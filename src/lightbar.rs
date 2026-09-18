@@ -1,11 +1,11 @@
-//! DualSense lightbar HID output (serialized writes).
+//! DualSense lightbar HID output (serialized DualSense HID I/O).
 
 use crate::app_log;
 use crate::battery::{is_dualsense_gamepad, normalize_identity, resolve_device_identity};
 use crate::color::{Rgb, color_for_battery_percent};
 use crate::steam;
 use hidapi::{BusType, HidApi, HidDevice};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
@@ -32,6 +32,8 @@ const OUTPUT_VALID_FLAG2_LIGHTBAR_SETUP: u8 = 1 << 1;
 /// Must be a **separate** report from the RGB write.
 const OUTPUT_LIGHTBAR_SETUP_LIGHT_OUT: u8 = 1 << 1;
 
+const WRITE_RETRY_DELAY: Duration = Duration::from_millis(75);
+
 pub const IDENTIFY_FLASH_MS: u64 = 150;
 pub const IDENTIFY_FLASH_COUNT: u32 = 5;
 
@@ -53,7 +55,8 @@ pub const LOW_BATTERY_PULSE_ON_MS: u64 = 400;
 pub const LOW_BATTERY_PULSE_GAP_MS: u64 = 1600;
 pub const LOW_BATTERY_ORANGE: Rgb = Rgb::ORANGE;
 
-static LIGHTBAR_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes all DualSense HID open/read/write/close (battery poll + lightbar).
+static HID_IO_LOCK: Mutex<()> = Mutex::new(());
 static BT_OUTPUT_SEQ: AtomicU8 = AtomicU8::new(0);
 /// When false, automatic battery/poll/pulse RGB writes are skipped (Identify / CLI still work).
 static AUTOMATIC_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -62,6 +65,9 @@ static CLAIMED_SERIALS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 /// Last observed Steam running state; forget claims when it changes.
 static LAST_STEAM_RUNNING: LazyLock<Mutex<Option<bool>>> = LazyLock::new(|| Mutex::new(None));
+/// Last successfully written RGB per pad (skip redundant poll rewrites).
+static LAST_APPLIED: LazyLock<Mutex<HashMap<String, Rgb>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Enable or disable automatic lightbar RGB (poll + low-battery pulse).
 pub fn set_enabled(enabled: bool) {
@@ -78,7 +84,7 @@ fn next_bt_seq_tag() -> u8 {
     seq << 4
 }
 
-/// Drop claims for pads that are no longer present (Bluetooth reconnect needs a fresh claim).
+/// Drop claims (and last-applied colors) for pads that are no longer present.
 pub fn sync_lightbar_claims(active_serials: impl IntoIterator<Item = impl AsRef<str>>) {
     let active: HashSet<String> = active_serials
         .into_iter()
@@ -87,12 +93,18 @@ pub fn sync_lightbar_claims(active_serials: impl IntoIterator<Item = impl AsRef<
     if let Ok(mut claimed) = CLAIMED_SERIALS.lock() {
         claimed.retain(|s| active.contains(s));
     }
+    if let Ok(mut last) = LAST_APPLIED.lock() {
+        last.retain(|s, _| active.contains(s));
+    }
 }
 
 /// Drop all `LIGHT_OUT` claims (e.g. Steam started/stopped).
 fn forget_all_claims() {
     if let Ok(mut claimed) = CLAIMED_SERIALS.lock() {
         claimed.clear();
+    }
+    if let Ok(mut last) = LAST_APPLIED.lock() {
+        last.clear();
     }
 }
 
@@ -129,16 +141,62 @@ fn forget_claim(serial: &str) {
     }
 }
 
-/// Apply a lightbar color to the controller with the given serial.
-pub fn apply_lightbar_rgb(serial: &str, color: Rgb) -> Result<(), String> {
-    let _guard = LIGHTBAR_LOCK
-        .lock()
-        .map_err(|_| "lightbar lock poisoned".to_string())?;
-    apply_lightbar_rgb_unlocked(serial, color)
+fn record_last_applied(serial: &str, color: Rgb) {
+    if let Ok(mut last) = LAST_APPLIED.lock() {
+        last.insert(normalize_identity(serial), color);
+    }
 }
 
-/// Apply lightbar while already holding [`LIGHTBAR_LOCK`] (poll / identify).
-pub(crate) fn apply_lightbar_rgb_unlocked(serial: &str, color: Rgb) -> Result<(), String> {
+fn last_applied_matches(serial: &str, color: Rgb) -> bool {
+    LAST_APPLIED
+        .lock()
+        .ok()
+        .and_then(|last| last.get(&normalize_identity(serial)).copied())
+        .is_some_and(|prev| prev == color)
+}
+
+/// Whether a poll/spectrum write can be skipped (same RGB, no pending claim).
+pub(crate) fn should_skip_rgb_write(serial: &str, color: Rgb, claim: bool, force: bool) -> bool {
+    !force && !claim && last_applied_matches(serial, color)
+}
+
+fn is_retryable_write_error(err: &impl std::fmt::Display) -> bool {
+    let text = err.to_string();
+    text.contains("0x000003E5")
+        || text.contains("WaitForSingleObject")
+        || text.contains("Overlapped I/O")
+}
+
+/// Whether a debounced spectrum commit generation is still current.
+pub fn spectrum_commit_is_current(current: u64, commit: u64) -> bool {
+    current == commit
+}
+
+/// Apply a lightbar color to the controller with the given serial.
+pub fn apply_lightbar_rgb(serial: &str, color: Rgb) -> Result<(), String> {
+    let _guard = HID_IO_LOCK
+        .lock()
+        .map_err(|_| "lightbar lock poisoned".to_string())?;
+    apply_lightbar_rgb_unlocked(serial, color, true)
+}
+
+/// Apply lightbar while already holding [`HID_IO_LOCK`] (poll / identify).
+pub(crate) fn apply_lightbar_rgb_unlocked(
+    serial: &str,
+    color: Rgb,
+    force: bool,
+) -> Result<(), String> {
+    match try_apply_by_serial(serial, color, force) {
+        Ok(()) => Ok(()),
+        Err(err) if is_retryable_write_error(&err) => {
+            thread::sleep(WRITE_RETRY_DELAY);
+            try_apply_by_serial(serial, color, force)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn try_apply_by_serial(serial: &str, color: Rgb, force: bool) -> Result<(), String> {
     let api = HidApi::new().map_err(|e| e.to_string())?;
     let target = normalize_identity(serial);
 
@@ -165,10 +223,32 @@ pub(crate) fn apply_lightbar_rgb_unlocked(serial: &str, color: Rgb) -> Result<()
     }
 
     let (device, is_bluetooth, _) = best.ok_or_else(|| format!("controller {serial} not found"))?;
+    apply_on_open_device(&device, &target, color, is_bluetooth, force)
+}
+
+/// Write lightbar on an already-open handle (caller must hold [`HID_IO_LOCK`]).
+pub fn apply_on_open_device(
+    device: &HidDevice,
+    serial: &str,
+    color: Rgb,
+    is_bluetooth: bool,
+    force: bool,
+) -> Result<(), String> {
+    let target = normalize_identity(serial);
     let claim = take_claim_if_needed(&target);
-    match set_lightbar_on_device(&device, color, is_bluetooth, claim) {
-        Ok(()) => Ok(()),
+    if should_skip_rgb_write(&target, color, claim, force) {
+        return Ok(());
+    }
+
+    match set_lightbar_on_device(device, color, is_bluetooth, claim) {
+        Ok(()) => {
+            record_last_applied(&target, color);
+            Ok(())
+        }
         Err(err) => {
+            // Claim may have partially completed; forget so the next attempt reclaims.
+            // Do not RGB-write after a failed claim/write on this handle — caller should
+            // reopen (hid_close cancels stuck overlapped I/O on Windows).
             if claim {
                 forget_claim(&target);
             }
@@ -177,11 +257,13 @@ pub(crate) fn apply_lightbar_rgb_unlocked(serial: &str, color: Rgb) -> Result<()
     }
 }
 
-/// Write lightbar while already holding [`LIGHTBAR_LOCK`] (used during poll).
+/// Write lightbar while already holding [`HID_IO_LOCK`] (used during poll).
 ///
 /// Bluetooth DualSense ignores RGB until the lightbar is reconfigured with a
 /// dedicated `LIGHT_OUT` setup report (same as Linux `hid-playstation`). Color is
 /// then applied in a second report with only the lightbar RGB flag.
+///
+/// If the claim write fails, RGB is **not** attempted on the same handle.
 pub fn set_lightbar_on_device(
     device: &HidDevice,
     color: Rgb,
@@ -247,9 +329,9 @@ fn build_bt_report(fill_common: impl FnOnce(&mut [u8])) -> [u8; OUTPUT_REPORT_BT
     report
 }
 
-/// Hold the lightbar lock for a closure (poll path).
+/// Hold the DualSense HID I/O lock for a closure (poll / power-off path).
 pub fn with_lightbar_lock<T>(f: impl FnOnce() -> T) -> T {
-    let _guard = LIGHTBAR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = HID_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     f()
 }
 
@@ -257,14 +339,14 @@ pub fn with_lightbar_lock<T>(f: impl FnOnce() -> T) -> T {
 pub fn identify_controller(serial: &str, percent: u8) -> Result<(), String> {
     let normal = color_for_battery_percent(percent);
     let flash_for = Duration::from_millis(IDENTIFY_FLASH_MS);
-    let _guard = LIGHTBAR_LOCK
+    let _guard = HID_IO_LOCK
         .lock()
         .map_err(|_| "lightbar lock poisoned".to_string())?;
 
     for _ in 0..IDENTIFY_FLASH_COUNT {
-        apply_lightbar_rgb_unlocked(serial, Rgb::WHITE)?;
+        apply_lightbar_rgb_unlocked(serial, Rgb::WHITE, true)?;
         thread::sleep(flash_for);
-        apply_lightbar_rgb_unlocked(serial, normal)?;
+        apply_lightbar_rgb_unlocked(serial, normal, true)?;
         thread::sleep(flash_for);
     }
 
@@ -276,12 +358,15 @@ pub fn identify_controller(serial: &str, percent: u8) -> Result<(), String> {
 pub fn apply_lightbar_all(color: Rgb) -> Result<usize, String> {
     let api = HidApi::new().map_err(|e| e.to_string())?;
     let mut applied = 0usize;
-    let _guard = LIGHTBAR_LOCK
+    let _guard = HID_IO_LOCK
         .lock()
         .map_err(|_| "lightbar lock poisoned".to_string())?;
 
     if let Ok(mut claimed) = CLAIMED_SERIALS.lock() {
         claimed.clear();
+    }
+    if let Ok(mut last) = LAST_APPLIED.lock() {
+        last.clear();
     }
 
     for info in api.device_list().filter(|d| is_dualsense_gamepad(d)) {
@@ -294,13 +379,9 @@ pub fn apply_lightbar_all(color: Rgb) -> Result<usize, String> {
         };
         let serial = resolve_device_identity(info, &device);
         let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
-        let claim = take_claim_if_needed(&serial);
-        match set_lightbar_on_device(&device, color, is_bluetooth, claim) {
+        match apply_on_open_device(&device, &serial, color, is_bluetooth, true) {
             Ok(()) => applied += 1,
             Err(err) => {
-                if claim {
-                    forget_claim(&serial);
-                }
                 app_log::warn(format!("lightbar write failed: {err}"));
             }
         }
@@ -405,6 +486,20 @@ mod tests {
         *LAST_STEAM_RUNNING.lock().unwrap() = Some(true);
         assert!(take_claim_if_needed("aabbcc"));
 
+        // Last-applied skip (same shared claim/last maps — keep in this serial test).
+        forget_all_claims();
+        let serial = "aabbccddeeff";
+        let color = Rgb::new(10, 20, 30);
+        let other = Rgb::new(40, 50, 60);
+        assert!(!should_skip_rgb_write(serial, color, false, false));
+        record_last_applied(serial, color);
+        assert!(should_skip_rgb_write(serial, color, false, false));
+        assert!(!should_skip_rgb_write(serial, other, false, false));
+        assert!(!should_skip_rgb_write(serial, color, true, false));
+        assert!(!should_skip_rgb_write(serial, color, false, true));
+        sync_lightbar_claims(std::iter::empty::<&str>());
+        assert!(!should_skip_rgb_write(serial, color, false, false));
+
         clear_claim_test_state();
     }
 
@@ -423,5 +518,20 @@ mod tests {
         let done_at =
             start + Duration::from_millis(IDENTIFY_FLASH_MS * u64::from(IDENTIFY_FLASH_COUNT) * 2);
         assert_eq!(identify_flash_is_white(start, done_at), None);
+    }
+
+    #[test]
+    fn spectrum_commit_generation_drops_stale() {
+        assert!(spectrum_commit_is_current(3, 3));
+        assert!(!spectrum_commit_is_current(4, 3));
+        assert!(!spectrum_commit_is_current(2, 3));
+    }
+
+    #[test]
+    fn retryable_write_error_detects_io_pending() {
+        assert!(is_retryable_write_error(
+            &"hidapi error: hid_write/WaitForSingleObject: (0x000003E5) Overlapped I/O operation is in progress."
+        ));
+        assert!(!is_retryable_write_error(&"controller not found"));
     }
 }

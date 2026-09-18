@@ -56,6 +56,8 @@ const BATTERY_INTERVAL: Duration = Duration::from_secs(60);
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
 /// When HID lists pads but battery reads keep failing, retry sooner than BATTERY_INTERVAL.
 const UNREAD_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+/// Debounce spectrum prefs save + HID apply after the last color edit.
+const SPECTRUM_DEBOUNCE: Duration = Duration::from_millis(150);
 /// How long an overlay toast stays on screen.
 const TOAST_LIFETIME: Duration = Duration::from_secs(5);
 /// Slide-in / slide-out duration for overlay toasts.
@@ -114,6 +116,11 @@ pub enum Message {
     /// Begin dismiss (slide-out) for the toast of the given generation.
     ToastDismiss(u64),
 
+    /// Debounced spectrum prefs save + lightbar HID apply.
+    SpectrumCommit(u64),
+    /// Background spectrum HID apply finished (no-op handler).
+    SpectrumHidDone,
+
     Exit,
 }
 
@@ -158,6 +165,9 @@ pub struct App {
     toast_placement: Option<ToastPlacement>,
     toast_anim_started: Instant,
     toast_dismissing: bool,
+
+    /// Bumped on every spectrum edit; stale SpectrumCommit messages are ignored.
+    spectrum_generation: u64,
 
     #[cfg(feature = "dev-emulate")]
     dev_mode: bool,
@@ -250,6 +260,7 @@ impl App {
             toast_placement: None,
             toast_anim_started: Instant::now(),
             toast_dismissing: false,
+            spectrum_generation: 0,
             #[cfg(feature = "dev-emulate")]
             dev_mode,
             #[cfg(feature = "dev-emulate")]
@@ -266,7 +277,7 @@ impl App {
         app.sync_low_battery();
         app.refresh_analytics_panel();
 
-        let task = Task::batch([app.request_refresh(), app.ensure_toast_window()]);
+        let task = Task::batch([app.request_refresh(true), app.ensure_toast_window()]);
         (app, task)
     }
 
@@ -421,6 +432,9 @@ impl App {
                 }
             }
 
+            Message::SpectrumCommit(generation) => self.on_spectrum_commit(generation),
+            Message::SpectrumHidDone => Task::none(),
+
             Message::Exit => {
                 self.known.save();
                 self.tray_icon.take();
@@ -507,13 +521,15 @@ impl App {
             && self.last_battery_poll.elapsed() >= UNREAD_RETRY_INTERVAL;
 
         if membership_changed || battery_due || liveness_due || unread_retry {
-            self.request_refresh()
+            // Re-assert lightbar on battery/membership; skip unchanged RGB on liveness-only.
+            let force_lightbar = membership_changed || battery_due || unread_retry;
+            self.request_refresh(force_lightbar)
         } else {
             Task::none()
         }
     }
 
-    fn request_refresh(&mut self) -> Task<Message> {
+    fn request_refresh(&mut self, force_lightbar: bool) -> Task<Message> {
         #[cfg(feature = "dev-emulate")]
         if self.emulating {
             return Task::none();
@@ -530,9 +546,10 @@ impl App {
             return Task::none();
         }
 
-        Task::perform(spawn_blocking(battery::poll_controllers), |outcome| {
-            Message::PollResult(outcome.unwrap_or_else(Err))
-        })
+        Task::perform(
+            spawn_blocking(move || battery::poll_controllers(force_lightbar)),
+            |outcome| Message::PollResult(outcome.unwrap_or_else(Err)),
+        )
     }
 
     fn on_poll_result(&mut self, result: Result<Vec<ControllerStatus>, String>) -> Task<Message> {
@@ -913,9 +930,10 @@ impl App {
                 self.sync_low_battery();
                 if enabled {
                     // Re-apply spectrum colors now that automatic writes are back on.
-                    self.apply_spectrum(self.prefs.spectrum.clone());
+                    self.apply_spectrum(self.prefs.spectrum.clone())
+                } else {
+                    Task::none()
                 }
-                Task::none()
             }
             ConfigureMessage::OpenDataFolder => {
                 if let Err(err) = paths::open_data_folder() {
@@ -956,8 +974,7 @@ impl App {
             }
             ConfigureMessage::ResetSpectrum => {
                 let next = self.configure_state.reset();
-                self.apply_spectrum(next);
-                Task::none()
+                self.apply_spectrum(next)
             }
             #[cfg(feature = "dev-emulate")]
             ConfigureMessage::DeveloperPreset(preset) => self.apply_dev_preset(preset),
@@ -966,32 +983,62 @@ impl App {
 
     fn apply_spectrum_maybe(&mut self, spectrum: Option<BatterySpectrum>) -> Task<Message> {
         if let Some(spectrum) = spectrum {
-            self.apply_spectrum(spectrum);
+            self.apply_spectrum(spectrum)
+        } else {
+            Task::none()
         }
-        Task::none()
     }
 
-    fn apply_spectrum(&mut self, spectrum: BatterySpectrum) {
+    /// Update in-memory spectrum immediately; debounce prefs save + HID write.
+    fn apply_spectrum(&mut self, spectrum: BatterySpectrum) -> Task<Message> {
         self.prefs.spectrum = spectrum.clone();
+        color::set_active_spectrum(spectrum);
+        self.spectrum_generation = self.spectrum_generation.wrapping_add(1);
+        let generation = self.spectrum_generation;
+        Task::perform(delay(SPECTRUM_DEBOUNCE), move |_| {
+            Message::SpectrumCommit(generation)
+        })
+    }
+
+    fn on_spectrum_commit(&mut self, generation: u64) -> Task<Message> {
+        if !lightbar::spectrum_commit_is_current(self.spectrum_generation, generation) {
+            return Task::none();
+        }
+
         self.prefs.save();
-        color::set_active_spectrum(spectrum.clone());
 
         if !lightbar::is_enabled() {
-            return;
+            return Task::none();
         }
 
-        for controller in &self.controllers {
-            if is_emulated_serial(&controller.serial) {
-                continue;
-            }
-            let color = spectrum.color_at_percent(controller.percent);
-            if let Err(err) = lightbar::apply_lightbar_rgb(&controller.serial, color) {
-                app_log::warn(format!(
-                    "failed to apply spectrum color for {}: {err}",
-                    controller.serial
-                ));
-            }
+        let targets: Vec<(String, color::Rgb)> = self
+            .controllers
+            .iter()
+            .filter(|c| !is_emulated_serial(&c.serial))
+            .map(|c| {
+                (
+                    c.serial.clone(),
+                    self.prefs.spectrum.color_at_percent(c.percent),
+                )
+            })
+            .collect();
+
+        if targets.is_empty() {
+            return Task::none();
         }
+
+        Task::perform(
+            spawn_blocking(move || {
+                for (serial, color) in targets {
+                    if let Err(err) = lightbar::apply_lightbar_rgb(&serial, color) {
+                        app_log::warn(format!(
+                            "failed to apply spectrum color for {serial}: {err}"
+                        ));
+                    }
+                }
+            }),
+            |_| Message::SpectrumHidDone,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -1092,7 +1139,7 @@ impl App {
             self.dev_paused_percent = None;
             let task = self.apply_controllers(Vec::new());
             self.last_battery_poll = Instant::now();
-            return task.chain(self.request_refresh());
+            return task.chain(self.request_refresh(true));
         }
 
         if preset.is_analytics() && !self.prefs.analytics_enabled {

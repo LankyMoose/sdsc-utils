@@ -168,7 +168,7 @@ fn attach_console_for_cli() {
 }
 
 fn list_controllers_cli() -> ExitCode {
-    match battery::poll_controllers() {
+    match battery::poll_controllers(true) {
         Ok(statuses) => {
             if statuses.is_empty() {
                 println!("No DualSense controllers found.");
