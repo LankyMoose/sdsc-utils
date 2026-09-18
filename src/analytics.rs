@@ -36,6 +36,10 @@ const MAX_STEP_SECS: u64 = 6 * 60 * 60;
 /// Heartbeat gaps larger than this are treated as "app was closed" and skipped.
 pub const HEARTBEAT_MAX_GAP: Duration = Duration::from_secs(150);
 
+/// After connect, DualSense percents are often wrong for a while (especially BT).
+/// Do not open or commit bucket windows until this grace elapses.
+pub const CONNECT_GRACE: Duration = Duration::from_secs(30 * 60);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BucketDirection {
@@ -111,6 +115,10 @@ pub struct AnalyticsStore {
     by_serial: HashMap<String, SerialRecord>,
     dirty: bool,
     last_tick_ms: Option<u64>,
+    /// Wall-clock ms when the current connect grace began (runtime only).
+    connected_at_ms: HashMap<String, u64>,
+    /// Serials that have been reconciled once after leaving connect grace.
+    grace_reconciled: std::collections::HashSet<String>,
 }
 
 impl AnalyticsStore {
@@ -124,6 +132,8 @@ impl AnalyticsStore {
                 by_serial: file.controllers,
                 dirty: false,
                 last_tick_ms: None,
+                connected_at_ms: HashMap::new(),
+                grace_reconciled: std::collections::HashSet::new(),
             },
             Err(err) => {
                 app_log::warn(format!(
@@ -166,6 +176,8 @@ impl AnalyticsStore {
     pub fn clear(&mut self) {
         self.by_serial.clear();
         self.last_tick_ms = None;
+        self.connected_at_ms.clear();
+        self.grace_reconciled.clear();
         self.dirty = true;
         self.save();
     }
@@ -179,6 +191,39 @@ impl AnalyticsStore {
             return false;
         }
         true
+    }
+
+    /// Emulated pads skip connect grace so developer presets start windows immediately.
+    fn skips_connect_grace(serial: &str) -> bool {
+        serial.starts_with("emu-")
+    }
+
+    fn in_connect_grace(&self, serial: &str, now_ms: u64) -> bool {
+        if Self::skips_connect_grace(serial) {
+            return false;
+        }
+        self.connected_at_ms.get(serial).is_some_and(|started| {
+            now_ms.saturating_sub(*started) < CONNECT_GRACE.as_millis() as u64
+        })
+    }
+
+    /// Record a connect edge. Brief HID absences keep the original grace clock;
+    /// longer absences (or first connect) start a new grace and drop any stale window.
+    fn on_connect(&mut self, serial: &str, now_ms: u64, previous_last_seen: Option<u64>) {
+        if Self::skips_connect_grace(serial) {
+            return;
+        }
+        let brief_blip = previous_last_seen
+            .filter(|_| self.connected_at_ms.contains_key(serial))
+            .is_some_and(|last| {
+                now_ms.saturating_sub(last) <= HEARTBEAT_MAX_GAP.as_millis() as u64
+            });
+        if brief_blip {
+            return;
+        }
+        self.connected_at_ms.insert(serial.to_string(), now_ms);
+        self.grace_reconciled.remove(serial);
+        self.clear_in_progress(serial, now_ms);
     }
 
     /// Developer helper: seed full drain/charge step chains so ETA UI can be checked.
@@ -294,7 +339,34 @@ impl AnalyticsStore {
         now_ms: u64,
     ) {
         let serial = next.serial.as_str();
+        let previous_last_seen = self.by_serial.get(serial).map(|r| r.last_seen_ms);
         self.ensure_record(serial, now_ms);
+
+        if prev.is_none() {
+            self.on_connect(serial, now_ms, previous_last_seen);
+        }
+
+        if self.in_connect_grace(serial, now_ms) {
+            if let Some(record) = self.by_serial.get_mut(serial) {
+                record.last_seen_ms = now_ms;
+            }
+            return;
+        }
+
+        if !Self::skips_connect_grace(serial) && !self.grace_reconciled.contains(serial) {
+            self.grace_reconciled.insert(serial.to_string());
+            let progress = self
+                .by_serial
+                .get(serial)
+                .and_then(|r| r.in_progress.clone());
+            if let Some(p) = progress {
+                let mismatch =
+                    p.percent != next.percent || !direction_matches(p.direction, next.state);
+                if mismatch {
+                    self.clear_in_progress(serial, now_ms);
+                }
+            }
+        }
 
         let want = match next.state {
             PowerState::Discharging => Some(BucketDirection::Drain),
@@ -921,6 +993,18 @@ mod tests {
         store.observe(prev, next, true, |_| false, at);
     }
 
+    /// Connect at `t0`, then observe again after connect grace so a bucket window can open.
+    fn connect_past_grace(
+        store: &mut AnalyticsStore,
+        pads: &[ControllerStatus],
+        t0: SystemTime,
+    ) -> SystemTime {
+        observe_enabled(store, &[], pads, t0);
+        let after = t0 + CONNECT_GRACE + Duration::from_secs(1);
+        observe_enabled(store, pads, pads, after);
+        after
+    }
+
     /// Accrue `minutes` of active time at a fixed percent/state via heartbeats.
     fn accrue(
         store: &mut AnalyticsStore,
@@ -945,9 +1029,9 @@ mod tests {
     fn drain_heartbeats_accrue_until_drop() {
         let mut store = AnalyticsStore::default();
         let forty_five = vec![pad("a", 45, PowerState::Discharging)];
-        observe_enabled(&mut store, &[], &forty_five, ms(1_000));
+        let t0 = connect_past_grace(&mut store, &forty_five, ms(1_000));
         assert_eq!(store.in_progress("a").map(|p| p.percent), Some(45));
-        let t = accrue(&mut store, "a", 45, PowerState::Discharging, ms(1_000), 5);
+        let t = accrue(&mut store, "a", 45, PowerState::Discharging, t0, 5);
         assert!(store.by_serial["a"].drain_steps.is_empty());
         let thirty_five = vec![pad("a", 35, PowerState::Discharging)];
         observe_enabled(
@@ -968,8 +1052,8 @@ mod tests {
         let mut store = AnalyticsStore::default();
         let forty_five = vec![pad("a", 45, PowerState::Discharging)];
         let thirty_five = vec![pad("a", 35, PowerState::Discharging)];
-        observe_enabled(&mut store, &[], &forty_five, ms(1_000));
-        let t = accrue(&mut store, "a", 45, PowerState::Discharging, ms(1_000), 5);
+        let t0 = connect_past_grace(&mut store, &forty_five, ms(1_000));
+        let t = accrue(&mut store, "a", 45, PowerState::Discharging, t0, 5);
         observe_enabled(
             &mut store,
             &forty_five,
@@ -1078,14 +1162,15 @@ mod tests {
     fn drain_disconnect_pauses_then_drop_commits() {
         let mut store = AnalyticsStore::default();
         let thirty_five = vec![pad("a", 35, PowerState::Discharging)];
-        observe_enabled(&mut store, &[], &thirty_five, ms(1_000));
-        let t = accrue(&mut store, "a", 35, PowerState::Discharging, ms(1_000), 3);
+        let t0 = connect_past_grace(&mut store, &thirty_five, ms(1_000));
+        let t = accrue(&mut store, "a", 35, PowerState::Discharging, t0, 3);
+        // Brief absence (under HEARTBEAT_MAX_GAP): pause accrual, keep window + grace clock.
         observe_enabled(&mut store, &thirty_five, &[], t + Duration::from_secs(90));
         assert!(store.in_progress("a").is_some());
-        // Overnight gap — no accrual.
-        let day2 = t + Duration::from_secs(20 * 60 * 60);
-        observe_enabled(&mut store, &[], &thirty_five, day2);
-        let t2 = accrue(&mut store, "a", 35, PowerState::Discharging, day2, 3);
+        let resume = t + Duration::from_secs(120);
+        observe_enabled(&mut store, &[], &thirty_five, resume);
+        assert_eq!(store.in_progress("a").map(|p| p.percent), Some(35));
+        let t2 = accrue(&mut store, "a", 35, PowerState::Discharging, resume, 3);
         let twenty_five = vec![pad("a", 25, PowerState::Discharging)];
         observe_enabled(
             &mut store,
@@ -1094,7 +1179,7 @@ mod tests {
             t2 + Duration::from_secs(90),
         );
         let sample = store.by_serial["a"].drain_steps[0].samples_ms[0];
-        // ~6 minutes total across sittings, not overnight.
+        // ~6 minutes total across sittings, not the gap.
         assert!((5 * 60 * 1000..15 * 60 * 1000).contains(&sample));
     }
 
@@ -1133,8 +1218,8 @@ mod tests {
         let mut store = AnalyticsStore::default();
         let five = vec![pad("a", 5, PowerState::Charging)];
         let fifteen = vec![pad("a", 15, PowerState::Charging)];
-        observe_enabled(&mut store, &[], &five, ms(1_000));
-        let t = accrue(&mut store, "a", 5, PowerState::Charging, ms(1_000), 5);
+        let t0 = connect_past_grace(&mut store, &five, ms(1_000));
+        let t = accrue(&mut store, "a", 5, PowerState::Charging, t0, 5);
         observe_enabled(&mut store, &five, &fifteen, t + Duration::from_secs(90));
         let discharging = vec![pad("a", 15, PowerState::Discharging)];
         observe_enabled(
@@ -1194,8 +1279,8 @@ mod tests {
         let mut store = AnalyticsStore::default();
         let ninety_five = vec![pad("a", 95, PowerState::Charging)];
         let complete = vec![pad("a", 100, PowerState::Complete)];
-        observe_enabled(&mut store, &[], &ninety_five, ms(1_000));
-        let t = accrue(&mut store, "a", 95, PowerState::Charging, ms(1_000), 5);
+        let t0 = connect_past_grace(&mut store, &ninety_five, ms(1_000));
+        let t = accrue(&mut store, "a", 95, PowerState::Charging, t0, 5);
         observe_enabled(
             &mut store,
             &ninety_five,
@@ -1209,6 +1294,95 @@ mod tests {
             .find(|s| s.from_percent == 95 && s.to_percent == 100)
             .expect("95→100");
         assert!(!step.samples_ms.is_empty());
+    }
+
+    #[test]
+    fn connect_grace_skips_window_and_percent_jumps() {
+        let mut store = AnalyticsStore::default();
+        let wrong = vec![pad("a", 100, PowerState::Discharging)];
+        observe_enabled(&mut store, &[], &wrong, ms(1_000));
+        assert!(store.in_progress("a").is_none());
+
+        // Settling jump during grace must not open a window or commit a step.
+        let settled = vec![pad("a", 65, PowerState::Discharging)];
+        observe_enabled(
+            &mut store,
+            &wrong,
+            &settled,
+            ms(1_000) + Duration::from_secs(10 * 60),
+        );
+        assert!(store.in_progress("a").is_none());
+        assert!(store.by_serial["a"].drain_steps.is_empty());
+    }
+
+    #[test]
+    fn connect_grace_then_window_at_settled_percent() {
+        let mut store = AnalyticsStore::default();
+        let wrong = vec![pad("a", 100, PowerState::Discharging)];
+        observe_enabled(&mut store, &[], &wrong, ms(1_000));
+        let settled = vec![pad("a", 65, PowerState::Discharging)];
+        observe_enabled(
+            &mut store,
+            &wrong,
+            &settled,
+            ms(1_000) + Duration::from_secs(5 * 60),
+        );
+
+        let after_grace = ms(1_000) + CONNECT_GRACE + Duration::from_secs(1);
+        observe_enabled(&mut store, &settled, &settled, after_grace);
+        assert_eq!(store.in_progress("a").map(|p| p.percent), Some(65));
+
+        let t = accrue(&mut store, "a", 65, PowerState::Discharging, after_grace, 5);
+        let fifty_five = vec![pad("a", 55, PowerState::Discharging)];
+        observe_enabled(
+            &mut store,
+            &settled,
+            &fifty_five,
+            t + Duration::from_secs(90),
+        );
+        let steps = &store.by_serial["a"].drain_steps;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].from_percent, 65);
+        assert_eq!(steps[0].to_percent, 55);
+    }
+
+    #[test]
+    fn overnight_reconnect_resets_connect_grace() {
+        let mut store = AnalyticsStore::default();
+        let pad35 = vec![pad("a", 35, PowerState::Discharging)];
+        let t0 = connect_past_grace(&mut store, &pad35, ms(1_000));
+        assert!(store.in_progress("a").is_some());
+
+        observe_enabled(&mut store, &pad35, &[], t0 + Duration::from_secs(90));
+        let day2 = t0 + Duration::from_secs(20 * 60 * 60);
+        observe_enabled(&mut store, &[], &pad35, day2);
+        // True reconnect: stale window cleared and grace starts again.
+        assert!(store.in_progress("a").is_none());
+        assert!(store.in_connect_grace("a", system_time_ms(day2)));
+
+        let still_grace = day2 + Duration::from_secs(10 * 60);
+        observe_enabled(&mut store, &pad35, &pad35, still_grace);
+        assert!(store.in_progress("a").is_none());
+    }
+
+    #[test]
+    fn brief_absence_does_not_reset_connect_grace() {
+        let mut store = AnalyticsStore::default();
+        let pad45 = vec![pad("a", 45, PowerState::Discharging)];
+        let t0 = connect_past_grace(&mut store, &pad45, ms(1_000));
+        let connected_at = *store.connected_at_ms.get("a").expect("grace clock");
+        assert_eq!(store.in_progress("a").map(|p| p.percent), Some(45));
+
+        observe_enabled(&mut store, &pad45, &[], t0 + Duration::from_secs(30));
+        let resume = t0 + Duration::from_secs(90);
+        observe_enabled(&mut store, &[], &pad45, resume);
+        assert_eq!(
+            store.connected_at_ms.get("a").copied(),
+            Some(connected_at),
+            "brief HID blip must keep original connect time"
+        );
+        assert_eq!(store.in_progress("a").map(|p| p.percent), Some(45));
+        assert!(!store.in_connect_grace("a", system_time_ms(resume)));
     }
 
     #[test]
