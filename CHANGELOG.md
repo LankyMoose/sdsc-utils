@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Battery analytics ignores bucket-window starts for ~30 minutes after a controller connects, so the first (often wrong) DualSense readings cannot open or poison a step timer.
+
 ## [1.3.1] - 2026-09-13
 
 ### Fixed
