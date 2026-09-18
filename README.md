@@ -4,6 +4,34 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 
 **Unofficial.** DualSense, DualSense Edge, PlayStation, and related marks are trademarks of Sony Interactive Entertainment Inc. This project is not affiliated with, endorsed by, or sponsored by Sony.
 
+## Screenshots
+
+<p align="center">
+  <img src="assets/screenshots/controller-list.png" alt="Controller popup with battery rings and ETA" width="420" />
+</p>
+
+<p align="center">Controller popup — battery %, remaining-time estimate, Identify / Turn off, and Remember</p>
+
+<p align="center">
+  <img src="assets/screenshots/configuration-lightbar.png" alt="Settings lightbar spectrum editor" width="520" />
+</p>
+
+<p align="center">Settings → Lightbar — enable toggle, multi-stop spectrum, and color picker</p>
+
+<p align="center">
+  <img src="assets/screenshots/configuration-notifications.png" alt="Settings notifications" width="360" />
+  &nbsp;
+  <img src="assets/screenshots/configuration-toasts.png" alt="Settings toast position" width="360" />
+</p>
+
+<p align="center">Notifications and toast corner placement</p>
+
+<p align="center">
+  <img src="assets/screenshots/configuration-analytics.png" alt="Settings battery analytics" width="520" />
+</p>
+
+<p align="center">Settings → Analytics — opt-in local charge/drain learning and coverage charts</p>
+
 ## Download
 
 **Recommended (Windows):** install from the [Microsoft Store](https://apps.microsoft.com/) once the listing is live (search for **SDSC Utils**). Store installs are signed by Microsoft and update automatically through the Store / `winget`.
