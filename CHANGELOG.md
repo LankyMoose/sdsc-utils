@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Default lightbar spectrum is `#0101FE` → `#8704FF` → `#FF0101` (full / mid / empty).
 - Split Settings canvas programs into `configure_view/{mod,spectrum,coverage}.rs` (no behavior change).
-
 
 ## [1.3.2] - 2026-09-18
 
