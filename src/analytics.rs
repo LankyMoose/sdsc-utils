@@ -183,7 +183,7 @@ impl AnalyticsStore {
     }
 
     pub fn is_storable_serial(serial: &str) -> bool {
-        if serial.is_empty() || serial == "unknown" {
+        if !crate::dualsense::is_storable_serial(serial) {
             return false;
         }
         #[cfg(not(feature = "dev-emulate"))]

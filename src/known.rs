@@ -2,6 +2,7 @@
 
 use crate::app_log;
 use crate::battery::ControllerStatus;
+use crate::dualsense::is_storable_serial;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -76,13 +77,13 @@ impl KnownControllers {
     fn from_file(file: KnownFile) -> Self {
         let mut by_serial = HashMap::new();
         for record in file.controllers {
-            if Self::is_storable_serial(&record.serial) {
+            if is_storable_serial(&record.serial) {
                 by_serial.insert(record.serial.clone(), record);
             }
         }
         let mut nicknames = HashMap::new();
         for (serial, name) in file.nicknames {
-            if !Self::is_storable_serial(&serial) {
+            if !is_storable_serial(&serial) {
                 continue;
             }
             let trimmed = name.trim();
@@ -138,7 +139,7 @@ impl KnownControllers {
 
     /// Set or clear a nickname. Empty / whitespace clears. Returns true if stored data changed.
     pub fn set_nickname(&mut self, serial: &str, nickname: Option<String>) -> bool {
-        if !Self::is_storable_serial(serial) {
+        if !is_storable_serial(serial) {
             return false;
         }
         let next = nickname
@@ -165,7 +166,7 @@ impl KnownControllers {
     }
 
     pub fn remember(&mut self, controller: &ControllerStatus) -> bool {
-        if !Self::is_storable_serial(&controller.serial) {
+        if !is_storable_serial(&controller.serial) {
             return false;
         }
         match self.by_serial.get_mut(&controller.serial) {
@@ -200,7 +201,7 @@ impl KnownControllers {
     pub fn sync_from_live(&mut self, live: &[ControllerStatus]) -> bool {
         let mut changed = false;
         for controller in live {
-            if !Self::is_storable_serial(&controller.serial) {
+            if !is_storable_serial(&controller.serial) {
                 continue;
             }
             if let Some(record) = self.by_serial.get_mut(&controller.serial)
@@ -229,10 +230,6 @@ impl KnownControllers {
             .collect();
         out.sort_by(|a, b| a.serial.cmp(&b.serial));
         out
-    }
-
-    pub fn is_storable_serial(serial: &str) -> bool {
-        !serial.is_empty() && serial != "unknown"
     }
 }
 

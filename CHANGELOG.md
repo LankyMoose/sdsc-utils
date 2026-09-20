@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Lightbar reasserts RGB on every ~5s poll with claim-once (`LIGHT_OUT` then RGB) per connection, without Steam-specific branching — works against any other HID writer that briefly owns the bar.
+- Fresh connects always reclaim the lightbar (`LIGHT_OUT` + RGB), including after a presence-only disconnect that never ran a HID poll.
+
+### Changed
+
+- Removed unused lightbar skip-unchanged / `force` poll knobs; polls always reassert after claim-once.
+- HID layering: shared `dualsense` identity + lock; `battery` read-only; `poll` orchestrates read then lightbar apply under one lock.
+- Thinned the iced daemon: tray, window placement, and Win32 FFI live in dedicated modules.
+- Presence scans use path keys (`list_presence_paths`); storable-serial checks go through `dualsense::is_storable_serial`.
+
+
 ## [1.3.2] - 2026-09-18
 
 ### Fixed

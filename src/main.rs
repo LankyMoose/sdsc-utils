@@ -8,6 +8,7 @@ mod autostart;
 mod battery;
 mod color;
 mod configure_view;
+mod dualsense;
 #[cfg(feature = "dev-emulate")]
 mod emulate;
 mod icon;
@@ -17,13 +18,17 @@ mod notify;
 mod packaged;
 mod paths;
 mod percent_ring;
+mod poll;
 mod popup_view;
 mod prefs;
-mod steam;
 mod svg_icon;
 mod theme;
 mod toast;
 mod toast_view;
+mod tray;
+#[cfg(windows)]
+mod win32;
+mod window_layout;
 
 use app_meta::{DISPLAY_NAME, PKG_NAME, PKG_VERSION};
 use single_instance::SingleInstance;
@@ -168,7 +173,7 @@ fn attach_console_for_cli() {
 }
 
 fn list_controllers_cli() -> ExitCode {
-    match battery::poll_controllers(true) {
+    match poll::poll_controllers(&[]) {
         Ok(statuses) => {
             if statuses.is_empty() {
                 println!("No DualSense controllers found.");
