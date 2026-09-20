@@ -1,19 +1,12 @@
 //! DualSense discovery and battery reading.
 
 use crate::app_log;
-use crate::color::color_for_battery_percent;
-use crate::lightbar::{self, with_lightbar_lock};
-use hidapi::{BusType, DeviceInfo, HidApi, HidDevice};
+use crate::dualsense::{
+    self, is_dualsense_device, is_storable_serial, normalize_identity, resolve_device_identity,
+};
+use hidapi::{BusType, HidApi, HidDevice};
 use std::thread;
 use std::time::Duration;
-
-const SONY_VENDOR_ID: u16 = 0x054C;
-const DUALSENSE_PRODUCT_ID: u16 = 0x0CE6;
-const DUALSENSE_EDGE_PRODUCT_ID: u16 = 0x0DF2;
-
-/// Generic Desktop / Game Pad — the DualSense HID interface that carries battery data.
-const HID_USAGE_PAGE_GENERIC_DESKTOP: u16 = 0x01;
-const HID_USAGE_GAMEPAD: u16 = 0x05;
 
 const USB_REPORT_SIZE: usize = 64;
 const BT_REPORT_SIZE: usize = 78;
@@ -25,9 +18,6 @@ const BT_REPORT_FULL: u8 = 0x31;
 const USB_REPORT_ID: u8 = 0x01;
 const CALIBRATION_FEATURE_REPORT: u8 = 0x05;
 const CALIBRATION_FEATURE_SIZE: usize = 41;
-/// DualSense pairing-info feature report (Linux hid-playstation).
-const PAIRING_INFO_FEATURE_REPORT: u8 = 0x09;
-const PAIRING_INFO_FEATURE_SIZE: usize = 20;
 /// DualSense Bluetooth control feature report (dualsensectl / HID descriptor).
 /// Descriptor Report Count for ID 0x08 is 47 data bytes → 48 with report ID.
 const BT_CONTROL_FEATURE_REPORT: u8 = 0x08;
@@ -105,85 +95,14 @@ impl ControllerStatus {
 }
 
 #[derive(Debug, Clone)]
-struct BatteryStatus {
-    percent: u8,
-    state: PowerState,
-    connection: &'static str,
-}
-
-fn hid_serial(info: &DeviceInfo) -> String {
-    info.serial_number()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("unknown")
-        .to_string()
+pub(crate) struct BatteryReading {
+    pub percent: u8,
+    pub state: PowerState,
+    pub connection: &'static str,
 }
 
 fn is_known_serial(serial: &str) -> bool {
-    !serial.is_empty() && serial != "unknown"
-}
-
-/// Normalize MAC-style identities so `AA:BB:…` and `aabb…` compare equal.
-pub(crate) fn normalize_identity(serial: &str) -> String {
-    serial
-        .chars()
-        .filter(|c| *c != ':' && *c != '-')
-        .flat_map(|c| c.to_lowercase())
-        .collect()
-}
-
-/// Format a little-endian MAC (as in feature report 0x09) like Windows BT HID serials.
-fn format_mac_from_le(mac_le: &[u8; 6]) -> String {
-    mac_le.iter().rev().map(|b| format!("{b:02x}")).collect()
-}
-
-fn read_mac_address_le(device: &HidDevice) -> Result<[u8; 6], hidapi::HidError> {
-    let mut buf = vec![0u8; PAIRING_INFO_FEATURE_SIZE];
-    buf[0] = PAIRING_INFO_FEATURE_REPORT;
-    let n = device.get_feature_report(&mut buf)?;
-    if n < 7 || buf[0] != PAIRING_INFO_FEATURE_REPORT {
-        return Err(hidapi::HidError::HidApiError {
-            message: format!("pairing-info report too short or unexpected id ({n} bytes)"),
-        });
-    }
-    let mut mac = [0u8; 6];
-    mac.copy_from_slice(&buf[1..7]);
-    Ok(mac)
-}
-
-/// Stable pad identity: HID serial when present, otherwise MAC from pairing-info.
-/// Windows often leaves the USB serial empty while Bluetooth exposes the MAC.
-pub(crate) fn resolve_device_identity(info: &DeviceInfo, device: &HidDevice) -> String {
-    let hid = hid_serial(info);
-    if is_known_serial(&hid) {
-        return normalize_identity(&hid);
-    }
-    match read_mac_address_le(device) {
-        Ok(mac) => format_mac_from_le(&mac),
-        Err(err) => {
-            app_log::warn(format!(
-                "could not read MAC for {} over {}: {err}",
-                product_name(info.product_id()),
-                match info.bus_type() {
-                    BusType::Usb => "USB",
-                    BusType::Bluetooth => "Bluetooth",
-                    _ => "unknown bus",
-                }
-            ));
-            "unknown".into()
-        }
-    }
-}
-
-/// Presence keys for connect/disconnect (HID paths — unique per USB/BT node).
-pub fn list_controller_serials() -> Result<Vec<String>, String> {
-    let api = HidApi::new().map_err(|e| e.to_string())?;
-    let mut keys: Vec<String> = api
-        .device_list()
-        .filter(|d| is_dualsense_gamepad(d))
-        .map(|d| d.path().to_string_lossy().into_owned())
-        .collect();
-    keys.sort();
-    Ok(keys)
+    is_storable_serial(serial)
 }
 
 /// Collapse the same physical pad enumerated on USB and Bluetooth (prefer USB).
@@ -214,146 +133,7 @@ fn dedupe_statuses(mut statuses: Vec<ControllerStatus>) -> Vec<ControllerStatus>
     unique
 }
 
-/// Opened DualSense after a successful battery read (kept for lightbar write).
-struct PolledPad {
-    status: ControllerStatus,
-    device: HidDevice,
-    is_bluetooth: bool,
-}
-
-/// Collapse USB+BT of the same pad, keeping the preferred open handle (USB wins).
-fn dedupe_polled(mut pads: Vec<PolledPad>) -> Vec<PolledPad> {
-    let mut unique: Vec<PolledPad> = Vec::with_capacity(pads.len());
-
-    for pad in pads.drain(..) {
-        if !is_known_serial(&pad.status.serial) {
-            unique.push(pad);
-            continue;
-        }
-
-        if let Some(existing) = unique
-            .iter_mut()
-            .find(|s| is_known_serial(&s.status.serial) && s.status.serial == pad.status.serial)
-        {
-            let pad_is_usb = pad.status.connection == "USB";
-            let existing_is_usb = existing.status.connection == "USB";
-            if pad_is_usb && !existing_is_usb {
-                *existing = pad;
-            }
-        } else {
-            unique.push(pad);
-        }
-    }
-
-    unique
-}
-
-/// Poll DualSense battery (and optionally refresh lightbar).
-///
-/// `force_lightbar`: re-assert RGB even when unchanged (battery / membership polls).
-/// Liveness ticks pass `false` so unchanged colors are skipped.
-pub fn poll_controllers(force_lightbar: bool) -> Result<Vec<ControllerStatus>, String> {
-    // Entire open/read/write under one lock so pulse/spectrum cannot race this pad.
-    with_lightbar_lock(|| poll_controllers_unlocked(force_lightbar))
-}
-
-fn poll_controllers_unlocked(force_lightbar: bool) -> Result<Vec<ControllerStatus>, String> {
-    let api = HidApi::new().map_err(|e| e.to_string())?;
-    let devices: Vec<&DeviceInfo> = api
-        .device_list()
-        .filter(|d| is_dualsense_gamepad(d))
-        .collect();
-
-    if devices.is_empty() {
-        lightbar::sync_lightbar_claims(std::iter::empty::<&str>());
-        return Ok(Vec::new());
-    }
-
-    let mut pads = Vec::with_capacity(devices.len());
-
-    for info in devices {
-        let product = product_name(info.product_id());
-        let hid = hid_serial(info);
-        let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
-
-        match info.open_device(&api).and_then(|device| {
-            let serial = resolve_device_identity(info, &device);
-            let battery = read_battery(&device)?;
-            Ok((device, serial, battery))
-        }) {
-            Ok((device, serial, battery)) => pads.push(PolledPad {
-                status: ControllerStatus {
-                    index: 0,
-                    product,
-                    connection: battery.connection,
-                    serial,
-                    percent: battery.percent,
-                    state: battery.state,
-                },
-                device,
-                is_bluetooth,
-            }),
-            Err(err) => {
-                app_log::warn(format!(
-                    "failed to read {product} (hid serial {hid}): {err}"
-                ));
-            }
-        }
-    }
-
-    let mut pads = dedupe_polled(pads);
-    pads.sort_by(|a, b| a.status.serial.cmp(&b.status.serial));
-    for (i, pad) in pads.iter_mut().enumerate() {
-        pad.status.index = i + 1;
-    }
-
-    lightbar::sync_lightbar_claims(pads.iter().map(|p| p.status.serial.as_str()));
-
-    // Apply lightbar on the same handle used for the battery read.
-    if lightbar::is_enabled() {
-        for pad in &pads {
-            let color = color_for_battery_percent(pad.status.percent);
-            if let Err(err) = lightbar::apply_on_open_device(
-                &pad.device,
-                &pad.status.serial,
-                color,
-                pad.is_bluetooth,
-                force_lightbar,
-            ) {
-                // Reopen clears stuck Windows overlapped I/O after a write timeout.
-                if let Err(retry_err) =
-                    lightbar::apply_lightbar_rgb_unlocked(&pad.status.serial, color, force_lightbar)
-                {
-                    lightbar::warn_lightbar(
-                        pad.status.product,
-                        format!("{err}; retry: {retry_err}"),
-                    );
-                }
-            }
-        }
-    }
-
-    Ok(pads.into_iter().map(|p| p.status).collect())
-}
-
-pub(crate) fn is_dualsense_gamepad(d: &DeviceInfo) -> bool {
-    d.vendor_id() == SONY_VENDOR_ID
-        && matches!(
-            d.product_id(),
-            DUALSENSE_PRODUCT_ID | DUALSENSE_EDGE_PRODUCT_ID
-        )
-        && d.usage_page() == HID_USAGE_PAGE_GENERIC_DESKTOP
-        && d.usage() == HID_USAGE_GAMEPAD
-}
-
-fn product_name(product_id: u16) -> &'static str {
-    match product_id {
-        DUALSENSE_EDGE_PRODUCT_ID => "DualSense Edge",
-        _ => "DualSense",
-    }
-}
-
-fn read_battery(device: &HidDevice) -> Result<BatteryStatus, hidapi::HidError> {
+pub(crate) fn read_battery(device: &HidDevice) -> Result<BatteryReading, hidapi::HidError> {
     let bus_type = device.get_device_info()?.bus_type();
     let (connection, report_size, power_offset, is_bluetooth) = match bus_type {
         BusType::Usb => ("USB", USB_REPORT_SIZE, USB_POWER_OFFSET, false),
@@ -411,7 +191,7 @@ fn read_battery(device: &HidDevice) -> Result<BatteryStatus, hidapi::HidError> {
         let state = PowerState::from_nibble(power >> POWER_STATE_SHIFT);
         let percent = percent_from_level(level, state);
 
-        return Ok(BatteryStatus {
+        return Ok(BatteryReading {
             percent,
             state,
             connection,
@@ -463,22 +243,14 @@ fn build_bt_control_off_report(size: usize, seed: u8) -> Vec<u8> {
     buf
 }
 
-fn is_dualsense_device(d: &DeviceInfo) -> bool {
-    d.vendor_id() == SONY_VENDOR_ID
-        && matches!(
-            d.product_id(),
-            DUALSENSE_PRODUCT_ID | DUALSENSE_EDGE_PRODUCT_ID
-        )
-}
-
 /// Power off a DualSense over Bluetooth (feature report 0x08). USB pads are rejected.
 ///
 /// Windows exposes DualSense as multiple HID interfaces; feature report 0x08 may not be
 /// on the Gamepad usage we use for battery. Try every Bluetooth DualSense interface and
 /// several report sizes/CRC seeds until SetFeature succeeds.
 pub fn power_off_bluetooth(serial: &str) -> Result<(), String> {
-    // Hold the lightbar lock for the whole open/write so we do not race identify/RGB.
-    with_lightbar_lock(|| power_off_bluetooth_unlocked(serial))
+    // Hold the HID lock for the whole open/write so we do not race identify/RGB.
+    dualsense::with_hid_lock(|| power_off_bluetooth_unlocked(serial))
 }
 
 fn power_off_bluetooth_unlocked(serial: &str) -> Result<(), String> {
@@ -604,13 +376,6 @@ mod tests {
         assert!(!pad.is_low_battery(15));
         assert!(pad.is_low_battery(25));
         assert!(pad.is_low_battery(35));
-    }
-
-    #[test]
-    fn mac_from_le_matches_windows_bt_serial_style() {
-        // Feature report stores MAC little-endian; Windows BT serial is big-endian hex.
-        let mac_le = [0x26, 0x69, 0x15, 0x48, 0x46, 0x44];
-        assert_eq!(format_mac_from_le(&mac_le), "444648156926");
     }
 
     #[test]

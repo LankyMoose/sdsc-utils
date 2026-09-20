@@ -51,7 +51,7 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 - Dark **iced** Configure window for notification (including low-battery %), toast-position, autostart, lightbar, and **opt-in battery analytics** settings
 - **Battery analytics** (off by default): learns each DualSense battery step for charge and play, shows remaining-time estimates after one qualifying step (interpolating within the current percent bucket; refining as more steps are observed; mid-cycle unplug/charge does not wipe history), and draws per-controller coverage charts in Settings → Analytics (local `analytics.json` only; open the data folder from Settings → System to inspect or delete files)
 - Detects controllers connecting/disconnecting within a few seconds
-- Lightbar color blends across a customizable **2–5 stop spectrum** (default **blue → purple → red**) as battery drops (updated about once a minute); edit via tray **Settings** with a left-hand tab list. An **Enable lightbar** toggle (on by default) pauses battery-driven colors and the low-battery pulse while leaving Identify available. The Lightbar panel stays fully expanded when active: drag stops along the bar, click empty areas to add stops (up to 5), and drag a stop away to remove it (down to 2). Changes apply immediately.
+- Lightbar color blends across a customizable **2–5 stop spectrum** (default **blue → purple → red**) as battery drops (reasserted about every 5 seconds); edit via tray **Settings** with a left-hand tab list. An **Enable lightbar** toggle (on by default) pauses battery-driven colors and the low-battery pulse while leaving Identify available. The Lightbar panel stays fully expanded when active: drag stops along the bar, click empty areas to add stops (up to 5), and drag a stop away to remove it (down to 2). Changes apply immediately.
 - At **low battery while discharging** (same configurable threshold as the toast; default ≤5%), the lightbar periodically pulses **orange**
 - Icons live in `assets/icons/` (SVG) and are rasterized at build/runtime
 - UI shell is an **iced** daemon (tray via `tray-icon`); Configure, controller popup, and toasts are iced windows
@@ -165,7 +165,7 @@ DualSense firmware reports battery in **11 coarse steps** (0–10). Percentages 
 - **Controller not listed** — wait a few seconds after power-on (presence is scanned every 3s); check the log if open/read fails.
 - **Tray slow to show disconnect** — fixed in 0.1.2 (faster liveness probes). Bluetooth pads can linger in Windows HID briefly after power-off.
 - **Same controller listed twice (USB + Bluetooth)** — fixed in 0.1.3 (MAC-based identity; USB preferred).
-- **Lightbar stuck off or default blue** — fixed in 0.1.6 (separate `LIGHT_OUT` claim, then RGB). If colors stop updating while **Steam is running**, update to 0.1.7 (skips the claim when Steam is open). Test with `--set-lightbar 255 100 0`. If it still fails, check the log for HID write errors.
+- **Lightbar stuck off or default blue** — fixed in 0.1.6 (separate `LIGHT_OUT` claim, then RGB). The app reasserts battery color about every 5s so other software (game launchers, etc.) does not keep the bar after a one-shot overwrite. Test with `--set-lightbar 255 100 0`. If it still fails, check the log for HID write errors.
 
 ## Releases
 

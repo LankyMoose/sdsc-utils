@@ -15,22 +15,34 @@ use crate::configure_view::{
     self, AnalyticsPadRow, AnalyticsPanel, ConfigureMessage, ConfigureSettings, ConfigureState,
     NotificationSetting,
 };
+use crate::dualsense;
 #[cfg(feature = "dev-emulate")]
 use crate::emulate::{self, Preset};
-use crate::icon;
 use crate::known::KnownControllers;
 use crate::lightbar::{
     self, LOW_BATTERY_ORANGE, LOW_BATTERY_PULSE_GAP_MS, LOW_BATTERY_PULSE_ON_MS,
 };
 use crate::notify::{NotifyEvent, NotifyTracker};
 use crate::paths;
+use crate::poll::{
+    self, BATTERY_INTERVAL, LIVENESS_INTERVAL, PRESENCE_INTERVAL, UNREAD_RETRY_INTERVAL,
+};
 use crate::popup_view::{self, ControllerRow, PopupMessage};
-use crate::prefs::{Prefs, ToastPosition, clamp_low_battery_percent};
+use crate::prefs::{Prefs, clamp_low_battery_percent};
 use crate::theme;
 use crate::toast::ToastMessage;
 use crate::toast_view;
+use crate::tray::{self, QUIT_ID, SETTINGS_ID};
+#[cfg(windows)]
+use crate::win32;
+use crate::window_layout::{
+    TOAST_SLIDE_DURATION, ToastPlacement, TrayAnchor, hide_toast, overlay_platform_specific,
+    popup_position, show_toast_without_activate, slide_y, toast_placement,
+    window_platform_specific,
+};
 
 use iced::futures::Stream;
+use iced::futures::StreamExt;
 use iced::futures::channel::{mpsc, oneshot};
 use iced::widget::{container, operation, space};
 use iced::{Element, Point, Size, Subscription, Task, Theme, stream, window};
@@ -42,42 +54,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{
-    MouseButton as TrayMouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
-};
+use tray_icon::TrayIcon;
 
-/// How often to scan for DualSense connect/disconnect.
-const PRESENCE_INTERVAL: Duration = Duration::from_secs(3);
-/// How often to re-read battery / lightbar when membership is stable and pads are readable.
-const BATTERY_INTERVAL: Duration = Duration::from_secs(60);
-/// While the tray shows connected pads, re-probe often so a powered-off BT pad
-/// (still lingering in the HID list) is dropped quickly.
-const LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
-/// When HID lists pads but battery reads keep failing, retry sooner than BATTERY_INTERVAL.
-const UNREAD_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 /// Debounce spectrum prefs save + HID apply after the last color edit.
 const SPECTRUM_DEBOUNCE: Duration = Duration::from_millis(150);
 /// How long an overlay toast stays on screen.
 const TOAST_LIFETIME: Duration = Duration::from_secs(5);
-/// Slide-in / slide-out duration for overlay toasts.
-const TOAST_SLIDE_DURATION: Duration = Duration::from_millis(250);
-/// Gap between the tray icon and the popup.
-const POPUP_GAP: f32 = 8.0;
-/// Minimum distance kept from any screen edge.
-const SCREEN_MARGIN: f32 = 8.0;
-
-const QUIT_ID: &str = "quit";
-const SETTINGS_ID: &str = "settings";
-
-/// Screen rectangle of the tray icon, in physical pixels.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TrayAnchor {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -237,7 +219,7 @@ impl App {
             notify: NotifyTracker::new(),
             analytics,
             controllers: Vec::new(),
-            last_discovered: battery::list_controller_serials().unwrap_or_default(),
+            last_discovered: dualsense::list_presence_paths().unwrap_or_default(),
             last_battery_poll: Instant::now(),
             identifying,
             refreshing: Arc::new(AtomicBool::new(false)),
@@ -277,7 +259,7 @@ impl App {
         app.sync_low_battery();
         app.refresh_analytics_panel();
 
-        let task = Task::batch([app.request_refresh(true), app.ensure_toast_window()]);
+        let task = Task::batch([app.request_refresh(), app.ensure_toast_window()]);
         (app, task)
     }
 
@@ -305,7 +287,7 @@ impl App {
                 _ => None,
             }),
             iced::time::every(PRESENCE_INTERVAL).map(|_| Message::Tick),
-            Subscription::run(tray_events),
+            Subscription::run(tray_events_mapped),
         ];
 
         if self.toast_message.is_some() {
@@ -448,28 +430,12 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn create_tray(&mut self) {
-        let menu = Menu::new();
-        let _ = menu.append(&MenuItem::with_id(SETTINGS_ID, "Settings", true, None));
-        let _ = menu.append(&MenuItem::with_id(QUIT_ID, "Exit", true, None));
-
-        match TrayIconBuilder::new()
-            .with_tooltip(icon::tooltip_for_controllers(&self.controllers))
-            .with_icon(icon::icon_for_controllers(&self.controllers))
-            .with_menu(Box::new(menu))
-            .with_menu_on_left_click(false)
-            .build()
-        {
-            Ok(tray) => self.tray_icon = Some(tray),
-            Err(err) => app_log::error(format!("failed to create tray icon: {err}")),
-        }
+        self.tray_icon = tray::create_tray(&self.controllers);
     }
 
     fn apply_tray(&mut self) -> Task<Message> {
-        let icon = icon::icon_for_controllers(&self.controllers);
-        let tooltip = icon::tooltip_for_controllers(&self.controllers);
-        if let Some(tray) = self.tray_icon.as_mut() {
-            let _ = tray.set_icon(Some(icon));
-            let _ = tray.set_tooltip(Some(tooltip));
+        if let Some(tray_icon) = self.tray_icon.as_mut() {
+            tray::apply_tray(tray_icon, &self.controllers);
         }
         self.sync_popup_rows_and_fit()
     }
@@ -488,7 +454,7 @@ impl App {
             return Task::none();
         }
 
-        let discovered = match battery::list_controller_serials() {
+        let discovered = match dualsense::list_presence_paths() {
             Ok(serials) => serials,
             Err(err) => {
                 app_log::warn(format!("presence scan failed: {err}"));
@@ -502,6 +468,9 @@ impl App {
         // HID list went empty — update the tray immediately. A powered-off DualSense
         // often disappears from enumeration well before the next battery poll.
         if membership_changed && self.last_discovered.is_empty() {
+            // Presence-only clear never runs HID poll; drop claims so reconnect
+            // always gets LIGHT_OUT + RGB.
+            lightbar::sync_lightbar_claims(std::iter::empty::<&str>());
             let task = if self.controllers.is_empty() {
                 Task::none()
             } else {
@@ -521,15 +490,15 @@ impl App {
             && self.last_battery_poll.elapsed() >= UNREAD_RETRY_INTERVAL;
 
         if membership_changed || battery_due || liveness_due || unread_retry {
-            // Re-assert lightbar on battery/membership; skip unchanged RGB on liveness-only.
-            let force_lightbar = membership_changed || battery_due || unread_retry;
-            self.request_refresh(force_lightbar)
+            // Reassert lightbar on every poll (~5s liveness included) so other HID
+            // writers (game launchers, etc.) do not keep the bar after a one-shot overwrite.
+            self.request_refresh()
         } else {
             Task::none()
         }
     }
 
-    fn request_refresh(&mut self, force_lightbar: bool) -> Task<Message> {
+    fn request_refresh(&mut self) -> Task<Message> {
         #[cfg(feature = "dev-emulate")]
         if self.emulating {
             return Task::none();
@@ -546,8 +515,10 @@ impl App {
             return Task::none();
         }
 
+        let previously_connected: Vec<String> =
+            self.controllers.iter().map(|c| c.serial.clone()).collect();
         Task::perform(
-            spawn_blocking(move || battery::poll_controllers(force_lightbar)),
+            spawn_blocking(move || poll::poll_controllers(&previously_connected)),
             |outcome| Message::PollResult(outcome.unwrap_or_else(Err)),
         )
     }
@@ -649,7 +620,7 @@ impl App {
             rows.push(ControllerRow::connected(
                 controller,
                 self.known.is_remembered(&controller.serial),
-                KnownControllers::is_storable_serial(&controller.serial)
+                dualsense::is_storable_serial(&controller.serial)
                     && !is_emulated_serial(&controller.serial),
                 self.known.nickname(&controller.serial).map(str::to_string),
                 threshold,
@@ -1001,7 +972,7 @@ impl App {
     }
 
     fn on_spectrum_commit(&mut self, generation: u64) -> Task<Message> {
-        if !lightbar::spectrum_commit_is_current(self.spectrum_generation, generation) {
+        if self.spectrum_generation != generation {
             return Task::none();
         }
 
@@ -1139,7 +1110,7 @@ impl App {
             self.dev_paused_percent = None;
             let task = self.apply_controllers(Vec::new());
             self.last_battery_poll = Instant::now();
-            return task.chain(self.request_refresh(true));
+            return task.chain(self.request_refresh());
         }
 
         if preset.is_analytics() && !self.prefs.analytics_enabled {
@@ -1375,7 +1346,7 @@ impl App {
 }
 
 // ---------------------------------------------------------------------------
-// Window placement
+// Window placement (message-producing wrappers)
 // ---------------------------------------------------------------------------
 
 fn place_popup(id: window::Id) -> Task<Message> {
@@ -1388,309 +1359,11 @@ fn place_toast(id: window::Id) -> Task<Message> {
     window::monitor_size(id).map(move |monitor| Message::PlaceToast { id, monitor })
 }
 
-/// Show the overlay toast without activating it (so a game keeps focus).
-///
-/// iced/`set_mode(Windowed)` maps to `ShowWindow(SW_SHOW)`, which steals the
-/// foreground. On Windows we apply `WS_EX_NOACTIVATE` and show with
-/// `SW_SHOWNOACTIVATE` instead.
-fn show_toast_without_activate(id: window::Id) -> Task<Message> {
-    #[cfg(windows)]
-    {
-        window::run(id, |window| {
-            use window::raw_window_handle::RawWindowHandle;
-
-            let Ok(handle) = window.window_handle() else {
-                return;
-            };
-            let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
-                return;
-            };
-            let hwnd = win32_handle.hwnd.get();
-            unsafe {
-                win32::apply_noactivate_exstyle(hwnd);
-                win32::ShowWindow(hwnd, win32::SW_SHOWNOACTIVATE);
-            }
-        })
-        .discard()
-    }
-    #[cfg(not(windows))]
-    {
-        window::set_mode(id, window::Mode::Windowed)
-    }
-}
-
-/// Hide the overlay toast without going through iced `set_mode(Hidden)`.
-///
-/// On Windows the toast is shown via raw `ShowWindow`, so winit's `VISIBLE`
-/// flag stays false; `set_mode(Hidden)` would then be a no-op and leave the
-/// toast on screen.
-fn hide_toast(id: window::Id) -> Task<Message> {
-    #[cfg(windows)]
-    {
-        window::run(id, |window| {
-            use window::raw_window_handle::RawWindowHandle;
-
-            let Ok(handle) = window.window_handle() else {
-                return;
-            };
-            let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
-                return;
-            };
-            let hwnd = win32_handle.hwnd.get();
-            unsafe {
-                win32::ShowWindow(hwnd, win32::SW_HIDE);
-            }
-        })
-        .discard()
-    }
-    #[cfg(not(windows))]
-    {
-        window::set_mode(id, window::Mode::Hidden)
-    }
-}
-
-fn popup_position(anchor: TrayAnchor, scale: f32, monitor: Option<Size>, size: Size) -> Point {
-    let scale = if scale > 0.0 { scale } else { 1.0 };
-    let anchor_x = anchor.x / scale;
-    let anchor_y = anchor.y / scale;
-    let anchor_w = anchor.width / scale;
-    let anchor_h = anchor.height / scale;
-
-    let mut x = anchor_x + anchor_w / 2.0 - size.width / 2.0;
-    let mut y = anchor_y - size.height - POPUP_GAP;
-
-    if let Some(monitor) = monitor {
-        // A tray at the top of the screen leaves no room above it.
-        if y < SCREEN_MARGIN {
-            y = anchor_y + anchor_h + POPUP_GAP;
-        }
-        x = clamp_axis(x, size.width, monitor.width);
-        y = clamp_axis(y, size.height, monitor.height);
-    }
-
-    Point::new(x.max(0.0), y.max(0.0))
-}
-
-fn toast_placement(position: ToastPosition, monitor: Option<Size>) -> ToastPlacement {
-    toast_placement_in(position, resolve_toast_area(monitor))
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ToastArea {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ToastPlacement {
-    x: f32,
-    target_y: f32,
-    outside_y: f32,
-}
-
-fn resolve_toast_area(monitor: Option<Size>) -> ToastArea {
-    #[cfg(windows)]
-    if let Some(area) = primary_toast_area() {
-        return area;
-    }
-
-    match monitor {
-        Some(size) => ToastArea {
-            x: 0.0,
-            y: 0.0,
-            width: size.width,
-            height: size.height,
-        },
-        None => ToastArea {
-            x: 0.0,
-            y: 0.0,
-            width: 1920.0,
-            height: 1080.0,
-        },
-    }
-}
-
-fn toast_placement_in(position: ToastPosition, area: ToastArea) -> ToastPlacement {
-    let target = toast_position_in(position, area);
-    let outside_y = match position {
-        ToastPosition::TopLeft | ToastPosition::TopCenter | ToastPosition::TopRight => {
-            area.y - toast_view::HEIGHT
-        }
-        ToastPosition::BottomLeft | ToastPosition::BottomCenter | ToastPosition::BottomRight => {
-            area.y + area.height
-        }
-    };
-    ToastPlacement {
-        x: target.x,
-        target_y: target.y,
-        outside_y,
-    }
-}
-
-fn toast_position_in(position: ToastPosition, area: ToastArea) -> Point {
-    let width = toast_view::WIDTH;
-    let height = toast_view::HEIGHT;
-    let margin = toast_view::MARGIN;
-
-    let x = match position {
-        ToastPosition::TopLeft | ToastPosition::BottomLeft => area.x + margin,
-        ToastPosition::TopCenter | ToastPosition::BottomCenter => {
-            area.x + (area.width - width) / 2.0
-        }
-        ToastPosition::TopRight | ToastPosition::BottomRight => {
-            area.x + area.width - width - margin
-        }
-    };
-
-    let y = match position {
-        ToastPosition::TopLeft | ToastPosition::TopCenter | ToastPosition::TopRight => {
-            area.y + margin
-        }
-        ToastPosition::BottomLeft | ToastPosition::BottomCenter | ToastPosition::BottomRight => {
-            area.y + area.height - height - margin
-        }
-    };
-
-    Point::new(x.max(0.0), y.max(0.0))
-}
-
-fn slide_y(placement: ToastPlacement, progress: f32, dismissing: bool) -> f32 {
-    let eased = ease_out_cubic(progress.clamp(0.0, 1.0));
-    let t = if dismissing { 1.0 - eased } else { eased };
-    placement.outside_y + (placement.target_y - placement.outside_y) * t
-}
-
-fn ease_out_cubic(progress: f32) -> f32 {
-    1.0 - (1.0 - progress).powi(3)
-}
-
-/// Primary-monitor toast target in logical pixels.
-///
-/// Uses the Windows work area so a visible taskbar is cleared, while an
-/// auto-hide taskbar (which does not reserve work-area space) lets bottom
-/// toasts sit near the screen edge. Fullscreen apps get the full monitor.
-#[cfg(windows)]
-fn primary_toast_area() -> Option<ToastArea> {
-    unsafe {
-        let monitor =
-            win32::MonitorFromPoint(win32::Point { x: 0, y: 0 }, win32::MONITOR_DEFAULTTOPRIMARY);
-        if monitor == 0 {
-            return None;
-        }
-
-        let mut info = win32::MonitorInfo {
-            size: std::mem::size_of::<win32::MonitorInfo>() as u32,
-            monitor: win32::Rect::default(),
-            work: win32::Rect::default(),
-            flags: 0,
-        };
-        if win32::GetMonitorInfoW(monitor, &mut info) == 0 {
-            return None;
-        }
-
-        let foreground = win32::GetForegroundWindow();
-        let mut foreground_rect = win32::Rect::default();
-        let got_foreground =
-            foreground != 0 && win32::GetWindowRect(foreground, &mut foreground_rect) != 0;
-        let fullscreen = got_foreground
-            && foreground_rect.left <= info.monitor.left + 2
-            && foreground_rect.top <= info.monitor.top + 2
-            && foreground_rect.right >= info.monitor.right - 2
-            && foreground_rect.bottom >= info.monitor.bottom - 2;
-
-        let area = if fullscreen { info.monitor } else { info.work };
-
-        let mut dpi_x = 0u32;
-        let mut dpi_y = 0u32;
-        let dpi_ok =
-            win32::GetDpiForMonitor(monitor, win32::MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) == 0
-                && dpi_x > 0;
-        let scale = if dpi_ok { dpi_x as f32 / 96.0 } else { 1.0 };
-
-        Some(ToastArea {
-            x: area.left as f32 / scale,
-            y: area.top as f32 / scale,
-            width: (area.right - area.left).max(1) as f32 / scale,
-            height: (area.bottom - area.top).max(1) as f32 / scale,
-        })
-    }
-}
-
-fn clamp_axis(value: f32, extent: f32, available: f32) -> f32 {
-    let max = (available - extent - SCREEN_MARGIN).max(SCREEN_MARGIN);
-    value.clamp(SCREEN_MARGIN, max)
-}
-
-#[cfg(target_os = "windows")]
-fn overlay_platform_specific() -> window::settings::PlatformSpecific {
-    window::settings::PlatformSpecific {
-        drag_and_drop: false,
-        skip_taskbar: true,
-        undecorated_shadow: false,
-        corner_preference: window::settings::platform::CornerPreference::Round,
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn overlay_platform_specific() -> window::settings::PlatformSpecific {
-    window::settings::PlatformSpecific::default()
-}
-
-#[cfg(target_os = "windows")]
-fn window_platform_specific() -> window::settings::PlatformSpecific {
-    window::settings::PlatformSpecific {
-        drag_and_drop: false,
-        skip_taskbar: false,
-        // Match the popup: DWM undecorated shadows flash white on close when the
-        // wgpu surface is destroyed before the HWND is gone.
-        undecorated_shadow: false,
-        corner_preference: window::settings::platform::CornerPreference::Round,
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn window_platform_specific() -> window::settings::PlatformSpecific {
-    window::settings::PlatformSpecific::default()
-}
-
-// ---------------------------------------------------------------------------
-// Subscriptions
-// ---------------------------------------------------------------------------
-
-/// Bridges the global `tray-icon` / `muda` event handlers into the iced runtime.
-///
-/// Both handlers are backed by a `OnceLock`, so this stream must be created
-/// exactly once for the lifetime of the process.
-fn tray_events() -> impl Stream<Item = Message> {
-    stream::channel(64, async move |output: mpsc::Sender<Message>| {
-        let menu_output = output.clone();
-        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            // Every clone owns a guaranteed slot, so `try_send` cannot be starved.
-            let _ = menu_output.clone().try_send(Message::TrayMenu(event.id.0));
-        }));
-
-        let icon_output = output.clone();
-        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-            if let TrayIconEvent::Click {
-                rect,
-                button: TrayMouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                let anchor = TrayAnchor {
-                    x: rect.position.x as f32,
-                    y: rect.position.y as f32,
-                    width: rect.size.width as f32,
-                    height: rect.size.height as f32,
-                };
-                let _ = icon_output.clone().try_send(Message::TrayLeftClick(anchor));
-            }
-        }));
-
-        std::future::pending::<()>().await;
+/// Map tray events into iced `Message` values.
+fn tray_events_mapped() -> impl Stream<Item = Message> {
+    tray::tray_events().map(|event| match event {
+        tray::TrayEvent::Menu(id) => Message::TrayMenu(id),
+        tray::TrayEvent::LeftClick(anchor) => Message::TrayLeftClick(anchor),
     })
 }
 
@@ -1739,132 +1412,6 @@ async fn wait_for_escape() -> Option<()> {
 #[cfg(not(windows))]
 async fn wait_for_escape() -> Option<()> {
     std::future::pending::<()>().await
-}
-
-#[cfg(windows)]
-mod win32 {
-    pub const MOD_NOREPEAT: u32 = 0x4000;
-    pub const VK_ESCAPE: u32 = 0x1B;
-    pub const HOTKEY_ID: i32 = 0x4454;
-    pub const WM_HOTKEY: u32 = 0x0312;
-    pub const WM_QUIT: u32 = 0x0012;
-    pub const MONITOR_DEFAULTTOPRIMARY: u32 = 1;
-    pub const MDT_EFFECTIVE_DPI: u32 = 0;
-
-    pub const GWL_EXSTYLE: i32 = -20;
-    pub const WS_EX_NOACTIVATE: isize = 0x0800_0000;
-    pub const SW_HIDE: i32 = 0;
-    pub const SW_SHOWNOACTIVATE: i32 = 4;
-    pub const HWND_TOPMOST: isize = -1;
-    pub const SWP_NOSIZE: u32 = 0x0001;
-    pub const SWP_NOMOVE: u32 = 0x0002;
-    pub const SWP_NOACTIVATE: u32 = 0x0010;
-    pub const SWP_FRAMECHANGED: u32 = 0x0020;
-
-    #[derive(Clone, Copy, Default)]
-    #[repr(C)]
-    pub struct Point {
-        pub x: i32,
-        pub y: i32,
-    }
-
-    #[derive(Clone, Copy, Default)]
-    #[repr(C)]
-    pub struct Rect {
-        pub left: i32,
-        pub top: i32,
-        pub right: i32,
-        pub bottom: i32,
-    }
-
-    #[repr(C)]
-    pub struct MonitorInfo {
-        pub size: u32,
-        pub monitor: Rect,
-        pub work: Rect,
-        pub flags: u32,
-    }
-
-    #[derive(Clone, Copy, Default)]
-    #[repr(C)]
-    pub struct Message {
-        pub hwnd: isize,
-        pub message: u32,
-        pub w_param: usize,
-        pub l_param: isize,
-        pub time: u32,
-        pub pt: Point,
-    }
-
-    /// Posts `WM_QUIT` to the hotkey worker when the awaiting future is dropped.
-    pub struct ThreadQuitGuard(pub u32);
-
-    impl Drop for ThreadQuitGuard {
-        fn drop(&mut self) {
-            if self.0 != 0 {
-                unsafe {
-                    PostThreadMessageW(self.0, WM_QUIT, 0, 0);
-                }
-            }
-        }
-    }
-
-    /// Mark `hwnd` as non-activating and reaffirm always-on-top without focus.
-    pub unsafe fn apply_noactivate_exstyle(hwnd: isize) {
-        unsafe {
-            let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE);
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-            );
-        }
-    }
-
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        pub fn RegisterHotKey(hwnd: isize, id: i32, modifiers: u32, key: u32) -> i32;
-        pub fn UnregisterHotKey(hwnd: isize, id: i32) -> i32;
-        pub fn GetMessageW(message: *mut Message, hwnd: isize, min: u32, max: u32) -> i32;
-        pub fn PostThreadMessageW(thread: u32, message: u32, w_param: usize, l_param: isize)
-        -> i32;
-        pub fn MonitorFromPoint(point: Point, flags: u32) -> isize;
-        pub fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
-        pub fn GetForegroundWindow() -> isize;
-        pub fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
-        pub fn GetWindowLongW(hwnd: isize, index: i32) -> isize;
-        pub fn SetWindowLongW(hwnd: isize, index: i32, value: isize) -> isize;
-        pub fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
-        pub fn SetWindowPos(
-            hwnd: isize,
-            insert_after: isize,
-            x: i32,
-            y: i32,
-            cx: i32,
-            cy: i32,
-            flags: u32,
-        ) -> i32;
-    }
-
-    #[link(name = "shcore")]
-    unsafe extern "system" {
-        pub fn GetDpiForMonitor(
-            monitor: isize,
-            dpi_type: u32,
-            dpi_x: *mut u32,
-            dpi_y: *mut u32,
-        ) -> i32;
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        pub fn GetCurrentThreadId() -> u32;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1970,86 +1517,4 @@ fn controllers_equivalent(a: &[ControllerStatus], b: &[ControllerStatus]) -> boo
             && x.connection == y.connection
             && x.product == y.product
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn popup_is_anchored_above_a_bottom_right_tray() {
-        let anchor = TrayAnchor {
-            x: 1800.0,
-            y: 1040.0,
-            width: 24.0,
-            height: 24.0,
-        };
-        let position = popup_position(
-            anchor,
-            1.0,
-            Some(Size::new(1920.0, 1080.0)),
-            Size::new(360.0, 200.0),
-        );
-        assert!(position.y < 1040.0);
-        assert!(position.x + 360.0 <= 1920.0);
-    }
-
-    #[test]
-    fn popup_flips_below_a_top_anchored_tray() {
-        let anchor = TrayAnchor {
-            x: 100.0,
-            y: 0.0,
-            width: 24.0,
-            height: 24.0,
-        };
-        let position = popup_position(
-            anchor,
-            1.0,
-            Some(Size::new(1920.0, 1080.0)),
-            Size::new(360.0, 200.0),
-        );
-        assert!(position.y >= 24.0);
-    }
-
-    #[test]
-    fn toast_positions_respect_the_requested_corner() {
-        let area = ToastArea {
-            x: 0.0,
-            y: 0.0,
-            width: 1920.0,
-            height: 1080.0,
-        };
-        let top_left = toast_position_in(ToastPosition::TopLeft, area);
-        let bottom_right = toast_position_in(ToastPosition::BottomRight, area);
-        assert!(top_left.x < bottom_right.x);
-        assert!(top_left.y < bottom_right.y);
-    }
-
-    #[test]
-    fn bottom_toasts_use_a_single_edge_margin() {
-        let area = ToastArea {
-            x: 0.0,
-            y: 0.0,
-            width: 1920.0,
-            height: 1080.0,
-        };
-        let bottom = toast_position_in(ToastPosition::BottomCenter, area);
-        let expected_y = area.height - toast_view::HEIGHT - toast_view::MARGIN;
-        assert!((bottom.y - expected_y).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn toast_slide_eases_from_outside_to_target() {
-        let placement = ToastPlacement {
-            x: 10.0,
-            target_y: 100.0,
-            outside_y: 200.0,
-        };
-        assert!((slide_y(placement, 0.0, false) - 200.0).abs() < f32::EPSILON);
-        assert!((slide_y(placement, 1.0, false) - 100.0).abs() < f32::EPSILON);
-        assert!((slide_y(placement, 0.0, true) - 100.0).abs() < f32::EPSILON);
-        assert!((slide_y(placement, 1.0, true) - 200.0).abs() < f32::EPSILON);
-        let mid = slide_y(placement, 0.5, false);
-        assert!(mid < 150.0, "ease-out should be past the midpoint by t=0.5");
-    }
 }
