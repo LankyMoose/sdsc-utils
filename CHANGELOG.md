@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Split Settings canvas programs into `configure_view/{mod,spectrum,coverage}.rs` (no behavior change).
+
+
 ## [1.3.2] - 2026-09-18
 
 ### Fixed
