@@ -14,11 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Default lightbar spectrum is `#0101FE` → `#8704FF` → `#FF0101` (full / mid / empty).
 - Removed unused lightbar skip-unchanged / `force` poll knobs; polls always reassert after claim-once.
 - HID layering: shared `dualsense` identity + lock; `battery` read-only; `poll` orchestrates read then lightbar apply under one lock.
-- Thinned the iced daemon: tray, window placement, and Win32 FFI live in dedicated modules.
+- Thinned the iced daemon: tray, window placement, and Win32 FFI live in dedicated modules; Settings canvas programs split under `configure_view`.
 - Presence scans use path keys (`list_presence_paths`); storable-serial checks go through `dualsense::is_storable_serial`.
-
 
 ## [1.3.2] - 2026-09-18
 
