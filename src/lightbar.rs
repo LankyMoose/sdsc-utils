@@ -1,11 +1,10 @@
-//! DualSense lightbar HID output (serialized DualSense HID I/O).
+//! DualSense lightbar HID output.
 
 use crate::app_log;
-use crate::battery::{is_dualsense_gamepad, normalize_identity, resolve_device_identity};
 use crate::color::{Rgb, color_for_battery_percent};
-use crate::steam;
+use crate::dualsense::{self, is_dualsense_gamepad, normalize_identity, resolve_device_identity};
 use hidapi::{BusType, HidApi, HidDevice};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
@@ -55,19 +54,13 @@ pub const LOW_BATTERY_PULSE_ON_MS: u64 = 400;
 pub const LOW_BATTERY_PULSE_GAP_MS: u64 = 1600;
 pub const LOW_BATTERY_ORANGE: Rgb = Rgb::ORANGE;
 
-/// Serializes all DualSense HID open/read/write/close (battery poll + lightbar).
-static HID_IO_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes DualSense lightbar claim tracking (I/O lock lives in [`crate::dualsense`]).
 static BT_OUTPUT_SEQ: AtomicU8 = AtomicU8::new(0);
 /// When false, automatic battery/poll/pulse RGB writes are skipped (Identify / CLI still work).
 static AUTOMATIC_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Serials that have already received a `LIGHT_OUT` claim this connection.
 static CLAIMED_SERIALS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
-/// Last observed Steam running state; forget claims when it changes.
-static LAST_STEAM_RUNNING: LazyLock<Mutex<Option<bool>>> = LazyLock::new(|| Mutex::new(None));
-/// Last successfully written RGB per pad (skip redundant poll rewrites).
-static LAST_APPLIED: LazyLock<Mutex<HashMap<String, Rgb>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Enable or disable automatic lightbar RGB (poll + low-battery pulse).
 pub fn set_enabled(enabled: bool) {
@@ -84,7 +77,7 @@ fn next_bt_seq_tag() -> u8 {
     seq << 4
 }
 
-/// Drop claims (and last-applied colors) for pads that are no longer present.
+/// Drop claims for pads that are no longer present.
 pub fn sync_lightbar_claims(active_serials: impl IntoIterator<Item = impl AsRef<str>>) {
     let active: HashSet<String> = active_serials
         .into_iter()
@@ -93,42 +86,16 @@ pub fn sync_lightbar_claims(active_serials: impl IntoIterator<Item = impl AsRef<
     if let Ok(mut claimed) = CLAIMED_SERIALS.lock() {
         claimed.retain(|s| active.contains(s));
     }
-    if let Ok(mut last) = LAST_APPLIED.lock() {
-        last.retain(|s, _| active.contains(s));
-    }
 }
 
-/// Drop all `LIGHT_OUT` claims (e.g. Steam started/stopped).
+/// Drop all `LIGHT_OUT` claims (e.g. CLI force-reapply).
 fn forget_all_claims() {
     if let Ok(mut claimed) = CLAIMED_SERIALS.lock() {
         claimed.clear();
     }
-    if let Ok(mut last) = LAST_APPLIED.lock() {
-        last.clear();
-    }
-}
-
-/// Forget claims when Steam starts or stops so the next write picks the right path.
-fn sync_steam_transition() {
-    let running = steam::is_running();
-    let mut last = LAST_STEAM_RUNNING.lock().unwrap_or_else(|e| e.into_inner());
-    match *last {
-        None => *last = Some(running),
-        Some(prev) if prev != running => {
-            forget_all_claims();
-            *last = Some(running);
-        }
-        Some(_) => {}
-    }
 }
 
 fn take_claim_if_needed(serial: &str) -> bool {
-    sync_steam_transition();
-    if steam::is_running() {
-        // Steam Input already initialized the lightbar; RGB-only writes work.
-        return false;
-    }
-
     let Ok(mut claimed) = CLAIMED_SERIALS.lock() else {
         return true;
     };
@@ -141,23 +108,13 @@ fn forget_claim(serial: &str) {
     }
 }
 
-fn record_last_applied(serial: &str, color: Rgb) {
-    if let Ok(mut last) = LAST_APPLIED.lock() {
-        last.insert(normalize_identity(serial), color);
-    }
-}
-
-fn last_applied_matches(serial: &str, color: Rgb) -> bool {
-    LAST_APPLIED
-        .lock()
-        .ok()
-        .and_then(|last| last.get(&normalize_identity(serial)).copied())
-        .is_some_and(|prev| prev == color)
-}
-
-/// Whether a poll/spectrum write can be skipped (same RGB, no pending claim).
-pub(crate) fn should_skip_rgb_write(serial: &str, color: Rgb, claim: bool, force: bool) -> bool {
-    !force && !claim && last_applied_matches(serial, color)
+/// Drop the claim for `serial` so the next apply runs `LIGHT_OUT` then RGB.
+///
+/// Used when a pad newly appears in the live set: presence can clear the tray
+/// without a HID poll, which would otherwise leave a stale claim and skip
+/// reclaim on Bluetooth reconnect.
+pub fn prepare_connect_apply(serial: &str) {
+    forget_claim(serial);
 }
 
 fn is_retryable_write_error(err: &impl std::fmt::Display) -> bool {
@@ -167,36 +124,25 @@ fn is_retryable_write_error(err: &impl std::fmt::Display) -> bool {
         || text.contains("Overlapped I/O")
 }
 
-/// Whether a debounced spectrum commit generation is still current.
-pub fn spectrum_commit_is_current(current: u64, commit: u64) -> bool {
-    current == commit
-}
-
 /// Apply a lightbar color to the controller with the given serial.
 pub fn apply_lightbar_rgb(serial: &str, color: Rgb) -> Result<(), String> {
-    let _guard = HID_IO_LOCK
-        .lock()
-        .map_err(|_| "lightbar lock poisoned".to_string())?;
-    apply_lightbar_rgb_unlocked(serial, color, true)
+    let _guard = dualsense::lock_hid()?;
+    apply_lightbar_rgb_unlocked(serial, color)
 }
 
-/// Apply lightbar while already holding [`HID_IO_LOCK`] (poll / identify).
-pub(crate) fn apply_lightbar_rgb_unlocked(
-    serial: &str,
-    color: Rgb,
-    force: bool,
-) -> Result<(), String> {
-    match try_apply_by_serial(serial, color, force) {
+/// Apply lightbar while already holding the HID I/O lock (poll / identify).
+pub(crate) fn apply_lightbar_rgb_unlocked(serial: &str, color: Rgb) -> Result<(), String> {
+    match try_apply_by_serial(serial, color) {
         Ok(()) => Ok(()),
         Err(err) if is_retryable_write_error(&err) => {
             thread::sleep(WRITE_RETRY_DELAY);
-            try_apply_by_serial(serial, color, force)
+            try_apply_by_serial(serial, color)
         }
         Err(err) => Err(err),
     }
 }
 
-fn try_apply_by_serial(serial: &str, color: Rgb, force: bool) -> Result<(), String> {
+fn try_apply_by_serial(serial: &str, color: Rgb) -> Result<(), String> {
     let api = HidApi::new().map_err(|e| e.to_string())?;
     let target = normalize_identity(serial);
 
@@ -223,28 +169,21 @@ fn try_apply_by_serial(serial: &str, color: Rgb, force: bool) -> Result<(), Stri
     }
 
     let (device, is_bluetooth, _) = best.ok_or_else(|| format!("controller {serial} not found"))?;
-    apply_on_open_device(&device, &target, color, is_bluetooth, force)
+    apply_on_open_device(&device, &target, color, is_bluetooth)
 }
 
-/// Write lightbar on an already-open handle (caller must hold [`HID_IO_LOCK`]).
+/// Write lightbar on an already-open handle (caller must hold the HID I/O lock).
 pub fn apply_on_open_device(
     device: &HidDevice,
     serial: &str,
     color: Rgb,
     is_bluetooth: bool,
-    force: bool,
 ) -> Result<(), String> {
     let target = normalize_identity(serial);
     let claim = take_claim_if_needed(&target);
-    if should_skip_rgb_write(&target, color, claim, force) {
-        return Ok(());
-    }
 
     match set_lightbar_on_device(device, color, is_bluetooth, claim) {
-        Ok(()) => {
-            record_last_applied(&target, color);
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(err) => {
             // Claim may have partially completed; forget so the next attempt reclaims.
             // Do not RGB-write after a failed claim/write on this handle — caller should
@@ -257,7 +196,7 @@ pub fn apply_on_open_device(
     }
 }
 
-/// Write lightbar while already holding [`HID_IO_LOCK`] (used during poll).
+/// Write lightbar while already holding the HID I/O lock (used during poll).
 ///
 /// Bluetooth DualSense ignores RGB until the lightbar is reconfigured with a
 /// dedicated `LIGHT_OUT` setup report (same as Linux `hid-playstation`). Color is
@@ -329,24 +268,16 @@ fn build_bt_report(fill_common: impl FnOnce(&mut [u8])) -> [u8; OUTPUT_REPORT_BT
     report
 }
 
-/// Hold the DualSense HID I/O lock for a closure (poll / power-off path).
-pub fn with_lightbar_lock<T>(f: impl FnOnce() -> T) -> T {
-    let _guard = HID_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    f()
-}
-
 /// Flash white, then restore battery color, five times (lock held for the sequence).
 pub fn identify_controller(serial: &str, percent: u8) -> Result<(), String> {
     let normal = color_for_battery_percent(percent);
     let flash_for = Duration::from_millis(IDENTIFY_FLASH_MS);
-    let _guard = HID_IO_LOCK
-        .lock()
-        .map_err(|_| "lightbar lock poisoned".to_string())?;
+    let _guard = dualsense::lock_hid()?;
 
     for _ in 0..IDENTIFY_FLASH_COUNT {
-        apply_lightbar_rgb_unlocked(serial, Rgb::WHITE, true)?;
+        apply_lightbar_rgb_unlocked(serial, Rgb::WHITE)?;
         thread::sleep(flash_for);
-        apply_lightbar_rgb_unlocked(serial, normal, true)?;
+        apply_lightbar_rgb_unlocked(serial, normal)?;
         thread::sleep(flash_for);
     }
 
@@ -354,20 +285,13 @@ pub fn identify_controller(serial: &str, percent: u8) -> Result<(), String> {
 }
 
 /// Apply a color to every connected DualSense (CLI / debug).
-/// Re-claims with `LIGHT_OUT` when Steam is not running.
+/// Clears claims so each pad receives a fresh `LIGHT_OUT` then RGB.
 pub fn apply_lightbar_all(color: Rgb) -> Result<usize, String> {
     let api = HidApi::new().map_err(|e| e.to_string())?;
     let mut applied = 0usize;
-    let _guard = HID_IO_LOCK
-        .lock()
-        .map_err(|_| "lightbar lock poisoned".to_string())?;
+    let _guard = dualsense::lock_hid()?;
 
-    if let Ok(mut claimed) = CLAIMED_SERIALS.lock() {
-        claimed.clear();
-    }
-    if let Ok(mut last) = LAST_APPLIED.lock() {
-        last.clear();
-    }
+    forget_all_claims();
 
     for info in api.device_list().filter(|d| is_dualsense_gamepad(d)) {
         let device = match info.open_device(&api) {
@@ -379,7 +303,7 @@ pub fn apply_lightbar_all(color: Rgb) -> Result<usize, String> {
         };
         let serial = resolve_device_identity(info, &device);
         let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
-        match apply_on_open_device(&device, &serial, color, is_bluetooth, true) {
+        match apply_on_open_device(&device, &serial, color, is_bluetooth) {
             Ok(()) => applied += 1,
             Err(err) => {
                 app_log::warn(format!("lightbar write failed: {err}"));
@@ -437,22 +361,9 @@ mod tests {
         assert!(report[74..78].iter().any(|&b| b != 0));
     }
 
-    fn reset_claim_test_state(steam_running: bool) {
-        steam::set_running_for_test(Some(steam_running));
-        forget_all_claims();
-        *LAST_STEAM_RUNNING.lock().unwrap() = None;
-    }
-
-    fn clear_claim_test_state() {
-        steam::set_running_for_test(None);
-        forget_all_claims();
-        *LAST_STEAM_RUNNING.lock().unwrap() = None;
-    }
-
     #[test]
-    fn claim_tracking_and_steam_behavior() {
-        // Single test so the shared Steam override is not raced by parallel runners.
-        reset_claim_test_state(false);
+    fn claim_once_per_connection() {
+        forget_all_claims();
 
         sync_lightbar_claims(std::iter::empty::<&str>());
         assert!(take_claim_if_needed("aabbcc"));
@@ -463,44 +374,12 @@ mod tests {
         assert!(take_claim_if_needed("aabbcc"));
         sync_lightbar_claims(std::iter::empty::<&str>());
 
-        reset_claim_test_state(false);
-        assert!(take_claim_if_needed("aabbcc"));
-        assert!(!take_claim_if_needed("aabbcc"));
-
-        reset_claim_test_state(true);
-        assert!(!take_claim_if_needed("aabbcc"));
-        assert!(!take_claim_if_needed("ddeeff"));
-
-        reset_claim_test_state(false);
-        assert!(take_claim_if_needed("aabbcc"));
-
-        reset_claim_test_state(false);
-        assert!(take_claim_if_needed("aabbcc"));
-        assert!(!take_claim_if_needed("aabbcc"));
-
-        steam::set_running_for_test(Some(true));
-        *LAST_STEAM_RUNNING.lock().unwrap() = Some(false);
-        assert!(!take_claim_if_needed("aabbcc"));
-
-        steam::set_running_for_test(Some(false));
-        *LAST_STEAM_RUNNING.lock().unwrap() = Some(true);
-        assert!(take_claim_if_needed("aabbcc"));
-
-        // Last-applied skip (same shared claim/last maps — keep in this serial test).
         forget_all_claims();
-        let serial = "aabbccddeeff";
-        let color = Rgb::new(10, 20, 30);
-        let other = Rgb::new(40, 50, 60);
-        assert!(!should_skip_rgb_write(serial, color, false, false));
-        record_last_applied(serial, color);
-        assert!(should_skip_rgb_write(serial, color, false, false));
-        assert!(!should_skip_rgb_write(serial, other, false, false));
-        assert!(!should_skip_rgb_write(serial, color, true, false));
-        assert!(!should_skip_rgb_write(serial, color, false, true));
-        sync_lightbar_claims(std::iter::empty::<&str>());
-        assert!(!should_skip_rgb_write(serial, color, false, false));
-
-        clear_claim_test_state();
+        assert!(take_claim_if_needed("aabbcc"));
+        assert!(!take_claim_if_needed("aabbcc"));
+        prepare_connect_apply("aabbcc");
+        assert!(take_claim_if_needed("aabbcc"));
+        forget_all_claims();
     }
 
     #[test]
@@ -518,13 +397,6 @@ mod tests {
         let done_at =
             start + Duration::from_millis(IDENTIFY_FLASH_MS * u64::from(IDENTIFY_FLASH_COUNT) * 2);
         assert_eq!(identify_flash_is_white(start, done_at), None);
-    }
-
-    #[test]
-    fn spectrum_commit_generation_drops_stale() {
-        assert!(spectrum_commit_is_current(3, 3));
-        assert!(!spectrum_commit_is_current(4, 3));
-        assert!(!spectrum_commit_is_current(2, 3));
     }
 
     #[test]
