@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-09-20
+
 ### Fixed
 
 - Lightbar reasserts RGB on every ~5s poll with claim-once (`LIGHT_OUT` then RGB) per connection, without Steam-specific branching — works against any other HID writer that briefly owns the bar.
@@ -265,6 +267,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded DualSense silhouette for the tray and `.exe` icon.
 - Windows CI and tagged release workflow.
 
+[1.3.3]: https://github.com/LankyMoose/sdsc-utils/compare/v1.3.2...v1.3.3
 [1.3.2]: https://github.com/LankyMoose/sdsc-utils/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.2.1...v1.3.0
