@@ -3,6 +3,7 @@
 use crate::app_log;
 use crate::battery::LOW_BATTERY_PERCENT;
 use crate::color::BatterySpectrum;
+use crate::gesture::{GestureControl, default_gesture};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -48,6 +49,13 @@ pub struct Prefs {
     /// Drive DualSense lightbar from battery spectrum (default on).
     #[serde(default = "default_true")]
     pub lightbar_enabled: bool,
+    /// Open the start-screen launcher on 0→1 connect / reopen gesture (default on).
+    #[serde(default = "default_true")]
+    pub start_screen_enabled: bool,
+    /// Chord that reopens the start screen while a pad is connected.
+    /// Empty = no gesture reopen (0→1 auto-open still works). Missing key → default.
+    #[serde(default = "default_gesture")]
+    pub start_screen_gesture: Vec<GestureControl>,
 }
 
 fn default_true() -> bool {
@@ -82,6 +90,8 @@ impl Default for Prefs {
             spectrum: BatterySpectrum::default_spectrum(),
             analytics_enabled: false,
             lightbar_enabled: true,
+            start_screen_enabled: true,
+            start_screen_gesture: default_gesture(),
         }
     }
 }
@@ -145,6 +155,8 @@ mod tests {
         assert_eq!(prefs.low_battery_percent, LOW_BATTERY_PERCENT);
         assert!(!prefs.analytics_enabled);
         assert!(prefs.lightbar_enabled);
+        assert!(prefs.start_screen_enabled);
+        assert_eq!(prefs.start_screen_gesture, default_gesture());
     }
 
     #[test]
@@ -155,6 +167,24 @@ mod tests {
         .unwrap();
         assert!(!prefs.analytics_enabled);
         assert!(prefs.lightbar_enabled);
+    }
+
+    #[test]
+    fn older_prefs_default_start_screen_on_with_default_gesture() {
+        let prefs: Prefs = serde_json::from_str(
+            r#"{"notify_low":true,"notify_charged":true,"notify_connect":true,"notify_disconnect":true}"#,
+        )
+        .unwrap();
+        assert!(prefs.start_screen_enabled);
+        assert_eq!(prefs.start_screen_gesture, default_gesture());
+    }
+
+    #[test]
+    fn empty_gesture_list_deserializes() {
+        let prefs: Prefs =
+            serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":[]}"#)
+                .unwrap();
+        assert!(prefs.start_screen_gesture.is_empty());
     }
 
     #[test]

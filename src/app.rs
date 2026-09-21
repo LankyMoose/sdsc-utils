@@ -13,12 +13,15 @@ use crate::battery::{self, ControllerStatus};
 use crate::color::{self, BatterySpectrum, color_for_battery_percent};
 use crate::configure_view::{
     self, AnalyticsPadRow, AnalyticsPanel, ConfigureMessage, ConfigureSettings, ConfigureState,
-    NotificationSetting,
+    NotificationSetting, PadInputPanel, Section, StartScreenPanel,
 };
 use crate::dualsense;
 #[cfg(feature = "dev-emulate")]
 use crate::emulate::{self, Preset};
+use crate::games::{self, GamesCatalog};
+use crate::gesture::{self, GestureDetector, GestureRecorder};
 use crate::known::KnownControllers;
+use crate::launch;
 use crate::lightbar::{
     self, LOW_BATTERY_ORANGE, LOW_BATTERY_PULSE_GAP_MS, LOW_BATTERY_PULSE_ON_MS,
 };
@@ -29,6 +32,9 @@ use crate::poll::{
 };
 use crate::popup_view::{self, ControllerRow, PopupMessage};
 use crate::prefs::{Prefs, clamp_low_battery_percent};
+use crate::start_input::{self, ButtonEdges, NavAction, NavLogSnapshot, NavSource, NavStepper};
+use crate::start_view::{self, StartMessage};
+use crate::steam::{self, SteamGame};
 use crate::theme;
 use crate::toast::ToastMessage;
 use crate::toast_view;
@@ -44,11 +50,13 @@ use crate::window_layout::{
 use iced::futures::Stream;
 use iced::futures::StreamExt;
 use iced::futures::channel::{mpsc, oneshot};
+use iced::keyboard;
 use iced::widget::{container, operation, space};
 use iced::{Element, Point, Size, Subscription, Task, Theme, stream, window};
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -60,6 +68,10 @@ use tray_icon::TrayIcon;
 const SPECTRUM_DEBOUNCE: Duration = Duration::from_millis(150);
 /// How long an overlay toast stays on screen.
 const TOAST_LIFETIME: Duration = Duration::from_secs(5);
+/// Ignore 0→1 auto-open briefly after the last pad vanished (BT ghost flaps).
+const START_CONNECT_COOLDOWN: Duration = Duration::from_secs(5);
+/// DualSense poll rate while start-screen input / gesture listening is active.
+const PAD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -87,6 +99,18 @@ pub enum Message {
     ConfigureOpened(window::Id),
     Configure(ConfigureMessage),
 
+    StartOpened(window::Id),
+    Start(StartMessage),
+    /// Keyboard while some iced window has focus; filtered to the start screen in update.
+    StartKey {
+        id: window::Id,
+        action: StartKeyAction,
+    },
+    /// Periodic DualSense sample for gestures / start-screen navigation.
+    PadPoll,
+    ManualFilePicked(Option<PathBuf>),
+    SteamScanDone(Result<Vec<SteamGame>, String>),
+
     PlaceToast {
         id: window::Id,
         monitor: Option<Size>,
@@ -106,11 +130,20 @@ pub enum Message {
     Exit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartKeyAction {
+    Up,
+    Down,
+    Confirm,
+    Cancel,
+}
+
 pub struct App {
     prefs: Prefs,
     known: KnownControllers,
     notify: NotifyTracker,
     analytics: AnalyticsStore,
+    games: GamesCatalog,
 
     controllers: Vec<ControllerStatus>,
     /// Last HID presence snapshot (serials), used to detect connect/disconnect.
@@ -139,6 +172,29 @@ pub struct App {
     configure_state: ConfigureState,
     /// Snapshot for the Analytics settings tab (refreshed with controller/analytics changes).
     analytics_panel: AnalyticsPanel,
+    start_screen_panel: StartScreenPanel,
+    pad_input_panel: PadInputPanel,
+
+    start_window: Option<window::Id>,
+    start_state: start_view::State,
+    /// After last pad disconnect, suppress 0→1 auto-open briefly.
+    start_connect_cooldown_until: Option<Instant>,
+    gesture_detector: GestureDetector,
+    gesture_recorder: GestureRecorder,
+    nav_stepper: NavStepper,
+    button_edges: ButtonEdges,
+    steam_by_id: HashMap<u32, SteamGame>,
+    /// `Some` after a successful Steam library scan (installed appids). `None` = unknown.
+    steam_installed: Option<Vec<u32>>,
+    hid_exclusive_warned: bool,
+    /// One-shot when both Gaming.Input and DualSense HID fail while start is open.
+    nav_missing_warned: bool,
+    /// Logged once per start-session which nav backend succeeded.
+    nav_source_logged: Option<NavSource>,
+    /// Last edge-logged nav snapshot (cleared when start closes).
+    last_nav_log: Option<NavLogSnapshot>,
+    /// One-shot when falling back from empty Gamepad to HID this start-session.
+    nav_hid_fallback_logged: bool,
 
     toast_window: Option<window::Id>,
     toast_message: Option<ToastMessage>,
@@ -201,6 +257,7 @@ impl App {
         let prefs = Prefs::load();
         let known = KnownControllers::load();
         let analytics = AnalyticsStore::load();
+        let games = GamesCatalog::load();
         color::set_active_spectrum(prefs.spectrum.clone());
         lightbar::set_enabled(prefs.lightbar_enabled);
 
@@ -218,6 +275,7 @@ impl App {
             known,
             notify: NotifyTracker::new(),
             analytics,
+            games,
             controllers: Vec::new(),
             last_discovered: dualsense::list_presence_paths().unwrap_or_default(),
             last_battery_poll: Instant::now(),
@@ -235,6 +293,22 @@ impl App {
             configure_window: None,
             configure_state,
             analytics_panel: AnalyticsPanel::default(),
+            start_screen_panel: StartScreenPanel::default(),
+            pad_input_panel: PadInputPanel::default(),
+            start_window: None,
+            start_state: start_view::State::default(),
+            start_connect_cooldown_until: None,
+            gesture_detector: GestureDetector::new(),
+            gesture_recorder: GestureRecorder::default(),
+            nav_stepper: NavStepper::default(),
+            button_edges: ButtonEdges::default(),
+            steam_by_id: HashMap::new(),
+            steam_installed: None,
+            hid_exclusive_warned: false,
+            nav_missing_warned: false,
+            nav_source_logged: None,
+            last_nav_log: None,
+            nav_hid_fallback_logged: false,
             toast_window: None,
             toast_message: None,
             toast_queue: VecDeque::new(),
@@ -251,6 +325,8 @@ impl App {
             dev_paused_percent: None,
         };
 
+        app.sync_start_panel_catalog();
+
         // Show the tray immediately, then poll in the background so a stuck HID
         // read cannot delay the icon for tens of seconds. Pre-create the toast
         // window hidden so iced keeps a warm GPU compositor for fast popup/Settings opens.
@@ -259,13 +335,19 @@ impl App {
         app.sync_low_battery();
         app.refresh_analytics_panel();
 
-        let task = Task::batch([app.request_refresh(), app.ensure_toast_window()]);
+        let task = Task::batch([
+            app.request_refresh(),
+            app.ensure_toast_window(),
+            app.refresh_steam_library(),
+        ]);
         (app, task)
     }
 
     fn title(&self, window: window::Id) -> String {
         if Some(window) == self.configure_window {
             "Settings".to_string()
+        } else if Some(window) == self.start_window {
+            "Quick launch".to_string()
         } else {
             crate::app_meta::DISPLAY_NAME.to_string()
         }
@@ -284,6 +366,24 @@ impl App {
             window::close_events().map(Message::WindowClosed),
             iced::event::listen_with(|event, _status, id| match event {
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
+                iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
+                    let action = match key {
+                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                            Some(StartKeyAction::Cancel)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                            Some(StartKeyAction::Confirm)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                            Some(StartKeyAction::Up)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                            Some(StartKeyAction::Down)
+                        }
+                        _ => None,
+                    }?;
+                    Some(Message::StartKey { id, action })
+                }
                 _ => None,
             }),
             iced::time::every(PRESENCE_INTERVAL).map(|_| Message::Tick),
@@ -305,6 +405,15 @@ impl App {
             subscriptions.push(window::frames().map(|_| Message::IdentifyFrame));
         }
 
+        let pad_input_live =
+            self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
+        let pad_listening = pad_input_live
+            || (self.prefs.start_screen_enabled
+                && (!self.controllers.is_empty() || self.gesture_recorder.is_active()));
+        if pad_listening {
+            subscriptions.push(iced::time::every(PAD_POLL_INTERVAL).map(|_| Message::PadPoll));
+        }
+
         Subscription::batch(subscriptions)
     }
 
@@ -319,8 +428,14 @@ impl App {
                 &self.configure_state,
                 &self.configure_settings(),
                 &self.analytics_panel,
+                &self.start_screen_panel,
+                &self.pad_input_panel,
             )
             .map(Message::Configure);
+        }
+
+        if Some(window) == self.start_window {
+            return start_view::view(&self.start_state).map(Message::Start);
         }
 
         if Some(window) == self.toast_window {
@@ -357,6 +472,13 @@ impl App {
                     Task::none()
                 } else if Some(id) == self.configure_window {
                     self.configure_window = None;
+                    self.cancel_gesture_recording();
+                    Task::none()
+                } else if Some(id) == self.start_window {
+                    self.start_window = None;
+                    self.nav_stepper.reset();
+                    self.button_edges.reset();
+                    self.clear_start_nav_diag();
                     Task::none()
                 } else if Some(id) == self.toast_window {
                     self.toast_window = None;
@@ -370,6 +492,8 @@ impl App {
                 // The popup is a transient tray flyout: dismiss it when focus moves away.
                 if Some(id) == self.popup_window && !self.popup_state.is_editing_any() {
                     self.close_popup()
+                } else if Some(id) == self.start_window {
+                    self.close_start_screen()
                 } else {
                     Task::none()
                 }
@@ -392,6 +516,31 @@ impl App {
 
             Message::ConfigureOpened(id) => window::gain_focus(id),
             Message::Configure(message) => self.on_configure_message(message),
+
+            Message::StartOpened(id) => {
+                window::set_mode(id, window::Mode::Windowed).chain(window::gain_focus(id))
+            }
+            Message::Start(message) => self.on_start_message(message),
+            Message::StartKey { id, action } => {
+                if Some(id) == self.start_window {
+                    return match action {
+                        StartKeyAction::Up => self.on_start_message(StartMessage::MoveUp),
+                        StartKeyAction::Down => self.on_start_message(StartMessage::MoveDown),
+                        StartKeyAction::Confirm => self.on_start_message(StartMessage::Confirm),
+                        StartKeyAction::Cancel => self.on_start_message(StartMessage::Close),
+                    };
+                }
+                if Some(id) == self.configure_window
+                    && action == StartKeyAction::Cancel
+                    && self.gesture_recorder.is_active()
+                {
+                    self.cancel_gesture_recording();
+                }
+                Task::none()
+            }
+            Message::PadPoll => self.on_pad_poll(),
+            Message::ManualFilePicked(path) => self.on_manual_file_picked(path),
+            Message::SteamScanDone(result) => self.on_steam_scan_done(result),
 
             Message::PlaceToast { id, monitor } => {
                 let placement = toast_placement(self.prefs.toast_position, monitor);
@@ -571,8 +720,13 @@ impl App {
         }
 
         let mut events = Vec::new();
+        let mut opened_from_empty = false;
         if controllers_changed {
             let previous = std::mem::replace(&mut self.controllers, controllers);
+            opened_from_empty = previous.is_empty() && !self.controllers.is_empty();
+            if !previous.is_empty() && self.controllers.is_empty() {
+                self.start_connect_cooldown_until = Some(Instant::now() + START_CONNECT_COOLDOWN);
+            }
             events = self
                 .notify
                 .evaluate(&previous, &self.controllers, &self.prefs, |serial| {
@@ -583,7 +737,30 @@ impl App {
 
         self.known.save();
         let tray = self.apply_tray();
-        tray.chain(self.queue_notifications(events))
+        let mut task = tray.chain(self.queue_notifications(events));
+
+        if self.controllers.is_empty() && self.start_window.is_some() {
+            task = task.chain(self.close_start_screen());
+        } else if opened_from_empty && self.should_auto_open_start() {
+            task = task.chain(self.open_start_screen());
+        }
+
+        task
+    }
+
+    fn should_auto_open_start(&self) -> bool {
+        let cooldown_active = self
+            .start_connect_cooldown_until
+            .is_some_and(|until| Instant::now() < until);
+        should_auto_open_start(
+            self.prefs.start_screen_enabled,
+            !self.display_catalog().is_empty(),
+            true,
+            true,
+            self.start_window.is_some(),
+            cooldown_active,
+            start_input::foreground_is_exclusive_fullscreen(),
+        )
     }
 
     fn sync_low_battery(&self) {
@@ -772,6 +949,17 @@ impl App {
             toast_position: self.prefs.toast_position,
             analytics_enabled: self.prefs.analytics_enabled,
             lightbar_enabled: self.prefs.lightbar_enabled,
+            start_screen_enabled: self.prefs.start_screen_enabled,
+            start_screen_gesture: self.prefs.start_screen_gesture.clone(),
+            gesture_recording: self.gesture_recorder.is_active(),
+            gesture_recording_live: {
+                let peak: Vec<_> = self.gesture_recorder.peak().iter().copied().collect();
+                if peak.is_empty() {
+                    String::new()
+                } else {
+                    gesture::format_gesture(&peak)
+                }
+            },
             #[cfg(windows)]
             autostart: autostart::is_enabled(),
             show_developer: {
@@ -849,18 +1037,19 @@ impl App {
 
     fn on_configure_message(&mut self, message: ConfigureMessage) -> Task<Message> {
         match message {
-            // Hide first so DWM cannot flash the default (white) brush while the
-            // wgpu surface is torn down; keep id until WindowClosed.
-            ConfigureMessage::Close => match self.configure_window {
-                Some(id) => window::set_mode(id, window::Mode::Hidden).chain(window::close(id)),
-                None => Task::none(),
-            },
-            ConfigureMessage::DragWindow => match self.configure_window {
-                Some(id) => window::drag(id),
-                None => Task::none(),
-            },
             ConfigureMessage::SelectSection(section) => {
+                if self.configure_state.section == Section::StartScreen
+                    && section != Section::StartScreen
+                {
+                    self.cancel_gesture_recording();
+                }
                 self.configure_state.select_section(section);
+                if section == Section::StartScreen {
+                    return self.refresh_steam_library();
+                }
+                if section == Section::PadInput {
+                    return self.refresh_pad_input_panel();
+                }
                 Task::none()
             }
             ConfigureMessage::SetNotification(setting, enabled) => {
@@ -906,6 +1095,89 @@ impl App {
                     Task::none()
                 }
             }
+            ConfigureMessage::SetStartScreenEnabled(enabled) => {
+                self.prefs.start_screen_enabled = enabled;
+                self.prefs.save();
+                Task::none()
+            }
+            ConfigureMessage::PreviewStartScreen => self.open_start_screen(),
+            ConfigureMessage::StartGestureRecord => {
+                self.gesture_recorder.start();
+                self.gesture_detector.reset();
+                Task::none()
+            }
+            ConfigureMessage::ResetStartGesture => {
+                self.cancel_gesture_recording();
+                self.prefs.start_screen_gesture = gesture::default_gesture();
+                self.prefs.save();
+                Task::none()
+            }
+            ConfigureMessage::CancelGestureRecord => {
+                self.cancel_gesture_recording();
+                Task::none()
+            }
+            ConfigureMessage::RefreshSteamLibrary => self.refresh_steam_library(),
+            ConfigureMessage::ToggleSteamGame(appid, enabled) => {
+                if self.games.toggle_steam(appid, enabled) {
+                    self.games.save();
+                    self.sync_start_panel_catalog();
+                    self.refresh_start_rows();
+                }
+                Task::none()
+            }
+            ConfigureMessage::AddManualPath => {
+                let draft = self.start_screen_panel.manual_draft.trim().to_string();
+                if draft.is_empty() {
+                    return Task::none();
+                }
+                let title = games::title_from_target(&draft);
+                self.games.add_manual(title, draft);
+                self.games.save();
+                self.start_screen_panel.manual_draft.clear();
+                self.sync_start_panel_catalog();
+                self.refresh_start_rows();
+                Task::none()
+            }
+            ConfigureMessage::PickManualFile => Task::perform(
+                spawn_blocking(|| {
+                    rfd::FileDialog::new()
+                        .add_filter("Programs", &["exe", "lnk", "url"])
+                        .pick_file()
+                        .map(|p| p.to_string_lossy().into_owned())
+                }),
+                |result| match result {
+                    Ok(path) => Message::ManualFilePicked(path.map(PathBuf::from)),
+                    Err(_) => Message::ManualFilePicked(None),
+                },
+            ),
+            ConfigureMessage::ManualDraftChanged(value) => {
+                self.start_screen_panel.manual_draft = value;
+                Task::none()
+            }
+            ConfigureMessage::RenameCatalogEntry(index, title) => {
+                if self.games.set_manual_title(index, title) {
+                    self.games.save();
+                    self.sync_start_panel_catalog();
+                    self.refresh_start_rows();
+                }
+                Task::none()
+            }
+            ConfigureMessage::MoveCatalogEntry(index, up) => {
+                if self.games.move_entry(index, up) {
+                    self.games.save();
+                    self.sync_start_panel_catalog();
+                    self.refresh_start_rows();
+                }
+                Task::none()
+            }
+            ConfigureMessage::RemoveCatalogEntry(index) => {
+                if self.games.remove_at(index) {
+                    self.games.save();
+                    self.sync_start_panel_catalog();
+                    self.refresh_start_rows();
+                }
+                Task::none()
+            }
             ConfigureMessage::OpenDataFolder => {
                 if let Err(err) = paths::open_data_folder() {
                     app_log::warn(format!("open data folder failed: {err}"));
@@ -949,6 +1221,19 @@ impl App {
             }
             #[cfg(feature = "dev-emulate")]
             ConfigureMessage::DeveloperPreset(preset) => self.apply_dev_preset(preset),
+            // Hide first so DWM cannot flash the default (white) brush while the
+            // wgpu surface is torn down; keep id until WindowClosed.
+            ConfigureMessage::Close => {
+                self.cancel_gesture_recording();
+                match self.configure_window {
+                    Some(id) => window::set_mode(id, window::Mode::Hidden).chain(window::close(id)),
+                    None => Task::none(),
+                }
+            }
+            ConfigureMessage::DragWindow => match self.configure_window {
+                Some(id) => window::drag(id),
+                None => Task::none(),
+            },
         }
     }
 
@@ -1196,6 +1481,336 @@ impl App {
         }
 
         self.apply_controllers(next)
+    }
+
+    // -----------------------------------------------------------------------
+    // Start screen
+    // -----------------------------------------------------------------------
+
+    fn display_catalog(&self) -> Vec<crate::games::GameEntry> {
+        self.games
+            .merge_for_display(self.steam_installed.as_deref())
+    }
+
+    fn sync_start_panel_catalog(&mut self) {
+        self.start_screen_panel.catalog = self.games.entries.clone();
+    }
+
+    fn refresh_start_rows(&mut self) {
+        let rows: Vec<_> = self
+            .display_catalog()
+            .iter()
+            .map(|entry| start_view::StartRow::from_entry(entry, &self.steam_by_id))
+            .collect();
+        self.start_state.set_rows(rows);
+    }
+
+    fn refresh_steam_library(&self) -> Task<Message> {
+        Task::perform(
+            spawn_blocking(steam::list_installed_games),
+            |result| match result {
+                Ok(Ok(games)) => Message::SteamScanDone(Ok(games)),
+                Ok(Err(err)) => Message::SteamScanDone(Err(err)),
+                Err(err) => Message::SteamScanDone(Err(err)),
+            },
+        )
+    }
+
+    fn on_steam_scan_done(&mut self, result: Result<Vec<SteamGame>, String>) -> Task<Message> {
+        match result {
+            Ok(games) => {
+                self.steam_installed = Some(games.iter().map(|g| g.appid).collect());
+                self.steam_by_id = games.iter().map(|g| (g.appid, g.clone())).collect();
+                self.start_screen_panel.steam_games = games;
+                self.start_screen_panel.steam_error = None;
+            }
+            Err(err) => {
+                steam::warn_scan_error(&err);
+                // Keep prior successful install list if any; otherwise stay Unknown so
+                // curated Steam rows remain visible.
+                self.start_screen_panel.steam_error = Some(err);
+                self.start_screen_panel.steam_games.clear();
+            }
+        }
+        self.refresh_start_rows();
+        Task::none()
+    }
+
+    fn on_manual_file_picked(&mut self, path: Option<PathBuf>) -> Task<Message> {
+        let Some(path) = path else {
+            return Task::none();
+        };
+        let target = path.to_string_lossy().into_owned();
+        let title = games::title_from_target(&target);
+        self.games.add_manual(title, target);
+        self.games.save();
+        self.sync_start_panel_catalog();
+        self.refresh_start_rows();
+        Task::none()
+    }
+
+    fn cancel_gesture_recording(&mut self) {
+        self.gesture_recorder.cancel();
+    }
+
+    fn open_start_screen(&mut self) -> Task<Message> {
+        if !self.prefs.start_screen_enabled {
+            return Task::none();
+        }
+        self.refresh_start_rows();
+        if self.start_state.rows.is_empty() {
+            return Task::none();
+        }
+        if let Some(id) = self.start_window {
+            return window::gain_focus(id);
+        }
+
+        self.nav_stepper.reset();
+        self.button_edges.reset();
+        self.gesture_detector.reset();
+        self.clear_start_nav_diag();
+
+        let (id, open) = window::open(window::Settings {
+            size: Size::new(start_view::WIDTH, start_view::HEIGHT),
+            position: window::Position::Centered,
+            visible: false,
+            resizable: false,
+            decorations: false,
+            level: window::Level::AlwaysOnTop,
+            exit_on_close_request: true,
+            platform_specific: overlay_platform_specific(),
+            ..window::Settings::default()
+        });
+        self.start_window = Some(id);
+        open.map(Message::StartOpened)
+    }
+
+    fn close_start_screen(&mut self) -> Task<Message> {
+        self.nav_stepper.reset();
+        self.button_edges.reset();
+        self.clear_start_nav_diag();
+        match self.start_window {
+            Some(id) => window::set_mode(id, window::Mode::Hidden).chain(window::close(id)),
+            None => Task::none(),
+        }
+    }
+
+    fn clear_start_nav_diag(&mut self) {
+        self.nav_missing_warned = false;
+        self.nav_source_logged = None;
+        self.last_nav_log = None;
+        self.nav_hid_fallback_logged = false;
+    }
+
+    fn log_start_nav_diag(&mut self, sample: &start_input::PadSample, source: NavSource) {
+        if self.nav_source_logged.is_none() {
+            if source == NavSource::Hid && !self.nav_hid_fallback_logged {
+                app_log::info(
+                    "start-nav: Gaming.Input empty or unavailable; using DualSense HID fallback",
+                );
+                self.nav_hid_fallback_logged = true;
+            }
+            if source == NavSource::Hid {
+                app_log::info(format!(
+                    "start-nav: source={} buttons0=0x{:02x}",
+                    source.as_str(),
+                    sample.buttons0
+                ));
+            } else {
+                app_log::info(format!("start-nav: source={}", source.as_str()));
+            }
+            self.nav_source_logged = Some(source);
+        }
+
+        let snap = NavLogSnapshot::from_sample(sample);
+        if self.last_nav_log != Some(snap) {
+            app_log::info(snap.format_line(source));
+            self.last_nav_log = Some(snap);
+        }
+    }
+
+    fn on_start_message(&mut self, message: StartMessage) -> Task<Message> {
+        match message {
+            StartMessage::Launch(index) => {
+                if index < self.start_state.rows.len() {
+                    self.start_state.selected = index;
+                }
+                self.launch_selected()
+            }
+            StartMessage::MoveUp => {
+                self.start_state.move_selection(-1);
+                Task::none()
+            }
+            StartMessage::MoveDown => {
+                self.start_state.move_selection(1);
+                Task::none()
+            }
+            StartMessage::Confirm => self.launch_selected(),
+            StartMessage::Close => self.close_start_screen(),
+        }
+    }
+
+    fn launch_selected(&mut self) -> Task<Message> {
+        let Some(target) = self.start_state.selected_target().map(str::to_string) else {
+            return Task::none();
+        };
+        match launch::launch_target(&target) {
+            Ok(()) => self.close_start_screen(),
+            Err(err) => {
+                app_log::warn(format!("launch failed for {target}: {err}"));
+                // Keep the card open so a failed launch is obvious (not a silent no-op).
+                Task::none()
+            }
+        }
+    }
+
+    fn on_pad_poll(&mut self) -> Task<Message> {
+        let mut task = Task::none();
+        if self.configure_window.is_some() && self.configure_state.section == Section::PadInput {
+            task = task.chain(self.refresh_pad_input_panel());
+        }
+
+        let listening = self.prefs.start_screen_enabled
+            && (!self.controllers.is_empty() || self.gesture_recorder.is_active());
+        if !listening {
+            return task;
+        }
+
+        // Gesture recording needs raw DualSense bits (L2/R2/L3/R3, etc.).
+        if self.gesture_recorder.is_active() {
+            let Some(sample) = start_input::read_gesture_sample() else {
+                if !self.hid_exclusive_warned && !self.controllers.is_empty() {
+                    app_log::warn(
+                        "could not read DualSense HID for gesture recording (device may be exclusive); try again",
+                    );
+                    self.hid_exclusive_warned = true;
+                }
+                return task;
+            };
+            self.hid_exclusive_warned = false;
+            if let Some(peak) = self.gesture_recorder.update(&sample.held) {
+                self.prefs.start_screen_gesture = peak;
+                self.prefs.save();
+            }
+            return task;
+        }
+
+        if self.start_window.is_some() {
+            match start_input::read_nav_sample() {
+                start_input::NavReadOutcome::Missing {
+                    hid_fallback_attempted,
+                } => {
+                    if hid_fallback_attempted && !self.nav_hid_fallback_logged {
+                        app_log::info(
+                            "start-nav: Gaming.Input empty or unavailable; DualSense HID fallback attempted",
+                        );
+                        self.nav_hid_fallback_logged = true;
+                    }
+                    if !self.nav_missing_warned && !self.controllers.is_empty() {
+                        app_log::warn(
+                            "start-nav: no Gaming.Input gamepad and DualSense HID read failed; keyboard/mouse still work",
+                        );
+                        self.nav_missing_warned = true;
+                    }
+                    return task;
+                }
+                start_input::NavReadOutcome::Sample(reading) => {
+                    self.nav_missing_warned = false;
+                    self.log_start_nav_diag(&reading.sample, reading.source);
+                    let sample = reading.sample;
+
+                    let now = Instant::now();
+                    if let Some(action) = self.nav_stepper.update(&sample, now) {
+                        let next = match action {
+                            NavAction::Up => self.on_start_message(StartMessage::MoveUp),
+                            NavAction::Down => self.on_start_message(StartMessage::MoveDown),
+                            NavAction::Confirm | NavAction::Cancel => Task::none(),
+                        };
+                        task = task.chain(next);
+                    }
+                    if let Some(action) = self.button_edges.update(&sample) {
+                        let next = match action {
+                            NavAction::Confirm => self.on_start_message(StartMessage::Confirm),
+                            NavAction::Cancel => self.on_start_message(StartMessage::Close),
+                            NavAction::Up | NavAction::Down => Task::none(),
+                        };
+                        return task.chain(next);
+                    }
+                    return task;
+                }
+            }
+        }
+
+        // Background reopen gesture via short DualSense HID read.
+        let Some(sample) = start_input::read_gesture_sample() else {
+            return task;
+        };
+        if self.prefs.start_screen_enabled
+            && !self.prefs.start_screen_gesture.is_empty()
+            && self
+                .gesture_detector
+                .update(&self.prefs.start_screen_gesture, &sample.held)
+        {
+            return task.chain(self.open_start_screen());
+        }
+
+        task
+    }
+
+    fn refresh_pad_input_panel(&mut self) -> Task<Message> {
+        // Full DualSense HID sample for held controls (same short open/read/close as gestures).
+        let next = if let Some(sample) = start_input::read_gesture_sample() {
+            let held: Vec<_> = sample.held.iter().copied().collect();
+            PadInputPanel {
+                has_sample: true,
+                source: "hid".to_string(),
+                buttons0: Some(sample.buttons0),
+                cross: sample.cross,
+                circle: sample.circle,
+                dpad_up: sample.dpad_up,
+                dpad_down: sample.dpad_down,
+                stick_band: start_input::StickBand::from_stick_y(sample.stick_y)
+                    .as_str()
+                    .to_string(),
+                stick_y: sample.stick_y,
+                held: gesture::format_gesture(&held),
+            }
+        } else {
+            match start_input::read_nav_sample() {
+                start_input::NavReadOutcome::Sample(reading) => {
+                    let held: Vec<_> = reading.sample.held.iter().copied().collect();
+                    PadInputPanel {
+                        has_sample: true,
+                        source: reading.source.as_str().to_string(),
+                        buttons0: if reading.source == NavSource::Hid {
+                            Some(reading.sample.buttons0)
+                        } else {
+                            None
+                        },
+                        cross: reading.sample.cross,
+                        circle: reading.sample.circle,
+                        dpad_up: reading.sample.dpad_up,
+                        dpad_down: reading.sample.dpad_down,
+                        stick_band: start_input::StickBand::from_stick_y(reading.sample.stick_y)
+                            .as_str()
+                            .to_string(),
+                        stick_y: reading.sample.stick_y,
+                        held: gesture::format_gesture(&held),
+                    }
+                }
+                start_input::NavReadOutcome::Missing { .. } => PadInputPanel {
+                    has_sample: false,
+                    source: "none".to_string(),
+                    ..PadInputPanel::default()
+                },
+            }
+        };
+
+        if next == self.pad_input_panel {
+            return Task::none();
+        }
+        self.pad_input_panel = next;
+        Task::none()
     }
 
     // -----------------------------------------------------------------------
@@ -1517,4 +2132,57 @@ fn controllers_equivalent(a: &[ControllerStatus], b: &[ControllerStatus]) -> boo
             && x.connection == y.connection
             && x.product == y.product
     })
+}
+
+/// Gate for automatic start-screen open on a 0→1 controller connect.
+pub(crate) fn should_auto_open_start(
+    enabled: bool,
+    catalog_nonempty: bool,
+    previous_empty: bool,
+    next_nonempty: bool,
+    already_open: bool,
+    cooldown_active: bool,
+    fullscreen: bool,
+) -> bool {
+    enabled
+        && catalog_nonempty
+        && previous_empty
+        && next_nonempty
+        && !already_open
+        && !cooldown_active
+        && !fullscreen
+}
+
+#[cfg(test)]
+mod start_gate_tests {
+    use super::should_auto_open_start;
+
+    #[test]
+    fn opens_on_clean_zero_to_one() {
+        assert!(should_auto_open_start(
+            true, true, true, true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn skips_when_disabled_empty_open_cooldown_or_fullscreen() {
+        assert!(!should_auto_open_start(
+            false, true, true, true, false, false, false
+        ));
+        assert!(!should_auto_open_start(
+            true, false, true, true, false, false, false
+        ));
+        assert!(!should_auto_open_start(
+            true, true, false, true, false, false, false
+        ));
+        assert!(!should_auto_open_start(
+            true, true, true, true, true, false, false
+        ));
+        assert!(!should_auto_open_start(
+            true, true, true, true, false, true, false
+        ));
+        assert!(!should_auto_open_start(
+            true, true, true, true, false, false, true
+        ));
+    }
 }

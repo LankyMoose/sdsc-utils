@@ -22,7 +22,14 @@ tray-icon = { version = "0.24.2", default-features = false }
 windows = { version = "0.61", features = [
     "ApplicationModel",
     "Foundation",
+    "Foundation_Collections",
+    "Gaming_Input",
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+winreg = "0.55"
 
 [dependencies]
 crc32fast = "1.5.0"
@@ -30,6 +37,7 @@ hidapi = "2.6.6"
 iced = { version = "0.14.0", features = ["canvas", "tokio", "svg", "image"] }
 png = "0.17"
 resvg = { version = "0.45", default-features = false }
+rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 single-instance = "0.3.3"

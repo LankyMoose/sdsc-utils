@@ -362,7 +362,6 @@ pub fn position_marker(
 }
 
 /// Filled accent button.
-#[allow(dead_code)]
 pub fn primary(_theme: &Theme, status: button::Status) -> button::Style {
     match status {
         button::Status::Active => button_base(Some(ACCENT), INK, RADIUS_SM),

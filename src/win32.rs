@@ -10,7 +10,10 @@ pub const WM_QUIT: u32 = 0x0012;
 pub const MONITOR_DEFAULTTOPRIMARY: u32 = 1;
 pub const MDT_EFFECTIVE_DPI: u32 = 0;
 
+pub const GWL_STYLE: i32 = -16;
 pub const GWL_EXSTYLE: i32 = -20;
+pub const WS_CAPTION: isize = 0x00C0_0000;
+pub const WS_THICKFRAME: isize = 0x0004_0000;
 pub const WS_EX_NOACTIVATE: isize = 0x0800_0000;
 pub const SW_HIDE: i32 = 0;
 pub const SW_SHOWNOACTIVATE: i32 = 4;
@@ -36,6 +39,7 @@ pub struct Rect {
     pub bottom: i32,
 }
 
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct MonitorInfo {
     pub size: u32,

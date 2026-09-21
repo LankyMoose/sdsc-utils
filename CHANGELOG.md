@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Start screen** launcher: when the first DualSense connects (0→1), an always-on-top quick-launch card can open with a curated list of Steam games and manual shortcuts. Navigate with D-pad / combined analog sticks / arrows; Cross or Enter launches; Circle or Escape dismisses.
+- Reopen the start screen anytime with a configurable controller chord (default **L2 + R2 + L3 + R3**); record or reset the gesture in Settings → Start screen.
+- Settings → **Start screen**: enable toggle, Preview, Steam library checklist, manual `.exe` / `.lnk` / `steam://` shortcuts, reorder/remove, and gesture recording. Catalog persists in `games.json`.
+
 ## [1.3.3] - 2026-09-20
 
 ### Fixed

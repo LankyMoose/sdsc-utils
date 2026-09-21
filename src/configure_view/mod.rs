@@ -1,5 +1,6 @@
 //! Configure window UI: sidebar tabs, notification toggles, toast
-//! position picker, lightbar spectrum editor, and battery analytics.
+//! position picker, lightbar spectrum editor, battery analytics, and
+//! start-screen launcher settings.
 
 mod coverage;
 mod spectrum;
@@ -14,13 +15,16 @@ use crate::app_meta::{DISPLAY_NAME, PKG_VERSION};
 use crate::color::{BatterySpectrum, hsv_to_rgb};
 #[cfg(feature = "dev-emulate")]
 use crate::emulate::Preset;
+use crate::games::GameEntry;
+use crate::gesture::{self, GestureControl};
 use crate::prefs::{LOW_BATTERY_PERCENT_MAX, LOW_BATTERY_PERCENT_MIN, ToastPosition};
+use crate::steam::SteamGame;
 use crate::svg_icon;
 use crate::theme;
 use iced::mouse;
 use iced::widget::{
     Column, Row, button, canvas as canvas_widget, checkbox, column, container, mouse_area, row,
-    scrollable, slider, space, svg, text, tooltip,
+    scrollable, slider, space, svg, text, text_input, tooltip,
 };
 use iced::{Alignment, Color, Element, Fill, Length};
 use std::time::Duration;
@@ -51,6 +55,8 @@ pub enum Section {
     ToastPosition,
     Lightbar,
     Analytics,
+    StartScreen,
+    PadInput,
     #[cfg(feature = "dev-emulate")]
     Developer,
 }
@@ -63,6 +69,8 @@ impl Section {
             Self::ToastPosition => "Toast position",
             Self::Lightbar => "Lightbar colors",
             Self::Analytics => "Analytics",
+            Self::StartScreen => "Start screen",
+            Self::PadInput => "Pad input",
             #[cfg(feature = "dev-emulate")]
             Self::Developer => "Developer",
         }
@@ -77,8 +85,10 @@ impl Section {
                 Self::ToastPosition,
                 Self::Lightbar,
                 Self::Analytics,
+                Self::StartScreen,
             ];
             if show_developer {
+                sections.push(Self::PadInput);
                 sections.push(Self::Developer);
             }
             sections
@@ -92,6 +102,7 @@ impl Section {
                 Self::ToastPosition,
                 Self::Lightbar,
                 Self::Analytics,
+                Self::StartScreen,
             ]
         }
     }
@@ -106,7 +117,7 @@ pub enum NotificationSetting {
 }
 
 /// Read-only snapshot of app preferences shown by the configure window.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ConfigureSettings {
     pub notify_low: bool,
     pub notify_charged: bool,
@@ -116,9 +127,38 @@ pub struct ConfigureSettings {
     pub toast_position: ToastPosition,
     pub analytics_enabled: bool,
     pub lightbar_enabled: bool,
+    pub start_screen_enabled: bool,
+    pub start_screen_gesture: Vec<GestureControl>,
+    pub gesture_recording: bool,
+    pub gesture_recording_live: String,
     #[cfg(windows)]
     pub autostart: bool,
     pub show_developer: bool,
+}
+
+/// Start-screen tab content (Steam checklist + curated catalog).
+#[derive(Debug, Clone, Default)]
+pub struct StartScreenPanel {
+    pub steam_games: Vec<SteamGame>,
+    pub steam_error: Option<String>,
+    pub catalog: Vec<GameEntry>,
+    pub manual_draft: String,
+}
+
+/// Live DualSense / gamepad readings for the Pad input debug tab.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PadInputPanel {
+    pub has_sample: bool,
+    /// `gamepad`, `hid`, or `none`.
+    pub source: String,
+    pub buttons0: Option<u8>,
+    pub cross: bool,
+    pub circle: bool,
+    pub dpad_up: bool,
+    pub dpad_down: bool,
+    pub stick_band: String,
+    pub stick_y: f32,
+    pub held: String,
 }
 
 /// Analytics tab content (owned snapshot; not `Copy` because of open sessions).
@@ -158,6 +198,19 @@ pub enum ConfigureMessage {
     SetToastPosition(ToastPosition),
     SetAnalyticsEnabled(bool),
     SetLightbarEnabled(bool),
+    SetStartScreenEnabled(bool),
+    PreviewStartScreen,
+    StartGestureRecord,
+    ResetStartGesture,
+    CancelGestureRecord,
+    RefreshSteamLibrary,
+    ToggleSteamGame(u32, bool),
+    AddManualPath,
+    PickManualFile,
+    ManualDraftChanged(String),
+    RenameCatalogEntry(usize, String),
+    MoveCatalogEntry(usize, bool),
+    RemoveCatalogEntry(usize),
     OpenDataFolder,
     #[cfg(windows)]
     SetAutostart(bool),
@@ -365,6 +418,8 @@ pub fn view<'a>(
     state: &'a ConfigureState,
     settings: &ConfigureSettings,
     analytics: &'a AnalyticsPanel,
+    start_screen: &'a StartScreenPanel,
+    pad_input: &'a PadInputPanel,
 ) -> Element<'a, ConfigureMessage> {
     let title = mouse_area(
         container(text("Settings").size(16.0).color(theme::INK))
@@ -402,7 +457,7 @@ pub fn view<'a>(
     .height(Length::Fixed(HEADER_HEIGHT));
 
     let sidebar = tab_list(state.section, settings.show_developer);
-    let content = section_content(state, settings, analytics);
+    let content = section_content(state, settings, analytics, start_screen, pad_input);
 
     let body = row![
         container(sidebar)
@@ -480,6 +535,8 @@ fn section_content<'a>(
     state: &'a ConfigureState,
     settings: &ConfigureSettings,
     analytics: &'a AnalyticsPanel,
+    start_screen: &'a StartScreenPanel,
+    pad_input: &'a PadInputPanel,
 ) -> Element<'a, ConfigureMessage> {
     match state.section {
         Section::System => system_view(settings),
@@ -489,6 +546,8 @@ fn section_content<'a>(
         }
         Section::Lightbar => lightbar_view(state, settings),
         Section::Analytics => analytics_view(settings, analytics),
+        Section::StartScreen => start_screen_view(settings, start_screen),
+        Section::PadInput => pad_input_view(pad_input),
         #[cfg(feature = "dev-emulate")]
         Section::Developer => developer_view(),
     }
@@ -824,6 +883,266 @@ fn lightbar_view<'a>(
     }
 
     content.into()
+}
+
+fn pad_input_view<'a>(panel: &'a PadInputPanel) -> Element<'a, ConfigureMessage> {
+    let mut items = Column::new().spacing(8).width(Fill);
+
+    items = items.push(
+        text("Live DualSense readings for navigation debugging.")
+            .size(12.0)
+            .color(theme::MUTED),
+    );
+
+    if !panel.has_sample {
+        items = items.push(
+            text("No DualSense HID reading (disconnected or exclusive)")
+                .size(13.0)
+                .color(theme::DIM),
+        );
+        return items.into();
+    }
+
+    let source_line = match panel.buttons0 {
+        Some(b0) => format!("source={}  buttons0=0x{b0:02x}", panel.source),
+        None => format!("source={}", panel.source),
+    };
+    items = items.push(text(source_line).size(13.0).color(theme::INK));
+
+    let bit = |label: &str, on: bool| {
+        text(format!("{label}={}", u8::from(on)))
+            .size(13.0)
+            .color(if on { theme::INK } else { theme::MUTED })
+    };
+
+    items = items.push(
+        column![
+            bit("cross", panel.cross),
+            bit("circle", panel.circle),
+            bit("dpad_up", panel.dpad_up),
+            bit("dpad_down", panel.dpad_down),
+            text(format!(
+                "stick={}  stick_y={:.2}",
+                panel.stick_band, panel.stick_y
+            ))
+            .size(13.0)
+            .color(theme::INK),
+        ]
+        .spacing(4),
+    );
+
+    let held = if panel.held.is_empty() {
+        "(none)".to_string()
+    } else {
+        panel.held.clone()
+    };
+    items = items.push(
+        column![
+            text("Held").size(11.0).color(theme::DIM),
+            text(held).size(13.0).color(theme::INK),
+        ]
+        .spacing(2),
+    );
+
+    items.into()
+}
+
+fn start_screen_view<'a>(
+    settings: &ConfigureSettings,
+    panel: &'a StartScreenPanel,
+) -> Element<'a, ConfigureMessage> {
+    let mut items = Column::new().spacing(10).width(Fill);
+
+    items = items.push(
+        checkbox(settings.start_screen_enabled)
+            .label("Show start screen when a controller connects")
+            .size(16.0)
+            .text_size(13.0)
+            .spacing(8)
+            .on_toggle(ConfigureMessage::SetStartScreenEnabled),
+    );
+
+    items = items.push(
+        button(text("Preview start screen").size(13.0))
+            .padding([6, 10])
+            .on_press(ConfigureMessage::PreviewStartScreen)
+            .style(theme::ghost),
+    );
+
+    items = items.push(text("Reopen gesture").size(13.0).color(theme::INK));
+    items = items.push(
+        text(gesture::format_gesture(&settings.start_screen_gesture))
+            .size(12.0)
+            .color(theme::MUTED),
+    );
+
+    if settings.gesture_recording {
+        items = items.push(
+            text(if settings.gesture_recording_live.is_empty() {
+                "Hold combo, then release…".to_string()
+            } else {
+                format!("Holding: {}", settings.gesture_recording_live)
+            })
+            .size(12.0)
+            .color(theme::ACCENT),
+        );
+        items = items.push(
+            button(text("Cancel recording").size(12.0))
+                .padding([5, 8])
+                .on_press(ConfigureMessage::CancelGestureRecord)
+                .style(theme::ghost),
+        );
+    } else {
+        items = items.push(
+            row![
+                button(text("Record").size(12.0))
+                    .padding([5, 8])
+                    .on_press(ConfigureMessage::StartGestureRecord)
+                    .style(theme::primary),
+                button(text("Reset to default").size(12.0))
+                    .padding([5, 8])
+                    .on_press(ConfigureMessage::ResetStartGesture)
+                    .style(theme::ghost),
+            ]
+            .spacing(6),
+        );
+    }
+
+    items = items.push(text("Installed Steam games").size(13.0).color(theme::INK));
+    items = items.push(
+        button(text("Refresh Steam library").size(12.0))
+            .padding([5, 8])
+            .on_press(ConfigureMessage::RefreshSteamLibrary)
+            .style(theme::ghost),
+    );
+
+    if let Some(err) = panel.steam_error.as_deref() {
+        items = items.push(text(err).size(11.0).color(theme::DIM));
+    } else if panel.steam_games.is_empty() {
+        items = items.push(
+            text("No installed Steam games found.")
+                .size(11.0)
+                .color(theme::DIM),
+        );
+    } else {
+        let selected: std::collections::HashSet<u32> = panel
+            .catalog
+            .iter()
+            .filter_map(|e| match e {
+                GameEntry::Steam { appid } => Some(*appid),
+                _ => None,
+            })
+            .collect();
+        for game in &panel.steam_games {
+            let appid = game.appid;
+            let checked = selected.contains(&appid);
+            items = items.push(
+                checkbox(checked)
+                    .label(game.name.clone())
+                    .size(14.0)
+                    .text_size(12.0)
+                    .spacing(6)
+                    .on_toggle(move |enabled| ConfigureMessage::ToggleSteamGame(appid, enabled)),
+            );
+        }
+    }
+
+    items = items.push(text("Manual shortcuts").size(13.0).color(theme::INK));
+    items = items.push(
+        row![
+            text_input("Path, .lnk, or steam://…", &panel.manual_draft)
+                .size(12.0)
+                .padding(6)
+                .on_input(ConfigureMessage::ManualDraftChanged)
+                .style(theme::input),
+            button(text("Add").size(12.0))
+                .padding([5, 8])
+                .on_press(ConfigureMessage::AddManualPath)
+                .style(theme::ghost),
+            button(text("Browse…").size(12.0))
+                .padding([5, 8])
+                .on_press(ConfigureMessage::PickManualFile)
+                .style(theme::ghost),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center),
+    );
+
+    if panel.catalog.is_empty() {
+        items = items.push(
+            text("Catalog is empty — check Steam games or add a shortcut.")
+                .size(11.0)
+                .color(theme::DIM),
+        );
+    } else {
+        items = items.push(text("Launch order").size(12.0).color(theme::DIM));
+        for (index, entry) in panel.catalog.iter().enumerate() {
+            items = items.push(catalog_row(index, entry, &panel.steam_games));
+        }
+    }
+
+    items.into()
+}
+
+fn catalog_row<'a>(
+    index: usize,
+    entry: &'a GameEntry,
+    steam_games: &'a [SteamGame],
+) -> Element<'a, ConfigureMessage> {
+    match entry {
+        GameEntry::Steam { appid } => {
+            let label = steam_games
+                .iter()
+                .find(|g| g.appid == *appid)
+                .map(|g| g.name.as_str())
+                .unwrap_or("Steam game");
+            row![
+                text(label).size(12.0).width(Fill),
+                catalog_move_buttons(index),
+                button(text("Remove").size(11.0))
+                    .padding([3, 6])
+                    .on_press(ConfigureMessage::RemoveCatalogEntry(index))
+                    .style(theme::ghost),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .into()
+        }
+        GameEntry::Manual { title, target, .. } => column![
+            text_input("", title)
+                .size(12.0)
+                .padding(4)
+                .on_input(move |value| ConfigureMessage::RenameCatalogEntry(index, value))
+                .style(theme::input),
+            text(target).size(10.0).color(theme::DIM),
+            row![
+                catalog_move_buttons(index),
+                button(text("Remove").size(11.0))
+                    .padding([3, 6])
+                    .on_press(ConfigureMessage::RemoveCatalogEntry(index))
+                    .style(theme::ghost),
+            ]
+            .spacing(4),
+        ]
+        .spacing(2)
+        .width(Fill)
+        .into(),
+    }
+}
+
+fn catalog_move_buttons<'a>(index: usize) -> Element<'a, ConfigureMessage> {
+    row![
+        button(text("↑").size(11.0))
+            .padding([3, 6])
+            .on_press(ConfigureMessage::MoveCatalogEntry(index, true))
+            .style(theme::ghost),
+        button(text("↓").size(11.0))
+            .padding([3, 6])
+            .on_press(ConfigureMessage::MoveCatalogEntry(index, false))
+            .style(theme::ghost),
+    ]
+    .spacing(2)
+    .into()
 }
 
 #[cfg(feature = "dev-emulate")]
