@@ -34,7 +34,7 @@ use crate::popup_view::{self, ControllerRow, PopupMessage};
 use crate::prefs::{Prefs, clamp_low_battery_percent};
 use crate::process_match::{self, RunningSession};
 use crate::start_input::{
-    self, ButtonEdges, NavAction, NavLogSnapshot, NavSource, NavStepper, TriangleHold,
+    self, ButtonEdges, CrossHold, NavAction, NavLogSnapshot, NavSource, NavStepper, TriangleHold,
 };
 use crate::start_view::{self, ReplaceConfirm, StartMessage, StartSlide};
 use crate::steam::{self, SteamGame};
@@ -112,6 +112,7 @@ pub enum Message {
     StartKey {
         id: window::Id,
         action: StartKeyAction,
+        pressed: bool,
     },
     /// Periodic DualSense sample for gestures / start-screen navigation.
     PadPoll,
@@ -191,6 +192,11 @@ pub struct App {
     nav_stepper: NavStepper,
     button_edges: ButtonEdges,
     triangle_hold: TriangleHold,
+    cross_hold: CrossHold,
+    /// False after open until open-gesture buttons are released.
+    start_nav_armed: bool,
+    /// Keyboard Enter held (for hold-to-proceed on replace confirm).
+    confirm_key_held: bool,
     running_session: Option<RunningSession>,
     /// Throttle for process enumeration / catalog restore (not pad UI).
     last_running_check: Option<Instant>,
@@ -316,6 +322,9 @@ impl App {
             nav_stepper: NavStepper::default(),
             button_edges: ButtonEdges::default(),
             triangle_hold: TriangleHold::default(),
+            cross_hold: CrossHold::default(),
+            start_nav_armed: true,
+            confirm_key_held: false,
             running_session: None,
             last_running_check: None,
             match_path_cache: HashMap::new(),
@@ -399,7 +408,22 @@ impl App {
                         }
                         _ => None,
                     }?;
-                    Some(Message::StartKey { id, action })
+                    Some(Message::StartKey {
+                        id,
+                        action,
+                        pressed: true,
+                    })
+                }
+                iced::Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
+                    if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
+                        Some(Message::StartKey {
+                            id,
+                            action: StartKeyAction::Confirm,
+                            pressed: false,
+                        })
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             }),
@@ -545,20 +569,56 @@ impl App {
             Message::StartFrame => {
                 let now = Instant::now();
                 let _ = self.start_state.tick_anim(now);
+                // Keyboard-only hold progress when pad poll is not running.
+                if self.start_state.replace_confirm.is_some() && self.confirm_key_held {
+                    let (progress, completed) = self.cross_hold.update(true, now);
+                    self.start_state.cross_progress = progress;
+                    if completed {
+                        return self.complete_replace_confirm();
+                    }
+                }
                 Task::none()
             }
             Message::Start(message) => self.on_start_message(message),
-            Message::StartKey { id, action } => {
+            Message::StartKey {
+                id,
+                action,
+                pressed,
+            } => {
                 if Some(id) == self.start_window {
+                    if !self.start_nav_armed && pressed {
+                        return Task::none();
+                    }
                     return match action {
-                        StartKeyAction::Up => self.on_start_message(StartMessage::MoveUp),
-                        StartKeyAction::Down => self.on_start_message(StartMessage::MoveDown),
-                        StartKeyAction::Confirm => self.on_start_message(StartMessage::Confirm),
-                        StartKeyAction::Cancel => self.on_start_message(StartMessage::Close),
+                        StartKeyAction::Up if pressed => {
+                            self.on_start_message(StartMessage::MoveUp)
+                        }
+                        StartKeyAction::Down if pressed => {
+                            self.on_start_message(StartMessage::MoveDown)
+                        }
+                        StartKeyAction::Confirm => {
+                            if self.start_state.replace_confirm.is_some() {
+                                self.confirm_key_held = pressed;
+                                if !pressed {
+                                    self.cross_hold.reset();
+                                    self.start_state.cross_progress = 0.0;
+                                }
+                                Task::none()
+                            } else if pressed {
+                                self.on_start_message(StartMessage::Confirm)
+                            } else {
+                                Task::none()
+                            }
+                        }
+                        StartKeyAction::Cancel if pressed => {
+                            self.on_start_message(StartMessage::Close)
+                        }
+                        _ => Task::none(),
                     };
                 }
                 if Some(id) == self.configure_window
                     && action == StartKeyAction::Cancel
+                    && pressed
                     && self.gesture_recorder.is_active()
                 {
                     self.cancel_gesture_recording();
@@ -1127,7 +1187,12 @@ impl App {
                 self.prefs.save();
                 Task::none()
             }
-            ConfigureMessage::PreviewStartScreen => self.open_start_screen(),
+            ConfigureMessage::PreviewStartScreen => {
+                let task = self.open_start_screen();
+                // Settings preview has no open-gesture leftover holds.
+                self.start_nav_armed = true;
+                task
+            }
             ConfigureMessage::StartGestureRecord => {
                 self.gesture_recorder.start();
                 self.gesture_detector.reset();
@@ -1742,6 +1807,9 @@ impl App {
         if self.start_state.rows.is_empty() {
             return Task::none();
         }
+
+        self.prepare_start_nav_on_open(false);
+
         if let Some(id) = self.start_window {
             // Re-focus existing window; force running restore in case game started while closed.
             self.last_running_check = None;
@@ -1749,13 +1817,8 @@ impl App {
             return window::gain_focus(id);
         }
 
-        self.nav_stepper.reset();
-        self.button_edges.reset();
-        self.triangle_hold.reset();
         self.gesture_detector.reset();
         self.clear_start_nav_diag();
-        self.start_state.replace_confirm = None;
-        self.start_state.triangle_progress = 0.0;
         // refresh_start_rows already ran a throttled check; force one restore on open.
         self.last_running_check = None;
         self.refresh_running_badge();
@@ -1775,12 +1838,27 @@ impl App {
         open.map(Message::StartOpened)
     }
 
+    /// Reset to Games and (optionally) require a full control release before nav fires.
+    fn prepare_start_nav_on_open(&mut self, arm_immediately: bool) {
+        self.start_state.reset_to_games();
+        self.nav_stepper.reset();
+        self.button_edges.reset();
+        self.triangle_hold.reset();
+        self.cross_hold.reset();
+        self.confirm_key_held = false;
+        self.start_nav_armed = arm_immediately;
+    }
+
     fn close_start_screen(&mut self) -> Task<Message> {
         self.nav_stepper.reset();
         self.button_edges.reset();
         self.triangle_hold.reset();
+        self.cross_hold.reset();
+        self.confirm_key_held = false;
+        self.start_nav_armed = true;
         self.start_state.replace_confirm = None;
         self.start_state.triangle_progress = 0.0;
+        self.start_state.cross_progress = 0.0;
         self.clear_start_nav_diag();
         match self.start_window {
             Some(id) => window::set_mode(id, window::Mode::Hidden).chain(window::close(id)),
@@ -1853,30 +1931,24 @@ impl App {
                 }
             }
             StartMessage::PrevSlide => {
-                if !self.start_state.animating() {
-                    let now = Instant::now();
-                    let to = self.start_state.slide.other();
-                    // Prev: Controllers → Games (dir -1), Games → Controllers wrapping (dir -1)
-                    self.start_state.begin_slide(to, -1, now);
-                }
+                // L2: Controllers → Games only (no wrap). Interruptible mid-anim.
+                self.start_state
+                    .request_slide(StartSlide::Games, Instant::now());
                 Task::none()
             }
             StartMessage::NextSlide => {
-                if !self.start_state.animating() {
-                    let now = Instant::now();
-                    let to = self.start_state.slide.other();
-                    self.start_state.begin_slide(to, 1, now);
-                }
+                // R2: Games → Controllers only (no wrap). Interruptible mid-anim.
+                self.start_state
+                    .request_slide(StartSlide::Controllers, Instant::now());
                 Task::none()
             }
         }
     }
 
     fn on_start_confirm(&mut self) -> Task<Message> {
-        if let Some(confirm) = self.start_state.replace_confirm.take() {
-            self.close_running_game();
-            self.start_state.game_selected = confirm.next_index;
-            return self.launch_selected();
+        // Replace confirm requires hold-Cross / hold-Enter (see pad poll / key hold).
+        if self.start_state.replace_confirm.is_some() {
+            return Task::none();
         }
         match self.start_state.slide {
             StartSlide::Games => self.launch_selected(),
@@ -1888,6 +1960,18 @@ impl App {
                 Task::none()
             }
         }
+    }
+
+    fn complete_replace_confirm(&mut self) -> Task<Message> {
+        let Some(confirm) = self.start_state.replace_confirm.take() else {
+            return Task::none();
+        };
+        self.cross_hold.reset();
+        self.confirm_key_held = false;
+        self.start_state.cross_progress = 0.0;
+        self.close_running_game();
+        self.start_state.game_selected = confirm.next_index;
+        self.launch_selected()
     }
 
     fn launch_selected(&mut self) -> Task<Message> {
@@ -1989,6 +2073,42 @@ impl App {
                     let now = Instant::now();
                     let _ = self.start_state.tick_anim(now);
 
+                    if !self.start_nav_armed {
+                        self.button_edges.sync(&sample);
+                        self.nav_stepper.reset();
+                        self.triangle_hold.reset();
+                        self.cross_hold.reset();
+                        self.start_state.triangle_progress = 0.0;
+                        self.start_state.cross_progress = 0.0;
+                        if start_input::sample_nav_resting(&sample) {
+                            self.start_nav_armed = true;
+                        }
+                        return task;
+                    }
+
+                    // Replace confirm: hold Cross (or keyboard Enter) to proceed.
+                    if self.start_state.replace_confirm.is_some() {
+                        let cross_held = sample.cross || self.confirm_key_held;
+                        let (progress, completed) = self.cross_hold.update(cross_held, now);
+                        self.start_state.cross_progress = progress;
+                        self.start_state.triangle_progress = 0.0;
+                        self.triangle_hold.reset();
+                        if completed {
+                            return task.chain(self.complete_replace_confirm());
+                        }
+                        // Circle cancels immediately; Cross tap / stick ignored.
+                        if let Some(action) = self.button_edges.update(&sample)
+                            && action == NavAction::Cancel
+                        {
+                            return task.chain(self.on_start_message(StartMessage::Close));
+                        }
+                        return task;
+                    }
+
+                    self.start_state.cross_progress = 0.0;
+                    self.cross_hold.reset();
+                    self.confirm_key_held = false;
+
                     // Triangle hold: Games closes running game; Controllers powers off BT pad.
                     let (progress, completed) = self.triangle_hold.update(sample.triangle, now);
                     self.start_state.triangle_progress = progress;
@@ -2023,20 +2143,8 @@ impl App {
                         let next = match action {
                             NavAction::Confirm => self.on_start_message(StartMessage::Confirm),
                             NavAction::Cancel => self.on_start_message(StartMessage::Close),
-                            NavAction::PrevSlide => {
-                                if self.start_state.animating() {
-                                    Task::none()
-                                } else {
-                                    self.on_start_message(StartMessage::PrevSlide)
-                                }
-                            }
-                            NavAction::NextSlide => {
-                                if self.start_state.animating() {
-                                    Task::none()
-                                } else {
-                                    self.on_start_message(StartMessage::NextSlide)
-                                }
-                            }
+                            NavAction::PrevSlide => self.on_start_message(StartMessage::PrevSlide),
+                            NavAction::NextSlide => self.on_start_message(StartMessage::NextSlide),
                             NavAction::Up | NavAction::Down => Task::none(),
                         };
                         return task.chain(next);

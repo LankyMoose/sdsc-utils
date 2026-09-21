@@ -31,8 +31,6 @@ pub enum NavAction {
     NextSlide,
 }
 
-const TRIANGLE_HOLD: Duration = Duration::from_secs(1);
-
 #[derive(Debug, Clone, Default)]
 pub struct PadSample {
     pub held: BTreeSet<GestureControl>,
@@ -209,11 +207,16 @@ impl ButtonEdges {
         } else if sample.r2 && !self.r2 {
             action = Some(NavAction::NextSlide);
         }
+        self.sync(sample);
+        action
+    }
+
+    /// Track held buttons without emitting rising-edge actions (used while nav is disarmed).
+    pub fn sync(&mut self, sample: &PadSample) {
         self.cross = sample.cross;
         self.circle = sample.circle;
         self.l2 = sample.l2;
         self.r2 = sample.r2;
-        action
     }
 
     pub fn reset(&mut self) {
@@ -221,14 +224,16 @@ impl ButtonEdges {
     }
 }
 
-/// Tracks Triangle hold progress (0..=1) and fires once after [`TRIANGLE_HOLD`].
+/// Tracks a face-button hold (0..=1) and fires once after [`BUTTON_HOLD`].
 #[derive(Debug, Clone, Default)]
-pub struct TriangleHold {
+pub struct HoldTracker {
     started: Option<Instant>,
     fired: bool,
 }
 
-impl TriangleHold {
+const BUTTON_HOLD: Duration = Duration::from_secs(1);
+
+impl HoldTracker {
     /// Returns `(progress, just_completed)`.
     pub fn update(&mut self, held: bool, now: Instant) -> (f32, bool) {
         if !held {
@@ -238,7 +243,7 @@ impl TriangleHold {
         }
         let started = *self.started.get_or_insert(now);
         let elapsed = now.saturating_duration_since(started);
-        let progress = (elapsed.as_secs_f32() / TRIANGLE_HOLD.as_secs_f32()).min(1.0);
+        let progress = (elapsed.as_secs_f32() / BUTTON_HOLD.as_secs_f32()).min(1.0);
         if progress >= 1.0 && !self.fired {
             self.fired = true;
             return (1.0, true);
@@ -249,6 +254,22 @@ impl TriangleHold {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
+}
+
+/// Triangle / Cross hold trackers share the same timing.
+pub type TriangleHold = HoldTracker;
+pub type CrossHold = HoldTracker;
+
+/// True when face buttons, triggers, D-pad, and stick are at rest (safe to arm start nav).
+pub fn sample_nav_resting(sample: &PadSample) -> bool {
+    !sample.cross
+        && !sample.circle
+        && !sample.triangle
+        && !sample.l2
+        && !sample.r2
+        && !sample.dpad_up
+        && !sample.dpad_down
+        && sample.stick_y == 0.0
 }
 
 /// Read start-screen navigation: Gaming.Input Gamepad first, then short DualSense HID.
@@ -769,5 +790,28 @@ mod tests {
         };
         assert_eq!(edges.update(&sample), Some(NavAction::Confirm));
         assert!(edges.update(&sample).is_none());
+    }
+
+    #[test]
+    fn button_edges_sync_then_held_r2_does_not_fire() {
+        let mut edges = ButtonEdges::default();
+        let held = PadSample {
+            r2: true,
+            ..Default::default()
+        };
+        edges.sync(&held);
+        assert!(edges.update(&held).is_none());
+        let released = PadSample::default();
+        assert!(edges.update(&released).is_none());
+        assert_eq!(edges.update(&held), Some(NavAction::NextSlide));
+    }
+
+    #[test]
+    fn sample_nav_resting_requires_clear_controls() {
+        assert!(sample_nav_resting(&PadSample::default()));
+        assert!(!sample_nav_resting(&PadSample {
+            r2: true,
+            ..Default::default()
+        }));
     }
 }

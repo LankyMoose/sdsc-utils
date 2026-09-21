@@ -24,15 +24,19 @@ pub const WIDTH: f32 = 640.0;
 /// Logical height of the start-screen window.
 pub const HEIGHT: f32 = 720.0;
 
-pub const SLIDE_ANIM_MS: u64 = 220;
+pub const SLIDE_ANIM_MS: u64 = 360;
+const SLIDE_ANIM_MIN_MS: u64 = 120;
 const HEADER_HEIGHT: f32 = 52.0;
 const ROW_HEIGHT: f32 = 88.0;
 const CONTROLLER_ROW_HEIGHT: f32 = 100.0;
 const PADDING: f32 = 20.0;
 const ICON_SIZE: f32 = 56.0;
 const HOLD_RING_SIZE: f32 = 32.0;
+const FACE_GLYPH_SIZE: f32 = 18.0;
 const ROW_GAP: f32 = 10.0;
 const ACCENT_BAR_W: f32 = 4.0;
+/// Body width inside outer padding — dual-pane strip unit.
+const PANE_W: f32 = WIDTH - 2.0 * PADDING;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StartSlide {
@@ -46,13 +50,6 @@ impl StartSlide {
         match self {
             Self::Games => "Games",
             Self::Controllers => "Controllers",
-        }
-    }
-
-    pub fn other(self) -> Self {
-        match self {
-            Self::Games => Self::Controllers,
-            Self::Controllers => Self::Games,
         }
     }
 }
@@ -122,10 +119,9 @@ pub struct StartControllerRow {
 
 #[derive(Debug, Clone)]
 struct SlideAnim {
-    from: StartSlide,
+    from_x: f32,
     to: StartSlide,
-    /// -1 = to the left (Prev), +1 = to the right (Next).
-    direction: i8,
+    duration_ms: u64,
     started: Instant,
 }
 
@@ -146,6 +142,7 @@ pub struct State {
     pub running_target: Option<String>,
     pub replace_confirm: Option<ReplaceConfirm>,
     pub triangle_progress: f32,
+    pub cross_progress: f32,
     anim: Option<SlideAnim>,
 }
 
@@ -160,6 +157,7 @@ impl Default for State {
             running_target: None,
             replace_confirm: None,
             triangle_progress: 0.0,
+            cross_progress: 0.0,
             anim: None,
         }
     }
@@ -184,12 +182,24 @@ impl State {
         }
     }
 
+    /// Land on Games with no in-flight anim (used whenever the start screen opens).
+    pub fn reset_to_games(&mut self) {
+        self.slide = StartSlide::Games;
+        self.anim = None;
+        self.replace_confirm = None;
+        self.triangle_progress = 0.0;
+        self.cross_progress = 0.0;
+    }
+
     pub fn animating(&self) -> bool {
         self.anim.is_some()
     }
 
     pub fn needs_frames(&self) -> bool {
-        self.anim.is_some() || self.triangle_progress > 0.0
+        self.anim.is_some()
+            || self.triangle_progress > 0.0
+            || self.cross_progress > 0.0
+            || self.replace_confirm.is_some()
     }
 
     pub fn tick_anim(&mut self, now: Instant) -> bool {
@@ -197,7 +207,7 @@ impl State {
             return false;
         };
         let elapsed = now.saturating_duration_since(anim.started);
-        if elapsed >= Duration::from_millis(SLIDE_ANIM_MS) {
+        if elapsed >= Duration::from_millis(anim.duration_ms) {
             self.slide = anim.to;
             self.anim = None;
             return true;
@@ -205,21 +215,41 @@ impl State {
         true
     }
 
-    pub fn begin_slide(&mut self, to: StartSlide, direction: i8, now: Instant) {
-        if self.anim.is_some() || to == self.slide {
+    /// Request a slide target. Interruptible: restarts from the current scroll position.
+    /// No-op if already at / animating toward `to`.
+    pub fn request_slide(&mut self, to: StartSlide, now: Instant) {
+        if self.anim.as_ref().is_some_and(|a| a.to == to) {
             return;
         }
+        if self.anim.is_none() && self.slide == to {
+            return;
+        }
+
+        let from_x = self.slide_scroll_x(now);
+        let to_x = slide_x(to);
+        let distance = (to_x - from_x).abs();
+        if distance < 0.5 {
+            self.slide = to;
+            self.anim = None;
+            return;
+        }
+
+        let duration_ms = ((SLIDE_ANIM_MS as f32) * (distance / PANE_W))
+            .round()
+            .clamp(SLIDE_ANIM_MIN_MS as f32, SLIDE_ANIM_MS as f32) as u64;
+
         self.replace_confirm = None;
+        self.cross_progress = 0.0;
         self.anim = Some(SlideAnim {
-            from: self.slide,
+            from_x,
             to,
-            direction,
+            duration_ms,
             started: now,
         });
     }
 
     pub fn move_selection(&mut self, delta: i32) {
-        if self.replace_confirm.is_some() {
+        if self.replace_confirm.is_some() || self.anim.is_some() {
             return;
         }
         match self.slide {
@@ -245,14 +275,31 @@ impl State {
         self.controllers.get(self.controller_selected)
     }
 
-    fn anim_offset(&self, now: Instant) -> f32 {
+    /// Horizontal scroll of the dual-pane strip (0 = Games, PANE_W = Controllers).
+    fn slide_scroll_x(&self, now: Instant) -> f32 {
         let Some(anim) = self.anim.as_ref() else {
-            return 0.0;
+            return slide_x(self.slide);
         };
         let t = now.saturating_duration_since(anim.started).as_secs_f32()
-            / (SLIDE_ANIM_MS as f32 / 1000.0);
+            / (anim.duration_ms as f32 / 1000.0).max(0.001);
         let eased = window_layout::ease_out_cubic(t.clamp(0.0, 1.0));
-        -anim.direction as f32 * WIDTH * eased
+        let to_x = slide_x(anim.to);
+        anim.from_x + (to_x - anim.from_x) * eased
+    }
+
+    fn header_slide(&self, now: Instant) -> StartSlide {
+        if self.slide_scroll_x(now) >= PANE_W * 0.5 {
+            StartSlide::Controllers
+        } else {
+            StartSlide::Games
+        }
+    }
+}
+
+fn slide_x(slide: StartSlide) -> f32 {
+    match slide {
+        StartSlide::Games => 0.0,
+        StartSlide::Controllers => PANE_W,
     }
 }
 
@@ -261,7 +308,7 @@ pub fn view<'a>(
     spectrum: &BatterySpectrum,
     now: Instant,
 ) -> Element<'a, StartMessage> {
-    let shown = visible_slide(state, now);
+    let shown = state.header_slide(now);
     let header = slide_header(shown);
 
     let body = if state.replace_confirm.is_some() {
@@ -279,10 +326,7 @@ pub fn view<'a>(
                 .width(Fill)
                 .height(Length::Fixed(1.0))
                 .style(theme::configure_header_rule),
-            container(body)
-                .padding(Padding::from([PADDING, 0.0]))
-                .width(Fill)
-                .height(Fill),
+            container(body).width(Fill).height(Fill),
             hint,
         ]
         .spacing(10)
@@ -296,46 +340,46 @@ pub fn view<'a>(
     .into()
 }
 
-fn visible_slide(state: &State, now: Instant) -> StartSlide {
-    if let Some(anim) = state.anim.as_ref() {
-        if state.anim_offset(now).abs() > WIDTH * 0.35 {
-            return anim.to;
-        }
-        return anim.from;
-    }
-    state.slide
-}
-
-/// Games: title left, `R2 Controllers` cue right. Controllers: `Games L2` left, title right.
+/// Three equal columns: left cue | centered title | right cue.
 fn slide_header(slide: StartSlide) -> Element<'static, StartMessage> {
-    match slide {
-        StartSlide::Games => row![
-            text(slide.title()).size(30.0).color(theme::INK),
-            space().width(Fill),
-            row![
-                text("R2").size(14.0).color(theme::ACCENT),
-                text("Controllers").size(14.0).color(theme::MUTED),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        ]
-        .align_y(Alignment::Center)
-        .height(Length::Fixed(HEADER_HEIGHT))
-        .into(),
+    let left: Element<'static, StartMessage> = match slide {
         StartSlide::Controllers => row![
-            row![
-                text("Games").size(14.0).color(theme::MUTED),
-                text("L2").size(14.0).color(theme::ACCENT),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-            space().width(Fill),
-            text(slide.title()).size(30.0).color(theme::INK),
+            text("Games").size(14.0).color(theme::MUTED),
+            text("L2").size(14.0).color(theme::ACCENT),
         ]
+        .spacing(8)
         .align_y(Alignment::Center)
-        .height(Length::Fixed(HEADER_HEIGHT))
         .into(),
-    }
+        StartSlide::Games => space().into(),
+    };
+    let right: Element<'static, StartMessage> = match slide {
+        StartSlide::Games => row![
+            text("R2").size(14.0).color(theme::ACCENT),
+            text("Controllers").size(14.0).color(theme::MUTED),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into(),
+        StartSlide::Controllers => space().into(),
+    };
+
+    row![
+        container(left)
+            .width(Fill)
+            .align_x(Alignment::Start)
+            .center_y(Fill),
+        container(text(slide.title()).size(30.0).color(theme::INK))
+            .width(Fill)
+            .center_x(Fill)
+            .center_y(Fill),
+        container(right)
+            .width(Fill)
+            .align_x(Alignment::End)
+            .center_y(Fill),
+    ]
+    .align_y(Alignment::Center)
+    .height(Length::Fixed(HEADER_HEIGHT))
+    .into()
 }
 
 fn carousel_body<'a>(
@@ -343,18 +387,29 @@ fn carousel_body<'a>(
     spectrum: &BatterySpectrum,
     now: Instant,
 ) -> Element<'a, StartMessage> {
-    slide_content(state, visible_slide(state, now), spectrum)
-}
+    let scroll = state.slide_scroll_x(now);
+    let strip = row![
+        container(games_list(state))
+            .width(Length::Fixed(PANE_W))
+            .height(Fill),
+        container(controllers_list(state, spectrum))
+            .width(Length::Fixed(PANE_W))
+            .height(Fill),
+    ]
+    .width(Length::Fixed(PANE_W * 2.0))
+    .height(Fill);
 
-fn slide_content<'a>(
-    state: &'a State,
-    slide: StartSlide,
-    spectrum: &BatterySpectrum,
-) -> Element<'a, StartMessage> {
-    match slide {
-        StartSlide::Games => games_list(state),
-        StartSlide::Controllers => controllers_list(state, spectrum),
-    }
+    container(strip)
+        .width(Length::Fixed(PANE_W))
+        .height(Fill)
+        .clip(true)
+        .padding(Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: -scroll,
+        })
+        .into()
 }
 
 fn games_list(state: &State) -> Element<'_, StartMessage> {
@@ -423,11 +478,24 @@ fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
             ))
             .size(14.0)
             .color(theme::MUTED),
-            text("Cross confirm · Circle cancel")
-                .size(13.0)
-                .color(theme::DIM),
+            space().height(8),
+            action_cluster(&[
+                ActionHint {
+                    face: FaceButton::Cross,
+                    label: "Proceed",
+                    hold: Some(state.cross_progress),
+                    hold_prefix: true,
+                },
+                ActionHint {
+                    face: FaceButton::Circle,
+                    label: "Cancel",
+                    hold: None,
+                    hold_prefix: false,
+                },
+            ]),
         ]
-        .spacing(12),
+        .spacing(12)
+        .align_x(Alignment::Center),
     )
     .width(Fill)
     .height(Fill)
@@ -436,28 +504,146 @@ fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
     .into()
 }
 
-fn footer_hint(state: &State) -> Element<'_, StartMessage> {
-    let label = if state.replace_confirm.is_some() {
-        "Cross confirm · Circle cancel".to_string()
-    } else {
-        match state.slide {
-            StartSlide::Games => {
-                if state.running_target.is_some() {
-                    "Hold △ to close game · Circle dismiss".into()
-                } else {
-                    "Cross launch · Circle dismiss".into()
-                }
-            }
-            StartSlide::Controllers => "Cross identify · Hold △ power off · Circle dismiss".into(),
+#[derive(Clone, Copy)]
+enum FaceButton {
+    Cross,
+    Circle,
+    Triangle,
+}
+
+impl FaceButton {
+    fn svg(self) -> &'static str {
+        match self {
+            Self::Cross => svg_icon::FACE_CROSS_SVG,
+            Self::Circle => svg_icon::FACE_CIRCLE_SVG,
+            Self::Triangle => svg_icon::FACE_TRIANGLE_SVG,
         }
+    }
+}
+
+struct ActionHint {
+    face: FaceButton,
+    label: &'static str,
+    hold: Option<f32>,
+    hold_prefix: bool,
+}
+
+fn footer_hint(state: &State) -> Element<'_, StartMessage> {
+    if state.replace_confirm.is_some() {
+        return container(action_cluster(&[
+            ActionHint {
+                face: FaceButton::Cross,
+                label: "Proceed",
+                hold: Some(state.cross_progress),
+                hold_prefix: true,
+            },
+            ActionHint {
+                face: FaceButton::Circle,
+                label: "Cancel",
+                hold: None,
+                hold_prefix: false,
+            },
+        ]))
+        .width(Fill)
+        .center_x(Fill)
+        .into();
+    }
+
+    let hints: Vec<ActionHint> = match state.slide {
+        StartSlide::Games => {
+            let mut v = vec![
+                ActionHint {
+                    face: FaceButton::Cross,
+                    label: "Launch",
+                    hold: None,
+                    hold_prefix: false,
+                },
+                ActionHint {
+                    face: FaceButton::Circle,
+                    label: "Close",
+                    hold: None,
+                    hold_prefix: false,
+                },
+            ];
+            if state.running_target.is_some() {
+                v.push(ActionHint {
+                    face: FaceButton::Triangle,
+                    label: "Close game",
+                    hold: Some(state.triangle_progress),
+                    hold_prefix: true,
+                });
+            }
+            v
+        }
+        StartSlide::Controllers => vec![
+            ActionHint {
+                face: FaceButton::Cross,
+                label: "Identify",
+                hold: None,
+                hold_prefix: false,
+            },
+            ActionHint {
+                face: FaceButton::Triangle,
+                label: "Power off",
+                hold: Some(state.triangle_progress),
+                hold_prefix: true,
+            },
+            ActionHint {
+                face: FaceButton::Circle,
+                label: "Close",
+                hold: None,
+                hold_prefix: false,
+            },
+        ],
+    };
+    container(action_cluster(&hints))
+        .width(Fill)
+        .center_x(Fill)
+        .into()
+}
+
+fn action_cluster(hints: &[ActionHint]) -> Element<'static, StartMessage> {
+    let mut row = row![].spacing(28).align_y(Alignment::Center);
+    for hint in hints {
+        row = row.push(action_hint(hint));
+    }
+    row.into()
+}
+
+fn action_hint(hint: &ActionHint) -> Element<'static, StartMessage> {
+    let glyph: Element<'static, StartMessage> = if let Some(progress) = hint.hold {
+        hold_glyph(hint.face, progress)
+    } else {
+        face_svg(hint.face)
     };
 
-    row![
-        text(label).size(14.0).color(theme::MUTED),
-        space().width(Fill),
-        hold_ring(state.triangle_progress),
+    let mut parts = row![].spacing(8).align_y(Alignment::Center);
+    if hint.hold_prefix && hint.hold.is_some() {
+        parts = parts.push(text("Hold").size(14.0).color(theme::MUTED));
+    }
+    parts = parts.push(glyph);
+    parts = parts.push(text(hint.label).size(14.0).color(theme::MUTED));
+    parts.into()
+}
+
+fn face_svg(face: FaceButton) -> Element<'static, StartMessage> {
+    svg(svg::Handle::from_memory(face.svg().as_bytes()))
+        .width(Length::Fixed(FACE_GLYPH_SIZE))
+        .height(Length::Fixed(FACE_GLYPH_SIZE))
+        .into()
+}
+
+fn hold_glyph(face: FaceButton, progress: f32) -> Element<'static, StartMessage> {
+    iced::widget::stack![
+        hold_ring(progress),
+        container(face_svg(face))
+            .width(Length::Fixed(HOLD_RING_SIZE))
+            .height(Length::Fixed(HOLD_RING_SIZE))
+            .center_x(Fill)
+            .center_y(Fill),
     ]
-    .align_y(Alignment::Center)
+    .width(Length::Fixed(HOLD_RING_SIZE))
+    .height(Length::Fixed(HOLD_RING_SIZE))
     .into()
 }
 
@@ -515,14 +701,6 @@ impl canvas::Program<StartMessage> for HoldRing {
                 Stroke::default().with_width(2.5).with_color(theme::ACCENT),
             );
         }
-        frame.fill(
-            &Path::circle(center, radius * 0.35),
-            if self.progress > 0.0 {
-                theme::ACCENT
-            } else {
-                theme::DIM
-            },
-        );
         vec![frame.into_geometry()]
     }
 }
