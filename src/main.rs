@@ -24,6 +24,7 @@ mod percent_ring;
 mod poll;
 mod popup_view;
 mod prefs;
+mod process_match;
 mod start_input;
 mod start_view;
 mod steam;

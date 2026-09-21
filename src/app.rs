@@ -32,8 +32,11 @@ use crate::poll::{
 };
 use crate::popup_view::{self, ControllerRow, PopupMessage};
 use crate::prefs::{Prefs, clamp_low_battery_percent};
-use crate::start_input::{self, ButtonEdges, NavAction, NavLogSnapshot, NavSource, NavStepper};
-use crate::start_view::{self, StartMessage};
+use crate::process_match::{self, RunningSession};
+use crate::start_input::{
+    self, ButtonEdges, NavAction, NavLogSnapshot, NavSource, NavStepper, TriangleHold,
+};
+use crate::start_view::{self, ReplaceConfirm, StartMessage, StartSlide};
 use crate::steam::{self, SteamGame};
 use crate::theme;
 use crate::toast::ToastMessage;
@@ -72,6 +75,8 @@ const TOAST_LIFETIME: Duration = Duration::from_secs(5);
 const START_CONNECT_COOLDOWN: Duration = Duration::from_secs(5);
 /// DualSense poll rate while start-screen input / gesture listening is active.
 const PAD_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Process/catalog running checks are expensive; never run them at pad-poll rate.
+const RUNNING_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -100,6 +105,8 @@ pub enum Message {
     Configure(ConfigureMessage),
 
     StartOpened(window::Id),
+    /// Drive start-screen slide / Triangle-hold animation frames.
+    StartFrame,
     Start(StartMessage),
     /// Keyboard while some iced window has focus; filtered to the start screen in update.
     StartKey {
@@ -183,6 +190,12 @@ pub struct App {
     gesture_recorder: GestureRecorder,
     nav_stepper: NavStepper,
     button_edges: ButtonEdges,
+    triangle_hold: TriangleHold,
+    running_session: Option<RunningSession>,
+    /// Throttle for process enumeration / catalog restore (not pad UI).
+    last_running_check: Option<Instant>,
+    /// Cached `match_paths_for_target` results (cleared on Steam library refresh).
+    match_path_cache: HashMap<String, Vec<PathBuf>>,
     steam_by_id: HashMap<u32, SteamGame>,
     /// `Some` after a successful Steam library scan (installed appids). `None` = unknown.
     steam_installed: Option<Vec<u32>>,
@@ -302,6 +315,10 @@ impl App {
             gesture_recorder: GestureRecorder::default(),
             nav_stepper: NavStepper::default(),
             button_edges: ButtonEdges::default(),
+            triangle_hold: TriangleHold::default(),
+            running_session: None,
+            last_running_check: None,
+            match_path_cache: HashMap::new(),
             steam_by_id: HashMap::new(),
             steam_installed: None,
             hid_exclusive_warned: false,
@@ -414,6 +431,10 @@ impl App {
             subscriptions.push(iced::time::every(PAD_POLL_INTERVAL).map(|_| Message::PadPoll));
         }
 
+        if self.start_window.is_some() && self.start_state.needs_frames() {
+            subscriptions.push(window::frames().map(|_| Message::StartFrame));
+        }
+
         Subscription::batch(subscriptions)
     }
 
@@ -435,7 +456,8 @@ impl App {
         }
 
         if Some(window) == self.start_window {
-            return start_view::view(&self.start_state).map(Message::Start);
+            return start_view::view(&self.start_state, &self.prefs.spectrum, Instant::now())
+                .map(Message::Start);
         }
 
         if Some(window) == self.toast_window {
@@ -519,6 +541,11 @@ impl App {
 
             Message::StartOpened(id) => {
                 window::set_mode(id, window::Mode::Windowed).chain(window::gain_focus(id))
+            }
+            Message::StartFrame => {
+                let now = Instant::now();
+                let _ = self.start_state.tick_anim(now);
+                Task::none()
             }
             Message::Start(message) => self.on_start_message(message),
             Message::StartKey { id, action } => {
@@ -1505,6 +1532,158 @@ impl App {
         self.start_state.set_rows(rows);
     }
 
+    fn refresh_start_controllers(&mut self) {
+        let rows: Vec<_> = self
+            .controllers
+            .iter()
+            .map(|c| {
+                let nickname = self.known.nickname(&c.serial);
+                let eta = if self.prefs.analytics_enabled {
+                    self.analytics.eta_for(c).map(analytics::format_eta_ring)
+                } else {
+                    None
+                };
+                start_view::StartControllerRow {
+                    serial: c.serial.clone(),
+                    title: start_view::controller_title(c.product, nickname),
+                    connection: c.connection.to_string(),
+                    state: if c.is_low_battery(self.prefs.low_battery_percent) {
+                        "low battery".into()
+                    } else {
+                        start_view::power_state_label(c.state).into()
+                    },
+                    percent: c.percent,
+                    low: c.is_low_battery(self.prefs.low_battery_percent),
+                    bluetooth: c.connection.eq_ignore_ascii_case("Bluetooth"),
+                    eta,
+                }
+            })
+            .collect();
+        self.start_state.set_controllers(rows);
+    }
+
+    fn refresh_running_badge(&mut self) {
+        self.refresh_running_badge_inner(false);
+    }
+
+    fn refresh_running_badge_inner(&mut self, force: bool) {
+        let now = Instant::now();
+
+        // Optimistic UI during Steam/game start — no process enumeration.
+        if let Some(session) = self.running_session.as_ref()
+            && now.duration_since(session.launched_at) < process_match::LAUNCH_GRACE
+        {
+            self.start_state.running_target = Some(session.target.clone());
+            return;
+        }
+
+        if !force
+            && self
+                .last_running_check
+                .is_some_and(|t| now.duration_since(t) < RUNNING_CHECK_INTERVAL)
+        {
+            return;
+        }
+        self.last_running_check = Some(now);
+
+        if let Some(session) = self.running_session.as_mut() {
+            if process_match::any_matching_running(&session.match_paths) {
+                session.miss_since = None;
+                self.start_state.running_target = Some(session.target.clone());
+                return;
+            }
+
+            match session.miss_since {
+                None => {
+                    session.miss_since = Some(now);
+                    self.start_state.running_target = Some(session.target.clone());
+                    return;
+                }
+                Some(since) if now.duration_since(since) < process_match::MISS_CLEAR => {
+                    self.start_state.running_target = Some(session.target.clone());
+                    return;
+                }
+                Some(_) => {
+                    let target = session.target.clone();
+                    app_log::info(format!("running session cleared (process miss): {target}"));
+                    self.running_session = None;
+                    self.start_state.running_target = None;
+                }
+            }
+        } else {
+            self.start_state.running_target = None;
+        }
+
+        self.try_restore_running_from_catalog();
+    }
+
+    fn cached_match_paths(&mut self, target: &str) -> Vec<PathBuf> {
+        if let Some(paths) = self.match_path_cache.get(target) {
+            return paths.clone();
+        }
+        let paths = process_match::match_paths_for_target(target);
+        self.match_path_cache
+            .insert(target.to_string(), paths.clone());
+        paths
+    }
+
+    /// Scan catalog targets for a live process (single process snapshot).
+    fn try_restore_running_from_catalog(&mut self) {
+        let candidates: Vec<(String, String)> = self
+            .start_state
+            .rows
+            .iter()
+            .map(|r| (r.title.clone(), r.target.clone()))
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+
+        let path_sets: Vec<Vec<PathBuf>> = candidates
+            .iter()
+            .map(|(_, target)| self.cached_match_paths(target))
+            .collect();
+
+        let Some(idx) = process_match::first_matching_index(&path_sets) else {
+            return;
+        };
+        let (title, target) = candidates[idx].clone();
+        if self
+            .running_session
+            .as_ref()
+            .is_some_and(|s| s.matches_target(&target))
+        {
+            self.start_state.running_target = Some(target);
+            return;
+        }
+        let match_paths = path_sets[idx].clone();
+        app_log::info(format!("running session restored: {target}"));
+        self.running_session = Some(RunningSession::restored(title, target.clone(), match_paths));
+        self.start_state.running_target = Some(target);
+    }
+
+    fn begin_running_session(&mut self, title: String, target: String) {
+        let match_paths = self.cached_match_paths(&target);
+        if match_paths.is_empty() {
+            app_log::warn(format!(
+                "running session: empty match_paths for {target} (badge may clear after grace)"
+            ));
+        }
+        self.running_session = Some(RunningSession::new(title, target.clone(), match_paths));
+        self.start_state.running_target = Some(target);
+    }
+
+    fn close_running_game(&mut self) {
+        let Some(session) = self.running_session.clone() else {
+            return;
+        };
+        if let Err(err) = process_match::close_matching(&session.match_paths) {
+            app_log::warn(format!("close game failed for {}: {err}", session.target));
+        }
+        self.running_session = None;
+        self.start_state.running_target = None;
+    }
+
     fn refresh_steam_library(&self) -> Task<Message> {
         Task::perform(
             spawn_blocking(steam::list_installed_games),
@@ -1532,6 +1711,7 @@ impl App {
                 self.start_screen_panel.steam_games.clear();
             }
         }
+        self.match_path_cache.clear();
         self.refresh_start_rows();
         Task::none()
     }
@@ -1558,17 +1738,27 @@ impl App {
             return Task::none();
         }
         self.refresh_start_rows();
+        self.refresh_start_controllers();
         if self.start_state.rows.is_empty() {
             return Task::none();
         }
         if let Some(id) = self.start_window {
+            // Re-focus existing window; force running restore in case game started while closed.
+            self.last_running_check = None;
+            self.refresh_running_badge();
             return window::gain_focus(id);
         }
 
         self.nav_stepper.reset();
         self.button_edges.reset();
+        self.triangle_hold.reset();
         self.gesture_detector.reset();
         self.clear_start_nav_diag();
+        self.start_state.replace_confirm = None;
+        self.start_state.triangle_progress = 0.0;
+        // refresh_start_rows already ran a throttled check; force one restore on open.
+        self.last_running_check = None;
+        self.refresh_running_badge();
 
         let (id, open) = window::open(window::Settings {
             size: Size::new(start_view::WIDTH, start_view::HEIGHT),
@@ -1588,6 +1778,9 @@ impl App {
     fn close_start_screen(&mut self) -> Task<Message> {
         self.nav_stepper.reset();
         self.button_edges.reset();
+        self.triangle_hold.reset();
+        self.start_state.replace_confirm = None;
+        self.start_state.triangle_progress = 0.0;
         self.clear_start_nav_diag();
         match self.start_window {
             Some(id) => window::set_mode(id, window::Mode::Hidden).chain(window::close(id)),
@@ -1633,9 +1826,15 @@ impl App {
         match message {
             StartMessage::Launch(index) => {
                 if index < self.start_state.rows.len() {
-                    self.start_state.selected = index;
+                    self.start_state.game_selected = index;
                 }
                 self.launch_selected()
+            }
+            StartMessage::SelectController(index) => {
+                if index < self.start_state.controllers.len() {
+                    self.start_state.controller_selected = index;
+                }
+                Task::none()
             }
             StartMessage::MoveUp => {
                 self.start_state.move_selection(-1);
@@ -1645,20 +1844,85 @@ impl App {
                 self.start_state.move_selection(1);
                 Task::none()
             }
-            StartMessage::Confirm => self.launch_selected(),
-            StartMessage::Close => self.close_start_screen(),
+            StartMessage::Confirm => self.on_start_confirm(),
+            StartMessage::Close => {
+                if self.start_state.replace_confirm.take().is_some() {
+                    Task::none()
+                } else {
+                    self.close_start_screen()
+                }
+            }
+            StartMessage::PrevSlide => {
+                if !self.start_state.animating() {
+                    let now = Instant::now();
+                    let to = self.start_state.slide.other();
+                    // Prev: Controllers → Games (dir -1), Games → Controllers wrapping (dir -1)
+                    self.start_state.begin_slide(to, -1, now);
+                }
+                Task::none()
+            }
+            StartMessage::NextSlide => {
+                if !self.start_state.animating() {
+                    let now = Instant::now();
+                    let to = self.start_state.slide.other();
+                    self.start_state.begin_slide(to, 1, now);
+                }
+                Task::none()
+            }
+        }
+    }
+
+    fn on_start_confirm(&mut self) -> Task<Message> {
+        if let Some(confirm) = self.start_state.replace_confirm.take() {
+            self.close_running_game();
+            self.start_state.game_selected = confirm.next_index;
+            return self.launch_selected();
+        }
+        match self.start_state.slide {
+            StartSlide::Games => self.launch_selected(),
+            StartSlide::Controllers => {
+                if let Some(row) = self.start_state.selected_controller() {
+                    let serial = row.serial.clone();
+                    let _ = self.identify(&serial);
+                }
+                Task::none()
+            }
         }
     }
 
     fn launch_selected(&mut self) -> Task<Message> {
-        let Some(target) = self.start_state.selected_target().map(str::to_string) else {
+        let Some(row) = self
+            .start_state
+            .rows
+            .get(self.start_state.game_selected)
+            .cloned()
+        else {
             return Task::none();
         };
-        match launch::launch_target(&target) {
-            Ok(()) => self.close_start_screen(),
+
+        if let Some(session) = self.running_session.as_ref() {
+            if session.matches_target(&row.target) {
+                return Task::none();
+            }
+            if process_match::any_matching_running(&session.match_paths) {
+                self.start_state.replace_confirm = Some(ReplaceConfirm {
+                    running_title: session.title.clone(),
+                    next_title: row.title.clone(),
+                    next_index: self.start_state.game_selected,
+                });
+                return Task::none();
+            }
+            self.running_session = None;
+            self.start_state.running_target = None;
+        }
+
+        match launch::launch_target(&row.target) {
+            Ok(()) => {
+                self.begin_running_session(row.title, row.target);
+                Task::none()
+            }
             Err(err) => {
-                app_log::warn(format!("launch failed for {target}: {err}"));
-                // Keep the card open so a failed launch is obvious (not a silent no-op).
+                app_log::warn(format!("launch failed for {}: {err}", row.target));
                 Task::none()
             }
         }
@@ -1719,12 +1983,39 @@ impl App {
                     self.log_start_nav_diag(&reading.sample, reading.source);
                     let sample = reading.sample;
 
+                    self.refresh_start_controllers();
+                    self.refresh_running_badge();
+
                     let now = Instant::now();
-                    if let Some(action) = self.nav_stepper.update(&sample, now) {
+                    let _ = self.start_state.tick_anim(now);
+
+                    // Triangle hold: Games closes running game; Controllers powers off BT pad.
+                    let (progress, completed) = self.triangle_hold.update(sample.triangle, now);
+                    self.start_state.triangle_progress = progress;
+                    if completed {
+                        match self.start_state.slide {
+                            StartSlide::Games => self.close_running_game(),
+                            StartSlide::Controllers => {
+                                if let Some(row) = self.start_state.selected_controller()
+                                    && row.bluetooth
+                                {
+                                    let serial = row.serial.clone();
+                                    self.power_off(&serial);
+                                }
+                            }
+                        }
+                    }
+
+                    if !self.start_state.animating()
+                        && let Some(action) = self.nav_stepper.update(&sample, now)
+                    {
                         let next = match action {
                             NavAction::Up => self.on_start_message(StartMessage::MoveUp),
                             NavAction::Down => self.on_start_message(StartMessage::MoveDown),
-                            NavAction::Confirm | NavAction::Cancel => Task::none(),
+                            NavAction::Confirm
+                            | NavAction::Cancel
+                            | NavAction::PrevSlide
+                            | NavAction::NextSlide => Task::none(),
                         };
                         task = task.chain(next);
                     }
@@ -1732,6 +2023,20 @@ impl App {
                         let next = match action {
                             NavAction::Confirm => self.on_start_message(StartMessage::Confirm),
                             NavAction::Cancel => self.on_start_message(StartMessage::Close),
+                            NavAction::PrevSlide => {
+                                if self.start_state.animating() {
+                                    Task::none()
+                                } else {
+                                    self.on_start_message(StartMessage::PrevSlide)
+                                }
+                            }
+                            NavAction::NextSlide => {
+                                if self.start_state.animating() {
+                                    Task::none()
+                                } else {
+                                    self.on_start_message(StartMessage::NextSlide)
+                                }
+                            }
                             NavAction::Up | NavAction::Down => Task::none(),
                         };
                         return task.chain(next);

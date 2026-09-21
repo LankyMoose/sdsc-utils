@@ -136,6 +136,38 @@ pub fn parse_appmanifest(text: &str) -> Option<(u32, String)> {
     Some((appid?, name?))
 }
 
+/// Parse `"installdir"` from an appmanifest.
+pub fn parse_appmanifest_installdir(text: &str) -> Option<String> {
+    for line in text.lines() {
+        if let Some(value) = vdf_string_value(line.trim(), "installdir") {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Absolute `steamapps/common/{installdir}` for an installed appid, if found.
+pub fn install_dir_for_appid(appid: u32) -> Option<PathBuf> {
+    let steam_root = steam_root().ok().flatten()?;
+    let library_roots = library_folders(&steam_root).ok()?;
+    let manifest_name = format!("appmanifest_{appid}.acf");
+    for root in library_roots {
+        let steamapps = root.join("steamapps");
+        let manifest = steamapps.join(&manifest_name);
+        let Ok(text) = fs::read_to_string(&manifest) else {
+            continue;
+        };
+        let Some(installdir) = parse_appmanifest_installdir(&text) else {
+            continue;
+        };
+        let path = steamapps.join("common").join(installdir);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 fn vdf_string_value(line: &str, key: &str) -> Option<String> {
     // "key"		"value"
     let mut parts = line.split('"').filter(|s| !s.trim().is_empty());
@@ -203,6 +235,22 @@ mod tests {
         let (id, name) = parse_appmanifest(text).unwrap();
         assert_eq!(id, 1245620);
         assert_eq!(name, "ELDEN RING");
+    }
+
+    #[test]
+    fn parse_appmanifest_installdir_reads() {
+        let text = r#"
+"AppState"
+{
+	"appid"		"570"
+	"installdir"		"dota 2 beta"
+	"name"		"Dota 2"
+}
+"#;
+        assert_eq!(
+            parse_appmanifest_installdir(text).as_deref(),
+            Some("dota 2 beta")
+        );
     }
 
     #[test]

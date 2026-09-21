@@ -27,7 +27,11 @@ pub enum NavAction {
     Down,
     Confirm,
     Cancel,
+    PrevSlide,
+    NextSlide,
 }
+
+const TRIANGLE_HOLD: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Default)]
 pub struct PadSample {
@@ -38,6 +42,9 @@ pub struct PadSample {
     pub dpad_down: bool,
     pub cross: bool,
     pub circle: bool,
+    pub triangle: bool,
+    pub l2: bool,
+    pub r2: bool,
     /// Raw DualSense `buttons[0]` (hat + face). Useful for offset diagnostics.
     pub buttons0: u8,
 }
@@ -186,6 +193,8 @@ impl NavStepper {
 pub struct ButtonEdges {
     cross: bool,
     circle: bool,
+    l2: bool,
+    r2: bool,
 }
 
 impl ButtonEdges {
@@ -195,10 +204,46 @@ impl ButtonEdges {
             action = Some(NavAction::Confirm);
         } else if sample.circle && !self.circle {
             action = Some(NavAction::Cancel);
+        } else if sample.l2 && !self.l2 {
+            action = Some(NavAction::PrevSlide);
+        } else if sample.r2 && !self.r2 {
+            action = Some(NavAction::NextSlide);
         }
         self.cross = sample.cross;
         self.circle = sample.circle;
+        self.l2 = sample.l2;
+        self.r2 = sample.r2;
         action
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Tracks Triangle hold progress (0..=1) and fires once after [`TRIANGLE_HOLD`].
+#[derive(Debug, Clone, Default)]
+pub struct TriangleHold {
+    started: Option<Instant>,
+    fired: bool,
+}
+
+impl TriangleHold {
+    /// Returns `(progress, just_completed)`.
+    pub fn update(&mut self, held: bool, now: Instant) -> (f32, bool) {
+        if !held {
+            self.started = None;
+            self.fired = false;
+            return (0.0, false);
+        }
+        let started = *self.started.get_or_insert(now);
+        let elapsed = now.saturating_duration_since(started);
+        let progress = (elapsed.as_secs_f32() / TRIANGLE_HOLD.as_secs_f32()).min(1.0);
+        if progress >= 1.0 && !self.fired {
+            self.fired = true;
+            return (1.0, true);
+        }
+        (progress, false)
     }
 
     pub fn reset(&mut self) {
@@ -255,9 +300,12 @@ fn read_gamepad_nav_sample() -> Option<PadSample> {
     let buttons = reading.Buttons;
     let dpad_up = buttons.contains(GamepadButtons::DPadUp);
     let dpad_down = buttons.contains(GamepadButtons::DPadDown);
-    // Standard gamepad: A ≈ Cross, B ≈ Circle on DualSense via Windows.
+    // Standard gamepad: A ≈ Cross, B ≈ Circle, Y ≈ Triangle on DualSense via Windows.
     let cross = buttons.contains(GamepadButtons::A);
     let circle = buttons.contains(GamepadButtons::B);
+    let triangle = buttons.contains(GamepadButtons::Y);
+    let l2 = reading.LeftTrigger >= 0.25;
+    let r2 = reading.RightTrigger >= 0.25;
 
     let lx = reading.LeftThumbstickX as f32;
     let ly = -(reading.LeftThumbstickY as f32); // Windows Y is up-positive; we use up-negative.
@@ -271,6 +319,15 @@ fn read_gamepad_nav_sample() -> Option<PadSample> {
     }
     if circle {
         held.insert(GestureControl::Circle);
+    }
+    if triangle {
+        held.insert(GestureControl::Triangle);
+    }
+    if l2 {
+        held.insert(GestureControl::L2);
+    }
+    if r2 {
+        held.insert(GestureControl::R2);
     }
     if dpad_up {
         held.insert(GestureControl::DpadUp);
@@ -286,6 +343,9 @@ fn read_gamepad_nav_sample() -> Option<PadSample> {
         dpad_down,
         cross,
         circle,
+        triangle,
+        l2,
+        r2,
         buttons0: 0,
     })
 }
@@ -472,6 +532,9 @@ pub fn parse_report(buf: &[u8], base: usize) -> PadSample {
         dpad_down,
         cross,
         circle,
+        triangle,
+        l2,
+        r2,
         buttons0,
     }
 }
