@@ -85,10 +85,6 @@ pub struct GestureDetector {
 }
 
 impl GestureDetector {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Returns true once when every required control is held, then stays silent
     /// until at least one required control is released.
     pub fn update(&mut self, required: &[GestureControl], held: &BTreeSet<GestureControl>) -> bool {
@@ -189,7 +185,7 @@ mod tests {
     #[test]
     fn detector_fires_once_on_rising_edge() {
         let required = default_gesture();
-        let mut detector = GestureDetector::new();
+        let mut detector = GestureDetector::default();
         let mut held = BTreeSet::new();
         assert!(!detector.update(&required, &held));
 
@@ -214,7 +210,7 @@ mod tests {
 
     #[test]
     fn empty_gesture_never_fires() {
-        let mut detector = GestureDetector::new();
+        let mut detector = GestureDetector::default();
         let held: BTreeSet<_> = [GestureControl::L2].into_iter().collect();
         assert!(!detector.update(&[], &held));
     }
