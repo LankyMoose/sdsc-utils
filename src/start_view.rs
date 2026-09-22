@@ -28,7 +28,7 @@ pub const WIDTH: f32 = 640.0;
 /// Logical height of the start-screen window.
 pub const HEIGHT: f32 = 500.0;
 
-pub const SLIDE_ANIM_MS: u64 = 180;
+pub const SLIDE_ANIM_MS: u64 = 220;
 const SLIDE_ANIM_MIN_MS: u64 = 60;
 const HEADER_HEIGHT: f32 = 36.0;
 /// Matches the Games footer band (face hints + padded Add shortcut button).
@@ -574,6 +574,9 @@ impl State {
                 let len = self.rows.len() as i32;
                 let before = self.game_selected as i32;
                 let after = (before + delta).rem_euclid(len);
+                if after == before {
+                    return None;
+                }
                 self.game_selected = after as usize;
                 Some(reveal_for_step(before, after, delta))
             }
@@ -584,6 +587,9 @@ impl State {
                 let len = self.controllers.len() as i32;
                 let before = self.controller_selected as i32;
                 let after = (before + delta).rem_euclid(len);
+                if after == before {
+                    return None;
+                }
                 self.controller_selected = after as usize;
                 Some(reveal_for_step(before, after, delta))
             }

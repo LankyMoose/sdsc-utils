@@ -9,12 +9,14 @@ use crate::dualsense::{
     self, hid_serial, is_dualsense_gamepad, is_storable_serial, product_name,
     resolve_device_identity,
 };
-use crate::lightbar;
+use crate::lightbar::{self, HidPhaseTiming};
 use hidapi::{BusType, DeviceInfo, HidApi, HidDevice};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// How often to scan for DualSense connect/disconnect.
+/// How often to scan for DualSense connect/disconnect when pads are already known.
 pub const PRESENCE_INTERVAL: Duration = Duration::from_secs(3);
+/// Faster presence scan while the tray is empty (and start screen can auto-open on 0→1).
+pub const PRESENCE_INTERVAL_EMPTY: Duration = Duration::from_millis(500);
 /// How often to re-read battery / lightbar when membership is stable and pads are readable.
 pub const BATTERY_INTERVAL: Duration = Duration::from_secs(60);
 /// While the tray shows connected pads, re-probe often so a powered-off BT pad
@@ -68,14 +70,36 @@ pub fn poll_controllers(previously_connected: &[String]) -> Result<Vec<Controlle
     dualsense::with_hid_lock(|| poll_controllers_unlocked(previously_connected))
 }
 
+/// Daemon worker entry: no outer lock (worker is exclusive).
+pub fn poll_controllers_timed(
+    previously_connected: &[String],
+) -> (Result<Vec<ControllerStatus>, String>, HidPhaseTiming) {
+    let started = Instant::now();
+    let mut timing = HidPhaseTiming::default();
+    let result = poll_controllers_unlocked_timed(previously_connected, &mut timing);
+    // If unlocked path did not fill enumerate (empty list early exit), still record total as io-ish.
+    let _ = started;
+    (result, timing)
+}
+
 fn poll_controllers_unlocked(
     previously_connected: &[String],
 ) -> Result<Vec<ControllerStatus>, String> {
+    let mut timing = HidPhaseTiming::default();
+    poll_controllers_unlocked_timed(previously_connected, &mut timing)
+}
+
+fn poll_controllers_unlocked_timed(
+    previously_connected: &[String],
+    timing: &mut HidPhaseTiming,
+) -> Result<Vec<ControllerStatus>, String> {
+    let enum_started = Instant::now();
     let api = HidApi::new().map_err(|e| e.to_string())?;
     let devices: Vec<&DeviceInfo> = api
         .device_list()
         .filter(|d| is_dualsense_gamepad(d))
         .collect();
+    timing.enumerate_ms += enum_started.elapsed().as_millis();
 
     if devices.is_empty() {
         lightbar::sync_lightbar_claims(std::iter::empty::<&str>());
@@ -89,9 +113,13 @@ fn poll_controllers_unlocked(
         let hid = hid_serial(info);
         let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
 
+        let open_started = Instant::now();
         match info.open_device(&api).and_then(|device| {
+            timing.open_ms += open_started.elapsed().as_millis();
+            let io_started = Instant::now();
             let serial = resolve_device_identity(info, &device);
             let battery = battery::read_battery(&device)?;
+            timing.io_ms += io_started.elapsed().as_millis();
             Ok((device, serial, battery))
         }) {
             Ok((device, serial, battery)) => pads.push(PolledPad {
@@ -107,6 +135,7 @@ fn poll_controllers_unlocked(
                 is_bluetooth,
             }),
             Err(err) => {
+                timing.open_ms += open_started.elapsed().as_millis();
                 app_log::warn(format!(
                     "failed to read {product} (hid serial {hid}): {err}"
                 ));
@@ -134,21 +163,25 @@ fn poll_controllers_unlocked(
                 lightbar::prepare_connect_apply(&pad.status.serial);
             }
             let color = color_for_battery_percent(pad.status.percent);
+            let io_started = Instant::now();
             if let Err(err) = lightbar::apply_on_open_device(
                 &pad.device,
                 &pad.status.serial,
                 color,
                 pad.is_bluetooth,
             ) {
+                timing.io_ms += io_started.elapsed().as_millis();
                 // Reopen clears stuck Windows overlapped I/O after a write timeout.
-                if let Err(retry_err) =
-                    lightbar::apply_lightbar_rgb_unlocked(&pad.status.serial, color)
-                {
+                let (retry, t) = lightbar::apply_lightbar_rgb_timed(&pad.status.serial, color);
+                timing.add_assign(t);
+                if let Err(retry_err) = retry {
                     lightbar::warn_lightbar(
                         pad.status.product,
                         format!("{err}; retry: {retry_err}"),
                     );
                 }
+            } else {
+                timing.io_ms += io_started.elapsed().as_millis();
             }
         }
     }

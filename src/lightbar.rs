@@ -1,7 +1,7 @@
 //! DualSense lightbar HID output.
 
 use crate::app_log;
-use crate::color::{Rgb, color_for_battery_percent};
+use crate::color::Rgb;
 use crate::dualsense::{self, is_dualsense_gamepad, normalize_identity, resolve_device_identity};
 use hidapi::{BusType, HidApi, HidDevice};
 use std::collections::HashSet;
@@ -9,6 +9,22 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Phase timings for hid-worker metrics (enumerate / open / io).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HidPhaseTiming {
+    pub enumerate_ms: u128,
+    pub open_ms: u128,
+    pub io_ms: u128,
+}
+
+impl HidPhaseTiming {
+    pub fn add_assign(&mut self, other: Self) {
+        self.enumerate_ms += other.enumerate_ms;
+        self.open_ms += other.open_ms;
+        self.io_ms += other.io_ms;
+    }
+}
 
 const OUTPUT_REPORT_USB_ID: u8 = 0x02;
 const OUTPUT_REPORT_USB_SIZE: usize = 63;
@@ -38,7 +54,7 @@ pub const IDENTIFY_FLASH_COUNT: u32 = 5;
 
 /// Whether the identify sequence should show white at `now`.
 ///
-/// Matches [`identify_controller`]: white for [`IDENTIFY_FLASH_MS`], then battery
+/// Matches Identify flash timing: white for [`IDENTIFY_FLASH_MS`], then battery
 /// color for the same duration, repeated [`IDENTIFY_FLASH_COUNT`] times.
 /// Returns `None` when the sequence is finished.
 pub fn identify_flash_is_white(started: Instant, now: Instant) -> Option<bool> {
@@ -124,35 +140,46 @@ fn is_retryable_write_error(err: &impl std::fmt::Display) -> bool {
         || text.contains("Overlapped I/O")
 }
 
-/// Apply a lightbar color to the controller with the given serial.
-pub fn apply_lightbar_rgb(serial: &str, color: Rgb) -> Result<(), String> {
-    let _guard = dualsense::lock_hid()?;
-    apply_lightbar_rgb_unlocked(serial, color)
-}
-
-/// Apply lightbar while already holding the HID I/O lock (poll / identify).
-pub(crate) fn apply_lightbar_rgb_unlocked(serial: &str, color: Rgb) -> Result<(), String> {
-    match try_apply_by_serial(serial, color) {
-        Ok(()) => Ok(()),
+/// Daemon worker entry: no outer lock (worker is exclusive).
+pub fn apply_lightbar_rgb_timed(serial: &str, color: Rgb) -> (Result<(), String>, HidPhaseTiming) {
+    let (first, mut timing) = try_apply_by_serial_timed(serial, color);
+    match first {
+        Ok(()) => (Ok(()), timing),
         Err(err) if is_retryable_write_error(&err) => {
             thread::sleep(WRITE_RETRY_DELAY);
-            try_apply_by_serial(serial, color)
+            let (retry, t2) = try_apply_by_serial_timed(serial, color);
+            timing.add_assign(t2);
+            (retry, timing)
         }
-        Err(err) => Err(err),
+        Err(err) => (Err(err), timing),
     }
 }
 
-fn try_apply_by_serial(serial: &str, color: Rgb) -> Result<(), String> {
-    let api = HidApi::new().map_err(|e| e.to_string())?;
+fn try_apply_by_serial_timed(serial: &str, color: Rgb) -> (Result<(), String>, HidPhaseTiming) {
+    let mut timing = HidPhaseTiming::default();
+    let enum_started = Instant::now();
+    let api = match HidApi::new() {
+        Ok(api) => api,
+        Err(e) => {
+            timing.enumerate_ms = enum_started.elapsed().as_millis();
+            return (Err(e.to_string()), timing);
+        }
+    };
     let target = normalize_identity(serial);
 
     // Prefer USB when the same pad appears on both buses.
     let mut best: Option<(HidDevice, bool, bool)> = None; // device, is_bluetooth, is_usb
+    let mut open_ms = 0u128;
     for info in api.device_list().filter(|d| is_dualsense_gamepad(d)) {
+        let open_started = Instant::now();
         let device = match info.open_device(&api) {
             Ok(d) => d,
-            Err(_) => continue,
+            Err(_) => {
+                open_ms += open_started.elapsed().as_millis();
+                continue;
+            }
         };
+        open_ms += open_started.elapsed().as_millis();
         let identity = resolve_device_identity(info, &device);
         if identity != target {
             continue;
@@ -167,9 +194,16 @@ fn try_apply_by_serial(serial: &str, color: Rgb) -> Result<(), String> {
             best = Some((device, is_bluetooth, is_usb));
         }
     }
+    timing.enumerate_ms = enum_started.elapsed().as_millis().saturating_sub(open_ms);
+    timing.open_ms = open_ms;
 
-    let (device, is_bluetooth, _) = best.ok_or_else(|| format!("controller {serial} not found"))?;
-    apply_on_open_device(&device, &target, color, is_bluetooth)
+    let Some((device, is_bluetooth, _)) = best else {
+        return (Err(format!("controller {serial} not found")), timing);
+    };
+    let io_started = Instant::now();
+    let result = apply_on_open_device(&device, &target, color, is_bluetooth);
+    timing.io_ms = io_started.elapsed().as_millis();
+    (result, timing)
 }
 
 /// Write lightbar on an already-open handle (caller must hold the HID I/O lock).
@@ -179,10 +213,21 @@ pub fn apply_on_open_device(
     color: Rgb,
     is_bluetooth: bool,
 ) -> Result<(), String> {
+    apply_on_open_device_timed(device, serial, color, is_bluetooth).0
+}
+
+/// Timed write on an already-open handle (hid-worker Identify cache — no enumerate/open).
+pub fn apply_on_open_device_timed(
+    device: &HidDevice,
+    serial: &str,
+    color: Rgb,
+    is_bluetooth: bool,
+) -> (Result<(), String>, HidPhaseTiming) {
+    let mut timing = HidPhaseTiming::default();
     let target = normalize_identity(serial);
     let claim = take_claim_if_needed(&target);
-
-    match set_lightbar_on_device(device, color, is_bluetooth, claim) {
+    let io_started = Instant::now();
+    let result = match set_lightbar_on_device(device, color, is_bluetooth, claim) {
         Ok(()) => Ok(()),
         Err(err) => {
             // Claim may have partially completed; forget so the next attempt reclaims.
@@ -193,7 +238,9 @@ pub fn apply_on_open_device(
             }
             Err(err.to_string())
         }
-    }
+    };
+    timing.io_ms = io_started.elapsed().as_millis();
+    (result, timing)
 }
 
 /// Write lightbar while already holding the HID I/O lock (used during poll).
@@ -268,50 +315,59 @@ fn build_bt_report(fill_common: impl FnOnce(&mut [u8])) -> [u8; OUTPUT_REPORT_BT
     report
 }
 
-/// Flash white, then restore battery color, five times (lock held for the sequence).
-pub fn identify_controller(serial: &str, percent: u8) -> Result<(), String> {
-    let normal = color_for_battery_percent(percent);
-    let flash_for = Duration::from_millis(IDENTIFY_FLASH_MS);
-    let _guard = dualsense::lock_hid()?;
-
-    for _ in 0..IDENTIFY_FLASH_COUNT {
-        apply_lightbar_rgb_unlocked(serial, Rgb::WHITE)?;
-        thread::sleep(flash_for);
-        apply_lightbar_rgb_unlocked(serial, normal)?;
-        thread::sleep(flash_for);
-    }
-
-    Ok(())
-}
-
 /// Apply a color to every connected DualSense (CLI / debug).
 /// Clears claims so each pad receives a fresh `LIGHT_OUT` then RGB.
 pub fn apply_lightbar_all(color: Rgb) -> Result<usize, String> {
-    let api = HidApi::new().map_err(|e| e.to_string())?;
-    let mut applied = 0usize;
     let _guard = dualsense::lock_hid()?;
+    apply_lightbar_all_timed(color).0
+}
+
+pub fn apply_lightbar_all_timed(color: Rgb) -> (Result<usize, String>, HidPhaseTiming) {
+    let mut timing = HidPhaseTiming::default();
+    let enum_started = Instant::now();
+    let api = match HidApi::new() {
+        Ok(api) => api,
+        Err(e) => {
+            timing.enumerate_ms = enum_started.elapsed().as_millis();
+            return (Err(e.to_string()), timing);
+        }
+    };
+    let mut applied = 0usize;
 
     forget_all_claims();
 
+    let mut open_ms = 0u128;
+    let mut io_ms = 0u128;
     for info in api.device_list().filter(|d| is_dualsense_gamepad(d)) {
+        let open_started = Instant::now();
         let device = match info.open_device(&api) {
             Ok(d) => d,
             Err(err) => {
+                open_ms += open_started.elapsed().as_millis();
                 app_log::warn(format!("lightbar open failed: {err}"));
                 continue;
             }
         };
+        open_ms += open_started.elapsed().as_millis();
         let serial = resolve_device_identity(info, &device);
         let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
+        let io_started = Instant::now();
         match apply_on_open_device(&device, &serial, color, is_bluetooth) {
             Ok(()) => applied += 1,
             Err(err) => {
                 app_log::warn(format!("lightbar write failed: {err}"));
             }
         }
+        io_ms += io_started.elapsed().as_millis();
     }
+    timing.enumerate_ms = enum_started
+        .elapsed()
+        .as_millis()
+        .saturating_sub(open_ms + io_ms);
+    timing.open_ms = open_ms;
+    timing.io_ms = io_ms;
 
-    Ok(applied)
+    (Ok(applied), timing)
 }
 
 pub fn warn_lightbar(product: &str, err: impl std::fmt::Display) {

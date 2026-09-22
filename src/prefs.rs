@@ -74,6 +74,12 @@ pub struct Prefs {
     /// Empty = no gesture reopen (0→1 auto-open still works). Missing key → default.
     #[serde(default = "default_gesture")]
     pub start_screen_gesture: Vec<GestureControl>,
+    /// Play UI cues while navigating the start screen (default on).
+    #[serde(default = "default_true")]
+    pub start_screen_sounds_enabled: bool,
+    /// Master volume for start-screen UI sounds (0–100, default 60).
+    #[serde(default = "default_start_screen_sound_volume")]
+    pub start_screen_sound_volume: u8,
     /// Start-screen games list sort (default last played).
     #[serde(default)]
     pub games_sort_mode: GamesSortMode,
@@ -87,6 +93,10 @@ fn default_low_battery_percent() -> u8 {
     LOW_BATTERY_PERCENT
 }
 
+fn default_start_screen_sound_volume() -> u8 {
+    60
+}
+
 pub fn clamp_low_battery_percent(value: u8) -> u8 {
     let clamped = value.clamp(LOW_BATTERY_PERCENT_MIN, LOW_BATTERY_PERCENT_MAX);
     // Floor to the greatest observable mid-point ≤ clamped (preserves fire points
@@ -97,6 +107,10 @@ pub fn clamp_low_battery_percent(value: u8) -> u8 {
         .rev()
         .find(|&p| p <= clamped)
         .unwrap_or(LOW_BATTERY_PERCENT_MIN)
+}
+
+pub fn clamp_start_screen_sound_volume(value: u8) -> u8 {
+    value.min(100)
 }
 
 impl Default for Prefs {
@@ -113,6 +127,8 @@ impl Default for Prefs {
             lightbar_enabled: true,
             start_screen_enabled: true,
             start_screen_gesture: default_gesture(),
+            start_screen_sounds_enabled: true,
+            start_screen_sound_volume: default_start_screen_sound_volume(),
             games_sort_mode: GamesSortMode::default(),
         }
     }
@@ -127,6 +143,8 @@ impl Prefs {
         match serde_json::from_slice::<Prefs>(&bytes) {
             Ok(mut prefs) => {
                 prefs.low_battery_percent = clamp_low_battery_percent(prefs.low_battery_percent);
+                prefs.start_screen_sound_volume =
+                    clamp_start_screen_sound_volume(prefs.start_screen_sound_volume);
                 prefs
             }
             Err(err) => {
@@ -207,6 +225,23 @@ mod tests {
             serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":[]}"#)
                 .unwrap();
         assert!(prefs.start_screen_gesture.is_empty());
+    }
+
+    #[test]
+    fn older_prefs_default_start_screen_sounds_on() {
+        let prefs: Prefs =
+            serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":["ps"]}"#)
+                .unwrap();
+        assert!(prefs.start_screen_sounds_enabled);
+        assert_eq!(prefs.start_screen_sound_volume, 60);
+    }
+
+    #[test]
+    fn clamp_start_screen_sound_volume_bounds() {
+        assert_eq!(clamp_start_screen_sound_volume(0), 0);
+        assert_eq!(clamp_start_screen_sound_volume(60), 60);
+        assert_eq!(clamp_start_screen_sound_volume(100), 100);
+        assert_eq!(clamp_start_screen_sound_volume(255), 100);
     }
 
     #[test]

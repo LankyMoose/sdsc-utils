@@ -14,6 +14,7 @@ mod emulate;
 mod file_icon;
 mod games;
 mod gesture;
+mod hid_worker;
 mod icon;
 mod known;
 mod launch;
@@ -35,6 +36,7 @@ mod theme;
 mod toast;
 mod toast_view;
 mod tray;
+mod ui_sound;
 #[cfg(windows)]
 mod win32;
 mod window_layout;
