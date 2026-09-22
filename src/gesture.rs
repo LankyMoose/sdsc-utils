@@ -54,14 +54,9 @@ impl GestureControl {
     }
 }
 
-/// Default reopen chord: L2 + R2 + L3 + R3.
+/// Default reopen chord: PS (Guide) button.
 pub fn default_gesture() -> Vec<GestureControl> {
-    vec![
-        GestureControl::L2,
-        GestureControl::R2,
-        GestureControl::L3,
-        GestureControl::R3,
-    ]
+    vec![GestureControl::Ps]
 }
 
 /// Human-readable chord label (`L2 + R2 + L3 + R3`).
@@ -103,6 +98,12 @@ impl GestureDetector {
             self.armed = false;
             false
         }
+    }
+
+    /// Treat the chord as already consumed (e.g. after recording) so a sticky
+    /// rematch does not fire until the controls are released.
+    pub fn mark_armed(&mut self) {
+        self.armed = true;
     }
 }
 
@@ -163,16 +164,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_gesture_is_triggers_and_sticks() {
-        assert_eq!(
-            default_gesture(),
-            vec![
-                GestureControl::L2,
-                GestureControl::R2,
-                GestureControl::L3,
-                GestureControl::R3,
-            ]
-        );
+    fn default_gesture_is_ps() {
+        assert_eq!(default_gesture(), vec![GestureControl::Ps]);
     }
 
     #[test]
@@ -189,22 +182,32 @@ mod tests {
         let mut held = BTreeSet::new();
         assert!(!detector.update(&required, &held));
 
-        held.insert(GestureControl::L2);
-        held.insert(GestureControl::R2);
+        held.insert(GestureControl::Cross);
         assert!(!detector.update(&required, &held));
 
-        held.insert(GestureControl::L3);
-        held.insert(GestureControl::R3);
+        held.insert(GestureControl::Ps);
         assert!(detector.update(&required, &held));
         assert!(!detector.update(&required, &held));
 
         // Extra buttons still match (superset OK).
-        held.insert(GestureControl::Cross);
+        held.insert(GestureControl::L2);
         assert!(!detector.update(&required, &held));
 
-        held.remove(&GestureControl::L3);
+        held.remove(&GestureControl::Ps);
         assert!(!detector.update(&required, &held));
-        held.insert(GestureControl::L3);
+        held.insert(GestureControl::Ps);
+        assert!(detector.update(&required, &held));
+    }
+
+    #[test]
+    fn mark_armed_skips_current_match() {
+        let required = default_gesture();
+        let mut detector = GestureDetector::default();
+        detector.mark_armed();
+        let held: BTreeSet<_> = [GestureControl::Ps].into_iter().collect();
+        assert!(!detector.update(&required, &held));
+        let empty = BTreeSet::new();
+        assert!(!detector.update(&required, &empty));
         assert!(detector.update(&required, &held));
     }
 
@@ -223,23 +226,17 @@ mod tests {
         held.insert(GestureControl::L2);
         held.insert(GestureControl::R2);
         assert!(recorder.update(&held).is_none());
-        held.insert(GestureControl::L3);
-        held.insert(GestureControl::R3);
+        held.insert(GestureControl::Ps);
         assert!(recorder.update(&held).is_none());
-        held.remove(&GestureControl::R3);
+        held.remove(&GestureControl::Ps);
         assert!(recorder.update(&held).is_none());
         held.clear();
         let peak = recorder.update(&held).expect("finished");
         assert_eq!(
             peak.into_iter().collect::<BTreeSet<_>>(),
-            [
-                GestureControl::L2,
-                GestureControl::R2,
-                GestureControl::L3,
-                GestureControl::R3,
-            ]
-            .into_iter()
-            .collect()
+            [GestureControl::L2, GestureControl::R2, GestureControl::Ps,]
+                .into_iter()
+                .collect()
         );
         assert!(!recorder.is_active());
     }

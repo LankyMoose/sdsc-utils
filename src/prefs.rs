@@ -27,6 +27,24 @@ pub enum ToastPosition {
     BottomRight,
 }
 
+/// Browse-mode ordering for the start-screen games list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GamesSortMode {
+    #[default]
+    LastPlayed,
+    Alphabetical,
+}
+
+impl GamesSortMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::LastPlayed => Self::Alphabetical,
+            Self::Alphabetical => Self::LastPlayed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Prefs {
     #[serde(default = "default_true")]
@@ -56,6 +74,9 @@ pub struct Prefs {
     /// Empty = no gesture reopen (0→1 auto-open still works). Missing key → default.
     #[serde(default = "default_gesture")]
     pub start_screen_gesture: Vec<GestureControl>,
+    /// Start-screen games list sort (default last played).
+    #[serde(default)]
+    pub games_sort_mode: GamesSortMode,
 }
 
 fn default_true() -> bool {
@@ -92,6 +113,7 @@ impl Default for Prefs {
             lightbar_enabled: true,
             start_screen_enabled: true,
             start_screen_gesture: default_gesture(),
+            games_sort_mode: GamesSortMode::default(),
         }
     }
 }
@@ -228,5 +250,20 @@ mod tests {
             serde_json::to_string(&ToastPosition::BottomCenter).unwrap(),
             r#""bottom_center""#
         );
+    }
+
+    #[test]
+    fn games_sort_mode_cycles_and_defaults() {
+        assert_eq!(GamesSortMode::default(), GamesSortMode::LastPlayed);
+        assert_eq!(
+            GamesSortMode::LastPlayed.cycle(),
+            GamesSortMode::Alphabetical
+        );
+        assert_eq!(
+            GamesSortMode::Alphabetical.cycle(),
+            GamesSortMode::LastPlayed
+        );
+        let prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(prefs.games_sort_mode, GamesSortMode::LastPlayed);
     }
 }

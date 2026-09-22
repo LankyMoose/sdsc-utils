@@ -6,24 +6,28 @@ use std::path::Path;
 use std::process::Command;
 
 /// Open a catalog target (path, `.lnk`, or URL such as `steam://…`).
-pub fn launch_target(target: &str) -> Result<(), String> {
+///
+/// `args` is passed through to the process when non-empty (Windows: ShellExecute
+/// parameters; Unix: whitespace-split argv for file targets).
+pub fn launch_target(target: &str, args: &str) -> Result<(), String> {
     let trimmed = target.trim();
     if trimmed.is_empty() {
         return Err("empty launch target".into());
     }
+    let args = args.trim();
 
     #[cfg(windows)]
     {
-        launch_windows(trimmed)
+        launch_windows(trimmed, args)
     }
     #[cfg(not(windows))]
     {
-        launch_unix(trimmed)
+        launch_unix(trimmed, args)
     }
 }
 
 #[cfg(windows)]
-fn launch_windows(target: &str) -> Result<(), String> {
+fn launch_windows(target: &str, args: &str) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -37,13 +41,26 @@ fn launch_windows(target: &str) -> Result<(), String> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    let params: Option<Vec<u16>> = if args.is_empty() {
+        None
+    } else {
+        Some(
+            std::ffi::OsStr::new(args)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect(),
+        )
+    };
 
     let result = unsafe {
         ShellExecuteW(
             None,
             PCWSTR(operation.as_ptr()),
             PCWSTR(wide.as_ptr()),
-            PCWSTR::null(),
+            params
+                .as_ref()
+                .map(|p| PCWSTR(p.as_ptr()))
+                .unwrap_or(PCWSTR::null()),
             PCWSTR::null(),
             SW_SHOWNORMAL,
         )
@@ -61,7 +78,7 @@ fn launch_windows(target: &str) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn launch_unix(target: &str) -> Result<(), String> {
+fn launch_unix(target: &str, args: &str) -> Result<(), String> {
     if looks_like_url(target) {
         #[cfg(target_os = "macos")]
         {
@@ -82,8 +99,13 @@ fn launch_unix(target: &str) -> Result<(), String> {
     }
 
     let path = Path::new(target);
-    Command::new(path)
-        .spawn()
+    let mut cmd = Command::new(path);
+    if !args.is_empty() {
+        for arg in args.split_whitespace() {
+            cmd.arg(arg);
+        }
+    }
+    cmd.spawn()
         .map_err(|e| format!("failed to launch {}: {e}", path.display()))?;
     Ok(())
 }
@@ -97,7 +119,7 @@ fn looks_like_url(target: &str) -> bool {
 mod tests {
     #[test]
     fn empty_target_errors() {
-        assert!(super::launch_target("").is_err());
-        assert!(super::launch_target("   ").is_err());
+        assert!(super::launch_target("", "").is_err());
+        assert!(super::launch_target("   ", "").is_err());
     }
 }

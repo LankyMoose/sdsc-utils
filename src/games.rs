@@ -1,7 +1,9 @@
 //! Persisted start-screen game catalog (`games.json`).
 
 use crate::app_log;
+use crate::prefs::GamesSortMode;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,15 +18,33 @@ pub enum GameEntry {
         id: String,
         title: String,
         target: String,
+        #[serde(default)]
+        args: String,
+        #[serde(default)]
+        icon: Option<String>,
     },
 }
 
 impl GameEntry {
-    pub fn manual(title: impl Into<String>, target: impl Into<String>) -> Self {
+    pub fn manual_with(
+        title: impl Into<String>,
+        target: impl Into<String>,
+        args: impl Into<String>,
+        icon: Option<String>,
+    ) -> Self {
         Self::Manual {
             id: new_manual_id(),
             title: title.into(),
             target: target.into(),
+            args: args.into(),
+            icon,
+        }
+    }
+
+    pub fn play_key(&self) -> String {
+        match self {
+            Self::Steam { appid } => format!("steam:{appid}"),
+            Self::Manual { id, .. } => format!("manual:{id}"),
         }
     }
 }
@@ -33,6 +53,9 @@ impl GameEntry {
 pub struct GamesCatalog {
     #[serde(default)]
     pub entries: Vec<GameEntry>,
+    /// Unix millis of last successful launch, keyed by [`GameEntry::play_key`].
+    #[serde(default)]
+    pub last_played_ms: BTreeMap<String, u64>,
 }
 
 impl GamesCatalog {
@@ -91,45 +114,65 @@ impl GamesCatalog {
         }
     }
 
-    pub fn add_manual(&mut self, title: String, target: String) {
-        self.entries.push(GameEntry::manual(title, target));
+    pub fn add_manual(
+        &mut self,
+        title: String,
+        target: String,
+        args: String,
+        icon: Option<String>,
+    ) {
+        self.entries
+            .push(GameEntry::manual_with(title, target, args, icon));
     }
 
-    pub fn remove_at(&mut self, index: usize) -> bool {
-        if index < self.entries.len() {
-            self.entries.remove(index);
+    pub fn update_manual(
+        &mut self,
+        id: &str,
+        title: String,
+        args: String,
+        icon: Option<String>,
+    ) -> bool {
+        for entry in &mut self.entries {
+            if let GameEntry::Manual {
+                id: mid,
+                title: t,
+                args: a,
+                icon: ic,
+                ..
+            } = entry
+                && mid == id
+            {
+                *t = title;
+                *a = args;
+                *ic = icon;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn remove_manual_id(&mut self, id: &str) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| !matches!(e, GameEntry::Manual { id: mid, .. } if mid == id));
+        if self.entries.len() != before {
+            self.last_played_ms.remove(&format!("manual:{id}"));
             true
         } else {
             false
         }
     }
 
-    pub fn move_entry(&mut self, index: usize, up: bool) -> bool {
-        if index >= self.entries.len() {
-            return false;
-        }
-        let swap = if up {
-            index.checked_sub(1)
-        } else if index + 1 < self.entries.len() {
-            Some(index + 1)
-        } else {
-            None
-        };
-        let Some(other) = swap else {
-            return false;
-        };
-        self.entries.swap(index, other);
-        true
+    pub fn touch_played_key(&mut self, key: impl Into<String>) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_played_ms.insert(key.into(), now_ms);
     }
 
-    pub fn set_manual_title(&mut self, index: usize, title: String) -> bool {
-        match self.entries.get_mut(index) {
-            Some(GameEntry::Manual { title: current, .. }) => {
-                *current = title;
-                true
-            }
-            _ => false,
-        }
+    pub fn last_played(&self, entry: &GameEntry) -> Option<u64> {
+        self.last_played_ms.get(&entry.play_key()).copied()
     }
 
     /// Entries for the start screen.
@@ -148,6 +191,30 @@ impl GamesCatalog {
             })
             .cloned()
             .collect()
+    }
+
+    /// Curated catalog sorted for browse mode.
+    pub fn merge_sorted(
+        &self,
+        installed_steam: Option<&[u32]>,
+        mode: GamesSortMode,
+        title_of: impl Fn(&GameEntry) -> String,
+    ) -> Vec<GameEntry> {
+        let mut entries = self.merge_for_display(installed_steam);
+        match mode {
+            GamesSortMode::Alphabetical => {
+                entries.sort_by_key(|e| title_of(e).to_lowercase());
+            }
+            GamesSortMode::LastPlayed => {
+                entries.sort_by(|a, b| {
+                    let pa = self.last_played(a).unwrap_or(0);
+                    let pb = self.last_played(b).unwrap_or(0);
+                    pb.cmp(&pa)
+                        .then_with(|| title_of(a).to_lowercase().cmp(&title_of(b).to_lowercase()))
+                });
+            }
+        }
+        entries
     }
 }
 
@@ -188,6 +255,7 @@ mod tests {
     fn empty_catalog_deserializes() {
         let catalog: GamesCatalog = serde_json::from_str("{}").unwrap();
         assert!(catalog.entries.is_empty());
+        assert!(catalog.last_played_ms.is_empty());
     }
 
     #[test]
@@ -213,24 +281,101 @@ mod tests {
     }
 
     #[test]
-    fn move_and_rename_manual() {
+    fn update_manual_edits_fields() {
         let mut catalog = GamesCatalog::default();
-        catalog.add_manual("A".into(), "a.exe".into());
-        catalog.add_manual("B".into(), "b.exe".into());
-        assert!(catalog.move_entry(1, true));
-        assert_eq!(
-            match &catalog.entries[0] {
-                GameEntry::Manual { title, .. } => title.as_str(),
-                _ => "",
-            },
-            "B"
-        );
-        assert!(catalog.set_manual_title(0, "Bee".into()));
+        catalog.add_manual("A".into(), "a.exe".into(), String::new(), None);
+        let id = match &catalog.entries[0] {
+            GameEntry::Manual { id, .. } => id.clone(),
+            _ => panic!("manual"),
+        };
+        assert!(catalog.update_manual(
+            &id,
+            "Bee".into(),
+            "--flag".into(),
+            Some(r"C:\icon.png".into()),
+        ));
+        match &catalog.entries[0] {
+            GameEntry::Manual {
+                title,
+                args,
+                icon,
+                target,
+                ..
+            } => {
+                assert_eq!(title, "Bee");
+                assert_eq!(args, "--flag");
+                assert_eq!(icon.as_deref(), Some(r"C:\icon.png"));
+                assert_eq!(target, "a.exe");
+            }
+            _ => panic!("manual"),
+        }
+        assert!(!catalog.update_manual("missing", "X".into(), String::new(), None));
     }
 
     #[test]
     fn title_from_target_uses_stem() {
         assert_eq!(title_from_target(r"C:\Games\Cool Game.exe"), "Cool Game");
         assert!(title_from_target("steam://rungameid/1").starts_with("Steam:"));
+    }
+
+    #[test]
+    fn last_played_sort_puts_recent_first() {
+        let mut catalog = GamesCatalog::default();
+        catalog.toggle_steam(1, true);
+        catalog.toggle_steam(2, true);
+        catalog.add_manual("Zebra".into(), "z.exe".into(), String::new(), None);
+        let z_key = catalog.entries[2].play_key();
+        catalog.last_played_ms.insert("steam:2".into(), 200);
+        catalog.last_played_ms.insert(z_key, 100);
+
+        let title = |e: &GameEntry| match e {
+            GameEntry::Steam { appid } => format!("Steam {appid}"),
+            GameEntry::Manual { title, .. } => title.clone(),
+        };
+        let sorted = catalog.merge_sorted(None, GamesSortMode::LastPlayed, title);
+        assert_eq!(
+            sorted
+                .iter()
+                .map(|e| match e {
+                    GameEntry::Steam { appid } => format!("s{appid}"),
+                    GameEntry::Manual { title, .. } => title.clone(),
+                })
+                .collect::<Vec<_>>(),
+            vec!["s2", "Zebra", "s1"]
+        );
+
+        let alpha = catalog.merge_sorted(None, GamesSortMode::Alphabetical, title);
+        assert_eq!(
+            alpha
+                .iter()
+                .map(|e| match e {
+                    GameEntry::Steam { appid } => format!("Steam {appid}"),
+                    GameEntry::Manual { title, .. } => title.clone(),
+                })
+                .collect::<Vec<_>>(),
+            vec!["Steam 1", "Steam 2", "Zebra"]
+        );
+    }
+
+    #[test]
+    fn touch_played_and_remove_manual_clears_timestamp() {
+        let mut catalog = GamesCatalog::default();
+        catalog.toggle_steam(7, true);
+        catalog.add_manual("Solo".into(), "solo.exe".into(), String::new(), None);
+        let manual = catalog.entries[1].clone();
+        catalog.touch_played_key(GameEntry::Steam { appid: 7 }.play_key());
+        catalog.touch_played_key(manual.play_key());
+        assert!(
+            catalog
+                .last_played(&GameEntry::Steam { appid: 7 })
+                .is_some()
+        );
+        assert!(catalog.last_played(&manual).is_some());
+        let id = match &manual {
+            GameEntry::Manual { id, .. } => id.clone(),
+            _ => panic!("manual"),
+        };
+        assert!(catalog.remove_manual_id(&id));
+        assert!(!catalog.last_played_ms.contains_key(&format!("manual:{id}")));
     }
 }

@@ -29,6 +29,10 @@ pub enum NavAction {
     Cancel,
     PrevSlide,
     NextSlide,
+    ToggleEdit,
+    CycleSort,
+    /// Triangle edge — edit selected manual while in edit mode.
+    Triangle,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -40,7 +44,9 @@ pub struct PadSample {
     pub dpad_down: bool,
     pub cross: bool,
     pub circle: bool,
+    pub square: bool,
     pub triangle: bool,
+    pub options: bool,
     pub l2: bool,
     pub r2: bool,
     /// Raw DualSense `buttons[0]` (hat + face). Useful for offset diagnostics.
@@ -202,6 +208,9 @@ impl NavStepper {
 pub struct ButtonEdges {
     cross: bool,
     circle: bool,
+    square: bool,
+    triangle: bool,
+    options: bool,
     l2: bool,
     r2: bool,
 }
@@ -213,6 +222,12 @@ impl ButtonEdges {
             action = Some(NavAction::Confirm);
         } else if sample.circle && !self.circle {
             action = Some(NavAction::Cancel);
+        } else if sample.square && !self.square {
+            action = Some(NavAction::ToggleEdit);
+        } else if sample.triangle && !self.triangle {
+            action = Some(NavAction::Triangle);
+        } else if sample.options && !self.options {
+            action = Some(NavAction::CycleSort);
         } else if sample.l2 && !self.l2 {
             action = Some(NavAction::PrevSlide);
         } else if sample.r2 && !self.r2 {
@@ -226,6 +241,9 @@ impl ButtonEdges {
     pub fn sync(&mut self, sample: &PadSample) {
         self.cross = sample.cross;
         self.circle = sample.circle;
+        self.square = sample.square;
+        self.triangle = sample.triangle;
+        self.options = sample.options;
         self.l2 = sample.l2;
         self.r2 = sample.r2;
     }
@@ -271,7 +289,9 @@ pub type CrossHold = HoldTracker;
 pub fn sample_nav_resting(sample: &PadSample) -> bool {
     !sample.cross
         && !sample.circle
+        && !sample.square
         && !sample.triangle
+        && !sample.options
         && !sample.l2
         && !sample.r2
         && !sample.dpad_up
@@ -334,10 +354,12 @@ fn gamepad_reading_from_pad(
     let buttons = reading.Buttons;
     let dpad_up = buttons.contains(GamepadButtons::DPadUp);
     let dpad_down = buttons.contains(GamepadButtons::DPadDown);
-    // Standard gamepad: A ≈ Cross, B ≈ Circle, Y ≈ Triangle on DualSense via Windows.
+    // Standard gamepad: A ≈ Cross, B ≈ Circle, X ≈ Square, Y ≈ Triangle on DualSense via Windows.
     let cross = buttons.contains(GamepadButtons::A);
     let circle = buttons.contains(GamepadButtons::B);
+    let square = buttons.contains(GamepadButtons::X);
     let triangle = buttons.contains(GamepadButtons::Y);
+    let options = buttons.contains(GamepadButtons::Menu);
     let l2 = reading.LeftTrigger >= 0.25;
     let r2 = reading.RightTrigger >= 0.25;
 
@@ -354,8 +376,14 @@ fn gamepad_reading_from_pad(
     if circle {
         held.insert(GestureControl::Circle);
     }
+    if square {
+        held.insert(GestureControl::Square);
+    }
     if triangle {
         held.insert(GestureControl::Triangle);
+    }
+    if options {
+        held.insert(GestureControl::Options);
     }
     if l2 {
         held.insert(GestureControl::L2);
@@ -379,7 +407,9 @@ fn gamepad_reading_from_pad(
             dpad_down,
             cross,
             circle,
+            square,
             triangle,
+            options,
             l2,
             r2,
             buttons0: 0,
@@ -601,7 +631,9 @@ pub fn parse_report(buf: &[u8], base: usize) -> PadSample {
         dpad_down,
         cross,
         circle,
+        square,
         triangle,
+        options,
         l2,
         r2,
         buttons0,
@@ -650,7 +682,7 @@ struct PadSlot {
 #[derive(Debug, Clone, Default)]
 pub struct PadNavBank {
     slots: HashMap<PadId, PadSlot>,
-    /// When true, newly seen pads start armed (Settings preview).
+    /// When true, newly seen pads start armed (e.g. after start screen opens cleanly).
     arm_new_pads: bool,
 }
 
@@ -680,11 +712,21 @@ impl PadNavBank {
         self.arm_new_pads = arm_immediately;
     }
 
-    /// Arm every currently tracked pad (Settings preview).
-    pub fn arm_all(&mut self) {
-        self.arm_new_pads = true;
-        for slot in self.slots.values_mut() {
-            slot.armed = true;
+    /// Sync presence + button edges without emitting actions or hold progress.
+    /// Used while a slide animates so held buttons do not fire when the anim settles.
+    pub fn sync_edges_only(&mut self, readings: &[NavReading]) {
+        self.sync_presence(readings);
+        for reading in readings {
+            let Some(slot) = self.slots.get_mut(&reading.id) else {
+                continue;
+            };
+            slot.button_edges.sync(&reading.sample);
+            slot.nav_stepper.reset();
+            slot.triangle_hold.reset();
+            slot.cross_hold.reset();
+            if !slot.armed && sample_nav_resting(&reading.sample) {
+                slot.armed = true;
+            }
         }
     }
 
@@ -807,6 +849,19 @@ pub struct GestureDetectorBank {
 impl GestureDetectorBank {
     pub fn reset(&mut self) {
         self.detectors.clear();
+    }
+
+    /// Mark every live pad as already armed so the current/sticky hold cannot
+    /// reopen the start screen (used right after gesture recording commits).
+    pub fn consume_pending_match(&mut self, readings: &[NavReading]) {
+        let live: HashSet<PadId> = readings.iter().map(|r| r.id.clone()).collect();
+        self.detectors.retain(|id, _| live.contains(id));
+        for reading in readings {
+            self.detectors
+                .entry(reading.id.clone())
+                .or_default()
+                .mark_armed();
+        }
     }
 
     /// Returns true when any single pad completes the chord this tick.
@@ -1049,6 +1104,28 @@ mod tests {
     }
 
     #[test]
+    fn button_edges_fires_square_toggle_edit() {
+        let mut edges = ButtonEdges::default();
+        let sample = PadSample {
+            square: true,
+            ..Default::default()
+        };
+        assert_eq!(edges.update(&sample), Some(NavAction::ToggleEdit));
+        assert!(edges.update(&sample).is_none());
+    }
+
+    #[test]
+    fn button_edges_fires_options_cycle_sort() {
+        let mut edges = ButtonEdges::default();
+        let sample = PadSample {
+            options: true,
+            ..Default::default()
+        };
+        assert_eq!(edges.update(&sample), Some(NavAction::CycleSort));
+        assert!(edges.update(&sample).is_none());
+    }
+
+    #[test]
     fn button_edges_fires_cross_once() {
         let mut edges = ButtonEdges::default();
         let sample = PadSample {
@@ -1099,7 +1176,9 @@ mod tests {
                 GestureControl::R2 => sample.r2 = true,
                 GestureControl::Cross => sample.cross = true,
                 GestureControl::Circle => sample.circle = true,
+                GestureControl::Square => sample.square = true,
                 GestureControl::Triangle => sample.triangle = true,
+                GestureControl::Options => sample.options = true,
                 _ => {}
             }
         }
@@ -1182,20 +1261,32 @@ mod tests {
         let mut bank = GestureDetectorBank::default();
         let required = crate::gesture::default_gesture();
 
-        let a = chord_sample(&[GestureControl::L2, GestureControl::R2]);
-        let b = chord_sample(&[GestureControl::L3, GestureControl::R3]);
+        let a = chord_sample(&[GestureControl::L2]);
+        let b = chord_sample(&[GestureControl::R2]);
         assert!(!bank.update(&required, &[reading("a", a), reading("b", b)]));
 
-        let full = chord_sample(&[
-            GestureControl::L2,
-            GestureControl::R2,
-            GestureControl::L3,
-            GestureControl::R3,
-        ]);
+        let full = chord_sample(&[GestureControl::Ps]);
         assert!(bank.update(
             &required,
             &[reading("a", full), reading("b", PadSample::default())]
         ));
+    }
+
+    #[test]
+    fn consume_pending_match_suppresses_sticky_reopen() {
+        let mut bank = GestureDetectorBank::default();
+        let required = crate::gesture::default_gesture();
+        let empty = [reading("a", PadSample::default())];
+        bank.consume_pending_match(&empty);
+
+        let sticky = chord_sample(&[GestureControl::Ps]);
+        assert!(
+            !bank.update(&required, &[reading("a", sticky.clone())]),
+            "sticky rematch after record must not fire"
+        );
+
+        assert!(!bank.update(&required, &[reading("a", PadSample::default())]));
+        assert!(bank.update(&required, &[reading("a", sticky)]));
     }
 
     #[test]

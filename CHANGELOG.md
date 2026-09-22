@@ -10,17 +10,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Start screen** launcher: when the first DualSense connects (0→1), an always-on-top quick-launch card can open with a curated list of Steam games and manual shortcuts. Navigate with D-pad / combined analog sticks / arrows; Cross or Enter launches; Circle or Escape dismisses.
-- Reopen the start screen anytime with a configurable controller chord (default **L2 + R2 + L3 + R3**); record or reset the gesture in Settings → Start screen.
-- Settings → **Start screen**: enable toggle, Preview, Steam library checklist, manual `.exe` / `.lnk` / `steam://` shortcuts, reorder/remove, and gesture recording. Catalog persists in `games.json`.
+- Reopen the start screen anytime with a configurable controller chord (default **PS**); record or reset the gesture in Settings → System (when start screen is enabled).
+- Settings → **System**: start-screen enable toggle and reopen-gesture recording. Catalog persists in `games.json`.
+- Start screen opens even with an empty curated catalog (empty copy + Square hint).
+- **Square** toggles edit mode: checklist of all installed Steam games (Cross adds/removes from the catalog) plus removable manuals; **Add shortcut…** (edit only) opens a modal for title, optional args, and optional custom image. **Triangle** edits the selected manual. Leaving Games or closing clears edit mode.
+- Browse mode **Options** toggles sort between **Last played** and **A–Z** (preference in prefs). Successful launches record `last_played_ms` in `games.json`.
+- Manual shortcuts support optional launch **arguments** and a custom **icon** path in `games.json`.
 
 ### Changed
 
 - Start-screen open / close / navigation accepts input from **any** connected controller. Each pad is sampled and edge-detected independently — sticks and buttons are never merged across devices.
 - Start-screen header always shows both **Games** and **Controllers** (active larger, inactive dimmed; L2/R2 only on the inactive side). Game rows use fixed single-line layout with Steam library icons, extracted `.exe`/`.lnk` icons, or a generic placeholder.
+- Item actions (Launch / Toggle / Remove, Identify / Power off, Close game) appear on the **selected** start-screen row; the footer keeps screen-level Edit / Close / Options. Sort shows both **Last played** and **A–Z** with the active mode emphasized.
+- Start-screen edit mode is draft-based: Cross/Add change a working copy; **Square** Saves, **Circle** Cancels (without closing). Hold prompts no longer show a “Hold” label (ring only).
+- Games ↔ Controllers slide animation is ~50% faster. List keep-in-view scrolls only on the leading edge (down pins bottom, up pins top); wrap-around flips the pin. Games footer shows Edit/Save, Close/Cancel, and sort (muted in edit); **Add shortcut…** only in edit mode. Selected game persists across edit enter/exit by identity; enter/Cancel prefer centering the selection, and Save centers when it is out of view. Start-screen window is 640×500 with tighter header/footer chrome. Settings **Start screen** tab removed — enable/gesture live under System.
 
 ### Fixed
 
 - Steam start-screen icons resolve under the modern `librarycache/{appid}/` layout (e.g. `library_600x900.jpg` / nested `library_capsule.jpg`), not only the legacy flat `{appid}_icon.jpg` filenames. Game-row art uses a shared 2:3 portrait cell with cover-fit so capsules are not squashed.
+- Start-screen list scrollbars reserve a gutter so they no longer overlap row content; Games ↔ Controllers carousel slides via translate (fixed pane size) instead of negative padding that reflowed layout mid-animation. Slide drawing/hit-testing clips to the list bounds so the neighboring pane no longer peeks at the edges.
+- Start-screen slide animation skips pad-poll controller rebuilds/nav so frames alone drive the transition.
+- Start-screen list keep-in-view no longer top-pins every step when navigating without the mouse over the list (carousel now forwards redraw so viewport size is known; unknown viewport uses a layout estimate).
+- Start screen stays open while the add/edit-shortcut modal is up or a native file picker has focus (focus-loss no longer cancels the draft).
 
 ## [1.3.3] - 2026-09-20
 

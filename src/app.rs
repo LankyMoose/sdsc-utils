@@ -13,7 +13,7 @@ use crate::battery::{self, ControllerStatus};
 use crate::color::{self, BatterySpectrum, color_for_battery_percent};
 use crate::configure_view::{
     self, AnalyticsPadRow, AnalyticsPanel, ConfigureMessage, ConfigureSettings, ConfigureState,
-    NotificationSetting, PadInputPanel, Section, StartScreenPanel,
+    NotificationSetting, PadInputPanel, Section,
 };
 use crate::dualsense;
 #[cfg(feature = "dev-emulate")]
@@ -118,6 +118,7 @@ pub enum Message {
     /// Periodic DualSense sample for gestures / start-screen navigation.
     PadPoll,
     ManualFilePicked(Option<PathBuf>),
+    ManualIconPicked(Option<PathBuf>),
     SteamScanDone(Result<Vec<SteamGame>, String>),
 
     PlaceToast {
@@ -153,6 +154,8 @@ pub struct App {
     notify: NotifyTracker,
     analytics: AnalyticsStore,
     games: GamesCatalog,
+    /// In-progress start-screen edit checklist; committed on Save, discarded on Cancel.
+    edit_draft: Option<GamesCatalog>,
 
     controllers: Vec<ControllerStatus>,
     /// Last HID presence snapshot (serials), used to detect connect/disconnect.
@@ -181,11 +184,12 @@ pub struct App {
     configure_state: ConfigureState,
     /// Snapshot for the Analytics settings tab (refreshed with controller/analytics changes).
     analytics_panel: AnalyticsPanel,
-    start_screen_panel: StartScreenPanel,
     pad_input_panel: PadInputPanel,
 
     start_window: Option<window::Id>,
     start_state: start_view::State,
+    /// True while an rfd picker is open from the start screen (suppress unfocus-close).
+    start_file_dialog_open: bool,
     /// After last pad disconnect, suppress 0→1 auto-open briefly.
     start_connect_cooldown_until: Option<Instant>,
     gesture_detectors: GestureDetectorBank,
@@ -295,6 +299,7 @@ impl App {
             notify: NotifyTracker::new(),
             analytics,
             games,
+            edit_draft: None,
             controllers: Vec::new(),
             last_discovered: dualsense::list_presence_paths().unwrap_or_default(),
             last_battery_poll: Instant::now(),
@@ -312,10 +317,10 @@ impl App {
             configure_window: None,
             configure_state,
             analytics_panel: AnalyticsPanel::default(),
-            start_screen_panel: StartScreenPanel::default(),
             pad_input_panel: PadInputPanel::default(),
             start_window: None,
             start_state: start_view::State::default(),
+            start_file_dialog_open: false,
             start_connect_cooldown_until: None,
             gesture_detectors: GestureDetectorBank::default(),
             gesture_recorder: GestureRecorder::default(),
@@ -348,8 +353,6 @@ impl App {
             #[cfg(feature = "dev-emulate")]
             dev_paused_percent: None,
         };
-
-        app.sync_start_panel_catalog();
 
         // Show the tray immediately, then poll in the background so a stuck HID
         // read cannot delay the icon for tens of seconds. Pre-create the toast
@@ -471,7 +474,6 @@ impl App {
                 &self.configure_state,
                 &self.configure_settings(),
                 &self.analytics_panel,
-                &self.start_screen_panel,
                 &self.pad_input_panel,
             )
             .map(Message::Configure);
@@ -536,7 +538,13 @@ impl App {
                 if Some(id) == self.popup_window && !self.popup_state.is_editing_any() {
                     self.close_popup()
                 } else if Some(id) == self.start_window {
-                    self.close_start_screen()
+                    // File dialogs (add/edit shortcut, choose image) steal focus — keep the
+                    // start screen open so the modal / draft is not discarded.
+                    if self.start_state.manual_add.is_some() || self.start_file_dialog_open {
+                        Task::none()
+                    } else {
+                        self.close_start_screen()
+                    }
                 } else {
                     Task::none()
                 }
@@ -621,6 +629,7 @@ impl App {
             }
             Message::PadPoll => self.on_pad_poll(),
             Message::ManualFilePicked(path) => self.on_manual_file_picked(path),
+            Message::ManualIconPicked(path) => self.on_manual_icon_picked(path),
             Message::SteamScanDone(result) => self.on_steam_scan_done(result),
 
             Message::PlaceToast { id, monitor } => {
@@ -835,7 +844,6 @@ impl App {
             .is_some_and(|until| Instant::now() < until);
         should_auto_open_start(
             self.prefs.start_screen_enabled,
-            !self.display_catalog().is_empty(),
             true,
             true,
             self.start_window.is_some(),
@@ -1119,15 +1127,10 @@ impl App {
     fn on_configure_message(&mut self, message: ConfigureMessage) -> Task<Message> {
         match message {
             ConfigureMessage::SelectSection(section) => {
-                if self.configure_state.section == Section::StartScreen
-                    && section != Section::StartScreen
-                {
+                if self.configure_state.section == Section::System && section != Section::System {
                     self.cancel_gesture_recording();
                 }
                 self.configure_state.select_section(section);
-                if section == Section::StartScreen {
-                    return self.refresh_steam_library();
-                }
                 if section == Section::PadInput {
                     return self.refresh_pad_input_panel();
                 }
@@ -1179,13 +1182,13 @@ impl App {
             ConfigureMessage::SetStartScreenEnabled(enabled) => {
                 self.prefs.start_screen_enabled = enabled;
                 self.prefs.save();
+                if !enabled {
+                    self.cancel_gesture_recording();
+                    if self.start_window.is_some() {
+                        return self.close_start_screen();
+                    }
+                }
                 Task::none()
-            }
-            ConfigureMessage::PreviewStartScreen => {
-                let task = self.open_start_screen();
-                // Settings preview has no open-gesture leftover holds.
-                self.pad_nav.arm_all();
-                task
             }
             ConfigureMessage::StartGestureRecord => {
                 self.gesture_recorder.start();
@@ -1197,72 +1200,13 @@ impl App {
                 self.cancel_gesture_recording();
                 self.prefs.start_screen_gesture = gesture::default_gesture();
                 self.prefs.save();
+                // Avoid opening if the new default chord is already held.
+                let readings = start_input::read_all_gesture_samples();
+                self.gesture_detectors.consume_pending_match(&readings);
                 Task::none()
             }
             ConfigureMessage::CancelGestureRecord => {
                 self.cancel_gesture_recording();
-                Task::none()
-            }
-            ConfigureMessage::RefreshSteamLibrary => self.refresh_steam_library(),
-            ConfigureMessage::ToggleSteamGame(appid, enabled) => {
-                if self.games.toggle_steam(appid, enabled) {
-                    self.games.save();
-                    self.sync_start_panel_catalog();
-                    self.refresh_start_rows();
-                }
-                Task::none()
-            }
-            ConfigureMessage::AddManualPath => {
-                let draft = self.start_screen_panel.manual_draft.trim().to_string();
-                if draft.is_empty() {
-                    return Task::none();
-                }
-                let title = games::title_from_target(&draft);
-                self.games.add_manual(title, draft);
-                self.games.save();
-                self.start_screen_panel.manual_draft.clear();
-                self.sync_start_panel_catalog();
-                self.refresh_start_rows();
-                Task::none()
-            }
-            ConfigureMessage::PickManualFile => Task::perform(
-                spawn_blocking(|| {
-                    rfd::FileDialog::new()
-                        .add_filter("Programs", &["exe", "lnk", "url"])
-                        .pick_file()
-                        .map(|p| p.to_string_lossy().into_owned())
-                }),
-                |result| match result {
-                    Ok(path) => Message::ManualFilePicked(path.map(PathBuf::from)),
-                    Err(_) => Message::ManualFilePicked(None),
-                },
-            ),
-            ConfigureMessage::ManualDraftChanged(value) => {
-                self.start_screen_panel.manual_draft = value;
-                Task::none()
-            }
-            ConfigureMessage::RenameCatalogEntry(index, title) => {
-                if self.games.set_manual_title(index, title) {
-                    self.games.save();
-                    self.sync_start_panel_catalog();
-                    self.refresh_start_rows();
-                }
-                Task::none()
-            }
-            ConfigureMessage::MoveCatalogEntry(index, up) => {
-                if self.games.move_entry(index, up) {
-                    self.games.save();
-                    self.sync_start_panel_catalog();
-                    self.refresh_start_rows();
-                }
-                Task::none()
-            }
-            ConfigureMessage::RemoveCatalogEntry(index) => {
-                if self.games.remove_at(index) {
-                    self.games.save();
-                    self.sync_start_panel_catalog();
-                    self.refresh_start_rows();
-                }
                 Task::none()
             }
             ConfigureMessage::OpenDataFolder => {
@@ -1575,21 +1519,91 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn display_catalog(&self) -> Vec<crate::games::GameEntry> {
-        self.games
-            .merge_for_display(self.steam_installed.as_deref())
-    }
-
-    fn sync_start_panel_catalog(&mut self) {
-        self.start_screen_panel.catalog = self.games.entries.clone();
+        let steam_by_id = &self.steam_by_id;
+        self.games.merge_sorted(
+            self.steam_installed.as_deref(),
+            self.prefs.games_sort_mode,
+            |entry| match entry {
+                crate::games::GameEntry::Steam { appid } => steam_by_id
+                    .get(appid)
+                    .map(|g| g.name.clone())
+                    .unwrap_or_else(|| format!("Steam {appid}")),
+                crate::games::GameEntry::Manual { title, .. } => title.clone(),
+            },
+        )
     }
 
     fn refresh_start_rows(&mut self) {
-        let rows: Vec<_> = self
-            .display_catalog()
-            .iter()
-            .map(|entry| start_view::StartRow::from_entry(entry, &self.steam_by_id))
-            .collect();
+        self.start_state.sort_mode = self.prefs.games_sort_mode;
+        let rows = if self.start_state.editing {
+            self.edit_checklist_rows()
+        } else {
+            self.display_catalog()
+                .iter()
+                .map(|entry| start_view::StartRow::from_entry(entry, &self.steam_by_id))
+                .collect()
+        };
         self.start_state.set_rows(rows);
+    }
+
+    fn edit_catalog(&self) -> &GamesCatalog {
+        self.edit_draft.as_ref().unwrap_or(&self.games)
+    }
+
+    fn edit_catalog_mut(&mut self) -> &mut GamesCatalog {
+        self.edit_draft.as_mut().unwrap_or(&mut self.games)
+    }
+
+    fn edit_checklist_rows(&self) -> Vec<start_view::StartRow> {
+        let catalog = self.edit_catalog();
+        let mut rows: Vec<_> = self
+            .steam_by_id
+            .values()
+            .map(|game| start_view::StartRow::steam_edit(game, catalog.contains_steam(game.appid)))
+            .collect();
+        for entry in &catalog.entries {
+            if let Some(row) = start_view::StartRow::manual_edit(entry) {
+                rows.push(row);
+            }
+        }
+        rows.sort_by_key(|a| a.title.to_lowercase());
+        rows
+    }
+
+    fn discard_edit_draft(&mut self) {
+        self.edit_draft = None;
+        self.start_state.editing = false;
+        self.start_state.edit_anchor_play_key = None;
+        self.start_state.manual_add = None;
+    }
+
+    fn enter_start_edit(&mut self) -> Task<Message> {
+        self.start_state.capture_edit_anchor();
+        self.edit_draft = Some(self.games.clone());
+        self.start_state.editing = true;
+        self.refresh_start_rows();
+        let key = self.start_state.edit_anchor_play_key.clone();
+        self.start_state.select_game_by_play_key(key.as_deref());
+        self.scroll_start_selection_to_center(true)
+    }
+
+    fn commit_start_edit(&mut self) -> Task<Message> {
+        if let Some(draft) = self.edit_draft.take() {
+            self.games = draft;
+            self.games.save();
+        }
+        self.start_state.editing = false;
+        self.refresh_start_rows();
+        self.start_state.restore_edit_anchor();
+        self.scroll_start_selection_to_center(false)
+    }
+
+    fn cancel_start_edit(&mut self) -> Task<Message> {
+        let key = self.start_state.edit_anchor_play_key.take();
+        self.discard_edit_draft();
+        self.refresh_start_rows();
+        self.start_state.select_game_by_play_key(key.as_deref());
+        self.scroll_start_selection_to_center(true)
     }
 
     fn refresh_start_controllers(&mut self) {
@@ -1733,6 +1747,11 @@ impl App {
         self.start_state.running_target = Some(target);
     }
 
+    fn touch_last_played(&mut self, play_key: &str) {
+        self.games.touch_played_key(play_key);
+        self.games.save();
+    }
+
     fn close_running_game(&mut self) {
         let Some(session) = self.running_session.clone() else {
             return;
@@ -1760,15 +1779,11 @@ impl App {
             Ok(games) => {
                 self.steam_installed = Some(games.iter().map(|g| g.appid).collect());
                 self.steam_by_id = games.iter().map(|g| (g.appid, g.clone())).collect();
-                self.start_screen_panel.steam_games = games;
-                self.start_screen_panel.steam_error = None;
             }
             Err(err) => {
                 steam::warn_scan_error(&err);
                 // Keep prior successful install list if any; otherwise stay Unknown so
                 // curated Steam rows remain visible.
-                self.start_screen_panel.steam_error = Some(err);
-                self.start_screen_panel.steam_games.clear();
             }
         }
         self.match_path_cache.clear();
@@ -1777,15 +1792,65 @@ impl App {
     }
 
     fn on_manual_file_picked(&mut self, path: Option<PathBuf>) -> Task<Message> {
+        self.start_file_dialog_open = false;
         let Some(path) = path else {
             return Task::none();
         };
+        if !self.start_state.editing {
+            return Task::none();
+        }
         let target = path.to_string_lossy().into_owned();
         let title = games::title_from_target(&target);
-        self.games.add_manual(title, target);
-        self.games.save();
-        self.sync_start_panel_catalog();
+        let shell_icon = start_view::probe_shell_icon(&target);
+        self.start_state.manual_add = Some(start_view::ManualAddDraft {
+            edit_id: None,
+            target,
+            title,
+            args: String::new(),
+            icon_path: None,
+            shell_icon,
+        });
+        Task::none()
+    }
+
+    fn on_manual_icon_picked(&mut self, path: Option<PathBuf>) -> Task<Message> {
+        self.start_file_dialog_open = false;
+        let Some(draft) = self.start_state.manual_add.as_mut() else {
+            return Task::none();
+        };
+        if let Some(path) = path {
+            draft.icon_path = Some(path);
+        }
+        Task::none()
+    }
+
+    fn confirm_manual_add(&mut self) -> Task<Message> {
+        let Some(draft) = self.start_state.manual_add.take() else {
+            return Task::none();
+        };
+        let title = draft.title.trim();
+        let title = if title.is_empty() {
+            games::title_from_target(&draft.target)
+        } else {
+            title.to_string()
+        };
+        let icon = draft
+            .icon_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        let args = draft.args.trim().to_string();
+        if let Some(id) = draft.edit_id.as_deref() {
+            self.edit_catalog_mut().update_manual(id, title, args, icon);
+        } else {
+            self.edit_catalog_mut()
+                .add_manual(title, draft.target, args, icon);
+        }
         self.refresh_start_rows();
+        self.scroll_start_selection_into_view()
+    }
+
+    fn cancel_manual_add(&mut self) -> Task<Message> {
+        self.start_state.manual_add = None;
         Task::none()
     }
 
@@ -1798,11 +1863,11 @@ impl App {
         if !self.prefs.start_screen_enabled {
             return Task::none();
         }
+        self.start_state.editing = false;
+        self.start_state.edit_anchor_play_key = None;
+        self.edit_draft = None;
         self.refresh_start_rows();
         self.refresh_start_controllers();
-        if self.start_state.rows.is_empty() {
-            return Task::none();
-        }
 
         self.prepare_start_nav_on_open(false);
 
@@ -1846,9 +1911,8 @@ impl App {
         self.pad_nav.reset();
         self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
-        self.start_state.replace_confirm = None;
-        self.start_state.triangle_progress = 0.0;
-        self.start_state.cross_progress = 0.0;
+        self.start_state.reset_to_games();
+        self.discard_edit_draft();
         self.clear_start_nav_diag();
         match self.start_window {
             Some(id) => window::set_mode(id, window::Mode::Hidden).chain(window::close(id)),
@@ -1903,51 +1967,278 @@ impl App {
                 if index < self.start_state.rows.len() {
                     self.start_state.game_selected = index;
                 }
-                self.launch_selected()
+                let scroll = self.scroll_start_selection_into_view();
+                if self.start_state.editing {
+                    scroll.chain(self.edit_toggle_selected())
+                } else {
+                    scroll.chain(self.launch_selected())
+                }
             }
             StartMessage::SelectController(index) => {
                 if index < self.start_state.controllers.len() {
                     self.start_state.controller_selected = index;
                 }
-                Task::none()
+                self.scroll_start_selection_into_view()
             }
             StartMessage::MoveUp => {
-                self.start_state.move_selection(-1);
-                Task::none()
+                let direction = self
+                    .start_state
+                    .move_selection(-1)
+                    .unwrap_or(start_view::ScrollReveal::Up);
+                self.scroll_start_selection_into_view_dir(direction)
             }
             StartMessage::MoveDown => {
-                self.start_state.move_selection(1);
-                Task::none()
+                let direction = self
+                    .start_state
+                    .move_selection(1)
+                    .unwrap_or(start_view::ScrollReveal::Down);
+                self.scroll_start_selection_into_view_dir(direction)
             }
             StartMessage::Confirm => self.on_start_confirm(),
             StartMessage::Close => {
-                if self.start_state.replace_confirm.take().is_some() {
+                if self.start_state.manual_add.take().is_some()
+                    || self.start_state.replace_confirm.take().is_some()
+                {
                     Task::none()
+                } else if self.start_state.editing {
+                    self.cancel_start_edit()
                 } else {
                     self.close_start_screen()
                 }
             }
             StartMessage::PrevSlide => {
+                if self.start_state.overlay_blocking() {
+                    return Task::none();
+                }
+                if self.start_state.editing {
+                    self.discard_edit_draft();
+                    self.refresh_start_rows();
+                }
                 // L2: Controllers → Games only (no wrap). Interruptible mid-anim.
                 self.start_state
                     .request_slide(StartSlide::Games, Instant::now());
                 Task::none()
             }
             StartMessage::NextSlide => {
+                if self.start_state.overlay_blocking() {
+                    return Task::none();
+                }
+                if self.start_state.editing {
+                    self.discard_edit_draft();
+                    self.refresh_start_rows();
+                }
                 // R2: Games → Controllers only (no wrap). Interruptible mid-anim.
                 self.start_state
                     .request_slide(StartSlide::Controllers, Instant::now());
                 Task::none()
             }
+            StartMessage::ToggleEdit => self.toggle_start_edit(),
+            StartMessage::CycleSort => self.cycle_games_sort(),
+            StartMessage::AddShortcut => {
+                if self.start_state.editing && !self.start_state.overlay_blocking() {
+                    self.pick_manual_shortcut()
+                } else {
+                    Task::none()
+                }
+            }
+            StartMessage::EditManual => self.begin_manual_edit(),
+            StartMessage::GamesScrolled(y, viewport_h) => {
+                self.start_state.set_games_scroll(y, viewport_h);
+                Task::none()
+            }
+            StartMessage::ControllersScrolled(y, viewport_h) => {
+                self.start_state.set_controllers_scroll(y, viewport_h);
+                Task::none()
+            }
+            StartMessage::ManualAddTitle(title) => {
+                if let Some(draft) = self.start_state.manual_add.as_mut() {
+                    draft.title = title;
+                }
+                Task::none()
+            }
+            StartMessage::ManualAddArgs(args) => {
+                if let Some(draft) = self.start_state.manual_add.as_mut() {
+                    draft.args = args;
+                }
+                Task::none()
+            }
+            StartMessage::ManualPickIcon => self.pick_manual_icon(),
+            StartMessage::ManualClearIcon => {
+                if let Some(draft) = self.start_state.manual_add.as_mut() {
+                    draft.icon_path = None;
+                }
+                Task::none()
+            }
         }
     }
 
+    fn scroll_start_selection_into_view(&mut self) -> Task<Message> {
+        self.scroll_start_selection_into_view_dir(start_view::ScrollReveal::Either)
+    }
+
+    fn scroll_start_selection_into_view_dir(
+        &mut self,
+        direction: start_view::ScrollReveal,
+    ) -> Task<Message> {
+        let Some((id, y)) = self.start_state.selection_scroll_y(direction) else {
+            return Task::none();
+        };
+        self.start_state.note_scroll_y(&id, y);
+        operation::scroll_to(
+            id,
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
+        )
+    }
+
+    fn scroll_start_selection_to_center(&mut self, force: bool) -> Task<Message> {
+        let target = if force {
+            self.start_state.selection_scroll_y_center_prefer()
+        } else {
+            self.start_state.selection_scroll_y_center()
+        };
+        let Some((id, y)) = target else {
+            return Task::none();
+        };
+        self.start_state.note_scroll_y(&id, y);
+        operation::scroll_to(
+            id,
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
+        )
+    }
+
+    fn toggle_start_edit(&mut self) -> Task<Message> {
+        if self.start_state.slide != StartSlide::Games
+            || self.start_state.overlay_blocking()
+            || self.start_state.animating()
+        {
+            return Task::none();
+        }
+        if self.start_state.editing {
+            self.commit_start_edit()
+        } else {
+            self.enter_start_edit()
+        }
+    }
+
+    fn cycle_games_sort(&mut self) -> Task<Message> {
+        if self.start_state.editing
+            || self.start_state.slide != StartSlide::Games
+            || self.start_state.overlay_blocking()
+        {
+            return Task::none();
+        }
+        self.prefs.games_sort_mode = self.prefs.games_sort_mode.cycle();
+        self.prefs.save();
+        self.refresh_start_rows();
+        self.scroll_start_selection_into_view()
+    }
+
+    fn pick_manual_shortcut(&mut self) -> Task<Message> {
+        self.start_file_dialog_open = true;
+        Task::perform(
+            spawn_blocking(|| {
+                rfd::FileDialog::new()
+                    .add_filter("Programs", &["exe", "lnk", "url"])
+                    .pick_file()
+                    .map(|p| p.to_string_lossy().into_owned())
+            }),
+            |result| match result {
+                Ok(path) => Message::ManualFilePicked(path.map(PathBuf::from)),
+                Err(_) => Message::ManualFilePicked(None),
+            },
+        )
+    }
+
+    fn pick_manual_icon(&mut self) -> Task<Message> {
+        self.start_file_dialog_open = true;
+        Task::perform(
+            spawn_blocking(|| {
+                rfd::FileDialog::new()
+                    .add_filter("Images", &["png", "jpg", "jpeg", "ico", "webp"])
+                    .pick_file()
+                    .map(|p| p.to_string_lossy().into_owned())
+            }),
+            |result| match result {
+                Ok(path) => Message::ManualIconPicked(path.map(PathBuf::from)),
+                Err(_) => Message::ManualIconPicked(None),
+            },
+        )
+    }
+
+    fn begin_manual_edit(&mut self) -> Task<Message> {
+        if !self.start_state.editing || self.start_state.overlay_blocking() {
+            return Task::none();
+        }
+        let Some(row) = self
+            .start_state
+            .rows
+            .get(self.start_state.game_selected)
+            .cloned()
+        else {
+            return Task::none();
+        };
+        let Some(start_view::EditRow::Manual { id }) = row.edit.as_ref() else {
+            return Task::none();
+        };
+        let icon_path = self.edit_catalog().entries.iter().find_map(|e| match e {
+            crate::games::GameEntry::Manual { id: mid, icon, .. } if mid == id => {
+                icon.as_ref().map(PathBuf::from)
+            }
+            _ => None,
+        });
+        let shell_icon = start_view::probe_shell_icon(&row.target);
+        self.start_state.manual_add = Some(start_view::ManualAddDraft {
+            edit_id: Some(id.clone()),
+            target: row.target,
+            title: row.title,
+            args: row.args,
+            icon_path,
+            shell_icon,
+        });
+        Task::none()
+    }
+
+    fn edit_toggle_selected(&mut self) -> Task<Message> {
+        let Some(row) = self
+            .start_state
+            .rows
+            .get(self.start_state.game_selected)
+            .cloned()
+        else {
+            return Task::none();
+        };
+        let changed = match row.edit.as_ref() {
+            Some(start_view::EditRow::Steam { appid, in_catalog }) => {
+                self.edit_catalog_mut().toggle_steam(*appid, !*in_catalog)
+            }
+            Some(start_view::EditRow::Manual { id }) => {
+                self.edit_catalog_mut().remove_manual_id(id)
+            }
+            None => false,
+        };
+        if changed {
+            self.refresh_start_rows();
+            return self.scroll_start_selection_into_view();
+        }
+        Task::none()
+    }
+
     fn on_start_confirm(&mut self) -> Task<Message> {
+        if self.start_state.manual_add.is_some() {
+            return self.confirm_manual_add();
+        }
         // Replace confirm requires hold-Cross / hold-Enter (see pad poll / key hold).
         if self.start_state.replace_confirm.is_some() {
             return Task::none();
         }
         match self.start_state.slide {
+            StartSlide::Games if self.start_state.editing => self.edit_toggle_selected(),
             StartSlide::Games => self.launch_selected(),
             StartSlide::Controllers => {
                 if let Some(row) = self.start_state.selected_controller() {
@@ -1997,8 +2288,9 @@ impl App {
             self.start_state.running_target = None;
         }
 
-        match launch::launch_target(&row.target) {
+        match launch::launch_target(&row.target, &row.args) {
             Ok(()) => {
+                self.touch_last_played(&row.play_key);
                 self.begin_running_session(row.title, row.target);
                 Task::none()
             }
@@ -2040,6 +2332,9 @@ impl App {
                 self.prefs.start_screen_gesture = peak;
                 self.prefs.save();
                 self.gesture_record_latch.clear();
+                // Recording ends on release; a sticky HID frame of the new chord
+                // must not immediately reopen the start screen.
+                self.gesture_detectors.consume_pending_match(&readings);
             }
             return task;
         }
@@ -2066,14 +2361,22 @@ impl App {
                 start_input::NavReadingsOutcome::Readings(readings) => {
                     self.nav_missing_warned = false;
 
+                    let now = Instant::now();
+                    if self.start_state.animating() {
+                        // Frames drive the slide; only keep button edges in sync.
+                        self.pad_nav.sync_edges_only(&readings);
+                        let _ = self.start_state.tick_anim(now);
+                        return task;
+                    }
+
                     self.refresh_start_controllers();
                     self.refresh_running_badge();
 
-                    let now = Instant::now();
                     let _ = self.start_state.tick_anim(now);
 
                     let replace_confirm = self.start_state.replace_confirm.is_some();
-                    let allow_nav_move = !self.start_state.animating() && !replace_confirm;
+                    let manual_add = self.start_state.manual_add.is_some();
+                    let allow_nav_move = !replace_confirm && !manual_add;
                     let tick = self
                         .pad_nav
                         .tick(&readings, now, allow_nav_move, replace_confirm);
@@ -2102,20 +2405,41 @@ impl App {
                         return task;
                     }
 
+                    if manual_add {
+                        self.start_state.cross_progress = 0.0;
+                        self.start_state.triangle_progress = 0.0;
+                        self.confirm_key_held = false;
+                        self.keyboard_cross_hold.reset();
+                        if let Some(action) = tick.action {
+                            let next = match action {
+                                NavAction::Confirm => self.confirm_manual_add(),
+                                NavAction::Cancel => self.cancel_manual_add(),
+                                _ => Task::none(),
+                            };
+                            return task.chain(next);
+                        }
+                        return task;
+                    }
+
                     self.start_state.cross_progress = 0.0;
                     self.confirm_key_held = false;
                     self.keyboard_cross_hold.reset();
 
-                    self.start_state.triangle_progress = tick.triangle_progress;
-                    if tick.triangle_completed {
-                        match self.start_state.slide {
-                            StartSlide::Games => self.close_running_game(),
-                            StartSlide::Controllers => {
-                                if let Some(row) = self.start_state.selected_controller()
-                                    && row.bluetooth
-                                {
-                                    let serial = row.serial.clone();
-                                    self.power_off(&serial);
+                    // Edit mode: Triangle is a tap (Edit manual), not a hold-to-close.
+                    if self.start_state.editing {
+                        self.start_state.triangle_progress = 0.0;
+                    } else {
+                        self.start_state.triangle_progress = tick.triangle_progress;
+                        if tick.triangle_completed {
+                            match self.start_state.slide {
+                                StartSlide::Games => self.close_running_game(),
+                                StartSlide::Controllers => {
+                                    if let Some(row) = self.start_state.selected_controller()
+                                        && row.bluetooth
+                                    {
+                                        let serial = row.serial.clone();
+                                        self.power_off(&serial);
+                                    }
                                 }
                             }
                         }
@@ -2129,6 +2453,11 @@ impl App {
                             NavAction::Cancel => self.on_start_message(StartMessage::Close),
                             NavAction::PrevSlide => self.on_start_message(StartMessage::PrevSlide),
                             NavAction::NextSlide => self.on_start_message(StartMessage::NextSlide),
+                            NavAction::ToggleEdit => {
+                                self.on_start_message(StartMessage::ToggleEdit)
+                            }
+                            NavAction::CycleSort => self.on_start_message(StartMessage::CycleSort),
+                            NavAction::Triangle => self.on_start_message(StartMessage::EditManual),
                         };
                         return task.chain(next);
                     }
@@ -2547,20 +2876,13 @@ fn controllers_equivalent(a: &[ControllerStatus], b: &[ControllerStatus]) -> boo
 /// Gate for automatic start-screen open on a 0→1 controller connect.
 pub(crate) fn should_auto_open_start(
     enabled: bool,
-    catalog_nonempty: bool,
     previous_empty: bool,
     next_nonempty: bool,
     already_open: bool,
     cooldown_active: bool,
     fullscreen: bool,
 ) -> bool {
-    enabled
-        && catalog_nonempty
-        && previous_empty
-        && next_nonempty
-        && !already_open
-        && !cooldown_active
-        && !fullscreen
+    enabled && previous_empty && next_nonempty && !already_open && !cooldown_active && !fullscreen
 }
 
 #[cfg(test)]
@@ -2570,29 +2892,26 @@ mod start_gate_tests {
     #[test]
     fn opens_on_clean_zero_to_one() {
         assert!(should_auto_open_start(
-            true, true, true, true, false, false, false
+            true, true, true, false, false, false
         ));
     }
 
     #[test]
     fn skips_when_disabled_empty_open_cooldown_or_fullscreen() {
         assert!(!should_auto_open_start(
-            false, true, true, true, false, false, false
+            false, true, true, false, false, false
         ));
         assert!(!should_auto_open_start(
-            true, false, true, true, false, false, false
+            true, false, true, false, false, false
         ));
         assert!(!should_auto_open_start(
-            true, true, false, true, false, false, false
+            true, true, true, true, false, false
         ));
         assert!(!should_auto_open_start(
-            true, true, true, true, true, false, false
+            true, true, true, false, true, false
         ));
         assert!(!should_auto_open_start(
-            true, true, true, true, false, true, false
-        ));
-        assert!(!should_auto_open_start(
-            true, true, true, true, false, false, true
+            true, true, true, false, false, true
         ));
     }
 }
