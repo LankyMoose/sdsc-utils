@@ -19,7 +19,7 @@ use crate::dualsense;
 #[cfg(feature = "dev-emulate")]
 use crate::emulate::{self, Preset};
 use crate::games::{self, GamesCatalog};
-use crate::gesture::{self, GestureDetector, GestureRecorder};
+use crate::gesture::{self, GestureRecorder};
 use crate::known::KnownControllers;
 use crate::launch;
 use crate::lightbar::{
@@ -34,7 +34,8 @@ use crate::popup_view::{self, ControllerRow, PopupMessage};
 use crate::prefs::{Prefs, clamp_low_battery_percent};
 use crate::process_match::{self, RunningSession};
 use crate::start_input::{
-    self, ButtonEdges, CrossHold, NavAction, NavLogSnapshot, NavSource, NavStepper, TriangleHold,
+    self, CrossHold, GestureDetectorBank, GestureRecordLatch, NavAction, NavLogSnapshot, NavSource,
+    PadNavBank,
 };
 use crate::start_view::{self, ReplaceConfirm, StartMessage, StartSlide};
 use crate::steam::{self, SteamGame};
@@ -187,14 +188,13 @@ pub struct App {
     start_state: start_view::State,
     /// After last pad disconnect, suppress 0→1 auto-open briefly.
     start_connect_cooldown_until: Option<Instant>,
-    gesture_detector: GestureDetector,
+    gesture_detectors: GestureDetectorBank,
     gesture_recorder: GestureRecorder,
-    nav_stepper: NavStepper,
-    button_edges: ButtonEdges,
-    triangle_hold: TriangleHold,
-    cross_hold: CrossHold,
-    /// False after open until open-gesture buttons are released.
-    start_nav_armed: bool,
+    /// Latch Settings gesture recording to one pad (no cross-pad union).
+    gesture_record_latch: GestureRecordLatch,
+    pad_nav: PadNavBank,
+    /// Keyboard Enter hold for replace-confirm (not folded into pad slots).
+    keyboard_cross_hold: CrossHold,
     /// Keyboard Enter held (for hold-to-proceed on replace confirm).
     confirm_key_held: bool,
     running_session: Option<RunningSession>,
@@ -317,13 +317,11 @@ impl App {
             start_window: None,
             start_state: start_view::State::default(),
             start_connect_cooldown_until: None,
-            gesture_detector: GestureDetector::new(),
+            gesture_detectors: GestureDetectorBank::default(),
             gesture_recorder: GestureRecorder::default(),
-            nav_stepper: NavStepper::default(),
-            button_edges: ButtonEdges::default(),
-            triangle_hold: TriangleHold::default(),
-            cross_hold: CrossHold::default(),
-            start_nav_armed: true,
+            gesture_record_latch: GestureRecordLatch::default(),
+            pad_nav: PadNavBank::default(),
+            keyboard_cross_hold: CrossHold::default(),
             confirm_key_held: false,
             running_session: None,
             last_running_check: None,
@@ -522,8 +520,7 @@ impl App {
                     Task::none()
                 } else if Some(id) == self.start_window {
                     self.start_window = None;
-                    self.nav_stepper.reset();
-                    self.button_edges.reset();
+                    self.pad_nav.reset();
                     self.clear_start_nav_diag();
                     Task::none()
                 } else if Some(id) == self.toast_window {
@@ -571,8 +568,8 @@ impl App {
                 let _ = self.start_state.tick_anim(now);
                 // Keyboard-only hold progress when pad poll is not running.
                 if self.start_state.replace_confirm.is_some() && self.confirm_key_held {
-                    let (progress, completed) = self.cross_hold.update(true, now);
-                    self.start_state.cross_progress = progress;
+                    let (progress, completed) = self.keyboard_cross_hold.update(true, now);
+                    self.start_state.cross_progress = self.start_state.cross_progress.max(progress);
                     if completed {
                         return self.complete_replace_confirm();
                     }
@@ -586,9 +583,7 @@ impl App {
                 pressed,
             } => {
                 if Some(id) == self.start_window {
-                    if !self.start_nav_armed && pressed {
-                        return Task::none();
-                    }
+                    // Leftover-chord arming is pad-local; keyboard stays live.
                     return match action {
                         StartKeyAction::Up if pressed => {
                             self.on_start_message(StartMessage::MoveUp)
@@ -600,8 +595,7 @@ impl App {
                             if self.start_state.replace_confirm.is_some() {
                                 self.confirm_key_held = pressed;
                                 if !pressed {
-                                    self.cross_hold.reset();
-                                    self.start_state.cross_progress = 0.0;
+                                    self.keyboard_cross_hold.reset();
                                 }
                                 Task::none()
                             } else if pressed {
@@ -1190,12 +1184,13 @@ impl App {
             ConfigureMessage::PreviewStartScreen => {
                 let task = self.open_start_screen();
                 // Settings preview has no open-gesture leftover holds.
-                self.start_nav_armed = true;
+                self.pad_nav.arm_all();
                 task
             }
             ConfigureMessage::StartGestureRecord => {
                 self.gesture_recorder.start();
-                self.gesture_detector.reset();
+                self.gesture_record_latch.clear();
+                self.gesture_detectors.reset();
                 Task::none()
             }
             ConfigureMessage::ResetStartGesture => {
@@ -1796,6 +1791,7 @@ impl App {
 
     fn cancel_gesture_recording(&mut self) {
         self.gesture_recorder.cancel();
+        self.gesture_record_latch.clear();
     }
 
     fn open_start_screen(&mut self) -> Task<Message> {
@@ -1817,7 +1813,7 @@ impl App {
             return window::gain_focus(id);
         }
 
-        self.gesture_detector.reset();
+        self.gesture_detectors.reset();
         self.clear_start_nav_diag();
         // refresh_start_rows already ran a throttled check; force one restore on open.
         self.last_running_check = None;
@@ -1841,21 +1837,15 @@ impl App {
     /// Reset to Games and (optionally) require a full control release before nav fires.
     fn prepare_start_nav_on_open(&mut self, arm_immediately: bool) {
         self.start_state.reset_to_games();
-        self.nav_stepper.reset();
-        self.button_edges.reset();
-        self.triangle_hold.reset();
-        self.cross_hold.reset();
+        self.pad_nav.prepare_on_open(arm_immediately);
+        self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
-        self.start_nav_armed = arm_immediately;
     }
 
     fn close_start_screen(&mut self) -> Task<Message> {
-        self.nav_stepper.reset();
-        self.button_edges.reset();
-        self.triangle_hold.reset();
-        self.cross_hold.reset();
+        self.pad_nav.reset();
+        self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
-        self.start_nav_armed = true;
         self.start_state.replace_confirm = None;
         self.start_state.triangle_progress = 0.0;
         self.start_state.cross_progress = 0.0;
@@ -1873,29 +1863,36 @@ impl App {
         self.nav_hid_fallback_logged = false;
     }
 
-    fn log_start_nav_diag(&mut self, sample: &start_input::PadSample, source: NavSource) {
+    fn log_start_nav_diag(&mut self, reading: &start_input::NavReading, pad_count: usize) {
         if self.nav_source_logged.is_none() {
-            if source == NavSource::Hid && !self.nav_hid_fallback_logged {
+            if reading.source == NavSource::Hid && !self.nav_hid_fallback_logged {
                 app_log::info(
                     "start-nav: Gaming.Input empty or unavailable; using DualSense HID fallback",
                 );
                 self.nav_hid_fallback_logged = true;
             }
-            if source == NavSource::Hid {
+            if reading.source == NavSource::Hid {
                 app_log::info(format!(
-                    "start-nav: source={} buttons0=0x{:02x}",
-                    source.as_str(),
-                    sample.buttons0
+                    "start-nav: source={} pads={} id={} buttons0=0x{:02x}",
+                    reading.source.as_str(),
+                    pad_count,
+                    reading.id.as_str(),
+                    reading.sample.buttons0
                 ));
             } else {
-                app_log::info(format!("start-nav: source={}", source.as_str()));
+                app_log::info(format!(
+                    "start-nav: source={} pads={} id={}",
+                    reading.source.as_str(),
+                    pad_count,
+                    reading.id.as_str()
+                ));
             }
-            self.nav_source_logged = Some(source);
+            self.nav_source_logged = Some(reading.source);
         }
 
-        let snap = NavLogSnapshot::from_sample(sample);
+        let snap = NavLogSnapshot::from_sample(&reading.sample);
         if self.last_nav_log != Some(snap) {
-            app_log::info(snap.format_line(source));
+            app_log::info(snap.format_line(reading.source));
             self.last_nav_log = Some(snap);
         }
     }
@@ -1966,7 +1963,7 @@ impl App {
         let Some(confirm) = self.start_state.replace_confirm.take() else {
             return Task::none();
         };
-        self.cross_hold.reset();
+        self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
         self.start_state.cross_progress = 0.0;
         self.close_running_game();
@@ -2026,7 +2023,8 @@ impl App {
 
         // Gesture recording needs raw DualSense bits (L2/R2/L3/R3, etc.).
         if self.gesture_recorder.is_active() {
-            let Some(sample) = start_input::read_gesture_sample() else {
+            let readings = start_input::read_all_gesture_samples();
+            if readings.is_empty() {
                 if !self.hid_exclusive_warned && !self.controllers.is_empty() {
                     app_log::warn(
                         "could not read DualSense HID for gesture recording (device may be exclusive); try again",
@@ -2034,18 +2032,21 @@ impl App {
                     self.hid_exclusive_warned = true;
                 }
                 return task;
-            };
+            }
             self.hid_exclusive_warned = false;
-            if let Some(peak) = self.gesture_recorder.update(&sample.held) {
+            if let Some(sample) = self.gesture_record_latch.select(&readings)
+                && let Some(peak) = self.gesture_recorder.update(&sample.held)
+            {
                 self.prefs.start_screen_gesture = peak;
                 self.prefs.save();
+                self.gesture_record_latch.clear();
             }
             return task;
         }
 
         if self.start_window.is_some() {
-            match start_input::read_nav_sample() {
-                start_input::NavReadOutcome::Missing {
+            match start_input::read_nav_readings() {
+                start_input::NavReadingsOutcome::Missing {
                     hid_fallback_attempted,
                 } => {
                     if hid_fallback_attempted && !self.nav_hid_fallback_logged {
@@ -2062,10 +2063,8 @@ impl App {
                     }
                     return task;
                 }
-                start_input::NavReadOutcome::Sample(reading) => {
+                start_input::NavReadingsOutcome::Readings(readings) => {
                     self.nav_missing_warned = false;
-                    self.log_start_nav_diag(&reading.sample, reading.source);
-                    let sample = reading.sample;
 
                     self.refresh_start_controllers();
                     self.refresh_running_badge();
@@ -2073,46 +2072,42 @@ impl App {
                     let now = Instant::now();
                     let _ = self.start_state.tick_anim(now);
 
-                    if !self.start_nav_armed {
-                        self.button_edges.sync(&sample);
-                        self.nav_stepper.reset();
-                        self.triangle_hold.reset();
-                        self.cross_hold.reset();
-                        self.start_state.triangle_progress = 0.0;
-                        self.start_state.cross_progress = 0.0;
-                        if start_input::sample_nav_resting(&sample) {
-                            self.start_nav_armed = true;
-                        }
-                        return task;
+                    let replace_confirm = self.start_state.replace_confirm.is_some();
+                    let allow_nav_move = !self.start_state.animating() && !replace_confirm;
+                    let tick = self
+                        .pad_nav
+                        .tick(&readings, now, allow_nav_move, replace_confirm);
+
+                    if let Some(diag) = &tick.diag {
+                        self.log_start_nav_diag(diag, readings.len());
                     }
 
-                    // Replace confirm: hold Cross (or keyboard Enter) to proceed.
-                    if self.start_state.replace_confirm.is_some() {
-                        let cross_held = sample.cross || self.confirm_key_held;
-                        let (progress, completed) = self.cross_hold.update(cross_held, now);
-                        self.start_state.cross_progress = progress;
+                    if replace_confirm {
+                        let mut cross_progress = tick.cross_progress;
+                        let mut cross_completed = tick.cross_completed;
+                        if self.confirm_key_held {
+                            let (k_progress, k_completed) =
+                                self.keyboard_cross_hold.update(true, now);
+                            cross_progress = cross_progress.max(k_progress);
+                            cross_completed = cross_completed || k_completed;
+                        }
+                        self.start_state.cross_progress = cross_progress;
                         self.start_state.triangle_progress = 0.0;
-                        self.triangle_hold.reset();
-                        if completed {
+                        if cross_completed {
                             return task.chain(self.complete_replace_confirm());
                         }
-                        // Circle cancels immediately; Cross tap / stick ignored.
-                        if let Some(action) = self.button_edges.update(&sample)
-                            && action == NavAction::Cancel
-                        {
+                        if tick.action == Some(NavAction::Cancel) {
                             return task.chain(self.on_start_message(StartMessage::Close));
                         }
                         return task;
                     }
 
                     self.start_state.cross_progress = 0.0;
-                    self.cross_hold.reset();
                     self.confirm_key_held = false;
+                    self.keyboard_cross_hold.reset();
 
-                    // Triangle hold: Games closes running game; Controllers powers off BT pad.
-                    let (progress, completed) = self.triangle_hold.update(sample.triangle, now);
-                    self.start_state.triangle_progress = progress;
-                    if completed {
+                    self.start_state.triangle_progress = tick.triangle_progress;
+                    if tick.triangle_completed {
                         match self.start_state.slide {
                             StartSlide::Games => self.close_running_game(),
                             StartSlide::Controllers => {
@@ -2126,26 +2121,14 @@ impl App {
                         }
                     }
 
-                    if !self.start_state.animating()
-                        && let Some(action) = self.nav_stepper.update(&sample, now)
-                    {
+                    if let Some(action) = tick.action {
                         let next = match action {
                             NavAction::Up => self.on_start_message(StartMessage::MoveUp),
                             NavAction::Down => self.on_start_message(StartMessage::MoveDown),
-                            NavAction::Confirm
-                            | NavAction::Cancel
-                            | NavAction::PrevSlide
-                            | NavAction::NextSlide => Task::none(),
-                        };
-                        task = task.chain(next);
-                    }
-                    if let Some(action) = self.button_edges.update(&sample) {
-                        let next = match action {
                             NavAction::Confirm => self.on_start_message(StartMessage::Confirm),
                             NavAction::Cancel => self.on_start_message(StartMessage::Close),
                             NavAction::PrevSlide => self.on_start_message(StartMessage::PrevSlide),
                             NavAction::NextSlide => self.on_start_message(StartMessage::NextSlide),
-                            NavAction::Up | NavAction::Down => Task::none(),
                         };
                         return task.chain(next);
                     }
@@ -2154,15 +2137,16 @@ impl App {
             }
         }
 
-        // Background reopen gesture via short DualSense HID read.
-        let Some(sample) = start_input::read_gesture_sample() else {
+        // Background reopen gesture via short DualSense HID reads (all pads, no merge).
+        let readings = start_input::read_all_gesture_samples();
+        if readings.is_empty() {
             return task;
-        };
+        }
         if self.prefs.start_screen_enabled
             && !self.prefs.start_screen_gesture.is_empty()
             && self
-                .gesture_detector
-                .update(&self.prefs.start_screen_gesture, &sample.held)
+                .gesture_detectors
+                .update(&self.prefs.start_screen_gesture, &readings)
         {
             return task.chain(self.open_start_screen());
         }
@@ -2171,47 +2155,60 @@ impl App {
     }
 
     fn refresh_pad_input_panel(&mut self) -> Task<Message> {
-        // Full DualSense HID sample for held controls (same short open/read/close as gestures).
-        let next = if let Some(sample) = start_input::read_gesture_sample() {
-            let held: Vec<_> = sample.held.iter().copied().collect();
+        // Prefer DualSense HID (full held set); else Gaming.Input / HID nav readings.
+        let next = if let Some(reading) =
+            start_input::preferred_reading(&start_input::read_all_gesture_samples())
+        {
+            let held: Vec<_> = reading.sample.held.iter().copied().collect();
             PadInputPanel {
                 has_sample: true,
                 source: "hid".to_string(),
-                buttons0: Some(sample.buttons0),
-                cross: sample.cross,
-                circle: sample.circle,
-                dpad_up: sample.dpad_up,
-                dpad_down: sample.dpad_down,
-                stick_band: start_input::StickBand::from_stick_y(sample.stick_y)
+                buttons0: Some(reading.sample.buttons0),
+                cross: reading.sample.cross,
+                circle: reading.sample.circle,
+                dpad_up: reading.sample.dpad_up,
+                dpad_down: reading.sample.dpad_down,
+                stick_band: start_input::StickBand::from_stick_y(reading.sample.stick_y)
                     .as_str()
                     .to_string(),
-                stick_y: sample.stick_y,
+                stick_y: reading.sample.stick_y,
                 held: gesture::format_gesture(&held),
             }
         } else {
-            match start_input::read_nav_sample() {
-                start_input::NavReadOutcome::Sample(reading) => {
-                    let held: Vec<_> = reading.sample.held.iter().copied().collect();
-                    PadInputPanel {
-                        has_sample: true,
-                        source: reading.source.as_str().to_string(),
-                        buttons0: if reading.source == NavSource::Hid {
-                            Some(reading.sample.buttons0)
-                        } else {
-                            None
+            match start_input::read_nav_readings() {
+                start_input::NavReadingsOutcome::Readings(readings) => {
+                    match start_input::preferred_reading(&readings) {
+                        Some(reading) => {
+                            let held: Vec<_> = reading.sample.held.iter().copied().collect();
+                            PadInputPanel {
+                                has_sample: true,
+                                source: reading.source.as_str().to_string(),
+                                buttons0: if reading.source == NavSource::Hid {
+                                    Some(reading.sample.buttons0)
+                                } else {
+                                    None
+                                },
+                                cross: reading.sample.cross,
+                                circle: reading.sample.circle,
+                                dpad_up: reading.sample.dpad_up,
+                                dpad_down: reading.sample.dpad_down,
+                                stick_band: start_input::StickBand::from_stick_y(
+                                    reading.sample.stick_y,
+                                )
+                                .as_str()
+                                .to_string(),
+                                stick_y: reading.sample.stick_y,
+                                held: gesture::format_gesture(&held),
+                            }
+                        }
+                        None => PadInputPanel {
+                            has_sample: false,
+                            source: "none".to_string(),
+                            ..PadInputPanel::default()
                         },
-                        cross: reading.sample.cross,
-                        circle: reading.sample.circle,
-                        dpad_up: reading.sample.dpad_up,
-                        dpad_down: reading.sample.dpad_down,
-                        stick_band: start_input::StickBand::from_stick_y(reading.sample.stick_y)
-                            .as_str()
-                            .to_string(),
-                        stick_y: reading.sample.stick_y,
-                        held: gesture::format_gesture(&held),
                     }
                 }
-                start_input::NavReadOutcome::Missing { .. } => PadInputPanel {
+                start_input::NavReadingsOutcome::Missing { .. } => PadInputPanel {
                     has_sample: false,
                     source: "none".to_string(),
                     ..PadInputPanel::default()

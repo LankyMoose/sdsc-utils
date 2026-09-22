@@ -108,10 +108,6 @@ impl GestureDetector {
             false
         }
     }
-
-    pub fn reset(&mut self) {
-        self.armed = false;
-    }
 }
 
 /// Peak-set recorder for Settings → Record gesture.

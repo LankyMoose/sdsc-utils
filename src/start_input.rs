@@ -1,9 +1,9 @@
 //! Start-screen navigation (Windows.Gaming.Input + DualSense HID fallback) and reopen gestures.
 
 use crate::dualsense::{self, is_dualsense_gamepad};
-use crate::gesture::GestureControl;
+use crate::gesture::{GestureControl, GestureDetector};
 use hidapi::{BusType, HidApi, HidDevice};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 const USB_REPORT_ID: u8 = 0x01;
@@ -63,8 +63,19 @@ impl NavSource {
     }
 }
 
+/// Stable pad identity for per-controller edge / hold / gesture state.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PadId(pub String);
+
+impl PadId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NavReading {
+    pub id: PadId,
     pub sample: PadSample,
     pub source: NavSource,
 }
@@ -218,10 +229,6 @@ impl ButtonEdges {
         self.l2 = sample.l2;
         self.r2 = sample.r2;
     }
-
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
 }
 
 /// Tracks a face-button hold (0..=1) and fires once after [`BUTTON_HOLD`].
@@ -272,31 +279,36 @@ pub fn sample_nav_resting(sample: &PadSample) -> bool {
         && sample.stick_y == 0.0
 }
 
-/// Read start-screen navigation: Gaming.Input Gamepad first, then short DualSense HID.
+/// Pick a single reading for debug UI: prefer a non-resting pad, else the first.
+pub fn preferred_reading(readings: &[NavReading]) -> Option<&NavReading> {
+    readings
+        .iter()
+        .find(|r| !sample_nav_resting(&r.sample))
+        .or_else(|| readings.first())
+}
+
+/// Read start-screen navigation: all Gaming.Input Gamepads, else all DualSense HID.
 ///
-/// HID path is open/read/close (same as gestures) so it does not hold the device.
-pub fn read_nav_sample() -> NavReadOutcome {
-    if let Some(sample) = read_gamepad_nav_sample() {
-        return NavReadOutcome::Sample(NavReading {
-            sample,
-            source: NavSource::Gamepad,
-        });
+/// Never mixes backends (avoids double-counting a DualSense). Never merges samples.
+/// HID path is open/read/close per device so it does not hold exclusive access.
+pub fn read_nav_readings() -> NavReadingsOutcome {
+    let gamepads = read_all_gamepad_nav_samples();
+    if !gamepads.is_empty() {
+        return NavReadingsOutcome::Readings(gamepads);
     }
-    match read_gesture_sample() {
-        Some(sample) => NavReadOutcome::Sample(NavReading {
-            sample,
-            source: NavSource::Hid,
-        }),
-        None => NavReadOutcome::Missing {
-            hid_fallback_attempted: true,
-        },
+    let hid = read_all_gesture_samples();
+    if !hid.is_empty() {
+        return NavReadingsOutcome::Readings(hid);
+    }
+    NavReadingsOutcome::Missing {
+        hid_fallback_attempted: true,
     }
 }
 
-/// Result of a start-screen nav poll.
+/// Result of a multi-pad start-screen nav poll.
 #[derive(Debug)]
-pub enum NavReadOutcome {
-    Sample(NavReading),
+pub enum NavReadingsOutcome {
+    Readings(Vec<NavReading>),
     /// Both backends failed. `hid_fallback_attempted` is true when Gaming.Input
     /// had no usable pad and DualSense HID was tried.
     Missing {
@@ -304,19 +316,20 @@ pub enum NavReadOutcome {
     },
 }
 
-/// Windows.Gaming.Input only (A=Cross, B=Circle). Empty when DualSense is not a Gamepad.
 #[cfg(windows)]
-fn read_gamepad_nav_sample() -> Option<PadSample> {
-    use windows::Gaming::Input::{Gamepad, GamepadButtons};
+fn gamepad_reading_from_pad(
+    pad: &windows::Gaming::Input::Gamepad,
+    index: u32,
+) -> Option<NavReading> {
+    use windows::Gaming::Input::{GamepadButtons, RawGameController};
 
-    let gamepads = Gamepad::Gamepads().ok()?;
-    let count = gamepads.Size().ok()?;
-    if count == 0 {
-        return None;
-    }
-    // Prefer the last-connected pad (highest index).
-    let pad = gamepads.GetAt(count - 1).ok()?;
     let reading = pad.GetCurrentReading().ok()?;
+
+    let id = RawGameController::FromGameController(pad)
+        .ok()
+        .and_then(|raw| raw.NonRoamableId().ok())
+        .map(|h| PadId(format!("gamepad:{h}")))
+        .unwrap_or_else(|| PadId(format!("gamepad:{index}")));
 
     let buttons = reading.Buttons;
     let dpad_up = buttons.contains(GamepadButtons::DPadUp);
@@ -357,42 +370,77 @@ fn read_gamepad_nav_sample() -> Option<PadSample> {
         held.insert(GestureControl::DpadDown);
     }
 
-    Some(PadSample {
-        held,
-        stick_y: dy,
-        dpad_up,
-        dpad_down,
-        cross,
-        circle,
-        triangle,
-        l2,
-        r2,
-        buttons0: 0,
+    Some(NavReading {
+        id,
+        sample: PadSample {
+            held,
+            stick_y: dy,
+            dpad_up,
+            dpad_down,
+            cross,
+            circle,
+            triangle,
+            l2,
+            r2,
+            buttons0: 0,
+        },
+        source: NavSource::Gamepad,
     })
 }
 
+/// Windows.Gaming.Input: one reading per connected Gamepad.
+#[cfg(windows)]
+fn read_all_gamepad_nav_samples() -> Vec<NavReading> {
+    use windows::Gaming::Input::Gamepad;
+
+    let Ok(gamepads) = Gamepad::Gamepads() else {
+        return Vec::new();
+    };
+    let Ok(count) = gamepads.Size() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let Ok(pad) = gamepads.GetAt(i) else {
+            continue;
+        };
+        if let Some(reading) = gamepad_reading_from_pad(&pad, i) {
+            out.push(reading);
+        }
+    }
+    out
+}
+
 #[cfg(not(windows))]
-fn read_gamepad_nav_sample() -> Option<PadSample> {
-    None
+fn read_all_gamepad_nav_samples() -> Vec<NavReading> {
+    Vec::new()
 }
 
-/// Short DualSense HID open/read/close for reopen-gesture chords (L2/R2/L3/R3, etc.).
-pub fn read_gesture_sample() -> Option<PadSample> {
-    dualsense::with_hid_lock(read_gesture_sample_unlocked)
+/// All DualSense HID pads (short open/read/close each). Used for reopen chord and recording.
+pub fn read_all_gesture_samples() -> Vec<NavReading> {
+    dualsense::with_hid_lock(read_all_gesture_samples_unlocked)
 }
 
-fn read_gesture_sample_unlocked() -> Option<PadSample> {
-    let api = HidApi::new().ok()?;
+fn read_all_gesture_samples_unlocked() -> Vec<NavReading> {
+    let Ok(api) = HidApi::new() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
     for info in api.device_list().filter(|d| is_dualsense_gamepad(d)) {
         let Ok(device) = info.open_device(&api) else {
             continue;
         };
         let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
         if let Some(sample) = read_device_sample_once(&device, is_bluetooth) {
-            return Some(sample);
+            let path = info.path().to_string_lossy().into_owned();
+            out.push(NavReading {
+                id: PadId(format!("hid:{path}")),
+                sample,
+                source: NavSource::Hid,
+            });
         }
     }
-    None
+    out
 }
 
 fn read_device_sample_once(device: &HidDevice, is_bluetooth: bool) -> Option<PadSample> {
@@ -585,6 +633,228 @@ pub fn combined_stick(lx: f32, ly: f32, rx: f32, ry: f32) -> (f32, f32) {
         (0.0, 0.0)
     } else {
         (dx, dy)
+    }
+}
+
+/// Per-pad edge / hold / arming state for start-screen navigation.
+#[derive(Debug, Clone, Default)]
+struct PadSlot {
+    nav_stepper: NavStepper,
+    button_edges: ButtonEdges,
+    triangle_hold: TriangleHold,
+    cross_hold: CrossHold,
+    armed: bool,
+}
+
+/// Bank of per-pad nav machines. Never merges samples across pads.
+#[derive(Debug, Clone, Default)]
+pub struct PadNavBank {
+    slots: HashMap<PadId, PadSlot>,
+    /// When true, newly seen pads start armed (Settings preview).
+    arm_new_pads: bool,
+}
+
+/// Result of one multi-pad nav tick (at most one [`NavAction`]).
+#[derive(Debug, Clone, Default)]
+pub struct PadTickResult {
+    pub action: Option<NavAction>,
+    /// Pad that produced `action` (for diagnostics).
+    pub action_pad: Option<PadId>,
+    pub triangle_progress: f32,
+    pub triangle_completed: bool,
+    pub cross_progress: f32,
+    pub cross_completed: bool,
+    /// Sample for edge logging: action pad, else first non-resting, else first.
+    pub diag: Option<NavReading>,
+}
+
+impl PadNavBank {
+    pub fn reset(&mut self) {
+        self.slots.clear();
+        self.arm_new_pads = false;
+    }
+
+    /// Clear machines; new pads arm immediately when `arm_immediately`.
+    pub fn prepare_on_open(&mut self, arm_immediately: bool) {
+        self.slots.clear();
+        self.arm_new_pads = arm_immediately;
+    }
+
+    /// Arm every currently tracked pad (Settings preview).
+    pub fn arm_all(&mut self) {
+        self.arm_new_pads = true;
+        for slot in self.slots.values_mut() {
+            slot.armed = true;
+        }
+    }
+
+    /// Sync presence, update every pad's edge/hold state, emit at most one action.
+    ///
+    /// `allow_nav_move` gates D-pad/stick repeats (false while a slide animates).
+    /// `replace_confirm` switches to Cross-hold / Circle-cancel mode.
+    pub fn tick(
+        &mut self,
+        readings: &[NavReading],
+        now: Instant,
+        allow_nav_move: bool,
+        replace_confirm: bool,
+    ) -> PadTickResult {
+        self.sync_presence(readings);
+
+        let mut result = PadTickResult {
+            diag: preferred_reading(readings).cloned(),
+            ..Default::default()
+        };
+
+        let mut button_action: Option<(PadId, NavAction)> = None;
+        let mut nav_action: Option<(PadId, NavAction)> = None;
+
+        for reading in readings {
+            let Some(slot) = self.slots.get_mut(&reading.id) else {
+                continue;
+            };
+
+            if !slot.armed {
+                slot.button_edges.sync(&reading.sample);
+                slot.nav_stepper.reset();
+                slot.triangle_hold.reset();
+                slot.cross_hold.reset();
+                if sample_nav_resting(&reading.sample) {
+                    slot.armed = true;
+                }
+                continue;
+            }
+
+            if replace_confirm {
+                let (progress, completed) = slot.cross_hold.update(reading.sample.cross, now);
+                if progress > result.cross_progress {
+                    result.cross_progress = progress;
+                }
+                if completed {
+                    result.cross_completed = true;
+                }
+                slot.triangle_hold.reset();
+                if let Some(action) = slot.button_edges.update(&reading.sample)
+                    && action == NavAction::Cancel
+                    && button_action.is_none()
+                {
+                    button_action = Some((reading.id.clone(), action));
+                }
+                continue;
+            }
+
+            slot.cross_hold.reset();
+            let (t_progress, t_completed) = slot.triangle_hold.update(reading.sample.triangle, now);
+            if t_progress > result.triangle_progress {
+                result.triangle_progress = t_progress;
+            }
+            if t_completed {
+                result.triangle_completed = true;
+            }
+
+            if allow_nav_move
+                && let Some(action) = slot.nav_stepper.update(&reading.sample, now)
+                && nav_action.is_none()
+            {
+                nav_action = Some((reading.id.clone(), action));
+            }
+
+            if let Some(action) = slot.button_edges.update(&reading.sample)
+                && button_action.is_none()
+            {
+                button_action = Some((reading.id.clone(), action));
+            }
+        }
+
+        // Prefer button over stick/D-pad when both fire this tick.
+        let chosen = button_action.or(nav_action);
+        if let Some((id, action)) = chosen {
+            result.diag = readings.iter().find(|r| r.id == id).cloned();
+            result.action_pad = Some(id);
+            result.action = Some(action);
+        }
+
+        result
+    }
+
+    fn sync_presence(&mut self, readings: &[NavReading]) {
+        let live: HashSet<PadId> = readings.iter().map(|r| r.id.clone()).collect();
+        self.slots.retain(|id, _| live.contains(id));
+        for reading in readings {
+            if self.slots.contains_key(&reading.id) {
+                continue;
+            }
+            let mut slot = PadSlot::default();
+            // First sight: sync edges without firing so held Cross is not a Confirm.
+            slot.button_edges.sync(&reading.sample);
+            if self.arm_new_pads {
+                slot.armed = true;
+            } else {
+                // Unarmed until full rest (covers leftover open-chord and mid-press connects).
+                slot.armed = false;
+            }
+            self.slots.insert(reading.id.clone(), slot);
+        }
+    }
+}
+
+/// Per-pad reopen-gesture detectors (chord must complete on a single pad).
+#[derive(Debug, Clone, Default)]
+pub struct GestureDetectorBank {
+    detectors: HashMap<PadId, GestureDetector>,
+}
+
+impl GestureDetectorBank {
+    pub fn reset(&mut self) {
+        self.detectors.clear();
+    }
+
+    /// Returns true when any single pad completes the chord this tick.
+    pub fn update(&mut self, required: &[GestureControl], readings: &[NavReading]) -> bool {
+        let live: HashSet<PadId> = readings.iter().map(|r| r.id.clone()).collect();
+        self.detectors.retain(|id, _| live.contains(id));
+
+        let mut fired = false;
+        for reading in readings {
+            let detector = self
+                .detectors
+                .entry(reading.id.clone())
+                .or_insert_with(GestureDetector::new);
+            if detector.update(required, &reading.sample.held) {
+                fired = true;
+            }
+        }
+        fired
+    }
+}
+
+/// Latch gesture recording to the first pad that holds a control (no cross-pad union).
+#[derive(Debug, Clone, Default)]
+pub struct GestureRecordLatch {
+    pad: Option<PadId>,
+}
+
+impl GestureRecordLatch {
+    pub fn clear(&mut self) {
+        self.pad = None;
+    }
+
+    /// Returns the sample to feed the recorder, if any pad is latched / should latch.
+    pub fn select<'a>(&mut self, readings: &'a [NavReading]) -> Option<&'a PadSample> {
+        if let Some(id) = self.pad.clone() {
+            if let Some(reading) = readings.iter().find(|r| r.id == id) {
+                return Some(&reading.sample);
+            }
+            // Latched pad disappeared; allow another to take over this tick.
+            self.pad = None;
+        }
+        for reading in readings {
+            if !reading.sample.held.is_empty() {
+                self.pad = Some(reading.id.clone());
+                return Some(&reading.sample);
+            }
+        }
+        None
     }
 }
 
@@ -813,5 +1083,151 @@ mod tests {
             r2: true,
             ..Default::default()
         }));
+    }
+
+    fn reading(id: &str, sample: PadSample) -> NavReading {
+        NavReading {
+            id: PadId(id.to_string()),
+            sample,
+            source: NavSource::Hid,
+        }
+    }
+
+    fn chord_sample(controls: &[GestureControl]) -> PadSample {
+        let mut sample = PadSample::default();
+        for c in controls {
+            sample.held.insert(*c);
+            match c {
+                GestureControl::L2 => sample.l2 = true,
+                GestureControl::R2 => sample.r2 = true,
+                GestureControl::Cross => sample.cross = true,
+                GestureControl::Circle => sample.circle = true,
+                GestureControl::Triangle => sample.triangle = true,
+                _ => {}
+            }
+        }
+        sample
+    }
+
+    #[test]
+    fn pad_b_can_confirm_while_pad_a_holds_open_chord() {
+        let mut bank = PadNavBank::default();
+        bank.prepare_on_open(false);
+        let now = Instant::now();
+
+        // Pad A still holding open chord (unarmed); pad B at rest then Cross.
+        let open = chord_sample(&[
+            GestureControl::L2,
+            GestureControl::R2,
+            GestureControl::L3,
+            GestureControl::R3,
+        ]);
+        let tick1 = bank.tick(
+            &[
+                reading("a", open.clone()),
+                reading("b", PadSample::default()),
+            ],
+            now,
+            true,
+            false,
+        );
+        assert!(tick1.action.is_none());
+
+        let cross = PadSample {
+            cross: true,
+            held: [GestureControl::Cross].into_iter().collect(),
+            ..Default::default()
+        };
+        let tick2 = bank.tick(&[reading("a", open), reading("b", cross)], now, true, false);
+        assert_eq!(tick2.action, Some(NavAction::Confirm));
+        assert_eq!(tick2.action_pad.as_ref().map(|p| p.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn same_tick_two_pads_emit_only_first_action() {
+        let mut bank = PadNavBank::default();
+        bank.prepare_on_open(true);
+        let now = Instant::now();
+
+        // Arm both at rest first.
+        let _ = bank.tick(
+            &[
+                reading("a", PadSample::default()),
+                reading("b", PadSample::default()),
+            ],
+            now,
+            true,
+            false,
+        );
+
+        let circle = PadSample {
+            circle: true,
+            held: [GestureControl::Circle].into_iter().collect(),
+            ..Default::default()
+        };
+        let cross = PadSample {
+            cross: true,
+            held: [GestureControl::Cross].into_iter().collect(),
+            ..Default::default()
+        };
+        let tick = bank.tick(
+            &[reading("a", circle), reading("b", cross)],
+            now,
+            true,
+            false,
+        );
+        assert_eq!(tick.action, Some(NavAction::Cancel));
+        assert_eq!(tick.action_pad.as_ref().map(|p| p.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn reopen_gesture_requires_full_chord_on_one_pad() {
+        let mut bank = GestureDetectorBank::default();
+        let required = crate::gesture::default_gesture();
+
+        let a = chord_sample(&[GestureControl::L2, GestureControl::R2]);
+        let b = chord_sample(&[GestureControl::L3, GestureControl::R3]);
+        assert!(!bank.update(&required, &[reading("a", a), reading("b", b)]));
+
+        let full = chord_sample(&[
+            GestureControl::L2,
+            GestureControl::R2,
+            GestureControl::L3,
+            GestureControl::R3,
+        ]);
+        assert!(bank.update(
+            &required,
+            &[reading("a", full), reading("b", PadSample::default())]
+        ));
+    }
+
+    #[test]
+    fn new_pad_holding_cross_does_not_confirm() {
+        let mut bank = PadNavBank::default();
+        bank.prepare_on_open(false);
+        let now = Instant::now();
+        let cross = PadSample {
+            cross: true,
+            held: [GestureControl::Cross].into_iter().collect(),
+            ..Default::default()
+        };
+        let tick = bank.tick(&[reading("new", cross)], now, true, false);
+        assert!(tick.action.is_none());
+    }
+
+    #[test]
+    fn gesture_record_latch_stays_on_first_pad() {
+        let mut latch = GestureRecordLatch::default();
+        let a = chord_sample(&[GestureControl::L2]);
+        let b = chord_sample(&[GestureControl::R2]);
+        let readings = [reading("a", a.clone()), reading("b", b.clone())];
+        let sample = latch.select(&readings).expect("latch a");
+        assert!(sample.held.contains(&GestureControl::L2));
+
+        // Still latched to a even if empty; b ignored.
+        let empty_a = PadSample::default();
+        let readings2 = [reading("a", empty_a), reading("b", b)];
+        let sample2 = latch.select(&readings2).expect("still a");
+        assert!(sample2.held.is_empty());
     }
 }

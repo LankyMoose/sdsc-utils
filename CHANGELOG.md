@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reopen the start screen anytime with a configurable controller chord (default **L2 + R2 + L3 + R3**); record or reset the gesture in Settings → Start screen.
 - Settings → **Start screen**: enable toggle, Preview, Steam library checklist, manual `.exe` / `.lnk` / `steam://` shortcuts, reorder/remove, and gesture recording. Catalog persists in `games.json`.
 
+### Changed
+
+- Start-screen open / close / navigation accepts input from **any** connected controller. Each pad is sampled and edge-detected independently — sticks and buttons are never merged across devices.
+
 ## [1.3.3] - 2026-09-20
 
 ### Fixed
