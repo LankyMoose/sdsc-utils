@@ -197,7 +197,7 @@ pub fn slide_y(placement: ToastPlacement, progress: f32, dismissing: bool) -> f3
     placement.outside_y + (placement.target_y - placement.outside_y) * t
 }
 
-fn ease_out_cubic(progress: f32) -> f32 {
+pub fn ease_out_cubic(progress: f32) -> f32 {
     1.0 - (1.0 - progress).powi(3)
 }
 

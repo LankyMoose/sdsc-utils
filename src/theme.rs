@@ -334,6 +334,22 @@ pub fn chip(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style 
     }
 }
 
+/// Full-width start-menu row (in-game OSD feel).
+pub fn menu_row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let (fill, ink) = match (selected, status) {
+            (true, button::Status::Disabled) => (Some(alpha(ACCENT, 0.18)), DIM),
+            (true, _) => (Some(alpha(ACCENT, 0.22)), INK),
+            (false, button::Status::Hovered) | (false, button::Status::Pressed) => {
+                (Some(PANEL_HOVER), INK)
+            }
+            (false, button::Status::Disabled) => (Some(alpha(PANEL, 0.5)), DIM),
+            (false, button::Status::Active) => (Some(PANEL), INK),
+        };
+        button_base(fill, ink, RADIUS)
+    }
+}
+
 /// Mini toast card on the toast-position diagram.
 pub fn position_marker(
     selected: bool,
@@ -362,7 +378,6 @@ pub fn position_marker(
 }
 
 /// Filled accent button.
-#[allow(dead_code)]
 pub fn primary(_theme: &Theme, status: button::Status) -> button::Style {
     match status {
         button::Status::Active => button_base(Some(ACCENT), INK, RADIUS_SM),

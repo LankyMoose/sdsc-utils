@@ -189,11 +189,7 @@ mod tests {
             notify_charged,
             notify_connect,
             notify_disconnect: true,
-            low_battery_percent: crate::battery::LOW_BATTERY_PERCENT,
-            toast_position: Default::default(),
-            spectrum: Default::default(),
-            analytics_enabled: false,
-            lightbar_enabled: true,
+            ..Prefs::default()
         }
     }
 

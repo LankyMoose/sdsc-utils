@@ -1,5 +1,6 @@
 //! Configure window UI: sidebar tabs, notification toggles, toast
-//! position picker, lightbar spectrum editor, and battery analytics.
+//! position picker, lightbar spectrum editor, battery analytics, and
+//! system / start-screen launcher settings.
 
 mod coverage;
 mod spectrum;
@@ -14,6 +15,7 @@ use crate::app_meta::{DISPLAY_NAME, PKG_VERSION};
 use crate::color::{BatterySpectrum, hsv_to_rgb};
 #[cfg(feature = "dev-emulate")]
 use crate::emulate::Preset;
+use crate::gesture::{self, GestureControl};
 use crate::prefs::{LOW_BATTERY_PERCENT_MAX, LOW_BATTERY_PERCENT_MIN, ToastPosition};
 use crate::svg_icon;
 use crate::theme;
@@ -51,6 +53,7 @@ pub enum Section {
     ToastPosition,
     Lightbar,
     Analytics,
+    PadInput,
     #[cfg(feature = "dev-emulate")]
     Developer,
 }
@@ -63,6 +66,7 @@ impl Section {
             Self::ToastPosition => "Toast position",
             Self::Lightbar => "Lightbar colors",
             Self::Analytics => "Analytics",
+            Self::PadInput => "Pad input",
             #[cfg(feature = "dev-emulate")]
             Self::Developer => "Developer",
         }
@@ -79,6 +83,7 @@ impl Section {
                 Self::Analytics,
             ];
             if show_developer {
+                sections.push(Self::PadInput);
                 sections.push(Self::Developer);
             }
             sections
@@ -106,7 +111,7 @@ pub enum NotificationSetting {
 }
 
 /// Read-only snapshot of app preferences shown by the configure window.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ConfigureSettings {
     pub notify_low: bool,
     pub notify_charged: bool,
@@ -116,9 +121,29 @@ pub struct ConfigureSettings {
     pub toast_position: ToastPosition,
     pub analytics_enabled: bool,
     pub lightbar_enabled: bool,
+    pub start_screen_enabled: bool,
+    pub start_screen_gesture: Vec<GestureControl>,
+    pub gesture_recording: bool,
+    pub gesture_recording_live: String,
     #[cfg(windows)]
     pub autostart: bool,
     pub show_developer: bool,
+}
+
+/// Live DualSense / gamepad readings for the Pad input debug tab.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PadInputPanel {
+    pub has_sample: bool,
+    /// `gamepad`, `hid`, or `none`.
+    pub source: String,
+    pub buttons0: Option<u8>,
+    pub cross: bool,
+    pub circle: bool,
+    pub dpad_up: bool,
+    pub dpad_down: bool,
+    pub stick_band: String,
+    pub stick_y: f32,
+    pub held: String,
 }
 
 /// Analytics tab content (owned snapshot; not `Copy` because of open sessions).
@@ -158,6 +183,10 @@ pub enum ConfigureMessage {
     SetToastPosition(ToastPosition),
     SetAnalyticsEnabled(bool),
     SetLightbarEnabled(bool),
+    SetStartScreenEnabled(bool),
+    StartGestureRecord,
+    ResetStartGesture,
+    CancelGestureRecord,
     OpenDataFolder,
     #[cfg(windows)]
     SetAutostart(bool),
@@ -365,6 +394,7 @@ pub fn view<'a>(
     state: &'a ConfigureState,
     settings: &ConfigureSettings,
     analytics: &'a AnalyticsPanel,
+    pad_input: &'a PadInputPanel,
 ) -> Element<'a, ConfigureMessage> {
     let title = mouse_area(
         container(text("Settings").size(16.0).color(theme::INK))
@@ -402,7 +432,7 @@ pub fn view<'a>(
     .height(Length::Fixed(HEADER_HEIGHT));
 
     let sidebar = tab_list(state.section, settings.show_developer);
-    let content = section_content(state, settings, analytics);
+    let content = section_content(state, settings, analytics, pad_input);
 
     let body = row![
         container(sidebar)
@@ -480,6 +510,7 @@ fn section_content<'a>(
     state: &'a ConfigureState,
     settings: &ConfigureSettings,
     analytics: &'a AnalyticsPanel,
+    pad_input: &'a PadInputPanel,
 ) -> Element<'a, ConfigureMessage> {
     match state.section {
         Section::System => system_view(settings),
@@ -489,6 +520,7 @@ fn section_content<'a>(
         }
         Section::Lightbar => lightbar_view(state, settings),
         Section::Analytics => analytics_view(settings, analytics),
+        Section::PadInput => pad_input_view(pad_input),
         #[cfg(feature = "dev-emulate")]
         Section::Developer => developer_view(),
     }
@@ -510,6 +542,56 @@ fn system_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage
     }
 
     items = items.push(
+        checkbox(settings.start_screen_enabled)
+            .label("Show start screen when a controller connects")
+            .size(16.0)
+            .text_size(13.0)
+            .spacing(8)
+            .on_toggle(ConfigureMessage::SetStartScreenEnabled),
+    );
+
+    if settings.start_screen_enabled {
+        items = items.push(text("Reopen gesture").size(13.0).color(theme::INK));
+        items = items.push(
+            text(gesture::format_gesture(&settings.start_screen_gesture))
+                .size(12.0)
+                .color(theme::MUTED),
+        );
+
+        if settings.gesture_recording {
+            items = items.push(
+                text(if settings.gesture_recording_live.is_empty() {
+                    "Hold combo, then release…".to_string()
+                } else {
+                    format!("Holding: {}", settings.gesture_recording_live)
+                })
+                .size(12.0)
+                .color(theme::ACCENT),
+            );
+            items = items.push(
+                button(text("Cancel recording").size(12.0))
+                    .padding([5, 8])
+                    .on_press(ConfigureMessage::CancelGestureRecord)
+                    .style(theme::ghost),
+            );
+        } else {
+            items = items.push(
+                row![
+                    button(text("Record").size(12.0))
+                        .padding([5, 8])
+                        .on_press(ConfigureMessage::StartGestureRecord)
+                        .style(theme::primary),
+                    button(text("Reset to default").size(12.0))
+                        .padding([5, 8])
+                        .on_press(ConfigureMessage::ResetStartGesture)
+                        .style(theme::ghost),
+                ]
+                .spacing(6),
+            );
+        }
+    }
+
+    items = items.push(
         button(text("Open data folder").size(13.0))
             .padding([6, 10])
             .on_press(ConfigureMessage::OpenDataFolder)
@@ -522,7 +604,6 @@ fn system_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage
             .color(theme::DIM),
     );
 
-    let _ = settings;
     items.into()
 }
 
@@ -824,6 +905,68 @@ fn lightbar_view<'a>(
     }
 
     content.into()
+}
+
+fn pad_input_view<'a>(panel: &'a PadInputPanel) -> Element<'a, ConfigureMessage> {
+    let mut items = Column::new().spacing(8).width(Fill);
+
+    items = items.push(
+        text("Live DualSense readings for navigation debugging.")
+            .size(12.0)
+            .color(theme::MUTED),
+    );
+
+    if !panel.has_sample {
+        items = items.push(
+            text("No DualSense HID reading (disconnected or exclusive)")
+                .size(13.0)
+                .color(theme::DIM),
+        );
+        return items.into();
+    }
+
+    let source_line = match panel.buttons0 {
+        Some(b0) => format!("source={}  buttons0=0x{b0:02x}", panel.source),
+        None => format!("source={}", panel.source),
+    };
+    items = items.push(text(source_line).size(13.0).color(theme::INK));
+
+    let bit = |label: &str, on: bool| {
+        text(format!("{label}={}", u8::from(on)))
+            .size(13.0)
+            .color(if on { theme::INK } else { theme::MUTED })
+    };
+
+    items = items.push(
+        column![
+            bit("cross", panel.cross),
+            bit("circle", panel.circle),
+            bit("dpad_up", panel.dpad_up),
+            bit("dpad_down", panel.dpad_down),
+            text(format!(
+                "stick={}  stick_y={:.2}",
+                panel.stick_band, panel.stick_y
+            ))
+            .size(13.0)
+            .color(theme::INK),
+        ]
+        .spacing(4),
+    );
+
+    let held = if panel.held.is_empty() {
+        "(none)".to_string()
+    } else {
+        panel.held.clone()
+    };
+    items = items.push(
+        column![
+            text("Held").size(11.0).color(theme::DIM),
+            text(held).size(13.0).color(theme::INK),
+        ]
+        .spacing(2),
+    );
+
+    items.into()
 }
 
 #[cfg(feature = "dev-emulate")]
