@@ -11,6 +11,7 @@ mod configure_view;
 mod dualsense;
 #[cfg(feature = "dev-emulate")]
 mod emulate;
+mod file_icon;
 mod games;
 mod gesture;
 mod icon;

@@ -98,12 +98,46 @@ fn library_folders(steam_root: &Path) -> Result<Vec<PathBuf>, String> {
 
 fn library_cache_icon(steam_root: &Path, appid: u32) -> Option<PathBuf> {
     let cache = steam_root.join("appcache").join("librarycache");
-    let candidates = [
-        cache.join(format!("{appid}_icon.jpg")),
+    library_cache_icon_in(&cache, appid)
+}
+
+/// Resolve artwork under `appcache/librarycache` for an appid.
+///
+/// Prefers Steam library capsules (2:3 portrait). Modern Steam nests these under
+/// `{appid}/` or `{appid}/{hash}/`; older installs used flat `{appid}_*.jpg` names.
+/// Tiny 32×32 client icons are never used — they look poor at list size.
+fn library_cache_icon_in(cache: &Path, appid: u32) -> Option<PathBuf> {
+    let app_dir = cache.join(appid.to_string());
+
+    let named = [
+        app_dir.join("library_600x900.jpg"),
+        app_dir.join("library_capsule.jpg"),
         cache.join(format!("{appid}_library_600x900.jpg")),
+        cache.join(format!("{appid}_icon.jpg")),
+        app_dir.join("header.jpg"),
         cache.join(format!("{appid}.jpg")),
     ];
-    candidates.into_iter().find(|p| p.is_file())
+    if let Some(path) = named.into_iter().find(|p| p.is_file()) {
+        return Some(path);
+    }
+
+    // Newer clients nest capsule/header under content-hash directories.
+    if let Ok(entries) = fs::read_dir(&app_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            for name in ["library_capsule.jpg", "library_600x900.jpg"] {
+                let candidate = path.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Parse `libraryfolders.vdf` and collect `"path"` values.
@@ -256,5 +290,65 @@ mod tests {
     #[test]
     fn launch_uri_format() {
         assert_eq!(launch_uri(570), "steam://rungameid/570");
+    }
+
+    #[test]
+    fn library_cache_prefers_modern_app_subdir() {
+        let root = std::env::temp_dir().join(format!(
+            "sdsc-steam-icon-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache = root.join("librarycache");
+        let app = cache.join("1245620");
+        fs::create_dir_all(&app).unwrap();
+        let modern = app.join("library_600x900.jpg");
+        fs::write(&modern, b"fake").unwrap();
+        // Legacy flat names would have been preferred by the old resolver —
+        // ensure we find the modern path when only the subdir exists.
+        assert_eq!(library_cache_icon_in(&cache, 1245620), Some(modern));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_cache_falls_back_to_legacy_flat_icon() {
+        let root = std::env::temp_dir().join(format!(
+            "sdsc-steam-icon-legacy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache = root.join("librarycache");
+        fs::create_dir_all(&cache).unwrap();
+        let legacy = cache.join("570_icon.jpg");
+        fs::write(&legacy, b"fake").unwrap();
+        assert_eq!(library_cache_icon_in(&cache, 570), Some(legacy));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_cache_finds_nested_capsule() {
+        let root = std::env::temp_dir().join(format!(
+            "sdsc-steam-icon-nested-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache = root.join("librarycache");
+        let nested = cache
+            .join("570")
+            .join("6843027380c3bfd0952449fd9174f492ef2e7b40");
+        fs::create_dir_all(&nested).unwrap();
+        let capsule = nested.join("library_capsule.jpg");
+        fs::write(&capsule, b"fake").unwrap();
+        assert_eq!(library_cache_icon_in(&cache, 570), Some(capsule));
+        let _ = fs::remove_dir_all(&root);
     }
 }

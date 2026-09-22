@@ -2,6 +2,7 @@
 
 use crate::battery::PowerState;
 use crate::color::BatterySpectrum;
+use crate::file_icon;
 use crate::games::GameEntry;
 use crate::percent_ring::{self, POPUP_SIZE};
 use crate::steam::SteamGame;
@@ -10,13 +11,15 @@ use crate::theme;
 use crate::window_layout;
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
+use iced::widget::text::Wrapping;
 use iced::widget::{button, column, container, row, scrollable, space, svg, text};
 use iced::{
-    Alignment, Background, Border, Color, Element, Fill, Length, Padding, Point, Rectangle,
-    Renderer, Theme,
+    Alignment, Background, Border, Color, ContentFit, Element, Fill, Length, Padding, Point,
+    Rectangle, Renderer, Theme,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Logical width of the start-screen window.
@@ -30,7 +33,9 @@ const HEADER_HEIGHT: f32 = 52.0;
 const ROW_HEIGHT: f32 = 88.0;
 const CONTROLLER_ROW_HEIGHT: f32 = 100.0;
 const PADDING: f32 = 20.0;
-const ICON_SIZE: f32 = 56.0;
+/// Portrait cell matching Steam library capsules (2:3).
+const ICON_W: f32 = 48.0;
+const ICON_H: f32 = 72.0;
 const HOLD_RING_SIZE: f32 = 32.0;
 const FACE_GLYPH_SIZE: f32 = 18.0;
 const ROW_GAP: f32 = 10.0;
@@ -71,7 +76,18 @@ pub struct StartRow {
     pub title: String,
     pub subtitle: Option<String>,
     pub target: String,
-    pub icon_path: Option<PathBuf>,
+    pub icon: Option<StartIcon>,
+}
+
+/// Runtime-resolved game art (Steam path or extracted shell icon).
+#[derive(Debug, Clone)]
+pub enum StartIcon {
+    Path(PathBuf),
+    Rgba {
+        width: u32,
+        height: u32,
+        pixels: Arc<[u8]>,
+    },
 }
 
 impl StartRow {
@@ -83,14 +99,14 @@ impl StartRow {
                         title: game.name.clone(),
                         subtitle: Some(format!("Steam · {appid}")),
                         target: crate::steam::launch_uri(*appid),
-                        icon_path: game.icon_path.clone(),
+                        icon: game.icon_path.clone().map(StartIcon::Path),
                     }
                 } else {
                     Self {
                         title: format!("Steam {appid}"),
                         subtitle: Some(format!("steam://rungameid/{appid}")),
                         target: crate::steam::launch_uri(*appid),
-                        icon_path: None,
+                        icon: None,
                     }
                 }
             }
@@ -98,10 +114,24 @@ impl StartRow {
                 title: title.clone(),
                 subtitle: Some(target.clone()),
                 target: target.clone(),
-                icon_path: None,
+                icon: manual_icon(target),
             },
         }
     }
+}
+
+fn manual_icon(target: &str) -> Option<StartIcon> {
+    if target.starts_with("steam://") {
+        return None;
+    }
+    let path = PathBuf::from(target);
+    // Extract a bit larger than the cell so Cover scales cleanly.
+    let (width, height, pixels) = file_icon::rgba_for_path(&path, ICON_H as u32)?;
+    Some(StartIcon::Rgba {
+        width,
+        height,
+        pixels: pixels.into(),
+    })
 }
 
 /// Connected-pad row for the Controllers slide (no remember / nickname edit).
@@ -340,37 +370,54 @@ pub fn view<'a>(
     .into()
 }
 
-/// Three equal columns: left cue | centered title | right cue.
+/// Always show both slide labels; active is large/opaque, inactive dimmed.
+/// L2/R2 cues only appear beside the inactive (switchable-to) slide.
 fn slide_header(slide: StartSlide) -> Element<'static, StartMessage> {
-    let left: Element<'static, StartMessage> = match slide {
-        StartSlide::Controllers => row![
-            text("Games").size(14.0).color(theme::MUTED),
-            text("L2").size(14.0).color(theme::ACCENT),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .into(),
-        StartSlide::Games => space().into(),
+    let games_active = matches!(slide, StartSlide::Games);
+    let controllers_active = matches!(slide, StartSlide::Controllers);
+
+    let games_label = if games_active {
+        text(StartSlide::Games.title()).size(26.0).color(theme::INK)
+    } else {
+        text(StartSlide::Games.title())
+            .size(15.0)
+            .color(theme::alpha(theme::MUTED, 0.45))
     };
-    let right: Element<'static, StartMessage> = match slide {
-        StartSlide::Games => row![
+    let controllers_label = if controllers_active {
+        text(StartSlide::Controllers.title())
+            .size(26.0)
+            .color(theme::INK)
+    } else {
+        text(StartSlide::Controllers.title())
+            .size(15.0)
+            .color(theme::alpha(theme::MUTED, 0.45))
+    };
+
+    let left: Element<'static, StartMessage> = if controllers_active {
+        row![text("L2").size(14.0).color(theme::ACCENT), games_label,]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into()
+    } else {
+        games_label.into()
+    };
+
+    let right: Element<'static, StartMessage> = if games_active {
+        row![
+            controllers_label,
             text("R2").size(14.0).color(theme::ACCENT),
-            text("Controllers").size(14.0).color(theme::MUTED),
         ]
         .spacing(8)
         .align_y(Alignment::Center)
-        .into(),
-        StartSlide::Controllers => space().into(),
+        .into()
+    } else {
+        controllers_label.into()
     };
 
     row![
         container(left)
             .width(Fill)
             .align_x(Alignment::Start)
-            .center_y(Fill),
-        container(text(slide.title()).size(30.0).color(theme::INK))
-            .width(Fill)
-            .center_x(Fill)
             .center_y(Fill),
         container(right)
             .width(Fill)
@@ -730,31 +777,72 @@ fn game_row(
     selected: bool,
     running: bool,
 ) -> Element<'_, StartMessage> {
-    let icon: Element<'_, StartMessage> = if let Some(path) = row.icon_path.as_ref() {
-        iced::widget::image(iced::widget::image::Handle::from_path(path.clone()))
-            .width(Length::Fixed(ICON_SIZE))
-            .height(Length::Fixed(ICON_SIZE))
-            .into()
-    } else {
-        container(
-            svg(svg::Handle::from_memory(svg_icon::DUALSENSE_SVG.as_bytes()))
-                .width(Length::Fixed(ICON_SIZE * 0.7))
-                .height(Length::Fixed(ICON_SIZE * 0.7)),
+    let icon_inner: Element<'_, StartMessage> = match row.icon.as_ref() {
+        Some(StartIcon::Path(path)) => {
+            iced::widget::image(iced::widget::image::Handle::from_path(path.clone()))
+                .width(Length::Fixed(ICON_W))
+                .height(Length::Fixed(ICON_H))
+                .content_fit(ContentFit::Cover)
+                .into()
+        }
+        Some(StartIcon::Rgba {
+            width,
+            height,
+            pixels,
+        }) => iced::widget::image(iced::widget::image::Handle::from_rgba(
+            *width,
+            *height,
+            pixels.to_vec(),
+        ))
+        .width(Length::Fixed(ICON_W))
+        .height(Length::Fixed(ICON_H))
+        .content_fit(ContentFit::Cover)
+        .into(),
+        None => container(
+            svg(svg::Handle::from_memory(svg_icon::GAME_SVG.as_bytes()))
+                .width(Length::Fixed(ICON_W * 0.5))
+                .height(Length::Fixed(ICON_W * 0.5))
+                .style(|_theme, _status| svg::Style {
+                    color: Some(theme::MUTED),
+                }),
         )
-        .width(Length::Fixed(ICON_SIZE))
-        .height(Length::Fixed(ICON_SIZE))
+        .width(Length::Fixed(ICON_W))
+        .height(Length::Fixed(ICON_H))
         .center_x(Fill)
         .center_y(Fill)
         .style(theme::well)
-        .into()
+        .into(),
     };
 
-    let mut titles = column![text(&row.title).size(19.0).color(theme::INK)].spacing(4);
-    if running {
-        titles = titles.push(text("Running").size(13.0).color(theme::SUCCESS));
+    let icon = container(icon_inner)
+        .width(Length::Fixed(ICON_W))
+        .height(Length::Fixed(ICON_H))
+        .clip(true)
+        .style(|_| container::Style {
+            border: Border {
+                radius: theme::RADIUS_SM.into(),
+                ..Default::default()
+            },
+            ..container::Style::default()
+        });
+
+    let title = text(&row.title)
+        .size(19.0)
+        .color(theme::INK)
+        .wrapping(Wrapping::None)
+        .width(Fill);
+
+    let subtitle = if running {
+        text("Running").size(13.0).color(theme::SUCCESS)
     } else if let Some(sub) = row.subtitle.as_ref() {
-        titles = titles.push(text(sub).size(13.0).color(theme::MUTED));
+        text(sub.as_str()).size(13.0).color(theme::MUTED)
+    } else {
+        text(" ").size(13.0).color(Color::TRANSPARENT)
     }
+    .wrapping(Wrapping::None)
+    .width(Fill);
+
+    let titles = column![title, subtitle].spacing(4).width(Fill).clip(true);
 
     button(
         row![selection_bar(selected), icon, titles]

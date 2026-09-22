@@ -17,6 +17,7 @@ pub const CHECK_SVG: &str = include_str!("../assets/icons/check.svg");
 pub const FACE_CROSS_SVG: &str = include_str!("../assets/icons/face-cross.svg");
 pub const FACE_CIRCLE_SVG: &str = include_str!("../assets/icons/face-circle.svg");
 pub const FACE_TRIANGLE_SVG: &str = include_str!("../assets/icons/face-triangle.svg");
+pub const GAME_SVG: &str = include_str!("../assets/icons/game.svg");
 
 /// Canonical DualSense body fill in [`DUALSENSE_SVG`].
 pub const BODY_HEX: &str = "#EBEBF0";

@@ -371,7 +371,7 @@ impl App {
         if Some(window) == self.configure_window {
             "Settings".to_string()
         } else if Some(window) == self.start_window {
-            "Quick launch".to_string()
+            String::new()
         } else {
             crate::app_meta::DISPLAY_NAME.to_string()
         }

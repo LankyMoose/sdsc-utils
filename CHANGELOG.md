@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Start-screen open / close / navigation accepts input from **any** connected controller. Each pad is sampled and edge-detected independently — sticks and buttons are never merged across devices.
+- Start-screen header always shows both **Games** and **Controllers** (active larger, inactive dimmed; L2/R2 only on the inactive side). Game rows use fixed single-line layout with Steam library icons, extracted `.exe`/`.lnk` icons, or a generic placeholder.
+
+### Fixed
+
+- Steam start-screen icons resolve under the modern `librarycache/{appid}/` layout (e.g. `library_600x900.jpg` / nested `library_capsule.jpg`), not only the legacy flat `{appid}_icon.jpg` filenames. Game-row art uses a shared 2:3 portrait cell with cover-fit so capsules are not squashed.
 
 ## [1.3.3] - 2026-09-20
 
