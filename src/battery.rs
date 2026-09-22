@@ -2,7 +2,7 @@
 
 use crate::app_log;
 use crate::dualsense::{
-    self, is_dualsense_device, is_storable_serial, normalize_identity, resolve_device_identity,
+    is_dualsense_device, is_storable_serial, normalize_identity, resolve_device_identity,
 };
 use hidapi::{BusType, HidApi, HidDevice};
 use std::thread;
@@ -248,29 +248,44 @@ fn build_bt_control_off_report(size: usize, seed: u8) -> Vec<u8> {
 /// Windows exposes DualSense as multiple HID interfaces; feature report 0x08 may not be
 /// on the Gamepad usage we use for battery. Try every Bluetooth DualSense interface and
 /// several report sizes/CRC seeds until SetFeature succeeds.
-pub fn power_off_bluetooth(serial: &str) -> Result<(), String> {
-    // Hold the HID lock for the whole open/write so we do not race identify/RGB.
-    dualsense::with_hid_lock(|| power_off_bluetooth_unlocked(serial))
+pub fn power_off_bluetooth_timed(
+    serial: &str,
+) -> (Result<(), String>, crate::lightbar::HidPhaseTiming) {
+    let mut timing = crate::lightbar::HidPhaseTiming::default();
+    let enum_started = std::time::Instant::now();
+    let result = power_off_bluetooth_unlocked_timed(serial, &mut timing);
+    if timing.enumerate_ms == 0 && timing.open_ms == 0 && timing.io_ms == 0 {
+        timing.enumerate_ms = enum_started.elapsed().as_millis();
+    }
+    (result, timing)
 }
 
-fn power_off_bluetooth_unlocked(serial: &str) -> Result<(), String> {
+fn power_off_bluetooth_unlocked_timed(
+    serial: &str,
+    timing: &mut crate::lightbar::HidPhaseTiming,
+) -> Result<(), String> {
+    let enum_started = std::time::Instant::now();
     let api = HidApi::new().map_err(|e| e.to_string())?;
     let target = normalize_identity(serial);
 
     let mut matched: Vec<(String, HidDevice)> = Vec::new();
     let mut unknown: Vec<(String, HidDevice)> = Vec::new();
+    let mut open_ms = 0u128;
     for info in api.device_list().filter(|d| is_dualsense_device(d)) {
         if !matches!(info.bus_type(), BusType::Bluetooth) {
             continue;
         }
         let path = info.path().to_string_lossy().into_owned();
+        let open_started = std::time::Instant::now();
         let device = match info.open_device(&api) {
             Ok(d) => d,
             Err(err) => {
+                open_ms += open_started.elapsed().as_millis();
                 app_log::warn(format!("power-off: open failed for {path}: {err}"));
                 continue;
             }
         };
+        open_ms += open_started.elapsed().as_millis();
         let identity = resolve_device_identity(info, &device);
         if identity == target {
             matched.push((path, device));
@@ -279,6 +294,8 @@ fn power_off_bluetooth_unlocked(serial: &str) -> Result<(), String> {
             unknown.push((path, device));
         }
     }
+    timing.enumerate_ms += enum_started.elapsed().as_millis().saturating_sub(open_ms);
+    timing.open_ms += open_ms;
 
     let mut candidates = matched;
     if candidates.is_empty() {
@@ -300,12 +317,14 @@ fn power_off_bluetooth_unlocked(serial: &str) -> Result<(), String> {
     ];
     let mut errors = Vec::new();
 
+    let io_started = std::time::Instant::now();
     for (path, device) in &candidates {
         for &seed in &FEATURE_CRC32_SEEDS {
             for &size in &sizes {
                 let report = build_bt_control_off_report(size, seed);
                 match device.send_feature_report(&report) {
                     Ok(()) => {
+                        timing.io_ms += io_started.elapsed().as_millis();
                         app_log::info(format!(
                             "power-off sent for {serial} via {path} (size={size}, seed={seed:#04x})"
                         ));
@@ -318,6 +337,7 @@ fn power_off_bluetooth_unlocked(serial: &str) -> Result<(), String> {
             }
         }
     }
+    timing.io_ms += io_started.elapsed().as_millis();
 
     Err(format!(
         "power-off feature report failed after {} attempt(s): {}",

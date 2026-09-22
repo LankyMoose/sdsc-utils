@@ -19,7 +19,7 @@ const PAIRING_INFO_FEATURE_SIZE: usize = 20;
 /// Serializes all DualSense HID open/read/write/close (battery, lightbar, power-off).
 static HID_IO_LOCK: Mutex<()> = Mutex::new(());
 
-/// Hold the DualSense HID I/O lock for a closure.
+/// Hold the DualSense HID I/O lock for a closure (CLI one-shots only).
 pub fn with_hid_lock<T>(f: impl FnOnce() -> T) -> T {
     let _guard = HID_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     f()
@@ -103,22 +103,20 @@ pub fn resolve_device_identity(info: &DeviceInfo, device: &HidDevice) -> String 
     }
 }
 
+/// True for DualSense / DualSense Edge vendor+product (any interface).
+pub fn is_dualsense_vid_pid(vendor_id: u16, product_id: u16) -> bool {
+    vendor_id == SONY_VENDOR_ID
+        && matches!(product_id, DUALSENSE_PRODUCT_ID | DUALSENSE_EDGE_PRODUCT_ID)
+}
+
 pub fn is_dualsense_gamepad(d: &DeviceInfo) -> bool {
-    d.vendor_id() == SONY_VENDOR_ID
-        && matches!(
-            d.product_id(),
-            DUALSENSE_PRODUCT_ID | DUALSENSE_EDGE_PRODUCT_ID
-        )
+    is_dualsense_vid_pid(d.vendor_id(), d.product_id())
         && d.usage_page() == HID_USAGE_PAGE_GENERIC_DESKTOP
         && d.usage() == HID_USAGE_GAMEPAD
 }
 
 pub fn is_dualsense_device(d: &DeviceInfo) -> bool {
-    d.vendor_id() == SONY_VENDOR_ID
-        && matches!(
-            d.product_id(),
-            DUALSENSE_PRODUCT_ID | DUALSENSE_EDGE_PRODUCT_ID
-        )
+    is_dualsense_vid_pid(d.vendor_id(), d.product_id())
 }
 
 /// Presence keys for connect/disconnect (HID paths — unique per USB/BT node).

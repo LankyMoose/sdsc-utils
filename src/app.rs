@@ -9,7 +9,7 @@ use crate::analytics::{self, AnalyticsStore};
 use crate::app_log;
 #[cfg(windows)]
 use crate::autostart;
-use crate::battery::{self, ControllerStatus};
+use crate::battery::ControllerStatus;
 use crate::color::{self, BatterySpectrum, color_for_battery_percent};
 use crate::configure_view::{
     self, AnalyticsPadRow, AnalyticsPanel, ConfigureMessage, ConfigureSettings, ConfigureState,
@@ -20,6 +20,7 @@ use crate::dualsense;
 use crate::emulate::{self, Preset};
 use crate::games::{self, GamesCatalog};
 use crate::gesture::{self, GestureRecorder};
+use crate::hid_worker::HidWorkerHandle;
 use crate::known::KnownControllers;
 use crate::launch;
 use crate::lightbar::{
@@ -28,10 +29,11 @@ use crate::lightbar::{
 use crate::notify::{NotifyEvent, NotifyTracker};
 use crate::paths;
 use crate::poll::{
-    self, BATTERY_INTERVAL, LIVENESS_INTERVAL, PRESENCE_INTERVAL, UNREAD_RETRY_INTERVAL,
+    BATTERY_INTERVAL, LIVENESS_INTERVAL, PRESENCE_INTERVAL, PRESENCE_INTERVAL_EMPTY,
+    UNREAD_RETRY_INTERVAL,
 };
 use crate::popup_view::{self, ControllerRow, PopupMessage};
-use crate::prefs::{Prefs, clamp_low_battery_percent};
+use crate::prefs::{Prefs, clamp_low_battery_percent, clamp_start_screen_sound_volume};
 use crate::process_match::{self, RunningSession};
 use crate::start_input::{
     self, CrossHold, GestureDetectorBank, GestureRecordLatch, NavAction, NavLogSnapshot, NavSource,
@@ -43,6 +45,7 @@ use crate::theme;
 use crate::toast::ToastMessage;
 use crate::toast_view;
 use crate::tray::{self, QUIT_ID, SETTINGS_ID};
+use crate::ui_sound::{self, UiSoundKind};
 #[cfg(windows)]
 use crate::win32;
 use crate::window_layout::{
@@ -74,8 +77,10 @@ const SPECTRUM_DEBOUNCE: Duration = Duration::from_millis(150);
 const TOAST_LIFETIME: Duration = Duration::from_secs(5);
 /// Ignore 0→1 auto-open briefly after the last pad vanished (BT ghost flaps).
 const START_CONNECT_COOLDOWN: Duration = Duration::from_secs(5);
-/// DualSense poll rate while start-screen input / gesture listening is active.
-const PAD_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// DualSense poll rate while start-nav or gesture recording needs low latency.
+const PAD_POLL_ACTIVE: Duration = Duration::from_millis(16);
+/// DualSense poll rate for reopen-gesture / Pad Input / background listen.
+const PAD_POLL_BACKGROUND: Duration = Duration::from_millis(50);
 /// Process/catalog running checks are expensive; never run them at pad-poll rate.
 const RUNNING_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -134,8 +139,6 @@ pub enum Message {
 
     /// Debounced spectrum prefs save + lightbar HID apply.
     SpectrumCommit(u64),
-    /// Background spectrum HID apply finished (no-op handler).
-    SpectrumHidDone,
 
     Exit,
 }
@@ -168,6 +171,8 @@ pub struct App {
     refreshing: Arc<AtomicBool>,
     /// Controllers currently in the critical low-battery bucket (serial, percent).
     low_battery: Arc<Mutex<Vec<(String, u8)>>>,
+    /// Serializes DualSense HID for the daemon (never on the UI thread).
+    hid_worker: HidWorkerHandle,
 
     tray_icon: Option<TrayIcon>,
     tray_anchor: TrayAnchor,
@@ -187,6 +192,8 @@ pub struct App {
     pad_input_panel: PadInputPanel,
 
     start_window: Option<window::Id>,
+    /// False until StartOpened shows the window — blocks pad nav / sounds early.
+    start_nav_ready: bool,
     start_state: start_view::State,
     /// True while an rfd picker is open from the start screen (suppress unfocus-close).
     start_file_dialog_open: bool,
@@ -212,12 +219,12 @@ pub struct App {
     hid_exclusive_warned: bool,
     /// One-shot when both Gaming.Input and DualSense HID fail while start is open.
     nav_missing_warned: bool,
+    /// One-shot while every live pad is unarmed (waiting for rest).
+    nav_unarmed_warned: bool,
     /// Logged once per start-session which nav backend succeeded.
     nav_source_logged: Option<NavSource>,
     /// Last edge-logged nav snapshot (cleared when start closes).
     last_nav_log: Option<NavLogSnapshot>,
-    /// One-shot when falling back from empty Gamepad to HID this start-session.
-    nav_hid_fallback_logged: bool,
 
     toast_window: Option<window::Id>,
     toast_message: Option<ToastMessage>,
@@ -287,9 +294,10 @@ impl App {
         #[cfg(windows)]
         autostart::ensure_quiet_entry();
 
-        let identifying = Arc::new(AtomicBool::new(false));
+        let hid_worker = HidWorkerHandle::start();
+        let identifying = hid_worker.identifying();
         let low_battery = Arc::new(Mutex::new(Vec::new()));
-        start_low_battery_pulse_thread(Arc::clone(&identifying), Arc::clone(&low_battery));
+        start_low_battery_pulse_thread(hid_worker.clone(), Arc::clone(&low_battery));
 
         let configure_state = ConfigureState::new(prefs.spectrum.clone());
 
@@ -306,6 +314,7 @@ impl App {
             identifying,
             refreshing: Arc::new(AtomicBool::new(false)),
             low_battery,
+            hid_worker,
             tray_icon: None,
             tray_anchor: TrayAnchor::default(),
             popup_window: None,
@@ -319,6 +328,7 @@ impl App {
             analytics_panel: AnalyticsPanel::default(),
             pad_input_panel: PadInputPanel::default(),
             start_window: None,
+            start_nav_ready: false,
             start_state: start_view::State::default(),
             start_file_dialog_open: false,
             start_connect_cooldown_until: None,
@@ -335,9 +345,9 @@ impl App {
             steam_installed: None,
             hid_exclusive_warned: false,
             nav_missing_warned: false,
+            nav_unarmed_warned: false,
             nav_source_logged: None,
             last_nav_log: None,
-            nav_hid_fallback_logged: false,
             toast_window: None,
             toast_message: None,
             toast_queue: VecDeque::new(),
@@ -416,19 +426,31 @@ impl App {
                     })
                 }
                 iced::Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
-                    if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
-                        Some(Message::StartKey {
-                            id,
-                            action: StartKeyAction::Confirm,
-                            pressed: false,
-                        })
-                    } else {
-                        None
-                    }
+                    let action = match key {
+                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                            Some(StartKeyAction::Cancel)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                            Some(StartKeyAction::Confirm)
+                        }
+                        _ => None,
+                    }?;
+                    Some(Message::StartKey {
+                        id,
+                        action,
+                        pressed: false,
+                    })
                 }
                 _ => None,
             }),
-            iced::time::every(PRESENCE_INTERVAL).map(|_| Message::Tick),
+            iced::time::every(
+                if self.prefs.start_screen_enabled && self.controllers.is_empty() {
+                    PRESENCE_INTERVAL_EMPTY
+                } else {
+                    PRESENCE_INTERVAL
+                },
+            )
+            .map(|_| Message::Tick),
             Subscription::run(tray_events_mapped),
         ];
 
@@ -452,8 +474,15 @@ impl App {
         let pad_listening = pad_input_live
             || (self.prefs.start_screen_enabled
                 && (!self.controllers.is_empty() || self.gesture_recorder.is_active()));
+        let pad_hot = self.pad_input_hot();
+        self.hid_worker.set_input_hot(pad_hot);
         if pad_listening {
-            subscriptions.push(iced::time::every(PAD_POLL_INTERVAL).map(|_| Message::PadPoll));
+            let interval = if pad_hot {
+                PAD_POLL_ACTIVE
+            } else {
+                PAD_POLL_BACKGROUND
+            };
+            subscriptions.push(iced::time::every(interval).map(|_| Message::PadPoll));
         }
 
         if self.start_window.is_some() && self.start_state.needs_frames() {
@@ -522,6 +551,7 @@ impl App {
                     Task::none()
                 } else if Some(id) == self.start_window {
                     self.start_window = None;
+                    self.start_nav_ready = false;
                     self.pad_nav.reset();
                     self.clear_start_nav_diag();
                     Task::none()
@@ -569,16 +599,19 @@ impl App {
             Message::Configure(message) => self.on_configure_message(message),
 
             Message::StartOpened(id) => {
+                self.start_nav_ready = true;
                 window::set_mode(id, window::Mode::Windowed).chain(window::gain_focus(id))
             }
             Message::StartFrame => {
                 let now = Instant::now();
                 let _ = self.start_state.tick_anim(now);
                 // Keyboard-only hold progress when pad poll is not running.
-                if self.start_state.replace_confirm.is_some() && self.confirm_key_held {
-                    let (progress, completed) = self.keyboard_cross_hold.update(true, now);
+                if self.start_state.replace_confirm.is_some() {
+                    let (progress, completed) =
+                        self.keyboard_cross_hold.update(self.confirm_key_held, now);
                     self.start_state.cross_progress = self.start_state.cross_progress.max(progress);
                     if completed {
+                        self.play_start_sound(UiSoundKind::Hold);
                         return self.complete_replace_confirm();
                     }
                 }
@@ -594,26 +627,34 @@ impl App {
                     // Leftover-chord arming is pad-local; keyboard stays live.
                     return match action {
                         StartKeyAction::Up if pressed => {
+                            self.cancel_start_holds();
                             self.on_start_message(StartMessage::MoveUp)
                         }
                         StartKeyAction::Down if pressed => {
+                            self.cancel_start_holds();
                             self.on_start_message(StartMessage::MoveDown)
                         }
                         StartKeyAction::Confirm => {
                             if self.start_state.replace_confirm.is_some() {
-                                self.confirm_key_held = pressed;
-                                if !pressed {
-                                    self.keyboard_cross_hold.reset();
+                                if pressed {
+                                    self.pad_nav.cancel_holds();
                                 }
+                                self.confirm_key_held = pressed;
                                 Task::none()
                             } else if pressed {
+                                self.cancel_start_holds();
                                 self.on_start_message(StartMessage::Confirm)
                             } else {
                                 Task::none()
                             }
                         }
-                        StartKeyAction::Cancel if pressed => {
-                            self.on_start_message(StartMessage::Close)
+                        StartKeyAction::Cancel => {
+                            if pressed {
+                                self.cancel_start_holds();
+                                self.on_start_message(StartMessage::Close)
+                            } else {
+                                Task::none()
+                            }
                         }
                         _ => Task::none(),
                     };
@@ -654,10 +695,10 @@ impl App {
             }
 
             Message::SpectrumCommit(generation) => self.on_spectrum_commit(generation),
-            Message::SpectrumHidDone => Task::none(),
 
             Message::Exit => {
                 self.known.save();
+                self.hid_worker.shutdown();
                 self.tray_icon.take();
                 iced::exit()
             }
@@ -723,10 +764,15 @@ impl App {
         let liveness_due =
             !self.controllers.is_empty() && self.last_battery_poll.elapsed() >= LIVENESS_INTERVAL;
         // HID can list a pad that we cannot open/read yet (sleeping BT, exclusive access).
-        // Retry on a moderate interval — not every presence tick — so the UI stays responsive.
+        // While the tray is empty, retry on the fast presence cadence so 0→1 open is snappy.
         let unread_retry = !self.last_discovered.is_empty()
             && self.controllers.is_empty()
-            && self.last_battery_poll.elapsed() >= UNREAD_RETRY_INTERVAL;
+            && self.last_battery_poll.elapsed()
+                >= if self.prefs.start_screen_enabled {
+                    PRESENCE_INTERVAL_EMPTY
+                } else {
+                    UNREAD_RETRY_INTERVAL
+                };
 
         if membership_changed || battery_due || liveness_due || unread_retry {
             // Reassert lightbar on every poll (~5s liveness included) so other HID
@@ -756,10 +802,8 @@ impl App {
 
         let previously_connected: Vec<String> =
             self.controllers.iter().map(|c| c.serial.clone()).collect();
-        Task::perform(
-            spawn_blocking(move || poll::poll_controllers(&previously_connected)),
-            |outcome| Message::PollResult(outcome.unwrap_or_else(Err)),
-        )
+        let worker = self.hid_worker.clone();
+        Task::perform(worker.poll(previously_connected), Message::PollResult)
     }
 
     fn on_poll_result(&mut self, result: Result<Vec<ControllerStatus>, String>) -> Task<Message> {
@@ -1040,6 +1084,8 @@ impl App {
             lightbar_enabled: self.prefs.lightbar_enabled,
             start_screen_enabled: self.prefs.start_screen_enabled,
             start_screen_gesture: self.prefs.start_screen_gesture.clone(),
+            start_screen_sounds_enabled: self.prefs.start_screen_sounds_enabled,
+            start_screen_sound_volume: self.prefs.start_screen_sound_volume,
             gesture_recording: self.gesture_recorder.is_active(),
             gesture_recording_live: {
                 let peak: Vec<_> = self.gesture_recorder.peak().iter().copied().collect();
@@ -1132,7 +1178,15 @@ impl App {
                 }
                 self.configure_state.select_section(section);
                 if section == Section::PadInput {
-                    return self.refresh_pad_input_panel();
+                    match start_input::read_nav_readings() {
+                        start_input::NavReadingsOutcome::Readings(readings) => {
+                            self.apply_pad_input_panel_from_readings(&readings);
+                        }
+                        start_input::NavReadingsOutcome::Missing { .. } => {
+                            self.apply_pad_input_panel_from_readings(&[]);
+                        }
+                    }
+                    return Task::none();
                 }
                 Task::none()
             }
@@ -1190,6 +1244,25 @@ impl App {
                 }
                 Task::none()
             }
+            ConfigureMessage::SetStartScreenSounds(enabled) => {
+                self.prefs.start_screen_sounds_enabled = enabled;
+                self.prefs.save();
+                if enabled {
+                    self.play_start_sound(UiSoundKind::Nav);
+                }
+                Task::none()
+            }
+            ConfigureMessage::SetStartScreenSoundVolume(volume) => {
+                let volume = clamp_start_screen_sound_volume(volume);
+                if self.prefs.start_screen_sound_volume != volume {
+                    self.prefs.start_screen_sound_volume = volume;
+                    self.prefs.save();
+                    if self.prefs.start_screen_sounds_enabled {
+                        self.play_start_sound(UiSoundKind::Nav);
+                    }
+                }
+                Task::none()
+            }
             ConfigureMessage::StartGestureRecord => {
                 self.gesture_recorder.start();
                 self.gesture_record_latch.clear();
@@ -1200,9 +1273,8 @@ impl App {
                 self.cancel_gesture_recording();
                 self.prefs.start_screen_gesture = gesture::default_gesture();
                 self.prefs.save();
-                // Avoid opening if the new default chord is already held.
-                let readings = start_input::read_all_gesture_samples();
-                self.gesture_detectors.consume_pending_match(&readings);
+                // Clear detectors so a held default chord cannot reopen immediately.
+                self.gesture_detectors.reset();
                 Task::none()
             }
             ConfigureMessage::CancelGestureRecord => {
@@ -1314,18 +1386,10 @@ impl App {
             return Task::none();
         }
 
-        Task::perform(
-            spawn_blocking(move || {
-                for (serial, color) in targets {
-                    if let Err(err) = lightbar::apply_lightbar_rgb(&serial, color) {
-                        app_log::warn(format!(
-                            "failed to apply spectrum color for {serial}: {err}"
-                        ));
-                    }
-                }
-            }),
-            |_| Message::SpectrumHidDone,
-        )
+        for (serial, color) in targets {
+            self.hid_worker.set_rgb(serial, color);
+        }
+        Task::none()
     }
 
     // -----------------------------------------------------------------------
@@ -1342,25 +1406,8 @@ impl App {
             return false;
         };
 
-        if self
-            .identifying
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return false;
-        }
-
-        let serial = serial.to_string();
-        let percent = controller.percent;
-        let identifying = Arc::clone(&self.identifying);
-
-        thread::spawn(move || {
-            if let Err(err) = lightbar::identify_controller(&serial, percent) {
-                app_log::warn(format!("identify failed for {serial}: {err}"));
-            }
-            identifying.store(false, Ordering::SeqCst);
-        });
-        true
+        self.hid_worker
+            .identify(serial.to_string(), controller.percent)
     }
 
     fn power_off(&self, serial: &str) {
@@ -1382,14 +1429,7 @@ impl App {
             return;
         }
 
-        let serial = serial.to_string();
-        thread::spawn(move || {
-            if let Err(err) = battery::power_off_bluetooth(&serial) {
-                app_log::warn(format!("power-off failed for {serial}: {err}"));
-            } else {
-                app_log::info(format!("power-off sent for {serial}"));
-            }
-        });
+        self.hid_worker.power_off(serial.to_string());
     }
 
     fn toggle_remember(&mut self, serial: &str) -> Task<Message> {
@@ -1859,6 +1899,11 @@ impl App {
         self.gesture_record_latch.clear();
     }
 
+    /// True when HID/UI input sampling should run at the active (~60 Hz) rate.
+    fn pad_input_hot(&self) -> bool {
+        self.start_window.is_some() || self.gesture_recorder.is_active()
+    }
+
     fn open_start_screen(&mut self) -> Task<Message> {
         if !self.prefs.start_screen_enabled {
             return Task::none();
@@ -1878,6 +1923,7 @@ impl App {
             return window::gain_focus(id);
         }
 
+        self.start_nav_ready = false;
         self.gesture_detectors.reset();
         self.clear_start_nav_diag();
         // refresh_start_rows already ran a throttled check; force one restore on open.
@@ -1887,7 +1933,8 @@ impl App {
         let (id, open) = window::open(window::Settings {
             size: Size::new(start_view::WIDTH, start_view::HEIGHT),
             position: window::Position::Centered,
-            visible: false,
+            // Visible immediately; StartOpened still arms focus + start_nav_ready.
+            visible: true,
             resizable: false,
             decorations: false,
             level: window::Level::AlwaysOnTop,
@@ -1908,6 +1955,7 @@ impl App {
     }
 
     fn close_start_screen(&mut self) -> Task<Message> {
+        self.start_nav_ready = false;
         self.pad_nav.reset();
         self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
@@ -1922,35 +1970,19 @@ impl App {
 
     fn clear_start_nav_diag(&mut self) {
         self.nav_missing_warned = false;
+        self.nav_unarmed_warned = false;
         self.nav_source_logged = None;
         self.last_nav_log = None;
-        self.nav_hid_fallback_logged = false;
     }
 
     fn log_start_nav_diag(&mut self, reading: &start_input::NavReading, pad_count: usize) {
         if self.nav_source_logged.is_none() {
-            if reading.source == NavSource::Hid && !self.nav_hid_fallback_logged {
-                app_log::info(
-                    "start-nav: Gaming.Input empty or unavailable; using DualSense HID fallback",
-                );
-                self.nav_hid_fallback_logged = true;
-            }
-            if reading.source == NavSource::Hid {
-                app_log::info(format!(
-                    "start-nav: source={} pads={} id={} buttons0=0x{:02x}",
-                    reading.source.as_str(),
-                    pad_count,
-                    reading.id.as_str(),
-                    reading.sample.buttons0
-                ));
-            } else {
-                app_log::info(format!(
-                    "start-nav: source={} pads={} id={}",
-                    reading.source.as_str(),
-                    pad_count,
-                    reading.id.as_str()
-                ));
-            }
+            app_log::info(format!(
+                "start-nav: source={} pads={} id={}",
+                reading.source.as_str(),
+                pad_count,
+                reading.id.as_str()
+            ));
             self.nav_source_logged = Some(reading.source);
         }
 
@@ -1962,11 +1994,20 @@ impl App {
     }
 
     fn on_start_message(&mut self, message: StartMessage) -> Task<Message> {
+        // Keyboard / UI actions other than pure scroll cancel an in-progress hold.
+        match &message {
+            StartMessage::GamesScrolled(..)
+            | StartMessage::ControllersScrolled(..)
+            | StartMessage::ManualAddTitle(_)
+            | StartMessage::ManualAddArgs(_) => {}
+            _ => self.cancel_start_holds(),
+        }
         match message {
             StartMessage::Launch(index) => {
                 if index < self.start_state.rows.len() {
                     self.start_state.game_selected = index;
                 }
+                self.play_start_sound(UiSoundKind::Action);
                 let scroll = self.scroll_start_selection_into_view();
                 if self.start_state.editing {
                     scroll.chain(self.edit_toggle_selected())
@@ -1975,34 +2016,47 @@ impl App {
                 }
             }
             StartMessage::SelectController(index) => {
-                if index < self.start_state.controllers.len() {
+                if index < self.start_state.controllers.len()
+                    && self.start_state.controller_selected != index
+                {
                     self.start_state.controller_selected = index;
+                    self.play_start_sound(UiSoundKind::Nav);
                 }
                 self.scroll_start_selection_into_view()
             }
             StartMessage::MoveUp => {
-                let direction = self
-                    .start_state
-                    .move_selection(-1)
-                    .unwrap_or(start_view::ScrollReveal::Up);
-                self.scroll_start_selection_into_view_dir(direction)
+                let direction = self.start_state.move_selection(-1);
+                if direction.is_some() {
+                    self.play_start_sound(UiSoundKind::Nav);
+                }
+                self.scroll_start_selection_into_view_dir(
+                    direction.unwrap_or(start_view::ScrollReveal::Up),
+                )
             }
             StartMessage::MoveDown => {
-                let direction = self
-                    .start_state
-                    .move_selection(1)
-                    .unwrap_or(start_view::ScrollReveal::Down);
-                self.scroll_start_selection_into_view_dir(direction)
+                let direction = self.start_state.move_selection(1);
+                if direction.is_some() {
+                    self.play_start_sound(UiSoundKind::Nav);
+                }
+                self.scroll_start_selection_into_view_dir(
+                    direction.unwrap_or(start_view::ScrollReveal::Down),
+                )
             }
-            StartMessage::Confirm => self.on_start_confirm(),
+            StartMessage::Confirm => {
+                self.play_start_sound(UiSoundKind::Action);
+                self.on_start_confirm()
+            }
             StartMessage::Close => {
                 if self.start_state.manual_add.take().is_some()
                     || self.start_state.replace_confirm.take().is_some()
                 {
+                    self.play_start_sound(UiSoundKind::Action);
                     Task::none()
                 } else if self.start_state.editing {
+                    self.play_start_sound(UiSoundKind::Action);
                     self.cancel_start_edit()
                 } else {
+                    self.play_start_sound(UiSoundKind::Action);
                     self.close_start_screen()
                 }
             }
@@ -2032,16 +2086,30 @@ impl App {
                     .request_slide(StartSlide::Controllers, Instant::now());
                 Task::none()
             }
-            StartMessage::ToggleEdit => self.toggle_start_edit(),
-            StartMessage::CycleSort => self.cycle_games_sort(),
+            StartMessage::ToggleEdit => {
+                self.play_start_sound(UiSoundKind::Action);
+                self.toggle_start_edit()
+            }
+            StartMessage::CycleSort => {
+                self.play_start_sound(UiSoundKind::Action);
+                self.cycle_games_sort()
+            }
             StartMessage::AddShortcut => {
                 if self.start_state.editing && !self.start_state.overlay_blocking() {
+                    self.play_start_sound(UiSoundKind::Action);
                     self.pick_manual_shortcut()
                 } else {
                     Task::none()
                 }
             }
-            StartMessage::EditManual => self.begin_manual_edit(),
+            StartMessage::EditManual => {
+                let before = self.start_state.manual_add.is_some();
+                let task = self.begin_manual_edit();
+                if !before && self.start_state.manual_add.is_some() {
+                    self.play_start_sound(UiSoundKind::Action);
+                }
+                task
+            }
             StartMessage::GamesScrolled(y, viewport_h) => {
                 self.start_state.set_games_scroll(y, viewport_h);
                 Task::none()
@@ -2062,14 +2130,33 @@ impl App {
                 }
                 Task::none()
             }
-            StartMessage::ManualPickIcon => self.pick_manual_icon(),
+            StartMessage::ManualPickIcon => {
+                self.play_start_sound(UiSoundKind::Action);
+                self.pick_manual_icon()
+            }
             StartMessage::ManualClearIcon => {
                 if let Some(draft) = self.start_state.manual_add.as_mut() {
                     draft.icon_path = None;
+                    self.play_start_sound(UiSoundKind::Action);
                 }
                 Task::none()
             }
         }
+    }
+
+    fn play_start_sound(&self, kind: UiSoundKind) {
+        if !self.prefs.start_screen_sounds_enabled {
+            return;
+        }
+        let volume = f32::from(self.prefs.start_screen_sound_volume) / 100.0;
+        ui_sound::play(kind, volume);
+    }
+
+    fn cancel_start_holds(&mut self) {
+        self.pad_nav.cancel_holds();
+        self.keyboard_cross_hold.cancel();
+        self.start_state.triangle_progress = 0.0;
+        self.start_state.cross_progress = 0.0;
     }
 
     fn scroll_start_selection_into_view(&mut self) -> Task<Message> {
@@ -2302,197 +2389,235 @@ impl App {
     }
 
     fn on_pad_poll(&mut self) -> Task<Message> {
-        let mut task = Task::none();
-        if self.configure_window.is_some() && self.configure_state.section == Section::PadInput {
-            task = task.chain(self.refresh_pad_input_panel());
-        }
-
+        let pad_input_open =
+            self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
         let listening = self.prefs.start_screen_enabled
             && (!self.controllers.is_empty() || self.gesture_recorder.is_active());
-        if !listening {
-            return task;
+
+        let readings = match start_input::read_nav_readings() {
+            start_input::NavReadingsOutcome::Readings(r) => r,
+            start_input::NavReadingsOutcome::Missing { .. } => Vec::new(),
+        };
+
+        if pad_input_open {
+            self.apply_pad_input_panel_from_readings(&readings);
         }
 
-        // Gesture recording needs raw DualSense bits (L2/R2/L3/R3, etc.).
+        if !listening {
+            return Task::none();
+        }
+
         if self.gesture_recorder.is_active() {
-            let readings = start_input::read_all_gesture_samples();
-            if readings.is_empty() {
-                if !self.hid_exclusive_warned && !self.controllers.is_empty() {
-                    app_log::warn(
-                        "could not read DualSense HID for gesture recording (device may be exclusive); try again",
-                    );
-                    self.hid_exclusive_warned = true;
-                }
-                return task;
-            }
-            self.hid_exclusive_warned = false;
-            if let Some(sample) = self.gesture_record_latch.select(&readings)
-                && let Some(peak) = self.gesture_recorder.update(&sample.held)
-            {
-                self.prefs.start_screen_gesture = peak;
-                self.prefs.save();
-                self.gesture_record_latch.clear();
-                // Recording ends on release; a sticky HID frame of the new chord
-                // must not immediately reopen the start screen.
-                self.gesture_detectors.consume_pending_match(&readings);
-            }
-            return task;
+            return self.on_gesture_record(&readings);
         }
 
         if self.start_window.is_some() {
-            match start_input::read_nav_readings() {
-                start_input::NavReadingsOutcome::Missing {
-                    hid_fallback_attempted,
-                } => {
-                    if hid_fallback_attempted && !self.nav_hid_fallback_logged {
-                        app_log::info(
-                            "start-nav: Gaming.Input empty or unavailable; DualSense HID fallback attempted",
-                        );
-                        self.nav_hid_fallback_logged = true;
-                    }
-                    if !self.nav_missing_warned && !self.controllers.is_empty() {
-                        app_log::warn(
-                            "start-nav: no Gaming.Input gamepad and DualSense HID read failed; keyboard/mouse still work",
-                        );
-                        self.nav_missing_warned = true;
-                    }
-                    return task;
+            if !self.start_nav_ready {
+                return Task::none();
+            }
+            if readings.is_empty() {
+                if !self.nav_missing_warned && !self.controllers.is_empty() {
+                    app_log::warn(
+                        "start-nav: no hid-worker input snapshot yet; keyboard/mouse still work",
+                    );
+                    self.nav_missing_warned = true;
                 }
-                start_input::NavReadingsOutcome::Readings(readings) => {
-                    self.nav_missing_warned = false;
+                return Task::none();
+            }
+            return self.handle_start_nav_readings(&readings);
+        }
 
-                    let now = Instant::now();
-                    if self.start_state.animating() {
-                        // Frames drive the slide; only keep button edges in sync.
-                        self.pad_nav.sync_edges_only(&readings);
-                        let _ = self.start_state.tick_anim(now);
-                        return task;
+        self.on_reopen_gesture(&readings)
+    }
+
+    fn handle_start_nav_readings(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
+        self.nav_missing_warned = false;
+
+        let now = Instant::now();
+        let animating = self.start_state.animating();
+        // Mid-slide: keep L2/R2 edges live for interruptible request_slide,
+        // but skip controller-row rebuilds (those hitch the UI thread).
+        if !animating {
+            self.refresh_start_controllers();
+            self.refresh_running_badge();
+        }
+
+        let _ = self.start_state.tick_anim(now);
+
+        let replace_confirm = self.start_state.replace_confirm.is_some();
+        let manual_add = self.start_state.manual_add.is_some();
+        let allow_nav_move = !animating && !replace_confirm && !manual_add;
+        let tick = self.pad_nav.tick(
+            readings,
+            now,
+            allow_nav_move,
+            replace_confirm && !animating,
+            self.start_state.editing,
+        );
+        if let Some(diag) = &tick.diag {
+            self.log_start_nav_diag(diag, readings.len());
+        }
+        if tick.unarmed_pads > 0 && tick.armed_pads == 0 {
+            if !self.nav_unarmed_warned {
+                if let Some(diag) = &tick.diag {
+                    app_log::warn(format!(
+                        "start-nav: pad unarmed waiting for rest (stick_y={:.3} l2={} r2={} cross={} circle={})",
+                        diag.sample.stick_y,
+                        u8::from(diag.sample.l2),
+                        u8::from(diag.sample.r2),
+                        u8::from(diag.sample.cross),
+                        u8::from(diag.sample.circle),
+                    ));
+                }
+                self.nav_unarmed_warned = true;
+            }
+        } else if tick.armed_pads > 0 {
+            self.nav_unarmed_warned = false;
+        }
+
+        if animating {
+            if let Some(action) = tick.action {
+                let next = match action {
+                    NavAction::PrevSlide => self.on_start_message(StartMessage::PrevSlide),
+                    NavAction::NextSlide => self.on_start_message(StartMessage::NextSlide),
+                    NavAction::Cancel => self.on_start_message(StartMessage::Close),
+                    _ => Task::none(),
+                };
+                return next;
+            }
+            return Task::none();
+        }
+
+        if replace_confirm {
+            let mut cross_progress = tick.cross_progress;
+            let mut cross_completed = tick.cross_completed;
+            let (k_progress, k_completed) =
+                self.keyboard_cross_hold.update(self.confirm_key_held, now);
+            cross_progress = cross_progress.max(k_progress);
+            cross_completed = cross_completed || k_completed;
+            self.start_state.cross_progress = cross_progress;
+            self.start_state.triangle_progress = 0.0;
+            if cross_completed {
+                self.play_start_sound(UiSoundKind::Hold);
+                return self.complete_replace_confirm();
+            }
+            if tick.action == Some(NavAction::Cancel) {
+                self.keyboard_cross_hold.cancel();
+                self.start_state.cross_progress = 0.0;
+                return self.on_start_message(StartMessage::Close);
+            }
+            return Task::none();
+        }
+
+        if manual_add {
+            self.start_state.cross_progress = 0.0;
+            self.start_state.triangle_progress = 0.0;
+            self.confirm_key_held = false;
+            self.keyboard_cross_hold.reset();
+            if let Some(action) = tick.action {
+                let next = match action {
+                    NavAction::Confirm => {
+                        self.play_start_sound(UiSoundKind::Action);
+                        self.confirm_manual_add()
                     }
-
-                    self.refresh_start_controllers();
-                    self.refresh_running_badge();
-
-                    let _ = self.start_state.tick_anim(now);
-
-                    let replace_confirm = self.start_state.replace_confirm.is_some();
-                    let manual_add = self.start_state.manual_add.is_some();
-                    let allow_nav_move = !replace_confirm && !manual_add;
-                    let tick = self
-                        .pad_nav
-                        .tick(&readings, now, allow_nav_move, replace_confirm);
-
-                    if let Some(diag) = &tick.diag {
-                        self.log_start_nav_diag(diag, readings.len());
+                    NavAction::Cancel => {
+                        self.play_start_sound(UiSoundKind::Action);
+                        self.cancel_manual_add()
                     }
+                    _ => Task::none(),
+                };
+                return next;
+            }
+            return Task::none();
+        }
 
-                    if replace_confirm {
-                        let mut cross_progress = tick.cross_progress;
-                        let mut cross_completed = tick.cross_completed;
-                        if self.confirm_key_held {
-                            let (k_progress, k_completed) =
-                                self.keyboard_cross_hold.update(true, now);
-                            cross_progress = cross_progress.max(k_progress);
-                            cross_completed = cross_completed || k_completed;
+        self.start_state.cross_progress = 0.0;
+        self.confirm_key_held = false;
+        self.keyboard_cross_hold.reset();
+
+        if self.start_state.editing {
+            self.start_state.triangle_progress = 0.0;
+        } else {
+            self.start_state.triangle_progress = tick.triangle_progress;
+            if tick.triangle_completed {
+                self.play_start_sound(UiSoundKind::Hold);
+                match self.start_state.slide {
+                    StartSlide::Games => self.close_running_game(),
+                    StartSlide::Controllers => {
+                        if let Some(row) = self.start_state.selected_controller()
+                            && row.bluetooth
+                        {
+                            let serial = row.serial.clone();
+                            self.power_off(&serial);
                         }
-                        self.start_state.cross_progress = cross_progress;
-                        self.start_state.triangle_progress = 0.0;
-                        if cross_completed {
-                            return task.chain(self.complete_replace_confirm());
-                        }
-                        if tick.action == Some(NavAction::Cancel) {
-                            return task.chain(self.on_start_message(StartMessage::Close));
-                        }
-                        return task;
                     }
-
-                    if manual_add {
-                        self.start_state.cross_progress = 0.0;
-                        self.start_state.triangle_progress = 0.0;
-                        self.confirm_key_held = false;
-                        self.keyboard_cross_hold.reset();
-                        if let Some(action) = tick.action {
-                            let next = match action {
-                                NavAction::Confirm => self.confirm_manual_add(),
-                                NavAction::Cancel => self.cancel_manual_add(),
-                                _ => Task::none(),
-                            };
-                            return task.chain(next);
-                        }
-                        return task;
-                    }
-
-                    self.start_state.cross_progress = 0.0;
-                    self.confirm_key_held = false;
-                    self.keyboard_cross_hold.reset();
-
-                    // Edit mode: Triangle is a tap (Edit manual), not a hold-to-close.
-                    if self.start_state.editing {
-                        self.start_state.triangle_progress = 0.0;
-                    } else {
-                        self.start_state.triangle_progress = tick.triangle_progress;
-                        if tick.triangle_completed {
-                            match self.start_state.slide {
-                                StartSlide::Games => self.close_running_game(),
-                                StartSlide::Controllers => {
-                                    if let Some(row) = self.start_state.selected_controller()
-                                        && row.bluetooth
-                                    {
-                                        let serial = row.serial.clone();
-                                        self.power_off(&serial);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some(action) = tick.action {
-                        let next = match action {
-                            NavAction::Up => self.on_start_message(StartMessage::MoveUp),
-                            NavAction::Down => self.on_start_message(StartMessage::MoveDown),
-                            NavAction::Confirm => self.on_start_message(StartMessage::Confirm),
-                            NavAction::Cancel => self.on_start_message(StartMessage::Close),
-                            NavAction::PrevSlide => self.on_start_message(StartMessage::PrevSlide),
-                            NavAction::NextSlide => self.on_start_message(StartMessage::NextSlide),
-                            NavAction::ToggleEdit => {
-                                self.on_start_message(StartMessage::ToggleEdit)
-                            }
-                            NavAction::CycleSort => self.on_start_message(StartMessage::CycleSort),
-                            NavAction::Triangle => self.on_start_message(StartMessage::EditManual),
-                        };
-                        return task.chain(next);
-                    }
-                    return task;
                 }
             }
         }
 
-        // Background reopen gesture via short DualSense HID reads (all pads, no merge).
-        let readings = start_input::read_all_gesture_samples();
+        if let Some(action) = tick.action {
+            let next = match action {
+                NavAction::Up => self.on_start_message(StartMessage::MoveUp),
+                NavAction::Down => self.on_start_message(StartMessage::MoveDown),
+                NavAction::Confirm => self.on_start_message(StartMessage::Confirm),
+                NavAction::Cancel => self.on_start_message(StartMessage::Close),
+                NavAction::PrevSlide => self.on_start_message(StartMessage::PrevSlide),
+                NavAction::NextSlide => self.on_start_message(StartMessage::NextSlide),
+                NavAction::ToggleEdit => self.on_start_message(StartMessage::ToggleEdit),
+                NavAction::CycleSort => self.on_start_message(StartMessage::CycleSort),
+                NavAction::Triangle if self.start_state.editing => {
+                    self.on_start_message(StartMessage::EditManual)
+                }
+                NavAction::Triangle => Task::none(),
+            };
+            return next;
+        }
+        return Task::none();
+    }
+
+    fn on_gesture_record(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
         if readings.is_empty() {
-            return task;
+            if !self.hid_exclusive_warned && !self.controllers.is_empty() {
+                app_log::warn("could not read controller for gesture recording; try again");
+                self.hid_exclusive_warned = true;
+            }
+            return Task::none();
+        }
+        self.hid_exclusive_warned = false;
+        if let Some(sample) = self.gesture_record_latch.select(readings)
+            && let Some(peak) = self.gesture_recorder.update(&sample.held)
+        {
+            self.prefs.start_screen_gesture = peak;
+            self.prefs.save();
+            self.gesture_record_latch.clear();
+            self.gesture_detectors.consume_pending_match(readings);
+        }
+        Task::none()
+    }
+
+    fn on_reopen_gesture(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
+        if readings.is_empty() {
+            return Task::none();
         }
         if self.prefs.start_screen_enabled
             && !self.prefs.start_screen_gesture.is_empty()
             && self
                 .gesture_detectors
-                .update(&self.prefs.start_screen_gesture, &readings)
+                .update(&self.prefs.start_screen_gesture, readings)
         {
-            return task.chain(self.open_start_screen());
+            self.open_start_screen()
+        } else {
+            Task::none()
         }
-
-        task
     }
 
-    fn refresh_pad_input_panel(&mut self) -> Task<Message> {
-        // Prefer DualSense HID (full held set); else Gaming.Input / HID nav readings.
-        let next = if let Some(reading) =
-            start_input::preferred_reading(&start_input::read_all_gesture_samples())
-        {
+    fn apply_pad_input_panel_from_readings(&mut self, readings: &[start_input::NavReading]) {
+        let next = if let Some(reading) = start_input::preferred_reading(readings) {
             let held: Vec<_> = reading.sample.held.iter().copied().collect();
             PadInputPanel {
                 has_sample: true,
-                source: "hid".to_string(),
-                buttons0: Some(reading.sample.buttons0),
+                source: reading.source.as_str().to_string(),
+                buttons0: None,
                 cross: reading.sample.cross,
                 circle: reading.sample.circle,
                 dpad_up: reading.sample.dpad_up,
@@ -2504,57 +2629,10 @@ impl App {
                 held: gesture::format_gesture(&held),
             }
         } else {
-            match start_input::read_nav_readings() {
-                start_input::NavReadingsOutcome::Readings(readings) => {
-                    match start_input::preferred_reading(&readings) {
-                        Some(reading) => {
-                            let held: Vec<_> = reading.sample.held.iter().copied().collect();
-                            PadInputPanel {
-                                has_sample: true,
-                                source: reading.source.as_str().to_string(),
-                                buttons0: if reading.source == NavSource::Hid {
-                                    Some(reading.sample.buttons0)
-                                } else {
-                                    None
-                                },
-                                cross: reading.sample.cross,
-                                circle: reading.sample.circle,
-                                dpad_up: reading.sample.dpad_up,
-                                dpad_down: reading.sample.dpad_down,
-                                stick_band: start_input::StickBand::from_stick_y(
-                                    reading.sample.stick_y,
-                                )
-                                .as_str()
-                                .to_string(),
-                                stick_y: reading.sample.stick_y,
-                                held: gesture::format_gesture(&held),
-                            }
-                        }
-                        None => PadInputPanel {
-                            has_sample: false,
-                            source: "none".to_string(),
-                            ..PadInputPanel::default()
-                        },
-                    }
-                }
-                start_input::NavReadingsOutcome::Missing { .. } => PadInputPanel {
-                    has_sample: false,
-                    source: "none".to_string(),
-                    ..PadInputPanel::default()
-                },
-            }
+            PadInputPanel::default()
         };
-
-        if next == self.pad_input_panel {
-            return Task::none();
-        }
         self.pad_input_panel = next;
-        Task::none()
     }
-
-    // -----------------------------------------------------------------------
-    // Toasts
-    // -----------------------------------------------------------------------
 
     fn queue_notifications(&mut self, events: Vec<NotifyEvent>) -> Task<Message> {
         for event in events {
@@ -2802,12 +2880,13 @@ fn delay(duration: Duration) -> impl Future<Output = ()> + Send {
 }
 
 fn start_low_battery_pulse_thread(
-    identifying: Arc<AtomicBool>,
+    hid_worker: HidWorkerHandle,
     low_battery: Arc<Mutex<Vec<(String, u8)>>>,
 ) {
     thread::spawn(move || {
         let on = Duration::from_millis(LOW_BATTERY_PULSE_ON_MS);
         let gap = Duration::from_millis(LOW_BATTERY_PULSE_GAP_MS);
+        let identifying = hid_worker.identifying();
 
         loop {
             thread::sleep(gap);
@@ -2830,9 +2909,7 @@ fn start_low_battery_pulse_thread(
                     continue;
                 }
 
-                if let Err(err) = lightbar::apply_lightbar_rgb(&serial, LOW_BATTERY_ORANGE) {
-                    app_log::warn(format!("low-battery pulse failed for {serial}: {err}"));
-                }
+                hid_worker.set_rgb(serial.clone(), LOW_BATTERY_ORANGE);
                 thread::sleep(on);
 
                 if identifying.load(Ordering::SeqCst) || !lightbar::is_enabled() {
@@ -2840,9 +2917,7 @@ fn start_low_battery_pulse_thread(
                 }
 
                 let color = color_for_battery_percent(percent);
-                if let Err(err) = lightbar::apply_lightbar_rgb(&serial, color) {
-                    app_log::warn(format!("low-battery restore failed for {serial}: {err}"));
-                }
+                hid_worker.set_rgb(serial, color);
             }
         }
     });

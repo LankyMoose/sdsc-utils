@@ -1,25 +1,35 @@
-//! Start-screen navigation (Windows.Gaming.Input + DualSense HID fallback) and reopen gestures.
+//! Start-screen navigation via DualSense HID (hid-worker snapshot) and reopen gestures.
+//!
+//! PadPoll never opens HID on the UI thread — it clones the latest samples published
+//! by [`crate::hid_worker`]. The worker interleaves Identify lightbar writes with
+//! short input reads on the same handle so nav stays live during flashes.
 
-use crate::dualsense::{self, is_dualsense_gamepad};
 use crate::gesture::{GestureControl, GestureDetector};
-use hidapi::{BusType, HidApi, HidDevice};
+use hidapi::HidDevice;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const USB_REPORT_ID: u8 = 0x01;
-const BT_REPORT_FULL: u8 = 0x31;
-const BT_REPORT_TRUNCATED: u8 = 0x01;
-const CALIBRATION_FEATURE_REPORT: u8 = 0x05;
-const CALIBRATION_FEATURE_SIZE: usize = 41;
-
-const STICK_CENTER: f32 = 128.0;
 /// Per-axis deadzone applied to each stick before combining (kills rest bias).
 const STICK_AXIS_DEADZONE: f32 = 0.25;
 /// Residual deadzone on the combined vector after per-stick cleaning.
 const STICK_COMBINED_DEADZONE: f32 = 0.15;
-const TRIGGER_ANALOG_THRESHOLD: u8 = 64; // ~25% of 255
+const TRIGGER_ANALOG_THRESHOLD: u8 = 30;
+const STICK_CENTER: f32 = 128.0;
 const NAV_INITIAL_DELAY: Duration = Duration::from_millis(280);
 const NAV_REPEAT: Duration = Duration::from_millis(90);
+/// Worker input read budget (UI must never call this path).
+pub const INPUT_READ_TIMEOUT_MS: i32 = 15;
+
+const USB_REPORT_SIZE: usize = 64;
+const BT_REPORT_SIZE: usize = 78;
+const BT_REPORT_TRUNCATED: u8 = 0x01;
+const BT_REPORT_FULL: u8 = 0x31;
+const USB_REPORT_ID: u8 = 0x01;
+const CALIBRATION_FEATURE_REPORT: u8 = 0x05;
+const CALIBRATION_FEATURE_SIZE: usize = 41;
+
+static INPUT_SNAPSHOT: OnceLock<Arc<Mutex<Vec<NavReading>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavAction {
@@ -49,21 +59,17 @@ pub struct PadSample {
     pub options: bool,
     pub l2: bool,
     pub r2: bool,
-    /// Raw DualSense `buttons[0]` (hat + face). Useful for offset diagnostics.
-    pub buttons0: u8,
 }
 
 /// Which backend produced a start-screen nav sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavSource {
-    Gamepad,
     Hid,
 }
 
 impl NavSource {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Gamepad => "gamepad",
             Self::Hid => "hid",
         }
     }
@@ -122,7 +128,10 @@ pub struct NavLogSnapshot {
     pub circle: bool,
     pub dpad_up: bool,
     pub dpad_down: bool,
+    pub l2: bool,
+    pub r2: bool,
     pub stick: StickBand,
+    pub resting: bool,
 }
 
 impl NavLogSnapshot {
@@ -132,19 +141,25 @@ impl NavLogSnapshot {
             circle: sample.circle,
             dpad_up: sample.dpad_up,
             dpad_down: sample.dpad_down,
+            l2: sample.l2,
+            r2: sample.r2,
             stick: StickBand::from_stick_y(sample.stick_y),
+            resting: sample_nav_resting(sample),
         }
     }
 
     pub fn format_line(self, source: NavSource) -> String {
         format!(
-            "start-nav: src={} cross={} circle={} dpad_up={} dpad_down={} stick={}",
+            "start-nav: src={} cross={} circle={} l2={} r2={} dpad_up={} dpad_down={} stick={} resting={}",
             source.as_str(),
             u8::from(self.cross),
             u8::from(self.circle),
+            u8::from(self.l2),
+            u8::from(self.r2),
             u8::from(self.dpad_up),
             u8::from(self.dpad_down),
             self.stick.as_str(),
+            u8::from(self.resting),
         )
     }
 }
@@ -204,6 +219,54 @@ impl NavStepper {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeButton {
+    Cross,
+    Circle,
+    Square,
+    Triangle,
+    Options,
+    L2,
+    R2,
+}
+
+impl EdgeButton {
+    const ALL: [Self; 7] = [
+        Self::Cross,
+        Self::Circle,
+        Self::Square,
+        Self::Triangle,
+        Self::Options,
+        Self::L2,
+        Self::R2,
+    ];
+
+    fn action(self) -> NavAction {
+        match self {
+            Self::Cross => NavAction::Confirm,
+            Self::Circle => NavAction::Cancel,
+            Self::Square => NavAction::ToggleEdit,
+            Self::Triangle => NavAction::Triangle,
+            Self::Options => NavAction::CycleSort,
+            Self::L2 => NavAction::PrevSlide,
+            Self::R2 => NavAction::NextSlide,
+        }
+    }
+
+    fn held(self, sample: &PadSample) -> bool {
+        match self {
+            Self::Cross => sample.cross,
+            Self::Circle => sample.circle,
+            Self::Square => sample.square,
+            Self::Triangle => sample.triangle,
+            Self::Options => sample.options,
+            Self::L2 => sample.l2,
+            Self::R2 => sample.r2,
+        }
+    }
+}
+
+/// Rising-edge face and shoulder buttons; `hold_owned` never fires here.
 #[derive(Debug, Clone, Default)]
 pub struct ButtonEdges {
     cross: bool,
@@ -216,28 +279,44 @@ pub struct ButtonEdges {
 }
 
 impl ButtonEdges {
-    pub fn update(&mut self, sample: &PadSample) -> Option<NavAction> {
+    fn prev_held(&self, button: EdgeButton) -> bool {
+        match button {
+            EdgeButton::Cross => self.cross,
+            EdgeButton::Circle => self.circle,
+            EdgeButton::Square => self.square,
+            EdgeButton::Triangle => self.triangle,
+            EdgeButton::Options => self.options,
+            EdgeButton::L2 => self.l2,
+            EdgeButton::R2 => self.r2,
+        }
+    }
+
+    /// True when any control other than `except` just went down.
+    pub fn foreign_press(&self, sample: &PadSample, except: Option<EdgeButton>) -> bool {
+        EdgeButton::ALL
+            .iter()
+            .any(|&b| Some(b) != except && b.held(sample) && !self.prev_held(b))
+    }
+
+    /// Fire on rising edge. `hold_owned` is never emitted (hold tracker owns it).
+    pub fn update(
+        &mut self,
+        sample: &PadSample,
+        hold_owned: Option<EdgeButton>,
+    ) -> Option<NavAction> {
         let mut action = None;
-        if sample.cross && !self.cross {
-            action = Some(NavAction::Confirm);
-        } else if sample.circle && !self.circle {
-            action = Some(NavAction::Cancel);
-        } else if sample.square && !self.square {
-            action = Some(NavAction::ToggleEdit);
-        } else if sample.triangle && !self.triangle {
-            action = Some(NavAction::Triangle);
-        } else if sample.options && !self.options {
-            action = Some(NavAction::CycleSort);
-        } else if sample.l2 && !self.l2 {
-            action = Some(NavAction::PrevSlide);
-        } else if sample.r2 && !self.r2 {
-            action = Some(NavAction::NextSlide);
+        for &b in &EdgeButton::ALL {
+            let now = b.held(sample);
+            let was = self.prev_held(b);
+            if now && !was && Some(b) != hold_owned && action.is_none() {
+                action = Some(b.action());
+            }
         }
         self.sync(sample);
         action
     }
 
-    /// Track held buttons without emitting rising-edge actions (used while nav is disarmed).
+    /// Track held buttons without firing (used while nav is disarmed / animating).
     pub fn sync(&mut self, sample: &PadSample) {
         self.cross = sample.cross;
         self.circle = sample.circle;
@@ -247,33 +326,60 @@ impl ButtonEdges {
         self.l2 = sample.l2;
         self.r2 = sample.r2;
     }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
-/// Tracks a face-button hold (0..=1) and fires once after [`BUTTON_HOLD`].
+/// Tracks a face-button hold (0..=1). Completes when full duration is reached while held.
 #[derive(Debug, Clone, Default)]
 pub struct HoldTracker {
     started: Option<Instant>,
-    fired: bool,
+    /// Fired for this press; ignore until release.
+    completed_this_press: bool,
+    /// After cancel (e.g. Circle), ignore this press until release.
+    suppress_until_release: bool,
 }
 
 const BUTTON_HOLD: Duration = Duration::from_secs(1);
 
 impl HoldTracker {
     /// Returns `(progress, just_completed)`.
+    ///
+    /// `just_completed` is true on the frame progress first reaches 1.0 while still held.
     pub fn update(&mut self, held: bool, now: Instant) -> (f32, bool) {
         if !held {
             self.started = None;
-            self.fired = false;
+            self.completed_this_press = false;
+            self.suppress_until_release = false;
             return (0.0, false);
+        }
+        if self.suppress_until_release {
+            return (0.0, false);
+        }
+        if self.completed_this_press {
+            return (1.0, false);
         }
         let started = *self.started.get_or_insert(now);
         let elapsed = now.saturating_duration_since(started);
         let progress = (elapsed.as_secs_f32() / BUTTON_HOLD.as_secs_f32()).min(1.0);
-        if progress >= 1.0 && !self.fired {
-            self.fired = true;
+        if progress >= 1.0 {
+            self.completed_this_press = true;
             return (1.0, true);
         }
         (progress, false)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.started.is_some() && !self.completed_this_press
+    }
+
+    /// Abort the current hold without completing (caller should still be holding).
+    pub fn cancel(&mut self) {
+        self.started = None;
+        self.completed_this_press = false;
+        self.suppress_until_release = true;
     }
 
     pub fn reset(&mut self) {
@@ -307,21 +413,33 @@ pub fn preferred_reading(readings: &[NavReading]) -> Option<&NavReading> {
         .or_else(|| readings.first())
 }
 
-/// Read start-screen navigation: all Gaming.Input Gamepads, else all DualSense HID.
-///
-/// Never mixes backends (avoids double-counting a DualSense). Never merges samples.
-/// HID path is open/read/close per device so it does not hold exclusive access.
+/// Install the hid-worker input snapshot (called once at worker start).
+pub fn set_input_snapshot(snapshot: Arc<Mutex<Vec<NavReading>>>) {
+    let _ = INPUT_SNAPSHOT.set(snapshot);
+}
+
+/// PadPoll entry: O(1) clone of hid-worker snapshot (never opens HID on the UI thread).
 pub fn read_nav_readings() -> NavReadingsOutcome {
-    let gamepads = read_all_gamepad_nav_samples();
-    if !gamepads.is_empty() {
-        return NavReadingsOutcome::Readings(gamepads);
+    let readings = INPUT_SNAPSHOT
+        .get()
+        .and_then(|s| s.lock().ok().map(|g| g.clone()))
+        .unwrap_or_default();
+    if readings.is_empty() {
+        NavReadingsOutcome::Missing {}
+    } else {
+        log_source_once(NavSource::Hid, readings.len());
+        NavReadingsOutcome::Readings(readings)
     }
-    let hid = read_all_gesture_samples();
-    if !hid.is_empty() {
-        return NavReadingsOutcome::Readings(hid);
-    }
-    NavReadingsOutcome::Missing {
-        hid_fallback_attempted: true,
+}
+
+fn log_source_once(source: NavSource, pads: usize) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        crate::app_log::info(format!(
+            "start-nav: backend={} pads={pads} (hid-worker snapshot)",
+            source.as_str(),
+        ));
     }
 }
 
@@ -329,157 +447,27 @@ pub fn read_nav_readings() -> NavReadingsOutcome {
 #[derive(Debug)]
 pub enum NavReadingsOutcome {
     Readings(Vec<NavReading>),
-    /// Both backends failed. `hid_fallback_attempted` is true when Gaming.Input
-    /// had no usable pad and DualSense HID was tried.
-    Missing {
-        hid_fallback_attempted: bool,
-    },
+    /// No DualSense HID sample in the worker snapshot yet.
+    Missing {},
 }
 
-#[cfg(windows)]
-fn gamepad_reading_from_pad(
-    pad: &windows::Gaming::Input::Gamepad,
-    index: u32,
-) -> Option<NavReading> {
-    use windows::Gaming::Input::{GamepadButtons, RawGameController};
-
-    let reading = pad.GetCurrentReading().ok()?;
-
-    let id = RawGameController::FromGameController(pad)
-        .ok()
-        .and_then(|raw| raw.NonRoamableId().ok())
-        .map(|h| PadId(format!("gamepad:{h}")))
-        .unwrap_or_else(|| PadId(format!("gamepad:{index}")));
-
-    let buttons = reading.Buttons;
-    let dpad_up = buttons.contains(GamepadButtons::DPadUp);
-    let dpad_down = buttons.contains(GamepadButtons::DPadDown);
-    // Standard gamepad: A ≈ Cross, B ≈ Circle, X ≈ Square, Y ≈ Triangle on DualSense via Windows.
-    let cross = buttons.contains(GamepadButtons::A);
-    let circle = buttons.contains(GamepadButtons::B);
-    let square = buttons.contains(GamepadButtons::X);
-    let triangle = buttons.contains(GamepadButtons::Y);
-    let options = buttons.contains(GamepadButtons::Menu);
-    let l2 = reading.LeftTrigger >= 0.25;
-    let r2 = reading.RightTrigger >= 0.25;
-
-    let lx = reading.LeftThumbstickX as f32;
-    let ly = -(reading.LeftThumbstickY as f32); // Windows Y is up-positive; we use up-negative.
-    let rx = reading.RightThumbstickX as f32;
-    let ry = -(reading.RightThumbstickY as f32);
-    let (_dx, dy) = combined_stick(lx, ly, rx, ry);
-
-    let mut held = BTreeSet::new();
-    if cross {
-        held.insert(GestureControl::Cross);
-    }
-    if circle {
-        held.insert(GestureControl::Circle);
-    }
-    if square {
-        held.insert(GestureControl::Square);
-    }
-    if triangle {
-        held.insert(GestureControl::Triangle);
-    }
-    if options {
-        held.insert(GestureControl::Options);
-    }
-    if l2 {
-        held.insert(GestureControl::L2);
-    }
-    if r2 {
-        held.insert(GestureControl::R2);
-    }
-    if dpad_up {
-        held.insert(GestureControl::DpadUp);
-    }
-    if dpad_down {
-        held.insert(GestureControl::DpadDown);
-    }
-
-    Some(NavReading {
-        id,
-        sample: PadSample {
-            held,
-            stick_y: dy,
-            dpad_up,
-            dpad_down,
-            cross,
-            circle,
-            square,
-            triangle,
-            options,
-            l2,
-            r2,
-            buttons0: 0,
-        },
-        source: NavSource::Gamepad,
-    })
-}
-
-/// Windows.Gaming.Input: one reading per connected Gamepad.
-#[cfg(windows)]
-fn read_all_gamepad_nav_samples() -> Vec<NavReading> {
-    use windows::Gaming::Input::Gamepad;
-
-    let Ok(gamepads) = Gamepad::Gamepads() else {
-        return Vec::new();
+/// Short DualSense input read for hid-worker (never call from the UI thread).
+///
+/// At most 2 attempts, `read_timeout` 15ms. Truncated BT: one feature request + one retry.
+pub fn read_device_sample_short(device: &HidDevice, is_bluetooth: bool) -> Option<PadSample> {
+    let report_size = if is_bluetooth {
+        BT_REPORT_SIZE
+    } else {
+        USB_REPORT_SIZE
     };
-    let Ok(count) = gamepads.Size() else {
-        return Vec::new();
-    };
-    let mut out = Vec::with_capacity(count as usize);
-    for i in 0..count {
-        let Ok(pad) = gamepads.GetAt(i) else {
-            continue;
-        };
-        if let Some(reading) = gamepad_reading_from_pad(&pad, i) {
-            out.push(reading);
-        }
-    }
-    out
-}
-
-#[cfg(not(windows))]
-fn read_all_gamepad_nav_samples() -> Vec<NavReading> {
-    Vec::new()
-}
-
-/// All DualSense HID pads (short open/read/close each). Used for reopen chord and recording.
-pub fn read_all_gesture_samples() -> Vec<NavReading> {
-    dualsense::with_hid_lock(read_all_gesture_samples_unlocked)
-}
-
-fn read_all_gesture_samples_unlocked() -> Vec<NavReading> {
-    let Ok(api) = HidApi::new() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for info in api.device_list().filter(|d| is_dualsense_gamepad(d)) {
-        let Ok(device) = info.open_device(&api) else {
-            continue;
-        };
-        let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
-        if let Some(sample) = read_device_sample_once(&device, is_bluetooth) {
-            let path = info.path().to_string_lossy().into_owned();
-            out.push(NavReading {
-                id: PadId(format!("hid:{path}")),
-                sample,
-                source: NavSource::Hid,
-            });
-        }
-    }
-    out
-}
-
-fn read_device_sample_once(device: &HidDevice, is_bluetooth: bool) -> Option<PadSample> {
-    let report_size = if is_bluetooth { 78 } else { 64 };
     let mut requested_full = false;
 
-    for _ in 0..6 {
+    for _ in 0..2 {
         let mut buf = vec![0u8; report_size];
-        let n = device.read_timeout(&mut buf, 80).ok()?;
+        let n = match device.read_timeout(&mut buf, INPUT_READ_TIMEOUT_MS) {
+            Ok(n) => n,
+            Err(_) => return None,
+        };
         if n == 0 {
             continue;
         }
@@ -490,8 +478,9 @@ fn read_device_sample_once(device: &HidDevice, is_bluetooth: bool) -> Option<Pad
                 feature[0] = CALIBRATION_FEATURE_REPORT;
                 let _ = device.get_feature_report(&mut feature);
                 requested_full = true;
+                continue;
             }
-            continue;
+            return None;
         }
 
         let expected = if is_bluetooth {
@@ -509,28 +498,33 @@ fn read_device_sample_once(device: &HidDevice, is_bluetooth: bool) -> Option<Pad
     None
 }
 
+/// Build a nav reading from a HID sample + device identity.
+pub fn hid_nav_reading(identity: &str, sample: PadSample) -> NavReading {
+    NavReading {
+        id: PadId(format!("hid:{identity}")),
+        sample,
+        source: NavSource::Hid,
+    }
+}
+
 /// Parse sticks/buttons from a DualSense input report.
 ///
-/// `base` indexes the report-ID byte. Common payload (Linux `dualsense_input_report`)
-/// starts at `base + 1`: sticks, triggers, then `seq_number` at `base + 7`, then
-/// `buttons[]` at `base + 8`. USB uses `base = 0`; BT `0x31` uses `base = 1`.
+/// `base` indexes the report-ID byte. Common payload starts at `base + 1`.
+/// USB uses `base = 0`; BT `0x31` uses `base = 1`.
 pub fn parse_report(buf: &[u8], base: usize) -> PadSample {
-    let lx = axis(buf.get(base + 1).copied().unwrap_or(128));
-    let ly = axis(buf.get(base + 2).copied().unwrap_or(128));
-    let rx = axis(buf.get(base + 3).copied().unwrap_or(128));
-    let ry = axis(buf.get(base + 4).copied().unwrap_or(128));
+    let lx = axis_u8(buf.get(base + 1).copied().unwrap_or(128));
+    let ly = axis_u8(buf.get(base + 2).copied().unwrap_or(128));
+    let rx = axis_u8(buf.get(base + 3).copied().unwrap_or(128));
+    let ry = axis_u8(buf.get(base + 4).copied().unwrap_or(128));
     let l2_analog = buf.get(base + 5).copied().unwrap_or(0);
     let r2_analog = buf.get(base + 6).copied().unwrap_or(0);
-    // base + 7 is seq_number; buttons start at base + 8.
     let buttons0 = buf.get(base + 8).copied().unwrap_or(0);
     let buttons1 = buf.get(base + 9).copied().unwrap_or(0);
     let buttons2 = buf.get(base + 10).copied().unwrap_or(0);
 
-    let (dx, dy) = combined_stick(lx, ly, rx, ry);
-    let _ = dx;
+    let (_dx, dy) = combined_stick(lx, ly, rx, ry);
 
     let dpad = buttons0 & 0x0F;
-    // DualSense hat: 0..=7 directions, 8..=15 = released (null).
     let (dpad_up, dpad_down, dpad_left, dpad_right) = match dpad {
         0 => (true, false, false, false),
         1 => (true, false, false, true),
@@ -636,11 +630,10 @@ pub fn parse_report(buf: &[u8], base: usize) -> PadSample {
         options,
         l2,
         r2,
-        buttons0,
     }
 }
 
-fn axis(raw: u8) -> f32 {
+fn axis_u8(raw: u8) -> f32 {
     (f32::from(raw) - STICK_CENTER) / STICK_CENTER
 }
 
@@ -696,6 +689,10 @@ pub struct PadTickResult {
     pub triangle_completed: bool,
     pub cross_progress: f32,
     pub cross_completed: bool,
+    /// How many live pads are armed this tick.
+    pub armed_pads: usize,
+    /// How many live pads are still waiting for a resting sample.
+    pub unarmed_pads: usize,
     /// Sample for edge logging: action pad, else first non-resting, else first.
     pub diag: Option<NavReading>,
 }
@@ -712,20 +709,14 @@ impl PadNavBank {
         self.arm_new_pads = arm_immediately;
     }
 
-    /// Sync presence + button edges without emitting actions or hold progress.
-    /// Used while a slide animates so held buttons do not fire when the anim settles.
-    pub fn sync_edges_only(&mut self, readings: &[NavReading]) {
-        self.sync_presence(readings);
-        for reading in readings {
-            let Some(slot) = self.slots.get_mut(&reading.id) else {
-                continue;
-            };
-            slot.button_edges.sync(&reading.sample);
-            slot.nav_stepper.reset();
-            slot.triangle_hold.reset();
-            slot.cross_hold.reset();
-            if !slot.armed && sample_nav_resting(&reading.sample) {
-                slot.armed = true;
+    /// Abort in-progress Triangle / Cross holds.
+    pub fn cancel_holds(&mut self) {
+        for slot in self.slots.values_mut() {
+            if slot.triangle_hold.is_active() {
+                slot.triangle_hold.cancel();
+            }
+            if slot.cross_hold.is_active() {
+                slot.cross_hold.cancel();
             }
         }
     }
@@ -734,12 +725,14 @@ impl PadNavBank {
     ///
     /// `allow_nav_move` gates D-pad/stick repeats (false while a slide animates).
     /// `replace_confirm` switches to Cross-hold / Circle-cancel mode.
+    /// `editing` when true: Triangle is a discrete EditManual tap (not hold-owned).
     pub fn tick(
         &mut self,
         readings: &[NavReading],
         now: Instant,
         allow_nav_move: bool,
         replace_confirm: bool,
+        editing: bool,
     ) -> PadTickResult {
         self.sync_presence(readings);
 
@@ -750,6 +743,7 @@ impl PadNavBank {
 
         let mut button_action: Option<(PadId, NavAction)> = None;
         let mut nav_action: Option<(PadId, NavAction)> = None;
+        let mut newly_armed: Vec<PadId> = Vec::new();
 
         for reading in readings {
             let Some(slot) = self.slots.get_mut(&reading.id) else {
@@ -757,15 +751,21 @@ impl PadNavBank {
             };
 
             if !slot.armed {
+                slot.button_edges.clear();
                 slot.button_edges.sync(&reading.sample);
                 slot.nav_stepper.reset();
                 slot.triangle_hold.reset();
                 slot.cross_hold.reset();
                 if sample_nav_resting(&reading.sample) {
                     slot.armed = true;
+                    newly_armed.push(reading.id.clone());
+                    result.armed_pads += 1;
+                } else {
+                    result.unarmed_pads += 1;
                 }
                 continue;
             }
+            result.armed_pads += 1;
 
             if replace_confirm {
                 let (progress, completed) = slot.cross_hold.update(reading.sample.cross, now);
@@ -776,7 +776,23 @@ impl PadNavBank {
                     result.cross_completed = true;
                 }
                 slot.triangle_hold.reset();
-                if let Some(action) = slot.button_edges.update(&reading.sample)
+
+                let stick_interrupt = reading.sample.dpad_up
+                    || reading.sample.dpad_down
+                    || reading.sample.stick_y != 0.0;
+                let foreign = slot
+                    .button_edges
+                    .foreign_press(&reading.sample, Some(EdgeButton::Cross));
+                if slot.cross_hold.is_active() && (stick_interrupt || foreign) {
+                    slot.cross_hold.cancel();
+                    result.cross_progress = 0.0;
+                    result.cross_completed = false;
+                }
+
+                let edge = slot
+                    .button_edges
+                    .update(&reading.sample, Some(EdgeButton::Cross));
+                if let Some(action) = edge
                     && action == NavAction::Cancel
                     && button_action.is_none()
                 {
@@ -794,14 +810,33 @@ impl PadNavBank {
                 result.triangle_completed = true;
             }
 
-            if allow_nav_move
-                && let Some(action) = slot.nav_stepper.update(&reading.sample, now)
+            let nav = if allow_nav_move {
+                slot.nav_stepper.update(&reading.sample, now)
+            } else {
+                None
+            };
+
+            // Browse: Triangle is hold-owned (close / power-off). Edit: discrete EditManual.
+            let hold_owned = if editing {
+                None
+            } else {
+                Some(EdgeButton::Triangle)
+            };
+            let foreign = slot.button_edges.foreign_press(&reading.sample, hold_owned);
+            if slot.triangle_hold.is_active() && (nav.is_some() || foreign) {
+                slot.triangle_hold.cancel();
+                result.triangle_progress = 0.0;
+                result.triangle_completed = false;
+            }
+
+            let edge = slot.button_edges.update(&reading.sample, hold_owned);
+
+            if let Some(action) = nav
                 && nav_action.is_none()
             {
                 nav_action = Some((reading.id.clone(), action));
             }
-
-            if let Some(action) = slot.button_edges.update(&reading.sample)
+            if let Some(action) = edge
                 && button_action.is_none()
             {
                 button_action = Some((reading.id.clone(), action));
@@ -814,6 +849,15 @@ impl PadNavBank {
             result.diag = readings.iter().find(|r| r.id == id).cloned();
             result.action_pad = Some(id);
             result.action = Some(action);
+        }
+
+        if !newly_armed.is_empty() {
+            crate::app_log::info(format!(
+                "start-nav: armed pads={:?} (armed={} unarmed={})",
+                newly_armed.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+                result.armed_pads,
+                result.unarmed_pads,
+            ));
         }
 
         result
@@ -1016,6 +1060,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_report_reads_cross_and_l2() {
+        let mut buf = [0u8; 64];
+        buf[0] = 0x01;
+        buf[1] = 128;
+        buf[2] = 128;
+        buf[3] = 128;
+        buf[4] = 128;
+        buf[5] = 200; // L2 analog
+        buf[8] = 0x08 | (1 << 5); // resting hat + Cross
+        let sample = parse_report(&buf, 0);
+        assert!(sample.cross);
+        assert!(sample.l2);
+        assert!(!sample.circle);
+    }
+
+    #[test]
+    fn parse_report_seq_zero_is_not_dpad_up() {
+        let mut buf = [0u8; 64];
+        buf[0] = 0x01;
+        buf[1] = 128;
+        buf[2] = 128;
+        buf[3] = 128;
+        buf[4] = 128;
+        buf[8] = 0x08; // hat null / released
+        let sample = parse_report(&buf, 0);
+        assert!(!sample.dpad_up);
+        assert!(!sample.dpad_down);
+    }
+
+    #[test]
     fn combined_stick_reinforces_and_cancels() {
         let (_, dy) = combined_stick(0.0, -0.5, 0.0, -0.5);
         assert!(dy < -0.9);
@@ -1067,73 +1141,55 @@ mod tests {
     }
 
     #[test]
-    fn parse_report_reads_cross_and_l2() {
-        let mut buf = vec![0u8; 64];
-        buf[0] = USB_REPORT_ID;
-        buf[1] = 128;
-        buf[2] = 128;
-        buf[3] = 128;
-        buf[4] = 128;
-        buf[5] = 200; // L2 analog
-        buf[7] = 0; // seq_number (must not be read as buttons)
-        buf[8] = 0x08 | (1 << 5); // resting hat + Cross
-        buf[9] = (1 << 6) | (1 << 7); // L3 + R3
-        let sample = parse_report(&buf, 0);
-        assert!(sample.cross);
-        assert!(!sample.dpad_up);
-        assert_eq!(sample.buttons0, 0x08 | (1 << 5));
-        assert!(sample.held.contains(&GestureControl::L2));
-        assert!(sample.held.contains(&GestureControl::L3));
-        assert!(sample.held.contains(&GestureControl::R3));
-    }
-
-    #[test]
-    fn parse_report_seq_zero_is_not_dpad_up() {
-        let mut buf = vec![0u8; 64];
-        buf[0] = USB_REPORT_ID;
-        buf[1] = 128;
-        buf[2] = 128;
-        buf[3] = 128;
-        buf[4] = 128;
-        buf[7] = 0; // seq
-        buf[8] = 0x08; // neutral hat
-        let sample = parse_report(&buf, 0);
-        assert!(!sample.dpad_up);
-        assert!(!sample.dpad_down);
-        assert!(!sample.cross);
-    }
-
-    #[test]
     fn button_edges_fires_square_toggle_edit() {
         let mut edges = ButtonEdges::default();
-        let sample = PadSample {
+        let held = PadSample {
             square: true,
             ..Default::default()
         };
-        assert_eq!(edges.update(&sample), Some(NavAction::ToggleEdit));
-        assert!(edges.update(&sample).is_none());
+        assert_eq!(edges.update(&held, None), Some(NavAction::ToggleEdit));
+        assert!(edges.update(&held, None).is_none());
+        assert!(edges.update(&PadSample::default(), None).is_none());
     }
 
     #[test]
     fn button_edges_fires_options_cycle_sort() {
         let mut edges = ButtonEdges::default();
-        let sample = PadSample {
+        let held = PadSample {
             options: true,
             ..Default::default()
         };
-        assert_eq!(edges.update(&sample), Some(NavAction::CycleSort));
-        assert!(edges.update(&sample).is_none());
+        assert_eq!(edges.update(&held, None), Some(NavAction::CycleSort));
+        assert!(edges.update(&PadSample::default(), None).is_none());
     }
 
     #[test]
-    fn button_edges_fires_cross_once() {
+    fn button_edges_fires_cross_on_press() {
         let mut edges = ButtonEdges::default();
-        let sample = PadSample {
+        let held = PadSample {
             cross: true,
             ..Default::default()
         };
-        assert_eq!(edges.update(&sample), Some(NavAction::Confirm));
-        assert!(edges.update(&sample).is_none());
+        assert_eq!(edges.update(&held, None), Some(NavAction::Confirm));
+        assert!(edges.update(&held, None).is_none());
+        assert!(edges.update(&PadSample::default(), None).is_none());
+    }
+
+    #[test]
+    fn button_edges_rising_edge_can_fire_after_other_button() {
+        let mut edges = ButtonEdges::default();
+        let cross = PadSample {
+            cross: true,
+            ..Default::default()
+        };
+        assert_eq!(edges.update(&cross, None), Some(NavAction::Confirm));
+        let both = PadSample {
+            cross: true,
+            circle: true,
+            ..Default::default()
+        };
+        assert_eq!(edges.update(&both, None), Some(NavAction::Cancel));
+        assert!(edges.update(&PadSample::default(), None).is_none());
     }
 
     #[test]
@@ -1144,10 +1200,26 @@ mod tests {
             ..Default::default()
         };
         edges.sync(&held);
-        assert!(edges.update(&held).is_none());
+        assert!(edges.update(&held, None).is_none());
         let released = PadSample::default();
-        assert!(edges.update(&released).is_none());
-        assert_eq!(edges.update(&held), Some(NavAction::NextSlide));
+        assert!(edges.update(&released, None).is_none());
+        assert_eq!(edges.update(&held, None), Some(NavAction::NextSlide));
+        assert!(edges.update(&released, None).is_none());
+    }
+
+    #[test]
+    fn button_edges_hold_owned_triangle_never_arms() {
+        let mut edges = ButtonEdges::default();
+        let held = PadSample {
+            triangle: true,
+            ..Default::default()
+        };
+        assert!(edges.update(&held, Some(EdgeButton::Triangle)).is_none());
+        assert!(
+            edges
+                .update(&PadSample::default(), Some(EdgeButton::Triangle))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1206,6 +1278,7 @@ mod tests {
             now,
             true,
             false,
+            false,
         );
         assert!(tick1.action.is_none());
 
@@ -1214,9 +1287,23 @@ mod tests {
             held: [GestureControl::Cross].into_iter().collect(),
             ..Default::default()
         };
-        let tick2 = bank.tick(&[reading("a", open), reading("b", cross)], now, true, false);
+        let tick2 = bank.tick(
+            &[reading("a", open.clone()), reading("b", cross.clone())],
+            now,
+            true,
+            false,
+            false,
+        );
         assert_eq!(tick2.action, Some(NavAction::Confirm));
         assert_eq!(tick2.action_pad.as_ref().map(|p| p.as_str()), Some("b"));
+        let tick3 = bank.tick(
+            &[reading("a", open), reading("b", PadSample::default())],
+            now,
+            true,
+            false,
+            false,
+        );
+        assert!(tick3.action.is_none());
     }
 
     #[test]
@@ -1234,6 +1321,7 @@ mod tests {
             now,
             true,
             false,
+            false,
         );
 
         let circle = PadSample {
@@ -1247,13 +1335,25 @@ mod tests {
             ..Default::default()
         };
         let tick = bank.tick(
-            &[reading("a", circle), reading("b", cross)],
+            &[reading("a", circle.clone()), reading("b", cross)],
             now,
             true,
+            false,
             false,
         );
         assert_eq!(tick.action, Some(NavAction::Cancel));
         assert_eq!(tick.action_pad.as_ref().map(|p| p.as_str()), Some("a"));
+        let tick2 = bank.tick(
+            &[
+                reading("a", PadSample::default()),
+                reading("b", PadSample::default()),
+            ],
+            now,
+            true,
+            false,
+            false,
+        );
+        assert!(tick2.action.is_none());
     }
 
     #[test]
@@ -1299,8 +1399,62 @@ mod tests {
             held: [GestureControl::Cross].into_iter().collect(),
             ..Default::default()
         };
-        let tick = bank.tick(&[reading("new", cross)], now, true, false);
+        let tick = bank.tick(&[reading("new", cross)], now, true, false, false);
         assert!(tick.action.is_none());
+    }
+
+    #[test]
+    fn hold_completes_when_full_duration_while_held() {
+        let mut hold = HoldTracker::default();
+        let t0 = Instant::now();
+        let (p0, c0) = hold.update(true, t0);
+        assert!(p0 < 1.0 && !c0);
+        let (p1, c1) = hold.update(true, t0 + Duration::from_millis(500));
+        assert!(p1 > 0.0 && p1 < 1.0 && !c1);
+        let (p2, c2) = hold.update(true, t0 + Duration::from_secs(1));
+        assert_eq!(p2, 1.0);
+        assert!(c2, "completes when full duration reached while held");
+        let (p3, c3) = hold.update(
+            true,
+            t0 + Duration::from_secs(1) + Duration::from_millis(10),
+        );
+        assert_eq!(p3, 1.0);
+        assert!(!c3, "does not re-fire while still held");
+        let (p4, c4) = hold.update(false, t0 + Duration::from_secs(2));
+        assert_eq!(p4, 0.0);
+        assert!(!c4);
+    }
+
+    #[test]
+    fn hold_early_release_does_not_complete() {
+        let mut hold = HoldTracker::default();
+        let t0 = Instant::now();
+        let _ = hold.update(true, t0);
+        let (_, c) = hold.update(false, t0 + Duration::from_millis(400));
+        assert!(!c);
+    }
+
+    #[test]
+    fn hold_cancel_suppresses_until_release() {
+        let mut hold = HoldTracker::default();
+        let t0 = Instant::now();
+        let _ = hold.update(true, t0);
+        let _ = hold.update(true, t0 + Duration::from_millis(500));
+        assert!(hold.is_active());
+        hold.cancel();
+        assert!(!hold.is_active());
+        let (p, c) = hold.update(
+            true,
+            t0 + Duration::from_secs(1) + Duration::from_millis(50),
+        );
+        assert_eq!(p, 0.0);
+        assert!(!c);
+        let (_, c2) = hold.update(false, t0 + Duration::from_secs(2));
+        assert!(!c2);
+        // New press after cancel+release can complete again while held.
+        let _ = hold.update(true, t0 + Duration::from_secs(2));
+        let (_, c3) = hold.update(true, t0 + Duration::from_secs(3));
+        assert!(c3);
     }
 
     #[test]

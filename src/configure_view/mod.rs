@@ -49,6 +49,7 @@ const POSITION_TOAST_MARGIN: f32 = 8.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
     System,
+    StartScreen,
     Notifications,
     ToastPosition,
     Lightbar,
@@ -62,6 +63,7 @@ impl Section {
     fn title(self) -> &'static str {
         match self {
             Self::System => "System",
+            Self::StartScreen => "Start screen",
             Self::Notifications => "Notifications",
             Self::ToastPosition => "Toast position",
             Self::Lightbar => "Lightbar colors",
@@ -77,6 +79,7 @@ impl Section {
         {
             let mut sections = vec![
                 Self::System,
+                Self::StartScreen,
                 Self::Notifications,
                 Self::ToastPosition,
                 Self::Lightbar,
@@ -93,6 +96,7 @@ impl Section {
             let _ = show_developer;
             vec![
                 Self::System,
+                Self::StartScreen,
                 Self::Notifications,
                 Self::ToastPosition,
                 Self::Lightbar,
@@ -123,6 +127,8 @@ pub struct ConfigureSettings {
     pub lightbar_enabled: bool,
     pub start_screen_enabled: bool,
     pub start_screen_gesture: Vec<GestureControl>,
+    pub start_screen_sounds_enabled: bool,
+    pub start_screen_sound_volume: u8,
     pub gesture_recording: bool,
     pub gesture_recording_live: String,
     #[cfg(windows)]
@@ -184,6 +190,8 @@ pub enum ConfigureMessage {
     SetAnalyticsEnabled(bool),
     SetLightbarEnabled(bool),
     SetStartScreenEnabled(bool),
+    SetStartScreenSounds(bool),
+    SetStartScreenSoundVolume(u8),
     StartGestureRecord,
     ResetStartGesture,
     CancelGestureRecord,
@@ -514,6 +522,7 @@ fn section_content<'a>(
 ) -> Element<'a, ConfigureMessage> {
     match state.section {
         Section::System => system_view(settings),
+        Section::StartScreen => start_screen_view(settings),
         Section::Notifications => notifications_view(settings),
         Section::ToastPosition => {
             toast_position_view(settings, theme::from_rgb(state.spectrum.accent()))
@@ -540,6 +549,25 @@ fn system_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage
                 .on_toggle(ConfigureMessage::SetAutostart),
         );
     }
+
+    items = items.push(
+        button(text("Open data folder").size(13.0))
+            .padding([6, 10])
+            .on_press(ConfigureMessage::OpenDataFolder)
+            .style(theme::ghost),
+    );
+
+    items = items.push(
+        text(format!("{DISPLAY_NAME} {PKG_VERSION}"))
+            .size(12.0)
+            .color(theme::DIM),
+    );
+
+    items.into()
+}
+
+fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
+    let mut items = Column::new().spacing(8).width(Fill);
 
     items = items.push(
         checkbox(settings.start_screen_enabled)
@@ -589,20 +617,33 @@ fn system_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage
                 .spacing(6),
             );
         }
+
+        items = items.push(
+            checkbox(settings.start_screen_sounds_enabled)
+                .label("UI sounds")
+                .size(16.0)
+                .text_size(13.0)
+                .spacing(8)
+                .on_toggle(ConfigureMessage::SetStartScreenSounds),
+        );
+
+        if settings.start_screen_sounds_enabled {
+            let volume = settings.start_screen_sound_volume;
+            items = items.push(
+                column![
+                    text(format!("Volume {volume}%"))
+                        .size(12.0)
+                        .color(theme::MUTED),
+                    slider(0.0..=100.0, f32::from(volume), |value| {
+                        ConfigureMessage::SetStartScreenSoundVolume(value.round() as u8)
+                    })
+                    .step(5.0_f32),
+                ]
+                .spacing(4)
+                .width(Fill),
+            );
+        }
     }
-
-    items = items.push(
-        button(text("Open data folder").size(13.0))
-            .padding([6, 10])
-            .on_press(ConfigureMessage::OpenDataFolder)
-            .style(theme::ghost),
-    );
-
-    items = items.push(
-        text(format!("{DISPLAY_NAME} {PKG_VERSION}"))
-            .size(12.0)
-            .color(theme::DIM),
-    );
 
     items.into()
 }
