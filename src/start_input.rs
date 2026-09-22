@@ -816,10 +816,7 @@ impl GestureDetectorBank {
 
         let mut fired = false;
         for reading in readings {
-            let detector = self
-                .detectors
-                .entry(reading.id.clone())
-                .or_insert_with(GestureDetector::new);
+            let detector = self.detectors.entry(reading.id.clone()).or_default();
             if detector.update(required, &reading.sample.held) {
                 fired = true;
             }
