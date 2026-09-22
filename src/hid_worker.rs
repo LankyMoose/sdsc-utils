@@ -276,7 +276,11 @@ impl HidWorkerHandle {
 }
 
 fn identify_flash_color(step: u32, normal: Rgb) -> Rgb {
-    if step % 2 == 0 { Rgb::WHITE } else { normal }
+    if step.is_multiple_of(2) {
+        Rgb::WHITE
+    } else {
+        normal
+    }
 }
 
 fn write_rgb_cached(

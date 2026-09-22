@@ -2572,7 +2572,7 @@ impl App {
             };
             return next;
         }
-        return Task::none();
+        Task::none()
     }
 
     fn on_gesture_record(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
