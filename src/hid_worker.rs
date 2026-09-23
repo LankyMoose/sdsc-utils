@@ -4,8 +4,10 @@
 //! plus short input reads published to a shared snapshot. The UI PadPoll path only
 //! clones that snapshot — it never opens HID — so Identify cannot stall iced.
 //!
-//! During Identify, flash writes and one short input read share the same cached
-//! handle so start-nav keeps receiving `hid:{serial}` samples.
+//! **Lightbar writes never use the input cache handle.** Long-lived read handles on
+//! Windows/DualSense often accept `write` with `Ok` without updating the bar, and can
+//! poison `LIGHT_OUT` claims. SetRgb / Identify always drop the cached device, then
+//! open-write-close; input sampling may reopen afterward.
 //!
 //! Timing lines (grep `hid-worker:`) record enumerate / open / io / total.
 
@@ -59,7 +61,8 @@ struct OpenDevice {
     is_bluetooth: bool,
 }
 
-/// Keeps `HidApi` alive with per-serial open handles for output + input.
+/// Keeps `HidApi` alive with per-serial open handles for **input** sampling.
+/// Lightbar writes must not use these handles — see [`write_rgb_exclusive`].
 struct DeviceCache {
     api: HidApi,
     devices: HashMap<String, OpenDevice>,
@@ -283,29 +286,21 @@ fn identify_flash_color(step: u32, normal: Rgb) -> Rgb {
     }
 }
 
-fn write_rgb_cached(
+/// Lightbar output must not use the input-pump handle: long-lived read handles on
+/// Windows/DualSense often accept `write` with `Ok` without updating the bar.
+fn write_rgb_exclusive(
     cache: &mut DeviceCache,
     serial: &str,
     color: Rgb,
 ) -> (Result<(), String>, HidPhaseTiming) {
-    match cache.ensure(serial) {
-        Ok(open) => {
-            let (result, timing) = lightbar::apply_on_open_device_timed(
-                &open.device,
-                serial,
-                color,
-                open.is_bluetooth,
-            );
-            if result.is_err() {
-                cache.drop_serial(serial);
-            }
-            (result, timing)
-        }
-        Err(_) => {
-            // Cache miss / open failed — fall back to full open-write-close.
-            lightbar::apply_lightbar_rgb_timed(serial, color)
-        }
+    let target = normalize_identity(serial);
+    let was_cached = cache.devices.contains_key(&target);
+    cache.drop_serial(serial);
+    if was_cached {
+        // Input handles can "succeed" RGB writes without a real claim; force LIGHT_OUT.
+        lightbar::prepare_connect_apply(serial);
     }
+    lightbar::apply_lightbar_rgb_timed(serial, color)
 }
 
 fn sample_one(cache: &mut DeviceCache, serial: &str) -> Option<NavReading> {
@@ -361,7 +356,7 @@ fn begin_identify(
 ) -> Option<IdentifySession> {
     let normal = color_for_battery_percent(percent);
     let started = Instant::now();
-    let (result, timing) = write_rgb_cached(cache, &serial, identify_flash_color(0, normal));
+    let (result, timing) = write_rgb_exclusive(cache, &serial, identify_flash_color(0, normal));
     if let Err(err) = result {
         app_log::warn(format!("identify failed for {serial}: {err}"));
         log_cmd(
@@ -403,7 +398,7 @@ fn advance_identify(
 
     if s.next_write >= IDENTIFY_WRITES {
         let finished = session.take().expect("session present");
-        // Keep handle so input sampling continues without reopen thrash.
+        // Exclusive writes already dropped the handle; refresh input snapshot.
         log_cmd(
             "Identify",
             &finished.timing,
@@ -419,7 +414,7 @@ fn advance_identify(
 
     let color = identify_flash_color(s.next_write, s.normal);
     let serial = s.serial.clone();
-    let (result, t) = write_rgb_cached(cache, &serial, color);
+    let (result, t) = write_rgb_exclusive(cache, &serial, color);
     s.timing.add_assign(t);
     s.flashes += 1;
     if let Err(err) = result {
@@ -508,9 +503,7 @@ fn handle_cmd(
                 return false;
             }
             let started = Instant::now();
-            let (result, timing) = write_rgb_cached(cache, &serial, color);
-            // Drop after write; idle sampling reopens for input.
-            cache.drop_serial(&serial);
+            let (result, timing) = write_rgb_exclusive(cache, &serial, color);
             if let Err(err) = result {
                 app_log::warn(format!("lightbar write failed for {serial}: {err}"));
             }
@@ -558,6 +551,8 @@ fn worker_loop(
             return;
         }
     };
+    // Clear claims poisoned by prior no-op writes on input-cache handles.
+    lightbar::forget_all_claims();
     let mut session: Option<IdentifySession> = None;
 
     loop {

@@ -104,8 +104,8 @@ pub fn sync_lightbar_claims(active_serials: impl IntoIterator<Item = impl AsRef<
     }
 }
 
-/// Drop all `LIGHT_OUT` claims (e.g. CLI force-reapply).
-fn forget_all_claims() {
+/// Drop all `LIGHT_OUT` claims (e.g. CLI force-reapply, hid-worker session start).
+pub fn forget_all_claims() {
     if let Ok(mut claimed) = CLAIMED_SERIALS.lock() {
         claimed.clear();
     }

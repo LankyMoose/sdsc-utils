@@ -6,6 +6,7 @@ use crate::file_icon;
 use crate::games::GameEntry;
 use crate::percent_ring::{self, POPUP_SIZE};
 use crate::prefs::GamesSortMode;
+use crate::start_input::FaceHeld;
 use crate::steam::SteamGame;
 use crate::svg_icon;
 use crate::theme;
@@ -48,6 +49,10 @@ const ICON_W: f32 = 48.0;
 const ICON_H: f32 = 72.0;
 const HOLD_RING_SIZE: f32 = 32.0;
 const FACE_GLYPH_SIZE: f32 = 18.0;
+/// Peak scale of a face glyph while its button is pressed (layout size unchanged).
+const PRESSED_SCALE: f32 = 1.1;
+/// Pressed grow and armed-color transitions.
+const HINT_ANIM: Duration = Duration::from_millis(100);
 const ROW_GAP: f32 = 10.0;
 const ACCENT_BAR_W: f32 = 4.0;
 const ROW_ACTION_SPACING: f32 = 14.0;
@@ -259,6 +264,24 @@ struct SlideAnim {
     started: Instant,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct FacePressAnim {
+    cross: f32,
+    circle: f32,
+    square: f32,
+    triangle: f32,
+}
+
+fn approach_anim(current: &mut f32, target: bool, dt: f32) {
+    let target = if target { 1.0 } else { 0.0 };
+    let step = dt / HINT_ANIM.as_secs_f32();
+    if *current < target {
+        *current = (*current + step).min(target);
+    } else if *current > target {
+        *current = (*current - step).max(target);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ReplaceConfirm {
     pub running_title: String,
@@ -296,6 +319,15 @@ pub struct State {
     pub manual_add: Option<ManualAddDraft>,
     pub triangle_progress: f32,
     pub cross_progress: f32,
+    /// Face buttons currently held (pad OR keyboard) for action-hint press styling.
+    pub held: FaceHeld,
+    /// Animated 0..=1 press amounts per face (drives pressed scale).
+    press_anim: FacePressAnim,
+    /// Animated 0..=1 toward white-ish hold arc once triangle hold is armed.
+    triangle_armed_anim: f32,
+    /// Animated 0..=1 toward white-ish hold arc once cross hold is armed.
+    cross_armed_anim: f32,
+    hint_anim_tick: Option<Instant>,
     pub editing: bool,
     pub sort_mode: GamesSortMode,
     /// `play_key` of the row selected when edit mode was entered (restored on Save/Cancel).
@@ -332,6 +364,11 @@ impl Default for State {
             manual_add: None,
             triangle_progress: 0.0,
             cross_progress: 0.0,
+            held: FaceHeld::default(),
+            press_anim: FacePressAnim::default(),
+            triangle_armed_anim: 0.0,
+            cross_armed_anim: 0.0,
+            hint_anim_tick: None,
             editing: false,
             sort_mode: GamesSortMode::default(),
             edit_anchor_play_key: None,
@@ -483,6 +520,11 @@ impl State {
         self.manual_add = None;
         self.triangle_progress = 0.0;
         self.cross_progress = 0.0;
+        self.held = FaceHeld::default();
+        self.press_anim = FacePressAnim::default();
+        self.triangle_armed_anim = 0.0;
+        self.cross_armed_anim = 0.0;
+        self.hint_anim_tick = None;
         self.editing = false;
         self.edit_anchor_play_key = None;
         self.game_selected = 0;
@@ -505,6 +547,52 @@ impl State {
             || self.cross_progress > 0.0
             || self.replace_confirm.is_some()
             || self.manual_add.is_some()
+            || self.hint_anims_need_frames()
+    }
+
+    fn hint_anims_need_frames(&self) -> bool {
+        const EPS: f32 = 0.001;
+        let press = [
+            (self.held.cross, self.press_anim.cross),
+            (self.held.circle, self.press_anim.circle),
+            (self.held.square, self.press_anim.square),
+            (self.held.triangle, self.press_anim.triangle),
+        ];
+        if press
+            .iter()
+            .any(|&(held, t)| (held && t < 1.0 - EPS) || (!held && t > EPS))
+        {
+            return true;
+        }
+        let triangle_armed = self.triangle_progress >= 1.0;
+        let cross_armed = self.cross_progress >= 1.0;
+        (triangle_armed && self.triangle_armed_anim < 1.0 - EPS)
+            || (!triangle_armed && self.triangle_armed_anim > EPS)
+            || (cross_armed && self.cross_armed_anim < 1.0 - EPS)
+            || (!cross_armed && self.cross_armed_anim > EPS)
+    }
+
+    /// Advance pressed-scale and armed-color hint animations (~100ms).
+    pub fn tick_hint_anims(&mut self, now: Instant) {
+        let dt = self
+            .hint_anim_tick
+            .map(|t| now.saturating_duration_since(t).as_secs_f32())
+            .unwrap_or(0.0)
+            .min(0.05);
+        self.hint_anim_tick = Some(now);
+        if dt <= 0.0 {
+            return;
+        }
+        approach_anim(&mut self.press_anim.cross, self.held.cross, dt);
+        approach_anim(&mut self.press_anim.circle, self.held.circle, dt);
+        approach_anim(&mut self.press_anim.square, self.held.square, dt);
+        approach_anim(&mut self.press_anim.triangle, self.held.triangle, dt);
+        approach_anim(
+            &mut self.triangle_armed_anim,
+            self.triangle_progress >= 1.0,
+            dt,
+        );
+        approach_anim(&mut self.cross_armed_anim, self.cross_progress >= 1.0, dt);
     }
 
     pub fn tick_anim(&mut self, now: Instant) -> bool {
@@ -879,7 +967,7 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
         } else {
             row![
                 text("No games yet — press").size(15.0).color(theme::MUTED),
-                face_svg(FaceButton::Square),
+                face_svg(FaceButton::Square, FACE_GLYPH_SIZE),
                 text("to edit.").size(15.0).color(theme::MUTED),
             ]
             .spacing(6)
@@ -912,6 +1000,21 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
                     state.triangle_progress
                 } else {
                     0.0
+                },
+                if selected {
+                    state.triangle_armed_anim
+                } else {
+                    0.0
+                },
+                if selected {
+                    state.held
+                } else {
+                    FaceHeld::default()
+                },
+                if selected {
+                    state.press_anim
+                } else {
+                    FacePressAnim::default()
                 },
             ))
         },
@@ -954,6 +1057,21 @@ fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element
                     state.triangle_progress
                 } else {
                     0.0
+                },
+                if selected {
+                    state.triangle_armed_anim
+                } else {
+                    0.0
+                },
+                if selected {
+                    state.held
+                } else {
+                    FaceHeld::default()
+                },
+                if selected {
+                    state.press_anim
+                } else {
+                    FacePressAnim::default()
                 },
             ))
         },
@@ -1056,18 +1174,13 @@ fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
             ]
             .spacing(10),
             action_cluster(&[
-                ActionHint {
-                    face: Some(FaceButton::Cross),
-                    text_glyph: None,
-                    label: if draft.is_edit() { "Save" } else { "Add" },
-                    hold: None,
-                },
-                ActionHint {
-                    face: Some(FaceButton::Circle),
-                    text_glyph: None,
-                    label: "Cancel",
-                    hold: None,
-                },
+                face_hint(
+                    FaceButton::Cross,
+                    if draft.is_edit() { "Save" } else { "Add" },
+                    state.held,
+                    state.press_anim,
+                ),
+                face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim,),
             ]),
         ]
         .spacing(10)
@@ -1121,18 +1234,15 @@ fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
             .color(theme::MUTED),
             space().height(8),
             action_cluster(&[
-                ActionHint {
-                    face: Some(FaceButton::Cross),
-                    text_glyph: None,
-                    label: "Proceed",
-                    hold: Some(state.cross_progress),
-                },
-                ActionHint {
-                    face: Some(FaceButton::Circle),
-                    text_glyph: None,
-                    label: "Cancel",
-                    hold: None,
-                },
+                face_hold_hint(
+                    FaceButton::Cross,
+                    "Proceed",
+                    state.cross_progress,
+                    state.cross_armed_anim,
+                    state.held,
+                    state.press_anim,
+                ),
+                face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim,),
             ]),
         ]
         .spacing(12)
@@ -1162,6 +1272,15 @@ impl FaceButton {
             Self::Triangle => svg_icon::FACE_TRIANGLE_SVG,
         }
     }
+
+    fn held(self, held: FaceHeld) -> bool {
+        match self {
+            Self::Cross => held.cross,
+            Self::Circle => held.circle,
+            Self::Square => held.square,
+            Self::Triangle => held.triangle,
+        }
+    }
 }
 
 struct ActionHint {
@@ -1169,6 +1288,59 @@ struct ActionHint {
     text_glyph: Option<&'static str>,
     label: &'static str,
     hold: Option<f32>,
+    /// 0..=1 blend of hold arc toward ink once armed (animated).
+    armed_t: f32,
+    /// Regular (non-hold) action: light the ring while the face button is pressed.
+    pressed: bool,
+    /// 0..=1 animated press amount (drives layout-stable scale).
+    press_t: f32,
+}
+
+fn face_hint(
+    face: FaceButton,
+    label: &'static str,
+    held: FaceHeld,
+    press_anim: FacePressAnim,
+) -> ActionHint {
+    ActionHint {
+        face: Some(face),
+        text_glyph: None,
+        label,
+        hold: None,
+        armed_t: 0.0,
+        pressed: face.held(held),
+        press_t: press_anim.for_face(face),
+    }
+}
+
+fn face_hold_hint(
+    face: FaceButton,
+    label: &'static str,
+    progress: f32,
+    armed_t: f32,
+    held: FaceHeld,
+    press_anim: FacePressAnim,
+) -> ActionHint {
+    ActionHint {
+        face: Some(face),
+        text_glyph: None,
+        label,
+        hold: Some(progress),
+        armed_t,
+        pressed: face.held(held),
+        press_t: press_anim.for_face(face),
+    }
+}
+
+impl FacePressAnim {
+    fn for_face(self, face: FaceButton) -> f32 {
+        match face {
+            FaceButton::Cross => self.cross,
+            FaceButton::Circle => self.circle,
+            FaceButton::Square => self.square,
+            FaceButton::Triangle => self.triangle,
+        }
+    }
 }
 
 fn footer_hint(state: &State) -> Element<'_, StartMessage> {
@@ -1179,52 +1351,39 @@ fn footer_hint(state: &State) -> Element<'_, StartMessage> {
             "Add"
         };
         return footer_band(action_cluster(&[
-            ActionHint {
-                face: Some(FaceButton::Cross),
-                text_glyph: None,
-                label,
-                hold: None,
-            },
-            ActionHint {
-                face: Some(FaceButton::Circle),
-                text_glyph: None,
-                label: "Cancel",
-                hold: None,
-            },
+            face_hint(FaceButton::Cross, label, state.held, state.press_anim),
+            face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
         ]));
     }
     if state.replace_confirm.is_some() {
         return footer_band(action_cluster(&[
-            ActionHint {
-                face: Some(FaceButton::Cross),
-                text_glyph: None,
-                label: "Proceed",
-                hold: Some(state.cross_progress),
-            },
-            ActionHint {
-                face: Some(FaceButton::Circle),
-                text_glyph: None,
-                label: "Cancel",
-                hold: None,
-            },
+            face_hold_hint(
+                FaceButton::Cross,
+                "Proceed",
+                state.cross_progress,
+                state.cross_armed_anim,
+                state.held,
+                state.press_anim,
+            ),
+            face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
         ]));
     }
 
     let cluster: Element<'_, StartMessage> = match state.slide {
         StartSlide::Games => {
             let hints = [
-                ActionHint {
-                    face: Some(FaceButton::Square),
-                    text_glyph: None,
-                    label: if state.editing { "Save" } else { "Edit" },
-                    hold: None,
-                },
-                ActionHint {
-                    face: Some(FaceButton::Circle),
-                    text_glyph: None,
-                    label: if state.editing { "Cancel" } else { "Close" },
-                    hold: None,
-                },
+                face_hint(
+                    FaceButton::Square,
+                    if state.editing { "Save" } else { "Edit" },
+                    state.held,
+                    state.press_anim,
+                ),
+                face_hint(
+                    FaceButton::Circle,
+                    if state.editing { "Cancel" } else { "Close" },
+                    state.held,
+                    state.press_anim,
+                ),
             ];
             iced::widget::row![
                 action_cluster(&hints),
@@ -1234,12 +1393,12 @@ fn footer_hint(state: &State) -> Element<'_, StartMessage> {
             .align_y(Alignment::Center)
             .into()
         }
-        StartSlide::Controllers => action_cluster(&[ActionHint {
-            face: Some(FaceButton::Circle),
-            text_glyph: None,
-            label: "Close",
-            hold: None,
-        }]),
+        StartSlide::Controllers => action_cluster(&[face_hint(
+            FaceButton::Circle,
+            "Close",
+            state.held,
+            state.press_anim,
+        )]),
     };
 
     let cluster = if state.editing && matches!(state.slide, StartSlide::Games) {
@@ -1317,17 +1476,18 @@ fn action_cluster_spaced(hints: &[ActionHint], spacing: f32) -> Element<'static,
 }
 
 fn action_hint(hint: &ActionHint) -> Element<'static, StartMessage> {
-    let glyph: Element<'static, StartMessage> = if let Some(progress) = hint.hold {
-        if let Some(face) = hint.face {
-            hold_glyph(face, progress)
+    let glyph: Element<'static, StartMessage> = if let Some(face) = hint.face {
+        let style = if let Some(progress) = hint.hold {
+            RingStyle::Hold {
+                progress,
+                armed_t: hint.armed_t,
+            }
+        } else if hint.pressed {
+            RingStyle::Pressed
         } else {
-            text(hint.text_glyph.unwrap_or("?"))
-                .size(14.0)
-                .color(theme::ACCENT)
-                .into()
-        }
-    } else if let Some(face) = hint.face {
-        face_svg(face)
+            RingStyle::Idle
+        };
+        face_glyph(face, style, hint.press_t)
     } else {
         text(hint.text_glyph.unwrap_or("?"))
             .size(14.0)
@@ -1341,17 +1501,32 @@ fn action_hint(hint: &ActionHint) -> Element<'static, StartMessage> {
         .into()
 }
 
-fn face_svg(face: FaceButton) -> Element<'static, StartMessage> {
+fn face_svg(face: FaceButton, size: f32) -> Element<'static, StartMessage> {
     svg(svg::Handle::from_memory(face.svg().as_bytes()))
-        .width(Length::Fixed(FACE_GLYPH_SIZE))
-        .height(Length::Fixed(FACE_GLYPH_SIZE))
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
         .into()
 }
 
-fn hold_glyph(face: FaceButton, progress: f32) -> Element<'static, StartMessage> {
+#[derive(Clone, Copy)]
+enum RingStyle {
+    Idle,
+    Pressed,
+    Hold { progress: f32, armed_t: f32 },
+}
+
+fn face_glyph(face: FaceButton, style: RingStyle, press_t: f32) -> Element<'static, StartMessage> {
+    let press_t = press_t.clamp(0.0, 1.0);
+    let scale = 1.0 + (PRESSED_SCALE - 1.0) * press_t;
+    // Idle radius is inset so full press (× PRESSED_SCALE) + stroke stays inside the slot.
+    let half = HOLD_RING_SIZE / 2.0;
+    let max_radius = half - 2.5; // leave room for ~2.5px stroke
+    let idle_radius = max_radius / PRESSED_SCALE;
+    let radius = idle_radius * scale;
+    let glyph_size = FACE_GLYPH_SIZE * (idle_radius / (half - 2.0)) * scale;
     iced::widget::stack![
-        hold_ring(progress),
-        container(face_svg(face))
+        action_ring(style, radius),
+        container(face_svg(face, glyph_size))
             .width(Length::Fixed(HOLD_RING_SIZE))
             .height(Length::Fixed(HOLD_RING_SIZE))
             .center_x(Fill)
@@ -1362,18 +1537,19 @@ fn hold_glyph(face: FaceButton, progress: f32) -> Element<'static, StartMessage>
     .into()
 }
 
-fn hold_ring(progress: f32) -> Element<'static, StartMessage> {
-    iced::widget::canvas(HoldRing { progress })
+fn action_ring(style: RingStyle, radius: f32) -> Element<'static, StartMessage> {
+    iced::widget::canvas(ActionRing { style, radius })
         .width(Length::Fixed(HOLD_RING_SIZE))
         .height(Length::Fixed(HOLD_RING_SIZE))
         .into()
 }
 
-struct HoldRing {
-    progress: f32,
+struct ActionRing {
+    style: RingStyle,
+    radius: f32,
 }
 
-impl canvas::Program<StartMessage> for HoldRing {
+impl canvas::Program<StartMessage> for ActionRing {
     type State = ();
 
     fn draw(
@@ -1386,35 +1562,59 @@ impl canvas::Program<StartMessage> for HoldRing {
     ) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
         let center = Point::new(bounds.width / 2.0, bounds.height / 2.0);
-        let radius = (bounds.width.min(bounds.height) / 2.0) - 2.0;
+        let radius = self.radius;
         let track = Path::circle(center, radius);
-        frame.stroke(
-            &track,
-            Stroke::default().with_width(2.0).with_color(Color {
-                a: 0.25,
-                ..theme::MUTED
-            }),
-        );
-        if self.progress > 0.01 {
-            let start = -std::f32::consts::FRAC_PI_2;
-            let end = start + self.progress * std::f32::consts::TAU;
-            let steps = ((self.progress * 48.0).ceil() as usize).max(2);
-            let arc = Path::new(|builder| {
-                for i in 0..=steps {
-                    let t = i as f32 / steps as f32;
-                    let a = start + (end - start) * t;
-                    let p = Point::new(center.x + radius * a.cos(), center.y + radius * a.sin());
-                    if i == 0 {
-                        builder.move_to(p);
-                    } else {
-                        builder.line_to(p);
-                    }
+
+        match self.style {
+            RingStyle::Pressed => {
+                frame.stroke(
+                    &track,
+                    Stroke::default().with_width(2.5).with_color(theme::ACCENT),
+                );
+            }
+            RingStyle::Idle => {
+                frame.stroke(
+                    &track,
+                    Stroke::default().with_width(2.0).with_color(Color {
+                        a: 0.25,
+                        ..theme::MUTED
+                    }),
+                );
+            }
+            RingStyle::Hold { progress, armed_t } => {
+                frame.stroke(
+                    &track,
+                    Stroke::default().with_width(2.0).with_color(Color {
+                        a: 0.25,
+                        ..theme::MUTED
+                    }),
+                );
+                if progress > 0.01 {
+                    let start = -std::f32::consts::FRAC_PI_2;
+                    let end = start + progress * std::f32::consts::TAU;
+                    let steps = ((progress * 48.0).ceil() as usize).max(2);
+                    let arc = Path::new(|builder| {
+                        for i in 0..=steps {
+                            let t = i as f32 / steps as f32;
+                            let a = start + (end - start) * t;
+                            let p = Point::new(
+                                center.x + radius * a.cos(),
+                                center.y + radius * a.sin(),
+                            );
+                            if i == 0 {
+                                builder.move_to(p);
+                            } else {
+                                builder.line_to(p);
+                            }
+                        }
+                    });
+                    let arc_color = lerp_color(theme::ACCENT, theme::MUTED, armed_t);
+                    frame.stroke(
+                        &arc,
+                        Stroke::default().with_width(2.5).with_color(arc_color),
+                    );
                 }
-            });
-            frame.stroke(
-                &arc,
-                Stroke::default().with_width(2.5).with_color(theme::ACCENT),
-            );
+            }
         }
         vec![frame.into_geometry()]
     }
@@ -1446,6 +1646,9 @@ fn game_row(
     running: bool,
     editing: bool,
     triangle_progress: f32,
+    triangle_armed_t: f32,
+    held: FaceHeld,
+    press_anim: FacePressAnim,
 ) -> Element<'_, StartMessage> {
     let muted = editing && !row.in_catalog();
     let title_color = if muted {
@@ -1554,34 +1757,21 @@ fn game_row(
                 Some(EditRow::Manual { .. }) => "Remove",
                 Some(EditRow::Steam { .. }) | None => "Toggle",
             };
-            hints.push(ActionHint {
-                face: Some(FaceButton::Cross),
-                text_glyph: None,
-                label,
-                hold: None,
-            });
+            hints.push(face_hint(FaceButton::Cross, label, held, press_anim));
             if matches!(row.edit, Some(EditRow::Manual { .. })) {
-                hints.push(ActionHint {
-                    face: Some(FaceButton::Triangle),
-                    text_glyph: None,
-                    label: "Edit",
-                    hold: None,
-                });
+                hints.push(face_hint(FaceButton::Triangle, "Edit", held, press_anim));
             }
         } else {
-            hints.push(ActionHint {
-                face: Some(FaceButton::Cross),
-                text_glyph: None,
-                label: "Launch",
-                hold: None,
-            });
+            hints.push(face_hint(FaceButton::Cross, "Launch", held, press_anim));
             if running {
-                hints.push(ActionHint {
-                    face: Some(FaceButton::Triangle),
-                    text_glyph: None,
-                    label: "Close game",
-                    hold: Some(triangle_progress),
-                });
+                hints.push(face_hold_hint(
+                    FaceButton::Triangle,
+                    "Close game",
+                    triangle_progress,
+                    triangle_armed_t,
+                    held,
+                    press_anim,
+                ));
             }
         }
         content = content.push(action_cluster_spaced(&hints, ROW_ACTION_SPACING));
@@ -1602,6 +1792,9 @@ fn controller_row<'a>(
     selected: bool,
     spectrum: &BatterySpectrum,
     triangle_progress: f32,
+    triangle_armed_t: f32,
+    held: FaceHeld,
+    press_anim: FacePressAnim,
 ) -> Element<'a, StartMessage> {
     let ring_color = theme::from_rgb(spectrum.color_at_percent(row.percent));
     let ring =
@@ -1627,19 +1820,16 @@ fn controller_row<'a>(
         .align_y(Alignment::Center);
 
     if selected {
-        let mut hints = vec![ActionHint {
-            face: Some(FaceButton::Cross),
-            text_glyph: None,
-            label: "Identify",
-            hold: None,
-        }];
+        let mut hints = vec![face_hint(FaceButton::Cross, "Identify", held, press_anim)];
         if row.bluetooth {
-            hints.push(ActionHint {
-                face: Some(FaceButton::Triangle),
-                text_glyph: None,
-                label: "Power off",
-                hold: Some(triangle_progress),
-            });
+            hints.push(face_hold_hint(
+                FaceButton::Triangle,
+                "Power off",
+                triangle_progress,
+                triangle_armed_t,
+                held,
+                press_anim,
+            ));
         }
         content = content.push(action_cluster_spaced(&hints, ROW_ACTION_SPACING));
     }

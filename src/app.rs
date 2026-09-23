@@ -36,8 +36,8 @@ use crate::popup_view::{self, ControllerRow, PopupMessage};
 use crate::prefs::{Prefs, clamp_low_battery_percent, clamp_start_screen_sound_volume};
 use crate::process_match::{self, RunningSession};
 use crate::start_input::{
-    self, CrossHold, GestureDetectorBank, GestureRecordLatch, NavAction, NavLogSnapshot, NavSource,
-    PadNavBank,
+    self, CrossHold, FaceHeld, GestureDetectorBank, GestureRecordLatch, NavAction, NavLogSnapshot,
+    NavSource, PadNavBank,
 };
 use crate::start_view::{self, ReplaceConfirm, StartMessage, StartSlide};
 use crate::steam::{self, SteamGame};
@@ -206,8 +206,12 @@ pub struct App {
     pad_nav: PadNavBank,
     /// Keyboard Enter hold for replace-confirm (not folded into pad slots).
     keyboard_cross_hold: CrossHold,
-    /// Keyboard Enter held (for hold-to-proceed on replace confirm).
+    /// Keyboard Enter held (for hold-to-proceed on replace confirm / Cross press styling).
     confirm_key_held: bool,
+    /// Keyboard Escape held (Circle press styling).
+    cancel_key_held: bool,
+    /// Last armed-pad face held snapshot (merged with keyboard in [`Self::sync_start_held`]).
+    pad_held: FaceHeld,
     running_session: Option<RunningSession>,
     /// Throttle for process enumeration / catalog restore (not pad UI).
     last_running_check: Option<Instant>,
@@ -338,6 +342,8 @@ impl App {
             pad_nav: PadNavBank::default(),
             keyboard_cross_hold: CrossHold::default(),
             confirm_key_held: false,
+            cancel_key_held: false,
+            pad_held: FaceHeld::default(),
             running_session: None,
             last_running_check: None,
             match_path_cache: HashMap::new(),
@@ -615,6 +621,8 @@ impl App {
                         return self.complete_replace_confirm();
                     }
                 }
+                self.sync_start_held();
+                self.start_state.tick_hint_anims(now);
                 Task::none()
             }
             Message::Start(message) => self.on_start_message(message),
@@ -635,13 +643,14 @@ impl App {
                             self.on_start_message(StartMessage::MoveDown)
                         }
                         StartKeyAction::Confirm => {
+                            self.confirm_key_held = pressed;
+                            self.sync_start_held();
                             if self.start_state.replace_confirm.is_some() {
                                 if pressed {
                                     self.pad_nav.cancel_holds();
                                 }
-                                self.confirm_key_held = pressed;
                                 Task::none()
-                            } else if pressed {
+                            } else if !pressed {
                                 self.cancel_start_holds();
                                 self.on_start_message(StartMessage::Confirm)
                             } else {
@@ -649,7 +658,9 @@ impl App {
                             }
                         }
                         StartKeyAction::Cancel => {
-                            if pressed {
+                            self.cancel_key_held = pressed;
+                            self.sync_start_held();
+                            if !pressed {
                                 self.cancel_start_holds();
                                 self.on_start_message(StartMessage::Close)
                             } else {
@@ -1952,6 +1963,8 @@ impl App {
         self.pad_nav.prepare_on_open(arm_immediately);
         self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
+        self.cancel_key_held = false;
+        self.pad_held = FaceHeld::default();
     }
 
     fn close_start_screen(&mut self) -> Task<Message> {
@@ -1959,6 +1972,8 @@ impl App {
         self.pad_nav.reset();
         self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
+        self.cancel_key_held = false;
+        self.pad_held = FaceHeld::default();
         self.start_state.reset_to_games();
         self.discard_edit_draft();
         self.clear_start_nav_diag();
@@ -2007,12 +2022,20 @@ impl App {
                 if index < self.start_state.rows.len() {
                     self.start_state.game_selected = index;
                 }
-                self.play_start_sound(UiSoundKind::Action);
                 let scroll = self.scroll_start_selection_into_view();
                 if self.start_state.editing {
-                    scroll.chain(self.edit_toggle_selected())
+                    match self.edit_toggle_selected() {
+                        Some(task) => {
+                            self.play_start_sound(UiSoundKind::Action);
+                            scroll.chain(task)
+                        }
+                        None => scroll,
+                    }
+                } else if self.launch_selected() {
+                    self.play_start_sound(UiSoundKind::Action);
+                    scroll
                 } else {
-                    scroll.chain(self.launch_selected())
+                    scroll
                 }
             }
             StartMessage::SelectController(index) => {
@@ -2042,22 +2065,22 @@ impl App {
                     direction.unwrap_or(start_view::ScrollReveal::Down),
                 )
             }
-            StartMessage::Confirm => {
-                self.play_start_sound(UiSoundKind::Action);
-                self.on_start_confirm()
-            }
+            StartMessage::Confirm => self.on_start_confirm(),
             StartMessage::Close => {
-                if self.start_state.manual_add.take().is_some()
-                    || self.start_state.replace_confirm.take().is_some()
-                {
+                if self.start_state.manual_add.is_some() {
+                    self.play_start_sound(UiSoundKind::Action);
+                    self.cancel_manual_add()
+                } else if self.start_state.replace_confirm.take().is_some() {
                     self.play_start_sound(UiSoundKind::Action);
                     Task::none()
                 } else if self.start_state.editing {
                     self.play_start_sound(UiSoundKind::Action);
                     self.cancel_start_edit()
-                } else {
+                } else if self.start_window.is_some() {
                     self.play_start_sound(UiSoundKind::Action);
                     self.close_start_screen()
+                } else {
+                    Task::none()
                 }
             }
             StartMessage::PrevSlide => {
@@ -2086,14 +2109,20 @@ impl App {
                     .request_slide(StartSlide::Controllers, Instant::now());
                 Task::none()
             }
-            StartMessage::ToggleEdit => {
-                self.play_start_sound(UiSoundKind::Action);
-                self.toggle_start_edit()
-            }
-            StartMessage::CycleSort => {
-                self.play_start_sound(UiSoundKind::Action);
-                self.cycle_games_sort()
-            }
+            StartMessage::ToggleEdit => match self.toggle_start_edit() {
+                Some(task) => {
+                    self.play_start_sound(UiSoundKind::Action);
+                    task
+                }
+                None => Task::none(),
+            },
+            StartMessage::CycleSort => match self.cycle_games_sort() {
+                Some(task) => {
+                    self.play_start_sound(UiSoundKind::Action);
+                    task
+                }
+                None => Task::none(),
+            },
             StartMessage::AddShortcut => {
                 if self.start_state.editing && !self.start_state.overlay_blocking() {
                     self.play_start_sound(UiSoundKind::Action);
@@ -2154,9 +2183,21 @@ impl App {
 
     fn cancel_start_holds(&mut self) {
         self.pad_nav.cancel_holds();
+        self.pad_nav.cancel_held_face_releases();
         self.keyboard_cross_hold.cancel();
         self.start_state.triangle_progress = 0.0;
         self.start_state.cross_progress = 0.0;
+    }
+
+    fn sync_start_held(&mut self) {
+        let mut held = self.pad_held;
+        if self.confirm_key_held {
+            held.cross = true;
+        }
+        if self.cancel_key_held {
+            held.circle = true;
+        }
+        self.start_state.held = held;
     }
 
     fn scroll_start_selection_into_view(&mut self) -> Task<Message> {
@@ -2199,31 +2240,31 @@ impl App {
         )
     }
 
-    fn toggle_start_edit(&mut self) -> Task<Message> {
+    fn toggle_start_edit(&mut self) -> Option<Task<Message>> {
         if self.start_state.slide != StartSlide::Games
             || self.start_state.overlay_blocking()
             || self.start_state.animating()
         {
-            return Task::none();
+            return None;
         }
-        if self.start_state.editing {
+        Some(if self.start_state.editing {
             self.commit_start_edit()
         } else {
             self.enter_start_edit()
-        }
+        })
     }
 
-    fn cycle_games_sort(&mut self) -> Task<Message> {
+    fn cycle_games_sort(&mut self) -> Option<Task<Message>> {
         if self.start_state.editing
             || self.start_state.slide != StartSlide::Games
             || self.start_state.overlay_blocking()
         {
-            return Task::none();
+            return None;
         }
         self.prefs.games_sort_mode = self.prefs.games_sort_mode.cycle();
         self.prefs.save();
         self.refresh_start_rows();
-        self.scroll_start_selection_into_view()
+        Some(self.scroll_start_selection_into_view())
     }
 
     fn pick_manual_shortcut(&mut self) -> Task<Message> {
@@ -2291,14 +2332,14 @@ impl App {
         Task::none()
     }
 
-    fn edit_toggle_selected(&mut self) -> Task<Message> {
+    fn edit_toggle_selected(&mut self) -> Option<Task<Message>> {
         let Some(row) = self
             .start_state
             .rows
             .get(self.start_state.game_selected)
             .cloned()
         else {
-            return Task::none();
+            return None;
         };
         let changed = match row.edit.as_ref() {
             Some(start_view::EditRow::Steam { appid, in_catalog }) => {
@@ -2311,13 +2352,15 @@ impl App {
         };
         if changed {
             self.refresh_start_rows();
-            return self.scroll_start_selection_into_view();
+            Some(self.scroll_start_selection_into_view())
+        } else {
+            None
         }
-        Task::none()
     }
 
     fn on_start_confirm(&mut self) -> Task<Message> {
         if self.start_state.manual_add.is_some() {
+            self.play_start_sound(UiSoundKind::Action);
             return self.confirm_manual_add();
         }
         // Replace confirm requires hold-Cross / hold-Enter (see pad poll / key hold).
@@ -2325,12 +2368,25 @@ impl App {
             return Task::none();
         }
         match self.start_state.slide {
-            StartSlide::Games if self.start_state.editing => self.edit_toggle_selected(),
-            StartSlide::Games => self.launch_selected(),
+            StartSlide::Games if self.start_state.editing => match self.edit_toggle_selected() {
+                Some(task) => {
+                    self.play_start_sound(UiSoundKind::Action);
+                    task
+                }
+                None => Task::none(),
+            },
+            StartSlide::Games => {
+                if self.launch_selected() {
+                    self.play_start_sound(UiSoundKind::Action);
+                }
+                Task::none()
+            }
             StartSlide::Controllers => {
                 if let Some(row) = self.start_state.selected_controller() {
                     let serial = row.serial.clone();
-                    let _ = self.identify(&serial);
+                    if self.identify(&serial) {
+                        self.play_start_sound(UiSoundKind::Action);
+                    }
                 }
                 Task::none()
             }
@@ -2346,22 +2402,24 @@ impl App {
         self.start_state.cross_progress = 0.0;
         self.close_running_game();
         self.start_state.game_selected = confirm.next_index;
-        self.launch_selected()
+        let _ = self.launch_selected();
+        Task::none()
     }
 
-    fn launch_selected(&mut self) -> Task<Message> {
+    /// Launch the selected game. Returns true when launch, replace-confirm, or a real attempt ran.
+    fn launch_selected(&mut self) -> bool {
         let Some(row) = self
             .start_state
             .rows
             .get(self.start_state.game_selected)
             .cloned()
         else {
-            return Task::none();
+            return false;
         };
 
         if let Some(session) = self.running_session.as_ref() {
             if session.matches_target(&row.target) {
-                return Task::none();
+                return false;
             }
             if process_match::any_matching_running(&session.match_paths) {
                 self.start_state.replace_confirm = Some(ReplaceConfirm {
@@ -2369,7 +2427,7 @@ impl App {
                     next_title: row.title.clone(),
                     next_index: self.start_state.game_selected,
                 });
-                return Task::none();
+                return true;
             }
             self.running_session = None;
             self.start_state.running_target = None;
@@ -2379,11 +2437,11 @@ impl App {
             Ok(()) => {
                 self.touch_last_played(&row.play_key);
                 self.begin_running_session(row.title, row.target);
-                Task::none()
+                true
             }
             Err(err) => {
                 app_log::warn(format!("launch failed for {}: {err}", row.target));
-                Task::none()
+                false
             }
         }
     }
@@ -2475,7 +2533,11 @@ impl App {
             self.nav_unarmed_warned = false;
         }
 
+        self.pad_held = tick.held;
+        self.sync_start_held();
+
         if animating {
+            self.start_state.tick_hint_anims(now);
             if let Some(action) = tick.action {
                 let next = match action {
                     NavAction::PrevSlide => self.on_start_message(StartMessage::PrevSlide),
@@ -2497,6 +2559,7 @@ impl App {
             cross_completed = cross_completed || k_completed;
             self.start_state.cross_progress = cross_progress;
             self.start_state.triangle_progress = 0.0;
+            self.start_state.tick_hint_anims(now);
             if cross_completed {
                 self.play_start_sound(UiSoundKind::Hold);
                 return self.complete_replace_confirm();
@@ -2512,18 +2575,14 @@ impl App {
         if manual_add {
             self.start_state.cross_progress = 0.0;
             self.start_state.triangle_progress = 0.0;
-            self.confirm_key_held = false;
             self.keyboard_cross_hold.reset();
+            self.start_state.tick_hint_anims(now);
             if let Some(action) = tick.action {
                 let next = match action {
-                    NavAction::Confirm => {
-                        self.play_start_sound(UiSoundKind::Action);
-                        self.confirm_manual_add()
-                    }
-                    NavAction::Cancel => {
-                        self.play_start_sound(UiSoundKind::Action);
-                        self.cancel_manual_add()
-                    }
+                    NavAction::Confirm | NavAction::Cancel => self.on_start_message(match action {
+                        NavAction::Confirm => StartMessage::Confirm,
+                        _ => StartMessage::Close,
+                    }),
                     _ => Task::none(),
                 };
                 return next;
@@ -2532,7 +2591,6 @@ impl App {
         }
 
         self.start_state.cross_progress = 0.0;
-        self.confirm_key_held = false;
         self.keyboard_cross_hold.reset();
 
         if self.start_state.editing {
@@ -2554,6 +2612,8 @@ impl App {
                 }
             }
         }
+
+        self.start_state.tick_hint_anims(now);
 
         if let Some(action) = tick.action {
             let next = match action {
