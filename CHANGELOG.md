@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-23
+
 ### Added
 
 - **Start screen** launcher: when the first DualSense connects (0→1), an always-on-top quick-launch card can open with curated Steam games and manual shortcuts. Navigate with D-pad / combined analog sticks / keyboard; Cross or Enter launches; Circle or Escape dismisses. Opens with an empty catalog (empty copy + Square hint). Any connected DualSense can drive open / close / navigation (inputs are never merged across pads).
@@ -20,7 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - DualSense HID I/O (lightbar / battery poll / Identify / power-off, and start-nav input when enabled) runs on a dedicated **hid-worker** thread. The UI clones a shared input snapshot and never opens HID on the iced thread, so Identify can interleave with short input reads on the same handle.
-- When the start screen is enabled, PadPoll and idle HID sampling run at ~16 ms while the start screen is open or a reopen gesture is being recorded; otherwise ~50 ms. With no controllers known, presence / unread poll runs every ~500 ms so Bluetooth 0→1 open is faster (restores the 3 s cadence once a pad is connected).
+- While pad input is live (start screen, reopen gesture, Pad Input), HID sampling and UI snapshot apply run at about one wired DualSense report (~4 ms); presence / unread poll stays ~500 ms when no controllers are known.
+- Darker, sharper Settings / Start / popup chrome (theme hierarchy, framed outlines, list separators).
+- Overlay toasts stay topmost over other apps; when Start or Settings is open, those windows sit above the toast in the same topmost band so they keep presenting. Start opens concurrently with connect toasts (no longer waits on toast expiry).
+
+### Fixed
+
+- Multi-second UI freezes from constructing a new `HidApi` on every poll — the worker keeps one long-lived API and refreshes devices as needed.
+- Windows multi-window toast present starvation and wrong battery % on queued connect toasts (remount toast surface on handoff; generation-guarded place).
 
 ## [1.3.3] - 2026-09-20
 
@@ -282,6 +291,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded DualSense silhouette for the tray and `.exe` icon.
 - Windows CI and tagged release workflow.
 
+[1.4.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.3.3...v1.4.0
 [1.3.3]: https://github.com/LankyMoose/sdsc-utils/compare/v1.3.2...v1.3.3
 [1.3.2]: https://github.com/LankyMoose/sdsc-utils/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.3.0...v1.3.1
