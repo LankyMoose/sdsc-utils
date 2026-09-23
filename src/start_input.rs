@@ -1493,8 +1493,10 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(tick2.action, Some(NavAction::Confirm));
-        assert_eq!(tick2.action_pad.as_ref().map(|p| p.as_str()), Some("b"));
+        assert!(
+            tick2.action.is_none(),
+            "Cross arms on press, fires on release"
+        );
         let tick3 = bank.tick(
             &[reading("a", open), reading("b", PadSample::default())],
             now,
@@ -1502,7 +1504,8 @@ mod tests {
             false,
             false,
         );
-        assert!(tick3.action.is_none());
+        assert_eq!(tick3.action, Some(NavAction::Confirm));
+        assert_eq!(tick3.action_pad.as_ref().map(|p| p.as_str()), Some("b"));
     }
 
     #[test]
@@ -1540,8 +1543,7 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(tick.action, Some(NavAction::Cancel));
-        assert_eq!(tick.action_pad.as_ref().map(|p| p.as_str()), Some("a"));
+        assert!(tick.action.is_none(), "face actions arm on press");
         let tick2 = bank.tick(
             &[
                 reading("a", PadSample::default()),
@@ -1552,7 +1554,8 @@ mod tests {
             false,
             false,
         );
-        assert!(tick2.action.is_none());
+        assert_eq!(tick2.action, Some(NavAction::Cancel));
+        assert_eq!(tick2.action_pad.as_ref().map(|p| p.as_str()), Some("a"));
     }
 
     #[test]
