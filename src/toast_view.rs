@@ -19,11 +19,19 @@ const HEADING_SIZE: f32 = 14.0;
 const BODY_SIZE: f32 = 13.0;
 
 /// Renders the toast card. Clicking anywhere on it emits `on_dismiss`.
-pub fn view<'a, Message>(message: &'a ToastMessage, on_dismiss: Message) -> Element<'a, Message>
+///
+/// `generation` changes the layout width by 1px so iced/wgpu cannot keep the
+/// previous toast's surface when messages are chained on one window.
+pub fn view<'a, Message>(
+    message: &'a ToastMessage,
+    generation: u64,
+    on_dismiss: Message,
+) -> Element<'a, Message>
 where
     Message: Clone + 'a,
 {
     let accent = theme::from_rgb(message.accent);
+    let width = WIDTH + if generation % 2 == 0 { 0.0 } else { 1.0 };
 
     let rail = container(space())
         .width(Length::Fixed(RAIL_WIDTH))
@@ -58,10 +66,14 @@ where
     .height(Fill)
     .style(theme::toast_card(accent));
 
-    mouse_area(card)
-        .on_press(on_dismiss)
-        .interaction(iced::mouse::Interaction::Pointer)
-        .into()
+    mouse_area(
+        container(card)
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(HEIGHT)),
+    )
+    .on_press(on_dismiss)
+    .interaction(iced::mouse::Interaction::Pointer)
+    .into()
 }
 
 /// Renders nothing when the toast window is open but idle between messages.

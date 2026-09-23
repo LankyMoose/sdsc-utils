@@ -26,10 +26,15 @@ pub const WS_EX_NOACTIVATE: isize = 0x0800_0000;
 pub const SW_HIDE: i32 = 0;
 pub const SW_SHOWNOACTIVATE: i32 = 4;
 pub const HWND_TOPMOST: isize = -1;
+pub const HWND_NOTOPMOST: isize = -2;
 pub const SWP_NOSIZE: u32 = 0x0001;
 pub const SWP_NOMOVE: u32 = 0x0002;
 pub const SWP_NOACTIVATE: u32 = 0x0010;
 pub const SWP_FRAMECHANGED: u32 = 0x0020;
+pub const RDW_INVALIDATE: u32 = 0x0001;
+pub const RDW_ERASE: u32 = 0x0004;
+pub const RDW_FRAME: u32 = 0x0400;
+pub const RDW_ALLCHILDREN: u32 = 0x0080;
 
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -80,11 +85,35 @@ impl Drop for ThreadQuitGuard {
     }
 }
 
-/// Mark `hwnd` as non-activating and reaffirm always-on-top without focus.
-pub unsafe fn apply_noactivate_exstyle(hwnd: isize) {
+/// Mark `hwnd` as non-activating and optionally pin it above other apps.
+///
+/// Toast stays topmost so it clears Cursor / games. When Settings / Start /
+/// popup are open, raise those HWNDs into the same topmost band *after* the
+/// toast (see [`raise_topmost`]) so they keep presents (iced#3108 / #3320).
+pub unsafe fn apply_noactivate_exstyle(hwnd: isize, topmost: bool) {
     unsafe {
         let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
         let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE);
+        let after = if topmost {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        };
+        let _ = SetWindowPos(
+            hwnd,
+            after,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+/// Pin `hwnd` to the top of the topmost band without activating it.
+pub unsafe fn raise_topmost(hwnd: isize) {
+    unsafe {
         let _ = SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -92,7 +121,19 @@ pub unsafe fn apply_noactivate_exstyle(hwnd: isize) {
             0,
             0,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Force Win32 to repaint `hwnd` (helps iced pick up a new toast view).
+pub unsafe fn invalidate_hwnd(hwnd: isize) {
+    unsafe {
+        let _ = RedrawWindow(
+            hwnd,
+            std::ptr::null(),
+            0,
+            RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN,
         );
     }
 }
@@ -119,6 +160,7 @@ unsafe extern "system" {
         cy: i32,
         flags: u32,
     ) -> i32;
+    pub fn RedrawWindow(hwnd: isize, rect: *const Rect, region: isize, flags: u32) -> i32;
 }
 
 #[link(name = "shcore")]

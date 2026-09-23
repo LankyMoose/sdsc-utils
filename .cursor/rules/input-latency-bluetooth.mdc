@@ -1,0 +1,25 @@
+---
+description: Prefer immediate DualSense input reads; keep Bluetooth traffic minimal
+alwaysApply: true
+---
+
+# Immediate input, minimal Bluetooth
+
+When changing DualSense input sampling, nav, or HID I/O in this repo:
+
+## Prefer immediate reads
+
+1. Prefer an immediate input read over saving CPU or timer wakes. Do **not** insert a poll sleep to be polite to the system.
+2. Do **not** busy-spin: block in the HID read so the thread wakes when the next report arrives (`read_timeout(0)` to drain, then a short block ≈ one wired report interval when empty).
+3. While pad input is live (start screen, reopen gesture, Pad Input), keep the UI snapshot apply cadence in the same ballpark as the pad report rate (about 4ms wired).
+
+## Keep Bluetooth traffic low
+
+4. Reading reports the pad is already sending does **not** count as extra Bluetooth traffic.
+5. Do **not** add output reports, feature reports, or handle open/close churn in order to read faster.
+6. Lightbar, battery poll, and Identify stay as infrequent as they are now. The one-time Bluetooth full-report (calibration) request stays one-time.
+7. On a short read timeout, keep the open handle and last reading. Drop the handle only on a real I/O error — reconnecting adds Bluetooth setup traffic and drops in-progress presses.
+
+## Diagnostics
+
+8. This does **not** relax [debug-diagnostics.mdc](debug-diagnostics.mdc). Release builds stay quiet; gate investigation-volume traces with debug helpers.

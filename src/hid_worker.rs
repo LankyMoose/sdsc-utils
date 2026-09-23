@@ -29,12 +29,12 @@ use std::time::{Duration, Instant};
 
 const PULSE_SAMPLE_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const SLOW_CMD_LOG_MS: u128 = 20;
-/// Background input wake cadence (reopen-gesture / Pad Input / idle).
+/// Background input wake when nothing is listening (command wait only).
 const BACKGROUND_POLL: Duration = Duration::from_millis(50);
-/// Active input wake cadence while start-nav or gesture recording needs low latency.
-const ACTIVE_POLL: Duration = Duration::from_millis(16);
+/// Active input wake ≈ one wired DualSense report (`bInterval` 4).
+const ACTIVE_POLL: Duration = Duration::from_millis(4);
 /// While waiting for the next Identify flash, still sample this often.
-const IDENTIFY_SAMPLE_POLL: Duration = Duration::from_millis(16);
+const IDENTIFY_SAMPLE_POLL: Duration = Duration::from_millis(4);
 const IDENTIFY_WRITES: u32 = IDENTIFY_FLASH_COUNT * 2;
 const SAMPLE_STALL_MS: u128 = 100;
 
@@ -401,7 +401,7 @@ impl HidWorkerHandle {
 
 fn identify_flash_color(step: u32, normal: Rgb) -> Rgb {
     if step.is_multiple_of(2) {
-        Rgb::WHITE
+        lightbar::IDENTIFY_FLASH
     } else {
         normal
     }
@@ -433,17 +433,30 @@ fn write_rgb_exclusive(
     (result, timing)
 }
 
-fn sample_one(cache: &mut DeviceCache, serial: &str, input_hot: bool) -> Option<NavReading> {
+fn sample_one(cache: &mut DeviceCache, serial: &str, input_hot: bool) -> SampleOneResult {
     let _op = crate::hid_diag::enter_op("sample_one");
-    let open = cache.ensure(serial).ok()?;
+    let open = match cache.ensure(serial) {
+        Ok(o) => o,
+        Err(_) => return SampleOneResult::HardFail,
+    };
     let is_bluetooth = open.is_bluetooth;
     match start_input::read_device_sample_short(&open.device, is_bluetooth, serial, input_hot) {
-        ShortSampleOutcome::Ok(sample) => Some(start_input::hid_nav_reading(serial, sample)),
+        ShortSampleOutcome::Ok(sample) => {
+            SampleOneResult::Ok(start_input::hid_nav_reading(serial, sample))
+        }
+        ShortSampleOutcome::Timeout => SampleOneResult::Timeout,
         ShortSampleOutcome::Fail(_) => {
             cache.drop_serial(serial);
-            None
+            SampleOneResult::HardFail
         }
     }
+}
+
+enum SampleOneResult {
+    Ok(NavReading),
+    /// Keep handle; caller should reuse the previous snapshot reading.
+    Timeout,
+    HardFail,
 }
 
 fn snapshot_age_ms(snapshot: &Mutex<InputSnapshot>) -> u128 {
@@ -505,10 +518,26 @@ fn sample_all_inputs(
     cache.ensure_all_pads();
     let serials: Vec<String> = cache.devices.keys().cloned().collect();
     let cached = serials.len();
+    let prev_by_id: HashMap<String, NavReading> = snapshot
+        .lock()
+        .map(|g| {
+            g.readings
+                .iter()
+                .map(|r| (r.id.0.clone(), r.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut out = Vec::with_capacity(serials.len());
     for serial in serials {
-        if let Some(reading) = sample_one(cache, &serial, input_hot) {
-            out.push(reading);
+        match sample_one(cache, &serial, input_hot) {
+            SampleOneResult::Ok(reading) => out.push(reading),
+            SampleOneResult::Timeout => {
+                let key = format!("hid:{serial}");
+                if let Some(prev) = prev_by_id.get(&key) {
+                    out.push(prev.clone());
+                }
+            }
+            SampleOneResult::HardFail => {}
         }
     }
     let reason = if out.len() < cached && cached > 0 {
@@ -542,18 +571,20 @@ fn sample_serial_into_snapshot(
     serial: &str,
     input_hot: bool,
 ) {
-    let Some(reading) = sample_one(cache, serial, input_hot) else {
-        return;
-    };
-    if let Ok(mut guard) = snapshot.lock() {
-        guard.seq = guard.seq.saturating_add(1);
-        guard.published_at = Instant::now();
-        guard.reason = SnapshotReason::Identify;
-        if let Some(slot) = guard.readings.iter_mut().find(|r| r.id.0 == reading.id.0) {
-            *slot = reading;
-        } else {
-            guard.readings.push(reading);
+    match sample_one(cache, serial, input_hot) {
+        SampleOneResult::Ok(reading) => {
+            if let Ok(mut guard) = snapshot.lock() {
+                guard.seq = guard.seq.saturating_add(1);
+                guard.published_at = Instant::now();
+                guard.reason = SnapshotReason::Identify;
+                if let Some(slot) = guard.readings.iter_mut().find(|r| r.id.0 == reading.id.0) {
+                    *slot = reading;
+                } else {
+                    guard.readings.push(reading);
+                }
+            }
         }
+        SampleOneResult::Timeout | SampleOneResult::HardFail => {}
     }
 }
 
@@ -873,19 +904,55 @@ fn worker_loop(
             continue;
         }
 
-        let timeout = if let Some(s) = session.as_ref() {
-            let until_flash = s
-                .wake_at
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_millis(1));
-            until_flash.min(IDENTIFY_SAMPLE_POLL)
-        } else if hot {
-            ACTIVE_POLL
-        } else {
-            BACKGROUND_POLL
-        };
+        // Prefer immediate cmd handling; never sleep before draining HID when hot.
+        match rx.try_recv() {
+            Ok(cmd) => {
+                in_cmd = match &cmd {
+                    HidCmd::Poll { .. } => "Poll",
+                    HidCmd::Identify { .. } => "Identify",
+                    HidCmd::PowerOff { .. } => "PowerOff",
+                    HidCmd::SetRgb { .. } => "SetRgb",
+                    HidCmd::Shutdown => "Shutdown",
+                };
+                if handle_cmd(
+                    cmd,
+                    &mut session,
+                    &mut cache,
+                    &input_snapshot,
+                    &identifying,
+                    &last_noisy_log,
+                    hot,
+                ) {
+                    break;
+                }
+                if session.is_none() {
+                    in_cmd = "none";
+                }
+                continue;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
 
-        match rx.recv_timeout(timeout) {
+        if hot || session.is_some() {
+            if let Some(s) = session.as_ref() {
+                let serial = s.serial.clone();
+                let until_flash = s
+                    .wake_at
+                    .saturating_duration_since(Instant::now())
+                    .min(IDENTIFY_SAMPLE_POLL);
+                sample_serial_into_snapshot(&mut cache, &input_snapshot, &serial, hot);
+                if !until_flash.is_zero() {
+                    thread::sleep(until_flash.min(ACTIVE_POLL));
+                }
+            } else {
+                sample_all_inputs(&mut cache, &input_snapshot, hot, &last_noisy_log, None);
+            }
+            continue;
+        }
+
+        // Idle: wait for a command (or presence-driven wake).
+        match rx.recv_timeout(BACKGROUND_POLL) {
             Ok(cmd) => {
                 in_cmd = match &cmd {
                     HidCmd::Poll { .. } => "Poll",
@@ -910,12 +977,7 @@ fn worker_loop(
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                if let Some(s) = session.as_ref() {
-                    let serial = s.serial.clone();
-                    sample_serial_into_snapshot(&mut cache, &input_snapshot, &serial, hot);
-                } else {
-                    sample_all_inputs(&mut cache, &input_snapshot, hot, &last_noisy_log, None);
-                }
+                sample_all_inputs(&mut cache, &input_snapshot, hot, &last_noisy_log, None);
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }

@@ -41,12 +41,16 @@ pub struct ToastPlacement {
 /// Show the overlay toast without activating it (so a game keeps focus).
 ///
 /// iced/`set_mode(Windowed)` maps to `ShowWindow(SW_SHOW)`, which steals the
-/// foreground. On Windows we apply `WS_EX_NOACTIVATE` and show with
-/// `SW_SHOWNOACTIVATE` instead.
+/// foreground. On Windows we apply `WS_EX_NOACTIVATE`, pin `HWND_TOPMOST`, and
+/// show with `SW_SHOWNOACTIVATE` instead.
+///
+/// Callers that have Settings / Start / popup open should then
+/// [`raise_window_topmost`] those windows so they sit above the toast in the
+/// topmost band and keep receiving presents (iced#3108 / #3320).
 pub fn show_toast_without_activate<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     #[cfg(windows)]
     {
-        window::run(id, |window| {
+        window::run(id, move |window| {
             use window::raw_window_handle::RawWindowHandle;
 
             let Ok(handle) = window.window_handle() else {
@@ -57,7 +61,7 @@ pub fn show_toast_without_activate<Message: Send + 'static>(id: window::Id) -> T
             };
             let hwnd = win32_handle.hwnd.get();
             unsafe {
-                win32::apply_noactivate_exstyle(hwnd);
+                win32::apply_noactivate_exstyle(hwnd, true);
                 win32::ShowWindow(hwnd, win32::SW_SHOWNOACTIVATE);
             }
         })
@@ -66,7 +70,96 @@ pub fn show_toast_without_activate<Message: Send + 'static>(id: window::Id) -> T
     #[cfg(not(windows))]
     {
         window::set_mode(id, window::Mode::Windowed)
+            .chain(window::set_level(id, window::Level::AlwaysOnTop))
     }
+}
+
+/// Re-assert toast topmost (e.g. after Settings / Start / popup open or close).
+pub fn set_toast_topmost<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+    #[cfg(windows)]
+    {
+        window::run(id, move |window| {
+            use window::raw_window_handle::RawWindowHandle;
+
+            let Ok(handle) = window.window_handle() else {
+                return;
+            };
+            let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
+                return;
+            };
+            let hwnd = win32_handle.hwnd.get();
+            unsafe {
+                win32::apply_noactivate_exstyle(hwnd, true);
+            }
+        })
+        .discard()
+    }
+    #[cfg(not(windows))]
+    {
+        window::set_level(id, window::Level::AlwaysOnTop)
+    }
+}
+
+/// Raise an interactive UI window to the top of the topmost band (above toast).
+pub fn raise_window_topmost<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+    #[cfg(windows)]
+    {
+        window::run(id, move |window| {
+            use window::raw_window_handle::RawWindowHandle;
+
+            let Ok(handle) = window.window_handle() else {
+                return;
+            };
+            let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
+                return;
+            };
+            let hwnd = win32_handle.hwnd.get();
+            unsafe {
+                win32::raise_topmost(hwnd);
+            }
+        })
+        .discard()
+    }
+    #[cfg(not(windows))]
+    {
+        window::set_level(id, window::Level::AlwaysOnTop)
+    }
+}
+
+/// Ask Win32 to invalidate the toast HWND so a new view can present.
+pub fn invalidate_toast<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+    #[cfg(windows)]
+    {
+        window::run(id, move |window| {
+            use window::raw_window_handle::RawWindowHandle;
+
+            let Ok(handle) = window.window_handle() else {
+                return;
+            };
+            let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
+                return;
+            };
+            let hwnd = win32_handle.hwnd.get();
+            unsafe {
+                win32::invalidate_hwnd(hwnd);
+            }
+        })
+        .discard()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = id;
+        Task::none()
+    }
+}
+
+/// Nudge toast size by ±1px so wgpu rebuilds the surface for a new message.
+pub fn remount_toast_surface<Message: Send + 'static>(
+    id: window::Id,
+    generation: u64,
+) -> Task<Message> {
+    let width = crate::toast_view::WIDTH + if generation % 2 == 0 { 0.0 } else { 1.0 };
+    window::resize(id, Size::new(width, crate::toast_view::HEIGHT))
 }
 
 /// Hide the overlay toast without going through iced `set_mode(Hidden)`.
@@ -264,7 +357,7 @@ pub fn overlay_platform_specific() -> window::settings::PlatformSpecific {
         drag_and_drop: false,
         skip_taskbar: true,
         undecorated_shadow: false,
-        corner_preference: window::settings::platform::CornerPreference::Round,
+        corner_preference: window::settings::platform::CornerPreference::DoNotRound,
     }
 }
 
@@ -281,7 +374,7 @@ pub fn window_platform_specific() -> window::settings::PlatformSpecific {
         // Match the popup: DWM undecorated shadows flash white on close when the
         // wgpu surface is destroyed before the HWND is gone.
         undecorated_shadow: false,
-        corner_preference: window::settings::platform::CornerPreference::Round,
+        corner_preference: window::settings::platform::CornerPreference::DoNotRound,
     }
 }
 

@@ -49,8 +49,9 @@ use crate::ui_sound::{self, UiSoundKind};
 #[cfg(windows)]
 use crate::win32;
 use crate::window_layout::{
-    TOAST_SLIDE_DURATION, ToastPlacement, TrayAnchor, hide_toast, overlay_platform_specific,
-    popup_position, show_toast_without_activate, slide_y, toast_placement,
+    TOAST_SLIDE_DURATION, ToastPlacement, TrayAnchor, hide_toast, invalidate_toast,
+    overlay_platform_specific, popup_position, raise_window_topmost, remount_toast_surface,
+    set_toast_topmost, show_toast_without_activate, slide_y, toast_placement,
     window_platform_specific,
 };
 
@@ -77,10 +78,11 @@ const SPECTRUM_DEBOUNCE: Duration = Duration::from_millis(150);
 const TOAST_LIFETIME: Duration = Duration::from_secs(5);
 /// Ignore 0→1 auto-open briefly after the last pad vanished (BT ghost flaps).
 const START_CONNECT_COOLDOWN: Duration = Duration::from_secs(5);
-/// DualSense poll rate while start-nav or gesture recording needs low latency.
-const PAD_POLL_ACTIVE: Duration = Duration::from_millis(16);
-/// DualSense poll rate for reopen-gesture / Pad Input / background listen.
-const PAD_POLL_BACKGROUND: Duration = Duration::from_millis(50);
+/// DualSense poll rate while pad input is live (~one wired report).
+const PAD_POLL_ACTIVE: Duration = Duration::from_millis(4);
+/// UI animation tick (~60Hz). Prefer this over `window::frames()` so an
+/// AlwaysOnTop toast cannot starve other iced windows on Windows (iced#3108).
+const UI_TICK: Duration = Duration::from_millis(16);
 /// Process/catalog running checks are expensive; never run them at pad-poll rate.
 const RUNNING_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const PAD_POLL_STALL_MS: u128 = 80;
@@ -135,6 +137,7 @@ pub enum Message {
     PlaceToast {
         id: window::Id,
         monitor: Option<Size>,
+        generation: u64,
     },
     /// Advance the active toast slide animation.
     ToastFrame,
@@ -494,12 +497,14 @@ impl App {
             ));
         }
 
-        if self.toast_animating() {
-            subscriptions.push(window::frames().map(|_| Message::ToastFrame));
+        if self.toast_message.is_some() {
+            // Tick for the whole toast lifetime so content swaps present, not only
+            // during the slide animation.
+            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::ToastFrame));
         }
 
-        if self.popup_state.identify_flash_active() {
-            subscriptions.push(window::frames().map(|_| Message::IdentifyFrame));
+        if self.popup_state.identify_flash_active() || self.start_state.identify_flash_active() {
+            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::IdentifyFrame));
         }
 
         let pad_input_live =
@@ -507,19 +512,14 @@ impl App {
         let pad_listening = pad_input_live
             || (self.prefs.start_screen_enabled
                 && (!self.controllers.is_empty() || self.gesture_recorder.is_active()));
-        let pad_hot = self.pad_input_hot();
-        self.hid_worker.set_input_hot(pad_hot);
+        // Fast path whenever we are listening — reopen gesture needs the same cadence.
+        self.hid_worker.set_input_hot(pad_listening);
         if pad_listening {
-            let interval = if pad_hot {
-                PAD_POLL_ACTIVE
-            } else {
-                PAD_POLL_BACKGROUND
-            };
-            subscriptions.push(iced::time::every(interval).map(|_| Message::PadPoll));
+            subscriptions.push(iced::time::every(PAD_POLL_ACTIVE).map(|_| Message::PadPoll));
         }
 
         if self.start_window.is_some() && self.start_state.needs_frames() {
-            subscriptions.push(window::frames().map(|_| Message::StartFrame));
+            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::StartFrame));
         }
 
         Subscription::batch(subscriptions)
@@ -548,9 +548,11 @@ impl App {
 
         if Some(window) == self.toast_window {
             return match self.toast_message.as_ref() {
-                Some(message) => {
-                    toast_view::view(message, Message::ToastDismiss(self.toast_generation))
-                }
+                Some(message) => toast_view::view(
+                    message,
+                    self.toast_generation,
+                    Message::ToastDismiss(self.toast_generation),
+                ),
                 None => toast_view::empty(),
             };
         }
@@ -578,17 +580,17 @@ impl App {
                 if Some(id) == self.popup_window {
                     self.popup_window = None;
                     self.popup_state.cancel();
-                    Task::none()
+                    self.sync_toast_zorder()
                 } else if Some(id) == self.configure_window {
                     self.configure_window = None;
                     self.cancel_gesture_recording();
-                    Task::none()
+                    self.sync_toast_zorder()
                 } else if Some(id) == self.start_window {
                     self.start_window = None;
                     self.start_nav_ready = false;
                     self.pad_nav.reset();
                     self.clear_start_nav_diag();
-                    Task::none()
+                    self.sync_toast_zorder()
                 } else if Some(id) == self.toast_window {
                     self.toast_window = None;
                     // Recreate so iced keeps a warm compositor for popup/Settings.
@@ -713,17 +715,50 @@ impl App {
             Message::ManualIconPicked(path) => self.on_manual_icon_picked(path),
             Message::SteamScanDone(result) => self.on_steam_scan_done(result),
 
-            Message::PlaceToast { id, monitor } => {
+            Message::PlaceToast {
+                id,
+                monitor,
+                generation,
+            } => {
+                if generation != self.toast_generation || self.toast_message.is_none() {
+                    return Task::none();
+                }
                 let placement = toast_placement(self.prefs.toast_position, monitor);
                 self.toast_placement = Some(placement);
                 self.toast_anim_started = Instant::now();
                 self.toast_dismissing = false;
                 let start = Point::new(placement.x, placement.outside_y);
-                window::move_to(id, start).chain(show_toast_without_activate(id))
+                let percent = self.toast_message.as_ref().map(|m| m.percent).unwrap_or(0);
+                crate::hid_diag::diag_info(format!(
+                    "ui-diag: place toast gen={generation} percent={percent}"
+                ));
+                // Remount surface for this message, show toast on top, focus UI
+                // underneath so Settings/Start still present (iced#3320).
+                remount_toast_surface(id, generation)
+                    .chain(window::move_to(id, start))
+                    .chain(window::set_level(id, window::Level::AlwaysOnTop))
+                    .chain(show_toast_without_activate(id))
+                    .chain(invalidate_toast(id))
+                    .chain(self.refocus_interactive_ui())
+                    .chain(raise_window_topmost(id))
             }
-            Message::ToastFrame => self.animate_toast(),
+            Message::ToastFrame => {
+                let anim = if self.toast_animating() {
+                    self.animate_toast()
+                } else {
+                    Task::none()
+                };
+                // Keep toast at the top of the topmost band (above Start) without
+                // burying it under UI every tick.
+                let pin = match self.toast_window {
+                    Some(id) if self.toast_message.is_some() => raise_window_topmost(id),
+                    _ => Task::none(),
+                };
+                anim.chain(pin)
+            }
             Message::IdentifyFrame => {
                 self.popup_state.tick_identify_flash();
+                self.start_state.tick_identify_flash();
                 Task::none()
             }
             Message::ToastDismiss(generation) => {
@@ -987,9 +1022,9 @@ impl App {
 
     /// Rebuild popup rows and, when the flyout is open, resize/re-anchor if height changed.
     fn sync_popup_rows_and_fit(&mut self) -> Task<Message> {
-        let before = popup_view::window_height(self.popup_rows.len());
+        let before = self.popup_window_height();
         self.sync_popup_rows();
-        let after = popup_view::window_height(self.popup_rows.len());
+        let after = self.popup_window_height();
         if before == after {
             Task::none()
         } else {
@@ -997,11 +1032,15 @@ impl App {
         }
     }
 
+    fn popup_window_height(&self) -> f32 {
+        popup_view::window_height(self.popup_rows.len(), self.popup_monitor.map(|m| m.height))
+    }
+
     fn fit_popup_window(&self) -> Task<Message> {
         let Some(id) = self.popup_window else {
             return Task::none();
         };
-        let height = popup_view::window_height(self.popup_rows.len());
+        let height = self.popup_window_height();
         let size = Size::new(popup_view::WIDTH, height);
         let position = popup_position(self.tray_anchor, self.popup_scale, self.popup_monitor, size);
         window::resize(id, size).chain(window::move_to(id, position))
@@ -1021,7 +1060,7 @@ impl App {
         }
 
         self.popup_state.cancel();
-        let height = popup_view::window_height(self.popup_rows.len());
+        let height = self.popup_window_height();
         let (id, open) = window::open(window::Settings {
             size: Size::new(popup_view::WIDTH, height),
             position: window::Position::Default,
@@ -1036,10 +1075,11 @@ impl App {
 
         self.popup_window = Some(id);
         open.map(Message::PopupOpened)
+            .chain(self.sync_toast_zorder())
     }
 
     fn reveal_popup(&self, id: window::Id) -> Task<Message> {
-        let height = popup_view::window_height(self.popup_rows.len());
+        let height = self.popup_window_height();
         let size = Size::new(popup_view::WIDTH, height);
         let position = popup_position(self.tray_anchor, self.popup_scale, self.popup_monitor, size);
         window::resize(id, size)
@@ -1068,6 +1108,7 @@ impl App {
             PopupMessage::Identify(serial) => {
                 if self.identify(&serial) {
                     self.popup_state.begin_identify_flash(&serial);
+                    self.start_state.begin_identify_flash(&serial);
                 }
                 Task::none()
             }
@@ -1195,6 +1236,9 @@ impl App {
             position: window::Position::Centered,
             resizable: false,
             decorations: false,
+            // AlwaysOnTop like Start: a Normal Settings window loses presents to the
+            // toast on Windows even when the toast is demoted (iced#3320).
+            level: window::Level::AlwaysOnTop,
             exit_on_close_request: true,
             platform_specific: window_platform_specific(),
             ..window::Settings::default()
@@ -1202,6 +1246,7 @@ impl App {
 
         self.configure_window = Some(id);
         open.map(Message::ConfigureOpened)
+            .chain(self.sync_toast_zorder())
     }
 
     fn on_configure_message(&mut self, message: ConfigureMessage) -> Task<Message> {
@@ -1342,6 +1387,10 @@ impl App {
             }
             ConfigureMessage::RemoveStop => {
                 let next = self.configure_state.remove_selected();
+                self.apply_spectrum_maybe(next)
+            }
+            ConfigureMessage::RemoveStopAt(index) => {
+                let next = self.configure_state.remove_at(index);
                 self.apply_spectrum_maybe(next)
             }
             ConfigureMessage::HueChanged(hue) => {
@@ -1866,6 +1915,20 @@ impl App {
         self.start_state.running_target = None;
     }
 
+    /// Hold-Cross close: only when the selected row is the running game.
+    fn close_running_game_if_selected(&mut self) {
+        let Some(session) = self.running_session.as_ref() else {
+            return;
+        };
+        let Some(row) = self.start_state.rows.get(self.start_state.game_selected) else {
+            return;
+        };
+        if !session.matches_target(&row.target) {
+            return;
+        }
+        self.close_running_game();
+    }
+
     fn refresh_steam_library(&self) -> Task<Message> {
         Task::perform(
             spawn_blocking(steam::list_installed_games),
@@ -1962,9 +2025,14 @@ impl App {
         self.gesture_record_latch.clear();
     }
 
-    /// True when HID/UI input sampling should run at the active (~60 Hz) rate.
+    /// True when HID/UI input sampling should run at the active (~report-rate) rate.
+    #[allow(dead_code)] // kept for callers / diagnostics that still want the hot predicate
     fn pad_input_hot(&self) -> bool {
-        self.start_window.is_some() || self.gesture_recorder.is_active()
+        self.start_window.is_some()
+            || self.gesture_recorder.is_active()
+            || (self.configure_window.is_some()
+                && self.configure_state.section == Section::PadInput)
+            || (self.prefs.start_screen_enabled && !self.controllers.is_empty())
     }
 
     fn open_start_screen(&mut self) -> Task<Message> {
@@ -2007,7 +2075,11 @@ impl App {
             ..window::Settings::default()
         });
         self.start_window = Some(id);
-        Task::batch([badge, open.map(Message::StartOpened)])
+        Task::batch([
+            badge,
+            open.map(Message::StartOpened),
+            self.sync_toast_zorder(),
+        ])
     }
 
     /// Reset to Games and (optionally) require a full control release before nav fires.
@@ -2467,6 +2539,8 @@ impl App {
                 if let Some(row) = self.start_state.selected_controller() {
                     let serial = row.serial.clone();
                     if self.identify(&serial) {
+                        self.popup_state.begin_identify_flash(&serial);
+                        self.start_state.begin_identify_flash(&serial);
                         self.play_start_sound(UiSoundKind::Action);
                     }
                 }
@@ -2668,12 +2742,25 @@ impl App {
         let replace_confirm = self.start_state.replace_confirm.is_some();
         let manual_add = self.start_state.manual_add.is_some();
         let allow_nav_move = !animating && !replace_confirm && !manual_add;
+        let editing = self.start_state.editing;
+        let hold_cross_close = !editing
+            && !replace_confirm
+            && !manual_add
+            && !animating
+            && matches!(self.start_state.slide, StartSlide::Games);
+        let hold_triangle_power = !editing
+            && !replace_confirm
+            && !manual_add
+            && !animating
+            && matches!(self.start_state.slide, StartSlide::Controllers);
         let tick = self.pad_nav.tick(
             readings,
             now,
             allow_nav_move,
             replace_confirm && !animating,
-            self.start_state.editing,
+            editing,
+            hold_cross_close,
+            hold_triangle_power,
         );
         if let Some(diag) = &tick.diag {
             self.log_start_nav_diag(diag, readings.len());
@@ -2748,32 +2835,39 @@ impl App {
                 Task::none()
             }
         } else {
-            self.start_state.cross_progress = 0.0;
             self.keyboard_cross_hold.reset();
 
-            if self.start_state.editing {
-                self.start_state.triangle_progress = 0.0;
+            if hold_cross_close {
+                self.start_state.cross_progress = tick.cross_progress;
+                if tick.cross_completed {
+                    self.play_start_sound(UiSoundKind::Hold);
+                    self.close_running_game_if_selected();
+                }
             } else {
+                self.start_state.cross_progress = 0.0;
+            }
+
+            if hold_triangle_power {
                 self.start_state.triangle_progress = tick.triangle_progress;
                 if tick.triangle_completed {
                     self.play_start_sound(UiSoundKind::Hold);
-                    match self.start_state.slide {
-                        StartSlide::Games => self.close_running_game(),
-                        StartSlide::Controllers => {
-                            if let Some(row) = self.start_state.selected_controller()
-                                && row.bluetooth
-                            {
-                                let serial = row.serial.clone();
-                                self.power_off(&serial);
-                            }
-                        }
+                    if let Some(row) = self.start_state.selected_controller()
+                        && row.bluetooth
+                    {
+                        let serial = row.serial.clone();
+                        self.power_off(&serial);
                     }
                 }
+            } else {
+                self.start_state.triangle_progress = 0.0;
             }
 
             self.start_state.tick_hint_anims(now);
 
-            if let Some(action) = tick.action {
+            if tick.cross_completed && hold_cross_close {
+                // Hold-close already handled; do not also Confirm/Launch.
+                Task::none()
+            } else if let Some(action) = tick.action {
                 match action {
                     NavAction::Up => self.on_start_message(StartMessage::MoveUp),
                     NavAction::Down => self.on_start_message(StartMessage::MoveDown),
@@ -2927,6 +3021,12 @@ impl App {
             return Task::none();
         };
 
+        crate::hid_diag::diag_info(format!(
+            "ui-diag: toast show heading={:?} percent={} queue_left={}",
+            message.heading,
+            message.percent,
+            self.toast_queue.len()
+        ));
         self.toast_message = Some(message);
         self.toast_generation = self.toast_generation.wrapping_add(1);
         let generation = self.toast_generation;
@@ -2936,11 +3036,12 @@ impl App {
         });
 
         if let Some(id) = self.toast_window {
-            return place_toast(id).chain(expire);
+            return place_toast(id, generation).chain(expire);
         }
 
         let (_id, open) = self.create_toast_window();
-        open.then(place_toast).chain(expire)
+        open.then(move |id| place_toast(id, generation))
+            .chain(expire)
     }
 
     fn dismiss_toast(&mut self) -> Task<Message> {
@@ -2982,19 +3083,57 @@ impl App {
         self.toast_placement = None;
         self.toast_dismissing = false;
 
+        // Stay visible across handoff so the next message can remount/present on
+        // the same HWND (closing/recreating dropped the follow-up toast).
+        if !self.toast_queue.is_empty() {
+            crate::hid_diag::diag_info(format!(
+                "ui-diag: toast handoff remount queue={}",
+                self.toast_queue.len()
+            ));
+            return self.show_next_toast();
+        }
+
         // Keep the window alive but hidden: it doubles as the GPU compositor
         // sentinel so popup/Settings can open without a cold wgpu init.
-        let hide = match self.toast_window {
+        match self.toast_window {
             Some(id) => hide_toast(id),
             None => Task::none(),
-        };
-        hide.chain(self.show_next_toast())
+        }
     }
 
     fn toast_animating(&self) -> bool {
         self.toast_message.is_some()
             && self.toast_placement.is_some()
             && (self.toast_dismissing || self.toast_anim_started.elapsed() < TOAST_SLIDE_DURATION)
+    }
+
+    /// Prefer Settings, then Start, then popup as the focused presenting window.
+    fn refocus_interactive_ui(&self) -> Task<Message> {
+        if let Some(id) = self.configure_window {
+            return window::gain_focus(id);
+        }
+        if let Some(id) = self.start_window {
+            return window::gain_focus(id);
+        }
+        if let Some(id) = self.popup_window {
+            return window::gain_focus(id);
+        }
+        Task::none()
+    }
+
+    /// Re-assert toast topmost (above Start/Settings) after UI open/close.
+    fn sync_toast_zorder(&self) -> Task<Message> {
+        let Some(id) = self.toast_window else {
+            return Task::none();
+        };
+        if self.toast_message.is_none() {
+            return Task::none();
+        }
+        crate::hid_diag::diag_info("ui-diag: sync toast z-order (toast on top)");
+        window::set_level(id, window::Level::AlwaysOnTop)
+            .chain(set_toast_topmost(id))
+            .chain(self.refocus_interactive_ui())
+            .chain(raise_window_topmost(id))
     }
 }
 
@@ -3008,8 +3147,12 @@ fn place_popup(id: window::Id) -> Task<Message> {
     })
 }
 
-fn place_toast(id: window::Id) -> Task<Message> {
-    window::monitor_size(id).map(move |monitor| Message::PlaceToast { id, monitor })
+fn place_toast(id: window::Id, generation: u64) -> Task<Message> {
+    window::monitor_size(id).map(move |monitor| Message::PlaceToast {
+        id,
+        monitor,
+        generation,
+    })
 }
 
 /// Map tray events into iced `Message` values.

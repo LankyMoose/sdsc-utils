@@ -41,6 +41,8 @@ pub fn init() {
         }
     }
 
+    install_panic_hook();
+
     let session_id = epoch_ms() as u64;
     SESSION_ID.store(session_id, Ordering::Relaxed);
     if let Ok(mut guard) = SESSION_STARTED.lock() {
@@ -52,6 +54,46 @@ pub fn init() {
     ));
     #[cfg(debug_assertions)]
     hid_trace(format!("session start id={session_id}"));
+}
+
+/// Log panics to `app.log` (and stderr when available). Needed because
+/// `windows_subsystem = "windows"` discards the default stderr panic output.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Box<dyn Any>".to_string()
+        };
+        let line = format!("PANIC at {location}: {payload}");
+        // Prefer a direct append so a poisoned logger mutex cannot hide the panic.
+        append_panic_line(&line);
+        let _ = writeln!(std::io::stderr(), "{line}");
+        previous(info);
+    }));
+}
+
+fn append_panic_line(message: &str) {
+    let line = format!("[{}] ERROR: {message}\n", epoch_secs());
+    let path = LOG_PATH
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(|| log_file_path("app.log"));
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = file.write_all(line.as_bytes());
+        let _ = file.flush();
+    }
 }
 
 /// Stable id for this process run (epoch ms at init). Appears in both log files.

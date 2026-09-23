@@ -1,7 +1,7 @@
 //! Tray-anchored controller overview, rendered by the iced daemon.
 
 use crate::battery::ControllerStatus;
-use crate::color::{BatterySpectrum, Rgb};
+use crate::color::BatterySpectrum;
 use crate::known::KnownController;
 use crate::lightbar;
 use crate::percent_ring::{self, POPUP_SIZE};
@@ -16,13 +16,19 @@ use std::time::{Duration, Instant};
 
 /// Logical width of the popup window.
 pub const WIDTH: f32 = 380.0;
-/// Maximum number of rows shown before the list scrolls.
-pub const MAX_VISIBLE_ROWS: usize = 6;
+/// Popup grows with row count until this fraction of the monitor height.
+const MAX_HEIGHT_FRACTION: f32 = 0.5;
+/// Fallback monitor height when iced has not reported one yet.
+const FALLBACK_MONITOR_HEIGHT: f32 = 1080.0;
 
 const HEADER_HEIGHT: f32 = 38.0;
 const ROW_HEIGHT: f32 = 88.0;
-const ROW_SPACING: f32 = 6.0;
+const ROW_SPACING: f32 = theme::LIST_SEPARATOR_GAP;
 const PADDING: f32 = 10.0;
+/// Gap between the title underline and the list (matches Start’s chrome rhythm).
+const HEADER_BODY_GAP: f32 = 8.0;
+/// Gap between list content and the embedded scrollbar.
+const SCROLL_GAP: f32 = 8.0;
 const EMPTY_HEIGHT: f32 = 56.0;
 const ICON_SIZE: f32 = 18.0;
 const NICKNAME_MAX_CHARS: usize = 32;
@@ -209,15 +215,28 @@ pub enum PopupMessage {
     CancelEdit,
 }
 
-/// Height the popup window should be given for `rows` entries.
-pub fn window_height(rows: usize) -> f32 {
-    let visible = rows.min(MAX_VISIBLE_ROWS);
-    let list = if visible == 0 {
+/// Non-list chrome: frame + padding + header + underline + gap before the list.
+fn chrome_height() -> f32 {
+    theme::WINDOW_FRAME * 2.0 + PADDING * 2.0 + HEADER_HEIGHT + 1.0 + HEADER_BODY_GAP
+}
+
+fn list_content_height(rows: usize) -> f32 {
+    if rows == 0 {
         EMPTY_HEIGHT
     } else {
-        visible as f32 * ROW_HEIGHT + (visible.saturating_sub(1) as f32) * ROW_SPACING
-    };
-    HEADER_HEIGHT + list + PADDING * 2.0
+        rows as f32 * ROW_HEIGHT + rows.saturating_sub(1) as f32 * ROW_SPACING
+    }
+}
+
+/// Height the popup window should be given for `rows` entries (capped at 50vh).
+pub fn window_height(rows: usize, monitor_height: Option<f32>) -> f32 {
+    let monitor_h = monitor_height
+        .filter(|h| *h > 0.0)
+        .unwrap_or(FALLBACK_MONITOR_HEIGHT);
+    let chrome = chrome_height();
+    let natural = chrome + list_content_height(rows);
+    let max_h = (monitor_h * MAX_HEIGHT_FRACTION).max(chrome + ROW_HEIGHT);
+    natural.min(max_h)
 }
 
 pub fn view<'a>(
@@ -236,7 +255,8 @@ pub fn view<'a>(
     ]
     .align_y(Alignment::Center)
     .spacing(6)
-    .padding([0, 2]);
+    .padding([0, 2])
+    .height(Length::Fixed(HEADER_HEIGHT));
 
     let body: Element<'_, PopupMessage> = if rows.is_empty() {
         container(
@@ -250,20 +270,44 @@ pub fn view<'a>(
     } else {
         let list = rows
             .iter()
-            .fold(Column::new().spacing(ROW_SPACING), |list, entry| {
+            .enumerate()
+            .fold(Column::new().spacing(0), |list, (index, entry)| {
+                let list = if index > 0 {
+                    list.push(theme::list_separator())
+                } else {
+                    list
+                };
                 list.push(controller_row(state, entry, spectrum))
             })
             .width(Fill);
 
-        scrollable(list).height(Fill).into()
+        // Embed scrollbar with a gutter so row actions are not flush to the thumb.
+        // Outer column padding keeps the bar off the window frame.
+        scrollable(list)
+            .spacing(SCROLL_GAP)
+            .height(Fill)
+            .width(Fill)
+            .into()
     };
 
-    container(column![header, body].spacing(8).width(Fill).height(Fill))
-        .padding(PADDING)
-        .width(Fill)
-        .height(Fill)
-        .style(theme::root)
-        .into()
+    // Match Start: 1px LINE frame, title, underline, then content.
+    let chrome = column![
+        header,
+        container(space())
+            .width(Fill)
+            .height(Length::Fixed(1.0))
+            .style(theme::configure_header_rule),
+    ]
+    .spacing(0)
+    .width(Fill);
+
+    theme::framed(
+        column![chrome, body]
+            .spacing(HEADER_BODY_GAP)
+            .padding(PADDING)
+            .width(Fill)
+            .height(Fill),
+    )
 }
 
 fn controller_row<'a>(
@@ -273,7 +317,7 @@ fn controller_row<'a>(
 ) -> Element<'a, PopupMessage> {
     let accent = theme::from_rgb(spectrum.color_at_percent(entry.percent));
     let ring_color = if state.ring_flash_white(&entry.serial) {
-        theme::from_rgb(Rgb::WHITE)
+        theme::from_rgb(lightbar::IDENTIFY_FLASH)
     } else if entry.connected {
         accent
     } else {
@@ -384,7 +428,7 @@ fn controller_row<'a>(
     .padding([8, 10])
     .width(Fill)
     .height(Length::Fixed(ROW_HEIGHT))
-    .style(theme::surface)
+    .style(theme::popup_row)
     .into()
 }
 

@@ -53,6 +53,8 @@ const WRITE_RETRY_DELAY: Duration = Duration::from_millis(75);
 pub const IDENTIFY_FLASH_MS: u64 = 125;
 /// Full white→color cycles. Total Identify ≈ `COUNT * 2 * FLASH_MS` = 1s.
 pub const IDENTIFY_FLASH_COUNT: u32 = 4;
+/// Soft off-white for Identify flashes (UI rings + lightbar) — less harsh than pure white.
+pub const IDENTIFY_FLASH: Rgb = Rgb::new(210, 212, 220);
 
 /// Whether the identify sequence should show white at `now`.
 ///

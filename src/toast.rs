@@ -76,13 +76,27 @@ mod tests {
     }
 
     #[test]
-    fn preview_has_stable_copy() {
-        let spectrum = BatterySpectrum::default();
-        let message = ToastMessage::preview(&spectrum);
-        assert_eq!(message.percent, 70);
-        assert_eq!(message.accent, spectrum.color_at_percent(70));
-        assert!(!message.heading.is_empty());
-        assert!(!message.body.is_empty());
-        assert_eq!(message.eta.as_deref(), Some("~3h 30m"));
+    fn queued_connects_keep_distinct_percents() {
+        let mut tracker = NotifyTracker::new();
+        let connected = vec![
+            pad("a", 40),
+            ControllerStatus {
+                index: 2,
+                product: "DualSense",
+                connection: "Bluetooth",
+                serial: "b".to_string(),
+                percent: 85,
+                state: PowerState::Discharging,
+            },
+        ];
+        let events = tracker.evaluate(&[], &connected, &Prefs::default(), |_| None);
+        assert_eq!(events.len(), 2);
+        let messages: Vec<_> = events
+            .into_iter()
+            .map(|event| ToastMessage::from_notification(event, BatterySpectrum::default(), None))
+            .collect();
+        assert_eq!(messages[0].percent, 40);
+        assert_eq!(messages[1].percent, 85);
+        assert_ne!(messages[0].heading, messages[1].heading);
     }
 }

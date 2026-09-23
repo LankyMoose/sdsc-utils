@@ -17,6 +17,7 @@ impl Rgb {
         Self { r, g, b }
     }
 
+    #[allow(dead_code)] // used by unit tests
     pub const WHITE: Self = Self::new(255, 255, 255);
     pub const ORANGE: Self = Self::new(255, 100, 0);
 
@@ -89,8 +90,8 @@ impl BatterySpectrum {
     pub fn default_spectrum() -> Self {
         Self {
             stops: vec![
-                GradientStop::new(100, Rgb::new(0x01, 0x01, 0xFE)),
-                GradientStop::new(50, Rgb::new(0x87, 0x04, 0xFF)),
+                GradientStop::new(100, Rgb::new(0x25, 0x25, 0xEB)),
+                GradientStop::new(50, Rgb::new(0x89, 0x10, 0xE1)),
                 GradientStop::new(0, Rgb::new(0xFF, 0x01, 0x01)),
             ],
         }
@@ -99,13 +100,6 @@ impl BatterySpectrum {
     pub fn from_stops(mut stops: Vec<GradientStop>) -> Result<Self, String> {
         normalize_stops(&mut stops)?;
         Ok(Self { stops })
-    }
-
-    pub fn accent(&self) -> Rgb {
-        self.stops
-            .first()
-            .map(|stop| stop.color)
-            .unwrap_or(Rgb::new(0x01, 0x01, 0xFE))
     }
 
     pub fn color_at_percent(&self, percent: u8) -> Rgb {
@@ -387,8 +381,8 @@ mod tests {
     #[test]
     fn default_stops_match_expected_hex() {
         let s = BatterySpectrum::default_spectrum();
-        assert_eq!(s.color_at_percent(100), Rgb::new(0x01, 0x01, 0xFE));
-        assert_eq!(s.color_at_percent(50), Rgb::new(0x87, 0x04, 0xFF));
+        assert_eq!(s.color_at_percent(100), Rgb::new(0x25, 0x25, 0xEB));
+        assert_eq!(s.color_at_percent(50), Rgb::new(0x89, 0x10, 0xE1));
         assert_eq!(s.color_at_percent(0), Rgb::new(0xFF, 0x01, 0x01));
     }
 
@@ -420,8 +414,8 @@ mod tests {
     fn lerp_midpoint_between_full_and_mid() {
         let s = BatterySpectrum::default_spectrum();
         let c = s.color_at_percent(75);
-        // Halfway from #0101FE to #8704FF
-        assert_eq!(c, Rgb::new(68, 3, 255));
+        // Halfway from #2525EB to #8910E1
+        assert_eq!(c, Rgb::new(87, 27, 230));
     }
 
     #[test]

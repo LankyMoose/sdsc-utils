@@ -11,15 +11,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Per-axis deadzone applied to each stick before combining (kills rest bias).
-const STICK_AXIS_DEADZONE: f32 = 0.25;
+const STICK_AXIS_DEADZONE: f32 = 0.9;
 /// Residual deadzone on the combined vector after per-stick cleaning.
 const STICK_COMBINED_DEADZONE: f32 = 0.15;
 const TRIGGER_ANALOG_THRESHOLD: u8 = 30;
 const STICK_CENTER: f32 = 128.0;
 const NAV_INITIAL_DELAY: Duration = Duration::from_millis(280);
 const NAV_REPEAT: Duration = Duration::from_millis(90);
-/// Worker input read budget (UI must never call this path).
-pub const INPUT_READ_TIMEOUT_MS: i32 = 15;
+/// One wired DualSense report interval (`bInterval` 4). Block this long when the queue is empty.
+pub const INPUT_REPORT_WAIT_MS: i32 = 4;
+/// Cap on non-blocking drains per wake (32 = default Windows HID buffer depth).
+const INPUT_DRAIN_CAP: usize = 32;
 
 const USB_REPORT_SIZE: usize = 64;
 const BT_REPORT_SIZE: usize = 78;
@@ -312,15 +314,18 @@ impl EdgeButton {
 
     const PRESS_FIRE: [Self; 2] = [Self::L2, Self::R2];
 
-    fn action(self) -> NavAction {
+    fn action(self) -> Option<NavAction> {
         match self {
-            Self::Cross => NavAction::Confirm,
-            Self::Circle => NavAction::Cancel,
-            Self::Square => NavAction::ToggleEdit,
-            Self::Triangle => NavAction::Triangle,
-            Self::Options => NavAction::CycleSort,
-            Self::L2 => NavAction::PrevSlide,
-            Self::R2 => NavAction::NextSlide,
+            Self::Cross => Some(NavAction::Confirm),
+            Self::Circle => Some(NavAction::Cancel),
+            // Browse: sort. Edit: remapped to EditManual in PadNavBank.
+            Self::Square => Some(NavAction::CycleSort),
+            // Browse: enter edit. Edit: save (ToggleEdit commits).
+            Self::Triangle => Some(NavAction::ToggleEdit),
+            // Options no longer drives start-screen actions (Square sorts).
+            Self::Options => None,
+            Self::L2 => Some(NavAction::PrevSlide),
+            Self::R2 => Some(NavAction::NextSlide),
         }
     }
 
@@ -421,7 +426,7 @@ impl ButtonEdges {
             let now = b.held(sample);
             let was = self.prev_held(b);
             if now && !was && action.is_none() {
-                action = Some(b.action());
+                action = b.action();
             }
         }
         for &b in &EdgeButton::RELEASE_FIRE {
@@ -431,7 +436,7 @@ impl ButtonEdges {
                 let cancelled = self.cancelled(b);
                 self.set_cancelled(b, false);
                 if !cancelled && Some(b) != hold_owned && action.is_none() {
-                    action = Some(b.action());
+                    action = b.action();
                 }
             }
         }
@@ -569,9 +574,10 @@ impl HoldTracker {
 pub type TriangleHold = HoldTracker;
 pub type CrossHold = HoldTracker;
 
-/// True when face buttons, triggers, D-pad, and stick are at rest (safe to arm start nav).
+/// True when face/system buttons, triggers, D-pad, and stick are at rest (safe to arm start nav).
 pub fn sample_nav_resting(sample: &PadSample) -> bool {
-    !sample.cross
+    sample.held.is_empty()
+        && !sample.cross
         && !sample.circle
         && !sample.square
         && !sample.triangle
@@ -664,7 +670,6 @@ pub enum SampleFail {
     Io,
     Truncated,
     BadReport,
-    Empty,
     Feature,
 }
 
@@ -675,7 +680,6 @@ impl SampleFail {
             Self::Io => "io",
             Self::Truncated => "truncated",
             Self::BadReport => "bad_report",
-            Self::Empty => "empty",
             Self::Feature => "feature",
         }
     }
@@ -685,7 +689,10 @@ impl SampleFail {
 #[derive(Debug)]
 pub enum ShortSampleOutcome {
     Ok(PadSample),
-    #[allow(dead_code)] // retained for callers / future diag
+    /// No new report this wake — keep the open handle and the previous snapshot reading.
+    Timeout,
+    /// Hard failure — drop the handle (I/O / bad report / feature).
+    #[allow(dead_code)] // matched by hid_worker; field read for logging there
     Fail(SampleFail),
 }
 
@@ -705,10 +712,165 @@ fn sample_summary(sample: &PadSample) -> String {
     )
 }
 
-/// Short DualSense input read for hid-worker (never call from the UI thread).
+/// Merge a drained batch: newest sticks, OR digital buttons / triggers / D-pad.
 ///
-/// At most 2 attempts, `read_timeout` 15ms. Truncated BT: one feature request + one retry.
-/// Traces every attempt; `input_hot` only changes success-line cadence (caller passes it).
+/// Latches a tap that went down and up inside one wake so the next wake can see the release.
+pub fn merge_nav_samples(batch: &[PadSample]) -> Option<PadSample> {
+    let last = batch.last()?.clone();
+    let mut out = last.clone();
+    for s in batch {
+        out.cross |= s.cross;
+        out.circle |= s.circle;
+        out.square |= s.square;
+        out.triangle |= s.triangle;
+        out.options |= s.options;
+        out.l2 |= s.l2;
+        out.r2 |= s.r2;
+        out.dpad_up |= s.dpad_up;
+        out.dpad_down |= s.dpad_down;
+        out.held = out.held.union(&s.held).copied().collect();
+    }
+    out.stick_y = last.stick_y;
+    Some(out)
+}
+
+fn latch_diag(batch: &[PadSample], merged: &PadSample) {
+    let Some(last) = batch.last() else {
+        return;
+    };
+    let latched = (merged.cross && !last.cross)
+        || (merged.circle && !last.circle)
+        || (merged.square && !last.square)
+        || (merged.triangle && !last.triangle)
+        || (merged.options && !last.options)
+        || (merged.l2 && !last.l2)
+        || (merged.r2 && !last.r2);
+    if latched {
+        crate::hid_diag::diag_info(format!(
+            "hid-diag: drain latched buttons n={} cross={} circle={} square={} triangle={}",
+            batch.len(),
+            u8::from(merged.cross && !last.cross),
+            u8::from(merged.circle && !last.circle),
+            u8::from(merged.square && !last.square),
+            u8::from(merged.triangle && !last.triangle),
+        ));
+    }
+}
+
+/// One DualSense report read (optional block). Used by the drain loop.
+fn read_one_report(
+    device: &HidDevice,
+    is_bluetooth: bool,
+    serial: &str,
+    bus: &str,
+    report_size: usize,
+    timeout_ms: i32,
+    requested_full: &mut bool,
+    started: Instant,
+) -> Result<Option<PadSample>, SampleFail> {
+    let mut buf = vec![0u8; report_size];
+    let n = {
+        let _op = crate::hid_diag::enter_op("read_timeout");
+        match device.read_timeout(&mut buf, timeout_ms) {
+            Ok(n) => n,
+            Err(err) => {
+                drop(_op);
+                let fail = if err.to_string().to_lowercase().contains("timeout") {
+                    SampleFail::Timeout
+                } else {
+                    SampleFail::Io
+                };
+                if fail == SampleFail::Timeout && timeout_ms == 0 {
+                    return Ok(None);
+                }
+                if fail == SampleFail::Timeout {
+                    crate::hid_diag::diag_info(format!(
+                        "hid-diag: sample timeout keep_handle serial={serial} bus={bus}"
+                    ));
+                    return Err(SampleFail::Timeout);
+                }
+                crate::hid_diag::trace_read(
+                    "sample",
+                    serial,
+                    bus,
+                    started.elapsed().as_millis(),
+                    &format!("fail={} err={err}", fail.as_str()),
+                    false,
+                );
+                return Err(fail);
+            }
+        }
+    };
+    if n == 0 {
+        return Ok(None);
+    }
+
+    if is_bluetooth && buf[0] == BT_REPORT_TRUNCATED {
+        if !*requested_full {
+            let mut feature = vec![0u8; CALIBRATION_FEATURE_SIZE];
+            feature[0] = CALIBRATION_FEATURE_REPORT;
+            let feature_result = {
+                let _op = crate::hid_diag::enter_op("get_feature_report");
+                device.get_feature_report(&mut feature)
+            };
+            match feature_result {
+                Ok(_) => {
+                    *requested_full = true;
+                    return Ok(None);
+                }
+                Err(err) => {
+                    crate::hid_diag::trace_read(
+                        "sample",
+                        serial,
+                        bus,
+                        started.elapsed().as_millis(),
+                        &format!("fail=feature err={err}"),
+                        false,
+                    );
+                    return Err(SampleFail::Feature);
+                }
+            }
+        }
+        crate::hid_diag::trace_read(
+            "sample",
+            serial,
+            bus,
+            started.elapsed().as_millis(),
+            "fail=truncated",
+            false,
+        );
+        return Err(SampleFail::Truncated);
+    }
+
+    let expected = if is_bluetooth {
+        BT_REPORT_FULL
+    } else {
+        USB_REPORT_ID
+    };
+    if buf[0] != expected {
+        crate::hid_diag::trace_read(
+            "sample",
+            serial,
+            bus,
+            started.elapsed().as_millis(),
+            &format!("fail=bad_report id=0x{:02x} n={n}", buf[0]),
+            false,
+        );
+        return Err(SampleFail::BadReport);
+    }
+
+    let base = if is_bluetooth { 1 } else { 0 };
+    Ok(Some(parse_report(&buf, base)))
+}
+
+/// Drain queued DualSense reports, wait one report interval, then drain again.
+///
+/// Newest sticks win; digital buttons are OR'd across the batch so a tap that
+/// released inside the drain still appears held for one snapshot. The blocking
+/// wait runs even after a non-empty zero-timeout drain so the hot path paces to
+/// the pad's report clock instead of busy-spinning.
+///
+/// Never call from the UI thread. Truncated BT: one feature request (one-time) + retry.
 pub fn read_device_sample_short(
     device: &HidDevice,
     is_bluetooth: bool,
@@ -723,132 +885,78 @@ pub fn read_device_sample_short(
     };
     let mut requested_full = false;
     let started = Instant::now();
+    let mut batch: Vec<PadSample> = Vec::new();
 
-    for attempt in 0..2 {
-        let mut buf = vec![0u8; report_size];
-        let n = {
-            let _op = crate::hid_diag::enter_op("read_timeout");
-            match device.read_timeout(&mut buf, INPUT_READ_TIMEOUT_MS) {
-                Ok(n) => n,
-                Err(err) => {
-                    drop(_op);
-                    let fail = if err.to_string().to_lowercase().contains("timeout") {
-                        SampleFail::Timeout
-                    } else {
-                        SampleFail::Io
-                    };
-                    crate::hid_diag::trace_read(
-                        "sample",
-                        serial,
-                        bus,
-                        started.elapsed().as_millis(),
-                        &format!("fail={} attempt={attempt} err={err}", fail.as_str()),
-                        false,
-                    );
-                    return ShortSampleOutcome::Fail(fail);
-                }
-            }
-        };
-        if n == 0 {
-            if attempt == 1 {
-                crate::hid_diag::trace_read(
-                    "sample",
+    let drain_queued =
+        |batch: &mut Vec<PadSample>, requested_full: &mut bool| -> Result<(), SampleFail> {
+            for _ in 0..INPUT_DRAIN_CAP {
+                match read_one_report(
+                    device,
+                    is_bluetooth,
                     serial,
                     bus,
-                    started.elapsed().as_millis(),
-                    "fail=empty n=0",
-                    false,
-                );
-                return ShortSampleOutcome::Fail(SampleFail::Empty);
-            }
-            continue;
-        }
-
-        if is_bluetooth && buf[0] == BT_REPORT_TRUNCATED {
-            if !requested_full {
-                let mut feature = vec![0u8; CALIBRATION_FEATURE_SIZE];
-                feature[0] = CALIBRATION_FEATURE_REPORT;
-                let feature_result = {
-                    let _op = crate::hid_diag::enter_op("get_feature_report");
-                    device.get_feature_report(&mut feature)
-                };
-                match feature_result {
-                    Ok(_) => {
-                        requested_full = true;
-                        continue;
-                    }
-                    Err(err) => {
-                        crate::hid_diag::trace_read(
-                            "sample",
-                            serial,
-                            bus,
-                            started.elapsed().as_millis(),
-                            &format!("fail=feature err={err}"),
-                            false,
-                        );
-                        return ShortSampleOutcome::Fail(SampleFail::Feature);
-                    }
+                    report_size,
+                    0,
+                    requested_full,
+                    started,
+                )? {
+                    Some(sample) => batch.push(sample),
+                    None => break,
                 }
             }
-            crate::hid_diag::trace_read(
-                "sample",
-                serial,
-                bus,
-                started.elapsed().as_millis(),
-                "fail=truncated",
-                false,
-            );
-            return ShortSampleOutcome::Fail(SampleFail::Truncated);
-        }
-
-        let expected = if is_bluetooth {
-            BT_REPORT_FULL
-        } else {
-            USB_REPORT_ID
+            Ok(())
         };
-        if buf[0] != expected {
-            crate::hid_diag::trace_read(
-                "sample",
-                serial,
-                bus,
-                started.elapsed().as_millis(),
-                &format!("fail=bad_report id=0x{:02x} n={n}", buf[0]),
-                false,
-            );
-            if attempt == 1 {
-                return ShortSampleOutcome::Fail(SampleFail::BadReport);
-            }
-            continue;
-        }
 
-        let base = if is_bluetooth { 1 } else { 0 };
-        let sample = parse_report(&buf, base);
-        // Success: always when hot; otherwise keep volume down via edge on fail-only
-        // is already covered — plan says success once per sample while hot, background cadence
-        // otherwise. Caller samples at 50ms background / 16ms hot, so log every success
-        // while hot and every success on background too would be ~20 Hz — plan says
-        // "on the background cadence otherwise". Logging every success at background poll
-        // rate is fine (50ms). Always log successes.
-        let _ = input_hot;
-        crate::hid_diag::trace_read(
-            "sample",
-            serial,
-            bus,
-            started.elapsed().as_millis(),
-            &sample_summary(&sample),
-            true,
-        );
-        return ShortSampleOutcome::Ok(sample);
+    // Drain anything already queued (immediate).
+    if let Err(fail) = drain_queued(&mut batch, &mut requested_full) {
+        return match fail {
+            SampleFail::Timeout => ShortSampleOutcome::Timeout,
+            other => ShortSampleOutcome::Fail(other),
+        };
     }
+
+    // Always wait one report interval so a non-empty drain cannot busy-spin the
+    // worker: pace to the pad's report clock, and merge any report that arrives.
+    match read_one_report(
+        device,
+        is_bluetooth,
+        serial,
+        bus,
+        report_size,
+        INPUT_REPORT_WAIT_MS,
+        &mut requested_full,
+        started,
+    ) {
+        Ok(Some(sample)) => batch.push(sample),
+        Ok(None) | Err(SampleFail::Timeout) => {
+            if batch.is_empty() {
+                return ShortSampleOutcome::Timeout;
+            }
+        }
+        Err(other) => return ShortSampleOutcome::Fail(other),
+    }
+    if let Err(fail) = drain_queued(&mut batch, &mut requested_full) {
+        return match fail {
+            SampleFail::Timeout => ShortSampleOutcome::Timeout,
+            other => ShortSampleOutcome::Fail(other),
+        };
+    }
+
+    let Some(merged) = merge_nav_samples(&batch) else {
+        return ShortSampleOutcome::Timeout;
+    };
+    latch_diag(&batch, &merged);
+
+    let _ = input_hot;
     crate::hid_diag::trace_read(
         "sample",
         serial,
         bus,
         started.elapsed().as_millis(),
-        "fail=empty",
-        false,
+        &format!("{} drain_n={}", sample_summary(&merged), batch.len()),
+        true,
     );
-    ShortSampleOutcome::Fail(SampleFail::Empty)
+    ShortSampleOutcome::Ok(merged)
 }
 
 /// Build a nav reading from a HID sample + device identity.
@@ -1115,7 +1223,9 @@ impl PadNavBank {
     ///
     /// `allow_nav_move` gates D-pad/stick repeats (false while a slide animates).
     /// `replace_confirm` switches to Cross-hold / Circle-cancel mode.
-    /// `editing` when true: Triangle is a discrete EditManual tap (not hold-owned).
+    /// `editing` when true: Triangle saves (ToggleEdit); Square is EditManual.
+    /// `hold_cross_close` (games browse): Cross hold closes the running game.
+    /// `hold_triangle_power` (controllers): Triangle hold powers off Bluetooth.
     pub fn tick(
         &mut self,
         readings: &[NavReading],
@@ -1123,6 +1233,8 @@ impl PadNavBank {
         allow_nav_move: bool,
         replace_confirm: bool,
         editing: bool,
+        hold_cross_close: bool,
+        hold_triangle_power: bool,
     ) -> PadTickResult {
         self.sync_presence(readings);
 
@@ -1192,14 +1304,45 @@ impl PadNavBank {
                 continue;
             }
 
-            slot.cross_hold.reset();
-            let (t_progress, t_completed) = slot.triangle_hold.update(reading.sample.triangle, now);
-            if t_progress > result.triangle_progress {
-                result.triangle_progress = t_progress;
+            // Games browse: Cross hold closes the running game (short Cross still Confirms).
+            if hold_cross_close {
+                let (c_progress, c_completed) = slot.cross_hold.update(reading.sample.cross, now);
+                if c_progress > result.cross_progress {
+                    result.cross_progress = c_progress;
+                }
+                if c_completed {
+                    result.cross_completed = true;
+                }
+                let stick_interrupt = reading.sample.dpad_up
+                    || reading.sample.dpad_down
+                    || reading.sample.stick_y != 0.0;
+                let foreign = slot
+                    .button_edges
+                    .foreign_press(&reading.sample, Some(EdgeButton::Cross));
+                if slot.cross_hold.is_active() && (stick_interrupt || foreign) {
+                    slot.cross_hold.cancel();
+                    result.cross_progress = 0.0;
+                    result.cross_completed = false;
+                }
+            } else {
+                slot.cross_hold.reset();
             }
-            if t_completed {
-                result.triangle_completed = true;
-            }
+
+            // Controllers: Triangle hold powers off. Games browse / edit: short Triangle.
+            let hold_owned = if hold_triangle_power {
+                let (t_progress, t_completed) =
+                    slot.triangle_hold.update(reading.sample.triangle, now);
+                if t_progress > result.triangle_progress {
+                    result.triangle_progress = t_progress;
+                }
+                if t_completed {
+                    result.triangle_completed = true;
+                }
+                Some(EdgeButton::Triangle)
+            } else {
+                slot.triangle_hold.reset();
+                None
+            };
 
             let nav = if allow_nav_move {
                 slot.nav_stepper.update(&reading.sample, now)
@@ -1207,20 +1350,19 @@ impl PadNavBank {
                 None
             };
 
-            // Browse: Triangle is hold-owned (close / power-off). Edit: discrete EditManual.
-            let hold_owned = if editing {
-                None
-            } else {
-                Some(EdgeButton::Triangle)
-            };
             let foreign = slot.button_edges.foreign_press(&reading.sample, hold_owned);
-            if slot.triangle_hold.is_active() && (nav.is_some() || foreign) {
+            if hold_triangle_power && slot.triangle_hold.is_active() && (nav.is_some() || foreign) {
                 slot.triangle_hold.cancel();
                 result.triangle_progress = 0.0;
                 result.triangle_completed = false;
             }
 
             let edge = slot.button_edges.update(&reading.sample, hold_owned);
+            let edge = edge.map(|action| match action {
+                // Edit mode: Square edits the selected manual (was Triangle).
+                NavAction::CycleSort if editing => NavAction::Triangle,
+                other => other,
+            });
 
             if let Some(action) = nav
                 && nav_action.is_none()
@@ -1230,6 +1372,10 @@ impl PadNavBank {
             if let Some(action) = edge
                 && button_action.is_none()
             {
+                // A completed Cross-hold close must not also Confirm/Launch.
+                if result.cross_completed && action == NavAction::Confirm {
+                    continue;
+                }
                 button_action = Some((reading.id.clone(), action));
             }
         }
@@ -1443,11 +1589,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merge_nav_samples_latches_button_released_in_batch() {
+        let down = PadSample {
+            cross: true,
+            ..Default::default()
+        };
+        let up = PadSample::default();
+        let merged = merge_nav_samples(&[down, up]).expect("batch");
+        assert!(
+            merged.cross,
+            "tap that released mid-drain must stay latched"
+        );
+        assert_eq!(merged.stick_y, 0.0);
+    }
+
+    #[test]
+    fn merge_nav_samples_keeps_newest_stick() {
+        let a = PadSample {
+            stick_y: -0.8,
+            ..Default::default()
+        };
+        let b = PadSample {
+            stick_y: 0.6,
+            ..Default::default()
+        };
+        let merged = merge_nav_samples(&[a, b]).expect("batch");
+        assert!((merged.stick_y - 0.6).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn combined_stick_either_side_moves() {
-        let (_, dy) = combined_stick(0.0, -0.8, 0.0, 0.0);
+        let (_, dy) = combined_stick(0.0, -0.95, 0.0, 0.0);
         assert!(dy < -0.3);
-        let (_, dy2) = combined_stick(0.0, 0.0, 0.0, 0.8);
+        let (_, dy2) = combined_stick(0.0, 0.0, 0.0, 0.95);
         assert!(dy2 > 0.3);
+    }
+
+    #[test]
+    fn combined_stick_below_deadzone_does_not_move() {
+        let (dx, dy) = combined_stick(0.0, -0.8, 0.0, 0.0);
+        assert_eq!(dx, 0.0);
+        assert_eq!(dy, 0.0);
     }
 
     #[test]
@@ -1482,9 +1664,9 @@ mod tests {
 
     #[test]
     fn combined_stick_reinforces_and_cancels() {
-        let (_, dy) = combined_stick(0.0, -0.5, 0.0, -0.5);
-        assert!(dy < -0.9);
-        let (_, dy2) = combined_stick(0.0, -0.5, 0.0, 0.5);
+        let (_, dy) = combined_stick(0.0, -0.95, 0.0, -0.95);
+        assert!(dy < -1.0);
+        let (_, dy2) = combined_stick(0.0, -0.95, 0.0, 0.95);
         assert_eq!(dy2, 0.0);
     }
 
@@ -1532,10 +1714,24 @@ mod tests {
     }
 
     #[test]
-    fn button_edges_fires_square_toggle_edit_on_release() {
+    fn button_edges_fires_square_cycle_sort_on_release() {
         let mut edges = ButtonEdges::default();
         let held = PadSample {
             square: true,
+            ..Default::default()
+        };
+        assert!(edges.update(&held, None).is_none());
+        assert_eq!(
+            edges.update(&PadSample::default(), None),
+            Some(NavAction::CycleSort)
+        );
+    }
+
+    #[test]
+    fn button_edges_fires_triangle_toggle_edit_on_release() {
+        let mut edges = ButtonEdges::default();
+        let held = PadSample {
+            triangle: true,
             ..Default::default()
         };
         assert!(edges.update(&held, None).is_none());
@@ -1546,17 +1742,14 @@ mod tests {
     }
 
     #[test]
-    fn button_edges_fires_options_cycle_sort_on_release() {
+    fn button_edges_options_does_not_fire() {
         let mut edges = ButtonEdges::default();
         let held = PadSample {
             options: true,
             ..Default::default()
         };
         assert!(edges.update(&held, None).is_none());
-        assert_eq!(
-            edges.update(&PadSample::default(), None),
-            Some(NavAction::CycleSort)
-        );
+        assert!(edges.update(&PadSample::default(), None).is_none());
     }
 
     #[test]
@@ -1584,7 +1777,7 @@ mod tests {
         edges.cancel_held_releases();
         assert!(
             edges.update(&PadSample::default(), None).is_none(),
-            "cancelled held Square must not ToggleEdit on release"
+            "cancelled held Square must not CycleSort on release"
         );
     }
 
@@ -1606,7 +1799,7 @@ mod tests {
             circle: true,
             ..Default::default()
         };
-        // Square released while cancelled — no ToggleEdit.
+        // Square released while cancelled — no CycleSort.
         assert!(edges.update(&circle_only, None).is_none());
         assert_eq!(
             edges.update(&PadSample::default(), None),
@@ -1663,6 +1856,10 @@ mod tests {
             r2: true,
             ..Default::default()
         }));
+        assert!(!sample_nav_resting(&PadSample {
+            held: [GestureControl::Ps].into_iter().collect(),
+            ..Default::default()
+        }));
     }
 
     fn reading(id: &str, sample: PadSample) -> NavReading {
@@ -1713,6 +1910,8 @@ mod tests {
             true,
             false,
             false,
+            false,
+            false,
         );
         assert!(tick1.action.is_none());
 
@@ -1727,6 +1926,8 @@ mod tests {
             true,
             false,
             false,
+            false,
+            false,
         );
         assert!(
             tick2.action.is_none(),
@@ -1736,6 +1937,8 @@ mod tests {
             &[reading("a", open), reading("b", PadSample::default())],
             now,
             true,
+            false,
+            false,
             false,
             false,
         );
@@ -1759,6 +1962,8 @@ mod tests {
             true,
             false,
             false,
+            false,
+            false,
         );
 
         let circle = PadSample {
@@ -1777,6 +1982,8 @@ mod tests {
             true,
             false,
             false,
+            false,
+            false,
         );
         assert!(tick.action.is_none(), "face actions arm on press");
         let tick2 = bank.tick(
@@ -1786,6 +1993,8 @@ mod tests {
             ],
             now,
             true,
+            false,
+            false,
             false,
             false,
         );
@@ -1836,7 +2045,15 @@ mod tests {
             held: [GestureControl::Cross].into_iter().collect(),
             ..Default::default()
         };
-        let tick = bank.tick(&[reading("new", cross)], now, true, false, false);
+        let tick = bank.tick(
+            &[reading("new", cross)],
+            now,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(tick.action.is_none());
     }
 
@@ -1989,7 +2206,15 @@ mod tests {
         bank.prepare_on_open(true);
         let now = Instant::now();
         let resting = PadSample::default();
-        let _ = bank.tick(&[reading("a", resting)], now, true, false, false);
+        let _ = bank.tick(
+            &[reading("a", resting)],
+            now,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
         let sample = PadSample {
             cross: true,
             square: true,
@@ -1998,7 +2223,15 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        let tick = bank.tick(&[reading("a", sample)], now, true, false, false);
+        let tick = bank.tick(
+            &[reading("a", sample)],
+            now,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(tick.held.cross);
         assert!(tick.held.square);
         assert!(!tick.held.circle);
