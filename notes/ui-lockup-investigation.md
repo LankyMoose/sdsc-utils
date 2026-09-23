@@ -212,25 +212,24 @@ No `last_op=hidapi_new` / `slow op=hidapi_new ms=5xxx` in this window — felt h
 - Shorter `slow op=hidapi_new ms=50–166` also appear; user-visible multi-second freezes match the **~5010ms** completions.
 - Pre-watchdog Hitch 1 `Identify total_ms=6791` is consistent with a ~5s `hidapi_new` buried inside Identify flash reopen/enumerate.
 
-## Toast Z-order vs Settings freeze (Windows)
+## Toast Z-order vs Settings / Start freeze (Windows)
 
 iced multi-window present starvation: [iced#3108](https://github.com/iced-rs/iced/issues/3108) / [#3320](https://github.com/iced-rs/iced/issues/3320).
 
-**Do not demote** the toast to `HWND_NOTOPMOST` when Settings/Start/popup are open — that puts the toast under Cursor and other normal apps.
+**Do not demote** the toast to `HWND_NOTOPMOST` when Settings/Start/popup are open — that puts the toast under Cursor.
 
-**Do:** keep toast `HWND_TOPMOST` always; after show (and while toast is up with UI open), `SetWindowPos(UI, HWND_TOPMOST)` so Settings/Start sit above the toast in the same topmost band, then `gain_focus` the interactive window.
+**Do not** raise toast above Start every `ToastFrame` — that starves Start presents.
 
-Debug grep: `ui-diag: place toast topmost`, `ui-diag: sync toast z-order`, `ui-diag: toast show`, `ui-diag: toast handoff skip-hide`.
+**Do:** keep toast `HWND_TOPMOST` (above Cursor); raise Start/Settings into the same topmost band *above* the toast (corner toast stays visible beside centered Start); `gain_focus` the interactive window.
+
+Debug grep: `ui-diag: place toast gen=`, `ui-diag: sync toast z-order (toast + raise UI)`.
 
 ## Queued toast wrong content (Windows)
 
 Symptom: two connect toasts both showed the first pad’s %, then recreate made only one toast appear.
 
-`app.log` proved the **model is correct** (`toast show … percent=55` then `percent=100`). Stale swapchain on reuse; closing/recreating the HWND dropped the follow-up toast. Raising Start above the toast also hid it.
+`app.log` proved the **model is correct** (`toast show … percent=55` then `percent=100`). Stale swapchain on reuse; closing/recreating the HWND dropped the follow-up toast.
 
-Fix:
-1. Reuse one toast HWND; on handoff skip hide and **remount** (±1px resize + `RedrawWindow`)
-2. Keep toast at the **top** of the topmost band (above Start); only `gain_focus` UI underneath for presents
-3. `ToastFrame` for the full toast lifetime; `PlaceToast` is generation-guarded
+Fix: reuse one toast HWND; on handoff skip hide and **remount** (±1px resize + `RedrawWindow`); `PlaceToast` is generation-guarded.
 
 Debug grep: `ui-diag: toast show`, `ui-diag: place toast gen=`, `ui-diag: toast handoff remount`.

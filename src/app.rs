@@ -732,15 +732,15 @@ impl App {
                 crate::hid_diag::diag_info(format!(
                     "ui-diag: place toast gen={generation} percent={percent}"
                 ));
-                // Remount surface for this message, show toast on top, focus UI
-                // underneath so Settings/Start still present (iced#3320).
+                // Toast stays TOPMOST (above Cursor). Raise Start/Settings above it
+                // in the same band so they keep presents (iced#3320); toast at the
+                // screen edge stays visible beside the centered Start window.
                 remount_toast_surface(id, generation)
                     .chain(window::move_to(id, start))
                     .chain(window::set_level(id, window::Level::AlwaysOnTop))
                     .chain(show_toast_without_activate(id))
                     .chain(invalidate_toast(id))
-                    .chain(self.refocus_interactive_ui())
-                    .chain(raise_window_topmost(id))
+                    .chain(self.raise_interactive_ui_above_toast(true))
             }
             Message::ToastFrame => {
                 let anim = if self.toast_animating() {
@@ -748,13 +748,9 @@ impl App {
                 } else {
                     Task::none()
                 };
-                // Keep toast at the top of the topmost band (above Start) without
-                // burying it under UI every tick.
-                let pin = match self.toast_window {
-                    Some(id) if self.toast_message.is_some() => raise_window_topmost(id),
-                    _ => Task::none(),
-                };
-                anim.chain(pin)
+                // Re-pin UI above toast so Start/Settings keep presenting while
+                // the toast animates (do not raise toast above UI every tick).
+                anim.chain(self.raise_interactive_ui_above_toast(false))
             }
             Message::IdentifyFrame => {
                 self.popup_state.tick_identify_flash();
@@ -940,15 +936,18 @@ impl App {
 
         self.known.save();
         let tray = self.apply_tray();
-        let mut task = tray.chain(self.queue_notifications(events));
-
-        if self.controllers.is_empty() && self.start_window.is_some() {
-            task = task.chain(self.close_start_screen());
+        let notify = tray.chain(self.queue_notifications(events));
+        // Batch with toast work: show_next_toast's Task includes the ~5s expire
+        // delay, so chaining open_start_screen after it deferred Start until the
+        // toast finished.
+        let start = if self.controllers.is_empty() && self.start_window.is_some() {
+            self.close_start_screen()
         } else if opened_from_empty && self.should_auto_open_start() {
-            task = task.chain(self.open_start_screen());
-        }
-
-        task
+            self.open_start_screen()
+        } else {
+            Task::none()
+        };
+        Task::batch([notify, start])
     }
 
     fn should_auto_open_start(&self) -> bool {
@@ -3121,7 +3120,28 @@ impl App {
         Task::none()
     }
 
-    /// Re-assert toast topmost (above Start/Settings) after UI open/close.
+    /// Raise interactive UI into the topmost band above the toast (last wins).
+    /// Toast stays TOPMOST vs Cursor; UI above toast keeps presents (iced#3320).
+    fn raise_interactive_ui_above_toast(&self, focus: bool) -> Task<Message> {
+        let mut task = Task::none();
+        if let Some(id) = self.popup_window {
+            task = task.chain(raise_window_topmost(id));
+        }
+        if let Some(id) = self.start_window {
+            task = task.chain(raise_window_topmost(id));
+        }
+        if let Some(id) = self.configure_window {
+            task = task.chain(raise_window_topmost(id));
+        }
+        if focus {
+            task.chain(self.refocus_interactive_ui())
+        } else {
+            task
+        }
+    }
+
+    /// Re-assert toast topmost, then UI above it, after Settings / Start / popup
+    /// open or close.
     fn sync_toast_zorder(&self) -> Task<Message> {
         let Some(id) = self.toast_window else {
             return Task::none();
@@ -3129,11 +3149,10 @@ impl App {
         if self.toast_message.is_none() {
             return Task::none();
         }
-        crate::hid_diag::diag_info("ui-diag: sync toast z-order (toast on top)");
+        crate::hid_diag::diag_info("ui-diag: sync toast z-order (toast + raise UI)");
         window::set_level(id, window::Level::AlwaysOnTop)
             .chain(set_toast_topmost(id))
-            .chain(self.refocus_interactive_ui())
-            .chain(raise_window_topmost(id))
+            .chain(self.raise_interactive_ui_above_toast(true))
     }
 }
 
