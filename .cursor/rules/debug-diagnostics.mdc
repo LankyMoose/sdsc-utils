@@ -1,0 +1,20 @@
+---
+description: Require debug-only diagnostic logging for new work (lockup-investigation standard)
+alwaysApply: true
+---
+
+# Debug-only diagnostics required
+
+All further improvements, bugfixes, and features in this repo must include a **similar level of non-release diagnostic logging** to the UI lockup / HID investigation. Release builds must stay quiet and cheap.
+
+## Rules
+
+1. Prefer `cfg(debug_assertions)` or helpers that no-op in release (`hid_diag::diag_info` / `diag_warn`, `app_log::hid_trace` / `mark_hitch`). Do **not** leave high-volume HID traces or hitch-report UI enabled in `--release`.
+
+2. When chasing hangs, races, or intermittent failures: add phase markers / slow-op timing (`hid_diag::enter_op`), correlate-able log tokens, and enough context to reconstruct a 5–10s window after a user mark.
+
+3. If the UI can freeze, provide a **debug-only** way to stamp a mark that does not rely solely on the iced UI thread (pattern: F7/F8 + `HITCH_MARK` via `app_log::mark_hitch`).
+
+4. Worked example and grep tokens: [`notes/ui-lockup-investigation.md`](notes/ui-lockup-investigation.md). Extend that note (or add a sibling under `notes/`) when landing new investigation tooling.
+
+5. Keep normal `app.log` warn/error for real user-facing failures in all builds; gate only investigation-volume / hitch-hunting output.

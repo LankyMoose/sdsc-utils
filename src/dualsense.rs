@@ -120,6 +120,8 @@ pub fn is_dualsense_device(d: &DeviceInfo) -> bool {
 }
 
 /// Presence keys for connect/disconnect (HID paths — unique per USB/BT node).
+/// One-shot helper (CLI/tests). The daemon uses [`crate::hid_worker::HidWorkerHandle::presence_paths`].
+#[allow(dead_code)]
 pub fn list_presence_paths() -> Result<Vec<String>, String> {
     let api = hidapi::HidApi::new().map_err(|e| e.to_string())?;
     let mut keys: Vec<String> = api

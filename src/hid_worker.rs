@@ -4,8 +4,10 @@
 //! plus short input reads published to a shared snapshot. The UI PadPoll path only
 //! clones that snapshot — it never opens HID — so Identify cannot stall iced.
 //!
-//! During Identify, flash writes and one short input read share the same cached
-//! handle so start-nav keeps receiving `hid:{serial}` samples.
+//! **Lightbar writes never use the input cache handle.** Long-lived read handles on
+//! Windows/DualSense often accept `write` with `Ok` without updating the bar, and can
+//! poison `LIGHT_OUT` claims. SetRgb / Identify always drop the cached device, then
+//! open-write-close; input sampling may reopen afterward.
 //!
 //! Timing lines (grep `hid-worker:`) record enumerate / open / io / total.
 
@@ -14,8 +16,8 @@ use crate::battery::{self, ControllerStatus};
 use crate::color::{Rgb, color_for_battery_percent};
 use crate::dualsense::{is_dualsense_gamepad, normalize_identity, resolve_device_identity};
 use crate::lightbar::{self, HidPhaseTiming, IDENTIFY_FLASH_COUNT, IDENTIFY_FLASH_MS};
-use crate::poll;
-use crate::start_input::{self, NavReading};
+use crate::poll::{self, PRESENCE_INTERVAL, PRESENCE_INTERVAL_EMPTY};
+use crate::start_input::{self, InputSnapshot, NavReading, ShortSampleOutcome, SnapshotReason};
 use hidapi::{BusType, HidApi, HidDevice};
 use iced::futures::channel::oneshot;
 use std::collections::HashMap;
@@ -34,6 +36,7 @@ const ACTIVE_POLL: Duration = Duration::from_millis(16);
 /// While waiting for the next Identify flash, still sample this often.
 const IDENTIFY_SAMPLE_POLL: Duration = Duration::from_millis(16);
 const IDENTIFY_WRITES: u32 = IDENTIFY_FLASH_COUNT * 2;
+const SAMPLE_STALL_MS: u128 = 100;
 
 enum HidCmd {
     Poll {
@@ -59,24 +62,58 @@ struct OpenDevice {
     is_bluetooth: bool,
 }
 
-/// Keeps `HidApi` alive with per-serial open handles for output + input.
+/// Keeps `HidApi` alive with per-serial open handles for **input** sampling.
+/// Lightbar writes must not use these handles — see [`write_rgb_exclusive`].
 struct DeviceCache {
     api: HidApi,
     devices: HashMap<String, OpenDevice>,
+    last_enum_at: Option<Instant>,
+    presence: Arc<Mutex<Vec<String>>>,
 }
 
 impl DeviceCache {
-    fn new() -> Result<Self, String> {
+    fn new(presence: Arc<Mutex<Vec<String>>>) -> Result<Self, String> {
         let api = HidApi::new().map_err(|e| e.to_string())?;
-        Ok(Self {
+        let mut cache = Self {
             api,
             devices: HashMap::new(),
-        })
+            last_enum_at: None,
+            presence,
+        };
+        let _ = cache.refresh_device_list();
+        Ok(cache)
     }
 
-    fn refresh_api(&mut self) -> Result<(), String> {
-        self.api = HidApi::new().map_err(|e| e.to_string())?;
+    /// Re-enumerate in place (does **not** reconstruct `HidApi`).
+    fn refresh_device_list(&mut self) -> Result<(), String> {
+        let _op = crate::hid_diag::enter_op("hidapi_refresh");
+        self.api.refresh_devices().map_err(|e| e.to_string())?;
+        self.last_enum_at = Some(Instant::now());
+        let mut paths: Vec<String> = self
+            .api
+            .device_list()
+            .filter(|d| is_dualsense_gamepad(d))
+            .map(|d| d.path().to_string_lossy().into_owned())
+            .collect();
+        paths.sort();
+        if let Ok(mut guard) = self.presence.lock() {
+            *guard = paths;
+        }
         Ok(())
+    }
+
+    fn enum_due(&self) -> bool {
+        match self.last_enum_at {
+            None => true,
+            Some(at) => {
+                let interval = if self.devices.is_empty() {
+                    PRESENCE_INTERVAL_EMPTY
+                } else {
+                    PRESENCE_INTERVAL
+                };
+                at.elapsed() >= interval
+            }
+        }
     }
 
     fn drop_all(&mut self) {
@@ -87,18 +124,37 @@ impl DeviceCache {
         self.devices.remove(&normalize_identity(serial));
     }
 
-    /// Open (or reuse) the DualSense matching `serial`. Prefers USB when both exist.
-    fn ensure(&mut self, serial: &str) -> Result<&OpenDevice, String> {
+    /// Try to open `serial` from the current device list (no refresh).
+    fn try_open_serial(&mut self, serial: &str) -> Option<OpenDevice> {
         let target = normalize_identity(serial);
-        if self.devices.contains_key(&target) {
-            return Ok(self.devices.get(&target).expect("contains"));
-        }
-
-        self.refresh_api()?;
-        let mut best: Option<(OpenDevice, bool)> = None; // device, is_usb
+        let mut best: Option<(OpenDevice, bool)> = None;
         for info in self.api.device_list().filter(|d| is_dualsense_gamepad(d)) {
-            let Ok(device) = info.open_device(&self.api) else {
-                continue;
+            let open_started = Instant::now();
+            let hint = info.serial_number().unwrap_or("");
+            let device = {
+                let _op = crate::hid_diag::enter_op("open_device");
+                match info.open_device(&self.api) {
+                    Ok(d) => {
+                        crate::hid_diag::trace_open(
+                            "sample",
+                            info,
+                            hint,
+                            open_started.elapsed().as_millis(),
+                            Ok(()),
+                        );
+                        d
+                    }
+                    Err(err) => {
+                        crate::hid_diag::trace_open(
+                            "sample",
+                            info,
+                            hint,
+                            open_started.elapsed().as_millis(),
+                            Err(&err.to_string()),
+                        );
+                        continue;
+                    }
+                }
             };
             let identity = resolve_device_identity(info, &device);
             if identity != target {
@@ -120,7 +176,23 @@ impl DeviceCache {
                 ));
             }
         }
-        let Some((open, _)) = best else {
+        best.map(|(open, _)| open)
+    }
+
+    /// Open (or reuse) the DualSense matching `serial`. Prefers USB when both exist.
+    fn ensure(&mut self, serial: &str) -> Result<&OpenDevice, String> {
+        let target = normalize_identity(serial);
+        if self.devices.contains_key(&target) {
+            return Ok(self.devices.get(&target).expect("contains"));
+        }
+
+        if let Some(open) = self.try_open_serial(serial) {
+            self.devices.insert(target.clone(), open);
+            return Ok(self.devices.get(&target).expect("just inserted"));
+        }
+
+        self.refresh_device_list()?;
+        let Some(open) = self.try_open_serial(serial) else {
             return Err(format!("controller {serial} not found"));
         };
         self.devices.insert(target.clone(), open);
@@ -128,10 +200,28 @@ impl DeviceCache {
     }
 
     /// Ensure every connected DualSense gamepad has a cached handle (USB preferred).
+    /// Refreshes the device list only when empty or on the presence cadence.
     fn ensure_all_pads(&mut self) {
-        if self.refresh_api().is_err() {
-            return;
+        if self.devices.is_empty() || self.enum_due() {
+            if self.refresh_device_list().is_err() {
+                return;
+            }
+            // Drop handles for pads that vanished from the list.
+            let live: std::collections::HashSet<String> = self
+                .api
+                .device_list()
+                .filter(|d| is_dualsense_gamepad(d))
+                .filter_map(|d| {
+                    d.serial_number()
+                        .filter(|s| !s.is_empty())
+                        .map(normalize_identity)
+                })
+                .collect();
+            if !live.is_empty() {
+                self.devices.retain(|id, _| live.contains(id));
+            }
         }
+
         let mut best: HashMap<String, (OpenDevice, bool)> = HashMap::new();
         for info in self.api.device_list().filter(|d| is_dualsense_gamepad(d)) {
             let identity_hint = info.serial_number().filter(|s| !s.is_empty()).unwrap_or("");
@@ -143,8 +233,31 @@ impl DeviceCache {
             {
                 continue;
             }
-            let Ok(device) = info.open_device(&self.api) else {
-                continue;
+            let open_started = Instant::now();
+            let device = {
+                let _op = crate::hid_diag::enter_op("open_device");
+                match info.open_device(&self.api) {
+                    Ok(d) => {
+                        crate::hid_diag::trace_open(
+                            "sample",
+                            info,
+                            identity_hint,
+                            open_started.elapsed().as_millis(),
+                            Ok(()),
+                        );
+                        d
+                    }
+                    Err(err) => {
+                        crate::hid_diag::trace_open(
+                            "sample",
+                            info,
+                            identity_hint,
+                            open_started.elapsed().as_millis(),
+                            Err(&err.to_string()),
+                        );
+                        continue;
+                    }
+                }
             };
             let identity = resolve_device_identity(info, &device);
             if self.devices.contains_key(&identity) {
@@ -191,6 +304,7 @@ pub struct HidWorkerHandle {
     tx: Sender<HidCmd>,
     identifying: Arc<AtomicBool>,
     input_hot: Arc<AtomicBool>,
+    presence: Arc<Mutex<Vec<String>>>,
 }
 
 impl HidWorkerHandle {
@@ -200,7 +314,9 @@ impl HidWorkerHandle {
         let identifying_worker = Arc::clone(&identifying);
         let input_hot = Arc::new(AtomicBool::new(false));
         let input_hot_worker = Arc::clone(&input_hot);
-        let input_snapshot = Arc::new(Mutex::new(Vec::new()));
+        let presence = Arc::new(Mutex::new(Vec::new()));
+        let presence_worker = Arc::clone(&presence);
+        let input_snapshot = Arc::new(Mutex::new(InputSnapshot::default()));
         start_input::set_input_snapshot(Arc::clone(&input_snapshot));
         let last_noisy_log = Arc::new(Mutex::new(Instant::now() - PULSE_SAMPLE_LOG_INTERVAL));
         let last_noisy_log_worker = Arc::clone(&last_noisy_log);
@@ -208,12 +324,14 @@ impl HidWorkerHandle {
         thread::Builder::new()
             .name("hid-worker".into())
             .spawn(move || {
+                crate::hid_diag::start_worker_watchdog();
                 worker_loop(
                     rx,
                     identifying_worker,
                     input_hot_worker,
                     last_noisy_log_worker,
                     input_snapshot,
+                    presence_worker,
                 );
             })
             .expect("spawn hid-worker");
@@ -222,11 +340,17 @@ impl HidWorkerHandle {
             tx,
             identifying,
             input_hot,
+            presence,
         }
     }
 
     pub fn identifying(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.identifying)
+    }
+
+    /// Latest DualSense gamepad HID paths from the worker's throttled refresh.
+    pub fn presence_paths(&self) -> Vec<String> {
+        self.presence.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// Elevate input sampling to ~60 Hz while start-nav / gesture record need it.
@@ -283,85 +407,213 @@ fn identify_flash_color(step: u32, normal: Rgb) -> Rgb {
     }
 }
 
-fn write_rgb_cached(
+/// Lightbar output must not use the input-pump handle: long-lived read handles on
+/// Windows/DualSense often accept `write` with `Ok` without updating the bar.
+fn write_rgb_exclusive(
     cache: &mut DeviceCache,
     serial: &str,
     color: Rgb,
 ) -> (Result<(), String>, HidPhaseTiming) {
-    match cache.ensure(serial) {
-        Ok(open) => {
-            let (result, timing) = lightbar::apply_on_open_device_timed(
-                &open.device,
-                serial,
-                color,
-                open.is_bluetooth,
-            );
-            if result.is_err() {
-                cache.drop_serial(serial);
-            }
-            (result, timing)
-        }
-        Err(_) => {
-            // Cache miss / open failed — fall back to full open-write-close.
-            lightbar::apply_lightbar_rgb_timed(serial, color)
+    let target = normalize_identity(serial);
+    let was_cached = cache.devices.contains_key(&target);
+    cache.drop_serial(serial);
+    if was_cached {
+        // Input handles can "succeed" RGB writes without a real claim; force LIGHT_OUT.
+        lightbar::prepare_connect_apply(serial);
+    }
+    let (result, mut timing) = lightbar::apply_lightbar_rgb_timed(&cache.api, serial, color);
+    if result.is_err() {
+        // Stale device list — refresh once and retry.
+        if cache.refresh_device_list().is_ok() {
+            let (retry, t2) = lightbar::apply_lightbar_rgb_timed(&cache.api, serial, color);
+            timing.add_assign(t2);
+            return (retry, timing);
         }
     }
+    (result, timing)
 }
 
-fn sample_one(cache: &mut DeviceCache, serial: &str) -> Option<NavReading> {
+fn sample_one(cache: &mut DeviceCache, serial: &str, input_hot: bool) -> Option<NavReading> {
+    let _op = crate::hid_diag::enter_op("sample_one");
     let open = cache.ensure(serial).ok()?;
-    let sample = start_input::read_device_sample_short(&open.device, open.is_bluetooth)?;
-    Some(start_input::hid_nav_reading(serial, sample))
+    let is_bluetooth = open.is_bluetooth;
+    match start_input::read_device_sample_short(&open.device, is_bluetooth, serial, input_hot) {
+        ShortSampleOutcome::Ok(sample) => Some(start_input::hid_nav_reading(serial, sample)),
+        ShortSampleOutcome::Fail(_) => {
+            cache.drop_serial(serial);
+            None
+        }
+    }
 }
 
-fn publish_snapshot(snapshot: &Mutex<Vec<NavReading>>, readings: Vec<NavReading>) {
+fn snapshot_age_ms(snapshot: &Mutex<InputSnapshot>) -> u128 {
+    snapshot
+        .lock()
+        .map(|g| g.published_at.elapsed().as_millis())
+        .unwrap_or(0)
+}
+
+fn publish_snapshot(
+    snapshot: &Mutex<InputSnapshot>,
+    readings: Vec<NavReading>,
+    reason: SnapshotReason,
+    after_cmd: Option<&str>,
+    last_noisy_log: &Mutex<Instant>,
+) {
+    let _op = crate::hid_diag::enter_op("publish_snapshot");
+    let prev_pads = snapshot.lock().map(|g| g.readings.len()).unwrap_or(0);
+    let gap_ms = snapshot_age_ms(snapshot);
+    let was_empty = prev_pads == 0;
+    let now_empty = readings.is_empty();
+    let pad_count = readings.len();
+
     if let Ok(mut guard) = snapshot.lock() {
-        *guard = readings;
+        guard.seq = guard.seq.saturating_add(1);
+        guard.published_at = Instant::now();
+        guard.reason = reason;
+        guard.readings = readings;
     }
+
+    let clearing = matches!(
+        reason,
+        SnapshotReason::ClearedPoll
+            | SnapshotReason::ClearedPowerOff
+            | SnapshotReason::ClearedShutdown
+    );
+    if clearing && !was_empty {
+        crate::hid_diag::diag_info(format!(
+            "hid-diag: snapshot clear reason={} prev_pads={prev_pads}",
+            reason.as_str()
+        ));
+    } else if !now_empty && was_empty {
+        let after = after_cmd.unwrap_or("-");
+        crate::hid_diag::diag_info(format!(
+            "hid-diag: snapshot restore pads={pad_count} gap_ms={gap_ms} after={after}"
+        ));
+    }
+    let _ = last_noisy_log;
 }
 
 /// Sample all cached DualSense pads; open any missing connected pads first.
-fn sample_all_inputs(cache: &mut DeviceCache, snapshot: &Mutex<Vec<NavReading>>) {
+fn sample_all_inputs(
+    cache: &mut DeviceCache,
+    snapshot: &Mutex<InputSnapshot>,
+    input_hot: bool,
+    last_noisy_log: &Mutex<Instant>,
+    after_cmd: Option<&str>,
+) {
     cache.ensure_all_pads();
     let serials: Vec<String> = cache.devices.keys().cloned().collect();
+    let cached = serials.len();
     let mut out = Vec::with_capacity(serials.len());
     for serial in serials {
-        if let Some(reading) = sample_one(cache, &serial) {
+        if let Some(reading) = sample_one(cache, &serial, input_hot) {
             out.push(reading);
         }
     }
-    publish_snapshot(snapshot, out);
+    let reason = if out.len() < cached && cached > 0 {
+        SnapshotReason::SamplePartial
+    } else {
+        SnapshotReason::Sample
+    };
+    // For SamplePartial, also emit the short line with real cached count.
+    if matches!(reason, SnapshotReason::SamplePartial) {
+        let due = last_noisy_log
+            .lock()
+            .map(|t| t.elapsed() >= PULSE_SAMPLE_LOG_INTERVAL)
+            .unwrap_or(true);
+        if due {
+            if let Ok(mut guard) = last_noisy_log.lock() {
+                *guard = Instant::now();
+            }
+            crate::hid_diag::diag_info(format!(
+                "hid-diag: sample short cached={cached} published={}",
+                out.len()
+            ));
+        }
+    }
+    publish_snapshot(snapshot, out, reason, after_cmd, last_noisy_log);
 }
 
 /// Refresh the snapshot entry for one serial (Identify path).
 fn sample_serial_into_snapshot(
     cache: &mut DeviceCache,
-    snapshot: &Mutex<Vec<NavReading>>,
+    snapshot: &Mutex<InputSnapshot>,
     serial: &str,
+    input_hot: bool,
 ) {
-    let Some(reading) = sample_one(cache, serial) else {
+    let Some(reading) = sample_one(cache, serial, input_hot) else {
         return;
     };
     if let Ok(mut guard) = snapshot.lock() {
-        if let Some(slot) = guard.iter_mut().find(|r| r.id.0 == reading.id.0) {
+        guard.seq = guard.seq.saturating_add(1);
+        guard.published_at = Instant::now();
+        guard.reason = SnapshotReason::Identify;
+        if let Some(slot) = guard.readings.iter_mut().find(|r| r.id.0 == reading.id.0) {
             *slot = reading;
         } else {
-            guard.push(reading);
+            guard.readings.push(reading);
         }
     }
 }
 
+fn log_cmd_begin(cmd: &str, snapshot: &Mutex<InputSnapshot>) {
+    let since_pub_ms = snapshot_age_ms(snapshot);
+    crate::hid_diag::diag_info(format!(
+        "hid-diag: cmd begin={cmd} since_publish_ms={since_pub_ms}"
+    ));
+}
+
+fn maybe_log_sample_stall(
+    snapshot: &Mutex<InputSnapshot>,
+    input_hot: bool,
+    in_cmd: &str,
+    stall_logged: &mut bool,
+    last_noisy_log: &Mutex<Instant>,
+) {
+    if !input_hot {
+        *stall_logged = false;
+        return;
+    }
+    let gap_ms = snapshot_age_ms(snapshot);
+    if gap_ms < SAMPLE_STALL_MS {
+        *stall_logged = false;
+        return;
+    }
+    if *stall_logged {
+        let due = last_noisy_log
+            .lock()
+            .map(|t| t.elapsed() >= PULSE_SAMPLE_LOG_INTERVAL)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+    }
+    *stall_logged = true;
+    if let Ok(mut guard) = last_noisy_log.lock() {
+        *guard = Instant::now();
+    }
+    crate::hid_diag::diag_info(format!(
+        "hid-diag: sample stalled gap_ms={gap_ms} in_cmd={in_cmd}"
+    ));
+}
+
 fn begin_identify(
     cache: &mut DeviceCache,
-    snapshot: &Mutex<Vec<NavReading>>,
+    snapshot: &Mutex<InputSnapshot>,
     serial: String,
     percent: u8,
     identifying: &AtomicBool,
     last_noisy_log: &Mutex<Instant>,
+    input_hot: bool,
 ) -> Option<IdentifySession> {
     let normal = color_for_battery_percent(percent);
+    log_cmd_begin("Identify", snapshot);
     let started = Instant::now();
-    let (result, timing) = write_rgb_cached(cache, &serial, identify_flash_color(0, normal));
+    let (result, timing) = {
+        let _op = crate::hid_diag::enter_op("cmd_Identify");
+        write_rgb_exclusive(cache, &serial, identify_flash_color(0, normal))
+    };
     if let Err(err) = result {
         app_log::warn(format!("identify failed for {serial}: {err}"));
         log_cmd(
@@ -375,7 +627,7 @@ fn begin_identify(
         identifying.store(false, Ordering::SeqCst);
         return None;
     }
-    sample_serial_into_snapshot(cache, snapshot, &serial);
+    sample_serial_into_snapshot(cache, snapshot, &serial, input_hot);
     Some(IdentifySession {
         serial,
         normal,
@@ -390,9 +642,10 @@ fn begin_identify(
 fn advance_identify(
     session: &mut Option<IdentifySession>,
     cache: &mut DeviceCache,
-    snapshot: &Mutex<Vec<NavReading>>,
+    snapshot: &Mutex<InputSnapshot>,
     identifying: &AtomicBool,
     last_noisy_log: &Mutex<Instant>,
+    input_hot: bool,
 ) {
     let Some(s) = session.as_mut() else {
         return;
@@ -403,7 +656,7 @@ fn advance_identify(
 
     if s.next_write >= IDENTIFY_WRITES {
         let finished = session.take().expect("session present");
-        // Keep handle so input sampling continues without reopen thrash.
+        // Exclusive writes already dropped the handle; refresh input snapshot.
         log_cmd(
             "Identify",
             &finished.timing,
@@ -413,13 +666,17 @@ fn advance_identify(
             last_noisy_log,
         );
         identifying.store(false, Ordering::SeqCst);
-        sample_all_inputs(cache, snapshot);
+        sample_all_inputs(cache, snapshot, input_hot, last_noisy_log, Some("Identify"));
         return;
     }
 
+    log_cmd_begin("IdentifyFlash", snapshot);
     let color = identify_flash_color(s.next_write, s.normal);
     let serial = s.serial.clone();
-    let (result, t) = write_rgb_cached(cache, &serial, color);
+    let (result, t) = {
+        let _op = crate::hid_diag::enter_op("cmd_IdentifyFlash");
+        write_rgb_exclusive(cache, &serial, color)
+    };
     s.timing.add_assign(t);
     s.flashes += 1;
     if let Err(err) = result {
@@ -437,7 +694,7 @@ fn advance_identify(
         identifying.store(false, Ordering::SeqCst);
         return;
     }
-    sample_serial_into_snapshot(cache, snapshot, &serial);
+    sample_serial_into_snapshot(cache, snapshot, &serial, input_hot);
     s.next_write += 1;
     s.wake_at = Instant::now() + Duration::from_millis(IDENTIFY_FLASH_MS);
 }
@@ -457,15 +714,22 @@ fn handle_cmd(
     cmd: HidCmd,
     session: &mut Option<IdentifySession>,
     cache: &mut DeviceCache,
-    snapshot: &Mutex<Vec<NavReading>>,
+    snapshot: &Mutex<InputSnapshot>,
     identifying: &AtomicBool,
     last_noisy_log: &Mutex<Instant>,
+    input_hot: bool,
 ) -> bool {
     match cmd {
         HidCmd::Shutdown => {
             abort_identify(session, cache, identifying);
             cache.drop_all();
-            publish_snapshot(snapshot, Vec::new());
+            publish_snapshot(
+                snapshot,
+                Vec::new(),
+                SnapshotReason::ClearedShutdown,
+                Some("Shutdown"),
+                last_noisy_log,
+            );
             true
         }
         HidCmd::Identify { serial, percent } => {
@@ -478,6 +742,7 @@ fn handle_cmd(
                 percent,
                 identifying,
                 last_noisy_log,
+                input_hot,
             );
             false
         }
@@ -486,9 +751,19 @@ fn handle_cmd(
                 abort_identify(session, cache, identifying);
             }
             cache.drop_all();
-            publish_snapshot(snapshot, Vec::new());
+            publish_snapshot(
+                snapshot,
+                Vec::new(),
+                SnapshotReason::ClearedPowerOff,
+                Some("PowerOff"),
+                last_noisy_log,
+            );
+            log_cmd_begin("PowerOff", snapshot);
             let started = Instant::now();
-            let (result, timing) = battery::power_off_bluetooth_timed(&serial);
+            let (result, timing) = {
+                let _ = cache.refresh_device_list();
+                battery::power_off_bluetooth_timed(&cache.api, &serial)
+            };
             match result {
                 Ok(()) => app_log::info(format!("power-off sent for {serial}")),
                 Err(err) => app_log::warn(format!("power-off failed for {serial}: {err}")),
@@ -507,10 +782,9 @@ fn handle_cmd(
             if session.as_ref().is_some_and(|s| s.serial == serial) {
                 return false;
             }
+            log_cmd_begin("SetRgb", snapshot);
             let started = Instant::now();
-            let (result, timing) = write_rgb_cached(cache, &serial, color);
-            // Drop after write; idle sampling reopens for input.
-            cache.drop_serial(&serial);
+            let (result, timing) = write_rgb_exclusive(cache, &serial, color);
             if let Err(err) = result {
                 app_log::warn(format!("lightbar write failed for {serial}: {err}"));
             }
@@ -525,11 +799,15 @@ fn handle_cmd(
             false
         }
         HidCmd::Poll { previously, reply } => {
-            // Fresh opens for membership + battery; drop cache across poll.
+            // Release input handles so Poll can open; keep last nav readings published.
             cache.drop_all();
-            publish_snapshot(snapshot, Vec::new());
+            log_cmd_begin("Poll", snapshot);
             let started = Instant::now();
-            let (result, timing) = poll::poll_controllers_timed(&previously);
+            let (result, timing) = {
+                let _op = crate::hid_diag::enter_op("cmd_Poll");
+                let _ = cache.refresh_device_list();
+                poll::poll_controllers_timed(&cache.api, &previously)
+            };
             log_cmd(
                 "Poll",
                 &timing,
@@ -549,29 +827,49 @@ fn worker_loop(
     identifying: Arc<AtomicBool>,
     input_hot: Arc<AtomicBool>,
     last_noisy_log: Arc<Mutex<Instant>>,
-    input_snapshot: Arc<Mutex<Vec<NavReading>>>,
+    input_snapshot: Arc<Mutex<InputSnapshot>>,
+    presence: Arc<Mutex<Vec<String>>>,
 ) {
-    let mut cache = match DeviceCache::new() {
+    let mut cache = match DeviceCache::new(presence) {
         Ok(c) => c,
         Err(err) => {
             app_log::warn(format!("hid-worker: HidApi init failed: {err}"));
             return;
         }
     };
+    // Clear claims poisoned by prior no-op writes on input-cache handles.
+    lightbar::forget_all_claims();
     let mut session: Option<IdentifySession> = None;
+    let mut stall_logged = false;
+    let mut in_cmd = "none";
 
     loop {
+        crate::hid_diag::note_progress("worker_loop");
+        let hot = input_hot.load(Ordering::Relaxed);
+        maybe_log_sample_stall(
+            &input_snapshot,
+            hot,
+            in_cmd,
+            &mut stall_logged,
+            &last_noisy_log,
+        );
+
         if session
             .as_ref()
             .is_some_and(|s| Instant::now() >= s.wake_at)
         {
+            in_cmd = "Identify";
             advance_identify(
                 &mut session,
                 &mut cache,
                 &input_snapshot,
                 &identifying,
                 &last_noisy_log,
+                hot,
             );
+            if session.is_none() {
+                in_cmd = "none";
+            }
             continue;
         }
 
@@ -581,7 +879,7 @@ fn worker_loop(
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_millis(1));
             until_flash.min(IDENTIFY_SAMPLE_POLL)
-        } else if input_hot.load(Ordering::Relaxed) {
+        } else if hot {
             ACTIVE_POLL
         } else {
             BACKGROUND_POLL
@@ -589,6 +887,13 @@ fn worker_loop(
 
         match rx.recv_timeout(timeout) {
             Ok(cmd) => {
+                in_cmd = match &cmd {
+                    HidCmd::Poll { .. } => "Poll",
+                    HidCmd::Identify { .. } => "Identify",
+                    HidCmd::PowerOff { .. } => "PowerOff",
+                    HidCmd::SetRgb { .. } => "SetRgb",
+                    HidCmd::Shutdown => "Shutdown",
+                };
                 if handle_cmd(
                     cmd,
                     &mut session,
@@ -596,15 +901,20 @@ fn worker_loop(
                     &input_snapshot,
                     &identifying,
                     &last_noisy_log,
+                    hot,
                 ) {
                     break;
+                }
+                if session.is_none() {
+                    in_cmd = "none";
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(s) = session.as_ref() {
-                    sample_serial_into_snapshot(&mut cache, &input_snapshot, &s.serial);
+                    let serial = s.serial.clone();
+                    sample_serial_into_snapshot(&mut cache, &input_snapshot, &serial, hot);
                 } else {
-                    sample_all_inputs(&mut cache, &input_snapshot);
+                    sample_all_inputs(&mut cache, &input_snapshot, hot, &last_noisy_log, None);
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break,

@@ -36,8 +36,8 @@ use crate::popup_view::{self, ControllerRow, PopupMessage};
 use crate::prefs::{Prefs, clamp_low_battery_percent, clamp_start_screen_sound_volume};
 use crate::process_match::{self, RunningSession};
 use crate::start_input::{
-    self, CrossHold, GestureDetectorBank, GestureRecordLatch, NavAction, NavLogSnapshot, NavSource,
-    PadNavBank,
+    self, CrossHold, FaceHeld, GestureDetectorBank, GestureRecordLatch, NavAction, NavLogSnapshot,
+    NavSource, PadNavBank,
 };
 use crate::start_view::{self, ReplaceConfirm, StartMessage, StartSlide};
 use crate::steam::{self, SteamGame};
@@ -83,6 +83,10 @@ const PAD_POLL_ACTIVE: Duration = Duration::from_millis(16);
 const PAD_POLL_BACKGROUND: Duration = Duration::from_millis(50);
 /// Process/catalog running checks are expensive; never run them at pad-poll rate.
 const RUNNING_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const PAD_POLL_STALL_MS: u128 = 80;
+const PAD_POLL_SLOW_MS: u128 = 20;
+const SNAPSHOT_STALE_MS: u128 = 100;
+const START_NAV_NOT_READY_MS: u128 = 200;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -90,6 +94,8 @@ pub enum Message {
     Tick,
     /// Result of a background `poll_controllers` call.
     PollResult(Result<Vec<ControllerStatus>, String>),
+    /// Result of a background process-image snapshot (running badge).
+    ProcessEnumResult(Result<Vec<(u32, PathBuf)>, String>),
 
     /// A tray menu item was activated.
     TrayMenu(String),
@@ -206,11 +212,17 @@ pub struct App {
     pad_nav: PadNavBank,
     /// Keyboard Enter hold for replace-confirm (not folded into pad slots).
     keyboard_cross_hold: CrossHold,
-    /// Keyboard Enter held (for hold-to-proceed on replace confirm).
+    /// Keyboard Enter held (for hold-to-proceed on replace confirm / Cross press styling).
     confirm_key_held: bool,
+    /// Keyboard Escape held (Circle press styling).
+    cancel_key_held: bool,
+    /// Last armed-pad face held snapshot (merged with keyboard in [`Self::sync_start_held`]).
+    pad_held: FaceHeld,
     running_session: Option<RunningSession>,
     /// Throttle for process enumeration / catalog restore (not pad UI).
     last_running_check: Option<Instant>,
+    /// True while a background process enum task is outstanding.
+    process_enum_inflight: bool,
     /// Cached `match_paths_for_target` results (cleared on Steam library refresh).
     match_path_cache: HashMap<String, Vec<PathBuf>>,
     steam_by_id: HashMap<u32, SteamGame>,
@@ -225,6 +237,16 @@ pub struct App {
     nav_source_logged: Option<NavSource>,
     /// Last edge-logged nav snapshot (cleared when start closes).
     last_nav_log: Option<NavLogSnapshot>,
+    /// Last PadPoll Instant while start window open (stall detection).
+    last_pad_poll_at: Option<Instant>,
+    /// One-shot while snapshot is empty (tracks gap start).
+    nav_missing_since: Option<Instant>,
+    /// One-shot while snapshot is non-empty but stale.
+    nav_stale_warned: bool,
+    /// One-shot when start_nav_ready stays false after open.
+    nav_not_ready_warned: bool,
+    /// When the start window was opened (for not-ready timing).
+    start_opened_at: Option<Instant>,
 
     toast_window: Option<window::Id>,
     toast_message: Option<ToastMessage>,
@@ -301,6 +323,7 @@ impl App {
 
         let configure_state = ConfigureState::new(prefs.spectrum.clone());
 
+        let last_discovered = hid_worker.presence_paths();
         let mut app = Self {
             prefs,
             known,
@@ -309,7 +332,7 @@ impl App {
             games,
             edit_draft: None,
             controllers: Vec::new(),
-            last_discovered: dualsense::list_presence_paths().unwrap_or_default(),
+            last_discovered,
             last_battery_poll: Instant::now(),
             identifying,
             refreshing: Arc::new(AtomicBool::new(false)),
@@ -338,8 +361,11 @@ impl App {
             pad_nav: PadNavBank::default(),
             keyboard_cross_hold: CrossHold::default(),
             confirm_key_held: false,
+            cancel_key_held: false,
+            pad_held: FaceHeld::default(),
             running_session: None,
             last_running_check: None,
+            process_enum_inflight: false,
             match_path_cache: HashMap::new(),
             steam_by_id: HashMap::new(),
             steam_installed: None,
@@ -348,6 +374,11 @@ impl App {
             nav_unarmed_warned: false,
             nav_source_logged: None,
             last_nav_log: None,
+            last_pad_poll_at: None,
+            nav_missing_since: None,
+            nav_stale_warned: false,
+            nav_not_ready_warned: false,
+            start_opened_at: None,
             toast_window: None,
             toast_message: None,
             toast_queue: VecDeque::new(),
@@ -368,6 +399,8 @@ impl App {
         // read cannot delay the icon for tens of seconds. Pre-create the toast
         // window hidden so iced keeps a warm GPU compositor for fast popup/Settings opens.
         app.create_tray();
+        #[cfg(all(windows, debug_assertions))]
+        start_hitch_hotkey_worker();
         app.sync_popup_rows();
         app.sync_low_battery();
         app.refresh_analytics_panel();
@@ -529,6 +562,7 @@ impl App {
         match message {
             Message::Tick => self.on_tick(),
             Message::PollResult(result) => self.on_poll_result(result),
+            Message::ProcessEnumResult(result) => self.on_process_enum_result(result),
 
             Message::TrayMenu(id) => match id.as_str() {
                 SETTINGS_ID => self.open_configure(),
@@ -600,6 +634,7 @@ impl App {
 
             Message::StartOpened(id) => {
                 self.start_nav_ready = true;
+                self.nav_not_ready_warned = false;
                 window::set_mode(id, window::Mode::Windowed).chain(window::gain_focus(id))
             }
             Message::StartFrame => {
@@ -615,6 +650,8 @@ impl App {
                         return self.complete_replace_confirm();
                     }
                 }
+                self.sync_start_held();
+                self.start_state.tick_hint_anims(now);
                 Task::none()
             }
             Message::Start(message) => self.on_start_message(message),
@@ -635,13 +672,14 @@ impl App {
                             self.on_start_message(StartMessage::MoveDown)
                         }
                         StartKeyAction::Confirm => {
+                            self.confirm_key_held = pressed;
+                            self.sync_start_held();
                             if self.start_state.replace_confirm.is_some() {
                                 if pressed {
                                     self.pad_nav.cancel_holds();
                                 }
-                                self.confirm_key_held = pressed;
                                 Task::none()
-                            } else if pressed {
+                            } else if !pressed {
                                 self.cancel_start_holds();
                                 self.on_start_message(StartMessage::Confirm)
                             } else {
@@ -649,7 +687,9 @@ impl App {
                             }
                         }
                         StartKeyAction::Cancel => {
-                            if pressed {
+                            self.cancel_key_held = pressed;
+                            self.sync_start_held();
+                            if !pressed {
                                 self.cancel_start_holds();
                                 self.on_start_message(StartMessage::Close)
                             } else {
@@ -734,13 +774,7 @@ impl App {
             return Task::none();
         }
 
-        let discovered = match dualsense::list_presence_paths() {
-            Ok(serials) => serials,
-            Err(err) => {
-                app_log::warn(format!("presence scan failed: {err}"));
-                return Task::none();
-            }
-        };
+        let discovered = self.hid_worker.presence_paths();
 
         let membership_changed = discovered != self.last_discovered;
         self.last_discovered = discovered;
@@ -1179,7 +1213,7 @@ impl App {
                 self.configure_state.select_section(section);
                 if section == Section::PadInput {
                     match start_input::read_nav_readings() {
-                        start_input::NavReadingsOutcome::Readings(readings) => {
+                        start_input::NavReadingsOutcome::Readings { readings, .. } => {
                             self.apply_pad_input_panel_from_readings(&readings);
                         }
                         start_input::NavReadingsOutcome::Missing { .. } => {
@@ -1676,11 +1710,11 @@ impl App {
         self.start_state.set_controllers(rows);
     }
 
-    fn refresh_running_badge(&mut self) {
-        self.refresh_running_badge_inner(false);
+    fn refresh_running_badge(&mut self) -> Task<Message> {
+        self.refresh_running_badge_inner(false)
     }
 
-    fn refresh_running_badge_inner(&mut self, force: bool) {
+    fn refresh_running_badge_inner(&mut self, _force: bool) -> Task<Message> {
         let now = Instant::now();
 
         // Optimistic UI during Steam/game start — no process enumeration.
@@ -1688,20 +1722,49 @@ impl App {
             && now.duration_since(session.launched_at) < process_match::LAUNCH_GRACE
         {
             self.start_state.running_target = Some(session.target.clone());
-            return;
+            return Task::none();
         }
 
-        if !force
-            && self
-                .last_running_check
-                .is_some_and(|t| now.duration_since(t) < RUNNING_CHECK_INTERVAL)
+        if self.process_enum_inflight {
+            return Task::none();
+        }
+
+        if self
+            .last_running_check
+            .is_some_and(|t| now.duration_since(t) < RUNNING_CHECK_INTERVAL)
         {
-            return;
+            return Task::none();
         }
         self.last_running_check = Some(now);
+        self.process_enum_inflight = true;
+
+        Task::perform(
+            spawn_blocking(process_match::list_process_images),
+            Message::ProcessEnumResult,
+        )
+    }
+
+    fn on_process_enum_result(
+        &mut self,
+        result: Result<Vec<(u32, PathBuf)>, String>,
+    ) -> Task<Message> {
+        self.process_enum_inflight = false;
+        let images = match result {
+            Ok(images) => images,
+            Err(err) => {
+                app_log::warn(format!("process enum failed: {err}"));
+                return Task::none();
+            }
+        };
+        self.apply_running_badge_from_images(&images);
+        Task::none()
+    }
+
+    fn apply_running_badge_from_images(&mut self, images: &[(u32, PathBuf)]) {
+        let now = Instant::now();
 
         if let Some(session) = self.running_session.as_mut() {
-            if process_match::any_matching_running(&session.match_paths) {
+            if process_match::any_matching_in_images(&session.match_paths, images) {
                 session.miss_since = None;
                 self.start_state.running_target = Some(session.target.clone());
                 return;
@@ -1728,7 +1791,7 @@ impl App {
             self.start_state.running_target = None;
         }
 
-        self.try_restore_running_from_catalog();
+        self.try_restore_running_from_catalog(images);
     }
 
     fn cached_match_paths(&mut self, target: &str) -> Vec<PathBuf> {
@@ -1742,7 +1805,7 @@ impl App {
     }
 
     /// Scan catalog targets for a live process (single process snapshot).
-    fn try_restore_running_from_catalog(&mut self) {
+    fn try_restore_running_from_catalog(&mut self, images: &[(u32, PathBuf)]) {
         let candidates: Vec<(String, String)> = self
             .start_state
             .rows
@@ -1758,7 +1821,7 @@ impl App {
             .map(|(_, target)| self.cached_match_paths(target))
             .collect();
 
-        let Some(idx) = process_match::first_matching_index(&path_sets) else {
+        let Some(idx) = process_match::first_matching_index_in_images(&path_sets, images) else {
             return;
         };
         let (title, target) = candidates[idx].clone();
@@ -1919,16 +1982,17 @@ impl App {
         if let Some(id) = self.start_window {
             // Re-focus existing window; force running restore in case game started while closed.
             self.last_running_check = None;
-            self.refresh_running_badge();
-            return window::gain_focus(id);
+            let badge = self.refresh_running_badge();
+            return Task::batch([badge, window::gain_focus(id)]);
         }
 
         self.start_nav_ready = false;
         self.gesture_detectors.reset();
         self.clear_start_nav_diag();
+        self.start_opened_at = Some(Instant::now());
         // refresh_start_rows already ran a throttled check; force one restore on open.
         self.last_running_check = None;
-        self.refresh_running_badge();
+        let badge = self.refresh_running_badge();
 
         let (id, open) = window::open(window::Settings {
             size: Size::new(start_view::WIDTH, start_view::HEIGHT),
@@ -1943,7 +2007,7 @@ impl App {
             ..window::Settings::default()
         });
         self.start_window = Some(id);
-        open.map(Message::StartOpened)
+        Task::batch([badge, open.map(Message::StartOpened)])
     }
 
     /// Reset to Games and (optionally) require a full control release before nav fires.
@@ -1952,6 +2016,8 @@ impl App {
         self.pad_nav.prepare_on_open(arm_immediately);
         self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
+        self.cancel_key_held = false;
+        self.pad_held = FaceHeld::default();
     }
 
     fn close_start_screen(&mut self) -> Task<Message> {
@@ -1959,6 +2025,8 @@ impl App {
         self.pad_nav.reset();
         self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
+        self.cancel_key_held = false;
+        self.pad_held = FaceHeld::default();
         self.start_state.reset_to_games();
         self.discard_edit_draft();
         self.clear_start_nav_diag();
@@ -1973,6 +2041,26 @@ impl App {
         self.nav_unarmed_warned = false;
         self.nav_source_logged = None;
         self.last_nav_log = None;
+        self.last_pad_poll_at = None;
+        self.nav_missing_since = None;
+        self.nav_stale_warned = false;
+        self.nav_not_ready_warned = false;
+        self.start_opened_at = None;
+    }
+
+    /// Mouse report buttons — stamp both logs with kind + live snapshot context.
+    #[cfg(debug_assertions)]
+    fn mark_hitch_now(&mut self, kind: &str) {
+        let start_open = self.start_window.is_some();
+        let nav_ready = self.start_nav_ready;
+        let controllers = self.controllers.len();
+        stamp_hitch_report(
+            kind,
+            "button",
+            Some(format!(
+                "start_open={start_open} nav_ready={nav_ready} controllers={controllers}"
+            )),
+        );
     }
 
     fn log_start_nav_diag(&mut self, reading: &start_input::NavReading, pad_count: usize) {
@@ -2000,6 +2088,8 @@ impl App {
             | StartMessage::ControllersScrolled(..)
             | StartMessage::ManualAddTitle(_)
             | StartMessage::ManualAddArgs(_) => {}
+            #[cfg(debug_assertions)]
+            StartMessage::ReportLightbarFailure | StartMessage::ReportInputFailure => {}
             _ => self.cancel_start_holds(),
         }
         match message {
@@ -2007,12 +2097,20 @@ impl App {
                 if index < self.start_state.rows.len() {
                     self.start_state.game_selected = index;
                 }
-                self.play_start_sound(UiSoundKind::Action);
                 let scroll = self.scroll_start_selection_into_view();
                 if self.start_state.editing {
-                    scroll.chain(self.edit_toggle_selected())
+                    match self.edit_toggle_selected() {
+                        Some(task) => {
+                            self.play_start_sound(UiSoundKind::Action);
+                            scroll.chain(task)
+                        }
+                        None => scroll,
+                    }
+                } else if self.launch_selected() {
+                    self.play_start_sound(UiSoundKind::Action);
+                    scroll
                 } else {
-                    scroll.chain(self.launch_selected())
+                    scroll
                 }
             }
             StartMessage::SelectController(index) => {
@@ -2042,22 +2140,22 @@ impl App {
                     direction.unwrap_or(start_view::ScrollReveal::Down),
                 )
             }
-            StartMessage::Confirm => {
-                self.play_start_sound(UiSoundKind::Action);
-                self.on_start_confirm()
-            }
+            StartMessage::Confirm => self.on_start_confirm(),
             StartMessage::Close => {
-                if self.start_state.manual_add.take().is_some()
-                    || self.start_state.replace_confirm.take().is_some()
-                {
+                if self.start_state.manual_add.is_some() {
+                    self.play_start_sound(UiSoundKind::Action);
+                    self.cancel_manual_add()
+                } else if self.start_state.replace_confirm.take().is_some() {
                     self.play_start_sound(UiSoundKind::Action);
                     Task::none()
                 } else if self.start_state.editing {
                     self.play_start_sound(UiSoundKind::Action);
                     self.cancel_start_edit()
-                } else {
+                } else if self.start_window.is_some() {
                     self.play_start_sound(UiSoundKind::Action);
                     self.close_start_screen()
+                } else {
+                    Task::none()
                 }
             }
             StartMessage::PrevSlide => {
@@ -2086,14 +2184,20 @@ impl App {
                     .request_slide(StartSlide::Controllers, Instant::now());
                 Task::none()
             }
-            StartMessage::ToggleEdit => {
-                self.play_start_sound(UiSoundKind::Action);
-                self.toggle_start_edit()
-            }
-            StartMessage::CycleSort => {
-                self.play_start_sound(UiSoundKind::Action);
-                self.cycle_games_sort()
-            }
+            StartMessage::ToggleEdit => match self.toggle_start_edit() {
+                Some(task) => {
+                    self.play_start_sound(UiSoundKind::Action);
+                    task
+                }
+                None => Task::none(),
+            },
+            StartMessage::CycleSort => match self.cycle_games_sort() {
+                Some(task) => {
+                    self.play_start_sound(UiSoundKind::Action);
+                    task
+                }
+                None => Task::none(),
+            },
             StartMessage::AddShortcut => {
                 if self.start_state.editing && !self.start_state.overlay_blocking() {
                     self.play_start_sound(UiSoundKind::Action);
@@ -2141,6 +2245,16 @@ impl App {
                 }
                 Task::none()
             }
+            #[cfg(debug_assertions)]
+            StartMessage::ReportLightbarFailure => {
+                self.mark_hitch_now("lightbar");
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            StartMessage::ReportInputFailure => {
+                self.mark_hitch_now("input");
+                Task::none()
+            }
         }
     }
 
@@ -2154,9 +2268,21 @@ impl App {
 
     fn cancel_start_holds(&mut self) {
         self.pad_nav.cancel_holds();
+        self.pad_nav.cancel_held_face_releases();
         self.keyboard_cross_hold.cancel();
         self.start_state.triangle_progress = 0.0;
         self.start_state.cross_progress = 0.0;
+    }
+
+    fn sync_start_held(&mut self) {
+        let mut held = self.pad_held;
+        if self.confirm_key_held {
+            held.cross = true;
+        }
+        if self.cancel_key_held {
+            held.circle = true;
+        }
+        self.start_state.held = held;
     }
 
     fn scroll_start_selection_into_view(&mut self) -> Task<Message> {
@@ -2199,31 +2325,31 @@ impl App {
         )
     }
 
-    fn toggle_start_edit(&mut self) -> Task<Message> {
+    fn toggle_start_edit(&mut self) -> Option<Task<Message>> {
         if self.start_state.slide != StartSlide::Games
             || self.start_state.overlay_blocking()
             || self.start_state.animating()
         {
-            return Task::none();
+            return None;
         }
-        if self.start_state.editing {
+        Some(if self.start_state.editing {
             self.commit_start_edit()
         } else {
             self.enter_start_edit()
-        }
+        })
     }
 
-    fn cycle_games_sort(&mut self) -> Task<Message> {
+    fn cycle_games_sort(&mut self) -> Option<Task<Message>> {
         if self.start_state.editing
             || self.start_state.slide != StartSlide::Games
             || self.start_state.overlay_blocking()
         {
-            return Task::none();
+            return None;
         }
         self.prefs.games_sort_mode = self.prefs.games_sort_mode.cycle();
         self.prefs.save();
         self.refresh_start_rows();
-        self.scroll_start_selection_into_view()
+        Some(self.scroll_start_selection_into_view())
     }
 
     fn pick_manual_shortcut(&mut self) -> Task<Message> {
@@ -2291,15 +2417,12 @@ impl App {
         Task::none()
     }
 
-    fn edit_toggle_selected(&mut self) -> Task<Message> {
-        let Some(row) = self
+    fn edit_toggle_selected(&mut self) -> Option<Task<Message>> {
+        let row = self
             .start_state
             .rows
             .get(self.start_state.game_selected)
-            .cloned()
-        else {
-            return Task::none();
-        };
+            .cloned()?;
         let changed = match row.edit.as_ref() {
             Some(start_view::EditRow::Steam { appid, in_catalog }) => {
                 self.edit_catalog_mut().toggle_steam(*appid, !*in_catalog)
@@ -2311,13 +2434,15 @@ impl App {
         };
         if changed {
             self.refresh_start_rows();
-            return self.scroll_start_selection_into_view();
+            Some(self.scroll_start_selection_into_view())
+        } else {
+            None
         }
-        Task::none()
     }
 
     fn on_start_confirm(&mut self) -> Task<Message> {
         if self.start_state.manual_add.is_some() {
+            self.play_start_sound(UiSoundKind::Action);
             return self.confirm_manual_add();
         }
         // Replace confirm requires hold-Cross / hold-Enter (see pad poll / key hold).
@@ -2325,12 +2450,25 @@ impl App {
             return Task::none();
         }
         match self.start_state.slide {
-            StartSlide::Games if self.start_state.editing => self.edit_toggle_selected(),
-            StartSlide::Games => self.launch_selected(),
+            StartSlide::Games if self.start_state.editing => match self.edit_toggle_selected() {
+                Some(task) => {
+                    self.play_start_sound(UiSoundKind::Action);
+                    task
+                }
+                None => Task::none(),
+            },
+            StartSlide::Games => {
+                if self.launch_selected() {
+                    self.play_start_sound(UiSoundKind::Action);
+                }
+                Task::none()
+            }
             StartSlide::Controllers => {
                 if let Some(row) = self.start_state.selected_controller() {
                     let serial = row.serial.clone();
-                    let _ = self.identify(&serial);
+                    if self.identify(&serial) {
+                        self.play_start_sound(UiSoundKind::Action);
+                    }
                 }
                 Task::none()
             }
@@ -2346,22 +2484,24 @@ impl App {
         self.start_state.cross_progress = 0.0;
         self.close_running_game();
         self.start_state.game_selected = confirm.next_index;
-        self.launch_selected()
+        let _ = self.launch_selected();
+        Task::none()
     }
 
-    fn launch_selected(&mut self) -> Task<Message> {
+    /// Launch the selected game. Returns true when launch, replace-confirm, or a real attempt ran.
+    fn launch_selected(&mut self) -> bool {
         let Some(row) = self
             .start_state
             .rows
             .get(self.start_state.game_selected)
             .cloned()
         else {
-            return Task::none();
+            return false;
         };
 
         if let Some(session) = self.running_session.as_ref() {
             if session.matches_target(&row.target) {
-                return Task::none();
+                return false;
             }
             if process_match::any_matching_running(&session.match_paths) {
                 self.start_state.replace_confirm = Some(ReplaceConfirm {
@@ -2369,7 +2509,7 @@ impl App {
                     next_title: row.title.clone(),
                     next_index: self.start_state.game_selected,
                 });
-                return Task::none();
+                return true;
             }
             self.running_session = None;
             self.start_state.running_target = None;
@@ -2379,24 +2519,51 @@ impl App {
             Ok(()) => {
                 self.touch_last_played(&row.play_key);
                 self.begin_running_session(row.title, row.target);
-                Task::none()
+                true
             }
             Err(err) => {
                 app_log::warn(format!("launch failed for {}: {err}", row.target));
-                Task::none()
+                false
             }
         }
     }
 
     fn on_pad_poll(&mut self) -> Task<Message> {
+        let poll_started = Instant::now();
+        let start_open = self.start_window.is_some();
+
+        if start_open {
+            if let Some(prev) = self.last_pad_poll_at {
+                let gap_ms = prev.elapsed().as_millis();
+                if gap_ms >= PAD_POLL_STALL_MS {
+                    crate::hid_diag::diag_info(format!("ui-diag: pad-poll stall gap_ms={gap_ms}"));
+                }
+            }
+            self.last_pad_poll_at = Some(poll_started);
+
+            if !self.start_nav_ready
+                && !self.nav_not_ready_warned
+                && self
+                    .start_opened_at
+                    .is_some_and(|t| t.elapsed().as_millis() >= START_NAV_NOT_READY_MS)
+            {
+                let for_ms = self
+                    .start_opened_at
+                    .map(|t| t.elapsed().as_millis())
+                    .unwrap_or(0);
+                app_log::warn(format!("start-nav: not ready for_ms={for_ms}"));
+                self.nav_not_ready_warned = true;
+            }
+        }
+
         let pad_input_open =
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
         let listening = self.prefs.start_screen_enabled
             && (!self.controllers.is_empty() || self.gesture_recorder.is_active());
 
-        let readings = match start_input::read_nav_readings() {
-            start_input::NavReadingsOutcome::Readings(r) => r,
-            start_input::NavReadingsOutcome::Missing { .. } => Vec::new(),
+        let (readings, meta) = match start_input::read_nav_readings() {
+            start_input::NavReadingsOutcome::Readings { readings, meta } => (readings, Some(meta)),
+            start_input::NavReadingsOutcome::Missing { meta } => (Vec::new(), Some(meta)),
         };
 
         if pad_input_open {
@@ -2411,20 +2578,60 @@ impl App {
             return self.on_gesture_record(&readings);
         }
 
-        if self.start_window.is_some() {
+        if start_open {
             if !self.start_nav_ready {
                 return Task::none();
             }
             if readings.is_empty() {
-                if !self.nav_missing_warned && !self.controllers.is_empty() {
-                    app_log::warn(
-                        "start-nav: no hid-worker input snapshot yet; keyboard/mouse still work",
-                    );
-                    self.nav_missing_warned = true;
+                if let Some(meta) = &meta {
+                    let age_ms = meta.published_at.elapsed().as_millis();
+                    if self.nav_missing_since.is_none() {
+                        self.nav_missing_since = Some(Instant::now());
+                    }
+                    if !self.nav_missing_warned && !self.controllers.is_empty() {
+                        app_log::warn(format!(
+                            "start-nav: no hid-worker input snapshot yet; keyboard/mouse still work reason={} age_ms={age_ms} seq={}",
+                            meta.reason.as_str(),
+                            meta.seq
+                        ));
+                        self.nav_missing_warned = true;
+                    }
                 }
                 return Task::none();
             }
-            return self.handle_start_nav_readings(&readings);
+
+            if let Some(since) = self.nav_missing_since.take() {
+                let gap_ms = since.elapsed().as_millis();
+                let reason = meta.as_ref().map(|m| m.reason.as_str()).unwrap_or("-");
+                app_log::info(format!(
+                    "start-nav: snapshot restored gap_ms={gap_ms} pads={} reason={reason}",
+                    readings.len()
+                ));
+                self.nav_missing_warned = false;
+            }
+
+            if let Some(meta) = &meta {
+                let age_ms = meta.published_at.elapsed().as_millis();
+                if age_ms >= SNAPSHOT_STALE_MS {
+                    if !self.nav_stale_warned {
+                        app_log::warn(format!(
+                            "start-nav: snapshot stale age_ms={age_ms} seq={} reason={}",
+                            meta.seq,
+                            meta.reason.as_str()
+                        ));
+                        self.nav_stale_warned = true;
+                    }
+                } else {
+                    self.nav_stale_warned = false;
+                }
+            }
+
+            let task = self.handle_start_nav_readings(&readings);
+            let total_ms = poll_started.elapsed().as_millis();
+            if total_ms >= PAD_POLL_SLOW_MS {
+                crate::hid_diag::diag_info(format!("ui-diag: pad-poll slow total_ms={total_ms}"));
+            }
+            return task;
         }
 
         self.on_reopen_gesture(&readings)
@@ -2437,10 +2644,24 @@ impl App {
         let animating = self.start_state.animating();
         // Mid-slide: keep L2/R2 edges live for interruptible request_slide,
         // but skip controller-row rebuilds (those hitch the UI thread).
-        if !animating {
+        let badge_task = if !animating {
+            let controllers_started = Instant::now();
             self.refresh_start_controllers();
-            self.refresh_running_badge();
-        }
+            let controllers_ms = controllers_started.elapsed().as_millis();
+
+            let badge_started = Instant::now();
+            let badge = self.refresh_running_badge();
+            let badge_ms = badge_started.elapsed().as_millis();
+
+            if controllers_ms >= PAD_POLL_SLOW_MS || badge_ms >= PAD_POLL_SLOW_MS {
+                crate::hid_diag::diag_info(format!(
+                    "ui-diag: pad-poll slow controllers_ms={controllers_ms} badge_ms={badge_ms}"
+                ));
+            }
+            badge
+        } else {
+            Task::none()
+        };
 
         let _ = self.start_state.tick_anim(now);
 
@@ -2475,20 +2696,22 @@ impl App {
             self.nav_unarmed_warned = false;
         }
 
-        if animating {
+        self.pad_held = tick.held;
+        self.sync_start_held();
+
+        let nav_task = if animating {
+            self.start_state.tick_hint_anims(now);
             if let Some(action) = tick.action {
-                let next = match action {
+                match action {
                     NavAction::PrevSlide => self.on_start_message(StartMessage::PrevSlide),
                     NavAction::NextSlide => self.on_start_message(StartMessage::NextSlide),
                     NavAction::Cancel => self.on_start_message(StartMessage::Close),
                     _ => Task::none(),
-                };
-                return next;
+                }
+            } else {
+                Task::none()
             }
-            return Task::none();
-        }
-
-        if replace_confirm {
+        } else if replace_confirm {
             let mut cross_progress = tick.cross_progress;
             let mut cross_completed = tick.cross_completed;
             let (k_progress, k_completed) =
@@ -2497,82 +2720,80 @@ impl App {
             cross_completed = cross_completed || k_completed;
             self.start_state.cross_progress = cross_progress;
             self.start_state.triangle_progress = 0.0;
+            self.start_state.tick_hint_anims(now);
             if cross_completed {
                 self.play_start_sound(UiSoundKind::Hold);
-                return self.complete_replace_confirm();
-            }
-            if tick.action == Some(NavAction::Cancel) {
+                self.complete_replace_confirm()
+            } else if tick.action == Some(NavAction::Cancel) {
                 self.keyboard_cross_hold.cancel();
                 self.start_state.cross_progress = 0.0;
-                return self.on_start_message(StartMessage::Close);
+                self.on_start_message(StartMessage::Close)
+            } else {
+                Task::none()
             }
-            return Task::none();
-        }
-
-        if manual_add {
+        } else if manual_add {
             self.start_state.cross_progress = 0.0;
             self.start_state.triangle_progress = 0.0;
-            self.confirm_key_held = false;
             self.keyboard_cross_hold.reset();
+            self.start_state.tick_hint_anims(now);
             if let Some(action) = tick.action {
-                let next = match action {
-                    NavAction::Confirm => {
-                        self.play_start_sound(UiSoundKind::Action);
-                        self.confirm_manual_add()
-                    }
-                    NavAction::Cancel => {
-                        self.play_start_sound(UiSoundKind::Action);
-                        self.cancel_manual_add()
-                    }
+                match action {
+                    NavAction::Confirm | NavAction::Cancel => self.on_start_message(match action {
+                        NavAction::Confirm => StartMessage::Confirm,
+                        _ => StartMessage::Close,
+                    }),
                     _ => Task::none(),
-                };
-                return next;
+                }
+            } else {
+                Task::none()
             }
-            return Task::none();
-        }
-
-        self.start_state.cross_progress = 0.0;
-        self.confirm_key_held = false;
-        self.keyboard_cross_hold.reset();
-
-        if self.start_state.editing {
-            self.start_state.triangle_progress = 0.0;
         } else {
-            self.start_state.triangle_progress = tick.triangle_progress;
-            if tick.triangle_completed {
-                self.play_start_sound(UiSoundKind::Hold);
-                match self.start_state.slide {
-                    StartSlide::Games => self.close_running_game(),
-                    StartSlide::Controllers => {
-                        if let Some(row) = self.start_state.selected_controller()
-                            && row.bluetooth
-                        {
-                            let serial = row.serial.clone();
-                            self.power_off(&serial);
+            self.start_state.cross_progress = 0.0;
+            self.keyboard_cross_hold.reset();
+
+            if self.start_state.editing {
+                self.start_state.triangle_progress = 0.0;
+            } else {
+                self.start_state.triangle_progress = tick.triangle_progress;
+                if tick.triangle_completed {
+                    self.play_start_sound(UiSoundKind::Hold);
+                    match self.start_state.slide {
+                        StartSlide::Games => self.close_running_game(),
+                        StartSlide::Controllers => {
+                            if let Some(row) = self.start_state.selected_controller()
+                                && row.bluetooth
+                            {
+                                let serial = row.serial.clone();
+                                self.power_off(&serial);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        if let Some(action) = tick.action {
-            let next = match action {
-                NavAction::Up => self.on_start_message(StartMessage::MoveUp),
-                NavAction::Down => self.on_start_message(StartMessage::MoveDown),
-                NavAction::Confirm => self.on_start_message(StartMessage::Confirm),
-                NavAction::Cancel => self.on_start_message(StartMessage::Close),
-                NavAction::PrevSlide => self.on_start_message(StartMessage::PrevSlide),
-                NavAction::NextSlide => self.on_start_message(StartMessage::NextSlide),
-                NavAction::ToggleEdit => self.on_start_message(StartMessage::ToggleEdit),
-                NavAction::CycleSort => self.on_start_message(StartMessage::CycleSort),
-                NavAction::Triangle if self.start_state.editing => {
-                    self.on_start_message(StartMessage::EditManual)
+            self.start_state.tick_hint_anims(now);
+
+            if let Some(action) = tick.action {
+                match action {
+                    NavAction::Up => self.on_start_message(StartMessage::MoveUp),
+                    NavAction::Down => self.on_start_message(StartMessage::MoveDown),
+                    NavAction::Confirm => self.on_start_message(StartMessage::Confirm),
+                    NavAction::Cancel => self.on_start_message(StartMessage::Close),
+                    NavAction::PrevSlide => self.on_start_message(StartMessage::PrevSlide),
+                    NavAction::NextSlide => self.on_start_message(StartMessage::NextSlide),
+                    NavAction::ToggleEdit => self.on_start_message(StartMessage::ToggleEdit),
+                    NavAction::CycleSort => self.on_start_message(StartMessage::CycleSort),
+                    NavAction::Triangle if self.start_state.editing => {
+                        self.on_start_message(StartMessage::EditManual)
+                    }
+                    NavAction::Triangle => Task::none(),
                 }
-                NavAction::Triangle => Task::none(),
-            };
-            return next;
-        }
-        Task::none()
+            } else {
+                Task::none()
+            }
+        };
+
+        Task::batch([badge_task, nav_task])
     }
 
     fn on_gesture_record(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
@@ -2797,6 +3018,83 @@ fn tray_events_mapped() -> impl Stream<Item = Message> {
         tray::TrayEvent::Menu(id) => Message::TrayMenu(id),
         tray::TrayEvent::LeftClick(anchor) => Message::TrayLeftClick(anchor),
     })
+}
+
+/// Stamp a hitch mark using the shared input snapshot (safe off the UI thread).
+#[cfg(debug_assertions)]
+fn stamp_hitch_report(kind: &str, source: &str, extra: Option<String>) {
+    let (pads, reason, age_ms, seq) = match start_input::read_nav_readings() {
+        start_input::NavReadingsOutcome::Readings { readings, meta } => (
+            readings.len(),
+            meta.reason.as_str(),
+            meta.published_at.elapsed().as_millis(),
+            meta.seq,
+        ),
+        start_input::NavReadingsOutcome::Missing { meta } => (
+            0,
+            meta.reason.as_str(),
+            meta.published_at.elapsed().as_millis(),
+            meta.seq,
+        ),
+    };
+    let ctx = crate::hid_diag::failure_context();
+    let extra = extra.map(|e| format!(" {e}")).unwrap_or_default();
+    app_log::mark_hitch(format!(
+        "kind={kind} source={source}{extra} pads={pads} reason={reason} age_ms={age_ms} seq={seq} {ctx}"
+    ));
+}
+
+/// Global F7 / F8 hitch markers — own Win32 message pump so marks still land if iced is stuck.
+/// Debug builds only (`cfg(debug_assertions)`).
+#[cfg(all(windows, debug_assertions))]
+fn start_hitch_hotkey_worker() {
+    use std::sync::OnceLock;
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        thread::spawn(|| unsafe {
+            if win32::RegisterHotKey(
+                0,
+                win32::HOTKEY_ID_LIGHTBAR_HITCH,
+                win32::MOD_NOREPEAT,
+                win32::VK_F7,
+            ) == 0
+            {
+                app_log::warn("hitch hotkey: failed to register F7");
+                return;
+            }
+            if win32::RegisterHotKey(
+                0,
+                win32::HOTKEY_ID_INPUT_HITCH,
+                win32::MOD_NOREPEAT,
+                win32::VK_F8,
+            ) == 0
+            {
+                app_log::warn("hitch hotkey: failed to register F8");
+                win32::UnregisterHotKey(0, win32::HOTKEY_ID_LIGHTBAR_HITCH);
+                return;
+            }
+            app_log::info("hitch hotkeys armed: F7=lightbar F8=input");
+
+            let mut message = win32::Message::default();
+            while win32::GetMessageW(&mut message, 0, 0, 0) > 0 {
+                if message.message != win32::WM_HOTKEY {
+                    continue;
+                }
+                let kind = if message.w_param == win32::HOTKEY_ID_LIGHTBAR_HITCH as usize {
+                    "lightbar"
+                } else if message.w_param == win32::HOTKEY_ID_INPUT_HITCH as usize {
+                    "input"
+                } else {
+                    continue;
+                };
+                // Stamp immediately on this thread — do not wait for iced.
+                stamp_hitch_report(kind, "hotkey", None);
+            }
+
+            win32::UnregisterHotKey(0, win32::HOTKEY_ID_LIGHTBAR_HITCH);
+            win32::UnregisterHotKey(0, win32::HOTKEY_ID_INPUT_HITCH);
+        });
+    });
 }
 
 /// Global Escape hotkey while an overlay toast is visible.

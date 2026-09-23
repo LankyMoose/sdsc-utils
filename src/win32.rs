@@ -4,7 +4,15 @@
 
 pub const MOD_NOREPEAT: u32 = 0x4000;
 pub const VK_ESCAPE: u32 = 0x1B;
+#[cfg(debug_assertions)]
+pub const VK_F7: u32 = 0x76;
+#[cfg(debug_assertions)]
+pub const VK_F8: u32 = 0x77;
 pub const HOTKEY_ID: i32 = 0x4454;
+#[cfg(debug_assertions)]
+pub const HOTKEY_ID_LIGHTBAR_HITCH: i32 = 0x4455;
+#[cfg(debug_assertions)]
+pub const HOTKEY_ID_INPUT_HITCH: i32 = 0x4456;
 pub const WM_HOTKEY: u32 = 0x0312;
 pub const WM_QUIT: u32 = 0x0012;
 pub const MONITOR_DEFAULTTOPRIMARY: u32 = 1;

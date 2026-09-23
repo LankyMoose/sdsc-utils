@@ -248,12 +248,14 @@ fn build_bt_control_off_report(size: usize, seed: u8) -> Vec<u8> {
 /// Windows exposes DualSense as multiple HID interfaces; feature report 0x08 may not be
 /// on the Gamepad usage we use for battery. Try every Bluetooth DualSense interface and
 /// several report sizes/CRC seeds until SetFeature succeeds.
+/// Power-off using caller's `HidApi` (hid-worker). CLI can `HidApi::new()` once then call this.
 pub fn power_off_bluetooth_timed(
+    api: &HidApi,
     serial: &str,
 ) -> (Result<(), String>, crate::lightbar::HidPhaseTiming) {
     let mut timing = crate::lightbar::HidPhaseTiming::default();
     let enum_started = std::time::Instant::now();
-    let result = power_off_bluetooth_unlocked_timed(serial, &mut timing);
+    let result = power_off_bluetooth_unlocked_timed(api, serial, &mut timing);
     if timing.enumerate_ms == 0 && timing.open_ms == 0 && timing.io_ms == 0 {
         timing.enumerate_ms = enum_started.elapsed().as_millis();
     }
@@ -261,11 +263,11 @@ pub fn power_off_bluetooth_timed(
 }
 
 fn power_off_bluetooth_unlocked_timed(
+    api: &HidApi,
     serial: &str,
     timing: &mut crate::lightbar::HidPhaseTiming,
 ) -> Result<(), String> {
     let enum_started = std::time::Instant::now();
-    let api = HidApi::new().map_err(|e| e.to_string())?;
     let target = normalize_identity(serial);
 
     let mut matched: Vec<(String, HidDevice)> = Vec::new();
@@ -277,7 +279,7 @@ fn power_off_bluetooth_unlocked_timed(
         }
         let path = info.path().to_string_lossy().into_owned();
         let open_started = std::time::Instant::now();
-        let device = match info.open_device(&api) {
+        let device = match info.open_device(api) {
             Ok(d) => d,
             Err(err) => {
                 open_ms += open_started.elapsed().as_millis();

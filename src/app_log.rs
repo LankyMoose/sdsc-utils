@@ -1,73 +1,198 @@
 //! Simple append-only file logger (visible under windows_subsystem = "windows").
+//!
+//! - `app.log` — edge-triggered summaries (second resolution, 1 MB rotate)
+//! - `hid-trace.log` — every HID open/write/read attempt (ms resolution, 16 MB rotate);
+//!   **debug builds only** (`cfg(debug_assertions)`)
 
 use crate::app_meta::{DISPLAY_NAME, PKG_NAME, PKG_VERSION};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime};
 
 const MAX_LOG_BYTES: u64 = 1_000_000;
+#[cfg(debug_assertions)]
+const MAX_HID_TRACE_BYTES: u64 = 16_000_000;
 
 static LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(debug_assertions)]
+static HID_TRACE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+static SESSION_ID: AtomicU64 = AtomicU64::new(0);
+static SESSION_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
 
 pub fn init() {
-    let path = log_file_path();
+    let path = log_file_path("app.log");
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    rotate_if_needed(&path);
+    rotate_if_needed(&path, MAX_LOG_BYTES, "log.1");
     if let Ok(mut guard) = LOG_PATH.lock() {
         *guard = Some(path);
     }
+
+    #[cfg(debug_assertions)]
+    {
+        let trace = log_file_path("hid-trace.log");
+        rotate_if_needed(&trace, MAX_HID_TRACE_BYTES, "log.1");
+        if let Ok(mut guard) = HID_TRACE_PATH.lock() {
+            *guard = Some(trace);
+        }
+    }
+
+    let session_id = epoch_ms() as u64;
+    SESSION_ID.store(session_id, Ordering::Relaxed);
+    if let Ok(mut guard) = SESSION_STARTED.lock() {
+        *guard = Some(Instant::now());
+    }
+
     info(format!(
-        "{DISPLAY_NAME} ({PKG_NAME}) {PKG_VERSION} starting"
+        "{DISPLAY_NAME} ({PKG_NAME}) {PKG_VERSION} starting session={session_id}"
     ));
+    #[cfg(debug_assertions)]
+    hid_trace(format!("session start id={session_id}"));
 }
 
-fn log_file_path() -> PathBuf {
+/// Stable id for this process run (epoch ms at init). Appears in both log files.
+#[allow(dead_code)] // hitch marks (debug builds)
+pub fn session_id() -> u64 {
+    SESSION_ID.load(Ordering::Relaxed)
+}
+
+/// Milliseconds since [`init`].
+#[allow(dead_code)] // hitch marks (debug builds)
+pub fn session_uptime_ms() -> u128 {
+    SESSION_STARTED
+        .lock()
+        .ok()
+        .and_then(|g| g.map(|t| t.elapsed().as_millis()))
+        .unwrap_or(0)
+}
+
+/// User-marked hitch: stamp both logs so short sessions can be aligned later.
+/// No-op in release builds.
+#[allow(dead_code)] // hitch UI / hotkeys (debug builds)
+pub fn mark_hitch(extra: impl AsRef<str>) {
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = extra;
+        return;
+    }
+    #[cfg(debug_assertions)]
+    {
+        let sid = session_id();
+        let up_ms = session_uptime_ms();
+        let extra = extra.as_ref();
+        let detail = if extra.is_empty() {
+            String::new()
+        } else {
+            format!(" {extra}")
+        };
+        let line = format!("HITCH_MARK session={sid} up_ms={up_ms}{detail}");
+        warn(line.clone());
+        hid_trace(line);
+    }
+}
+
+fn log_file_path(file_name: &str) -> PathBuf {
     #[cfg(windows)]
     {
         if let Some(appdata) = std::env::var_os("APPDATA") {
-            return PathBuf::from(appdata).join(PKG_NAME).join("app.log");
+            return PathBuf::from(appdata).join(PKG_NAME).join(file_name);
         }
     }
 
     #[cfg(not(windows))]
     {
         if let Ok(state) = std::env::var("XDG_STATE_HOME") {
-            return PathBuf::from(state).join(PKG_NAME).join("app.log");
+            return PathBuf::from(state).join(PKG_NAME).join(file_name);
         }
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home)
                 .join(".local")
                 .join("state")
                 .join(PKG_NAME)
-                .join("app.log");
+                .join(file_name);
         }
     }
 
-    PathBuf::from(format!("{PKG_NAME}.log"))
+    PathBuf::from(format!("{PKG_NAME}-{file_name}"))
 }
 
-fn rotate_if_needed(path: &Path) {
+fn rotate_if_needed(path: &Path, max_bytes: u64, bak_ext: &str) {
     if let Ok(meta) = fs::metadata(path)
-        && meta.len() >= MAX_LOG_BYTES
+        && meta.len() >= max_bytes
     {
-        let bak = path.with_extension("log.1");
+        let bak = path.with_extension(bak_ext);
         let _ = fs::remove_file(&bak);
         let _ = fs::rename(path, bak);
     }
 }
 
-fn write_line(level: &str, message: impl AsRef<str>) {
-    let ts = SystemTime::now()
+fn epoch_secs() -> u64 {
+    SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let line = format!("[{ts}] {level}: {}\n", message.as_ref());
+        .unwrap_or(0)
+}
 
-    let path = LOG_PATH.lock().ok().and_then(|g| g.clone());
+fn epoch_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn write_line(level: &str, message: impl AsRef<str>) {
+    let line = format!("[{}] {level}: {}\n", epoch_secs(), message.as_ref());
+    append_to(&LOG_PATH, &line);
+}
+
+/// Compact HID diagnostic stream (millisecond timestamps). Prefer for high-rate I/O.
+/// No-op in release builds.
+#[allow(dead_code)] // called from hid_diag (debug builds)
+pub fn hid_trace(message: impl AsRef<str>) {
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = message;
+    }
+    #[cfg(debug_assertions)]
+    {
+        let started = Instant::now();
+        let line = format!("[{}] {}\n", epoch_ms(), message.as_ref());
+        if let Ok(guard) = HID_TRACE_PATH.lock()
+            && let Some(path) = guard.as_ref()
+        {
+            rotate_if_needed(path, MAX_HID_TRACE_BYTES, "log.1");
+        }
+        append_to(&HID_TRACE_PATH, &line);
+        let ms = started.elapsed().as_millis();
+        if ms >= 50 {
+            let slow = format!("[{}] hid-diag: slow op=hid_trace_io ms={ms}\n", epoch_ms());
+            append_to(&HID_TRACE_PATH, &slow);
+            write_line("INFO", format!("hid-diag: slow op=hid_trace_io ms={ms}"));
+        }
+    }
+}
+
+/// Like [`hid_trace`] but never self-reports slow I/O (watchdog / nested use).
+/// No-op in release builds.
+#[allow(dead_code)] // called from hid_diag (debug builds)
+pub fn hid_trace_raw(message: impl AsRef<str>) {
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = message;
+    }
+    #[cfg(debug_assertions)]
+    {
+        let line = format!("[{}] {}\n", epoch_ms(), message.as_ref());
+        append_to(&HID_TRACE_PATH, &line);
+    }
+}
+
+fn append_to(path_slot: &Mutex<Option<PathBuf>>, line: &str) {
+    let path = path_slot.lock().ok().and_then(|g| g.clone());
     if let Some(path) = path
         && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
     {

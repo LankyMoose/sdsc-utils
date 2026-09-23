@@ -29,7 +29,67 @@ const USB_REPORT_ID: u8 = 0x01;
 const CALIBRATION_FEATURE_REPORT: u8 = 0x05;
 const CALIBRATION_FEATURE_SIZE: usize = 41;
 
-static INPUT_SNAPSHOT: OnceLock<Arc<Mutex<Vec<NavReading>>>> = OnceLock::new();
+static INPUT_SNAPSHOT: OnceLock<Arc<Mutex<InputSnapshot>>> = OnceLock::new();
+
+/// Why the worker last published (or cleared) the input snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotReason {
+    Sample,
+    SamplePartial,
+    /// Cleared before a battery/liveness Poll (legacy; Poll no longer clears the snapshot).
+    #[allow(dead_code)]
+    ClearedPoll,
+    ClearedPowerOff,
+    ClearedShutdown,
+    Identify,
+    LockPoisoned,
+    NeverPublished,
+}
+
+impl SnapshotReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sample => "Sample",
+            Self::SamplePartial => "SamplePartial",
+            Self::ClearedPoll => "ClearedPoll",
+            Self::ClearedPowerOff => "ClearedPowerOff",
+            Self::ClearedShutdown => "ClearedShutdown",
+            Self::Identify => "Identify",
+            Self::LockPoisoned => "LockPoisoned",
+            Self::NeverPublished => "NeverPublished",
+        }
+    }
+}
+
+/// Shared pad samples published by the hid-worker.
+#[derive(Debug, Clone)]
+pub struct InputSnapshot {
+    pub readings: Vec<NavReading>,
+    pub published_at: Instant,
+    pub seq: u64,
+    pub reason: SnapshotReason,
+}
+
+impl Default for InputSnapshot {
+    fn default() -> Self {
+        Self {
+            readings: Vec::new(),
+            published_at: Instant::now(),
+            seq: 0,
+            reason: SnapshotReason::NeverPublished,
+        }
+    }
+}
+
+/// Metadata returned with every PadPoll snapshot read.
+#[derive(Debug, Clone)]
+pub struct SnapshotMeta {
+    pub published_at: Instant,
+    pub seq: u64,
+    pub reason: SnapshotReason,
+    #[allow(dead_code)] // exposed for UI/diag consumers
+    pub pad_count: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavAction {
@@ -241,6 +301,17 @@ impl EdgeButton {
         Self::R2,
     ];
 
+    /// Face + Options: activate on release. L2/R2: activate on press.
+    const RELEASE_FIRE: [Self; 5] = [
+        Self::Cross,
+        Self::Circle,
+        Self::Square,
+        Self::Triangle,
+        Self::Options,
+    ];
+
+    const PRESS_FIRE: [Self; 2] = [Self::L2, Self::R2];
+
     fn action(self) -> NavAction {
         match self {
             Self::Cross => NavAction::Confirm,
@@ -266,7 +337,7 @@ impl EdgeButton {
     }
 }
 
-/// Rising-edge face and shoulder buttons; `hold_owned` never fires here.
+/// Face/Options fire on release; L2/R2 on press. `hold_owned` never fires here.
 #[derive(Debug, Clone, Default)]
 pub struct ButtonEdges {
     cross: bool,
@@ -276,6 +347,12 @@ pub struct ButtonEdges {
     options: bool,
     l2: bool,
     r2: bool,
+    /// Face/Options that went down but were cancelled by a foreign face press.
+    cancel_cross: bool,
+    cancel_circle: bool,
+    cancel_square: bool,
+    cancel_triangle: bool,
+    cancel_options: bool,
 }
 
 impl ButtonEdges {
@@ -291,6 +368,28 @@ impl ButtonEdges {
         }
     }
 
+    fn cancelled(&self, button: EdgeButton) -> bool {
+        match button {
+            EdgeButton::Cross => self.cancel_cross,
+            EdgeButton::Circle => self.cancel_circle,
+            EdgeButton::Square => self.cancel_square,
+            EdgeButton::Triangle => self.cancel_triangle,
+            EdgeButton::Options => self.cancel_options,
+            EdgeButton::L2 | EdgeButton::R2 => false,
+        }
+    }
+
+    fn set_cancelled(&mut self, button: EdgeButton, value: bool) {
+        match button {
+            EdgeButton::Cross => self.cancel_cross = value,
+            EdgeButton::Circle => self.cancel_circle = value,
+            EdgeButton::Square => self.cancel_square = value,
+            EdgeButton::Triangle => self.cancel_triangle = value,
+            EdgeButton::Options => self.cancel_options = value,
+            EdgeButton::L2 | EdgeButton::R2 => {}
+        }
+    }
+
     /// True when any control other than `except` just went down.
     pub fn foreign_press(&self, sample: &PadSample, except: Option<EdgeButton>) -> bool {
         EdgeButton::ALL
@@ -298,20 +397,45 @@ impl ButtonEdges {
             .any(|&b| Some(b) != except && b.held(sample) && !self.prev_held(b))
     }
 
-    /// Fire on rising edge. `hold_owned` is never emitted (hold tracker owns it).
+    /// L2/R2: rising edge. Face/Options: falling edge unless cancelled or `hold_owned`.
     pub fn update(
         &mut self,
         sample: &PadSample,
         hold_owned: Option<EdgeButton>,
     ) -> Option<NavAction> {
-        let mut action = None;
-        for &b in &EdgeButton::ALL {
+        // Foreign face/Options press cancels other held face/Options pending releases.
+        for &b in &EdgeButton::RELEASE_FIRE {
             let now = b.held(sample);
             let was = self.prev_held(b);
-            if now && !was && Some(b) != hold_owned && action.is_none() {
+            if now && !was {
+                for &other in &EdgeButton::RELEASE_FIRE {
+                    if other != b && self.prev_held(other) {
+                        self.set_cancelled(other, true);
+                    }
+                }
+            }
+        }
+
+        let mut action = None;
+        for &b in &EdgeButton::PRESS_FIRE {
+            let now = b.held(sample);
+            let was = self.prev_held(b);
+            if now && !was && action.is_none() {
                 action = Some(b.action());
             }
         }
+        for &b in &EdgeButton::RELEASE_FIRE {
+            let now = b.held(sample);
+            let was = self.prev_held(b);
+            if was && !now {
+                let cancelled = self.cancelled(b);
+                self.set_cancelled(b, false);
+                if !cancelled && Some(b) != hold_owned && action.is_none() {
+                    action = Some(b.action());
+                }
+            }
+        }
+
         self.sync(sample);
         action
     }
@@ -330,55 +454,109 @@ impl ButtonEdges {
     pub fn clear(&mut self) {
         *self = Self::default();
     }
+
+    /// Mark every currently held face/Options so its pending release will not fire.
+    pub fn cancel_held_releases(&mut self) {
+        for &b in &EdgeButton::RELEASE_FIRE {
+            if self.prev_held(b) {
+                self.set_cancelled(b, true);
+            }
+        }
+    }
 }
 
-/// Tracks a face-button hold (0..=1). Completes when full duration is reached while held.
+/// Tracks a face-button hold (0..=1). Charge eases out visually; early release decays.
+/// Completes only on release when charge is full and the press was not cancelled.
 #[derive(Debug, Clone, Default)]
 pub struct HoldTracker {
-    started: Option<Instant>,
-    /// Fired for this press; ignore until release.
-    completed_this_press: bool,
+    /// Linear charge 0..=1 (before ease-out). Continuous hold fills this in [`BUTTON_HOLD`].
+    charge: f32,
+    last_tick: Option<Instant>,
+    /// Button is currently down (for [`Self::is_active`]).
+    holding: bool,
     /// After cancel (e.g. Circle), ignore this press until release.
     suppress_until_release: bool,
 }
 
 const BUTTON_HOLD: Duration = Duration::from_secs(1);
+/// Full-to-empty visual decay after early release.
+const BUTTON_DECAY: Duration = Duration::from_millis(1500);
+
+/// Cubic ease-out: fast start, slow finish. `u` is linear charge 0..=1.
+pub fn hold_ease_out(u: f32) -> f32 {
+    let t = 1.0 - u.clamp(0.0, 1.0);
+    1.0 - t * t * t
+}
+
+/// Inverse of [`hold_ease_out`] so decay can unwind visual progress then restore charge.
+pub fn hold_ease_out_inv(p: f32) -> f32 {
+    let p = p.clamp(0.0, 1.0);
+    1.0 - (1.0 - p).cbrt()
+}
 
 impl HoldTracker {
     /// Returns `(progress, just_completed)`.
     ///
-    /// `just_completed` is true on the frame progress first reaches 1.0 while still held.
+    /// Progress is ease-out of charge (ring fill). `just_completed` is true on the
+    /// release frame when charge was full and the press was not cancelled.
     pub fn update(&mut self, held: bool, now: Instant) -> (f32, bool) {
-        if !held {
-            self.started = None;
-            self.completed_this_press = false;
-            self.suppress_until_release = false;
-            return (0.0, false);
-        }
         if self.suppress_until_release {
+            if held {
+                return (0.0, false);
+            }
+            self.suppress_until_release = false;
+            self.charge = 0.0;
+            self.last_tick = None;
+            self.holding = false;
             return (0.0, false);
         }
-        if self.completed_this_press {
-            return (1.0, false);
+
+        let dt = self
+            .last_tick
+            .map(|t| now.saturating_duration_since(t).as_secs_f32())
+            .unwrap_or(0.0);
+        self.last_tick = Some(now);
+
+        if held {
+            self.holding = true;
+            self.charge = (self.charge + dt / BUTTON_HOLD.as_secs_f32()).min(1.0);
+            return (hold_ease_out(self.charge), false);
         }
-        let started = *self.started.get_or_insert(now);
-        let elapsed = now.saturating_duration_since(started);
-        let progress = (elapsed.as_secs_f32() / BUTTON_HOLD.as_secs_f32()).min(1.0);
-        if progress >= 1.0 {
-            self.completed_this_press = true;
-            return (1.0, true);
+
+        self.holding = false;
+        if self.charge >= 1.0 {
+            self.charge = 0.0;
+            self.last_tick = None;
+            return (0.0, true);
         }
+
+        if self.charge <= 0.0 {
+            self.charge = 0.0;
+            self.last_tick = None;
+            return (0.0, false);
+        }
+
+        let mut progress = hold_ease_out(self.charge);
+        progress = (progress - dt / BUTTON_DECAY.as_secs_f32()).max(0.0);
+        if progress <= 0.0 {
+            self.charge = 0.0;
+            self.last_tick = None;
+            return (0.0, false);
+        }
+        self.charge = hold_ease_out_inv(progress);
         (progress, false)
     }
 
+    /// True while the button is held and charging or full (not decaying, not suppressed).
     pub fn is_active(&self) -> bool {
-        self.started.is_some() && !self.completed_this_press
+        self.holding && !self.suppress_until_release
     }
 
-    /// Abort the current hold without completing (caller should still be holding).
+    /// Abort charge/decay immediately. If still held, ignore until release.
     pub fn cancel(&mut self) {
-        self.started = None;
-        self.completed_this_press = false;
+        self.charge = 0.0;
+        self.last_tick = None;
+        self.holding = false;
         self.suppress_until_release = true;
     }
 
@@ -414,21 +592,46 @@ pub fn preferred_reading(readings: &[NavReading]) -> Option<&NavReading> {
 }
 
 /// Install the hid-worker input snapshot (called once at worker start).
-pub fn set_input_snapshot(snapshot: Arc<Mutex<Vec<NavReading>>>) {
+pub fn set_input_snapshot(snapshot: Arc<Mutex<InputSnapshot>>) {
     let _ = INPUT_SNAPSHOT.set(snapshot);
 }
 
 /// PadPoll entry: O(1) clone of hid-worker snapshot (never opens HID on the UI thread).
 pub fn read_nav_readings() -> NavReadingsOutcome {
-    let readings = INPUT_SNAPSHOT
-        .get()
-        .and_then(|s| s.lock().ok().map(|g| g.clone()))
-        .unwrap_or_default();
-    if readings.is_empty() {
-        NavReadingsOutcome::Missing {}
+    let Some(slot) = INPUT_SNAPSHOT.get() else {
+        return NavReadingsOutcome::Missing {
+            meta: SnapshotMeta {
+                published_at: Instant::now(),
+                seq: 0,
+                reason: SnapshotReason::NeverPublished,
+                pad_count: 0,
+            },
+        };
+    };
+    let Ok(guard) = slot.lock() else {
+        return NavReadingsOutcome::Missing {
+            meta: SnapshotMeta {
+                published_at: Instant::now(),
+                seq: 0,
+                reason: SnapshotReason::LockPoisoned,
+                pad_count: 0,
+            },
+        };
+    };
+    let meta = SnapshotMeta {
+        published_at: guard.published_at,
+        seq: guard.seq,
+        reason: guard.reason,
+        pad_count: guard.readings.len(),
+    };
+    if guard.readings.is_empty() {
+        NavReadingsOutcome::Missing { meta }
     } else {
-        log_source_once(NavSource::Hid, readings.len());
-        NavReadingsOutcome::Readings(readings)
+        log_source_once(NavSource::Hid, guard.readings.len());
+        NavReadingsOutcome::Readings {
+            readings: guard.readings.clone(),
+            meta,
+        }
     }
 }
 
@@ -446,29 +649,118 @@ fn log_source_once(source: NavSource, pads: usize) {
 /// Result of a multi-pad start-screen nav poll.
 #[derive(Debug)]
 pub enum NavReadingsOutcome {
-    Readings(Vec<NavReading>),
+    Readings {
+        readings: Vec<NavReading>,
+        meta: SnapshotMeta,
+    },
     /// No DualSense HID sample in the worker snapshot yet.
-    Missing {},
+    Missing { meta: SnapshotMeta },
+}
+
+/// Why a short input read failed (no sample).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleFail {
+    Timeout,
+    Io,
+    Truncated,
+    BadReport,
+    Empty,
+    Feature,
+}
+
+impl SampleFail {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Io => "io",
+            Self::Truncated => "truncated",
+            Self::BadReport => "bad_report",
+            Self::Empty => "empty",
+            Self::Feature => "feature",
+        }
+    }
+}
+
+/// Outcome of a short DualSense input read for hid-worker.
+#[derive(Debug)]
+pub enum ShortSampleOutcome {
+    Ok(PadSample),
+    #[allow(dead_code)] // retained for callers / future diag
+    Fail(SampleFail),
+}
+
+fn sample_summary(sample: &PadSample) -> String {
+    format!(
+        "ok stick_y={:.2} l2={} r2={} cross={} circle={} square={} triangle={} options={} dpad_u={} dpad_d={}",
+        sample.stick_y,
+        u8::from(sample.l2),
+        u8::from(sample.r2),
+        u8::from(sample.cross),
+        u8::from(sample.circle),
+        u8::from(sample.square),
+        u8::from(sample.triangle),
+        u8::from(sample.options),
+        u8::from(sample.dpad_up),
+        u8::from(sample.dpad_down),
+    )
 }
 
 /// Short DualSense input read for hid-worker (never call from the UI thread).
 ///
 /// At most 2 attempts, `read_timeout` 15ms. Truncated BT: one feature request + one retry.
-pub fn read_device_sample_short(device: &HidDevice, is_bluetooth: bool) -> Option<PadSample> {
+/// Traces every attempt; `input_hot` only changes success-line cadence (caller passes it).
+pub fn read_device_sample_short(
+    device: &HidDevice,
+    is_bluetooth: bool,
+    serial: &str,
+    input_hot: bool,
+) -> ShortSampleOutcome {
+    let bus = if is_bluetooth { "bt" } else { "usb" };
     let report_size = if is_bluetooth {
         BT_REPORT_SIZE
     } else {
         USB_REPORT_SIZE
     };
     let mut requested_full = false;
+    let started = Instant::now();
 
-    for _ in 0..2 {
+    for attempt in 0..2 {
         let mut buf = vec![0u8; report_size];
-        let n = match device.read_timeout(&mut buf, INPUT_READ_TIMEOUT_MS) {
-            Ok(n) => n,
-            Err(_) => return None,
+        let n = {
+            let _op = crate::hid_diag::enter_op("read_timeout");
+            match device.read_timeout(&mut buf, INPUT_READ_TIMEOUT_MS) {
+                Ok(n) => n,
+                Err(err) => {
+                    drop(_op);
+                    let fail = if err.to_string().to_lowercase().contains("timeout") {
+                        SampleFail::Timeout
+                    } else {
+                        SampleFail::Io
+                    };
+                    crate::hid_diag::trace_read(
+                        "sample",
+                        serial,
+                        bus,
+                        started.elapsed().as_millis(),
+                        &format!("fail={} attempt={attempt} err={err}", fail.as_str()),
+                        false,
+                    );
+                    return ShortSampleOutcome::Fail(fail);
+                }
+            }
         };
         if n == 0 {
+            if attempt == 1 {
+                crate::hid_diag::trace_read(
+                    "sample",
+                    serial,
+                    bus,
+                    started.elapsed().as_millis(),
+                    "fail=empty n=0",
+                    false,
+                );
+                return ShortSampleOutcome::Fail(SampleFail::Empty);
+            }
             continue;
         }
 
@@ -476,11 +768,37 @@ pub fn read_device_sample_short(device: &HidDevice, is_bluetooth: bool) -> Optio
             if !requested_full {
                 let mut feature = vec![0u8; CALIBRATION_FEATURE_SIZE];
                 feature[0] = CALIBRATION_FEATURE_REPORT;
-                let _ = device.get_feature_report(&mut feature);
-                requested_full = true;
-                continue;
+                let feature_result = {
+                    let _op = crate::hid_diag::enter_op("get_feature_report");
+                    device.get_feature_report(&mut feature)
+                };
+                match feature_result {
+                    Ok(_) => {
+                        requested_full = true;
+                        continue;
+                    }
+                    Err(err) => {
+                        crate::hid_diag::trace_read(
+                            "sample",
+                            serial,
+                            bus,
+                            started.elapsed().as_millis(),
+                            &format!("fail=feature err={err}"),
+                            false,
+                        );
+                        return ShortSampleOutcome::Fail(SampleFail::Feature);
+                    }
+                }
             }
-            return None;
+            crate::hid_diag::trace_read(
+                "sample",
+                serial,
+                bus,
+                started.elapsed().as_millis(),
+                "fail=truncated",
+                false,
+            );
+            return ShortSampleOutcome::Fail(SampleFail::Truncated);
         }
 
         let expected = if is_bluetooth {
@@ -489,13 +807,48 @@ pub fn read_device_sample_short(device: &HidDevice, is_bluetooth: bool) -> Optio
             USB_REPORT_ID
         };
         if buf[0] != expected {
+            crate::hid_diag::trace_read(
+                "sample",
+                serial,
+                bus,
+                started.elapsed().as_millis(),
+                &format!("fail=bad_report id=0x{:02x} n={n}", buf[0]),
+                false,
+            );
+            if attempt == 1 {
+                return ShortSampleOutcome::Fail(SampleFail::BadReport);
+            }
             continue;
         }
 
         let base = if is_bluetooth { 1 } else { 0 };
-        return Some(parse_report(&buf, base));
+        let sample = parse_report(&buf, base);
+        // Success: always when hot; otherwise keep volume down via edge on fail-only
+        // is already covered — plan says success once per sample while hot, background cadence
+        // otherwise. Caller samples at 50ms background / 16ms hot, so log every success
+        // while hot and every success on background too would be ~20 Hz — plan says
+        // "on the background cadence otherwise". Logging every success at background poll
+        // rate is fine (50ms). Always log successes.
+        let _ = input_hot;
+        crate::hid_diag::trace_read(
+            "sample",
+            serial,
+            bus,
+            started.elapsed().as_millis(),
+            &sample_summary(&sample),
+            true,
+        );
+        return ShortSampleOutcome::Ok(sample);
     }
-    None
+    crate::hid_diag::trace_read(
+        "sample",
+        serial,
+        bus,
+        started.elapsed().as_millis(),
+        "fail=empty",
+        false,
+    );
+    ShortSampleOutcome::Fail(SampleFail::Empty)
 }
 
 /// Build a nav reading from a HID sample + device identity.
@@ -679,6 +1032,38 @@ pub struct PadNavBank {
     arm_new_pads: bool,
 }
 
+/// Which face / Options buttons are currently held (OR across armed pads).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FaceHeld {
+    pub cross: bool,
+    pub circle: bool,
+    pub square: bool,
+    pub triangle: bool,
+    pub options: bool,
+}
+
+impl FaceHeld {
+    fn from_sample(sample: &PadSample) -> Self {
+        Self {
+            cross: sample.cross,
+            circle: sample.circle,
+            square: sample.square,
+            triangle: sample.triangle,
+            options: sample.options,
+        }
+    }
+
+    pub fn or(self, other: Self) -> Self {
+        Self {
+            cross: self.cross || other.cross,
+            circle: self.circle || other.circle,
+            square: self.square || other.square,
+            triangle: self.triangle || other.triangle,
+            options: self.options || other.options,
+        }
+    }
+}
+
 /// Result of one multi-pad nav tick (at most one [`NavAction`]).
 #[derive(Debug, Clone, Default)]
 pub struct PadTickResult {
@@ -689,6 +1074,8 @@ pub struct PadTickResult {
     pub triangle_completed: bool,
     pub cross_progress: f32,
     pub cross_completed: bool,
+    /// Face buttons held on any armed pad this tick.
+    pub held: FaceHeld,
     /// How many live pads are armed this tick.
     pub armed_pads: usize,
     /// How many live pads are still waiting for a resting sample.
@@ -709,15 +1096,18 @@ impl PadNavBank {
         self.arm_new_pads = arm_immediately;
     }
 
-    /// Abort in-progress Triangle / Cross holds.
+    /// Abort Triangle / Cross charge and decay immediately.
     pub fn cancel_holds(&mut self) {
         for slot in self.slots.values_mut() {
-            if slot.triangle_hold.is_active() {
-                slot.triangle_hold.cancel();
-            }
-            if slot.cross_hold.is_active() {
-                slot.cross_hold.cancel();
-            }
+            slot.triangle_hold.cancel();
+            slot.cross_hold.cancel();
+        }
+    }
+
+    /// Cancel pending face/Options releases on every pad (e.g. after a slide change).
+    pub fn cancel_held_face_releases(&mut self) {
+        for slot in self.slots.values_mut() {
+            slot.button_edges.cancel_held_releases();
         }
     }
 
@@ -766,6 +1156,7 @@ impl PadNavBank {
                 continue;
             }
             result.armed_pads += 1;
+            result.held = result.held.or(FaceHeld::from_sample(&reading.sample));
 
             if replace_confirm {
                 let (progress, completed) = slot.cross_hold.update(reading.sample.cross, now);
@@ -1141,54 +1532,97 @@ mod tests {
     }
 
     #[test]
-    fn button_edges_fires_square_toggle_edit() {
+    fn button_edges_fires_square_toggle_edit_on_release() {
         let mut edges = ButtonEdges::default();
         let held = PadSample {
             square: true,
             ..Default::default()
         };
-        assert_eq!(edges.update(&held, None), Some(NavAction::ToggleEdit));
         assert!(edges.update(&held, None).is_none());
-        assert!(edges.update(&PadSample::default(), None).is_none());
+        assert_eq!(
+            edges.update(&PadSample::default(), None),
+            Some(NavAction::ToggleEdit)
+        );
     }
 
     #[test]
-    fn button_edges_fires_options_cycle_sort() {
+    fn button_edges_fires_options_cycle_sort_on_release() {
         let mut edges = ButtonEdges::default();
         let held = PadSample {
             options: true,
             ..Default::default()
         };
-        assert_eq!(edges.update(&held, None), Some(NavAction::CycleSort));
-        assert!(edges.update(&PadSample::default(), None).is_none());
+        assert!(edges.update(&held, None).is_none());
+        assert_eq!(
+            edges.update(&PadSample::default(), None),
+            Some(NavAction::CycleSort)
+        );
     }
 
     #[test]
-    fn button_edges_fires_cross_on_press() {
+    fn button_edges_fires_cross_on_release() {
         let mut edges = ButtonEdges::default();
         let held = PadSample {
             cross: true,
             ..Default::default()
         };
-        assert_eq!(edges.update(&held, None), Some(NavAction::Confirm));
         assert!(edges.update(&held, None).is_none());
-        assert!(edges.update(&PadSample::default(), None).is_none());
+        assert_eq!(
+            edges.update(&PadSample::default(), None),
+            Some(NavAction::Confirm)
+        );
     }
 
     #[test]
-    fn button_edges_rising_edge_can_fire_after_other_button() {
+    fn button_edges_cancel_held_releases_blocks_square_toggle() {
         let mut edges = ButtonEdges::default();
-        let cross = PadSample {
-            cross: true,
+        let square = PadSample {
+            square: true,
             ..Default::default()
         };
-        assert_eq!(edges.update(&cross, None), Some(NavAction::Confirm));
+        assert!(edges.update(&square, None).is_none());
+        edges.cancel_held_releases();
+        assert!(
+            edges.update(&PadSample::default(), None).is_none(),
+            "cancelled held Square must not ToggleEdit on release"
+        );
+    }
+
+    #[test]
+    fn button_edges_foreign_face_cancels_pending_release() {
+        let mut edges = ButtonEdges::default();
+        let square = PadSample {
+            square: true,
+            ..Default::default()
+        };
+        assert!(edges.update(&square, None).is_none());
         let both = PadSample {
-            cross: true,
+            square: true,
             circle: true,
             ..Default::default()
         };
-        assert_eq!(edges.update(&both, None), Some(NavAction::Cancel));
+        assert!(edges.update(&both, None).is_none());
+        let circle_only = PadSample {
+            circle: true,
+            ..Default::default()
+        };
+        // Square released while cancelled — no ToggleEdit.
+        assert!(edges.update(&circle_only, None).is_none());
+        assert_eq!(
+            edges.update(&PadSample::default(), None),
+            Some(NavAction::Cancel)
+        );
+    }
+
+    #[test]
+    fn button_edges_l2_r2_still_fire_on_press() {
+        let mut edges = ButtonEdges::default();
+        let r2 = PadSample {
+            r2: true,
+            ..Default::default()
+        };
+        assert_eq!(edges.update(&r2, None), Some(NavAction::NextSlide));
+        assert!(edges.update(&r2, None).is_none());
         assert!(edges.update(&PadSample::default(), None).is_none());
     }
 
@@ -1294,8 +1728,10 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(tick2.action, Some(NavAction::Confirm));
-        assert_eq!(tick2.action_pad.as_ref().map(|p| p.as_str()), Some("b"));
+        assert!(
+            tick2.action.is_none(),
+            "Cross arms on press, fires on release"
+        );
         let tick3 = bank.tick(
             &[reading("a", open), reading("b", PadSample::default())],
             now,
@@ -1303,7 +1739,8 @@ mod tests {
             false,
             false,
         );
-        assert!(tick3.action.is_none());
+        assert_eq!(tick3.action, Some(NavAction::Confirm));
+        assert_eq!(tick3.action_pad.as_ref().map(|p| p.as_str()), Some("b"));
     }
 
     #[test]
@@ -1341,8 +1778,7 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(tick.action, Some(NavAction::Cancel));
-        assert_eq!(tick.action_pad.as_ref().map(|p| p.as_str()), Some("a"));
+        assert!(tick.action.is_none(), "face actions arm on press");
         let tick2 = bank.tick(
             &[
                 reading("a", PadSample::default()),
@@ -1353,7 +1789,8 @@ mod tests {
             false,
             false,
         );
-        assert!(tick2.action.is_none());
+        assert_eq!(tick2.action, Some(NavAction::Cancel));
+        assert_eq!(tick2.action_pad.as_ref().map(|p| p.as_str()), Some("a"));
     }
 
     #[test]
@@ -1404,34 +1841,106 @@ mod tests {
     }
 
     #[test]
-    fn hold_completes_when_full_duration_while_held() {
+    fn hold_completes_on_release_when_full() {
         let mut hold = HoldTracker::default();
         let t0 = Instant::now();
         let (p0, c0) = hold.update(true, t0);
         assert!(p0 < 1.0 && !c0);
         let (p1, c1) = hold.update(true, t0 + Duration::from_millis(500));
         assert!(p1 > 0.0 && p1 < 1.0 && !c1);
+        // Ease-out is well ahead of linear time at mid-hold.
+        assert!(
+            p1 > 0.75,
+            "ease-out should be ahead of linear 0.5 at 500ms, got {p1}"
+        );
         let (p2, c2) = hold.update(true, t0 + Duration::from_secs(1));
         assert_eq!(p2, 1.0);
-        assert!(c2, "completes when full duration reached while held");
+        assert!(!c2, "stays armed while held at full; does not fire yet");
+        assert!(hold.is_active(), "full hold remains cancellable");
         let (p3, c3) = hold.update(
             true,
             t0 + Duration::from_secs(1) + Duration::from_millis(10),
         );
         assert_eq!(p3, 1.0);
-        assert!(!c3, "does not re-fire while still held");
+        assert!(!c3, "does not fire while still held");
         let (p4, c4) = hold.update(false, t0 + Duration::from_secs(2));
         assert_eq!(p4, 0.0);
-        assert!(!c4);
+        assert!(c4, "fires on release when full and not cancelled");
     }
 
     #[test]
-    fn hold_early_release_does_not_complete() {
+    fn hold_full_cancel_then_release_does_not_fire() {
         let mut hold = HoldTracker::default();
         let t0 = Instant::now();
         let _ = hold.update(true, t0);
-        let (_, c) = hold.update(false, t0 + Duration::from_millis(400));
+        let _ = hold.update(true, t0 + Duration::from_secs(1));
+        assert!(hold.is_active());
+        hold.cancel();
+        assert!(!hold.is_active());
+        let (p, c) = hold.update(
+            true,
+            t0 + Duration::from_secs(1) + Duration::from_millis(10),
+        );
+        assert_eq!(p, 0.0);
         assert!(!c);
+        let (_, c2) = hold.update(false, t0 + Duration::from_secs(2));
+        assert!(!c2, "cancelled full hold must not fire on release");
+    }
+
+    #[test]
+    fn hold_ease_out_is_ahead_of_linear_early() {
+        let mut hold = HoldTracker::default();
+        let t0 = Instant::now();
+        let _ = hold.update(true, t0);
+        let (p, _) = hold.update(true, t0 + Duration::from_millis(100));
+        // Linear would be 0.1; ease-out ≈ 1 - 0.9^3 ≈ 0.271.
+        assert!(p > 0.25 && p < 0.35, "expected ~0.27 at 100ms, got {p}");
+        let (p2, _) = hold.update(true, t0 + Duration::from_millis(250));
+        assert!(p2 > 0.55 && p2 < 0.65, "expected ~0.58 at 250ms, got {p2}");
+    }
+
+    #[test]
+    fn hold_early_release_decays_instead_of_snap() {
+        let mut hold = HoldTracker::default();
+        let t0 = Instant::now();
+        let _ = hold.update(true, t0);
+        let (p_held, c) = hold.update(true, t0 + Duration::from_millis(400));
+        assert!(!c);
+        assert!(p_held > 0.5);
+        let (p_rel, c_rel) = hold.update(false, t0 + Duration::from_millis(400));
+        assert!(!c_rel);
+        assert!(
+            (p_rel - p_held).abs() < 0.02,
+            "first release frame keeps progress"
+        );
+        assert!(!hold.is_active(), "decaying is not an active hold");
+        let (p_later, _) = hold.update(
+            false,
+            t0 + Duration::from_millis(400) + Duration::from_millis(300),
+        );
+        assert!(
+            p_later < p_rel && p_later > 0.0,
+            "progress decays over time"
+        );
+    }
+
+    #[test]
+    fn hold_partial_presses_stack_to_completion() {
+        let mut hold = HoldTracker::default();
+        let t0 = Instant::now();
+        let _ = hold.update(true, t0);
+        let _ = hold.update(true, t0 + Duration::from_millis(500));
+        let (p0, c0) = hold.update(false, t0 + Duration::from_millis(500));
+        assert!(!c0 && p0 > 0.8);
+        // Brief decay, then press again — finish without a full unbroken second.
+        let t1 = t0 + Duration::from_millis(550);
+        let _ = hold.update(false, t1);
+        let _ = hold.update(true, t1);
+        let (p1, c1) = hold.update(true, t1 + Duration::from_millis(550));
+        assert!(!c1, "reaches full while held without firing");
+        assert_eq!(p1, 1.0);
+        let (_, c2) = hold.update(false, t1 + Duration::from_millis(560));
+        assert!(c2, "stacked partial holds fire on release when full");
     }
 
     #[test]
@@ -1451,10 +1960,58 @@ mod tests {
         assert!(!c);
         let (_, c2) = hold.update(false, t0 + Duration::from_secs(2));
         assert!(!c2);
-        // New press after cancel+release can complete again while held.
+        // New press after cancel+release can arm again, then fire on release.
         let _ = hold.update(true, t0 + Duration::from_secs(2));
         let (_, c3) = hold.update(true, t0 + Duration::from_secs(3));
-        assert!(c3);
+        assert!(!c3);
+        let (_, c4) = hold.update(
+            false,
+            t0 + Duration::from_secs(3) + Duration::from_millis(10),
+        );
+        assert!(c4);
+    }
+
+    #[test]
+    fn hold_cancel_clears_decaying_charge() {
+        let mut hold = HoldTracker::default();
+        let t0 = Instant::now();
+        let _ = hold.update(true, t0);
+        let _ = hold.update(true, t0 + Duration::from_millis(400));
+        let _ = hold.update(false, t0 + Duration::from_millis(400));
+        hold.cancel();
+        let (p, _) = hold.update(false, t0 + Duration::from_millis(500));
+        assert_eq!(p, 0.0);
+    }
+
+    #[test]
+    fn pad_tick_reports_held_face_buttons() {
+        let mut bank = PadNavBank::default();
+        bank.prepare_on_open(true);
+        let now = Instant::now();
+        let resting = PadSample::default();
+        let _ = bank.tick(&[reading("a", resting)], now, true, false, false);
+        let sample = PadSample {
+            cross: true,
+            square: true,
+            held: [GestureControl::Cross, GestureControl::Square]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let tick = bank.tick(&[reading("a", sample)], now, true, false, false);
+        assert!(tick.held.cross);
+        assert!(tick.held.square);
+        assert!(!tick.held.circle);
+        assert!(!tick.held.triangle);
+    }
+
+    #[test]
+    fn hold_ease_out_roundtrip() {
+        for u in [0.0_f32, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0] {
+            let p = hold_ease_out(u);
+            let back = hold_ease_out_inv(p);
+            assert!((back - u).abs() < 1e-5, "u={u} p={p} back={back}");
+        }
     }
 
     #[test]
