@@ -99,15 +99,17 @@ fn steam_appid(target: &str) -> Option<u32> {
 
 /// True when any running process image matches `match_paths` (exact file or under a root).
 pub fn any_matching_running(match_paths: &[PathBuf]) -> bool {
-    #[cfg(windows)]
-    {
-        !matching_pids(match_paths).is_empty()
+    any_matching_in_images(match_paths, &list_process_images())
+}
+
+/// Same as [`any_matching_running`] against a pre-taken process snapshot.
+pub fn any_matching_in_images(match_paths: &[PathBuf], images: &[(u32, PathBuf)]) -> bool {
+    if match_paths.is_empty() {
+        return false;
     }
-    #[cfg(not(windows))]
-    {
-        let _ = match_paths;
-        false
-    }
+    images
+        .iter()
+        .any(|(_, path)| path_matches(path, match_paths))
 }
 
 /// Ask matching processes to close (WM_CLOSE), then terminate leftovers.
@@ -153,25 +155,40 @@ fn normalize_path_key(path: &Path) -> String {
 }
 
 /// Index of the first path-set that matches a live process (one process snapshot).
+#[allow(dead_code)]
 pub fn first_matching_index(path_sets: &[Vec<PathBuf>]) -> Option<usize> {
-    #[cfg(windows)]
-    {
-        if path_sets.is_empty() || path_sets.iter().all(|p| p.is_empty()) {
-            return None;
-        }
-        for (_pid, path) in process_images() {
-            for (i, paths) in path_sets.iter().enumerate() {
-                if !paths.is_empty() && path_matches(&path, paths) {
-                    return Some(i);
-                }
+    first_matching_index_in_images(path_sets, &list_process_images())
+}
+
+/// Same as [`first_matching_index`] against a pre-taken process snapshot.
+pub fn first_matching_index_in_images(
+    path_sets: &[Vec<PathBuf>],
+    images: &[(u32, PathBuf)],
+) -> Option<usize> {
+    if path_sets.is_empty() || path_sets.iter().all(|p| p.is_empty()) {
+        return None;
+    }
+    for (_pid, path) in images {
+        for (i, paths) in path_sets.iter().enumerate() {
+            if !paths.is_empty() && path_matches(path, paths) {
+                return Some(i);
             }
         }
-        None
+    }
+    None
+}
+
+const SLOW_PROCESS_ENUM_MS: u128 = 20;
+
+/// Full process image snapshot (Toolhelp + module path). Safe to call off the UI thread.
+pub fn list_process_images() -> Vec<(u32, PathBuf)> {
+    #[cfg(windows)]
+    {
+        process_images()
     }
     #[cfg(not(windows))]
     {
-        let _ = path_sets;
-        None
+        Vec::new()
     }
 }
 
@@ -185,6 +202,7 @@ fn process_images() -> Vec<(u32, PathBuf)> {
     use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
+    let started = Instant::now();
     let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
         return Vec::new();
     };
@@ -217,7 +235,101 @@ fn process_images() -> Vec<(u32, PathBuf)> {
         }
         let _ = CloseHandle(snap);
     }
+    let ms = started.elapsed().as_millis();
+    if ms >= SLOW_PROCESS_ENUM_MS {
+        crate::hid_diag::diag_info(format!(
+            "ui-diag: process-enum ms={ms} images={}",
+            out.len()
+        ));
+    }
     out
+}
+
+/// True when any running process basename equals `name` (case-insensitive). Names only — no full path.
+#[cfg(windows)]
+#[allow(dead_code)] // hid_diag steam scan (debug builds)
+pub fn any_process_name_eq_ignore_case(name: &str) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let needle = name.to_lowercase();
+    let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return false;
+    };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut found = false;
+    unsafe {
+        if Process32FirstW(snap, &mut entry).is_ok() {
+            loop {
+                let exe = String::from_utf16_lossy(
+                    &entry.szExeFile[..entry
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szExeFile.len())],
+                )
+                .to_lowercase();
+                if exe == needle {
+                    found = true;
+                    break;
+                }
+                if Process32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    found
+}
+
+#[cfg(not(windows))]
+pub fn any_process_name_eq_ignore_case(_name: &str) -> bool {
+    false
+}
+
+/// Basename of the foreground window's process image, if available.
+#[cfg(windows)]
+#[allow(dead_code)] // hid_diag failure_context (debug builds)
+pub fn foreground_process_name() -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return None;
+        };
+        let mut buf = [0u16; 512];
+        let n = K32GetModuleFileNameExW(Some(handle), None, &mut buf);
+        let _ = CloseHandle(handle);
+        if n == 0 {
+            return None;
+        }
+        let path = PathBuf::from(String::from_utf16_lossy(&buf[..n as usize]));
+        path.file_name().map(|n| n.to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(not(windows))]
+pub fn foreground_process_name() -> Option<String> {
+    None
 }
 
 #[cfg(windows)]
@@ -225,7 +337,7 @@ fn matching_pids(match_paths: &[PathBuf]) -> Vec<u32> {
     if match_paths.is_empty() {
         return Vec::new();
     }
-    process_images()
+    list_process_images()
         .into_iter()
         .filter_map(|(pid, path)| path_matches(&path, match_paths).then_some(pid))
         .collect()

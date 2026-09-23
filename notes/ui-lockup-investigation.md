@@ -1,74 +1,212 @@
-# UI lock-up investigation (2026-09-23)
+# UI lock-up / HID fight investigation (2026-09-23)
 
-Hand-off notes for a follow-up fix. Investigation only — no code changes for this issue yet.
+Hand-off notes. **Fix landed (reuse HidApi):** worker keeps one long-lived `HidApi`, refreshes via `refresh_devices()` on a throttle (not every sample), shares that api into Poll/Identify/lightbar/power-off, **does not clear** the input snapshot on Poll, publishes presence paths for the UI tick (no UI-thread `HidApi::new`), runs process enum via `Task::perform`, and Identify is **4 flashes / 1s** (`IDENTIFY_FLASH_COUNT=4`, `IDENTIFY_FLASH_MS=125`).
 
-## Symptom
+**Diagnostics are debug-build only** (`cfg(debug_assertions)`): `hid-trace.log`, hitch F7/F8 + report buttons, worker phase watchdog / `enter_op` traces, and investigation-volume `hid-diag:` / `ui-diag:` lines no-op or omit in `--release`. Future agents: see [`.cursor/rules/debug-diagnostics.mdc`](../.cursor/rules/debug-diagnostics.mdc) — new work must include a similar level of non-release diagnostics.
 
-Occasional / “random” start-screen UI lock-up while using DualSense nav. Feels like pad-driven UI freezes briefly.
+Historical evidence of the ~5s freezes is preserved below (`last_op=hidapi_new`). See [Investigate next](#investigate-next) for BT write size.
 
-## Log location
+## Symptoms (pre-fix)
 
-- Active: `%APPDATA%\sdsc-utils\app.log` (rotated: `app.log.1`)
-- Legacy / unused: `%APPDATA%\ps5-battery-display\app.log`, `%APPDATA%\dualsense-battery-indicators\app.log`
-- Logger: [`src/app_log.rs`](../src/app_log.rs) (unix epoch seconds timestamps)
+1. Occasional start-screen pad nav lock-up (keyboard/mouse may still work).
+2. Occasional full freeze (pad + UI) lasting multiple seconds.
+3. Occasional lightbar write that appears to do nothing.
+4. Early hypothesis: Steam Input holding the DualSense interface — **not supported by the captured input hitches** (no `err=` / access denied; all opens/reads `ok`, `steam=1`).
 
-No `ERROR` lines observed in current logs. This is not a panic / hard crash.
+## Log locations
 
-## Smoking gun
+| File | Role |
+|------|------|
+| `%APPDATA%\sdsc-utils\app.log` | Edge summaries, second timestamps, 1 MB rotate → `app.log.1` |
+| `%APPDATA%\sdsc-utils\hid-trace.log` | Every HID open / write / read, **ms** timestamps, 16 MB rotate → `hid-trace.log.1` |
 
-Every hid-worker **battery/liveness `Poll`** clears the start-nav input snapshot, then blocks the worker on HID I/O. Start UI then sees an empty snapshot until the next input sample.
+Logger: [`src/app_log.rs`](../src/app_log.rs). Phase + watchdog: [`src/hid_diag.rs`](../src/hid_diag.rs).
 
-### Code
+## Known internal causes (historical)
 
-[`src/hid_worker.rs`](../src/hid_worker.rs) — `HidCmd::Poll`:
+### A. Poll snapshot wipe (pad-only, short) — **fixed**
 
-```rust
-cache.drop_all();
-publish_snapshot(snapshot, Vec::new()); // wipes pad samples
-let (result, timing) = poll::poll_controllers_timed(&previously);
+Poll no longer publishes an empty `ClearedPoll` snapshot. It still `drop_all()`s input handles so Poll can open, then `refresh_devices` + poll on the shared api; samples reopen afterward.
+
+### B. ~5s `HidApi::new()` hang (full freeze) — **fixed (mitigated)**
+
+Was: `ensure_all_pads` / `refresh_api` called **`HidApi::new()` every sample** (16–50 ms), plus UI `list_presence_paths` and Poll/Identify each constructing their own api. Hang typically `slow op=hidapi_new ms=5010–5011`.
+
+Now: one worker `HidApi`; `enter_op("hidapi_refresh")` + `refresh_devices()` only when empty / presence cadence / Poll / open miss. Verify: `slow op=hidapi_new` should be gone; `hidapi_refresh` rare.
+
+### C. Identify duration — **shortened**
+
+Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**.
+
+## Grep tokens
+
+### `hid-trace.log`
+
+- `open caller=` / `write caller=` / `read caller=`
+- `steam=0|1`; failures also `fg=` / `fs=`
+- `hid-diag: slow op=hid_trace_io` — sync append to the trace file took ≥50ms
+- `hid-diag: worker stall ...` — watchdog (also in `app.log`)
+- `HITCH_MARK`
+- `write … ok bytes=547 expected=78` — BT lightbar return-size quirk ([Investigate next](#investigate-next))
+
+### `app.log`
+
+- `hid-diag: cmd begin=` / `snapshot clear` / `snapshot restore` / `sample short` / `sample stalled`
+- `hid-diag: slow op=` — completed op ≥50ms (`open_device`, `read_timeout`, `hid_write`, `hidapi_refresh`, …)
+- `hid-diag: worker stall kind=op|idle last_op=... gap_ms=... tier=250|500|1000|2000|5000`
+- `start-nav: no … snapshot` / `snapshot restored` / `snapshot stale`
+- `ui-diag: pad-poll stall` / `pad-poll slow` / `process-enum`
+- `HITCH_MARK kind=lightbar|input source=hotkey|button`
+
+## How to tell causes apart
+
+| Signature | Meaning |
+|-----------|---------|
+| `worker stall … last_op=hidapi_new` / `slow op=hidapi_new ms≈5000` | Pre-fix primary freeze |
+| `slow op=hidapi_refresh` rare / large | Post-fix: throttled enum still slow on Windows |
+| `ClearedPoll` + restore | Pre-fix Poll wipe (should no longer appear) |
+| `pad-poll stall gap_ms` thousands | Iced UI thread stuck |
+| Identify `total_ms≈1000` | Expected Identify after timing change |
+| Identify `total_ms≈1700` | Pre-change Identify |
+| `open`/`write`/`read` `err=` + `steam=1` | Device fight (not seen on freeze marks) |
+
+## Multi-session hitch hunting
+
+- Session id: `session=` on start lines in both logs.
+- **F7** / button → `kind=lightbar`; **F8** / button → `kind=input` (`RegisterHotKey`, stamps even if iced is stuck).
+- Look **5–10 s before** each `HITCH_MARK`.
+
+## Suggested verify after this fix
+
+- Pad nav >30 s; Identify (~1s, 4 flashes); F7/F8 if anything still freezes.
+- Grep `slow op=hidapi_new` / `last_op=hidapi_new` — should be **absent**.
+- Grep `hidapi_refresh` — should not fire every sample.
+- Confirm Identify / lightbar / power-off / running badge / connect-disconnect.
+
+## Investigate next
+
+**BT lightbar write return size: `ok bytes=547 expected=78`**
+
+- Seen repeatedly in `hid-trace.log` on DualSense **Bluetooth** lightbar writes (`caller=lightbar` / `caller=poll`, phases `claim` and `rgb`).
+- hidapi still reports success (`ok`); the bar sometimes still looks unchanged — may be separate from the ~5s enum freezes.
+- Likely avenues: wrong report length / padding for BT output reports, truncating vs accepting oversized returns, Steam or another writer overwriting immediately after, claim/`LIGHT_OUT` not sticking on BT.
+- Capture: pair a “lightbar no-op” F7 mark with matching `write … bytes=547 expected=78` lines; compare USB vs BT write sizes; check build/CRC helpers in [`src/lightbar.rs`](../src/lightbar.rs) against DualSense BT output report layout.
+
+## Out of scope (still)
+
+- hid-trace I/O buffering (only if stalls show `slow op=hid_trace_io`).
+
+---
+
+## Captured sessions (2026-09-23 evening)
+
+Pre-watchdog. Machine: Windows, DualSense **BT** serial `444648156926`, `steam=1`, F8 marks. Quiet gaps were visible but `last_op` unknown at the time.
+
+| | Hitch 1 | Hitch 2 |
+|--|---------|---------|
+| `session=` | `1790145725366` | `1790146291895` |
+| Mark epoch ms | `1790145868924` | `1790146352649` |
+| `up_ms` | `143558` | `60753` |
+| Pattern | Identify + **5.0s quiet** mid-flash | **5.0s quiet** + UI stall 4230ms |
+| At F8 | `age_ms=10` fresh | `age_ms=15` fresh |
+
+### Hitch 1 — excerpts
+
+```text
+[1790145859] INFO: hid-diag: cmd begin=Identify …
+[1790145860] WARN: start-nav: snapshot stale age_ms=105 … reason=Identify
+[1790145866] INFO: hid-worker: cmd=Identify flashes=10 … total_ms=6791
+[1790145868] INFO: hid-diag: snapshot clear reason=ClearedPoll …
+[1790145868] WARN: HITCH_MARK session=1790145725366 up_ms=143558 kind=input … age_ms=10 …
 ```
 
-`PowerOff` also clears the snapshot the same way.
+```text
+[1790145859912] write caller=lightbar phase=rgb … rgb=4403ff … ok
+# ← ~5016ms NO hid-trace →
+[1790145864928] open caller=sample …
+[1790145868924] HITCH_MARK session=1790145725366 …
+```
 
-Worker is single-threaded: while Poll/Identify/etc. runs, `sample_all_inputs` does not run.
+### Hitch 2 — excerpts
 
-### UI side
+```text
+[1790146343] WARN: start-nav: snapshot stale age_ms=104 …
+[1790146348] INFO: ui-diag: pad-poll stall gap_ms=4230
+[1790146348] INFO: hid-diag: snapshot clear reason=ClearedPoll …
+[1790146352] WARN: HITCH_MARK session=1790146291895 up_ms=60753 kind=input … age_ms=15 …
+```
 
-[`src/app.rs`](../src/app.rs) `on_pad_poll` → `start_input::read_nav_readings()`:
+```text
+[1790146343147] read caller=sample … ok
+# ← ~5034ms NO hid-trace →
+[1790146348181] read caller=sample … ok
+[1790146352649] HITCH_MARK session=1790146291895 …
+```
 
-- Empty snapshot → `NavReadingsOutcome::Missing`
-- With start window open: logs warn and returns without handling pad input
-- Warn text: `start-nav: no hid-worker input snapshot yet; keyboard/mouse still work`
+---
 
-So keyboard/mouse should still work; pad nav goes dead for the Poll window.
+## Watchdog sessions (2026-09-23 later)
 
-## Evidence from logs
+Same machine/pad. Build with `enter_op` + hid-watchdog. **Root cause confirmed: `last_op=hidapi_new` ≈ 5.011s.**
 
-- **~303 / 313** “no hid-worker input snapshot yet” warns sit next to a `hid-worker: cmd=Poll` (same second / adjacent lines).
-- Liveness refresh cadence: [`LIVENESS_INTERVAL`](../src/poll.rs) = **5s** when controllers are present → hitch is periodic, feels “random” during use.
-- Typical Poll: `total_ms≈8–15`. Spikes stretch the dead window:
-  - `open_ms` up to **~450–550**
-  - `io_ms` often **~200–230**
-- Identify usually `total_ms≈1700` (expected flash sequence). One outlier: `enumerate_ms=5084`, `total_ms=6719`.
-- Latest session example: Poll at `T` → missing warn at `T` → nav resumes ~1s later after next sample.
+| | LB1 (F7) | IN3 (F8) | IN4 (F8) |
+|--|----------|----------|----------|
+| `session=` | `1790147353650` | `1790147353650` | `1790147843512` |
+| Mark epoch (app.log sec) | `1790147471` | `1790147569` | `1790147913` |
+| `up_ms` | `117437` | `215633` | `69624` |
+| Kind | lightbar | input | input |
+| Pattern | F7 mid-**`hidapi_new`** hang (`age_ms=2752`); `slow op=hidapi_new ms=5011` | **`hidapi_new` 5011ms** + UI stall 4867ms + Poll | Two Identifies (~1732 / 1726ms) + Poll wipes; **no** 5s `hidapi_new` |
+| At mark | stale snapshot | fresh after restore | fresh |
 
-## Cadence context
+### LB1 — F7 during `hidapi_new`
 
-- Presence / refresh triggers in [`App`](../src/app.rs) call `request_refresh` → `worker.poll(...)`.
-- Battery interval 60s; liveness **5s**; empty-presence retry faster.
-- Comment in app already notes controller-row rebuilds can hitch the UI thread mid-slide (separate from snapshot wipe).
+```text
+[1790147468] WARN: start-nav: snapshot stale age_ms=127 seq=3859 reason=Sample
+[1790147468] WARN: hid-diag: worker stall kind=op last_op=hidapi_new gap_ms=321 tier=250
+[1790147468] WARN: hid-diag: worker stall kind=op last_op=hidapi_new gap_ms=522 tier=500
+[1790147469] WARN: hid-diag: worker stall kind=op last_op=hidapi_new gap_ms=1025 tier=1000
+[1790147470] WARN: hid-diag: worker stall kind=op last_op=hidapi_new gap_ms=2029 tier=2000
+[1790147471] WARN: HITCH_MARK session=1790147353650 up_ms=117437 kind=lightbar source=hotkey pads=1 reason=Sample age_ms=2752 seq=3859 steam=1 fg=sdsc-utils.exe fs=0
+[1790147473] INFO: hid-diag: slow op=hidapi_new ms=5011
+```
 
-## Recommended fix (for next agent)
+### IN3 — classic full freeze
 
-1. **Do not clear the input snapshot on Poll** — keep last good `NavReading`s until fresh samples are published after poll (or after cache rebuild).
-2. Prefer not calling `cache.drop_all()` on every Poll if input handles can stay warm; if drop is required for correct battery membership, still leave snapshot intact during the gap.
-3. Same for PowerOff if a brief empty snapshot is undesirable (or republish quickly after).
-4. Optional: stop treating transient empty-after-Poll as a warn (or rate-limit) once (1) is fixed.
-5. Out of scope unless still broken after (1): full mouse/window freeze (process enum on UI thread in `refresh_running_badge` / `process_match`) — logs do not show that path clearly; warn text implies mouse kept working.
+```text
+[1790147562] WARN: start-nav: snapshot stale age_ms=107 …
+[1790147562] WARN: hid-diag: worker stall kind=op last_op=hidapi_new gap_ms=330 tier=250
+[1790147562] WARN: hid-diag: worker stall kind=op last_op=hidapi_new gap_ms=531 tier=500
+[1790147563] WARN: hid-diag: worker stall kind=op last_op=hidapi_new gap_ms=1034 tier=1000
+[1790147564] WARN: hid-diag: worker stall kind=op last_op=hidapi_new gap_ms=2038 tier=2000
+[1790147567] INFO: hid-diag: slow op=hidapi_new ms=5011
+[1790147567] INFO: ui-diag: pad-poll stall gap_ms=4867
+[1790147567] INFO: hid-diag: snapshot clear reason=ClearedPoll …
+[1790147569] WARN: HITCH_MARK session=1790147353650 up_ms=215633 kind=input source=hotkey pads=1 reason=Sample age_ms=0 seq=7016 steam=1 fg=sdsc-utils.exe fs=0
+```
 
-## Suggested verify
+### IN4 — Identify/Poll without 5s enum
 
-- Open start screen, use pad continuously for >30s.
-- Confirm no `no hid-worker input snapshot yet` lined up with each `cmd=Poll`.
-- Confirm no multi-hundred-ms pad dead zones on slow Polls.
-- Identify / lightbar / power-off still work.
+```text
+[1790147905] INFO: hid-diag: cmd begin=Identify …
+[1790147906] INFO: hid-worker: cmd=Identify flashes=10 … total_ms=1732
+[1790147907] INFO: hid-diag: snapshot clear reason=ClearedPoll …
+[1790147908] INFO: hid-diag: cmd begin=Identify …
+[1790147910] INFO: hid-worker: cmd=Identify flashes=10 … total_ms=1726
+[1790147913] WARN: HITCH_MARK session=1790147843512 up_ms=69624 kind=input … age_ms=29 …
+[1790147913] INFO: hid-diag: snapshot clear reason=ClearedPoll …
+```
+
+No `last_op=hidapi_new` / `slow op=hidapi_new ms=5xxx` in this window — felt hitch is Identify ownership + Poll wipe (causes A/C), not the enum hang.
+
+### Additional unmarked blackout (same session as LB1/IN3)
+
+```text
+[1790147681]–[1790147686] worker stall last_op=hidapi_new … tier through 5000
+[1790147686] INFO: hid-diag: slow op=hidapi_new ms=5010
+```
+
+### Side notes
+
+- BT writes still log `ok bytes=547 expected=78`.
+- Shorter `slow op=hidapi_new ms=50–166` also appear; user-visible multi-second freezes match the **~5010ms** completions.
+- Pre-watchdog Hitch 1 `Identify total_ms=6791` is consistent with a ~5s `hidapi_new` buried inside Identify flash reopen/enumerate.

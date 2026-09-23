@@ -67,34 +67,29 @@ fn dedupe_polled(mut pads: Vec<PolledPad>) -> Vec<PolledPad> {
 /// `LIGHT_OUT` + RGB always run (needed after a presence-only disconnect that
 /// never synced claims).
 pub fn poll_controllers(previously_connected: &[String]) -> Result<Vec<ControllerStatus>, String> {
-    dualsense::with_hid_lock(|| poll_controllers_unlocked(previously_connected))
+    dualsense::with_hid_lock(|| {
+        let api = HidApi::new().map_err(|e| e.to_string())?;
+        let mut timing = HidPhaseTiming::default();
+        poll_controllers_with_api(&api, previously_connected, &mut timing)
+    })
 }
 
-/// Daemon worker entry: no outer lock (worker is exclusive).
+/// Daemon worker entry: no outer lock (worker is exclusive). Uses caller's `HidApi`.
 pub fn poll_controllers_timed(
+    api: &HidApi,
     previously_connected: &[String],
 ) -> (Result<Vec<ControllerStatus>, String>, HidPhaseTiming) {
-    let started = Instant::now();
     let mut timing = HidPhaseTiming::default();
-    let result = poll_controllers_unlocked_timed(previously_connected, &mut timing);
-    // If unlocked path did not fill enumerate (empty list early exit), still record total as io-ish.
-    let _ = started;
+    let result = poll_controllers_with_api(api, previously_connected, &mut timing);
     (result, timing)
 }
 
-fn poll_controllers_unlocked(
-    previously_connected: &[String],
-) -> Result<Vec<ControllerStatus>, String> {
-    let mut timing = HidPhaseTiming::default();
-    poll_controllers_unlocked_timed(previously_connected, &mut timing)
-}
-
-fn poll_controllers_unlocked_timed(
+fn poll_controllers_with_api(
+    api: &HidApi,
     previously_connected: &[String],
     timing: &mut HidPhaseTiming,
 ) -> Result<Vec<ControllerStatus>, String> {
     let enum_started = Instant::now();
-    let api = HidApi::new().map_err(|e| e.to_string())?;
     let devices: Vec<&DeviceInfo> = api
         .device_list()
         .filter(|d| is_dualsense_gamepad(d))
@@ -114,28 +109,53 @@ fn poll_controllers_unlocked_timed(
         let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
 
         let open_started = Instant::now();
-        match info.open_device(&api).and_then(|device| {
-            timing.open_ms += open_started.elapsed().as_millis();
-            let io_started = Instant::now();
-            let serial = resolve_device_identity(info, &device);
-            let battery = battery::read_battery(&device)?;
-            timing.io_ms += io_started.elapsed().as_millis();
-            Ok((device, serial, battery))
-        }) {
-            Ok((device, serial, battery)) => pads.push(PolledPad {
-                status: ControllerStatus {
-                    index: 0,
-                    product,
-                    connection: battery.connection,
-                    serial,
-                    percent: battery.percent,
-                    state: battery.state,
-                },
-                device,
-                is_bluetooth,
-            }),
+        let hint = hid_serial(info);
+        let device = match info.open_device(api) {
+            Ok(d) => {
+                let ms = open_started.elapsed().as_millis();
+                timing.open_ms += ms;
+                crate::hid_diag::trace_open("poll", info, &hint, ms, Ok(()));
+                d
+            }
             Err(err) => {
-                timing.open_ms += open_started.elapsed().as_millis();
+                let ms = open_started.elapsed().as_millis();
+                timing.open_ms += ms;
+                crate::hid_diag::trace_open("poll", info, &hint, ms, Err(&err.to_string()));
+                app_log::warn(format!(
+                    "failed to open {product} (hid serial {hid}): {err}"
+                ));
+                continue;
+            }
+        };
+
+        let io_started = Instant::now();
+        let serial = resolve_device_identity(info, &device);
+        match battery::read_battery(&device) {
+            Ok(battery) => {
+                timing.io_ms += io_started.elapsed().as_millis();
+                pads.push(PolledPad {
+                    status: ControllerStatus {
+                        index: 0,
+                        product,
+                        connection: battery.connection,
+                        serial,
+                        percent: battery.percent,
+                        state: battery.state,
+                    },
+                    device,
+                    is_bluetooth,
+                });
+            }
+            Err(err) => {
+                timing.io_ms += io_started.elapsed().as_millis();
+                crate::hid_diag::trace_read(
+                    "poll",
+                    &serial,
+                    crate::hid_diag::bus_tag(info.bus_type()),
+                    io_started.elapsed().as_millis(),
+                    &format!("fail=battery err={err}"),
+                    false,
+                );
                 app_log::warn(format!(
                     "failed to read {product} (hid serial {hid}): {err}"
                 ));
@@ -172,7 +192,7 @@ fn poll_controllers_unlocked_timed(
             ) {
                 timing.io_ms += io_started.elapsed().as_millis();
                 // Reopen clears stuck Windows overlapped I/O after a write timeout.
-                let (retry, t) = lightbar::apply_lightbar_rgb_timed(&pad.status.serial, color);
+                let (retry, t) = lightbar::apply_lightbar_rgb_timed(api, &pad.status.serial, color);
                 timing.add_assign(t);
                 if let Err(retry_err) = retry {
                     lightbar::warn_lightbar(

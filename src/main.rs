@@ -14,6 +14,7 @@ mod emulate;
 mod file_icon;
 mod games;
 mod gesture;
+mod hid_diag;
 mod hid_worker;
 mod icon;
 mod known;

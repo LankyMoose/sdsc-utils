@@ -99,6 +99,12 @@ pub enum StartMessage {
     ManualAddArgs(String),
     ManualPickIcon,
     ManualClearIcon,
+    /// Mouse-only: stamp lightbar-miss hitch for multi-session diag.
+    #[cfg(debug_assertions)]
+    ReportLightbarFailure,
+    /// Mouse-only: stamp pad-input hitch for multi-session diag.
+    #[cfg(debug_assertions)]
+    ReportInputFailure,
 }
 
 /// Runtime-resolved game art (Steam path or extracted shell icon).
@@ -871,6 +877,10 @@ pub fn view<'a>(
     };
 
     let hint = footer_hint(state);
+    #[cfg(debug_assertions)]
+    let diag = diag_report_bar();
+    #[cfg(not(debug_assertions))]
+    let diag: Element<'_, StartMessage> = space().height(Length::Fixed(0.0)).into();
 
     container(
         column![
@@ -880,6 +890,7 @@ pub fn view<'a>(
                 .height(Length::Fixed(1.0))
                 .style(theme::configure_header_rule),
             container(body).width(Fill).height(Fill),
+            diag,
             hint,
         ]
         .spacing(10)
@@ -890,6 +901,32 @@ pub fn view<'a>(
     .width(Fill)
     .height(Fill)
     .style(theme::root)
+    .into()
+}
+
+/// Mouse + global hotkey hitch markers (not pad-navigable). Stamps `HITCH_MARK` in the logs.
+/// Debug builds only.
+#[cfg(debug_assertions)]
+fn diag_report_bar() -> Element<'static, StartMessage> {
+    row![
+        button(
+            text("Report lightbar write failure (F7)")
+                .size(11.0)
+                .color(theme::MUTED),
+        )
+        .padding([4, 8])
+        .on_press(StartMessage::ReportLightbarFailure)
+        .style(theme::ghost),
+        button(
+            text("Report input failure (F8)")
+                .size(11.0)
+                .color(theme::MUTED),
+        )
+        .padding([4, 8])
+        .on_press(StartMessage::ReportInputFailure)
+        .style(theme::ghost),
+    ]
+    .spacing(8)
     .into()
 }
 

@@ -29,7 +29,67 @@ const USB_REPORT_ID: u8 = 0x01;
 const CALIBRATION_FEATURE_REPORT: u8 = 0x05;
 const CALIBRATION_FEATURE_SIZE: usize = 41;
 
-static INPUT_SNAPSHOT: OnceLock<Arc<Mutex<Vec<NavReading>>>> = OnceLock::new();
+static INPUT_SNAPSHOT: OnceLock<Arc<Mutex<InputSnapshot>>> = OnceLock::new();
+
+/// Why the worker last published (or cleared) the input snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotReason {
+    Sample,
+    SamplePartial,
+    /// Cleared before a battery/liveness Poll (legacy; Poll no longer clears the snapshot).
+    #[allow(dead_code)]
+    ClearedPoll,
+    ClearedPowerOff,
+    ClearedShutdown,
+    Identify,
+    LockPoisoned,
+    NeverPublished,
+}
+
+impl SnapshotReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sample => "Sample",
+            Self::SamplePartial => "SamplePartial",
+            Self::ClearedPoll => "ClearedPoll",
+            Self::ClearedPowerOff => "ClearedPowerOff",
+            Self::ClearedShutdown => "ClearedShutdown",
+            Self::Identify => "Identify",
+            Self::LockPoisoned => "LockPoisoned",
+            Self::NeverPublished => "NeverPublished",
+        }
+    }
+}
+
+/// Shared pad samples published by the hid-worker.
+#[derive(Debug, Clone)]
+pub struct InputSnapshot {
+    pub readings: Vec<NavReading>,
+    pub published_at: Instant,
+    pub seq: u64,
+    pub reason: SnapshotReason,
+}
+
+impl Default for InputSnapshot {
+    fn default() -> Self {
+        Self {
+            readings: Vec::new(),
+            published_at: Instant::now(),
+            seq: 0,
+            reason: SnapshotReason::NeverPublished,
+        }
+    }
+}
+
+/// Metadata returned with every PadPoll snapshot read.
+#[derive(Debug, Clone)]
+pub struct SnapshotMeta {
+    pub published_at: Instant,
+    pub seq: u64,
+    pub reason: SnapshotReason,
+    #[allow(dead_code)] // exposed for UI/diag consumers
+    pub pad_count: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavAction {
@@ -532,21 +592,46 @@ pub fn preferred_reading(readings: &[NavReading]) -> Option<&NavReading> {
 }
 
 /// Install the hid-worker input snapshot (called once at worker start).
-pub fn set_input_snapshot(snapshot: Arc<Mutex<Vec<NavReading>>>) {
+pub fn set_input_snapshot(snapshot: Arc<Mutex<InputSnapshot>>) {
     let _ = INPUT_SNAPSHOT.set(snapshot);
 }
 
 /// PadPoll entry: O(1) clone of hid-worker snapshot (never opens HID on the UI thread).
 pub fn read_nav_readings() -> NavReadingsOutcome {
-    let readings = INPUT_SNAPSHOT
-        .get()
-        .and_then(|s| s.lock().ok().map(|g| g.clone()))
-        .unwrap_or_default();
-    if readings.is_empty() {
-        NavReadingsOutcome::Missing {}
+    let Some(slot) = INPUT_SNAPSHOT.get() else {
+        return NavReadingsOutcome::Missing {
+            meta: SnapshotMeta {
+                published_at: Instant::now(),
+                seq: 0,
+                reason: SnapshotReason::NeverPublished,
+                pad_count: 0,
+            },
+        };
+    };
+    let Ok(guard) = slot.lock() else {
+        return NavReadingsOutcome::Missing {
+            meta: SnapshotMeta {
+                published_at: Instant::now(),
+                seq: 0,
+                reason: SnapshotReason::LockPoisoned,
+                pad_count: 0,
+            },
+        };
+    };
+    let meta = SnapshotMeta {
+        published_at: guard.published_at,
+        seq: guard.seq,
+        reason: guard.reason,
+        pad_count: guard.readings.len(),
+    };
+    if guard.readings.is_empty() {
+        NavReadingsOutcome::Missing { meta }
     } else {
-        log_source_once(NavSource::Hid, readings.len());
-        NavReadingsOutcome::Readings(readings)
+        log_source_once(NavSource::Hid, guard.readings.len());
+        NavReadingsOutcome::Readings {
+            readings: guard.readings.clone(),
+            meta,
+        }
     }
 }
 
@@ -564,29 +649,118 @@ fn log_source_once(source: NavSource, pads: usize) {
 /// Result of a multi-pad start-screen nav poll.
 #[derive(Debug)]
 pub enum NavReadingsOutcome {
-    Readings(Vec<NavReading>),
+    Readings {
+        readings: Vec<NavReading>,
+        meta: SnapshotMeta,
+    },
     /// No DualSense HID sample in the worker snapshot yet.
-    Missing {},
+    Missing { meta: SnapshotMeta },
+}
+
+/// Why a short input read failed (no sample).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleFail {
+    Timeout,
+    Io,
+    Truncated,
+    BadReport,
+    Empty,
+    Feature,
+}
+
+impl SampleFail {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Io => "io",
+            Self::Truncated => "truncated",
+            Self::BadReport => "bad_report",
+            Self::Empty => "empty",
+            Self::Feature => "feature",
+        }
+    }
+}
+
+/// Outcome of a short DualSense input read for hid-worker.
+#[derive(Debug)]
+pub enum ShortSampleOutcome {
+    Ok(PadSample),
+    #[allow(dead_code)] // retained for callers / future diag
+    Fail(SampleFail),
+}
+
+fn sample_summary(sample: &PadSample) -> String {
+    format!(
+        "ok stick_y={:.2} l2={} r2={} cross={} circle={} square={} triangle={} options={} dpad_u={} dpad_d={}",
+        sample.stick_y,
+        u8::from(sample.l2),
+        u8::from(sample.r2),
+        u8::from(sample.cross),
+        u8::from(sample.circle),
+        u8::from(sample.square),
+        u8::from(sample.triangle),
+        u8::from(sample.options),
+        u8::from(sample.dpad_up),
+        u8::from(sample.dpad_down),
+    )
 }
 
 /// Short DualSense input read for hid-worker (never call from the UI thread).
 ///
 /// At most 2 attempts, `read_timeout` 15ms. Truncated BT: one feature request + one retry.
-pub fn read_device_sample_short(device: &HidDevice, is_bluetooth: bool) -> Option<PadSample> {
+/// Traces every attempt; `input_hot` only changes success-line cadence (caller passes it).
+pub fn read_device_sample_short(
+    device: &HidDevice,
+    is_bluetooth: bool,
+    serial: &str,
+    input_hot: bool,
+) -> ShortSampleOutcome {
+    let bus = if is_bluetooth { "bt" } else { "usb" };
     let report_size = if is_bluetooth {
         BT_REPORT_SIZE
     } else {
         USB_REPORT_SIZE
     };
     let mut requested_full = false;
+    let started = Instant::now();
 
-    for _ in 0..2 {
+    for attempt in 0..2 {
         let mut buf = vec![0u8; report_size];
-        let n = match device.read_timeout(&mut buf, INPUT_READ_TIMEOUT_MS) {
-            Ok(n) => n,
-            Err(_) => return None,
+        let n = {
+            let _op = crate::hid_diag::enter_op("read_timeout");
+            match device.read_timeout(&mut buf, INPUT_READ_TIMEOUT_MS) {
+                Ok(n) => n,
+                Err(err) => {
+                    drop(_op);
+                    let fail = if err.to_string().to_lowercase().contains("timeout") {
+                        SampleFail::Timeout
+                    } else {
+                        SampleFail::Io
+                    };
+                    crate::hid_diag::trace_read(
+                        "sample",
+                        serial,
+                        bus,
+                        started.elapsed().as_millis(),
+                        &format!("fail={} attempt={attempt} err={err}", fail.as_str()),
+                        false,
+                    );
+                    return ShortSampleOutcome::Fail(fail);
+                }
+            }
         };
         if n == 0 {
+            if attempt == 1 {
+                crate::hid_diag::trace_read(
+                    "sample",
+                    serial,
+                    bus,
+                    started.elapsed().as_millis(),
+                    "fail=empty n=0",
+                    false,
+                );
+                return ShortSampleOutcome::Fail(SampleFail::Empty);
+            }
             continue;
         }
 
@@ -594,11 +768,37 @@ pub fn read_device_sample_short(device: &HidDevice, is_bluetooth: bool) -> Optio
             if !requested_full {
                 let mut feature = vec![0u8; CALIBRATION_FEATURE_SIZE];
                 feature[0] = CALIBRATION_FEATURE_REPORT;
-                let _ = device.get_feature_report(&mut feature);
-                requested_full = true;
-                continue;
+                let feature_result = {
+                    let _op = crate::hid_diag::enter_op("get_feature_report");
+                    device.get_feature_report(&mut feature)
+                };
+                match feature_result {
+                    Ok(_) => {
+                        requested_full = true;
+                        continue;
+                    }
+                    Err(err) => {
+                        crate::hid_diag::trace_read(
+                            "sample",
+                            serial,
+                            bus,
+                            started.elapsed().as_millis(),
+                            &format!("fail=feature err={err}"),
+                            false,
+                        );
+                        return ShortSampleOutcome::Fail(SampleFail::Feature);
+                    }
+                }
             }
-            return None;
+            crate::hid_diag::trace_read(
+                "sample",
+                serial,
+                bus,
+                started.elapsed().as_millis(),
+                "fail=truncated",
+                false,
+            );
+            return ShortSampleOutcome::Fail(SampleFail::Truncated);
         }
 
         let expected = if is_bluetooth {
@@ -607,13 +807,48 @@ pub fn read_device_sample_short(device: &HidDevice, is_bluetooth: bool) -> Optio
             USB_REPORT_ID
         };
         if buf[0] != expected {
+            crate::hid_diag::trace_read(
+                "sample",
+                serial,
+                bus,
+                started.elapsed().as_millis(),
+                &format!("fail=bad_report id=0x{:02x} n={n}", buf[0]),
+                false,
+            );
+            if attempt == 1 {
+                return ShortSampleOutcome::Fail(SampleFail::BadReport);
+            }
             continue;
         }
 
         let base = if is_bluetooth { 1 } else { 0 };
-        return Some(parse_report(&buf, base));
+        let sample = parse_report(&buf, base);
+        // Success: always when hot; otherwise keep volume down via edge on fail-only
+        // is already covered — plan says success once per sample while hot, background cadence
+        // otherwise. Caller samples at 50ms background / 16ms hot, so log every success
+        // while hot and every success on background too would be ~20 Hz — plan says
+        // "on the background cadence otherwise". Logging every success at background poll
+        // rate is fine (50ms). Always log successes.
+        let _ = input_hot;
+        crate::hid_diag::trace_read(
+            "sample",
+            serial,
+            bus,
+            started.elapsed().as_millis(),
+            &sample_summary(&sample),
+            true,
+        );
+        return ShortSampleOutcome::Ok(sample);
     }
-    None
+    crate::hid_diag::trace_read(
+        "sample",
+        serial,
+        bus,
+        started.elapsed().as_millis(),
+        "fail=empty",
+        false,
+    );
+    ShortSampleOutcome::Fail(SampleFail::Empty)
 }
 
 /// Build a nav reading from a HID sample + device identity.
