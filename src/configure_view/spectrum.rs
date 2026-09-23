@@ -15,7 +15,8 @@ const HIT_RADIUS: f32 = 12.0;
 const STOP_REMOVE_DISTANCE: f32 = 28.0;
 
 /// Gradient preview with draggable stop handles.
-/// Click empty bar to add; drag a stop vertically off the bar to remove.
+/// Left-click empty bar to add; drag a stop vertically off the bar, or right-click a
+/// stop, to remove (while more than [`BatterySpectrum::MIN_STOPS`] remain).
 pub(super) struct SpectrumBar {
     pub stops: Vec<GradientStop>,
     pub selected: usize,
@@ -89,6 +90,16 @@ impl canvas::Program<ConfigureMessage> for SpectrumBar {
                         canvas::Action::publish(ConfigureMessage::AddStopAt(percent)).and_capture(),
                     )
                 }
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                let position = cursor.position_in(bounds)?;
+                let index = self.hit(position.x, bounds.width)?;
+                if self.stops.len() <= BatterySpectrum::MIN_STOPS {
+                    return Some(
+                        canvas::Action::publish(ConfigureMessage::SelectStop(index)).and_capture(),
+                    );
+                }
+                Some(canvas::Action::publish(ConfigureMessage::RemoveStopAt(index)).and_capture())
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) if state.dragging => {
                 let point = cursor.position()?;

@@ -34,9 +34,13 @@ pub const HEIGHT: f32 = 400.0;
 
 const SIDEBAR_WIDTH: f32 = 120.0;
 const CONTENT_PADDING: f32 = 10.0;
+/// Gap between scrollable content and the embedded scrollbar.
+const SCROLL_GAP: f32 = 8.0;
+/// Inset so the scrollbar is not flush to the window frame.
+const SCROLL_EDGE: f32 = 8.0;
 const HEADER_HEIGHT: f32 = 32.0;
-/// Content pane width inside the window (sidebar + gaps/padding subtracted).
-const CONTENT_WIDTH: f32 = WIDTH - SIDEBAR_WIDTH - CONTENT_PADDING * 3.0;
+/// Content pane width: window minus sidebar, scroll gutters, and content padding.
+const CONTENT_WIDTH: f32 = WIDTH - SIDEBAR_WIDTH - CONTENT_PADDING * 2.0 - SCROLL_GAP - SCROLL_EDGE;
 
 const COVERAGE_HEIGHT: f32 = 56.0;
 /// Vertical distance outside the bar that arms stop removal (matches softbuffer UI).
@@ -204,6 +208,8 @@ pub enum ConfigureMessage {
     /// Insert a stop at the clicked percent on the spectrum bar.
     AddStopAt(u8),
     RemoveStop,
+    /// Remove the stop at `index` (e.g. right-click on a handle or stop row).
+    RemoveStopAt(usize),
     HueChanged(f32),
     SaturationValueChanged(f32, f32),
     ResetSpectrum,
@@ -352,6 +358,14 @@ impl ConfigureState {
         }
     }
 
+    pub fn remove_at(&mut self, index: usize) -> Option<BatterySpectrum> {
+        if index >= self.spectrum.stops.len() {
+            return None;
+        }
+        self.selected = index;
+        self.remove_selected()
+    }
+
     pub fn reset(&mut self) -> BatterySpectrum {
         self.spectrum = BatterySpectrum::default_spectrum();
         self.selected = 0;
@@ -446,16 +460,19 @@ pub fn view<'a>(
         container(sidebar)
             .width(Length::Fixed(SIDEBAR_WIDTH))
             .height(Fill)
-            .padding([4, 4])
             .style(theme::sidebar),
-        // Embed the scrollbar so it takes layout width instead of overlaying
-        // content; spacing matches the gap between sidebar and content.
-        scrollable(content)
-            .spacing(CONTENT_PADDING)
-            .height(Fill)
-            .width(Fill),
+        // Embed scrollbar with gutters: content ↔ bar ↔ window edge.
+        container(
+            scrollable(container(content).padding(CONTENT_PADDING).width(Fill))
+                .spacing(SCROLL_GAP)
+                .height(Fill)
+                .width(Fill),
+        )
+        .padding(iced::Padding::ZERO.right(SCROLL_EDGE))
+        .width(Fill)
+        .height(Fill),
     ]
-    .spacing(CONTENT_PADDING)
+    .spacing(0)
     .width(Fill)
     .height(Fill);
 
@@ -463,18 +480,24 @@ pub fn view<'a>(
         container(header)
             .padding([0.0, CONTENT_PADDING])
             .width(Fill),
-        container(space())
-            .width(Fill)
-            .height(Length::Fixed(1.0))
-            .style(theme::configure_header_rule),
+        // Inset like Start: do not meet the window side borders, or the
+        // underline + root border read as a box around only the title.
+        container(
+            container(space())
+                .width(Fill)
+                .height(Length::Fixed(1.0))
+                .style(theme::configure_header_rule),
+        )
+        .padding([0.0, CONTENT_PADDING])
+        .width(Fill),
     ]
+    .spacing(0)
     .width(Fill);
 
-    container(
+    theme::framed(
         column![
             chrome,
             container(body)
-                .padding(CONTENT_PADDING)
                 .width(Fill)
                 .height(Fill)
                 .style(theme::configure_body),
@@ -482,10 +505,6 @@ pub fn view<'a>(
         .width(Fill)
         .height(Fill),
     )
-    .width(Fill)
-    .height(Fill)
-    .style(theme::root)
-    .into()
 }
 
 fn tab_list<'a>(active: Section, show_developer: bool) -> Element<'a, ConfigureMessage> {
@@ -524,9 +543,7 @@ fn section_content<'a>(
         Section::System => system_view(settings),
         Section::StartScreen => start_screen_view(settings),
         Section::Notifications => notifications_view(settings),
-        Section::ToastPosition => {
-            toast_position_view(settings, theme::from_rgb(state.spectrum.accent()))
-        }
+        Section::ToastPosition => toast_position_view(settings, theme::ACCENT),
         Section::Lightbar => lightbar_view(state, settings),
         Section::Analytics => analytics_view(settings, analytics),
         Section::PadInput => pad_input_view(pad_input),
@@ -897,22 +914,25 @@ fn lightbar_view<'a>(
         |list, (index, stop)| {
             let selected = index == state.selected;
             list.push(
-                button(
-                    row![
-                        container(space())
-                            .width(Length::Fixed(14.0))
-                            .height(Length::Fixed(14.0))
-                            .style(theme::swatch(theme::from_rgb(stop.color))),
-                        text(format!("{}%", stop.percent)).size(12.0).width(Fill),
-                        text(stop.color.to_hex()).size(12.0).color(theme::MUTED),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
+                mouse_area(
+                    button(
+                        row![
+                            container(space())
+                                .width(Length::Fixed(14.0))
+                                .height(Length::Fixed(14.0))
+                                .style(theme::swatch(theme::from_rgb(stop.color))),
+                            text(format!("{}%", stop.percent)).size(12.0).width(Fill),
+                            text(stop.color.to_hex()).size(12.0).color(theme::MUTED),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([4, 6])
+                    .width(Fill)
+                    .on_press(ConfigureMessage::SelectStop(index))
+                    .style(theme::chip(selected)),
                 )
-                .padding([4, 6])
-                .width(Fill)
-                .on_press(ConfigureMessage::SelectStop(index))
-                .style(theme::chip(selected)),
+                .on_right_press(ConfigureMessage::RemoveStopAt(index)),
             )
         },
     );

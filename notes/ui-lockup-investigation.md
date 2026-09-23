@@ -57,6 +57,7 @@ Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**
 - `start-nav: no … snapshot` / `snapshot restored` / `snapshot stale`
 - `ui-diag: pad-poll stall` / `pad-poll slow` / `process-enum`
 - `HITCH_MARK kind=lightbar|input source=hotkey|button`
+- `PANIC at file:line:col: …` — custom hook in [`app_log::init`](../src/app_log.rs); required because `windows_subsystem = "windows"` discards stderr panic text (exit 101 with an empty console)
 
 ## How to tell causes apart
 
@@ -210,3 +211,25 @@ No `last_op=hidapi_new` / `slow op=hidapi_new ms=5xxx` in this window — felt h
 - BT writes still log `ok bytes=547 expected=78`.
 - Shorter `slow op=hidapi_new ms=50–166` also appear; user-visible multi-second freezes match the **~5010ms** completions.
 - Pre-watchdog Hitch 1 `Identify total_ms=6791` is consistent with a ~5s `hidapi_new` buried inside Identify flash reopen/enumerate.
+
+## Toast Z-order vs Settings / Start freeze (Windows)
+
+iced multi-window present starvation: [iced#3108](https://github.com/iced-rs/iced/issues/3108) / [#3320](https://github.com/iced-rs/iced/issues/3320).
+
+**Do not demote** the toast to `HWND_NOTOPMOST` when Settings/Start/popup are open — that puts the toast under Cursor.
+
+**Do not** raise toast above Start every `ToastFrame` — that starves Start presents.
+
+**Do:** keep toast `HWND_TOPMOST` (above Cursor); raise Start/Settings into the same topmost band *above* the toast (corner toast stays visible beside centered Start); `gain_focus` the interactive window.
+
+Debug grep: `ui-diag: place toast gen=`, `ui-diag: sync toast z-order (toast + raise UI)`.
+
+## Queued toast wrong content (Windows)
+
+Symptom: two connect toasts both showed the first pad’s %, then recreate made only one toast appear.
+
+`app.log` proved the **model is correct** (`toast show … percent=55` then `percent=100`). Stale swapchain on reuse; closing/recreating the HWND dropped the follow-up toast.
+
+Fix: reuse one toast HWND; on handoff skip hide and **remount** (±1px resize + `RedrawWindow`); `PlaceToast` is generation-guarded.
+
+Debug grep: `ui-diag: toast show`, `ui-diag: place toast gen=`, `ui-diag: toast handoff remount`.

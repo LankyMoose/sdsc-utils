@@ -4,6 +4,7 @@ use crate::battery::PowerState;
 use crate::color::BatterySpectrum;
 use crate::file_icon;
 use crate::games::GameEntry;
+use crate::lightbar;
 use crate::percent_ring::{self, POPUP_SIZE};
 use crate::prefs::GamesSortMode;
 use crate::start_input::FaceHeld;
@@ -19,8 +20,8 @@ use iced::widget::{
     Float, button, column, container, row, scrollable, space, svg, text, text_input,
 };
 use iced::{
-    Alignment, Background, Border, Color, ContentFit, Element, Fill, Font, Length, Padding, Pixels,
-    Point, Rectangle, Renderer, Theme,
+    Alignment, Background, Border, Color, ContentFit, Element, Fill, Font, Length, Point,
+    Rectangle, Renderer, Theme,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -56,8 +57,7 @@ const FACE_GLYPH_SIZE: f32 = 18.0;
 const PRESSED_SCALE: f32 = 1.1;
 /// Pressed grow and armed-color transitions.
 const HINT_ANIM: Duration = Duration::from_millis(100);
-const ROW_GAP: f32 = 10.0;
-const ACCENT_BAR_W: f32 = 4.0;
+const ROW_GAP: f32 = theme::LIST_SEPARATOR_GAP;
 const ROW_ACTION_SPACING: f32 = 14.0;
 /// Body width inside outer padding — dual-pane strip unit.
 const PANE_W: f32 = WIDTH - 2.0 * PADDING;
@@ -286,6 +286,8 @@ struct FacePressAnim {
 struct RowHintState {
     triangle_progress: f32,
     triangle_armed_t: f32,
+    cross_progress: f32,
+    cross_armed_t: f32,
     held: FaceHeld,
     press_anim: FacePressAnim,
 }
@@ -296,6 +298,8 @@ impl RowHintState {
             Self {
                 triangle_progress: state.triangle_progress,
                 triangle_armed_t: state.triangle_armed_anim,
+                cross_progress: state.cross_progress,
+                cross_armed_t: state.cross_armed_anim,
                 held: state.held,
                 press_anim: state.press_anim,
             }
@@ -371,6 +375,15 @@ pub struct State {
     controllers_scroll_y: f32,
     controllers_viewport_h: f32,
     anim: Option<SlideAnim>,
+    /// Ring flash started with the last successful Identify (Controllers slide).
+    identify_flash: Option<IdentifyFlash>,
+}
+
+/// Active Identify ring flash for one controller row on the start screen.
+#[derive(Debug, Clone)]
+struct IdentifyFlash {
+    serial: String,
+    started: Instant,
 }
 
 /// How to pin a selection that has left the viewport.
@@ -410,6 +423,7 @@ impl Default for State {
             controllers_scroll_y: 0.0,
             controllers_viewport_h: 0.0,
             anim: None,
+            identify_flash: None,
         }
     }
 }
@@ -581,6 +595,39 @@ impl State {
             || self.replace_confirm.is_some()
             || self.manual_add.is_some()
             || self.hint_anims_need_frames()
+            || self.identify_flash_active()
+    }
+
+    /// Start the UI ring flash that mirrors the lightbar Identify pattern.
+    pub fn begin_identify_flash(&mut self, serial: &str) {
+        self.identify_flash = Some(IdentifyFlash {
+            serial: serial.to_string(),
+            started: Instant::now(),
+        });
+    }
+
+    /// True while a ring Identify flash still has frames to draw.
+    pub fn identify_flash_active(&self) -> bool {
+        self.identify_flash.as_ref().is_some_and(|flash| {
+            lightbar::identify_flash_is_white(flash.started, Instant::now()).is_some()
+        })
+    }
+
+    /// Drop finished flash state; call from the frame subscription.
+    pub fn tick_identify_flash(&mut self) {
+        let finished = self.identify_flash.as_ref().is_some_and(|flash| {
+            lightbar::identify_flash_is_white(flash.started, Instant::now()).is_none()
+        });
+        if finished {
+            self.identify_flash = None;
+        }
+    }
+
+    fn ring_flash_white(&self, serial: &str) -> bool {
+        self.identify_flash.as_ref().is_some_and(|flash| {
+            flash.serial == serial
+                && lightbar::identify_flash_is_white(flash.started, Instant::now()) == Some(true)
+        })
     }
 
     fn hint_anims_need_frames(&self) -> bool {
@@ -882,14 +929,21 @@ pub fn view<'a>(
     #[cfg(not(debug_assertions))]
     let diag: Element<'_, StartMessage> = space().height(Length::Fixed(0.0)).into();
 
-    container(
+    theme::framed(
         column![
-            header,
-            container(space())
+            column![
+                header,
+                container(space())
+                    .width(Fill)
+                    .height(Length::Fixed(1.0))
+                    .style(theme::configure_header_rule),
+            ]
+            .spacing(0)
+            .width(Fill),
+            container(body)
                 .width(Fill)
-                .height(Length::Fixed(1.0))
-                .style(theme::configure_header_rule),
-            container(body).width(Fill).height(Fill),
+                .height(Fill)
+                .style(theme::content),
             diag,
             hint,
         ]
@@ -898,10 +952,6 @@ pub fn view<'a>(
         .width(Fill)
         .height(Fill),
     )
-    .width(Fill)
-    .height(Fill)
-    .style(theme::root)
-    .into()
 }
 
 /// Mouse + global hotkey hitch markers (not pad-navigable). Stamps `HITCH_MARK` in the logs.
@@ -1033,7 +1083,7 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
         } else {
             row![
                 text("No games yet — press").size(15.0).color(theme::MUTED),
-                face_svg(FaceButton::Square, FACE_GLYPH_SIZE),
+                face_svg(FaceButton::Triangle, FACE_GLYPH_SIZE),
                 text("to edit.").size(15.0).color(theme::MUTED),
             ]
             .spacing(6)
@@ -1048,7 +1098,7 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
             .into();
     }
     let items = state.rows.iter().enumerate().fold(
-        column![].spacing(ROW_GAP).width(Fill),
+        column![].spacing(0).width(Fill),
         |col, (index, row)| {
             let selected = index == state.game_selected;
             let running = !state.editing
@@ -1056,6 +1106,11 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
                     .running_target
                     .as_ref()
                     .is_some_and(|t| t == &row.target);
+            let col = if index > 0 {
+                col.push(theme::list_separator())
+            } else {
+                col
+            };
             col.push(game_row(
                 index,
                 row,
@@ -1092,14 +1147,20 @@ fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element
         .into();
     }
     let items = state.controllers.iter().enumerate().fold(
-        column![].spacing(ROW_GAP).width(Fill),
+        column![].spacing(0).width(Fill),
         |col, (index, row)| {
             let selected = index == state.controller_selected;
+            let col = if index > 0 {
+                col.push(theme::list_separator())
+            } else {
+                col
+            };
             col.push(controller_row(
                 index,
                 row,
                 selected,
                 spectrum,
+                state.ring_flash_white(&row.serial),
                 RowHintState::for_selected(state, selected),
             ))
         },
@@ -1401,7 +1462,7 @@ fn footer_hint(state: &State) -> Element<'_, StartMessage> {
         StartSlide::Games => {
             let hints = [
                 face_hint(
-                    FaceButton::Square,
+                    FaceButton::Triangle,
                     if state.editing { "Save" } else { "Edit" },
                     state.held,
                     state.press_anim,
@@ -1414,7 +1475,17 @@ fn footer_hint(state: &State) -> Element<'_, StartMessage> {
                 ),
             ];
             if state.editing {
-                action_cluster(&hints)
+                // Add shortcut first, then Save / Cancel.
+                iced::widget::row![
+                    button(text("Add shortcut…").size(14.0).color(theme::ACCENT))
+                        .padding([6, 12])
+                        .on_press(StartMessage::AddShortcut)
+                        .style(theme::ghost),
+                    action_cluster(&hints),
+                ]
+                .spacing(28)
+                .align_y(Alignment::Center)
+                .into()
             } else {
                 iced::widget::row![
                     sort_mode_picker(state.sort_mode, state.held, state.press_anim),
@@ -1431,21 +1502,6 @@ fn footer_hint(state: &State) -> Element<'_, StartMessage> {
             state.held,
             state.press_anim,
         )]),
-    };
-
-    let cluster = if state.editing && matches!(state.slide, StartSlide::Games) {
-        iced::widget::row![
-            cluster,
-            button(text("Add shortcut…").size(14.0).color(theme::ACCENT))
-                .padding([6, 12])
-                .on_press(StartMessage::AddShortcut)
-                .style(theme::ghost),
-        ]
-        .spacing(28)
-        .align_y(Alignment::Center)
-        .into()
-    } else {
-        cluster
     };
 
     footer_band(cluster)
@@ -1472,87 +1528,18 @@ fn sort_mode_picker(
         false,
     );
     let alpha = sort_mode_label("A–Z", matches!(mode, GamesSortMode::Alphabetical), false);
-    let pressed = held.options;
-    let press_t = press_anim.options;
-    iced::widget::row![
-        start_badge_glyph(pressed, press_t, false),
-        last_played,
-        text("·").size(14.0).color(dim),
-        alpha,
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center)
-    .into()
-}
-
-const START_BADGE_FONT: Font = Font {
-    weight: Weight::Bold,
-    ..Font::MONOSPACE
-};
-
-/// Idle size = former pressed size (`PRESSED_SCALE` baked in).
-const START_LABEL_SIZE: f32 = 9.0 * PRESSED_SCALE;
-const START_PAD_X: f32 = 8.0 * PRESSED_SCALE;
-const START_PAD_Y: f32 = 5.0 * PRESSED_SCALE;
-/// Caps sit high in the em-box; nudge down for optical center inside the capsule.
-const START_CAPS_NUDGE: f32 = 1.25 * PRESSED_SCALE;
-
-/// DualSense Options → classic START label in a horizontal capsule hint.
-fn start_badge_glyph(pressed: bool, press_t: f32, muted: bool) -> Element<'static, StartMessage> {
-    let press_t = press_t.clamp(0.0, 1.0);
-    let scale = 1.0 + (PRESSED_SCALE - 1.0) * press_t;
-    // Layout always uses the default (former active) metrics.
-    let label_size = START_LABEL_SIZE;
-    let pad_x = START_PAD_X;
-    let pad_y = START_PAD_Y;
-    let nudge = START_CAPS_NUDGE;
-    // Padded content box height; half of that → true stadium ends.
-    let outer_h = label_size + pad_y * 2.0;
-    let radius = outer_h * 0.5;
-    let border_width = if pressed { 2.0 } else { 1.5 };
-    let border_color = if muted {
-        theme::alpha(theme::MUTED, 0.2)
-    } else if pressed {
-        theme::ACCENT
-    } else {
-        Color {
-            a: 0.25,
-            ..theme::MUTED
-        }
-    };
-    let label_color = if muted {
-        theme::alpha(theme::MUTED, 0.45)
-    } else {
-        theme::ACCENT
-    };
-    let pill = container(
-        text("START")
-            .size(label_size)
-            .line_height(Pixels(label_size))
-            .font(START_BADGE_FONT)
-            .color(label_color),
-    )
-    .padding(Padding {
-        top: pad_y + nudge,
-        right: pad_x,
-        bottom: pad_y - nudge,
-        left: pad_x,
-    })
-    .style(move |_| container::Style {
-        border: Border {
-            color: border_color,
-            width: border_width,
-            radius: radius.into(),
+    let glyph = face_glyph(
+        FaceButton::Square,
+        if held.square {
+            RingStyle::Pressed
+        } else {
+            RingStyle::Idle
         },
-        ..container::Style::default()
-    });
-
-    // Always Float so the widget tree stays stable across the press; layout size unchanged.
-    let glyph: Element<'static, StartMessage> = Float::new(pill).scale(scale).into();
-
-    container(glyph)
-        .height(Length::Fixed(HOLD_RING_SIZE))
-        .center_y(Fill)
+        press_anim.square,
+    );
+    iced::widget::row![glyph, last_played, text("·").size(14.0).color(dim), alpha,]
+        .spacing(8)
+        .align_y(Alignment::Center)
         .into()
 }
 
@@ -1728,25 +1715,6 @@ impl canvas::Program<StartMessage> for ActionRing {
     }
 }
 
-fn selection_bar(selected: bool) -> Element<'static, StartMessage> {
-    container(space())
-        .width(Length::Fixed(ACCENT_BAR_W))
-        .height(Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(if selected {
-                theme::ACCENT
-            } else {
-                Color::TRANSPARENT
-            })),
-            border: Border {
-                radius: 2.0.into(),
-                ..Default::default()
-            },
-            ..container::Style::default()
-        })
-        .into()
-}
-
 fn game_row(
     index: usize,
     row: &StartRow,
@@ -1819,6 +1787,14 @@ fn game_row(
     let title = text(&row.title)
         .size(19.0)
         .color(title_color)
+        .font(if selected {
+            Font {
+                weight: Weight::Bold,
+                ..Font::DEFAULT
+            }
+        } else {
+            Font::DEFAULT
+        })
         .wrapping(Wrapping::None)
         .width(Fill);
 
@@ -1834,9 +1810,7 @@ fn game_row(
 
     let titles = column![title, subtitle].spacing(4).width(Fill).clip(true);
 
-    let mut content = row![selection_bar(selected), icon]
-        .spacing(14)
-        .align_y(Alignment::Center);
+    let mut content = row![icon].spacing(14).align_y(Alignment::Center);
 
     if editing {
         let mark = if row.in_catalog() { "✓" } else { "○" };
@@ -1870,25 +1844,26 @@ fn game_row(
             ));
             if matches!(row.edit, Some(EditRow::Manual { .. })) {
                 actions.push(face_hint(
-                    FaceButton::Triangle,
+                    FaceButton::Square,
                     "Edit",
                     hint.held,
                     hint.press_anim,
                 ));
             }
         } else {
-            actions.push(face_hint(
-                FaceButton::Cross,
-                "Launch",
-                hint.held,
-                hint.press_anim,
-            ));
             if running {
                 actions.push(face_hold_hint(
-                    FaceButton::Triangle,
+                    FaceButton::Cross,
                     "Close game",
-                    hint.triangle_progress,
-                    hint.triangle_armed_t,
+                    hint.cross_progress,
+                    hint.cross_armed_t,
+                    hint.held,
+                    hint.press_anim,
+                ));
+            } else {
+                actions.push(face_hint(
+                    FaceButton::Cross,
+                    "Launch",
                     hint.held,
                     hint.press_anim,
                 ));
@@ -1911,9 +1886,14 @@ fn controller_row<'a>(
     row: &'a StartControllerRow,
     selected: bool,
     spectrum: &BatterySpectrum,
+    ring_flash_white: bool,
     hint: RowHintState,
 ) -> Element<'a, StartMessage> {
-    let ring_color = theme::from_rgb(spectrum.color_at_percent(row.percent));
+    let ring_color = if ring_flash_white {
+        theme::from_rgb(lightbar::IDENTIFY_FLASH)
+    } else {
+        theme::from_rgb(spectrum.color_at_percent(row.percent))
+    };
     let ring =
         percent_ring::percent_ring(row.percent, ring_color, POPUP_SIZE * 0.95, row.eta.clone());
 
@@ -1923,7 +1903,17 @@ fn controller_row<'a>(
         theme::MUTED
     };
     let titles = column![
-        text(&row.title).size(19.0).color(theme::INK),
+        text(&row.title)
+            .size(19.0)
+            .color(theme::INK)
+            .font(if selected {
+                Font {
+                    weight: Weight::Bold,
+                    ..Font::DEFAULT
+                }
+            } else {
+                Font::DEFAULT
+            }),
         text(format!("{} · {}", row.connection, row.state))
             .size(13.0)
             .color(meta_color),
@@ -1932,9 +1922,7 @@ fn controller_row<'a>(
     .width(Fill)
     .clip(true);
 
-    let mut content = row![selection_bar(selected), ring, titles]
-        .spacing(14)
-        .align_y(Alignment::Center);
+    let mut content = row![ring, titles].spacing(14).align_y(Alignment::Center);
 
     if selected {
         let mut actions = vec![face_hint(
@@ -1986,31 +1974,41 @@ mod tests {
 
     #[test]
     fn scroll_y_reveals_below_and_above_viewport() {
-        // Row 5 sits at y=490 with stride 98; viewport 300 starting at 0 → need scroll (Either/Down).
-        let y = scroll_y_to_reveal(5, 20, 88.0, 10.0, 0.0, 300.0, ScrollReveal::Either).unwrap();
-        assert!((y - (5.0 * 98.0 + 88.0 - 300.0)).abs() < 0.1);
+        let gap = ROW_GAP;
+        let stride = ROW_HEIGHT + gap;
+        // Row 5 below viewport 300 starting at 0 → need scroll (Either/Down).
+        let y =
+            scroll_y_to_reveal(5, 20, ROW_HEIGHT, gap, 0.0, 300.0, ScrollReveal::Either).unwrap();
+        assert!((y - (5.0 * stride + ROW_HEIGHT - 300.0)).abs() < 0.1);
 
         // Already visible near top with estimated/real viewport — no scroll.
-        assert!(scroll_y_to_reveal(1, 20, 88.0, 10.0, 0.0, 300.0, ScrollReveal::Either).is_none());
+        assert!(
+            scroll_y_to_reveal(1, 20, ROW_HEIGHT, gap, 0.0, 300.0, ScrollReveal::Either).is_none()
+        );
         // Unknown viewport uses estimate; early rows should still not force a top pin.
-        assert!(scroll_y_to_reveal(1, 20, 88.0, 10.0, 0.0, 0.0, ScrollReveal::Down).is_none());
+        assert!(scroll_y_to_reveal(1, 20, ROW_HEIGHT, gap, 0.0, 0.0, ScrollReveal::Down).is_none());
 
         // Scrolled past selection → scroll back up to row top.
-        let y = scroll_y_to_reveal(2, 20, 88.0, 10.0, 400.0, 300.0, ScrollReveal::Either).unwrap();
-        assert!((y - 2.0 * 98.0).abs() < 0.1);
+        let y =
+            scroll_y_to_reveal(2, 20, ROW_HEIGHT, gap, 400.0, 300.0, ScrollReveal::Either).unwrap();
+        assert!((y - 2.0 * stride).abs() < 0.1);
     }
 
     #[test]
     fn scroll_y_leading_edge_only() {
+        let gap = ROW_GAP;
+        let stride = ROW_HEIGHT + gap;
         // Row above viewport: Down must not scroll; Up must pin to top.
-        assert!(scroll_y_to_reveal(2, 20, 88.0, 10.0, 400.0, 300.0, ScrollReveal::Down).is_none());
-        let y = scroll_y_to_reveal(2, 20, 88.0, 10.0, 400.0, 300.0, ScrollReveal::Up).unwrap();
-        assert!((y - 2.0 * 98.0).abs() < 0.1);
+        assert!(
+            scroll_y_to_reveal(2, 20, ROW_HEIGHT, gap, 400.0, 300.0, ScrollReveal::Down).is_none()
+        );
+        let y = scroll_y_to_reveal(2, 20, ROW_HEIGHT, gap, 400.0, 300.0, ScrollReveal::Up).unwrap();
+        assert!((y - 2.0 * stride).abs() < 0.1);
 
         // Row below viewport: Up must not scroll; Down must pin to bottom.
-        assert!(scroll_y_to_reveal(5, 20, 88.0, 10.0, 0.0, 300.0, ScrollReveal::Up).is_none());
-        let y = scroll_y_to_reveal(5, 20, 88.0, 10.0, 0.0, 300.0, ScrollReveal::Down).unwrap();
-        assert!((y - (5.0 * 98.0 + 88.0 - 300.0)).abs() < 0.1);
+        assert!(scroll_y_to_reveal(5, 20, ROW_HEIGHT, gap, 0.0, 300.0, ScrollReveal::Up).is_none());
+        let y = scroll_y_to_reveal(5, 20, ROW_HEIGHT, gap, 0.0, 300.0, ScrollReveal::Down).unwrap();
+        assert!((y - (5.0 * stride + ROW_HEIGHT - 300.0)).abs() < 0.1);
     }
 
     #[test]
@@ -2023,13 +2021,15 @@ mod tests {
 
     #[test]
     fn scroll_y_center_when_out_of_view() {
-        assert!(scroll_y_center(1, 20, 88.0, 10.0, 0.0, 300.0, false).is_none());
-        let y = scroll_y_center(5, 20, 88.0, 10.0, 0.0, 300.0, false).unwrap();
-        let expected = 5.0 * 98.0 - (300.0 - 88.0) / 2.0;
+        let gap = ROW_GAP;
+        let stride = ROW_HEIGHT + gap;
+        assert!(scroll_y_center(1, 20, ROW_HEIGHT, gap, 0.0, 300.0, false).is_none());
+        let y = scroll_y_center(5, 20, ROW_HEIGHT, gap, 0.0, 300.0, false).unwrap();
+        let expected = 5.0 * stride - (300.0 - ROW_HEIGHT) / 2.0;
         assert!((y - expected).abs() < 0.1);
         // Force recenters even when already visible.
-        let y = scroll_y_center(1, 20, 88.0, 10.0, 0.0, 300.0, true).unwrap();
-        let expected = (1.0_f32 * 98.0 - (300.0 - 88.0) / 2.0).max(0.0);
+        let y = scroll_y_center(1, 20, ROW_HEIGHT, gap, 0.0, 300.0, true).unwrap();
+        let expected = (1.0_f32 * stride - (300.0 - ROW_HEIGHT) / 2.0).max(0.0);
         assert!((y - expected).abs() < 0.1);
     }
 }
