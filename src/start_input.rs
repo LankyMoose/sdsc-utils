@@ -797,13 +797,14 @@ pub struct PadNavBank {
     arm_new_pads: bool,
 }
 
-/// Which face buttons are currently held (OR across armed pads).
+/// Which face / Options buttons are currently held (OR across armed pads).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FaceHeld {
     pub cross: bool,
     pub circle: bool,
     pub square: bool,
     pub triangle: bool,
+    pub options: bool,
 }
 
 impl FaceHeld {
@@ -813,6 +814,7 @@ impl FaceHeld {
             circle: sample.circle,
             square: sample.square,
             triangle: sample.triangle,
+            options: sample.options,
         }
     }
 
@@ -822,6 +824,7 @@ impl FaceHeld {
             circle: self.circle || other.circle,
             square: self.square || other.square,
             triangle: self.triangle || other.triangle,
+            options: self.options || other.options,
         }
     }
 }

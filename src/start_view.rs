@@ -11,13 +11,16 @@ use crate::steam::SteamGame;
 use crate::svg_icon;
 use crate::theme;
 use crate::window_layout;
+use iced::font::Weight;
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::widget::text::Wrapping;
-use iced::widget::{button, column, container, row, scrollable, space, svg, text, text_input};
+use iced::widget::{
+    Float, button, column, container, row, scrollable, space, svg, text, text_input,
+};
 use iced::{
-    Alignment, Background, Border, Color, ContentFit, Element, Fill, Length, Point, Rectangle,
-    Renderer, Theme,
+    Alignment, Background, Border, Color, ContentFit, Element, Fill, Font, Length, Padding, Pixels,
+    Point, Rectangle, Renderer, Theme,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -270,6 +273,7 @@ struct FacePressAnim {
     circle: f32,
     square: f32,
     triangle: f32,
+    options: f32,
 }
 
 fn approach_anim(current: &mut f32, target: bool, dt: f32) {
@@ -557,6 +561,7 @@ impl State {
             (self.held.circle, self.press_anim.circle),
             (self.held.square, self.press_anim.square),
             (self.held.triangle, self.press_anim.triangle),
+            (self.held.options, self.press_anim.options),
         ];
         if press
             .iter()
@@ -587,6 +592,7 @@ impl State {
         approach_anim(&mut self.press_anim.circle, self.held.circle, dt);
         approach_anim(&mut self.press_anim.square, self.held.square, dt);
         approach_anim(&mut self.press_anim.triangle, self.held.triangle, dt);
+        approach_anim(&mut self.press_anim.options, self.held.options, dt);
         approach_anim(
             &mut self.triangle_armed_anim,
             self.triangle_progress >= 1.0,
@@ -1385,13 +1391,17 @@ fn footer_hint(state: &State) -> Element<'_, StartMessage> {
                     state.press_anim,
                 ),
             ];
-            iced::widget::row![
-                action_cluster(&hints),
-                sort_mode_picker(state.sort_mode, state.editing),
-            ]
-            .spacing(28)
-            .align_y(Alignment::Center)
-            .into()
+            if state.editing {
+                action_cluster(&hints)
+            } else {
+                iced::widget::row![
+                    sort_mode_picker(state.sort_mode, state.held, state.press_anim),
+                    action_cluster(&hints),
+                ]
+                .spacing(28)
+                .align_y(Alignment::Center)
+                .into()
+            }
         }
         StartSlide::Controllers => action_cluster(&[face_hint(
             FaceButton::Circle,
@@ -1428,17 +1438,22 @@ fn footer_band(content: Element<'_, StartMessage>) -> Element<'_, StartMessage> 
         .into()
 }
 
-fn sort_mode_picker(mode: GamesSortMode, muted: bool) -> Element<'static, StartMessage> {
+fn sort_mode_picker(
+    mode: GamesSortMode,
+    held: FaceHeld,
+    press_anim: FacePressAnim,
+) -> Element<'static, StartMessage> {
     let dim = theme::alpha(theme::MUTED, 0.45);
-    let options_color = if muted { dim } else { theme::ACCENT };
     let last_played = sort_mode_label(
         "Last played",
         matches!(mode, GamesSortMode::LastPlayed),
-        muted,
+        false,
     );
-    let alpha = sort_mode_label("A–Z", matches!(mode, GamesSortMode::Alphabetical), muted);
+    let alpha = sort_mode_label("A–Z", matches!(mode, GamesSortMode::Alphabetical), false);
+    let pressed = held.options;
+    let press_t = press_anim.options;
     iced::widget::row![
-        text("Options").size(14.0).color(options_color),
+        start_badge_glyph(pressed, press_t, false),
         last_played,
         text("·").size(14.0).color(dim),
         alpha,
@@ -1446,6 +1461,81 @@ fn sort_mode_picker(mode: GamesSortMode, muted: bool) -> Element<'static, StartM
     .spacing(8)
     .align_y(Alignment::Center)
     .into()
+}
+
+const START_BADGE_FONT: Font = Font {
+    weight: Weight::Bold,
+    ..Font::MONOSPACE
+};
+
+/// Idle size = former pressed size (`PRESSED_SCALE` baked in).
+const START_LABEL_SIZE: f32 = 9.0 * PRESSED_SCALE;
+const START_PAD_X: f32 = 8.0 * PRESSED_SCALE;
+const START_PAD_Y: f32 = 5.0 * PRESSED_SCALE;
+/// Caps sit high in the em-box; nudge down for optical center inside the capsule.
+const START_CAPS_NUDGE: f32 = 1.25 * PRESSED_SCALE;
+
+/// DualSense Options → classic START label in a horizontal capsule hint.
+fn start_badge_glyph(pressed: bool, press_t: f32, muted: bool) -> Element<'static, StartMessage> {
+    let press_t = press_t.clamp(0.0, 1.0);
+    let scale = 1.0 + (PRESSED_SCALE - 1.0) * press_t;
+    // Layout always uses the default (former active) metrics.
+    let label_size = START_LABEL_SIZE;
+    let pad_x = START_PAD_X;
+    let pad_y = START_PAD_Y;
+    let nudge = START_CAPS_NUDGE;
+    // Padded content box height; half of that → true stadium ends.
+    let outer_h = label_size + pad_y * 2.0;
+    let radius = outer_h * 0.5;
+    let border_width = if pressed { 2.0 } else { 1.5 };
+    let border_color = if muted {
+        theme::alpha(theme::MUTED, 0.2)
+    } else if pressed {
+        theme::ACCENT
+    } else {
+        Color {
+            a: 0.25,
+            ..theme::MUTED
+        }
+    };
+    let label_color = if muted {
+        theme::alpha(theme::MUTED, 0.45)
+    } else {
+        theme::ACCENT
+    };
+    let pill = container(
+        text("START")
+            .size(label_size)
+            .line_height(Pixels(label_size))
+            .font(START_BADGE_FONT)
+            .color(label_color),
+    )
+    .padding(Padding {
+        top: pad_y + nudge,
+        right: pad_x,
+        bottom: pad_y - nudge,
+        left: pad_x,
+    })
+    .style(move |_| container::Style {
+        border: Border {
+            color: border_color,
+            width: border_width,
+            radius: radius.into(),
+        },
+        ..container::Style::default()
+    });
+
+    // Scale on press via Float so layout width/height stay at the idle size.
+    let glyph: Element<'static, StartMessage> = if scale > 1.001 {
+        Float::new(pill).scale(scale).into()
+    } else {
+        pill.into()
+    };
+
+    container(glyph)
+        .height(Length::Fixed(HOLD_RING_SIZE))
+        .center_y(Fill)
+        .into()
 }
 
 fn sort_mode_label(
