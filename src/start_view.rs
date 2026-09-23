@@ -1510,12 +1510,8 @@ fn start_badge_glyph(pressed: bool, press_t: f32, muted: bool) -> Element<'stati
         ..container::Style::default()
     });
 
-    // Scale on press via Float so layout width/height stay at the idle size.
-    let glyph: Element<'static, StartMessage> = if scale > 1.001 {
-        Float::new(pill).scale(scale).into()
-    } else {
-        pill.into()
-    };
+    // Always Float so the widget tree stays stable across the press; layout size unchanged.
+    let glyph: Element<'static, StartMessage> = Float::new(pill).scale(scale).into();
 
     container(glyph)
         .height(Length::Fixed(HOLD_RING_SIZE))
@@ -1594,13 +1590,13 @@ fn face_glyph(face: FaceButton, style: RingStyle, press_t: f32) -> Element<'stat
     let press_t = press_t.clamp(0.0, 1.0);
     let scale = 1.0 + (PRESSED_SCALE - 1.0) * press_t;
     // Idle radius is inset so full press (× PRESSED_SCALE) + stroke stays inside the slot.
+    // Geometry stays fixed; Float scales the stack so SVG/canvas are not re-rasterized each frame.
     let half = HOLD_RING_SIZE / 2.0;
     let max_radius = half - 2.5; // leave room for ~2.5px stroke
     let idle_radius = max_radius / PRESSED_SCALE;
-    let radius = idle_radius * scale;
-    let glyph_size = FACE_GLYPH_SIZE * (idle_radius / (half - 2.0)) * scale;
-    iced::widget::stack![
-        action_ring(style, radius),
+    let glyph_size = FACE_GLYPH_SIZE * (idle_radius / (half - 2.0));
+    let stack = iced::widget::stack![
+        action_ring(style, idle_radius),
         container(face_svg(face, glyph_size))
             .width(Length::Fixed(HOLD_RING_SIZE))
             .height(Length::Fixed(HOLD_RING_SIZE))
@@ -1608,8 +1604,8 @@ fn face_glyph(face: FaceButton, style: RingStyle, press_t: f32) -> Element<'stat
             .center_y(Fill),
     ]
     .width(Length::Fixed(HOLD_RING_SIZE))
-    .height(Length::Fixed(HOLD_RING_SIZE))
-    .into()
+    .height(Length::Fixed(HOLD_RING_SIZE));
+    Float::new(stack).scale(scale).into()
 }
 
 fn action_ring(style: RingStyle, radius: f32) -> Element<'static, StartMessage> {
