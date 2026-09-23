@@ -158,7 +158,12 @@ pub fn remount_toast_surface<Message: Send + 'static>(
     id: window::Id,
     generation: u64,
 ) -> Task<Message> {
-    let width = crate::toast_view::WIDTH + if generation % 2 == 0 { 0.0 } else { 1.0 };
+    let width = crate::toast_view::WIDTH
+        + if generation.is_multiple_of(2) {
+            0.0
+        } else {
+            1.0
+        };
     window::resize(id, Size::new(width, crate::toast_view::HEIGHT))
 }
 

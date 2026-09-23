@@ -31,7 +31,12 @@ where
     Message: Clone + 'a,
 {
     let accent = theme::from_rgb(message.accent);
-    let width = WIDTH + if generation % 2 == 0 { 0.0 } else { 1.0 };
+    let width = WIDTH
+        + if generation.is_multiple_of(2) {
+            0.0
+        } else {
+            1.0
+        };
 
     let rail = container(space())
         .width(Length::Fixed(RAIL_WIDTH))

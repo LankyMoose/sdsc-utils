@@ -758,6 +758,7 @@ fn latch_diag(batch: &[PadSample], merged: &PadSample) {
 }
 
 /// One DualSense report read (optional block). Used by the drain loop.
+#[allow(clippy::too_many_arguments)]
 fn read_one_report(
     device: &HidDevice,
     is_bluetooth: bool,
