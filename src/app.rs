@@ -2333,14 +2333,11 @@ impl App {
     }
 
     fn edit_toggle_selected(&mut self) -> Option<Task<Message>> {
-        let Some(row) = self
+        let row = self
             .start_state
             .rows
             .get(self.start_state.game_selected)
-            .cloned()
-        else {
-            return None;
-        };
+            .cloned()?;
         let changed = match row.edit.as_ref() {
             Some(start_view::EditRow::Steam { appid, in_catalog }) => {
                 self.edit_catalog_mut().toggle_steam(*appid, !*in_catalog)

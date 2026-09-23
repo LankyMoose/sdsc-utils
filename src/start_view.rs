@@ -276,6 +276,29 @@ struct FacePressAnim {
     options: f32,
 }
 
+#[derive(Clone, Copy, Default)]
+struct RowHintState {
+    triangle_progress: f32,
+    triangle_armed_t: f32,
+    held: FaceHeld,
+    press_anim: FacePressAnim,
+}
+
+impl RowHintState {
+    fn for_selected(state: &State, selected: bool) -> Self {
+        if selected {
+            Self {
+                triangle_progress: state.triangle_progress,
+                triangle_armed_t: state.triangle_armed_anim,
+                held: state.held,
+                press_anim: state.press_anim,
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
 fn approach_anim(current: &mut f32, target: bool, dt: f32) {
     let target = if target { 1.0 } else { 0.0 };
     let step = dt / HINT_ANIM.as_secs_f32();
@@ -1002,26 +1025,7 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
                 selected,
                 running,
                 state.editing,
-                if selected {
-                    state.triangle_progress
-                } else {
-                    0.0
-                },
-                if selected {
-                    state.triangle_armed_anim
-                } else {
-                    0.0
-                },
-                if selected {
-                    state.held
-                } else {
-                    FaceHeld::default()
-                },
-                if selected {
-                    state.press_anim
-                } else {
-                    FacePressAnim::default()
-                },
+                RowHintState::for_selected(state, selected),
             ))
         },
     );
@@ -1059,26 +1063,7 @@ fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element
                 row,
                 selected,
                 spectrum,
-                if selected {
-                    state.triangle_progress
-                } else {
-                    0.0
-                },
-                if selected {
-                    state.triangle_armed_anim
-                } else {
-                    0.0
-                },
-                if selected {
-                    state.held
-                } else {
-                    FaceHeld::default()
-                },
-                if selected {
-                    state.press_anim
-                } else {
-                    FacePressAnim::default()
-                },
+                RowHintState::for_selected(state, selected),
             ))
         },
     );
@@ -1735,10 +1720,7 @@ fn game_row(
     selected: bool,
     running: bool,
     editing: bool,
-    triangle_progress: f32,
-    triangle_armed_t: f32,
-    held: FaceHeld,
-    press_anim: FacePressAnim,
+    hint: RowHintState,
 ) -> Element<'_, StartMessage> {
     let muted = editing && !row.in_catalog();
     let title_color = if muted {
@@ -1841,30 +1823,45 @@ fn game_row(
     content = content.push(titles);
 
     if selected {
-        let mut hints = Vec::new();
+        let mut actions = Vec::new();
         if editing {
             let label = match row.edit.as_ref() {
                 Some(EditRow::Manual { .. }) => "Remove",
                 Some(EditRow::Steam { .. }) | None => "Toggle",
             };
-            hints.push(face_hint(FaceButton::Cross, label, held, press_anim));
+            actions.push(face_hint(
+                FaceButton::Cross,
+                label,
+                hint.held,
+                hint.press_anim,
+            ));
             if matches!(row.edit, Some(EditRow::Manual { .. })) {
-                hints.push(face_hint(FaceButton::Triangle, "Edit", held, press_anim));
+                actions.push(face_hint(
+                    FaceButton::Triangle,
+                    "Edit",
+                    hint.held,
+                    hint.press_anim,
+                ));
             }
         } else {
-            hints.push(face_hint(FaceButton::Cross, "Launch", held, press_anim));
+            actions.push(face_hint(
+                FaceButton::Cross,
+                "Launch",
+                hint.held,
+                hint.press_anim,
+            ));
             if running {
-                hints.push(face_hold_hint(
+                actions.push(face_hold_hint(
                     FaceButton::Triangle,
                     "Close game",
-                    triangle_progress,
-                    triangle_armed_t,
-                    held,
-                    press_anim,
+                    hint.triangle_progress,
+                    hint.triangle_armed_t,
+                    hint.held,
+                    hint.press_anim,
                 ));
             }
         }
-        content = content.push(action_cluster_spaced(&hints, ROW_ACTION_SPACING));
+        content = content.push(action_cluster_spaced(&actions, ROW_ACTION_SPACING));
     }
 
     button(content.width(Fill).height(Length::Fixed(ROW_HEIGHT)))
@@ -1881,10 +1878,7 @@ fn controller_row<'a>(
     row: &'a StartControllerRow,
     selected: bool,
     spectrum: &BatterySpectrum,
-    triangle_progress: f32,
-    triangle_armed_t: f32,
-    held: FaceHeld,
-    press_anim: FacePressAnim,
+    hint: RowHintState,
 ) -> Element<'a, StartMessage> {
     let ring_color = theme::from_rgb(spectrum.color_at_percent(row.percent));
     let ring =
@@ -1910,18 +1904,23 @@ fn controller_row<'a>(
         .align_y(Alignment::Center);
 
     if selected {
-        let mut hints = vec![face_hint(FaceButton::Cross, "Identify", held, press_anim)];
+        let mut actions = vec![face_hint(
+            FaceButton::Cross,
+            "Identify",
+            hint.held,
+            hint.press_anim,
+        )];
         if row.bluetooth {
-            hints.push(face_hold_hint(
+            actions.push(face_hold_hint(
                 FaceButton::Triangle,
                 "Power off",
-                triangle_progress,
-                triangle_armed_t,
-                held,
-                press_anim,
+                hint.triangle_progress,
+                hint.triangle_armed_t,
+                hint.held,
+                hint.press_anim,
             ));
         }
-        content = content.push(action_cluster_spaced(&hints, ROW_ACTION_SPACING));
+        content = content.push(action_cluster_spaced(&actions, ROW_ACTION_SPACING));
     }
 
     button(
