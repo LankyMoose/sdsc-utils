@@ -1227,6 +1227,7 @@ impl PadNavBank {
     /// `editing` when true: Triangle saves (ToggleEdit); Square is EditManual.
     /// `hold_cross_close` (games browse): Cross hold closes the running game.
     /// `hold_triangle_power` (controllers): Triangle hold powers off Bluetooth.
+    #[allow(clippy::too_many_arguments)]
     pub fn tick(
         &mut self,
         readings: &[NavReading],
