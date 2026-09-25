@@ -5,3 +5,4 @@ pub mod emulate;
 pub mod hid;
 pub mod known;
 pub mod model;
+pub mod unknown;

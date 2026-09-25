@@ -13,7 +13,9 @@
 
 use crate::controller::driver;
 use crate::controller::dualsense::battery;
-use crate::controller::dualsense::identity::{normalize_identity, resolve_device_identity};
+use crate::controller::dualsense::identity::{
+    is_storable_serial, normalize_identity, resolve_device_identity,
+};
 use crate::controller::dualsense::lightbar::{
     self, HidPhaseTiming, IDENTIFY_FLASH_COUNT, IDENTIFY_FLASH_MS,
 };
@@ -134,11 +136,20 @@ impl DeviceCache {
     fn try_open_serial(&mut self, serial: &str) -> Option<OpenDevice> {
         let target = normalize_identity(serial);
         let mut best: Option<(OpenDevice, bool)> = None;
-        for info in self
-            .api
-            .device_list()
-            .filter(|d| driver::registry().for_gamepad(d).is_some())
-        {
+        let registry = driver::registry();
+        for info in self.api.device_list().filter(|d| {
+            registry
+                .for_gamepad(d)
+                .is_some_and(|drv| drv.supports_input())
+        }) {
+            let Some(drv) = registry.for_gamepad(info) else {
+                continue;
+            };
+            // Skip opens when enumerate already exposes a different storable identity.
+            let from_info = drv.identity_from_info(info);
+            if is_storable_serial(&from_info) && from_info != target {
+                continue;
+            }
             let open_started = Instant::now();
             let hint = info.serial_number().unwrap_or("");
             let device = {
@@ -166,10 +177,7 @@ impl DeviceCache {
                     }
                 }
             };
-            let identity = driver::registry()
-                .for_gamepad(info)
-                .map(|drv| drv.identity(info, &device))
-                .unwrap_or_else(|| resolve_device_identity(info, &device));
+            let identity = drv.identity(info, &device);
             if identity != target {
                 continue;
             }
@@ -223,7 +231,11 @@ impl DeviceCache {
             let live: std::collections::HashSet<String> = self
                 .api
                 .device_list()
-                .filter(|d| driver::registry().for_gamepad(d).is_some())
+                .filter(|d| {
+                    driver::registry()
+                        .for_gamepad(d)
+                        .is_some_and(|drv| drv.supports_input())
+                })
                 .filter_map(|d| {
                     d.serial_number()
                         .filter(|s| !s.is_empty())
@@ -236,11 +248,11 @@ impl DeviceCache {
         }
 
         let mut best: HashMap<String, (OpenDevice, bool)> = HashMap::new();
-        for info in self
-            .api
-            .device_list()
-            .filter(|d| driver::registry().for_gamepad(d).is_some())
-        {
+        for info in self.api.device_list().filter(|d| {
+            driver::registry()
+                .for_gamepad(d)
+                .is_some_and(|drv| drv.supports_input())
+        }) {
             let identity_hint = info.serial_number().filter(|s| !s.is_empty()).unwrap_or("");
             // Skip open if we already hold this pad (second open often fails exclusive).
             if !identity_hint.is_empty()

@@ -69,6 +69,11 @@ where
         .align_y(Alignment::Center)
         .height(Fill)
         .into(),
+        ToastTrailing::Unavailable => row![rail, body, percent_ring::unavailable_ring(TOAST_SIZE)]
+            .spacing(PADDING)
+            .align_y(Alignment::Center)
+            .height(Fill)
+            .into(),
         ToastTrailing::Bug => {
             let icon = svg(svg::Handle::from_memory(svg_icon::BUG_SVG.as_bytes()))
                 .width(Length::Fixed(BUG_ICON_SIZE))

@@ -8,14 +8,27 @@ use serde::{Deserialize, Serialize};
 pub enum ControllerKind {
     #[default]
     DualSense,
+    Unknown,
 }
 
 impl ControllerKind {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // mirrors Connection::as_str; useful for logs / future UI
     pub fn as_str(self) -> &'static str {
         match self {
             Self::DualSense => "DualSense",
+            Self::Unknown => "Unknown",
         }
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::ControllerKind;
+
+    #[test]
+    fn kind_as_str() {
+        assert_eq!(ControllerKind::DualSense.as_str(), "DualSense");
+        assert_eq!(ControllerKind::Unknown.as_str(), "Unknown");
     }
 }
 
@@ -43,6 +56,14 @@ impl Connection {
         matches!(self, Self::Bluetooth)
     }
 
+    pub fn from_bus(bus: hidapi::BusType) -> Option<Self> {
+        match bus {
+            hidapi::BusType::Usb => Some(Self::Usb),
+            hidapi::BusType::Bluetooth => Some(Self::Bluetooth),
+            _ => None,
+        }
+    }
+
     #[allow(dead_code)]
     pub fn from_label(label: &str) -> Option<Self> {
         match label {
@@ -59,7 +80,7 @@ impl std::fmt::Display for Connection {
     }
 }
 
-/// DualSense-style coarse battery state (also used as the shared UI model).
+/// Coarse battery state shared by drivers and UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerState {
     Discharging,
@@ -101,22 +122,32 @@ impl PowerState {
     }
 }
 
+/// Result of a battery probe (real or synthetic).
+#[derive(Debug, Clone)]
+pub struct BatteryReading {
+    pub percent: u8,
+    pub state: PowerState,
+    pub connection: Connection,
+}
+
 #[derive(Debug, Clone)]
 pub struct ControllerStatus {
     pub index: usize,
     pub kind: ControllerKind,
-    pub product: &'static str,
+    pub product: String,
     pub connection: Connection,
     pub serial: String,
     pub percent: u8,
     pub state: PowerState,
     pub supports_lightbar: bool,
     pub supports_power_off: bool,
+    pub supports_battery: bool,
+    pub supports_input: bool,
 }
 
 impl ControllerStatus {
     /// Low battery while discharging (toast, orange pulse, popup label).
     pub fn is_low_battery(&self, threshold: u8) -> bool {
-        self.percent <= threshold && self.state.is_discharging()
+        self.supports_battery && self.percent <= threshold && self.state.is_discharging()
     }
 }

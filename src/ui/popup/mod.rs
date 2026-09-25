@@ -56,6 +56,7 @@ pub struct ControllerRow {
     pub eta: Option<String>,
     pub supports_identify: bool,
     pub supports_power_off: bool,
+    pub supports_battery: bool,
 }
 
 impl ControllerRow {
@@ -69,10 +70,12 @@ impl ControllerRow {
     ) -> Self {
         Self {
             serial: controller.serial.clone(),
-            product: controller.product.to_string(),
+            product: controller.product.clone(),
             nickname,
             connection: controller.connection.to_string(),
-            state: if controller.is_low_battery(low_battery_percent) {
+            state: if !controller.supports_battery {
+                "unsupported".to_string()
+            } else if controller.is_low_battery(low_battery_percent) {
                 "low battery".to_string()
             } else {
                 controller.state.as_str().to_string()
@@ -82,9 +85,14 @@ impl ControllerRow {
             remembered,
             remember_enabled,
             low: controller.is_low_battery(low_battery_percent),
-            eta,
+            eta: if controller.supports_battery {
+                eta
+            } else {
+                None
+            },
             supports_identify: controller.supports_lightbar,
             supports_power_off: controller.supports_power_off,
+            supports_battery: controller.supports_battery,
         }
     }
 
@@ -93,6 +101,10 @@ impl ControllerRow {
         nickname: Option<String>,
         eta: Option<String>,
     ) -> Self {
+        let supports_battery = !matches!(
+            controller.kind,
+            crate::controller::model::ControllerKind::Unknown
+        );
         Self {
             serial: controller.serial.clone(),
             product: controller.product.clone(),
@@ -104,9 +116,10 @@ impl ControllerRow {
             remembered: true,
             remember_enabled: true,
             low: false,
-            eta,
+            eta: if supports_battery { eta } else { None },
             supports_identify: false,
             supports_power_off: false,
+            supports_battery,
         }
     }
 
@@ -329,7 +342,11 @@ fn controller_row<'a>(
     } else {
         theme::DIM
     };
-    let ring = percent_ring::percent_ring(entry.percent, ring_color, POPUP_SIZE, entry.eta.clone());
+    let ring = if entry.supports_battery {
+        percent_ring::percent_ring(entry.percent, ring_color, POPUP_SIZE, entry.eta.clone())
+    } else {
+        percent_ring::unavailable_ring(POPUP_SIZE)
+    };
 
     let name: Element<'_, PopupMessage> = if state.is_editing(&entry.serial) {
         text_input("Nickname", &state.draft)

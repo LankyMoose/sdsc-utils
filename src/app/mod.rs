@@ -513,9 +513,10 @@ impl App {
 
         let pad_input_live =
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
+        let any_input_pad = self.controllers.iter().any(|c| c.supports_input);
         let pad_listening = pad_input_live
             || (self.prefs.start_screen_enabled
-                && (!self.controllers.is_empty() || self.gesture_recorder.is_active()));
+                && (any_input_pad || self.gesture_recorder.is_active()));
         // Fast path whenever we are listening — reopen gesture needs the same cadence.
         self.hid_worker.set_input_hot(pad_listening);
         if pad_listening {
@@ -1753,9 +1754,11 @@ impl App {
                 };
                 start_view::StartControllerRow {
                     serial: c.serial.clone(),
-                    title: start_view::controller_title(c.product, nickname),
+                    title: start_view::controller_title(&c.product, nickname),
                     connection: c.connection.to_string(),
-                    state: if c.is_low_battery(self.prefs.low_battery_percent) {
+                    state: if !c.supports_battery {
+                        "unsupported".into()
+                    } else if c.is_low_battery(self.prefs.low_battery_percent) {
                         "low battery".into()
                     } else {
                         start_view::power_state_label(c.state).into()
@@ -1763,7 +1766,8 @@ impl App {
                     percent: c.percent,
                     low: c.is_low_battery(self.prefs.low_battery_percent),
                     bluetooth: c.connection.is_bluetooth() && c.supports_power_off,
-                    eta,
+                    eta: if c.supports_battery { eta } else { None },
+                    supports_battery: c.supports_battery,
                 }
             })
             .collect();
@@ -2043,7 +2047,8 @@ impl App {
             || self.gesture_recorder.is_active()
             || (self.configure_window.is_some()
                 && self.configure_state.section == Section::PadInput)
-            || (self.prefs.start_screen_enabled && !self.controllers.is_empty())
+            || (self.prefs.start_screen_enabled
+                && self.controllers.iter().any(|c| c.supports_input))
     }
 
     fn open_start_screen(&mut self) -> Task<Message> {

@@ -9,6 +9,7 @@ use crate::ui::color::{BatterySpectrum, Rgb};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToastTrailing {
     Percent { percent: u8, eta: Option<String> },
+    Unavailable,
     Bug,
 }
 
@@ -26,12 +27,23 @@ impl ToastMessage {
         spectrum: BatterySpectrum,
         eta: Option<String>,
     ) -> Self {
-        let percent = event.percent.unwrap_or(100).min(100);
-        Self {
-            heading: event.heading,
-            body: event.body,
-            accent: spectrum.color_at_percent(percent),
-            trailing: ToastTrailing::Percent { percent, eta },
+        match event.percent {
+            Some(percent) => {
+                let percent = percent.min(100);
+                Self {
+                    heading: event.heading,
+                    body: event.body,
+                    accent: spectrum.color_at_percent(percent),
+                    trailing: ToastTrailing::Percent { percent, eta },
+                }
+            }
+            None => Self {
+                heading: event.heading,
+                body: event.body,
+                // Matches `theme::MUTED` (#9A9AB0).
+                accent: Rgb::new(0x9A, 0x9A, 0xB0),
+                trailing: ToastTrailing::Unavailable,
+            },
         }
     }
 
@@ -66,7 +78,7 @@ impl ToastMessage {
     pub fn percent(&self) -> u8 {
         match &self.trailing {
             ToastTrailing::Percent { percent, .. } => *percent,
-            ToastTrailing::Bug => 0,
+            ToastTrailing::Unavailable | ToastTrailing::Bug => 0,
         }
     }
 }
@@ -135,6 +147,22 @@ mod tests {
         assert_eq!(messages[0].percent(), 40);
         assert_eq!(messages[1].percent(), 85);
         assert_ne!(messages[0].heading, messages[1].heading);
+    }
+
+    #[test]
+    fn from_notification_unavailable_when_no_percent() {
+        let event = crate::persist::notify::NotifyEvent {
+            heading: "Xbox Controller (USB)".into(),
+            body: "Connected".into(),
+            percent: None,
+            serial: "vidpidpath".into(),
+            state: PowerState::Unknown,
+        };
+        let message = ToastMessage::from_notification(event, BatterySpectrum::default(), None);
+        assert!(matches!(message.trailing, ToastTrailing::Unavailable));
+        assert_eq!(message.percent(), 0);
+        assert_eq!(message.accent, Rgb::new(0x9A, 0x9A, 0xB0));
+        assert!(message.heading.contains("Xbox Controller"));
     }
 
     #[test]

@@ -128,27 +128,28 @@ fn format_event(
 ) -> NotifyEvent {
     let name = nickname
         .filter(|value| !value.is_empty())
-        .unwrap_or(controller.product);
+        .unwrap_or(controller.product.as_str());
     let heading = format!("{name} ({})", controller.connection);
+    let percent = controller.supports_battery.then_some(controller.percent);
     match kind {
         NotifyKind::Connect => NotifyEvent {
             heading,
             body: "Connected".to_string(),
-            percent: Some(controller.percent),
+            percent,
             serial: controller.serial.clone(),
             state: controller.state,
         },
         NotifyKind::Disconnect => NotifyEvent {
             heading,
             body: "Disconnected".to_string(),
-            percent: Some(controller.percent),
+            percent,
             serial: controller.serial.clone(),
             state: controller.state,
         },
         NotifyKind::Low => NotifyEvent {
             heading,
             body: "Is low".to_string(),
-            percent: Some(controller.percent),
+            percent,
             serial: controller.serial.clone(),
             state: controller.state,
         },

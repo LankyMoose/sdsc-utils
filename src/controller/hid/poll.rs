@@ -7,12 +7,13 @@ use crate::controller::dualsense::battery;
 use crate::controller::dualsense::identity::{self as dualsense, hid_serial, is_storable_serial};
 use crate::controller::dualsense::lightbar::{self, HidPhaseTiming};
 use crate::controller::model::{ControllerKind, ControllerStatus};
+use crate::controller::unknown;
 use crate::platform::app_log;
 use crate::ui::color::color_for_battery_percent;
 use hidapi::{BusType, DeviceInfo, HidApi, HidDevice};
 use std::time::{Duration, Instant};
 
-/// How often to scan for DualSense connect/disconnect when pads are already known.
+/// How often to scan for connect/disconnect when pads are already known.
 pub const PRESENCE_INTERVAL: Duration = Duration::from_secs(3);
 /// Faster presence scan while the tray is empty (and start screen can auto-open on 0→1).
 pub const PRESENCE_INTERVAL_EMPTY: Duration = Duration::from_millis(500);
@@ -25,10 +26,10 @@ pub const LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
 /// When HID lists pads but battery reads keep failing, retry sooner than BATTERY_INTERVAL.
 pub const UNREAD_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Opened pad after a successful battery read (kept for lightbar write).
+/// Polled pad: DualSense keeps an open handle for lightbar; Unknown is presence-only.
 struct PolledPad {
     status: ControllerStatus,
-    device: HidDevice,
+    device: Option<HidDevice>,
     is_bluetooth: bool,
 }
 
@@ -59,7 +60,7 @@ fn dedupe_polled(mut pads: Vec<PolledPad>) -> Vec<PolledPad> {
 
 fn status_from_reading(
     driver: &dyn ControllerDriver,
-    product: &'static str,
+    product: String,
     reading: &battery::BatteryReading,
     serial: String,
 ) -> ControllerStatus {
@@ -72,6 +73,19 @@ fn status_from_reading(
             reading.percent,
             reading.state,
         ),
+        ControllerKind::Unknown => ControllerStatus {
+            index: 0,
+            kind: ControllerKind::Unknown,
+            product,
+            connection: reading.connection,
+            serial,
+            percent: reading.percent,
+            state: reading.state,
+            supports_lightbar: false,
+            supports_power_off: false,
+            supports_battery: false,
+            supports_input: false,
+        },
     }
 }
 
@@ -123,9 +137,20 @@ fn poll_controllers_with_api(
         let Some(drv) = registry.for_gamepad(info) else {
             continue;
         };
-        let product = drv.product_name(info.product_id());
-        let hid = hid_serial(info);
         let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
+
+        // Unknown: presence-only — never open or read reports.
+        if !drv.supports_battery() {
+            pads.push(PolledPad {
+                status: unknown::status_from_info(0, info),
+                device: None,
+                is_bluetooth,
+            });
+            continue;
+        }
+
+        let product = drv.product_name(info);
+        let hid = hid_serial(info);
 
         let open_started = Instant::now();
         let hint = hid_serial(info);
@@ -160,7 +185,7 @@ fn poll_controllers_with_api(
                 timing.io_ms += io_started.elapsed().as_millis();
                 pads.push(PolledPad {
                     status: status_from_reading(drv, product, &reading, serial),
-                    device,
+                    device: Some(device),
                     is_bluetooth,
                 });
             }
@@ -203,25 +228,25 @@ fn poll_controllers_with_api(
             if !pad.status.supports_lightbar {
                 continue;
             }
+            let Some(device) = pad.device.as_ref() else {
+                continue;
+            };
             let serial_key = dualsense::normalize_identity(&pad.status.serial);
             if !previous.contains(&serial_key) {
                 lightbar::prepare_connect_apply(&pad.status.serial);
             }
             let color = color_for_battery_percent(pad.status.percent);
             let io_started = Instant::now();
-            if let Err(err) = lightbar::apply_on_open_device(
-                &pad.device,
-                &pad.status.serial,
-                color,
-                pad.is_bluetooth,
-            ) {
+            if let Err(err) =
+                lightbar::apply_on_open_device(device, &pad.status.serial, color, pad.is_bluetooth)
+            {
                 timing.io_ms += io_started.elapsed().as_millis();
                 // Reopen clears stuck Windows overlapped I/O after a write timeout.
                 let (retry, t) = lightbar::apply_lightbar_rgb_timed(api, &pad.status.serial, color);
                 timing.add_assign(t);
                 if let Err(retry_err) = retry {
                     lightbar::warn_lightbar(
-                        pad.status.product,
+                        &pad.status.product,
                         format!("{err}; retry: {retry_err}"),
                     );
                 }

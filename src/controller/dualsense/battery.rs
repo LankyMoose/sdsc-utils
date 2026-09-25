@@ -9,7 +9,7 @@ use hidapi::{BusType, HidApi, HidDevice};
 use std::thread;
 use std::time::Duration;
 
-pub use crate::controller::model::{Connection, ControllerStatus, PowerState};
+pub use crate::controller::model::{BatteryReading, Connection, ControllerStatus, PowerState};
 const USB_REPORT_SIZE: usize = 64;
 const BT_REPORT_SIZE: usize = 78;
 const USB_POWER_OFFSET: usize = 53;
@@ -37,13 +37,6 @@ const MAX_POWER_LEVEL: u8 = 0x0A;
 
 /// Lowest DualSense reporting bucket (mid-point 5% ≈ 0–9%).
 pub const LOW_BATTERY_PERCENT: u8 = 5;
-
-#[derive(Debug, Clone)]
-pub struct BatteryReading {
-    pub percent: u8,
-    pub state: PowerState,
-    pub connection: Connection,
-}
 
 fn is_known_serial(serial: &str) -> bool {
     is_storable_serial(serial)
@@ -77,7 +70,7 @@ fn dedupe_statuses(mut statuses: Vec<ControllerStatus>) -> Vec<ControllerStatus>
 
 pub fn dualsense_status(
     index: usize,
-    product: &'static str,
+    product: impl Into<String>,
     connection: Connection,
     serial: String,
     percent: u8,
@@ -86,13 +79,15 @@ pub fn dualsense_status(
     ControllerStatus {
         index,
         kind: ControllerKind::DualSense,
-        product,
+        product: product.into(),
         connection,
         serial,
         percent,
         state,
         supports_lightbar: true,
         supports_power_off: true,
+        supports_battery: true,
+        supports_input: true,
     }
 }
 
@@ -349,6 +344,10 @@ mod tests {
         };
         assert!(discharging.is_low_battery(LOW_BATTERY_PERCENT));
         assert!(!charging.is_low_battery(LOW_BATTERY_PERCENT));
+        assert!(discharging.supports_battery);
+        assert!(discharging.supports_input);
+        assert!(discharging.supports_lightbar);
+        assert!(discharging.supports_power_off);
     }
 
     #[test]

@@ -293,7 +293,7 @@ impl AnalyticsStore {
         // Heartbeat: accrue only while the pad is present.
         if heartbeat_ok {
             for controller in next {
-                if !Self::is_storable_serial(&controller.serial) {
+                if !controller.supports_battery || !Self::is_storable_serial(&controller.serial) {
                     continue;
                 }
                 if let Some(record) = self.by_serial.get_mut(&controller.serial)
@@ -310,7 +310,7 @@ impl AnalyticsStore {
 
         // Disconnect: pause accrual (keep in_progress; no commit).
         for prev in previous {
-            if !Self::is_storable_serial(&prev.serial) {
+            if !prev.supports_battery || !Self::is_storable_serial(&prev.serial) {
                 continue;
             }
             if next_by.contains_key(prev.serial.as_str()) {
@@ -323,7 +323,7 @@ impl AnalyticsStore {
         }
 
         for controller in next {
-            if !Self::is_storable_serial(&controller.serial) {
+            if !controller.supports_battery || !Self::is_storable_serial(&controller.serial) {
                 continue;
             }
             let prev = prev_by.get(controller.serial.as_str()).copied();

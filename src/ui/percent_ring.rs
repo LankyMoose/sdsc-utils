@@ -91,6 +91,35 @@ pub fn percent_ring<'a, Message: 'a>(
         .into()
 }
 
+/// Empty muted ring with an em dash — used when battery cannot be read.
+pub fn unavailable_ring<'a, Message: 'a>(size: f32) -> Element<'a, Message> {
+    let color = theme::DIM;
+    let percent_size = text_size(size, 0, false);
+    let ring = canvas_widget(PercentRing {
+        percent: 0,
+        color,
+        size,
+    })
+    .width(Length::Fixed(size))
+    .height(Length::Fixed(size));
+
+    let label = text("—")
+        .size(percent_size)
+        .line_height(Pixels(percent_size))
+        .color(theme::MUTED);
+
+    let labels = container(label)
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .center_x(Fill)
+        .center_y(Fill);
+
+    stack![ring, labels]
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .into()
+}
+
 fn text_size(ring_size: f32, percent: u8, has_eta: bool) -> f32 {
     let base = if percent >= 100 {
         REF_TEXT_FULL

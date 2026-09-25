@@ -261,6 +261,7 @@ pub struct StartControllerRow {
     pub low: bool,
     pub bluetooth: bool,
     pub eta: Option<String>,
+    pub supports_battery: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1876,8 +1877,11 @@ fn controller_row<'a>(
     } else {
         theme::from_rgb(spectrum.color_at_percent(row.percent))
     };
-    let ring =
-        percent_ring::percent_ring(row.percent, ring_color, POPUP_SIZE * 0.95, row.eta.clone());
+    let ring = if row.supports_battery {
+        percent_ring::percent_ring(row.percent, ring_color, POPUP_SIZE * 0.95, row.eta.clone())
+    } else {
+        percent_ring::unavailable_ring(POPUP_SIZE * 0.95)
+    };
 
     let meta_color = if row.low {
         theme::WARNING

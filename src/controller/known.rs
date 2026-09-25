@@ -37,7 +37,7 @@ impl KnownController {
     fn from_status(status: &ControllerStatus) -> Self {
         Self {
             serial: status.serial.clone(),
-            product: status.product.to_string(),
+            product: status.product.clone(),
             connection: status.connection.to_string(),
             percent: status.percent,
             kind: status.kind,
@@ -45,7 +45,7 @@ impl KnownController {
     }
 
     fn update_from_status(&mut self, status: &ControllerStatus) -> bool {
-        let product = status.product.to_string();
+        let product = status.product.clone();
         let connection = status.connection.to_string();
         let changed = self.product != product
             || self.connection != connection
