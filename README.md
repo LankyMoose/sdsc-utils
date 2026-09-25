@@ -142,6 +142,8 @@ That unlocks a **Developer** section in the **Configure** window with emulated c
 - Prefs file: `%APPDATA%\sdsc-utils\prefs.json` (notification toggles/threshold/position + lightbar spectrum/enabled + analytics opt-in)
 - Remembered controllers: `%APPDATA%\sdsc-utils\controllers.json` (remembered pads + nicknames)
 - Battery analytics (when enabled): `%APPDATA%\sdsc-utils\analytics.json` (per-pad step samples + in-progress timer)
+- Start-screen games: `%APPDATA%\sdsc-utils\games.json`
+- Per-game macros: `%APPDATA%\sdsc-utils\macros.json` (shareable text format; see [`notes/macro-format.md`](notes/macro-format.md))
 - Autostart: portable builds write `sdsc-utils.lnk` into the user Startup folder; Microsoft Store / MSIX builds use a packaged Startup Task (both toggleable in **Configure**). Older portable `.cmd` entries are migrated to `.lnk` automatically.
 - Overlay toasts work over desktop, windowed, and borderless-fullscreen content. Exclusive fullscreen and some protected games can remain above all desktop windows.
 - The left-click controller popup is available on Windows and macOS. The `tray-icon` Linux backend does not emit tray click events; use the right-click **Settings** menu there.

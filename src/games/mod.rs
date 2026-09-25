@@ -1,6 +1,9 @@
 //! Persisted start-screen game catalog (`games.json`).
 
 pub mod launch;
+pub mod macro_lib;
+pub mod macro_run;
+pub mod macro_text;
 pub mod process_match;
 pub mod steam;
 

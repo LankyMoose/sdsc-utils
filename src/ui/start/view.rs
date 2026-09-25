@@ -92,6 +92,19 @@ pub enum StartMessage {
     AddShortcut,
     /// Open the add/edit modal for the selected manual (edit mode).
     EditManual,
+    /// Open macros for the selected game (edit manage, or run while playing).
+    OpenMacros,
+    MacroSelect(usize),
+    MacroAdd,
+    MacroImport,
+    MacroImportPaste(Option<String>),
+    MacroCopyCatalog,
+    MacroCopySelected,
+    MacroEditSelected,
+    MacroRemoveSelected,
+    MacroEditName(String),
+    MacroEditAction(String),
+    MacroEditSave,
     GamesScrolled(f32, f32),
     ControllersScrolled(f32, f32),
     ManualAddTitle(String),
@@ -128,6 +141,8 @@ pub struct StartRow {
     pub icon: Option<StartIcon>,
     /// Set in edit mode so Cross/click toggles membership or removes a manual.
     pub edit: Option<EditRow>,
+    /// True when this game has at least one macro in the library.
+    pub has_macros: bool,
 }
 
 /// Edit-mode action for a games-list row.
@@ -150,6 +165,7 @@ impl StartRow {
                         play_key: entry.play_key(),
                         icon: game.icon_path.clone().map(StartIcon::Path),
                         edit: None,
+                        has_macros: false,
                     }
                 } else {
                     Self {
@@ -160,6 +176,7 @@ impl StartRow {
                         play_key: entry.play_key(),
                         icon: None,
                         edit: None,
+                        has_macros: false,
                     }
                 }
             }
@@ -177,6 +194,7 @@ impl StartRow {
                 play_key: entry.play_key(),
                 icon: manual_icon(target, icon.as_deref()),
                 edit: None,
+                has_macros: false,
             },
         }
     }
@@ -193,6 +211,7 @@ impl StartRow {
                 appid: game.appid,
                 in_catalog,
             }),
+            has_macros: false,
         }
     }
 
@@ -215,6 +234,7 @@ impl StartRow {
             play_key: entry.play_key(),
             icon: manual_icon(target, icon.as_deref()),
             edit: Some(EditRow::Manual { id: id.clone() }),
+            has_macros: false,
         })
     }
 
@@ -344,6 +364,43 @@ impl ManualAddDraft {
     }
 }
 
+/// One row in the macros list overlay.
+#[derive(Debug, Clone)]
+pub struct MacroListRow {
+    pub id: String,
+    pub name: String,
+}
+
+/// Start-screen macros overlay (list / edit).
+#[derive(Debug, Clone)]
+pub enum MacroOverlay {
+    List {
+        play_key: String,
+        game_title: String,
+        /// True when opened from Options on a running game (Cross runs).
+        run_mode: bool,
+        selected: usize,
+        rows: Vec<MacroListRow>,
+        status: Option<String>,
+    },
+    Edit {
+        play_key: String,
+        /// None = new macro.
+        id: Option<String>,
+        name: String,
+        action: String,
+        error: Option<String>,
+    },
+}
+
+impl MacroOverlay {
+    pub fn play_key(&self) -> &str {
+        match self {
+            Self::List { play_key, .. } | Self::Edit { play_key, .. } => play_key,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct State {
     pub slide: StartSlide,
@@ -354,6 +411,7 @@ pub struct State {
     pub running_target: Option<String>,
     pub replace_confirm: Option<ReplaceConfirm>,
     pub manual_add: Option<ManualAddDraft>,
+    pub macro_overlay: Option<MacroOverlay>,
     pub triangle_progress: f32,
     pub cross_progress: f32,
     /// Face buttons currently held (pad OR keyboard) for action-hint press styling.
@@ -410,6 +468,7 @@ impl Default for State {
             running_target: None,
             replace_confirm: None,
             manual_add: None,
+            macro_overlay: None,
             triangle_progress: 0.0,
             cross_progress: 0.0,
             held: FaceHeld::default(),
@@ -578,6 +637,7 @@ impl State {
         self.anim = None;
         self.replace_confirm = None;
         self.manual_add = None;
+        self.macro_overlay = None;
         self.triangle_progress = 0.0;
         self.cross_progress = 0.0;
         self.held = FaceHeld::default();
@@ -594,7 +654,7 @@ impl State {
     }
 
     pub fn overlay_blocking(&self) -> bool {
-        self.replace_confirm.is_some() || self.manual_add.is_some()
+        self.replace_confirm.is_some() || self.manual_add.is_some() || self.macro_overlay.is_some()
     }
 
     pub fn animating(&self) -> bool {
@@ -607,6 +667,7 @@ impl State {
             || self.cross_progress > 0.0
             || self.replace_confirm.is_some()
             || self.manual_add.is_some()
+            || self.macro_overlay.is_some()
             || self.hint_anims_need_frames()
             || self.identify_flash_active()
     }
@@ -732,6 +793,7 @@ impl State {
 
         self.replace_confirm = None;
         self.manual_add = None;
+        self.macro_overlay = None;
         self.cross_progress = 0.0;
         if to != StartSlide::Games {
             self.editing = false;
@@ -746,7 +808,23 @@ impl State {
     }
 
     pub fn move_selection(&mut self, delta: i32) -> Option<ScrollReveal> {
-        if self.overlay_blocking() || self.anim.is_some() {
+        if self.anim.is_some() {
+            return None;
+        }
+        if let Some(MacroOverlay::List { selected, rows, .. }) = self.macro_overlay.as_mut() {
+            if rows.is_empty() {
+                return None;
+            }
+            let len = rows.len() as i32;
+            let before = *selected as i32;
+            let after = (before + delta).rem_euclid(len);
+            if after == before {
+                return None;
+            }
+            *selected = after as usize;
+            return Some(reveal_for_step(before, after, delta));
+        }
+        if self.overlay_blocking() {
             return None;
         }
         match self.slide {
@@ -776,6 +854,42 @@ impl State {
                 self.controller_selected = after as usize;
                 Some(reveal_for_step(before, after, delta))
             }
+        }
+    }
+
+    pub fn open_macro_list(
+        &mut self,
+        play_key: String,
+        game_title: String,
+        run_mode: bool,
+        rows: Vec<MacroListRow>,
+        status: Option<String>,
+    ) {
+        self.macro_overlay = Some(MacroOverlay::List {
+            play_key,
+            game_title,
+            run_mode,
+            selected: 0,
+            rows,
+            status,
+        });
+    }
+
+    pub fn refresh_macro_list_rows(&mut self, rows: Vec<MacroListRow>) {
+        if let Some(MacroOverlay::List {
+            selected,
+            rows: dest,
+            status,
+            ..
+        }) = self.macro_overlay.as_mut()
+        {
+            *dest = rows;
+            if dest.is_empty() {
+                *selected = 0;
+            } else {
+                *selected = (*selected).min(dest.len() - 1);
+            }
+            let _ = status;
         }
     }
 
@@ -928,7 +1042,11 @@ pub fn view<'a>(
 ) -> Element<'a, StartMessage> {
     let header = slide_header(state.slide_progress(now));
 
-    let body = if state.manual_add.is_some() {
+    let body = if matches!(state.macro_overlay, Some(MacroOverlay::Edit { .. })) {
+        macro_edit_view(state)
+    } else if matches!(state.macro_overlay, Some(MacroOverlay::List { .. })) {
+        macro_list_view(state)
+    } else if state.manual_add.is_some() {
         manual_add_view(state)
     } else if state.replace_confirm.is_some() {
         replace_confirm_view(state)
@@ -1190,6 +1308,199 @@ fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element
         .into()
 }
 
+fn macro_list_view(state: &State) -> Element<'_, StartMessage> {
+    let Some(MacroOverlay::List {
+        game_title,
+        run_mode,
+        selected,
+        rows,
+        status,
+        ..
+    }) = state.macro_overlay.as_ref()
+    else {
+        return space().into();
+    };
+
+    let heading = if *run_mode {
+        format!("Run macro — {game_title}")
+    } else {
+        format!("Macros — {game_title}")
+    };
+
+    let list: Element<'_, StartMessage> = if rows.is_empty() {
+        container(
+            text(if *run_mode {
+                "No macros for this game."
+            } else {
+                "No macros yet — Add or Import from the clipboard."
+            })
+            .size(15.0)
+            .color(theme::MUTED),
+        )
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill)
+        .into()
+    } else {
+        let items =
+            rows.iter()
+                .enumerate()
+                .fold(column![].spacing(0).width(Fill), |col, (index, row)| {
+                    let selected = index == *selected;
+                    let label = text(&row.name)
+                        .size(18.0)
+                        .color(theme::INK)
+                        .font(if selected {
+                            Font {
+                                weight: Weight::Bold,
+                                ..Font::DEFAULT
+                            }
+                        } else {
+                            Font::DEFAULT
+                        });
+                    let btn = button(label)
+                        .padding([12, 14])
+                        .width(Fill)
+                        .on_press(StartMessage::MacroSelect(index))
+                        .style(theme::menu_row(selected));
+                    col.push(btn)
+                });
+        scrollable(items).height(Fill).width(Fill).into()
+    };
+
+    let mut tools = row![].spacing(8).align_y(Alignment::Center);
+    if !*run_mode {
+        tools = tools
+            .push(
+                button(text("Add").size(13.0))
+                    .padding([5, 10])
+                    .on_press(StartMessage::MacroAdd)
+                    .style(theme::ghost),
+            )
+            .push(
+                button(text("Import").size(13.0))
+                    .padding([5, 10])
+                    .on_press(StartMessage::MacroImport)
+                    .style(theme::ghost),
+            );
+        if !rows.is_empty() {
+            tools = tools
+                .push(
+                    button(text("Copy catalog").size(13.0))
+                        .padding([5, 10])
+                        .on_press(StartMessage::MacroCopyCatalog)
+                        .style(theme::ghost),
+                )
+                .push(
+                    button(text("Edit").size(13.0))
+                        .padding([5, 10])
+                        .on_press(StartMessage::MacroEditSelected)
+                        .style(theme::ghost),
+                )
+                .push(
+                    button(text("Copy").size(13.0))
+                        .padding([5, 10])
+                        .on_press(StartMessage::MacroCopySelected)
+                        .style(theme::ghost),
+                )
+                .push(
+                    button(text("Remove").size(13.0))
+                        .padding([5, 10])
+                        .on_press(StartMessage::MacroRemoveSelected)
+                        .style(theme::ghost),
+                );
+        }
+    }
+
+    let status_el: Element<'_, StartMessage> = if let Some(msg) = status.as_ref() {
+        text(msg.as_str()).size(12.0).color(theme::WARNING).into()
+    } else {
+        space().height(Length::Fixed(0.0)).into()
+    };
+
+    container(
+        column![
+            text(heading).size(20.0).color(theme::INK),
+            tools,
+            status_el,
+            list,
+        ]
+        .spacing(10)
+        .width(Fill)
+        .height(Fill),
+    )
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+fn macro_edit_view(state: &State) -> Element<'_, StartMessage> {
+    let Some(MacroOverlay::Edit {
+        id,
+        name,
+        action,
+        error,
+        ..
+    }) = state.macro_overlay.as_ref()
+    else {
+        return space().into();
+    };
+
+    let title = if id.is_some() {
+        "Edit macro"
+    } else {
+        "Add macro"
+    };
+
+    let err: Element<'_, StartMessage> = if let Some(msg) = error.as_ref() {
+        text(msg.as_str()).size(12.0).color(theme::WARNING).into()
+    } else {
+        space().height(Length::Fixed(0.0)).into()
+    };
+
+    container(
+        column![
+            text(title).size(20.0).color(theme::INK),
+            space().height(6),
+            text_input("Name", name)
+                .size(14.0)
+                .padding(8)
+                .on_input(StartMessage::MacroEditName)
+                .style(theme::input),
+            text_input(
+                r#"action: focus > wait 100 > press enter > type "/cmd" > press enter"#,
+                action,
+            )
+            .size(14.0)
+            .padding(8)
+            .on_input(StartMessage::MacroEditAction)
+            .style(theme::input),
+            text("Paste the action chain (steps separated by  > ).")
+                .size(12.0)
+                .color(theme::MUTED),
+            err,
+            space().height(8),
+            row![
+                button(text("Save").size(14.0))
+                    .padding([6, 14])
+                    .on_press(StartMessage::MacroEditSave)
+                    .style(theme::primary),
+                button(text("Cancel").size(14.0))
+                    .padding([6, 14])
+                    .on_press(StartMessage::Close)
+                    .style(theme::ghost),
+            ]
+            .spacing(10),
+        ]
+        .spacing(8)
+        .width(Fill),
+    )
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
 fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
     let Some(draft) = state.manual_add.as_ref() else {
         return space().into();
@@ -1426,6 +1737,18 @@ fn face_hold_hint(
     }
 }
 
+fn options_hint(label: &'static str, held: FaceHeld, press_anim: FacePressAnim) -> ActionHint {
+    ActionHint {
+        face: None,
+        text_glyph: Some("OPT"),
+        label,
+        hold: None,
+        armed_t: 0.0,
+        pressed: held.options,
+        press_t: press_anim.options,
+    }
+}
+
 impl FacePressAnim {
     fn for_face(self, face: FaceButton) -> f32 {
         match face {
@@ -1438,6 +1761,59 @@ impl FacePressAnim {
 }
 
 fn footer_hint(state: &State) -> Element<'_, StartMessage> {
+    if let Some(MacroOverlay::Edit { .. }) = state.macro_overlay.as_ref() {
+        return footer_band(action_cluster(&[
+            face_hint(FaceButton::Cross, "Save", state.held, state.press_anim),
+            face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
+        ]));
+    }
+    if let Some(MacroOverlay::List { run_mode, rows, .. }) = state.macro_overlay.as_ref() {
+        let mut hints = Vec::new();
+        if *run_mode {
+            if !rows.is_empty() {
+                hints.push(face_hint(
+                    FaceButton::Cross,
+                    "Run",
+                    state.held,
+                    state.press_anim,
+                ));
+            }
+            hints.push(face_hint(
+                FaceButton::Circle,
+                "Back",
+                state.held,
+                state.press_anim,
+            ));
+        } else {
+            if !rows.is_empty() {
+                hints.push(face_hint(
+                    FaceButton::Cross,
+                    "Edit",
+                    state.held,
+                    state.press_anim,
+                ));
+                hints.push(face_hint(
+                    FaceButton::Square,
+                    "Copy",
+                    state.held,
+                    state.press_anim,
+                ));
+                hints.push(face_hint(
+                    FaceButton::Triangle,
+                    "Remove",
+                    state.held,
+                    state.press_anim,
+                ));
+            }
+            hints.push(face_hint(
+                FaceButton::Circle,
+                "Back",
+                state.held,
+                state.press_anim,
+            ));
+        }
+        return footer_band(action_cluster(&hints));
+    }
     if state.manual_add.is_some() {
         let label = if state.manual_add.as_ref().is_some_and(|d| d.is_edit()) {
             "Save"
@@ -1480,11 +1856,15 @@ fn footer_hint(state: &State) -> Element<'_, StartMessage> {
                 ),
             ];
             if state.editing {
-                // Add shortcut first, then Save / Cancel.
+                // Add shortcut / Macros, then Save / Cancel.
                 iced::widget::row![
                     button(text("Add shortcut…").size(14.0).color(theme::ACCENT))
                         .padding([6, 12])
                         .on_press(StartMessage::AddShortcut)
+                        .style(theme::ghost),
+                    button(text("Macros…").size(14.0).color(theme::ACCENT))
+                        .padding([6, 12])
+                        .on_press(StartMessage::OpenMacros)
                         .style(theme::ghost),
                     action_cluster(&hints),
                 ]
@@ -1887,6 +2267,9 @@ fn game_row(
                     hint.held,
                     hint.press_anim,
                 ));
+                if row.has_macros {
+                    actions.push(options_hint("Macros", hint.held, hint.press_anim));
+                }
             } else {
                 actions.push(face_hint(
                     FaceButton::Cross,

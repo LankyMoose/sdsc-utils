@@ -19,6 +19,9 @@ use crate::controller::hid::worker::HidWorkerHandle;
 use crate::controller::known::KnownControllers;
 use crate::controller::model::{Connection, ControllerStatus};
 use crate::games::launch;
+use crate::games::macro_lib::{self, ImportBind, MacroLibrary};
+use crate::games::macro_run;
+use crate::games::macro_text::{self, GameRef};
 use crate::games::process_match::{self, RunningSession};
 use crate::games::steam::{self, SteamGame};
 use crate::games::{self, GamesCatalog};
@@ -50,7 +53,9 @@ use crate::ui::start::input::{
     self as start_input, CrossHold, FaceHeld, GestureDetectorBank, GestureRecordLatch, NavAction,
     NavLogSnapshot, NavSource, PadNavBank,
 };
-use crate::ui::start::view::{self as start_view, ReplaceConfirm, StartMessage, StartSlide};
+use crate::ui::start::view::{
+    self as start_view, MacroListRow, MacroOverlay, ReplaceConfirm, StartMessage, StartSlide,
+};
 use crate::ui::theme;
 use crate::ui::toast::ToastMessage;
 use crate::ui::toast::view as toast_view;
@@ -61,9 +66,9 @@ use iced::futures::StreamExt;
 use iced::futures::channel::{mpsc, oneshot};
 use iced::keyboard;
 use iced::widget::{container, operation, space};
-use iced::{Element, Point, Size, Subscription, Task, Theme, stream, window};
+use iced::{Element, Point, Size, Subscription, Task, Theme, clipboard, stream, window};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -135,6 +140,18 @@ pub enum Message {
     ManualIconPicked(Option<PathBuf>),
     SteamScanDone(Result<Vec<SteamGame>, String>),
 
+    /// Macro focus completed; close start then run key steps.
+    MacroFocusDone {
+        name: String,
+        paths: Vec<PathBuf>,
+        steps: Vec<macro_text::Step>,
+        result: Result<(), String>,
+    },
+    MacroRunDone {
+        name: String,
+        result: Result<(), String>,
+    },
+
     PlaceToast {
         id: window::Id,
         monitor: Option<Size>,
@@ -167,6 +184,8 @@ pub struct App {
     notify: NotifyTracker,
     analytics: AnalyticsStore,
     games: GamesCatalog,
+    /// Per-game macro library (`macros.json`).
+    macros: MacroLibrary,
     /// In-progress start-screen edit checklist; committed on Save, discarded on Cancel.
     edit_draft: Option<GamesCatalog>,
 
@@ -314,6 +333,7 @@ impl App {
         let known = KnownControllers::load();
         let analytics = AnalyticsStore::load();
         let games = GamesCatalog::load();
+        let macros = MacroLibrary::load();
         color::set_active_spectrum(prefs.spectrum.clone());
         lightbar::set_enabled(prefs.lightbar_enabled);
 
@@ -334,6 +354,7 @@ impl App {
             notify: NotifyTracker::new(),
             analytics,
             games,
+            macros,
             edit_draft: None,
             controllers: Vec::new(),
             last_discovered,
@@ -610,7 +631,10 @@ impl App {
                 } else if Some(id) == self.start_window {
                     // File dialogs (add/edit shortcut, choose image) steal focus — keep the
                     // start screen open so the modal / draft is not discarded.
-                    if self.start_state.manual_add.is_some() || self.start_file_dialog_open {
+                    if self.start_state.manual_add.is_some()
+                        || self.start_state.macro_overlay.is_some()
+                        || self.start_file_dialog_open
+                    {
                         Task::none()
                     } else {
                         self.close_start_screen()
@@ -718,6 +742,20 @@ impl App {
             Message::ManualFilePicked(path) => self.on_manual_file_picked(path),
             Message::ManualIconPicked(path) => self.on_manual_icon_picked(path),
             Message::SteamScanDone(result) => self.on_steam_scan_done(result),
+
+            Message::MacroFocusDone {
+                name,
+                paths,
+                steps,
+                result,
+            } => self.on_macro_focus_done(name, paths, steps, result),
+            Message::MacroRunDone { name, result } => {
+                match result {
+                    Ok(()) => app_log::info(format!("macro: finished name={name}")),
+                    Err(err) => app_log::warn(format!("macro: failed name={name} err={err}")),
+                }
+                Task::none()
+            }
 
             Message::PlaceToast {
                 id,
@@ -1669,7 +1707,7 @@ impl App {
 
     fn refresh_start_rows(&mut self) {
         self.start_state.sort_mode = self.prefs.games_sort_mode;
-        let rows = if self.start_state.editing {
+        let mut rows = if self.start_state.editing {
             self.edit_checklist_rows()
         } else {
             self.display_catalog()
@@ -1677,6 +1715,9 @@ impl App {
                 .map(|entry| start_view::StartRow::from_entry(entry, &self.steam_by_id))
                 .collect()
         };
+        for row in &mut rows {
+            row.has_macros = self.macros.has_macros(&row.play_key);
+        }
         self.start_state.set_rows(rows);
     }
 
@@ -1709,6 +1750,7 @@ impl App {
         self.start_state.editing = false;
         self.start_state.edit_anchor_play_key = None;
         self.start_state.manual_add = None;
+        self.start_state.macro_overlay = None;
     }
 
     fn enter_start_edit(&mut self) -> Task<Message> {
@@ -1723,10 +1765,28 @@ impl App {
 
     fn commit_start_edit(&mut self) -> Task<Message> {
         if let Some(draft) = self.edit_draft.take() {
+            let keep: HashSet<String> = draft.entries.iter().map(|e| e.play_key()).collect();
+            let orphaned: Vec<String> = self
+                .macros
+                .games
+                .keys()
+                .filter(|k| !keep.contains(*k))
+                .cloned()
+                .collect();
+            let mut dirty = false;
+            for key in orphaned {
+                if self.macros.remove_game(&key) {
+                    dirty = true;
+                }
+            }
+            if dirty {
+                self.macros.save();
+            }
             self.games = draft;
             self.games.save();
         }
         self.start_state.editing = false;
+        self.start_state.macro_overlay = None;
         self.refresh_start_rows();
         self.start_state.restore_edit_anchor();
         self.scroll_start_selection_to_center(false)
@@ -2156,6 +2216,426 @@ impl App {
         self.start_opened_at = None;
     }
 
+    fn game_header_for_row(&self, row: &start_view::StartRow) -> String {
+        if let Some(appid) = row.play_key.strip_prefix("steam:") {
+            return GameRef::format(appid.parse().ok(), &row.title);
+        }
+        if let Some(stored) = self
+            .macros
+            .for_game(&row.play_key)
+            .and_then(|g| g.headers.get("game"))
+        {
+            return stored.clone();
+        }
+        GameRef::format(None, &row.title)
+    }
+
+    fn macro_list_rows(&self, play_key: &str) -> Vec<MacroListRow> {
+        self.macros
+            .for_game(play_key)
+            .map(|g| {
+                g.macros
+                    .iter()
+                    .map(|m| MacroListRow {
+                        id: m.id.clone(),
+                        name: m.name.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn open_macros_overlay(&mut self) {
+        let Some(row) = self
+            .start_state
+            .rows
+            .get(self.start_state.game_selected)
+            .cloned()
+        else {
+            return;
+        };
+        if !row.in_catalog() {
+            return;
+        }
+        let run_mode = !self.start_state.editing
+            && self
+                .start_state
+                .running_target
+                .as_ref()
+                .is_some_and(|t| t == &row.target)
+            && row.has_macros;
+        if !self.start_state.editing && !run_mode {
+            return;
+        }
+        let header = self.game_header_for_row(&row);
+        self.macros.ensure_game_header(&row.play_key, header);
+        let rows = self.macro_list_rows(&row.play_key);
+        self.start_state
+            .open_macro_list(row.play_key, row.title, run_mode, rows, None);
+    }
+
+    fn return_to_macro_list(&mut self, status: Option<String>) {
+        let play_key = self
+            .start_state
+            .macro_overlay
+            .as_ref()
+            .map(|o| o.play_key().to_string());
+        let Some(play_key) = play_key else {
+            return;
+        };
+        let title = self
+            .start_state
+            .rows
+            .iter()
+            .find(|r| r.play_key == play_key)
+            .map(|r| r.title.clone())
+            .unwrap_or_else(|| play_key.clone());
+        let rows = self.macro_list_rows(&play_key);
+        let run_mode = false;
+        self.start_state
+            .open_macro_list(play_key, title, run_mode, rows, status);
+        self.refresh_start_rows();
+    }
+
+    fn open_macro_editor(&mut self, id: Option<String>) {
+        let play_key = match self.start_state.macro_overlay.as_ref() {
+            Some(o) => o.play_key().to_string(),
+            None => return,
+        };
+        let (name, action) = if let Some(ref mid) = id {
+            self.macros
+                .find_macro(&play_key, mid)
+                .map(|m| (m.name.clone(), m.body.clone()))
+                .unwrap_or_default()
+        } else {
+            (String::new(), String::new())
+        };
+        self.start_state.macro_overlay = Some(MacroOverlay::Edit {
+            play_key,
+            id,
+            name,
+            action,
+            error: None,
+        });
+    }
+
+    fn open_macro_editor_selected(&mut self) {
+        let id = match self.start_state.macro_overlay.as_ref() {
+            Some(MacroOverlay::List { selected, rows, .. }) => {
+                rows.get(*selected).map(|r| r.id.clone())
+            }
+            _ => None,
+        };
+        let Some(id) = id else {
+            return;
+        };
+        self.open_macro_editor(Some(id));
+    }
+
+    fn save_macro_editor(&mut self) {
+        let Some(MacroOverlay::Edit {
+            play_key,
+            id,
+            name,
+            action,
+            ..
+        }) = self.start_state.macro_overlay.clone()
+        else {
+            return;
+        };
+        let name = name.trim().to_string();
+        let action = action.trim().to_string();
+        if name.is_empty() {
+            if let Some(MacroOverlay::Edit { error, .. }) = self.start_state.macro_overlay.as_mut()
+            {
+                *error = Some("name must be non-empty".into());
+            }
+            return;
+        }
+        // Allow pasting a full `action: …` line into the field.
+        let action = action
+            .strip_prefix("action:")
+            .map(|s| s.trim().to_string())
+            .unwrap_or(action);
+        let result = match id {
+            Some(ref mid) => self
+                .macros
+                .update_macro(&play_key, mid, name, action)
+                .map(|_| ()),
+            None => self.macros.add_macro(&play_key, name, action).map(|_| ()),
+        };
+        match result {
+            Ok(()) => {
+                self.macros.save();
+                self.return_to_macro_list(None);
+            }
+            Err(err) => {
+                if let Some(MacroOverlay::Edit { error, .. }) =
+                    self.start_state.macro_overlay.as_mut()
+                {
+                    *error = Some(err);
+                }
+            }
+        }
+    }
+
+    fn remove_selected_macro(&mut self) {
+        let (play_key, id) = match self.start_state.macro_overlay.as_ref() {
+            Some(MacroOverlay::List {
+                play_key,
+                selected,
+                rows,
+                run_mode: false,
+                ..
+            }) => {
+                let Some(row) = rows.get(*selected) else {
+                    return;
+                };
+                (play_key.clone(), row.id.clone())
+            }
+            _ => return,
+        };
+        if self.macros.remove_macro(&play_key, &id) {
+            self.macros.save();
+        }
+        let rows = self.macro_list_rows(&play_key);
+        self.start_state.refresh_macro_list_rows(rows);
+        self.refresh_start_rows();
+    }
+
+    fn copy_macro_catalog(&mut self) -> Task<Message> {
+        let Some(MacroOverlay::List { play_key, .. }) = self.start_state.macro_overlay.as_ref()
+        else {
+            return Task::none();
+        };
+        let play_key = play_key.clone();
+        let fallback = self
+            .start_state
+            .rows
+            .iter()
+            .find(|r| r.play_key == play_key)
+            .map(|r| self.game_header_for_row(r))
+            .unwrap_or_else(|| play_key.clone());
+        let Some(text) = self.macros.export_catalog(&play_key, &fallback) else {
+            return Task::none();
+        };
+        self.play_start_sound(UiSoundKind::Action);
+        clipboard::write(text)
+    }
+
+    fn copy_selected_macro(&mut self) -> Task<Message> {
+        let (play_key, id) = match self.start_state.macro_overlay.as_ref() {
+            Some(MacroOverlay::List {
+                play_key,
+                selected,
+                rows,
+                ..
+            }) => {
+                let Some(row) = rows.get(*selected) else {
+                    return Task::none();
+                };
+                (play_key.clone(), row.id.clone())
+            }
+            _ => return Task::none(),
+        };
+        let fallback = self
+            .start_state
+            .rows
+            .iter()
+            .find(|r| r.play_key == play_key)
+            .map(|r| self.game_header_for_row(r))
+            .unwrap_or_else(|| play_key.clone());
+        let Some(text) = self.macros.export_macro(&play_key, &id, &fallback) else {
+            return Task::none();
+        };
+        self.play_start_sound(UiSoundKind::Action);
+        clipboard::write(text)
+    }
+
+    fn import_macros_from_text(&mut self, text: String) {
+        let open_key = match self.start_state.macro_overlay.as_ref() {
+            Some(o) => o.play_key().to_string(),
+            None => return,
+        };
+        let doc = match macro_lib::parse_import(&text) {
+            Ok(doc) => doc,
+            Err(err) => {
+                if let Some(MacroOverlay::List { status, .. }) =
+                    self.start_state.macro_overlay.as_mut()
+                {
+                    *status = Some(err.to_string());
+                }
+                return;
+            }
+        };
+        let catalog = self.display_catalog();
+        let bind = self
+            .macros
+            .resolve_import_target(&doc, &open_key, &catalog, |e| match e {
+                crate::games::GameEntry::Steam { appid } => self
+                    .steam_by_id
+                    .get(appid)
+                    .map(|g| g.name.clone())
+                    .unwrap_or_else(|| format!("Steam {appid}")),
+                crate::games::GameEntry::Manual { title, .. } => title.clone(),
+            });
+        let (play_key, warning) = match bind {
+            ImportBind::Target(key) => (key, None),
+            ImportBind::Fallback { play_key, warning } => (play_key, Some(warning)),
+            ImportBind::Ambiguous(msg) => {
+                if let Some(MacroOverlay::List { status, .. }) =
+                    self.start_state.macro_overlay.as_mut()
+                {
+                    *status = Some(msg);
+                }
+                return;
+            }
+        };
+        match self.macros.merge_document(&play_key, doc) {
+            Ok(result) => {
+                self.macros.save();
+                let status = Some(format!(
+                    "imported +{} ~{}{}",
+                    result.added,
+                    result.updated,
+                    warning
+                        .as_ref()
+                        .map(|w| format!(" ({w})"))
+                        .unwrap_or_default()
+                ));
+                if play_key == open_key {
+                    let rows = self.macro_list_rows(&play_key);
+                    if let Some(MacroOverlay::List {
+                        rows: dest,
+                        selected,
+                        status: st,
+                        ..
+                    }) = self.start_state.macro_overlay.as_mut()
+                    {
+                        *dest = rows;
+                        if dest.is_empty() {
+                            *selected = 0;
+                        } else {
+                            *selected = (*selected).min(dest.len() - 1);
+                        }
+                        *st = status;
+                    }
+                } else {
+                    // Switched to another game — reopen that list.
+                    let title = self
+                        .start_state
+                        .rows
+                        .iter()
+                        .find(|r| r.play_key == play_key)
+                        .map(|r| r.title.clone())
+                        .unwrap_or_else(|| play_key.clone());
+                    let rows = self.macro_list_rows(&play_key);
+                    self.start_state
+                        .open_macro_list(play_key, title, false, rows, status);
+                }
+                self.refresh_start_rows();
+            }
+            Err(err) => {
+                if let Some(MacroOverlay::List { status, .. }) =
+                    self.start_state.macro_overlay.as_mut()
+                {
+                    *status = Some(err);
+                }
+            }
+        }
+    }
+
+    fn run_selected_macro(&mut self) -> Task<Message> {
+        let (play_key, id, name) = match self.start_state.macro_overlay.as_ref() {
+            Some(MacroOverlay::List {
+                play_key,
+                selected,
+                rows,
+                run_mode: true,
+                ..
+            }) => {
+                let Some(row) = rows.get(*selected) else {
+                    return Task::none();
+                };
+                (play_key.clone(), row.id.clone(), row.name.clone())
+            }
+            _ => return Task::none(),
+        };
+        let Some(record) = self.macros.find_macro(&play_key, &id).cloned() else {
+            return Task::none();
+        };
+        let steps = match macro_text::parse_action(&record.body) {
+            Ok(s) => s,
+            Err(err) => {
+                app_log::warn(format!("macro: bad action name={name}: {err}"));
+                return Task::none();
+            }
+        };
+        let paths = self
+            .running_session
+            .as_ref()
+            .map(|s| s.match_paths.clone())
+            .unwrap_or_default();
+        if paths.is_empty() {
+            app_log::warn(format!("macro: no match paths for {play_key}"));
+            return Task::none();
+        }
+        let name_for_focus = name.clone();
+        Task::perform(
+            spawn_blocking(move || {
+                macro_run::focus_game(&paths)
+                    .map_err(|e| e.to_string())
+                    .map(|()| (paths, steps))
+            }),
+            move |result| match result {
+                Ok(Ok((paths, steps))) => Message::MacroFocusDone {
+                    name: name_for_focus,
+                    paths,
+                    steps,
+                    result: Ok(()),
+                },
+                Ok(Err(err)) => Message::MacroFocusDone {
+                    name: name_for_focus,
+                    paths: Vec::new(),
+                    steps: Vec::new(),
+                    result: Err(err),
+                },
+                Err(err) => Message::MacroFocusDone {
+                    name: name_for_focus,
+                    paths: Vec::new(),
+                    steps: Vec::new(),
+                    result: Err(err),
+                },
+            },
+        )
+    }
+
+    fn on_macro_focus_done(
+        &mut self,
+        name: String,
+        paths: Vec<PathBuf>,
+        steps: Vec<macro_text::Step>,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        if let Err(err) = result {
+            app_log::warn(format!("macro: focus failed name={name} err={err}"));
+            return Task::none();
+        }
+        let close = self.close_start_screen();
+        let name_run = name.clone();
+        let run = Task::perform(
+            spawn_blocking(move || macro_run::run_keys(&paths, &steps).map_err(|e| e.to_string())),
+            move |result| Message::MacroRunDone {
+                name: name_run,
+                result: match result {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(err)) | Err(err) => Err(err),
+                },
+            },
+        );
+        close.chain(run)
+    }
+
     /// Mouse report buttons — stamp both logs with kind + live snapshot context.
     #[cfg(debug_assertions)]
     fn mark_hitch_now(&mut self, kind: &str) {
@@ -2195,7 +2675,9 @@ impl App {
             StartMessage::GamesScrolled(..)
             | StartMessage::ControllersScrolled(..)
             | StartMessage::ManualAddTitle(_)
-            | StartMessage::ManualAddArgs(_) => {}
+            | StartMessage::ManualAddArgs(_)
+            | StartMessage::MacroEditName(_)
+            | StartMessage::MacroEditAction(_) => {}
             #[cfg(debug_assertions)]
             StartMessage::ReportLightbarFailure | StartMessage::ReportInputFailure => {}
             _ => self.cancel_start_holds(),
@@ -2250,7 +2732,17 @@ impl App {
             }
             StartMessage::Confirm => self.on_start_confirm(),
             StartMessage::Close => {
-                if self.start_state.manual_add.is_some() {
+                if matches!(
+                    self.start_state.macro_overlay,
+                    Some(MacroOverlay::Edit { .. })
+                ) {
+                    self.play_start_sound(UiSoundKind::Action);
+                    self.return_to_macro_list(None);
+                    Task::none()
+                } else if self.start_state.macro_overlay.take().is_some() {
+                    self.play_start_sound(UiSoundKind::Action);
+                    Task::none()
+                } else if self.start_state.manual_add.is_some() {
                     self.play_start_sound(UiSoundKind::Action);
                     self.cancel_manual_add()
                 } else if self.start_state.replace_confirm.take().is_some() {
@@ -2321,6 +2813,67 @@ impl App {
                     self.play_start_sound(UiSoundKind::Action);
                 }
                 task
+            }
+            StartMessage::OpenMacros => {
+                self.play_start_sound(UiSoundKind::Action);
+                self.open_macros_overlay();
+                Task::none()
+            }
+            StartMessage::MacroSelect(index) => {
+                if let Some(MacroOverlay::List { selected, rows, .. }) =
+                    self.start_state.macro_overlay.as_mut()
+                    && index < rows.len()
+                {
+                    *selected = index;
+                    self.play_start_sound(UiSoundKind::Nav);
+                }
+                Task::none()
+            }
+            StartMessage::MacroAdd => {
+                self.play_start_sound(UiSoundKind::Action);
+                self.open_macro_editor(None);
+                Task::none()
+            }
+            StartMessage::MacroImport => {
+                self.play_start_sound(UiSoundKind::Action);
+                clipboard::read().map(|text| Message::Start(StartMessage::MacroImportPaste(text)))
+            }
+            StartMessage::MacroImportPaste(text) => {
+                self.import_macros_from_text(text.unwrap_or_default());
+                Task::none()
+            }
+            StartMessage::MacroCopyCatalog => self.copy_macro_catalog(),
+            StartMessage::MacroCopySelected => self.copy_selected_macro(),
+            StartMessage::MacroEditSelected => {
+                self.play_start_sound(UiSoundKind::Action);
+                self.open_macro_editor_selected();
+                Task::none()
+            }
+            StartMessage::MacroRemoveSelected => {
+                self.play_start_sound(UiSoundKind::Action);
+                self.remove_selected_macro();
+                Task::none()
+            }
+            StartMessage::MacroEditName(name) => {
+                if let Some(MacroOverlay::Edit { name: dest, .. }) =
+                    self.start_state.macro_overlay.as_mut()
+                {
+                    *dest = name;
+                }
+                Task::none()
+            }
+            StartMessage::MacroEditAction(action) => {
+                if let Some(MacroOverlay::Edit { action: dest, .. }) =
+                    self.start_state.macro_overlay.as_mut()
+                {
+                    *dest = action;
+                }
+                Task::none()
+            }
+            StartMessage::MacroEditSave => {
+                self.play_start_sound(UiSoundKind::Action);
+                self.save_macro_editor();
+                Task::none()
             }
             StartMessage::GamesScrolled(y, viewport_h) => {
                 self.start_state.set_games_scroll(y, viewport_h);
@@ -2576,6 +3129,19 @@ impl App {
     }
 
     fn on_start_confirm(&mut self) -> Task<Message> {
+        if let Some(MacroOverlay::Edit { .. }) = self.start_state.macro_overlay.as_ref() {
+            self.play_start_sound(UiSoundKind::Action);
+            self.save_macro_editor();
+            return Task::none();
+        }
+        if let Some(MacroOverlay::List { run_mode, .. }) = self.start_state.macro_overlay.as_ref() {
+            self.play_start_sound(UiSoundKind::Action);
+            if *run_mode {
+                return self.run_selected_macro();
+            }
+            self.open_macro_editor_selected();
+            return Task::none();
+        }
         if self.start_state.manual_add.is_some() {
             self.play_start_sound(UiSoundKind::Action);
             return self.confirm_manual_add();
@@ -2810,16 +3376,28 @@ impl App {
 
         let replace_confirm = self.start_state.replace_confirm.is_some();
         let manual_add = self.start_state.manual_add.is_some();
-        let allow_nav_move = !animating && !replace_confirm && !manual_add;
+        let macro_list = matches!(
+            self.start_state.macro_overlay,
+            Some(MacroOverlay::List { .. })
+        );
+        let macro_edit = matches!(
+            self.start_state.macro_overlay,
+            Some(MacroOverlay::Edit { .. })
+        );
+        let allow_nav_move = !animating && !replace_confirm && !manual_add && !macro_edit;
         let editing = self.start_state.editing;
         let hold_cross_close = !editing
             && !replace_confirm
             && !manual_add
+            && !macro_list
+            && !macro_edit
             && !animating
             && matches!(self.start_state.slide, StartSlide::Games);
         let hold_triangle_power = !editing
             && !replace_confirm
             && !manual_add
+            && !macro_list
+            && !macro_edit
             && !animating
             && matches!(self.start_state.slide, StartSlide::Controllers);
         let tick = self.pad_nav.tick(
@@ -2827,7 +3405,7 @@ impl App {
             now,
             allow_nav_move,
             replace_confirm && !animating,
-            editing,
+            editing && !macro_list && !macro_edit,
             hold_cross_close,
             hold_triangle_power,
         );
@@ -2887,7 +3465,7 @@ impl App {
             } else {
                 Task::none()
             }
-        } else if manual_add {
+        } else if manual_add || macro_edit {
             self.start_state.cross_progress = 0.0;
             self.start_state.triangle_progress = 0.0;
             self.keyboard_cross_hold.reset();
@@ -2898,6 +3476,32 @@ impl App {
                         NavAction::Confirm => StartMessage::Confirm,
                         _ => StartMessage::Close,
                     }),
+                    _ => Task::none(),
+                }
+            } else {
+                Task::none()
+            }
+        } else if macro_list {
+            self.start_state.cross_progress = 0.0;
+            self.start_state.triangle_progress = 0.0;
+            self.keyboard_cross_hold.reset();
+            self.start_state.tick_hint_anims(now);
+            let run_mode = matches!(
+                self.start_state.macro_overlay,
+                Some(MacroOverlay::List { run_mode: true, .. })
+            );
+            if let Some(action) = tick.action {
+                match action {
+                    NavAction::Up => self.on_start_message(StartMessage::MoveUp),
+                    NavAction::Down => self.on_start_message(StartMessage::MoveDown),
+                    NavAction::Confirm => self.on_start_message(StartMessage::Confirm),
+                    NavAction::Cancel => self.on_start_message(StartMessage::Close),
+                    NavAction::CycleSort if !run_mode => {
+                        self.on_start_message(StartMessage::MacroCopySelected)
+                    }
+                    NavAction::ToggleEdit if !run_mode => {
+                        self.on_start_message(StartMessage::MacroRemoveSelected)
+                    }
                     _ => Task::none(),
                 }
             } else {
@@ -2950,6 +3554,7 @@ impl App {
                         self.on_start_message(StartMessage::EditManual)
                     }
                     NavAction::Triangle => Task::none(),
+                    NavAction::Macros => self.on_start_message(StartMessage::OpenMacros),
                 }
             } else {
                 Task::none()
