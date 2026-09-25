@@ -8,6 +8,7 @@ mod autostart;
 mod battery;
 mod color;
 mod configure_view;
+mod crash_restart;
 mod dualsense;
 #[cfg(feature = "dev-emulate")]
 mod emulate;
@@ -52,6 +53,20 @@ fn main() -> ExitCode {
     app_log::init();
 
     let args: Vec<String> = env::args().skip(1).collect();
+
+    if args.iter().any(|a| a == crash_restart::RELAUNCH_FLAG) {
+        return crash_restart::run_relauncher();
+    }
+
+    // Undocumented: set the crash-restart notice flag, then start tray normally.
+    let test_crash_toast = args.iter().any(|a| a == "--test-crash-toast");
+    let args: Vec<String> = args
+        .into_iter()
+        .filter(|a| a != "--test-crash-toast")
+        .collect();
+    if test_crash_toast {
+        crash_restart::request_notice();
+    }
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         attach_console_for_cli();
@@ -131,6 +146,8 @@ fn main() -> ExitCode {
         app_log::info("another instance is already running; exiting");
         return ExitCode::SUCCESS;
     }
+
+    crash_restart::arm_tray_mode();
 
     #[cfg(feature = "dev-emulate")]
     let tray_result = app::run(dev_mode);

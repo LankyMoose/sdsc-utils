@@ -15,6 +15,7 @@ use crate::configure_view::{
     self, AnalyticsPadRow, AnalyticsPanel, ConfigureMessage, ConfigureSettings, ConfigureState,
     NotificationSetting, PadInputPanel, Section,
 };
+use crate::crash_restart;
 use crate::dualsense;
 #[cfg(feature = "dev-emulate")]
 use crate::emulate::{self, Preset};
@@ -408,9 +409,12 @@ impl App {
         app.sync_low_battery();
         app.refresh_analytics_panel();
 
+        let toast_boot = app
+            .ensure_toast_window()
+            .chain(app.maybe_show_crash_restart_toast());
         let task = Task::batch([
             app.request_refresh(),
-            app.ensure_toast_window(),
+            toast_boot,
             app.refresh_steam_library(),
         ]);
         (app, task)
@@ -728,7 +732,11 @@ impl App {
                 self.toast_anim_started = Instant::now();
                 self.toast_dismissing = false;
                 let start = Point::new(placement.x, placement.outside_y);
-                let percent = self.toast_message.as_ref().map(|m| m.percent).unwrap_or(0);
+                let percent = self
+                    .toast_message
+                    .as_ref()
+                    .map(|m| m.percent())
+                    .unwrap_or(0);
                 crate::hid_diag::diag_info(format!(
                     "ui-diag: place toast gen={generation} percent={percent}"
                 ));
@@ -2995,6 +3003,16 @@ impl App {
         open.discard()
     }
 
+    /// One-shot toast after crash auto-relaunch (or `--test-crash-toast`).
+    fn maybe_show_crash_restart_toast(&mut self) -> Task<Message> {
+        if !crash_restart::take_pending_notice() {
+            return Task::none();
+        }
+        app_log::info("crash-restart: notice toast");
+        self.toast_queue.push_back(ToastMessage::crash_restart());
+        self.show_next_toast()
+    }
+
     fn create_toast_window(&mut self) -> (window::Id, Task<window::Id>) {
         let (id, open) = window::open(window::Settings {
             size: Size::new(toast_view::WIDTH, toast_view::HEIGHT),
@@ -3023,7 +3041,7 @@ impl App {
         crate::hid_diag::diag_info(format!(
             "ui-diag: toast show heading={:?} percent={} queue_left={}",
             message.heading,
-            message.percent,
+            message.percent(),
             self.toast_queue.len()
         ));
         self.toast_message = Some(message);

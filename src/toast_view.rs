@@ -1,9 +1,10 @@
 //! Overlay toast card rendered by the iced daemon.
 
 use crate::percent_ring::{self, TOAST_SIZE};
+use crate::svg_icon;
 use crate::theme;
-use crate::toast::ToastMessage;
-use iced::widget::{column, container, mouse_area, row, space, text};
+use crate::toast::{ToastMessage, ToastTrailing};
+use iced::widget::{column, container, mouse_area, row, space, svg, text};
 use iced::{Alignment, Element, Fill, Length, Shrink};
 
 /// Logical width of the toast window.
@@ -17,6 +18,8 @@ const RAIL_WIDTH: f32 = 3.0;
 const PADDING: f32 = 12.0;
 const HEADING_SIZE: f32 = 14.0;
 const BODY_SIZE: f32 = 13.0;
+/// Compact leading icon for crash-restart toasts (not the percent-ring slot).
+const BUG_ICON_SIZE: f32 = 36.0;
 
 /// Renders the toast card. Clicking anywhere on it emits `on_dismiss`.
 ///
@@ -56,20 +59,36 @@ where
     .spacing(4)
     .width(Fill);
 
-    let card = container(
-        row![
+    let content: Element<'_, Message> = match &message.trailing {
+        ToastTrailing::Percent { percent, eta } => row![
             rail,
             body,
-            percent_ring::percent_ring(message.percent, accent, TOAST_SIZE, message.eta.clone())
+            percent_ring::percent_ring(*percent, accent, TOAST_SIZE, eta.clone())
         ]
         .spacing(PADDING)
         .align_y(Alignment::Center)
-        .height(Fill),
-    )
-    .padding(PADDING)
-    .width(Fill)
-    .height(Fill)
-    .style(theme::toast_card(accent));
+        .height(Fill)
+        .into(),
+        ToastTrailing::Bug => {
+            let icon = svg(svg::Handle::from_memory(svg_icon::BUG_SVG.as_bytes()))
+                .width(Length::Fixed(BUG_ICON_SIZE))
+                .height(Length::Fixed(BUG_ICON_SIZE))
+                .style(move |_theme, _status| svg::Style {
+                    color: Some(accent),
+                });
+            row![rail, icon, body]
+                .spacing(PADDING)
+                .align_y(Alignment::Center)
+                .height(Fill)
+                .into()
+        }
+    };
+
+    let card = container(content)
+        .padding(PADDING)
+        .width(Fill)
+        .height(Fill)
+        .style(theme::toast_card(accent));
 
     mouse_area(
         container(card)

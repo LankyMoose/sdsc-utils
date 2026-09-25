@@ -25,7 +25,6 @@ use iced::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Logical width of the start-screen window.
@@ -108,14 +107,15 @@ pub enum StartMessage {
 }
 
 /// Runtime-resolved game art (Steam path or extracted shell icon).
+///
+/// `Rgba` stores an iced [`image::Handle`] built once at extraction time.
+/// Recreating `Handle::from_rgba` every `view()` assigns a new cache id and
+/// forces iced's image atlas to re-upload (and often grow) each redraw.
 #[derive(Debug, Clone)]
 pub enum StartIcon {
     Path(PathBuf),
-    Rgba {
-        width: u32,
-        height: u32,
-        pixels: Arc<[u8]>,
-    },
+    /// Decoded shell icon; handle id is stable across frames.
+    Rgba(iced::widget::image::Handle),
 }
 
 #[derive(Debug, Clone)]
@@ -240,11 +240,9 @@ fn manual_icon(target: &str, custom: Option<&str>) -> Option<StartIcon> {
     let path = PathBuf::from(target);
     // Extract a bit larger than the cell so Cover scales cleanly.
     let (width, height, pixels) = file_icon::rgba_for_path(&path, ICON_H as u32)?;
-    Some(StartIcon::Rgba {
-        width,
-        height,
-        pixels: pixels.into(),
-    })
+    Some(StartIcon::Rgba(iced::widget::image::Handle::from_rgba(
+        width, height, pixels,
+    )))
 }
 
 /// Probe whether a target path yields a shell icon (for the add-manual modal).
@@ -1292,19 +1290,11 @@ fn start_icon_image(icon: &StartIcon) -> Element<'static, StartMessage> {
                 .content_fit(ContentFit::Cover)
                 .into()
         }
-        StartIcon::Rgba {
-            width,
-            height,
-            pixels,
-        } => iced::widget::image(iced::widget::image::Handle::from_rgba(
-            *width,
-            *height,
-            pixels.to_vec(),
-        ))
-        .width(Length::Fixed(ICON_W))
-        .height(Length::Fixed(ICON_H))
-        .content_fit(ContentFit::Cover)
-        .into(),
+        StartIcon::Rgba(handle) => iced::widget::image(handle.clone())
+            .width(Length::Fixed(ICON_W))
+            .height(Length::Fixed(ICON_H))
+            .content_fit(ContentFit::Cover)
+            .into(),
     }
 }
 
@@ -1743,19 +1733,11 @@ fn game_row(
                 .content_fit(ContentFit::Cover)
                 .into()
         }
-        Some(StartIcon::Rgba {
-            width,
-            height,
-            pixels,
-        }) => iced::widget::image(iced::widget::image::Handle::from_rgba(
-            *width,
-            *height,
-            pixels.to_vec(),
-        ))
-        .width(Length::Fixed(ICON_W))
-        .height(Length::Fixed(ICON_H))
-        .content_fit(ContentFit::Cover)
-        .into(),
+        Some(StartIcon::Rgba(handle)) => iced::widget::image(handle.clone())
+            .width(Length::Fixed(ICON_W))
+            .height(Length::Fixed(ICON_H))
+            .content_fit(ContentFit::Cover)
+            .into(),
         None => container(
             svg(svg::Handle::from_memory(svg_icon::GAME_SVG.as_bytes()))
                 .width(Length::Fixed(ICON_W * 0.5))
