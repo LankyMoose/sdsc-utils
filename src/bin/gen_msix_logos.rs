@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-#[path = "../svg_icon.rs"]
+#[path = "../ui/svg_icon.rs"]
 mod svg_icon;
 
 use std::env;

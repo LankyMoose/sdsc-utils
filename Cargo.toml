@@ -12,6 +12,7 @@ homepage = "https://github.com/LankyMoose/sdsc-utils"
 keywords = ["dualsense", "playstation", "battery", "hid", "tray"]
 categories = ["hardware-support", "gui"]
 build = "build.rs"
+default-run = "sdsc-utils"
 
 [features]
 default = []
@@ -38,7 +39,13 @@ winreg = "0.55"
 [dependencies]
 crc32fast = "1.5.0"
 hidapi = "2.6.6"
-iced = { version = "0.14.0", features = ["advanced", "canvas", "tokio", "svg", "image"] }
+iced = { version = "0.14.0", features = [
+    "advanced",
+    "canvas",
+    "tokio",
+    "svg",
+    "image",
+] }
 png = "0.17"
 resvg = { version = "0.45", default-features = false }
 rfd = "0.15"
