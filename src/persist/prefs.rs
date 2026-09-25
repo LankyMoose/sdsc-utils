@@ -83,6 +83,9 @@ pub struct Prefs {
     /// Start-screen games list sort (default last played).
     #[serde(default)]
     pub games_sort_mode: GamesSortMode,
+    /// Controllers slide: include remembered disconnected pads (default off).
+    #[serde(default)]
+    pub show_all_controllers: bool,
 }
 
 fn default_true() -> bool {
@@ -130,6 +133,7 @@ impl Default for Prefs {
             start_screen_sounds_enabled: true,
             start_screen_sound_volume: default_start_screen_sound_volume(),
             games_sort_mode: GamesSortMode::default(),
+            show_all_controllers: false,
         }
     }
 }
@@ -300,5 +304,11 @@ mod tests {
         );
         let prefs: Prefs = serde_json::from_str("{}").unwrap();
         assert_eq!(prefs.games_sort_mode, GamesSortMode::LastPlayed);
+    }
+
+    #[test]
+    fn older_prefs_default_show_all_controllers_off() {
+        let prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(!prefs.show_all_controllers);
     }
 }
