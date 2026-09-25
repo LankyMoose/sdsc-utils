@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Connect toast slide-in no longer freezes, pops, or stays off-screen when the start screen opens on the same 0→1 connect (slide clock starts after show, frames are dt-capped, and Start waits only for slide settle).
+
 ## [1.4.1] - 2026-09-25
 
 ### Added

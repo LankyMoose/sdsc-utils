@@ -42,10 +42,10 @@ use crate::ui::configure::{
     ConfigureState, NotificationSetting, PadInputPanel, Section,
 };
 use crate::ui::layout::{
-    TOAST_SLIDE_DURATION, ToastPlacement, TrayAnchor, hide_toast, invalidate_toast,
-    overlay_platform_specific, popup_position, raise_window_topmost, remount_toast_surface,
-    set_toast_topmost, show_toast_without_activate, slide_y, toast_placement,
-    window_platform_specific,
+    TOAST_SLIDE_DURATION, ToastPlacement, TrayAnchor, advance_toast_slide, hide_toast,
+    invalidate_toast, overlay_platform_specific, popup_position, raise_window_topmost,
+    remount_toast_surface, set_toast_topmost, show_toast_without_activate, slide_y,
+    toast_placement, window_platform_specific,
 };
 use crate::ui::popup::{self as popup_view, ControllerRow, PopupMessage};
 use crate::ui::start::gesture::{self, GestureRecorder};
@@ -155,6 +155,10 @@ pub enum Message {
     PlaceToast {
         id: window::Id,
         monitor: Option<Size>,
+        generation: u64,
+    },
+    /// Toast HWND is shown at outside_y; start the slide-in clock.
+    ToastShown {
         generation: u64,
     },
     /// Advance the active toast slide animation.
@@ -276,8 +280,17 @@ pub struct App {
     toast_queue: VecDeque<ToastMessage>,
     toast_generation: u64,
     toast_placement: Option<ToastPlacement>,
+    /// Last frame Instant for capped slide dt (set on ToastShown / dismiss / each frame).
     toast_anim_started: Instant,
+    /// Capped elapsed since slide-in or slide-out began.
+    toast_slide_elapsed: Duration,
+    /// True after PlaceToast finished showing; slide-in may advance.
+    toast_slide_started: bool,
+    /// True after slide-in applied progress 1 (rest pose).
+    toast_slide_settled: bool,
     toast_dismissing: bool,
+    /// Open start screen after the in-flight connect toast finishes slide-in (or dismisses).
+    pending_start_after_toast: bool,
 
     /// Bumped on every spectrum edit; stale SpectrumCommit messages are ignored.
     spectrum_generation: u64,
@@ -410,7 +423,11 @@ impl App {
             toast_generation: 0,
             toast_placement: None,
             toast_anim_started: Instant::now(),
+            toast_slide_elapsed: Duration::ZERO,
+            toast_slide_started: false,
+            toast_slide_settled: false,
             toast_dismissing: false,
+            pending_start_after_toast: false,
             spectrum_generation: 0,
             #[cfg(feature = "dev-emulate")]
             dev_mode,
@@ -767,7 +784,9 @@ impl App {
                 }
                 let placement = toast_placement(self.prefs.toast_position, monitor);
                 self.toast_placement = Some(placement);
-                self.toast_anim_started = Instant::now();
+                self.toast_slide_elapsed = Duration::ZERO;
+                self.toast_slide_started = false;
+                self.toast_slide_settled = false;
                 self.toast_dismissing = false;
                 let start = Point::new(placement.x, placement.outside_y);
                 let percent = self
@@ -781,12 +800,28 @@ impl App {
                 // Toast stays TOPMOST (above Cursor). Raise Start/Settings above it
                 // in the same band so they keep presents (iced#3320); toast at the
                 // screen edge stays visible beside the centered Start window.
+                // Slide clock starts on ToastShown after show — not here — so frames
+                // cannot race the off-screen move_to.
                 remount_toast_surface(id, generation)
                     .chain(window::move_to(id, start))
                     .chain(window::set_level(id, window::Level::AlwaysOnTop))
                     .chain(show_toast_without_activate(id))
                     .chain(invalidate_toast(id))
                     .chain(self.raise_interactive_ui_above_toast(true))
+                    .chain(Task::done(Message::ToastShown { generation }))
+            }
+            Message::ToastShown { generation } => {
+                if generation != self.toast_generation || self.toast_message.is_none() {
+                    return Task::none();
+                }
+                self.toast_slide_started = true;
+                self.toast_slide_settled = false;
+                self.toast_slide_elapsed = Duration::ZERO;
+                self.toast_anim_started = Instant::now();
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: toast slide start gen={generation}"
+                ));
+                Task::none()
             }
             Message::ToastFrame => {
                 let anim = if self.toast_animating() {
@@ -981,15 +1016,26 @@ impl App {
         }
 
         self.known.save();
+        let connect_toast_queued = events.iter().any(|event| event.body == "Connected");
         let tray = self.apply_tray();
         let notify = tray.chain(self.queue_notifications(events));
-        // Batch with toast work: show_next_toast's Task includes the ~5s expire
-        // delay, so chaining open_start_screen after it deferred Start until the
-        // toast finished.
+        // Do not chain open_start_screen after show_next_toast: its Task includes
+        // the ~5s expire delay. Also defer 0→1 Start until the connect toast
+        // finishes slide-in so Start's window create cannot stall the slide.
         let start = if self.controllers.is_empty() && self.start_window.is_some() {
+            self.pending_start_after_toast = false;
             self.close_start_screen()
         } else if opened_from_empty && self.should_auto_open_start() {
-            self.open_start_screen()
+            if should_defer_auto_open_start(true, connect_toast_queued) {
+                self.pending_start_after_toast = true;
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: defer start until toast slide settles",
+                );
+                Task::none()
+            } else {
+                self.pending_start_after_toast = false;
+                self.open_start_screen()
+            }
         } else {
             Task::none()
         };
@@ -3733,6 +3779,7 @@ impl App {
             return Task::none();
         }
         self.toast_dismissing = true;
+        self.toast_slide_elapsed = Duration::ZERO;
         self.toast_anim_started = Instant::now();
         self.animate_toast()
     }
@@ -3745,16 +3792,38 @@ impl App {
             return Task::none();
         };
 
-        let progress = (self.toast_anim_started.elapsed().as_secs_f32()
-            / TOAST_SLIDE_DURATION.as_secs_f32())
-        .min(1.0);
+        let now = Instant::now();
+        let raw_dt = now.saturating_duration_since(self.toast_anim_started);
+        self.toast_anim_started = now;
+        let (elapsed, progress, capped) =
+            advance_toast_slide(self.toast_slide_elapsed, raw_dt, TOAST_SLIDE_DURATION);
+        self.toast_slide_elapsed = elapsed;
+        if capped {
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: toast slide dt capped ms={} progress={progress:.2} dismissing={}",
+                raw_dt.as_millis(),
+                self.toast_dismissing
+            ));
+        }
+
         let y = slide_y(placement, progress, self.toast_dismissing);
         let move_task = window::move_to(id, Point::new(placement.x, y));
 
-        if self.toast_dismissing && progress >= 1.0 {
+        if progress < 1.0 {
+            return move_task;
+        }
+
+        if self.toast_dismissing {
             move_task.chain(self.finish_toast())
+        } else if !self.toast_slide_settled {
+            self.toast_slide_settled = true;
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: toast slide settle gen={} capped_frame={}",
+                self.toast_generation, capped
+            ));
+            move_task.chain(self.open_pending_start_if_needed())
         } else {
-            move_task
+            Task::none()
         }
     }
 
@@ -3766,6 +3835,9 @@ impl App {
         self.toast_generation = self.toast_generation.wrapping_add(1);
         self.toast_placement = None;
         self.toast_dismissing = false;
+        self.toast_slide_started = false;
+        self.toast_slide_settled = false;
+        self.toast_slide_elapsed = Duration::ZERO;
 
         // Stay visible across handoff so the next message can remount/present on
         // the same HWND (closing/recreating dropped the follow-up toast).
@@ -3779,16 +3851,31 @@ impl App {
 
         // Keep the window alive but hidden: it doubles as the GPU compositor
         // sentinel so popup/Settings can open without a cold wgpu init.
-        match self.toast_window {
+        let hide = match self.toast_window {
             Some(id) => hide_toast(id),
             None => Task::none(),
+        };
+        // Dismissed before slide settled (or no further toast): flush deferred Start.
+        hide.chain(self.open_pending_start_if_needed())
+    }
+
+    fn open_pending_start_if_needed(&mut self) -> Task<Message> {
+        if !self.pending_start_after_toast {
+            return Task::none();
+        }
+        self.pending_start_after_toast = false;
+        if self.should_auto_open_start() {
+            crate::controller::hid::diag::diag_info("ui-diag: start open after toast settle");
+            self.open_start_screen()
+        } else {
+            Task::none()
         }
     }
 
     fn toast_animating(&self) -> bool {
         self.toast_message.is_some()
             && self.toast_placement.is_some()
-            && (self.toast_dismissing || self.toast_anim_started.elapsed() < TOAST_SLIDE_DURATION)
+            && (self.toast_dismissing || (self.toast_slide_started && !self.toast_slide_settled))
     }
 
     /// Prefer Settings, then Start, then popup as the focused presenting window.
@@ -4105,9 +4192,14 @@ pub(crate) fn should_auto_open_start(
     enabled && previous_empty && next_nonempty && !already_open && !cooldown_active && !fullscreen
 }
 
+/// Defer 0→1 Start until a connect toast finishes slide-in (both stay on screen).
+pub(crate) fn should_defer_auto_open_start(want_open: bool, connect_toast_queued: bool) -> bool {
+    want_open && connect_toast_queued
+}
+
 #[cfg(test)]
 mod start_gate_tests {
-    use super::should_auto_open_start;
+    use super::{should_auto_open_start, should_defer_auto_open_start};
 
     #[test]
     fn opens_on_clean_zero_to_one() {
@@ -4133,5 +4225,13 @@ mod start_gate_tests {
         assert!(!should_auto_open_start(
             true, true, true, false, false, true
         ));
+    }
+
+    #[test]
+    fn defers_start_only_when_connect_toast_pending() {
+        assert!(should_defer_auto_open_start(true, true));
+        assert!(!should_defer_auto_open_start(true, false));
+        assert!(!should_defer_auto_open_start(false, true));
+        assert!(!should_defer_auto_open_start(false, false));
     }
 }
