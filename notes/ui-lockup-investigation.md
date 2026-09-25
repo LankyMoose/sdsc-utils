@@ -236,3 +236,13 @@ Symptom: two connect toasts both showed the first pad’s %, then recreate made 
 Fix: reuse one toast HWND; on handoff skip hide and **remount** (±1px resize + `RedrawWindow`); `PlaceToast` is generation-guarded.
 
 Debug grep: `ui-diag: toast show`, `ui-diag: place toast gen=`, `ui-diag: toast handoff remount`.
+
+## Connect toast slide vs Start open (Windows)
+
+Symptom: on 0→1 connect (toast + Start together), the Connected toast sometimes never appears, freezes mid-slide, or pops into the rest pose.
+
+Cause: slide-in used a 250ms wall clock that stopped issuing `move_to` once elapsed ≥ 250ms, and the clock started in `PlaceToast` before show. Opening Start in the same batch stalled the UI; depending on how far the clock got, the toast stayed at `outside_y`, mid-travel, or already at the rest pose on first paint.
+
+Fix: start the slide clock on `ToastShown` (after show); advance with capped per-frame dt (`advance_toast_slide`); keep issuing frames until progress 1 is **applied** (rest pose); defer 0→1 Start until that settle (toast lifetime unchanged — both still on screen together).
+
+Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: toast slide start`, `ui-diag: toast slide settle`, `ui-diag: toast slide dt capped`, `ui-diag: start open after toast settle`.

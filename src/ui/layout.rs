@@ -13,6 +13,9 @@ pub const POPUP_GAP: f32 = 8.0;
 pub const SCREEN_MARGIN: f32 = 8.0;
 /// Slide-in / slide-out duration for overlay toasts.
 pub const TOAST_SLIDE_DURATION: std::time::Duration = std::time::Duration::from_millis(250);
+/// Max wall time applied per toast animation frame (~2× the ~16ms UI tick).
+/// Caps a stalled frame so slide-in cannot jump to the rest pose in one tick.
+pub const TOAST_SLIDE_MAX_FRAME_DT: std::time::Duration = std::time::Duration::from_millis(32);
 
 /// Screen rectangle of the tray icon, in physical pixels.
 #[derive(Debug, Clone, Copy, Default)]
@@ -299,6 +302,26 @@ pub fn ease_out_cubic(progress: f32) -> f32 {
     1.0 - (1.0 - progress).powi(3)
 }
 
+/// Advance toast slide elapsed with a per-frame cap so a UI stall cannot skip
+/// the rest of the animation in one tick.
+///
+/// Returns `(new_elapsed, progress 0..=1, raw_dt_was_capped)`.
+pub fn advance_toast_slide(
+    elapsed: std::time::Duration,
+    raw_dt: std::time::Duration,
+    duration: std::time::Duration,
+) -> (std::time::Duration, f32, bool) {
+    let capped = raw_dt > TOAST_SLIDE_MAX_FRAME_DT;
+    let dt = raw_dt.min(TOAST_SLIDE_MAX_FRAME_DT);
+    let new_elapsed = elapsed.saturating_add(dt);
+    let progress = if duration.is_zero() {
+        1.0
+    } else {
+        (new_elapsed.as_secs_f32() / duration.as_secs_f32()).min(1.0)
+    };
+    (new_elapsed, progress, capped)
+}
+
 /// Primary-monitor toast target in logical pixels.
 ///
 /// Uses the Windows work area so a visible taskbar is cleared, while an
@@ -459,5 +482,68 @@ mod tests {
         assert!((slide_y(placement, 1.0, true) - 200.0).abs() < f32::EPSILON);
         let mid = slide_y(placement, 0.5, false);
         assert!(mid > 100.0 && mid < 200.0);
+    }
+
+    #[test]
+    fn capped_slide_does_not_jump_on_large_dt() {
+        use std::time::Duration;
+        let (elapsed, progress, capped) = advance_toast_slide(
+            Duration::ZERO,
+            Duration::from_millis(400),
+            TOAST_SLIDE_DURATION,
+        );
+        assert!(capped);
+        assert_eq!(elapsed, TOAST_SLIDE_MAX_FRAME_DT);
+        assert!(progress < 1.0);
+        assert!((progress - 32.0 / 250.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn capped_slide_reaches_rest_pose_after_enough_steps() {
+        use std::time::Duration;
+        let placement = ToastPlacement {
+            x: 10.0,
+            target_y: 100.0,
+            outside_y: 200.0,
+        };
+        let mut elapsed = Duration::ZERO;
+        let mut progress = 0.0;
+        // One huge gap still needs several capped steps to finish.
+        while progress < 1.0 {
+            let (next, p, _) =
+                advance_toast_slide(elapsed, Duration::from_millis(400), TOAST_SLIDE_DURATION);
+            elapsed = next;
+            progress = p;
+            assert!(
+                elapsed <= TOAST_SLIDE_DURATION + TOAST_SLIDE_MAX_FRAME_DT,
+                "should reach progress 1 without unbounded looping"
+            );
+        }
+        assert!((slide_y(placement, progress, false) - placement.target_y).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn slide_in_must_apply_end_keyframe_even_if_elapsed_past_duration() {
+        use std::time::Duration;
+        let placement = ToastPlacement {
+            x: 10.0,
+            target_y: 100.0,
+            outside_y: 200.0,
+        };
+        // Simulate many capped frames until progress hits 1 — the caller must
+        // still move to target_y (dismiss-style end keyframe).
+        let mut elapsed = Duration::ZERO;
+        let mut progress = 0.0;
+        while progress < 1.0 {
+            let (next, p, _) =
+                advance_toast_slide(elapsed, Duration::from_millis(50), TOAST_SLIDE_DURATION);
+            elapsed = next;
+            progress = p;
+            assert!(
+                elapsed <= TOAST_SLIDE_DURATION + TOAST_SLIDE_MAX_FRAME_DT,
+                "should reach progress 1 without unbounded looping"
+            );
+        }
+        assert!((slide_y(placement, progress, false) - placement.target_y).abs() < f32::EPSILON);
     }
 }
