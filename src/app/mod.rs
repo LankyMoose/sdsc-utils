@@ -1741,7 +1741,8 @@ impl App {
     }
 
     fn refresh_start_controllers(&mut self) {
-        let rows: Vec<_> = self
+        self.start_state.show_all_controllers = self.prefs.show_all_controllers;
+        let mut rows: Vec<_> = self
             .controllers
             .iter()
             .map(|c| {
@@ -1763,10 +1764,34 @@ impl App {
                     percent: c.percent,
                     low: c.is_low_battery(self.prefs.low_battery_percent),
                     bluetooth: c.connection.is_bluetooth() && c.supports_power_off,
+                    connected: true,
                     eta,
                 }
             })
             .collect();
+        if self.prefs.show_all_controllers {
+            for controller in self.known.remembered_disconnected(&self.controllers) {
+                let nickname = self.known.nickname(&controller.serial);
+                let eta = if self.prefs.analytics_enabled {
+                    self.analytics
+                        .eta_play_at(&controller.serial, controller.percent)
+                        .map(analytics::format_eta_ring)
+                } else {
+                    None
+                };
+                rows.push(start_view::StartControllerRow {
+                    serial: controller.serial.clone(),
+                    title: start_view::controller_title(&controller.product, nickname),
+                    connection: controller.connection.clone(),
+                    state: "disconnected".into(),
+                    percent: controller.percent,
+                    low: false,
+                    bluetooth: false,
+                    connected: false,
+                    eta,
+                });
+            }
+        }
         self.start_state.set_controllers(rows);
     }
 
@@ -2274,7 +2299,7 @@ impl App {
                 }
                 None => Task::none(),
             },
-            StartMessage::CycleSort => match self.cycle_games_sort() {
+            StartMessage::CycleSort => match self.on_start_cycle_sort() {
                 Some(task) => {
                     self.play_start_sound(UiSoundKind::Action);
                     task
@@ -2435,6 +2460,33 @@ impl App {
         Some(self.scroll_start_selection_into_view())
     }
 
+    fn on_start_cycle_sort(&mut self) -> Option<Task<Message>> {
+        match self.start_state.slide {
+            StartSlide::Games => self.cycle_games_sort(),
+            StartSlide::Controllers => {
+                let next = !self.prefs.show_all_controllers;
+                self.set_show_all_controllers(next)
+            }
+        }
+    }
+
+    fn set_show_all_controllers(&mut self, show_all: bool) -> Option<Task<Message>> {
+        if self.start_state.slide != StartSlide::Controllers
+            || self.start_state.overlay_blocking()
+            || self.prefs.show_all_controllers == show_all
+        {
+            return None;
+        }
+        self.prefs.show_all_controllers = show_all;
+        self.prefs.save();
+        app_log::hid_trace(format!(
+            "start-controllers: show_all={}",
+            u8::from(show_all)
+        ));
+        self.refresh_start_controllers();
+        Some(self.scroll_start_selection_into_view())
+    }
+
     fn pick_manual_shortcut(&mut self) -> Task<Message> {
         self.start_file_dialog_open = true;
         Task::perform(
@@ -2547,7 +2599,9 @@ impl App {
                 Task::none()
             }
             StartSlide::Controllers => {
-                if let Some(row) = self.start_state.selected_controller() {
+                if let Some(row) = self.start_state.selected_controller()
+                    && row.connected
+                {
                     let serial = row.serial.clone();
                     if self.identify(&serial) {
                         self.popup_state.begin_identify_flash(&serial);

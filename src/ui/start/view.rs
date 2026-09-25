@@ -35,7 +35,7 @@ pub const HEIGHT: f32 = 500.0;
 pub const SLIDE_ANIM_MS: u64 = 220;
 const SLIDE_ANIM_MIN_MS: u64 = 60;
 const HEADER_HEIGHT: f32 = 36.0;
-/// Matches the Games footer band (face hints + padded Add shortcut button).
+/// Matches the Games footer band (face-cycle toggle + face hints).
 const FOOTER_HEIGHT: f32 = 32.0;
 const TITLE_ACTIVE: f32 = 20.0;
 const TITLE_INACTIVE: f32 = 15.0;
@@ -250,7 +250,7 @@ pub fn probe_shell_icon(target: &str) -> Option<StartIcon> {
     manual_icon(target, None)
 }
 
-/// Connected-pad row for the Controllers slide (no remember / nickname edit).
+/// Controller row for the Controllers slide (live or remembered disconnected).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StartControllerRow {
     pub serial: String,
@@ -260,6 +260,8 @@ pub struct StartControllerRow {
     pub percent: u8,
     pub low: bool,
     pub bluetooth: bool,
+    /// Live HID pad vs remembered-but-disconnected.
+    pub connected: bool,
     pub eta: Option<String>,
 }
 
@@ -365,6 +367,8 @@ pub struct State {
     hint_anim_tick: Option<Instant>,
     pub editing: bool,
     pub sort_mode: GamesSortMode,
+    /// Controllers slide: include remembered disconnected pads.
+    pub show_all_controllers: bool,
     /// `play_key` of the row selected when edit mode was entered (restored on Save/Cancel).
     pub edit_anchor_play_key: Option<String>,
     /// Last known games-list scroll offset / viewport height (for keep-selection-visible).
@@ -415,6 +419,7 @@ impl Default for State {
             hint_anim_tick: None,
             editing: false,
             sort_mode: GamesSortMode::default(),
+            show_all_controllers: false,
             edit_anchor_play_key: None,
             games_scroll_y: 0.0,
             games_viewport_h: 0.0,
@@ -437,12 +442,22 @@ impl State {
     }
 
     pub fn set_controllers(&mut self, controllers: Vec<StartControllerRow>) {
-        self.controllers = controllers;
-        if self.controllers.is_empty() {
-            self.controller_selected = 0;
+        let prev_serial = self
+            .controllers
+            .get(self.controller_selected)
+            .map(|r| r.serial.as_str());
+        let next_selected = if controllers.is_empty() {
+            0
+        } else if let Some(serial) = prev_serial {
+            controllers
+                .iter()
+                .position(|r| r.serial == serial)
+                .unwrap_or_else(|| self.controller_selected.min(controllers.len() - 1))
         } else {
-            self.controller_selected = self.controller_selected.min(self.controllers.len() - 1);
-        }
+            self.controller_selected.min(controllers.len() - 1)
+        };
+        self.controllers = controllers;
+        self.controller_selected = next_selected;
     }
 
     pub fn set_games_scroll(&mut self, y: f32, viewport_h: f32) {
@@ -1478,7 +1493,22 @@ fn footer_hint(state: &State) -> Element<'_, StartMessage> {
                 .into()
             } else {
                 iced::widget::row![
-                    sort_mode_picker(state.sort_mode, state.held, state.press_anim),
+                    face_cycle_toggle(
+                        FaceButton::Square,
+                        state.held,
+                        state.press_anim,
+                        &[
+                            (
+                                "Last played",
+                                matches!(state.sort_mode, GamesSortMode::LastPlayed),
+                            ),
+                            (
+                                "A–Z",
+                                matches!(state.sort_mode, GamesSortMode::Alphabetical),
+                            ),
+                        ],
+                        StartMessage::CycleSort,
+                    ),
                     action_cluster(&hints),
                 ]
                 .spacing(28)
@@ -1486,12 +1516,27 @@ fn footer_hint(state: &State) -> Element<'_, StartMessage> {
                 .into()
             }
         }
-        StartSlide::Controllers => action_cluster(&[face_hint(
-            FaceButton::Circle,
-            "Close",
-            state.held,
-            state.press_anim,
-        )]),
+        StartSlide::Controllers => iced::widget::row![
+            face_cycle_toggle(
+                FaceButton::Square,
+                state.held,
+                state.press_anim,
+                &[
+                    ("Connected", !state.show_all_controllers),
+                    ("All", state.show_all_controllers),
+                ],
+                StartMessage::CycleSort,
+            ),
+            action_cluster(&[face_hint(
+                FaceButton::Circle,
+                "Close",
+                state.held,
+                state.press_anim,
+            )]),
+        ]
+        .spacing(28)
+        .align_y(Alignment::Center)
+        .into(),
     };
 
     footer_band(cluster)
@@ -1506,41 +1551,41 @@ fn footer_band(content: Element<'_, StartMessage>) -> Element<'_, StartMessage> 
         .into()
 }
 
-fn sort_mode_picker(
-    mode: GamesSortMode,
+/// Square glyph + segmented labels; pad and mouse both fire `on_press`.
+fn face_cycle_toggle(
+    face: FaceButton,
     held: FaceHeld,
     press_anim: FacePressAnim,
+    options: &[(&'static str, bool)],
+    on_press: StartMessage,
 ) -> Element<'static, StartMessage> {
     let dim = theme::alpha(theme::MUTED, 0.45);
-    let last_played = sort_mode_label(
-        "Last played",
-        matches!(mode, GamesSortMode::LastPlayed),
-        false,
-    );
-    let alpha = sort_mode_label("A–Z", matches!(mode, GamesSortMode::Alphabetical), false);
     let glyph = face_glyph(
-        FaceButton::Square,
-        if held.square {
+        face,
+        if face.held(held) {
             RingStyle::Pressed
         } else {
             RingStyle::Idle
         },
-        press_anim.square,
+        press_anim.for_face(face),
     );
-    iced::widget::row![glyph, last_played, text("·").size(14.0).color(dim), alpha,]
-        .spacing(8)
-        .align_y(Alignment::Center)
+    let mut labels = row![].spacing(8).align_y(Alignment::Center);
+    labels = labels.push(glyph);
+    for (i, (label, active)) in options.iter().copied().enumerate() {
+        if i > 0 {
+            labels = labels.push(text("·").size(14.0).color(dim));
+        }
+        labels = labels.push(toggle_option_label(label, active));
+    }
+    button(labels)
+        .padding(0)
+        .on_press(on_press)
+        .style(theme::ghost)
         .into()
 }
 
-fn sort_mode_label(
-    label: &'static str,
-    active: bool,
-    muted: bool,
-) -> Element<'static, StartMessage> {
-    let color = if muted {
-        theme::alpha(theme::MUTED, 0.45)
-    } else if active {
+fn toggle_option_label(label: &'static str, active: bool) -> Element<'static, StartMessage> {
+    let color = if active {
         theme::INK
     } else {
         theme::alpha(theme::MUTED, 0.55)
@@ -1873,8 +1918,10 @@ fn controller_row<'a>(
 ) -> Element<'a, StartMessage> {
     let ring_color = if ring_flash_white {
         theme::from_rgb(lightbar::IDENTIFY_FLASH)
-    } else {
+    } else if row.connected {
         theme::from_rgb(spectrum.color_at_percent(row.percent))
+    } else {
+        theme::DIM
     };
     let ring =
         percent_ring::percent_ring(row.percent, ring_color, POPUP_SIZE * 0.95, row.eta.clone());
@@ -1884,10 +1931,15 @@ fn controller_row<'a>(
     } else {
         theme::MUTED
     };
+    let title_color = if row.connected {
+        theme::INK
+    } else {
+        theme::MUTED
+    };
     let titles = column![
         text(&row.title)
             .size(19.0)
-            .color(theme::INK)
+            .color(title_color)
             .font(if selected {
                 Font {
                     weight: Weight::Bold,
@@ -1906,7 +1958,7 @@ fn controller_row<'a>(
 
     let mut content = row![ring, titles].spacing(14).align_y(Alignment::Center);
 
-    if selected {
+    if selected && row.connected {
         let mut actions = vec![face_hint(
             FaceButton::Cross,
             "Identify",
