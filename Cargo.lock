@@ -4343,7 +4343,7 @@ dependencies = [
 
 [[package]]
 name = "sdsc-utils"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "crc32fast",
  "hidapi",

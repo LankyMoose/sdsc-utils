@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-09-25
+
+### Added
+
+- After a tray-mode panic, the app schedules a budgeted delayed relaunch and shows a one-shot toast asking for `app.log` from the data directory (bug icon). Undocumented `--test-crash-toast` exercises that path without crashing.
+
+### Fixed
+
+- Start-screen shell icons no longer rebuild a new iced `image::Handle` every frame (stable RGBA handles), reducing wgpu image-atlas churn that could panic after GPU device loss.
+- Panic hook records a capped `PANIC_BACKTRACE` in `app.log` for renderer crashes.
+
 ## [1.4.0] - 2026-09-23
 
 ### Added
@@ -291,6 +302,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded DualSense silhouette for the tray and `.exe` icon.
 - Windows CI and tagged release workflow.
 
+[1.4.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.3.3...v1.4.0
 [1.3.3]: https://github.com/LankyMoose/sdsc-utils/compare/v1.3.2...v1.3.3
 [1.3.2]: https://github.com/LankyMoose/sdsc-utils/compare/v1.3.1...v1.3.2
