@@ -58,6 +58,9 @@ Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**
 - `ui-diag: pad-poll stall` / `pad-poll slow` / `process-enum`
 - `HITCH_MARK kind=lightbar|input source=hotkey|button`
 - `PANIC at file:line:col: …` — custom hook in [`app_log::init`](../src/app_log.rs); required because `windows_subsystem = "windows"` discards stderr panic text (exit 101 with an empty console)
+- `PANIC_BACKTRACE …` — capped `Backtrace::force_capture()` right after `PANIC at` (all builds); use to tell iced atlas/main-thread from the image worker
+- `crash-restart: scheduled` / `launching` / `giving up after N` — panic hook arms a delayed self-relaunch ([`crash_restart`](../src/crash_restart.rs)); budget file `crash-restart.json` caps 3 restarts / 10 min
+- `crash-restart: notice toast` — post-relaunch (or `--test-crash-toast`) one-shot toast with bug icon; `notice` flag in `crash-restart.json`
 
 ## How to tell causes apart
 

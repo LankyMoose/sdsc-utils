@@ -58,6 +58,9 @@ pub fn init() {
 
 /// Log panics to `app.log` (and stderr when available). Needed because
 /// `windows_subsystem = "windows"` discards the default stderr panic output.
+///
+/// Also appends a capped backtrace so GPU/renderer panics (e.g. iced atlas
+/// `create_view`) can be attributed without a debugger.
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -75,9 +78,26 @@ fn install_panic_hook() {
         let line = format!("PANIC at {location}: {payload}");
         // Prefer a direct append so a poisoned logger mutex cannot hide the panic.
         append_panic_line(&line);
+        append_panic_line(&format!("PANIC_BACKTRACE {}", panic_backtrace_capped()));
+        crate::crash_restart::schedule_from_panic();
         let _ = writeln!(std::io::stderr(), "{line}");
         previous(info);
     }));
+}
+
+/// Capture a backtrace for panic logging; keep it short enough for one rotate.
+fn panic_backtrace_capped() -> String {
+    const MAX_CHARS: usize = 4_000;
+    let bt = std::backtrace::Backtrace::force_capture();
+    let full = format!("{bt}");
+    if full.len() <= MAX_CHARS {
+        return full;
+    }
+    let mut end = MAX_CHARS;
+    while end > 0 && !full.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…(truncated)", &full[..end])
 }
 
 fn append_panic_line(message: &str) {
