@@ -1,7 +1,7 @@
 //! Build script: embed Windows .exe icon from DualSense SVG (same as tray).
 
 #[allow(dead_code)]
-#[path = "src/svg_icon.rs"]
+#[path = "src/ui/svg_icon.rs"]
 mod svg_icon;
 
 use std::env;
@@ -37,7 +37,7 @@ fn main() {
         }
     }
 
-    println!("cargo:rerun-if-changed=src/svg_icon.rs");
+    println!("cargo:rerun-if-changed=src/ui/svg_icon.rs");
     println!("cargo:rerun-if-changed=assets/icons/dualsense.svg");
     println!("cargo:rerun-if-changed=assets/icons/settings.svg");
     println!("cargo:rerun-if-changed=assets/icons/identify.svg");

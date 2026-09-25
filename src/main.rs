@@ -1,53 +1,21 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-mod analytics;
 mod app;
-mod app_log;
-mod app_meta;
-mod autostart;
-mod battery;
-mod color;
-mod configure_view;
-mod crash_restart;
-mod dualsense;
-#[cfg(feature = "dev-emulate")]
-mod emulate;
-mod file_icon;
+mod controller;
 mod games;
-mod gesture;
-mod hid_diag;
-mod hid_worker;
-mod icon;
-mod known;
-mod launch;
-mod lightbar;
-mod notify;
-mod packaged;
-mod paths;
-mod percent_ring;
-mod poll;
-mod popup_view;
-mod prefs;
-mod process_match;
-mod start_carousel;
-mod start_input;
-mod start_view;
-mod steam;
-mod svg_icon;
-mod theme;
-mod toast;
-mod toast_view;
-mod tray;
-mod ui_sound;
-#[cfg(windows)]
-mod win32;
-mod window_layout;
+mod persist;
+mod platform;
+mod ui;
 
-use app_meta::{DISPLAY_NAME, PKG_NAME, PKG_VERSION};
+use platform::app_log;
+use platform::app_meta::{DISPLAY_NAME, PKG_NAME, PKG_VERSION};
+use platform::autostart;
+use platform::crash_restart;
 use single_instance::SingleInstance;
 use std::env;
 use std::io::{self, Write};
 use std::process::ExitCode;
+use ui::color;
 
 fn main() -> ExitCode {
     app_log::init();
@@ -202,7 +170,7 @@ fn attach_console_for_cli() {
 }
 
 fn list_controllers_cli() -> ExitCode {
-    match poll::poll_controllers(&[]) {
+    match controller::hid::poll::poll_controllers(&[]) {
         Ok(statuses) => {
             if statuses.is_empty() {
                 println!("No DualSense controllers found.");
@@ -253,7 +221,17 @@ fn set_lightbar_cli(rgb_args: &[String]) -> ExitCode {
     };
 
     let color = color::Rgb::new(r, g, b);
-    match lightbar::apply_lightbar_all(color) {
+    let registry = controller::driver::registry();
+    // DualSense is the only lightbar driver today; refuse clearly if none match.
+    let any_gamepad = hidapi::HidApi::new()
+        .ok()
+        .map(|api| api.device_list().any(|d| registry.for_gamepad(d).is_some()))
+        .unwrap_or(false);
+    if !any_gamepad {
+        eprintln!("error: no DualSense controllers found");
+        return ExitCode::FAILURE;
+    }
+    match controller::dualsense::lightbar::apply_lightbar_all(color) {
         Ok(0) => {
             eprintln!("error: no DualSense controllers found");
             ExitCode::FAILURE
