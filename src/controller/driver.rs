@@ -21,6 +21,7 @@ pub trait ControllerDriver: Send + Sync {
 
 pub trait LightbarControl: ControllerDriver {
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     fn apply(
         &self,
         device: &HidDevice,
