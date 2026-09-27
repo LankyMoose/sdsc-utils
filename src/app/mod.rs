@@ -246,6 +246,8 @@ pub struct App {
     /// Cached `match_paths_for_target` results (cleared on Steam library refresh).
     match_path_cache: HashMap<String, Vec<PathBuf>>,
     steam_by_id: HashMap<u32, SteamGame>,
+    /// True until the first `SteamScanDone` (Ok or Err). Drives Games-list skeleton rows.
+    steam_scan_pending: bool,
     /// `Some` after a successful Steam library scan (installed appids). `None` = unknown.
     steam_installed: Option<Vec<u32>>,
     hid_exclusive_warned: bool,
@@ -396,6 +398,7 @@ impl App {
             process_enum_inflight: false,
             match_path_cache: HashMap::new(),
             steam_by_id: HashMap::new(),
+            steam_scan_pending: true,
             steam_installed: None,
             hid_exclusive_warned: false,
             nav_missing_warned: false,
@@ -1746,7 +1749,13 @@ impl App {
         } else {
             self.display_catalog()
                 .iter()
-                .map(|entry| start_view::StartRow::from_entry(entry, &self.steam_by_id))
+                .map(|entry| {
+                    start_view::StartRow::from_entry(
+                        entry,
+                        &self.steam_by_id,
+                        self.steam_scan_pending,
+                    )
+                })
                 .collect()
         };
         self.start_state.set_rows(rows);
@@ -2066,6 +2075,7 @@ impl App {
                 // curated Steam rows remain visible.
             }
         }
+        self.steam_scan_pending = false;
         self.match_path_cache.clear();
         self.refresh_start_rows();
         Task::none()

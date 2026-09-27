@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Start Games list shows skeleton rows (empty icon well + muted bars) for Steam entries while the library scan is still pending, instead of temporary `Steam {appid}` + controller-SVG placeholders.
+
 ### Added
 
 - Start Controllers slide: Square cycles **Connected** / **All** (prefs `show_all_controllers`, default Connected). **All** includes remembered disconnected pads (muted; no Identify / Power off), using the same face-cycle footer pattern as Games sort.
