@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Start Controllers slide: Square cycles **Connected** / **All** (prefs `show_all_controllers`, default Connected). **All** includes remembered disconnected pads (muted; no Identify / Power off), using the same face-cycle footer pattern as Games sort.
+
 ### Fixed
 
 - Connect toast slide-in no longer freezes, pops, or stays off-screen when the start screen opens on the same 0→1 connect (slide clock starts after show, frames are dt-capped, and Start waits only for slide settle).
@@ -31,10 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Start screen** launcher: when the first DualSense connects (0→1), an always-on-top quick-launch card can open with curated Steam games and manual shortcuts. Navigate with D-pad / combined analog sticks / keyboard; Cross or Enter launches; Circle or Escape dismisses. Opens with an empty catalog (empty copy + Square hint). Any connected DualSense can drive open / close / navigation (inputs are never merged across pads).
 - Reopen anytime with a configurable controller chord (default **PS**); record or reset the gesture in Settings → **Start screen**. Catalog lives in `games.json`.
 - Settings → **Start screen**: enable toggle, reopen-gesture recording, and optional UI sounds (nav / action / hold-complete) with volume.
-- **Square** toggles edit mode: Steam checklist (Cross adds/removes) plus removable manuals; **Add shortcut…** (edit only) for title, optional args, and optional custom image; **Triangle** edits the selected manual. Edit is draft-based (**Square** Saves, **Circle** Cancels without closing).
-- Browse mode DualSense **Options** (footer **START** hint) toggles sort between **Last played** and **A–Z** (preference in prefs). Successful launches record `last_played_ms`. Manual shortcuts support optional launch arguments and a custom icon path.
-- Games ↔ Controllers header (L2/R2 to switch); item actions on the selected row; footer for Edit / Close / START. Steam icons use the modern `librarycache/{appid}/` layout (with legacy flat-name fallback); game art uses a shared 2:3 portrait cell.
-- Discrete face / Options actions activate on **release** (pressed hint stays lit while held); L2/R2 and list nav stay on press. Hold actions (close game / power off / replace Proceed) complete on **release** only when the hold was full and not cancelled. Hold arcs turn muted when armed; face hints ease slightly larger while pressed (~100ms, in-bounds). Pending face releases cancel on slide/nav context changes. UI sounds play only when the action actually runs. Nav and sounds arm only after the window is shown.
+- **Triangle** toggles edit mode: Steam checklist (Cross adds/removes) plus removable manuals; **Add shortcut…** (edit only) for title, optional args, and optional custom image; **Square** edits the selected manual while editing. Edit is draft-based (**Triangle** Saves, **Circle** Cancels without closing).
+- Browse mode DualSense **Square** (footer **Last played · A–Z**) toggles sort between last played and alphabetical (preference in prefs). Successful launches record `last_played_ms`. Manual shortcuts support optional launch arguments and a custom icon path.
+- Games ↔ Controllers header (L2/R2 to switch); item actions on the selected row; footer for sort / Edit / Close. Steam icons use the modern `librarycache/{appid}/` layout (with legacy flat-name fallback); game art uses a shared 2:3 portrait cell.
+- Discrete face actions activate on **release** (pressed hint stays lit while held); L2/R2 and list nav stay on press. Hold actions (close game / power off / replace Proceed) complete on **release** only when the hold was full and not cancelled. Hold arcs turn muted when armed; face hints ease slightly larger while pressed (~100ms, in-bounds). Pending face releases cancel on slide/nav context changes. UI sounds play only when the action actually runs. Nav and sounds arm only after the window is shown.
 
 ### Changed
 
