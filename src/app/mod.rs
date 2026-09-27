@@ -3412,10 +3412,10 @@ impl App {
         if let Some(id) = self.configure_window {
             return window::gain_focus(id);
         }
-        if self.start_visible {
-            if let Some(id) = self.start_window {
-                return window::gain_focus(id);
-            }
+        if self.start_visible
+            && let Some(id) = self.start_window
+        {
+            return window::gain_focus(id);
         }
         if let Some(id) = self.popup_window {
             return window::gain_focus(id);
