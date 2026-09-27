@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Concurrent connect toast + cold Start open no longer pairs `window::open` with same-turn toast z-order sync; toast hide is deferred briefly while Start is visible, and Resting no longer raises every frame — reducing iced `create_renderer` / image-atlas panics under multi-window GPU stress.
+- Debug builds log wgpu adapter/backend at boot and include toast/Start lifecycle ages in panic context (`wgpu-diag`).
 - Bluetooth lightbar on Windows no longer silently no-ops: RGB goes out via control `HidD_SetOutputReport` (not interrupt `WriteFile` padded to 547 bytes), and poll reopens a fresh handle after the battery read so a prior input handle cannot stick a false `LIGHT_OUT` claim.
 - Connect toast slide-in no longer freezes, pops, or stays off-screen when the start screen opens on the same 0→1 connect (slide clock starts after show, frames are dt-capped, and Start waits only for slide settle).
 - 0→1 Start open is latched through toast slide-in with a ~500ms deadline so Start cannot be dropped if settle stalls or fullscreen/cooldown flips after connect.

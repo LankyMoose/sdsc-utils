@@ -297,12 +297,14 @@ Debug grep: `ui-diag: toast show`, `ui-diag: place toast gen=`, `ui-diag: toast 
 
 Symptom: on 0→1 connect (toast + Start together), the Connected toast sometimes never appears, freezes mid-slide, or pops into the rest pose.
 
-Cause: slide-in used a 250ms wall clock that stopped issuing `move_to` once elapsed ≥ 250ms, and the clock started in `PlaceToast` before show. Opening Start in the same batch stalled the UI; depending on how far the clock got, the toast stayed at `outside_y`, mid-travel, or already at the rest pose on first paint.
+Cause (historical): slide-in used a 250ms wall clock that stopped issuing `move_to` once elapsed ≥ 250ms, and the clock started in `PlaceToast` before show. Opening Start in the same batch stalled the UI.
 
-Fix: start the slide clock on `ToastShown` (after show); advance with capped per-frame dt (`advance_toast_slide`); keep issuing frames until progress 1 is **applied** (rest pose); defer 0→1 Start until that settle (toast lifetime unchanged — both still on screen together).
+Cause (session `1790509148457`): a 500ms Start deadline fired **before** `place toast`, so Start’s window create starved the toast present (iced#3108 / #3320). Log order: `toast show` → `defer start` → `start open after toast deadline` → `place toast gen=1`.
 
-Hardening: latch the Start decision at connect (do not re-check fullscreen/cooldown on flush); force-open within ~500ms if settle never arrives; finish immediately on dismiss without placement so pending cannot stick. Toast still shows ASAP; Start follows settle or the deadline.
+Cause (session `1790510886493`): after the state machine landed, a **2s Placing wall-clock failsafe** treated a stale `ToastFrame` `raw_dt` (time since app boot / last toast) as “placement gave up.” Log: `Idle->Placing` → `Placing->Idle` + `start open` in the same second — toast never reached `SlidingIn`. Reconnect after intentional power-off then showed toast with `after=Nothing` because `START_CONNECT_COOLDOWN` armed on the power-off 1→0.
 
-**Reopen gesture during latch:** while `pending_start_after_toast`, PadPoll must not treat a held PS (power-on) as reopen — that opened Start mid-slide and bypassed the latch. On Start open/close, `consume_pending_match` marks the live chord armed so focus-close cannot immediately recreate Start.
+Fix: pure presentation state machine in [`src/ui/toast/machine.rs`](../src/ui/toast/machine.rs). Phases `Placing → SlidingIn → Resting → SlidingOut`. **Placing is event-only** (`Frame` ignored; leave only on `Shown` or `Dismiss`) — no placing timer/failsafe. Start opens only as an `OpenStart` effect from slide rest or dismiss finish. `RaiseInteractive` only after Resting. Placement uses `primary_toast_area()` immediately (no `monitor_size` hop). Intentional power-off sets `skip_next_connect_cooldown` so the next reconnect can latch `OpenStart` again (unexpected disconnects still get the 5s ghost-flap cooldown). Do not put the toast on a second thread — iced presents on one UI thread.
 
-Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: toast slide start`, `ui-diag: toast slide settle`, `ui-diag: toast slide dt capped`, `ui-diag: start open after toast settle`, `ui-diag: start open after toast deadline`, `ui-diag: toast dismiss without placement`, `ui-diag: latched start skipped`, `ui-diag: reopen gesture suppressed (pending start after toast)`.
+**Reopen gesture during latch:** `suppresses_reopen_gesture()` while `after == OpenStart` and phase is Placing/SlidingIn.
+
+Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: toast Placing->SlidingIn`, `ui-diag: toast SlidingIn->Resting`, `ui-diag: toast show … body=Connected after=OpenStart`, `ui-diag: place toast gen=`, `ui-diag: start open after toast settle`, `ui-diag: skip connect cooldown (intentional power-off)`, `ui-diag: reopen gesture suppressed (toast OpenStart pending)`.

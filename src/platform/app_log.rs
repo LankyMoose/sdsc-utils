@@ -78,6 +78,7 @@ fn install_panic_hook() {
         let line = format!("PANIC at {location}: {payload}");
         // Prefer a direct append so a poisoned logger mutex cannot hide the panic.
         append_panic_line(&line);
+        append_panic_line(&crate::platform::wgpu_diag::context_line());
         append_panic_line(&format!("PANIC_BACKTRACE {}", panic_backtrace_capped()));
         crate::platform::crash_restart::schedule_from_panic();
         let _ = writeln!(std::io::stderr(), "{line}");

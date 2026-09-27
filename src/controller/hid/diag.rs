@@ -374,6 +374,7 @@ mod release {
         _phase: &str,
         _serial: &str,
         _bus: &str,
+        _transport: &str,
         _rgb: Option<(u8, u8, u8)>,
         _claim_needed: bool,
         _retry: bool,
