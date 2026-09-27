@@ -248,4 +248,6 @@ Fix: start the slide clock on `ToastShown` (after show); advance with capped per
 
 Hardening: latch the Start decision at connect (do not re-check fullscreen/cooldown on flush); force-open within ~500ms if settle never arrives; finish immediately on dismiss without placement so pending cannot stick. Toast still shows ASAP; Start follows settle or the deadline.
 
-Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: toast slide start`, `ui-diag: toast slide settle`, `ui-diag: toast slide dt capped`, `ui-diag: start open after toast settle`, `ui-diag: start open after toast deadline`, `ui-diag: toast dismiss without placement`, `ui-diag: latched start skipped`.
+**Reopen gesture during latch:** while `pending_start_after_toast`, PadPoll must not treat a held PS (power-on) as reopen — that opened Start mid-slide and bypassed the latch. On Start open/close, `consume_pending_match` marks the live chord armed so focus-close cannot immediately recreate Start.
+
+Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: toast slide start`, `ui-diag: toast slide settle`, `ui-diag: toast slide dt capped`, `ui-diag: start open after toast settle`, `ui-diag: start open after toast deadline`, `ui-diag: toast dismiss without placement`, `ui-diag: latched start skipped`, `ui-diag: reopen gesture suppressed (pending start after toast)`.
