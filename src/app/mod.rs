@@ -1967,7 +1967,13 @@ impl App {
 
     fn refresh_steam_library(&self) -> Task<Message> {
         Task::perform(
-            spawn_blocking(steam::list_installed_games),
+            spawn_blocking(|| {
+                let games = steam::list_installed_games()?;
+                crate::ui::start::icon_cache::prepare_paths(
+                    games.iter().filter_map(|g| g.icon_path.as_deref()),
+                );
+                Ok::<_, String>(games)
+            }),
             |result| match result {
                 Ok(Ok(games)) => Message::SteamScanDone(Ok(games)),
                 Ok(Err(err)) => Message::SteamScanDone(Err(err)),

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Start-screen game art no longer uploads full-size Steam capsules (or fresh shell `from_rgba` handles on every row refresh) into iced’s image atlas — icons are downscaled once and reused, reducing atlas `grow` / `create_view` panics after GPU pressure.
+
 ## [1.4.1] - 2026-09-25
 
 ### Added
