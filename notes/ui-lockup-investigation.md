@@ -245,4 +245,6 @@ Cause: slide-in used a 250ms wall clock that stopped issuing `move_to` once elap
 
 Fix: start the slide clock on `ToastShown` (after show); advance with capped per-frame dt (`advance_toast_slide`); keep issuing frames until progress 1 is **applied** (rest pose); defer 0→1 Start until that settle (toast lifetime unchanged — both still on screen together).
 
-Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: toast slide start`, `ui-diag: toast slide settle`, `ui-diag: toast slide dt capped`, `ui-diag: start open after toast settle`.
+Hardening: latch the Start decision at connect (do not re-check fullscreen/cooldown on flush); force-open within ~500ms if settle never arrives; finish immediately on dismiss without placement so pending cannot stick. Toast still shows ASAP; Start follows settle or the deadline.
+
+Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: toast slide start`, `ui-diag: toast slide settle`, `ui-diag: toast slide dt capped`, `ui-diag: start open after toast settle`, `ui-diag: start open after toast deadline`, `ui-diag: toast dismiss without placement`, `ui-diag: latched start skipped`.
