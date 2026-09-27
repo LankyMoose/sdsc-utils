@@ -5,10 +5,10 @@ use crate::controller::model::PowerState;
 use crate::games::GameEntry;
 use crate::games::steam::SteamGame;
 use crate::persist::prefs::GamesSortMode;
-use crate::platform::file_icon;
 use crate::ui::color::BatterySpectrum;
 use crate::ui::layout as window_layout;
 use crate::ui::percent_ring::{self, POPUP_SIZE};
+use crate::ui::start::icon_cache;
 use crate::ui::start::input::FaceHeld;
 use crate::ui::svg_icon;
 use crate::ui::theme;
@@ -106,17 +106,13 @@ pub enum StartMessage {
     ReportInputFailure,
 }
 
-/// Runtime-resolved game art (Steam path or extracted shell icon).
+/// Runtime-resolved game art (Steam / custom / shell), as a stable iced handle.
 ///
-/// `Rgba` stores an iced [`image::Handle`] built once at extraction time.
-/// Recreating `Handle::from_rgba` every `view()` assigns a new cache id and
-/// forces iced's image atlas to re-upload (and often grow) each redraw.
+/// Built once via [`icon_cache`] (downscaled raster or shell extract). Recreating
+/// `Handle::from_rgba` every refresh assigns a new cache id and forces iced's
+/// image atlas to re-upload (and often grow) each redraw.
 #[derive(Debug, Clone)]
-pub enum StartIcon {
-    Path(PathBuf),
-    /// Decoded shell icon; handle id is stable across frames.
-    Rgba(iced::widget::image::Handle),
-}
+pub struct StartIcon(pub iced::widget::image::Handle);
 
 #[derive(Debug, Clone)]
 pub struct StartRow {
@@ -148,7 +144,7 @@ impl StartRow {
                         target: crate::games::steam::launch_uri(*appid),
                         args: String::new(),
                         play_key: entry.play_key(),
-                        icon: game.icon_path.clone().map(StartIcon::Path),
+                        icon: steam_icon(game),
                         edit: None,
                     }
                 } else {
@@ -188,7 +184,7 @@ impl StartRow {
             target: crate::games::steam::launch_uri(game.appid),
             args: String::new(),
             play_key: format!("steam:{}", game.appid),
-            icon: game.icon_path.clone().map(StartIcon::Path),
+            icon: steam_icon(game),
             edit: Some(EditRow::Steam {
                 appid: game.appid,
                 in_catalog,
@@ -227,22 +223,28 @@ impl StartRow {
     }
 }
 
+fn steam_icon(game: &SteamGame) -> Option<StartIcon> {
+    game.icon_path
+        .as_ref()
+        .and_then(|p| icon_cache::handle_for_path(p))
+        .map(StartIcon)
+}
+
 fn manual_icon(target: &str, custom: Option<&str>) -> Option<StartIcon> {
     if let Some(path) = custom.filter(|p| !p.is_empty()) {
         let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(StartIcon::Path(path));
+        if path.is_file()
+            && let Some(handle) = icon_cache::handle_for_path_warn(&path)
+        {
+            return Some(StartIcon(handle));
         }
+        // Fall through to shell icon when the custom image fails to decode.
     }
     if target.starts_with("steam://") {
         return None;
     }
     let path = PathBuf::from(target);
-    // Extract a bit larger than the cell so Cover scales cleanly.
-    let (width, height, pixels) = file_icon::rgba_for_path(&path, ICON_H as u32)?;
-    Some(StartIcon::Rgba(iced::widget::image::Handle::from_rgba(
-        width, height, pixels,
-    )))
+    icon_cache::handle_for_shell(&path).map(StartIcon)
 }
 
 /// Probe whether a target path yields a shell icon (for the add-manual modal).
@@ -1195,25 +1197,14 @@ fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
         return space().into();
     };
 
-    let icon_el: Element<'_, StartMessage> =
-        if let Some(path) = draft.icon_path.as_ref().filter(|p| p.is_file()) {
-            start_icon_image(&StartIcon::Path(path.clone()))
-        } else if let Some(shell) = draft.shell_icon.as_ref() {
-            start_icon_image(shell)
-        } else {
-            container(space())
-                .width(Length::Fixed(ICON_W))
-                .height(Length::Fixed(ICON_H))
-                .style(|_t: &Theme| container::Style {
-                    background: Some(Background::Color(theme::alpha(theme::PANEL, 0.85))),
-                    border: Border {
-                        radius: 6.0.into(),
-                        ..Border::default()
-                    },
-                    ..container::Style::default()
-                })
-                .into()
-        };
+    let icon_el: Element<'_, StartMessage> = draft
+        .icon_path
+        .as_ref()
+        .filter(|p| p.is_file())
+        .and_then(|p| icon_cache::handle_for_path_warn(p))
+        .map(|handle| start_icon_image(&StartIcon(handle)))
+        .or_else(|| draft.shell_icon.as_ref().map(start_icon_image))
+        .unwrap_or_else(manual_icon_placeholder);
 
     let icon_hint = if draft.shell_icon.is_none() && draft.icon_path.is_none() {
         text("No icon found — choose an image (optional)")
@@ -1297,20 +1288,26 @@ fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
 }
 
 fn start_icon_image(icon: &StartIcon) -> Element<'static, StartMessage> {
-    match icon {
-        StartIcon::Path(path) => {
-            iced::widget::image(iced::widget::image::Handle::from_path(path.clone()))
-                .width(Length::Fixed(ICON_W))
-                .height(Length::Fixed(ICON_H))
-                .content_fit(ContentFit::Cover)
-                .into()
-        }
-        StartIcon::Rgba(handle) => iced::widget::image(handle.clone())
-            .width(Length::Fixed(ICON_W))
-            .height(Length::Fixed(ICON_H))
-            .content_fit(ContentFit::Cover)
-            .into(),
-    }
+    iced::widget::image(icon.0.clone())
+        .width(Length::Fixed(ICON_W))
+        .height(Length::Fixed(ICON_H))
+        .content_fit(ContentFit::Cover)
+        .into()
+}
+
+fn manual_icon_placeholder() -> Element<'static, StartMessage> {
+    container(space())
+        .width(Length::Fixed(ICON_W))
+        .height(Length::Fixed(ICON_H))
+        .style(|_t: &Theme| container::Style {
+            background: Some(Background::Color(theme::alpha(theme::PANEL, 0.85))),
+            border: Border {
+                radius: 6.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
@@ -1771,14 +1768,7 @@ fn game_row(
     };
 
     let icon_inner: Element<'_, StartMessage> = match row.icon.as_ref() {
-        Some(StartIcon::Path(path)) => {
-            iced::widget::image(iced::widget::image::Handle::from_path(path.clone()))
-                .width(Length::Fixed(ICON_W))
-                .height(Length::Fixed(ICON_H))
-                .content_fit(ContentFit::Cover)
-                .into()
-        }
-        Some(StartIcon::Rgba(handle)) => iced::widget::image(handle.clone())
+        Some(icon) => iced::widget::image(icon.0.clone())
             .width(Length::Fixed(ICON_W))
             .height(Length::Fixed(ICON_H))
             .content_fit(ContentFit::Cover)

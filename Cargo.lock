@@ -4349,6 +4349,7 @@ dependencies = [
  "hidapi",
  "iced",
  "ico",
+ "image",
  "png 0.17.16",
  "resvg",
  "rfd",

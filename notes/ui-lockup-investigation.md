@@ -61,6 +61,7 @@ Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**
 - `PANIC_BACKTRACE …` — capped `Backtrace::force_capture()` right after `PANIC at` (all builds); use to tell iced atlas/main-thread from the image worker
 - `crash-restart: scheduled` / `launching` / `giving up after N` — panic hook arms a delayed self-relaunch ([`crash_restart`](../src/crash_restart.rs)); budget file `crash-restart.json` caps 3 restarts / 10 min
 - `crash-restart: notice toast` — post-relaunch (or `--test-crash-toast`) one-shot toast with bug icon; `notice` flag in `crash-restart.json`
+- **Sibling:** wgpu `iced_wgpu::image texture atlas` / `Texture::create_view` panics (seen on **v1.4.1** after the stable-Rgba mitigation) → [`wgpu-image-atlas-crash.md`](wgpu-image-atlas-crash.md). Not fixed by toast/Start slide latch work.
 
 ## How to tell causes apart
 
