@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Connect toast slide-in no longer freezes, pops, or stays off-screen when the start screen opens on the same 0→1 connect (slide clock starts after show, frames are dt-capped, and Start waits only for slide settle).
+- 0→1 Start open is latched through toast slide-in with a ~500ms deadline so Start cannot be dropped if settle stalls or fullscreen/cooldown flips after connect.
 - Start-screen game art no longer uploads full-size Steam capsules (or fresh shell `from_rgba` handles on every row refresh) into iced’s image atlas — icons are downscaled once and reused, reducing atlas `grow` / `create_view` panics after GPU pressure.
 
 ## [1.4.1] - 2026-09-25
