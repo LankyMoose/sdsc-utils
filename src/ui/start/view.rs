@@ -124,6 +124,8 @@ pub struct StartRow {
     pub icon: Option<StartIcon>,
     /// Set in edit mode so Cross/click toggles membership or removes a manual.
     pub edit: Option<EditRow>,
+    /// Steam catalog still scanning — paint empty well + muted bars, not AppID text.
+    pub skeleton: bool,
 }
 
 /// Edit-mode action for a games-list row.
@@ -134,7 +136,11 @@ pub enum EditRow {
 }
 
 impl StartRow {
-    pub fn from_entry(entry: &GameEntry, steam_by_id: &HashMap<u32, SteamGame>) -> Self {
+    pub fn from_entry(
+        entry: &GameEntry,
+        steam_by_id: &HashMap<u32, SteamGame>,
+        steam_scan_pending: bool,
+    ) -> Self {
         match entry {
             GameEntry::Steam { appid } => {
                 if let Some(game) = steam_by_id.get(appid) {
@@ -146,6 +152,18 @@ impl StartRow {
                         play_key: entry.play_key(),
                         icon: steam_icon(game),
                         edit: None,
+                        skeleton: false,
+                    }
+                } else if steam_scan_pending {
+                    Self {
+                        title: String::new(),
+                        subtitle: None,
+                        target: crate::games::steam::launch_uri(*appid),
+                        args: String::new(),
+                        play_key: entry.play_key(),
+                        icon: None,
+                        edit: None,
+                        skeleton: true,
                     }
                 } else {
                     Self {
@@ -156,6 +174,7 @@ impl StartRow {
                         play_key: entry.play_key(),
                         icon: None,
                         edit: None,
+                        skeleton: false,
                     }
                 }
             }
@@ -173,6 +192,7 @@ impl StartRow {
                 play_key: entry.play_key(),
                 icon: manual_icon(target, icon.as_deref()),
                 edit: None,
+                skeleton: false,
             },
         }
     }
@@ -189,6 +209,7 @@ impl StartRow {
                 appid: game.appid,
                 in_catalog,
             }),
+            skeleton: false,
         }
     }
 
@@ -211,6 +232,7 @@ impl StartRow {
             play_key: entry.play_key(),
             icon: manual_icon(target, icon.as_deref()),
             edit: Some(EditRow::Manual { id: id.clone() }),
+            skeleton: false,
         })
     }
 
@@ -1747,6 +1769,21 @@ impl canvas::Program<StartMessage> for ActionRing {
     }
 }
 
+fn skeleton_bar(width: f32, height: f32) -> Element<'static, StartMessage> {
+    container(space())
+        .width(Length::Fixed(width))
+        .height(Length::Fixed(height))
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(theme::alpha(theme::MUTED, 0.22))),
+            border: Border {
+                radius: theme::RADIUS_SM.into(),
+                ..Default::default()
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 fn game_row(
     index: usize,
     row: &StartRow,
@@ -1767,26 +1804,34 @@ fn game_row(
         theme::MUTED
     };
 
-    let icon_inner: Element<'_, StartMessage> = match row.icon.as_ref() {
-        Some(icon) => iced::widget::image(icon.0.clone())
+    let icon_inner: Element<'_, StartMessage> = if row.skeleton {
+        container(space())
             .width(Length::Fixed(ICON_W))
             .height(Length::Fixed(ICON_H))
-            .content_fit(ContentFit::Cover)
+            .style(theme::well)
+            .into()
+    } else {
+        match row.icon.as_ref() {
+            Some(icon) => iced::widget::image(icon.0.clone())
+                .width(Length::Fixed(ICON_W))
+                .height(Length::Fixed(ICON_H))
+                .content_fit(ContentFit::Cover)
+                .into(),
+            None => container(
+                svg(svg::Handle::from_memory(svg_icon::GAME_SVG.as_bytes()))
+                    .width(Length::Fixed(ICON_W * 0.5))
+                    .height(Length::Fixed(ICON_W * 0.5))
+                    .style(|_theme, _status| svg::Style {
+                        color: Some(theme::MUTED),
+                    }),
+            )
+            .width(Length::Fixed(ICON_W))
+            .height(Length::Fixed(ICON_H))
+            .center_x(Fill)
+            .center_y(Fill)
+            .style(theme::well)
             .into(),
-        None => container(
-            svg(svg::Handle::from_memory(svg_icon::GAME_SVG.as_bytes()))
-                .width(Length::Fixed(ICON_W * 0.5))
-                .height(Length::Fixed(ICON_W * 0.5))
-                .style(|_theme, _status| svg::Style {
-                    color: Some(theme::MUTED),
-                }),
-        )
-        .width(Length::Fixed(ICON_W))
-        .height(Length::Fixed(ICON_H))
-        .center_x(Fill)
-        .center_y(Fill)
-        .style(theme::well)
-        .into(),
+        }
     };
 
     let icon = container(icon_inner)
@@ -1801,31 +1846,42 @@ fn game_row(
             ..container::Style::default()
         });
 
-    let title = text(&row.title)
-        .size(19.0)
-        .color(title_color)
-        .font(if selected {
-            Font {
-                weight: Weight::Bold,
-                ..Font::DEFAULT
-            }
+    let titles: Element<'_, StartMessage> = if row.skeleton {
+        column![skeleton_bar(220.0, 14.0), skeleton_bar(160.0, 10.0),]
+            .spacing(8)
+            .width(Fill)
+            .into()
+    } else {
+        let title = text(&row.title)
+            .size(19.0)
+            .color(title_color)
+            .font(if selected {
+                Font {
+                    weight: Weight::Bold,
+                    ..Font::DEFAULT
+                }
+            } else {
+                Font::DEFAULT
+            })
+            .wrapping(Wrapping::None)
+            .width(Fill);
+
+        let subtitle = if running {
+            text("Running").size(13.0).color(theme::SUCCESS)
+        } else if let Some(sub) = row.subtitle.as_ref() {
+            text(sub.as_str()).size(13.0).color(sub_color)
         } else {
-            Font::DEFAULT
-        })
+            text(" ").size(13.0).color(Color::TRANSPARENT)
+        }
         .wrapping(Wrapping::None)
         .width(Fill);
 
-    let subtitle = if running {
-        text("Running").size(13.0).color(theme::SUCCESS)
-    } else if let Some(sub) = row.subtitle.as_ref() {
-        text(sub.as_str()).size(13.0).color(sub_color)
-    } else {
-        text(" ").size(13.0).color(Color::TRANSPARENT)
-    }
-    .wrapping(Wrapping::None)
-    .width(Fill);
-
-    let titles = column![title, subtitle].spacing(4).width(Fill).clip(true);
+        column![title, subtitle]
+            .spacing(4)
+            .width(Fill)
+            .clip(true)
+            .into()
+    };
 
     let mut content = row![icon].spacing(14).align_y(Alignment::Center);
 
@@ -1995,6 +2051,47 @@ pub fn power_state_label(state: PowerState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_entry_skeleton_while_scan_pending() {
+        let entry = GameEntry::Steam { appid: 1371980 };
+        let empty = HashMap::new();
+        let row = StartRow::from_entry(&entry, &empty, true);
+        assert!(row.skeleton);
+        assert!(row.title.is_empty());
+        assert!(row.icon.is_none());
+        assert_eq!(row.play_key, "steam:1371980");
+        assert!(!row.target.is_empty());
+    }
+
+    #[test]
+    fn from_entry_appid_fallback_after_scan() {
+        let entry = GameEntry::Steam { appid: 1371980 };
+        let empty = HashMap::new();
+        let row = StartRow::from_entry(&entry, &empty, false);
+        assert!(!row.skeleton);
+        assert_eq!(row.title, "Steam 1371980");
+        assert_eq!(row.subtitle.as_deref(), Some("steam://rungameid/1371980"));
+    }
+
+    #[test]
+    fn from_entry_resolved_steam_name() {
+        let entry = GameEntry::Steam { appid: 238960 };
+        let mut map = HashMap::new();
+        map.insert(
+            238960,
+            SteamGame {
+                appid: 238960,
+                name: "Path of Exile".into(),
+                icon_path: None,
+            },
+        );
+        let row = StartRow::from_entry(&entry, &map, true);
+        assert!(!row.skeleton);
+        assert_eq!(row.title, "Path of Exile");
+        assert_eq!(row.subtitle.as_deref(), Some("Steam · 238960"));
+        assert!(row.icon.is_none());
+    }
 
     #[test]
     fn scroll_y_reveals_below_and_above_viewport() {
