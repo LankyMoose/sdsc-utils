@@ -114,14 +114,14 @@ impl State {
 
     /// True while 0→1 Start is latched and the toast has not reached rest yet.
     pub fn suppresses_reopen_gesture(&self) -> bool {
-        match self {
+        matches!(
+            self,
             Self::Active(Active {
                 after: AfterToast::OpenStart,
                 phase: Phase::Placing | Phase::SlidingIn { .. },
                 ..
-            }) => true,
-            _ => false,
-        }
+            })
+        )
     }
 
     pub fn is_resting(&self) -> bool {

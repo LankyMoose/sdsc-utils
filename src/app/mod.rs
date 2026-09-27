@@ -2162,12 +2162,12 @@ impl App {
         self.prepare_start_nav_on_open(false);
 
         // Already open: re-focus; force running restore in case a game started.
-        if self.start_visible {
-            if let Some(id) = self.start_window {
-                self.last_running_check = None;
-                let badge = self.refresh_running_badge();
-                return Task::batch([badge, window::gain_focus(id)]);
-            }
+        if self.start_visible
+            && let Some(id) = self.start_window
+        {
+            self.last_running_check = None;
+            let badge = self.refresh_running_badge();
+            return Task::batch([badge, window::gain_focus(id)]);
         }
 
         // Mark the current chord consumed (do not reset): a held PS from power-on
