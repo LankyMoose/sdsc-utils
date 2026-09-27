@@ -1,9 +1,11 @@
 //! Overlay toast message model (presented by the iced daemon via [`view`]).
 
+pub mod machine;
 pub mod view;
 
 use crate::persist::notify::NotifyEvent;
 use crate::ui::color::{BatterySpectrum, Rgb};
+use crate::ui::toast::machine::AfterToast;
 
 /// Right-hand content of a toast card.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +20,8 @@ pub struct ToastMessage {
     pub body: String,
     pub accent: Rgb,
     pub trailing: ToastTrailing,
+    /// Latched at queue time (0→1 Connected → open Start after rest).
+    pub after: AfterToast,
 }
 
 impl ToastMessage {
@@ -32,6 +36,7 @@ impl ToastMessage {
             body: event.body,
             accent: spectrum.color_at_percent(percent),
             trailing: ToastTrailing::Percent { percent, eta },
+            after: AfterToast::Nothing,
         }
     }
 
@@ -45,6 +50,7 @@ impl ToastMessage {
                 percent: PERCENT,
                 eta: Some("~3h 30m".to_string()),
             },
+            after: AfterToast::Nothing,
         }
     }
 
@@ -60,6 +66,7 @@ impl ToastMessage {
             body: "Please send app.log from the data directory to the developers.".to_string(),
             accent: ACCENT,
             trailing: ToastTrailing::Bug,
+            after: AfterToast::Nothing,
         }
     }
 

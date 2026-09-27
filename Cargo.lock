@@ -4358,6 +4358,7 @@ dependencies = [
  "serde_json",
  "single-instance",
  "tray-icon",
+ "wgpu",
  "windows 0.61.3",
  "winreg",
  "winres",
