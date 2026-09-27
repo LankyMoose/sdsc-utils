@@ -231,30 +231,6 @@ fn try_apply_by_serial_timed(
     (result, timing)
 }
 
-/// Write lightbar on an already-open handle (caller must hold the HID I/O lock).
-pub fn apply_on_open_device(
-    device: &HidDevice,
-    serial: &str,
-    color: Rgb,
-    is_bluetooth: bool,
-) -> Result<(), String> {
-    apply_on_open_device_timed(device, serial, color, is_bluetooth).0
-}
-
-/// Timed write on an already-open handle (hid-worker Identify cache — no enumerate/open).
-pub fn apply_on_open_device_timed(
-    device: &HidDevice,
-    serial: &str,
-    color: Rgb,
-    is_bluetooth: bool,
-) -> (Result<(), String>, HidPhaseTiming) {
-    let mut timing = HidPhaseTiming::default();
-    let io_started = Instant::now();
-    let result = apply_on_open_device_inner(device, serial, color, is_bluetooth, "poll", false);
-    timing.io_ms = io_started.elapsed().as_millis();
-    (result, timing)
-}
-
 fn apply_on_open_device_inner(
     device: &HidDevice,
     serial: &str,
@@ -369,12 +345,26 @@ fn write_output_report(
         BusType::Usb
     });
     let started = Instant::now();
-    let result = if is_bluetooth {
+    // (bytes_reported, expected_len, transport)
+    let result: Result<(usize, usize, &'static str), hidapi::HidError> = if is_bluetooth {
         let report = build_bt_report(fill_common);
         let _op = crate::controller::hid::diag::enter_op("hid_write");
-        match device.write(&report) {
-            Ok(n) => Ok((n, report.len())),
-            Err(err) => Err(err),
+        // Windows BT: interrupt WriteFile returns Ok with OutputReportByteLength
+        // (often 547) while the bar stays unchanged. Control Set_Report works
+        // (same path as DS4Windows / C hidapi hid_send_output_report).
+        #[cfg(windows)]
+        {
+            match send_bt_output_control(device, &report) {
+                Ok(n) => Ok((n, report.len(), "control")),
+                Err(err) => Err(err),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            match device.write(&report) {
+                Ok(n) => Ok((n, report.len(), "interrupt")),
+                Err(err) => Err(err),
+            }
         }
     } else {
         let mut report = [0u8; OUTPUT_REPORT_USB_SIZE];
@@ -382,17 +372,18 @@ fn write_output_report(
         fill_common(&mut report[1..]);
         let _op = crate::controller::hid::diag::enter_op("hid_write");
         match device.write(&report) {
-            Ok(n) => Ok((n, report.len())),
+            Ok(n) => Ok((n, report.len(), "interrupt")),
             Err(err) => Err(err),
         }
     };
     let ms = started.elapsed().as_millis();
     match &result {
-        Ok((n, expected)) => crate::controller::hid::diag::trace_write(
+        Ok((n, expected, transport)) => crate::controller::hid::diag::trace_write(
             caller,
             phase,
             serial,
             bus,
+            transport,
             rgb,
             claim_needed,
             retry,
@@ -404,6 +395,7 @@ fn write_output_report(
             phase,
             serial,
             bus,
+            if is_bluetooth { "control" } else { "interrupt" },
             rgb,
             claim_needed,
             retry,
@@ -412,6 +404,109 @@ fn write_output_report(
         ),
     }
     result.map(|_| ())
+}
+
+/// DualSense Bluetooth lightbar via `HidD_SetOutputReport` (control endpoint).
+///
+/// Pads to `OutputReportByteLength` like C hidapi — Windows rejects shorter
+/// buffers with `ERROR_INVALID_PARAMETER`. Rust hidapi's `send_output_report`
+/// pads to `FeatureReportByteLength` instead, which truncates our 78-byte CRC.
+#[cfg(windows)]
+fn send_bt_output_control(device: &HidDevice, report: &[u8]) -> Result<usize, hidapi::HidError> {
+    let info = device.get_device_info()?;
+    let path = info.path().to_string_lossy().into_owned();
+    match win_hid_set_output_report(&path, report) {
+        Ok(n) => Ok(n),
+        Err(message) => Err(hidapi::HidError::HidApiError { message }),
+    }
+}
+
+/// Open `path`, pad `report` to the device's output report length, Set_Report.
+#[cfg(windows)]
+fn win_hid_set_output_report(path: &str, report: &[u8]) -> Result<usize, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Devices::HumanInterfaceDevice::{
+        HIDP_CAPS, HidD_FreePreparsedData, HidD_GetPreparsedData, HidD_SetOutputReport,
+        HidP_GetCaps, PHIDP_PREPARSED_DATA,
+    };
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::core::PCWSTR;
+
+    if report.is_empty() {
+        return Err("empty output report".into());
+    }
+
+    let wide: Vec<u16> = std::ffi::OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map_err(|e| format!("CreateFileW: {e}"))?;
+
+    struct HandleGuard(HANDLE);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+    let guard = HandleGuard(handle);
+
+    let mut preparsed = PHIDP_PREPARSED_DATA::default();
+    if !unsafe { HidD_GetPreparsedData(guard.0, &mut preparsed) } || preparsed.0 == 0 {
+        return Err("HidD_GetPreparsedData failed".into());
+    }
+
+    struct PreparsedGuard(PHIDP_PREPARSED_DATA);
+    impl Drop for PreparsedGuard {
+        fn drop(&mut self) {
+            if self.0.0 != 0 {
+                let _ = unsafe { HidD_FreePreparsedData(self.0) };
+            }
+        }
+    }
+    let preparsed = PreparsedGuard(preparsed);
+
+    let mut caps = HIDP_CAPS::default();
+    let status = unsafe { HidP_GetCaps(preparsed.0, &mut caps) };
+    if status.is_err() {
+        return Err(format!("HidP_GetCaps: {status:?}"));
+    }
+
+    let out_len = caps.OutputReportByteLength as usize;
+    if out_len == 0 {
+        return Err("OutputReportByteLength is 0".into());
+    }
+
+    // Windows requires at least OutputReportByteLength for SetOutputReport
+    // (C hidapi pads the same way). Extra bytes past our 78-byte DualSense
+    // payload stay zero; CRC stays in report[74..78].
+    let send_len = out_len.max(report.len());
+    let mut buf = vec![0u8; send_len];
+    buf[..report.len()].copy_from_slice(report);
+
+    if !unsafe { HidD_SetOutputReport(guard.0, buf.as_ptr() as _, send_len as u32) } {
+        return Err(format!(
+            "HidD_SetOutputReport failed (send_len={send_len}, report_len={})",
+            report.len()
+        ));
+    }
+
+    // Report the intended DualSense payload size, not the padded Windows length.
+    Ok(report.len())
 }
 
 fn build_bt_report(fill_common: impl FnOnce(&mut [u8])) -> [u8; OUTPUT_REPORT_BT_SIZE] {
