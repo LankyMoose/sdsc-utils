@@ -233,12 +233,12 @@ fn steam_icon(game: &SteamGame) -> Option<StartIcon> {
 fn manual_icon(target: &str, custom: Option<&str>) -> Option<StartIcon> {
     if let Some(path) = custom.filter(|p| !p.is_empty()) {
         let path = PathBuf::from(path);
-        if path.is_file() {
-            if let Some(handle) = icon_cache::handle_for_path_warn(&path) {
-                return Some(StartIcon(handle));
-            }
-            // Fall through to shell icon when the custom image fails to decode.
+        if path.is_file()
+            && let Some(handle) = icon_cache::handle_for_path_warn(&path)
+        {
+            return Some(StartIcon(handle));
         }
+        // Fall through to shell icon when the custom image fails to decode.
     }
     if target.starts_with("steam://") {
         return None;
