@@ -618,6 +618,9 @@ impl App {
                     self.start_nav_ready = false;
                     self.pad_nav.reset();
                     self.clear_start_nav_diag();
+                    // Window may close without close_start_screen (e.g. titlebar);
+                    // consume so a held reopen chord cannot immediately recreate.
+                    self.consume_reopen_gesture_chord();
                     self.sync_toast_zorder()
                 } else if Some(id) == self.toast_window {
                     self.toast_window = None;
@@ -2155,7 +2158,9 @@ impl App {
         }
 
         self.start_nav_ready = false;
-        self.gesture_detectors.reset();
+        // Mark the current chord consumed (do not reset): a held PS from power-on
+        // must not reopen Start immediately after a focus-close.
+        self.consume_reopen_gesture_chord();
         self.clear_start_nav_diag();
         self.start_opened_at = Some(Instant::now());
         // refresh_start_rows already ran a throttled check; force one restore on open.
@@ -2182,6 +2187,18 @@ impl App {
         ])
     }
 
+    /// Mark the live reopen chord as already matched so a sticky hold cannot fire.
+    fn consume_reopen_gesture_chord(&mut self) {
+        match start_input::read_nav_readings() {
+            start_input::NavReadingsOutcome::Readings { readings, .. } => {
+                self.gesture_detectors.consume_pending_match(&readings);
+            }
+            start_input::NavReadingsOutcome::Missing { .. } => {
+                self.gesture_detectors.reset();
+            }
+        }
+    }
+
     /// Reset to Games and (optionally) require a full control release before nav fires.
     fn prepare_start_nav_on_open(&mut self, arm_immediately: bool) {
         self.start_state.reset_to_games();
@@ -2202,6 +2219,9 @@ impl App {
         self.start_state.reset_to_games();
         self.discard_edit_draft();
         self.clear_start_nav_diag();
+        // Focus-close often leaves the reopen chord held (e.g. PS); consume now
+        // so the next PadPoll cannot immediately reopen.
+        self.consume_reopen_gesture_chord();
         match self.start_window {
             Some(id) => window::set_mode(id, window::Mode::Hidden).chain(window::close(id)),
             None => Task::none(),
@@ -3045,6 +3065,14 @@ impl App {
 
     fn on_reopen_gesture(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
         if readings.is_empty() {
+            return Task::none();
+        }
+        // 0→1 auto-open owns this window; a PS power-on chord must not open Start
+        // mid toast slide (stalls move_to / presents).
+        if self.pending_start_after_toast {
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: reopen gesture suppressed (pending start after toast)",
+            );
             return Task::none();
         }
         if self.prefs.start_screen_enabled
