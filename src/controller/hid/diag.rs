@@ -163,6 +163,7 @@ mod active {
         phase: &str,
         serial: &str,
         bus: &str,
+        transport: &str,
         rgb: Option<(u8, u8, u8)>,
         claim_needed: bool,
         retry: bool,
@@ -175,11 +176,11 @@ mod active {
         };
         match result {
             Ok((bytes, expected)) => app_log::hid_trace(format!(
-                "write caller={caller} phase={phase} serial={serial} bus={bus}{rgb_part} claim={claim_needed} retry={retry} ms={ms} ok bytes={bytes} expected={expected} {}",
+                "write caller={caller} phase={phase} serial={serial} bus={bus} transport={transport}{rgb_part} claim={claim_needed} retry={retry} ms={ms} ok bytes={bytes} expected={expected} {}",
                 steam_tag()
             )),
             Err(err) => app_log::hid_trace(format!(
-                "write caller={caller} phase={phase} serial={serial} bus={bus}{rgb_part} claim={claim_needed} retry={retry} ms={ms} err={err} {}",
+                "write caller={caller} phase={phase} serial={serial} bus={bus} transport={transport}{rgb_part} claim={claim_needed} retry={retry} ms={ms} err={err} {}",
                 failure_context()
             )),
         }
