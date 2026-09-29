@@ -5,9 +5,9 @@
 //! clones that snapshot — it never opens HID — so Identify cannot stall iced.
 //!
 //! **Lightbar writes never use the input cache handle.** Long-lived read handles on
-//! Windows/DualSense often accept `write` with `Ok` without updating the bar, and can
-//! poison `LIGHT_OUT` claims. SetRgb / Identify always drop the cached device, then
-//! open-write-close; input sampling may reopen afterward.
+//! Windows/DualSense often accept `write` with `Ok` without updating the bar.
+//! SetRgb / Identify always drop the cached device, then open-write-close (claim-once
+//! `LIGHT_OUT` only when needed); input sampling may reopen afterward.
 //!
 //! Timing lines (grep `hid-worker:`) record enumerate / open / io / total.
 
@@ -429,18 +429,15 @@ fn identify_flash_color(step: u32, normal: Rgb) -> Rgb {
 
 /// Lightbar output must not use the input-pump handle: long-lived read handles on
 /// Windows/DualSense often accept `write` with `Ok` without updating the bar.
+/// Drop the cached handle, then open fresh for claim-once + RGB (do **not** force
+/// `LIGHT_OUT` just because the input handle existed — that fades the bar before
+/// every SetRgb while start-nav is sampling).
 fn write_rgb_exclusive(
     cache: &mut DeviceCache,
     serial: &str,
     color: Rgb,
 ) -> (Result<(), String>, HidPhaseTiming) {
-    let target = normalize_identity(serial);
-    let was_cached = cache.devices.contains_key(&target);
     cache.drop_serial(serial);
-    if was_cached {
-        // Input handles can "succeed" RGB writes without a real claim; force LIGHT_OUT.
-        lightbar::prepare_connect_apply(serial);
-    }
     let (result, mut timing) = lightbar::apply_lightbar_rgb_timed(&cache.api, serial, color);
     if result.is_err() {
         // Stale device list — refresh once and retry.

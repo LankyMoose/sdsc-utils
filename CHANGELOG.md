@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Bluetooth lightbar on Windows: while Steam is running, skip `LIGHT_OUT` (v0.1.7) — Steam Input already owns the bar. RGB goes out via interrupt `write` again (control `send_output_report` still returned Ok with no bar change after the Steam skip). Also try every DualSense HID collection for the serial and request the BT calibration feature before writing (SDL enhanced-mode priming).
+
 ## [1.4.2] - 2026-09-28
 
 ### Changed
