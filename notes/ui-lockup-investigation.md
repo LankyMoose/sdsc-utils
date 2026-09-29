@@ -4,7 +4,7 @@ Hand-off notes. **Fix landed (reuse HidApi):** worker keeps one long-lived `HidA
 
 **Diagnostics are debug-build only** (`cfg(debug_assertions)`): `hid-trace.log`, hitch F7/F8 + report buttons, worker phase watchdog / `enter_op` traces, and investigation-volume `hid-diag:` / `ui-diag:` lines no-op or omit in `--release`. Future agents: see [`.cursor/rules/debug-diagnostics.mdc`](../.cursor/rules/debug-diagnostics.mdc) — new work must include a similar level of non-release diagnostics.
 
-Historical evidence of the ~5s freezes is preserved below (`last_op=hidapi_new`). See [Investigate next](#investigate-next) for BT write size.
+Historical evidence of the ~5s freezes is preserved below (`last_op=hidapi_new`). See [Investigate next](#investigate-next) for BT lightbar write path.
 
 ## Symptoms (pre-fix)
 
@@ -47,7 +47,8 @@ Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**
 - `hid-diag: slow op=hid_trace_io` — sync append to the trace file took ≥50ms
 - `hid-diag: worker stall ...` — watchdog (also in `app.log`)
 - `HITCH_MARK`
-- `write … ok bytes=547 expected=78` — historical BT interrupt padding quirk (pre-control-path fix)
+- `write … ok bytes=547 expected=78` — historical BT interrupt padding quirk (pre-control-path)
+- `transport=control` — Windows BT lightbar via hidapi `send_output_report` (side CreateFileW path was a silent no-op)
 - `transport=control|interrupt` — lightbar write path (Windows BT should be `control`)
 
 ### `app.log`
@@ -91,11 +92,18 @@ Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**
 
 ## Investigate next
 
-**BT lightbar silent no-op on Windows — fixed path: control `HidD_SetOutputReport`**
+**BT lightbar silent no-op on Windows — interrupt path (1.4.1)**
 
 - Captured with F7: session `1790507921026` (below). Interrupt `write` returned `ok bytes=547 expected=78` while the bar stayed unchanged.
-- Root cause: Windows DualSense BT advertises `OutputReportByteLength=547`; interrupt `WriteFile` pads and “succeeds” without updating RGB. Control `HidD_SetOutputReport` (padded to that length, like C hidapi) is the working path. Poll also wrote on the battery-read handle, which can accept `Ok` without changing the bar.
-- Fix: Windows BT lightbar uses Set_Report (`transport=control` in hid-trace); poll drops the read handle and reopens for lightbar.
+- Root cause: Windows DualSense BT advertises `OutputReportByteLength=547`; interrupt `WriteFile` pads and “succeeds” without updating RGB. Poll also wrote on the battery-read handle, which can accept `Ok` without changing the bar.
+
+**BT lightbar still no-op after control `CreateFileW` path (1.4.2) — fixed**
+
+- Session `1790586627711` (debug) / `1790596459165` (release): every write was `transport=control` `ok bytes=78 expected=78` (`rgb=6b16e4` / `7f12e2` on `444648156926`, `steam=1`) and the bar stayed unchanged. No `lightbar write failed` on the live pad.
+- Side-handle `CreateFileW` + `HidD_SetOutputReport` (pad to 547) returned success without updating RGB. Claim (`LIGHT_OUT`) was also forced before every SetRgb while start-nav held an input handle, fading the bar before each color.
+- Session `1790683895217` (after send_output_report on open handle + claim-once): still `claim=true` then RGB `ok` with `steam=1`; Identify flashed in hid-trace (`d2d4dc`/`ac0c9e`) but the bar did not change.
+- Session `1790684159072` (Steam skip landed): all writes `claim=false` `transport=control` `ok`, Identify still traced, bar still unchanged — control Set_Report is a silent no-op on this machine even for RGB-only.
+- Fix: skip `LIGHT_OUT` while `steam.exe` is running; Windows BT RGB uses interrupt `write` again (control only as hard-error fallback); try every DualSense HID collection for the serial; request calibration feature before BT writes. Poll still drops the battery-read handle before lightbar.
 
 ## Out of scope (still)
 

@@ -1,7 +1,8 @@
 //! DualSense lightbar HID output.
 
 use crate::controller::dualsense::identity::{
-    self as dualsense, is_dualsense_gamepad, normalize_identity, resolve_device_identity,
+    self as dualsense, is_dualsense_device, is_dualsense_gamepad, normalize_identity,
+    resolve_device_identity,
 };
 use crate::platform::app_log;
 use crate::ui::color::Rgb;
@@ -11,6 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const STEAM_CLAIM_CACHE_TTL: Duration = Duration::from_secs(3);
 
 /// Phase timings for hid-worker metrics (enumerate / open / io).
 #[derive(Debug, Default, Clone, Copy)]
@@ -34,6 +37,10 @@ const OUTPUT_REPORT_BT_ID: u8 = 0x31;
 const OUTPUT_REPORT_BT_SIZE: usize = 78;
 const OUTPUT_REPORT_BT_TAG: u8 = 0x10;
 const OUTPUT_CRC32_SEED: u8 = 0xA2;
+/// Calibration feature report — requesting it switches BT pads to full reports / effects
+/// (same as Linux hid-playstation / SDL enhanced mode).
+const CALIBRATION_FEATURE_REPORT: u8 = 0x05;
+const CALIBRATION_FEATURE_SIZE: usize = 41;
 
 /// Offsets into the DualSense common output payload (after report ID / BT header).
 const OFF_VALID_FLAG1: usize = 1;
@@ -83,6 +90,18 @@ static AUTOMATIC_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Serials that have already received a `LIGHT_OUT` claim this connection.
 static CLAIMED_SERIALS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+/// Last observed Steam running state; forget claims when it changes.
+static LAST_STEAM_RUNNING: Mutex<Option<bool>> = Mutex::new(None);
+struct SteamClaimCache {
+    running: bool,
+    refreshed_at: Option<Instant>,
+}
+static STEAM_CLAIM_CACHE: Mutex<SteamClaimCache> = Mutex::new(SteamClaimCache {
+    running: false,
+    refreshed_at: None,
+});
+#[cfg(test)]
+static STEAM_CLAIM_TEST_OVERRIDE: Mutex<Option<bool>> = Mutex::new(None);
 
 /// Enable or disable automatic lightbar RGB (poll + low-battery pulse).
 pub fn set_enabled(enabled: bool) {
@@ -97,6 +116,56 @@ pub fn is_enabled() -> bool {
 fn next_bt_seq_tag() -> u8 {
     let seq = BT_OUTPUT_SEQ.fetch_add(1, Ordering::Relaxed) & 0x0F;
     seq << 4
+}
+
+/// Whether `steam.exe` is running (cached). Used only for lightbar claim strategy —
+/// must work in release (unlike debug-only hid-diag steam tags).
+fn steam_running_for_claim() -> bool {
+    #[cfg(test)]
+    if let Ok(guard) = STEAM_CLAIM_TEST_OVERRIDE.lock()
+        && let Some(value) = *guard
+    {
+        return value;
+    }
+
+    let now = Instant::now();
+    if let Ok(mut guard) = STEAM_CLAIM_CACHE.lock() {
+        if guard
+            .refreshed_at
+            .is_some_and(|t| now.duration_since(t) < STEAM_CLAIM_CACHE_TTL)
+        {
+            return guard.running;
+        }
+        let running = detect_steam_running();
+        guard.running = running;
+        guard.refreshed_at = Some(now);
+        return running;
+    }
+    detect_steam_running()
+}
+
+fn detect_steam_running() -> bool {
+    #[cfg(windows)]
+    {
+        crate::games::process_match::any_process_name_eq_ignore_case("steam.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+fn set_steam_running_for_test(running: Option<bool>) {
+    if let Ok(mut guard) = STEAM_CLAIM_TEST_OVERRIDE.lock() {
+        *guard = running;
+    }
+    if let Ok(mut cache) = STEAM_CLAIM_CACHE.lock() {
+        cache.refreshed_at = None;
+    }
+    if let Ok(mut last) = LAST_STEAM_RUNNING.lock() {
+        *last = None;
+    }
 }
 
 /// Drop claims for pads that are no longer present.
@@ -117,7 +186,30 @@ pub fn forget_all_claims() {
     }
 }
 
+/// Forget claims when Steam starts or stops so the next write picks the right path.
+fn sync_steam_transition() {
+    let running = steam_running_for_claim();
+    let Ok(mut last) = LAST_STEAM_RUNNING.lock() else {
+        return;
+    };
+    match *last {
+        None => *last = Some(running),
+        Some(prev) if prev != running => {
+            forget_all_claims();
+            *last = Some(running);
+        }
+        Some(_) => {}
+    }
+}
+
 fn take_claim_if_needed(serial: &str) -> bool {
+    sync_steam_transition();
+    // Steam Input already initialized the lightbar; LIGHT_OUT fights it and leaves
+    // RGB writes as silent no-ops (restored from v0.1.7).
+    if steam_running_for_claim() {
+        return false;
+    }
+
     let Ok(mut claimed) = CLAIMED_SERIALS.lock() else {
         return true;
     };
@@ -134,7 +226,8 @@ fn forget_claim(serial: &str) {
 ///
 /// Used when a pad newly appears in the live set: presence can clear the tray
 /// without a HID poll, which would otherwise leave a stale claim and skip
-/// reclaim on Bluetooth reconnect.
+/// reclaim on Bluetooth reconnect. No-op for claim strategy while Steam is
+/// running (`take_claim_if_needed` skips `LIGHT_OUT`).
 pub fn prepare_connect_apply(serial: &str) {
     forget_claim(serial);
 }
@@ -144,6 +237,14 @@ fn is_retryable_write_error(err: &impl std::fmt::Display) -> bool {
     text.contains("0x000003E5")
         || text.contains("WaitForSingleObject")
         || text.contains("Overlapped I/O")
+}
+
+/// Request calibration so the pad switches to full BT reports / accepts effects (SDL).
+/// Best-effort: ignore failures (Steam may already own the feature pipe).
+fn prepare_bt_output_mode(device: &HidDevice) {
+    let mut feature = vec![0u8; CALIBRATION_FEATURE_SIZE];
+    feature[0] = CALIBRATION_FEATURE_REPORT;
+    let _ = device.get_feature_report(&mut feature);
 }
 
 /// Daemon worker entry: no outer lock (worker is exclusive). Uses caller's `HidApi`.
@@ -175,10 +276,12 @@ fn try_apply_by_serial_timed(
     let enum_started = Instant::now();
     let target = normalize_identity(serial);
 
-    // Prefer USB when the same pad appears on both buses.
-    let mut best: Option<(HidDevice, bool, bool)> = None; // device, is_bluetooth, is_usb
+    // Prefer USB gamepad, then BT gamepad, then any other DualSense collection for
+    // the same serial (output report 0x31 is not always accepted on the Gamepad
+    // usage alone under Windows Bluetooth).
+    let mut candidates: Vec<(HidDevice, bool, i32)> = Vec::new(); // device, is_bt, rank
     let mut open_ms = 0u128;
-    for info in api.device_list().filter(|d| is_dualsense_gamepad(d)) {
+    for info in api.device_list().filter(|d| is_dualsense_device(d)) {
         let open_started = Instant::now();
         let hint = dualsense::hid_serial(info);
         let device = {
@@ -210,25 +313,64 @@ fn try_apply_by_serial_timed(
         }
         let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
         let is_usb = matches!(info.bus_type(), BusType::Usb);
-        let replace = match &best {
-            None => true,
-            Some((_, _, prev_is_usb)) => is_usb && !*prev_is_usb,
+        let is_gamepad = is_dualsense_gamepad(info);
+        let rank = match (is_usb, is_gamepad) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, true) => 2,
+            (false, false) => 3,
         };
-        if replace {
-            best = Some((device, is_bluetooth, is_usb));
-        }
+        candidates.push((device, is_bluetooth, rank));
     }
     timing.enumerate_ms = enum_started.elapsed().as_millis().saturating_sub(open_ms);
     timing.open_ms = open_ms;
 
-    let Some((device, is_bluetooth, _)) = best else {
+    if candidates.is_empty() {
         return (Err(format!("controller {serial} not found")), timing);
-    };
+    }
+    candidates.sort_by_key(|(_, _, rank)| *rank);
+
     let io_started = Instant::now();
-    let result =
-        apply_on_open_device_inner(&device, &target, color, is_bluetooth, "lightbar", retry);
+    let mut last_err: Option<String> = None;
+    let mut any_ok = false;
+    // One claim decision for the serial; later interfaces only send RGB.
+    let mut claim = take_claim_if_needed(&target);
+    for (device, is_bluetooth, _) in candidates {
+        if is_bluetooth {
+            prepare_bt_output_mode(&device);
+        }
+        match apply_on_open_device_inner(
+            &device,
+            &target,
+            color,
+            is_bluetooth,
+            "lightbar",
+            retry,
+            claim,
+        ) {
+            Ok(()) => {
+                any_ok = true;
+                claim = false;
+            }
+            Err(err) => {
+                if claim {
+                    forget_claim(&target);
+                    claim = take_claim_if_needed(&target);
+                }
+                last_err = Some(err);
+            }
+        }
+    }
     timing.io_ms = io_started.elapsed().as_millis();
-    (result, timing)
+
+    if any_ok {
+        (Ok(()), timing)
+    } else {
+        (
+            Err(last_err.unwrap_or_else(|| format!("controller {serial} not found"))),
+            timing,
+        )
+    }
 }
 
 fn apply_on_open_device_inner(
@@ -238,28 +380,22 @@ fn apply_on_open_device_inner(
     is_bluetooth: bool,
     caller: &str,
     retry: bool,
+    claim: bool,
 ) -> Result<(), String> {
     let target = normalize_identity(serial);
-    let claim = take_claim_if_needed(&target);
     match set_lightbar_on_device(device, color, is_bluetooth, claim, &target, caller, retry) {
         Ok(()) => Ok(()),
-        Err(err) => {
-            // Claim may have partially completed; forget so the next attempt reclaims.
-            // Do not RGB-write after a failed claim/write on this handle — caller should
-            // reopen (hid_close cancels stuck overlapped I/O on Windows).
-            if claim {
-                forget_claim(&target);
-            }
-            Err(err.to_string())
-        }
+        Err(err) => Err(err.to_string()),
     }
 }
 
 /// Write lightbar while already holding the HID I/O lock (used during poll).
 ///
 /// Bluetooth DualSense ignores RGB until the lightbar is reconfigured with a
-/// dedicated `LIGHT_OUT` setup report (same as Linux `hid-playstation`). Color is
-/// then applied in a second report with only the lightbar RGB flag.
+/// dedicated `LIGHT_OUT` setup report (same as Linux `hid-playstation`) when Steam
+/// is **not** running. Color is then applied in a second report with only the
+/// lightbar RGB flag. While Steam Input is running, skip `LIGHT_OUT` — Steam already
+/// initialized the bar and the claim fights it (silent no-op).
 ///
 /// If the claim write fails, RGB is **not** attempted on the same handle.
 pub fn set_lightbar_on_device(
@@ -349,14 +485,18 @@ fn write_output_report(
     let result: Result<(usize, usize, &'static str), hidapi::HidError> = if is_bluetooth {
         let report = build_bt_report(fill_common);
         let _op = crate::controller::hid::diag::enter_op("hid_write");
-        // Windows BT: interrupt WriteFile returns Ok with OutputReportByteLength
-        // (often 547) while the bar stays unchanged. Control Set_Report works
-        // (same path as DS4Windows / C hidapi hid_send_output_report).
+        // Windows BT + Steam: interrupt `write` with RGB-only (no LIGHT_OUT) is the
+        // path that historically updated the bar (v0.1.7). Control `send_output_report`
+        // returns Ok here but the bar stays unchanged (session 1790684159072).
+        // Fall back to control only when interrupt errors hard.
         #[cfg(windows)]
         {
-            match send_bt_output_control(device, &report) {
-                Ok(n) => Ok((n, report.len(), "control")),
-                Err(err) => Err(err),
+            match device.write(&report) {
+                Ok(n) => Ok((n, report.len(), "interrupt")),
+                Err(write_err) => match device.send_output_report(&report) {
+                    Ok(()) => Ok((report.len(), report.len(), "control-fallback")),
+                    Err(_) => Err(write_err),
+                },
             }
         }
         #[cfg(not(windows))]
@@ -395,7 +535,7 @@ fn write_output_report(
             phase,
             serial,
             bus,
-            if is_bluetooth { "control" } else { "interrupt" },
+            "interrupt",
             rgb,
             claim_needed,
             retry,
@@ -404,109 +544,6 @@ fn write_output_report(
         ),
     }
     result.map(|_| ())
-}
-
-/// DualSense Bluetooth lightbar via `HidD_SetOutputReport` (control endpoint).
-///
-/// Pads to `OutputReportByteLength` like C hidapi — Windows rejects shorter
-/// buffers with `ERROR_INVALID_PARAMETER`. Rust hidapi's `send_output_report`
-/// pads to `FeatureReportByteLength` instead, which truncates our 78-byte CRC.
-#[cfg(windows)]
-fn send_bt_output_control(device: &HidDevice, report: &[u8]) -> Result<usize, hidapi::HidError> {
-    let info = device.get_device_info()?;
-    let path = info.path().to_string_lossy().into_owned();
-    match win_hid_set_output_report(&path, report) {
-        Ok(n) => Ok(n),
-        Err(message) => Err(hidapi::HidError::HidApiError { message }),
-    }
-}
-
-/// Open `path`, pad `report` to the device's output report length, Set_Report.
-#[cfg(windows)]
-fn win_hid_set_output_report(path: &str, report: &[u8]) -> Result<usize, String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Devices::HumanInterfaceDevice::{
-        HIDP_CAPS, HidD_FreePreparsedData, HidD_GetPreparsedData, HidD_SetOutputReport,
-        HidP_GetCaps, PHIDP_PREPARSED_DATA,
-    };
-    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
-    use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
-    use windows::core::PCWSTR;
-
-    if report.is_empty() {
-        return Err("empty output report".into());
-    }
-
-    let wide: Vec<u16> = std::ffi::OsStr::new(path)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let handle = unsafe {
-        CreateFileW(
-            PCWSTR(wide.as_ptr()),
-            GENERIC_READ.0 | GENERIC_WRITE.0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            None,
-        )
-    }
-    .map_err(|e| format!("CreateFileW: {e}"))?;
-
-    struct HandleGuard(HANDLE);
-    impl Drop for HandleGuard {
-        fn drop(&mut self) {
-            let _ = unsafe { CloseHandle(self.0) };
-        }
-    }
-    let guard = HandleGuard(handle);
-
-    let mut preparsed = PHIDP_PREPARSED_DATA::default();
-    if !unsafe { HidD_GetPreparsedData(guard.0, &mut preparsed) } || preparsed.0 == 0 {
-        return Err("HidD_GetPreparsedData failed".into());
-    }
-
-    struct PreparsedGuard(PHIDP_PREPARSED_DATA);
-    impl Drop for PreparsedGuard {
-        fn drop(&mut self) {
-            if self.0.0 != 0 {
-                let _ = unsafe { HidD_FreePreparsedData(self.0) };
-            }
-        }
-    }
-    let preparsed = PreparsedGuard(preparsed);
-
-    let mut caps = HIDP_CAPS::default();
-    let status = unsafe { HidP_GetCaps(preparsed.0, &mut caps) };
-    if status.is_err() {
-        return Err(format!("HidP_GetCaps: {status:?}"));
-    }
-
-    let out_len = caps.OutputReportByteLength as usize;
-    if out_len == 0 {
-        return Err("OutputReportByteLength is 0".into());
-    }
-
-    // Windows requires at least OutputReportByteLength for SetOutputReport
-    // (C hidapi pads the same way). Extra bytes past our 78-byte DualSense
-    // payload stay zero; CRC stays in report[74..78].
-    let send_len = out_len.max(report.len());
-    let mut buf = vec![0u8; send_len];
-    buf[..report.len()].copy_from_slice(report);
-
-    if !unsafe { HidD_SetOutputReport(guard.0, buf.as_ptr() as _, send_len as u32) } {
-        return Err(format!(
-            "HidD_SetOutputReport failed (send_len={send_len}, report_len={})",
-            report.len()
-        ));
-    }
-
-    // Report the intended DualSense payload size, not the padded Windows length.
-    Ok(report.len())
 }
 
 fn build_bt_report(fill_common: impl FnOnce(&mut [u8])) -> [u8; OUTPUT_REPORT_BT_SIZE] {
@@ -584,6 +621,10 @@ pub fn apply_lightbar_all_timed(color: Rgb) -> (Result<usize, String>, HidPhaseT
         };
         let serial = resolve_device_identity(info, &device);
         let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
+        if is_bluetooth {
+            prepare_bt_output_mode(&device);
+        }
+        let claim = take_claim_if_needed(&serial);
         let io_started = Instant::now();
         match apply_on_open_device_inner(
             &device,
@@ -592,9 +633,13 @@ pub fn apply_lightbar_all_timed(color: Rgb) -> (Result<usize, String>, HidPhaseT
             is_bluetooth,
             "lightbar_all",
             false,
+            claim,
         ) {
             Ok(()) => applied += 1,
             Err(err) => {
+                if claim {
+                    forget_claim(&serial);
+                }
                 app_log::warn(format!("lightbar write failed: {err}"));
             }
         }
@@ -617,6 +662,15 @@ pub fn warn_lightbar(product: &str, err: impl std::fmt::Display) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static CLAIM_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_claim_test_lock(f: impl FnOnce()) {
+        let _guard = CLAIM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        f();
+        set_steam_running_for_test(None);
+        forget_all_claims();
+    }
 
     #[test]
     fn bt_claim_report_has_setup_without_rgb() {
@@ -659,23 +713,43 @@ mod tests {
 
     #[test]
     fn claim_once_per_connection() {
-        forget_all_claims();
+        with_claim_test_lock(|| {
+            set_steam_running_for_test(Some(false));
+            forget_all_claims();
 
-        sync_lightbar_claims(std::iter::empty::<&str>());
-        assert!(take_claim_if_needed("aabbcc"));
-        assert!(!take_claim_if_needed("aabbcc"));
-        assert!(take_claim_if_needed("ddeeff"));
-        sync_lightbar_claims(["ddeeff"]);
-        assert!(!take_claim_if_needed("ddeeff"));
-        assert!(take_claim_if_needed("aabbcc"));
-        sync_lightbar_claims(std::iter::empty::<&str>());
+            sync_lightbar_claims(std::iter::empty::<&str>());
+            assert!(take_claim_if_needed("aabbcc"));
+            assert!(!take_claim_if_needed("aabbcc"));
+            assert!(take_claim_if_needed("ddeeff"));
+            sync_lightbar_claims(["ddeeff"]);
+            assert!(!take_claim_if_needed("ddeeff"));
+            assert!(take_claim_if_needed("aabbcc"));
+            sync_lightbar_claims(std::iter::empty::<&str>());
 
-        forget_all_claims();
-        assert!(take_claim_if_needed("aabbcc"));
-        assert!(!take_claim_if_needed("aabbcc"));
-        prepare_connect_apply("aabbcc");
-        assert!(take_claim_if_needed("aabbcc"));
-        forget_all_claims();
+            forget_all_claims();
+            assert!(take_claim_if_needed("aabbcc"));
+            assert!(!take_claim_if_needed("aabbcc"));
+            prepare_connect_apply("aabbcc");
+            assert!(take_claim_if_needed("aabbcc"));
+        });
+    }
+
+    #[test]
+    fn steam_skips_light_out_claim() {
+        with_claim_test_lock(|| {
+            set_steam_running_for_test(Some(true));
+            forget_all_claims();
+            assert!(!take_claim_if_needed("aabbcc"));
+            assert!(!take_claim_if_needed("aabbcc"));
+
+            set_steam_running_for_test(Some(false));
+            // Transition clears claims; without Steam we claim once.
+            assert!(take_claim_if_needed("aabbcc"));
+            assert!(!take_claim_if_needed("aabbcc"));
+
+            set_steam_running_for_test(Some(true));
+            assert!(!take_claim_if_needed("aabbcc"));
+        });
     }
 
     #[test]

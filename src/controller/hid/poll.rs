@@ -156,7 +156,7 @@ fn poll_controllers_with_api(
             Ok(reading) => {
                 timing.io_ms += io_started.elapsed().as_millis();
                 // Drop the read handle before lightbar: DualSense Windows handles that
-                // have been used for input often accept write()/SetOutputReport with Ok
+                // have been used for input often accept write()/send_output_report with Ok
                 // without updating the bar (see write_rgb_exclusive).
                 drop(device);
                 pads.push(PolledPad {
