@@ -180,7 +180,7 @@ DualSense firmware reports battery in **11 coarse steps** (0–10). Percentages 
 - **Controller not listed** — wait a few seconds after power-on (presence is scanned every 3s); check the log if open/read fails.
 - **Tray slow to show disconnect** — fixed in 0.1.2 (faster liveness probes). Bluetooth pads can linger in Windows HID briefly after power-off.
 - **Same controller listed twice (USB + Bluetooth)** — fixed in 0.1.3 (MAC-based identity; USB preferred).
-- **Lightbar stuck off or default blue** — fixed in 0.1.6 (separate `LIGHT_OUT` claim, then RGB). The app reasserts battery color about every 5s so other software (game launchers, etc.) does not keep the bar after a one-shot overwrite. Test with `--set-lightbar 255 100 0`. If it still fails, check the log for HID write errors.
+- **Lightbar stuck off or default blue** — fixed in 0.1.6 (separate `LIGHT_OUT` claim, then RGB). If colors stop updating while **Steam is running**, update to 1.4.3 (skips the claim when Steam is open). The app reasserts battery color about every 5s so other software does not keep the bar after a one-shot overwrite. Test with `--set-lightbar 255 100 0`. If it still fails, check the log for HID write errors.
 
 ## Releases
 
@@ -189,8 +189,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 CI builds on Windows. To publish a binary + MSIX artifact:
 
 ```bash
-git tag v1.4.2
-git push origin v1.4.2
+git tag v1.4.3
+git push origin v1.4.3
 ```
 
 The release workflow attaches `sdsc-utils.exe` and `sdsc-utils.msix` to the GitHub Release for that tag. Upload the MSIX to Partner Center for Store distribution. You can also run the **Release** workflow manually (`workflow_dispatch`).

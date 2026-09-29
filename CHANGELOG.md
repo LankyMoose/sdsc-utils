@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-09-30
+
 ### Fixed
 
-- Bluetooth lightbar on Windows: while Steam is running, skip `LIGHT_OUT` (v0.1.7) — Steam Input already owns the bar. RGB goes out via interrupt `write` again (control `send_output_report` still returned Ok with no bar change after the Steam skip). Also try every DualSense HID collection for the serial and request the BT calibration feature before writing (SDL enhanced-mode priming).
+- Bluetooth lightbar on Windows works again while Steam is running: skip `LIGHT_OUT` when Steam Input already owns the bar, send RGB via interrupt `write` (control only as a hard-error fallback), try every DualSense HID collection for the serial, and request the BT calibration feature before writing.
 
 ## [1.4.2] - 2026-09-28
 
@@ -326,6 +328,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded DualSense silhouette for the tray and `.exe` icon.
 - Windows CI and tagged release workflow.
 
+[1.4.3]: https://github.com/LankyMoose/sdsc-utils/compare/v1.4.2...v1.4.3
 [1.4.2]: https://github.com/LankyMoose/sdsc-utils/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.3.3...v1.4.0
