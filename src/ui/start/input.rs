@@ -1111,7 +1111,7 @@ impl PadNavBank {
     /// `allow_nav_move` gates D-pad/stick repeats (false while a slide animates).
     /// `replace_confirm` switches to Cross-hold / Circle-cancel mode.
     /// `editing` when true: Triangle saves (ToggleEdit); Square is EditManual.
-    /// `hold_cross_close` (games browse): Cross hold closes the running game.
+    /// `hold_cross_close` (games browse, running row): Cross hold closes the game.
     /// `hold_triangle_power` (controllers): Triangle hold powers off Bluetooth.
     #[allow(clippy::too_many_arguments)]
     pub fn tick(
@@ -1192,7 +1192,8 @@ impl PadNavBank {
                 continue;
             }
 
-            // Games browse: Cross hold closes the running game (short Cross still Confirms).
+            // Games browse on the running row: Cross hold closes the game (owned; early
+            // release decays instead of Confirm). Controllers: Triangle hold powers off.
             if hold_cross_close {
                 let (c_progress, c_completed) = slot.cross_hold.update(reading.sample.cross, now);
                 if c_progress > result.cross_progress {
@@ -1216,8 +1217,10 @@ impl PadNavBank {
                 slot.cross_hold.reset();
             }
 
-            // Controllers: Triangle hold powers off. Games browse / edit: short Triangle.
-            let hold_owned = if hold_triangle_power {
+            let hold_owned = if hold_cross_close {
+                slot.triangle_hold.reset();
+                Some(EdgeButton::Cross)
+            } else if hold_triangle_power {
                 let (t_progress, t_completed) =
                     slot.triangle_hold.update(reading.sample.triangle, now);
                 if t_progress > result.triangle_progress {
@@ -2086,6 +2089,85 @@ mod tests {
         hold.cancel();
         let (p, _) = hold.update(false, t0 + Duration::from_millis(500));
         assert_eq!(p, 0.0);
+    }
+
+    #[test]
+    fn hold_cross_close_early_release_decays_without_confirm() {
+        let mut bank = PadNavBank::default();
+        bank.prepare_on_open(true);
+        let t0 = Instant::now();
+        let _ = bank.tick(
+            &[reading("a", PadSample::default())],
+            t0,
+            true,
+            false,
+            false,
+            true,
+            false,
+        );
+
+        let cross = PadSample {
+            cross: true,
+            held: [GestureControl::Cross].into_iter().collect(),
+            ..Default::default()
+        };
+        let t_press = t0 + Duration::from_millis(10);
+        let _ = bank.tick(
+            &[reading("a", cross.clone())],
+            t_press,
+            true,
+            false,
+            false,
+            true,
+            false,
+        );
+        let tick_held = bank.tick(
+            &[reading("a", cross)],
+            t_press + Duration::from_millis(400),
+            true,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert!(tick_held.cross_progress > 0.5);
+        assert!(!tick_held.cross_completed);
+        assert!(tick_held.action.is_none());
+
+        let t_rel = t_press + Duration::from_millis(400);
+        let tick_rel = bank.tick(
+            &[reading("a", PadSample::default())],
+            t_rel,
+            true,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert!(
+            tick_rel.action.is_none(),
+            "owned Cross must not Confirm on early release"
+        );
+        assert!(!tick_rel.cross_completed);
+        assert!(
+            (tick_rel.cross_progress - tick_held.cross_progress).abs() < 0.02,
+            "first release frame keeps progress"
+        );
+
+        let tick_later = bank.tick(
+            &[reading("a", PadSample::default())],
+            t_rel + Duration::from_millis(300),
+            true,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert!(
+            tick_later.cross_progress < tick_rel.cross_progress && tick_later.cross_progress > 0.0,
+            "progress decays over time"
+        );
+        assert!(tick_later.action.is_none());
     }
 
     #[test]

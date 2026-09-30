@@ -2937,11 +2937,18 @@ impl App {
         let manual_add = self.start_state.manual_add.is_some();
         let allow_nav_move = !animating && !replace_confirm && !manual_add;
         let editing = self.start_state.editing;
+        // Only when the selected row shows Close game (running target match).
         let hold_cross_close = !editing
             && !replace_confirm
             && !manual_add
             && !animating
-            && matches!(self.start_state.slide, StartSlide::Games);
+            && matches!(self.start_state.slide, StartSlide::Games)
+            && self.start_state.running_target.as_ref().is_some_and(|t| {
+                self.start_state
+                    .rows
+                    .get(self.start_state.game_selected)
+                    .is_some_and(|row| &row.target == t)
+            });
         let hold_triangle_power = !editing
             && !replace_confirm
             && !manual_add
