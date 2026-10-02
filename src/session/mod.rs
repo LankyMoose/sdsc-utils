@@ -263,7 +263,8 @@ impl DeviceSession {
     }
 }
 
-fn controllers_equivalent(a: &[ControllerStatus], b: &[ControllerStatus]) -> bool {
+/// True when live snapshots differ only in ways the UI ignores for row refresh.
+pub fn controllers_equivalent(a: &[ControllerStatus], b: &[ControllerStatus]) -> bool {
     if a.len() != b.len() {
         return false;
     }

@@ -761,7 +761,11 @@ impl SampleFail {
 /// Outcome of a short DualSense input read for hid-worker.
 #[derive(Debug)]
 pub enum ShortSampleOutcome {
-    Ok(PadSample),
+    Ok {
+        sample: PadSample,
+        /// Newest battery fields parsed from the same report(s), if present.
+        battery: Option<crate::controller::dualsense::battery::BatteryReading>,
+    },
     /// No new report this wake — keep the open handle and the previous snapshot reading.
     Timeout,
     /// Hard failure — drop the handle (I/O / bad report / feature).
@@ -841,7 +845,13 @@ fn read_one_report(
     timeout_ms: i32,
     requested_full: &mut bool,
     started: Instant,
-) -> Result<Option<PadSample>, SampleFail> {
+) -> Result<
+    Option<(
+        PadSample,
+        Option<crate::controller::dualsense::battery::BatteryReading>,
+    )>,
+    SampleFail,
+> {
     let mut buf = vec![0u8; report_size];
     let n = {
         let _op = crate::controller::hid::diag::enter_op("read_timeout");
@@ -933,10 +943,11 @@ fn read_one_report(
         return Err(SampleFail::BadReport);
     }
 
-    Ok(Some(crate::controller::dualsense::input::parse_report(
-        &buf,
-        if is_bluetooth { 1 } else { 0 },
-    )))
+    let sample =
+        crate::controller::dualsense::input::parse_report(&buf, if is_bluetooth { 1 } else { 0 });
+    let battery =
+        crate::controller::dualsense::battery::parse_battery_from_report(&buf[..n], is_bluetooth);
+    Ok(Some((sample, battery)))
 }
 
 /// Drain queued DualSense reports, wait one report interval, then drain again.
@@ -962,9 +973,13 @@ pub fn read_device_sample_short(
     let mut requested_full = false;
     let started = Instant::now();
     let mut batch: Vec<PadSample> = Vec::new();
+    let mut battery = None;
 
     let drain_queued =
-        |batch: &mut Vec<PadSample>, requested_full: &mut bool| -> Result<(), SampleFail> {
+        |batch: &mut Vec<PadSample>,
+         battery: &mut Option<crate::controller::dualsense::battery::BatteryReading>,
+         requested_full: &mut bool|
+         -> Result<(), SampleFail> {
             for _ in 0..INPUT_DRAIN_CAP {
                 match read_one_report(
                     device,
@@ -976,7 +991,12 @@ pub fn read_device_sample_short(
                     requested_full,
                     started,
                 )? {
-                    Some(sample) => batch.push(sample),
+                    Some((sample, batt)) => {
+                        batch.push(sample);
+                        if batt.is_some() {
+                            *battery = batt;
+                        }
+                    }
                     None => break,
                 }
             }
@@ -984,7 +1004,7 @@ pub fn read_device_sample_short(
         };
 
     // Drain anything already queued (immediate).
-    if let Err(fail) = drain_queued(&mut batch, &mut requested_full) {
+    if let Err(fail) = drain_queued(&mut batch, &mut battery, &mut requested_full) {
         return match fail {
             SampleFail::Timeout => ShortSampleOutcome::Timeout,
             other => ShortSampleOutcome::Fail(other),
@@ -1003,7 +1023,12 @@ pub fn read_device_sample_short(
         &mut requested_full,
         started,
     ) {
-        Ok(Some(sample)) => batch.push(sample),
+        Ok(Some((sample, batt))) => {
+            batch.push(sample);
+            if batt.is_some() {
+                battery = batt;
+            }
+        }
         Ok(None) | Err(SampleFail::Timeout) => {
             if batch.is_empty() {
                 return ShortSampleOutcome::Timeout;
@@ -1011,7 +1036,7 @@ pub fn read_device_sample_short(
         }
         Err(other) => return ShortSampleOutcome::Fail(other),
     }
-    if let Err(fail) = drain_queued(&mut batch, &mut requested_full) {
+    if let Err(fail) = drain_queued(&mut batch, &mut battery, &mut requested_full) {
         return match fail {
             SampleFail::Timeout => ShortSampleOutcome::Timeout,
             other => ShortSampleOutcome::Fail(other),
@@ -1032,7 +1057,10 @@ pub fn read_device_sample_short(
         &format!("{} drain_n={}", sample_summary(&merged), batch.len()),
         true,
     );
-    ShortSampleOutcome::Ok(merged)
+    ShortSampleOutcome::Ok {
+        sample: merged,
+        battery,
+    }
 }
 
 /// Build a nav reading from a HID sample + device identity.

@@ -136,6 +136,8 @@ pub enum Message {
     },
     /// Pad input edge from the hid-worker (report-rate; replaces UI PadPoll timer).
     PadInput(crate::domain::pad::InputEdge),
+    /// Client mode: reconcile shell-side pad-input hot flag with the service.
+    ClientIpcSync,
     /// Message from the HID/tray service (shell-client mode).
     Service(crate::ipc::ServiceMessage),
     ManualFilePicked(Option<PathBuf>),
@@ -192,6 +194,8 @@ pub struct App {
     hid_worker: Option<HidWorkerHandle>,
     /// True when this process is the iced shell attached to the service.
     client_mode: bool,
+    /// Last [`ShellCommand::SetInputHot`] sent to the service (client mode).
+    client_input_hot: bool,
 
     tray_icon: Option<TrayIcon>,
     tray_anchor: TrayAnchor,
@@ -396,6 +400,7 @@ impl App {
             refreshing: Arc::new(AtomicBool::new(false)),
             hid_worker,
             client_mode,
+            client_input_hot: false,
             tray_icon: None,
             tray_anchor: TrayAnchor::default(),
             popup_window: None,
@@ -559,6 +564,9 @@ impl App {
             subscriptions.push(Subscription::run(tray_events_mapped));
         } else {
             subscriptions.push(Subscription::run(service_message_stream));
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(250)).map(|_| Message::ClientIpcSync),
+            );
         }
 
         if self.toast_message.is_some() {
@@ -578,18 +586,12 @@ impl App {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::IdentifyFrame));
         }
 
-        let pad_input_live =
-            self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
-        let pad_listening = pad_input_live
-            || (self.session.prefs.start_screen_enabled
-                && (!self.session.controllers.is_empty() || self.gesture_recorder.is_active()));
-        // Fast path whenever we are listening — reopen gesture needs the same cadence.
-        if self.client_mode {
-            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetInputHot {
-                hot: pad_listening,
-            });
-            // Edges arrive as ServiceMessage::PadInput; no local worker channel.
-        } else {
+        if !self.client_mode {
+            let pad_input_live = self.configure_window.is_some()
+                && self.configure_state.section == Section::PadInput;
+            let pad_listening = pad_input_live
+                || (self.session.prefs.start_screen_enabled
+                    && (!self.session.controllers.is_empty() || self.gesture_recorder.is_active()));
             self.hid_worker
                 .as_ref()
                 .map(|w| w.set_input_hot(pad_listening));
@@ -597,6 +599,8 @@ impl App {
                 subscriptions.push(Subscription::run(pad_input_edge_stream));
             }
         }
+        // Client mode: reopen gesture stays on the service; pad edges only when
+        // Start / Settings pad-input / gesture record need them (see shell_wants_pad_input).
 
         if self.start_visible && self.start_state.needs_frames() {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::StartFrame));
@@ -677,6 +681,7 @@ impl App {
                     self.start_window = None;
                     self.start_visible = false;
                     self.report_start_visible(false);
+                    self.sync_client_input_hot();
                     self.start_nav_ready = false;
                     self.pad_nav.reset();
                     self.clear_start_nav_diag();
@@ -841,6 +846,10 @@ impl App {
                 Task::none()
             }
             Message::PadInput(edge) => self.on_pad_input(edge),
+            Message::ClientIpcSync => {
+                self.sync_client_input_hot();
+                Task::none()
+            }
             Message::Service(msg) => self.on_service_message(msg),
             Message::ManualFilePicked(path) => self.on_manual_file_picked(path),
             Message::ManualIconPicked(path) => self.on_manual_icon_picked(path),
@@ -1129,6 +1138,31 @@ impl App {
         if self.client_mode {
             let _ =
                 crate::ipc::send_command(&crate::ipc::ShellCommand::ReportStartVisible { visible });
+        }
+    }
+
+    /// True when the shell (not the service) should receive live pad-input edges.
+    fn shell_wants_pad_input(&self) -> bool {
+        let pad_input_live =
+            self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
+        pad_input_live
+            || self.gesture_recorder.is_active()
+            || (self.start_visible
+                && self.session.prefs.start_screen_enabled
+                && !self.session.controllers.is_empty())
+    }
+
+    fn sync_client_input_hot(&mut self) {
+        if !self.client_mode {
+            return;
+        }
+        let hot = self.shell_wants_pad_input();
+        if self.client_input_hot == hot {
+            return;
+        }
+        self.client_input_hot = hot;
+        if crate::ipc::send_command(&crate::ipc::ShellCommand::SetInputHot { hot }).is_err() {
+            self.client_input_hot = !hot;
         }
     }
 
@@ -2390,6 +2424,7 @@ impl App {
         self.start_window = Some(id);
         self.start_visible = true;
         self.report_start_visible(true);
+        self.sync_client_input_hot();
         self.session.start_auto_open_pending = false;
         crate::platform::wgpu_diag::note_start_open();
         Task::batch([badge, open.map(Message::StartOpened)])
@@ -2422,6 +2457,7 @@ impl App {
         // cannot resurface Start while the hide is in flight.
         self.start_visible = false;
         self.report_start_visible(false);
+        self.sync_client_input_hot();
         self.start_nav_ready = false;
         self.start_revealed_at = None;
         self.reopen_needs_chord_release = true;
@@ -3054,27 +3090,35 @@ impl App {
         use crate::ipc::ServiceMessage;
         match msg {
             ServiceMessage::Controllers(controllers) => {
-                let ctx = crate::session::ApplyContext {
-                    start_visible: self.start_visible,
-                    fullscreen: start_input::foreground_is_exclusive_fullscreen(),
-                    now: Instant::now(),
-                    lightbar_enabled: lightbar::is_enabled(),
-                };
-                // Controllers already observed by the service session; apply locally
-                // for UI state without re-saving known/analytics (service owns those).
-                self.session.controllers = controllers;
-                self.sync_popup_rows();
-                self.sync_low_battery();
-                let _ = ctx;
+                // Service already ran session + HID; refresh shell UI only when changed.
+                if !crate::session::controllers_equivalent(&self.session.controllers, &controllers)
+                {
+                    self.session.controllers = controllers;
+                    self.sync_popup_rows();
+                    if self.start_visible {
+                        self.refresh_start_controllers();
+                    }
+                }
+                self.sync_client_input_hot();
                 Task::none()
             }
             ServiceMessage::Effects(effects) => self.apply_session_effects(effects),
-            ServiceMessage::PadInput(edge) => self.on_pad_input(edge),
+            ServiceMessage::PadInput(edge) => {
+                if self.shell_wants_pad_input() {
+                    self.on_pad_input(edge)
+                } else {
+                    Task::none()
+                }
+            }
             ServiceMessage::TrayOpenPopup { anchor } => {
+                app_log::info("shell: apply tray open popup");
                 self.tray_anchor = anchor;
                 self.toggle_popup()
             }
-            ServiceMessage::TrayOpenSettings => self.open_configure(),
+            ServiceMessage::TrayOpenSettings => {
+                app_log::info("shell: apply tray open settings");
+                self.open_configure()
+            }
             ServiceMessage::Notifications {
                 events,
                 open_start_after_toast,
@@ -3120,8 +3164,7 @@ impl App {
 
         let pad_input_open =
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
-        let listening = self.session.prefs.start_screen_enabled
-            && (!self.session.controllers.is_empty() || self.gesture_recorder.is_active());
+        let listening = self.shell_wants_pad_input();
 
         if pad_input_open {
             self.apply_pad_input_panel_from_readings(&readings);
@@ -3836,28 +3879,74 @@ impl Drop for InputEdgeBindGuard {
 }
 
 /// Shell-client: drain service IPC messages into iced.
+///
+/// Blocking TCP reads run on a dedicated thread. Doing them inside the
+/// `stream::channel` future would stall iced's UI poll (same thread polls the
+/// runner and the output receiver), so tray/Settings messages would never apply.
 fn service_message_stream() -> impl Stream<Item = Message> {
     stream::channel(64, async move |mut output| {
-        let client = loop {
-            match crate::ipc::PipeClient::connect() {
-                Ok(c) => break c,
-                Err(_) => {
-                    iced::futures::future::ready(()).await;
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
-        };
-        let Ok(mut reader) = client.try_clone_reader() else {
-            return;
-        };
-        loop {
-            match reader.recv() {
-                Ok(msg) => {
-                    if output.send(Message::Service(msg)).await.is_err() {
-                        break;
+        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel(128);
+        let _ = std::thread::Builder::new()
+            .name("sdsc-ipc-recv".into())
+            .spawn(move || {
+                loop {
+                    let client = loop {
+                        match crate::ipc::PipeClient::connect() {
+                            Ok(c) => break c,
+                            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+                        }
+                    };
+                    let Ok(mut reader) = client.try_clone_reader() else {
+                        continue;
+                    };
+                    // Keep the write half alive so the server does not see EOF on accept.
+                    let _keep_alive = client;
+                    crate::platform::app_log::info("shell: ipc receive connected");
+                    loop {
+                        match reader.recv() {
+                            Ok(msg) => {
+                                let droppable =
+                                    matches!(&msg, crate::ipc::ServiceMessage::PadInput(_));
+                                match tx.try_send(msg) {
+                                    Ok(()) => {}
+                                    Err(err) if err.is_full() => {
+                                        if droppable {
+                                            // Prefer a fresh pad sample over blocking HID→UI.
+                                        } else {
+                                            let msg = err.into_inner();
+                                            // Controllers / tray / effects: wait for a free slot.
+                                            let mut msg = msg;
+                                            loop {
+                                                match tx.try_send(msg) {
+                                                    Ok(()) => break,
+                                                    Err(e) if e.is_full() => {
+                                                        msg = e.into_inner();
+                                                        std::thread::sleep(Duration::from_millis(
+                                                            1,
+                                                        ));
+                                                    }
+                                                    Err(_) => return,
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(_) => return,
+                                }
+                            }
+                            Err(err) => {
+                                crate::platform::app_log::warn(format!(
+                                    "shell: ipc receive disconnected: {err}"
+                                ));
+                                break;
+                            }
+                        }
                     }
                 }
-                Err(_) => break,
+            });
+
+        while let Some(msg) = rx.next().await {
+            if output.send(Message::Service(msg)).await.is_err() {
+                break;
             }
         }
     })

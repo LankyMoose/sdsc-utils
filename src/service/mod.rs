@@ -2,13 +2,15 @@
 //!
 //! Spawns `sdsc-shell` and talks to it over IPC. Owns DualSense HID and the tray.
 
+use crate::controller::dualsense::identity as dualsense;
 use crate::controller::dualsense::lightbar;
 use crate::controller::hid::poll::{
     BATTERY_INTERVAL, LIVENESS_INTERVAL, PRESENCE_INTERVAL_EMPTY, UNREAD_RETRY_INTERVAL,
 };
 use crate::controller::hid::worker::HidWorkerHandle;
 use crate::controller::known::KnownControllers;
-use crate::domain::color;
+use crate::controller::model::ControllerStatus;
+use crate::domain::color::{self, color_for_battery_percent};
 use crate::domain::pad::{self as start_input, GestureDetectorBank};
 use crate::ipc::{
     PipeServer, SHELL_PIPE_ENV, ServiceMessage, ShellCommand, bound_port, shell_exe_path,
@@ -16,14 +18,24 @@ use crate::ipc::{
 use crate::persist::analytics::AnalyticsStore;
 use crate::persist::prefs::Prefs;
 use crate::platform::app_log;
-use crate::session::{ApplyContext, DeviceSession, SessionEffect};
+use crate::session::{ApplyContext, DeviceSession, SessionEffect, controllers_equivalent};
 use crate::ui::tray::{self, QUIT_ID, SETTINGS_ID};
+use std::collections::HashMap;
 use std::process::{Child, Command};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tray_icon::menu::MenuEvent;
 use tray_icon::{MouseButton as TrayMouseButton, MouseButtonState, TrayIconEvent};
+
+enum TrayServiceEvent {
+    OpenPopup {
+        anchor: crate::ui::layout::TrayAnchor,
+    },
+    OpenSettings,
+    Quit,
+}
 
 /// Run the service until Quit. Spawns and respawns the iced shell.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -44,7 +56,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_presence_check = Instant::now();
     let mut last_persist_check = Instant::now();
     let mut start_visible = false;
-    let mut shell_input_hot = false;
+    let shell_input_hot = Arc::new(AtomicBool::new(false));
     let mut gesture_detectors = GestureDetectorBank::default();
     let mut reopen_needs_release = false;
     let mut pending_open_start = false;
@@ -54,18 +66,60 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (edge_tx, edge_rx) = mpsc::sync_channel::<start_input::InputEdge>(32);
     start_input::bind_service_edge_sender(edge_tx);
     let edge_pipe = pipe.handle();
+    let forward_pad_edges = Arc::clone(&shell_input_hot);
     thread::Builder::new()
         .name("sdsc-edge-fwd".into())
         .spawn(move || {
             while let Ok(edge) = edge_rx.recv() {
+                if !forward_pad_edges.load(Ordering::Relaxed) {
+                    continue;
+                }
                 let _ = edge_pipe.send(ServiceMessage::PadInput(edge));
             }
         })
         .map_err(|e| e.to_string())?;
 
+    // tray-icon / muda deliver via OnceLock handlers; mirror the iced bridge so
+    // clicks are not lost when we only poll `receiver()` between long HID polls.
+    let (tray_tx, tray_rx) = mpsc::sync_channel::<TrayServiceEvent>(16);
+    {
+        let tx = tray_tx.clone();
+        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+            if let TrayIconEvent::Click {
+                rect,
+                button: TrayMouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let anchor = crate::ui::layout::TrayAnchor {
+                    x: rect.position.x as f32,
+                    y: rect.position.y as f32,
+                    width: rect.size.width as f32,
+                    height: rect.size.height as f32,
+                };
+                let _ = tx.try_send(TrayServiceEvent::OpenPopup { anchor });
+            }
+        }));
+        let tx = tray_tx;
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| match event.id.0.as_str() {
+            SETTINGS_ID => {
+                let _ = tx.try_send(TrayServiceEvent::OpenSettings);
+            }
+            QUIT_ID => {
+                let _ = tx.try_send(TrayServiceEvent::Quit);
+            }
+            _ => {}
+        }));
+    }
+
     app_log::info("service: started (HID + tray); shell spawned");
 
     loop {
+        // Pump before draining tray events so Win32 delivers click/menu callbacks.
+        #[cfg(windows)]
+        pump_win_messages();
+
         if last_shell_check.elapsed() >= Duration::from_secs(1) {
             last_shell_check = Instant::now();
             if let Some(status) = shell.try_wait()? {
@@ -100,7 +154,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &hid_worker,
                     &pipe,
                     &mut start_visible,
-                    &mut shell_input_hot,
+                    &shell_input_hot,
                     &mut gesture_detectors,
                 )?,
                 LoopControl::Quit
@@ -113,41 +167,45 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if let TrayIconEvent::Click {
-                rect,
-                button: TrayMouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                let anchor = crate::ui::layout::TrayAnchor {
-                    x: rect.position.x as f32,
-                    y: rect.position.y as f32,
-                    width: rect.size.width as f32,
-                    height: rect.size.height as f32,
-                };
-                let _ = pipe.send(ServiceMessage::TrayOpenPopup { anchor });
-            }
-        }
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            match event.id.0.as_str() {
-                SETTINGS_ID => {
-                    let _ = pipe.send(ServiceMessage::TrayOpenSettings);
+        while let Ok(event) = tray_rx.try_recv() {
+            match event {
+                TrayServiceEvent::OpenPopup { anchor } => {
+                    if pipe.client_count() == 0 {
+                        app_log::warn("service: tray popup ignored (shell not connected)");
+                    } else {
+                        app_log::info("service: tray open popup → shell");
+                        let _ = pipe.send(ServiceMessage::TrayOpenPopup { anchor });
+                    }
                 }
-                QUIT_ID => {
+                TrayServiceEvent::OpenSettings => {
+                    if pipe.client_count() == 0 {
+                        app_log::warn("service: tray settings ignored (shell not connected)");
+                    } else {
+                        app_log::info("service: tray open settings → shell");
+                        let _ = pipe.send(ServiceMessage::TrayOpenSettings);
+                    }
+                }
+                TrayServiceEvent::Quit => {
                     let _ = pipe.send(ServiceMessage::Shutdown);
                     let _ = shell.kill();
                     start_input::clear_service_edge_sender();
                     hid_worker.shutdown();
                     return Ok(());
                 }
-                _ => {}
             }
         }
 
+        let nav_priority = start_visible || shell_input_hot.load(Ordering::Relaxed);
+        // Elevate sampling before the hot Controllers path so live battery is fresh.
+        let listening = shell_input_hot.load(Ordering::Relaxed)
+            || start_visible
+            || (session.prefs.start_screen_enabled && !session.controllers.is_empty());
+        hid_worker.set_input_hot(listening);
+
+        // While Start owns input, check presence/membership more often so a BT
+        // disconnect is not deferred until the window closes (liveness Poll).
         let presence_due = last_presence_check.elapsed()
-            >= if session.controllers.is_empty() {
+            >= if session.controllers.is_empty() || nav_priority {
                 PRESENCE_INTERVAL_EMPTY
             } else {
                 Duration::from_secs(3)
@@ -174,14 +232,42 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 dispatch_effects(&mut session, &hid_worker, &pipe, &mut tray, effects);
                 last_battery_poll = Instant::now();
+            } else if nav_priority {
+                // Hot path: battery + membership from the input sample stream.
+                // Never drop_all Poll — that starves Start nav.
+                let live = hid_worker.live_controllers();
+                if live.is_empty() && !presence.is_empty() {
+                    // Waiting for the first sample after a pad joined — keep session.
+                    if presence_changed {
+                        crate::controller::hid::diag::diag_info(
+                            "service: hot path waiting for live battery sample",
+                        );
+                    }
+                } else if !controllers_equivalent(&session.controllers, &live) || presence_changed {
+                    apply_hot_path_lightbar(&hid_worker, &session.controllers, &live);
+                    last_battery_poll = Instant::now();
+                    let effects = session.on_poll_result(
+                        live.clone(),
+                        ApplyContext {
+                            start_visible,
+                            fullscreen: start_input::foreground_is_exclusive_fullscreen(),
+                            now: Instant::now(),
+                            lightbar_enabled: lightbar::is_enabled(),
+                        },
+                    );
+                    let _ = pipe.send(ServiceMessage::Controllers(live));
+                    dispatch_effects(&mut session, &hid_worker, &pipe, &mut tray, effects);
+                }
             } else {
+                // Cold path (tray idle): classic exclusive Poll for battery/liveness.
                 let battery_due = last_battery_poll.elapsed() >= BATTERY_INTERVAL;
                 let liveness_due = last_battery_poll.elapsed() >= LIVENESS_INTERVAL
                     && !session.controllers.is_empty();
                 let unread_due = last_battery_poll.elapsed() >= UNREAD_RETRY_INTERVAL
                     && !presence.is_empty()
                     && session.controllers.is_empty();
-                if presence_changed || battery_due || liveness_due || unread_due {
+                let schedule_due = presence_changed || battery_due || liveness_due || unread_due;
+                if schedule_due {
                     let previously: Vec<String> = session
                         .controllers
                         .iter()
@@ -207,11 +293,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-
-        // Sample while start is enabled and pads are present, or the shell asked for hot input.
-        let listening = shell_input_hot
-            || (session.prefs.start_screen_enabled && !session.controllers.is_empty());
-        hid_worker.set_input_hot(listening);
 
         // Reopen gesture in the service so a PS chord during shell restart still works.
         if listening
@@ -259,7 +340,7 @@ fn handle_command(
     hid_worker: &HidWorkerHandle,
     pipe: &PipeServer,
     start_visible: &mut bool,
-    shell_input_hot: &mut bool,
+    shell_input_hot: &Arc<AtomicBool>,
     gesture_detectors: &mut GestureDetectorBank,
 ) -> Result<LoopControl, Box<dyn std::error::Error>> {
     match cmd {
@@ -294,7 +375,7 @@ fn handle_command(
             Ok(LoopControl::Continue)
         }
         ShellCommand::SetInputHot { hot } => {
-            *shell_input_hot = hot;
+            shell_input_hot.store(hot, Ordering::Relaxed);
             Ok(LoopControl::Continue)
         }
         ShellCommand::ReportStartVisible { visible } => {
@@ -376,7 +457,8 @@ fn dispatch_effects(
             | SessionEffect::SyncPopup => {}
         }
     }
-    // Shell applies UI-facing effects; skip persistence/HID that the service already did.
+    // Shell applies UI-facing effects; skip work the service already did locally
+    // or already pushed on a dedicated IPC message (Notifications).
     let ui_effects: Vec<SessionEffect> = effects
         .into_iter()
         .filter(|e| {
@@ -386,6 +468,7 @@ fn dispatch_effects(
                     | SessionEffect::SetLowBatteryTargets { .. }
                     | SessionEffect::SaveKnown
                     | SessionEffect::SaveAnalytics
+                    | SessionEffect::QueueNotifications { .. }
             )
         })
         .collect();
@@ -447,6 +530,52 @@ fn reload_persist(session: &mut DeviceSession) {
     lightbar::set_enabled(prefs.lightbar_enabled);
     session.prefs = prefs;
     session.known = KnownControllers::load();
+}
+
+/// Apply connect / battery-color lightbar via exclusive SetRgb while input is hot.
+///
+/// Membership gains clear the claim (`prepare_connect_apply`); percent bucket
+/// changes reassert RGB. Same open-write-close cost as Identify — not a full Poll.
+fn apply_hot_path_lightbar(
+    hid_worker: &HidWorkerHandle,
+    previous: &[ControllerStatus],
+    next: &[ControllerStatus],
+) {
+    lightbar::sync_lightbar_claims(
+        next.iter()
+            .filter(|c| c.supports_lightbar)
+            .map(|c| c.serial.as_str()),
+    );
+    if !lightbar::is_enabled() {
+        return;
+    }
+    let prev_by_serial: HashMap<&str, &ControllerStatus> =
+        previous.iter().map(|c| (c.serial.as_str(), c)).collect();
+    for pad in next {
+        if !pad.supports_lightbar {
+            continue;
+        }
+        let color = color_for_battery_percent(pad.percent);
+        match prev_by_serial.get(pad.serial.as_str()) {
+            None => {
+                lightbar::prepare_connect_apply(&pad.serial);
+                crate::controller::hid::diag::diag_info(format!(
+                    "service: hot lightbar connect serial={}",
+                    dualsense::normalize_identity(&pad.serial)
+                ));
+                hid_worker.set_rgb(pad.serial.clone(), color);
+            }
+            Some(old) if color_for_battery_percent(old.percent) != color => {
+                crate::controller::hid::diag::diag_info(format!(
+                    "service: hot lightbar color serial={} percent={}",
+                    dualsense::normalize_identity(&pad.serial),
+                    pad.percent
+                ));
+                hid_worker.set_rgb(pad.serial.clone(), color);
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(windows)]
