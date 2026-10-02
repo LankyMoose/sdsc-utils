@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-03
+
 ### Added
 
 - Start screen **Controller haptics** (Settings → Start screen, on by default, strength slider default 60%): nav, action, hold, and L2/R2 slide cues pulse DualSense motors, including over Windows Bluetooth. Slide changes also play a slide clip when UI sounds are on.
@@ -346,6 +348,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded DualSense silhouette for the tray and `.exe` icon.
 - Windows CI and tagged release workflow.
 
+[1.5.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.4.3...v1.5.0
 [1.4.3]: https://github.com/LankyMoose/sdsc-utils/compare/v1.4.2...v1.4.3
 [1.4.2]: https://github.com/LankyMoose/sdsc-utils/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.4.0...v1.4.1

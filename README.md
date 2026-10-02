@@ -65,7 +65,7 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 - Dark **iced** Configure window for notification (including low-battery %), toast-position, autostart, lightbar, start-screen (System tab), and **opt-in battery analytics** settings
 - **Battery analytics** (off by default): learns each DualSense battery step for charge and play, shows remaining-time estimates after one qualifying step (interpolating within the current percent bucket; refining as more steps are observed; mid-cycle unplug/charge does not wipe history), and draws per-controller coverage charts in Settings → Analytics (local `analytics.json` only; open the data folder from Settings → System to inspect or delete files)
 - Detects controllers connecting/disconnecting within a few seconds
-- **Start screen** (Settings → Start screen): headline quick-launch when the first DualSense connects — curated Steam games and manual shortcuts, Games ↔ Controllers tabs (L2/R2), DualSense and keyboard nav. Cross/Enter launches; Circle/Escape closes; Square edits the catalog (Steam checklist + Add shortcut); Options toggles Last played ↔ A–Z; Controllers tab supports Identify and Bluetooth power-off. Opens with an empty catalog. Optional UI sounds with volume. Any connected pad can drive the UI (inputs are not merged across pads). Reopen with a configurable chord (default PS / Guide). Catalog lives in `games.json` under the data folder
+- **Start screen** (Settings → Start screen): headline quick-launch when the first DualSense connects — curated Steam games and manual shortcuts, Games ↔ Controllers tabs (L2/R2), DualSense and keyboard nav. Cross/Enter launches; Circle/Escape closes; Square edits the catalog (Steam checklist + Add shortcut); Options toggles Last played ↔ A–Z; Controllers tab supports Identify and Bluetooth power-off. Opens with an empty catalog. Optional UI sounds with volume and controller haptics with strength. Any connected pad can drive the UI (inputs are not merged across pads). Reopen with a configurable chord (default PS / Guide). Catalog lives in `games.json` under the data folder
 - Lightbar color blends across a customizable **2–5 stop spectrum** (default **blue → purple → red**) as battery drops (reasserted about every 5 seconds); edit via tray **Settings** with a left-hand tab list. An **Enable lightbar** toggle (on by default) pauses battery-driven colors and the low-battery pulse while leaving Identify available. The Lightbar panel stays fully expanded when active: drag stops along the bar, click empty areas to add stops (up to 5), and drag a stop away to remove it (down to 2). Changes apply immediately.
 - At **low battery while discharging** (same configurable threshold as the toast; default ≤5%), the lightbar periodically pulses **orange**
 - Icons live in `assets/icons/` (SVG) and are rasterized at build/runtime
@@ -189,8 +189,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 CI builds on Windows. To publish a binary + MSIX artifact:
 
 ```bash
-git tag v1.4.3
-git push origin v1.4.3
+git tag v1.5.0
+git push origin v1.5.0
 ```
 
 The release workflow attaches `sdsc-utils.exe` and `sdsc-utils.msix` to the GitHub Release for that tag. Upload the MSIX to Partner Center for Store distribution. You can also run the **Release** workflow manually (`workflow_dispatch`).

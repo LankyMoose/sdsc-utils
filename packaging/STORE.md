@@ -7,7 +7,7 @@ These steps cannot be done from the repo. Do them in your browser / Partner Cent
 1. Open [storedeveloper.microsoft.com](https://storedeveloper.microsoft.com) and create a **free Individual** developer account (government ID + selfie).
 2. Reserve the app name **SDSC Utils** (exact Store title).
 
-## Listing copy (v1.4.3)
+## Listing copy (v1.5.0)
 
 Paste into Partner Center. Do **not** expand SDSC as “Sony DualSense Controller Utilities” anywhere in the listing.
 
@@ -25,7 +25,7 @@ SDSC Utils is a Windows system-tray utility for DualSense battery status, lightb
 
 What you get
 • Tray icon and popup for connected controllers, with optional nicknames and Remember for disconnected pads
-• Start screen quick-launch when the first pad connects: Steam games and manual shortcuts, DualSense navigation, Games and Controllers tabs
+• Start screen quick-launch when the first pad connects: Steam games and manual shortcuts, DualSense navigation and controller haptics, Games and Controllers tabs
 • Overlay toasts for connect, disconnect, low battery, and charge complete
 • Battery-driven lightbar spectrum (customizable; can be turned off) and Identify to find the right pad
 • Soft power-off over Bluetooth from the popup or start screen
@@ -54,6 +54,6 @@ When asked about `runFullTrust`: tray icon + raw DualSense HID (`hidapi`) for ba
 
 ## First upload / update
 
-1. Download `sdsc-utils.msix` from the [v1.4.3 GitHub Release](https://github.com/LankyMoose/sdsc-utils/releases/tag/v1.4.3) (or pack locally — see [README.md](README.md)).
-2. Confirm the package identity matches Partner Center (`LankyMoose.SDSCUtils` / publisher CN in [`AppxManifest.xml`](AppxManifest.xml)). Identity Version is stamped from `Cargo.toml` (`1.4.3` → `1.4.3.0`).
+1. Download `sdsc-utils.msix` from the [v1.5.0 GitHub Release](https://github.com/LankyMoose/sdsc-utils/releases/tag/v1.5.0) (or pack locally — see [README.md](README.md)).
+2. Confirm the package identity matches Partner Center (`LankyMoose.SDSCUtils` / publisher CN in [`AppxManifest.xml`](AppxManifest.xml)). Identity Version is stamped from `Cargo.toml` (`1.5.0` → `1.5.0.0`).
 3. Submit for certification.
