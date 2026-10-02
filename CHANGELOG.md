@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Start screen **Controller haptics** (Settings → Start screen, on by default, strength slider default 60%): nav, action, hold, and L2/R2 slide cues pulse DualSense motors, including over Windows Bluetooth. Slide changes also play a slide clip when UI sounds are on.
+
+### Changed
+
+- DualSense HID and the tray stay in the `sdsc-utils` service; the iced UI runs as a separate shell over local IPC, so a shell crash can restart without reopening Bluetooth.
+- While pad input is live, battery percent and lightbar color come from the reports the controller is already sending. Navigation stays responsive, another pad can join the list, and connect colors apply without a UI freeze. The slower exclusive poll remains when the app is idle.
+
+### Fixed
+
+- Low-battery toast fires only when a watched pad's percent crosses down through the threshold. A controller that powers on already inside that window shows Connected only.
+- In-ring remaining-time labels like `~10h 30m` shrink to fit the battery ring; shorter labels stay the same size.
+- 0→1 Start still opens if the Connected toast flaps: one missed poll keeps the last status, a presence blip under 2s does not arm the reconnect cooldown, and Start retries if the window was still closing.
+- Close game hold decays on early release the same way Power off does. A short Cross on the running-game row no longer cancels the shared hold charge.
+- Triangle hold is ignored on Controllers rows that do not show **Power off** (wired pads and remembered disconnected pads).
+- Hold-to-power-off waits until an in-flight start-screen rumble pulse finishes, so the hold haptic is not cut off.
+
 ## [1.4.3] - 2026-09-30
 
 ### Fixed
