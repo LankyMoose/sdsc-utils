@@ -3294,11 +3294,16 @@ impl App {
                     .get(self.start_state.game_selected)
                     .is_some_and(|row| &row.target == t)
             });
+        // Match the row hint: Triangle hold only when Power off is shown.
         let hold_triangle_power = !editing
             && !replace_confirm
             && !manual_add
             && !animating
-            && matches!(self.start_state.slide, StartSlide::Controllers);
+            && matches!(self.start_state.slide, StartSlide::Controllers)
+            && self
+                .start_state
+                .selected_controller()
+                .is_some_and(|row| row.show_power_off());
         let tick = self.pad_nav.tick(
             readings,
             now,
@@ -3407,14 +3412,13 @@ impl App {
 
             if hold_triangle_power {
                 self.start_state.triangle_progress = tick.triangle_progress;
-                if tick.triangle_completed {
+                if tick.triangle_completed
+                    && let Some(row) = self.start_state.selected_controller()
+                    && row.show_power_off()
+                {
+                    let serial = row.serial.clone();
                     self.play_start_cue(UiSoundKind::Hold);
-                    if let Some(row) = self.start_state.selected_controller()
-                        && row.bluetooth
-                    {
-                        let serial = row.serial.clone();
-                        self.power_off(&serial);
-                    }
+                    self.power_off(&serial);
                 }
             } else {
                 self.start_state.triangle_progress = 0.0;

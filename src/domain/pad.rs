@@ -1207,7 +1207,7 @@ impl PadNavBank {
     /// `replace_confirm` switches to Cross-hold / Circle-cancel mode.
     /// `editing` when true: Triangle saves (ToggleEdit); Square is EditManual.
     /// `hold_cross_close` (games browse, running row): Cross hold closes the game.
-    /// `hold_triangle_power` (controllers): Triangle hold powers off Bluetooth.
+    /// `hold_triangle_power` (controllers, selected row shows Power off): Triangle hold powers off Bluetooth.
     #[allow(clippy::too_many_arguments)]
     pub fn tick(
         &mut self,
