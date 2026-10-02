@@ -982,6 +982,7 @@ fn expire_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>, now: 
     *active = still;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_cmd(
     cmd: HidCmd,
     session: &mut Option<IdentifySession>,
