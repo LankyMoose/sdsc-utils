@@ -146,6 +146,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         while let Some(cmd) = pipe.try_recv_command() {
             if matches!(
+                &cmd,
+                ShellCommand::ReportStartVisible { visible: false } if start_visible
+            ) {
+                // Start closed — require chord release before reopen.
+                reopen_needs_release = true;
+            }
+            if matches!(
                 handle_command(
                     cmd,
                     &mut session,
@@ -292,28 +299,46 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Reopen gesture in the service so a PS chord during shell restart still works.
+        // Reopen gesture lives in the service so the shell can stay idle until a match.
+        // Also covers a PS chord held across a shell restart (client_count == 0).
         if listening
             && session.prefs.start_screen_enabled
             && !start_visible
-            && pipe.client_count() == 0
             && let start_input::NavReadingsOutcome::Readings { readings, .. } =
                 start_input::read_nav_readings()
         {
-            if reopen_needs_release {
-                let chord = &session.prefs.start_screen_gesture;
-                let still_held = readings
+            let chord = &session.prefs.start_screen_gesture;
+            let chord_held = !chord.is_empty()
+                && readings
                     .iter()
                     .any(|r| chord.iter().all(|c| r.sample.held.contains(c)));
-                if !still_held {
-                    reopen_needs_release = false;
-                    gesture_detectors.reset();
+            let rising = !reopen_needs_release
+                && !chord.is_empty()
+                && gesture_detectors.update(chord, &readings);
+            match reopen_gesture_outcome(
+                reopen_needs_release,
+                chord_held,
+                rising,
+                pipe.client_count() > 0,
+            ) {
+                ReopenGestureOutcome::Hold => {}
+                ReopenGestureOutcome::Idle => {
+                    if reopen_needs_release && !chord_held {
+                        reopen_needs_release = false;
+                        gesture_detectors.reset();
+                    }
                 }
-            } else if !session.prefs.start_screen_gesture.is_empty()
-                && gesture_detectors.update(&session.prefs.start_screen_gesture, &readings)
-            {
-                reopen_needs_release = true;
-                pending_open_start = true;
+                ReopenGestureOutcome::OpenNow => {
+                    reopen_needs_release = true;
+                    pending_open_start = false;
+                    app_log::info("service: reopen gesture → OpenStart");
+                    let _ = pipe.send(ServiceMessage::Effects(vec![SessionEffect::OpenStart]));
+                }
+                ReopenGestureOutcome::Latch => {
+                    reopen_needs_release = true;
+                    pending_open_start = true;
+                    app_log::info("service: reopen gesture latched (shell down)");
+                }
             }
         }
 
@@ -376,7 +401,7 @@ fn handle_command(
         }
         ShellCommand::ReportStartVisible { visible } => {
             if *start_visible && !visible {
-                // Start closed — require chord release before reopen.
+                // Detectors reset here; reopen_needs_release is armed in the loop.
                 gesture_detectors.reset();
             }
             *start_visible = visible;
@@ -590,3 +615,92 @@ fn pump_win_messages() {
 
 #[cfg(not(windows))]
 fn pump_win_messages() {}
+
+/// What the service should do after one reopen-gesture sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReopenGestureOutcome {
+    /// Chord still held after a prior fire or Start close — stay silent.
+    Hold,
+    /// Rising-edge match while a shell client is attached — open Start now.
+    OpenNow,
+    /// Rising-edge match while the shell is down — latch until attach.
+    Latch,
+    /// No fire this tick (including a completed release that clears the gate).
+    Idle,
+}
+
+/// Decide send-now / latch / wait-for-release for the service reopen detector.
+fn reopen_gesture_outcome(
+    needs_release: bool,
+    chord_held: bool,
+    rising_edge: bool,
+    client_connected: bool,
+) -> ReopenGestureOutcome {
+    if needs_release {
+        if chord_held {
+            return ReopenGestureOutcome::Hold;
+        }
+        return ReopenGestureOutcome::Idle;
+    }
+    if rising_edge {
+        if client_connected {
+            return ReopenGestureOutcome::OpenNow;
+        }
+        return ReopenGestureOutcome::Latch;
+    }
+    ReopenGestureOutcome::Idle
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reopen_sends_now_when_shell_connected() {
+        assert_eq!(
+            reopen_gesture_outcome(false, true, true, true),
+            ReopenGestureOutcome::OpenNow
+        );
+    }
+
+    #[test]
+    fn reopen_latches_when_shell_down() {
+        assert_eq!(
+            reopen_gesture_outcome(false, true, true, false),
+            ReopenGestureOutcome::Latch
+        );
+    }
+
+    #[test]
+    fn reopen_waits_for_release_after_fire() {
+        assert_eq!(
+            reopen_gesture_outcome(true, true, false, true),
+            ReopenGestureOutcome::Hold
+        );
+        // Rising edge while still gated must not fire again.
+        assert_eq!(
+            reopen_gesture_outcome(true, true, true, true),
+            ReopenGestureOutcome::Hold
+        );
+    }
+
+    #[test]
+    fn reopen_clears_gate_after_release() {
+        assert_eq!(
+            reopen_gesture_outcome(true, false, false, true),
+            ReopenGestureOutcome::Idle
+        );
+    }
+
+    #[test]
+    fn reopen_idle_without_rising_edge() {
+        assert_eq!(
+            reopen_gesture_outcome(false, false, false, true),
+            ReopenGestureOutcome::Idle
+        );
+        assert_eq!(
+            reopen_gesture_outcome(false, true, false, true),
+            ReopenGestureOutcome::Idle
+        );
+    }
+}

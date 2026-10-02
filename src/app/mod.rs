@@ -1104,7 +1104,15 @@ impl App {
                     tasks.push(self.queue_notifications(events, open_start_after_toast));
                 }
                 SessionEffect::OpenStart => {
-                    tasks.push(self.open_start_screen());
+                    // Service may fire the reopen chord during the connect-toast
+                    // latch; the toast's own AfterToast::OpenStart still opens Start.
+                    if self.toast_machine.suppresses_reopen_gesture() {
+                        crate::controller::hid::diag::diag_info(
+                            "ui-diag: service OpenStart ignored (toast OpenStart pending)",
+                        );
+                    } else {
+                        tasks.push(self.open_start_screen());
+                    }
                 }
                 SessionEffect::CloseStart => {
                     tasks.push(self.close_start_screen());
