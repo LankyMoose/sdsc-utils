@@ -1272,6 +1272,7 @@ fn expire_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>, now: 
 }
 
 /// Run the PowerOff body: stop rumble, drop handles, clear snapshot, send feature report.
+#[allow(clippy::too_many_arguments)]
 fn execute_power_off(
     serial: &str,
     session: &mut Option<IdentifySession>,
