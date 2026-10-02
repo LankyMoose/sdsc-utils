@@ -241,7 +241,7 @@ fn is_retryable_write_error(err: &impl std::fmt::Display) -> bool {
 
 /// Request calibration so the pad switches to full BT reports / accepts effects (SDL).
 /// Best-effort: ignore failures (Steam may already own the feature pipe).
-fn prepare_bt_output_mode(device: &HidDevice) {
+pub(crate) fn prepare_bt_output_mode(device: &HidDevice) {
     let mut feature = vec![0u8; CALIBRATION_FEATURE_SIZE];
     feature[0] = CALIBRATION_FEATURE_REPORT;
     let _ = device.get_feature_report(&mut feature);
@@ -464,7 +464,7 @@ fn write_lightbar_rgb(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_output_report(
+pub(crate) fn write_output_report(
     device: &HidDevice,
     is_bluetooth: bool,
     serial: &str,

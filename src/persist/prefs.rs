@@ -80,6 +80,12 @@ pub struct Prefs {
     /// Master volume for start-screen UI sounds (0–100, default 60).
     #[serde(default = "default_start_screen_sound_volume")]
     pub start_screen_sound_volume: u8,
+    /// Play DualSense rumble cues while navigating the start screen (default on).
+    #[serde(default = "default_true")]
+    pub start_screen_haptics_enabled: bool,
+    /// Master strength for start-screen haptic cues (0–100, default 60).
+    #[serde(default = "default_start_screen_haptics_strength")]
+    pub start_screen_haptics_strength: u8,
     /// Start-screen games list sort (default last played).
     #[serde(default)]
     pub games_sort_mode: GamesSortMode,
@@ -100,6 +106,10 @@ fn default_start_screen_sound_volume() -> u8 {
     60
 }
 
+fn default_start_screen_haptics_strength() -> u8 {
+    60
+}
+
 pub fn clamp_low_battery_percent(value: u8) -> u8 {
     let clamped = value.clamp(LOW_BATTERY_PERCENT_MIN, LOW_BATTERY_PERCENT_MAX);
     // Floor to the greatest observable mid-point ≤ clamped (preserves fire points
@@ -113,6 +123,10 @@ pub fn clamp_low_battery_percent(value: u8) -> u8 {
 }
 
 pub fn clamp_start_screen_sound_volume(value: u8) -> u8 {
+    value.min(100)
+}
+
+pub fn clamp_start_screen_haptics_strength(value: u8) -> u8 {
     value.min(100)
 }
 
@@ -132,6 +146,8 @@ impl Default for Prefs {
             start_screen_gesture: default_gesture(),
             start_screen_sounds_enabled: true,
             start_screen_sound_volume: default_start_screen_sound_volume(),
+            start_screen_haptics_enabled: true,
+            start_screen_haptics_strength: default_start_screen_haptics_strength(),
             games_sort_mode: GamesSortMode::default(),
             show_all_controllers: false,
         }
@@ -149,6 +165,8 @@ impl Prefs {
                 prefs.low_battery_percent = clamp_low_battery_percent(prefs.low_battery_percent);
                 prefs.start_screen_sound_volume =
                     clamp_start_screen_sound_volume(prefs.start_screen_sound_volume);
+                prefs.start_screen_haptics_strength =
+                    clamp_start_screen_haptics_strength(prefs.start_screen_haptics_strength);
                 prefs
             }
             Err(err) => {
@@ -241,11 +259,28 @@ mod tests {
     }
 
     #[test]
+    fn older_prefs_default_start_screen_haptics_on() {
+        let prefs: Prefs =
+            serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":["ps"]}"#)
+                .unwrap();
+        assert!(prefs.start_screen_haptics_enabled);
+        assert_eq!(prefs.start_screen_haptics_strength, 60);
+    }
+
+    #[test]
     fn clamp_start_screen_sound_volume_bounds() {
         assert_eq!(clamp_start_screen_sound_volume(0), 0);
         assert_eq!(clamp_start_screen_sound_volume(60), 60);
         assert_eq!(clamp_start_screen_sound_volume(100), 100);
         assert_eq!(clamp_start_screen_sound_volume(255), 100);
+    }
+
+    #[test]
+    fn clamp_start_screen_haptics_strength_bounds() {
+        assert_eq!(clamp_start_screen_haptics_strength(0), 0);
+        assert_eq!(clamp_start_screen_haptics_strength(60), 60);
+        assert_eq!(clamp_start_screen_haptics_strength(100), 100);
+        assert_eq!(clamp_start_screen_haptics_strength(255), 100);
     }
 
     #[test]

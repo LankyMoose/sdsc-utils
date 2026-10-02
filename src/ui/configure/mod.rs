@@ -133,6 +133,8 @@ pub struct ConfigureSettings {
     pub start_screen_gesture: Vec<GestureControl>,
     pub start_screen_sounds_enabled: bool,
     pub start_screen_sound_volume: u8,
+    pub start_screen_haptics_enabled: bool,
+    pub start_screen_haptics_strength: u8,
     pub gesture_recording: bool,
     pub gesture_recording_live: String,
     #[cfg(windows)]
@@ -196,6 +198,8 @@ pub enum ConfigureMessage {
     SetStartScreenEnabled(bool),
     SetStartScreenSounds(bool),
     SetStartScreenSoundVolume(u8),
+    SetStartScreenHaptics(bool),
+    SetStartScreenHapticsStrength(u8),
     StartGestureRecord,
     ResetStartGesture,
     CancelGestureRecord,
@@ -653,6 +657,32 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
                         .color(theme::MUTED),
                     slider(0.0..=100.0, f32::from(volume), |value| {
                         ConfigureMessage::SetStartScreenSoundVolume(value.round() as u8)
+                    })
+                    .step(5.0_f32),
+                ]
+                .spacing(4)
+                .width(Fill),
+            );
+        }
+
+        items = items.push(
+            checkbox(settings.start_screen_haptics_enabled)
+                .label("Controller haptics")
+                .size(16.0)
+                .text_size(13.0)
+                .spacing(8)
+                .on_toggle(ConfigureMessage::SetStartScreenHaptics),
+        );
+
+        if settings.start_screen_haptics_enabled {
+            let strength = settings.start_screen_haptics_strength;
+            items = items.push(
+                column![
+                    text(format!("Strength {strength}%"))
+                        .size(12.0)
+                        .color(theme::MUTED),
+                    slider(0.0..=100.0, f32::from(strength), |value| {
+                        ConfigureMessage::SetStartScreenHapticsStrength(value.round() as u8)
                     })
                     .step(5.0_f32),
                 ]

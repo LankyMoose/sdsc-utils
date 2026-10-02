@@ -1,22 +1,30 @@
 //! Single-threaded DualSense HID owner for the iced daemon.
 //!
-//! Owns **all** DualSense HID I/O: lightbar / battery poll / Identify / power-off,
-//! plus short input reads published to a shared snapshot. The UI PadPoll path only
-//! clones that snapshot — it never opens HID — so Identify cannot stall iced.
+//! Owns **all** DualSense HID I/O: lightbar / battery poll / Identify / power-off /
+//! rumble, plus short input reads published to a shared snapshot. The UI PadPoll path
+//! only clones that snapshot — it never opens HID — so Identify cannot stall iced.
 //!
 //! **Lightbar writes never use the input cache handle.** Long-lived read handles on
 //! Windows/DualSense often accept `write` with `Ok` without updating the bar.
 //! SetRgb / Identify always drop the cached device, then open-write-close (claim-once
 //! `LIGHT_OUT` only when needed); input sampling may reopen afterward.
 //!
+//! **Rumble uses a separate long-lived output handle** (not `write_rgb_exclusive`) so
+//! start-nav pulses do not drop the input cache. Opens ranked DualSense collections
+//! (same order as lightbar) and requests BT calibration once per rumble handle.
+//! Poll / PowerOff / Shutdown still drop rumble handles so those paths can open.
+//!
 //! Timing lines (grep `hid-worker:`) record enumerate / open / io / total.
 
 use crate::controller::driver;
 use crate::controller::dualsense::battery;
-use crate::controller::dualsense::identity::{normalize_identity, resolve_device_identity};
+use crate::controller::dualsense::identity::{
+    is_dualsense_device, is_dualsense_gamepad, normalize_identity, resolve_device_identity,
+};
 use crate::controller::dualsense::lightbar::{
     self, HidPhaseTiming, IDENTIFY_FLASH_COUNT, IDENTIFY_FLASH_MS,
 };
+use crate::controller::dualsense::rumble;
 use crate::controller::hid::poll::{self, PRESENCE_INTERVAL, PRESENCE_INTERVAL_EMPTY};
 use crate::controller::model::ControllerStatus;
 use crate::platform::app_log;
@@ -60,6 +68,15 @@ enum HidCmd {
         serial: String,
         color: Rgb,
     },
+    /// Pulse DualSense motors; worker schedules a stop after `duration_ms`.
+    Rumble {
+        serial: String,
+        right: u8,
+        left: u8,
+        duration_ms: u64,
+    },
+    /// Zero motors on every open rumble handle and drop them.
+    RumbleStopAll,
     Shutdown,
 }
 
@@ -308,6 +325,113 @@ impl DeviceCache {
     }
 }
 
+/// Separate open handles for rumble output. Never used for input reads.
+/// Dropped on Poll / PowerOff / Shutdown so those paths can reopen HID.
+struct RumbleCache {
+    devices: HashMap<String, OpenDevice>,
+    /// Log once when falling back to the input-cache handle.
+    fallback_warned: bool,
+}
+
+struct ActiveRumble {
+    serial: String,
+    stop_at: Instant,
+}
+
+impl RumbleCache {
+    fn new() -> Self {
+        Self {
+            devices: HashMap::new(),
+            fallback_warned: false,
+        }
+    }
+
+    fn drop_all(&mut self) {
+        self.devices.clear();
+    }
+
+    fn drop_serial(&mut self, serial: &str) {
+        self.devices.remove(&normalize_identity(serial));
+    }
+
+    fn ensure<'a>(&'a mut self, api: &HidApi, serial: &str) -> Result<&'a OpenDevice, String> {
+        let target = normalize_identity(serial);
+        if self.devices.contains_key(&target) {
+            return Ok(self.devices.get(&target).expect("contains"));
+        }
+        let open = open_rumble_device(api, &target)
+            .ok_or_else(|| format!("rumble: DualSense {target} not found / open failed"))?;
+        self.devices.insert(target.clone(), open);
+        Ok(self.devices.get(&target).expect("just inserted"))
+    }
+}
+
+/// Open a DualSense for rumble output using the same collection ranking as lightbar.
+/// Bluetooth pads get a one-time calibration feature request so motors are accepted.
+fn open_rumble_device(api: &HidApi, target: &str) -> Option<OpenDevice> {
+    // Prefer USB gamepad, then USB other, then BT gamepad, then BT other.
+    let mut best: Option<(OpenDevice, i32)> = None;
+    for info in api.device_list().filter(|d| is_dualsense_device(d)) {
+        let open_started = Instant::now();
+        let hint = info.serial_number().unwrap_or("");
+        let device = {
+            let _op = crate::controller::hid::diag::enter_op("open_device");
+            match info.open_device(api) {
+                Ok(d) => {
+                    crate::controller::hid::diag::trace_open(
+                        "rumble",
+                        info,
+                        hint,
+                        open_started.elapsed().as_millis(),
+                        Ok(()),
+                    );
+                    d
+                }
+                Err(err) => {
+                    crate::controller::hid::diag::trace_open(
+                        "rumble",
+                        info,
+                        hint,
+                        open_started.elapsed().as_millis(),
+                        Err(&err.to_string()),
+                    );
+                    continue;
+                }
+            }
+        };
+        let identity = resolve_device_identity(info, &device);
+        if identity != target {
+            continue;
+        }
+        let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
+        let is_usb = matches!(info.bus_type(), BusType::Usb);
+        let is_gamepad = is_dualsense_gamepad(info);
+        let rank = match (is_usb, is_gamepad) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, true) => 2,
+            (false, false) => 3,
+        };
+        let replace = match &best {
+            None => true,
+            Some((_, prev_rank)) => rank < *prev_rank,
+        };
+        if replace {
+            if is_bluetooth {
+                lightbar::prepare_bt_output_mode(&device);
+            }
+            best = Some((
+                OpenDevice {
+                    device,
+                    is_bluetooth,
+                },
+                rank,
+            ));
+        }
+    }
+    best.map(|(open, _)| open)
+}
+
 struct IdentifySession {
     serial: String,
     normal: Rgb,
@@ -412,6 +536,21 @@ impl HidWorkerHandle {
 
     pub fn set_rgb(&self, serial: String, color: Rgb) {
         let _ = self.tx.send(HidCmd::SetRgb { serial, color });
+    }
+
+    /// Pulse DualSense motors for `duration_ms`, then auto-stop.
+    pub fn rumble(&self, serial: String, right: u8, left: u8, duration_ms: u64) {
+        let _ = self.tx.send(HidCmd::Rumble {
+            serial,
+            right,
+            left,
+            duration_ms,
+        });
+    }
+
+    /// Stop all active rumble and drop rumble handles.
+    pub fn rumble_stop_all(&self) {
+        let _ = self.tx.send(HidCmd::RumbleStopAll);
     }
 
     pub fn shutdown(&self) {
@@ -758,10 +897,98 @@ fn abort_identify(
     }
 }
 
+fn stop_all_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>) {
+    for (serial, open) in rumble.devices.iter() {
+        let _ = rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, serial);
+    }
+    active.clear();
+    rumble.drop_all();
+}
+
+fn write_rumble_pulse(
+    cache: &mut DeviceCache,
+    rumble: &mut RumbleCache,
+    serial: &str,
+    right: u8,
+    left: u8,
+) -> Result<(), String> {
+    let target = normalize_identity(serial);
+
+    // Prefer long-lived exclusive rumble handle. On write failure, drop and re-probe.
+    for attempt in 0..2u8 {
+        if attempt > 0 {
+            rumble.drop_serial(&target);
+            crate::controller::hid::diag::diag_info(format!(
+                "hid-diag: rumble re-probe serial={target}"
+            ));
+        }
+        match rumble.ensure(&cache.api, &target) {
+            Ok(open) => {
+                let is_bt = open.is_bluetooth;
+                match rumble::set_rumble_on_device(&open.device, is_bt, &target, right, left) {
+                    Ok(()) => {
+                        crate::controller::hid::diag::diag_info(format!(
+                            "hid-diag: rumble ok serial={target} r={right} l={left} bt={}",
+                            u8::from(is_bt)
+                        ));
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        crate::controller::hid::diag::diag_warn(format!(
+                            "hid-diag: rumble write fail serial={target} attempt={attempt} err={err}"
+                        ));
+                        if attempt == 0 {
+                            continue;
+                        }
+                        // Fall through to input-handle fallback below.
+                        break;
+                    }
+                }
+            }
+            Err(open_err) => {
+                crate::controller::hid::diag::diag_warn(format!(
+                    "hid-diag: rumble open fail serial={target} err={open_err}"
+                ));
+                break;
+            }
+        }
+    }
+
+    // Last resort: input-cache handle (often accepts Ok without motors — warn once).
+    if let Ok(open) = cache.ensure(&target) {
+        if !rumble.fallback_warned {
+            app_log::warn(
+                "rumble: exclusive open/write failed; writing on input handle (may be silent)",
+            );
+            rumble.fallback_warned = true;
+        }
+        return rumble::set_rumble_on_device(&open.device, open.is_bluetooth, &target, right, left)
+            .map_err(|e| e.to_string());
+    }
+    Err(format!("rumble: no handle for {target}"))
+}
+
+fn expire_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>, now: Instant) {
+    let mut still = Vec::with_capacity(active.len());
+    for entry in active.drain(..) {
+        if entry.stop_at > now {
+            still.push(entry);
+            continue;
+        }
+        if let Some(open) = rumble.devices.get(&normalize_identity(&entry.serial)) {
+            let _ = rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, &entry.serial);
+        }
+    }
+    *active = still;
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_cmd(
     cmd: HidCmd,
     session: &mut Option<IdentifySession>,
     cache: &mut DeviceCache,
+    rumble: &mut RumbleCache,
+    active_rumble: &mut Vec<ActiveRumble>,
     snapshot: &Mutex<InputSnapshot>,
     identifying: &AtomicBool,
     last_noisy_log: &Mutex<Instant>,
@@ -770,6 +997,7 @@ fn handle_cmd(
     match cmd {
         HidCmd::Shutdown => {
             abort_identify(session, cache, identifying);
+            stop_all_rumble(rumble, active_rumble);
             cache.drop_all();
             publish_snapshot(
                 snapshot,
@@ -798,6 +1026,7 @@ fn handle_cmd(
             if session.as_ref().is_some_and(|s| s.serial == serial) {
                 abort_identify(session, cache, identifying);
             }
+            stop_all_rumble(rumble, active_rumble);
             cache.drop_all();
             publish_snapshot(
                 snapshot,
@@ -846,8 +1075,42 @@ fn handle_cmd(
             );
             false
         }
+        HidCmd::Rumble {
+            serial,
+            right,
+            left,
+            duration_ms,
+        } => {
+            let target = normalize_identity(&serial);
+            // Retrigger: replace any pending stop for this serial.
+            active_rumble.retain(|e| normalize_identity(&e.serial) != target);
+            match write_rumble_pulse(cache, rumble, &target, right, left) {
+                Ok(()) => {
+                    if duration_ms > 0 && (right > 0 || left > 0) {
+                        active_rumble.push(ActiveRumble {
+                            serial: target,
+                            stop_at: Instant::now() + Duration::from_millis(duration_ms),
+                        });
+                    } else if let Some(open) = rumble.devices.get(&target) {
+                        let _ =
+                            rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, &target);
+                    }
+                }
+                Err(err) => {
+                    crate::controller::hid::diag::diag_warn(format!(
+                        "rumble write failed for {target}: {err}"
+                    ));
+                }
+            }
+            false
+        }
+        HidCmd::RumbleStopAll => {
+            stop_all_rumble(rumble, active_rumble);
+            false
+        }
         HidCmd::Poll { previously, reply } => {
-            // Release input handles so Poll can open; keep last nav readings published.
+            // Release input + rumble handles so Poll can open; keep last nav readings.
+            stop_all_rumble(rumble, active_rumble);
             cache.drop_all();
             log_cmd_begin("Poll", snapshot);
             let started = Instant::now();
@@ -887,6 +1150,8 @@ fn worker_loop(
     };
     // Clear claims poisoned by prior no-op writes on input-cache handles.
     lightbar::forget_all_claims();
+    let mut rumble = RumbleCache::new();
+    let mut active_rumble: Vec<ActiveRumble> = Vec::new();
     let mut session: Option<IdentifySession> = None;
     let mut stall_logged = false;
     let mut in_cmd = "none";
@@ -894,6 +1159,7 @@ fn worker_loop(
     loop {
         crate::controller::hid::diag::note_progress("worker_loop");
         let hot = input_hot.load(Ordering::Relaxed);
+        expire_rumble(&mut rumble, &mut active_rumble, Instant::now());
         maybe_log_sample_stall(
             &input_snapshot,
             hot,
@@ -929,12 +1195,16 @@ fn worker_loop(
                     HidCmd::Identify { .. } => "Identify",
                     HidCmd::PowerOff { .. } => "PowerOff",
                     HidCmd::SetRgb { .. } => "SetRgb",
+                    HidCmd::Rumble { .. } => "Rumble",
+                    HidCmd::RumbleStopAll => "RumbleStopAll",
                     HidCmd::Shutdown => "Shutdown",
                 };
                 if handle_cmd(
                     cmd,
                     &mut session,
                     &mut cache,
+                    &mut rumble,
+                    &mut active_rumble,
                     &input_snapshot,
                     &identifying,
                     &last_noisy_log,
@@ -951,7 +1221,7 @@ fn worker_loop(
             Err(mpsc::TryRecvError::Empty) => {}
         }
 
-        if hot || session.is_some() {
+        if hot || session.is_some() || !active_rumble.is_empty() {
             if let Some(s) = session.as_ref() {
                 let serial = s.serial.clone();
                 let until_flash = s
@@ -962,8 +1232,11 @@ fn worker_loop(
                 if !until_flash.is_zero() {
                     thread::sleep(until_flash.min(ACTIVE_POLL));
                 }
-            } else {
+            } else if hot {
                 sample_all_inputs(&mut cache, &input_snapshot, hot, &last_noisy_log, None);
+            } else {
+                // Rumble stop pending while input is cold — wake soon, no sample.
+                thread::sleep(ACTIVE_POLL);
             }
             continue;
         }
@@ -976,12 +1249,16 @@ fn worker_loop(
                     HidCmd::Identify { .. } => "Identify",
                     HidCmd::PowerOff { .. } => "PowerOff",
                     HidCmd::SetRgb { .. } => "SetRgb",
+                    HidCmd::Rumble { .. } => "Rumble",
+                    HidCmd::RumbleStopAll => "RumbleStopAll",
                     HidCmd::Shutdown => "Shutdown",
                 };
                 if handle_cmd(
                     cmd,
                     &mut session,
                     &mut cache,
+                    &mut rumble,
+                    &mut active_rumble,
                     &input_snapshot,
                     &identifying,
                     &last_noisy_log,

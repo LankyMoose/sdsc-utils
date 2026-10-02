@@ -729,12 +729,13 @@ impl State {
 
     /// Request a slide target. Interruptible: restarts from the current scroll position.
     /// No-op if already at / animating toward `to`.
-    pub fn request_slide(&mut self, to: StartSlide, now: Instant) {
+    /// Returns `true` when a transition started or completed instantly after a move.
+    pub fn request_slide(&mut self, to: StartSlide, now: Instant) -> bool {
         if self.anim.as_ref().is_some_and(|a| a.to == to) {
-            return;
+            return false;
         }
         if self.anim.is_none() && self.slide == to {
-            return;
+            return false;
         }
 
         let from_x = self.slide_scroll_x(now);
@@ -747,7 +748,7 @@ impl State {
             }
             self.slide = to;
             self.anim = None;
-            return;
+            return false;
         }
 
         let duration_ms = ((SLIDE_ANIM_MS as f32) * (distance / PANE_W))
@@ -767,6 +768,7 @@ impl State {
             duration_ms,
             started: now,
         });
+        true
     }
 
     pub fn move_selection(&mut self, delta: i32) -> Option<ScrollReveal> {

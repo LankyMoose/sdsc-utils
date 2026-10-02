@@ -14,12 +14,14 @@ use std::thread;
 const NAV_MP3: &[u8] = include_bytes!("../../assets/sounds/ui-nav.mp3");
 const ACTION_MP3: &[u8] = include_bytes!("../../assets/sounds/ui-action.mp3");
 const HOLD_MP3: &[u8] = include_bytes!("../../assets/sounds/ui-hold.mp3");
+const SLIDE_MP3: &[u8] = include_bytes!("../../assets/sounds/ui-slide.mp3");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiSoundKind {
     Nav,
     Action,
     Hold,
+    Slide,
 }
 
 impl UiSoundKind {
@@ -28,6 +30,7 @@ impl UiSoundKind {
             Self::Nav => NAV_MP3,
             Self::Action => ACTION_MP3,
             Self::Hold => HOLD_MP3,
+            Self::Slide => SLIDE_MP3,
         }
     }
 }
