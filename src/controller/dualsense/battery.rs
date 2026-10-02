@@ -4,29 +4,20 @@ use crate::controller::dualsense::identity::{
     is_dualsense_device, is_storable_serial, normalize_identity, resolve_device_identity,
 };
 use crate::controller::model::ControllerKind;
+use crate::domain::protocol::{
+    BT_CONTROL_FEATURE_REPORT, BT_CONTROL_FEATURE_SIZE, BT_CONTROL_FEATURE_SIZE_ALT,
+    BT_CONTROL_FEATURE_SIZE_PADDED, BT_REPORT_FULL, BT_REPORT_SIZE, BT_REPORT_TRUNCATED,
+    CALIBRATION_FEATURE_REPORT, CALIBRATION_FEATURE_SIZE, USB_REPORT_ID, USB_REPORT_SIZE,
+};
 use crate::platform::app_log;
 use hidapi::{BusType, HidApi, HidDevice};
 use std::thread;
 use std::time::Duration;
 
 pub use crate::controller::model::{Connection, ControllerStatus, PowerState};
-const USB_REPORT_SIZE: usize = 64;
-const BT_REPORT_SIZE: usize = 78;
 const USB_POWER_OFFSET: usize = 53;
 const BT_POWER_OFFSET: usize = 54;
 
-const BT_REPORT_TRUNCATED: u8 = 0x01;
-const BT_REPORT_FULL: u8 = 0x31;
-const USB_REPORT_ID: u8 = 0x01;
-const CALIBRATION_FEATURE_REPORT: u8 = 0x05;
-const CALIBRATION_FEATURE_SIZE: usize = 41;
-/// DualSense Bluetooth control feature report (dualsensectl / HID descriptor).
-/// Descriptor Report Count for ID 0x08 is 47 data bytes → 48 with report ID.
-const BT_CONTROL_FEATURE_REPORT: u8 = 0x08;
-const BT_CONTROL_FEATURE_SIZE: usize = 48;
-/// dualsensectl historically used 47; keep as a Windows fallback size.
-const BT_CONTROL_FEATURE_SIZE_ALT: usize = 47;
-const BT_CONTROL_FEATURE_SIZE_PADDED: usize = 64;
 const BT_CONTROL_OFF: u8 = 0x02;
 /// Feature-report CRC seeds: Linux hid-playstation uses 0xA3; dualsensectl uses 0x53.
 const FEATURE_CRC32_SEEDS: [u8; 2] = [0xA3, 0x53];
@@ -77,7 +68,7 @@ fn dedupe_statuses(mut statuses: Vec<ControllerStatus>) -> Vec<ControllerStatus>
 
 pub fn dualsense_status(
     index: usize,
-    product: &'static str,
+    product: impl Into<String>,
     connection: Connection,
     serial: String,
     percent: u8,
@@ -86,7 +77,7 @@ pub fn dualsense_status(
     ControllerStatus {
         index,
         kind: ControllerKind::DualSense,
-        product,
+        product: product.into(),
         connection,
         serial,
         percent,
@@ -98,7 +89,7 @@ pub fn dualsense_status(
 
 pub fn read_battery(device: &HidDevice) -> Result<BatteryReading, hidapi::HidError> {
     let bus_type = device.get_device_info()?.bus_type();
-    let (connection, report_size, power_offset, is_bluetooth) = match bus_type {
+    let (_connection, report_size, power_offset, is_bluetooth) = match bus_type {
         BusType::Usb => (Connection::Usb, USB_REPORT_SIZE, USB_POWER_OFFSET, false),
         BusType::Bluetooth => (Connection::Bluetooth, BT_REPORT_SIZE, BT_POWER_OFFSET, true),
         other => {
@@ -149,20 +140,40 @@ pub fn read_battery(device: &HidDevice) -> Result<BatteryReading, hidapi::HidErr
             });
         }
 
-        let power = buf[power_offset];
-        let level = (power & POWER_LEVEL_MASK).min(MAX_POWER_LEVEL);
-        let state = PowerState::from_nibble(power >> POWER_STATE_SHIFT);
-        let percent = percent_from_level(level, state);
-
-        return Ok(BatteryReading {
-            percent,
-            state,
-            connection,
+        if let Some(reading) = parse_battery_from_report(&buf[..n], is_bluetooth) {
+            return Ok(reading);
+        }
+        return Err(hidapi::HidError::HidApiError {
+            message: "input report missing battery fields".into(),
         });
     }
 
     Err(hidapi::HidError::HidApiError {
         message: "timed out waiting for a DualSense input report with battery data".into(),
+    })
+}
+
+/// Parse battery from an already-validated DualSense input report buffer.
+///
+/// `buf[0]` must be the report ID (`USB_REPORT_ID` or `BT_REPORT_FULL`). Used by the
+/// hot input sampler so battery does not need a second exclusive read.
+pub fn parse_battery_from_report(buf: &[u8], is_bluetooth: bool) -> Option<BatteryReading> {
+    let (connection, power_offset) = if is_bluetooth {
+        (Connection::Bluetooth, BT_POWER_OFFSET)
+    } else {
+        (Connection::Usb, USB_POWER_OFFSET)
+    };
+    if buf.len() <= power_offset {
+        return None;
+    }
+    let power = buf[power_offset];
+    let level = (power & POWER_LEVEL_MASK).min(MAX_POWER_LEVEL);
+    let state = PowerState::from_nibble(power >> POWER_STATE_SHIFT);
+    let percent = percent_from_level(level, state);
+    Some(BatteryReading {
+        percent,
+        state,
+        connection,
     })
 }
 
@@ -320,6 +331,27 @@ fn power_off_bluetooth_unlocked_timed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_battery_from_usb_and_bt_reports() {
+        let mut usb = vec![0u8; USB_REPORT_SIZE];
+        usb[0] = USB_REPORT_ID;
+        // level 5 (≈55%), discharging
+        usb[USB_POWER_OFFSET] = 0x05;
+        let usb_reading = parse_battery_from_report(&usb, false).expect("usb");
+        assert_eq!(usb_reading.percent, 55);
+        assert_eq!(usb_reading.state, PowerState::Discharging);
+        assert!(usb_reading.connection.is_usb());
+
+        let mut bt = vec![0u8; BT_REPORT_SIZE];
+        bt[0] = BT_REPORT_FULL;
+        // level 10, charging (state nibble 0x01)
+        bt[BT_POWER_OFFSET] = (0x01 << POWER_STATE_SHIFT) | 0x0A;
+        let bt_reading = parse_battery_from_report(&bt, true).expect("bt");
+        assert_eq!(bt_reading.percent, 100);
+        assert_eq!(bt_reading.state, PowerState::Charging);
+        assert!(!bt_reading.connection.is_usb());
+    }
 
     #[test]
     fn percent_buckets_match_linux_midpoints() {

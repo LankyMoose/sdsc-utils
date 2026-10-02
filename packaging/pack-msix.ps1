@@ -3,6 +3,9 @@
 # Usage:
 #   ./packaging/pack-msix.ps1 -ExePath target/release/sdsc-utils.exe -OutDir target/msix
 #
+# Copies sdsc-shell.exe from the same directory as -ExePath (required for the
+# HID/tray service to spawn the iced shell).
+#
 # Identity Version is stamped from Cargo.toml (e.g. 1.3.1 -> 1.3.1.0).
 # Identity Name / Publisher in AppxManifest.xml must match Partner Center.
 
@@ -78,6 +81,11 @@ New-Item -ItemType Directory -Path $layout | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $layout "Assets") | Out-Null
 
 Copy-Item $exe (Join-Path $layout "sdsc-utils.exe")
+$shellSrc = Join-Path (Split-Path -Parent $exe) "sdsc-shell.exe"
+if (-not (Test-Path $shellSrc)) {
+    throw "sdsc-shell.exe not found next to $exe (build both bins with cargo build --release --bins)"
+}
+Copy-Item $shellSrc (Join-Path $layout "sdsc-shell.exe")
 Copy-Item (Join-Path $RepoRoot "packaging\Assets\*") (Join-Path $layout "Assets\") -Force
 
 $manifestSrc = Join-Path $RepoRoot "packaging\AppxManifest.xml"

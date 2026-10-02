@@ -328,3 +328,11 @@ Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: toast Pl
 ## Start-screen rumble (haptics)
 
 Start-menu nav/action cues may pulse DualSense motors via `HidCmd::Rumble`. **Do not** route rumble through `write_rgb_exclusive` (that drops the input-cache handle and reopens). Rumble keeps a **separate long-lived output handle**, opens ranked DualSense collections like lightbar (USB gamepad → USB other → BT gamepad → BT other), and calls `prepare_bt_output_mode` once on BT opens. Poll / PowerOff / Shutdown drop rumble handles. Debug: grep `hid-diag: rumble` / write traces with `caller=rumble`.
+
+## Battery from input stream (hot path)
+
+While Start / pad-input is hot, **do not** run exclusive battery `Poll` (`drop_all` + `read_timeout`). Battery is parsed from the same USB `0x01` / BT `0x31` reports the sample loop already drains (`parse_battery_from_report`). Service synthesizes `Controllers` from `HidWorkerHandle::live_controllers()` and applies lightbar via exclusive `SetRgb` only on membership / color-bucket change.
+
+Cold (tray idle): classic timed `Poll` unchanged.
+
+Debug grep: `service: hot path waiting for live battery sample`, `service: hot lightbar connect`, `service: hot lightbar color`, `hid-diag: sample short`.

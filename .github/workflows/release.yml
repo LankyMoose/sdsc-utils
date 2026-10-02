@@ -32,7 +32,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sdsc-utils-windows
-          path: target/release/sdsc-utils.exe
+          path: |
+            target/release/sdsc-utils.exe
+            target/release/sdsc-shell.exe
 
       - name: Pack MSIX
         shell: pwsh
@@ -52,5 +54,6 @@ jobs:
         with:
           files: |
             target/release/sdsc-utils.exe
+            target/release/sdsc-shell.exe
             target/msix/sdsc-utils.msix
           generate_release_notes: true

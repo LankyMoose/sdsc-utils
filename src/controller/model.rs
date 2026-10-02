@@ -60,7 +60,8 @@ impl std::fmt::Display for Connection {
 }
 
 /// DualSense-style coarse battery state (also used as the shared UI model).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PowerState {
     Discharging,
     Charging,
@@ -101,11 +102,11 @@ impl PowerState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControllerStatus {
     pub index: usize,
     pub kind: ControllerKind,
-    pub product: &'static str,
+    pub product: String,
     pub connection: Connection,
     pub serial: String,
     pub percent: u8,
