@@ -289,6 +289,13 @@ pub struct StartControllerRow {
     pub eta: Option<String>,
 }
 
+impl StartControllerRow {
+    /// Triangle hold is shown and accepted only for a live Bluetooth pad.
+    pub fn show_power_off(&self) -> bool {
+        self.connected && self.bluetooth
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SlideAnim {
     from_x: f32,
@@ -2013,7 +2020,7 @@ fn controller_row<'a>(
             hint.held,
             hint.press_anim,
         )];
-        if row.bluetooth {
+        if row.show_power_off() {
             actions.push(face_hold_hint(
                 FaceButton::Triangle,
                 "Power off",
@@ -2053,6 +2060,33 @@ pub fn power_state_label(state: PowerState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_controller(connected: bool, bluetooth: bool) -> StartControllerRow {
+        StartControllerRow {
+            serial: "pad".into(),
+            title: "DualSense".into(),
+            connection: if bluetooth { "Bluetooth" } else { "USB" }.into(),
+            state: if connected {
+                "charging"
+            } else {
+                "disconnected"
+            }
+            .into(),
+            percent: 50,
+            low: false,
+            bluetooth,
+            connected,
+            eta: None,
+        }
+    }
+
+    #[test]
+    fn power_off_hint_only_for_live_bluetooth() {
+        assert!(sample_controller(true, true).show_power_off());
+        assert!(!sample_controller(true, false).show_power_off());
+        assert!(!sample_controller(false, true).show_power_off());
+        assert!(!sample_controller(false, false).show_power_off());
+    }
 
     #[test]
     fn from_entry_skeleton_while_scan_pending() {
