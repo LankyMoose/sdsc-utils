@@ -189,8 +189,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 CI builds on Windows. To publish a binary + MSIX artifact:
 
 ```bash
-git tag v1.5.1
-git push origin v1.5.1
+git tag v1.5.2
+git push origin v1.5.2
 ```
 
 The release workflow attaches one portable `sdsc-utils.exe` (the UI shell is bundled inside it) and `sdsc-utils.msix` to the GitHub Release for that tag. Upload the MSIX to Partner Center for Store distribution. You can also run the **Release** workflow manually (`workflow_dispatch`).
