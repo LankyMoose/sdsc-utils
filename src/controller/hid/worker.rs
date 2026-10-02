@@ -13,6 +13,7 @@
 //! start-nav pulses do not drop the input cache. Opens ranked DualSense collections
 //! (same order as lightbar) and requests BT calibration once per rumble handle.
 //! Poll / PowerOff / Shutdown still drop rumble handles so those paths can open.
+//! PowerOff waits for any in-flight rumble pulse to finish first (hold cue), then runs.
 //!
 //! Timing lines (grep `hid-worker:`) record enumerate / open / io / total.
 
@@ -338,6 +339,69 @@ struct RumbleCache {
 struct ActiveRumble {
     serial: String,
     stop_at: Instant,
+}
+
+/// Power-off deferred until in-flight rumble pulses reach their stop time.
+struct PendingPowerOff {
+    serials: Vec<String>,
+    not_before: Instant,
+}
+
+/// Latest future stop among in-flight rumble pulses, if any.
+fn rumble_defer_until(active: &[ActiveRumble], now: Instant) -> Option<Instant> {
+    active
+        .iter()
+        .filter(|e| e.stop_at > now)
+        .map(|e| e.stop_at)
+        .max()
+}
+
+fn queue_pending_power_off(
+    pending: &mut Option<PendingPowerOff>,
+    serial: String,
+    not_before: Instant,
+) {
+    let target = normalize_identity(&serial);
+    match pending {
+        Some(p) => {
+            if !p.serials.iter().any(|s| normalize_identity(s) == target) {
+                p.serials.push(serial);
+            }
+            if not_before > p.not_before {
+                p.not_before = not_before;
+            }
+        }
+        None => {
+            *pending = Some(PendingPowerOff {
+                serials: vec![serial],
+                not_before,
+            });
+        }
+    }
+}
+
+/// Ready when the defer deadline has passed, or no pulse is left to wait for.
+fn pending_power_off_ready(
+    pending: &PendingPowerOff,
+    active: &[ActiveRumble],
+    now: Instant,
+) -> bool {
+    now >= pending.not_before || rumble_defer_until(active, now).is_none()
+}
+
+fn take_due_power_offs(
+    pending: &mut Option<PendingPowerOff>,
+    active: &[ActiveRumble],
+    now: Instant,
+) -> Vec<String> {
+    let ready = pending
+        .as_ref()
+        .is_some_and(|p| pending_power_off_ready(p, active, now));
+    if ready {
+        pending.take().map(|p| p.serials).unwrap_or_default()
+    } else {
+        Vec::new()
+    }
 }
 
 impl RumbleCache {
@@ -1207,6 +1271,56 @@ fn expire_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>, now: 
     *active = still;
 }
 
+/// Run the PowerOff body: stop rumble, drop handles, clear snapshot, send feature report.
+#[allow(clippy::too_many_arguments)]
+fn execute_power_off(
+    serial: &str,
+    session: &mut Option<IdentifySession>,
+    cache: &mut DeviceCache,
+    live_pads: &Mutex<HashMap<String, LivePadStatus>>,
+    rumble: &mut RumbleCache,
+    active_rumble: &mut Vec<ActiveRumble>,
+    snapshot: &Mutex<InputSnapshot>,
+    identifying: &AtomicBool,
+    last_noisy_log: &Mutex<Instant>,
+    input_hot: bool,
+) {
+    if session.as_ref().is_some_and(|s| s.serial == serial) {
+        abort_identify(session, cache, identifying);
+    }
+    stop_all_rumble(rumble, active_rumble);
+    cache.drop_all();
+    if let Ok(mut guard) = live_pads.lock() {
+        guard.clear();
+    }
+    publish_snapshot(
+        snapshot,
+        Vec::new(),
+        SnapshotReason::ClearedPowerOff,
+        Some("PowerOff"),
+        last_noisy_log,
+        input_hot,
+    );
+    log_cmd_begin("PowerOff", snapshot);
+    let started = Instant::now();
+    let (result, timing) = {
+        let _ = cache.refresh_device_list();
+        battery::power_off_bluetooth_timed(&cache.api, serial)
+    };
+    match result {
+        Ok(()) => app_log::info(format!("power-off sent for {serial}")),
+        Err(err) => app_log::warn(format!("power-off failed for {serial}: {err}")),
+    }
+    log_cmd(
+        "PowerOff",
+        &timing,
+        started.elapsed(),
+        None,
+        true,
+        last_noisy_log,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_cmd(
     cmd: HidCmd,
@@ -1215,6 +1329,7 @@ fn handle_cmd(
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
     rumble: &mut RumbleCache,
     active_rumble: &mut Vec<ActiveRumble>,
+    pending_power_off: &mut Option<PendingPowerOff>,
     pulse: &mut LowBatteryPulse,
     snapshot: &Mutex<InputSnapshot>,
     identifying: &AtomicBool,
@@ -1223,6 +1338,7 @@ fn handle_cmd(
 ) -> bool {
     match cmd {
         HidCmd::Shutdown => {
+            *pending_power_off = None;
             abort_identify(session, cache, identifying);
             stop_all_rumble(rumble, active_rumble);
             pulse.set_targets(Vec::new());
@@ -1256,39 +1372,31 @@ fn handle_cmd(
             false
         }
         HidCmd::PowerOff { serial } => {
+            // Abort Identify for this pad immediately (going away), even if deferred.
             if session.as_ref().is_some_and(|s| s.serial == serial) {
                 abort_identify(session, cache, identifying);
             }
-            stop_all_rumble(rumble, active_rumble);
-            cache.drop_all();
-            if let Ok(mut guard) = live_pads.lock() {
-                guard.clear();
+            let now = Instant::now();
+            if let Some(not_before) = rumble_defer_until(active_rumble, now) {
+                let remain_ms = not_before.saturating_duration_since(now).as_millis();
+                crate::controller::hid::diag::diag_info(format!(
+                    "hid-diag: power-off deferred serial={} remain_ms={remain_ms}",
+                    normalize_identity(&serial)
+                ));
+                queue_pending_power_off(pending_power_off, serial, not_before);
+                return false;
             }
-            publish_snapshot(
+            execute_power_off(
+                &serial,
+                session,
+                cache,
+                live_pads,
+                rumble,
+                active_rumble,
                 snapshot,
-                Vec::new(),
-                SnapshotReason::ClearedPowerOff,
-                Some("PowerOff"),
+                identifying,
                 last_noisy_log,
                 input_hot,
-            );
-            log_cmd_begin("PowerOff", snapshot);
-            let started = Instant::now();
-            let (result, timing) = {
-                let _ = cache.refresh_device_list();
-                battery::power_off_bluetooth_timed(&cache.api, &serial)
-            };
-            match result {
-                Ok(()) => app_log::info(format!("power-off sent for {serial}")),
-                Err(err) => app_log::warn(format!("power-off failed for {serial}: {err}")),
-            }
-            log_cmd(
-                "PowerOff",
-                &timing,
-                started.elapsed(),
-                None,
-                true,
-                last_noisy_log,
             );
             false
         }
@@ -1417,6 +1525,7 @@ fn worker_loop(
     lightbar::forget_all_claims();
     let mut rumble = RumbleCache::new();
     let mut active_rumble: Vec<ActiveRumble> = Vec::new();
+    let mut pending_power_off: Option<PendingPowerOff> = None;
     let mut pulse = LowBatteryPulse::new();
     let mut session: Option<IdentifySession> = None;
     let mut stall_logged = false;
@@ -1427,6 +1536,20 @@ fn worker_loop(
         let hot = input_hot.load(Ordering::Relaxed);
         let now = Instant::now();
         expire_rumble(&mut rumble, &mut active_rumble, now);
+        for serial in take_due_power_offs(&mut pending_power_off, &active_rumble, now) {
+            execute_power_off(
+                &serial,
+                &mut session,
+                &mut cache,
+                &live_pads,
+                &mut rumble,
+                &mut active_rumble,
+                &input_snapshot,
+                &identifying,
+                &last_noisy_log,
+                hot,
+            );
+        }
         let identifying_now = session.is_some() || identifying.load(Ordering::SeqCst);
         if pulse.tick(&mut cache, identifying_now, now) {
             in_cmd = "LowBatteryPulse";
@@ -1479,6 +1602,7 @@ fn worker_loop(
                     &live_pads,
                     &mut rumble,
                     &mut active_rumble,
+                    &mut pending_power_off,
                     &mut pulse,
                     &input_snapshot,
                     &identifying,
@@ -1499,7 +1623,13 @@ fn worker_loop(
         let pulse_pending = pulse
             .wake_at()
             .is_some_and(|t| t <= Instant::now() + ACTIVE_POLL);
-        if hot || session.is_some() || !active_rumble.is_empty() || pulse_pending {
+        let power_off_waiting = pending_power_off.is_some();
+        if hot
+            || session.is_some()
+            || !active_rumble.is_empty()
+            || pulse_pending
+            || power_off_waiting
+        {
             if let Some(s) = session.as_ref() {
                 let serial = s.serial.clone();
                 let until_flash = s
@@ -1559,6 +1689,7 @@ fn worker_loop(
                     &live_pads,
                     &mut rumble,
                     &mut active_rumble,
+                    &mut pending_power_off,
                     &mut pulse,
                     &input_snapshot,
                     &identifying,
@@ -1614,4 +1745,86 @@ fn log_cmd(
         "hid-worker: cmd={cmd}{flash_part} enumerate_ms={} open_ms={} io_ms={} total_ms={}",
         timing.enumerate_ms, timing.open_ms, timing.io_ms, total_ms
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rumble_defer_until_none_when_empty() {
+        let now = Instant::now();
+        assert!(rumble_defer_until(&[], now).is_none());
+    }
+
+    #[test]
+    fn rumble_defer_until_ignores_already_due() {
+        let now = Instant::now();
+        let active = vec![ActiveRumble {
+            serial: "a".into(),
+            stop_at: now,
+        }];
+        assert!(rumble_defer_until(&active, now).is_none());
+    }
+
+    #[test]
+    fn rumble_defer_until_is_latest_future_stop() {
+        let now = Instant::now();
+        let early = now + Duration::from_millis(40);
+        let late = now + Duration::from_millis(90);
+        let active = vec![
+            ActiveRumble {
+                serial: "a".into(),
+                stop_at: early,
+            },
+            ActiveRumble {
+                serial: "b".into(),
+                stop_at: late,
+            },
+        ];
+        assert_eq!(rumble_defer_until(&active, now), Some(late));
+    }
+
+    #[test]
+    fn pending_power_off_waits_until_deadline() {
+        let now = Instant::now();
+        let stop = now + Duration::from_millis(90);
+        let mut pending = None;
+        queue_pending_power_off(&mut pending, "pad1".into(), stop);
+
+        let active = vec![ActiveRumble {
+            serial: "pad1".into(),
+            stop_at: stop,
+        }];
+        assert!(take_due_power_offs(&mut pending, &active, now).is_empty());
+        assert!(pending.is_some());
+
+        let due = take_due_power_offs(&mut pending, &[], stop);
+        assert_eq!(due, vec!["pad1".to_string()]);
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn pending_power_off_ready_when_pulses_cleared_early() {
+        let now = Instant::now();
+        let stop = now + Duration::from_millis(90);
+        let mut pending = None;
+        queue_pending_power_off(&mut pending, "pad1".into(), stop);
+        // RumbleStopAll / expire cleared pulses before the clock deadline.
+        let due = take_due_power_offs(&mut pending, &[], now);
+        assert_eq!(due, vec!["pad1".to_string()]);
+    }
+
+    #[test]
+    fn second_power_off_joins_pending_with_shared_deadline() {
+        let now = Instant::now();
+        let early = now + Duration::from_millis(50);
+        let late = now + Duration::from_millis(90);
+        let mut pending = None;
+        queue_pending_power_off(&mut pending, "a".into(), early);
+        queue_pending_power_off(&mut pending, "b".into(), late);
+        let p = pending.as_ref().expect("pending");
+        assert_eq!(p.serials, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(p.not_before, late);
+    }
 }
