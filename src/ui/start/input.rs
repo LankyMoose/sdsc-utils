@@ -1067,8 +1067,12 @@ pub struct PadTickResult {
     pub action_pad: Option<PadId>,
     pub triangle_progress: f32,
     pub triangle_completed: bool,
+    /// Pad that completed Triangle hold this tick.
+    pub triangle_completed_pad: Option<PadId>,
     pub cross_progress: f32,
     pub cross_completed: bool,
+    /// Pad that completed Cross hold this tick.
+    pub cross_completed_pad: Option<PadId>,
     /// Face buttons held on any armed pad this tick.
     pub held: FaceHeld,
     /// How many live pads are armed this tick.
@@ -1165,6 +1169,7 @@ impl PadNavBank {
                 }
                 if completed {
                     result.cross_completed = true;
+                    result.cross_completed_pad = Some(reading.id.clone());
                 }
                 slot.triangle_hold.reset();
 
@@ -1178,6 +1183,7 @@ impl PadNavBank {
                     slot.cross_hold.cancel();
                     result.cross_progress = 0.0;
                     result.cross_completed = false;
+                    result.cross_completed_pad = None;
                 }
 
                 let edge = slot
@@ -1201,6 +1207,7 @@ impl PadNavBank {
                 }
                 if c_completed {
                     result.cross_completed = true;
+                    result.cross_completed_pad = Some(reading.id.clone());
                 }
                 let stick_interrupt = reading.sample.dpad_up
                     || reading.sample.dpad_down
@@ -1212,6 +1219,7 @@ impl PadNavBank {
                     slot.cross_hold.cancel();
                     result.cross_progress = 0.0;
                     result.cross_completed = false;
+                    result.cross_completed_pad = None;
                 }
             } else {
                 slot.cross_hold.reset();
@@ -1228,6 +1236,7 @@ impl PadNavBank {
                 }
                 if t_completed {
                     result.triangle_completed = true;
+                    result.triangle_completed_pad = Some(reading.id.clone());
                 }
                 Some(EdgeButton::Triangle)
             } else {
@@ -1246,6 +1255,7 @@ impl PadNavBank {
                 slot.triangle_hold.cancel();
                 result.triangle_progress = 0.0;
                 result.triangle_completed = false;
+                result.triangle_completed_pad = None;
             }
 
             let edge = slot.button_edges.update(&reading.sample, hold_owned);

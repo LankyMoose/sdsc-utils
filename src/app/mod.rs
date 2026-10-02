@@ -10,6 +10,7 @@ use crate::controller::dualsense::identity as dualsense;
 use crate::controller::dualsense::lightbar::{
     self, LOW_BATTERY_ORANGE, LOW_BATTERY_PULSE_GAP_MS, LOW_BATTERY_PULSE_ON_MS,
 };
+use crate::controller::dualsense::rumble::MotorPulse;
 #[cfg(feature = "dev-emulate")]
 use crate::controller::emulate::{self, Preset};
 use crate::controller::hid::poll::{
@@ -26,7 +27,10 @@ use crate::games::{self, GamesCatalog};
 use crate::persist::analytics::{self, AnalyticsStore};
 use crate::persist::notify::{NotifyEvent, NotifyTracker};
 use crate::persist::paths;
-use crate::persist::prefs::{Prefs, clamp_low_battery_percent, clamp_start_screen_sound_volume};
+use crate::persist::prefs::{
+    Prefs, clamp_low_battery_percent, clamp_start_screen_haptics_strength,
+    clamp_start_screen_sound_volume,
+};
 use crate::platform::app_log;
 #[cfg(windows)]
 use crate::platform::autostart;
@@ -238,6 +242,8 @@ pub struct App {
     /// Latch Settings gesture recording to one pad (no cross-pad union).
     gesture_record_latch: GestureRecordLatch,
     pad_nav: PadNavBank,
+    /// When set, the next start cue may rumble this DualSense serial (pad-originated).
+    haptic_pad_serial: Option<String>,
     /// Keyboard Enter hold for replace-confirm (not folded into pad slots).
     keyboard_cross_hold: CrossHold,
     /// Keyboard Enter held (for hold-to-proceed on replace confirm / Cross press styling).
@@ -400,6 +406,7 @@ impl App {
             gesture_recorder: GestureRecorder::default(),
             gesture_record_latch: GestureRecordLatch::default(),
             pad_nav: PadNavBank::default(),
+            haptic_pad_serial: None,
             keyboard_cross_hold: CrossHold::default(),
             confirm_key_held: false,
             cancel_key_held: false,
@@ -724,7 +731,8 @@ impl App {
                         self.keyboard_cross_hold.update(self.confirm_key_held, now);
                     self.start_state.cross_progress = self.start_state.cross_progress.max(progress);
                     if completed {
-                        self.play_start_sound(UiSoundKind::Hold);
+                        self.haptic_pad_serial = None;
+                        self.play_start_cue(UiSoundKind::Hold);
                         return self.complete_replace_confirm();
                     }
                 }
@@ -732,12 +740,18 @@ impl App {
                 self.start_state.tick_hint_anims(now);
                 Task::none()
             }
-            Message::Start(message) => self.on_start_message(message),
+            Message::Start(message) => {
+                // Mouse / iced UI messages are not pad-originated.
+                self.haptic_pad_serial = None;
+                self.on_start_message(message)
+            }
             Message::StartKey {
                 id,
                 action,
                 pressed,
             } => {
+                // Keyboard is never pad-originated.
+                self.haptic_pad_serial = None;
                 if Some(id) == self.start_window && self.start_visible {
                     // Leftover-chord arming is pad-local; keyboard stays live.
                     return match action {
@@ -1299,6 +1313,8 @@ impl App {
             start_screen_gesture: self.prefs.start_screen_gesture.clone(),
             start_screen_sounds_enabled: self.prefs.start_screen_sounds_enabled,
             start_screen_sound_volume: self.prefs.start_screen_sound_volume,
+            start_screen_haptics_enabled: self.prefs.start_screen_haptics_enabled,
+            start_screen_haptics_strength: self.prefs.start_screen_haptics_strength,
             gesture_recording: self.gesture_recorder.is_active(),
             gesture_recording_live: {
                 let peak: Vec<_> = self.gesture_recorder.peak().iter().copied().collect();
@@ -1476,6 +1492,27 @@ impl App {
                     self.prefs.save();
                     if self.prefs.start_screen_sounds_enabled {
                         self.play_start_sound(UiSoundKind::Nav);
+                    }
+                }
+                Task::none()
+            }
+            ConfigureMessage::SetStartScreenHaptics(enabled) => {
+                self.prefs.start_screen_haptics_enabled = enabled;
+                self.prefs.save();
+                if enabled {
+                    self.preview_haptic_all(MotorPulse::NAV);
+                } else {
+                    self.hid_worker.rumble_stop_all();
+                }
+                Task::none()
+            }
+            ConfigureMessage::SetStartScreenHapticsStrength(strength) => {
+                let strength = clamp_start_screen_haptics_strength(strength);
+                if self.prefs.start_screen_haptics_strength != strength {
+                    self.prefs.start_screen_haptics_strength = strength;
+                    self.prefs.save();
+                    if self.prefs.start_screen_haptics_enabled {
+                        self.preview_haptic_all(MotorPulse::NAV);
                     }
                 }
                 Task::none()
@@ -2310,6 +2347,8 @@ impl App {
         self.start_nav_ready = false;
         self.start_revealed_at = None;
         self.reopen_needs_chord_release = true;
+        self.haptic_pad_serial = None;
+        self.hid_worker.rumble_stop_all();
         self.pad_nav.reset();
         self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
@@ -2395,13 +2434,13 @@ impl App {
                 if self.start_state.editing {
                     match self.edit_toggle_selected() {
                         Some(task) => {
-                            self.play_start_sound(UiSoundKind::Action);
+                            self.play_start_cue(UiSoundKind::Action);
                             scroll.chain(task)
                         }
                         None => scroll,
                     }
                 } else if self.launch_selected() {
-                    self.play_start_sound(UiSoundKind::Action);
+                    self.play_start_cue(UiSoundKind::Action);
                     scroll
                 } else {
                     scroll
@@ -2412,14 +2451,14 @@ impl App {
                     && self.start_state.controller_selected != index
                 {
                     self.start_state.controller_selected = index;
-                    self.play_start_sound(UiSoundKind::Nav);
+                    self.play_start_cue(UiSoundKind::Nav);
                 }
                 self.scroll_start_selection_into_view()
             }
             StartMessage::MoveUp => {
                 let direction = self.start_state.move_selection(-1);
                 if direction.is_some() {
-                    self.play_start_sound(UiSoundKind::Nav);
+                    self.play_start_cue(UiSoundKind::Nav);
                 }
                 self.scroll_start_selection_into_view_dir(
                     direction.unwrap_or(start_view::ScrollReveal::Up),
@@ -2428,7 +2467,7 @@ impl App {
             StartMessage::MoveDown => {
                 let direction = self.start_state.move_selection(1);
                 if direction.is_some() {
-                    self.play_start_sound(UiSoundKind::Nav);
+                    self.play_start_cue(UiSoundKind::Nav);
                 }
                 self.scroll_start_selection_into_view_dir(
                     direction.unwrap_or(start_view::ScrollReveal::Down),
@@ -2437,16 +2476,16 @@ impl App {
             StartMessage::Confirm => self.on_start_confirm(),
             StartMessage::Close => {
                 if self.start_state.manual_add.is_some() {
-                    self.play_start_sound(UiSoundKind::Action);
+                    self.play_start_cue(UiSoundKind::Action);
                     self.cancel_manual_add()
                 } else if self.start_state.replace_confirm.take().is_some() {
-                    self.play_start_sound(UiSoundKind::Action);
+                    self.play_start_cue(UiSoundKind::Action);
                     Task::none()
                 } else if self.start_state.editing {
-                    self.play_start_sound(UiSoundKind::Action);
+                    self.play_start_cue(UiSoundKind::Action);
                     self.cancel_start_edit()
                 } else if self.start_visible {
-                    self.play_start_sound(UiSoundKind::Action);
+                    self.play_start_cue(UiSoundKind::Action);
                     self.close_start_screen()
                 } else {
                     Task::none()
@@ -2461,8 +2500,12 @@ impl App {
                     self.refresh_start_rows();
                 }
                 // L2: Controllers → Games only (no wrap). Interruptible mid-anim.
-                self.start_state
-                    .request_slide(StartSlide::Games, Instant::now());
+                if self
+                    .start_state
+                    .request_slide(StartSlide::Games, Instant::now())
+                {
+                    self.play_start_cue(UiSoundKind::Slide);
+                }
                 Task::none()
             }
             StartMessage::NextSlide => {
@@ -2474,27 +2517,31 @@ impl App {
                     self.refresh_start_rows();
                 }
                 // R2: Games → Controllers only (no wrap). Interruptible mid-anim.
-                self.start_state
-                    .request_slide(StartSlide::Controllers, Instant::now());
+                if self
+                    .start_state
+                    .request_slide(StartSlide::Controllers, Instant::now())
+                {
+                    self.play_start_cue(UiSoundKind::Slide);
+                }
                 Task::none()
             }
             StartMessage::ToggleEdit => match self.toggle_start_edit() {
                 Some(task) => {
-                    self.play_start_sound(UiSoundKind::Action);
+                    self.play_start_cue(UiSoundKind::Action);
                     task
                 }
                 None => Task::none(),
             },
             StartMessage::CycleSort => match self.on_start_cycle_sort() {
                 Some(task) => {
-                    self.play_start_sound(UiSoundKind::Action);
+                    self.play_start_cue(UiSoundKind::Action);
                     task
                 }
                 None => Task::none(),
             },
             StartMessage::AddShortcut => {
                 if self.start_state.editing && !self.start_state.overlay_blocking() {
-                    self.play_start_sound(UiSoundKind::Action);
+                    self.play_start_cue(UiSoundKind::Action);
                     self.pick_manual_shortcut()
                 } else {
                     Task::none()
@@ -2504,7 +2551,7 @@ impl App {
                 let before = self.start_state.manual_add.is_some();
                 let task = self.begin_manual_edit();
                 if !before && self.start_state.manual_add.is_some() {
-                    self.play_start_sound(UiSoundKind::Action);
+                    self.play_start_cue(UiSoundKind::Action);
                 }
                 task
             }
@@ -2529,13 +2576,13 @@ impl App {
                 Task::none()
             }
             StartMessage::ManualPickIcon => {
-                self.play_start_sound(UiSoundKind::Action);
+                self.play_start_cue(UiSoundKind::Action);
                 self.pick_manual_icon()
             }
             StartMessage::ManualClearIcon => {
                 if let Some(draft) = self.start_state.manual_add.as_mut() {
                     draft.icon_path = None;
-                    self.play_start_sound(UiSoundKind::Action);
+                    self.play_start_cue(UiSoundKind::Action);
                 }
                 Task::none()
             }
@@ -2558,6 +2605,54 @@ impl App {
         }
         let volume = f32::from(self.prefs.start_screen_sound_volume) / 100.0;
         ui_sound::play(kind, volume);
+    }
+
+    /// Sound + optional pad haptic for a start-screen cue.
+    fn play_start_cue(&self, kind: UiSoundKind) {
+        self.play_start_sound(kind);
+        self.play_start_haptic(kind);
+    }
+
+    fn play_start_haptic(&self, kind: UiSoundKind) {
+        if !self.prefs.start_screen_haptics_enabled {
+            return;
+        }
+        let Some(serial) = self.haptic_pad_serial.as_ref() else {
+            return;
+        };
+        let pulse = match kind {
+            UiSoundKind::Nav => MotorPulse::NAV,
+            UiSoundKind::Action => MotorPulse::ACTION,
+            UiSoundKind::Hold => MotorPulse::HOLD,
+            UiSoundKind::Slide => MotorPulse::SLIDE,
+        };
+        let (right, left, duration) = pulse.scaled(self.prefs.start_screen_haptics_strength);
+        if right == 0 && left == 0 {
+            return;
+        }
+        self.hid_worker
+            .rumble(serial.clone(), right, left, duration.as_millis() as u64);
+    }
+
+    /// Preview haptic on every connected DualSense (settings toggle / strength slider).
+    fn preview_haptic_all(&self, pulse: MotorPulse) {
+        if !self.prefs.start_screen_haptics_enabled {
+            return;
+        }
+        let (right, left, duration) = pulse.scaled(self.prefs.start_screen_haptics_strength);
+        if right == 0 && left == 0 {
+            return;
+        }
+        let ms = duration.as_millis() as u64;
+        for controller in &self.controllers {
+            self.hid_worker
+                .rumble(controller.serial.clone(), right, left, ms);
+        }
+    }
+
+    fn set_haptic_pad_from_id(&mut self, pad: Option<&start_input::PadId>) {
+        self.haptic_pad_serial =
+            pad.and_then(|id| id.as_str().strip_prefix("hid:").map(|s| s.to_string()));
     }
 
     fn cancel_start_holds(&mut self) {
@@ -2763,7 +2858,7 @@ impl App {
 
     fn on_start_confirm(&mut self) -> Task<Message> {
         if self.start_state.manual_add.is_some() {
-            self.play_start_sound(UiSoundKind::Action);
+            self.play_start_cue(UiSoundKind::Action);
             return self.confirm_manual_add();
         }
         // Replace confirm requires hold-Cross / hold-Enter (see pad poll / key hold).
@@ -2773,14 +2868,14 @@ impl App {
         match self.start_state.slide {
             StartSlide::Games if self.start_state.editing => match self.edit_toggle_selected() {
                 Some(task) => {
-                    self.play_start_sound(UiSoundKind::Action);
+                    self.play_start_cue(UiSoundKind::Action);
                     task
                 }
                 None => Task::none(),
             },
             StartSlide::Games => {
                 if self.launch_selected() {
-                    self.play_start_sound(UiSoundKind::Action);
+                    self.play_start_cue(UiSoundKind::Action);
                 }
                 Task::none()
             }
@@ -2792,7 +2887,7 @@ impl App {
                     if self.identify(&serial) {
                         self.popup_state.begin_identify_flash(&serial);
                         self.start_state.begin_identify_flash(&serial);
-                        self.play_start_sound(UiSoundKind::Action);
+                        self.play_start_cue(UiSoundKind::Action);
                     }
                 }
                 Task::none()
@@ -3048,6 +3143,14 @@ impl App {
         self.pad_held = tick.held;
         self.sync_start_held();
 
+        // Pad-originated cues rumble the pad that fired (or completed a hold).
+        let haptic_pad = tick
+            .action_pad
+            .as_ref()
+            .or(tick.cross_completed_pad.as_ref())
+            .or(tick.triangle_completed_pad.as_ref());
+        self.set_haptic_pad_from_id(haptic_pad);
+
         let nav_task = if animating {
             self.start_state.tick_hint_anims(now);
             if let Some(action) = tick.action {
@@ -3071,7 +3174,11 @@ impl App {
             self.start_state.triangle_progress = 0.0;
             self.start_state.tick_hint_anims(now);
             if cross_completed {
-                self.play_start_sound(UiSoundKind::Hold);
+                // Keyboard-only complete: no pad serial → no rumble.
+                if k_completed && tick.cross_completed_pad.is_none() {
+                    self.haptic_pad_serial = None;
+                }
+                self.play_start_cue(UiSoundKind::Hold);
                 self.complete_replace_confirm()
             } else if tick.action == Some(NavAction::Cancel) {
                 self.keyboard_cross_hold.cancel();
@@ -3102,7 +3209,7 @@ impl App {
             if hold_cross_close {
                 self.start_state.cross_progress = tick.cross_progress;
                 if tick.cross_completed {
-                    self.play_start_sound(UiSoundKind::Hold);
+                    self.play_start_cue(UiSoundKind::Hold);
                     self.close_running_game_if_selected();
                 }
             } else {
@@ -3112,7 +3219,7 @@ impl App {
             if hold_triangle_power {
                 self.start_state.triangle_progress = tick.triangle_progress;
                 if tick.triangle_completed {
-                    self.play_start_sound(UiSoundKind::Hold);
+                    self.play_start_cue(UiSoundKind::Hold);
                     if let Some(row) = self.start_state.selected_controller()
                         && row.bluetooth
                     {
