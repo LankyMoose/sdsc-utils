@@ -1,4 +1,7 @@
 //! Connect, low-battery, and charge-complete edge detection for overlay toasts.
+//!
+//! Low battery fires only after an observed bucket moves from above the
+//! threshold into the low window. A pad that appears already low does not.
 
 use crate::controller::model::{ControllerStatus, PowerState};
 use crate::persist::prefs::Prefs;
@@ -92,11 +95,26 @@ impl NotifyTracker {
                 events.push((controller, NotifyKind::Connect));
             }
 
-            let was_low = prev.is_some_and(|p| p.is_low_battery(prefs.low_battery_percent));
-            if controller.is_low_battery(prefs.low_battery_percent) {
-                if !was_low && !flags.notified_low && prefs.notify_low {
+            let threshold = prefs.low_battery_percent;
+            if controller.is_low_battery(threshold) {
+                // Require a prior window above the threshold. A pad that connects
+                // (or is first seen) already inside the low window has not crossed.
+                let crossed = bucket_crossed_down(prev, controller.percent, threshold);
+                if crossed && !flags.notified_low && prefs.notify_low {
+                    diag_notify(format!(
+                        "ui-diag: low battery crossed serial={} from={}% to={}% threshold={threshold}",
+                        controller.serial,
+                        prev.map(|prior| prior.percent)
+                            .unwrap_or(controller.percent),
+                        controller.percent,
+                    ));
                     events.push((controller, NotifyKind::Low));
                     flags.notified_low = true;
+                } else if prev.is_none() && prefs.notify_low {
+                    diag_notify(format!(
+                        "ui-diag: low battery suppressed (appeared inside window) serial={} percent={} threshold={threshold}",
+                        controller.serial, controller.percent,
+                    ));
                 }
             } else {
                 flags.notified_low = false;
@@ -120,6 +138,19 @@ impl NotifyTracker {
 
         events
     }
+}
+
+/// The prior snapshot's battery window was above `threshold` and this snapshot
+/// is at or below it. Appearing already inside the low window is not a crossing.
+fn bucket_crossed_down(prev: Option<&ControllerStatus>, next_percent: u8, threshold: u8) -> bool {
+    prev.is_some_and(|prior| prior.percent > threshold) && next_percent <= threshold
+}
+
+fn diag_notify(message: impl AsRef<str>) {
+    #[cfg(debug_assertions)]
+    crate::platform::app_log::info(message);
+    #[cfg(not(debug_assertions))]
+    let _ = message;
 }
 
 fn format_event(
@@ -298,20 +329,23 @@ mod tests {
     }
 
     #[test]
-    fn connect_and_low_can_both_fire() {
+    fn connect_already_low_is_only_a_connect() {
         let mut tracker = NotifyTracker::new();
         let p = prefs(true, true, true);
         let low = vec![pad(
             "a",
             5,
             PowerState::Discharging,
-            crate::controller::model::Connection::Usb,
+            crate::controller::model::Connection::Bluetooth,
         )];
 
-        let events = tracker.collect_events(&[], &low, &p);
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].1, NotifyKind::Connect);
-        assert_eq!(events[1].1, NotifyKind::Low);
+        let events = tracker.evaluate(&[], &low, &p, |_| None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].body, "Connected");
+        assert_eq!(events[0].percent, Some(5));
+        assert!(!tracker.by_serial["a"].notified_low);
+
+        assert!(tracker.evaluate(&low, &low, &p, |_| None).is_empty());
     }
 
     #[test]
@@ -410,10 +444,85 @@ mod tests {
             crate::controller::model::Connection::Bluetooth,
         )];
 
-        assert_eq!(tracker.collect_events(&[], &low, &p).len(), 1);
+        assert!(tracker.collect_events(&[], &low, &p).is_empty());
+        assert!(!tracker.by_serial["a"].notified_low);
         assert!(tracker.collect_events(&low, &mid, &p).is_empty());
         assert!(!tracker.by_serial["a"].notified_low);
-        assert_eq!(tracker.collect_events(&mid, &low, &p).len(), 1);
+        let events = tracker.collect_events(&mid, &low, &p);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1, NotifyKind::Low);
+    }
+
+    #[test]
+    fn same_window_unplug_is_not_a_low_crossing() {
+        let mut tracker = NotifyTracker::new();
+        let p = prefs(true, true, false);
+        let charging = vec![pad(
+            "a",
+            5,
+            PowerState::Charging,
+            crate::controller::model::Connection::Usb,
+        )];
+        let discharging = vec![pad(
+            "a",
+            5,
+            PowerState::Discharging,
+            crate::controller::model::Connection::Usb,
+        )];
+
+        assert!(tracker.collect_events(&[], &charging, &p).is_empty());
+        assert!(
+            tracker
+                .collect_events(&charging, &discharging, &p)
+                .is_empty()
+        );
+        assert!(!tracker.by_serial["a"].notified_low);
+    }
+
+    #[test]
+    fn higher_window_then_low_while_unplugging_notifies() {
+        let mut tracker = NotifyTracker::new();
+        let p = prefs(true, true, false);
+        let charging = vec![pad(
+            "a",
+            15,
+            PowerState::Charging,
+            crate::controller::model::Connection::Usb,
+        )];
+        let low = vec![pad(
+            "a",
+            5,
+            PowerState::Discharging,
+            crate::controller::model::Connection::Usb,
+        )];
+
+        assert!(tracker.collect_events(&[], &charging, &p).is_empty());
+        let events = tracker.collect_events(&charging, &low, &p);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1, NotifyKind::Low);
+    }
+
+    #[test]
+    fn drop_inside_an_already_low_window_stays_quiet() {
+        let mut tracker = NotifyTracker::new();
+        let mut p = prefs(true, true, false);
+        p.low_battery_percent = 25;
+        let at_threshold = vec![pad(
+            "a",
+            25,
+            PowerState::Discharging,
+            crate::controller::model::Connection::Usb,
+        )];
+        let lower = vec![pad(
+            "a",
+            5,
+            PowerState::Discharging,
+            crate::controller::model::Connection::Usb,
+        )];
+
+        assert!(tracker.collect_events(&[], &at_threshold, &p).is_empty());
+        assert!(tracker.collect_events(&at_threshold, &lower, &p).is_empty());
+        assert!(!tracker.by_serial["a"].notified_low);
     }
 
     #[test]
