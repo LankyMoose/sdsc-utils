@@ -22,6 +22,8 @@ const REF_TEXT_FULL: f32 = 16.0;
 const REF_ETA_TEXT: f32 = 11.0;
 /// When ETA is present, shrink the percent a bit so the pair fits inside the ring.
 const ETA_PERCENT_SCALE: f32 = 0.78;
+/// Extra shrink for labels like `~10h 30m` (two-digit hours + minutes).
+const WIDE_ETA_SCALE: f32 = 0.88;
 /// Gap between percent and ETA as a fraction of ETA size.
 const ETA_GAP_FRAC: f32 = 0.12;
 /// Nudge the two-line block slightly up so ETA isn't tight against the lower arc.
@@ -40,7 +42,6 @@ pub fn percent_ring<'a, Message: 'a>(
     let percent = percent.min(100);
     let has_eta = eta.is_some();
     let percent_size = text_size(size, percent, has_eta);
-    let eta_size = eta_text_size(size);
 
     let ring = canvas_widget(PercentRing {
         percent,
@@ -58,6 +59,7 @@ pub fn percent_ring<'a, Message: 'a>(
         .color(theme::INK);
 
     let labels: Element<'a, Message> = if let Some(eta) = eta {
+        let eta_size = eta_text_size(size, &eta);
         let gap = eta_size * ETA_GAP_FRAC;
         column![
             percent_label,
@@ -101,8 +103,31 @@ fn text_size(ring_size: f32, percent: u8, has_eta: bool) -> f32 {
     base * (ring_size / REF_SIZE) * scale
 }
 
-fn eta_text_size(ring_size: f32) -> f32 {
-    REF_ETA_TEXT * (ring_size / REF_SIZE)
+fn eta_text_size(ring_size: f32, eta: &str) -> f32 {
+    let scale = if is_wide_eta_label(eta) {
+        WIDE_ETA_SCALE
+    } else {
+        1.0
+    };
+    REF_ETA_TEXT * (ring_size / REF_SIZE) * scale
+}
+
+/// True for floored labels with ≥10 hours and a minutes suffix (`~10h 30m`).
+fn is_wide_eta_label(eta: &str) -> bool {
+    let Some(rest) = eta.strip_prefix('~') else {
+        return false;
+    };
+    let Some((hours, mins)) = rest.split_once('h') else {
+        return false;
+    };
+    let Ok(hours) = hours.parse::<u64>() else {
+        return false;
+    };
+    if hours < 10 {
+        return false;
+    }
+    let mins = mins.trim();
+    !mins.is_empty() && mins.ends_with('m')
 }
 
 #[derive(Clone)]
@@ -207,5 +232,23 @@ mod tests {
         let expected = ring_start_angle() + Degrees(360.0);
         assert!((f32::from(end) - f32::from(expected)).abs() < f32::EPSILON);
         assert!(filled_end_angle(140).is_some());
+    }
+
+    #[test]
+    fn wide_eta_label_is_two_digit_hours_with_minutes() {
+        assert!(is_wide_eta_label("~10h 30m"));
+        assert!(is_wide_eta_label("~12h 30m"));
+        assert!(!is_wide_eta_label("~9h 30m"));
+        assert!(!is_wide_eta_label("~10h"));
+        assert!(!is_wide_eta_label("~40m"));
+        assert!(!is_wide_eta_label("~<5m"));
+    }
+
+    #[test]
+    fn wide_eta_text_is_scaled_down() {
+        let normal = eta_text_size(REF_SIZE, "~9h 30m");
+        let wide = eta_text_size(REF_SIZE, "~10h 30m");
+        assert!((normal - REF_ETA_TEXT).abs() < f32::EPSILON);
+        assert!((wide - REF_ETA_TEXT * WIDE_ETA_SCALE).abs() < f32::EPSILON);
     }
 }
