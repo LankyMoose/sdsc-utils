@@ -592,9 +592,9 @@ impl App {
             let pad_listening = pad_input_live
                 || (self.session.prefs.start_screen_enabled
                     && (!self.session.controllers.is_empty() || self.gesture_recorder.is_active()));
-            self.hid_worker
-                .as_ref()
-                .map(|w| w.set_input_hot(pad_listening));
+            if let Some(w) = self.hid_worker.as_ref() {
+                w.set_input_hot(pad_listening);
+            }
             if pad_listening {
                 subscriptions.push(Subscription::run(pad_input_edge_stream));
             }
@@ -927,7 +927,9 @@ impl App {
                 if self.client_mode {
                     crate::ipc::clear_command_client();
                 } else {
-                    self.hid_worker.as_ref().map(|w| w.shutdown());
+                    if let Some(w) = self.hid_worker.as_ref() {
+                        w.shutdown();
+                    }
                 }
                 self.tray_icon.take();
                 iced::exit()
@@ -1090,9 +1092,9 @@ impl App {
                             &crate::ipc::ShellCommand::SetLowBatteryTargets { targets },
                         );
                     } else {
-                        self.hid_worker
-                            .as_ref()
-                            .map(|w| w.set_low_battery_targets(targets));
+                        if let Some(w) = self.hid_worker.as_ref() {
+                            w.set_low_battery_targets(targets);
+                        }
                     }
                 }
                 SessionEffect::QueueNotifications {
@@ -1573,7 +1575,9 @@ impl App {
                 } else if self.client_mode {
                     let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RumbleStopAll);
                 } else {
-                    self.hid_worker.as_ref().map(|w| w.rumble_stop_all());
+                    if let Some(w) = self.hid_worker.as_ref() {
+                        w.rumble_stop_all();
+                    }
                 }
                 Task::none()
             }
@@ -1721,7 +1725,9 @@ impl App {
                 let _ =
                     crate::ipc::send_command(&crate::ipc::ShellCommand::SetRgb { serial, color });
             } else {
-                self.hid_worker.as_ref().map(|w| w.set_rgb(serial, color));
+                if let Some(w) = self.hid_worker.as_ref() {
+                    w.set_rgb(serial, color);
+                }
             }
         }
         Task::none()
@@ -1783,9 +1789,9 @@ impl App {
                 serial: serial.to_string(),
             });
         } else {
-            self.hid_worker
-                .as_ref()
-                .map(|w| w.power_off(serial.to_string()));
+            if let Some(w) = self.hid_worker.as_ref() {
+                w.power_off(serial.to_string());
+            }
         }
     }
 
@@ -2465,7 +2471,9 @@ impl App {
         if self.client_mode {
             let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RumbleStopAll);
         } else {
-            self.hid_worker.as_ref().map(|w| w.rumble_stop_all());
+            if let Some(w) = self.hid_worker.as_ref() {
+                w.rumble_stop_all();
+            }
         }
         self.pad_nav.reset();
         self.keyboard_cross_hold.reset();
@@ -2757,9 +2765,9 @@ impl App {
                 duration_ms: duration.as_millis() as u64,
             });
         } else {
-            self.hid_worker
-                .as_ref()
-                .map(|w| w.rumble(serial.clone(), right, left, duration.as_millis() as u64));
+            if let Some(w) = self.hid_worker.as_ref() {
+                w.rumble(serial.clone(), right, left, duration.as_millis() as u64);
+            }
         }
     }
 

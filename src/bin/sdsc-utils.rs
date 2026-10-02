@@ -252,7 +252,7 @@ fn set_lightbar_cli(rgb_args: &[String]) -> ExitCode {
 
     let any_gamepad = hidapi::HidApi::new()
         .ok()
-        .map(|api| api.device_list().any(|d| controller::driver::is_gamepad(d)))
+        .map(|api| api.device_list().any(controller::driver::is_gamepad))
         .unwrap_or(false);
     if !any_gamepad {
         eprintln!("error: no DualSense controllers found");

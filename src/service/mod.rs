@@ -299,25 +299,23 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             && session.prefs.start_screen_enabled
             && !start_visible
             && pipe.client_count() == 0
-        {
-            if let start_input::NavReadingsOutcome::Readings { readings, .. } =
+            && let start_input::NavReadingsOutcome::Readings { readings, .. } =
                 start_input::read_nav_readings()
-            {
-                if reopen_needs_release {
-                    let chord = &session.prefs.start_screen_gesture;
-                    let still_held = readings
-                        .iter()
-                        .any(|r| chord.iter().all(|c| r.sample.held.contains(c)));
-                    if !still_held {
-                        reopen_needs_release = false;
-                        gesture_detectors.reset();
-                    }
-                } else if !session.prefs.start_screen_gesture.is_empty()
-                    && gesture_detectors.update(&session.prefs.start_screen_gesture, &readings)
-                {
-                    reopen_needs_release = true;
-                    pending_open_start = true;
+        {
+            if reopen_needs_release {
+                let chord = &session.prefs.start_screen_gesture;
+                let still_held = readings
+                    .iter()
+                    .any(|r| chord.iter().all(|c| r.sample.held.contains(c)));
+                if !still_held {
+                    reopen_needs_release = false;
+                    gesture_detectors.reset();
                 }
+            } else if !session.prefs.start_screen_gesture.is_empty()
+                && gesture_detectors.update(&session.prefs.start_screen_gesture, &readings)
+            {
+                reopen_needs_release = true;
+                pending_open_start = true;
             }
         }
 

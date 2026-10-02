@@ -951,10 +951,8 @@ fn sample_serial_into_snapshot(
             } else {
                 None
             };
-            if input_hot {
-                if let Some(edge) = edge {
-                    start_input::push_input_edge(edge);
-                }
+            if input_hot && let Some(edge) = edge {
+                start_input::push_input_edge(edge);
             }
         }
         SampleOneResult::Timeout | SampleOneResult::HardFail => {}
@@ -1002,6 +1000,7 @@ fn maybe_log_sample_stall(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn begin_identify(
     cache: &mut DeviceCache,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
@@ -1367,21 +1366,21 @@ fn handle_cmd(
                 poll::poll_controllers_timed(&cache.api, &previously)
             };
             // Seed live map from Poll so a hot transition has immediate statuses.
-            if let Ok(ref controllers) = result {
-                if let Ok(mut guard) = live_pads.lock() {
-                    for c in controllers {
-                        guard.insert(
-                            normalize_identity(&c.serial),
-                            LivePadStatus {
-                                product: c.product.clone(),
-                                reading: battery::BatteryReading {
-                                    percent: c.percent,
-                                    state: c.state,
-                                    connection: c.connection,
-                                },
+            if let Ok(ref controllers) = result
+                && let Ok(mut guard) = live_pads.lock()
+            {
+                for c in controllers {
+                    guard.insert(
+                        normalize_identity(&c.serial),
+                        LivePadStatus {
+                            product: c.product.clone(),
+                            reading: battery::BatteryReading {
+                                percent: c.percent,
+                                state: c.state,
+                                connection: c.connection,
                             },
-                        );
-                    }
+                        },
+                    );
                 }
             }
             log_cmd(

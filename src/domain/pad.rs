@@ -93,16 +93,16 @@ pub fn clear_service_edge_sender() {
 
 /// Push a sample edge to the UI / service bridge (no-op when nothing is listening).
 pub fn push_input_edge(edge: InputEdge) {
-    if let Ok(mut guard) = INPUT_EDGE_TX.lock() {
-        if let Some(tx) = guard.as_mut() {
-            // Prefer a fresh sample over blocking the HID thread.
-            let _ = tx.try_send(edge.clone());
-        }
+    if let Ok(mut guard) = INPUT_EDGE_TX.lock()
+        && let Some(tx) = guard.as_mut()
+    {
+        // Prefer a fresh sample over blocking the HID thread.
+        let _ = tx.try_send(edge.clone());
     }
-    if let Ok(guard) = SERVICE_EDGE_TX.lock() {
-        if let Some(tx) = guard.as_ref() {
-            let _ = tx.try_send(edge);
-        }
+    if let Ok(guard) = SERVICE_EDGE_TX.lock()
+        && let Some(tx) = guard.as_ref()
+    {
+        let _ = tx.try_send(edge);
     }
 }
 

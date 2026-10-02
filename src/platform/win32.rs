@@ -90,6 +90,9 @@ impl Drop for ThreadQuitGuard {
 /// Toast stays topmost so it clears Cursor / games. When Settings / Start /
 /// popup are open, raise those HWNDs into the same topmost band *after* the
 /// toast (see [`raise_topmost`]) so they keep presents (iced#3108 / #3320).
+///
+/// # Safety
+/// `hwnd` must be a valid Win32 window handle owned by this process.
 pub unsafe fn apply_noactivate_exstyle(hwnd: isize, topmost: bool) {
     unsafe {
         let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
@@ -112,6 +115,9 @@ pub unsafe fn apply_noactivate_exstyle(hwnd: isize, topmost: bool) {
 }
 
 /// Pin `hwnd` to the top of the topmost band without activating it.
+///
+/// # Safety
+/// `hwnd` must be a valid Win32 window handle owned by this process.
 pub unsafe fn raise_topmost(hwnd: isize) {
     unsafe {
         let _ = SetWindowPos(
@@ -127,6 +133,9 @@ pub unsafe fn raise_topmost(hwnd: isize) {
 }
 
 /// Force Win32 to repaint `hwnd` (helps iced pick up a new toast view).
+///
+/// # Safety
+/// `hwnd` must be a valid Win32 window handle owned by this process.
 pub unsafe fn invalidate_hwnd(hwnd: isize) {
     unsafe {
         let _ = RedrawWindow(

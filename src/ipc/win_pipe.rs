@@ -11,7 +11,7 @@ use crate::persist::paths;
 use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -38,15 +38,15 @@ fn write_port(port: u16) -> Result<(), String> {
 fn read_port() -> Result<u16, String> {
     if let Ok(endpoint) = std::env::var(SHELL_PIPE_ENV) {
         // Service sets this to the decimal port for the shell child.
-        if let Ok(port) = endpoint.parse::<u16>() {
-            if port > 1 {
-                return Ok(port);
-            }
+        if let Ok(port) = endpoint.parse::<u16>()
+            && port > 1
+        {
+            return Ok(port);
         }
-        if let Some(port) = endpoint.rsplit(':').next().and_then(|s| s.parse().ok()) {
-            if port > 1 {
-                return Ok(port);
-            }
+        if let Some(port) = endpoint.rsplit(':').next().and_then(|s| s.parse().ok())
+            && port > 1
+        {
+            return Ok(port);
         }
     }
     let bound = BOUND_PORT.load(Ordering::SeqCst);
@@ -87,10 +87,7 @@ impl PipeServer {
     }
 
     pub fn try_recv_command(&self) -> Option<ShellCommand> {
-        match self.from_client.try_recv() {
-            Ok(cmd) => Some(cmd),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-        }
+        self.from_client.try_recv().ok()
     }
 
     pub fn send(&self, msg: ServiceMessage) -> Result<(), String> {
@@ -152,14 +149,9 @@ fn accept_loop(listener: TcpListener, cmd_tx: Sender<ShellCommand>, clients: Cli
         }
         let cmd_tx2 = cmd_tx.clone();
         thread::spawn(move || {
-            loop {
-                match recv_message::<_, ShellCommand>(&mut reader) {
-                    Ok(cmd) => {
-                        if cmd_tx2.send(cmd).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok(cmd) = recv_message::<_, ShellCommand>(&mut reader) {
+                if cmd_tx2.send(cmd).is_err() {
+                    break;
                 }
             }
         });
