@@ -4,29 +4,20 @@ use crate::controller::dualsense::identity::{
     is_dualsense_device, is_storable_serial, normalize_identity, resolve_device_identity,
 };
 use crate::controller::model::ControllerKind;
+use crate::domain::protocol::{
+    BT_CONTROL_FEATURE_REPORT, BT_CONTROL_FEATURE_SIZE, BT_CONTROL_FEATURE_SIZE_ALT,
+    BT_CONTROL_FEATURE_SIZE_PADDED, BT_REPORT_FULL, BT_REPORT_SIZE, BT_REPORT_TRUNCATED,
+    CALIBRATION_FEATURE_REPORT, CALIBRATION_FEATURE_SIZE, USB_REPORT_ID, USB_REPORT_SIZE,
+};
 use crate::platform::app_log;
 use hidapi::{BusType, HidApi, HidDevice};
 use std::thread;
 use std::time::Duration;
 
 pub use crate::controller::model::{Connection, ControllerStatus, PowerState};
-const USB_REPORT_SIZE: usize = 64;
-const BT_REPORT_SIZE: usize = 78;
 const USB_POWER_OFFSET: usize = 53;
 const BT_POWER_OFFSET: usize = 54;
 
-const BT_REPORT_TRUNCATED: u8 = 0x01;
-const BT_REPORT_FULL: u8 = 0x31;
-const USB_REPORT_ID: u8 = 0x01;
-const CALIBRATION_FEATURE_REPORT: u8 = 0x05;
-const CALIBRATION_FEATURE_SIZE: usize = 41;
-/// DualSense Bluetooth control feature report (dualsensectl / HID descriptor).
-/// Descriptor Report Count for ID 0x08 is 47 data bytes → 48 with report ID.
-const BT_CONTROL_FEATURE_REPORT: u8 = 0x08;
-const BT_CONTROL_FEATURE_SIZE: usize = 48;
-/// dualsensectl historically used 47; keep as a Windows fallback size.
-const BT_CONTROL_FEATURE_SIZE_ALT: usize = 47;
-const BT_CONTROL_FEATURE_SIZE_PADDED: usize = 64;
 const BT_CONTROL_OFF: u8 = 0x02;
 /// Feature-report CRC seeds: Linux hid-playstation uses 0xA3; dualsensectl uses 0x53.
 const FEATURE_CRC32_SEEDS: [u8; 2] = [0xA3, 0x53];
@@ -77,7 +68,7 @@ fn dedupe_statuses(mut statuses: Vec<ControllerStatus>) -> Vec<ControllerStatus>
 
 pub fn dualsense_status(
     index: usize,
-    product: &'static str,
+    product: impl Into<String>,
     connection: Connection,
     serial: String,
     percent: u8,
@@ -86,7 +77,7 @@ pub fn dualsense_status(
     ControllerStatus {
         index,
         kind: ControllerKind::DualSense,
-        product,
+        product: product.into(),
         connection,
         serial,
         percent,

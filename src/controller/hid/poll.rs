@@ -2,13 +2,13 @@
 //!
 //! Also owns the presence / battery / liveness cadence used by the iced daemon.
 
-use crate::controller::driver::{self, ControllerDriver};
+use crate::controller::driver;
 use crate::controller::dualsense::battery;
 use crate::controller::dualsense::identity::{self as dualsense, hid_serial, is_storable_serial};
 use crate::controller::dualsense::lightbar::{self, HidPhaseTiming};
-use crate::controller::model::{ControllerKind, ControllerStatus};
+use crate::controller::model::ControllerStatus;
+use crate::domain::color::color_for_battery_percent;
 use crate::platform::app_log;
-use crate::ui::color::color_for_battery_percent;
 use hidapi::{DeviceInfo, HidApi};
 use std::time::{Duration, Instant};
 
@@ -56,21 +56,18 @@ fn dedupe_polled(mut pads: Vec<PolledPad>) -> Vec<PolledPad> {
 }
 
 fn status_from_reading(
-    driver: &dyn ControllerDriver,
-    product: &'static str,
+    product: &str,
     reading: &battery::BatteryReading,
     serial: String,
 ) -> ControllerStatus {
-    match driver.kind() {
-        ControllerKind::DualSense => battery::dualsense_status(
-            0,
-            product,
-            reading.connection,
-            serial,
-            reading.percent,
-            reading.state,
-        ),
-    }
+    battery::dualsense_status(
+        0,
+        product,
+        reading.connection,
+        serial,
+        reading.percent,
+        reading.state,
+    )
 }
 
 /// Poll connected pads and reassert lightbar RGB where supported.
@@ -102,11 +99,10 @@ fn poll_controllers_with_api(
     previously_connected: &[String],
     timing: &mut HidPhaseTiming,
 ) -> Result<Vec<ControllerStatus>, String> {
-    let registry = driver::registry();
     let enum_started = Instant::now();
     let devices: Vec<&DeviceInfo> = api
         .device_list()
-        .filter(|d| registry.for_gamepad(d).is_some())
+        .filter(|d| driver::is_gamepad(d))
         .collect();
     timing.enumerate_ms += enum_started.elapsed().as_millis();
 
@@ -118,10 +114,10 @@ fn poll_controllers_with_api(
     let mut pads = Vec::with_capacity(devices.len());
 
     for info in devices {
-        let Some(drv) = registry.for_gamepad(info) else {
+        if !driver::is_gamepad(info) {
             continue;
-        };
-        let product = drv.product_name(info.product_id());
+        }
+        let product = dualsense::product_name(info.product_id());
         let hid = hid_serial(info);
 
         let open_started = Instant::now();
@@ -151,8 +147,8 @@ fn poll_controllers_with_api(
         };
 
         let io_started = Instant::now();
-        let serial = drv.identity(info, &device);
-        match drv.read_battery(&device) {
+        let serial = dualsense::resolve_device_identity(info, &device);
+        match battery::read_battery(&device) {
             Ok(reading) => {
                 timing.io_ms += io_started.elapsed().as_millis();
                 // Drop the read handle before lightbar: DualSense Windows handles that
@@ -160,7 +156,7 @@ fn poll_controllers_with_api(
                 // without updating the bar (see write_rgb_exclusive).
                 drop(device);
                 pads.push(PolledPad {
-                    status: status_from_reading(drv, product, &reading, serial),
+                    status: status_from_reading(product, &reading, serial),
                 });
             }
             Err(err) => {
@@ -211,7 +207,7 @@ fn poll_controllers_with_api(
             let (result, t) = lightbar::apply_lightbar_rgb_timed(api, &pad.status.serial, color);
             timing.add_assign(t);
             if let Err(err) = result {
-                lightbar::warn_lightbar(pad.status.product, err);
+                lightbar::warn_lightbar(&pad.status.product, err);
             }
         }
     }

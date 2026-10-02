@@ -119,7 +119,7 @@ mod active {
         {
             let fg = crate::games::process_match::foreground_process_name()
                 .unwrap_or_else(|| "?".into());
-            let fs = u8::from(crate::ui::start::input::foreground_is_exclusive_fullscreen());
+            let fs = u8::from(crate::domain::pad::foreground_is_exclusive_fullscreen());
             format!("steam={steam} fg={fg} fs={fs}")
         }
         #[cfg(not(windows))]

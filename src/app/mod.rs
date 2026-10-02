@@ -7,9 +7,7 @@
 //! open — Start uses a normal OS window open).
 
 use crate::controller::dualsense::identity as dualsense;
-use crate::controller::dualsense::lightbar::{
-    self, LOW_BATTERY_ORANGE, LOW_BATTERY_PULSE_GAP_MS, LOW_BATTERY_PULSE_ON_MS,
-};
+use crate::controller::dualsense::lightbar;
 use crate::controller::dualsense::rumble::MotorPulse;
 #[cfg(feature = "dev-emulate")]
 use crate::controller::emulate::{self, Preset};
@@ -25,7 +23,7 @@ use crate::games::process_match::{self, RunningSession};
 use crate::games::steam::{self, SteamGame};
 use crate::games::{self, GamesCatalog};
 use crate::persist::analytics::{self, AnalyticsStore};
-use crate::persist::notify::{NotifyEvent, NotifyTracker};
+use crate::persist::notify::NotifyEvent;
 use crate::persist::paths;
 use crate::persist::prefs::{
     Prefs, clamp_low_battery_percent, clamp_start_screen_haptics_strength,
@@ -38,7 +36,7 @@ use crate::platform::crash_restart;
 use crate::platform::ui_sound::{self, UiSoundKind};
 #[cfg(windows)]
 use crate::platform::win32;
-use crate::ui::color::{self, BatterySpectrum, color_for_battery_percent};
+use crate::ui::color::{self, BatterySpectrum};
 use crate::ui::configure::{
     self as configure_view, AnalyticsPadRow, AnalyticsPanel, ConfigureMessage, ConfigureSettings,
     ConfigureState, NotificationSetting, PadInputPanel, Section,
@@ -61,6 +59,7 @@ use crate::ui::toast::machine::{self as toast_machine, AfterToast, Effect as Toa
 use crate::ui::toast::view as toast_view;
 use crate::ui::tray::{self, QUIT_ID, SETTINGS_ID};
 
+use iced::futures::SinkExt;
 use iced::futures::Stream;
 use iced::futures::StreamExt;
 use iced::futures::channel::{mpsc, oneshot};
@@ -68,11 +67,11 @@ use iced::keyboard;
 use iced::widget::{container, operation, space};
 use iced::{Element, Point, Size, Subscription, Task, Theme, stream, window};
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -82,11 +81,8 @@ use tray_icon::TrayIcon;
 const SPECTRUM_DEBOUNCE: Duration = Duration::from_millis(150);
 /// How long an overlay toast stays on screen.
 const TOAST_LIFETIME: Duration = Duration::from_secs(5);
-/// Ignore 0→1 auto-open briefly after the last pad vanished (BT ghost flaps).
-const START_CONNECT_COOLDOWN: Duration = Duration::from_secs(5);
-/// Nonempty stretch shorter than this is an arrival blip — do not arm ghost cooldown.
-const MIN_CONNECT_STRETCH: Duration = Duration::from_secs(2);
 /// DualSense poll rate while pad input is live (~one wired report).
+#[allow(dead_code)] // documentation / parity with worker ACTIVE_POLL
 const PAD_POLL_ACTIVE: Duration = Duration::from_millis(4);
 /// UI animation tick (~60Hz). Prefer this over `window::frames()` so an
 /// AlwaysOnTop toast cannot starve other iced windows on Windows (iced#3108).
@@ -138,8 +134,10 @@ pub enum Message {
         action: StartKeyAction,
         pressed: bool,
     },
-    /// Periodic DualSense sample for gestures / start-screen navigation.
-    PadPoll,
+    /// Pad input edge from the hid-worker (report-rate; replaces UI PadPoll timer).
+    PadInput(crate::domain::pad::InputEdge),
+    /// Message from the HID/tray service (shell-client mode).
+    Service(crate::ipc::ServiceMessage),
     ManualFilePicked(Option<PathBuf>),
     ManualIconPicked(Option<PathBuf>),
     SteamScanDone(Result<Vec<SteamGame>, String>),
@@ -176,15 +174,11 @@ pub enum StartKeyAction {
 }
 
 pub struct App {
-    prefs: Prefs,
-    known: KnownControllers,
-    notify: NotifyTracker,
-    analytics: AnalyticsStore,
+    session: crate::session::DeviceSession,
     games: GamesCatalog,
     /// In-progress start-screen edit checklist; committed on Save, discarded on Cancel.
     edit_draft: Option<GamesCatalog>,
 
-    controllers: Vec<ControllerStatus>,
     /// Last HID presence snapshot (serials), used to detect connect/disconnect.
     last_discovered: Vec<String>,
     last_battery_poll: Instant,
@@ -193,10 +187,11 @@ pub struct App {
     identifying: Arc<AtomicBool>,
     /// True while a background battery poll is in flight.
     refreshing: Arc<AtomicBool>,
-    /// Controllers currently in the critical low-battery bucket (serial, percent).
-    low_battery: Arc<Mutex<Vec<(String, u8)>>>,
     /// Serializes DualSense HID for the daemon (never on the UI thread).
-    hid_worker: HidWorkerHandle,
+    /// `None` in shell-client mode (service owns HID).
+    hid_worker: Option<HidWorkerHandle>,
+    /// True when this process is the iced shell attached to the service.
+    client_mode: bool,
 
     tray_icon: Option<TrayIcon>,
     tray_anchor: TrayAnchor,
@@ -223,16 +218,6 @@ pub struct App {
     start_state: start_view::State,
     /// True while an rfd picker is open from the start screen (suppress unfocus-close).
     start_file_dialog_open: bool,
-    /// After last pad disconnect, suppress 0→1 auto-open briefly.
-    start_connect_cooldown_until: Option<Instant>,
-    /// Set by intentional Power Off; next 1→0 must not arm connect cooldown.
-    skip_next_connect_cooldown: bool,
-    /// When the controller list last became nonempty (short-arrival cooldown gate).
-    controllers_nonempty_since: Option<Instant>,
-    /// Consecutive poll misses per serial (hold one miss before accepting drop).
-    missed_poll_counts: HashMap<String, u8>,
-    /// 0→1 auto-open requested; cleared once Start is visible, retried on close-in-flight.
-    start_auto_open_pending: bool,
     /// After hide / connect-reveal: ignore reopen until the chord is fully released.
     reopen_needs_chord_release: bool,
     /// When Start was last revealed (unfocus grace).
@@ -320,15 +305,28 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     run_app()
 }
 
+/// Iced shell attached to the HID/tray service (no local DualSense HID owner).
+pub fn run_shell_client() -> Result<(), Box<dyn std::error::Error>> {
+    crate::platform::app_log::info("shell: client mode (service owns HID + tray)");
+    // Wait briefly for the service pipe to come up.
+    for _ in 0..50 {
+        if crate::ipc::PipeClient::connect().is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    run_app_as_client()
+}
+
 fn run_app(
     #[cfg(feature = "dev-emulate")] dev_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::platform::wgpu_diag::log_adapters_at_boot();
 
     #[cfg(feature = "dev-emulate")]
-    let boot = move || App::boot(dev_mode);
+    let boot = move || App::boot(dev_mode, false);
     #[cfg(not(feature = "dev-emulate"))]
-    let boot = App::boot;
+    let boot = || App::boot(false);
 
     iced::daemon(boot, App::update, App::view)
         .subscription(App::subscription)
@@ -340,12 +338,27 @@ fn run_app(
     Ok(())
 }
 
+fn run_app_as_client() -> Result<(), Box<dyn std::error::Error>> {
+    crate::platform::wgpu_diag::log_adapters_at_boot();
+    let boot = || App::boot(true);
+    iced::daemon(boot, App::update, App::view)
+        .subscription(App::subscription)
+        .title(App::title)
+        .theme(App::theme)
+        .antialiasing(true)
+        .run()?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
 impl App {
-    fn boot(#[cfg(feature = "dev-emulate")] dev_mode: bool) -> (Self, Task<Message>) {
+    fn boot(
+        #[cfg(feature = "dev-emulate")] dev_mode: bool,
+        client_mode: bool,
+    ) -> (Self, Task<Message>) {
         let prefs = Prefs::load();
         let known = KnownControllers::load();
         let analytics = AnalyticsStore::load();
@@ -354,30 +367,35 @@ impl App {
         lightbar::set_enabled(prefs.lightbar_enabled);
 
         #[cfg(windows)]
-        autostart::ensure_quiet_entry();
+        if !client_mode {
+            autostart::ensure_quiet_entry();
+        }
 
-        let hid_worker = HidWorkerHandle::start();
-        let identifying = hid_worker.identifying();
-        let low_battery = Arc::new(Mutex::new(Vec::new()));
-        start_low_battery_pulse_thread(hid_worker.clone(), Arc::clone(&low_battery));
+        let (hid_worker, identifying) = if client_mode {
+            (None, Arc::new(AtomicBool::new(false)))
+        } else {
+            let worker = HidWorkerHandle::start();
+            let identifying = worker.identifying();
+            (Some(worker), identifying)
+        };
 
         let configure_state = ConfigureState::new(prefs.spectrum.clone());
+        let session = crate::session::DeviceSession::new(prefs, known, analytics);
 
-        let last_discovered = hid_worker.presence_paths();
+        let last_discovered = hid_worker
+            .as_ref()
+            .map(|w| w.presence_paths())
+            .unwrap_or_default();
         let mut app = Self {
-            prefs,
-            known,
-            notify: NotifyTracker::new(),
-            analytics,
+            session,
             games,
             edit_draft: None,
-            controllers: Vec::new(),
             last_discovered,
             last_battery_poll: Instant::now(),
             identifying,
             refreshing: Arc::new(AtomicBool::new(false)),
-            low_battery,
             hid_worker,
+            client_mode,
             tray_icon: None,
             tray_anchor: TrayAnchor::default(),
             popup_window: None,
@@ -395,11 +413,6 @@ impl App {
             start_nav_ready: false,
             start_state: start_view::State::default(),
             start_file_dialog_open: false,
-            start_connect_cooldown_until: None,
-            skip_next_connect_cooldown: false,
-            controllers_nonempty_since: None,
-            missed_poll_counts: HashMap::new(),
-            start_auto_open_pending: false,
             reopen_needs_chord_release: false,
             start_revealed_at: None,
             gesture_detectors: GestureDetectorBank::default(),
@@ -444,10 +457,10 @@ impl App {
             dev_paused_percent: None,
         };
 
-        // Show the tray immediately, then poll in the background so a stuck HID
-        // read cannot delay the icon for tens of seconds. Pre-create the toast
-        // window hidden so iced keeps a warm GPU compositor for overlays.
-        app.create_tray();
+        // Show the tray immediately (standalone only — service owns the tray in client mode).
+        if !client_mode {
+            app.create_tray();
+        }
         #[cfg(all(windows, debug_assertions))]
         start_hitch_hotkey_worker();
         app.sync_popup_rows();
@@ -528,16 +541,25 @@ impl App {
                 }
                 _ => None,
             }),
-            iced::time::every(
-                if self.prefs.start_screen_enabled && self.controllers.is_empty() {
-                    PRESENCE_INTERVAL_EMPTY
-                } else {
-                    PRESENCE_INTERVAL
-                },
-            )
-            .map(|_| Message::Tick),
-            Subscription::run(tray_events_mapped),
         ];
+
+        if !self.client_mode {
+            subscriptions.push(
+                iced::time::every(
+                    if self.session.prefs.start_screen_enabled
+                        && self.session.controllers.is_empty()
+                    {
+                        PRESENCE_INTERVAL_EMPTY
+                    } else {
+                        PRESENCE_INTERVAL
+                    },
+                )
+                .map(|_| Message::Tick),
+            );
+            subscriptions.push(Subscription::run(tray_events_mapped));
+        } else {
+            subscriptions.push(Subscription::run(service_message_stream));
+        }
 
         if self.toast_message.is_some() {
             subscriptions.push(Subscription::run_with(
@@ -559,12 +581,21 @@ impl App {
         let pad_input_live =
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
         let pad_listening = pad_input_live
-            || (self.prefs.start_screen_enabled
-                && (!self.controllers.is_empty() || self.gesture_recorder.is_active()));
+            || (self.session.prefs.start_screen_enabled
+                && (!self.session.controllers.is_empty() || self.gesture_recorder.is_active()));
         // Fast path whenever we are listening — reopen gesture needs the same cadence.
-        self.hid_worker.set_input_hot(pad_listening);
-        if pad_listening {
-            subscriptions.push(iced::time::every(PAD_POLL_ACTIVE).map(|_| Message::PadPoll));
+        if self.client_mode {
+            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetInputHot {
+                hot: pad_listening,
+            });
+            // Edges arrive as ServiceMessage::PadInput; no local worker channel.
+        } else {
+            self.hid_worker
+                .as_ref()
+                .map(|w| w.set_input_hot(pad_listening));
+            if pad_listening {
+                subscriptions.push(Subscription::run(pad_input_edge_stream));
+            }
         }
 
         if self.start_visible && self.start_state.needs_frames() {
@@ -576,8 +607,12 @@ impl App {
 
     fn view(&self, window: window::Id) -> Element<'_, Message> {
         if Some(window) == self.popup_window {
-            return popup_view::view(&self.popup_state, &self.popup_rows, &self.prefs.spectrum)
-                .map(Message::Popup);
+            return popup_view::view(
+                &self.popup_state,
+                &self.popup_rows,
+                &self.session.prefs.spectrum,
+            )
+            .map(Message::Popup);
         }
 
         if Some(window) == self.configure_window {
@@ -591,8 +626,12 @@ impl App {
         }
 
         if Some(window) == self.start_window {
-            return start_view::view(&self.start_state, &self.prefs.spectrum, Instant::now())
-                .map(Message::Start);
+            return start_view::view(
+                &self.start_state,
+                &self.session.prefs.spectrum,
+                Instant::now(),
+            )
+            .map(Message::Start);
         }
 
         if Some(window) == self.toast_window {
@@ -637,14 +676,15 @@ impl App {
                 } else if Some(id) == self.start_window {
                     self.start_window = None;
                     self.start_visible = false;
+                    self.report_start_visible(false);
                     self.start_nav_ready = false;
                     self.pad_nav.reset();
                     self.clear_start_nav_diag();
                     self.consume_reopen_gesture_chord();
                     let sync = self.sync_toast_zorder();
-                    if self.start_auto_open_pending
-                        && self.prefs.start_screen_enabled
-                        && !self.controllers.is_empty()
+                    if self.session.start_auto_open_pending
+                        && self.session.prefs.start_screen_enabled
+                        && !self.session.controllers.is_empty()
                     {
                         crate::controller::hid::diag::diag_info(
                             "ui-diag: retry start open after close",
@@ -800,7 +840,8 @@ impl App {
                 }
                 Task::none()
             }
-            Message::PadPoll => self.on_pad_poll(),
+            Message::PadInput(edge) => self.on_pad_input(edge),
+            Message::Service(msg) => self.on_service_message(msg),
             Message::ManualFilePicked(path) => self.on_manual_file_picked(path),
             Message::ManualIconPicked(path) => self.on_manual_icon_picked(path),
             Message::SteamScanDone(result) => self.on_steam_scan_done(result),
@@ -810,7 +851,7 @@ impl App {
                     return Task::none();
                 }
                 // Sync placement (Win32 work area on Windows); no monitor_size hop.
-                let placement = toast_placement(self.prefs.toast_position, None);
+                let placement = toast_placement(self.session.prefs.toast_position, None);
                 self.toast_placement = Some(placement);
                 let start = Point::new(placement.x, placement.outside_y);
                 let percent = self
@@ -873,8 +914,12 @@ impl App {
             Message::SpectrumCommit(generation) => self.on_spectrum_commit(generation),
 
             Message::Exit => {
-                self.known.save();
-                self.hid_worker.shutdown();
+                self.session.known.save();
+                if self.client_mode {
+                    crate::ipc::clear_command_client();
+                } else {
+                    self.hid_worker.as_ref().map(|w| w.shutdown());
+                }
                 self.tray_icon.take();
                 iced::exit()
             }
@@ -886,12 +931,12 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn create_tray(&mut self) {
-        self.tray_icon = tray::create_tray(&self.controllers);
+        self.tray_icon = tray::create_tray(&self.session.controllers);
     }
 
     fn apply_tray(&mut self) -> Task<Message> {
         if let Some(tray_icon) = self.tray_icon.as_mut() {
-            tray::apply_tray(tray_icon, &self.controllers);
+            tray::apply_tray(tray_icon, &self.session.controllers);
         }
         self.sync_popup_rows_and_fit()
     }
@@ -910,7 +955,11 @@ impl App {
             return Task::none();
         }
 
-        let discovered = self.hid_worker.presence_paths();
+        let discovered = self
+            .hid_worker
+            .as_ref()
+            .map(|w| w.presence_paths())
+            .unwrap_or_default();
 
         let membership_changed = discovered != self.last_discovered;
         self.last_discovered = discovered;
@@ -921,8 +970,8 @@ impl App {
             // Presence-only clear never runs HID poll; drop claims so reconnect
             // always gets LIGHT_OUT + RGB. Skip the one-miss hold — the device is gone.
             lightbar::sync_lightbar_claims(std::iter::empty::<&str>());
-            self.missed_poll_counts.clear();
-            let task = if self.controllers.is_empty() {
+            self.session.clear_missed_polls();
+            let task = if self.session.controllers.is_empty() {
                 Task::none()
             } else {
                 self.apply_controllers(Vec::new())
@@ -932,14 +981,14 @@ impl App {
         }
 
         let battery_due = self.last_battery_poll.elapsed() >= BATTERY_INTERVAL;
-        let liveness_due =
-            !self.controllers.is_empty() && self.last_battery_poll.elapsed() >= LIVENESS_INTERVAL;
+        let liveness_due = !self.session.controllers.is_empty()
+            && self.last_battery_poll.elapsed() >= LIVENESS_INTERVAL;
         // HID can list a pad that we cannot open/read yet (sleeping BT, exclusive access).
         // While the tray is empty, retry on the fast presence cadence so 0→1 open is snappy.
         let unread_retry = !self.last_discovered.is_empty()
-            && self.controllers.is_empty()
+            && self.session.controllers.is_empty()
             && self.last_battery_poll.elapsed()
-                >= if self.prefs.start_screen_enabled {
+                >= if self.session.prefs.start_screen_enabled {
                     PRESENCE_INTERVAL_EMPTY
                 } else {
                     UNREAD_RETRY_INTERVAL
@@ -971,9 +1020,16 @@ impl App {
             return Task::none();
         }
 
-        let previously_connected: Vec<String> =
-            self.controllers.iter().map(|c| c.serial.clone()).collect();
-        let worker = self.hid_worker.clone();
+        let previously_connected: Vec<String> = self
+            .session
+            .controllers
+            .iter()
+            .map(|c| c.serial.clone())
+            .collect();
+        let Some(worker) = self.hid_worker.clone() else {
+            self.refreshing.store(false, Ordering::SeqCst);
+            return Task::none();
+        };
         Task::perform(worker.poll(previously_connected), Message::PollResult)
     }
 
@@ -988,17 +1044,14 @@ impl App {
 
         match result {
             Ok(controllers) => {
-                let (reconciled, held) = reconcile_poll_with_hold(
-                    &self.controllers,
-                    controllers,
-                    &mut self.missed_poll_counts,
-                );
-                for serial in &held {
-                    crate::controller::hid::diag::diag_info(format!(
-                        "ui-diag: hold pad across missed read serial={serial}"
-                    ));
-                }
-                self.apply_controllers(reconciled)
+                let ctx = crate::session::ApplyContext {
+                    start_visible: self.start_visible,
+                    fullscreen: start_input::foreground_is_exclusive_fullscreen(),
+                    now: Instant::now(),
+                    lightbar_enabled: lightbar::is_enabled(),
+                };
+                let effects = self.session.on_poll_result(controllers, ctx);
+                self.apply_session_effects(effects)
             }
             Err(err) => {
                 app_log::warn(format!("refresh failed: {err}"));
@@ -1007,129 +1060,93 @@ impl App {
         }
     }
 
-    fn apply_controllers(&mut self, controllers: Vec<ControllerStatus>) -> Task<Message> {
-        let known_changed = self.known.sync_from_live(&controllers);
-        let controllers_changed = !controllers_equivalent(&self.controllers, &controllers);
-
-        // Analytics heartbeat runs even when the snapshot is unchanged so open
-        // sessions accumulate active time between percent/state edges.
-        if self.prefs.analytics_enabled {
-            let previous = self.controllers.clone();
-            let next = if controllers_changed {
-                controllers.as_slice()
-            } else {
-                self.controllers.as_slice()
-            };
-            let keep = |serial: &str| {
-                self.known.is_remembered(serial) || self.known.nickname(serial).is_some()
-            };
-            self.analytics
-                .observe(&previous, next, true, keep, std::time::SystemTime::now());
-            self.analytics.save();
-            self.refresh_analytics_panel();
-        }
-
-        if !controllers_changed && !known_changed {
-            if self.prefs.analytics_enabled {
-                return self.sync_popup_rows_and_fit();
-            }
-            return Task::none();
-        }
-
-        let mut events = Vec::new();
-        let mut opened_from_empty = false;
-        if controllers_changed {
-            let previous = std::mem::replace(&mut self.controllers, controllers);
-            opened_from_empty = previous.is_empty() && !self.controllers.is_empty();
-            if opened_from_empty {
-                self.controllers_nonempty_since = Some(Instant::now());
-            }
-            if !previous.is_empty() && self.controllers.is_empty() {
-                let stretch = self.controllers_nonempty_since.map(|since| since.elapsed());
-                self.controllers_nonempty_since = None;
-                let skip = take_skip_connect_cooldown(&mut self.skip_next_connect_cooldown);
-                match connect_cooldown_on_empty(skip, stretch, MIN_CONNECT_STRETCH) {
-                    ConnectCooldownDecision::SkipIntentional => {
-                        crate::controller::hid::diag::diag_info(
-                            "ui-diag: skip connect cooldown (intentional power-off)",
-                        );
-                    }
-                    ConnectCooldownDecision::SkipShortArrival => {
-                        crate::controller::hid::diag::diag_info(
-                            "ui-diag: skip connect cooldown (short arrival)",
-                        );
-                    }
-                    ConnectCooldownDecision::Arm => {
-                        self.start_connect_cooldown_until =
-                            Some(Instant::now() + START_CONNECT_COOLDOWN);
+    fn apply_session_effects(
+        &mut self,
+        effects: Vec<crate::session::SessionEffect>,
+    ) -> Task<Message> {
+        use crate::session::SessionEffect;
+        let mut tasks = Vec::new();
+        for effect in effects {
+            match effect {
+                SessionEffect::SetTray { connected: _ } => {
+                    if !self.client_mode {
+                        tasks.push(self.apply_tray());
+                    } else {
+                        tasks.push(self.sync_popup_rows_and_fit());
                     }
                 }
+                SessionEffect::SetLowBatteryTargets { targets } => {
+                    if self.client_mode {
+                        let _ = crate::ipc::send_command(
+                            &crate::ipc::ShellCommand::SetLowBatteryTargets { targets },
+                        );
+                    } else {
+                        self.hid_worker
+                            .as_ref()
+                            .map(|w| w.set_low_battery_targets(targets));
+                    }
+                }
+                SessionEffect::QueueNotifications {
+                    events,
+                    open_start_after_toast,
+                } => {
+                    tasks.push(self.queue_notifications(events, open_start_after_toast));
+                }
+                SessionEffect::OpenStart => {
+                    tasks.push(self.open_start_screen());
+                }
+                SessionEffect::CloseStart => {
+                    tasks.push(self.close_start_screen());
+                }
+                SessionEffect::ClearStartLatch => {
+                    self.toast_machine.clear_after();
+                }
+                SessionEffect::SaveKnown => {
+                    if !self.client_mode {
+                        self.session.known.save();
+                    }
+                }
+                SessionEffect::SaveAnalytics => {
+                    if !self.client_mode {
+                        self.session.analytics.save();
+                    }
+                }
+                SessionEffect::RefreshAnalyticsPanel => {
+                    if self.client_mode {
+                        self.session.analytics = AnalyticsStore::load();
+                    }
+                    self.refresh_analytics_panel();
+                }
+                SessionEffect::SyncPopup => {
+                    tasks.push(self.sync_popup_rows_and_fit());
+                }
             }
-            events = self
-                .notify
-                .evaluate(&previous, &self.controllers, &self.prefs, |serial| {
-                    self.known.nickname(serial).map(str::to_string)
-                });
-            self.sync_low_battery();
         }
-
-        self.known.save();
-        let connect_toast_queued = events.iter().any(|event| event.body == "Connected");
-        let want_auto_open = opened_from_empty && self.should_auto_open_start();
-        if want_auto_open {
-            self.start_auto_open_pending = true;
-        }
-        let open_start_after_toast =
-            want_auto_open && should_defer_auto_open_start(true, connect_toast_queued);
-        let tray = self.apply_tray();
-        let notify = tray.chain(self.queue_notifications(events, open_start_after_toast));
-        // Do not chain open_start_screen after show_next_toast: its Task includes
-        // the ~5s expire delay. 0→1 Start is latched on the Connected toast and
-        // opens only when the presentation machine emits OpenStart.
-        let start = if self.controllers.is_empty() {
-            // Confirmed empty: cancel any latched open even if Start is not visible.
-            self.start_auto_open_pending = false;
-            self.toast_machine.clear_after();
-            if self.start_visible {
-                self.close_start_screen()
-            } else {
-                Task::none()
-            }
-        } else if want_auto_open && !connect_toast_queued {
-            self.open_start_screen()
-        } else {
-            Task::none()
-        };
-        Task::batch([notify, start])
+        Task::batch(tasks)
     }
 
-    fn should_auto_open_start(&self) -> bool {
-        let cooldown_active = self
-            .start_connect_cooldown_until
-            .is_some_and(|until| Instant::now() < until);
-        should_auto_open_start(
-            self.prefs.start_screen_enabled,
-            true,
-            true,
-            self.start_visible,
-            cooldown_active,
-            start_input::foreground_is_exclusive_fullscreen(),
-        )
+    fn report_start_visible(&self, visible: bool) {
+        if self.client_mode {
+            let _ =
+                crate::ipc::send_command(&crate::ipc::ShellCommand::ReportStartVisible { visible });
+        }
     }
 
-    fn sync_low_battery(&self) {
-        let list: Vec<(String, u8)> = if lightbar::is_enabled() {
-            let threshold = self.prefs.low_battery_percent;
-            self.controllers
-                .iter()
-                .filter(|c| c.is_low_battery(threshold) && !is_emulated_serial(&c.serial))
-                .map(|c| (c.serial.clone(), c.percent))
-                .collect()
-        } else {
-            Vec::new()
+    /// Apply a controller snapshot through the session (used by presence clear + emulate).
+    fn apply_controllers(&mut self, controllers: Vec<ControllerStatus>) -> Task<Message> {
+        let ctx = crate::session::ApplyContext {
+            start_visible: self.start_visible,
+            fullscreen: start_input::foreground_is_exclusive_fullscreen(),
+            now: Instant::now(),
+            lightbar_enabled: lightbar::is_enabled(),
         };
-        if let Ok(mut guard) = self.low_battery.lock() {
-            *guard = list;
+        let effects = self.session.apply_controllers(controllers, ctx);
+        self.apply_session_effects(effects)
+    }
+
+    fn sync_low_battery(&mut self) {
+        if let Some(effect) = self.session.refresh_low_battery() {
+            let _ = self.apply_session_effects(vec![effect]);
         }
     }
 
@@ -1138,11 +1155,12 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn sync_popup_rows(&mut self) {
-        let threshold = self.prefs.low_battery_percent;
+        let threshold = self.session.prefs.low_battery_percent;
         let mut rows = Vec::new();
-        for controller in &self.controllers {
-            let eta = if self.prefs.analytics_enabled {
-                self.analytics
+        for controller in &self.session.controllers {
+            let eta = if self.session.prefs.analytics_enabled {
+                self.session
+                    .analytics
                     .eta_for(controller)
                     .map(analytics::format_eta_ring)
             } else {
@@ -1150,18 +1168,30 @@ impl App {
             };
             rows.push(ControllerRow::connected(
                 controller,
-                self.known.is_remembered(&controller.serial),
+                self.session.known.is_remembered(&controller.serial),
                 dualsense::is_storable_serial(&controller.serial)
                     && !is_emulated_serial(&controller.serial),
-                self.known.nickname(&controller.serial).map(str::to_string),
+                self.session
+                    .known
+                    .nickname(&controller.serial)
+                    .map(str::to_string),
                 threshold,
                 eta,
             ));
         }
-        for controller in self.known.remembered_disconnected(&self.controllers) {
-            let nickname = self.known.nickname(&controller.serial).map(str::to_string);
-            let eta = if self.prefs.analytics_enabled {
-                self.analytics
+        for controller in self
+            .session
+            .known
+            .remembered_disconnected(&self.session.controllers)
+        {
+            let nickname = self
+                .session
+                .known
+                .nickname(&controller.serial)
+                .map(str::to_string);
+            let eta = if self.session.prefs.analytics_enabled {
+                self.session
+                    .analytics
                     .eta_play_at(&controller.serial, controller.percent)
                     .map(analytics::format_eta_ring)
             } else {
@@ -1270,7 +1300,7 @@ impl App {
             }
             PopupMessage::ToggleRemember(serial) => self.toggle_remember(&serial),
             PopupMessage::BeginEdit(serial) => {
-                let current = self.known.nickname(&serial).map(str::to_string);
+                let current = self.session.known.nickname(&serial).map(str::to_string);
                 self.popup_state.begin_edit(&serial, current.as_deref());
                 Task::batch([
                     operation::focus(popup_view::nickname_input_id()),
@@ -1301,20 +1331,20 @@ impl App {
 
     fn configure_settings(&self) -> ConfigureSettings {
         ConfigureSettings {
-            notify_low: self.prefs.notify_low,
-            notify_charged: self.prefs.notify_charged,
-            notify_connect: self.prefs.notify_connect,
-            notify_disconnect: self.prefs.notify_disconnect,
-            low_battery_percent: self.prefs.low_battery_percent,
-            toast_position: self.prefs.toast_position,
-            analytics_enabled: self.prefs.analytics_enabled,
-            lightbar_enabled: self.prefs.lightbar_enabled,
-            start_screen_enabled: self.prefs.start_screen_enabled,
-            start_screen_gesture: self.prefs.start_screen_gesture.clone(),
-            start_screen_sounds_enabled: self.prefs.start_screen_sounds_enabled,
-            start_screen_sound_volume: self.prefs.start_screen_sound_volume,
-            start_screen_haptics_enabled: self.prefs.start_screen_haptics_enabled,
-            start_screen_haptics_strength: self.prefs.start_screen_haptics_strength,
+            notify_low: self.session.prefs.notify_low,
+            notify_charged: self.session.prefs.notify_charged,
+            notify_connect: self.session.prefs.notify_connect,
+            notify_disconnect: self.session.prefs.notify_disconnect,
+            low_battery_percent: self.session.prefs.low_battery_percent,
+            toast_position: self.session.prefs.toast_position,
+            analytics_enabled: self.session.prefs.analytics_enabled,
+            lightbar_enabled: self.session.prefs.lightbar_enabled,
+            start_screen_enabled: self.session.prefs.start_screen_enabled,
+            start_screen_gesture: self.session.prefs.start_screen_gesture.clone(),
+            start_screen_sounds_enabled: self.session.prefs.start_screen_sounds_enabled,
+            start_screen_sound_volume: self.session.prefs.start_screen_sound_volume,
+            start_screen_haptics_enabled: self.session.prefs.start_screen_haptics_enabled,
+            start_screen_haptics_strength: self.session.prefs.start_screen_haptics_strength,
             gesture_recording: self.gesture_recorder.is_active(),
             gesture_recording_live: {
                 let peak: Vec<_> = self.gesture_recorder.peak().iter().copied().collect();
@@ -1340,21 +1370,24 @@ impl App {
     }
 
     fn analytics_panel(&self) -> AnalyticsPanel {
-        if !self.prefs.analytics_enabled {
+        if !self.session.prefs.analytics_enabled {
             return AnalyticsPanel::default();
         }
         let rows = self
+            .session
             .analytics
             .panel_rows()
             .iter()
             .map(|row| {
                 let label = self
+                    .session
                     .known
                     .nickname(&row.serial)
                     .map(str::to_string)
                     .filter(|name| !name.is_empty())
                     .or_else(|| {
-                        self.controllers
+                        self.session
+                            .controllers
                             .iter()
                             .find(|c| c.serial == row.serial)
                             .map(|c| c.product.to_string())
@@ -1383,7 +1416,7 @@ impl App {
         }
 
         self.configure_state
-            .set_spectrum(self.prefs.spectrum.clone());
+            .set_spectrum(self.session.prefs.spectrum.clone());
 
         let (id, open) = window::open(window::Settings {
             size: Size::new(configure_view::WIDTH, configure_view::HEIGHT),
@@ -1425,50 +1458,52 @@ impl App {
             }
             ConfigureMessage::SetNotification(setting, enabled) => {
                 match setting {
-                    NotificationSetting::Connect => self.prefs.notify_connect = enabled,
-                    NotificationSetting::Disconnect => self.prefs.notify_disconnect = enabled,
-                    NotificationSetting::Low => self.prefs.notify_low = enabled,
-                    NotificationSetting::Charged => self.prefs.notify_charged = enabled,
+                    NotificationSetting::Connect => self.session.prefs.notify_connect = enabled,
+                    NotificationSetting::Disconnect => {
+                        self.session.prefs.notify_disconnect = enabled
+                    }
+                    NotificationSetting::Low => self.session.prefs.notify_low = enabled,
+                    NotificationSetting::Charged => self.session.prefs.notify_charged = enabled,
                 }
-                self.prefs.save();
+                self.session.prefs.save();
                 Task::none()
             }
             ConfigureMessage::SetLowBatteryPercent(percent) => {
                 let percent = clamp_low_battery_percent(percent);
-                if self.prefs.low_battery_percent != percent {
-                    self.prefs.low_battery_percent = percent;
-                    self.prefs.save();
+                if self.session.prefs.low_battery_percent != percent {
+                    self.session.prefs.low_battery_percent = percent;
+                    self.session.prefs.save();
                     self.sync_low_battery();
                     return self.sync_popup_rows_and_fit();
                 }
                 Task::none()
             }
             ConfigureMessage::SetToastPosition(position) => {
-                self.prefs.toast_position = position;
-                self.prefs.save();
+                self.session.prefs.toast_position = position;
+                self.session.prefs.save();
                 self.show_position_preview()
             }
             ConfigureMessage::SetAnalyticsEnabled(enabled) => {
-                self.prefs.analytics_enabled = enabled;
-                self.prefs.save();
+                self.session.prefs.analytics_enabled = enabled;
+                self.session.prefs.save();
                 self.refresh_analytics_panel();
                 self.sync_popup_rows_and_fit()
             }
             ConfigureMessage::SetLightbarEnabled(enabled) => {
-                self.prefs.lightbar_enabled = enabled;
-                self.prefs.save();
+                self.session.prefs.lightbar_enabled = enabled;
+                self.session.prefs.save();
                 lightbar::set_enabled(enabled);
                 self.sync_low_battery();
                 if enabled {
                     // Re-apply spectrum colors now that automatic writes are back on.
-                    self.apply_spectrum(self.prefs.spectrum.clone())
+                    self.apply_spectrum(self.session.prefs.spectrum.clone())
                 } else {
                     Task::none()
                 }
             }
             ConfigureMessage::SetStartScreenEnabled(enabled) => {
-                self.prefs.start_screen_enabled = enabled;
-                self.prefs.save();
+                self.session.prefs.start_screen_enabled = enabled;
+                self.session.prefs.save();
                 if !enabled {
                     self.cancel_gesture_recording();
                     if self.start_visible {
@@ -1478,8 +1513,8 @@ impl App {
                 Task::none()
             }
             ConfigureMessage::SetStartScreenSounds(enabled) => {
-                self.prefs.start_screen_sounds_enabled = enabled;
-                self.prefs.save();
+                self.session.prefs.start_screen_sounds_enabled = enabled;
+                self.session.prefs.save();
                 if enabled {
                     self.play_start_sound(UiSoundKind::Nav);
                 }
@@ -1487,31 +1522,33 @@ impl App {
             }
             ConfigureMessage::SetStartScreenSoundVolume(volume) => {
                 let volume = clamp_start_screen_sound_volume(volume);
-                if self.prefs.start_screen_sound_volume != volume {
-                    self.prefs.start_screen_sound_volume = volume;
-                    self.prefs.save();
-                    if self.prefs.start_screen_sounds_enabled {
+                if self.session.prefs.start_screen_sound_volume != volume {
+                    self.session.prefs.start_screen_sound_volume = volume;
+                    self.session.prefs.save();
+                    if self.session.prefs.start_screen_sounds_enabled {
                         self.play_start_sound(UiSoundKind::Nav);
                     }
                 }
                 Task::none()
             }
             ConfigureMessage::SetStartScreenHaptics(enabled) => {
-                self.prefs.start_screen_haptics_enabled = enabled;
-                self.prefs.save();
+                self.session.prefs.start_screen_haptics_enabled = enabled;
+                self.session.prefs.save();
                 if enabled {
                     self.preview_haptic_all(MotorPulse::NAV);
+                } else if self.client_mode {
+                    let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RumbleStopAll);
                 } else {
-                    self.hid_worker.rumble_stop_all();
+                    self.hid_worker.as_ref().map(|w| w.rumble_stop_all());
                 }
                 Task::none()
             }
             ConfigureMessage::SetStartScreenHapticsStrength(strength) => {
                 let strength = clamp_start_screen_haptics_strength(strength);
-                if self.prefs.start_screen_haptics_strength != strength {
-                    self.prefs.start_screen_haptics_strength = strength;
-                    self.prefs.save();
-                    if self.prefs.start_screen_haptics_enabled {
+                if self.session.prefs.start_screen_haptics_strength != strength {
+                    self.session.prefs.start_screen_haptics_strength = strength;
+                    self.session.prefs.save();
+                    if self.session.prefs.start_screen_haptics_enabled {
                         self.preview_haptic_all(MotorPulse::NAV);
                     }
                 }
@@ -1525,8 +1562,8 @@ impl App {
             }
             ConfigureMessage::ResetStartGesture => {
                 self.cancel_gesture_recording();
-                self.prefs.start_screen_gesture = gesture::default_gesture();
-                self.prefs.save();
+                self.session.prefs.start_screen_gesture = gesture::default_gesture();
+                self.session.prefs.save();
                 // Clear detectors so a held default chord cannot reopen immediately.
                 self.gesture_detectors.reset();
                 Task::none()
@@ -1608,7 +1645,7 @@ impl App {
 
     /// Update in-memory spectrum immediately; debounce prefs save + HID write.
     fn apply_spectrum(&mut self, spectrum: BatterySpectrum) -> Task<Message> {
-        self.prefs.spectrum = spectrum.clone();
+        self.session.prefs.spectrum = spectrum.clone();
         color::set_active_spectrum(spectrum);
         self.spectrum_generation = self.spectrum_generation.wrapping_add(1);
         let generation = self.spectrum_generation;
@@ -1622,20 +1659,21 @@ impl App {
             return Task::none();
         }
 
-        self.prefs.save();
+        self.session.prefs.save();
 
         if !lightbar::is_enabled() {
             return Task::none();
         }
 
         let targets: Vec<(String, color::Rgb)> = self
+            .session
             .controllers
             .iter()
             .filter(|c| !is_emulated_serial(&c.serial))
             .map(|c| {
                 (
                     c.serial.clone(),
-                    self.prefs.spectrum.color_at_percent(c.percent),
+                    self.session.prefs.spectrum.color_at_percent(c.percent),
                 )
             })
             .collect();
@@ -1645,7 +1683,12 @@ impl App {
         }
 
         for (serial, color) in targets {
-            self.hid_worker.set_rgb(serial, color);
+            if self.client_mode {
+                let _ =
+                    crate::ipc::send_command(&crate::ipc::ShellCommand::SetRgb { serial, color });
+            } else {
+                self.hid_worker.as_ref().map(|w| w.set_rgb(serial, color));
+            }
         }
         Task::none()
     }
@@ -1660,15 +1703,24 @@ impl App {
             return false;
         }
 
-        let Some(controller) = self.controllers.iter().find(|c| c.serial == serial) else {
+        let Some(controller) = self.session.controllers.iter().find(|c| c.serial == serial) else {
             return false;
         };
         if !controller.supports_lightbar {
             return false;
         }
 
-        self.hid_worker
-            .identify(serial.to_string(), controller.percent)
+        if self.client_mode {
+            crate::ipc::send_command(&crate::ipc::ShellCommand::Identify {
+                serial: serial.to_string(),
+                percent: controller.percent,
+            })
+            .is_ok()
+        } else {
+            self.hid_worker
+                .as_ref()
+                .is_some_and(|w| w.identify(serial.to_string(), controller.percent))
+        }
     }
 
     fn power_off(&mut self, serial: &str) {
@@ -1679,7 +1731,7 @@ impl App {
             return;
         }
 
-        let Some(controller) = self.controllers.iter().find(|c| c.serial == serial) else {
+        let Some(controller) = self.session.controllers.iter().find(|c| c.serial == serial) else {
             return;
         };
         if !controller.supports_power_off || !controller.connection.is_bluetooth() {
@@ -1691,8 +1743,16 @@ impl App {
         }
 
         // Reconnect after user power-off should open Start again (not ghost-flap cooldown).
-        self.skip_next_connect_cooldown = true;
-        self.hid_worker.power_off(serial.to_string());
+        self.session.mark_skip_connect_cooldown();
+        if self.client_mode {
+            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::PowerOff {
+                serial: serial.to_string(),
+            });
+        } else {
+            self.hid_worker
+                .as_ref()
+                .map(|w| w.power_off(serial.to_string()));
+        }
     }
 
     fn toggle_remember(&mut self, serial: &str) -> Task<Message> {
@@ -1700,13 +1760,15 @@ impl App {
             return Task::none();
         }
 
-        if self.known.is_remembered(serial) {
-            self.known.forget(serial);
-        } else if let Some(controller) = self.controllers.iter().find(|c| c.serial == serial) {
-            self.known.remember(controller);
+        if self.session.known.is_remembered(serial) {
+            self.session.known.forget(serial);
+        } else if let Some(controller) =
+            self.session.controllers.iter().find(|c| c.serial == serial)
+        {
+            self.session.known.remember(controller);
         }
 
-        self.known.save();
+        self.session.known.save();
         self.sync_popup_rows_and_fit()
     }
 
@@ -1714,8 +1776,8 @@ impl App {
         if is_emulated_serial(serial) {
             return Task::none();
         }
-        if self.known.set_nickname(serial, nickname) {
-            self.known.save();
+        if self.session.known.set_nickname(serial, nickname) {
+            self.session.known.save();
             self.sync_popup_rows_and_fit()
         } else {
             Task::none()
@@ -1732,9 +1794,9 @@ impl App {
             return task.chain(self.request_refresh());
         }
 
-        if preset.is_analytics() && !self.prefs.analytics_enabled {
-            self.prefs.analytics_enabled = true;
-            self.prefs.save();
+        if preset.is_analytics() && !self.session.prefs.analytics_enabled {
+            self.session.prefs.analytics_enabled = true;
+            self.session.prefs.save();
             app_log::info("analytics enabled for developer preset");
         }
 
@@ -1750,18 +1812,22 @@ impl App {
             } else {
                 Duration::from_secs(25 * 60)
             };
-            self.analytics
+            self.session
+                .analytics
                 .dev_credit_active(emulate::PRIMARY_SERIAL, credit);
         }
 
         if preset == Preset::AnalyticsSeedEstimates {
-            self.analytics.dev_seed_estimates(emulate::PRIMARY_SERIAL);
-            self.analytics.save();
+            self.session
+                .analytics
+                .dev_seed_estimates(emulate::PRIMARY_SERIAL);
+            self.session.analytics.save();
             self.refresh_analytics_panel();
         }
 
         if preset == Preset::AnalyticsPause {
             self.dev_paused_percent = self
+                .session
                 .controllers
                 .iter()
                 .find(|c| c.serial == emulate::PRIMARY_SERIAL)
@@ -1770,17 +1836,18 @@ impl App {
         }
 
         // Unplug-from-full needs a Complete → Discharging edge.
-        let ensure_complete = preset == Preset::AnalyticsUnplugFull
-            && !self
-                .controllers
-                .iter()
-                .any(|c| c.serial == emulate::PRIMARY_SERIAL && c.state == PowerState::Complete);
+        let ensure_complete =
+            preset == Preset::AnalyticsUnplugFull
+                && !self.session.controllers.iter().any(|c| {
+                    c.serial == emulate::PRIMARY_SERIAL && c.state == PowerState::Complete
+                });
 
         let next = if preset == Preset::AnalyticsResume {
             let percent = self
                 .dev_paused_percent
                 .or_else(|| {
-                    self.analytics
+                    self.session
+                        .analytics
                         .in_progress(emulate::PRIMARY_SERIAL)
                         .map(|p| p.percent)
                 })
@@ -1794,11 +1861,11 @@ impl App {
                 PowerState::Discharging,
             )]
         } else {
-            emulate::apply_preset(preset, &self.controllers)
+            emulate::apply_preset(preset, &self.session.controllers)
         };
 
         self.emulating = true;
-        self.analytics.save();
+        self.session.analytics.save();
         self.refresh_analytics_panel();
 
         if ensure_complete {
@@ -1826,7 +1893,7 @@ impl App {
         let steam_by_id = &self.steam_by_id;
         self.games.merge_sorted(
             self.steam_installed.as_deref(),
-            self.prefs.games_sort_mode,
+            self.session.prefs.games_sort_mode,
             |entry| match entry {
                 crate::games::GameEntry::Steam { appid } => steam_by_id
                     .get(appid)
@@ -1838,7 +1905,7 @@ impl App {
     }
 
     fn refresh_start_rows(&mut self) {
-        self.start_state.sort_mode = self.prefs.games_sort_mode;
+        self.start_state.sort_mode = self.session.prefs.games_sort_mode;
         let rows = if self.start_state.editing {
             self.edit_checklist_rows()
         } else {
@@ -1917,39 +1984,48 @@ impl App {
     }
 
     fn refresh_start_controllers(&mut self) {
-        self.start_state.show_all_controllers = self.prefs.show_all_controllers;
+        self.start_state.show_all_controllers = self.session.prefs.show_all_controllers;
         let mut rows: Vec<_> = self
+            .session
             .controllers
             .iter()
             .map(|c| {
-                let nickname = self.known.nickname(&c.serial);
-                let eta = if self.prefs.analytics_enabled {
-                    self.analytics.eta_for(c).map(analytics::format_eta_ring)
+                let nickname = self.session.known.nickname(&c.serial);
+                let eta = if self.session.prefs.analytics_enabled {
+                    self.session
+                        .analytics
+                        .eta_for(c)
+                        .map(analytics::format_eta_ring)
                 } else {
                     None
                 };
                 start_view::StartControllerRow {
                     serial: c.serial.clone(),
-                    title: start_view::controller_title(c.product, nickname),
+                    title: start_view::controller_title(&c.product, nickname),
                     connection: c.connection.to_string(),
-                    state: if c.is_low_battery(self.prefs.low_battery_percent) {
+                    state: if c.is_low_battery(self.session.prefs.low_battery_percent) {
                         "low battery".into()
                     } else {
                         start_view::power_state_label(c.state).into()
                     },
                     percent: c.percent,
-                    low: c.is_low_battery(self.prefs.low_battery_percent),
+                    low: c.is_low_battery(self.session.prefs.low_battery_percent),
                     bluetooth: c.connection.is_bluetooth() && c.supports_power_off,
                     connected: true,
                     eta,
                 }
             })
             .collect();
-        if self.prefs.show_all_controllers {
-            for controller in self.known.remembered_disconnected(&self.controllers) {
-                let nickname = self.known.nickname(&controller.serial);
-                let eta = if self.prefs.analytics_enabled {
-                    self.analytics
+        if self.session.prefs.show_all_controllers {
+            for controller in self
+                .session
+                .known
+                .remembered_disconnected(&self.session.controllers)
+            {
+                let nickname = self.session.known.nickname(&controller.serial);
+                let eta = if self.session.prefs.analytics_enabled {
+                    self.session
+                        .analytics
                         .eta_play_at(&controller.serial, controller.percent)
                         .map(analytics::format_eta_ring)
                 } else {
@@ -2251,11 +2327,11 @@ impl App {
             || self.gesture_recorder.is_active()
             || (self.configure_window.is_some()
                 && self.configure_state.section == Section::PadInput)
-            || (self.prefs.start_screen_enabled && !self.controllers.is_empty())
+            || (self.session.prefs.start_screen_enabled && !self.session.controllers.is_empty())
     }
 
     fn open_start_screen(&mut self) -> Task<Message> {
-        if !self.prefs.start_screen_enabled {
+        if !self.session.prefs.start_screen_enabled {
             return Task::none();
         }
         self.start_state.editing = false;
@@ -2270,7 +2346,7 @@ impl App {
         if self.start_visible
             && let Some(id) = self.start_window
         {
-            self.start_auto_open_pending = false;
+            self.session.start_auto_open_pending = false;
             self.last_running_check = None;
             let badge = self.refresh_running_badge();
             return Task::batch([badge, window::gain_focus(id)]);
@@ -2313,7 +2389,8 @@ impl App {
         });
         self.start_window = Some(id);
         self.start_visible = true;
-        self.start_auto_open_pending = false;
+        self.report_start_visible(true);
+        self.session.start_auto_open_pending = false;
         crate::platform::wgpu_diag::note_start_open();
         Task::batch([badge, open.map(Message::StartOpened)])
     }
@@ -2344,11 +2421,16 @@ impl App {
         // Clear visibility before any hide task so Resting toast RaiseInteractive
         // cannot resurface Start while the hide is in flight.
         self.start_visible = false;
+        self.report_start_visible(false);
         self.start_nav_ready = false;
         self.start_revealed_at = None;
         self.reopen_needs_chord_release = true;
         self.haptic_pad_serial = None;
-        self.hid_worker.rumble_stop_all();
+        if self.client_mode {
+            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RumbleStopAll);
+        } else {
+            self.hid_worker.as_ref().map(|w| w.rumble_stop_all());
+        }
         self.pad_nav.reset();
         self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
@@ -2386,7 +2468,7 @@ impl App {
     fn mark_hitch_now(&mut self, kind: &str) {
         let start_open = self.start_visible;
         let nav_ready = self.start_nav_ready;
-        let controllers = self.controllers.len();
+        let controllers = self.session.controllers.len();
         stamp_hitch_report(
             kind,
             "button",
@@ -2600,10 +2682,10 @@ impl App {
     }
 
     fn play_start_sound(&self, kind: UiSoundKind) {
-        if !self.prefs.start_screen_sounds_enabled {
+        if !self.session.prefs.start_screen_sounds_enabled {
             return;
         }
-        let volume = f32::from(self.prefs.start_screen_sound_volume) / 100.0;
+        let volume = f32::from(self.session.prefs.start_screen_sound_volume) / 100.0;
         ui_sound::play(kind, volume);
     }
 
@@ -2614,7 +2696,7 @@ impl App {
     }
 
     fn play_start_haptic(&self, kind: UiSoundKind) {
-        if !self.prefs.start_screen_haptics_enabled {
+        if !self.session.prefs.start_screen_haptics_enabled {
             return;
         }
         let Some(serial) = self.haptic_pad_serial.as_ref() else {
@@ -2626,27 +2708,47 @@ impl App {
             UiSoundKind::Hold => MotorPulse::HOLD,
             UiSoundKind::Slide => MotorPulse::SLIDE,
         };
-        let (right, left, duration) = pulse.scaled(self.prefs.start_screen_haptics_strength);
+        let (right, left, duration) =
+            pulse.scaled(self.session.prefs.start_screen_haptics_strength);
         if right == 0 && left == 0 {
             return;
         }
-        self.hid_worker
-            .rumble(serial.clone(), right, left, duration.as_millis() as u64);
+        if self.client_mode {
+            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::Rumble {
+                serial: serial.clone(),
+                right,
+                left,
+                duration_ms: duration.as_millis() as u64,
+            });
+        } else {
+            self.hid_worker
+                .as_ref()
+                .map(|w| w.rumble(serial.clone(), right, left, duration.as_millis() as u64));
+        }
     }
 
     /// Preview haptic on every connected DualSense (settings toggle / strength slider).
     fn preview_haptic_all(&self, pulse: MotorPulse) {
-        if !self.prefs.start_screen_haptics_enabled {
+        if !self.session.prefs.start_screen_haptics_enabled {
             return;
         }
-        let (right, left, duration) = pulse.scaled(self.prefs.start_screen_haptics_strength);
+        let (right, left, duration) =
+            pulse.scaled(self.session.prefs.start_screen_haptics_strength);
         if right == 0 && left == 0 {
             return;
         }
         let ms = duration.as_millis() as u64;
-        for controller in &self.controllers {
-            self.hid_worker
-                .rumble(controller.serial.clone(), right, left, ms);
+        for controller in &self.session.controllers {
+            if self.client_mode {
+                let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::Rumble {
+                    serial: controller.serial.clone(),
+                    right,
+                    left,
+                    duration_ms: ms,
+                });
+            } else if let Some(w) = self.hid_worker.as_ref() {
+                w.rumble(controller.serial.clone(), right, left, ms);
+            }
         }
     }
 
@@ -2735,8 +2837,8 @@ impl App {
         {
             return None;
         }
-        self.prefs.games_sort_mode = self.prefs.games_sort_mode.cycle();
-        self.prefs.save();
+        self.session.prefs.games_sort_mode = self.session.prefs.games_sort_mode.cycle();
+        self.session.prefs.save();
         self.refresh_start_rows();
         Some(self.scroll_start_selection_into_view())
     }
@@ -2745,7 +2847,7 @@ impl App {
         match self.start_state.slide {
             StartSlide::Games => self.cycle_games_sort(),
             StartSlide::Controllers => {
-                let next = !self.prefs.show_all_controllers;
+                let next = !self.session.prefs.show_all_controllers;
                 self.set_show_all_controllers(next)
             }
         }
@@ -2754,12 +2856,12 @@ impl App {
     fn set_show_all_controllers(&mut self, show_all: bool) -> Option<Task<Message>> {
         if self.start_state.slide != StartSlide::Controllers
             || self.start_state.overlay_blocking()
-            || self.prefs.show_all_controllers == show_all
+            || self.session.prefs.show_all_controllers == show_all
         {
             return None;
         }
-        self.prefs.show_all_controllers = show_all;
-        self.prefs.save();
+        self.session.prefs.show_all_controllers = show_all;
+        self.session.prefs.save();
         app_log::hid_trace(format!(
             "start-controllers: show_all={}",
             u8::from(show_all)
@@ -2948,16 +3050,54 @@ impl App {
         }
     }
 
-    fn on_pad_poll(&mut self) -> Task<Message> {
+    fn on_service_message(&mut self, msg: crate::ipc::ServiceMessage) -> Task<Message> {
+        use crate::ipc::ServiceMessage;
+        match msg {
+            ServiceMessage::Controllers(controllers) => {
+                let ctx = crate::session::ApplyContext {
+                    start_visible: self.start_visible,
+                    fullscreen: start_input::foreground_is_exclusive_fullscreen(),
+                    now: Instant::now(),
+                    lightbar_enabled: lightbar::is_enabled(),
+                };
+                // Controllers already observed by the service session; apply locally
+                // for UI state without re-saving known/analytics (service owns those).
+                self.session.controllers = controllers;
+                self.sync_popup_rows();
+                self.sync_low_battery();
+                let _ = ctx;
+                Task::none()
+            }
+            ServiceMessage::Effects(effects) => self.apply_session_effects(effects),
+            ServiceMessage::PadInput(edge) => self.on_pad_input(edge),
+            ServiceMessage::TrayOpenPopup { anchor } => {
+                self.tray_anchor = anchor;
+                self.toggle_popup()
+            }
+            ServiceMessage::TrayOpenSettings => self.open_configure(),
+            ServiceMessage::Notifications {
+                events,
+                open_start_after_toast,
+            } => self.queue_notifications(events, open_start_after_toast),
+            ServiceMessage::Shutdown => self.update(Message::Exit),
+            ServiceMessage::Ack
+            | ServiceMessage::ControllerList(_)
+            | ServiceMessage::LightbarSet { .. } => Task::none(),
+        }
+    }
+
+    fn on_pad_input(&mut self, edge: crate::domain::pad::InputEdge) -> Task<Message> {
         let poll_started = Instant::now();
         let start_open = self.start_visible;
+        let meta = Some(edge.meta());
+        let readings = edge.readings;
 
         if start_open {
             if let Some(prev) = self.last_pad_poll_at {
                 let gap_ms = prev.elapsed().as_millis();
                 if gap_ms >= PAD_POLL_STALL_MS {
                     crate::controller::hid::diag::diag_info(format!(
-                        "ui-diag: pad-poll stall gap_ms={gap_ms}"
+                        "ui-diag: pad-input stall gap_ms={gap_ms}"
                     ));
                 }
             }
@@ -2980,13 +3120,8 @@ impl App {
 
         let pad_input_open =
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
-        let listening = self.prefs.start_screen_enabled
-            && (!self.controllers.is_empty() || self.gesture_recorder.is_active());
-
-        let (readings, meta) = match start_input::read_nav_readings() {
-            start_input::NavReadingsOutcome::Readings { readings, meta } => (readings, Some(meta)),
-            start_input::NavReadingsOutcome::Missing { meta } => (Vec::new(), Some(meta)),
-        };
+        let listening = self.session.prefs.start_screen_enabled
+            && (!self.session.controllers.is_empty() || self.gesture_recorder.is_active());
 
         if pad_input_open {
             self.apply_pad_input_panel_from_readings(&readings);
@@ -3000,6 +3135,16 @@ impl App {
             return self.on_gesture_record(&readings);
         }
 
+        // Continue with the same body as the old on_pad_poll from start_open onward.
+        self.on_pad_readings(readings, meta, start_open)
+    }
+
+    fn on_pad_readings(
+        &mut self,
+        readings: Vec<start_input::NavReading>,
+        meta: Option<start_input::SnapshotMeta>,
+        start_open: bool,
+    ) -> Task<Message> {
         if start_open {
             if !self.start_nav_ready {
                 return Task::none();
@@ -3010,7 +3155,7 @@ impl App {
                     if self.nav_missing_since.is_none() {
                         self.nav_missing_since = Some(Instant::now());
                     }
-                    if !self.nav_missing_warned && !self.controllers.is_empty() {
+                    if !self.nav_missing_warned && !self.session.controllers.is_empty() {
                         app_log::warn(format!(
                             "start-nav: no hid-worker input snapshot yet; keyboard/mouse still work reason={} age_ms={age_ms} seq={}",
                             meta.reason.as_str(),
@@ -3048,14 +3193,7 @@ impl App {
                 }
             }
 
-            let task = self.handle_start_nav_readings(&readings);
-            let total_ms = poll_started.elapsed().as_millis();
-            if total_ms >= PAD_POLL_SLOW_MS {
-                crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: pad-poll slow total_ms={total_ms}"
-                ));
-            }
-            return task;
+            return self.handle_start_nav_readings(&readings);
         }
 
         self.on_reopen_gesture(&readings)
@@ -3261,7 +3399,7 @@ impl App {
 
     fn on_gesture_record(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
         if readings.is_empty() {
-            if !self.hid_exclusive_warned && !self.controllers.is_empty() {
+            if !self.hid_exclusive_warned && !self.session.controllers.is_empty() {
                 app_log::warn("could not read controller for gesture recording; try again");
                 self.hid_exclusive_warned = true;
             }
@@ -3271,8 +3409,8 @@ impl App {
         if let Some(sample) = self.gesture_record_latch.select(readings)
             && let Some(peak) = self.gesture_recorder.update(&sample.held)
         {
-            self.prefs.start_screen_gesture = peak;
-            self.prefs.save();
+            self.session.prefs.start_screen_gesture = peak;
+            self.session.prefs.save();
             self.gesture_record_latch.clear();
             self.gesture_detectors.consume_pending_match(readings);
         }
@@ -3291,10 +3429,12 @@ impl App {
             );
             return Task::none();
         }
-        if !self.prefs.start_screen_enabled || self.prefs.start_screen_gesture.is_empty() {
+        if !self.session.prefs.start_screen_enabled
+            || self.session.prefs.start_screen_gesture.is_empty()
+        {
             return Task::none();
         }
-        let required = &self.prefs.start_screen_gesture;
+        let required = &self.session.prefs.start_screen_gesture;
         // After hide / connect-reveal: wait for a full chord release before rising edges.
         if self.reopen_needs_chord_release {
             if chord_held_on_any_pad(required, readings) {
@@ -3351,7 +3491,7 @@ impl App {
         for event in events {
             let eta = self.toast_eta_for(&event);
             let mut message =
-                ToastMessage::from_notification(event, self.prefs.spectrum.clone(), eta);
+                ToastMessage::from_notification(event, self.session.prefs.spectrum.clone(), eta);
             if open_start_after && message.body == "Connected" {
                 message.after = AfterToast::OpenStart;
                 open_start_after = false;
@@ -3365,7 +3505,7 @@ impl App {
     }
 
     fn toast_eta_for(&self, event: &NotifyEvent) -> Option<String> {
-        if !self.prefs.analytics_enabled {
+        if !self.session.prefs.analytics_enabled {
             return None;
         }
         let status = crate::controller::dualsense::battery::dualsense_status(
@@ -3376,7 +3516,8 @@ impl App {
             event.percent.unwrap_or(0),
             event.state,
         );
-        self.analytics
+        self.session
+            .analytics
             .eta_for(&status)
             .map(analytics::format_eta_ring)
     }
@@ -3384,7 +3525,7 @@ impl App {
     fn show_position_preview(&mut self) -> Task<Message> {
         self.toast_queue.clear();
         self.toast_queue
-            .push_back(ToastMessage::preview(&self.prefs.spectrum));
+            .push_back(ToastMessage::preview(&self.session.prefs.spectrum));
         // Force-finish any in-flight toast without waiting for the machine.
         self.toast_machine = toast_machine::State::Idle;
         let finish = self.effect_toast_finished();
@@ -3545,7 +3686,11 @@ impl App {
     }
 
     fn effect_open_start(&mut self) -> Task<Message> {
-        if should_flush_latched_start(true, self.prefs.start_screen_enabled, self.start_visible) {
+        if crate::session::should_flush_latched_start(
+            true,
+            self.session.prefs.start_screen_enabled,
+            self.start_visible,
+        ) {
             crate::controller::hid::diag::diag_info("ui-diag: start open after toast settle");
             self.open_start_screen()
         } else {
@@ -3666,6 +3811,55 @@ fn tray_events_mapped() -> impl Stream<Item = Message> {
     tray::tray_events().map(|event| match event {
         tray::TrayEvent::Menu(id) => Message::TrayMenu(id),
         tray::TrayEvent::LeftClick(anchor) => Message::TrayLeftClick(anchor),
+    })
+}
+
+/// Bind the hid-worker → iced pad-input edge channel while listening.
+fn pad_input_edge_stream() -> impl Stream<Item = Message> {
+    stream::channel(64, async move |mut output| {
+        let (tx, mut rx) = iced::futures::channel::mpsc::channel(32);
+        start_input::bind_input_edge_sender(tx);
+        let _guard = InputEdgeBindGuard;
+        while let Some(edge) = rx.next().await {
+            if output.send(Message::PadInput(edge)).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+struct InputEdgeBindGuard;
+impl Drop for InputEdgeBindGuard {
+    fn drop(&mut self) {
+        start_input::clear_input_edge_sender();
+    }
+}
+
+/// Shell-client: drain service IPC messages into iced.
+fn service_message_stream() -> impl Stream<Item = Message> {
+    stream::channel(64, async move |mut output| {
+        let client = loop {
+            match crate::ipc::PipeClient::connect() {
+                Ok(c) => break c,
+                Err(_) => {
+                    iced::futures::future::ready(()).await;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        };
+        let Ok(mut reader) = client.try_clone_reader() else {
+            return;
+        };
+        loop {
+            match reader.recv() {
+                Ok(msg) => {
+                    if output.send(Message::Service(msg)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
     })
 }
 
@@ -3826,50 +4020,6 @@ fn delay(duration: Duration) -> impl Future<Output = ()> + Send {
     }
 }
 
-fn start_low_battery_pulse_thread(
-    hid_worker: HidWorkerHandle,
-    low_battery: Arc<Mutex<Vec<(String, u8)>>>,
-) {
-    thread::spawn(move || {
-        let on = Duration::from_millis(LOW_BATTERY_PULSE_ON_MS);
-        let gap = Duration::from_millis(LOW_BATTERY_PULSE_GAP_MS);
-        let identifying = hid_worker.identifying();
-
-        loop {
-            thread::sleep(gap);
-
-            if identifying.load(Ordering::SeqCst) || !lightbar::is_enabled() {
-                continue;
-            }
-
-            let targets = low_battery
-                .lock()
-                .map(|guard| guard.clone())
-                .unwrap_or_default();
-
-            for (serial, percent) in targets {
-                if identifying.load(Ordering::SeqCst) || !lightbar::is_enabled() {
-                    break;
-                }
-
-                if is_emulated_serial(&serial) {
-                    continue;
-                }
-
-                hid_worker.set_rgb(serial.clone(), LOW_BATTERY_ORANGE);
-                thread::sleep(on);
-
-                if identifying.load(Ordering::SeqCst) || !lightbar::is_enabled() {
-                    break;
-                }
-
-                let color = color_for_battery_percent(percent);
-                hid_worker.set_rgb(serial, color);
-            }
-        }
-    });
-}
-
 fn is_emulated_serial(serial: &str) -> bool {
     #[cfg(feature = "dev-emulate")]
     {
@@ -3882,20 +4032,6 @@ fn is_emulated_serial(serial: &str) -> bool {
     }
 }
 
-fn controllers_equivalent(a: &[ControllerStatus], b: &[ControllerStatus]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b.iter()).all(|(x, y)| {
-        x.serial == y.serial
-            && x.percent == y.percent
-            && x.state == y.state
-            && x.connection == y.connection
-            && x.product == y.product
-    })
-}
-
-/// True when any live pad currently holds every control in `required`.
 fn chord_held_on_any_pad(
     required: &[gesture::GestureControl],
     readings: &[start_input::NavReading],
@@ -3906,223 +4042,4 @@ fn chord_held_on_any_pad(
     readings
         .iter()
         .any(|r| required.iter().all(|c| r.sample.held.contains(c)))
-}
-
-/// Gate for automatic start-screen open on a 0→1 controller connect.
-pub(crate) fn should_auto_open_start(
-    enabled: bool,
-    previous_empty: bool,
-    next_nonempty: bool,
-    already_open: bool,
-    cooldown_active: bool,
-    fullscreen: bool,
-) -> bool {
-    enabled && previous_empty && next_nonempty && !already_open && !cooldown_active && !fullscreen
-}
-
-/// Defer 0→1 Start until a connect toast finishes slide-in (both stay on screen).
-pub(crate) fn should_defer_auto_open_start(want_open: bool, connect_toast_queued: bool) -> bool {
-    want_open && connect_toast_queued
-}
-
-/// Consume the intentional power-off flag; returns true when cooldown must be skipped.
-pub(crate) fn take_skip_connect_cooldown(flag: &mut bool) -> bool {
-    let skip = *flag;
-    *flag = false;
-    skip
-}
-
-/// Whether to arm the ghost-flap cooldown after the list goes empty.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConnectCooldownDecision {
-    SkipIntentional,
-    SkipShortArrival,
-    Arm,
-}
-
-/// Decide cooldown after 1→0. Short arrival blips must not suppress the next open.
-pub(crate) fn connect_cooldown_on_empty(
-    skip_intentional: bool,
-    nonempty_stretch: Option<Duration>,
-    min_stretch: Duration,
-) -> ConnectCooldownDecision {
-    if skip_intentional {
-        ConnectCooldownDecision::SkipIntentional
-    } else if nonempty_stretch.is_some_and(|d| d < min_stretch) {
-        ConnectCooldownDecision::SkipShortArrival
-    } else {
-        ConnectCooldownDecision::Arm
-    }
-}
-
-/// Latched flush: open if still enabled and not already open (ignore fullscreen/cooldown).
-pub(crate) fn should_flush_latched_start(
-    pending: bool,
-    start_enabled: bool,
-    already_open: bool,
-) -> bool {
-    pending && start_enabled && !already_open
-}
-
-/// Keep a pad for one consecutive poll miss; drop on the second.
-///
-/// Returns the reconciled list and serials held this tick (for diagnostics).
-pub(crate) fn reconcile_poll_with_hold(
-    previous: &[ControllerStatus],
-    polled: Vec<ControllerStatus>,
-    miss_counts: &mut HashMap<String, u8>,
-) -> (Vec<ControllerStatus>, Vec<String>) {
-    let polled_serials: HashSet<String> = polled.iter().map(|c| c.serial.clone()).collect();
-
-    // Pads that returned clear their miss streak.
-    miss_counts.retain(|serial, _| !polled_serials.contains(serial));
-
-    let mut out = polled;
-    let mut held = Vec::new();
-
-    for prev in previous {
-        if polled_serials.contains(&prev.serial) {
-            continue;
-        }
-        let count = miss_counts.entry(prev.serial.clone()).or_insert(0);
-        *count = count.saturating_add(1);
-        if *count == 1 {
-            held.push(prev.serial.clone());
-            out.push(prev.clone());
-        } else {
-            // Second consecutive miss: accept the drop.
-            miss_counts.remove(&prev.serial);
-        }
-    }
-
-    out.sort_by(|a, b| a.serial.cmp(&b.serial));
-    for (i, controller) in out.iter_mut().enumerate() {
-        controller.index = i + 1;
-    }
-    (out, held)
-}
-
-#[cfg(test)]
-mod start_gate_tests {
-    use super::{
-        ConnectCooldownDecision, connect_cooldown_on_empty, reconcile_poll_with_hold,
-        should_auto_open_start, should_defer_auto_open_start, should_flush_latched_start,
-        take_skip_connect_cooldown,
-    };
-    use crate::controller::dualsense::battery::dualsense_status;
-    use crate::controller::model::{Connection, ControllerStatus, PowerState};
-    use std::collections::HashMap;
-    use std::time::Duration;
-
-    fn pad(serial: &str) -> ControllerStatus {
-        dualsense_status(
-            1,
-            "DualSense",
-            Connection::Bluetooth,
-            serial.to_string(),
-            50,
-            PowerState::Discharging,
-        )
-    }
-
-    #[test]
-    fn opens_on_clean_zero_to_one() {
-        assert!(should_auto_open_start(
-            true, true, true, false, false, false
-        ));
-    }
-
-    #[test]
-    fn skips_when_disabled_empty_open_cooldown_or_fullscreen() {
-        assert!(!should_auto_open_start(
-            false, true, true, false, false, false
-        ));
-        assert!(!should_auto_open_start(
-            true, false, true, false, false, false
-        ));
-        assert!(!should_auto_open_start(
-            true, true, true, true, false, false
-        ));
-        assert!(!should_auto_open_start(
-            true, true, true, false, true, false
-        ));
-        assert!(!should_auto_open_start(
-            true, true, true, false, false, true
-        ));
-    }
-
-    #[test]
-    fn defers_start_only_when_connect_toast_pending() {
-        assert!(should_defer_auto_open_start(true, true));
-        assert!(!should_defer_auto_open_start(true, false));
-        assert!(!should_defer_auto_open_start(false, true));
-        assert!(!should_defer_auto_open_start(false, false));
-    }
-
-    #[test]
-    fn latched_flush_ignores_fullscreen_and_requires_pending() {
-        assert!(should_flush_latched_start(true, true, false));
-        assert!(!should_flush_latched_start(true, true, true));
-        assert!(!should_flush_latched_start(true, false, false));
-        assert!(!should_flush_latched_start(false, true, false));
-    }
-
-    #[test]
-    fn intentional_power_off_skips_connect_cooldown_once() {
-        let mut flag = true;
-        assert!(take_skip_connect_cooldown(&mut flag));
-        assert!(!flag);
-        assert!(!take_skip_connect_cooldown(&mut flag));
-    }
-
-    #[test]
-    fn short_arrival_skips_cooldown_long_stretch_arms() {
-        let min = Duration::from_secs(2);
-        assert_eq!(
-            connect_cooldown_on_empty(true, Some(Duration::from_secs(10)), min),
-            ConnectCooldownDecision::SkipIntentional
-        );
-        assert_eq!(
-            connect_cooldown_on_empty(false, Some(Duration::from_millis(500)), min),
-            ConnectCooldownDecision::SkipShortArrival
-        );
-        assert_eq!(
-            connect_cooldown_on_empty(false, Some(Duration::from_secs(3)), min),
-            ConnectCooldownDecision::Arm
-        );
-        assert_eq!(
-            connect_cooldown_on_empty(false, None, min),
-            ConnectCooldownDecision::Arm
-        );
-    }
-
-    #[test]
-    fn one_miss_held_second_miss_dropped() {
-        let previous = vec![pad("a")];
-        let mut misses = HashMap::new();
-
-        let (held_list, held) = reconcile_poll_with_hold(&previous, Vec::new(), &mut misses);
-        assert_eq!(held, vec!["a".to_string()]);
-        assert_eq!(held_list.len(), 1);
-        assert_eq!(held_list[0].serial, "a");
-        assert_eq!(misses.get("a"), Some(&1));
-
-        let (dropped, held2) = reconcile_poll_with_hold(&held_list, Vec::new(), &mut misses);
-        assert!(held2.is_empty());
-        assert!(dropped.is_empty());
-        assert!(!misses.contains_key("a"));
-    }
-
-    #[test]
-    fn returned_pad_clears_miss_streak() {
-        let previous = vec![pad("a")];
-        let mut misses = HashMap::new();
-        let (held_list, _) = reconcile_poll_with_hold(&previous, Vec::new(), &mut misses);
-        assert_eq!(misses.get("a"), Some(&1));
-
-        let (back, held) = reconcile_poll_with_hold(&held_list, vec![pad("a")], &mut misses);
-        assert!(held.is_empty());
-        assert_eq!(back.len(), 1);
-        assert!(!misses.contains_key("a"));
-    }
 }

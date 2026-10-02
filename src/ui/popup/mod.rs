@@ -69,7 +69,7 @@ impl ControllerRow {
     ) -> Self {
         Self {
             serial: controller.serial.clone(),
-            product: controller.product.to_string(),
+            product: controller.product.clone(),
             nickname,
             connection: controller.connection.to_string(),
             state: if controller.is_low_battery(low_battery_percent) {

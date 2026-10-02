@@ -1,9 +1,9 @@
 //! Persisted notification preferences.
 
 use crate::controller::dualsense::battery::LOW_BATTERY_PERCENT;
+use crate::domain::color::BatterySpectrum;
+use crate::domain::gesture::{GestureControl, default_gesture};
 use crate::platform::app_log;
-use crate::ui::color::BatterySpectrum;
-use crate::ui::start::gesture::{GestureControl, default_gesture};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;

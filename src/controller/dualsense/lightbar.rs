@@ -4,8 +4,9 @@ use crate::controller::dualsense::identity::{
     self as dualsense, is_dualsense_device, is_dualsense_gamepad, normalize_identity,
     resolve_device_identity,
 };
+use crate::domain::color::Rgb;
+use crate::domain::protocol::{CALIBRATION_FEATURE_REPORT, CALIBRATION_FEATURE_SIZE};
 use crate::platform::app_log;
-use crate::ui::color::Rgb;
 use hidapi::{BusType, HidApi, HidDevice};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -37,10 +38,6 @@ const OUTPUT_REPORT_BT_ID: u8 = 0x31;
 const OUTPUT_REPORT_BT_SIZE: usize = 78;
 const OUTPUT_REPORT_BT_TAG: u8 = 0x10;
 const OUTPUT_CRC32_SEED: u8 = 0xA2;
-/// Calibration feature report — requesting it switches BT pads to full reports / effects
-/// (same as Linux hid-playstation / SDL enhanced mode).
-const CALIBRATION_FEATURE_REPORT: u8 = 0x05;
-const CALIBRATION_FEATURE_SIZE: usize = 41;
 
 /// Offsets into the DualSense common output payload (after report ID / BT header).
 const OFF_VALID_FLAG1: usize = 1;

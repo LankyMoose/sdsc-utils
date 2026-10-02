@@ -22,16 +22,18 @@ use crate::controller::dualsense::identity::{
     is_dualsense_device, is_dualsense_gamepad, normalize_identity, resolve_device_identity,
 };
 use crate::controller::dualsense::lightbar::{
-    self, HidPhaseTiming, IDENTIFY_FLASH_COUNT, IDENTIFY_FLASH_MS,
+    self, HidPhaseTiming, IDENTIFY_FLASH_COUNT, IDENTIFY_FLASH_MS, LOW_BATTERY_ORANGE,
+    LOW_BATTERY_PULSE_GAP_MS, LOW_BATTERY_PULSE_ON_MS,
 };
 use crate::controller::dualsense::rumble;
 use crate::controller::hid::poll::{self, PRESENCE_INTERVAL, PRESENCE_INTERVAL_EMPTY};
 use crate::controller::model::ControllerStatus;
-use crate::platform::app_log;
-use crate::ui::color::{Rgb, color_for_battery_percent};
-use crate::ui::start::input::{
-    self as start_input, InputSnapshot, NavReading, ShortSampleOutcome, SnapshotReason,
+use crate::domain::color::{Rgb, color_for_battery_percent};
+use crate::domain::pad::{
+    self as start_input, InputSnapshot, NavReading, ShortSampleOutcome, SnapshotMeta,
+    SnapshotReason,
 };
+use crate::platform::app_log;
 use hidapi::{BusType, HidApi, HidDevice};
 use iced::futures::channel::oneshot;
 use std::collections::HashMap;
@@ -77,6 +79,10 @@ enum HidCmd {
     },
     /// Zero motors on every open rumble handle and drop them.
     RumbleStopAll,
+    /// Replace the low-battery orange pulse target list (empty = stop pulsing).
+    SetLowBatteryTargets {
+        targets: Vec<(String, u8)>,
+    },
     Shutdown,
 }
 
@@ -115,7 +121,7 @@ impl DeviceCache {
         let mut paths: Vec<String> = self
             .api
             .device_list()
-            .filter(|d| driver::registry().for_gamepad(d).is_some())
+            .filter(|d| driver::is_gamepad(d))
             .map(|d| d.path().to_string_lossy().into_owned())
             .collect();
         paths.sort();
@@ -151,11 +157,7 @@ impl DeviceCache {
     fn try_open_serial(&mut self, serial: &str) -> Option<OpenDevice> {
         let target = normalize_identity(serial);
         let mut best: Option<(OpenDevice, bool)> = None;
-        for info in self
-            .api
-            .device_list()
-            .filter(|d| driver::registry().for_gamepad(d).is_some())
-        {
+        for info in self.api.device_list().filter(|d| driver::is_gamepad(d)) {
             let open_started = Instant::now();
             let hint = info.serial_number().unwrap_or("");
             let device = {
@@ -183,10 +185,7 @@ impl DeviceCache {
                     }
                 }
             };
-            let identity = driver::registry()
-                .for_gamepad(info)
-                .map(|drv| drv.identity(info, &device))
-                .unwrap_or_else(|| resolve_device_identity(info, &device));
+            let identity = resolve_device_identity(info, &device);
             if identity != target {
                 continue;
             }
@@ -240,7 +239,7 @@ impl DeviceCache {
             let live: std::collections::HashSet<String> = self
                 .api
                 .device_list()
-                .filter(|d| driver::registry().for_gamepad(d).is_some())
+                .filter(|d| driver::is_gamepad(d))
                 .filter_map(|d| {
                     d.serial_number()
                         .filter(|s| !s.is_empty())
@@ -253,11 +252,7 @@ impl DeviceCache {
         }
 
         let mut best: HashMap<String, (OpenDevice, bool)> = HashMap::new();
-        for info in self
-            .api
-            .device_list()
-            .filter(|d| driver::registry().for_gamepad(d).is_some())
-        {
+        for info in self.api.device_list().filter(|d| driver::is_gamepad(d)) {
             let identity_hint = info.serial_number().filter(|s| !s.is_empty()).unwrap_or("");
             // Skip open if we already hold this pad (second open often fails exclusive).
             if !identity_hint.is_empty()
@@ -293,10 +288,7 @@ impl DeviceCache {
                     }
                 }
             };
-            let identity = driver::registry()
-                .for_gamepad(info)
-                .map(|drv| drv.identity(info, &device))
-                .unwrap_or_else(|| resolve_device_identity(info, &device));
+            let identity = resolve_device_identity(info, &device);
             if self.devices.contains_key(&identity) {
                 continue;
             }
@@ -442,6 +434,103 @@ struct IdentifySession {
     started: Instant,
 }
 
+/// Worker-owned low-battery orange pulse (replaces the App side thread).
+///
+/// Timing matches the old pulse thread: gap → for each target orange → restore → gap.
+/// Yields to Identify (no RGB writes while an Identify session is live) and to the
+/// lightbar enable flag.
+struct LowBatteryPulse {
+    targets: Vec<(String, u8)>,
+    phase: PulsePhase,
+}
+
+enum PulsePhase {
+    /// Waiting before the next orange burst.
+    Gap { until: Instant },
+    /// Holding orange on `targets[index]` until restore.
+    Orange { index: usize, until: Instant },
+}
+
+impl LowBatteryPulse {
+    fn new() -> Self {
+        Self {
+            targets: Vec::new(),
+            phase: PulsePhase::Gap {
+                until: Instant::now() + Duration::from_millis(LOW_BATTERY_PULSE_GAP_MS),
+            },
+        }
+    }
+
+    fn set_targets(&mut self, targets: Vec<(String, u8)>) {
+        self.targets = targets;
+        if self.targets.is_empty() {
+            self.phase = PulsePhase::Gap {
+                until: Instant::now() + Duration::from_millis(LOW_BATTERY_PULSE_GAP_MS),
+            };
+        }
+    }
+
+    fn wake_at(&self) -> Option<Instant> {
+        if self.targets.is_empty() {
+            return None;
+        }
+        Some(match &self.phase {
+            PulsePhase::Gap { until } | PulsePhase::Orange { until, .. } => *until,
+        })
+    }
+
+    /// Advance the pulse schedule. Returns true when an RGB write ran.
+    fn tick(&mut self, cache: &mut DeviceCache, identifying: bool, now: Instant) -> bool {
+        if self.targets.is_empty() {
+            return false;
+        }
+        match self.phase {
+            PulsePhase::Gap { until } if now >= until => {
+                if identifying || !lightbar::is_enabled() {
+                    // Reschedule gap without writing — Identify / disable owns the bar.
+                    self.phase = PulsePhase::Gap {
+                        until: now + Duration::from_millis(LOW_BATTERY_PULSE_GAP_MS),
+                    };
+                    return false;
+                }
+                let (serial, _) = &self.targets[0];
+                let _ = write_rgb_exclusive(cache, serial, LOW_BATTERY_ORANGE);
+                self.phase = PulsePhase::Orange {
+                    index: 0,
+                    until: now + Duration::from_millis(LOW_BATTERY_PULSE_ON_MS),
+                };
+                true
+            }
+            PulsePhase::Orange { index, until } if now >= until => {
+                if identifying || !lightbar::is_enabled() {
+                    self.phase = PulsePhase::Gap {
+                        until: now + Duration::from_millis(LOW_BATTERY_PULSE_GAP_MS),
+                    };
+                    return false;
+                }
+                let (serial, percent) = self.targets[index].clone();
+                let color = color_for_battery_percent(percent);
+                let _ = write_rgb_exclusive(cache, &serial, color);
+                let next = index + 1;
+                if next < self.targets.len() {
+                    let (serial, _) = &self.targets[next];
+                    let _ = write_rgb_exclusive(cache, serial, LOW_BATTERY_ORANGE);
+                    self.phase = PulsePhase::Orange {
+                        index: next,
+                        until: now + Duration::from_millis(LOW_BATTERY_PULSE_ON_MS),
+                    };
+                } else {
+                    self.phase = PulsePhase::Gap {
+                        until: now + Duration::from_millis(LOW_BATTERY_PULSE_GAP_MS),
+                    };
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Cloneable handle to enqueue DualSense HID work.
 #[derive(Clone)]
 pub struct HidWorkerHandle {
@@ -553,6 +642,11 @@ impl HidWorkerHandle {
         let _ = self.tx.send(HidCmd::RumbleStopAll);
     }
 
+    /// Replace the low-battery orange pulse targets (empty clears).
+    pub fn set_low_battery_targets(&self, targets: Vec<(String, u8)>) {
+        let _ = self.tx.send(HidCmd::SetLowBatteryTargets { targets });
+    }
+
     pub fn shutdown(&self) {
         let _ = self.tx.send(HidCmd::Shutdown);
     }
@@ -628,6 +722,7 @@ fn publish_snapshot(
     reason: SnapshotReason,
     after_cmd: Option<&str>,
     last_noisy_log: &Mutex<Instant>,
+    emit_edge: bool,
 ) {
     let _op = crate::controller::hid::diag::enter_op("publish_snapshot");
     let prev_pads = snapshot.lock().map(|g| g.readings.len()).unwrap_or(0);
@@ -636,11 +731,28 @@ fn publish_snapshot(
     let now_empty = readings.is_empty();
     let pad_count = readings.len();
 
-    if let Ok(mut guard) = snapshot.lock() {
+    let meta = if let Ok(mut guard) = snapshot.lock() {
         guard.seq = guard.seq.saturating_add(1);
         guard.published_at = Instant::now();
         guard.reason = reason;
-        guard.readings = readings;
+        guard.readings = readings.clone();
+        SnapshotMeta {
+            published_at: guard.published_at,
+            seq: guard.seq,
+            reason: guard.reason,
+            pad_count: guard.readings.len(),
+        }
+    } else {
+        SnapshotMeta {
+            published_at: Instant::now(),
+            seq: 0,
+            reason,
+            pad_count,
+        }
+    };
+
+    if emit_edge {
+        start_input::push_input_edge(start_input::InputEdge::from_snapshot(readings, &meta));
     }
 
     let clearing = matches!(
@@ -717,7 +829,7 @@ fn sample_all_inputs(
             ));
         }
     }
-    publish_snapshot(snapshot, out, reason, after_cmd, last_noisy_log);
+    publish_snapshot(snapshot, out, reason, after_cmd, last_noisy_log, input_hot);
 }
 
 /// Refresh the snapshot entry for one serial (Identify path).
@@ -729,7 +841,7 @@ fn sample_serial_into_snapshot(
 ) {
     match sample_one(cache, serial, input_hot) {
         SampleOneResult::Ok(reading) => {
-            if let Ok(mut guard) = snapshot.lock() {
+            let edge = if let Ok(mut guard) = snapshot.lock() {
                 guard.seq = guard.seq.saturating_add(1);
                 guard.published_at = Instant::now();
                 guard.reason = SnapshotReason::Identify;
@@ -737,6 +849,22 @@ fn sample_serial_into_snapshot(
                     *slot = reading;
                 } else {
                     guard.readings.push(reading);
+                }
+                Some(start_input::InputEdge::from_snapshot(
+                    guard.readings.clone(),
+                    &SnapshotMeta {
+                        published_at: guard.published_at,
+                        seq: guard.seq,
+                        reason: guard.reason,
+                        pad_count: guard.readings.len(),
+                    },
+                ))
+            } else {
+                None
+            };
+            if input_hot {
+                if let Some(edge) = edge {
+                    start_input::push_input_edge(edge);
                 }
             }
         }
@@ -989,6 +1117,7 @@ fn handle_cmd(
     cache: &mut DeviceCache,
     rumble: &mut RumbleCache,
     active_rumble: &mut Vec<ActiveRumble>,
+    pulse: &mut LowBatteryPulse,
     snapshot: &Mutex<InputSnapshot>,
     identifying: &AtomicBool,
     last_noisy_log: &Mutex<Instant>,
@@ -998,6 +1127,7 @@ fn handle_cmd(
         HidCmd::Shutdown => {
             abort_identify(session, cache, identifying);
             stop_all_rumble(rumble, active_rumble);
+            pulse.set_targets(Vec::new());
             cache.drop_all();
             publish_snapshot(
                 snapshot,
@@ -1005,6 +1135,7 @@ fn handle_cmd(
                 SnapshotReason::ClearedShutdown,
                 Some("Shutdown"),
                 last_noisy_log,
+                false,
             );
             true
         }
@@ -1034,6 +1165,7 @@ fn handle_cmd(
                 SnapshotReason::ClearedPowerOff,
                 Some("PowerOff"),
                 last_noisy_log,
+                input_hot,
             );
             log_cmd_begin("PowerOff", snapshot);
             let started = Instant::now();
@@ -1108,6 +1240,10 @@ fn handle_cmd(
             stop_all_rumble(rumble, active_rumble);
             false
         }
+        HidCmd::SetLowBatteryTargets { targets } => {
+            pulse.set_targets(targets);
+            false
+        }
         HidCmd::Poll { previously, reply } => {
             // Release input + rumble handles so Poll can open; keep last nav readings.
             stop_all_rumble(rumble, active_rumble);
@@ -1152,6 +1288,7 @@ fn worker_loop(
     lightbar::forget_all_claims();
     let mut rumble = RumbleCache::new();
     let mut active_rumble: Vec<ActiveRumble> = Vec::new();
+    let mut pulse = LowBatteryPulse::new();
     let mut session: Option<IdentifySession> = None;
     let mut stall_logged = false;
     let mut in_cmd = "none";
@@ -1159,7 +1296,12 @@ fn worker_loop(
     loop {
         crate::controller::hid::diag::note_progress("worker_loop");
         let hot = input_hot.load(Ordering::Relaxed);
-        expire_rumble(&mut rumble, &mut active_rumble, Instant::now());
+        let now = Instant::now();
+        expire_rumble(&mut rumble, &mut active_rumble, now);
+        let identifying_now = session.is_some() || identifying.load(Ordering::SeqCst);
+        if pulse.tick(&mut cache, identifying_now, now) {
+            in_cmd = "LowBatteryPulse";
+        }
         maybe_log_sample_stall(
             &input_snapshot,
             hot,
@@ -1197,6 +1339,7 @@ fn worker_loop(
                     HidCmd::SetRgb { .. } => "SetRgb",
                     HidCmd::Rumble { .. } => "Rumble",
                     HidCmd::RumbleStopAll => "RumbleStopAll",
+                    HidCmd::SetLowBatteryTargets { .. } => "SetLowBatteryTargets",
                     HidCmd::Shutdown => "Shutdown",
                 };
                 if handle_cmd(
@@ -1205,6 +1348,7 @@ fn worker_loop(
                     &mut cache,
                     &mut rumble,
                     &mut active_rumble,
+                    &mut pulse,
                     &input_snapshot,
                     &identifying,
                     &last_noisy_log,
@@ -1221,7 +1365,10 @@ fn worker_loop(
             Err(mpsc::TryRecvError::Empty) => {}
         }
 
-        if hot || session.is_some() || !active_rumble.is_empty() {
+        let pulse_pending = pulse
+            .wake_at()
+            .is_some_and(|t| t <= Instant::now() + ACTIVE_POLL);
+        if hot || session.is_some() || !active_rumble.is_empty() || pulse_pending {
             if let Some(s) = session.as_ref() {
                 let serial = s.serial.clone();
                 let until_flash = s
@@ -1235,14 +1382,27 @@ fn worker_loop(
             } else if hot {
                 sample_all_inputs(&mut cache, &input_snapshot, hot, &last_noisy_log, None);
             } else {
-                // Rumble stop pending while input is cold — wake soon, no sample.
-                thread::sleep(ACTIVE_POLL);
+                // Rumble/pulse stop pending while input is cold — wake soon, no sample.
+                let sleep_for = pulse
+                    .wake_at()
+                    .map(|t| t.saturating_duration_since(Instant::now()))
+                    .unwrap_or(ACTIVE_POLL)
+                    .min(ACTIVE_POLL);
+                if !sleep_for.is_zero() {
+                    thread::sleep(sleep_for);
+                }
             }
             continue;
         }
 
-        // Idle: wait for a command (or presence-driven wake).
-        match rx.recv_timeout(BACKGROUND_POLL) {
+        // Idle: wait for a command, presence wake, or next pulse tick.
+        let idle_timeout = pulse
+            .wake_at()
+            .map(|t| t.saturating_duration_since(Instant::now()))
+            .unwrap_or(BACKGROUND_POLL)
+            .min(BACKGROUND_POLL)
+            .max(Duration::from_millis(1));
+        match rx.recv_timeout(idle_timeout) {
             Ok(cmd) => {
                 in_cmd = match &cmd {
                     HidCmd::Poll { .. } => "Poll",
@@ -1251,6 +1411,7 @@ fn worker_loop(
                     HidCmd::SetRgb { .. } => "SetRgb",
                     HidCmd::Rumble { .. } => "Rumble",
                     HidCmd::RumbleStopAll => "RumbleStopAll",
+                    HidCmd::SetLowBatteryTargets { .. } => "SetLowBatteryTargets",
                     HidCmd::Shutdown => "Shutdown",
                 };
                 if handle_cmd(
@@ -1259,6 +1420,7 @@ fn worker_loop(
                     &mut cache,
                     &mut rumble,
                     &mut active_rumble,
+                    &mut pulse,
                     &input_snapshot,
                     &identifying,
                     &last_noisy_log,

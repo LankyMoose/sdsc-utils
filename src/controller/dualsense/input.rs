@@ -1,7 +1,7 @@
 //! DualSense input-report parsing into the shared [`PadSample`] nav contract.
 
-use crate::ui::start::gesture::GestureControl;
-use crate::ui::start::input::{PadSample, combined_stick};
+use crate::domain::gesture::GestureControl;
+use crate::domain::pad::{PadSample, combined_stick};
 use std::collections::BTreeSet;
 
 const TRIGGER_ANALOG_THRESHOLD: u8 = 30;

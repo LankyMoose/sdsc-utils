@@ -1,21 +1,16 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-mod app;
-mod controller;
-mod games;
-mod persist;
-mod platform;
-mod ui;
+//! SDSC Utils service — owns DualSense HID, tray, and session; spawns the iced shell.
 
-use platform::app_log;
-use platform::app_meta::{DISPLAY_NAME, PKG_NAME, PKG_VERSION};
-use platform::autostart;
-use platform::crash_restart;
+use sdsc_utils::platform::app_log;
+use sdsc_utils::platform::app_meta::{DISPLAY_NAME, PKG_NAME, PKG_VERSION};
+use sdsc_utils::platform::autostart;
+use sdsc_utils::platform::crash_restart;
+use sdsc_utils::{controller, ipc, service};
 use single_instance::SingleInstance;
 use std::env;
 use std::io::{self, Write};
 use std::process::ExitCode;
-use ui::color;
 
 fn main() -> ExitCode {
     app_log::init();
@@ -26,7 +21,6 @@ fn main() -> ExitCode {
         return crash_restart::run_relauncher();
     }
 
-    // Undocumented: set the crash-restart notice flag, then start tray normally.
     let test_crash_toast = args.iter().any(|a| a == "--test-crash-toast");
     let args: Vec<String> = args
         .into_iter()
@@ -88,13 +82,6 @@ fn main() -> ExitCode {
         return set_lightbar_cli(&args[idx + 1..]);
     }
 
-    #[cfg(feature = "dev-emulate")]
-    let (dev_mode, args) = {
-        let dev_mode = args.iter().any(|a| a == "--dev");
-        let args: Vec<String> = args.into_iter().filter(|a| a != "--dev").collect();
-        (dev_mode, args)
-    };
-
     if let Some(unknown) = args.first() {
         attach_console_for_cli();
         eprintln!("error: unknown argument '{unknown}'");
@@ -117,13 +104,8 @@ fn main() -> ExitCode {
 
     crash_restart::arm_tray_mode();
 
-    #[cfg(feature = "dev-emulate")]
-    let tray_result = app::run(dev_mode);
-    #[cfg(not(feature = "dev-emulate"))]
-    let tray_result = app::run();
-
-    if let Err(err) = tray_result {
-        app_log::error(format!("tray exited with error: {err}"));
+    if let Err(err) = service::run() {
+        app_log::error(format!("service exited with error: {err}"));
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -144,10 +126,8 @@ fn print_help() {
     println!(
         "      --set-lightbar R G B   Set lightbar RGB (0-255) on all connected pads and exit"
     );
-    #[cfg(feature = "dev-emulate")]
-    println!("      --dev                  Enable Developer menu in Configure (emulated pads)");
     println!();
-    println!("With no options, starts the system tray app.");
+    println!("With no options, starts the HID/tray service and spawns sdsc-shell.");
 }
 
 fn attach_console_for_cli() {
@@ -170,29 +150,47 @@ fn attach_console_for_cli() {
 }
 
 fn list_controllers_cli() -> ExitCode {
+    // Prefer talking to a running service so we don't open a second HidApi.
+    if let Ok(mut client) = ipc::PipeClient::connect() {
+        match client.request_list_controllers() {
+            Ok(statuses) => {
+                print_controllers(&statuses);
+                return ExitCode::SUCCESS;
+            }
+            Err(err) => {
+                eprintln!("error: ipc list failed: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     match controller::hid::poll::poll_controllers(&[]) {
         Ok(statuses) => {
-            if statuses.is_empty() {
-                println!("No DualSense controllers found.");
-            } else {
-                println!("{} controller(s):", statuses.len());
-                for s in &statuses {
-                    println!(
-                        "  #{} {} ({}) id={} {}% {}",
-                        s.index,
-                        s.product,
-                        s.connection,
-                        s.serial,
-                        s.percent,
-                        s.state.as_str()
-                    );
-                }
-            }
+            print_controllers(&statuses);
             ExitCode::SUCCESS
         }
         Err(err) => {
             eprintln!("error: {err}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+fn print_controllers(statuses: &[controller::model::ControllerStatus]) {
+    if statuses.is_empty() {
+        println!("No DualSense controllers found.");
+    } else {
+        println!("{} controller(s):", statuses.len());
+        for s in statuses {
+            println!(
+                "  #{} {} ({}) id={} {}% {}",
+                s.index,
+                s.product,
+                s.connection,
+                s.serial,
+                s.percent,
+                s.state.as_str()
+            );
         }
     }
 }
@@ -220,12 +218,41 @@ fn set_lightbar_cli(rgb_args: &[String]) -> ExitCode {
         }
     };
 
-    let color = color::Rgb::new(r, g, b);
-    let registry = controller::driver::registry();
-    // DualSense is the only lightbar driver today; refuse clearly if none match.
+    let color = sdsc_utils::domain::color::Rgb::new(r, g, b);
+
+    if let Ok(mut client) = ipc::PipeClient::connect() {
+        if let Err(err) = client.send_command(&ipc::ShellCommand::SetLightbarAll { color }) {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+        match ipc::recv_matching(&mut client, |m| {
+            matches!(m, ipc::ServiceMessage::LightbarSet { .. })
+        }) {
+            Ok(ipc::ServiceMessage::LightbarSet { count }) => {
+                if count == 0 {
+                    eprintln!("error: no DualSense controllers found");
+                    return ExitCode::FAILURE;
+                }
+                println!(
+                    "Set lightbar to {} on {count} controller(s).",
+                    color.to_hex()
+                );
+                return ExitCode::SUCCESS;
+            }
+            Ok(other) => {
+                eprintln!("error: unexpected reply {other:?}");
+                return ExitCode::FAILURE;
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     let any_gamepad = hidapi::HidApi::new()
         .ok()
-        .map(|api| api.device_list().any(|d| registry.for_gamepad(d).is_some()))
+        .map(|api| api.device_list().any(|d| controller::driver::is_gamepad(d)))
         .unwrap_or(false);
     if !any_gamepad {
         eprintln!("error: no DualSense controllers found");

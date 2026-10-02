@@ -18,7 +18,7 @@ pub const TOAST_SLIDE_DURATION: std::time::Duration = std::time::Duration::from_
 pub const TOAST_SLIDE_MAX_FRAME_DT: std::time::Duration = std::time::Duration::from_millis(32);
 
 /// Screen rectangle of the tray icon, in physical pixels.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct TrayAnchor {
     pub x: f32,
     pub y: f32,

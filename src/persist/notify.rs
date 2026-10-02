@@ -2,6 +2,7 @@
 
 use crate::controller::model::{ControllerStatus, PowerState};
 use crate::persist::prefs::Prefs;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Default)]
@@ -23,7 +24,7 @@ enum NotifyKind {
     Charged,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotifyEvent {
     pub heading: String,
     pub body: String,
@@ -128,7 +129,7 @@ fn format_event(
 ) -> NotifyEvent {
     let name = nickname
         .filter(|value| !value.is_empty())
-        .unwrap_or(controller.product);
+        .unwrap_or(controller.product.as_str());
     let heading = format!("{name} ({})", controller.connection);
     match kind {
         NotifyKind::Connect => NotifyEvent {
