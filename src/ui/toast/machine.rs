@@ -7,6 +7,10 @@
 use crate::ui::layout::{TOAST_SLIDE_DURATION, advance_toast_slide};
 use std::time::Duration;
 
+/// Frame ticks while Placing before the reopen gesture is allowed again (~1s at 16ms).
+/// Does not leave Placing or emit OpenStart — only lifts gesture suppress.
+pub const PLACING_GESTURE_SUPPRESS_FRAMES: u32 = 60;
+
 /// What to do after this toast reaches rest (or finishes early).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AfterToast {
@@ -36,6 +40,8 @@ pub struct Active {
     pub after: AfterToast,
     /// Toast body for debug transition lines (e.g. "Connected").
     pub body: String,
+    /// Count of Frame events while in Placing (gesture suppress budget).
+    pub placing_frames: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -113,15 +119,24 @@ impl State {
     }
 
     /// True while 0→1 Start is latched and the toast has not reached rest yet.
+    ///
+    /// During Placing, suppress lifts after [`PLACING_GESTURE_SUPPRESS_FRAMES`] so a
+    /// lost `Shown` cannot block the reopen gesture forever. Phase stays Placing.
     pub fn suppresses_reopen_gesture(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::Active(Active {
                 after: AfterToast::OpenStart,
-                phase: Phase::Placing | Phase::SlidingIn { .. },
+                phase: Phase::Placing,
+                placing_frames,
                 ..
-            })
-        )
+            }) => *placing_frames < PLACING_GESTURE_SUPPRESS_FRAMES,
+            Self::Active(Active {
+                after: AfterToast::OpenStart,
+                phase: Phase::SlidingIn { .. },
+                ..
+            }) => true,
+            _ => false,
+        }
     }
 
     pub fn is_resting(&self) -> bool {
@@ -173,6 +188,7 @@ pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
                 phase: Phase::Placing,
                 after,
                 body,
+                placing_frames: 0,
             }),
             vec![Effect::PlaceShow],
         ),
@@ -183,6 +199,7 @@ pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
                 phase: Phase::Placing,
                 after,
                 body,
+                placing_frames,
             }),
             Event::Shown {
                 generation: shown_gen,
@@ -195,17 +212,20 @@ pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
                 },
                 after,
                 body,
+                placing_frames,
             }),
             Vec::new(),
         ),
 
         // Placing is event-only: frames never advance or abort placement.
+        // Count frames so gesture suppress can lift without emitting OpenStart.
         (
             State::Active(Active {
                 generation,
                 phase: Phase::Placing,
                 after,
                 body,
+                placing_frames,
             }),
             Event::Frame {
                 generation: frame_gen,
@@ -217,6 +237,7 @@ pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
                 phase: Phase::Placing,
                 after,
                 body,
+                placing_frames: placing_frames.saturating_add(1),
             }),
             Vec::new(),
         ),
@@ -227,12 +248,21 @@ pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
                 phase: Phase::SlidingIn { elapsed },
                 after,
                 body,
+                placing_frames,
             }),
             Event::Frame {
                 generation: frame_gen,
                 raw_dt,
             },
-        ) if frame_gen == generation => step_slide(generation, elapsed, raw_dt, after, body, false),
+        ) if frame_gen == generation => step_slide(
+            generation,
+            elapsed,
+            raw_dt,
+            after,
+            body,
+            placing_frames,
+            false,
+        ),
 
         (
             State::Active(Active {
@@ -240,12 +270,21 @@ pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
                 phase: Phase::SlidingOut { elapsed },
                 after,
                 body,
+                placing_frames,
             }),
             Event::Frame {
                 generation: frame_gen,
                 raw_dt,
             },
-        ) if frame_gen == generation => step_slide(generation, elapsed, raw_dt, after, body, true),
+        ) if frame_gen == generation => step_slide(
+            generation,
+            elapsed,
+            raw_dt,
+            after,
+            body,
+            placing_frames,
+            true,
+        ),
 
         (
             State::Active(Active {
@@ -253,6 +292,7 @@ pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
                 phase: Phase::Resting,
                 after,
                 body,
+                placing_frames,
             }),
             Event::Frame {
                 generation: frame_gen,
@@ -264,6 +304,7 @@ pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
                 phase: Phase::Resting,
                 after,
                 body,
+                placing_frames,
             }),
             // Do not RaiseInteractive every tick — z-order churn under multi-window
             // present correlated with device/atlas stress. Raise on settle + sync only.
@@ -276,6 +317,7 @@ pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
                 phase: Phase::Placing,
                 after,
                 body: _,
+                placing_frames: _,
             }),
             Event::Dismiss {
                 generation: dismiss_gen,
@@ -295,6 +337,7 @@ pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
                 phase: Phase::SlidingIn { .. } | Phase::Resting,
                 after,
                 body,
+                placing_frames,
             }),
             Event::Dismiss {
                 generation: dismiss_gen,
@@ -307,6 +350,7 @@ pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
                 },
                 after,
                 body,
+                placing_frames,
             }),
             // First dismiss frame runs on next ToastFrame; kick one Move at 0.
             vec![Effect::Move {
@@ -326,6 +370,7 @@ fn step_slide(
     raw_dt: Duration,
     after: AfterToast,
     body: String,
+    placing_frames: u32,
     dismissing: bool,
 ) -> (State, Vec<Effect>) {
     let (new_elapsed, progress, capped) =
@@ -359,6 +404,7 @@ fn step_slide(
                 phase,
                 after,
                 body,
+                placing_frames,
             }),
             effects,
         );
@@ -384,6 +430,7 @@ fn step_slide(
                 phase: Phase::Resting,
                 after,
                 body,
+                placing_frames,
             }),
             effects,
         )
@@ -440,6 +487,7 @@ mod tests {
                 generation: 1,
                 phase: Phase::Placing,
                 after: AfterToast::OpenStart,
+                placing_frames: 0,
                 ..
             })
         ));
@@ -464,6 +512,60 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::OpenStart | Effect::Finished))
         );
+        // One frame counted; still under the suppress budget.
+        assert!(matches!(
+            state,
+            State::Active(Active {
+                placing_frames: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn placing_frame_budget_lifts_gesture_suppress_without_open_start() {
+        let (mut state, _) = step(State::Idle, show_connect(1));
+        for _ in 0..PLACING_GESTURE_SUPPRESS_FRAMES {
+            assert!(state.suppresses_reopen_gesture());
+            let (next, effects) = step(
+                state,
+                Event::Frame {
+                    generation: 1,
+                    raw_dt: Duration::from_secs(10),
+                },
+            );
+            assert!(effects.is_empty());
+            assert!(!effects.iter().any(|e| matches!(e, Effect::OpenStart)));
+            state = next;
+            assert!(matches!(state.phase(), Some(Phase::Placing)));
+        }
+        assert!(!state.suppresses_reopen_gesture());
+        assert!(matches!(state.phase(), Some(Phase::Placing)));
+        assert_eq!(state.after(), AfterToast::OpenStart);
+    }
+
+    #[test]
+    fn shown_after_placing_budget_still_settles_and_opens_start() {
+        let (mut state, _) = step(State::Idle, show_connect(1));
+        for _ in 0..PLACING_GESTURE_SUPPRESS_FRAMES {
+            let (next, _) = step(
+                state,
+                Event::Frame {
+                    generation: 1,
+                    raw_dt: Duration::from_millis(16),
+                },
+            );
+            state = next;
+        }
+        assert!(!state.suppresses_reopen_gesture());
+
+        let (state, _) = step(state, Event::Shown { generation: 1 });
+        assert!(matches!(state.phase(), Some(Phase::SlidingIn { .. })));
+        assert!(state.suppresses_reopen_gesture());
+
+        let (state, opened) = settle_slide_in(state);
+        assert!(opened, "slide-in never settled / opened Start");
+        assert!(state.is_resting());
     }
 
     #[test]

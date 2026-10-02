@@ -64,7 +64,7 @@ use iced::keyboard;
 use iced::widget::{container, operation, space};
 use iced::{Element, Point, Size, Subscription, Task, Theme, stream, window};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,6 +80,8 @@ const SPECTRUM_DEBOUNCE: Duration = Duration::from_millis(150);
 const TOAST_LIFETIME: Duration = Duration::from_secs(5);
 /// Ignore 0→1 auto-open briefly after the last pad vanished (BT ghost flaps).
 const START_CONNECT_COOLDOWN: Duration = Duration::from_secs(5);
+/// Nonempty stretch shorter than this is an arrival blip — do not arm ghost cooldown.
+const MIN_CONNECT_STRETCH: Duration = Duration::from_secs(2);
 /// DualSense poll rate while pad input is live (~one wired report).
 const PAD_POLL_ACTIVE: Duration = Duration::from_millis(4);
 /// UI animation tick (~60Hz). Prefer this over `window::frames()` so an
@@ -221,6 +223,12 @@ pub struct App {
     start_connect_cooldown_until: Option<Instant>,
     /// Set by intentional Power Off; next 1→0 must not arm connect cooldown.
     skip_next_connect_cooldown: bool,
+    /// When the controller list last became nonempty (short-arrival cooldown gate).
+    controllers_nonempty_since: Option<Instant>,
+    /// Consecutive poll misses per serial (hold one miss before accepting drop).
+    missed_poll_counts: HashMap<String, u8>,
+    /// 0→1 auto-open requested; cleared once Start is visible, retried on close-in-flight.
+    start_auto_open_pending: bool,
     /// After hide / connect-reveal: ignore reopen until the chord is fully released.
     reopen_needs_chord_release: bool,
     /// When Start was last revealed (unfocus grace).
@@ -383,6 +391,9 @@ impl App {
             start_file_dialog_open: false,
             start_connect_cooldown_until: None,
             skip_next_connect_cooldown: false,
+            controllers_nonempty_since: None,
+            missed_poll_counts: HashMap::new(),
+            start_auto_open_pending: false,
             reopen_needs_chord_release: false,
             start_revealed_at: None,
             gesture_detectors: GestureDetectorBank::default(),
@@ -623,7 +634,18 @@ impl App {
                     self.pad_nav.reset();
                     self.clear_start_nav_diag();
                     self.consume_reopen_gesture_chord();
-                    self.sync_toast_zorder()
+                    let sync = self.sync_toast_zorder();
+                    if self.start_auto_open_pending
+                        && self.prefs.start_screen_enabled
+                        && !self.controllers.is_empty()
+                    {
+                        crate::controller::hid::diag::diag_info(
+                            "ui-diag: retry start open after close",
+                        );
+                        sync.chain(self.open_start_screen())
+                    } else {
+                        sync
+                    }
                 } else if Some(id) == self.toast_window {
                     self.toast_window = None;
                     // Recreate so iced keeps a warm compositor for popup/Settings.
@@ -883,8 +905,9 @@ impl App {
         // often disappears from enumeration well before the next battery poll.
         if membership_changed && self.last_discovered.is_empty() {
             // Presence-only clear never runs HID poll; drop claims so reconnect
-            // always gets LIGHT_OUT + RGB.
+            // always gets LIGHT_OUT + RGB. Skip the one-miss hold — the device is gone.
             lightbar::sync_lightbar_claims(std::iter::empty::<&str>());
+            self.missed_poll_counts.clear();
             let task = if self.controllers.is_empty() {
                 Task::none()
             } else {
@@ -950,7 +973,19 @@ impl App {
         }
 
         match result {
-            Ok(controllers) => self.apply_controllers(controllers),
+            Ok(controllers) => {
+                let (reconciled, held) = reconcile_poll_with_hold(
+                    &self.controllers,
+                    controllers,
+                    &mut self.missed_poll_counts,
+                );
+                for serial in &held {
+                    crate::controller::hid::diag::diag_info(format!(
+                        "ui-diag: hold pad across missed read serial={serial}"
+                    ));
+                }
+                self.apply_controllers(reconciled)
+            }
             Err(err) => {
                 app_log::warn(format!("refresh failed: {err}"));
                 Task::none()
@@ -992,14 +1027,28 @@ impl App {
         if controllers_changed {
             let previous = std::mem::replace(&mut self.controllers, controllers);
             opened_from_empty = previous.is_empty() && !self.controllers.is_empty();
+            if opened_from_empty {
+                self.controllers_nonempty_since = Some(Instant::now());
+            }
             if !previous.is_empty() && self.controllers.is_empty() {
-                if take_skip_connect_cooldown(&mut self.skip_next_connect_cooldown) {
-                    crate::controller::hid::diag::diag_info(
-                        "ui-diag: skip connect cooldown (intentional power-off)",
-                    );
-                } else {
-                    self.start_connect_cooldown_until =
-                        Some(Instant::now() + START_CONNECT_COOLDOWN);
+                let stretch = self.controllers_nonempty_since.map(|since| since.elapsed());
+                self.controllers_nonempty_since = None;
+                let skip = take_skip_connect_cooldown(&mut self.skip_next_connect_cooldown);
+                match connect_cooldown_on_empty(skip, stretch, MIN_CONNECT_STRETCH) {
+                    ConnectCooldownDecision::SkipIntentional => {
+                        crate::controller::hid::diag::diag_info(
+                            "ui-diag: skip connect cooldown (intentional power-off)",
+                        );
+                    }
+                    ConnectCooldownDecision::SkipShortArrival => {
+                        crate::controller::hid::diag::diag_info(
+                            "ui-diag: skip connect cooldown (short arrival)",
+                        );
+                    }
+                    ConnectCooldownDecision::Arm => {
+                        self.start_connect_cooldown_until =
+                            Some(Instant::now() + START_CONNECT_COOLDOWN);
+                    }
                 }
             }
             events = self
@@ -1012,18 +1061,27 @@ impl App {
 
         self.known.save();
         let connect_toast_queued = events.iter().any(|event| event.body == "Connected");
-        let open_start_after_toast = opened_from_empty
-            && self.should_auto_open_start()
-            && should_defer_auto_open_start(true, connect_toast_queued);
+        let want_auto_open = opened_from_empty && self.should_auto_open_start();
+        if want_auto_open {
+            self.start_auto_open_pending = true;
+        }
+        let open_start_after_toast =
+            want_auto_open && should_defer_auto_open_start(true, connect_toast_queued);
         let tray = self.apply_tray();
         let notify = tray.chain(self.queue_notifications(events, open_start_after_toast));
         // Do not chain open_start_screen after show_next_toast: its Task includes
         // the ~5s expire delay. 0→1 Start is latched on the Connected toast and
         // opens only when the presentation machine emits OpenStart.
-        let start = if self.controllers.is_empty() && self.start_visible {
+        let start = if self.controllers.is_empty() {
+            // Confirmed empty: cancel any latched open even if Start is not visible.
+            self.start_auto_open_pending = false;
             self.toast_machine.clear_after();
-            self.close_start_screen()
-        } else if opened_from_empty && self.should_auto_open_start() && !connect_toast_queued {
+            if self.start_visible {
+                self.close_start_screen()
+            } else {
+                Task::none()
+            }
+        } else if want_auto_open && !connect_toast_queued {
             self.open_start_screen()
         } else {
             Task::none()
@@ -2175,6 +2233,7 @@ impl App {
         if self.start_visible
             && let Some(id) = self.start_window
         {
+            self.start_auto_open_pending = false;
             self.last_running_check = None;
             let badge = self.refresh_running_badge();
             return Task::batch([badge, window::gain_focus(id)]);
@@ -2195,6 +2254,7 @@ impl App {
         // StartOpened raises after the window/renderer exists.
         if self.start_window.is_some() {
             // Stale id without visibility (close in flight) — wait for WindowClosed.
+            // Leave start_auto_open_pending set so WindowClosed can retry.
             crate::controller::hid::diag::diag_info(
                 "ui-diag: start open skipped (window still closing)",
             );
@@ -2216,6 +2276,7 @@ impl App {
         });
         self.start_window = Some(id);
         self.start_visible = true;
+        self.start_auto_open_pending = false;
         crate::platform::wgpu_diag::note_start_open();
         Task::batch([badge, open.map(Message::StartOpened)])
     }
@@ -3764,6 +3825,29 @@ pub(crate) fn take_skip_connect_cooldown(flag: &mut bool) -> bool {
     skip
 }
 
+/// Whether to arm the ghost-flap cooldown after the list goes empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectCooldownDecision {
+    SkipIntentional,
+    SkipShortArrival,
+    Arm,
+}
+
+/// Decide cooldown after 1→0. Short arrival blips must not suppress the next open.
+pub(crate) fn connect_cooldown_on_empty(
+    skip_intentional: bool,
+    nonempty_stretch: Option<Duration>,
+    min_stretch: Duration,
+) -> ConnectCooldownDecision {
+    if skip_intentional {
+        ConnectCooldownDecision::SkipIntentional
+    } else if nonempty_stretch.is_some_and(|d| d < min_stretch) {
+        ConnectCooldownDecision::SkipShortArrival
+    } else {
+        ConnectCooldownDecision::Arm
+    }
+}
+
 /// Latched flush: open if still enabled and not already open (ignore fullscreen/cooldown).
 pub(crate) fn should_flush_latched_start(
     pending: bool,
@@ -3773,12 +3857,66 @@ pub(crate) fn should_flush_latched_start(
     pending && start_enabled && !already_open
 }
 
+/// Keep a pad for one consecutive poll miss; drop on the second.
+///
+/// Returns the reconciled list and serials held this tick (for diagnostics).
+pub(crate) fn reconcile_poll_with_hold(
+    previous: &[ControllerStatus],
+    polled: Vec<ControllerStatus>,
+    miss_counts: &mut HashMap<String, u8>,
+) -> (Vec<ControllerStatus>, Vec<String>) {
+    let polled_serials: HashSet<String> = polled.iter().map(|c| c.serial.clone()).collect();
+
+    // Pads that returned clear their miss streak.
+    miss_counts.retain(|serial, _| !polled_serials.contains(serial));
+
+    let mut out = polled;
+    let mut held = Vec::new();
+
+    for prev in previous {
+        if polled_serials.contains(&prev.serial) {
+            continue;
+        }
+        let count = miss_counts.entry(prev.serial.clone()).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count == 1 {
+            held.push(prev.serial.clone());
+            out.push(prev.clone());
+        } else {
+            // Second consecutive miss: accept the drop.
+            miss_counts.remove(&prev.serial);
+        }
+    }
+
+    out.sort_by(|a, b| a.serial.cmp(&b.serial));
+    for (i, controller) in out.iter_mut().enumerate() {
+        controller.index = i + 1;
+    }
+    (out, held)
+}
+
 #[cfg(test)]
 mod start_gate_tests {
     use super::{
+        ConnectCooldownDecision, connect_cooldown_on_empty, reconcile_poll_with_hold,
         should_auto_open_start, should_defer_auto_open_start, should_flush_latched_start,
         take_skip_connect_cooldown,
     };
+    use crate::controller::dualsense::battery::dualsense_status;
+    use crate::controller::model::{Connection, ControllerStatus, PowerState};
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    fn pad(serial: &str) -> ControllerStatus {
+        dualsense_status(
+            1,
+            "DualSense",
+            Connection::Bluetooth,
+            serial.to_string(),
+            50,
+            PowerState::Discharging,
+        )
+    }
 
     #[test]
     fn opens_on_clean_zero_to_one() {
@@ -3828,5 +3966,56 @@ mod start_gate_tests {
         assert!(take_skip_connect_cooldown(&mut flag));
         assert!(!flag);
         assert!(!take_skip_connect_cooldown(&mut flag));
+    }
+
+    #[test]
+    fn short_arrival_skips_cooldown_long_stretch_arms() {
+        let min = Duration::from_secs(2);
+        assert_eq!(
+            connect_cooldown_on_empty(true, Some(Duration::from_secs(10)), min),
+            ConnectCooldownDecision::SkipIntentional
+        );
+        assert_eq!(
+            connect_cooldown_on_empty(false, Some(Duration::from_millis(500)), min),
+            ConnectCooldownDecision::SkipShortArrival
+        );
+        assert_eq!(
+            connect_cooldown_on_empty(false, Some(Duration::from_secs(3)), min),
+            ConnectCooldownDecision::Arm
+        );
+        assert_eq!(
+            connect_cooldown_on_empty(false, None, min),
+            ConnectCooldownDecision::Arm
+        );
+    }
+
+    #[test]
+    fn one_miss_held_second_miss_dropped() {
+        let previous = vec![pad("a")];
+        let mut misses = HashMap::new();
+
+        let (held_list, held) = reconcile_poll_with_hold(&previous, Vec::new(), &mut misses);
+        assert_eq!(held, vec!["a".to_string()]);
+        assert_eq!(held_list.len(), 1);
+        assert_eq!(held_list[0].serial, "a");
+        assert_eq!(misses.get("a"), Some(&1));
+
+        let (dropped, held2) = reconcile_poll_with_hold(&held_list, Vec::new(), &mut misses);
+        assert!(held2.is_empty());
+        assert!(dropped.is_empty());
+        assert!(!misses.contains_key("a"));
+    }
+
+    #[test]
+    fn returned_pad_clears_miss_streak() {
+        let previous = vec![pad("a")];
+        let mut misses = HashMap::new();
+        let (held_list, _) = reconcile_poll_with_hold(&previous, Vec::new(), &mut misses);
+        assert_eq!(misses.get("a"), Some(&1));
+
+        let (back, held) = reconcile_poll_with_hold(&held_list, vec![pad("a")], &mut misses);
+        assert!(held.is_empty());
+        assert_eq!(back.len(), 1);
+        assert!(!misses.contains_key("a"));
     }
 }
