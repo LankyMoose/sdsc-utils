@@ -1,6 +1,6 @@
 [package]
 name = "sdsc-utils"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2024"
 rust-version = "1.88"
 description = "SDSC Utils — system tray battery, lightbar, and identify utilities for DualSense controllers"
@@ -78,6 +78,7 @@ rfd = "0.15"
 rodio = { version = "0.20", default-features = false, features = ["mp3"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 single-instance = "0.3.3"
 
 [build-dependencies]

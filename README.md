@@ -50,7 +50,7 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 
 **Recommended (Windows):** install from the [Microsoft Store](https://apps.microsoft.com/) once the listing is live (search for **SDSC Utils**). Store installs are signed by Microsoft and update automatically through the Store / `winget`.
 
-**Advanced:** portable builds are attached to [GitHub Releases](https://github.com/LankyMoose/sdsc-utils/releases) as `sdsc-utils.exe`. That executable is **not** Authenticode-signed. Browsers and Windows SmartScreen often warn on uncommon unsigned downloads — that is expected. There is no in-app auto-update for the portable build; download the next release manually when you want it.
+**Advanced:** portable builds are attached to [GitHub Releases](https://github.com/LankyMoose/sdsc-utils/releases) as a single `sdsc-utils.exe`. The first launch unpacks the UI program into `%APPDATA%\sdsc-utils\shell`. That executable is **not** Authenticode-signed. Browsers and Windows SmartScreen often warn on uncommon unsigned downloads — that is expected. There is no in-app auto-update for the portable build; download the next release manually when you want it.
 
 ## Features
 
@@ -189,11 +189,11 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 CI builds on Windows. To publish a binary + MSIX artifact:
 
 ```bash
-git tag v1.5.0
-git push origin v1.5.0
+git tag v1.5.1
+git push origin v1.5.1
 ```
 
-The release workflow attaches `sdsc-utils.exe` and `sdsc-utils.msix` to the GitHub Release for that tag. Upload the MSIX to Partner Center for Store distribution. You can also run the **Release** workflow manually (`workflow_dispatch`).
+The release workflow attaches one portable `sdsc-utils.exe` (the UI shell is bundled inside it) and `sdsc-utils.msix` to the GitHub Release for that tag. Upload the MSIX to Partner Center for Store distribution. You can also run the **Release** workflow manually (`workflow_dispatch`).
 
 ## Privacy policy
 

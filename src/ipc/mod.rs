@@ -10,7 +10,6 @@ use crate::session::SessionEffect;
 use crate::ui::layout::TrayAnchor;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// Well-known pipe name for the user-session service.
@@ -137,17 +136,6 @@ pub fn recv_message<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -> Re
 /// Path / name used for the pipe (overridable via env for tests).
 pub fn pipe_endpoint() -> String {
     std::env::var(SHELL_PIPE_ENV).unwrap_or_else(|_| PIPE_NAME.to_string())
-}
-
-/// Resolve the shell executable next to the service binary.
-pub fn shell_exe_path() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sdsc-utils"));
-    path.set_file_name(if cfg!(windows) {
-        "sdsc-shell.exe"
-    } else {
-        "sdsc-shell"
-    });
-    path
 }
 
 /// Long-lived command client used by the iced shell (and fire-and-forget HID proxies).

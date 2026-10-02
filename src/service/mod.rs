@@ -12,9 +12,7 @@ use crate::controller::known::KnownControllers;
 use crate::controller::model::ControllerStatus;
 use crate::domain::color::{self, color_for_battery_percent};
 use crate::domain::pad::{self as start_input, GestureDetectorBank};
-use crate::ipc::{
-    PipeServer, SHELL_PIPE_ENV, ServiceMessage, ShellCommand, bound_port, shell_exe_path,
-};
+use crate::ipc::{PipeServer, SHELL_PIPE_ENV, ServiceMessage, ShellCommand, bound_port};
 use crate::persist::analytics::AnalyticsStore;
 use crate::persist::prefs::Prefs;
 use crate::platform::app_log;
@@ -476,7 +474,7 @@ fn dispatch_effects(
 }
 
 fn spawn_shell() -> Result<Child, Box<dyn std::error::Error>> {
-    let exe = shell_exe_path();
+    let exe = crate::platform::shell_bundle::prepare_shell_exe()?;
     let port = bound_port();
     let mut cmd = Command::new(&exe);
     // Pass the real port so the shell attaches as a client (not port "1").
