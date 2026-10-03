@@ -127,6 +127,18 @@ pub fn arc_offset_x(distance: f32) -> f32 {
     ARC_PX * distance.abs()
 }
 
+/// Layout box for a strip child at `distance`.
+///
+/// Capsule height/width follow [`scale_at_distance`]; the title column stays
+/// [`TITLE_COL`] so outer peeks (`|d| = 2`) do not force needless wraps.
+pub fn slot_child_size(metrics: &StripMetrics, distance: f32) -> Size {
+    let scale = scale_at_distance(distance);
+    let max_art_w = metrics.center_w * metrics.selected_scale;
+    let art_w = metrics.center_w * scale;
+    let inset = ((max_art_w - art_w) * 0.5).max(0.0);
+    Size::new(inset + art_w + TITLE_COL, metrics.center_h * scale)
+}
+
 /// Catalog index for a visible slot, or `None` for a skeleton filler.
 ///
 /// When `len < VISIBLE`, out-of-range linear indices become dummies. With enough
@@ -254,7 +266,6 @@ where
     ) -> layout::Node {
         let limits = limits.width(self.width).height(self.height);
         let size = limits.resolve(self.width, self.height, Size::ZERO);
-        let slot = Size::new(self.metrics.slot_w, self.metrics.slot_h);
         let center_h = self.metrics.center_h;
 
         let mut children = Vec::with_capacity(self.items.len());
@@ -265,8 +276,7 @@ where
             .enumerate()
         {
             let dist = slot_distance(i, self.anchor, self.visual_scroll);
-            let scale = scale_at_distance(dist);
-            let child_size = Size::new(slot.width * scale, slot.height * scale);
+            let child_size = slot_child_size(&self.metrics, dist);
             let child_limits = layout::Limits::new(Size::ZERO, child_size);
             let mut node = item
                 .as_widget_mut()
@@ -538,5 +548,23 @@ mod tests {
         assert!((slot_distance(NEIGHBORS as usize + 1, 5, 5.0) - 1.0).abs() < 0.001);
         // Mid-scroll toward next: center slot sits slightly above visual center.
         assert!((slot_distance(NEIGHBORS as usize, 5, 4.5) - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn slot_child_keeps_full_title_col() {
+        let m = metrics_for_height(1080.0);
+        let d2 = slot_child_size(&m, 2.0);
+        let scale = SCALE_AT_2;
+        let max_art_w = m.center_w * m.selected_scale;
+        let art_w = m.center_w * scale;
+        let inset = ((max_art_w - art_w) * 0.5).max(0.0);
+        let title_w = d2.width - inset - art_w;
+        assert!((title_w - TITLE_COL).abs() < 0.01);
+        assert!(d2.width > m.slot_w * SCALE_AT_2 + 1.0);
+        assert!((slot_child_size(&m, 0.0).width - m.slot_w).abs() < 0.01);
+        for d in [0.0_f32, 1.0, 2.0] {
+            let row = slot_child_size(&m, d);
+            assert!(arc_offset_x(d) + row.width <= m.slot_w + 0.01);
+        }
     }
 }
