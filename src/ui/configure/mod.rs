@@ -154,7 +154,10 @@ pub struct PadInputPanel {
     pub circle: bool,
     pub dpad_up: bool,
     pub dpad_down: bool,
+    pub dpad_left: bool,
+    pub dpad_right: bool,
     pub stick_band: String,
+    pub stick_x: f32,
     pub stick_y: f32,
     pub held: String,
 }
@@ -1045,9 +1048,11 @@ fn pad_input_view<'a>(panel: &'a PadInputPanel) -> Element<'a, ConfigureMessage>
             bit("circle", panel.circle),
             bit("dpad_up", panel.dpad_up),
             bit("dpad_down", panel.dpad_down),
+            bit("dpad_left", panel.dpad_left),
+            bit("dpad_right", panel.dpad_right),
             text(format!(
-                "stick={}  stick_y={:.2}",
-                panel.stick_band, panel.stick_y
+                "stick={}  stick_x={:.2}  stick_y={:.2}",
+                panel.stick_band, panel.stick_x, panel.stick_y
             ))
             .size(13.0)
             .color(theme::INK),

@@ -243,18 +243,28 @@ pub fn immersive_stage(_theme: &Theme) -> container::Style {
     }
 }
 
-/// Shared glass fill for immersive header / dock / footer hints.
+/// Shared glass fill for immersive chrome islands.
 fn immersive_chrome_fill() -> Color {
     // Darker than BASE_BG, see-through so atmosphere/backdrop read through.
     alpha(darken(BASE_BG, 0.55), 0.58)
 }
 
-/// Immersive controllers drawer: dark glass, no border (flush with header).
-pub fn immersive_dock(_theme: &Theme) -> container::Style {
-    container::Style {
+/// Capsule island shared by footer hints (fixed radius).
+pub fn immersive_island(theme: &Theme) -> container::Style {
+    immersive_island_radius(20.0)(theme)
+}
+
+/// Controllers dock island — pass `ring_radius + edge_inset` for concentric corners.
+pub fn immersive_island_radius(radius: f32) -> impl Fn(&Theme) -> container::Style {
+    let radius = radius.max(0.0);
+    move |_theme: &Theme| container::Style {
         background: Some(Background::Color(immersive_chrome_fill())),
         text_color: Some(INK),
-        border: Border::default(),
+        border: Border {
+            color: alpha(LINE, 0.28),
+            width: 1.0,
+            radius: radius.into(),
+        },
         ..container::Style::default()
     }
 }
@@ -277,17 +287,8 @@ pub fn immersive_backdrop_wash(_theme: &Theme) -> container::Style {
 }
 
 /// Pill behind immersive footer action hints.
-pub fn immersive_footer_capsule(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(immersive_chrome_fill())),
-        text_color: Some(INK),
-        border: Border {
-            color: alpha(LINE, 0.28),
-            width: 1.0,
-            radius: 20.0.into(),
-        },
-        ..container::Style::default()
-    }
+pub fn immersive_footer_capsule(theme: &Theme) -> container::Style {
+    immersive_island(theme)
 }
 
 /// Configure content area below the title bar.
@@ -525,6 +526,31 @@ pub fn menu_row_surface(selected: bool) -> impl Fn(&Theme) -> container::Style {
             },
             ..container::Style::default()
         }
+    }
+}
+
+/// Target inner radius for selected controller rows when the dock is fully expanded.
+/// Island radius is `pad +` this so corners stay concentric.
+pub const IMMERSIVE_DOCK_ROW_RADIUS: f32 = 12.0;
+
+/// Controllers island row: near-neutral select wash; radius from island − pad.
+pub fn immersive_dock_row_surface(
+    selected: bool,
+    radius: f32,
+) -> impl Fn(&Theme) -> container::Style {
+    let radius = radius.max(0.0);
+    move |_theme| container::Style {
+        background: if selected {
+            Some(Background::Color(alpha(INK, 0.05)))
+        } else {
+            None
+        },
+        text_color: Some(INK),
+        border: Border {
+            radius: radius.into(),
+            ..Default::default()
+        },
+        ..container::Style::default()
     }
 }
 

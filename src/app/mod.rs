@@ -177,6 +177,8 @@ pub enum Message {
 pub enum StartKeyAction {
     Up,
     Down,
+    Left,
+    Right,
     Confirm,
     Cancel,
 }
@@ -529,6 +531,12 @@ impl App {
                         keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
                             Some(StartKeyAction::Down)
                         }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
+                            Some(StartKeyAction::Left)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
+                            Some(StartKeyAction::Right)
+                        }
                         _ => None,
                     }?;
                     Some(Message::StartKey {
@@ -841,6 +849,14 @@ impl App {
                         StartKeyAction::Down if pressed => {
                             self.cancel_start_holds();
                             self.on_start_message(StartMessage::MoveDown)
+                        }
+                        StartKeyAction::Left if pressed && self.start_state.immersive => {
+                            self.cancel_start_holds();
+                            self.on_start_message(StartMessage::PrevSlide)
+                        }
+                        StartKeyAction::Right if pressed && self.start_state.immersive => {
+                            self.cancel_start_holds();
+                            self.on_start_message(StartMessage::NextSlide)
                         }
                         StartKeyAction::Confirm => {
                             self.confirm_key_held = pressed;
@@ -2971,7 +2987,7 @@ impl App {
                     self.play_start_cue(UiSoundKind::Action);
                     self.cancel_start_edit()
                 } else if self.start_visible {
-                    // Immersive + dock open: Circle collapses the drawer first (same as L2).
+                    // Immersive + dock open: Circle collapses the drawer first (same as Left).
                     if self.start_state.immersive
                         && start_mode::dock_collapse_target(self.start_state.dock_expanded)
                             .is_some()
@@ -3005,7 +3021,7 @@ impl App {
                 }
                 let now = Instant::now();
                 if self.start_state.immersive {
-                    // L2: collapse controllers dock.
+                    // Left: collapse controllers island.
                     if start_mode::dock_collapse_target(self.start_state.dock_expanded).is_some()
                         && self.start_state.request_dock(false, now)
                     {
@@ -3013,7 +3029,7 @@ impl App {
                         crate::controller::hid::diag::diag_info("ui-diag: start dock collapse");
                     }
                 } else if self.start_state.request_slide(StartSlide::Games, now) {
-                    // L2: Controllers → Games only (no wrap). Interruptible mid-anim.
+                    // Left: Controllers → Games only (no wrap). Interruptible mid-anim.
                     self.play_start_cue(UiSoundKind::Slide);
                 }
                 Task::none()
@@ -3028,7 +3044,7 @@ impl App {
                 }
                 let now = Instant::now();
                 if self.start_state.immersive {
-                    // R2: expand controllers dock.
+                    // Right: expand controllers island.
                     if start_mode::dock_expand_target(self.start_state.dock_expanded).is_some()
                         && self.start_state.request_dock(true, now)
                     {
@@ -3036,7 +3052,7 @@ impl App {
                         crate::controller::hid::diag::diag_info("ui-diag: start dock expand");
                     }
                 } else if self.start_state.request_slide(StartSlide::Controllers, now) {
-                    // R2: Games → Controllers only (no wrap). Interruptible mid-anim.
+                    // Right: Games → Controllers only (no wrap). Interruptible mid-anim.
                     self.play_start_cue(UiSoundKind::Slide);
                 }
                 Task::none()
@@ -3659,7 +3675,7 @@ impl App {
 
         let now = Instant::now();
         let animating = self.start_state.animating();
-        // Mid-slide: keep L2/R2 edges live for interruptible request_slide,
+        // Mid-slide: keep Left/Right nav live for interruptible request_slide,
         // but skip controller-row rebuilds (those hitch the UI thread).
         let badge_task = if !animating {
             let controllers_started = Instant::now();
@@ -3708,10 +3724,13 @@ impl App {
                 .start_state
                 .selected_controller()
                 .is_some_and(|row| row.show_power_off());
+        // Immersive: left/right slides. Compact: L2/R2 slides (stepper stays vertical-only).
+        let horizontal_nav = self.start_state.immersive;
         let tick = self.pad_nav.tick(
             readings,
             now,
             allow_nav_move,
+            horizontal_nav,
             replace_confirm && !animating,
             editing,
             hold_cross_close,
@@ -3724,10 +3743,11 @@ impl App {
             if !self.nav_unarmed_warned {
                 if let Some(diag) = &tick.diag {
                     app_log::warn(format!(
-                        "start-nav: pad unarmed waiting for rest (stick_y={:.3} l2={} r2={} cross={} circle={})",
+                        "start-nav: pad unarmed waiting for rest (stick_x={:.3} stick_y={:.3} dpad_l={} dpad_r={} cross={} circle={})",
+                        diag.sample.stick_x,
                         diag.sample.stick_y,
-                        u8::from(diag.sample.l2),
-                        u8::from(diag.sample.r2),
+                        u8::from(diag.sample.dpad_left),
+                        u8::from(diag.sample.dpad_right),
                         u8::from(diag.sample.cross),
                         u8::from(diag.sample.circle),
                     ));
@@ -3970,9 +3990,15 @@ impl App {
                 circle: reading.sample.circle,
                 dpad_up: reading.sample.dpad_up,
                 dpad_down: reading.sample.dpad_down,
-                stick_band: start_input::StickBand::from_stick_y(reading.sample.stick_y)
-                    .as_str()
-                    .to_string(),
+                dpad_left: reading.sample.dpad_left,
+                dpad_right: reading.sample.dpad_right,
+                stick_band: start_input::StickBand::from_stick(
+                    reading.sample.stick_x,
+                    reading.sample.stick_y,
+                )
+                .as_str()
+                .to_string(),
+                stick_x: reading.sample.stick_x,
                 stick_y: reading.sample.stick_y,
                 held: gesture::format_gesture(&held),
             }

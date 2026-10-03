@@ -183,10 +183,14 @@ pub enum NavAction {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PadSample {
     pub held: BTreeSet<GestureControl>,
+    /// Combined stick X after deadzone; negative = left. Non-zero means past deadzone.
+    pub stick_x: f32,
     /// Combined stick Y after deadzone; negative = up. Non-zero means past deadzone.
     pub stick_y: f32,
     pub dpad_up: bool,
     pub dpad_down: bool,
+    pub dpad_left: bool,
+    pub dpad_right: bool,
     pub cross: bool,
     pub circle: bool,
     pub square: bool,
@@ -234,6 +238,8 @@ pub enum StickBand {
     Neutral,
     Up,
     Down,
+    Left,
+    Right,
 }
 
 impl StickBand {
@@ -247,11 +253,34 @@ impl StickBand {
         }
     }
 
+    /// Dominant-axis band from combined stick X/Y (ties prefer vertical).
+    pub fn from_stick(stick_x: f32, stick_y: f32) -> Self {
+        let ax = stick_x.abs();
+        let ay = stick_y.abs();
+        if ax == 0.0 && ay == 0.0 {
+            Self::Neutral
+        } else if ax > ay {
+            if stick_x < 0.0 {
+                Self::Left
+            } else {
+                Self::Right
+            }
+        } else if stick_y < 0.0 {
+            Self::Up
+        } else if stick_y > 0.0 {
+            Self::Down
+        } else {
+            Self::Neutral
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Neutral => "neutral",
             Self::Up => "up",
             Self::Down => "down",
+            Self::Left => "left",
+            Self::Right => "right",
         }
     }
 }
@@ -263,6 +292,8 @@ pub struct NavLogSnapshot {
     pub circle: bool,
     pub dpad_up: bool,
     pub dpad_down: bool,
+    pub dpad_left: bool,
+    pub dpad_right: bool,
     pub l2: bool,
     pub r2: bool,
     pub stick: StickBand,
@@ -276,16 +307,18 @@ impl NavLogSnapshot {
             circle: sample.circle,
             dpad_up: sample.dpad_up,
             dpad_down: sample.dpad_down,
+            dpad_left: sample.dpad_left,
+            dpad_right: sample.dpad_right,
             l2: sample.l2,
             r2: sample.r2,
-            stick: StickBand::from_stick_y(sample.stick_y),
+            stick: StickBand::from_stick(sample.stick_x, sample.stick_y),
             resting: sample_nav_resting(sample),
         }
     }
 
     pub fn format_line(self, source: NavSource) -> String {
         format!(
-            "start-nav: src={} cross={} circle={} l2={} r2={} dpad_up={} dpad_down={} stick={} resting={}",
+            "start-nav: src={} cross={} circle={} l2={} r2={} dpad_up={} dpad_down={} dpad_l={} dpad_r={} stick={} resting={}",
             source.as_str(),
             u8::from(self.cross),
             u8::from(self.circle),
@@ -293,32 +326,79 @@ impl NavLogSnapshot {
             u8::from(self.r2),
             u8::from(self.dpad_up),
             u8::from(self.dpad_down),
+            u8::from(self.dpad_left),
+            u8::from(self.dpad_right),
             self.stick.as_str(),
             u8::from(self.resting),
         )
     }
 }
 
-/// Shared nav stepper for D-pad + sticks (prevents double-fire).
+/// Shared 2D nav stepper for D-pad + sticks (dominant axis; prevents double-fire).
 #[derive(Debug, Clone, Default)]
 pub struct NavStepper {
+    /// Encoded direction: -2 Left, -1 Up, 1 Down, 2 Right, 0 idle.
     direction: i8,
     next_fire: Option<Instant>,
 }
 
 impl NavStepper {
-    pub fn update(&mut self, sample: &PadSample, now: Instant) -> Option<NavAction> {
-        let stick_up = sample.stick_y < 0.0;
-        let stick_down = sample.stick_y > 0.0;
-        let want_up = sample.dpad_up || stick_up;
-        let want_down = sample.dpad_down || stick_down;
+    fn action_for(direction: i8) -> Option<NavAction> {
+        match direction {
+            -2 => Some(NavAction::PrevSlide),
+            -1 => Some(NavAction::Up),
+            1 => Some(NavAction::Down),
+            2 => Some(NavAction::NextSlide),
+            _ => None,
+        }
+    }
 
-        let direction = if want_up && !want_down {
-            -1
-        } else if want_down && !want_up {
-            1
+    /// `horizontal`: immersive left/right slides. Compact keeps vertical-only (L2/R2 slides).
+    pub fn update(
+        &mut self,
+        sample: &PadSample,
+        now: Instant,
+        horizontal: bool,
+    ) -> Option<NavAction> {
+        let want_left = horizontal && (sample.dpad_left || sample.stick_x < 0.0);
+        let want_right = horizontal && (sample.dpad_right || sample.stick_x > 0.0);
+        let want_up = sample.dpad_up || sample.stick_y < 0.0;
+        let want_down = sample.dpad_down || sample.stick_y > 0.0;
+
+        let horiz = if want_left && !want_right {
+            Some(-1i8)
+        } else if want_right && !want_left {
+            Some(1)
         } else {
-            0
+            None
+        };
+        let vert = if want_up && !want_down {
+            Some(-1i8)
+        } else if want_down && !want_up {
+            Some(1)
+        } else {
+            None
+        };
+
+        let direction = match (horiz, vert) {
+            (Some(h), Some(_v)) => {
+                let ax = sample.stick_x.abs();
+                let ay = sample.stick_y.abs();
+                if ax > ay {
+                    h * 2
+                } else if ay > ax {
+                    // Vertical wins on stronger Y (or equal when both sticks zero → dpad tie).
+                    vert.unwrap_or(0)
+                } else if self.direction.abs() == 2 {
+                    // Stick-magnitude tie: keep the active axis so diagonals don't flicker.
+                    h * 2
+                } else {
+                    vert.unwrap_or(0)
+                }
+            }
+            (Some(h), None) => h * 2,
+            (None, Some(v)) => v,
+            (None, None) => 0,
         };
 
         if direction == 0 {
@@ -330,20 +410,12 @@ impl NavStepper {
         if self.direction != direction {
             self.direction = direction;
             self.next_fire = Some(now + NAV_INITIAL_DELAY);
-            return Some(if direction < 0 {
-                NavAction::Up
-            } else {
-                NavAction::Down
-            });
+            return Self::action_for(direction);
         }
 
         if self.next_fire.is_some_and(|t| now >= t) {
             self.next_fire = Some(now + NAV_REPEAT);
-            return Some(if direction < 0 {
-                NavAction::Up
-            } else {
-                NavAction::Down
-            });
+            return Self::action_for(direction);
         }
         None
     }
@@ -376,7 +448,7 @@ impl EdgeButton {
         Self::R2,
     ];
 
-    /// Face + Options: activate on release. L2/R2: activate on press.
+    /// Face + Options: activate on release. L2/R2: activate on press (compact slides).
     const RELEASE_FIRE: [Self; 5] = [
         Self::Cross,
         Self::Circle,
@@ -397,6 +469,7 @@ impl EdgeButton {
             Self::Triangle => Some(NavAction::ToggleEdit),
             // Options no longer drives start-screen actions (Square sorts).
             Self::Options => None,
+            // Compact carousel: L2/R2 change slides. Immersive filters these out in PadNavBank.
             Self::L2 => Some(NavAction::PrevSlide),
             Self::R2 => Some(NavAction::NextSlide),
         }
@@ -659,6 +732,9 @@ pub fn sample_nav_resting(sample: &PadSample) -> bool {
         && !sample.r2
         && !sample.dpad_up
         && !sample.dpad_down
+        && !sample.dpad_left
+        && !sample.dpad_right
+        && sample.stick_x == 0.0
         && sample.stick_y == 0.0
 }
 
@@ -775,7 +851,8 @@ pub enum ShortSampleOutcome {
 
 fn sample_summary(sample: &PadSample) -> String {
     format!(
-        "ok stick_y={:.2} l2={} r2={} cross={} circle={} square={} triangle={} options={} dpad_u={} dpad_d={}",
+        "ok stick_x={:.2} stick_y={:.2} l2={} r2={} cross={} circle={} square={} triangle={} options={} dpad_u={} dpad_d={} dpad_l={} dpad_r={}",
+        sample.stick_x,
         sample.stick_y,
         u8::from(sample.l2),
         u8::from(sample.r2),
@@ -786,6 +863,8 @@ fn sample_summary(sample: &PadSample) -> String {
         u8::from(sample.options),
         u8::from(sample.dpad_up),
         u8::from(sample.dpad_down),
+        u8::from(sample.dpad_left),
+        u8::from(sample.dpad_right),
     )
 }
 
@@ -805,8 +884,11 @@ pub fn merge_nav_samples(batch: &[PadSample]) -> Option<PadSample> {
         out.r2 |= s.r2;
         out.dpad_up |= s.dpad_up;
         out.dpad_down |= s.dpad_down;
+        out.dpad_left |= s.dpad_left;
+        out.dpad_right |= s.dpad_right;
         out.held = out.held.union(&s.held).copied().collect();
     }
+    out.stick_x = last.stick_x;
     out.stick_y = last.stick_y;
     Some(out)
 }
@@ -1204,6 +1286,7 @@ impl PadNavBank {
     /// Sync presence, update every pad's edge/hold state, emit at most one action.
     ///
     /// `allow_nav_move` gates D-pad/stick repeats (false while a slide animates).
+    /// `horizontal_nav`: immersive left/right slides (and suppress L2/R2). Compact uses L2/R2.
     /// `replace_confirm` switches to Cross-hold / Circle-cancel mode.
     /// `editing` when true: Triangle saves (ToggleEdit); Square is EditManual.
     /// `hold_cross_close` (games browse, running row): Cross hold closes the game.
@@ -1214,6 +1297,7 @@ impl PadNavBank {
         readings: &[NavReading],
         now: Instant,
         allow_nav_move: bool,
+        horizontal_nav: bool,
         replace_confirm: bool,
         editing: bool,
         hold_cross_close: bool,
@@ -1266,6 +1350,9 @@ impl PadNavBank {
 
                 let stick_interrupt = reading.sample.dpad_up
                     || reading.sample.dpad_down
+                    || reading.sample.dpad_left
+                    || reading.sample.dpad_right
+                    || reading.sample.stick_x != 0.0
                     || reading.sample.stick_y != 0.0;
                 let foreign = slot
                     .button_edges
@@ -1302,6 +1389,9 @@ impl PadNavBank {
                 }
                 let stick_interrupt = reading.sample.dpad_up
                     || reading.sample.dpad_down
+                    || reading.sample.dpad_left
+                    || reading.sample.dpad_right
+                    || reading.sample.stick_x != 0.0
                     || reading.sample.stick_y != 0.0;
                 let foreign = slot
                     .button_edges
@@ -1336,7 +1426,8 @@ impl PadNavBank {
             };
 
             let nav = if allow_nav_move {
-                slot.nav_stepper.update(&reading.sample, now)
+                slot.nav_stepper
+                    .update(&reading.sample, now, horizontal_nav)
             } else {
                 None
             };
@@ -1350,10 +1441,12 @@ impl PadNavBank {
             }
 
             let edge = slot.button_edges.update(&reading.sample, hold_owned);
-            let edge = edge.map(|action| match action {
+            let edge = edge.and_then(|action| match action {
+                // Immersive: slides are left/right — ignore trigger edges.
+                NavAction::PrevSlide | NavAction::NextSlide if horizontal_nav => None,
                 // Edit mode: Square edits the selected manual (was Triangle).
-                NavAction::CycleSort if editing => NavAction::Triangle,
-                other => other,
+                NavAction::CycleSort if editing => Some(NavAction::Triangle),
+                other => Some(other),
             });
 
             if let Some(action) = nav
@@ -1598,14 +1691,17 @@ mod tests {
     #[test]
     fn merge_nav_samples_keeps_newest_stick() {
         let a = PadSample {
+            stick_x: -0.8,
             stick_y: -0.8,
             ..Default::default()
         };
         let b = PadSample {
+            stick_x: 0.4,
             stick_y: 0.6,
             ..Default::default()
         };
         let merged = merge_nav_samples(&[a, b]).expect("batch");
+        assert!((merged.stick_x - 0.4).abs() < f32::EPSILON);
         assert!((merged.stick_y - 0.6).abs() < f32::EPSILON);
     }
 
@@ -1652,6 +1748,88 @@ mod tests {
         let sample = parse_report(&buf, 0);
         assert!(!sample.dpad_up);
         assert!(!sample.dpad_down);
+        assert!(!sample.dpad_left);
+        assert!(!sample.dpad_right);
+    }
+
+    #[test]
+    fn parse_report_reads_dpad_left_right_and_stick_x() {
+        let mut buf = [0u8; 64];
+        buf[0] = 0x01;
+        buf[1] = 10; // left stick hard left
+        buf[2] = 128;
+        buf[3] = 128;
+        buf[4] = 128;
+        buf[8] = 0x06; // hat left
+        let sample = parse_report(&buf, 0);
+        assert!(sample.dpad_left);
+        assert!(!sample.dpad_right);
+        assert!(sample.stick_x < -0.3);
+
+        buf[1] = 128;
+        buf[8] = 0x02; // hat right
+        let sample = parse_report(&buf, 0);
+        assert!(sample.dpad_right);
+        assert!(!sample.dpad_left);
+        assert_eq!(sample.stick_x, 0.0);
+    }
+
+    #[test]
+    fn nav_stepper_horizontal_fires_slide_actions() {
+        let mut stepper = NavStepper::default();
+        let now = Instant::now();
+        let left = PadSample {
+            dpad_left: true,
+            ..Default::default()
+        };
+        assert_eq!(stepper.update(&left, now, true), Some(NavAction::PrevSlide));
+        assert!(stepper.update(&left, now, true).is_none());
+
+        stepper.reset();
+        let right = PadSample {
+            stick_x: 0.9,
+            ..Default::default()
+        };
+        assert_eq!(
+            stepper.update(&right, now, true),
+            Some(NavAction::NextSlide)
+        );
+    }
+
+    #[test]
+    fn nav_stepper_vertical_still_fires_up_down() {
+        let mut stepper = NavStepper::default();
+        let now = Instant::now();
+        let up = PadSample {
+            dpad_up: true,
+            ..Default::default()
+        };
+        assert_eq!(stepper.update(&up, now, true), Some(NavAction::Up));
+        stepper.reset();
+        let down = PadSample {
+            stick_y: 0.9,
+            ..Default::default()
+        };
+        assert_eq!(stepper.update(&down, now, true), Some(NavAction::Down));
+    }
+
+    #[test]
+    fn nav_stepper_dominant_axis_prefers_stronger_stick() {
+        let mut stepper = NavStepper::default();
+        let now = Instant::now();
+        let diag = PadSample {
+            stick_x: 0.9,
+            stick_y: 0.3,
+            ..Default::default()
+        };
+        assert_eq!(stepper.update(&diag, now, true), Some(NavAction::NextSlide));
+        stepper.reset();
+        let diag_v = PadSample {
+            stick_x: 0.3,
+            stick_y: -0.9,
+            ..Default::default()
+        };
+        assert_eq!(stepper.update(&diag_v, now, true), Some(NavAction::Up));
     }
 
     #[test]
@@ -1800,7 +1978,7 @@ mod tests {
     }
 
     #[test]
-    fn button_edges_l2_r2_still_fire_on_press() {
+    fn button_edges_l2_r2_fire_slide_actions_on_press() {
         let mut edges = ButtonEdges::default();
         let r2 = PadSample {
             r2: true,
@@ -1809,6 +1987,12 @@ mod tests {
         assert_eq!(edges.update(&r2, None), Some(NavAction::NextSlide));
         assert!(edges.update(&r2, None).is_none());
         assert!(edges.update(&PadSample::default(), None).is_none());
+
+        let l2 = PadSample {
+            l2: true,
+            ..Default::default()
+        };
+        assert_eq!(edges.update(&l2, None), Some(NavAction::PrevSlide));
     }
 
     #[test]
@@ -1824,6 +2008,22 @@ mod tests {
         assert!(edges.update(&released, None).is_none());
         assert_eq!(edges.update(&held, None), Some(NavAction::NextSlide));
         assert!(edges.update(&released, None).is_none());
+    }
+
+    #[test]
+    fn nav_stepper_horizontal_disabled_ignores_left_right() {
+        let mut stepper = NavStepper::default();
+        let now = Instant::now();
+        let left = PadSample {
+            dpad_left: true,
+            ..Default::default()
+        };
+        assert!(stepper.update(&left, now, false).is_none());
+        let up = PadSample {
+            dpad_up: true,
+            ..Default::default()
+        };
+        assert_eq!(stepper.update(&up, now, false), Some(NavAction::Up));
     }
 
     #[test]
@@ -1846,6 +2046,14 @@ mod tests {
         assert!(sample_nav_resting(&PadSample::default()));
         assert!(!sample_nav_resting(&PadSample {
             r2: true,
+            ..Default::default()
+        }));
+        assert!(!sample_nav_resting(&PadSample {
+            dpad_left: true,
+            ..Default::default()
+        }));
+        assert!(!sample_nav_resting(&PadSample {
+            stick_x: 0.5,
             ..Default::default()
         }));
         assert!(!sample_nav_resting(&PadSample {
@@ -1904,6 +2112,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(tick1.action.is_none());
 
@@ -1920,6 +2129,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(
             tick2.action.is_none(),
@@ -1929,6 +2139,7 @@ mod tests {
             &[reading("a", open), reading("b", PadSample::default())],
             now,
             true,
+            false,
             false,
             false,
             false,
@@ -1956,6 +2167,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
 
         let circle = PadSample {
@@ -1976,6 +2188,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(tick.action.is_none(), "face actions arm on press");
         let tick2 = bank.tick(
@@ -1985,6 +2198,7 @@ mod tests {
             ],
             now,
             true,
+            false,
             false,
             false,
             false,
@@ -2041,6 +2255,7 @@ mod tests {
             &[reading("new", cross)],
             now,
             true,
+            false,
             false,
             false,
             false,
@@ -2203,6 +2418,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             true,
             false,
         );
@@ -2219,6 +2435,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             true,
             false,
         );
@@ -2226,6 +2443,7 @@ mod tests {
             &[reading("a", cross)],
             t_press + Duration::from_millis(400),
             true,
+            false,
             false,
             false,
             true,
@@ -2240,6 +2458,7 @@ mod tests {
             &[reading("a", PadSample::default())],
             t_rel,
             true,
+            false,
             false,
             false,
             true,
@@ -2259,6 +2478,7 @@ mod tests {
             &[reading("a", PadSample::default())],
             t_rel + Duration::from_millis(300),
             true,
+            false,
             false,
             false,
             true,
@@ -2285,6 +2505,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let sample = PadSample {
             cross: true,
@@ -2298,6 +2519,7 @@ mod tests {
             &[reading("a", sample)],
             now,
             true,
+            false,
             false,
             false,
             false,

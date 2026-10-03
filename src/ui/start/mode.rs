@@ -176,12 +176,12 @@ pub fn settle_immersive(transition: StartTransition) -> bool {
     matches!(transition, StartTransition::Promoting)
 }
 
-/// R2 while immersive: expand dock when collapsed.
+/// Right while immersive: expand dock when collapsed.
 pub fn dock_expand_target(expanded: bool) -> Option<bool> {
     if expanded { None } else { Some(true) }
 }
 
-/// L2 while immersive: collapse dock when expanded.
+/// Left while immersive: collapse dock when expanded.
 pub fn dock_collapse_target(expanded: bool) -> Option<bool> {
     if !expanded { None } else { Some(false) }
 }

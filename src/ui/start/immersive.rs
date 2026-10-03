@@ -16,17 +16,18 @@ use iced::{Alignment, Element, Fill, Font, Length, Padding};
 use std::time::Instant;
 
 const EDGE_PAD: f32 = 16.0;
-/// Peek column fits the active (grown) ring.
-const DOCK_PEEK_W: f32 = 120.0;
-/// Wide enough for larger type + inline Identify/Power-off on one row.
-const DOCK_MAX_W: f32 = 560.0;
+/// Minimum gap from ring outer edge → peek column edge (also sizes peek width for max ring).
+const DOCK_RING_INSET: f32 = 6.0;
 const DOCK_RING_MIN: f32 = 52.0;
 const DOCK_RING_MAX: f32 = 68.0;
-/// Fixed row height fits max ring; all rings lerp with dock expand.
+/// Peek column = ring cell only (sized for the largest ring + inset).
+const DOCK_PEEK_W: f32 = DOCK_RING_MAX + DOCK_RING_INSET * 2.0;
+/// Wide enough for larger type + inline Identify/Power-off on one row.
+const DOCK_MAX_W: f32 = 560.0;
+/// Expanded row height (peek rows hug the ring).
 const DOCK_ROW_H: f32 = 80.0;
+/// Expanded list gap (peek gap matches island pad — see [`dock_peek_inset`]).
 const DOCK_ROW_GAP: f32 = 8.0;
-/// Compact title strip at the top of the controllers drawer (R2 / Controllers / L2).
-const DOCK_TITLE_H: f32 = 36.0;
 /// Reserved trailing width for dock action hints (avoids select flicker).
 const DOCK_HINT_COL_W: f32 = 210.0;
 const MODAL_W: f32 = 640.0;
@@ -248,12 +249,21 @@ fn stage_with_dock<'a>(
     }
 
     let dock = controllers_dock_host(state, spectrum, dock_p);
-    layers.push(
-        row![space().width(Fill), dock]
-            .width(Fill)
+    // Top-right floating capsule — same inset as footer (EDGE_PAD / 10).
+    let dock_overlay = row![
+        space().width(Fill),
+        column![dock, space().height(Fill),]
             .height(Fill)
-            .into(),
-    );
+            .padding(Padding {
+                top: 10.0,
+                right: EDGE_PAD,
+                bottom: 0.0,
+                left: 0.0,
+            }),
+    ]
+    .width(Fill)
+    .height(Fill);
+    layers.push(dock_overlay.into());
 
     stack(layers).width(Fill).height(Fill).into()
 }
@@ -508,15 +518,29 @@ fn controllers_dock_host<'a>(
     spectrum: &BatterySpectrum,
     dock_progress: f32,
 ) -> Element<'a, StartMessage> {
+    let t = dock_progress.clamp(0.0, 1.0);
+    let row_h = dock_row_h(dock_progress);
+    // Reveal only the list — peek width is exactly the ring column.
     let visible_w = dock_panel_width(dock_progress, DOCK_PEEK_W, DOCK_MAX_W);
     let details_w = DOCK_MAX_W - DOCK_PEEK_W;
 
-    let mut list = column![]
-        .spacing(DOCK_ROW_GAP)
-        .width(Length::Fixed(DOCK_MAX_W));
-    list = list.push(dock_title_row(dock_progress, details_w));
+    // Island pad stays at the peek inset (concentric with rings) through expand.
+    let pad = dock_peek_inset();
+    let pad_y = pad;
+    // Side pad only while expanded (peek stays flush so reveal width == ring column).
+    let pad_x = pad * t;
+    // Peek gap matches island pad; expanded uses the list gap.
+    let row_gap = pad + (DOCK_ROW_GAP - pad) * t;
+    // Peek: concentric with rings (radius = peek_w/2). Expand: pad + row radius so corners nest.
+    let peek_radius = DOCK_PEEK_W * 0.5;
+    let expanded_island = pad + theme::IMMERSIVE_DOCK_ROW_RADIUS;
+    let island_radius = peek_radius + (expanded_island - peek_radius) * t;
+    // Nested rounded-rect: inner = outer − pad (never the same as the island).
+    let row_radius = (island_radius - pad).max(0.0);
+
+    let mut list = column![].spacing(row_gap).width(Length::Fixed(DOCK_MAX_W));
     if state.controllers.is_empty() {
-        list = list.push(dock_empty_row(details_w));
+        list = list.push(dock_empty_row(details_w, row_h));
     } else {
         for (i, row) in state.controllers.iter().enumerate() {
             let selected =
@@ -528,89 +552,49 @@ fn controllers_dock_host<'a>(
                 state.ring_flash_white(&row.serial),
                 details_w,
                 dock_progress,
+                row_h,
+                row_radius,
                 state,
             ));
         }
     }
 
-    let pad = Padding {
-        top: 8.0,
-        right: 0.0,
-        bottom: 52.0,
-        left: 0.0,
-    };
     let full = container(list)
-        .padding(pad)
-        .width(Length::Fixed(DOCK_MAX_W))
-        .height(Fill);
+        .padding(Padding {
+            top: pad_y,
+            right: 0.0,
+            bottom: pad_y,
+            left: 0.0,
+        })
+        .width(Length::Fixed(DOCK_MAX_W));
 
-    let revealed = crate::ui::start::reveal::width_reveal(full, DOCK_MAX_W, visible_w).height(Fill);
+    // Shrink so the floating island sizes to its rows (Fill collapses to 0 off a Fill parent).
+    let revealed =
+        crate::ui::start::reveal::width_reveal(full, DOCK_MAX_W, visible_w).height(Length::Shrink);
 
     container(revealed)
-        .width(Length::Fixed(visible_w))
-        .height(Fill)
-        .style(theme::immersive_dock)
+        .padding(Padding {
+            top: 0.0,
+            right: pad_x,
+            bottom: 0.0,
+            left: pad_x,
+        })
+        .style(theme::immersive_island_radius(island_radius))
+        .clip(true)
         .into()
 }
 
-/// Peek shows R2 to open; expanded reveals Controllers + L2 to collapse.
-fn dock_title_row(dock_progress: f32, details_w: f32) -> Element<'static, StartMessage> {
-    let t = dock_progress.clamp(0.0, 1.0);
-    let r2_t = 1.0 - t;
-
-    let peek = container(
-        text("R2")
-            .size(13.0)
-            .color(theme::alpha(theme::ACCENT, r2_t)),
-    )
-    .width(Length::Fixed(DOCK_PEEK_W))
-    .height(Length::Fixed(DOCK_TITLE_H))
-    .center_x(Fill)
-    .center_y(Fill);
-
-    let details = container(
-        row![
-            text(StartSlide::Controllers.title())
-                .size(15.0)
-                .color(theme::alpha(theme::INK, t)),
-            text("L2").size(13.0).color(theme::alpha(theme::ACCENT, t)),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center),
-    )
-    .width(Length::Fixed(details_w))
-    .height(Length::Fixed(DOCK_TITLE_H))
-    .center_y(Fill)
-    .padding(Padding {
-        top: 0.0,
-        right: 16.0,
-        bottom: 0.0,
-        left: 4.0,
-    });
-
-    container(
-        row![peek, details]
-            .width(Length::Fixed(DOCK_MAX_W))
-            .height(Length::Fixed(DOCK_TITLE_H))
-            .align_y(Alignment::Center),
-    )
-    .width(Length::Fixed(DOCK_MAX_W))
-    .height(Length::Fixed(DOCK_TITLE_H))
-    .clip(true)
-    .into()
-}
-
-fn dock_empty_row<'a>(details_w: f32) -> Element<'a, StartMessage> {
+fn dock_empty_row<'a>(details_w: f32, row_h: f32) -> Element<'a, StartMessage> {
     container(
         row![
             container(text("—").size(13.0).color(theme::DIM))
                 .width(Length::Fixed(DOCK_PEEK_W))
-                .height(Length::Fixed(DOCK_ROW_H))
+                .height(Length::Fixed(row_h))
                 .center_x(Fill)
                 .center_y(Fill),
             container(text("No controllers").size(13.0).color(theme::DIM))
                 .width(Length::Fixed(details_w))
-                .height(Length::Fixed(DOCK_ROW_H))
+                .height(Length::Fixed(row_h))
                 .center_y(Fill)
                 .padding(Padding {
                     top: 0.0,
@@ -620,11 +604,11 @@ fn dock_empty_row<'a>(details_w: f32) -> Element<'a, StartMessage> {
                 }),
         ]
         .width(Length::Fixed(DOCK_MAX_W))
-        .height(Length::Fixed(DOCK_ROW_H))
+        .height(Length::Fixed(row_h))
         .align_y(Alignment::Center),
     )
     .width(Length::Fixed(DOCK_MAX_W))
-    .height(Length::Fixed(DOCK_ROW_H))
+    .height(Length::Fixed(row_h))
     .clip(true)
     .into()
 }
@@ -632,6 +616,18 @@ fn dock_empty_row<'a>(details_w: f32) -> Element<'a, StartMessage> {
 fn dock_ring_size(dock_progress: f32) -> f32 {
     let t = dock_progress.clamp(0.0, 1.0);
     DOCK_RING_MIN + (DOCK_RING_MAX - DOCK_RING_MIN) * t
+}
+
+/// Horizontal inset from peek column edge to the peek-sized ring (== island pad / row gap).
+fn dock_peek_inset() -> f32 {
+    (DOCK_PEEK_W - DOCK_RING_MIN).max(0.0) * 0.5
+}
+
+/// Peek rows hug the ring; expanded rows grow for title + meta.
+fn dock_row_h(dock_progress: f32) -> f32 {
+    let t = dock_progress.clamp(0.0, 1.0);
+    let ring = dock_ring_size(dock_progress);
+    ring + (DOCK_ROW_H - ring) * t
 }
 
 /// ETA stays hidden in peek; fades in through the latter part of expand.
@@ -646,6 +642,8 @@ fn dock_controller_row<'a>(
     flash_white: bool,
     details_w: f32,
     dock_progress: f32,
+    row_h: f32,
+    row_radius: f32,
     state: &State,
 ) -> Element<'a, StartMessage> {
     let ring_color = if flash_white {
@@ -664,7 +662,7 @@ fn dock_controller_row<'a>(
     );
     let ring_cell = container(ring)
         .width(Length::Fixed(DOCK_PEEK_W))
-        .height(Length::Fixed(DOCK_ROW_H))
+        .height(Length::Fixed(row_h))
         .center_x(Fill)
         .center_y(Fill);
 
@@ -699,7 +697,7 @@ fn dock_controller_row<'a>(
         if let Some(hints) = immersive_dock_row_hints(row, state, selected) {
             container(hints)
                 .width(Length::Fixed(DOCK_HINT_COL_W))
-                .height(Length::Fixed(DOCK_ROW_H))
+                .height(Length::Fixed(row_h))
                 .center_y(Fill)
                 .align_x(Alignment::End)
                 .clip(true)
@@ -707,7 +705,7 @@ fn dock_controller_row<'a>(
         } else {
             space()
                 .width(Length::Fixed(DOCK_HINT_COL_W))
-                .height(Length::Fixed(DOCK_ROW_H))
+                .height(Length::Fixed(row_h))
                 .into()
         };
 
@@ -720,17 +718,17 @@ fn dock_controller_row<'a>(
         row![
             container(titles)
                 .width(Length::Fixed(titles_w))
-                .height(Length::Fixed(DOCK_ROW_H))
+                .height(Length::Fixed(row_h))
                 .center_y(Fill),
             hints,
         ]
         .spacing(gap)
         .width(Length::Fixed(inner_w))
-        .height(Length::Fixed(DOCK_ROW_H))
+        .height(Length::Fixed(row_h))
         .align_y(Alignment::Center),
     )
     .width(Length::Fixed(details_w))
-    .height(Length::Fixed(DOCK_ROW_H))
+    .height(Length::Fixed(row_h))
     .padding(Padding {
         top: 0.0,
         right: pad_r,
@@ -741,12 +739,12 @@ fn dock_controller_row<'a>(
     container(
         row![ring_cell, details_cell]
             .width(Length::Fixed(DOCK_MAX_W))
-            .height(Length::Fixed(DOCK_ROW_H))
+            .height(Length::Fixed(row_h))
             .align_y(Alignment::Center),
     )
     .width(Length::Fixed(DOCK_MAX_W))
-    .height(Length::Fixed(DOCK_ROW_H))
+    .height(Length::Fixed(row_h))
     .clip(true)
-    .style(theme::menu_row_surface(selected))
+    .style(theme::immersive_dock_row_surface(selected, row_radius))
     .into()
 }

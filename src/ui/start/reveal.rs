@@ -73,6 +73,21 @@ where
         limits: &layout::Limits,
     ) -> layout::Node {
         let reveal = self.reveal.min(self.content_width);
+
+        // Shrink: measure content first (Fill height would resolve to 0 with no definite parent).
+        if matches!(self.height, Length::Shrink) {
+            let child_limits = layout::Limits::new(
+                Size::new(self.content_width, 0.0),
+                Size::new(self.content_width, limits.max().height),
+            );
+            let child =
+                self.content
+                    .as_widget_mut()
+                    .layout(&mut tree.children[0], renderer, &child_limits);
+            let host = Size::new(reveal, child.size().height);
+            return layout::Node::with_children(host, vec![child]);
+        }
+
         let host_limits = limits.width(Length::Fixed(reveal)).height(self.height);
         let host = host_limits.resolve(Length::Fixed(reveal), self.height, Size::ZERO);
 
