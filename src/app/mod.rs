@@ -4423,28 +4423,13 @@ impl App {
     /// Toast stays TOPMOST vs Cursor; UI above toast keeps presents (iced#3320).
     /// Only called when the machine emits RaiseInteractive (Resting / settle).
     /// Hidden warm Start must not be raised — that resurfaced Start after close.
-    ///
-    /// Immersive Start covers the primary monitor, so raising it above the toast
-    /// hides disconnect/low-battery overlays entirely. Compact Start is small
-    /// enough that the toast stays visible beside it — keep that raise for
-    /// presents. While immersive, re-raise the toast instead.
+    /// Immersive cover occludes the toast HWND; see `immersive_toast_overlay`.
     fn raise_interactive_ui_above_toast(&self, focus: bool) -> Task<Message> {
         let mut task = Task::none();
-        let immersive_start = self.start_visible && self.start_state.immersive;
         if let Some(id) = self.popup_window {
             task = task.chain(raise_window_topmost(id));
         }
-        if immersive_start {
-            crate::controller::hid::diag::diag_info(
-                "ui-diag: start raise skipped (immersive; toast stays visible)",
-            );
-            if let Some(id) = self.toast_window {
-                task = task
-                    .chain(window::set_level(id, window::Level::AlwaysOnTop))
-                    .chain(set_toast_topmost(id))
-                    .chain(raise_window_topmost(id));
-            }
-        } else if self.start_visible {
+        if self.start_visible {
             if let Some(id) = self.start_window {
                 task = task.chain(raise_window_topmost(id));
             }
@@ -4455,7 +4440,7 @@ impl App {
         if let Some(id) = self.configure_window {
             task = task.chain(raise_window_topmost(id));
         }
-        if focus && !immersive_start {
+        if focus {
             task.chain(self.refocus_interactive_ui())
         } else {
             task
