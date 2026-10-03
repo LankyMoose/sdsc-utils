@@ -18,11 +18,12 @@ pub struct AmbientUniforms {
     pub time: f32,
     pub dock_progress: f32,
     pub veil: f32,
-    pub _pad: f32,
+    /// Soft iris open amount (0 = closed, 1 = fully open).
+    pub aperture: f32,
 }
 
 impl AmbientUniforms {
-    pub fn from_theme(time: f32, dock_progress: f32, veil: f32) -> Self {
+    pub fn from_theme(time: f32, dock_progress: f32, veil: f32, aperture: f32) -> Self {
         Self {
             base_bg: color4(theme::BASE_BG),
             content: color4(theme::CONTENT),
@@ -30,7 +31,7 @@ impl AmbientUniforms {
             time,
             dock_progress: dock_progress.clamp(0.0, 1.0),
             veil: veil.clamp(0.0, 1.0),
-            _pad: 0.0,
+            aperture: aperture.clamp(0.0, 1.0),
         }
     }
 }
@@ -45,9 +46,9 @@ pub struct AmbientProgram {
 }
 
 impl AmbientProgram {
-    pub fn new(time: f32, dock_progress: f32, veil: f32) -> Self {
+    pub fn new(time: f32, dock_progress: f32, veil: f32, aperture: f32) -> Self {
         Self {
-            uniforms: AmbientUniforms::from_theme(time, dock_progress, veil),
+            uniforms: AmbientUniforms::from_theme(time, dock_progress, veil, aperture),
         }
     }
 }
@@ -195,10 +196,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uniforms_clamp_dock_and_veil() {
-        let u = AmbientUniforms::from_theme(1.5, 2.0, -1.0);
+    fn uniforms_clamp_dock_veil_aperture() {
+        let u = AmbientUniforms::from_theme(1.5, 2.0, -1.0, 1.5);
         assert_eq!(u.dock_progress, 1.0);
         assert_eq!(u.veil, 0.0);
+        assert_eq!(u.aperture, 1.0);
         assert_eq!(u.time, 1.5);
         assert!((u.base_bg[0] - theme::BASE_BG.r).abs() < 0.001);
     }

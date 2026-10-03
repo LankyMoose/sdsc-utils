@@ -233,29 +233,62 @@ pub fn content(_theme: &Theme) -> container::Style {
     }
 }
 
-/// Immersive main stage over the ambient shader.
+/// Immersive stage: no fill/border — atmosphere shows through.
 pub fn immersive_stage(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(alpha(CONTENT, 0.82))),
+        background: None,
         text_color: Some(INK),
-        border: Border {
-            color: alpha(LINE, 0.65),
-            width: 1.0,
-            radius: RADIUS.into(),
-        },
+        border: Border::default(),
         ..container::Style::default()
     }
 }
 
-/// Immersive controllers dock panel.
+/// Immersive controllers drawer: near-black, no border (flush with header).
 pub fn immersive_dock(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(alpha(BASE_BG, 0.96))),
+        text_color: Some(INK),
+        border: Border::default(),
+        ..container::Style::default()
+    }
+}
+
+/// Full-bleed darken wash when the controllers drawer is open.
+pub fn immersive_dim(amount: f32) -> impl Fn(&Theme) -> container::Style {
+    let amount = amount.clamp(0.0, 1.0);
+    move |_theme: &Theme| container::Style {
+        background: Some(Background::Color(alpha(Color::BLACK, amount))),
+        ..container::Style::default()
+    }
+}
+
+/// Soft top/bottom wash over Steam backdrop art.
+pub fn immersive_backdrop_wash(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(alpha(BASE_BG, 0.62))),
+        ..container::Style::default()
+    }
+}
+
+/// Full-bleed immersive title band (near-black, no rounding).
+pub fn immersive_header_band(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(alpha(BASE_BG, 0.96))),
+        text_color: Some(INK),
+        border: Border::default(),
+        ..container::Style::default()
+    }
+}
+
+/// Pill behind immersive footer action hints.
+pub fn immersive_footer_capsule(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(alpha(PANEL, 0.92))),
         text_color: Some(INK),
         border: Border {
-            color: alpha(LINE, 0.8),
+            color: alpha(LINE, 0.35),
             width: 1.0,
-            radius: RADIUS.into(),
+            radius: 28.0.into(),
         },
         ..container::Style::default()
     }

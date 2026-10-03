@@ -131,6 +131,8 @@ pub enum Message {
     StartFrame,
     /// HWND resize finished — apply immersive flag after promote/demote veil.
     StartImmersiveSettled,
+    /// Background immersive art warm finished — peek cache + fade-in.
+    ImmersiveArtReady,
     Start(StartMessage),
     /// Keyboard while some iced window has focus; filtered to the start screen in update.
     StartKey {
@@ -767,17 +769,39 @@ impl App {
                     // Raise/focus after create_renderer has a chance to finish —
                     // chaining sync on the same turn as window::open correlated
                     // with atlas create_renderer panics.
-                    window::gain_focus(id)
+                    let mut task = window::gain_focus(id)
                         .chain(raise_window_topmost(id))
-                        .chain(self.sync_toast_zorder())
+                        .chain(self.sync_toast_zorder());
+                    if self.start_state.immersive {
+                        task = task.chain(self.warm_immersive_art_task());
+                    }
+                    task
                 } else {
                     Task::none()
                 }
             }
             Message::StartImmersiveSettled => self.finish_start_immersive_transition(),
+            Message::ImmersiveArtReady => {
+                let now = Instant::now();
+                if self.start_state.immersive {
+                    if self
+                        .start_state
+                        .rows
+                        .get(self.start_state.game_selected)
+                        .is_some_and(|r| r.backdrop_icon().is_some())
+                    {
+                        self.start_state.note_backdrop_ready(now);
+                    }
+                    crate::controller::hid::diag::diag_info("ui-diag: immersive art warm done");
+                }
+                Task::none()
+            }
             Message::StartFrame => {
                 let now = Instant::now();
                 let _ = self.start_state.tick_anim(now);
+                if let Some(task) = self.tick_immersive_transition_phase(now) {
+                    return task;
+                }
                 // Keyboard-only hold progress when pad poll is not running.
                 if self.start_state.replace_confirm.is_some() {
                     let (progress, completed) =
@@ -2280,6 +2304,8 @@ impl App {
     }
 
     fn refresh_steam_library(&self) -> Task<Message> {
+        // List icons only here — full immersive prepare must not block SteamScanDone
+        // (compact stayed on skeletons until every hero/backdrop decoded).
         Task::perform(
             spawn_blocking(|| {
                 let games = steam::list_installed_games()?;
@@ -2311,7 +2337,39 @@ impl App {
         self.steam_scan_pending = false;
         self.match_path_cache.clear();
         self.refresh_start_rows();
-        Task::none()
+        let mut task = self.prepare_immersive_library_task();
+        if self.start_visible && self.start_state.immersive {
+            task = task.chain(self.warm_immersive_art_task());
+        }
+        task
+    }
+
+    /// Offline warm of library hero/backdrop tiers after scan (does not block skeletons).
+    fn prepare_immersive_library_task(&self) -> Task<Message> {
+        let heroes: Vec<_> = self
+            .steam_by_id
+            .values()
+            .filter_map(|g| g.icon_path.clone())
+            .collect();
+        let backdrops: Vec<_> = self
+            .steam_by_id
+            .values()
+            .filter_map(|g| g.backdrop_path.clone())
+            .collect();
+        if heroes.is_empty() && backdrops.is_empty() {
+            return Task::none();
+        }
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: immersive art library prepare begin heroes={} backdrops={}",
+            heroes.len(),
+            backdrops.len()
+        ));
+        Task::perform(
+            spawn_blocking(move || {
+                crate::ui::start::icon_cache::prepare_immersive(&heroes, &backdrops);
+            }),
+            |_| Message::ImmersiveArtReady,
+        )
     }
 
     fn on_manual_file_picked(&mut self, path: Option<PathBuf>) -> Task<Message> {
@@ -2492,14 +2550,17 @@ impl App {
         }
     }
 
+    fn immersive_transition_busy(&self) -> bool {
+        self.start_state.transition.is_some() || self.start_state.transition_phase.is_some()
+    }
+
     fn enter_start_immersive(&mut self) -> Task<Message> {
-        let Some(id) = self.start_window.filter(|_| self.start_visible) else {
+        let Some(_id) = self.start_window.filter(|_| self.start_visible) else {
             return Task::none();
         };
-        let Some(transition) = start_mode::begin_promote(
-            self.start_state.immersive,
-            self.start_state.transition.is_some(),
-        ) else {
+        let Some(_transition) =
+            start_mode::begin_promote(self.start_state.immersive, self.immersive_transition_busy())
+        else {
             return Task::none();
         };
         let cover = primary_monitor_cover().unwrap_or(MonitorCover {
@@ -2509,41 +2570,97 @@ impl App {
             height: 1080.0,
         });
         self.start_monitor_cover = Some(cover);
-        self.start_state.transition = Some(transition);
         self.reopen_needs_chord_release = true;
         self.consume_reopen_gesture_chord();
         crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
-        window::resize(id, cover.size())
-            .chain(window::move_to(id, cover.origin()))
-            .chain(Task::done(Message::StartImmersiveSettled))
+        self.start_state
+            .begin_transition_phase(start_mode::TransitionPhase::ExitCompact, Instant::now());
+        Task::none()
     }
 
     fn leave_start_immersive(&mut self) -> Task<Message> {
-        let Some(id) = self.start_window.filter(|_| self.start_visible) else {
+        let Some(_id) = self.start_window.filter(|_| self.start_visible) else {
             return Task::none();
         };
-        let Some(transition) = start_mode::begin_demote(
-            self.start_state.immersive,
-            self.start_state.transition.is_some(),
-        ) else {
+        let Some(_transition) =
+            start_mode::begin_demote(self.start_state.immersive, self.immersive_transition_busy())
+        else {
             return Task::none();
         };
-        self.start_state.transition = Some(transition);
         self.reopen_needs_chord_release = true;
         self.consume_reopen_gesture_chord();
         crate::controller::hid::diag::diag_info("ui-diag: start immersive leave");
-        let size = Size::new(start_view::WIDTH, start_view::HEIGHT);
-        let position = self
-            .start_monitor_cover
-            .or_else(primary_monitor_cover)
-            .map(|cover| cover.center_for(size))
-            .unwrap_or(Point::new(
-                ((1920.0 - size.width) / 2.0).max(0.0),
-                ((1080.0 - size.height) / 2.0).max(0.0),
-            ));
-        window::resize(id, size)
-            .chain(window::move_to(id, position))
-            .chain(Task::done(Message::StartImmersiveSettled))
+        self.start_state
+            .begin_transition_phase(start_mode::TransitionPhase::ExitImmersive, Instant::now());
+        Task::none()
+    }
+
+    fn tick_immersive_transition_phase(&mut self, now: Instant) -> Option<Task<Message>> {
+        if !self.start_state.phase_finished(now) {
+            return None;
+        }
+        let phase = self.start_state.transition_phase.map(|(p, _)| p)?;
+        match phase {
+            start_mode::TransitionPhase::ExitCompact => Some(self.perform_immersive_resize(true)),
+            start_mode::TransitionPhase::ExitImmersive => {
+                Some(self.perform_immersive_resize(false))
+            }
+            start_mode::TransitionPhase::EnterImmersive
+            | start_mode::TransitionPhase::EnterCompact => {
+                self.start_state.clear_transition_phase();
+                if !self.start_state.immersive {
+                    self.start_state.ambient_time = 0.0;
+                }
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start immersive transition phase={} done",
+                    phase.label()
+                ));
+                None
+            }
+            start_mode::TransitionPhase::Resizing => None,
+        }
+    }
+
+    fn perform_immersive_resize(&mut self, promoting: bool) -> Task<Message> {
+        let Some(id) = self.start_window.filter(|_| self.start_visible) else {
+            self.start_state.clear_transition_phase();
+            return Task::none();
+        };
+        let transition = if promoting {
+            start_mode::StartTransition::Promoting
+        } else {
+            start_mode::StartTransition::Demoting
+        };
+        self.start_state.transition = Some(transition);
+        self.start_state
+            .begin_transition_phase(start_mode::TransitionPhase::Resizing, Instant::now());
+        if promoting {
+            let cover = self.start_monitor_cover.unwrap_or_else(|| {
+                primary_monitor_cover().unwrap_or(MonitorCover {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                })
+            });
+            self.start_monitor_cover = Some(cover);
+            window::resize(id, cover.size())
+                .chain(window::move_to(id, cover.origin()))
+                .chain(Task::done(Message::StartImmersiveSettled))
+        } else {
+            let size = Size::new(start_view::WIDTH, start_view::HEIGHT);
+            let position = self
+                .start_monitor_cover
+                .or_else(primary_monitor_cover)
+                .map(|cover| cover.center_for(size))
+                .unwrap_or(Point::new(
+                    ((1920.0 - size.width) / 2.0).max(0.0),
+                    ((1080.0 - size.height) / 2.0).max(0.0),
+                ));
+            window::resize(id, size)
+                .chain(window::move_to(id, position))
+                .chain(Task::done(Message::StartImmersiveSettled))
+        }
     }
 
     fn finish_start_immersive_transition(&mut self) -> Task<Message> {
@@ -2552,19 +2669,54 @@ impl App {
         };
         let immersive = start_mode::settle_immersive(transition);
         self.start_state.immersive = immersive;
-        self.start_state.clear_immersive_session();
+        self.start_state.dock_expanded = false;
         self.start_state.slide = StartSlide::Games;
-        if !immersive {
+        // Dock/strip anims cleared via transition phase begin + request_dock defaults.
+        let now = Instant::now();
+        if immersive {
+            // Keep ambient_time; open aperture + chrome.
+            self.start_state
+                .begin_transition_phase(start_mode::TransitionPhase::EnterImmersive, now);
+        } else {
             self.start_monitor_cover = None;
+            self.start_state
+                .begin_transition_phase(start_mode::TransitionPhase::EnterCompact, now);
         }
         self.reopen_needs_chord_release = true;
         self.consume_reopen_gesture_chord();
         let kind = if immersive { "promote" } else { "demote" };
         crate::controller::hid::diag::diag_info(format!("ui-diag: start immersive settle {kind}"));
-        let Some(id) = self.start_window else {
+        let focus = self
+            .start_window
+            .map(|id| window::gain_focus(id).chain(raise_window_topmost(id)))
+            .unwrap_or_else(Task::none);
+        if immersive {
+            focus.chain(self.warm_immersive_art_task())
+        } else {
+            focus
+        }
+    }
+
+    fn warm_immersive_art_task(&self) -> Task<Message> {
+        let (heroes, shells, backdrops) = self.start_state.immersive_warm_paths();
+        if heroes.is_empty() && shells.is_empty() && backdrops.is_empty() {
             return Task::none();
-        };
-        window::gain_focus(id).chain(raise_window_topmost(id))
+        }
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: immersive art warm begin heroes={} shells={} backdrops={}",
+            heroes.len(),
+            shells.len(),
+            backdrops.len()
+        ));
+        Task::perform(
+            spawn_blocking(move || {
+                crate::ui::start::icon_cache::warm_immersive_paths(&heroes, &backdrops);
+                for path in shells {
+                    let _ = crate::ui::start::icon_cache::hero_for_shell(&path);
+                }
+            }),
+            |_| Message::ImmersiveArtReady,
+        )
     }
 
     /// Mark the live reopen chord as already matched so a sticky hold cannot fire.
@@ -2723,11 +2875,14 @@ impl App {
                 }
                 let prev = self.start_state.game_selected;
                 self.start_state.game_selected = index;
+                let mut task = self.scroll_start_selection_into_view();
                 if self.start_state.immersive {
                     self.start_state.begin_strip_anim(prev, Instant::now());
+                    self.start_state.reset_backdrop_fade();
+                    task = task.chain(self.warm_immersive_art_task());
                 }
                 self.play_start_cue(UiSoundKind::Nav);
-                self.scroll_start_selection_into_view()
+                task
             }
             StartMessage::SelectController(index) => {
                 if index < self.start_state.controllers.len()
@@ -2744,6 +2899,9 @@ impl App {
             StartMessage::MoveUp => {
                 let prev_game = self.start_state.game_selected;
                 let direction = self.start_state.move_selection(-1);
+                let mut task = self.scroll_start_selection_into_view_dir(
+                    direction.unwrap_or(start_view::ScrollReveal::Up),
+                );
                 if direction.is_some() {
                     self.play_start_cue(UiSoundKind::Nav);
                     if self.start_state.immersive
@@ -2751,15 +2909,18 @@ impl App {
                         && self.start_state.game_selected != prev_game
                     {
                         self.start_state.begin_strip_anim(prev_game, Instant::now());
+                        self.start_state.reset_backdrop_fade();
+                        task = task.chain(self.warm_immersive_art_task());
                     }
                 }
-                self.scroll_start_selection_into_view_dir(
-                    direction.unwrap_or(start_view::ScrollReveal::Up),
-                )
+                task
             }
             StartMessage::MoveDown => {
                 let prev_game = self.start_state.game_selected;
                 let direction = self.start_state.move_selection(1);
+                let mut task = self.scroll_start_selection_into_view_dir(
+                    direction.unwrap_or(start_view::ScrollReveal::Down),
+                );
                 if direction.is_some() {
                     self.play_start_cue(UiSoundKind::Nav);
                     if self.start_state.immersive
@@ -2767,11 +2928,11 @@ impl App {
                         && self.start_state.game_selected != prev_game
                     {
                         self.start_state.begin_strip_anim(prev_game, Instant::now());
+                        self.start_state.reset_backdrop_fade();
+                        task = task.chain(self.warm_immersive_art_task());
                     }
                 }
-                self.scroll_start_selection_into_view_dir(
-                    direction.unwrap_or(start_view::ScrollReveal::Down),
-                )
+                task
             }
             StartMessage::Confirm => self.on_start_confirm(),
             StartMessage::Close => {

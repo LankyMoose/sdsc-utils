@@ -35,13 +35,19 @@ pub const HEIGHT: f32 = 500.0;
 pub const SLIDE_ANIM_MS: u64 = 220;
 const SLIDE_ANIM_MIN_MS: u64 = 60;
 const HEADER_HEIGHT: f32 = 36.0;
+const IMMERSIVE_HEADER_HEIGHT: f32 = 64.0;
 /// Matches the Games footer band (face-cycle toggle + face hints).
 const FOOTER_HEIGHT: f32 = 32.0;
+const IMMERSIVE_FOOTER_HEIGHT: f32 = 56.0;
 const TITLE_ACTIVE: f32 = 20.0;
 const TITLE_INACTIVE: f32 = 15.0;
+const IMMERSIVE_TITLE_ACTIVE: f32 = 32.0;
+const IMMERSIVE_TITLE_INACTIVE: f32 = 22.0;
 const CUE_SIZE: f32 = 14.0;
+const IMMERSIVE_CUE_SIZE: f32 = 18.0;
 /// Width reserved for an L2/R2 cue plus gap while revealed.
 const CUE_SLOT_W: f32 = 30.0;
+const IMMERSIVE_CUE_SLOT_W: f32 = 42.0;
 const ROW_HEIGHT: f32 = 88.0;
 const CONTROLLER_ROW_HEIGHT: f32 = 100.0;
 /// Horizontal inset; vertical chrome uses [`PAD_Y`].
@@ -133,6 +139,8 @@ pub struct StartRow {
     pub icon: Option<StartIcon>,
     /// Path used for immersive hero art (selected + neighbors only).
     pub icon_source: Option<IconSource>,
+    /// Landscape Steam art for immersive full-bleed backdrop.
+    pub backdrop_path: Option<PathBuf>,
     /// Set in edit mode so Cross/click toggles membership or removes a manual.
     pub edit: Option<EditRow>,
     /// Steam catalog still scanning — paint empty well + muted bars, not AppID text.
@@ -164,6 +172,7 @@ impl StartRow {
                         play_key: entry.play_key(),
                         icon: steam_icon(game),
                         icon_source,
+                        backdrop_path: game.backdrop_path.clone(),
                         edit: None,
                         skeleton: false,
                     }
@@ -176,6 +185,7 @@ impl StartRow {
                         play_key: entry.play_key(),
                         icon: None,
                         icon_source: None,
+                        backdrop_path: None,
                         edit: None,
                         skeleton: true,
                     }
@@ -188,6 +198,7 @@ impl StartRow {
                         play_key: entry.play_key(),
                         icon: None,
                         icon_source: None,
+                        backdrop_path: None,
                         edit: None,
                         skeleton: false,
                     }
@@ -209,6 +220,7 @@ impl StartRow {
                     play_key: entry.play_key(),
                     icon: manual_icon(target, icon.as_deref()),
                     icon_source,
+                    backdrop_path: None,
                     edit: None,
                     skeleton: false,
                 }
@@ -226,6 +238,7 @@ impl StartRow {
             play_key: format!("steam:{}", game.appid),
             icon: steam_icon(game),
             icon_source,
+            backdrop_path: game.backdrop_path.clone(),
             edit: Some(EditRow::Steam {
                 appid: game.appid,
                 in_catalog,
@@ -254,19 +267,37 @@ impl StartRow {
             play_key: entry.play_key(),
             icon: manual_icon(target, icon.as_deref()),
             icon_source,
+            backdrop_path: None,
             edit: Some(EditRow::Manual { id: id.clone() }),
             skeleton: false,
         })
     }
 
-    /// Immersive hero art for this row (cached; miss falls back to list icon).
+    /// Immersive hero art — peek only (never decodes on the UI thread).
+    /// Falls back to the list icon when the hero tier is still cold.
     pub fn hero_icon(&self) -> Option<StartIcon> {
         match &self.icon_source {
-            Some(IconSource::File(path)) => icon_cache::hero_for_path(path).map(StartIcon),
-            Some(IconSource::Shell(path)) => icon_cache::hero_for_shell(path).map(StartIcon),
+            Some(IconSource::File(path)) => icon_cache::hero_cached(path).map(StartIcon),
+            Some(IconSource::Shell(path)) => icon_cache::hero_shell_cached(path).map(StartIcon),
             None => None,
         }
         .or_else(|| self.icon.clone())
+    }
+
+    /// True when the immersive hero tier is already decoded (no list fallback).
+    pub fn hero_ready(&self) -> bool {
+        match &self.icon_source {
+            Some(IconSource::File(path)) => icon_cache::hero_cached(path).is_some(),
+            Some(IconSource::Shell(path)) => icon_cache::hero_shell_cached(path).is_some(),
+            None => self.icon.is_some(),
+        }
+    }
+
+    /// Immersive landscape backdrop — peek only (never decodes on the UI thread).
+    pub fn backdrop_icon(&self) -> Option<StartIcon> {
+        self.backdrop_path
+            .as_ref()
+            .and_then(|p| icon_cache::backdrop_cached(p).map(StartIcon))
     }
 
     pub fn in_catalog(&self) -> bool {
@@ -448,6 +479,8 @@ pub struct State {
     pub immersive: bool,
     /// HWND resize in flight — paint veil until settled.
     pub transition: Option<crate::ui::start::mode::StartTransition>,
+    /// Cinematic phase around promote/demote (exit → resize → enter).
+    pub transition_phase: Option<(crate::ui::start::mode::TransitionPhase, Instant)>,
     /// Immersive controllers dock target (expanded = Controllers focus).
     pub dock_expanded: bool,
     pub game_selected: usize,
@@ -484,6 +517,10 @@ pub struct State {
     strip_anim: Option<StripAnim>,
     /// Seconds for ambient shader time uniform.
     pub ambient_time: f32,
+    /// Incoming backdrop land/crossfade (`started = None` = waiting for peek art).
+    backdrop_current: Option<(String, Option<Instant>)>,
+    /// Outgoing backdrop during opacity crossfade: `(play_key, started)`.
+    backdrop_outgoing: Option<(String, Instant)>,
     /// Ring flash started with the last successful Identify (Controllers slide).
     identify_flash: Option<IdentifyFlash>,
 }
@@ -512,6 +549,7 @@ impl Default for State {
             slide: StartSlide::Games,
             immersive: false,
             transition: None,
+            transition_phase: None,
             dock_expanded: false,
             game_selected: 0,
             rows: Vec::new(),
@@ -539,6 +577,8 @@ impl Default for State {
             dock_anim: None,
             strip_anim: None,
             ambient_time: 0.0,
+            backdrop_current: None,
+            backdrop_outgoing: None,
             identify_flash: None,
         }
     }
@@ -714,7 +754,16 @@ impl State {
     }
 
     pub fn animating(&self) -> bool {
-        self.anim.is_some() || (self.immersive && self.dock_anim.is_some())
+        self.anim.is_some()
+            || (self.immersive && self.dock_anim.is_some())
+            || self.strip_busy()
+            || self.transition_phase.is_some()
+            || self.transition.is_some()
+    }
+
+    /// Immersive strip scroll in flight — blocks further Games Up/Down.
+    pub fn strip_busy(&self) -> bool {
+        self.immersive && self.strip_anim.is_some()
     }
 
     pub fn needs_frames(&self) -> bool {
@@ -722,6 +771,9 @@ impl State {
             || self.dock_anim.is_some()
             || self.strip_anim.is_some()
             || self.transition.is_some()
+            || self.transition_phase.is_some()
+            || self.backdrop_current.is_some()
+            || self.backdrop_outgoing.is_some()
             || self.immersive
             || self.triangle_progress > 0.0
             || self.cross_progress > 0.0
@@ -798,9 +850,16 @@ impl State {
     }
 
     pub fn begin_strip_anim(&mut self, from_index: usize, now: Instant) {
+        let len = self.rows.len() as f32;
+        if len < 1.0 {
+            self.strip_anim = None;
+            return;
+        }
         let to = self.game_selected as f32;
-        let from = from_index as f32;
-        if (from - to).abs() < 0.01 {
+        let delta = crate::ui::start::vstrip::shortest_circular_delta(from_index as f32, to, len);
+        // Animate toward `to` from `to - delta` so wraps are one step (e.g. -1 → 0).
+        let from = to - delta;
+        if delta.abs() < 0.01 {
             self.strip_anim = None;
             return;
         }
@@ -812,12 +871,167 @@ impl State {
         });
     }
 
+    /// Clear dock/strip/transition and ambient (close / leave immersive fully).
     pub fn clear_immersive_session(&mut self) {
         self.dock_expanded = false;
         self.dock_anim = None;
         self.strip_anim = None;
         self.transition = None;
+        self.transition_phase = None;
+        self.backdrop_current = None;
+        self.backdrop_outgoing = None;
         self.ambient_time = 0.0;
+    }
+
+    pub fn begin_transition_phase(
+        &mut self,
+        phase: crate::ui::start::mode::TransitionPhase,
+        now: Instant,
+    ) {
+        self.dock_anim = None;
+        self.strip_anim = None;
+        self.transition_phase = Some((phase, now));
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start immersive transition phase={}",
+            phase.label()
+        ));
+    }
+
+    pub fn clear_transition_phase(&mut self) {
+        self.transition_phase = None;
+    }
+
+    pub fn phase_progress(&self, now: Instant) -> f32 {
+        let Some((phase, started)) = self.transition_phase else {
+            return 1.0;
+        };
+        let elapsed = now.saturating_duration_since(started).as_millis() as u64;
+        crate::ui::start::mode::phase_progress(elapsed, phase.duration_ms())
+    }
+
+    /// True when a timed phase (not Resizing) has reached its duration.
+    pub fn phase_finished(&self, now: Instant) -> bool {
+        let Some((phase, started)) = self.transition_phase else {
+            return false;
+        };
+        let dur = phase.duration_ms();
+        if dur == 0 {
+            return false;
+        }
+        now.saturating_duration_since(started) >= Duration::from_millis(dur)
+    }
+
+    /// Start backdrop land/crossfade once peek art exists for a waiting selection.
+    pub fn note_backdrop_ready(&mut self, now: Instant) {
+        let Some(row) = self.rows.get(self.game_selected) else {
+            return;
+        };
+        if row.backdrop_icon().is_none() {
+            return;
+        }
+        match &mut self.backdrop_current {
+            Some((key, started)) if key == &row.play_key && started.is_none() => {
+                *started = Some(now);
+            }
+            None => {}
+            _ => {}
+        }
+    }
+
+    /// Visual params for the incoming backdrop: `(opacity, scale, ox, oy)`.
+    pub fn backdrop_incoming_visual(&self, now: Instant) -> Option<(f32, f32, f32, f32)> {
+        use crate::ui::start::mode::{
+            BACKDROP_LAND_OX0, BACKDROP_LAND_OY0, BACKDROP_LAND_SCALE0, art_fade_progress,
+            backdrop_land_offset, backdrop_land_progress, backdrop_land_scale,
+        };
+        let row = self.rows.get(self.game_selected)?;
+        row.backdrop_icon()?;
+        match &self.backdrop_current {
+            Some((key, None)) if key == &row.play_key => Some((
+                0.0,
+                BACKDROP_LAND_SCALE0,
+                BACKDROP_LAND_OX0,
+                BACKDROP_LAND_OY0,
+            )),
+            Some((key, Some(started))) if key == &row.play_key => {
+                let elapsed = now.saturating_duration_since(*started).as_millis() as u64;
+                let opacity = art_fade_progress(elapsed);
+                let land = backdrop_land_progress(elapsed);
+                let scale = backdrop_land_scale(land);
+                let (ox, oy) = backdrop_land_offset(land);
+                Some((opacity, scale, ox, oy))
+            }
+            None => Some((1.0, 1.0, 0.0, 0.0)),
+            _ => None,
+        }
+    }
+
+    /// Outgoing backdrop during crossfade: `(play_key, opacity)`.
+    pub fn backdrop_outgoing_visual(&self, now: Instant) -> Option<(&str, f32)> {
+        let (key, started) = self.backdrop_outgoing.as_ref()?;
+        let elapsed = now.saturating_duration_since(*started).as_millis() as u64;
+        let opacity = 1.0 - crate::ui::start::mode::art_fade_progress(elapsed);
+        if opacity <= 0.01 {
+            return None;
+        }
+        Some((key.as_str(), opacity))
+    }
+
+    /// Resolve a peek backdrop handle by play_key (for outgoing layer).
+    pub fn backdrop_icon_for_key(&self, play_key: &str) -> Option<StartIcon> {
+        self.rows
+            .iter()
+            .find(|r| r.play_key == play_key)
+            .and_then(|r| r.backdrop_icon())
+    }
+
+    /// Paths to warm for the current immersive selection window.
+    /// Returns `(hero_files, hero_shells, backdrops)`.
+    pub fn immersive_warm_paths(&self) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+        use crate::ui::start::vstrip::NEIGHBORS;
+        let mut heroes = Vec::new();
+        let mut shells = Vec::new();
+        let mut backdrops = Vec::new();
+        let len = self.rows.len() as isize;
+        if len == 0 {
+            return (heroes, shells, backdrops);
+        }
+        let selected = self.game_selected.min(self.rows.len() - 1) as isize;
+        for delta in -NEIGHBORS..=NEIGHBORS {
+            let idx = (selected + delta).rem_euclid(len) as usize;
+            let row = &self.rows[idx];
+            match &row.icon_source {
+                Some(IconSource::File(path)) => heroes.push(path.clone()),
+                Some(IconSource::Shell(path)) => shells.push(path.clone()),
+                None => {}
+            }
+        }
+        for delta in -1isize..=1 {
+            let idx = (selected + delta).rem_euclid(len) as usize;
+            if let Some(path) = self.rows[idx].backdrop_path.clone() {
+                backdrops.push(path);
+            }
+        }
+        (heroes, shells, backdrops)
+    }
+
+    /// Selection changed: park prior art as outgoing and wait/land the new one.
+    pub fn reset_backdrop_fade(&mut self) {
+        let now = Instant::now();
+        if let Some((prev_key, Some(_))) = self.backdrop_current.take() {
+            // Only crossfade out if we were actually showing something.
+            if self.backdrop_icon_for_key(&prev_key).is_some() {
+                self.backdrop_outgoing = Some((prev_key, now));
+            }
+        } else {
+            self.backdrop_current = None;
+        }
+        let key = self
+            .rows
+            .get(self.game_selected)
+            .map(|r| r.play_key.clone());
+        self.backdrop_current = key.map(|k| (k, None));
+        self.note_backdrop_ready(now);
     }
 
     /// Start the UI ring flash that mirrors the lightbar Identify pattern.
@@ -927,7 +1141,28 @@ impl State {
                 busy = true;
             }
         }
-        if self.immersive || self.transition.is_some() {
+        if let Some((_key, started)) = &self.backdrop_current {
+            if let Some(started) = started {
+                let elapsed = now.saturating_duration_since(*started);
+                if elapsed < Duration::from_millis(crate::ui::start::mode::BACKDROP_LAND_MS) {
+                    busy = true;
+                }
+            } else {
+                busy = true;
+            }
+        }
+        if let Some((_, started)) = &self.backdrop_outgoing {
+            let elapsed = now.saturating_duration_since(*started);
+            if elapsed >= Duration::from_millis(crate::ui::start::mode::ART_FADE_MS) {
+                self.backdrop_outgoing = None;
+            } else {
+                busy = true;
+            }
+        }
+        if self.transition_phase.is_some() {
+            busy = true;
+        }
+        if self.immersive || self.transition.is_some() || self.transition_phase.is_some() {
             self.ambient_time += 1.0 / 60.0;
             busy = true;
         }
@@ -984,6 +1219,9 @@ impl State {
         }
         match self.slide {
             StartSlide::Games => {
+                if self.strip_busy() {
+                    return None;
+                }
                 if self.rows.is_empty() {
                     return None;
                 }
@@ -1159,10 +1397,23 @@ pub fn view<'a>(
     spectrum: &BatterySpectrum,
     now: Instant,
 ) -> Element<'a, StartMessage> {
-    if state.transition.is_some() {
+    use crate::ui::start::mode::TransitionPhase;
+
+    if matches!(
+        state.transition_phase.map(|(p, _)| p),
+        Some(TransitionPhase::Resizing)
+    ) || state.transition.is_some()
+    {
         return crate::ui::start::immersive::veil_view(state, now);
     }
-    if state.immersive {
+
+    let phase = state.transition_phase.map(|(p, _)| p);
+    let show_immersive = state.immersive
+        || matches!(
+            phase,
+            Some(TransitionPhase::EnterImmersive | TransitionPhase::ExitImmersive)
+        );
+    if show_immersive {
         return crate::ui::start::immersive::view(state, spectrum, now);
     }
 
@@ -1182,7 +1433,7 @@ pub fn view<'a>(
     #[cfg(not(debug_assertions))]
     let diag: Element<'_, StartMessage> = space().height(Length::Fixed(0.0)).into();
 
-    theme::framed(
+    let compact = theme::framed(
         column![
             column![
                 header,
@@ -1204,7 +1455,49 @@ pub fn view<'a>(
         .padding([PAD_Y, PADDING])
         .width(Fill)
         .height(Fill),
-    )
+    );
+
+    // ExitCompact / EnterCompact: blackout + scale (no ambient on compact).
+    match phase {
+        Some(TransitionPhase::ExitCompact) => {
+            let t = state.phase_progress(now);
+            crate::ui::start::immersive::compact_transition_overlay(compact, t, true)
+        }
+        Some(TransitionPhase::EnterCompact) => {
+            let t = state.phase_progress(now);
+            crate::ui::start::immersive::compact_transition_overlay(compact, 1.0 - t, false)
+        }
+        _ => compact,
+    }
+}
+
+/// Identify / Power-off hints for an immersive dock row (mirrors compact Controllers).
+pub(crate) fn immersive_dock_row_hints(
+    row: &StartControllerRow,
+    state: &State,
+    selected: bool,
+) -> Option<Element<'static, StartMessage>> {
+    if !selected || !row.connected {
+        return None;
+    }
+    let hint = RowHintState::for_selected(state, true);
+    let mut actions = vec![face_hint(
+        FaceButton::Cross,
+        "Identify",
+        hint.held,
+        hint.press_anim,
+    )];
+    if row.show_power_off() {
+        actions.push(face_hold_hint(
+            FaceButton::Triangle,
+            "Power off",
+            hint.triangle_progress,
+            hint.triangle_armed_t,
+            hint.held,
+            hint.press_anim,
+        ));
+    }
+    Some(action_cluster_spaced(&actions, ROW_ACTION_SPACING))
 }
 
 /// Mouse + global hotkey hitch markers (not pad-navigable). Stamps `HITCH_MARK` in the logs.
@@ -1235,31 +1528,64 @@ fn diag_report_bar() -> Element<'static, StartMessage> {
 
 /// Header titles and L2/R2 cues interpolate with carousel progress (0 = Games, 1 = Controllers).
 pub(crate) fn slide_header(progress: f32) -> Element<'static, StartMessage> {
+    slide_header_metrics(
+        progress,
+        HEADER_HEIGHT,
+        TITLE_ACTIVE,
+        TITLE_INACTIVE,
+        CUE_SIZE,
+        CUE_SLOT_W,
+    )
+}
+
+/// Immersive header: same cue reveal logic, larger type and band.
+pub(crate) fn immersive_slide_header(progress: f32) -> Element<'static, StartMessage> {
+    slide_header_metrics(
+        progress,
+        IMMERSIVE_HEADER_HEIGHT,
+        IMMERSIVE_TITLE_ACTIVE,
+        IMMERSIVE_TITLE_INACTIVE,
+        IMMERSIVE_CUE_SIZE,
+        IMMERSIVE_CUE_SLOT_W,
+    )
+}
+
+fn slide_header_metrics(
+    progress: f32,
+    height: f32,
+    title_active: f32,
+    title_inactive: f32,
+    cue_size: f32,
+    cue_slot_w: f32,
+) -> Element<'static, StartMessage> {
     let games_t = progress;
     let controllers_t = 1.0 - progress;
 
     let games_label = text(StartSlide::Games.title())
-        .size(lerp(TITLE_ACTIVE, TITLE_INACTIVE, games_t))
+        .size(lerp(title_active, title_inactive, games_t))
         .color(lerp_color(
             theme::INK,
             theme::alpha(theme::MUTED, 0.45),
             games_t,
         ));
     let controllers_label = text(StartSlide::Controllers.title())
-        .size(lerp(TITLE_ACTIVE, TITLE_INACTIVE, controllers_t))
+        .size(lerp(title_active, title_inactive, controllers_t))
         .color(lerp_color(
             theme::INK,
             theme::alpha(theme::MUTED, 0.45),
             controllers_t,
         ));
 
-    let left = row![slide_cue("L2", games_t, Alignment::Start), games_label,]
-        .spacing(0)
-        .align_y(Alignment::End);
+    let left = row![
+        slide_cue("L2", games_t, Alignment::Start, cue_size, cue_slot_w),
+        games_label,
+    ]
+    .spacing(0)
+    .align_y(Alignment::End);
 
     let right = row![
         controllers_label,
-        slide_cue("R2", controllers_t, Alignment::End),
+        slide_cue("R2", controllers_t, Alignment::End, cue_size, cue_slot_w),
     ]
     .spacing(0)
     .align_y(Alignment::End);
@@ -1276,17 +1602,23 @@ pub(crate) fn slide_header(progress: f32) -> Element<'static, StartMessage> {
             .align_x(Alignment::End)
             .align_y(Alignment::End),
     ]
-    .height(Length::Fixed(HEADER_HEIGHT))
+    .height(Length::Fixed(height))
     .into()
 }
 
 /// Width-revealed + faded L2/R2 cue (`amount` 0 = hidden, 1 = fully shown).
-fn slide_cue(label: &'static str, amount: f32, align: Alignment) -> Element<'static, StartMessage> {
+fn slide_cue(
+    label: &'static str,
+    amount: f32,
+    align: Alignment,
+    cue_size: f32,
+    cue_slot_w: f32,
+) -> Element<'static, StartMessage> {
     let amount = amount.clamp(0.0, 1.0);
-    let width = CUE_SLOT_W * amount;
+    let width = cue_slot_w * amount;
     container(
         text(label)
-            .size(CUE_SIZE)
+            .size(cue_size)
             .color(theme::alpha(theme::ACCENT, amount)),
     )
     .width(Length::Fixed(width))
@@ -1679,23 +2011,29 @@ pub(crate) fn footer_hint(state: &State, immersive: bool) -> Element<'_, StartMe
         } else {
             "Add"
         };
-        return footer_band(action_cluster(&[
-            face_hint(FaceButton::Cross, label, state.held, state.press_anim),
-            face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
-        ]));
+        return footer_band(
+            action_cluster(&[
+                face_hint(FaceButton::Cross, label, state.held, state.press_anim),
+                face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
+            ]),
+            immersive,
+        );
     }
     if state.replace_confirm.is_some() {
-        return footer_band(action_cluster(&[
-            face_hold_hint(
-                FaceButton::Cross,
-                "Proceed",
-                state.cross_progress,
-                state.cross_armed_anim,
-                state.held,
-                state.press_anim,
-            ),
-            face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
-        ]));
+        return footer_band(
+            action_cluster(&[
+                face_hold_hint(
+                    FaceButton::Cross,
+                    "Proceed",
+                    state.cross_progress,
+                    state.cross_armed_anim,
+                    state.held,
+                    state.press_anim,
+                ),
+                face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
+            ]),
+            immersive,
+        );
     }
 
     let circle_label = if state.editing {
@@ -1782,16 +2120,26 @@ pub(crate) fn footer_hint(state: &State, immersive: bool) -> Element<'_, StartMe
         .into(),
     };
 
-    footer_band(cluster)
+    footer_band(cluster, immersive)
 }
 
-fn footer_band(content: Element<'_, StartMessage>) -> Element<'_, StartMessage> {
-    container(content)
-        .width(Fill)
-        .height(Length::Fixed(FOOTER_HEIGHT))
+fn footer_band(content: Element<'_, StartMessage>, immersive: bool) -> Element<'_, StartMessage> {
+    let height = if immersive {
+        IMMERSIVE_FOOTER_HEIGHT
+    } else {
+        FOOTER_HEIGHT
+    };
+    // Immersive: shrink to the action cluster so the footer capsule hugs content.
+    // Compact: fill the footer band as before.
+    let band = container(content)
+        .height(Length::Fixed(height))
         .align_x(Alignment::Center)
-        .align_y(Alignment::Center)
-        .into()
+        .align_y(Alignment::Center);
+    if immersive {
+        band.into()
+    } else {
+        band.width(Fill).into()
+    }
 }
 
 /// Square glyph + segmented labels; pad and mouse both fire `on_press`.
@@ -2335,6 +2683,7 @@ mod tests {
                 appid: 238960,
                 name: "Path of Exile".into(),
                 icon_path: None,
+                backdrop_path: None,
             },
         );
         let row = StartRow::from_entry(&entry, &map, true);

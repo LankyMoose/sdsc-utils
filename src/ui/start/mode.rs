@@ -26,6 +26,59 @@ pub enum StartTransition {
     Demoting,
 }
 
+/// Choreographed phases around the hard HWND resize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionPhase {
+    /// Compact chrome fading out; still 640×500.
+    ExitCompact,
+    /// Veil only while HWND resizes (matches [`StartTransition`]).
+    Resizing,
+    /// Immersive aperture/chrome opening after promote settle.
+    EnterImmersive,
+    /// Immersive aperture/chrome closing before demote resize.
+    ExitImmersive,
+    /// Compact chrome fading in after demote settle.
+    EnterCompact,
+}
+
+pub const EXIT_COMPACT_MS: u64 = 450;
+pub const ENTER_IMMERSIVE_MS: u64 = 1100;
+pub const EXIT_IMMERSIVE_MS: u64 = 700;
+pub const ENTER_COMPACT_MS: u64 = 400;
+/// Opacity crossfade between game backdrops.
+pub const ART_FADE_MS: u64 = 450;
+/// Slow ken-burns settle (scale + center) after landing on a game.
+pub const BACKDROP_LAND_MS: u64 = 10_000;
+/// Ken-burns start scale (must be ≥ 1 so Cover never letterboxes).
+pub const BACKDROP_LAND_SCALE0: f32 = 1.0;
+/// Ken-burns end scale (slow zoom-in).
+pub const BACKDROP_LAND_SCALE1: f32 = 1.08;
+/// Pan offsets kept at 0 so Cover stays edge-to-edge.
+pub const BACKDROP_LAND_OX0: f32 = 0.0;
+pub const BACKDROP_LAND_OY0: f32 = 0.0;
+
+impl TransitionPhase {
+    pub fn duration_ms(self) -> u64 {
+        match self {
+            Self::ExitCompact => EXIT_COMPACT_MS,
+            Self::Resizing => 0,
+            Self::EnterImmersive => ENTER_IMMERSIVE_MS,
+            Self::ExitImmersive => EXIT_IMMERSIVE_MS,
+            Self::EnterCompact => ENTER_COMPACT_MS,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ExitCompact => "exit_compact",
+            Self::Resizing => "resizing",
+            Self::EnterImmersive => "enter_immersive",
+            Self::ExitImmersive => "exit_immersive",
+            Self::EnterCompact => "enter_compact",
+        }
+    }
+}
+
 /// Cold open / first reopen: prefer immersive when the pref is on.
 pub fn on_open(prefer_immersive: bool) -> ImmersiveTransition {
     if prefer_immersive {
@@ -87,6 +140,85 @@ pub fn dock_expand_target(expanded: bool) -> Option<bool> {
 /// L2 while immersive: collapse dock when expanded.
 pub fn dock_collapse_target(expanded: bool) -> Option<bool> {
     if !expanded { None } else { Some(false) }
+}
+
+/// Stage scale while the controllers drawer opens (1 → ~12% smaller).
+pub fn dock_stage_scale(progress: f32) -> f32 {
+    let t = progress.clamp(0.0, 1.0);
+    1.0 - 0.12 * t
+}
+
+/// Dim overlay alpha over the games stage while the drawer opens.
+pub fn dock_stage_dim(progress: f32) -> f32 {
+    progress.clamp(0.0, 1.0) * 0.45
+}
+
+/// Overlay drawer width from thin peek → expanded panel.
+pub fn dock_panel_width(progress: f32, peek: f32, expanded: f32) -> f32 {
+    let t = progress.clamp(0.0, 1.0);
+    peek + (expanded - peek) * t
+}
+
+/// Ease-out cubic progress 0..=1 for elapsed/duration.
+pub fn phase_progress(elapsed_ms: u64, duration_ms: u64) -> f32 {
+    if duration_ms == 0 {
+        return 1.0;
+    }
+    let t = (elapsed_ms as f32 / duration_ms as f32).clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// Content/veil reveal after HWND settle (0 = veiled, 1 = clear).
+pub fn settle_reveal(elapsed_ms: u64, duration_ms: u64) -> f32 {
+    phase_progress(elapsed_ms, duration_ms)
+}
+
+/// Art fade-in progress (0 = invisible, 1 = opaque).
+pub fn art_fade_progress(elapsed_ms: u64) -> f32 {
+    phase_progress(elapsed_ms, ART_FADE_MS)
+}
+
+/// Backdrop land zoom progress (0 = start pose, 1 = settled).
+pub fn backdrop_land_progress(elapsed_ms: u64) -> f32 {
+    phase_progress(elapsed_ms, BACKDROP_LAND_MS)
+}
+
+/// Incoming backdrop scale for land progress (1.0 → 1.08 zoom-in).
+pub fn backdrop_land_scale(progress: f32) -> f32 {
+    let t = progress.clamp(0.0, 1.0);
+    BACKDROP_LAND_SCALE0 + (BACKDROP_LAND_SCALE1 - BACKDROP_LAND_SCALE0) * t
+}
+
+/// Incoming backdrop offset (drifts to 0,0).
+pub fn backdrop_land_offset(progress: f32) -> (f32, f32) {
+    let t = progress.clamp(0.0, 1.0);
+    let inv = 1.0 - t;
+    (BACKDROP_LAND_OX0 * inv, BACKDROP_LAND_OY0 * inv)
+}
+
+/// Promote enter: aperture 0→1 from phase progress.
+pub fn enter_aperture(progress: f32) -> f32 {
+    progress.clamp(0.0, 1.0)
+}
+
+/// Demote exit: aperture 1→0 from phase progress.
+pub fn exit_aperture(progress: f32) -> f32 {
+    1.0 - progress.clamp(0.0, 1.0)
+}
+
+/// Chrome scale during enter immersive (0.94 → 1.0).
+pub fn enter_chrome_scale(progress: f32) -> f32 {
+    0.94 + 0.06 * progress.clamp(0.0, 1.0)
+}
+
+/// Chrome scale during exit immersive (1.0 → 0.96).
+pub fn exit_chrome_scale(progress: f32) -> f32 {
+    1.0 - 0.04 * progress.clamp(0.0, 1.0)
+}
+
+/// Staggered chrome opacity: header leads, footer lags slightly.
+pub fn chrome_stagger(progress: f32, lag: f32) -> f32 {
+    ((progress - lag) / (1.0 - lag).max(0.001)).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -156,5 +288,69 @@ mod tests {
         assert_eq!(dock_expand_target(true), None);
         assert_eq!(dock_collapse_target(true), Some(false));
         assert_eq!(dock_collapse_target(false), None);
+    }
+
+    #[test]
+    fn dock_overlay_scale_dim_width() {
+        assert!((dock_stage_scale(0.0) - 1.0).abs() < 0.001);
+        assert!((dock_stage_scale(1.0) - 0.88).abs() < 0.001);
+        assert!((dock_stage_dim(0.0) - 0.0).abs() < 0.001);
+        assert!((dock_stage_dim(1.0) - 0.45).abs() < 0.001);
+        assert!((dock_panel_width(0.0, 72.0, 340.0) - 72.0).abs() < 0.001);
+        assert!((dock_panel_width(1.0, 72.0, 340.0) - 340.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn settle_reveal_eases_out() {
+        assert!((settle_reveal(0, 200) - 0.0).abs() < 0.001);
+        assert!(settle_reveal(100, 200) > 0.5);
+        assert!((settle_reveal(200, 200) - 1.0).abs() < 0.001);
+        assert!((settle_reveal(999, 200) - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn aperture_and_chrome_choreography() {
+        assert!((enter_aperture(0.0) - 0.0).abs() < 0.001);
+        assert!((enter_aperture(1.0) - 1.0).abs() < 0.001);
+        assert!((exit_aperture(0.0) - 1.0).abs() < 0.001);
+        assert!((exit_aperture(1.0) - 0.0).abs() < 0.001);
+        assert!((enter_chrome_scale(0.0) - 0.94).abs() < 0.001);
+        assert!((enter_chrome_scale(1.0) - 1.0).abs() < 0.001);
+        assert!(chrome_stagger(0.2, 0.15) < chrome_stagger(0.8, 0.15));
+        assert!((art_fade_progress(0) - 0.0).abs() < 0.001);
+        assert!((art_fade_progress(ART_FADE_MS) - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn backdrop_land_zoom_helpers() {
+        assert!((backdrop_land_scale(0.0) - BACKDROP_LAND_SCALE0).abs() < 0.001);
+        assert!((backdrop_land_scale(1.0) - BACKDROP_LAND_SCALE1).abs() < 0.001);
+        assert!(BACKDROP_LAND_SCALE0 >= 1.0);
+        let (x0, y0) = backdrop_land_offset(0.0);
+        assert!((x0 - BACKDROP_LAND_OX0).abs() < 0.001);
+        assert!((y0 - BACKDROP_LAND_OY0).abs() < 0.001);
+        let (x1, y1) = backdrop_land_offset(1.0);
+        assert!(x1.abs() < 0.001 && y1.abs() < 0.001);
+        assert!((backdrop_land_progress(0) - 0.0).abs() < 0.001);
+        assert!((backdrop_land_progress(BACKDROP_LAND_MS) - 1.0).abs() < 0.001);
+        assert!(backdrop_land_progress(BACKDROP_LAND_MS / 2) > 0.5);
+    }
+
+    #[test]
+    fn phase_durations() {
+        assert_eq!(TransitionPhase::ExitCompact.duration_ms(), EXIT_COMPACT_MS);
+        assert_eq!(
+            TransitionPhase::EnterImmersive.duration_ms(),
+            ENTER_IMMERSIVE_MS
+        );
+        assert_eq!(
+            TransitionPhase::ExitImmersive.duration_ms(),
+            EXIT_IMMERSIVE_MS
+        );
+        assert_eq!(
+            TransitionPhase::EnterCompact.duration_ms(),
+            ENTER_COMPACT_MS
+        );
+        assert_eq!(EXIT_COMPACT_MS + ENTER_IMMERSIVE_MS, 1550);
     }
 }

@@ -14,20 +14,49 @@ pub const NEIGHBORS: isize = 3;
 pub const VISIBLE: usize = (NEIGHBORS * 2 + 1) as usize;
 pub const STRIP_ANIM_MS: u64 = 200;
 
-const CENTER_W: f32 = 240.0;
-const CENTER_H: f32 = 360.0;
-const STRIDE: f32 = 118.0;
+/// Capsule art size inside each strip slot (neighbor / base size).
+pub const CENTER_W: f32 = 220.0;
+pub const CENTER_H: f32 = 330.0;
+/// Selected hero scale relative to [`CENTER_W`] / [`CENTER_H`].
+pub const SELECTED_SCALE: f32 = 1.33;
+/// Neighbor title + subtitle column width.
+pub const TITLE_COL: f32 = 480.0;
+/// Full slot (capsule + title column) used for layout / scale.
+pub const SLOT_W: f32 = CENTER_W + TITLE_COL;
+pub const SLOT_H: f32 = CENTER_H;
+/// Vertical pitch: clears enlarged selected (~439h) plus ~20px gap.
+pub const STRIDE: f32 = 410.0;
 
 /// Scale for a signed distance (in index units) from the visual center.
+/// Selected is ~33% larger; neighbors return to 1.0 by |d| = 1.
 pub fn scale_at_distance(distance: f32) -> f32 {
     let d = distance.abs();
-    (1.0 - d * 0.18).clamp(0.42, 1.0)
+    if d >= 1.0 {
+        1.0
+    } else {
+        SELECTED_SCALE + (1.0 - SELECTED_SCALE) * d
+    }
 }
 
-/// Opacity for a signed distance from the visual center.
+/// Opacity for a signed distance from the visual center (next=0.8, next+1=0.6, …).
 pub fn opacity_at_distance(distance: f32) -> f32 {
     let d = distance.abs();
-    (1.0 - d * 0.16).clamp(0.28, 1.0)
+    (1.0 - 0.2 * d).clamp(0.35, 1.0)
+}
+
+/// Shortest signed step on a circular list of length `len` from `from` → `to`.
+///
+/// Used so last→first animates as `+1` (and first→last as `-1`) instead of
+/// lerping across the whole catalog.
+pub fn shortest_circular_delta(from: f32, to: f32, len: f32) -> f32 {
+    if len <= 1.0 {
+        return 0.0;
+    }
+    let mut d = (to - from).rem_euclid(len);
+    if d > len * 0.5 {
+        d -= len;
+    }
+    d
 }
 
 /// Eased fractional scroll between `from` and `to` indices.
@@ -119,7 +148,7 @@ where
     ) -> layout::Node {
         let limits = limits.width(self.width).height(self.height);
         let size = limits.resolve(self.width, self.height, Size::ZERO);
-        let center = Size::new(CENTER_W, CENTER_H);
+        let slot = Size::new(SLOT_W, SLOT_H);
 
         let mut children = Vec::with_capacity(self.items.len());
         for (i, (item, child_tree)) in self
@@ -130,12 +159,13 @@ where
         {
             let dist = slot_distance(i, self.anchor, self.visual_scroll);
             let scale = scale_at_distance(dist);
-            let child_size = Size::new(center.width * scale, center.height * scale);
+            let child_size = Size::new(slot.width * scale, slot.height * scale);
             let child_limits = layout::Limits::new(Size::ZERO, child_size);
             let mut node = item
                 .as_widget_mut()
                 .layout(child_tree, renderer, &child_limits);
-            let x = (size.width - child_size.width) * 0.5;
+            // Left-align so scale changes do not slide heroes on the X axis.
+            let x = 0.0;
             let y = size.height * 0.5 + dist * STRIDE - child_size.height * 0.5;
             node = node.move_to(iced::Point::new(x, y));
             children.push(node);
@@ -301,10 +331,33 @@ mod tests {
 
     #[test]
     fn scale_falls_off_with_distance() {
-        assert!((scale_at_distance(0.0) - 1.0).abs() < 0.001);
-        assert!(scale_at_distance(1.0) < scale_at_distance(0.0));
-        assert!(scale_at_distance(3.0) <= scale_at_distance(1.0));
-        assert!(scale_at_distance(10.0) >= 0.42);
+        assert!((scale_at_distance(0.0) - SELECTED_SCALE).abs() < 0.001);
+        assert!((scale_at_distance(1.0) - 1.0).abs() < 0.001);
+        assert!((scale_at_distance(2.0) - 1.0).abs() < 0.001);
+        assert!(scale_at_distance(0.5) > 1.0 && scale_at_distance(0.5) < SELECTED_SCALE);
+    }
+
+    #[test]
+    fn opacity_steps_down_by_fifth() {
+        assert!((opacity_at_distance(0.0) - 1.0).abs() < 0.001);
+        assert!((opacity_at_distance(1.0) - 0.8).abs() < 0.001);
+        assert!((opacity_at_distance(2.0) - 0.6).abs() < 0.001);
+    }
+
+    #[test]
+    fn stride_clears_selected_with_gap() {
+        let selected_h = CENTER_H * SELECTED_SCALE;
+        let neighbor_h = CENTER_H;
+        let clearance = selected_h * 0.5 + neighbor_h * 0.5;
+        assert!(STRIDE > clearance + 16.0);
+    }
+
+    #[test]
+    fn shortest_circular_wraps_forward_and_back() {
+        assert!((shortest_circular_delta(4.0, 0.0, 5.0) - 1.0).abs() < 0.001);
+        assert!((shortest_circular_delta(0.0, 4.0, 5.0) - (-1.0)).abs() < 0.001);
+        assert!((shortest_circular_delta(2.0, 3.0, 5.0) - 1.0).abs() < 0.001);
+        assert!((shortest_circular_delta(3.0, 1.0, 5.0) - (-2.0)).abs() < 0.001);
     }
 
     #[test]
