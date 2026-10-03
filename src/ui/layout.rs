@@ -156,6 +156,29 @@ pub fn raise_window_topmost<Message: Send + 'static>(id: window::Id) -> Task<Mes
     }
 }
 
+/// Win32 HWND for an iced window (`None` when unavailable / non-Win32).
+pub fn window_hwnd(id: window::Id) -> Task<Option<isize>> {
+    #[cfg(windows)]
+    {
+        window::run(id, |window| {
+            use window::raw_window_handle::RawWindowHandle;
+
+            let Ok(handle) = window.window_handle() else {
+                return None;
+            };
+            let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
+                return None;
+            };
+            Some(win32_handle.hwnd.get())
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = id;
+        Task::done(None)
+    }
+}
+
 /// Ask Win32 to invalidate the toast HWND so a new view can present.
 pub fn invalidate_toast<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     #[cfg(windows)]
@@ -323,6 +346,17 @@ pub fn slide_y(placement: ToastPlacement, progress: f32, dismissing: bool) -> f3
     let eased = ease_out_cubic(progress.clamp(0.0, 1.0));
     let t = if dismissing { 1.0 - eased } else { eased };
     placement.outside_y + (placement.target_y - placement.outside_y) * t
+}
+
+/// Toast top-left in cover-local coordinates (screen placement minus cover origin).
+pub fn toast_local_in_cover(
+    placement: ToastPlacement,
+    progress: f32,
+    dismissing: bool,
+    cover: MonitorCover,
+) -> Point {
+    let screen_y = slide_y(placement, progress, dismissing);
+    Point::new(placement.x - cover.x, screen_y - cover.y)
 }
 
 pub fn ease_out_cubic(progress: f32) -> f32 {
@@ -577,6 +611,42 @@ mod tests {
         assert!((slide_y(placement, 1.0, true) - 200.0).abs() < f32::EPSILON);
         let mid = slide_y(placement, 0.5, false);
         assert!(mid > 100.0 && mid < 200.0);
+    }
+
+    #[test]
+    fn toast_local_in_cover_subtracts_origin() {
+        let placement = ToastPlacement {
+            x: 100.0,
+            target_y: 50.0,
+            outside_y: -100.0,
+        };
+        let cover = MonitorCover {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+        let resting = toast_local_in_cover(placement, 1.0, false, cover);
+        assert!((resting.x - 100.0).abs() < f32::EPSILON);
+        assert!((resting.y - 50.0).abs() < f32::EPSILON);
+
+        let cover_offset = MonitorCover {
+            x: 1920.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+        let placement2 = ToastPlacement {
+            x: 1936.0,
+            target_y: 16.0,
+            outside_y: -84.0,
+        };
+        let local = toast_local_in_cover(placement2, 1.0, false, cover_offset);
+        assert!((local.x - 16.0).abs() < f32::EPSILON);
+        assert!((local.y - 16.0).abs() < f32::EPSILON);
+
+        let placing = toast_local_in_cover(placement, 0.0, false, cover);
+        assert!((placing.y - (-100.0)).abs() < f32::EPSILON);
     }
 
     #[test]
