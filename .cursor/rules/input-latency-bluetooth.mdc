@@ -23,3 +23,5 @@ When changing DualSense input sampling, nav, or HID I/O in this repo:
 ## Diagnostics
 
 8. This does **not** relax [debug-diagnostics.mdc](debug-diagnostics.mdc). Release builds stay quiet; gate investigation-volume traces with debug helpers.
+
+Hot-path battery from the input stream, silence drop, and Start rumble’s separate output handle: [`notes/hid-live-session.md`](notes/hid-live-session.md).

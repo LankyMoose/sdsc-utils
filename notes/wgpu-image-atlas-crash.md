@@ -1,5 +1,7 @@
 # wgpu iced image atlas crash
 
+**Status:** do-not-regress. **When to read:** tray panic + `crash-restart`, atlas / `Texture::create_view`. Index: [README.md](README.md).
+
 Handoff / investigation notes for the iced/wgpu image-atlas panic.
 
 ## Symptom

@@ -1,10 +1,14 @@
 # UI lock-up / HID fight investigation (2026-09-23)
 
+**Status:** playbook. **When to read:** chasing UI/pad freezes, extending debug diagnostics, reading hitch marks. Index: [README.md](README.md).
+
+**Related notes:** [windows-bt-lightbar.md](windows-bt-lightbar.md) · [windows-toast.md](windows-toast.md) · [start-immersive.md](start-immersive.md) · [hid-live-session.md](hid-live-session.md) · [wgpu-image-atlas-crash.md](wgpu-image-atlas-crash.md)
+
 Hand-off notes. **Fix landed (reuse HidApi):** worker keeps one long-lived `HidApi`, refreshes via `refresh_devices()` on a throttle (not every sample), shares that api into Poll/Identify/lightbar/power-off, **does not clear** the input snapshot on Poll, publishes presence paths for the UI tick (no UI-thread `HidApi::new`), runs process enum via `Task::perform`, and Identify is **4 flashes / 1s** (`IDENTIFY_FLASH_COUNT=4`, `IDENTIFY_FLASH_MS=125`).
 
 **Diagnostics are debug-build only** (`cfg(debug_assertions)`): `hid-trace.log`, hitch F7/F8 + report buttons, worker phase watchdog / `enter_op` traces, and investigation-volume `hid-diag:` / `ui-diag:` lines no-op or omit in `--release`. Future agents: see [`.cursor/rules/debug-diagnostics.mdc`](../.cursor/rules/debug-diagnostics.mdc) — new work must include a similar level of non-release diagnostics.
 
-Historical evidence of the ~5s freezes is preserved below (`last_op=hidapi_new`). See [Investigate next](#investigate-next) for BT lightbar write path.
+Historical evidence of the ~5s freezes is preserved below (`last_op=hidapi_new`). BT lightbar silent no-ops (closed): [windows-bt-lightbar.md](windows-bt-lightbar.md).
 
 ## Symptoms (pre-fix)
 
@@ -47,9 +51,7 @@ Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**
 - `hid-diag: slow op=hid_trace_io` — sync append to the trace file took ≥50ms
 - `hid-diag: worker stall ...` — watchdog (also in `app.log`)
 - `HITCH_MARK`
-- `write … ok bytes=547 expected=78` — historical BT interrupt padding quirk (pre-control-path)
-- `transport=control` — Windows BT lightbar via hidapi `send_output_report` (side CreateFileW path was a silent no-op)
-- `transport=control|interrupt` — lightbar write path (Windows BT should be `control`)
+- Lightbar transport / `bytes=547 expected=78` — see [windows-bt-lightbar.md](windows-bt-lightbar.md)
 
 ### `app.log`
 
@@ -91,79 +93,9 @@ Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**
 - Grep `hidapi_refresh` — should not fire every sample.
 - Confirm Identify / lightbar / power-off / running badge / connect-disconnect.
 
-## Investigate next
-
-**BT lightbar silent no-op on Windows — interrupt path (1.4.1)**
-
-- Captured with F7: session `1790507921026` (below). Interrupt `write` returned `ok bytes=547 expected=78` while the bar stayed unchanged.
-- Root cause: Windows DualSense BT advertises `OutputReportByteLength=547`; interrupt `WriteFile` pads and “succeeds” without updating RGB. Poll also wrote on the battery-read handle, which can accept `Ok` without changing the bar.
-
-**BT lightbar still no-op after control `CreateFileW` path (1.4.2) — fixed**
-
-- Session `1790586627711` (debug) / `1790596459165` (release): every write was `transport=control` `ok bytes=78 expected=78` (`rgb=6b16e4` / `7f12e2` on `444648156926`, `steam=1`) and the bar stayed unchanged. No `lightbar write failed` on the live pad.
-- Side-handle `CreateFileW` + `HidD_SetOutputReport` (pad to 547) returned success without updating RGB. Claim (`LIGHT_OUT`) was also forced before every SetRgb while start-nav held an input handle, fading the bar before each color.
-- Session `1790683895217` (after send_output_report on open handle + claim-once): still `claim=true` then RGB `ok` with `steam=1`; Identify flashed in hid-trace (`d2d4dc`/`ac0c9e`) but the bar did not change.
-- Session `1790684159072` (Steam skip landed): all writes `claim=false` `transport=control` `ok`, Identify still traced, bar still unchanged — control Set_Report is a silent no-op on this machine even for RGB-only.
-- Fix: skip `LIGHT_OUT` while `steam.exe` is running; Windows BT RGB uses interrupt `write` again (control only as hard-error fallback); try every DualSense HID collection for the serial; request calibration feature before BT writes. Poll still drops the battery-read handle before lightbar.
-
 ## Out of scope (still)
 
 - hid-trace I/O buffering (only if stalls show `slow op=hid_trace_io`).
-
----
-
-## Captured session — lightbar no-op F7 (2026-09-28)
-
-SDSC Utils **1.4.1** debug. DualSense **BT** serial `444648156926`, 85%, `steam=1`. F7 ~3s after the first claim+rgb pair; bar never took `rgb=431fe8` (correct spectrum color for 85%). Every lightbar transfer is `ok` — no `lightbar write failed` line. Power-off ~15s after the mark succeeded on the control endpoint (`size=48, seed=0x53`).
-
-| | LB-noop (F7) |
-|--|--|
-| `session=` | `1790507921026` |
-| Mark epoch ms | `1790507971682` |
-| `up_ms` | `50655` |
-| Kind | lightbar |
-| Pattern | claim+rgb `ok bytes=547 expected=78`; reassert same RGB; bar unchanged; `age_ms=0` |
-| At mark | fresh Sample snapshot, `fg=sdsc-utils.exe` |
-
-### `app.log` (verbatim; start-nav omitted)
-
-```text
-[1790507921] INFO: SDSC Utils (sdsc-utils) 1.4.1 starting session=1790507921026
-[1790507921] INFO: hitch hotkeys armed: F7=lightbar F8=input
-[1790507962] INFO: hid-diag: sample short cached=1 published=0
-[1790507962] INFO: hid-diag: cmd begin=Poll since_publish_ms=32
-[1790507962] INFO: hid-worker: cmd=Poll enumerate_ms=0 open_ms=0 io_ms=10 total_ms=19
-[1790507962] INFO: ui-diag: toast show heading="DualSense (Bluetooth)" percent=85 queue_left=0
-[1790507968] INFO: hid-diag: cmd begin=Poll since_publish_ms=0
-[1790507968] INFO: hid-diag: slow op=hidapi_refresh ms=71
-[1790507968] INFO: hid-worker: cmd=Poll enumerate_ms=0 open_ms=0 io_ms=0 total_ms=74
-[1790507971] WARN: HITCH_MARK session=1790507921026 up_ms=50655 kind=lightbar source=hotkey pads=1 reason=Sample age_ms=0 seq=6320 steam=1 fg=sdsc-utils.exe fs=0
-[1790507974] INFO: hid-diag: cmd begin=Poll since_publish_ms=0
-[1790507974] INFO: hid-worker: cmd=Poll enumerate_ms=0 open_ms=0 io_ms=0 total_ms=72
-[1790507980] INFO: hid-diag: cmd begin=Poll since_publish_ms=0
-[1790507980] INFO: hid-worker: cmd=Poll enumerate_ms=0 open_ms=0 io_ms=0 total_ms=73
-[1790507986] INFO: hid-diag: cmd begin=Poll since_publish_ms=0
-[1790507986] INFO: hid-worker: cmd=Poll enumerate_ms=0 open_ms=0 io_ms=0 total_ms=73
-[1790507986] INFO: power-off sent for 444648156926 via \\?\HID#{00001124-0000-1000-8000-00805f9b34fb}_VID&0002054c_PID&0ce6#8&15b6e16c&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030} (size=48, seed=0x53)
-[1790507986] INFO: power-off sent for 444648156926
-[1790507987] INFO: hid-diag: sample timeout keep_handle serial=444648156926 bus=bt
-[1790507989] INFO: ui-diag: toast show heading="DualSense (Bluetooth)" percent=85 queue_left=0
-```
-
-### `hid-trace.log.1` / `hid-trace.log` (verbatim)
-
-```text
-[1790507962452] read caller=sample serial=444648156926 bus=bt ms=6 fail=truncated steam=1 fg=Cursor.exe fs=0
-[1790507962566] open caller=poll serial=444648156926 path=\\?\HID#{00001124-0000-1000-8000-00805f9b34fb}_VID&0002054c_PID&0ce6#8&15b6e16c&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030} iface=-1 usage_page=0x0001 usage=0x0005 bus=bt ms=0 ok steam=1
-[1790507962576] write caller=poll phase=claim serial=444648156926 bus=bt claim=true retry=false ms=0 ok bytes=547 expected=78 steam=1
-[1790507962577] write caller=poll phase=rgb serial=444648156926 bus=bt rgb=431fe8 claim=true retry=false ms=0 ok bytes=547 expected=78 steam=1
-[1790507968675] write caller=poll phase=rgb serial=444648156926 bus=bt rgb=431fe8 claim=false retry=false ms=0 ok bytes=547 expected=78 steam=1
-[1790507971682] HITCH_MARK session=1790507921026 up_ms=50655 kind=lightbar source=hotkey pads=1 reason=Sample age_ms=0 seq=6320 steam=1 fg=sdsc-utils.exe fs=0
-[1790507974677] write caller=poll phase=rgb serial=444648156926 bus=bt rgb=431fe8 claim=false retry=false ms=0 ok bytes=547 expected=78 steam=1
-[1790507980669] write caller=poll phase=rgb serial=444648156926 bus=bt rgb=431fe8 claim=false retry=false ms=0 ok bytes=547 expected=78 steam=1
-[1790507986670] write caller=poll phase=rgb serial=444648156926 bus=bt rgb=431fe8 claim=false retry=false ms=0 ok bytes=547 expected=78 steam=1
-[1790507987303] read caller=sample serial=444648156926 bus=bt ms=0 fail=io err=hidapi error: ReadFile: (0x0000048F) The device is not connected. steam=1 fg=sdsc-utils.exe fs=0
-```
 
 ---
 
@@ -276,78 +208,6 @@ No `last_op=hidapi_new` / `slow op=hidapi_new ms=5xxx` in this window — felt h
 
 ### Side notes
 
-- BT writes still log `ok bytes=547 expected=78`.
+- BT writes still log `ok bytes=547 expected=78` (see [windows-bt-lightbar.md](windows-bt-lightbar.md)).
 - Shorter `slow op=hidapi_new ms=50–166` also appear; user-visible multi-second freezes match the **~5010ms** completions.
 - Pre-watchdog Hitch 1 `Identify total_ms=6791` is consistent with a ~5s `hidapi_new` buried inside Identify flash reopen/enumerate.
-
-## Toast Z-order vs Settings / Start freeze (Windows)
-
-iced multi-window present starvation: [iced#3108](https://github.com/iced-rs/iced/issues/3108) / [#3320](https://github.com/iced-rs/iced/issues/3320).
-
-**Do not demote** the toast to `HWND_NOTOPMOST` when Settings/Start/popup are open — that puts the toast under Cursor.
-
-**Do not** raise toast above Start every `ToastFrame` — that starves Start presents.
-
-**Do:** keep toast `HWND_TOPMOST` (above Cursor); raise Start/Settings into the same topmost band *above* the toast (corner toast stays visible beside centered Start); `gain_focus` the interactive window.
-
-**Immersive cover:** the primary-monitor Start HWND occludes the toast HWND (and unowned `rfd` file dialogs). Do **not** raise the toast above Start (present starvation). While immersive, composite the same toast card into the Start window (`Float` overlay at cover-local slide pose). Parent add/edit shortcut file dialogs to the Start HWND via `rfd::FileDialog::set_parent` so the picker opens above the cover.
-
-Debug grep: `ui-diag: place toast gen=`, `ui-diag: sync toast z-order (toast + raise UI)`, `ui-diag: immersive toast composite gen=`, `ui-diag: file dialog parent hwnd=`.
-
-## Queued toast wrong content (Windows)
-
-Symptom: two connect toasts both showed the first pad’s %, then recreate made only one toast appear.
-
-`app.log` proved the **model is correct** (`toast show … percent=55` then `percent=100`). Stale swapchain on reuse; closing/recreating the HWND dropped the follow-up toast.
-
-Fix: reuse one toast HWND; on handoff skip hide and **remount** (±1px resize + `RedrawWindow`); `PlaceToast` is generation-guarded.
-
-Debug grep: `ui-diag: toast show`, `ui-diag: place toast gen=`, `ui-diag: toast handoff remount`.
-
-## Connect toast slide vs Start open (Windows)
-
-Symptom: on 0→1 connect (toast + Start together), the Connected toast sometimes never appears, freezes mid-slide, or pops into the rest pose.
-
-Cause (historical): slide-in used a 250ms wall clock that stopped issuing `move_to` once elapsed ≥ 250ms, and the clock started in `PlaceToast` before show. Opening Start in the same batch stalled the UI.
-
-Cause (session `1790509148457`): a 500ms Start deadline fired **before** `place toast`, so Start’s window create starved the toast present (iced#3108 / #3320). Log order: `toast show` → `defer start` → `start open after toast deadline` → `place toast gen=1`.
-
-Cause (session `1790510886493`): after the state machine landed, a **2s Placing wall-clock failsafe** treated a stale `ToastFrame` `raw_dt` (time since app boot / last toast) as “placement gave up.” Log: `Idle->Placing` → `Placing->Idle` + `start open` in the same second — toast never reached `SlidingIn`. Reconnect after intentional power-off then showed toast with `after=Nothing` because `START_CONNECT_COOLDOWN` armed on the power-off 1→0.
-
-Fix: pure presentation state machine in [`src/ui/toast/machine.rs`](../src/ui/toast/machine.rs). Phases `Placing → SlidingIn → Resting → SlidingOut`. **Placing is event-only** (`Frame` ignored for phase change; leave only on `Shown` or `Dismiss`) — **no placing wall-clock failsafe** (stays removed). Start opens only as an `OpenStart` effect from slide rest or dismiss finish. `RaiseInteractive` only after Resting. Placement uses `primary_toast_area()` immediately (no `monitor_size` hop). Intentional power-off sets `skip_next_connect_cooldown` so the next reconnect can latch `OpenStart` again (unexpected disconnects still get the 5s ghost-flap cooldown). Do not put the toast on a second thread — iced presents on one UI thread.
-
-**Reopen gesture during latch:** `suppresses_reopen_gesture()` while `after == OpenStart` and phase is Placing/SlidingIn. During Placing, suppress lifts after ~60 Frame ticks (~1s) so a lost `Shown` cannot block the gesture forever; phase stays Placing and no `OpenStart` is emitted from that budget.
-
-### 0→1 Start survive toast (robustness)
-
-Toast and Start are separate gates. To stop Connected-without-Start on turn-on:
-
-- **One-miss hold:** a failed battery/open poll keeps the last status for one tick; the second consecutive miss accepts the drop. Presence-empty (HID list gone) still clears immediately.
-- **Short arrival:** nonempty stretch under 2s does not arm the 5s ghost cooldown (enumerate blip). Stable disconnects still arm it; intentional Power Off still skips.
-- **Pending retry:** `start_auto_open_pending` is set when 0→1 auto-open gates pass; cleared only once Start is visible. Close-in-flight leaves it set; `WindowClosed` retries. Confirmed empty clears pending and `clear_after()` even when Start is not visible.
-
-Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: toast Placing->SlidingIn`, `ui-diag: toast SlidingIn->Resting`, `ui-diag: toast show … body=Connected after=OpenStart`, `ui-diag: place toast gen=`, `ui-diag: start open after toast settle`, `ui-diag: skip connect cooldown (intentional power-off)`, `ui-diag: skip connect cooldown (short arrival)`, `ui-diag: hold pad across missed read serial=`, `ui-diag: retry start open after close`, `ui-diag: reopen gesture suppressed (toast OpenStart pending)`.
-
-## Start-screen rumble (haptics)
-
-Start-menu nav/action cues may pulse DualSense motors via `HidCmd::Rumble`. **Do not** route rumble through `write_rgb_exclusive` (that drops the input-cache handle and reopens). Rumble keeps a **separate long-lived output handle**, opens ranked DualSense collections like lightbar (USB gamepad → USB other → BT gamepad → BT other), and calls `prepare_bt_output_mode` once on BT opens. Poll / PowerOff / Shutdown drop rumble handles. Debug: grep `hid-diag: rumble` / write traces with `caller=rumble`.
-
-## Battery from input stream (hot path)
-
-While Start / pad-input is hot, **do not** run exclusive battery `Poll` (`drop_all` + `read_timeout`). Battery is parsed from the same USB `0x01` / BT `0x31` reports the sample loop already drains (`parse_battery_from_report`). Service synthesizes `Controllers` from `HidWorkerHandle::live_controllers()` and applies lightbar via exclusive `SetRgb` only on membership / color-bucket change.
-
-Cold (tray idle): classic timed `Poll` unchanged.
-
-**Silence drop:** a powered-off DualSense often lingers in the Windows HID list while stopping input reports. Short sample timeouts still keep the open handle and the last reading (no reconnect / no extra BT traffic). After ~200ms of consecutive sample timeouts (~50 × 4ms), drop that pad from `live_pads` and stop republishing its stale nav reading. Silence streak lives on the open handle so Identify-only sampling does not age other pads. Service hot path reads `live_controllers()` every loop (~16ms), not only on the 500ms presence tick. “Wait for first sample” (`live` empty + presence nonempty) applies only when `session.controllers` is already empty — otherwise a silence drop must clear the session. Shell Start Controllers (compact list **and** immersive dock) refresh from `ServiceMessage::Controllers`; send the **reconciled** `session.controllers` (after the one-miss hold) on hot-path changes and on presence-empty clear so the UI and disconnect toast move together.
-
-Debug grep: `service: hot path waiting for live battery sample`, `service: hot lightbar connect`, `service: hot lightbar color`, `hid-diag: sample short`, `hid-diag: live silence serial=`.
-
-## Start immersive mode
-
-Compact Start (640×500) can promote to a borderless primary-monitor cover. Pref `start_screen_always_immersive` opens immersive only and makes Circle/Escape close (no demote). When off, the reopen chord toggles compact ↔ immersive; Circle/Escape demotes (`Back`). Successful launch while immersive closes Start so a topmost cover cannot sit above the game.
-
-Promote/demote ceremony: ExitCompact blackout → HWND resize under veil → EnterImmersive immersive chrome under one full-bleed veil (ease-in lift); demote ExitImmersive full-bleed veil → resize → EnterCompact (+ scroll selection into view). Never paint immersive chrome at the wrong HWND size. Immersive art is off-thread; backdrops crossfade (~0.45s) then ken-burns settle (~10s). Controllers dock is a right-side floating capsule island (same glass as footer hints), vertically inset so it clears the footer; unified fixed-height rows wipe via `WidthReveal` (full dock width layout + scissor peek→expand). Immersive dock peek↔expand uses Left/Right (dpad, stick, arrow keys); compact carousel still uses L2/R2. Dock face hints omit Float scale so row height stays locked. Strip Up/Down gated while `strip_anim` is active. Game/controller lists are pad-only (no mouse press/hover); edit actions stay clickable. Disconnect membership uses the same hot-path silence drop + `ServiceMessage::Controllers` as compact (dock rows + composite toast).
-
-**Same-press open→promote:** open and promote share the reopen chord. After `OpenStart`, a [`ChordReleaseGate`](../src/domain/gesture.rs) keeps the sticky hold latched until the chord is continuously absent for 64ms (longer than one HID wake / bounce). A one-sample gap does not clear the latch or disarm detectors. Shell `consume_reopen_gesture_chord` must not `reset` on Missing snapshot (client mode has no local HID snapshot). Duplicate `OpenStart` while Start is already visible re-arms the latch.
-
-Debug grep: `ui-diag: start immersive enter`, `ui-diag: start immersive leave`, `ui-diag: start immersive settle promote|demote`, `ui-diag: start immersive transition phase=`, `ui-diag: immersive art prepare`, `ui-diag: immersive art warm begin|done`, `ui-diag: reopen gesture promote immersive`, `ui-diag: reopen chord glitch ignored`, `ui-diag: start cold open immersive=`, `ui-diag: start dock expand|collapse`, `ui-diag: shader ambient pipeline ready`, `ui-diag: icon handle path=`.

@@ -1,0 +1,13 @@
+# Start immersive mode
+
+**Status:** do-not-regress. **When to read:** immersive cover, reopen chord, controllers dock. Index: [README.md](README.md).
+
+Compact Start (640×500) can promote to a borderless primary-monitor cover. Pref `start_screen_always_immersive` opens immersive only and makes Circle/Escape close (no demote). When off, the reopen chord toggles compact ↔ immersive; Circle/Escape demotes (`Back`). Successful launch while immersive closes Start so a topmost cover cannot sit above the game.
+
+Promote/demote ceremony: ExitCompact blackout → HWND resize under veil → EnterImmersive immersive chrome under one full-bleed veil (ease-in lift); demote ExitImmersive full-bleed veil → resize → EnterCompact (+ scroll selection into view). Never paint immersive chrome at the wrong HWND size. Immersive art is off-thread; backdrops crossfade (~0.45s) then ken-burns settle (~10s). Controllers dock is a right-side floating capsule island (same glass as footer hints), vertically inset so it clears the footer; unified fixed-height rows wipe via `WidthReveal` (full dock width layout + scissor peek→expand). Immersive dock peek↔expand uses Left/Right (dpad, stick, arrow keys); compact carousel still uses L2/R2. Dock face hints omit Float scale so row height stays locked. Strip Up/Down gated while `strip_anim` is active. Game/controller lists are pad-only (no mouse press/hover); edit actions stay clickable. Disconnect membership uses the same hot-path silence drop + `ServiceMessage::Controllers` as compact (dock rows + composite toast).
+
+**Same-press open→promote:** open and promote share the reopen chord. After `OpenStart`, a [`ChordReleaseGate`](../src/domain/gesture.rs) keeps the sticky hold latched until the chord is continuously absent for 64ms (longer than one HID wake / bounce). A one-sample gap does not clear the latch or disarm detectors. Shell `consume_reopen_gesture_chord` must not `reset` on Missing snapshot (client mode has no local HID snapshot). Duplicate `OpenStart` while Start is already visible re-arms the latch.
+
+Debug grep: `ui-diag: start immersive enter`, `ui-diag: start immersive leave`, `ui-diag: start immersive settle promote|demote`, `ui-diag: start immersive transition phase=`, `ui-diag: immersive art prepare`, `ui-diag: immersive art warm begin|done`, `ui-diag: reopen gesture promote immersive`, `ui-diag: reopen chord glitch ignored`, `ui-diag: start cold open immersive=`, `ui-diag: start dock expand|collapse`, `ui-diag: shader ambient pipeline ready`, `ui-diag: icon handle path=`.
+
+Related: immersive toast composite and file-dialog parenting → [windows-toast.md](windows-toast.md). Hot-path disconnect / silence drop → [hid-live-session.md](hid-live-session.md).

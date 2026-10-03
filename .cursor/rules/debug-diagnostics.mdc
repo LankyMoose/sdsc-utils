@@ -15,6 +15,6 @@ All further improvements, bugfixes, and features in this repo must include a **s
 
 3. If the UI can freeze, provide a **debug-only** way to stamp a mark that does not rely solely on the iced UI thread (pattern: F7/F8 + `HITCH_MARK` via `app_log::mark_hitch`).
 
-4. Worked example and grep tokens: [`notes/ui-lockup-investigation.md`](notes/ui-lockup-investigation.md). Extend that note (or add a sibling under `notes/`) when landing new investigation tooling.
+4. Hitch-hunting worked example and shared grep tokens: [`notes/ui-lockup-investigation.md`](notes/ui-lockup-investigation.md). Catalog of topic notes: [`notes/README.md`](notes/README.md). Add or extend the matching sibling under `notes/` when landing new investigation tooling; do not append unrelated sections to the lockup note.
 
 5. Keep normal `app.log` warn/error for real user-facing failures in all builds; gate only investigation-volume / hitch-hunting output.
