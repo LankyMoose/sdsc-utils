@@ -41,10 +41,14 @@ pub enum TransitionPhase {
     EnterCompact,
 }
 
-pub const EXIT_COMPACT_MS: u64 = 450;
-pub const ENTER_IMMERSIVE_MS: u64 = 1100;
-pub const EXIT_IMMERSIVE_MS: u64 = 700;
-pub const ENTER_COMPACT_MS: u64 = 400;
+/// Shared duration for darken-compact / reveal-immersive / darken-immersive / reveal-compact.
+pub const VEIL_TRANSITION_MS: u64 = 300;
+pub const EXIT_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
+pub const ENTER_IMMERSIVE_MS: u64 = VEIL_TRANSITION_MS;
+/// Legacy grow-segment fraction (unused by the single top-veil enter path).
+pub const ENTER_GROW_END: f32 = 0.28;
+pub const EXIT_IMMERSIVE_MS: u64 = VEIL_TRANSITION_MS;
+pub const ENTER_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
 /// Opacity crossfade between game backdrops.
 pub const ART_FADE_MS: u64 = 450;
 /// Slow ken-burns settle (scale + center) after landing on a game.
@@ -168,6 +172,20 @@ pub fn phase_progress(elapsed_ms: u64, duration_ms: u64) -> f32 {
     1.0 - (1.0 - t).powi(3)
 }
 
+/// Linear 0..=1 elapsed fraction (no easing).
+pub fn phase_progress_linear(elapsed_ms: u64, duration_ms: u64) -> f32 {
+    if duration_ms == 0 {
+        return 1.0;
+    }
+    (elapsed_ms as f32 / duration_ms as f32).clamp(0.0, 1.0)
+}
+
+/// Ease-in cubic — slow start, used for enter immersive chrome reveal.
+pub fn ease_in_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * t
+}
+
 /// Content/veil reveal after HWND settle (0 = veiled, 1 = clear).
 pub fn settle_reveal(elapsed_ms: u64, duration_ms: u64) -> f32 {
     phase_progress(elapsed_ms, duration_ms)
@@ -194,6 +212,43 @@ pub fn backdrop_land_offset(progress: f32) -> (f32, f32) {
     let t = progress.clamp(0.0, 1.0);
     let inv = 1.0 - t;
     (BACKDROP_LAND_OX0 * inv, BACKDROP_LAND_OY0 * inv)
+}
+
+/// Early EnterImmersive grow segment progress, or `None` once iris/chrome begin.
+pub fn enter_grow_progress(phase_progress: f32) -> Option<f32> {
+    let t = phase_progress.clamp(0.0, 1.0);
+    if t < ENTER_GROW_END {
+        Some((t / ENTER_GROW_END).clamp(0.0, 1.0))
+    } else {
+        None
+    }
+}
+
+/// Remap EnterImmersive progress so iris/chrome run over the post-grow remainder.
+pub fn enter_immersive_chrome_progress(phase_progress: f32) -> f32 {
+    let t = phase_progress.clamp(0.0, 1.0);
+    if t <= ENTER_GROW_END {
+        0.0
+    } else {
+        ((t - ENTER_GROW_END) / (1.0 - ENTER_GROW_END).max(0.001)).clamp(0.0, 1.0)
+    }
+}
+
+/// Island → fill scale during the compact-grow segment.
+pub fn enter_grow_scale(grow: f32, island: f32) -> f32 {
+    let g = grow.clamp(0.0, 1.0);
+    let island = island.clamp(0.12, 0.95);
+    island + (1.0 - island) * g
+}
+
+/// Veil during grow: starts solid, lifts mid-segment, returns near-black before iris.
+pub fn enter_grow_veil(grow: f32) -> f32 {
+    let g = grow.clamp(0.0, 1.0);
+    if g < 0.5 {
+        1.0 - 0.4 * (g * 2.0)
+    } else {
+        0.6 + 0.38 * ((g - 0.5) * 2.0)
+    }
 }
 
 /// Promote enter: aperture 0→1 from phase progress.
@@ -319,6 +374,15 @@ mod tests {
         assert!(chrome_stagger(0.2, 0.15) < chrome_stagger(0.8, 0.15));
         assert!((art_fade_progress(0) - 0.0).abs() < 0.001);
         assert!((art_fade_progress(ART_FADE_MS) - 1.0).abs() < 0.001);
+        assert!(enter_grow_progress(0.0).is_some());
+        assert!(enter_grow_progress(ENTER_GROW_END).is_none());
+        assert!((enter_immersive_chrome_progress(ENTER_GROW_END) - 0.0).abs() < 0.001);
+        assert!((enter_immersive_chrome_progress(1.0) - 1.0).abs() < 0.001);
+        assert!((enter_grow_scale(0.0, 0.4) - 0.4).abs() < 0.001);
+        assert!((enter_grow_scale(1.0, 0.4) - 1.0).abs() < 0.001);
+        assert!((enter_grow_veil(0.0) - 1.0).abs() < 0.001);
+        assert!(enter_grow_veil(0.5) < enter_grow_veil(0.0));
+        assert!(enter_grow_veil(1.0) > enter_grow_veil(0.5));
     }
 
     #[test]
@@ -353,6 +417,14 @@ mod tests {
             TransitionPhase::EnterCompact.duration_ms(),
             ENTER_COMPACT_MS
         );
-        assert_eq!(EXIT_COMPACT_MS + ENTER_IMMERSIVE_MS, 1550);
+        assert_eq!(ENTER_IMMERSIVE_MS, VEIL_TRANSITION_MS);
+        assert_eq!(EXIT_IMMERSIVE_MS, VEIL_TRANSITION_MS);
+        assert_eq!(ENTER_COMPACT_MS, VEIL_TRANSITION_MS);
+        assert!((ease_in_cubic(0.0) - 0.0).abs() < 0.001);
+        assert!((ease_in_cubic(1.0) - 1.0).abs() < 0.001);
+        assert!(ease_in_cubic(0.5) < 0.5);
+        assert!((phase_progress_linear(0, 1000) - 0.0).abs() < 0.001);
+        assert!((phase_progress_linear(500, 1000) - 0.5).abs() < 0.001);
+        assert!((phase_progress_linear(1000, 1000) - 1.0).abs() < 0.001);
     }
 }

@@ -3,10 +3,7 @@
 use crate::ui::color::BatterySpectrum;
 use crate::ui::percent_ring;
 use crate::ui::shader::AmbientProgram;
-use crate::ui::start::mode::{
-    TransitionPhase, chrome_stagger, dock_panel_width, dock_stage_dim, dock_stage_scale,
-    enter_aperture, enter_chrome_scale, exit_aperture, exit_chrome_scale,
-};
+use crate::ui::start::mode::{TransitionPhase, dock_panel_width, dock_stage_dim, dock_stage_scale};
 use crate::ui::start::view::{
     StartControllerRow, StartMessage, StartRow, StartSlide, State, footer_hint,
     immersive_dock_row_hints, immersive_slide_header, manual_add_view, replace_confirm_view,
@@ -14,16 +11,22 @@ use crate::ui::start::view::{
 use crate::ui::start::vstrip::{self, CENTER_H, CENTER_W, NEIGHBORS, SELECTED_SCALE, SLOT_W};
 use crate::ui::theme;
 use iced::font::Weight;
-use iced::widget::{Float, button, column, container, row, shader, space, stack, text};
+use iced::widget::{Float, column, container, row, shader, space, stack, text};
 use iced::{Alignment, Element, Fill, Font, Length, Padding};
 use std::time::Instant;
 
 const EDGE_PAD: f32 = 28.0;
-const DOCK_PEEK_W: f32 = 110.0;
-const DOCK_MAX_W: f32 = 360.0;
-const DOCK_RING_MIN: f32 = 56.0;
-/// Fixed dock row height so rings do not jump when details/hints appear.
-const DOCK_ROW_H: f32 = 88.0;
+/// Peek column fits the active (grown) ring.
+const DOCK_PEEK_W: f32 = 120.0;
+/// Wide enough for larger type + inline Identify/Power-off on one row.
+const DOCK_MAX_W: f32 = 560.0;
+const DOCK_RING_MIN: f32 = 52.0;
+const DOCK_RING_MAX: f32 = 68.0;
+/// Fixed row height fits max ring; all rings lerp with dock expand.
+const DOCK_ROW_H: f32 = 80.0;
+const DOCK_ROW_GAP: f32 = 8.0;
+/// Reserved trailing width for dock action hints (avoids select flicker).
+const DOCK_HINT_COL_W: f32 = 210.0;
 const MODAL_W: f32 = 640.0;
 
 pub fn veil_view(state: &State, now: Instant) -> Element<'_, StartMessage> {
@@ -76,11 +79,8 @@ pub fn view<'a>(
     now: Instant,
 ) -> Element<'a, StartMessage> {
     let dock_p = state.dock_progress(now);
-    let (aperture, chrome_scale, header_a, stage_a, footer_a, veil) =
-        immersive_chrome_params(state, now);
-
-    let program = AmbientProgram::new(state.ambient_time, dock_p, veil, aperture);
-
+    // Chrome stays fully lit; one top veil handles enter/exit (no per-panel dims).
+    let program = AmbientProgram::new(state.ambient_time, dock_p, 0.0, 1.0);
     let atmosphere = shader(program).width(Fill).height(Fill);
 
     let body: Element<'_, StartMessage> = if state.manual_add.is_some() {
@@ -111,15 +111,9 @@ pub fn view<'a>(
         .style(theme::immersive_footer_capsule);
 
     // Header + full-height body (dock reaches window bottom); footer overlays.
-    let main = column![
-        container(header).style(theme::immersive_dim(1.0 - header_a)),
-        container(body)
-            .width(Fill)
-            .height(Fill)
-            .style(theme::immersive_dim(1.0 - stage_a)),
-    ]
-    .width(Fill)
-    .height(Fill);
+    let main = column![header, container(body).width(Fill).height(Fill)]
+        .width(Fill)
+        .height(Fill);
 
     let footer_overlay = column![
         space().height(Fill),
@@ -131,49 +125,38 @@ pub fn view<'a>(
                 right: EDGE_PAD,
                 bottom: 18.0,
                 left: EDGE_PAD,
-            })
-            .style(theme::immersive_dim(1.0 - footer_a)),
+            }),
     ]
     .width(Fill)
     .height(Fill);
 
     let chrome = stack![main, footer_overlay].width(Fill).height(Fill);
+    let base = stack![atmosphere, chrome].width(Fill).height(Fill);
 
-    let chrome: Element<'_, StartMessage> = if (chrome_scale - 1.0).abs() < 0.002 {
-        chrome.into()
+    let veil = transition_top_veil(state, now);
+    if veil > 0.001 {
+        stack![
+            base,
+            container(space())
+                .width(Fill)
+                .height(Fill)
+                .style(theme::immersive_dim(veil)),
+        ]
+        .width(Fill)
+        .height(Fill)
+        .into()
     } else {
-        container(Float::new(chrome).scale(chrome_scale))
-            .width(Fill)
-            .height(Fill)
-            .center_x(Fill)
-            .center_y(Fill)
-            .into()
-    };
-
-    stack![atmosphere, chrome].width(Fill).height(Fill).into()
+        base.into()
+    }
 }
 
-fn immersive_chrome_params(state: &State, now: Instant) -> (f32, f32, f32, f32, f32, f32) {
-    let progress = state.phase_progress(now);
+/// Full-bleed blackout — same ease-out curve as compact ExitCompact / EnterCompact.
+fn transition_top_veil(state: &State, now: Instant) -> f32 {
+    let t = state.phase_progress(now).clamp(0.0, 1.0);
     match state.transition_phase.map(|(p, _)| p) {
-        Some(TransitionPhase::EnterImmersive) => {
-            // Ambient rises first; aperture opens through the middle; chrome staggers late.
-            let aperture = enter_aperture(chrome_stagger(progress, 0.12));
-            let scale = enter_chrome_scale(chrome_stagger(progress, 0.22));
-            let header = chrome_stagger(progress, 0.28);
-            let stage = chrome_stagger(progress, 0.38);
-            let footer = chrome_stagger(progress, 0.48);
-            let veil = (1.0 - progress) * 0.85;
-            (aperture, scale, header, stage, footer, veil)
-        }
-        Some(TransitionPhase::ExitImmersive) => {
-            let aperture = exit_aperture(progress);
-            let scale = exit_chrome_scale(progress);
-            let fade = 1.0 - chrome_stagger(progress, 0.0);
-            let veil = progress * 0.9;
-            (aperture, scale, fade, fade, fade, veil)
-        }
-        _ => (1.0, 1.0, 1.0, 1.0, 1.0, 0.0),
+        Some(TransitionPhase::EnterImmersive) => 1.0 - t,
+        Some(TransitionPhase::ExitImmersive) => t,
+        _ => 0.0,
     }
 }
 
@@ -374,7 +357,7 @@ fn empty_games(state: &State) -> Element<'_, StartMessage> {
 
 fn strip_slot(
     row: &StartRow,
-    index: usize,
+    _index: usize,
     selected: bool,
     editing: bool,
     scale: f32,
@@ -446,17 +429,8 @@ fn strip_slot(
     .height(Fill)
     .align_y(Alignment::Center);
 
-    button(body)
-        .padding(0)
-        .width(Fill)
-        .height(Fill)
-        .on_press(if selected {
-            StartMessage::Launch(index)
-        } else {
-            StartMessage::SelectGame(index)
-        })
-        .style(theme::ghost)
-        .into()
+    // Pad/keyboard navigate the strip — presentational slot (no mouse press/hover).
+    container(body).width(Fill).height(Fill).into()
 }
 
 fn strip_capsule(
@@ -526,51 +500,33 @@ fn strip_capsule(
         .into()
 }
 
-/// Fixed peek rings + clipped fixed-width details (reveal on expand, no text reflow).
+/// Unified rows at full dock width; [`width_reveal`] scissors peek→expanded (no column desync).
 fn controllers_dock_host<'a>(
     state: &'a State,
     spectrum: &BatterySpectrum,
     dock_progress: f32,
 ) -> Element<'a, StartMessage> {
     let visible_w = dock_panel_width(dock_progress, DOCK_PEEK_W, DOCK_MAX_W);
-    let details_full = DOCK_MAX_W - DOCK_PEEK_W;
-    let details_reveal = (visible_w - DOCK_PEEK_W).max(0.0);
+    let details_w = DOCK_MAX_W - DOCK_PEEK_W;
 
-    let mut rings = column![].spacing(12).width(Length::Fixed(DOCK_PEEK_W));
-    let mut details = column![].spacing(12).width(Length::Fixed(details_full));
-
+    let mut list = column![]
+        .spacing(DOCK_ROW_GAP)
+        .width(Length::Fixed(DOCK_MAX_W));
     if state.controllers.is_empty() {
-        rings = rings.push(
-            container(text("—").size(13.0).color(theme::DIM))
-                .width(Length::Fixed(DOCK_PEEK_W))
-                .height(Length::Fixed(DOCK_ROW_H))
-                .center_x(Fill)
-                .center_y(Fill),
-        );
-        details = details.push(
-            container(text("No controllers").size(13.0).color(theme::DIM))
-                .width(Length::Fixed(details_full))
-                .height(Length::Fixed(DOCK_ROW_H))
-                .center_y(Fill)
-                .padding(Padding {
-                    top: 0.0,
-                    right: 16.0,
-                    bottom: 0.0,
-                    left: 4.0,
-                }),
-        );
+        list = list.push(dock_empty_row(details_w));
     } else {
         for (i, row) in state.controllers.iter().enumerate() {
             let selected =
                 i == state.controller_selected && matches!(state.slide, StartSlide::Controllers);
-            rings = rings.push(dock_ring_cell(
-                i,
+            list = list.push(dock_controller_row(
                 row,
                 spectrum,
                 selected,
                 state.ring_flash_white(&row.serial),
+                details_w,
+                dock_progress,
+                state,
             ));
-            details = details.push(dock_details_cell(i, row, selected, state, details_full));
         }
     }
 
@@ -580,29 +536,67 @@ fn controllers_dock_host<'a>(
         bottom: 72.0,
         left: 0.0,
     };
-    let rings_col = container(rings).padding(pad).height(Fill);
-    let details_inner = container(details)
-        .width(Length::Fixed(details_full))
+    let full = container(list)
         .padding(pad)
+        .width(Length::Fixed(DOCK_MAX_W))
         .height(Fill);
-    let details_clip = container(details_inner)
-        .width(Length::Fixed(details_reveal))
-        .height(Fill)
-        .clip(true);
 
-    container(row![rings_col, details_clip].width(Fill).height(Fill))
+    let revealed = crate::ui::start::reveal::width_reveal(full, DOCK_MAX_W, visible_w).height(Fill);
+
+    container(revealed)
         .width(Length::Fixed(visible_w))
         .height(Fill)
         .style(theme::immersive_dock)
         .into()
 }
 
-fn dock_ring_cell<'a>(
-    index: usize,
+fn dock_empty_row<'a>(details_w: f32) -> Element<'a, StartMessage> {
+    container(
+        row![
+            container(text("—").size(13.0).color(theme::DIM))
+                .width(Length::Fixed(DOCK_PEEK_W))
+                .height(Length::Fixed(DOCK_ROW_H))
+                .center_x(Fill)
+                .center_y(Fill),
+            container(text("No controllers").size(13.0).color(theme::DIM))
+                .width(Length::Fixed(details_w))
+                .height(Length::Fixed(DOCK_ROW_H))
+                .center_y(Fill)
+                .padding(Padding {
+                    top: 0.0,
+                    right: 16.0,
+                    bottom: 0.0,
+                    left: 4.0,
+                }),
+        ]
+        .width(Length::Fixed(DOCK_MAX_W))
+        .height(Length::Fixed(DOCK_ROW_H))
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fixed(DOCK_MAX_W))
+    .height(Length::Fixed(DOCK_ROW_H))
+    .clip(true)
+    .into()
+}
+
+fn dock_ring_size(dock_progress: f32) -> f32 {
+    let t = dock_progress.clamp(0.0, 1.0);
+    DOCK_RING_MIN + (DOCK_RING_MAX - DOCK_RING_MIN) * t
+}
+
+/// ETA stays hidden in peek; fades in through the latter part of expand.
+fn dock_eta_reveal(dock_progress: f32) -> f32 {
+    ((dock_progress.clamp(0.0, 1.0) - 0.2) / 0.8).clamp(0.0, 1.0)
+}
+
+fn dock_controller_row<'a>(
     row: &'a StartControllerRow,
     spectrum: &BatterySpectrum,
     selected: bool,
     flash_white: bool,
+    details_w: f32,
+    dock_progress: f32,
+    state: &State,
 ) -> Element<'a, StartMessage> {
     let ring_color = if flash_white {
         theme::from_rgb(crate::controller::dualsense::lightbar::IDENTIFY_FLASH)
@@ -611,29 +605,19 @@ fn dock_ring_cell<'a>(
     } else {
         theme::DIM
     };
-    let ring = percent_ring::percent_ring(row.percent, ring_color, DOCK_RING_MIN, row.eta.clone());
-    button(
-        container(ring)
-            .width(Length::Fixed(DOCK_PEEK_W))
-            .height(Length::Fixed(DOCK_ROW_H))
-            .center_x(Fill)
-            .center_y(Fill),
-    )
-    .padding(0)
-    .width(Length::Fixed(DOCK_PEEK_W))
-    .height(Length::Fixed(DOCK_ROW_H))
-    .on_press(StartMessage::SelectController(index))
-    .style(theme::menu_row(selected))
-    .into()
-}
+    let ring = percent_ring::percent_ring(
+        row.percent,
+        ring_color,
+        dock_ring_size(dock_progress),
+        row.eta.clone(),
+        dock_eta_reveal(dock_progress),
+    );
+    let ring_cell = container(ring)
+        .width(Length::Fixed(DOCK_PEEK_W))
+        .height(Length::Fixed(DOCK_ROW_H))
+        .center_x(Fill)
+        .center_y(Fill);
 
-fn dock_details_cell<'a>(
-    index: usize,
-    row: &'a StartControllerRow,
-    selected: bool,
-    state: &State,
-    details_w: f32,
-) -> Element<'a, StartMessage> {
     let title_color = if row.connected {
         theme::INK
     } else {
@@ -644,8 +628,8 @@ fn dock_details_cell<'a>(
     } else {
         theme::MUTED
     };
-    let mut col = column![
-        text(&row.title).size(16.0).color(title_color).font(Font {
+    let titles = column![
+        text(&row.title).size(18.0).color(title_color).font(Font {
             weight: if selected {
                 Weight::Bold
             } else {
@@ -654,33 +638,65 @@ fn dock_details_cell<'a>(
             ..Font::DEFAULT
         }),
         text(format!("{} · {}", row.connection, row.state))
-            .size(12.0)
+            .size(13.0)
             .color(meta),
     ]
-    .spacing(4)
+    .spacing(3)
     .width(Fill);
 
-    if let Some(hints) = immersive_dock_row_hints(row, state, selected) {
-        col = col.push(hints);
-    }
+    // Inline hints; always reserve trailing width so select does not shift titles.
+    let hints: Element<'_, StartMessage> =
+        if let Some(hints) = immersive_dock_row_hints(row, state, selected) {
+            container(hints)
+                .width(Length::Fixed(DOCK_HINT_COL_W))
+                .height(Length::Fixed(DOCK_ROW_H))
+                .center_y(Fill)
+                .align_x(Alignment::End)
+                .clip(true)
+                .into()
+        } else {
+            space()
+                .width(Length::Fixed(DOCK_HINT_COL_W))
+                .height(Length::Fixed(DOCK_ROW_H))
+                .into()
+        };
 
-    button(
-        container(col)
-            .width(Length::Fixed(details_w))
-            .height(Length::Fixed(DOCK_ROW_H))
-            .center_y(Fill)
-            .clip(true)
-            .padding(Padding {
-                top: 0.0,
-                right: 16.0,
-                bottom: 0.0,
-                left: 4.0,
-            }),
+    let pad_l = 4.0;
+    let pad_r = 16.0;
+    let gap = 8.0;
+    let inner_w = (details_w - pad_l - pad_r).max(DOCK_HINT_COL_W + 80.0);
+    let titles_w = (inner_w - DOCK_HINT_COL_W - gap).max(80.0);
+    let details_cell = container(
+        row![
+            container(titles)
+                .width(Length::Fixed(titles_w))
+                .height(Length::Fixed(DOCK_ROW_H))
+                .center_y(Fill),
+            hints,
+        ]
+        .spacing(gap)
+        .width(Length::Fixed(inner_w))
+        .height(Length::Fixed(DOCK_ROW_H))
+        .align_y(Alignment::Center),
     )
-    .padding(0)
     .width(Length::Fixed(details_w))
     .height(Length::Fixed(DOCK_ROW_H))
-    .on_press(StartMessage::SelectController(index))
-    .style(theme::menu_row(selected))
+    .padding(Padding {
+        top: 0.0,
+        right: pad_r,
+        bottom: 0.0,
+        left: pad_l,
+    });
+
+    container(
+        row![ring_cell, details_cell]
+            .width(Length::Fixed(DOCK_MAX_W))
+            .height(Length::Fixed(DOCK_ROW_H))
+            .align_y(Alignment::Center),
+    )
+    .width(Length::Fixed(DOCK_MAX_W))
+    .height(Length::Fixed(DOCK_ROW_H))
+    .clip(true)
+    .style(theme::menu_row_surface(selected))
     .into()
 }

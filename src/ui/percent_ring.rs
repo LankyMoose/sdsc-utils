@@ -33,15 +33,21 @@ const ETA_BLOCK_NUDGE_Y: f32 = 0.04;
 /// When `eta` is set (e.g. `~3h 30m`), it sits under the percent inside the ring.
 ///
 /// Labels use iced `text` widgets (not canvas `fill_text`) so glyph color stays uniform.
+/// `eta_reveal` (0..=1) fades/clips the estimate and eases percent type size (0 = peek / hidden).
 pub fn percent_ring<'a, Message: 'a>(
     percent: u8,
     color: Color,
     size: f32,
     eta: Option<String>,
+    eta_reveal: f32,
 ) -> Element<'a, Message> {
     let percent = percent.min(100);
-    let has_eta = eta.is_some();
-    let percent_size = text_size(size, percent, has_eta);
+    let reveal = if eta.is_some() {
+        eta_reveal.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let percent_size = text_size(size, percent, reveal);
 
     let ring = canvas_widget(PercentRing {
         percent,
@@ -58,15 +64,22 @@ pub fn percent_ring<'a, Message: 'a>(
         .line_height(Pixels(percent_size))
         .color(theme::INK);
 
-    let labels: Element<'a, Message> = if let Some(eta) = eta {
-        let eta_size = eta_text_size(size, &eta);
-        let gap = eta_size * ETA_GAP_FRAC;
+    let labels: Element<'a, Message> = if let Some(eta) = eta.as_ref().filter(|_| reveal > 0.001) {
+        let eta_size = eta_text_size(size, eta);
+        let gap = eta_size * ETA_GAP_FRAC * reveal;
+        let eta_line_h = eta_size * reveal;
         column![
             percent_label,
-            text(eta)
-                .size(eta_size)
-                .line_height(Pixels(eta_size))
-                .color(theme::MUTED),
+            container(
+                text(eta.clone())
+                    .size(eta_size)
+                    .line_height(Pixels(eta_size))
+                    .color(theme::alpha(theme::MUTED, reveal)),
+            )
+            .width(Fill)
+            .height(Length::Fixed(eta_line_h))
+            .center_x(Fill)
+            .clip(true),
         ]
         .spacing(gap)
         .align_x(Alignment::Center)
@@ -75,11 +88,7 @@ pub fn percent_ring<'a, Message: 'a>(
         percent_label.into()
     };
 
-    let nudge = if has_eta {
-        size * ETA_BLOCK_NUDGE_Y
-    } else {
-        0.0
-    };
+    let nudge = size * ETA_BLOCK_NUDGE_Y * reveal;
     let labels = container(labels)
         .width(Length::Fixed(size))
         .height(Length::Fixed(size))
@@ -93,13 +102,14 @@ pub fn percent_ring<'a, Message: 'a>(
         .into()
 }
 
-fn text_size(ring_size: f32, percent: u8, has_eta: bool) -> f32 {
+fn text_size(ring_size: f32, percent: u8, eta_reveal: f32) -> f32 {
     let base = if percent >= 100 {
         REF_TEXT_FULL
     } else {
         REF_TEXT
     };
-    let scale = if has_eta { ETA_PERCENT_SCALE } else { 1.0 };
+    let t = eta_reveal.clamp(0.0, 1.0);
+    let scale = 1.0 + (ETA_PERCENT_SCALE - 1.0) * t;
     base * (ring_size / REF_SIZE) * scale
 }
 

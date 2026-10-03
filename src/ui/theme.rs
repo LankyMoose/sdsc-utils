@@ -498,21 +498,37 @@ pub fn chip(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style 
     }
 }
 
-/// Full-width start-menu row (in-game OSD feel).
+/// Full-width start-menu row (pad/keyboard select — no mouse hover wash).
 pub fn menu_row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |_theme, status| {
+    move |_theme, _status| {
         // Desaturate toward DIM, then a lighter wash so the row stays dark.
         let select = mix(ACCENT, DIM, 0.55);
-        let (fill, ink) = match (selected, status) {
-            (true, button::Status::Disabled) => (Some(alpha(select, 0.12)), DIM),
-            (true, _) => (Some(alpha(select, 0.16)), INK),
-            (false, button::Status::Hovered) | (false, button::Status::Pressed) => {
-                (Some(alpha(PANEL_HOVER, 0.85)), INK)
-            }
-            (false, button::Status::Disabled) => (None, DIM),
-            (false, button::Status::Active) => (None, INK),
+        let (fill, ink) = if selected {
+            (Some(alpha(select, 0.16)), INK)
+        } else {
+            (None, INK)
         };
         button_base(fill, ink, RADIUS_SM)
+    }
+}
+
+/// Presentational list-row surface (same wash as [`menu_row`], for non-button hosts).
+pub fn menu_row_surface(selected: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| {
+        let select = mix(ACCENT, DIM, 0.55);
+        container::Style {
+            background: if selected {
+                Some(Background::Color(alpha(select, 0.16)))
+            } else {
+                None
+            },
+            text_color: Some(INK),
+            border: Border {
+                radius: RADIUS_SM.into(),
+                ..Default::default()
+            },
+            ..container::Style::default()
+        }
     }
 }
 

@@ -2700,7 +2700,8 @@ impl App {
         if immersive {
             focus.chain(self.warm_immersive_art_task())
         } else {
-            focus
+            // Reveal the selected game after the HWND returns to compact size.
+            focus.chain(self.scroll_start_selection_into_view())
         }
     }
 

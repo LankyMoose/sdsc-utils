@@ -329,7 +329,13 @@ fn controller_row<'a>(
     } else {
         theme::DIM
     };
-    let ring = percent_ring::percent_ring(entry.percent, ring_color, POPUP_SIZE, entry.eta.clone());
+    let ring = percent_ring::percent_ring(
+        entry.percent,
+        ring_color,
+        POPUP_SIZE,
+        entry.eta.clone(),
+        1.0,
+    );
 
     let name: Element<'_, PopupMessage> = if state.is_editing(&entry.serial) {
         text_input("Nickname", &state.draft)

@@ -909,6 +909,15 @@ impl State {
         crate::ui::start::mode::phase_progress(elapsed, phase.duration_ms())
     }
 
+    /// Linear phase fraction — use for EnterImmersive grow/chrome so ease-out cannot crush timing.
+    pub fn phase_progress_linear(&self, now: Instant) -> f32 {
+        let Some((phase, started)) = self.transition_phase else {
+            return 1.0;
+        };
+        let elapsed = now.saturating_duration_since(started).as_millis() as u64;
+        crate::ui::start::mode::phase_progress_linear(elapsed, phase.duration_ms())
+    }
+
     /// True when a timed phase (not Resizing) has reached its duration.
     pub fn phase_finished(&self, now: Instant) -> bool {
         let Some((phase, started)) = self.transition_phase else {
@@ -1431,9 +1440,31 @@ pub fn view<'a>(
             Some(TransitionPhase::EnterImmersive | TransitionPhase::ExitImmersive)
         );
     if show_immersive {
+        // Enter/exit: immersive chrome under a single full-bleed veil (no compact flash).
         return crate::ui::start::immersive::view(state, spectrum, now);
     }
 
+    let compact = compact_chrome(state, spectrum, now);
+
+    // ExitCompact / EnterCompact: blackout + scale (no ambient on compact).
+    match phase {
+        Some(TransitionPhase::ExitCompact) => {
+            let t = state.phase_progress(now);
+            crate::ui::start::immersive::compact_transition_overlay(compact, t, true)
+        }
+        Some(TransitionPhase::EnterCompact) => {
+            let t = state.phase_progress(now);
+            crate::ui::start::immersive::compact_transition_overlay(compact, 1.0 - t, false)
+        }
+        _ => compact,
+    }
+}
+
+fn compact_chrome<'a>(
+    state: &'a State,
+    spectrum: &BatterySpectrum,
+    now: Instant,
+) -> Element<'a, StartMessage> {
     let header = slide_header(state.slide_progress(now));
 
     let body = if state.manual_add.is_some() {
@@ -1450,7 +1481,7 @@ pub fn view<'a>(
     #[cfg(not(debug_assertions))]
     let diag: Element<'_, StartMessage> = space().height(Length::Fixed(0.0)).into();
 
-    let compact = theme::framed(
+    theme::framed(
         column![
             column![
                 header,
@@ -1472,23 +1503,11 @@ pub fn view<'a>(
         .padding([PAD_Y, PADDING])
         .width(Fill)
         .height(Fill),
-    );
-
-    // ExitCompact / EnterCompact: blackout + scale (no ambient on compact).
-    match phase {
-        Some(TransitionPhase::ExitCompact) => {
-            let t = state.phase_progress(now);
-            crate::ui::start::immersive::compact_transition_overlay(compact, t, true)
-        }
-        Some(TransitionPhase::EnterCompact) => {
-            let t = state.phase_progress(now);
-            crate::ui::start::immersive::compact_transition_overlay(compact, 1.0 - t, false)
-        }
-        _ => compact,
-    }
+    )
 }
 
 /// Identify / Power-off hints for an immersive dock row (mirrors compact Controllers).
+/// Uses layout-stable glyphs (no Float scale) so dock row height cannot escape.
 pub(crate) fn immersive_dock_row_hints(
     row: &StartControllerRow,
     state: &State,
@@ -1514,7 +1533,7 @@ pub(crate) fn immersive_dock_row_hints(
             hint.press_anim,
         ));
     }
-    Some(action_cluster_spaced(&actions, ROW_ACTION_SPACING))
+    Some(action_cluster_dock(&actions))
 }
 
 /// Mouse + global hotkey hitch markers (not pad-navigable). Stamps `HITCH_MARK` in the logs.
@@ -2213,6 +2232,17 @@ fn action_cluster_spaced(hints: &[ActionHint], spacing: f32) -> Element<'static,
     row.into()
 }
 
+/// Dock row cluster — no Float scale (keeps fixed row height).
+fn action_cluster_dock(hints: &[ActionHint]) -> Element<'static, StartMessage> {
+    let mut row = row![]
+        .spacing(ROW_ACTION_SPACING)
+        .align_y(Alignment::Center);
+    for hint in hints {
+        row = row.push(action_hint_dock(hint));
+    }
+    row.into()
+}
+
 fn action_hint(hint: &ActionHint) -> Element<'static, StartMessage> {
     let glyph: Element<'static, StartMessage> = if let Some(face) = hint.face {
         let style = if let Some(progress) = hint.hold {
@@ -2239,6 +2269,32 @@ fn action_hint(hint: &ActionHint) -> Element<'static, StartMessage> {
         .into()
 }
 
+fn action_hint_dock(hint: &ActionHint) -> Element<'static, StartMessage> {
+    let glyph: Element<'static, StartMessage> = if let Some(face) = hint.face {
+        let style = if let Some(progress) = hint.hold {
+            RingStyle::Hold {
+                progress,
+                armed_t: hint.armed_t,
+            }
+        } else if hint.pressed {
+            RingStyle::Pressed
+        } else {
+            RingStyle::Idle
+        };
+        face_glyph_dock(face, style)
+    } else {
+        text(hint.text_glyph.unwrap_or("?"))
+            .size(14.0)
+            .color(theme::ACCENT)
+            .into()
+    };
+
+    row![glyph, text(hint.label).size(13.0).color(theme::MUTED)]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into()
+}
+
 fn face_svg(face: FaceButton, size: f32) -> Element<'static, StartMessage> {
     svg(svg::Handle::from_memory(face.svg().as_bytes()))
         .width(Length::Fixed(size))
@@ -2258,11 +2314,21 @@ fn face_glyph(face: FaceButton, style: RingStyle, press_t: f32) -> Element<'stat
     let scale = 1.0 + (PRESSED_SCALE - 1.0) * press_t;
     // Idle radius is inset so full press (× PRESSED_SCALE) + stroke stays inside the slot.
     // Geometry stays fixed; Float scales the stack so SVG/canvas are not re-rasterized each frame.
+    let stack = face_glyph_stack(face, style);
+    Float::new(stack).scale(scale).into()
+}
+
+/// Dock-safe glyph: same art, no Float (scaled Float becomes an overlay and breaks row height).
+fn face_glyph_dock(face: FaceButton, style: RingStyle) -> Element<'static, StartMessage> {
+    face_glyph_stack(face, style)
+}
+
+fn face_glyph_stack(face: FaceButton, style: RingStyle) -> Element<'static, StartMessage> {
     let half = HOLD_RING_SIZE / 2.0;
     let max_radius = half - 2.5; // leave room for ~2.5px stroke
     let idle_radius = max_radius / PRESSED_SCALE;
     let glyph_size = FACE_GLYPH_SIZE * (idle_radius / (half - 2.0));
-    let stack = iced::widget::stack![
+    iced::widget::stack![
         action_ring(style, idle_radius),
         container(face_svg(face, glyph_size))
             .width(Length::Fixed(HOLD_RING_SIZE))
@@ -2271,8 +2337,8 @@ fn face_glyph(face: FaceButton, style: RingStyle, press_t: f32) -> Element<'stat
             .center_y(Fill),
     ]
     .width(Length::Fixed(HOLD_RING_SIZE))
-    .height(Length::Fixed(HOLD_RING_SIZE));
-    Float::new(stack).scale(scale).into()
+    .height(Length::Fixed(HOLD_RING_SIZE))
+    .into()
 }
 
 fn action_ring(style: RingStyle, radius: f32) -> Element<'static, StartMessage> {
@@ -2374,7 +2440,7 @@ fn skeleton_bar(width: f32, height: f32) -> Element<'static, StartMessage> {
 }
 
 fn game_row(
-    index: usize,
+    _index: usize,
     row: &StartRow,
     selected: bool,
     running: bool,
@@ -2534,17 +2600,17 @@ fn game_row(
         content = content.push(action_cluster_spaced(&actions, ROW_ACTION_SPACING));
     }
 
-    button(content.width(Fill).height(Length::Fixed(ROW_HEIGHT)))
+    // Pad/keyboard navigate — no mouse press/hover on list rows (edit actions stay clickable).
+    container(content.width(Fill).height(Length::Fixed(ROW_HEIGHT)))
         .padding([0, 12])
         .width(Fill)
         .height(Length::Fixed(ROW_HEIGHT))
-        .on_press(StartMessage::Launch(index))
-        .style(theme::menu_row(selected))
+        .style(theme::menu_row_surface(selected))
         .into()
 }
 
 fn controller_row<'a>(
-    index: usize,
+    _index: usize,
     row: &'a StartControllerRow,
     selected: bool,
     spectrum: &BatterySpectrum,
@@ -2558,8 +2624,13 @@ fn controller_row<'a>(
     } else {
         theme::DIM
     };
-    let ring =
-        percent_ring::percent_ring(row.percent, ring_color, POPUP_SIZE * 0.95, row.eta.clone());
+    let ring = percent_ring::percent_ring(
+        row.percent,
+        ring_color,
+        POPUP_SIZE * 0.95,
+        row.eta.clone(),
+        1.0,
+    );
 
     let meta_color = if row.low {
         theme::WARNING
@@ -2613,7 +2684,7 @@ fn controller_row<'a>(
         content = content.push(action_cluster_spaced(&actions, ROW_ACTION_SPACING));
     }
 
-    button(
+    container(
         content
             .width(Fill)
             .height(Length::Fixed(CONTROLLER_ROW_HEIGHT)),
@@ -2621,8 +2692,7 @@ fn controller_row<'a>(
     .padding([0, 12])
     .width(Fill)
     .height(Length::Fixed(CONTROLLER_ROW_HEIGHT))
-    .on_press(StartMessage::SelectController(index))
-    .style(theme::menu_row(selected))
+    .style(theme::menu_row_surface(selected))
     .into()
 }
 

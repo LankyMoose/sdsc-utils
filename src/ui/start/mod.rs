@@ -4,5 +4,6 @@ pub mod icon_cache;
 pub mod immersive;
 pub mod input;
 pub mod mode;
+pub mod reveal;
 pub mod view;
 pub mod vstrip;
