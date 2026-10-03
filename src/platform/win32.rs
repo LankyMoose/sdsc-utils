@@ -15,6 +15,7 @@ pub const HOTKEY_ID_LIGHTBAR_HITCH: i32 = 0x4455;
 pub const HOTKEY_ID_INPUT_HITCH: i32 = 0x4456;
 pub const WM_HOTKEY: u32 = 0x0312;
 pub const WM_QUIT: u32 = 0x0012;
+pub const MONITOR_DEFAULTTONULL: u32 = 0;
 pub const MONITOR_DEFAULTTOPRIMARY: u32 = 1;
 pub const MDT_EFFECTIVE_DPI: u32 = 0;
 
@@ -153,6 +154,7 @@ unsafe extern "system" {
     pub fn UnregisterHotKey(hwnd: isize, id: i32) -> i32;
     pub fn GetMessageW(message: *mut Message, hwnd: isize, min: u32, max: u32) -> i32;
     pub fn PostThreadMessageW(thread: u32, message: u32, w_param: usize, l_param: isize) -> i32;
+    pub fn GetCursorPos(point: *mut Point) -> i32;
     pub fn MonitorFromPoint(point: Point, flags: u32) -> isize;
     pub fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
     pub fn GetForegroundWindow() -> isize;

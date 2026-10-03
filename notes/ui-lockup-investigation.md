@@ -58,6 +58,7 @@ Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**
 - `hid-diag: worker stall kind=op|idle last_op=... gap_ms=... tier=250|500|1000|2000|5000`
 - `start-nav: no … snapshot` / `snapshot restored` / `snapshot stale`
 - `ui-diag: pad-poll stall` / `pad-poll slow` / `process-enum`
+- `ui-diag: start cursor hide` / `start cursor show` — immersive idle cursor hide (debug builds)
 - `HITCH_MARK kind=lightbar|input source=hotkey|button`
 - `PANIC at file:line:col: …` — custom hook in [`app_log::init`](../src/app_log.rs); required because `windows_subsystem = "windows"` discards stderr panic text (exit 101 with an empty console)
 - `PANIC_BACKTRACE …` — capped `Backtrace::force_capture()` right after `PANIC at` (all builds); use to tell iced atlas/main-thread from the image worker

@@ -361,6 +361,35 @@ pub fn primary_monitor_cover() -> Option<MonitorCover> {
     }
 }
 
+/// Whether the system cursor is currently on the primary monitor.
+///
+/// Used for immersive Start idle cursor hide — secondary monitors keep a visible
+/// cursor even while Start covers the primary.
+pub fn cursor_on_primary_monitor() -> bool {
+    #[cfg(windows)]
+    {
+        unsafe {
+            let mut point = win32::Point::default();
+            if win32::GetCursorPos(&mut point) == 0 {
+                return false;
+            }
+            let primary = win32::MonitorFromPoint(
+                win32::Point { x: 0, y: 0 },
+                win32::MONITOR_DEFAULTTOPRIMARY,
+            );
+            if primary == 0 {
+                return false;
+            }
+            let under_cursor = win32::MonitorFromPoint(point, win32::MONITOR_DEFAULTTONULL);
+            under_cursor != 0 && under_cursor == primary
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Primary-monitor toast target in logical pixels.
 ///
 /// Uses the Windows work area so a visible taskbar is cleared, while an

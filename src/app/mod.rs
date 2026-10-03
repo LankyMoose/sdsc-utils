@@ -42,12 +42,13 @@ use crate::ui::configure::{
     ConfigureState, NotificationSetting, PadInputPanel, Section,
 };
 use crate::ui::layout::{
-    MonitorCover, ToastPlacement, TrayAnchor, hide_toast, invalidate_toast,
-    overlay_platform_specific, popup_position, primary_monitor_cover, raise_window_topmost,
-    remount_toast_surface, set_toast_topmost, show_toast_without_activate, slide_y,
-    toast_placement, window_platform_specific,
+    MonitorCover, ToastPlacement, TrayAnchor, cursor_on_primary_monitor, hide_toast,
+    invalidate_toast, overlay_platform_specific, popup_position, primary_monitor_cover,
+    raise_window_topmost, remount_toast_surface, set_toast_topmost, show_toast_without_activate,
+    slide_y, toast_placement, window_platform_specific,
 };
 use crate::ui::popup::{self as popup_view, ControllerRow, PopupMessage};
+use crate::ui::start::cursor_hide;
 use crate::ui::start::gesture::{self, GestureRecorder};
 use crate::ui::start::input::{
     self as start_input, CrossHold, FaceHeld, GestureDetectorBank, GestureRecordLatch, NavAction,
@@ -66,6 +67,7 @@ use iced::futures::Stream;
 use iced::futures::StreamExt;
 use iced::futures::channel::{mpsc, oneshot};
 use iced::keyboard;
+use iced::mouse;
 use iced::widget::{container, operation, space};
 use iced::{Element, Point, Size, Subscription, Task, Theme, stream, window};
 
@@ -97,6 +99,8 @@ const SNAPSHOT_STALE_MS: u128 = 100;
 const START_NAV_NOT_READY_MS: u128 = 200;
 /// Ignore Start WindowUnfocused briefly after reveal (toast z-order focus blips).
 const START_UNFOCUS_GRACE: Duration = Duration::from_millis(150);
+/// Hide the mouse cursor after this idle while immersive Start covers the primary.
+const START_CURSOR_IDLE_HIDE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -129,6 +133,8 @@ pub enum Message {
     StartOpened(window::Id),
     /// Drive start-screen slide / Triangle-hold animation frames.
     StartFrame,
+    /// Mouse move/button/wheel on a window — used to reset immersive cursor idle hide.
+    StartCursorActivity(window::Id),
     /// HWND resize finished — apply immersive flag after promote/demote veil.
     StartImmersiveSettled,
     /// Background immersive art warm finished — peek cache + fade-in.
@@ -230,6 +236,10 @@ pub struct App {
     start_state: start_view::State,
     /// Monitor covered while immersive (used to center compact on demote).
     start_monitor_cover: Option<MonitorCover>,
+    /// Last mouse activity on the Start window (immersive idle cursor hide).
+    start_cursor_last_active: Instant,
+    /// When true, Start view forces [`mouse::Interaction::Hidden`].
+    start_cursor_hidden: bool,
     /// True while an rfd picker is open from the start screen (suppress unfocus-close).
     start_file_dialog_open: bool,
     /// After hide / connect-reveal: ignore reopen until the chord is fully released.
@@ -428,6 +438,8 @@ impl App {
             start_nav_ready: false,
             start_state: start_view::State::default(),
             start_monitor_cover: None,
+            start_cursor_last_active: Instant::now(),
+            start_cursor_hidden: false,
             start_file_dialog_open: false,
             reopen_needs_chord_release: false,
             start_revealed_at: None,
@@ -561,6 +573,12 @@ impl App {
                         pressed: false,
                     })
                 }
+                iced::Event::Mouse(
+                    mouse::Event::CursorMoved { .. }
+                    | mouse::Event::ButtonPressed(_)
+                    | mouse::Event::ButtonReleased(_)
+                    | mouse::Event::WheelScrolled { .. },
+                ) => Some(Message::StartCursorActivity(id)),
                 _ => None,
             }),
         ];
@@ -647,7 +665,7 @@ impl App {
         }
 
         if Some(window) == self.start_window {
-            return start_view::view(
+            let start = start_view::view(
                 &self.start_state,
                 &self.session.prefs.spectrum,
                 Instant::now(),
@@ -655,6 +673,7 @@ impl App {
                 &self.session.prefs.start_screen_gesture,
             )
             .map(Message::Start);
+            return cursor_hide::force_cursor(start, self.start_cursor_hidden).into();
         }
 
         if Some(window) == self.toast_window {
@@ -825,6 +844,13 @@ impl App {
                 }
                 self.sync_start_held();
                 self.start_state.tick_hint_anims(now);
+                self.tick_start_cursor_idle(now);
+                Task::none()
+            }
+            Message::StartCursorActivity(id) => {
+                if Some(id) == self.start_window && self.start_visible {
+                    self.note_start_cursor_activity();
+                }
                 Task::none()
             }
             Message::Start(message) => {
@@ -2517,6 +2543,7 @@ impl App {
             start_mode::ImmersiveTransition::OpenImmersive
         );
         self.start_state.immersive = immersive;
+        self.clear_start_cursor_hide();
         let (size, position) = if immersive {
             let cover = primary_monitor_cover().unwrap_or(MonitorCover {
                 x: 0.0,
@@ -2588,6 +2615,7 @@ impl App {
             height: 1080.0,
         });
         self.start_monitor_cover = Some(cover);
+        self.clear_start_cursor_hide();
         self.reopen_needs_chord_release = true;
         self.consume_reopen_gesture_chord();
         crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
@@ -2612,6 +2640,7 @@ impl App {
         self.reopen_needs_chord_release = true;
         self.consume_reopen_gesture_chord();
         crate::controller::hid::diag::diag_info("ui-diag: start immersive leave");
+        self.clear_start_cursor_hide();
         self.start_state
             .begin_transition_phase(start_mode::TransitionPhase::ExitImmersive, Instant::now());
         Task::none()
@@ -2714,6 +2743,7 @@ impl App {
                 .begin_transition_phase(start_mode::TransitionPhase::EnterImmersive, now);
         } else {
             self.start_monitor_cover = None;
+            self.clear_start_cursor_hide();
             self.start_state.clear_backdrop_transition();
             self.start_state
                 .begin_transition_phase(start_mode::TransitionPhase::EnterCompact, now);
@@ -2779,6 +2809,43 @@ impl App {
         self.pad_held = FaceHeld::default();
     }
 
+    fn note_start_cursor_activity(&mut self) {
+        self.start_cursor_last_active = Instant::now();
+        self.set_start_cursor_hidden(false);
+    }
+
+    fn clear_start_cursor_hide(&mut self) {
+        self.start_cursor_last_active = Instant::now();
+        self.set_start_cursor_hidden(false);
+    }
+
+    fn set_start_cursor_hidden(&mut self, hidden: bool) {
+        if self.start_cursor_hidden == hidden {
+            return;
+        }
+        self.start_cursor_hidden = hidden;
+        if hidden {
+            crate::controller::hid::diag::diag_info("ui-diag: start cursor hide");
+        } else {
+            crate::controller::hid::diag::diag_info("ui-diag: start cursor show");
+        }
+    }
+
+    fn tick_start_cursor_idle(&mut self, now: Instant) {
+        if !self.start_visible || !self.start_state.immersive {
+            self.set_start_cursor_hidden(false);
+            return;
+        }
+        if !cursor_on_primary_monitor() {
+            self.set_start_cursor_hidden(false);
+            return;
+        }
+        let idle = now.saturating_duration_since(self.start_cursor_last_active);
+        if idle >= START_CURSOR_IDLE_HIDE {
+            self.set_start_cursor_hidden(true);
+        }
+    }
+
     fn close_start_screen(&mut self) -> Task<Message> {
         // Clear visibility before any hide task so Resting toast RaiseInteractive
         // cannot resurface Start while the hide is in flight.
@@ -2790,6 +2857,7 @@ impl App {
         self.start_state.immersive = false;
         self.start_state.clear_immersive_session();
         self.start_monitor_cover = None;
+        self.clear_start_cursor_hide();
         self.reopen_needs_chord_release = true;
         self.haptic_pad_serial = None;
         if self.client_mode {
