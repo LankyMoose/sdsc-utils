@@ -35,19 +35,14 @@ pub const HEIGHT: f32 = 500.0;
 pub const SLIDE_ANIM_MS: u64 = 220;
 const SLIDE_ANIM_MIN_MS: u64 = 60;
 const HEADER_HEIGHT: f32 = 36.0;
-const IMMERSIVE_HEADER_HEIGHT: f32 = 64.0;
 /// Matches the Games footer band (face-cycle toggle + face hints).
 const FOOTER_HEIGHT: f32 = 32.0;
-const IMMERSIVE_FOOTER_HEIGHT: f32 = 56.0;
+const IMMERSIVE_FOOTER_HEIGHT: f32 = 44.0;
 const TITLE_ACTIVE: f32 = 20.0;
 const TITLE_INACTIVE: f32 = 15.0;
-const IMMERSIVE_TITLE_ACTIVE: f32 = 32.0;
-const IMMERSIVE_TITLE_INACTIVE: f32 = 22.0;
 const CUE_SIZE: f32 = 14.0;
-const IMMERSIVE_CUE_SIZE: f32 = 18.0;
 /// Width reserved for an L2/R2 cue plus gap while revealed.
 const CUE_SLOT_W: f32 = 30.0;
-const IMMERSIVE_CUE_SLOT_W: f32 = 42.0;
 const ROW_HEIGHT: f32 = 88.0;
 const CONTROLLER_ROW_HEIGHT: f32 = 100.0;
 /// Horizontal inset; vertical chrome uses [`PAD_Y`].
@@ -1610,18 +1605,6 @@ pub(crate) fn slide_header(progress: f32) -> Element<'static, StartMessage> {
         TITLE_INACTIVE,
         CUE_SIZE,
         CUE_SLOT_W,
-    )
-}
-
-/// Immersive header: same cue reveal logic, larger type and band.
-pub(crate) fn immersive_slide_header(progress: f32) -> Element<'static, StartMessage> {
-    slide_header_metrics(
-        progress,
-        IMMERSIVE_HEADER_HEIGHT,
-        IMMERSIVE_TITLE_ACTIVE,
-        IMMERSIVE_TITLE_INACTIVE,
-        IMMERSIVE_CUE_SIZE,
-        IMMERSIVE_CUE_SLOT_W,
     )
 }
 

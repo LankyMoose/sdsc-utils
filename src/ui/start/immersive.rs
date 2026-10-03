@@ -6,7 +6,7 @@ use crate::ui::shader::AmbientProgram;
 use crate::ui::start::mode::{TransitionPhase, dock_panel_width, dock_stage_dim, dock_stage_scale};
 use crate::ui::start::view::{
     StartControllerRow, StartMessage, StartRow, StartSlide, State, footer_hint,
-    immersive_dock_row_hints, immersive_slide_header, manual_add_view, replace_confirm_view,
+    immersive_dock_row_hints, manual_add_view, replace_confirm_view,
 };
 use crate::ui::start::vstrip::{self, CENTER_H, CENTER_W, NEIGHBORS, SELECTED_SCALE, SLOT_W};
 use crate::ui::theme;
@@ -15,7 +15,7 @@ use iced::widget::{Float, column, container, row, shader, space, stack, text};
 use iced::{Alignment, Element, Fill, Font, Length, Padding};
 use std::time::Instant;
 
-const EDGE_PAD: f32 = 28.0;
+const EDGE_PAD: f32 = 16.0;
 /// Peek column fits the active (grown) ring.
 const DOCK_PEEK_W: f32 = 120.0;
 /// Wide enough for larger type + inline Identify/Power-off on one row.
@@ -25,6 +25,8 @@ const DOCK_RING_MAX: f32 = 68.0;
 /// Fixed row height fits max ring; all rings lerp with dock expand.
 const DOCK_ROW_H: f32 = 80.0;
 const DOCK_ROW_GAP: f32 = 8.0;
+/// Compact title strip at the top of the controllers drawer (R2 / Controllers / L2).
+const DOCK_TITLE_H: f32 = 36.0;
 /// Reserved trailing width for dock action hints (avoids select flicker).
 const DOCK_HINT_COL_W: f32 = 210.0;
 const MODAL_W: f32 = 640.0;
@@ -90,16 +92,6 @@ pub fn view<'a>(
         stage_with_dock(state, spectrum, now, dock_p, flat)
     };
 
-    let header = container(immersive_slide_header(dock_p))
-        .width(Fill)
-        .padding(Padding {
-            top: 14.0,
-            right: EDGE_PAD,
-            bottom: 10.0,
-            left: EDGE_PAD,
-        })
-        .style(theme::immersive_header_band);
-
     let footer_capsule = container(footer_hint(
         state,
         true,
@@ -108,18 +100,14 @@ pub fn view<'a>(
         flat,
     ))
     .padding(Padding {
-        top: 10.0,
-        right: 28.0,
-        bottom: 10.0,
-        left: 28.0,
+        top: 6.0,
+        right: 16.0,
+        bottom: 6.0,
+        left: 16.0,
     })
     .style(theme::immersive_footer_capsule);
 
-    // Header + full-height body (dock reaches window bottom); footer overlays.
-    let main = column![header, container(body).width(Fill).height(Fill)]
-        .width(Fill)
-        .height(Fill);
-
+    // Full-bleed stage + dock; footer hints overlay the bottom.
     let footer_overlay = column![
         space().height(Fill),
         container(footer_capsule)
@@ -128,14 +116,14 @@ pub fn view<'a>(
             .padding(Padding {
                 top: 0.0,
                 right: EDGE_PAD,
-                bottom: 18.0,
+                bottom: 10.0,
                 left: EDGE_PAD,
             }),
     ]
     .width(Fill)
     .height(Fill);
 
-    let chrome = stack![main, footer_overlay].width(Fill).height(Fill);
+    let chrome = stack![body, footer_overlay].width(Fill).height(Fill);
     let base = stack![atmosphere, chrome].width(Fill).height(Fill);
 
     if flat {
@@ -526,6 +514,7 @@ fn controllers_dock_host<'a>(
     let mut list = column![]
         .spacing(DOCK_ROW_GAP)
         .width(Length::Fixed(DOCK_MAX_W));
+    list = list.push(dock_title_row(dock_progress, details_w));
     if state.controllers.is_empty() {
         list = list.push(dock_empty_row(details_w));
     } else {
@@ -545,9 +534,9 @@ fn controllers_dock_host<'a>(
     }
 
     let pad = Padding {
-        top: 20.0,
+        top: 8.0,
         right: 0.0,
-        bottom: 72.0,
+        bottom: 52.0,
         left: 0.0,
     };
     let full = container(list)
@@ -562,6 +551,53 @@ fn controllers_dock_host<'a>(
         .height(Fill)
         .style(theme::immersive_dock)
         .into()
+}
+
+/// Peek shows R2 to open; expanded reveals Controllers + L2 to collapse.
+fn dock_title_row(dock_progress: f32, details_w: f32) -> Element<'static, StartMessage> {
+    let t = dock_progress.clamp(0.0, 1.0);
+    let r2_t = 1.0 - t;
+
+    let peek = container(
+        text("R2")
+            .size(13.0)
+            .color(theme::alpha(theme::ACCENT, r2_t)),
+    )
+    .width(Length::Fixed(DOCK_PEEK_W))
+    .height(Length::Fixed(DOCK_TITLE_H))
+    .center_x(Fill)
+    .center_y(Fill);
+
+    let details = container(
+        row![
+            text(StartSlide::Controllers.title())
+                .size(15.0)
+                .color(theme::alpha(theme::INK, t)),
+            text("L2").size(13.0).color(theme::alpha(theme::ACCENT, t)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fixed(details_w))
+    .height(Length::Fixed(DOCK_TITLE_H))
+    .center_y(Fill)
+    .padding(Padding {
+        top: 0.0,
+        right: 16.0,
+        bottom: 0.0,
+        left: 4.0,
+    });
+
+    container(
+        row![peek, details]
+            .width(Length::Fixed(DOCK_MAX_W))
+            .height(Length::Fixed(DOCK_TITLE_H))
+            .align_y(Alignment::Center),
+    )
+    .width(Length::Fixed(DOCK_MAX_W))
+    .height(Length::Fixed(DOCK_TITLE_H))
+    .clip(true)
+    .into()
 }
 
 fn dock_empty_row<'a>(details_w: f32) -> Element<'a, StartMessage> {

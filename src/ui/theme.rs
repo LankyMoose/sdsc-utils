@@ -243,10 +243,16 @@ pub fn immersive_stage(_theme: &Theme) -> container::Style {
     }
 }
 
-/// Immersive controllers drawer: near-black, no border (flush with header).
+/// Shared glass fill for immersive header / dock / footer hints.
+fn immersive_chrome_fill() -> Color {
+    // Darker than BASE_BG, see-through so atmosphere/backdrop read through.
+    alpha(darken(BASE_BG, 0.55), 0.58)
+}
+
+/// Immersive controllers drawer: dark glass, no border (flush with header).
 pub fn immersive_dock(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(alpha(BASE_BG, 0.96))),
+        background: Some(Background::Color(immersive_chrome_fill())),
         text_color: Some(INK),
         border: Border::default(),
         ..container::Style::default()
@@ -270,25 +276,15 @@ pub fn immersive_backdrop_wash(_theme: &Theme) -> container::Style {
     }
 }
 
-/// Full-bleed immersive title band (near-black, no rounding).
-pub fn immersive_header_band(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(alpha(BASE_BG, 0.96))),
-        text_color: Some(INK),
-        border: Border::default(),
-        ..container::Style::default()
-    }
-}
-
 /// Pill behind immersive footer action hints.
 pub fn immersive_footer_capsule(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(alpha(PANEL, 0.92))),
+        background: Some(Background::Color(immersive_chrome_fill())),
         text_color: Some(INK),
         border: Border {
-            color: alpha(LINE, 0.35),
+            color: alpha(LINE, 0.28),
             width: 1.0,
-            radius: 28.0.into(),
+            radius: 20.0.into(),
         },
         ..container::Style::default()
     }
