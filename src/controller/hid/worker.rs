@@ -12,8 +12,9 @@
 //! **Rumble uses a separate long-lived output handle** (not `write_rgb_exclusive`) so
 //! start-nav pulses do not drop the input cache. Opens ranked DualSense collections
 //! (same order as lightbar) and requests BT calibration once per rumble handle.
-//! Poll / PowerOff / Shutdown still drop rumble handles so those paths can open.
-//! PowerOff waits for any in-flight rumble pulse to finish first (hold cue), then runs.
+//! Poll / Shutdown drop all rumble handles; PowerOff drops only the target pad's
+//! rumble + input handle so a sibling USB pad stays live. PowerOff waits for any
+//! in-flight rumble pulse on the target to finish first (hold cue), then runs.
 //!
 //! Timing lines (grep `hid-worker:`) record enumerate / open / io / total.
 
@@ -350,7 +351,7 @@ impl DeviceCache {
 }
 
 /// Separate open handles for rumble output. Never used for input reads.
-/// Dropped on Poll / PowerOff / Shutdown so those paths can reopen HID.
+/// Dropped on Poll / Shutdown; PowerOff drops only the target serial.
 struct RumbleCache {
     devices: HashMap<String, OpenDevice>,
     /// Log once when falling back to the input-cache handle.
@@ -1246,6 +1247,29 @@ fn stop_all_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>) {
     rumble.drop_all();
 }
 
+/// Stop motors and drop the rumble handle for one pad only.
+fn stop_rumble_for_serial(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>, serial: &str) {
+    let target = normalize_identity(serial);
+    active.retain(|e| normalize_identity(&e.serial) != target);
+    if let Some(open) = rumble.devices.get(&target) {
+        let _ = rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, &target);
+    }
+    rumble.drop_serial(&target);
+}
+
+/// Drop the powered-off pad from a nav snapshot; keep sibling pads.
+fn readings_without_power_off_target(readings: Vec<NavReading>, serial: &str) -> Vec<NavReading> {
+    let target = normalize_identity(serial);
+    readings
+        .into_iter()
+        .filter(|r| {
+            let id = r.id.0.as_str();
+            let identity = id.strip_prefix("hid:").unwrap_or(id);
+            normalize_identity(identity) != target
+        })
+        .collect()
+}
+
 fn write_rumble_pulse(
     cache: &mut DeviceCache,
     rumble: &mut RumbleCache,
@@ -1323,7 +1347,7 @@ fn expire_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>, now: 
     *active = still;
 }
 
-/// Run the PowerOff body: stop rumble, drop handles, clear snapshot, send feature report.
+/// Run the PowerOff body: stop the target pad's rumble/input, keep siblings, send feature report.
 #[allow(clippy::too_many_arguments)]
 fn execute_power_off(
     serial: &str,
@@ -1340,15 +1364,28 @@ fn execute_power_off(
     if session.as_ref().is_some_and(|s| s.serial == serial) {
         abort_identify(session, cache, identifying);
     }
-    stop_all_rumble(rumble, active_rumble);
-    cache.drop_all();
-    if let Ok(mut guard) = live_pads.lock() {
-        guard.clear();
-    }
+    stop_rumble_for_serial(rumble, active_rumble, serial);
+    // Exclusive feature-report open needs this pad's input handle released only.
+    cache.drop_serial(serial);
+    forget_live_pad(live_pads, serial);
+    let remaining = snapshot
+        .lock()
+        .map(|g| readings_without_power_off_target(g.readings.clone(), serial))
+        .unwrap_or_default();
+    let kept = remaining.len();
+    crate::controller::hid::diag::diag_info(format!(
+        "hid-diag: power-off drop serial={} kept_live={kept}",
+        normalize_identity(serial)
+    ));
+    let reason = if remaining.is_empty() {
+        SnapshotReason::ClearedPowerOff
+    } else {
+        SnapshotReason::SamplePartial
+    };
     publish_snapshot(
         snapshot,
-        Vec::new(),
-        SnapshotReason::ClearedPowerOff,
+        remaining,
+        reason,
         Some("PowerOff"),
         last_noisy_log,
         input_hot,
@@ -1895,5 +1932,31 @@ mod tests {
             advance_silence_streak(LIVE_SILENCE_TIMEOUTS),
             (LIVE_SILENCE_TIMEOUTS + 1, true)
         );
+    }
+
+    fn stub_reading(id: &str) -> NavReading {
+        NavReading {
+            id: start_input::PadId(id.to_string()),
+            sample: start_input::PadSample::default(),
+            source: start_input::NavSource::Hid,
+        }
+    }
+
+    #[test]
+    fn power_off_snapshot_keeps_sibling_pad() {
+        let readings = vec![
+            stub_reading("hid:444648156926"),
+            stub_reading("hid:444648164f65"),
+        ];
+        let kept = readings_without_power_off_target(readings, "44:46:48:15:69:26");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id.0, "hid:444648164f65");
+    }
+
+    #[test]
+    fn power_off_snapshot_clears_when_last_pad() {
+        let readings = vec![stub_reading("hid:aabbccddeeff")];
+        let kept = readings_without_power_off_target(readings, "aa-bb-cc-dd-ee-ff");
+        assert!(kept.is_empty());
     }
 }

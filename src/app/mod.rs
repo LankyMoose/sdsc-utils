@@ -1878,8 +1878,14 @@ impl App {
             return;
         }
 
-        // Reconnect after user power-off should open Start again (not ghost-flap cooldown).
-        self.session.mark_skip_connect_cooldown();
+        // Reconnect after user power-off should open Start again (not ghost-flap cooldown),
+        // but only when this was the last pad — a sibling must not look like a fresh 0→1.
+        if crate::session::should_skip_connect_cooldown_on_power_off(
+            &self.session.controllers,
+            serial,
+        ) {
+            self.session.mark_skip_connect_cooldown();
+        }
         if self.client_mode {
             let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::PowerOff {
                 serial: serial.to_string(),

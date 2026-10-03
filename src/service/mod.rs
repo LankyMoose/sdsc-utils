@@ -17,7 +17,10 @@ use crate::ipc::{PipeServer, SHELL_PIPE_ENV, ServiceMessage, ShellCommand, bound
 use crate::persist::analytics::AnalyticsStore;
 use crate::persist::prefs::Prefs;
 use crate::platform::app_log;
-use crate::session::{ApplyContext, DeviceSession, SessionEffect, controllers_equivalent};
+use crate::session::{
+    ApplyContext, DeviceSession, SessionEffect, controllers_equivalent,
+    should_skip_connect_cooldown_on_power_off,
+};
 use crate::ui::tray::{self, QUIT_ID, SETTINGS_ID};
 use std::collections::HashMap;
 use std::process::{Child, Command};
@@ -406,7 +409,11 @@ fn handle_command(
             Ok(LoopControl::Continue)
         }
         ShellCommand::PowerOff { serial } => {
-            session.mark_skip_connect_cooldown();
+            // Only the last pad's intentional power-off should skip the 0→1 ghost
+            // cooldown; powering off one of two must not reopen Start on the sibling.
+            if should_skip_connect_cooldown_on_power_off(&session.controllers, &serial) {
+                session.mark_skip_connect_cooldown();
+            }
             hid_worker.power_off(serial);
             Ok(LoopControl::Continue)
         }
