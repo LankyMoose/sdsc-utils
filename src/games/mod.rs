@@ -198,11 +198,16 @@ impl GamesCatalog {
     }
 
     /// Curated catalog sorted for browse mode.
+    ///
+    /// `played_at_ms` supplies the effective last-played timestamp (milliseconds).
+    /// Callers typically take the newer of catalog `last_played_ms` and Steam’s
+    /// `LastPlayed` without writing Steam times back into the catalog.
     pub fn merge_sorted(
         &self,
         installed_steam: Option<&[u32]>,
         mode: GamesSortMode,
         title_of: impl Fn(&GameEntry) -> String,
+        played_at_ms: impl Fn(&GameEntry) -> Option<u64>,
     ) -> Vec<GameEntry> {
         let mut entries = self.merge_for_display(installed_steam);
         match mode {
@@ -211,8 +216,8 @@ impl GamesCatalog {
             }
             GamesSortMode::LastPlayed => {
                 entries.sort_by(|a, b| {
-                    let pa = self.last_played(a).unwrap_or(0);
-                    let pb = self.last_played(b).unwrap_or(0);
+                    let pa = played_at_ms(a).unwrap_or(0);
+                    let pb = played_at_ms(b).unwrap_or(0);
                     pb.cmp(&pa)
                         .then_with(|| title_of(a).to_lowercase().cmp(&title_of(b).to_lowercase()))
                 });
@@ -336,7 +341,8 @@ mod tests {
             GameEntry::Steam { appid } => format!("Steam {appid}"),
             GameEntry::Manual { title, .. } => title.clone(),
         };
-        let sorted = catalog.merge_sorted(None, GamesSortMode::LastPlayed, title);
+        let played = |e: &GameEntry| catalog.last_played(e);
+        let sorted = catalog.merge_sorted(None, GamesSortMode::LastPlayed, title, played);
         assert_eq!(
             sorted
                 .iter()
@@ -348,7 +354,7 @@ mod tests {
             vec!["s2", "Zebra", "s1"]
         );
 
-        let alpha = catalog.merge_sorted(None, GamesSortMode::Alphabetical, title);
+        let alpha = catalog.merge_sorted(None, GamesSortMode::Alphabetical, title, played);
         assert_eq!(
             alpha
                 .iter()
@@ -358,6 +364,24 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             vec!["Steam 1", "Steam 2", "Zebra"]
+        );
+
+        // Steam LastPlayed (ms) wins when newer than catalog touch.
+        let steam_played = |e: &GameEntry| match e {
+            GameEntry::Steam { appid: 1 } => Some(500),
+            _ => catalog.last_played(e),
+        };
+        let steam_sorted =
+            catalog.merge_sorted(None, GamesSortMode::LastPlayed, title, steam_played);
+        assert_eq!(
+            steam_sorted
+                .iter()
+                .map(|e| match e {
+                    GameEntry::Steam { appid } => format!("s{appid}"),
+                    GameEntry::Manual { title, .. } => title.clone(),
+                })
+                .collect::<Vec<_>>(),
+            vec!["s1", "s2", "Zebra"]
         );
     }
 

@@ -5,6 +5,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Steam `StateFlags` bit: update available / required.
+const STATE_UPDATE_REQUIRED: u32 = 2;
+
+/// SteamID64 base for converting to the numeric `userdata/<id>` folder.
+const STEAM_ID64_BASE: u64 = 76_561_197_960_265_728;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SteamGame {
     pub appid: u32,
@@ -12,12 +18,36 @@ pub struct SteamGame {
     pub icon_path: Option<PathBuf>,
     /// Landscape hero/header art for immersive backdrops (when present).
     pub backdrop_path: Option<PathBuf>,
+    /// Lifetime playtime from `localconfig.vdf`, in minutes.
+    pub playtime_minutes: Option<u32>,
+    /// Newest of manifest / localconfig `LastPlayed` (unix seconds).
+    pub last_played_unix: Option<u64>,
+    /// Install size from the appmanifest (`SizeOnDisk`).
+    pub size_bytes: Option<u64>,
+    /// Manifest `StateFlags` has the update-required bit set.
+    pub update_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestMeta {
+    appid: u32,
+    name: String,
+    last_played_unix: Option<u64>,
+    size_bytes: Option<u64>,
+    update_required: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AppPlayStats {
+    playtime_minutes: Option<u32>,
+    last_played_unix: Option<u64>,
 }
 
 /// Installed Steam games, sorted by name.
 pub fn list_installed_games() -> Result<Vec<SteamGame>, String> {
     let steam_root = steam_root()?.ok_or_else(|| "Steam install not found".to_string())?;
     let library_roots = library_folders(&steam_root)?;
+    let play_by_id = load_play_stats(&steam_root);
     let mut by_id: BTreeMap<u32, SteamGame> = BTreeMap::new();
 
     for root in library_roots {
@@ -36,18 +66,24 @@ pub fn list_installed_games() -> Result<Vec<SteamGame>, String> {
             let Ok(text) = fs::read_to_string(&path) else {
                 continue;
             };
-            let Some((appid, title)) = parse_appmanifest(&text) else {
+            let Some(meta) = parse_appmanifest_meta(&text) else {
                 continue;
             };
-            let icon_path = library_cache_icon(&steam_root, appid);
-            let backdrop_path = library_cache_backdrop(&steam_root, appid);
+            let play = play_by_id.get(&meta.appid).cloned().unwrap_or_default();
+            let last_played_unix = max_opt(meta.last_played_unix, play.last_played_unix);
+            let icon_path = library_cache_icon(&steam_root, meta.appid);
+            let backdrop_path = library_cache_backdrop(&steam_root, meta.appid);
             by_id.insert(
-                appid,
+                meta.appid,
                 SteamGame {
-                    appid,
-                    name: title,
+                    appid: meta.appid,
+                    name: meta.name,
                     icon_path,
                     backdrop_path,
+                    playtime_minutes: play.playtime_minutes.filter(|&m| m > 0),
+                    last_played_unix: last_played_unix.filter(|&t| t > 0),
+                    size_bytes: meta.size_bytes.filter(|&b| b > 0),
+                    update_required: meta.update_required,
                 },
             );
         }
@@ -55,7 +91,54 @@ pub fn list_installed_games() -> Result<Vec<SteamGame>, String> {
 
     let mut games: Vec<_> = by_id.into_values().collect();
     games.sort_by_key(|a| a.name.to_lowercase());
+
+    #[cfg(debug_assertions)]
+    {
+        let with_play = games
+            .iter()
+            .filter(|g| g.playtime_minutes.is_some())
+            .count();
+        let with_size = games.iter().filter(|g| g.size_bytes.is_some()).count();
+        let with_last = games
+            .iter()
+            .filter(|g| g.last_played_unix.is_some())
+            .count();
+        app_log::hid_trace(format!(
+            "steam scan: games={} playtime={} size={} last_played={}",
+            games.len(),
+            with_play,
+            with_size,
+            with_last
+        ));
+    }
+
     Ok(games)
+}
+
+/// Compact browse subtitle: playtime, size, last played, optional Update.
+///
+/// Example: `82 h · 9.8 GB · 2 Oct 2025`. Falls back to `Steam` when empty.
+pub fn browse_subtitle(game: &SteamGame) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(mins) = game.playtime_minutes.filter(|&m| m > 0) {
+        parts.push(format_playtime(mins));
+    }
+    if let Some(bytes) = game.size_bytes.filter(|&b| b > 0) {
+        parts.push(format_size(bytes));
+    }
+    if let Some(unix) = game.last_played_unix.filter(|&t| t > 0)
+        && let Some(date) = format_last_played_date(unix)
+    {
+        parts.push(date);
+    }
+    if game.update_required {
+        parts.push("Update required".into());
+    }
+    if parts.is_empty() {
+        "Steam".into()
+    } else {
+        parts.join(" · ")
+    }
 }
 
 pub fn steam_root() -> Result<Option<PathBuf>, String> {
@@ -98,6 +181,214 @@ fn library_folders(steam_root: &Path) -> Result<Vec<PathBuf>, String> {
         }
     }
     Ok(roots)
+}
+
+fn load_play_stats(steam_root: &Path) -> BTreeMap<u32, AppPlayStats> {
+    let Some(account) = resolve_account_id(steam_root) else {
+        return BTreeMap::new();
+    };
+    let path = steam_root
+        .join("userdata")
+        .join(account.to_string())
+        .join("config")
+        .join("localconfig.vdf");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return BTreeMap::new();
+    };
+    parse_localconfig_apps(&text)
+}
+
+fn resolve_account_id(steam_root: &Path) -> Option<u32> {
+    let loginusers = steam_root.join("config").join("loginusers.vdf");
+    if let Ok(text) = fs::read_to_string(&loginusers)
+        && let Some(id) = most_recent_account_id(&text)
+    {
+        let path = steam_root
+            .join("userdata")
+            .join(id.to_string())
+            .join("config")
+            .join("localconfig.vdf");
+        if path.is_file() {
+            return Some(id);
+        }
+    }
+
+    let userdata = steam_root.join("userdata");
+    let Ok(entries) = fs::read_dir(&userdata) else {
+        return None;
+    };
+    let mut ids: Vec<u32> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let id: u32 = name.parse().ok()?;
+            let lc = e.path().join("config").join("localconfig.vdf");
+            lc.is_file().then_some(id)
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.into_iter().next()
+}
+
+/// Prefer `MostRecent`, else highest `Timestamp`, else first listed user.
+pub fn most_recent_account_id(loginusers_text: &str) -> Option<u32> {
+    let users = parse_loginusers(loginusers_text);
+    if users.is_empty() {
+        return None;
+    }
+    if let Some((_, id)) = users
+        .iter()
+        .filter(|u| u.most_recent)
+        .filter_map(|u| account_id_from_steam_id64(u.steam_id64).map(|id| (u, id)))
+        .next()
+    {
+        return Some(id);
+    }
+    users
+        .iter()
+        .filter_map(|u| {
+            let id = account_id_from_steam_id64(u.steam_id64)?;
+            Some((u.timestamp, id))
+        })
+        .max_by_key(|(ts, _)| *ts)
+        .map(|(_, id)| id)
+}
+
+pub fn account_id_from_steam_id64(steam_id64: u64) -> Option<u32> {
+    steam_id64
+        .checked_sub(STEAM_ID64_BASE)
+        .and_then(|v| u32::try_from(v).ok())
+}
+
+#[derive(Debug, Clone)]
+struct LoginUser {
+    steam_id64: u64,
+    most_recent: bool,
+    timestamp: u64,
+}
+
+fn parse_loginusers(text: &str) -> Vec<LoginUser> {
+    let mut users = Vec::new();
+    let mut depth = 0i32;
+    let mut pending_key: Option<String> = None;
+    let mut current_id: Option<u64> = None;
+    let mut current_depth: Option<i32> = None;
+    let mut most_recent = false;
+    let mut timestamp = 0u64;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "{" {
+            depth += 1;
+            if let Some(key) = pending_key.take()
+                && let Ok(id) = key.parse::<u64>()
+                && depth >= 2
+            {
+                current_id = Some(id);
+                current_depth = Some(depth);
+                most_recent = false;
+                timestamp = 0;
+            }
+            continue;
+        }
+        if trimmed == "}" {
+            if current_depth == Some(depth)
+                && let Some(steam_id64) = current_id.take()
+            {
+                users.push(LoginUser {
+                    steam_id64,
+                    most_recent,
+                    timestamp,
+                });
+                current_depth = None;
+            }
+            depth -= 1;
+            pending_key = None;
+            continue;
+        }
+        if let Some(value) = vdf_string_value(trimmed, "MostRecent") {
+            if current_id.is_some() {
+                most_recent = value == "1";
+            }
+            pending_key = None;
+        } else if let Some(value) = vdf_string_value(trimmed, "Timestamp") {
+            if current_id.is_some() {
+                timestamp = value.parse().unwrap_or(0);
+            }
+            pending_key = None;
+        } else if let Some(key) = vdf_key_only(trimmed) {
+            pending_key = Some(key);
+        } else {
+            pending_key = None;
+        }
+    }
+    users
+}
+
+/// Parse `apps` entries from `localconfig.vdf` (Playtime minutes + LastPlayed).
+fn parse_localconfig_apps(text: &str) -> BTreeMap<u32, AppPlayStats> {
+    let mut out: BTreeMap<u32, AppPlayStats> = BTreeMap::new();
+    let mut depth = 0i32;
+    let mut pending_key: Option<String> = None;
+    let mut apps_depth: Option<i32> = None;
+    let mut current_app: Option<u32> = None;
+    let mut current_app_depth: Option<i32> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "{" {
+            depth += 1;
+            if let Some(key) = pending_key.take() {
+                if key == "apps" && apps_depth.is_none() {
+                    apps_depth = Some(depth);
+                } else if let Some(ad) = apps_depth
+                    && depth == ad + 1
+                    && let Ok(appid) = key.parse::<u32>()
+                {
+                    current_app = Some(appid);
+                    current_app_depth = Some(depth);
+                    out.entry(appid).or_default();
+                }
+            }
+            continue;
+        }
+        if trimmed == "}" {
+            if current_app_depth == Some(depth) {
+                current_app = None;
+                current_app_depth = None;
+            }
+            if apps_depth == Some(depth) {
+                apps_depth = None;
+            }
+            depth -= 1;
+            pending_key = None;
+            continue;
+        }
+
+        if let Some(appid) = current_app {
+            if let Some(value) = vdf_string_value(trimmed, "Playtime") {
+                if let Ok(mins) = value.parse::<u32>() {
+                    out.entry(appid).or_default().playtime_minutes = Some(mins);
+                }
+                pending_key = None;
+                continue;
+            }
+            if let Some(value) = vdf_string_value(trimmed, "LastPlayed") {
+                if let Ok(ts) = value.parse::<u64>() {
+                    out.entry(appid).or_default().last_played_unix = Some(ts);
+                }
+                pending_key = None;
+                continue;
+            }
+        }
+
+        if let Some(key) = vdf_key_only(trimmed) {
+            pending_key = Some(key);
+        } else {
+            pending_key = None;
+        }
+    }
+    out
 }
 
 fn library_cache_icon(steam_root: &Path, appid: u32) -> Option<PathBuf> {
@@ -196,20 +487,40 @@ pub fn parse_libraryfolders(text: &str) -> Vec<String> {
 
 /// Parse an `appmanifest_*.acf` for appid + name.
 pub fn parse_appmanifest(text: &str) -> Option<(u32, String)> {
+    let meta = parse_appmanifest_meta(text)?;
+    Some((meta.appid, meta.name))
+}
+
+/// Parse appid, name, size, last played, and update flag from an appmanifest.
+fn parse_appmanifest_meta(text: &str) -> Option<ManifestMeta> {
     let mut appid = None;
     let mut name = None;
+    let mut last_played_unix = None;
+    let mut size_bytes = None;
+    let mut state_flags = None;
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(value) = vdf_string_value(trimmed, "appid") {
             appid = value.parse().ok();
         } else if let Some(value) = vdf_string_value(trimmed, "name") {
             name = Some(value);
-        }
-        if appid.is_some() && name.is_some() {
-            break;
+        } else if let Some(value) = vdf_string_value(trimmed, "LastPlayed") {
+            last_played_unix = value.parse().ok();
+        } else if let Some(value) = vdf_string_value(trimmed, "SizeOnDisk") {
+            size_bytes = value.parse().ok();
+        } else if let Some(value) = vdf_string_value(trimmed, "StateFlags") {
+            state_flags = value.parse::<u32>().ok();
         }
     }
-    Some((appid?, name?))
+    Some(ManifestMeta {
+        appid: appid?,
+        name: name?,
+        last_played_unix,
+        size_bytes,
+        update_required: state_flags
+            .map(|f| f & STATE_UPDATE_REQUIRED != 0)
+            .unwrap_or(false),
+    })
 }
 
 /// Parse `"installdir"` from an appmanifest.
@@ -244,6 +555,93 @@ pub fn install_dir_for_appid(appid: u32) -> Option<PathBuf> {
     None
 }
 
+fn format_playtime(minutes: u32) -> String {
+    if minutes < 60 {
+        format!("{minutes} min")
+    } else {
+        format!("{} h", minutes / 60)
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const GB: u64 = 1_000_000_000;
+    const MB: u64 = 1_000_000;
+    if bytes >= GB {
+        let gb = bytes as f64 / GB as f64;
+        format!("{gb:.1} GB")
+    } else {
+        let mb = (bytes / MB).max(1);
+        format!("{mb} MB")
+    }
+}
+
+fn format_last_played_date(unix_secs: u64) -> Option<String> {
+    let local_secs = unix_secs_to_local(unix_secs)?;
+    let days = (local_secs as i64).div_euclid(86_400);
+    let (year, month, day) = ymd_from_unix_days(days)?;
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month_name = MONTHS.get((month - 1) as usize)?;
+    Some(format!("{day} {month_name} {year}"))
+}
+
+fn unix_secs_to_local(unix_secs: u64) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+
+        // FILETIME is 100ns ticks since 1601-01-01 UTC.
+        const EPOCH_DIFF_SECS: u64 = 11_644_473_600;
+        let ticks = unix_secs
+            .checked_add(EPOCH_DIFF_SECS)?
+            .checked_mul(10_000_000)?;
+        let utc = FILETIME {
+            dwLowDateTime: ticks as u32,
+            dwHighDateTime: (ticks >> 32) as u32,
+        };
+        let mut local = FILETIME::default();
+        unsafe { FileTimeToLocalFileTime(&utc, &mut local) }.ok()?;
+        let local_ticks = ((local.dwHighDateTime as u64) << 32) | (local.dwLowDateTime as u64);
+        local_ticks
+            .checked_div(10_000_000)?
+            .checked_sub(EPOCH_DIFF_SECS)
+    }
+    #[cfg(not(windows))]
+    {
+        Some(unix_secs)
+    }
+}
+
+/// Civil date from days since Unix epoch (proleptic Gregorian).
+fn ymd_from_unix_days(days: i64) -> Option<(i32, u32, u32)> {
+    // Howard Hinnant civil_from_days
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let year = i32::try_from(y).ok()?;
+    let month = u32::try_from(m).ok()?;
+    let day = u32::try_from(d).ok()?;
+    Some((year, month, day))
+}
+
+fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    }
+}
+
 fn vdf_string_value(line: &str, key: &str) -> Option<String> {
     // "key"		"value"
     let mut parts = line.split('"').filter(|s| !s.trim().is_empty());
@@ -253,6 +651,15 @@ fn vdf_string_value(line: &str, key: &str) -> Option<String> {
     }
     let value = parts.next()?;
     Some(unescape_vdf(value))
+}
+
+fn vdf_key_only(line: &str) -> Option<String> {
+    let mut parts = line.split('"').filter(|s| !s.trim().is_empty());
+    let key = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(unescape_vdf(key))
 }
 
 fn unescape_vdf(value: &str) -> String {
@@ -314,6 +721,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_appmanifest_meta_reads_size_played_update() {
+        let text = r#"
+"AppState"
+{
+	"appid"		"1145350"
+	"name"		"Hades II"
+	"StateFlags"		"6"
+	"LastPlayed"		"1759385954"
+	"SizeOnDisk"		"10497069117"
+}
+"#;
+        let meta = parse_appmanifest_meta(text).unwrap();
+        assert_eq!(meta.appid, 1145350);
+        assert_eq!(meta.name, "Hades II");
+        assert_eq!(meta.last_played_unix, Some(1_759_385_954));
+        assert_eq!(meta.size_bytes, Some(10_497_069_117));
+        assert!(meta.update_required);
+    }
+
+    #[test]
     fn parse_appmanifest_installdir_reads() {
         let text = r#"
 "AppState"
@@ -327,6 +754,132 @@ mod tests {
             parse_appmanifest_installdir(text).as_deref(),
             Some("dota 2 beta")
         );
+    }
+
+    #[test]
+    fn parse_localconfig_apps_reads_playtime() {
+        let text = r#"
+"UserLocalConfigStore"
+{
+	"Software"
+	{
+		"Valve"
+		{
+			"Steam"
+			{
+				"apps"
+				{
+					"730"
+					{
+						"LastPlayed"		"1714533943"
+						"Playtime"		"4902"
+					}
+					"570"
+					{
+						"LastPlayed"		"1630653656"
+						"Playtime"		"1149"
+					}
+				}
+			}
+		}
+	}
+}
+"#;
+        let apps = parse_localconfig_apps(text);
+        assert_eq!(apps.get(&730).unwrap().playtime_minutes, Some(4902));
+        assert_eq!(
+            apps.get(&730).unwrap().last_played_unix,
+            Some(1_714_533_943)
+        );
+        assert_eq!(apps.get(&570).unwrap().playtime_minutes, Some(1149));
+    }
+
+    #[test]
+    fn account_id_from_steam_id64_math() {
+        assert_eq!(
+            account_id_from_steam_id64(76_561_198_095_830_057),
+            Some(135_564_329)
+        );
+    }
+
+    #[test]
+    fn most_recent_account_prefers_flag_then_timestamp() {
+        let text = r#"
+"users"
+{
+	"76561198000000001"
+	{
+		"Timestamp"		"100"
+		"MostRecent"		"0"
+	}
+	"76561198095830057"
+	{
+		"Timestamp"		"50"
+		"MostRecent"		"1"
+	}
+}
+"#;
+        assert_eq!(most_recent_account_id(text), Some(135_564_329));
+
+        let by_ts = r#"
+"users"
+{
+	"76561198000000001"
+	{
+		"Timestamp"		"100"
+	}
+	"76561198095830057"
+	{
+		"Timestamp"		"200"
+	}
+}
+"#;
+        assert_eq!(most_recent_account_id(by_ts), Some(135_564_329));
+    }
+
+    #[test]
+    fn browse_subtitle_formats_parts() {
+        let game = SteamGame {
+            appid: 730,
+            name: "Counter-Strike 2".into(),
+            icon_path: None,
+            backdrop_path: None,
+            playtime_minutes: Some(4902),
+            last_played_unix: Some(1_759_385_954),
+            size_bytes: Some(10_497_069_117),
+            update_required: true,
+        };
+        let sub = browse_subtitle(&game);
+        assert!(sub.starts_with("81 h · 10.5 GB · "), "{sub}");
+        assert!(sub.ends_with(" · Update required"), "{sub}");
+        assert!(sub.contains(" 202"), "{sub}");
+
+        let empty = SteamGame {
+            appid: 1,
+            name: "X".into(),
+            icon_path: None,
+            backdrop_path: None,
+            playtime_minutes: None,
+            last_played_unix: None,
+            size_bytes: None,
+            update_required: false,
+        };
+        assert_eq!(browse_subtitle(&empty), "Steam");
+
+        let mins = SteamGame {
+            playtime_minutes: Some(13),
+            size_bytes: Some(512_000),
+            ..empty
+        };
+        assert_eq!(browse_subtitle(&mins), "13 min · 1 MB");
+    }
+
+    #[test]
+    fn ymd_from_unix_days_known_dates() {
+        // 2025-10-02 UTC
+        assert_eq!(ymd_from_unix_days(20_363), Some((2025, 10, 2)));
+        // 1970-01-01
+        assert_eq!(ymd_from_unix_days(0), Some((1970, 1, 1)));
     }
 
     #[test]

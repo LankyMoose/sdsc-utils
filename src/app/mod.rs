@@ -2037,6 +2037,19 @@ impl App {
                     .unwrap_or_else(|| format!("Steam {appid}")),
                 crate::games::GameEntry::Manual { title, .. } => title.clone(),
             },
+            |entry| {
+                let catalog_ms = self.games.last_played(entry).unwrap_or(0);
+                let steam_ms = match entry {
+                    crate::games::GameEntry::Steam { appid } => steam_by_id
+                        .get(appid)
+                        .and_then(|g| g.last_played_unix)
+                        .map(|secs| secs.saturating_mul(1000))
+                        .unwrap_or(0),
+                    crate::games::GameEntry::Manual { .. } => 0,
+                };
+                let ms = catalog_ms.max(steam_ms);
+                (ms > 0).then_some(ms)
+            },
         )
     }
 
