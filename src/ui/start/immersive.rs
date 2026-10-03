@@ -635,6 +635,7 @@ fn dock_eta_reveal(dock_progress: f32) -> f32 {
     ((dock_progress.clamp(0.0, 1.0) - 0.2) / 0.8).clamp(0.0, 1.0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dock_controller_row<'a>(
     row: &'a StartControllerRow,
     spectrum: &BatterySpectrum,
