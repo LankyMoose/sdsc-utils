@@ -42,9 +42,10 @@ use crate::ui::configure::{
     ConfigureState, NotificationSetting, PadInputPanel, Section,
 };
 use crate::ui::layout::{
-    ToastPlacement, TrayAnchor, hide_toast, invalidate_toast, overlay_platform_specific,
-    popup_position, raise_window_topmost, remount_toast_surface, set_toast_topmost,
-    show_toast_without_activate, slide_y, toast_placement, window_platform_specific,
+    MonitorCover, ToastPlacement, TrayAnchor, hide_toast, invalidate_toast,
+    overlay_platform_specific, popup_position, primary_monitor_cover, raise_window_topmost,
+    remount_toast_surface, set_toast_topmost, show_toast_without_activate, slide_y,
+    toast_placement, window_platform_specific,
 };
 use crate::ui::popup::{self as popup_view, ControllerRow, PopupMessage};
 use crate::ui::start::gesture::{self, GestureRecorder};
@@ -52,6 +53,7 @@ use crate::ui::start::input::{
     self as start_input, CrossHold, FaceHeld, GestureDetectorBank, GestureRecordLatch, NavAction,
     NavLogSnapshot, NavSource, PadNavBank,
 };
+use crate::ui::start::mode::{self as start_mode, StartPresentation};
 use crate::ui::start::view::{self as start_view, ReplaceConfirm, StartMessage, StartSlide};
 use crate::ui::theme;
 use crate::ui::toast::ToastMessage;
@@ -220,6 +222,8 @@ pub struct App {
     /// False until Start is revealed and ready — blocks pad nav / sounds early.
     start_nav_ready: bool,
     start_state: start_view::State,
+    /// Monitor covered while immersive (used to center compact on demote).
+    start_monitor_cover: Option<MonitorCover>,
     /// True while an rfd picker is open from the start screen (suppress unfocus-close).
     start_file_dialog_open: bool,
     /// After hide / connect-reveal: ignore reopen until the chord is fully released.
@@ -417,6 +421,7 @@ impl App {
             start_visible: false,
             start_nav_ready: false,
             start_state: start_view::State::default(),
+            start_monitor_cover: None,
             start_file_dialog_open: false,
             reopen_needs_chord_release: false,
             start_revealed_at: None,
@@ -1384,6 +1389,7 @@ impl App {
             analytics_enabled: self.session.prefs.analytics_enabled,
             lightbar_enabled: self.session.prefs.lightbar_enabled,
             start_screen_enabled: self.session.prefs.start_screen_enabled,
+            start_screen_immersive: self.session.prefs.start_screen_immersive,
             start_screen_gesture: self.session.prefs.start_screen_gesture.clone(),
             start_screen_sounds_enabled: self.session.prefs.start_screen_sounds_enabled,
             start_screen_sound_volume: self.session.prefs.start_screen_sound_volume,
@@ -1554,6 +1560,11 @@ impl App {
                         return self.close_start_screen();
                     }
                 }
+                Task::none()
+            }
+            ConfigureMessage::SetStartScreenImmersive(enabled) => {
+                self.session.prefs.start_screen_immersive = enabled;
+                self.session.prefs.save();
                 Task::none()
             }
             ConfigureMessage::SetStartScreenSounds(enabled) => {
@@ -2422,11 +2433,37 @@ impl App {
             return Task::none();
         }
 
+        let immersive = matches!(
+            start_mode::on_open(self.session.prefs.start_screen_immersive),
+            start_mode::ImmersiveTransition::OpenImmersive
+        );
+        self.start_state.immersive = immersive;
+        let (size, position) = if immersive {
+            let cover = primary_monitor_cover().unwrap_or(MonitorCover {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            });
+            self.start_monitor_cover = Some(cover);
+            crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
+            (cover.size(), window::Position::Specific(cover.origin()))
+        } else {
+            self.start_monitor_cover = None;
+            (
+                Size::new(start_view::WIDTH, start_view::HEIGHT),
+                window::Position::Centered,
+            )
+        };
+
         self.start_nav_ready = false;
-        crate::controller::hid::diag::diag_info("ui-diag: start cold open");
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start cold open immersive={}",
+            u8::from(immersive)
+        ));
         let (id, open) = window::open(window::Settings {
-            size: Size::new(start_view::WIDTH, start_view::HEIGHT),
-            position: window::Position::Centered,
+            size,
+            position,
             visible: true,
             resizable: false,
             decorations: false,
@@ -2442,6 +2479,65 @@ impl App {
         self.session.start_auto_open_pending = false;
         crate::platform::wgpu_diag::note_start_open();
         Task::batch([badge, open.map(Message::StartOpened)])
+    }
+
+    fn start_presentation(&self) -> StartPresentation {
+        if self.start_state.immersive {
+            StartPresentation::Immersive
+        } else {
+            StartPresentation::Compact
+        }
+    }
+
+    fn enter_start_immersive(&mut self) -> Task<Message> {
+        let Some(id) = self.start_window.filter(|_| self.start_visible) else {
+            return Task::none();
+        };
+        if self.start_state.immersive {
+            return Task::none();
+        }
+        let cover = primary_monitor_cover().unwrap_or(MonitorCover {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        });
+        self.start_monitor_cover = Some(cover);
+        self.start_state.immersive = true;
+        self.reopen_needs_chord_release = true;
+        self.consume_reopen_gesture_chord();
+        crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
+        window::resize(id, cover.size())
+            .chain(window::move_to(id, cover.origin()))
+            .chain(window::gain_focus(id))
+            .chain(raise_window_topmost(id))
+    }
+
+    fn leave_start_immersive(&mut self) -> Task<Message> {
+        let Some(id) = self.start_window.filter(|_| self.start_visible) else {
+            return Task::none();
+        };
+        if !self.start_state.immersive {
+            return Task::none();
+        }
+        self.start_state.immersive = false;
+        self.reopen_needs_chord_release = true;
+        self.consume_reopen_gesture_chord();
+        crate::controller::hid::diag::diag_info("ui-diag: start immersive leave");
+        let size = Size::new(start_view::WIDTH, start_view::HEIGHT);
+        let position = self
+            .start_monitor_cover
+            .or_else(primary_monitor_cover)
+            .map(|cover| cover.center_for(size))
+            .unwrap_or(Point::new(
+                ((1920.0 - size.width) / 2.0).max(0.0),
+                ((1080.0 - size.height) / 2.0).max(0.0),
+            ));
+        self.start_monitor_cover = None;
+        window::resize(id, size)
+            .chain(window::move_to(id, position))
+            .chain(window::gain_focus(id))
+            .chain(raise_window_topmost(id))
     }
 
     /// Mark the live reopen chord as already matched so a sticky hold cannot fire.
@@ -2474,6 +2570,8 @@ impl App {
         self.sync_client_input_hot();
         self.start_nav_ready = false;
         self.start_revealed_at = None;
+        self.start_state.immersive = false;
+        self.start_monitor_cover = None;
         self.reopen_needs_chord_release = true;
         self.haptic_pad_serial = None;
         if self.client_mode {
@@ -2575,7 +2673,11 @@ impl App {
                     }
                 } else if self.launch_selected() {
                     self.play_start_cue(UiSoundKind::Action);
-                    scroll
+                    if self.start_state.immersive {
+                        scroll.chain(self.close_start_screen())
+                    } else {
+                        scroll
+                    }
                 } else {
                     scroll
                 }
@@ -2620,7 +2722,10 @@ impl App {
                     self.cancel_start_edit()
                 } else if self.start_visible {
                     self.play_start_cue(UiSoundKind::Action);
-                    self.close_start_screen()
+                    match start_mode::on_cancel(self.start_presentation()) {
+                        start_mode::ImmersiveTransition::Demote => self.leave_start_immersive(),
+                        _ => self.close_start_screen(),
+                    }
                 } else {
                     Task::none()
                 }
@@ -3030,6 +3135,9 @@ impl App {
             StartSlide::Games => {
                 if self.launch_selected() {
                     self.play_start_cue(UiSoundKind::Action);
+                    if self.start_state.immersive {
+                        return self.close_start_screen();
+                    }
                 }
                 Task::none()
             }
@@ -3058,7 +3166,9 @@ impl App {
         self.start_state.cross_progress = 0.0;
         self.close_running_game();
         self.start_state.game_selected = confirm.next_index;
-        let _ = self.launch_selected();
+        if self.launch_selected() && self.start_state.immersive {
+            return self.close_start_screen();
+        }
         Task::none()
     }
 
@@ -3260,6 +3370,11 @@ impl App {
 
     fn handle_start_nav_readings(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
         self.nav_missing_warned = false;
+
+        // Compact → immersive via a second reopen-chord press (service only listens when closed).
+        if let Some(promote) = self.try_promote_immersive_from_gesture(readings) {
+            return promote;
+        }
 
         let now = Instant::now();
         let animating = self.start_state.animating();
@@ -3520,6 +3635,41 @@ impl App {
             self.open_start_screen()
         } else {
             Task::none()
+        }
+    }
+
+    /// Rising-edge reopen chord while compact Start is open → enter immersive.
+    fn try_promote_immersive_from_gesture(
+        &mut self,
+        readings: &[start_input::NavReading],
+    ) -> Option<Task<Message>> {
+        if !self.start_visible || readings.is_empty() {
+            return None;
+        }
+        if self.start_state.overlay_blocking() {
+            return None;
+        }
+        let required = &self.session.prefs.start_screen_gesture;
+        if required.is_empty() || start_mode::chord_is_circle_only(required) {
+            return None;
+        }
+        if self.reopen_needs_chord_release {
+            if chord_held_on_any_pad(required, readings) {
+                return None;
+            }
+            self.reopen_needs_chord_release = false;
+        }
+        if !self.gesture_detectors.update(required, readings) {
+            return None;
+        }
+        match start_mode::on_reopen_chord(self.start_presentation()) {
+            start_mode::ImmersiveTransition::Promote => {
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: reopen gesture promote immersive",
+                );
+                Some(self.enter_start_immersive())
+            }
+            _ => None,
         }
     }
 

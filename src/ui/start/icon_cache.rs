@@ -13,6 +13,9 @@ use std::sync::{LazyLock, Mutex};
 /// Display cell is 48×72; upload at 2× for Cover scaling.
 pub const CACHE_W: u32 = 96;
 pub const CACHE_H: u32 = 144;
+/// Immersive hero capsule; upload at this size for Cover scaling (~2× a 160×240 cell).
+pub const HERO_W: u32 = 320;
+pub const HERO_H: u32 = 480;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CacheKey {
@@ -20,6 +23,10 @@ enum CacheKey {
     File(PathBuf),
     /// Shell-extracted icon for an executable / shortcut target.
     Shell(PathBuf),
+    /// Larger raster for the immersive selected-game capsule.
+    HeroFile(PathBuf),
+    /// Larger shell extract for immersive manual shortcuts.
+    HeroShell(PathBuf),
 }
 
 static CACHE: LazyLock<Mutex<HashMap<CacheKey, Option<Handle>>>> =
@@ -57,7 +64,23 @@ pub fn handle_for_path_warn(path: &Path) -> Option<Handle> {
 
 /// Cached handle for a shell-extracted icon (exe / lnk target).
 pub fn handle_for_shell(path: &Path) -> Option<Handle> {
-    lookup(CacheKey::Shell(path.to_path_buf()), || decode_shell(path))
+    lookup(CacheKey::Shell(path.to_path_buf()), || {
+        decode_shell(path, CACHE_H)
+    })
+}
+
+/// Immersive hero handle for a raster path (selected game + neighbors only).
+pub fn hero_for_path(path: &Path) -> Option<Handle> {
+    lookup(CacheKey::HeroFile(path.to_path_buf()), || {
+        decode_file_sized(path, HERO_W, HERO_H, false)
+    })
+}
+
+/// Immersive hero handle for a shell-extracted icon.
+pub fn hero_for_shell(path: &Path) -> Option<Handle> {
+    lookup(CacheKey::HeroShell(path.to_path_buf()), || {
+        decode_shell(path, HERO_H)
+    })
 }
 
 /// Warm the cache for Steam library paths (call from a blocking worker).
@@ -90,6 +113,15 @@ fn lookup(key: CacheKey, load: impl FnOnce() -> Option<(u32, u32, Vec<u8>)>) -> 
 }
 
 fn decode_file(path: &Path, warn_on_fail: bool) -> Option<(u32, u32, Vec<u8>)> {
+    decode_file_sized(path, CACHE_W, CACHE_H, warn_on_fail)
+}
+
+fn decode_file_sized(
+    path: &Path,
+    max_w: u32,
+    max_h: u32,
+    warn_on_fail: bool,
+) -> Option<(u32, u32, Vec<u8>)> {
     let img = match image::open(path) {
         Ok(img) => img,
         Err(err) => {
@@ -103,7 +135,7 @@ fn decode_file(path: &Path, warn_on_fail: bool) -> Option<(u32, u32, Vec<u8>)> {
         }
     };
     let (src_w, src_h) = (img.width(), img.height());
-    let (dst_w, dst_h) = fit_within(src_w, src_h, CACHE_W, CACHE_H);
+    let (dst_w, dst_h) = fit_within(src_w, src_h, max_w, max_h);
     let rgba = if dst_w == src_w && dst_h == src_h {
         img.to_rgba8()
     } else {
@@ -111,7 +143,7 @@ fn decode_file(path: &Path, warn_on_fail: bool) -> Option<(u32, u32, Vec<u8>)> {
             .to_rgba8()
     };
     crate::controller::hid::diag::diag_info(format!(
-        "ui-diag: icon handle path={} src={src_w}x{src_h} dst={}x{}",
+        "ui-diag: icon handle path={} src={src_w}x{src_h} dst={}x{} max={max_w}x{max_h}",
         path.display(),
         rgba.width(),
         rgba.height()
@@ -119,10 +151,10 @@ fn decode_file(path: &Path, warn_on_fail: bool) -> Option<(u32, u32, Vec<u8>)> {
     Some((rgba.width(), rgba.height(), rgba.into_raw()))
 }
 
-fn decode_shell(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
-    let (width, height, pixels) = crate::platform::file_icon::rgba_for_path(path, CACHE_H)?;
+fn decode_shell(path: &Path, size: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let (width, height, pixels) = crate::platform::file_icon::rgba_for_path(path, size)?;
     crate::controller::hid::diag::diag_info(format!(
-        "ui-diag: icon handle shell={} src={width}x{height} dst={width}x{height}",
+        "ui-diag: icon handle shell={} src={width}x{height} dst={width}x{height} size={size}",
         path.display()
     ));
     Some((width, height, pixels))
@@ -136,6 +168,11 @@ mod tests {
     #[test]
     fn fit_600x900_into_cache_cell() {
         assert_eq!(fit_within(600, 900, CACHE_W, CACHE_H), (96, 144));
+    }
+
+    #[test]
+    fn fit_600x900_into_hero_cell() {
+        assert_eq!(fit_within(600, 900, HERO_W, HERO_H), (320, 480));
     }
 
     #[test]

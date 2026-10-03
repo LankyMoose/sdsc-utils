@@ -1,5 +1,7 @@
 pub mod carousel;
 pub mod gesture;
 pub mod icon_cache;
+pub mod immersive;
 pub mod input;
+pub mod mode;
 pub mod view;

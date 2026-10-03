@@ -336,3 +336,9 @@ While Start / pad-input is hot, **do not** run exclusive battery `Poll` (`drop_a
 Cold (tray idle): classic timed `Poll` unchanged.
 
 Debug grep: `service: hot path waiting for live battery sample`, `service: hot lightbar connect`, `service: hot lightbar color`, `hid-diag: sample short`.
+
+## Start immersive mode
+
+Compact Start (640×500) can promote to a borderless primary-monitor cover. Pref `start_screen_immersive` cold-opens immersive; a second reopen-chord press promotes while compact; Circle/Escape demotes. Successful launch while immersive closes Start so a topmost cover cannot sit above the game.
+
+Debug grep: `ui-diag: start immersive enter`, `ui-diag: start immersive leave`, `ui-diag: reopen gesture promote immersive`, `ui-diag: start cold open immersive=`.

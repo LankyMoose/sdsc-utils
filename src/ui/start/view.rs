@@ -114,6 +114,13 @@ pub enum StartMessage {
 #[derive(Debug, Clone)]
 pub struct StartIcon(pub iced::widget::image::Handle);
 
+/// Where to load list / hero art for a start-screen game row.
+#[derive(Debug, Clone)]
+pub enum IconSource {
+    File(PathBuf),
+    Shell(PathBuf),
+}
+
 #[derive(Debug, Clone)]
 pub struct StartRow {
     pub title: String,
@@ -122,6 +129,8 @@ pub struct StartRow {
     pub args: String,
     pub play_key: String,
     pub icon: Option<StartIcon>,
+    /// Path used for immersive hero art (selected + neighbors only).
+    pub icon_source: Option<IconSource>,
     /// Set in edit mode so Cross/click toggles membership or removes a manual.
     pub edit: Option<EditRow>,
     /// Steam catalog still scanning — paint empty well + muted bars, not AppID text.
@@ -144,6 +153,7 @@ impl StartRow {
         match entry {
             GameEntry::Steam { appid } => {
                 if let Some(game) = steam_by_id.get(appid) {
+                    let icon_source = steam_icon_source(game);
                     Self {
                         title: game.name.clone(),
                         subtitle: Some(format!("Steam · {appid}")),
@@ -151,6 +161,7 @@ impl StartRow {
                         args: String::new(),
                         play_key: entry.play_key(),
                         icon: steam_icon(game),
+                        icon_source,
                         edit: None,
                         skeleton: false,
                     }
@@ -162,6 +173,7 @@ impl StartRow {
                         args: String::new(),
                         play_key: entry.play_key(),
                         icon: None,
+                        icon_source: None,
                         edit: None,
                         skeleton: true,
                     }
@@ -173,6 +185,7 @@ impl StartRow {
                         args: String::new(),
                         play_key: entry.play_key(),
                         icon: None,
+                        icon_source: None,
                         edit: None,
                         skeleton: false,
                     }
@@ -184,20 +197,25 @@ impl StartRow {
                 args,
                 icon,
                 ..
-            } => Self {
-                title: title.clone(),
-                subtitle: Some(target.clone()),
-                target: target.clone(),
-                args: args.clone(),
-                play_key: entry.play_key(),
-                icon: manual_icon(target, icon.as_deref()),
-                edit: None,
-                skeleton: false,
-            },
+            } => {
+                let icon_source = manual_icon_source(target, icon.as_deref());
+                Self {
+                    title: title.clone(),
+                    subtitle: Some(target.clone()),
+                    target: target.clone(),
+                    args: args.clone(),
+                    play_key: entry.play_key(),
+                    icon: manual_icon(target, icon.as_deref()),
+                    icon_source,
+                    edit: None,
+                    skeleton: false,
+                }
+            }
         }
     }
 
     pub fn steam_edit(game: &SteamGame, in_catalog: bool) -> Self {
+        let icon_source = steam_icon_source(game);
         Self {
             title: game.name.clone(),
             subtitle: Some(format!("Steam · {}", game.appid)),
@@ -205,6 +223,7 @@ impl StartRow {
             args: String::new(),
             play_key: format!("steam:{}", game.appid),
             icon: steam_icon(game),
+            icon_source,
             edit: Some(EditRow::Steam {
                 appid: game.appid,
                 in_catalog,
@@ -224,6 +243,7 @@ impl StartRow {
         else {
             return None;
         };
+        let icon_source = manual_icon_source(target, icon.as_deref());
         Some(Self {
             title: title.clone(),
             subtitle: Some(target.clone()),
@@ -231,9 +251,20 @@ impl StartRow {
             args: args.clone(),
             play_key: entry.play_key(),
             icon: manual_icon(target, icon.as_deref()),
+            icon_source,
             edit: Some(EditRow::Manual { id: id.clone() }),
             skeleton: false,
         })
+    }
+
+    /// Immersive hero art for this row (cached; miss falls back to list icon).
+    pub fn hero_icon(&self) -> Option<StartIcon> {
+        match &self.icon_source {
+            Some(IconSource::File(path)) => icon_cache::hero_for_path(path).map(StartIcon),
+            Some(IconSource::Shell(path)) => icon_cache::hero_for_shell(path).map(StartIcon),
+            None => None,
+        }
+        .or_else(|| self.icon.clone())
     }
 
     pub fn in_catalog(&self) -> bool {
@@ -245,11 +276,28 @@ impl StartRow {
     }
 }
 
+fn steam_icon_source(game: &SteamGame) -> Option<IconSource> {
+    game.icon_path.as_ref().map(|p| IconSource::File(p.clone()))
+}
+
 fn steam_icon(game: &SteamGame) -> Option<StartIcon> {
     game.icon_path
         .as_ref()
         .and_then(|p| icon_cache::handle_for_path(p))
         .map(StartIcon)
+}
+
+fn manual_icon_source(target: &str, custom: Option<&str>) -> Option<IconSource> {
+    if let Some(path) = custom.filter(|p| !p.is_empty()) {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(IconSource::File(path));
+        }
+    }
+    if target.starts_with("steam://") {
+        return None;
+    }
+    Some(IconSource::Shell(PathBuf::from(target)))
 }
 
 fn manual_icon(target: &str, custom: Option<&str>) -> Option<StartIcon> {
@@ -378,6 +426,8 @@ impl ManualAddDraft {
 #[derive(Debug, Clone)]
 pub struct State {
     pub slide: StartSlide,
+    /// Fullscreen console presentation (same data as compact).
+    pub immersive: bool,
     pub game_selected: usize,
     pub rows: Vec<StartRow>,
     pub controller_selected: usize,
@@ -434,6 +484,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             slide: StartSlide::Games,
+            immersive: false,
             game_selected: 0,
             rows: Vec::new(),
             controller_selected: 0,
@@ -667,7 +718,7 @@ impl State {
         }
     }
 
-    fn ring_flash_white(&self, serial: &str) -> bool {
+    pub(crate) fn ring_flash_white(&self, serial: &str) -> bool {
         self.identify_flash.as_ref().is_some_and(|flash| {
             flash.serial == serial
                 && lightbar::identify_flash_is_white(flash.started, Instant::now()) == Some(true)
@@ -829,7 +880,7 @@ impl State {
     }
 
     /// 0 = fully on Games, 1 = fully on Controllers (follows the carousel ease).
-    fn slide_progress(&self, now: Instant) -> f32 {
+    pub(crate) fn slide_progress(&self, now: Instant) -> f32 {
         (self.slide_scroll_x(now) / PANE_W).clamp(0.0, 1.0)
     }
 }
@@ -959,6 +1010,10 @@ pub fn view<'a>(
     spectrum: &BatterySpectrum,
     now: Instant,
 ) -> Element<'a, StartMessage> {
+    if state.immersive {
+        return crate::ui::start::immersive::view(state, spectrum, now);
+    }
+
     let header = slide_header(state.slide_progress(now));
 
     let body = if state.manual_add.is_some() {
@@ -969,7 +1024,7 @@ pub fn view<'a>(
         carousel_body(state, spectrum, now)
     };
 
-    let hint = footer_hint(state);
+    let hint = footer_hint(state, false);
     #[cfg(debug_assertions)]
     let diag = diag_report_bar();
     #[cfg(not(debug_assertions))]
@@ -1027,7 +1082,7 @@ fn diag_report_bar() -> Element<'static, StartMessage> {
 }
 
 /// Header titles and L2/R2 cues interpolate with carousel progress (0 = Games, 1 = Controllers).
-fn slide_header(progress: f32) -> Element<'static, StartMessage> {
+pub(crate) fn slide_header(progress: f32) -> Element<'static, StartMessage> {
     let games_t = progress;
     let controllers_t = 1.0 - progress;
 
@@ -1223,7 +1278,7 @@ fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element
         .into()
 }
 
-fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
+pub(crate) fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
     let Some(draft) = state.manual_add.as_ref() else {
         return space().into();
     };
@@ -1341,7 +1396,7 @@ fn manual_icon_placeholder() -> Element<'static, StartMessage> {
         .into()
 }
 
-fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
+pub(crate) fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
     let Some(confirm) = state.replace_confirm.as_ref() else {
         return space().into();
     };
@@ -1465,7 +1520,7 @@ impl FacePressAnim {
     }
 }
 
-fn footer_hint(state: &State) -> Element<'_, StartMessage> {
+pub(crate) fn footer_hint(state: &State, immersive: bool) -> Element<'_, StartMessage> {
     if state.manual_add.is_some() {
         let label = if state.manual_add.as_ref().is_some_and(|d| d.is_edit()) {
             "Save"
@@ -1491,6 +1546,14 @@ fn footer_hint(state: &State) -> Element<'_, StartMessage> {
         ]));
     }
 
+    let circle_label = if state.editing {
+        "Cancel"
+    } else if immersive {
+        "Back"
+    } else {
+        "Close"
+    };
+
     let cluster: Element<'_, StartMessage> = match state.slide {
         StartSlide::Games => {
             let hints = [
@@ -1502,7 +1565,7 @@ fn footer_hint(state: &State) -> Element<'_, StartMessage> {
                 ),
                 face_hint(
                     FaceButton::Circle,
-                    if state.editing { "Cancel" } else { "Close" },
+                    circle_label,
                     state.held,
                     state.press_anim,
                 ),
@@ -1557,7 +1620,7 @@ fn footer_hint(state: &State) -> Element<'_, StartMessage> {
             ),
             action_cluster(&[face_hint(
                 FaceButton::Circle,
-                "Close",
+                circle_label,
                 state.held,
                 state.press_anim,
             )]),

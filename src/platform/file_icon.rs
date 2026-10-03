@@ -7,14 +7,24 @@ use std::sync::{LazyLock, Mutex};
 /// Cached RGBA pixels for a filesystem path (width × height × 4).
 type IconRgba = (u32, u32, Vec<u8>);
 
-static CACHE: LazyLock<Mutex<HashMap<PathBuf, Option<IconRgba>>>> =
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    path: PathBuf,
+    size: u32,
+}
+
+static CACHE: LazyLock<Mutex<HashMap<CacheKey, Option<IconRgba>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Return a square RGBA icon for `path`, or `None` if extraction fails.
 ///
 /// Results are cached (including failures) so start-screen refreshes stay cheap.
+/// Cache keys include `size` so list and hero tiers do not collide.
 pub fn rgba_for_path(path: &Path, size: u32) -> Option<(u32, u32, Vec<u8>)> {
-    let key = path.to_path_buf();
+    let key = CacheKey {
+        path: path.to_path_buf(),
+        size,
+    };
     {
         let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = cache.get(&key) {
