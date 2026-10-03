@@ -290,7 +290,9 @@ iced multi-window present starvation: [iced#3108](https://github.com/iced-rs/ice
 
 **Do:** keep toast `HWND_TOPMOST` (above Cursor); raise Start/Settings into the same topmost band *above* the toast (corner toast stays visible beside centered Start); `gain_focus` the interactive window.
 
-Debug grep: `ui-diag: place toast gen=`, `ui-diag: sync toast z-order (toast + raise UI)`.
+**Immersive cover:** the primary-monitor Start HWND occludes the toast HWND (and unowned `rfd` file dialogs). Do **not** raise the toast above Start (present starvation). While immersive, composite the same toast card into the Start window (`Float` overlay at cover-local slide pose). Parent add/edit shortcut file dialogs to the Start HWND via `rfd::FileDialog::set_parent` so the picker opens above the cover.
+
+Debug grep: `ui-diag: place toast gen=`, `ui-diag: sync toast z-order (toast + raise UI)`, `ui-diag: immersive toast composite gen=`, `ui-diag: file dialog parent hwnd=`.
 
 ## Queued toast wrong content (Windows)
 
