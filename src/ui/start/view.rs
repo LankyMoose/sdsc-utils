@@ -140,6 +140,8 @@ pub struct StartRow {
     pub edit: Option<EditRow>,
     /// Steam catalog still scanning — paint empty well + muted bars, not AppID text.
     pub skeleton: bool,
+    /// Steam install has an update pending (`StateFlags` update-required).
+    pub update_required: bool,
 }
 
 /// Edit-mode action for a games-list row.
@@ -150,6 +152,14 @@ pub enum EditRow {
 }
 
 impl StartRow {
+    fn launch_hint_label(&self) -> &'static str {
+        if self.update_required {
+            "Update & launch"
+        } else {
+            "Launch"
+        }
+    }
+
     pub fn from_entry(
         entry: &GameEntry,
         steam_by_id: &HashMap<u32, SteamGame>,
@@ -161,7 +171,7 @@ impl StartRow {
                     let icon_source = steam_icon_source(game);
                     Self {
                         title: game.name.clone(),
-                        subtitle: Some(format!("Steam · {appid}")),
+                        subtitle: Some(crate::games::steam::browse_subtitle(game)),
                         target: crate::games::steam::launch_uri(*appid),
                         args: String::new(),
                         play_key: entry.play_key(),
@@ -170,6 +180,7 @@ impl StartRow {
                         backdrop_path: game.backdrop_path.clone(),
                         edit: None,
                         skeleton: false,
+                        update_required: game.update_required,
                     }
                 } else if steam_scan_pending {
                     Self {
@@ -183,6 +194,7 @@ impl StartRow {
                         backdrop_path: None,
                         edit: None,
                         skeleton: true,
+                        update_required: false,
                     }
                 } else {
                     Self {
@@ -196,6 +208,7 @@ impl StartRow {
                         backdrop_path: None,
                         edit: None,
                         skeleton: false,
+                        update_required: false,
                     }
                 }
             }
@@ -218,6 +231,7 @@ impl StartRow {
                     backdrop_path: None,
                     edit: None,
                     skeleton: false,
+                    update_required: false,
                 }
             }
         }
@@ -227,7 +241,7 @@ impl StartRow {
         let icon_source = steam_icon_source(game);
         Self {
             title: game.name.clone(),
-            subtitle: Some(format!("Steam · {}", game.appid)),
+            subtitle: Some(crate::games::steam::browse_subtitle(game)),
             target: crate::games::steam::launch_uri(game.appid),
             args: String::new(),
             play_key: format!("steam:{}", game.appid),
@@ -239,6 +253,7 @@ impl StartRow {
                 in_catalog,
             }),
             skeleton: false,
+            update_required: game.update_required,
         }
     }
 
@@ -265,6 +280,7 @@ impl StartRow {
             backdrop_path: None,
             edit: Some(EditRow::Manual { id: id.clone() }),
             skeleton: false,
+            update_required: false,
         })
     }
 
@@ -1644,7 +1660,7 @@ pub(crate) fn immersive_game_hints(
     } else {
         actions.push(face_hint(
             FaceButton::Cross,
-            "Launch",
+            row.launch_hint_label(),
             hint.held,
             hint.press_anim,
         ));
@@ -2852,7 +2868,7 @@ fn game_row(
             } else {
                 actions.push(face_hint(
                     FaceButton::Cross,
-                    "Launch",
+                    row.launch_hint_label(),
                     hint.held,
                     hint.press_anim,
                 ));
@@ -3032,12 +3048,18 @@ mod tests {
                 name: "Path of Exile".into(),
                 icon_path: None,
                 backdrop_path: None,
+                playtime_minutes: None,
+                last_played_unix: None,
+                size_bytes: None,
+                update_required: true,
             },
         );
         let row = StartRow::from_entry(&entry, &map, true);
         assert!(!row.skeleton);
         assert_eq!(row.title, "Path of Exile");
-        assert_eq!(row.subtitle.as_deref(), Some("Steam · 238960"));
+        assert_eq!(row.subtitle.as_deref(), Some("Update required"));
+        assert!(row.update_required);
+        assert_eq!(row.launch_hint_label(), "Update & launch");
         assert!(row.icon.is_none());
     }
 
@@ -3117,6 +3139,7 @@ mod tests {
                     backdrop_path: None,
                     edit: None,
                     skeleton: false,
+                    update_required: false,
                 })
                 .collect(),
             game_selected: 3,
