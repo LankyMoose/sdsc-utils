@@ -2582,8 +2582,12 @@ impl App {
         let Some(_id) = self.start_window.filter(|_| self.start_visible) else {
             return Task::none();
         };
-        let Some(_transition) =
-            start_mode::begin_demote(self.start_state.immersive, self.immersive_transition_busy())
+        // EnterImmersive veil is interruptible; HWND resize / ExitImmersive are not.
+        let blocked = start_mode::demote_blocked(
+            self.start_state.transition.is_some(),
+            self.start_state.transition_phase.map(|(p, _)| p),
+        );
+        let Some(_transition) = start_mode::begin_demote(self.start_state.immersive, blocked)
         else {
             return Task::none();
         };
@@ -2881,11 +2885,12 @@ impl App {
                 if index >= self.start_state.rows.len() || index == self.start_state.game_selected {
                     return Task::none();
                 }
-                let prev = self.start_state.game_selected;
+                let prev_game = self.start_state.game_selected;
                 self.start_state.game_selected = index;
                 let mut task = self.scroll_start_selection_into_view();
                 if self.start_state.immersive {
-                    self.start_state.begin_strip_anim(prev, Instant::now());
+                    self.start_state
+                        .begin_strip_anim(prev_game as f32, Instant::now());
                     self.start_state.reset_backdrop_fade();
                     task = task.chain(self.warm_immersive_art_task());
                 }
@@ -2916,7 +2921,8 @@ impl App {
                         && matches!(self.start_state.slide, StartSlide::Games)
                         && self.start_state.game_selected != prev_game
                     {
-                        self.start_state.begin_strip_anim(prev_game, Instant::now());
+                        self.start_state
+                            .begin_strip_anim(prev_game as f32, Instant::now());
                         self.start_state.reset_backdrop_fade();
                         task = task.chain(self.warm_immersive_art_task());
                     }
@@ -2935,7 +2941,8 @@ impl App {
                         && matches!(self.start_state.slide, StartSlide::Games)
                         && self.start_state.game_selected != prev_game
                     {
-                        self.start_state.begin_strip_anim(prev_game, Instant::now());
+                        self.start_state
+                            .begin_strip_anim(prev_game as f32, Instant::now());
                         self.start_state.reset_backdrop_fade();
                         task = task.chain(self.warm_immersive_art_task());
                     }
@@ -2954,6 +2961,18 @@ impl App {
                     self.play_start_cue(UiSoundKind::Action);
                     self.cancel_start_edit()
                 } else if self.start_visible {
+                    // Immersive + dock open: Circle collapses the drawer first (same as L2).
+                    if self.start_state.immersive
+                        && start_mode::dock_collapse_target(self.start_state.dock_expanded)
+                            .is_some()
+                        && self.start_state.request_dock(false, Instant::now())
+                    {
+                        self.play_start_cue(UiSoundKind::Slide);
+                        crate::controller::hid::diag::diag_info(
+                            "ui-diag: start dock collapse (cancel)",
+                        );
+                        return Task::none();
+                    }
                     self.play_start_cue(UiSoundKind::Action);
                     match start_mode::on_cancel(self.start_presentation()) {
                         start_mode::ImmersiveTransition::Demote => self.leave_start_immersive(),

@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 pub const NEIGHBORS: isize = 3;
 pub const VISIBLE: usize = (NEIGHBORS * 2 + 1) as usize;
 pub const STRIP_ANIM_MS: u64 = 200;
+/// Shorter retarget when the strip is already mid-scroll (rapid pad/keyboard steps).
+pub const STRIP_ANIM_CATCHUP_MS: u64 = 110;
 
 /// Capsule art size inside each strip slot (neighbor / base size).
 pub const CENTER_W: f32 = 220.0;

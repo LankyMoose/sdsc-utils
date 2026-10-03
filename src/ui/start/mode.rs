@@ -122,9 +122,25 @@ pub fn begin_promote(immersive: bool, transitioning: bool) -> Option<StartTransi
     }
 }
 
-/// Begin demote only from immersive with no in-flight transition.
-pub fn begin_demote(immersive: bool, transitioning: bool) -> Option<StartTransition> {
-    if !immersive || transitioning {
+/// True when demote must wait (HWND resize / already exiting). [`TransitionPhase::EnterImmersive`] is interruptible.
+pub fn demote_blocked(hwnd_transition: bool, phase: Option<TransitionPhase>) -> bool {
+    if hwnd_transition {
+        return true;
+    }
+    match phase {
+        None | Some(TransitionPhase::EnterImmersive) => false,
+        Some(
+            TransitionPhase::ExitCompact
+            | TransitionPhase::Resizing
+            | TransitionPhase::ExitImmersive
+            | TransitionPhase::EnterCompact,
+        ) => true,
+    }
+}
+
+/// Begin demote from immersive when not [`demote_blocked`].
+pub fn begin_demote(immersive: bool, blocked: bool) -> Option<StartTransition> {
+    if !immersive || blocked {
         None
     } else {
         Some(StartTransition::Demoting)
@@ -333,6 +349,14 @@ mod tests {
         assert_eq!(begin_demote(true, false), Some(StartTransition::Demoting));
         assert_eq!(begin_demote(false, false), None);
         assert_eq!(begin_demote(true, true), None);
+        assert!(!demote_blocked(false, None));
+        assert!(!demote_blocked(
+            false,
+            Some(TransitionPhase::EnterImmersive)
+        ));
+        assert!(demote_blocked(true, Some(TransitionPhase::EnterImmersive)));
+        assert!(demote_blocked(false, Some(TransitionPhase::ExitImmersive)));
+        assert!(demote_blocked(false, Some(TransitionPhase::Resizing)));
         assert!(settle_immersive(StartTransition::Promoting));
         assert!(!settle_immersive(StartTransition::Demoting));
     }

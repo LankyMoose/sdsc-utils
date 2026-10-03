@@ -754,14 +754,14 @@ impl State {
     }
 
     pub fn animating(&self) -> bool {
+        // Strip scroll is retargetable — do not gate pad Up/Down on it.
         self.anim.is_some()
             || (self.immersive && self.dock_anim.is_some())
-            || self.strip_busy()
             || self.transition_phase.is_some()
             || self.transition.is_some()
     }
 
-    /// Immersive strip scroll in flight — blocks further Games Up/Down.
+    /// Immersive strip scroll in flight (visual chase; nav may retarget).
     pub fn strip_busy(&self) -> bool {
         self.immersive && self.strip_anim.is_some()
     }
@@ -849,24 +849,41 @@ impl State {
         self.game_selected as f32
     }
 
-    pub fn begin_strip_anim(&mut self, from_index: usize, now: Instant) {
+    /// Chase selection from the current visual scroll (retargets mid-flight for rapid steps).
+    ///
+    /// `from_visual` is the strip position before `game_selected` changed. When no anim is
+    /// in flight, [`strip_scroll`] would already equal the new selection — so callers must
+    /// pass the previous settled index (or live visual) explicitly.
+    pub fn begin_strip_anim(&mut self, from_visual: f32, now: Instant) {
         let len = self.rows.len() as f32;
         if len < 1.0 {
             self.strip_anim = None;
             return;
         }
+        let catching_up = self.strip_anim.is_some();
+        // Mid-flight: chase from the live eased scroll. Settled: use caller's prior index.
+        let visual = if catching_up {
+            self.strip_scroll(now)
+        } else {
+            from_visual
+        };
         let to = self.game_selected as f32;
-        let delta = crate::ui::start::vstrip::shortest_circular_delta(from_index as f32, to, len);
-        // Animate toward `to` from `to - delta` so wraps are one step (e.g. -1 → 0).
+        let delta = crate::ui::start::vstrip::shortest_circular_delta(visual, to, len);
+        // Animate toward `to` from `to - delta` so wraps are short (e.g. -1 → 0).
         let from = to - delta;
         if delta.abs() < 0.01 {
             self.strip_anim = None;
             return;
         }
+        let duration_ms = if catching_up {
+            crate::ui::start::vstrip::STRIP_ANIM_CATCHUP_MS
+        } else {
+            crate::ui::start::vstrip::STRIP_ANIM_MS
+        };
         self.strip_anim = Some(StripAnim {
             from,
             to,
-            duration_ms: crate::ui::start::vstrip::STRIP_ANIM_MS,
+            duration_ms,
             started: now,
         });
     }
@@ -1245,9 +1262,6 @@ impl State {
         }
         match self.slide {
             StartSlide::Games => {
-                if self.strip_busy() {
-                    return None;
-                }
                 if self.rows.is_empty() {
                     return None;
                 }
@@ -2839,5 +2853,44 @@ mod tests {
         let y = scroll_y_center(1, 20, ROW_HEIGHT, gap, 0.0, 300.0, true).unwrap();
         let expected = (1.0_f32 * stride - (300.0 - ROW_HEIGHT) / 2.0).max(0.0);
         assert!((y - expected).abs() < 0.1);
+    }
+
+    #[test]
+    fn begin_strip_anim_uses_prior_index_when_settled() {
+        let mut state = State::default();
+        state.rows = (0..5)
+            .map(|i| StartRow {
+                title: format!("g{i}"),
+                subtitle: None,
+                target: format!("t{i}"),
+                args: String::new(),
+                play_key: format!("k{i}"),
+                icon: None,
+                icon_source: None,
+                backdrop_path: None,
+                edit: None,
+                skeleton: false,
+            })
+            .collect();
+        let now = Instant::now();
+        // After selection advances, strip_scroll alone would equal `to` — must pass prior index.
+        state.game_selected = 3;
+        state.begin_strip_anim(2.0, now);
+        let anim = state.strip_anim.as_ref().expect("settled step starts anim");
+        assert!((anim.from - 2.0).abs() < 0.01);
+        assert!((anim.to - 3.0).abs() < 0.01);
+        assert_eq!(anim.duration_ms, crate::ui::start::vstrip::STRIP_ANIM_MS);
+
+        // Mid-flight retarget uses live visual, not the stale from_visual hint.
+        let mid = now + Duration::from_millis(crate::ui::start::vstrip::STRIP_ANIM_MS / 2);
+        state.game_selected = 4;
+        state.begin_strip_anim(0.0, mid);
+        let anim = state.strip_anim.as_ref().expect("retarget keeps anim");
+        assert!((anim.to - 4.0).abs() < 0.01);
+        assert!(anim.from > 2.0 && anim.from < 3.0);
+        assert_eq!(
+            anim.duration_ms,
+            crate::ui::start::vstrip::STRIP_ANIM_CATCHUP_MS
+        );
     }
 }
