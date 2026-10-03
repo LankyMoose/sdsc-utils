@@ -80,6 +80,8 @@ impl StartSlide {
 #[derive(Debug, Clone)]
 pub enum StartMessage {
     Launch(usize),
+    /// Immersive strip: select a game without launching.
+    SelectGame(usize),
     SelectController(usize),
     MoveUp,
     MoveDown,
@@ -424,10 +426,30 @@ impl ManualAddDraft {
 }
 
 #[derive(Debug, Clone)]
+struct DockAnim {
+    from: f32,
+    to: f32,
+    duration_ms: u64,
+    started: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct StripAnim {
+    from: f32,
+    to: f32,
+    duration_ms: u64,
+    started: Instant,
+}
+
+#[derive(Debug, Clone)]
 pub struct State {
     pub slide: StartSlide,
     /// Fullscreen console presentation (same data as compact).
     pub immersive: bool,
+    /// HWND resize in flight — paint veil until settled.
+    pub transition: Option<crate::ui::start::mode::StartTransition>,
+    /// Immersive controllers dock target (expanded = Controllers focus).
+    pub dock_expanded: bool,
     pub game_selected: usize,
     pub rows: Vec<StartRow>,
     pub controller_selected: usize,
@@ -458,6 +480,10 @@ pub struct State {
     controllers_scroll_y: f32,
     controllers_viewport_h: f32,
     anim: Option<SlideAnim>,
+    dock_anim: Option<DockAnim>,
+    strip_anim: Option<StripAnim>,
+    /// Seconds for ambient shader time uniform.
+    pub ambient_time: f32,
     /// Ring flash started with the last successful Identify (Controllers slide).
     identify_flash: Option<IdentifyFlash>,
 }
@@ -485,6 +511,8 @@ impl Default for State {
         Self {
             slide: StartSlide::Games,
             immersive: false,
+            transition: None,
+            dock_expanded: false,
             game_selected: 0,
             rows: Vec::new(),
             controller_selected: 0,
@@ -508,6 +536,9 @@ impl Default for State {
             controllers_scroll_y: 0.0,
             controllers_viewport_h: 0.0,
             anim: None,
+            dock_anim: None,
+            strip_anim: None,
+            ambient_time: 0.0,
             identify_flash: None,
         }
     }
@@ -658,6 +689,9 @@ impl State {
     pub fn reset_to_games(&mut self) {
         self.slide = StartSlide::Games;
         self.anim = None;
+        self.dock_anim = None;
+        self.strip_anim = None;
+        self.dock_expanded = false;
         self.replace_confirm = None;
         self.manual_add = None;
         self.triangle_progress = 0.0;
@@ -680,17 +714,110 @@ impl State {
     }
 
     pub fn animating(&self) -> bool {
-        self.anim.is_some()
+        self.anim.is_some() || (self.immersive && self.dock_anim.is_some())
     }
 
     pub fn needs_frames(&self) -> bool {
         self.anim.is_some()
+            || self.dock_anim.is_some()
+            || self.strip_anim.is_some()
+            || self.transition.is_some()
+            || self.immersive
             || self.triangle_progress > 0.0
             || self.cross_progress > 0.0
             || self.replace_confirm.is_some()
             || self.manual_add.is_some()
             || self.hint_anims_need_frames()
             || self.identify_flash_active()
+    }
+
+    /// Immersive dock width progress 0..=1 (eased while animating).
+    pub fn dock_progress(&self, now: Instant) -> f32 {
+        if let Some(anim) = &self.dock_anim {
+            let t = (now.saturating_duration_since(anim.started).as_secs_f32()
+                / (anim.duration_ms.max(1) as f32 / 1000.0))
+                .clamp(0.0, 1.0);
+            let e = window_layout::ease_out_cubic(t);
+            return anim.from + (anim.to - anim.from) * e;
+        }
+        if self.dock_expanded { 1.0 } else { 0.0 }
+    }
+
+    /// Request immersive dock expand/collapse. Syncs [`Self::slide`] for focus/footer.
+    pub fn request_dock(&mut self, expanded: bool, now: Instant) -> bool {
+        let target = if expanded { 1.0 } else { 0.0 };
+        if self
+            .dock_anim
+            .as_ref()
+            .is_some_and(|a| (a.to - target).abs() < 0.01)
+        {
+            return false;
+        }
+        if self.dock_anim.is_none() && self.dock_expanded == expanded {
+            return false;
+        }
+        let from = self.dock_progress(now);
+        self.dock_expanded = expanded;
+        self.slide = if expanded {
+            StartSlide::Controllers
+        } else {
+            StartSlide::Games
+        };
+        if expanded {
+            self.editing = false;
+            self.edit_anchor_play_key = None;
+        }
+        self.replace_confirm = None;
+        self.manual_add = None;
+        self.cross_progress = 0.0;
+        if (from - target).abs() < 0.01 {
+            self.dock_anim = None;
+            return false;
+        }
+        self.dock_anim = Some(DockAnim {
+            from,
+            to: target,
+            duration_ms: SLIDE_ANIM_MS,
+            started: now,
+        });
+        true
+    }
+
+    /// Fractional game index for the immersive vertical strip.
+    pub fn strip_scroll(&self, now: Instant) -> f32 {
+        if let Some(anim) = &self.strip_anim {
+            return crate::ui::start::vstrip::strip_scroll(
+                anim.from,
+                anim.to,
+                anim.started,
+                now,
+                anim.duration_ms,
+            );
+        }
+        self.game_selected as f32
+    }
+
+    pub fn begin_strip_anim(&mut self, from_index: usize, now: Instant) {
+        let to = self.game_selected as f32;
+        let from = from_index as f32;
+        if (from - to).abs() < 0.01 {
+            self.strip_anim = None;
+            return;
+        }
+        self.strip_anim = Some(StripAnim {
+            from,
+            to,
+            duration_ms: crate::ui::start::vstrip::STRIP_ANIM_MS,
+            started: now,
+        });
+    }
+
+    pub fn clear_immersive_session(&mut self) {
+        self.dock_expanded = false;
+        self.dock_anim = None;
+        self.strip_anim = None;
+        self.transition = None;
+        self.ambient_time = 0.0;
     }
 
     /// Start the UI ring flash that mirrors the lightbar Identify pattern.
@@ -773,16 +900,38 @@ impl State {
     }
 
     pub fn tick_anim(&mut self, now: Instant) -> bool {
-        let Some(anim) = self.anim.as_ref() else {
-            return false;
-        };
-        let elapsed = now.saturating_duration_since(anim.started);
-        if elapsed >= Duration::from_millis(anim.duration_ms) {
-            self.slide = anim.to;
-            self.anim = None;
-            return true;
+        let mut busy = false;
+        if let Some(anim) = self.anim.as_ref() {
+            let elapsed = now.saturating_duration_since(anim.started);
+            if elapsed >= Duration::from_millis(anim.duration_ms) {
+                self.slide = anim.to;
+                self.anim = None;
+            } else {
+                busy = true;
+            }
         }
-        true
+        if let Some(anim) = self.dock_anim.as_ref() {
+            let elapsed = now.saturating_duration_since(anim.started);
+            if elapsed >= Duration::from_millis(anim.duration_ms) {
+                self.dock_expanded = anim.to >= 0.5;
+                self.dock_anim = None;
+            } else {
+                busy = true;
+            }
+        }
+        if let Some(anim) = self.strip_anim.as_ref() {
+            let elapsed = now.saturating_duration_since(anim.started);
+            if elapsed >= Duration::from_millis(anim.duration_ms) {
+                self.strip_anim = None;
+            } else {
+                busy = true;
+            }
+        }
+        if self.immersive || self.transition.is_some() {
+            self.ambient_time += 1.0 / 60.0;
+            busy = true;
+        }
+        busy
     }
 
     /// Request a slide target. Interruptible: restarts from the current scroll position.
@@ -1010,6 +1159,9 @@ pub fn view<'a>(
     spectrum: &BatterySpectrum,
     now: Instant,
 ) -> Element<'a, StartMessage> {
+    if state.transition.is_some() {
+        return crate::ui::start::immersive::veil_view(state, now);
+    }
     if state.immersive {
         return crate::ui::start::immersive::view(state, spectrum, now);
     }

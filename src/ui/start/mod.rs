@@ -5,3 +5,4 @@ pub mod immersive;
 pub mod input;
 pub mod mode;
 pub mod view;
+pub mod vstrip;

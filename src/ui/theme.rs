@@ -233,6 +233,34 @@ pub fn content(_theme: &Theme) -> container::Style {
     }
 }
 
+/// Immersive main stage over the ambient shader.
+pub fn immersive_stage(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(alpha(CONTENT, 0.82))),
+        text_color: Some(INK),
+        border: Border {
+            color: alpha(LINE, 0.65),
+            width: 1.0,
+            radius: RADIUS.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Immersive controllers dock panel.
+pub fn immersive_dock(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(alpha(PANEL, 0.92))),
+        text_color: Some(INK),
+        border: Border {
+            color: alpha(LINE, 0.8),
+            width: 1.0,
+            radius: RADIUS.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Configure content area below the title bar.
 pub fn configure_body(theme: &Theme) -> container::Style {
     content(theme)

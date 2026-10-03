@@ -2,73 +2,161 @@
 
 use crate::ui::color::BatterySpectrum;
 use crate::ui::percent_ring;
+use crate::ui::shader::AmbientProgram;
 use crate::ui::start::view::{
     StartControllerRow, StartMessage, StartRow, StartSlide, State, footer_hint, manual_add_view,
-    replace_confirm_view, slide_header,
+    replace_confirm_view,
 };
+use crate::ui::start::vstrip::{self, NEIGHBORS};
 use crate::ui::theme;
 use iced::font::Weight;
-use iced::widget::{button, column, container, row, space, text};
+use iced::widget::{button, column, container, row, shader, space, stack, text};
 use iced::{Alignment, Element, Fill, Font, Length, Padding};
 use std::time::Instant;
 
-const PAD: f32 = 48.0;
-const HERO_W: f32 = 200.0;
-const HERO_H: f32 = 300.0;
-const RAIL_W: f32 = 320.0;
-const RAIL_ROW_H: f32 = 40.0;
-const CONTROLLER_RING: f32 = 160.0;
+const PAD: f32 = 40.0;
+const DOCK_MIN_W: f32 = 80.0;
+const DOCK_MAX_W: f32 = 340.0;
+const DOCK_RING_MIN: f32 = 44.0;
+const DOCK_RING_MAX: f32 = 72.0;
 const MODAL_W: f32 = 640.0;
-const RAIL_NEIGHBORS: isize = 4;
+const CAPSULE_W: f32 = 240.0;
+
+pub fn veil_view(state: &State, now: Instant) -> Element<'_, StartMessage> {
+    let dock = state.dock_progress(now);
+    let program = AmbientProgram::new(state.ambient_time, dock, 1.0);
+    stack![
+        shader(program).width(Fill).height(Fill),
+        container(space())
+            .width(Fill)
+            .height(Fill)
+            .style(theme::root),
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
 
 pub fn view<'a>(
     state: &'a State,
     spectrum: &BatterySpectrum,
     now: Instant,
 ) -> Element<'a, StartMessage> {
-    let header = slide_header(state.slide_progress(now));
+    let dock_p = state.dock_progress(now);
+    let program = AmbientProgram::new(state.ambient_time, dock_p, 0.0);
 
     let body: Element<'_, StartMessage> = if state.manual_add.is_some() {
         modal_card(manual_add_view(state))
     } else if state.replace_confirm.is_some() {
         modal_card(replace_confirm_view(state))
     } else {
-        match state.slide {
-            StartSlide::Games => games_stage(state),
-            StartSlide::Controllers => controllers_stage(state, spectrum),
-        }
+        let stage = games_stage(state, now);
+        let dock = controllers_dock(state, spectrum, dock_p);
+        row![
+            container(stage)
+                .width(Fill)
+                .height(Fill)
+                .padding(Padding {
+                    top: 12.0,
+                    right: 16.0,
+                    bottom: 12.0,
+                    left: PAD,
+                })
+                .style(theme::immersive_stage),
+            dock,
+        ]
+        .spacing(16)
+        .width(Fill)
+        .height(Fill)
+        .into()
     };
 
+    let header = dock_header(dock_p);
     let hint = footer_hint(state, true);
 
-    container(
-        column![
-            container(header).width(Fill).padding(Padding {
-                top: PAD * 0.5,
-                right: PAD,
-                bottom: 0.0,
-                left: PAD,
-            }),
-            container(body).width(Fill).height(Fill).padding(Padding {
-                top: 16.0,
-                right: PAD,
-                bottom: 16.0,
-                left: PAD,
-            }),
-            container(hint).width(Fill).padding(Padding {
-                top: 0.0,
-                right: PAD,
-                bottom: PAD * 0.6,
-                left: PAD,
-            }),
-        ]
-        .width(Fill)
-        .height(Fill),
-    )
+    let chrome = column![
+        container(header).width(Fill).padding(Padding {
+            top: PAD * 0.45,
+            right: PAD,
+            bottom: 0.0,
+            left: PAD,
+        }),
+        container(body).width(Fill).height(Fill).padding(Padding {
+            top: 8.0,
+            right: PAD,
+            bottom: 8.0,
+            left: 0.0,
+        }),
+        container(hint).width(Fill).padding(Padding {
+            top: 0.0,
+            right: PAD,
+            bottom: PAD * 0.55,
+            left: PAD,
+        }),
+    ]
     .width(Fill)
-    .height(Fill)
-    .style(theme::root)
+    .height(Fill);
+
+    stack![shader(program).width(Fill).height(Fill), chrome,]
+        .width(Fill)
+        .height(Fill)
+        .into()
+}
+
+fn dock_header(dock_progress: f32) -> Element<'static, StartMessage> {
+    let games_t = dock_progress;
+    let controllers_t = 1.0 - dock_progress;
+    let left = row![
+        text("L2")
+            .size(13.0)
+            .color(theme::alpha(theme::ACCENT, 0.35 + 0.65 * (1.0 - games_t))),
+        text("Games")
+            .size(lerp(20.0, 15.0, games_t))
+            .color(lerp_color(
+                theme::INK,
+                theme::alpha(theme::MUTED, 0.45),
+                games_t,
+            )),
+    ]
+    .spacing(8)
+    .align_y(Alignment::End);
+
+    let right = row![
+        text("Controllers")
+            .size(lerp(20.0, 15.0, controllers_t))
+            .color(lerp_color(
+                theme::INK,
+                theme::alpha(theme::MUTED, 0.45),
+                controllers_t,
+            )),
+        text("R2").size(13.0).color(theme::alpha(
+            theme::ACCENT,
+            0.35 + 0.65 * (1.0 - controllers_t)
+        )),
+    ]
+    .spacing(8)
+    .align_y(Alignment::End);
+
+    row![
+        container(left).width(Fill).align_x(Alignment::Start),
+        container(right).width(Fill).align_x(Alignment::End),
+    ]
+    .height(Length::Fixed(36.0))
     .into()
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t.clamp(0.0, 1.0)
+}
+
+fn lerp_color(a: iced::Color, b: iced::Color, t: f32) -> iced::Color {
+    let t = t.clamp(0.0, 1.0);
+    iced::Color {
+        r: lerp(a.r, b.r, t),
+        g: lerp(a.g, b.g, t),
+        b: lerp(a.b, b.b, t),
+        a: lerp(a.a, b.a, t),
+    }
 }
 
 fn modal_card(inner: Element<'_, StartMessage>) -> Element<'_, StartMessage> {
@@ -84,30 +172,35 @@ fn modal_card(inner: Element<'_, StartMessage>) -> Element<'_, StartMessage> {
     .into()
 }
 
-fn games_stage(state: &State) -> Element<'_, StartMessage> {
+fn games_stage(state: &State, now: Instant) -> Element<'_, StartMessage> {
     if state.rows.is_empty() {
         return empty_games(state);
     }
 
     let selected = state.game_selected.min(state.rows.len().saturating_sub(1));
-    let row = &state.rows[selected];
-    // Warm hero art for the selection and its immediate neighbors.
     warm_hero_neighbors(&state.rows, selected);
+    let visual = state.strip_scroll(now);
+    let len = state.rows.len() as isize;
 
-    let hero = hero_capsule(row);
-    let title = text(&row.title).size(36.0).color(theme::INK).font(Font {
+    let mut items = Vec::with_capacity(vstrip::VISIBLE);
+    for delta in -NEIGHBORS..=NEIGHBORS {
+        let idx = (selected as isize + delta).rem_euclid(len) as usize;
+        let row = &state.rows[idx];
+        items.push(strip_capsule(row, idx, idx == selected, state.editing));
+    }
+
+    let strip = vstrip::vstrip(visual, selected, items)
+        .width(Length::Fixed(CAPSULE_W + 48.0))
+        .height(Fill);
+
+    let row = &state.rows[selected];
+    let mut details = column![text(&row.title).size(34.0).color(theme::INK).font(Font {
         weight: Weight::Bold,
         ..Font::DEFAULT
-    });
-    let subtitle = row
-        .subtitle
-        .as_ref()
-        .map(|s| text(s.clone()).size(16.0).color(theme::MUTED));
-
-    let mut details = column![hero, space().height(Length::Fixed(20.0)), title].spacing(0);
-    if let Some(sub) = subtitle {
-        details = details.push(space().height(Length::Fixed(8.0)));
-        details = details.push(sub);
+    }),]
+    .spacing(8);
+    if let Some(sub) = row.subtitle.as_ref() {
+        details = details.push(text(sub.clone()).size(15.0).color(theme::MUTED));
     }
     if state.editing {
         let mark = if row.in_catalog() {
@@ -115,28 +208,32 @@ fn games_stage(state: &State) -> Element<'_, StartMessage> {
         } else {
             "Not in library — Cross to add"
         };
-        details = details.push(space().height(Length::Fixed(12.0)));
         details = details.push(text(mark).size(14.0).color(theme::ACCENT));
     } else if state
         .running_target
         .as_ref()
         .is_some_and(|t| t == &row.target)
     {
-        details = details.push(space().height(Length::Fixed(12.0)));
         details = details.push(text("Playing").size(14.0).color(theme::ACCENT));
     }
 
-    let featured = container(details)
-        .width(Fill)
-        .height(Fill)
-        .align_y(Alignment::Center)
-        .align_x(Alignment::Start);
-
-    row![featured, title_rail(&state.rows, selected, state.editing)]
-        .spacing(40)
-        .width(Fill)
-        .height(Fill)
-        .into()
+    row![
+        strip,
+        container(details)
+            .width(Fill)
+            .height(Fill)
+            .align_y(Alignment::Center)
+            .padding(Padding {
+                top: 0.0,
+                right: 12.0,
+                bottom: 0.0,
+                left: 28.0,
+            }),
+    ]
+    .spacing(8)
+    .width(Fill)
+    .height(Fill)
+    .into()
 }
 
 fn empty_games(state: &State) -> Element<'_, StartMessage> {
@@ -158,145 +255,144 @@ fn warm_hero_neighbors(rows: &[StartRow], selected: usize) {
     if len == 0 {
         return;
     }
-    for delta in -1..=1 {
+    for delta in -2..=2 {
         let idx = (selected as isize + delta).rem_euclid(len) as usize;
         let _ = rows[idx].hero_icon();
     }
 }
 
-fn hero_capsule(row: &StartRow) -> Element<'_, StartMessage> {
+fn strip_capsule(
+    row: &StartRow,
+    index: usize,
+    selected: bool,
+    editing: bool,
+) -> Element<'_, StartMessage> {
+    let muted = editing && !row.in_catalog();
     let inner: Element<'_, StartMessage> = if row.skeleton {
         container(space())
-            .width(Length::Fixed(HERO_W))
-            .height(Length::Fixed(HERO_H))
+            .width(Fill)
+            .height(Fill)
             .style(theme::well)
             .into()
     } else {
         match row.hero_icon() {
             Some(icon) => iced::widget::image(icon.0)
-                .width(Length::Fixed(HERO_W))
-                .height(Length::Fixed(HERO_H))
+                .width(Fill)
+                .height(Fill)
                 .content_fit(iced::ContentFit::Cover)
                 .into(),
             None => container(
                 text(row.title.chars().next().unwrap_or('?').to_string())
-                    .size(64.0)
-                    .color(theme::MUTED),
+                    .size(if selected { 56.0 } else { 36.0 })
+                    .color(if muted {
+                        theme::alpha(theme::MUTED, 0.5)
+                    } else {
+                        theme::MUTED
+                    }),
             )
-            .width(Length::Fixed(HERO_W))
-            .height(Length::Fixed(HERO_H))
+            .width(Fill)
+            .height(Fill)
             .style(theme::well)
             .center_x(Fill)
             .center_y(Fill)
             .into(),
         }
     };
-    container(inner)
-        .width(Length::Fixed(HERO_W))
-        .height(Length::Fixed(HERO_H))
-        .into()
-}
 
-fn title_rail(rows: &[StartRow], selected: usize, editing: bool) -> Element<'_, StartMessage> {
-    let len = rows.len() as isize;
-    let mut items = column![].spacing(4).width(Length::Fixed(RAIL_W));
+    let border = if selected {
+        theme::alpha(theme::ACCENT, 0.85)
+    } else {
+        theme::alpha(theme::LINE, 0.5)
+    };
 
-    if len == 0 {
-        return space().into();
-    }
-    for delta in -RAIL_NEIGHBORS..=RAIL_NEIGHBORS {
-        let idx = (selected as isize + delta).rem_euclid(len) as usize;
-        let row = &rows[idx];
-        let is_sel = idx == selected;
-        let muted = editing && !row.in_catalog();
-        let label = if row.skeleton {
-            "…".to_string()
-        } else if row.title.is_empty() {
-            "Untitled".to_string()
-        } else {
-            row.title.clone()
-        };
-        let color = if is_sel {
-            theme::INK
-        } else if muted {
-            theme::alpha(theme::MUTED, 0.4)
-        } else {
-            theme::alpha(theme::MUTED, 0.75)
-        };
-        let size = if is_sel { 20.0 } else { 15.0 };
-        let font = if is_sel {
-            Font {
-                weight: Weight::Bold,
-                ..Font::DEFAULT
-            }
-        } else {
-            Font::DEFAULT
-        };
-        items = items.push(
-            button(
-                text(label)
-                    .size(size)
-                    .color(color)
-                    .font(font)
-                    .wrapping(iced::widget::text::Wrapping::Word),
-            )
-            .padding([8, 12])
-            .width(Fill)
-            .height(Length::Fixed(RAIL_ROW_H))
-            .on_press(StartMessage::Launch(idx))
-            .style(theme::menu_row(is_sel)),
-        );
-    }
-
-    container(items)
-        .width(Length::Fixed(RAIL_W))
-        .height(Fill)
-        .align_y(Alignment::Center)
-        .into()
-}
-
-fn controllers_stage<'a>(
-    state: &'a State,
-    spectrum: &BatterySpectrum,
-) -> Element<'a, StartMessage> {
-    if state.controllers.is_empty() {
-        return container(
-            text("No controllers — connect a DualSense to begin.")
-                .size(22.0)
-                .color(theme::MUTED),
-        )
+    let card = container(inner)
         .width(Fill)
         .height(Fill)
-        .center_x(Fill)
-        .center_y(Fill)
-        .into();
+        .style(move |_theme: &iced::Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(theme::CONTENT)),
+            border: iced::Border {
+                color: border,
+                width: if selected { 2.0 } else { 1.0 },
+                radius: theme::RADIUS.into(),
+            },
+            ..iced::widget::container::Style::default()
+        });
+
+    button(card)
+        .padding(0)
+        .width(Fill)
+        .height(Fill)
+        .on_press(if selected {
+            StartMessage::Launch(index)
+        } else {
+            StartMessage::SelectGame(index)
+        })
+        .style(theme::ghost)
+        .into()
+}
+
+fn controllers_dock<'a>(
+    state: &'a State,
+    spectrum: &BatterySpectrum,
+    dock_progress: f32,
+) -> Element<'a, StartMessage> {
+    let width = lerp(DOCK_MIN_W, DOCK_MAX_W, dock_progress);
+    let expanded = dock_progress > 0.45;
+
+    let connected: Vec<&StartControllerRow> =
+        state.controllers.iter().filter(|c| c.connected).collect();
+    let list: Vec<&StartControllerRow> = if expanded {
+        state.controllers.iter().collect()
+    } else {
+        connected
+    };
+
+    let mut items = column![].spacing(10).width(Fill);
+    if list.is_empty() {
+        items = items.push(
+            text(if expanded { "No controllers" } else { "—" })
+                .size(12.0)
+                .color(theme::DIM),
+        );
+    } else {
+        for (i, row) in state.controllers.iter().enumerate() {
+            if !expanded && !row.connected {
+                continue;
+            }
+            let selected =
+                i == state.controller_selected && matches!(state.slide, StartSlide::Controllers);
+            items = items.push(dock_row(
+                i,
+                row,
+                spectrum,
+                selected,
+                expanded,
+                state.ring_flash_white(&row.serial),
+                dock_progress,
+            ));
+        }
     }
 
-    let selected = state
-        .controller_selected
-        .min(state.controllers.len().saturating_sub(1));
-    let row = &state.controllers[selected];
-    let featured = featured_controller(row, spectrum, state.ring_flash_white(&row.serial));
-    let rail = controller_rail(&state.controllers, selected);
-
-    row![
-        container(featured)
-            .width(Fill)
-            .height(Fill)
-            .align_x(Alignment::Center)
-            .align_y(Alignment::Center),
-        rail,
-    ]
-    .spacing(40)
-    .width(Fill)
+    container(container(items).width(Fill).height(Fill).padding(Padding {
+        top: 16.0,
+        right: 12.0,
+        bottom: 16.0,
+        left: 12.0,
+    }))
+    .width(Length::Fixed(width))
     .height(Fill)
+    .style(theme::immersive_dock)
     .into()
 }
 
-fn featured_controller<'a>(
+fn dock_row<'a>(
+    index: usize,
     row: &'a StartControllerRow,
     spectrum: &BatterySpectrum,
+    selected: bool,
+    expanded: bool,
     flash_white: bool,
+    dock_progress: f32,
 ) -> Element<'a, StartMessage> {
     let ring_color = if flash_white {
         theme::from_rgb(crate::controller::dualsense::lightbar::IDENTIFY_FLASH)
@@ -305,79 +401,49 @@ fn featured_controller<'a>(
     } else {
         theme::DIM
     };
-    let ring =
-        percent_ring::percent_ring(row.percent, ring_color, CONTROLLER_RING, row.eta.clone());
-    let title_color = if row.connected {
-        theme::INK
-    } else {
-        theme::MUTED
-    };
-    let meta_color = if row.low {
-        theme::WARNING
-    } else {
-        theme::MUTED
-    };
+    let ring_size = lerp(DOCK_RING_MIN, DOCK_RING_MAX, dock_progress);
+    let ring = percent_ring::percent_ring(row.percent, ring_color, ring_size, row.eta.clone());
 
-    column![
-        ring,
-        space().height(Length::Fixed(24.0)),
-        text(&row.title).size(32.0).color(title_color).font(Font {
-            weight: Weight::Bold,
-            ..Font::DEFAULT
-        }),
-        space().height(Length::Fixed(8.0)),
-        text(format!("{} · {}", row.connection, row.state))
-            .size(16.0)
-            .color(meta_color),
-    ]
-    .align_x(Alignment::Center)
-    .into()
-}
-
-fn controller_rail(
-    controllers: &[StartControllerRow],
-    selected: usize,
-) -> Element<'_, StartMessage> {
-    let len = controllers.len() as isize;
-    if len == 0 {
-        return space().into();
-    }
-    let mut items = column![].spacing(4).width(Length::Fixed(RAIL_W));
-    for delta in -RAIL_NEIGHBORS..=RAIL_NEIGHBORS {
-        let idx = (selected as isize + delta).rem_euclid(len) as usize;
-        let row = &controllers[idx];
-        let is_sel = idx == selected;
-        let color = if is_sel {
+    let content: Element<'_, StartMessage> = if expanded {
+        let title_color = if row.connected {
             theme::INK
-        } else if row.connected {
-            theme::alpha(theme::MUTED, 0.75)
         } else {
-            theme::alpha(theme::MUTED, 0.4)
+            theme::MUTED
         };
-        items = items.push(
-            button(
-                text(format!("{}  {}%", row.title, row.percent))
-                    .size(if is_sel { 18.0 } else { 14.0 })
-                    .color(color)
-                    .font(if is_sel {
-                        Font {
-                            weight: Weight::Bold,
-                            ..Font::DEFAULT
-                        }
+        let meta = if row.low {
+            theme::WARNING
+        } else {
+            theme::MUTED
+        };
+        row![
+            ring,
+            column![
+                text(&row.title).size(16.0).color(title_color).font(Font {
+                    weight: if selected {
+                        Weight::Bold
                     } else {
-                        Font::DEFAULT
-                    }),
-            )
-            .padding([8, 12])
-            .width(Fill)
-            .height(Length::Fixed(RAIL_ROW_H))
-            .on_press(StartMessage::SelectController(idx))
-            .style(theme::menu_row(is_sel)),
-        );
-    }
-    container(items)
-        .width(Length::Fixed(RAIL_W))
-        .height(Fill)
+                        Weight::Normal
+                    },
+                    ..Font::DEFAULT
+                }),
+                text(format!("{} · {}", row.connection, row.state))
+                    .size(12.0)
+                    .color(meta),
+            ]
+            .spacing(4)
+            .width(Fill),
+        ]
+        .spacing(12)
         .align_y(Alignment::Center)
+        .into()
+    } else {
+        container(ring).center_x(Fill).into()
+    };
+
+    button(content)
+        .padding(if expanded { [8, 8] } else { [4, 4] })
+        .width(Fill)
+        .on_press(StartMessage::SelectController(index))
+        .style(theme::menu_row(selected))
         .into()
 }

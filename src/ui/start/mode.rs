@@ -1,4 +1,4 @@
-//! Pure start-screen presentation transitions (compact ↔ immersive).
+//! Pure start-screen presentation transitions (compact ↔ immersive) and dock focus.
 
 /// Windowed launcher vs fullscreen console stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -17,6 +17,13 @@ pub enum ImmersiveTransition {
     Demote,
     Close,
     Noop,
+}
+
+/// In-flight HWND resize between compact and immersive layouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartTransition {
+    Promoting,
+    Demoting,
 }
 
 /// Cold open / first reopen: prefer immersive when the pref is on.
@@ -47,6 +54,39 @@ pub fn on_cancel(presentation: StartPresentation) -> ImmersiveTransition {
 /// True when the reopen chord is exactly Circle (Cancel owns that button).
 pub fn chord_is_circle_only(gesture: &[crate::domain::gesture::GestureControl]) -> bool {
     matches!(gesture, [crate::domain::gesture::GestureControl::Circle])
+}
+
+/// Begin promote only from compact with no in-flight transition.
+pub fn begin_promote(immersive: bool, transitioning: bool) -> Option<StartTransition> {
+    if immersive || transitioning {
+        None
+    } else {
+        Some(StartTransition::Promoting)
+    }
+}
+
+/// Begin demote only from immersive with no in-flight transition.
+pub fn begin_demote(immersive: bool, transitioning: bool) -> Option<StartTransition> {
+    if !immersive || transitioning {
+        None
+    } else {
+        Some(StartTransition::Demoting)
+    }
+}
+
+/// After resize settles: target `immersive` flag for the transition.
+pub fn settle_immersive(transition: StartTransition) -> bool {
+    matches!(transition, StartTransition::Promoting)
+}
+
+/// R2 while immersive: expand dock when collapsed.
+pub fn dock_expand_target(expanded: bool) -> Option<bool> {
+    if expanded { None } else { Some(true) }
+}
+
+/// L2 while immersive: collapse dock when expanded.
+pub fn dock_collapse_target(expanded: bool) -> Option<bool> {
+    if !expanded { None } else { Some(false) }
 }
 
 #[cfg(test)]
@@ -93,5 +133,28 @@ mod tests {
             GestureControl::Ps
         ]));
         assert!(!chord_is_circle_only(&[]));
+    }
+
+    #[test]
+    fn promote_demote_settle_ordering() {
+        assert_eq!(
+            begin_promote(false, false),
+            Some(StartTransition::Promoting)
+        );
+        assert_eq!(begin_promote(true, false), None);
+        assert_eq!(begin_promote(false, true), None);
+        assert_eq!(begin_demote(true, false), Some(StartTransition::Demoting));
+        assert_eq!(begin_demote(false, false), None);
+        assert_eq!(begin_demote(true, true), None);
+        assert!(settle_immersive(StartTransition::Promoting));
+        assert!(!settle_immersive(StartTransition::Demoting));
+    }
+
+    #[test]
+    fn dock_expand_collapse_targets() {
+        assert_eq!(dock_expand_target(false), Some(true));
+        assert_eq!(dock_expand_target(true), None);
+        assert_eq!(dock_collapse_target(true), Some(false));
+        assert_eq!(dock_collapse_target(false), None);
     }
 }

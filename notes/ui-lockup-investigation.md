@@ -341,4 +341,6 @@ Debug grep: `service: hot path waiting for live battery sample`, `service: hot l
 
 Compact Start (640×500) can promote to a borderless primary-monitor cover. Pref `start_screen_immersive` cold-opens immersive; a second reopen-chord press promotes while compact; Circle/Escape demotes. Successful launch while immersive closes Start so a topmost cover cannot sit above the game.
 
-Debug grep: `ui-diag: start immersive enter`, `ui-diag: start immersive leave`, `ui-diag: reopen gesture promote immersive`, `ui-diag: start cold open immersive=`.
+Promote/demote paint a veil until `StartImmersiveSettled` (resize then flip `immersive`) so layouts never stretch into the wrong HWND size. Immersive uses a WGSL ambient shader, vertical cover-flow strip, and a right controllers dock (R2 expand / L2 collapse).
+
+Debug grep: `ui-diag: start immersive enter`, `ui-diag: start immersive leave`, `ui-diag: start immersive settle promote|demote`, `ui-diag: reopen gesture promote immersive`, `ui-diag: start cold open immersive=`, `ui-diag: start dock expand|collapse`, `ui-diag: shader ambient pipeline ready`.
