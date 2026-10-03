@@ -1034,17 +1034,19 @@ impl State {
     /// Paths to warm for the current immersive selection window.
     /// Returns `(hero_files, hero_shells, backdrops)`.
     pub fn immersive_warm_paths(&self) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
-        use crate::ui::start::vstrip::NEIGHBORS;
+        use crate::ui::start::vstrip::{self, NEIGHBORS};
         let mut heroes = Vec::new();
         let mut shells = Vec::new();
         let mut backdrops = Vec::new();
-        let len = self.rows.len() as isize;
+        let len = self.rows.len();
         if len == 0 {
             return (heroes, shells, backdrops);
         }
-        let selected = self.game_selected.min(self.rows.len() - 1) as isize;
+        let selected = self.game_selected.min(len - 1);
         for delta in -NEIGHBORS..=NEIGHBORS {
-            let idx = (selected + delta).rem_euclid(len) as usize;
+            let Some(idx) = vstrip::slot_catalog_index(selected, delta, len) else {
+                continue;
+            };
             let row = &self.rows[idx];
             match &row.icon_source {
                 Some(IconSource::File(path)) => heroes.push(path.clone()),
@@ -1053,7 +1055,9 @@ impl State {
             }
         }
         for delta in -1isize..=1 {
-            let idx = (selected + delta).rem_euclid(len) as usize;
+            let Some(idx) = vstrip::slot_catalog_index(selected, delta, len) else {
+                continue;
+            };
             if let Some(path) = self.rows[idx].backdrop_path.clone() {
                 backdrops.push(path);
             }
@@ -1443,6 +1447,7 @@ pub fn view<'a>(
     now: Instant,
     always_immersive: bool,
     promote_gesture: &'a [crate::domain::gesture::GestureControl],
+    stage_h: f32,
 ) -> Element<'a, StartMessage> {
     use crate::ui::start::mode::TransitionPhase;
 
@@ -1468,6 +1473,7 @@ pub fn view<'a>(
             now,
             always_immersive,
             promote_gesture,
+            stage_h,
         );
     }
 

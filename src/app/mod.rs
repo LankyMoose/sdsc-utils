@@ -665,12 +665,14 @@ impl App {
         }
 
         if Some(window) == self.start_window {
+            let stage_h = self.start_monitor_cover.map(|c| c.height).unwrap_or(1080.0);
             let start = start_view::view(
                 &self.start_state,
                 &self.session.prefs.spectrum,
                 Instant::now(),
                 self.session.prefs.start_screen_always_immersive,
                 &self.session.prefs.start_screen_gesture,
+                stage_h,
             )
             .map(Message::Start);
             return cursor_hide::force_cursor(start, self.start_cursor_hidden).into();

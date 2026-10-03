@@ -8,7 +8,7 @@ use crate::ui::start::view::{
     StartControllerRow, StartMessage, StartRow, StartSlide, State, footer_hint,
     immersive_dock_row_hints, manual_add_view, replace_confirm_view,
 };
-use crate::ui::start::vstrip::{self, CENTER_H, CENTER_W, NEIGHBORS, SELECTED_SCALE, SLOT_W};
+use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics};
 use crate::ui::theme;
 use iced::font::Weight;
 use iced::widget::{Float, column, container, row, shader, space, stack, text};
@@ -16,6 +16,8 @@ use iced::{Alignment, Element, Fill, Font, Length, Padding};
 use std::time::Instant;
 
 const EDGE_PAD: f32 = 16.0;
+/// ~1″ inset for the games strip from the left window edge (96 logical px / inch).
+const STRIP_LEFT_PAD: f32 = 96.0;
 /// Minimum gap from ring outer edge → peek column edge (also sizes peek width for max ring).
 const DOCK_RING_INSET: f32 = 6.0;
 const DOCK_RING_MIN: f32 = 52.0;
@@ -76,6 +78,7 @@ pub fn view<'a>(
     now: Instant,
     always_immersive: bool,
     promote_gesture: &'a [crate::domain::gesture::GestureControl],
+    stage_h: f32,
 ) -> Element<'a, StartMessage> {
     let dock_p = state.dock_progress(now);
     let veil = transition_top_veil(state, now);
@@ -90,7 +93,7 @@ pub fn view<'a>(
     } else if state.replace_confirm.is_some() {
         modal_card(replace_confirm_view(state))
     } else {
-        stage_with_dock(state, spectrum, now, dock_p, flat)
+        stage_with_dock(state, spectrum, now, dock_p, flat, stage_h)
     };
 
     let footer_capsule = container(footer_hint(
@@ -210,13 +213,14 @@ fn stage_with_dock<'a>(
     now: Instant,
     dock_p: f32,
     flat: bool,
+    stage_h: f32,
 ) -> Element<'a, StartMessage> {
     let scale = dock_stage_scale(dock_p);
     let dim = dock_stage_dim(dock_p);
 
     // Backdrop lives in the games stage (scales with dock), not the full window.
     let mut stage_layers = stage_backdrop_layers(state, now);
-    stage_layers.push(games_stage(state, now));
+    stage_layers.push(games_stage(state, now, stage_h));
     let stage = stack(stage_layers).width(Fill).height(Fill);
 
     // Float paints above the enter/exit veil — skip scale while flattening.
@@ -281,34 +285,39 @@ fn modal_card(inner: Element<'_, StartMessage>) -> Element<'_, StartMessage> {
     .into()
 }
 
-fn games_stage(state: &State, now: Instant) -> Element<'_, StartMessage> {
+fn games_stage(state: &State, now: Instant, stage_h: f32) -> Element<'_, StartMessage> {
     if state.rows.is_empty() {
         return empty_games(state);
     }
 
+    let metrics = vstrip::metrics_for_height(stage_h);
     let selected = state.game_selected.min(state.rows.len().saturating_sub(1));
     let visual = state.strip_scroll(now);
-    let len = state.rows.len() as isize;
+    let len = state.rows.len();
 
     let mut items = Vec::with_capacity(vstrip::VISIBLE);
     for delta in -NEIGHBORS..=NEIGHBORS {
-        let idx = (selected as isize + delta).rem_euclid(len) as usize;
-        let row = &state.rows[idx];
         let dist = delta as f32 + (selected as f32 - visual);
         let scale = vstrip::scale_at_distance(dist);
         let fade = vstrip::opacity_at_distance(dist);
-        items.push(strip_slot(
-            row,
-            idx,
-            idx == selected,
-            state.editing,
-            scale,
-            fade,
-        ));
+        match vstrip::slot_catalog_index(selected, delta, len) {
+            Some(idx) => {
+                let row = &state.rows[idx];
+                items.push(strip_slot(
+                    row,
+                    idx == selected,
+                    state.editing,
+                    scale,
+                    fade,
+                    &metrics,
+                ));
+            }
+            None => items.push(strip_slot_dummy(scale, fade, &metrics)),
+        }
     }
 
-    let strip = vstrip::vstrip(visual, selected, items)
-        .width(Length::Fixed(SLOT_W))
+    let strip = vstrip::vstrip(visual, selected, metrics, items)
+        .width(Length::Fixed(metrics.slot_w))
         .height(Fill);
 
     // Status marks only — title/subtitle live beside each hero in the strip.
@@ -334,7 +343,7 @@ fn games_stage(state: &State, now: Instant) -> Element<'_, StartMessage> {
             top: 0.0,
             right: 0.0,
             bottom: 0.0,
-            left: EDGE_PAD,
+            left: STRIP_LEFT_PAD,
         }),
         container(meta)
             .width(Fill)
@@ -367,14 +376,57 @@ fn empty_games(state: &State) -> Element<'_, StartMessage> {
         .into()
 }
 
-fn strip_slot(
-    row: &StartRow,
-    _index: usize,
+/// Non-navigable filler when the linear strip index is outside the catalog.
+fn strip_slot_dummy(
+    scale: f32,
+    fade: f32,
+    metrics: &StripMetrics,
+) -> Element<'static, StartMessage> {
+    let fade = fade.clamp(0.0, 1.0);
+    let capsule = container(space())
+        .width(Fill)
+        .height(Fill)
+        .style(theme::well);
+    let title = text("…")
+        .size(22.0)
+        .color(theme::alpha(theme::MUTED, 0.85 * fade));
+    let label: Element<'static, StartMessage> = container(title)
+        .width(Fill)
+        .height(Fill)
+        .align_y(Alignment::Center)
+        .padding(Padding {
+            top: 0.0,
+            right: 8.0,
+            bottom: 0.0,
+            left: 14.0,
+        })
+        .into();
+    let max_art_w = metrics.center_w * metrics.selected_scale;
+    let art_w = metrics.center_w * scale;
+    let art_h = metrics.center_h * scale;
+    let inset = ((max_art_w - art_w) * 0.5).max(0.0);
+    let body = row![
+        space().width(Length::Fixed(inset)),
+        container(capsule)
+            .width(Length::Fixed(art_w))
+            .height(Length::Fixed(art_h)),
+        label,
+    ]
+    .spacing(0)
+    .width(Fill)
+    .height(Fill)
+    .align_y(Alignment::Center);
+    container(body).width(Fill).height(Fill).into()
+}
+
+fn strip_slot<'a>(
+    row: &'a StartRow,
     selected: bool,
     editing: bool,
     scale: f32,
     fade: f32,
-) -> Element<'_, StartMessage> {
+    metrics: &StripMetrics,
+) -> Element<'a, StartMessage> {
     let muted = editing && !row.in_catalog();
     let hero_ready = row.hero_ready();
     let capsule = strip_capsule(row, selected, muted, hero_ready, fade);
@@ -425,9 +477,9 @@ fn strip_slot(
 
     // Explicit pixel size so vstrip scale actually enlarges the hero.
     // Inset smaller art so every capsule shares the selected art centerline.
-    let max_art_w = CENTER_W * SELECTED_SCALE;
-    let art_w = CENTER_W * scale;
-    let art_h = CENTER_H * scale;
+    let max_art_w = metrics.center_w * metrics.selected_scale;
+    let art_w = metrics.center_w * scale;
+    let art_h = metrics.center_h * scale;
     let inset = ((max_art_w - art_w) * 0.5).max(0.0);
     let body = row![
         space().width(Length::Fixed(inset)),
