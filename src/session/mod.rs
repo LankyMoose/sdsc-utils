@@ -8,7 +8,7 @@ mod gate;
 pub use gate::{
     ConnectCooldownDecision, connect_cooldown_on_empty, reconcile_poll_with_hold,
     should_auto_open_start, should_defer_auto_open_start, should_flush_latched_start,
-    take_skip_connect_cooldown,
+    should_skip_connect_cooldown_on_power_off, take_skip_connect_cooldown,
 };
 
 use crate::controller::dualsense::lightbar;

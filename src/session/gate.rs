@@ -1,5 +1,6 @@
 //! Pure start-open / connect-cooldown / poll-hold helpers.
 
+use crate::controller::dualsense::identity::normalize_identity;
 use crate::controller::model::ControllerStatus;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -26,6 +27,21 @@ pub fn take_skip_connect_cooldown(flag: &mut bool) -> bool {
     let skip = *flag;
     *flag = false;
     skip
+}
+
+/// Arm skip-connect-cooldown only when powering off the sole live controller.
+///
+/// Powering off one of several pads must not skip the ghost-flap cooldown that
+/// guards a later 0→1 open for a sibling that never left.
+pub fn should_skip_connect_cooldown_on_power_off(
+    controllers: &[ControllerStatus],
+    serial: &str,
+) -> bool {
+    let target = normalize_identity(serial);
+    controllers.len() == 1
+        && controllers
+            .first()
+            .is_some_and(|c| normalize_identity(&c.serial) == target)
 }
 
 /// Whether to arm the ghost-flap cooldown after the list goes empty.
@@ -159,6 +175,17 @@ mod tests {
         assert!(take_skip_connect_cooldown(&mut flag));
         assert!(!flag);
         assert!(!take_skip_connect_cooldown(&mut flag));
+    }
+
+    #[test]
+    fn power_off_skips_cooldown_only_for_sole_controller() {
+        let alone = vec![pad("aa:bb")];
+        assert!(should_skip_connect_cooldown_on_power_off(&alone, "AA-BB"));
+        assert!(!should_skip_connect_cooldown_on_power_off(&alone, "cc:dd"));
+
+        let two = vec![pad("aa:bb"), pad("cc:dd")];
+        assert!(!should_skip_connect_cooldown_on_power_off(&two, "aa:bb"));
+        assert!(!should_skip_connect_cooldown_on_power_off(&[], "aa:bb"));
     }
 
     #[test]

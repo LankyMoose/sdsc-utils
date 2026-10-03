@@ -4,7 +4,7 @@
 
 ## Start-screen rumble (haptics)
 
-Start-menu nav/action cues may pulse DualSense motors via `HidCmd::Rumble`. **Do not** route rumble through `write_rgb_exclusive` (that drops the input-cache handle and reopens). Rumble keeps a **separate long-lived output handle**, opens ranked DualSense collections like lightbar (USB gamepad → USB other → BT gamepad → BT other), and calls `prepare_bt_output_mode` once on BT opens. Poll / PowerOff / Shutdown drop rumble handles. Debug: grep `hid-diag: rumble` / write traces with `caller=rumble`.
+Start-menu nav/action cues may pulse DualSense motors via `HidCmd::Rumble`. **Do not** route rumble through `write_rgb_exclusive` (that drops the input-cache handle and reopens). Rumble keeps a **separate long-lived output handle**, opens ranked DualSense collections like lightbar (USB gamepad → USB other → BT gamepad → BT other), and calls `prepare_bt_output_mode` once on BT opens. Poll / Shutdown drop all rumble handles; **PowerOff drops only the target** pad’s rumble + input handle + live status (siblings stay in `live_pads` / the nav snapshot). Intentional skip-connect-cooldown arms only when that pad was the sole live controller. Debug: grep `hid-diag: rumble` / `hid-diag: power-off drop` / write traces with `caller=rumble`.
 
 ## Battery from input stream (hot path)
 
