@@ -3396,16 +3396,20 @@ impl App {
 
     fn pick_manual_shortcut(&mut self) -> Task<Message> {
         self.start_file_dialog_open = true;
-        self.pick_file_dialog("Programs", &["exe", "lnk", "url"], |path| {
-            Message::ManualFilePicked(path.map(PathBuf::from))
-        })
+        self.pick_file_dialog(
+            "Programs",
+            &["exe", "lnk", "url"],
+            Message::ManualFilePicked,
+        )
     }
 
     fn pick_manual_icon(&mut self) -> Task<Message> {
         self.start_file_dialog_open = true;
-        self.pick_file_dialog("Images", &["png", "jpg", "jpeg", "ico", "webp"], |path| {
-            Message::ManualIconPicked(path.map(PathBuf::from))
-        })
+        self.pick_file_dialog(
+            "Images",
+            &["png", "jpg", "jpeg", "ico", "webp"],
+            Message::ManualIconPicked,
+        )
     }
 
     /// Native file picker; on Windows parents to Start so it clears immersive cover.
