@@ -1476,11 +1476,15 @@ pub fn view<'a>(
         );
     }
 
+    // Always keep the same outer stack as ExitCompact/EnterCompact so the games
+    // scrollable is not remounted (and scroll reset) when promote begins.
+    let veil = match phase {
+        Some(TransitionPhase::ExitCompact) => state.phase_progress(now),
+        Some(TransitionPhase::EnterCompact) => 1.0 - state.phase_progress(now),
+        _ => 0.0,
+    };
     // Flat hints under the dim veil — Float face glyphs would paint above it.
-    let flat_hints = matches!(
-        phase,
-        Some(TransitionPhase::ExitCompact | TransitionPhase::EnterCompact)
-    );
+    let flat_hints = veil > 0.001;
     let compact = compact_chrome(
         state,
         spectrum,
@@ -1489,19 +1493,7 @@ pub fn view<'a>(
         promote_gesture,
         flat_hints,
     );
-
-    // ExitCompact / EnterCompact: blackout (no ambient on compact).
-    match phase {
-        Some(TransitionPhase::ExitCompact) => {
-            let t = state.phase_progress(now);
-            crate::ui::start::immersive::compact_transition_overlay(compact, t, true)
-        }
-        Some(TransitionPhase::EnterCompact) => {
-            let t = state.phase_progress(now);
-            crate::ui::start::immersive::compact_transition_overlay(compact, 1.0 - t, false)
-        }
-        _ => compact,
-    }
+    crate::ui::start::immersive::compact_transition_overlay(compact, veil, false)
 }
 
 fn compact_chrome<'a>(
