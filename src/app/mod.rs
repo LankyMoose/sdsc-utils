@@ -49,7 +49,7 @@ use crate::ui::layout::{
 };
 use crate::ui::popup::{self as popup_view, ControllerRow, PopupMessage};
 use crate::ui::start::cursor_hide;
-use crate::ui::start::gesture::{self, GestureRecorder};
+use crate::ui::start::gesture::{self, ChordReleaseGate, ChordReleaseTick, GestureRecorder};
 use crate::ui::start::input::{
     self as start_input, CrossHold, FaceHeld, GestureDetectorBank, GestureRecordLatch, NavAction,
     NavLogSnapshot, NavSource, PadNavBank,
@@ -242,8 +242,8 @@ pub struct App {
     start_cursor_hidden: bool,
     /// True while an rfd picker is open from the start screen (suppress unfocus-close).
     start_file_dialog_open: bool,
-    /// After hide / connect-reveal: ignore reopen until the chord is fully released.
-    reopen_needs_chord_release: bool,
+    /// After open / hide / promote: ignore reopen until a debounced full release.
+    chord_release_gate: ChordReleaseGate,
     /// When Start was last revealed (unfocus grace).
     start_revealed_at: Option<Instant>,
     gesture_detectors: GestureDetectorBank,
@@ -441,7 +441,7 @@ impl App {
             start_cursor_last_active: Instant::now(),
             start_cursor_hidden: false,
             start_file_dialog_open: false,
-            reopen_needs_chord_release: false,
+            chord_release_gate: ChordReleaseGate::default(),
             start_revealed_at: None,
             gesture_detectors: GestureDetectorBank::default(),
             gesture_recorder: GestureRecorder::default(),
@@ -2513,21 +2513,23 @@ impl App {
         self.prepare_start_nav_on_open(false);
 
         // Already open: re-focus; force running restore in case a game started.
+        // Duplicate OpenStart (service glitch before ReportStartVisible) must
+        // re-arm the release latch so the opening press cannot promote.
         if self.start_visible
             && let Some(id) = self.start_window
         {
             self.session.start_auto_open_pending = false;
             self.last_running_check = None;
+            self.arm_chord_release_latch();
             let badge = self.refresh_running_badge();
             return Task::batch([badge, window::gain_focus(id)]);
         }
 
         // Mark the current chord consumed (do not reset): a held PS from power-on
         // must not reopen Start immediately after a focus-close.
-        self.consume_reopen_gesture_chord();
+        self.arm_chord_release_latch();
         self.clear_start_nav_diag();
         self.start_opened_at = Some(Instant::now());
-        self.reopen_needs_chord_release = true;
         self.start_revealed_at = Some(Instant::now());
         // refresh_start_rows already ran a throttled check; force one restore on open.
         self.last_running_check = None;
@@ -2622,8 +2624,7 @@ impl App {
         });
         self.start_monitor_cover = Some(cover);
         self.clear_start_cursor_hide();
-        self.reopen_needs_chord_release = true;
-        self.consume_reopen_gesture_chord();
+        self.arm_chord_release_latch();
         crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
         self.start_state
             .begin_transition_phase(start_mode::TransitionPhase::ExitCompact, Instant::now());
@@ -2643,8 +2644,7 @@ impl App {
         else {
             return Task::none();
         };
-        self.reopen_needs_chord_release = true;
-        self.consume_reopen_gesture_chord();
+        self.arm_chord_release_latch();
         crate::controller::hid::diag::diag_info("ui-diag: start immersive leave");
         self.clear_start_cursor_hide();
         self.start_state
@@ -2754,8 +2754,7 @@ impl App {
             self.start_state
                 .begin_transition_phase(start_mode::TransitionPhase::EnterCompact, now);
         }
-        self.reopen_needs_chord_release = true;
-        self.consume_reopen_gesture_chord();
+        self.arm_chord_release_latch();
         let kind = if immersive { "promote" } else { "demote" };
         crate::controller::hid::diag::diag_info(format!("ui-diag: start immersive settle {kind}"));
         let focus = self
@@ -2793,6 +2792,16 @@ impl App {
         )
     }
 
+    /// Arm the debounced release latch and mark any locally visible chord consumed.
+    ///
+    /// In client mode the HID snapshot lives in the service process, so
+    /// [`read_nav_readings`] is usually Missing — leave detectors alone (do not
+    /// reset/disarm). Live pad edges while latched call `consume_pending_match`.
+    fn arm_chord_release_latch(&mut self) {
+        self.chord_release_gate.arm();
+        self.consume_reopen_gesture_chord();
+    }
+
     /// Mark the live reopen chord as already matched so a sticky hold cannot fire.
     fn consume_reopen_gesture_chord(&mut self) {
         match start_input::read_nav_readings() {
@@ -2800,7 +2809,8 @@ impl App {
                 self.gesture_detectors.consume_pending_match(&readings);
             }
             start_input::NavReadingsOutcome::Missing { .. } => {
-                self.gesture_detectors.reset();
+                // Shell has no local snapshot — resetting would disarm detectors
+                // and let the same press promote after a one-sample gap.
             }
         }
     }
@@ -2864,7 +2874,6 @@ impl App {
         self.start_state.clear_immersive_session();
         self.start_monitor_cover = None;
         self.clear_start_cursor_hide();
-        self.reopen_needs_chord_release = true;
         self.haptic_pad_serial = None;
         if self.client_mode {
             let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RumbleStopAll);
@@ -2881,9 +2890,9 @@ impl App {
         self.start_state.reset_to_games();
         self.discard_edit_draft();
         self.clear_start_nav_diag();
-        // Focus-close often leaves the reopen chord held (e.g. PS); consume now
-        // so the next PadPoll cannot immediately reopen.
-        self.consume_reopen_gesture_chord();
+        // Focus-close often leaves the reopen chord held (e.g. PS); latch until
+        // a debounced full release so the next PadPoll cannot immediately reopen.
+        self.arm_chord_release_latch();
         match self.start_window {
             Some(id) => {
                 crate::controller::hid::diag::diag_info("ui-diag: start close");
@@ -4015,15 +4024,25 @@ impl App {
             return Task::none();
         }
         let required = &self.session.prefs.start_screen_gesture;
-        // After hide / connect-reveal: wait for a full chord release before rising edges.
-        if self.reopen_needs_chord_release {
-            if chord_held_on_any_pad(required, readings) {
-                crate::controller::hid::diag::diag_info(
-                    "ui-diag: reopen gesture waiting for release",
-                );
+        let chord_held = chord_held_on_any_pad(required, readings);
+        let now = Instant::now();
+        let (tick, glitch) = self.chord_release_gate.tick(chord_held, now);
+        if glitch {
+            crate::controller::hid::diag::diag_info("ui-diag: reopen chord glitch ignored");
+        }
+        match tick {
+            ChordReleaseTick::Blocked => {
+                if chord_held {
+                    self.gesture_detectors.consume_pending_match(readings);
+                }
                 return Task::none();
             }
-            self.reopen_needs_chord_release = false;
+            ChordReleaseTick::Cleared => {
+                // Absent sample disarms detectors; next held rising edge may fire.
+                let _ = self.gesture_detectors.update(required, readings);
+                return Task::none();
+            }
+            ChordReleaseTick::Open => {}
         }
         if self.gesture_detectors.update(required, readings) {
             let held = start_input::preferred_reading(readings)
@@ -4055,11 +4074,24 @@ impl App {
         if required.is_empty() || start_mode::chord_is_circle_only(required) {
             return None;
         }
-        if self.reopen_needs_chord_release {
-            if chord_held_on_any_pad(required, readings) {
+        let chord_held = chord_held_on_any_pad(required, readings);
+        let now = Instant::now();
+        let (tick, glitch) = self.chord_release_gate.tick(chord_held, now);
+        if glitch {
+            crate::controller::hid::diag::diag_info("ui-diag: reopen chord glitch ignored");
+        }
+        match tick {
+            ChordReleaseTick::Blocked => {
+                if chord_held {
+                    self.gesture_detectors.consume_pending_match(readings);
+                }
                 return None;
             }
-            self.reopen_needs_chord_release = false;
+            ChordReleaseTick::Cleared => {
+                let _ = self.gesture_detectors.update(required, readings);
+                return None;
+            }
+            ChordReleaseTick::Open => {}
         }
         if !self.gesture_detectors.update(required, readings) {
             return None;

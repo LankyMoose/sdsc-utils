@@ -11,6 +11,7 @@ use crate::controller::hid::worker::HidWorkerHandle;
 use crate::controller::known::KnownControllers;
 use crate::controller::model::ControllerStatus;
 use crate::domain::color::{self, color_for_battery_percent};
+use crate::domain::gesture::{ChordReleaseGate, ChordReleaseTick};
 use crate::domain::pad::{self as start_input, GestureDetectorBank};
 use crate::ipc::{PipeServer, SHELL_PIPE_ENV, ServiceMessage, ShellCommand, bound_port};
 use crate::persist::analytics::AnalyticsStore;
@@ -56,7 +57,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut start_visible = false;
     let shell_input_hot = Arc::new(AtomicBool::new(false));
     let mut gesture_detectors = GestureDetectorBank::default();
-    let mut reopen_needs_release = false;
+    let mut chord_release_gate = ChordReleaseGate::default();
     let mut pending_open_start = false;
     let mut last_client_count = 0usize;
 
@@ -125,7 +126,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "service: shell exited ({status}); respawning without reopening HID"
                 ));
                 // Chord may still be held across the restart — require release.
-                reopen_needs_release = true;
+                chord_release_gate.arm();
                 gesture_detectors.reset();
                 last_client_count = 0;
                 shell = spawn_shell()?;
@@ -149,8 +150,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &cmd,
                 ShellCommand::ReportStartVisible { visible: false } if start_visible
             ) {
-                // Start closed — require chord release before reopen.
-                reopen_needs_release = true;
+                // Start closed — require debounced chord release before reopen.
+                chord_release_gate.arm();
             }
             if matches!(
                 handle_command(
@@ -321,30 +322,43 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 && readings
                     .iter()
                     .any(|r| chord.iter().all(|c| r.sample.held.contains(c)));
-            let rising = !reopen_needs_release
-                && !chord.is_empty()
-                && gesture_detectors.update(chord, &readings);
+            let now = Instant::now();
+            let (tick, glitch) = chord_release_gate.tick(chord_held, now);
+            if glitch {
+                crate::controller::hid::diag::diag_info("ui-diag: reopen chord glitch ignored");
+            }
+            let rising = match tick {
+                ChordReleaseTick::Blocked => {
+                    if chord_held {
+                        gesture_detectors.consume_pending_match(&readings);
+                    }
+                    false
+                }
+                ChordReleaseTick::Cleared => {
+                    // Absent sample disarms detectors; next held rising edge may fire.
+                    let _ = gesture_detectors.update(chord, &readings);
+                    false
+                }
+                ChordReleaseTick::Open => {
+                    !chord.is_empty() && gesture_detectors.update(chord, &readings)
+                }
+            };
             match reopen_gesture_outcome(
-                reopen_needs_release,
+                tick == ChordReleaseTick::Blocked,
                 chord_held,
                 rising,
                 pipe.client_count() > 0,
             ) {
                 ReopenGestureOutcome::Hold => {}
-                ReopenGestureOutcome::Idle => {
-                    if reopen_needs_release && !chord_held {
-                        reopen_needs_release = false;
-                        gesture_detectors.reset();
-                    }
-                }
+                ReopenGestureOutcome::Idle => {}
                 ReopenGestureOutcome::OpenNow => {
-                    reopen_needs_release = true;
+                    chord_release_gate.arm();
                     pending_open_start = false;
                     app_log::info("service: reopen gesture → OpenStart");
                     let _ = pipe.send(ServiceMessage::Effects(vec![SessionEffect::OpenStart]));
                 }
                 ReopenGestureOutcome::Latch => {
-                    reopen_needs_release = true;
+                    chord_release_gate.arm();
                     pending_open_start = true;
                     app_log::info("service: reopen gesture latched (shell down)");
                 }
@@ -410,7 +424,7 @@ fn handle_command(
         }
         ShellCommand::ReportStartVisible { visible } => {
             if *start_visible && !visible {
-                // Detectors reset here; reopen_needs_release is armed in the loop.
+                // Detectors reset here; chord_release_gate is armed in the loop.
                 gesture_detectors.reset();
             }
             *start_visible = visible;
