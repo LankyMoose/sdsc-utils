@@ -233,6 +233,64 @@ pub fn content(_theme: &Theme) -> container::Style {
     }
 }
 
+/// Immersive stage: no fill/border — atmosphere shows through.
+pub fn immersive_stage(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: None,
+        text_color: Some(INK),
+        border: Border::default(),
+        ..container::Style::default()
+    }
+}
+
+/// Shared glass fill for immersive chrome islands.
+fn immersive_chrome_fill() -> Color {
+    // Darker than BASE_BG, see-through so atmosphere/backdrop read through.
+    alpha(darken(BASE_BG, 0.55), 0.58)
+}
+
+/// Capsule island shared by footer hints (fixed radius).
+pub fn immersive_island(theme: &Theme) -> container::Style {
+    immersive_island_radius(20.0)(theme)
+}
+
+/// Controllers dock island — pass `ring_radius + edge_inset` for concentric corners.
+pub fn immersive_island_radius(radius: f32) -> impl Fn(&Theme) -> container::Style {
+    let radius = radius.max(0.0);
+    move |_theme: &Theme| container::Style {
+        background: Some(Background::Color(immersive_chrome_fill())),
+        text_color: Some(INK),
+        border: Border {
+            color: alpha(LINE, 0.28),
+            width: 1.0,
+            radius: radius.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Full-bleed darken wash when the controllers drawer is open.
+pub fn immersive_dim(amount: f32) -> impl Fn(&Theme) -> container::Style {
+    let amount = amount.clamp(0.0, 1.0);
+    move |_theme: &Theme| container::Style {
+        background: Some(Background::Color(alpha(Color::BLACK, amount))),
+        ..container::Style::default()
+    }
+}
+
+/// Soft top/bottom wash over Steam backdrop art.
+pub fn immersive_backdrop_wash(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(alpha(BASE_BG, 0.62))),
+        ..container::Style::default()
+    }
+}
+
+/// Pill behind immersive footer action hints.
+pub fn immersive_footer_capsule(theme: &Theme) -> container::Style {
+    immersive_island(theme)
+}
+
 /// Configure content area below the title bar.
 pub fn configure_body(theme: &Theme) -> container::Style {
     content(theme)
@@ -437,21 +495,62 @@ pub fn chip(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style 
     }
 }
 
-/// Full-width start-menu row (in-game OSD feel).
+/// Full-width start-menu row (pad/keyboard select — no mouse hover wash).
 pub fn menu_row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |_theme, status| {
+    move |_theme, _status| {
         // Desaturate toward DIM, then a lighter wash so the row stays dark.
         let select = mix(ACCENT, DIM, 0.55);
-        let (fill, ink) = match (selected, status) {
-            (true, button::Status::Disabled) => (Some(alpha(select, 0.12)), DIM),
-            (true, _) => (Some(alpha(select, 0.16)), INK),
-            (false, button::Status::Hovered) | (false, button::Status::Pressed) => {
-                (Some(alpha(PANEL_HOVER, 0.85)), INK)
-            }
-            (false, button::Status::Disabled) => (None, DIM),
-            (false, button::Status::Active) => (None, INK),
+        let (fill, ink) = if selected {
+            (Some(alpha(select, 0.16)), INK)
+        } else {
+            (None, INK)
         };
         button_base(fill, ink, RADIUS_SM)
+    }
+}
+
+/// Presentational list-row surface (same wash as [`menu_row`], for non-button hosts).
+pub fn menu_row_surface(selected: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| {
+        let select = mix(ACCENT, DIM, 0.55);
+        container::Style {
+            background: if selected {
+                Some(Background::Color(alpha(select, 0.16)))
+            } else {
+                None
+            },
+            text_color: Some(INK),
+            border: Border {
+                radius: RADIUS_SM.into(),
+                ..Default::default()
+            },
+            ..container::Style::default()
+        }
+    }
+}
+
+/// Target inner radius for selected controller rows when the dock is fully expanded.
+/// Island radius is `pad +` this so corners stay concentric.
+pub const IMMERSIVE_DOCK_ROW_RADIUS: f32 = 12.0;
+
+/// Controllers island row: near-neutral select wash; radius from island − pad.
+pub fn immersive_dock_row_surface(
+    selected: bool,
+    radius: f32,
+) -> impl Fn(&Theme) -> container::Style {
+    let radius = radius.max(0.0);
+    move |_theme| container::Style {
+        background: if selected {
+            Some(Background::Color(alpha(INK, 0.05)))
+        } else {
+            None
+        },
+        text_color: Some(INK),
+        border: Border {
+            radius: radius.into(),
+            ..Default::default()
+        },
+        ..container::Style::default()
     }
 }
 

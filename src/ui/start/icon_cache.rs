@@ -4,6 +4,9 @@
 //! force `Atlas::grow` → `Texture::create_view`. A failed grow (memory / device
 //! loss) panics the process. We decode once, fit to 2× the portrait cell, and
 //! reuse one [`Handle`] so atlas churn stays bounded.
+//!
+//! Immersive hero/backdrop decode must run off the UI thread (`prepare_*` /
+//! warm workers). UI code uses [`hero_cached`] / [`backdrop_cached`] only.
 
 use iced::widget::image::Handle;
 use std::collections::HashMap;
@@ -13,6 +16,12 @@ use std::sync::{LazyLock, Mutex};
 /// Display cell is 48×72; upload at 2× for Cover scaling.
 pub const CACHE_W: u32 = 96;
 pub const CACHE_H: u32 = 144;
+/// Immersive hero capsule; upload at this size for Cover scaling (~2× a 160×240 cell).
+pub const HERO_W: u32 = 320;
+pub const HERO_H: u32 = 480;
+/// Immersive full-bleed landscape backdrop (fits atlas; Cover-scaled on screen).
+pub const BACKDROP_W: u32 = 1280;
+pub const BACKDROP_H: u32 = 720;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CacheKey {
@@ -20,6 +29,12 @@ enum CacheKey {
     File(PathBuf),
     /// Shell-extracted icon for an executable / shortcut target.
     Shell(PathBuf),
+    /// Larger raster for the immersive selected-game capsule.
+    HeroFile(PathBuf),
+    /// Larger shell extract for immersive manual shortcuts.
+    HeroShell(PathBuf),
+    /// Landscape Steam art for immersive atmosphere.
+    BackdropFile(PathBuf),
 }
 
 static CACHE: LazyLock<Mutex<HashMap<CacheKey, Option<Handle>>>> =
@@ -57,10 +72,48 @@ pub fn handle_for_path_warn(path: &Path) -> Option<Handle> {
 
 /// Cached handle for a shell-extracted icon (exe / lnk target).
 pub fn handle_for_shell(path: &Path) -> Option<Handle> {
-    lookup(CacheKey::Shell(path.to_path_buf()), || decode_shell(path))
+    lookup(CacheKey::Shell(path.to_path_buf()), || {
+        decode_shell(path, CACHE_H)
+    })
 }
 
-/// Warm the cache for Steam library paths (call from a blocking worker).
+/// Immersive hero handle for a raster path (worker / preload only).
+pub fn hero_for_path(path: &Path) -> Option<Handle> {
+    lookup(CacheKey::HeroFile(path.to_path_buf()), || {
+        decode_file_sized(path, HERO_W, HERO_H, false)
+    })
+}
+
+/// Immersive hero handle for a shell-extracted icon (worker / preload only).
+pub fn hero_for_shell(path: &Path) -> Option<Handle> {
+    lookup(CacheKey::HeroShell(path.to_path_buf()), || {
+        decode_shell(path, HERO_H)
+    })
+}
+
+/// Immersive landscape backdrop handle (worker / preload only).
+pub fn backdrop_for_path(path: &Path) -> Option<Handle> {
+    lookup(CacheKey::BackdropFile(path.to_path_buf()), || {
+        decode_file_sized(path, BACKDROP_W, BACKDROP_H, false)
+    })
+}
+
+/// Peek hero raster — never decodes on the calling thread.
+pub fn hero_cached(path: &Path) -> Option<Handle> {
+    peek(CacheKey::HeroFile(path.to_path_buf()))
+}
+
+/// Peek hero shell extract — never decodes.
+pub fn hero_shell_cached(path: &Path) -> Option<Handle> {
+    peek(CacheKey::HeroShell(path.to_path_buf()))
+}
+
+/// Peek backdrop — never decodes on the calling thread.
+pub fn backdrop_cached(path: &Path) -> Option<Handle> {
+    peek(CacheKey::BackdropFile(path.to_path_buf()))
+}
+
+/// Warm the cache for Steam library list paths (call from a blocking worker).
 pub fn prepare_paths<I, P>(paths: I)
 where
     I: IntoIterator<Item = P>,
@@ -69,6 +122,46 @@ where
     for path in paths {
         let _ = handle_for_path(path.as_ref());
     }
+}
+
+/// Warm immersive hero + backdrop tiers (blocking worker only).
+pub fn prepare_immersive(
+    hero_paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    backdrop_paths: impl IntoIterator<Item = impl AsRef<Path>>,
+) {
+    let mut heroes = 0u32;
+    let mut backdrops = 0u32;
+    for path in hero_paths {
+        if hero_for_path(path.as_ref()).is_some() {
+            heroes += 1;
+        }
+    }
+    for path in backdrop_paths {
+        if backdrop_for_path(path.as_ref()).is_some() {
+            backdrops += 1;
+        }
+    }
+    crate::controller::hid::diag::diag_info(format!(
+        "ui-diag: immersive art prepare heroes={heroes} backdrops={backdrops}"
+    ));
+}
+
+/// Warm a window of hero + backdrop paths (selection neighbor warm).
+pub fn warm_immersive_paths(
+    hero_paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    backdrop_paths: impl IntoIterator<Item = impl AsRef<Path>>,
+) {
+    for path in hero_paths {
+        let _ = hero_for_path(path.as_ref());
+    }
+    for path in backdrop_paths {
+        let _ = backdrop_for_path(path.as_ref());
+    }
+}
+
+fn peek(key: CacheKey) -> Option<Handle> {
+    let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.get(&key).and_then(|entry| entry.clone())
 }
 
 fn lookup(key: CacheKey, load: impl FnOnce() -> Option<(u32, u32, Vec<u8>)>) -> Option<Handle> {
@@ -90,6 +183,15 @@ fn lookup(key: CacheKey, load: impl FnOnce() -> Option<(u32, u32, Vec<u8>)>) -> 
 }
 
 fn decode_file(path: &Path, warn_on_fail: bool) -> Option<(u32, u32, Vec<u8>)> {
+    decode_file_sized(path, CACHE_W, CACHE_H, warn_on_fail)
+}
+
+fn decode_file_sized(
+    path: &Path,
+    max_w: u32,
+    max_h: u32,
+    warn_on_fail: bool,
+) -> Option<(u32, u32, Vec<u8>)> {
     let img = match image::open(path) {
         Ok(img) => img,
         Err(err) => {
@@ -103,7 +205,7 @@ fn decode_file(path: &Path, warn_on_fail: bool) -> Option<(u32, u32, Vec<u8>)> {
         }
     };
     let (src_w, src_h) = (img.width(), img.height());
-    let (dst_w, dst_h) = fit_within(src_w, src_h, CACHE_W, CACHE_H);
+    let (dst_w, dst_h) = fit_within(src_w, src_h, max_w, max_h);
     let rgba = if dst_w == src_w && dst_h == src_h {
         img.to_rgba8()
     } else {
@@ -111,7 +213,7 @@ fn decode_file(path: &Path, warn_on_fail: bool) -> Option<(u32, u32, Vec<u8>)> {
             .to_rgba8()
     };
     crate::controller::hid::diag::diag_info(format!(
-        "ui-diag: icon handle path={} src={src_w}x{src_h} dst={}x{}",
+        "ui-diag: icon handle path={} src={src_w}x{src_h} dst={}x{} max={max_w}x{max_h}",
         path.display(),
         rgba.width(),
         rgba.height()
@@ -119,10 +221,10 @@ fn decode_file(path: &Path, warn_on_fail: bool) -> Option<(u32, u32, Vec<u8>)> {
     Some((rgba.width(), rgba.height(), rgba.into_raw()))
 }
 
-fn decode_shell(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
-    let (width, height, pixels) = crate::platform::file_icon::rgba_for_path(path, CACHE_H)?;
+fn decode_shell(path: &Path, size: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let (width, height, pixels) = crate::platform::file_icon::rgba_for_path(path, size)?;
     crate::controller::hid::diag::diag_info(format!(
-        "ui-diag: icon handle shell={} src={width}x{height} dst={width}x{height}",
+        "ui-diag: icon handle shell={} src={width}x{height} dst={width}x{height} size={size}",
         path.display()
     ));
     Some((width, height, pixels))
@@ -133,9 +235,26 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    fn write_tiny_png(path: &Path) {
+        let mut enc = png::Encoder::new(std::fs::File::create(path).unwrap(), 2, 2);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().unwrap();
+        writer
+            .write_image_data(&[
+                255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+            ])
+            .unwrap();
+    }
+
     #[test]
     fn fit_600x900_into_cache_cell() {
         assert_eq!(fit_within(600, 900, CACHE_W, CACHE_H), (96, 144));
+    }
+
+    #[test]
+    fn fit_600x900_into_hero_cell() {
+        assert_eq!(fit_within(600, 900, HERO_W, HERO_H), (320, 480));
     }
 
     #[test]
@@ -145,27 +264,44 @@ mod tests {
 
     #[test]
     fn same_path_reuses_handle_id() {
-        // Unique temp path so parallel tests do not collide on the process cache.
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("sdsc-icon-cache-{n}"));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("tiny.png");
-        {
-            // 2×2 opaque red PNG
-            let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), 2, 2);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
-            let mut writer = enc.write_header().unwrap();
-            writer
-                .write_image_data(&[
-                    255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
-                ])
-                .unwrap();
-        }
+        write_tiny_png(&path);
         let a = handle_for_path(&path).expect("decode");
         let b = handle_for_path(&path).expect("cached");
         assert_eq!(a.id(), b.id());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peek_hero_none_until_prepare() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sdsc-icon-hero-peek-{n}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("hero.png");
+        write_tiny_png(&path);
+        assert!(hero_cached(&path).is_none());
+        assert!(hero_for_path(&path).is_some());
+        assert!(hero_cached(&path).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peek_backdrop_none_until_prepare() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sdsc-icon-backdrop-peek-{n}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bd.png");
+        write_tiny_png(&path);
+        assert!(backdrop_cached(&path).is_none());
+        prepare_immersive([&path], [&path]);
+        assert!(hero_cached(&path).is_some());
+        assert!(backdrop_cached(&path).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

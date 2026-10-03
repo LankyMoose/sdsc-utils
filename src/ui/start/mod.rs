@@ -1,5 +1,10 @@
 pub mod carousel;
+pub mod cursor_hide;
 pub mod gesture;
 pub mod icon_cache;
+pub mod immersive;
 pub mod input;
+pub mod mode;
+pub mod reveal;
 pub mod view;
+pub mod vstrip;

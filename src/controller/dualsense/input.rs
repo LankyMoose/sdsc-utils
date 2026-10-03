@@ -22,7 +22,7 @@ pub fn parse_report(buf: &[u8], base: usize) -> PadSample {
     let buttons1 = buf.get(base + 9).copied().unwrap_or(0);
     let buttons2 = buf.get(base + 10).copied().unwrap_or(0);
 
-    let (_dx, dy) = combined_stick(lx, ly, rx, ry);
+    let (dx, dy) = combined_stick(lx, ly, rx, ry);
 
     let dpad = buttons0 & 0x0F;
     let (dpad_up, dpad_down, dpad_left, dpad_right) = match dpad {
@@ -120,9 +120,12 @@ pub fn parse_report(buf: &[u8], base: usize) -> PadSample {
 
     PadSample {
         held,
+        stick_x: dx,
         stick_y: dy,
         dpad_up,
         dpad_down,
+        dpad_left,
+        dpad_right,
         cross,
         circle,
         square,

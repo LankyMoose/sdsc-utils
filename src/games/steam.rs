@@ -10,6 +10,8 @@ pub struct SteamGame {
     pub appid: u32,
     pub name: String,
     pub icon_path: Option<PathBuf>,
+    /// Landscape hero/header art for immersive backdrops (when present).
+    pub backdrop_path: Option<PathBuf>,
 }
 
 /// Installed Steam games, sorted by name.
@@ -38,12 +40,14 @@ pub fn list_installed_games() -> Result<Vec<SteamGame>, String> {
                 continue;
             };
             let icon_path = library_cache_icon(&steam_root, appid);
+            let backdrop_path = library_cache_backdrop(&steam_root, appid);
             by_id.insert(
                 appid,
                 SteamGame {
                     appid,
                     name: title,
                     icon_path,
+                    backdrop_path,
                 },
             );
         }
@@ -101,6 +105,11 @@ fn library_cache_icon(steam_root: &Path, appid: u32) -> Option<PathBuf> {
     library_cache_icon_in(&cache, appid)
 }
 
+fn library_cache_backdrop(steam_root: &Path, appid: u32) -> Option<PathBuf> {
+    let cache = steam_root.join("appcache").join("librarycache");
+    library_cache_backdrop_in(&cache, appid)
+}
+
 /// Resolve artwork under `appcache/librarycache` for an appid.
 ///
 /// Prefers Steam library capsules (2:3 portrait). Modern Steam nests these under
@@ -129,6 +138,39 @@ fn library_cache_icon_in(cache: &Path, appid: u32) -> Option<PathBuf> {
                 continue;
             }
             for name in ["library_capsule.jpg", "library_600x900.jpg"] {
+                let candidate = path.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Landscape art for immersive full-bleed backdrops (`library_hero` / `header`).
+fn library_cache_backdrop_in(cache: &Path, appid: u32) -> Option<PathBuf> {
+    let app_dir = cache.join(appid.to_string());
+
+    let named = [
+        app_dir.join("library_hero.jpg"),
+        app_dir.join("library_hero.png"),
+        app_dir.join("header.jpg"),
+        cache.join(format!("{appid}_library_hero.jpg")),
+        cache.join(format!("{appid}_header.jpg")),
+    ];
+    if let Some(path) = named.into_iter().find(|p| p.is_file()) {
+        return Some(path);
+    }
+
+    if let Ok(entries) = fs::read_dir(&app_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            for name in ["library_hero.jpg", "library_hero.png", "header.jpg"] {
                 let candidate = path.join(name);
                 if candidate.is_file() {
                     return Some(candidate);
@@ -328,6 +370,27 @@ mod tests {
         let legacy = cache.join("570_icon.jpg");
         fs::write(&legacy, b"fake").unwrap();
         assert_eq!(library_cache_icon_in(&cache, 570), Some(legacy));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_cache_backdrop_prefers_hero_over_header() {
+        let root = std::env::temp_dir().join(format!(
+            "sdsc-steam-backdrop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache = root.join("librarycache");
+        let app = cache.join("570");
+        fs::create_dir_all(&app).unwrap();
+        let header = app.join("header.jpg");
+        let hero = app.join("library_hero.jpg");
+        fs::write(&header, b"header").unwrap();
+        fs::write(&hero, b"hero").unwrap();
+        assert_eq!(library_cache_backdrop_in(&cache, 570), Some(hero));
         let _ = fs::remove_dir_all(&root);
     }
 

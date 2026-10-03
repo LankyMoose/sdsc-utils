@@ -42,16 +42,19 @@ use crate::ui::configure::{
     ConfigureState, NotificationSetting, PadInputPanel, Section,
 };
 use crate::ui::layout::{
-    ToastPlacement, TrayAnchor, hide_toast, invalidate_toast, overlay_platform_specific,
-    popup_position, raise_window_topmost, remount_toast_surface, set_toast_topmost,
-    show_toast_without_activate, slide_y, toast_placement, window_platform_specific,
+    MonitorCover, ToastPlacement, TrayAnchor, cursor_on_primary_monitor, hide_toast,
+    invalidate_toast, overlay_platform_specific, popup_position, primary_monitor_cover,
+    raise_window_topmost, remount_toast_surface, set_toast_topmost, show_toast_without_activate,
+    slide_y, toast_placement, window_platform_specific,
 };
 use crate::ui::popup::{self as popup_view, ControllerRow, PopupMessage};
+use crate::ui::start::cursor_hide;
 use crate::ui::start::gesture::{self, GestureRecorder};
 use crate::ui::start::input::{
     self as start_input, CrossHold, FaceHeld, GestureDetectorBank, GestureRecordLatch, NavAction,
     NavLogSnapshot, NavSource, PadNavBank,
 };
+use crate::ui::start::mode::{self as start_mode, StartPresentation};
 use crate::ui::start::view::{self as start_view, ReplaceConfirm, StartMessage, StartSlide};
 use crate::ui::theme;
 use crate::ui::toast::ToastMessage;
@@ -64,6 +67,7 @@ use iced::futures::Stream;
 use iced::futures::StreamExt;
 use iced::futures::channel::{mpsc, oneshot};
 use iced::keyboard;
+use iced::mouse;
 use iced::widget::{container, operation, space};
 use iced::{Element, Point, Size, Subscription, Task, Theme, stream, window};
 
@@ -95,6 +99,8 @@ const SNAPSHOT_STALE_MS: u128 = 100;
 const START_NAV_NOT_READY_MS: u128 = 200;
 /// Ignore Start WindowUnfocused briefly after reveal (toast z-order focus blips).
 const START_UNFOCUS_GRACE: Duration = Duration::from_millis(150);
+/// Hide the mouse cursor after this idle while immersive Start covers the primary.
+const START_CURSOR_IDLE_HIDE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -127,6 +133,12 @@ pub enum Message {
     StartOpened(window::Id),
     /// Drive start-screen slide / Triangle-hold animation frames.
     StartFrame,
+    /// Mouse move/button/wheel on a window — used to reset immersive cursor idle hide.
+    StartCursorActivity(window::Id),
+    /// HWND resize finished — apply immersive flag after promote/demote veil.
+    StartImmersiveSettled,
+    /// Background immersive art warm finished — peek cache + fade-in.
+    ImmersiveArtReady,
     Start(StartMessage),
     /// Keyboard while some iced window has focus; filtered to the start screen in update.
     StartKey {
@@ -171,6 +183,8 @@ pub enum Message {
 pub enum StartKeyAction {
     Up,
     Down,
+    Left,
+    Right,
     Confirm,
     Cancel,
 }
@@ -220,6 +234,12 @@ pub struct App {
     /// False until Start is revealed and ready — blocks pad nav / sounds early.
     start_nav_ready: bool,
     start_state: start_view::State,
+    /// Monitor covered while immersive (used to center compact on demote).
+    start_monitor_cover: Option<MonitorCover>,
+    /// Last mouse activity on the Start window (immersive idle cursor hide).
+    start_cursor_last_active: Instant,
+    /// When true, Start view forces [`mouse::Interaction::Hidden`].
+    start_cursor_hidden: bool,
     /// True while an rfd picker is open from the start screen (suppress unfocus-close).
     start_file_dialog_open: bool,
     /// After hide / connect-reveal: ignore reopen until the chord is fully released.
@@ -417,6 +437,9 @@ impl App {
             start_visible: false,
             start_nav_ready: false,
             start_state: start_view::State::default(),
+            start_monitor_cover: None,
+            start_cursor_last_active: Instant::now(),
+            start_cursor_hidden: false,
             start_file_dialog_open: false,
             reopen_needs_chord_release: false,
             start_revealed_at: None,
@@ -520,6 +543,12 @@ impl App {
                         keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
                             Some(StartKeyAction::Down)
                         }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
+                            Some(StartKeyAction::Left)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
+                            Some(StartKeyAction::Right)
+                        }
                         _ => None,
                     }?;
                     Some(Message::StartKey {
@@ -544,6 +573,12 @@ impl App {
                         pressed: false,
                     })
                 }
+                iced::Event::Mouse(
+                    mouse::Event::CursorMoved { .. }
+                    | mouse::Event::ButtonPressed(_)
+                    | mouse::Event::ButtonReleased(_)
+                    | mouse::Event::WheelScrolled { .. },
+                ) => Some(Message::StartCursorActivity(id)),
                 _ => None,
             }),
         ];
@@ -630,12 +665,17 @@ impl App {
         }
 
         if Some(window) == self.start_window {
-            return start_view::view(
+            let stage_h = self.start_monitor_cover.map(|c| c.height).unwrap_or(1080.0);
+            let start = start_view::view(
                 &self.start_state,
                 &self.session.prefs.spectrum,
                 Instant::now(),
+                self.session.prefs.start_screen_always_immersive,
+                &self.session.prefs.start_screen_gesture,
+                stage_h,
             )
             .map(Message::Start);
+            return cursor_hide::force_cursor(start, self.start_cursor_hidden).into();
         }
 
         if Some(window) == self.toast_window {
@@ -760,16 +800,39 @@ impl App {
                     // Raise/focus after create_renderer has a chance to finish —
                     // chaining sync on the same turn as window::open correlated
                     // with atlas create_renderer panics.
-                    window::gain_focus(id)
+                    let mut task = window::gain_focus(id)
                         .chain(raise_window_topmost(id))
-                        .chain(self.sync_toast_zorder())
+                        .chain(self.sync_toast_zorder());
+                    if self.start_state.immersive {
+                        task = task.chain(self.warm_immersive_art_task());
+                    }
+                    task
                 } else {
                     Task::none()
                 }
             }
+            Message::StartImmersiveSettled => self.finish_start_immersive_transition(),
+            Message::ImmersiveArtReady => {
+                let now = Instant::now();
+                if self.start_state.immersive {
+                    if self
+                        .start_state
+                        .rows
+                        .get(self.start_state.game_selected)
+                        .is_some_and(|r| r.backdrop_icon().is_some())
+                    {
+                        self.start_state.note_backdrop_ready(now);
+                    }
+                    crate::controller::hid::diag::diag_info("ui-diag: immersive art warm done");
+                }
+                Task::none()
+            }
             Message::StartFrame => {
                 let now = Instant::now();
                 let _ = self.start_state.tick_anim(now);
+                if let Some(task) = self.tick_immersive_transition_phase(now) {
+                    return task;
+                }
                 // Keyboard-only hold progress when pad poll is not running.
                 if self.start_state.replace_confirm.is_some() {
                     let (progress, completed) =
@@ -783,6 +846,13 @@ impl App {
                 }
                 self.sync_start_held();
                 self.start_state.tick_hint_anims(now);
+                self.tick_start_cursor_idle(now);
+                Task::none()
+            }
+            Message::StartCursorActivity(id) => {
+                if Some(id) == self.start_window && self.start_visible {
+                    self.note_start_cursor_activity();
+                }
                 Task::none()
             }
             Message::Start(message) => {
@@ -807,6 +877,14 @@ impl App {
                         StartKeyAction::Down if pressed => {
                             self.cancel_start_holds();
                             self.on_start_message(StartMessage::MoveDown)
+                        }
+                        StartKeyAction::Left if pressed && self.start_state.immersive => {
+                            self.cancel_start_holds();
+                            self.on_start_message(StartMessage::PrevSlide)
+                        }
+                        StartKeyAction::Right if pressed && self.start_state.immersive => {
+                            self.cancel_start_holds();
+                            self.on_start_message(StartMessage::NextSlide)
                         }
                         StartKeyAction::Confirm => {
                             self.confirm_key_held = pressed;
@@ -1384,6 +1462,7 @@ impl App {
             analytics_enabled: self.session.prefs.analytics_enabled,
             lightbar_enabled: self.session.prefs.lightbar_enabled,
             start_screen_enabled: self.session.prefs.start_screen_enabled,
+            start_screen_always_immersive: self.session.prefs.start_screen_always_immersive,
             start_screen_gesture: self.session.prefs.start_screen_gesture.clone(),
             start_screen_sounds_enabled: self.session.prefs.start_screen_sounds_enabled,
             start_screen_sound_volume: self.session.prefs.start_screen_sound_volume,
@@ -1554,6 +1633,11 @@ impl App {
                         return self.close_start_screen();
                     }
                 }
+                Task::none()
+            }
+            ConfigureMessage::SetStartScreenAlwaysImmersive(enabled) => {
+                self.session.prefs.start_screen_always_immersive = enabled;
+                self.session.prefs.save();
                 Task::none()
             }
             ConfigureMessage::SetStartScreenSounds(enabled) => {
@@ -2266,6 +2350,8 @@ impl App {
     }
 
     fn refresh_steam_library(&self) -> Task<Message> {
+        // List icons only here — full immersive prepare must not block SteamScanDone
+        // (compact stayed on skeletons until every hero/backdrop decoded).
         Task::perform(
             spawn_blocking(|| {
                 let games = steam::list_installed_games()?;
@@ -2297,7 +2383,39 @@ impl App {
         self.steam_scan_pending = false;
         self.match_path_cache.clear();
         self.refresh_start_rows();
-        Task::none()
+        let mut task = self.prepare_immersive_library_task();
+        if self.start_visible && self.start_state.immersive {
+            task = task.chain(self.warm_immersive_art_task());
+        }
+        task
+    }
+
+    /// Offline warm of library hero/backdrop tiers after scan (does not block skeletons).
+    fn prepare_immersive_library_task(&self) -> Task<Message> {
+        let heroes: Vec<_> = self
+            .steam_by_id
+            .values()
+            .filter_map(|g| g.icon_path.clone())
+            .collect();
+        let backdrops: Vec<_> = self
+            .steam_by_id
+            .values()
+            .filter_map(|g| g.backdrop_path.clone())
+            .collect();
+        if heroes.is_empty() && backdrops.is_empty() {
+            return Task::none();
+        }
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: immersive art library prepare begin heroes={} backdrops={}",
+            heroes.len(),
+            backdrops.len()
+        ));
+        Task::perform(
+            spawn_blocking(move || {
+                crate::ui::start::icon_cache::prepare_immersive(&heroes, &backdrops);
+            }),
+            |_| Message::ImmersiveArtReady,
+        )
     }
 
     fn on_manual_file_picked(&mut self, path: Option<PathBuf>) -> Task<Message> {
@@ -2422,11 +2540,38 @@ impl App {
             return Task::none();
         }
 
+        let immersive = matches!(
+            start_mode::on_open(self.session.prefs.start_screen_always_immersive),
+            start_mode::ImmersiveTransition::OpenImmersive
+        );
+        self.start_state.immersive = immersive;
+        self.clear_start_cursor_hide();
+        let (size, position) = if immersive {
+            let cover = primary_monitor_cover().unwrap_or(MonitorCover {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            });
+            self.start_monitor_cover = Some(cover);
+            crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
+            (cover.size(), window::Position::Specific(cover.origin()))
+        } else {
+            self.start_monitor_cover = None;
+            (
+                Size::new(start_view::WIDTH, start_view::HEIGHT),
+                window::Position::Centered,
+            )
+        };
+
         self.start_nav_ready = false;
-        crate::controller::hid::diag::diag_info("ui-diag: start cold open");
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start cold open immersive={}",
+            u8::from(immersive)
+        ));
         let (id, open) = window::open(window::Settings {
-            size: Size::new(start_view::WIDTH, start_view::HEIGHT),
-            position: window::Position::Centered,
+            size,
+            position,
             visible: true,
             resizable: false,
             decorations: false,
@@ -2442,6 +2587,206 @@ impl App {
         self.session.start_auto_open_pending = false;
         crate::platform::wgpu_diag::note_start_open();
         Task::batch([badge, open.map(Message::StartOpened)])
+    }
+
+    fn start_presentation(&self) -> StartPresentation {
+        if self.start_state.immersive {
+            StartPresentation::Immersive
+        } else {
+            StartPresentation::Compact
+        }
+    }
+
+    fn immersive_transition_busy(&self) -> bool {
+        self.start_state.transition.is_some() || self.start_state.transition_phase.is_some()
+    }
+
+    fn enter_start_immersive(&mut self) -> Task<Message> {
+        let Some(_id) = self.start_window.filter(|_| self.start_visible) else {
+            return Task::none();
+        };
+        let Some(_transition) =
+            start_mode::begin_promote(self.start_state.immersive, self.immersive_transition_busy())
+        else {
+            return Task::none();
+        };
+        let cover = primary_monitor_cover().unwrap_or(MonitorCover {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        });
+        self.start_monitor_cover = Some(cover);
+        self.clear_start_cursor_hide();
+        self.reopen_needs_chord_release = true;
+        self.consume_reopen_gesture_chord();
+        crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
+        self.start_state
+            .begin_transition_phase(start_mode::TransitionPhase::ExitCompact, Instant::now());
+        Task::none()
+    }
+
+    fn leave_start_immersive(&mut self) -> Task<Message> {
+        let Some(_id) = self.start_window.filter(|_| self.start_visible) else {
+            return Task::none();
+        };
+        // EnterImmersive veil is interruptible; HWND resize / ExitImmersive are not.
+        let blocked = start_mode::demote_blocked(
+            self.start_state.transition.is_some(),
+            self.start_state.transition_phase.map(|(p, _)| p),
+        );
+        let Some(_transition) = start_mode::begin_demote(self.start_state.immersive, blocked)
+        else {
+            return Task::none();
+        };
+        self.reopen_needs_chord_release = true;
+        self.consume_reopen_gesture_chord();
+        crate::controller::hid::diag::diag_info("ui-diag: start immersive leave");
+        self.clear_start_cursor_hide();
+        self.start_state
+            .begin_transition_phase(start_mode::TransitionPhase::ExitImmersive, Instant::now());
+        Task::none()
+    }
+
+    fn tick_immersive_transition_phase(&mut self, now: Instant) -> Option<Task<Message>> {
+        if !self.start_state.phase_finished(now) {
+            return None;
+        }
+        let phase = self.start_state.transition_phase.map(|(p, _)| p)?;
+        match phase {
+            start_mode::TransitionPhase::ExitCompact => Some(self.perform_immersive_resize(true)),
+            start_mode::TransitionPhase::ExitImmersive => {
+                Some(self.perform_immersive_resize(false))
+            }
+            start_mode::TransitionPhase::EnterImmersive => {
+                self.start_state.clear_transition_phase();
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start immersive transition phase={} done",
+                    phase.label()
+                ));
+                None
+            }
+            start_mode::TransitionPhase::EnterCompact => {
+                self.start_state.clear_transition_phase();
+                self.start_state.ambient_time = 0.0;
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start immersive transition phase={} done",
+                    phase.label()
+                ));
+                // After the Float scale veil clears, force the compact list onto the selection
+                // (stale games_scroll_y from pre-promote often makes into-view a no-op).
+                Some(self.scroll_start_selection_to_center(true))
+            }
+            start_mode::TransitionPhase::Resizing => None,
+        }
+    }
+
+    fn perform_immersive_resize(&mut self, promoting: bool) -> Task<Message> {
+        let Some(id) = self.start_window.filter(|_| self.start_visible) else {
+            self.start_state.clear_transition_phase();
+            return Task::none();
+        };
+        let transition = if promoting {
+            start_mode::StartTransition::Promoting
+        } else {
+            start_mode::StartTransition::Demoting
+        };
+        self.start_state.transition = Some(transition);
+        self.start_state
+            .begin_transition_phase(start_mode::TransitionPhase::Resizing, Instant::now());
+        if promoting {
+            let cover = self.start_monitor_cover.unwrap_or_else(|| {
+                primary_monitor_cover().unwrap_or(MonitorCover {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                })
+            });
+            self.start_monitor_cover = Some(cover);
+            window::resize(id, cover.size())
+                .chain(window::move_to(id, cover.origin()))
+                .chain(Task::done(Message::StartImmersiveSettled))
+        } else {
+            let size = Size::new(start_view::WIDTH, start_view::HEIGHT);
+            let position = self
+                .start_monitor_cover
+                .or_else(primary_monitor_cover)
+                .map(|cover| cover.center_for(size))
+                .unwrap_or(Point::new(
+                    ((1920.0 - size.width) / 2.0).max(0.0),
+                    ((1080.0 - size.height) / 2.0).max(0.0),
+                ));
+            window::resize(id, size)
+                .chain(window::move_to(id, position))
+                .chain(Task::done(Message::StartImmersiveSettled))
+        }
+    }
+
+    fn finish_start_immersive_transition(&mut self) -> Task<Message> {
+        let Some(transition) = self.start_state.transition.take() else {
+            return Task::none();
+        };
+        let immersive = start_mode::settle_immersive(transition);
+        self.start_state.immersive = immersive;
+        self.start_state.dock_expanded = false;
+        self.start_state.slide = StartSlide::Games;
+        // Dock/strip anims cleared via transition phase begin + request_dock defaults.
+        let now = Instant::now();
+        if immersive {
+            // Keep ambient_time; open aperture + chrome.
+            // Re-arm backdrop to the live selection — compact nav leaves a stale key.
+            self.start_state.reset_backdrop_fade();
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start immersive settle promote backdrop re-arm sel={}",
+                self.start_state.game_selected
+            ));
+            self.start_state
+                .begin_transition_phase(start_mode::TransitionPhase::EnterImmersive, now);
+        } else {
+            self.start_monitor_cover = None;
+            self.clear_start_cursor_hide();
+            self.start_state.clear_backdrop_transition();
+            self.start_state
+                .begin_transition_phase(start_mode::TransitionPhase::EnterCompact, now);
+        }
+        self.reopen_needs_chord_release = true;
+        self.consume_reopen_gesture_chord();
+        let kind = if immersive { "promote" } else { "demote" };
+        crate::controller::hid::diag::diag_info(format!("ui-diag: start immersive settle {kind}"));
+        let focus = self
+            .start_window
+            .map(|id| window::gain_focus(id).chain(raise_window_topmost(id)))
+            .unwrap_or_else(Task::none);
+        if immersive {
+            focus.chain(self.warm_immersive_art_task())
+        } else {
+            // Center selection as soon as compact chrome exists; EnterCompact completion
+            // re-centers once the scale Float is gone (see tick_immersive_transition_phase).
+            focus.chain(self.scroll_start_selection_to_center(true))
+        }
+    }
+
+    fn warm_immersive_art_task(&self) -> Task<Message> {
+        let (heroes, shells, backdrops) = self.start_state.immersive_warm_paths();
+        if heroes.is_empty() && shells.is_empty() && backdrops.is_empty() {
+            return Task::none();
+        }
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: immersive art warm begin heroes={} shells={} backdrops={}",
+            heroes.len(),
+            shells.len(),
+            backdrops.len()
+        ));
+        Task::perform(
+            spawn_blocking(move || {
+                crate::ui::start::icon_cache::warm_immersive_paths(&heroes, &backdrops);
+                for path in shells {
+                    let _ = crate::ui::start::icon_cache::hero_for_shell(&path);
+                }
+            }),
+            |_| Message::ImmersiveArtReady,
+        )
     }
 
     /// Mark the live reopen chord as already matched so a sticky hold cannot fire.
@@ -2466,6 +2811,43 @@ impl App {
         self.pad_held = FaceHeld::default();
     }
 
+    fn note_start_cursor_activity(&mut self) {
+        self.start_cursor_last_active = Instant::now();
+        self.set_start_cursor_hidden(false);
+    }
+
+    fn clear_start_cursor_hide(&mut self) {
+        self.start_cursor_last_active = Instant::now();
+        self.set_start_cursor_hidden(false);
+    }
+
+    fn set_start_cursor_hidden(&mut self, hidden: bool) {
+        if self.start_cursor_hidden == hidden {
+            return;
+        }
+        self.start_cursor_hidden = hidden;
+        if hidden {
+            crate::controller::hid::diag::diag_info("ui-diag: start cursor hide");
+        } else {
+            crate::controller::hid::diag::diag_info("ui-diag: start cursor show");
+        }
+    }
+
+    fn tick_start_cursor_idle(&mut self, now: Instant) {
+        if !self.start_visible || !self.start_state.immersive {
+            self.set_start_cursor_hidden(false);
+            return;
+        }
+        if !cursor_on_primary_monitor() {
+            self.set_start_cursor_hidden(false);
+            return;
+        }
+        let idle = now.saturating_duration_since(self.start_cursor_last_active);
+        if idle >= START_CURSOR_IDLE_HIDE {
+            self.set_start_cursor_hidden(true);
+        }
+    }
+
     fn close_start_screen(&mut self) -> Task<Message> {
         // Clear visibility before any hide task so Resting toast RaiseInteractive
         // cannot resurface Start while the hide is in flight.
@@ -2474,6 +2856,10 @@ impl App {
         self.sync_client_input_hot();
         self.start_nav_ready = false;
         self.start_revealed_at = None;
+        self.start_state.immersive = false;
+        self.start_state.clear_immersive_session();
+        self.start_monitor_cover = None;
+        self.clear_start_cursor_hide();
         self.reopen_needs_chord_release = true;
         self.haptic_pad_serial = None;
         if self.client_mode {
@@ -2561,6 +2947,13 @@ impl App {
         }
         match message {
             StartMessage::Launch(index) => {
+                if self.start_state.immersive
+                    && index < self.start_state.rows.len()
+                    && index != self.start_state.game_selected
+                {
+                    // Neighbor capsule click selects only (center / Cross launches).
+                    return self.on_start_message(StartMessage::SelectGame(index));
+                }
                 if index < self.start_state.rows.len() {
                     self.start_state.game_selected = index;
                 }
@@ -2575,10 +2968,30 @@ impl App {
                     }
                 } else if self.launch_selected() {
                     self.play_start_cue(UiSoundKind::Action);
-                    scroll
+                    if self.start_state.immersive {
+                        scroll.chain(self.close_start_screen())
+                    } else {
+                        scroll
+                    }
                 } else {
                     scroll
                 }
+            }
+            StartMessage::SelectGame(index) => {
+                if index >= self.start_state.rows.len() || index == self.start_state.game_selected {
+                    return Task::none();
+                }
+                let prev_game = self.start_state.game_selected;
+                self.start_state.game_selected = index;
+                let mut task = self.scroll_start_selection_into_view();
+                if self.start_state.immersive {
+                    self.start_state
+                        .begin_strip_anim(prev_game as f32, Instant::now());
+                    self.start_state.reset_backdrop_fade();
+                    task = task.chain(self.warm_immersive_art_task());
+                }
+                self.play_start_cue(UiSoundKind::Nav);
+                task
             }
             StartMessage::SelectController(index) => {
                 if index < self.start_state.controllers.len()
@@ -2587,25 +3000,50 @@ impl App {
                     self.start_state.controller_selected = index;
                     self.play_start_cue(UiSoundKind::Nav);
                 }
+                if self.start_state.immersive && !self.start_state.dock_expanded {
+                    let _ = self.start_state.request_dock(true, Instant::now());
+                }
                 self.scroll_start_selection_into_view()
             }
             StartMessage::MoveUp => {
+                let prev_game = self.start_state.game_selected;
                 let direction = self.start_state.move_selection(-1);
+                let mut task = self.scroll_start_selection_into_view_dir(
+                    direction.unwrap_or(start_view::ScrollReveal::Up),
+                );
                 if direction.is_some() {
                     self.play_start_cue(UiSoundKind::Nav);
+                    if self.start_state.immersive
+                        && matches!(self.start_state.slide, StartSlide::Games)
+                        && self.start_state.game_selected != prev_game
+                    {
+                        self.start_state
+                            .begin_strip_anim(prev_game as f32, Instant::now());
+                        self.start_state.reset_backdrop_fade();
+                        task = task.chain(self.warm_immersive_art_task());
+                    }
                 }
-                self.scroll_start_selection_into_view_dir(
-                    direction.unwrap_or(start_view::ScrollReveal::Up),
-                )
+                task
             }
             StartMessage::MoveDown => {
+                let prev_game = self.start_state.game_selected;
                 let direction = self.start_state.move_selection(1);
+                let mut task = self.scroll_start_selection_into_view_dir(
+                    direction.unwrap_or(start_view::ScrollReveal::Down),
+                );
                 if direction.is_some() {
                     self.play_start_cue(UiSoundKind::Nav);
+                    if self.start_state.immersive
+                        && matches!(self.start_state.slide, StartSlide::Games)
+                        && self.start_state.game_selected != prev_game
+                    {
+                        self.start_state
+                            .begin_strip_anim(prev_game as f32, Instant::now());
+                        self.start_state.reset_backdrop_fade();
+                        task = task.chain(self.warm_immersive_art_task());
+                    }
                 }
-                self.scroll_start_selection_into_view_dir(
-                    direction.unwrap_or(start_view::ScrollReveal::Down),
-                )
+                task
             }
             StartMessage::Confirm => self.on_start_confirm(),
             StartMessage::Close => {
@@ -2619,42 +3057,72 @@ impl App {
                     self.play_start_cue(UiSoundKind::Action);
                     self.cancel_start_edit()
                 } else if self.start_visible {
+                    // Immersive + dock open: Circle collapses the drawer first (same as Left).
+                    if self.start_state.immersive
+                        && start_mode::dock_collapse_target(self.start_state.dock_expanded)
+                            .is_some()
+                        && self.start_state.request_dock(false, Instant::now())
+                    {
+                        self.play_start_cue(UiSoundKind::Slide);
+                        crate::controller::hid::diag::diag_info(
+                            "ui-diag: start dock collapse (cancel)",
+                        );
+                        return Task::none();
+                    }
                     self.play_start_cue(UiSoundKind::Action);
-                    self.close_start_screen()
+                    match start_mode::on_cancel(
+                        self.start_presentation(),
+                        self.session.prefs.start_screen_always_immersive,
+                    ) {
+                        start_mode::ImmersiveTransition::Demote => self.leave_start_immersive(),
+                        _ => self.close_start_screen(),
+                    }
                 } else {
                     Task::none()
                 }
             }
             StartMessage::PrevSlide => {
-                if self.start_state.overlay_blocking() {
+                if self.start_state.overlay_blocking() || self.start_state.transition.is_some() {
                     return Task::none();
                 }
                 if self.start_state.editing {
                     self.discard_edit_draft();
                     self.refresh_start_rows();
                 }
-                // L2: Controllers → Games only (no wrap). Interruptible mid-anim.
-                if self
-                    .start_state
-                    .request_slide(StartSlide::Games, Instant::now())
-                {
+                let now = Instant::now();
+                if self.start_state.immersive {
+                    // Left: collapse controllers island.
+                    if start_mode::dock_collapse_target(self.start_state.dock_expanded).is_some()
+                        && self.start_state.request_dock(false, now)
+                    {
+                        self.play_start_cue(UiSoundKind::Slide);
+                        crate::controller::hid::diag::diag_info("ui-diag: start dock collapse");
+                    }
+                } else if self.start_state.request_slide(StartSlide::Games, now) {
+                    // Left: Controllers → Games only (no wrap). Interruptible mid-anim.
                     self.play_start_cue(UiSoundKind::Slide);
                 }
                 Task::none()
             }
             StartMessage::NextSlide => {
-                if self.start_state.overlay_blocking() {
+                if self.start_state.overlay_blocking() || self.start_state.transition.is_some() {
                     return Task::none();
                 }
                 if self.start_state.editing {
                     self.discard_edit_draft();
                     self.refresh_start_rows();
                 }
-                // R2: Games → Controllers only (no wrap). Interruptible mid-anim.
-                if self
-                    .start_state
-                    .request_slide(StartSlide::Controllers, Instant::now())
-                {
+                let now = Instant::now();
+                if self.start_state.immersive {
+                    // Right: expand controllers island.
+                    if start_mode::dock_expand_target(self.start_state.dock_expanded).is_some()
+                        && self.start_state.request_dock(true, now)
+                    {
+                        self.play_start_cue(UiSoundKind::Slide);
+                        crate::controller::hid::diag::diag_info("ui-diag: start dock expand");
+                    }
+                } else if self.start_state.request_slide(StartSlide::Controllers, now) {
+                    // Right: Games → Controllers only (no wrap). Interruptible mid-anim.
                     self.play_start_cue(UiSoundKind::Slide);
                 }
                 Task::none()
@@ -3030,6 +3498,9 @@ impl App {
             StartSlide::Games => {
                 if self.launch_selected() {
                     self.play_start_cue(UiSoundKind::Action);
+                    if self.start_state.immersive {
+                        return self.close_start_screen();
+                    }
                 }
                 Task::none()
             }
@@ -3058,7 +3529,9 @@ impl App {
         self.start_state.cross_progress = 0.0;
         self.close_running_game();
         self.start_state.game_selected = confirm.next_index;
-        let _ = self.launch_selected();
+        if self.launch_selected() && self.start_state.immersive {
+            return self.close_start_screen();
+        }
         Task::none()
     }
 
@@ -3261,9 +3734,18 @@ impl App {
     fn handle_start_nav_readings(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
         self.nav_missing_warned = false;
 
+        let gesture = &self.session.prefs.start_screen_gesture;
+        self.start_state.reopen_chord_held =
+            start_mode::promote_gesture_usable(gesture) && chord_held_on_any_pad(gesture, readings);
+
+        // Reopen chord toggles compact ↔ immersive (service only listens when closed).
+        if let Some(toggle) = self.try_toggle_immersive_from_gesture(readings) {
+            return toggle;
+        }
+
         let now = Instant::now();
         let animating = self.start_state.animating();
-        // Mid-slide: keep L2/R2 edges live for interruptible request_slide,
+        // Mid-slide: keep Left/Right nav live for interruptible request_slide,
         // but skip controller-row rebuilds (those hitch the UI thread).
         let badge_task = if !animating {
             let controllers_started = Instant::now();
@@ -3312,10 +3794,13 @@ impl App {
                 .start_state
                 .selected_controller()
                 .is_some_and(|row| row.show_power_off());
+        // Immersive: left/right slides. Compact: L2/R2 slides (stepper stays vertical-only).
+        let horizontal_nav = self.start_state.immersive;
         let tick = self.pad_nav.tick(
             readings,
             now,
             allow_nav_move,
+            horizontal_nav,
             replace_confirm && !animating,
             editing,
             hold_cross_close,
@@ -3328,10 +3813,11 @@ impl App {
             if !self.nav_unarmed_warned {
                 if let Some(diag) = &tick.diag {
                     app_log::warn(format!(
-                        "start-nav: pad unarmed waiting for rest (stick_y={:.3} l2={} r2={} cross={} circle={})",
+                        "start-nav: pad unarmed waiting for rest (stick_x={:.3} stick_y={:.3} dpad_l={} dpad_r={} cross={} circle={})",
+                        diag.sample.stick_x,
                         diag.sample.stick_y,
-                        u8::from(diag.sample.l2),
-                        u8::from(diag.sample.r2),
+                        u8::from(diag.sample.dpad_left),
+                        u8::from(diag.sample.dpad_right),
                         u8::from(diag.sample.cross),
                         u8::from(diag.sample.circle),
                     ));
@@ -3523,6 +4009,46 @@ impl App {
         }
     }
 
+    /// Rising-edge reopen chord while Start is open → promote or demote (not when always-immersive).
+    fn try_toggle_immersive_from_gesture(
+        &mut self,
+        readings: &[start_input::NavReading],
+    ) -> Option<Task<Message>> {
+        if !self.start_visible || readings.is_empty() {
+            return None;
+        }
+        if self.start_state.overlay_blocking() || self.start_state.transition.is_some() {
+            return None;
+        }
+        let required = &self.session.prefs.start_screen_gesture;
+        if required.is_empty() || start_mode::chord_is_circle_only(required) {
+            return None;
+        }
+        if self.reopen_needs_chord_release {
+            if chord_held_on_any_pad(required, readings) {
+                return None;
+            }
+            self.reopen_needs_chord_release = false;
+        }
+        if !self.gesture_detectors.update(required, readings) {
+            return None;
+        }
+        let always = self.session.prefs.start_screen_always_immersive;
+        match start_mode::on_reopen_chord(self.start_presentation(), always) {
+            start_mode::ImmersiveTransition::Promote => {
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: reopen gesture promote immersive",
+                );
+                Some(self.enter_start_immersive())
+            }
+            start_mode::ImmersiveTransition::Demote => {
+                crate::controller::hid::diag::diag_info("ui-diag: reopen gesture demote immersive");
+                Some(self.leave_start_immersive())
+            }
+            _ => None,
+        }
+    }
+
     fn apply_pad_input_panel_from_readings(&mut self, readings: &[start_input::NavReading]) {
         let next = if let Some(reading) = start_input::preferred_reading(readings) {
             let held: Vec<_> = reading.sample.held.iter().copied().collect();
@@ -3534,9 +4060,15 @@ impl App {
                 circle: reading.sample.circle,
                 dpad_up: reading.sample.dpad_up,
                 dpad_down: reading.sample.dpad_down,
-                stick_band: start_input::StickBand::from_stick_y(reading.sample.stick_y)
-                    .as_str()
-                    .to_string(),
+                dpad_left: reading.sample.dpad_left,
+                dpad_right: reading.sample.dpad_right,
+                stick_band: start_input::StickBand::from_stick(
+                    reading.sample.stick_x,
+                    reading.sample.stick_y,
+                )
+                .as_str()
+                .to_string(),
+                stick_x: reading.sample.stick_x,
                 stick_y: reading.sample.stick_y,
                 held: gesture::format_gesture(&held),
             }

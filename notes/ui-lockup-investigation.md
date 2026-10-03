@@ -58,6 +58,7 @@ Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**
 - `hid-diag: worker stall kind=op|idle last_op=... gap_ms=... tier=250|500|1000|2000|5000`
 - `start-nav: no … snapshot` / `snapshot restored` / `snapshot stale`
 - `ui-diag: pad-poll stall` / `pad-poll slow` / `process-enum`
+- `ui-diag: start cursor hide` / `start cursor show` — immersive idle cursor hide (debug builds)
 - `HITCH_MARK kind=lightbar|input source=hotkey|button`
 - `PANIC at file:line:col: …` — custom hook in [`app_log::init`](../src/app_log.rs); required because `windows_subsystem = "windows"` discards stderr panic text (exit 101 with an empty console)
 - `PANIC_BACKTRACE …` — capped `Backtrace::force_capture()` right after `PANIC at` (all builds); use to tell iced atlas/main-thread from the image worker
@@ -336,3 +337,11 @@ While Start / pad-input is hot, **do not** run exclusive battery `Poll` (`drop_a
 Cold (tray idle): classic timed `Poll` unchanged.
 
 Debug grep: `service: hot path waiting for live battery sample`, `service: hot lightbar connect`, `service: hot lightbar color`, `hid-diag: sample short`.
+
+## Start immersive mode
+
+Compact Start (640×500) can promote to a borderless primary-monitor cover. Pref `start_screen_always_immersive` opens immersive only and makes Circle/Escape close (no demote). When off, the reopen chord toggles compact ↔ immersive; Circle/Escape demotes (`Back`). Successful launch while immersive closes Start so a topmost cover cannot sit above the game.
+
+Promote/demote ceremony: ExitCompact blackout → HWND resize under veil → EnterImmersive immersive chrome under one full-bleed veil (ease-in lift); demote ExitImmersive full-bleed veil → resize → EnterCompact (+ scroll selection into view). Never paint immersive chrome at the wrong HWND size. Immersive art is off-thread; backdrops crossfade (~0.45s) then ken-burns settle (~10s). Controllers dock is a right-side floating capsule island (same glass as footer hints), vertically inset so it clears the footer; unified fixed-height rows wipe via `WidthReveal` (full dock width layout + scissor peek→expand). Immersive dock peek↔expand uses Left/Right (dpad, stick, arrow keys); compact carousel still uses L2/R2. Dock face hints omit Float scale so row height stays locked. Strip Up/Down gated while `strip_anim` is active. Game/controller lists are pad-only (no mouse press/hover); edit actions stay clickable.
+
+Debug grep: `ui-diag: start immersive enter`, `ui-diag: start immersive leave`, `ui-diag: start immersive settle promote|demote`, `ui-diag: start immersive transition phase=`, `ui-diag: immersive art prepare`, `ui-diag: immersive art warm begin|done`, `ui-diag: reopen gesture promote immersive`, `ui-diag: start cold open immersive=`, `ui-diag: start dock expand|collapse`, `ui-diag: shader ambient pipeline ready`, `ui-diag: icon handle path=`.

@@ -63,7 +63,7 @@ where
         ToastTrailing::Percent { percent, eta } => row![
             rail,
             body,
-            percent_ring::percent_ring(*percent, accent, TOAST_SIZE, eta.clone())
+            percent_ring::percent_ring(*percent, accent, TOAST_SIZE, eta.clone(), 1.0)
         ]
         .spacing(PADDING)
         .align_y(Alignment::Center)

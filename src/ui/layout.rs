@@ -34,6 +34,33 @@ pub struct ToastArea {
     pub height: f32,
 }
 
+/// Full monitor rectangle in logical pixels (covers the taskbar).
+#[derive(Debug, Clone, Copy)]
+pub struct MonitorCover {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl MonitorCover {
+    pub fn size(self) -> Size {
+        Size::new(self.width, self.height)
+    }
+
+    pub fn origin(self) -> Point {
+        Point::new(self.x, self.y)
+    }
+
+    /// Center a window of `size` inside this monitor.
+    pub fn center_for(self, size: Size) -> Point {
+        Point::new(
+            self.x + ((self.width - size.width) / 2.0).max(0.0),
+            self.y + ((self.height - size.height) / 2.0).max(0.0),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ToastPlacement {
     pub x: f32,
@@ -322,6 +349,47 @@ pub fn advance_toast_slide(
     (new_elapsed, progress, capped)
 }
 
+/// Primary-monitor full cover in logical pixels (taskbar included).
+pub fn primary_monitor_cover() -> Option<MonitorCover> {
+    #[cfg(windows)]
+    {
+        primary_monitor_metrics().map(|m| m.cover)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Whether the system cursor is currently on the primary monitor.
+///
+/// Used for immersive Start idle cursor hide — secondary monitors keep a visible
+/// cursor even while Start covers the primary.
+pub fn cursor_on_primary_monitor() -> bool {
+    #[cfg(windows)]
+    {
+        unsafe {
+            let mut point = win32::Point::default();
+            if win32::GetCursorPos(&mut point) == 0 {
+                return false;
+            }
+            let primary = win32::MonitorFromPoint(
+                win32::Point { x: 0, y: 0 },
+                win32::MONITOR_DEFAULTTOPRIMARY,
+            );
+            if primary == 0 {
+                return false;
+            }
+            let under_cursor = win32::MonitorFromPoint(point, win32::MONITOR_DEFAULTTONULL);
+            under_cursor != 0 && under_cursor == primary
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Primary-monitor toast target in logical pixels.
 ///
 /// Uses the Windows work area so a visible taskbar is cleared, while an
@@ -329,6 +397,29 @@ pub fn advance_toast_slide(
 /// toasts sit near the screen edge. Fullscreen apps get the full monitor.
 #[cfg(windows)]
 fn primary_toast_area() -> Option<ToastArea> {
+    let metrics = primary_monitor_metrics()?;
+    let area = if metrics.foreground_covers_monitor {
+        metrics.cover
+    } else {
+        metrics.work
+    };
+    Some(ToastArea {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height,
+    })
+}
+
+#[cfg(windows)]
+struct PrimaryMonitorMetrics {
+    cover: MonitorCover,
+    work: MonitorCover,
+    foreground_covers_monitor: bool,
+}
+
+#[cfg(windows)]
+fn primary_monitor_metrics() -> Option<PrimaryMonitorMetrics> {
     unsafe {
         let monitor =
             win32::MonitorFromPoint(win32::Point { x: 0, y: 0 }, win32::MONITOR_DEFAULTTOPRIMARY);
@@ -346,18 +437,6 @@ fn primary_toast_area() -> Option<ToastArea> {
             return None;
         }
 
-        let foreground = win32::GetForegroundWindow();
-        let mut foreground_rect = win32::Rect::default();
-        let got_foreground =
-            foreground != 0 && win32::GetWindowRect(foreground, &mut foreground_rect) != 0;
-        let fullscreen = got_foreground
-            && foreground_rect.left <= info.monitor.left + 2
-            && foreground_rect.top <= info.monitor.top + 2
-            && foreground_rect.right >= info.monitor.right - 2
-            && foreground_rect.bottom >= info.monitor.bottom - 2;
-
-        let area = if fullscreen { info.monitor } else { info.work };
-
         let mut dpi_x = 0u32;
         let mut dpi_y = 0u32;
         let dpi_ok =
@@ -365,11 +444,27 @@ fn primary_toast_area() -> Option<ToastArea> {
                 && dpi_x > 0;
         let scale = if dpi_ok { dpi_x as f32 / 96.0 } else { 1.0 };
 
-        Some(ToastArea {
-            x: area.left as f32 / scale,
-            y: area.top as f32 / scale,
-            width: (area.right - area.left).max(1) as f32 / scale,
-            height: (area.bottom - area.top).max(1) as f32 / scale,
+        let to_cover = |rect: win32::Rect| MonitorCover {
+            x: rect.left as f32 / scale,
+            y: rect.top as f32 / scale,
+            width: (rect.right - rect.left).max(1) as f32 / scale,
+            height: (rect.bottom - rect.top).max(1) as f32 / scale,
+        };
+
+        let foreground = win32::GetForegroundWindow();
+        let mut foreground_rect = win32::Rect::default();
+        let got_foreground =
+            foreground != 0 && win32::GetWindowRect(foreground, &mut foreground_rect) != 0;
+        let foreground_covers_monitor = got_foreground
+            && foreground_rect.left <= info.monitor.left + 2
+            && foreground_rect.top <= info.monitor.top + 2
+            && foreground_rect.right >= info.monitor.right - 2
+            && foreground_rect.bottom >= info.monitor.bottom - 2;
+
+        Some(PrimaryMonitorMetrics {
+            cover: to_cover(info.monitor),
+            work: to_cover(info.work),
+            foreground_covers_monitor,
         })
     }
 }

@@ -4,6 +4,7 @@ pub mod icon;
 pub mod layout;
 pub mod percent_ring;
 pub mod popup;
+pub mod shader;
 pub mod start;
 pub mod svg_icon;
 pub mod theme;

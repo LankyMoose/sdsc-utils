@@ -130,6 +130,7 @@ pub struct ConfigureSettings {
     pub analytics_enabled: bool,
     pub lightbar_enabled: bool,
     pub start_screen_enabled: bool,
+    pub start_screen_always_immersive: bool,
     pub start_screen_gesture: Vec<GestureControl>,
     pub start_screen_sounds_enabled: bool,
     pub start_screen_sound_volume: u8,
@@ -153,7 +154,10 @@ pub struct PadInputPanel {
     pub circle: bool,
     pub dpad_up: bool,
     pub dpad_down: bool,
+    pub dpad_left: bool,
+    pub dpad_right: bool,
     pub stick_band: String,
+    pub stick_x: f32,
     pub stick_y: f32,
     pub held: String,
 }
@@ -196,6 +200,7 @@ pub enum ConfigureMessage {
     SetAnalyticsEnabled(bool),
     SetLightbarEnabled(bool),
     SetStartScreenEnabled(bool),
+    SetStartScreenAlwaysImmersive(bool),
     SetStartScreenSounds(bool),
     SetStartScreenSoundVolume(u8),
     SetStartScreenHaptics(bool),
@@ -600,6 +605,15 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
     );
 
     if settings.start_screen_enabled {
+        items = items.push(
+            checkbox(settings.start_screen_always_immersive)
+                .label("Always immersive")
+                .size(16.0)
+                .text_size(13.0)
+                .spacing(8)
+                .on_toggle(ConfigureMessage::SetStartScreenAlwaysImmersive),
+        );
+
         items = items.push(text("Reopen gesture").size(13.0).color(theme::INK));
         items = items.push(
             text(gesture::format_gesture(&settings.start_screen_gesture))
@@ -1034,9 +1048,11 @@ fn pad_input_view<'a>(panel: &'a PadInputPanel) -> Element<'a, ConfigureMessage>
             bit("circle", panel.circle),
             bit("dpad_up", panel.dpad_up),
             bit("dpad_down", panel.dpad_down),
+            bit("dpad_left", panel.dpad_left),
+            bit("dpad_right", panel.dpad_right),
             text(format!(
-                "stick={}  stick_y={:.2}",
-                panel.stick_band, panel.stick_y
+                "stick={}  stick_x={:.2}  stick_y={:.2}",
+                panel.stick_band, panel.stick_x, panel.stick_y
             ))
             .size(13.0)
             .color(theme::INK),
