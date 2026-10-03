@@ -55,6 +55,9 @@ const ACTIVE_POLL: Duration = Duration::from_millis(4);
 const IDENTIFY_SAMPLE_POLL: Duration = Duration::from_millis(4);
 const IDENTIFY_WRITES: u32 = IDENTIFY_FLASH_COUNT * 2;
 const SAMPLE_STALL_MS: u128 = 100;
+/// Consecutive sample timeouts before dropping a pad from the hot-path live map
+/// (~200ms at [`ACTIVE_POLL`] / wired report interval). HID handle stays open.
+const LIVE_SILENCE_TIMEOUTS: u32 = 50;
 
 enum HidCmd {
     Poll {
@@ -92,6 +95,24 @@ struct OpenDevice {
     device: HidDevice,
     is_bluetooth: bool,
     product: String,
+    /// Consecutive [`ShortSampleOutcome::Timeout`] while this pad is sampled.
+    /// Stored on the open handle so Identify-only sampling does not age other pads.
+    silence_timeouts: u32,
+}
+
+/// After one sample timeout: new streak and whether the pad should leave `live_pads`.
+fn advance_silence_streak(prev: u32) -> (u32, bool) {
+    let next = prev.saturating_add(1);
+    (next, next >= LIVE_SILENCE_TIMEOUTS)
+}
+
+fn open_device(device: HidDevice, is_bluetooth: bool, product: String) -> OpenDevice {
+    OpenDevice {
+        device,
+        is_bluetooth,
+        product,
+        silence_timeouts: 0,
+    }
 }
 
 /// Keeps `HidApi` alive with per-serial open handles for **input** sampling.
@@ -206,11 +227,11 @@ impl DeviceCache {
             };
             if replace {
                 best = Some((
-                    OpenDevice {
+                    open_device(
                         device,
                         is_bluetooth,
-                        product: product_name(info.product_id()).to_string(),
-                    },
+                        product_name(info.product_id()).to_string(),
+                    ),
                     is_usb,
                 ));
             }
@@ -312,11 +333,11 @@ impl DeviceCache {
                 best.insert(
                     identity,
                     (
-                        OpenDevice {
+                        open_device(
                             device,
                             is_bluetooth,
-                            product: product_name(info.product_id()).to_string(),
-                        },
+                            product_name(info.product_id()).to_string(),
+                        ),
                         is_usb,
                     ),
                 );
@@ -487,11 +508,11 @@ fn open_rumble_device(api: &HidApi, target: &str) -> Option<OpenDevice> {
                 lightbar::prepare_bt_output_mode(&device);
             }
             best = Some((
-                OpenDevice {
+                open_device(
                     device,
                     is_bluetooth,
-                    product: product_name(info.product_id()).to_string(),
-                },
+                    product_name(info.product_id()).to_string(),
+                ),
                 rank,
             ));
         }
@@ -800,23 +821,51 @@ fn sample_one(
     input_hot: bool,
 ) -> SampleOneResult {
     let _op = crate::controller::hid::diag::enter_op("sample_one");
-    let open = match cache.ensure(serial) {
-        Ok(o) => o,
-        Err(_) => {
-            forget_live_pad(live_pads, serial);
-            return SampleOneResult::HardFail;
-        }
+    if cache.ensure(serial).is_err() {
+        forget_live_pad(live_pads, serial);
+        return SampleOneResult::HardFail;
+    }
+    let key = normalize_identity(serial);
+    let (is_bluetooth, product) = {
+        let open = cache.devices.get(&key).expect("ensure inserted");
+        (open.is_bluetooth, open.product.clone())
     };
-    let is_bluetooth = open.is_bluetooth;
-    let product = open.product.clone();
-    match start_input::read_device_sample_short(&open.device, is_bluetooth, serial, input_hot) {
+    let outcome = {
+        let open = cache.devices.get(&key).expect("ensure inserted");
+        start_input::read_device_sample_short(&open.device, is_bluetooth, serial, input_hot)
+    };
+    match outcome {
         ShortSampleOutcome::Ok { sample, battery } => {
+            if let Some(open) = cache.devices.get_mut(&key) {
+                open.silence_timeouts = 0;
+            }
             if let Some(reading) = battery {
                 remember_live_pad(live_pads, serial, product, reading);
             }
             SampleOneResult::Ok(start_input::hid_nav_reading(serial, sample))
         }
-        ShortSampleOutcome::Timeout => SampleOneResult::Timeout,
+        ShortSampleOutcome::Timeout => {
+            let prev = cache
+                .devices
+                .get(&key)
+                .map(|o| o.silence_timeouts)
+                .unwrap_or(0);
+            let (next, drop_live) = advance_silence_streak(prev);
+            if let Some(open) = cache.devices.get_mut(&key) {
+                open.silence_timeouts = next;
+            }
+            if drop_live {
+                if next == LIVE_SILENCE_TIMEOUTS {
+                    crate::controller::hid::diag::diag_info(format!(
+                        "hid-diag: live silence serial={serial} timeouts={next}"
+                    ));
+                }
+                forget_live_pad(live_pads, serial);
+                SampleOneResult::Silent
+            } else {
+                SampleOneResult::Timeout
+            }
+        }
         ShortSampleOutcome::Fail(_) => {
             cache.drop_serial(serial);
             forget_live_pad(live_pads, serial);
@@ -856,6 +905,9 @@ enum SampleOneResult {
     Ok(NavReading),
     /// Keep handle; caller should reuse the previous snapshot reading.
     Timeout,
+    /// Pad went silent long enough: drop from live battery / stop republishing nav.
+    /// Handle stays open until a real I/O error or the device leaves the HID list.
+    Silent,
     HardFail,
 }
 
@@ -957,7 +1009,7 @@ fn sample_all_inputs(
                     out.push(prev.clone());
                 }
             }
-            SampleOneResult::HardFail => {}
+            SampleOneResult::Silent | SampleOneResult::HardFail => {}
         }
     }
     let reason = if out.len() < cached && cached > 0 {
@@ -1019,7 +1071,7 @@ fn sample_serial_into_snapshot(
                 start_input::push_input_edge(edge);
             }
         }
-        SampleOneResult::Timeout | SampleOneResult::HardFail => {}
+        SampleOneResult::Timeout | SampleOneResult::Silent | SampleOneResult::HardFail => {}
     }
 }
 
@@ -1826,5 +1878,22 @@ mod tests {
         let p = pending.as_ref().expect("pending");
         assert_eq!(p.serials, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(p.not_before, late);
+    }
+
+    #[test]
+    fn silence_streak_holds_until_threshold() {
+        assert_eq!(advance_silence_streak(0), (1, false));
+        assert_eq!(
+            advance_silence_streak(LIVE_SILENCE_TIMEOUTS - 2),
+            (LIVE_SILENCE_TIMEOUTS - 1, false)
+        );
+        assert_eq!(
+            advance_silence_streak(LIVE_SILENCE_TIMEOUTS - 1),
+            (LIVE_SILENCE_TIMEOUTS, true)
+        );
+        assert_eq!(
+            advance_silence_streak(LIVE_SILENCE_TIMEOUTS),
+            (LIVE_SILENCE_TIMEOUTS + 1, true)
+        );
     }
 }

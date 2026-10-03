@@ -215,10 +215,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 Duration::from_secs(3)
             };
+        let mut presence_changed = false;
         if presence_due {
             last_presence_check = Instant::now();
             let presence = hid_worker.presence_paths();
-            let presence_changed = presence != last_discovered;
+            presence_changed = presence != last_discovered;
             if presence_changed {
                 last_discovered = presence.clone();
             }
@@ -235,35 +236,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         lightbar_enabled: lightbar::is_enabled(),
                     },
                 );
+                // Shell refreshes compact Controllers from Controllers IPC only.
+                let _ = pipe.send(ServiceMessage::Controllers(session.controllers.clone()));
                 dispatch_effects(&mut session, &hid_worker, &pipe, &mut tray, effects);
                 last_battery_poll = Instant::now();
-            } else if nav_priority {
-                // Hot path: battery + membership from the input sample stream.
-                // Never drop_all Poll — that starves Start nav.
-                let live = hid_worker.live_controllers();
-                if live.is_empty() && !presence.is_empty() {
-                    // Waiting for the first sample after a pad joined — keep session.
-                    if presence_changed {
-                        crate::controller::hid::diag::diag_info(
-                            "service: hot path waiting for live battery sample",
-                        );
-                    }
-                } else if !controllers_equivalent(&session.controllers, &live) || presence_changed {
-                    apply_hot_path_lightbar(&hid_worker, &session.controllers, &live);
-                    last_battery_poll = Instant::now();
-                    let effects = session.on_poll_result(
-                        live.clone(),
-                        ApplyContext {
-                            start_visible,
-                            fullscreen: start_input::foreground_is_exclusive_fullscreen(),
-                            now: Instant::now(),
-                            lightbar_enabled: lightbar::is_enabled(),
-                        },
-                    );
-                    let _ = pipe.send(ServiceMessage::Controllers(live));
-                    dispatch_effects(&mut session, &hid_worker, &pipe, &mut tray, effects);
-                }
-            } else {
+            } else if !nav_priority {
                 // Cold path (tray idle): classic exclusive Poll for battery/liveness.
                 let battery_due = last_battery_poll.elapsed() >= BATTERY_INTERVAL;
                 let liveness_due = last_battery_poll.elapsed() >= LIVENESS_INTERVAL
@@ -282,7 +259,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     match poll_sync(&hid_worker, previously) {
                         Ok(controllers) => {
                             let effects = session.on_poll_result(
-                                controllers.clone(),
+                                controllers,
                                 ApplyContext {
                                     start_visible,
                                     fullscreen: start_input::foreground_is_exclusive_fullscreen(),
@@ -290,12 +267,44 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     lightbar_enabled: lightbar::is_enabled(),
                                 },
                             );
-                            let _ = pipe.send(ServiceMessage::Controllers(controllers));
+                            let _ =
+                                pipe.send(ServiceMessage::Controllers(session.controllers.clone()));
                             dispatch_effects(&mut session, &hid_worker, &pipe, &mut tray, effects);
                         }
                         Err(err) => app_log::warn(format!("service poll failed: {err}")),
                     }
                 }
+            }
+        }
+
+        // Hot path: every service loop (~16ms) so silence drops update Start quickly.
+        // Skip when HID presence is empty — stale live_pads must not re-add pads.
+        if nav_priority && !last_discovered.is_empty() {
+            let live = hid_worker.live_controllers();
+            if hot_path_wait_for_first_sample(
+                live.is_empty(),
+                !last_discovered.is_empty(),
+                session.controllers.is_empty(),
+            ) {
+                if presence_changed {
+                    crate::controller::hid::diag::diag_info(
+                        "service: hot path waiting for live battery sample",
+                    );
+                }
+            } else if !controllers_equivalent(&session.controllers, &live) || presence_changed {
+                apply_hot_path_lightbar(&hid_worker, &session.controllers, &live);
+                last_battery_poll = Instant::now();
+                let effects = session.on_poll_result(
+                    live,
+                    ApplyContext {
+                        start_visible,
+                        fullscreen: start_input::foreground_is_exclusive_fullscreen(),
+                        now: Instant::now(),
+                        lightbar_enabled: lightbar::is_enabled(),
+                    },
+                );
+                let _ = pipe.send(ServiceMessage::Controllers(session.controllers.clone()));
+                dispatch_effects(&mut session, &hid_worker, &pipe, &mut tray, effects);
             }
         }
 
@@ -616,6 +625,16 @@ fn pump_win_messages() {
 #[cfg(not(windows))]
 fn pump_win_messages() {}
 
+/// Keep the session while HID lists a pad but the hot sample stream has no
+/// battery yet — only when we do not already show that pad as connected.
+fn hot_path_wait_for_first_sample(
+    live_empty: bool,
+    presence_nonempty: bool,
+    session_empty: bool,
+) -> bool {
+    live_empty && presence_nonempty && session_empty
+}
+
 /// What the service should do after one reopen-gesture sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReopenGestureOutcome {
@@ -654,6 +673,14 @@ fn reopen_gesture_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_for_first_sample_only_when_session_empty() {
+        assert!(hot_path_wait_for_first_sample(true, true, true));
+        assert!(!hot_path_wait_for_first_sample(true, true, false));
+        assert!(!hot_path_wait_for_first_sample(true, false, true));
+        assert!(!hot_path_wait_for_first_sample(false, true, true));
+    }
 
     #[test]
     fn reopen_sends_now_when_shell_connected() {

@@ -336,7 +336,9 @@ While Start / pad-input is hot, **do not** run exclusive battery `Poll` (`drop_a
 
 Cold (tray idle): classic timed `Poll` unchanged.
 
-Debug grep: `service: hot path waiting for live battery sample`, `service: hot lightbar connect`, `service: hot lightbar color`, `hid-diag: sample short`.
+**Silence drop:** a powered-off DualSense often lingers in the Windows HID list while stopping input reports. Short sample timeouts still keep the open handle and the last reading (no reconnect / no extra BT traffic). After ~200ms of consecutive sample timeouts (~50 × 4ms), drop that pad from `live_pads` and stop republishing its stale nav reading. Silence streak lives on the open handle so Identify-only sampling does not age other pads. Service hot path reads `live_controllers()` every loop (~16ms), not only on the 500ms presence tick. “Wait for first sample” (`live` empty + presence nonempty) applies only when `session.controllers` is already empty — otherwise a silence drop must clear the session. Shell compact Controllers refresh only from `ServiceMessage::Controllers`; send the **reconciled** `session.controllers` (after the one-miss hold) on hot-path changes and on presence-empty clear so the list and disconnect toast move together.
+
+Debug grep: `service: hot path waiting for live battery sample`, `service: hot lightbar connect`, `service: hot lightbar color`, `hid-diag: sample short`, `hid-diag: live silence serial=`.
 
 ## Start immersive mode
 
