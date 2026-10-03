@@ -83,34 +83,58 @@ impl TransitionPhase {
     }
 }
 
-/// Cold open / first reopen: prefer immersive when the pref is on.
-pub fn on_open(prefer_immersive: bool) -> ImmersiveTransition {
-    if prefer_immersive {
+/// Cold open / first reopen: immersive when always-immersive pref is on.
+pub fn on_open(always_immersive: bool) -> ImmersiveTransition {
+    if always_immersive {
         ImmersiveTransition::OpenImmersive
     } else {
         ImmersiveTransition::OpenCompact
     }
 }
 
-/// Second reopen-chord press while Start is already visible.
-pub fn on_reopen_chord(presentation: StartPresentation) -> ImmersiveTransition {
+/// Reopen-chord while Start is already visible: promote compact, or demote immersive
+/// when always-immersive is off (toggle). Always-immersive stays put (no compact).
+pub fn on_reopen_chord(
+    presentation: StartPresentation,
+    always_immersive: bool,
+) -> ImmersiveTransition {
     match presentation {
         StartPresentation::Compact => ImmersiveTransition::Promote,
-        StartPresentation::Immersive => ImmersiveTransition::Noop,
+        StartPresentation::Immersive if always_immersive => ImmersiveTransition::Noop,
+        StartPresentation::Immersive => ImmersiveTransition::Demote,
     }
 }
 
 /// Circle / Escape after modals are cleared.
-pub fn on_cancel(presentation: StartPresentation) -> ImmersiveTransition {
+///
+/// When `always_immersive`, immersive cancel closes Start instead of demoting to compact.
+pub fn on_cancel(presentation: StartPresentation, always_immersive: bool) -> ImmersiveTransition {
     match presentation {
+        StartPresentation::Immersive if always_immersive => ImmersiveTransition::Close,
         StartPresentation::Immersive => ImmersiveTransition::Demote,
         StartPresentation::Compact => ImmersiveTransition::Close,
+    }
+}
+
+/// Footer Circle label for the main (non-modal) start chrome.
+pub fn cancel_circle_label(immersive: bool, always_immersive: bool, editing: bool) -> &'static str {
+    if editing {
+        "Cancel"
+    } else if immersive && !always_immersive {
+        "Back"
+    } else {
+        "Close"
     }
 }
 
 /// True when the reopen chord is exactly Circle (Cancel owns that button).
 pub fn chord_is_circle_only(gesture: &[crate::domain::gesture::GestureControl]) -> bool {
     matches!(gesture, [crate::domain::gesture::GestureControl::Circle])
+}
+
+/// Compact footer can show an enter-immersive cue for this chord.
+pub fn promote_gesture_usable(gesture: &[crate::domain::gesture::GestureControl]) -> bool {
+    !gesture.is_empty() && !chord_is_circle_only(gesture)
 }
 
 /// Begin promote only from compact with no in-flight transition.
@@ -304,27 +328,50 @@ mod tests {
     }
 
     #[test]
-    fn chord_promotes_compact_only() {
+    fn chord_toggles_when_not_always_immersive() {
         assert_eq!(
-            on_reopen_chord(StartPresentation::Compact),
+            on_reopen_chord(StartPresentation::Compact, false),
             ImmersiveTransition::Promote
         );
         assert_eq!(
-            on_reopen_chord(StartPresentation::Immersive),
+            on_reopen_chord(StartPresentation::Immersive, false),
+            ImmersiveTransition::Demote
+        );
+        assert_eq!(
+            on_reopen_chord(StartPresentation::Immersive, true),
             ImmersiveTransition::Noop
+        );
+        assert_eq!(
+            on_reopen_chord(StartPresentation::Compact, true),
+            ImmersiveTransition::Promote
         );
     }
 
     #[test]
     fn cancel_demotes_or_closes() {
         assert_eq!(
-            on_cancel(StartPresentation::Immersive),
+            on_cancel(StartPresentation::Immersive, false),
             ImmersiveTransition::Demote
         );
         assert_eq!(
-            on_cancel(StartPresentation::Compact),
+            on_cancel(StartPresentation::Immersive, true),
             ImmersiveTransition::Close
         );
+        assert_eq!(
+            on_cancel(StartPresentation::Compact, false),
+            ImmersiveTransition::Close
+        );
+        assert_eq!(
+            on_cancel(StartPresentation::Compact, true),
+            ImmersiveTransition::Close
+        );
+        assert_eq!(cancel_circle_label(true, false, false), "Back");
+        assert_eq!(cancel_circle_label(true, true, false), "Close");
+        assert_eq!(cancel_circle_label(false, false, false), "Close");
+        assert_eq!(cancel_circle_label(true, false, true), "Cancel");
+        assert!(promote_gesture_usable(&[GestureControl::Ps]));
+        assert!(!promote_gesture_usable(&[]));
+        assert!(!promote_gesture_usable(&[GestureControl::Circle]));
     }
 
     #[test]

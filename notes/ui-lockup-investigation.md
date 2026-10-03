@@ -339,7 +339,7 @@ Debug grep: `service: hot path waiting for live battery sample`, `service: hot l
 
 ## Start immersive mode
 
-Compact Start (640×500) can promote to a borderless primary-monitor cover. Pref `start_screen_immersive` cold-opens immersive; a second reopen-chord press promotes while compact; Circle/Escape demotes. Successful launch while immersive closes Start so a topmost cover cannot sit above the game.
+Compact Start (640×500) can promote to a borderless primary-monitor cover. Pref `start_screen_always_immersive` opens immersive only and makes Circle/Escape close (no demote). When off, the reopen chord toggles compact ↔ immersive; Circle/Escape demotes (`Back`). Successful launch while immersive closes Start so a topmost cover cannot sit above the game.
 
 Promote/demote ceremony: ExitCompact blackout → HWND resize under veil → EnterImmersive immersive chrome under one full-bleed veil (ease-in lift); demote ExitImmersive full-bleed veil → resize → EnterCompact (+ scroll selection into view). Never paint immersive chrome at the wrong HWND size. Immersive art is off-thread; backdrops crossfade (~0.45s) then ken-burns settle (~10s). Controllers dock is full-height under an overlaid footer capsule; unified fixed-height rows wipe via `WidthReveal` (full dock width layout + scissor peek→expand). Dock face hints omit Float scale so row height stays locked. Strip Up/Down gated while `strip_anim` is active. Game/controller lists are pad-only (no mouse press/hover); edit actions stay clickable.
 

@@ -130,7 +130,7 @@ pub struct ConfigureSettings {
     pub analytics_enabled: bool,
     pub lightbar_enabled: bool,
     pub start_screen_enabled: bool,
-    pub start_screen_immersive: bool,
+    pub start_screen_always_immersive: bool,
     pub start_screen_gesture: Vec<GestureControl>,
     pub start_screen_sounds_enabled: bool,
     pub start_screen_sound_volume: u8,
@@ -197,7 +197,7 @@ pub enum ConfigureMessage {
     SetAnalyticsEnabled(bool),
     SetLightbarEnabled(bool),
     SetStartScreenEnabled(bool),
-    SetStartScreenImmersive(bool),
+    SetStartScreenAlwaysImmersive(bool),
     SetStartScreenSounds(bool),
     SetStartScreenSoundVolume(u8),
     SetStartScreenHaptics(bool),
@@ -603,12 +603,12 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
 
     if settings.start_screen_enabled {
         items = items.push(
-            checkbox(settings.start_screen_immersive)
-                .label("Open in immersive mode")
+            checkbox(settings.start_screen_always_immersive)
+                .label("Always immersive")
                 .size(16.0)
                 .text_size(13.0)
                 .spacing(8)
-                .on_toggle(ConfigureMessage::SetStartScreenImmersive),
+                .on_toggle(ConfigureMessage::SetStartScreenAlwaysImmersive),
         );
 
         items = items.push(text("Reopen gesture").size(13.0).color(theme::INK));

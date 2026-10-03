@@ -70,9 +70,9 @@ pub struct Prefs {
     /// Open the start-screen launcher on 0→1 connect / reopen gesture (default on).
     #[serde(default = "default_true")]
     pub start_screen_enabled: bool,
-    /// Cold-open Start in immersive (fullscreen) presentation (default off).
+    /// Always use immersive Start (never show compact; cancel closes) (default off).
     #[serde(default)]
-    pub start_screen_immersive: bool,
+    pub start_screen_always_immersive: bool,
     /// Chord that reopens the start screen while a pad is connected.
     /// Empty = no gesture reopen (0→1 auto-open still works). Missing key → default.
     #[serde(default = "default_gesture")]
@@ -146,7 +146,7 @@ impl Default for Prefs {
             analytics_enabled: false,
             lightbar_enabled: true,
             start_screen_enabled: true,
-            start_screen_immersive: false,
+            start_screen_always_immersive: false,
             start_screen_gesture: default_gesture(),
             start_screen_sounds_enabled: true,
             start_screen_sound_volume: default_start_screen_sound_volume(),
@@ -352,10 +352,10 @@ mod tests {
     }
 
     #[test]
-    fn older_prefs_default_start_screen_immersive_off() {
+    fn older_prefs_default_start_screen_always_immersive_off() {
         let prefs: Prefs =
             serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":["ps"]}"#)
                 .unwrap();
-        assert!(!prefs.start_screen_immersive);
+        assert!(!prefs.start_screen_always_immersive);
     }
 }

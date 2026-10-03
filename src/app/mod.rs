@@ -643,6 +643,8 @@ impl App {
                 &self.start_state,
                 &self.session.prefs.spectrum,
                 Instant::now(),
+                self.session.prefs.start_screen_always_immersive,
+                &self.session.prefs.start_screen_gesture,
             )
             .map(Message::Start);
         }
@@ -1416,7 +1418,7 @@ impl App {
             analytics_enabled: self.session.prefs.analytics_enabled,
             lightbar_enabled: self.session.prefs.lightbar_enabled,
             start_screen_enabled: self.session.prefs.start_screen_enabled,
-            start_screen_immersive: self.session.prefs.start_screen_immersive,
+            start_screen_always_immersive: self.session.prefs.start_screen_always_immersive,
             start_screen_gesture: self.session.prefs.start_screen_gesture.clone(),
             start_screen_sounds_enabled: self.session.prefs.start_screen_sounds_enabled,
             start_screen_sound_volume: self.session.prefs.start_screen_sound_volume,
@@ -1589,8 +1591,8 @@ impl App {
                 }
                 Task::none()
             }
-            ConfigureMessage::SetStartScreenImmersive(enabled) => {
-                self.session.prefs.start_screen_immersive = enabled;
+            ConfigureMessage::SetStartScreenAlwaysImmersive(enabled) => {
+                self.session.prefs.start_screen_always_immersive = enabled;
                 self.session.prefs.save();
                 Task::none()
             }
@@ -2495,7 +2497,7 @@ impl App {
         }
 
         let immersive = matches!(
-            start_mode::on_open(self.session.prefs.start_screen_immersive),
+            start_mode::on_open(self.session.prefs.start_screen_always_immersive),
             start_mode::ImmersiveTransition::OpenImmersive
         );
         self.start_state.immersive = immersive;
@@ -2609,17 +2611,24 @@ impl App {
             start_mode::TransitionPhase::ExitImmersive => {
                 Some(self.perform_immersive_resize(false))
             }
-            start_mode::TransitionPhase::EnterImmersive
-            | start_mode::TransitionPhase::EnterCompact => {
+            start_mode::TransitionPhase::EnterImmersive => {
                 self.start_state.clear_transition_phase();
-                if !self.start_state.immersive {
-                    self.start_state.ambient_time = 0.0;
-                }
                 crate::controller::hid::diag::diag_info(format!(
                     "ui-diag: start immersive transition phase={} done",
                     phase.label()
                 ));
                 None
+            }
+            start_mode::TransitionPhase::EnterCompact => {
+                self.start_state.clear_transition_phase();
+                self.start_state.ambient_time = 0.0;
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start immersive transition phase={} done",
+                    phase.label()
+                ));
+                // After the Float scale veil clears, force the compact list onto the selection
+                // (stale games_scroll_y from pre-promote often makes into-view a no-op).
+                Some(self.scroll_start_selection_to_center(true))
             }
             start_mode::TransitionPhase::Resizing => None,
         }
@@ -2704,8 +2713,9 @@ impl App {
         if immersive {
             focus.chain(self.warm_immersive_art_task())
         } else {
-            // Reveal the selected game after the HWND returns to compact size.
-            focus.chain(self.scroll_start_selection_into_view())
+            // Center selection as soon as compact chrome exists; EnterCompact completion
+            // re-centers once the scale Float is gone (see tick_immersive_transition_phase).
+            focus.chain(self.scroll_start_selection_to_center(true))
         }
     }
 
@@ -2974,7 +2984,10 @@ impl App {
                         return Task::none();
                     }
                     self.play_start_cue(UiSoundKind::Action);
-                    match start_mode::on_cancel(self.start_presentation()) {
+                    match start_mode::on_cancel(
+                        self.start_presentation(),
+                        self.session.prefs.start_screen_always_immersive,
+                    ) {
                         start_mode::ImmersiveTransition::Demote => self.leave_start_immersive(),
                         _ => self.close_start_screen(),
                     }
@@ -3635,9 +3648,13 @@ impl App {
     fn handle_start_nav_readings(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
         self.nav_missing_warned = false;
 
-        // Compact → immersive via a second reopen-chord press (service only listens when closed).
-        if let Some(promote) = self.try_promote_immersive_from_gesture(readings) {
-            return promote;
+        let gesture = &self.session.prefs.start_screen_gesture;
+        self.start_state.reopen_chord_held =
+            start_mode::promote_gesture_usable(gesture) && chord_held_on_any_pad(gesture, readings);
+
+        // Reopen chord toggles compact ↔ immersive (service only listens when closed).
+        if let Some(toggle) = self.try_toggle_immersive_from_gesture(readings) {
+            return toggle;
         }
 
         let now = Instant::now();
@@ -3902,8 +3919,8 @@ impl App {
         }
     }
 
-    /// Rising-edge reopen chord while compact Start is open → enter immersive.
-    fn try_promote_immersive_from_gesture(
+    /// Rising-edge reopen chord while Start is open → promote or demote (not when always-immersive).
+    fn try_toggle_immersive_from_gesture(
         &mut self,
         readings: &[start_input::NavReading],
     ) -> Option<Task<Message>> {
@@ -3926,12 +3943,17 @@ impl App {
         if !self.gesture_detectors.update(required, readings) {
             return None;
         }
-        match start_mode::on_reopen_chord(self.start_presentation()) {
+        let always = self.session.prefs.start_screen_always_immersive;
+        match start_mode::on_reopen_chord(self.start_presentation(), always) {
             start_mode::ImmersiveTransition::Promote => {
                 crate::controller::hid::diag::diag_info(
                     "ui-diag: reopen gesture promote immersive",
                 );
                 Some(self.enter_start_immersive())
+            }
+            start_mode::ImmersiveTransition::Demote => {
+                crate::controller::hid::diag::diag_info("ui-diag: reopen gesture demote immersive");
+                Some(self.leave_start_immersive())
             }
             _ => None,
         }

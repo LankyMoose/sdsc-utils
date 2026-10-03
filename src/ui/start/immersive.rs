@@ -45,24 +45,18 @@ pub fn veil_view(state: &State, now: Instant) -> Element<'_, StartMessage> {
 }
 
 /// Compact chrome blackout (`veil_amount` 0 = clear, 1 = solid black). No ambient overlay.
+///
+/// Do **not** wrap chrome in [`Float`] here: iced paints Floats above later stack
+/// siblings (including any veil), so footer/face-hint Floats would sit on top of the fade.
+/// Compact enter/exit is dim-only; scale is omitted for that reason.
 pub fn compact_transition_overlay(
     compact: Element<'_, StartMessage>,
     veil_amount: f32,
-    exiting: bool,
+    _exiting: bool,
 ) -> Element<'_, StartMessage> {
     let veil = veil_amount.clamp(0.0, 1.0);
-    let scale = if exiting {
-        1.0 - 0.08 * veil
-    } else {
-        0.92 + 0.08 * (1.0 - veil)
-    };
-    let scaled = container(Float::new(compact).scale(scale))
-        .width(Fill)
-        .height(Fill)
-        .center_x(Fill)
-        .center_y(Fill);
     stack![
-        scaled,
+        compact,
         container(space())
             .width(Fill)
             .height(Fill)
@@ -77,8 +71,13 @@ pub fn view<'a>(
     state: &'a State,
     spectrum: &BatterySpectrum,
     now: Instant,
+    always_immersive: bool,
+    promote_gesture: &'a [crate::domain::gesture::GestureControl],
 ) -> Element<'a, StartMessage> {
     let dock_p = state.dock_progress(now);
+    let veil = transition_top_veil(state, now);
+    // Any Float under the veil paints above it — flatten stage scale + hint presses.
+    let flat = veil > 0.001;
     // Chrome stays fully lit; one top veil handles enter/exit (no per-panel dims).
     let program = AmbientProgram::new(state.ambient_time, dock_p, 0.0, 1.0);
     let atmosphere = shader(program).width(Fill).height(Fill);
@@ -88,7 +87,7 @@ pub fn view<'a>(
     } else if state.replace_confirm.is_some() {
         modal_card(replace_confirm_view(state))
     } else {
-        stage_with_dock(state, spectrum, now, dock_p)
+        stage_with_dock(state, spectrum, now, dock_p, flat)
     };
 
     let header = container(immersive_slide_header(dock_p))
@@ -101,14 +100,20 @@ pub fn view<'a>(
         })
         .style(theme::immersive_header_band);
 
-    let footer_capsule = container(footer_hint(state, true))
-        .padding(Padding {
-            top: 10.0,
-            right: 28.0,
-            bottom: 10.0,
-            left: 28.0,
-        })
-        .style(theme::immersive_footer_capsule);
+    let footer_capsule = container(footer_hint(
+        state,
+        true,
+        always_immersive,
+        promote_gesture,
+        flat,
+    ))
+    .padding(Padding {
+        top: 10.0,
+        right: 28.0,
+        bottom: 10.0,
+        left: 28.0,
+    })
+    .style(theme::immersive_footer_capsule);
 
     // Header + full-height body (dock reaches window bottom); footer overlays.
     let main = column![header, container(body).width(Fill).height(Fill)]
@@ -133,8 +138,7 @@ pub fn view<'a>(
     let chrome = stack![main, footer_overlay].width(Fill).height(Fill);
     let base = stack![atmosphere, chrome].width(Fill).height(Fill);
 
-    let veil = transition_top_veil(state, now);
-    if veil > 0.001 {
+    if flat {
         stack![
             base,
             container(space())
@@ -216,6 +220,7 @@ fn stage_with_dock<'a>(
     spectrum: &BatterySpectrum,
     now: Instant,
     dock_p: f32,
+    flat: bool,
 ) -> Element<'a, StartMessage> {
     let scale = dock_stage_scale(dock_p);
     let dim = dock_stage_dim(dock_p);
@@ -225,13 +230,22 @@ fn stage_with_dock<'a>(
     stage_layers.push(games_stage(state, now));
     let stage = stack(stage_layers).width(Fill).height(Fill);
 
-    let scaled_stage: Element<'_, StartMessage> = container(Float::new(stage).scale(scale))
-        .width(Fill)
-        .height(Fill)
-        .center_x(Fill)
-        .center_y(Fill)
-        .style(theme::immersive_stage)
-        .into();
+    // Float paints above the enter/exit veil — skip scale while flattening.
+    let scaled_stage: Element<'_, StartMessage> = if flat || (scale - 1.0).abs() < 0.001 {
+        container(stage)
+            .width(Fill)
+            .height(Fill)
+            .style(theme::immersive_stage)
+            .into()
+    } else {
+        container(Float::new(stage).scale(scale))
+            .width(Fill)
+            .height(Fill)
+            .center_x(Fill)
+            .center_y(Fill)
+            .style(theme::immersive_stage)
+            .into()
+    };
 
     let mut layers: Vec<Element<'_, StartMessage>> = vec![scaled_stage];
 

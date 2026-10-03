@@ -20,7 +20,7 @@ use iced::widget::{
     Float, button, column, container, row, scrollable, space, svg, text, text_input,
 };
 use iced::{
-    Alignment, Background, Border, Color, ContentFit, Element, Fill, Font, Length, Point,
+    Alignment, Background, Border, Color, ContentFit, Element, Fill, Font, Length, Padding, Point,
     Rectangle, Renderer, Theme,
 };
 use std::collections::HashMap;
@@ -494,8 +494,12 @@ pub struct State {
     pub cross_progress: f32,
     /// Face buttons currently held (pad OR keyboard) for action-hint press styling.
     pub held: FaceHeld,
+    /// Reopen chord fully held (for immersive-toggle hint press styling).
+    pub reopen_chord_held: bool,
     /// Animated 0..=1 press amounts per face (drives pressed scale).
     press_anim: FacePressAnim,
+    /// Animated 0..=1 press for the reopen-chord hint glyph.
+    reopen_chord_press: f32,
     /// Animated 0..=1 toward white-ish hold arc once triangle hold is armed.
     triangle_armed_anim: f32,
     /// Animated 0..=1 toward white-ish hold arc once cross hold is armed.
@@ -561,7 +565,9 @@ impl Default for State {
             triangle_progress: 0.0,
             cross_progress: 0.0,
             held: FaceHeld::default(),
+            reopen_chord_held: false,
             press_anim: FacePressAnim::default(),
+            reopen_chord_press: 0.0,
             triangle_armed_anim: 0.0,
             cross_armed_anim: 0.0,
             hint_anim_tick: None,
@@ -737,7 +743,9 @@ impl State {
         self.triangle_progress = 0.0;
         self.cross_progress = 0.0;
         self.held = FaceHeld::default();
+        self.reopen_chord_held = false;
         self.press_anim = FacePressAnim::default();
+        self.reopen_chord_press = 0.0;
         self.triangle_armed_anim = 0.0;
         self.cross_armed_anim = 0.0;
         self.hint_anim_tick = None;
@@ -1117,6 +1125,7 @@ impl State {
             (self.held.square, self.press_anim.square),
             (self.held.triangle, self.press_anim.triangle),
             (self.held.options, self.press_anim.options),
+            (self.reopen_chord_held, self.reopen_chord_press),
         ];
         if press
             .iter()
@@ -1148,6 +1157,7 @@ impl State {
         approach_anim(&mut self.press_anim.square, self.held.square, dt);
         approach_anim(&mut self.press_anim.triangle, self.held.triangle, dt);
         approach_anim(&mut self.press_anim.options, self.held.options, dt);
+        approach_anim(&mut self.reopen_chord_press, self.reopen_chord_held, dt);
         approach_anim(
             &mut self.triangle_armed_anim,
             self.triangle_progress >= 1.0,
@@ -1436,6 +1446,8 @@ pub fn view<'a>(
     state: &'a State,
     spectrum: &BatterySpectrum,
     now: Instant,
+    always_immersive: bool,
+    promote_gesture: &'a [crate::domain::gesture::GestureControl],
 ) -> Element<'a, StartMessage> {
     use crate::ui::start::mode::TransitionPhase;
 
@@ -1455,12 +1467,30 @@ pub fn view<'a>(
         );
     if show_immersive {
         // Enter/exit: immersive chrome under a single full-bleed veil (no compact flash).
-        return crate::ui::start::immersive::view(state, spectrum, now);
+        return crate::ui::start::immersive::view(
+            state,
+            spectrum,
+            now,
+            always_immersive,
+            promote_gesture,
+        );
     }
 
-    let compact = compact_chrome(state, spectrum, now);
+    // Flat hints under the dim veil — Float face glyphs would paint above it.
+    let flat_hints = matches!(
+        phase,
+        Some(TransitionPhase::ExitCompact | TransitionPhase::EnterCompact)
+    );
+    let compact = compact_chrome(
+        state,
+        spectrum,
+        now,
+        always_immersive,
+        promote_gesture,
+        flat_hints,
+    );
 
-    // ExitCompact / EnterCompact: blackout + scale (no ambient on compact).
+    // ExitCompact / EnterCompact: blackout (no ambient on compact).
     match phase {
         Some(TransitionPhase::ExitCompact) => {
             let t = state.phase_progress(now);
@@ -1478,6 +1508,9 @@ fn compact_chrome<'a>(
     state: &'a State,
     spectrum: &BatterySpectrum,
     now: Instant,
+    always_immersive: bool,
+    promote_gesture: &'a [crate::domain::gesture::GestureControl],
+    flat_hints: bool,
 ) -> Element<'a, StartMessage> {
     let header = slide_header(state.slide_progress(now));
 
@@ -1489,7 +1522,7 @@ fn compact_chrome<'a>(
         carousel_body(state, spectrum, now)
     };
 
-    let hint = footer_hint(state, false);
+    let hint = footer_hint(state, false, always_immersive, promote_gesture, flat_hints);
     #[cfg(debug_assertions)]
     let diag = diag_report_bar();
     #[cfg(not(debug_assertions))]
@@ -1886,15 +1919,18 @@ pub(crate) fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
                     .style(theme::ghost),
             ]
             .spacing(10),
-            action_cluster(&[
-                face_hint(
-                    FaceButton::Cross,
-                    if draft.is_edit() { "Save" } else { "Add" },
-                    state.held,
-                    state.press_anim,
-                ),
-                face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim,),
-            ]),
+            action_cluster(
+                &[
+                    face_hint(
+                        FaceButton::Cross,
+                        if draft.is_edit() { "Save" } else { "Add" },
+                        state.held,
+                        state.press_anim,
+                    ),
+                    face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
+                ],
+                false,
+            ),
         ]
         .spacing(10)
         .width(Length::Fixed(420.0))
@@ -1944,17 +1980,20 @@ pub(crate) fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
             .size(14.0)
             .color(theme::MUTED),
             space().height(8),
-            action_cluster(&[
-                face_hold_hint(
-                    FaceButton::Cross,
-                    "Proceed",
-                    state.cross_progress,
-                    state.cross_armed_anim,
-                    state.held,
-                    state.press_anim,
-                ),
-                face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim,),
-            ]),
+            action_cluster(
+                &[
+                    face_hold_hint(
+                        FaceButton::Cross,
+                        "Proceed",
+                        state.cross_progress,
+                        state.cross_armed_anim,
+                        state.held,
+                        state.press_anim,
+                    ),
+                    face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
+                ],
+                false,
+            ),
         ]
         .spacing(12)
         .align_x(Alignment::Center),
@@ -2054,7 +2093,13 @@ impl FacePressAnim {
     }
 }
 
-pub(crate) fn footer_hint(state: &State, immersive: bool) -> Element<'_, StartMessage> {
+pub(crate) fn footer_hint<'a>(
+    state: &'a State,
+    immersive: bool,
+    always_immersive: bool,
+    promote_gesture: &'a [crate::domain::gesture::GestureControl],
+    flat_hints: bool,
+) -> Element<'a, StartMessage> {
     if state.manual_add.is_some() {
         let label = if state.manual_add.as_ref().is_some_and(|d| d.is_edit()) {
             "Save"
@@ -2062,37 +2107,60 @@ pub(crate) fn footer_hint(state: &State, immersive: bool) -> Element<'_, StartMe
             "Add"
         };
         return footer_band(
-            action_cluster(&[
-                face_hint(FaceButton::Cross, label, state.held, state.press_anim),
-                face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
-            ]),
+            action_cluster(
+                &[
+                    face_hint(FaceButton::Cross, label, state.held, state.press_anim),
+                    face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
+                ],
+                flat_hints,
+            ),
             immersive,
         );
     }
     if state.replace_confirm.is_some() {
         return footer_band(
-            action_cluster(&[
-                face_hold_hint(
-                    FaceButton::Cross,
-                    "Proceed",
-                    state.cross_progress,
-                    state.cross_armed_anim,
-                    state.held,
-                    state.press_anim,
-                ),
-                face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
-            ]),
+            action_cluster(
+                &[
+                    face_hold_hint(
+                        FaceButton::Cross,
+                        "Proceed",
+                        state.cross_progress,
+                        state.cross_armed_anim,
+                        state.held,
+                        state.press_anim,
+                    ),
+                    face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
+                ],
+                flat_hints,
+            ),
             immersive,
         );
     }
 
-    let circle_label = if state.editing {
-        "Cancel"
-    } else if immersive {
-        "Back"
-    } else {
-        "Close"
-    };
+    let circle_label =
+        crate::ui::start::mode::cancel_circle_label(immersive, always_immersive, state.editing);
+    // Compact → Immersive; immersive (when not always-on) → Compact via the same chord.
+    let toggle_label =
+        if !state.editing && crate::ui::start::mode::promote_gesture_usable(promote_gesture) {
+            if !immersive {
+                Some("Immersive")
+            } else if !always_immersive {
+                Some("Compact")
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    let promote_cue: Option<Element<'a, StartMessage>> = toggle_label.map(|label| {
+        gesture_chord_hint(
+            promote_gesture,
+            label,
+            state.reopen_chord_held,
+            state.reopen_chord_press,
+            flat_hints,
+        )
+    });
 
     let cluster: Element<'_, StartMessage> = match state.slide {
         StartSlide::Games => {
@@ -2117,38 +2185,39 @@ pub(crate) fn footer_hint(state: &State, immersive: bool) -> Element<'_, StartMe
                         .padding([6, 12])
                         .on_press(StartMessage::AddShortcut)
                         .style(theme::ghost),
-                    action_cluster(&hints),
+                    action_cluster(&hints, flat_hints),
                 ]
                 .spacing(28)
                 .align_y(Alignment::Center)
                 .into()
             } else {
-                iced::widget::row![
-                    face_cycle_toggle(
-                        FaceButton::Square,
-                        state.held,
-                        state.press_anim,
-                        &[
-                            (
-                                "Last played",
-                                matches!(state.sort_mode, GamesSortMode::LastPlayed),
-                            ),
-                            (
-                                "A–Z",
-                                matches!(state.sort_mode, GamesSortMode::Alphabetical),
-                            ),
-                        ],
-                        StartMessage::CycleSort,
-                    ),
-                    action_cluster(&hints),
-                ]
+                let mut row = iced::widget::row![face_cycle_toggle(
+                    FaceButton::Square,
+                    state.held,
+                    state.press_anim,
+                    &[
+                        (
+                            "Last played",
+                            matches!(state.sort_mode, GamesSortMode::LastPlayed),
+                        ),
+                        (
+                            "A–Z",
+                            matches!(state.sort_mode, GamesSortMode::Alphabetical),
+                        ),
+                    ],
+                    StartMessage::CycleSort,
+                    flat_hints,
+                ),]
                 .spacing(28)
-                .align_y(Alignment::Center)
-                .into()
+                .align_y(Alignment::Center);
+                if let Some(cue) = promote_cue {
+                    row = row.push(cue);
+                }
+                row.push(action_cluster(&hints, flat_hints)).into()
             }
         }
-        StartSlide::Controllers => iced::widget::row![
-            face_cycle_toggle(
+        StartSlide::Controllers => {
+            let mut row = iced::widget::row![face_cycle_toggle(
                 FaceButton::Square,
                 state.held,
                 state.press_anim,
@@ -2157,20 +2226,128 @@ pub(crate) fn footer_hint(state: &State, immersive: bool) -> Element<'_, StartMe
                     ("All", state.show_all_controllers),
                 ],
                 StartMessage::CycleSort,
-            ),
-            action_cluster(&[face_hint(
-                FaceButton::Circle,
-                circle_label,
-                state.held,
-                state.press_anim,
-            )]),
-        ]
-        .spacing(28)
-        .align_y(Alignment::Center)
-        .into(),
+                flat_hints,
+            ),]
+            .spacing(28)
+            .align_y(Alignment::Center);
+            if let Some(cue) = promote_cue {
+                row = row.push(cue);
+            }
+            row.push(action_cluster(
+                &[face_hint(
+                    FaceButton::Circle,
+                    circle_label,
+                    state.held,
+                    state.press_anim,
+                )],
+                flat_hints,
+            ))
+            .into()
+        }
     };
 
     footer_band(cluster, immersive)
+}
+
+/// Reopen-chord cue: short single control → circle; else one capsule with joined text.
+fn gesture_chord_hint(
+    controls: &[crate::domain::gesture::GestureControl],
+    label: &'static str,
+    pressed: bool,
+    press_t: f32,
+    flat: bool,
+) -> Element<'static, StartMessage> {
+    let glyph = if gesture_uses_circle(controls) {
+        text_glyph_circle(controls[0].as_str(), pressed, press_t, flat)
+    } else {
+        text_glyph_capsule(
+            crate::domain::gesture::format_gesture(controls),
+            pressed,
+            press_t,
+            flat,
+        )
+    };
+    row![glyph, text(label).size(14.0).color(theme::MUTED)]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// Circle for a single control whose label is at most 2 characters (e.g. PS, L3).
+fn gesture_uses_circle(controls: &[crate::domain::gesture::GestureControl]) -> bool {
+    matches!(controls, [c] if c.as_str().chars().count() <= 2)
+}
+
+fn text_glyph_circle(
+    glyph: &'static str,
+    pressed: bool,
+    press_t: f32,
+    flat: bool,
+) -> Element<'static, StartMessage> {
+    let half = HOLD_RING_SIZE / 2.0;
+    let max_radius = half - 2.5;
+    let idle_radius = max_radius / PRESSED_SCALE;
+    let style = if pressed {
+        RingStyle::Pressed
+    } else {
+        RingStyle::Idle
+    };
+    let stack = iced::widget::stack![
+        action_ring(style, idle_radius),
+        container(text(glyph).size(12.0).color(theme::ACCENT))
+            .width(Length::Fixed(HOLD_RING_SIZE))
+            .height(Length::Fixed(HOLD_RING_SIZE))
+            .center_x(Fill)
+            .center_y(Fill),
+    ]
+    .width(Length::Fixed(HOLD_RING_SIZE))
+    .height(Length::Fixed(HOLD_RING_SIZE));
+    if flat {
+        stack.into()
+    } else {
+        let scale = 1.0 + (PRESSED_SCALE - 1.0) * press_t.clamp(0.0, 1.0);
+        Float::new(stack).scale(scale).into()
+    }
+}
+
+fn text_glyph_capsule(
+    glyph: String,
+    pressed: bool,
+    press_t: f32,
+    flat: bool,
+) -> Element<'static, StartMessage> {
+    let border_color = if pressed {
+        theme::ACCENT
+    } else {
+        Color {
+            a: 0.25,
+            ..theme::MUTED
+        }
+    };
+    let border_w = if pressed { 2.5 } else { 2.0 };
+    let pill = container(text(glyph).size(12.0).color(theme::ACCENT))
+        .padding(Padding {
+            top: 0.0,
+            right: 12.0,
+            bottom: 0.0,
+            left: 12.0,
+        })
+        .height(Length::Fixed(HOLD_RING_SIZE))
+        .align_y(Alignment::Center)
+        .style(move |_theme| container::Style {
+            border: Border {
+                color: border_color,
+                width: border_w,
+                radius: (HOLD_RING_SIZE / 2.0).into(),
+            },
+            ..container::Style::default()
+        });
+    if flat {
+        pill.into()
+    } else {
+        let scale = 1.0 + (PRESSED_SCALE - 1.0) * press_t.clamp(0.0, 1.0);
+        Float::new(pill).scale(scale).into()
+    }
 }
 
 fn footer_band(content: Element<'_, StartMessage>, immersive: bool) -> Element<'_, StartMessage> {
@@ -2199,6 +2376,7 @@ fn face_cycle_toggle(
     press_anim: FacePressAnim,
     options: &[(&'static str, bool)],
     on_press: StartMessage,
+    flat: bool,
 ) -> Element<'static, StartMessage> {
     let dim = theme::alpha(theme::MUTED, 0.45);
     let glyph = face_glyph(
@@ -2209,6 +2387,7 @@ fn face_cycle_toggle(
             RingStyle::Idle
         },
         press_anim.for_face(face),
+        flat,
     );
     let mut labels = row![].spacing(8).align_y(Alignment::Center);
     labels = labels.push(glyph);
@@ -2234,14 +2413,18 @@ fn toggle_option_label(label: &'static str, active: bool) -> Element<'static, St
     text(label).size(14.0).color(color).into()
 }
 
-fn action_cluster(hints: &[ActionHint]) -> Element<'static, StartMessage> {
-    action_cluster_spaced(hints, 28.0)
+fn action_cluster(hints: &[ActionHint], flat: bool) -> Element<'static, StartMessage> {
+    action_cluster_spaced(hints, 28.0, flat)
 }
 
-fn action_cluster_spaced(hints: &[ActionHint], spacing: f32) -> Element<'static, StartMessage> {
+fn action_cluster_spaced(
+    hints: &[ActionHint],
+    spacing: f32,
+    flat: bool,
+) -> Element<'static, StartMessage> {
     let mut row = row![].spacing(spacing).align_y(Alignment::Center);
     for hint in hints {
-        row = row.push(action_hint(hint));
+        row = row.push(action_hint(hint, flat));
     }
     row.into()
 }
@@ -2257,7 +2440,7 @@ fn action_cluster_dock(hints: &[ActionHint]) -> Element<'static, StartMessage> {
     row.into()
 }
 
-fn action_hint(hint: &ActionHint) -> Element<'static, StartMessage> {
+fn action_hint(hint: &ActionHint, flat: bool) -> Element<'static, StartMessage> {
     let glyph: Element<'static, StartMessage> = if let Some(face) = hint.face {
         let style = if let Some(progress) = hint.hold {
             RingStyle::Hold {
@@ -2269,7 +2452,7 @@ fn action_hint(hint: &ActionHint) -> Element<'static, StartMessage> {
         } else {
             RingStyle::Idle
         };
-        face_glyph(face, style, hint.press_t)
+        face_glyph(face, style, hint.press_t, flat)
     } else {
         text(hint.text_glyph.unwrap_or("?"))
             .size(14.0)
@@ -2323,12 +2506,20 @@ enum RingStyle {
     Hold { progress: f32, armed_t: f32 },
 }
 
-fn face_glyph(face: FaceButton, style: RingStyle, press_t: f32) -> Element<'static, StartMessage> {
+fn face_glyph(
+    face: FaceButton,
+    style: RingStyle,
+    press_t: f32,
+    flat: bool,
+) -> Element<'static, StartMessage> {
+    let stack = face_glyph_stack(face, style);
+    if flat {
+        return stack;
+    }
     let press_t = press_t.clamp(0.0, 1.0);
     let scale = 1.0 + (PRESSED_SCALE - 1.0) * press_t;
     // Idle radius is inset so full press (× PRESSED_SCALE) + stroke stays inside the slot.
     // Geometry stays fixed; Float scales the stack so SVG/canvas are not re-rasterized each frame.
-    let stack = face_glyph_stack(face, style);
     Float::new(stack).scale(scale).into()
 }
 
@@ -2611,7 +2802,7 @@ fn game_row(
                 ));
             }
         }
-        content = content.push(action_cluster_spaced(&actions, ROW_ACTION_SPACING));
+        content = content.push(action_cluster_spaced(&actions, ROW_ACTION_SPACING, false));
     }
 
     // Pad/keyboard navigate — no mouse press/hover on list rows (edit actions stay clickable).
@@ -2695,7 +2886,7 @@ fn controller_row<'a>(
                 hint.press_anim,
             ));
         }
-        content = content.push(action_cluster_spaced(&actions, ROW_ACTION_SPACING));
+        content = content.push(action_cluster_spaced(&actions, ROW_ACTION_SPACING, false));
     }
 
     container(
