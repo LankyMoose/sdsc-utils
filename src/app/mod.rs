@@ -733,7 +733,10 @@ impl App {
                     let sync = self.sync_toast_zorder();
                     if self.session.start_auto_open_pending
                         && self.session.prefs.start_screen_enabled
-                        && !self.session.controllers.is_empty()
+                        && crate::session::has_start_presence(
+                            &self.session.controllers,
+                            self.session.prefs.start_screen_usb_controllers,
+                        )
                     {
                         crate::controller::hid::diag::diag_info(
                             "ui-diag: retry start open after close",
@@ -1467,6 +1470,7 @@ impl App {
             lightbar_enabled: self.session.prefs.lightbar_enabled,
             start_screen_enabled: self.session.prefs.start_screen_enabled,
             start_screen_always_immersive: self.session.prefs.start_screen_always_immersive,
+            start_screen_usb_controllers: self.session.prefs.start_screen_usb_controllers,
             start_screen_gesture: self.session.prefs.start_screen_gesture.clone(),
             start_screen_sounds_enabled: self.session.prefs.start_screen_sounds_enabled,
             start_screen_sound_volume: self.session.prefs.start_screen_sound_volume,
@@ -1643,6 +1647,23 @@ impl App {
                 self.session.prefs.start_screen_always_immersive = enabled;
                 self.session.prefs.save();
                 Task::none()
+            }
+            ConfigureMessage::SetStartScreenUsbControllers(enabled) => {
+                if self.session.prefs.start_screen_usb_controllers == enabled {
+                    return Task::none();
+                }
+                self.session.prefs.start_screen_usb_controllers = enabled;
+                self.session.prefs.save();
+                // Client mode: service also reloads prefs within ~2s and may re-emit
+                // OpenStart/CloseStart; shell applies immediately for snappy UI.
+                let ctx = crate::session::ApplyContext {
+                    start_visible: self.start_visible,
+                    fullscreen: start_input::foreground_is_exclusive_fullscreen(),
+                    now: Instant::now(),
+                    lightbar_enabled: lightbar::is_enabled(),
+                };
+                let effects = self.session.reevaluate_start_presence(ctx);
+                self.apply_session_effects(effects)
             }
             ConfigureMessage::SetStartScreenSounds(enabled) => {
                 self.session.prefs.start_screen_sounds_enabled = enabled;
@@ -1883,6 +1904,7 @@ impl App {
         if crate::session::should_skip_connect_cooldown_on_power_off(
             &self.session.controllers,
             serial,
+            self.session.prefs.start_screen_usb_controllers,
         ) {
             self.session.mark_skip_connect_cooldown();
         }

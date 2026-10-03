@@ -6,8 +6,9 @@
 mod gate;
 
 pub use gate::{
-    ConnectCooldownDecision, connect_cooldown_on_empty, reconcile_poll_with_hold,
-    should_auto_open_start, should_defer_auto_open_start, should_flush_latched_start,
+    ConnectCooldownDecision, connect_cooldown_on_empty, has_start_presence,
+    reconcile_poll_with_hold, should_auto_close_start, should_auto_open_start,
+    should_defer_auto_open_start, should_flush_latched_start,
     should_skip_connect_cooldown_on_power_off, take_skip_connect_cooldown,
 };
 
@@ -160,15 +161,38 @@ impl DeviceSession {
             return effects;
         }
 
+        let include_usb = self.prefs.start_screen_usb_controllers;
         let mut events = Vec::new();
-        let mut opened_from_empty = false;
+        let mut presence_edge: Option<(bool, bool)> = None;
         if controllers_changed {
             let previous = std::mem::replace(&mut self.controllers, controllers);
-            opened_from_empty = previous.is_empty() && !self.controllers.is_empty();
-            if opened_from_empty {
+            let prev_present = has_start_presence(&previous, include_usb);
+            let next_present = has_start_presence(&self.controllers, include_usb);
+            presence_edge = Some((prev_present, next_present));
+            if prev_present != next_present {
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start presence include_usb={} prev={} next={}",
+                    u8::from(include_usb),
+                    u8::from(prev_present),
+                    u8::from(next_present)
+                ));
+            } else if previous.is_empty()
+                && !self.controllers.is_empty()
+                && !include_usb
+                && !next_present
+            {
+                // Raw 0→1 was USB-only while USB does not count.
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start presence include_usb={} prev={} next={}",
+                    u8::from(include_usb),
+                    u8::from(prev_present),
+                    u8::from(next_present)
+                ));
+            }
+            if !prev_present && next_present {
                 self.controllers_nonempty_since = Some(ctx.now);
             }
-            if !previous.is_empty() && self.controllers.is_empty() {
+            if prev_present && !next_present {
                 let stretch = self
                     .controllers_nonempty_since
                     .map(|since| ctx.now.saturating_duration_since(since));
@@ -200,15 +224,16 @@ impl DeviceSession {
 
         effects.push(SessionEffect::SaveKnown);
         let connect_toast_queued = events.iter().any(|event| event.body == "Connected");
-        let want_auto_open = opened_from_empty
-            && should_auto_open_start(
+        let want_auto_open = presence_edge.is_some_and(|(prev_present, next_present)| {
+            should_auto_open_start(
                 self.prefs.start_screen_enabled,
-                true,
-                true,
+                !prev_present,
+                next_present,
                 ctx.start_visible,
                 self.cooldown_active(ctx.now),
                 ctx.fullscreen,
-            );
+            )
+        });
         if want_auto_open {
             self.start_auto_open_pending = true;
         }
@@ -225,16 +250,61 @@ impl DeviceSession {
             });
         }
 
-        if self.controllers.is_empty() {
+        if let Some((prev_present, next_present)) = presence_edge {
+            if !next_present {
+                self.start_auto_open_pending = false;
+                effects.push(SessionEffect::ClearStartLatch);
+                if should_auto_close_start(prev_present, next_present, ctx.start_visible) {
+                    effects.push(SessionEffect::CloseStart);
+                }
+            } else if want_auto_open && !connect_toast_queued {
+                effects.push(SessionEffect::OpenStart);
+            }
+        }
+
+        effects
+    }
+
+    /// Re-evaluate open/close after `start_screen_usb_controllers` changes.
+    ///
+    /// Does not arm the ghost-flap cooldown (settings flip is not a pad leave).
+    pub fn reevaluate_start_presence(&mut self, ctx: ApplyContext) -> Vec<SessionEffect> {
+        let include_usb = self.prefs.start_screen_usb_controllers;
+        let present = has_start_presence(&self.controllers, include_usb);
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start presence include_usb={} prev={} next={} (prefs)",
+            u8::from(include_usb),
+            // Treat settings flip as edge from the opposite presence so open/close fire.
+            u8::from(!present),
+            u8::from(present)
+        ));
+
+        let mut effects = Vec::new();
+        if present {
+            // Qualifying pads exist under the new rule — open if gates pass.
+            if self.controllers_nonempty_since.is_none() {
+                self.controllers_nonempty_since = Some(ctx.now);
+            }
+            let want_auto_open = should_auto_open_start(
+                self.prefs.start_screen_enabled,
+                true, // pretend previous empty so the edge fires
+                true,
+                ctx.start_visible,
+                self.cooldown_active(ctx.now),
+                ctx.fullscreen,
+            );
+            if want_auto_open {
+                self.start_auto_open_pending = true;
+                effects.push(SessionEffect::OpenStart);
+            }
+        } else {
             self.start_auto_open_pending = false;
+            self.controllers_nonempty_since = None;
             effects.push(SessionEffect::ClearStartLatch);
             if ctx.start_visible {
                 effects.push(SessionEffect::CloseStart);
             }
-        } else if want_auto_open && !connect_toast_queued {
-            effects.push(SessionEffect::OpenStart);
         }
-
         effects
     }
 

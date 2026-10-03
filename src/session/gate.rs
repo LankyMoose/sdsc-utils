@@ -5,7 +5,20 @@ use crate::controller::model::ControllerStatus;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-/// Gate for automatic start-screen open on a 0→1 controller connect.
+/// Whether any pad counts toward start-screen auto-open / auto-close.
+///
+/// When `include_usb` is false, only Bluetooth pads qualify.
+pub fn has_start_presence(controllers: &[ControllerStatus], include_usb: bool) -> bool {
+    controllers.iter().any(|c| {
+        if include_usb {
+            true
+        } else {
+            c.connection.is_bluetooth()
+        }
+    })
+}
+
+/// Gate for automatic start-screen open on a qualifying 0→1 connect.
 pub fn should_auto_open_start(
     enabled: bool,
     previous_empty: bool,
@@ -15,6 +28,15 @@ pub fn should_auto_open_start(
     fullscreen: bool,
 ) -> bool {
     enabled && previous_empty && next_nonempty && !already_open && !cooldown_active && !fullscreen
+}
+
+/// Close Start when qualifying presence drops 1→0 while the window is visible.
+pub fn should_auto_close_start(
+    prev_present: bool,
+    next_present: bool,
+    start_visible: bool,
+) -> bool {
+    prev_present && !next_present && start_visible
 }
 
 /// Defer 0→1 Start until a connect toast finishes slide-in (both stay on screen).
@@ -29,22 +51,28 @@ pub fn take_skip_connect_cooldown(flag: &mut bool) -> bool {
     skip
 }
 
-/// Arm skip-connect-cooldown only when powering off the sole live controller.
+/// Arm skip-connect-cooldown only when powering off the sole qualifying controller.
 ///
-/// Powering off one of several pads must not skip the ghost-flap cooldown that
-/// guards a later 0→1 open for a sibling that never left.
+/// Powering off one of several qualifying pads must not skip the ghost-flap cooldown
+/// that guards a later 0→1 open for a sibling that never left. Non-qualifying pads
+/// (USB when `include_usb` is false) are ignored.
 pub fn should_skip_connect_cooldown_on_power_off(
     controllers: &[ControllerStatus],
     serial: &str,
+    include_usb: bool,
 ) -> bool {
     let target = normalize_identity(serial);
-    controllers.len() == 1
-        && controllers
+    let qualifying: Vec<&ControllerStatus> = controllers
+        .iter()
+        .filter(|c| include_usb || c.connection.is_bluetooth())
+        .collect();
+    qualifying.len() == 1
+        && qualifying
             .first()
             .is_some_and(|c| normalize_identity(&c.serial) == target)
 }
 
-/// Whether to arm the ghost-flap cooldown after the list goes empty.
+/// Whether to arm the ghost-flap cooldown after qualifying presence goes empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectCooldownDecision {
     SkipIntentional,
@@ -52,7 +80,7 @@ pub enum ConnectCooldownDecision {
     Arm,
 }
 
-/// Decide cooldown after 1→0. Short arrival blips must not suppress the next open.
+/// Decide cooldown after qualifying 1→0. Short arrival blips must not suppress the next open.
 pub fn connect_cooldown_on_empty(
     skip_intentional: bool,
     nonempty_stretch: Option<Duration>,
@@ -127,6 +155,17 @@ mod tests {
         )
     }
 
+    fn usb_pad(serial: &str) -> ControllerStatus {
+        dualsense_status(
+            1,
+            "DualSense",
+            Connection::Usb,
+            serial.to_string(),
+            50,
+            PowerState::Charging,
+        )
+    }
+
     #[test]
     fn opens_on_clean_zero_to_one() {
         assert!(should_auto_open_start(
@@ -150,6 +189,70 @@ mod tests {
         ));
         assert!(!should_auto_open_start(
             true, true, true, false, false, true
+        ));
+    }
+
+    #[test]
+    fn presence_includes_usb_when_allowed() {
+        let usb = vec![usb_pad("aa:bb")];
+        assert!(has_start_presence(&usb, true));
+        assert!(!has_start_presence(&usb, false));
+        assert!(has_start_presence(&[pad("aa:bb")], false));
+        assert!(has_start_presence(&[usb_pad("aa:bb"), pad("cc:dd")], false));
+        assert!(!has_start_presence(&[], false));
+    }
+
+    #[test]
+    fn usb_off_usb_only_connect_does_not_open() {
+        let prev = has_start_presence(&[], false);
+        let next = has_start_presence(&[usb_pad("aa:bb")], false);
+        assert!(!should_auto_open_start(
+            true, !prev, next, false, false, false
+        ));
+    }
+
+    #[test]
+    fn usb_off_bluetooth_connect_while_usb_present_opens() {
+        let prev = has_start_presence(&[usb_pad("aa:bb")], false);
+        let next = has_start_presence(&[usb_pad("aa:bb"), pad("cc:dd")], false);
+        assert!(!prev);
+        assert!(next);
+        assert!(should_auto_open_start(
+            true, !prev, next, false, false, false
+        ));
+    }
+
+    #[test]
+    fn usb_off_last_bluetooth_leave_closes_with_usb_remaining() {
+        let prev = has_start_presence(&[usb_pad("aa:bb"), pad("cc:dd")], false);
+        let next = has_start_presence(&[usb_pad("aa:bb")], false);
+        assert!(should_auto_close_start(prev, next, true));
+        assert!(!should_auto_close_start(prev, next, false));
+    }
+
+    #[test]
+    fn usb_off_usb_leave_while_bluetooth_remains_does_not_close() {
+        let prev = has_start_presence(&[usb_pad("aa:bb"), pad("cc:dd")], false);
+        let next = has_start_presence(&[pad("cc:dd")], false);
+        assert!(!should_auto_close_start(prev, next, true));
+    }
+
+    #[test]
+    fn usb_on_presence_matches_raw_list() {
+        let usb = vec![usb_pad("aa:bb")];
+        assert!(has_start_presence(&usb, true));
+        assert!(should_auto_open_start(
+            true,
+            !has_start_presence(&[], true),
+            has_start_presence(&usb, true),
+            false,
+            false,
+            false
+        ));
+        assert!(should_auto_close_start(
+            has_start_presence(&usb, true),
+            has_start_presence(&[], true),
+            true
         ));
     }
 
@@ -178,14 +281,42 @@ mod tests {
     }
 
     #[test]
-    fn power_off_skips_cooldown_only_for_sole_controller() {
+    fn power_off_skips_cooldown_only_for_sole_qualifying_controller() {
         let alone = vec![pad("aa:bb")];
-        assert!(should_skip_connect_cooldown_on_power_off(&alone, "AA-BB"));
-        assert!(!should_skip_connect_cooldown_on_power_off(&alone, "cc:dd"));
+        assert!(should_skip_connect_cooldown_on_power_off(
+            &alone, "AA-BB", true
+        ));
+        assert!(!should_skip_connect_cooldown_on_power_off(
+            &alone, "cc:dd", true
+        ));
 
         let two = vec![pad("aa:bb"), pad("cc:dd")];
-        assert!(!should_skip_connect_cooldown_on_power_off(&two, "aa:bb"));
-        assert!(!should_skip_connect_cooldown_on_power_off(&[], "aa:bb"));
+        assert!(!should_skip_connect_cooldown_on_power_off(
+            &two, "aa:bb", true
+        ));
+        assert!(!should_skip_connect_cooldown_on_power_off(
+            &[],
+            "aa:bb",
+            true
+        ));
+
+        // USB ignored when include_usb is false: sole Bluetooth still qualifies.
+        let usb_and_bt = vec![usb_pad("usb:1"), pad("aa:bb")];
+        assert!(should_skip_connect_cooldown_on_power_off(
+            &usb_and_bt,
+            "aa:bb",
+            false
+        ));
+        assert!(!should_skip_connect_cooldown_on_power_off(
+            &usb_and_bt,
+            "usb:1",
+            false
+        ));
+        assert!(!should_skip_connect_cooldown_on_power_off(
+            &usb_and_bt,
+            "aa:bb",
+            true
+        ));
     }
 
     #[test]
