@@ -145,7 +145,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         if last_persist_check.elapsed() >= Duration::from_secs(2) {
             last_persist_check = Instant::now();
-            reload_persist_if_needed(&mut session);
+            if let Some(effects) = reload_persist_if_needed(&mut session, start_visible) {
+                dispatch_effects(&mut session, &hid_worker, &pipe, &mut tray, effects);
+            }
         }
 
         while let Some(cmd) = pipe.try_recv_command() {
@@ -411,7 +413,11 @@ fn handle_command(
         ShellCommand::PowerOff { serial } => {
             // Only the last pad's intentional power-off should skip the 0→1 ghost
             // cooldown; powering off one of two must not reopen Start on the sibling.
-            if should_skip_connect_cooldown_on_power_off(&session.controllers, &serial) {
+            if should_skip_connect_cooldown_on_power_off(
+                &session.controllers,
+                &serial,
+                session.prefs.start_screen_usb_controllers,
+            ) {
                 session.mark_skip_connect_cooldown();
             }
             hid_worker.power_off(serial);
@@ -465,7 +471,22 @@ fn handle_command(
             Ok(LoopControl::Continue)
         }
         ShellCommand::ReloadPersist => {
-            reload_persist(session);
+            if let Some(effects) = reload_persist(session, *start_visible) {
+                let ui_effects: Vec<SessionEffect> = effects
+                    .into_iter()
+                    .filter(|e| {
+                        matches!(
+                            e,
+                            SessionEffect::OpenStart
+                                | SessionEffect::CloseStart
+                                | SessionEffect::ClearStartLatch
+                        )
+                    })
+                    .collect();
+                if !ui_effects.is_empty() {
+                    let _ = pipe.send(ServiceMessage::Effects(ui_effects));
+                }
+            }
             Ok(LoopControl::Continue)
         }
     }
@@ -570,17 +591,31 @@ fn pollster_block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-fn reload_persist_if_needed(session: &mut DeviceSession) {
+fn reload_persist_if_needed(
+    session: &mut DeviceSession,
+    start_visible: bool,
+) -> Option<Vec<SessionEffect>> {
     // Cheap: always reload prefs/known so Settings edits in the shell take effect.
-    reload_persist(session);
+    reload_persist(session, start_visible)
 }
 
-fn reload_persist(session: &mut DeviceSession) {
+fn reload_persist(session: &mut DeviceSession, start_visible: bool) -> Option<Vec<SessionEffect>> {
     let prefs = Prefs::load();
+    let usb_changed =
+        prefs.start_screen_usb_controllers != session.prefs.start_screen_usb_controllers;
     color::set_active_spectrum(prefs.spectrum.clone());
     lightbar::set_enabled(prefs.lightbar_enabled);
     session.prefs = prefs;
     session.known = KnownControllers::load();
+    if !usb_changed {
+        return None;
+    }
+    Some(session.reevaluate_start_presence(ApplyContext {
+        start_visible,
+        fullscreen: start_input::foreground_is_exclusive_fullscreen(),
+        now: Instant::now(),
+        lightbar_enabled: lightbar::is_enabled(),
+    }))
 }
 
 /// Apply connect / battery-color lightbar via exclusive SetRgb while input is hot.

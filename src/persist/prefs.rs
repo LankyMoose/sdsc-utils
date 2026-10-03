@@ -73,6 +73,10 @@ pub struct Prefs {
     /// Always use immersive Start (never show compact; cancel closes) (default off).
     #[serde(default)]
     pub start_screen_always_immersive: bool,
+    /// Count USB pads for start-screen auto-open / auto-close (default on).
+    /// When off, only Bluetooth pads drive open and close.
+    #[serde(default = "default_true")]
+    pub start_screen_usb_controllers: bool,
     /// Chord that reopens the start screen while a pad is connected.
     /// Empty = no gesture reopen (0→1 auto-open still works). Missing key → default.
     #[serde(default = "default_gesture")]
@@ -147,6 +151,7 @@ impl Default for Prefs {
             lightbar_enabled: true,
             start_screen_enabled: true,
             start_screen_always_immersive: false,
+            start_screen_usb_controllers: true,
             start_screen_gesture: default_gesture(),
             start_screen_sounds_enabled: true,
             start_screen_sound_volume: default_start_screen_sound_volume(),
@@ -357,5 +362,13 @@ mod tests {
             serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":["ps"]}"#)
                 .unwrap();
         assert!(!prefs.start_screen_always_immersive);
+    }
+
+    #[test]
+    fn older_prefs_default_start_screen_usb_controllers_on() {
+        let prefs: Prefs =
+            serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":["ps"]}"#)
+                .unwrap();
+        assert!(prefs.start_screen_usb_controllers);
     }
 }

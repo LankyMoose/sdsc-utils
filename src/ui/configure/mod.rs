@@ -131,6 +131,7 @@ pub struct ConfigureSettings {
     pub lightbar_enabled: bool,
     pub start_screen_enabled: bool,
     pub start_screen_always_immersive: bool,
+    pub start_screen_usb_controllers: bool,
     pub start_screen_gesture: Vec<GestureControl>,
     pub start_screen_sounds_enabled: bool,
     pub start_screen_sound_volume: u8,
@@ -201,6 +202,7 @@ pub enum ConfigureMessage {
     SetLightbarEnabled(bool),
     SetStartScreenEnabled(bool),
     SetStartScreenAlwaysImmersive(bool),
+    SetStartScreenUsbControllers(bool),
     SetStartScreenSounds(bool),
     SetStartScreenSoundVolume(u8),
     SetStartScreenHaptics(bool),
@@ -605,6 +607,20 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
     );
 
     if settings.start_screen_enabled {
+        items = items.push(
+            checkbox(settings.start_screen_usb_controllers)
+                .label("USB controllers")
+                .size(16.0)
+                .text_size(13.0)
+                .spacing(8)
+                .on_toggle(ConfigureMessage::SetStartScreenUsbControllers),
+        );
+        items = items.push(
+            text("When off, only Bluetooth opens and closes the start screen.")
+                .size(12.0)
+                .color(theme::MUTED),
+        );
+
         items = items.push(
             checkbox(settings.start_screen_always_immersive)
                 .label("Always immersive")
