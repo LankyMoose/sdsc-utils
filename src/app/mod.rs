@@ -45,7 +45,7 @@ use crate::ui::layout::{
     MonitorCover, ToastPlacement, TrayAnchor, cursor_on_primary_monitor, hide_toast,
     invalidate_toast, overlay_platform_specific, popup_position, primary_monitor_cover,
     raise_window_topmost, remount_toast_surface, set_toast_topmost, show_toast_without_activate,
-    slide_y, toast_placement, window_platform_specific,
+    slide_y, toast_local_in_cover, toast_placement, window_hwnd, window_platform_specific,
 };
 use crate::ui::popup::{self as popup_view, ControllerRow, PopupMessage};
 use crate::ui::start::cursor_hide;
@@ -68,8 +68,8 @@ use iced::futures::StreamExt;
 use iced::futures::channel::{mpsc, oneshot};
 use iced::keyboard;
 use iced::mouse;
-use iced::widget::{container, operation, space};
-use iced::{Element, Point, Size, Subscription, Task, Theme, stream, window};
+use iced::widget::{Float, container, operation, space, stack};
+use iced::{Element, Fill, Point, Size, Subscription, Task, Theme, Vector, stream, window};
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -675,6 +675,10 @@ impl App {
                 stage_h,
             )
             .map(Message::Start);
+            let start = match self.immersive_toast_overlay() {
+                Some(toast) => stack![start, toast].width(Fill).height(Fill).into(),
+                None => start,
+            };
             return cursor_hide::force_cursor(start, self.start_cursor_hidden).into();
         }
 
@@ -3392,34 +3396,61 @@ impl App {
 
     fn pick_manual_shortcut(&mut self) -> Task<Message> {
         self.start_file_dialog_open = true;
-        Task::perform(
-            spawn_blocking(|| {
-                rfd::FileDialog::new()
-                    .add_filter("Programs", &["exe", "lnk", "url"])
-                    .pick_file()
-                    .map(|p| p.to_string_lossy().into_owned())
-            }),
-            |result| match result {
-                Ok(path) => Message::ManualFilePicked(path.map(PathBuf::from)),
-                Err(_) => Message::ManualFilePicked(None),
-            },
+        self.pick_file_dialog(
+            "Programs",
+            &["exe", "lnk", "url"],
+            Message::ManualFilePicked,
         )
     }
 
     fn pick_manual_icon(&mut self) -> Task<Message> {
         self.start_file_dialog_open = true;
-        Task::perform(
-            spawn_blocking(|| {
-                rfd::FileDialog::new()
-                    .add_filter("Images", &["png", "jpg", "jpeg", "ico", "webp"])
-                    .pick_file()
-                    .map(|p| p.to_string_lossy().into_owned())
-            }),
-            |result| match result {
-                Ok(path) => Message::ManualIconPicked(path.map(PathBuf::from)),
-                Err(_) => Message::ManualIconPicked(None),
-            },
+        self.pick_file_dialog(
+            "Images",
+            &["png", "jpg", "jpeg", "ico", "webp"],
+            Message::ManualIconPicked,
         )
+    }
+
+    /// Native file picker; on Windows parents to Start so it clears immersive cover.
+    fn pick_file_dialog(
+        &self,
+        filter_name: &'static str,
+        extensions: &'static [&'static str],
+        to_message: impl Fn(Option<PathBuf>) -> Message + Send + 'static,
+    ) -> Task<Message> {
+        let parent = match self.start_window.filter(|_| self.start_visible) {
+            Some(id) => window_hwnd(id),
+            None => Task::done(None),
+        };
+        let mut to_message = Some(to_message);
+        parent.then(move |parent_hwnd| {
+            let to_message = to_message
+                .take()
+                .expect("file dialog mapping consumed once");
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: file dialog parent hwnd={}",
+                parent_hwnd
+                    .map(|h| format!("0x{h:x}"))
+                    .unwrap_or_else(|| "none".into())
+            ));
+            Task::perform(
+                spawn_blocking(move || {
+                    let mut dialog = rfd::FileDialog::new().add_filter(filter_name, extensions);
+                    #[cfg(windows)]
+                    if let Some(parent) = parent_hwnd.and_then(Win32DialogParent::new) {
+                        dialog = dialog.set_parent(&parent);
+                    }
+                    #[cfg(not(windows))]
+                    let _ = parent_hwnd;
+                    dialog.pick_file().map(|p| p.to_string_lossy().into_owned())
+                }),
+                move |result| match result {
+                    Ok(path) => to_message(path.map(PathBuf::from)),
+                    Err(_) => to_message(None),
+                },
+            )
+        })
     }
 
     fn begin_manual_edit(&mut self) -> Task<Message> {
@@ -4221,12 +4252,52 @@ impl App {
         // Shown starts the slide clock after the HWND is visible at outside_y.
         if next_name == "SlidingIn" && prev == "Placing" {
             self.toast_anim_started = Instant::now();
+            if self.start_visible && self.start_state.immersive {
+                let generation = next.generation().or(prev_gen).unwrap_or(0);
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: immersive toast composite gen={generation}"
+                ));
+            }
         }
         if next_name == "SlidingOut" && prev != "SlidingOut" {
             self.toast_anim_started = Instant::now();
         }
         self.toast_machine = next;
         self.apply_toast_effects(effects)
+    }
+
+    /// Draw the active toast inside immersive Start (cover occludes the toast HWND).
+    fn immersive_toast_overlay(&self) -> Option<Element<'_, Message>> {
+        if !self.start_visible || !self.start_state.immersive {
+            return None;
+        }
+        let message = self.toast_message.as_ref()?;
+        let (progress, dismissing) = self.toast_machine.slide_pose()?;
+        let placement = self.toast_placement?;
+        let cover = self.start_monitor_cover?;
+        let local = toast_local_in_cover(placement, progress, dismissing, cover);
+        let card = toast_view::view(
+            message,
+            self.toast_generation,
+            Message::ToastDismiss(self.toast_generation),
+        );
+        // Layout at (0,0), then Float-translate into cover-local pose. Non-zero
+        // translate (or a tiny nudge) puts the card in the overlay band above the
+        // stage/veil and dock Floats; only the card's mouse_area captures clicks.
+        let x = local.x;
+        let y = local.y;
+        Some(
+            Float::new(card)
+                .scale(1.0)
+                .translate(move |_bounds, _viewport| {
+                    if x == 0.0 && y == 0.0 {
+                        Vector::new(0.0, 0.001)
+                    } else {
+                        Vector::new(x, y)
+                    }
+                })
+                .into(),
+        )
     }
 
     fn apply_toast_effects(&mut self, effects: Vec<ToastEffect>) -> Task<Message> {
@@ -4642,6 +4713,57 @@ async fn wait_for_escape() -> Option<()> {
 #[cfg(not(windows))]
 async fn wait_for_escape() -> Option<()> {
     std::future::pending::<()>().await
+}
+
+// ---------------------------------------------------------------------------
+// Native file dialog parent (Windows)
+// ---------------------------------------------------------------------------
+
+/// Thin HWND wrapper for [`rfd::FileDialog::set_parent`].
+#[cfg(windows)]
+struct Win32DialogParent {
+    hwnd: window::raw_window_handle::Win32WindowHandle,
+}
+
+#[cfg(windows)]
+impl Win32DialogParent {
+    fn new(hwnd: isize) -> Option<Self> {
+        use std::num::NonZeroIsize;
+        let hwnd = NonZeroIsize::new(hwnd)?;
+        Some(Self {
+            hwnd: window::raw_window_handle::Win32WindowHandle::new(hwnd),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl window::raw_window_handle::HasWindowHandle for Win32DialogParent {
+    fn window_handle(
+        &self,
+    ) -> Result<window::raw_window_handle::WindowHandle<'_>, window::raw_window_handle::HandleError>
+    {
+        Ok(unsafe {
+            window::raw_window_handle::WindowHandle::borrow_raw(
+                window::raw_window_handle::RawWindowHandle::Win32(self.hwnd),
+            )
+        })
+    }
+}
+
+#[cfg(windows)]
+impl window::raw_window_handle::HasDisplayHandle for Win32DialogParent {
+    fn display_handle(
+        &self,
+    ) -> Result<window::raw_window_handle::DisplayHandle<'_>, window::raw_window_handle::HandleError>
+    {
+        Ok(unsafe {
+            window::raw_window_handle::DisplayHandle::borrow_raw(
+                window::raw_window_handle::RawDisplayHandle::Windows(
+                    window::raw_window_handle::WindowsDisplayHandle::new(),
+                ),
+            )
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

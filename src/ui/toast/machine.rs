@@ -164,11 +164,35 @@ impl State {
         self.is_active()
     }
 
+    /// Linear slide pose for compositing: `(progress 0..=1, dismissing)`.
+    ///
+    /// Placing is off-screen (`0`, slide-in). Resting is the target (`1`, slide-in).
+    /// Pass the progress into [`crate::ui::layout::slide_y`] for the eased screen Y.
+    pub fn slide_pose(&self) -> Option<(f32, bool)> {
+        match self {
+            Self::Idle => None,
+            Self::Active(Active { phase, .. }) => match phase {
+                Phase::Placing => Some((0.0, false)),
+                Phase::SlidingIn { elapsed } => Some((slide_progress(*elapsed), false)),
+                Phase::Resting => Some((1.0, false)),
+                Phase::SlidingOut { elapsed } => Some((slide_progress(*elapsed), true)),
+            },
+        }
+    }
+
     /// Clear a latched OpenStart without finishing the toast (e.g. pads went empty).
     pub fn clear_after(&mut self) {
         if let Self::Active(active) = self {
             active.after = AfterToast::Nothing;
         }
+    }
+}
+
+fn slide_progress(elapsed: Duration) -> f32 {
+    if TOAST_SLIDE_DURATION.is_zero() {
+        1.0
+    } else {
+        (elapsed.as_secs_f32() / TOAST_SLIDE_DURATION.as_secs_f32()).min(1.0)
     }
 }
 
@@ -492,6 +516,19 @@ mod tests {
             })
         ));
         assert_eq!(effects, vec![Effect::PlaceShow]);
+    }
+
+    #[test]
+    fn slide_pose_tracks_phase() {
+        assert_eq!(State::Idle.slide_pose(), None);
+        let (placing, _) = step(State::Idle, show_connect(1));
+        assert_eq!(placing.slide_pose(), Some((0.0, false)));
+        let (sliding, _) = step(placing, Event::Shown { generation: 1 });
+        assert_eq!(sliding.slide_pose(), Some((0.0, false)));
+        let (resting, _) = settle_slide_in(sliding);
+        assert_eq!(resting.slide_pose(), Some((1.0, false)));
+        let (dismissing, _) = step(resting, Event::Dismiss { generation: 1 });
+        assert_eq!(dismissing.slide_pose(), Some((0.0, true)));
     }
 
     #[test]
