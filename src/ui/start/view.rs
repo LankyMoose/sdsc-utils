@@ -1576,6 +1576,82 @@ pub(crate) fn immersive_dock_row_hints(
     Some(action_cluster_dock(&actions))
 }
 
+/// Edit-mode membership mark for the immersive hero meta column.
+pub(crate) fn immersive_game_membership_label(row: &StartRow) -> Element<'static, StartMessage> {
+    let in_lib = row.in_catalog();
+    let mark = if in_lib { "✓" } else { "○" };
+    let mark_color = if in_lib {
+        theme::ACCENT
+    } else {
+        theme::alpha(theme::MUTED, 0.7)
+    };
+    let label = if in_lib {
+        "In library"
+    } else {
+        "Not in library"
+    };
+    // Match [`action_hint_dock`] label size + color.
+    row![
+        text(mark).size(14.0).color(mark_color),
+        text(label).size(13.0).color(theme::alpha(theme::INK, 0.85)),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// Launch / Close game / edit face cues beside the immersive selected hero.
+///
+/// Layout-stable (`action_cluster_dock`) so veil/Float cannot resize the meta column.
+pub(crate) fn immersive_game_hints(
+    row: &StartRow,
+    state: &State,
+) -> Element<'static, StartMessage> {
+    let hint = RowHintState::for_selected(state, true);
+    let mut actions = Vec::new();
+    if state.editing {
+        let label = match row.edit.as_ref() {
+            Some(EditRow::Manual { .. }) => "Remove",
+            Some(EditRow::Steam { .. }) | None => "Toggle",
+        };
+        actions.push(face_hint(
+            FaceButton::Cross,
+            label,
+            hint.held,
+            hint.press_anim,
+        ));
+        if matches!(row.edit, Some(EditRow::Manual { .. })) {
+            actions.push(face_hint(
+                FaceButton::Square,
+                "Edit",
+                hint.held,
+                hint.press_anim,
+            ));
+        }
+    } else if state
+        .running_target
+        .as_ref()
+        .is_some_and(|t| t == &row.target)
+    {
+        actions.push(face_hold_hint(
+            FaceButton::Cross,
+            "Close game",
+            hint.cross_progress,
+            hint.cross_armed_t,
+            hint.held,
+            hint.press_anim,
+        ));
+    } else {
+        actions.push(face_hint(
+            FaceButton::Cross,
+            "Launch",
+            hint.held,
+            hint.press_anim,
+        ));
+    }
+    action_cluster_dock(&actions)
+}
+
 /// Mouse + global hotkey hitch markers (not pad-navigable). Stamps `HITCH_MARK` in the logs.
 /// Debug builds only.
 #[cfg(debug_assertions)]
@@ -2467,10 +2543,16 @@ fn action_hint_dock(hint: &ActionHint) -> Element<'static, StartMessage> {
             .into()
     };
 
-    row![glyph, text(hint.label).size(13.0).color(theme::MUTED)]
-        .spacing(6)
-        .align_y(Alignment::Center)
-        .into()
+    // Brighter than footer MUTED — dock/meta cues sit over translucent backdrop wash.
+    row![
+        glyph,
+        text(hint.label)
+            .size(13.0)
+            .color(theme::alpha(theme::INK, 0.85)),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn face_svg(face: FaceButton, size: f32) -> Element<'static, StartMessage> {

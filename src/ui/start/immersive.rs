@@ -6,7 +6,8 @@ use crate::ui::shader::AmbientProgram;
 use crate::ui::start::mode::{TransitionPhase, dock_panel_width, dock_stage_dim, dock_stage_scale};
 use crate::ui::start::view::{
     StartControllerRow, StartMessage, StartRow, StartSlide, State, footer_hint,
-    immersive_dock_row_hints, manual_add_view, replace_confirm_view,
+    immersive_dock_row_hints, immersive_game_hints, immersive_game_membership_label,
+    manual_add_view, replace_confirm_view,
 };
 use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics};
 use crate::ui::theme;
@@ -303,13 +304,20 @@ fn games_stage(state: &State, now: Instant, stage_h: f32) -> Element<'_, StartMe
         match vstrip::slot_catalog_index(selected, delta, len) {
             Some(idx) => {
                 let row = &state.rows[idx];
+                let selected_slot = idx == selected;
+                let overlay = if selected_slot {
+                    Some(hero_hint_overlay(row, state))
+                } else {
+                    None
+                };
                 items.push(strip_slot(
                     row,
-                    idx == selected,
+                    selected_slot,
                     state.editing,
                     scale,
                     fade,
                     &metrics,
+                    overlay,
                 ));
             }
             None => items.push(strip_slot_dummy(scale, fade, &metrics)),
@@ -320,24 +328,7 @@ fn games_stage(state: &State, now: Instant, stage_h: f32) -> Element<'_, StartMe
         .width(Length::Fixed(metrics.slot_w))
         .height(Fill);
 
-    // Status marks only — title/subtitle live beside each hero in the strip.
-    let row = &state.rows[selected];
-    let mut meta = column![].spacing(6);
-    if state.editing {
-        let mark = if row.in_catalog() {
-            "In library — Cross to remove"
-        } else {
-            "Not in library — Cross to add"
-        };
-        meta = meta.push(text(mark).size(14.0).color(theme::ACCENT));
-    } else if state
-        .running_target
-        .as_ref()
-        .is_some_and(|t| t == &row.target)
-    {
-        meta = meta.push(text("Playing").size(15.0).color(theme::ACCENT));
-    }
-
+    // Titles sit beside heroes; Launch/Close/edit cues overlay the selected capsule.
     row![
         container(strip).padding(Padding {
             top: 0.0,
@@ -345,21 +336,28 @@ fn games_stage(state: &State, now: Instant, stage_h: f32) -> Element<'_, StartMe
             bottom: 0.0,
             left: STRIP_LEFT_PAD,
         }),
-        container(meta)
-            .width(Fill)
-            .height(Fill)
-            .align_y(Alignment::Center)
-            .padding(Padding {
-                top: 0.0,
-                right: EDGE_PAD + DOCK_PEEK_W,
-                bottom: 0.0,
-                left: 12.0,
-            }),
+        space().width(Fill),
     ]
     .spacing(0)
     .width(Fill)
     .height(Fill)
     .into()
+}
+
+/// Membership / Playing + face cues stacked on the selected hero art.
+fn hero_hint_overlay<'a>(row: &'a StartRow, state: &'a State) -> Element<'a, StartMessage> {
+    let running = state
+        .running_target
+        .as_ref()
+        .is_some_and(|t| t == &row.target);
+    let mut col = column![].spacing(10).align_x(Alignment::Center);
+    if state.editing {
+        col = col.push(immersive_game_membership_label(row));
+    } else if running {
+        col = col.push(text("Playing").size(15.0).color(theme::ACCENT));
+    }
+    col = col.push(immersive_game_hints(row, state));
+    col.into()
 }
 
 fn empty_games(state: &State) -> Element<'_, StartMessage> {
@@ -426,15 +424,17 @@ fn strip_slot<'a>(
     scale: f32,
     fade: f32,
     metrics: &StripMetrics,
+    overlay: Option<Element<'a, StartMessage>>,
 ) -> Element<'a, StartMessage> {
     let muted = editing && !row.in_catalog();
     let hero_ready = row.hero_ready();
-    let capsule = strip_capsule(row, selected, muted, hero_ready, fade);
+    let capsule = strip_capsule(row, selected, muted, hero_ready, fade, overlay);
 
-    let title_size = if selected { 30.0 } else { 22.0 };
+    let title_size = if selected { 39.0 } else { 22.0 };
     let title_alpha = if muted { 0.55 * fade } else { fade };
+    // Selected titles are large; pull back from pure white for less glare.
     let title_color = if selected {
-        theme::alpha(theme::INK, fade)
+        theme::alpha(theme::mix(theme::INK, theme::MUTED, 0.28), title_alpha)
     } else {
         theme::alpha(theme::MUTED, 0.85 * title_alpha)
     };
@@ -454,12 +454,13 @@ fn strip_slot<'a>(
         ..Font::DEFAULT
     });
 
+    let sub_alpha = if muted { 0.55 * fade } else { 0.9 * fade };
     let mut titles = column![title].spacing(6);
     if let Some(sub) = row.subtitle.as_ref() {
         titles = titles.push(
             text(sub.clone())
                 .size(if selected { 16.0 } else { 14.0 })
-                .color(theme::alpha(theme::MUTED, 0.9 * fade)),
+                .color(theme::alpha(theme::MUTED, sub_alpha)),
         );
     }
 
@@ -497,15 +498,17 @@ fn strip_slot<'a>(
     container(body).width(Fill).height(Fill).into()
 }
 
-fn strip_capsule(
-    row: &StartRow,
+fn strip_capsule<'a>(
+    row: &'a StartRow,
     selected: bool,
     muted: bool,
     hero_ready: bool,
     fade: f32,
-) -> Element<'_, StartMessage> {
+    overlay: Option<Element<'a, StartMessage>>,
+) -> Element<'a, StartMessage> {
     let fade = fade.clamp(0.0, 1.0);
-    let inner: Element<'_, StartMessage> = if row.skeleton {
+    let art_fade = if muted { 0.55 * fade } else { fade };
+    let art: Element<'_, StartMessage> = if row.skeleton {
         container(space())
             .width(Fill)
             .height(Fill)
@@ -517,13 +520,13 @@ fn strip_capsule(
                 .width(Fill)
                 .height(Fill)
                 .content_fit(iced::ContentFit::Cover)
-                .opacity(fade)
+                .opacity(art_fade)
                 .into(),
             Some(icon) => iced::widget::image(icon.0)
                 .width(Fill)
                 .height(Fill)
                 .content_fit(iced::ContentFit::Cover)
-                .opacity(0.55 * fade)
+                .opacity(0.55 * art_fade)
                 .into(),
             None => container(
                 text(row.title.chars().next().unwrap_or('?').to_string())
@@ -543,6 +546,32 @@ fn strip_capsule(
         }
     };
 
+    // Solid dark footer band, content-sized and bottom-aligned.
+    let inner: Element<'_, StartMessage> = if let Some(hints) = overlay {
+        let footer = container(hints)
+            .width(Fill)
+            .center_x(Fill)
+            .padding(Padding {
+                top: 10.0,
+                right: 12.0,
+                bottom: 10.0,
+                left: 12.0,
+            })
+            .style(|_theme: &iced::Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(theme::alpha(
+                    iced::Color::BLACK,
+                    0.82,
+                ))),
+                ..iced::widget::container::Style::default()
+            });
+        let cues = column![space().height(Fill), footer,]
+            .width(Fill)
+            .height(Fill);
+        stack![art, cues].width(Fill).height(Fill).into()
+    } else {
+        art
+    };
+
     let border = if selected {
         theme::alpha(theme::ACCENT, 0.85 * fade)
     } else {
@@ -552,6 +581,7 @@ fn strip_capsule(
     container(inner)
         .width(Fill)
         .height(Fill)
+        .clip(true)
         .style(move |_theme: &iced::Theme| iced::widget::container::Style {
             background: Some(iced::Background::Color(theme::CONTENT)),
             border: iced::Border {

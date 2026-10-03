@@ -17,15 +17,15 @@ pub const STRIP_ANIM_MS: u64 = 200;
 pub const STRIP_ANIM_CATCHUP_MS: u64 = 110;
 
 /// Selected hero scale relative to base capsule size.
-pub const SELECTED_SCALE: f32 = 1.33;
+pub const SELECTED_SCALE: f32 = 1.42;
 /// Scale at `|d| = 1` (continues shrinking past the first neighbor).
 pub const SCALE_AT_1: f32 = 0.88;
 /// Scale at `|d| = 2` (outer peek cards).
-pub const SCALE_AT_2: f32 = 0.72;
+pub const SCALE_AT_2: f32 = 0.58;
 /// Neighbor title + subtitle column width.
 pub const TITLE_COL: f32 = 480.0;
 /// Rightward arc offset per index unit of distance from center.
-pub const ARC_PX: f32 = 9.0;
+pub const ARC_PX: f32 = 14.0;
 /// Constant edge gap between adjacent capsules (negative = slight overlap / denser stream).
 const STRIDE_GAP: f32 = 12.0;
 /// Fraction of the outer (`|d| = 2`) card visible at the viewport edge.
@@ -112,7 +112,7 @@ pub fn scale_at_distance(distance: f32) -> f32 {
     } else if d <= 2.0 {
         SCALE_AT_1 + (SCALE_AT_2 - SCALE_AT_1) * (d - 1.0)
     } else {
-        (SCALE_AT_2 - 0.08 * (d - 2.0)).max(0.55)
+        (SCALE_AT_2 - 0.06 * (d - 2.0)).max(0.48)
     }
 }
 
