@@ -2262,7 +2262,6 @@ pub(crate) fn footer_hint<'a>(
                             matches!(state.sort_mode, GamesSortMode::Alphabetical),
                         ),
                     ],
-                    StartMessage::CycleSort,
                     flat_hints,
                 ),]
                 .spacing(28)
@@ -2282,7 +2281,6 @@ pub(crate) fn footer_hint<'a>(
                     ("Connected", !state.show_all_controllers),
                     ("All", state.show_all_controllers),
                 ],
-                StartMessage::CycleSort,
                 flat_hints,
             ),]
             .spacing(28)
@@ -2426,13 +2424,12 @@ fn footer_band(content: Element<'_, StartMessage>, immersive: bool) -> Element<'
     }
 }
 
-/// Square glyph + segmented labels; pad and mouse both fire `on_press`.
+/// Square glyph + segmented labels; pad Square cycles (presentational — no mouse).
 fn face_cycle_toggle(
     face: FaceButton,
     held: FaceHeld,
     press_anim: FacePressAnim,
     options: &[(&'static str, bool)],
-    on_press: StartMessage,
     flat: bool,
 ) -> Element<'static, StartMessage> {
     let dim = theme::alpha(theme::MUTED, 0.45);
@@ -2454,11 +2451,7 @@ fn face_cycle_toggle(
         }
         labels = labels.push(toggle_option_label(label, active));
     }
-    button(labels)
-        .padding(0)
-        .on_press(on_press)
-        .style(theme::ghost)
-        .into()
+    labels.into()
 }
 
 fn toggle_option_label(label: &'static str, active: bool) -> Element<'static, StartMessage> {
