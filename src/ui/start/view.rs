@@ -921,6 +921,12 @@ impl State {
         now.saturating_duration_since(started) >= Duration::from_millis(dur)
     }
 
+    /// Drop crossfade/land state (demote / leave immersive without closing).
+    pub fn clear_backdrop_transition(&mut self) {
+        self.backdrop_current = None;
+        self.backdrop_outgoing = None;
+    }
+
     /// Start backdrop land/crossfade once peek art exists for a waiting selection.
     pub fn note_backdrop_ready(&mut self, now: Instant) {
         let Some(row) = self.rows.get(self.game_selected) else {
@@ -929,12 +935,23 @@ impl State {
         if row.backdrop_icon().is_none() {
             return;
         }
-        match &mut self.backdrop_current {
-            Some((key, started)) if key == &row.play_key && started.is_none() => {
+        let key = row.play_key.clone();
+        let waiting = matches!(&self.backdrop_current, Some((k, None)) if k == &key);
+        let armed = matches!(&self.backdrop_current, Some((k, Some(_))) if k == &key);
+        if waiting {
+            if let Some((_, started)) = &mut self.backdrop_current {
                 *started = Some(now);
             }
-            None => {}
-            _ => {}
+        } else if !armed {
+            let was = self
+                .backdrop_current
+                .as_ref()
+                .map(|(k, _)| k.as_str())
+                .unwrap_or("none");
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: backdrop ready re-arm key={key} was={was}"
+            ));
+            self.backdrop_current = Some((key, Some(now)));
         }
     }
 
@@ -961,8 +978,8 @@ impl State {
                 let (ox, oy) = backdrop_land_offset(land);
                 Some((opacity, scale, ox, oy))
             }
-            None => Some((1.0, 1.0, 0.0, 0.0)),
-            _ => None,
+            // No state, or stale key after compact nav — still paint current art.
+            None | Some(_) => Some((1.0, 1.0, 0.0, 0.0)),
         }
     }
 

@@ -11,7 +11,7 @@ use crate::ui::start::view::{
     StartControllerRow, StartMessage, StartRow, StartSlide, State, footer_hint,
     immersive_dock_row_hints, immersive_slide_header, manual_add_view, replace_confirm_view,
 };
-use crate::ui::start::vstrip::{self, CENTER_H, CENTER_W, NEIGHBORS, SLOT_W};
+use crate::ui::start::vstrip::{self, CENTER_H, CENTER_W, NEIGHBORS, SELECTED_SCALE, SLOT_W};
 use crate::ui::theme;
 use iced::font::Weight;
 use iced::widget::{Float, button, column, container, row, shader, space, stack, text};
@@ -22,6 +22,8 @@ const EDGE_PAD: f32 = 28.0;
 const DOCK_PEEK_W: f32 = 110.0;
 const DOCK_MAX_W: f32 = 360.0;
 const DOCK_RING_MIN: f32 = 56.0;
+/// Fixed dock row height so rings do not jump when details/hints appear.
+const DOCK_ROW_H: f32 = 88.0;
 const MODAL_W: f32 = 640.0;
 
 pub fn veil_view(state: &State, now: Instant) -> Element<'_, StartMessage> {
@@ -427,9 +429,13 @@ fn strip_slot(
         .into();
 
     // Explicit pixel size so vstrip scale actually enlarges the hero.
+    // Inset smaller art so every capsule shares the selected art centerline.
+    let max_art_w = CENTER_W * SELECTED_SCALE;
     let art_w = CENTER_W * scale;
     let art_h = CENTER_H * scale;
+    let inset = ((max_art_w - art_w) * 0.5).max(0.0);
     let body = row![
+        space().width(Length::Fixed(inset)),
         container(capsule)
             .width(Length::Fixed(art_w))
             .height(Length::Fixed(art_h)),
@@ -520,80 +526,83 @@ fn strip_capsule(
         .into()
 }
 
-/// Single fixed-width panel: rings in the left peek column, details to the right.
-/// Host clips `visible_w` and slides the panel in — no peek/expanded tree swap.
+/// Fixed peek rings + clipped fixed-width details (reveal on expand, no text reflow).
 fn controllers_dock_host<'a>(
     state: &'a State,
     spectrum: &BatterySpectrum,
     dock_progress: f32,
 ) -> Element<'a, StartMessage> {
     let visible_w = dock_panel_width(dock_progress, DOCK_PEEK_W, DOCK_MAX_W);
-    let slide = (DOCK_MAX_W - visible_w).max(0.0);
-    let panel = controllers_dock_panel(state, spectrum);
-    container(
-        row![space().width(Length::Fixed(slide)), panel]
-            .width(Length::Fixed(DOCK_MAX_W))
-            .height(Fill),
-    )
-    .width(Length::Fixed(visible_w))
-    .height(Fill)
-    .clip(true)
-    .into()
-}
+    let details_full = DOCK_MAX_W - DOCK_PEEK_W;
+    let details_reveal = (visible_w - DOCK_PEEK_W).max(0.0);
 
-fn controllers_dock_panel<'a>(
-    state: &'a State,
-    spectrum: &BatterySpectrum,
-) -> Element<'a, StartMessage> {
-    let mut items = column![].spacing(12).width(Fill);
+    let mut rings = column![].spacing(12).width(Length::Fixed(DOCK_PEEK_W));
+    let mut details = column![].spacing(12).width(Length::Fixed(details_full));
+
     if state.controllers.is_empty() {
-        items = items.push(
-            row![
-                container(text("—").size(13.0).color(theme::DIM))
-                    .width(Length::Fixed(DOCK_PEEK_W))
-                    .center_x(Fill),
-                text("No controllers")
-                    .size(13.0)
-                    .color(theme::DIM)
-                    .width(Fill),
-            ]
-            .align_y(Alignment::Center)
-            .width(Fill),
+        rings = rings.push(
+            container(text("—").size(13.0).color(theme::DIM))
+                .width(Length::Fixed(DOCK_PEEK_W))
+                .height(Length::Fixed(DOCK_ROW_H))
+                .center_x(Fill)
+                .center_y(Fill),
+        );
+        details = details.push(
+            container(text("No controllers").size(13.0).color(theme::DIM))
+                .width(Length::Fixed(details_full))
+                .height(Length::Fixed(DOCK_ROW_H))
+                .center_y(Fill)
+                .padding(Padding {
+                    top: 0.0,
+                    right: 16.0,
+                    bottom: 0.0,
+                    left: 4.0,
+                }),
         );
     } else {
         for (i, row) in state.controllers.iter().enumerate() {
             let selected =
                 i == state.controller_selected && matches!(state.slide, StartSlide::Controllers);
-            items = items.push(dock_row_unified(
+            rings = rings.push(dock_ring_cell(
                 i,
                 row,
                 spectrum,
                 selected,
                 state.ring_flash_white(&row.serial),
-                state,
             ));
+            details = details.push(dock_details_cell(i, row, selected, state, details_full));
         }
     }
 
-    container(container(items).width(Fill).height(Fill).padding(Padding {
+    let pad = Padding {
         top: 20.0,
         right: 0.0,
         bottom: 72.0,
         left: 0.0,
-    }))
-    .width(Length::Fixed(DOCK_MAX_W))
-    .height(Fill)
-    .style(theme::immersive_dock)
-    .into()
+    };
+    let rings_col = container(rings).padding(pad).height(Fill);
+    let details_inner = container(details)
+        .width(Length::Fixed(details_full))
+        .padding(pad)
+        .height(Fill);
+    let details_clip = container(details_inner)
+        .width(Length::Fixed(details_reveal))
+        .height(Fill)
+        .clip(true);
+
+    container(row![rings_col, details_clip].width(Fill).height(Fill))
+        .width(Length::Fixed(visible_w))
+        .height(Fill)
+        .style(theme::immersive_dock)
+        .into()
 }
 
-fn dock_row_unified<'a>(
+fn dock_ring_cell<'a>(
     index: usize,
     row: &'a StartControllerRow,
     spectrum: &BatterySpectrum,
     selected: bool,
     flash_white: bool,
-    state: &State,
 ) -> Element<'a, StartMessage> {
     let ring_color = if flash_white {
         theme::from_rgb(crate::controller::dualsense::lightbar::IDENTIFY_FLASH)
@@ -602,8 +611,29 @@ fn dock_row_unified<'a>(
     } else {
         theme::DIM
     };
-    // Fixed ring size — no lerp during expand (avoids layout jank).
     let ring = percent_ring::percent_ring(row.percent, ring_color, DOCK_RING_MIN, row.eta.clone());
+    button(
+        container(ring)
+            .width(Length::Fixed(DOCK_PEEK_W))
+            .height(Length::Fixed(DOCK_ROW_H))
+            .center_x(Fill)
+            .center_y(Fill),
+    )
+    .padding(0)
+    .width(Length::Fixed(DOCK_PEEK_W))
+    .height(Length::Fixed(DOCK_ROW_H))
+    .on_press(StartMessage::SelectController(index))
+    .style(theme::menu_row(selected))
+    .into()
+}
+
+fn dock_details_cell<'a>(
+    index: usize,
+    row: &'a StartControllerRow,
+    selected: bool,
+    state: &State,
+    details_w: f32,
+) -> Element<'a, StartMessage> {
     let title_color = if row.connected {
         theme::INK
     } else {
@@ -614,7 +644,7 @@ fn dock_row_unified<'a>(
     } else {
         theme::MUTED
     };
-    let mut details = column![
+    let mut col = column![
         text(&row.title).size(16.0).color(title_color).font(Font {
             weight: if selected {
                 Weight::Bold
@@ -631,30 +661,25 @@ fn dock_row_unified<'a>(
     .width(Fill);
 
     if let Some(hints) = immersive_dock_row_hints(row, state, selected) {
-        details = details.push(hints);
+        col = col.push(hints);
     }
 
-    let details_w = DOCK_MAX_W - DOCK_PEEK_W;
     button(
-        row![
-            container(ring)
-                .width(Length::Fixed(DOCK_PEEK_W))
-                .center_x(Fill)
-                .padding([10, 8]),
-            container(details)
-                .width(Length::Fixed(details_w))
-                .padding(Padding {
-                    top: 10.0,
-                    right: 16.0,
-                    bottom: 10.0,
-                    left: 4.0,
-                }),
-        ]
-        .align_y(Alignment::Center)
-        .width(Fill),
+        container(col)
+            .width(Length::Fixed(details_w))
+            .height(Length::Fixed(DOCK_ROW_H))
+            .center_y(Fill)
+            .clip(true)
+            .padding(Padding {
+                top: 0.0,
+                right: 16.0,
+                bottom: 0.0,
+                left: 4.0,
+            }),
     )
     .padding(0)
-    .width(Fill)
+    .width(Length::Fixed(details_w))
+    .height(Length::Fixed(DOCK_ROW_H))
     .on_press(StartMessage::SelectController(index))
     .style(theme::menu_row(selected))
     .into()

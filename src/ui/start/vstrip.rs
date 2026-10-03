@@ -21,8 +21,8 @@ pub const CENTER_H: f32 = 330.0;
 pub const SELECTED_SCALE: f32 = 1.33;
 /// Neighbor title + subtitle column width.
 pub const TITLE_COL: f32 = 480.0;
-/// Full slot (capsule + title column) used for layout / scale.
-pub const SLOT_W: f32 = CENTER_W + TITLE_COL;
+/// Full slot room for selected art width + title column.
+pub const SLOT_W: f32 = CENTER_W * SELECTED_SCALE + TITLE_COL;
 pub const SLOT_H: f32 = CENTER_H;
 /// Vertical pitch: clears enlarged selected (~439h) plus ~20px gap.
 pub const STRIDE: f32 = 410.0;
@@ -38,10 +38,10 @@ pub fn scale_at_distance(distance: f32) -> f32 {
     }
 }
 
-/// Opacity for a signed distance from the visual center (next=0.8, next+1=0.6, …).
+/// Opacity for a signed distance from the visual center (next≈0.7, next+1≈0.4, …).
 pub fn opacity_at_distance(distance: f32) -> f32 {
     let d = distance.abs();
-    (1.0 - 0.2 * d).clamp(0.35, 1.0)
+    (1.0 - 0.3 * d).clamp(0.25, 1.0)
 }
 
 /// Shortest signed step on a circular list of length `len` from `from` → `to`.
@@ -338,10 +338,10 @@ mod tests {
     }
 
     #[test]
-    fn opacity_steps_down_by_fifth() {
+    fn opacity_steps_down_by_third() {
         assert!((opacity_at_distance(0.0) - 1.0).abs() < 0.001);
-        assert!((opacity_at_distance(1.0) - 0.8).abs() < 0.001);
-        assert!((opacity_at_distance(2.0) - 0.6).abs() < 0.001);
+        assert!((opacity_at_distance(1.0) - 0.7).abs() < 0.001);
+        assert!((opacity_at_distance(2.0) - 0.4).abs() < 0.001);
     }
 
     #[test]

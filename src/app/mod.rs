@@ -2675,10 +2675,17 @@ impl App {
         let now = Instant::now();
         if immersive {
             // Keep ambient_time; open aperture + chrome.
+            // Re-arm backdrop to the live selection — compact nav leaves a stale key.
+            self.start_state.reset_backdrop_fade();
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start immersive settle promote backdrop re-arm sel={}",
+                self.start_state.game_selected
+            ));
             self.start_state
                 .begin_transition_phase(start_mode::TransitionPhase::EnterImmersive, now);
         } else {
             self.start_monitor_cover = None;
+            self.start_state.clear_backdrop_transition();
             self.start_state
                 .begin_transition_phase(start_mode::TransitionPhase::EnterCompact, now);
         }
