@@ -2857,24 +2857,26 @@ mod tests {
 
     #[test]
     fn begin_strip_anim_uses_prior_index_when_settled() {
-        let mut state = State::default();
-        state.rows = (0..5)
-            .map(|i| StartRow {
-                title: format!("g{i}"),
-                subtitle: None,
-                target: format!("t{i}"),
-                args: String::new(),
-                play_key: format!("k{i}"),
-                icon: None,
-                icon_source: None,
-                backdrop_path: None,
-                edit: None,
-                skeleton: false,
-            })
-            .collect();
+        let mut state = State {
+            rows: (0..5)
+                .map(|i| StartRow {
+                    title: format!("g{i}"),
+                    subtitle: None,
+                    target: format!("t{i}"),
+                    args: String::new(),
+                    play_key: format!("k{i}"),
+                    icon: None,
+                    icon_source: None,
+                    backdrop_path: None,
+                    edit: None,
+                    skeleton: false,
+                })
+                .collect(),
+            game_selected: 3,
+            ..Default::default()
+        };
         let now = Instant::now();
         // After selection advances, strip_scroll alone would equal `to` — must pass prior index.
-        state.game_selected = 3;
         state.begin_strip_anim(2.0, now);
         let anim = state.strip_anim.as_ref().expect("settled step starts anim");
         assert!((anim.from - 2.0).abs() < 0.01);
