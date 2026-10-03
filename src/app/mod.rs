@@ -4423,6 +4423,7 @@ impl App {
     /// Toast stays TOPMOST vs Cursor; UI above toast keeps presents (iced#3320).
     /// Only called when the machine emits RaiseInteractive (Resting / settle).
     /// Hidden warm Start must not be raised — that resurfaced Start after close.
+    /// Immersive cover occludes the toast HWND; see `immersive_toast_overlay`.
     fn raise_interactive_ui_above_toast(&self, focus: bool) -> Task<Message> {
         let mut task = Task::none();
         if let Some(id) = self.popup_window {
