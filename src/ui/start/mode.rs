@@ -325,7 +325,9 @@ mod tests {
     fn backdrop_land_zoom_helpers() {
         assert!((backdrop_land_scale(0.0) - BACKDROP_LAND_SCALE0).abs() < 0.001);
         assert!((backdrop_land_scale(1.0) - BACKDROP_LAND_SCALE1).abs() < 0.001);
-        assert!(BACKDROP_LAND_SCALE0 >= 1.0);
+        const {
+            assert!(BACKDROP_LAND_SCALE0 >= 1.0);
+        }
         let (x0, y0) = backdrop_land_offset(0.0);
         assert!((x0 - BACKDROP_LAND_OX0).abs() < 0.001);
         assert!((y0 - BACKDROP_LAND_OY0).abs() < 0.001);
