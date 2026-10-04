@@ -41,15 +41,19 @@ pub enum TransitionPhase {
     EnterCompact,
 }
 
-/// Shared duration for darken-compact / reveal-immersive / darken-immersive / reveal-compact.
+/// Shared duration for darken-compact / darken-immersive / reveal-compact.
 pub const VEIL_TRANSITION_MS: u64 = 300;
 pub const EXIT_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
-pub const ENTER_IMMERSIVE_MS: u64 = VEIL_TRANSITION_MS;
+/// EnterImmersive top-veil lift (ease-in-out); matches splash length so one ceremony covers both.
+pub const ENTER_REVEAL_MS: u64 = 450;
+pub const ENTER_IMMERSIVE_MS: u64 = ENTER_REVEAL_MS;
+/// Cap per StartFrame so a UI stall cannot skip the start of the enter curve.
+pub const ENTER_REVEAL_MAX_FRAME_MS: u64 = 32;
 /// Legacy grow-segment fraction (unused by the single top-veil enter path).
 pub const ENTER_GROW_END: f32 = 0.28;
 pub const EXIT_IMMERSIVE_MS: u64 = VEIL_TRANSITION_MS;
 pub const ENTER_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
-/// Opacity crossfade between game backdrops.
+/// Opacity crossfade between game backdrops (selection change; not enter veil).
 pub const ART_FADE_MS: u64 = 450;
 /// Slow ken-burns settle (scale + center) after landing on a game.
 pub const BACKDROP_LAND_MS: u64 = 10_000;
@@ -220,10 +224,20 @@ pub fn phase_progress_linear(elapsed_ms: u64, duration_ms: u64) -> f32 {
     (elapsed_ms as f32 / duration_ms as f32).clamp(0.0, 1.0)
 }
 
-/// Ease-in cubic — slow start, used for enter immersive chrome reveal.
+/// Ease-in cubic — slow start.
 pub fn ease_in_cubic(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * t
+}
+
+/// Ease-in-out cubic — smooth enter-immersive veil lift.
+pub fn ease_in_out_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        4.0 * t * t * t
+    } else {
+        1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
+    }
 }
 
 /// Content/veil reveal after HWND settle (0 = veiled, 1 = clear).
@@ -231,9 +245,21 @@ pub fn settle_reveal(elapsed_ms: u64, duration_ms: u64) -> f32 {
     phase_progress(elapsed_ms, duration_ms)
 }
 
-/// Art fade-in progress (0 = invisible, 1 = opaque).
+/// EnterImmersive top-veil alpha (1 = solid black, 0 = clear).
+pub fn enter_veil_amount(elapsed_ms: u64) -> f32 {
+    let t = phase_progress_linear(elapsed_ms, ENTER_REVEAL_MS);
+    1.0 - ease_in_out_cubic(t)
+}
+
+/// Art fade-in progress (0 = invisible, 1 = opaque) — ease-out for game-change crossfade.
 pub fn art_fade_progress(elapsed_ms: u64) -> f32 {
     phase_progress(elapsed_ms, ART_FADE_MS)
+}
+
+/// Ambient → splash after enter veil — ease-in-out so the rise is visible, not front-loaded.
+pub fn enter_art_fade_progress(elapsed_ms: u64) -> f32 {
+    let t = phase_progress_linear(elapsed_ms, ART_FADE_MS);
+    ease_in_out_cubic(t)
 }
 
 /// Backdrop land zoom progress (0 = start pose, 1 = settled).
@@ -445,6 +471,11 @@ mod tests {
         assert!(chrome_stagger(0.2, 0.15) < chrome_stagger(0.8, 0.15));
         assert!((art_fade_progress(0) - 0.0).abs() < 0.001);
         assert!((art_fade_progress(ART_FADE_MS) - 1.0).abs() < 0.001);
+        assert!((enter_art_fade_progress(0) - 0.0).abs() < 0.001);
+        assert!((enter_art_fade_progress(ART_FADE_MS) - 1.0).abs() < 0.001);
+        assert!((enter_art_fade_progress(ART_FADE_MS / 2) - 0.5).abs() < 0.001);
+        // Ease-out is already ~0.875 at midpoint — enter splash must stay near half.
+        assert!(art_fade_progress(ART_FADE_MS / 2) > 0.8);
         assert!(enter_grow_progress(0.0).is_some());
         assert!(enter_grow_progress(ENTER_GROW_END).is_none());
         assert!((enter_immersive_chrome_progress(ENTER_GROW_END) - 0.0).abs() < 0.001);
@@ -488,12 +519,21 @@ mod tests {
             TransitionPhase::EnterCompact.duration_ms(),
             ENTER_COMPACT_MS
         );
-        assert_eq!(ENTER_IMMERSIVE_MS, VEIL_TRANSITION_MS);
+        assert_eq!(ENTER_IMMERSIVE_MS, ENTER_REVEAL_MS);
+        assert_eq!(ENTER_REVEAL_MS, ART_FADE_MS);
         assert_eq!(EXIT_IMMERSIVE_MS, VEIL_TRANSITION_MS);
         assert_eq!(ENTER_COMPACT_MS, VEIL_TRANSITION_MS);
         assert!((ease_in_cubic(0.0) - 0.0).abs() < 0.001);
         assert!((ease_in_cubic(1.0) - 1.0).abs() < 0.001);
         assert!(ease_in_cubic(0.5) < 0.5);
+        assert!((ease_in_out_cubic(0.0) - 0.0).abs() < 0.001);
+        assert!((ease_in_out_cubic(1.0) - 1.0).abs() < 0.001);
+        assert!((ease_in_out_cubic(0.5) - 0.5).abs() < 0.001);
+        assert!((enter_veil_amount(0) - 1.0).abs() < 0.001);
+        assert!((enter_veil_amount(ENTER_REVEAL_MS / 2) - 0.5).abs() < 0.001);
+        assert!((enter_veil_amount(ENTER_REVEAL_MS) - 0.0).abs() < 0.001);
+        // Ease-out would already be ~0.875 at the midpoint — enter must stay near half.
+        assert!(phase_progress(ENTER_REVEAL_MS / 2, ENTER_REVEAL_MS) > 0.8);
         assert!((phase_progress_linear(0, 1000) - 0.0).abs() < 0.001);
         assert!((phase_progress_linear(500, 1000) - 0.5).abs() < 0.001);
         assert!((phase_progress_linear(1000, 1000) - 1.0).abs() < 0.001);

@@ -136,20 +136,22 @@ where
 }
 
 /// Warm immersive hero + backdrop tiers (blocking worker only).
+///
+/// Backdrops first so splash peeks beat strip heroes when filling the catalog.
 pub fn prepare_immersive(
     hero_paths: impl IntoIterator<Item = impl AsRef<Path>>,
     backdrop_paths: impl IntoIterator<Item = impl AsRef<Path>>,
 ) {
     let mut heroes = 0u32;
     let mut backdrops = 0u32;
-    for path in hero_paths {
-        if hero_for_path(path.as_ref()).is_some() {
-            heroes += 1;
-        }
-    }
     for path in backdrop_paths {
         if backdrop_for_path(path.as_ref()).is_some() {
             backdrops += 1;
+        }
+    }
+    for path in hero_paths {
+        if hero_for_path(path.as_ref()).is_some() {
+            heroes += 1;
         }
     }
     crate::controller::hid::diag::diag_info(format!(
@@ -157,16 +159,67 @@ pub fn prepare_immersive(
     ));
 }
 
+/// Drop paths already in the process cache. Returns `(heroes, backdrops, skipped)`.
+pub fn filter_uncached_immersive(
+    hero_paths: impl IntoIterator<Item = PathBuf>,
+    backdrop_paths: impl IntoIterator<Item = PathBuf>,
+) -> (Vec<PathBuf>, Vec<PathBuf>, usize) {
+    let mut skipped = 0usize;
+    let mut heroes = Vec::new();
+    for path in hero_paths {
+        if hero_cached(&path).is_some() {
+            skipped += 1;
+        } else {
+            heroes.push(path);
+        }
+    }
+    let mut backdrops = Vec::new();
+    for path in backdrop_paths {
+        if backdrop_cached(&path).is_some() {
+            skipped += 1;
+        } else {
+            backdrops.push(path);
+        }
+    }
+    (heroes, backdrops, skipped)
+}
+
+/// Pull the selected cover out of a neighbor backdrop list so it can decode first.
+///
+/// Returns `(selected, rest)`. If `selected` is `Some` but missing from `backdrops`,
+/// it is still returned so callers can priority-decode it.
+pub fn split_selected_backdrop(
+    selected: Option<PathBuf>,
+    backdrops: Vec<PathBuf>,
+) -> (Option<PathBuf>, Vec<PathBuf>) {
+    let Some(sel) = selected else {
+        return (None, backdrops);
+    };
+    let mut rest = Vec::with_capacity(backdrops.len());
+    let mut found = None;
+    for path in backdrops {
+        if found.is_none() && path == sel {
+            found = Some(path);
+        } else {
+            rest.push(path);
+        }
+    }
+    (found.or(Some(sel)), rest)
+}
+
 /// Warm a window of hero + backdrop paths (selection neighbor warm).
+///
+/// Decodes **backdrops first** (splash cover), then heroes. Prefer
+/// [`filter_uncached_immersive`] before calling so cache hits stay off the worker.
 pub fn warm_immersive_paths(
     hero_paths: impl IntoIterator<Item = impl AsRef<Path>>,
     backdrop_paths: impl IntoIterator<Item = impl AsRef<Path>>,
 ) {
-    for path in hero_paths {
-        let _ = hero_for_path(path.as_ref());
-    }
     for path in backdrop_paths {
         let _ = backdrop_for_path(path.as_ref());
+    }
+    for path in hero_paths {
+        let _ = hero_for_path(path.as_ref());
     }
 }
 
@@ -328,5 +381,47 @@ mod tests {
         assert!(hero_cached(&path).is_some());
         assert!(backdrop_cached(&path).is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filter_uncached_skips_warm_hits() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sdsc-icon-filter-{n}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let warm = dir.join("warm.png");
+        let cold = dir.join("cold.png");
+        write_tiny_png(&warm);
+        write_tiny_png(&cold);
+        assert!(backdrop_for_path(&warm).is_some());
+        // Backdrop tier warm only — hero path still needs work.
+        let (heroes, backdrops, skipped) =
+            filter_uncached_immersive(vec![warm.clone()], vec![warm.clone(), cold.clone()]);
+        assert_eq!(heroes, vec![warm.clone()]);
+        assert_eq!(backdrops, vec![cold.clone()]);
+        assert_eq!(skipped, 1);
+        assert!(hero_for_path(&warm).is_some());
+        let (heroes, backdrops, skipped) =
+            filter_uncached_immersive(vec![warm.clone()], vec![warm.clone(), cold.clone()]);
+        assert!(heroes.is_empty());
+        assert_eq!(backdrops, vec![cold]);
+        assert_eq!(skipped, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_selected_backdrop_pulls_cover_first() {
+        let sel = PathBuf::from("sel.png");
+        let a = PathBuf::from("a.png");
+        let b = PathBuf::from("b.png");
+        let (got, rest) =
+            split_selected_backdrop(Some(sel.clone()), vec![a.clone(), sel.clone(), b.clone()]);
+        assert_eq!(got, Some(sel));
+        assert_eq!(rest, vec![a.clone(), b]);
+
+        let sel2 = PathBuf::from("missing.png");
+        let (got, rest) = split_selected_backdrop(Some(sel2.clone()), vec![a.clone()]);
+        assert_eq!(got, Some(sel2));
+        assert_eq!(rest, vec![a]);
     }
 }

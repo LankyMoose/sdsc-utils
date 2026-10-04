@@ -488,6 +488,14 @@ struct StripAnim {
     started: Instant,
 }
 
+/// Frame-capped EnterImmersive veil clock (armed once the window can paint).
+#[derive(Debug, Clone)]
+struct EnterRevealClock {
+    elapsed_ms: u64,
+    armed: bool,
+    last_tick: Option<Instant>,
+}
+
 #[derive(Debug, Clone)]
 pub struct State {
     pub slide: StartSlide,
@@ -497,6 +505,16 @@ pub struct State {
     pub transition: Option<crate::ui::start::mode::StartTransition>,
     /// Cinematic phase around promote/demote (exit → resize → enter).
     pub transition_phase: Option<(crate::ui::start::mode::TransitionPhase, Instant)>,
+    /// Capped enter-reveal progress while [`TransitionPhase::EnterImmersive`] is active.
+    enter_reveal: Option<EnterRevealClock>,
+    /// Art is ready but splash reveal is held until the enter veil clears.
+    splash_reveal_pending: bool,
+    /// Pending reveal should snap opaque (cached) rather than ambient-fade.
+    splash_reveal_cached: bool,
+    /// Incoming splash uses ease-in-out enter fade (uncached ambient → art).
+    enter_splash_fade: bool,
+    /// Incoming splash paints fully opaque (cached reopen / after-veil snap).
+    splash_opaque: bool,
     /// Immersive controllers dock target (expanded = Controllers focus).
     pub dock_expanded: bool,
     pub game_selected: usize,
@@ -539,8 +557,8 @@ pub struct State {
     pub ambient_time: f32,
     /// Incoming backdrop land/crossfade (`started = None` = waiting for peek art).
     backdrop_current: Option<(String, Option<Instant>)>,
-    /// Outgoing backdrop during opacity crossfade: `(play_key, started)`.
-    backdrop_outgoing: Option<(String, Instant)>,
+    /// Outgoing backdrop during cover-crossfade: `(play_key, frozen_scale)`.
+    backdrop_outgoing: Option<(String, f32)>,
     /// Ring flash started with the last successful Identify (Controllers slide).
     identify_flash: Option<IdentifyFlash>,
 }
@@ -570,6 +588,11 @@ impl Default for State {
             immersive: false,
             transition: None,
             transition_phase: None,
+            enter_reveal: None,
+            splash_reveal_pending: false,
+            splash_reveal_cached: false,
+            enter_splash_fade: false,
+            splash_opaque: false,
             dock_expanded: false,
             game_selected: 0,
             rows: Vec::new(),
@@ -919,6 +942,11 @@ impl State {
         self.strip_anim = None;
         self.transition = None;
         self.transition_phase = None;
+        self.enter_reveal = None;
+        self.splash_reveal_pending = false;
+        self.splash_reveal_cached = false;
+        self.enter_splash_fade = false;
+        self.splash_opaque = false;
         self.backdrop_current = None;
         self.backdrop_outgoing = None;
         self.ambient_time = 0.0;
@@ -929,9 +957,23 @@ impl State {
         phase: crate::ui::start::mode::TransitionPhase,
         now: Instant,
     ) {
+        use crate::ui::start::mode::TransitionPhase;
         self.dock_anim = None;
         self.strip_anim = None;
         self.transition_phase = Some((phase, now));
+        if matches!(phase, TransitionPhase::EnterImmersive) {
+            self.enter_reveal = Some(EnterRevealClock {
+                elapsed_ms: 0,
+                armed: false,
+                last_tick: None,
+            });
+            self.splash_reveal_pending = false;
+            self.splash_reveal_cached = false;
+            self.enter_splash_fade = false;
+            self.splash_opaque = false;
+        } else {
+            self.enter_reveal = None;
+        }
         crate::controller::hid::diag::diag_info(format!(
             "ui-diag: start immersive transition phase={}",
             phase.label()
@@ -940,12 +982,80 @@ impl State {
 
     pub fn clear_transition_phase(&mut self) {
         self.transition_phase = None;
+        self.enter_reveal = None;
+        // Pending splash starts on the next `tick_anim` / explicit try_start (same clock).
+    }
+
+    /// True while EnterImmersive is in flight — splash fade waits until the phase ends.
+    fn enter_veil_blocks_splash(&self) -> bool {
+        matches!(
+            self.transition_phase.map(|(p, _)| p),
+            Some(crate::ui::start::mode::TransitionPhase::EnterImmersive)
+        )
+    }
+
+    /// Begin advancing the EnterImmersive veil (cold open after StartOpened, or promote settle).
+    pub fn arm_enter_reveal(&mut self, now: Instant) {
+        let Some(clock) = self.enter_reveal.as_mut() else {
+            return;
+        };
+        if clock.armed {
+            return;
+        }
+        clock.armed = true;
+        clock.last_tick = Some(now);
+        clock.elapsed_ms = 0;
+        crate::controller::hid::diag::diag_info("ui-diag: start immersive enter reveal armed");
+    }
+
+    /// Advance the capped EnterImmersive clock. Call once per StartFrame.
+    pub fn advance_enter_reveal(&mut self, now: Instant) {
+        use crate::ui::start::mode::ENTER_REVEAL_MAX_FRAME_MS;
+        let Some(clock) = self.enter_reveal.as_mut() else {
+            return;
+        };
+        if !clock.armed {
+            return;
+        }
+        let last = clock.last_tick.unwrap_or(now);
+        let raw_ms = now.saturating_duration_since(last).as_millis() as u64;
+        let dt = raw_ms.min(ENTER_REVEAL_MAX_FRAME_MS);
+        if raw_ms > ENTER_REVEAL_MAX_FRAME_MS {
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start immersive enter reveal capped raw_ms={raw_ms}"
+            ));
+        }
+        clock.elapsed_ms = clock.elapsed_ms.saturating_add(dt);
+        clock.last_tick = Some(now);
+    }
+
+    /// EnterImmersive veil alpha from the capped clock (1 = solid, 0 = clear).
+    pub fn enter_veil_amount(&self) -> f32 {
+        use crate::ui::start::mode::enter_veil_amount;
+        match &self.enter_reveal {
+            Some(clock) if clock.armed => enter_veil_amount(clock.elapsed_ms),
+            Some(_) => 1.0,
+            None => 0.0,
+        }
     }
 
     pub fn phase_progress(&self, now: Instant) -> f32 {
         let Some((phase, started)) = self.transition_phase else {
             return 1.0;
         };
+        if matches!(
+            phase,
+            crate::ui::start::mode::TransitionPhase::EnterImmersive
+        ) {
+            use crate::ui::start::mode::{ENTER_REVEAL_MS, phase_progress_linear};
+            let elapsed = self
+                .enter_reveal
+                .as_ref()
+                .filter(|c| c.armed)
+                .map(|c| c.elapsed_ms)
+                .unwrap_or(0);
+            return phase_progress_linear(elapsed, ENTER_REVEAL_MS);
+        }
         let elapsed = now.saturating_duration_since(started).as_millis() as u64;
         crate::ui::start::mode::phase_progress(elapsed, phase.duration_ms())
     }
@@ -955,6 +1065,19 @@ impl State {
         let Some((phase, started)) = self.transition_phase else {
             return 1.0;
         };
+        if matches!(
+            phase,
+            crate::ui::start::mode::TransitionPhase::EnterImmersive
+        ) {
+            use crate::ui::start::mode::{ENTER_REVEAL_MS, phase_progress_linear};
+            let elapsed = self
+                .enter_reveal
+                .as_ref()
+                .filter(|c| c.armed)
+                .map(|c| c.elapsed_ms)
+                .unwrap_or(0);
+            return phase_progress_linear(elapsed, ENTER_REVEAL_MS);
+        }
         let elapsed = now.saturating_duration_since(started).as_millis() as u64;
         crate::ui::start::mode::phase_progress_linear(elapsed, phase.duration_ms())
     }
@@ -968,6 +1091,15 @@ impl State {
         if dur == 0 {
             return false;
         }
+        if matches!(
+            phase,
+            crate::ui::start::mode::TransitionPhase::EnterImmersive
+        ) {
+            return self
+                .enter_reveal
+                .as_ref()
+                .is_some_and(|c| c.armed && c.elapsed_ms >= dur);
+        }
         now.saturating_duration_since(started) >= Duration::from_millis(dur)
     }
 
@@ -975,30 +1107,102 @@ impl State {
     pub fn clear_backdrop_transition(&mut self) {
         self.backdrop_current = None;
         self.backdrop_outgoing = None;
+        self.splash_reveal_pending = false;
+        self.splash_reveal_cached = false;
+        self.enter_splash_fade = false;
+        self.splash_opaque = false;
     }
 
     /// Arm backdrop for immersive enter with no prior splash on screen.
     ///
-    /// Always fades in from zero. Priming before the first paint avoids the
-    /// `backdrop_current = None` full-opacity fallback, so a later
-    /// [`Self::note_backdrop_ready`] cannot blink through opaque → zero.
+    /// Cached art: paint fully opaque **under** the enter veil so the new window's
+    /// image atlas uploads during the blackout — holding at opacity 0 skips the
+    /// draw, then after-veil snap shows ambient until the async upload lands.
+    /// Uncached: wait for decode, then ease-in-out ambient → splash after the veil.
     pub fn prime_backdrop_for_enter(&mut self, now: Instant) {
         self.backdrop_outgoing = None;
+        self.enter_splash_fade = false;
+        self.splash_opaque = false;
         let Some(row) = self.rows.get(self.game_selected) else {
             self.backdrop_current = None;
+            self.splash_reveal_pending = false;
+            self.splash_reveal_cached = false;
             return;
         };
         let key = row.play_key.clone();
         if row.backdrop_icon().is_some() {
-            self.backdrop_current = Some((key.clone(), Some(now)));
-            crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: backdrop enter prime key={key} mode=fade"
-            ));
+            // Warm hit: opaque under veil (or immediately if no veil).
+            self.reveal_cached_opaque(key, now);
         } else {
+            self.splash_reveal_pending = false;
+            self.splash_reveal_cached = false;
             self.backdrop_current = Some((key.clone(), None));
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: backdrop enter prime key={key} mode=waiting"
             ));
+        }
+    }
+
+    /// Cached splash at full opacity (reopen / warm hit under or after veil).
+    fn reveal_cached_opaque(&mut self, key: String, now: Instant) {
+        self.enter_splash_fade = false;
+        self.splash_opaque = true;
+        self.splash_reveal_pending = false;
+        self.splash_reveal_cached = false;
+        self.backdrop_current = Some((key.clone(), Some(now)));
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: backdrop reveal cached_opaque key={key}"
+        ));
+    }
+
+    /// Uncached enter: ease-in-out ambient → splash.
+    fn start_enter_splash_fade(&mut self, key: String, now: Instant) {
+        self.enter_splash_fade = true;
+        self.splash_opaque = false;
+        self.splash_reveal_pending = false;
+        self.splash_reveal_cached = false;
+        self.backdrop_current = Some((key.clone(), Some(now)));
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: backdrop ready ambient_fade key={key}"
+        ));
+    }
+
+    /// Title change: incoming fades in over a solid outgoing underlay.
+    fn start_cover_crossfade(&mut self, key: String, now: Instant) {
+        self.enter_splash_fade = false;
+        self.splash_opaque = false;
+        self.splash_reveal_pending = false;
+        self.splash_reveal_cached = false;
+        self.backdrop_current = Some((key.clone(), Some(now)));
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: backdrop crossfade cover key={key}"
+        ));
+    }
+
+    /// Begin a held enter splash reveal once the veil phase ends.
+    ///
+    /// Cached reopen snaps opaque (no ambient). First decode eases ambient → splash.
+    pub fn try_start_pending_splash_reveal(&mut self, now: Instant) {
+        if !self.splash_reveal_pending || self.enter_veil_blocks_splash() {
+            return;
+        }
+        let Some(row) = self.rows.get(self.game_selected) else {
+            return;
+        };
+        if row.backdrop_icon().is_none() {
+            return;
+        }
+        let key = row.play_key.clone();
+        if self.splash_reveal_cached {
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: backdrop reveal after_veil cached key={key}"
+            ));
+            self.reveal_cached_opaque(key, now);
+        } else {
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: backdrop reveal after_veil ambient key={key}"
+            ));
+            self.start_enter_splash_fade(key, now);
         }
     }
 
@@ -1013,9 +1217,24 @@ impl State {
         let key = row.play_key.clone();
         let waiting = matches!(&self.backdrop_current, Some((k, None)) if k == &key);
         let armed = matches!(&self.backdrop_current, Some((k, Some(_))) if k == &key);
-        if waiting {
-            if let Some((_, started)) = &mut self.backdrop_current {
-                *started = Some(now);
+        if waiting || self.splash_reveal_pending {
+            if self.enter_veil_blocks_splash() {
+                // Preserve splash_reveal_cached from prime (warm reopen → snap).
+                // Uncached waiting already has it false → after-veil ambient fade.
+                self.splash_reveal_pending = true;
+                self.backdrop_current = Some((key.clone(), None));
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: backdrop ready hold_for_veil key={key} cached={}",
+                    u8::from(self.splash_reveal_cached)
+                ));
+            } else if !armed {
+                if self.backdrop_outgoing.is_some() {
+                    self.start_cover_crossfade(key, now);
+                } else if self.splash_reveal_cached {
+                    self.reveal_cached_opaque(key, now);
+                } else {
+                    self.start_enter_splash_fade(key, now);
+                }
             }
         } else if !armed {
             // Missing/stale key: start a fade. Do not restart when already armed
@@ -1028,7 +1247,11 @@ impl State {
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: backdrop ready re-arm key={key} was={was}"
             ));
-            self.backdrop_current = Some((key, Some(now)));
+            if self.backdrop_outgoing.is_some() {
+                self.start_cover_crossfade(key, now);
+            } else {
+                self.start_enter_splash_fade(key, now);
+            }
         }
     }
 
@@ -1037,6 +1260,7 @@ impl State {
         use crate::ui::start::mode::{
             BACKDROP_LAND_OX0, BACKDROP_LAND_OY0, BACKDROP_LAND_SCALE0, art_fade_progress,
             backdrop_land_offset, backdrop_land_progress, backdrop_land_scale,
+            enter_art_fade_progress,
         };
         let row = self.rows.get(self.game_selected)?;
         row.backdrop_icon()?;
@@ -1049,7 +1273,13 @@ impl State {
             )),
             Some((key, Some(started))) if key == &row.play_key => {
                 let elapsed = now.saturating_duration_since(*started).as_millis() as u64;
-                let opacity = art_fade_progress(elapsed);
+                let opacity = if self.splash_opaque {
+                    1.0
+                } else if self.enter_splash_fade {
+                    enter_art_fade_progress(elapsed)
+                } else {
+                    art_fade_progress(elapsed)
+                };
                 let land = backdrop_land_progress(elapsed);
                 let scale = backdrop_land_scale(land);
                 let (ox, oy) = backdrop_land_offset(land);
@@ -1060,15 +1290,10 @@ impl State {
         }
     }
 
-    /// Outgoing backdrop during crossfade: `(play_key, opacity)`.
-    pub fn backdrop_outgoing_visual(&self, now: Instant) -> Option<(&str, f32)> {
-        let (key, started) = self.backdrop_outgoing.as_ref()?;
-        let elapsed = now.saturating_duration_since(*started).as_millis() as u64;
-        let opacity = 1.0 - crate::ui::start::mode::art_fade_progress(elapsed);
-        if opacity <= 0.01 {
-            return None;
-        }
-        Some((key.as_str(), opacity))
+    /// Outgoing backdrop during cover-crossfade: `(play_key, opacity=1, frozen_scale)`.
+    pub fn backdrop_outgoing_visual(&self, _now: Instant) -> Option<(&str, f32, f32)> {
+        let (key, scale) = self.backdrop_outgoing.as_ref()?;
+        Some((key.as_str(), 1.0, (*scale).max(1.0)))
     }
 
     /// Resolve a peek backdrop handle by play_key (for outgoing layer).
@@ -1116,28 +1341,34 @@ impl State {
                 Some(IconSource::Shell(path)) => shells.push(path.clone()),
                 None => {}
             }
-        }
-        for delta in -1isize..=1 {
-            let Some(idx) = vstrip::slot_catalog_index(selected, delta, len) else {
-                continue;
-            };
-            if let Some(path) = self.rows[idx].backdrop_path.clone() {
+            if let Some(path) = row.backdrop_path.clone() {
                 backdrops.push(path);
             }
         }
         (heroes, shells, backdrops)
     }
 
-    /// Selection changed: park prior art as outgoing and wait/land the new one.
+    /// Selection changed: park prior art as solid underlay and land the new one.
     pub fn reset_backdrop_fade(&mut self) {
+        use crate::ui::start::mode::{backdrop_land_progress, backdrop_land_scale};
         let now = Instant::now();
-        if let Some((prev_key, Some(_))) = self.backdrop_current.take() {
-            // Only crossfade out if we were actually showing something.
-            if self.backdrop_icon_for_key(&prev_key).is_some() {
-                self.backdrop_outgoing = Some((prev_key, now));
+        self.splash_reveal_pending = false;
+        self.splash_reveal_cached = false;
+        self.enter_splash_fade = false;
+        self.splash_opaque = false;
+        // Freeze ken-burns from the parked current (selection may already have moved).
+        let frozen_scale = match &self.backdrop_current {
+            Some((_, Some(started))) => {
+                let elapsed = now.saturating_duration_since(*started).as_millis() as u64;
+                backdrop_land_scale(backdrop_land_progress(elapsed)).max(1.0)
             }
-        } else {
-            self.backdrop_current = None;
+            _ => 1.0,
+        };
+        if let Some((prev_key, _)) = self.backdrop_current.take() {
+            // Cover-crossfade underlay — only if peek art exists for the prior key.
+            if self.backdrop_icon_for_key(&prev_key).is_some() {
+                self.backdrop_outgoing = Some((prev_key, frozen_scale));
+            }
         }
         let key = self
             .rows
@@ -1229,6 +1460,8 @@ impl State {
     }
 
     pub fn tick_anim(&mut self, now: Instant) -> bool {
+        self.advance_enter_reveal(now);
+        self.try_start_pending_splash_reveal(now);
         let mut busy = false;
         if let Some(anim) = self.anim.as_ref() {
             let elapsed = now.saturating_duration_since(anim.started);
@@ -1266,9 +1499,12 @@ impl State {
                 busy = true;
             }
         }
-        if let Some((_, started)) = &self.backdrop_outgoing {
-            let elapsed = now.saturating_duration_since(*started);
-            if elapsed >= Duration::from_millis(crate::ui::start::mode::ART_FADE_MS) {
+        if self.backdrop_outgoing.is_some() {
+            // Cover-crossfade: drop solid underlay once incoming is fully on.
+            let incoming_done = self
+                .backdrop_incoming_visual(now)
+                .is_some_and(|(opacity, _, _, _)| opacity >= 0.99);
+            if incoming_done {
                 self.backdrop_outgoing = None;
             } else {
                 busy = true;
@@ -3321,7 +3557,7 @@ mod tests {
     }
 
     #[test]
-    fn prime_backdrop_cached_fades_from_zero_without_restart() {
+    fn prime_backdrop_cached_snaps_opaque_without_restart() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -3337,18 +3573,16 @@ mod tests {
         let (opacity, _, _, _) = state
             .backdrop_incoming_visual(now)
             .expect("cached enter paints");
-        assert!(opacity < 0.05);
+        assert!((opacity - 1.0).abs() < 0.001);
+        assert!(state.splash_opaque);
+        assert!(!state.enter_splash_fade);
 
-        let mid = now + Duration::from_millis(crate::ui::start::mode::ART_FADE_MS / 2);
-        let (mid_opacity, _, _, _) = state.backdrop_incoming_visual(mid).expect("mid fade");
-        assert!(mid_opacity > 0.4 && mid_opacity < 1.0);
-
-        // Late ImmersiveArtReady must not restart the fade from zero.
-        state.note_backdrop_ready(mid + Duration::from_millis(16));
+        // Late ImmersiveArtReady must not restart a fade from zero.
+        state.note_backdrop_ready(now + Duration::from_millis(16));
         let (opacity, _, _, _) = state
-            .backdrop_incoming_visual(mid + Duration::from_millis(16))
+            .backdrop_incoming_visual(now + Duration::from_millis(16))
             .expect("still paints");
-        assert!(opacity >= mid_opacity - 0.01);
+        assert!((opacity - 1.0).abs() < 0.001);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3400,5 +3634,327 @@ mod tests {
         assert!(opacity < 0.05);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_reveal_stays_solid_until_armed() {
+        use crate::ui::start::mode::TransitionPhase;
+        let mut state = State::default();
+        let now = Instant::now();
+        state.begin_transition_phase(TransitionPhase::EnterImmersive, now);
+        assert!((state.enter_veil_amount() - 1.0).abs() < 0.001);
+        assert!(!state.phase_finished(now + Duration::from_millis(500)));
+        // Wall time alone must not advance the capped clock.
+        state.advance_enter_reveal(now + Duration::from_millis(200));
+        assert!((state.enter_veil_amount() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn enter_reveal_ease_in_out_midpoint_and_stall_cap() {
+        use crate::ui::start::mode::{ENTER_REVEAL_MAX_FRAME_MS, ENTER_REVEAL_MS, TransitionPhase};
+        let mut state = State::default();
+        let t0 = Instant::now();
+        state.begin_transition_phase(TransitionPhase::EnterImmersive, t0);
+        state.arm_enter_reveal(t0);
+        assert!((state.enter_veil_amount() - 1.0).abs() < 0.001);
+
+        // A 200ms stall advances only one capped step.
+        let mut now = t0 + Duration::from_millis(200);
+        state.advance_enter_reveal(now);
+        let after_stall = state.enter_reveal.as_ref().unwrap().elapsed_ms;
+        assert_eq!(after_stall, ENTER_REVEAL_MAX_FRAME_MS);
+
+        // Walk exactly to midpoint (capped steps) so ease-in-out lands at ~0.5.
+        let midpoint = ENTER_REVEAL_MS / 2;
+        while state.enter_reveal.as_ref().unwrap().elapsed_ms < midpoint {
+            let remain = midpoint - state.enter_reveal.as_ref().unwrap().elapsed_ms;
+            let step = remain.min(ENTER_REVEAL_MAX_FRAME_MS);
+            now += Duration::from_millis(step);
+            state.advance_enter_reveal(now);
+        }
+        assert_eq!(state.enter_reveal.as_ref().unwrap().elapsed_ms, midpoint);
+        let mid = state.enter_veil_amount();
+        assert!((mid - 0.5).abs() < 0.02, "mid veil={mid}");
+
+        while !state.phase_finished(now) {
+            now += Duration::from_millis(ENTER_REVEAL_MAX_FRAME_MS);
+            state.advance_enter_reveal(now);
+        }
+        assert!(state.enter_veil_amount() < 0.01);
+    }
+
+    #[test]
+    fn enter_paints_cached_splash_opaque_under_veil() {
+        use crate::ui::start::mode::{ENTER_REVEAL_MAX_FRAME_MS, TransitionPhase};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sdsc-enter-hold-splash-{n}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bd.png");
+        write_tiny_png(&path);
+        assert!(icon_cache::backdrop_for_path(&path).is_some());
+
+        let mut state = state_with_backdrop(path);
+        let t0 = Instant::now();
+        state.begin_transition_phase(TransitionPhase::EnterImmersive, t0);
+        state.arm_enter_reveal(t0);
+        state.prime_backdrop_for_enter(t0);
+        // Must paint under the veil (opacity > 0) so the new-window atlas uploads
+        // before unveil — holding at 0 skips the draw and flashes ambient after.
+        assert!(state.splash_opaque);
+        assert!(!state.splash_reveal_pending);
+        let (opacity, _, _, _) = state
+            .backdrop_incoming_visual(t0)
+            .expect("cached splash paints under veil");
+        assert!((opacity - 1.0).abs() < 0.001);
+
+        let mut now = t0;
+        while !state.phase_finished(now) {
+            now += Duration::from_millis(ENTER_REVEAL_MAX_FRAME_MS);
+            state.advance_enter_reveal(now);
+            state.try_start_pending_splash_reveal(now);
+            let (opacity, _, _, _) = state.backdrop_incoming_visual(now).unwrap();
+            assert!((opacity - 1.0).abs() < 0.001);
+        }
+        // Late ArtReady must not restart a fade from zero.
+        state.note_backdrop_ready(now);
+        state.clear_transition_phase();
+        state.try_start_pending_splash_reveal(now);
+        assert!(state.splash_opaque);
+        assert!(!state.enter_splash_fade);
+        let (opacity, _, _, _) = state
+            .backdrop_incoming_visual(now)
+            .expect("still opaque after veil");
+        assert!((opacity - 1.0).abs() < 0.001);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cold_start_late_art_fades_ambient_to_splash() {
+        use crate::ui::start::mode::{
+            ART_FADE_MS, ENTER_REVEAL_MAX_FRAME_MS, TransitionPhase, enter_art_fade_progress,
+        };
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sdsc-cold-ambient-fade-{n}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bd.png");
+        write_tiny_png(&path);
+        assert!(icon_cache::backdrop_cached(&path).is_none());
+
+        let mut state = state_with_backdrop(path.clone());
+        let t0 = Instant::now();
+        state.begin_transition_phase(TransitionPhase::EnterImmersive, t0);
+        state.arm_enter_reveal(t0);
+        state.prime_backdrop_for_enter(t0);
+        assert!(!state.splash_reveal_pending);
+        assert!(state.backdrop_incoming_visual(t0).is_none());
+
+        let mut now = t0;
+        while !state.phase_finished(now) {
+            now += Duration::from_millis(ENTER_REVEAL_MAX_FRAME_MS);
+            state.advance_enter_reveal(now);
+        }
+        state.clear_transition_phase();
+
+        assert!(icon_cache::backdrop_for_path(&path).is_some());
+        state.note_backdrop_ready(now);
+        assert!(state.enter_splash_fade);
+        let (opacity, _, _, _) = state
+            .backdrop_incoming_visual(now)
+            .expect("late art starts fade");
+        assert!(opacity < 0.05, "must fade from zero, got {opacity}");
+
+        let mid = now + Duration::from_millis(ART_FADE_MS / 2);
+        let (mid_opacity, _, _, _) = state.backdrop_incoming_visual(mid).expect("mid fade");
+        assert!(
+            (mid_opacity - enter_art_fade_progress(ART_FADE_MS / 2)).abs() < 0.02,
+            "mid={mid_opacity}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn title_change_cover_crossfade_keeps_outgoing_solid() {
+        use crate::ui::start::mode::ART_FADE_MS;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sdsc-cover-crossfade-{n}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let path0 = dir.join("bd0.png");
+        let path1 = dir.join("bd1.png");
+        write_tiny_png(&path0);
+        write_tiny_png(&path1);
+        assert!(icon_cache::backdrop_for_path(&path0).is_some());
+        assert!(icon_cache::backdrop_for_path(&path1).is_some());
+
+        let mut state = State {
+            rows: vec![
+                StartRow {
+                    title: "g0".into(),
+                    subtitle: None,
+                    target: "t0".into(),
+                    args: String::new(),
+                    play_key: "k0".into(),
+                    icon: None,
+                    icon_source: None,
+                    backdrop_path: Some(path0),
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                },
+                StartRow {
+                    title: "g1".into(),
+                    subtitle: None,
+                    target: "t1".into(),
+                    args: String::new(),
+                    play_key: "k1".into(),
+                    icon: None,
+                    icon_source: None,
+                    backdrop_path: Some(path1),
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                },
+            ],
+            game_selected: 0,
+            immersive: true,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        state.prime_backdrop_for_enter(now);
+        assert!(state.splash_opaque);
+
+        state.game_selected = 1;
+        state.reset_backdrop_fade();
+        let mid = Instant::now() + Duration::from_millis(ART_FADE_MS / 2);
+        let (out_key, out_opacity, out_scale) = state
+            .backdrop_outgoing_visual(mid)
+            .expect("outgoing underlay");
+        assert_eq!(out_key, "k0");
+        assert!(
+            (out_opacity - 1.0).abs() < 0.001,
+            "outgoing must stay solid"
+        );
+        assert!((out_scale - 1.0).abs() < 0.001, "fresh land freezes at 1.0");
+        let (in_opacity, _, _, _) = state
+            .backdrop_incoming_visual(mid)
+            .expect("incoming fading");
+        assert!(in_opacity > 0.4 && in_opacity < 1.0, "in={in_opacity}");
+        assert!(!state.enter_splash_fade);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_backdrop_freezes_outgoing_ken_burns_scale() {
+        use crate::ui::start::mode::{BACKDROP_LAND_MS, backdrop_land_scale};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sdsc-freeze-scale-{n}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let path0 = dir.join("bd0.png");
+        let path1 = dir.join("bd1.png");
+        write_tiny_png(&path0);
+        write_tiny_png(&path1);
+        assert!(icon_cache::backdrop_for_path(&path0).is_some());
+        assert!(icon_cache::backdrop_for_path(&path1).is_some());
+
+        let mut state = State {
+            rows: vec![
+                StartRow {
+                    title: "g0".into(),
+                    subtitle: None,
+                    target: "t0".into(),
+                    args: String::new(),
+                    play_key: "k0".into(),
+                    icon: None,
+                    icon_source: None,
+                    backdrop_path: Some(path0),
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                },
+                StartRow {
+                    title: "g1".into(),
+                    subtitle: None,
+                    target: "t1".into(),
+                    args: String::new(),
+                    play_key: "k1".into(),
+                    icon: None,
+                    icon_source: None,
+                    backdrop_path: Some(path1),
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                },
+            ],
+            game_selected: 0,
+            immersive: true,
+            ..Default::default()
+        };
+        let t0 = Instant::now();
+        state.prime_backdrop_for_enter(t0);
+        // Advance land clock without wall-waiting: rewrite started into the past.
+        let mid_land = BACKDROP_LAND_MS / 4;
+        if let Some((_, started)) = &mut state.backdrop_current {
+            *started = Some(t0 - Duration::from_millis(mid_land));
+        }
+        let expected =
+            backdrop_land_scale(crate::ui::start::mode::backdrop_land_progress(mid_land));
+        assert!(expected > 1.01, "test needs mid-land scale, got {expected}");
+
+        // Selection moves first (matches app), then reset parks prior scale.
+        state.game_selected = 1;
+        state.reset_backdrop_fade();
+        let (_, _, frozen) = state
+            .backdrop_outgoing_visual(Instant::now())
+            .expect("outgoing");
+        assert!(
+            (frozen - expected).abs() < 0.005,
+            "frozen={frozen} expected={expected}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn immersive_warm_paths_include_neighbor_backdrops() {
+        let bd: Vec<_> = (0..5)
+            .map(|i| PathBuf::from(format!("bd{i}.png")))
+            .collect();
+        let state = State {
+            rows: (0..5)
+                .map(|i| StartRow {
+                    title: format!("g{i}"),
+                    subtitle: None,
+                    target: format!("t{i}"),
+                    args: String::new(),
+                    play_key: format!("k{i}"),
+                    icon: None,
+                    icon_source: Some(IconSource::File(PathBuf::from(format!("h{i}.png")))),
+                    backdrop_path: Some(bd[i].clone()),
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                })
+                .collect(),
+            game_selected: 2,
+            ..Default::default()
+        };
+        let (_heroes, _, backdrops) = state.immersive_warm_paths();
+        // ±NEIGHBORS (2) around selection 2 → indices 0..=4
+        for path in &bd {
+            assert!(
+                backdrops.contains(path),
+                "missing neighbor backdrop {path:?} in {backdrops:?}"
+            );
+        }
     }
 }
