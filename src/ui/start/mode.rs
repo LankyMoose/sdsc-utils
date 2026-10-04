@@ -552,7 +552,9 @@ mod tests {
         // Huge Cover X overflow must not amplify horizontal travel.
         let (px_wide, _) = backdrop_pose_pixels(1.0, 0.0, 800.0, 110.0, 200.0, 100.0);
         assert!((px_wide - 200.0 * BACKDROP_PAN_STAGE_X).abs() < 0.001);
-        assert!(BACKDROP_PAN_STAGE_X < BACKDROP_PAN_STAGE_Y);
+        const {
+            assert!(BACKDROP_PAN_STAGE_X < BACKDROP_PAN_STAGE_Y);
+        }
     }
 
     #[test]
