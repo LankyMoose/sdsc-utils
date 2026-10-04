@@ -366,33 +366,33 @@ fn games_stage(
 
     let mut items = Vec::with_capacity(vstrip::VISIBLE);
     for delta in -NEIGHBORS..=NEIGHBORS {
-        let dist = delta as f32 + (selected as f32 - visual);
+        let Some((idx, dist)) = vstrip::visual_slot(visual, delta, len) else {
+            continue;
+        };
         let scale = vstrip::scale_at_distance(dist);
         let fade = vstrip::opacity_at_distance(dist) * list_opacity;
-        match vstrip::slot_catalog_index(selected, delta, len) {
-            Some(idx) => {
-                let row = &state.rows[idx];
-                let selected_slot = idx == selected;
-                let overlay = if selected_slot && list_opacity > 0.85 {
-                    Some(hero_hint_overlay(row, state))
-                } else {
-                    None
-                };
-                items.push(strip_slot(
-                    row,
-                    selected_slot,
-                    state.editing,
-                    scale,
-                    fade,
-                    &metrics,
-                    overlay,
-                ));
-            }
-            None => items.push(strip_slot_dummy(scale, fade, &metrics)),
-        }
+        let row = &state.rows[idx];
+        let selected_slot = idx == selected;
+        let overlay = if selected_slot && list_opacity > 0.85 {
+            Some(hero_hint_overlay(row, state))
+        } else {
+            None
+        };
+        items.push((
+            dist,
+            strip_slot(
+                row,
+                selected_slot,
+                state.editing,
+                scale,
+                fade,
+                &metrics,
+                overlay,
+            ),
+        ));
     }
 
-    let strip = vstrip::vstrip(visual, selected, metrics, items)
+    let strip = vstrip::vstrip(metrics, items)
         .width(Length::Fixed(metrics.slot_w))
         .height(Fill);
 
@@ -443,49 +443,6 @@ fn empty_games(state: &State) -> Element<'_, StartMessage> {
         .center_x(Fill)
         .center_y(Fill)
         .into()
-}
-
-/// Non-navigable filler when the linear strip index is outside the catalog.
-fn strip_slot_dummy(
-    scale: f32,
-    fade: f32,
-    metrics: &StripMetrics,
-) -> Element<'static, StartMessage> {
-    let fade = fade.clamp(0.0, 1.0);
-    let capsule = container(space())
-        .width(Fill)
-        .height(Fill)
-        .style(theme::well);
-    let title = text("…")
-        .size(22.0)
-        .color(theme::alpha(theme::MUTED, 0.85 * fade));
-    let label: Element<'static, StartMessage> = container(title)
-        .width(Fill)
-        .height(Fill)
-        .align_y(Alignment::Center)
-        .padding(Padding {
-            top: 0.0,
-            right: 8.0,
-            bottom: 0.0,
-            left: 14.0,
-        })
-        .into();
-    let max_art_w = metrics.center_w * metrics.selected_scale;
-    let art_w = metrics.center_w * scale;
-    let art_h = metrics.center_h * scale;
-    let inset = ((max_art_w - art_w) * 0.5).max(0.0);
-    let body = row![
-        space().width(Length::Fixed(inset)),
-        container(capsule)
-            .width(Length::Fixed(art_w))
-            .height(Length::Fixed(art_h)),
-        label,
-    ]
-    .spacing(0)
-    .width(Fill)
-    .height(Fill)
-    .align_y(Alignment::Center);
-    container(body).width(Fill).height(Fill).into()
 }
 
 fn strip_slot<'a>(

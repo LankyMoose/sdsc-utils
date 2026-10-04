@@ -211,21 +211,21 @@ static CACHE: LazyLock<Mutex<CacheState>> = LazyLock::new(|| Mutex::new(CacheSta
 
 /// Catalog indices within `radius` of `selected`.
 ///
-/// Immersive (circular) wraps when `len >=` strip visible count; compact is linear.
+/// Games strip is linear (`circular: false`). Circular remains available for
+/// callers that still want wrap, but Start Games warm paths pass linear.
 pub fn art_window_indices(
     selected: usize,
     len: usize,
     circular: bool,
     radius: isize,
 ) -> Vec<usize> {
-    use crate::ui::start::vstrip::VISIBLE;
     if len == 0 {
         return Vec::new();
     }
     let radius = radius.max(0);
     let selected = selected.min(len - 1);
     let mut out = Vec::with_capacity((radius as usize * 2 + 1).min(len));
-    if circular && len >= VISIBLE {
+    if circular {
         for delta in -radius..=radius {
             let idx = (selected as isize + delta).rem_euclid(len as isize) as usize;
             if !out.contains(&idx) {
@@ -773,6 +773,14 @@ mod tests {
         let idxs = art_window_indices(0, 30, false, ART_WINDOW);
         assert_eq!(idxs, (0..=ART_WINDOW as usize).collect::<Vec<_>>());
         assert!(!idxs.contains(&29));
+    }
+
+    #[test]
+    fn art_window_linear_short_catalog_no_wrap() {
+        let idxs = art_window_indices(0, 3, false, 2);
+        assert_eq!(idxs, vec![0, 1, 2]);
+        let at_end = art_window_indices(2, 3, false, 2);
+        assert_eq!(at_end, vec![0, 1, 2]);
     }
 
     #[test]
