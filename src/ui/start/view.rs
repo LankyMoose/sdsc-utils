@@ -1435,16 +1435,16 @@ impl State {
         }
 
         // Start staggered ExitRight once the batch has held Success long enough.
-        if self.chrome_status_batch_exit_at.is_none() {
-            if let Some(all_at) = self.chrome_status_all_success_at {
-                let hold = CHROME_STATUS_SUCCESS_HOLD_MS + CHROME_STATUS_STEP_HOLD_MS;
-                if now.saturating_duration_since(all_at) >= Duration::from_millis(hold) {
-                    self.chrome_status_batch_exit_at = Some(now);
-                    crate::controller::hid::diag::diag_info(format!(
-                        "ui-diag: chrome status exit_right begin n={}",
-                        self.chrome_status.len()
-                    ));
-                }
+        if self.chrome_status_batch_exit_at.is_none()
+            && let Some(all_at) = self.chrome_status_all_success_at
+        {
+            let hold = CHROME_STATUS_SUCCESS_HOLD_MS + CHROME_STATUS_STEP_HOLD_MS;
+            if now.saturating_duration_since(all_at) >= Duration::from_millis(hold) {
+                self.chrome_status_batch_exit_at = Some(now);
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: chrome status exit_right begin n={}",
+                    self.chrome_status.len()
+                ));
             }
         }
         if let Some(batch_at) = self.chrome_status_batch_exit_at {
@@ -2942,6 +2942,7 @@ pub(crate) fn slide_header(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn slide_header_metrics(
     progress: f32,
     height: f32,

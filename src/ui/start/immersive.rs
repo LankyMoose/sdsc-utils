@@ -131,8 +131,7 @@ pub fn view<'a>(
     .width(Fill)
     .height(Fill);
 
-    let mut chrome_layers: Vec<Element<'_, StartMessage>> =
-        vec![body.into(), footer_overlay.into()];
+    let mut chrome_layers: Vec<Element<'_, StartMessage>> = vec![body, footer_overlay.into()];
     let chrome_status = state.chrome_load_status(now);
     if !chrome_status.is_empty() {
         // Clip flush to the window bottom-right; height grows with the status rail.
