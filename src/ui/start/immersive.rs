@@ -147,12 +147,11 @@ pub fn view<'a>(
     }
 }
 
-/// Full-bleed blackout — same ease-out curve as compact ExitCompact / EnterCompact.
+/// Full-bleed blackout — enter uses capped ease-in-out; exit uses ease-out like compact.
 fn transition_top_veil(state: &State, now: Instant) -> f32 {
-    let t = state.phase_progress(now).clamp(0.0, 1.0);
     match state.transition_phase.map(|(p, _)| p) {
-        Some(TransitionPhase::EnterImmersive) => 1.0 - t,
-        Some(TransitionPhase::ExitImmersive) => t,
+        Some(TransitionPhase::EnterImmersive) => state.enter_veil_amount(),
+        Some(TransitionPhase::ExitImmersive) => state.phase_progress(now).clamp(0.0, 1.0),
         _ => 0.0,
     }
 }
@@ -160,13 +159,15 @@ fn transition_top_veil(state: &State, now: Instant) -> f32 {
 fn stage_backdrop_layers<'a>(state: &'a State, now: Instant) -> Vec<Element<'a, StartMessage>> {
     let selected = state.game_selected.min(state.rows.len().saturating_sub(1));
     let mut layers: Vec<Element<'_, StartMessage>> = Vec::new();
-    let mut has_backdrop = false;
+    // Dim tracks splash opacity so ambient→art does not pop a full wash.
+    let mut dim_amount = 0.0_f32;
 
-    if let Some((key, opacity)) = state.backdrop_outgoing_visual(now)
+    if let Some((key, opacity, scale)) = state.backdrop_outgoing_visual(now)
         && let Some(art) = state.backdrop_icon_for_key(key)
     {
-        layers.push(backdrop_layer(art, opacity, 1.0));
-        has_backdrop = true;
+        // Keep the parked ken-burns scale — snapping to 1.0 causes a zoom blip.
+        layers.push(backdrop_layer(art, opacity, scale));
+        dim_amount = dim_amount.max(opacity);
     }
 
     if let Some(row) = state.rows.get(selected)
@@ -175,16 +176,15 @@ fn stage_backdrop_layers<'a>(state: &'a State, now: Instant) -> Vec<Element<'a, 
         && opacity > 0.01
     {
         layers.push(backdrop_layer(art, opacity, scale));
-        has_backdrop = true;
+        dim_amount = dim_amount.max(opacity);
     }
 
-    // Constant dim while any backdrop is present (not tied to incoming fade).
-    if has_backdrop {
+    if dim_amount > 0.01 {
         layers.push(
             container(space())
                 .width(Fill)
                 .height(Fill)
-                .style(theme::immersive_dim(0.58))
+                .style(theme::immersive_dim(0.58 * dim_amount))
                 .into(),
         );
     }

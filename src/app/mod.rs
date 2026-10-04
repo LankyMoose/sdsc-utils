@@ -800,7 +800,8 @@ impl App {
                 if Some(id) == self.start_window && self.start_visible {
                     self.start_nav_ready = true;
                     self.nav_not_ready_warned = false;
-                    self.start_revealed_at = Some(Instant::now());
+                    let now = Instant::now();
+                    self.start_revealed_at = Some(now);
                     crate::controller::hid::diag::diag_info(format!(
                         "ui-diag: start opened id={id:?}"
                     ));
@@ -811,6 +812,9 @@ impl App {
                         .chain(raise_window_topmost(id))
                         .chain(self.sync_toast_zorder());
                     if self.start_state.immersive {
+                        // Cold open: arm the enter veil + prime splash once the window paints.
+                        self.start_state.arm_enter_reveal(now);
+                        self.start_state.prime_backdrop_for_enter(now);
                         task = task.chain(self.warm_immersive_art_task());
                     }
                     task
@@ -2439,7 +2443,7 @@ impl App {
         self.prepare_immersive_library_task()
     }
 
-    /// Priority-decode the selected game, then warm the rest of the library off-thread.
+    /// Priority-decode the selected game, then neighbors, then the rest of the library.
     fn prepare_immersive_library_task(&self) -> Task<Message> {
         let (priority_hero, priority_shell, priority_backdrop) =
             self.start_state.immersive_priority_paths();
@@ -2470,15 +2474,15 @@ impl App {
 
         let has_priority =
             priority_hero.is_some() || priority_shell.is_some() || priority_backdrop.is_some();
-        let has_rest = !list_files.is_empty()
+        let has_neighbors = !neighbor_heroes.is_empty()
+            || !neighbor_shells.is_empty()
+            || !neighbor_backdrops.is_empty();
+        let has_library = !list_files.is_empty()
             || !list_shells.is_empty()
             || !all_heroes.is_empty()
             || !all_hero_shells.is_empty()
-            || !all_backdrops.is_empty()
-            || !neighbor_heroes.is_empty()
-            || !neighbor_shells.is_empty()
-            || !neighbor_backdrops.is_empty();
-        if !has_priority && !has_rest {
+            || !all_backdrops.is_empty();
+        if !has_priority && !has_neighbors && !has_library {
             return Task::none();
         }
 
@@ -2489,30 +2493,83 @@ impl App {
             .map(|r| r.play_key.clone())
             .unwrap_or_default();
 
-        let rest = Task::perform(
-            spawn_blocking(move || {
-                // Neighbors first (strip + adjacent backdrops), then the rest of the library.
-                crate::ui::start::icon_cache::warm_immersive_paths(
-                    &neighbor_heroes,
-                    &neighbor_backdrops,
+        // Neighbors: remaining covers (selected already handled by priority), then
+        // strip heroes. Always emit ArtReady on the backdrop step so peeks refresh
+        // even when every path was already cached.
+        let neighbors = if has_neighbors {
+            let (heroes, backdrops, skipped) =
+                crate::ui::start::icon_cache::filter_uncached_immersive(
+                    neighbor_heroes,
+                    neighbor_backdrops,
                 );
-                for path in &neighbor_shells {
-                    let _ = crate::ui::start::icon_cache::hero_for_shell(path);
-                }
-                crate::ui::start::icon_cache::prepare_paths(&list_files);
-                for path in &list_shells {
-                    let _ = crate::ui::start::icon_cache::handle_for_shell(path);
-                }
-                crate::ui::start::icon_cache::prepare_immersive(&all_heroes, &all_backdrops);
-                for path in &all_hero_shells {
-                    let _ = crate::ui::start::icon_cache::hero_for_shell(path);
-                }
-            }),
-            |_| Message::ImmersiveArtReady,
-        );
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: immersive art warm begin heroes={} shells={} backdrops={} skipped={}",
+                heroes.len(),
+                neighbor_shells.len(),
+                backdrops.len(),
+                skipped
+            ));
+            let shells = neighbor_shells;
+            let backdrop_task = if backdrops.is_empty() {
+                Task::done(Message::ImmersiveArtReady)
+            } else {
+                Task::perform(
+                    spawn_blocking(move || {
+                        crate::ui::start::icon_cache::warm_immersive_paths(
+                            &[] as &[std::path::PathBuf],
+                            &backdrops,
+                        );
+                        crate::controller::hid::diag::diag_info(
+                            "ui-diag: immersive art neighbors ready",
+                        );
+                    }),
+                    |_| Message::ImmersiveArtReady,
+                )
+            };
+            let hero_task = if heroes.is_empty() && shells.is_empty() {
+                Task::none()
+            } else {
+                Task::perform(
+                    spawn_blocking(move || {
+                        crate::ui::start::icon_cache::warm_immersive_paths(
+                            &heroes,
+                            &[] as &[std::path::PathBuf],
+                        );
+                        for path in &shells {
+                            let _ = crate::ui::start::icon_cache::hero_for_shell(path);
+                        }
+                    }),
+                    |_| Message::ImmersiveArtReady,
+                )
+            };
+            backdrop_task.chain(hero_task)
+        } else {
+            Task::none()
+        };
+
+        let library = if has_library {
+            Task::perform(
+                spawn_blocking(move || {
+                    crate::ui::start::icon_cache::prepare_paths(&list_files);
+                    for path in &list_shells {
+                        let _ = crate::ui::start::icon_cache::handle_for_shell(path);
+                    }
+                    crate::ui::start::icon_cache::prepare_immersive(&all_heroes, &all_backdrops);
+                    for path in &all_hero_shells {
+                        let _ = crate::ui::start::icon_cache::hero_for_shell(path);
+                    }
+                }),
+                |_| Message::ImmersiveArtReady,
+            )
+        } else {
+            Task::none()
+        };
+
+        // Neighbors before library fill; do not bury splash decode behind catalog work.
+        let after_priority = neighbors.chain(library);
 
         if !has_priority {
-            return rest;
+            return after_priority;
         }
 
         crate::controller::hid::diag::diag_info(format!(
@@ -2522,32 +2579,47 @@ impl App {
             u8::from(priority_backdrop.is_some())
         ));
 
-        let priority = Task::perform(
-            spawn_blocking(move || {
-                if let Some(path) = priority_hero.as_ref() {
-                    let _ = crate::ui::start::icon_cache::hero_for_path(path);
-                    // List-tier icon for compact / hero fallback.
-                    let _ = crate::ui::start::icon_cache::handle_for_path(path);
-                }
-                if let Some(path) = priority_shell.as_ref() {
-                    let _ = crate::ui::start::icon_cache::hero_for_shell(path);
-                    let _ = crate::ui::start::icon_cache::handle_for_shell(path);
-                }
-                if let Some(path) = priority_backdrop.as_ref() {
-                    let _ = crate::ui::start::icon_cache::backdrop_for_path(path);
-                }
-                crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: immersive art priority ready key={play_key}"
-                ));
-            }),
-            |_| Message::ImmersiveArtReady,
-        );
-
-        if has_rest {
-            priority.chain(rest)
+        // Selected cover first so splash can arm before strip hero decode.
+        let priority_cover = if let Some(path) = priority_backdrop {
+            let key = play_key.clone();
+            Task::perform(
+                spawn_blocking(move || {
+                    let _ = crate::ui::start::icon_cache::backdrop_for_path(&path);
+                    crate::controller::hid::diag::diag_info(format!(
+                        "ui-diag: immersive art priority ready key={key}"
+                    ));
+                }),
+                |_| Message::ImmersiveArtReady,
+            )
         } else {
-            priority
-        }
+            Task::none()
+        };
+        let priority_hero_task = if priority_hero.is_some() || priority_shell.is_some() {
+            let key = play_key;
+            Task::perform(
+                spawn_blocking(move || {
+                    if let Some(path) = priority_hero.as_ref() {
+                        let _ = crate::ui::start::icon_cache::hero_for_path(path);
+                        // List-tier icon for compact / hero fallback.
+                        let _ = crate::ui::start::icon_cache::handle_for_path(path);
+                    }
+                    if let Some(path) = priority_shell.as_ref() {
+                        let _ = crate::ui::start::icon_cache::hero_for_shell(path);
+                        let _ = crate::ui::start::icon_cache::handle_for_shell(path);
+                    }
+                    crate::controller::hid::diag::diag_info(format!(
+                        "ui-diag: immersive art priority hero ready key={key}"
+                    ));
+                }),
+                |_| Message::ImmersiveArtReady,
+            )
+        } else {
+            Task::none()
+        };
+
+        priority_cover
+            .chain(priority_hero_task)
+            .chain(after_priority)
     }
 
     fn on_manual_file_picked(&mut self, path: Option<PathBuf>) -> Task<Message> {
@@ -2688,8 +2760,11 @@ impl App {
                 height: 1080.0,
             });
             self.start_monitor_cover = Some(cover);
-            // Cached splash must not paint at opacity 1 then restart the fade.
-            self.start_state.prime_backdrop_for_enter(Instant::now());
+            // Enter veil stays solid until StartOpened arms the capped clock.
+            self.start_state.begin_transition_phase(
+                start_mode::TransitionPhase::EnterImmersive,
+                Instant::now(),
+            );
             crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
             (cover.size(), window::Position::Specific(cover.origin()))
         } else {
@@ -2794,6 +2869,8 @@ impl App {
             }
             start_mode::TransitionPhase::EnterImmersive => {
                 self.start_state.clear_transition_phase();
+                // Veil phase over — begin held ambient→splash on this same clock tick.
+                self.start_state.try_start_pending_splash_reveal(now);
                 crate::controller::hid::diag::diag_info(format!(
                     "ui-diag: start immersive transition phase={} done",
                     phase.label()
@@ -2869,14 +2946,15 @@ impl App {
         let now = Instant::now();
         if immersive {
             // Keep ambient_time; open aperture + chrome.
-            // Prime (not reset): no prior splash to crossfade; avoid blink on cached art.
+            // Phase + arm before prime so splash holds under the veil, then fades after.
+            self.start_state
+                .begin_transition_phase(start_mode::TransitionPhase::EnterImmersive, now);
+            self.start_state.arm_enter_reveal(now);
             self.start_state.prime_backdrop_for_enter(now);
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: start immersive settle promote backdrop re-arm sel={}",
                 self.start_state.game_selected
             ));
-            self.start_state
-                .begin_transition_phase(start_mode::TransitionPhase::EnterImmersive, now);
         } else {
             self.start_monitor_cover = None;
             self.clear_start_cursor_hide();
@@ -2902,24 +2980,90 @@ impl App {
 
     fn warm_immersive_art_task(&self) -> Task<Message> {
         let (heroes, shells, backdrops) = self.start_state.immersive_warm_paths();
-        if heroes.is_empty() && shells.is_empty() && backdrops.is_empty() {
-            return Task::none();
-        }
+        let selected_backdrop = self.start_state.immersive_priority_paths().2;
+        let (selected_backdrop, other_backdrops) =
+            crate::ui::start::icon_cache::split_selected_backdrop(selected_backdrop, backdrops);
+
+        let mut skipped = 0usize;
+        let selected_uncached = match selected_backdrop {
+            Some(path) if crate::ui::start::icon_cache::backdrop_cached(&path).is_some() => {
+                skipped += 1;
+                None
+            }
+            other => other,
+        };
+        let (heroes, other_backdrops, skipped_rest) =
+            crate::ui::start::icon_cache::filter_uncached_immersive(heroes, other_backdrops);
+        skipped += skipped_rest;
+        let shells: Vec<_> = shells
+            .into_iter()
+            .filter(|path| {
+                if crate::ui::start::icon_cache::hero_shell_cached(path).is_some() {
+                    skipped += 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
         crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: immersive art warm begin heroes={} shells={} backdrops={}",
+            "ui-diag: immersive art warm begin selected={} heroes={} shells={} backdrops={} skipped={skipped}",
+            u8::from(selected_uncached.is_some()),
             heroes.len(),
             shells.len(),
-            backdrops.len()
+            other_backdrops.len(),
         ));
-        Task::perform(
-            spawn_blocking(move || {
-                crate::ui::start::icon_cache::warm_immersive_paths(&heroes, &backdrops);
-                for path in shells {
-                    let _ = crate::ui::start::icon_cache::hero_for_shell(&path);
-                }
-            }),
-            |_| Message::ImmersiveArtReady,
-        )
+
+        // Selected cover → ArtReady immediately (splash/crossfade), then remaining
+        // neighbor backdrops, then strip heroes. Always emit ArtReady once so enter
+        // fade arms even on a full cache hit.
+        let selected_task = if let Some(path) = selected_uncached {
+            Task::perform(
+                spawn_blocking(move || {
+                    let _ = crate::ui::start::icon_cache::backdrop_for_path(&path);
+                    crate::controller::hid::diag::diag_info(
+                        "ui-diag: immersive art selected ready",
+                    );
+                }),
+                |_| Message::ImmersiveArtReady,
+            )
+        } else {
+            Task::done(Message::ImmersiveArtReady)
+        };
+        let neighbor_backdrop_task = if other_backdrops.is_empty() {
+            Task::none()
+        } else {
+            Task::perform(
+                spawn_blocking(move || {
+                    crate::ui::start::icon_cache::warm_immersive_paths(
+                        &[] as &[std::path::PathBuf],
+                        &other_backdrops,
+                    );
+                    crate::controller::hid::diag::diag_info(
+                        "ui-diag: immersive art neighbors ready",
+                    );
+                }),
+                |_| Message::ImmersiveArtReady,
+            )
+        };
+        let hero_task = if heroes.is_empty() && shells.is_empty() {
+            Task::none()
+        } else {
+            Task::perform(
+                spawn_blocking(move || {
+                    crate::ui::start::icon_cache::warm_immersive_paths(
+                        &heroes,
+                        &[] as &[std::path::PathBuf],
+                    );
+                    for path in shells {
+                        let _ = crate::ui::start::icon_cache::hero_for_shell(&path);
+                    }
+                }),
+                |_| Message::ImmersiveArtReady,
+            )
+        };
+        selected_task.chain(neighbor_backdrop_task).chain(hero_task)
     }
 
     /// Arm the debounced release latch and mark any locally visible chord consumed.
