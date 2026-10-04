@@ -176,6 +176,8 @@ pub struct StartRow {
     pub skeleton: bool,
     /// Steam install has an update pending (`StateFlags` update-required).
     pub update_required: bool,
+    /// Effective last-played time (catalog touch or Steam), milliseconds. `None` = never.
+    pub played_at_ms: Option<u64>,
 }
 
 /// Edit-mode action for a games-list row.
@@ -217,6 +219,7 @@ impl StartRow {
                         edit: None,
                         skeleton: false,
                         update_required: game.update_required,
+                        played_at_ms: None,
                     }
                 } else if steam_scan_pending {
                     Self {
@@ -231,6 +234,7 @@ impl StartRow {
                         edit: None,
                         skeleton: true,
                         update_required: false,
+                        played_at_ms: None,
                     }
                 } else {
                     Self {
@@ -245,6 +249,7 @@ impl StartRow {
                         edit: None,
                         skeleton: false,
                         update_required: false,
+                        played_at_ms: None,
                     }
                 }
             }
@@ -268,6 +273,7 @@ impl StartRow {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    played_at_ms: None,
                 }
             }
         }
@@ -292,6 +298,7 @@ impl StartRow {
             }),
             skeleton: false,
             update_required: game.update_required,
+            played_at_ms: None,
         }
     }
 
@@ -319,6 +326,7 @@ impl StartRow {
             edit: Some(EditRow::Manual { id: id.clone() }),
             skeleton: false,
             update_required: false,
+            played_at_ms: None,
         })
     }
 
@@ -591,6 +599,22 @@ struct StripAnim {
     started: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct PositionSectionAnim {
+    from: f32,
+    to: f32,
+    duration_ms: u64,
+    started: Instant,
+}
+
+/// Fade-in when the position bar reappears after being hidden.
+#[derive(Debug, Clone)]
+struct PositionVisAnim {
+    from: f32,
+    to: f32,
+    started: Instant,
+}
+
 /// Frame-capped EnterImmersive veil clock (armed once the window can paint).
 #[derive(Debug, Clone)]
 struct EnterRevealClock {
@@ -735,6 +759,12 @@ pub struct State {
     anim: Option<SlideAnim>,
     dock_anim: Option<DockAnim>,
     strip_anim: Option<StripAnim>,
+    /// In-flight section index chase (None = settled on the current section).
+    position_section: Option<PositionSectionAnim>,
+    /// Last games-strip scroll / section change (drives auto-hide).
+    position_bar_last_scroll: Option<Instant>,
+    /// Fade-in while re-showing; hide uses [position::visibility_after_idle].
+    position_bar_vis: Option<PositionVisAnim>,
     /// Seconds for ambient shader time uniform.
     pub ambient_time: f32,
     /// Incoming backdrop land/crossfade (`started = None` = waiting for peek art).
@@ -822,6 +852,9 @@ impl Default for State {
             anim: None,
             dock_anim: None,
             strip_anim: None,
+            position_section: None,
+            position_bar_last_scroll: None,
+            position_bar_vis: None,
             ambient_time: 0.0,
             backdrop_current: None,
             backdrop_outgoing: None,
@@ -843,6 +876,7 @@ impl State {
         } else {
             self.game_selected = self.game_selected.min(self.rows.len() - 1);
         }
+        self.sync_position_section(Instant::now(), crate::ui::start::vstrip::STRIP_ANIM_MS);
     }
 
     pub fn set_controllers(&mut self, controllers: Vec<StartControllerRow>) {
@@ -951,15 +985,18 @@ impl State {
     pub fn select_game_by_play_key(&mut self, play_key: Option<&str>) {
         if self.rows.is_empty() {
             self.game_selected = 0;
+            self.sync_position_section(Instant::now(), crate::ui::start::vstrip::STRIP_ANIM_MS);
             return;
         }
         if let Some(key) = play_key
             && let Some(i) = self.rows.iter().position(|r| r.play_key == key)
         {
             self.game_selected = i;
+            self.sync_position_section(Instant::now(), crate::ui::start::vstrip::STRIP_ANIM_MS);
             return;
         }
         self.game_selected = 0;
+        self.sync_position_section(Instant::now(), crate::ui::start::vstrip::STRIP_ANIM_MS);
     }
 
     /// Remember the current games selection’s `play_key` for edit enter/exit restore.
@@ -982,6 +1019,9 @@ impl State {
         self.anim = None;
         self.dock_anim = None;
         self.strip_anim = None;
+        self.position_section = None;
+        self.position_bar_last_scroll = None;
+        self.position_bar_vis = None;
         self.dock_expanded = false;
         self.replace_confirm = None;
         self.manual_add = None;
@@ -1137,6 +1177,7 @@ impl State {
         let len = self.rows.len() as f32;
         if len < 1.0 {
             self.strip_anim = None;
+            self.sync_position_section(now, crate::ui::start::vstrip::STRIP_ANIM_MS);
             return;
         }
         let catching_up = self.strip_anim.is_some();
@@ -1150,6 +1191,7 @@ impl State {
         let delta = to - from;
         if delta.abs() < 0.01 {
             self.strip_anim = None;
+            self.sync_position_section(now, crate::ui::start::vstrip::STRIP_ANIM_MS);
             return;
         }
         let duration_ms = if catching_up {
@@ -1163,13 +1205,113 @@ impl State {
             duration_ms,
             started: now,
         });
+        self.sync_position_section(now, duration_ms);
     }
 
+    pub(crate) fn games_section_mode(&self) -> crate::ui::start::position::SectionMode {
+        if self.editing || matches!(self.sort_mode, GamesSortMode::Alphabetical) {
+            crate::ui::start::position::SectionMode::Alphabetical
+        } else {
+            crate::ui::start::position::SectionMode::LastPlayed
+        }
+    }
+
+    /// Eased fractional section index (active label centered in the position bar).
+    pub(crate) fn position_section_visual(&self, now: Instant) -> f32 {
+        let Some(anim) = &self.position_section else {
+            return self.position_section_target();
+        };
+        let t = (now.saturating_duration_since(anim.started).as_secs_f32()
+            / (anim.duration_ms.max(1) as f32 / 1000.0))
+            .clamp(0.0, 1.0);
+        let eased = window_layout::ease_out_cubic(t);
+        anim.from + (anim.to - anim.from) * eased
+    }
+
+    /// Show/hide opacity for the position bar (1 = fully visible).
+    pub(crate) fn position_bar_visibility(&self, now: Instant) -> f32 {
+        use crate::ui::start::position::{FADE_MS, visibility_after_idle};
+        if let Some(anim) = &self.position_bar_vis {
+            let t = (now.saturating_duration_since(anim.started).as_secs_f32()
+                / (FADE_MS.max(1) as f32 / 1000.0))
+                .clamp(0.0, 1.0);
+            let eased = window_layout::ease_out_cubic(t);
+            return anim.from + (anim.to - anim.from) * eased;
+        }
+        let Some(last) = self.position_bar_last_scroll else {
+            return 0.0;
+        };
+        let elapsed = now.saturating_duration_since(last).as_millis() as u64;
+        visibility_after_idle(elapsed)
+    }
+
+    fn position_section_target(&self) -> f32 {
+        let mode = self.games_section_mode();
+        if self.rows.is_empty() {
+            return 0.0;
+        }
+        let idx = self.game_selected.min(self.rows.len() - 1);
+        let row = &self.rows[idx];
+        crate::ui::start::position::section_index(
+            mode,
+            &row.title,
+            row.played_at_ms,
+            crate::ui::start::position::now_ms(),
+            crate::ui::start::position::local_utc_offset_secs(),
+        ) as f32
+    }
+
+    fn note_position_bar_scroll(&mut self, now: Instant) {
+        let current = self.position_bar_visibility(now);
+        self.position_bar_last_scroll = Some(now);
+        if current >= 0.99 {
+            self.position_bar_vis = None;
+            return;
+        }
+        if self
+            .position_bar_vis
+            .as_ref()
+            .is_some_and(|anim| (anim.to - 1.0).abs() < 0.01)
+        {
+            return;
+        }
+        self.position_bar_vis = Some(PositionVisAnim {
+            from: current,
+            to: 1.0,
+            started: now,
+        });
+    }
+
+    fn sync_position_section(&mut self, now: Instant, duration_ms: u64) {
+        self.note_position_bar_scroll(now);
+        let target = self.position_section_target();
+        let current = self.position_section_visual(now);
+        if (current - target).abs() < 0.004 {
+            self.position_section = None;
+            return;
+        }
+        if self
+            .position_section
+            .as_ref()
+            .is_some_and(|anim| (anim.to - target).abs() < 0.004)
+        {
+            return;
+        }
+        self.position_section = Some(PositionSectionAnim {
+            from: current,
+            to: target,
+            duration_ms,
+            started: now,
+        });
+    }
     /// Clear dock/strip/transition and ambient (close / leave immersive fully).
     pub fn clear_immersive_session(&mut self) {
         self.dock_expanded = false;
         self.dock_anim = None;
         self.strip_anim = None;
+        self.position_section = None;
+        self.position_bar_last_scroll = None;
+        self.position_bar_vis = None;
         self.settings.reset();
         self.transition = None;
         self.transition_phase = None;
@@ -1277,6 +1419,9 @@ impl State {
         use crate::ui::start::mode::TransitionPhase;
         self.dock_anim = None;
         self.strip_anim = None;
+        self.position_section = None;
+        self.position_bar_last_scroll = None;
+        self.position_bar_vis = None;
         self.transition_phase = Some((phase, now));
         if matches!(phase, TransitionPhase::EnterImmersive) {
             self.enter_reveal = Some(EnterRevealClock {
@@ -2389,6 +2534,30 @@ impl State {
                 busy = true;
             }
         }
+        if let Some(anim) = self.position_section.as_ref() {
+            let elapsed = now.saturating_duration_since(anim.started);
+            if elapsed >= Duration::from_millis(anim.duration_ms) {
+                self.position_section = None;
+            } else {
+                busy = true;
+            }
+        }
+        if let Some(anim) = self.position_bar_vis.as_ref() {
+            use crate::ui::start::position::FADE_MS;
+            let elapsed = now.saturating_duration_since(anim.started);
+            if elapsed >= Duration::from_millis(FADE_MS) {
+                // Settled at to=1; idle hide is computed from last_scroll.
+                self.position_bar_vis = None;
+            } else {
+                busy = true;
+            }
+        } else if let Some(last) = self.position_bar_last_scroll {
+            use crate::ui::start::position::{FADE_MS, HIDE_AFTER_MS};
+            let elapsed = now.saturating_duration_since(last).as_millis() as u64;
+            if elapsed < HIDE_AFTER_MS + FADE_MS {
+                busy = true;
+            }
+        }
         // Continuous ken-burns + pending splash decode both need frames.
         if self.backdrop_current.is_some() {
             busy = true;
@@ -2482,6 +2651,7 @@ impl State {
                     return None;
                 }
                 self.game_selected = after as usize;
+                self.sync_position_section(Instant::now(), crate::ui::start::vstrip::STRIP_ANIM_MS);
                 Some(reveal_for_step(before, after, delta))
             }
             StartSlide::Controllers => {
@@ -4907,6 +5077,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    played_at_ms: None,
                 },
                 StartRow {
                     title: "g1".into(),
@@ -4920,6 +5091,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    played_at_ms: None,
                 },
                 StartRow {
                     title: "g2".into(),
@@ -4933,6 +5105,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    played_at_ms: None,
                 },
             ],
             game_selected: 0,
@@ -4976,6 +5149,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    played_at_ms: None,
                 })
                 .collect(),
             game_selected: 3,
@@ -5018,6 +5192,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    played_at_ms: None,
                 })
                 .collect(),
             game_selected: 0,
@@ -5046,6 +5221,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    played_at_ms: None,
                 })
                 .collect(),
             game_selected: 0,
@@ -5086,6 +5262,7 @@ mod tests {
                 edit: None,
                 skeleton: false,
                 update_required: false,
+                played_at_ms: None,
             }],
             game_selected: 0,
             immersive: true,
@@ -5219,6 +5396,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    played_at_ms: None,
                 }],
                 game_selected: 0,
                 immersive: true,
@@ -5264,6 +5442,7 @@ mod tests {
                 edit: None,
                 skeleton: true,
                 update_required: false,
+                played_at_ms: None,
             }],
             game_selected: 0,
             immersive: true,
@@ -5312,6 +5491,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    played_at_ms: None,
                 }],
                 game_selected: 0,
                 immersive: true,
@@ -5347,6 +5527,7 @@ mod tests {
                 edit: None,
                 skeleton: true,
                 update_required: false,
+                played_at_ms: None,
             }],
             game_selected: 0,
             immersive: true,
@@ -5524,6 +5705,7 @@ mod tests {
                         edit: None,
                         skeleton: false,
                         update_required: false,
+                        played_at_ms: None,
                     },
                     StartRow {
                         title: "g1".into(),
@@ -5537,6 +5719,7 @@ mod tests {
                         edit: None,
                         skeleton: false,
                         update_required: false,
+                        played_at_ms: None,
                     },
                 ],
                 game_selected: 0,
@@ -5605,6 +5788,7 @@ mod tests {
                         edit: None,
                         skeleton: false,
                         update_required: false,
+                        played_at_ms: None,
                     },
                     StartRow {
                         title: "g1".into(),
@@ -5618,6 +5802,7 @@ mod tests {
                         edit: None,
                         skeleton: false,
                         update_required: false,
+                        played_at_ms: None,
                     },
                 ],
                 game_selected: 0,
@@ -5674,6 +5859,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    played_at_ms: None,
                 })
                 .collect(),
             game_selected: 2,
@@ -5705,6 +5891,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    played_at_ms: None,
                 })
                 .collect(),
             game_selected: 0,
@@ -5752,6 +5939,7 @@ mod tests {
                 edit: None,
                 skeleton: false,
                 update_required: false,
+                played_at_ms: None,
             };
             assert!(row.list_icon_live().is_none());
             assert!(icon_cache::handle_for_path(&path).is_some());

@@ -3,7 +3,7 @@ name = "sdsc-utils"
 version = "1.5.2"
 edition = "2024"
 rust-version = "1.88"
-description = "SDSC Utils — system tray battery, lightbar, and identify utilities for DualSense controllers"
+description = "SDSC Utils â€” system tray battery, lightbar, and identify utilities for DualSense controllers"
 authors = ["LankyMoose"]
 license = "MIT"
 readme = "README.md"
@@ -50,6 +50,7 @@ windows = { version = "0.61", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_System_Time",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
