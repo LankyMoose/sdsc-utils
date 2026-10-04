@@ -12,7 +12,7 @@ iced multi-window present starvation: [iced#3108](https://github.com/iced-rs/ice
 
 **Do:** keep toast `HWND_TOPMOST` (above Cursor); raise Start/Settings into the same topmost band *above* the toast (corner toast stays visible beside centered Start); `gain_focus` the interactive window.
 
-**Immersive cover:** the primary-monitor Start HWND occludes the toast HWND (and unowned `rfd` file dialogs). Do **not** raise the toast above Start (present starvation). While immersive, composite the same toast card into the Start window (`Float` overlay at cover-local slide pose). Parent add/edit shortcut file dialogs to the Start HWND via `rfd::FileDialog::set_parent` so the picker opens above the cover.
+**Immersive cover:** the primary-monitor Start HWND occludes the toast HWND (and unowned `rfd` file dialogs). Do **not** raise the toast above Start (present starvation). While immersive, composite the same toast card into the Start window (`Float` overlay at cover-local slide pose); keep the toast HWND blank/hidden (no `show_toast_without_activate`, no `move_to`). Parent add/edit shortcut file dialogs to the Start HWND via `rfd::FileDialog::set_parent` so the picker opens above the cover.
 
 Debug grep: `ui-diag: place toast gen=`, `ui-diag: sync toast z-order (toast + raise UI)`, `ui-diag: immersive toast composite gen=`, `ui-diag: file dialog parent hwnd=`.
 
@@ -40,6 +40,20 @@ Fix: pure presentation state machine in [`src/ui/toast/machine.rs`](../src/ui/to
 
 **Reopen gesture during latch:** `suppresses_reopen_gesture()` while `after == OpenStart` and phase is Placing/SlidingIn. During Placing, suppress lifts after ~60 Frame ticks (~1s) so a lost `Shown` cannot block the gesture forever; phase stays Placing and no `OpenStart` is emitted from that budget.
 
+### Immersive 0→1 Connected (composite only)
+
+When Connected would auto-open Start **and** `start_screen_always_immersive` is on, do **not** slide the toast on the desktop HWND first (that double-up’d with the in-cover composite). Instead:
+
+1. Queue Connected with `after=Nothing` (no `AfterToast::OpenStart`).
+2. Set `defer_toast_for_immersive_start` so `show_next_toast` no-ops (holds the **whole** queue — same-tick or staggered multi-pad Connecteds append only).
+3. Open immersive Start immediately.
+4. On `StartOpened` (or already-hosting), clear the defer flag and show; toast HWND stays hidden; card slides only via `immersive toast composite`.
+5. If Start cannot host (disabled / compact / close abandoned), fall back to HWND toast so Connected is never dropped.
+
+Compact auto-open keeps defer-until-toast-rest (`AfterToast::OpenStart`).
+
+Debug grep: `ui-diag: immersive connect toast (start first, composite only)`, `ui-diag: immersive connect toast release (start hosting)`, `ui-diag: immersive connect toast fallback (hwnd)`, `ui-diag: place toast … composite_only=1`, `ui-diag: immersive toast composite gen=`.
+
 ### 0→1 Start survive toast (robustness)
 
 Toast and Start are separate gates. To stop Connected-without-Start on turn-on:
@@ -48,4 +62,4 @@ Toast and Start are separate gates. To stop Connected-without-Start on turn-on:
 - **Short arrival:** nonempty stretch under 2s does not arm the 5s ghost cooldown (enumerate blip). Stable disconnects still arm it; intentional Power Off still skips.
 - **Pending retry:** `start_auto_open_pending` is set when 0→1 auto-open gates pass; cleared only once Start is visible. Close-in-flight leaves it set; `WindowClosed` retries. Confirmed empty clears pending and `clear_after()` even when Start is not visible.
 
-Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: toast Placing->SlidingIn`, `ui-diag: toast SlidingIn->Resting`, `ui-diag: toast show … body=Connected after=OpenStart`, `ui-diag: place toast gen=`, `ui-diag: start open after toast settle`, `ui-diag: skip connect cooldown (intentional power-off)`, `ui-diag: skip connect cooldown (short arrival)`, `ui-diag: hold pad across missed read serial=`, `ui-diag: retry start open after close`, `ui-diag: reopen gesture suppressed (toast OpenStart pending)`.
+Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: toast Placing->SlidingIn`, `ui-diag: toast SlidingIn->Resting`, `ui-diag: toast show … body=Connected after=OpenStart`, `ui-diag: place toast gen=`, `ui-diag: start open after toast settle`, `ui-diag: skip connect cooldown (intentional power-off)`, `ui-diag: skip connect cooldown (short arrival)`, `ui-diag: hold pad across missed read serial=`, `ui-diag: retry start open after close`, `ui-diag: reopen gesture suppressed (toast OpenStart pending)`, `ui-diag: immersive connect toast`.

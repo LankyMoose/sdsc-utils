@@ -302,6 +302,8 @@ pub struct App {
     toast_anim_started: Instant,
     /// Pure toast / deferred-Start presentation machine.
     toast_machine: toast_machine::State,
+    /// Hold toast show until immersive Start can host the composite (0→1 Connected).
+    defer_toast_for_immersive_start: bool,
 
     /// Bumped on every spectrum edit; stale SpectrumCommit messages are ignored.
     spectrum_generation: u64,
@@ -476,6 +478,7 @@ impl App {
             toast_placement: None,
             toast_anim_started: Instant::now(),
             toast_machine: toast_machine::State::Idle,
+            defer_toast_for_immersive_start: false,
             spectrum_generation: 0,
             #[cfg(feature = "dev-emulate")]
             dev_mode,
@@ -690,6 +693,10 @@ impl App {
         }
 
         if Some(window) == self.toast_window {
+            // Immersive Start composites the card; keep the toast HWND blank.
+            if self.immersive_hosts_toast() {
+                return toast_view::empty();
+            }
             return match self.toast_message.as_ref() {
                 Some(message) => toast_view::view(
                     message,
@@ -749,6 +756,9 @@ impl App {
                             "ui-diag: retry start open after close",
                         );
                         sync.chain(self.open_start_screen())
+                    } else if self.defer_toast_for_immersive_start {
+                        // Start will not host — fall back to HWND toasts.
+                        sync.chain(self.release_deferred_immersive_toasts_fallback())
                     } else {
                         sync
                     }
@@ -829,7 +839,15 @@ impl App {
                         }
                         task = task.chain(self.warm_immersive_art_task());
                     }
-                    task
+                    let release = if self.defer_toast_for_immersive_start
+                        && self.start_visible
+                        && !self.start_state.immersive
+                    {
+                        self.release_deferred_immersive_toasts_fallback()
+                    } else {
+                        self.try_release_deferred_immersive_toasts()
+                    };
+                    task.chain(release)
                 } else {
                     Task::none()
                 }
@@ -1005,18 +1023,24 @@ impl App {
                     .as_ref()
                     .map(|m| m.body.as_str())
                     .unwrap_or("-");
+                let composite_only = self.immersive_hosts_toast();
                 crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: place toast gen={generation} body={body} percent={percent}"
+                    "ui-diag: place toast gen={generation} body={body} percent={percent} composite_only={}",
+                    u8::from(composite_only)
                 ));
                 crate::platform::wgpu_diag::note_toast_remount();
                 // Do not raise interactive UI here — machine emits RaiseInteractive
                 // only after Resting so Start create cannot starve the slide.
-                remount_toast_surface(id, generation)
+                // Immersive Start hosts the card; keep the toast HWND hidden.
+                let mut place = remount_toast_surface(id, generation)
                     .chain(window::move_to(id, start))
-                    .chain(window::set_level(id, window::Level::AlwaysOnTop))
-                    .chain(show_toast_without_activate(id))
-                    .chain(invalidate_toast(id))
-                    .chain(Task::done(Message::ToastShown { generation }))
+                    .chain(window::set_level(id, window::Level::AlwaysOnTop));
+                if !composite_only {
+                    place = place
+                        .chain(show_toast_without_activate(id))
+                        .chain(invalidate_toast(id));
+                }
+                place.chain(Task::done(Message::ToastShown { generation }))
             }
             Message::ToastShown { generation } => {
                 self.toast_step(toast_machine::Event::Shown { generation })
@@ -4254,20 +4278,89 @@ impl App {
         events: Vec<NotifyEvent>,
         mut open_start_after: bool,
     ) -> Task<Message> {
+        let immersive_connect = open_start_after
+            && self.session.prefs.start_screen_always_immersive
+            && events.iter().any(|event| event.body == "Connected");
         for event in events {
             let eta = self.toast_eta_for(&event);
             let mut message =
                 ToastMessage::from_notification(event, self.session.prefs.spectrum.clone(), eta);
             if open_start_after && message.body == "Connected" {
-                message.after = AfterToast::OpenStart;
                 open_start_after = false;
-                crate::controller::hid::diag::diag_info(
-                    "ui-diag: defer start until toast slide settles",
-                );
+                if immersive_connect {
+                    // Start opens first; Connected slides only inside the cover.
+                    message.after = AfterToast::Nothing;
+                } else {
+                    message.after = AfterToast::OpenStart;
+                    crate::controller::hid::diag::diag_info(
+                        "ui-diag: defer start until toast slide settles",
+                    );
+                }
             }
             self.toast_queue.push_back(message);
         }
+        if immersive_connect {
+            return self.begin_immersive_connect_toast();
+        }
         self.show_next_toast()
+    }
+
+    /// Open immersive Start first; hold the toast queue until Start can host it.
+    fn begin_immersive_connect_toast(&mut self) -> Task<Message> {
+        let was_visible = self.start_visible;
+        self.defer_toast_for_immersive_start = true;
+        crate::controller::hid::diag::diag_info(
+            "ui-diag: immersive connect toast (start first, composite only)",
+        );
+        if !self.session.prefs.start_screen_enabled {
+            return self.release_deferred_immersive_toasts_fallback();
+        }
+        let open = self.open_start_screen();
+        if was_visible && self.start_visible && self.start_state.immersive {
+            return open.chain(self.try_release_deferred_immersive_toasts());
+        }
+        if self.start_visible && self.start_state.immersive {
+            // Cold open in flight — wait for StartOpened before showing.
+            return open;
+        }
+        if self.start_visible && !self.start_state.immersive {
+            // Unexpected compact host — fall back to HWND.
+            return open.chain(self.release_deferred_immersive_toasts_fallback());
+        }
+        if self.start_window.is_some() {
+            // Close in flight; WindowClosed retries open, then StartOpened releases.
+            return open;
+        }
+        // Open did not take — show on HWND so Connected is never dropped.
+        open.chain(self.release_deferred_immersive_toasts_fallback())
+    }
+
+    /// Release held toasts once immersive Start is hosting (or drop the hold).
+    fn try_release_deferred_immersive_toasts(&mut self) -> Task<Message> {
+        if !self.defer_toast_for_immersive_start {
+            return Task::none();
+        }
+        if self.start_visible && self.start_state.immersive {
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: immersive connect toast release (start hosting)",
+            );
+            self.defer_toast_for_immersive_start = false;
+            return self.show_next_toast();
+        }
+        Task::none()
+    }
+
+    fn release_deferred_immersive_toasts_fallback(&mut self) -> Task<Message> {
+        if !self.defer_toast_for_immersive_start {
+            return Task::none();
+        }
+        crate::controller::hid::diag::diag_info("ui-diag: immersive connect toast fallback (hwnd)");
+        self.defer_toast_for_immersive_start = false;
+        self.show_next_toast()
+    }
+
+    fn immersive_hosts_toast(&self) -> bool {
+        self.start_visible && self.start_state.immersive
     }
 
     fn toast_eta_for(&self, event: &NotifyEvent) -> Option<String> {
@@ -4336,6 +4429,9 @@ impl App {
     }
 
     fn show_next_toast(&mut self) -> Task<Message> {
+        if self.defer_toast_for_immersive_start {
+            return Task::none();
+        }
         if self.toast_message.is_some() {
             return Task::none();
         }
@@ -4481,6 +4577,10 @@ impl App {
     }
 
     fn effect_toast_move(&self, progress: f32, dismissing: bool) -> Task<Message> {
+        // Immersive composite owns the slide pose; leave the toast HWND alone.
+        if self.immersive_hosts_toast() {
+            return Task::none();
+        }
         let Some(id) = self.toast_window else {
             return Task::none();
         };
