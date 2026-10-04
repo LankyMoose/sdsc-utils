@@ -264,6 +264,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     last_battery_poll = Instant::now();
                     match poll_sync(&hid_worker, previously) {
                         Ok(controllers) => {
+                            session
+                                .notify
+                                .queue_launch_quiet(hid_worker.take_launch_serials());
                             let effects = session.on_poll_result(
                                 controllers,
                                 ApplyContext {
@@ -300,6 +303,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else if !controllers_equivalent(&session.controllers, &live) || presence_changed {
                 apply_hot_path_lightbar(&hid_worker, &session.controllers, &live);
                 last_battery_poll = Instant::now();
+                session
+                    .notify
+                    .queue_launch_quiet(hid_worker.take_launch_serials());
                 let effects = session.on_poll_result(
                     live,
                     ApplyContext {
