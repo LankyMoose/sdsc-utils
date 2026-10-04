@@ -4,14 +4,17 @@ pub mod launch;
 pub mod process_match;
 pub mod steam;
 
+use crate::persist::json;
 use crate::persist::prefs::GamesSortMode;
 use crate::platform::app_log;
 use serde::{Deserialize, Serialize};
+use serde_json::Map;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// New persisted fields need `#[serde(default)]` (or the oldest-shape fixture fails).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GameEntry {
@@ -68,15 +71,24 @@ impl GamesCatalog {
         let Ok(bytes) = fs::read(&path) else {
             return Self::default();
         };
-        match serde_json::from_slice::<GamesCatalog>(&bytes) {
-            Ok(catalog) => catalog,
-            Err(err) => {
-                app_log::warn(format!(
-                    "failed to parse games at {}: {err}; starting empty",
-                    path.display()
-                ));
-                Self::default()
-            }
+        let Some(root) = json::parse_object(&path, &bytes) else {
+            return Self::default();
+        };
+        Self::from_root(&path, root)
+    }
+
+    fn from_root(path: &Path, mut root: Map<String, serde_json::Value>) -> Self {
+        let items = json::take_array(&mut root, "entries");
+        let source_len = items.len();
+        let (entries, skipped) = json::decode_array::<GameEntry>(items);
+        if json::total_loss(path, "game entries", source_len, entries.len()) {
+            return Self::default();
+        }
+        json::warn_skipped(path, "game entries", skipped);
+        let last_played_ms = json::take_default(&mut root, "last_played_ms");
+        Self {
+            entries,
+            last_played_ms,
         }
     }
 
@@ -259,12 +271,56 @@ pub fn title_from_target(target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+
+    fn catalog_from_str(json: &str) -> GamesCatalog {
+        let Value::Object(root) = serde_json::from_str(json).unwrap() else {
+            panic!("expected object");
+        };
+        GamesCatalog::from_root(Path::new("games.json"), root)
+    }
 
     #[test]
     fn empty_catalog_deserializes() {
         let catalog: GamesCatalog = serde_json::from_str("{}").unwrap();
         assert!(catalog.entries.is_empty());
         assert!(catalog.last_played_ms.is_empty());
+    }
+
+    #[test]
+    fn older_games_shape_loads_and_skips_bad_entry() {
+        let catalog = catalog_from_str(
+            r#"{
+                "entries": [
+                    {"kind":"steam","appid":10},
+                    {"kind":"manual","id":"m1","title":"Manual","target":"C:\\game.exe"},
+                    {"kind":"steam"}
+                ],
+                "last_played_ms": {"steam:10": 99}
+            }"#,
+        );
+        assert_eq!(catalog.entries.len(), 2);
+        assert!(matches!(
+            &catalog.entries[0],
+            GameEntry::Steam { appid: 10 }
+        ));
+        match &catalog.entries[1] {
+            GameEntry::Manual {
+                id,
+                title,
+                target,
+                args,
+                icon,
+            } => {
+                assert_eq!(id, "m1");
+                assert_eq!(title, "Manual");
+                assert_eq!(target, r"C:\game.exe");
+                assert!(args.is_empty());
+                assert!(icon.is_none());
+            }
+            other => panic!("expected manual, got {other:?}"),
+        }
+        assert_eq!(catalog.last_played_ms.get("steam:10"), Some(&99));
     }
 
     #[test]

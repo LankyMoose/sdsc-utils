@@ -9,11 +9,13 @@
 
 use crate::controller::dualsense::battery::LOW_BATTERY_PERCENT;
 use crate::controller::model::{ControllerStatus, PowerState};
+use crate::persist::json;
 use crate::platform::app_log;
 use serde::{Deserialize, Serialize};
+use serde_json::Map;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How many durations to keep per drain/charge step edge.
@@ -49,6 +51,7 @@ pub enum BucketDirection {
 }
 
 /// In-progress time in the current DualSense bucket (not a session).
+/// New persisted fields need `#[serde(default)]` (or the oldest-shape fixture fails).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InProgressBucket {
     pub direction: BucketDirection,
@@ -57,6 +60,7 @@ pub struct InProgressBucket {
 }
 
 /// Last-3 duration samples for one directed percent edge.
+/// New persisted fields need `#[serde(default)]` (or the oldest-shape fixture fails).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepSample {
     pub from_percent: u8,
@@ -65,8 +69,10 @@ pub struct StepSample {
     pub samples_ms: Vec<u64>,
 }
 
+/// New persisted fields need `#[serde(default)]` (or the oldest-shape fixture fails).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct SerialRecord {
+    #[serde(default)]
     last_seen_ms: u64,
     #[serde(default)]
     drain_steps: Vec<StepSample>,
@@ -128,21 +134,26 @@ impl AnalyticsStore {
         let Ok(bytes) = fs::read(&path) else {
             return Self::default();
         };
-        match serde_json::from_slice::<AnalyticsFile>(&bytes) {
-            Ok(file) => Self {
-                by_serial: file.controllers,
-                dirty: false,
-                last_tick_ms: None,
-                connected_at_ms: HashMap::new(),
-                grace_reconciled: std::collections::HashSet::new(),
-            },
-            Err(err) => {
-                app_log::warn(format!(
-                    "failed to parse analytics at {}: {err}; starting empty",
-                    path.display()
-                ));
-                Self::default()
-            }
+        let Some(root) = json::parse_object(&path, &bytes) else {
+            return Self::default();
+        };
+        Self::from_root(&path, root)
+    }
+
+    fn from_root(path: &Path, mut root: Map<String, serde_json::Value>) -> Self {
+        let map = json::take_object(&mut root, "controllers");
+        let source_len = map.len();
+        let (by_serial, skipped) = json::decode_map_values::<SerialRecord>(map);
+        if json::total_loss(path, "analytics controllers", source_len, by_serial.len()) {
+            return Self::default();
+        }
+        json::warn_skipped(path, "analytics controllers", skipped);
+        Self {
+            by_serial,
+            dirty: false,
+            last_tick_ms: None,
+            connected_at_ms: HashMap::new(),
+            grace_reconciled: std::collections::HashSet::new(),
         }
     }
 
@@ -1024,6 +1035,48 @@ mod tests {
             observe_enabled(store, &cur, &cur, t);
         }
         t
+    }
+
+    fn store_from_str(json: &str) -> AnalyticsStore {
+        let serde_json::Value::Object(root) = serde_json::from_str(json).unwrap() else {
+            panic!("expected object");
+        };
+        AnalyticsStore::from_root(Path::new("analytics.json"), root)
+    }
+
+    #[test]
+    fn older_analytics_shape_loads_and_skips_bad_serial() {
+        let store = store_from_str(
+            r#"{
+                "controllers": {
+                    "only_seen": {"last_seen_ms": 42},
+                    "full": {
+                        "last_seen_ms": 100,
+                        "drain_steps": [{"from_percent": 45, "to_percent": 35, "samples_ms": [60000]}],
+                        "in_progress": {"direction": "drain", "percent": 35, "active_ms": 1000}
+                    },
+                    "bad_step": {
+                        "last_seen_ms": 50,
+                        "drain_steps": [1]
+                    },
+                    "no_seen": {}
+                }
+            }"#,
+        );
+        assert_eq!(store.by_serial.len(), 3);
+        assert_eq!(store.by_serial["only_seen"].last_seen_ms, 42);
+        assert!(store.by_serial["only_seen"].drain_steps.is_empty());
+        assert_eq!(store.by_serial["full"].drain_steps.len(), 1);
+        assert_eq!(store.by_serial["full"].drain_steps[0].from_percent, 45);
+        assert_eq!(
+            store.by_serial["full"]
+                .in_progress
+                .as_ref()
+                .map(|p| p.percent),
+            Some(35)
+        );
+        assert_eq!(store.by_serial["no_seen"].last_seen_ms, 0);
+        assert!(!store.by_serial.contains_key("bad_step"));
     }
 
     #[test]
