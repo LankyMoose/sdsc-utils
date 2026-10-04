@@ -2,7 +2,7 @@
 
 use crate::ui::color::BatterySpectrum;
 use crate::ui::percent_ring;
-use crate::ui::shader::AmbientProgram;
+use crate::ui::shader::{AmbientProgram, VignetteProgram};
 use crate::ui::start::mode::{TransitionPhase, dock_panel_width, dock_stage_dim, dock_stage_scale};
 use crate::ui::start::translate::backdrop_art;
 use crate::ui::start::view::{
@@ -238,6 +238,15 @@ fn stage_backdrop_layers<'a>(state: &'a State, now: Instant) -> Vec<Element<'a, 
                 .into(),
         );
     }
+
+    // Soft rectangular edge vignette over atmosphere/splash only — games strip,
+    // dock, footer, settings, and status chips paint above this stack.
+    layers.push(
+        shader(VignetteProgram::new(1.0))
+            .width(Fill)
+            .height(Fill)
+            .into(),
+    );
 
     layers
 }

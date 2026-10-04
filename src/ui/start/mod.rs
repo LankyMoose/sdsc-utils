@@ -22,5 +22,6 @@ pub fn wipe_art_caches() {
     crate::platform::file_icon::clear_all();
     crate::ui::svg_icon::clear_cache();
     crate::ui::shader::ambient::reset_pipeline_diag();
+    crate::ui::shader::vignette::reset_pipeline_diag();
     crate::platform::wgpu_diag::reset();
 }
