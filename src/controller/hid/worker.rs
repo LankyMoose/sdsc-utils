@@ -161,6 +161,8 @@ impl DeviceCache {
     /// Re-enumerate in place (does **not** reconstruct `HidApi`).
     fn refresh_device_list(&mut self) -> Result<(), String> {
         let _op = crate::controller::hid::diag::enter_op("hidapi_refresh");
+        let started = Instant::now();
+        crate::controller::hid::diag::diag_info("hid-diag: hidapi_refresh begin");
         self.api.refresh_devices().map_err(|e| e.to_string())?;
         self.last_enum_at = Some(Instant::now());
         let mut paths: Vec<String> = self
@@ -174,20 +176,17 @@ impl DeviceCache {
         if let Ok(mut guard) = self.presence.lock() {
             *guard = paths;
         }
+        crate::controller::hid::diag::diag_info(format!(
+            "hid-diag: hidapi_refresh end ms={}",
+            started.elapsed().as_millis()
+        ));
         Ok(())
     }
 
     fn enum_due(&self, input_hot: bool) -> bool {
         match self.last_enum_at {
             None => true,
-            Some(at) => {
-                let interval = if self.devices.is_empty() || input_hot {
-                    PRESENCE_INTERVAL_EMPTY
-                } else {
-                    PRESENCE_INTERVAL
-                };
-                at.elapsed() >= interval
-            }
+            Some(at) => at.elapsed() >= presence_enum_interval(self.devices.is_empty(), input_hot),
         }
     }
 
@@ -277,24 +276,38 @@ impl DeviceCache {
 
     /// Ensure every connected DualSense gamepad has a cached handle (USB preferred).
     /// Refreshes the device list only when empty or on the presence cadence.
+    ///
+    /// While input is hot and pads are already open, skip blocking
+    /// `HidApi::refresh_devices()` so a multi-second Windows enum cannot freeze
+    /// the ~4ms sample loop. Presence still refreshes when cold or when no
+    /// handles are open (EMPTY cadence for first connect).
     fn ensure_all_pads(&mut self, input_hot: bool) {
         if self.devices.is_empty() || self.enum_due(input_hot) {
-            if self.refresh_device_list().is_err() {
+            if input_hot && !self.devices.is_empty() {
+                // Defer enum: sample open handles without waiting on refresh.
+                // Advance the cadence clock so we do not re-enter every ~4ms sample.
+                crate::controller::hid::diag::diag_info(format!(
+                    "hid-diag: hidapi_refresh deferred input_hot=1 open={}",
+                    self.devices.len()
+                ));
+                self.last_enum_at = Some(Instant::now());
+            } else if self.refresh_device_list().is_err() {
                 return;
-            }
-            // Drop handles for pads that vanished from the list.
-            let live: std::collections::HashSet<String> = self
-                .api
-                .device_list()
-                .filter(|d| driver::is_gamepad(d))
-                .filter_map(|d| {
-                    d.serial_number()
-                        .filter(|s| !s.is_empty())
-                        .map(normalize_identity)
-                })
-                .collect();
-            if !live.is_empty() {
-                self.devices.retain(|id, _| live.contains(id));
+            } else {
+                // Drop handles for pads that vanished from the list.
+                let live: std::collections::HashSet<String> = self
+                    .api
+                    .device_list()
+                    .filter(|d| driver::is_gamepad(d))
+                    .filter_map(|d| {
+                        d.serial_number()
+                            .filter(|s| !s.is_empty())
+                            .map(normalize_identity)
+                    })
+                    .collect();
+                if !live.is_empty() {
+                    self.devices.retain(|id, _| live.contains(id));
+                }
             }
         }
 
@@ -1016,6 +1029,18 @@ fn publish_snapshot(
     let _ = last_noisy_log;
 }
 
+/// Presence enum cadence: empty list polls often for first connect; once pads are
+/// open, use the normal interval even while input is hot (do not put a 500ms
+/// `refresh_devices` onto the ~4ms sample path).
+fn presence_enum_interval(devices_empty: bool, input_hot: bool) -> Duration {
+    let _ = input_hot;
+    if devices_empty {
+        PRESENCE_INTERVAL_EMPTY
+    } else {
+        PRESENCE_INTERVAL
+    }
+}
+
 /// Sample all cached DualSense pads; open any missing connected pads first.
 fn sample_all_inputs(
     cache: &mut DeviceCache,
@@ -1025,7 +1050,9 @@ fn sample_all_inputs(
     last_noisy_log: &Mutex<Instant>,
     after_cmd: Option<&str>,
 ) {
+    let sample_started = Instant::now();
     cache.ensure_all_pads(input_hot);
+    let after_ensure_ms = sample_started.elapsed().as_millis();
     let serials: Vec<String> = cache.devices.keys().cloned().collect();
     prune_live_pads(live_pads, &serials);
     let cached = serials.len();
@@ -1073,6 +1100,13 @@ fn sample_all_inputs(
         }
     }
     publish_snapshot(snapshot, out, reason, after_cmd, last_noisy_log, input_hot);
+    let sample_ms = sample_started.elapsed().as_millis();
+    if after_ensure_ms >= 50 || sample_ms >= 50 {
+        crate::controller::hid::diag::diag_info(format!(
+            "hid-diag: sample_all ensure_ms={after_ensure_ms} sample_ms={sample_ms} hot={} open={}",
+            input_hot as u8, cached
+        ));
+    }
 }
 
 /// Refresh the snapshot entry for one serial (Identify path).
@@ -2007,5 +2041,14 @@ mod tests {
         let readings = vec![stub_reading("hid:aabbccddeeff")];
         let kept = readings_without_power_off_target(readings, "aa-bb-cc-dd-ee-ff");
         assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn presence_enum_interval_empty_is_fast_open_is_slow() {
+        assert_eq!(presence_enum_interval(true, true), PRESENCE_INTERVAL_EMPTY);
+        assert_eq!(presence_enum_interval(true, false), PRESENCE_INTERVAL_EMPTY);
+        // Hot + open must not use the 500ms EMPTY cadence (hidapi_refresh stall).
+        assert_eq!(presence_enum_interval(false, true), PRESENCE_INTERVAL);
+        assert_eq!(presence_enum_interval(false, false), PRESENCE_INTERVAL);
     }
 }
