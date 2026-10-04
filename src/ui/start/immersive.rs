@@ -35,7 +35,7 @@ const DOCK_ROW_H: f32 = 80.0;
 const DOCK_ROW_GAP: f32 = 8.0;
 /// Reserved trailing width for dock action hints (avoids select flicker).
 const DOCK_HINT_COL_W: f32 = 210.0;
-const MODAL_W: f32 = 640.0;
+const MODAL_W: f32 = crate::ui::start::view::WIDTH;
 
 pub fn veil_view(state: &State, now: Instant) -> Element<'_, StartMessage> {
     let dock = state.dock_progress(now);
@@ -82,12 +82,14 @@ pub fn view<'a>(
     always_immersive: bool,
     promote_gesture: &'a [crate::domain::gesture::GestureControl],
     stage_h: f32,
+    settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
 ) -> Element<'a, StartMessage> {
     let dock_p = state.dock_progress(now);
     let veil = transition_top_veil(state, now);
     let idle_veil = state.idle_dim_amount(now);
+    let settings_p = state.settings.progress(now);
     // Any Float under a veil paints above it — flatten stage scale + hint presses.
-    let flat = veil > 0.001 || idle_veil > 0.001;
+    let flat = veil > 0.001 || idle_veil > 0.001 || settings_p > 0.001;
     // Chrome stays fully lit; one top veil handles enter/exit (no per-panel dims).
     let program = AmbientProgram::new(state.ambient_time, dock_p, 0.0, 1.0);
     let atmosphere = shader(program).width(Fill).height(Fill);
@@ -165,7 +167,15 @@ pub fn view<'a>(
     let base = stack![atmosphere, chrome].width(Fill).height(Fill);
 
     let mut layers: Vec<Element<'_, StartMessage>> = vec![base.into()];
-    // Idle/sleep wash sits under the enter/exit ceremony veil.
+    // Settings above chrome; idle/sleep + ceremony veils paint above the drawer.
+    if state.settings.visible(now) {
+        layers.push(crate::ui::start::settings::immersive_drawer(
+            state,
+            settings_snapshot,
+            settings_p,
+        ));
+    }
+    // Idle/sleep wash sits above settings; ceremony veil stays on top.
     if idle_veil > 0.001 {
         layers.push(
             container(space())

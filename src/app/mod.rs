@@ -700,6 +700,7 @@ impl App {
 
         if Some(window) == self.start_window {
             let stage_h = self.start_monitor_cover.map(|c| c.height).unwrap_or(1080.0);
+            let settings_snapshot = self.start_settings_snapshot();
             let start = start_view::view(
                 &self.start_state,
                 &self.session.prefs.spectrum,
@@ -707,6 +708,7 @@ impl App {
                 self.session.prefs.start_screen_always_immersive,
                 &self.session.prefs.start_screen_gesture,
                 stage_h,
+                &settings_snapshot,
             )
             .map(Message::Start);
             let start = match self.immersive_toast_overlay() {
@@ -1040,19 +1042,43 @@ impl App {
                     return match action {
                         StartKeyAction::Up if pressed => {
                             self.cancel_start_holds();
-                            self.on_start_message(StartMessage::MoveUp)
+                            if self.start_state.settings.open {
+                                self.on_start_settings_nav(Some(NavAction::Up))
+                            } else {
+                                self.on_start_message(StartMessage::MoveUp)
+                            }
                         }
                         StartKeyAction::Down if pressed => {
                             self.cancel_start_holds();
-                            self.on_start_message(StartMessage::MoveDown)
+                            if self.start_state.settings.open {
+                                self.on_start_settings_nav(Some(NavAction::Down))
+                            } else {
+                                self.on_start_message(StartMessage::MoveDown)
+                            }
                         }
-                        StartKeyAction::Left if pressed && self.start_state.immersive => {
+                        StartKeyAction::Left
+                            if pressed
+                                && (self.start_state.immersive
+                                    || self.start_state.settings.open) =>
+                        {
                             self.cancel_start_holds();
-                            self.on_start_message(StartMessage::PrevSlide)
+                            if self.start_state.settings.open {
+                                self.on_start_settings_nav(Some(NavAction::PrevSlide))
+                            } else {
+                                self.on_start_message(StartMessage::PrevSlide)
+                            }
                         }
-                        StartKeyAction::Right if pressed && self.start_state.immersive => {
+                        StartKeyAction::Right
+                            if pressed
+                                && (self.start_state.immersive
+                                    || self.start_state.settings.open) =>
+                        {
                             self.cancel_start_holds();
-                            self.on_start_message(StartMessage::NextSlide)
+                            if self.start_state.settings.open {
+                                self.on_start_settings_nav(Some(NavAction::NextSlide))
+                            } else {
+                                self.on_start_message(StartMessage::NextSlide)
+                            }
                         }
                         StartKeyAction::Confirm => {
                             self.confirm_key_held = pressed;
@@ -1064,7 +1090,11 @@ impl App {
                                 Task::none()
                             } else if !pressed {
                                 self.cancel_start_holds();
-                                self.on_start_message(StartMessage::Confirm)
+                                if self.start_state.settings.open {
+                                    self.on_start_settings_nav(Some(NavAction::Confirm))
+                                } else {
+                                    self.on_start_message(StartMessage::Confirm)
+                                }
                             } else {
                                 Task::none()
                             }
@@ -1842,121 +1872,34 @@ impl App {
                 Task::none()
             }
             ConfigureMessage::SetStartScreenAlwaysImmersive(enabled) => {
-                self.session.prefs.start_screen_always_immersive = enabled;
-                self.session.prefs.save();
-                Task::none()
+                self.apply_start_screen_always_immersive(enabled)
             }
             ConfigureMessage::SetStartScreenInactiveSecs(secs) => {
-                let (inactive, sleep) = clamp_start_screen_idle_timeouts(
-                    secs,
-                    self.session.prefs.start_screen_sleep_secs,
-                );
-                if self.session.prefs.start_screen_inactive_secs != inactive
-                    || self.session.prefs.start_screen_sleep_secs != sleep
-                {
-                    self.session.prefs.start_screen_inactive_secs = inactive;
-                    self.session.prefs.start_screen_sleep_secs = sleep;
-                    self.session.prefs.save();
-                }
-                Task::none()
+                self.apply_start_screen_inactive_secs(secs)
             }
             ConfigureMessage::SetStartScreenSleepSecs(secs) => {
-                let (inactive, sleep) = clamp_start_screen_idle_timeouts(
-                    self.session.prefs.start_screen_inactive_secs,
-                    secs,
-                );
-                if self.session.prefs.start_screen_inactive_secs != inactive
-                    || self.session.prefs.start_screen_sleep_secs != sleep
-                {
-                    self.session.prefs.start_screen_inactive_secs = inactive;
-                    self.session.prefs.start_screen_sleep_secs = sleep;
-                    self.session.prefs.save();
-                }
-                Task::none()
+                self.apply_start_screen_sleep_secs(secs)
             }
             ConfigureMessage::SetStartScreenInactiveDimPercent(percent) => {
-                let percent = clamp_start_screen_inactive_dim_percent(percent);
-                if self.session.prefs.start_screen_inactive_dim_percent != percent {
-                    self.session.prefs.start_screen_inactive_dim_percent = percent;
-                    self.session.prefs.save();
-                }
-                Task::none()
+                self.apply_start_screen_inactive_dim_percent(percent)
             }
             ConfigureMessage::SetStartScreenUsbControllers(enabled) => {
-                if self.session.prefs.start_screen_usb_controllers == enabled {
-                    return Task::none();
-                }
-                self.session.prefs.start_screen_usb_controllers = enabled;
-                self.session.prefs.save();
-                // Prefs flip may CloseStart when USB pads no longer qualify; never opens.
-                // Client mode: service reloads prefs within ~2s and applies the same rule.
-                let ctx = crate::session::ApplyContext {
-                    start_visible: self.start_visible,
-                    fullscreen: start_input::foreground_is_exclusive_fullscreen(),
-                    now: Instant::now(),
-                    lightbar_enabled: lightbar::is_enabled(),
-                };
-                let effects = self.session.reevaluate_start_presence(ctx);
-                self.apply_session_effects(effects)
+                self.apply_start_screen_usb_controllers(enabled)
             }
             ConfigureMessage::SetStartScreenSounds(enabled) => {
-                self.session.prefs.start_screen_sounds_enabled = enabled;
-                self.session.prefs.save();
-                if enabled {
-                    self.play_start_sound(UiSoundKind::Nav);
-                }
-                Task::none()
+                self.apply_start_screen_sounds(enabled)
             }
             ConfigureMessage::SetStartScreenSoundVolume(volume) => {
-                let volume = clamp_start_screen_sound_volume(volume);
-                if self.session.prefs.start_screen_sound_volume != volume {
-                    self.session.prefs.start_screen_sound_volume = volume;
-                    self.session.prefs.save();
-                    if self.session.prefs.start_screen_sounds_enabled {
-                        self.play_start_sound(UiSoundKind::Nav);
-                    }
-                }
-                Task::none()
+                self.apply_start_screen_sound_volume(volume)
             }
             ConfigureMessage::SetStartScreenHaptics(enabled) => {
-                self.session.prefs.start_screen_haptics_enabled = enabled;
-                self.session.prefs.save();
-                if enabled {
-                    self.preview_haptic_all(MotorPulse::NAV);
-                } else if self.client_mode {
-                    let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RumbleStopAll);
-                } else {
-                    if let Some(w) = self.hid_worker.as_ref() {
-                        w.rumble_stop_all();
-                    }
-                }
-                Task::none()
+                self.apply_start_screen_haptics(enabled)
             }
             ConfigureMessage::SetStartScreenHapticsStrength(strength) => {
-                let strength = clamp_start_screen_haptics_strength(strength);
-                if self.session.prefs.start_screen_haptics_strength != strength {
-                    self.session.prefs.start_screen_haptics_strength = strength;
-                    self.session.prefs.save();
-                    if self.session.prefs.start_screen_haptics_enabled {
-                        self.preview_haptic_all(MotorPulse::NAV);
-                    }
-                }
-                Task::none()
+                self.apply_start_screen_haptics_strength(strength)
             }
-            ConfigureMessage::StartGestureRecord => {
-                self.gesture_recorder.start();
-                self.gesture_record_latch.clear();
-                self.gesture_detectors.reset();
-                Task::none()
-            }
-            ConfigureMessage::ResetStartGesture => {
-                self.cancel_gesture_recording();
-                self.session.prefs.start_screen_gesture = gesture::default_gesture();
-                self.session.prefs.save();
-                // Clear detectors so a held default chord cannot reopen immediately.
-                self.gesture_detectors.reset();
-                Task::none()
-            }
+            ConfigureMessage::StartGestureRecord => self.apply_start_gesture_record(),
+            ConfigureMessage::ResetStartGesture => self.apply_reset_start_gesture(),
             ConfigureMessage::CancelGestureRecord => {
                 self.cancel_gesture_recording();
                 Task::none()
@@ -2899,6 +2842,151 @@ impl App {
         self.gesture_record_latch.clear();
     }
 
+    fn start_settings_snapshot(&self) -> crate::ui::start::settings::StartSettingsSnapshot {
+        crate::ui::start::settings::StartSettingsSnapshot {
+            usb_controllers: self.session.prefs.start_screen_usb_controllers,
+            always_immersive: self.session.prefs.start_screen_always_immersive,
+            inactive_secs: self.session.prefs.start_screen_inactive_secs,
+            sleep_secs: self.session.prefs.start_screen_sleep_secs,
+            inactive_dim_percent: self.session.prefs.start_screen_inactive_dim_percent,
+            gesture: self.session.prefs.start_screen_gesture.clone(),
+            gesture_recording: self.gesture_recorder.is_active(),
+            gesture_recording_live: {
+                let peak: Vec<_> = self.gesture_recorder.peak().iter().copied().collect();
+                if peak.is_empty() {
+                    String::new()
+                } else {
+                    gesture::format_gesture(&peak)
+                }
+            },
+            sounds_enabled: self.session.prefs.start_screen_sounds_enabled,
+            sound_volume: self.session.prefs.start_screen_sound_volume,
+            haptics_enabled: self.session.prefs.start_screen_haptics_enabled,
+            haptics_strength: self.session.prefs.start_screen_haptics_strength,
+        }
+    }
+
+    fn apply_start_screen_always_immersive(&mut self, enabled: bool) -> Task<Message> {
+        self.session.prefs.start_screen_always_immersive = enabled;
+        self.session.prefs.save();
+        Task::none()
+    }
+
+    fn apply_start_screen_inactive_secs(&mut self, secs: u32) -> Task<Message> {
+        let (inactive, sleep) =
+            clamp_start_screen_idle_timeouts(secs, self.session.prefs.start_screen_sleep_secs);
+        if self.session.prefs.start_screen_inactive_secs != inactive
+            || self.session.prefs.start_screen_sleep_secs != sleep
+        {
+            self.session.prefs.start_screen_inactive_secs = inactive;
+            self.session.prefs.start_screen_sleep_secs = sleep;
+            self.session.prefs.save();
+        }
+        Task::none()
+    }
+
+    fn apply_start_screen_sleep_secs(&mut self, secs: u32) -> Task<Message> {
+        let (inactive, sleep) =
+            clamp_start_screen_idle_timeouts(self.session.prefs.start_screen_inactive_secs, secs);
+        if self.session.prefs.start_screen_inactive_secs != inactive
+            || self.session.prefs.start_screen_sleep_secs != sleep
+        {
+            self.session.prefs.start_screen_inactive_secs = inactive;
+            self.session.prefs.start_screen_sleep_secs = sleep;
+            self.session.prefs.save();
+        }
+        Task::none()
+    }
+
+    fn apply_start_screen_inactive_dim_percent(&mut self, percent: u8) -> Task<Message> {
+        let percent = clamp_start_screen_inactive_dim_percent(percent);
+        if self.session.prefs.start_screen_inactive_dim_percent != percent {
+            self.session.prefs.start_screen_inactive_dim_percent = percent;
+            self.session.prefs.save();
+        }
+        Task::none()
+    }
+
+    fn apply_start_screen_usb_controllers(&mut self, enabled: bool) -> Task<Message> {
+        if self.session.prefs.start_screen_usb_controllers == enabled {
+            return Task::none();
+        }
+        self.session.prefs.start_screen_usb_controllers = enabled;
+        self.session.prefs.save();
+        // Prefs flip may CloseStart when USB pads no longer qualify; never opens.
+        // Client mode: service reloads prefs within ~2s and applies the same rule.
+        let ctx = crate::session::ApplyContext {
+            start_visible: self.start_visible,
+            fullscreen: start_input::foreground_is_exclusive_fullscreen(),
+            now: Instant::now(),
+            lightbar_enabled: lightbar::is_enabled(),
+        };
+        let effects = self.session.reevaluate_start_presence(ctx);
+        self.apply_session_effects(effects)
+    }
+
+    fn apply_start_screen_sounds(&mut self, enabled: bool) -> Task<Message> {
+        self.session.prefs.start_screen_sounds_enabled = enabled;
+        self.session.prefs.save();
+        if enabled {
+            self.play_start_sound(UiSoundKind::Nav);
+        }
+        Task::none()
+    }
+
+    fn apply_start_screen_sound_volume(&mut self, volume: u8) -> Task<Message> {
+        let volume = clamp_start_screen_sound_volume(volume);
+        if self.session.prefs.start_screen_sound_volume != volume {
+            self.session.prefs.start_screen_sound_volume = volume;
+            self.session.prefs.save();
+            if self.session.prefs.start_screen_sounds_enabled {
+                self.play_start_sound(UiSoundKind::Nav);
+            }
+        }
+        Task::none()
+    }
+
+    fn apply_start_screen_haptics(&mut self, enabled: bool) -> Task<Message> {
+        self.session.prefs.start_screen_haptics_enabled = enabled;
+        self.session.prefs.save();
+        if enabled {
+            self.preview_haptic_all(MotorPulse::NAV);
+        } else if self.client_mode {
+            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RumbleStopAll);
+        } else if let Some(w) = self.hid_worker.as_ref() {
+            w.rumble_stop_all();
+        }
+        Task::none()
+    }
+
+    fn apply_start_screen_haptics_strength(&mut self, strength: u8) -> Task<Message> {
+        let strength = clamp_start_screen_haptics_strength(strength);
+        if self.session.prefs.start_screen_haptics_strength != strength {
+            self.session.prefs.start_screen_haptics_strength = strength;
+            self.session.prefs.save();
+            if self.session.prefs.start_screen_haptics_enabled {
+                self.preview_haptic_all(MotorPulse::NAV);
+            }
+        }
+        Task::none()
+    }
+
+    fn apply_start_gesture_record(&mut self) -> Task<Message> {
+        self.gesture_recorder.start();
+        self.gesture_record_latch.clear();
+        self.gesture_detectors.reset();
+        Task::none()
+    }
+
+    fn apply_reset_start_gesture(&mut self) -> Task<Message> {
+        self.cancel_gesture_recording();
+        self.session.prefs.start_screen_gesture = gesture::default_gesture();
+        self.session.prefs.save();
+        // Clear detectors so a held default chord cannot reopen immediately.
+        self.gesture_detectors.reset();
+        Task::none()
+    }
+
     /// True when HID/UI input sampling should run at the active (~report-rate) rate.
     #[allow(dead_code)] // kept for callers / diagnostics that still want the hot predicate
     fn pad_input_hot(&self) -> bool {
@@ -3462,6 +3550,7 @@ impl App {
         match &message {
             StartMessage::GamesScrolled(..)
             | StartMessage::ControllersScrolled(..)
+            | StartMessage::SettingsScrolled(..)
             | StartMessage::ManualAddTitle(_)
             | StartMessage::ManualAddArgs(_) => {}
             #[cfg(debug_assertions)]
@@ -3572,7 +3661,17 @@ impl App {
             }
             StartMessage::Confirm => self.on_start_confirm(),
             StartMessage::Close => {
-                if self.start_state.manual_add.is_some() {
+                if self.start_state.settings.open {
+                    self.play_start_cue(UiSoundKind::Action);
+                    if self.gesture_recorder.is_active() {
+                        self.cancel_gesture_recording();
+                    }
+                    let now = Instant::now();
+                    if self.start_state.request_settings(false, now) {
+                        crate::controller::hid::diag::diag_info("ui-diag: start settings close");
+                    }
+                    Task::none()
+                } else if self.start_state.manual_add.is_some() {
                     self.play_start_cue(UiSoundKind::Action);
                     self.cancel_manual_add()
                 } else if self.start_state.replace_confirm.take().is_some() {
@@ -3690,6 +3789,10 @@ impl App {
                 self.start_state.set_controllers_scroll(y, viewport_h);
                 Task::none()
             }
+            StartMessage::SettingsScrolled(y, viewport_h) => {
+                self.start_state.settings.set_scroll(y, viewport_h);
+                Task::none()
+            }
             StartMessage::ManualAddTitle(title) => {
                 if let Some(draft) = self.start_state.manual_add.as_mut() {
                     draft.title = title;
@@ -3711,6 +3814,48 @@ impl App {
                     draft.icon_path = None;
                     self.play_start_cue(UiSoundKind::Action);
                 }
+                Task::none()
+            }
+            StartMessage::ToggleSettings => {
+                let now = Instant::now();
+                let open = !self.start_state.settings.open;
+                if self.gesture_recorder.is_active() {
+                    self.cancel_gesture_recording();
+                }
+                if self.start_state.request_settings(open, now) {
+                    self.play_start_cue(UiSoundKind::Action);
+                    crate::controller::hid::diag::diag_info(format!(
+                        "ui-diag: start settings {}",
+                        if open { "open" } else { "close" }
+                    ));
+                    if open {
+                        return self
+                            .scroll_settings_focus_into_view(start_view::ScrollReveal::Either);
+                    }
+                }
+                Task::none()
+            }
+            StartMessage::SetUsbControllers(enabled) => {
+                self.apply_start_screen_usb_controllers(enabled)
+            }
+            StartMessage::SetAlwaysImmersive(enabled) => {
+                self.apply_start_screen_always_immersive(enabled)
+            }
+            StartMessage::SetInactiveSecs(secs) => self.apply_start_screen_inactive_secs(secs),
+            StartMessage::SetSleepSecs(secs) => self.apply_start_screen_sleep_secs(secs),
+            StartMessage::SetInactiveDimPercent(percent) => {
+                self.apply_start_screen_inactive_dim_percent(percent)
+            }
+            StartMessage::SetSounds(enabled) => self.apply_start_screen_sounds(enabled),
+            StartMessage::SetSoundVolume(volume) => self.apply_start_screen_sound_volume(volume),
+            StartMessage::SetHaptics(enabled) => self.apply_start_screen_haptics(enabled),
+            StartMessage::SetHapticsStrength(strength) => {
+                self.apply_start_screen_haptics_strength(strength)
+            }
+            StartMessage::StartGestureRecord => self.apply_start_gesture_record(),
+            StartMessage::ResetStartGesture => self.apply_reset_start_gesture(),
+            StartMessage::CancelGestureRecord => {
+                self.cancel_gesture_recording();
                 Task::none()
             }
             #[cfg(debug_assertions)]
@@ -4216,6 +4361,27 @@ impl App {
         }
 
         if self.gesture_recorder.is_active() {
+            // Start settings: Circle aborts only before a chord is held (Escape/Close also
+            // cancel). Once `peak` is non-empty, Circle may be part of the combo.
+            if self.start_visible
+                && self.start_state.settings.open
+                && self.gesture_recorder.peak().is_empty()
+            {
+                let now = Instant::now();
+                let tick = self
+                    .pad_nav
+                    .tick(&readings, now, false, false, false, false, false, false);
+                self.pad_held = tick.held;
+                self.sync_start_held();
+                if tick.action == Some(NavAction::Cancel) {
+                    self.cancel_gesture_recording();
+                    self.play_start_cue(UiSoundKind::Action);
+                    crate::controller::hid::diag::diag_info(
+                        "ui-diag: start settings gesture record cancel",
+                    );
+                    return Task::none();
+                }
+            }
             return self.on_gesture_record(&readings);
         }
 
@@ -4350,12 +4516,14 @@ impl App {
 
         let replace_confirm = self.start_state.replace_confirm.is_some();
         let manual_add = self.start_state.manual_add.is_some();
-        let allow_nav_move = !animating && !replace_confirm && !manual_add;
+        let settings_open = self.start_state.settings.open;
+        let allow_nav_move = settings_open || (!animating && !replace_confirm && !manual_add);
         let editing = self.start_state.editing;
         // Only when the selected row shows Close game (running target match).
         let hold_cross_close = !editing
             && !replace_confirm
             && !manual_add
+            && !settings_open
             && !animating
             && matches!(self.start_state.slide, StartSlide::Games)
             && self.start_state.running_target.as_ref().is_some_and(|t| {
@@ -4368,14 +4536,15 @@ impl App {
         let hold_triangle_power = !editing
             && !replace_confirm
             && !manual_add
+            && !settings_open
             && !animating
             && matches!(self.start_state.slide, StartSlide::Controllers)
             && self
                 .start_state
                 .selected_controller()
                 .is_some_and(|row| row.show_power_off());
-        // Immersive: left/right slides. Compact: L2/R2 slides (stepper stays vertical-only).
-        let horizontal_nav = self.start_state.immersive;
+        // Immersive: left/right slides. Settings: Left/Right nudge sliders (compact too).
+        let horizontal_nav = self.start_state.immersive || settings_open;
         let tick = self.pad_nav.tick(
             readings,
             now,
@@ -4419,7 +4588,16 @@ impl App {
             .or(tick.triangle_completed_pad.as_ref());
         self.set_haptic_pad_from_id(haptic_pad);
 
-        let nav_task = if animating {
+        let nav_task = if tick.action == Some(NavAction::ToggleSettings) {
+            self.start_state.tick_hint_anims(now);
+            self.on_start_message(StartMessage::ToggleSettings)
+        } else if settings_open {
+            self.start_state.cross_progress = 0.0;
+            self.start_state.triangle_progress = 0.0;
+            self.keyboard_cross_hold.reset();
+            self.start_state.tick_hint_anims(now);
+            self.on_start_settings_nav(tick.action)
+        } else if animating {
             self.start_state.tick_hint_anims(now);
             if let Some(action) = tick.action {
                 match action {
@@ -4517,6 +4695,9 @@ impl App {
                         self.on_start_message(StartMessage::EditManual)
                     }
                     NavAction::Triangle => Task::none(),
+                    NavAction::ToggleSettings => {
+                        self.on_start_message(StartMessage::ToggleSettings)
+                    }
                 }
             } else {
                 Task::none()
@@ -4524,6 +4705,99 @@ impl App {
         };
 
         Task::batch([badge_task, nav_task])
+    }
+
+    fn scroll_settings_focus_into_view(
+        &mut self,
+        direction: start_view::ScrollReveal,
+    ) -> Task<Message> {
+        let snapshot = self.start_settings_snapshot();
+        let immersive = self.start_state.immersive;
+        let Some(y) = self
+            .start_state
+            .settings
+            .focus_scroll_y(&snapshot, immersive, direction)
+        else {
+            return Task::none();
+        };
+        self.start_state.settings.scroll_y = y;
+        operation::scroll_to(
+            crate::ui::start::settings::settings_scroll_id(),
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
+        )
+    }
+
+    fn on_start_settings_nav(&mut self, action: Option<NavAction>) -> Task<Message> {
+        let Some(action) = action else {
+            return Task::none();
+        };
+        let snapshot = self.start_settings_snapshot();
+        self.start_state.settings.clamp_focus(&snapshot);
+        match action {
+            NavAction::Up => {
+                let before = self.start_state.settings.focus;
+                if self.start_state.settings.move_focus(-1, &snapshot) {
+                    self.play_start_cue(UiSoundKind::Nav);
+                    let after = self.start_state.settings.focus;
+                    crate::controller::hid::diag::diag_info(format!(
+                        "ui-diag: start settings focus={after}"
+                    ));
+                    let dir = crate::ui::start::settings::reveal_for_focus_step(before, after, -1);
+                    return self.scroll_settings_focus_into_view(dir);
+                }
+                Task::none()
+            }
+            NavAction::Down => {
+                let before = self.start_state.settings.focus;
+                if self.start_state.settings.move_focus(1, &snapshot) {
+                    self.play_start_cue(UiSoundKind::Nav);
+                    let after = self.start_state.settings.focus;
+                    crate::controller::hid::diag::diag_info(format!(
+                        "ui-diag: start settings focus={after}"
+                    ));
+                    let dir = crate::ui::start::settings::reveal_for_focus_step(before, after, 1);
+                    return self.scroll_settings_focus_into_view(dir);
+                }
+                Task::none()
+            }
+            NavAction::PrevSlide | NavAction::NextSlide => {
+                let delta = if matches!(action, NavAction::PrevSlide) {
+                    -1
+                } else {
+                    1
+                };
+                let Some(row) = self.start_state.settings.focused_row(&snapshot) else {
+                    return Task::none();
+                };
+                if let Some(msg) = crate::ui::start::settings::nudge_message(row, &snapshot, delta)
+                {
+                    self.play_start_cue(UiSoundKind::Nav);
+                    return self.on_start_message(msg);
+                }
+                Task::none()
+            }
+            NavAction::Confirm => {
+                let Some(row) = self.start_state.settings.focused_row(&snapshot) else {
+                    return Task::none();
+                };
+                if let Some(msg) = crate::ui::start::settings::confirm_message(row, &snapshot) {
+                    self.play_start_cue(UiSoundKind::Action);
+                    let task = self.on_start_message(msg);
+                    let snap = self.start_settings_snapshot();
+                    self.start_state.settings.clamp_focus(&snap);
+                    return task;
+                }
+                // Slider rows: Cross does nothing (use Left/Right).
+                Task::none()
+            }
+            NavAction::Cancel | NavAction::ToggleSettings => {
+                self.on_start_message(StartMessage::Close)
+            }
+            _ => Task::none(),
+        }
     }
 
     fn on_gesture_record(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {

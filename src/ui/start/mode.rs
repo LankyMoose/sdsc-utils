@@ -29,7 +29,7 @@ pub enum StartTransition {
 /// Choreographed phases around the hard HWND resize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionPhase {
-    /// Compact chrome fading out; still 640×500.
+    /// Compact chrome fading out; still compact HWND size.
     ExitCompact,
     /// Veil only while HWND resizes (matches [`StartTransition`]).
     Resizing,
