@@ -2601,6 +2601,8 @@ impl App {
                 height: 1080.0,
             });
             self.start_monitor_cover = Some(cover);
+            // Cached splash must not paint at opacity 1 then restart the fade.
+            self.start_state.prime_backdrop_for_enter(Instant::now());
             crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
             (cover.size(), window::Position::Specific(cover.origin()))
         } else {
@@ -2780,8 +2782,8 @@ impl App {
         let now = Instant::now();
         if immersive {
             // Keep ambient_time; open aperture + chrome.
-            // Re-arm backdrop to the live selection — compact nav leaves a stale key.
-            self.start_state.reset_backdrop_fade();
+            // Prime (not reset): no prior splash to crossfade; avoid blink on cached art.
+            self.start_state.prime_backdrop_for_enter(now);
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: start immersive settle promote backdrop re-arm sel={}",
                 self.start_state.game_selected
