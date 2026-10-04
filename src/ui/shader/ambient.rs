@@ -8,6 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static PIPELINE_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// Reset one-shot pipeline diag (process Exit) so the next run logs again.
+pub fn reset_pipeline_diag() {
+    PIPELINE_LOGGED.store(false, Ordering::Relaxed);
+}
+
 /// CPU-side uniforms (must match [`ambient.wgsl`] layout / alignment).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]

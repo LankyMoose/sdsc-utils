@@ -31,6 +31,13 @@ pub fn note_toast_remount() {
     LAST_TOAST_REMOUNT_MS.store(epoch_ms(), Ordering::Relaxed);
 }
 
+/// Clear lifecycle stamps (process Exit).
+pub fn reset() {
+    LAST_START_OPEN_MS.store(0, Ordering::Relaxed);
+    LAST_TOAST_HIDE_MS.store(0, Ordering::Relaxed);
+    LAST_TOAST_REMOUNT_MS.store(0, Ordering::Relaxed);
+}
+
 /// One-line snapshot for panic / diag correlation.
 pub fn context_line() -> String {
     let now = epoch_ms();

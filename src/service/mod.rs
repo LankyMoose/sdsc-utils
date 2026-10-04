@@ -171,7 +171,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 LoopControl::Quit
             ) {
                 let _ = pipe.send(ServiceMessage::Shutdown);
-                let _ = shell.kill();
+                stop_shell_graceful(&mut shell);
                 start_input::clear_service_edge_sender();
                 hid_worker.shutdown();
                 return Ok(());
@@ -198,7 +198,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 TrayServiceEvent::Quit => {
                     let _ = pipe.send(ServiceMessage::Shutdown);
-                    let _ = shell.kill();
+                    stop_shell_graceful(&mut shell);
                     start_input::clear_service_edge_sender();
                     hid_worker.shutdown();
                     return Ok(());
@@ -552,6 +552,36 @@ fn dispatch_effects(
         .collect();
     if !ui_effects.is_empty() {
         let _ = pipe.send(ServiceMessage::Effects(ui_effects));
+    }
+}
+
+/// Let the shell run `Message::Exit` (art wipe + join) before we force-kill.
+fn stop_shell_graceful(shell: &mut Child) {
+    const GRACE_MS: u64 = 2500;
+    const STEP_MS: u64 = 25;
+    let deadline = Instant::now() + Duration::from_millis(GRACE_MS);
+    loop {
+        match shell.try_wait() {
+            Ok(Some(status)) => {
+                app_log::info(format!("service: shell exited gracefully status={status}"));
+                return;
+            }
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(STEP_MS));
+            }
+            Ok(None) => {
+                app_log::warn("service: shell Exit timed out; killing");
+                let _ = shell.kill();
+                let _ = shell.wait();
+                return;
+            }
+            Err(err) => {
+                app_log::warn(format!("service: shell try_wait failed: {err}; killing"));
+                let _ = shell.kill();
+                let _ = shell.wait();
+                return;
+            }
+        }
     }
 }
 

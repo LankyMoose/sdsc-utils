@@ -47,6 +47,8 @@ pub const EXIT_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
 /// EnterImmersive top-veil lift (ease-in-out); matches splash length so one ceremony covers both.
 pub const ENTER_REVEAL_MS: u64 = 450;
 pub const ENTER_IMMERSIVE_MS: u64 = ENTER_REVEAL_MS;
+/// Max time to hold a solid enter veil waiting for selected splash + strip heroes.
+pub const ENTER_ART_HOLD_MAX_MS: u64 = 3000;
 /// Cap per StartFrame so a UI stall cannot skip the start of the enter curve.
 pub const ENTER_REVEAL_MAX_FRAME_MS: u64 = 32;
 /// Legacy grow-segment fraction (unused by the single top-veil enter path).
