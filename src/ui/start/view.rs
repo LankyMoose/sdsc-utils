@@ -327,7 +327,7 @@ fn steam_icon_source(game: &SteamGame) -> Option<IconSource> {
 fn steam_icon(game: &SteamGame) -> Option<StartIcon> {
     game.icon_path
         .as_ref()
-        .and_then(|p| icon_cache::handle_for_path(p))
+        .and_then(|p| icon_cache::icon_cached(p))
         .map(StartIcon)
 }
 
@@ -344,26 +344,31 @@ fn manual_icon_source(target: &str, custom: Option<&str>) -> Option<IconSource> 
     Some(IconSource::Shell(PathBuf::from(target)))
 }
 
+/// Peek-only list icon — never decodes on the UI thread.
 fn manual_icon(target: &str, custom: Option<&str>) -> Option<StartIcon> {
     if let Some(path) = custom.filter(|p| !p.is_empty()) {
         let path = PathBuf::from(path);
         if path.is_file()
-            && let Some(handle) = icon_cache::handle_for_path_warn(&path)
+            && let Some(handle) = icon_cache::icon_cached(&path)
         {
             return Some(StartIcon(handle));
         }
-        // Fall through to shell icon when the custom image fails to decode.
+        // Fall through to shell icon when the custom image is cold / missing.
     }
     if target.starts_with("steam://") {
         return None;
     }
     let path = PathBuf::from(target);
-    icon_cache::handle_for_shell(&path).map(StartIcon)
+    icon_cache::icon_shell_cached(&path).map(StartIcon)
 }
 
 /// Probe whether a target path yields a shell icon (for the add-manual modal).
 pub fn probe_shell_icon(target: &str) -> Option<StartIcon> {
-    manual_icon(target, None)
+    if target.starts_with("steam://") {
+        return None;
+    }
+    let path = PathBuf::from(target);
+    icon_cache::handle_for_shell(&path).map(StartIcon)
 }
 
 /// Controller row for the Controllers slide (live or remembered disconnected).
@@ -1072,6 +1077,21 @@ impl State {
             .iter()
             .find(|r| r.play_key == play_key)
             .and_then(|r| r.backdrop_icon())
+    }
+
+    /// Selected-row art to decode first on cold start.
+    /// Returns `(hero_file, hero_shell, backdrop)`.
+    pub fn immersive_priority_paths(&self) -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
+        if self.rows.is_empty() {
+            return (None, None, None);
+        }
+        let row = &self.rows[self.game_selected.min(self.rows.len() - 1)];
+        let (hero, shell) = match &row.icon_source {
+            Some(IconSource::File(path)) => (Some(path.clone()), None),
+            Some(IconSource::Shell(path)) => (None, Some(path.clone())),
+            None => (None, None),
+        };
+        (hero, shell, row.backdrop_path.clone())
     }
 
     /// Paths to warm for the current immersive selection window.
@@ -3149,6 +3169,80 @@ mod tests {
         let y = scroll_y_center(1, 20, ROW_HEIGHT, gap, 0.0, 300.0, true).unwrap();
         let expected = (1.0_f32 * stride - (300.0 - ROW_HEIGHT) / 2.0).max(0.0);
         assert!((y - expected).abs() < 0.1);
+    }
+
+    #[test]
+    fn immersive_priority_paths_are_selected_row_only() {
+        let hero0 = PathBuf::from("hero0.png");
+        let hero1 = PathBuf::from("hero1.png");
+        let hero2 = PathBuf::from("hero2.png");
+        let bd0 = PathBuf::from("bd0.png");
+        let bd1 = PathBuf::from("bd1.png");
+        let mut state = State {
+            rows: vec![
+                StartRow {
+                    title: "g0".into(),
+                    subtitle: None,
+                    target: "t0".into(),
+                    args: String::new(),
+                    play_key: "k0".into(),
+                    icon: None,
+                    icon_source: Some(IconSource::File(hero0.clone())),
+                    backdrop_path: Some(bd0.clone()),
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                },
+                StartRow {
+                    title: "g1".into(),
+                    subtitle: None,
+                    target: "t1".into(),
+                    args: String::new(),
+                    play_key: "k1".into(),
+                    icon: None,
+                    icon_source: Some(IconSource::File(hero1.clone())),
+                    backdrop_path: Some(bd1.clone()),
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                },
+                StartRow {
+                    title: "g2".into(),
+                    subtitle: None,
+                    target: "t2".into(),
+                    args: String::new(),
+                    play_key: "k2".into(),
+                    icon: None,
+                    icon_source: Some(IconSource::File(hero2.clone())),
+                    backdrop_path: None,
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                },
+            ],
+            game_selected: 0,
+            ..Default::default()
+        };
+
+        let (hero, shell, backdrop) = state.immersive_priority_paths();
+        assert_eq!(hero.as_deref(), Some(hero0.as_path()));
+        assert!(shell.is_none());
+        assert_eq!(backdrop.as_deref(), Some(bd0.as_path()));
+
+        let (warm_heroes, warm_shells, warm_backdrops) = state.immersive_warm_paths();
+        assert!(warm_shells.is_empty());
+        // Neighbors include the selected path; priority decode runs first so the
+        // rest job may hit a cache — selected must not be the sole warm entry.
+        assert!(warm_heroes.contains(&hero0));
+        assert!(warm_heroes.contains(&hero1));
+        assert!(warm_backdrops.contains(&bd0));
+        assert!(warm_backdrops.contains(&bd1));
+
+        state.game_selected = 1;
+        let (hero, shell, backdrop) = state.immersive_priority_paths();
+        assert_eq!(hero.as_deref(), Some(hero1.as_path()));
+        assert!(shell.is_none());
+        assert_eq!(backdrop.as_deref(), Some(bd1.as_path()));
     }
 
     #[test]

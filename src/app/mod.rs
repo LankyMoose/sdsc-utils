@@ -820,6 +820,9 @@ impl App {
             }
             Message::StartImmersiveSettled => self.finish_start_immersive_transition(),
             Message::ImmersiveArtReady => {
+                // Compact list icons snapshot at row build; refresh so newly decoded
+                // handles appear. Immersive hero/backdrop peeks stay live per frame.
+                self.refresh_start_rows();
                 let now = Instant::now();
                 if self.start_state.immersive {
                     if self
@@ -2406,16 +2409,10 @@ impl App {
     }
 
     fn refresh_steam_library(&self) -> Task<Message> {
-        // List icons only here — full immersive prepare must not block SteamScanDone
-        // (compact stayed on skeletons until every hero/backdrop decoded).
+        // Metadata only — list / immersive art decode runs after SteamScanDone so the
+        // selected game can paint before the rest of the library is warm.
         Task::perform(
-            spawn_blocking(|| {
-                let games = steam::list_installed_games()?;
-                crate::ui::start::icon_cache::prepare_paths(
-                    games.iter().filter_map(|g| g.icon_path.as_deref()),
-                );
-                Ok::<_, String>(games)
-            }),
+            spawn_blocking(steam::list_installed_games),
             |result| match result {
                 Ok(Ok(games)) => Message::SteamScanDone(Ok(games)),
                 Ok(Err(err)) => Message::SteamScanDone(Err(err)),
@@ -2439,39 +2436,118 @@ impl App {
         self.steam_scan_pending = false;
         self.match_path_cache.clear();
         self.refresh_start_rows();
-        let mut task = self.prepare_immersive_library_task();
-        if self.start_visible && self.start_state.immersive {
-            task = task.chain(self.warm_immersive_art_task());
-        }
-        task
+        self.prepare_immersive_library_task()
     }
 
-    /// Offline warm of library hero/backdrop tiers after scan (does not block skeletons).
+    /// Priority-decode the selected game, then warm the rest of the library off-thread.
     fn prepare_immersive_library_task(&self) -> Task<Message> {
-        let heroes: Vec<_> = self
-            .steam_by_id
-            .values()
-            .filter_map(|g| g.icon_path.clone())
-            .collect();
-        let backdrops: Vec<_> = self
-            .steam_by_id
-            .values()
-            .filter_map(|g| g.backdrop_path.clone())
-            .collect();
-        if heroes.is_empty() && backdrops.is_empty() {
+        let (priority_hero, priority_shell, priority_backdrop) =
+            self.start_state.immersive_priority_paths();
+        let (neighbor_heroes, neighbor_shells, neighbor_backdrops) =
+            self.start_state.immersive_warm_paths();
+
+        let mut list_files = Vec::new();
+        let mut list_shells = Vec::new();
+        let mut all_heroes = Vec::new();
+        let mut all_hero_shells = Vec::new();
+        let mut all_backdrops = Vec::new();
+        for row in &self.start_state.rows {
+            match &row.icon_source {
+                Some(start_view::IconSource::File(path)) => {
+                    list_files.push(path.clone());
+                    all_heroes.push(path.clone());
+                }
+                Some(start_view::IconSource::Shell(path)) => {
+                    list_shells.push(path.clone());
+                    all_hero_shells.push(path.clone());
+                }
+                None => {}
+            }
+            if let Some(path) = row.backdrop_path.clone() {
+                all_backdrops.push(path);
+            }
+        }
+
+        let has_priority =
+            priority_hero.is_some() || priority_shell.is_some() || priority_backdrop.is_some();
+        let has_rest = !list_files.is_empty()
+            || !list_shells.is_empty()
+            || !all_heroes.is_empty()
+            || !all_hero_shells.is_empty()
+            || !all_backdrops.is_empty()
+            || !neighbor_heroes.is_empty()
+            || !neighbor_shells.is_empty()
+            || !neighbor_backdrops.is_empty();
+        if !has_priority && !has_rest {
             return Task::none();
         }
-        crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: immersive art library prepare begin heroes={} backdrops={}",
-            heroes.len(),
-            backdrops.len()
-        ));
-        Task::perform(
+
+        let play_key = self
+            .start_state
+            .rows
+            .get(self.start_state.game_selected)
+            .map(|r| r.play_key.clone())
+            .unwrap_or_default();
+
+        let rest = Task::perform(
             spawn_blocking(move || {
-                crate::ui::start::icon_cache::prepare_immersive(&heroes, &backdrops);
+                // Neighbors first (strip + adjacent backdrops), then the rest of the library.
+                crate::ui::start::icon_cache::warm_immersive_paths(
+                    &neighbor_heroes,
+                    &neighbor_backdrops,
+                );
+                for path in &neighbor_shells {
+                    let _ = crate::ui::start::icon_cache::hero_for_shell(path);
+                }
+                crate::ui::start::icon_cache::prepare_paths(&list_files);
+                for path in &list_shells {
+                    let _ = crate::ui::start::icon_cache::handle_for_shell(path);
+                }
+                crate::ui::start::icon_cache::prepare_immersive(&all_heroes, &all_backdrops);
+                for path in &all_hero_shells {
+                    let _ = crate::ui::start::icon_cache::hero_for_shell(path);
+                }
             }),
             |_| Message::ImmersiveArtReady,
-        )
+        );
+
+        if !has_priority {
+            return rest;
+        }
+
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: immersive art priority begin key={play_key} hero={} shell={} backdrop={}",
+            u8::from(priority_hero.is_some()),
+            u8::from(priority_shell.is_some()),
+            u8::from(priority_backdrop.is_some())
+        ));
+
+        let priority = Task::perform(
+            spawn_blocking(move || {
+                if let Some(path) = priority_hero.as_ref() {
+                    let _ = crate::ui::start::icon_cache::hero_for_path(path);
+                    // List-tier icon for compact / hero fallback.
+                    let _ = crate::ui::start::icon_cache::handle_for_path(path);
+                }
+                if let Some(path) = priority_shell.as_ref() {
+                    let _ = crate::ui::start::icon_cache::hero_for_shell(path);
+                    let _ = crate::ui::start::icon_cache::handle_for_shell(path);
+                }
+                if let Some(path) = priority_backdrop.as_ref() {
+                    let _ = crate::ui::start::icon_cache::backdrop_for_path(path);
+                }
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: immersive art priority ready key={play_key}"
+                ));
+            }),
+            |_| Message::ImmersiveArtReady,
+        );
+
+        if has_rest {
+            priority.chain(rest)
+        } else {
+            priority
+        }
     }
 
     fn on_manual_file_picked(&mut self, path: Option<PathBuf>) -> Task<Message> {
