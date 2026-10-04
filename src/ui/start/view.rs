@@ -972,6 +972,31 @@ impl State {
         self.backdrop_outgoing = None;
     }
 
+    /// Arm backdrop for immersive enter with no prior splash on screen.
+    ///
+    /// Always fades in from zero. Priming before the first paint avoids the
+    /// `backdrop_current = None` full-opacity fallback, so a later
+    /// [`Self::note_backdrop_ready`] cannot blink through opaque → zero.
+    pub fn prime_backdrop_for_enter(&mut self, now: Instant) {
+        self.backdrop_outgoing = None;
+        let Some(row) = self.rows.get(self.game_selected) else {
+            self.backdrop_current = None;
+            return;
+        };
+        let key = row.play_key.clone();
+        if row.backdrop_icon().is_some() {
+            self.backdrop_current = Some((key.clone(), Some(now)));
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: backdrop enter prime key={key} mode=fade"
+            ));
+        } else {
+            self.backdrop_current = Some((key.clone(), None));
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: backdrop enter prime key={key} mode=waiting"
+            ));
+        }
+    }
+
     /// Start backdrop land/crossfade once peek art exists for a waiting selection.
     pub fn note_backdrop_ready(&mut self, now: Instant) {
         let Some(row) = self.rows.get(self.game_selected) else {
@@ -988,6 +1013,8 @@ impl State {
                 *started = Some(now);
             }
         } else if !armed {
+            // Missing/stale key: start a fade. Do not restart when already armed
+            // (enter prime / in-flight land) — that was the cached-splash blink.
             let was = self
                 .backdrop_current
                 .as_ref()
@@ -3164,5 +3191,120 @@ mod tests {
             anim.duration_ms,
             crate::ui::start::vstrip::STRIP_ANIM_CATCHUP_MS
         );
+    }
+
+    fn write_tiny_png(path: &std::path::Path) {
+        let mut enc = png::Encoder::new(std::fs::File::create(path).unwrap(), 2, 2);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().unwrap();
+        writer
+            .write_image_data(&[
+                255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+            ])
+            .unwrap();
+    }
+
+    fn state_with_backdrop(path: PathBuf) -> State {
+        State {
+            rows: vec![StartRow {
+                title: "g0".into(),
+                subtitle: None,
+                target: "t0".into(),
+                args: String::new(),
+                play_key: "k0".into(),
+                icon: None,
+                icon_source: None,
+                backdrop_path: Some(path),
+                edit: None,
+                skeleton: false,
+                update_required: false,
+            }],
+            game_selected: 0,
+            immersive: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prime_backdrop_cached_fades_from_zero_without_restart() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sdsc-backdrop-prime-cached-{n}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bd.png");
+        write_tiny_png(&path);
+        assert!(icon_cache::backdrop_for_path(&path).is_some());
+
+        let mut state = state_with_backdrop(path);
+        let now = Instant::now();
+        state.prime_backdrop_for_enter(now);
+        let (opacity, _, _, _) = state
+            .backdrop_incoming_visual(now)
+            .expect("cached enter paints");
+        assert!(opacity < 0.05);
+
+        let mid = now + Duration::from_millis(crate::ui::start::mode::ART_FADE_MS / 2);
+        let (mid_opacity, _, _, _) = state.backdrop_incoming_visual(mid).expect("mid fade");
+        assert!(mid_opacity > 0.4 && mid_opacity < 1.0);
+
+        // Late ImmersiveArtReady must not restart the fade from zero.
+        state.note_backdrop_ready(mid + Duration::from_millis(16));
+        let (opacity, _, _, _) = state
+            .backdrop_incoming_visual(mid + Duration::from_millis(16))
+            .expect("still paints");
+        assert!(opacity >= mid_opacity - 0.01);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prime_backdrop_uncached_waits_then_fades_from_zero() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sdsc-backdrop-prime-cold-{n}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bd.png");
+        write_tiny_png(&path);
+        assert!(icon_cache::backdrop_cached(&path).is_none());
+
+        let mut state = state_with_backdrop(path.clone());
+        let now = Instant::now();
+        state.prime_backdrop_for_enter(now);
+        assert!(state.backdrop_incoming_visual(now).is_none());
+
+        assert!(icon_cache::backdrop_for_path(&path).is_some());
+        state.note_backdrop_ready(now);
+        let (opacity, _, _, _) = state
+            .backdrop_incoming_visual(now)
+            .expect("fade starts once ready");
+        assert!(opacity < 0.05);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn note_backdrop_ready_missing_state_fades_cached() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sdsc-backdrop-ready-miss-{n}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bd.png");
+        write_tiny_png(&path);
+        assert!(icon_cache::backdrop_for_path(&path).is_some());
+
+        let mut state = state_with_backdrop(path);
+        let now = Instant::now();
+        assert!(state.backdrop_current.is_none());
+        state.note_backdrop_ready(now);
+        let (opacity, _, _, _) = state
+            .backdrop_incoming_visual(now)
+            .expect("missing+cached starts fade");
+        assert!(opacity < 0.05);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
