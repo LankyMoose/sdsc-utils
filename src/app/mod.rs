@@ -318,6 +318,8 @@ pub struct App {
     /// Hold toast show until immersive Start can host the composite (0→1 Connected).
     /// True until the first Start HWND of this process finishes its cold-load ceremony.
     start_cold_load_remaining: bool,
+    /// Compact Steam settle fired during promote ceremony — kick after EnterImmersive.
+    steam_scan_deferred_for_promote: bool,
     defer_toast_for_immersive_start: bool,
 
     /// Bumped on every spectrum edit; stale SpectrumCommit messages are ignored.
@@ -498,6 +500,7 @@ impl App {
             toast_anim_started: Instant::now(),
             toast_machine: toast_machine::State::Idle,
             start_cold_load_remaining: true,
+            steam_scan_deferred_for_promote: false,
             defer_toast_for_immersive_start: false,
             spectrum_generation: 0,
             #[cfg(feature = "dev-emulate")]
@@ -2685,9 +2688,28 @@ impl App {
     /// Kick the first live Steam scan/refresh this process. Idempotent.
     fn maybe_kick_deferred_steam_scan(&mut self) -> Task<Message> {
         if self.steam_library_refreshed || self.steam_scan_started.is_some() {
+            self.steam_scan_deferred_for_promote = false;
             return Task::none();
         }
+        if self.immersive_transition_busy() {
+            self.steam_scan_deferred_for_promote = true;
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: steam scan defer during promote ceremony",
+            );
+            return Task::none();
+        }
+        self.steam_scan_deferred_for_promote = false;
         self.refresh_steam_library()
+    }
+
+    /// Drain a Steam kick that was deferred across promote ExitCompact→EnterImmersive.
+    fn flush_deferred_steam_scan_after_promote(&mut self) -> Task<Message> {
+        if !self.steam_scan_deferred_for_promote {
+            return Task::none();
+        }
+        self.steam_scan_deferred_for_promote = false;
+        crate::controller::hid::diag::diag_info("ui-diag: steam scan flush after promote enter");
+        self.maybe_kick_deferred_steam_scan()
     }
 
     fn on_steam_scan_done(&mut self, result: Result<Vec<SteamGame>, String>) -> Task<Message> {
@@ -2757,11 +2779,16 @@ impl App {
 
     /// Post a single-flight art job for the current selection (cheap; no Task spawn).
     fn request_start_art(&mut self) {
+        self.request_start_art_circular(self.start_state.immersive);
+    }
+
+    /// Like [`Self::request_start_art`] with an explicit circular/linear near window.
+    fn request_start_art_circular(&mut self, circular: bool) {
         let generation = crate::ui::start::icon_cache::bump_art_warm_generation();
         let (selected_hero, selected_shell, selected_backdrop) =
             self.start_state.immersive_priority_paths();
-        let near = self.start_state.art_near_set();
-        let prefetch = self.start_state.art_retain_set();
+        let near = self.start_state.art_near_set_circular(circular);
+        let prefetch = self.start_state.art_retain_set_circular(circular);
         self.start_state.art_awaiting_paint = true;
         crate::ui::start::art_worker::submit(crate::ui::start::art_worker::ArtJob {
             generation,
@@ -2773,12 +2800,33 @@ impl App {
         });
     }
 
+    /// Pre-warm immersive (circular) art under ExitCompact blackout.
+    fn prewarm_immersive_art_for_promote(&mut self) {
+        crate::controller::hid::diag::diag_info(
+            "ui-diag: art warm promote prewarm (exit_compact circular)",
+        );
+        self.request_start_art_circular(true);
+    }
+
     fn warm_start_art_task(&mut self) -> Task<Message> {
         self.request_start_art();
         Task::none()
     }
 
+    /// After promote settle: skip gen bump when selection art is ready or still decoding.
     fn warm_immersive_art_task(&mut self) -> Task<Message> {
+        if self.start_state.enter_art_sync_ready() {
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: art warm skip (promote settle already sync)",
+            );
+            return Task::none();
+        }
+        if self.start_state.art_awaiting_paint {
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: art warm skip (promote settle in flight)",
+            );
+            return Task::none();
+        }
         self.request_start_art();
         Task::none()
     }
@@ -3006,6 +3054,8 @@ impl App {
         crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
         self.start_state
             .begin_transition_phase(start_mode::TransitionPhase::ExitCompact, Instant::now());
+        // Decode under ExitCompact blackout so settle is more often a warm hit.
+        self.prewarm_immersive_art_for_promote();
         steam
     }
 
@@ -3048,7 +3098,7 @@ impl App {
                     "ui-diag: start immersive transition phase={} done",
                     phase.label()
                 ));
-                None
+                Some(self.flush_deferred_steam_scan_after_promote())
             }
             start_mode::TransitionPhase::EnterCompact => {
                 self.start_state.clear_transition_phase();
@@ -3119,13 +3169,14 @@ impl App {
         let now = Instant::now();
         if immersive {
             // Keep ambient_time; open aperture + chrome.
-            // Phase + arm before prime so splash holds under the veil, then fades after.
+            // Lift onto ambient+dock immediately (cold-style); list stays hidden until art sync.
             self.start_state
                 .begin_transition_phase(start_mode::TransitionPhase::EnterImmersive, now);
             self.start_state.prime_backdrop_for_enter(now);
+            self.start_state.arm_enter_reveal(now);
             if !self.start_state.try_arm_enter_reveal_when_art_ready(now) {
                 crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: start immersive enter art hold (promote) steam_scan={}",
+                    "ui-diag: start immersive enter art hold (promote) steam_scan={} list_hidden=1",
                     u8::from(self.steam_scan_pending)
                 ));
             }

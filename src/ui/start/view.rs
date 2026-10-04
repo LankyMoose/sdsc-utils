@@ -614,6 +614,8 @@ pub struct State {
     chrome_status_batch_exit_at: Option<Instant>,
     /// Immersive cold: when the games strip began fading in (`None` = still hidden).
     games_list_reveal_at: Option<Instant>,
+    /// When EnterImmersive began waiting for list reveal (art hold / promote).
+    enter_list_hold_started: Option<Instant>,
     /// Art is ready but splash reveal is held until the enter veil clears.
     splash_reveal_pending: bool,
     /// Pending reveal should snap opaque (cached) rather than ambient-fade.
@@ -713,6 +715,7 @@ impl Default for State {
             chrome_status_all_success_at: None,
             chrome_status_batch_exit_at: None,
             games_list_reveal_at: None,
+            enter_list_hold_started: None,
             splash_reveal_pending: false,
             splash_reveal_cached: false,
             enter_splash_fade: false,
@@ -1186,6 +1189,9 @@ impl State {
                 armed: false,
                 last_tick: None,
             });
+            // Hide strip until art sync / timeout begins the list reveal (cold + promote).
+            self.games_list_reveal_at = None;
+            self.enter_list_hold_started = Some(now);
             self.splash_reveal_pending = false;
             self.splash_reveal_cached = false;
             self.enter_splash_fade = false;
@@ -1237,6 +1243,7 @@ impl State {
         self.cold_load_active = true;
         self.cold_ambient_started = None;
         self.games_list_reveal_at = None;
+        self.enter_list_hold_started = None;
         crate::controller::hid::diag::diag_info("ui-diag: start cold load begin");
     }
 
@@ -1532,14 +1539,15 @@ impl State {
             .or_else(|| visuals.first().copied())
     }
 
-    /// Opacity of the immersive games strip (0 = hidden during cold, 1 = fully shown).
+    /// Opacity of the immersive games strip (0 = hidden until list reveal, 1 = fully shown).
     pub fn games_list_opacity(&self, now: Instant) -> f32 {
         use crate::ui::start::mode::{GAMES_LIST_FADE_MS, phase_progress};
         if !self.immersive {
             return 1.0;
         }
         let Some(started) = self.games_list_reveal_at else {
-            return if self.cold_load_active { 0.0 } else { 1.0 };
+            // Cold + promote EnterImmersive: strip stays hidden until art sync / timeout.
+            return 0.0;
         };
         let elapsed = now.saturating_duration_since(started).as_millis() as u64;
         phase_progress(elapsed, GAMES_LIST_FADE_MS)
@@ -1549,6 +1557,7 @@ impl State {
     pub fn begin_games_list_reveal(&mut self, now: Instant) {
         if self.games_list_reveal_at.is_none() {
             self.games_list_reveal_at = Some(now);
+            self.enter_list_hold_started = None;
             crate::controller::hid::diag::diag_info("ui-diag: start games list reveal begin");
             if self.chrome_status_has_kind(ChromeStatusKind::PreparingArt) {
                 self.note_chrome_status_success(ChromeStatusKind::PreparingArt, now);
@@ -1594,22 +1603,29 @@ impl State {
 
     /// Arm enter reveal once splash + strip heroes are ready.
     ///
-    /// Immersive cold: enter veil is armed on open (ambient+dock). When art is ready,
-    /// only fade the games list / splash in — do not re-black the chrome.
+    /// Immersive cold / promote: enter veil may already be lifting onto ambient+dock.
+    /// When art is ready, fade the games list / splash in — do not re-black the chrome.
     pub fn try_arm_enter_reveal_when_art_ready(&mut self, now: Instant) -> bool {
         if self.enter_reveal.is_none() || self.enter_reveal_armed() {
-            // Cold immersive: list reveal after art (veil already lifting/cleared).
-            if self.cold_load_active && self.immersive && self.enter_art_sync_ready() {
+            // Veil already lifting/cleared: list reveal after art (cold + promote).
+            if self.immersive && self.games_list_reveal_at.is_none() && self.enter_art_sync_ready()
+            {
                 self.begin_games_list_reveal(now);
                 if let Some(row) = self.rows.get(self.game_selected)
                     && row.backdrop_icon().is_some()
                 {
                     self.start_enter_splash_fade(row.play_key.clone(), now);
                 }
-                self.finish_cold_load();
-                crate::controller::hid::diag::diag_info(
-                    "ui-diag: start immersive enter art sync ready cold=1 list_reveal=1",
-                );
+                if self.cold_load_active {
+                    self.finish_cold_load();
+                    crate::controller::hid::diag::diag_info(
+                        "ui-diag: start immersive enter art sync ready cold=1 list_reveal=1",
+                    );
+                } else {
+                    crate::controller::hid::diag::diag_info(
+                        "ui-diag: start immersive enter art sync ready list_reveal=1",
+                    );
+                }
                 return true;
             }
             return false;
@@ -1636,6 +1652,7 @@ impl State {
             ));
             return true;
         }
+        self.begin_games_list_reveal(now);
         if let Some(row) = self.rows.get(self.game_selected)
             && row.backdrop_icon().is_some()
         {
@@ -1643,7 +1660,7 @@ impl State {
         }
         self.arm_enter_reveal(now);
         crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start immersive enter art sync ready ms={hold_ms}"
+            "ui-diag: start immersive enter art sync ready ms={hold_ms} list_reveal=1"
         ));
         true
     }
@@ -1677,6 +1694,28 @@ impl State {
                 return;
             }
         }
+        // Promote / warm enter: list stay-hidden clock outlives the veil phase.
+        if self.immersive
+            && self.games_list_reveal_at.is_none()
+            && let Some(started) = self.enter_list_hold_started
+            && now.saturating_duration_since(started)
+                >= Duration::from_millis(ENTER_ART_HOLD_MAX_MS)
+        {
+            let hold_ms = now.saturating_duration_since(started).as_millis();
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start immersive enter art hold timeout ms={hold_ms} list_reveal=1"
+            ));
+            self.begin_games_list_reveal(now);
+            if let Some(row) = self.rows.get(self.game_selected)
+                && row.backdrop_icon().is_some()
+            {
+                self.start_enter_splash_fade(row.play_key.clone(), now);
+            }
+            if self.enter_reveal.is_some() && !self.enter_reveal_armed() {
+                self.arm_enter_reveal(now);
+            }
+            return;
+        }
         if self.enter_reveal.is_none() || self.enter_reveal_armed() {
             return;
         }
@@ -1690,6 +1729,7 @@ impl State {
         crate::controller::hid::diag::diag_info(format!(
             "ui-diag: start immersive enter art hold timeout ms={hold_ms}"
         ));
+        self.begin_games_list_reveal(now);
         if let Some(row) = self.rows.get(self.game_selected)
             && row.backdrop_icon().is_some()
         {
@@ -2008,13 +2048,21 @@ impl State {
     ///
     /// Immersive uses a circular index window (strip wrap); compact is linear.
     pub fn art_paths_for_radius(&self, radius: isize) -> icon_cache::ArtRetainSet {
+        self.art_paths_for_radius_circular(radius, self.immersive)
+    }
+
+    /// Like [`Self::art_paths_for_radius`] with an explicit circular/linear window.
+    ///
+    /// Promote pre-warm runs under ExitCompact (`immersive` still false) but needs the
+    /// circular strip window so settle does not restart decode.
+    pub fn art_paths_for_radius_circular(
+        &self,
+        radius: isize,
+        circular: bool,
+    ) -> icon_cache::ArtRetainSet {
         let mut set = icon_cache::ArtRetainSet::default();
-        let indices = icon_cache::art_window_indices(
-            self.game_selected,
-            self.rows.len(),
-            self.immersive,
-            radius,
-        );
+        let indices =
+            icon_cache::art_window_indices(self.game_selected, self.rows.len(), circular, radius);
         for idx in indices {
             let row = &self.rows[idx];
             match &row.icon_source {
@@ -2037,7 +2085,12 @@ impl State {
 
     /// Full retain set: ±[`icon_cache::ART_WINDOW`] plus crossfade / dialog pins.
     pub fn art_retain_set(&self) -> icon_cache::ArtRetainSet {
-        let mut set = self.art_paths_for_radius(icon_cache::ART_WINDOW);
+        self.art_retain_set_circular(self.immersive)
+    }
+
+    /// Retain set with an explicit circular/linear near window (promote pre-warm).
+    pub fn art_retain_set_circular(&self, circular: bool) -> icon_cache::ArtRetainSet {
+        let mut set = self.art_paths_for_radius_circular(icon_cache::ART_WINDOW, circular);
         if let Some((key, _, _, _)) = self.backdrop_outgoing.as_ref()
             && let Some(path) = self
                 .rows
@@ -2068,6 +2121,12 @@ impl State {
     pub fn art_near_set(&self) -> icon_cache::ArtRetainSet {
         use crate::ui::start::vstrip::NEIGHBORS;
         self.art_paths_for_radius(NEIGHBORS)
+    }
+
+    /// Near set with an explicit circular/linear window (promote pre-warm).
+    pub fn art_near_set_circular(&self, circular: bool) -> icon_cache::ArtRetainSet {
+        use crate::ui::start::vstrip::NEIGHBORS;
+        self.art_paths_for_radius_circular(NEIGHBORS, circular)
     }
 
     /// Paths to warm for the current selection art window.
@@ -4835,9 +4894,126 @@ mod tests {
             assert!(state.try_arm_enter_reveal_when_art_ready(now));
             assert!(state.enter_reveal_armed());
             assert!(state.splash_opaque);
+            assert!(
+                state.games_list_reveal_at.is_some(),
+                "art sync must begin list reveal"
+            );
 
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+
+    #[test]
+    fn promote_enter_hides_list_until_art_sync() {
+        use crate::ui::start::mode::TransitionPhase;
+        let mut state = State {
+            rows: vec![StartRow {
+                title: "g".into(),
+                subtitle: None,
+                target: "t".into(),
+                args: String::new(),
+                play_key: "k".into(),
+                icon: None,
+                icon_source: None,
+                backdrop_path: None,
+                edit: None,
+                skeleton: true,
+                update_required: false,
+            }],
+            game_selected: 0,
+            immersive: true,
+            steam_scan_pending: true,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        state.begin_transition_phase(TransitionPhase::EnterImmersive, now);
+        state.prime_backdrop_for_enter(now);
+        // Promote settle arms veil onto ambient immediately; list stays hidden.
+        state.arm_enter_reveal(now);
+        assert!(state.enter_reveal_armed());
+        assert!(state.games_list_reveal_at.is_none());
+        assert!((state.games_list_opacity(now) - 0.0).abs() < 0.001);
+        assert!(!state.enter_art_sync_ready());
+        assert!(!state.try_arm_enter_reveal_when_art_ready(now));
+        assert!(state.games_list_reveal_at.is_none());
+    }
+
+    #[test]
+    fn promote_enter_art_ready_reveals_list_while_veil_armed() {
+        icon_cache::with_cache_lock(|| {
+            use crate::ui::start::mode::TransitionPhase;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("sdsc-promote-list-reveal-{n}"));
+            let _ = std::fs::create_dir_all(&dir);
+            let hero = dir.join("hero.png");
+            let bd = dir.join("bd.png");
+            write_tiny_png(&hero);
+            write_tiny_png(&bd);
+            assert!(icon_cache::hero_for_path(&hero).is_some());
+            assert!(icon_cache::backdrop_for_path(&bd).is_some());
+
+            let mut state = State {
+                rows: vec![StartRow {
+                    title: "g".into(),
+                    subtitle: None,
+                    target: "t".into(),
+                    args: String::new(),
+                    play_key: "k".into(),
+                    icon: None,
+                    icon_source: Some(IconSource::File(hero.clone())),
+                    backdrop_path: Some(bd.clone()),
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                }],
+                game_selected: 0,
+                immersive: true,
+                steam_scan_pending: false,
+                ..Default::default()
+            };
+            let now = Instant::now();
+            state.begin_transition_phase(TransitionPhase::EnterImmersive, now);
+            state.prime_backdrop_for_enter(now);
+            state.arm_enter_reveal(now);
+            assert!(state.games_list_reveal_at.is_none());
+            assert!(state.enter_art_sync_ready());
+            assert!(state.try_arm_enter_reveal_when_art_ready(now));
+            assert!(state.games_list_reveal_at.is_some());
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn promote_enter_list_hold_timeout_reveals_without_art() {
+        use crate::ui::start::mode::{ENTER_ART_HOLD_MAX_MS, TransitionPhase};
+        let mut state = State {
+            rows: vec![StartRow {
+                title: "g".into(),
+                subtitle: None,
+                target: "t".into(),
+                args: String::new(),
+                play_key: "k".into(),
+                icon: None,
+                icon_source: None,
+                backdrop_path: None,
+                edit: None,
+                skeleton: true,
+                update_required: false,
+            }],
+            game_selected: 0,
+            immersive: true,
+            ..Default::default()
+        };
+        let t0 = Instant::now();
+        state.begin_transition_phase(TransitionPhase::EnterImmersive, t0);
+        state.arm_enter_reveal(t0);
+        assert!(state.games_list_reveal_at.is_none());
+        let later = t0 + Duration::from_millis(ENTER_ART_HOLD_MAX_MS + 10);
+        state.maybe_force_enter_reveal_after_art_hold(later);
+        assert!(state.games_list_reveal_at.is_some());
     }
 
     #[test]
