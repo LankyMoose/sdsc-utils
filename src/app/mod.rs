@@ -1835,10 +1835,8 @@ impl App {
             ConfigureMessage::SetStartScreenEnabled(enabled) => {
                 self.session.prefs.start_screen_enabled = enabled;
                 self.session.prefs.save();
-                if !enabled {
-                    if self.start_visible {
-                        return self.close_start_screen();
-                    }
+                if !enabled && self.start_visible {
+                    return self.close_start_screen();
                 }
                 Task::none()
             }
