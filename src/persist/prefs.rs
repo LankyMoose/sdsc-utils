@@ -73,6 +73,15 @@ pub struct Prefs {
     /// Always use immersive Start (never show compact; cancel closes) (default off).
     #[serde(default)]
     pub start_screen_always_immersive: bool,
+    /// Immersive idle dim after this many seconds (default 30). Snapped to idle steps.
+    #[serde(default = "default_start_screen_inactive_secs")]
+    pub start_screen_inactive_secs: u32,
+    /// Immersive sleep (full black) after this many seconds (default 120). Snapped to sleep steps.
+    #[serde(default = "default_start_screen_sleep_secs")]
+    pub start_screen_sleep_secs: u32,
+    /// Idle-mode black overlay percent 0–100 (default 50). Sleep is always 100%.
+    #[serde(default = "default_start_screen_inactive_dim_percent")]
+    pub start_screen_inactive_dim_percent: u8,
     /// Count USB pads for start-screen auto-open / auto-close (default on).
     /// When off, only Bluetooth pads drive open and close.
     #[serde(default = "default_true")]
@@ -117,6 +126,25 @@ fn default_start_screen_haptics_strength() -> u8 {
     60
 }
 
+fn default_start_screen_inactive_secs() -> u32 {
+    30
+}
+
+fn default_start_screen_sleep_secs() -> u32 {
+    120
+}
+
+fn default_start_screen_inactive_dim_percent() -> u8 {
+    50
+}
+
+/// Allowed immersive idle timeouts (seconds): 5s, 15s, 30s, 1m, 2m, 3m, 5m, 10m.
+pub const START_SCREEN_IDLE_SECS_STEPS: &[u32] = &[5, 15, 30, 60, 120, 180, 300, 600];
+/// Allowed immersive sleep timeouts (seconds): 1m–5m like idle, then 5m gaps to 60m.
+pub const START_SCREEN_SLEEP_SECS_STEPS: &[u32] = &[
+    60, 120, 180, 300, 600, 900, 1_200, 1_500, 1_800, 2_100, 2_400, 2_700, 3_000, 3_300, 3_600,
+];
+
 pub fn clamp_low_battery_percent(value: u8) -> u8 {
     let clamped = value.clamp(LOW_BATTERY_PERCENT_MIN, LOW_BATTERY_PERCENT_MAX);
     // Floor to the greatest observable mid-point ≤ clamped (preserves fire points
@@ -137,6 +165,70 @@ pub fn clamp_start_screen_haptics_strength(value: u8) -> u8 {
     value.min(100)
 }
 
+pub fn clamp_start_screen_inactive_dim_percent(value: u8) -> u8 {
+    value.min(100)
+}
+
+/// Snap `value` to the nearest entry in a sorted ascending step table.
+/// Ties prefer the shorter timeout.
+pub fn snap_to_secs_steps(value: u32, steps: &[u32]) -> u32 {
+    let Some(&first) = steps.first() else {
+        return value;
+    };
+    let mut best = first;
+    let mut best_dist = value.abs_diff(first);
+    for &step in steps.iter().skip(1) {
+        let dist = value.abs_diff(step);
+        if dist < best_dist || (dist == best_dist && step < best) {
+            best = step;
+            best_dist = dist;
+        }
+    }
+    best
+}
+
+/// Index of `secs` in `steps`, or nearest step index.
+pub fn secs_step_index(secs: u32, steps: &[u32]) -> usize {
+    let snapped = snap_to_secs_steps(secs, steps);
+    steps.iter().position(|&s| s == snapped).unwrap_or(0)
+}
+
+/// Format a timeout for Settings labels (`5 seconds`, `3 minutes`).
+pub fn format_timeout_duration(secs: u32) -> String {
+    if secs < 60 {
+        if secs == 1 {
+            "1 second".into()
+        } else {
+            format!("{secs} seconds")
+        }
+    } else {
+        let mins = secs / 60;
+        if mins == 1 {
+            "1 minute".into()
+        } else {
+            format!("{mins} minutes")
+        }
+    }
+}
+
+/// Earliest allowed sleep step that is strictly after `idle_secs` (one breakpoint ahead).
+pub fn min_sleep_secs_for_idle(idle_secs: u32) -> u32 {
+    let idle = snap_to_secs_steps(idle_secs, START_SCREEN_IDLE_SECS_STEPS);
+    START_SCREEN_SLEEP_SECS_STEPS
+        .iter()
+        .copied()
+        .find(|&s| s > idle)
+        .unwrap_or(*START_SCREEN_SLEEP_SECS_STEPS.last().unwrap_or(&idle))
+}
+
+/// Clamp idle/sleep to allowed steps; sleep is always at least one breakpoint ahead of idle.
+pub fn clamp_start_screen_idle_timeouts(idle_secs: u32, sleep_secs: u32) -> (u32, u32) {
+    let idle = snap_to_secs_steps(idle_secs, START_SCREEN_IDLE_SECS_STEPS);
+    let min_sleep = min_sleep_secs_for_idle(idle);
+    let sleep = snap_to_secs_steps(sleep_secs, START_SCREEN_SLEEP_SECS_STEPS).max(min_sleep);
+    (idle, sleep)
+}
+
 impl Default for Prefs {
     fn default() -> Self {
         Self {
@@ -151,6 +243,9 @@ impl Default for Prefs {
             lightbar_enabled: true,
             start_screen_enabled: true,
             start_screen_always_immersive: false,
+            start_screen_inactive_secs: default_start_screen_inactive_secs(),
+            start_screen_sleep_secs: default_start_screen_sleep_secs(),
+            start_screen_inactive_dim_percent: default_start_screen_inactive_dim_percent(),
             start_screen_usb_controllers: true,
             start_screen_gesture: default_gesture(),
             start_screen_sounds_enabled: true,
@@ -176,6 +271,15 @@ impl Prefs {
                     clamp_start_screen_sound_volume(prefs.start_screen_sound_volume);
                 prefs.start_screen_haptics_strength =
                     clamp_start_screen_haptics_strength(prefs.start_screen_haptics_strength);
+                prefs.start_screen_inactive_dim_percent = clamp_start_screen_inactive_dim_percent(
+                    prefs.start_screen_inactive_dim_percent,
+                );
+                let (inactive, sleep) = clamp_start_screen_idle_timeouts(
+                    prefs.start_screen_inactive_secs,
+                    prefs.start_screen_sleep_secs,
+                );
+                prefs.start_screen_inactive_secs = inactive;
+                prefs.start_screen_sleep_secs = sleep;
                 prefs
             }
             Err(err) => {
@@ -362,6 +466,40 @@ mod tests {
             serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":["ps"]}"#)
                 .unwrap();
         assert!(!prefs.start_screen_always_immersive);
+    }
+
+    #[test]
+    fn older_prefs_default_immersive_idle_timeouts() {
+        let prefs: Prefs =
+            serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":["ps"]}"#)
+                .unwrap();
+        assert_eq!(prefs.start_screen_inactive_secs, 30);
+        assert_eq!(prefs.start_screen_sleep_secs, 120);
+        assert_eq!(prefs.start_screen_inactive_dim_percent, 50);
+    }
+
+    #[test]
+    fn clamp_start_screen_idle_timeouts_orders_and_bounds() {
+        assert_eq!(clamp_start_screen_idle_timeouts(30, 180), (30, 180));
+        // Sleep must be ≥ one sleep breakpoint ahead of idle (2m → 3m).
+        assert_eq!(clamp_start_screen_idle_timeouts(120, 60), (120, 180));
+        assert_eq!(clamp_start_screen_idle_timeouts(120, 120), (120, 180));
+        assert_eq!(clamp_start_screen_idle_timeouts(0, 10), (5, 60));
+        assert_eq!(min_sleep_secs_for_idle(600), 900);
+        assert_eq!(clamp_start_screen_idle_timeouts(9_999, 9_999), (600, 3_600));
+        assert_eq!(snap_to_secs_steps(20, START_SCREEN_IDLE_SECS_STEPS), 15);
+        assert_eq!(snap_to_secs_steps(45, START_SCREEN_IDLE_SECS_STEPS), 30);
+        assert_eq!(snap_to_secs_steps(90, START_SCREEN_SLEEP_SECS_STEPS), 60);
+        assert_eq!(clamp_start_screen_inactive_dim_percent(30), 30);
+        assert_eq!(clamp_start_screen_inactive_dim_percent(255), 100);
+    }
+
+    #[test]
+    fn format_timeout_duration_units() {
+        assert_eq!(format_timeout_duration(5), "5 seconds");
+        assert_eq!(format_timeout_duration(1), "1 second");
+        assert_eq!(format_timeout_duration(60), "1 minute");
+        assert_eq!(format_timeout_duration(180), "3 minutes");
     }
 
     #[test]

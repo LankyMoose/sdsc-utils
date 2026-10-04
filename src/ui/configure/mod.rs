@@ -138,6 +138,9 @@ pub struct ConfigureSettings {
     pub lightbar_enabled: bool,
     pub start_screen_enabled: bool,
     pub start_screen_always_immersive: bool,
+    pub start_screen_inactive_secs: u32,
+    pub start_screen_sleep_secs: u32,
+    pub start_screen_inactive_dim_percent: u8,
     pub start_screen_usb_controllers: bool,
     pub start_screen_gesture: Vec<GestureControl>,
     pub start_screen_sounds_enabled: bool,
@@ -209,6 +212,9 @@ pub enum ConfigureMessage {
     SetLightbarEnabled(bool),
     SetStartScreenEnabled(bool),
     SetStartScreenAlwaysImmersive(bool),
+    SetStartScreenInactiveSecs(u32),
+    SetStartScreenSleepSecs(u32),
+    SetStartScreenInactiveDimPercent(u8),
     SetStartScreenUsbControllers(bool),
     SetStartScreenSounds(bool),
     SetStartScreenSoundVolume(u8),
@@ -680,9 +686,32 @@ fn footer_link_button<'a>(
     .into()
 }
 
+/// Hairline between Start screen setting groups (content pane already insets sides).
+fn configure_section_rule<'a>() -> Element<'a, ConfigureMessage> {
+    container(
+        container(space())
+            .width(Fill)
+            .height(Length::Fixed(1.0))
+            .style(theme::configure_header_rule),
+    )
+    .padding(iced::Padding {
+        top: 10.0,
+        right: 0.0,
+        bottom: 10.0,
+        left: 0.0,
+    })
+    .width(Fill)
+    .into()
+}
+
+fn configure_section_heading<'a>(label: &'static str) -> Element<'a, ConfigureMessage> {
+    text(label).size(13.0).color(theme::INK).into()
+}
+
 fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
     let mut items = Column::new().spacing(8).width(Fill);
 
+    items = items.push(configure_section_heading("Opening"));
     items = items.push(
         checkbox(settings.start_screen_enabled)
             .label("Show start screen when a controller connects")
@@ -707,6 +736,8 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
                 .color(theme::MUTED),
         );
 
+        items = items.push(configure_section_rule());
+        items = items.push(configure_section_heading("Immersive"));
         items = items.push(
             checkbox(settings.start_screen_always_immersive)
                 .label("Always immersive")
@@ -716,7 +747,85 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
                 .on_toggle(ConfigureMessage::SetStartScreenAlwaysImmersive),
         );
 
-        items = items.push(text("Reopen gesture").size(13.0).color(theme::INK));
+        let idle_secs = settings.start_screen_inactive_secs;
+        let idle_steps = crate::persist::prefs::START_SCREEN_IDLE_SECS_STEPS;
+        let idle_idx = crate::persist::prefs::secs_step_index(idle_secs, idle_steps);
+        items = items.push(
+            column![
+                text(format!(
+                    "Idle after {}",
+                    crate::persist::prefs::format_timeout_duration(idle_secs)
+                ))
+                .size(12.0)
+                .color(theme::MUTED),
+                slider(
+                    0.0..=(idle_steps.len().saturating_sub(1) as f32),
+                    idle_idx as f32,
+                    |value| {
+                        let idx = (value.round() as usize).min(idle_steps.len().saturating_sub(1));
+                        ConfigureMessage::SetStartScreenInactiveSecs(idle_steps[idx])
+                    }
+                )
+                .step(1.0_f32),
+            ]
+            .spacing(4)
+            .width(Fill),
+        );
+
+        let sleep_secs = settings.start_screen_sleep_secs;
+        let sleep_steps = crate::persist::prefs::START_SCREEN_SLEEP_SECS_STEPS;
+        let min_sleep = crate::persist::prefs::min_sleep_secs_for_idle(idle_secs);
+        let sleep_choices: Vec<u32> = sleep_steps
+            .iter()
+            .copied()
+            .filter(|&s| s >= min_sleep)
+            .collect();
+        let sleep_choices = if sleep_choices.is_empty() {
+            vec![*sleep_steps.last().unwrap_or(&min_sleep)]
+        } else {
+            sleep_choices
+        };
+        let sleep_idx = crate::persist::prefs::secs_step_index(sleep_secs, &sleep_choices);
+        items = items.push(
+            column![
+                text(format!(
+                    "Sleep after {}",
+                    crate::persist::prefs::format_timeout_duration(sleep_secs)
+                ))
+                .size(12.0)
+                .color(theme::MUTED),
+                slider(
+                    0.0..=(sleep_choices.len().saturating_sub(1) as f32),
+                    sleep_idx as f32,
+                    move |value| {
+                        let idx =
+                            (value.round() as usize).min(sleep_choices.len().saturating_sub(1));
+                        ConfigureMessage::SetStartScreenSleepSecs(sleep_choices[idx])
+                    },
+                )
+                .step(1.0_f32),
+            ]
+            .spacing(4)
+            .width(Fill),
+        );
+
+        let dim = settings.start_screen_inactive_dim_percent;
+        items = items.push(
+            column![
+                text(format!("Idle dim {dim}%"))
+                    .size(12.0)
+                    .color(theme::MUTED),
+                slider(0.0..=100.0, f32::from(dim), |value| {
+                    ConfigureMessage::SetStartScreenInactiveDimPercent(value.round() as u8)
+                })
+                .step(5.0_f32),
+            ]
+            .spacing(4)
+            .width(Fill),
+        );
+
+        items = items.push(configure_section_rule());
+        items = items.push(configure_section_heading("Gesture"));
         items = items.push(
             text(gesture::format_gesture(&settings.start_screen_gesture))
                 .size(12.0)
@@ -755,6 +864,8 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             );
         }
 
+        items = items.push(configure_section_rule());
+        items = items.push(configure_section_heading("Feedback"));
         items = items.push(
             checkbox(settings.start_screen_sounds_enabled)
                 .label("UI sounds")
@@ -808,6 +919,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         }
     }
 
+    items = items.push(configure_section_rule());
     items = items.push(
         text(format!(
             "Last-known compatible Steam version: {LAST_KNOWN_COMPATIBLE_STEAM_VERSION}"

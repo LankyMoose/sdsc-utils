@@ -27,6 +27,7 @@ use crate::persist::notify::NotifyEvent;
 use crate::persist::paths;
 use crate::persist::prefs::{
     Prefs, clamp_low_battery_percent, clamp_start_screen_haptics_strength,
+    clamp_start_screen_idle_timeouts, clamp_start_screen_inactive_dim_percent,
     clamp_start_screen_sound_volume,
 };
 use crate::platform::app_log;
@@ -133,7 +134,7 @@ pub enum Message {
     StartOpened(window::Id),
     /// Drive start-screen slide / Triangle-hold animation frames.
     StartFrame,
-    /// Mouse move/button/wheel on a window — used to reset immersive cursor idle hide.
+    /// Mouse move/button/wheel on a window — resets immersive activity (cursor + idle/sleep).
     StartCursorActivity(window::Id),
     /// HWND resize finished — apply immersive flag after promote/demote veil.
     StartImmersiveSettled,
@@ -236,7 +237,9 @@ pub struct App {
     start_state: start_view::State,
     /// Monitor covered while immersive (used to center compact on demote).
     start_monitor_cover: Option<MonitorCover>,
-    /// Last mouse activity on the Start window (immersive idle cursor hide).
+    /// Last user activity on Start (mouse / keyboard / pad) for immersive idle/sleep.
+    start_last_activity: Instant,
+    /// Last mouse activity on Start (immersive cursor hide only — pad must not unhide).
     start_cursor_last_active: Instant,
     /// When true, Start view forces [`mouse::Interaction::Hidden`].
     start_cursor_hidden: bool,
@@ -440,6 +443,7 @@ impl App {
             start_nav_ready: false,
             start_state: start_view::State::default(),
             start_monitor_cover: None,
+            start_last_activity: Instant::now(),
             start_cursor_last_active: Instant::now(),
             start_cursor_hidden: false,
             start_file_dialog_open: false,
@@ -919,6 +923,12 @@ impl App {
                 self.sync_start_held();
                 self.start_state.tick_hint_anims(now);
                 self.tick_start_cursor_idle(now);
+                if self.tick_start_idle(now) {
+                    self.pad_nav.prepare_on_open(false);
+                    crate::controller::hid::diag::diag_info(
+                        "ui-diag: start idle pad re-arm after sleep wake",
+                    );
+                }
                 Task::none()
             }
             Message::StartCursorActivity(id) => {
@@ -930,6 +940,7 @@ impl App {
             Message::Start(message) => {
                 // Mouse / iced UI messages are not pad-originated.
                 self.haptic_pad_serial = None;
+                self.note_start_activity();
                 self.on_start_message(message)
             }
             Message::StartKey {
@@ -940,6 +951,7 @@ impl App {
                 // Keyboard is never pad-originated.
                 self.haptic_pad_serial = None;
                 if Some(id) == self.start_window && self.start_visible {
+                    self.note_start_activity();
                     // Leftover-chord arming is pad-local; keyboard stays live.
                     return match action {
                         StartKeyAction::Up if pressed => {
@@ -1559,6 +1571,9 @@ impl App {
             lightbar_enabled: self.session.prefs.lightbar_enabled,
             start_screen_enabled: self.session.prefs.start_screen_enabled,
             start_screen_always_immersive: self.session.prefs.start_screen_always_immersive,
+            start_screen_inactive_secs: self.session.prefs.start_screen_inactive_secs,
+            start_screen_sleep_secs: self.session.prefs.start_screen_sleep_secs,
+            start_screen_inactive_dim_percent: self.session.prefs.start_screen_inactive_dim_percent,
             start_screen_usb_controllers: self.session.prefs.start_screen_usb_controllers,
             start_screen_gesture: self.session.prefs.start_screen_gesture.clone(),
             start_screen_sounds_enabled: self.session.prefs.start_screen_sounds_enabled,
@@ -1737,14 +1752,50 @@ impl App {
                 self.session.prefs.save();
                 Task::none()
             }
+            ConfigureMessage::SetStartScreenInactiveSecs(secs) => {
+                let (inactive, sleep) = clamp_start_screen_idle_timeouts(
+                    secs,
+                    self.session.prefs.start_screen_sleep_secs,
+                );
+                if self.session.prefs.start_screen_inactive_secs != inactive
+                    || self.session.prefs.start_screen_sleep_secs != sleep
+                {
+                    self.session.prefs.start_screen_inactive_secs = inactive;
+                    self.session.prefs.start_screen_sleep_secs = sleep;
+                    self.session.prefs.save();
+                }
+                Task::none()
+            }
+            ConfigureMessage::SetStartScreenSleepSecs(secs) => {
+                let (inactive, sleep) = clamp_start_screen_idle_timeouts(
+                    self.session.prefs.start_screen_inactive_secs,
+                    secs,
+                );
+                if self.session.prefs.start_screen_inactive_secs != inactive
+                    || self.session.prefs.start_screen_sleep_secs != sleep
+                {
+                    self.session.prefs.start_screen_inactive_secs = inactive;
+                    self.session.prefs.start_screen_sleep_secs = sleep;
+                    self.session.prefs.save();
+                }
+                Task::none()
+            }
+            ConfigureMessage::SetStartScreenInactiveDimPercent(percent) => {
+                let percent = clamp_start_screen_inactive_dim_percent(percent);
+                if self.session.prefs.start_screen_inactive_dim_percent != percent {
+                    self.session.prefs.start_screen_inactive_dim_percent = percent;
+                    self.session.prefs.save();
+                }
+                Task::none()
+            }
             ConfigureMessage::SetStartScreenUsbControllers(enabled) => {
                 if self.session.prefs.start_screen_usb_controllers == enabled {
                     return Task::none();
                 }
                 self.session.prefs.start_screen_usb_controllers = enabled;
                 self.session.prefs.save();
-                // Client mode: service also reloads prefs within ~2s and may re-emit
-                // OpenStart/CloseStart; shell applies immediately for snappy UI.
+                // Prefs flip may CloseStart when USB pads no longer qualify; never opens.
+                // Client mode: service reloads prefs within ~2s and applies the same rule.
                 let ctx = crate::session::ApplyContext {
                     start_visible: self.start_visible,
                     fullscreen: start_input::foreground_is_exclusive_fullscreen(),
@@ -2686,7 +2737,7 @@ impl App {
             start_mode::ImmersiveTransition::OpenImmersive
         );
         self.start_state.immersive = immersive;
-        self.clear_start_cursor_hide();
+        self.clear_start_activity();
         let (size, position) = if immersive {
             let cover = primary_monitor_cover().unwrap_or(MonitorCover {
                 x: 0.0,
@@ -2763,7 +2814,7 @@ impl App {
             height: 1080.0,
         });
         self.start_monitor_cover = Some(cover);
-        self.clear_start_cursor_hide();
+        self.clear_start_activity();
         self.arm_chord_release_latch();
         crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
         self.start_state
@@ -2786,7 +2837,7 @@ impl App {
         };
         self.arm_chord_release_latch();
         crate::controller::hid::diag::diag_info("ui-diag: start immersive leave");
-        self.clear_start_cursor_hide();
+        self.clear_start_activity();
         self.start_state
             .begin_transition_phase(start_mode::TransitionPhase::ExitImmersive, Instant::now());
         Task::none()
@@ -2896,7 +2947,7 @@ impl App {
             ));
         } else {
             self.start_monitor_cover = None;
-            self.clear_start_cursor_hide();
+            self.clear_start_activity();
             self.start_state.clear_backdrop_transition();
             self.start_state
                 .begin_transition_phase(start_mode::TransitionPhase::EnterCompact, now);
@@ -2950,14 +3001,29 @@ impl App {
         self.pad_held = FaceHeld::default();
     }
 
-    fn note_start_cursor_activity(&mut self) {
-        self.start_cursor_last_active = Instant::now();
-        self.set_start_cursor_hidden(false);
+    /// Stamp idle/sleep activity (does not unhide the cursor — pad/keyboard stay mouse-free).
+    fn note_start_activity(&mut self) {
+        let now = Instant::now();
+        self.start_last_activity = now;
+        self.wake_start_idle(now, false);
     }
 
-    fn clear_start_cursor_hide(&mut self) {
-        self.start_cursor_last_active = Instant::now();
+    /// Mouse move/click/wheel: wake idle/sleep and show the cursor.
+    fn note_start_cursor_activity(&mut self) {
+        let now = Instant::now();
+        self.start_last_activity = now;
+        self.start_cursor_last_active = now;
         self.set_start_cursor_hidden(false);
+        self.wake_start_idle(now, false);
+    }
+
+    /// Reset activity clocks without treating it as a sleep-wake (open/promote/close).
+    fn clear_start_activity(&mut self) {
+        let now = Instant::now();
+        self.start_last_activity = now;
+        self.start_cursor_last_active = now;
+        self.set_start_cursor_hidden(false);
+        self.start_state.reset_idle_dim();
     }
 
     fn set_start_cursor_hidden(&mut self, hidden: bool) {
@@ -2987,6 +3053,77 @@ impl App {
         }
     }
 
+    /// Wake idle/sleep overlay toward Active. `from_sleep` marks pad-gated wake.
+    fn wake_start_idle(&mut self, now: Instant, from_sleep: bool) {
+        use crate::ui::start::idle::IdlePhase;
+        if !self.start_visible || !self.start_state.immersive {
+            return;
+        }
+        if matches!(self.start_state.idle_phase, IdlePhase::Active)
+            && !self.start_state.idle_sleep_wake_pending
+            && !self.start_state.idle_dim_animating(now)
+        {
+            return;
+        }
+        let was_sleep = matches!(self.start_state.idle_phase, IdlePhase::Sleep) || from_sleep;
+        let inactive_dim = f32::from(self.session.prefs.start_screen_inactive_dim_percent) / 100.0;
+        if self
+            .start_state
+            .set_idle_phase(IdlePhase::Active, inactive_dim, now, was_sleep)
+        {
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start idle phase={} wake_from_sleep={}",
+                IdlePhase::Active.label(),
+                u8::from(was_sleep),
+            ));
+        }
+    }
+
+    /// Advance idle/sleep timeouts + dim anim. Returns true if pad should re-arm after sleep wake.
+    fn tick_start_idle(&mut self, now: Instant) -> bool {
+        use crate::ui::start::idle::{self as start_idle};
+
+        if !self.start_visible || !self.start_state.immersive {
+            self.start_state.reset_idle_dim();
+            return false;
+        }
+        // Don't advance idle during promote/demote ceremony.
+        if self.start_state.transition_phase.is_some() || self.start_state.transition.is_some() {
+            let clear_gate = self.start_state.tick_idle_dim(now);
+            return clear_gate;
+        }
+
+        let clear_gate = self.start_state.tick_idle_dim(now);
+
+        // While waking from sleep, keep targeting Active (activity already stamped).
+        if self.start_state.idle_sleep_wake_pending {
+            return clear_gate;
+        }
+
+        let idle_secs = now
+            .saturating_duration_since(self.start_last_activity)
+            .as_secs_f32();
+        let target = start_idle::phase_for_idle_secs(
+            idle_secs,
+            self.session.prefs.start_screen_inactive_secs,
+            self.session.prefs.start_screen_sleep_secs,
+        );
+        if target != self.start_state.idle_phase {
+            let inactive_dim =
+                f32::from(self.session.prefs.start_screen_inactive_dim_percent) / 100.0;
+            if self
+                .start_state
+                .set_idle_phase(target, inactive_dim, now, false)
+            {
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start idle phase={}",
+                    target.label()
+                ));
+            }
+        }
+        clear_gate
+    }
+
     fn close_start_screen(&mut self) -> Task<Message> {
         // Clear visibility before any hide task so Resting toast RaiseInteractive
         // cannot resurface Start while the hide is in flight.
@@ -3003,7 +3140,7 @@ impl App {
         crate::ui::start::art_worker::cancel_jobs(generation);
         self.start_state.art_awaiting_paint = false;
         self.start_monitor_cover = None;
-        self.clear_start_cursor_hide();
+        self.clear_start_activity();
         self.haptic_pad_serial = None;
         if self.client_mode {
             let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RumbleStopAll);
@@ -3906,6 +4043,27 @@ impl App {
     fn handle_start_nav_readings(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
         self.nav_missing_warned = false;
 
+        let now = Instant::now();
+        let pad_active = readings
+            .iter()
+            .any(|r| !start_input::sample_nav_resting(&r.sample));
+
+        // Sleep / sleep-wake: pad may only begin wake — no nav, dock, cancel, or cues.
+        if self.start_state.idle_pad_gated() {
+            if pad_active {
+                self.start_last_activity = now;
+                self.wake_start_idle(now, true);
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: start idle pad gated (sleep wake)",
+                );
+            }
+            return Task::none();
+        }
+
+        if pad_active {
+            self.note_start_activity();
+        }
+
         let gesture = &self.session.prefs.start_screen_gesture;
         self.start_state.reopen_chord_held =
             start_mode::promote_gesture_usable(gesture) && chord_held_on_any_pad(gesture, readings);
@@ -3915,7 +4073,6 @@ impl App {
             return toggle;
         }
 
-        let now = Instant::now();
         let animating = self.start_state.animating();
         // Mid-slide: keep Left/Right nav live for interruptible request_slide,
         // but skip controller-row rebuilds (those hitch the UI thread).

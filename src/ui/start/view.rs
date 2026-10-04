@@ -43,7 +43,8 @@ const TITLE_INACTIVE: f32 = 15.0;
 const CUE_SIZE: f32 = 14.0;
 /// Width reserved for an L2/R2 cue plus gap while revealed.
 const CUE_SLOT_W: f32 = 30.0;
-const ROW_HEIGHT: f32 = 88.0;
+/// Title + up to two labeled meta lines (+ update badge).
+const ROW_HEIGHT: f32 = 104.0;
 const CONTROLLER_ROW_HEIGHT: f32 = 100.0;
 /// Horizontal inset; vertical chrome uses [`PAD_Y`].
 const PADDING: f32 = 20.0;
@@ -124,10 +125,27 @@ pub enum IconSource {
     Shell(PathBuf),
 }
 
+/// Subtext under a game title (plain path/URI, or stacked Steam labels).
+#[derive(Debug, Clone)]
+pub enum StartSubtitle {
+    Plain(String),
+    Labeled(Vec<crate::games::steam::MetaLine>),
+}
+
+impl StartSubtitle {
+    /// Empty-catalog Steam fallback — hide when showing an update badge alone.
+    pub fn is_steam_fallback(&self) -> bool {
+        match self {
+            Self::Plain(text) => text == "Steam",
+            Self::Labeled(lines) => crate::games::steam::meta_lines_are_steam_fallback(lines),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StartRow {
     pub title: String,
-    pub subtitle: Option<String>,
+    pub subtitle: Option<StartSubtitle>,
     pub target: String,
     pub args: String,
     pub play_key: String,
@@ -171,7 +189,9 @@ impl StartRow {
                     let icon_source = steam_icon_source(game);
                     Self {
                         title: game.name.clone(),
-                        subtitle: Some(crate::games::steam::browse_meta_subtitle(game)),
+                        subtitle: Some(StartSubtitle::Labeled(
+                            crate::games::steam::browse_meta_lines(game),
+                        )),
                         target: crate::games::steam::launch_uri(*appid),
                         args: String::new(),
                         play_key: entry.play_key(),
@@ -199,7 +219,7 @@ impl StartRow {
                 } else {
                     Self {
                         title: format!("Steam {appid}"),
-                        subtitle: Some(format!("steam://rungameid/{appid}")),
+                        subtitle: Some(StartSubtitle::Plain(format!("steam://rungameid/{appid}"))),
                         target: crate::games::steam::launch_uri(*appid),
                         args: String::new(),
                         play_key: entry.play_key(),
@@ -222,7 +242,7 @@ impl StartRow {
                 let icon_source = manual_icon_source(target, icon.as_deref());
                 Self {
                     title: title.clone(),
-                    subtitle: Some(target.clone()),
+                    subtitle: Some(StartSubtitle::Plain(target.clone())),
                     target: target.clone(),
                     args: args.clone(),
                     play_key: entry.play_key(),
@@ -241,7 +261,9 @@ impl StartRow {
         let icon_source = steam_icon_source(game);
         Self {
             title: game.name.clone(),
-            subtitle: Some(crate::games::steam::browse_meta_subtitle(game)),
+            subtitle: Some(StartSubtitle::Labeled(
+                crate::games::steam::browse_meta_lines(game),
+            )),
             target: crate::games::steam::launch_uri(game.appid),
             args: String::new(),
             play_key: format!("steam:{}", game.appid),
@@ -271,7 +293,7 @@ impl StartRow {
         let icon_source = manual_icon_source(target, icon.as_deref());
         Some(Self {
             title: title.clone(),
-            subtitle: Some(target.clone()),
+            subtitle: Some(StartSubtitle::Plain(target.clone())),
             target: target.clone(),
             args: args.clone(),
             play_key: entry.play_key(),
@@ -506,6 +528,14 @@ struct EnterRevealClock {
     last_tick: Option<Instant>,
 }
 
+/// Eased immersive idle/sleep dim crossfade.
+#[derive(Debug, Clone)]
+struct IdleDimAnim {
+    from: f32,
+    to: f32,
+    started: Instant,
+}
+
 #[derive(Debug, Clone)]
 pub struct State {
     pub slide: StartSlide,
@@ -573,6 +603,14 @@ pub struct State {
     identify_flash: Option<IdentifyFlash>,
     /// Keep painting while the art worker may still fill peeks (compact list / cover).
     pub art_awaiting_paint: bool,
+    /// Immersive inactive / sleep logical phase.
+    pub idle_phase: crate::ui::start::idle::IdlePhase,
+    /// In-flight idle dim alpha crossfade.
+    idle_dim_anim: Option<IdleDimAnim>,
+    /// Settled idle dim alpha when not animating.
+    idle_dim_settled: f32,
+    /// True from Sleep wake until dim returns to Active (pad fully gated).
+    pub idle_sleep_wake_pending: bool,
 }
 
 /// Active Identify ring flash for one controller row on the start screen.
@@ -638,6 +676,10 @@ impl Default for State {
             backdrop_outgoing: None,
             identify_flash: None,
             art_awaiting_paint: false,
+            idle_phase: crate::ui::start::idle::IdlePhase::Active,
+            idle_dim_anim: None,
+            idle_dim_settled: 0.0,
+            idle_sleep_wake_pending: false,
         }
     }
 }
@@ -964,6 +1006,92 @@ impl State {
         self.backdrop_current = None;
         self.backdrop_outgoing = None;
         self.ambient_time = 0.0;
+        self.reset_idle_dim();
+    }
+
+    /// Reset immersive idle/sleep overlay to Active (no anim).
+    pub fn reset_idle_dim(&mut self) {
+        self.idle_phase = crate::ui::start::idle::IdlePhase::Active;
+        self.idle_dim_anim = None;
+        self.idle_dim_settled = 0.0;
+        self.idle_sleep_wake_pending = false;
+    }
+
+    /// Current idle/sleep overlay alpha (0 = clear).
+    pub fn idle_dim_amount(&self, now: Instant) -> f32 {
+        if let Some(anim) = &self.idle_dim_anim {
+            let elapsed = now.saturating_duration_since(anim.started).as_millis() as u64;
+            return crate::ui::start::idle::dim_alpha(anim.from, anim.to, elapsed);
+        }
+        self.idle_dim_settled
+    }
+
+    /// True while Sleep, or while waking from Sleep until dim settles on Active.
+    pub fn idle_pad_gated(&self) -> bool {
+        matches!(self.idle_phase, crate::ui::start::idle::IdlePhase::Sleep)
+            || self.idle_sleep_wake_pending
+    }
+
+    /// True while an idle dim crossfade is in flight.
+    pub fn idle_dim_animating(&self, now: Instant) -> bool {
+        self.idle_dim_anim.as_ref().is_some_and(|anim| {
+            let elapsed = now.saturating_duration_since(anim.started).as_millis() as u64;
+            !crate::ui::start::idle::dim_anim_done(elapsed)
+        })
+    }
+
+    /// Begin eased crossfade toward `phase` target alpha. Returns true if phase changed.
+    pub fn set_idle_phase(
+        &mut self,
+        phase: crate::ui::start::idle::IdlePhase,
+        inactive_dim: f32,
+        now: Instant,
+        from_sleep_wake: bool,
+    ) -> bool {
+        use crate::ui::start::idle::IdlePhase;
+        if self.idle_phase == phase && self.idle_dim_anim.is_none() && !from_sleep_wake {
+            return false;
+        }
+        let from = self.idle_dim_amount(now);
+        let to = phase.target_alpha(inactive_dim);
+        let leaving_sleep = matches!(self.idle_phase, IdlePhase::Sleep)
+            || from_sleep_wake
+            || self.idle_sleep_wake_pending;
+        self.idle_phase = phase;
+        if from_sleep_wake || (leaving_sleep && matches!(phase, IdlePhase::Active)) {
+            self.idle_sleep_wake_pending = true;
+        }
+        if (from - to).abs() < 0.001 {
+            self.idle_dim_anim = None;
+            self.idle_dim_settled = to;
+        } else {
+            self.idle_dim_anim = Some(IdleDimAnim {
+                from,
+                to,
+                started: now,
+            });
+        }
+        true
+    }
+
+    /// Advance idle dim anim; returns true when a sleep-wake gate should clear (re-arm pad).
+    pub fn tick_idle_dim(&mut self, now: Instant) -> bool {
+        if let Some(anim) = &self.idle_dim_anim {
+            let elapsed = now.saturating_duration_since(anim.started).as_millis() as u64;
+            if !crate::ui::start::idle::dim_anim_done(elapsed) {
+                return false;
+            }
+            self.idle_dim_settled = anim.to;
+            self.idle_dim_anim = None;
+        }
+        if self.idle_sleep_wake_pending
+            && matches!(self.idle_phase, crate::ui::start::idle::IdlePhase::Active)
+            && self.idle_dim_anim.is_none()
+        {
+            self.idle_sleep_wake_pending = false;
+            return true;
+        }
+        false
     }
 
     pub fn begin_transition_phase(
@@ -3135,15 +3263,27 @@ fn skeleton_bar(width: f32, height: f32) -> Element<'static, StartMessage> {
         .into()
 }
 
-/// Soft accent pill for pending Steam updates (compact + immersive status rows).
+/// Soft pill for pending Steam updates (compact accent; immersive grey).
 pub(crate) fn update_required_badge(
     selected: bool,
     muted: bool,
     fade: f32,
+    immersive: bool,
 ) -> Element<'static, StartMessage> {
     let fade = fade.clamp(0.0, 1.0);
     let a = if muted { 0.55 * fade } else { fade };
     let label_size = if selected { 13.0 } else { 11.0 };
+    let (fill, stroke) = if immersive {
+        (
+            theme::alpha(theme::MUTED, 0.22 * a),
+            theme::alpha(theme::MUTED, 0.40 * a),
+        )
+    } else {
+        (
+            theme::alpha(theme::ACCENT, 0.22 * a),
+            theme::alpha(theme::ACCENT, 0.45 * a),
+        )
+    };
     container(
         text("Update required")
             .size(label_size)
@@ -3160,9 +3300,9 @@ pub(crate) fn update_required_badge(
         left: 9.0,
     })
     .style(move |_theme: &Theme| container::Style {
-        background: Some(Background::Color(theme::alpha(theme::ACCENT, 0.22 * a))),
+        background: Some(Background::Color(fill)),
         border: Border {
-            color: theme::alpha(theme::ACCENT, 0.45 * a),
+            color: stroke,
             width: 1.0,
             radius: 999.0.into(),
         },
@@ -3171,15 +3311,69 @@ pub(crate) fn update_required_badge(
     .into()
 }
 
+/// Meta under a game title: plain path, or stacked `Label: value` lines.
+pub(crate) fn game_subtitle_block<'a>(
+    subtitle: &'a StartSubtitle,
+    value_color: Color,
+    label_color: Color,
+    value_size: f32,
+) -> Element<'a, StartMessage> {
+    match subtitle {
+        StartSubtitle::Plain(plain) => text(plain.as_str())
+            .size(value_size)
+            .color(value_color)
+            .wrapping(Wrapping::Word)
+            .width(Fill)
+            .into(),
+        StartSubtitle::Labeled(lines) => {
+            let mut col = column![].spacing(2).width(Fill);
+            for line in lines {
+                col = col.push(
+                    row![
+                        text(format!("{}:", line.label))
+                            .size(value_size)
+                            .color(label_color),
+                        text(line.value.as_str())
+                            .size(value_size)
+                            .color(value_color)
+                            .wrapping(Wrapping::Word),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                );
+            }
+            col.into()
+        }
+    }
+}
+
 /// Compact combined status string (tests / fallbacks). UI prefers meta + badge.
 #[cfg(test)]
 fn compact_status_label(row: &StartRow) -> Option<String> {
-    match (row.subtitle.as_deref(), row.update_required) {
-        (None, false) => None,
-        (None, true) => Some("Update required".into()),
-        (Some("Steam"), true) => Some("Update required".into()),
-        (Some(meta), true) => Some(format!("{meta} · Update required")),
-        (Some(meta), false) => Some(meta.to_string()),
+    let show_meta = row
+        .subtitle
+        .as_ref()
+        .is_some_and(|sub| !(row.update_required && sub.is_steam_fallback()));
+    match (&row.subtitle, row.update_required, show_meta) {
+        (None, false, _) => None,
+        (None, true, _) | (Some(_), true, false) => Some("Update required".into()),
+        (Some(StartSubtitle::Plain(text)), false, _) => Some(text.clone()),
+        (Some(StartSubtitle::Plain(text)), true, true) => Some(format!("{text} · Update required")),
+        (Some(StartSubtitle::Labeled(lines)), false, _) => Some(
+            lines
+                .iter()
+                .map(|l| format!("{}: {}", l.label, l.value))
+                .collect::<Vec<_>>()
+                .join(" · "),
+        ),
+        (Some(StartSubtitle::Labeled(lines)), true, true) => Some(format!(
+            "{} · Update required",
+            lines
+                .iter()
+                .map(|l| format!("{}: {}", l.label, l.value))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        )),
     }
 }
 
@@ -3251,7 +3445,7 @@ fn game_row(
             .width(Fill)
             .into()
     } else {
-        let title = text(&row.title)
+        let title_text = text(&row.title)
             .size(19.0)
             .color(title_color)
             .font(if selected {
@@ -3262,8 +3456,21 @@ fn game_row(
             } else {
                 Font::DEFAULT
             })
-            .wrapping(Wrapping::None)
-            .width(Fill);
+            .wrapping(Wrapping::None);
+
+        // Update badge sits on the title row in compact (immersive keeps it under meta).
+        let title: Element<'_, StartMessage> = if !running && row.update_required {
+            row![
+                title_text,
+                update_required_badge(selected, muted, 1.0, false),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .width(Fill)
+            .into()
+        } else {
+            title_text.width(Fill).into()
+        };
 
         let status: Element<'_, StartMessage> = if running {
             text("Running")
@@ -3275,22 +3482,10 @@ fn game_row(
         } else {
             let show_meta = row
                 .subtitle
-                .as_deref()
-                .is_some_and(|sub| !(row.update_required && sub == "Steam"));
-            if show_meta || row.update_required {
-                let mut status = row![].spacing(8).align_y(Alignment::Center);
-                if show_meta && let Some(sub) = row.subtitle.as_ref() {
-                    status = status.push(
-                        text(sub.as_str())
-                            .size(13.0)
-                            .color(sub_color)
-                            .wrapping(Wrapping::None),
-                    );
-                }
-                if row.update_required {
-                    status = status.push(update_required_badge(selected, muted, 1.0));
-                }
-                status.width(Fill).into()
+                .as_ref()
+                .is_some_and(|sub| !(row.update_required && sub.is_steam_fallback()));
+            if show_meta && let Some(sub) = row.subtitle.as_ref() {
+                game_subtitle_block(sub, sub_color, theme::alpha(sub_color, 0.8), 12.0)
             } else {
                 text(" ")
                     .size(13.0)
@@ -3527,7 +3722,10 @@ mod tests {
         let row = StartRow::from_entry(&entry, &empty, false);
         assert!(!row.skeleton);
         assert_eq!(row.title, "Steam 1371980");
-        assert_eq!(row.subtitle.as_deref(), Some("steam://rungameid/1371980"));
+        assert!(matches!(
+            row.subtitle.as_ref(),
+            Some(StartSubtitle::Plain(uri)) if uri == "steam://rungameid/1371980"
+        ));
     }
 
     #[test]
@@ -3550,7 +3748,11 @@ mod tests {
         let row = StartRow::from_entry(&entry, &map, true);
         assert!(!row.skeleton);
         assert_eq!(row.title, "Path of Exile");
-        assert_eq!(row.subtitle.as_deref(), Some("Steam"));
+        assert!(
+            row.subtitle
+                .as_ref()
+                .is_some_and(|sub| sub.is_steam_fallback())
+        );
         assert!(row.update_required);
         assert_eq!(
             compact_status_label(&row).as_deref(),
