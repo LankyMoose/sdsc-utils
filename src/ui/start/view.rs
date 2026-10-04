@@ -5375,40 +5375,42 @@ mod tests {
 
     #[test]
     fn list_icon_live_peeks_cache_without_row_snapshot() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("sdsc-list-live-{n}"));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("icon.png");
-        {
-            let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), 2, 2);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
-            let mut writer = enc.write_header().unwrap();
-            writer
-                .write_image_data(&[
-                    255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
-                ])
-                .unwrap();
-        }
-        let row = StartRow {
-            title: "g".into(),
-            subtitle: None,
-            target: "t".into(),
-            args: String::new(),
-            play_key: "k".into(),
-            icon: None,
-            icon_source: Some(IconSource::File(path.clone())),
-            backdrop_path: None,
-            edit: None,
-            skeleton: false,
-            update_required: false,
-        };
-        assert!(row.list_icon_live().is_none());
-        assert!(icon_cache::handle_for_path(&path).is_some());
-        assert!(row.list_icon_live().is_some());
-        let _ = std::fs::remove_dir_all(&dir);
+        icon_cache::with_cache_lock(|| {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("sdsc-list-live-{n}"));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("icon.png");
+            {
+                let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), 2, 2);
+                enc.set_color(png::ColorType::Rgba);
+                enc.set_depth(png::BitDepth::Eight);
+                let mut writer = enc.write_header().unwrap();
+                writer
+                    .write_image_data(&[
+                        255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+                    ])
+                    .unwrap();
+            }
+            let row = StartRow {
+                title: "g".into(),
+                subtitle: None,
+                target: "t".into(),
+                args: String::new(),
+                play_key: "k".into(),
+                icon: None,
+                icon_source: Some(IconSource::File(path.clone())),
+                backdrop_path: None,
+                edit: None,
+                skeleton: false,
+                update_required: false,
+            };
+            assert!(row.list_icon_live().is_none());
+            assert!(icon_cache::handle_for_path(&path).is_some());
+            assert!(row.list_icon_live().is_some());
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
