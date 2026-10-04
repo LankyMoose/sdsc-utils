@@ -1140,6 +1140,11 @@ impl App {
 
         match result {
             Ok(controllers) => {
+                if let Some(worker) = self.hid_worker.as_ref() {
+                    self.session
+                        .notify
+                        .queue_launch_quiet(worker.take_launch_serials());
+                }
                 let ctx = crate::session::ApplyContext {
                     start_visible: self.start_visible,
                     fullscreen: start_input::foreground_is_exclusive_fullscreen(),

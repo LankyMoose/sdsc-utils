@@ -6,6 +6,7 @@ use crate::controller::driver;
 use crate::controller::dualsense::battery;
 use crate::controller::dualsense::identity::{self as dualsense, hid_serial, is_storable_serial};
 use crate::controller::dualsense::lightbar::{self, HidPhaseTiming};
+use crate::controller::hid::launch_paths::LaunchPaths;
 use crate::controller::model::ControllerStatus;
 use crate::domain::color::color_for_battery_percent;
 use crate::platform::app_log;
@@ -80,17 +81,23 @@ pub fn poll_controllers(previously_connected: &[String]) -> Result<Vec<Controlle
     dualsense::with_hid_lock(|| {
         let api = HidApi::new().map_err(|e| e.to_string())?;
         let mut timing = HidPhaseTiming::default();
-        poll_controllers_with_api(&api, previously_connected, &mut timing)
+        poll_controllers_with_api(&api, previously_connected, &mut timing, None, None)
     })
 }
 
 /// Daemon worker entry: no outer lock (worker is exclusive). Uses caller's `HidApi`.
+///
+/// When `launch` / `launch_quiet` are set, serials for paths present at first enum
+/// are appended to `launch_quiet` on a successful battery read (no Connected toast).
 pub fn poll_controllers_timed(
     api: &HidApi,
     previously_connected: &[String],
+    launch: Option<&mut LaunchPaths>,
+    launch_quiet: Option<&mut Vec<String>>,
 ) -> (Result<Vec<ControllerStatus>, String>, HidPhaseTiming) {
     let mut timing = HidPhaseTiming::default();
-    let result = poll_controllers_with_api(api, previously_connected, &mut timing);
+    let result =
+        poll_controllers_with_api(api, previously_connected, &mut timing, launch, launch_quiet);
     (result, timing)
 }
 
@@ -98,6 +105,8 @@ fn poll_controllers_with_api(
     api: &HidApi,
     previously_connected: &[String],
     timing: &mut HidPhaseTiming,
+    mut launch: Option<&mut LaunchPaths>,
+    mut launch_quiet: Option<&mut Vec<String>>,
 ) -> Result<Vec<ControllerStatus>, String> {
     let enum_started = Instant::now();
     let devices: Vec<&DeviceInfo> = api
@@ -147,6 +156,7 @@ fn poll_controllers_with_api(
         };
 
         let io_started = Instant::now();
+        let path = info.path().to_string_lossy().into_owned();
         let serial = dualsense::resolve_device_identity(info, &device);
         match battery::read_battery(&device) {
             Ok(reading) => {
@@ -155,6 +165,14 @@ fn poll_controllers_with_api(
                 // have been used for input often accept write()/send_output_report with Ok
                 // without updating the bar (see write_rgb_exclusive).
                 drop(device);
+                if let Some(quiet) = launch
+                    .as_mut()
+                    .and_then(|l| l.take_serial_for_path(&path, &serial))
+                {
+                    if let Some(out) = launch_quiet.as_mut() {
+                        out.push(quiet);
+                    }
+                }
                 pads.push(PolledPad {
                     status: status_from_reading(product, &reading, serial),
                 });

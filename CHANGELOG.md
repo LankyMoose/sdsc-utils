@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Connected toasts are skipped for controllers already connected when the app starts.
+
 ## [1.5.2] - 2026-10-03
 
 ### Fixed

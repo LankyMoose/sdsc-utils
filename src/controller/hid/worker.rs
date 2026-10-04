@@ -29,6 +29,7 @@ use crate::controller::dualsense::lightbar::{
     LOW_BATTERY_PULSE_GAP_MS, LOW_BATTERY_PULSE_ON_MS,
 };
 use crate::controller::dualsense::rumble;
+use crate::controller::hid::launch_paths::LaunchPaths;
 use crate::controller::hid::poll::{self, PRESENCE_INTERVAL, PRESENCE_INTERVAL_EMPTY};
 use crate::controller::model::ControllerStatus;
 use crate::domain::color::{Rgb, color_for_battery_percent};
@@ -123,6 +124,8 @@ struct DeviceCache {
     devices: HashMap<String, OpenDevice>,
     last_enum_at: Option<Instant>,
     presence: Arc<Mutex<Vec<String>>>,
+    launch_paths: LaunchPaths,
+    launch_serials: Arc<Mutex<Vec<String>>>,
 }
 
 /// Last battery + product label observed while sampling (hot path).
@@ -132,16 +135,27 @@ struct LivePadStatus {
 }
 
 impl DeviceCache {
-    fn new(presence: Arc<Mutex<Vec<String>>>) -> Result<Self, String> {
+    fn new(
+        presence: Arc<Mutex<Vec<String>>>,
+        launch_serials: Arc<Mutex<Vec<String>>>,
+    ) -> Result<Self, String> {
         let api = HidApi::new().map_err(|e| e.to_string())?;
         let mut cache = Self {
             api,
             devices: HashMap::new(),
             last_enum_at: None,
             presence,
+            launch_paths: LaunchPaths::new(),
+            launch_serials,
         };
         let _ = cache.refresh_device_list();
         Ok(cache)
+    }
+
+    fn queue_launch_serial(&self, serial: String) {
+        if let Ok(mut guard) = self.launch_serials.lock() {
+            guard.push(serial);
+        }
     }
 
     /// Re-enumerate in place (does **not** reconstruct `HidApi`).
@@ -156,6 +170,7 @@ impl DeviceCache {
             .map(|d| d.path().to_string_lossy().into_owned())
             .collect();
         paths.sort();
+        self.launch_paths.on_device_list(paths.iter().cloned());
         if let Ok(mut guard) = self.presence.lock() {
             *guard = paths;
         }
@@ -292,6 +307,11 @@ impl DeviceCache {
                     .devices
                     .contains_key(&normalize_identity(identity_hint))
             {
+                let path = info.path().to_string_lossy().into_owned();
+                let identity = normalize_identity(identity_hint);
+                if let Some(serial) = self.launch_paths.take_serial_for_path(&path, &identity) {
+                    self.queue_launch_serial(serial);
+                }
                 continue;
             }
             let open_started = Instant::now();
@@ -320,7 +340,11 @@ impl DeviceCache {
                     }
                 }
             };
+            let path = info.path().to_string_lossy().into_owned();
             let identity = resolve_device_identity(info, &device);
+            if let Some(serial) = self.launch_paths.take_serial_for_path(&path, &identity) {
+                self.queue_launch_serial(serial);
+            }
             if self.devices.contains_key(&identity) {
                 continue;
             }
@@ -637,6 +661,8 @@ pub struct HidWorkerHandle {
     presence: Arc<Mutex<Vec<String>>>,
     /// Latest battery/product per serial from the input sample path.
     live_pads: Arc<Mutex<HashMap<String, LivePadStatus>>>,
+    /// Serials resolved from HID paths present at first enum (suppress Connected toast).
+    launch_serials: Arc<Mutex<Vec<String>>>,
 }
 
 impl HidWorkerHandle {
@@ -650,6 +676,8 @@ impl HidWorkerHandle {
         let presence_worker = Arc::clone(&presence);
         let live_pads = Arc::new(Mutex::new(HashMap::new()));
         let live_pads_worker = Arc::clone(&live_pads);
+        let launch_serials = Arc::new(Mutex::new(Vec::new()));
+        let launch_serials_worker = Arc::clone(&launch_serials);
         let input_snapshot = Arc::new(Mutex::new(InputSnapshot::default()));
         start_input::set_input_snapshot(Arc::clone(&input_snapshot));
         let last_noisy_log = Arc::new(Mutex::new(Instant::now() - PULSE_SAMPLE_LOG_INTERVAL));
@@ -667,6 +695,7 @@ impl HidWorkerHandle {
                     input_snapshot,
                     presence_worker,
                     live_pads_worker,
+                    launch_serials_worker,
                 );
             })
             .expect("spawn hid-worker");
@@ -677,6 +706,7 @@ impl HidWorkerHandle {
             input_hot,
             presence,
             live_pads,
+            launch_serials,
         }
     }
 
@@ -687,6 +717,14 @@ impl HidWorkerHandle {
     /// Latest DualSense gamepad HID paths from the worker's throttled refresh.
     pub fn presence_paths(&self) -> Vec<String> {
         self.presence.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Drain serials identified from paths that were already present at worker start.
+    pub fn take_launch_serials(&self) -> Vec<String> {
+        self.launch_serials
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
     }
 
     /// Controller statuses built from the hot input sample path (no exclusive Poll).
@@ -1557,11 +1595,20 @@ fn handle_cmd(
             }
             log_cmd_begin("Poll", snapshot);
             let started = Instant::now();
+            let mut quiet = Vec::new();
             let (result, timing) = {
                 let _op = crate::controller::hid::diag::enter_op("cmd_Poll");
                 let _ = cache.refresh_device_list();
-                poll::poll_controllers_timed(&cache.api, &previously)
+                poll::poll_controllers_timed(
+                    &cache.api,
+                    &previously,
+                    Some(&mut cache.launch_paths),
+                    Some(&mut quiet),
+                )
             };
+            for serial in quiet {
+                cache.queue_launch_serial(serial);
+            }
             // Seed live map from Poll so a hot transition has immediate statuses.
             if let Ok(ref controllers) = result
                 && let Ok(mut guard) = live_pads.lock()
@@ -1602,8 +1649,9 @@ fn worker_loop(
     input_snapshot: Arc<Mutex<InputSnapshot>>,
     presence: Arc<Mutex<Vec<String>>>,
     live_pads: Arc<Mutex<HashMap<String, LivePadStatus>>>,
+    launch_serials: Arc<Mutex<Vec<String>>>,
 ) {
-    let mut cache = match DeviceCache::new(presence) {
+    let mut cache = match DeviceCache::new(presence, launch_serials) {
         Ok(c) => c,
         Err(err) => {
             app_log::warn(format!("hid-worker: HidApi init failed: {err}"));

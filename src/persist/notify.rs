@@ -2,11 +2,12 @@
 //!
 //! Low battery fires only after an observed bucket moves from above the
 //! threshold into the low window. A pad that appears already low does not.
+//! Connect toasts skip serials queued as already present at process launch.
 
 use crate::controller::model::{ControllerStatus, PowerState};
 use crate::persist::prefs::Prefs;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default)]
 struct SerialFlags {
@@ -17,6 +18,8 @@ struct SerialFlags {
 #[derive(Debug, Default)]
 pub struct NotifyTracker {
     by_serial: HashMap<String, SerialFlags>,
+    /// Serials already connected at process start — suppress one Connected toast.
+    launch_quiet: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +42,11 @@ pub struct NotifyEvent {
 impl NotifyTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Mark serials that were already present when the app started (no Connected toast).
+    pub fn queue_launch_quiet(&mut self, serials: impl IntoIterator<Item = String>) {
+        self.launch_quiet.extend(serials);
     }
 
     /// Collect overlay toasts for connect / low-battery / charge-complete transitions.
@@ -92,7 +100,14 @@ impl NotifyTracker {
             let prev = prev_by_serial.get(controller.serial.as_str()).copied();
 
             if prev.is_none() && prefs.notify_connect {
-                events.push((controller, NotifyKind::Connect));
+                if self.launch_quiet.remove(&controller.serial) {
+                    diag_notify(format!(
+                        "ui-diag: connect suppressed (present at launch) serial={}",
+                        controller.serial
+                    ));
+                } else {
+                    events.push((controller, NotifyKind::Connect));
+                }
             }
 
             let threshold = prefs.low_battery_percent;
@@ -262,6 +277,69 @@ mod tests {
         assert_eq!(tracker.collect_events(&[], &connected, &p).len(), 1);
         assert!(tracker.collect_events(&connected, &[], &p).is_empty());
         assert_eq!(tracker.collect_events(&[], &connected, &p).len(), 1);
+    }
+
+    #[test]
+    fn launch_quiet_skips_connect_for_queued_serial_only() {
+        let mut tracker = NotifyTracker::new();
+        tracker.queue_launch_quiet(["a".to_string()]);
+        let p = prefs(true, true, true);
+        let connected = vec![
+            pad(
+                "a",
+                40,
+                PowerState::Discharging,
+                crate::controller::model::Connection::Usb,
+            ),
+            pad(
+                "b",
+                85,
+                PowerState::Discharging,
+                crate::controller::model::Connection::Bluetooth,
+            ),
+        ];
+
+        let events = tracker.collect_events(&[], &connected, &p);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0.serial, "b");
+        assert_eq!(events[0].1, NotifyKind::Connect);
+    }
+
+    #[test]
+    fn launch_quiet_reconnect_after_disconnect_notifies() {
+        let mut tracker = NotifyTracker::new();
+        tracker.queue_launch_quiet(["a".to_string()]);
+        let p = prefs(true, true, true);
+        let connected = vec![pad(
+            "a",
+            40,
+            PowerState::Discharging,
+            crate::controller::model::Connection::Usb,
+        )];
+
+        assert!(tracker.collect_events(&[], &connected, &p).is_empty());
+        assert!(tracker.collect_events(&connected, &[], &p).is_empty());
+        assert_eq!(tracker.collect_events(&[], &connected, &p).len(), 1);
+    }
+
+    #[test]
+    fn launch_quiet_disconnect_still_notifies() {
+        let mut tracker = NotifyTracker::new();
+        tracker.queue_launch_quiet(["a".to_string()]);
+        let connected = vec![pad(
+            "a",
+            40,
+            PowerState::Discharging,
+            crate::controller::model::Connection::Bluetooth,
+        )];
+        assert!(
+            tracker
+                .evaluate(&[], &connected, &prefs(true, true, true), |_| None)
+                .is_empty()
+        );
+        let events = tracker.evaluate(&connected, &[], &prefs(true, true, false), |_| None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].body, "Disconnected");
     }
 
     #[test]
