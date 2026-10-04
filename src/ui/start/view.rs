@@ -28,9 +28,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Logical width of the start-screen window.
-pub const WIDTH: f32 = 640.0;
-/// Logical height of the start-screen window.
-pub const HEIGHT: f32 = 500.0;
+pub const WIDTH: f32 = 768.0;
+/// Logical height of the start-screen window (same 32∶25 aspect as 640×500).
+pub const HEIGHT: f32 = 600.0;
 
 pub const SLIDE_ANIM_MS: u64 = 220;
 const SLIDE_ANIM_MIN_MS: u64 = 60;
@@ -98,10 +98,25 @@ pub enum StartMessage {
     EditManual,
     GamesScrolled(f32, f32),
     ControllersScrolled(f32, f32),
+    SettingsScrolled(f32, f32),
     ManualAddTitle(String),
     ManualAddArgs(String),
     ManualPickIcon,
     ManualClearIcon,
+    /// Options — open/close in-window Start settings.
+    ToggleSettings,
+    SetUsbControllers(bool),
+    SetAlwaysImmersive(bool),
+    SetInactiveSecs(u32),
+    SetSleepSecs(u32),
+    SetInactiveDimPercent(u8),
+    SetSounds(bool),
+    SetSoundVolume(u8),
+    SetHaptics(bool),
+    SetHapticsStrength(u8),
+    StartGestureRecord,
+    ResetStartGesture,
+    CancelGestureRecord,
     /// Mouse-only: stamp lightbar-miss hitch for multi-session diag.
     #[cfg(debug_assertions)]
     ReportLightbarFailure,
@@ -452,16 +467,71 @@ struct RowHintState {
     press_anim: FacePressAnim,
 }
 
+/// Which chrome surface may light face / Options / reopen-chord press visuals.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HintPressOwner {
+    Browse,
+    Settings,
+    ManualAdd,
+    ReplaceConfirm,
+}
+
+impl HintPressOwner {
+    fn current(state: &State) -> Self {
+        if state.settings.open || state.settings.anim.is_some() {
+            Self::Settings
+        } else if state.manual_add.is_some() {
+            Self::ManualAdd
+        } else if state.replace_confirm.is_some() {
+            Self::ReplaceConfirm
+        } else {
+            Self::Browse
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct HintPress {
+    held: FaceHeld,
+    press_anim: FacePressAnim,
+    reopen_held: bool,
+    reopen_press: f32,
+    triangle_progress: f32,
+    triangle_armed_t: f32,
+    cross_progress: f32,
+    cross_armed_t: f32,
+}
+
+impl HintPress {
+    fn for_owner(state: &State, owner: HintPressOwner) -> Self {
+        if HintPressOwner::current(state) != owner {
+            return Self::default();
+        }
+        Self {
+            held: state.held,
+            press_anim: state.press_anim,
+            reopen_held: state.reopen_chord_held,
+            reopen_press: state.reopen_chord_press,
+            triangle_progress: state.triangle_progress,
+            triangle_armed_t: state.triangle_armed_anim,
+            cross_progress: state.cross_progress,
+            cross_armed_t: state.cross_armed_anim,
+        }
+    }
+}
+
 impl RowHintState {
     fn for_selected(state: &State, selected: bool) -> Self {
+        // Browse row/dock/hero share press with the browse footer — idle while an overlay owns input.
         if selected {
+            let press = HintPress::for_owner(state, HintPressOwner::Browse);
             Self {
-                triangle_progress: state.triangle_progress,
-                triangle_armed_t: state.triangle_armed_anim,
-                cross_progress: state.cross_progress,
-                cross_armed_t: state.cross_armed_anim,
-                held: state.held,
-                press_anim: state.press_anim,
+                triangle_progress: press.triangle_progress,
+                triangle_armed_t: press.triangle_armed_t,
+                cross_progress: press.cross_progress,
+                cross_armed_t: press.cross_armed_t,
+                held: press.held,
+                press_anim: press.press_anim,
             }
         } else {
             Self::default()
@@ -633,6 +703,8 @@ pub struct State {
     pub running_target: Option<String>,
     pub replace_confirm: Option<ReplaceConfirm>,
     pub manual_add: Option<ManualAddDraft>,
+    /// Options settings panel (compact modal / immersive drawer).
+    pub settings: crate::ui::start::settings::SettingsPanel,
     pub triangle_progress: f32,
     pub cross_progress: f32,
     /// Face buttons currently held (pad OR keyboard) for action-hint press styling.
@@ -728,6 +800,7 @@ impl Default for State {
             running_target: None,
             replace_confirm: None,
             manual_add: None,
+            settings: crate::ui::start::settings::SettingsPanel::default(),
             triangle_progress: 0.0,
             cross_progress: 0.0,
             held: FaceHeld::default(),
@@ -911,6 +984,7 @@ impl State {
         self.dock_expanded = false;
         self.replace_confirm = None;
         self.manual_add = None;
+        self.settings.reset();
         self.triangle_progress = 0.0;
         self.cross_progress = 0.0;
         self.held = FaceHeld::default();
@@ -929,7 +1003,24 @@ impl State {
     }
 
     pub fn overlay_blocking(&self) -> bool {
-        self.replace_confirm.is_some() || self.manual_add.is_some()
+        self.replace_confirm.is_some()
+            || self.manual_add.is_some()
+            || self.settings.open
+            || self.settings.anim.is_some()
+    }
+
+    /// Toggle Options settings. Compact opens instantly; immersive slides the drawer.
+    pub fn request_settings(&mut self, open: bool, now: Instant) -> bool {
+        let animate = self.immersive;
+        if self.settings.request(open, now, animate) {
+            if open {
+                self.replace_confirm = None;
+                self.cross_progress = 0.0;
+            }
+            true
+        } else {
+            false
+        }
     }
 
     pub fn animating(&self) -> bool {
@@ -959,6 +1050,8 @@ impl State {
             || self.cross_progress > 0.0
             || self.replace_confirm.is_some()
             || self.manual_add.is_some()
+            || self.settings.open
+            || self.settings.anim.is_some()
             || self.hint_anims_need_frames()
             || self.identify_flash_active()
             || self.art_awaiting_paint
@@ -1076,6 +1169,7 @@ impl State {
         self.dock_expanded = false;
         self.dock_anim = None;
         self.strip_anim = None;
+        self.settings.reset();
         self.transition = None;
         self.transition_phase = None;
         self.enter_reveal = None;
@@ -2285,6 +2379,9 @@ impl State {
                 busy = true;
             }
         }
+        if self.settings.tick(now) {
+            busy = true;
+        }
         if let Some(anim) = self.strip_anim.as_ref() {
             let elapsed = now.saturating_duration_since(anim.started);
             if elapsed >= Duration::from_millis(anim.duration_ms) {
@@ -2455,7 +2552,6 @@ pub(crate) fn scroll_y_to_reveal(
     }
     let stride = row_h + gap;
     let row_top = index as f32 * stride;
-    let row_bottom = row_top + row_h;
     // Before the first on_scroll, fall back to a layout estimate — never force a
     // top pin on every step (that made controller nav look glued to the top).
     let viewport_h = if viewport_h <= 1.0 {
@@ -2463,6 +2559,21 @@ pub(crate) fn scroll_y_to_reveal(
     } else {
         viewport_h
     };
+    scroll_y_to_reveal_bounds(row_top, row_h, scroll_y, viewport_h, direction)
+}
+
+/// Pin-top / pin-bottom reveal for a row with known content bounds.
+pub fn scroll_y_to_reveal_bounds(
+    row_top: f32,
+    row_h: f32,
+    scroll_y: f32,
+    viewport_h: f32,
+    direction: ScrollReveal,
+) -> Option<f32> {
+    if row_h <= 0.0 || viewport_h <= 0.0 {
+        return None;
+    }
+    let row_bottom = row_top + row_h;
     let view_top = scroll_y;
     let view_bottom = scroll_y + viewport_h;
     match direction {
@@ -2475,14 +2586,14 @@ pub(crate) fn scroll_y_to_reveal(
         }
         ScrollReveal::Up => {
             if row_top < view_top {
-                Some(row_top)
+                Some(row_top.max(0.0))
             } else {
                 None
             }
         }
         ScrollReveal::Either => {
             if row_top < view_top {
-                Some(row_top)
+                Some(row_top.max(0.0))
             } else if row_bottom > view_bottom {
                 Some((row_bottom - viewport_h).max(0.0))
             } else {
@@ -2745,6 +2856,7 @@ pub fn view<'a>(
     always_immersive: bool,
     promote_gesture: &'a [crate::domain::gesture::GestureControl],
     stage_h: f32,
+    settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
 ) -> Element<'a, StartMessage> {
     use crate::ui::start::mode::TransitionPhase;
 
@@ -2772,6 +2884,7 @@ pub fn view<'a>(
             always_immersive,
             promote_gesture,
             stage_h,
+            settings_snapshot,
         );
     }
 
@@ -2798,7 +2911,19 @@ pub fn view<'a>(
         flat_hints,
         primary,
     );
-    crate::ui::start::immersive::compact_transition_overlay(compact, veil, false)
+    let with_veil = crate::ui::start::immersive::compact_transition_overlay(compact, veil, false);
+    let settings_p = state.settings.progress(now);
+    if state.settings.visible(now) {
+        stack![
+            with_veil,
+            crate::ui::start::settings::compact_overlay(state, settings_snapshot, settings_p),
+        ]
+        .width(Fill)
+        .height(Fill)
+        .into()
+    } else {
+        with_veil
+    }
 }
 
 fn compact_chrome<'a>(
@@ -3314,18 +3439,21 @@ pub(crate) fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
                     .style(theme::ghost),
             ]
             .spacing(10),
-            action_cluster(
-                &[
-                    face_hint(
-                        FaceButton::Cross,
-                        if draft.is_edit() { "Save" } else { "Add" },
-                        state.held,
-                        state.press_anim,
-                    ),
-                    face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
-                ],
-                false,
-            ),
+            {
+                let press = HintPress::for_owner(state, HintPressOwner::ManualAdd);
+                action_cluster(
+                    &[
+                        face_hint(
+                            FaceButton::Cross,
+                            if draft.is_edit() { "Save" } else { "Add" },
+                            press.held,
+                            press.press_anim,
+                        ),
+                        face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
+                    ],
+                    false,
+                )
+            },
         ]
         .spacing(10)
         .width(Length::Fixed(420.0))
@@ -3375,20 +3503,23 @@ pub(crate) fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
             .size(14.0)
             .color(theme::MUTED),
             space().height(8),
-            action_cluster(
-                &[
-                    face_hold_hint(
-                        FaceButton::Cross,
-                        "Proceed",
-                        state.cross_progress,
-                        state.cross_armed_anim,
-                        state.held,
-                        state.press_anim,
-                    ),
-                    face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
-                ],
-                false,
-            ),
+            {
+                let press = HintPress::for_owner(state, HintPressOwner::ReplaceConfirm);
+                action_cluster(
+                    &[
+                        face_hold_hint(
+                            FaceButton::Cross,
+                            "Proceed",
+                            press.cross_progress,
+                            press.cross_armed_t,
+                            press.held,
+                            press.press_anim,
+                        ),
+                        face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
+                    ],
+                    false,
+                )
+            },
         ]
         .spacing(12)
         .align_x(Alignment::Center),
@@ -3495,7 +3626,9 @@ pub(crate) fn footer_hint<'a>(
     promote_gesture: &'a [crate::domain::gesture::GestureControl],
     flat_hints: bool,
 ) -> Element<'a, StartMessage> {
+    // Settings keeps its own footer inside the panel — main chrome footer stays browse/modals.
     if state.manual_add.is_some() {
+        let press = HintPress::for_owner(state, HintPressOwner::ManualAdd);
         let label = if state.manual_add.as_ref().is_some_and(|d| d.is_edit()) {
             "Save"
         } else {
@@ -3504,8 +3637,8 @@ pub(crate) fn footer_hint<'a>(
         return footer_band(
             action_cluster(
                 &[
-                    face_hint(FaceButton::Cross, label, state.held, state.press_anim),
-                    face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
+                    face_hint(FaceButton::Cross, label, press.held, press.press_anim),
+                    face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
                 ],
                 flat_hints,
             ),
@@ -3513,18 +3646,19 @@ pub(crate) fn footer_hint<'a>(
         );
     }
     if state.replace_confirm.is_some() {
+        let press = HintPress::for_owner(state, HintPressOwner::ReplaceConfirm);
         return footer_band(
             action_cluster(
                 &[
                     face_hold_hint(
                         FaceButton::Cross,
                         "Proceed",
-                        state.cross_progress,
-                        state.cross_armed_anim,
-                        state.held,
-                        state.press_anim,
+                        press.cross_progress,
+                        press.cross_armed_t,
+                        press.held,
+                        press.press_anim,
                     ),
-                    face_hint(FaceButton::Circle, "Cancel", state.held, state.press_anim),
+                    face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
                 ],
                 flat_hints,
             ),
@@ -3532,6 +3666,7 @@ pub(crate) fn footer_hint<'a>(
         );
     }
 
+    let press = HintPress::for_owner(state, HintPressOwner::Browse);
     let circle_label =
         crate::ui::start::mode::cancel_circle_label(immersive, always_immersive, state.editing);
     // Compact → Immersive; immersive (when not always-on) → Compact via the same chord.
@@ -3551,8 +3686,8 @@ pub(crate) fn footer_hint<'a>(
         gesture_chord_hint(
             promote_gesture,
             label,
-            state.reopen_chord_held,
-            state.reopen_chord_press,
+            press.reopen_held,
+            press.reopen_press,
             flat_hints,
         )
     });
@@ -3563,14 +3698,14 @@ pub(crate) fn footer_hint<'a>(
                 face_hint(
                     FaceButton::Triangle,
                     if state.editing { "Save" } else { "Edit" },
-                    state.held,
-                    state.press_anim,
+                    press.held,
+                    press.press_anim,
                 ),
                 face_hint(
                     FaceButton::Circle,
                     circle_label,
-                    state.held,
-                    state.press_anim,
+                    press.held,
+                    press.press_anim,
                 ),
             ];
             if state.editing {
@@ -3588,8 +3723,8 @@ pub(crate) fn footer_hint<'a>(
             } else {
                 let mut row = iced::widget::row![face_cycle_toggle(
                     FaceButton::Square,
-                    state.held,
-                    state.press_anim,
+                    press.held,
+                    press.press_anim,
                     &[
                         (
                             "Last played",
@@ -3607,14 +3742,20 @@ pub(crate) fn footer_hint<'a>(
                 if let Some(cue) = promote_cue {
                     row = row.push(cue);
                 }
+                row = row.push(options_hint_el(
+                    "Settings",
+                    press.held,
+                    press.press_anim,
+                    flat_hints,
+                ));
                 row.push(action_cluster(&hints, flat_hints)).into()
             }
         }
         StartSlide::Controllers => {
             let mut row = iced::widget::row![face_cycle_toggle(
                 FaceButton::Square,
-                state.held,
-                state.press_anim,
+                press.held,
+                press.press_anim,
                 &[
                     ("Connected", !state.show_all_controllers),
                     ("All", state.show_all_controllers),
@@ -3626,12 +3767,18 @@ pub(crate) fn footer_hint<'a>(
             if let Some(cue) = promote_cue {
                 row = row.push(cue);
             }
+            row = row.push(options_hint_el(
+                "Settings",
+                press.held,
+                press.press_anim,
+                flat_hints,
+            ));
             row.push(action_cluster(
                 &[face_hint(
                     FaceButton::Circle,
                     circle_label,
-                    state.held,
-                    state.press_anim,
+                    press.held,
+                    press.press_anim,
                 )],
                 flat_hints,
             ))
@@ -3640,6 +3787,40 @@ pub(crate) fn footer_hint<'a>(
     };
 
     footer_band(cluster, immersive)
+}
+
+fn options_hint_el(
+    label: &'static str,
+    held: FaceHeld,
+    press_anim: FacePressAnim,
+    flat: bool,
+) -> Element<'static, StartMessage> {
+    let glyph = start_options_capsule(held.options, press_anim.options, flat);
+    row![glyph, text(label).size(14.0).color(theme::MUTED)]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// Visible idle diameter of face / text rings (inset so ×[`PRESSED_SCALE`] stays in-slot).
+fn hint_ring_idle_diameter() -> f32 {
+    let half = HOLD_RING_SIZE / 2.0;
+    let max_radius = half - 2.5;
+    (max_radius / PRESSED_SCALE) * 2.0
+}
+
+/// DualSense Options → START capsule (visual height matches face-ring idle diameter).
+fn start_options_capsule(
+    pressed: bool,
+    press_t: f32,
+    flat: bool,
+) -> Element<'static, StartMessage> {
+    let label = text("START")
+        .size(12.0)
+        .font(Font::MONOSPACE)
+        .color(theme::ACCENT);
+    // Monospace caps sit high in the em box — nudge down for optical center.
+    hint_text_capsule(label, 10.0, 1.0, pressed, press_t, flat)
 }
 
 /// Reopen-chord cue: short single control → circle; else one capsule with joined text.
@@ -3709,6 +3890,42 @@ fn text_glyph_capsule(
     press_t: f32,
     flat: bool,
 ) -> Element<'static, StartMessage> {
+    hint_text_capsule(
+        text(glyph).size(12.0).color(theme::ACCENT),
+        10.0,
+        0.0,
+        pressed,
+        press_t,
+        flat,
+    )
+}
+
+/// Pill glyph centered in a [`HOLD_RING_SIZE`] slot so height matches face rings.
+///
+/// `optical_top` adds extra top padding inside the pill (monospace caps often sit high).
+fn hint_text_capsule(
+    label: text::Text<'static>,
+    pad_x: f32,
+    optical_top: f32,
+    pressed: bool,
+    press_t: f32,
+    flat: bool,
+) -> Element<'static, StartMessage> {
+    hint_element_capsule(label, pad_x, optical_top, pressed, press_t, flat)
+}
+
+/// Shared capsule chrome for text and multi-glyph pills.
+///
+/// Important: use [`Alignment::Center`], never `center_y(Fill)` — Fill expands the
+/// capsule to the parent height (settings footer became a tall vertical pill).
+fn hint_element_capsule(
+    content: impl Into<Element<'static, StartMessage>>,
+    pad_x: f32,
+    optical_top: f32,
+    pressed: bool,
+    press_t: f32,
+    flat: bool,
+) -> Element<'static, StartMessage> {
     let border_color = if pressed {
         theme::ACCENT
     } else {
@@ -3718,28 +3935,33 @@ fn text_glyph_capsule(
         }
     };
     let border_w = if pressed { 2.5 } else { 2.0 };
-    let pill = container(text(glyph).size(12.0).color(theme::ACCENT))
+    let pill_h = hint_ring_idle_diameter();
+    let pill = container(content)
         .padding(Padding {
-            top: 0.0,
-            right: 12.0,
+            top: optical_top,
+            right: pad_x,
             bottom: 0.0,
-            left: 12.0,
+            left: pad_x,
         })
-        .height(Length::Fixed(HOLD_RING_SIZE))
+        .height(Length::Fixed(pill_h))
         .align_y(Alignment::Center)
         .style(move |_theme| container::Style {
             border: Border {
                 color: border_color,
                 width: border_w,
-                radius: (HOLD_RING_SIZE / 2.0).into(),
+                radius: (pill_h / 2.0).into(),
             },
             ..container::Style::default()
         });
+    // Same outer slot as [`text_glyph_circle`] / face rings so labels share a baseline.
+    let slot = container(pill)
+        .height(Length::Fixed(HOLD_RING_SIZE))
+        .align_y(Alignment::Center);
     if flat {
-        pill.into()
+        slot.into()
     } else {
         let scale = 1.0 + (PRESSED_SCALE - 1.0) * press_t.clamp(0.0, 1.0);
-        Float::new(pill).scale(scale).into()
+        Float::new(slot).scale(scale).into()
     }
 }
 
@@ -3842,10 +4064,12 @@ fn action_hint(hint: &ActionHint, flat: bool) -> Element<'static, StartMessage> 
         };
         face_glyph(face, style, hint.press_t, flat)
     } else {
-        text(hint.text_glyph.unwrap_or("?"))
-            .size(14.0)
-            .color(theme::ACCENT)
-            .into()
+        text_glyph_circle(
+            hint.text_glyph.unwrap_or("?"),
+            hint.pressed,
+            hint.press_t,
+            flat,
+        )
     };
 
     row![glyph, text(hint.label).size(14.0).color(theme::MUTED)]

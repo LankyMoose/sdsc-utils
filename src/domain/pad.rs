@@ -178,6 +178,8 @@ pub enum NavAction {
     CycleSort,
     /// Triangle edge — edit selected manual while in edit mode.
     Triangle,
+    /// Options — open/close Start settings.
+    ToggleSettings,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -467,8 +469,7 @@ impl EdgeButton {
             Self::Square => Some(NavAction::CycleSort),
             // Browse: enter edit. Edit: save (ToggleEdit commits).
             Self::Triangle => Some(NavAction::ToggleEdit),
-            // Options no longer drives start-screen actions (Square sorts).
-            Self::Options => None,
+            Self::Options => Some(NavAction::ToggleSettings),
             // Compact carousel: L2/R2 change slides. Immersive filters these out in PadNavBank.
             Self::L2 => Some(NavAction::PrevSlide),
             Self::R2 => Some(NavAction::NextSlide),
@@ -1912,14 +1913,17 @@ mod tests {
     }
 
     #[test]
-    fn button_edges_options_does_not_fire() {
+    fn button_edges_options_fires_toggle_settings_on_release() {
         let mut edges = ButtonEdges::default();
         let held = PadSample {
             options: true,
             ..Default::default()
         };
         assert!(edges.update(&held, None).is_none());
-        assert!(edges.update(&PadSample::default(), None).is_none());
+        assert_eq!(
+            edges.update(&PadSample::default(), None),
+            Some(NavAction::ToggleSettings)
+        );
     }
 
     #[test]
