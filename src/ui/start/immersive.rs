@@ -6,8 +6,8 @@ use crate::ui::shader::{AmbientProgram, VignetteProgram};
 use crate::ui::start::mode::{TransitionPhase, dock_panel_width, dock_stage_dim, dock_stage_scale};
 use crate::ui::start::translate::backdrop_art;
 use crate::ui::start::view::{
-    StartControllerRow, StartMessage, StartRow, StartSlide, State, footer_hint,
-    game_subtitle_block, immersive_dock_row_hints, immersive_game_hints,
+    StartControllerRow, StartMessage, StartRow, StartSlide, State, empty_games_browse_prompt,
+    footer_hint, game_subtitle_block, immersive_dock_row_hints, immersive_game_hints,
     immersive_game_membership_label, manual_add_view, replace_confirm_view, scan_status_chip,
     scan_status_stack, update_required_badge,
 };
@@ -429,12 +429,15 @@ fn hero_hint_overlay<'a>(row: &'a StartRow, state: &'a State) -> Element<'a, Sta
 }
 
 fn empty_games(state: &State) -> Element<'_, StartMessage> {
-    let copy = if state.editing {
-        "No installed Steam games — add a manual shortcut."
+    let empty: Element<'_, StartMessage> = if state.editing {
+        text("No installed Steam games — add a manual shortcut.")
+            .size(22.0)
+            .color(theme::MUTED)
+            .into()
     } else {
-        "No games yet — press Triangle to edit."
+        empty_games_browse_prompt(state, 22.0)
     };
-    container(text(copy).size(22.0).color(theme::MUTED))
+    container(empty)
         .width(Fill)
         .height(Fill)
         .center_x(Fill)
