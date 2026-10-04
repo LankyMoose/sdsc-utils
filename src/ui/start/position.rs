@@ -59,10 +59,24 @@ pub struct BarSpec {
     pub labels: &'static [&'static str],
     /// Fractional section index: the label at this index is centered.
     pub visual: f32,
-    /// Overall bar opacity (list reveal only; show/hide does not fade).
-    pub opacity: f32,
-    /// 0 = slid off the left edge, 1 = resting. Bar and labels share this.
+    /// List-reveal multiplier. Show/hide opacity is applied on top.
+    pub reveal: f32,
+    /// Settled show/hide opacity, used when [`motion`](Self::motion) is `None`.
+    pub show_opacity: f32,
+    /// 0 = slid off the left edge, 1 = resting. Used when [`motion`](Self::motion) is `None`.
     pub slide: f32,
+    /// In-flight show/hide. Draw samples this every frame so the slide is not
+    /// stuck to the 16ms UI tick.
+    pub motion: Option<ShowHide>,
+}
+
+/// One show/hide chase. `to` is 0 (hide) or 1 (show).
+#[derive(Debug, Clone, Copy)]
+pub struct ShowHide {
+    pub from_slide: f32,
+    pub from_opacity: f32,
+    pub to: f32,
+    pub started: std::time::Instant,
 }
 
 pub fn labels(mode: SectionMode) -> &'static [&'static str] {
@@ -206,17 +220,42 @@ pub fn gap_line(index: usize, count: usize, visual: f32, base_h: f32) -> Option<
 }
 
 /// Eased show/hide amount over `duration_ms` (slide uses [`FADE_MS`], opacity [`OPACITY_MS`]).
-pub fn show_hide_amount(from: f32, to: f32, elapsed_ms: u64, duration_ms: u64) -> f32 {
-    let t = (elapsed_ms as f32 / duration_ms.max(1) as f32).clamp(0.0, 1.0);
+///
+/// `elapsed_ms` is fractional so a vsync sample between whole milliseconds still moves.
+pub fn show_hide_amount(from: f32, to: f32, elapsed_ms: f32, duration_ms: u64) -> f32 {
+    let t = (elapsed_ms / duration_ms.max(1) as f32).clamp(0.0, 1.0);
     let eased = ease_out_cubic(t);
     (from + (to - from) * eased).clamp(0.0, 1.0)
+}
+
+impl BarSpec {
+    /// Slide and show/hide opacity at `now`. Motion is sampled here, not at view build.
+    pub fn slide_opacity_at(&self, now: std::time::Instant) -> (f32, f32) {
+        let Some(motion) = self.motion else {
+            return (self.slide, self.show_opacity);
+        };
+        let elapsed = now.saturating_duration_since(motion.started).as_secs_f32() * 1000.0;
+        (
+            show_hide_amount(motion.from_slide, motion.to, elapsed, FADE_MS),
+            show_hide_amount(motion.from_opacity, motion.to, elapsed, OPACITY_MS),
+        )
+    }
+
+    /// True while the horizontal slide has not reached its target.
+    pub fn show_hide_busy(&self, now: std::time::Instant) -> bool {
+        let Some(motion) = self.motion else {
+            return false;
+        };
+        let elapsed = now.saturating_duration_since(motion.started).as_secs_f32() * 1000.0;
+        elapsed < FADE_MS as f32
+    }
 }
 
 pub fn visibility_after_idle(elapsed_ms: u64) -> f32 {
     if elapsed_ms <= HIDE_AFTER_MS {
         1.0
     } else {
-        show_hide_amount(1.0, 0.0, elapsed_ms - HIDE_AFTER_MS, OPACITY_MS)
+        show_hide_amount(1.0, 0.0, (elapsed_ms - HIDE_AFTER_MS) as f32, OPACITY_MS)
     }
 }
 
@@ -270,6 +309,22 @@ struct PositionBar {
 impl<Message> canvas::Program<Message> for PositionBar {
     type State = ();
 
+    fn update(
+        &self,
+        _state: &mut Self::State,
+        _event: &canvas::Event,
+        _bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Option<canvas::Action<Message>> {
+        // The 16ms StartFrame tick is not vsync. While the slide is running,
+        // ask for the next frame so draw() can sample time at display rate.
+        if self.spec.show_hide_busy(std::time::Instant::now()) {
+            Some(canvas::Action::request_redraw())
+        } else {
+            None
+        }
+    }
+
     fn draw(
         &self,
         _state: &Self::State,
@@ -278,77 +333,85 @@ impl<Message> canvas::Program<Message> for PositionBar {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        let opacity = self.spec.opacity.clamp(0.0, 1.0);
-        let slide = self.spec.slide.clamp(0.0, 1.0);
+        let (slide, show_opacity) = self.spec.slide_opacity_at(std::time::Instant::now());
+        let opacity = (self.spec.reveal * show_opacity).clamp(0.0, 1.0);
+        let slide = slide.clamp(0.0, 1.0);
         if opacity < 0.01 || slide < 0.01 || bounds.height < 8.0 || self.spec.labels.is_empty() {
             return Vec::new();
         }
         let mut frame = Frame::new(renderer, bounds.size());
-        // Clip is the canvas bounds. Shift the whole column (gap lines and labels)
-        // so show/hide travels horizontally off the left edge.
-        frame.translate(Vector::new((slide - 1.0) * bounds.width, 0.0));
+        // Clip to the column, then shift gap lines and labels together so
+        // show/hide travels off the left edge.
+        let region = Rectangle::new(Point::ORIGIN, bounds.size());
+        frame.with_clip(region, |frame| {
+            frame.translate(Vector::new((slide - 1.0) * bounds.width, 0.0));
 
-        let count = self.spec.labels.len();
-        let center_y = bounds.height * 0.5;
-        let axis_x = column_axis(bounds.width);
-        let visual = self.spec.visual.clamp(0.0, (count - 1) as f32);
-        let base_h = base_h_for_bar(bounds.height);
-        let placed = label_positions(count, visual, center_y, base_h);
+            let count = self.spec.labels.len();
+            let center_y = bounds.height * 0.5;
+            let axis_x = column_axis(bounds.width);
+            let visual = self.spec.visual.clamp(0.0, (count - 1) as f32);
+            let base_h = base_h_for_bar(bounds.height);
+            let placed = label_positions(count, visual, center_y, base_h);
 
-        // One vertical line in the gap between each pair of sections, on the
-        // same axis as the labels. No line through a label, and no thumb.
-        for i in 0..count.saturating_sub(1) {
-            let Some((rel0, rel1)) = gap_line(i, count, visual, base_h) else {
-                continue;
-            };
-            let y0 = center_y + rel0;
-            let y1 = center_y + rel1;
-            if y1 < -8.0 || y0 > bounds.height + 8.0 {
-                continue;
+            // One vertical line in the gap between each pair of sections, on the
+            // same axis as the labels. No line through a label, and no thumb.
+            for i in 0..count.saturating_sub(1) {
+                let Some((rel0, rel1)) = gap_line(i, count, visual, base_h) else {
+                    continue;
+                };
+                let y0 = center_y + rel0;
+                let y1 = center_y + rel1;
+                if y1 < -8.0 || y0 > bounds.height + 8.0 {
+                    continue;
+                }
+                let mid_dist = (i as f32 + 0.5) - visual;
+                let local_op = opacity_at_distance(mid_dist) * opacity;
+                if local_op < 0.02 {
+                    continue;
+                }
+                let line = Path::line(Point::new(axis_x, y0), Point::new(axis_x, y1));
+                frame.stroke(
+                    &line,
+                    Stroke::default()
+                        .with_width(1.5)
+                        .with_color(theme::alpha(theme::MUTED, 0.55 * local_op)),
+                );
             }
-            let mid_dist = (i as f32 + 0.5) - visual;
-            let local_op = opacity_at_distance(mid_dist) * opacity;
-            if local_op < 0.02 {
-                continue;
-            }
-            let line = Path::line(Point::new(axis_x, y0), Point::new(axis_x, y1));
-            frame.stroke(
-                &line,
-                Stroke::default()
-                    .with_width(1.5)
-                    .with_color(theme::alpha(theme::MUTED, 0.55 * local_op)),
-            );
-        }
 
-        for (i, dist, y) in placed {
-            if y < -12.0 || y > bounds.height + 12.0 {
-                continue;
-            }
-            let label = self.spec.labels[i];
-            let scale = scale_at_distance(dist);
-            let local_op = opacity_at_distance(dist) * opacity;
-            if local_op < 0.02 {
-                continue;
-            }
-            let active = dist.abs() < 0.35;
+            for (i, dist, y) in placed {
+                if y < -12.0 || y > bounds.height + 12.0 {
+                    continue;
+                }
+                let label = self.spec.labels[i];
+                let scale = scale_at_distance(dist);
+                let local_op = opacity_at_distance(dist) * opacity;
+                if local_op < 0.02 {
+                    continue;
+                }
+                let active = dist.abs() < 0.35;
 
-            let mut text = canvas::Text::from(label);
-            text.content = label.to_ascii_uppercase();
-            // Same vertical axis as the gap lines, centered on the column.
-            text.position = Point::new(axis_x, y);
-            text.color = if active {
-                theme::alpha(theme::INK, local_op)
-            } else {
-                theme::alpha(theme::MUTED, 0.78 * local_op)
-            };
-            text.size = Pixels(BASE_TEXT * scale);
-            text.font = Font::MONOSPACE;
-            text.max_width = LABEL_MAX_WIDTH;
-            text.align_x = Horizontal::Center.into();
-            text.align_y = Vertical::Center;
-            frame.fill_text(text);
-        }
-
+                let mut text = canvas::Text::from(label);
+                text.content = label.to_ascii_uppercase();
+                // Same vertical axis as the gap lines, centered on the column.
+                text.position = Point::new(axis_x, y);
+                text.color = if active {
+                    theme::alpha(theme::INK, local_op)
+                } else {
+                    theme::alpha(theme::MUTED, 0.78 * local_op)
+                };
+                text.size = Pixels(BASE_TEXT * scale);
+                text.font = Font::MONOSPACE;
+                text.max_width = LABEL_MAX_WIDTH;
+                text.align_x = Horizontal::Center.into();
+                text.align_y = Vertical::Center;
+                // Outlines land in the same mesh as the gap lines. fill_text goes
+                // through the glyph rasterizer, which snaps each glyph to a whole
+                // pixel, so the labels stepped while the lines glided.
+                text.draw_with(|path, color| {
+                    frame.fill(&path, color);
+                });
+            }
+        });
         vec![frame.into_geometry()]
     }
 
@@ -466,15 +529,15 @@ mod tests {
     #[test]
     fn opacity_leads_the_slide() {
         const { assert!(OPACITY_MS < FADE_MS) };
-        let half = OPACITY_MS / 2;
+        let half = (OPACITY_MS / 2) as f32;
         let op_left = show_hide_amount(1.0, 0.0, half, OPACITY_MS);
         let slide_left = show_hide_amount(1.0, 0.0, half, FADE_MS);
         assert!(
             op_left < slide_left - 0.05,
             "op={op_left} slide={slide_left}"
         );
-        assert!(show_hide_amount(1.0, 0.0, OPACITY_MS, OPACITY_MS).abs() < 1e-4);
-        assert!(show_hide_amount(1.0, 0.0, OPACITY_MS, FADE_MS) > 0.02);
+        assert!(show_hide_amount(1.0, 0.0, OPACITY_MS as f32, OPACITY_MS).abs() < 1e-4);
+        assert!(show_hide_amount(1.0, 0.0, OPACITY_MS as f32, FADE_MS) > 0.02);
     }
 
     #[test]

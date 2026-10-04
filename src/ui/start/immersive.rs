@@ -401,8 +401,10 @@ fn games_stage(
     let bar = crate::ui::start::position::view(crate::ui::start::position::BarSpec {
         labels: crate::ui::start::position::labels(mode),
         visual: state.position_section_visual(now),
-        opacity: list_opacity * state.position_bar_opacity(now),
+        reveal: list_opacity,
+        show_opacity: state.position_bar_opacity(now),
         slide: state.position_bar_slide(now),
+        motion: state.position_bar_motion(),
     });
 
     // Titles sit beside heroes; Launch/Close/edit cues overlay the selected capsule.

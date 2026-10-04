@@ -1247,10 +1247,22 @@ impl State {
         self.position_bar_show(now).1
     }
 
+    /// In-flight show/hide clock. The canvas samples this at draw time.
+    pub(crate) fn position_bar_motion(&self) -> Option<crate::ui::start::position::ShowHide> {
+        self.position_bar_slide
+            .as_ref()
+            .map(|anim| crate::ui::start::position::ShowHide {
+                from_slide: anim.from,
+                from_opacity: anim.opacity_from,
+                to: anim.to,
+                started: anim.started,
+            })
+    }
+
     fn position_bar_show(&self, now: Instant) -> (f32, f32) {
         use crate::ui::start::position::{FADE_MS, OPACITY_MS, show_hide_amount};
         if let Some(anim) = &self.position_bar_slide {
-            let elapsed = now.saturating_duration_since(anim.started).as_millis() as u64;
+            let elapsed = now.saturating_duration_since(anim.started).as_secs_f32() * 1000.0;
             let slide = show_hide_amount(anim.from, anim.to, elapsed, FADE_MS);
             let opacity = show_hide_amount(anim.opacity_from, anim.to, elapsed, OPACITY_MS);
             return (slide, opacity);
