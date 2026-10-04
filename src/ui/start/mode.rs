@@ -57,15 +57,20 @@ pub const EXIT_IMMERSIVE_MS: u64 = VEIL_TRANSITION_MS;
 pub const ENTER_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
 /// Opacity crossfade between game backdrops (selection change; not enter veil).
 pub const ART_FADE_MS: u64 = 450;
-/// Slow ken-burns settle (scale + center) after landing on a game.
-pub const BACKDROP_LAND_MS: u64 = 10_000;
-/// Ken-burns start scale (must be ≥ 1 so Cover never letterboxes).
-pub const BACKDROP_LAND_SCALE0: f32 = 1.0;
-/// Ken-burns end scale (slow zoom-in).
-pub const BACKDROP_LAND_SCALE1: f32 = 1.08;
-/// Pan offsets kept at 0 so Cover stays edge-to-edge.
-pub const BACKDROP_LAND_OX0: f32 = 0.0;
-pub const BACKDROP_LAND_OY0: f32 = 0.0;
+/// Shared ken-burns period for zoom + pan (burn-in drift while splash is held).
+pub const BACKDROP_ZOOM_PERIOD_MS: u64 = 30_000;
+/// Mid scale between min zoom and peak (must stay > 1 for Cover pan headroom).
+pub const BACKDROP_SCALE_BASE: f32 = 1.055;
+/// Peak zoom excursion around [`BACKDROP_SCALE_BASE`].
+pub const BACKDROP_SCALE_AMP: f32 = 0.02;
+/// Floor scale while panning (Cover edge safety).
+pub const BACKDROP_SCALE_MIN: f32 = 1.035;
+/// Max horizontal drift as a fraction of stage width (Cover overflow is often huge).
+pub const BACKDROP_PAN_STAGE_X: f32 = 0.012;
+/// Max vertical drift as a fraction of stage height.
+pub const BACKDROP_PAN_STAGE_Y: f32 = 0.035;
+/// Never spend more than this fraction of real Cover+zoom overflow (black-edge safety).
+pub const BACKDROP_PAN_OVERFLOW_CAP: f32 = 0.92;
 
 impl TransitionPhase {
     pub fn duration_ms(self) -> u64 {
@@ -264,22 +269,47 @@ pub fn enter_art_fade_progress(elapsed_ms: u64) -> f32 {
     ease_in_out_cubic(t)
 }
 
-/// Backdrop land zoom progress (0 = start pose, 1 = settled).
-pub fn backdrop_land_progress(elapsed_ms: u64) -> f32 {
-    phase_progress(elapsed_ms, BACKDROP_LAND_MS)
+fn backdrop_pose_theta(elapsed_ms: u64) -> f32 {
+    elapsed_ms as f32 / BACKDROP_ZOOM_PERIOD_MS as f32 * std::f32::consts::TAU
 }
 
-/// Incoming backdrop scale for land progress (1.0 → 1.08 zoom-in).
-pub fn backdrop_land_scale(progress: f32) -> f32 {
-    let t = progress.clamp(0.0, 1.0);
-    BACKDROP_LAND_SCALE0 + (BACKDROP_LAND_SCALE1 - BACKDROP_LAND_SCALE0) * t
+/// Continuous ken-burns scale (always ≥ [`BACKDROP_SCALE_MIN`]).
+///
+/// Starts at the zoom floor (centered pan) and eases out — `-cos` so velocity is 0 at t=0.
+pub fn backdrop_pose_scale(elapsed_ms: u64) -> f32 {
+    let wave = -backdrop_pose_theta(elapsed_ms).cos();
+    (BACKDROP_SCALE_BASE + BACKDROP_SCALE_AMP * wave).max(BACKDROP_SCALE_MIN)
 }
 
-/// Incoming backdrop offset (drifts to 0,0).
-pub fn backdrop_land_offset(progress: f32) -> (f32, f32) {
-    let t = progress.clamp(0.0, 1.0);
-    let inv = 1.0 - t;
-    (BACKDROP_LAND_OX0 * inv, BACKDROP_LAND_OY0 * inv)
+/// Normalized pan offsets in `[-1, 1]`, locked to the zoom period.
+///
+/// Starts centered (`0,0`); diagonal drift via opposite-signed Y.
+pub fn backdrop_pose_offset(elapsed_ms: u64) -> (f32, f32) {
+    let ox = backdrop_pose_theta(elapsed_ms).sin();
+    let oy = -ox;
+    (ox, oy)
+}
+
+/// Convert normalized pan into pixels from the drawn Cover rect vs stage.
+///
+/// Travel is staged in **stage fractions** (so wide Cover overflow cannot make X
+/// race), then clamped to available overflow so the clip never shows empty edges.
+pub fn backdrop_pose_pixels(
+    ox_norm: f32,
+    oy_norm: f32,
+    drawn_w: f32,
+    drawn_h: f32,
+    stage_w: f32,
+    stage_h: f32,
+) -> (f32, f32) {
+    let avail_x = (drawn_w - stage_w).max(0.0) * 0.5 * BACKDROP_PAN_OVERFLOW_CAP;
+    let avail_y = (drawn_h - stage_h).max(0.0) * 0.5 * BACKDROP_PAN_OVERFLOW_CAP;
+    let headroom_x = (stage_w * BACKDROP_PAN_STAGE_X).min(avail_x);
+    let headroom_y = (stage_h * BACKDROP_PAN_STAGE_Y).min(avail_y);
+    (
+        ox_norm.clamp(-1.0, 1.0) * headroom_x,
+        oy_norm.clamp(-1.0, 1.0) * headroom_y,
+    )
 }
 
 /// Early EnterImmersive grow segment progress, or `None` once iris/chrome begin.
@@ -490,20 +520,41 @@ mod tests {
     }
 
     #[test]
-    fn backdrop_land_zoom_helpers() {
-        assert!((backdrop_land_scale(0.0) - BACKDROP_LAND_SCALE0).abs() < 0.001);
-        assert!((backdrop_land_scale(1.0) - BACKDROP_LAND_SCALE1).abs() < 0.001);
+    fn backdrop_pose_helpers() {
         const {
-            assert!(BACKDROP_LAND_SCALE0 >= 1.0);
+            assert!(BACKDROP_SCALE_MIN >= 1.0);
+            assert!(BACKDROP_SCALE_BASE - BACKDROP_SCALE_AMP <= BACKDROP_SCALE_MIN + 0.001);
         }
-        let (x0, y0) = backdrop_land_offset(0.0);
-        assert!((x0 - BACKDROP_LAND_OX0).abs() < 0.001);
-        assert!((y0 - BACKDROP_LAND_OY0).abs() < 0.001);
-        let (x1, y1) = backdrop_land_offset(1.0);
-        assert!(x1.abs() < 0.001 && y1.abs() < 0.001);
-        assert!((backdrop_land_progress(0) - 0.0).abs() < 0.001);
-        assert!((backdrop_land_progress(BACKDROP_LAND_MS) - 1.0).abs() < 0.001);
-        assert!(backdrop_land_progress(BACKDROP_LAND_MS / 2) > 0.5);
+        // Starts at zoom floor, pan centered, rest (d(scale)/dt = 0 via -cos).
+        let s0 = backdrop_pose_scale(0);
+        let floor = (BACKDROP_SCALE_BASE - BACKDROP_SCALE_AMP).max(BACKDROP_SCALE_MIN);
+        assert!((s0 - floor).abs() < 0.001);
+        let (x0, y0) = backdrop_pose_offset(0);
+        assert!(x0.abs() < 0.001 && y0.abs() < 0.001);
+        // Quarter turn: pan at +X / −Y peak, zoom at mid base.
+        let mid = BACKDROP_ZOOM_PERIOD_MS / 4;
+        let (x1, y1) = backdrop_pose_offset(mid);
+        assert!(x1 > 0.9);
+        assert!((y1 + x1).abs() < 0.001);
+        assert!((backdrop_pose_scale(mid) - BACKDROP_SCALE_BASE).abs() < 0.001);
+        // Half turn: zoom peak, pan back through center.
+        let half = BACKDROP_ZOOM_PERIOD_MS / 2;
+        let peak = BACKDROP_SCALE_BASE + BACKDROP_SCALE_AMP;
+        assert!((backdrop_pose_scale(half) - peak).abs() < 0.001);
+        let (x2, y2) = backdrop_pose_offset(half);
+        assert!(x2.abs() < 0.001 && y2.abs() < 0.001);
+        // Modest overflow: stage targets win (not raw overflow %).
+        let (px, py) = backdrop_pose_pixels(1.0, -1.0, 220.0, 110.0, 200.0, 100.0);
+        let expect_x = (200.0 * BACKDROP_PAN_STAGE_X).min(10.0 * BACKDROP_PAN_OVERFLOW_CAP);
+        let expect_y = (100.0 * BACKDROP_PAN_STAGE_Y).min(5.0 * BACKDROP_PAN_OVERFLOW_CAP);
+        assert!((px - expect_x).abs() < 0.001);
+        assert!((py + expect_y).abs() < 0.001);
+        // Huge Cover X overflow must not amplify horizontal travel.
+        let (px_wide, _) = backdrop_pose_pixels(1.0, 0.0, 800.0, 110.0, 200.0, 100.0);
+        assert!((px_wide - 200.0 * BACKDROP_PAN_STAGE_X).abs() < 0.001);
+        const {
+            assert!(BACKDROP_PAN_STAGE_X < BACKDROP_PAN_STAGE_Y);
+        }
     }
 
     #[test]
