@@ -45,10 +45,16 @@ const CONTENT_WIDTH: f32 = WIDTH - SIDEBAR_WIDTH - CONTENT_PADDING * 2.0 - SCROL
 const COVERAGE_HEIGHT: f32 = 56.0;
 /// Vertical distance outside the bar that arms stop removal (matches softbuffer UI).
 const ICON_SIZE: f32 = 16.0;
+/// Footer store / GitHub marks — slightly larger so the Store logo stays readable.
+const FOOTER_ICON_SIZE: f32 = 20.0;
 /// Representative toast aspect for the position diagram (max width / typical height).
 const TOAST_ASPECT: f32 = crate::ui::toast::view::WIDTH / crate::ui::toast::view::HEIGHT;
 const POSITION_TOAST_W: f32 = 56.0;
 const POSITION_TOAST_MARGIN: f32 = 8.0;
+
+const GITHUB_URL: &str = "https://github.com/LankyMoose/sdsc-utils";
+const MICROSOFT_STORE_URL: &str =
+    "https://apps.microsoft.com/store/detail/9NDMHS9RKPP0?cid=in-app-link";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
@@ -211,6 +217,7 @@ pub enum ConfigureMessage {
     ResetStartGesture,
     CancelGestureRecord,
     OpenDataFolder,
+    OpenExternalLink(&'static str),
     #[cfg(windows)]
     SetAutostart(bool),
     SelectStop(usize),
@@ -465,7 +472,38 @@ pub fn view<'a>(
     .height(Length::Fixed(HEADER_HEIGHT));
 
     let sidebar = tab_list(state.section, settings.show_developer);
-    let content = section_content(state, settings, analytics, pad_input);
+    let content_pane: Element<'_, ConfigureMessage> = match state.section {
+        Section::System => column![
+            scrollable(
+                container(system_settings_view(settings))
+                    .padding(CONTENT_PADDING)
+                    .width(Fill),
+            )
+            .spacing(SCROLL_GAP)
+            .height(Fill)
+            .width(Fill),
+            container(system_footer())
+                .padding(iced::Padding {
+                    top: 0.0,
+                    right: CONTENT_PADDING,
+                    bottom: CONTENT_PADDING,
+                    left: CONTENT_PADDING,
+                })
+                .width(Fill),
+        ]
+        .width(Fill)
+        .height(Fill)
+        .into(),
+        _ => scrollable(
+            container(section_content(state, settings, analytics, pad_input))
+                .padding(CONTENT_PADDING)
+                .width(Fill),
+        )
+        .spacing(SCROLL_GAP)
+        .height(Fill)
+        .width(Fill)
+        .into(),
+    };
 
     let body = row![
         container(sidebar)
@@ -473,15 +511,10 @@ pub fn view<'a>(
             .height(Fill)
             .style(theme::sidebar),
         // Embed scrollbar with gutters: content ↔ bar ↔ window edge.
-        container(
-            scrollable(container(content).padding(CONTENT_PADDING).width(Fill))
-                .spacing(SCROLL_GAP)
-                .height(Fill)
-                .width(Fill),
-        )
-        .padding(iced::Padding::ZERO.right(SCROLL_EDGE))
-        .width(Fill)
-        .height(Fill),
+        container(content_pane)
+            .padding(iced::Padding::ZERO.right(SCROLL_EDGE))
+            .width(Fill)
+            .height(Fill),
     ]
     .spacing(0)
     .width(Fill)
@@ -551,7 +584,7 @@ fn section_content<'a>(
     pad_input: &'a PadInputPanel,
 ) -> Element<'a, ConfigureMessage> {
     match state.section {
-        Section::System => system_view(settings),
+        Section::System => system_settings_view(settings),
         Section::StartScreen => start_screen_view(settings),
         Section::Notifications => notifications_view(settings),
         Section::ToastPosition => toast_position_view(settings, theme::ACCENT),
@@ -563,7 +596,7 @@ fn section_content<'a>(
     }
 }
 
-fn system_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
+fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
     let mut items = Column::new().spacing(8).width(Fill);
 
     #[cfg(windows)]
@@ -585,13 +618,65 @@ fn system_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage
             .style(theme::ghost),
     );
 
-    items = items.push(
-        text(format!("{DISPLAY_NAME} {PKG_VERSION}"))
-            .size(12.0)
-            .color(theme::DIM),
-    );
-
     items.into()
+}
+
+fn system_footer<'a>() -> Element<'a, ConfigureMessage> {
+    let links = row![
+        footer_link_button(
+            svg_icon::GITHUB_SVG,
+            Some(theme::MUTED),
+            "GitHub",
+            GITHUB_URL,
+        ),
+        footer_link_button(
+            svg_icon::MICROSOFT_STORE_SVG,
+            None,
+            "Microsoft Store",
+            MICROSOFT_STORE_URL,
+        ),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center);
+
+    let version = text(format!("{DISPLAY_NAME} {PKG_VERSION}"))
+        .size(12.0)
+        .color(theme::DIM);
+
+    Row::new()
+        .spacing(0)
+        .width(Fill)
+        .align_y(Alignment::Center)
+        .push(links)
+        .push(space().width(Fill))
+        .push(version)
+        .into()
+}
+
+fn footer_link_button<'a>(
+    source: &'static str,
+    tint: Option<Color>,
+    tip: &'static str,
+    url: &'static str,
+) -> Element<'a, ConfigureMessage> {
+    let icon = svg(svg::Handle::from_memory(source.as_bytes()))
+        .width(Length::Fixed(FOOTER_ICON_SIZE))
+        .height(Length::Fixed(FOOTER_ICON_SIZE))
+        .style(move |_theme, _status| svg::Style { color: tint });
+
+    tooltip(
+        button(icon)
+            .padding(4)
+            .on_press(ConfigureMessage::OpenExternalLink(url))
+            .style(theme::ghost),
+        text(tip).size(12.0).color(theme::INK),
+        tooltip::Position::Top,
+    )
+    .gap(6)
+    .padding(6)
+    .delay(Duration::from_millis(350))
+    .style(theme::tooltip)
+    .into()
 }
 
 fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {

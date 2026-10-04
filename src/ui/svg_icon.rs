@@ -20,6 +20,8 @@ pub const FACE_TRIANGLE_SVG: &str = include_str!("../../assets/icons/face-triang
 pub const FACE_SQUARE_SVG: &str = include_str!("../../assets/icons/face-square.svg");
 pub const GAME_SVG: &str = include_str!("../../assets/icons/game.svg");
 pub const BUG_SVG: &str = include_str!("../../assets/icons/bug.svg");
+pub const GITHUB_SVG: &str = include_str!("../../assets/icons/github.svg");
+pub const MICROSOFT_STORE_SVG: &str = include_str!("../../assets/icons/microsoft-store.svg");
 
 /// Canonical DualSense body fill in [`DUALSENSE_SVG`].
 pub const BODY_HEX: &str = "#EBEBF0";
