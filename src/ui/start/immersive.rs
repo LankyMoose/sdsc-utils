@@ -4,10 +4,11 @@ use crate::ui::color::BatterySpectrum;
 use crate::ui::percent_ring;
 use crate::ui::shader::AmbientProgram;
 use crate::ui::start::mode::{TransitionPhase, dock_panel_width, dock_stage_dim, dock_stage_scale};
+use crate::ui::start::translate::backdrop_art;
 use crate::ui::start::view::{
     StartControllerRow, StartMessage, StartRow, StartSlide, State, footer_hint,
     immersive_dock_row_hints, immersive_game_hints, immersive_game_membership_label,
-    manual_add_view, replace_confirm_view,
+    manual_add_view, replace_confirm_view, update_required_badge,
 };
 use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics};
 use crate::ui::theme;
@@ -162,20 +163,20 @@ fn stage_backdrop_layers<'a>(state: &'a State, now: Instant) -> Vec<Element<'a, 
     // Dim tracks splash opacity so ambient→art does not pop a full wash.
     let mut dim_amount = 0.0_f32;
 
-    if let Some((key, opacity, scale)) = state.backdrop_outgoing_visual(now)
+    if let Some((key, opacity, scale, ox, oy)) = state.backdrop_outgoing_visual(now)
         && let Some(art) = state.backdrop_icon_for_key(key)
     {
-        // Keep the parked ken-burns scale — snapping to 1.0 causes a zoom blip.
-        layers.push(backdrop_layer(art, opacity, scale));
+        // Parked pose stays frozen (scale + pan) — resetting pan looked like a navigate glitch.
+        layers.push(backdrop_layer(art, opacity, scale, ox, oy));
         dim_amount = dim_amount.max(opacity);
     }
 
     if let Some(row) = state.rows.get(selected)
         && let Some(art) = row.backdrop_icon()
-        && let Some((opacity, scale, _ox, _oy)) = state.backdrop_incoming_visual(now)
+        && let Some((opacity, scale, ox, oy)) = state.backdrop_incoming_visual(now)
         && opacity > 0.01
     {
-        layers.push(backdrop_layer(art, opacity, scale));
+        layers.push(backdrop_layer(art, opacity, scale, ox, oy));
         dim_amount = dim_amount.max(opacity);
     }
 
@@ -196,16 +197,12 @@ fn backdrop_layer(
     art: crate::ui::start::view::StartIcon,
     opacity: f32,
     scale: f32,
+    ox_norm: f32,
+    oy_norm: f32,
 ) -> Element<'static, StartMessage> {
-    // Image scale/opacity only — never Float (overlay) or padding (Cover gaps).
-    // Scale stays ≥ 1.0 so Cover always fills the games stage.
-    let img = iced::widget::image(art.0)
-        .width(Fill)
-        .height(Fill)
-        .content_fit(iced::ContentFit::Cover)
-        .opacity(opacity.clamp(0.0, 1.0))
-        .scale(scale.max(1.0));
-    container(img).width(Fill).height(Fill).into()
+    // One-shot Cover draw: zoom then pan inside headroom, clipped to the stage.
+    // (Translating an iced Image after its own bounds-clip reveals black edges.)
+    backdrop_art(art.0, opacity, scale, ox_norm, oy_norm).into()
 }
 
 fn stage_with_dock<'a>(
@@ -456,12 +453,25 @@ fn strip_slot<'a>(
 
     let sub_alpha = if muted { 0.55 * fade } else { 0.9 * fade };
     let mut titles = column![title].spacing(6);
-    if let Some(sub) = row.subtitle.as_ref() {
-        titles = titles.push(
-            text(sub.clone())
-                .size(if selected { 16.0 } else { 14.0 })
-                .color(theme::alpha(theme::MUTED, sub_alpha)),
-        );
+    // Meta + optional Update pill share one status row.
+    let show_meta = row
+        .subtitle
+        .as_deref()
+        .is_some_and(|sub| !(row.update_required && sub == "Steam"));
+    if show_meta || row.update_required {
+        let meta_size = if selected { 16.0 } else { 14.0 };
+        let mut status = row![].spacing(8).align_y(Alignment::Center);
+        if show_meta && let Some(sub) = row.subtitle.as_ref() {
+            status = status.push(
+                text(sub.clone())
+                    .size(meta_size)
+                    .color(theme::alpha(theme::MUTED, sub_alpha)),
+            );
+        }
+        if row.update_required {
+            status = status.push(update_required_badge(selected, muted, fade));
+        }
+        titles = titles.push(status);
     }
 
     let label: Element<'_, StartMessage> = container(titles)
@@ -506,14 +516,12 @@ fn strip_capsule<'a>(
     fade: f32,
     overlay: Option<Element<'a, StartMessage>>,
 ) -> Element<'a, StartMessage> {
+    // Subtle radius: image uses border_radius; card border matches for the ring.
+    const HERO_RADIUS: f32 = 3.0;
     let fade = fade.clamp(0.0, 1.0);
     let art_fade = if muted { 0.55 * fade } else { fade };
     let art: Element<'_, StartMessage> = if row.skeleton {
-        container(space())
-            .width(Fill)
-            .height(Fill)
-            .style(theme::well)
-            .into()
+        container(space()).width(Fill).height(Fill).into()
     } else {
         match row.hero_icon() {
             Some(icon) if hero_ready => iced::widget::image(icon.0)
@@ -521,12 +529,14 @@ fn strip_capsule<'a>(
                 .height(Fill)
                 .content_fit(iced::ContentFit::Cover)
                 .opacity(art_fade)
+                .border_radius(HERO_RADIUS)
                 .into(),
             Some(icon) => iced::widget::image(icon.0)
                 .width(Fill)
                 .height(Fill)
                 .content_fit(iced::ContentFit::Cover)
                 .opacity(0.55 * art_fade)
+                .border_radius(HERO_RADIUS)
                 .into(),
             None => container(
                 text(row.title.chars().next().unwrap_or('?').to_string())
@@ -539,15 +549,29 @@ fn strip_capsule<'a>(
             )
             .width(Fill)
             .height(Fill)
-            .style(theme::well)
             .center_x(Fill)
             .center_y(Fill)
             .into(),
         }
     };
 
-    // Solid dark footer band, content-sized and bottom-aligned.
-    let inner: Element<'_, StartMessage> = if let Some(hints) = overlay {
+    let border = if selected {
+        theme::alpha(theme::ACCENT, 0.85 * fade)
+    } else {
+        theme::alpha(theme::LINE, 0.45 * fade)
+    };
+    let border_w = if selected { 2.0 } else { 1.0 };
+    let frame = move |_theme: &iced::Theme| iced::widget::container::Style {
+        background: Some(iced::Background::Color(theme::CONTENT)),
+        border: iced::Border {
+            color: border,
+            width: border_w,
+            radius: HERO_RADIUS.into(),
+        },
+        ..iced::widget::container::Style::default()
+    };
+
+    if let Some(hints) = overlay {
         let footer = container(hints)
             .width(Fill)
             .center_x(Fill)
@@ -562,36 +586,34 @@ fn strip_capsule<'a>(
                     iced::Color::BLACK,
                     0.82,
                 ))),
+                border: iced::Border {
+                    radius: iced::border::Radius {
+                        top_left: 0.0,
+                        top_right: 0.0,
+                        bottom_right: HERO_RADIUS,
+                        bottom_left: HERO_RADIUS,
+                    },
+                    ..Default::default()
+                },
                 ..iced::widget::container::Style::default()
             });
         let cues = column![space().height(Fill), footer,]
             .width(Fill)
             .height(Fill);
-        stack![art, cues].width(Fill).height(Fill).into()
+        if muted {
+            // Edit mode, not in library: keep the full selection ring visible.
+            let body = stack![container(art).width(Fill).height(Fill), cues,]
+                .width(Fill)
+                .height(Fill);
+            container(body).width(Fill).height(Fill).style(frame).into()
+        } else {
+            // Play / in-library: footer covers the bottom accent edge.
+            let framed_art = container(art).width(Fill).height(Fill).style(frame);
+            stack![framed_art, cues].width(Fill).height(Fill).into()
+        }
     } else {
-        art
-    };
-
-    let border = if selected {
-        theme::alpha(theme::ACCENT, 0.85 * fade)
-    } else {
-        theme::alpha(theme::LINE, 0.45 * fade)
-    };
-
-    container(inner)
-        .width(Fill)
-        .height(Fill)
-        .clip(true)
-        .style(move |_theme: &iced::Theme| iced::widget::container::Style {
-            background: Some(iced::Background::Color(theme::CONTENT)),
-            border: iced::Border {
-                color: border,
-                width: if selected { 2.0 } else { 1.0 },
-                radius: 6.0.into(),
-            },
-            ..iced::widget::container::Style::default()
-        })
-        .into()
+        container(art).width(Fill).height(Fill).style(frame).into()
+    }
 }
 
 /// Unified rows at full dock width; [`width_reveal`] scissors peek→expanded (no column desync).

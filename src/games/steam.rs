@@ -134,10 +134,10 @@ pub fn list_installed_games() -> Result<Vec<SteamGame>, String> {
     Ok(games)
 }
 
-/// Compact browse subtitle: playtime, size, last played, optional Update.
+/// Meta-only browse subtitle: playtime, size, last played (no update clause).
 ///
 /// Example: `82 h · 9.8 GB · 2 Oct 2025`. Falls back to `Steam` when empty.
-pub fn browse_subtitle(game: &SteamGame) -> String {
+pub fn browse_meta_subtitle(game: &SteamGame) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(mins) = game.playtime_minutes.filter(|&m| m > 0) {
         parts.push(format_playtime(mins));
@@ -150,13 +150,25 @@ pub fn browse_subtitle(game: &SteamGame) -> String {
     {
         parts.push(date);
     }
-    if game.update_required {
-        parts.push("Update required".into());
-    }
     if parts.is_empty() {
         "Steam".into()
     } else {
         parts.join(" · ")
+    }
+}
+
+/// Compact browse subtitle: meta plus optional Update.
+///
+/// Example: `82 h · 9.8 GB · 2 Oct 2025 · Update required`.
+pub fn browse_subtitle(game: &SteamGame) -> String {
+    let meta = browse_meta_subtitle(game);
+    if !game.update_required {
+        return meta;
+    }
+    if meta == "Steam" {
+        "Update required".into()
+    } else {
+        format!("{meta} · Update required")
     }
 }
 
@@ -1002,10 +1014,13 @@ mod tests {
             size_bytes: Some(10_497_069_117),
             update_required: true,
         };
+        let meta = browse_meta_subtitle(&game);
+        assert!(meta.starts_with("81 h · 10.5 GB · "), "{meta}");
+        assert!(!meta.contains("Update"), "{meta}");
+        assert!(meta.contains(" 202"), "{meta}");
         let sub = browse_subtitle(&game);
-        assert!(sub.starts_with("81 h · 10.5 GB · "), "{sub}");
+        assert!(sub.starts_with(&meta), "{sub}");
         assert!(sub.ends_with(" · Update required"), "{sub}");
-        assert!(sub.contains(" 202"), "{sub}");
 
         let empty = SteamGame {
             appid: 1,
@@ -1017,7 +1032,15 @@ mod tests {
             size_bytes: None,
             update_required: false,
         };
+        assert_eq!(browse_meta_subtitle(&empty), "Steam");
         assert_eq!(browse_subtitle(&empty), "Steam");
+        assert_eq!(
+            browse_subtitle(&SteamGame {
+                update_required: true,
+                ..empty.clone()
+            }),
+            "Update required"
+        );
 
         let mins = SteamGame {
             playtime_minutes: Some(13),

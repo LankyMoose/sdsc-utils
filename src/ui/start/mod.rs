@@ -7,6 +7,7 @@ pub mod immersive;
 pub mod input;
 pub mod mode;
 pub mod reveal;
+pub mod translate;
 pub mod view;
 pub mod vstrip;
 

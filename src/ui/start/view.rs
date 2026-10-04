@@ -171,7 +171,7 @@ impl StartRow {
                     let icon_source = steam_icon_source(game);
                     Self {
                         title: game.name.clone(),
-                        subtitle: Some(crate::games::steam::browse_subtitle(game)),
+                        subtitle: Some(crate::games::steam::browse_meta_subtitle(game)),
                         target: crate::games::steam::launch_uri(*appid),
                         args: String::new(),
                         play_key: entry.play_key(),
@@ -241,7 +241,7 @@ impl StartRow {
         let icon_source = steam_icon_source(game);
         Self {
             title: game.name.clone(),
-            subtitle: Some(crate::games::steam::browse_subtitle(game)),
+            subtitle: Some(crate::games::steam::browse_meta_subtitle(game)),
             target: crate::games::steam::launch_uri(game.appid),
             args: String::new(),
             play_key: format!("steam:{}", game.appid),
@@ -567,8 +567,8 @@ pub struct State {
     pub ambient_time: f32,
     /// Incoming backdrop land/crossfade (`started = None` = waiting for peek art).
     backdrop_current: Option<(String, Option<Instant>)>,
-    /// Outgoing backdrop during cover-crossfade: `(play_key, frozen_scale)`.
-    backdrop_outgoing: Option<(String, f32)>,
+    /// Outgoing backdrop during cover-crossfade: `(play_key, scale, ox_norm, oy_norm)`.
+    backdrop_outgoing: Option<(String, f32, f32, f32)>,
     /// Ring flash started with the last successful Identify (Controllers slide).
     identify_flash: Option<IdentifyFlash>,
     /// Keep painting while the art worker may still fill peeks (compact list / cover).
@@ -1352,22 +1352,18 @@ impl State {
         }
     }
 
-    /// Visual params for the incoming backdrop: `(opacity, scale, ox, oy)`.
+    /// Visual params for the incoming backdrop: `(opacity, scale, ox_norm, oy_norm)`.
     pub fn backdrop_incoming_visual(&self, now: Instant) -> Option<(f32, f32, f32, f32)> {
         use crate::ui::start::mode::{
-            BACKDROP_LAND_OX0, BACKDROP_LAND_OY0, BACKDROP_LAND_SCALE0, art_fade_progress,
-            backdrop_land_offset, backdrop_land_progress, backdrop_land_scale,
-            enter_art_fade_progress,
+            art_fade_progress, backdrop_pose_offset, backdrop_pose_scale, enter_art_fade_progress,
         };
         let row = self.rows.get(self.game_selected)?;
         row.backdrop_icon()?;
         match &self.backdrop_current {
-            Some((key, None)) if key == &row.play_key => Some((
-                0.0,
-                BACKDROP_LAND_SCALE0,
-                BACKDROP_LAND_OX0,
-                BACKDROP_LAND_OY0,
-            )),
+            Some((key, None)) if key == &row.play_key => {
+                let (ox, oy) = backdrop_pose_offset(0);
+                Some((0.0, backdrop_pose_scale(0), ox, oy))
+            }
             Some((key, Some(started))) if key == &row.play_key => {
                 let elapsed = now.saturating_duration_since(*started).as_millis() as u64;
                 let opacity = if self.splash_opaque {
@@ -1377,20 +1373,19 @@ impl State {
                 } else {
                     art_fade_progress(elapsed)
                 };
-                let land = backdrop_land_progress(elapsed);
-                let scale = backdrop_land_scale(land);
-                let (ox, oy) = backdrop_land_offset(land);
+                let scale = backdrop_pose_scale(elapsed);
+                let (ox, oy) = backdrop_pose_offset(elapsed);
                 Some((opacity, scale, ox, oy))
             }
             // No state, or stale key after compact nav — still paint current art.
-            None | Some(_) => Some((1.0, 1.0, 0.0, 0.0)),
+            None | Some(_) => Some((1.0, backdrop_pose_scale(0), 0.0, 0.0)),
         }
     }
 
-    /// Outgoing backdrop during cover-crossfade: `(play_key, opacity=1, frozen_scale)`.
-    pub fn backdrop_outgoing_visual(&self, _now: Instant) -> Option<(&str, f32, f32)> {
-        let (key, scale) = self.backdrop_outgoing.as_ref()?;
-        Some((key.as_str(), 1.0, (*scale).max(1.0)))
+    /// Outgoing backdrop during cover-crossfade: `(play_key, opacity=1, scale, ox, oy)`.
+    pub fn backdrop_outgoing_visual(&self, _now: Instant) -> Option<(&str, f32, f32, f32, f32)> {
+        let (key, scale, ox, oy) = self.backdrop_outgoing.as_ref()?;
+        Some((key.as_str(), 1.0, (*scale).max(1.0), *ox, *oy))
     }
 
     /// Resolve a peek backdrop handle by play_key (for outgoing layer).
@@ -1450,7 +1445,7 @@ impl State {
     /// Full retain set: ±[`icon_cache::ART_WINDOW`] plus crossfade / dialog pins.
     pub fn art_retain_set(&self) -> icon_cache::ArtRetainSet {
         let mut set = self.art_paths_for_radius(icon_cache::ART_WINDOW);
-        if let Some((key, _)) = self.backdrop_outgoing.as_ref()
+        if let Some((key, _, _, _)) = self.backdrop_outgoing.as_ref()
             && let Some(path) = self
                 .rows
                 .iter()
@@ -1491,24 +1486,28 @@ impl State {
 
     /// Selection changed: park prior art as solid underlay and land the new one.
     pub fn reset_backdrop_fade(&mut self) {
-        use crate::ui::start::mode::{backdrop_land_progress, backdrop_land_scale};
+        use crate::ui::start::mode::{backdrop_pose_offset, backdrop_pose_scale};
         let now = Instant::now();
         self.splash_reveal_pending = false;
         self.splash_reveal_cached = false;
         self.enter_splash_fade = false;
         self.splash_opaque = false;
-        // Freeze ken-burns from the parked current (selection may already have moved).
-        let frozen_scale = match &self.backdrop_current {
+        // Freeze full ken-burns pose — pan snap-to-center was a visible navigate glitch.
+        let (frozen_scale, frozen_ox, frozen_oy) = match &self.backdrop_current {
             Some((_, Some(started))) => {
                 let elapsed = now.saturating_duration_since(*started).as_millis() as u64;
-                backdrop_land_scale(backdrop_land_progress(elapsed)).max(1.0)
+                let (ox, oy) = backdrop_pose_offset(elapsed);
+                (backdrop_pose_scale(elapsed).max(1.0), ox, oy)
             }
-            _ => 1.0,
+            _ => {
+                let (ox, oy) = backdrop_pose_offset(0);
+                (backdrop_pose_scale(0).max(1.0), ox, oy)
+            }
         };
         if let Some((prev_key, _)) = self.backdrop_current.take() {
             // Cover-crossfade underlay — only if peek art exists for the prior key.
             if self.backdrop_icon_for_key(&prev_key).is_some() {
-                self.backdrop_outgoing = Some((prev_key, frozen_scale));
+                self.backdrop_outgoing = Some((prev_key, frozen_scale, frozen_ox, frozen_oy));
             }
         }
         let key = self
@@ -1632,15 +1631,9 @@ impl State {
                 busy = true;
             }
         }
-        if let Some((_key, started)) = &self.backdrop_current {
-            if let Some(started) = started {
-                let elapsed = now.saturating_duration_since(*started);
-                if elapsed < Duration::from_millis(crate::ui::start::mode::BACKDROP_LAND_MS) {
-                    busy = true;
-                }
-            } else {
-                busy = true;
-            }
+        // Continuous ken-burns + pending splash decode both need frames.
+        if self.backdrop_current.is_some() {
+            busy = true;
         }
         if self.backdrop_outgoing.is_some() {
             // Cover-crossfade: drop solid underlay once incoming is fully on.
@@ -3142,6 +3135,54 @@ fn skeleton_bar(width: f32, height: f32) -> Element<'static, StartMessage> {
         .into()
 }
 
+/// Soft accent pill for pending Steam updates (compact + immersive status rows).
+pub(crate) fn update_required_badge(
+    selected: bool,
+    muted: bool,
+    fade: f32,
+) -> Element<'static, StartMessage> {
+    let fade = fade.clamp(0.0, 1.0);
+    let a = if muted { 0.55 * fade } else { fade };
+    let label_size = if selected { 13.0 } else { 11.0 };
+    container(
+        text("Update required")
+            .size(label_size)
+            .color(theme::alpha(theme::INK, 0.92 * a))
+            .font(Font {
+                weight: Weight::Semibold,
+                ..Font::DEFAULT
+            }),
+    )
+    .padding(Padding {
+        top: 3.0,
+        right: 9.0,
+        bottom: 3.0,
+        left: 9.0,
+    })
+    .style(move |_theme: &Theme| container::Style {
+        background: Some(Background::Color(theme::alpha(theme::ACCENT, 0.22 * a))),
+        border: Border {
+            color: theme::alpha(theme::ACCENT, 0.45 * a),
+            width: 1.0,
+            radius: 999.0.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
+/// Compact combined status string (tests / fallbacks). UI prefers meta + badge.
+#[cfg(test)]
+fn compact_status_label(row: &StartRow) -> Option<String> {
+    match (row.subtitle.as_deref(), row.update_required) {
+        (None, false) => None,
+        (None, true) => Some("Update required".into()),
+        (Some("Steam"), true) => Some("Update required".into()),
+        (Some(meta), true) => Some(format!("{meta} · Update required")),
+        (Some(meta), false) => Some(meta.to_string()),
+    }
+}
+
 fn game_row(
     _index: usize,
     row: &StartRow,
@@ -3224,17 +3265,43 @@ fn game_row(
             .wrapping(Wrapping::None)
             .width(Fill);
 
-        let subtitle = if running {
-            text("Running").size(13.0).color(theme::SUCCESS)
-        } else if let Some(sub) = row.subtitle.as_ref() {
-            text(sub.as_str()).size(13.0).color(sub_color)
+        let status: Element<'_, StartMessage> = if running {
+            text("Running")
+                .size(13.0)
+                .color(theme::SUCCESS)
+                .wrapping(Wrapping::None)
+                .width(Fill)
+                .into()
         } else {
-            text(" ").size(13.0).color(Color::TRANSPARENT)
-        }
-        .wrapping(Wrapping::None)
-        .width(Fill);
+            let show_meta = row
+                .subtitle
+                .as_deref()
+                .is_some_and(|sub| !(row.update_required && sub == "Steam"));
+            if show_meta || row.update_required {
+                let mut status = row![].spacing(8).align_y(Alignment::Center);
+                if show_meta && let Some(sub) = row.subtitle.as_ref() {
+                    status = status.push(
+                        text(sub.as_str())
+                            .size(13.0)
+                            .color(sub_color)
+                            .wrapping(Wrapping::None),
+                    );
+                }
+                if row.update_required {
+                    status = status.push(update_required_badge(selected, muted, 1.0));
+                }
+                status.width(Fill).into()
+            } else {
+                text(" ")
+                    .size(13.0)
+                    .color(Color::TRANSPARENT)
+                    .wrapping(Wrapping::None)
+                    .width(Fill)
+                    .into()
+            }
+        };
 
-        column![title, subtitle]
+        column![title, status]
             .spacing(4)
             .width(Fill)
             .clip(true)
@@ -3483,8 +3550,12 @@ mod tests {
         let row = StartRow::from_entry(&entry, &map, true);
         assert!(!row.skeleton);
         assert_eq!(row.title, "Path of Exile");
-        assert_eq!(row.subtitle.as_deref(), Some("Update required"));
+        assert_eq!(row.subtitle.as_deref(), Some("Steam"));
         assert!(row.update_required);
+        assert_eq!(
+            compact_status_label(&row).as_deref(),
+            Some("Update required")
+        );
         assert_eq!(row.launch_hint_label(), "Update & launch");
         assert!(row.icon.is_none());
     }
@@ -4025,6 +4096,7 @@ mod tests {
                 immersive: true,
                 ..Default::default()
             };
+            use crate::ui::start::mode::backdrop_pose_scale;
             let now = Instant::now();
             state.prime_backdrop_for_enter(now);
             assert!(state.splash_opaque);
@@ -4032,7 +4104,7 @@ mod tests {
             state.game_selected = 1;
             state.reset_backdrop_fade();
             let mid = Instant::now() + Duration::from_millis(ART_FADE_MS / 2);
-            let (out_key, out_opacity, out_scale) = state
+            let (out_key, out_opacity, out_scale, out_ox, out_oy) = state
                 .backdrop_outgoing_visual(mid)
                 .expect("outgoing underlay");
             assert_eq!(out_key, "k0");
@@ -4040,7 +4112,12 @@ mod tests {
                 (out_opacity - 1.0).abs() < 0.001,
                 "outgoing must stay solid"
             );
-            assert!((out_scale - 1.0).abs() < 0.001, "fresh land freezes at 1.0");
+            let fresh = backdrop_pose_scale(0);
+            assert!(
+                (out_scale - fresh).abs() < 0.001,
+                "fresh pose freezes at {fresh}, got {out_scale}"
+            );
+            assert!(out_ox.abs() < 0.001 && out_oy.abs() < 0.001);
             let (in_opacity, _, _, _) = state
                 .backdrop_incoming_visual(mid)
                 .expect("incoming fading");
@@ -4054,7 +4131,7 @@ mod tests {
     #[test]
     fn reset_backdrop_freezes_outgoing_ken_burns_scale() {
         icon_cache::with_cache_lock(|| {
-            use crate::ui::start::mode::{BACKDROP_LAND_MS, backdrop_land_scale};
+            use crate::ui::start::mode::{BACKDROP_ZOOM_PERIOD_MS, backdrop_pose_scale};
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
@@ -4102,24 +4179,29 @@ mod tests {
             };
             let t0 = Instant::now();
             state.prime_backdrop_for_enter(t0);
-            // Advance land clock without wall-waiting: rewrite started into the past.
-            let mid_land = BACKDROP_LAND_MS / 4;
+            // Advance pose clock without wall-waiting: rewrite started into the past.
+            let mid_pose = BACKDROP_ZOOM_PERIOD_MS / 4;
             if let Some((_, started)) = &mut state.backdrop_current {
-                *started = Some(t0 - Duration::from_millis(mid_land));
+                *started = Some(t0 - Duration::from_millis(mid_pose));
             }
-            let expected =
-                backdrop_land_scale(crate::ui::start::mode::backdrop_land_progress(mid_land));
-            assert!(expected > 1.01, "test needs mid-land scale, got {expected}");
+            use crate::ui::start::mode::backdrop_pose_offset;
+            let expected = backdrop_pose_scale(mid_pose);
+            let (exp_ox, exp_oy) = backdrop_pose_offset(mid_pose);
+            assert!(expected > 1.01, "test needs mid-pose scale, got {expected}");
 
-            // Selection moves first (matches app), then reset parks prior scale.
+            // Selection moves first (matches app), then reset parks prior pose.
             state.game_selected = 1;
             state.reset_backdrop_fade();
-            let (_, _, frozen) = state
+            let (_, _, frozen, ox, oy) = state
                 .backdrop_outgoing_visual(Instant::now())
                 .expect("outgoing");
             assert!(
                 (frozen - expected).abs() < 0.005,
                 "frozen={frozen} expected={expected}"
+            );
+            assert!(
+                (ox - exp_ox).abs() < 0.005 && (oy - exp_oy).abs() < 0.005,
+                "frozen pan=({ox},{oy}) expected=({exp_ox},{exp_oy})"
             );
 
             let _ = std::fs::remove_dir_all(&dir);
