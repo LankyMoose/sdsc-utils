@@ -265,37 +265,23 @@ impl DeviceSession {
         effects
     }
 
-    /// Re-evaluate open/close after `start_screen_usb_controllers` changes.
+    /// Re-evaluate close after `start_screen_usb_controllers` changes.
     ///
+    /// A settings flip is not a connect edge — never auto-open Start here.
     /// Does not arm the ghost-flap cooldown (settings flip is not a pad leave).
     pub fn reevaluate_start_presence(&mut self, ctx: ApplyContext) -> Vec<SessionEffect> {
         let include_usb = self.prefs.start_screen_usb_controllers;
         let present = has_start_presence(&self.controllers, include_usb);
         crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start presence include_usb={} prev={} next={} (prefs)",
+            "ui-diag: start presence include_usb={} present={} (prefs)",
             u8::from(include_usb),
-            // Treat settings flip as edge from the opposite presence so open/close fire.
-            u8::from(!present),
-            u8::from(present)
+            u8::from(present),
         ));
 
         let mut effects = Vec::new();
         if present {
-            // Qualifying pads exist under the new rule — open if gates pass.
             if self.controllers_nonempty_since.is_none() {
                 self.controllers_nonempty_since = Some(ctx.now);
-            }
-            let want_auto_open = should_auto_open_start(
-                self.prefs.start_screen_enabled,
-                true, // pretend previous empty so the edge fires
-                true,
-                ctx.start_visible,
-                self.cooldown_active(ctx.now),
-                ctx.fullscreen,
-            );
-            if want_auto_open {
-                self.start_auto_open_pending = true;
-                effects.push(SessionEffect::OpenStart);
             }
         } else {
             self.start_auto_open_pending = false;

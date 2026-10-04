@@ -134,32 +134,69 @@ pub fn list_installed_games() -> Result<Vec<SteamGame>, String> {
     Ok(games)
 }
 
-/// Meta-only browse subtitle: playtime, size, last played (no update clause).
-///
-/// Example: `82 h · 9.8 GB · 2 Oct 2025`. Falls back to `Steam` when empty.
-pub fn browse_meta_subtitle(game: &SteamGame) -> String {
-    let mut parts: Vec<String> = Vec::new();
+/// One labeled meta row under a Steam browse title (playtime / size / last played).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetaLine {
+    pub label: &'static str,
+    pub value: String,
+}
+
+/// Labeled browse meta lines (no update clause). Falls back to Store / Steam when empty.
+pub fn browse_meta_lines(game: &SteamGame) -> Vec<MetaLine> {
+    let mut lines: Vec<MetaLine> = Vec::new();
     if let Some(mins) = game.playtime_minutes.filter(|&m| m > 0) {
-        parts.push(format_playtime(mins));
-    }
-    if let Some(bytes) = game.size_bytes.filter(|&b| b > 0) {
-        parts.push(format_size(bytes));
+        lines.push(MetaLine {
+            label: "Played",
+            value: format_playtime(mins),
+        });
     }
     if let Some(unix) = game.last_played_unix.filter(|&t| t > 0)
         && let Some(date) = format_last_played_date(unix)
     {
-        parts.push(date);
+        lines.push(MetaLine {
+            label: "Last played",
+            value: date,
+        });
     }
-    if parts.is_empty() {
+    if lines.is_empty() {
+        lines.push(MetaLine {
+            label: "Store",
+            value: "Steam".into(),
+        });
+    }
+    lines
+}
+
+/// True when meta is only the empty-catalog Store / Steam fallback.
+pub fn meta_lines_are_steam_fallback(lines: &[MetaLine]) -> bool {
+    matches!(
+        lines,
+        [MetaLine {
+            label: "Store",
+            value
+        }] if value == "Steam"
+    )
+}
+
+/// Meta-only browse subtitle joined with middots (tests / legacy).
+///
+/// Example: `82 h · 2 Oct 2025`. Falls back to `Steam` when empty.
+pub fn browse_meta_subtitle(game: &SteamGame) -> String {
+    let lines = browse_meta_lines(game);
+    if meta_lines_are_steam_fallback(&lines) {
         "Steam".into()
     } else {
-        parts.join(" · ")
+        lines
+            .into_iter()
+            .map(|line| line.value)
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 }
 
 /// Compact browse subtitle: meta plus optional Update.
 ///
-/// Example: `82 h · 9.8 GB · 2 Oct 2025 · Update required`.
+/// Example: `82 h · 2 Oct 2025 · Update required`.
 pub fn browse_subtitle(game: &SteamGame) -> String {
     let meta = browse_meta_subtitle(game);
     if !game.update_required {
@@ -683,18 +720,6 @@ fn format_playtime(minutes: u32) -> String {
     }
 }
 
-fn format_size(bytes: u64) -> String {
-    const GB: u64 = 1_000_000_000;
-    const MB: u64 = 1_000_000;
-    if bytes >= GB {
-        let gb = bytes as f64 / GB as f64;
-        format!("{gb:.1} GB")
-    } else {
-        let mb = (bytes / MB).max(1);
-        format!("{mb} MB")
-    }
-}
-
 fn format_last_played_date(unix_secs: u64) -> Option<String> {
     let local_secs = unix_secs_to_local(unix_secs)?;
     let days = (local_secs as i64).div_euclid(86_400);
@@ -1014,10 +1039,16 @@ mod tests {
             size_bytes: Some(10_497_069_117),
             update_required: true,
         };
+        let lines = browse_meta_lines(&game);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].label, "Played");
+        assert_eq!(lines[0].value, "81 h");
+        assert_eq!(lines[1].label, "Last played");
+        assert!(lines[1].value.contains("202"), "{}", lines[1].value);
         let meta = browse_meta_subtitle(&game);
-        assert!(meta.starts_with("81 h · 10.5 GB · "), "{meta}");
+        assert!(meta.starts_with("81 h · "), "{meta}");
+        assert!(!meta.contains("GB"), "{meta}");
         assert!(!meta.contains("Update"), "{meta}");
-        assert!(meta.contains(" 202"), "{meta}");
         let sub = browse_subtitle(&game);
         assert!(sub.starts_with(&meta), "{sub}");
         assert!(sub.ends_with(" · Update required"), "{sub}");
@@ -1032,6 +1063,7 @@ mod tests {
             size_bytes: None,
             update_required: false,
         };
+        assert!(meta_lines_are_steam_fallback(&browse_meta_lines(&empty)));
         assert_eq!(browse_meta_subtitle(&empty), "Steam");
         assert_eq!(browse_subtitle(&empty), "Steam");
         assert_eq!(
@@ -1047,7 +1079,11 @@ mod tests {
             size_bytes: Some(512_000),
             ..empty
         };
-        assert_eq!(browse_subtitle(&mins), "13 min · 1 MB");
+        assert_eq!(browse_subtitle(&mins), "13 min");
+        let mins_lines = browse_meta_lines(&mins);
+        assert_eq!(mins_lines.len(), 1);
+        assert_eq!(mins_lines[0].label, "Played");
+        assert_eq!(mins_lines[0].value, "13 min");
     }
 
     #[test]

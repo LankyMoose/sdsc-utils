@@ -7,8 +7,8 @@ use crate::ui::start::mode::{TransitionPhase, dock_panel_width, dock_stage_dim, 
 use crate::ui::start::translate::backdrop_art;
 use crate::ui::start::view::{
     StartControllerRow, StartMessage, StartRow, StartSlide, State, footer_hint,
-    immersive_dock_row_hints, immersive_game_hints, immersive_game_membership_label,
-    manual_add_view, replace_confirm_view, update_required_badge,
+    game_subtitle_block, immersive_dock_row_hints, immersive_game_hints,
+    immersive_game_membership_label, manual_add_view, replace_confirm_view, update_required_badge,
 };
 use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics};
 use crate::ui::theme;
@@ -84,8 +84,9 @@ pub fn view<'a>(
 ) -> Element<'a, StartMessage> {
     let dock_p = state.dock_progress(now);
     let veil = transition_top_veil(state, now);
-    // Any Float under the veil paints above it — flatten stage scale + hint presses.
-    let flat = veil > 0.001;
+    let idle_veil = state.idle_dim_amount(now);
+    // Any Float under a veil paints above it — flatten stage scale + hint presses.
+    let flat = veil > 0.001 || idle_veil > 0.001;
     // Chrome stays fully lit; one top veil handles enter/exit (no per-panel dims).
     let program = AmbientProgram::new(state.ambient_time, dock_p, 0.0, 1.0);
     let atmosphere = shader(program).width(Fill).height(Fill);
@@ -132,20 +133,27 @@ pub fn view<'a>(
     let chrome = stack![body, footer_overlay].width(Fill).height(Fill);
     let base = stack![atmosphere, chrome].width(Fill).height(Fill);
 
-    if flat {
-        stack![
-            base,
+    let mut layers: Vec<Element<'_, StartMessage>> = vec![base.into()];
+    // Idle/sleep wash sits under the enter/exit ceremony veil.
+    if idle_veil > 0.001 {
+        layers.push(
             container(space())
                 .width(Fill)
                 .height(Fill)
-                .style(theme::immersive_dim(veil)),
-        ]
-        .width(Fill)
-        .height(Fill)
-        .into()
-    } else {
-        base.into()
+                .style(theme::immersive_dim(idle_veil))
+                .into(),
+        );
     }
+    if veil > 0.001 {
+        layers.push(
+            container(space())
+                .width(Fill)
+                .height(Fill)
+                .style(theme::immersive_dim(veil))
+                .into(),
+        );
+    }
+    stack(layers).width(Fill).height(Fill).into()
 }
 
 /// Full-bleed blackout — enter uses capped ease-in-out; exit uses ease-out like compact.
@@ -453,23 +461,26 @@ fn strip_slot<'a>(
 
     let sub_alpha = if muted { 0.55 * fade } else { 0.9 * fade };
     let mut titles = column![title].spacing(6);
-    // Meta + optional Update pill share one status row.
+    // Stacked `Played:` / `Last played:` + optional Update pill.
     let show_meta = row
         .subtitle
-        .as_deref()
-        .is_some_and(|sub| !(row.update_required && sub == "Steam"));
+        .as_ref()
+        .is_some_and(|sub| !(row.update_required && sub.is_steam_fallback()));
     if show_meta || row.update_required {
         let meta_size = if selected { 16.0 } else { 14.0 };
-        let mut status = row![].spacing(8).align_y(Alignment::Center);
+        let mut status = column![].spacing(6).width(Fill);
         if show_meta && let Some(sub) = row.subtitle.as_ref() {
-            status = status.push(
-                text(sub.clone())
-                    .size(meta_size)
-                    .color(theme::alpha(theme::MUTED, sub_alpha)),
-            );
+            let value_color = theme::alpha(theme::MUTED, sub_alpha);
+            let label_color = theme::alpha(theme::MUTED, sub_alpha * 0.8);
+            status = status.push(game_subtitle_block(
+                sub,
+                value_color,
+                label_color,
+                meta_size,
+            ));
         }
         if row.update_required {
-            status = status.push(update_required_badge(selected, muted, fade));
+            status = status.push(update_required_badge(selected, muted, fade, true));
         }
         titles = titles.push(status);
     }
