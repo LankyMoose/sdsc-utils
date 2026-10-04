@@ -632,7 +632,8 @@ fn system_footer<'a>() -> Element<'a, ConfigureMessage> {
     let links = row![
         footer_link_button(
             svg_icon::GITHUB_SVG,
-            Some(theme::MUTED),
+            // Match Microsoft Store bag main fill (`#F2F2F2`).
+            Some(theme::rgb(0xF2, 0xF2, 0xF2)),
             "GitHub",
             GITHUB_URL,
         ),
