@@ -1,6 +1,5 @@
 //! In-window Start Screen settings (Options): compact modal / immersive right drawer.
 
-use crate::domain::gesture::GestureControl;
 use crate::persist::prefs::{
     START_SCREEN_IDLE_SECS_STEPS, START_SCREEN_SLEEP_SECS_STEPS, format_timeout_duration,
     min_sleep_secs_for_idle, secs_step_index,
@@ -9,7 +8,7 @@ use crate::ui::layout as window_layout;
 use crate::ui::start::view::{ScrollReveal, StartMessage, State, scroll_y_to_reveal_bounds};
 use crate::ui::theme;
 use iced::font::Weight;
-use iced::widget::{button, column, container, row, scrollable, slider, space, text, toggler};
+use iced::widget::{column, container, row, scrollable, slider, space, text, toggler};
 use iced::{Alignment, Element, Fill, Font, Length, Padding};
 use std::time::{Duration, Instant};
 
@@ -44,9 +43,6 @@ pub struct StartSettingsSnapshot {
     pub inactive_secs: u32,
     pub sleep_secs: u32,
     pub inactive_dim_percent: u8,
-    pub gesture: Vec<GestureControl>,
-    pub gesture_recording: bool,
-    pub gesture_recording_live: String,
     pub sounds_enabled: bool,
     pub sound_volume: u8,
     pub haptics_enabled: bool,
@@ -61,8 +57,6 @@ pub enum SettingsRow {
     IdleSecs,
     SleepSecs,
     IdleDim,
-    GestureRecord,
-    GestureReset,
     Sounds,
     SoundVolume,
     Haptics,
@@ -77,12 +71,8 @@ impl SettingsRow {
             Self::IdleSecs,
             Self::SleepSecs,
             Self::IdleDim,
-            Self::GestureRecord,
+            Self::Sounds,
         ];
-        if !snapshot.gesture_recording {
-            rows.push(Self::GestureReset);
-        }
-        rows.push(Self::Sounds);
         if snapshot.sounds_enabled {
             rows.push(Self::SoundVolume);
         }
@@ -300,14 +290,6 @@ pub fn confirm_message(row: SettingsRow, snapshot: &StartSettingsSnapshot) -> Op
         }
         SettingsRow::Sounds => Some(StartMessage::SetSounds(!snapshot.sounds_enabled)),
         SettingsRow::Haptics => Some(StartMessage::SetHaptics(!snapshot.haptics_enabled)),
-        SettingsRow::GestureRecord => {
-            if snapshot.gesture_recording {
-                Some(StartMessage::CancelGestureRecord)
-            } else {
-                Some(StartMessage::StartGestureRecord)
-            }
-        }
-        SettingsRow::GestureReset => Some(StartMessage::ResetStartGesture),
         SettingsRow::IdleSecs
         | SettingsRow::SleepSecs
         | SettingsRow::IdleDim
@@ -412,7 +394,6 @@ pub fn nudge_message(
                 Some(StartMessage::SetHapticsStrength(next))
             }
         }
-        _ => None,
     }
 }
 
@@ -491,25 +472,6 @@ pub fn focus_row_bounds(
     }
     gap(slider_row_h(ty.helper));
     gap(section_rule_h());
-    gap(ty.section); // Gesture
-    gap(ty.helper); // chord label
-    if snapshot.gesture_recording {
-        gap(ty.helper); // holding…
-        if target == SettingsRow::GestureRecord {
-            return Some((gap(action_row_h(ty.body)), action_row_h(ty.body)));
-        }
-        gap(action_row_h(ty.body));
-    } else {
-        if target == SettingsRow::GestureRecord {
-            return Some((gap(action_row_h(ty.body)), action_row_h(ty.body)));
-        }
-        gap(action_row_h(ty.body));
-        if target == SettingsRow::GestureReset {
-            return Some((gap(action_row_h(ty.body)), action_row_h(ty.body)));
-        }
-        gap(action_row_h(ty.body));
-    }
-    gap(section_rule_h());
     gap(ty.section); // Feedback
     if target == SettingsRow::Sounds {
         return Some((gap(toggle_row_h(ty.toggle)), toggle_row_h(ty.toggle)));
@@ -538,10 +500,6 @@ fn toggle_row_h(toggle: f32) -> f32 {
 fn slider_row_h(label: f32) -> f32 {
     // Label + gap + slider track (iced default is a bit taller than a tight 22px guess).
     ROW_PAD * 2.0 + label + 4.0 + 26.0
-}
-
-fn action_row_h(body: f32) -> f32 {
-    ROW_PAD * 2.0 + body + 14.0
 }
 
 fn section_rule_h() -> f32 {
@@ -649,44 +607,6 @@ pub fn panel_view<'a>(
         f32::from(dim),
         |value| StartMessage::SetInactiveDimPercent(value.round() as u8),
     ));
-
-    items = items.push(section_rule());
-    items = items.push(section_label("Gesture", ty.section));
-    items = items.push(
-        text(crate::ui::start::gesture::format_gesture(&snapshot.gesture))
-            .size(ty.helper)
-            .color(theme::MUTED),
-    );
-    if snapshot.gesture_recording {
-        items = items.push(
-            text(if snapshot.gesture_recording_live.is_empty() {
-                "Hold combo, then release…".to_string()
-            } else {
-                format!("Holding: {}", snapshot.gesture_recording_live)
-            })
-            .size(ty.helper)
-            .color(theme::ACCENT),
-        );
-        items = items.push(action_row(
-            "Cancel recording",
-            focus_rows.get(focus) == Some(&SettingsRow::GestureRecord),
-            ty,
-            StartMessage::CancelGestureRecord,
-        ));
-    } else {
-        items = items.push(action_row(
-            "Record",
-            focus_rows.get(focus) == Some(&SettingsRow::GestureRecord),
-            ty,
-            StartMessage::StartGestureRecord,
-        ));
-        items = items.push(action_row(
-            "Reset to default",
-            focus_rows.get(focus) == Some(&SettingsRow::GestureReset),
-            ty,
-            StartMessage::ResetStartGesture,
-        ));
-    }
 
     items = items.push(section_rule());
     items = items.push(section_label("Feedback", ty.section));
@@ -908,25 +828,6 @@ fn slider_row(
     .into()
 }
 
-fn action_row(
-    label: &'static str,
-    focused: bool,
-    ty: TypeScale,
-    message: StartMessage,
-) -> Element<'static, StartMessage> {
-    container(
-        button(text(label).size(ty.body))
-            .padding([5, 8])
-            .width(Fill)
-            .on_press(message)
-            .style(theme::chip(focused)),
-    )
-    .padding(ROW_PAD)
-    .width(Fill)
-    .style(focus_style(focused))
-    .into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,9 +839,6 @@ mod tests {
             inactive_secs: 30,
             sleep_secs: 120,
             inactive_dim_percent: 50,
-            gesture: crate::domain::gesture::default_gesture(),
-            gesture_recording: false,
-            gesture_recording_live: String::new(),
             sounds_enabled: sounds,
             sound_volume: 60,
             haptics_enabled: haptics,

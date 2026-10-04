@@ -752,7 +752,7 @@ impl HidWorkerHandle {
         out
     }
 
-    /// Elevate input sampling to ~60 Hz while start-nav / gesture record need it.
+    /// Elevate input sampling to ~60 Hz while start-nav needs it.
     pub fn set_input_hot(&self, hot: bool) {
         self.input_hot.store(hot, Ordering::Relaxed);
     }

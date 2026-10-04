@@ -17,7 +17,6 @@ use crate::persist::analytics::{
 use crate::persist::prefs::{LOW_BATTERY_PERCENT_MAX, LOW_BATTERY_PERCENT_MIN, ToastPosition};
 use crate::platform::app_meta::{DISPLAY_NAME, PKG_VERSION};
 use crate::ui::color::{BatterySpectrum, hsv_to_rgb};
-use crate::ui::start::gesture::{self, GestureControl};
 use crate::ui::svg_icon;
 use crate::ui::theme;
 use iced::mouse;
@@ -142,13 +141,10 @@ pub struct ConfigureSettings {
     pub start_screen_sleep_secs: u32,
     pub start_screen_inactive_dim_percent: u8,
     pub start_screen_usb_controllers: bool,
-    pub start_screen_gesture: Vec<GestureControl>,
     pub start_screen_sounds_enabled: bool,
     pub start_screen_sound_volume: u8,
     pub start_screen_haptics_enabled: bool,
     pub start_screen_haptics_strength: u8,
-    pub gesture_recording: bool,
-    pub gesture_recording_live: String,
     #[cfg(windows)]
     pub autostart: bool,
     pub show_developer: bool,
@@ -220,9 +216,6 @@ pub enum ConfigureMessage {
     SetStartScreenSoundVolume(u8),
     SetStartScreenHaptics(bool),
     SetStartScreenHapticsStrength(u8),
-    StartGestureRecord,
-    ResetStartGesture,
-    CancelGestureRecord,
     OpenDataFolder,
     OpenExternalLink(&'static str),
     #[cfg(windows)]
@@ -829,46 +822,6 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             .spacing(4)
             .width(Fill),
         );
-
-        items = items.push(configure_section_rule());
-        items = items.push(configure_section_heading("Gesture"));
-        items = items.push(
-            text(gesture::format_gesture(&settings.start_screen_gesture))
-                .size(12.0)
-                .color(theme::MUTED),
-        );
-
-        if settings.gesture_recording {
-            items = items.push(
-                text(if settings.gesture_recording_live.is_empty() {
-                    "Hold combo, then release…".to_string()
-                } else {
-                    format!("Holding: {}", settings.gesture_recording_live)
-                })
-                .size(12.0)
-                .color(theme::ACCENT),
-            );
-            items = items.push(
-                button(text("Cancel recording").size(12.0))
-                    .padding([5, 8])
-                    .on_press(ConfigureMessage::CancelGestureRecord)
-                    .style(theme::ghost),
-            );
-        } else {
-            items = items.push(
-                row![
-                    button(text("Record").size(12.0))
-                        .padding([5, 8])
-                        .on_press(ConfigureMessage::StartGestureRecord)
-                        .style(theme::primary),
-                    button(text("Reset to default").size(12.0))
-                        .padding([5, 8])
-                        .on_press(ConfigureMessage::ResetStartGesture)
-                        .style(theme::ghost),
-                ]
-                .spacing(6),
-            );
-        }
 
         items = items.push(configure_section_rule());
         items = items.push(configure_section_heading("Feedback"));

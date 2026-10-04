@@ -86,8 +86,8 @@ pub struct Prefs {
     /// When off, only Bluetooth pads drive open and close.
     #[serde(default = "default_true")]
     pub start_screen_usb_controllers: bool,
-    /// Chord that reopens the start screen while a pad is connected.
-    /// Empty = no gesture reopen (0→1 auto-open still works). Missing key → default.
+    /// Reopen / promote chord while a pad is connected.
+    /// Always forced to PS on load/save; custom chords are no longer honored.
     #[serde(default = "default_gesture")]
     pub start_screen_gesture: Vec<GestureControl>,
     /// Play UI cues while navigating the start screen (default on).
@@ -266,20 +266,7 @@ impl Prefs {
         };
         match serde_json::from_slice::<Prefs>(&bytes) {
             Ok(mut prefs) => {
-                prefs.low_battery_percent = clamp_low_battery_percent(prefs.low_battery_percent);
-                prefs.start_screen_sound_volume =
-                    clamp_start_screen_sound_volume(prefs.start_screen_sound_volume);
-                prefs.start_screen_haptics_strength =
-                    clamp_start_screen_haptics_strength(prefs.start_screen_haptics_strength);
-                prefs.start_screen_inactive_dim_percent = clamp_start_screen_inactive_dim_percent(
-                    prefs.start_screen_inactive_dim_percent,
-                );
-                let (inactive, sleep) = clamp_start_screen_idle_timeouts(
-                    prefs.start_screen_inactive_secs,
-                    prefs.start_screen_sleep_secs,
-                );
-                prefs.start_screen_inactive_secs = inactive;
-                prefs.start_screen_sleep_secs = sleep;
+                prefs.normalize();
                 prefs
             }
             Err(err) => {
@@ -300,7 +287,10 @@ impl Prefs {
             app_log::warn(format!("failed to create prefs dir: {err}"));
             return;
         }
-        match serde_json::to_vec_pretty(self) {
+        // Rewrite stale custom / empty chords as PS on disk.
+        let mut prefs = self.clone();
+        prefs.start_screen_gesture = default_gesture();
+        match serde_json::to_vec_pretty(&prefs) {
             Ok(bytes) => {
                 if let Err(err) = fs::write(&path, bytes) {
                     app_log::warn(format!("failed to write prefs: {err}"));
@@ -308,6 +298,24 @@ impl Prefs {
             }
             Err(err) => app_log::warn(format!("failed to serialize prefs: {err}")),
         }
+    }
+
+    /// Clamp numeric prefs and force the reopen chord to PS.
+    fn normalize(&mut self) {
+        self.low_battery_percent = clamp_low_battery_percent(self.low_battery_percent);
+        self.start_screen_sound_volume =
+            clamp_start_screen_sound_volume(self.start_screen_sound_volume);
+        self.start_screen_haptics_strength =
+            clamp_start_screen_haptics_strength(self.start_screen_haptics_strength);
+        self.start_screen_inactive_dim_percent =
+            clamp_start_screen_inactive_dim_percent(self.start_screen_inactive_dim_percent);
+        let (inactive, sleep) = clamp_start_screen_idle_timeouts(
+            self.start_screen_inactive_secs,
+            self.start_screen_sleep_secs,
+        );
+        self.start_screen_inactive_secs = inactive;
+        self.start_screen_sleep_secs = sleep;
+        self.start_screen_gesture = default_gesture();
     }
 }
 
@@ -355,11 +363,24 @@ mod tests {
     }
 
     #[test]
-    fn empty_gesture_list_deserializes() {
-        let prefs: Prefs =
+    fn empty_gesture_list_normalizes_to_ps() {
+        let mut prefs: Prefs =
             serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":[]}"#)
                 .unwrap();
         assert!(prefs.start_screen_gesture.is_empty());
+        prefs.normalize();
+        assert_eq!(prefs.start_screen_gesture, default_gesture());
+    }
+
+    #[test]
+    fn custom_gesture_normalizes_to_ps() {
+        let mut prefs: Prefs = serde_json::from_str(
+            r#"{"start_screen_enabled":true,"start_screen_gesture":["l2","r2"]}"#,
+        )
+        .unwrap();
+        assert_ne!(prefs.start_screen_gesture, default_gesture());
+        prefs.normalize();
+        assert_eq!(prefs.start_screen_gesture, default_gesture());
     }
 
     #[test]
