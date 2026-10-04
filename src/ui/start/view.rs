@@ -3669,19 +3669,16 @@ pub(crate) fn footer_hint<'a>(
     let press = HintPress::for_owner(state, HintPressOwner::Browse);
     let circle_label =
         crate::ui::start::mode::cancel_circle_label(immersive, always_immersive, state.editing);
-    // Compact → Immersive; immersive (when not always-on) → Compact via the same chord.
-    let toggle_label =
-        if !state.editing && crate::ui::start::mode::promote_gesture_usable(promote_gesture) {
-            if !immersive {
-                Some("Immersive")
-            } else if !always_immersive {
-                Some("Compact")
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+    // Compact footer: reopen chord → Immersive. Immersive demote is Circle (Back) when
+    // always-immersive is off — do not also advertise Compact on the reopen chord.
+    let toggle_label = if !state.editing
+        && !immersive
+        && crate::ui::start::mode::promote_gesture_usable(promote_gesture)
+    {
+        Some("Immersive")
+    } else {
+        None
+    };
     let promote_cue: Option<Element<'a, StartMessage>> = toggle_label.map(|label| {
         gesture_chord_hint(
             promote_gesture,
