@@ -1,15 +1,34 @@
 //! Steam library discovery (Windows): registry path + VDF/ACF manifests.
+//!
+//! Library roots are resolved newest-format-first (nested `libraryfolders.vdf`
+//! `"path"` objects → legacy flat numeric paths → `config.vdf`
+//! `BaseInstallFolder_*`). App manifests, `loginusers.vdf`, and
+//! `localconfig.vdf` stay on the current text reader until those layouts change;
+//! bump [`LAST_KNOWN_COMPATIBLE_STEAM_VERSION`] after verifying a newer client.
 
 use crate::platform::app_log;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Steam client package build last verified to scan successfully.
+/// Bump only after a successful check against a newer client.
+pub const LAST_KNOWN_COMPATIBLE_STEAM_VERSION: &str = "1788652215";
+
 /// Steam `StateFlags` bit: update available / required.
 const STATE_UPDATE_REQUIRED: u32 = 2;
 
 /// SteamID64 base for converting to the numeric `userdata/<id>` folder.
 const STEAM_ID64_BASE: u64 = 76_561_197_960_265_728;
+
+/// Which reader contributed extra library roots beyond the Steam install.
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibraryFolderSource {
+    Nested,
+    LegacyFlat,
+    BaseInstall,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SteamGame {
@@ -170,17 +189,66 @@ pub fn steam_root() -> Result<Option<PathBuf>, String> {
 
 fn library_folders(steam_root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut roots = vec![steam_root.to_path_buf()];
+    #[cfg(debug_assertions)]
+    let mut sources: Vec<LibraryFolderSource> = Vec::new();
     let vdf_path = steam_root.join("steamapps").join("libraryfolders.vdf");
-    let Ok(text) = fs::read_to_string(&vdf_path) else {
-        return Ok(roots);
-    };
-    for path in parse_libraryfolders(&text) {
+    if let Ok(text) = fs::read_to_string(&vdf_path) {
+        if push_library_paths(&mut roots, parse_libraryfolders(&text)) {
+            #[cfg(debug_assertions)]
+            sources.push(LibraryFolderSource::Nested);
+        }
+        if push_library_paths(&mut roots, parse_libraryfolders_legacy_flat(&text)) {
+            #[cfg(debug_assertions)]
+            sources.push(LibraryFolderSource::LegacyFlat);
+        }
+    }
+
+    // Older Steam listed extra libraries only in config.vdf.
+    if roots.len() == 1 {
+        let config_path = steam_root.join("config").join("config.vdf");
+        if let Ok(text) = fs::read_to_string(&config_path)
+            && push_library_paths(&mut roots, parse_base_install_folders(&text))
+        {
+            #[cfg(debug_assertions)]
+            sources.push(LibraryFolderSource::BaseInstall);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let source_labels: Vec<&str> = sources
+            .iter()
+            .map(|s| match s {
+                LibraryFolderSource::Nested => "nested",
+                LibraryFolderSource::LegacyFlat => "legacy_flat",
+                LibraryFolderSource::BaseInstall => "base_install",
+            })
+            .collect();
+        app_log::hid_trace(format!(
+            "steam library folders: roots={} sources={}",
+            roots.len(),
+            if source_labels.is_empty() {
+                "root_only".into()
+            } else {
+                source_labels.join(",")
+            }
+        ));
+    }
+
+    Ok(roots)
+}
+
+/// Append existing directory paths not already in `roots`. Returns true if any were added.
+fn push_library_paths(roots: &mut Vec<PathBuf>, paths: impl IntoIterator<Item = String>) -> bool {
+    let mut added = false;
+    for path in paths {
         let normalized = PathBuf::from(path.replace('\\', "/"));
         if normalized.is_dir() && !roots.iter().any(|r| r == &normalized) {
             roots.push(normalized);
+            added = true;
         }
     }
-    Ok(roots)
+    added
 }
 
 fn load_play_stats(steam_root: &Path) -> BTreeMap<u32, AppPlayStats> {
@@ -473,7 +541,7 @@ fn library_cache_backdrop_in(cache: &Path, appid: u32) -> Option<PathBuf> {
     None
 }
 
-/// Parse `libraryfolders.vdf` and collect `"path"` values.
+/// Parse modern `libraryfolders.vdf` and collect nested `"path"` values.
 pub fn parse_libraryfolders(text: &str) -> Vec<String> {
     let mut paths = Vec::new();
     for line in text.lines() {
@@ -483,6 +551,46 @@ pub fn parse_libraryfolders(text: &str) -> Vec<String> {
         }
     }
     paths
+}
+
+/// Parse legacy flat `libraryfolders.vdf` entries (`"1" "D:\\SteamLibrary"`).
+///
+/// Only numeric keys whose value looks like a directory are accepted.
+fn parse_libraryfolders_legacy_flat(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let Some((key, value)) = vdf_key_value(line.trim()) else {
+            continue;
+        };
+        if !key.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if looks_like_directory_path(&value) {
+            paths.push(value);
+        }
+    }
+    paths
+}
+
+/// Parse `BaseInstallFolder_*` path values from `config/config.vdf`.
+fn parse_base_install_folders(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let Some((key, value)) = vdf_key_value(line.trim()) else {
+            continue;
+        };
+        if key.starts_with("BaseInstallFolder_") && looks_like_directory_path(&value) {
+            paths.push(value);
+        }
+    }
+    paths
+}
+
+fn looks_like_directory_path(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    value.contains('\\') || value.contains('/') || (value.len() >= 2 && value.as_bytes()[1] == b':')
 }
 
 /// Parse an `appmanifest_*.acf` for appid + name.
@@ -643,14 +751,19 @@ fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 }
 
 fn vdf_string_value(line: &str, key: &str) -> Option<String> {
-    // "key"		"value"
-    let mut parts = line.split('"').filter(|s| !s.trim().is_empty());
-    let found_key = parts.next()?;
+    let (found_key, value) = vdf_key_value(line)?;
     if found_key != key {
         return None;
     }
+    Some(value)
+}
+
+/// `"key" "value"` on one line.
+fn vdf_key_value(line: &str) -> Option<(String, String)> {
+    let mut parts = line.split('"').filter(|s| !s.trim().is_empty());
+    let key = parts.next()?;
     let value = parts.next()?;
-    Some(unescape_vdf(value))
+    Some((unescape_vdf(key), unescape_vdf(value)))
 }
 
 fn vdf_key_only(line: &str) -> Option<String> {
@@ -702,6 +815,46 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(paths[0].contains("Steam"));
         assert_eq!(paths[1], r"D:\SteamLibrary");
+        // Modern nested objects must not be read as legacy flat paths.
+        assert!(parse_libraryfolders_legacy_flat(text).is_empty());
+    }
+
+    #[test]
+    fn parse_libraryfolders_legacy_flat_collects_directories() {
+        let text = r#"
+"LibraryFolders"
+{
+	"TimeNextStatsReport"		"1234567890"
+	"ContentStatsID"		"9876543210"
+	"1"		"D:\\SteamLibrary"
+	"2"		"E:\\Games\\Steam"
+}
+"#;
+        let paths = parse_libraryfolders_legacy_flat(text);
+        assert_eq!(paths, vec![r"D:\SteamLibrary", r"E:\Games\Steam"]);
+        assert!(parse_libraryfolders(text).is_empty());
+    }
+
+    #[test]
+    fn parse_base_install_folders_collects_paths() {
+        let text = r#"
+"InstallConfigStore"
+{
+	"Software"
+	{
+		"Valve"
+		{
+			"Steam"
+			{
+				"BaseInstallFolder_1"		"D:\\SteamLibrary"
+				"BaseInstallFolder_2"		"F:/Extra Library"
+			}
+		}
+	}
+}
+"#;
+        let paths = parse_base_install_folders(text);
+        assert_eq!(paths, vec![r"D:\SteamLibrary", "F:/Extra Library"]);
     }
 
     #[test]

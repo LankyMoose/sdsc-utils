@@ -10,6 +10,7 @@ use spectrum::{BAR_HEIGHT, HUE_HEIGHT, HueBar, SV_HEIGHT, SpectrumBar, SvSquare}
 
 #[cfg(feature = "dev-emulate")]
 use crate::controller::emulate::Preset;
+use crate::games::steam::LAST_KNOWN_COMPATIBLE_STEAM_VERSION;
 use crate::persist::analytics::{
     BucketDirection, ControllerAnalytics, InProgressBucket, StepCoverage, format_duration_short,
 };
@@ -806,6 +807,14 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             );
         }
     }
+
+    items = items.push(
+        text(format!(
+            "Last-known compatible Steam version: {LAST_KNOWN_COMPATIBLE_STEAM_VERSION}"
+        ))
+        .size(12.0)
+        .color(theme::MUTED),
+    );
 
     items.into()
 }
