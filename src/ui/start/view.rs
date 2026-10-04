@@ -3669,19 +3669,16 @@ pub(crate) fn footer_hint<'a>(
     let press = HintPress::for_owner(state, HintPressOwner::Browse);
     let circle_label =
         crate::ui::start::mode::cancel_circle_label(immersive, always_immersive, state.editing);
-    // Compact → Immersive; immersive (when not always-on) → Compact via the same chord.
-    let toggle_label =
-        if !state.editing && crate::ui::start::mode::promote_gesture_usable(promote_gesture) {
-            if !immersive {
-                Some("Immersive")
-            } else if !always_immersive {
-                Some("Compact")
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+    // Compact footer: reopen chord → Immersive. Immersive demote is Circle (Back) when
+    // always-immersive is off — do not also advertise Compact on the reopen chord.
+    let toggle_label = if !state.editing
+        && !immersive
+        && crate::ui::start::mode::promote_gesture_usable(promote_gesture)
+    {
+        Some("Immersive")
+    } else {
+        None
+    };
     let promote_cue: Option<Element<'a, StartMessage>> = toggle_label.map(|label| {
         gesture_chord_hint(
             promote_gesture,
@@ -5009,28 +5006,30 @@ mod tests {
 
     #[test]
     fn prime_backdrop_uncached_waits_then_fades_from_zero() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("sdsc-backdrop-prime-cold-{n}"));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("bd.png");
-        write_tiny_png(&path);
-        assert!(icon_cache::backdrop_cached(&path).is_none());
+        icon_cache::with_cache_lock(|| {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("sdsc-backdrop-prime-cold-{n}"));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("bd.png");
+            write_tiny_png(&path);
+            assert!(icon_cache::backdrop_cached(&path).is_none());
 
-        let mut state = state_with_backdrop(path.clone());
-        let now = Instant::now();
-        state.prime_backdrop_for_enter(now);
-        assert!(state.backdrop_incoming_visual(now).is_none());
+            let mut state = state_with_backdrop(path.clone());
+            let now = Instant::now();
+            state.prime_backdrop_for_enter(now);
+            assert!(state.backdrop_incoming_visual(now).is_none());
 
-        assert!(icon_cache::backdrop_for_path(&path).is_some());
-        state.note_backdrop_ready(now);
-        let (opacity, _, _, _) = state
-            .backdrop_incoming_visual(now)
-            .expect("fade starts once ready");
-        assert!(opacity < 0.05);
+            assert!(icon_cache::backdrop_for_path(&path).is_some());
+            state.note_backdrop_ready(now);
+            let (opacity, _, _, _) = state
+                .backdrop_incoming_visual(now)
+                .expect("fade starts once ready");
+            assert!(opacity < 0.05);
 
-        let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
@@ -5276,97 +5275,101 @@ mod tests {
 
     #[test]
     fn enter_paints_cached_splash_opaque_under_veil() {
-        use crate::ui::start::mode::{ENTER_REVEAL_MAX_FRAME_MS, TransitionPhase};
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("sdsc-enter-hold-splash-{n}"));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("bd.png");
-        write_tiny_png(&path);
-        assert!(icon_cache::backdrop_for_path(&path).is_some());
+        icon_cache::with_cache_lock(|| {
+            use crate::ui::start::mode::{ENTER_REVEAL_MAX_FRAME_MS, TransitionPhase};
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("sdsc-enter-hold-splash-{n}"));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("bd.png");
+            write_tiny_png(&path);
+            assert!(icon_cache::backdrop_for_path(&path).is_some());
 
-        let mut state = state_with_backdrop(path);
-        let t0 = Instant::now();
-        state.begin_transition_phase(TransitionPhase::EnterImmersive, t0);
-        state.arm_enter_reveal(t0);
-        state.prime_backdrop_for_enter(t0);
-        // Must paint under the veil (opacity > 0) so the new-window atlas uploads
-        // before unveil — holding at 0 skips the draw and flashes ambient after.
-        assert!(state.splash_opaque);
-        assert!(!state.splash_reveal_pending);
-        let (opacity, _, _, _) = state
-            .backdrop_incoming_visual(t0)
-            .expect("cached splash paints under veil");
-        assert!((opacity - 1.0).abs() < 0.001);
-
-        let mut now = t0;
-        while !state.phase_finished(now) {
-            now += Duration::from_millis(ENTER_REVEAL_MAX_FRAME_MS);
-            state.advance_enter_reveal(now);
-            state.try_start_pending_splash_reveal(now);
-            let (opacity, _, _, _) = state.backdrop_incoming_visual(now).unwrap();
+            let mut state = state_with_backdrop(path);
+            let t0 = Instant::now();
+            state.begin_transition_phase(TransitionPhase::EnterImmersive, t0);
+            state.arm_enter_reveal(t0);
+            state.prime_backdrop_for_enter(t0);
+            // Must paint under the veil (opacity > 0) so the new-window atlas uploads
+            // before unveil — holding at 0 skips the draw and flashes ambient after.
+            assert!(state.splash_opaque);
+            assert!(!state.splash_reveal_pending);
+            let (opacity, _, _, _) = state
+                .backdrop_incoming_visual(t0)
+                .expect("cached splash paints under veil");
             assert!((opacity - 1.0).abs() < 0.001);
-        }
-        // Late ArtReady must not restart a fade from zero.
-        state.note_backdrop_ready(now);
-        state.clear_transition_phase();
-        state.try_start_pending_splash_reveal(now);
-        assert!(state.splash_opaque);
-        assert!(!state.enter_splash_fade);
-        let (opacity, _, _, _) = state
-            .backdrop_incoming_visual(now)
-            .expect("still opaque after veil");
-        assert!((opacity - 1.0).abs() < 0.001);
 
-        let _ = std::fs::remove_dir_all(&dir);
+            let mut now = t0;
+            while !state.phase_finished(now) {
+                now += Duration::from_millis(ENTER_REVEAL_MAX_FRAME_MS);
+                state.advance_enter_reveal(now);
+                state.try_start_pending_splash_reveal(now);
+                let (opacity, _, _, _) = state.backdrop_incoming_visual(now).unwrap();
+                assert!((opacity - 1.0).abs() < 0.001);
+            }
+            // Late ArtReady must not restart a fade from zero.
+            state.note_backdrop_ready(now);
+            state.clear_transition_phase();
+            state.try_start_pending_splash_reveal(now);
+            assert!(state.splash_opaque);
+            assert!(!state.enter_splash_fade);
+            let (opacity, _, _, _) = state
+                .backdrop_incoming_visual(now)
+                .expect("still opaque after veil");
+            assert!((opacity - 1.0).abs() < 0.001);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
     fn cold_start_late_art_fades_ambient_to_splash() {
-        use crate::ui::start::mode::{
-            ART_FADE_MS, ENTER_REVEAL_MAX_FRAME_MS, TransitionPhase, enter_art_fade_progress,
-        };
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("sdsc-cold-ambient-fade-{n}"));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("bd.png");
-        write_tiny_png(&path);
-        assert!(icon_cache::backdrop_cached(&path).is_none());
+        icon_cache::with_cache_lock(|| {
+            use crate::ui::start::mode::{
+                ART_FADE_MS, ENTER_REVEAL_MAX_FRAME_MS, TransitionPhase, enter_art_fade_progress,
+            };
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("sdsc-cold-ambient-fade-{n}"));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("bd.png");
+            write_tiny_png(&path);
+            assert!(icon_cache::backdrop_cached(&path).is_none());
 
-        let mut state = state_with_backdrop(path.clone());
-        let t0 = Instant::now();
-        state.begin_transition_phase(TransitionPhase::EnterImmersive, t0);
-        state.arm_enter_reveal(t0);
-        state.prime_backdrop_for_enter(t0);
-        assert!(!state.splash_reveal_pending);
-        assert!(state.backdrop_incoming_visual(t0).is_none());
+            let mut state = state_with_backdrop(path.clone());
+            let t0 = Instant::now();
+            state.begin_transition_phase(TransitionPhase::EnterImmersive, t0);
+            state.arm_enter_reveal(t0);
+            state.prime_backdrop_for_enter(t0);
+            assert!(!state.splash_reveal_pending);
+            assert!(state.backdrop_incoming_visual(t0).is_none());
 
-        let mut now = t0;
-        while !state.phase_finished(now) {
-            now += Duration::from_millis(ENTER_REVEAL_MAX_FRAME_MS);
-            state.advance_enter_reveal(now);
-        }
-        state.clear_transition_phase();
+            let mut now = t0;
+            while !state.phase_finished(now) {
+                now += Duration::from_millis(ENTER_REVEAL_MAX_FRAME_MS);
+                state.advance_enter_reveal(now);
+            }
+            state.clear_transition_phase();
 
-        assert!(icon_cache::backdrop_for_path(&path).is_some());
-        state.note_backdrop_ready(now);
-        assert!(state.enter_splash_fade);
-        let (opacity, _, _, _) = state
-            .backdrop_incoming_visual(now)
-            .expect("late art starts fade");
-        assert!(opacity < 0.05, "must fade from zero, got {opacity}");
+            assert!(icon_cache::backdrop_for_path(&path).is_some());
+            state.note_backdrop_ready(now);
+            assert!(state.enter_splash_fade);
+            let (opacity, _, _, _) = state
+                .backdrop_incoming_visual(now)
+                .expect("late art starts fade");
+            assert!(opacity < 0.05, "must fade from zero, got {opacity}");
 
-        let mid = now + Duration::from_millis(ART_FADE_MS / 2);
-        let (mid_opacity, _, _, _) = state.backdrop_incoming_visual(mid).expect("mid fade");
-        assert!(
-            (mid_opacity - enter_art_fade_progress(ART_FADE_MS / 2)).abs() < 0.02,
-            "mid={mid_opacity}"
-        );
+            let mid = now + Duration::from_millis(ART_FADE_MS / 2);
+            let (mid_opacity, _, _, _) = state.backdrop_incoming_visual(mid).expect("mid fade");
+            assert!(
+                (mid_opacity - enter_art_fade_progress(ART_FADE_MS / 2)).abs() < 0.02,
+                "mid={mid_opacity}"
+            );
 
-        let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
