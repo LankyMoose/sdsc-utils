@@ -21,7 +21,7 @@ This is **empty atlas construction for a new window renderer** (`create_renderer
 
 ### Why edit-mode is not the smoking gun
 
-Edit mode attaches icons for every installed Steam game. Rapid edit on/off has not reproduced the panic. Browse with a few enabled games only draws those rows. `prepare_paths` warms CPU-side `icon_cache` Handles for the library; they enter the GPU atlas only when drawn.
+Edit mode attaches icons for every installed Steam game. Rapid edit on/off has not reproduced the panic. Browse with a few enabled games only draws those rows. A single-flight art worker warms CPU-side `icon_cache` Handles for a ±10 selection window (not the whole library); they enter the GPU atlas only when drawn.
 
 ### Captured sequences
 

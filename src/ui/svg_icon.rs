@@ -126,6 +126,13 @@ struct CacheKey {
 static RASTER_CACHE: LazyLock<Mutex<HashMap<CacheKey, Vec<u8>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Drop every cached SVG raster (process Exit).
+pub fn clear_cache() {
+    if let Ok(mut cache) = RASTER_CACHE.lock() {
+        cache.clear();
+    }
+}
+
 /// Rasterize an SVG into straight RGBA (`size × size × 4`).
 pub fn rasterize(svg: &str, size: u32, colors: &ColorMap) -> Result<Vec<u8>, String> {
     if size == 0 {

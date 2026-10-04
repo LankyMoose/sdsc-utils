@@ -285,14 +285,14 @@ impl StartRow {
     }
 
     /// Immersive hero art — peek only (never decodes on the UI thread).
-    /// Falls back to the list icon when the hero tier is still cold.
+    /// Falls back to the live list-tier peek when the hero tier is still cold.
     pub fn hero_icon(&self) -> Option<StartIcon> {
         match &self.icon_source {
             Some(IconSource::File(path)) => icon_cache::hero_cached(path).map(StartIcon),
             Some(IconSource::Shell(path)) => icon_cache::hero_shell_cached(path).map(StartIcon),
             None => None,
         }
-        .or_else(|| self.icon.clone())
+        .or_else(|| self.list_icon_live())
     }
 
     /// True when the immersive hero tier is already decoded (no list fallback).
@@ -309,6 +309,16 @@ impl StartRow {
         self.backdrop_path
             .as_ref()
             .and_then(|p| icon_cache::backdrop_cached(p).map(StartIcon))
+    }
+
+    /// List-tier icon — live peek (never decodes on the UI thread).
+    pub fn list_icon_live(&self) -> Option<StartIcon> {
+        match &self.icon_source {
+            Some(IconSource::File(path)) => icon_cache::icon_cached(path).map(StartIcon),
+            Some(IconSource::Shell(path)) => icon_cache::icon_shell_cached(path).map(StartIcon),
+            None => None,
+        }
+        .or_else(|| self.icon.clone())
     }
 
     pub fn in_catalog(&self) -> bool {
@@ -368,7 +378,7 @@ pub fn probe_shell_icon(target: &str) -> Option<StartIcon> {
         return None;
     }
     let path = PathBuf::from(target);
-    icon_cache::handle_for_shell(&path).map(StartIcon)
+    icon_cache::handle_for_shell_pinned(&path).map(StartIcon)
 }
 
 /// Controller row for the Controllers slide (live or remembered disconnected).
@@ -561,6 +571,8 @@ pub struct State {
     backdrop_outgoing: Option<(String, f32)>,
     /// Ring flash started with the last successful Identify (Controllers slide).
     identify_flash: Option<IdentifyFlash>,
+    /// Keep painting while the art worker may still fill peeks (compact list / cover).
+    pub art_awaiting_paint: bool,
 }
 
 /// Active Identify ring flash for one controller row on the start screen.
@@ -625,6 +637,7 @@ impl Default for State {
             backdrop_current: None,
             backdrop_outgoing: None,
             identify_flash: None,
+            art_awaiting_paint: false,
         }
     }
 }
@@ -828,6 +841,7 @@ impl State {
             || self.manual_add.is_some()
             || self.hint_anims_need_frames()
             || self.identify_flash_active()
+            || self.art_awaiting_paint
     }
 
     /// Immersive dock width progress 0..=1 (eased while animating).
@@ -1006,6 +1020,89 @@ impl State {
         clock.last_tick = Some(now);
         clock.elapsed_ms = 0;
         crate::controller::hid::diag::diag_info("ui-diag: start immersive enter reveal armed");
+    }
+
+    /// True once the enter-reveal clock is advancing (veil lifting).
+    pub fn enter_reveal_armed(&self) -> bool {
+        self.enter_reveal.as_ref().is_some_and(|c| c.armed)
+    }
+
+    /// Selected splash + visible strip heroes are decoded (matches idle Steam-scan pre-warm).
+    pub fn enter_art_sync_ready(&self) -> bool {
+        use crate::ui::start::vstrip::{NEIGHBORS, VISIBLE};
+        let len = self.rows.len();
+        if len == 0 {
+            return true;
+        }
+        let selected = self.game_selected.min(len - 1);
+        let Some(sel) = self.rows.get(selected) else {
+            return true;
+        };
+        // Wait for Steam scan to materialize real rows before syncing enter.
+        if sel.skeleton {
+            return false;
+        }
+        if sel.backdrop_path.is_some() && sel.backdrop_icon().is_none() {
+            return false;
+        }
+        if sel.icon_source.is_some() && !sel.hero_ready() {
+            return false;
+        }
+        let circular = self.immersive && len >= VISIBLE;
+        for idx in icon_cache::art_window_indices(selected, len, circular, NEIGHBORS) {
+            let Some(row) = self.rows.get(idx) else {
+                continue;
+            };
+            if row.skeleton {
+                return false;
+            }
+            if row.icon_source.is_some() && !row.hero_ready() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Arm enter reveal once splash + strip heroes are ready; snap splash opaque under the veil.
+    ///
+    /// Cold open after process restart must wait here so art does not trickle in after the
+    /// veil lifts (first launch feels synced because Steam scan pre-warms while idle).
+    pub fn try_arm_enter_reveal_when_art_ready(&mut self, now: Instant) -> bool {
+        if self.enter_reveal.is_none() || self.enter_reveal_armed() {
+            return false;
+        }
+        if !self.enter_art_sync_ready() {
+            return false;
+        }
+        if let Some(row) = self.rows.get(self.game_selected)
+            && row.backdrop_icon().is_some()
+        {
+            self.reveal_cached_opaque(row.play_key.clone(), now);
+        }
+        self.arm_enter_reveal(now);
+        crate::controller::hid::diag::diag_info("ui-diag: start immersive enter art sync ready");
+        true
+    }
+
+    /// If art stays cold too long, lift the veil anyway (avoid a stuck blackout).
+    pub fn maybe_force_enter_reveal_after_art_hold(&mut self, now: Instant) {
+        use crate::ui::start::mode::ENTER_ART_HOLD_MAX_MS;
+        if self.enter_reveal.is_none() || self.enter_reveal_armed() {
+            return;
+        }
+        let Some((_, started)) = self.transition_phase else {
+            return;
+        };
+        if now.saturating_duration_since(started) < Duration::from_millis(ENTER_ART_HOLD_MAX_MS) {
+            return;
+        }
+        crate::controller::hid::diag::diag_info("ui-diag: start immersive enter art hold timeout");
+        if let Some(row) = self.rows.get(self.game_selected)
+            && row.backdrop_icon().is_some()
+        {
+            self.reveal_cached_opaque(row.play_key.clone(), now);
+        }
+        self.arm_enter_reveal(now);
     }
 
     /// Advance the capped EnterImmersive clock. Call once per StartFrame.
@@ -1319,33 +1416,79 @@ impl State {
         (hero, shell, row.backdrop_path.clone())
     }
 
-    /// Paths to warm for the current immersive selection window.
-    /// Returns `(hero_files, hero_shells, backdrops)`.
-    pub fn immersive_warm_paths(&self) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
-        use crate::ui::start::vstrip::{self, NEIGHBORS};
-        let mut heroes = Vec::new();
-        let mut shells = Vec::new();
-        let mut backdrops = Vec::new();
-        let len = self.rows.len();
-        if len == 0 {
-            return (heroes, shells, backdrops);
-        }
-        let selected = self.game_selected.min(len - 1);
-        for delta in -NEIGHBORS..=NEIGHBORS {
-            let Some(idx) = vstrip::slot_catalog_index(selected, delta, len) else {
-                continue;
-            };
+    /// Art paths for catalog indices within `radius` of the selection.
+    ///
+    /// Immersive uses a circular index window (strip wrap); compact is linear.
+    pub fn art_paths_for_radius(&self, radius: isize) -> icon_cache::ArtRetainSet {
+        let mut set = icon_cache::ArtRetainSet::default();
+        let indices = icon_cache::art_window_indices(
+            self.game_selected,
+            self.rows.len(),
+            self.immersive,
+            radius,
+        );
+        for idx in indices {
             let row = &self.rows[idx];
             match &row.icon_source {
-                Some(IconSource::File(path)) => heroes.push(path.clone()),
-                Some(IconSource::Shell(path)) => shells.push(path.clone()),
+                Some(IconSource::File(path)) => {
+                    set.list_files.push(path.clone());
+                    set.heroes.push(path.clone());
+                }
+                Some(IconSource::Shell(path)) => {
+                    set.list_shells.push(path.clone());
+                    set.hero_shells.push(path.clone());
+                }
                 None => {}
             }
             if let Some(path) = row.backdrop_path.clone() {
-                backdrops.push(path);
+                set.backdrops.push(path);
             }
         }
-        (heroes, shells, backdrops)
+        set
+    }
+
+    /// Full retain set: ±[`icon_cache::ART_WINDOW`] plus crossfade / dialog pins.
+    pub fn art_retain_set(&self) -> icon_cache::ArtRetainSet {
+        let mut set = self.art_paths_for_radius(icon_cache::ART_WINDOW);
+        if let Some((key, _)) = self.backdrop_outgoing.as_ref() {
+            if let Some(path) = self
+                .rows
+                .iter()
+                .find(|r| r.play_key == *key)
+                .and_then(|r| r.backdrop_path.clone())
+            {
+                if !set.backdrops.contains(&path) {
+                    set.backdrops.push(path);
+                }
+            }
+        }
+        if let Some(draft) = self.manual_add.as_ref() {
+            if let Some(path) = draft.icon_path.clone() {
+                if !set.list_files.contains(&path) {
+                    set.list_files.push(path);
+                }
+            }
+            if !draft.target.starts_with("steam://") {
+                let path = PathBuf::from(&draft.target);
+                if !set.list_shells.contains(&path) {
+                    set.list_shells.push(path);
+                }
+            }
+        }
+        set
+    }
+
+    /// Visible strip / near-list paths (±[`vstrip::NEIGHBORS`]) — warm immediately.
+    pub fn art_near_set(&self) -> icon_cache::ArtRetainSet {
+        use crate::ui::start::vstrip::NEIGHBORS;
+        self.art_paths_for_radius(NEIGHBORS)
+    }
+
+    /// Paths to warm for the current selection art window.
+    /// Returns `(hero_files, hero_shells, backdrops)`.
+    pub fn immersive_warm_paths(&self) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+        let set = self.art_retain_set();
+        (set.heroes, set.hero_shells, set.backdrops)
     }
 
     /// Selection changed: park prior art as solid underlay and land the new one.
@@ -1460,6 +1603,8 @@ impl State {
     }
 
     pub fn tick_anim(&mut self, now: Instant) -> bool {
+        self.maybe_force_enter_reveal_after_art_hold(now);
+        let _ = self.try_arm_enter_reveal_when_art_ready(now);
         self.advance_enter_reveal(now);
         self.try_start_pending_splash_reveal(now);
         let mut busy = false;
@@ -3026,8 +3171,8 @@ fn game_row(
             .style(theme::well)
             .into()
     } else {
-        match row.icon.as_ref() {
-            Some(icon) => iced::widget::image(icon.0.clone())
+        match row.list_icon_live() {
+            Some(icon) => iced::widget::image(icon.0)
                 .width(Length::Fixed(ICON_W))
                 .height(Length::Fixed(ICON_H))
                 .content_fit(ContentFit::Cover)
@@ -3558,33 +3703,35 @@ mod tests {
 
     #[test]
     fn prime_backdrop_cached_snaps_opaque_without_restart() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("sdsc-backdrop-prime-cached-{n}"));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("bd.png");
-        write_tiny_png(&path);
-        assert!(icon_cache::backdrop_for_path(&path).is_some());
+        icon_cache::with_cache_lock(|| {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("sdsc-backdrop-prime-cached-{n}"));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("bd.png");
+            write_tiny_png(&path);
+            assert!(icon_cache::backdrop_for_path(&path).is_some());
 
-        let mut state = state_with_backdrop(path);
-        let now = Instant::now();
-        state.prime_backdrop_for_enter(now);
-        let (opacity, _, _, _) = state
-            .backdrop_incoming_visual(now)
-            .expect("cached enter paints");
-        assert!((opacity - 1.0).abs() < 0.001);
-        assert!(state.splash_opaque);
-        assert!(!state.enter_splash_fade);
+            let mut state = state_with_backdrop(path);
+            let now = Instant::now();
+            state.prime_backdrop_for_enter(now);
+            let (opacity, _, _, _) = state
+                .backdrop_incoming_visual(now)
+                .expect("cached enter paints");
+            assert!((opacity - 1.0).abs() < 0.001);
+            assert!(state.splash_opaque);
+            assert!(!state.enter_splash_fade);
 
-        // Late ImmersiveArtReady must not restart a fade from zero.
-        state.note_backdrop_ready(now + Duration::from_millis(16));
-        let (opacity, _, _, _) = state
-            .backdrop_incoming_visual(now + Duration::from_millis(16))
-            .expect("still paints");
-        assert!((opacity - 1.0).abs() < 0.001);
+            // Late ImmersiveArtReady must not restart a fade from zero.
+            state.note_backdrop_ready(now + Duration::from_millis(16));
+            let (opacity, _, _, _) = state
+                .backdrop_incoming_visual(now + Duration::from_millis(16))
+                .expect("still paints");
+            assert!((opacity - 1.0).abs() < 0.001);
 
-        let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
@@ -3615,25 +3762,27 @@ mod tests {
 
     #[test]
     fn note_backdrop_ready_missing_state_fades_cached() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("sdsc-backdrop-ready-miss-{n}"));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("bd.png");
-        write_tiny_png(&path);
-        assert!(icon_cache::backdrop_for_path(&path).is_some());
+        icon_cache::with_cache_lock(|| {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("sdsc-backdrop-ready-miss-{n}"));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("bd.png");
+            write_tiny_png(&path);
+            assert!(icon_cache::backdrop_for_path(&path).is_some());
 
-        let mut state = state_with_backdrop(path);
-        let now = Instant::now();
-        assert!(state.backdrop_current.is_none());
-        state.note_backdrop_ready(now);
-        let (opacity, _, _, _) = state
-            .backdrop_incoming_visual(now)
-            .expect("missing+cached starts fade");
-        assert!(opacity < 0.05);
+            let mut state = state_with_backdrop(path);
+            let now = Instant::now();
+            assert!(state.backdrop_current.is_none());
+            state.note_backdrop_ready(now);
+            let (opacity, _, _, _) = state
+                .backdrop_incoming_visual(now)
+                .expect("missing+cached starts fade");
+            assert!(opacity < 0.05);
 
-        let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
@@ -3647,6 +3796,57 @@ mod tests {
         // Wall time alone must not advance the capped clock.
         state.advance_enter_reveal(now + Duration::from_millis(200));
         assert!((state.enter_veil_amount() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn enter_holds_veil_until_splash_and_strip_heroes_ready() {
+        icon_cache::with_cache_lock(|| {
+            use crate::ui::start::mode::TransitionPhase;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("sdsc-enter-art-sync-{n}"));
+            let _ = std::fs::create_dir_all(&dir);
+            let hero = dir.join("hero.png");
+            let bd = dir.join("bd.png");
+            write_tiny_png(&hero);
+            write_tiny_png(&bd);
+
+            let mut state = State {
+                rows: vec![StartRow {
+                    title: "g".into(),
+                    subtitle: None,
+                    target: "t".into(),
+                    args: String::new(),
+                    play_key: "k".into(),
+                    icon: None,
+                    icon_source: Some(IconSource::File(hero.clone())),
+                    backdrop_path: Some(bd.clone()),
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                }],
+                game_selected: 0,
+                immersive: true,
+                ..Default::default()
+            };
+            let now = Instant::now();
+            state.begin_transition_phase(TransitionPhase::EnterImmersive, now);
+            state.prime_backdrop_for_enter(now);
+            assert!(!state.enter_art_sync_ready());
+            assert!(!state.try_arm_enter_reveal_when_art_ready(now));
+            assert!(!state.enter_reveal_armed());
+            assert!((state.enter_veil_amount() - 1.0).abs() < 0.001);
+
+            assert!(icon_cache::hero_for_path(&hero).is_some());
+            assert!(icon_cache::backdrop_for_path(&bd).is_some());
+            assert!(state.enter_art_sync_ready());
+            assert!(state.try_arm_enter_reveal_when_art_ready(now));
+            assert!(state.enter_reveal_armed());
+            assert!(state.splash_opaque);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
@@ -3780,148 +3980,152 @@ mod tests {
 
     #[test]
     fn title_change_cover_crossfade_keeps_outgoing_solid() {
-        use crate::ui::start::mode::ART_FADE_MS;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("sdsc-cover-crossfade-{n}"));
-        let _ = std::fs::create_dir_all(&dir);
-        let path0 = dir.join("bd0.png");
-        let path1 = dir.join("bd1.png");
-        write_tiny_png(&path0);
-        write_tiny_png(&path1);
-        assert!(icon_cache::backdrop_for_path(&path0).is_some());
-        assert!(icon_cache::backdrop_for_path(&path1).is_some());
+        icon_cache::with_cache_lock(|| {
+            use crate::ui::start::mode::ART_FADE_MS;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("sdsc-cover-crossfade-{n}"));
+            let _ = std::fs::create_dir_all(&dir);
+            let path0 = dir.join("bd0.png");
+            let path1 = dir.join("bd1.png");
+            write_tiny_png(&path0);
+            write_tiny_png(&path1);
+            assert!(icon_cache::backdrop_for_path(&path0).is_some());
+            assert!(icon_cache::backdrop_for_path(&path1).is_some());
 
-        let mut state = State {
-            rows: vec![
-                StartRow {
-                    title: "g0".into(),
-                    subtitle: None,
-                    target: "t0".into(),
-                    args: String::new(),
-                    play_key: "k0".into(),
-                    icon: None,
-                    icon_source: None,
-                    backdrop_path: Some(path0),
-                    edit: None,
-                    skeleton: false,
-                    update_required: false,
-                },
-                StartRow {
-                    title: "g1".into(),
-                    subtitle: None,
-                    target: "t1".into(),
-                    args: String::new(),
-                    play_key: "k1".into(),
-                    icon: None,
-                    icon_source: None,
-                    backdrop_path: Some(path1),
-                    edit: None,
-                    skeleton: false,
-                    update_required: false,
-                },
-            ],
-            game_selected: 0,
-            immersive: true,
-            ..Default::default()
-        };
-        let now = Instant::now();
-        state.prime_backdrop_for_enter(now);
-        assert!(state.splash_opaque);
+            let mut state = State {
+                rows: vec![
+                    StartRow {
+                        title: "g0".into(),
+                        subtitle: None,
+                        target: "t0".into(),
+                        args: String::new(),
+                        play_key: "k0".into(),
+                        icon: None,
+                        icon_source: None,
+                        backdrop_path: Some(path0),
+                        edit: None,
+                        skeleton: false,
+                        update_required: false,
+                    },
+                    StartRow {
+                        title: "g1".into(),
+                        subtitle: None,
+                        target: "t1".into(),
+                        args: String::new(),
+                        play_key: "k1".into(),
+                        icon: None,
+                        icon_source: None,
+                        backdrop_path: Some(path1),
+                        edit: None,
+                        skeleton: false,
+                        update_required: false,
+                    },
+                ],
+                game_selected: 0,
+                immersive: true,
+                ..Default::default()
+            };
+            let now = Instant::now();
+            state.prime_backdrop_for_enter(now);
+            assert!(state.splash_opaque);
 
-        state.game_selected = 1;
-        state.reset_backdrop_fade();
-        let mid = Instant::now() + Duration::from_millis(ART_FADE_MS / 2);
-        let (out_key, out_opacity, out_scale) = state
-            .backdrop_outgoing_visual(mid)
-            .expect("outgoing underlay");
-        assert_eq!(out_key, "k0");
-        assert!(
-            (out_opacity - 1.0).abs() < 0.001,
-            "outgoing must stay solid"
-        );
-        assert!((out_scale - 1.0).abs() < 0.001, "fresh land freezes at 1.0");
-        let (in_opacity, _, _, _) = state
-            .backdrop_incoming_visual(mid)
-            .expect("incoming fading");
-        assert!(in_opacity > 0.4 && in_opacity < 1.0, "in={in_opacity}");
-        assert!(!state.enter_splash_fade);
+            state.game_selected = 1;
+            state.reset_backdrop_fade();
+            let mid = Instant::now() + Duration::from_millis(ART_FADE_MS / 2);
+            let (out_key, out_opacity, out_scale) = state
+                .backdrop_outgoing_visual(mid)
+                .expect("outgoing underlay");
+            assert_eq!(out_key, "k0");
+            assert!(
+                (out_opacity - 1.0).abs() < 0.001,
+                "outgoing must stay solid"
+            );
+            assert!((out_scale - 1.0).abs() < 0.001, "fresh land freezes at 1.0");
+            let (in_opacity, _, _, _) = state
+                .backdrop_incoming_visual(mid)
+                .expect("incoming fading");
+            assert!(in_opacity > 0.4 && in_opacity < 1.0, "in={in_opacity}");
+            assert!(!state.enter_splash_fade);
 
-        let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
     fn reset_backdrop_freezes_outgoing_ken_burns_scale() {
-        use crate::ui::start::mode::{BACKDROP_LAND_MS, backdrop_land_scale};
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("sdsc-freeze-scale-{n}"));
-        let _ = std::fs::create_dir_all(&dir);
-        let path0 = dir.join("bd0.png");
-        let path1 = dir.join("bd1.png");
-        write_tiny_png(&path0);
-        write_tiny_png(&path1);
-        assert!(icon_cache::backdrop_for_path(&path0).is_some());
-        assert!(icon_cache::backdrop_for_path(&path1).is_some());
+        icon_cache::with_cache_lock(|| {
+            use crate::ui::start::mode::{BACKDROP_LAND_MS, backdrop_land_scale};
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("sdsc-freeze-scale-{n}"));
+            let _ = std::fs::create_dir_all(&dir);
+            let path0 = dir.join("bd0.png");
+            let path1 = dir.join("bd1.png");
+            write_tiny_png(&path0);
+            write_tiny_png(&path1);
+            assert!(icon_cache::backdrop_for_path(&path0).is_some());
+            assert!(icon_cache::backdrop_for_path(&path1).is_some());
 
-        let mut state = State {
-            rows: vec![
-                StartRow {
-                    title: "g0".into(),
-                    subtitle: None,
-                    target: "t0".into(),
-                    args: String::new(),
-                    play_key: "k0".into(),
-                    icon: None,
-                    icon_source: None,
-                    backdrop_path: Some(path0),
-                    edit: None,
-                    skeleton: false,
-                    update_required: false,
-                },
-                StartRow {
-                    title: "g1".into(),
-                    subtitle: None,
-                    target: "t1".into(),
-                    args: String::new(),
-                    play_key: "k1".into(),
-                    icon: None,
-                    icon_source: None,
-                    backdrop_path: Some(path1),
-                    edit: None,
-                    skeleton: false,
-                    update_required: false,
-                },
-            ],
-            game_selected: 0,
-            immersive: true,
-            ..Default::default()
-        };
-        let t0 = Instant::now();
-        state.prime_backdrop_for_enter(t0);
-        // Advance land clock without wall-waiting: rewrite started into the past.
-        let mid_land = BACKDROP_LAND_MS / 4;
-        if let Some((_, started)) = &mut state.backdrop_current {
-            *started = Some(t0 - Duration::from_millis(mid_land));
-        }
-        let expected =
-            backdrop_land_scale(crate::ui::start::mode::backdrop_land_progress(mid_land));
-        assert!(expected > 1.01, "test needs mid-land scale, got {expected}");
+            let mut state = State {
+                rows: vec![
+                    StartRow {
+                        title: "g0".into(),
+                        subtitle: None,
+                        target: "t0".into(),
+                        args: String::new(),
+                        play_key: "k0".into(),
+                        icon: None,
+                        icon_source: None,
+                        backdrop_path: Some(path0),
+                        edit: None,
+                        skeleton: false,
+                        update_required: false,
+                    },
+                    StartRow {
+                        title: "g1".into(),
+                        subtitle: None,
+                        target: "t1".into(),
+                        args: String::new(),
+                        play_key: "k1".into(),
+                        icon: None,
+                        icon_source: None,
+                        backdrop_path: Some(path1),
+                        edit: None,
+                        skeleton: false,
+                        update_required: false,
+                    },
+                ],
+                game_selected: 0,
+                immersive: true,
+                ..Default::default()
+            };
+            let t0 = Instant::now();
+            state.prime_backdrop_for_enter(t0);
+            // Advance land clock without wall-waiting: rewrite started into the past.
+            let mid_land = BACKDROP_LAND_MS / 4;
+            if let Some((_, started)) = &mut state.backdrop_current {
+                *started = Some(t0 - Duration::from_millis(mid_land));
+            }
+            let expected =
+                backdrop_land_scale(crate::ui::start::mode::backdrop_land_progress(mid_land));
+            assert!(expected > 1.01, "test needs mid-land scale, got {expected}");
 
-        // Selection moves first (matches app), then reset parks prior scale.
-        state.game_selected = 1;
-        state.reset_backdrop_fade();
-        let (_, _, frozen) = state
-            .backdrop_outgoing_visual(Instant::now())
-            .expect("outgoing");
-        assert!(
-            (frozen - expected).abs() < 0.005,
-            "frozen={frozen} expected={expected}"
-        );
+            // Selection moves first (matches app), then reset parks prior scale.
+            state.game_selected = 1;
+            state.reset_backdrop_fade();
+            let (_, _, frozen) = state
+                .backdrop_outgoing_visual(Instant::now())
+                .expect("outgoing");
+            assert!(
+                (frozen - expected).abs() < 0.005,
+                "frozen={frozen} expected={expected}"
+            );
 
-        let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
@@ -3949,12 +4153,83 @@ mod tests {
             ..Default::default()
         };
         let (_heroes, _, backdrops) = state.immersive_warm_paths();
-        // ±NEIGHBORS (2) around selection 2 → indices 0..=4
+        // Compact (linear) ±ART_WINDOW around selection 2 → all 5 rows.
         for path in &bd {
             assert!(
                 backdrops.contains(path),
-                "missing neighbor backdrop {path:?} in {backdrops:?}"
+                "missing window backdrop {path:?} in {backdrops:?}"
             );
         }
+    }
+
+    #[test]
+    fn art_retain_set_circular_when_immersive() {
+        let state = State {
+            rows: (0..30)
+                .map(|i| StartRow {
+                    title: format!("g{i}"),
+                    subtitle: None,
+                    target: format!("t{i}"),
+                    args: String::new(),
+                    play_key: format!("k{i}"),
+                    icon: None,
+                    icon_source: Some(IconSource::File(PathBuf::from(format!("h{i}.png")))),
+                    backdrop_path: Some(PathBuf::from(format!("bd{i}.png"))),
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                })
+                .collect(),
+            game_selected: 0,
+            immersive: true,
+            ..Default::default()
+        };
+        let set = state.art_retain_set();
+        let w = icon_cache::ART_WINDOW as usize;
+        assert!(set.backdrops.contains(&PathBuf::from("bd0.png")));
+        assert!(set.backdrops.contains(&PathBuf::from("bd29.png")));
+        assert!(
+            set.backdrops
+                .contains(&PathBuf::from(format!("bd{}.png", 30 - w)))
+        );
+        assert!(!set.backdrops.contains(&PathBuf::from("bd15.png")));
+    }
+
+    #[test]
+    fn list_icon_live_peeks_cache_without_row_snapshot() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sdsc-list-live-{n}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("icon.png");
+        {
+            let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), 2, 2);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().unwrap();
+            writer
+                .write_image_data(&[
+                    255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+                ])
+                .unwrap();
+        }
+        let row = StartRow {
+            title: "g".into(),
+            subtitle: None,
+            target: "t".into(),
+            args: String::new(),
+            play_key: "k".into(),
+            icon: None,
+            icon_source: Some(IconSource::File(path.clone())),
+            backdrop_path: None,
+            edit: None,
+            skeleton: false,
+            update_required: false,
+        };
+        assert!(row.list_icon_live().is_none());
+        assert!(icon_cache::handle_for_path(&path).is_some());
+        assert!(row.list_icon_live().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

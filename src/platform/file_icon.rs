@@ -16,6 +16,14 @@ struct CacheKey {
 static CACHE: LazyLock<Mutex<HashMap<CacheKey, Option<IconRgba>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Drop every cached shell extract (process Exit).
+pub fn clear_all() {
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let n = cache.len();
+    cache.clear();
+    crate::controller::hid::diag::diag_info(format!("ui-diag: file icon cache clear entries={n}"));
+}
+
 /// Return a square RGBA icon for `path`, or `None` if extraction fails.
 ///
 /// Results are cached (including failures) so start-screen refreshes stay cheap.
