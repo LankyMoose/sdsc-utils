@@ -22,8 +22,8 @@ use crate::ui::svg_icon;
 use crate::ui::theme;
 use iced::mouse;
 use iced::widget::{
-    Column, Row, button, canvas as canvas_widget, checkbox, column, container, mouse_area, row,
-    scrollable, slider, space, svg, text, tooltip,
+    Column, Row, button, canvas as canvas_widget, checkbox, column, container, hover, mouse_area,
+    row, scrollable, slider, space, svg, text, tooltip,
 };
 use iced::{Alignment, Color, Element, Fill, Length};
 use std::time::Duration;
@@ -632,7 +632,8 @@ fn system_footer<'a>() -> Element<'a, ConfigureMessage> {
     let links = row![
         footer_link_button(
             svg_icon::GITHUB_SVG,
-            Some(theme::MUTED),
+            // Match Microsoft Store bag main fill (`#F2F2F2`).
+            Some(theme::rgb(0xF2, 0xF2, 0xF2)),
             "GitHub",
             GITHUB_URL,
         ),
@@ -666,10 +667,15 @@ fn footer_link_button<'a>(
     tip: &'static str,
     url: &'static str,
 ) -> Element<'a, ConfigureMessage> {
-    let icon = svg(svg::Handle::from_memory(source.as_bytes()))
-        .width(Length::Fixed(FOOTER_ICON_SIZE))
-        .height(Length::Fixed(FOOTER_ICON_SIZE))
-        .style(move |_theme, _status| svg::Style { color: tint });
+    let icon = |opacity: f32| {
+        svg(svg::Handle::from_memory(source.as_bytes()))
+            .width(Length::Fixed(FOOTER_ICON_SIZE))
+            .height(Length::Fixed(FOOTER_ICON_SIZE))
+            .opacity(opacity)
+            .style(move |_theme, _status| svg::Style { color: tint })
+    };
+    // Dim when idle; full-opacity twin paints on top while hovered.
+    let icon = hover(icon(0.8), icon(1.0));
 
     tooltip(
         button(icon)
