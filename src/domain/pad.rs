@@ -1519,7 +1519,7 @@ impl GestureDetectorBank {
     }
 
     /// Mark every live pad as already armed so the current/sticky hold cannot
-    /// reopen the start screen (used right after gesture recording commits).
+    /// reopen the start screen (e.g. after open / close / promote).
     pub fn consume_pending_match(&mut self, readings: &[NavReading]) {
         let live: HashSet<PadId> = readings.iter().map(|r| r.id.clone()).collect();
         self.detectors.retain(|id, _| live.contains(id));
@@ -1544,36 +1544,6 @@ impl GestureDetectorBank {
             }
         }
         fired
-    }
-}
-
-/// Latch gesture recording to the first pad that holds a control (no cross-pad union).
-#[derive(Debug, Clone, Default)]
-pub struct GestureRecordLatch {
-    pad: Option<PadId>,
-}
-
-impl GestureRecordLatch {
-    pub fn clear(&mut self) {
-        self.pad = None;
-    }
-
-    /// Returns the sample to feed the recorder, if any pad is latched / should latch.
-    pub fn select<'a>(&mut self, readings: &'a [NavReading]) -> Option<&'a PadSample> {
-        if let Some(id) = self.pad.clone() {
-            if let Some(reading) = readings.iter().find(|r| r.id == id) {
-                return Some(&reading.sample);
-            }
-            // Latched pad disappeared; allow another to take over this tick.
-            self.pad = None;
-        }
-        for reading in readings {
-            if !reading.sample.held.is_empty() {
-                self.pad = Some(reading.id.clone());
-                return Some(&reading.sample);
-            }
-        }
-        None
     }
 }
 
@@ -2542,21 +2512,5 @@ mod tests {
             let back = hold_ease_out_inv(p);
             assert!((back - u).abs() < 1e-5, "u={u} p={p} back={back}");
         }
-    }
-
-    #[test]
-    fn gesture_record_latch_stays_on_first_pad() {
-        let mut latch = GestureRecordLatch::default();
-        let a = chord_sample(&[GestureControl::L2]);
-        let b = chord_sample(&[GestureControl::R2]);
-        let readings = [reading("a", a.clone()), reading("b", b.clone())];
-        let sample = latch.select(&readings).expect("latch a");
-        assert!(sample.held.contains(&GestureControl::L2));
-
-        // Still latched to a even if empty; b ignored.
-        let empty_a = PadSample::default();
-        let readings2 = [reading("a", empty_a), reading("b", b)];
-        let sample2 = latch.select(&readings2).expect("still a");
-        assert!(sample2.held.is_empty());
     }
 }

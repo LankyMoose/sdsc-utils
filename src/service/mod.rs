@@ -11,7 +11,7 @@ use crate::controller::hid::worker::HidWorkerHandle;
 use crate::controller::known::KnownControllers;
 use crate::controller::model::ControllerStatus;
 use crate::domain::color::{self, color_for_battery_percent};
-use crate::domain::gesture::{ChordReleaseGate, ChordReleaseTick};
+use crate::domain::gesture::{self, ChordReleaseGate, ChordReleaseTick};
 use crate::domain::pad::{self as start_input, GestureDetectorBank};
 use crate::ipc::{PipeServer, SHELL_PIPE_ENV, ServiceMessage, ShellCommand, bound_port};
 use crate::persist::analytics::AnalyticsStore;
@@ -373,11 +373,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             && let start_input::NavReadingsOutcome::Readings { readings, .. } =
                 start_input::read_nav_readings()
         {
-            let chord = &session.prefs.start_screen_gesture;
-            let chord_held = !chord.is_empty()
-                && readings
-                    .iter()
-                    .any(|r| chord.iter().all(|c| r.sample.held.contains(c)));
+            let chord = gesture::default_gesture();
+            let chord_held = readings
+                .iter()
+                .any(|r| chord.iter().all(|c| r.sample.held.contains(c)));
             let now = Instant::now();
             let (tick, glitch) = chord_release_gate.tick(chord_held, now);
             if glitch {
@@ -392,12 +391,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 ChordReleaseTick::Cleared => {
                     // Absent sample disarms detectors; next held rising edge may fire.
-                    let _ = gesture_detectors.update(chord, &readings);
+                    let _ = gesture_detectors.update(&chord, &readings);
                     false
                 }
-                ChordReleaseTick::Open => {
-                    !chord.is_empty() && gesture_detectors.update(chord, &readings)
-                }
+                ChordReleaseTick::Open => gesture_detectors.update(&chord, &readings),
             };
             match reopen_gesture_outcome(
                 tick == ChordReleaseTick::Blocked,

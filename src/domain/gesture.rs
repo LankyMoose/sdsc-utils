@@ -1,4 +1,4 @@
-//! Configurable DualSense chord used to reopen the start screen.
+//! DualSense reopen / promote chord (fixed PS) and rising-edge detectors.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -107,8 +107,8 @@ impl GestureDetector {
         }
     }
 
-    /// Treat the chord as already consumed (e.g. after recording) so a sticky
-    /// rematch does not fire until the controls are released.
+    /// Treat the chord as already consumed so a sticky rematch does not fire
+    /// until the controls are released.
     pub fn mark_armed(&mut self) {
         self.armed = true;
     }
@@ -151,7 +151,7 @@ impl ChordReleaseGate {
         self.saw_short_gap = false;
     }
 
-    /// Clear without waiting (e.g. gesture reset / empty chord pref).
+    /// Clear without waiting.
     pub fn clear(&mut self) {
         self.latched = false;
         self.absent_since = None;
@@ -192,58 +192,6 @@ impl ChordReleaseGate {
                     (ChordReleaseTick::Blocked, false)
                 }
             }
-        }
-    }
-}
-
-/// Peak-set recorder for Settings → Record gesture.
-#[derive(Debug, Clone, Default)]
-pub struct GestureRecorder {
-    active: bool,
-    saw_input: bool,
-    peak: BTreeSet<GestureControl>,
-}
-
-impl GestureRecorder {
-    pub fn start(&mut self) {
-        self.active = true;
-        self.saw_input = false;
-        self.peak.clear();
-    }
-
-    pub fn cancel(&mut self) {
-        self.active = false;
-        self.saw_input = false;
-        self.peak.clear();
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
-    pub fn peak(&self) -> &BTreeSet<GestureControl> {
-        &self.peak
-    }
-
-    /// Feed the current held set. When the user releases after holding something,
-    /// returns the peak simultaneous set (at least one control).
-    pub fn update(&mut self, held: &BTreeSet<GestureControl>) -> Option<Vec<GestureControl>> {
-        if !self.active {
-            return None;
-        }
-        if !held.is_empty() {
-            self.saw_input = true;
-            for control in held {
-                self.peak.insert(*control);
-            }
-            return None;
-        }
-        if self.saw_input && !self.peak.is_empty() {
-            let result: Vec<_> = self.peak.iter().copied().collect();
-            self.cancel();
-            Some(result)
-        } else {
-            None
         }
     }
 }
@@ -305,29 +253,6 @@ mod tests {
         let mut detector = GestureDetector::default();
         let held: BTreeSet<_> = [GestureControl::L2].into_iter().collect();
         assert!(!detector.update(&[], &held));
-    }
-
-    #[test]
-    fn recorder_keeps_peak_across_staggered_release() {
-        let mut recorder = GestureRecorder::default();
-        recorder.start();
-        let mut held = BTreeSet::new();
-        held.insert(GestureControl::L2);
-        held.insert(GestureControl::R2);
-        assert!(recorder.update(&held).is_none());
-        held.insert(GestureControl::Ps);
-        assert!(recorder.update(&held).is_none());
-        held.remove(&GestureControl::Ps);
-        assert!(recorder.update(&held).is_none());
-        held.clear();
-        let peak = recorder.update(&held).expect("finished");
-        assert_eq!(
-            peak.into_iter().collect::<BTreeSet<_>>(),
-            [GestureControl::L2, GestureControl::R2, GestureControl::Ps,]
-                .into_iter()
-                .collect()
-        );
-        assert!(!recorder.is_active());
     }
 
     #[test]

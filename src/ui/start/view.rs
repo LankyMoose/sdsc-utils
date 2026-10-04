@@ -114,9 +114,6 @@ pub enum StartMessage {
     SetSoundVolume(u8),
     SetHaptics(bool),
     SetHapticsStrength(u8),
-    StartGestureRecord,
-    ResetStartGesture,
-    CancelGestureRecord,
     /// Mouse-only: stamp lightbar-miss hitch for multi-session diag.
     #[cfg(debug_assertions)]
     ReportLightbarFailure,

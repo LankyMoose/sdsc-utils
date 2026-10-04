@@ -50,10 +50,10 @@ use crate::ui::layout::{
 };
 use crate::ui::popup::{self as popup_view, ControllerRow, PopupMessage};
 use crate::ui::start::cursor_hide;
-use crate::ui::start::gesture::{self, ChordReleaseGate, ChordReleaseTick, GestureRecorder};
+use crate::ui::start::gesture::{self, ChordReleaseGate, ChordReleaseTick};
 use crate::ui::start::input::{
-    self as start_input, CrossHold, FaceHeld, GestureDetectorBank, GestureRecordLatch, NavAction,
-    NavLogSnapshot, NavSource, PadNavBank,
+    self as start_input, CrossHold, FaceHeld, GestureDetectorBank, NavAction, NavLogSnapshot,
+    NavSource, PadNavBank,
 };
 use crate::ui::start::mode::{self as start_mode, StartPresentation};
 use crate::ui::start::view::{self as start_view, ReplaceConfirm, StartMessage, StartSlide};
@@ -256,9 +256,6 @@ pub struct App {
     /// When Start was last revealed (unfocus grace).
     start_revealed_at: Option<Instant>,
     gesture_detectors: GestureDetectorBank,
-    gesture_recorder: GestureRecorder,
-    /// Latch Settings gesture recording to one pad (no cross-pad union).
-    gesture_record_latch: GestureRecordLatch,
     pad_nav: PadNavBank,
     /// When set, the next start cue may rumble this DualSense serial (pad-originated).
     haptic_pad_serial: Option<String>,
@@ -286,7 +283,6 @@ pub struct App {
     steam_library_refreshed: bool,
     /// `Some` after a successful Steam library scan (installed appids). `None` = unknown.
     steam_installed: Option<Vec<u32>>,
-    hid_exclusive_warned: bool,
     /// One-shot when both Gaming.Input and DualSense HID fail while start is open.
     nav_missing_warned: bool,
     /// One-shot while every live pad is unarmed (waiting for rest).
@@ -465,8 +461,6 @@ impl App {
             chord_release_gate: ChordReleaseGate::default(),
             start_revealed_at: None,
             gesture_detectors: GestureDetectorBank::default(),
-            gesture_recorder: GestureRecorder::default(),
-            gesture_record_latch: GestureRecordLatch::default(),
             pad_nav: PadNavBank::default(),
             haptic_pad_serial: None,
             keyboard_cross_hold: CrossHold::default(),
@@ -482,7 +476,6 @@ impl App {
             steam_scan_started: None,
             steam_library_refreshed: false,
             steam_installed: None,
-            hid_exclusive_warned: false,
             nav_missing_warned: false,
             nav_unarmed_warned: false,
             nav_source_logged: None,
@@ -653,7 +646,7 @@ impl App {
                 && self.configure_state.section == Section::PadInput;
             let pad_listening = pad_input_live
                 || (self.session.prefs.start_screen_enabled
-                    && (!self.session.controllers.is_empty() || self.gesture_recorder.is_active()));
+                    && !self.session.controllers.is_empty());
             if let Some(w) = self.hid_worker.as_ref() {
                 w.set_input_hot(pad_listening);
             }
@@ -662,7 +655,7 @@ impl App {
             }
         }
         // Client mode: reopen gesture stays on the service; pad edges only when
-        // Start / Settings pad-input / gesture record need them (see shell_wants_pad_input).
+        // Start / Settings pad-input need them (see shell_wants_pad_input).
 
         if self.start_visible && (self.start_state.needs_frames() || self.steam_scan_in_flight()) {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::StartFrame));
@@ -706,6 +699,7 @@ impl App {
                 &self.session.prefs.spectrum,
                 Instant::now(),
                 self.session.prefs.start_screen_always_immersive,
+                // Prefs always normalize to PS on load/save.
                 &self.session.prefs.start_screen_gesture,
                 stage_h,
                 &settings_snapshot,
@@ -759,7 +753,6 @@ impl App {
                     self.sync_toast_zorder()
                 } else if Some(id) == self.configure_window {
                     self.configure_window = None;
-                    self.cancel_gesture_recording();
                     self.sync_toast_zorder()
                 } else if Some(id) == self.start_window {
                     self.start_window = None;
@@ -1112,13 +1105,6 @@ impl App {
                         _ => Task::none(),
                     };
                 }
-                if Some(id) == self.configure_window
-                    && action == StartKeyAction::Cancel
-                    && pressed
-                    && self.gesture_recorder.is_active()
-                {
-                    self.cancel_gesture_recording();
-                }
                 Task::none()
             }
             Message::PadInput(edge) => self.on_pad_input(edge),
@@ -1466,7 +1452,6 @@ impl App {
         let pad_input_live =
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
         pad_input_live
-            || self.gesture_recorder.is_active()
             || (self.start_visible
                 && self.session.prefs.start_screen_enabled
                 && !self.session.controllers.is_empty())
@@ -1699,20 +1684,10 @@ impl App {
             start_screen_sleep_secs: self.session.prefs.start_screen_sleep_secs,
             start_screen_inactive_dim_percent: self.session.prefs.start_screen_inactive_dim_percent,
             start_screen_usb_controllers: self.session.prefs.start_screen_usb_controllers,
-            start_screen_gesture: self.session.prefs.start_screen_gesture.clone(),
             start_screen_sounds_enabled: self.session.prefs.start_screen_sounds_enabled,
             start_screen_sound_volume: self.session.prefs.start_screen_sound_volume,
             start_screen_haptics_enabled: self.session.prefs.start_screen_haptics_enabled,
             start_screen_haptics_strength: self.session.prefs.start_screen_haptics_strength,
-            gesture_recording: self.gesture_recorder.is_active(),
-            gesture_recording_live: {
-                let peak: Vec<_> = self.gesture_recorder.peak().iter().copied().collect();
-                if peak.is_empty() {
-                    String::new()
-                } else {
-                    gesture::format_gesture(&peak)
-                }
-            },
             #[cfg(windows)]
             autostart: autostart::is_enabled(),
             show_developer: {
@@ -1798,9 +1773,6 @@ impl App {
     fn on_configure_message(&mut self, message: ConfigureMessage) -> Task<Message> {
         match message {
             ConfigureMessage::SelectSection(section) => {
-                if self.configure_state.section == Section::System && section != Section::System {
-                    self.cancel_gesture_recording();
-                }
                 self.configure_state.select_section(section);
                 if section == Section::PadInput {
                     match start_input::read_nav_readings() {
@@ -1863,11 +1835,8 @@ impl App {
             ConfigureMessage::SetStartScreenEnabled(enabled) => {
                 self.session.prefs.start_screen_enabled = enabled;
                 self.session.prefs.save();
-                if !enabled {
-                    self.cancel_gesture_recording();
-                    if self.start_visible {
-                        return self.close_start_screen();
-                    }
+                if !enabled && self.start_visible {
+                    return self.close_start_screen();
                 }
                 Task::none()
             }
@@ -1897,12 +1866,6 @@ impl App {
             }
             ConfigureMessage::SetStartScreenHapticsStrength(strength) => {
                 self.apply_start_screen_haptics_strength(strength)
-            }
-            ConfigureMessage::StartGestureRecord => self.apply_start_gesture_record(),
-            ConfigureMessage::ResetStartGesture => self.apply_reset_start_gesture(),
-            ConfigureMessage::CancelGestureRecord => {
-                self.cancel_gesture_recording();
-                Task::none()
             }
             ConfigureMessage::OpenDataFolder => {
                 if let Err(err) = paths::open_data_folder() {
@@ -1959,13 +1922,10 @@ impl App {
             ConfigureMessage::DeveloperPreset(preset) => self.apply_dev_preset(preset),
             // Hide first so DWM cannot flash the default (white) brush while the
             // wgpu surface is torn down; keep id until WindowClosed.
-            ConfigureMessage::Close => {
-                self.cancel_gesture_recording();
-                match self.configure_window {
-                    Some(id) => window::set_mode(id, window::Mode::Hidden).chain(window::close(id)),
-                    None => Task::none(),
-                }
-            }
+            ConfigureMessage::Close => match self.configure_window {
+                Some(id) => window::set_mode(id, window::Mode::Hidden).chain(window::close(id)),
+                None => Task::none(),
+            },
             ConfigureMessage::DragWindow => match self.configure_window {
                 Some(id) => window::drag(id),
                 None => Task::none(),
@@ -2837,11 +2797,6 @@ impl App {
         Task::none()
     }
 
-    fn cancel_gesture_recording(&mut self) {
-        self.gesture_recorder.cancel();
-        self.gesture_record_latch.clear();
-    }
-
     fn start_settings_snapshot(&self) -> crate::ui::start::settings::StartSettingsSnapshot {
         crate::ui::start::settings::StartSettingsSnapshot {
             usb_controllers: self.session.prefs.start_screen_usb_controllers,
@@ -2849,16 +2804,6 @@ impl App {
             inactive_secs: self.session.prefs.start_screen_inactive_secs,
             sleep_secs: self.session.prefs.start_screen_sleep_secs,
             inactive_dim_percent: self.session.prefs.start_screen_inactive_dim_percent,
-            gesture: self.session.prefs.start_screen_gesture.clone(),
-            gesture_recording: self.gesture_recorder.is_active(),
-            gesture_recording_live: {
-                let peak: Vec<_> = self.gesture_recorder.peak().iter().copied().collect();
-                if peak.is_empty() {
-                    String::new()
-                } else {
-                    gesture::format_gesture(&peak)
-                }
-            },
             sounds_enabled: self.session.prefs.start_screen_sounds_enabled,
             sound_volume: self.session.prefs.start_screen_sound_volume,
             haptics_enabled: self.session.prefs.start_screen_haptics_enabled,
@@ -2971,27 +2916,10 @@ impl App {
         Task::none()
     }
 
-    fn apply_start_gesture_record(&mut self) -> Task<Message> {
-        self.gesture_recorder.start();
-        self.gesture_record_latch.clear();
-        self.gesture_detectors.reset();
-        Task::none()
-    }
-
-    fn apply_reset_start_gesture(&mut self) -> Task<Message> {
-        self.cancel_gesture_recording();
-        self.session.prefs.start_screen_gesture = gesture::default_gesture();
-        self.session.prefs.save();
-        // Clear detectors so a held default chord cannot reopen immediately.
-        self.gesture_detectors.reset();
-        Task::none()
-    }
-
     /// True when HID/UI input sampling should run at the active (~report-rate) rate.
     #[allow(dead_code)] // kept for callers / diagnostics that still want the hot predicate
     fn pad_input_hot(&self) -> bool {
         self.start_visible
-            || self.gesture_recorder.is_active()
             || (self.configure_window.is_some()
                 && self.configure_state.section == Section::PadInput)
             || (self.session.prefs.start_screen_enabled && !self.session.controllers.is_empty())
@@ -3663,9 +3591,6 @@ impl App {
             StartMessage::Close => {
                 if self.start_state.settings.open {
                     self.play_start_cue(UiSoundKind::Action);
-                    if self.gesture_recorder.is_active() {
-                        self.cancel_gesture_recording();
-                    }
                     let now = Instant::now();
                     if self.start_state.request_settings(false, now) {
                         crate::controller::hid::diag::diag_info("ui-diag: start settings close");
@@ -3819,9 +3744,6 @@ impl App {
             StartMessage::ToggleSettings => {
                 let now = Instant::now();
                 let open = !self.start_state.settings.open;
-                if self.gesture_recorder.is_active() {
-                    self.cancel_gesture_recording();
-                }
                 if self.start_state.request_settings(open, now) {
                     self.play_start_cue(UiSoundKind::Action);
                     crate::controller::hid::diag::diag_info(format!(
@@ -3851,12 +3773,6 @@ impl App {
             StartMessage::SetHaptics(enabled) => self.apply_start_screen_haptics(enabled),
             StartMessage::SetHapticsStrength(strength) => {
                 self.apply_start_screen_haptics_strength(strength)
-            }
-            StartMessage::StartGestureRecord => self.apply_start_gesture_record(),
-            StartMessage::ResetStartGesture => self.apply_reset_start_gesture(),
-            StartMessage::CancelGestureRecord => {
-                self.cancel_gesture_recording();
-                Task::none()
             }
             #[cfg(debug_assertions)]
             StartMessage::ReportLightbarFailure => {
@@ -4360,31 +4276,6 @@ impl App {
             return Task::none();
         }
 
-        if self.gesture_recorder.is_active() {
-            // Start settings: Circle aborts only before a chord is held (Escape/Close also
-            // cancel). Once `peak` is non-empty, Circle may be part of the combo.
-            if self.start_visible
-                && self.start_state.settings.open
-                && self.gesture_recorder.peak().is_empty()
-            {
-                let now = Instant::now();
-                let tick = self
-                    .pad_nav
-                    .tick(&readings, now, false, false, false, false, false, false);
-                self.pad_held = tick.held;
-                self.sync_start_held();
-                if tick.action == Some(NavAction::Cancel) {
-                    self.cancel_gesture_recording();
-                    self.play_start_cue(UiSoundKind::Action);
-                    crate::controller::hid::diag::diag_info(
-                        "ui-diag: start settings gesture record cancel",
-                    );
-                    return Task::none();
-                }
-            }
-            return self.on_gesture_record(&readings);
-        }
-
         // Continue with the same body as the old on_pad_poll from start_open onward.
         self.on_pad_readings(readings, meta, start_open)
     }
@@ -4481,9 +4372,9 @@ impl App {
             self.note_start_activity();
         }
 
-        let gesture = &self.session.prefs.start_screen_gesture;
-        self.start_state.reopen_chord_held =
-            start_mode::promote_gesture_usable(gesture) && chord_held_on_any_pad(gesture, readings);
+        let gesture = gesture::default_gesture();
+        self.start_state.reopen_chord_held = start_mode::promote_gesture_usable(&gesture)
+            && chord_held_on_any_pad(&gesture, readings);
 
         // Reopen chord toggles compact ↔ immersive (service only listens when closed).
         if let Some(toggle) = self.try_toggle_immersive_from_gesture(readings) {
@@ -4800,26 +4691,6 @@ impl App {
         }
     }
 
-    fn on_gesture_record(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
-        if readings.is_empty() {
-            if !self.hid_exclusive_warned && !self.session.controllers.is_empty() {
-                app_log::warn("could not read controller for gesture recording; try again");
-                self.hid_exclusive_warned = true;
-            }
-            return Task::none();
-        }
-        self.hid_exclusive_warned = false;
-        if let Some(sample) = self.gesture_record_latch.select(readings)
-            && let Some(peak) = self.gesture_recorder.update(&sample.held)
-        {
-            self.session.prefs.start_screen_gesture = peak;
-            self.session.prefs.save();
-            self.gesture_record_latch.clear();
-            self.gesture_detectors.consume_pending_match(readings);
-        }
-        Task::none()
-    }
-
     fn on_reopen_gesture(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
         if readings.is_empty() {
             return Task::none();
@@ -4832,13 +4703,11 @@ impl App {
             );
             return Task::none();
         }
-        if !self.session.prefs.start_screen_enabled
-            || self.session.prefs.start_screen_gesture.is_empty()
-        {
+        if !self.session.prefs.start_screen_enabled {
             return Task::none();
         }
-        let required = &self.session.prefs.start_screen_gesture;
-        let chord_held = chord_held_on_any_pad(required, readings);
+        let required = gesture::default_gesture();
+        let chord_held = chord_held_on_any_pad(&required, readings);
         let now = Instant::now();
         let (tick, glitch) = self.chord_release_gate.tick(chord_held, now);
         if glitch {
@@ -4853,12 +4722,12 @@ impl App {
             }
             ChordReleaseTick::Cleared => {
                 // Absent sample disarms detectors; next held rising edge may fire.
-                let _ = self.gesture_detectors.update(required, readings);
+                let _ = self.gesture_detectors.update(&required, readings);
                 return Task::none();
             }
             ChordReleaseTick::Open => {}
         }
-        if self.gesture_detectors.update(required, readings) {
+        if self.gesture_detectors.update(&required, readings) {
             let held = start_input::preferred_reading(readings)
                 .map(|r| {
                     gesture::format_gesture(&r.sample.held.iter().copied().collect::<Vec<_>>())
@@ -4884,11 +4753,11 @@ impl App {
         if self.start_state.overlay_blocking() || self.start_state.transition.is_some() {
             return None;
         }
-        let required = &self.session.prefs.start_screen_gesture;
-        if required.is_empty() || start_mode::chord_is_circle_only(required) {
+        let required = gesture::default_gesture();
+        if start_mode::chord_is_circle_only(&required) {
             return None;
         }
-        let chord_held = chord_held_on_any_pad(required, readings);
+        let chord_held = chord_held_on_any_pad(&required, readings);
         let now = Instant::now();
         let (tick, glitch) = self.chord_release_gate.tick(chord_held, now);
         if glitch {
@@ -4902,12 +4771,12 @@ impl App {
                 return None;
             }
             ChordReleaseTick::Cleared => {
-                let _ = self.gesture_detectors.update(required, readings);
+                let _ = self.gesture_detectors.update(&required, readings);
                 return None;
             }
             ChordReleaseTick::Open => {}
         }
-        if !self.gesture_detectors.update(required, readings) {
+        if !self.gesture_detectors.update(&required, readings) {
             return None;
         }
         let always = self.session.prefs.start_screen_always_immersive;

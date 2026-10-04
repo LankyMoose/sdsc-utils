@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Connected toasts are skipped for controllers already connected when the app starts.
 - Configure System footer: GitHub icon fill matches the Microsoft Store bag (`#F2F2F2`); both footer link icons use 0.8 opacity until hovered.
+- Start reopen / promote gesture is fixed to **PS** (Guide); custom chord recording is removed from Settings.
 
 ## [1.5.2] - 2026-10-03
 
@@ -94,8 +95,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Start screen** launcher: when the first DualSense connects (0→1), an always-on-top quick-launch card can open with curated Steam games and manual shortcuts. Navigate with D-pad / combined analog sticks / keyboard; Cross or Enter launches; Circle or Escape dismisses. Opens with an empty catalog (empty copy + Square hint). Any connected DualSense can drive open / close / navigation (inputs are never merged across pads).
-- Reopen anytime with a configurable controller chord (default **PS**); record or reset the gesture in Settings → **Start screen**. Catalog lives in `games.json`.
-- Settings → **Start screen**: enable toggle, reopen-gesture recording, and optional UI sounds (nav / action / hold-complete) with volume.
+- Reopen anytime with the **PS** (Guide) button. Catalog lives in `games.json`.
+- Settings → **Start screen**: enable toggle and optional UI sounds (nav / action / hold-complete) with volume.
 - **Triangle** toggles edit mode: Steam checklist (Cross adds/removes) plus removable manuals; **Add shortcut…** (edit only) for title, optional args, and optional custom image; **Square** edits the selected manual while editing. Edit is draft-based (**Triangle** Saves, **Circle** Cancels without closing).
 - Browse mode DualSense **Square** (footer **Last played · A–Z**) toggles sort between last played and alphabetical (preference in prefs). Successful launches record `last_played_ms`. Manual shortcuts support optional launch arguments and a custom icon path.
 - Games ↔ Controllers header (L2/R2 to switch); item actions on the selected row; footer for sort / Edit / Close. Steam icons use the modern `librarycache/{appid}/` layout (with legacy flat-name fallback); game art uses a shared 2:3 portrait cell.
