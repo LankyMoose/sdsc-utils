@@ -6,9 +6,11 @@
 
 Hand-off notes. **Fix landed (reuse HidApi):** worker keeps one long-lived `HidApi`, refreshes via `refresh_devices()` on a throttle (not every sample), shares that api into Poll/Identify/lightbar/power-off, **does not clear** the input snapshot on Poll, publishes presence paths for the UI tick (no UI-thread `HidApi::new`), runs process enum via `Task::perform`, and Identify is **4 flashes / 1s** (`IDENTIFY_FLASH_COUNT=4`, `IDENTIFY_FLASH_MS=125`).
 
+**Follow-up (2026-10):** hot-path `hidapi_refresh` stall — while `input_hot` and pads are already open, skip blocking `refresh_devices()` so Windows enum cannot freeze the ~4ms sample loop; presence still refreshes when cold or when no handles are open. Shell-client F8 no longer reports local `NeverPublished` (service owns HID); marks use last IPC pad/controllers context + `client=1`.
+
 **Diagnostics are debug-build only** (`cfg(debug_assertions)`): `hid-trace.log`, hitch F7/F8 + report buttons, worker phase watchdog / `enter_op` traces, and investigation-volume `hid-diag:` / `ui-diag:` lines no-op or omit in `--release`. Future agents: see [`.cursor/rules/debug-diagnostics.mdc`](../.cursor/rules/debug-diagnostics.mdc) — new work must include a similar level of non-release diagnostics.
 
-Historical evidence of the ~5s freezes is preserved below (`last_op=hidapi_new`). BT lightbar silent no-ops (closed): [windows-bt-lightbar.md](windows-bt-lightbar.md).
+Historical evidence of the ~5s freezes is preserved below (`last_op=hidapi_new`, later `last_op=hidapi_refresh`). BT lightbar silent no-ops (closed): [windows-bt-lightbar.md](windows-bt-lightbar.md).
 
 ## Symptoms (pre-fix)
 
@@ -42,6 +44,16 @@ Now: one worker `HidApi`; `enter_op("hidapi_refresh")` + `refresh_devices()` onl
 
 Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**.
 
+### D. Hot-path `hidapi_refresh` (~5s pad stall) — **fixed**
+
+Was: `enum_due` used `PRESENCE_INTERVAL_EMPTY` (500 ms) whenever `input_hot`, so Start / pad-input put `HidApi::refresh_devices()` on the hot sample path. On Windows that enum often takes ~5 s (`slow op=hidapi_refresh ms≈5012` + `pad-input stall gap_ms≈5005`).
+
+Now: empty device cache still uses EMPTY cadence (first connect); once pads are open, use `PRESENCE_INTERVAL` and **defer** refresh while `input_hot` so sampling keeps reading open handles. Debug: `hidapi_refresh begin` / `end ms=` / `deferred input_hot=1` / `sample_all ensure_ms=`.
+
+### E. Shell-client F8 `NeverPublished` — **fixed (diag honesty)**
+
+Shell client mode has no local `INPUT_SNAPSHOT` (`shell: client mode (service owns HID + tray)`). Pre-fix F8 showed `pads=0 reason=NeverPublished` even with live pads via IPC — a red herring. Marks now stamp last PadInput / Controllers context and include `client=1`.
+
 ## Grep tokens
 
 ### `hid-trace.log`
@@ -57,11 +69,13 @@ Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**
 
 - `hid-diag: cmd begin=` / `snapshot clear` / `snapshot restore` / `sample short` / `sample stalled`
 - `hid-diag: slow op=` — completed op ≥50ms (`open_device`, `read_timeout`, `hid_write`, `hidapi_refresh`, …)
+- `hid-diag: hidapi_refresh begin` / `end ms=` / `deferred input_hot=1` / `sample_all ensure_ms=`
 - `hid-diag: worker stall kind=op|idle last_op=... gap_ms=... tier=250|500|1000|2000|5000`
 - `start-nav: no … snapshot` / `snapshot restored` / `snapshot stale`
-- `ui-diag: pad-poll stall` / `pad-poll slow` / `process-enum`
+- `ui-diag: pad-input stall` / `pad-poll stall` / `pad-poll slow` / `process-enum`
 - `ui-diag: start cursor hide` / `start cursor show` — immersive idle cursor hide (debug builds)
-- `HITCH_MARK kind=lightbar|input source=hotkey|button`
+- `HITCH_MARK kind=lightbar|input source=hotkey|button` — shell client also `client=1`
+- `shell: client mode (service owns HID + tray)` — local snapshot is unused; do not trust `NeverPublished` on F8 without `client=1`
 - `PANIC at file:line:col: …` — custom hook in [`app_log::init`](../src/app_log.rs); required because `windows_subsystem = "windows"` discards stderr panic text (exit 101 with an empty console)
 - `PANIC_BACKTRACE …` — capped `Backtrace::force_capture()` right after `PANIC at` (all builds); use to tell iced atlas/main-thread from the image worker
 - `crash-restart: scheduled` / `launching` / `giving up after N` — panic hook arms a delayed self-relaunch ([`crash_restart`](../src/crash_restart.rs)); budget file `crash-restart.json` caps 3 restarts / 10 min
@@ -73,9 +87,12 @@ Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**
 | Signature | Meaning |
 |-----------|---------|
 | `worker stall … last_op=hidapi_new` / `slow op=hidapi_new ms≈5000` | Pre-fix primary freeze |
-| `slow op=hidapi_refresh` rare / large | Post-fix: throttled enum still slow on Windows |
+| `worker stall … last_op=hidapi_refresh` + `pad-input stall gap_ms≈5000` | Hot-path enum stall (cause D; should be gone after defer fix) |
+| `slow op=hidapi_refresh` rare / large while cold / empty | Expected: throttled enum still slow on Windows |
+| `HITCH_MARK … pads=0 reason=NeverPublished` without `client=1` | Real empty local snapshot |
+| `HITCH_MARK … client=1` | Shell client — pads/age from IPC, not local snapshot |
 | `ClearedPoll` + restore | Pre-fix Poll wipe (should no longer appear) |
-| `pad-poll stall gap_ms` thousands | Iced UI thread stuck |
+| `pad-poll stall gap_ms` / `pad-input stall gap_ms` thousands | Iced UI / IPC pad edge gap |
 | Identify `total_ms≈1000` | Expected Identify after timing change |
 | Identify `total_ms≈1700` | Pre-change Identify |
 | `open`/`write`/`read` `err=` + `steam=1` | Device fight (not seen on freeze marks) |
@@ -90,12 +107,36 @@ Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**
 
 - Pad nav >30 s; Identify (~1s, 4 flashes); F7/F8 if anything still freezes.
 - Grep `slow op=hidapi_new` / `last_op=hidapi_new` — should be **absent**.
-- Grep `hidapi_refresh` — should not fire every sample.
+- Grep `hidapi_refresh` — should not fire every sample; while Start is open with pads, prefer `deferred input_hot=1` over `begin`/`slow op=hidapi_refresh ms=5xxx`.
+- Shell client: F8 should show `client=1` and non-zero pads when IPC edges are flowing (not `NeverPublished`).
 - Confirm Identify / lightbar / power-off / running badge / connect-disconnect.
+
+## 5–30s playbook (hidapi_refresh + client F8)
+
+1. Reproduce pad stall on Start / pad-input (debug build). Note wall clock or press **F8**.
+2. Grep `app.log` for the session id, then **5–30 s before** the mark:
+   - `worker stall … last_op=hidapi_refresh` → `slow op=hidapi_refresh ms≈5xxx`
+   - matching `ui-diag: pad-input stall gap_ms≈5xxx`
+3. If the process logged `shell: client mode`, ignore bare `pads=0 reason=NeverPublished` on F8 unless the line also lacks `client=1` (pre-honesty builds). Prefer service-side `hid-diag` / shell `pad-input stall`.
+4. After the defer fix: hot window should show `hidapi_refresh deferred` on the presence cadence, not multi-second `ensure_ms` / sample gaps.
 
 ## Out of scope (still)
 
 - hid-trace I/O buffering (only if stalls show `slow op=hid_trace_io`).
+
+---
+
+## Session `1791118659116` (2026-10 — hidapi_refresh hot stall)
+
+Shell client + service. DualSense live; pad nav froze ~5s.
+
+| | Evidence |
+|--|----------|
+| ~T−20s | `worker stall … last_op=hidapi_refresh` → `slow op=hidapi_refresh ms=5012` |
+| Same window | `ui-diag: pad-input stall gap_ms=5005` |
+| F8 mark | `pads=0 reason=NeverPublished` — **misleading**: `shell: client mode (service owns HID + tray)`; local `read_nav_readings()` has no snapshot |
+
+Root cause: hot sample path blocked on `HidApi::refresh_devices()` (cause D). F8 red herring: cause E.
 
 ---
 

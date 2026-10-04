@@ -76,6 +76,8 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(debug_assertions)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -418,6 +420,9 @@ impl App {
             let identifying = worker.identifying();
             (Some(worker), identifying)
         };
+
+        #[cfg(debug_assertions)]
+        set_shell_client_hitch_mode(client_mode);
 
         let configure_state = ConfigureState::new(prefs.spectrum.clone());
         let session = crate::session::DeviceSession::new(prefs, known, analytics);
@@ -3442,6 +3447,9 @@ impl App {
         let start_open = self.start_visible;
         let nav_ready = self.start_nav_ready;
         let controllers = self.session.controllers.len();
+        if self.client_mode {
+            note_client_hitch_controllers(controllers);
+        }
         stamp_hitch_report(
             kind,
             "button",
@@ -4201,11 +4209,15 @@ impl App {
                         self.refresh_start_controllers();
                     }
                 }
+                #[cfg(debug_assertions)]
+                note_client_hitch_controllers(self.session.controllers.len());
                 self.sync_client_input_hot();
                 Task::none()
             }
             ServiceMessage::Effects(effects) => self.apply_session_effects(effects),
             ServiceMessage::PadInput(edge) => {
+                #[cfg(debug_assertions)]
+                note_client_hitch_pad_edge(&edge, self.session.controllers.len());
                 if self.shell_wants_pad_input() {
                     self.on_pad_input(edge)
                 } else {
@@ -5365,27 +5377,122 @@ fn service_message_stream() -> impl Stream<Item = Message> {
     })
 }
 
+/// Shell-client hitch context: local `INPUT_SNAPSHOT` is never published (service
+/// owns HID). F7/F8 must stamp from the last IPC pad/controllers view instead.
+#[cfg(debug_assertions)]
+static SHELL_CLIENT_HITCH: AtomicBool = AtomicBool::new(false);
+
+#[cfg(debug_assertions)]
+#[derive(Clone)]
+struct ClientHitchPadCtx {
+    pads: usize,
+    reason: &'static str,
+    seq: u64,
+    received_at: Instant,
+    controllers: usize,
+}
+
+#[cfg(debug_assertions)]
+static CLIENT_HITCH_PAD: Mutex<Option<ClientHitchPadCtx>> = Mutex::new(None);
+
+#[cfg(debug_assertions)]
+fn set_shell_client_hitch_mode(client: bool) {
+    SHELL_CLIENT_HITCH.store(client, Ordering::Relaxed);
+    if !client && let Ok(mut guard) = CLIENT_HITCH_PAD.lock() {
+        *guard = None;
+    }
+}
+
+#[cfg(debug_assertions)]
+fn note_client_hitch_pad_edge(edge: &crate::domain::pad::InputEdge, controllers: usize) {
+    if !SHELL_CLIENT_HITCH.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut guard) = CLIENT_HITCH_PAD.lock() {
+        *guard = Some(ClientHitchPadCtx {
+            pads: edge.pad_count.max(edge.readings.len()),
+            reason: edge.reason.as_str(),
+            seq: edge.seq,
+            received_at: Instant::now(),
+            controllers,
+        });
+    }
+}
+
+#[cfg(debug_assertions)]
+fn note_client_hitch_controllers(controllers: usize) {
+    if !SHELL_CLIENT_HITCH.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut guard) = CLIENT_HITCH_PAD.lock() {
+        match guard.as_mut() {
+            Some(ctx) => {
+                ctx.controllers = controllers;
+                // Keep pad/seq/age from the last live PadInput edge when present.
+                if ctx.pads == 0 {
+                    ctx.pads = controllers;
+                    ctx.reason = "ServiceControllers";
+                    ctx.received_at = Instant::now();
+                }
+            }
+            None => {
+                *guard = Some(ClientHitchPadCtx {
+                    pads: controllers,
+                    reason: "ServiceControllers",
+                    seq: 0,
+                    received_at: Instant::now(),
+                    controllers,
+                });
+            }
+        }
+    }
+}
+
 /// Stamp a hitch mark using the shared input snapshot (safe off the UI thread).
+///
+/// In shell-client mode the local snapshot stays `NeverPublished`; use the last
+/// IPC pad/controllers context and include `client=1`.
 #[cfg(debug_assertions)]
 fn stamp_hitch_report(kind: &str, source: &str, extra: Option<String>) {
-    let (pads, reason, age_ms, seq) = match start_input::read_nav_readings() {
-        start_input::NavReadingsOutcome::Readings { readings, meta } => (
-            readings.len(),
-            meta.reason.as_str(),
-            meta.published_at.elapsed().as_millis(),
-            meta.seq,
-        ),
-        start_input::NavReadingsOutcome::Missing { meta } => (
-            0,
-            meta.reason.as_str(),
-            meta.published_at.elapsed().as_millis(),
-            meta.seq,
-        ),
+    let client = SHELL_CLIENT_HITCH.load(Ordering::Relaxed);
+    let (pads, reason, age_ms, seq, client_suffix) = if client {
+        match CLIENT_HITCH_PAD.lock().ok().and_then(|g| g.clone()) {
+            Some(ctx) => (
+                ctx.pads,
+                ctx.reason,
+                ctx.received_at.elapsed().as_millis(),
+                ctx.seq,
+                format!(" client=1 controllers={}", ctx.controllers),
+            ),
+            None => (
+                0,
+                "NoClientCtx",
+                0,
+                0,
+                " client=1 controllers=0".to_string(),
+            ),
+        }
+    } else {
+        let (pads, reason, age_ms, seq) = match start_input::read_nav_readings() {
+            start_input::NavReadingsOutcome::Readings { readings, meta } => (
+                readings.len(),
+                meta.reason.as_str(),
+                meta.published_at.elapsed().as_millis(),
+                meta.seq,
+            ),
+            start_input::NavReadingsOutcome::Missing { meta } => (
+                0,
+                meta.reason.as_str(),
+                meta.published_at.elapsed().as_millis(),
+                meta.seq,
+            ),
+        };
+        (pads, reason, age_ms, seq, String::new())
     };
     let ctx = crate::controller::hid::diag::failure_context();
     let extra = extra.map(|e| format!(" {e}")).unwrap_or_default();
     app_log::mark_hitch(format!(
-        "kind={kind} source={source}{extra} pads={pads} reason={reason} age_ms={age_ms} seq={seq} {ctx}"
+        "kind={kind} source={source}{extra}{client_suffix} pads={pads} reason={reason} age_ms={age_ms} seq={seq} {ctx}"
     ));
 }
 
