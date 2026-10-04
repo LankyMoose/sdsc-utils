@@ -2,12 +2,15 @@
 
 use crate::controller::dualsense::identity::is_storable_serial;
 use crate::controller::model::ControllerStatus;
+use crate::persist::json;
 use crate::platform::app_log;
 use serde::{Deserialize, Serialize};
+use serde_json::Map;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+/// New persisted fields need `#[serde(default)]` (or the oldest-shape fixture fails).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnownController {
     pub serial: String,
@@ -67,16 +70,25 @@ impl KnownControllers {
         let Ok(bytes) = fs::read(&path) else {
             return Self::default();
         };
-        match serde_json::from_slice::<KnownFile>(&bytes) {
-            Ok(file) => Self::from_file(file),
-            Err(err) => {
-                app_log::warn(format!(
-                    "failed to parse controllers at {}: {err}; starting empty",
-                    path.display()
-                ));
-                Self::default()
-            }
+        let Some(root) = json::parse_object(&path, &bytes) else {
+            return Self::default();
+        };
+        Self::from_root(&path, root)
+    }
+
+    fn from_root(path: &Path, mut root: Map<String, serde_json::Value>) -> Self {
+        let items = json::take_array(&mut root, "controllers");
+        let source_len = items.len();
+        let (controllers, skipped) = json::decode_array::<KnownController>(items);
+        if json::total_loss(path, "controllers", source_len, controllers.len()) {
+            return Self::default();
         }
+        json::warn_skipped(path, "controllers", skipped);
+        let nicknames: HashMap<String, String> = json::take_default(&mut root, "nicknames");
+        Self::from_file(KnownFile {
+            controllers,
+            nicknames,
+        })
     }
 
     fn from_file(file: KnownFile) -> Self {
@@ -343,6 +355,31 @@ mod tests {
         .unwrap();
         let store = KnownControllers::from_file(file);
         assert!(store.is_remembered("abc"));
+        assert!(store.nicknames.is_empty());
+    }
+
+    #[test]
+    fn older_controllers_shape_loads_and_skips_bad_record() {
+        let root = serde_json::from_str(
+            r#"{
+                "controllers": [
+                    {"serial":"abc","product":"DualSense","connection":"USB","percent":40},
+                    {"serial":"def","product":"DualSense","connection":"USB","percent":"nope"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let serde_json::Value::Object(root) = root else {
+            panic!("expected object");
+        };
+        let store = KnownControllers::from_root(Path::new("controllers.json"), root);
+        assert!(store.is_remembered("abc"));
+        assert_eq!(store.by_serial["abc"].percent, 40);
+        assert_eq!(
+            store.by_serial["abc"].kind,
+            crate::controller::model::ControllerKind::DualSense
+        );
+        assert!(!store.is_remembered("def"));
         assert!(store.nicknames.is_empty());
     }
 }
