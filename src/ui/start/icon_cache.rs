@@ -5,8 +5,9 @@
 //! loss) panics the process. We decode once, fit to 2× the portrait cell, and
 //! reuse one [`Handle`] so atlas churn stays bounded.
 //!
-//! Immersive hero/backdrop decode must run off the UI thread (`prepare_*` /
-//! warm workers). UI code uses [`hero_cached`] / [`backdrop_cached`] only.
+//! Immersive hero/backdrop and list-icon decode must run off the UI thread
+//! (`prepare_*` / warm workers). UI code uses [`icon_cached`] / [`hero_cached`] /
+//! [`backdrop_cached`] (and shell peeks) only.
 
 use iced::widget::image::Handle;
 use std::collections::HashMap;
@@ -96,6 +97,16 @@ pub fn backdrop_for_path(path: &Path) -> Option<Handle> {
     lookup(CacheKey::BackdropFile(path.to_path_buf()), || {
         decode_file_sized(path, BACKDROP_W, BACKDROP_H, false)
     })
+}
+
+/// Peek list-tier raster — never decodes on the calling thread.
+pub fn icon_cached(path: &Path) -> Option<Handle> {
+    peek(CacheKey::File(path.to_path_buf()))
+}
+
+/// Peek list-tier shell extract — never decodes.
+pub fn icon_shell_cached(path: &Path) -> Option<Handle> {
+    peek(CacheKey::Shell(path.to_path_buf()))
 }
 
 /// Peek hero raster — never decodes on the calling thread.
@@ -273,6 +284,20 @@ mod tests {
         let a = handle_for_path(&path).expect("decode");
         let b = handle_for_path(&path).expect("cached");
         assert_eq!(a.id(), b.id());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peek_list_icon_none_until_prepare() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sdsc-icon-list-peek-{n}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("list.png");
+        write_tiny_png(&path);
+        assert!(icon_cached(&path).is_none());
+        assert!(handle_for_path(&path).is_some());
+        assert!(icon_cached(&path).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
