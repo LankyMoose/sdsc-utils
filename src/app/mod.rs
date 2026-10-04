@@ -1738,6 +1738,12 @@ impl App {
                 }
                 Task::none()
             }
+            ConfigureMessage::OpenExternalLink(url) => {
+                if let Err(err) = launch::launch_target(url, "") {
+                    app_log::warn(format!("open external link failed: {err}"));
+                }
+                Task::none()
+            }
             #[cfg(windows)]
             ConfigureMessage::SetAutostart(enabled) => {
                 if let Err(err) = autostart::set_enabled(enabled) {
