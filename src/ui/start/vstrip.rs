@@ -139,39 +139,37 @@ pub fn slot_child_size(metrics: &StripMetrics, distance: f32) -> Size {
     Size::new(inset + art_w + TITLE_COL, metrics.center_h * scale)
 }
 
-/// Catalog index for a visible slot, or `None` for a skeleton filler.
+/// Catalog index for a visible slot, or `None` when empty / out of range.
 ///
-/// When `len < VISIBLE`, out-of-range linear indices become dummies. With enough
-/// games, slots wrap circularly so the stream stays filled with real titles.
+/// Linear only — Games strip does not wrap.
 pub fn slot_catalog_index(selected: usize, delta: isize, len: usize) -> Option<usize> {
     if len == 0 {
         return None;
     }
     let idx = selected as isize + delta;
-    if len < VISIBLE {
-        if idx < 0 || idx >= len as isize {
-            None
-        } else {
-            Some(idx as usize)
-        }
+    if idx < 0 || idx >= len as isize {
+        None
     } else {
-        Some(idx.rem_euclid(len as isize) as usize)
+        Some(idx as usize)
     }
 }
 
-/// Shortest signed step on a circular list of length `len` from `from` → `to`.
+/// Catalog index and signed distance for a strip slot anchored on `visual`.
 ///
-/// Used so last→first animates as `+1` (and first→last as `-1`) instead of
-/// lerping across the whole catalog.
-pub fn shortest_circular_delta(from: f32, to: f32, len: f32) -> f32 {
-    if len <= 1.0 {
-        return 0.0;
+/// Linear: `floor(visual) + delta` must fall in `[0, len)`. Out-of-range peeks
+/// are omitted (no duplicate wrap titles, no skeleton fillers).
+pub fn visual_slot(visual: f32, delta: isize, len: usize) -> Option<(usize, f32)> {
+    if len == 0 {
+        return None;
     }
-    let mut d = (to - from).rem_euclid(len);
-    if d > len * 0.5 {
-        d -= len;
+    let base = visual.floor();
+    let frac = visual - base;
+    let idx = base as isize + delta;
+    if idx < 0 || idx >= len as isize {
+        return None;
     }
-    d
+    let dist = delta as f32 - frac;
+    Some((idx as usize, dist))
 }
 
 /// Eased fractional scroll between `from` and `to` indices.
@@ -183,38 +181,27 @@ pub fn strip_scroll(from: f32, to: f32, started: Instant, now: Instant, duration
     from + (to - from) * e
 }
 
-/// Signed distance for visible slot `i` (0..VISIBLE) when the strip is anchored
-/// on `anchor` and the visual scroll sits at `visual_scroll`.
-pub fn slot_distance(i: usize, anchor: usize, visual_scroll: f32) -> f32 {
-    let slot = i as f32 - NEIGHBORS as f32;
-    slot + (anchor as f32 - visual_scroll)
-}
-
 pub struct VStrip<'a, Message, Theme = iced::Theme, Renderer = iced::Renderer> {
-    /// Fractional game index at the visual center.
-    visual_scroll: f32,
-    /// Catalog index of the center slot's game.
-    anchor: usize,
     metrics: StripMetrics,
     width: Length,
     height: Length,
-    /// Children ordered top→bottom for the visible window (length [`VISIBLE`]).
+    /// Signed distance from visual center for each child (parallel to `items`).
+    distances: Vec<f32>,
+    /// Real catalog rows only (sparse; OOB peeks omitted).
     items: Vec<Element<'a, Message, Theme, Renderer>>,
 }
 
 pub fn vstrip<'a, Message, Theme, Renderer>(
-    visual_scroll: f32,
-    anchor: usize,
     metrics: StripMetrics,
-    items: impl IntoIterator<Item = Element<'a, Message, Theme, Renderer>>,
+    items: impl IntoIterator<Item = (f32, Element<'a, Message, Theme, Renderer>)>,
 ) -> VStrip<'a, Message, Theme, Renderer> {
+    let (distances, items): (Vec<f32>, Vec<_>) = items.into_iter().unzip();
     VStrip {
-        visual_scroll,
-        anchor,
         metrics,
         width: Length::Fill,
         height: Length::Fill,
-        items: items.into_iter().collect(),
+        distances,
+        items,
     }
 }
 
@@ -275,7 +262,7 @@ where
             .zip(tree.children.iter_mut())
             .enumerate()
         {
-            let dist = slot_distance(i, self.anchor, self.visual_scroll);
+            let dist = self.distances.get(i).copied().unwrap_or(0.0);
             let child_size = slot_child_size(&self.metrics, dist);
             let child_limits = layout::Limits::new(Size::ZERO, child_size);
             let mut node = item
@@ -388,8 +375,8 @@ where
         let child_layouts: Vec<_> = layout.children().collect();
         let mut order: Vec<usize> = (0..self.items.len()).collect();
         order.sort_by(|&a, &b| {
-            let da = slot_distance(a, self.anchor, self.visual_scroll).abs();
-            let db = slot_distance(b, self.anchor, self.visual_scroll).abs();
+            let da = self.distances.get(a).copied().unwrap_or(0.0).abs();
+            let db = self.distances.get(b).copied().unwrap_or(0.0).abs();
             db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -505,26 +492,35 @@ mod tests {
     }
 
     #[test]
-    fn slot_catalog_index_dummies_only_when_short() {
-        // Short catalog: linear + dummy OOB.
+    fn slot_catalog_index_linear_oob() {
+        assert_eq!(slot_catalog_index(0, 0, 0), None);
         assert_eq!(slot_catalog_index(0, -1, 3), None);
         assert_eq!(slot_catalog_index(0, 0, 3), Some(0));
         assert_eq!(slot_catalog_index(0, 2, 3), Some(2));
         assert_eq!(slot_catalog_index(0, 3, 3), None);
         assert_eq!(slot_catalog_index(2, 1, 3), None);
-        assert_eq!(slot_catalog_index(0, 0, 0), None);
-        // Enough games: circular fill (no dummies).
-        assert_eq!(slot_catalog_index(0, -1, 5), Some(4));
-        assert_eq!(slot_catalog_index(4, 1, 5), Some(0));
-        assert_eq!(slot_catalog_index(2, 2, 5), Some(4));
+        assert_eq!(slot_catalog_index(2, -1, 3), Some(1));
     }
 
     #[test]
-    fn shortest_circular_wraps_forward_and_back() {
-        assert!((shortest_circular_delta(4.0, 0.0, 5.0) - 1.0).abs() < 0.001);
-        assert!((shortest_circular_delta(0.0, 4.0, 5.0) - (-1.0)).abs() < 0.001);
-        assert!((shortest_circular_delta(2.0, 3.0, 5.0) - 1.0).abs() < 0.001);
-        assert!((shortest_circular_delta(3.0, 1.0, 5.0) - (-2.0)).abs() < 0.001);
+    fn visual_slot_linear_skips_oob_no_duplicates() {
+        let slots: Vec<_> = (-NEIGHBORS..=NEIGHBORS)
+            .filter_map(|d| visual_slot(0.0, d, 3))
+            .collect();
+        assert_eq!(slots.len(), 3);
+        assert_eq!(slots[0], (0, 0.0));
+        assert_eq!(slots[1].0, 1);
+        assert_eq!(slots[2].0, 2);
+        // No wrap duplicates above the first item.
+        assert!(visual_slot(0.0, -1, 3).is_none());
+        assert!(visual_slot(2.0, 1, 3).is_none());
+        // Mid-scroll distances stay continuous for in-range rows.
+        let (idx, dist) = visual_slot(1.5, 0, 3).unwrap();
+        assert_eq!(idx, 1);
+        assert!((dist - (-0.5)).abs() < 0.001);
+        let (idx, dist) = visual_slot(1.5, 1, 3).unwrap();
+        assert_eq!(idx, 2);
+        assert!((dist - 0.5).abs() < 0.001);
     }
 
     #[test]
@@ -540,14 +536,6 @@ mod tests {
         assert!((s2 - 2.0).abs() < 0.001);
         // Ease-out is ahead of linear at midpoint.
         assert!(s1 > 1.0);
-    }
-
-    #[test]
-    fn slot_distance_centers_anchor() {
-        assert!((slot_distance(NEIGHBORS as usize, 5, 5.0)).abs() < 0.001);
-        assert!((slot_distance(NEIGHBORS as usize + 1, 5, 5.0) - 1.0).abs() < 0.001);
-        // Mid-scroll toward next: center slot sits slightly above visual center.
-        assert!((slot_distance(NEIGHBORS as usize, 5, 4.5) - 0.5).abs() < 0.001);
     }
 
     #[test]

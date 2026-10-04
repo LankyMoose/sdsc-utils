@@ -1131,6 +1131,8 @@ impl State {
     /// `from_visual` is the strip position before `game_selected` changed. When no anim is
     /// in flight, [`strip_scroll`] would already equal the new selection — so callers must
     /// pass the previous settled index (or live visual) explicitly.
+    ///
+    /// Linear only — Games strip does not wrap, so `from`/`to` stay in catalog range.
     pub fn begin_strip_anim(&mut self, from_visual: f32, now: Instant) {
         let len = self.rows.len() as f32;
         if len < 1.0 {
@@ -1139,15 +1141,13 @@ impl State {
         }
         let catching_up = self.strip_anim.is_some();
         // Mid-flight: chase from the live eased scroll. Settled: use caller's prior index.
-        let visual = if catching_up {
+        let from = if catching_up {
             self.strip_scroll(now)
         } else {
             from_visual
         };
         let to = self.game_selected as f32;
-        let delta = crate::ui::start::vstrip::shortest_circular_delta(visual, to, len);
-        // Animate toward `to` from `to - delta` so wraps are short (e.g. -1 → 0).
-        let from = to - delta;
+        let delta = to - from;
         if delta.abs() < 0.01 {
             self.strip_anim = None;
             return;
@@ -1662,7 +1662,7 @@ impl State {
 
     /// Selected splash + visible strip heroes are decoded (matches idle Steam-scan pre-warm).
     pub fn enter_art_sync_ready(&self) -> bool {
-        use crate::ui::start::vstrip::{NEIGHBORS, VISIBLE};
+        use crate::ui::start::vstrip::NEIGHBORS;
         let len = self.rows.len();
         if len == 0 {
             return true;
@@ -1681,8 +1681,8 @@ impl State {
         if sel.icon_source.is_some() && !sel.hero_ready() {
             return false;
         }
-        let circular = self.immersive && len >= VISIBLE;
-        for idx in icon_cache::art_window_indices(selected, len, circular, NEIGHBORS) {
+        // Linear strip window — Games no longer wraps.
+        for idx in icon_cache::art_window_indices(selected, len, false, NEIGHBORS) {
             let Some(row) = self.rows.get(idx) else {
                 continue;
             };
@@ -2139,17 +2139,15 @@ impl State {
         (hero, shell, row.backdrop_path.clone())
     }
 
-    /// Art paths for catalog indices within `radius` of the selection.
-    ///
-    /// Immersive uses a circular index window (strip wrap); compact is linear.
+    /// Art paths for catalog indices within `radius` of the selection (linear).
     pub fn art_paths_for_radius(&self, radius: isize) -> icon_cache::ArtRetainSet {
-        self.art_paths_for_radius_circular(radius, self.immersive)
+        self.art_paths_for_radius_circular(radius, false)
     }
 
     /// Like [`Self::art_paths_for_radius`] with an explicit circular/linear window.
     ///
-    /// Promote pre-warm runs under ExitCompact (`immersive` still false) but needs the
-    /// circular strip window so settle does not restart decode.
+    /// Games strip is linear; callers pass `circular: false`. The flag remains for
+    /// tests / legacy call sites.
     pub fn art_paths_for_radius_circular(
         &self,
         radius: isize,
@@ -2180,7 +2178,7 @@ impl State {
 
     /// Full retain set: ±[`icon_cache::ART_WINDOW`] plus crossfade / dialog pins.
     pub fn art_retain_set(&self) -> icon_cache::ArtRetainSet {
-        self.art_retain_set_circular(self.immersive)
+        self.art_retain_set_circular(false)
     }
 
     /// Retain set with an explicit circular/linear near window (promote pre-warm).
@@ -2478,7 +2476,8 @@ impl State {
                 }
                 let len = self.rows.len() as i32;
                 let before = self.game_selected as i32;
-                let after = (before + delta).rem_euclid(len);
+                // No infinite wrap — Up on first / Down on last is a no-op.
+                let after = (before + delta).clamp(0, len - 1);
                 if after == before {
                     return None;
                 }
@@ -5003,6 +5002,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn begin_strip_anim_linear_mid_list_step() {
+        let mut state = State {
+            rows: (0..2)
+                .map(|i| StartRow {
+                    title: format!("g{i}"),
+                    subtitle: None,
+                    target: format!("t{i}"),
+                    args: String::new(),
+                    play_key: format!("k{i}"),
+                    icon: None,
+                    icon_source: None,
+                    backdrop_path: None,
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                })
+                .collect(),
+            game_selected: 0,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        state.begin_strip_anim(1.0, now);
+        let anim = state.strip_anim.as_ref().expect("linear step starts anim");
+        assert!((anim.from - 1.0).abs() < 0.01);
+        assert!((anim.to - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn move_selection_games_clamps_at_ends() {
+        let mut state = State {
+            rows: (0..3)
+                .map(|i| StartRow {
+                    title: format!("g{i}"),
+                    subtitle: None,
+                    target: format!("t{i}"),
+                    args: String::new(),
+                    play_key: format!("k{i}"),
+                    icon: None,
+                    icon_source: None,
+                    backdrop_path: None,
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                })
+                .collect(),
+            game_selected: 0,
+            ..Default::default()
+        };
+        assert!(state.move_selection(-1).is_none());
+        assert_eq!(state.game_selected, 0);
+        assert!(state.move_selection(1).is_some());
+        assert_eq!(state.game_selected, 1);
+        state.game_selected = 2;
+        assert!(state.move_selection(1).is_none());
+        assert_eq!(state.game_selected, 2);
+    }
+
     fn write_tiny_png(path: &std::path::Path) {
         let mut enc = png::Encoder::new(std::fs::File::create(path).unwrap(), 2, 2);
         enc.set_color(png::ColorType::Rgba);
@@ -5633,7 +5690,7 @@ mod tests {
     }
 
     #[test]
-    fn art_retain_set_circular_when_immersive() {
+    fn art_retain_set_linear_at_start_even_when_immersive() {
         let state = State {
             rows: (0..30)
                 .map(|i| StartRow {
@@ -5657,11 +5714,9 @@ mod tests {
         let set = state.art_retain_set();
         let w = icon_cache::ART_WINDOW as usize;
         assert!(set.backdrops.contains(&PathBuf::from("bd0.png")));
-        assert!(set.backdrops.contains(&PathBuf::from("bd29.png")));
-        assert!(
-            set.backdrops
-                .contains(&PathBuf::from(format!("bd{}.png", 30 - w)))
-        );
+        assert!(set.backdrops.contains(&PathBuf::from(format!("bd{w}.png"))));
+        // Linear: no wrap to the end of the catalog.
+        assert!(!set.backdrops.contains(&PathBuf::from("bd29.png")));
         assert!(!set.backdrops.contains(&PathBuf::from("bd15.png")));
     }
 

@@ -2687,7 +2687,8 @@ impl App {
 
     /// Post a single-flight art job for the current selection (cheap; no Task spawn).
     fn request_start_art(&mut self) {
-        self.request_start_art_circular(self.start_state.immersive);
+        // Linear strip window — Games no longer wraps.
+        self.request_start_art_circular(false);
     }
 
     /// Like [`Self::request_start_art`] with an explicit circular/linear near window.
@@ -2708,12 +2709,12 @@ impl App {
         });
     }
 
-    /// Pre-warm immersive (circular) art under ExitCompact blackout.
+    /// Pre-warm immersive art under ExitCompact blackout (linear strip window).
     fn prewarm_immersive_art_for_promote(&mut self) {
         crate::controller::hid::diag::diag_info(
-            "ui-diag: art warm promote prewarm (exit_compact circular)",
+            "ui-diag: art warm promote prewarm (exit_compact linear)",
         );
-        self.request_start_art_circular(true);
+        self.request_start_art_circular(false);
     }
 
     fn warm_start_art_task(&mut self) -> Task<Message> {
