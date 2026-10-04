@@ -2412,7 +2412,7 @@ impl App {
         // Metadata only — list / immersive art decode runs after SteamScanDone so the
         // selected game can paint before the rest of the library is warm.
         Task::perform(
-            spawn_blocking(|| steam::list_installed_games()),
+            spawn_blocking(steam::list_installed_games),
             |result| match result {
                 Ok(Ok(games)) => Message::SteamScanDone(Ok(games)),
                 Ok(Err(err)) => Message::SteamScanDone(Err(err)),
