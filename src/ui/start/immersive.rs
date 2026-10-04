@@ -169,10 +169,11 @@ pub fn view<'a>(
     let mut layers: Vec<Element<'_, StartMessage>> = vec![base.into()];
     // Settings above chrome; idle/sleep + ceremony veils paint above the drawer.
     if state.settings.visible(now) {
-        layers.push(
-            crate::ui::start::settings::immersive_drawer(state, settings_snapshot, settings_p)
-                .into(),
-        );
+        layers.push(crate::ui::start::settings::immersive_drawer(
+            state,
+            settings_snapshot,
+            settings_p,
+        ));
     }
     // Idle/sleep wash sits above settings; ceremony veil stays on top.
     if idle_veil > 0.001 {

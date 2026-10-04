@@ -525,10 +525,8 @@ pub fn focus_row_bounds(
         return Some((gap(toggle_row_h(ty.toggle)), toggle_row_h(ty.toggle)));
     }
     gap(toggle_row_h(ty.toggle));
-    if snapshot.haptics_enabled {
-        if target == SettingsRow::HapticsStrength {
-            return Some((gap(slider_row_h(ty.helper)), slider_row_h(ty.helper)));
-        }
+    if snapshot.haptics_enabled && target == SettingsRow::HapticsStrength {
+        return Some((gap(slider_row_h(ty.helper)), slider_row_h(ty.helper)));
     }
     None
 }
