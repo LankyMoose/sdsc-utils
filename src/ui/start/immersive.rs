@@ -8,7 +8,8 @@ use crate::ui::start::translate::backdrop_art;
 use crate::ui::start::view::{
     StartControllerRow, StartMessage, StartRow, StartSlide, State, footer_hint,
     game_subtitle_block, immersive_dock_row_hints, immersive_game_hints,
-    immersive_game_membership_label, manual_add_view, replace_confirm_view, update_required_badge,
+    immersive_game_membership_label, manual_add_view, replace_confirm_view, scan_status_chip,
+    scan_status_stack, update_required_badge,
 };
 use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics};
 use crate::ui::theme;
@@ -130,7 +131,37 @@ pub fn view<'a>(
     .width(Fill)
     .height(Fill);
 
-    let chrome = stack![body, footer_overlay].width(Fill).height(Fill);
+    let mut chrome_layers: Vec<Element<'_, StartMessage>> = vec![body, footer_overlay.into()];
+    let chrome_status = state.chrome_load_status(now);
+    if !chrome_status.is_empty() {
+        // Clip flush to the window bottom-right; height grows with the status rail.
+        let chip_h = 28.0;
+        let bottom_inset = 16.0;
+        let chips: Vec<_> = chrome_status
+            .iter()
+            .copied()
+            .map(|visual| {
+                let chip = scan_status_chip(chip_h, 18.0, now, visual);
+                (visual, chip)
+            })
+            .collect();
+        let scan_overlay = column![
+            space().height(Fill),
+            container(scan_status_stack(chips, chip_h, bottom_inset))
+                .width(Fill)
+                .padding(Padding {
+                    top: 0.0,
+                    right: EDGE_PAD,
+                    bottom: 0.0,
+                    left: 0.0,
+                }),
+        ]
+        .width(Fill)
+        .height(Fill);
+        chrome_layers.push(scan_overlay.into());
+    }
+
+    let chrome = stack(chrome_layers).width(Fill).height(Fill);
     let base = stack![atmosphere, chrome].width(Fill).height(Fill);
 
     let mut layers: Vec<Element<'_, StartMessage>> = vec![base.into()];
@@ -225,8 +256,15 @@ fn stage_with_dock<'a>(
     let dim = dock_stage_dim(dock_p);
 
     // Backdrop lives in the games stage (scales with dock), not the full window.
-    let mut stage_layers = stage_backdrop_layers(state, now);
-    stage_layers.push(games_stage(state, now, stage_h));
+    let list_op = state.games_list_opacity(now);
+    let mut stage_layers = if list_op > 0.01 {
+        stage_backdrop_layers(state, now)
+    } else {
+        Vec::new()
+    };
+    if list_op > 0.01 {
+        stage_layers.push(games_stage(state, now, stage_h, list_op));
+    }
     let stage = stack(stage_layers).width(Fill).height(Fill);
 
     // Float paints above the enter/exit veil — skip scale while flattening.
@@ -291,11 +329,17 @@ fn modal_card(inner: Element<'_, StartMessage>) -> Element<'_, StartMessage> {
     .into()
 }
 
-fn games_stage(state: &State, now: Instant, stage_h: f32) -> Element<'_, StartMessage> {
+fn games_stage(
+    state: &State,
+    now: Instant,
+    stage_h: f32,
+    list_opacity: f32,
+) -> Element<'_, StartMessage> {
     if state.rows.is_empty() {
         return empty_games(state);
     }
 
+    let list_opacity = list_opacity.clamp(0.0, 1.0);
     let metrics = vstrip::metrics_for_height(stage_h);
     let selected = state.game_selected.min(state.rows.len().saturating_sub(1));
     let visual = state.strip_scroll(now);
@@ -305,12 +349,12 @@ fn games_stage(state: &State, now: Instant, stage_h: f32) -> Element<'_, StartMe
     for delta in -NEIGHBORS..=NEIGHBORS {
         let dist = delta as f32 + (selected as f32 - visual);
         let scale = vstrip::scale_at_distance(dist);
-        let fade = vstrip::opacity_at_distance(dist);
+        let fade = vstrip::opacity_at_distance(dist) * list_opacity;
         match vstrip::slot_catalog_index(selected, delta, len) {
             Some(idx) => {
                 let row = &state.rows[idx];
                 let selected_slot = idx == selected;
-                let overlay = if selected_slot {
+                let overlay = if selected_slot && list_opacity > 0.85 {
                     Some(hero_hint_overlay(row, state))
                 } else {
                     None

@@ -188,13 +188,13 @@ pub fn recv_matching(
 mod win_pipe;
 
 #[cfg(windows)]
-pub use win_pipe::{PipeClient, PipeServer, PipeServerHandle, bound_port};
+pub use win_pipe::{PipeClient, PipeServer, PipeServerHandle, bound_port, service_endpoint_ready};
 
 #[cfg(not(windows))]
 mod unix_pipe;
 
 #[cfg(not(windows))]
-pub use unix_pipe::{PipeClient, PipeServer, PipeServerHandle};
+pub use unix_pipe::{PipeClient, PipeServer, PipeServerHandle, service_endpoint_ready};
 
 #[cfg(not(windows))]
 pub fn bound_port() -> u16 {

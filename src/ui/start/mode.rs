@@ -49,6 +49,34 @@ pub const ENTER_REVEAL_MS: u64 = 450;
 pub const ENTER_IMMERSIVE_MS: u64 = ENTER_REVEAL_MS;
 /// Max time to hold a solid enter veil waiting for selected splash + strip heroes.
 pub const ENTER_ART_HOLD_MAX_MS: u64 = 3000;
+/// First-launch cold load: black → ambient ease before status shows over atmosphere.
+pub const COLD_AMBIENT_MS: u64 = VEIL_TRANSITION_MS;
+/// Minimum wall time for a live Steam library scan/refresh so chrome spinners stay readable.
+pub const STEAM_SCAN_MIN_MS: u64 = 2000;
+/// After compact cold chrome settles, wait this long before kicking a background Steam refresh.
+/// Immersive kicks Steam on art-ready (Preparing success) instead — no settle delay.
+pub const STEAM_SCAN_SETTLE_DELAY_MS: u64 = 1000;
+/// Slide a chrome status chip in (below → its stack slot) / stack reflow.
+pub const CHROME_STATUS_IN_MS: u64 = 280;
+/// Slide-right exit duration once the batch clears.
+pub const CHROME_STATUS_EXIT_MS: u64 = 280;
+/// Hold each success checkmark before the batch may clear.
+pub const CHROME_STATUS_SUCCESS_HOLD_MS: u64 = 500;
+/// Extra pause after every chip is Success before staggered ExitRight.
+pub const CHROME_STATUS_STEP_HOLD_MS: u64 = 180;
+/// Delay between each chip starting ExitRight (bottom-first).
+pub const CHROME_STATUS_STAGGER_MS: u64 = 70;
+/// Horizontal travel for ExitRight (logical px). Must clear the widest status chip
+/// past the window's right edge (labels like "Scanning Steam library…").
+pub const CHROME_STATUS_EXIT_TRAVEL_PX: f32 = 520.0;
+/// Legacy aliases.
+pub const CHROME_STATUS_FADE_MS: u64 = CHROME_STATUS_EXIT_MS;
+pub const CHROME_STATUS_LIFT_MS: u64 = CHROME_STATUS_IN_MS;
+pub const STEAM_SCAN_BANNER_IN_MS: u64 = CHROME_STATUS_IN_MS;
+pub const STEAM_SCAN_BANNER_OUT_MS: u64 = CHROME_STATUS_EXIT_MS;
+pub const STEAM_SCAN_SUCCESS_HOLD_MS: u64 = CHROME_STATUS_SUCCESS_HOLD_MS;
+/// Immersive cold: fade the games strip in once artwork is ready.
+pub const GAMES_LIST_FADE_MS: u64 = ART_FADE_MS;
 /// Cap per StartFrame so a UI stall cannot skip the start of the enter curve.
 pub const ENTER_REVEAL_MAX_FRAME_MS: u64 = 32;
 /// Legacy grow-segment fraction (unused by the single top-veil enter path).
