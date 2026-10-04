@@ -41,7 +41,7 @@ pub struct ArtJob {
 }
 
 enum Cmd {
-    Job(ArtJob),
+    Job(Box<ArtJob>),
     Shutdown,
 }
 
@@ -102,14 +102,14 @@ pub fn cancel_jobs(generation: u64) {
         return;
     };
     crate::controller::hid::diag::diag_info(format!("ui-diag: art worker cancel gen={generation}"));
-    let _ = tx.send(Cmd::Job(ArtJob {
+    let _ = tx.send(Cmd::Job(Box::new(ArtJob {
         generation,
         selected_backdrop: None,
         selected_hero: None,
         selected_shell: None,
         near: ArtRetainSet::default(),
         prefetch: ArtRetainSet::default(),
-    }));
+    })));
 }
 
 /// Stop the worker thread and wipe every Start image cache (app Exit).
@@ -141,10 +141,10 @@ pub fn shutdown() {
 
 fn pin_job(job: &ArtJob) {
     let mut pins = job.prefetch.merged_with(&job.near);
-    if let Some(p) = &job.selected_backdrop {
-        if !pins.backdrops.contains(p) {
-            pins.backdrops.push(p.clone());
-        }
+    if let Some(p) = &job.selected_backdrop
+        && !pins.backdrops.contains(p)
+    {
+        pins.backdrops.push(p.clone());
     }
     if let Some(p) = &job.selected_hero {
         if !pins.heroes.contains(p) {
@@ -180,7 +180,7 @@ pub fn submit(job: ArtJob) {
     let Some(tx) = guard.as_ref() else {
         return;
     };
-    let _ = tx.send(Cmd::Job(job));
+    let _ = tx.send(Cmd::Job(Box::new(job)));
 }
 
 fn emit(event: ArtEvent) {
@@ -200,7 +200,7 @@ fn drain_latest(rx: &Receiver<Cmd>, mut current: ArtJob) -> Result<ArtJob, ()> {
                         current.generation, job.generation
                     ));
                 }
-                current = job;
+                current = *job;
             }
             Ok(Cmd::Shutdown) => return Err(()),
             Err(TryRecvError::Empty) => break,
@@ -219,7 +219,7 @@ fn worker_loop(rx: Receiver<Cmd>) {
                 Err(()) => break,
             },
             None => match rx.recv() {
-                Ok(Cmd::Job(j)) => match drain_latest(&rx, j) {
+                Ok(Cmd::Job(j)) => match drain_latest(&rx, *j) {
                     Ok(j) => j,
                     Err(()) => break,
                 },
@@ -230,7 +230,7 @@ fn worker_loop(rx: Receiver<Cmd>) {
         match run_job(&rx, job) {
             RunOutcome::Done => {}
             // Newer job was already drained out of the mailbox — must keep it.
-            RunOutcome::Superseded(next) => pending = Some(next),
+            RunOutcome::Superseded(next) => pending = Some(*next),
             RunOutcome::Shutdown => break,
         }
     }
@@ -241,7 +241,7 @@ fn worker_loop(rx: Receiver<Cmd>) {
 enum RunOutcome {
     Done,
     /// Mailbox delivered a newer generation; carry it so the loop can run it.
-    Superseded(ArtJob),
+    Superseded(Box<ArtJob>),
     Shutdown,
 }
 
@@ -252,7 +252,7 @@ fn continue_or_switch(
     generation: u64,
 ) -> Result<ArtJob, RunOutcome> {
     match drain_latest(rx, job) {
-        Ok(j) if j.generation != generation => Err(RunOutcome::Superseded(j)),
+        Ok(j) if j.generation != generation => Err(RunOutcome::Superseded(Box::new(j))),
         Ok(j) => Ok(j),
         Err(()) => Err(RunOutcome::Shutdown),
     }
@@ -284,10 +284,10 @@ fn run_job(rx: &Receiver<Cmd>, mut job: ArtJob) -> RunOutcome {
     };
 
     // --- Selected cover (splash / ambient) ---
-    if let Some(path) = job.selected_backdrop.clone() {
-        if icon_cache::backdrop_cached(&path).is_none() {
-            let _ = icon_cache::backdrop_for_path(&path);
-        }
+    if let Some(path) = job.selected_backdrop.clone()
+        && icon_cache::backdrop_cached(&path).is_none()
+    {
+        let _ = icon_cache::backdrop_for_path(&path);
     }
     emit(ArtEvent {
         generation,
@@ -459,8 +459,8 @@ mod tests {
     fn drain_latest_keeps_newest_generation() {
         let (tx, rx) = mpsc::channel();
         let first = empty_job(1);
-        tx.send(Cmd::Job(empty_job(2))).unwrap();
-        tx.send(Cmd::Job(empty_job(3))).unwrap();
+        tx.send(Cmd::Job(Box::new(empty_job(2)))).unwrap();
+        tx.send(Cmd::Job(Box::new(empty_job(3)))).unwrap();
         let got = drain_latest(&rx, first).expect("no shutdown");
         assert_eq!(got.generation, 3);
     }
@@ -469,7 +469,7 @@ mod tests {
     fn continue_or_switch_preserves_newer_job() {
         // Close→reopen race: reopen job is drained mid-run; must not be dropped.
         let (tx, rx) = mpsc::channel();
-        tx.send(Cmd::Job(empty_job(9))).unwrap();
+        tx.send(Cmd::Job(Box::new(empty_job(9)))).unwrap();
         match continue_or_switch(&rx, empty_job(1), 1) {
             Err(RunOutcome::Superseded(next)) => assert_eq!(next.generation, 9),
             other => panic!("expected Superseded(9), got {other:?}"),

@@ -531,10 +531,8 @@ fn lookup(
     if let Some(existing) = state.map.get(&key) {
         return existing.handle.clone();
     }
-    if force_pin {
-        if let Some(pins) = state.pins.as_mut() {
-            pins.insert(key.clone());
-        }
+    if force_pin && let Some(pins) = state.pins.as_mut() {
+        pins.insert(key.clone());
     }
     let tick = state.next_tick();
     let tier = key.tier();
@@ -859,8 +857,8 @@ mod tests {
                 .filter(|p| backdrop_cached(p).is_some())
                 .count();
             assert!(still <= LRU_BACKDROP_CAP);
-            // Total backdrops = pinned + still <= cap + 1 (pinned can push +1).
-            assert!(still + 1 <= LRU_BACKDROP_CAP + 1);
+            // Total backdrops = pinned + still; pinned can push one over the soft cap.
+            assert!(still < LRU_BACKDROP_CAP + 1);
             let _ = std::fs::remove_dir_all(&dir);
         });
     }

@@ -1450,23 +1450,21 @@ impl State {
     /// Full retain set: ±[`icon_cache::ART_WINDOW`] plus crossfade / dialog pins.
     pub fn art_retain_set(&self) -> icon_cache::ArtRetainSet {
         let mut set = self.art_paths_for_radius(icon_cache::ART_WINDOW);
-        if let Some((key, _)) = self.backdrop_outgoing.as_ref() {
-            if let Some(path) = self
+        if let Some((key, _)) = self.backdrop_outgoing.as_ref()
+            && let Some(path) = self
                 .rows
                 .iter()
                 .find(|r| r.play_key == *key)
                 .and_then(|r| r.backdrop_path.clone())
-            {
-                if !set.backdrops.contains(&path) {
-                    set.backdrops.push(path);
-                }
-            }
+            && !set.backdrops.contains(&path)
+        {
+            set.backdrops.push(path);
         }
         if let Some(draft) = self.manual_add.as_ref() {
-            if let Some(path) = draft.icon_path.clone() {
-                if !set.list_files.contains(&path) {
-                    set.list_files.push(path);
-                }
+            if let Some(path) = draft.icon_path.clone()
+                && !set.list_files.contains(&path)
+            {
+                set.list_files.push(path);
             }
             if !draft.target.starts_with("steam://") {
                 let path = PathBuf::from(&draft.target);
