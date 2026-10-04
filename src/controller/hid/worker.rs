@@ -1641,6 +1641,7 @@ fn handle_cmd(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     rx: Receiver<HidCmd>,
     identifying: Arc<AtomicBool>,

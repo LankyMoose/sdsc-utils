@@ -168,10 +168,9 @@ fn poll_controllers_with_api(
                 if let Some(quiet) = launch
                     .as_mut()
                     .and_then(|l| l.take_serial_for_path(&path, &serial))
+                    && let Some(out) = launch_quiet.as_mut()
                 {
-                    if let Some(out) = launch_quiet.as_mut() {
-                        out.push(quiet);
-                    }
+                    out.push(quiet);
                 }
                 pads.push(PolledPad {
                     status: status_from_reading(product, &reading, serial),
