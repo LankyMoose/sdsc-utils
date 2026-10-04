@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn opacity_leads_the_slide() {
-        assert!(OPACITY_MS < FADE_MS);
+        const { assert!(OPACITY_MS < FADE_MS) };
         let half = OPACITY_MS / 2;
         let op_left = show_hide_amount(1.0, 0.0, half, OPACITY_MS);
         let slide_left = show_hide_amount(1.0, 0.0, half, FADE_MS);
