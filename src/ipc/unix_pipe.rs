@@ -14,6 +14,11 @@ use std::time::Duration;
 
 type ClientList = Arc<Mutex<Vec<Sender<ServiceMessage>>>>;
 
+/// True when the service unix socket path exists (no connect — see win_pipe note).
+pub fn service_endpoint_ready() -> bool {
+    Path::new(&pipe_endpoint()).exists()
+}
+
 pub struct PipeServer {
     from_client: Receiver<ShellCommand>,
     clients: ClientList,

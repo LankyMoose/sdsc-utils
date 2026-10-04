@@ -50,7 +50,7 @@ When Connected would auto-open Start **and** `start_screen_always_immersive` is 
 4. On `StartOpened` (or already-hosting), clear the defer flag and show; toast HWND stays hidden; card slides only via `immersive toast composite`.
 5. If Start cannot host (disabled / compact / close abandoned), fall back to HWND toast so Connected is never dropped.
 
-Compact auto-open keeps defer-until-toast-rest (`AfterToast::OpenStart`).
+Compact auto-open also opens Start **first** (`AfterToast::Nothing`); Connected then slides on the toast HWND raised above Start (same start-first path as immersive, without cover composite).
 
 Debug grep: `ui-diag: immersive connect toast (start first, composite only)`, `ui-diag: immersive connect toast release (start hosting)`, `ui-diag: immersive connect toast fallback (hwnd)`, `ui-diag: place toast … composite_only=1`, `ui-diag: immersive toast composite gen=`.
 
@@ -62,4 +62,4 @@ Toast and Start are separate gates. To stop Connected-without-Start on turn-on:
 - **Short arrival:** nonempty stretch under 2s does not arm the 5s ghost cooldown (enumerate blip). Stable disconnects still arm it; intentional Power Off still skips.
 - **Pending retry:** `start_auto_open_pending` is set when 0→1 auto-open gates pass; cleared only once Start is visible. Close-in-flight leaves it set; `WindowClosed` retries. Confirmed empty clears pending and `clear_after()` even when Start is not visible.
 
-Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: toast Placing->SlidingIn`, `ui-diag: toast SlidingIn->Resting`, `ui-diag: toast show … body=Connected after=OpenStart`, `ui-diag: place toast gen=`, `ui-diag: start open after toast settle`, `ui-diag: skip connect cooldown (intentional power-off)`, `ui-diag: skip connect cooldown (short arrival)`, `ui-diag: hold pad across missed read serial=`, `ui-diag: retry start open after close`, `ui-diag: reopen gesture suppressed (toast OpenStart pending)`, `ui-diag: immersive connect toast`.
+Debug grep: `ui-diag: start first on connect`, `ui-diag: connect toast start-first`, `ui-diag: toast Placing->SlidingIn`, `ui-diag: toast SlidingIn->Resting`, `ui-diag: toast show … body=Connected`, `ui-diag: place toast gen=`, `ui-diag: start open after toast settle`, `ui-diag: skip connect cooldown (intentional power-off)`, `ui-diag: skip connect cooldown (short arrival)`, `ui-diag: hold pad across missed read serial=`, `ui-diag: retry start open after close`, `ui-diag: reopen gesture suppressed (toast OpenStart pending)`, `ui-diag: immersive connect toast`.

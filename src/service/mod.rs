@@ -53,9 +53,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut tray = tray::create_tray(&[]);
     let mut shell = spawn_shell()?;
     let mut last_discovered = hid_worker.presence_paths();
-    let mut last_battery_poll = Instant::now();
+    // Pads already present at launch must not wait for BATTERY/UNREAD cadence —
+    // schedule an immediate first poll so auto-open can fire as soon as the shell is up.
+    let mut last_battery_poll = Instant::now()
+        .checked_sub(BATTERY_INTERVAL)
+        .unwrap_or_else(Instant::now);
     let mut last_shell_check = Instant::now();
-    let mut last_presence_check = Instant::now();
+    let mut last_presence_check = Instant::now()
+        .checked_sub(PRESENCE_INTERVAL_EMPTY)
+        .unwrap_or_else(Instant::now);
     let mut last_persist_check = Instant::now();
     let mut start_visible = false;
     let shell_input_hot = Arc::new(AtomicBool::new(false));
@@ -137,16 +143,30 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let clients = pipe.client_count();
-        if clients > 0 && last_client_count == 0 && pending_open_start {
-            pending_open_start = false;
-            let _ = pipe.send(ServiceMessage::Effects(vec![SessionEffect::OpenStart]));
+        if clients > 0 && last_client_count == 0 {
+            // Shell just attached — push live pad list (earlier Controllers IPC may have
+            // been dropped while client_count was 0) then flush a latched OpenStart.
+            // Keep the latch until ReportStartVisible(true): a brief connect (or a
+            // message sent before the shell's recv loop is live) must not clear it.
+            let _ = pipe.send(ServiceMessage::Controllers(session.controllers.clone()));
+            if pending_open_start {
+                app_log::info("service: flushing latched OpenStart (shell up)");
+                let _ = pipe.send(ServiceMessage::Effects(vec![SessionEffect::OpenStart]));
+            }
         }
         last_client_count = clients;
 
         if last_persist_check.elapsed() >= Duration::from_secs(2) {
             last_persist_check = Instant::now();
             if let Some(effects) = reload_persist_if_needed(&mut session, start_visible) {
-                dispatch_effects(&mut session, &hid_worker, &pipe, &mut tray, effects);
+                dispatch_effects(
+                    &mut session,
+                    &hid_worker,
+                    &pipe,
+                    &mut tray,
+                    effects,
+                    &mut pending_open_start,
+                );
             }
         }
 
@@ -157,6 +177,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             ) {
                 // Start closed — require debounced chord release before reopen.
                 chord_release_gate.arm();
+            }
+            if matches!(&cmd, ShellCommand::ReportStartVisible { visible: true }) {
+                // Start HWND is up — drop any auto-open latch.
+                pending_open_start = false;
             }
             if matches!(
                 handle_command(
@@ -244,7 +268,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 // Shell refreshes compact Controllers from Controllers IPC only.
                 let _ = pipe.send(ServiceMessage::Controllers(session.controllers.clone()));
-                dispatch_effects(&mut session, &hid_worker, &pipe, &mut tray, effects);
+                dispatch_effects(
+                    &mut session,
+                    &hid_worker,
+                    &pipe,
+                    &mut tray,
+                    effects,
+                    &mut pending_open_start,
+                );
                 last_battery_poll = Instant::now();
             } else if !nav_priority {
                 // Cold path (tray idle): classic exclusive Poll for battery/liveness.
@@ -278,7 +309,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             let _ =
                                 pipe.send(ServiceMessage::Controllers(session.controllers.clone()));
-                            dispatch_effects(&mut session, &hid_worker, &pipe, &mut tray, effects);
+                            dispatch_effects(
+                                &mut session,
+                                &hid_worker,
+                                &pipe,
+                                &mut tray,
+                                effects,
+                                &mut pending_open_start,
+                            );
                         }
                         Err(err) => app_log::warn(format!("service poll failed: {err}")),
                     }
@@ -316,7 +354,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 );
                 let _ = pipe.send(ServiceMessage::Controllers(session.controllers.clone()));
-                dispatch_effects(&mut session, &hid_worker, &pipe, &mut tray, effects);
+                dispatch_effects(
+                    &mut session,
+                    &hid_worker,
+                    &pipe,
+                    &mut tray,
+                    effects,
+                    &mut pending_open_start,
+                );
             }
         }
 
@@ -504,6 +549,7 @@ fn dispatch_effects(
     pipe: &PipeServer,
     tray: &mut Option<tray_icon::TrayIcon>,
     effects: Vec<SessionEffect>,
+    pending_open_start: &mut bool,
 ) {
     for effect in &effects {
         match effect {
@@ -537,7 +583,7 @@ fn dispatch_effects(
     }
     // Shell applies UI-facing effects; skip work the service already did locally
     // or already pushed on a dedicated IPC message (Notifications).
-    let ui_effects: Vec<SessionEffect> = effects
+    let mut ui_effects: Vec<SessionEffect> = effects
         .into_iter()
         .filter(|e| {
             !matches!(
@@ -550,9 +596,27 @@ fn dispatch_effects(
             )
         })
         .collect();
-    if !ui_effects.is_empty() {
-        let _ = pipe.send(ServiceMessage::Effects(ui_effects));
+    if ui_effects.is_empty() {
+        return;
     }
+    // Early HID poll (pads already present) can race shell attach — OpenStart would
+    // be dropped with client_count==0. Latch like the reopen-gesture path.
+    if pipe.client_count() == 0 {
+        if ui_effects
+            .iter()
+            .any(|e| matches!(e, SessionEffect::OpenStart))
+        {
+            *pending_open_start = true;
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: service OpenStart latched (shell down)",
+            );
+        }
+        ui_effects.retain(|e| !matches!(e, SessionEffect::OpenStart));
+        if ui_effects.is_empty() {
+            return;
+        }
+    }
+    let _ = pipe.send(ServiceMessage::Effects(ui_effects));
 }
 
 /// Let the shell run `Message::Exit` (art wipe + join) before we force-kill.

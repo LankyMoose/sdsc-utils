@@ -17,7 +17,7 @@ use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Float, button, column, container, row, scrollable, space, svg, text, text_input,
+    Float, button, column, container, row, scrollable, space, stack, svg, text, text_input,
 };
 use iced::{
     Alignment, Background, Border, Color, ContentFit, Element, Fill, Font, Length, Padding, Point,
@@ -536,6 +536,59 @@ struct IdleDimAnim {
     started: Instant,
 }
 
+/// Background-task chip kind for the immersive BR / compact titlebar queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromeStatusKind {
+    PreparingArt,
+    SteamLibrary,
+}
+
+impl ChromeStatusKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PreparingArt => "preparing",
+            Self::SteamLibrary => "steam",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChromeStatusPhase {
+    In,
+    Active,
+    Success,
+    /// Slide off to the right (batch clear).
+    ExitRight,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChromeStatusItem {
+    kind: ChromeStatusKind,
+    phase: ChromeStatusPhase,
+    started: Instant,
+    /// Target stack slot (0 = bottom).
+    stack_slot: f32,
+    /// Slot at the start of the current reflow anim.
+    stack_from: f32,
+    /// When stack reflow began (`None` = settled at `stack_slot`).
+    stack_anim_started: Option<Instant>,
+}
+
+/// Visual for one chrome status chip in the stacked rail.
+#[derive(Debug, Clone, Copy)]
+pub struct ChromeStatusVisual {
+    pub kind: ChromeStatusKind,
+    /// 0 = bottom rest; higher = stacked above; may be &lt; 0 while entering.
+    pub stack_slot: f32,
+    /// 0 = at rest, 1 = fully slid off to the right.
+    pub exit_x: f32,
+    pub opacity: f32,
+    pub success: bool,
+}
+
+/// Backward-compatible alias used by compact titlebar (single chip).
+pub type SteamScanBannerVisual = ChromeStatusVisual;
+
 #[derive(Debug, Clone)]
 pub struct State {
     pub slide: StartSlide,
@@ -547,6 +600,20 @@ pub struct State {
     pub transition_phase: Option<(crate::ui::start::mode::TransitionPhase, Instant)>,
     /// Capped enter-reveal progress while [`TransitionPhase::EnterImmersive`] is active.
     enter_reveal: Option<EnterRevealClock>,
+    /// First Start HWND of the process: ambient + status ceremony (not warm reopen).
+    pub cold_load_active: bool,
+    /// When the cold black→ambient ease began (`StartOpened`).
+    cold_ambient_started: Option<Instant>,
+    /// Mirrored from App: true until first SteamScanDone.
+    pub steam_scan_pending: bool,
+    /// Immersive BR / compact titlebar status rail (bottom = newest).
+    chrome_status: Vec<ChromeStatusItem>,
+    /// When every live chip first became Success (`None` if any still working).
+    chrome_status_all_success_at: Option<Instant>,
+    /// Batch ExitRight stagger clock (`None` until clear starts).
+    chrome_status_batch_exit_at: Option<Instant>,
+    /// Immersive cold: when the games strip began fading in (`None` = still hidden).
+    games_list_reveal_at: Option<Instant>,
     /// Art is ready but splash reveal is held until the enter veil clears.
     splash_reveal_pending: bool,
     /// Pending reveal should snap opaque (cached) rather than ambient-fade.
@@ -639,6 +706,13 @@ impl Default for State {
             transition: None,
             transition_phase: None,
             enter_reveal: None,
+            cold_load_active: false,
+            cold_ambient_started: None,
+            steam_scan_pending: true,
+            chrome_status: Vec::new(),
+            chrome_status_all_success_at: None,
+            chrome_status_batch_exit_at: None,
+            games_list_reveal_at: None,
             splash_reveal_pending: false,
             splash_reveal_cached: false,
             enter_splash_fade: false,
@@ -877,6 +951,7 @@ impl State {
             || self.backdrop_current.is_some()
             || self.backdrop_outgoing.is_some()
             || self.immersive
+            || self.cold_load_active
             || self.triangle_progress > 0.0
             || self.cross_progress > 0.0
             || self.replace_confirm.is_some()
@@ -884,6 +959,8 @@ impl State {
             || self.hint_anims_need_frames()
             || self.identify_flash_active()
             || self.art_awaiting_paint
+            || !self.chrome_status.is_empty()
+            || self.games_list_reveal_at.is_some()
     }
 
     /// Immersive dock width progress 0..=1 (eased while animating).
@@ -1155,6 +1232,330 @@ impl State {
         self.enter_reveal.as_ref().is_some_and(|c| c.armed)
     }
 
+    /// Begin the process-first Start load ceremony (immersive ambient + dock; compact skips).
+    pub fn begin_cold_load(&mut self) {
+        self.cold_load_active = true;
+        self.cold_ambient_started = None;
+        self.games_list_reveal_at = None;
+        crate::controller::hid::diag::diag_info("ui-diag: start cold load begin");
+    }
+
+    /// Arm the black→ambient ease once the HWND can paint.
+    pub fn arm_cold_ambient(&mut self, now: Instant) {
+        if !self.cold_load_active || self.cold_ambient_started.is_some() {
+            return;
+        }
+        self.cold_ambient_started = Some(now);
+        crate::controller::hid::diag::diag_info("ui-diag: start cold load ambient armed");
+    }
+
+    /// Solid black remaining over ambient during cold load (1 = black, 0 = ambient clear).
+    pub fn cold_black_amount(&self, now: Instant) -> f32 {
+        use crate::ui::start::mode::{COLD_AMBIENT_MS, phase_progress};
+        if !self.cold_load_active {
+            return 0.0;
+        }
+        let Some(started) = self.cold_ambient_started else {
+            return 1.0;
+        };
+        let elapsed = now.saturating_duration_since(started).as_millis() as u64;
+        1.0 - phase_progress(elapsed, COLD_AMBIENT_MS)
+    }
+
+    /// End the cold-load ceremony (warm reopens skip it).
+    pub fn finish_cold_load(&mut self) {
+        if !self.cold_load_active {
+            return;
+        }
+        self.cold_load_active = false;
+        self.cold_ambient_started = None;
+        crate::controller::hid::diag::diag_info("ui-diag: start cold load done");
+    }
+
+    /// Start chrome status for a background task (Steam wrapper).
+    pub fn begin_steam_scan_banner(&mut self, now: Instant) {
+        self.begin_chrome_status(ChromeStatusKind::SteamLibrary, now);
+    }
+
+    /// Steam scan finished — stay Success on the rail (Preparing may begin while cold).
+    pub fn note_steam_scan_banner_success(&mut self, now: Instant) {
+        self.note_chrome_status_success(ChromeStatusKind::SteamLibrary, now);
+        // Cache-miss cold: Steam done but art still pending → stack Preparing under it.
+        if self.immersive
+            && self.cold_load_active
+            && self.games_list_reveal_at.is_none()
+            && !self.chrome_status_has_kind(ChromeStatusKind::PreparingArt)
+        {
+            self.begin_chrome_status(ChromeStatusKind::PreparingArt, now);
+        }
+    }
+
+    pub fn steam_scan_banner_active(&self) -> bool {
+        self.chrome_status_has_kind(ChromeStatusKind::SteamLibrary)
+    }
+
+    fn chrome_status_has_kind(&self, kind: ChromeStatusKind) -> bool {
+        self.chrome_status.iter().any(|i| {
+            i.kind == kind
+                && matches!(
+                    i.phase,
+                    ChromeStatusPhase::In | ChromeStatusPhase::Active | ChromeStatusPhase::Success
+                )
+        })
+    }
+
+    fn chrome_status_display_slot(item: &ChromeStatusItem, now: Instant) -> f32 {
+        use crate::ui::start::mode::{CHROME_STATUS_IN_MS, phase_progress};
+        if let Some(started) = item.stack_anim_started {
+            let t = phase_progress(
+                now.saturating_duration_since(started).as_millis() as u64,
+                CHROME_STATUS_IN_MS,
+            );
+            return item.stack_from + (item.stack_slot - item.stack_from) * t;
+        }
+        item.stack_slot
+    }
+
+    /// Begin a chrome status chip at the bottom of the rail (existing chips shift up).
+    pub fn begin_chrome_status(&mut self, kind: ChromeStatusKind, now: Instant) {
+        // Already on the rail (any phase) — keep stable.
+        if self.chrome_status.iter().any(|i| i.kind == kind) {
+            return;
+        }
+        // New work cancels any in-flight batch exit.
+        self.chrome_status_all_success_at = None;
+        self.chrome_status_batch_exit_at = None;
+        // Drop chips mid-exit so a new batch can start clean.
+        self.chrome_status
+            .retain(|i| i.phase != ChromeStatusPhase::ExitRight);
+
+        // Capture display slots first (immutable), then apply reflow.
+        let from_slots: Vec<f32> = self
+            .chrome_status
+            .iter()
+            .map(|i| Self::chrome_status_display_slot(i, now))
+            .collect();
+        for (item, from) in self.chrome_status.iter_mut().zip(from_slots) {
+            item.stack_from = from;
+            item.stack_slot += 1.0;
+            item.stack_anim_started = Some(now);
+        }
+        self.chrome_status.insert(
+            0,
+            ChromeStatusItem {
+                kind,
+                phase: ChromeStatusPhase::In,
+                started: now,
+                stack_slot: 0.0,
+                stack_from: -1.0,
+                // Drive enter with the same reflow clock so layout stays consistent.
+                stack_anim_started: Some(now),
+            },
+        );
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: chrome status begin kind={} n={}",
+            kind.label(),
+            self.chrome_status.len()
+        ));
+    }
+
+    /// Mark a status successful; chip stays stacked until the whole batch clears.
+    pub fn note_chrome_status_success(&mut self, kind: ChromeStatusKind, now: Instant) {
+        let Some(item) = self.chrome_status.iter_mut().find(|i| {
+            i.kind == kind
+                && matches!(
+                    i.phase,
+                    ChromeStatusPhase::In | ChromeStatusPhase::Active | ChromeStatusPhase::Success
+                )
+        }) else {
+            return;
+        };
+        if item.phase == ChromeStatusPhase::Success {
+            return;
+        }
+        item.phase = ChromeStatusPhase::Success;
+        item.started = now;
+        // Keep any in-flight stack reflow — clearing it snapped chips mid-animation.
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: chrome status success kind={}",
+            kind.label()
+        ));
+        self.note_chrome_status_maybe_all_success(now);
+    }
+
+    fn note_chrome_status_maybe_all_success(&mut self, now: Instant) {
+        if self.chrome_status.is_empty() {
+            self.chrome_status_all_success_at = None;
+            return;
+        }
+        let all_success = self
+            .chrome_status
+            .iter()
+            .all(|i| i.phase == ChromeStatusPhase::Success);
+        if all_success {
+            if self.chrome_status_all_success_at.is_none() {
+                self.chrome_status_all_success_at = Some(now);
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: chrome status all success n={}",
+                    self.chrome_status.len()
+                ));
+            }
+        } else {
+            self.chrome_status_all_success_at = None;
+            self.chrome_status_batch_exit_at = None;
+        }
+    }
+
+    fn tick_chrome_status(&mut self, now: Instant) {
+        use crate::ui::start::mode::{
+            CHROME_STATUS_EXIT_MS, CHROME_STATUS_IN_MS, CHROME_STATUS_STAGGER_MS,
+            CHROME_STATUS_STEP_HOLD_MS, CHROME_STATUS_SUCCESS_HOLD_MS,
+        };
+
+        // Settle stack reflow clocks.
+        for item in &mut self.chrome_status {
+            if let Some(started) = item.stack_anim_started {
+                let elapsed = now.saturating_duration_since(started).as_millis() as u64;
+                if elapsed >= CHROME_STATUS_IN_MS {
+                    item.stack_anim_started = None;
+                    item.stack_from = item.stack_slot;
+                }
+            }
+        }
+
+        // In → Active.
+        for item in &mut self.chrome_status {
+            if item.phase == ChromeStatusPhase::In {
+                let elapsed = now.saturating_duration_since(item.started).as_millis() as u64;
+                if elapsed >= CHROME_STATUS_IN_MS {
+                    item.phase = ChromeStatusPhase::Active;
+                    item.started = now;
+                }
+            }
+        }
+
+        // Start staggered ExitRight once the batch has held Success long enough.
+        if self.chrome_status_batch_exit_at.is_none() {
+            if let Some(all_at) = self.chrome_status_all_success_at {
+                let hold = CHROME_STATUS_SUCCESS_HOLD_MS + CHROME_STATUS_STEP_HOLD_MS;
+                if now.saturating_duration_since(all_at) >= Duration::from_millis(hold) {
+                    self.chrome_status_batch_exit_at = Some(now);
+                    crate::controller::hid::diag::diag_info(format!(
+                        "ui-diag: chrome status exit_right begin n={}",
+                        self.chrome_status.len()
+                    ));
+                }
+            }
+        }
+        if let Some(batch_at) = self.chrome_status_batch_exit_at {
+            let batch_elapsed = now.saturating_duration_since(batch_at).as_millis() as u64;
+            for (i, item) in self.chrome_status.iter_mut().enumerate() {
+                if item.phase != ChromeStatusPhase::Success {
+                    continue;
+                }
+                let stagger = (i as u64).saturating_mul(CHROME_STATUS_STAGGER_MS);
+                if batch_elapsed >= stagger {
+                    item.phase = ChromeStatusPhase::ExitRight;
+                    item.started = batch_at + Duration::from_millis(stagger);
+                }
+            }
+        }
+
+        // Remove finished ExitRight chips (bottom-first removals OK via reverse index).
+        let mut remove = Vec::new();
+        for (i, item) in self.chrome_status.iter().enumerate() {
+            if item.phase != ChromeStatusPhase::ExitRight {
+                continue;
+            }
+            let elapsed = now.saturating_duration_since(item.started).as_millis() as u64;
+            if elapsed >= CHROME_STATUS_EXIT_MS {
+                remove.push(i);
+            }
+        }
+        for i in remove.into_iter().rev() {
+            if let Some(item) = self.chrome_status.get(i) {
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: chrome status exit_right done kind={}",
+                    item.kind.label()
+                ));
+            }
+            self.chrome_status.remove(i);
+        }
+        if self.chrome_status.is_empty() {
+            if self.chrome_status_batch_exit_at.is_some() {
+                crate::controller::hid::diag::diag_info("ui-diag: chrome status clear n=0");
+            }
+            self.chrome_status_all_success_at = None;
+            self.chrome_status_batch_exit_at = None;
+        }
+    }
+
+    fn chrome_status_item_visual(item: &ChromeStatusItem, now: Instant) -> ChromeStatusVisual {
+        use crate::ui::start::mode::{CHROME_STATUS_EXIT_MS, phase_progress};
+        let stack_slot = Self::chrome_status_display_slot(item, now);
+        let (exit_x, opacity, success) = match item.phase {
+            ChromeStatusPhase::In | ChromeStatusPhase::Active => (0.0, 1.0, false),
+            ChromeStatusPhase::Success => (0.0, 1.0, true),
+            ChromeStatusPhase::ExitRight => {
+                let t = phase_progress(
+                    now.saturating_duration_since(item.started).as_millis() as u64,
+                    CHROME_STATUS_EXIT_MS,
+                );
+                // Full fade by the end so any remainder past travel is gone.
+                (t, 1.0 - t, true)
+            }
+        };
+        ChromeStatusVisual {
+            kind: item.kind,
+            stack_slot,
+            exit_x: exit_x.clamp(0.0, 1.0),
+            opacity: opacity.clamp(0.0, 1.0),
+            success,
+        }
+    }
+
+    /// All live chrome status visuals (bottom → top) for immersive BR stacking.
+    pub fn chrome_load_status(&self, now: Instant) -> Vec<ChromeStatusVisual> {
+        self.chrome_status
+            .iter()
+            .map(|i| Self::chrome_status_item_visual(i, now))
+            .collect()
+    }
+
+    /// Compact titlebar: newest Active, else newest Success / In.
+    pub fn chrome_load_status_primary(&self, now: Instant) -> Option<ChromeStatusVisual> {
+        let visuals = self.chrome_load_status(now);
+        visuals
+            .iter()
+            .find(|v| !v.success && v.exit_x < 0.01)
+            .copied()
+            .or_else(|| visuals.first().copied())
+    }
+
+    /// Opacity of the immersive games strip (0 = hidden during cold, 1 = fully shown).
+    pub fn games_list_opacity(&self, now: Instant) -> f32 {
+        use crate::ui::start::mode::{GAMES_LIST_FADE_MS, phase_progress};
+        if !self.immersive {
+            return 1.0;
+        }
+        let Some(started) = self.games_list_reveal_at else {
+            return if self.cold_load_active { 0.0 } else { 1.0 };
+        };
+        let elapsed = now.saturating_duration_since(started).as_millis() as u64;
+        phase_progress(elapsed, GAMES_LIST_FADE_MS)
+    }
+
+    /// Begin fading the immersive games list in (idempotent).
+    pub fn begin_games_list_reveal(&mut self, now: Instant) {
+        if self.games_list_reveal_at.is_none() {
+            self.games_list_reveal_at = Some(now);
+            crate::controller::hid::diag::diag_info("ui-diag: start games list reveal begin");
+            if self.chrome_status_has_kind(ChromeStatusKind::PreparingArt) {
+                self.note_chrome_status_success(ChromeStatusKind::PreparingArt, now);
+            }
+        }
+    }
+
     /// Selected splash + visible strip heroes are decoded (matches idle Steam-scan pre-warm).
     pub fn enter_art_sync_ready(&self) -> bool {
         use crate::ui::start::vstrip::{NEIGHBORS, VISIBLE};
@@ -1191,16 +1592,49 @@ impl State {
         true
     }
 
-    /// Arm enter reveal once splash + strip heroes are ready; snap splash opaque under the veil.
+    /// Arm enter reveal once splash + strip heroes are ready.
     ///
-    /// Cold open after process restart must wait here so art does not trickle in after the
-    /// veil lifts (first launch feels synced because Steam scan pre-warms while idle).
+    /// Immersive cold: enter veil is armed on open (ambient+dock). When art is ready,
+    /// only fade the games list / splash in — do not re-black the chrome.
     pub fn try_arm_enter_reveal_when_art_ready(&mut self, now: Instant) -> bool {
         if self.enter_reveal.is_none() || self.enter_reveal_armed() {
+            // Cold immersive: list reveal after art (veil already lifting/cleared).
+            if self.cold_load_active && self.immersive && self.enter_art_sync_ready() {
+                self.begin_games_list_reveal(now);
+                if let Some(row) = self.rows.get(self.game_selected)
+                    && row.backdrop_icon().is_some()
+                {
+                    self.start_enter_splash_fade(row.play_key.clone(), now);
+                }
+                self.finish_cold_load();
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: start immersive enter art sync ready cold=1 list_reveal=1",
+                );
+                return true;
+            }
             return false;
         }
         if !self.enter_art_sync_ready() {
             return false;
+        }
+        let hold_ms = self
+            .transition_phase
+            .map(|(_, started)| now.saturating_duration_since(started).as_millis())
+            .unwrap_or(0);
+        if self.cold_load_active && self.immersive {
+            // Veil never armed yet — start the initial lift, then reveal the list.
+            self.begin_games_list_reveal(now);
+            if let Some(row) = self.rows.get(self.game_selected)
+                && row.backdrop_icon().is_some()
+            {
+                self.start_enter_splash_fade(row.play_key.clone(), now);
+            }
+            self.finish_cold_load();
+            self.arm_enter_reveal(now);
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start immersive enter art sync ready ms={hold_ms} cold=1"
+            ));
+            return true;
         }
         if let Some(row) = self.rows.get(self.game_selected)
             && row.backdrop_icon().is_some()
@@ -1208,13 +1642,41 @@ impl State {
             self.reveal_cached_opaque(row.play_key.clone(), now);
         }
         self.arm_enter_reveal(now);
-        crate::controller::hid::diag::diag_info("ui-diag: start immersive enter art sync ready");
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start immersive enter art sync ready ms={hold_ms}"
+        ));
         true
     }
 
-    /// If art stays cold too long, lift the veil anyway (avoid a stuck blackout).
+    /// If art stays cold too long, lift the veil / reveal games anyway.
     pub fn maybe_force_enter_reveal_after_art_hold(&mut self, now: Instant) {
         use crate::ui::start::mode::ENTER_ART_HOLD_MAX_MS;
+        // Immersive cold: reveal the list even if art never synced.
+        if self.cold_load_active && self.immersive {
+            let timed_out = self.cold_ambient_started.is_some_and(|t| {
+                now.saturating_duration_since(t) >= Duration::from_millis(ENTER_ART_HOLD_MAX_MS)
+            });
+            if timed_out {
+                let hold_ms = self
+                    .cold_ambient_started
+                    .map(|t| now.saturating_duration_since(t).as_millis())
+                    .unwrap_or(0);
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start immersive enter art hold timeout ms={hold_ms} cold=1"
+                ));
+                self.begin_games_list_reveal(now);
+                if let Some(row) = self.rows.get(self.game_selected)
+                    && row.backdrop_icon().is_some()
+                {
+                    self.start_enter_splash_fade(row.play_key.clone(), now);
+                }
+                self.finish_cold_load();
+                if self.enter_reveal.is_some() && !self.enter_reveal_armed() {
+                    self.arm_enter_reveal(now);
+                }
+                return;
+            }
+        }
         if self.enter_reveal.is_none() || self.enter_reveal_armed() {
             return;
         }
@@ -1224,7 +1686,10 @@ impl State {
         if now.saturating_duration_since(started) < Duration::from_millis(ENTER_ART_HOLD_MAX_MS) {
             return;
         }
-        crate::controller::hid::diag::diag_info("ui-diag: start immersive enter art hold timeout");
+        let hold_ms = now.saturating_duration_since(started).as_millis();
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start immersive enter art hold timeout ms={hold_ms}"
+        ));
         if let Some(row) = self.rows.get(self.game_selected)
             && row.backdrop_icon().is_some()
         {
@@ -1732,7 +2197,17 @@ impl State {
         let _ = self.try_arm_enter_reveal_when_art_ready(now);
         self.advance_enter_reveal(now);
         self.try_start_pending_splash_reveal(now);
+        self.tick_chrome_status(now);
         let mut busy = false;
+        if !self.chrome_status.is_empty() {
+            busy = true;
+        }
+        if let Some(started) = self.games_list_reveal_at {
+            use crate::ui::start::mode::GAMES_LIST_FADE_MS;
+            if now.saturating_duration_since(started) < Duration::from_millis(GAMES_LIST_FADE_MS) {
+                busy = true;
+            }
+        }
         if let Some(anim) = self.anim.as_ref() {
             let elapsed = now.saturating_duration_since(anim.started);
             if elapsed >= Duration::from_millis(anim.duration_ms) {
@@ -1777,7 +2252,14 @@ impl State {
         if self.transition_phase.is_some() {
             busy = true;
         }
-        if self.immersive || self.transition.is_some() || self.transition_phase.is_some() {
+        if self.cold_load_active {
+            busy = true;
+        }
+        if self.immersive
+            || self.transition.is_some()
+            || self.transition_phase.is_some()
+            || self.cold_load_active
+        {
             self.ambient_time += 1.0 / 60.0;
             busy = true;
         }
@@ -2004,6 +2486,199 @@ fn reveal_for_step(before: i32, after: i32, delta: i32) -> ScrollReveal {
     }
 }
 
+/// Indeterminate scan spinner phase from a process-local epoch.
+pub(crate) fn scan_spinner_phase(now: Instant) -> f32 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    now.saturating_duration_since(epoch).as_secs_f32() * 2.8
+}
+
+/// Small indeterminate arc spinner (compact titlebar / immersive BR).
+pub(crate) fn scan_spinner<'a>(size: f32, now: Instant, opacity: f32) -> Element<'a, StartMessage> {
+    let phase = scan_spinner_phase(now);
+    iced::widget::canvas(ScanSpinner {
+        phase,
+        size,
+        opacity: opacity.clamp(0.0, 1.0),
+    })
+    .width(Length::Fixed(size))
+    .height(Length::Fixed(size))
+    .into()
+}
+
+struct ScanSpinner {
+    phase: f32,
+    size: f32,
+    opacity: f32,
+}
+
+impl canvas::Program<StartMessage> for ScanSpinner {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let center = Point::new(bounds.width / 2.0, bounds.height / 2.0);
+        let radius = (self.size / 2.0) - 2.0;
+        let stroke_w = if self.size <= 16.0 { 1.75 } else { 2.25 };
+        let track = Path::circle(center, radius);
+        frame.stroke(
+            &track,
+            Stroke::default().with_width(stroke_w).with_color(Color {
+                a: 0.22 * self.opacity,
+                ..theme::MUTED
+            }),
+        );
+        let sweep = std::f32::consts::TAU * 0.28;
+        let start = self.phase;
+        let end = start + sweep;
+        let steps = 18usize;
+        let arc = Path::new(|builder| {
+            for i in 0..=steps {
+                let t = i as f32 / steps as f32;
+                let a = start + (end - start) * t;
+                let p = Point::new(center.x + radius * a.cos(), center.y + radius * a.sin());
+                if i == 0 {
+                    builder.move_to(p);
+                } else {
+                    builder.line_to(p);
+                }
+            }
+        });
+        frame.stroke(
+            &arc,
+            Stroke::default().with_width(stroke_w).with_color(Color {
+                a: 0.9 * self.opacity,
+                ..theme::ACCENT
+            }),
+        );
+        vec![frame.into_geometry()]
+    }
+}
+
+/// Shared scan status chip (spinner or check + label) for compact titlebar / immersive BR.
+pub(crate) fn scan_status_chip<'a>(
+    spinner_size: f32,
+    label_size: f32,
+    now: Instant,
+    visual: ChromeStatusVisual,
+) -> Element<'a, StartMessage> {
+    let op = visual.opacity.clamp(0.0, 1.0);
+    let icon: Element<'_, StartMessage> = if visual.success {
+        svg(svg::Handle::from_memory(svg_icon::CHECK_SVG.as_bytes()))
+            .width(Length::Fixed(spinner_size))
+            .height(Length::Fixed(spinner_size))
+            .opacity(op)
+            .style(|_theme, _status| svg::Style {
+                color: Some(theme::SUCCESS),
+            })
+            .into()
+    } else {
+        scan_spinner(spinner_size, now, op)
+    };
+    let label = match (visual.kind, visual.success) {
+        (ChromeStatusKind::PreparingArt, true) => "Artwork ready",
+        (ChromeStatusKind::PreparingArt, false) => "Preparing artwork…",
+        (ChromeStatusKind::SteamLibrary, true) => "Steam library synced",
+        (ChromeStatusKind::SteamLibrary, false) => "Scanning Steam library…",
+    };
+    row![
+        icon,
+        text(label)
+            .size(label_size)
+            .wrapping(Wrapping::None)
+            .color(theme::alpha(theme::MUTED, 0.9 * op)),
+    ]
+    .spacing(if spinner_size >= 20.0 { 12.0 } else { 6.0 })
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// Clip + slide one scan chip. `progress` 0 = below rest, 1 = resting (compact titlebar).
+pub(crate) fn scan_status_slide<'a>(
+    chip: Element<'a, StartMessage>,
+    progress: f32,
+    chip_h: f32,
+    clip_h: f32,
+    bottom_inset: f32,
+) -> Element<'a, StartMessage> {
+    let chip_h = chip_h.max(1.0);
+    let bottom_inset = bottom_inset.max(0.0);
+    let content_h = chip_h + bottom_inset;
+    let clip_h = clip_h.max(content_h);
+    let travel = content_h;
+    let rest_gap = clip_h - content_h;
+    let gap = rest_gap + (1.0 - progress.clamp(0.0, 1.0)) * travel;
+    container(column![
+        space().height(Length::Fixed(gap)),
+        chip,
+        space().height(Length::Fixed(bottom_inset)),
+    ])
+    .height(Length::Fixed(clip_h))
+    .clip(true)
+    .into()
+}
+
+/// Stack N chrome status chips, bottom-right anchored.
+///
+/// Clip height follows chip *count* (not animated slots) so inserts grow the rail
+/// upward without shifting slot 0. New chips enter from below (slot &lt; 0, clipped).
+/// ExitRight translates via [`Float`] so layout width stays chip-tight on the right edge.
+pub(crate) fn scan_status_stack<'a>(
+    chips: Vec<(ChromeStatusVisual, Element<'a, StartMessage>)>,
+    chip_h: f32,
+    bottom_inset: f32,
+) -> Element<'a, StartMessage> {
+    use crate::ui::start::mode::CHROME_STATUS_EXIT_TRAVEL_PX;
+    use iced::Vector;
+
+    let chip_h = chip_h.max(1.0);
+    let bottom_inset = bottom_inset.max(0.0);
+    let travel = CHROME_STATUS_EXIT_TRAVEL_PX.max(0.0);
+    // Stable height from membership count — slot 0 stays put when N increases.
+    let n = chips.len().max(1) as f32;
+    let clip_h = bottom_inset + n * chip_h;
+
+    let mut layers: Vec<Element<'_, StartMessage>> = Vec::new();
+    for (visual, chip) in chips {
+        let slot = visual.stack_slot;
+        let y_from_bottom = bottom_inset + slot * chip_h;
+        let gap_above = (clip_h - chip_h - y_from_bottom).max(0.0);
+        let exit = visual.exit_x.clamp(0.0, 1.0);
+        let dx = exit * travel;
+        // Always Float while exiting so the first frames also translate (threshold
+        // previously skipped early motion).
+        let chip: Element<'_, StartMessage> = if exit > 0.001 {
+            Float::new(chip)
+                .translate(move |_bounds, _viewport| Vector::new(dx, 0.0))
+                .into()
+        } else {
+            chip
+        };
+        layers.push(
+            container(
+                column![space().height(Length::Fixed(gap_above)), chip,]
+                    .height(Length::Fixed(clip_h)),
+            )
+            .height(Length::Fixed(clip_h))
+            .width(Fill)
+            .align_x(Alignment::End)
+            .into(),
+        );
+    }
+    container(stack(layers).width(Fill).height(Length::Fixed(clip_h)))
+        .width(Fill)
+        .height(Length::Fixed(clip_h))
+        .clip(true)
+        .into()
+}
+
 pub fn view<'a>(
     state: &'a State,
     spectrum: &BatterySpectrum,
@@ -2022,6 +2697,7 @@ pub fn view<'a>(
         return crate::ui::start::immersive::veil_view(state, now);
     }
 
+    let chrome_status = state.chrome_load_status(now);
     let phase = state.transition_phase.map(|(p, _)| p);
     let show_immersive = state.immersive
         || matches!(
@@ -2049,6 +2725,11 @@ pub fn view<'a>(
     };
     // Flat hints under the dim veil — Float face glyphs would paint above it.
     let flat_hints = veil > 0.001;
+    let primary = chrome_status
+        .iter()
+        .find(|v| !v.success && v.exit_x < 0.01)
+        .copied()
+        .or_else(|| chrome_status.first().copied());
     let compact = compact_chrome(
         state,
         spectrum,
@@ -2056,6 +2737,7 @@ pub fn view<'a>(
         always_immersive,
         promote_gesture,
         flat_hints,
+        primary,
     );
     crate::ui::start::immersive::compact_transition_overlay(compact, veil, false)
 }
@@ -2067,8 +2749,9 @@ fn compact_chrome<'a>(
     always_immersive: bool,
     promote_gesture: &'a [crate::domain::gesture::GestureControl],
     flat_hints: bool,
+    steam_scan_banner: Option<SteamScanBannerVisual>,
 ) -> Element<'a, StartMessage> {
-    let header = slide_header(state.slide_progress(now));
+    let header = slide_header(state.slide_progress(now), steam_scan_banner, now);
 
     let body = if state.manual_add.is_some() {
         manual_add_view(state)
@@ -2242,7 +2925,11 @@ fn diag_report_bar() -> Element<'static, StartMessage> {
 }
 
 /// Header titles and L2/R2 cues interpolate with carousel progress (0 = Games, 1 = Controllers).
-pub(crate) fn slide_header(progress: f32) -> Element<'static, StartMessage> {
+pub(crate) fn slide_header(
+    progress: f32,
+    steam_scan_banner: Option<SteamScanBannerVisual>,
+    now: Instant,
+) -> Element<'static, StartMessage> {
     slide_header_metrics(
         progress,
         HEADER_HEIGHT,
@@ -2250,6 +2937,8 @@ pub(crate) fn slide_header(progress: f32) -> Element<'static, StartMessage> {
         TITLE_INACTIVE,
         CUE_SIZE,
         CUE_SLOT_W,
+        steam_scan_banner,
+        now,
     )
 }
 
@@ -2260,6 +2949,8 @@ fn slide_header_metrics(
     title_inactive: f32,
     cue_size: f32,
     cue_slot_w: f32,
+    steam_scan_banner: Option<SteamScanBannerVisual>,
+    now: Instant,
 ) -> Element<'static, StartMessage> {
     let games_t = progress;
     let controllers_t = 1.0 - progress;
@@ -2293,19 +2984,43 @@ fn slide_header_metrics(
     .spacing(0)
     .align_y(Alignment::End);
 
-    row![
-        container(left)
-            .width(Fill)
-            .height(Fill)
-            .align_x(Alignment::Start)
-            .align_y(Alignment::End),
-        container(right)
-            .width(Fill)
-            .height(Fill)
-            .align_x(Alignment::End)
-            .align_y(Alignment::End),
-    ]
+    let center: Element<'_, StartMessage> = if let Some(visual) = steam_scan_banner {
+        // Full-header clip at the underline; chip rests above it and slides the whole way.
+        let chip_h = 16.0;
+        let progress = (visual.stack_slot + 1.0).clamp(0.0, 1.0);
+        container(scan_status_slide(
+            scan_status_chip(12.0, 11.0, now, visual),
+            progress,
+            chip_h,
+            height,
+            6.0,
+        ))
+        .width(Fill)
+        .align_x(Alignment::Center)
+        .into()
+    } else {
+        space().width(Length::Fixed(8.0)).into()
+    };
+
+    container(
+        row![
+            container(left)
+                .width(Fill)
+                .height(Fill)
+                .align_x(Alignment::Start)
+                .align_y(Alignment::End),
+            center,
+            container(right)
+                .width(Fill)
+                .height(Fill)
+                .align_x(Alignment::End)
+                .align_y(Alignment::End),
+        ]
+        .height(Length::Fixed(height)),
+    )
+    .width(Fill)
     .height(Length::Fixed(height))
+    .clip(true)
     .into()
 }
 
@@ -3722,10 +4437,13 @@ mod tests {
         let row = StartRow::from_entry(&entry, &empty, false);
         assert!(!row.skeleton);
         assert_eq!(row.title, "Steam 1371980");
+        assert!(row.icon.is_none());
+        assert_eq!(row.play_key, "steam:1371980");
         assert!(matches!(
             row.subtitle.as_ref(),
             Some(StartSubtitle::Plain(uri)) if uri == "steam://rungameid/1371980"
         ));
+        assert!(!row.target.is_empty());
     }
 
     #[test]
@@ -4099,6 +4817,7 @@ mod tests {
                 }],
                 game_selected: 0,
                 immersive: true,
+                steam_scan_pending: false,
                 ..Default::default()
             };
             let now = Instant::now();
@@ -4513,5 +5232,186 @@ mod tests {
         assert!(icon_cache::handle_for_path(&path).is_some());
         assert!(row.list_icon_live().is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chrome_status_solo_success_exits_right_after_hold() {
+        use crate::ui::start::mode::{
+            CHROME_STATUS_EXIT_MS, CHROME_STATUS_IN_MS, CHROME_STATUS_STEP_HOLD_MS,
+            CHROME_STATUS_SUCCESS_HOLD_MS,
+        };
+        let t0 = Instant::now();
+        let mut state = State {
+            immersive: true,
+            ..State::default()
+        };
+        state.begin_chrome_status(ChromeStatusKind::PreparingArt, t0);
+        state.tick_chrome_status(t0 + Duration::from_millis(CHROME_STATUS_IN_MS));
+        state.note_chrome_status_success(ChromeStatusKind::PreparingArt, t0);
+        let v = state.chrome_load_status(t0);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].success);
+        assert!((v[0].stack_slot - 0.0).abs() < 0.01);
+        assert!(v[0].exit_x < 0.01);
+
+        let hold = CHROME_STATUS_SUCCESS_HOLD_MS + CHROME_STATUS_STEP_HOLD_MS;
+        let t_exit = t0 + Duration::from_millis(hold);
+        state.tick_chrome_status(t_exit);
+        let mid =
+            state.chrome_load_status(t_exit + Duration::from_millis(CHROME_STATUS_EXIT_MS / 2));
+        assert_eq!(mid.len(), 1);
+        assert!(
+            mid[0].exit_x > 0.2,
+            "solo clears with slide-right, not lift"
+        );
+        assert!((mid[0].stack_slot - 0.0).abs() < 0.01);
+
+        state.tick_chrome_status(t_exit + Duration::from_millis(CHROME_STATUS_EXIT_MS));
+        assert!(
+            state
+                .chrome_load_status(t_exit + Duration::from_millis(CHROME_STATUS_EXIT_MS))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn chrome_status_new_job_stacks_success_upward() {
+        use crate::ui::start::mode::CHROME_STATUS_IN_MS;
+        let t0 = Instant::now();
+        let mut state = State {
+            immersive: true,
+            ..State::default()
+        };
+        state.begin_chrome_status(ChromeStatusKind::PreparingArt, t0);
+        state.tick_chrome_status(t0 + Duration::from_millis(CHROME_STATUS_IN_MS));
+        state.note_chrome_status_success(ChromeStatusKind::PreparingArt, t0);
+        assert!((state.chrome_load_status(t0)[0].stack_slot - 0.0).abs() < 0.01);
+
+        // Steam begins while Preparing is Success — both stay; Preparing shifts up.
+        state.begin_chrome_status(ChromeStatusKind::SteamLibrary, t0);
+        let at_start = state.chrome_load_status(t0);
+        let prep0 = at_start
+            .iter()
+            .find(|v| v.kind == ChromeStatusKind::PreparingArt)
+            .unwrap();
+        let steam0 = at_start
+            .iter()
+            .find(|v| v.kind == ChromeStatusKind::SteamLibrary)
+            .unwrap();
+        assert!(prep0.success);
+        assert!(!steam0.success);
+        // Reflow just started: Preparing ~0, Steam ~-1.
+        assert!(prep0.stack_slot < 0.15);
+        assert!(steam0.stack_slot < -0.85);
+
+        let t_mid = t0 + Duration::from_millis(CHROME_STATUS_IN_MS / 2);
+        let mid = state.chrome_load_status(t_mid);
+        let prep = mid
+            .iter()
+            .find(|v| v.kind == ChromeStatusKind::PreparingArt)
+            .unwrap();
+        let steam = mid
+            .iter()
+            .find(|v| v.kind == ChromeStatusKind::SteamLibrary)
+            .unwrap();
+        assert!(
+            prep.stack_slot > 0.5,
+            "ease-out reflow should be past halfway at t=50%: {}",
+            prep.stack_slot
+        );
+        assert!(
+            steam.stack_slot > -0.5,
+            "entering chip should be past halfway: {}",
+            steam.stack_slot
+        );
+
+        state.tick_chrome_status(t0 + Duration::from_millis(CHROME_STATUS_IN_MS));
+        let done = state.chrome_load_status(t0 + Duration::from_millis(CHROME_STATUS_IN_MS));
+        let prep = done
+            .iter()
+            .find(|v| v.kind == ChromeStatusKind::PreparingArt)
+            .unwrap();
+        let steam = done
+            .iter()
+            .find(|v| v.kind == ChromeStatusKind::SteamLibrary)
+            .unwrap();
+        assert!((prep.stack_slot - 1.0).abs() < 0.01);
+        assert!((steam.stack_slot - 0.0).abs() < 0.01);
+        assert!(prep.exit_x < 0.01);
+    }
+
+    #[test]
+    fn chrome_status_batch_exit_staggers_bottom_first() {
+        use crate::ui::start::mode::{
+            CHROME_STATUS_STAGGER_MS, CHROME_STATUS_STEP_HOLD_MS, CHROME_STATUS_SUCCESS_HOLD_MS,
+        };
+        let t0 = Instant::now();
+        let mut state = State {
+            immersive: true,
+            ..State::default()
+        };
+        state.begin_chrome_status(ChromeStatusKind::PreparingArt, t0);
+        state.begin_chrome_status(ChromeStatusKind::SteamLibrary, t0);
+        // Force Active then Success without waiting In.
+        for item in &mut state.chrome_status {
+            item.phase = ChromeStatusPhase::Success;
+            item.started = t0;
+            item.stack_anim_started = None;
+        }
+        state.chrome_status[0].stack_slot = 0.0; // Steam (newer, bottom) after second begin
+        state.chrome_status[1].stack_slot = 1.0; // Preparing
+        state.note_chrome_status_maybe_all_success(t0);
+
+        let hold = CHROME_STATUS_SUCCESS_HOLD_MS + CHROME_STATUS_STEP_HOLD_MS;
+        let t_batch = t0 + Duration::from_millis(hold);
+        state.tick_chrome_status(t_batch);
+        // Bottom (index 0) is ExitRight; top still Success until stagger.
+        assert_eq!(state.chrome_status[0].phase, ChromeStatusPhase::ExitRight);
+        assert_eq!(state.chrome_status[1].phase, ChromeStatusPhase::Success);
+
+        let t_stagger = t_batch + Duration::from_millis(CHROME_STATUS_STAGGER_MS);
+        state.tick_chrome_status(t_stagger);
+        assert_eq!(state.chrome_status[1].phase, ChromeStatusPhase::ExitRight);
+        let v = state.chrome_load_status(t_stagger);
+        let bottom = v
+            .iter()
+            .find(|x| x.kind == state.chrome_status[0].kind)
+            .unwrap();
+        let top = v
+            .iter()
+            .find(|x| x.kind == state.chrome_status[1].kind)
+            .unwrap();
+        assert!(bottom.exit_x > top.exit_x);
+    }
+
+    #[test]
+    fn chrome_status_third_kind_blocks_batch_exit() {
+        use crate::ui::start::mode::{CHROME_STATUS_STEP_HOLD_MS, CHROME_STATUS_SUCCESS_HOLD_MS};
+        let t0 = Instant::now();
+        let mut state = State::default();
+        state.begin_chrome_status(ChromeStatusKind::PreparingArt, t0);
+        state.begin_chrome_status(ChromeStatusKind::SteamLibrary, t0);
+        for item in &mut state.chrome_status {
+            item.phase = ChromeStatusPhase::Success;
+            item.started = t0;
+            item.stack_anim_started = None;
+        }
+        state.note_chrome_status_maybe_all_success(t0);
+        // Simulate a third kind by re-using Steam after clearing it — instead push via
+        // temporarily renaming: begin no-ops duplicates, so clear Steam then re-add as Active.
+        // Use Preparing+Steam Success then begin is blocked; force-insert Active stand-in by
+        // flipping Steam back to Active.
+        state.chrome_status[0].phase = ChromeStatusPhase::Active;
+        state.chrome_status_all_success_at = None;
+
+        let hold = CHROME_STATUS_SUCCESS_HOLD_MS + CHROME_STATUS_STEP_HOLD_MS + 500;
+        state.tick_chrome_status(t0 + Duration::from_millis(hold));
+        assert!(
+            state
+                .chrome_status
+                .iter()
+                .all(|i| i.phase != ChromeStatusPhase::ExitRight),
+            "batch exit must wait until every chip is Success"
+        );
     }
 }

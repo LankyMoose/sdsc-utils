@@ -30,20 +30,26 @@ enum LibraryFolderSource {
     BaseInstall,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SteamGame {
     pub appid: u32,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_path: Option<PathBuf>,
     /// Landscape hero/header art for immersive backdrops (when present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backdrop_path: Option<PathBuf>,
     /// Lifetime playtime from `localconfig.vdf`, in minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playtime_minutes: Option<u32>,
     /// Newest of manifest / localconfig `LastPlayed` (unix seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_played_unix: Option<u64>,
     /// Install size from the appmanifest (`SizeOnDisk`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
     /// Manifest `StateFlags` has the update-required bit set.
+    #[serde(default)]
     pub update_required: bool,
 }
 

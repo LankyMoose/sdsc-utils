@@ -59,6 +59,12 @@ fn read_port() -> Result<u16, String> {
         .map_err(|_| format!("invalid ipc port file: {text}"))
 }
 
+/// True when the service has published a listening port (no TCP connect — probes
+/// must not register as shell clients or they can steal latched OpenStart).
+pub fn service_endpoint_ready() -> bool {
+    read_port().is_ok_and(|p| p > 1)
+}
+
 type ClientList = Arc<Mutex<Vec<Sender<ServiceMessage>>>>;
 
 /// Accepts shell/CLI clients; reconnects after disconnect. Broadcasts to all.
