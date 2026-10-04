@@ -3266,14 +3266,7 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
                 .color(theme::MUTED)
                 .into()
         } else {
-            row![
-                text("No games yet — press").size(15.0).color(theme::MUTED),
-                face_svg(FaceButton::Triangle, FACE_GLYPH_SIZE),
-                text("to edit.").size(15.0).color(theme::MUTED),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center)
-            .into()
+            empty_games_browse_prompt(state, 15.0)
         };
         return container(empty)
             .width(Fill)
@@ -3567,6 +3560,32 @@ struct ActionHint {
     pressed: bool,
     /// 0..=1 animated press amount (drives layout-stable scale).
     press_t: f32,
+}
+
+/// Empty browse Games list: "press [△] to edit" with the standard ringed face glyph.
+pub(crate) fn empty_games_browse_prompt(
+    state: &State,
+    text_size: f32,
+) -> Element<'static, StartMessage> {
+    let press = HintPress::for_owner(state, HintPressOwner::Browse);
+    let face = FaceButton::Triangle;
+    let style = if face.held(press.held) {
+        RingStyle::Pressed
+    } else {
+        RingStyle::Idle
+    };
+    // Flat: body prompt must not Float-scale (same stacking constraint as dock glyphs).
+    let glyph = face_glyph(face, style, press.press_anim.for_face(face), true);
+    row![
+        text("No games yet — press")
+            .size(text_size)
+            .color(theme::MUTED),
+        glyph,
+        text("to edit.").size(text_size).color(theme::MUTED),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn face_hint(
