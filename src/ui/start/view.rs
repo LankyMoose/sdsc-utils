@@ -38,6 +38,10 @@ const HEADER_HEIGHT: f32 = 36.0;
 /// Matches the Games footer band (face-cycle toggle + face hints).
 const FOOTER_HEIGHT: f32 = 32.0;
 const IMMERSIVE_FOOTER_HEIGHT: f32 = 44.0;
+/// Gap inside the secondary (left) footer cluster.
+const FOOTER_SECONDARY_GAP: f32 = 14.0;
+/// Immersive split footer min width so left/right packing reads clearly.
+const FOOTER_SPLIT_MIN_W: f32 = 560.0;
 const TITLE_ACTIVE: f32 = 20.0;
 const TITLE_INACTIVE: f32 = 15.0;
 const CUE_SIZE: f32 = 14.0;
@@ -3659,6 +3663,7 @@ pub(crate) fn footer_hint<'a>(
                 flat_hints,
             ),
             immersive,
+            false,
         );
     }
     if state.replace_confirm.is_some() {
@@ -3679,6 +3684,7 @@ pub(crate) fn footer_hint<'a>(
                 flat_hints,
             ),
             immersive,
+            false,
         );
     }
 
@@ -3705,101 +3711,136 @@ pub(crate) fn footer_hint<'a>(
         )
     });
 
-    let cluster: Element<'_, StartMessage> = match state.slide {
-        StartSlide::Games => {
-            let hints = [
-                face_hint(
-                    FaceButton::Triangle,
-                    if state.editing { "Save" } else { "Edit" },
-                    press.held,
-                    press.press_anim,
-                ),
-                face_hint(
-                    FaceButton::Circle,
-                    circle_label,
-                    press.held,
-                    press.press_anim,
-                ),
-            ];
-            if state.editing {
-                // Add shortcut first, then Save / Cancel.
-                iced::widget::row![
-                    button(text("Add shortcut…").size(14.0).color(theme::ACCENT))
-                        .padding([6, 12])
-                        .on_press(StartMessage::AddShortcut)
-                        .style(theme::ghost),
-                    action_cluster(&hints, flat_hints),
-                ]
-                .spacing(28)
-                .align_y(Alignment::Center)
-                .into()
-            } else {
-                let mut row = iced::widget::row![face_cycle_toggle(
-                    FaceButton::Square,
-                    press.held,
-                    press.press_anim,
-                    &[
-                        (
-                            "Last played",
-                            matches!(state.sort_mode, GamesSortMode::LastPlayed),
+    // Split layout: secondary (view / Immersive / Settings) left, primary actions right.
+    let (secondary, actions): (Element<'a, StartMessage>, Element<'a, StartMessage>) =
+        match state.slide {
+            StartSlide::Games => {
+                let hints = [
+                    face_hint(
+                        FaceButton::Triangle,
+                        if state.editing { "Save" } else { "Edit" },
+                        press.held,
+                        press.press_anim,
+                    ),
+                    face_hint(
+                        FaceButton::Circle,
+                        circle_label,
+                        press.held,
+                        press.press_anim,
+                    ),
+                ];
+                let actions = action_cluster(&hints, flat_hints);
+                if state.editing {
+                    (
+                        button(text("Add shortcut…").size(14.0).color(theme::ACCENT))
+                            .padding([6, 12])
+                            .on_press(StartMessage::AddShortcut)
+                            .style(theme::ghost)
+                            .into(),
+                        actions,
+                    )
+                } else {
+                    (
+                        footer_secondary_row(
+                            Some(face_cycle_toggle(
+                                FaceButton::Square,
+                                press.held,
+                                press.press_anim,
+                                &[
+                                    (
+                                        "Last played",
+                                        matches!(state.sort_mode, GamesSortMode::LastPlayed),
+                                    ),
+                                    (
+                                        "A–Z",
+                                        matches!(state.sort_mode, GamesSortMode::Alphabetical),
+                                    ),
+                                ],
+                                flat_hints,
+                            )),
+                            promote_cue,
+                            Some(options_hint_el(
+                                "Settings",
+                                press.held,
+                                press.press_anim,
+                                flat_hints,
+                            )),
                         ),
-                        (
-                            "A–Z",
-                            matches!(state.sort_mode, GamesSortMode::Alphabetical),
-                        ),
-                    ],
-                    flat_hints,
-                ),]
-                .spacing(28)
-                .align_y(Alignment::Center);
-                if let Some(cue) = promote_cue {
-                    row = row.push(cue);
+                        actions,
+                    )
                 }
-                row = row.push(options_hint_el(
-                    "Settings",
-                    press.held,
-                    press.press_anim,
+            }
+            StartSlide::Controllers => (
+                footer_secondary_row(
+                    Some(face_cycle_toggle(
+                        FaceButton::Square,
+                        press.held,
+                        press.press_anim,
+                        &[
+                            ("Connected", !state.show_all_controllers),
+                            ("All", state.show_all_controllers),
+                        ],
+                        flat_hints,
+                    )),
+                    promote_cue,
+                    Some(options_hint_el(
+                        "Settings",
+                        press.held,
+                        press.press_anim,
+                        flat_hints,
+                    )),
+                ),
+                action_cluster(
+                    &[face_hint(
+                        FaceButton::Circle,
+                        circle_label,
+                        press.held,
+                        press.press_anim,
+                    )],
                     flat_hints,
-                ));
-                row.push(action_cluster(&hints, flat_hints)).into()
-            }
-        }
-        StartSlide::Controllers => {
-            let mut row = iced::widget::row![face_cycle_toggle(
-                FaceButton::Square,
-                press.held,
-                press.press_anim,
-                &[
-                    ("Connected", !state.show_all_controllers),
-                    ("All", state.show_all_controllers),
-                ],
-                flat_hints,
-            ),]
-            .spacing(28)
-            .align_y(Alignment::Center);
-            if let Some(cue) = promote_cue {
-                row = row.push(cue);
-            }
-            row = row.push(options_hint_el(
-                "Settings",
-                press.held,
-                press.press_anim,
-                flat_hints,
-            ));
-            row.push(action_cluster(
-                &[face_hint(
-                    FaceButton::Circle,
-                    circle_label,
-                    press.held,
-                    press.press_anim,
-                )],
-                flat_hints,
-            ))
-            .into()
-        }
-    };
+                ),
+            ),
+        };
 
-    footer_band(cluster, immersive)
+    footer_band(compose_footer_split(secondary, actions), immersive, true)
+}
+
+fn footer_secondary_row<'a>(
+    view: Option<Element<'a, StartMessage>>,
+    promote: Option<Element<'a, StartMessage>>,
+    settings: Option<Element<'a, StartMessage>>,
+) -> Element<'a, StartMessage> {
+    let mut row = iced::widget::row![]
+        .spacing(FOOTER_SECONDARY_GAP)
+        .align_y(Alignment::Center);
+    if let Some(view) = view {
+        row = row.push(view);
+    }
+    if let Some(cue) = promote {
+        row = row.push(cue);
+    }
+    if let Some(settings) = settings {
+        row = row.push(settings);
+    }
+    row.into()
+}
+
+fn compose_footer_split<'a>(
+    secondary: Element<'a, StartMessage>,
+    actions: Element<'a, StartMessage>,
+) -> Element<'a, StartMessage> {
+    iced::widget::row![
+        container(secondary)
+            .width(Fill)
+            .align_x(Alignment::Start)
+            .align_y(Alignment::Center),
+        container(actions)
+            .align_x(Alignment::End)
+            .align_y(Alignment::Center),
+    ]
+    .width(Fill)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn options_hint_el(
@@ -3978,20 +4019,28 @@ fn hint_element_capsule(
     }
 }
 
-fn footer_band(content: Element<'_, StartMessage>, immersive: bool) -> Element<'_, StartMessage> {
+fn footer_band(
+    content: Element<'_, StartMessage>,
+    immersive: bool,
+    expand_immersive: bool,
+) -> Element<'_, StartMessage> {
     let height = if immersive {
         IMMERSIVE_FOOTER_HEIGHT
     } else {
         FOOTER_HEIGHT
     };
-    // Immersive: shrink to the action cluster so the footer capsule hugs content.
-    // Compact: fill the footer band as before.
+    // Immersive modals: hug the action cluster. Browse split: widen so left/right pack.
+    // Compact: fill the footer band.
     let band = container(content)
         .height(Length::Fixed(height))
         .align_x(Alignment::Center)
         .align_y(Alignment::Center);
     if immersive {
-        band.into()
+        if expand_immersive {
+            band.width(Length::Fixed(FOOTER_SPLIT_MIN_W)).into()
+        } else {
+            band.into()
+        }
     } else {
         band.width(Fill).into()
     }
