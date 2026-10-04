@@ -401,15 +401,16 @@ fn games_stage(
     let bar = crate::ui::start::position::view(crate::ui::start::position::BarSpec {
         labels: crate::ui::start::position::labels(mode),
         visual: state.position_section_visual(now),
-        opacity: list_opacity * state.position_bar_visibility(now),
+        opacity: list_opacity * state.position_bar_opacity(now),
+        slide: state.position_bar_slide(now),
     });
 
     // Titles sit beside heroes; Launch/Close/edit cues overlay the selected capsule.
     row![
         container(bar).padding(Padding {
-            top: 36.0,
+            top: 0.0,
             right: 0.0,
-            bottom: 36.0,
+            bottom: 0.0,
             left: EDGE_PAD,
         }),
         container(strip).padding(Padding {

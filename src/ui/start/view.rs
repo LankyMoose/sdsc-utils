@@ -607,10 +607,12 @@ struct PositionSectionAnim {
     started: Instant,
 }
 
-/// Fade-in when the position bar reappears after being hidden.
+/// Horizontal show/hide of the position bar (0 = off the left edge, 1 = resting).
+/// `opacity_from` eases to `to` over position::OPACITY_MS, ahead of the slide.
 #[derive(Debug, Clone)]
-struct PositionVisAnim {
+struct PositionSlideAnim {
     from: f32,
+    opacity_from: f32,
     to: f32,
     started: Instant,
 }
@@ -759,12 +761,14 @@ pub struct State {
     anim: Option<SlideAnim>,
     dock_anim: Option<DockAnim>,
     strip_anim: Option<StripAnim>,
-    /// In-flight section index chase (None = settled on the current section).
+    /// In-flight section index chase (None = settled on position_section_at).
     position_section: Option<PositionSectionAnim>,
+    /// Last settled section index. Not the live target; a chase starts from here.
+    position_section_at: f32,
     /// Last games-strip scroll / section change (drives auto-hide).
     position_bar_last_scroll: Option<Instant>,
-    /// Fade-in while re-showing; hide uses [position::visibility_after_idle].
-    position_bar_vis: Option<PositionVisAnim>,
+    /// Slide in from the left / out to the left. None = settled.
+    position_bar_slide: Option<PositionSlideAnim>,
     /// Seconds for ambient shader time uniform.
     pub ambient_time: f32,
     /// Incoming backdrop land/crossfade (`started = None` = waiting for peek art).
@@ -853,8 +857,9 @@ impl Default for State {
             dock_anim: None,
             strip_anim: None,
             position_section: None,
+            position_section_at: 0.0,
             position_bar_last_scroll: None,
-            position_bar_vis: None,
+            position_bar_slide: None,
             ambient_time: 0.0,
             backdrop_current: None,
             backdrop_outgoing: None,
@@ -876,7 +881,7 @@ impl State {
         } else {
             self.game_selected = self.game_selected.min(self.rows.len() - 1);
         }
-        self.sync_position_section(Instant::now(), crate::ui::start::vstrip::STRIP_ANIM_MS);
+        self.snap_position_section();
     }
 
     pub fn set_controllers(&mut self, controllers: Vec<StartControllerRow>) {
@@ -985,18 +990,18 @@ impl State {
     pub fn select_game_by_play_key(&mut self, play_key: Option<&str>) {
         if self.rows.is_empty() {
             self.game_selected = 0;
-            self.sync_position_section(Instant::now(), crate::ui::start::vstrip::STRIP_ANIM_MS);
+            self.snap_position_section();
             return;
         }
         if let Some(key) = play_key
             && let Some(i) = self.rows.iter().position(|r| r.play_key == key)
         {
             self.game_selected = i;
-            self.sync_position_section(Instant::now(), crate::ui::start::vstrip::STRIP_ANIM_MS);
+            self.snap_position_section();
             return;
         }
         self.game_selected = 0;
-        self.sync_position_section(Instant::now(), crate::ui::start::vstrip::STRIP_ANIM_MS);
+        self.snap_position_section();
     }
 
     /// Remember the current games selection’s `play_key` for edit enter/exit restore.
@@ -1019,9 +1024,9 @@ impl State {
         self.anim = None;
         self.dock_anim = None;
         self.strip_anim = None;
-        self.position_section = None;
         self.position_bar_last_scroll = None;
-        self.position_bar_vis = None;
+        self.position_bar_slide = None;
+        self.snap_position_section();
         self.dock_expanded = false;
         self.replace_confirm = None;
         self.manual_add = None;
@@ -1217,9 +1222,13 @@ impl State {
     }
 
     /// Eased fractional section index (active label centered in the position bar).
+    ///
+    /// When no chase is in flight this is the last settled index, not the live
+    /// target. The target already follows game_selected, so reading it here
+    /// would skip the slide (the games strip has the same trap).
     pub(crate) fn position_section_visual(&self, now: Instant) -> f32 {
         let Some(anim) = &self.position_section else {
-            return self.position_section_target();
+            return self.position_section_at;
         };
         let t = (now.saturating_duration_since(anim.started).as_secs_f32()
             / (anim.duration_ms.max(1) as f32 / 1000.0))
@@ -1228,21 +1237,29 @@ impl State {
         anim.from + (anim.to - anim.from) * eased
     }
 
-    /// Show/hide opacity for the position bar (1 = fully visible).
-    pub(crate) fn position_bar_visibility(&self, now: Instant) -> f32 {
-        use crate::ui::start::position::{FADE_MS, visibility_after_idle};
-        if let Some(anim) = &self.position_bar_vis {
-            let t = (now.saturating_duration_since(anim.started).as_secs_f32()
-                / (FADE_MS.max(1) as f32 / 1000.0))
-                .clamp(0.0, 1.0);
-            let eased = window_layout::ease_out_cubic(t);
-            return anim.from + (anim.to - anim.from) * eased;
+    /// Horizontal show amount: 0 is off the left edge, 1 is resting.
+    pub(crate) fn position_bar_slide(&self, now: Instant) -> f32 {
+        self.position_bar_show(now).0
+    }
+
+    /// Show/hide opacity. Reaches the target over position::OPACITY_MS, before the slide.
+    pub(crate) fn position_bar_opacity(&self, now: Instant) -> f32 {
+        self.position_bar_show(now).1
+    }
+
+    fn position_bar_show(&self, now: Instant) -> (f32, f32) {
+        use crate::ui::start::position::{FADE_MS, OPACITY_MS, show_hide_amount};
+        if let Some(anim) = &self.position_bar_slide {
+            let elapsed = now.saturating_duration_since(anim.started).as_millis() as u64;
+            let slide = show_hide_amount(anim.from, anim.to, elapsed, FADE_MS);
+            let opacity = show_hide_amount(anim.opacity_from, anim.to, elapsed, OPACITY_MS);
+            return (slide, opacity);
         }
-        let Some(last) = self.position_bar_last_scroll else {
-            return 0.0;
-        };
-        let elapsed = now.saturating_duration_since(last).as_millis() as u64;
-        visibility_after_idle(elapsed)
+        if self.position_bar_last_scroll.is_some() {
+            (1.0, 1.0)
+        } else {
+            (0.0, 0.0)
+        }
     }
 
     fn position_section_target(&self) -> f32 {
@@ -1262,21 +1279,22 @@ impl State {
     }
 
     fn note_position_bar_scroll(&mut self, now: Instant) {
-        let current = self.position_bar_visibility(now);
+        let (current, current_op) = self.position_bar_show(now);
         self.position_bar_last_scroll = Some(now);
-        if current >= 0.99 {
-            self.position_bar_vis = None;
+        if current >= 0.99 && current_op >= 0.99 {
+            self.position_bar_slide = None;
             return;
         }
         if self
-            .position_bar_vis
+            .position_bar_slide
             .as_ref()
             .is_some_and(|anim| (anim.to - 1.0).abs() < 0.01)
         {
             return;
         }
-        self.position_bar_vis = Some(PositionVisAnim {
+        self.position_bar_slide = Some(PositionSlideAnim {
             from: current,
+            opacity_from: current_op,
             to: 1.0,
             started: now,
         });
@@ -1288,6 +1306,7 @@ impl State {
         let current = self.position_section_visual(now);
         if (current - target).abs() < 0.004 {
             self.position_section = None;
+            self.position_section_at = target;
             return;
         }
         if self
@@ -1304,14 +1323,21 @@ impl State {
             started: now,
         });
     }
+
+    /// Jump to the current section with no notch slide (catalog reload / restore).
+    fn snap_position_section(&mut self) {
+        self.position_section = None;
+        self.position_section_at = self.position_section_target();
+    }
+
     /// Clear dock/strip/transition and ambient (close / leave immersive fully).
     pub fn clear_immersive_session(&mut self) {
         self.dock_expanded = false;
         self.dock_anim = None;
         self.strip_anim = None;
-        self.position_section = None;
         self.position_bar_last_scroll = None;
-        self.position_bar_vis = None;
+        self.position_bar_slide = None;
+        self.snap_position_section();
         self.settings.reset();
         self.transition = None;
         self.transition_phase = None;
@@ -1419,9 +1445,9 @@ impl State {
         use crate::ui::start::mode::TransitionPhase;
         self.dock_anim = None;
         self.strip_anim = None;
-        self.position_section = None;
         self.position_bar_last_scroll = None;
-        self.position_bar_vis = None;
+        self.position_bar_slide = None;
+        self.snap_position_section();
         self.transition_phase = Some((phase, now));
         if matches!(phase, TransitionPhase::EnterImmersive) {
             self.enter_reveal = Some(EnterRevealClock {
@@ -2534,27 +2560,37 @@ impl State {
                 busy = true;
             }
         }
-        if let Some(anim) = self.position_section.as_ref() {
+        if let Some(anim) = self.position_section.take() {
             let elapsed = now.saturating_duration_since(anim.started);
             if elapsed >= Duration::from_millis(anim.duration_ms) {
-                self.position_section = None;
+                self.position_section_at = anim.to;
             } else {
+                self.position_section = Some(anim);
                 busy = true;
             }
         }
-        if let Some(anim) = self.position_bar_vis.as_ref() {
-            use crate::ui::start::position::FADE_MS;
+        if let Some(anim) = self.position_bar_slide.take() {
             let elapsed = now.saturating_duration_since(anim.started);
-            if elapsed >= Duration::from_millis(FADE_MS) {
-                // Settled at to=1; idle hide is computed from last_scroll.
-                self.position_bar_vis = None;
+            if elapsed >= Duration::from_millis(crate::ui::start::position::FADE_MS) {
+                if anim.to < 0.01 {
+                    self.position_bar_last_scroll = None;
+                }
             } else {
+                self.position_bar_slide = Some(anim);
                 busy = true;
             }
         } else if let Some(last) = self.position_bar_last_scroll {
-            use crate::ui::start::position::{FADE_MS, HIDE_AFTER_MS};
+            use crate::ui::start::position::HIDE_AFTER_MS;
             let elapsed = now.saturating_duration_since(last).as_millis() as u64;
-            if elapsed < HIDE_AFTER_MS + FADE_MS {
+            if elapsed >= HIDE_AFTER_MS {
+                self.position_bar_slide = Some(PositionSlideAnim {
+                    from: 1.0,
+                    opacity_from: 1.0,
+                    to: 0.0,
+                    started: now,
+                });
+                busy = true;
+            } else {
                 busy = true;
             }
         }
