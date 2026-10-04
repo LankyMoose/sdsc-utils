@@ -2201,6 +2201,21 @@ impl App {
     // Start screen
     // -----------------------------------------------------------------------
 
+    fn effective_played_ms(&self, entry: &crate::games::GameEntry) -> Option<u64> {
+        let catalog_ms = self.games.last_played(entry).unwrap_or(0);
+        let steam_ms = match entry {
+            crate::games::GameEntry::Steam { appid } => self
+                .steam_by_id
+                .get(appid)
+                .and_then(|g| g.last_played_unix)
+                .map(|secs| secs.saturating_mul(1000))
+                .unwrap_or(0),
+            crate::games::GameEntry::Manual { .. } => 0,
+        };
+        let ms = catalog_ms.max(steam_ms);
+        (ms > 0).then_some(ms)
+    }
+
     fn display_catalog(&self) -> Vec<crate::games::GameEntry> {
         let steam_by_id = &self.steam_by_id;
         self.games.merge_sorted(
@@ -2237,11 +2252,13 @@ impl App {
             self.display_catalog()
                 .iter()
                 .map(|entry| {
-                    start_view::StartRow::from_entry(
+                    let mut row = start_view::StartRow::from_entry(
                         entry,
                         &self.steam_by_id,
                         self.steam_scan_pending,
-                    )
+                    );
+                    row.played_at_ms = self.effective_played_ms(entry);
+                    row
                 })
                 .collect()
         };

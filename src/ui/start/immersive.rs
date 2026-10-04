@@ -20,7 +20,7 @@ use std::time::Instant;
 
 const EDGE_PAD: f32 = 16.0;
 /// ~1″ inset for the games strip from the left window edge (96 logical px / inch).
-const STRIP_LEFT_PAD: f32 = 96.0;
+const STRIP_AFTER_BAR: f32 = 12.0;
 /// Minimum gap from ring outer edge → peek column edge (also sizes peek width for max ring).
 const DOCK_RING_INSET: f32 = 6.0;
 const DOCK_RING_MIN: f32 = 52.0;
@@ -396,13 +396,30 @@ fn games_stage(
         .width(Length::Fixed(metrics.slot_w))
         .height(Fill);
 
+    let mode = state.games_section_mode();
+
+    let bar = crate::ui::start::position::view(crate::ui::start::position::BarSpec {
+        labels: crate::ui::start::position::labels(mode),
+        visual: state.position_section_visual(now),
+        reveal: list_opacity,
+        show_opacity: state.position_bar_opacity(now),
+        slide: state.position_bar_slide(now),
+        motion: state.position_bar_motion(),
+    });
+
     // Titles sit beside heroes; Launch/Close/edit cues overlay the selected capsule.
     row![
+        container(bar).padding(Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: EDGE_PAD,
+        }),
         container(strip).padding(Padding {
             top: 0.0,
             right: 0.0,
             bottom: 0.0,
-            left: STRIP_LEFT_PAD,
+            left: STRIP_AFTER_BAR,
         }),
         space().width(Fill),
     ]
