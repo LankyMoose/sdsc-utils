@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Connected toasts are skipped for controllers already connected when the app starts.
+- Configure System footer: GitHub icon fill matches the Microsoft Store bag (`#F2F2F2`); both footer link icons use 0.8 opacity until hovered.
 
 ## [1.5.2] - 2026-10-03
 
