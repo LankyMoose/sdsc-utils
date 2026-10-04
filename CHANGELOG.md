@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A bad game, controller, or analytics record no longer discards the rest of that file. When nothing in the file can be loaded, the original is copied to `*.json.bak` before any later save replaces it.
+- Pad input no longer stalls for ~5s when Windows `hidapi_refresh` blocks while Start is hot; open pads keep sampling and F8 hitch marks in shell-client mode report IPC pad context instead of misleading `NeverPublished`.
 
 ### Changed
 
