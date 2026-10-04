@@ -242,7 +242,7 @@ fn stage_backdrop_layers<'a>(state: &'a State, now: Instant) -> Vec<Element<'a, 
     // Soft rectangular edge vignette over atmosphere/splash only — games strip,
     // dock, footer, settings, and status chips paint above this stack.
     layers.push(
-        shader(VignetteProgram::new(1.0))
+        shader(VignetteProgram::new(0.55))
             .width(Fill)
             .height(Fill)
             .into(),

@@ -7,10 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Immersive Start paints a soft rectangular edge vignette over atmosphere/splash only (games strip, dock, and footer stay undimmed).
-
 ### Fixed
 
 - A bad game, controller, or analytics record no longer discards the rest of that file. When nothing in the file can be loaded, the original is copied to `*.json.bak` before any later save replaces it.

@@ -32,13 +32,13 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // Rectangular edge falloff (inner shadow): 0 at center axes, 1 at borders.
     let p = abs(uv * 2.0 - 1.0);
     // How far inward the soft edge reaches (NDC units).
-    let soft = 0.52;
+    let soft = 0.38;
     let ax = smoothstep(1.0 - soft, 1.0, p.x);
     let ay = smoothstep(1.0 - soft, 1.0, p.y);
     // Prefer max for a rectangular frame; light corner boost without a hard box.
     let edge = max(ax, ay);
     let corner = ax * ay;
-    let alpha = clamp(edge * 0.72 + corner * 0.28, 0.0, 0.82) * clamp(u.strength, 0.0, 1.0);
+    let alpha = clamp(edge * 0.55 + corner * 0.20, 0.0, 0.50) * clamp(u.strength, 0.0, 1.0);
     // Straight-alpha black; pipeline uses ALPHA_BLENDING.
     return vec4<f32>(0.0, 0.0, 0.0, alpha);
 }
