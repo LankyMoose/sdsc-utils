@@ -3798,7 +3798,7 @@ pub(crate) fn empty_games_browse_prompt(
     // Flat: body prompt must not Float-scale (same stacking constraint as dock glyphs).
     let glyph = face_glyph(face, style, press.press_anim.for_face(face), true);
     row![
-        text("No games yet — press")
+        text("No games yet - press")
             .size(text_size)
             .color(theme::MUTED),
         glyph,
