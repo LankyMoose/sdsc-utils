@@ -7,7 +7,7 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 ## Screenshots
 
 <p align="center">
-  <img src="assets/screenshots/start-immersive-mode.png" alt="Immersive Start screen / Game launcher" width="420" />
+  <img src="assets/screenshots/start-immersive-mode.png" alt="Immersive Start screen / Game launcher" width="640" />
 </p>
 
 <p align="center">Immersive Start screen / Game launcher</p>
