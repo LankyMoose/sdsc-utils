@@ -7,16 +7,16 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 ## Screenshots
 
 <p align="center">
-  <img src="assets/screenshots/controller-list.png" alt="Controller popup with battery rings and ETA" width="420" />
+  <img src="assets/screenshots/start-immersive-mode.png" alt="Immersive Start screen / Game launcher" width="420" />
 </p>
 
-<p align="center">Controller popup — battery %, remaining-time estimate, Identify / Turn off, and Remember</p>
+<p align="center">Immersive Start screen / Game launcher</p>
 
 <p align="center">
-  <img src="assets/screenshots/start-games-list.png" alt="Start screen Games list" width="520" />
+  <img src="assets/screenshots/start-games-list.png" alt="Compact Start screen Games list" width="520" />
 </p>
 
-<p align="center">Start screen — Games list with DualSense Launch, sort, Edit, and Close hints</p>
+<p align="center">Compact Start screen — Games list with DualSense Launch, sort, Edit, and Close hints</p>
 
 <p align="center">
   <img src="assets/screenshots/start-games-list-edit.png" alt="Start screen Games edit mode" width="360" />
@@ -25,6 +25,12 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 </p>
 
 <p align="center">Edit catalog (Steam checklist) and Controllers tab (Identify / Power off)</p>
+
+<p align="center">
+  <img src="assets/screenshots/controller-list.png" alt="Controller popup with battery rings and ETA" width="420" />
+</p>
+
+<p align="center">Controller popup — battery %, remaining-time estimate, Identify / Turn off, and Remember</p>
 
 <p align="center">
   <img src="assets/screenshots/configuration-lightbar.png" alt="Settings lightbar spectrum editor" width="520" />
