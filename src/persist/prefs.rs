@@ -70,8 +70,8 @@ pub struct Prefs {
     /// Open the start-screen launcher on 0→1 connect / reopen gesture (default on).
     #[serde(default = "default_true")]
     pub start_screen_enabled: bool,
-    /// Always use immersive Start (never show compact; cancel closes) (default off).
-    #[serde(default)]
+    /// Always use immersive Start (never show compact; cancel closes) (default on).
+    #[serde(default = "default_true")]
     pub start_screen_always_immersive: bool,
     /// Immersive idle dim after this many seconds (default 30). Snapped to idle steps.
     #[serde(default = "default_start_screen_inactive_secs")]
@@ -242,7 +242,7 @@ impl Default for Prefs {
             analytics_enabled: false,
             lightbar_enabled: true,
             start_screen_enabled: true,
-            start_screen_always_immersive: false,
+            start_screen_always_immersive: true,
             start_screen_inactive_secs: default_start_screen_inactive_secs(),
             start_screen_sleep_secs: default_start_screen_sleep_secs(),
             start_screen_inactive_dim_percent: default_start_screen_inactive_dim_percent(),
@@ -482,10 +482,20 @@ mod tests {
     }
 
     #[test]
-    fn older_prefs_default_start_screen_always_immersive_off() {
+    fn missing_start_screen_always_immersive_defaults_on() {
         let prefs: Prefs =
             serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":["ps"]}"#)
                 .unwrap();
+        assert!(prefs.start_screen_always_immersive);
+        assert!(Prefs::default().start_screen_always_immersive);
+    }
+
+    #[test]
+    fn explicit_start_screen_always_immersive_false_stays_off() {
+        let prefs: Prefs = serde_json::from_str(
+            r#"{"start_screen_enabled":true,"start_screen_always_immersive":false}"#,
+        )
+        .unwrap();
         assert!(!prefs.start_screen_always_immersive);
     }
 

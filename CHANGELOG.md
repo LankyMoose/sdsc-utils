@@ -7,9 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-05
+
 ### Added
 
 - Immersive Start paints a soft rectangular edge vignette over atmosphere/splash only (games strip, dock, and footer stay undimmed).
+- Fullscreen immersive Start, including an always-immersive setting (default on). A second **PS** press promotes the compact launcher; **Circle** demotes (always-immersive closes instead).
+- Immersive cover-flow games strip, controllers dock, splash, and cold-load chrome.
+- Immersive idle and sleep dimming, with Settings controls. The cover darkens after inactivity and wakes on input.
+- In-window Start settings via the DualSense **Options** button (compact modal; immersive drawer) for Start screen prefs except Enabled.
+- USB controllers setting for start-screen auto open/close. When off, only Bluetooth pads open or hold the launcher.
+- Steam playtime, install size, and last played on game rows. Sort prefers Steam last played, and **Cross** reads **Update & launch** when an update is required.
+- Steam library format fallbacks, plus a last-known compatible version footnote.
+- Settings · System footer with GitHub and Microsoft Store links and the app version.
+- Display-only immersive games-list position indicator. Sections follow last played (Today, 7 days, 1 month, 1 year, Older, Never) or A–Z, slide in from the left, and hide after 2s without scrolling.
+- Empty Games list shows a ringed triangle hint on the browse prompt.
 
 ### Fixed
 
@@ -21,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Connected toasts are skipped for controllers already connected when the app starts.
 - Configure System footer: GitHub icon fill matches the Microsoft Store bag (`#F2F2F2`); both footer link icons use 0.8 opacity until hovered.
 - Start reopen / promote gesture is fixed to **PS** (Guide); custom chord recording is removed from Settings.
+- Immersive games strip does not wrap; pad navigation stops at the ends.
+- Start footer hints use a split layout (secondary controls on the left, primary actions on the right). Sort and cycle hints are pad-only.
+- Connected toast on 0→1 auto-open shows inside immersive Start, not as a separate desktop card.
+- Toasts and file pickers stay above immersive Start.
+- Compact reopen-chord hint is hidden in temporary immersive Start.
+- Powering off one DualSense keeps sibling controllers live.
+- A disconnected pad drops off the hot Start list within ~200ms.
+- Opening Start does not promote to immersive on the same **PS** press.
+- Empty Games list copy uses a hyphen in "No games yet - press" (the previous em dash is gone).
 
 ## [1.5.2] - 2026-10-03
 
@@ -375,6 +396,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded DualSense silhouette for the tray and `.exe` icon.
 - Windows CI and tagged release workflow.
 
+[1.6.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.5.2...v1.6.0
 [1.5.2]: https://github.com/LankyMoose/sdsc-utils/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.4.3...v1.5.0
