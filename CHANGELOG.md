@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Newly-detected presence that auto-opens immersive Start no longer shows a `Connected` toast (cold-launch and hot-connect now match); compact auto-open shows the toast first and opens Start on slide settle, so the card can never be swallowed by the window create.
 - Closing a game flips status from `Playing`/`Running` to `Closing` immediately (async close; badge clears on process exit).
 - Game rows disable (dim + `Not installed`, skipped in nav, launch blocked) when a scan proves them uninstalled; stale immediate launches fail gracefully with a rows refresh instead of an error popup.
+- Brief input-report stalls (e.g. a weak low-battery Bluetooth link under two-pad load) no longer flap the session: missed polls hold the pad for 2s of wall time instead of a single miss, so short stalls can't trigger `Disconnected`/`Connected` toast loops, lightbar reclaim flashes, or input-handle drops.
 
 ## [1.6.0] - 2026-10-05
 

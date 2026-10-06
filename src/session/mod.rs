@@ -78,7 +78,7 @@ pub struct DeviceSession {
     start_connect_cooldown_until: Option<Instant>,
     pub(crate) skip_next_connect_cooldown: bool,
     controllers_nonempty_since: Option<Instant>,
-    missed_poll_counts: HashMap<String, u8>,
+    missed_poll_since: HashMap<String, Instant>,
     pub start_auto_open_pending: bool,
 }
 
@@ -94,13 +94,13 @@ impl DeviceSession {
             start_connect_cooldown_until: None,
             skip_next_connect_cooldown: false,
             controllers_nonempty_since: None,
-            missed_poll_counts: HashMap::new(),
+            missed_poll_since: HashMap::new(),
             start_auto_open_pending: false,
         }
     }
 
     pub fn clear_missed_polls(&mut self) {
-        self.missed_poll_counts.clear();
+        self.missed_poll_since.clear();
     }
 
     pub fn mark_skip_connect_cooldown(&mut self) {
@@ -118,8 +118,12 @@ impl DeviceSession {
         polled: Vec<ControllerStatus>,
         ctx: ApplyContext,
     ) -> Vec<SessionEffect> {
-        let (reconciled, held) =
-            reconcile_poll_with_hold(&self.controllers, polled, &mut self.missed_poll_counts);
+        let (reconciled, held) = reconcile_poll_with_hold(
+            &self.controllers,
+            polled,
+            &mut self.missed_poll_since,
+            ctx.now,
+        );
         for serial in &held {
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: hold pad across missed read serial={serial}"
@@ -483,6 +487,44 @@ mod tests {
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
         assert!(!has_open_start(&effects));
         assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
+    }
+
+    #[test]
+    fn hot_path_stall_within_hold_keeps_pad_quiet() {
+        use std::time::Duration;
+
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let pad_a = bt_pad("aa");
+        let pad_b = bt_pad("bb");
+        let t0 = Instant::now();
+        let ctx_at = |now: Instant| ApplyContext {
+            start_visible: false,
+            fullscreen: false,
+            now,
+            lightbar_enabled: false,
+        };
+        // Two pads connected.
+        let _ = session.apply_controllers(vec![pad_a.clone(), pad_b.clone()], ctx_at(t0));
+        assert_eq!(session.controllers.len(), 2);
+
+        // Hot path misses pad B every ~16ms: held, no flap.
+        for ms in [16, 32, 500, 1500] {
+            let effects =
+                session.on_poll_result(vec![pad_a.clone()], ctx_at(t0 + Duration::from_millis(ms)));
+            assert_eq!(session.controllers.len(), 2, "held at +{ms}ms");
+            assert!(
+                !queued_bodies(&effects).contains(&"Disconnected".to_string()),
+                "no disconnect at +{ms}ms"
+            );
+        }
+
+        // Past the hold window: accepted drop with a Disconnect toast.
+        let effects = session.on_poll_result(
+            vec![pad_a.clone()],
+            ctx_at(t0 + crate::session::gate::POLL_MISS_HOLD + Duration::from_secs(1)),
+        );
+        assert_eq!(session.controllers.len(), 1);
+        assert!(queued_bodies(&effects).contains(&"Disconnected".to_string()));
     }
 
     #[test]

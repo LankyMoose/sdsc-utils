@@ -5055,7 +5055,7 @@ impl App {
                     self.session.prefs.spectrum.clone(),
                     eta,
                 );
-                self.toast_queue.push_back(message);
+                ToastMessage::enqueue(&mut self.toast_queue, message);
             }
             return open.chain(self.show_next_toast());
         }
@@ -5073,7 +5073,7 @@ impl App {
                     "ui-diag: defer start until toast slide settles",
                 );
             }
-            self.toast_queue.push_back(message);
+            ToastMessage::enqueue(&mut self.toast_queue, message);
         }
         self.show_next_toast()
     }
@@ -5126,7 +5126,7 @@ impl App {
             return Task::none();
         }
         app_log::info("crash-restart: notice toast");
-        self.toast_queue.push_back(ToastMessage::crash_restart());
+        ToastMessage::enqueue(&mut self.toast_queue, ToastMessage::crash_restart());
         self.show_next_toast()
     }
 
