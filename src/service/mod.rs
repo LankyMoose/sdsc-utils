@@ -464,7 +464,7 @@ fn handle_command(
             if should_skip_connect_cooldown_on_power_off(
                 &session.controllers,
                 &serial,
-                session.prefs.start_screen_usb_controllers,
+                session.prefs.start_screen_auto_open.includes_usb(),
             ) {
                 session.mark_skip_connect_cooldown();
             }
@@ -698,8 +698,11 @@ fn reload_persist_if_needed(
 
 fn reload_persist(session: &mut DeviceSession, start_visible: bool) -> Option<Vec<SessionEffect>> {
     let prefs = Prefs::load();
-    let usb_changed =
-        prefs.start_screen_usb_controllers != session.prefs.start_screen_usb_controllers;
+    // Re-evaluate close only when the USB scope actually flips while auto-open
+    // can fire; switching to Never never closes (matches the shell apply rule).
+    let scope_changed = prefs.start_screen_auto_open.includes_usb()
+        != session.prefs.start_screen_auto_open.includes_usb();
+    let usb_changed = prefs.start_screen_auto_open.auto_opens() && scope_changed;
     color::set_active_spectrum(prefs.spectrum.clone());
     lightbar::set_enabled(prefs.lightbar_enabled);
     session.prefs = prefs;

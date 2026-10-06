@@ -161,7 +161,7 @@ impl DeviceSession {
             return effects;
         }
 
-        let include_usb = self.prefs.start_screen_usb_controllers;
+        let include_usb = self.prefs.start_screen_auto_open.includes_usb();
         let mut events = Vec::new();
         let mut presence_edge: Option<(bool, bool)> = None;
         if controllers_changed {
@@ -223,10 +223,9 @@ impl DeviceSession {
         }
 
         effects.push(SessionEffect::SaveKnown);
-        let connect_toast_queued = events.iter().any(|event| event.body == "Connected");
         let want_auto_open = presence_edge.is_some_and(|(prev_present, next_present)| {
             should_auto_open_start(
-                self.prefs.start_screen_enabled,
+                self.prefs.start_screen_enabled && self.prefs.start_screen_auto_open.auto_opens(),
                 !prev_present,
                 next_present,
                 ctx.start_visible,
@@ -234,6 +233,19 @@ impl DeviceSession {
                 ctx.fullscreen,
             )
         });
+        // When presence newly opens immersive Start, suppress the Connected toast
+        // entirely. Cold-launch already suppresses via launch_quiet; hot connects
+        // must match so behaviour is identical. Compact keeps the toast (HWND).
+        if want_auto_open && self.prefs.start_screen_always_immersive {
+            let before = events.len();
+            events.retain(|event| event.body != "Connected");
+            if events.len() != before {
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: connect toast suppressed (immersive auto-open)",
+                );
+            }
+        }
+        let connect_toast_queued = events.iter().any(|event| event.body == "Connected");
         if want_auto_open {
             self.start_auto_open_pending = true;
         }
@@ -265,12 +277,12 @@ impl DeviceSession {
         effects
     }
 
-    /// Re-evaluate close after `start_screen_usb_controllers` changes.
+    /// Re-evaluate close after the auto-open USB scope changes.
     ///
     /// A settings flip is not a connect edge — never auto-open Start here.
     /// Does not arm the ghost-flap cooldown (settings flip is not a pad leave).
     pub fn reevaluate_start_presence(&mut self, ctx: ApplyContext) -> Vec<SessionEffect> {
-        let include_usb = self.prefs.start_screen_usb_controllers;
+        let include_usb = self.prefs.start_screen_auto_open.includes_usb();
         let present = has_start_presence(&self.controllers, include_usb);
         crate::controller::hid::diag::diag_info(format!(
             "ui-diag: start presence include_usb={} present={} (prefs)",
@@ -352,4 +364,161 @@ pub fn log_apply(effects: &[SessionEffect]) {
         return;
     }
     app_log::info(format!("session: apply effects={}", effects.len()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controller::dualsense::battery::dualsense_status;
+    use crate::controller::model::{Connection, PowerState};
+    use crate::persist::prefs::StartAutoOpen;
+
+    fn bt_pad(serial: &str) -> ControllerStatus {
+        dualsense_status(
+            1,
+            "DualSense",
+            Connection::Bluetooth,
+            serial.to_string(),
+            50,
+            PowerState::Discharging,
+        )
+    }
+
+    fn usb_pad(serial: &str) -> ControllerStatus {
+        dualsense_status(
+            1,
+            "DualSense",
+            Connection::Usb,
+            serial.to_string(),
+            50,
+            PowerState::Discharging,
+        )
+    }
+
+    fn ctx(start_visible: bool) -> ApplyContext {
+        ApplyContext {
+            start_visible,
+            fullscreen: false,
+            now: Instant::now(),
+            lightbar_enabled: false,
+        }
+    }
+
+    fn session_with(immersive: bool, mode: StartAutoOpen) -> DeviceSession {
+        let prefs = Prefs {
+            start_screen_enabled: true,
+            start_screen_auto_open: mode,
+            start_screen_always_immersive: immersive,
+            notify_connect: true,
+            analytics_enabled: false,
+            ..Prefs::default()
+        };
+        DeviceSession::new(
+            prefs,
+            KnownControllers::default(),
+            AnalyticsStore::default(),
+        )
+    }
+
+    fn has_open_start(effects: &[SessionEffect]) -> bool {
+        effects
+            .iter()
+            .any(|e| matches!(e, SessionEffect::OpenStart))
+    }
+
+    fn queued_bodies(effects: &[SessionEffect]) -> Vec<String> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                SessionEffect::QueueNotifications { events, .. } => Some(events),
+                _ => None,
+            })
+            .flatten()
+            .map(|ev| ev.body.clone())
+            .collect()
+    }
+
+    #[test]
+    fn immersive_auto_open_suppresses_connected_toast() {
+        let mut session = session_with(true, StartAutoOpen::Any);
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        assert!(has_open_start(&effects));
+        assert!(
+            !queued_bodies(&effects).contains(&"Connected".to_string()),
+            "immersive open must not queue Connected, got {:?}",
+            queued_bodies(&effects)
+        );
+    }
+
+    #[test]
+    fn compact_auto_open_keeps_connected_toast() {
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        assert!(!has_open_start(&effects));
+        assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
+        // Deferred open latched for after-toast.
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                SessionEffect::QueueNotifications {
+                    open_start_after_toast: true,
+                    ..
+                }
+            )),
+            "compact should defer open until toast"
+        );
+    }
+
+    #[test]
+    fn immersive_no_suppress_when_already_open() {
+        let mut session = session_with(true, StartAutoOpen::Any);
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(true));
+        assert!(!has_open_start(&effects));
+        assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
+    }
+
+    #[test]
+    fn auto_open_never_never_opens_but_still_toasts() {
+        let mut session = session_with(true, StartAutoOpen::Never);
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        assert!(!has_open_start(&effects));
+        assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
+    }
+
+    #[test]
+    fn bluetooth_mode_ignores_usb_only_presence() {
+        // USB-only arrival is not qualifying presence in Bluetooth mode:
+        // no open, and the toast stays a plain notification.
+        let mut session = session_with(false, StartAutoOpen::Bluetooth);
+        let effects = session.apply_controllers(vec![usb_pad("usb:1")], ctx(false));
+        assert!(!has_open_start(&effects));
+        assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                SessionEffect::QueueNotifications {
+                    open_start_after_toast: true,
+                    ..
+                }
+            )),
+            "USB-only arrival must not latch an open in Bluetooth mode"
+        );
+    }
+
+    #[test]
+    fn bluetooth_mode_opens_on_bluetooth_arrival() {
+        let mut session = session_with(false, StartAutoOpen::Bluetooth);
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                SessionEffect::QueueNotifications {
+                    open_start_after_toast: true,
+                    ..
+                }
+            )),
+            "Bluetooth arrival should latch an open in Bluetooth mode"
+        );
+    }
 }

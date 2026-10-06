@@ -168,7 +168,6 @@ pub fn framed<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Elem
 }
 
 /// Raised surface with a hairline border.
-#[allow(dead_code)]
 pub fn panel(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(PANEL)),

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Center-top clock widget in immersive Start showing the system locale time (12h/24h per Windows settings; 12h am/pm fallback elsewhere), with a Display clock toggle in Start settings and Configure (on by default).
+- Separate Start screen settings: `Enable start screen` (master) and a single `Auto open` selector (`Never` / `When a Bluetooth controller connects` / `When any controller connects`, default `When any controller connects`): expandable dropdown in Start settings (Cross opens, dpad picks, Left/Right quick-cycle) and native dropdown in Configure.
+
+### Fixed
+
+- Newly-detected presence that auto-opens immersive Start no longer shows a `Connected` toast (cold-launch and hot-connect now match); compact auto-open shows the toast first and opens Start on slide settle, so the card can never be swallowed by the window create.
+- Closing a game flips status from `Playing`/`Running` to `Closing` immediately (async close; badge clears on process exit).
+- Game rows disable (dim + `Not installed`, skipped in nav, launch blocked) when a scan proves them uninstalled; stale immediate launches fail gracefully with a rows refresh instead of an error popup.
+
 ## [1.6.0] - 2026-10-05
 
 ### Added

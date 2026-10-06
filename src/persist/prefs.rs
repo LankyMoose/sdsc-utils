@@ -5,6 +5,7 @@ use crate::domain::color::BatterySpectrum;
 use crate::domain::gesture::{GestureControl, default_gesture};
 use crate::platform::app_log;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::fs;
 use std::path::PathBuf;
 
@@ -45,6 +46,72 @@ impl GamesSortMode {
     }
 }
 
+/// When a controller connect auto-opens the start screen.
+/// Single control subsuming the former auto-open bool + USB-scope bool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartAutoOpen {
+    /// Never auto-open (manual / gesture open only).
+    Never,
+    /// Only Bluetooth connects open; USB pads are ignored for open and close.
+    Bluetooth,
+    /// Any controller connect opens (default).
+    #[default]
+    Any,
+}
+
+impl StartAutoOpen {
+    /// Whether connects can auto-open at all.
+    pub fn auto_opens(self) -> bool {
+        !matches!(self, Self::Never)
+    }
+
+    /// Whether USB pads count toward open/close presence.
+    pub fn includes_usb(self) -> bool {
+        matches!(self, Self::Any)
+    }
+
+    /// Next option, wrapping around (Cross cycles infinitely).
+    pub fn next(self) -> Self {
+        match self {
+            Self::Never => Self::Bluetooth,
+            Self::Bluetooth => Self::Any,
+            Self::Any => Self::Never,
+        }
+    }
+
+    /// Previous option, wrapping around.
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Never => Self::Any,
+            Self::Bluetooth => Self::Never,
+            Self::Any => Self::Bluetooth,
+        }
+    }
+
+    /// Short display label for the single-option viewport.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Never => "Never",
+            Self::Bluetooth => "When a Bluetooth controller connects",
+            Self::Any => "When any controller connects",
+        }
+    }
+}
+
+impl std::fmt::Display for StartAutoOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// All modes in cycle/menu order.
+pub const AUTO_OPEN_MODES: [StartAutoOpen; 3] = [
+    StartAutoOpen::Never,
+    StartAutoOpen::Bluetooth,
+    StartAutoOpen::Any,
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Prefs {
     #[serde(default = "default_true")]
@@ -68,11 +135,21 @@ pub struct Prefs {
     #[serde(default = "default_true")]
     pub lightbar_enabled: bool,
     /// Open the start-screen launcher on 0→1 connect / reopen gesture (default on).
+    /// Master switch: when off, the start screen never opens.
     #[serde(default = "default_true")]
     pub start_screen_enabled: bool,
+    /// Automatically open the start screen when a controller connects.
+    /// `never` disables it (gesture / manual open still work);
+    /// `bluetooth` ignores USB pads for open and close; `any` counts every
+    /// controller (default).
+    #[serde(default)]
+    pub start_screen_auto_open: StartAutoOpen,
     /// Always use immersive Start (never show compact; cancel closes) (default on).
     #[serde(default = "default_true")]
     pub start_screen_always_immersive: bool,
+    /// Show the clock widget at the top while immersive Start is visible (default on).
+    #[serde(default = "default_true")]
+    pub start_screen_clock_enabled: bool,
     /// Immersive idle dim after this many seconds (default 30). Snapped to idle steps.
     #[serde(default = "default_start_screen_inactive_secs")]
     pub start_screen_inactive_secs: u32,
@@ -82,10 +159,6 @@ pub struct Prefs {
     /// Idle-mode black overlay percent 0–100 (default 50). Sleep is always 100%.
     #[serde(default = "default_start_screen_inactive_dim_percent")]
     pub start_screen_inactive_dim_percent: u8,
-    /// Count USB pads for start-screen auto-open / auto-close (default on).
-    /// When off, only Bluetooth pads drive open and close.
-    #[serde(default = "default_true")]
-    pub start_screen_usb_controllers: bool,
     /// Reopen / promote chord while a pad is connected.
     /// Always forced to PS on load/save; custom chords are no longer honored.
     #[serde(default = "default_gesture")]
@@ -242,11 +315,12 @@ impl Default for Prefs {
             analytics_enabled: false,
             lightbar_enabled: true,
             start_screen_enabled: true,
+            start_screen_auto_open: StartAutoOpen::Any,
             start_screen_always_immersive: true,
+            start_screen_clock_enabled: true,
             start_screen_inactive_secs: default_start_screen_inactive_secs(),
             start_screen_sleep_secs: default_start_screen_sleep_secs(),
             start_screen_inactive_dim_percent: default_start_screen_inactive_dim_percent(),
-            start_screen_usb_controllers: true,
             start_screen_gesture: default_gesture(),
             start_screen_sounds_enabled: true,
             start_screen_sound_volume: default_start_screen_sound_volume(),
@@ -258,13 +332,56 @@ impl Default for Prefs {
     }
 }
 
+/// Legacy keys consumed into [`StartAutoOpen`] (no surviving struct fields).
+const LEGACY_AUTO_OPEN_KEY: &str = "start_screen_auto_open";
+const LEGACY_USB_KEY: &str = "start_screen_usb_controllers";
+
+/// One-time migration from pre-1.6.1 bool prefs into the [`StartAutoOpen`]
+/// enum. Runs on the JSON object before struct deserialization; new string
+/// values pass through untouched:
+/// - unreleased bool `start_screen_auto_open: false` → `never`;
+/// - `true` (or a 1.6.0 file without the key) + legacy USB bool →
+///   `any` / `bluetooth` (USB defaulted on, matching the old defaults).
+fn migrate_legacy_auto_open(root: &mut Map<String, Value>) {
+    if matches!(root.get(LEGACY_AUTO_OPEN_KEY), Some(Value::String(_))) {
+        return;
+    }
+    let legacy_bool = root.get(LEGACY_AUTO_OPEN_KEY).and_then(Value::as_bool);
+    let usb = root
+        .get(LEGACY_USB_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mode = match legacy_bool {
+        Some(false) => "never",
+        _ => {
+            if usb {
+                "any"
+            } else {
+                "bluetooth"
+            }
+        }
+    };
+    root.insert(
+        LEGACY_AUTO_OPEN_KEY.to_string(),
+        Value::String(mode.to_string()),
+    );
+}
+
 impl Prefs {
     pub fn load() -> Self {
         let path = prefs_path();
         let Ok(bytes) = fs::read(&path) else {
             return Self::default();
         };
-        match serde_json::from_slice::<Prefs>(&bytes) {
+        let Ok(Value::Object(mut root)) = serde_json::from_slice::<Value>(&bytes) else {
+            app_log::warn(format!(
+                "failed to parse prefs at {}: not a JSON object; using defaults",
+                path.display()
+            ));
+            return Self::default();
+        };
+        migrate_legacy_auto_open(&mut root);
+        match serde_json::from_value::<Prefs>(Value::Object(root)) {
             Ok(mut prefs) => {
                 prefs.normalize();
                 prefs
@@ -533,11 +650,99 @@ mod tests {
         assert_eq!(format_timeout_duration(180), "3 minutes");
     }
 
+    /// Parse helper mirroring [`Prefs::load`] (minus the filesystem read).
+    fn prefs_from_json(json: &str) -> Prefs {
+        let Value::Object(mut root) = serde_json::from_str(json).unwrap() else {
+            panic!("expected object");
+        };
+        migrate_legacy_auto_open(&mut root);
+        let mut prefs: Prefs = serde_json::from_value(Value::Object(root)).unwrap();
+        prefs.normalize();
+        prefs
+    }
+
     #[test]
-    fn older_prefs_default_start_screen_usb_controllers_on() {
-        let prefs: Prefs =
-            serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":["ps"]}"#)
-                .unwrap();
-        assert!(prefs.start_screen_usb_controllers);
+    fn start_auto_open_defaults_to_any() {
+        let prefs = prefs_from_json("{}");
+        assert!(prefs.start_screen_enabled);
+        assert_eq!(prefs.start_screen_auto_open, StartAutoOpen::Any);
+        assert_eq!(Prefs::default().start_screen_auto_open, StartAutoOpen::Any);
+        // Serializes as a plain string (single key, no legacy bool cruft).
+        let value = serde_json::to_value(Prefs::default()).unwrap();
+        assert_eq!(value["start_screen_auto_open"], "any");
+        assert!(value.get("start_screen_usb_controllers").is_none());
+    }
+
+    #[test]
+    fn start_auto_open_modes_parse_and_persist() {
+        for (raw, mode) in [
+            ("never", StartAutoOpen::Never),
+            ("bluetooth", StartAutoOpen::Bluetooth),
+            ("any", StartAutoOpen::Any),
+        ] {
+            let prefs = prefs_from_json(&format!(r#"{{"start_screen_auto_open":{raw:?}}}"#));
+            assert_eq!(prefs.start_screen_auto_open, mode);
+        }
+    }
+
+    #[test]
+    fn legacy_1_6_0_usb_bool_migrates_to_scoped_mode() {
+        // 1.6.0 files have no auto-open key: USB choice maps onto the enum.
+        let prefs = prefs_from_json(
+            r#"{"start_screen_enabled":true,"start_screen_usb_controllers":false}"#,
+        );
+        assert_eq!(prefs.start_screen_auto_open, StartAutoOpen::Bluetooth);
+        let prefs =
+            prefs_from_json(r#"{"start_screen_enabled":true,"start_screen_usb_controllers":true}"#);
+        assert_eq!(prefs.start_screen_auto_open, StartAutoOpen::Any);
+    }
+
+    #[test]
+    fn legacy_unreleased_auto_open_bool_migrates() {
+        // `false` always meant never; `true` defers to the USB scope.
+        let prefs = prefs_from_json(
+            r#"{"start_screen_auto_open":false,"start_screen_usb_controllers":true}"#,
+        );
+        assert_eq!(prefs.start_screen_auto_open, StartAutoOpen::Never);
+        let prefs = prefs_from_json(
+            r#"{"start_screen_auto_open":true,"start_screen_usb_controllers":false}"#,
+        );
+        assert_eq!(prefs.start_screen_auto_open, StartAutoOpen::Bluetooth);
+        let prefs = prefs_from_json(r#"{"start_screen_auto_open":true}"#);
+        assert_eq!(prefs.start_screen_auto_open, StartAutoOpen::Any);
+    }
+
+    #[test]
+    fn start_auto_open_cycles_with_wrap_and_labels() {
+        assert_eq!(StartAutoOpen::Never.next(), StartAutoOpen::Bluetooth);
+        assert_eq!(StartAutoOpen::Bluetooth.next(), StartAutoOpen::Any);
+        assert_eq!(StartAutoOpen::Any.next(), StartAutoOpen::Never);
+        assert_eq!(StartAutoOpen::Never.prev(), StartAutoOpen::Any);
+        assert_eq!(StartAutoOpen::Any.prev(), StartAutoOpen::Bluetooth);
+        assert_eq!(StartAutoOpen::Never.label(), "Never");
+        assert_eq!(
+            StartAutoOpen::Bluetooth.label(),
+            "When a Bluetooth controller connects"
+        );
+        assert_eq!(StartAutoOpen::Any.label(), "When any controller connects");
+        assert_eq!(
+            StartAutoOpen::Bluetooth.to_string(),
+            "When a Bluetooth controller connects"
+        );
+        assert!(StartAutoOpen::Any.auto_opens());
+        assert!(StartAutoOpen::Bluetooth.auto_opens());
+        assert!(!StartAutoOpen::Never.auto_opens());
+        assert!(StartAutoOpen::Any.includes_usb());
+        assert!(!StartAutoOpen::Bluetooth.includes_usb());
+        assert!(!StartAutoOpen::Never.includes_usb());
+    }
+
+    #[test]
+    fn start_screen_clock_defaults_on() {
+        let prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(prefs.start_screen_clock_enabled);
+        assert!(Prefs::default().start_screen_clock_enabled);
+        let prefs: Prefs = serde_json::from_str(r#"{"start_screen_clock_enabled":false}"#).unwrap();
+        assert!(!prefs.start_screen_clock_enabled);
     }
 }

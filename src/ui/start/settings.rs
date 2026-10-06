@@ -1,14 +1,15 @@
 //! In-window Start Screen settings (Options): compact modal / immersive right drawer.
 
 use crate::persist::prefs::{
-    START_SCREEN_IDLE_SECS_STEPS, START_SCREEN_SLEEP_SECS_STEPS, format_timeout_duration,
-    min_sleep_secs_for_idle, secs_step_index,
+    AUTO_OPEN_MODES, START_SCREEN_IDLE_SECS_STEPS, START_SCREEN_SLEEP_SECS_STEPS, StartAutoOpen,
+    format_timeout_duration, min_sleep_secs_for_idle, secs_step_index,
 };
 use crate::ui::layout as window_layout;
 use crate::ui::start::view::{ScrollReveal, StartMessage, State, scroll_y_to_reveal_bounds};
 use crate::ui::theme;
 use iced::font::Weight;
-use iced::widget::{column, container, row, scrollable, slider, space, text, toggler};
+use iced::widget::text::Wrapping;
+use iced::widget::{column, container, mouse_area, row, scrollable, slider, space, text, toggler};
 use iced::{Alignment, Element, Fill, Font, Length, Padding};
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,8 @@ pub const MODAL_W: f32 = 576.0;
 const DRAWER_ANIM_MS: u64 = 220;
 const ROW_PAD: f32 = 10.0;
 const COL_GAP: f32 = 6.0;
+/// Inner padding of the expanded auto-open dropdown panel.
+const MENU_PANEL_PAD: f32 = 4.0;
 /// Gap between scrollable content and the embedded scrollbar (matches Configure/Popup).
 const SCROLL_GAP: f32 = 8.0;
 /// Padding inside the settings scrollable content (must match `panel_view` list padding).
@@ -38,8 +41,9 @@ const COMPACT_MODAL_MAX_H: f32 = 528.0;
 /// Prefs snapshot for the Start settings panel (Enabled stays Configure-only).
 #[derive(Debug, Clone)]
 pub struct StartSettingsSnapshot {
-    pub usb_controllers: bool,
+    pub auto_open: StartAutoOpen,
     pub always_immersive: bool,
+    pub clock_enabled: bool,
     pub inactive_secs: u32,
     pub sleep_secs: u32,
     pub inactive_dim_percent: u8,
@@ -52,8 +56,9 @@ pub struct StartSettingsSnapshot {
 /// Focusable rows in the Start settings list (dynamic when sounds/haptics off).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
-    UsbControllers,
+    AutoOpen,
     AlwaysImmersive,
+    Clock,
     IdleSecs,
     SleepSecs,
     IdleDim,
@@ -66,8 +71,9 @@ pub enum SettingsRow {
 impl SettingsRow {
     pub fn focusable(snapshot: &StartSettingsSnapshot) -> Vec<Self> {
         let mut rows = vec![
-            Self::UsbControllers,
+            Self::AutoOpen,
             Self::AlwaysImmersive,
+            Self::Clock,
             Self::IdleSecs,
             Self::SleepSecs,
             Self::IdleDim,
@@ -111,6 +117,9 @@ pub struct SettingsPanel {
     pub anim: Option<SettingsAnim>,
     pub scroll_y: f32,
     pub viewport_h: f32,
+    /// Expanded auto-open dropdown: highlighted option index into
+    /// [`AUTO_OPEN_MODES`]. `None` = closed (header shows current value only).
+    pub auto_open_menu: Option<usize>,
 }
 
 impl SettingsPanel {
@@ -158,6 +167,10 @@ impl SettingsPanel {
             self.open = true;
             self.focus = 0;
             self.scroll_y = 0.0;
+            self.auto_open_menu = None;
+        } else {
+            // Drop the expanded dropdown the moment the drawer starts leaving.
+            self.auto_open_menu = None;
         }
         if !animate || (from - target).abs() < 0.01 {
             self.open = open;
@@ -227,7 +240,12 @@ impl SettingsPanel {
         immersive: bool,
         direction: ScrollReveal,
     ) -> Option<f32> {
-        let (row_top, row_h) = focus_row_bounds(self.focus, snapshot, immersive)?;
+        let (row_top, row_h) = focus_row_bounds(
+            self.focus,
+            snapshot,
+            immersive,
+            self.auto_open_menu.is_some(),
+        )?;
         let viewport_h = if self.viewport_h <= 1.0 {
             if immersive {
                 720.0
@@ -282,12 +300,12 @@ pub fn scrim_dim(progress: f32) -> f32 {
 /// Confirm on the focused row (toggle / activate button).
 pub fn confirm_message(row: SettingsRow, snapshot: &StartSettingsSnapshot) -> Option<StartMessage> {
     match row {
-        SettingsRow::UsbControllers => {
-            Some(StartMessage::SetUsbControllers(!snapshot.usb_controllers))
-        }
+        // Cross opens the dropdown; picking happens from the menu highlight.
+        SettingsRow::AutoOpen => Some(StartMessage::ToggleAutoOpenMenu),
         SettingsRow::AlwaysImmersive => {
             Some(StartMessage::SetAlwaysImmersive(!snapshot.always_immersive))
         }
+        SettingsRow::Clock => Some(StartMessage::SetClock(!snapshot.clock_enabled)),
         SettingsRow::Sounds => Some(StartMessage::SetSounds(!snapshot.sounds_enabled)),
         SettingsRow::Haptics => Some(StartMessage::SetHaptics(!snapshot.haptics_enabled)),
         SettingsRow::IdleSecs
@@ -309,18 +327,24 @@ pub fn nudge_message(
     let step = if delta < 0 { -1isize } else { 1isize };
     let want_on = delta > 0;
     match row {
-        SettingsRow::UsbControllers => {
-            if snapshot.usb_controllers == want_on {
-                None
-            } else {
-                Some(StartMessage::SetUsbControllers(want_on))
-            }
-        }
+        // Single-option viewport: Left/Right rotate through the modes infinitely.
+        SettingsRow::AutoOpen => Some(StartMessage::SetAutoOpen(if delta > 0 {
+            snapshot.auto_open.next()
+        } else {
+            snapshot.auto_open.prev()
+        })),
         SettingsRow::AlwaysImmersive => {
             if snapshot.always_immersive == want_on {
                 None
             } else {
                 Some(StartMessage::SetAlwaysImmersive(want_on))
+            }
+        }
+        SettingsRow::Clock => {
+            if snapshot.clock_enabled == want_on {
+                None
+            } else {
+                Some(StartMessage::SetClock(want_on))
             }
         }
         SettingsRow::Sounds => {
@@ -433,6 +457,7 @@ pub fn focus_row_bounds(
     focus: usize,
     snapshot: &StartSettingsSnapshot,
     immersive: bool,
+    menu_open: bool,
 ) -> Option<(f32, f32)> {
     let rows = SettingsRow::focusable(snapshot);
     let target = *rows.get(focus)?;
@@ -448,14 +473,32 @@ pub fn focus_row_bounds(
 
     // Match panel_view scroll stacking order (column spacing = COL_GAP between children).
     gap(ty.section); // Opening
-    if target == SettingsRow::UsbControllers {
-        return Some((gap(toggle_row_h(ty.toggle)), toggle_row_h(ty.toggle)));
+    if target == SettingsRow::AutoOpen {
+        return Some((
+            gap(cycle_row_h(ty.helper, ty.toggle)),
+            cycle_row_h(ty.helper, ty.toggle),
+        ));
     }
-    gap(toggle_row_h(ty.toggle));
-    gap(ty.helper); // USB helper
+    gap(cycle_row_h(ty.helper, ty.toggle));
+    // Expanded dropdown panel: padding top/bottom + one option row per mode
+    // with hairlines between. Slots into the same COL_GAP stacking as children.
+    if menu_open {
+        let mut panel_h = MENU_PANEL_PAD * 2.0;
+        for i in 0..AUTO_OPEN_MODES.len() {
+            if i > 0 {
+                panel_h += theme::LIST_SEPARATOR_GAP;
+            }
+            panel_h += menu_option_h(ty.body);
+        }
+        gap(panel_h);
+    }
     gap(section_rule_h());
     gap(ty.section); // Immersive
     if target == SettingsRow::AlwaysImmersive {
+        return Some((gap(toggle_row_h(ty.toggle)), toggle_row_h(ty.toggle)));
+    }
+    gap(toggle_row_h(ty.toggle));
+    if target == SettingsRow::Clock {
         return Some((gap(toggle_row_h(ty.toggle)), toggle_row_h(ty.toggle)));
     }
     gap(toggle_row_h(ty.toggle));
@@ -497,6 +540,20 @@ fn toggle_row_h(toggle: f32) -> f32 {
     ROW_PAD * 2.0 + toggle.max(22.0)
 }
 
+/// Fixed height of the cycle-row option viewport: one option visible.
+fn cycle_viewport_h(helper: f32) -> f32 {
+    helper * 1.5
+}
+
+fn cycle_row_h(helper: f32, toggle: f32) -> f32 {
+    ROW_PAD * 2.0 + cycle_viewport_h(helper).max(toggle).max(22.0)
+}
+
+/// Estimated height of one expanded dropdown option row.
+fn menu_option_h(body: f32) -> f32 {
+    ROW_PAD * 2.0 + (body * 1.25).max(22.0)
+}
+
 fn slider_row_h(label: f32) -> f32 {
     // Label + gap + slider track (iced default is a bit taller than a tight 22px guess).
     ROW_PAD * 2.0 + label + 4.0 + 26.0
@@ -533,18 +590,33 @@ pub fn panel_view<'a>(
 
     let mut items = column![].spacing(COL_GAP).width(Fill);
     items = items.push(section_label("Opening", ty.section));
-    items = items.push(toggle_row(
-        "USB controllers",
-        snapshot.usb_controllers,
-        focus_rows.get(focus) == Some(&SettingsRow::UsbControllers),
+    items = items.push(cycle_row(
+        "Auto open:",
+        snapshot.auto_open,
+        focus_rows.get(focus) == Some(&SettingsRow::AutoOpen),
         ty,
-        StartMessage::SetUsbControllers,
     ));
-    items = items.push(
-        text("When off, only Bluetooth opens and closes the start screen.")
-            .size(ty.helper)
-            .color(theme::MUTED),
-    );
+    // Expanded dropdown panel: every option selectable, highlight follows the menu.
+    if let Some(highlight) = state.settings.auto_open_menu {
+        let mut options = column![].spacing(0).width(Fill);
+        for (i, mode) in AUTO_OPEN_MODES.iter().enumerate() {
+            if i > 0 {
+                options = options.push(theme::list_separator());
+            }
+            options = options.push(auto_open_option_row(
+                *mode,
+                *mode == snapshot.auto_open,
+                i == highlight,
+                ty,
+            ));
+        }
+        items = items.push(
+            container(options)
+                .padding(MENU_PANEL_PAD)
+                .width(Fill)
+                .style(theme::panel),
+        );
+    }
 
     items = items.push(section_rule());
     items = items.push(section_label("Immersive", ty.section));
@@ -554,6 +626,13 @@ pub fn panel_view<'a>(
         focus_rows.get(focus) == Some(&SettingsRow::AlwaysImmersive),
         ty,
         StartMessage::SetAlwaysImmersive,
+    ));
+    items = items.push(toggle_row(
+        "Display clock",
+        snapshot.clock_enabled,
+        focus_rows.get(focus) == Some(&SettingsRow::Clock),
+        ty,
+        StartMessage::SetClock,
     ));
 
     let idle_secs = snapshot.inactive_secs;
@@ -801,6 +880,85 @@ fn toggle_row(
     .into()
 }
 
+/// Three-way selector header: label left, current option in a fixed-height
+/// clipped viewport right so only the selected option displays.
+/// Click (or pad Cross via [`SettingsRow::AutoOpen`]) toggles the menu.
+fn cycle_row(
+    label: &'static str,
+    mode: StartAutoOpen,
+    focused: bool,
+    ty: TypeScale,
+) -> Element<'static, StartMessage> {
+    // Fixed-height clipped viewport: only the selected option displays.
+    let viewport_h = cycle_viewport_h(ty.helper);
+    mouse_area(
+        container(
+            row![
+                text(label).size(ty.body).color(theme::INK),
+                container(
+                    container(
+                        text(mode.label())
+                            .size(ty.helper)
+                            .color(theme::INK)
+                            .wrapping(Wrapping::None),
+                    )
+                    .width(Fill)
+                    .align_x(Alignment::End),
+                )
+                .width(Fill)
+                .height(Length::Fixed(viewport_h))
+                .align_y(Alignment::Center)
+                .clip(true),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        )
+        .padding(ROW_PAD)
+        .width(Fill)
+        .style(focus_style(focused)),
+    )
+    .on_press(StartMessage::ToggleAutoOpenMenu)
+    .interaction(iced::mouse::Interaction::Pointer)
+    .into()
+}
+
+/// One expanded dropdown option: check mark tracks the committed mode,
+/// focus ring tracks the menu highlight. Click selects immediately.
+fn auto_open_option_row(
+    mode: StartAutoOpen,
+    selected: bool,
+    highlighted: bool,
+    ty: TypeScale,
+) -> Element<'static, StartMessage> {
+    let (mark, mark_color) = if selected {
+        ("✓", theme::ACCENT)
+    } else {
+        ("○", theme::alpha(theme::MUTED, 0.55))
+    };
+    mouse_area(
+        container(
+            row![
+                text(mark)
+                    .size(ty.body)
+                    .color(mark_color)
+                    .width(Length::Fixed(22.0)),
+                text(mode.label())
+                    .size(ty.body)
+                    .color(theme::INK)
+                    .width(Fill),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .padding(ROW_PAD)
+        .width(Fill)
+        .style(focus_style(highlighted)),
+    )
+    .on_press(StartMessage::SetAutoOpen(mode))
+    .interaction(iced::mouse::Interaction::Pointer)
+    .into()
+}
+
 fn slider_row(
     label: String,
     focused: bool,
@@ -834,8 +992,9 @@ mod tests {
 
     fn snap(sounds: bool, haptics: bool) -> StartSettingsSnapshot {
         StartSettingsSnapshot {
-            usb_controllers: true,
+            auto_open: StartAutoOpen::Any,
             always_immersive: false,
+            clock_enabled: true,
             inactive_secs: 30,
             sleep_secs: 120,
             inactive_dim_percent: 50,
@@ -854,6 +1013,38 @@ mod tests {
     }
 
     #[test]
+    fn focusable_lists_auto_open_first() {
+        let rows = SettingsRow::focusable(&snap(true, true));
+        assert_eq!(rows[0], SettingsRow::AutoOpen);
+        assert!(rows.contains(&SettingsRow::AlwaysImmersive));
+    }
+
+    #[test]
+    fn auto_open_confirm_opens_menu_nudge_quick_cycles() {
+        let s = snap(true, true);
+        // Confirm (Cross) expands the dropdown instead of changing the value.
+        let msg = confirm_message(SettingsRow::AutoOpen, &s).unwrap();
+        assert!(matches!(msg, StartMessage::ToggleAutoOpenMenu));
+        // Left/Right still quick-cycle without opening.
+        let msg = nudge_message(SettingsRow::AutoOpen, &s, 1).unwrap();
+        assert!(matches!(
+            msg,
+            StartMessage::SetAutoOpen(StartAutoOpen::Never)
+        ));
+        let msg = nudge_message(SettingsRow::AutoOpen, &s, -1).unwrap();
+        assert!(matches!(
+            msg,
+            StartMessage::SetAutoOpen(StartAutoOpen::Bluetooth)
+        ));
+        let never = StartSettingsSnapshot {
+            auto_open: StartAutoOpen::Never,
+            ..snap(true, true)
+        };
+        let msg = nudge_message(SettingsRow::AutoOpen, &never, -1).unwrap();
+        assert!(matches!(msg, StartMessage::SetAutoOpen(StartAutoOpen::Any)));
+    }
+
+    #[test]
     fn nudge_idle_steps() {
         let s = snap(true, true);
         let msg = nudge_message(SettingsRow::IdleSecs, &s, 1).unwrap();
@@ -865,12 +1056,14 @@ mod tests {
     #[test]
     fn nudge_toggles_left_off_right_on() {
         let s = snap(true, true);
-        assert!(nudge_message(SettingsRow::UsbControllers, &s, 1).is_none());
-        let msg = nudge_message(SettingsRow::UsbControllers, &s, -1).unwrap();
-        assert!(matches!(msg, StartMessage::SetUsbControllers(false)));
+        assert!(nudge_message(SettingsRow::Clock, &s, 1).is_none());
         assert!(nudge_message(SettingsRow::AlwaysImmersive, &s, -1).is_none());
         let msg = nudge_message(SettingsRow::AlwaysImmersive, &s, 1).unwrap();
         assert!(matches!(msg, StartMessage::SetAlwaysImmersive(true)));
+        let msg = nudge_message(SettingsRow::Clock, &s, -1).unwrap();
+        assert!(matches!(msg, StartMessage::SetClock(false)));
+        let msg = confirm_message(SettingsRow::Clock, &s).unwrap();
+        assert!(matches!(msg, StartMessage::SetClock(false)));
     }
 
     #[test]
@@ -890,11 +1083,34 @@ mod tests {
     #[test]
     fn focus_row_bounds_increases_with_focus() {
         let s = snap(true, true);
-        let (y0, _) = focus_row_bounds(0, &s, false).unwrap();
+        let (y0, _) = focus_row_bounds(0, &s, false, false).unwrap();
         let last = SettingsRow::focusable(&s).len() - 1;
-        let (y_last, _) = focus_row_bounds(last, &s, false).unwrap();
+        let (y_last, _) = focus_row_bounds(last, &s, false, false).unwrap();
         assert!(y_last > y0);
         assert!(y0 >= CONTENT_PAD_Y);
+    }
+
+    #[test]
+    fn focus_row_bounds_grows_with_expanded_menu() {
+        let s = snap(true, true);
+        // AutoOpen is focus 0; with the menu open everything below shifts
+        // down by one option row per mode.
+        let (closed_top, _) = focus_row_bounds(0, &s, false, false).unwrap();
+        let (open_top, _) = focus_row_bounds(0, &s, false, true).unwrap();
+        assert!((closed_top - open_top).abs() < f32::EPSILON);
+        let always = SettingsRow::focusable(&s)
+            .iter()
+            .position(|&r| r == SettingsRow::AlwaysImmersive)
+            .unwrap();
+        let (closed_y, _) = focus_row_bounds(always, &s, false, false).unwrap();
+        let (open_y, _) = focus_row_bounds(always, &s, false, true).unwrap();
+        // Expanded panel: padding top/bottom + one option row per mode with
+        // hairlines between, slotted into the column stacking.
+        let expected = MENU_PANEL_PAD * 2.0
+            + 3.0 * menu_option_h(TypeScale::for_mode(false).body)
+            + 2.0 * theme::LIST_SEPARATOR_GAP
+            + COL_GAP;
+        assert!((open_y - closed_y - expected).abs() < 0.5);
     }
 
     #[test]
@@ -907,7 +1123,7 @@ mod tests {
             scroll_y: 0.0,
             ..SettingsPanel::default()
         };
-        let (row_top, row_h) = focus_row_bounds(panel.focus, &s, false).unwrap();
+        let (row_top, row_h) = focus_row_bounds(panel.focus, &s, false, false).unwrap();
         let y = panel
             .focus_scroll_y(&s, false, ScrollReveal::Down)
             .expect("last row should need a reveal from the top");

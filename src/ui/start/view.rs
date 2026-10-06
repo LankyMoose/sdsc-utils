@@ -4,7 +4,7 @@ use crate::controller::dualsense::lightbar;
 use crate::controller::model::PowerState;
 use crate::games::GameEntry;
 use crate::games::steam::SteamGame;
-use crate::persist::prefs::GamesSortMode;
+use crate::persist::prefs::{GamesSortMode, StartAutoOpen};
 use crate::ui::color::BatterySpectrum;
 use crate::ui::layout as window_layout;
 use crate::ui::percent_ring::{self, POPUP_SIZE};
@@ -109,8 +109,10 @@ pub enum StartMessage {
     ManualClearIcon,
     /// Options — open/close in-window Start settings.
     ToggleSettings,
-    SetUsbControllers(bool),
+    SetAutoOpen(StartAutoOpen),
+    ToggleAutoOpenMenu,
     SetAlwaysImmersive(bool),
+    SetClock(bool),
     SetInactiveSecs(u32),
     SetSleepSecs(u32),
     SetInactiveDimPercent(u8),
@@ -176,6 +178,9 @@ pub struct StartRow {
     pub skeleton: bool,
     /// Steam install has an update pending (`StateFlags` update-required).
     pub update_required: bool,
+    /// Scan determined this target is no longer installed (Steam uninstalled or
+    /// manual file missing). Row is dimmed and cannot launch.
+    pub disabled: bool,
     /// Effective last-played time (catalog touch or Steam), milliseconds. `None` = never.
     pub played_at_ms: Option<u64>,
 }
@@ -219,6 +224,7 @@ impl StartRow {
                         edit: None,
                         skeleton: false,
                         update_required: game.update_required,
+                        disabled: false,
                         played_at_ms: None,
                     }
                 } else if steam_scan_pending {
@@ -234,6 +240,7 @@ impl StartRow {
                         edit: None,
                         skeleton: true,
                         update_required: false,
+                        disabled: false,
                         played_at_ms: None,
                     }
                 } else {
@@ -249,6 +256,9 @@ impl StartRow {
                         edit: None,
                         skeleton: false,
                         update_required: false,
+                        // Disabled is resolved in refresh (needs installed list);
+                        // default to enabled here so unknown-scan fallbacks stay launchable.
+                        disabled: false,
                         played_at_ms: None,
                     }
                 }
@@ -273,6 +283,7 @@ impl StartRow {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    disabled: false,
                     played_at_ms: None,
                 }
             }
@@ -298,6 +309,7 @@ impl StartRow {
             }),
             skeleton: false,
             update_required: game.update_required,
+            disabled: false,
             played_at_ms: None,
         }
     }
@@ -326,6 +338,7 @@ impl StartRow {
             edit: Some(EditRow::Manual { id: id.clone() }),
             skeleton: false,
             update_required: false,
+            disabled: false,
             played_at_ms: None,
         })
     }
@@ -728,6 +741,9 @@ pub struct State {
     pub controller_selected: usize,
     pub controllers: Vec<StartControllerRow>,
     pub running_target: Option<String>,
+    /// Target currently being closed (WM_CLOSE sent, waiting for process exit).
+    /// Shows "Closing" immediately instead of clearing to nothing.
+    pub closing_target: Option<String>,
     pub replace_confirm: Option<ReplaceConfirm>,
     pub manual_add: Option<ManualAddDraft>,
     /// Options settings panel (compact modal / immersive drawer).
@@ -833,6 +849,7 @@ impl Default for State {
             controller_selected: 0,
             controllers: Vec::new(),
             running_target: None,
+            closing_target: None,
             replace_confirm: None,
             manual_add: None,
             settings: crate::ui::start::settings::SettingsPanel::default(),
@@ -880,6 +897,25 @@ impl State {
             self.game_selected = 0;
         } else {
             self.game_selected = self.game_selected.min(self.rows.len() - 1);
+            // If the selected row became disabled (uninstall race), prefer the
+            // nearest enabled row so launch never targets a disabled entry.
+            if !self.editing
+                && self
+                    .rows
+                    .get(self.game_selected)
+                    .is_some_and(|r| r.disabled)
+                && !self.rows[self.game_selected].skeleton
+            {
+                // Search forward first, then backward.
+                let forward = (self.game_selected..self.rows.len())
+                    .find(|&i| !self.rows[i].disabled || self.rows[i].skeleton);
+                let backward = (0..self.game_selected)
+                    .rev()
+                    .find(|&i| !self.rows[i].disabled || self.rows[i].skeleton);
+                if let Some(i) = forward.or(backward) {
+                    self.game_selected = i;
+                }
+            }
         }
         self.snap_position_section();
     }
@@ -2691,10 +2727,28 @@ impl State {
                 if self.rows.is_empty() {
                     return None;
                 }
+                // Skip disabled rows (uninstalled) so nav never lands on them.
+                // Editing mode shows checklist (all enabled); skip only in browse.
+                let step = delta.signum();
+                if step == 0 {
+                    return None;
+                }
                 let len = self.rows.len() as i32;
                 let before = self.game_selected as i32;
-                // No infinite wrap — Up on first / Down on last is a no-op.
-                let after = (before + delta).clamp(0, len - 1);
+                let mut after = before + step;
+                while after >= 0 && after < len {
+                    let enabled = !self.rows[after as usize].disabled || self.editing;
+                    // Skeletons are still navigable (scan in flight).
+                    if enabled || self.rows[after as usize].skeleton {
+                        break;
+                    }
+                    after += step;
+                }
+                // Clamp: no wrap — Up on first / Down on last is a no-op.
+                // If the scan ran past the end over disabled rows, stay put.
+                if after < 0 || after >= len {
+                    return None;
+                }
                 if after == before {
                     return None;
                 }
@@ -3067,17 +3121,18 @@ pub(crate) fn scan_status_stack<'a>(
         .into()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     state: &'a State,
     spectrum: &BatterySpectrum,
     now: Instant,
     always_immersive: bool,
+    clock_enabled: bool,
     promote_gesture: &'a [crate::domain::gesture::GestureControl],
     stage_h: f32,
     settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
 ) -> Element<'a, StartMessage> {
     use crate::ui::start::mode::TransitionPhase;
-
     if matches!(
         state.transition_phase.map(|(p, _)| p),
         Some(TransitionPhase::Resizing)
@@ -3100,6 +3155,7 @@ pub fn view<'a>(
             spectrum,
             now,
             always_immersive,
+            clock_enabled,
             promote_gesture,
             stage_h,
             settings_snapshot,
@@ -3257,6 +3313,10 @@ pub(crate) fn immersive_game_hints(
 ) -> Element<'static, StartMessage> {
     let hint = RowHintState::for_selected(state, true);
     let mut actions = Vec::new();
+    let closing = state
+        .closing_target
+        .as_ref()
+        .is_some_and(|t| t == &row.target);
     if state.editing {
         let label = match row.edit.as_ref() {
             Some(EditRow::Manual { .. }) => "Remove",
@@ -3276,6 +3336,20 @@ pub(crate) fn immersive_game_hints(
                 hint.press_anim,
             ));
         }
+    } else if closing {
+        actions.push(face_hint(
+            FaceButton::Cross,
+            "Closing…",
+            hint.held,
+            hint.press_anim,
+        ));
+    } else if row.disabled {
+        actions.push(face_hint(
+            FaceButton::Cross,
+            "Not installed",
+            hint.held,
+            hint.press_anim,
+        ));
     } else if state
         .running_target
         .as_ref()
@@ -3505,6 +3579,11 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
                     .running_target
                     .as_ref()
                     .is_some_and(|t| t == &row.target);
+            let closing = !state.editing
+                && state
+                    .closing_target
+                    .as_ref()
+                    .is_some_and(|t| t == &row.target);
             let col = if index > 0 {
                 col.push(theme::list_separator())
             } else {
@@ -3515,6 +3594,7 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
                 row,
                 selected,
                 running,
+                closing,
                 state.editing,
                 RowHintState::for_selected(state, selected),
             ))
@@ -4660,16 +4740,22 @@ fn game_row(
     row: &StartRow,
     selected: bool,
     running: bool,
+    closing: bool,
     editing: bool,
     hint: RowHintState,
 ) -> Element<'_, StartMessage> {
     let muted = editing && !row.in_catalog();
-    let title_color = if muted {
+    let disabled = row.disabled && !editing;
+    let title_color = if disabled {
+        theme::alpha(theme::INK, 0.35)
+    } else if muted {
         theme::alpha(theme::INK, 0.45)
     } else {
         theme::INK
     };
-    let sub_color = if muted {
+    let sub_color = if disabled {
+        theme::alpha(theme::MUTED, 0.45)
+    } else if muted {
         theme::alpha(theme::MUTED, 0.55)
     } else {
         theme::MUTED
@@ -4750,10 +4836,24 @@ fn game_row(
             title_text.width(Fill).into()
         };
 
-        let status: Element<'_, StartMessage> = if running {
+        let status: Element<'_, StartMessage> = if closing {
+            text("Closing")
+                .size(13.0)
+                .color(theme::WARNING)
+                .wrapping(Wrapping::None)
+                .width(Fill)
+                .into()
+        } else if running {
             text("Running")
                 .size(13.0)
                 .color(theme::SUCCESS)
+                .wrapping(Wrapping::None)
+                .width(Fill)
+                .into()
+        } else if disabled {
+            text("Not installed")
+                .size(13.0)
+                .color(theme::alpha(theme::MUTED, 0.7))
                 .wrapping(Wrapping::None)
                 .width(Fill)
                 .into()
@@ -4822,12 +4922,26 @@ fn game_row(
                 ));
             }
         } else {
-            if running {
+            if closing {
+                actions.push(face_hint(
+                    FaceButton::Cross,
+                    "Closing…",
+                    hint.held,
+                    hint.press_anim,
+                ));
+            } else if running {
                 actions.push(face_hold_hint(
                     FaceButton::Cross,
                     "Close game",
                     hint.cross_progress,
                     hint.cross_armed_t,
+                    hint.held,
+                    hint.press_anim,
+                ));
+            } else if disabled {
+                actions.push(face_hint(
+                    FaceButton::Cross,
+                    "Not installed",
                     hint.held,
                     hint.press_anim,
                 ));
@@ -5125,6 +5239,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    disabled: false,
                     played_at_ms: None,
                 },
                 StartRow {
@@ -5139,6 +5254,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    disabled: false,
                     played_at_ms: None,
                 },
                 StartRow {
@@ -5153,6 +5269,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    disabled: false,
                     played_at_ms: None,
                 },
             ],
@@ -5197,6 +5314,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    disabled: false,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -5240,6 +5358,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    disabled: false,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -5269,6 +5388,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    disabled: false,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -5282,6 +5402,48 @@ mod tests {
         state.game_selected = 2;
         assert!(state.move_selection(1).is_none());
         assert_eq!(state.game_selected, 2);
+    }
+
+    fn test_row(title: &str, disabled: bool, played_at_ms: Option<u64>) -> StartRow {
+        StartRow {
+            title: title.into(),
+            subtitle: None,
+            target: format!("t-{title}"),
+            args: String::new(),
+            play_key: format!("k-{title}"),
+            icon: None,
+            icon_source: None,
+            backdrop_path: None,
+            edit: None,
+            skeleton: false,
+            update_required: false,
+            disabled,
+            played_at_ms,
+        }
+    }
+
+    #[test]
+    fn move_selection_skips_disabled_rows() {
+        let mut state = State {
+            rows: vec![
+                test_row("a", false, None),
+                test_row("b", true, None),
+                test_row("c", false, None),
+            ],
+            game_selected: 0,
+            ..Default::default()
+        };
+        // Down from 0 skips disabled 1, lands on 2.
+        assert!(state.move_selection(1).is_some());
+        assert_eq!(state.game_selected, 2);
+        // Up from 2 skips disabled 1, lands on 0.
+        assert!(state.move_selection(-1).is_some());
+        assert_eq!(state.game_selected, 0);
+        // All disabled past selection: no move.
+        state.game_selected = 0;
+        state.rows[2].disabled = true;
+        assert!(state.move_selection(1).is_none());
+        assert_eq!(state.game_selected, 0);
     }
 
     fn write_tiny_png(path: &std::path::Path) {
@@ -5310,6 +5472,7 @@ mod tests {
                 edit: None,
                 skeleton: false,
                 update_required: false,
+                disabled: false,
                 played_at_ms: None,
             }],
             game_selected: 0,
@@ -5444,6 +5607,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    disabled: false,
                     played_at_ms: None,
                 }],
                 game_selected: 0,
@@ -5490,6 +5654,7 @@ mod tests {
                 edit: None,
                 skeleton: true,
                 update_required: false,
+                disabled: false,
                 played_at_ms: None,
             }],
             game_selected: 0,
@@ -5539,6 +5704,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    disabled: false,
                     played_at_ms: None,
                 }],
                 game_selected: 0,
@@ -5575,6 +5741,7 @@ mod tests {
                 edit: None,
                 skeleton: true,
                 update_required: false,
+                disabled: false,
                 played_at_ms: None,
             }],
             game_selected: 0,
@@ -5753,6 +5920,7 @@ mod tests {
                         edit: None,
                         skeleton: false,
                         update_required: false,
+                        disabled: false,
                         played_at_ms: None,
                     },
                     StartRow {
@@ -5767,6 +5935,7 @@ mod tests {
                         edit: None,
                         skeleton: false,
                         update_required: false,
+                        disabled: false,
                         played_at_ms: None,
                     },
                 ],
@@ -5836,6 +6005,7 @@ mod tests {
                         edit: None,
                         skeleton: false,
                         update_required: false,
+                        disabled: false,
                         played_at_ms: None,
                     },
                     StartRow {
@@ -5850,6 +6020,7 @@ mod tests {
                         edit: None,
                         skeleton: false,
                         update_required: false,
+                        disabled: false,
                         played_at_ms: None,
                     },
                 ],
@@ -5907,6 +6078,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    disabled: false,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -5939,6 +6111,7 @@ mod tests {
                     edit: None,
                     skeleton: false,
                     update_required: false,
+                    disabled: false,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -5987,6 +6160,7 @@ mod tests {
                 edit: None,
                 skeleton: false,
                 update_required: false,
+                disabled: false,
                 played_at_ms: None,
             };
             assert!(row.list_icon_live().is_none());

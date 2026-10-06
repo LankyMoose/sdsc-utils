@@ -26,7 +26,7 @@ use crate::persist::analytics::{self, AnalyticsStore};
 use crate::persist::notify::NotifyEvent;
 use crate::persist::paths;
 use crate::persist::prefs::{
-    Prefs, clamp_low_battery_percent, clamp_start_screen_haptics_strength,
+    Prefs, StartAutoOpen, clamp_low_battery_percent, clamp_start_screen_haptics_strength,
     clamp_start_screen_idle_timeouts, clamp_start_screen_inactive_dim_percent,
     clamp_start_screen_sound_volume,
 };
@@ -115,6 +115,8 @@ pub enum Message {
     PollResult(Result<Vec<ControllerStatus>, String>),
     /// Result of a background process-image snapshot (running badge).
     ProcessEnumResult(Result<Vec<(u32, PathBuf)>, String>),
+    /// Background game-close finished (WM_CLOSE + terminate); badge refresh clears "Closing".
+    CloseGameDone(Result<(), String>),
 
     /// A tray menu item was activated.
     TrayMenu(String),
@@ -270,6 +272,8 @@ pub struct App {
     /// Last armed-pad face held snapshot (merged with keyboard in [`Self::sync_start_held`]).
     pad_held: FaceHeld,
     running_session: Option<RunningSession>,
+    /// Match paths for the target currently showing "Closing" (cleared on process exit).
+    closing_match_paths: Vec<PathBuf>,
     /// Throttle for process enumeration / catalog restore (not pad UI).
     last_running_check: Option<Instant>,
     /// True while a background process enum task is outstanding.
@@ -313,12 +317,10 @@ pub struct App {
     toast_anim_started: Instant,
     /// Pure toast / deferred-Start presentation machine.
     toast_machine: toast_machine::State,
-    /// Hold toast show until immersive Start can host the composite (0→1 Connected).
     /// True until the first Start HWND of this process finishes its cold-load ceremony.
     start_cold_load_remaining: bool,
     /// Compact Steam settle fired during promote ceremony — kick after EnterImmersive.
     steam_scan_deferred_for_promote: bool,
-    defer_toast_for_immersive_start: bool,
 
     /// Bumped on every spectrum edit; stale SpectrumCommit messages are ignored.
     spectrum_generation: u64,
@@ -473,6 +475,7 @@ impl App {
             cancel_key_held: false,
             pad_held: FaceHeld::default(),
             running_session: None,
+            closing_match_paths: Vec::new(),
             last_running_check: None,
             process_enum_inflight: false,
             match_path_cache: HashMap::new(),
@@ -499,7 +502,6 @@ impl App {
             toast_machine: toast_machine::State::Idle,
             start_cold_load_remaining: true,
             steam_scan_deferred_for_promote: false,
-            defer_toast_for_immersive_start: false,
             spectrum_generation: 0,
             #[cfg(feature = "dev-emulate")]
             dev_mode,
@@ -704,6 +706,7 @@ impl App {
                 &self.session.prefs.spectrum,
                 Instant::now(),
                 self.session.prefs.start_screen_always_immersive,
+                self.session.prefs.start_screen_clock_enabled,
                 // Prefs always normalize to PS on load/save.
                 &self.session.prefs.start_screen_gesture,
                 stage_h,
@@ -740,6 +743,7 @@ impl App {
             Message::Tick => self.on_tick(),
             Message::PollResult(result) => self.on_poll_result(result),
             Message::ProcessEnumResult(result) => self.on_process_enum_result(result),
+            Message::CloseGameDone(result) => self.on_close_game_done(result),
 
             Message::TrayMenu(id) => match id.as_str() {
                 SETTINGS_ID => self.open_configure(),
@@ -771,18 +775,16 @@ impl App {
                     let sync = self.sync_toast_zorder();
                     if self.session.start_auto_open_pending
                         && self.session.prefs.start_screen_enabled
+                        && self.session.prefs.start_screen_auto_open.auto_opens()
                         && crate::session::has_start_presence(
                             &self.session.controllers,
-                            self.session.prefs.start_screen_usb_controllers,
+                            self.session.prefs.start_screen_auto_open.includes_usb(),
                         )
                     {
                         crate::controller::hid::diag::diag_info(
                             "ui-diag: retry start open after close",
                         );
                         sync.chain(self.open_start_screen())
-                    } else if self.defer_toast_for_immersive_start {
-                        // Start will not host — fall back to HWND toasts.
-                        sync.chain(self.release_deferred_immersive_toasts_fallback())
                     } else {
                         sync
                     }
@@ -899,15 +901,7 @@ impl App {
                             task = task.chain(self.warm_start_art_task());
                         }
                     }
-                    let release = if self.defer_toast_for_immersive_start
-                        && self.start_visible
-                        && !self.start_state.immersive
-                    {
-                        self.release_deferred_immersive_toasts_fallback()
-                    } else {
-                        self.try_release_deferred_immersive_toasts()
-                    };
-                    task.chain(release)
+                    task
                 } else {
                     Task::none()
                 }
@@ -1684,11 +1678,12 @@ impl App {
             analytics_enabled: self.session.prefs.analytics_enabled,
             lightbar_enabled: self.session.prefs.lightbar_enabled,
             start_screen_enabled: self.session.prefs.start_screen_enabled,
+            start_screen_auto_open: self.session.prefs.start_screen_auto_open,
             start_screen_always_immersive: self.session.prefs.start_screen_always_immersive,
+            start_screen_clock_enabled: self.session.prefs.start_screen_clock_enabled,
             start_screen_inactive_secs: self.session.prefs.start_screen_inactive_secs,
             start_screen_sleep_secs: self.session.prefs.start_screen_sleep_secs,
             start_screen_inactive_dim_percent: self.session.prefs.start_screen_inactive_dim_percent,
-            start_screen_usb_controllers: self.session.prefs.start_screen_usb_controllers,
             start_screen_sounds_enabled: self.session.prefs.start_screen_sounds_enabled,
             start_screen_sound_volume: self.session.prefs.start_screen_sound_volume,
             start_screen_haptics_enabled: self.session.prefs.start_screen_haptics_enabled,
@@ -1845,8 +1840,14 @@ impl App {
                 }
                 Task::none()
             }
+            ConfigureMessage::SetStartScreenAutoOpen(enabled) => {
+                self.apply_start_screen_auto_open(enabled)
+            }
             ConfigureMessage::SetStartScreenAlwaysImmersive(enabled) => {
                 self.apply_start_screen_always_immersive(enabled)
+            }
+            ConfigureMessage::SetStartScreenClock(enabled) => {
+                self.apply_start_screen_clock(enabled)
             }
             ConfigureMessage::SetStartScreenInactiveSecs(secs) => {
                 self.apply_start_screen_inactive_secs(secs)
@@ -1856,9 +1857,6 @@ impl App {
             }
             ConfigureMessage::SetStartScreenInactiveDimPercent(percent) => {
                 self.apply_start_screen_inactive_dim_percent(percent)
-            }
-            ConfigureMessage::SetStartScreenUsbControllers(enabled) => {
-                self.apply_start_screen_usb_controllers(enabled)
             }
             ConfigureMessage::SetStartScreenSounds(enabled) => {
                 self.apply_start_screen_sounds(enabled)
@@ -2052,7 +2050,7 @@ impl App {
         if crate::session::should_skip_connect_cooldown_on_power_off(
             &self.session.controllers,
             serial,
-            self.session.prefs.start_screen_usb_controllers,
+            self.session.prefs.start_screen_auto_open.includes_usb(),
         ) {
             self.session.mark_skip_connect_cooldown();
         }
@@ -2218,8 +2216,10 @@ impl App {
 
     fn display_catalog(&self) -> Vec<crate::games::GameEntry> {
         let steam_by_id = &self.steam_by_id;
+        // Keep uninstalled Steam entries so rows can render disabled instead of
+        // vanishing. Disabled is resolved per-row in refresh_start_rows.
         self.games.merge_sorted(
-            self.steam_installed.as_deref(),
+            None,
             self.session.prefs.games_sort_mode,
             |entry| match entry {
                 crate::games::GameEntry::Steam { appid } => steam_by_id
@@ -2258,11 +2258,33 @@ impl App {
                         self.steam_scan_pending,
                     );
                     row.played_at_ms = self.effective_played_ms(entry);
+                    row.disabled = self.is_entry_disabled(entry, &row);
                     row
                 })
                 .collect()
         };
         self.start_state.set_rows(rows);
+    }
+
+    /// True when scan proves this entry is no longer installed (disabled row).
+    fn is_entry_disabled(
+        &self,
+        entry: &crate::games::GameEntry,
+        row: &start_view::StartRow,
+    ) -> bool {
+        if row.skeleton {
+            return false;
+        }
+        match entry {
+            crate::games::GameEntry::Steam { appid } => {
+                // Unknown scan (None) keeps rows enabled; known scan disables missing.
+                match self.steam_installed.as_deref() {
+                    Some(ids) => !ids.contains(appid),
+                    None => false,
+                }
+            }
+            crate::games::GameEntry::Manual { target, .. } => is_manual_target_missing(target),
+        }
     }
 
     fn edit_catalog(&self) -> &GamesCatalog {
@@ -2449,6 +2471,7 @@ impl App {
             if process_match::any_matching_in_images(&session.match_paths, images) {
                 session.miss_since = None;
                 self.start_state.running_target = Some(session.target.clone());
+                // Keep any unrelated Closing visible; don't clear it here.
                 return;
             }
 
@@ -2471,6 +2494,18 @@ impl App {
             }
         } else {
             self.start_state.running_target = None;
+        }
+
+        // "Closing" stays until its process actually exits (or paths were empty).
+        if self.start_state.closing_target.is_some() {
+            if !self.closing_match_paths.is_empty()
+                && process_match::any_matching_in_images(&self.closing_match_paths, images)
+            {
+                // Still exiting: keep Closing, don't restore it as Running.
+                return;
+            }
+            self.start_state.closing_target = None;
+            self.closing_match_paths.clear();
         }
 
         self.try_restore_running_from_catalog(images);
@@ -2537,29 +2572,49 @@ impl App {
         self.games.save();
     }
 
-    fn close_running_game(&mut self) {
+    fn close_running_game(&mut self) -> Task<Message> {
         let Some(session) = self.running_session.clone() else {
-            return;
+            return Task::none();
         };
-        if let Err(err) = process_match::close_matching(&session.match_paths) {
-            app_log::warn(format!("close game failed for {}: {err}", session.target));
-        }
+        // Show "Closing" immediately; clear "Playing" now so the status flips
+        // on the next frame even though WM_CLOSE + terminate blocks.
+        self.start_state.closing_target = Some(session.target.clone());
+        self.closing_match_paths = session.match_paths.clone();
         self.running_session = None;
         self.start_state.running_target = None;
+        self.start_state.cross_progress = 0.0;
+        let match_paths = session.match_paths.clone();
+        let target = session.target.clone();
+        crate::controller::hid::diag::diag_info(format!("ui-diag: game closing target={target}"));
+        Task::perform(
+            spawn_blocking(move || process_match::close_matching(&match_paths)),
+            |res: Result<Result<(), String>, String>| {
+                Message::CloseGameDone(res.unwrap_or_else(Err))
+            },
+        )
+    }
+
+    fn on_close_game_done(&mut self, result: Result<(), String>) -> Task<Message> {
+        if let Err(err) = result {
+            app_log::warn(format!("close game failed: {err}"));
+        }
+        // Force a process check so "Closing" clears as soon as the process exits.
+        self.last_running_check = None;
+        self.refresh_running_badge()
     }
 
     /// Hold-Cross close: only when the selected row is the running game.
-    fn close_running_game_if_selected(&mut self) {
+    fn close_running_game_if_selected(&mut self) -> Task<Message> {
         let Some(session) = self.running_session.as_ref() else {
-            return;
+            return Task::none();
         };
         let Some(row) = self.start_state.rows.get(self.start_state.game_selected) else {
-            return;
+            return Task::none();
         };
         if !session.matches_target(&row.target) {
-            return;
+            return Task::none();
         }
-        self.close_running_game();
+        self.close_running_game()
     }
 
     fn seed_steam_library_from_cache(&mut self) {
@@ -2822,8 +2877,9 @@ impl App {
 
     fn start_settings_snapshot(&self) -> crate::ui::start::settings::StartSettingsSnapshot {
         crate::ui::start::settings::StartSettingsSnapshot {
-            usb_controllers: self.session.prefs.start_screen_usb_controllers,
+            auto_open: self.session.prefs.start_screen_auto_open,
             always_immersive: self.session.prefs.start_screen_always_immersive,
+            clock_enabled: self.session.prefs.start_screen_clock_enabled,
             inactive_secs: self.session.prefs.start_screen_inactive_secs,
             sleep_secs: self.session.prefs.start_screen_sleep_secs,
             inactive_dim_percent: self.session.prefs.start_screen_inactive_dim_percent,
@@ -2836,6 +2892,12 @@ impl App {
 
     fn apply_start_screen_always_immersive(&mut self, enabled: bool) -> Task<Message> {
         self.session.prefs.start_screen_always_immersive = enabled;
+        self.session.prefs.save();
+        Task::none()
+    }
+
+    fn apply_start_screen_clock(&mut self, enabled: bool) -> Task<Message> {
+        self.session.prefs.start_screen_clock_enabled = enabled;
         self.session.prefs.save();
         Task::none()
     }
@@ -2875,13 +2937,25 @@ impl App {
         Task::none()
     }
 
-    fn apply_start_screen_usb_controllers(&mut self, enabled: bool) -> Task<Message> {
-        if self.session.prefs.start_screen_usb_controllers == enabled {
+    fn apply_start_screen_auto_open(&mut self, mode: StartAutoOpen) -> Task<Message> {
+        let old = self.session.prefs.start_screen_auto_open;
+        if old == mode {
             return Task::none();
         }
-        self.session.prefs.start_screen_usb_controllers = enabled;
+        self.session.prefs.start_screen_auto_open = mode;
         self.session.prefs.save();
-        // Prefs flip may CloseStart when USB pads no longer qualify; never opens.
+        // Selecting from the menu collapses it.
+        self.start_state.settings.auto_open_menu = None;
+        if !mode.auto_opens() {
+            // Disabling auto-open clears any latched auto-open; never opens
+            // or closes here.
+            self.session.start_auto_open_pending = false;
+            return Task::none();
+        }
+        if mode.includes_usb() == old.includes_usb() {
+            return Task::none();
+        }
+        // Scope flip may CloseStart when USB pads no longer qualify; never opens.
         // Client mode: service reloads prefs within ~2s and applies the same rule.
         let ctx = crate::session::ApplyContext {
             start_visible: self.start_visible,
@@ -3783,12 +3857,26 @@ impl App {
                 }
                 Task::none()
             }
-            StartMessage::SetUsbControllers(enabled) => {
-                self.apply_start_screen_usb_controllers(enabled)
+            StartMessage::SetAutoOpen(mode) => self.apply_start_screen_auto_open(mode),
+            StartMessage::ToggleAutoOpenMenu => {
+                if self.start_state.settings.auto_open_menu.take().is_some() {
+                    self.play_start_cue(UiSoundKind::Nav);
+                    Task::none()
+                } else {
+                    let current = self.session.prefs.start_screen_auto_open;
+                    let highlight = crate::persist::prefs::AUTO_OPEN_MODES
+                        .iter()
+                        .position(|&m| m == current)
+                        .unwrap_or(0);
+                    self.start_state.settings.auto_open_menu = Some(highlight);
+                    self.play_start_cue(UiSoundKind::Nav);
+                    self.scroll_settings_focus_into_view(start_view::ScrollReveal::Either)
+                }
             }
             StartMessage::SetAlwaysImmersive(enabled) => {
                 self.apply_start_screen_always_immersive(enabled)
             }
+            StartMessage::SetClock(enabled) => self.apply_start_screen_clock(enabled),
             StartMessage::SetInactiveSecs(secs) => self.apply_start_screen_inactive_secs(secs),
             StartMessage::SetSleepSecs(secs) => self.apply_start_screen_sleep_secs(secs),
             StartMessage::SetInactiveDimPercent(percent) => {
@@ -4166,12 +4254,12 @@ impl App {
         self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
         self.start_state.cross_progress = 0.0;
-        self.close_running_game();
+        let close_task = self.close_running_game();
         self.start_state.game_selected = confirm.next_index;
         if self.launch_selected() && self.start_state.immersive {
-            return self.close_start_screen();
+            return close_task.chain(self.close_start_screen());
         }
-        Task::none()
+        close_task
     }
 
     /// Launch the selected game. Returns true when launch, replace-confirm, or a real attempt ran.
@@ -4184,6 +4272,29 @@ impl App {
         else {
             return false;
         };
+
+        // Don't relaunch while this row is still closing.
+        if self
+            .start_state
+            .closing_target
+            .as_ref()
+            .is_some_and(|t| t == &row.target)
+        {
+            return false;
+        }
+
+        // Disabled rows never launch (uninstalled Steam or missing manual target).
+        // Re-validate at launch time so a stale row (scan race / immediate launch
+        // after uninstall) fails gracefully instead of opening Steam / error popup.
+        if row.disabled || self.is_row_invalid_now(&row) {
+            app_log::warn(format!(
+                "launch blocked (no longer installed): {} ({})",
+                row.title, row.target
+            ));
+            // Refresh disabled flags so the row dims immediately.
+            self.refresh_start_rows();
+            return false;
+        }
 
         if let Some(session) = self.running_session.as_ref() {
             if session.matches_target(&row.target) {
@@ -4209,9 +4320,28 @@ impl App {
             }
             Err(err) => {
                 app_log::warn(format!("launch failed for {}: {err}", row.target));
+                // Immediate-launch race (uninstalled between scan and press):
+                // refresh so the row dims instead of staying launchable.
+                self.refresh_start_rows();
                 false
             }
         }
+    }
+
+    /// Re-validate a row at press time (scan may be stale for immediate launches).
+    fn is_row_invalid_now(&self, row: &start_view::StartRow) -> bool {
+        if row.skeleton {
+            return true;
+        }
+        // Steam URI: check installed list when known.
+        if let Some(appid) = steam_appid_from_target(&row.target) {
+            if let Some(ids) = self.steam_installed.as_deref() {
+                return !ids.contains(&appid);
+            }
+            return false;
+        }
+        // Manual file target: absolute missing path is invalid.
+        is_manual_target_missing(&row.target)
     }
 
     fn on_service_message(&mut self, msg: crate::ipc::ServiceMessage) -> Task<Message> {
@@ -4573,11 +4703,12 @@ impl App {
         } else {
             self.keyboard_cross_hold.reset();
 
+            let mut close_task = Task::none();
             if hold_cross_close {
                 self.start_state.cross_progress = tick.cross_progress;
                 if tick.cross_completed {
                     self.play_start_cue(UiSoundKind::Hold);
-                    self.close_running_game_if_selected();
+                    close_task = self.close_running_game_if_selected();
                 }
             } else {
                 self.start_state.cross_progress = 0.0;
@@ -4601,7 +4732,7 @@ impl App {
 
             if tick.cross_completed && hold_cross_close {
                 // Hold-close already handled; do not also Confirm/Launch.
-                Task::none()
+                close_task
             } else if let Some(action) = tick.action {
                 match action {
                     NavAction::Up => self.on_start_message(StartMessage::MoveUp),
@@ -4655,6 +4786,10 @@ impl App {
         let Some(action) = action else {
             return Task::none();
         };
+        // Expanded dropdown captures all directional + confirm/cancel input.
+        if self.start_state.settings.auto_open_menu.is_some() {
+            return self.on_auto_open_menu_nav(action);
+        }
         let snapshot = self.start_settings_snapshot();
         self.start_state.settings.clamp_focus(&snapshot);
         match action {
@@ -4716,6 +4851,42 @@ impl App {
             }
             NavAction::Cancel | NavAction::ToggleSettings => {
                 self.on_start_message(StartMessage::Close)
+            }
+            _ => Task::none(),
+        }
+    }
+
+    /// Pad navigation while the auto-open dropdown menu is expanded.
+    /// Directionals move the highlight (wrapping), Cross selects and closes,
+    /// Circle/Options close without changing anything.
+    fn on_auto_open_menu_nav(&mut self, action: NavAction) -> Task<Message> {
+        const COUNT: isize = crate::persist::prefs::AUTO_OPEN_MODES.len() as isize;
+        let Some(highlight) = self.start_state.settings.auto_open_menu else {
+            return Task::none();
+        };
+        match action {
+            NavAction::Up | NavAction::PrevSlide => {
+                let next = (highlight as isize - 1).rem_euclid(COUNT) as usize;
+                self.start_state.settings.auto_open_menu = Some(next);
+                self.play_start_cue(UiSoundKind::Nav);
+                self.scroll_settings_focus_into_view(start_view::ScrollReveal::Either)
+            }
+            NavAction::Down | NavAction::NextSlide => {
+                let next = (highlight as isize + 1).rem_euclid(COUNT) as usize;
+                self.start_state.settings.auto_open_menu = Some(next);
+                self.play_start_cue(UiSoundKind::Nav);
+                self.scroll_settings_focus_into_view(start_view::ScrollReveal::Either)
+            }
+            NavAction::Confirm => {
+                let mode = crate::persist::prefs::AUTO_OPEN_MODES
+                    [highlight.min(crate::persist::prefs::AUTO_OPEN_MODES.len() - 1)];
+                self.play_start_cue(UiSoundKind::Action);
+                self.apply_start_screen_auto_open(mode)
+            }
+            NavAction::Cancel | NavAction::ToggleSettings => {
+                self.start_state.settings.auto_open_menu = None;
+                self.play_start_cue(UiSoundKind::Nav);
+                Task::none()
             }
             _ => Task::none(),
         }
@@ -4856,85 +5027,54 @@ impl App {
 
     fn queue_notifications(
         &mut self,
-        events: Vec<NotifyEvent>,
+        mut events: Vec<NotifyEvent>,
         mut open_start_after: bool,
     ) -> Task<Message> {
         let connect_open_start =
             open_start_after && events.iter().any(|event| event.body == "Connected");
         let immersive_connect =
             connect_open_start && self.session.prefs.start_screen_always_immersive;
+        // Immersive auto-open never shows a Connected toast (cold-launch via
+        // launch_quiet and hot connects must match). Session already filters,
+        // but drop any that slipped through (service race) so behaviour is
+        // bullet-proof.
+        if immersive_connect {
+            let before = events.len();
+            events.retain(|event| event.body != "Connected");
+            if events.len() != before {
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: connect toast suppressed (immersive auto-open, shell)",
+                );
+            }
+            let open = self.open_start_screen();
+            // Queue any non-Connected events normally (Low/Charged); Connected is gone.
+            for event in events {
+                let eta = self.toast_eta_for(&event);
+                let message = ToastMessage::from_notification(
+                    event,
+                    self.session.prefs.spectrum.clone(),
+                    eta,
+                );
+                self.toast_queue.push_back(message);
+            }
+            return open.chain(self.show_next_toast());
+        }
+        // Compact auto-open is toast-first: latch Start onto the toast settle so
+        // the Connected card always presents (the toast machine emits OpenStart
+        // exactly once — on rest, early dismiss, or slide-out finish).
         for event in events {
             let eta = self.toast_eta_for(&event);
             let mut message =
                 ToastMessage::from_notification(event, self.session.prefs.spectrum.clone(), eta);
             if open_start_after && message.body == "Connected" {
                 open_start_after = false;
-                // Open Start immediately; Connected toast follows (composite when immersive).
-                message.after = AfterToast::Nothing;
+                message.after = AfterToast::OpenStart;
                 crate::controller::hid::diag::diag_info(
-                    "ui-diag: start first on connect (toast after)",
+                    "ui-diag: defer start until toast slide settles",
                 );
             }
             self.toast_queue.push_back(message);
         }
-        if connect_open_start {
-            return self.begin_connect_open_start_first(immersive_connect);
-        }
-        self.show_next_toast()
-    }
-
-    /// Open Start first on Connected; hold the toast until Start can host it (or HWND fallback).
-    fn begin_connect_open_start_first(&mut self, immersive: bool) -> Task<Message> {
-        let was_visible = self.start_visible;
-        self.defer_toast_for_immersive_start = true;
-        crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: connect toast start-first immersive={}",
-            u8::from(immersive)
-        ));
-        if !self.session.prefs.start_screen_enabled {
-            return self.release_deferred_immersive_toasts_fallback();
-        }
-        let open = self.open_start_screen();
-        if was_visible && self.start_visible && self.start_state.immersive == immersive {
-            return open.chain(self.try_release_deferred_immersive_toasts());
-        }
-        if self.start_visible && self.start_state.immersive {
-            // Cold immersive open in flight — wait for StartOpened before composite toast.
-            return open;
-        }
-        if self.start_visible && !self.start_state.immersive {
-            // Compact hosts Connected on the toast HWND (raise above Start).
-            return open.chain(self.release_deferred_immersive_toasts_fallback());
-        }
-        if self.start_window.is_some() {
-            // Close in flight; WindowClosed retries open, then StartOpened releases.
-            return open;
-        }
-        // Open did not take — show on HWND so Connected is never dropped.
-        open.chain(self.release_deferred_immersive_toasts_fallback())
-    }
-
-    /// Release held toasts once immersive Start is hosting (or drop the hold).
-    fn try_release_deferred_immersive_toasts(&mut self) -> Task<Message> {
-        if !self.defer_toast_for_immersive_start {
-            return Task::none();
-        }
-        if self.start_visible && self.start_state.immersive {
-            crate::controller::hid::diag::diag_info(
-                "ui-diag: immersive connect toast release (start hosting)",
-            );
-            self.defer_toast_for_immersive_start = false;
-            return self.show_next_toast();
-        }
-        Task::none()
-    }
-
-    fn release_deferred_immersive_toasts_fallback(&mut self) -> Task<Message> {
-        if !self.defer_toast_for_immersive_start {
-            return Task::none();
-        }
-        crate::controller::hid::diag::diag_info("ui-diag: immersive connect toast fallback (hwnd)");
-        self.defer_toast_for_immersive_start = false;
         self.show_next_toast()
     }
 
@@ -5008,9 +5148,6 @@ impl App {
     }
 
     fn show_next_toast(&mut self) -> Task<Message> {
-        if self.defer_toast_for_immersive_start {
-            return Task::none();
-        }
         if self.toast_message.is_some() {
             return Task::none();
         }
@@ -5173,7 +5310,8 @@ impl App {
     fn effect_open_start(&mut self) -> Task<Message> {
         if crate::session::should_flush_latched_start(
             true,
-            self.session.prefs.start_screen_enabled,
+            self.session.prefs.start_screen_enabled
+                && self.session.prefs.start_screen_auto_open.auto_opens(),
             self.start_visible,
         ) {
             crate::controller::hid::diag::diag_info("ui-diag: start open after toast settle");
@@ -5668,6 +5806,32 @@ impl window::raw_window_handle::HasDisplayHandle for Win32DialogParent {
 // ---------------------------------------------------------------------------
 // Background helpers
 // ---------------------------------------------------------------------------
+
+/// True when a manual target is provably missing (absolute path that no longer exists).
+///
+/// URLs (`://`) and relative / shell targets stay enabled to avoid false positives.
+/// Empty targets are disabled (launch would fail immediately).
+fn is_manual_target_missing(target: &str) -> bool {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.contains("://") {
+        return false;
+    }
+    let path = std::path::Path::new(trimmed);
+    if path.is_absolute() {
+        return !path.exists();
+    }
+    false
+}
+
+fn steam_appid_from_target(target: &str) -> Option<u32> {
+    let rest = target.strip_prefix("steam://rungameid/")?;
+    rest.split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|s| s.parse().ok())
+}
 
 /// Run a blocking closure on a worker thread and await its result.
 fn spawn_blocking<T, F>(f: F) -> impl Future<Output = Result<T, String>> + Send
