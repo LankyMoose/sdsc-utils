@@ -70,6 +70,12 @@ pub struct Prefs {
     /// Open the start-screen launcher on 0→1 connect / reopen gesture (default on).
     #[serde(default = "default_true")]
     pub start_screen_enabled: bool,
+    /// When true, connecting a controller opens the start screen (default on).
+    /// When false, only reopen gesture / PS chord opens Start, even if start screen is enabled.
+    /// Separated from `start_screen_enabled` so users can enable the feature without
+    /// having every connect trigger the start screen.
+    #[serde(default = "default_true")]
+    pub start_screen_opens_on_connect: bool,
     /// Always use immersive Start (never show compact; cancel closes) (default on).
     #[serde(default = "default_true")]
     pub start_screen_always_immersive: bool,
@@ -252,6 +258,7 @@ impl Default for Prefs {
             start_screen_sound_volume: default_start_screen_sound_volume(),
             start_screen_haptics_enabled: true,
             start_screen_haptics_strength: default_start_screen_haptics_strength(),
+            start_screen_opens_on_connect: true,
             games_sort_mode: GamesSortMode::default(),
             show_all_controllers: false,
         }

@@ -225,14 +225,15 @@ impl DeviceSession {
         effects.push(SessionEffect::SaveKnown);
         let connect_toast_queued = events.iter().any(|event| event.body == "Connected");
         let want_auto_open = presence_edge.is_some_and(|(prev_present, next_present)| {
-            should_auto_open_start(
-                self.prefs.start_screen_enabled,
-                !prev_present,
-                next_present,
-                ctx.start_visible,
-                self.cooldown_active(ctx.now),
-                ctx.fullscreen,
-            )
+            self.prefs.start_screen_opens_on_connect
+                && should_auto_open_start(
+                    self.prefs.start_screen_enabled,
+                    !prev_present,
+                    next_present,
+                    ctx.start_visible,
+                    self.cooldown_active(ctx.now),
+                    ctx.fullscreen,
+                )
         });
         // When auto-open is desired, suppress the connect toast entirely.
         // This makes cold-launch and hot-connect behavior consistent:
