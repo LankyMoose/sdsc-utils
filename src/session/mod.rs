@@ -234,6 +234,10 @@ impl DeviceSession {
                 ctx.fullscreen,
             )
         });
+        // When auto-open is desired, suppress the connect toast entirely.
+        // This makes cold-launch and hot-connect behavior consistent:
+        // - Cold-launch with controller already on: no connect toast
+        // - Turning on a controller afterwards: no connect toast when auto-open triggers
         if want_auto_open {
             self.start_auto_open_pending = true;
         }
