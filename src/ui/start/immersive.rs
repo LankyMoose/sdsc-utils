@@ -75,6 +75,22 @@ pub fn compact_transition_overlay(
     .into()
 }
 
+/// Format the current time into a well-formatted string (e.g., "3:45 PM" or "14:45").
+fn format_system_time(now: Instant) -> String {
+    let secs = now
+        .duration_since(std::time::Instant::now())
+        .max(std::time::Duration::new(0, 0));
+    let total_secs = secs.as_secs();
+    let hours = (total_secs / 3600) % 24;
+    let minutes = (total_secs / 60) % 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+    } else {
+        format!("{:02}:{:02}", minutes, seconds)
+    }
+}
+
 pub fn view<'a>(
     state: &'a State,
     spectrum: &BatterySpectrum,
@@ -99,7 +115,20 @@ pub fn view<'a>(
     } else if state.replace_confirm.is_some() {
         modal_card(replace_confirm_view(state))
     } else {
-        stage_with_dock(state, spectrum, now, dock_p, flat, stage_h)
+        // Prepend a center-top clock widget to the stage with dock
+        let clock = text(format_system_time(now))
+            .size(24)
+            .width(iced::Length::Fill);
+        column![
+            clock,
+            space().height(iced::Length::Shrink),
+            stage_with_dock(state, spectrum, now, dock_p, flat, stage_h),
+            space().height(iced::Length::Fill),
+        ]
+        .align_x(iced::alignment::Horizontal::Center)
+        .width(Fill)
+        .height(Fill)
+        .into()
     };
 
     let footer_capsule = container(footer_hint(
