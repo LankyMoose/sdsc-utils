@@ -69,6 +69,9 @@ pub enum Section {
     PadInput,
     #[cfg(feature = "dev-emulate")]
     Developer,
+    /// Debug-only renderer diagnostics (window stress test).
+    #[cfg(debug_assertions)]
+    Diagnostics,
 }
 
 impl Section {
@@ -83,6 +86,8 @@ impl Section {
             Self::PadInput => "Pad input",
             #[cfg(feature = "dev-emulate")]
             Self::Developer => "Developer",
+            #[cfg(debug_assertions)]
+            Self::Diagnostics => "Diagnostics",
         }
     }
 
@@ -101,19 +106,25 @@ impl Section {
                 sections.push(Self::PadInput);
                 sections.push(Self::Developer);
             }
+            #[cfg(debug_assertions)]
+            sections.push(Self::Diagnostics);
             sections
         }
         #[cfg(not(feature = "dev-emulate"))]
         {
             let _ = show_developer;
-            vec![
+            #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+            let mut sections = vec![
                 Self::System,
                 Self::StartScreen,
                 Self::Notifications,
                 Self::ToastPosition,
                 Self::Lightbar,
                 Self::Analytics,
-            ]
+            ];
+            #[cfg(debug_assertions)]
+            sections.push(Self::Diagnostics);
+            sections
         }
     }
 }
@@ -237,6 +248,9 @@ pub enum ConfigureMessage {
     ResetSpectrum,
     #[cfg(feature = "dev-emulate")]
     DeveloperPreset(Preset),
+    /// Debug-only: start the renderer window stress test (Diagnostics section).
+    #[cfg(debug_assertions)]
+    RunWindowStress,
     /// Begin an OS window drag (title-bar press on the undecorated window).
     DragWindow,
     Close,
@@ -597,7 +611,29 @@ fn section_content<'a>(
         Section::PadInput => pad_input_view(pad_input),
         #[cfg(feature = "dev-emulate")]
         Section::Developer => developer_view(),
+        #[cfg(debug_assertions)]
+        Section::Diagnostics => diagnostics_view(),
     }
+}
+
+#[cfg(debug_assertions)]
+fn diagnostics_view<'a>() -> Element<'a, ConfigureMessage> {
+    column![
+        text("Renderer stress test")
+            .size(13.0)
+            .color(theme::INK),
+        text("Runs rapid toast + cold Start + configure + edit churn (the wgpu atlas-crash shape) for about a minute to shake out renderer crashes. Takes over window open/close while running — don't drive the UI at the same time, then check app.log for PANIC lines.")
+            .size(12.0)
+            .color(theme::DIM),
+        button(text("Run window stress test").size(13.0).width(Fill))
+            .padding([6, 10])
+            .width(Fill)
+            .on_press(ConfigureMessage::RunWindowStress)
+            .style(theme::primary),
+    ]
+    .spacing(8)
+    .width(Fill)
+    .into()
 }
 
 fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {

@@ -166,6 +166,11 @@ pub enum Message {
     SteamScanIdleFallback,
     /// Post-cold settle delay elapsed — kick background Steam refresh.
     SteamScanAfterSettle,
+    /// Debug-only window stress driver (Diagnostics section in Settings):
+    /// rapid toast + cold Start + configure + edit churn to shake out
+    /// renderer (e.g. wgpu atlas) crashes. Takes over windows while running.
+    #[cfg(debug_assertions)]
+    StressWindows(u8),
 
     PlaceToast {
         id: window::Id,
@@ -234,6 +239,9 @@ pub struct App {
     popup_rows: Vec<ControllerRow>,
 
     configure_window: Option<window::Id>,
+    /// Debug-only window stress test in flight (Diagnostics section).
+    #[cfg(debug_assertions)]
+    stress_running: bool,
     configure_state: ConfigureState,
     /// Snapshot for the Analytics settings tab (refreshed with controller/analytics changes).
     analytics_panel: AnalyticsPanel,
@@ -453,6 +461,8 @@ impl App {
             popup_state: popup_view::State::default(),
             popup_rows: Vec::new(),
             configure_window: None,
+            #[cfg(debug_assertions)]
+            stress_running: false,
             configure_state,
             analytics_panel: AnalyticsPanel::default(),
             pad_input_panel: PadInputPanel::default(),
@@ -1126,6 +1136,60 @@ impl App {
                 }
             }
             Message::SteamScanAfterSettle => self.maybe_kick_deferred_steam_scan(),
+            // Debug-only renderer stress driver: 5 fast cycles of toast +
+            // cold Start + configure + edit churn (the atlas-crash shape),
+            // then a final open. Takes over windows; see the variant docs.
+            #[cfg(debug_assertions)]
+            Message::StressWindows(step) => {
+                const CYCLES: u8 = 5;
+                const PER_CYCLE: u8 = 6;
+                let total = CYCLES * PER_CYCLE;
+                if step > total {
+                    self.stress_running = false;
+                    return Task::none();
+                }
+                if step == total {
+                    self.stress_running = false;
+                    crate::ui::toast::ToastMessage::enqueue(
+                        &mut self.toast_queue,
+                        crate::ui::toast::ToastMessage::preview(&self.session.prefs.spectrum),
+                    );
+                    return self.show_next_toast().chain(self.open_start_screen());
+                }
+                let next = Message::StressWindows(step + 1);
+                match step % PER_CYCLE {
+                    // Cold open under a live toast.
+                    0 => {
+                        crate::ui::toast::ToastMessage::enqueue(
+                            &mut self.toast_queue,
+                            crate::ui::toast::ToastMessage::preview(&self.session.prefs.spectrum),
+                        );
+                        self.show_next_toast()
+                            .chain(self.open_start_screen())
+                            .chain(Task::perform(delay(Duration::from_secs(2)), move |()| next))
+                    }
+                    // Second cold renderer while toast + Start are live.
+                    1 => self.open_configure().chain(Task::perform(
+                        delay(Duration::from_millis(1500)),
+                        move |()| next,
+                    )),
+                    2..=4 => self
+                        .toggle_start_edit()
+                        .unwrap_or_else(Task::none)
+                        .chain(Task::perform(delay(Duration::from_secs(1)), move |()| next)),
+                    // Tear it all down; toast expiry overlaps the next cold open.
+                    _ => {
+                        let close_cfg = self
+                            .configure_window
+                            .map(window::close)
+                            .unwrap_or_else(Task::none);
+                        let _ = self.toggle_start_edit();
+                        close_cfg
+                            .chain(self.close_start_screen())
+                            .chain(Task::perform(delay(Duration::from_secs(2)), move |()| next))
+                    }
+                }
+            }
 
             Message::PlaceToast { id, generation } => {
                 if generation != self.toast_generation || self.toast_message.is_none() {
@@ -1876,6 +1940,15 @@ impl App {
                     app_log::warn(format!("open data folder failed: {err}"));
                 }
                 Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::RunWindowStress => {
+                if self.stress_running {
+                    return Task::none();
+                }
+                self.stress_running = true;
+                app_log::info("stress: window stress test started from Diagnostics");
+                Task::done(Message::StressWindows(0))
             }
             ConfigureMessage::OpenExternalLink(url) => {
                 if let Err(err) = launch::launch_target(url, "") {
