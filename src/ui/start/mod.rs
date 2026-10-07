@@ -1,5 +1,6 @@
 pub mod art_worker;
 pub mod carousel;
+pub mod clock;
 pub mod cursor_hide;
 pub mod gesture;
 pub mod icon_cache;

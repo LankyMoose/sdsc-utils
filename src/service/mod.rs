@@ -328,6 +328,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Skip when HID presence is empty — stale live_pads must not re-add pads.
         if nav_priority && !last_discovered.is_empty() {
             let live = hid_worker.live_controllers();
+            // Always clear streaks for seen pads, even when the snapshot is
+            // equivalent and evaluation is skipped (else a recovered pad's
+            // stale streak drops it instantly on its next stall).
+            session.mark_seen(live.iter().map(|c| c.serial.as_str()));
             if hot_path_wait_for_first_sample(
                 live.is_empty(),
                 !last_discovered.is_empty(),
@@ -464,7 +468,7 @@ fn handle_command(
             if should_skip_connect_cooldown_on_power_off(
                 &session.controllers,
                 &serial,
-                session.prefs.start_screen_usb_controllers,
+                session.prefs.start_screen_auto_open.includes_usb(),
             ) {
                 session.mark_skip_connect_cooldown();
             }
@@ -698,8 +702,11 @@ fn reload_persist_if_needed(
 
 fn reload_persist(session: &mut DeviceSession, start_visible: bool) -> Option<Vec<SessionEffect>> {
     let prefs = Prefs::load();
-    let usb_changed =
-        prefs.start_screen_usb_controllers != session.prefs.start_screen_usb_controllers;
+    // Re-evaluate close only when the USB scope actually flips while auto-open
+    // can fire; switching to Never never closes (matches the shell apply rule).
+    let scope_changed = prefs.start_screen_auto_open.includes_usb()
+        != session.prefs.start_screen_auto_open.includes_usb();
+    let usb_changed = prefs.start_screen_auto_open.auto_opens() && scope_changed;
     color::set_active_spectrum(prefs.spectrum.clone());
     lightbar::set_enabled(prefs.lightbar_enabled);
     session.prefs = prefs;

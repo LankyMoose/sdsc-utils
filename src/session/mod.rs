@@ -12,6 +12,7 @@ pub use gate::{
     should_skip_connect_cooldown_on_power_off, take_skip_connect_cooldown,
 };
 
+use crate::controller::dualsense::identity::normalize_identity;
 use crate::controller::dualsense::lightbar;
 use crate::controller::known::KnownControllers;
 use crate::controller::model::ControllerStatus;
@@ -78,7 +79,7 @@ pub struct DeviceSession {
     start_connect_cooldown_until: Option<Instant>,
     pub(crate) skip_next_connect_cooldown: bool,
     controllers_nonempty_since: Option<Instant>,
-    missed_poll_counts: HashMap<String, u8>,
+    missed_poll_since: HashMap<String, Instant>,
     pub start_auto_open_pending: bool,
 }
 
@@ -94,13 +95,26 @@ impl DeviceSession {
             start_connect_cooldown_until: None,
             skip_next_connect_cooldown: false,
             controllers_nonempty_since: None,
-            missed_poll_counts: HashMap::new(),
+            missed_poll_since: HashMap::new(),
             start_auto_open_pending: false,
         }
     }
 
     pub fn clear_missed_polls(&mut self) {
-        self.missed_poll_counts.clear();
+        self.missed_poll_since.clear();
+    }
+
+    /// Clear miss streaks for pads seen in the latest snapshot.
+    ///
+    /// Must run on *every* ingestion, not just on change: the hot path skips
+    /// evaluation when the live snapshot is equivalent, and a held pad's clone
+    /// is identical — so a recovered pad's streak would otherwise survive until
+    /// the next stall drops it instantly with no hold.
+    pub fn mark_seen(&mut self, serials: impl IntoIterator<Item = impl AsRef<str>>) {
+        for serial in serials {
+            self.missed_poll_since
+                .remove(&normalize_identity(serial.as_ref()));
+        }
     }
 
     pub fn mark_skip_connect_cooldown(&mut self) {
@@ -118,8 +132,12 @@ impl DeviceSession {
         polled: Vec<ControllerStatus>,
         ctx: ApplyContext,
     ) -> Vec<SessionEffect> {
-        let (reconciled, held) =
-            reconcile_poll_with_hold(&self.controllers, polled, &mut self.missed_poll_counts);
+        let (reconciled, held) = reconcile_poll_with_hold(
+            &self.controllers,
+            polled,
+            &mut self.missed_poll_since,
+            ctx.now,
+        );
         for serial in &held {
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: hold pad across missed read serial={serial}"
@@ -161,7 +179,7 @@ impl DeviceSession {
             return effects;
         }
 
-        let include_usb = self.prefs.start_screen_usb_controllers;
+        let include_usb = self.prefs.start_screen_auto_open.includes_usb();
         let mut events = Vec::new();
         let mut presence_edge: Option<(bool, bool)> = None;
         if controllers_changed {
@@ -223,10 +241,9 @@ impl DeviceSession {
         }
 
         effects.push(SessionEffect::SaveKnown);
-        let connect_toast_queued = events.iter().any(|event| event.body == "Connected");
         let want_auto_open = presence_edge.is_some_and(|(prev_present, next_present)| {
             should_auto_open_start(
-                self.prefs.start_screen_enabled,
+                self.prefs.start_screen_enabled && self.prefs.start_screen_auto_open.auto_opens(),
                 !prev_present,
                 next_present,
                 ctx.start_visible,
@@ -234,6 +251,19 @@ impl DeviceSession {
                 ctx.fullscreen,
             )
         });
+        // When presence newly opens immersive Start, suppress the Connected toast
+        // entirely. Cold-launch already suppresses via launch_quiet; hot connects
+        // must match so behaviour is identical. Compact keeps the toast (HWND).
+        if want_auto_open && self.prefs.start_screen_always_immersive {
+            let before = events.len();
+            events.retain(|event| event.body != "Connected");
+            if events.len() != before {
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: connect toast suppressed (immersive auto-open)",
+                );
+            }
+        }
+        let connect_toast_queued = events.iter().any(|event| event.body == "Connected");
         if want_auto_open {
             self.start_auto_open_pending = true;
         }
@@ -265,12 +295,12 @@ impl DeviceSession {
         effects
     }
 
-    /// Re-evaluate close after `start_screen_usb_controllers` changes.
+    /// Re-evaluate close after the auto-open USB scope changes.
     ///
     /// A settings flip is not a connect edge — never auto-open Start here.
     /// Does not arm the ghost-flap cooldown (settings flip is not a pad leave).
     pub fn reevaluate_start_presence(&mut self, ctx: ApplyContext) -> Vec<SessionEffect> {
-        let include_usb = self.prefs.start_screen_usb_controllers;
+        let include_usb = self.prefs.start_screen_auto_open.includes_usb();
         let present = has_start_presence(&self.controllers, include_usb);
         crate::controller::hid::diag::diag_info(format!(
             "ui-diag: start presence include_usb={} present={} (prefs)",
@@ -352,4 +382,232 @@ pub fn log_apply(effects: &[SessionEffect]) {
         return;
     }
     app_log::info(format!("session: apply effects={}", effects.len()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controller::dualsense::battery::dualsense_status;
+    use crate::controller::model::{Connection, PowerState};
+    use crate::persist::prefs::StartAutoOpen;
+
+    fn bt_pad(serial: &str) -> ControllerStatus {
+        dualsense_status(
+            1,
+            "DualSense",
+            Connection::Bluetooth,
+            serial.to_string(),
+            50,
+            PowerState::Discharging,
+        )
+    }
+
+    fn usb_pad(serial: &str) -> ControllerStatus {
+        dualsense_status(
+            1,
+            "DualSense",
+            Connection::Usb,
+            serial.to_string(),
+            50,
+            PowerState::Discharging,
+        )
+    }
+
+    fn ctx(start_visible: bool) -> ApplyContext {
+        ApplyContext {
+            start_visible,
+            fullscreen: false,
+            now: Instant::now(),
+            lightbar_enabled: false,
+        }
+    }
+
+    fn session_with(immersive: bool, mode: StartAutoOpen) -> DeviceSession {
+        let prefs = Prefs {
+            start_screen_enabled: true,
+            start_screen_auto_open: mode,
+            start_screen_always_immersive: immersive,
+            notify_connect: true,
+            analytics_enabled: false,
+            ..Prefs::default()
+        };
+        DeviceSession::new(
+            prefs,
+            KnownControllers::default(),
+            AnalyticsStore::default(),
+        )
+    }
+
+    fn has_open_start(effects: &[SessionEffect]) -> bool {
+        effects
+            .iter()
+            .any(|e| matches!(e, SessionEffect::OpenStart))
+    }
+
+    fn queued_bodies(effects: &[SessionEffect]) -> Vec<String> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                SessionEffect::QueueNotifications { events, .. } => Some(events),
+                _ => None,
+            })
+            .flatten()
+            .map(|ev| ev.body.clone())
+            .collect()
+    }
+
+    #[test]
+    fn immersive_auto_open_suppresses_connected_toast() {
+        let mut session = session_with(true, StartAutoOpen::Any);
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        assert!(has_open_start(&effects));
+        assert!(
+            !queued_bodies(&effects).contains(&"Connected".to_string()),
+            "immersive open must not queue Connected, got {:?}",
+            queued_bodies(&effects)
+        );
+    }
+
+    #[test]
+    fn compact_auto_open_keeps_connected_toast() {
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        assert!(!has_open_start(&effects));
+        assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
+        // Deferred open latched for after-toast.
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                SessionEffect::QueueNotifications {
+                    open_start_after_toast: true,
+                    ..
+                }
+            )),
+            "compact should defer open until toast"
+        );
+    }
+
+    #[test]
+    fn immersive_no_suppress_when_already_open() {
+        let mut session = session_with(true, StartAutoOpen::Any);
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(true));
+        assert!(!has_open_start(&effects));
+        assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
+    }
+
+    #[test]
+    fn auto_open_never_never_opens_but_still_toasts() {
+        let mut session = session_with(true, StartAutoOpen::Never);
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        assert!(!has_open_start(&effects));
+        assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
+    }
+
+    #[test]
+    fn mark_seen_clears_stale_streak_so_next_stall_holds() {
+        use std::time::Duration;
+
+        // Regression: the hot path skips evaluation when the live snapshot is
+        // equivalent (a held clone is identical), so a recovered pad's streak
+        // survived and its next stall dropped instantly with no hold.
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let pad_a = bt_pad("aa");
+        let pad_b = bt_pad("bb");
+        let t0 = Instant::now();
+        let ctx_at = |now: Instant| ApplyContext {
+            start_visible: false,
+            fullscreen: false,
+            now,
+            lightbar_enabled: false,
+        };
+        let _ = session.apply_controllers(vec![pad_a.clone(), pad_b.clone()], ctx_at(t0));
+
+        // Stale streak as left by a recovered-then-unevaluated stall.
+        session
+            .missed_poll_since
+            .insert("bb".to_string(), t0 - Duration::from_secs(36));
+        // Fresh sighting on every hot loop clears it, evaluation or not.
+        session.mark_seen(["bb"]);
+        assert!(session.missed_poll_since.is_empty());
+
+        // The next stall therefore holds instead of dropping instantly.
+        let effects = session.on_poll_result(vec![pad_a.clone()], ctx_at(t0));
+        assert_eq!(session.controllers.len(), 2);
+        assert!(!queued_bodies(&effects).contains(&"Disconnected".to_string()));
+    }
+
+    #[test]
+    fn hot_path_stall_within_hold_keeps_pad_quiet() {
+        use std::time::Duration;
+
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let pad_a = bt_pad("aa");
+        let pad_b = bt_pad("bb");
+        let t0 = Instant::now();
+        let ctx_at = |now: Instant| ApplyContext {
+            start_visible: false,
+            fullscreen: false,
+            now,
+            lightbar_enabled: false,
+        };
+        // Two pads connected.
+        let _ = session.apply_controllers(vec![pad_a.clone(), pad_b.clone()], ctx_at(t0));
+        assert_eq!(session.controllers.len(), 2);
+
+        // Hot path misses pad B every ~16ms: held, no flap.
+        for ms in [16, 32, 500, 1500] {
+            let effects =
+                session.on_poll_result(vec![pad_a.clone()], ctx_at(t0 + Duration::from_millis(ms)));
+            assert_eq!(session.controllers.len(), 2, "held at +{ms}ms");
+            assert!(
+                !queued_bodies(&effects).contains(&"Disconnected".to_string()),
+                "no disconnect at +{ms}ms"
+            );
+        }
+
+        // Past the hold window: accepted drop with a Disconnect toast.
+        let effects = session.on_poll_result(
+            vec![pad_a.clone()],
+            ctx_at(t0 + crate::session::gate::POLL_MISS_HOLD + Duration::from_secs(1)),
+        );
+        assert_eq!(session.controllers.len(), 1);
+        assert!(queued_bodies(&effects).contains(&"Disconnected".to_string()));
+    }
+
+    #[test]
+    fn bluetooth_mode_ignores_usb_only_presence() {
+        // USB-only arrival is not qualifying presence in Bluetooth mode:
+        // no open, and the toast stays a plain notification.
+        let mut session = session_with(false, StartAutoOpen::Bluetooth);
+        let effects = session.apply_controllers(vec![usb_pad("usb:1")], ctx(false));
+        assert!(!has_open_start(&effects));
+        assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                SessionEffect::QueueNotifications {
+                    open_start_after_toast: true,
+                    ..
+                }
+            )),
+            "USB-only arrival must not latch an open in Bluetooth mode"
+        );
+    }
+
+    #[test]
+    fn bluetooth_mode_opens_on_bluetooth_arrival() {
+        let mut session = session_with(false, StartAutoOpen::Bluetooth);
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                SessionEffect::QueueNotifications {
+                    open_start_after_toast: true,
+                    ..
+                }
+            )),
+            "Bluetooth arrival should latch an open in Bluetooth mode"
+        );
+    }
 }

@@ -25,6 +25,10 @@ pub const BATTERY_INTERVAL: Duration = Duration::from_secs(60);
 pub const LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
 /// When HID lists pads but battery reads keep failing, retry sooner than BATTERY_INTERVAL.
 pub const UNREAD_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+/// Hot-sample battery newer than this skips the blocking read on liveness ticks.
+/// Sampling runs continuously (hot and cold-idle), so stable pads cost zero HID
+/// reads; blocking reads are reserved for new serials and stale pads.
+pub const POLL_LIVE_BATTERY_STALE: Duration = Duration::from_secs(30);
 
 /// Opened pad after a successful battery read (device dropped before lightbar).
 struct PolledPad {
@@ -199,35 +203,60 @@ fn poll_controllers_with_api(
         pad.status.index = i + 1;
     }
 
-    lightbar::sync_lightbar_claims(
-        pads.iter()
-            .filter(|p| p.status.supports_lightbar)
-            .map(|p| p.status.serial.as_str()),
+    reassert_lightbar_for_pads(
+        api,
+        previously_connected,
+        pads.iter().map(|p| &p.status),
+        timing,
     );
 
-    if lightbar::is_enabled() {
-        let previous: std::collections::HashSet<String> = previously_connected
-            .iter()
-            .map(|s| dualsense::normalize_identity(s))
-            .collect();
+    Ok(pads.into_iter().map(|p| p.status).collect())
+}
 
-        for pad in &pads {
-            if !pad.status.supports_lightbar {
-                continue;
-            }
-            let serial_key = dualsense::normalize_identity(&pad.status.serial);
-            if !previous.contains(&serial_key) {
-                lightbar::prepare_connect_apply(&pad.status.serial);
-            }
-            let color = color_for_battery_percent(pad.status.percent);
-            // Fresh open for lightbar (do not reuse the battery-read handle).
-            let (result, t) = lightbar::apply_lightbar_rgb_timed(api, &pad.status.serial, color);
-            timing.add_assign(t);
-            if let Err(err) = result {
-                lightbar::warn_lightbar(&pad.status.product, err);
-            }
+/// Reassert lightbar only where due (new pad, color change, slow backstop).
+/// Shared by full and incremental polls so CLI and daemon behave alike.
+pub(crate) fn reassert_lightbar_for_pads<'a>(
+    api: &HidApi,
+    previously_connected: &[String],
+    statuses: impl Iterator<Item = &'a ControllerStatus>,
+    timing: &mut HidPhaseTiming,
+) {
+    let statuses: Vec<&'a ControllerStatus> = statuses.collect();
+    lightbar::sync_lightbar_claims(
+        statuses
+            .iter()
+            .filter(|p| p.supports_lightbar)
+            .map(|p| p.serial.as_str()),
+    );
+    if !lightbar::is_enabled() {
+        return;
+    }
+    let previous: std::collections::HashSet<String> = previously_connected
+        .iter()
+        .map(|s| dualsense::normalize_identity(s))
+        .collect();
+
+    for pad in statuses {
+        if !pad.supports_lightbar {
+            continue;
+        }
+        let serial_key = dualsense::normalize_identity(&pad.serial);
+        let color = color_for_battery_percent(pad.percent);
+        if !previous.contains(&serial_key) {
+            lightbar::prepare_connect_apply(&pad.serial);
+        } else if !lightbar::lightbar_reassert_due(&pad.serial, color) {
+            // Stable pad, recently applied: skip the open-write-close so the
+            // 5s liveness tick stops churning every bar (color changes, new
+            // pads, and the 30s backstop still write).
+            continue;
+        }
+        // Fresh open for lightbar (do not reuse the battery-read handle).
+        let (result, t) = lightbar::apply_lightbar_rgb_timed(api, &pad.serial, color);
+        timing.add_assign(t);
+        if let Err(err) = result {
+            lightbar::warn_lightbar(&pad.product, err);
+        } else {
+            lightbar::note_lightbar_applied(&pad.serial, color);
         }
     }
-
-    Ok(pads.into_iter().map(|p| p.status).collect())
 }

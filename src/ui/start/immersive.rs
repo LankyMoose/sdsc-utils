@@ -75,11 +75,13 @@ pub fn compact_transition_overlay(
     .into()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     state: &'a State,
     spectrum: &BatterySpectrum,
     now: Instant,
     always_immersive: bool,
+    clock_enabled: bool,
     promote_gesture: &'a [crate::domain::gesture::GestureControl],
     stage_h: f32,
     settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
@@ -134,6 +136,39 @@ pub fn view<'a>(
     .height(Fill);
 
     let mut chrome_layers: Vec<Element<'_, StartMessage>> = vec![body, footer_overlay.into()];
+    if clock_enabled {
+        // Center-top clock widget (system locale time). Digits carry no descenders,
+        // so the font line box holds empty descender space below the baseline and
+        // the glyphs sit ~1px high: top padding runs 1px deeper to compensate
+        // (optical centering; total capsule height is unchanged).
+        let clock_capsule = container(
+            text(crate::ui::start::clock::clock_text())
+                .size(18.0)
+                .color(theme::alpha(theme::INK, 0.72)),
+        )
+        .padding(Padding {
+            top: 7.0,
+            right: 16.0,
+            bottom: 5.0,
+            left: 16.0,
+        })
+        .style(theme::immersive_footer_capsule);
+        let clock_overlay = column![
+            container(clock_capsule)
+                .width(Fill)
+                .center_x(Fill)
+                .padding(Padding {
+                    top: 10.0,
+                    right: EDGE_PAD,
+                    bottom: 0.0,
+                    left: EDGE_PAD,
+                }),
+            space().height(Fill),
+        ]
+        .width(Fill)
+        .height(Fill);
+        chrome_layers.push(clock_overlay.into());
+    }
     let chrome_status = state.chrome_load_status(now);
     if !chrome_status.is_empty() {
         // Clip flush to the window bottom-right; height grows with the status rail.
@@ -435,9 +470,15 @@ fn hero_hint_overlay<'a>(row: &'a StartRow, state: &'a State) -> Element<'a, Sta
         .running_target
         .as_ref()
         .is_some_and(|t| t == &row.target);
+    let closing = state
+        .closing_target
+        .as_ref()
+        .is_some_and(|t| t == &row.target);
     let mut col = column![].spacing(10).align_x(Alignment::Center);
     if state.editing {
         col = col.push(immersive_game_membership_label(row));
+    } else if closing {
+        col = col.push(text("Closing").size(15.0).color(theme::MUTED));
     } else if running {
         col = col.push(text("Playing").size(15.0).color(theme::ACCENT));
     }
@@ -472,11 +513,20 @@ fn strip_slot<'a>(
     overlay: Option<Element<'a, StartMessage>>,
 ) -> Element<'a, StartMessage> {
     let muted = editing && !row.in_catalog();
+    let disabled = row.disabled && !editing;
+    let dim = if disabled { 0.35 } else { 1.0 };
     let hero_ready = row.hero_ready();
-    let capsule = strip_capsule(row, selected, muted, hero_ready, fade, overlay);
+    let capsule = strip_capsule(
+        row,
+        selected,
+        muted || disabled,
+        hero_ready,
+        fade * dim,
+        overlay,
+    );
 
     let title_size = if selected { 39.0 } else { 22.0 };
-    let title_alpha = if muted { 0.55 * fade } else { fade };
+    let title_alpha = if muted { 0.55 * fade } else { fade * dim };
     // Selected titles are large; pull back from pure white for less glare.
     let title_color = if selected {
         theme::alpha(theme::mix(theme::INK, theme::MUTED, 0.28), title_alpha)
@@ -499,30 +549,42 @@ fn strip_slot<'a>(
         ..Font::DEFAULT
     });
 
-    let sub_alpha = if muted { 0.55 * fade } else { 0.9 * fade };
+    let sub_alpha = if muted { 0.55 * fade } else { 0.9 * fade * dim };
     let mut titles = column![title].spacing(6);
     // Stacked `Played:` / `Last played:` + optional Update pill.
-    let show_meta = row
-        .subtitle
-        .as_ref()
-        .is_some_and(|sub| !(row.update_required && sub.is_steam_fallback()));
-    if show_meta || row.update_required {
+    // Disabled rows show "Not installed" instead of meta.
+    if disabled {
         let meta_size = if selected { 16.0 } else { 14.0 };
         let mut status = column![].spacing(6).width(Fill);
-        if show_meta && let Some(sub) = row.subtitle.as_ref() {
-            let value_color = theme::alpha(theme::MUTED, sub_alpha);
-            let label_color = theme::alpha(theme::MUTED, sub_alpha * 0.8);
-            status = status.push(game_subtitle_block(
-                sub,
-                value_color,
-                label_color,
-                meta_size,
-            ));
-        }
-        if row.update_required {
-            status = status.push(update_required_badge(selected, muted, fade, true));
-        }
+        status = status.push(
+            text("Not installed")
+                .size(meta_size)
+                .color(theme::alpha(theme::MUTED, 0.7 * fade)),
+        );
         titles = titles.push(status);
+    } else {
+        let show_meta = row
+            .subtitle
+            .as_ref()
+            .is_some_and(|sub| !(row.update_required && sub.is_steam_fallback()));
+        if show_meta || row.update_required {
+            let meta_size = if selected { 16.0 } else { 14.0 };
+            let mut status = column![].spacing(6).width(Fill);
+            if show_meta && let Some(sub) = row.subtitle.as_ref() {
+                let value_color = theme::alpha(theme::MUTED, sub_alpha);
+                let label_color = theme::alpha(theme::MUTED, sub_alpha * 0.8);
+                status = status.push(game_subtitle_block(
+                    sub,
+                    value_color,
+                    label_color,
+                    meta_size,
+                ));
+            }
+            if row.update_required {
+                status = status.push(update_required_badge(selected, muted, fade, true));
+            }
+            titles = titles.push(status);
+        }
     }
 
     let label: Element<'_, StartMessage> = container(titles)
@@ -802,9 +864,13 @@ fn dock_controller_row<'a>(
     row_radius: f32,
     state: &State,
 ) -> Element<'a, StartMessage> {
+    let powering_off = state
+        .powering_off
+        .as_ref()
+        .is_some_and(|s| s == &row.serial);
     let ring_color = if flash_white {
         theme::from_rgb(crate::controller::dualsense::lightbar::IDENTIFY_FLASH)
-    } else if row.connected {
+    } else if row.connected && !powering_off {
         theme::from_rgb(spectrum.color_at_percent(row.percent))
     } else {
         theme::DIM
@@ -822,15 +888,22 @@ fn dock_controller_row<'a>(
         .center_x(Fill)
         .center_y(Fill);
 
-    let title_color = if row.connected {
+    let title_color = if row.connected && !powering_off {
         theme::INK
     } else {
         theme::MUTED
     };
-    let meta = if row.low {
+    let meta = if powering_off {
+        theme::MUTED
+    } else if row.low {
         theme::WARNING
     } else {
         theme::MUTED
+    };
+    let meta_text = if powering_off {
+        "Powering off".to_string()
+    } else {
+        format!("{} · {}", row.connection, row.state)
     };
     let titles = column![
         text(&row.title).size(18.0).color(title_color).font(Font {
@@ -841,9 +914,7 @@ fn dock_controller_row<'a>(
             },
             ..Font::DEFAULT
         }),
-        text(format!("{} · {}", row.connection, row.state))
-            .size(13.0)
-            .color(meta),
+        text(meta_text).size(13.0).color(meta),
     ]
     .spacing(3)
     .width(Fill);

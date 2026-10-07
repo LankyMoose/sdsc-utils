@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-10-07
+
+### Added
+
+- Powering-off status for controllers, mirroring game Closing: holding Triangle on a Start controller row (or the popup power button) immediately swaps the row to a muted-white `Powering off` status with a static `Powering off…` hint until the pad actually disappears; repeat commands while pending are ignored. Powering-off rows render dimmed with no Identify/Power off actions (the worker drops the pad any moment).
+- Center-top clock widget in immersive Start showing the system locale time (12h/24h per Windows settings; 12h am/pm fallback elsewhere), with a Display clock toggle in Start settings and Configure (on by default).
+- Separate Start screen settings: `Enable start screen` (master) and a single `Auto open` selector (`Never` / `When a Bluetooth controller connects` / `When any controller connects`, default `When any controller connects`): expandable dropdown in Start settings (Cross opens, dpad picks, Left/Right quick-cycle) and native dropdown in Configure.
+
+### Fixed
+
+- `Closing` (game) and `Powering off` (controller) status text is muted white instead of orange; low-battery warnings stay orange.
+- Newly-detected presence that auto-opens immersive Start no longer shows a `Connected` toast (cold-launch and hot-connect now match); compact auto-open shows the toast first and opens Start on slide settle, so the card can never be swallowed by the window create.
+- Closing a game flips status from `Playing`/`Running` to `Closing` immediately (async close; badge clears on process exit).
+- Game rows disable (dim + `Not installed`, skipped in nav, launch blocked) when a scan proves them uninstalled; stale immediate launches fail gracefully with a rows refresh instead of an error popup.
+- Brief input-report stalls (e.g. a weak low-battery Bluetooth link under two-pad load) no longer flap the session: missed polls hold the pad for 2s of wall time instead of a single miss, so short stalls can't trigger `Disconnected`/`Connected` toast loops, lightbar reclaim flashes, or input-handle drops.
+- Incremental HID poll: stable pads with fresh sample data cost zero HID reads on liveness ticks (cached handles are reused, rumble/input handles and the live map are no longer dropped every 5s); blocking battery reads are reserved for new serials (full attempts) and stale pads (fail-fast), and the lightbar reasserts only on new pads, color changes, and a 30s backstop instead of every tick.
+- Hot enumeration freeze bounded: `refresh_devices()` is forced at least every 20s even while input is hot, and a new OS arrival watcher (Windows `CM_Register_Notification` on the HID class, Linux `/dev` snapshot thread) fires list-only refresh hints so second-pad connects surface in ~1s instead of staying invisible until input goes cold.
+- Stale miss-streak no longer drops instantly: the hot path clears streaks for seen pads on every loop (`mark_seen`), not just on change, so a recovered pad's next stall holds the full 2s instead of firing an immediate false `Disconnected`.
+- Launch-quiet suppression only covers continuously-present pads: a serial absent from a snapshot loses its suppression, so a pad returning after a power cycle gets its `Connected` toast instead of inheriting a stale launch entry.
+- Power-off no longer falls through to unknown-identity interfaces when exact matches exist: if every matched send fails it reports failure rather than risk powering off a stranger's pad.
+- Ghost HID paths (enumerated but un-openable) back off after 3 consecutive open failures instead of burning an open per sample; records clear on success or when the path leaves enumeration.
+- Arrival watcher debounce gains a trailing follow-up so a second pad connecting inside the 1s burst window is re-scanned ~1.5s later instead of waiting out the 20s heartbeat.
+
 ## [1.6.0] - 2026-10-05
 
 ### Added
@@ -396,6 +419,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded DualSense silhouette for the tray and `.exe` icon.
 - Windows CI and tagged release workflow.
 
+[1.6.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.5.2...v1.6.0
 [1.5.2]: https://github.com/LankyMoose/sdsc-utils/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.5.0...v1.5.1

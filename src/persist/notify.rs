@@ -92,6 +92,13 @@ impl NotifyTracker {
 
         self.by_serial
             .retain(|serial, _| next.iter().any(|c| c.serial == *serial));
+        // Launch-quiet only covers pads continuously present since process
+        // start. A pad absent from this snapshot (powered off, replaced, BT
+        // linger gone) loses its suppression: a much later return is a real
+        // connect and must toast. Without this, a serial queued at worker
+        // start suppresses its first session appearance hours later.
+        self.launch_quiet
+            .retain(|serial| next.iter().any(|c| c.serial == *serial));
 
         let mut events = Vec::new();
 
@@ -277,6 +284,29 @@ mod tests {
         assert_eq!(tracker.collect_events(&[], &connected, &p).len(), 1);
         assert!(tracker.collect_events(&connected, &[], &p).is_empty());
         assert_eq!(tracker.collect_events(&[], &connected, &p).len(), 1);
+    }
+
+    #[test]
+    fn launch_quiet_purged_by_absence_so_late_return_toasts() {
+        // A serial queued at worker start but absent since (powered off,
+        // replaced) must not suppress its much-later return: quiet covers
+        // continuously-present pads only.
+        let mut tracker = NotifyTracker::new();
+        tracker.queue_launch_quiet(["a".to_string()]);
+        let p = prefs(true, true, true);
+        let connected = vec![pad(
+            "a",
+            40,
+            PowerState::Discharging,
+            crate::controller::model::Connection::Bluetooth,
+        )];
+
+        // Absent from this snapshot: suppression purged, nothing fires.
+        assert!(tracker.collect_events(&connected, &[], &p).is_empty());
+        // Much-later return is a real connect and must toast.
+        let events = tracker.collect_events(&[], &connected, &p);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1, NotifyKind::Connect);
     }
 
     #[test]

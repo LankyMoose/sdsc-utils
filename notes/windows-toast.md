@@ -40,19 +40,21 @@ Fix: pure presentation state machine in [`src/ui/toast/machine.rs`](../src/ui/to
 
 **Reopen gesture during latch:** `suppresses_reopen_gesture()` while `after == OpenStart` and phase is Placing/SlidingIn. During Placing, suppress lifts after ~60 Frame ticks (~1s) so a lost `Shown` cannot block the gesture forever; phase stays Placing and no `OpenStart` is emitted from that budget.
 
-### Immersive 0→1 Connected (composite only)
+### 0→1 Connected vs Start open order
 
-When Connected would auto-open Start **and** `start_screen_always_immersive` is on, do **not** slide the toast on the desktop HWND first (that double-up’d with the in-cover composite). Instead:
+Immersive auto-open suppresses the Connected toast at the session layer
+(cold-launch `launch_quiet` and hot connects behave identically), so Start
+opens immediately with no toast to race. The shell keeps a second-layer
+filter for service-race leftovers.
 
-1. Queue Connected with `after=Nothing` (no `AfterToast::OpenStart`).
-2. Set `defer_toast_for_immersive_start` so `show_next_toast` no-ops (holds the **whole** queue — same-tick or staggered multi-pad Connecteds append only).
-3. Open immersive Start immediately.
-4. On `StartOpened` (or already-hosting), clear the defer flag and show; toast HWND stays hidden; card slides only via `immersive toast composite`.
-5. If Start cannot host (disabled / compact / close abandoned), fall back to HWND toast so Connected is never dropped.
+Compact auto-open is toast-first: the Connected card latches
+`AfterToast::OpenStart` and presents on the desktop HWND with no competing
+Start window create (the starvation in `Cause` above); Start opens on slide
+rest via the machine effect (exactly once — settle consumes the latch, and
+early dismiss / slide-out finish also emit it). A mid-toast 1→0 clears the
+latch via `ClearStartLatch`, so Start never opens after the pads left.
 
-Compact auto-open also opens Start **first** (`AfterToast::Nothing`); Connected then slides on the toast HWND raised above Start (same start-first path as immersive, without cover composite).
-
-Debug grep: `ui-diag: immersive connect toast (start first, composite only)`, `ui-diag: immersive connect toast release (start hosting)`, `ui-diag: immersive connect toast fallback (hwnd)`, `ui-diag: place toast … composite_only=1`, `ui-diag: immersive toast composite gen=`.
+Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: connect toast suppressed (immersive auto-open`, `ui-diag: start open after toast settle`.
 
 ### 0→1 Start survive toast (robustness)
 
@@ -62,4 +64,4 @@ Toast and Start are separate gates. To stop Connected-without-Start on turn-on:
 - **Short arrival:** nonempty stretch under 2s does not arm the 5s ghost cooldown (enumerate blip). Stable disconnects still arm it; intentional Power Off still skips.
 - **Pending retry:** `start_auto_open_pending` is set when 0→1 auto-open gates pass; cleared only once Start is visible. Close-in-flight leaves it set; `WindowClosed` retries. Confirmed empty clears pending and `clear_after()` even when Start is not visible.
 
-Debug grep: `ui-diag: start first on connect`, `ui-diag: connect toast start-first`, `ui-diag: toast Placing->SlidingIn`, `ui-diag: toast SlidingIn->Resting`, `ui-diag: toast show … body=Connected`, `ui-diag: place toast gen=`, `ui-diag: start open after toast settle`, `ui-diag: skip connect cooldown (intentional power-off)`, `ui-diag: skip connect cooldown (short arrival)`, `ui-diag: hold pad across missed read serial=`, `ui-diag: retry start open after close`, `ui-diag: reopen gesture suppressed (toast OpenStart pending)`, `ui-diag: immersive connect toast`.
+Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: toast Placing->SlidingIn`, `ui-diag: toast SlidingIn->Resting`, `ui-diag: toast show … body=Connected after=OpenStart`, `ui-diag: place toast gen=`, `ui-diag: start open after toast settle`, `ui-diag: skip connect cooldown (intentional power-off)`, `ui-diag: skip connect cooldown (short arrival)`, `ui-diag: hold pad across missed read serial=`, `ui-diag: retry start open after close`, `ui-diag: reopen gesture suppressed (toast OpenStart pending)`, `ui-diag: immersive connect toast`, `ui-diag: connect toast suppressed (immersive auto-open`.

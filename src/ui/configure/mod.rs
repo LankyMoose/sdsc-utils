@@ -14,7 +14,9 @@ use crate::games::steam::LAST_KNOWN_COMPATIBLE_STEAM_VERSION;
 use crate::persist::analytics::{
     BucketDirection, ControllerAnalytics, InProgressBucket, StepCoverage, format_duration_short,
 };
-use crate::persist::prefs::{LOW_BATTERY_PERCENT_MAX, LOW_BATTERY_PERCENT_MIN, ToastPosition};
+use crate::persist::prefs::{
+    AUTO_OPEN_MODES, LOW_BATTERY_PERCENT_MAX, LOW_BATTERY_PERCENT_MIN, StartAutoOpen, ToastPosition,
+};
 use crate::platform::app_meta::{DISPLAY_NAME, PKG_VERSION};
 use crate::ui::color::{BatterySpectrum, hsv_to_rgb};
 use crate::ui::svg_icon;
@@ -22,7 +24,7 @@ use crate::ui::theme;
 use iced::mouse;
 use iced::widget::{
     Column, Row, button, canvas as canvas_widget, checkbox, column, container, hover, mouse_area,
-    row, scrollable, slider, space, svg, text, tooltip,
+    pick_list, row, scrollable, slider, space, svg, text, tooltip,
 };
 use iced::{Alignment, Color, Element, Fill, Length};
 use std::time::Duration;
@@ -136,11 +138,12 @@ pub struct ConfigureSettings {
     pub analytics_enabled: bool,
     pub lightbar_enabled: bool,
     pub start_screen_enabled: bool,
+    pub start_screen_auto_open: StartAutoOpen,
     pub start_screen_always_immersive: bool,
+    pub start_screen_clock_enabled: bool,
     pub start_screen_inactive_secs: u32,
     pub start_screen_sleep_secs: u32,
     pub start_screen_inactive_dim_percent: u8,
-    pub start_screen_usb_controllers: bool,
     pub start_screen_sounds_enabled: bool,
     pub start_screen_sound_volume: u8,
     pub start_screen_haptics_enabled: bool,
@@ -207,11 +210,12 @@ pub enum ConfigureMessage {
     SetAnalyticsEnabled(bool),
     SetLightbarEnabled(bool),
     SetStartScreenEnabled(bool),
+    SetStartScreenAutoOpen(StartAutoOpen),
     SetStartScreenAlwaysImmersive(bool),
+    SetStartScreenClock(bool),
     SetStartScreenInactiveSecs(u32),
     SetStartScreenSleepSecs(u32),
     SetStartScreenInactiveDimPercent(u8),
-    SetStartScreenUsbControllers(bool),
     SetStartScreenSounds(bool),
     SetStartScreenSoundVolume(u8),
     SetStartScreenHaptics(bool),
@@ -713,28 +717,28 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
     items = items.push(configure_section_heading("Opening"));
     items = items.push(
         checkbox(settings.start_screen_enabled)
-            .label("Show start screen when a controller connects")
+            .label("Enable start screen")
             .size(16.0)
             .text_size(13.0)
             .spacing(8)
             .on_toggle(ConfigureMessage::SetStartScreenEnabled),
     );
+    items = items.push(
+        column![
+            text("Auto open:").size(13.0).color(theme::INK),
+            pick_list(
+                AUTO_OPEN_MODES,
+                Some(settings.start_screen_auto_open),
+                ConfigureMessage::SetStartScreenAutoOpen,
+            )
+            .text_size(13.0)
+            .width(Fill),
+        ]
+        .spacing(4)
+        .width(Fill),
+    );
 
     if settings.start_screen_enabled {
-        items = items.push(
-            checkbox(settings.start_screen_usb_controllers)
-                .label("USB controllers")
-                .size(16.0)
-                .text_size(13.0)
-                .spacing(8)
-                .on_toggle(ConfigureMessage::SetStartScreenUsbControllers),
-        );
-        items = items.push(
-            text("When off, only Bluetooth opens and closes the start screen.")
-                .size(12.0)
-                .color(theme::MUTED),
-        );
-
         items = items.push(configure_section_rule());
         items = items.push(configure_section_heading("Immersive"));
         items = items.push(
@@ -744,6 +748,14 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
                 .text_size(13.0)
                 .spacing(8)
                 .on_toggle(ConfigureMessage::SetStartScreenAlwaysImmersive),
+        );
+        items = items.push(
+            checkbox(settings.start_screen_clock_enabled)
+                .label("Display clock")
+                .size(16.0)
+                .text_size(13.0)
+                .spacing(8)
+                .on_toggle(ConfigureMessage::SetStartScreenClock),
         );
 
         let idle_secs = settings.start_screen_inactive_secs;

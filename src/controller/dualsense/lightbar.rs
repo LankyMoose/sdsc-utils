@@ -8,6 +8,7 @@ use crate::domain::color::Rgb;
 use crate::domain::protocol::{CALIBRATION_FEATURE_REPORT, CALIBRATION_FEATURE_SIZE};
 use crate::platform::app_log;
 use hidapi::{BusType, HidApi, HidDevice};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -87,6 +88,13 @@ static AUTOMATIC_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Serials that have already received a `LIGHT_OUT` claim this connection.
 static CLAIMED_SERIALS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+/// Last RGB applied per serial (poll reassert / hot SetRgb). Lets the poll loop
+/// skip redundant writes: reassert only on color change or slow backstop.
+static LAST_APPLIED: LazyLock<Mutex<HashMap<String, (Rgb, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Slow reassert so foreign overwrites (game launchers, etc.) do not stick,
+/// without rewriting every pad on every 5s liveness tick.
+pub const LIGHTBAR_REASSERT_INTERVAL: Duration = Duration::from_secs(30);
 /// Last observed Steam running state; forget claims when it changes.
 static LAST_STEAM_RUNNING: Mutex<Option<bool>> = Mutex::new(None);
 struct SteamClaimCache {
@@ -174,12 +182,46 @@ pub fn sync_lightbar_claims(active_serials: impl IntoIterator<Item = impl AsRef<
     if let Ok(mut claimed) = CLAIMED_SERIALS.lock() {
         claimed.retain(|s| active.contains(s));
     }
+    if let Ok(mut applied) = LAST_APPLIED.lock() {
+        applied.retain(|s, _| active.contains(s));
+    }
+}
+
+/// Record a successful canonical-color write (poll reassert / hot SetRgb).
+/// Pulse orange/restore writes must not record: orange is not canonical.
+pub fn note_lightbar_applied(serial: &str, color: Rgb) {
+    if let Ok(mut applied) = LAST_APPLIED.lock() {
+        applied.insert(normalize_identity(serial), (color, Instant::now()));
+    }
+}
+
+/// Pure decision: reassert when no record, the color changed, or the slow
+/// backstop elapsed (foreign overwrites must not stick forever).
+fn reassert_due_at(record: Option<(Rgb, Instant)>, color: Rgb, now: Instant) -> bool {
+    match record {
+        None => true,
+        Some((last_color, at)) => {
+            last_color != color || now.saturating_duration_since(at) >= LIGHTBAR_REASSERT_INTERVAL
+        }
+    }
+}
+
+/// Whether `serial` needs a lightbar write for `color` right now.
+pub fn lightbar_reassert_due(serial: &str, color: Rgb) -> bool {
+    let record = LAST_APPLIED
+        .lock()
+        .map(|guard| guard.get(&normalize_identity(serial)).copied())
+        .unwrap_or(None);
+    reassert_due_at(record, color, Instant::now())
 }
 
 /// Drop all `LIGHT_OUT` claims (e.g. CLI force-reapply, hid-worker session start).
 pub fn forget_all_claims() {
     if let Ok(mut claimed) = CLAIMED_SERIALS.lock() {
         claimed.clear();
+    }
+    if let Ok(mut applied) = LAST_APPLIED.lock() {
+        applied.clear();
     }
 }
 
@@ -772,5 +814,29 @@ mod tests {
             &"hidapi error: hid_write/WaitForSingleObject: (0x000003E5) Overlapped I/O operation is in progress."
         ));
         assert!(!is_retryable_write_error(&"controller not found"));
+    }
+
+    #[test]
+    fn reassert_due_without_record_or_on_change_or_backstop() {
+        use crate::domain::color::Rgb;
+        let now = Instant::now();
+        let red = Rgb::new(255, 0, 0);
+        let blue = Rgb::new(0, 0, 255);
+        assert!(reassert_due_at(None, red, now));
+        assert!(!reassert_due_at(Some((red, now)), red, now));
+        assert!(reassert_due_at(Some((blue, now)), red, now));
+        assert!(reassert_due_at(
+            Some((red, now - LIGHTBAR_REASSERT_INTERVAL)),
+            red,
+            now
+        ));
+        assert!(!reassert_due_at(
+            Some((
+                red,
+                now - LIGHTBAR_REASSERT_INTERVAL + Duration::from_secs(1)
+            )),
+            red,
+            now
+        ));
     }
 }

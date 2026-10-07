@@ -249,6 +249,7 @@ pub fn view<'a>(
     state: &'a State,
     rows: &'a [ControllerRow],
     spectrum: &BatterySpectrum,
+    powering_off: Option<&str>,
 ) -> Element<'a, PopupMessage> {
     let header = row![
         text("Controllers").size(14.0).color(theme::INK).width(Fill),
@@ -283,7 +284,12 @@ pub fn view<'a>(
                 } else {
                     list
                 };
-                list.push(controller_row(state, entry, spectrum))
+                list.push(controller_row(
+                    state,
+                    entry,
+                    spectrum,
+                    powering_off.is_some_and(|s| s == entry.serial),
+                ))
             })
             .width(Fill);
 
@@ -320,11 +326,12 @@ fn controller_row<'a>(
     state: &'a State,
     entry: &'a ControllerRow,
     spectrum: &BatterySpectrum,
+    powering_off: bool,
 ) -> Element<'a, PopupMessage> {
     let accent = theme::from_rgb(spectrum.color_at_percent(entry.percent));
     let ring_color = if state.ring_flash_white(&entry.serial) {
         theme::from_rgb(lightbar::IDENTIFY_FLASH)
-    } else if entry.connected {
+    } else if entry.connected && !powering_off {
         accent
     } else {
         theme::DIM
@@ -352,7 +359,7 @@ fn controller_row<'a>(
     } else {
         text(entry.display_name())
             .size(14.0)
-            .color(if entry.connected {
+            .color(if entry.connected && !powering_off {
                 theme::INK
             } else {
                 theme::MUTED
@@ -384,32 +391,43 @@ fn controller_row<'a>(
                 PopupMessage::BeginEdit(entry.serial.clone()),
             ));
         }
-        if entry.show_identify() {
-            actions = actions.push(icon_button(
-                svg_icon::IDENTIFY_SVG,
-                theme::MUTED,
-                "Identify",
-                PopupMessage::Identify(entry.serial.clone()),
-            ));
-        }
-        if entry.show_power_off() {
-            actions = actions.push(icon_button(
-                svg_icon::POWER_SVG,
-                theme::MUTED,
-                "Power off",
-                PopupMessage::PowerOff(entry.serial.clone()),
-            ));
+        // A pad on its way out offers no actions (Identify and Power off are
+        // both dead ends).
+        if !powering_off {
+            if entry.show_identify() {
+                actions = actions.push(icon_button(
+                    svg_icon::IDENTIFY_SVG,
+                    theme::MUTED,
+                    "Identify",
+                    PopupMessage::Identify(entry.serial.clone()),
+                ));
+            }
+            if entry.show_power_off() {
+                actions = actions.push(icon_button(
+                    svg_icon::POWER_SVG,
+                    theme::MUTED,
+                    "Power off",
+                    PopupMessage::PowerOff(entry.serial.clone()),
+                ));
+            }
         }
     }
 
-    let meta = text(format!("{} · {}", entry.connection, entry.state))
-        .size(12.0)
-        .color(if entry.low {
-            theme::WARNING
-        } else {
-            theme::DIM
-        })
-        .width(Fill);
+    let meta = if powering_off {
+        text("Powering off")
+            .size(12.0)
+            .color(theme::MUTED)
+            .width(Fill)
+    } else {
+        text(format!("{} · {}", entry.connection, entry.state))
+            .size(12.0)
+            .color(if entry.low {
+                theme::WARNING
+            } else {
+                theme::DIM
+            })
+            .width(Fill)
+    };
 
     let remember: Element<'_, PopupMessage> = if entry.remember_enabled {
         let serial = entry.serial.clone();
