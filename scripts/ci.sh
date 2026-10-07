@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared local + GitHub Actions checklist (fmt, clippy, test).
+# Shared local + GitHub Actions checklist (fmt, clippy, test, build).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,5 +22,10 @@ cargo clippy --all-targets -- -D warnings
 
 echo "==> cargo test --all-targets"
 cargo test --all-targets
+
+# Test builds don't refresh target/debug/*.exe; build every binary so a green
+# run leaves runnable sdsc-utils + sdsc-shell that match the checked source.
+echo "==> cargo build"
+cargo build
 
 echo "CI checks passed."

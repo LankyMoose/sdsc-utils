@@ -1,5 +1,7 @@
 # Transparent windows go opaque-black under forced DX12
 
+> **Resolved (1.7.0):** boot now sets `WGPU_BACKEND=vulkan,dx12` (Vulkan preferred, DX12 fallback) and predicts alpha support via `wgpu_diag::alpha_composite()`. See [ui-refresh.md](ui-refresh.md). The analysis below is kept for the DX12-fallback path.
+
 ## Symptom
 
 Rounded glass cards (iced `container` with `border.radius` on a
@@ -138,10 +140,11 @@ a minute; check `app.log` for `PANIC`/atlas lines afterwards.
 - A glanceable build ID in the Settings footer (`<hash>[-dirty]@<unix>` baked
   by `build.rs`) proved invaluable for telling fresh test builds from stale
   ones during this investigation — especially with the service/shell split,
-  where `cargo run` rebuilds the service but a lingering `sdsc-shell.exe`
-  keeps showing old UI (single-instance only guards one side; check
-  `tasklist` for **both** names, and prefer `cargo build --bins` when
-  testing UI changes).
+  where `cargo run` rebuilt only the service and a stale or lingering
+  `sdsc-shell.exe` kept showing old UI (single-instance only guards one
+  side; check `tasklist` for **both** names). Since 1.7.0, `cargo run`
+  rebuilds the shell automatically (`shell-sync:` in `app.log`) and
+  `scripts/ci.sh` ends with `cargo build`.
 - If transparency is ever doubted again, the fastest separator is a probe
   window with a thick red border + big radius over a white background:
   curved-red + white corners = alpha works; curved-red + black = radius

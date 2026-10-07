@@ -78,8 +78,91 @@ pub fn append_shell_bundle(service: &Path, shell: &Path, out: &Path) -> Result<(
 /// Shell path for this process: sibling exe, or the copy unpacked from the bundle.
 pub fn prepare_shell_exe() -> Result<PathBuf, String> {
     let current = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    sync_shell_under_cargo_run();
     let cache = crate::persist::paths::data_dir().join("shell");
     resolve_shell_exe(&current, &cache)
+}
+
+/// `cargo run` only builds the default binary (`sdsc-utils`), so the sibling
+/// `sdsc-shell` — which renders all UI — can be stale or built without the
+/// same features (e.g. `dev-emulate`). When this process was launched by
+/// `cargo run`, rebuild the shell once with the matching profile/features
+/// before it is spawned. Installed, MSIX, and portable builds never see the
+/// `CARGO*` runtime env, so this is a no-op for them.
+fn sync_shell_under_cargo_run() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(args) = cargo_run_shell_build(
+            std::env::var_os("CARGO_PKG_NAME").as_deref(),
+            std::env::var_os("CARGO_MANIFEST_DIR").as_deref(),
+            cfg!(debug_assertions),
+            cfg!(feature = "dev-emulate"),
+        ) else {
+            return;
+        };
+        let Some(cargo) = std::env::var_os("CARGO") else {
+            return;
+        };
+        crate::platform::app_log::info(format!("shell-sync: cargo {}", args.join(" ")));
+        let mut cmd = std::process::Command::new(cargo);
+        cmd.args(&args);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        match cmd.output() {
+            Ok(out) if out.status.success() => {
+                crate::platform::app_log::info("shell-sync: sdsc-shell up to date");
+            }
+            Ok(out) => {
+                // Usually a running sdsc-shell holding the exe open. Spawn the
+                // existing binary rather than failing startup.
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let tail: Vec<&str> = stderr.lines().rev().take(8).collect();
+                let tail: Vec<&str> = tail.into_iter().rev().collect();
+                crate::platform::app_log::warn(format!(
+                    "shell-sync: rebuild failed ({}); using existing shell:\n{}",
+                    out.status,
+                    tail.join("\n")
+                ));
+            }
+            Err(err) => {
+                crate::platform::app_log::warn(format!("shell-sync: cargo spawn failed: {err}"));
+            }
+        }
+    });
+}
+
+/// `cargo build` args that rebuild `sdsc-shell` to match this `cargo run`, or
+/// `None` when this process was not launched by `cargo run` for this package.
+fn cargo_run_shell_build(
+    pkg_name: Option<&std::ffi::OsStr>,
+    manifest_dir: Option<&std::ffi::OsStr>,
+    debug: bool,
+    dev_emulate: bool,
+) -> Option<Vec<String>> {
+    // Guard against inheriting another package's `cargo run` env.
+    if pkg_name? != env!("CARGO_PKG_NAME") {
+        return None;
+    }
+    let manifest = Path::new(manifest_dir?).join("Cargo.toml");
+    let mut args = vec![
+        "build".to_string(),
+        "--bin".to_string(),
+        "sdsc-shell".to_string(),
+        "--manifest-path".to_string(),
+        manifest.to_string_lossy().into_owned(),
+    ];
+    if !debug {
+        args.push("--release".to_string());
+    }
+    if dev_emulate {
+        args.push("--features".to_string());
+        args.push("dev-emulate".to_string());
+    }
+    Some(args)
 }
 
 /// Pick the shell for `service_exe`, unpacking into `cache_dir` when needed.
@@ -255,6 +338,56 @@ mod tests {
 
     fn write(path: &Path, bytes: &[u8]) {
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn shell_sync_skipped_outside_cargo_run() {
+        assert_eq!(cargo_run_shell_build(None, None, true, false), None);
+        let dir = std::ffi::OsStr::new("C:/repo");
+        assert_eq!(cargo_run_shell_build(None, Some(dir), true, false), None);
+        let name = std::ffi::OsStr::new(env!("CARGO_PKG_NAME"));
+        assert_eq!(cargo_run_shell_build(Some(name), None, true, false), None);
+    }
+
+    #[test]
+    fn shell_sync_skipped_for_other_packages() {
+        let other = std::ffi::OsStr::new("some-other-crate");
+        let dir = std::ffi::OsStr::new("C:/repo");
+        assert_eq!(
+            cargo_run_shell_build(Some(other), Some(dir), true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn shell_sync_matches_profile_and_features() {
+        let name = std::ffi::OsStr::new(env!("CARGO_PKG_NAME"));
+        let dir = std::ffi::OsStr::new("repo");
+        let manifest = Path::new("repo")
+            .join("Cargo.toml")
+            .to_string_lossy()
+            .into_owned();
+
+        let debug = cargo_run_shell_build(Some(name), Some(dir), true, false).unwrap();
+        assert_eq!(
+            debug,
+            ["build", "--bin", "sdsc-shell", "--manifest-path", &manifest]
+        );
+
+        let release_dev = cargo_run_shell_build(Some(name), Some(dir), false, true).unwrap();
+        assert_eq!(
+            release_dev,
+            [
+                "build",
+                "--bin",
+                "sdsc-shell",
+                "--manifest-path",
+                &manifest,
+                "--release",
+                "--features",
+                "dev-emulate",
+            ]
+        );
     }
 
     #[test]

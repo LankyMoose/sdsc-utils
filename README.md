@@ -92,7 +92,7 @@ Requires Rust **1.88+** (edition 2024).
 cargo build --release
 ```
 
-Binary: `target/release/sdsc-utils` (`.exe` on Windows).
+This builds every binary. Run `target/release/sdsc-utils` (`.exe` on Windows); it is the background service and starts the UI process, `sdsc-shell`, from the same folder, so keep the two together.
 
 Release builds do **not** include the developer emulator (`dev-emulate` is off by default).
 
@@ -107,7 +107,7 @@ git config core.hooksPath .githooks
 ```
 
 - **pre-commit** — runs `cargo fmt --all` and re-stages already-staged `.rs` files.
-- **pre-push** — runs the same checklist as CI (`scripts/ci.sh`: fmt check, clippy `-D warnings`, tests) on **every** branch you push.
+- **pre-push** — runs the same checklist as CI (`scripts/ci.sh`: fmt check, clippy `-D warnings`, tests, debug build) on **every** branch you push.
 
 Bypass with `git commit --no-verify` or `git push --no-verify` when needed. You can also run checks manually: `bash scripts/ci.sh`.
 
@@ -118,6 +118,8 @@ cargo run --release
 # or
 ./target/release/sdsc-utils
 ```
+
+`cargo run` only compiles `sdsc-utils`, so when started that way it also rebuilds `sdsc-shell` (same profile and features) before launching it. You never end up with a stale UI.
 
 ### Developer emulator (optional)
 

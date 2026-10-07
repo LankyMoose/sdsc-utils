@@ -4,28 +4,27 @@
 
 | Action | Command |
 |---|---|
-| Run fmt + clippy + test (full CI) | `bash scripts/ci.sh` |
+| Run fmt + clippy + test + build (full CI) | `bash scripts/ci.sh` |
 | Format check only | `cargo fmt --all -- --check` |
 | Clippy (all targets, fail on warnings) | `cargo clippy --all-targets -- -D warnings` |
 | Run all tests | `cargo test --all-targets` |
+| Debug build (every binary) | `cargo build` |
 | Release build | `cargo build --release` |
+| Run (service + matching shell) | `cargo run` |
 | Run with dev emulator | `cargo run --features dev-emulate -- --dev` |
 | List connected controllers | `sdsc-utils --list-controllers` |
 
-## Workspace structure
+## Project structure
 
-- **Root `Cargo.toml`** — defines 4 crates: `sdsc-core`, `sdsc-platform`, `sdsc-shell`, `dualsense`
-- **`src/`** — monolithic source tree (not a workspace split); the root package is the UI app
-- **`crates/sdsc-core`** — core logic: HID, domain models, analytics, persist, UI logic, games/launch
-- **`crates/sdsc-platform`** — platform-specific code (macOS/Linux/windows build config, auto-start, crash restart, UI sounds, wgpu diag) — *currently mostly empty/macro-conditional*
-- **`crates/sdsc-shell`** — shell-related utilities (currently mostly empty)
-- **`crates/dualsense`** — DualSense HID protocol, driver, known controller list, emulation
-- **`src/bin/`** — three binaries: `sdsc-utils`, `sdsc-shell`, `gen_msix_logos`
+- **Single package, no workspace.** Root `Cargo.toml` is one crate (`sdsc-utils`): a library (`src/lib.rs`, crate name `sdsc_utils`) plus four binaries in `src/bin/`.
+- **`src/`** — everything lives here; see [Directory ownership](#directory-ownership) below.
 - **`build.rs`** — rasterizes the DualSense SVG and embeds the `.ico` into the Windows .exe
+- **`notes/`** — topic handoffs for agents (index: `notes/README.md`). Read the matching note before touching a do-not-regress area.
+- **`packaging/`** — MSIX packaging; **`scripts/`** — CI checklist; **`assets/`** — icons, sounds, README screenshots.
 
 ## Build / test / lint ordering
 
-**Always: fmt → clippy → test** (this is the CI order and the pre-commit hook order).
+**Always: fmt → clippy → test → build** (this is the CI order and the pre-push hook order).
 
 ```bash
 bash scripts/ci.sh
@@ -33,48 +32,53 @@ bash scripts/ci.sh
 cargo fmt --all -- --check     # must pass first
 cargo clippy --all-targets -- -D warnings   # must pass second
 cargo test --all-targets       # must pass third
+cargo build                    # refreshes target/debug/*.exe (test builds don't)
 ```
 
 Missing this order can cause subtle issues (clippy warnings can fmt-reformat code, breaking the `--check` gate).
 
 ## Key binaries & entrypoints
 
-- `src/bin/sdsc-utils.rs` — the system-tray app (the default binary)
-- `src/bin/sdsc-shell.rs` — shell / secondary binary
+- `src/bin/sdsc-utils.rs` — the service: HID, tray, session (the default binary); spawns `sdsc-shell` from next to its own exe
+- `src/bin/sdsc-shell.rs` — the iced UI process (popup, Settings, Start, toasts)
 - `src/bin/gen_msix_logos.rs` — MSIX logo generator
+- `src/bin/bundle-portable.rs` — appends `sdsc-shell` onto `sdsc-utils` for the portable download
+- Plain `cargo build` builds **all** binaries. `cargo run` builds only `sdsc-utils`, so when launched by `cargo run` the service rebuilds `sdsc-shell` with the same profile/features before spawning it (`shell_bundle::sync_shell_under_cargo_run`; grep `shell-sync:` in `app.log`). If that rebuild fails (usually an orphaned `sdsc-shell.exe` holding the file), the existing shell is used and a warning is logged.
 - `src/lib.rs` — re-exports all internal modules (`app`, `controller`, `domain`, `games`, `ipc`, `persist`, `platform`, `service`, `session`, `ui`)
 
 ## Conventions & quirks
 
-- **Battery steps**: DualSense firmware reports battery in 11 coarse steps (0–10). Percentages use the Linux mid-point mapping (step 0 → 5%, step 9 → 95%, step 10/full → 100%). See `src/domain/battery/` or the README.
+- **Battery steps**: DualSense firmware reports battery in 11 coarse steps (0–10). Percentages use the Linux mid-point mapping (step 0 → 5%, step 9 → 95%, step 10/full → 100%). See `src/controller/dualsense/battery.rs` or the README.
 - **Lightbar color**: Blue → Purple → Red gradient as battery drops; reasserted every ~5 seconds. Low-battery pulse (orange) when ≤5% while discharging.
 - **Single instance**: The app enforces single-instance via the `single-instance` crate. Second launch exits quietly.
 - **Windows features**: `tray-icon` builds differ per OS — root `Cargo.toml` has `[target.'cfg(windows)'.dependencies]`, `[target.'cfg(target_os = "macos")']`, `[target.'cfg(target_os = "linux")']` sections.
 - **No telemetry**: All data stays local (`prefs.json`, `controllers.json`, `analytics.json`, `app.log`).
-- **Pre-commit hooks**: `.githooks/` runs `cargo fmt --all` and `cargo clippy -D warnings` on every commit. Bypass with `--no-verify`.
-- **CI**: GitHub Actions `ci.yml` runs `bash scripts/ci.sh` on push/PR. The script does fmt → clippy → test in order.
+- **Git hooks** (`git config core.hooksPath .githooks`): pre-commit runs `cargo fmt --all` and re-stages staged `.rs` files; pre-push runs `scripts/ci.sh`. Bypass with `--no-verify`.
+- **CI**: GitHub Actions `ci.yml` runs `bash scripts/ci.sh` on push/PR. The script does fmt → clippy → test → build in order.
 
 ## Platform-specific notes
 
-- **Windows**: Requires the `windows` feature group (see root `Cargo.toml`). HID access via `hidapi`. Tray via `tray-icon` with `win32` backend.
-- **macOS**: `tray-icon` with default backend. Input monitoring may be prompted by macOS.
+- **Windows**: `windows` / `winreg` crates under `[target.'cfg(windows)'.dependencies]`. HID access via `hidapi`. Tray via `tray-icon` (no default features).
+- **macOS**: `tray-icon` (no default features). Input monitoring may be prompted by macOS.
 - **Linux**: `tray-icon` with `gtk` feature. Requires `libhidapi` / udev rules for DualSense access.
+- **Graphics backend**: on Windows boot sets `WGPU_BACKEND=vulkan,dx12` (Vulkan preferred, DX12 fallback) unless the env var is already set; `wgpu_diag::alpha_composite()` reports whether transparent windows will composite. See `notes/ui-refresh.md`.
 - **Developer emulator**: Build with `dev-emulate` feature: `cargo run --features dev-emulate -- --dev`. This adds a Developer section in Configure with emulated controllers and battery analytics presets.
 
-## Directory ownership (what changes in each crate)
+## Directory ownership
 
 | Directory | Typical changes |
 |---|---|
-| `crates/sdsc-core/src/games/` | Game launch matching, process spawning, Steam integration |
-| `crates/sdsc-core/src/persist/` | `prefs.json`, `controllers.json`, `analytics.json` read/write |
-| `crates/sdsc-core/src/ui_logic/` | Internal UI state logic (not the iced UI) |
-| `crates/sdsc-core/src/tests/` | Unit/integration tests and fixtures |
-| `crates/sdsc-platform/src/` | Platform config, auto-start, crash-restart, UI sounds, wgpu diagnostics |
-| `crates/dualsense/src/` | HID protocol, controller ID mapping, emulation support |
-| `src/app/` | iced app setup, tray icon, popup window |
-| `src/controller/` | HID driver, known controller models, emulation |
-| `src/service/` | IPC service between instances (if needed) |
-| `src/persist/` | File-backed prefs/persisted state (companion to crate) |
+| `src/app/` | iced daemon (`App`): window lifecycle for popup / Settings / Start / toast, message routing, shell side of IPC |
+| `src/service/` | Service process: owns HID worker + tray, spawns `sdsc-shell`, talks to it over IPC |
+| `src/session/` | Pure device session (no windows/HWND): presence, notify, analytics, Start-open policy; emits `SessionEffect`s the UI applies |
+| `src/ipc/` | Service ↔ shell pipe transport (Windows named pipe / Unix socket) |
+| `src/controller/` | HID polling + worker (`hid/`), DualSense protocol (`dualsense/`: battery, lightbar, rumble, input, identity), known controllers, `dev-emulate` emulation |
+| `src/domain/` | Pure logic: battery colors/spectrum math, pad gestures/chords, protocol helpers |
+| `src/games/` | Steam library scan, game launch, process matching |
+| `src/persist/` | `prefs.json`, `controllers.json`, `analytics.json`, `steam_library.json`, paths |
+| `src/platform/` | Logging, app metadata, autostart, crash-restart, device-arrival watch, file icons, MSIX/portable (`packaged`, `shell_bundle`), UI sounds, wgpu diagnostics, Win32 helpers |
+| `src/ui/` | All iced views + styling: `theme.rs`, `popup/`, `configure/` (Settings), `start/` (compact + immersive Start), `toast/`, `shader/`, `percent_ring.rs`, `layout.rs` (window placement) |
+| Tests | Inline `#[cfg(test)] mod tests` next to the code (no `tests/` dir) |
 
 ## Common gotchas for agents
 
@@ -89,11 +93,14 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 
 ## Where to find things
 
-- **HID driver / controller state** → `src/controller/hyd.rs`, `src/controller/model.rs`, `crates/dualsense/src/`
-- **Battery step → percentage math** → `src/domain/color.rs`, `src/domain/pad.rs`
-- **Lightbar gradient / spectrum editor** → `src/app/configure/`, `src/theme.rs`
-- **Start screen / game launcher** → `src/games/`, `src/bin/sdsc-utils.rs`
-- **Persisted state (prefs/controllers/analytics)** → `crates/sdsc-core/src/persist/`, `src/persist/`
-- **IPC / multi-instance** → `src/ipc/`, `src/session/`
+- **HID driver / controller state** → `src/controller/hid/`, `src/controller/driver.rs`, `src/controller/model.rs`, `src/controller/dualsense/`
+- **Battery step → percentage math** → `src/controller/dualsense/battery.rs`
+- **Battery color spectrum** → `src/domain/color.rs`; lightbar writes / reassert → `src/controller/dualsense/lightbar.rs`
+- **Lightbar spectrum editor (Settings)** → `src/ui/configure/spectrum.rs`, `src/ui/configure/mod.rs`
+- **Theme / shared widget styles** → `src/ui/theme.rs`; restyle plan → `notes/ui-refresh.md`
+- **Start screen / game launcher** → `src/ui/start/` (UI), `src/games/` (Steam scan, launch); immersive mode → `notes/start-immersive.md`
+- **Toasts** → `src/ui/toast/` (state machine in `machine.rs`); z-order / remount → `notes/windows-toast.md`
+- **Persisted state (prefs/controllers/analytics)** → `src/persist/`
+- **Service / shell split, IPC, single instance** → `src/service/`, `src/ipc/`, `src/session/`, `src/bin/sdsc-utils.rs`
 - **MSIX packaging** → `packaging/`, `src/platform/packaged.rs`, `src/platform/shell_bundle.rs`
 - **CI / clippy fmt gates** → `scripts/ci.sh`, `.github/workflows/ci.yml`

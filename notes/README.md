@@ -10,3 +10,5 @@ Topic handoffs for agents. Prefer the matching sibling over appending unrelated 
 | [start-immersive.md](start-immersive.md) | do-not-regress | Immersive Start promote/demote, chord latch, dock, Options settings, art | Immersive cover, reopen chord, controllers dock, Start settings panel |
 | [hid-live-session.md](hid-live-session.md) | do-not-regress | Hot-path battery from input stream, silence drop, Start rumble handle | Live pad sampling, disconnect while BT still listed, rumble vs lightbar handles |
 | [wgpu-image-atlas-crash.md](wgpu-image-atlas-crash.md) | do-not-regress | iced/wgpu image-atlas `create_renderer` panic | Tray panic + `crash-restart`, atlas / `Texture::create_view` |
+| [transparent-windows-dx12.md](transparent-windows-dx12.md) | historical | Why transparent windows go black under DX12; Vulkan validation | Rounded/glass windows show black corners; backend choice |
+| [ui-refresh.md](ui-refresh.md) | in progress | 1.7.0 restyle plan: immersive language for popup/Settings/toasts/compact Start; Vulkan-first backend | Restyling any non-immersive window, theme tokens, corner strategy |
