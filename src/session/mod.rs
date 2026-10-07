@@ -12,6 +12,7 @@ pub use gate::{
     should_skip_connect_cooldown_on_power_off, take_skip_connect_cooldown,
 };
 
+use crate::controller::dualsense::identity::normalize_identity;
 use crate::controller::dualsense::lightbar;
 use crate::controller::known::KnownControllers;
 use crate::controller::model::ControllerStatus;
@@ -101,6 +102,19 @@ impl DeviceSession {
 
     pub fn clear_missed_polls(&mut self) {
         self.missed_poll_since.clear();
+    }
+
+    /// Clear miss streaks for pads seen in the latest snapshot.
+    ///
+    /// Must run on *every* ingestion, not just on change: the hot path skips
+    /// evaluation when the live snapshot is equivalent, and a held pad's clone
+    /// is identical — so a recovered pad's streak would otherwise survive until
+    /// the next stall drops it instantly with no hold.
+    pub fn mark_seen(&mut self, serials: impl IntoIterator<Item = impl AsRef<str>>) {
+        for serial in serials {
+            self.missed_poll_since
+                .remove(&normalize_identity(serial.as_ref()));
+        }
     }
 
     pub fn mark_skip_connect_cooldown(&mut self) {
@@ -487,6 +501,39 @@ mod tests {
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
         assert!(!has_open_start(&effects));
         assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
+    }
+
+    #[test]
+    fn mark_seen_clears_stale_streak_so_next_stall_holds() {
+        use std::time::Duration;
+
+        // Regression: the hot path skips evaluation when the live snapshot is
+        // equivalent (a held clone is identical), so a recovered pad's streak
+        // survived and its next stall dropped instantly with no hold.
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let pad_a = bt_pad("aa");
+        let pad_b = bt_pad("bb");
+        let t0 = Instant::now();
+        let ctx_at = |now: Instant| ApplyContext {
+            start_visible: false,
+            fullscreen: false,
+            now,
+            lightbar_enabled: false,
+        };
+        let _ = session.apply_controllers(vec![pad_a.clone(), pad_b.clone()], ctx_at(t0));
+
+        // Stale streak as left by a recovered-then-unevaluated stall.
+        session
+            .missed_poll_since
+            .insert("bb".to_string(), t0 - Duration::from_secs(36));
+        // Fresh sighting on every hot loop clears it, evaluation or not.
+        session.mark_seen(["bb"]);
+        assert!(session.missed_poll_since.is_empty());
+
+        // The next stall therefore holds instead of dropping instantly.
+        let effects = session.on_poll_result(vec![pad_a.clone()], ctx_at(t0));
+        assert_eq!(session.controllers.len(), 2);
+        assert!(!queued_bodies(&effects).contains(&"Disconnected".to_string()));
     }
 
     #[test]

@@ -83,7 +83,8 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **The `single-instance` crate ensures only one run**. If you add GUI windows, make sure they're owned correctly or you'll get "single instance" exits.
 - **Windows .exe icon is generated from SVG at build time** via `build.rs`. If the SVG changes, the icon rebuilds automatically (rerun-if-changed is set).
 - **`--dev` flag only works when built with `dev-emulate` feature**. Without it, `--dev` is a no-op.
-- **Lightbar color reassertion every ~5 seconds** means if you overwrite the lightbar via another tool (e.g., Steam Input), the app will re-apply its color. This is intentional but worth noting when debugging "stuck" colors.
+- **Lightbar color reassertion every ~5 seconds** means if you overwrite the lightbar via another tool (e.g., Steam Input), the app will re-apply its color. This is intentional but worth noting when debugging "stuck" colors. (Incremental-poll work narrows this to change/new/30s-backstop; see `notes/hot-enumeration-freeze.md` for the Steam test watch.)
+- **Hot enumeration freeze**: while input is hot (`input_hot=1`, e.g. Start open with a stable pad), `refresh_devices()` is deferred up to `HOT_ENUM_MAX_DEFER` (20s heartbeat cap) and service cold polls are gated off — plus the OS arrival watcher (Windows `CM_Register_Notification`, Linux `/dev` snapshot; see `notes/device-arrival-watch.md`) fires list-only refresh hints so newly-connected pads surface in ~1s. Pre-existing freeze documented in `notes/hot-enumeration-freeze.md`; any poll/sampling change must still be validated with a Start-open + second-connect test, not just tray-idle.
 - **Battery step mapping is Linux-midpoint**. Windows may report different percentages; the app maps firmware steps → percentages via the fixed mid-point formula.
 
 ## Where to find things

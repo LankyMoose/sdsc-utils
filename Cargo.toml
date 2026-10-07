@@ -41,6 +41,7 @@ windows = { version = "0.61", features = [
     "Foundation",
     "Foundation_Collections",
     "Gaming_Input",
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Globalization",

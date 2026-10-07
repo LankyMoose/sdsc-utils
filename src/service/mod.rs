@@ -328,6 +328,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Skip when HID presence is empty — stale live_pads must not re-add pads.
         if nav_priority && !last_discovered.is_empty() {
             let live = hid_worker.live_controllers();
+            // Always clear streaks for seen pads, even when the snapshot is
+            // equivalent and evaluation is skipped (else a recovered pad's
+            // stale streak drops it instantly on its next stall).
+            session.mark_seen(live.iter().map(|c| c.serial.as_str()));
             if hot_path_wait_for_first_sample(
                 live.is_empty(),
                 !last_discovered.is_empty(),

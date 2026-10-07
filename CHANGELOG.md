@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Closing a game flips status from `Playing`/`Running` to `Closing` immediately (async close; badge clears on process exit).
 - Game rows disable (dim + `Not installed`, skipped in nav, launch blocked) when a scan proves them uninstalled; stale immediate launches fail gracefully with a rows refresh instead of an error popup.
 - Brief input-report stalls (e.g. a weak low-battery Bluetooth link under two-pad load) no longer flap the session: missed polls hold the pad for 2s of wall time instead of a single miss, so short stalls can't trigger `Disconnected`/`Connected` toast loops, lightbar reclaim flashes, or input-handle drops.
+- Incremental HID poll: stable pads with fresh sample data cost zero HID reads on liveness ticks (cached handles are reused, rumble/input handles and the live map are no longer dropped every 5s); blocking battery reads are reserved for new serials (full attempts) and stale pads (fail-fast), and the lightbar reasserts only on new pads, color changes, and a 30s backstop instead of every tick.
+- Hot enumeration freeze bounded: `refresh_devices()` is forced at least every 20s even while input is hot, and a new OS arrival watcher (Windows `CM_Register_Notification` on the HID class, Linux `/dev` snapshot thread) fires list-only refresh hints so second-pad connects surface in ~1s instead of staying invisible until input goes cold.
+- Stale miss-streak no longer drops instantly: the hot path clears streaks for seen pads on every loop (`mark_seen`), not just on change, so a recovered pad's next stall holds the full 2s instead of firing an immediate false `Disconnected`.
+- Launch-quiet suppression only covers continuously-present pads: a serial absent from a snapshot loses its suppression, so a pad returning after a power cycle gets its `Connected` toast instead of inheriting a stale launch entry.
+- Power-off no longer falls through to unknown-identity interfaces when exact matches exist: if every matched send fails it reports failure rather than risk powering off a stranger's pad.
+- Ghost HID paths (enumerated but un-openable) back off after 3 consecutive open failures instead of burning an open per sample; records clear on success or when the path leaves enumeration.
+- Arrival watcher debounce gains a trailing follow-up so a second pad connecting inside the 1s burst window is re-scanned ~1.5s later instead of waiting out the 20s heartbeat.
 
 ## [1.6.0] - 2026-10-05
 

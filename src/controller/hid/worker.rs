@@ -21,8 +21,8 @@
 use crate::controller::driver;
 use crate::controller::dualsense::battery;
 use crate::controller::dualsense::identity::{
-    is_dualsense_device, is_dualsense_gamepad, normalize_identity, product_name,
-    resolve_device_identity,
+    hid_serial, is_dualsense_device, is_dualsense_gamepad, is_storable_serial, normalize_identity,
+    product_name, resolve_device_identity,
 };
 use crate::controller::dualsense::lightbar::{
     self, HidPhaseTiming, IDENTIFY_FLASH_COUNT, IDENTIFY_FLASH_MS, LOW_BATTERY_ORANGE,
@@ -30,7 +30,9 @@ use crate::controller::dualsense::lightbar::{
 };
 use crate::controller::dualsense::rumble;
 use crate::controller::hid::launch_paths::LaunchPaths;
-use crate::controller::hid::poll::{self, PRESENCE_INTERVAL, PRESENCE_INTERVAL_EMPTY};
+use crate::controller::hid::poll::{
+    self, POLL_LIVE_BATTERY_STALE, PRESENCE_INTERVAL, PRESENCE_INTERVAL_EMPTY,
+};
 use crate::controller::model::ControllerStatus;
 use crate::domain::color::{Rgb, color_for_battery_percent};
 use crate::domain::pad::{
@@ -60,6 +62,34 @@ const SAMPLE_STALL_MS: u128 = 100;
 /// Consecutive sample timeouts before dropping a pad from the hot-path live map
 /// (~200ms at [`ACTIVE_POLL`] / wired report interval). HID handle stays open.
 const LIVE_SILENCE_TIMEOUTS: u32 = 50;
+/// Upper bound on hot enumeration deferral: force `refresh_devices()` at least
+/// this often even while input is hot. Bounds the arrival blind window on every
+/// OS (see notes/hot-enumeration-freeze.md); a routine refresh costs ~10ms.
+pub const HOT_ENUM_MAX_DEFER: Duration = Duration::from_secs(20);
+/// Minimum gap between OS arrival-hint refreshes (burst collapse).
+const REFRESH_HINT_THROTTLE: Duration = Duration::from_secs(1);
+/// Consecutive open failures before a path backs off (ghost-path churn guard).
+const OPEN_BACKOFF_THRESHOLD: u32 = 3;
+/// How long a backed-off path is skipped (re-probed sooner on list change).
+const OPEN_BACKOFF_WINDOW: Duration = Duration::from_secs(5);
+
+/// Pure decision: is the last enumeration older than `max_age` (or never ran)?
+fn refresh_overdue_at(last_refresh: Option<Instant>, now: Instant, max_age: Duration) -> bool {
+    last_refresh.is_none_or(|at| now.saturating_duration_since(at) >= max_age)
+}
+
+/// Pure decision: skip opening a path with `fails` consecutive failures as of
+/// `last`, evaluated at `now`.
+fn backoff_skip_at(fails: u32, last: Instant, now: Instant) -> bool {
+    fails >= OPEN_BACKOFF_THRESHOLD && now.saturating_duration_since(last) < OPEN_BACKOFF_WINDOW
+}
+
+/// Consecutive open failures per HID path (ghost devices linger in Windows
+/// enumeration while un-openable: `open_device: file not found`).
+struct OpenBackoff {
+    fails: u32,
+    last: Instant,
+}
 
 enum HidCmd {
     Poll {
@@ -90,6 +120,9 @@ enum HidCmd {
     SetLowBatteryTargets {
         targets: Vec<(String, u8)>,
     },
+    /// OS arrival/removal hint (device_watch): refresh the device list only.
+    /// Sampling opens newcomers; session ticks pick up membership.
+    RefreshPresence,
     Shutdown,
 }
 
@@ -123,6 +156,12 @@ struct DeviceCache {
     api: HidApi,
     devices: HashMap<String, OpenDevice>,
     last_enum_at: Option<Instant>,
+    /// Last *actual* `refresh_devices()` (unlike `last_enum_at`, deferrals do
+    /// not bump this). Drives the heartbeat cap while input is hot.
+    last_refresh_at: Option<Instant>,
+    /// Consecutive open failures per HID path; backed-off paths are skipped by
+    /// the sampling open loop (pruned to the listed set on every refresh).
+    open_backoff: HashMap<String, OpenBackoff>,
     presence: Arc<Mutex<Vec<String>>>,
     launch_paths: LaunchPaths,
     launch_serials: Arc<Mutex<Vec<String>>>,
@@ -132,6 +171,9 @@ struct DeviceCache {
 struct LivePadStatus {
     product: String,
     reading: battery::BatteryReading,
+    /// When the reading was last confirmed (sample or poll read). Drives the
+    /// incremental poll: fresh entries skip the blocking battery read.
+    updated_at: Instant,
 }
 
 impl DeviceCache {
@@ -144,6 +186,8 @@ impl DeviceCache {
             api,
             devices: HashMap::new(),
             last_enum_at: None,
+            last_refresh_at: None,
+            open_backoff: HashMap::new(),
             presence,
             launch_paths: LaunchPaths::new(),
             launch_serials,
@@ -165,6 +209,7 @@ impl DeviceCache {
         crate::controller::hid::diag::diag_info("hid-diag: hidapi_refresh begin");
         self.api.refresh_devices().map_err(|e| e.to_string())?;
         self.last_enum_at = Some(Instant::now());
+        self.last_refresh_at = self.last_enum_at;
         let mut paths: Vec<String> = self
             .api
             .device_list()
@@ -173,6 +218,11 @@ impl DeviceCache {
             .collect();
         paths.sort();
         self.launch_paths.on_device_list(paths.iter().cloned());
+        // Drop backoff records for paths no longer listed: bounds the map,
+        // and a reappearing path retries immediately (no stale skip).
+        let listed: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+        self.open_backoff
+            .retain(|path, _| listed.contains(path.as_str()));
         if let Ok(mut guard) = self.presence.lock() {
             *guard = paths;
         }
@@ -194,6 +244,34 @@ impl DeviceCache {
         self.devices.clear();
     }
 
+    /// Paths currently skipped by the sampling open loop (borrow ends here).
+    fn backoff_skipped_paths(&self) -> Vec<String> {
+        let now = Instant::now();
+        self.open_backoff
+            .iter()
+            .filter(|(_, backoff)| backoff_skip_at(backoff.fails, backoff.last, now))
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// Record an open outcome (call after any `device_list` borrow ends).
+    fn note_open_result(&mut self, path: &str, ok: bool) {
+        if ok {
+            self.open_backoff.remove(path);
+        } else if let Some(backoff) = self.open_backoff.get_mut(path) {
+            backoff.fails = backoff.fails.saturating_add(1);
+            backoff.last = Instant::now();
+        } else {
+            self.open_backoff.insert(
+                path.to_string(),
+                OpenBackoff {
+                    fails: 1,
+                    last: Instant::now(),
+                },
+            );
+        }
+    }
+
     fn drop_serial(&mut self, serial: &str) {
         self.devices.remove(&normalize_identity(serial));
     }
@@ -202,9 +280,13 @@ impl DeviceCache {
     fn try_open_serial(&mut self, serial: &str) -> Option<OpenDevice> {
         let target = normalize_identity(serial);
         let mut best: Option<(OpenDevice, bool)> = None;
+        // Collected for backoff bookkeeping after the `device_list` borrow ends.
+        let mut open_failed: Vec<String> = Vec::new();
+        let mut open_ok: Vec<String> = Vec::new();
         for info in self.api.device_list().filter(|d| driver::is_gamepad(d)) {
             let open_started = Instant::now();
             let hint = info.serial_number().unwrap_or("");
+            let path = info.path().to_string_lossy().into_owned();
             let device = {
                 let _op = crate::controller::hid::diag::enter_op("open_device");
                 match info.open_device(&self.api) {
@@ -216,6 +298,7 @@ impl DeviceCache {
                             open_started.elapsed().as_millis(),
                             Ok(()),
                         );
+                        open_ok.push(path.clone());
                         d
                     }
                     Err(err) => {
@@ -226,6 +309,7 @@ impl DeviceCache {
                             open_started.elapsed().as_millis(),
                             Err(&err.to_string()),
                         );
+                        open_failed.push(path);
                         continue;
                     }
                 }
@@ -250,6 +334,12 @@ impl DeviceCache {
                     is_usb,
                 ));
             }
+        }
+        for path in open_failed {
+            self.note_open_result(&path, false);
+        }
+        for path in open_ok {
+            self.note_open_result(&path, true);
         }
         best.map(|(open, _)| open)
     }
@@ -283,7 +373,11 @@ impl DeviceCache {
     /// handles are open (EMPTY cadence for first connect).
     fn ensure_all_pads(&mut self, input_hot: bool) {
         if self.devices.is_empty() || self.enum_due(input_hot) {
-            if input_hot && !self.devices.is_empty() {
+            // Heartbeat cap: never defer past HOT_ENUM_MAX_DEFER even while
+            // input is hot (bounds the arrival blind window on every OS).
+            let overdue =
+                refresh_overdue_at(self.last_refresh_at, Instant::now(), HOT_ENUM_MAX_DEFER);
+            if input_hot && !self.devices.is_empty() && !overdue {
                 // Defer enum: sample open handles without waiting on refresh.
                 // Advance the cadence clock so we do not re-enter every ~4ms sample.
                 crate::controller::hid::diag::diag_info(format!(
@@ -312,6 +406,12 @@ impl DeviceCache {
         }
 
         let mut best: HashMap<String, (OpenDevice, bool)> = HashMap::new();
+        // Ghost paths linger in Windows enumeration while un-openable; skip
+        // backed-off paths here (re-probed on list change) instead of burning
+        // an open per sample. Outcomes recorded after the borrow ends.
+        let skipped = self.backoff_skipped_paths();
+        let mut open_failed: Vec<String> = Vec::new();
+        let mut open_ok: Vec<String> = Vec::new();
         for info in self.api.device_list().filter(|d| driver::is_gamepad(d)) {
             let identity_hint = info.serial_number().filter(|s| !s.is_empty()).unwrap_or("");
             // Skip open if we already hold this pad (second open often fails exclusive).
@@ -327,6 +427,10 @@ impl DeviceCache {
                 }
                 continue;
             }
+            let path = info.path().to_string_lossy().into_owned();
+            if skipped.contains(&path) {
+                continue;
+            }
             let open_started = Instant::now();
             let device = {
                 let _op = crate::controller::hid::diag::enter_op("open_device");
@@ -339,6 +443,7 @@ impl DeviceCache {
                             open_started.elapsed().as_millis(),
                             Ok(()),
                         );
+                        open_ok.push(path.clone());
                         d
                     }
                     Err(err) => {
@@ -349,11 +454,11 @@ impl DeviceCache {
                             open_started.elapsed().as_millis(),
                             Err(&err.to_string()),
                         );
+                        open_failed.push(path);
                         continue;
                     }
                 }
             };
-            let path = info.path().to_string_lossy().into_owned();
             let identity = resolve_device_identity(info, &device);
             if let Some(serial) = self.launch_paths.take_serial_for_path(&path, &identity) {
                 self.queue_launch_serial(serial);
@@ -380,6 +485,12 @@ impl DeviceCache {
                     ),
                 );
             }
+        }
+        for path in open_failed {
+            self.note_open_result(&path, false);
+        }
+        for path in open_ok {
+            self.note_open_result(&path, true);
         }
         for (id, (open, _)) in best {
             self.devices.insert(id, open);
@@ -713,14 +824,25 @@ impl HidWorkerHandle {
             })
             .expect("spawn hid-worker");
 
-        Self {
+        let handle = Self {
             tx,
             identifying,
             input_hot,
             presence,
             live_pads,
             launch_serials,
+        };
+        // OS arrival/removal watcher (Windows/Linux; no-op elsewhere): fires
+        // throttled list-only refresh hints so hot enumeration cannot freeze
+        // discovery indefinitely. Heartbeat cap covers the rest.
+        let watched = crate::platform::device_watch::spawn_arrival_watcher({
+            let handle = handle.clone();
+            move || handle.notify_device_list_changed()
+        });
+        if watched {
+            crate::platform::app_log::info("device watch: OS arrival watcher armed");
         }
+        handle
     }
 
     pub fn identifying(&self) -> Arc<AtomicBool> {
@@ -830,6 +952,12 @@ impl HidWorkerHandle {
         let _ = self.tx.send(HidCmd::SetLowBatteryTargets { targets });
     }
 
+    /// OS device arrival/removal hint: refresh the device list soon.
+    /// List-only and throttled in the worker; sampling opens newcomers.
+    pub fn notify_device_list_changed(&self) {
+        let _ = self.tx.send(HidCmd::RefreshPresence);
+    }
+
     pub fn shutdown(&self) {
         let _ = self.tx.send(HidCmd::Shutdown);
     }
@@ -934,7 +1062,14 @@ fn remember_live_pad(
 ) {
     let key = normalize_identity(serial);
     if let Ok(mut guard) = live_pads.lock() {
-        guard.insert(key, LivePadStatus { product, reading });
+        guard.insert(
+            key,
+            LivePadStatus {
+                product,
+                reading,
+                updated_at: Instant::now(),
+            },
+        );
     }
 }
 
@@ -1570,6 +1705,8 @@ fn handle_cmd(
             let (result, timing) = write_rgb_exclusive(cache, &serial, color);
             if let Err(err) = result {
                 app_log::warn(format!("lightbar write failed for {serial}: {err}"));
+            } else {
+                lightbar::note_lightbar_applied(&serial, color);
             }
             log_cmd(
                 "SetRgb",
@@ -1618,48 +1755,32 @@ fn handle_cmd(
             pulse.set_targets(targets);
             false
         }
-        HidCmd::Poll { previously, reply } => {
-            // Release input + rumble handles so Poll can open; keep last nav readings.
-            stop_all_rumble(rumble, active_rumble);
-            cache.drop_all();
-            // Cold Poll refreshes battery itself; clear hot-path map so stale
-            // readings cannot shadow a later hot reconnect.
-            if let Ok(mut guard) = live_pads.lock() {
-                guard.clear();
+        HidCmd::RefreshPresence => {
+            // Arrival/removal hint: list-only refresh, throttled so bursts
+            // collapse. Newcomers are opened by sampling; no reads here.
+            let stale =
+                refresh_overdue_at(cache.last_refresh_at, Instant::now(), REFRESH_HINT_THROTTLE);
+            if stale {
+                crate::controller::hid::diag::diag_info("hid-diag: presence hint refresh");
+                let _ = cache.refresh_device_list();
             }
+            false
+        }
+        HidCmd::Poll { previously, reply } => {
+            // Incremental: keep input/rumble handles and the live map.
+            // Continuous sampling already reaps dead handles (HardFail), the
+            // session hold covers transient read misses, and rumble re-probes
+            // on write failure — no mass drop needed.
             log_cmd_begin("Poll", snapshot);
             let started = Instant::now();
             let mut quiet = Vec::new();
             let (result, timing) = {
                 let _op = crate::controller::hid::diag::enter_op("cmd_Poll");
                 let _ = cache.refresh_device_list();
-                poll::poll_controllers_timed(
-                    &cache.api,
-                    &previously,
-                    Some(&mut cache.launch_paths),
-                    Some(&mut quiet),
-                )
+                poll_incremental(cache, live_pads, &previously, &mut quiet)
             };
             for serial in quiet {
                 cache.queue_launch_serial(serial);
-            }
-            // Seed live map from Poll so a hot transition has immediate statuses.
-            if let Ok(ref controllers) = result
-                && let Ok(mut guard) = live_pads.lock()
-            {
-                for c in controllers {
-                    guard.insert(
-                        normalize_identity(&c.serial),
-                        LivePadStatus {
-                            product: c.product.clone(),
-                            reading: battery::BatteryReading {
-                                percent: c.percent,
-                                state: c.state,
-                                connection: c.connection,
-                            },
-                        },
-                    );
-                }
             }
             log_cmd(
                 "Poll",
@@ -1673,6 +1794,196 @@ fn handle_cmd(
             false
         }
     }
+}
+
+/// Incremental poll: reuse cached input handles, skip blocking battery reads
+/// when the sample path has fresh data, and reassert lightbar only where due.
+///
+/// Blocking reads are reserved for new serials (full attempts) and stale pads
+/// (fail-fast on the cached handle, full re-probe only after a drop).
+/// Successful reads refresh the live map via [`remember_live_pad`]; pads the
+/// poll misses are left alone so sampling (not a map wipe) owns liveness.
+fn poll_incremental(
+    cache: &mut DeviceCache,
+    live_pads: &Mutex<HashMap<String, LivePadStatus>>,
+    previously: &[String],
+    launch_quiet: &mut Vec<String>,
+) -> (Result<Vec<ControllerStatus>, String>, HidPhaseTiming) {
+    let mut timing = HidPhaseTiming::default();
+    let now = Instant::now();
+
+    // Fresh live batteries (single lock; released before any HID I/O).
+    let live_snapshot: HashMap<String, (String, battery::BatteryReading, Instant)> = live_pads
+        .lock()
+        .map(|guard| {
+            guard
+                .iter()
+                .map(|(serial, pad)| {
+                    (
+                        serial.clone(),
+                        (pad.product.clone(), pad.reading.clone(), pad.updated_at),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let enum_started = Instant::now();
+    let devices: Vec<(String, String)> = cache
+        .api
+        .device_list()
+        .filter(|d| driver::is_gamepad(d))
+        .map(|d| (d.path().to_string_lossy().into_owned(), hid_serial(d)))
+        .collect();
+    timing.enumerate_ms += enum_started.elapsed().as_millis();
+
+    if devices.is_empty() {
+        lightbar::sync_lightbar_claims(std::iter::empty::<&str>());
+        return (Ok(Vec::new()), timing);
+    }
+
+    let mut statuses: Vec<ControllerStatus> = Vec::with_capacity(devices.len());
+    for (path, hint) in devices {
+        let key = normalize_identity(&hint);
+        // Known pad on a live handle: fresh samples cost zero HID reads.
+        if is_storable_serial(&hint) && cache.devices.contains_key(&key) {
+            if let Some((product, reading, at)) = live_snapshot.get(&key)
+                && now.saturating_duration_since(*at) < POLL_LIVE_BATTERY_STALE
+            {
+                if let Some(serial) = cache.launch_paths.take_serial_for_path(&path, &key) {
+                    launch_quiet.push(serial);
+                }
+                statuses.push(battery::dualsense_status(
+                    0,
+                    product.clone(),
+                    reading.connection,
+                    key.clone(),
+                    reading.percent,
+                    reading.state,
+                ));
+                continue;
+            }
+            // Stale: fail-fast read on the cached handle (no extra open).
+            let product = cache.devices.get(&key).map(|open| open.product.clone());
+            let io_started = Instant::now();
+            let outcome = cache
+                .devices
+                .get(&key)
+                .map(|open| battery::read_battery_fast(&open.device));
+            timing.io_ms += io_started.elapsed().as_millis();
+            match (product, outcome) {
+                (Some(product), Some(Ok(reading))) => {
+                    if let Some(serial) = cache.launch_paths.take_serial_for_path(&path, &key) {
+                        launch_quiet.push(serial);
+                    }
+                    remember_live_pad(live_pads, &key, product.clone(), reading.clone());
+                    statuses.push(battery::dualsense_status(
+                        0,
+                        product,
+                        reading.connection,
+                        key,
+                        reading.percent,
+                        reading.state,
+                    ));
+                    continue;
+                }
+                _ => {
+                    // Dead handle or unreadable pad: drop and full re-probe below.
+                    // Sampling reaps the handle concurrently; the session hold
+                    // covers this single miss.
+                    cache.drop_serial(&key);
+                }
+            }
+        }
+        // Full probe: new serial, unknown hint, or re-probe after a drop.
+        // Re-resolve the device by path (list may have shifted since enumerate).
+        let open_started = Instant::now();
+        let probed: Option<(String, String, battery::BatteryReading, u128)> = (|| {
+            let api = &cache.api;
+            let info = api
+                .device_list()
+                .filter(|d| driver::is_gamepad(d))
+                .find(|d| d.path().to_string_lossy().into_owned() == path)?;
+            let product = product_name(info.product_id()).to_string();
+            let hid = hid_serial(info);
+            let device = match info.open_device(api) {
+                Ok(d) => {
+                    crate::controller::hid::diag::trace_open(
+                        "poll",
+                        info,
+                        &hid,
+                        open_started.elapsed().as_millis(),
+                        Ok(()),
+                    );
+                    d
+                }
+                Err(err) => {
+                    crate::controller::hid::diag::trace_open(
+                        "poll",
+                        info,
+                        &hid,
+                        open_started.elapsed().as_millis(),
+                        Err(&err.to_string()),
+                    );
+                    app_log::warn(format!(
+                        "failed to open {product} (hid serial {hid}): {err}"
+                    ));
+                    return None;
+                }
+            };
+            let serial = resolve_device_identity(info, &device);
+            let io_started = Instant::now();
+            match battery::read_battery(&device) {
+                Ok(reading) => {
+                    let io_ms = io_started.elapsed().as_millis();
+                    drop(device);
+                    Some((serial, product, reading, io_ms))
+                }
+                Err(err) => {
+                    let io_ms = io_started.elapsed().as_millis();
+                    crate::controller::hid::diag::trace_read(
+                        "poll",
+                        &serial,
+                        crate::controller::hid::diag::bus_tag(info.bus_type()),
+                        io_ms,
+                        &format!("fail=battery err={err}"),
+                        false,
+                    );
+                    app_log::warn(format!(
+                        "failed to read {product} (hid serial {hid}): {err}"
+                    ));
+                    // Pad stays missing this tick; the session hold covers it.
+                    None
+                }
+            }
+        })();
+        timing.open_ms += open_started.elapsed().as_millis();
+        let Some((serial, product, reading, io_ms)) = probed else {
+            continue;
+        };
+        timing.io_ms += io_ms;
+        if let Some(serial) = cache.launch_paths.take_serial_for_path(&path, &serial) {
+            launch_quiet.push(serial);
+        }
+        remember_live_pad(live_pads, &serial, product.clone(), reading.clone());
+        statuses.push(battery::dualsense_status(
+            0,
+            product,
+            reading.connection,
+            serial,
+            reading.percent,
+            reading.state,
+        ));
+    }
+
+    let mut statuses = battery::dedupe_statuses(statuses);
+    statuses.sort_by(|a, b| a.serial.cmp(&b.serial));
+    for (i, status) in statuses.iter_mut().enumerate() {
+        status.index = i + 1;
+    }
+
+    poll::reassert_lightbar_for_pads(&cache.api, previously, statuses.iter(), &mut timing);
+    (Ok(statuses), timing)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1765,6 +2076,7 @@ fn worker_loop(
                     HidCmd::Rumble { .. } => "Rumble",
                     HidCmd::RumbleStopAll => "RumbleStopAll",
                     HidCmd::SetLowBatteryTargets { .. } => "SetLowBatteryTargets",
+                    HidCmd::RefreshPresence => "RefreshPresence",
                     HidCmd::Shutdown => "Shutdown",
                 };
                 if handle_cmd(
@@ -1852,6 +2164,7 @@ fn worker_loop(
                     HidCmd::Rumble { .. } => "Rumble",
                     HidCmd::RumbleStopAll => "RumbleStopAll",
                     HidCmd::SetLowBatteryTargets { .. } => "SetLowBatteryTargets",
+                    HidCmd::RefreshPresence => "RefreshPresence",
                     HidCmd::Shutdown => "Shutdown",
                 };
                 if handle_cmd(
@@ -2041,6 +2354,65 @@ mod tests {
         let readings = vec![stub_reading("hid:aabbccddeeff")];
         let kept = readings_without_power_off_target(readings, "aa-bb-cc-dd-ee-ff");
         assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn backoff_skips_after_threshold_inside_window() {
+        let now = Instant::now();
+        assert!(!backoff_skip_at(OPEN_BACKOFF_THRESHOLD - 1, now, now));
+        assert!(backoff_skip_at(OPEN_BACKOFF_THRESHOLD, now, now));
+        assert!(!backoff_skip_at(
+            OPEN_BACKOFF_THRESHOLD,
+            now - OPEN_BACKOFF_WINDOW,
+            now
+        ));
+    }
+
+    #[test]
+    fn ghost_path_backoff_clears_on_success_and_refresh() {
+        let presence = Arc::new(Mutex::new(Vec::new()));
+        let launch_serials = Arc::new(Mutex::new(Vec::new()));
+        let mut cache = DeviceCache::new(presence, launch_serials).expect("hidapi init");
+        let ghost = "ghost-path".to_string();
+        cache.note_open_result(&ghost, false);
+        cache.note_open_result(&ghost, false);
+        assert!(!cache.backoff_skipped_paths().contains(&ghost));
+        cache.note_open_result(&ghost, false);
+        assert!(cache.backoff_skipped_paths().contains(&ghost));
+        cache.note_open_result(&ghost, true);
+        assert!(!cache.backoff_skipped_paths().contains(&ghost));
+
+        // A refresh that no longer lists the path drops its record, so a
+        // reappearing device retries immediately instead of waiting out backoff.
+        cache.note_open_result(&ghost, false);
+        cache.note_open_result(&ghost, false);
+        cache.note_open_result(&ghost, false);
+        assert!(cache.backoff_skipped_paths().contains(&ghost));
+        let _ = cache.refresh_device_list();
+        if !cache
+            .api
+            .device_list()
+            .any(|d| d.path().to_string_lossy().into_owned() == ghost)
+        {
+            assert!(!cache.backoff_skipped_paths().contains(&ghost));
+        }
+    }
+
+    #[test]
+    fn refresh_overdue_bounds_hot_deferral() {
+        let now = Instant::now();
+        assert!(refresh_overdue_at(None, now, HOT_ENUM_MAX_DEFER));
+        assert!(!refresh_overdue_at(Some(now), now, HOT_ENUM_MAX_DEFER));
+        assert!(!refresh_overdue_at(
+            Some(now - HOT_ENUM_MAX_DEFER + Duration::from_secs(1)),
+            now,
+            HOT_ENUM_MAX_DEFER
+        ));
+        assert!(refresh_overdue_at(
+            Some(now - HOT_ENUM_MAX_DEFER),
+            now,
+            HOT_ENUM_MAX_DEFER
+        ));
     }
 
     #[test]

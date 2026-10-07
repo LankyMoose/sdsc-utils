@@ -41,8 +41,7 @@ fn is_known_serial(serial: &str) -> bool {
 }
 
 /// Collapse the same physical pad enumerated on USB and Bluetooth (prefer USB).
-#[cfg(test)]
-fn dedupe_statuses(mut statuses: Vec<ControllerStatus>) -> Vec<ControllerStatus> {
+pub(crate) fn dedupe_statuses(mut statuses: Vec<ControllerStatus>) -> Vec<ControllerStatus> {
     let mut unique: Vec<ControllerStatus> = Vec::with_capacity(statuses.len());
 
     for status in statuses.drain(..) {
@@ -88,6 +87,19 @@ pub fn dualsense_status(
 }
 
 pub fn read_battery(device: &HidDevice) -> Result<BatteryReading, hidapi::HidError> {
+    read_battery_with_attempts(device, 6)
+}
+
+/// Fail-fast variant for known pads on liveness ticks: fewer waits for a
+/// streaming input report. New/unknown pads still get the full attempts.
+pub fn read_battery_fast(device: &HidDevice) -> Result<BatteryReading, hidapi::HidError> {
+    read_battery_with_attempts(device, 2)
+}
+
+fn read_battery_with_attempts(
+    device: &HidDevice,
+    attempts: u8,
+) -> Result<BatteryReading, hidapi::HidError> {
     let bus_type = device.get_device_info()?.bus_type();
     let (_connection, report_size, power_offset, is_bluetooth) = match bus_type {
         BusType::Usb => (Connection::Usb, USB_REPORT_SIZE, USB_POWER_OFFSET, false),
@@ -103,7 +115,7 @@ pub fn read_battery(device: &HidDevice) -> Result<BatteryReading, hidapi::HidErr
 
     // DualSense streams input reports when awake; a dead/sleeping pad must fail fast
     // so disconnect is visible within a couple of liveness ticks.
-    for _ in 0..6 {
+    for _ in 0..attempts.max(1) {
         let mut buf = vec![0u8; report_size];
         let n = device.read_timeout(&mut buf, 150)?;
         if n == 0 {
@@ -276,12 +288,10 @@ fn power_off_bluetooth_unlocked_timed(
     timing.enumerate_ms += enum_started.elapsed().as_millis().saturating_sub(open_ms);
     timing.open_ms += open_ms;
 
-    let mut candidates = matched;
-    if candidates.is_empty() {
-        candidates = unknown;
-    } else {
-        candidates.extend(unknown);
-    }
+    // Never mix unknown-identity interfaces into an exact match: if every
+    // matched send fails, report failure rather than risk powering off a
+    // stranger's pad (see notes/hot-enumeration-freeze.md, power-off verdict).
+    let candidates = if matched.is_empty() { unknown } else { matched };
 
     if candidates.is_empty() {
         return Err(format!(
