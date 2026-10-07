@@ -9,7 +9,6 @@ pub mod immersive;
 pub mod input;
 pub mod mode;
 pub mod position;
-pub mod reveal;
 pub mod settings;
 pub mod translate;
 pub mod view;

@@ -45,7 +45,7 @@ pub enum TransitionPhase {
 pub const VEIL_TRANSITION_MS: u64 = 300;
 pub const EXIT_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
 /// EnterImmersive top-veil lift (ease-in-out); matches splash length so one ceremony covers both.
-pub const ENTER_REVEAL_MS: u64 = 450;
+pub const ENTER_REVEAL_MS: u64 = crate::ui::motion::SLOW_MS;
 pub const ENTER_IMMERSIVE_MS: u64 = ENTER_REVEAL_MS;
 /// Max time to hold a solid enter veil waiting for selected splash + strip heroes.
 pub const ENTER_ART_HOLD_MAX_MS: u64 = 3000;
@@ -57,9 +57,9 @@ pub const STEAM_SCAN_MIN_MS: u64 = 2000;
 /// Immersive kicks Steam on art-ready (Preparing success) instead — no settle delay.
 pub const STEAM_SCAN_SETTLE_DELAY_MS: u64 = 1000;
 /// Slide a chrome status chip in (below → its stack slot) / stack reflow.
-pub const CHROME_STATUS_IN_MS: u64 = 280;
+pub const CHROME_STATUS_IN_MS: u64 = crate::ui::motion::BASE_MS;
 /// Slide-right exit duration once the batch clears.
-pub const CHROME_STATUS_EXIT_MS: u64 = 280;
+pub const CHROME_STATUS_EXIT_MS: u64 = crate::ui::motion::BASE_MS;
 /// Hold each success checkmark before the batch may clear.
 pub const CHROME_STATUS_SUCCESS_HOLD_MS: u64 = 500;
 /// Extra pause after every chip is Success before staggered ExitRight.
@@ -78,13 +78,13 @@ pub const STEAM_SCAN_SUCCESS_HOLD_MS: u64 = CHROME_STATUS_SUCCESS_HOLD_MS;
 /// Immersive cold: fade the games strip in once artwork is ready.
 pub const GAMES_LIST_FADE_MS: u64 = ART_FADE_MS;
 /// Cap per StartFrame so a UI stall cannot skip the start of the enter curve.
-pub const ENTER_REVEAL_MAX_FRAME_MS: u64 = 32;
+pub const ENTER_REVEAL_MAX_FRAME_MS: u64 = crate::ui::motion::MAX_FRAME_DT_MS;
 /// Legacy grow-segment fraction (unused by the single top-veil enter path).
 pub const ENTER_GROW_END: f32 = 0.28;
 pub const EXIT_IMMERSIVE_MS: u64 = VEIL_TRANSITION_MS;
 pub const ENTER_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
 /// Opacity crossfade between game backdrops (selection change; not enter veil).
-pub const ART_FADE_MS: u64 = 450;
+pub const ART_FADE_MS: u64 = crate::ui::motion::SLOW_MS;
 /// Shared ken-burns period for zoom + pan (burn-in drift while splash is held).
 pub const BACKDROP_ZOOM_PERIOD_MS: u64 = 30_000;
 /// Mid scale between min zoom and peak (must stay > 1 for Cover pan headroom).
@@ -244,36 +244,15 @@ pub fn dock_panel_width(progress: f32, peek: f32, expanded: f32) -> f32 {
 
 /// Ease-out cubic progress 0..=1 for elapsed/duration.
 pub fn phase_progress(elapsed_ms: u64, duration_ms: u64) -> f32 {
-    if duration_ms == 0 {
-        return 1.0;
-    }
-    let t = (elapsed_ms as f32 / duration_ms as f32).clamp(0.0, 1.0);
-    1.0 - (1.0 - t).powi(3)
+    crate::ui::motion::ease_out_cubic(phase_progress_linear(elapsed_ms, duration_ms))
 }
 
 /// Linear 0..=1 elapsed fraction (no easing).
 pub fn phase_progress_linear(elapsed_ms: u64, duration_ms: u64) -> f32 {
-    if duration_ms == 0 {
-        return 1.0;
-    }
-    (elapsed_ms as f32 / duration_ms as f32).clamp(0.0, 1.0)
+    crate::ui::motion::progress_linear(elapsed_ms, duration_ms)
 }
 
-/// Ease-in cubic — slow start.
-pub fn ease_in_cubic(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * t
-}
-
-/// Ease-in-out cubic — smooth enter-immersive veil lift.
-pub fn ease_in_out_cubic(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    if t < 0.5 {
-        4.0 * t * t * t
-    } else {
-        1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
-    }
-}
+pub use crate::ui::motion::{ease_in_cubic, ease_in_out_cubic};
 
 /// Content/veil reveal after HWND settle (0 = veiled, 1 = clear).
 pub fn settle_reveal(elapsed_ms: u64, duration_ms: u64) -> f32 {

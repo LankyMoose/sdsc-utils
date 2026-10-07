@@ -45,8 +45,54 @@ pub const DANGER: Color = rgb(0xBE, 0x00, 0x00);
 pub const WARNING: Color = rgb(0xFF, 0x64, 0x00);
 pub const SUCCESS: Color = rgb(0x35, 0xA0, 0x6B);
 
+/// Legacy hairline-era corner radius (pre-1.7.0 chrome). Prefer [`radius`].
 pub const RADIUS: f32 = 2.0;
+/// Legacy small corner radius (pre-1.7.0 chrome). Prefer [`radius`].
 pub const RADIUS_SM: f32 = 1.0;
+
+/// Corner radius scale for the immersive language (`notes/ui-refresh.md`).
+///
+/// Nest concentric corners as `inner = outer − padding`, never the same value
+/// for a panel and its children.
+pub mod radius {
+    /// Small controls: chips, inputs, swatches.
+    pub const SM: f32 = 8.0;
+    /// Rows and inner cards (immersive dock rows).
+    pub const MD: f32 = 12.0;
+    /// Cards and grouped panels.
+    pub const LG: f32 = 16.0;
+    /// Floating islands (immersive footer capsule).
+    pub const XL: f32 = 20.0;
+    /// Fully round ends — iced clamps to half the shorter side.
+    pub const PILL: f32 = 999.0;
+}
+
+/// Text size scale. Hierarchy comes from size, weight, and ink only (default font).
+pub mod type_scale {
+    /// Fine print: timeline ticks, tertiary labels.
+    pub const CAPTION: f32 = 11.0;
+    /// Meta lines under titles (connection · state).
+    pub const META: f32 = 13.0;
+    /// Default body / labels / footer hints.
+    pub const BODY: f32 = 14.0;
+    /// Row titles (immersive dock controller name).
+    pub const TITLE: f32 = 18.0;
+    /// Section / window headings.
+    pub const HEADING: f32 = 24.0;
+    /// Hero text (immersive selected game title).
+    pub const DISPLAY: f32 = 32.0;
+}
+
+// ---------------------------------------------------------------------------
+// Glass — the immersive island material
+// ---------------------------------------------------------------------------
+
+/// Island fill: darker than chrome and see-through so the backdrop reads through.
+pub const GLASS_FILL: Color = alpha(darken(BASE_BG, 0.55), 0.58);
+/// Island hairline: a whisper of [`LINE`], not a frame.
+pub const GLASS_HAIRLINE: Color = alpha(LINE, 0.28);
+/// Neutral selection wash for rows on glass (paired with bold title text).
+pub const SELECT_WASH: Color = alpha(INK, 0.05);
 
 /// Build a [`Color`] from 8-bit channels at compile time.
 pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
@@ -242,30 +288,32 @@ pub fn immersive_stage(_theme: &Theme) -> container::Style {
     }
 }
 
-/// Shared glass fill for immersive chrome islands.
-fn immersive_chrome_fill() -> Color {
-    // Darker than BASE_BG, see-through so atmosphere/backdrop read through.
-    alpha(darken(BASE_BG, 0.55), 0.58)
-}
-
-/// Capsule island shared by footer hints (fixed radius).
-pub fn immersive_island(theme: &Theme) -> container::Style {
-    immersive_island_radius(20.0)(theme)
-}
-
-/// Controllers dock island — pass `ring_radius + edge_inset` for concentric corners.
-pub fn immersive_island_radius(radius: f32) -> impl Fn(&Theme) -> container::Style {
+/// Glass island: [`GLASS_FILL`] with a [`GLASS_HAIRLINE`] at `radius`.
+///
+/// The shared panel material for every window. Pass the outer radius; nest
+/// children at `radius − padding`.
+pub fn glass(radius: f32) -> impl Fn(&Theme) -> container::Style {
     let radius = radius.max(0.0);
     move |_theme: &Theme| container::Style {
-        background: Some(Background::Color(immersive_chrome_fill())),
+        background: Some(Background::Color(GLASS_FILL)),
         text_color: Some(INK),
         border: Border {
-            color: alpha(LINE, 0.28),
+            color: GLASS_HAIRLINE,
             width: 1.0,
             radius: radius.into(),
         },
         ..container::Style::default()
     }
+}
+
+/// Capsule island shared by footer hints (fixed radius).
+pub fn immersive_island(theme: &Theme) -> container::Style {
+    glass(radius::XL)(theme)
+}
+
+/// Controllers dock island — pass `ring_radius + edge_inset` for concentric corners.
+pub fn immersive_island_radius(radius: f32) -> impl Fn(&Theme) -> container::Style {
+    glass(radius)
 }
 
 /// Full-bleed darken wash when the controllers drawer is open.
@@ -530,17 +578,22 @@ pub fn menu_row_surface(selected: bool) -> impl Fn(&Theme) -> container::Style {
 
 /// Target inner radius for selected controller rows when the dock is fully expanded.
 /// Island radius is `pad +` this so corners stay concentric.
-pub const IMMERSIVE_DOCK_ROW_RADIUS: f32 = 12.0;
+pub const IMMERSIVE_DOCK_ROW_RADIUS: f32 = radius::MD;
 
 /// Controllers island row: near-neutral select wash; radius from island − pad.
 pub fn immersive_dock_row_surface(
     selected: bool,
     radius: f32,
 ) -> impl Fn(&Theme) -> container::Style {
+    glass_row(selected, radius)
+}
+
+/// Row on a [`glass`] island: [`SELECT_WASH`] when selected, transparent otherwise.
+pub fn glass_row(selected: bool, radius: f32) -> impl Fn(&Theme) -> container::Style {
     let radius = radius.max(0.0);
     move |_theme| container::Style {
         background: if selected {
-            Some(Background::Color(alpha(INK, 0.05)))
+            Some(Background::Color(SELECT_WASH))
         } else {
             None
         },
@@ -637,6 +690,186 @@ pub fn row_button(_theme: &Theme, status: button::Status) -> button::Style {
             button_base(Some(PANEL_HOVER), INK, RADIUS_SM)
         }
         button::Status::Disabled => button_base(None, DIM, RADIUS_SM),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Form controls — immersive language (toggle, slider, pick list, scrollbar)
+// ---------------------------------------------------------------------------
+
+/// Off-state track / slider rest: a faint ink wash that reads on glass and chrome.
+const CONTROL_TRACK: Color = alpha(INK, 0.14);
+const CONTROL_TRACK_HOVER: Color = alpha(INK, 0.22);
+
+/// Pill toggle: accent track when on, faint ink track when off, ink knob.
+pub fn toggle(
+    _theme: &Theme,
+    status: iced::widget::toggler::Status,
+) -> iced::widget::toggler::Style {
+    use iced::widget::toggler::Status;
+    let (track, knob) = match status {
+        Status::Active { is_toggled: true } => (ACCENT, INK),
+        Status::Hovered { is_toggled: true } => (lighten(ACCENT, 0.12), INK),
+        Status::Active { is_toggled: false } => (CONTROL_TRACK, MUTED),
+        Status::Hovered { is_toggled: false } => (CONTROL_TRACK_HOVER, INK),
+        Status::Disabled { is_toggled: true } => (alpha(ACCENT, 0.35), DIM),
+        Status::Disabled { is_toggled: false } => (alpha(INK, 0.06), DIM),
+    };
+    iced::widget::toggler::Style {
+        background: Background::Color(track),
+        background_border_width: 0.0,
+        background_border_color: Color::TRANSPARENT,
+        foreground: Background::Color(knob),
+        foreground_border_width: 0.0,
+        foreground_border_color: Color::TRANSPARENT,
+        text_color: Some(INK),
+        // `None` keeps iced's fully rounded (pill) track.
+        border_radius: None,
+        padding_ratio: 0.1,
+    }
+}
+
+/// Slider: accent fill up to the handle over a faint track, round ink handle.
+pub fn slider(_theme: &Theme, status: iced::widget::slider::Status) -> iced::widget::slider::Style {
+    use iced::widget::slider::{Handle, HandleShape, Rail, Status};
+    let (rest, ring, ring_w) = match status {
+        Status::Active => (CONTROL_TRACK, Color::TRANSPARENT, 0.0),
+        Status::Hovered => (CONTROL_TRACK_HOVER, alpha(ACCENT, 0.45), 3.0),
+        Status::Dragged => (CONTROL_TRACK_HOVER, alpha(ACCENT, 0.75), 4.0),
+    };
+    iced::widget::slider::Style {
+        rail: Rail {
+            backgrounds: (Background::Color(ACCENT), Background::Color(rest)),
+            width: 4.0,
+            border: Border {
+                radius: radius::PILL.into(),
+                ..Border::default()
+            },
+        },
+        handle: Handle {
+            shape: HandleShape::Circle { radius: 8.0 },
+            background: Background::Color(INK),
+            border_width: ring_w,
+            border_color: ring,
+        },
+    }
+}
+
+/// Pick list field: faint ink fill, glass hairline, accent edge while open.
+pub fn pick_list(
+    _theme: &Theme,
+    status: iced::widget::pick_list::Status,
+) -> iced::widget::pick_list::Style {
+    use iced::widget::pick_list::Status;
+    let (fill, edge) = match status {
+        Status::Active => (alpha(INK, 0.06), GLASS_HAIRLINE),
+        Status::Hovered => (alpha(INK, 0.09), alpha(INK, 0.22)),
+        Status::Opened { .. } => (alpha(INK, 0.09), alpha(ACCENT, 0.65)),
+    };
+    iced::widget::pick_list::Style {
+        text_color: INK,
+        placeholder_color: DIM,
+        handle_color: MUTED,
+        background: Background::Color(fill),
+        border: Border {
+            color: edge,
+            width: 1.0,
+            radius: radius::SM.into(),
+        },
+    }
+}
+
+/// Pick list dropdown: opaque deep panel (legible over anything), soft shadow,
+/// neutral selection wash instead of an accent block.
+pub fn pick_list_menu(_theme: &Theme) -> iced::overlay::menu::Style {
+    iced::overlay::menu::Style {
+        background: Background::Color(darken(BASE_BG, 0.30)),
+        border: Border {
+            color: GLASS_HAIRLINE,
+            width: 1.0,
+            radius: radius::SM.into(),
+        },
+        text_color: MUTED,
+        selected_text_color: INK,
+        selected_background: Background::Color(alpha(INK, 0.08)),
+        shadow: iced::Shadow {
+            color: alpha(Color::BLACK, 0.45),
+            offset: iced::Vector::new(0.0, 6.0),
+            blur_radius: 18.0,
+        },
+    }
+}
+
+/// Scrollbar: no rail, thin pill thumb that brightens on hover / drag.
+pub fn scrollbar(
+    _theme: &Theme,
+    status: iced::widget::scrollable::Status,
+) -> iced::widget::scrollable::Style {
+    use iced::widget::scrollable::{AutoScroll, Rail, Scroller, Status};
+    let thumb = |strength: f32| Rail {
+        background: None,
+        border: Border::default(),
+        scroller: Scroller {
+            background: Background::Color(alpha(INK, strength)),
+            border: Border {
+                radius: radius::PILL.into(),
+                ..Border::default()
+            },
+        },
+    };
+    const IDLE: f32 = 0.16;
+    const HOVER: f32 = 0.30;
+    const DRAG: f32 = 0.45;
+    let (vertical, horizontal) = match status {
+        Status::Active { .. } => (IDLE, IDLE),
+        Status::Hovered {
+            is_vertical_scrollbar_hovered,
+            is_horizontal_scrollbar_hovered,
+            ..
+        } => (
+            if is_vertical_scrollbar_hovered {
+                HOVER
+            } else {
+                IDLE
+            },
+            if is_horizontal_scrollbar_hovered {
+                HOVER
+            } else {
+                IDLE
+            },
+        ),
+        Status::Dragged {
+            is_vertical_scrollbar_dragged,
+            is_horizontal_scrollbar_dragged,
+            ..
+        } => (
+            if is_vertical_scrollbar_dragged {
+                DRAG
+            } else {
+                IDLE
+            },
+            if is_horizontal_scrollbar_dragged {
+                DRAG
+            } else {
+                IDLE
+            },
+        ),
+    };
+    iced::widget::scrollable::Style {
+        container: container::Style::default(),
+        vertical_rail: thumb(vertical),
+        horizontal_rail: thumb(horizontal),
+        gap: None,
+        auto_scroll: AutoScroll {
+            background: Background::Color(GLASS_FILL),
+            border: Border {
+                color: GLASS_HAIRLINE,
+                width: 1.0,
+                radius: radius::PILL.into(),
+            },
+            shadow: iced::Shadow::default(),
+            icon: MUTED,
+        },
     }
 }
 

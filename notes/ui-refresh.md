@@ -31,7 +31,13 @@ Goal: bring the tray popup, Settings (configure), toasts, and compact Start up t
 ## Phases
 
 - [x] **0a Backend switch** — Vulkan-first with DX12 fallback + `alpha_composite()` prediction.
-- [ ] **0b Foundations (no visual change)** — theme tokens (radius scale 8/12/16/20, glass tiers, hairline alpha, neutral select wash, type scale 11/13/15/18/24/32, motion consts); promote `WidthReveal`, easing/frame-cap, face-glyph hint capsule, glass island out of `ui/start/` into shared `ui/`; custom toggle switch, slider, pick_list, scrollbar styles; nearly-static backdrop widget.
+- [x] **0b Foundations (no visual change)**
+  - `src/ui/motion.rs`: easing (`ease_out/in/in_out_cubic`), `progress_linear`, `advance_capped`, `MAX_FRAME_DT(_MS)` = 32, durations `FAST_MS` 100 / `BASE_MS` 280 / `SLOW_MS` 450. `start::mode` and `layout` delegate (public names kept); constants equal to a motion value now reference it. Toast slide stays 250 ms.
+  - `src/ui/reveal.rs`: `WidthReveal` moved from `ui/start/`.
+  - `theme.rs` tokens: `radius::{SM 8, MD 12, LG 16, XL 20, PILL}`, `type_scale::{CAPTION 11, META 13, BODY 14, TITLE 18, HEADING 24, DISPLAY 32}` (BODY kept at the app's existing 14, not 15), `GLASS_FILL`, `GLASS_HAIRLINE`, `SELECT_WASH`. `glass(radius)` / `glass_row(selected, radius)` are the shared island + row styles; `immersive_island*` / `immersive_dock_row_surface` delegate. Legacy `RADIUS`/`RADIUS_SM` remain for unconverted chrome.
+  - Form-control styles (defined, applied from Phase 1+): `theme::toggle` (iced `toggler`), `theme::slider`, `theme::pick_list` + `theme::pick_list_menu`, `theme::scrollbar`. Start settings drawer also uses stock `toggler`/`slider`, so both settings surfaces adopt these together.
+  - `src/ui/backdrop.rs`: `backdrop()` / `with_backdrop(content)` — ambient at `FROZEN_TIME` 0.0 (immersive's first frame, breath mid-swing) + vignette `VIGNETTE_STRENGTH` 0.35 (immersive stage uses 0.55). No continuous redraw.
+  - **Deferred:** face-glyph hint capsule stays in `start/view.rs` (coupled to `StartMessage` / press state, Start-only today). Promote when Settings gains pad navigation (Phase 4). Glass *tiers* beyond `GLASS_FILL` get defined in Phase 1 once they can be judged on screen.
 - [ ] **1 Window chrome** — drop `framed` outline + header rule; corner strategy per `alpha_composite()`; backdrop + spacing. Stress-test.
 - [ ] **2 Tray popup** — dock-style glass rows (bigger ring, 18px title, muted meta), pin toggle replaces Remember checkbox, quieter actions, empty state, staggered row entrance.
 - [ ] **3 Toasts** — rounded glass card, accent glow instead of 3px rail, optional dwell bar; align with immersive composite toast ([windows-toast.md](windows-toast.md)).

@@ -787,7 +787,7 @@ fn controllers_dock_host<'a>(
 
     // Shrink so the floating island sizes to its rows (Fill collapses to 0 off a Fill parent).
     let revealed =
-        crate::ui::start::reveal::width_reveal(full, DOCK_MAX_W, visible_w).height(Length::Shrink);
+        crate::ui::reveal::width_reveal(full, DOCK_MAX_W, visible_w).height(Length::Shrink);
 
     container(revealed)
         .padding(Padding {

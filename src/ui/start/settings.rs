@@ -788,7 +788,7 @@ pub fn immersive_drawer<'a>(
         .height(Fill)
         .style(theme::immersive_island_radius(0.0));
 
-    let revealed = crate::ui::start::reveal::width_reveal(panel, DRAWER_W, w).height(Fill);
+    let revealed = crate::ui::reveal::width_reveal(panel, DRAWER_W, w).height(Fill);
     let drawer = row![space().width(Fill), revealed].width(Fill).height(Fill);
 
     stack_scrim(dim, drawer)

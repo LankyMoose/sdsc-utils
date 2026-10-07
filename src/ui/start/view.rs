@@ -61,7 +61,7 @@ const FACE_GLYPH_SIZE: f32 = 18.0;
 /// Peak scale of a face glyph while its button is pressed (layout size unchanged).
 const PRESSED_SCALE: f32 = 1.1;
 /// Pressed grow and armed-color transitions.
-const HINT_ANIM: Duration = Duration::from_millis(100);
+const HINT_ANIM: Duration = Duration::from_millis(crate::ui::motion::FAST_MS);
 const ROW_GAP: f32 = theme::LIST_SEPARATOR_GAP;
 const ROW_ACTION_SPACING: f32 = 14.0;
 /// Body width inside outer padding — dual-pane strip unit.

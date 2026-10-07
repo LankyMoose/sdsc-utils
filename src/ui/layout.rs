@@ -15,7 +15,7 @@ pub const SCREEN_MARGIN: f32 = 8.0;
 pub const TOAST_SLIDE_DURATION: std::time::Duration = std::time::Duration::from_millis(250);
 /// Max wall time applied per toast animation frame (~2× the ~16ms UI tick).
 /// Caps a stalled frame so slide-in cannot jump to the rest pose in one tick.
-pub const TOAST_SLIDE_MAX_FRAME_DT: std::time::Duration = std::time::Duration::from_millis(32);
+pub const TOAST_SLIDE_MAX_FRAME_DT: std::time::Duration = crate::ui::motion::MAX_FRAME_DT;
 
 /// Screen rectangle of the tray icon, in physical pixels.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
@@ -359,9 +359,7 @@ pub fn toast_local_in_cover(
     Point::new(placement.x - cover.x, screen_y - cover.y)
 }
 
-pub fn ease_out_cubic(progress: f32) -> f32 {
-    1.0 - (1.0 - progress).powi(3)
-}
+pub use crate::ui::motion::ease_out_cubic;
 
 /// Advance toast slide elapsed with a per-frame cap so a UI stall cannot skip
 /// the rest of the animation in one tick.
@@ -372,15 +370,7 @@ pub fn advance_toast_slide(
     raw_dt: std::time::Duration,
     duration: std::time::Duration,
 ) -> (std::time::Duration, f32, bool) {
-    let capped = raw_dt > TOAST_SLIDE_MAX_FRAME_DT;
-    let dt = raw_dt.min(TOAST_SLIDE_MAX_FRAME_DT);
-    let new_elapsed = elapsed.saturating_add(dt);
-    let progress = if duration.is_zero() {
-        1.0
-    } else {
-        (new_elapsed.as_secs_f32() / duration.as_secs_f32()).min(1.0)
-    };
-    (new_elapsed, progress, capped)
+    crate::ui::motion::advance_capped(elapsed, raw_dt, duration)
 }
 
 /// Primary-monitor full cover in logical pixels (taskbar included).
