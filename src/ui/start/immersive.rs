@@ -478,7 +478,7 @@ fn hero_hint_overlay<'a>(row: &'a StartRow, state: &'a State) -> Element<'a, Sta
     if state.editing {
         col = col.push(immersive_game_membership_label(row));
     } else if closing {
-        col = col.push(text("Closing").size(15.0).color(theme::WARNING));
+        col = col.push(text("Closing").size(15.0).color(theme::MUTED));
     } else if running {
         col = col.push(text("Playing").size(15.0).color(theme::ACCENT));
     }
@@ -864,9 +864,13 @@ fn dock_controller_row<'a>(
     row_radius: f32,
     state: &State,
 ) -> Element<'a, StartMessage> {
+    let powering_off = state
+        .powering_off
+        .as_ref()
+        .is_some_and(|s| s == &row.serial);
     let ring_color = if flash_white {
         theme::from_rgb(crate::controller::dualsense::lightbar::IDENTIFY_FLASH)
-    } else if row.connected {
+    } else if row.connected && !powering_off {
         theme::from_rgb(spectrum.color_at_percent(row.percent))
     } else {
         theme::DIM
@@ -884,15 +888,22 @@ fn dock_controller_row<'a>(
         .center_x(Fill)
         .center_y(Fill);
 
-    let title_color = if row.connected {
+    let title_color = if row.connected && !powering_off {
         theme::INK
     } else {
         theme::MUTED
     };
-    let meta = if row.low {
+    let meta = if powering_off {
+        theme::MUTED
+    } else if row.low {
         theme::WARNING
     } else {
         theme::MUTED
+    };
+    let meta_text = if powering_off {
+        "Powering off".to_string()
+    } else {
+        format!("{} · {}", row.connection, row.state)
     };
     let titles = column![
         text(&row.title).size(18.0).color(title_color).font(Font {
@@ -903,9 +914,7 @@ fn dock_controller_row<'a>(
             },
             ..Font::DEFAULT
         }),
-        text(format!("{} · {}", row.connection, row.state))
-            .size(13.0)
-            .color(meta),
+        text(meta_text).size(13.0).color(meta),
     ]
     .spacing(3)
     .width(Fill);

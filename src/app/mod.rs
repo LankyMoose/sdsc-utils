@@ -684,6 +684,7 @@ impl App {
                 &self.popup_state,
                 &self.popup_rows,
                 &self.session.prefs.spectrum,
+                self.start_state.powering_off.as_deref(),
             )
             .map(Message::Popup);
         }
@@ -2005,6 +2006,10 @@ impl App {
             app_log::info(format!("identify skipped for emulated controller {serial}"));
             return false;
         }
+        // A pad on its way out takes no more commands.
+        if self.start_state.powering_off.as_deref() == Some(serial) {
+            return false;
+        }
 
         let Some(controller) = self.session.controllers.iter().find(|c| c.serial == serial) else {
             return false;
@@ -2033,6 +2038,10 @@ impl App {
             ));
             return;
         }
+        // Already going away: don't re-send the feature report on repeat holds.
+        if self.start_state.powering_off.as_deref() == Some(serial) {
+            return;
+        }
 
         let Some(controller) = self.session.controllers.iter().find(|c| c.serial == serial) else {
             return;
@@ -2045,6 +2054,8 @@ impl App {
             return;
         }
 
+        // Show "Powering off" immediately (cleared when the pad leaves the list).
+        self.start_state.powering_off = Some(serial.to_string());
         // Reconnect after user power-off should open Start again (not ghost-flap cooldown),
         // but only when this was the last pad — a sibling must not look like a fresh 0→1.
         if crate::session::should_skip_connect_cooldown_on_power_off(

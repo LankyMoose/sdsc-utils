@@ -744,6 +744,9 @@ pub struct State {
     /// Target currently being closed (WM_CLOSE sent, waiting for process exit).
     /// Shows "Closing" immediately instead of clearing to nothing.
     pub closing_target: Option<String>,
+    /// Controller serial currently being powered off (feature report sent,
+    /// waiting for the pad to disappear). Shows "Powering off" the same way.
+    pub powering_off: Option<String>,
     pub replace_confirm: Option<ReplaceConfirm>,
     pub manual_add: Option<ManualAddDraft>,
     /// Options settings panel (compact modal / immersive drawer).
@@ -850,6 +853,7 @@ impl Default for State {
             controllers: Vec::new(),
             running_target: None,
             closing_target: None,
+            powering_off: None,
             replace_confirm: None,
             manual_add: None,
             settings: crate::ui::start::settings::SettingsPanel::default(),
@@ -937,6 +941,16 @@ impl State {
         };
         self.controllers = controllers;
         self.controller_selected = next_selected;
+        // A powered-off pad is done once no *connected* row carries it
+        // (remembered-disconnected rows reuse the serial).
+        if self.powering_off.as_ref().is_some_and(|s| {
+            !self
+                .controllers
+                .iter()
+                .any(|r| r.connected && r.serial == *s)
+        }) {
+            self.powering_off = None;
+        }
     }
 
     pub fn set_games_scroll(&mut self, y: f32, viewport_h: f32) {
@@ -3261,6 +3275,18 @@ pub(crate) fn immersive_dock_row_hints(
         return None;
     }
     let hint = RowHintState::for_selected(state, true);
+    let powering_off = state
+        .powering_off
+        .as_ref()
+        .is_some_and(|s| s == &row.serial);
+    if powering_off {
+        return Some(action_cluster_dock(&[face_hint(
+            FaceButton::Triangle,
+            "Powering off…",
+            hint.held,
+            hint.press_anim,
+        )]));
+    }
     let mut actions = vec![face_hint(
         FaceButton::Cross,
         "Identify",
@@ -3629,6 +3655,10 @@ fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element
         column![].spacing(0).width(Fill),
         |col, (index, row)| {
             let selected = index == state.controller_selected;
+            let powering_off = state
+                .powering_off
+                .as_ref()
+                .is_some_and(|s| s == &row.serial);
             let col = if index > 0 {
                 col.push(theme::list_separator())
             } else {
@@ -3638,6 +3668,7 @@ fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element
                 index,
                 row,
                 selected,
+                powering_off,
                 spectrum,
                 state.ring_flash_white(&row.serial),
                 RowHintState::for_selected(state, selected),
@@ -4839,7 +4870,7 @@ fn game_row(
         let status: Element<'_, StartMessage> = if closing {
             text("Closing")
                 .size(13.0)
-                .color(theme::WARNING)
+                .color(theme::MUTED)
                 .wrapping(Wrapping::None)
                 .width(Fill)
                 .into()
@@ -4970,13 +5001,14 @@ fn controller_row<'a>(
     _index: usize,
     row: &'a StartControllerRow,
     selected: bool,
+    powering_off: bool,
     spectrum: &BatterySpectrum,
     ring_flash_white: bool,
     hint: RowHintState,
 ) -> Element<'a, StartMessage> {
     let ring_color = if ring_flash_white {
         theme::from_rgb(lightbar::IDENTIFY_FLASH)
-    } else if row.connected {
+    } else if row.connected && !powering_off {
         theme::from_rgb(spectrum.color_at_percent(row.percent))
     } else {
         theme::DIM
@@ -4994,7 +5026,17 @@ fn controller_row<'a>(
     } else {
         theme::MUTED
     };
-    let title_color = if row.connected {
+    let meta_text = if powering_off {
+        "Powering off".to_string()
+    } else {
+        format!("{} · {}", row.connection, row.state)
+    };
+    let meta_text_color = if powering_off {
+        theme::MUTED
+    } else {
+        meta_color
+    };
+    let title_color = if row.connected && !powering_off {
         theme::INK
     } else {
         theme::MUTED
@@ -5011,9 +5053,7 @@ fn controller_row<'a>(
             } else {
                 Font::DEFAULT
             }),
-        text(format!("{} · {}", row.connection, row.state))
-            .size(13.0)
-            .color(meta_color),
+        text(meta_text).size(13.0).color(meta_text_color),
     ]
     .spacing(4)
     .width(Fill)
@@ -5022,23 +5062,38 @@ fn controller_row<'a>(
     let mut content = row![ring, titles].spacing(14).align_y(Alignment::Center);
 
     if selected && row.connected {
-        let mut actions = vec![face_hint(
-            FaceButton::Cross,
-            "Identify",
-            hint.held,
-            hint.press_anim,
-        )];
-        if row.show_power_off() {
-            actions.push(face_hold_hint(
-                FaceButton::Triangle,
-                "Power off",
-                hint.triangle_progress,
-                hint.triangle_armed_t,
+        // A pad on its way out offers no actions: Identify and Power off are
+        // both dead ends (the worker drops the pad any moment).
+        if powering_off {
+            content = content.push(action_cluster_spaced(
+                &[face_hint(
+                    FaceButton::Triangle,
+                    "Powering off…",
+                    hint.held,
+                    hint.press_anim,
+                )],
+                ROW_ACTION_SPACING,
+                false,
+            ));
+        } else {
+            let mut actions = vec![face_hint(
+                FaceButton::Cross,
+                "Identify",
                 hint.held,
                 hint.press_anim,
-            ));
+            )];
+            if row.show_power_off() {
+                actions.push(face_hold_hint(
+                    FaceButton::Triangle,
+                    "Power off",
+                    hint.triangle_progress,
+                    hint.triangle_armed_t,
+                    hint.held,
+                    hint.press_anim,
+                ));
+            }
+            content = content.push(action_cluster_spaced(&actions, ROW_ACTION_SPACING, false));
         }
-        content = content.push(action_cluster_spaced(&actions, ROW_ACTION_SPACING, false));
     }
 
     container(
@@ -5093,6 +5148,45 @@ mod tests {
         assert!(!sample_controller(true, false).show_power_off());
         assert!(!sample_controller(false, true).show_power_off());
         assert!(!sample_controller(false, false).show_power_off());
+    }
+
+    fn controller_row_with(serial: &str, connected: bool) -> StartControllerRow {
+        StartControllerRow {
+            serial: serial.into(),
+            title: "DualSense".into(),
+            connection: "Bluetooth".into(),
+            state: "discharging".into(),
+            percent: 50,
+            low: false,
+            bluetooth: true,
+            connected,
+            eta: None,
+        }
+    }
+
+    #[test]
+    fn powering_off_clears_only_when_no_connected_row_remains() {
+        let mut state = State {
+            powering_off: Some("aa".into()),
+            ..Default::default()
+        };
+        // Still connected: flag survives rebuilds.
+        state.set_controllers(vec![
+            controller_row_with("aa", true),
+            controller_row_with("bb", true),
+        ]);
+        assert_eq!(state.powering_off.as_deref(), Some("aa"));
+        // Gone entirely: cleared.
+        state.set_controllers(vec![controller_row_with("bb", true)]);
+        assert_eq!(state.powering_off, None);
+
+        // Remembered-disconnected rows reuse the serial: still cleared.
+        state.powering_off = Some("aa".into());
+        state.set_controllers(vec![
+            controller_row_with("bb", true),
+            controller_row_with("aa", false),
+        ]);
+        assert_eq!(state.powering_off, None);
     }
 
     #[test]
