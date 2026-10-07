@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Unified "immersive" visual language across the app: floating glass cards, rounded corners, and the same ambient shader backdrop in the controllers popup, Settings, toasts, and compact Start.
+- Presentation now prefers Vulkan with DX12 as fallback, so transparent rounded windows composite correctly; on DX12-only systems the settings window falls back to a rounded, opaque DWM frame.
+- Toasts are rounded glass cards with a soft shadow and a rounded accent rail.
+- Settings window is larger (720×520) with a floating sidebar, grouped cards, and consistent toggles and sliders.
+- `SDSC_DEBUG_OPEN` (debug builds): open specific windows at boot; quiet mode moves them to the secondary monitor without focus and mutes sounds/haptics.
+
+### Changed
+
+- Lightbar spectrum editor bars and handles are rounded; the saturation square has rounded corners.
+- Remember is now a pin toggle icon in the popup row.
+
 ## [1.6.1] - 2026-10-07
 
 ### Added

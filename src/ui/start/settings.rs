@@ -486,7 +486,7 @@ pub fn focus_row_bounds(
         let mut panel_h = MENU_PANEL_PAD * 2.0;
         for i in 0..AUTO_OPEN_MODES.len() {
             if i > 0 {
-                panel_h += 1.0;
+                panel_h += 4.0;
             }
             panel_h += menu_option_h(ty.body);
         }
@@ -590,7 +590,7 @@ pub fn panel_view<'a>(
     ));
     // Expanded dropdown panel: every option selectable, highlight follows the menu.
     if let Some(highlight) = state.settings.auto_open_menu {
-        let mut options = column![].spacing(0).width(Fill);
+        let mut options = column![].spacing(4).width(Fill);
         for (i, mode) in AUTO_OPEN_MODES.iter().enumerate() {
             if i > 0 {
                 // Spacing separates options; no rule.
@@ -1092,7 +1092,7 @@ mod tests {
         // hairlines between, slotted into the column stacking.
         let expected = MENU_PANEL_PAD * 2.0
             + 3.0 * menu_option_h(TypeScale::for_mode(false).body)
-            + 2.0 * theme::LIST_SEPARATOR_GAP
+            + 2.0 * 4.0 // options column spacing
             + COL_GAP;
         assert!((open_y - closed_y - expected).abs() < 0.5);
     }

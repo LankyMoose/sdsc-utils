@@ -5,8 +5,8 @@
 
 use crate::ui::color::Rgb;
 use iced::theme::Palette;
-use iced::widget::{button, container, space, text_input};
-use iced::{Background, Border, Color, Element, Fill, Length, Theme};
+use iced::widget::{button, container, text_input};
+use iced::{Background, Border, Color, Element, Fill, Theme};
 use std::sync::LazyLock;
 
 // ---------------------------------------------------------------------------
@@ -409,39 +409,6 @@ pub fn configure_header_rule(_theme: &Theme) -> container::Style {
     }
 }
 
-/// Horizontal inset for [`list_separator`] (same idea as the title underline).
-pub const LIST_SEPARATOR_INSET: f32 = 12.0;
-/// Vertical pad around the 1px rule — total gap between rows is [`LIST_SEPARATOR_GAP`].
-const LIST_SEPARATOR_PAD_Y: f32 = 5.0;
-/// Layout height contributed by one inter-row separator (rule + padding).
-pub const LIST_SEPARATOR_GAP: f32 = 1.0 + LIST_SEPARATOR_PAD_Y * 2.0;
-/// List rules sit between [`CONTENT`] and [`LINE`] so they read softer than title chrome.
-const LIST_SEPARATOR_LIFT: f32 = 0.08;
-
-fn list_separator_color() -> Color {
-    lighten(BASE_BG, LIST_SEPARATOR_LIFT)
-}
-
-fn list_separator_rule(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(list_separator_color())),
-        ..container::Style::default()
-    }
-}
-
-/// Inset 1px hairline between list rows (start menu, controllers popup).
-pub fn list_separator<'a, Message: 'a>() -> Element<'a, Message> {
-    container(
-        container(space())
-            .width(Fill)
-            .height(Length::Fixed(1.0))
-            .style(list_separator_rule),
-    )
-    .padding([LIST_SEPARATOR_PAD_Y, LIST_SEPARATOR_INSET])
-    .width(Fill)
-    .into()
-}
-
 /// Solid color chip, e.g. a gradient stop swatch.
 pub fn swatch(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
@@ -455,15 +422,20 @@ pub fn swatch(color: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
-/// Toast card: flat dark chrome matching popup / Settings.
+/// Toast card: glass over the desktop, rounded, soft shadow.
 pub fn toast_card(_accent: Color) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
-        background: Some(Background::Color(BASE_BG)),
+        background: Some(Background::Color(GLASS_FILL)),
         text_color: Some(INK),
         border: Border {
-            color: LINE,
+            color: GLASS_HAIRLINE,
             width: 1.0,
-            radius: 0.0.into(),
+            radius: radius::LG.into(),
+        },
+        shadow: iced::Shadow {
+            color: alpha(Color::BLACK, 0.4),
+            offset: iced::Vector::new(0.0, 6.0),
+            blur_radius: 18.0,
         },
         ..container::Style::default()
     }
@@ -476,7 +448,7 @@ pub fn rail(accent: Color) -> impl Fn(&Theme) -> container::Style {
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
-            radius: 0.0.into(),
+            radius: 2.0.into(),
         },
         ..container::Style::default()
     }

@@ -591,6 +591,17 @@ impl App {
                     }
                 }
                 "start" => tasks.push(self.open_start_screen()),
+                "start-controllers" => {
+                    tasks.push(self.open_start_screen());
+                    self.start_state.request_slide(
+                        crate::ui::start::view::StartSlide::Controllers,
+                        Instant::now(),
+                    );
+                }
+                "start-edit" => {
+                    tasks.push(self.open_start_screen());
+                    let _ = self.toggle_start_edit();
+                }
                 "toast" => {
                     ToastMessage::enqueue(
                         &mut self.toast_queue,
@@ -5323,7 +5334,7 @@ impl App {
             visible: false,
             resizable: false,
             decorations: false,
-            transparent: true,
+            transparent: crate::ui::chrome::transparent_windows(),
             level: window::Level::AlwaysOnTop,
             exit_on_close_request: false,
             platform_specific: overlay_platform_specific(),

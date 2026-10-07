@@ -11,7 +11,7 @@ use crate::ui::percent_ring::{self, POPUP_SIZE};
 use crate::ui::start::icon_cache;
 use crate::ui::start::input::FaceHeld;
 use crate::ui::svg_icon;
-use crate::ui::theme;
+use crate::ui::{chrome, theme};
 use iced::font::Weight;
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
@@ -62,7 +62,7 @@ const FACE_GLYPH_SIZE: f32 = 18.0;
 const PRESSED_SCALE: f32 = 1.1;
 /// Pressed grow and armed-color transitions.
 const HINT_ANIM: Duration = Duration::from_millis(crate::ui::motion::FAST_MS);
-const ROW_GAP: f32 = theme::LIST_SEPARATOR_GAP;
+const ROW_GAP: f32 = 11.0;
 const ROW_ACTION_SPACING: f32 = 14.0;
 /// Body width inside outer padding — dual-pane strip unit.
 const PANE_W: f32 = WIDTH - 2.0 * PADDING;
@@ -3239,28 +3239,12 @@ fn compact_chrome<'a>(
     #[cfg(not(debug_assertions))]
     let diag: Element<'_, StartMessage> = space().height(Length::Fixed(0.0)).into();
 
-    theme::framed(
-        column![
-            column![
-                header,
-                container(space())
-                    .width(Fill)
-                    .height(Length::Fixed(1.0))
-                    .style(theme::configure_header_rule),
-            ]
-            .spacing(0)
-            .width(Fill),
-            container(body)
-                .width(Fill)
-                .height(Fill)
-                .style(theme::content),
-            diag,
-            hint,
-        ]
-        .spacing(10)
-        .padding([PAD_Y, PADDING])
-        .width(Fill)
-        .height(Fill),
+    chrome::window(
+        column![header, container(body).width(Fill).height(Fill), diag, hint,]
+            .spacing(10)
+            .padding([PAD_Y, PADDING])
+            .width(Fill)
+            .height(Fill),
     )
 }
 
@@ -3597,7 +3581,7 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
             .into();
     }
     let items = state.rows.iter().enumerate().fold(
-        column![].spacing(0).width(Fill),
+        column![].spacing(8).width(Fill),
         |col, (index, row)| {
             let selected = index == state.game_selected;
             let running = !state.editing
@@ -3610,11 +3594,6 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
                     .closing_target
                     .as_ref()
                     .is_some_and(|t| t == &row.target);
-            let col = if index > 0 {
-                col.push(theme::list_separator())
-            } else {
-                col
-            };
             col.push(game_row(
                 index,
                 row,
@@ -3652,18 +3631,13 @@ fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element
         .into();
     }
     let items = state.controllers.iter().enumerate().fold(
-        column![].spacing(0).width(Fill),
+        column![].spacing(8).width(Fill),
         |col, (index, row)| {
             let selected = index == state.controller_selected;
             let powering_off = state
                 .powering_off
                 .as_ref()
                 .is_some_and(|s| s == &row.serial);
-            let col = if index > 0 {
-                col.push(theme::list_separator())
-            } else {
-                col
-            };
             col.push(controller_row(
                 index,
                 row,
@@ -4993,7 +4967,7 @@ fn game_row(
         .padding([0, 12])
         .width(Fill)
         .height(Length::Fixed(ROW_HEIGHT))
-        .style(theme::menu_row_surface(selected))
+        .style(theme::glass_row(selected, theme::radius::MD))
         .into()
 }
 
@@ -5104,7 +5078,7 @@ fn controller_row<'a>(
     .padding([0, 12])
     .width(Fill)
     .height(Length::Fixed(CONTROLLER_ROW_HEIGHT))
-    .style(theme::menu_row_surface(selected))
+    .style(theme::glass_row(selected, theme::radius::MD))
     .into()
 }
 
