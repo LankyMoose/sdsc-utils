@@ -104,6 +104,67 @@ pub fn show_toast_without_activate<Message: Send + 'static>(id: window::Id) -> T
     }
 }
 
+/// Debug quiet mode: relocate to the secondary monitor and show without
+/// activating (see [`crate::platform::debug_quiet`]).
+#[cfg(windows)]
+fn quiet_show<Message: Send + 'static>(id: window::Id, show: bool) -> Task<Message> {
+    window::run(id, move |window| {
+        use window::raw_window_handle::RawWindowHandle;
+
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
+            return;
+        };
+        let hwnd = win32_handle.hwnd.get();
+        unsafe {
+            win32::move_to_secondary_monitor(hwnd);
+            if show {
+                win32::apply_noactivate_exstyle(hwnd, true);
+                win32::ShowWindow(hwnd, win32::SW_SHOWNOACTIVATE);
+            }
+        }
+    })
+    .discard()
+}
+
+/// Give a UI window focus (`window::gain_focus`). In debug quiet mode it is
+/// shown on the secondary monitor without activation instead.
+pub fn focus_window<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+    #[cfg(windows)]
+    if crate::platform::debug_quiet::enabled() {
+        return quiet_show(id, true);
+    }
+    window::gain_focus(id)
+}
+
+/// Show a hidden UI window (`Mode::Windowed`). Quiet mode: no activation,
+/// secondary monitor.
+pub fn show_window<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+    #[cfg(windows)]
+    if crate::platform::debug_quiet::enabled() {
+        return quiet_show(id, true);
+    }
+    window::set_mode(id, window::Mode::Windowed)
+}
+
+/// Move a window (`window::move_to`, primary-monitor logical coords). Quiet
+/// mode re-applies the secondary-monitor offset after the move.
+pub fn move_window<Message: Send + 'static>(id: window::Id, position: Point) -> Task<Message> {
+    #[cfg(windows)]
+    if crate::platform::debug_quiet::enabled() {
+        return window::move_to(id, position).chain(quiet_show(id, false));
+    }
+    window::move_to(id, position)
+}
+
+/// Whether newly opened UI windows should start visible (false in quiet mode
+/// so they never activate on creation; [`focus_window`] shows them).
+pub fn open_visible() -> bool {
+    !crate::platform::debug_quiet::enabled()
+}
+
 /// Re-assert toast topmost (e.g. after Settings / Start / popup open or close).
 pub fn set_toast_topmost<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     #[cfg(windows)]

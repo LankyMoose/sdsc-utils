@@ -2,6 +2,7 @@ pub mod app_log;
 pub mod app_meta;
 pub mod autostart;
 pub mod crash_restart;
+pub mod debug_quiet;
 pub mod device_watch;
 pub mod file_icon;
 pub mod packaged;

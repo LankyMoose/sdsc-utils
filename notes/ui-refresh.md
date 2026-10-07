@@ -28,6 +28,10 @@ Goal: bring the tray popup, Settings (configure), toasts, and compact Start up t
 
 `RADIUS` 2 / `RADIUS_SM` 1 (0 on chips, toasts, tabs); 1px `framed` LINE outline + header rules + list separators; flat `BASE_BG`/`CONTENT`; accent-blue selection (tabs/chips @ 28%); stock checkbox/slider/pick_list/scrollbar; 12–14px type; no motion outside the toast slide; Settings 420×400 with a 120px sidebar; Start-screen prefs duplicated between `configure/mod.rs` and `start/settings.rs`.
 
+## Screenshot / review tooling (debug builds)
+
+`SDSC_DEBUG_OPEN=popup|settings[:start|notifications|toast|lightbar|analytics|diagnostics]|start|toast` (comma-separated) opens those windows ~1.5s after boot (`Message::DebugOpen`). Setting it also enables **quiet mode** (`platform::debug_quiet`): windows are created hidden, shown with `SW_SHOWNOACTIVATE` + `WS_EX_NOACTIVATE`, and relocated from the primary to the first secondary monitor at the same relative position (`layout::{focus_window, show_window, move_window}` → `win32::move_to_secondary_monitor`); UI sounds, Start haptics, and pad input to the shell are off. Safe to run while a game owns the primary monitor. All window focus / move / show in `app/mod.rs` must go through those `layout` helpers (they are plain `gain_focus` / `move_to` / `set_mode(Windowed)` outside quiet mode).
+
 ## Phases
 
 - [x] **0a Backend switch** — Vulkan-first with DX12 fallback + `alpha_composite()` prediction.

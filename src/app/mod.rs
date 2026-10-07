@@ -43,10 +43,11 @@ use crate::ui::configure::{
     ConfigureState, NotificationSetting, PadInputPanel, Section,
 };
 use crate::ui::layout::{
-    MonitorCover, ToastPlacement, TrayAnchor, cursor_on_primary_monitor, hide_toast,
-    invalidate_toast, overlay_platform_specific, popup_position, primary_monitor_cover,
-    raise_window_topmost, remount_toast_surface, set_toast_topmost, show_toast_without_activate,
-    slide_y, toast_local_in_cover, toast_placement, window_hwnd, window_platform_specific,
+    MonitorCover, ToastPlacement, TrayAnchor, cursor_on_primary_monitor, focus_window, hide_toast,
+    invalidate_toast, move_window, open_visible, overlay_platform_specific, popup_position,
+    primary_monitor_cover, raise_window_topmost, remount_toast_surface, set_toast_topmost,
+    show_toast_without_activate, show_window, slide_y, toast_local_in_cover, toast_placement,
+    window_hwnd, window_platform_specific,
 };
 use crate::ui::popup::{self as popup_view, ControllerRow, PopupMessage};
 use crate::ui::start::cursor_hide;
@@ -86,6 +87,9 @@ use tray_icon::TrayIcon;
 
 /// Debounce spectrum prefs save + HID apply after the last color edit.
 const SPECTRUM_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Debug builds: comma list of windows to open at boot (see [`Message::DebugOpen`]).
+#[cfg(debug_assertions)]
+const DEBUG_OPEN_ENV: &str = crate::platform::debug_quiet::DEBUG_OPEN_ENV;
 /// How long an overlay toast stays on screen.
 const TOAST_LIFETIME: Duration = Duration::from_secs(5);
 /// DualSense poll rate while pad input is live (~one wired report).
@@ -171,6 +175,11 @@ pub enum Message {
     /// renderer (e.g. wgpu atlas) crashes. Takes over windows while running.
     #[cfg(debug_assertions)]
     StressWindows(u8),
+    /// Debug-only: open the windows named in `SDSC_DEBUG_OPEN` after boot
+    /// (`popup`, `settings[:section]`, `start`, `toast`; comma-separated) so
+    /// UI work can be screenshotted without clicking through the tray.
+    #[cfg(debug_assertions)]
+    DebugOpen(String),
 
     PlaceToast {
         id: window::Id,
@@ -539,8 +548,58 @@ impl App {
         let steam_fallback = Task::perform(delay(STEAM_SCAN_IDLE_FALLBACK), |()| {
             Message::SteamScanIdleFallback
         });
-        let task = Task::batch([app.request_refresh(), toast_boot, steam_fallback]);
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+        let mut task = Task::batch([app.request_refresh(), toast_boot, steam_fallback]);
+        #[cfg(debug_assertions)]
+        if let Ok(spec) = std::env::var(DEBUG_OPEN_ENV) {
+            // Let the tray / toast window settle before opening on top of them.
+            task = Task::batch([
+                task,
+                Task::perform(delay(Duration::from_millis(1500)), move |()| {
+                    Message::DebugOpen(spec.clone())
+                }),
+            ]);
+        }
         (app, task)
+    }
+
+    /// Open windows for `SDSC_DEBUG_OPEN` (see [`Message::DebugOpen`]).
+    #[cfg(debug_assertions)]
+    fn debug_open(&mut self, spec: &str) -> Task<Message> {
+        use crate::ui::configure::Section;
+        let mut tasks = Vec::new();
+        for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let (name, arg) = item.split_once(':').unwrap_or((item, ""));
+            app_log::info(format!("debug-open: {name} {arg}"));
+            match name {
+                "popup" => tasks.push(self.open_popup()),
+                "settings" => {
+                    let section = match arg {
+                        "start" => Some(Section::StartScreen),
+                        "notifications" => Some(Section::Notifications),
+                        "toast" => Some(Section::ToastPosition),
+                        "lightbar" => Some(Section::Lightbar),
+                        "analytics" => Some(Section::Analytics),
+                        "diagnostics" => Some(Section::Diagnostics),
+                        _ => None,
+                    };
+                    tasks.push(self.open_configure());
+                    if let Some(section) = section {
+                        self.configure_state.select_section(section);
+                    }
+                }
+                "start" => tasks.push(self.open_start_screen()),
+                "toast" => {
+                    ToastMessage::enqueue(
+                        &mut self.toast_queue,
+                        ToastMessage::preview(&self.session.prefs.spectrum),
+                    );
+                    tasks.push(self.show_next_toast());
+                }
+                other => app_log::warn(format!("debug-open: unknown window {other:?}")),
+            }
+        }
+        Task::batch(tasks)
     }
 
     fn title(&self, window: window::Id) -> String {
@@ -847,7 +906,7 @@ impl App {
             }
             Message::Popup(message) => self.on_popup_message(message),
 
-            Message::ConfigureOpened(id) => window::gain_focus(id),
+            Message::ConfigureOpened(id) => focus_window(id),
             Message::Configure(message) => self.on_configure_message(message),
 
             Message::StartOpened(id) => {
@@ -863,7 +922,7 @@ impl App {
                     // Raise/focus after create_renderer has a chance to finish —
                     // chaining sync on the same turn as window::open correlated
                     // with atlas create_renderer panics.
-                    let mut task = window::gain_focus(id)
+                    let mut task = focus_window(id)
                         .chain(raise_window_topmost(id))
                         .chain(self.sync_toast_zorder());
                     if self.start_state.immersive {
@@ -1117,7 +1176,13 @@ impl App {
                 }
                 Task::none()
             }
-            Message::PadInput(edge) => self.on_pad_input(edge),
+            Message::PadInput(edge) => {
+                if crate::platform::debug_quiet::enabled() {
+                    Task::none()
+                } else {
+                    self.on_pad_input(edge)
+                }
+            }
             Message::ClientIpcSync => {
                 self.sync_client_input_hot();
                 Task::none()
@@ -1191,6 +1256,9 @@ impl App {
                 }
             }
 
+            #[cfg(debug_assertions)]
+            Message::DebugOpen(spec) => self.debug_open(&spec),
+
             Message::PlaceToast { id, generation } => {
                 if generation != self.toast_generation || self.toast_message.is_none() {
                     return Task::none();
@@ -1219,7 +1287,7 @@ impl App {
                 // only after Resting so Start create cannot starve the slide.
                 // Immersive Start hosts the card; keep the toast HWND hidden.
                 let mut place = remount_toast_surface(id, generation)
-                    .chain(window::move_to(id, start))
+                    .chain(move_window(id, start))
                     .chain(window::set_level(id, window::Level::AlwaysOnTop));
                 if !composite_only {
                     place = place
@@ -1513,6 +1581,11 @@ impl App {
 
     /// True when the shell (not the service) should receive live pad-input edges.
     fn shell_wants_pad_input(&self) -> bool {
+        // Debug quiet mode: HID input is focus-independent, so a pad press during
+        // a game must never drive Start (navigate / launch).
+        if crate::platform::debug_quiet::enabled() {
+            return false;
+        }
         let pad_input_live =
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
         pad_input_live
@@ -1628,7 +1701,7 @@ impl App {
         let height = self.popup_window_height();
         let size = Size::new(popup_view::WIDTH, height);
         let position = popup_position(self.tray_anchor, self.popup_scale, self.popup_monitor, size);
-        window::resize(id, size).chain(window::move_to(id, position))
+        window::resize(id, size).chain(move_window(id, position))
     }
 
     fn toggle_popup(&mut self) -> Task<Message> {
@@ -1641,7 +1714,7 @@ impl App {
 
     fn open_popup(&mut self) -> Task<Message> {
         if let Some(id) = self.popup_window {
-            return window::gain_focus(id);
+            return focus_window(id);
         }
 
         self.popup_state.cancel();
@@ -1668,9 +1741,9 @@ impl App {
         let size = Size::new(popup_view::WIDTH, height);
         let position = popup_position(self.tray_anchor, self.popup_scale, self.popup_monitor, size);
         window::resize(id, size)
-            .chain(window::move_to(id, position))
-            .chain(window::set_mode(id, window::Mode::Windowed))
-            .chain(window::gain_focus(id))
+            .chain(move_window(id, position))
+            .chain(show_window(id))
+            .chain(focus_window(id))
     }
 
     fn close_popup(&mut self) -> Task<Message> {
@@ -1811,7 +1884,7 @@ impl App {
 
     fn open_configure(&mut self) -> Task<Message> {
         if let Some(id) = self.configure_window {
-            return window::gain_focus(id);
+            return focus_window(id);
         }
 
         self.configure_state
@@ -1820,6 +1893,7 @@ impl App {
         let (id, open) = window::open(window::Settings {
             size: Size::new(configure_view::WIDTH, configure_view::HEIGHT),
             position: window::Position::Centered,
+            visible: open_visible(),
             resizable: false,
             decorations: false,
             // AlwaysOnTop like Start: a Normal Settings window loses presents to the
@@ -3128,7 +3202,7 @@ impl App {
             self.last_running_check = None;
             self.arm_chord_release_latch();
             let badge = self.refresh_running_badge();
-            return Task::batch([badge, window::gain_focus(id)]);
+            return Task::batch([badge, focus_window(id)]);
         }
 
         // Mark the current chord consumed (do not reset): a held PS from power-on
@@ -3195,7 +3269,7 @@ impl App {
         let (id, open) = window::open(window::Settings {
             size,
             position,
-            visible: true,
+            visible: open_visible(),
             resizable: false,
             decorations: false,
             level: window::Level::AlwaysOnTop,
@@ -3336,7 +3410,7 @@ impl App {
             });
             self.start_monitor_cover = Some(cover);
             window::resize(id, cover.size())
-                .chain(window::move_to(id, cover.origin()))
+                .chain(move_window(id, cover.origin()))
                 .chain(Task::done(Message::StartImmersiveSettled))
         } else {
             let size = Size::new(start_view::WIDTH, start_view::HEIGHT);
@@ -3349,7 +3423,7 @@ impl App {
                     ((1080.0 - size.height) / 2.0).max(0.0),
                 ));
             window::resize(id, size)
-                .chain(window::move_to(id, position))
+                .chain(move_window(id, position))
                 .chain(Task::done(Message::StartImmersiveSettled))
         }
     }
@@ -3393,7 +3467,7 @@ impl App {
         crate::controller::hid::diag::diag_info(format!("ui-diag: start immersive settle {kind}"));
         let focus = self
             .start_window
-            .map(|id| window::gain_focus(id).chain(raise_window_topmost(id)))
+            .map(|id| focus_window(id).chain(raise_window_topmost(id)))
             .unwrap_or_else(Task::none);
         if immersive {
             focus.chain(self.warm_immersive_art_task())
@@ -4000,7 +4074,9 @@ impl App {
     }
 
     fn play_start_haptic(&self, kind: UiSoundKind) {
-        if !self.session.prefs.start_screen_haptics_enabled {
+        if !self.session.prefs.start_screen_haptics_enabled
+            || crate::platform::debug_quiet::enabled()
+        {
             return;
         }
         let Some(serial) = self.haptic_pad_serial.as_ref() else {
@@ -4033,7 +4109,9 @@ impl App {
 
     /// Preview haptic on every connected DualSense (settings toggle / strength slider).
     fn preview_haptic_all(&self, pulse: MotorPulse) {
-        if !self.session.prefs.start_screen_haptics_enabled {
+        if !self.session.prefs.start_screen_haptics_enabled
+            || crate::platform::debug_quiet::enabled()
+        {
             return;
         }
         let (right, left, duration) =
@@ -5388,7 +5466,7 @@ impl App {
             return Task::none();
         };
         let y = slide_y(placement, progress, dismissing);
-        window::move_to(id, Point::new(placement.x, y))
+        move_window(id, Point::new(placement.x, y))
     }
 
     fn effect_open_start(&mut self) -> Task<Message> {
@@ -5447,15 +5525,15 @@ impl App {
     /// Prefer Settings, then Start, then popup as the focused presenting window.
     fn refocus_interactive_ui(&self) -> Task<Message> {
         if let Some(id) = self.configure_window {
-            return window::gain_focus(id);
+            return focus_window(id);
         }
         if self.start_visible
             && let Some(id) = self.start_window
         {
-            return window::gain_focus(id);
+            return focus_window(id);
         }
         if let Some(id) = self.popup_window {
-            return window::gain_focus(id);
+            return focus_window(id);
         }
         Task::none()
     }

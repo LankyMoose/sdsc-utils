@@ -79,7 +79,7 @@ fn sender() -> Option<&'static Sender<Cmd>> {
 /// Play an embedded cue at `volume` in 0.0..=1.0. No-ops when volume is ~0.
 pub fn play(kind: UiSoundKind, volume: f32) {
     let volume = volume.clamp(0.0, 1.0);
-    if volume < 0.001 {
+    if volume < 0.001 || crate::platform::debug_quiet::enabled() {
         return;
     }
     let Some(tx) = sender() else {
