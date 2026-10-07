@@ -8,11 +8,27 @@ use iced::widget::canvas::{self, Frame, Geometry, Path};
 use iced::{Color, Event, Point, Rectangle, Renderer, Size, Theme};
 
 pub(super) const BAR_HEIGHT: f32 = 44.0;
-pub(super) const SV_HEIGHT: f32 = 112.0;
-pub(super) const HUE_HEIGHT: f32 = 20.0;
+pub(super) const SV_HEIGHT: f32 = 150.0;
+pub(super) const HUE_HEIGHT: f32 = 18.0;
 const HANDLE_WIDTH: f32 = 10.0;
 const HIT_RADIUS: f32 = 12.0;
 const STOP_REMOVE_DISTANCE: f32 = 28.0;
+/// Corner radius of the gradient bar and saturation/value square.
+const BAR_RADIUS: f32 = theme::radius::SM;
+const SV_RADIUS: f32 = theme::radius::SM;
+
+/// Vertical inset at column `x` so a `width × height` bar has `radius` corners.
+fn corner_inset(x: f32, width: f32, height: f32, radius: f32) -> f32 {
+    let r = radius.min(width / 2.0).min(height / 2.0).max(0.0);
+    let dx = if x < r {
+        r - x
+    } else if x > width - r {
+        x - (width - r)
+    } else {
+        return 0.0;
+    };
+    r - (r * r - dx.min(r) * dx.min(r)).max(0.0).sqrt()
+}
 
 /// Gradient preview with draggable stop handles.
 /// Left-click empty bar to add; drag a stop vertically off the bar, or right-click a
@@ -140,15 +156,17 @@ impl canvas::Program<ConfigureMessage> for SpectrumBar {
         let height = bounds.height;
         let spectrum = self.spectrum();
 
-        // Draw the gradient as thin columns so it matches `color_at_percent` exactly.
+        // Draw the gradient as thin columns so it matches `color_at_percent` exactly;
+        // columns inside a corner are inset vertically to round the bar.
         let columns = width.max(1.0).ceil() as usize;
         let step = width / columns as f32;
         for column in 0..columns {
             let x = column as f32 * step;
             let percent = Self::percent_at(x + step / 2.0, width);
+            let inset = corner_inset(x + step / 2.0, width, height, BAR_RADIUS);
             frame.fill_rectangle(
-                Point::new(x, 0.0),
-                Size::new(step + 1.0, height),
+                Point::new(x, inset),
+                Size::new(step + 1.0, (height - inset * 2.0).max(0.0)),
                 theme::from_rgb(spectrum.color_at_percent(percent)),
             );
         }
@@ -159,9 +177,11 @@ impl canvas::Program<ConfigureMessage> for SpectrumBar {
             let selected = index == self.selected;
             let removing = state.remove_armed && state.dragging && selected;
 
-            let outline = Path::rectangle(
-                Point::new(left - 1.0, -1.0),
-                Size::new(HANDLE_WIDTH + 2.0, height + 2.0),
+            // Pill knob: ring (state color) around the stop's own color.
+            let outline = Path::rounded_rectangle(
+                Point::new(left - 2.0, 2.0),
+                Size::new(HANDLE_WIDTH + 4.0, height - 4.0),
+                ((HANDLE_WIDTH + 4.0) / 2.0).into(),
             );
             frame.fill(
                 &outline,
@@ -170,12 +190,15 @@ impl canvas::Program<ConfigureMessage> for SpectrumBar {
                 } else if selected {
                     theme::INK
                 } else {
-                    theme::DIM
+                    theme::alpha(theme::INK, 0.55)
                 },
             );
 
-            let handle =
-                Path::rectangle(Point::new(left, 2.0), Size::new(HANDLE_WIDTH, height - 4.0));
+            let handle = Path::rounded_rectangle(
+                Point::new(left, 4.0),
+                Size::new(HANDLE_WIDTH, height - 8.0),
+                (HANDLE_WIDTH / 2.0).into(),
+            );
             frame.fill(&handle, theme::from_rgb(stop.color));
         }
 
@@ -280,7 +303,11 @@ impl canvas::Program<ConfigureMessage> for HueBar {
                 theme::from_rgb(hsv_to_rgb(hue, 1.0, 1.0)),
             );
         }
-        frame.fill_rectangle(Point::ORIGIN, size, spectrum);
+        // Pill track.
+        frame.fill(
+            &Path::rounded_rectangle(Point::ORIGIN, size, (size.height / 2.0).into()),
+            spectrum,
+        );
 
         let x = (self.hue.rem_euclid(360.0) / 360.0).clamp(0.0, 1.0) * size.width;
         let cursor_point = Point::new(x, size.height / 2.0);
@@ -396,13 +423,14 @@ impl canvas::Program<ConfigureMessage> for SvSquare {
             canvas::gradient::Linear::new(Point::new(0.0, 0.0), Point::new(size.width, 0.0))
                 .add_stop(0.0, Color::WHITE)
                 .add_stop(1.0, pure);
-        frame.fill_rectangle(Point::ORIGIN, size, saturation);
+        let square = Path::rounded_rectangle(Point::ORIGIN, size, SV_RADIUS.into());
+        frame.fill(&square, saturation);
 
         let value =
             canvas::gradient::Linear::new(Point::new(0.0, 0.0), Point::new(0.0, size.height))
                 .add_stop(0.0, Color::TRANSPARENT)
                 .add_stop(1.0, Color::BLACK);
-        frame.fill_rectangle(Point::ORIGIN, size, value);
+        frame.fill(&square, value);
 
         let cursor_point = Point::new(
             self.saturation.clamp(0.0, 1.0) * size.width,
@@ -435,5 +463,21 @@ impl canvas::Program<ConfigureMessage> for SvSquare {
         } else {
             mouse::Interaction::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corner_inset_rounds_only_the_ends() {
+        let (w, h, r) = (200.0, 44.0, 8.0);
+        assert_eq!(corner_inset(100.0, w, h, r), 0.0);
+        assert_eq!(corner_inset(r, w, h, r), 0.0);
+        assert!((corner_inset(0.0, w, h, r) - r).abs() < 1e-4);
+        assert!((corner_inset(w, w, h, r) - r).abs() < 1e-4);
+        let mid = corner_inset(r / 2.0, w, h, r);
+        assert!(mid > 0.0 && mid < r);
     }
 }

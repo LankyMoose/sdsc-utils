@@ -1,4 +1,5 @@
 pub mod backdrop;
+pub mod chrome;
 pub mod color;
 pub mod configure;
 pub mod icon;

@@ -14,6 +14,7 @@ pub const CLOSE_SVG: &str = include_str!("../../assets/icons/close.svg");
 #[allow(dead_code)] // available for title-bar chrome
 pub const MINIMIZE_SVG: &str = include_str!("../../assets/icons/minimize.svg");
 pub const CHECK_SVG: &str = include_str!("../../assets/icons/check.svg");
+pub const PIN_SVG: &str = include_str!("../../assets/icons/pin.svg");
 pub const FACE_CROSS_SVG: &str = include_str!("../../assets/icons/face-cross.svg");
 pub const FACE_CIRCLE_SVG: &str = include_str!("../../assets/icons/face-circle.svg");
 pub const FACE_TRIANGLE_SVG: &str = include_str!("../../assets/icons/face-triangle.svg");

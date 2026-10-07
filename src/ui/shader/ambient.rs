@@ -25,6 +25,9 @@ pub struct AmbientUniforms {
     pub veil: f32,
     /// Soft iris open amount (0 = closed, 1 = fully open).
     pub aperture: f32,
+    /// `[width_px, height_px, corner_radius_px, _]`. Filled in `prepare` from
+    /// the widget bounds × scale; radius 0 keeps the output opaque and square.
+    pub mask: [f32; 4],
 }
 
 impl AmbientUniforms {
@@ -37,7 +40,20 @@ impl AmbientUniforms {
             dock_progress: dock_progress.clamp(0.0, 1.0),
             veil: veil.clamp(0.0, 1.0),
             aperture: aperture.clamp(0.0, 1.0),
+            mask: [0.0; 4],
         }
+    }
+
+    /// Copy with the corner mask resolved for a widget of `bounds` (logical)
+    /// at `scale`; `radius` is logical px.
+    fn with_mask(mut self, bounds: &Rectangle, scale: f32, radius: f32) -> Self {
+        self.mask = [
+            bounds.width * scale,
+            bounds.height * scale,
+            radius.max(0.0) * scale,
+            0.0,
+        ];
+        self
     }
 }
 
@@ -48,13 +64,22 @@ fn color4(c: Color) -> [f32; 4] {
 #[derive(Debug, Clone, Copy)]
 pub struct AmbientProgram {
     pub uniforms: AmbientUniforms,
+    /// Logical corner radius for transparent rounded windows (0 = square).
+    pub corner_radius: f32,
 }
 
 impl AmbientProgram {
     pub fn new(time: f32, dock_progress: f32, veil: f32, aperture: f32) -> Self {
         Self {
             uniforms: AmbientUniforms::from_theme(time, dock_progress, veil, aperture),
+            corner_radius: 0.0,
         }
+    }
+
+    /// Mask the output to a rounded rect (transparent corners).
+    pub fn rounded(mut self, radius: f32) -> Self {
+        self.corner_radius = radius.max(0.0);
+        self
     }
 }
 
@@ -70,6 +95,7 @@ impl<Message> shader::Program<Message> for AmbientProgram {
     ) -> Self::Primitive {
         AmbientPrimitive {
             uniforms: self.uniforms,
+            corner_radius: self.corner_radius,
         }
     }
 }
@@ -77,6 +103,7 @@ impl<Message> shader::Program<Message> for AmbientProgram {
 #[derive(Debug)]
 pub struct AmbientPrimitive {
     uniforms: AmbientUniforms,
+    corner_radius: f32,
 }
 
 impl shader::Primitive for AmbientPrimitive {
@@ -87,10 +114,13 @@ impl shader::Primitive for AmbientPrimitive {
         pipeline: &mut AmbientPipeline,
         _device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _bounds: &Rectangle,
-        _viewport: &Viewport,
+        bounds: &Rectangle,
+        viewport: &Viewport,
     ) {
-        pipeline.update(queue, &self.uniforms);
+        let uniforms = self
+            .uniforms
+            .with_mask(bounds, viewport.scale_factor(), self.corner_radius);
+        pipeline.update(queue, &uniforms);
     }
 
     fn draw(&self, pipeline: &AmbientPipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
@@ -211,7 +241,22 @@ mod tests {
     }
 
     #[test]
-    fn uniforms_size_is_64_bytes() {
-        assert_eq!(std::mem::size_of::<AmbientUniforms>(), 64);
+    fn uniforms_size_matches_wgsl_layout() {
+        // 3 × vec4 colors + 4 × f32 + vec4 mask (16-byte aligned).
+        assert_eq!(std::mem::size_of::<AmbientUniforms>(), 80);
+    }
+
+    #[test]
+    fn mask_scales_to_physical_pixels() {
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 380.0,
+            height: 200.0,
+        };
+        let u = AmbientUniforms::from_theme(0.0, 0.0, 0.0, 1.0).with_mask(&bounds, 1.5, 12.0);
+        assert_eq!(u.mask, [570.0, 300.0, 18.0, 0.0]);
+        let square = AmbientUniforms::from_theme(0.0, 0.0, 0.0, 1.0).with_mask(&bounds, 2.0, -1.0);
+        assert_eq!(square.mask[2], 0.0);
     }
 }

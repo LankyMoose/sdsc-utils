@@ -6,6 +6,15 @@ struct Uniforms {
     dock_progress: f32,
     veil: f32,
     aperture: f32,
+    // x, y = widget size in physical px; z = corner radius in physical px
+    // (0 = square, fully opaque — immersive). w unused.
+    mask: vec4<f32>,
+}
+
+// Signed distance to a rounded rect of half-size `half` centred at the origin.
+fn rounded_rect_sdf(p: vec2<f32>, half: vec2<f32>, r: f32) -> f32 {
+    let q = abs(p) - half + vec2<f32>(r, r);
+    return length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -83,6 +92,17 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let rim = smoothstep(open_r + 0.04, open_r, radius)
         * smoothstep(open_r - 0.18, open_r - 0.02, radius);
     color += u.accent.rgb * rim * (1.0 - aperture) * 0.35;
+
+    // Rounded window corners (transparent windows): 1px AA edge, premultiplied
+    // so the REPLACE blend leaves clean alpha for the compositor.
+    let r = u.mask.z;
+    if (r > 0.0) {
+        let size = u.mask.xy;
+        let p = uv * size - size * 0.5;
+        let d = rounded_rect_sdf(p, size * 0.5, min(r, min(size.x, size.y) * 0.5));
+        let a = clamp(0.5 - d, 0.0, 1.0);
+        return vec4<f32>(color * a, a);
+    }
 
     return vec4<f32>(color, 1.0);
 }

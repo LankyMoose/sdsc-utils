@@ -1,13 +1,16 @@
 //! Nearly-static atmosphere for utility windows (popup, Settings, compact Start).
 //!
-//! Same shaders as immersive Start ([`AmbientProgram`] + [`VignetteProgram`])
-//! but with **frozen time**: the frame is a function of its inputs only, so the
-//! window redraws on events like any other iced view and never requests
-//! continuous frames. Full-motion ambient stays immersive-only
-//! (`notes/ui-refresh.md`, decision 4).
+//! Same shader as immersive Start ([`AmbientProgram`]) but with **frozen
+//! time**: the frame is a function of its inputs only, so the window redraws
+//! on events like any other iced view and never requests continuous frames.
+//! Full-motion ambient stays immersive-only (`notes/ui-refresh.md`, decision 4).
+//!
+//! No separate [`VignetteProgram`](crate::ui::shader::VignetteProgram) layer:
+//! the ambient shader already darkens toward its edges, and the vignette's
+//! alpha blend would tint the transparent corners of rounded windows.
 
-use crate::ui::shader::{AmbientProgram, VignetteProgram};
-use iced::widget::{shader, stack};
+use crate::ui::shader::AmbientProgram;
+use iced::widget::shader;
 use iced::{Element, Fill};
 
 /// Frozen ambient phase. In `ambient.wgsl`, time only drives the accent-bloom
@@ -16,31 +19,10 @@ use iced::{Element, Fill};
 /// at 0), so utility windows look like a still of the same atmosphere.
 pub const FROZEN_TIME: f32 = 0.0;
 
-/// Edge-vignette strength for utility windows. Softer than immersive's 0.55:
-/// small windows have less canvas, so a strong rim reads as a dark frame.
-pub const VIGNETTE_STRENGTH: f32 = 0.35;
-
-/// Full-bleed backdrop layer: ambient atmosphere (iris fully open, no veil, no
-/// dock push) under a soft edge vignette. Stack content on top of it.
-pub fn backdrop<'a, Message: 'a>() -> Element<'a, Message> {
-    stack![
-        shader(AmbientProgram::new(FROZEN_TIME, 0.0, 0.0, 1.0))
-            .width(Fill)
-            .height(Fill),
-        shader(VignetteProgram::new(VIGNETTE_STRENGTH))
-            .width(Fill)
-            .height(Fill),
-    ]
-    .width(Fill)
-    .height(Fill)
-    .into()
-}
-
-/// `content` over [`backdrop`].
-pub fn with_backdrop<'a, Message: 'a>(
-    content: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    stack![backdrop(), content.into()]
+/// Full-bleed backdrop layer (iris fully open, no veil, no dock push), masked
+/// to `corner_radius` logical px (0 = square, opaque).
+pub fn backdrop<'a, Message: 'a>(corner_radius: f32) -> Element<'a, Message> {
+    shader(AmbientProgram::new(FROZEN_TIME, 0.0, 0.0, 1.0).rounded(corner_radius))
         .width(Fill)
         .height(Fill)
         .into()
@@ -55,11 +37,5 @@ mod tests {
         // Mirrors `pulse` in ambient.wgsl.
         let pulse = 0.5 + 0.5 * (FROZEN_TIME * 1.4).sin();
         assert!((pulse - 0.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn vignette_is_softer_than_immersive() {
-        // Immersive stage uses 0.55; utility windows must stay subtler.
-        const _: () = assert!(VIGNETTE_STRENGTH > 0.0 && VIGNETTE_STRENGTH < 0.55);
     }
 }

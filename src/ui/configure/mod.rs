@@ -20,29 +20,42 @@ use crate::persist::prefs::{
 use crate::platform::app_meta::{DISPLAY_NAME, PKG_VERSION};
 use crate::ui::color::{BatterySpectrum, hsv_to_rgb};
 use crate::ui::svg_icon;
-use crate::ui::theme;
+use crate::ui::{chrome, theme};
+use iced::font::Weight;
 use iced::mouse;
 use iced::widget::{
-    Column, Row, button, canvas as canvas_widget, checkbox, column, container, hover, mouse_area,
-    pick_list, row, scrollable, slider, space, svg, text, tooltip,
+    Column, Row, button, canvas as canvas_widget, column, container, hover, mouse_area, pick_list,
+    row, scrollable, slider, space, svg, text, toggler, tooltip,
 };
-use iced::{Alignment, Color, Element, Fill, Length};
+use iced::{Alignment, Color, Element, Fill, Font, Length};
 use std::time::Duration;
 
 /// Logical width of the configure window.
-pub const WIDTH: f32 = 420.0;
+pub const WIDTH: f32 = 720.0;
 /// Logical height of the configure window.
-pub const HEIGHT: f32 = 400.0;
+pub const HEIGHT: f32 = 520.0;
 
-const SIDEBAR_WIDTH: f32 = 120.0;
-const CONTENT_PADDING: f32 = 10.0;
+/// Window inset around the sidebar island (concentric with the window corner).
+const WINDOW_PAD: f32 = 8.0;
+const SIDEBAR_WIDTH: f32 = 188.0;
+/// Gap between the sidebar island and the content column.
+const SIDEBAR_GAP: f32 = 8.0;
+const CONTENT_PADDING: f32 = 16.0;
 /// Gap between scrollable content and the embedded scrollbar.
 const SCROLL_GAP: f32 = 8.0;
 /// Inset so the scrollbar is not flush to the window frame.
-const SCROLL_EDGE: f32 = 8.0;
-const HEADER_HEIGHT: f32 = 32.0;
-/// Content pane width: window minus sidebar, scroll gutters, and content padding.
-const CONTENT_WIDTH: f32 = WIDTH - SIDEBAR_WIDTH - CONTENT_PADDING * 2.0 - SCROLL_GAP - SCROLL_EDGE;
+const SCROLL_EDGE: f32 = 6.0;
+const HEADER_HEIGHT: f32 = 52.0;
+/// Inner padding of a settings group card.
+const GROUP_PAD: f32 = 14.0;
+/// Content pane width: window minus inset, sidebar, gutters, and padding.
+const CONTENT_WIDTH: f32 = WIDTH
+    - WINDOW_PAD * 2.0
+    - SIDEBAR_WIDTH
+    - SIDEBAR_GAP
+    - CONTENT_PADDING * 2.0
+    - SCROLL_GAP
+    - SCROLL_EDGE;
 
 const COVERAGE_HEIGHT: f32 = 56.0;
 /// Vertical distance outside the bar that arms stop removal (matches softbuffer UI).
@@ -88,6 +101,22 @@ impl Section {
             Self::Developer => "Developer",
             #[cfg(debug_assertions)]
             Self::Diagnostics => "Diagnostics",
+        }
+    }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            Self::System => "Startup and app data",
+            Self::StartScreen => "Game launcher you open from your controller",
+            Self::Notifications => "Which controller events show a toast",
+            Self::ToastPosition => "Where toasts appear on your screen",
+            Self::Lightbar => "Lightbar color as the battery drains",
+            Self::Analytics => "Learned charge and play times",
+            Self::PadInput => "Live controller readings",
+            #[cfg(feature = "dev-emulate")]
+            Self::Developer => "Emulated controllers and analytics",
+            #[cfg(debug_assertions)]
+            Self::Diagnostics => "Renderer stress testing",
         }
     }
 
@@ -454,57 +483,77 @@ pub fn view<'a>(
     analytics: &'a AnalyticsPanel,
     pad_input: &'a PadInputPanel,
 ) -> Element<'a, ConfigureMessage> {
-    let title = mouse_area(
-        container(text("Settings").size(16.0).color(theme::INK))
-            .width(Fill)
-            .height(Fill)
-            .align_y(Alignment::Center),
+    // Section heading doubles as the drag handle for the undecorated window.
+    let heading = mouse_area(
+        container(
+            column![
+                text(state.section.title())
+                    .size(theme::type_scale::HEADING)
+                    .font(semibold())
+                    .color(theme::INK),
+                text(state.section.subtitle())
+                    .size(theme::type_scale::META)
+                    .color(theme::DIM),
+            ]
+            .spacing(2),
+        )
+        .width(Fill)
+        .height(Fill)
+        .align_y(Alignment::Center),
     )
     .on_press(ConfigureMessage::DragWindow)
     .interaction(mouse::Interaction::Grab);
 
-    let header = row![
-        title,
-        tooltip(
-            button(
-                svg(svg::Handle::from_memory(svg_icon::CLOSE_SVG.as_bytes()))
-                    .width(Length::Fixed(ICON_SIZE))
-                    .height(Length::Fixed(ICON_SIZE))
-                    .style(|_theme, _status| svg::Style {
-                        color: Some(theme::MUTED)
-                    }),
-            )
-            .padding(4)
-            .on_press(ConfigureMessage::Close)
-            .style(theme::ghost),
-            text("Close").size(12.0).color(theme::INK),
-            tooltip::Position::Bottom,
+    let close = tooltip(
+        button(
+            svg(svg::Handle::from_memory(svg_icon::CLOSE_SVG.as_bytes()))
+                .width(Length::Fixed(ICON_SIZE))
+                .height(Length::Fixed(ICON_SIZE))
+                .style(|_theme, _status| svg::Style {
+                    color: Some(theme::MUTED),
+                }),
         )
-        .gap(6)
-        .padding(6)
-        .delay(Duration::from_millis(350))
-        .style(theme::tooltip),
-    ]
-    .align_y(Alignment::Center)
-    .spacing(6)
-    .height(Length::Fixed(HEADER_HEIGHT));
+        .padding(7)
+        .on_press(ConfigureMessage::Close)
+        .style(theme::ghost),
+        text("Close").size(12.0).color(theme::INK),
+        tooltip::Position::Bottom,
+    )
+    .gap(6)
+    .padding(6)
+    .delay(Duration::from_millis(350))
+    .style(theme::tooltip);
 
-    let sidebar = tab_list(state.section, settings.show_developer);
+    let header = row![heading, close]
+        .align_y(Alignment::Center)
+        .spacing(6)
+        .height(Length::Fixed(HEADER_HEIGHT));
+
+    let scroll = |content: Element<'a, ConfigureMessage>| {
+        scrollable(
+            container(content)
+                .padding(iced::Padding {
+                    top: 4.0,
+                    right: CONTENT_PADDING,
+                    bottom: CONTENT_PADDING,
+                    left: CONTENT_PADDING,
+                })
+                .width(Fill),
+        )
+        .spacing(SCROLL_GAP)
+        .style(theme::scrollbar)
+        .height(Fill)
+        .width(Fill)
+    };
+
     let content_pane: Element<'_, ConfigureMessage> = match state.section {
         Section::System => column![
-            scrollable(
-                container(system_settings_view(settings))
-                    .padding(CONTENT_PADDING)
-                    .width(Fill),
-            )
-            .spacing(SCROLL_GAP)
-            .height(Fill)
-            .width(Fill),
+            scroll(system_settings_view(settings)),
             container(system_footer())
                 .padding(iced::Padding {
                     top: 0.0,
                     right: CONTENT_PADDING,
-                    bottom: CONTENT_PADDING,
+                    bottom: 12.0,
                     left: CONTENT_PADDING,
                 })
                 .width(Fill),
@@ -512,87 +561,204 @@ pub fn view<'a>(
         .width(Fill)
         .height(Fill)
         .into(),
-        _ => scrollable(
-            container(section_content(state, settings, analytics, pad_input))
-                .padding(CONTENT_PADDING)
-                .width(Fill),
-        )
-        .spacing(SCROLL_GAP)
-        .height(Fill)
-        .width(Fill)
-        .into(),
+        _ => scroll(section_content(state, settings, analytics, pad_input)).into(),
     };
 
-    let body = row![
-        container(sidebar)
-            .width(Length::Fixed(SIDEBAR_WIDTH))
-            .height(Fill)
-            .style(theme::sidebar),
-        // Embed scrollbar with gutters: content ↔ bar ↔ window edge.
+    let content = column![
+        container(header)
+            .padding([0.0, CONTENT_PADDING])
+            .width(Fill),
+        // Embed scrollbar with a gutter so it does not hug the window edge.
         container(content_pane)
             .padding(iced::Padding::ZERO.right(SCROLL_EDGE))
             .width(Fill)
             .height(Fill),
     ]
-    .spacing(0)
     .width(Fill)
     .height(Fill);
 
-    let chrome = column![
-        container(header)
-            .padding([0.0, CONTENT_PADDING])
-            .width(Fill),
-        // Inset like Start: do not meet the window side borders, or the
-        // underline + root border read as a box around only the title.
-        container(
-            container(space())
-                .width(Fill)
-                .height(Length::Fixed(1.0))
-                .style(theme::configure_header_rule),
-        )
-        .padding([0.0, CONTENT_PADDING])
-        .width(Fill),
-    ]
-    .spacing(0)
-    .width(Fill);
+    let sidebar = container(sidebar(state.section, settings.show_developer))
+        .width(Length::Fixed(SIDEBAR_WIDTH))
+        .height(Fill)
+        .style(theme::glass(sidebar_radius()));
 
-    theme::framed(
-        column![
-            chrome,
-            container(body)
-                .width(Fill)
-                .height(Fill)
-                .style(theme::configure_body),
-        ]
-        .width(Fill)
-        .height(Fill),
+    chrome::window(
+        row![sidebar, content]
+            .spacing(SIDEBAR_GAP)
+            .padding(WINDOW_PAD)
+            .width(Fill)
+            .height(Fill),
     )
 }
 
-fn tab_list<'a>(active: Section, show_developer: bool) -> Element<'a, ConfigureMessage> {
-    Section::all(show_developer)
-        .into_iter()
-        .fold(Column::new().spacing(2).width(Fill), |list, section| {
+fn semibold() -> Font {
+    Font {
+        weight: Weight::Semibold,
+        ..Font::DEFAULT
+    }
+}
+
+/// Sidebar island radius: concentric with the window corner.
+fn sidebar_radius() -> f32 {
+    (chrome::window_radius() - WINDOW_PAD).max(theme::radius::SM)
+}
+
+/// Floating glass rail: app title (drag handle) over pill tabs.
+fn sidebar<'a>(active: Section, show_developer: bool) -> Element<'a, ConfigureMessage> {
+    let title = mouse_area(
+        container(
+            row![
+                svg(svg::Handle::from_memory(svg_icon::DUALSENSE_SVG.as_bytes()))
+                    .width(Length::Fixed(20.0))
+                    .height(Length::Fixed(20.0))
+                    .style(|_theme, _status| svg::Style {
+                        color: Some(theme::INK),
+                    }),
+                text("Settings")
+                    .size(theme::type_scale::BODY + 1.0)
+                    .font(semibold())
+                    .color(theme::INK),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .padding([0, 10])
+        .width(Fill)
+        .height(Length::Fixed(HEADER_HEIGHT - 4.0))
+        .align_y(Alignment::Center),
+    )
+    .on_press(ConfigureMessage::DragWindow)
+    .interaction(mouse::Interaction::Grab);
+
+    let tabs = Section::all(show_developer).into_iter().fold(
+        Column::new().spacing(2).width(Fill),
+        |list, section| {
             let selected = active == section;
             list.push(
                 button(
                     row![
                         container(space())
-                            .width(Length::Fixed(2.0))
-                            .height(Length::Fixed(12.0))
-                            .style(theme::position_rail(selected)),
-                        text(section.title()).size(13.0).width(Fill),
+                            .width(Length::Fixed(3.0))
+                            .height(Length::Fixed(14.0))
+                            .style(theme::nav_marker(selected)),
+                        text(section.title())
+                            .size(theme::type_scale::BODY)
+                            .font(if selected { semibold() } else { Font::DEFAULT }),
                     ]
-                    .spacing(6)
+                    .spacing(10)
                     .align_y(Alignment::Center),
                 )
-                .padding([5, 6])
+                .padding([8, 10])
                 .width(Fill)
                 .on_press(ConfigureMessage::SelectSection(section))
-                .style(theme::tab(selected)),
+                .style(theme::nav_item(selected)),
             )
-        })
+        },
+    );
+
+    column![title, tabs]
+        .spacing(4)
+        .padding(6)
+        .width(Fill)
         .into()
+}
+
+// ---------------------------------------------------------------------------
+// Settings rows & groups
+// ---------------------------------------------------------------------------
+
+/// Glass card holding related rows, with an optional caption above it.
+fn group<'a>(
+    caption: Option<&'static str>,
+    rows: Vec<Element<'a, ConfigureMessage>>,
+) -> Element<'a, ConfigureMessage> {
+    let card = container(Column::with_children(rows).spacing(14).width(Fill))
+        .padding(GROUP_PAD)
+        .width(Fill)
+        .style(theme::glass(theme::radius::MD));
+    match caption {
+        Some(caption) => column![
+            container(
+                text(caption)
+                    .size(theme::type_scale::CAPTION + 1.0)
+                    .font(semibold())
+                    .color(theme::DIM),
+            )
+            .padding([0, 4]),
+            card,
+        ]
+        .spacing(8)
+        .width(Fill)
+        .into(),
+        None => card.into(),
+    }
+}
+
+/// Label (+ optional helper line) on the left, pill toggle on the right.
+fn toggle_row<'a>(
+    label: &'static str,
+    helper: Option<&'static str>,
+    value: bool,
+    on_toggle: impl Fn(bool) -> ConfigureMessage + 'a,
+) -> Element<'a, ConfigureMessage> {
+    let mut labels = column![text(label).size(theme::type_scale::BODY).color(theme::INK)]
+        .spacing(2)
+        .width(Fill);
+    if let Some(helper) = helper {
+        labels = labels.push(text(helper).size(12.0).color(theme::DIM));
+    }
+    row![
+        labels,
+        toggler(value)
+            .size(20.0)
+            .on_toggle(on_toggle)
+            .style(theme::toggle),
+    ]
+    .spacing(16)
+    .align_y(Alignment::Center)
+    .width(Fill)
+    .into()
+}
+
+/// Label with its live value on the right, slider underneath.
+fn slider_row<'a>(
+    label: &'static str,
+    value_label: String,
+    slider: impl Into<Element<'a, ConfigureMessage>>,
+) -> Element<'a, ConfigureMessage> {
+    column![
+        row![
+            text(label)
+                .size(theme::type_scale::BODY)
+                .color(theme::INK)
+                .width(Fill),
+            text(value_label)
+                .size(theme::type_scale::META)
+                .color(theme::MUTED),
+        ]
+        .align_y(Alignment::Center),
+        slider.into(),
+    ]
+    .spacing(8)
+    .width(Fill)
+    .into()
+}
+
+/// Secondary action button (ink wash, rounded).
+fn action_button<'a>(
+    label: &'static str,
+    message: ConfigureMessage,
+) -> Element<'a, ConfigureMessage> {
+    button(text(label).size(13.0))
+        .padding([7, 14])
+        .on_press(message)
+        .style(theme::secondary)
+        .into()
+}
+
+/// Dim explanatory paragraph.
+fn note<'a>(body: impl text::IntoFragment<'a>) -> Element<'a, ConfigureMessage> {
+    text(body).size(12.0).color(theme::DIM).into()
 }
 
 fn section_content<'a>(
@@ -618,47 +784,51 @@ fn section_content<'a>(
 
 #[cfg(debug_assertions)]
 fn diagnostics_view<'a>() -> Element<'a, ConfigureMessage> {
-    column![
-        text("Renderer stress test")
-            .size(13.0)
-            .color(theme::INK),
-        text("Runs rapid toast + cold Start + configure + edit churn (the wgpu atlas-crash shape) for about a minute to shake out renderer crashes. Takes over window open/close while running — don't drive the UI at the same time, then check app.log for PANIC lines.")
-            .size(12.0)
-            .color(theme::DIM),
-        button(text("Run window stress test").size(13.0).width(Fill))
-            .padding([6, 10])
-            .width(Fill)
-            .on_press(ConfigureMessage::RunWindowStress)
-            .style(theme::primary),
-    ]
-    .spacing(8)
-    .width(Fill)
-    .into()
+    group(
+        Some("Renderer stress test"),
+        vec![
+            note(
+                "Runs rapid toast + cold Start + configure + edit churn (the wgpu atlas-crash shape) for about a minute to shake out renderer crashes. Takes over window open/close while running — don't drive the UI at the same time, then check app.log for PANIC lines.",
+            ),
+            button(text("Run window stress test").size(13.0))
+                .padding([7, 14])
+                .on_press(ConfigureMessage::RunWindowStress)
+                .style(theme::primary)
+                .into(),
+        ],
+    )
 }
 
 fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
-    let mut items = Column::new().spacing(8).width(Fill);
-
     #[cfg(windows)]
-    {
-        items = items.push(
-            checkbox(settings.autostart)
-                .label("Start with Windows")
-                .size(16.0)
-                .text_size(13.0)
-                .spacing(8)
-                .on_toggle(ConfigureMessage::SetAutostart),
-        );
-    }
+    let startup: Vec<Element<'a, ConfigureMessage>> = vec![toggle_row(
+        "Start with Windows",
+        Some("Run quietly in the tray when you sign in"),
+        settings.autostart,
+        ConfigureMessage::SetAutostart,
+    )];
+    #[cfg(not(windows))]
+    let startup: Vec<Element<'a, ConfigureMessage>> = {
+        let _ = settings;
+        Vec::new()
+    };
 
-    items = items.push(
-        button(text("Open data folder").size(13.0))
-            .padding([6, 10])
-            .on_press(ConfigureMessage::OpenDataFolder)
-            .style(theme::ghost),
+    let data = group(
+        Some("Data"),
+        vec![
+            note("Preferences, remembered controllers, analytics, and logs stay on this PC."),
+            action_button("Open data folder", ConfigureMessage::OpenDataFolder),
+        ],
     );
 
-    items.into()
+    if startup.is_empty() {
+        data
+    } else {
+        column![group(Some("Startup"), startup), data]
+            .spacing(18)
+            .width(Fill)
+            .into()
+    }
 }
 
 fn system_footer<'a>() -> Element<'a, ConfigureMessage> {
@@ -725,99 +895,77 @@ fn footer_link_button<'a>(
     .into()
 }
 
-/// Hairline between Start screen setting groups (content pane already insets sides).
-fn configure_section_rule<'a>() -> Element<'a, ConfigureMessage> {
-    container(
-        container(space())
-            .width(Fill)
-            .height(Length::Fixed(1.0))
-            .style(theme::configure_header_rule),
-    )
-    .padding(iced::Padding {
-        top: 10.0,
-        right: 0.0,
-        bottom: 10.0,
-        left: 0.0,
-    })
-    .width(Fill)
-    .into()
-}
-
-fn configure_section_heading<'a>(label: &'static str) -> Element<'a, ConfigureMessage> {
-    text(label).size(13.0).color(theme::INK).into()
-}
-
 fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
-    let mut items = Column::new().spacing(8).width(Fill);
+    let mut groups = Column::new().spacing(18).width(Fill);
 
-    items = items.push(configure_section_heading("Opening"));
-    items = items.push(
-        checkbox(settings.start_screen_enabled)
-            .label("Enable start screen")
-            .size(16.0)
-            .text_size(13.0)
-            .spacing(8)
-            .on_toggle(ConfigureMessage::SetStartScreenEnabled),
-    );
-    items = items.push(
-        column![
-            text("Auto open:").size(13.0).color(theme::INK),
+    let mut opening = vec![toggle_row(
+        "Enable start screen",
+        Some("A controller-friendly launcher for your games"),
+        settings.start_screen_enabled,
+        ConfigureMessage::SetStartScreenEnabled,
+    )];
+    opening.push(
+        row![
+            column![
+                text("Auto open")
+                    .size(theme::type_scale::BODY)
+                    .color(theme::INK),
+                text("When a controller connects")
+                    .size(12.0)
+                    .color(theme::DIM),
+            ]
+            .spacing(2)
+            .width(Fill),
             pick_list(
                 AUTO_OPEN_MODES,
                 Some(settings.start_screen_auto_open),
                 ConfigureMessage::SetStartScreenAutoOpen,
             )
             .text_size(13.0)
-            .width(Fill),
+            .padding([7, 10])
+            .width(Length::Fixed(190.0))
+            .style(theme::pick_list)
+            .menu_style(theme::pick_list_menu),
         ]
-        .spacing(4)
-        .width(Fill),
+        .spacing(16)
+        .align_y(Alignment::Center)
+        .into(),
     );
+    groups = groups.push(group(Some("Opening"), opening));
 
     if settings.start_screen_enabled {
-        items = items.push(configure_section_rule());
-        items = items.push(configure_section_heading("Immersive"));
-        items = items.push(
-            checkbox(settings.start_screen_always_immersive)
-                .label("Always immersive")
-                .size(16.0)
-                .text_size(13.0)
-                .spacing(8)
-                .on_toggle(ConfigureMessage::SetStartScreenAlwaysImmersive),
-        );
-        items = items.push(
-            checkbox(settings.start_screen_clock_enabled)
-                .label("Display clock")
-                .size(16.0)
-                .text_size(13.0)
-                .spacing(8)
-                .on_toggle(ConfigureMessage::SetStartScreenClock),
-        );
+        let mut immersive = vec![
+            toggle_row(
+                "Always immersive",
+                Some("Open full screen; Circle closes instead of going back"),
+                settings.start_screen_always_immersive,
+                ConfigureMessage::SetStartScreenAlwaysImmersive,
+            ),
+            toggle_row(
+                "Display clock",
+                None,
+                settings.start_screen_clock_enabled,
+                ConfigureMessage::SetStartScreenClock,
+            ),
+        ];
 
         let idle_secs = settings.start_screen_inactive_secs;
         let idle_steps = crate::persist::prefs::START_SCREEN_IDLE_SECS_STEPS;
         let idle_idx = crate::persist::prefs::secs_step_index(idle_secs, idle_steps);
-        items = items.push(
-            column![
-                text(format!(
-                    "Idle after {}",
-                    crate::persist::prefs::format_timeout_duration(idle_secs)
-                ))
-                .size(12.0)
-                .color(theme::MUTED),
-                slider(
-                    0.0..=(idle_steps.len().saturating_sub(1) as f32),
-                    idle_idx as f32,
-                    |value| {
-                        let idx = (value.round() as usize).min(idle_steps.len().saturating_sub(1));
-                        ConfigureMessage::SetStartScreenInactiveSecs(idle_steps[idx])
-                    }
-                )
-                .step(1.0_f32),
-            ]
-            .spacing(4)
-            .width(Fill),
-        );
+        immersive.push(slider_row(
+            "Idle after",
+            crate::persist::prefs::format_timeout_duration(idle_secs),
+            slider(
+                0.0..=(idle_steps.len().saturating_sub(1) as f32),
+                idle_idx as f32,
+                |value| {
+                    let idx = (value.round() as usize).min(idle_steps.len().saturating_sub(1));
+                    ConfigureMessage::SetStartScreenInactiveSecs(idle_steps[idx])
+                },
+            )
+            .step(1.0_f32)
+            .style(theme::slider),
+        ));
 
         let sleep_secs = settings.start_screen_sleep_secs;
         let sleep_steps = crate::persist::prefs::START_SCREEN_SLEEP_SECS_STEPS;
@@ -833,192 +981,169 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             sleep_choices
         };
         let sleep_idx = crate::persist::prefs::secs_step_index(sleep_secs, &sleep_choices);
-        items = items.push(
-            column![
-                text(format!(
-                    "Sleep after {}",
-                    crate::persist::prefs::format_timeout_duration(sleep_secs)
-                ))
-                .size(12.0)
-                .color(theme::MUTED),
-                slider(
-                    0.0..=(sleep_choices.len().saturating_sub(1) as f32),
-                    sleep_idx as f32,
-                    move |value| {
-                        let idx =
-                            (value.round() as usize).min(sleep_choices.len().saturating_sub(1));
-                        ConfigureMessage::SetStartScreenSleepSecs(sleep_choices[idx])
-                    },
-                )
-                .step(1.0_f32),
-            ]
-            .spacing(4)
-            .width(Fill),
-        );
+        immersive.push(slider_row(
+            "Sleep after",
+            crate::persist::prefs::format_timeout_duration(sleep_secs),
+            slider(
+                0.0..=(sleep_choices.len().saturating_sub(1) as f32),
+                sleep_idx as f32,
+                move |value| {
+                    let idx = (value.round() as usize).min(sleep_choices.len().saturating_sub(1));
+                    ConfigureMessage::SetStartScreenSleepSecs(sleep_choices[idx])
+                },
+            )
+            .step(1.0_f32)
+            .style(theme::slider),
+        ));
 
         let dim = settings.start_screen_inactive_dim_percent;
-        items = items.push(
-            column![
-                text(format!("Idle dim {dim}%"))
-                    .size(12.0)
-                    .color(theme::MUTED),
-                slider(0.0..=100.0, f32::from(dim), |value| {
-                    ConfigureMessage::SetStartScreenInactiveDimPercent(value.round() as u8)
-                })
-                .step(5.0_f32),
-            ]
-            .spacing(4)
-            .width(Fill),
-        );
+        immersive.push(slider_row(
+            "Idle dim",
+            format!("{dim}%"),
+            slider(0.0..=100.0, f32::from(dim), |value| {
+                ConfigureMessage::SetStartScreenInactiveDimPercent(value.round() as u8)
+            })
+            .step(5.0_f32)
+            .style(theme::slider),
+        ));
+        groups = groups.push(group(Some("Immersive"), immersive));
 
-        items = items.push(configure_section_rule());
-        items = items.push(configure_section_heading("Feedback"));
-        items = items.push(
-            checkbox(settings.start_screen_sounds_enabled)
-                .label("UI sounds")
-                .size(16.0)
-                .text_size(13.0)
-                .spacing(8)
-                .on_toggle(ConfigureMessage::SetStartScreenSounds),
-        );
-
+        let mut feedback = vec![toggle_row(
+            "UI sounds",
+            None,
+            settings.start_screen_sounds_enabled,
+            ConfigureMessage::SetStartScreenSounds,
+        )];
         if settings.start_screen_sounds_enabled {
             let volume = settings.start_screen_sound_volume;
-            items = items.push(
-                column![
-                    text(format!("Volume {volume}%"))
-                        .size(12.0)
-                        .color(theme::MUTED),
-                    slider(0.0..=100.0, f32::from(volume), |value| {
-                        ConfigureMessage::SetStartScreenSoundVolume(value.round() as u8)
-                    })
-                    .step(5.0_f32),
-                ]
-                .spacing(4)
-                .width(Fill),
-            );
+            feedback.push(slider_row(
+                "Volume",
+                format!("{volume}%"),
+                slider(0.0..=100.0, f32::from(volume), |value| {
+                    ConfigureMessage::SetStartScreenSoundVolume(value.round() as u8)
+                })
+                .step(5.0_f32)
+                .style(theme::slider),
+            ));
         }
-
-        items = items.push(
-            checkbox(settings.start_screen_haptics_enabled)
-                .label("Controller haptics")
-                .size(16.0)
-                .text_size(13.0)
-                .spacing(8)
-                .on_toggle(ConfigureMessage::SetStartScreenHaptics),
-        );
-
+        feedback.push(toggle_row(
+            "Controller haptics",
+            None,
+            settings.start_screen_haptics_enabled,
+            ConfigureMessage::SetStartScreenHaptics,
+        ));
         if settings.start_screen_haptics_enabled {
             let strength = settings.start_screen_haptics_strength;
-            items = items.push(
-                column![
-                    text(format!("Strength {strength}%"))
-                        .size(12.0)
-                        .color(theme::MUTED),
-                    slider(0.0..=100.0, f32::from(strength), |value| {
-                        ConfigureMessage::SetStartScreenHapticsStrength(value.round() as u8)
-                    })
-                    .step(5.0_f32),
-                ]
-                .spacing(4)
-                .width(Fill),
-            );
+            feedback.push(slider_row(
+                "Strength",
+                format!("{strength}%"),
+                slider(0.0..=100.0, f32::from(strength), |value| {
+                    ConfigureMessage::SetStartScreenHapticsStrength(value.round() as u8)
+                })
+                .step(5.0_f32)
+                .style(theme::slider),
+            ));
         }
+        groups = groups.push(group(Some("Feedback"), feedback));
     }
 
-    items = items.push(configure_section_rule());
-    items = items.push(
-        text(format!(
+    groups = groups.push(
+        container(note(format!(
             "Last-known compatible Steam version: {LAST_KNOWN_COMPATIBLE_STEAM_VERSION}"
-        ))
-        .size(12.0)
-        .color(theme::MUTED),
+        )))
+        .padding([0, 4]),
     );
 
-    items.into()
+    groups.into()
 }
 
 fn notifications_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
-    let toggle = |label: &'static str, value: bool, setting: NotificationSetting| {
-        checkbox(value)
-            .label(label)
-            .size(16.0)
-            .text_size(13.0)
-            .spacing(8)
-            .on_toggle(move |enabled| ConfigureMessage::SetNotification(setting, enabled))
-    };
+    let toggle =
+        |label: &'static str, helper: &'static str, value: bool, setting: NotificationSetting| {
+            toggle_row(label, Some(helper), value, move |enabled| {
+                ConfigureMessage::SetNotification(setting, enabled)
+            })
+        };
 
-    let mut items = column![
-        toggle(
-            "Connected",
-            settings.notify_connect,
-            NotificationSetting::Connect
-        ),
-        toggle(
-            "Disconnected",
-            settings.notify_disconnect,
-            NotificationSetting::Disconnect
-        ),
-        toggle("Low battery", settings.notify_low, NotificationSetting::Low),
-    ]
-    .spacing(8)
-    .width(Fill);
+    let connection = group(
+        Some("Connection"),
+        vec![
+            toggle(
+                "Connected",
+                "When a controller connects",
+                settings.notify_connect,
+                NotificationSetting::Connect,
+            ),
+            toggle(
+                "Disconnected",
+                "When a controller disconnects or turns off",
+                settings.notify_disconnect,
+                NotificationSetting::Disconnect,
+            ),
+        ],
+    );
 
+    let mut battery_rows = vec![toggle(
+        "Low battery",
+        "When a controller drops to your threshold",
+        settings.notify_low,
+        NotificationSetting::Low,
+    )];
     if settings.notify_low {
         let threshold = settings.low_battery_percent;
-        items = items.push(
-            column![
-                text(format!("At or below {threshold}%"))
-                    .size(12.0)
-                    .color(theme::MUTED),
-                slider(
-                    f32::from(LOW_BATTERY_PERCENT_MIN)..=f32::from(LOW_BATTERY_PERCENT_MAX),
-                    f32::from(threshold),
-                    |value| ConfigureMessage::SetLowBatteryPercent(value.round() as u8),
-                )
-                .step(10.0_f32),
-            ]
-            .spacing(4)
-            .width(Fill),
-        );
+        battery_rows.push(slider_row(
+            "Threshold",
+            format!("{threshold}% or below"),
+            slider(
+                f32::from(LOW_BATTERY_PERCENT_MIN)..=f32::from(LOW_BATTERY_PERCENT_MAX),
+                f32::from(threshold),
+                |value| ConfigureMessage::SetLowBatteryPercent(value.round() as u8),
+            )
+            .step(10.0_f32)
+            .style(theme::slider),
+        ));
     }
-
-    items = items.push(toggle(
+    battery_rows.push(toggle(
         "Finished charging",
+        "When a charging controller reaches full",
         settings.notify_charged,
         NotificationSetting::Charged,
     ));
 
-    items.into()
+    column![connection, group(Some("Battery"), battery_rows)]
+        .spacing(18)
+        .width(Fill)
+        .into()
 }
 
 fn analytics_view<'a>(
     settings: &ConfigureSettings,
     panel: &'a AnalyticsPanel,
 ) -> Element<'a, ConfigureMessage> {
-    let mut items = Column::new().spacing(10).width(Fill);
+    let mut items = Column::new().spacing(18).width(Fill);
 
-    items = items.push(
-        checkbox(settings.analytics_enabled)
-            .label("Record battery analytics")
-            .size(16.0)
-            .text_size(13.0)
-            .spacing(8)
-            .on_toggle(ConfigureMessage::SetAnalyticsEnabled),
-    );
-
-    items = items.push(
-        text("Local only. Full charge / full drain are estimated totals for a complete cycle. Remaining time on the tray uses your current (or last-known) percent. Mid-cycle unplug or charge does not wipe learned steps.")
-            .size(12.0)
-            .color(theme::DIM),
-    );
+    items = items.push(group(
+        None,
+        vec![
+            toggle_row(
+                "Record battery analytics",
+                Some("Learns how long your controllers charge and last"),
+                settings.analytics_enabled,
+                ConfigureMessage::SetAnalyticsEnabled,
+            ),
+            note("Local only. Full charge / full drain are estimated totals for a complete cycle. Remaining time on the tray uses your current (or last-known) percent. Mid-cycle unplug or charge does not wipe learned steps."),
+        ],
+    ));
 
     if settings.analytics_enabled {
         if panel.rows.is_empty() {
             items = items.push(
-                text("Learning… play or charge through a battery step to seed estimates.")
-                    .size(12.0)
-                    .color(theme::MUTED),
+                container(
+                    text("Learning… play or charge through a battery step to seed estimates.")
+                        .size(13.0)
+                        .color(theme::MUTED),
+                )
+                .padding([0, 4]),
             );
         } else {
             for row in &panel.rows {
@@ -1045,10 +1170,15 @@ fn analytics_pad_card<'a>(row: &'a AnalyticsPadRow) -> Element<'a, ConfigureMess
     let mut col = Column::new()
         .spacing(6)
         .width(Fill)
-        .push(text(&row.label).size(13.0).color(theme::INK))
+        .push(
+            text(&row.label)
+                .size(15.0)
+                .font(semibold())
+                .color(theme::INK),
+        )
         .push(
             text(format!("{charge} · {play}"))
-                .size(12.0)
+                .size(theme::type_scale::META)
                 .color(theme::MUTED),
         );
 
@@ -1061,6 +1191,7 @@ fn analytics_pad_card<'a>(row: &'a AnalyticsPadRow) -> Element<'a, ConfigureMess
     }
 
     col = col
+        .push(space().height(Length::Fixed(4.0)))
         .push(text("Play coverage").size(11.0).color(theme::DIM))
         .push(
             canvas_widget(CoverageChart {
@@ -1081,9 +1212,9 @@ fn analytics_pad_card<'a>(row: &'a AnalyticsPadRow) -> Element<'a, ConfigureMess
         );
 
     container(col)
-        .padding(8)
+        .padding(GROUP_PAD)
         .width(Fill)
-        .style(theme::surface)
+        .style(theme::glass(theme::radius::MD))
         .into()
 }
 
@@ -1101,11 +1232,11 @@ fn toast_position_view<'a>(
         button(
             row![
                 container(space())
-                    .width(Length::Fixed(2.0))
+                    .width(Length::Fixed(3.0))
                     .height(Fill)
                     .style(theme::position_rail(selected))
             ]
-            .padding([2, 0])
+            .padding([4, 4])
             .height(Fill),
         )
         .padding(0)
@@ -1127,7 +1258,7 @@ fn toast_position_view<'a>(
             .push(marker(right))
     };
 
-    container(
+    let stage: Element<'a, ConfigureMessage> = container(
         column![
             row_of(
                 ToastPosition::TopLeft,
@@ -1148,6 +1279,17 @@ fn toast_position_view<'a>(
     .width(Fill)
     .height(Length::Fixed(stage_height))
     .style(theme::position_stage)
+    .into();
+
+    column![
+        stage,
+        container(note(
+            "Click a spot to move toasts there. A preview toast shows the new position."
+        ))
+        .padding([0, 4]),
+    ]
+    .spacing(10)
+    .width(Fill)
     .into()
 }
 
@@ -1155,25 +1297,22 @@ fn lightbar_view<'a>(
     state: &'a ConfigureState,
     settings: &ConfigureSettings,
 ) -> Element<'a, ConfigureMessage> {
-    let mut content = Column::new().spacing(8).width(Fill);
+    let mut content = Column::new().spacing(18).width(Fill);
 
-    content = content.push(
-        checkbox(settings.lightbar_enabled)
-            .label("Enable lightbar")
-            .size(16.0)
-            .text_size(13.0)
-            .spacing(8)
-            .on_toggle(ConfigureMessage::SetLightbarEnabled),
-    );
-
+    let mut master = vec![toggle_row(
+        "Battery lightbar",
+        Some("Color the lightbar by charge level"),
+        settings.lightbar_enabled,
+        ConfigureMessage::SetLightbarEnabled,
+    )];
     if !settings.lightbar_enabled {
-        content = content.push(
-            text("Battery-driven lightbar colors and the low-battery pulse are paused. Identify still works.")
-                .size(12.0)
-                .color(theme::DIM),
-        );
+        master.push(note(
+            "Battery-driven lightbar colors and the low-battery pulse are paused. Identify still works.",
+        ));
+        content = content.push(group(None, master));
         return content.into();
     }
+    content = content.push(group(None, master));
 
     let bar = canvas_widget(SpectrumBar {
         stops: state.spectrum.stops.clone(),
@@ -1200,7 +1339,7 @@ fn lightbar_view<'a>(
                         .spacing(8)
                         .align_y(Alignment::Center),
                     )
-                    .padding([4, 6])
+                    .padding([6, 10])
                     .width(Fill)
                     .on_press(ConfigureMessage::SelectStop(index))
                     .style(theme::chip(selected)),
@@ -1222,21 +1361,26 @@ fn lightbar_view<'a>(
         .width(Fill)
         .height(Length::Fixed(HUE_HEIGHT));
 
-    let reset = button(text("Reset defaults").size(12.0).center().width(Fill))
-        .padding([6, 4])
-        .width(Fill)
-        .on_press(ConfigureMessage::ResetSpectrum)
-        .style(theme::chip(false));
-
-    content = content.push(container(bar).width(Fill).style(theme::well));
-    content = content.push(stops);
-    content = content.push(container(sv).width(Fill).style(theme::well));
-    content = content.push(container(hue).width(Fill).style(theme::well));
-    content = content.push(reset);
-
+    let mut gradient: Vec<Element<'a, ConfigureMessage>> = vec![
+        bar.into(),
+        note(
+            "Full charge on the right, empty on the left. Click the bar to add a stop; drag a stop off the bar or right-click it to remove.",
+        ),
+        stops.into(),
+    ];
     if let Some(error) = state.error.as_deref() {
-        content = content.push(text(error).size(12.0).color(theme::WARNING));
+        gradient.push(text(error).size(12.0).color(theme::WARNING).into());
     }
+    content = content.push(group(Some("Gradient"), gradient));
+
+    content = content.push(group(
+        Some("Selected stop color"),
+        vec![
+            sv.into(),
+            hue.into(),
+            action_button("Reset to defaults", ConfigureMessage::ResetSpectrum),
+        ],
+    ));
 
     content.into()
 }
@@ -1347,11 +1491,11 @@ fn developer_view<'a>() -> Element<'a, ConfigureMessage> {
 
 #[cfg(feature = "dev-emulate")]
 fn dev_preset_button<'a>(preset: Preset) -> Element<'a, ConfigureMessage> {
-    button(text(preset.menu_label()).size(12.0).width(Fill))
-        .padding([5, 8])
+    button(text(preset.menu_label()).size(13.0).width(Fill))
+        .padding([7, 10])
         .width(Fill)
         .on_press(ConfigureMessage::DeveloperPreset(preset))
-        .style(theme::row_button)
+        .style(theme::secondary)
         .into()
 }
 

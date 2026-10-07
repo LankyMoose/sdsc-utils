@@ -179,10 +179,7 @@ pub fn toast_theme() -> Theme {
 // Containers
 // ---------------------------------------------------------------------------
 
-/// Width of the [`framed`] outline on each side.
-pub const WINDOW_FRAME: f32 = 1.0;
-
-/// Opaque window face (inside the 1px [`framed`] outline).
+/// Opaque chrome fill (transition veils, fallback view).
 pub fn root(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(BASE_BG)),
@@ -191,25 +188,34 @@ pub fn root(_theme: &Theme) -> container::Style {
     }
 }
 
-/// Outer ring behind [`framed`] padding — actual window outline pixels.
-pub fn window_frame(_theme: &Theme) -> container::Style {
+/// Solid modal card shown over other content inside a window (manual add,
+/// replace confirm, compact Start settings). Opaque so text never fights the
+/// content behind it; same radius language as glass islands, soft drop shadow.
+pub fn modal_card(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(LINE)),
+        background: Some(Background::Color(darken(BASE_BG, 0.25))),
         text_color: Some(INK),
+        border: Border {
+            color: GLASS_HAIRLINE,
+            width: 1.0,
+            radius: radius::LG.into(),
+        },
+        shadow: iced::Shadow {
+            color: alpha(Color::BLACK, 0.45),
+            offset: iced::Vector::new(0.0, 8.0),
+            blur_radius: 24.0,
+        },
         ..container::Style::default()
     }
 }
 
-/// Wrap opaque window content in a 1px [`LINE`] outline.
-///
-/// Uses padding over a fill instead of `Border` on the root: iced hairlines at
-/// the HWND edge are easy to lose (and `BASE_BG` on a black desktop disappears).
+/// Wrap in-window modal content in a [`modal_card`]. Window roots use
+/// [`crate::ui::chrome::window`] instead.
 pub fn framed<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(container(content).width(Fill).height(Fill).style(root))
-        .padding(WINDOW_FRAME)
+    container(content)
         .width(Fill)
         .height(Fill)
-        .style(window_frame)
+        .style(modal_card)
         .into()
 }
 
@@ -373,11 +379,11 @@ pub fn well(_theme: &Theme) -> container::Style {
 /// Dark 16:9 “monitor” backdrop for the toast-position diagram.
 pub fn position_stage(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(CONTENT)),
+        background: Some(Background::Color(darken(BASE_BG, 0.30))),
         border: Border {
-            color: LINE,
+            color: GLASS_HAIRLINE,
             width: 1.0,
-            radius: RADIUS.into(),
+            radius: radius::MD.into(),
         },
         ..container::Style::default()
     }
@@ -386,9 +392,9 @@ pub fn position_stage(_theme: &Theme) -> container::Style {
 /// Left accent rail inside a selected position marker.
 pub fn position_rail(selected: bool) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
-        background: selected.then_some(Background::Color(INK)),
+        background: selected.then_some(Background::Color(ACCENT)),
         border: Border {
-            radius: 1.0.into(),
+            radius: 1.5.into(),
             ..Border::default()
         },
         ..container::Style::default()
@@ -441,9 +447,9 @@ pub fn swatch(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
         background: Some(Background::Color(color)),
         border: Border {
-            color: LINE,
+            color: GLASS_HAIRLINE,
             width: 1.0,
-            radius: RADIUS_SM.into(),
+            radius: 3.0.into(),
         },
         ..container::Style::default()
     }
@@ -494,12 +500,13 @@ fn button_base(background: Option<Color>, text_color: Color, radius: f32) -> but
 }
 
 /// Transparent button that only lights up on hover. Used for icon actions.
+/// Ink washes (not opaque panels) so it reads on glass and chrome alike.
 pub fn ghost(_theme: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Active => button_base(None, MUTED, RADIUS_SM),
-        button::Status::Hovered => button_base(Some(PANEL_HOVER), INK, RADIUS_SM),
-        button::Status::Pressed => button_base(Some(LINE), INK, RADIUS_SM),
-        button::Status::Disabled => button_base(None, DIM, RADIUS_SM),
+        button::Status::Active => button_base(None, MUTED, radius::SM),
+        button::Status::Hovered => button_base(Some(alpha(INK, 0.08)), INK, radius::SM),
+        button::Status::Pressed => button_base(Some(alpha(INK, 0.14)), INK, radius::SM),
+        button::Status::Disabled => button_base(None, DIM, radius::SM),
     }
 }
 
@@ -519,6 +526,35 @@ pub fn tab(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     }
 }
 
+/// Sidebar nav item: neutral wash when selected/hovered, bold handled by caller.
+pub fn nav_item(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let (fill, ink) = match (selected, status) {
+            (true, button::Status::Disabled) => (Some(alpha(INK, 0.04)), DIM),
+            (true, _) => (Some(alpha(INK, 0.07)), INK),
+            (false, button::Status::Hovered) | (false, button::Status::Pressed) => {
+                (Some(alpha(INK, 0.05)), INK)
+            }
+            (false, button::Status::Disabled) => (None, DIM),
+            (false, button::Status::Active) => (None, MUTED),
+        };
+        button_base(fill, ink, radius::SM)
+    }
+}
+
+/// Accent marker rail beside the selected sidebar nav item.
+pub fn nav_marker(selected: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| container::Style {
+        background: selected.then_some(Background::Color(ACCENT)),
+        text_color: Some(INK),
+        border: Border {
+            radius: 1.5.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Selectable chip used by stop rows and similar compact toggles.
 pub fn chip(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_theme, status| {
@@ -526,18 +562,18 @@ pub fn chip(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style 
             (true, button::Status::Disabled) => (alpha(ACCENT, 0.12), DIM, alpha(ACCENT, 0.35)),
             (true, _) => (alpha(ACCENT, 0.28), INK, ACCENT),
             (false, button::Status::Hovered) | (false, button::Status::Pressed) => {
-                (PANEL_HOVER, INK, LINE)
+                (alpha(INK, 0.09), INK, alpha(INK, 0.2))
             }
-            (false, button::Status::Disabled) => (BASE_BG, DIM, alpha(LINE, 0.55)),
-            (false, button::Status::Active) => (PANEL, MUTED, LINE),
+            (false, button::Status::Disabled) => (alpha(INK, 0.03), DIM, alpha(LINE, 0.55)),
+            (false, button::Status::Active) => (alpha(INK, 0.05), MUTED, GLASS_HAIRLINE),
         };
         button::Style {
             border: Border {
                 color: border,
                 width: 1.0,
-                radius: 0.0.into(),
+                radius: radius::SM.into(),
             },
-            ..button_base(Some(fill), ink, 0.0)
+            ..button_base(Some(fill), ink, radius::SM)
         }
     }
 }
@@ -615,9 +651,9 @@ pub fn position_marker(
         let (fill, border) = match (selected, status) {
             (true, _) => (accent, INK),
             (false, button::Status::Hovered) | (false, button::Status::Pressed) => {
-                (PANEL_HOVER, LINE)
+                (alpha(INK, 0.10), alpha(INK, 0.25))
             }
-            (false, _) => (PANEL, LINE),
+            (false, _) => (alpha(INK, 0.06), GLASS_HAIRLINE),
         };
         button::Style {
             background: Some(Background::Color(fill)),
@@ -625,7 +661,7 @@ pub fn position_marker(
             border: Border {
                 color: border,
                 width: 1.0,
-                radius: 0.0.into(),
+                radius: 6.0.into(),
             },
             ..button::Style::default()
         }
@@ -639,6 +675,26 @@ pub fn primary(_theme: &Theme, status: button::Status) -> button::Style {
         button::Status::Hovered => button_base(Some(alpha(ACCENT, 0.85)), INK, RADIUS_SM),
         button::Status::Pressed => button_base(Some(alpha(ACCENT, 0.70)), INK, RADIUS_SM),
         button::Status::Disabled => button_base(Some(LINE), DIM, RADIUS_SM),
+    }
+}
+
+/// Secondary action: neutral fill with a glass hairline.
+pub fn secondary(_theme: &Theme, status: button::Status) -> button::Style {
+    let (fill, ink, edge) = match status {
+        button::Status::Active => (alpha(INK, 0.06), INK, GLASS_HAIRLINE),
+        button::Status::Hovered => (alpha(INK, 0.10), INK, alpha(INK, 0.22)),
+        button::Status::Pressed => (alpha(INK, 0.16), INK, alpha(INK, 0.30)),
+        button::Status::Disabled => (alpha(INK, 0.03), DIM, alpha(LINE, 0.4)),
+    };
+    button::Style {
+        background: Some(Background::Color(fill)),
+        text_color: ink,
+        border: Border {
+            color: edge,
+            width: 1.0,
+            radius: radius::SM.into(),
+        },
+        ..button::Style::default()
     }
 }
 
@@ -884,11 +940,11 @@ pub fn input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
         text_input::Status::Active | text_input::Status::Disabled => LINE,
     };
     text_input::Style {
-        background: Background::Color(BASE_BG),
+        background: Background::Color(alpha(INK, 0.06)),
         border: Border {
             color: border_color,
             width: 1.0,
-            radius: RADIUS_SM.into(),
+            radius: radius::SM.into(),
         },
         icon: MUTED,
         placeholder: DIM,

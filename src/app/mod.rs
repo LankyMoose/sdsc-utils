@@ -393,6 +393,7 @@ fn run_app(
         .subscription(App::subscription)
         .title(App::title)
         .theme(App::theme)
+        .style(App::style)
         .antialiasing(true)
         .run()?;
 
@@ -406,6 +407,7 @@ fn run_app_as_client() -> Result<(), Box<dyn std::error::Error>> {
         .subscription(App::subscription)
         .title(App::title)
         .theme(App::theme)
+        .style(App::style)
         .antialiasing(true)
         .run()?;
     Ok(())
@@ -612,6 +614,21 @@ impl App {
         }
     }
 
+    /// Clear color per frame. Transparent windows (alpha-capable backend) must
+    /// clear to transparent so self-drawn rounded corners show the desktop;
+    /// every window paints its own full backdrop on top.
+    fn style(&self, theme: &Theme) -> iced::theme::Style {
+        let palette = theme.palette();
+        iced::theme::Style {
+            background_color: if crate::ui::chrome::transparent_windows() {
+                iced::Color::TRANSPARENT
+            } else {
+                palette.background
+            },
+            text_color: palette.text,
+        }
+    }
+
     fn theme(&self, window: window::Id) -> Theme {
         if Some(window) == self.toast_window {
             theme::toast_theme()
@@ -713,7 +730,10 @@ impl App {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::ToastFrame));
         }
 
-        if self.popup_state.identify_flash_active() || self.start_state.identify_flash_active() {
+        if self.popup_state.identify_flash_active()
+            || self.start_state.identify_flash_active()
+            || (self.popup_window.is_some() && self.popup_state.entrance_active(Instant::now()))
+        {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::IdentifyFrame));
         }
 
@@ -1723,6 +1743,7 @@ impl App {
             size: Size::new(popup_view::WIDTH, height),
             position: window::Position::Default,
             visible: false,
+            transparent: crate::ui::chrome::transparent_windows(),
             resizable: false,
             decorations: false,
             level: window::Level::AlwaysOnTop,
@@ -1736,7 +1757,8 @@ impl App {
             .chain(self.sync_toast_zorder())
     }
 
-    fn reveal_popup(&self, id: window::Id) -> Task<Message> {
+    fn reveal_popup(&mut self, id: window::Id) -> Task<Message> {
+        self.popup_state.begin_entrance(Instant::now());
         let height = self.popup_window_height();
         let size = Size::new(popup_view::WIDTH, height);
         let position = popup_position(self.tray_anchor, self.popup_scale, self.popup_monitor, size);
@@ -1894,6 +1916,7 @@ impl App {
             size: Size::new(configure_view::WIDTH, configure_view::HEIGHT),
             position: window::Position::Centered,
             visible: open_visible(),
+            transparent: crate::ui::chrome::transparent_windows(),
             resizable: false,
             decorations: false,
             // AlwaysOnTop like Start: a Normal Settings window loses presents to the
@@ -3270,6 +3293,7 @@ impl App {
             size,
             position,
             visible: open_visible(),
+            transparent: crate::ui::chrome::transparent_windows(),
             resizable: false,
             decorations: false,
             level: window::Level::AlwaysOnTop,

@@ -565,7 +565,7 @@ pub fn overlay_platform_specific() -> window::settings::PlatformSpecific {
         drag_and_drop: false,
         skip_taskbar: true,
         undecorated_shadow: false,
-        corner_preference: window::settings::platform::CornerPreference::DoNotRound,
+        corner_preference: crate::ui::chrome::corner_preference(),
     }
 }
 
@@ -582,7 +582,7 @@ pub fn window_platform_specific() -> window::settings::PlatformSpecific {
         // Match the popup: DWM undecorated shadows flash white on close when the
         // wgpu surface is destroyed before the HWND is gone.
         undecorated_shadow: false,
-        corner_preference: window::settings::platform::CornerPreference::DoNotRound,
+        corner_preference: crate::ui::chrome::corner_preference(),
     }
 }
 

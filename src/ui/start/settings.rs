@@ -486,13 +486,13 @@ pub fn focus_row_bounds(
         let mut panel_h = MENU_PANEL_PAD * 2.0;
         for i in 0..AUTO_OPEN_MODES.len() {
             if i > 0 {
-                panel_h += theme::LIST_SEPARATOR_GAP;
+                panel_h += 1.0;
             }
             panel_h += menu_option_h(ty.body);
         }
         gap(panel_h);
     }
-    gap(section_rule_h());
+    gap(8.0);
     gap(ty.section); // Immersive
     if target == SettingsRow::AlwaysImmersive {
         return Some((gap(toggle_row_h(ty.toggle)), toggle_row_h(ty.toggle)));
@@ -514,7 +514,7 @@ pub fn focus_row_bounds(
         return Some((gap(slider_row_h(ty.helper)), slider_row_h(ty.helper)));
     }
     gap(slider_row_h(ty.helper));
-    gap(section_rule_h());
+    gap(8.0);
     gap(ty.section); // Feedback
     if target == SettingsRow::Sounds {
         return Some((gap(toggle_row_h(ty.toggle)), toggle_row_h(ty.toggle)));
@@ -559,10 +559,6 @@ fn slider_row_h(label: f32) -> f32 {
     ROW_PAD * 2.0 + label + 4.0 + 26.0
 }
 
-fn section_rule_h() -> f32 {
-    1.0 + 16.0
-}
-
 pub fn panel_view<'a>(
     state: &'a State,
     snapshot: &StartSettingsSnapshot,
@@ -580,10 +576,6 @@ pub fn panel_view<'a>(
                 ..Font::DEFAULT
             })
             .color(theme::INK),
-        container(space())
-            .width(Fill)
-            .height(Length::Fixed(1.0))
-            .style(theme::configure_header_rule),
     ]
     .spacing(10)
     .width(Fill);
@@ -601,7 +593,7 @@ pub fn panel_view<'a>(
         let mut options = column![].spacing(0).width(Fill);
         for (i, mode) in AUTO_OPEN_MODES.iter().enumerate() {
             if i > 0 {
-                options = options.push(theme::list_separator());
+                // Spacing separates options; no rule.
             }
             options = options.push(auto_open_option_row(
                 *mode,
@@ -614,11 +606,11 @@ pub fn panel_view<'a>(
             container(options)
                 .padding(MENU_PANEL_PAD)
                 .width(Fill)
-                .style(theme::panel),
+                .style(theme::modal_card),
         );
     }
 
-    items = items.push(section_rule());
+    items = items.push(space_gap());
     items = items.push(section_label("Immersive", ty.section));
     items = items.push(toggle_row(
         "Always immersive",
@@ -687,7 +679,7 @@ pub fn panel_view<'a>(
         |value| StartMessage::SetInactiveDimPercent(value.round() as u8),
     ));
 
-    items = items.push(section_rule());
+    items = items.push(space_gap());
     items = items.push(section_label("Feedback", ty.section));
     items = items.push(toggle_row(
         "UI sounds",
@@ -813,6 +805,10 @@ fn stack_scrim<'a>(
     stack(layers).width(Fill).height(Fill).into()
 }
 
+fn space_gap() -> Element<'static, StartMessage> {
+    space().height(Length::Fixed(8.0)).width(Fill).into()
+}
+
 fn section_label(label: &'static str, size: f32) -> Element<'static, StartMessage> {
     text(label)
         .size(size)
@@ -822,23 +818,6 @@ fn section_label(label: &'static str, size: f32) -> Element<'static, StartMessag
         })
         .color(theme::MUTED)
         .into()
-}
-
-fn section_rule() -> Element<'static, StartMessage> {
-    container(
-        container(space())
-            .width(Fill)
-            .height(Length::Fixed(1.0))
-            .style(theme::configure_header_rule),
-    )
-    .padding(Padding {
-        top: 8.0,
-        right: 0.0,
-        bottom: 8.0,
-        left: 0.0,
-    })
-    .width(Fill)
-    .into()
 }
 
 fn focus_style(focused: bool) -> impl Fn(&iced::Theme) -> container::Style {
@@ -869,7 +848,10 @@ fn toggle_row(
     container(
         row![
             text(label).size(ty.body).color(theme::INK).width(Fill),
-            toggler(checked).size(ty.toggle).on_toggle(message),
+            toggler(checked)
+                .size(ty.toggle)
+                .on_toggle(message)
+                .style(theme::toggle),
         ]
         .spacing(12)
         .align_y(Alignment::Center),
@@ -975,7 +957,9 @@ fn slider_row(
     container(
         column![
             text(label).size(ty.helper).color(theme::MUTED),
-            slider(range, value, on_change).step(step),
+            slider(range, value, on_change)
+                .step(step)
+                .style(theme::slider),
         ]
         .spacing(4)
         .width(Fill),

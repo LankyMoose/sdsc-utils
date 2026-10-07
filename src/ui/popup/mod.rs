@@ -6,12 +6,12 @@ use crate::controller::model::ControllerStatus;
 use crate::ui::color::BatterySpectrum;
 use crate::ui::percent_ring::{self, POPUP_SIZE};
 use crate::ui::svg_icon;
-use crate::ui::theme;
+use crate::ui::{chrome, motion, theme};
+use iced::font::Weight;
 use iced::widget::{
-    Column, button, checkbox, column, container, row, scrollable, space, svg, text, text_input,
-    tooltip,
+    Column, button, column, container, row, scrollable, space, svg, text, text_input, tooltip,
 };
-use iced::{Alignment, Color, Element, Fill, Length, Shrink};
+use iced::{Alignment, Background, Border, Color, Element, Fill, Font, Length, Shrink, Theme};
 use std::time::{Duration, Instant};
 
 /// Logical width of the popup window.
@@ -21,18 +21,24 @@ const MAX_HEIGHT_FRACTION: f32 = 0.5;
 /// Fallback monitor height when iced has not reported one yet.
 const FALLBACK_MONITOR_HEIGHT: f32 = 1080.0;
 
-const HEADER_HEIGHT: f32 = 38.0;
+/// Window inset; row cards nest at `window radius − PADDING` (concentric).
+const PADDING: f32 = 8.0;
+const HEADER_HEIGHT: f32 = 44.0;
 const ROW_HEIGHT: f32 = 88.0;
-const ROW_SPACING: f32 = theme::LIST_SEPARATOR_GAP;
-const PADDING: f32 = 10.0;
-/// Gap between the title underline and the list (matches Start’s chrome rhythm).
-const HEADER_BODY_GAP: f32 = 8.0;
+/// Gap between row cards (spacing does the separating — no rules).
+const ROW_SPACING: f32 = 6.0;
+/// Gap between the header and the first card.
+const HEADER_BODY_GAP: f32 = 2.0;
 /// Gap between list content and the embedded scrollbar.
-const SCROLL_GAP: f32 = 8.0;
-const EMPTY_HEIGHT: f32 = 56.0;
-const ICON_SIZE: f32 = 18.0;
+const SCROLL_GAP: f32 = 6.0;
+const EMPTY_HEIGHT: f32 = 132.0;
+const ICON_SIZE: f32 = 17.0;
 const NICKNAME_MAX_CHARS: usize = 32;
 const TOOLTIP_DELAY: Duration = Duration::from_millis(350);
+/// Delay between successive rows starting their entrance fade.
+const ENTRANCE_STAGGER_MS: u64 = 45;
+/// Rows that animate in; later rows (off-screen in a scroll) appear with the last.
+const ENTRANCE_MAX_STAGGERED: usize = 6;
 
 /// Widget id of the nickname editor, so the daemon can focus it on demand.
 pub fn nickname_input_id() -> iced::widget::Id {
@@ -146,9 +152,33 @@ pub struct State {
     pub draft: String,
     /// Ring flash started with the last successful Identify.
     identify_flash: Option<IdentifyFlash>,
+    /// When the popup was revealed (drives the staggered row entrance).
+    revealed_at: Option<Instant>,
 }
 
 impl State {
+    /// Start the staggered row entrance (call when the window becomes visible).
+    pub fn begin_entrance(&mut self, now: Instant) {
+        self.revealed_at = Some(now);
+    }
+
+    /// True while rows are still fading in (keep the frame tick alive).
+    pub fn entrance_active(&self, now: Instant) -> bool {
+        self.revealed_at.is_some_and(|at| {
+            let total = entrance_total_ms();
+            (now.saturating_duration_since(at).as_millis() as u64) < total
+        })
+    }
+
+    /// Entrance opacity 0..=1 for row `index` at `now` (1 when no entrance).
+    fn row_appear(&self, index: usize, now: Instant) -> f32 {
+        let Some(at) = self.revealed_at else {
+            return 1.0;
+        };
+        let elapsed = now.saturating_duration_since(at).as_millis() as u64;
+        entrance_appear(index, elapsed)
+    }
+
     pub fn begin_edit(&mut self, serial: &str, current: Option<&str>) {
         self.editing_serial = Some(serial.to_string());
         self.draft = current.unwrap_or_default().to_string();
@@ -158,6 +188,7 @@ impl State {
         self.editing_serial = None;
         self.draft.clear();
         self.identify_flash = None;
+        self.revealed_at = None;
     }
 
     /// Start the UI ring flash that mirrors the lightbar Identify pattern.
@@ -221,9 +252,23 @@ pub enum PopupMessage {
     CancelEdit,
 }
 
-/// Non-list chrome: frame + padding + header + underline + gap before the list.
+/// Total entrance length: last staggered row's delay + one fade.
+fn entrance_total_ms() -> u64 {
+    (ENTRANCE_MAX_STAGGERED as u64 - 1) * ENTRANCE_STAGGER_MS + motion::BASE_MS
+}
+
+/// Ease-out fade for row `index`, `elapsed_ms` after reveal.
+fn entrance_appear(index: usize, elapsed_ms: u64) -> f32 {
+    let delay = index.min(ENTRANCE_MAX_STAGGERED - 1) as u64 * ENTRANCE_STAGGER_MS;
+    motion::ease_out_cubic(motion::progress_linear(
+        elapsed_ms.saturating_sub(delay),
+        motion::BASE_MS,
+    ))
+}
+
+/// Non-list chrome: padding + header + gap before the list.
 fn chrome_height() -> f32 {
-    theme::WINDOW_FRAME * 2.0 + PADDING * 2.0 + HEADER_HEIGHT + 1.0 + HEADER_BODY_GAP
+    PADDING * 2.0 + HEADER_HEIGHT + HEADER_BODY_GAP
 }
 
 fn list_content_height(rows: usize) -> f32 {
@@ -245,14 +290,42 @@ pub fn window_height(rows: usize, monitor_height: Option<f32>) -> f32 {
     natural.min(max_h)
 }
 
+/// Row card corner radius: concentric with the window corner.
+fn card_radius() -> f32 {
+    (chrome::window_radius() - PADDING).max(theme::radius::SM)
+}
+
+/// Scale `color`'s alpha by the entrance `appear` factor.
+fn fade(color: Color, appear: f32) -> Color {
+    theme::alpha(color, color.a * appear.clamp(0.0, 1.0))
+}
+
 pub fn view<'a>(
     state: &'a State,
     rows: &'a [ControllerRow],
     spectrum: &BatterySpectrum,
     powering_off: Option<&str>,
 ) -> Element<'a, PopupMessage> {
+    let now = Instant::now();
+    let connected = rows.iter().filter(|r| r.connected).count();
+    let subtitle = match (rows.len(), connected) {
+        (0, _) => String::new(),
+        (_, 0) => "none connected".to_string(),
+        (_, n) => format!("{n} connected"),
+    };
+
     let header = row![
-        text("Controllers").size(14.0).color(theme::INK).width(Fill),
+        text("Controllers")
+            .size(theme::type_scale::TITLE)
+            .font(Font {
+                weight: Weight::Semibold,
+                ..Font::DEFAULT
+            })
+            .color(theme::INK),
+        text(subtitle)
+            .size(theme::type_scale::META)
+            .color(theme::DIM),
+        space().width(Fill),
         icon_button(
             svg_icon::SETTINGS_SVG,
             theme::MUTED,
@@ -261,60 +334,40 @@ pub fn view<'a>(
         ),
     ]
     .align_y(Alignment::Center)
-    .spacing(6)
-    .padding([0, 2])
+    .spacing(10)
+    .padding([0, 6])
     .height(Length::Fixed(HEADER_HEIGHT));
 
     let body: Element<'_, PopupMessage> = if rows.is_empty() {
-        container(
-            text("No DualSense controllers connected")
-                .size(13.0)
-                .color(theme::DIM),
-        )
-        .center_x(Fill)
-        .center_y(Length::Fixed(EMPTY_HEIGHT))
-        .into()
+        empty_state(state.row_appear(0, now))
     } else {
         let list = rows
             .iter()
             .enumerate()
-            .fold(Column::new().spacing(0), |list, (index, entry)| {
-                let list = if index > 0 {
-                    list.push(theme::list_separator())
-                } else {
-                    list
-                };
-                list.push(controller_row(
-                    state,
-                    entry,
-                    spectrum,
-                    powering_off.is_some_and(|s| s == entry.serial),
-                ))
-            })
+            .fold(
+                Column::new().spacing(ROW_SPACING),
+                |list, (index, entry)| {
+                    list.push(controller_row(
+                        state,
+                        entry,
+                        spectrum,
+                        powering_off.is_some_and(|s| s == entry.serial),
+                        state.row_appear(index, now),
+                    ))
+                },
+            )
             .width(Fill);
 
-        // Embed scrollbar with a gutter so row actions are not flush to the thumb.
-        // Outer column padding keeps the bar off the window frame.
         scrollable(list)
             .spacing(SCROLL_GAP)
+            .style(theme::scrollbar)
             .height(Fill)
             .width(Fill)
             .into()
     };
 
-    // Match Start: 1px LINE frame, title, underline, then content.
-    let chrome = column![
-        header,
-        container(space())
-            .width(Fill)
-            .height(Length::Fixed(1.0))
-            .style(theme::configure_header_rule),
-    ]
-    .spacing(0)
-    .width(Fill);
-
-    theme::framed(
-        column![chrome, body]
+    chrome::window(
+        column![header, body]
             .spacing(HEADER_BODY_GAP)
             .padding(PADDING)
             .width(Fill)
@@ -322,23 +375,66 @@ pub fn view<'a>(
     )
 }
 
+fn empty_state<'a>(appear: f32) -> Element<'a, PopupMessage> {
+    let icon = svg(svg::Handle::from_memory(svg_icon::DUALSENSE_SVG.as_bytes()))
+        .width(Length::Fixed(44.0))
+        .height(Length::Fixed(44.0))
+        .style(move |_theme, _status| svg::Style {
+            color: Some(fade(theme::DIM, appear)),
+        });
+    container(
+        column![
+            icon,
+            text("No controllers yet")
+                .size(theme::type_scale::BODY)
+                .color(fade(theme::MUTED, appear)),
+            text("Turn on a DualSense or plug it in with USB.")
+                .size(12.0)
+                .color(fade(theme::DIM, appear)),
+        ]
+        .spacing(6)
+        .align_x(Alignment::Center),
+    )
+    .center_x(Fill)
+    .center_y(Length::Fixed(EMPTY_HEIGHT))
+    .style(card_style(appear))
+    .into()
+}
+
+/// Glass row card, faded by the entrance `appear` factor.
+fn card_style(appear: f32) -> impl Fn(&Theme) -> container::Style {
+    let radius = card_radius();
+    move |_theme| container::Style {
+        background: Some(Background::Color(fade(theme::GLASS_FILL, appear))),
+        text_color: Some(theme::INK),
+        border: Border {
+            color: fade(theme::GLASS_HAIRLINE, appear),
+            width: 1.0,
+            radius: radius.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 fn controller_row<'a>(
     state: &'a State,
     entry: &'a ControllerRow,
     spectrum: &BatterySpectrum,
     powering_off: bool,
+    appear: f32,
 ) -> Element<'a, PopupMessage> {
+    let live = entry.connected && !powering_off;
     let accent = theme::from_rgb(spectrum.color_at_percent(entry.percent));
     let ring_color = if state.ring_flash_white(&entry.serial) {
         theme::from_rgb(lightbar::IDENTIFY_FLASH)
-    } else if entry.connected && !powering_off {
+    } else if live {
         accent
     } else {
         theme::DIM
     };
     let ring = percent_ring::percent_ring(
         entry.percent,
-        ring_color,
+        fade(ring_color, appear),
         POPUP_SIZE,
         entry.eta.clone(),
         1.0,
@@ -351,115 +447,135 @@ fn controller_row<'a>(
                 PopupMessage::DraftChanged(value.chars().take(NICKNAME_MAX_CHARS).collect())
             })
             .on_submit(PopupMessage::CommitNickname)
-            .size(13.0)
-            .padding([2, 6])
+            .size(14.0)
+            .padding([4, 8])
             .width(Fill)
             .style(theme::input)
             .into()
     } else {
         text(entry.display_name())
-            .size(14.0)
-            .color(if entry.connected && !powering_off {
-                theme::INK
-            } else {
-                theme::MUTED
+            .size(16.0)
+            .font(Font {
+                weight: if live {
+                    Weight::Semibold
+                } else {
+                    Weight::Normal
+                },
+                ..Font::DEFAULT
             })
+            .color(fade(if live { theme::INK } else { theme::MUTED }, appear))
             .width(Fill)
             .into()
     };
 
-    let mut actions = row![].spacing(2).align_y(Alignment::Center);
-    if state.is_editing(&entry.serial) {
-        actions = actions.push(icon_button(
-            svg_icon::CHECK_SVG,
-            theme::SUCCESS,
-            "Save nickname",
-            PopupMessage::CommitNickname,
-        ));
-        actions = actions.push(icon_button(
-            svg_icon::CLOSE_SVG,
-            theme::MUTED,
-            "Cancel",
-            PopupMessage::CancelEdit,
-        ));
-    } else {
-        if entry.show_edit() {
-            actions = actions.push(icon_button(
-                svg_icon::EDIT_SVG,
-                theme::MUTED,
-                "Edit nickname",
-                PopupMessage::BeginEdit(entry.serial.clone()),
-            ));
-        }
-        // A pad on its way out offers no actions (Identify and Power off are
-        // both dead ends).
-        if !powering_off {
-            if entry.show_identify() {
-                actions = actions.push(icon_button(
-                    svg_icon::IDENTIFY_SVG,
-                    theme::MUTED,
-                    "Identify",
-                    PopupMessage::Identify(entry.serial.clone()),
-                ));
-            }
-            if entry.show_power_off() {
-                actions = actions.push(icon_button(
-                    svg_icon::POWER_SVG,
-                    theme::MUTED,
-                    "Power off",
-                    PopupMessage::PowerOff(entry.serial.clone()),
-                ));
-            }
-        }
-    }
+    let actions = row_actions(state, entry, powering_off);
 
-    let meta = if powering_off {
-        text("Powering off")
-            .size(12.0)
-            .color(theme::MUTED)
-            .width(Fill)
+    let (meta_text, meta_color) = if powering_off {
+        ("Powering off".to_string(), theme::MUTED)
     } else {
-        text(format!("{} · {}", entry.connection, entry.state))
-            .size(12.0)
-            .color(if entry.low {
+        (
+            format!("{} · {}", entry.connection, entry.state),
+            if entry.low {
                 theme::WARNING
             } else {
                 theme::DIM
-            })
-            .width(Fill)
+            },
+        )
     };
-
-    let remember: Element<'_, PopupMessage> = if entry.remember_enabled {
-        let serial = entry.serial.clone();
-        checkbox(entry.remembered)
-            .label("Remember")
-            .size(14.0)
-            .text_size(12.0)
-            .spacing(5)
-            .on_toggle(move |_| PopupMessage::ToggleRemember(serial.clone()))
-            .into()
-    } else {
-        space().into()
-    };
+    let meta = text(meta_text)
+        .size(theme::type_scale::META)
+        .color(fade(meta_color, appear))
+        .width(Fill);
 
     let details = column![
         row![name, actions].spacing(6).align_y(Alignment::Center),
-        row![meta, remember].spacing(6).align_y(Alignment::Center),
+        meta
     ]
-    .spacing(5)
+    .spacing(4)
     .width(Fill);
 
     container(
         row![ring, details]
-            .spacing(10)
+            .spacing(14)
             .align_y(Alignment::Center)
             .width(Fill),
     )
     .padding([8, 10])
     .width(Fill)
     .height(Length::Fixed(ROW_HEIGHT))
-    .style(theme::popup_row)
+    .style(card_style(appear))
     .into()
+}
+
+/// Trailing icon actions: pin (remember), edit, identify, power off — or
+/// save / cancel while editing the nickname.
+fn row_actions<'a>(
+    state: &State,
+    entry: &'a ControllerRow,
+    powering_off: bool,
+) -> Element<'a, PopupMessage> {
+    let mut actions = row![].spacing(0).align_y(Alignment::Center);
+    if state.is_editing(&entry.serial) {
+        return actions
+            .push(icon_button(
+                svg_icon::CHECK_SVG,
+                theme::SUCCESS,
+                "Save nickname",
+                PopupMessage::CommitNickname,
+            ))
+            .push(icon_button(
+                svg_icon::CLOSE_SVG,
+                theme::MUTED,
+                "Cancel",
+                PopupMessage::CancelEdit,
+            ))
+            .into();
+    }
+    if entry.remember_enabled {
+        actions = actions.push(icon_button(
+            svg_icon::PIN_SVG,
+            if entry.remembered {
+                theme::ACCENT
+            } else {
+                theme::alpha(theme::MUTED, 0.55)
+            },
+            if entry.remembered {
+                "Remembered: stays listed when disconnected"
+            } else {
+                "Remember this controller"
+            },
+            PopupMessage::ToggleRemember(entry.serial.clone()),
+        ));
+    }
+    if entry.show_edit() {
+        actions = actions.push(icon_button(
+            svg_icon::EDIT_SVG,
+            theme::MUTED,
+            "Edit nickname",
+            PopupMessage::BeginEdit(entry.serial.clone()),
+        ));
+    }
+    // A pad on its way out offers no actions (Identify and Power off are
+    // both dead ends).
+    if !powering_off {
+        if entry.show_identify() {
+            actions = actions.push(icon_button(
+                svg_icon::IDENTIFY_SVG,
+                theme::MUTED,
+                "Identify",
+                PopupMessage::Identify(entry.serial.clone()),
+            ));
+        }
+        if entry.show_power_off() {
+            actions = actions.push(icon_button(
+                svg_icon::POWER_SVG,
+                theme::MUTED,
+                "Power off",
+                PopupMessage::PowerOff(entry.serial.clone()),
+            ));
+        }
+    }
+    actions.into()
 }
 
 fn icon_button<'a>(
@@ -474,7 +590,7 @@ fn icon_button<'a>(
             .height(Length::Fixed(ICON_SIZE))
             .style(move |_theme, _status| svg::Style { color: Some(color) }),
     )
-    .padding(4)
+    .padding(6)
     .width(Shrink)
     .height(Shrink)
     .on_press(message)
@@ -490,4 +606,28 @@ fn icon_button<'a>(
     .delay(TOOLTIP_DELAY)
     .style(theme::tooltip)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entrance_staggers_then_settles() {
+        assert_eq!(entrance_appear(0, 0), 0.0);
+        assert!(entrance_appear(0, 100) > entrance_appear(1, 100));
+        let total = entrance_total_ms();
+        for index in 0..10 {
+            assert_eq!(entrance_appear(index, total), 1.0);
+        }
+    }
+
+    #[test]
+    fn window_height_fits_rows_and_caps() {
+        let one = window_height(1, Some(1080.0));
+        let two = window_height(2, Some(1080.0));
+        assert!((two - one - (ROW_HEIGHT + ROW_SPACING)).abs() < 0.01);
+        assert!(window_height(50, Some(1080.0)) <= 540.0);
+        assert!(window_height(0, None) > chrome_height());
+    }
 }
