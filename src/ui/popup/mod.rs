@@ -351,7 +351,7 @@ pub fn view<'a>(
                         state,
                         entry,
                         spectrum,
-                        powering_off.is_some_and(|s| s == entry.serial),
+                        entry.connected && powering_off.is_some_and(|s| s == entry.serial),
                         state.row_appear(index, now),
                     ))
                 },

@@ -62,7 +62,7 @@ const FACE_GLYPH_SIZE: f32 = 18.0;
 const PRESSED_SCALE: f32 = 1.1;
 /// Pressed grow and armed-color transitions.
 const HINT_ANIM: Duration = Duration::from_millis(crate::ui::motion::FAST_MS);
-const ROW_GAP: f32 = 11.0;
+const ROW_GAP: f32 = 8.0;
 const ROW_ACTION_SPACING: f32 = 14.0;
 /// Body width inside outer padding — dual-pane strip unit.
 const PANE_W: f32 = WIDTH - 2.0 * PADDING;
@@ -3581,7 +3581,7 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
             .into();
     }
     let items = state.rows.iter().enumerate().fold(
-        column![].spacing(8).width(Fill),
+        column![].spacing(ROW_GAP).width(Fill),
         |col, (index, row)| {
             let selected = index == state.game_selected;
             let running = !state.editing
@@ -3631,13 +3631,14 @@ fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element
         .into();
     }
     let items = state.controllers.iter().enumerate().fold(
-        column![].spacing(8).width(Fill),
+        column![].spacing(ROW_GAP).width(Fill),
         |col, (index, row)| {
             let selected = index == state.controller_selected;
-            let powering_off = state
-                .powering_off
-                .as_ref()
-                .is_some_and(|s| s == &row.serial);
+            let powering_off = row.connected
+                && state
+                    .powering_off
+                    .as_ref()
+                    .is_some_and(|s| s == &row.serial);
             col.push(controller_row(
                 index,
                 row,
@@ -5227,6 +5228,7 @@ mod tests {
 
     #[test]
     fn scroll_y_reveals_below_and_above_viewport() {
+        assert_eq!(ROW_GAP, 8.0);
         let gap = ROW_GAP;
         let stride = ROW_HEIGHT + gap;
         // Row 5 below viewport 300 starting at 0 → need scroll (Either/Down).

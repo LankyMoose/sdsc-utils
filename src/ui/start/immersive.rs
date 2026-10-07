@@ -864,10 +864,11 @@ fn dock_controller_row<'a>(
     row_radius: f32,
     state: &State,
 ) -> Element<'a, StartMessage> {
-    let powering_off = state
-        .powering_off
-        .as_ref()
-        .is_some_and(|s| s == &row.serial);
+    let powering_off = row.connected
+        && state
+            .powering_off
+            .as_ref()
+            .is_some_and(|s| s == &row.serial);
     let ring_color = if flash_white {
         theme::from_rgb(crate::controller::dualsense::lightbar::IDENTIFY_FLASH)
     } else if row.connected && !powering_off {

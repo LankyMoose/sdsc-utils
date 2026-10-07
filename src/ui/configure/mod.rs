@@ -904,33 +904,35 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         settings.start_screen_enabled,
         ConfigureMessage::SetStartScreenEnabled,
     )];
-    opening.push(
-        row![
-            column![
-                text("Auto open")
-                    .size(theme::type_scale::BODY)
-                    .color(theme::INK),
-                text("When a controller connects")
-                    .size(12.0)
-                    .color(theme::DIM),
+    if settings.start_screen_enabled {
+        opening.push(
+            row![
+                column![
+                    text("Auto open")
+                        .size(theme::type_scale::BODY)
+                        .color(theme::INK),
+                    text("When a controller connects")
+                        .size(12.0)
+                        .color(theme::DIM),
+                ]
+                .spacing(2)
+                .width(Fill),
+                pick_list(
+                    AUTO_OPEN_MODES,
+                    Some(settings.start_screen_auto_open),
+                    ConfigureMessage::SetStartScreenAutoOpen,
+                )
+                .text_size(13.0)
+                .padding([7, 10])
+                .width(Length::Fixed(280.0))
+                .style(theme::pick_list)
+                .menu_style(theme::pick_list_menu),
             ]
-            .spacing(2)
-            .width(Fill),
-            pick_list(
-                AUTO_OPEN_MODES,
-                Some(settings.start_screen_auto_open),
-                ConfigureMessage::SetStartScreenAutoOpen,
-            )
-            .text_size(13.0)
-            .padding([7, 10])
-            .width(Length::Fixed(190.0))
-            .style(theme::pick_list)
-            .menu_style(theme::pick_list_menu),
-        ]
-        .spacing(16)
-        .align_y(Alignment::Center)
-        .into(),
-    );
+            .spacing(16)
+            .align_y(Alignment::Center)
+            .into(),
+        );
+    }
     groups = groups.push(group(Some("Opening"), opening));
 
     if settings.start_screen_enabled {
@@ -1528,5 +1530,36 @@ mod tests {
         assert!(state.remove_selected().is_some());
         assert!(state.remove_selected().is_none());
         assert!(state.error.is_some());
+    }
+
+    #[test]
+    fn start_screen_view_builds_when_disabled_and_enabled() {
+        let mut settings = ConfigureSettings {
+            notify_low: true,
+            notify_charged: true,
+            notify_connect: true,
+            notify_disconnect: true,
+            low_battery_percent: 20,
+            toast_position: ToastPosition::BottomRight,
+            analytics_enabled: false,
+            lightbar_enabled: true,
+            start_screen_enabled: false,
+            start_screen_auto_open: StartAutoOpen::Any,
+            start_screen_always_immersive: false,
+            start_screen_clock_enabled: true,
+            start_screen_inactive_secs: 60,
+            start_screen_sleep_secs: 300,
+            start_screen_inactive_dim_percent: 50,
+            start_screen_sounds_enabled: true,
+            start_screen_sound_volume: 80,
+            start_screen_haptics_enabled: true,
+            start_screen_haptics_strength: 80,
+            #[cfg(windows)]
+            autostart: false,
+            show_developer: false,
+        };
+        let _disabled_el = start_screen_view(&settings);
+        settings.start_screen_enabled = true;
+        let _enabled_el = start_screen_view(&settings);
     }
 }

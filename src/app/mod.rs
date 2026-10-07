@@ -1662,6 +1662,14 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn sync_popup_rows(&mut self) {
+        if self
+            .start_state
+            .powering_off
+            .as_ref()
+            .is_some_and(|s| !self.session.controllers.iter().any(|c| c.serial == *s))
+        {
+            self.start_state.powering_off = None;
+        }
         let threshold = self.session.prefs.low_battery_percent;
         let mut rows = Vec::new();
         for controller in &self.session.controllers {
@@ -4549,6 +4557,14 @@ impl App {
                 if !crate::session::controllers_equivalent(&self.session.controllers, &controllers)
                 {
                     self.session.controllers = controllers;
+                    if self
+                        .start_state
+                        .powering_off
+                        .as_ref()
+                        .is_some_and(|s| !self.session.controllers.iter().any(|c| c.serial == *s))
+                    {
+                        self.start_state.powering_off = None;
+                    }
                     self.sync_popup_rows();
                     if self.start_visible {
                         self.refresh_start_controllers();
