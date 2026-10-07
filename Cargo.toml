@@ -1,6 +1,6 @@
 [package]
 name = "sdsc-utils"
-version = "1.6.0"
+version = "1.6.1"
 edition = "2024"
 rust-version = "1.88"
 description = "SDSC Utils â€” system tray battery, lightbar, and identify utilities for DualSense controllers"

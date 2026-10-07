@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-10-07
+
 ### Added
 
 - Powering-off status for controllers, mirroring game Closing: holding Triangle on a Start controller row (or the popup power button) immediately swaps the row to a muted-white `Powering off` status with a static `Powering off…` hint until the pad actually disappears; repeat commands while pending are ignored. Powering-off rows render dimmed with no Identify/Power off actions (the worker drops the pad any moment).
@@ -417,6 +419,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded DualSense silhouette for the tray and `.exe` icon.
 - Windows CI and tagged release workflow.
 
+[1.6.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.5.2...v1.6.0
 [1.5.2]: https://github.com/LankyMoose/sdsc-utils/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.5.0...v1.5.1
