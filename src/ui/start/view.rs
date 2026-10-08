@@ -4,7 +4,7 @@ use crate::controller::dualsense::lightbar;
 use crate::controller::model::PowerState;
 use crate::games::GameEntry;
 use crate::games::steam::SteamGame;
-use crate::persist::prefs::{GamesSortMode, StartAutoOpen};
+use crate::persist::prefs::{GamesSortMode, ImmersiveLayout, StartAutoOpen};
 use crate::ui::color::BatterySpectrum;
 use crate::ui::layout as window_layout;
 use crate::ui::percent_ring::{self, POPUP_SIZE};
@@ -34,6 +34,13 @@ pub const HEIGHT: f32 = 600.0;
 
 pub const SLIDE_ANIM_MS: u64 = 220;
 const SLIDE_ANIM_MIN_MS: u64 = 60;
+/// Layout-transition duration when swapping immersive strip orientation
+/// (ease in-out, orientation swaps at the midpoint).
+pub const LAYOUT_TRANSITION_MS: u64 = 300;
+/// Peak slide distance (logical px) of the directional exit+enter: the old
+/// orientation slides out along its scroll axis while fading, the new one
+/// slides in from the opposite side while fading back in.
+const LAYOUT_TRANSITION_SLIDE_PX: f32 = 72.0;
 const HEADER_HEIGHT: f32 = 36.0;
 /// Matches the Games footer band (face-cycle toggle + face hints).
 const FOOTER_HEIGHT: f32 = 32.0;
@@ -111,8 +118,10 @@ pub enum StartMessage {
     ToggleSettings,
     SetAutoOpen(StartAutoOpen),
     ToggleAutoOpenMenu,
+    ToggleLayoutMenu,
     SetAlwaysImmersive(bool),
     SetClock(bool),
+    SetImmersiveLayout(ImmersiveLayout),
     SetInactiveSecs(u32),
     SetSleepSecs(u32),
     SetInactiveDimPercent(u8),
@@ -387,6 +396,30 @@ impl StartRow {
             None => true,
         }
     }
+
+    /// Browse-selectable ("enabled") row. Mirrors the browse
+    /// [`State::move_selection`] skip logic: disabled rows (uninstalled Steam
+    /// / missing manual target) are skipped, while scan skeletons stay
+    /// navigable. Edit-exit selection resolution uses this so the cursor can
+    /// never strand on a disabled row.
+    pub fn browse_enabled(&self) -> bool {
+        !self.disabled || self.skeleton
+    }
+}
+
+/// Deterministic edit-checklist order: title A–Z with a `play_key` tiebreak.
+///
+/// The checklist is built from `HashMap` iteration (`steam_by_id`), whose
+/// order is random per process; a bare title sort would reshuffle
+/// duplicate-title rows on every rebuild (toggle / scan / enter), which reads
+/// as the list re-sorting itself. The tiebreak keeps rebuilds byte-stable.
+pub fn sort_edit_rows(rows: &mut [StartRow]) {
+    rows.sort_by(|a, b| {
+        a.title
+            .to_lowercase()
+            .cmp(&b.title.to_lowercase())
+            .then_with(|| a.play_key.cmp(&b.play_key))
+    });
 }
 
 fn steam_icon_source(game: &SteamGame) -> Option<IconSource> {
@@ -612,6 +645,35 @@ struct StripAnim {
     started: Instant,
 }
 
+/// Selected-title crossfade under the horizontal art row (`None` = settled).
+///
+/// Rides the strip scroll clock (same duration, retargetable) so the
+/// full-width title swaps with the art instead of snapping. Like `strip_anim`
+/// it never blocks nav: [`State::animating`] deliberately ignores it.
+#[derive(Debug, Clone)]
+struct TitleAnim {
+    from_idx: usize,
+    to_idx: usize,
+    /// Scroll direction (-1 | 1) for the drift.
+    dir: i32,
+    duration_ms: u64,
+    started: Instant,
+}
+
+/// Directional slide+fade when swapping the immersive games-strip orientation.
+///
+/// The old orientation slides out along its scroll axis while fading out; at
+/// the midpoint the rendered orientation swaps and the new one slides in from
+/// the opposite side while fading back in. Interrupt policy: a new request
+/// replaces the in-flight transition (same restart-wins precedent as the
+/// strip scroll chase; layout switches are rare and nav is gated meanwhile).
+#[derive(Debug, Clone)]
+struct LayoutTransitionAnim {
+    from: ImmersiveLayout,
+    to: ImmersiveLayout,
+    started: Instant,
+}
+
 #[derive(Debug, Clone)]
 struct PositionSectionAnim {
     from: f32,
@@ -772,14 +834,18 @@ pub struct State {
     pub show_all_controllers: bool,
     /// `play_key` of the row selected when edit mode was entered (restored on Save/Cancel).
     pub edit_anchor_play_key: Option<String>,
-    /// Last known games-list scroll offset / viewport height (for keep-selection-visible).
-    games_scroll_y: f32,
-    games_viewport_h: f32,
-    controllers_scroll_y: f32,
-    controllers_viewport_h: f32,
+    /// Unified scroll-offset tracking for every Start list (games / controllers /
+    /// settings). Owns offset + viewport per list; `on_scroll` records live
+    /// values via [`State::record_list_scroll`], programmatic `scroll_to`
+    /// targets sync optimistically via [`State::note_scroll_y`] (on_scroll lags
+    /// a frame). Future lists add a [`StartListId`] variant + geometry below.
+    scrolls: ListScrollTracker,
     anim: Option<SlideAnim>,
     dock_anim: Option<DockAnim>,
     strip_anim: Option<StripAnim>,
+    title_anim: Option<TitleAnim>,
+    /// In-flight immersive orientation transition (`None` = settled on prefs layout).
+    layout_transition: Option<LayoutTransitionAnim>,
     /// In-flight section index chase (None = settled on position_section_at).
     position_section: Option<PositionSectionAnim>,
     /// Last settled section index. Not the live target; a chase starts from here.
@@ -813,6 +879,122 @@ pub struct State {
 struct IdentifyFlash {
     serial: String,
     started: Instant,
+}
+
+/// Which Start list a scroll offset belongs to.
+///
+/// Maps 1:1 to the scrollable widget [`Id`](iced::widget::Id) used in the
+/// view, so `on_scroll` / programmatic `scroll_to` targets resolve through one
+/// place. Add a variant + row geometry in the reveal helpers to plug in a new
+/// list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StartListId {
+    Games,
+    Controllers,
+    Settings,
+}
+
+impl StartListId {
+    /// Scrollable widget id for this list.
+    pub fn scroll_id(self) -> iced::widget::Id {
+        match self {
+            Self::Games => iced::widget::Id::new("start-games-scroll"),
+            Self::Controllers => iced::widget::Id::new("start-controllers-scroll"),
+            Self::Settings => crate::ui::start::settings::settings_scroll_id(),
+        }
+    }
+
+    /// Resolve a scrollable id back to its list (`None` for unknown / future ids).
+    pub fn from_scroll_id(id: &iced::widget::Id) -> Option<Self> {
+        if *id == Self::Games.scroll_id() {
+            Some(Self::Games)
+        } else if *id == Self::Controllers.scroll_id() {
+            Some(Self::Controllers)
+        } else if *id == Self::Settings.scroll_id() {
+            Some(Self::Settings)
+        } else {
+            None
+        }
+    }
+}
+
+/// Tracked offset + viewport for one [`StartListId`] list.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListScrollState {
+    pub offset_y: f32,
+    pub viewport_h: f32,
+}
+
+/// Single owner for every Start list's scroll offset + viewport.
+///
+/// `on_scroll` feeds [`Self::record`]; programmatic `scroll_to` targets sync
+/// optimistically via [`Self::note_programmatic`] / [`Self::note_programmatic_id`]
+/// because `on_scroll` lags a frame. Reveal helpers read the stored values
+/// (falling back to a layout estimate before the first `on_scroll`).
+#[derive(Debug, Clone, Default)]
+pub struct ListScrollTracker {
+    games: ListScrollState,
+    controllers: ListScrollState,
+    settings: ListScrollState,
+}
+
+impl ListScrollTracker {
+    fn slot_mut(&mut self, list: StartListId) -> &mut ListScrollState {
+        match list {
+            StartListId::Games => &mut self.games,
+            StartListId::Controllers => &mut self.controllers,
+            StartListId::Settings => &mut self.settings,
+        }
+    }
+
+    fn slot(&self, list: StartListId) -> &ListScrollState {
+        match list {
+            StartListId::Games => &self.games,
+            StartListId::Controllers => &self.controllers,
+            StartListId::Settings => &self.settings,
+        }
+    }
+
+    /// Record a live `on_scroll` viewport report.
+    pub fn record(&mut self, list: StartListId, offset_y: f32, viewport_h: f32) {
+        let slot = self.slot_mut(list);
+        slot.offset_y = offset_y;
+        slot.viewport_h = viewport_h;
+    }
+
+    /// Sync the tracked offset after issuing a programmatic `scroll_to`
+    /// (`on_scroll` may lag a frame behind).
+    pub fn note_programmatic(&mut self, list: StartListId, y: f32) {
+        self.slot_mut(list).offset_y = y;
+    }
+
+    /// [`Self::note_programmatic`] by widget id. Returns false for unknown /
+    /// future ids (no-op, never panics).
+    pub fn note_programmatic_id(&mut self, id: &iced::widget::Id, y: f32) -> bool {
+        match StartListId::from_scroll_id(id) {
+            Some(list) => {
+                self.note_programmatic(list, y);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn offset(&self, list: StartListId) -> f32 {
+        self.slot(list).offset_y
+    }
+
+    pub fn viewport(&self, list: StartListId) -> f32 {
+        self.slot(list).viewport_h
+    }
+
+    pub fn reset(&mut self, list: StartListId) {
+        *self.slot_mut(list) = ListScrollState::default();
+    }
+
+    pub fn reset_all(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// How to pin a selection that has left the viewport.
@@ -870,13 +1052,12 @@ impl Default for State {
             sort_mode: GamesSortMode::default(),
             show_all_controllers: false,
             edit_anchor_play_key: None,
-            games_scroll_y: 0.0,
-            games_viewport_h: 0.0,
-            controllers_scroll_y: 0.0,
-            controllers_viewport_h: 0.0,
+            scrolls: ListScrollTracker::default(),
             anim: None,
             dock_anim: None,
             strip_anim: None,
+            title_anim: None,
+            layout_transition: None,
             position_section: None,
             position_section_at: 0.0,
             position_bar_last_scroll: None,
@@ -953,26 +1134,51 @@ impl State {
         }
     }
 
-    pub fn set_games_scroll(&mut self, y: f32, viewport_h: f32) {
-        self.games_scroll_y = y;
-        self.games_viewport_h = viewport_h;
-    }
-
-    pub fn set_controllers_scroll(&mut self, y: f32, viewport_h: f32) {
-        self.controllers_scroll_y = y;
-        self.controllers_viewport_h = viewport_h;
-    }
-
-    /// Keep tracked offset in sync with a programmatic `scroll_to` (on_scroll may lag).
-    pub fn note_scroll_y(&mut self, id: &iced::widget::Id, y: f32) {
-        if *id == games_scroll_id() {
-            self.games_scroll_y = y;
-        } else if *id == controllers_scroll_id() {
-            self.controllers_scroll_y = y;
+    /// Record a live `on_scroll` viewport report for one list.
+    ///
+    /// Single entry point for all list content (`GamesScrolled` /
+    /// `ControllersScrolled` / `SettingsScrolled` handlers). The settings
+    /// panel keeps its own `scroll_y` / `viewport_h` (owned by
+    /// `settings.rs`, which this change deliberately does not touch), so a
+    /// settings record mirrors there as well to keep both readers consistent.
+    pub fn record_list_scroll(&mut self, list: StartListId, y: f32, viewport_h: f32) {
+        self.scrolls.record(list, y, viewport_h);
+        if list == StartListId::Settings {
+            self.settings.scroll_y = y;
+            self.settings.viewport_h = viewport_h;
         }
     }
 
-    /// Absolute Y offset to keep the current slide’s selection in view, if scrolling is needed.
+    /// Tracked offset for one list (for tests / reveal math).
+    pub fn list_offset(&self, list: StartListId) -> f32 {
+        self.scrolls.offset(list)
+    }
+
+    /// Tracked viewport height for one list (for tests / reveal math).
+    pub fn list_viewport(&self, list: StartListId) -> f32 {
+        self.scrolls.viewport(list)
+    }
+
+    /// Sync the tracked offset for a settings `scroll_to` that bypasses
+    /// [`Self::note_scroll_y`] (keeps the tracker mirror + panel consistent).
+    pub fn sync_settings_scroll(&mut self, y: f32) {
+        self.scrolls.note_programmatic(StartListId::Settings, y);
+        self.settings.scroll_y = y;
+    }
+
+    /// Keep tracked offset in sync with a programmatic `scroll_to` (on_scroll may lag).
+    ///
+    /// Unknown / future list ids are a silent no-op (returns false) so a new
+    /// list id can never break existing reveal paths.
+    pub fn note_scroll_y(&mut self, id: &iced::widget::Id, y: f32) -> bool {
+        let noted = self.scrolls.note_programmatic_id(id, y);
+        if noted && StartListId::from_scroll_id(id) == Some(StartListId::Settings) {
+            self.settings.scroll_y = y;
+        }
+        noted
+    }
+
+    /// Absolute Y offset to keep the current slide's selection in view, if scrolling is needed.
     pub fn selection_scroll_y(&self, direction: ScrollReveal) -> Option<(iced::widget::Id, f32)> {
         match self.slide {
             StartSlide::Games => {
@@ -981,11 +1187,11 @@ impl State {
                     self.rows.len(),
                     ROW_HEIGHT,
                     ROW_GAP,
-                    self.games_scroll_y,
-                    self.games_viewport_h,
+                    self.scrolls.offset(StartListId::Games),
+                    self.scrolls.viewport(StartListId::Games),
                     direction,
                 )?;
-                Some((games_scroll_id(), y))
+                Some((StartListId::Games.scroll_id(), y))
             }
             StartSlide::Controllers => {
                 let y = scroll_y_to_reveal(
@@ -993,11 +1199,11 @@ impl State {
                     self.controllers.len(),
                     CONTROLLER_ROW_HEIGHT,
                     ROW_GAP,
-                    self.controllers_scroll_y,
-                    self.controllers_viewport_h,
+                    self.scrolls.offset(StartListId::Controllers),
+                    self.scrolls.viewport(StartListId::Controllers),
                     direction,
                 )?;
-                Some((controllers_scroll_id(), y))
+                Some((StartListId::Controllers.scroll_id(), y))
             }
         }
     }
@@ -1012,11 +1218,11 @@ impl State {
             self.rows.len(),
             ROW_HEIGHT,
             ROW_GAP,
-            self.games_scroll_y,
-            self.games_viewport_h,
+            self.scrolls.offset(StartListId::Games),
+            self.scrolls.viewport(StartListId::Games),
             false,
         )?;
-        Some((games_scroll_id(), y))
+        Some((StartListId::Games.scroll_id(), y))
     }
 
     /// Always scroll so the games selection is as centered as the list allows.
@@ -1029,11 +1235,29 @@ impl State {
             self.rows.len(),
             ROW_HEIGHT,
             ROW_GAP,
-            self.games_scroll_y,
-            self.games_viewport_h,
+            self.scrolls.offset(StartListId::Games),
+            self.scrolls.viewport(StartListId::Games),
             true,
         )?;
-        Some((games_scroll_id(), y))
+        Some((StartListId::Games.scroll_id(), y))
+    }
+
+    /// Scroll target that makes the current slide's selection visible on open.
+    ///
+    /// Fresh windows mount their scrollables at offset 0 with no `on_scroll`
+    /// report yet, so this uses the stored offset (reset by
+    /// [`Self::reset_to_games`]) + the layout-estimate viewport fallback in
+    /// [`scroll_y_to_reveal`] / [`scroll_y_center`]. Callers must issue it
+    /// *after* the window exists (`StartOpened`); a `scroll_to` sent alongside
+    /// `window::open` targets a not-yet-mounted id and is dropped by iced,
+    /// which was the compact-reopen bug (tracked offset said "centered" while
+    /// the real viewport stayed at 0). Games force-centers (context on reopen);
+    /// Controllers pins with [`ScrollReveal::Either`].
+    pub fn open_reveal_scroll(&self) -> Option<(iced::widget::Id, f32)> {
+        match self.slide {
+            StartSlide::Games => self.selection_scroll_y_center_prefer(),
+            StartSlide::Controllers => self.selection_scroll_y(ScrollReveal::Either),
+        }
     }
 
     /// Select the row matching `play_key`, or the first row if missing / empty.
@@ -1062,10 +1286,145 @@ impl State {
             .map(|r| r.play_key.clone());
     }
 
-    /// Restore selection from [`Self::edit_anchor_play_key`] and clear the anchor.
-    pub fn restore_edit_anchor(&mut self) {
-        let key = self.edit_anchor_play_key.take();
-        self.select_game_by_play_key(key.as_deref());
+    /// Re-select `play_key` when it is still present, else keep the (already
+    /// clamped) index. Unlike [`Self::select_game_by_play_key`] this never
+    /// falls back to 0 — used to pin the edit cursor across checklist rebuilds
+    /// (toggle / manual add / Steam scan reorder shift A–Z indices, so a bare
+    /// index would drift to a different game; a 0-fallback would yank the
+    /// cursor, e.g. after removing a manual shortcut).
+    pub fn select_game_by_play_key_or_keep(&mut self, play_key: Option<&str>) {
+        let Some(key) = play_key else {
+            return;
+        };
+        if let Some(i) = self.rows.iter().position(|r| r.play_key == key)
+            && i != self.game_selected
+        {
+            self.game_selected = i;
+            self.snap_position_section();
+        }
+    }
+
+    /// Edit-save exit target in CHECKLIST space (call while still editing, on
+    /// the A–Z checklist rows, before the draft is committed).
+    ///
+    /// Keeps the cursor game when it is still toggled-on (`in_catalog`: Steam
+    /// rows carry the flag, manual rows are on while present); otherwise the
+    /// nearest toggled-on game ABOVE the cursor, else the nearest toggled-on
+    /// game AFTER it. Returns `None` when nothing is toggled on (draft catalog
+    /// emptied) — the post-save browse rows are then empty and the existing
+    /// empty-games view shows.
+    pub fn edit_exit_target_key(&self) -> Option<String> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        let cur = self.game_selected.min(self.rows.len() - 1);
+        if self.rows[cur].in_catalog() {
+            return Some(self.rows[cur].play_key.clone());
+        }
+        if let Some(row) = self.rows[..cur].iter().rev().find(|r| r.in_catalog()) {
+            return Some(row.play_key.clone());
+        }
+        if let Some(row) = self.rows[cur + 1..].iter().find(|r| r.in_catalog()) {
+            return Some(row.play_key.clone());
+        }
+        None
+    }
+
+    /// Browse-space edit-exit selection resolution (call after leaving edit
+    /// mode, on the rebuilt browse rows).
+    ///
+    /// Keeps `preferred_key` when it is still present AND enabled
+    /// ([`StartRow::browse_enabled`]); otherwise the nearest enabled game
+    /// ABOVE that position, else the nearest enabled game AFTER it. This is
+    /// deliberately above-first, unlike [`Self::set_rows`] (which prefers
+    /// forward) — exiting edit should hold the cursor where it was, not slide
+    /// it down the list.
+    ///
+    /// Save exits pass the [`Self::edit_exit_target_key`] cursor target;
+    /// cancel/discard exits pass the pre-edit anchor (the catalog is restored,
+    /// so the anchor revives the pre-edit game when still present+enabled,
+    /// else the same nearest rule applies). Empty rows land on index 0 and
+    /// the existing empty-games view shows; all-disabled non-empty rows keep
+    /// the clamped index (`set_rows` parity — launch stays blocked).
+    pub fn resolve_edit_exit_selection(&mut self, preferred_key: Option<&str>) {
+        if self.rows.is_empty() {
+            self.game_selected = 0;
+            self.snap_position_section();
+            return;
+        }
+        let start = preferred_key
+            .and_then(|key| self.rows.iter().position(|r| r.play_key == key))
+            .unwrap_or_else(|| self.game_selected.min(self.rows.len() - 1));
+        if self.rows[start].browse_enabled() {
+            self.game_selected = start;
+        } else if let Some(i) = (0..start).rev().find(|&i| self.rows[i].browse_enabled()) {
+            self.game_selected = i;
+        } else if let Some(i) =
+            ((start + 1)..self.rows.len()).find(|&i| self.rows[i].browse_enabled())
+        {
+            self.game_selected = i;
+        } else {
+            self.game_selected = start;
+        }
+        self.snap_position_section();
+    }
+
+    /// Current games selection as a stable key for service-side memory.
+    pub fn selected_game_key(&self) -> Option<String> {
+        self.rows
+            .get(self.game_selected)
+            .map(|r| r.play_key.clone())
+    }
+
+    /// Current controllers selection as a stable key for service-side memory.
+    pub fn selected_controller_key(&self) -> Option<String> {
+        self.controllers
+            .get(self.controller_selected)
+            .map(|r| r.serial.clone())
+    }
+
+    /// Resolve service-stored keys to indices after a shell restart.
+    ///
+    /// `None` keys leave that axis untouched; unknown keys (or empty lists)
+    /// fall back to 0. Returns true when an index moved.
+    pub fn resolve_start_selection(
+        &mut self,
+        game_key: Option<&str>,
+        controller_key: Option<&str>,
+    ) -> bool {
+        let mut changed = false;
+        if let Some(key) = game_key {
+            let index = if self.rows.is_empty() {
+                0
+            } else {
+                self.rows
+                    .iter()
+                    .position(|r| r.play_key == key)
+                    .unwrap_or(0)
+            };
+            if index != self.game_selected {
+                self.game_selected = index;
+                changed = true;
+            }
+        }
+        if let Some(serial) = controller_key {
+            let index = if self.controllers.is_empty() {
+                0
+            } else {
+                self.controllers
+                    .iter()
+                    .position(|r| r.serial == serial)
+                    .unwrap_or(0)
+            };
+            if index != self.controller_selected {
+                self.controller_selected = index;
+                changed = true;
+            }
+        }
+        if changed {
+            self.snap_position_section();
+        }
+        changed
     }
 
     /// Land on Games with no in-flight anim (used whenever the start screen opens).
@@ -1074,6 +1433,8 @@ impl State {
         self.anim = None;
         self.dock_anim = None;
         self.strip_anim = None;
+        self.title_anim = None;
+        self.layout_transition = None;
         self.position_bar_last_scroll = None;
         self.position_bar_slide = None;
         self.snap_position_section();
@@ -1094,8 +1455,10 @@ impl State {
         self.edit_anchor_play_key = None;
         self.game_selected = 0;
         self.controller_selected = 0;
-        self.games_scroll_y = 0.0;
-        self.controllers_scroll_y = 0.0;
+        // Fresh window mounts scrollables at 0 with no on_scroll yet; the
+        // open-time reveal (see `open_reveal_scroll`, issued on StartOpened)
+        // recomputes from here with the estimate-viewport fallback.
+        self.scrolls.reset_all();
     }
 
     pub fn overlay_blocking(&self) -> bool {
@@ -1112,6 +1475,11 @@ impl State {
             if open {
                 self.replace_confirm = None;
                 self.cross_progress = 0.0;
+                // Fresh settings open resets the panel offset to 0 internally;
+                // keep the tracker mirror consistent. List offsets for games /
+                // controllers are deliberately untouched so the shape-stable
+                // compact stack never remounts those scrollables.
+                self.scrolls.reset(StartListId::Settings);
             }
             true
         } else {
@@ -1119,12 +1487,34 @@ impl State {
         }
     }
 
+    /// Transition nav policy: overlay/chrome transitions (slide changes, dock,
+    /// strip/title, settings, position-bar anims) stay cancellable and never
+    /// block nav; transitions that reflow main content (horizontal↔vertical
+    /// layout transition) block pad + keyboard nav for their duration.
+    ///
+    /// Mechanism: this gates pad nav (slide/dock/promote/transition) but deliberately
+    /// ignores retargetable chrome (strip/title) and settings; modal overlays
+    /// use [`Self::overlay_blocking`]; the transition-scoped keyboard + Move/Prev/Next
+    /// gate is [`Self::layout_transition_active`].
     pub fn animating(&self) -> bool {
-        // Strip scroll is retargetable — do not gate pad Up/Down on it.
+        // Strip scroll + title crossfade are retargetable — do not gate pad Up/Down on them.
+        // The layout transition is not retargetable: block pad nav mid-transition.
         self.anim.is_some()
             || (self.immersive && self.dock_anim.is_some())
             || self.transition_phase.is_some()
             || self.transition.is_some()
+            || self.layout_transition.is_some()
+    }
+
+    /// True while the immersive layout transition is in flight.
+    ///
+    /// The transition reflows main content (horizontal↔vertical swap), so navigational
+    /// messages (MoveUp/MoveDown, Left/Right equivalents, PrevSlide/NextSlide,
+    /// settings focus/nudge) are dropped for its duration, while Confirm/Cancel/
+    /// Close/settings-toggle stay live (cancellable chrome). Slide/dock/strip/
+    /// title/settings anims never consult this gate.
+    pub fn layout_transition_active(&self) -> bool {
+        self.layout_transition.is_some()
     }
 
     /// Immersive strip scroll in flight (visual chase; nav may retarget).
@@ -1136,6 +1526,8 @@ impl State {
         self.anim.is_some()
             || self.dock_anim.is_some()
             || self.strip_anim.is_some()
+            || self.title_anim.is_some()
+            || self.layout_transition.is_some()
             || self.transition.is_some()
             || self.transition_phase.is_some()
             || self.backdrop_current.is_some()
@@ -1229,9 +1621,10 @@ impl State {
     ///
     /// Linear only — Games strip does not wrap, so `from`/`to` stay in catalog range.
     pub fn begin_strip_anim(&mut self, from_visual: f32, now: Instant) {
-        let len = self.rows.len() as f32;
-        if len < 1.0 {
+        let len = self.rows.len();
+        if len < 1 {
             self.strip_anim = None;
+            self.title_anim = None;
             self.sync_position_section(now, crate::ui::start::vstrip::STRIP_ANIM_MS);
             return;
         }
@@ -1246,6 +1639,7 @@ impl State {
         let delta = to - from;
         if delta.abs() < 0.01 {
             self.strip_anim = None;
+            self.title_anim = None;
             self.sync_position_section(now, crate::ui::start::vstrip::STRIP_ANIM_MS);
             return;
         }
@@ -1260,7 +1654,103 @@ impl State {
             duration_ms,
             started: now,
         });
+        self.begin_title_anim(from_visual, now, duration_ms);
         self.sync_position_section(now, duration_ms);
+    }
+
+    /// Selected-title crossfade on the strip clock (called from [`Self::begin_strip_anim`]).
+    ///
+    /// Chains from the incoming title when retargeting mid-flight; clears when
+    /// the index did not actually change so the title snaps with the strip.
+    fn begin_title_anim(&mut self, from_visual: f32, now: Instant, duration_ms: u64) {
+        let len = self.rows.len();
+        if len < 1 {
+            self.title_anim = None;
+            return;
+        }
+        // In-flight: the shown title is the incoming one. Settled: the caller-passed prior index.
+        let from_idx = self
+            .title_anim
+            .as_ref()
+            .map(|anim| anim.to_idx)
+            .unwrap_or_else(|| from_visual.round().clamp(0.0, len as f32 - 1.0) as usize)
+            .min(len - 1);
+        let to_idx = self.game_selected.min(len - 1);
+        let dir = (to_idx as isize - from_idx as isize).signum() as i32;
+        if dir == 0 {
+            self.title_anim = None;
+            return;
+        }
+        self.title_anim = Some(TitleAnim {
+            from_idx,
+            to_idx,
+            dir,
+            duration_ms,
+            started: now,
+        });
+    }
+
+    /// Selected-title crossfade visual: `(prev_idx, old_op, new_op, old_dx, new_dx)`.
+    ///
+    /// The outgoing title fades out while the incoming fades in over the strip
+    /// clock, with a slight drift in scroll direction. `None` when settled or
+    /// out of range (render the incoming title only). Opacities compose with
+    /// the layout-transition multiplier upstream (both scale the title fade).
+    pub fn title_crossfade_visual(&self, now: Instant) -> Option<(usize, f32, f32, f32, f32)> {
+        let anim = self.title_anim.as_ref()?;
+        let len = self.rows.len();
+        if anim.from_idx >= len || anim.to_idx >= len || anim.from_idx == anim.to_idx {
+            return None;
+        }
+        use crate::ui::start::vstrip::{
+            title_crossfade_drift, title_crossfade_opacity, title_crossfade_t,
+        };
+        let elapsed = now.saturating_duration_since(anim.started).as_millis() as u64;
+        let t = title_crossfade_t(elapsed, anim.duration_ms);
+        let (old_op, new_op) = title_crossfade_opacity(t);
+        let (old_dx, new_dx) = title_crossfade_drift(t, anim.dir as f32);
+        Some((anim.from_idx, old_op, new_op, old_dx, new_dx))
+    }
+
+    /// Begin the orientation transition after an actual layout change. No-op when
+    /// `from == to` so settings opens / redraws never animate. Replaces any
+    /// in-flight transition (layout switches are rare; latest target wins).
+    pub fn begin_layout_transition(
+        &mut self,
+        from: ImmersiveLayout,
+        to: ImmersiveLayout,
+        now: Instant,
+    ) {
+        if from == to {
+            return;
+        }
+        self.layout_transition = Some(LayoutTransitionAnim {
+            from,
+            to,
+            started: now,
+        });
+    }
+
+    /// Transition visual for this frame: `(render_layout, opacity_mul, dx, dy)`.
+    ///
+    /// First half renders the old orientation sliding out along its scroll axis
+    /// while fading out; at the midpoint the orientation swaps and the new one
+    /// slides in from the opposite side while fading back in. `current` is the
+    /// prefs layout (the settled target once no transition is in flight).
+    /// Offsets skip while flattening upstream (`Float`s paint above veils).
+    pub fn layout_transition_visual(
+        &self,
+        current: ImmersiveLayout,
+        now: Instant,
+    ) -> (ImmersiveLayout, f32, f32, f32) {
+        let Some(anim) = &self.layout_transition else {
+            return (current, 1.0, 0.0, 0.0);
+        };
+        let elapsed_ms = now.saturating_duration_since(anim.started).as_millis() as u64;
+        let eased = layout_transition_eased(elapsed_ms);
+        let layout = if eased < 0.5 { anim.from } else { anim.to };
+        let (dx, dy) = layout_transition_offset(eased, layout);
+        (layout, layout_transition_opacity(eased), dx, dy)
     }
 
     pub(crate) fn games_section_mode(&self) -> crate::ui::start::position::SectionMode {
@@ -1340,7 +1830,7 @@ impl State {
         ) as f32
     }
 
-    fn note_position_bar_scroll(&mut self, now: Instant) {
+    pub(crate) fn note_position_bar_scroll(&mut self, now: Instant) {
         let (current, current_op) = self.position_bar_show(now);
         self.position_bar_last_scroll = Some(now);
         if current >= 0.99 && current_op >= 0.99 {
@@ -1397,6 +1887,8 @@ impl State {
         self.dock_expanded = false;
         self.dock_anim = None;
         self.strip_anim = None;
+        self.title_anim = None;
+        self.layout_transition = None;
         self.position_bar_last_scroll = None;
         self.position_bar_slide = None;
         self.snap_position_section();
@@ -1507,6 +1999,7 @@ impl State {
         use crate::ui::start::mode::TransitionPhase;
         self.dock_anim = None;
         self.strip_anim = None;
+        self.title_anim = None;
         self.position_bar_last_scroll = None;
         self.position_bar_slide = None;
         self.snap_position_section();
@@ -2622,6 +3115,22 @@ impl State {
                 busy = true;
             }
         }
+        if let Some(anim) = self.title_anim.as_ref() {
+            let elapsed = now.saturating_duration_since(anim.started);
+            if elapsed >= Duration::from_millis(anim.duration_ms) {
+                self.title_anim = None;
+            } else {
+                busy = true;
+            }
+        }
+        if let Some(anim) = self.layout_transition.as_ref() {
+            let elapsed = now.saturating_duration_since(anim.started);
+            if elapsed >= Duration::from_millis(LAYOUT_TRANSITION_MS) {
+                self.layout_transition = None;
+            } else {
+                busy = true;
+            }
+        }
         if let Some(anim) = self.position_section.take() {
             let elapsed = now.saturating_duration_since(anim.started);
             if elapsed >= Duration::from_millis(anim.duration_ms) {
@@ -2733,7 +3242,7 @@ impl State {
     }
 
     pub fn move_selection(&mut self, delta: i32) -> Option<ScrollReveal> {
-        if self.overlay_blocking() || self.anim.is_some() {
+        if self.overlay_blocking() || self.anim.is_some() || self.layout_transition_active() {
             return None;
         }
         match self.slide {
@@ -2808,6 +3317,52 @@ impl State {
     }
 }
 
+/// Eased transition progress 0..=1 (ease in-out over [`LAYOUT_TRANSITION_MS`]).
+/// Pure so unit tests can pin the curve without a clock.
+pub fn layout_transition_eased(elapsed_ms: u64) -> f32 {
+    crate::ui::motion::ease_in_out_cubic(crate::ui::motion::progress_linear(
+        elapsed_ms,
+        LAYOUT_TRANSITION_MS,
+    ))
+}
+
+/// Strip opacity multiplier at eased transition progress: 1 at both ends,
+/// 0 at the midpoint swap (the old layout is fully out before the new one
+/// slides in, so the handoff never pops).
+pub fn layout_transition_opacity(eased: f32) -> f32 {
+    let eased = eased.clamp(0.0, 1.0);
+    if eased < 0.5 {
+        1.0 - 2.0 * eased
+    } else {
+        2.0 * eased - 1.0
+    }
+}
+
+/// Slide offset `(dx, dy)` at eased transition progress for the rendered layout.
+///
+/// Each half travels along its own scroll axis: vertical exits up and enters
+/// from below; horizontal exits left and enters from the right. Exit eases in
+/// (accelerates away), enter eases out (soft landing); travel peaks at
+/// [`LAYOUT_TRANSITION_SLIDE_PX`] at the midpoint swap where opacity is 0.
+pub fn layout_transition_offset(eased: f32, layout: ImmersiveLayout) -> (f32, f32) {
+    let eased = eased.clamp(0.0, 1.0);
+    let (half_t, entering) = if eased < 0.5 {
+        (eased * 2.0, false)
+    } else {
+        ((eased - 0.5) * 2.0, true)
+    };
+    let mag = if entering {
+        LAYOUT_TRANSITION_SLIDE_PX * (1.0 - window_layout::ease_out_cubic(half_t))
+    } else {
+        LAYOUT_TRANSITION_SLIDE_PX * crate::ui::motion::ease_in_cubic(half_t)
+    };
+    let signed = if entering { mag } else { -mag };
+    match layout {
+        ImmersiveLayout::Vertical => (0.0, signed),
+        ImmersiveLayout::Horizontal => (signed, 0.0),
+    }
+}
+
 fn slide_x(slide: StartSlide) -> f32 {
     match slide {
         StartSlide::Games => 0.0,
@@ -2816,11 +3371,11 @@ fn slide_x(slide: StartSlide) -> f32 {
 }
 
 pub fn games_scroll_id() -> iced::widget::Id {
-    iced::widget::Id::new("start-games-scroll")
+    StartListId::Games.scroll_id()
 }
 
 pub fn controllers_scroll_id() -> iced::widget::Id {
-    iced::widget::Id::new("start-controllers-scroll")
+    StartListId::Controllers.scroll_id()
 }
 
 /// Compute a new scroll Y so `index` stays fully visible, or `None` if already in view.
@@ -3144,6 +3699,7 @@ pub fn view<'a>(
     clock_enabled: bool,
     promote_gesture: &'a [crate::domain::gesture::GestureControl],
     stage_h: f32,
+    stage_w: f32,
     settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
 ) -> Element<'a, StartMessage> {
     use crate::ui::start::mode::TransitionPhase;
@@ -3172,7 +3728,9 @@ pub fn view<'a>(
             clock_enabled,
             promote_gesture,
             stage_h,
+            stage_w,
             settings_snapshot,
+            settings_snapshot.immersive_layout,
         );
     }
 
@@ -3201,17 +3759,21 @@ pub fn view<'a>(
     );
     let with_veil = crate::ui::start::immersive::compact_transition_overlay(compact, veil, false);
     let settings_p = state.settings.progress(now);
-    if state.settings.visible(now) {
-        stack![
-            with_veil,
-            crate::ui::start::settings::compact_overlay(state, settings_snapshot, settings_p),
-        ]
+    // Always keep the same outer stack shape so the games scrollable is not
+    // remounted (and its scroll offset reset) when the settings surface
+    // opens/closes — iced diffs widget state positionally, so swapping the
+    // root between `with_veil` and `stack![with_veil, overlay]` drops the whole
+    // subtree state. The closed top layer is inert space: it draws nothing and
+    // captures no input, so events reach the lists below unchanged.
+    let settings_layer: Element<'_, StartMessage> = if state.settings.visible(now) {
+        crate::ui::start::settings::compact_overlay(state, settings_snapshot, settings_p)
+    } else {
+        space().width(Fill).height(Fill).into()
+    };
+    stack![with_veil, settings_layer]
         .width(Fill)
         .height(Fill)
         .into()
-    } else {
-        with_veil
-    }
 }
 
 fn compact_chrome<'a>(
@@ -5125,6 +5687,117 @@ mod tests {
         assert!(!sample_controller(false, false).show_power_off());
     }
 
+    #[test]
+    fn request_settings_preserves_list_scroll_offsets() {
+        // Compact settings open/close must not disturb the Games/Controllers
+        // list scroll offsets (or selections): the compact view keeps a
+        // shape-stable outer stack so iced never remounts those scrollables.
+        let mut state = State::default();
+        state.record_list_scroll(StartListId::Games, 220.0, 400.0);
+        state.record_list_scroll(StartListId::Controllers, 120.0, 400.0);
+        state.game_selected = 3;
+        state.controller_selected = 2;
+        let now = Instant::now();
+        assert!(state.request_settings(true, now));
+        assert!((state.list_offset(StartListId::Games) - 220.0).abs() < f32::EPSILON);
+        assert!((state.list_offset(StartListId::Controllers) - 120.0).abs() < f32::EPSILON);
+        assert_eq!(state.game_selected, 3);
+        assert_eq!(state.controller_selected, 2);
+        // The settings panel's own scroll reset (fresh open) is intended,
+        // mirrored in the tracker.
+        assert!((state.settings.scroll_y - 0.0).abs() < f32::EPSILON);
+        assert!((state.list_offset(StartListId::Settings) - 0.0).abs() < f32::EPSILON);
+        assert!(state.request_settings(false, now));
+        assert!((state.list_offset(StartListId::Games) - 220.0).abs() < f32::EPSILON);
+        assert!((state.list_offset(StartListId::Controllers) - 120.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn tracker_records_and_notes_per_list_id() {
+        let mut state = State::default();
+        state.record_list_scroll(StartListId::Games, 220.0, 400.0);
+        state.record_list_scroll(StartListId::Controllers, 120.0, 350.0);
+        state.record_list_scroll(StartListId::Settings, 42.0, 480.0);
+        assert!((state.list_offset(StartListId::Games) - 220.0).abs() < f32::EPSILON);
+        assert!((state.list_viewport(StartListId::Games) - 400.0).abs() < f32::EPSILON);
+        assert!((state.list_offset(StartListId::Controllers) - 120.0).abs() < f32::EPSILON);
+        assert!((state.settings.scroll_y - 42.0).abs() < f32::EPSILON);
+        // Programmatic scroll_to syncs optimistically (on_scroll lags).
+        assert!(state.note_scroll_y(&StartListId::Games.scroll_id(), 330.0));
+        assert!((state.list_offset(StartListId::Games) - 330.0).abs() < f32::EPSILON);
+        assert!((state.list_viewport(StartListId::Games) - 400.0).abs() < f32::EPSILON);
+        assert!(state.note_scroll_y(&StartListId::Settings.scroll_id(), 60.0));
+        assert!((state.settings.scroll_y - 60.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn tracker_unknown_list_id_is_noop() {
+        // Unknown / future list ids must never disturb tracked lists.
+        let mut state = State::default();
+        state.record_list_scroll(StartListId::Games, 220.0, 400.0);
+        let unknown = iced::widget::Id::new("start-future-list-xyz");
+        assert!(StartListId::from_scroll_id(&unknown).is_none());
+        assert!(!state.note_scroll_y(&unknown, 999.0));
+        assert!((state.list_offset(StartListId::Games) - 220.0).abs() < f32::EPSILON);
+        assert!((state.list_offset(StartListId::Controllers) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn open_reveal_scrolls_restored_selection_into_view() {
+        // Regression: reopening compact Start after close must scroll to the
+        // restored selection. Fresh windows mount at offset 0 with no on_scroll
+        // yet, so the reveal must work off the reset offset + estimate viewport.
+        let mut state = State {
+            rows: vec![
+                game_row_with("steam:1"),
+                game_row_with("steam:2"),
+                game_row_with("steam:3"),
+                game_row_with("steam:4"),
+                game_row_with("steam:5"),
+                game_row_with("steam:6"),
+                game_row_with("steam:7"),
+                game_row_with("steam:8"),
+            ],
+            ..State::default()
+        };
+        // Simulate open: reset (fresh window, offsets zeroed) then restore.
+        state.reset_to_games();
+        state.game_selected = 6;
+        let (id, y) = state
+            .open_reveal_scroll()
+            .expect("restored selection must reveal on open");
+        assert_eq!(id, StartListId::Games.scroll_id());
+        assert!(y > 0.0);
+        // Optimistic sync (what App does alongside the scroll_to op).
+        assert!(state.note_scroll_y(&id, y));
+        assert!((state.list_offset(StartListId::Games) - y).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn open_reveal_covers_controllers_slide() {
+        let mut state = State {
+            controllers: vec![
+                controller_row_with("aa", true),
+                controller_row_with("bb", true),
+                controller_row_with("cc", true),
+                controller_row_with("dd", true),
+                controller_row_with("ee", true),
+                controller_row_with("ff", true),
+                controller_row_with("gg", true),
+                controller_row_with("hh", true),
+            ],
+            ..State::default()
+        };
+        state.reset_to_games();
+        state.slide = StartSlide::Controllers;
+        state.controller_selected = 6;
+        let (id, y) = state
+            .open_reveal_scroll()
+            .expect("controllers selection must reveal on open");
+        assert_eq!(id, StartListId::Controllers.scroll_id());
+        assert!(y > 0.0);
+    }
+
     fn controller_row_with(serial: &str, connected: bool) -> StartControllerRow {
         StartControllerRow {
             serial: serial.into(),
@@ -5137,6 +5810,117 @@ mod tests {
             connected,
             eta: None,
         }
+    }
+
+    fn game_row_with(play_key: &str) -> StartRow {
+        StartRow {
+            title: play_key.into(),
+            subtitle: None,
+            target: play_key.into(),
+            args: String::new(),
+            play_key: play_key.into(),
+            icon: None,
+            icon_source: None,
+            backdrop_path: None,
+            edit: None,
+            skeleton: false,
+            update_required: false,
+            disabled: false,
+            played_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn selection_keys_snapshot_current_indices() {
+        let mut state = State::default();
+        assert_eq!(state.selected_game_key(), None);
+        assert_eq!(state.selected_controller_key(), None);
+        state.rows = vec![
+            game_row_with("steam:1"),
+            game_row_with("steam:2"),
+            game_row_with("steam:3"),
+        ];
+        state.controllers = vec![
+            controller_row_with("aa", true),
+            controller_row_with("bb", true),
+        ];
+        state.game_selected = 2;
+        state.controller_selected = 1;
+        assert_eq!(state.selected_game_key().as_deref(), Some("steam:3"));
+        assert_eq!(state.selected_controller_key().as_deref(), Some("bb"));
+    }
+
+    #[test]
+    fn resolve_start_selection_matches_stable_keys() {
+        let mut state = State {
+            rows: vec![
+                game_row_with("steam:1"),
+                game_row_with("steam:2"),
+                game_row_with("steam:3"),
+            ],
+            controllers: vec![
+                controller_row_with("aa", true),
+                controller_row_with("bb", true),
+            ],
+            ..Default::default()
+        };
+        assert!(state.resolve_start_selection(Some("steam:3"), Some("bb")));
+        assert_eq!(state.game_selected, 2);
+        assert_eq!(state.controller_selected, 1);
+        // Resolving the same keys again is a no-op.
+        assert!(!state.resolve_start_selection(Some("steam:3"), Some("bb")));
+    }
+
+    #[test]
+    fn resolve_start_selection_miss_falls_back_to_zero() {
+        let mut state = State {
+            rows: vec![game_row_with("steam:1"), game_row_with("steam:2")],
+            controllers: vec![controller_row_with("aa", true)],
+            game_selected: 1,
+            ..Default::default()
+        };
+        // Unknown game key (uninstalled since the service stored it).
+        assert!(state.resolve_start_selection(Some("steam:gone"), None));
+        assert_eq!(state.game_selected, 0);
+        assert_eq!(state.controller_selected, 0);
+        // Unknown controller serial.
+        state.controller_selected = 0;
+        state.controllers = vec![
+            controller_row_with("aa", true),
+            controller_row_with("bb", true),
+        ];
+        state.controller_selected = 1;
+        assert!(state.resolve_start_selection(None, Some("zz")));
+        assert_eq!(state.controller_selected, 0);
+    }
+
+    #[test]
+    fn resolve_start_selection_none_keys_leave_axes_untouched() {
+        let mut state = State {
+            rows: vec![game_row_with("steam:1"), game_row_with("steam:2")],
+            controllers: vec![
+                controller_row_with("aa", true),
+                controller_row_with("bb", true),
+            ],
+            game_selected: 1,
+            controller_selected: 1,
+            ..Default::default()
+        };
+        assert!(!state.resolve_start_selection(None, None));
+        assert_eq!(state.game_selected, 1);
+        assert_eq!(state.controller_selected, 1);
+        // One axis only.
+        assert!(state.resolve_start_selection(Some("steam:1"), None));
+        assert_eq!(state.game_selected, 0);
+        assert_eq!(state.controller_selected, 1);
+    }
+
+    #[test]
+    fn resolve_start_selection_empty_lists_stay_zero() {
+        let mut state = State::default();
+        assert!(!state.resolve_start_selection(Some("steam:1"), Some("aa")));
+        assert_eq!(state.game_selected, 0);
+        assert_eq!(state.controller_selected, 0);
     }
 
     #[test]
@@ -5442,6 +6226,284 @@ mod tests {
         assert!((anim.to - 0.0).abs() < 0.01);
     }
 
+    fn title_rows(n: usize) -> Vec<StartRow> {
+        (0..n)
+            .map(|i| StartRow {
+                title: format!("g{i}"),
+                subtitle: None,
+                target: format!("t{i}"),
+                args: String::new(),
+                play_key: format!("k{i}"),
+                icon: None,
+                icon_source: None,
+                backdrop_path: None,
+                edit: None,
+                skeleton: false,
+                update_required: false,
+                disabled: false,
+                played_at_ms: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn begin_strip_anim_starts_title_crossfade_on_same_clock() {
+        let mut state = State {
+            rows: title_rows(5),
+            game_selected: 3,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        state.begin_strip_anim(2.0, now);
+        let title = state
+            .title_anim
+            .as_ref()
+            .expect("title crossfade rides the strip clock");
+        assert_eq!((title.from_idx, title.to_idx, title.dir), (2, 3, 1));
+        assert_eq!(title.duration_ms, crate::ui::start::vstrip::STRIP_ANIM_MS);
+        // Backward step drifts the other way.
+        let mut back = State {
+            rows: title_rows(5),
+            game_selected: 1,
+            ..Default::default()
+        };
+        back.begin_strip_anim(2.0, now);
+        let title = back.title_anim.as_ref().expect("backward step animates");
+        assert_eq!((title.from_idx, title.to_idx, title.dir), (2, 1, -1));
+    }
+
+    #[test]
+    fn title_crossfade_visual_tracks_strip_ease_and_settles() {
+        let mut state = State {
+            rows: title_rows(5),
+            game_selected: 3,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        state.begin_strip_anim(2.0, now);
+        // Start: old fully on, new at zero drifted into the scroll direction.
+        let (prev, old_op, new_op, old_dx, new_dx) =
+            state.title_crossfade_visual(now).expect("crossfade live");
+        assert_eq!(prev, 2);
+        assert!((old_op - 1.0).abs() < 0.001 && new_op.abs() < 0.001);
+        assert!(old_dx.abs() < 0.001 && new_dx > 0.0);
+        // Mid-flight: both partially visible, opacities sum to one.
+        let mid = now + Duration::from_millis(crate::ui::start::vstrip::STRIP_ANIM_MS / 2);
+        let (_, old_op, new_op, _, _) = state.title_crossfade_visual(mid).expect("crossfade mid");
+        assert!(old_op > 0.0 && old_op < 1.0);
+        assert!((old_op + new_op - 1.0).abs() < 0.001);
+        // Past the end the tick settles and the visual retires (incoming only).
+        let done = now + Duration::from_millis(crate::ui::start::vstrip::STRIP_ANIM_MS + 16);
+        state.tick_anim(done);
+        assert!(state.title_anim.is_none());
+        assert!(state.title_crossfade_visual(done).is_none());
+    }
+
+    #[test]
+    fn title_anim_retarget_chains_from_incoming_and_clears_on_noop() {
+        let mut state = State {
+            rows: title_rows(5),
+            game_selected: 3,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        state.begin_strip_anim(2.0, now);
+        // Rapid second step mid-flight: title chains from the incoming index.
+        let mid = now + Duration::from_millis(crate::ui::start::vstrip::STRIP_ANIM_MS / 2);
+        state.game_selected = 4;
+        state.begin_strip_anim(0.0, mid);
+        let title = state
+            .title_anim
+            .as_ref()
+            .expect("retarget keeps title anim");
+        assert_eq!((title.from_idx, title.to_idx, title.dir), (3, 4, 1));
+        assert_eq!(
+            title.duration_ms,
+            crate::ui::start::vstrip::STRIP_ANIM_CATCHUP_MS
+        );
+        // Same index (no strip motion): title clears so nothing crossfades.
+        let mut same = State {
+            rows: title_rows(5),
+            game_selected: 2,
+            ..Default::default()
+        };
+        same.begin_strip_anim(2.0, now);
+        assert!(same.strip_anim.is_none());
+        assert!(same.title_anim.is_none());
+    }
+
+    #[test]
+    fn title_anim_never_blocks_nav_but_keeps_frames() {
+        let mut state = State {
+            rows: title_rows(5),
+            game_selected: 2,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        state.game_selected = 3;
+        state.begin_strip_anim(2.0, now);
+        assert!(state.title_anim.is_some());
+        // Retargetable chase: pad nav is not gated while the title crossfades.
+        assert!(!state.animating());
+        assert!(state.move_selection(1).is_some());
+        assert_eq!(state.game_selected, 4);
+        // ... but frames keep flowing until the crossfade settles.
+        assert!(state.needs_frames());
+    }
+
+    #[test]
+    fn title_crossfade_visual_none_when_stale() {
+        let mut state = State {
+            rows: title_rows(5),
+            game_selected: 3,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        state.begin_strip_anim(2.0, now);
+        assert!(state.title_crossfade_visual(now).is_some());
+        // Catalog shrank past the outgoing index: render incoming only.
+        state.rows.truncate(2);
+        state.game_selected = 1;
+        assert!(state.title_crossfade_visual(now).is_none());
+    }
+
+    #[test]
+    fn layout_transition_curve_hits_endpoints_and_midpoint() {
+        use crate::persist::prefs::ImmersiveLayout;
+        // Progress curve: settled ends, clamped past the end.
+        assert_eq!(layout_transition_eased(0), 0.0);
+        assert_eq!(layout_transition_eased(LAYOUT_TRANSITION_MS), 1.0);
+        assert_eq!(layout_transition_eased(LAYOUT_TRANSITION_MS * 4), 1.0);
+        assert!((layout_transition_eased(LAYOUT_TRANSITION_MS / 2) - 0.5).abs() < 1e-6);
+        // Opacity: fully on at both ends, fully out at the midpoint swap.
+        assert!((layout_transition_opacity(0.0) - 1.0).abs() < 1e-6);
+        assert!((layout_transition_opacity(1.0) - 1.0).abs() < 1e-6);
+        assert!(layout_transition_opacity(0.5).abs() < 1e-6);
+        assert!(layout_transition_opacity(0.25) < 1.0 && layout_transition_opacity(0.25) > 0.0);
+        // Offset: resting at both ends, peaking at the midpoint swap, axis per layout.
+        let (dx, dy) = layout_transition_offset(0.0, ImmersiveLayout::Vertical);
+        assert!(dx.abs() < 1e-6 && dy.abs() < 1e-6);
+        let (dx, dy) = layout_transition_offset(1.0, ImmersiveLayout::Horizontal);
+        assert!(dx.abs() < 1e-6 && dy.abs() < 1e-6);
+        let (dx, dy) = layout_transition_offset(0.5, ImmersiveLayout::Vertical);
+        assert!(dx.abs() < 1e-6 && (dy.abs() - LAYOUT_TRANSITION_SLIDE_PX).abs() < 0.01);
+        let (dx, dy) = layout_transition_offset(0.5, ImmersiveLayout::Horizontal);
+        assert!((dx.abs() - LAYOUT_TRANSITION_SLIDE_PX).abs() < 0.01 && dy.abs() < 1e-6);
+        // Exit travels the negative side, enter arrives from the positive side.
+        let (_, exit_dy) = layout_transition_offset(0.25, ImmersiveLayout::Vertical);
+        assert!(exit_dy < 0.0);
+        let (_, enter_dy) = layout_transition_offset(0.75, ImmersiveLayout::Vertical);
+        assert!(enter_dy > 0.0);
+        let _ = ImmersiveLayout::Vertical;
+    }
+
+    #[test]
+    fn begin_layout_transition_only_on_change_and_swaps_at_midpoint() {
+        use crate::persist::prefs::ImmersiveLayout;
+        let mut state = State::default();
+        let now = Instant::now();
+        // Same layout: no anim (settings open / redraw must not transition).
+        state.begin_layout_transition(ImmersiveLayout::Vertical, ImmersiveLayout::Vertical, now);
+        assert!(state.layout_transition.is_none());
+        // Actual change: anim runs and needs frames.
+        state.begin_layout_transition(ImmersiveLayout::Vertical, ImmersiveLayout::Horizontal, now);
+        assert!(state.layout_transition.is_some());
+        assert!(state.needs_frames());
+        // First half renders the old orientation sliding out (up for vertical).
+        let quarter = now + Duration::from_millis(LAYOUT_TRANSITION_MS / 4);
+        let (layout, opacity, dx, dy) =
+            state.layout_transition_visual(ImmersiveLayout::Horizontal, quarter);
+        assert_eq!(layout, ImmersiveLayout::Vertical);
+        assert!(opacity < 1.0 && opacity > 0.0);
+        assert!(dx.abs() < 1e-6 && dy < 0.0);
+        // Second half renders the new orientation sliding in (from the right).
+        let three_quarter = now + Duration::from_millis(LAYOUT_TRANSITION_MS * 3 / 4);
+        let (layout, opacity, dx, dy) =
+            state.layout_transition_visual(ImmersiveLayout::Horizontal, three_quarter);
+        assert_eq!(layout, ImmersiveLayout::Horizontal);
+        assert!(opacity < 1.0 && opacity > 0.0);
+        assert!(dx > 0.0 && dy.abs() < 1e-6);
+        // Past the end the transition retires and the settled layout shows fully.
+        let done = now + Duration::from_millis(LAYOUT_TRANSITION_MS + 16);
+        state.tick_anim(done);
+        assert!(state.layout_transition.is_none());
+        let (layout, opacity, dx, dy) =
+            state.layout_transition_visual(ImmersiveLayout::Horizontal, done);
+        assert_eq!(layout, ImmersiveLayout::Horizontal);
+        assert_eq!(opacity, 1.0);
+        assert!(dx.abs() < 1e-6 && dy.abs() < 1e-6);
+    }
+
+    #[test]
+    fn layout_transition_blocks_nav_while_strip_stays_live() {
+        use crate::persist::prefs::ImmersiveLayout;
+        let mut state = State::default();
+        assert!(!state.animating());
+        let now = Instant::now();
+        // Transition in flight: pad nav gates on animating().
+        state.begin_layout_transition(ImmersiveLayout::Vertical, ImmersiveLayout::Horizontal, now);
+        assert!(state.animating());
+        // Retired: nav live again.
+        let done = now + Duration::from_millis(LAYOUT_TRANSITION_MS + 16);
+        state.tick_anim(done);
+        assert!(state.layout_transition.is_none());
+        assert!(!state.animating());
+        // Strip scroll stays nav-live: animating() ignores it.
+        let mut strip = State {
+            rows: (0..3)
+                .map(|i| StartRow {
+                    title: format!("g{i}"),
+                    subtitle: None,
+                    target: format!("t{i}"),
+                    args: String::new(),
+                    play_key: format!("k{i}"),
+                    icon: None,
+                    icon_source: None,
+                    backdrop_path: None,
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                    disabled: false,
+                    played_at_ms: None,
+                })
+                .collect(),
+            game_selected: 1,
+            immersive: true,
+            ..Default::default()
+        };
+        strip.begin_strip_anim(0.0, now);
+        assert!(strip.strip_busy());
+        assert!(!strip.animating());
+    }
+
+    #[test]
+    fn layout_transition_drops_keyboard_equivalent_nav_until_retire() {
+        use crate::persist::prefs::ImmersiveLayout;
+        let mut state = State {
+            rows: title_rows(3),
+            game_selected: 1,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        // Settled: selection moves.
+        assert!(!state.layout_transition_active());
+        assert!(state.move_selection(1).is_some());
+        assert_eq!(state.game_selected, 2);
+        assert!(state.move_selection(-1).is_some());
+        // Transition in flight: keyboard-equivalent dispatch is dropped.
+        state.begin_layout_transition(ImmersiveLayout::Vertical, ImmersiveLayout::Horizontal, now);
+        assert!(state.layout_transition_active());
+        assert!(state.move_selection(1).is_none());
+        assert!(state.move_selection(-1).is_none());
+        assert_eq!(state.game_selected, 1);
+        // Retired: nav live again.
+        let done = now + Duration::from_millis(LAYOUT_TRANSITION_MS + 16);
+        state.tick_anim(done);
+        assert!(!state.layout_transition_active());
+        assert!(state.move_selection(1).is_some());
+        assert_eq!(state.game_selected, 2);
+    }
+
     #[test]
     fn move_selection_games_clamps_at_ends() {
         let mut state = State {
@@ -5514,6 +6576,271 @@ mod tests {
         state.rows[2].disabled = true;
         assert!(state.move_selection(1).is_none());
         assert_eq!(state.game_selected, 0);
+    }
+
+    fn edit_check_row(play_key: &str, title: &str, in_catalog: bool) -> StartRow {
+        StartRow {
+            title: title.into(),
+            subtitle: None,
+            target: format!("t-{play_key}"),
+            args: String::new(),
+            play_key: play_key.into(),
+            icon: None,
+            icon_source: None,
+            backdrop_path: None,
+            edit: Some(EditRow::Steam {
+                appid: 7,
+                in_catalog,
+            }),
+            skeleton: false,
+            update_required: false,
+            disabled: false,
+            played_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn sort_edit_rows_tiebreaks_duplicate_titles_by_play_key() {
+        // `steam_by_id` iterates in hash order, so duplicate titles must not
+        // reshuffle the checklist on every rebuild (toggle/scan/enter).
+        let mut rows = vec![
+            edit_check_row("steam:2", "Same", true),
+            edit_check_row("steam:1", "same", true),
+            edit_check_row("steam:3", "Other", true),
+        ];
+        sort_edit_rows(&mut rows);
+        let keys: Vec<_> = rows.iter().map(|r| r.play_key.as_str()).collect();
+        assert_eq!(keys, vec!["steam:3", "steam:1", "steam:2"]);
+        // Shuffled input converges to the same order.
+        let mut shuffled = vec![
+            edit_check_row("steam:2", "Same", true),
+            edit_check_row("steam:3", "Other", true),
+            edit_check_row("steam:1", "same", true),
+        ];
+        sort_edit_rows(&mut shuffled);
+        let reshuffled: Vec<_> = shuffled.iter().map(|r| r.play_key.as_str()).collect();
+        assert_eq!(reshuffled, keys);
+    }
+
+    #[test]
+    fn select_game_by_play_key_or_keep_pins_across_rebuild() {
+        let mut state = State {
+            rows: vec![
+                game_row_with("steam:1"),
+                game_row_with("steam:2"),
+                game_row_with("steam:3"),
+            ],
+            game_selected: 2,
+            ..Default::default()
+        };
+        // Key still present (rebuilt list re-sorted around it): follow the key.
+        state.select_game_by_play_key_or_keep(Some("steam:1"));
+        assert_eq!(state.game_selected, 0);
+        // Key gone (manual removed mid-edit): keep the clamped neighbor,
+        // never yank to 0.
+        state.game_selected = 1;
+        state.select_game_by_play_key_or_keep(Some("steam:gone"));
+        assert_eq!(state.game_selected, 1);
+        // No key: no-op.
+        state.select_game_by_play_key_or_keep(None);
+        assert_eq!(state.game_selected, 1);
+        // Empty rows: no-op, no panic.
+        state.rows.clear();
+        state.game_selected = 0;
+        state.select_game_by_play_key_or_keep(Some("steam:1"));
+        assert_eq!(state.game_selected, 0);
+    }
+
+    #[test]
+    fn edit_exit_target_key_keeps_toggled_on_cursor() {
+        let state = State {
+            rows: vec![
+                edit_check_row("steam:1", "A", true),
+                edit_check_row("steam:2", "B", true),
+            ],
+            game_selected: 1,
+            editing: true,
+            ..Default::default()
+        };
+        assert_eq!(state.edit_exit_target_key().as_deref(), Some("steam:2"));
+    }
+
+    #[test]
+    fn edit_exit_target_key_prefers_above_then_after() {
+        let rows = vec![
+            edit_check_row("steam:1", "A", true),
+            edit_check_row("steam:2", "B", false),
+            edit_check_row("steam:3", "C", true),
+        ];
+        // Cursor on toggled-off B: nearest toggled-on above is A.
+        let state = State {
+            rows: rows.clone(),
+            game_selected: 1,
+            editing: true,
+            ..Default::default()
+        };
+        assert_eq!(state.edit_exit_target_key().as_deref(), Some("steam:1"));
+        // Nothing above: nearest toggled-on after.
+        let state = State {
+            rows: vec![
+                edit_check_row("steam:1", "A", false),
+                edit_check_row("steam:2", "B", false),
+                edit_check_row("steam:3", "C", true),
+            ],
+            game_selected: 0,
+            editing: true,
+            ..Default::default()
+        };
+        assert_eq!(state.edit_exit_target_key().as_deref(), Some("steam:3"));
+    }
+
+    #[test]
+    fn edit_exit_target_key_none_when_nothing_toggled_on() {
+        let state = State {
+            rows: vec![
+                edit_check_row("steam:1", "A", false),
+                edit_check_row("steam:2", "B", false),
+            ],
+            game_selected: 0,
+            editing: true,
+            ..Default::default()
+        };
+        assert_eq!(state.edit_exit_target_key(), None);
+        let empty = State {
+            editing: true,
+            ..Default::default()
+        };
+        assert_eq!(empty.edit_exit_target_key(), None);
+    }
+
+    #[test]
+    fn resolve_edit_exit_selection_keeps_enabled_preferred() {
+        let mut state = State {
+            rows: vec![
+                test_row("a", false, None),
+                test_row("b", false, None),
+                test_row("c", false, None),
+            ],
+            game_selected: 0,
+            ..Default::default()
+        };
+        state.resolve_edit_exit_selection(Some("k-b"));
+        assert_eq!(state.game_selected, 1);
+    }
+
+    #[test]
+    fn resolve_edit_exit_selection_prefers_above_then_after() {
+        // Preferred present but disabled (uninstalled mid-edit): above wins.
+        let mut state = State {
+            rows: vec![
+                test_row("a", false, None),
+                test_row("b", true, None),
+                test_row("c", false, None),
+            ],
+            game_selected: 0,
+            ..Default::default()
+        };
+        state.resolve_edit_exit_selection(Some("k-b"));
+        assert_eq!(state.game_selected, 0);
+        // Nothing enabled above: nearest enabled after.
+        let mut state = State {
+            rows: vec![
+                test_row("a", true, None),
+                test_row("b", true, None),
+                test_row("c", false, None),
+            ],
+            game_selected: 2,
+            ..Default::default()
+        };
+        state.resolve_edit_exit_selection(Some("k-a"));
+        assert_eq!(state.game_selected, 2);
+        // Preferred key gone entirely (toggled off on save): start from the
+        // clamped index, then the same above-first rule.
+        let mut state = State {
+            rows: vec![
+                test_row("a", false, None),
+                test_row("b", true, None),
+                test_row("c", false, None),
+            ],
+            game_selected: 1,
+            ..Default::default()
+        };
+        state.resolve_edit_exit_selection(Some("k-gone"));
+        assert_eq!(state.game_selected, 0);
+    }
+
+    #[test]
+    fn resolve_edit_exit_selection_empty_and_all_disabled() {
+        // No rows: index 0 so the existing empty-games view shows.
+        let mut state = State {
+            game_selected: 3,
+            ..Default::default()
+        };
+        state.resolve_edit_exit_selection(Some("k-anything"));
+        assert_eq!(state.game_selected, 0);
+        state.resolve_edit_exit_selection(None);
+        assert_eq!(state.game_selected, 0);
+        // Skeleton rows stay navigable (browse move_selection parity).
+        let mut skeleton = test_row("s", true, None);
+        skeleton.skeleton = true;
+        let mut state = State {
+            rows: vec![skeleton],
+            game_selected: 0,
+            ..Default::default()
+        };
+        state.resolve_edit_exit_selection(Some("k-s"));
+        assert_eq!(state.game_selected, 0);
+        // All disabled, none navigable: keep the clamped index (set_rows
+        // parity — the row renders dimmed and launch stays blocked).
+        let mut state = State {
+            rows: vec![test_row("a", true, None), test_row("b", true, None)],
+            game_selected: 1,
+            ..Default::default()
+        };
+        state.resolve_edit_exit_selection(Some("k-b"));
+        assert_eq!(state.game_selected, 1);
+    }
+
+    #[test]
+    fn edit_session_leaves_sort_and_section_mode_untouched() {
+        use crate::persist::prefs::GamesSortMode;
+        // Regression: entering/exiting edit mode (save AND cancel, with
+        // toggles in between) must not re-sort the games list. The stored
+        // sort always mirrors prefs — `cycle_games_sort` refuses while
+        // editing and `refresh_start_rows` re-syncs on every rebuild — and
+        // these State transitions (the unit-testable half) preserve it.
+        for sort in [GamesSortMode::LastPlayed, GamesSortMode::Alphabetical] {
+            let mut state = State {
+                rows: vec![test_row("b", false, None), test_row("a", false, None)],
+                game_selected: 1,
+                sort_mode: sort,
+                ..Default::default()
+            };
+            let section_before = state.games_section_mode();
+            // Enter edit: checklist rebuild + cursor pin must not touch sort.
+            state.editing = true;
+            state.capture_edit_anchor();
+            let mut checklist = vec![
+                edit_check_row("steam:1", "B", true),
+                edit_check_row("steam:2", "A", true),
+            ];
+            sort_edit_rows(&mut checklist);
+            state.set_rows(checklist);
+            state.select_game_by_play_key_or_keep(state.edit_anchor_play_key.clone().as_deref());
+            assert_eq!(state.sort_mode, sort);
+            // Mid-edit toggle rebuild: pin keeps the cursor, sort untouched.
+            state.select_game_by_play_key_or_keep(Some("steam:2"));
+            assert_eq!(state.sort_mode, sort);
+            // Exit (save or cancel): browse rows rebuilt under the same sort,
+            // selection resolved by key — sort/section identical to pre-enter.
+            state.editing = false;
+            state.edit_anchor_play_key.take();
+            state.set_rows(vec![test_row("a", false, None), test_row("b", false, None)]);
+            state.resolve_edit_exit_selection(Some("k-a"));
+            assert_eq!(state.sort_mode, sort);
+            assert_eq!(state.games_section_mode(), section_before);
+            assert_eq!(state.game_selected, 0);
+        }
     }
 
     fn write_tiny_png(path: &std::path::Path) {

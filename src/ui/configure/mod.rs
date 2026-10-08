@@ -2,6 +2,7 @@
 //! position picker, lightbar spectrum editor, battery analytics, and
 //! system / start-screen launcher settings.
 
+pub mod changelog;
 mod coverage;
 mod spectrum;
 
@@ -15,7 +16,8 @@ use crate::persist::analytics::{
     BucketDirection, ControllerAnalytics, InProgressBucket, StepCoverage, format_duration_short,
 };
 use crate::persist::prefs::{
-    AUTO_OPEN_MODES, LOW_BATTERY_PERCENT_MAX, LOW_BATTERY_PERCENT_MIN, StartAutoOpen, ToastPosition,
+    AUTO_OPEN_MODES, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout, LOW_BATTERY_PERCENT_MAX,
+    LOW_BATTERY_PERCENT_MIN, StartAutoOpen, ToastPosition,
 };
 use crate::platform::app_meta::{DISPLAY_NAME, PKG_VERSION};
 use crate::ui::color::{BatterySpectrum, hsv_to_rgb};
@@ -25,9 +27,10 @@ use iced::font::Weight;
 use iced::mouse;
 use iced::widget::{
     Column, Row, button, canvas as canvas_widget, column, container, hover, mouse_area, pick_list,
-    row, scrollable, slider, space, svg, text, toggler, tooltip,
+    row, scrollable, slider, space, stack, svg, text, toggler, tooltip,
 };
 use iced::{Alignment, Color, Element, Fill, Font, Length};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Logical width of the configure window.
@@ -71,12 +74,20 @@ const GITHUB_URL: &str = "https://github.com/LankyMoose/sdsc-utils";
 const MICROSOFT_STORE_URL: &str =
     "https://apps.microsoft.com/store/detail/9NDMHS9RKPP0?cid=in-app-link";
 
+/// Scrollable widget id for the Configure content pane.
+///
+/// Single owner so `on_configure_message` / `debug_open` section changes can
+/// `scroll_to` top through one place. Only one content scrollable is mounted
+/// at a time (System vs. other sections share the id via the `scroll` closure).
+pub fn content_scroll_id() -> iced::widget::Id {
+    iced::widget::Id::new("configure-content-scroll")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
     System,
     StartScreen,
     Notifications,
-    ToastPosition,
     Lightbar,
     Analytics,
     PadInput,
@@ -93,7 +104,6 @@ impl Section {
             Self::System => "System",
             Self::StartScreen => "Start screen",
             Self::Notifications => "Notifications",
-            Self::ToastPosition => "Toast position",
             Self::Lightbar => "Lightbar colors",
             Self::Analytics => "Analytics",
             Self::PadInput => "Pad input",
@@ -109,7 +119,6 @@ impl Section {
             Self::System => "Startup and app data",
             Self::StartScreen => "Game launcher you open from your controller",
             Self::Notifications => "Which controller events show a toast",
-            Self::ToastPosition => "Where toasts appear on your screen",
             Self::Lightbar => "Lightbar color as the battery drains",
             Self::Analytics => "Learned charge and play times",
             Self::PadInput => "Live controller readings",
@@ -127,7 +136,6 @@ impl Section {
                 Self::System,
                 Self::StartScreen,
                 Self::Notifications,
-                Self::ToastPosition,
                 Self::Lightbar,
                 Self::Analytics,
             ];
@@ -147,7 +155,6 @@ impl Section {
                 Self::System,
                 Self::StartScreen,
                 Self::Notifications,
-                Self::ToastPosition,
                 Self::Lightbar,
                 Self::Analytics,
             ];
@@ -180,6 +187,7 @@ pub struct ConfigureSettings {
     pub start_screen_enabled: bool,
     pub start_screen_auto_open: StartAutoOpen,
     pub start_screen_always_immersive: bool,
+    pub start_screen_immersive_layout: ImmersiveLayout,
     pub start_screen_clock_enabled: bool,
     pub start_screen_inactive_secs: u32,
     pub start_screen_sleep_secs: u32,
@@ -191,6 +199,8 @@ pub struct ConfigureSettings {
     #[cfg(windows)]
     pub autostart: bool,
     pub show_developer: bool,
+    pub extra_steam_paths: Vec<PathBuf>,
+    pub steam_path_error: Option<String>,
 }
 
 /// Live DualSense / gamepad readings for the Pad input debug tab.
@@ -252,6 +262,7 @@ pub enum ConfigureMessage {
     SetStartScreenEnabled(bool),
     SetStartScreenAutoOpen(StartAutoOpen),
     SetStartScreenAlwaysImmersive(bool),
+    SetImmersiveLayout(ImmersiveLayout),
     SetStartScreenClock(bool),
     SetStartScreenInactiveSecs(u32),
     SetStartScreenSleepSecs(u32),
@@ -262,6 +273,10 @@ pub enum ConfigureMessage {
     SetStartScreenHapticsStrength(u8),
     OpenDataFolder,
     OpenExternalLink(&'static str),
+    OpenChangelog,
+    CloseChangelog,
+    AddSteamPath,
+    RemoveSteamPath(usize),
     #[cfg(windows)]
     SetAutostart(bool),
     SelectStop(usize),
@@ -295,6 +310,8 @@ pub struct ConfigureState {
     pub saturation: f32,
     pub value: f32,
     pub error: Option<String>,
+    pub show_changelog: bool,
+    pub steam_path_error: Option<String>,
 }
 
 impl ConfigureState {
@@ -307,6 +324,8 @@ impl ConfigureState {
             saturation: 0.0,
             value: 0.0,
             error: None,
+            show_changelog: false,
+            steam_path_error: None,
         };
         state.sync_hsv();
         state
@@ -488,7 +507,7 @@ pub fn view<'a>(
         container(
             column![
                 text(state.section.title())
-                    .size(theme::type_scale::HEADING)
+                    .size(theme::type_scale::TITLE)
                     .font(semibold())
                     .color(theme::INK),
                 text(state.section.subtitle())
@@ -529,6 +548,13 @@ pub fn view<'a>(
         .spacing(6)
         .height(Length::Fixed(HEADER_HEIGHT));
 
+    // Hairline separating the tab-pane header from its content (LINE tier).
+    let header_rule: Element<'_, ConfigureMessage> = container(space())
+        .width(Fill)
+        .height(Length::Fixed(1.0))
+        .style(theme::configure_header_rule)
+        .into();
+
     let scroll = |content: Element<'a, ConfigureMessage>| {
         scrollable(
             container(content)
@@ -540,6 +566,7 @@ pub fn view<'a>(
                 })
                 .width(Fill),
         )
+        .id(content_scroll_id())
         .spacing(SCROLL_GAP)
         .style(theme::scrollbar)
         .height(Fill)
@@ -565,8 +592,13 @@ pub fn view<'a>(
     };
 
     let content = column![
-        container(header)
-            .padding([0.0, CONTENT_PADDING])
+        container(column![header, header_rule].spacing(8))
+            .padding(iced::Padding {
+                top: 0.0,
+                right: CONTENT_PADDING,
+                bottom: 10.0,
+                left: CONTENT_PADDING,
+            })
             .width(Fill),
         // Embed scrollbar with a gutter so it does not hug the window edge.
         container(content_pane)
@@ -582,13 +614,53 @@ pub fn view<'a>(
         .height(Fill)
         .style(theme::glass(sidebar_radius()));
 
-    chrome::window(
+    let window = chrome::window(
         row![sidebar, content]
             .spacing(SIDEBAR_GAP)
             .padding(WINDOW_PAD)
             .width(Fill)
             .height(Fill),
-    )
+    );
+    if !state.show_changelog {
+        return window;
+    }
+    // Modal overlay: the backdrop mouse_area swallows every click outside the
+    // card (closing the modal) so nothing reaches the Settings window below.
+    // It also reports an `Idle` interaction so the stack levitates the cursor
+    // for lower layers: press-capture alone only blocks clicks, while hover /
+    // tooltip state is driven by cursor position and would otherwise still
+    // reach the buttons underneath.
+    // The card sits in an idempotent `OpenChangelog` mouse_area that captures
+    // card-background clicks before they can fall through to the backdrop
+    // (which would otherwise close the modal from inside the card).
+    stack![
+        window,
+        mouse_area(
+            container(space())
+                .width(Fill)
+                .height(Fill)
+                .style(theme::immersive_dim(0.55)),
+        )
+        .on_press(ConfigureMessage::CloseChangelog)
+        .on_right_press(ConfigureMessage::CloseChangelog)
+        .interaction(mouse::Interaction::Idle),
+        container(
+            mouse_area(
+                container(theme::framed(changelog::changelog_view()))
+                    .width(Length::Fixed(WIDTH - 80.0))
+                    .max_height(HEIGHT - 60.0),
+            )
+            .on_press(ConfigureMessage::OpenChangelog)
+            .on_right_press(ConfigureMessage::OpenChangelog),
+        )
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill),
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
 }
 
 fn semibold() -> Font {
@@ -770,8 +842,7 @@ fn section_content<'a>(
     match state.section {
         Section::System => system_settings_view(settings),
         Section::StartScreen => start_screen_view(settings),
-        Section::Notifications => notifications_view(settings),
-        Section::ToastPosition => toast_position_view(settings, theme::ACCENT),
+        Section::Notifications => notifications_view(settings, theme::ACCENT),
         Section::Lightbar => lightbar_view(state, settings),
         Section::Analytics => analytics_view(settings, analytics),
         Section::PadInput => pad_input_view(pad_input),
@@ -818,6 +889,7 @@ fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, Configu
         vec![
             note("Preferences, remembered controllers, analytics, and logs stay on this PC."),
             action_button("Open data folder", ConfigureMessage::OpenDataFolder),
+            action_button("View changelog", ConfigureMessage::OpenChangelog),
         ],
     );
 
@@ -895,6 +967,12 @@ fn footer_link_button<'a>(
     .into()
 }
 
+impl std::fmt::Display for ImmersiveLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
     let mut groups = Column::new().spacing(18).width(Fill);
 
@@ -949,6 +1027,31 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
                 settings.start_screen_clock_enabled,
                 ConfigureMessage::SetStartScreenClock,
             ),
+            row![
+                column![
+                    text("Layout")
+                        .size(theme::type_scale::BODY)
+                        .color(theme::INK),
+                    text("Orientation of the games strip")
+                        .size(12.0)
+                        .color(theme::DIM),
+                ]
+                .spacing(2)
+                .width(Fill),
+                pick_list(
+                    IMMERSIVE_LAYOUT_MODES,
+                    Some(settings.start_screen_immersive_layout),
+                    ConfigureMessage::SetImmersiveLayout,
+                )
+                .text_size(13.0)
+                .padding([7, 10])
+                .width(Length::Fixed(200.0))
+                .style(theme::pick_list)
+                .menu_style(theme::pick_list_menu),
+            ]
+            .spacing(16)
+            .align_y(Alignment::Center)
+            .into(),
         ];
 
         let idle_secs = settings.start_screen_inactive_secs;
@@ -1056,10 +1159,46 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         .padding([0, 4]),
     );
 
+    let mut library_rows: Vec<Element<'_, ConfigureMessage>> = settings
+        .extra_steam_paths
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            row![
+                text(path.display().to_string())
+                    .size(13.0)
+                    .width(Fill)
+                    .color(theme::INK),
+                button(text("Remove").size(12.0))
+                    .padding([4, 10])
+                    .on_press(ConfigureMessage::RemoveSteamPath(i))
+                    .style(theme::ghost),
+            ]
+            .align_y(Alignment::Center)
+            .spacing(8)
+            .into()
+        })
+        .collect();
+    if let Some(err) = &settings.steam_path_error {
+        library_rows.push(note(err.clone()));
+    }
+    library_rows.push(action_button("Add folder…", ConfigureMessage::AddSteamPath));
+    groups = groups.push(group(Some("Extra Steam libraries"), library_rows));
+
     groups.into()
 }
 
-fn notifications_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
+fn any_notification_enabled(settings: &ConfigureSettings) -> bool {
+    settings.notify_connect
+        || settings.notify_disconnect
+        || settings.notify_low
+        || settings.notify_charged
+}
+
+fn notifications_view<'a>(
+    settings: &ConfigureSettings,
+    accent: Color,
+) -> Element<'a, ConfigureMessage> {
     let toggle =
         |label: &'static str, helper: &'static str, value: bool, setting: NotificationSetting| {
             toggle_row(label, Some(helper), value, move |enabled| {
@@ -1112,10 +1251,16 @@ fn notifications_view<'a>(settings: &ConfigureSettings) -> Element<'a, Configure
         NotificationSetting::Charged,
     ));
 
-    column![connection, group(Some("Battery"), battery_rows)]
+    let mut items = column![connection, group(Some("Battery"), battery_rows)]
         .spacing(18)
-        .width(Fill)
-        .into()
+        .width(Fill);
+    if any_notification_enabled(settings) {
+        items = items.push(group(
+            Some("Toast position"),
+            vec![toast_position_view(settings, accent)],
+        ));
+    }
+    items.into()
 }
 
 fn analytics_view<'a>(
@@ -1546,6 +1691,7 @@ mod tests {
             start_screen_enabled: false,
             start_screen_auto_open: StartAutoOpen::Any,
             start_screen_always_immersive: false,
+            start_screen_immersive_layout: ImmersiveLayout::Vertical,
             start_screen_clock_enabled: true,
             start_screen_inactive_secs: 60,
             start_screen_sleep_secs: 300,
@@ -1557,6 +1703,8 @@ mod tests {
             #[cfg(windows)]
             autostart: false,
             show_developer: false,
+            extra_steam_paths: Vec::new(),
+            steam_path_error: None,
         };
         let _disabled_el = start_screen_view(&settings);
         settings.start_screen_enabled = true;

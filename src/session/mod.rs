@@ -29,6 +29,17 @@ pub const START_CONNECT_COOLDOWN: Duration = Duration::from_secs(5);
 /// Nonempty stretch shorter than this is an arrival blip — do not arm ghost cooldown.
 pub const MIN_CONNECT_STRETCH: Duration = Duration::from_secs(2);
 
+/// Start-screen selection owned in memory by the service process.
+///
+/// Stable keys (never indices): game rows resolve via `play_key`, controller
+/// rows via pad serial. Survives shell restarts, dies with the service, and is
+/// never written to disk.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartSelection {
+    pub game_key: Option<String>,
+    pub controller_key: Option<String>,
+}
+
 /// Side effects the shell must perform after a session step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionEffect {
@@ -81,6 +92,9 @@ pub struct DeviceSession {
     controllers_nonempty_since: Option<Instant>,
     missed_poll_since: HashMap<String, Instant>,
     pub start_auto_open_pending: bool,
+    /// Last start-screen selection reported by the shell (service process
+    /// lifetime only — never persisted to disk).
+    pub start_selection: StartSelection,
 }
 
 impl DeviceSession {
@@ -97,6 +111,7 @@ impl DeviceSession {
             controllers_nonempty_since: None,
             missed_poll_since: HashMap::new(),
             start_auto_open_pending: false,
+            start_selection: StartSelection::default(),
         }
     }
 
@@ -119,6 +134,11 @@ impl DeviceSession {
 
     pub fn mark_skip_connect_cooldown(&mut self) {
         self.skip_next_connect_cooldown = true;
+    }
+
+    /// Remember the shell's start-screen selection (in memory only).
+    pub fn remember_start_selection(&mut self, selection: StartSelection) {
+        self.start_selection = selection;
     }
 
     pub fn cooldown_active(&self, now: Instant) -> bool {
@@ -609,5 +629,39 @@ mod tests {
             )),
             "Bluetooth arrival should latch an open in Bluetooth mode"
         );
+    }
+
+    #[test]
+    fn start_selection_defaults_to_empty() {
+        let session = session_with(false, StartAutoOpen::Any);
+        assert_eq!(session.start_selection, StartSelection::default());
+        assert_eq!(session.start_selection.game_key, None);
+        assert_eq!(session.start_selection.controller_key, None);
+    }
+
+    #[test]
+    fn start_selection_remember_overwrites() {
+        let mut session = session_with(false, StartAutoOpen::Any);
+        session.remember_start_selection(StartSelection {
+            game_key: Some("steam:440".to_string()),
+            controller_key: Some("pad-a".to_string()),
+        });
+        assert_eq!(
+            session.start_selection.game_key.as_deref(),
+            Some("steam:440")
+        );
+        assert_eq!(
+            session.start_selection.controller_key.as_deref(),
+            Some("pad-a")
+        );
+        session.remember_start_selection(StartSelection {
+            game_key: Some("manual:xyz".to_string()),
+            controller_key: None,
+        });
+        assert_eq!(
+            session.start_selection.game_key.as_deref(),
+            Some("manual:xyz")
+        );
+        assert_eq!(session.start_selection.controller_key, None);
     }
 }

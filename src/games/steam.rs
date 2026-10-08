@@ -68,10 +68,37 @@ struct AppPlayStats {
     last_played_unix: Option<u64>,
 }
 
+/// Returns true if `path` is a valid Steam library folder —
+/// i.e. it contains a `steamapps/` subdirectory with at least one `appmanifest_*.acf` file.
+pub fn validate_steam_library_path(path: &std::path::Path) -> bool {
+    let steamapps = path.join("steamapps");
+    let Ok(entries) = std::fs::read_dir(&steamapps) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let name = e.file_name();
+        let s = name.to_string_lossy();
+        s.starts_with("appmanifest_") && s.ends_with(".acf")
+    })
+}
+
 /// Installed Steam games, sorted by name.
-pub fn list_installed_games() -> Result<Vec<SteamGame>, String> {
+pub fn list_installed_games(extra_paths: &[PathBuf]) -> Result<Vec<SteamGame>, String> {
     let steam_root = steam_root()?.ok_or_else(|| "Steam install not found".to_string())?;
-    let library_roots = library_folders(&steam_root)?;
+    let mut library_roots = library_folders(&steam_root)?;
+    for path in extra_paths {
+        if !validate_steam_library_path(path) {
+            app_log::warn(format!(
+                "steam: skipping invalid extra library path: {}",
+                path.display()
+            ));
+            continue;
+        }
+        push_library_paths(
+            &mut library_roots,
+            std::iter::once(path.to_string_lossy().into_owned()),
+        );
+    }
     let play_by_id = load_play_stats(&steam_root);
     let mut by_id: BTreeMap<u32, SteamGame> = BTreeMap::new();
 
@@ -150,18 +177,18 @@ pub struct MetaLine {
 /// Labeled browse meta lines (no update clause). Falls back to Store / Steam when empty.
 pub fn browse_meta_lines(game: &SteamGame) -> Vec<MetaLine> {
     let mut lines: Vec<MetaLine> = Vec::new();
-    if let Some(mins) = game.playtime_minutes.filter(|&m| m > 0) {
-        lines.push(MetaLine {
-            label: "Played",
-            value: format_playtime(mins),
-        });
-    }
     if let Some(unix) = game.last_played_unix.filter(|&t| t > 0)
         && let Some(date) = format_last_played_date(unix)
     {
         lines.push(MetaLine {
             label: "Last played",
             value: date,
+        });
+    }
+    if let Some(mins) = game.playtime_minutes.filter(|&m| m > 0) {
+        lines.push(MetaLine {
+            label: "Played",
+            value: format_playtime(mins),
         });
     }
     if lines.is_empty() {
@@ -186,7 +213,7 @@ pub fn meta_lines_are_steam_fallback(lines: &[MetaLine]) -> bool {
 
 /// Meta-only browse subtitle joined with middots (tests / legacy).
 ///
-/// Example: `82 h · 2 Oct 2025`. Falls back to `Steam` when empty.
+/// Example: `2 Oct 2025 · 82 h`. Falls back to `Steam` when empty.
 pub fn browse_meta_subtitle(game: &SteamGame) -> String {
     let lines = browse_meta_lines(game);
     if meta_lines_are_steam_fallback(&lines) {
@@ -202,7 +229,7 @@ pub fn browse_meta_subtitle(game: &SteamGame) -> String {
 
 /// Compact browse subtitle: meta plus optional Update.
 ///
-/// Example: `82 h · 2 Oct 2025 · Update required`.
+/// Example: `2 Oct 2025 · 82 h · Update required`.
 pub fn browse_subtitle(game: &SteamGame) -> String {
     let meta = browse_meta_subtitle(game);
     if !game.update_required {
@@ -1047,12 +1074,12 @@ mod tests {
         };
         let lines = browse_meta_lines(&game);
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].label, "Played");
-        assert_eq!(lines[0].value, "81 h");
-        assert_eq!(lines[1].label, "Last played");
-        assert!(lines[1].value.contains("202"), "{}", lines[1].value);
+        assert_eq!(lines[0].label, "Last played");
+        assert!(lines[0].value.contains("202"), "{}", lines[0].value);
+        assert_eq!(lines[1].label, "Played");
+        assert_eq!(lines[1].value, "81 h");
         let meta = browse_meta_subtitle(&game);
-        assert!(meta.starts_with("81 h · "), "{meta}");
+        assert!(meta.ends_with(" · 81 h"), "{meta}");
         assert!(!meta.contains("GB"), "{meta}");
         assert!(!meta.contains("Update"), "{meta}");
         let sub = browse_subtitle(&game);
@@ -1184,5 +1211,111 @@ mod tests {
         fs::write(&capsule, b"fake").unwrap();
         assert_eq!(library_cache_icon_in(&cache, 570), Some(capsule));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_steam_library_path_cases() {
+        let base = std::env::temp_dir().join(format!(
+            "sdsc-steam-validate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // (c) no steamapps/ dir.
+        let no_steamapps = base.join("no-steamapps");
+        fs::create_dir_all(&no_steamapps).unwrap();
+        assert!(!validate_steam_library_path(&no_steamapps));
+
+        // (b) steamapps/ exists but holds no manifest.
+        let empty = base.join("empty");
+        fs::create_dir_all(empty.join("steamapps")).unwrap();
+        assert!(!validate_steam_library_path(&empty));
+
+        // (a) valid library with one manifest.
+        let valid = base.join("valid");
+        fs::create_dir_all(valid.join("steamapps")).unwrap();
+        fs::write(
+            valid.join("steamapps").join("appmanifest_123.acf"),
+            "\"AppState\"\n{\n\t\"appid\"\t\t\"123\"\n\t\"name\"\t\t\"Valid Game\"\n}\n",
+        )
+        .unwrap();
+        assert!(validate_steam_library_path(&valid));
+
+        // (d) nonexistent path.
+        assert!(!validate_steam_library_path(&base.join("does-not-exist")));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Extra-path scan through the real `list_installed_games`, with
+    /// `HKCU\Software\Valve\Steam\SteamPath` pointed at a temp root and
+    /// restored on drop.
+    #[cfg(windows)]
+    #[test]
+    fn list_installed_games_scans_extra_path() {
+        struct SteamPathGuard {
+            prev: Option<String>,
+        }
+
+        impl Drop for SteamPathGuard {
+            fn drop(&mut self) {
+                let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+                if let Ok((key, _)) = hkcu.create_subkey(r"Software\Valve\Steam") {
+                    match &self.prev {
+                        Some(prev) => {
+                            let _ = key.set_value("SteamPath", prev);
+                        }
+                        None => {
+                            let _ = key.delete_value("SteamPath");
+                        }
+                    }
+                }
+            }
+        }
+
+        let base = std::env::temp_dir().join(format!(
+            "sdsc-steam-extra-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fake_root = base.join("root");
+        fs::create_dir_all(fake_root.join("steamapps")).unwrap();
+        let extra = base.join("extra");
+        fs::create_dir_all(extra.join("steamapps")).unwrap();
+        fs::write(
+            extra.join("steamapps").join("appmanifest_999001.acf"),
+            "\"AppState\"\n{\n\t\"appid\"\t\t\"999001\"\n\t\"name\"\t\t\"Extra Lib Game\"\n}\n",
+        )
+        .unwrap();
+        assert!(validate_steam_library_path(&extra));
+
+        let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+        let prev: Option<String> = hkcu
+            .open_subkey(r"Software\Valve\Steam")
+            .ok()
+            .and_then(|key| key.get_value("SteamPath").ok());
+        {
+            let (key, _) = hkcu.create_subkey(r"Software\Valve\Steam").unwrap();
+            key.set_value("SteamPath", &fake_root.to_string_lossy().into_owned())
+                .unwrap();
+            let _guard = SteamPathGuard { prev };
+
+            // The bogus path exercises the skip-with-warning branch.
+            let bogus = base.join("bogus");
+            let games = list_installed_games(&[bogus, extra]).unwrap();
+            let game = games
+                .iter()
+                .find(|g| g.appid == 999001)
+                .expect("extra-lib game scanned");
+            assert_eq!(game.name, "Extra Lib Game");
+        }
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

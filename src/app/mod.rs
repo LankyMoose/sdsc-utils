@@ -110,6 +110,9 @@ const START_UNFOCUS_GRACE: Duration = Duration::from_millis(150);
 const START_CURSOR_IDLE_HIDE: Duration = Duration::from_secs(2);
 /// Kick Steam scan if Start never opened / settled (tray-only boot).
 const STEAM_SCAN_IDLE_FALLBACK: Duration = Duration::from_secs(2);
+/// Shell-client retries for the service-owned start selection (`ClientIpcSync`
+/// ticks every 250ms, so this covers ~10s before falling back to defaults).
+const START_SELECTION_SYNC_RETRIES: u8 = 40;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -165,6 +168,7 @@ pub enum Message {
     Service(crate::ipc::ServiceMessage),
     ManualFilePicked(Option<PathBuf>),
     ManualIconPicked(Option<PathBuf>),
+    SteamPathPicked(Option<PathBuf>),
     SteamScanDone(Result<Vec<SteamGame>, String>),
     /// Boot idle fallback: start deferred Steam scan if still not kicked.
     SteamScanIdleFallback,
@@ -193,6 +197,9 @@ pub enum Message {
     ToastFrame,
     /// Redraw the controller popup while an Identify ring flash is running.
     IdentifyFrame,
+    /// Slow utility-ambient drift tick (≤2fps, only while a utility window is
+    /// visible — popup, Settings, or non-immersive Start). Toasts excluded.
+    UtilityAmbientTick,
     /// Begin dismiss (slide-out) for the toast of the given generation.
     ToastDismiss(u64),
     /// Hide toast HWND after a short defer (avoid create_renderer vs hide stress).
@@ -324,6 +331,14 @@ pub struct App {
     nav_not_ready_warned: bool,
     /// When the start window was opened (for not-ready timing).
     start_opened_at: Option<Instant>,
+    /// Mirror of the service-owned start selection (client mode only).
+    start_selection_shadow: Option<crate::session::StartSelection>,
+    /// True once this shell lifetime reported a selection (local is newest).
+    start_selection_dirty: bool,
+    /// True until the first stored selection arrives (boot request retries).
+    start_selection_sync_pending: bool,
+    /// Boot-request attempts sent so far (stops at [`START_SELECTION_SYNC_RETRIES`]).
+    start_selection_sync_attempts: u8,
 
     toast_window: Option<window::Id>,
     toast_message: Option<ToastMessage>,
@@ -514,6 +529,10 @@ impl App {
             nav_stale_warned: false,
             nav_not_ready_warned: false,
             start_opened_at: None,
+            start_selection_shadow: None,
+            start_selection_dirty: false,
+            start_selection_sync_pending: false,
+            start_selection_sync_attempts: 0,
             toast_window: None,
             toast_message: None,
             toast_queue: VecDeque::new(),
@@ -535,6 +554,13 @@ impl App {
         // Show the tray immediately (standalone only — service owns the tray in client mode).
         if !client_mode {
             app.create_tray();
+        }
+        if client_mode {
+            // Ask the service for the stored start selection (survives shell
+            // restarts). The reply arrives on the IPC broadcast; retries ride
+            // `ClientIpcSync` in case the shell's recv loop is not live yet.
+            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RequestStartSelection);
+            app.start_selection_sync_pending = true;
         }
         #[cfg(all(windows, debug_assertions))]
         start_hitch_hotkey_worker();
@@ -579,7 +605,7 @@ impl App {
                     let section = match arg {
                         "start" => Some(Section::StartScreen),
                         "notifications" => Some(Section::Notifications),
-                        "toast" => Some(Section::ToastPosition),
+                        "toast" => Some(Section::Notifications),
                         "lightbar" => Some(Section::Lightbar),
                         "analytics" => Some(Section::Analytics),
                         "diagnostics" => Some(Section::Diagnostics),
@@ -588,6 +614,15 @@ impl App {
                     tasks.push(self.open_configure());
                     if let Some(section) = section {
                         self.configure_state.select_section(section);
+                        // Fresh windows mount at offset 0; for an already-open
+                        // window this resets the content scroll to top.
+                        tasks.push(operation::scroll_to(
+                            configure_view::content_scroll_id(),
+                            operation::AbsoluteOffset {
+                                x: None,
+                                y: Some(0.0),
+                            },
+                        ));
                     }
                 }
                 "start" => tasks.push(self.open_start_screen()),
@@ -768,6 +803,19 @@ impl App {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::StartFrame));
         }
 
+        if self.popup_window.is_some()
+            || self.configure_window.is_some()
+            || (self.start_visible && !self.start_state.immersive)
+        {
+            // Slow utility-ambient drift (backdrop.rs): ≤2fps redraws only while
+            // a utility window is actually visible; hidden/idle windows never
+            // tick, so they never redraw for this.
+            subscriptions.push(
+                iced::time::every(crate::ui::backdrop::UTILITY_TICK)
+                    .map(|_| Message::UtilityAmbientTick),
+            );
+        }
+
         if self.session.prefs.start_screen_enabled {
             subscriptions.push(
                 Subscription::run(crate::ui::start::art_worker::event_stream)
@@ -800,7 +848,9 @@ impl App {
         }
 
         if Some(window) == self.start_window {
-            let stage_h = self.start_monitor_cover.map(|c| c.height).unwrap_or(1080.0);
+            let cover = self.start_monitor_cover.map(|c| (c.width, c.height));
+            let stage_w = cover.map(|(w, _)| w).unwrap_or(1920.0);
+            let stage_h = cover.map(|(_, h)| h).unwrap_or(1080.0);
             let settings_snapshot = self.start_settings_snapshot();
             let start = start_view::view(
                 &self.start_state,
@@ -811,6 +861,7 @@ impl App {
                 // Prefs always normalize to PS on load/save.
                 &self.session.prefs.start_screen_gesture,
                 stage_h,
+                stage_w,
                 &settings_snapshot,
             )
             .map(Message::Start);
@@ -992,6 +1043,10 @@ impl App {
                         task = task.chain(self.warm_immersive_art_task());
                     } else {
                         // Compact: chrome + skeletons immediately; defer Steam settle.
+                        // The scrollables now exist, so reveal the restored
+                        // selection (a scroll_to sent with window::open would
+                        // have targeted a not-yet-mounted id and been dropped).
+                        task = task.chain(self.scroll_start_selection_for_open());
                         if self.start_cold_load_remaining {
                             self.start_cold_load_remaining = false;
                             task = task.chain(self.schedule_steam_scan_after_settle());
@@ -1132,11 +1187,28 @@ impl App {
                         };
                     }
                     // Leftover-chord arming is pad-local; keyboard stays live.
+                    // Layout transition reflows main content: drop keyboard nav for its
+                    // duration. Confirm/Cancel/Close stay live (cancellable chrome).
+                    if pressed
+                        && matches!(
+                            action,
+                            StartKeyAction::Up
+                                | StartKeyAction::Down
+                                | StartKeyAction::Left
+                                | StartKeyAction::Right
+                        )
+                        && self.start_state.layout_transition_active()
+                    {
+                        return Task::none();
+                    }
                     return match action {
                         StartKeyAction::Up if pressed => {
                             self.cancel_start_holds();
                             if self.start_state.settings.open {
                                 self.on_start_settings_nav(Some(NavAction::Up))
+                            } else if self.immersive_horizontal_games_nav() {
+                                // Horizontal Games strip scrolls Left/Right only.
+                                Task::none()
                             } else {
                                 self.on_start_message(StartMessage::MoveUp)
                             }
@@ -1145,6 +1217,9 @@ impl App {
                             self.cancel_start_holds();
                             if self.start_state.settings.open {
                                 self.on_start_settings_nav(Some(NavAction::Down))
+                            } else if self.immersive_horizontal_games_nav() {
+                                // Horizontal Games strip scrolls Left/Right only.
+                                Task::none()
                             } else {
                                 self.on_start_message(StartMessage::MoveDown)
                             }
@@ -1157,6 +1232,8 @@ impl App {
                             self.cancel_start_holds();
                             if self.start_state.settings.open {
                                 self.on_start_settings_nav(Some(NavAction::PrevSlide))
+                            } else if self.immersive_horizontal_games_nav() {
+                                self.on_start_message(StartMessage::MoveUp)
                             } else {
                                 self.on_start_message(StartMessage::PrevSlide)
                             }
@@ -1169,6 +1246,8 @@ impl App {
                             self.cancel_start_holds();
                             if self.start_state.settings.open {
                                 self.on_start_settings_nav(Some(NavAction::NextSlide))
+                            } else if self.immersive_horizontal_games_nav() {
+                                self.on_start_message(StartMessage::MoveDown)
                             } else {
                                 self.on_start_message(StartMessage::NextSlide)
                             }
@@ -1197,7 +1276,14 @@ impl App {
                             self.sync_start_held();
                             if !pressed {
                                 self.cancel_start_holds();
-                                self.on_start_message(StartMessage::Close)
+                                if self.start_state.settings.any_menu_open() {
+                                    // Expanded dropdown owns Cancel: Esc closes the
+                                    // menu only, exactly like pad Circle — not the
+                                    // whole settings surface.
+                                    self.on_start_settings_nav(Some(NavAction::Cancel))
+                                } else {
+                                    self.on_start_message(StartMessage::Close)
+                                }
                             } else {
                                 Task::none()
                             }
@@ -1216,11 +1302,13 @@ impl App {
             }
             Message::ClientIpcSync => {
                 self.sync_client_input_hot();
+                self.maybe_request_start_selection();
                 Task::none()
             }
             Message::Service(msg) => self.on_service_message(msg),
             Message::ManualFilePicked(path) => self.on_manual_file_picked(path),
             Message::ManualIconPicked(path) => self.on_manual_icon_picked(path),
+            Message::SteamPathPicked(path) => self.on_steam_path_picked(path),
             Message::SteamScanDone(result) => self.on_steam_scan_done(result),
             Message::SteamScanIdleFallback => {
                 // Only when Start screen is off — otherwise StartOpened / settle owns the kick
@@ -1342,6 +1430,10 @@ impl App {
             Message::IdentifyFrame => {
                 self.popup_state.tick_identify_flash();
                 self.start_state.tick_identify_flash();
+                Task::none()
+            }
+            Message::UtilityAmbientTick => {
+                crate::ui::backdrop::note_utility_tick();
                 Task::none()
             }
             Message::ToastDismiss(generation) => {
@@ -1610,6 +1702,63 @@ impl App {
         }
     }
 
+    /// Retry the stored-selection request until the service answers, this shell
+    /// reports its own selection (local is then newest), or attempts run out
+    /// (old service — fall back to current behavior).
+    fn maybe_request_start_selection(&mut self) {
+        if !self.client_mode || !self.start_selection_sync_pending || self.start_selection_dirty {
+            return;
+        }
+        if self.start_selection_sync_attempts >= START_SELECTION_SYNC_RETRIES {
+            self.start_selection_sync_pending = false;
+            return;
+        }
+        self.start_selection_sync_attempts += 1;
+        let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RequestStartSelection);
+    }
+
+    /// Apply a service-stored selection to the start lists (keys → indices).
+    /// Returns true when an index moved.
+    fn apply_start_selection(&mut self, selection: &crate::session::StartSelection) -> bool {
+        self.start_selection_shadow = Some(selection.clone());
+        self.start_state.resolve_start_selection(
+            selection.game_key.as_deref(),
+            selection.controller_key.as_deref(),
+        )
+    }
+
+    /// Report a selection change to the service (client mode, Start visible).
+    /// Close resets indices via `reset_to_games` after hiding, so those never report.
+    fn report_start_selection_changed(
+        &mut self,
+        game_key: &Option<String>,
+        controller_key: &Option<String>,
+    ) {
+        if !self.client_mode || !self.start_visible {
+            return;
+        }
+        if game_key.is_none() && controller_key.is_none() {
+            return;
+        }
+        let selection = crate::session::StartSelection {
+            game_key: game_key.clone(),
+            controller_key: controller_key.clone(),
+        };
+        if self.start_selection_shadow.as_ref() == Some(&selection) {
+            return;
+        }
+        self.start_selection_shadow = Some(selection);
+        // Local nav is newer than any queued service reply — stop sync retries and
+        // ignore a stale `StartSelection` that arrives afterwards.
+        self.start_selection_dirty = true;
+        self.start_selection_sync_pending = false;
+        let shadow = self.start_selection_shadow.clone().unwrap_or_default();
+        let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::ReportStartSelection {
+            game_key: shadow.game_key,
+            controller_key: shadow.controller_key,
+        });
+    }
+
     /// True when the shell (not the service) should receive live pad-input edges.
     fn shell_wants_pad_input(&self) -> bool {
         // Debug quiet mode: HID input is focus-independent, so a pad press during
@@ -1859,6 +2008,7 @@ impl App {
             start_screen_enabled: self.session.prefs.start_screen_enabled,
             start_screen_auto_open: self.session.prefs.start_screen_auto_open,
             start_screen_always_immersive: self.session.prefs.start_screen_always_immersive,
+            start_screen_immersive_layout: self.session.prefs.start_screen_immersive_layout,
             start_screen_clock_enabled: self.session.prefs.start_screen_clock_enabled,
             start_screen_inactive_secs: self.session.prefs.start_screen_inactive_secs,
             start_screen_sleep_secs: self.session.prefs.start_screen_sleep_secs,
@@ -1867,6 +2017,8 @@ impl App {
             start_screen_sound_volume: self.session.prefs.start_screen_sound_volume,
             start_screen_haptics_enabled: self.session.prefs.start_screen_haptics_enabled,
             start_screen_haptics_strength: self.session.prefs.start_screen_haptics_strength,
+            extra_steam_paths: self.session.prefs.extra_steam_paths.clone(),
+            steam_path_error: self.configure_state.steam_path_error.clone(),
             #[cfg(windows)]
             autostart: autostart::is_enabled(),
             show_developer: {
@@ -1955,6 +2107,13 @@ impl App {
         match message {
             ConfigureMessage::SelectSection(section) => {
                 self.configure_state.select_section(section);
+                let scroll_top = operation::scroll_to(
+                    configure_view::content_scroll_id(),
+                    operation::AbsoluteOffset {
+                        x: None,
+                        y: Some(0.0),
+                    },
+                );
                 if section == Section::PadInput {
                     match start_input::read_nav_readings() {
                         start_input::NavReadingsOutcome::Readings { readings, .. } => {
@@ -1964,9 +2123,9 @@ impl App {
                             self.apply_pad_input_panel_from_readings(&[]);
                         }
                     }
-                    return Task::none();
+                    return scroll_top;
                 }
-                Task::none()
+                scroll_top
             }
             ConfigureMessage::SetNotification(setting, enabled) => {
                 match setting {
@@ -2030,6 +2189,9 @@ impl App {
             ConfigureMessage::SetStartScreenClock(enabled) => {
                 self.apply_start_screen_clock(enabled)
             }
+            ConfigureMessage::SetImmersiveLayout(layout) => {
+                self.apply_start_screen_immersive_layout(layout)
+            }
             ConfigureMessage::SetStartScreenInactiveSecs(secs) => {
                 self.apply_start_screen_inactive_secs(secs)
             }
@@ -2054,6 +2216,32 @@ impl App {
             ConfigureMessage::OpenDataFolder => {
                 if let Err(err) = paths::open_data_folder() {
                     app_log::warn(format!("open data folder failed: {err}"));
+                }
+                Task::none()
+            }
+            ConfigureMessage::OpenChangelog => {
+                self.configure_state.show_changelog = true;
+                Task::none()
+            }
+            ConfigureMessage::CloseChangelog => {
+                self.configure_state.show_changelog = false;
+                Task::none()
+            }
+            ConfigureMessage::AddSteamPath => Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                        .pick_folder()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                },
+                Message::SteamPathPicked,
+            ),
+            ConfigureMessage::RemoveSteamPath(index) => {
+                if index < self.session.prefs.extra_steam_paths.len() {
+                    self.session.prefs.extra_steam_paths.remove(index);
+                    self.session.prefs.save();
+                    self.configure_state.steam_path_error = None;
+                    return self.refresh_steam_library();
                 }
                 Task::none()
             }
@@ -2445,7 +2633,19 @@ impl App {
     }
 
     fn refresh_start_rows(&mut self) {
+        // Edit enter/exit must never re-sort: `sort_mode` always mirrors the
+        // prefs sort here. The only prefs-sort writer is `cycle_games_sort`,
+        // which refuses while editing, so the mode is byte-identical before
+        // entering and after exiting (save and cancel paths).
         self.start_state.sort_mode = self.session.prefs.games_sort_mode;
+        // Pin the edit cursor by stable key across the rebuild: toggles,
+        // manual adds, and Steam-scan reorders shift A–Z checklist indices, so
+        // a bare index would drift to a different game mid-edit.
+        let edit_pin = if self.start_state.editing {
+            self.start_state.selected_game_key()
+        } else {
+            None
+        };
         let rows = if self.start_state.editing {
             self.edit_checklist_rows()
         } else {
@@ -2464,6 +2664,18 @@ impl App {
                 .collect()
         };
         self.start_state.set_rows(rows);
+        if self.start_state.editing {
+            // Keep the cursor on the same checklist game; a removed manual
+            // keeps the clamped neighbor. Never fall back to 0 or re-pin the
+            // IPC shadow here: the shadow still holds the pre-toggle key while
+            // a toggle message is in flight, which would yank the cursor
+            // (manual removal's key is already gone → shadow fallback is 0).
+            self.start_state
+                .select_game_by_play_key_or_keep(edit_pin.as_deref());
+        } else if let Some(selection) = self.start_selection_shadow.clone() {
+            self.start_state
+                .resolve_start_selection(selection.game_key.as_deref(), None);
+        }
     }
 
     /// True when scan proves this entry is no longer installed (disabled row).
@@ -2507,7 +2719,7 @@ impl App {
                 rows.push(row);
             }
         }
-        rows.sort_by_key(|a| a.title.to_lowercase());
+        start_view::sort_edit_rows(&mut rows);
         rows
     }
 
@@ -2530,22 +2742,37 @@ impl App {
     }
 
     fn commit_start_edit(&mut self) -> Task<Message> {
+        // Resolve the exit target while still on the checklist rows: keep the
+        // cursor game when still toggled-on, else nearest toggled-on above /
+        // after (`None` when the draft catalog is empty → empty view shows).
+        // The anchor is intentionally NOT used here: the user may have
+        // navigated mid-edit and the cursor must persist.
+        let target = self.start_state.edit_exit_target_key();
         if let Some(draft) = self.edit_draft.take() {
             self.games = draft;
             self.games.save();
         }
         self.start_state.editing = false;
+        self.start_state.edit_anchor_play_key = None;
         self.refresh_start_rows();
-        self.start_state.restore_edit_anchor();
+        // `refresh_start_rows` re-syncs `sort_mode` from prefs (edit never
+        // mutates sort), so only the selection needs resolving here.
+        self.start_state
+            .resolve_edit_exit_selection(target.as_deref());
         self.scroll_start_selection_to_center(false)
             .chain(self.warm_start_art_task())
     }
 
     fn cancel_start_edit(&mut self) -> Task<Message> {
-        let key = self.start_state.edit_anchor_play_key.take();
+        // Cancel restores the pre-edit catalog, so revive the pre-edit
+        // (anchor) game when still present+enabled, else the same
+        // nearest-enabled-above / after rule (`None` anchor + empty rows →
+        // the existing empty-games view shows).
+        let anchor = self.start_state.edit_anchor_play_key.take();
         self.discard_edit_draft();
         self.refresh_start_rows();
-        self.start_state.select_game_by_play_key(key.as_deref());
+        self.start_state
+            .resolve_edit_exit_selection(anchor.as_deref());
         self.scroll_start_selection_to_center(true)
             .chain(self.warm_start_art_task())
     }
@@ -2612,6 +2839,11 @@ impl App {
             }
         }
         self.start_state.set_controllers(rows);
+        // Keep a restored selection pinned to its pad across membership changes.
+        if let Some(selection) = self.start_selection_shadow.clone() {
+            self.start_state
+                .resolve_start_selection(None, selection.controller_key.as_deref());
+        }
     }
 
     fn refresh_running_badge(&mut self) -> Task<Message> {
@@ -2837,10 +3069,12 @@ impl App {
         crate::controller::hid::diag::diag_info("ui-diag: steam scan start deferred=1");
         // Floor so chrome spinners stay visible even on a warm/fast refresh.
         let min_ms = crate::ui::start::mode::STEAM_SCAN_MIN_MS;
+        let extra_paths: Vec<PathBuf> = self.session.prefs.extra_steam_paths.clone();
         Task::perform(
             async move {
                 let started = Instant::now();
-                let result = spawn_blocking(steam::list_installed_games).await;
+                let result =
+                    spawn_blocking(move || steam::list_installed_games(&extra_paths)).await;
                 let min = Duration::from_millis(min_ms);
                 let elapsed = started.elapsed();
                 if elapsed < min {
@@ -3045,6 +3279,32 @@ impl App {
         Task::none()
     }
 
+    fn on_steam_path_picked(&mut self, path: Option<PathBuf>) -> Task<Message> {
+        let Some(path) = path else {
+            return Task::none();
+        };
+        if !steam::validate_steam_library_path(&path) {
+            self.configure_state.steam_path_error =
+                Some("No Steam library found in that folder".to_string());
+            return Task::none();
+        }
+        if self
+            .session
+            .prefs
+            .extra_steam_paths
+            .iter()
+            .any(|existing| existing == &path)
+        {
+            self.configure_state.steam_path_error =
+                Some("That folder is already in the list".to_string());
+            return Task::none();
+        }
+        self.configure_state.steam_path_error = None;
+        self.session.prefs.extra_steam_paths.push(path);
+        self.session.prefs.save();
+        self.refresh_steam_library()
+    }
+
     fn confirm_manual_add(&mut self) -> Task<Message> {
         let Some(draft) = self.start_state.manual_add.take() else {
             return Task::none();
@@ -3080,6 +3340,7 @@ impl App {
             auto_open: self.session.prefs.start_screen_auto_open,
             always_immersive: self.session.prefs.start_screen_always_immersive,
             clock_enabled: self.session.prefs.start_screen_clock_enabled,
+            immersive_layout: self.session.prefs.start_screen_immersive_layout,
             inactive_secs: self.session.prefs.start_screen_inactive_secs,
             sleep_secs: self.session.prefs.start_screen_sleep_secs,
             inactive_dim_percent: self.session.prefs.start_screen_inactive_dim_percent,
@@ -3099,6 +3360,27 @@ impl App {
     fn apply_start_screen_clock(&mut self, enabled: bool) -> Task<Message> {
         self.session.prefs.start_screen_clock_enabled = enabled;
         self.session.prefs.save();
+        Task::none()
+    }
+
+    fn apply_start_screen_immersive_layout(
+        &mut self,
+        layout: crate::persist::prefs::ImmersiveLayout,
+    ) -> Task<Message> {
+        // Picking from the menu collapses it, even when re-picking the
+        // current value.
+        self.start_state.settings.close_menus();
+        if self.session.prefs.start_screen_immersive_layout == layout {
+            return Task::none();
+        }
+        let from = self.session.prefs.start_screen_immersive_layout;
+        self.session.prefs.start_screen_immersive_layout = layout;
+        self.session.prefs.save();
+        // Covers both the Configure pick-list and the Start drawer dropdown:
+        // animate only on an actual change, showing the old orientation
+        // through the first half of the transition.
+        self.start_state
+            .begin_layout_transition(from, layout, Instant::now());
         Task::none()
     }
 
@@ -3138,14 +3420,15 @@ impl App {
     }
 
     fn apply_start_screen_auto_open(&mut self, mode: StartAutoOpen) -> Task<Message> {
+        // Picking from the menu collapses it, even when re-picking the
+        // current value.
+        self.start_state.settings.close_menus();
         let old = self.session.prefs.start_screen_auto_open;
         if old == mode {
             return Task::none();
         }
         self.session.prefs.start_screen_auto_open = mode;
         self.session.prefs.save();
-        // Selecting from the menu collapses it.
-        self.start_state.settings.auto_open_menu = None;
         if !mode.auto_opens() {
             // Disabling auto-open clears any latched auto-open; never opens
             // or closes here.
@@ -3233,6 +3516,23 @@ impl App {
         self.refresh_start_controllers();
 
         self.prepare_start_nav_on_open(false);
+        // Shell restart: resolve the service-stored keys (reported before the
+        // restart) back to indices now that rows/controllers are rebuilt.
+        // NOTE: no scroll_to here — the fresh window's scrollables do not exist
+        // yet, so a scroll_to batched with window::open targets a not-mounted
+        // id and is dropped by iced (compact-reopen bug: tracked offset said
+        // "centered" while the real viewport stayed at 0). Selection indices
+        // are restored now; the scroll_to reveal runs on StartOpened, when the
+        // view exists (see scroll_start_selection_for_open).
+        let mut restored_art = Task::none();
+        if let Some(selection) = self.start_selection_shadow.clone()
+            && self.start_state.resolve_start_selection(
+                selection.game_key.as_deref(),
+                selection.controller_key.as_deref(),
+            )
+        {
+            restored_art = self.warm_start_art_task();
+        }
 
         // Already open: re-focus; force running restore in case a game started.
         // Duplicate OpenStart (service glitch before ReportStartVisible) must
@@ -3244,7 +3544,9 @@ impl App {
             self.last_running_check = None;
             self.arm_chord_release_latch();
             let badge = self.refresh_running_badge();
-            return Task::batch([badge, focus_window(id)]);
+            // Scrollable already mounted — reveal is live here.
+            let reveal = self.scroll_start_selection_for_open();
+            return Task::batch([badge, focus_window(id), reveal]);
         }
 
         // Mark the current chord consumed (do not reset): a held PS from power-on
@@ -3326,7 +3628,7 @@ impl App {
         self.sync_client_input_hot();
         self.session.start_auto_open_pending = false;
         crate::platform::wgpu_diag::note_start_open();
-        Task::batch([badge, open.map(Message::StartOpened)])
+        Task::batch([badge, restored_art, open.map(Message::StartOpened)])
     }
 
     fn start_presentation(&self) -> StartPresentation {
@@ -3422,8 +3724,8 @@ impl App {
                     phase.label()
                 ));
                 // After the Float scale veil clears, force the compact list onto the selection
-                // (stale games_scroll_y from pre-promote often makes into-view a no-op).
-                Some(self.scroll_start_selection_to_center(true))
+                // (stale tracked offset from pre-promote often makes into-view a no-op).
+                Some(self.scroll_start_selection_for_open())
             }
             start_mode::TransitionPhase::Resizing => None,
         }
@@ -3517,7 +3819,7 @@ impl App {
         } else {
             // Center selection as soon as compact chrome exists; EnterCompact completion
             // re-centers once the scale Float is gone (see tick_immersive_transition_phase).
-            focus.chain(self.scroll_start_selection_to_center(true))
+            focus.chain(self.scroll_start_selection_for_open())
         }
     }
 
@@ -3770,9 +4072,45 @@ impl App {
         }
     }
 
+    /// All Start selection changes funnel through here (mouse, keyboard, pad).
+    /// Snapshots stable keys around the inner handler and reports net changes
+    /// to the service so the selection survives shell restarts.
     fn on_start_message(&mut self, message: StartMessage) -> Task<Message> {
+        let before = (
+            self.start_state.selected_game_key(),
+            self.start_state.selected_controller_key(),
+        );
+        let task = self.on_start_message_inner(message);
+        let after = (
+            self.start_state.selected_game_key(),
+            self.start_state.selected_controller_key(),
+        );
+        if after != before {
+            self.report_start_selection_changed(&after.0, &after.1);
+        }
+        task
+    }
+
+    fn on_start_message_inner(&mut self, message: StartMessage) -> Task<Message> {
         // Cold ambient: only Close is live (escape hatch); ignore nav/launch/edit.
         if self.start_state.cold_load_active && !matches!(message, StartMessage::Close) {
+            return Task::none();
+        }
+        // Layout transition reflows main content: drop navigational messages for its
+        // duration (pad Up/Down already gate on animating(); this also covers
+        // keyboard dispatch and pad slide-switch). Confirm/Cancel/Close and
+        // settings-toggle stay live (cancellable chrome), as do deliberate
+        // settings commits (open-menu Confirm picks, mouse Set* writes) —
+        // only focus moves and slider nudges freeze mid-transition.
+        if self.start_state.layout_transition_active()
+            && matches!(
+                message,
+                StartMessage::MoveUp
+                    | StartMessage::MoveDown
+                    | StartMessage::PrevSlide
+                    | StartMessage::NextSlide
+            )
+        {
             return Task::none();
         }
         // Keyboard / UI actions other than pure scroll cancel an in-progress hold.
@@ -3936,8 +4274,15 @@ impl App {
                     return Task::none();
                 }
                 if self.start_state.editing {
+                    // Slide-switch discards the draft (cancel-equivalent): revive
+                    // the pre-edit anchor game, else nearest-enabled, so the
+                    // stale edit-mode index (checklist order) never lands on
+                    // the wrong browse row.
+                    let anchor = self.start_state.edit_anchor_play_key.clone();
                     self.discard_edit_draft();
                     self.refresh_start_rows();
+                    self.start_state
+                        .resolve_edit_exit_selection(anchor.as_deref());
                 }
                 let now = Instant::now();
                 if self.start_state.immersive {
@@ -3959,8 +4304,12 @@ impl App {
                     return Task::none();
                 }
                 if self.start_state.editing {
+                    // Same cancel-equivalent discard as PrevSlide (see above).
+                    let anchor = self.start_state.edit_anchor_play_key.clone();
                     self.discard_edit_draft();
                     self.refresh_start_rows();
+                    self.start_state
+                        .resolve_edit_exit_selection(anchor.as_deref());
                 }
                 let now = Instant::now();
                 if self.start_state.immersive {
@@ -4008,15 +4357,24 @@ impl App {
                 task
             }
             StartMessage::GamesScrolled(y, viewport_h) => {
-                self.start_state.set_games_scroll(y, viewport_h);
+                self.start_state
+                    .record_list_scroll(start_view::StartListId::Games, y, viewport_h);
                 Task::none()
             }
             StartMessage::ControllersScrolled(y, viewport_h) => {
-                self.start_state.set_controllers_scroll(y, viewport_h);
+                self.start_state.record_list_scroll(
+                    start_view::StartListId::Controllers,
+                    y,
+                    viewport_h,
+                );
                 Task::none()
             }
             StartMessage::SettingsScrolled(y, viewport_h) => {
-                self.start_state.settings.set_scroll(y, viewport_h);
+                self.start_state.record_list_scroll(
+                    start_view::StartListId::Settings,
+                    y,
+                    viewport_h,
+                );
                 Task::none()
             }
             StartMessage::ManualAddTitle(title) => {
@@ -4060,24 +4418,18 @@ impl App {
             }
             StartMessage::SetAutoOpen(mode) => self.apply_start_screen_auto_open(mode),
             StartMessage::ToggleAutoOpenMenu => {
-                if self.start_state.settings.auto_open_menu.take().is_some() {
-                    self.play_start_cue(UiSoundKind::Nav);
-                    Task::none()
-                } else {
-                    let current = self.session.prefs.start_screen_auto_open;
-                    let highlight = crate::persist::prefs::AUTO_OPEN_MODES
-                        .iter()
-                        .position(|&m| m == current)
-                        .unwrap_or(0);
-                    self.start_state.settings.auto_open_menu = Some(highlight);
-                    self.play_start_cue(UiSoundKind::Nav);
-                    self.scroll_settings_focus_into_view(start_view::ScrollReveal::Either)
-                }
+                self.toggle_start_selector_menu(crate::ui::start::settings::SettingsRow::AutoOpen)
             }
+            StartMessage::ToggleLayoutMenu => self.toggle_start_selector_menu(
+                crate::ui::start::settings::SettingsRow::ImmersiveLayout,
+            ),
             StartMessage::SetAlwaysImmersive(enabled) => {
                 self.apply_start_screen_always_immersive(enabled)
             }
             StartMessage::SetClock(enabled) => self.apply_start_screen_clock(enabled),
+            StartMessage::SetImmersiveLayout(layout) => {
+                self.apply_start_screen_immersive_layout(layout)
+            }
             StartMessage::SetInactiveSecs(secs) => self.apply_start_screen_inactive_secs(secs),
             StartMessage::SetSleepSecs(secs) => self.apply_start_screen_sleep_secs(secs),
             StartMessage::SetInactiveDimPercent(percent) => {
@@ -4241,6 +4593,25 @@ impl App {
         )
     }
 
+    /// Open-time reveal for the current slide's selection (Games force-centers,
+    /// Controllers pins bidirectionally). Must run only once the window's
+    /// scrollables exist (`StartOpened`, re-focus, post-resize settle) — never
+    /// batched with `window::open`. No-op when already in view; harmless when
+    /// immersive (strip/dock own the selection, the compact id is unmounted).
+    fn scroll_start_selection_for_open(&mut self) -> Task<Message> {
+        let Some((id, y)) = self.start_state.open_reveal_scroll() else {
+            return Task::none();
+        };
+        self.start_state.note_scroll_y(&id, y);
+        operation::scroll_to(
+            id,
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
+        )
+    }
+
     fn toggle_start_edit(&mut self) -> Option<Task<Message>> {
         if self.start_state.slide != StartSlide::Games
             || self.start_state.overlay_blocking()
@@ -4265,6 +4636,10 @@ impl App {
         self.session.prefs.games_sort_mode = self.session.prefs.games_sort_mode.cycle();
         self.session.prefs.save();
         self.refresh_start_rows();
+        if self.start_state.immersive {
+            self.start_state
+                .note_position_bar_scroll(std::time::Instant::now());
+        }
         Some(self.scroll_start_selection_into_view())
     }
 
@@ -4598,6 +4973,27 @@ impl App {
                 events,
                 open_start_after_toast,
             } => self.queue_notifications(events, open_start_after_toast),
+            ServiceMessage::StartSelection {
+                game_key,
+                controller_key,
+            } => {
+                if self.start_selection_dirty {
+                    // This shell already reported its own selection — local is
+                    // newer than this (possibly queued) reply.
+                    return Task::none();
+                }
+                self.start_selection_sync_pending = false;
+                let selection = crate::session::StartSelection {
+                    game_key,
+                    controller_key,
+                };
+                if self.apply_start_selection(&selection) && self.start_visible {
+                    self.scroll_start_selection_into_view()
+                        .chain(self.warm_start_art_task())
+                } else {
+                    Task::none()
+                }
+            }
             ServiceMessage::Shutdown => self.update(Message::Exit),
             ServiceMessage::Ack
             | ServiceMessage::ControllerList(_)
@@ -4713,6 +5109,24 @@ impl App {
         self.on_reopen_gesture(&readings)
     }
 
+    /// True when left/right should scroll the Games strip instead of switching
+    /// slides: horizontal immersive layout on the Games slide with no overlays
+    /// (settings / replace-confirm / manual-add) open. Edit mode is a mode,
+    /// not an overlay, so it stays included: left/right move selection (all
+    /// rows are enabled in the checklist) while Up/Down are suppressed and
+    /// L2/R2 keep slide switching.
+    fn immersive_horizontal_games_nav(&self) -> bool {
+        self.start_state.immersive
+            && matches!(
+                self.session.prefs.start_screen_immersive_layout,
+                crate::persist::prefs::ImmersiveLayout::Horizontal
+            )
+            && matches!(self.start_state.slide, StartSlide::Games)
+            && !self.start_state.settings.open
+            && self.start_state.replace_confirm.is_none()
+            && self.start_state.manual_add.is_none()
+    }
+
     fn handle_start_nav_readings(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
         self.nav_missing_warned = false;
 
@@ -4809,11 +5223,14 @@ impl App {
                 .is_some_and(|row| row.show_power_off());
         // Immersive: left/right slides. Settings: Left/Right nudge sliders (compact too).
         let horizontal_nav = self.start_state.immersive || settings_open;
+        // Horizontal Games strip: left/right scroll games, L2/R2 switch slides.
+        let horizontal_games_nav = self.immersive_horizontal_games_nav();
         let tick = self.pad_nav.tick(
             readings,
             now,
             allow_nav_move,
             horizontal_nav,
+            horizontal_games_nav,
             replace_confirm && !animating,
             editing,
             hold_cross_close,
@@ -4972,6 +5389,23 @@ impl App {
         Task::batch([badge_task, nav_task])
     }
 
+    /// Generic dropdown toggle for selector rows: collapsing the open row
+    /// just closes it; opening inits the highlight to the current value,
+    /// closes any other menu (single menu), and scrolls it into view.
+    fn toggle_start_selector_menu(
+        &mut self,
+        row: crate::ui::start::settings::SettingsRow,
+    ) -> Task<Message> {
+        let snapshot = self.start_settings_snapshot();
+        let opened = self.start_state.settings.toggle_menu(row, &snapshot);
+        self.play_start_cue(UiSoundKind::Nav);
+        if opened {
+            self.scroll_settings_focus_into_view(start_view::ScrollReveal::Either)
+        } else {
+            Task::none()
+        }
+    }
+
     fn scroll_settings_focus_into_view(
         &mut self,
         direction: start_view::ScrollReveal,
@@ -4985,7 +5419,7 @@ impl App {
         else {
             return Task::none();
         };
-        self.start_state.settings.scroll_y = y;
+        self.start_state.sync_settings_scroll(y);
         operation::scroll_to(
             crate::ui::start::settings::settings_scroll_id(),
             operation::AbsoluteOffset {
@@ -4999,9 +5433,21 @@ impl App {
         let Some(action) = action else {
             return Task::none();
         };
-        // Expanded dropdown captures all directional + confirm/cancel input.
-        if self.start_state.settings.auto_open_menu.is_some() {
-            return self.on_auto_open_menu_nav(action);
+        // Layout transition reflows main content: drop focus moves + slider nudges
+        // (pad and keyboard alike) while it runs; Confirm/Cancel stay live, and
+        // an open-menu Confirm still commits — deliberate picks are never
+        // frozen, only navigation is.
+        if self.start_state.layout_transition_active()
+            && matches!(
+                action,
+                NavAction::Up | NavAction::Down | NavAction::PrevSlide | NavAction::NextSlide
+            )
+        {
+            return Task::none();
+        }
+        // An expanded dropdown captures all directional + confirm/cancel input.
+        if self.start_state.settings.any_menu_open() {
+            return self.on_selector_menu_nav(action);
         }
         let snapshot = self.start_settings_snapshot();
         self.start_state.settings.clamp_focus(&snapshot);
@@ -5069,35 +5515,36 @@ impl App {
         }
     }
 
-    /// Pad navigation while the auto-open dropdown menu is expanded.
+    /// Pad navigation while a dropdown selector menu is expanded.
     /// Directionals move the highlight (wrapping), Cross selects and closes,
-    /// Circle/Options close without changing anything.
-    fn on_auto_open_menu_nav(&mut self, action: NavAction) -> Task<Message> {
-        const COUNT: isize = crate::persist::prefs::AUTO_OPEN_MODES.len() as isize;
-        let Some(highlight) = self.start_state.settings.auto_open_menu else {
+    /// Circle/Options close without changing anything. The open menu's row
+    /// parameterizes the option list; committing routes through the row's
+    /// select message so apply + close run even when re-picking the value.
+    fn on_selector_menu_nav(&mut self, action: NavAction) -> Task<Message> {
+        let Some((row, highlight)) = self.start_state.settings.menu else {
             return Task::none();
         };
+        let count = row.selector_count() as isize;
         match action {
             NavAction::Up | NavAction::PrevSlide => {
-                let next = (highlight as isize - 1).rem_euclid(COUNT) as usize;
-                self.start_state.settings.auto_open_menu = Some(next);
+                let next = (highlight as isize - 1).rem_euclid(count) as usize;
+                self.start_state.settings.set_menu_highlight(next);
                 self.play_start_cue(UiSoundKind::Nav);
                 self.scroll_settings_focus_into_view(start_view::ScrollReveal::Either)
             }
             NavAction::Down | NavAction::NextSlide => {
-                let next = (highlight as isize + 1).rem_euclid(COUNT) as usize;
-                self.start_state.settings.auto_open_menu = Some(next);
+                let next = (highlight as isize + 1).rem_euclid(count) as usize;
+                self.start_state.settings.set_menu_highlight(next);
                 self.play_start_cue(UiSoundKind::Nav);
                 self.scroll_settings_focus_into_view(start_view::ScrollReveal::Either)
             }
             NavAction::Confirm => {
-                let mode = crate::persist::prefs::AUTO_OPEN_MODES
-                    [highlight.min(crate::persist::prefs::AUTO_OPEN_MODES.len() - 1)];
+                let select = row.selector_select(highlight);
                 self.play_start_cue(UiSoundKind::Action);
-                self.apply_start_screen_auto_open(mode)
+                self.on_start_message(select)
             }
             NavAction::Cancel | NavAction::ToggleSettings => {
-                self.start_state.settings.auto_open_menu = None;
+                self.start_state.settings.close_menus();
                 self.play_start_cue(UiSoundKind::Nav);
                 Task::none()
             }

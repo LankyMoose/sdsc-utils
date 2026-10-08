@@ -112,6 +112,32 @@ pub const AUTO_OPEN_MODES: [StartAutoOpen; 3] = [
     StartAutoOpen::Any,
 ];
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImmersiveLayout {
+    #[default]
+    Vertical,
+    Horizontal,
+}
+
+impl ImmersiveLayout {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Vertical => Self::Horizontal,
+            Self::Horizontal => Self::Vertical,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Vertical => "Vertical",
+            Self::Horizontal => "Horizontal",
+        }
+    }
+}
+
+pub const IMMERSIVE_LAYOUT_MODES: [ImmersiveLayout; 2] =
+    [ImmersiveLayout::Vertical, ImmersiveLayout::Horizontal];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Prefs {
     #[serde(default = "default_true")]
@@ -181,6 +207,10 @@ pub struct Prefs {
     /// Controllers slide: include remembered disconnected pads (default off).
     #[serde(default)]
     pub show_all_controllers: bool,
+    #[serde(default)]
+    pub start_screen_immersive_layout: ImmersiveLayout,
+    #[serde(default)]
+    pub extra_steam_paths: Vec<std::path::PathBuf>,
 }
 
 fn default_true() -> bool {
@@ -328,6 +358,8 @@ impl Default for Prefs {
             start_screen_haptics_strength: default_start_screen_haptics_strength(),
             games_sort_mode: GamesSortMode::default(),
             show_all_controllers: false,
+            start_screen_immersive_layout: ImmersiveLayout::default(),
+            extra_steam_paths: Vec::new(),
         }
     }
 }
@@ -744,5 +776,39 @@ mod tests {
         assert!(Prefs::default().start_screen_clock_enabled);
         let prefs: Prefs = serde_json::from_str(r#"{"start_screen_clock_enabled":false}"#).unwrap();
         assert!(!prefs.start_screen_clock_enabled);
+    }
+
+    #[test]
+    fn immersive_layout_round_trips_with_extra_steam_paths() {
+        let prefs = Prefs {
+            start_screen_immersive_layout: ImmersiveLayout::Horizontal,
+            extra_steam_paths: vec![PathBuf::from("/steam/extra")],
+            ..Prefs::default()
+        };
+        let encoded = serde_json::to_string(&prefs).unwrap();
+        let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.start_screen_immersive_layout,
+            ImmersiveLayout::Horizontal
+        );
+        assert_eq!(
+            decoded.extra_steam_paths,
+            vec![PathBuf::from("/steam/extra")]
+        );
+    }
+
+    #[test]
+    fn older_prefs_default_to_vertical_layout_and_no_extra_paths() {
+        let prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            prefs.start_screen_immersive_layout,
+            ImmersiveLayout::Vertical
+        );
+        assert!(prefs.extra_steam_paths.is_empty());
+        assert_eq!(
+            Prefs::default().start_screen_immersive_layout,
+            ImmersiveLayout::Vertical
+        );
+        assert!(Prefs::default().extra_steam_paths.is_empty());
     }
 }

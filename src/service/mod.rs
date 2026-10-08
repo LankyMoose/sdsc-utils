@@ -18,7 +18,7 @@ use crate::persist::analytics::AnalyticsStore;
 use crate::persist::prefs::Prefs;
 use crate::platform::app_log;
 use crate::session::{
-    ApplyContext, DeviceSession, SessionEffect, controllers_equivalent,
+    ApplyContext, DeviceSession, SessionEffect, StartSelection, controllers_equivalent,
     should_skip_connect_cooldown_on_power_off,
 };
 use crate::ui::tray::{self, QUIT_ID, SETTINGS_ID};
@@ -149,6 +149,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Keep the latch until ReportStartVisible(true): a brief connect (or a
             // message sent before the shell's recv loop is live) must not clear it.
             let _ = pipe.send(ServiceMessage::Controllers(session.controllers.clone()));
+            // Restore the shell's start-screen selection after a shell restart
+            // (service process lifetime only — never touches disk).
+            let stored = session.start_selection.clone();
+            let _ = pipe.send(ServiceMessage::StartSelection {
+                game_key: stored.game_key,
+                controller_key: stored.controller_key,
+            });
             if pending_open_start {
                 app_log::info("service: flushing latched OpenStart (shell up)");
                 let _ = pipe.send(ServiceMessage::Effects(vec![SessionEffect::OpenStart]));
@@ -539,6 +546,25 @@ fn handle_command(
                     let _ = pipe.send(ServiceMessage::Effects(ui_effects));
                 }
             }
+            Ok(LoopControl::Continue)
+        }
+        ShellCommand::ReportStartSelection {
+            game_key,
+            controller_key,
+        } => {
+            // In-memory only for the service process lifetime — never persisted.
+            session.remember_start_selection(StartSelection {
+                game_key,
+                controller_key,
+            });
+            Ok(LoopControl::Continue)
+        }
+        ShellCommand::RequestStartSelection => {
+            let stored = session.start_selection.clone();
+            let _ = pipe.send(ServiceMessage::StartSelection {
+                game_key: stored.game_key,
+                controller_key: stored.controller_key,
+            });
             Ok(LoopControl::Continue)
         }
     }

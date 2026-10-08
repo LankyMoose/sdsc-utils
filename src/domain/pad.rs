@@ -20,6 +20,12 @@ const STICK_AXIS_DEADZONE: f32 = 0.9;
 const STICK_COMBINED_DEADZONE: f32 = 0.15;
 const NAV_INITIAL_DELAY: Duration = Duration::from_millis(280);
 const NAV_REPEAT: Duration = Duration::from_millis(90);
+/// Neutral-dropout grace: a neutral sample held this long is a deliberate
+/// release (reset gating); shorter gaps are threshold flicker and keep the
+/// active direction + repeat schedule. Longer than several input-report
+/// intervals (4ms) and UI ticks, shorter than the initial delay so a fresh
+/// press after a real release still fires at once.
+const NAV_NEUTRAL_GRACE: Duration = Duration::from_millis(100);
 /// One wired DualSense report interval (`bInterval` 4). Block this long when the queue is empty.
 pub const INPUT_REPORT_WAIT_MS: i32 = 4;
 /// Cap on non-blocking drains per wake (32 = default Windows HID buffer depth).
@@ -342,6 +348,12 @@ pub struct NavStepper {
     /// Encoded direction: -2 Left, -1 Up, 1 Down, 2 Right, 0 idle.
     direction: i8,
     next_fire: Option<Instant>,
+    /// When the sample drops to neutral while a direction is active, the moment
+    /// of the first neutral tick. Transient dropouts (analog threshold hover,
+    /// e.g. a worn stick wavering across the stick deadzone) must not reset
+    /// repeat gating — only a neutral held past [`NAV_NEUTRAL_GRACE`] is a
+    /// deliberate release.
+    neutral_since: Option<Instant>,
 }
 
 impl NavStepper {
@@ -356,16 +368,30 @@ impl NavStepper {
     }
 
     /// `horizontal`: immersive left/right slides. Compact keeps vertical-only (L2/R2 slides).
+    /// `allow_vertical`: false on the horizontal Games strip where Up/Down are
+    /// suppressed — vertical stick wobble must not enter direction state, or a
+    /// held-Left stick oscillating Left↔Up/Down would fire immediately on every
+    /// flip (Up/Down flips are dropped after the stepper but still reset the
+    /// repeat timer). Forcing want_up/want_down false here keeps direction
+    /// pinned so initial-delay + repeat gating holds.
+    ///
+    /// A neutral sample only resets direction state after [`NAV_NEUTRAL_GRACE`]:
+    /// analog sticks hovering at the deadzone edge flicker between deflected
+    /// and neutral (0↔dir), and an instant reset would fire immediately on
+    /// every return, bypassing repeat gating. Bridging brief dropouts keeps a
+    /// steady hold gated; a deliberate release still resets, and any
+    /// direction change (including the opposite direction) still fires at once.
     pub fn update(
         &mut self,
         sample: &PadSample,
         now: Instant,
         horizontal: bool,
+        allow_vertical: bool,
     ) -> Option<NavAction> {
         let want_left = horizontal && (sample.dpad_left || sample.stick_x < 0.0);
         let want_right = horizontal && (sample.dpad_right || sample.stick_x > 0.0);
-        let want_up = sample.dpad_up || sample.stick_y < 0.0;
-        let want_down = sample.dpad_down || sample.stick_y > 0.0;
+        let want_up = allow_vertical && (sample.dpad_up || sample.stick_y < 0.0);
+        let want_down = allow_vertical && (sample.dpad_down || sample.stick_y > 0.0);
 
         let horiz = if want_left && !want_right {
             Some(-1i8)
@@ -404,10 +430,23 @@ impl NavStepper {
         };
 
         if direction == 0 {
+            if self.direction == 0 {
+                self.neutral_since = None;
+                return None;
+            }
+            // Active hold dropped to neutral: bridge transient dropouts so a
+            // flickering stick cannot reset repeat gating; only a deliberate
+            // (grace-held) release resets.
+            let since = *self.neutral_since.get_or_insert(now);
+            if now.saturating_duration_since(since) < NAV_NEUTRAL_GRACE {
+                return None;
+            }
             self.direction = 0;
             self.next_fire = None;
+            self.neutral_since = None;
             return None;
         }
+        self.neutral_since = None;
 
         if self.direction != direction {
             self.direction = direction;
@@ -425,6 +464,7 @@ impl NavStepper {
     pub fn reset(&mut self) {
         self.direction = 0;
         self.next_fire = None;
+        self.neutral_since = None;
     }
 }
 
@@ -1288,6 +1328,9 @@ impl PadNavBank {
     ///
     /// `allow_nav_move` gates D-pad/stick repeats (false while a slide animates).
     /// `horizontal_nav`: immersive left/right slides (and suppress L2/R2). Compact uses L2/R2.
+    /// `horizontal_games_nav`: horizontal immersive Games strip — left/right scroll
+    /// games (remapped to Up/Down here) while L2/R2 keep their slide actions;
+    /// Up/Down are suppressed (Left/Right only).
     /// `replace_confirm` switches to Cross-hold / Circle-cancel mode.
     /// `editing` when true: Triangle saves (ToggleEdit); Square is EditManual.
     /// `hold_cross_close` (games browse, running row): Cross hold closes the game.
@@ -1299,6 +1342,7 @@ impl PadNavBank {
         now: Instant,
         allow_nav_move: bool,
         horizontal_nav: bool,
+        horizontal_games_nav: bool,
         replace_confirm: bool,
         editing: bool,
         hold_cross_close: bool,
@@ -1427,11 +1471,27 @@ impl PadNavBank {
             };
 
             let nav = if allow_nav_move {
-                slot.nav_stepper
-                    .update(&reading.sample, now, horizontal_nav)
+                slot.nav_stepper.update(
+                    &reading.sample,
+                    now,
+                    horizontal_nav || horizontal_games_nav,
+                    // Horizontal Games strip suppresses Up/Down: keep vertical
+                    // wobble out of stepper direction state (see `NavStepper::update`).
+                    // Slide mode (`horizontal_nav` without games) keeps vertical live.
+                    !horizontal_games_nav,
+                )
             } else {
                 None
             };
+            // Horizontal Games strip: left/right scroll games, so stepper slide
+            // actions become vertical moves (L2/R2 keep PrevSlide/NextSlide below).
+            // Up/Down do nothing here — scrolling is Left/Right only.
+            let nav = nav.and_then(|action| match action {
+                NavAction::PrevSlide if horizontal_games_nav => Some(NavAction::Up),
+                NavAction::NextSlide if horizontal_games_nav => Some(NavAction::Down),
+                NavAction::Up | NavAction::Down if horizontal_games_nav => None,
+                other => Some(other),
+            });
 
             let foreign = slot.button_edges.foreign_press(&reading.sample, hold_owned);
             if hold_triangle_power && slot.triangle_hold.is_active() && (nav.is_some() || foreign) {
@@ -1443,8 +1503,13 @@ impl PadNavBank {
 
             let edge = slot.button_edges.update(&reading.sample, hold_owned);
             let edge = edge.and_then(|action| match action {
-                // Immersive: slides are left/right — ignore trigger edges.
-                NavAction::PrevSlide | NavAction::NextSlide if horizontal_nav => None,
+                // Immersive: slides are left/right — ignore trigger edges, except
+                // on the horizontal Games strip where L2/R2 own slide switching.
+                NavAction::PrevSlide | NavAction::NextSlide
+                    if horizontal_nav && !horizontal_games_nav =>
+                {
+                    None
+                }
                 // Edit mode: Square edits the selected manual (was Triangle).
                 NavAction::CycleSort if editing => Some(NavAction::Triangle),
                 other => Some(other),
@@ -1753,8 +1818,11 @@ mod tests {
             dpad_left: true,
             ..Default::default()
         };
-        assert_eq!(stepper.update(&left, now, true), Some(NavAction::PrevSlide));
-        assert!(stepper.update(&left, now, true).is_none());
+        assert_eq!(
+            stepper.update(&left, now, true, true),
+            Some(NavAction::PrevSlide)
+        );
+        assert!(stepper.update(&left, now, true, true).is_none());
 
         stepper.reset();
         let right = PadSample {
@@ -1762,7 +1830,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            stepper.update(&right, now, true),
+            stepper.update(&right, now, true, true),
             Some(NavAction::NextSlide)
         );
     }
@@ -1775,13 +1843,16 @@ mod tests {
             dpad_up: true,
             ..Default::default()
         };
-        assert_eq!(stepper.update(&up, now, true), Some(NavAction::Up));
+        assert_eq!(stepper.update(&up, now, true, true), Some(NavAction::Up));
         stepper.reset();
         let down = PadSample {
             stick_y: 0.9,
             ..Default::default()
         };
-        assert_eq!(stepper.update(&down, now, true), Some(NavAction::Down));
+        assert_eq!(
+            stepper.update(&down, now, true, true),
+            Some(NavAction::Down)
+        );
     }
 
     #[test]
@@ -1793,14 +1864,20 @@ mod tests {
             stick_y: 0.3,
             ..Default::default()
         };
-        assert_eq!(stepper.update(&diag, now, true), Some(NavAction::NextSlide));
+        assert_eq!(
+            stepper.update(&diag, now, true, true),
+            Some(NavAction::NextSlide)
+        );
         stepper.reset();
         let diag_v = PadSample {
             stick_x: 0.3,
             stick_y: -0.9,
             ..Default::default()
         };
-        assert_eq!(stepper.update(&diag_v, now, true), Some(NavAction::Up));
+        assert_eq!(
+            stepper.update(&diag_v, now, true, true),
+            Some(NavAction::Up)
+        );
     }
 
     #[test]
@@ -1992,12 +2069,12 @@ mod tests {
             dpad_left: true,
             ..Default::default()
         };
-        assert!(stepper.update(&left, now, false).is_none());
+        assert!(stepper.update(&left, now, false, true).is_none());
         let up = PadSample {
             dpad_up: true,
             ..Default::default()
         };
-        assert_eq!(stepper.update(&up, now, false), Some(NavAction::Up));
+        assert_eq!(stepper.update(&up, now, false, true), Some(NavAction::Up));
     }
 
     #[test]
@@ -2087,6 +2164,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(tick1.action.is_none());
 
@@ -2104,6 +2182,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(
             tick2.action.is_none(),
@@ -2113,6 +2192,7 @@ mod tests {
             &[reading("a", open), reading("b", PadSample::default())],
             now,
             true,
+            false,
             false,
             false,
             false,
@@ -2142,6 +2222,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
 
         let circle = PadSample {
@@ -2163,6 +2244,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(tick.action.is_none(), "face actions arm on press");
         let tick2 = bank.tick(
@@ -2172,6 +2254,7 @@ mod tests {
             ],
             now,
             true,
+            false,
             false,
             false,
             false,
@@ -2229,6 +2312,7 @@ mod tests {
             &[reading("new", cross)],
             now,
             true,
+            false,
             false,
             false,
             false,
@@ -2393,6 +2477,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             true,
             false,
         );
@@ -2410,6 +2495,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             true,
             false,
         );
@@ -2417,6 +2503,7 @@ mod tests {
             &[reading("a", cross)],
             t_press + Duration::from_millis(400),
             true,
+            false,
             false,
             false,
             false,
@@ -2432,6 +2519,7 @@ mod tests {
             &[reading("a", PadSample::default())],
             t_rel,
             true,
+            false,
             false,
             false,
             false,
@@ -2452,6 +2540,7 @@ mod tests {
             &[reading("a", PadSample::default())],
             t_rel + Duration::from_millis(300),
             true,
+            false,
             false,
             false,
             false,
@@ -2480,6 +2569,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let sample = PadSample {
             cross: true,
@@ -2493,6 +2583,7 @@ mod tests {
             &[reading("a", sample)],
             now,
             true,
+            false,
             false,
             false,
             false,
@@ -2512,5 +2603,571 @@ mod tests {
             let back = hold_ease_out_inv(p);
             assert!((back - u).abs() < 1e-5, "u={u} p={p} back={back}");
         }
+    }
+
+    fn tick_games(
+        bank: &mut PadNavBank,
+        sample: PadSample,
+        now: Instant,
+        horizontal_games_nav: bool,
+    ) -> PadTickResult {
+        bank.tick(
+            &[reading("a", sample)],
+            now,
+            true,
+            true,
+            horizontal_games_nav,
+            false,
+            false,
+            false,
+            false,
+        )
+    }
+
+    #[test]
+    fn tick_horizontal_games_nav_left_right_scroll_games() {
+        let mut bank = PadNavBank::default();
+        bank.prepare_on_open(true);
+        let now = Instant::now();
+
+        let left = PadSample {
+            dpad_left: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            tick_games(&mut bank, left, now, true).action,
+            Some(NavAction::Up)
+        );
+
+        // Release resets the stepper so the opposite direction fires at once.
+        assert!(
+            tick_games(&mut bank, PadSample::default(), now, true)
+                .action
+                .is_none()
+        );
+        let right = PadSample {
+            stick_x: 0.9,
+            ..Default::default()
+        };
+        assert_eq!(
+            tick_games(&mut bank, right, now, true).action,
+            Some(NavAction::Down)
+        );
+
+        // Up/Down do nothing on the horizontal Games strip (Left/Right only).
+        assert!(
+            tick_games(&mut bank, PadSample::default(), now, true)
+                .action
+                .is_none()
+        );
+        let up = PadSample {
+            dpad_up: true,
+            ..Default::default()
+        };
+        assert!(tick_games(&mut bank, up, now, true).action.is_none());
+        assert!(
+            tick_games(&mut bank, PadSample::default(), now, true)
+                .action
+                .is_none()
+        );
+        let down = PadSample {
+            dpad_down: true,
+            ..Default::default()
+        };
+        assert!(tick_games(&mut bank, down, now, true).action.is_none());
+    }
+
+    #[test]
+    fn tick_horizontal_games_nav_keeps_trigger_slides() {
+        let mut bank = PadNavBank::default();
+        bank.prepare_on_open(true);
+        let now = Instant::now();
+        // Register the pad at rest first (first sight syncs edges without firing).
+        assert!(
+            tick_games(&mut bank, PadSample::default(), now, true)
+                .action
+                .is_none()
+        );
+
+        let l2 = PadSample {
+            l2: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            tick_games(&mut bank, l2, now, true).action,
+            Some(NavAction::PrevSlide)
+        );
+        assert!(
+            tick_games(&mut bank, PadSample::default(), now, true)
+                .action
+                .is_none()
+        );
+        let r2 = PadSample {
+            r2: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            tick_games(&mut bank, r2, now, true).action,
+            Some(NavAction::NextSlide)
+        );
+    }
+
+    fn tick_games_editing(bank: &mut PadNavBank, sample: PadSample, now: Instant) -> PadTickResult {
+        bank.tick(
+            &[reading("a", sample)],
+            now,
+            true,
+            true,
+            true,
+            false,
+            true,
+            false,
+            false,
+        )
+    }
+
+    #[test]
+    fn tick_horizontal_games_nav_editing_left_right_move_selection() {
+        // Edit mode on the horizontal Games strip: Left/Right must scroll
+        // games (Up/Down moves) instead of PrevSlide/NextSlide, which would
+        // discard the edit draft via the dock collapse/expand handlers.
+        // Up/Down stay suppressed, L2/R2 keep slide switching, and the edit
+        // face remaps (Square -> EditManual, Triangle -> save) are untouched.
+        let mut bank = PadNavBank::default();
+        bank.prepare_on_open(true);
+        let now = Instant::now();
+        // Register the pad at rest first (first sight syncs edges without firing).
+        assert!(
+            tick_games_editing(&mut bank, PadSample::default(), now)
+                .action
+                .is_none()
+        );
+
+        let left = PadSample {
+            dpad_left: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            tick_games_editing(&mut bank, left, now).action,
+            Some(NavAction::Up)
+        );
+
+        // Release resets the stepper so the opposite direction fires at once.
+        assert!(
+            tick_games_editing(&mut bank, PadSample::default(), now)
+                .action
+                .is_none()
+        );
+        let right = PadSample {
+            dpad_right: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            tick_games_editing(&mut bank, right, now).action,
+            Some(NavAction::Down)
+        );
+
+        // Up/Down do nothing on the horizontal strip, including in edit mode.
+        assert!(
+            tick_games_editing(&mut bank, PadSample::default(), now)
+                .action
+                .is_none()
+        );
+        let up = PadSample {
+            dpad_up: true,
+            ..Default::default()
+        };
+        assert!(tick_games_editing(&mut bank, up, now).action.is_none());
+        assert!(
+            tick_games_editing(&mut bank, PadSample::default(), now)
+                .action
+                .is_none()
+        );
+        let down = PadSample {
+            dpad_down: true,
+            ..Default::default()
+        };
+        assert!(tick_games_editing(&mut bank, down, now).action.is_none());
+
+        // L2/R2 keep slide switching in edit mode.
+        assert!(
+            tick_games_editing(&mut bank, PadSample::default(), now)
+                .action
+                .is_none()
+        );
+        let l2 = PadSample {
+            l2: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            tick_games_editing(&mut bank, l2, now).action,
+            Some(NavAction::PrevSlide)
+        );
+        assert!(
+            tick_games_editing(&mut bank, PadSample::default(), now)
+                .action
+                .is_none()
+        );
+        let r2 = PadSample {
+            r2: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            tick_games_editing(&mut bank, r2, now).action,
+            Some(NavAction::NextSlide)
+        );
+
+        // Edit face remaps untouched: Square (CycleSort) -> Triangle (EditManual).
+        assert!(
+            tick_games_editing(&mut bank, PadSample::default(), now)
+                .action
+                .is_none()
+        );
+        let square = PadSample {
+            square: true,
+            ..Default::default()
+        };
+        assert!(tick_games_editing(&mut bank, square, now).action.is_none());
+        assert_eq!(
+            tick_games_editing(&mut bank, PadSample::default(), now).action,
+            Some(NavAction::Triangle)
+        );
+
+        // Triangle still saves (ToggleEdit) in edit mode on the horizontal strip.
+        let triangle = PadSample {
+            triangle: true,
+            ..Default::default()
+        };
+        assert!(
+            tick_games_editing(&mut bank, triangle, now)
+                .action
+                .is_none()
+        );
+        assert_eq!(
+            tick_games_editing(&mut bank, PadSample::default(), now).action,
+            Some(NavAction::ToggleEdit)
+        );
+    }
+
+    #[test]
+    fn tick_vertical_immersive_suppresses_trigger_slides() {
+        let mut bank = PadNavBank::default();
+        bank.prepare_on_open(true);
+        let now = Instant::now();
+
+        // Left/right still switch slides; triggers stay suppressed.
+        let left = PadSample {
+            dpad_left: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            tick_games(&mut bank, left, now, false).action,
+            Some(NavAction::PrevSlide)
+        );
+        assert!(
+            tick_games(&mut bank, PadSample::default(), now, false)
+                .action
+                .is_none()
+        );
+        let l2 = PadSample {
+            l2: true,
+            ..Default::default()
+        };
+        assert!(tick_games(&mut bank, l2, now, false).action.is_none());
+    }
+
+    #[test]
+    fn nav_stepper_suppressed_vertical_wobble_stays_gated() {
+        // Left stick held leftward with small Y wobble: vertical must not enter
+        // direction state, so repeat gating holds (1 immediate + gated repeats).
+        let mut stepper = NavStepper::default();
+        let t0 = Instant::now();
+        let left = PadSample {
+            stick_x: -0.9,
+            ..Default::default()
+        };
+        let left_wobble_up = PadSample {
+            stick_x: -0.9,
+            stick_y: -0.2,
+            ..Default::default()
+        };
+        assert_eq!(
+            stepper.update(&left, t0, true, false),
+            Some(NavAction::PrevSlide)
+        );
+        // Alternate pure-left / left+slight-up every 10ms across the initial
+        // delay: no wobble tick may fire.
+        let mut fires = 1;
+        for ms in (10..280).step_by(10) {
+            let sample = if (ms / 10) % 2 == 0 {
+                left.clone()
+            } else {
+                left_wobble_up.clone()
+            };
+            let fired = stepper
+                .update(&sample, t0 + Duration::from_millis(ms), true, false)
+                .is_some();
+            assert!(!fired, "wobble tick at +{ms}ms must stay gated");
+            if fired {
+                fires += 1;
+            }
+        }
+        // First gated repeat at +280ms even on a wobble sample.
+        assert_eq!(
+            stepper.update(
+                &left_wobble_up,
+                t0 + Duration::from_millis(280),
+                true,
+                false
+            ),
+            Some(NavAction::PrevSlide)
+        );
+        fires += 1;
+        // Then every NAV_REPEAT (90ms): +370ms fires, midpoints stay gated.
+        assert!(
+            stepper
+                .update(&left, t0 + Duration::from_millis(325), true, false)
+                .is_none()
+        );
+        assert_eq!(
+            stepper.update(
+                &left_wobble_up,
+                t0 + Duration::from_millis(370),
+                true,
+                false
+            ),
+            Some(NavAction::PrevSlide)
+        );
+        fires += 1;
+        assert_eq!(fires, 3);
+    }
+
+    #[test]
+    fn tick_horizontal_games_nav_left_wobble_stays_gated() {
+        // End-to-end: horizontal Games strip maps stepper slides to Up/Down and
+        // drops raw Up/Down; alternating left / left+slight-up must scroll games
+        // at gated repeat rate, not once per wobble flip.
+        let mut bank = PadNavBank::default();
+        bank.prepare_on_open(true);
+        let t0 = Instant::now();
+        let left = PadSample {
+            stick_x: -0.9,
+            ..Default::default()
+        };
+        let left_wobble_up = PadSample {
+            stick_x: -0.9,
+            stick_y: -0.2,
+            ..Default::default()
+        };
+        assert!(
+            tick_games(&mut bank, PadSample::default(), t0, true)
+                .action
+                .is_none()
+        );
+        let mut fires = 0;
+        // 61 ticks every 10ms over 600ms: fires at 0, 280, 370, 460, 550.
+        for ms in (0..=600).step_by(10) {
+            let sample = if (ms / 10) % 2 == 0 {
+                left.clone()
+            } else {
+                left_wobble_up.clone()
+            };
+            let action = tick_games(
+                &mut bank,
+                sample,
+                t0 + Duration::from_millis(ms as u64),
+                true,
+            )
+            .action;
+            if let Some(action) = action {
+                assert_eq!(action, NavAction::Up, "left scrolls games at +{ms}ms");
+                fires += 1;
+            }
+        }
+        assert_eq!(fires, 5, "wobble must not bypass repeat gating");
+    }
+
+    /// Repro: steady left-held LEFT stick whose report bytes hover at the 0.9
+    /// per-axis deadzone (raw 11 <-> 14, a 3-LSB wobble from a worn stick that
+    /// can no longer hold full deflection) must stay repeat-gated. Each
+    /// dropout to neutral currently resets the stepper, so every return fires
+    /// immediately and leftward scroll runs far too fast.
+    #[test]
+    fn repro_left_stick_boundary_hover_stays_gated() {
+        // Parse-level: prove the byte jitter really does straddle the deadzone.
+        let mut left_hold = [0u8; 64];
+        left_hold[0] = 0x01;
+        left_hold[1] = 11; // (11-128)/128 = -0.914 -> passes 0.9
+        left_hold[2] = 128;
+        left_hold[3] = 128;
+        left_hold[4] = 128;
+        left_hold[8] = 0x08; // hat neutral
+        let mut left_drop = left_hold;
+        left_drop[1] = 14; // (14-128)/128 = -0.890625 -> killed -> 0.0
+        let held = parse_report(&left_hold, 0);
+        let dropped = parse_report(&left_drop, 0);
+        assert!(held.stick_x < 0.0, "raw 11 must deflect left");
+        assert_eq!(dropped.stick_x, 0.0, "raw 14 must read neutral");
+
+        // Stepper alone: alternate every 10ms for 1s (100 ticks).
+        // Gated expectation: fires at 0, 280, 370, ..., 910 -> 9 total.
+        let mut stepper = NavStepper::default();
+        let t0 = Instant::now();
+        let mut fires = 0;
+        for ms in 0..100 {
+            let sample = if ms % 2 == 0 {
+                held.clone()
+            } else {
+                dropped.clone()
+            };
+            if stepper
+                .update(&sample, t0 + Duration::from_millis(ms * 10), true, false)
+                .is_some()
+            {
+                fires += 1;
+            }
+        }
+        assert_eq!(fires, 9, "boundary hover must stay gated (stepper)");
+
+        // End-to-end through the bank in horizontal_games_nav mode.
+        let mut bank = PadNavBank::default();
+        bank.prepare_on_open(true);
+        let mut bank_fires = 0;
+        for ms in 0..100 {
+            let sample = if ms % 2 == 0 {
+                held.clone()
+            } else {
+                dropped.clone()
+            };
+            let action =
+                tick_games(&mut bank, sample, t0 + Duration::from_millis(ms * 10), true).action;
+            if let Some(action) = action {
+                assert_eq!(action, NavAction::Up, "left scrolls games");
+                bank_fires += 1;
+            }
+        }
+        assert_eq!(bank_fires, 9, "boundary hover must stay gated (bank)");
+    }
+
+    /// Controls: solid full deflection on either stick / either direction, and
+    /// d-pad left, are already stable and must stay gated at the same rate.
+    #[test]
+    fn repro_solid_holds_stay_gated_all_sticks_both_directions() {
+        fn usb_report(lx: u8, ly: u8, rx: u8, ry: u8, hat: u8) -> PadSample {
+            let mut buf = [0u8; 64];
+            buf[0] = 0x01;
+            buf[1] = lx;
+            buf[2] = ly;
+            buf[3] = rx;
+            buf[4] = ry;
+            buf[8] = hat;
+            parse_report(&buf, 0)
+        }
+        let cases: [(&str, PadSample); 5] = [
+            ("left-stick left", usb_report(4, 128, 128, 128, 0x08)),
+            ("left-stick right", usb_report(252, 128, 128, 128, 0x08)),
+            ("right-stick left", usb_report(128, 128, 4, 128, 0x08)),
+            ("right-stick right", usb_report(128, 128, 252, 128, 0x08)),
+            ("dpad left", usb_report(128, 128, 128, 128, 0x06)),
+        ];
+        for (name, sample) in cases {
+            assert!(
+                sample.stick_x != 0.0 || sample.dpad_left,
+                "{name} must deflect"
+            );
+            let mut stepper = NavStepper::default();
+            let t0 = Instant::now();
+            let mut fires = 0;
+            for ms in 0..100 {
+                if stepper
+                    .update(&sample, t0 + Duration::from_millis(ms * 10), true, true)
+                    .is_some()
+                {
+                    fires += 1;
+                }
+            }
+            assert_eq!(fires, 9, "{name} solid hold must stay gated");
+        }
+    }
+
+    /// Deliberate release (neutral past the dropout grace) then re-press must
+    /// still fire immediately, and the opposite direction must fire at once
+    /// even after only a brief neutral gap.
+    #[test]
+    fn deliberate_release_then_repress_fires_immediately() {
+        let mut stepper = NavStepper::default();
+        let t0 = Instant::now();
+        let left = PadSample {
+            stick_x: -0.95,
+            ..Default::default()
+        };
+        let right = PadSample {
+            stick_x: 0.95,
+            ..Default::default()
+        };
+        assert_eq!(
+            stepper.update(&left, t0, true, false),
+            Some(NavAction::PrevSlide)
+        );
+        // Brief neutral then opposite: direction change always fires at once.
+        assert!(
+            stepper
+                .update(
+                    &PadSample::default(),
+                    t0 + Duration::from_millis(30),
+                    true,
+                    false
+                )
+                .is_none()
+        );
+        assert_eq!(
+            stepper.update(&right, t0 + Duration::from_millis(30), true, false),
+            Some(NavAction::NextSlide)
+        );
+        // Same-direction re-press inside the grace stays gated (dropout, not
+        // release): pre-fix the brief neutral above reset state and this fired.
+        assert!(
+            stepper
+                .update(
+                    &PadSample::default(),
+                    t0 + Duration::from_millis(100),
+                    true,
+                    false
+                )
+                .is_none()
+        );
+        assert!(
+            stepper
+                .update(&right, t0 + Duration::from_millis(110), true, false)
+                .is_none()
+        );
+        // Long neutral: past the dropout grace -> state resets.
+        assert!(
+            stepper
+                .update(
+                    &PadSample::default(),
+                    t0 + Duration::from_millis(300),
+                    true,
+                    false
+                )
+                .is_none()
+        );
+        // Neutral held past the grace is a deliberate release: reset, so the
+        // same-direction re-press below fires via the fresh path.
+        assert!(
+            stepper
+                .update(
+                    &PadSample::default(),
+                    t0 + Duration::from_millis(450),
+                    true,
+                    false
+                )
+                .is_none()
+        );
+        // Fresh press fires at once.
+        assert_eq!(
+            stepper.update(&left, t0 + Duration::from_millis(460), true, false),
+            Some(NavAction::PrevSlide)
+        );
     }
 }

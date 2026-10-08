@@ -65,6 +65,13 @@ pub enum ShellCommand {
     },
     /// Reload prefs / known from disk after the shell saves them.
     ReloadPersist,
+    /// Start-screen selection changed (stable keys; service stores in memory).
+    ReportStartSelection {
+        game_key: Option<String>,
+        controller_key: Option<String>,
+    },
+    /// Shell (re)start: ask the service for the stored start selection.
+    RequestStartSelection,
     Ping,
 }
 
@@ -93,6 +100,12 @@ pub enum ServiceMessage {
     Notifications {
         events: Vec<NotifyEvent>,
         open_start_after_toast: bool,
+    },
+    /// Stored start-screen selection (reply to `RequestStartSelection` and
+    /// proactive push when the shell attaches).
+    StartSelection {
+        game_key: Option<String>,
+        controller_key: Option<String>,
     },
 }
 
@@ -199,4 +212,86 @@ pub use unix_pipe::{PipeClient, PipeServer, PipeServerHandle, service_endpoint_r
 #[cfg(not(windows))]
 pub fn bound_port() -> u16 {
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::StartSelection;
+
+    fn frame_round_trip<T>(value: &T) -> T
+    where
+        T: serde::Serialize + for<'de> serde::Deserialize<'de>,
+    {
+        let mut buf = Vec::new();
+        send_message(&mut buf, value).expect("encode");
+        let mut cursor = std::io::Cursor::new(buf);
+        recv_message(&mut cursor).expect("decode")
+    }
+
+    #[test]
+    fn report_start_selection_round_trip() {
+        let cmd = ShellCommand::ReportStartSelection {
+            game_key: Some("steam:440".to_string()),
+            controller_key: Some("pad-a".to_string()),
+        };
+        match frame_round_trip(&cmd) {
+            ShellCommand::ReportStartSelection {
+                game_key,
+                controller_key,
+            } => {
+                assert_eq!(game_key.as_deref(), Some("steam:440"));
+                assert_eq!(controller_key.as_deref(), Some("pad-a"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_start_selection_round_trip() {
+        match frame_round_trip(&ShellCommand::RequestStartSelection) {
+            ShellCommand::RequestStartSelection => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_start_selection_round_trip() {
+        let msg = ServiceMessage::StartSelection {
+            game_key: None,
+            controller_key: Some("pad-a".to_string()),
+        };
+        match frame_round_trip(&msg) {
+            ServiceMessage::StartSelection {
+                game_key,
+                controller_key,
+            } => {
+                assert_eq!(game_key, None);
+                assert_eq!(controller_key.as_deref(), Some("pad-a"));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_selection_converts_to_session_keys() {
+        let selection = StartSelection {
+            game_key: Some("steam:440".to_string()),
+            controller_key: None,
+        };
+        let msg = ServiceMessage::StartSelection {
+            game_key: selection.game_key.clone(),
+            controller_key: selection.controller_key.clone(),
+        };
+        match msg {
+            ServiceMessage::StartSelection {
+                game_key,
+                controller_key,
+            } => {
+                assert_eq!(game_key.as_deref(), Some("steam:440"));
+                assert_eq!(controller_key, None);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
 }
