@@ -323,6 +323,8 @@ pub struct App {
     last_nav_log: Option<NavLogSnapshot>,
     /// Last PadPoll Instant while start window open (stall detection).
     last_pad_poll_at: Option<Instant>,
+    /// Last hid-worker edge seq seen (gap detection for silently dropped edges).
+    last_edge_seq: Option<u64>,
     /// One-shot while snapshot is empty (tracks gap start).
     nav_missing_since: Option<Instant>,
     /// One-shot while snapshot is non-empty but stale.
@@ -525,6 +527,7 @@ impl App {
             nav_source_logged: None,
             last_nav_log: None,
             last_pad_poll_at: None,
+            last_edge_seq: None,
             nav_missing_since: None,
             nav_stale_warned: false,
             nav_not_ready_warned: false,
@@ -4030,6 +4033,7 @@ impl App {
         self.nav_source_logged = None;
         self.last_nav_log = None;
         self.last_pad_poll_at = None;
+        self.last_edge_seq = None;
         self.nav_missing_since = None;
         self.nav_stale_warned = false;
         self.nav_not_ready_warned = false;
@@ -4466,6 +4470,22 @@ impl App {
     fn play_start_cue(&self, kind: UiSoundKind) {
         self.play_start_sound(kind);
         self.play_start_haptic(kind);
+    }
+
+    /// Row-aware settings nav cue: splits sound/haptic so the pre-flip nav
+    /// cue never double-plays the modality the apply side previews after
+    /// saving (volume rows → sound preview, strength rows → haptic preview).
+    /// Sound rows play haptic-only here; haptic rows play sound-only.
+    fn play_start_settings_cue(
+        &self,
+        row: crate::ui::start::settings::SettingsRow,
+        kind: UiSoundKind,
+    ) {
+        match crate::ui::start::settings::settings_nav_cue(row) {
+            crate::ui::start::settings::SettingsCue::Full => self.play_start_cue(kind),
+            crate::ui::start::settings::SettingsCue::HapticOnly => self.play_start_haptic(kind),
+            crate::ui::start::settings::SettingsCue::SoundOnly => self.play_start_sound(kind),
+        }
     }
 
     fn play_start_haptic(&self, kind: UiSoundKind) {
@@ -5004,6 +5024,26 @@ impl App {
     fn on_pad_input(&mut self, edge: crate::domain::pad::InputEdge) -> Task<Message> {
         let poll_started = Instant::now();
         let start_open = self.start_visible;
+        // Edge transport is lossy by design (try_send drops when full): log
+        // seq gaps while Start is open so silent d-pad losses are visible.
+        // (Seq also advances on unpublished cold snapshots, so a gap at open
+        // while input-hot flaps is expected; steady-state gaps mean drops.)
+        if start_open {
+            if let Some(prev) = self.last_edge_seq
+                && edge.seq > prev + 1
+            {
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: pad-input edge gap dropped={} expected={} got={} reason={}",
+                    edge.seq - prev - 1,
+                    prev + 1,
+                    edge.seq,
+                    edge.reason.as_str(),
+                ));
+            }
+            self.last_edge_seq = Some(edge.seq);
+        } else {
+            self.last_edge_seq = None;
+        }
         let meta = Some(edge.meta());
         let readings = edge.readings;
 
@@ -5489,7 +5529,7 @@ impl App {
                 };
                 if let Some(msg) = crate::ui::start::settings::nudge_message(row, &snapshot, delta)
                 {
-                    self.play_start_cue(UiSoundKind::Nav);
+                    self.play_start_settings_cue(row, UiSoundKind::Nav);
                     return self.on_start_message(msg);
                 }
                 Task::none()
@@ -5499,7 +5539,7 @@ impl App {
                     return Task::none();
                 };
                 if let Some(msg) = crate::ui::start::settings::confirm_message(row, &snapshot) {
-                    self.play_start_cue(UiSoundKind::Action);
+                    self.play_start_settings_cue(row, UiSoundKind::Action);
                     let task = self.on_start_message(msg);
                     let snap = self.start_settings_snapshot();
                     self.start_state.settings.clamp_focus(&snap);
@@ -6100,8 +6140,10 @@ fn tray_events_mapped() -> impl Stream<Item = Message> {
 
 /// Bind the hid-worker → iced pad-input edge channel while listening.
 fn pad_input_edge_stream() -> impl Stream<Item = Message> {
-    stream::channel(64, async move |mut output| {
-        let (tx, mut rx) = iced::futures::channel::mpsc::channel(32);
+    // Deep enough to ride out Start-frame hitches without dropping taps:
+    // the worker publishes at report rate while hot.
+    stream::channel(128, async move |mut output| {
+        let (tx, mut rx) = iced::futures::channel::mpsc::channel(128);
         start_input::bind_input_edge_sender(tx);
         let _guard = InputEdgeBindGuard;
         while let Some(edge) = rx.next().await {
@@ -6125,7 +6167,7 @@ impl Drop for InputEdgeBindGuard {
 /// `stream::channel` future would stall iced's UI poll (same thread polls the
 /// runner and the output receiver), so tray/Settings messages would never apply.
 fn service_message_stream() -> impl Stream<Item = Message> {
-    stream::channel(64, async move |mut output| {
+    stream::channel(128, async move |mut output| {
         let (mut tx, mut rx) = iced::futures::channel::mpsc::channel(128);
         let _ = std::thread::Builder::new()
             .name("sdsc-ipc-recv".into())

@@ -363,6 +363,39 @@ pub enum RowKind {
     Slider,
 }
 
+/// Which half of the nav cue the pad path should play for a settings row.
+///
+/// The apply side previews the *changed* modality after saving (volume rows
+/// play sound at the new volume, strength rows rumble at the new strength),
+/// so the pre-flip nav cue must only play the *other* half — otherwise a
+/// pad nudge double-cues (old-value nav cue + new-value apply preview) while
+/// the equivalent mouse drag single-previews. Rows without an apply preview
+/// keep the full cue. Keep exhaustive alongside future rows: a new feedback
+/// row with an apply preview must be added to the split here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsCue {
+    Full,
+    HapticOnly,
+    SoundOnly,
+}
+
+/// Row-aware nav-cue policy for pad/keyboard settings navigation.
+pub fn settings_nav_cue(row: SettingsRow) -> SettingsCue {
+    match row {
+        // Apply plays sound at the new volume; nav covers haptics only.
+        SettingsRow::Sounds | SettingsRow::SoundVolume => SettingsCue::HapticOnly,
+        // Apply rumbles at the new strength; nav covers sound only.
+        SettingsRow::Haptics | SettingsRow::HapticsStrength => SettingsCue::SoundOnly,
+        SettingsRow::AutoOpen
+        | SettingsRow::AlwaysImmersive
+        | SettingsRow::Clock
+        | SettingsRow::ImmersiveLayout
+        | SettingsRow::IdleSecs
+        | SettingsRow::SleepSecs
+        | SettingsRow::IdleDim => SettingsCue::Full,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SettingsAnim {
     from: f32,
@@ -2118,5 +2151,32 @@ mod tests {
             SettingsRow::SleepSecs.slider_select(&s, 999.0),
             StartMessage::SetSleepSecs(v) if v == last_sleep
         ));
+    }
+
+    /// Nav-cue split: sound rows cue haptic-only (apply previews sound),
+    /// haptics rows cue sound-only (apply previews haptics), all other rows
+    /// keep the full cue. New feedback rows with apply previews must extend
+    /// this table.
+    #[test]
+    fn nav_cue_split_covers_all_rows() {
+        for row in SettingsRow::ALL {
+            match row {
+                SettingsRow::Sounds | SettingsRow::SoundVolume => assert_eq!(
+                    settings_nav_cue(row),
+                    SettingsCue::HapticOnly,
+                    "{row:?} apply previews sound, nav must be haptic-only"
+                ),
+                SettingsRow::Haptics | SettingsRow::HapticsStrength => assert_eq!(
+                    settings_nav_cue(row),
+                    SettingsCue::SoundOnly,
+                    "{row:?} apply previews haptics, nav must be sound-only"
+                ),
+                _ => assert_eq!(
+                    settings_nav_cue(row),
+                    SettingsCue::Full,
+                    "{row:?} has no apply preview, nav must be full"
+                ),
+            }
+        }
     }
 }

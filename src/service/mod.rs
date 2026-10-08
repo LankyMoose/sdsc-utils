@@ -71,7 +71,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_client_count = 0usize;
 
     // Forward hid-worker pad edges over IPC (and run reopen gesture while shell is down).
-    let (edge_tx, edge_rx) = mpsc::sync_channel::<start_input::InputEdge>(32);
+    // Deep enough to ride out shell-frame hitches without dropping taps.
+    let (edge_tx, edge_rx) = mpsc::sync_channel::<start_input::InputEdge>(128);
     start_input::bind_service_edge_sender(edge_tx);
     let edge_pipe = pipe.handle();
     let forward_pad_edges = Arc::clone(&shell_input_hot);

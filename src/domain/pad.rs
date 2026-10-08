@@ -348,6 +348,12 @@ pub struct NavStepper {
     /// Encoded direction: -2 Left, -1 Up, 1 Down, 2 Right, 0 idle.
     direction: i8,
     next_fire: Option<Instant>,
+    /// Whether the active direction is currently driven by the digital D-pad
+    /// (as opposed to the analog stick). D-pad releases are clean digital
+    /// edges — a neutral sample means a deliberate release and resets repeat
+    /// gating at once, so fast re-taps fire per press. Stick releases keep
+    /// the neutral-dropout grace below (worn-stick threshold flicker).
+    direction_from_dpad: bool,
     /// When the sample drops to neutral while a direction is active, the moment
     /// of the first neutral tick. Transient dropouts (analog threshold hover,
     /// e.g. a worn stick wavering across the stick deadzone) must not reset
@@ -381,6 +387,12 @@ impl NavStepper {
     /// every return, bypassing repeat gating. Bridging brief dropouts keeps a
     /// steady hold gated; a deliberate release still resets, and any
     /// direction change (including the opposite direction) still fires at once.
+    ///
+    /// Digital D-pad input is exempt from the grace: D-pad contacts don't
+    /// flicker, so a neutral sample after a D-pad-driven direction is a
+    /// deliberate release and resets at once. Without this, fast same-direction
+    /// re-taps (release shorter than the grace) stay on the repeat schedule
+    /// and the re-press is swallowed instead of firing.
     pub fn update(
         &mut self,
         sample: &PadSample,
@@ -434,6 +446,15 @@ impl NavStepper {
                 self.neutral_since = None;
                 return None;
             }
+            // Digital D-pad release: deliberate by construction, reset at once
+            // so a fast re-tap fires as a new press (no repeat-gating swallow).
+            if self.direction_from_dpad {
+                self.direction = 0;
+                self.direction_from_dpad = false;
+                self.next_fire = None;
+                self.neutral_since = None;
+                return None;
+            }
             // Active hold dropped to neutral: bridge transient dropouts so a
             // flickering stick cannot reset repeat gating; only a deliberate
             // (grace-held) release resets.
@@ -442,18 +463,31 @@ impl NavStepper {
                 return None;
             }
             self.direction = 0;
+            self.direction_from_dpad = false;
             self.next_fire = None;
             self.neutral_since = None;
             return None;
         }
         self.neutral_since = None;
+        // Whether the D-pad (not just the stick) drives this direction now.
+        // Mixed holds count as D-pad: while any D-pad contact holds the
+        // direction, a later all-neutral sample is a deliberate release.
+        let from_dpad = match direction {
+            -2 => sample.dpad_left,
+            2 => sample.dpad_right,
+            -1 => sample.dpad_up,
+            1 => sample.dpad_down,
+            _ => false,
+        };
 
         if self.direction != direction {
             self.direction = direction;
+            self.direction_from_dpad = from_dpad;
             self.next_fire = Some(now + NAV_INITIAL_DELAY);
             return Self::action_for(direction);
         }
 
+        self.direction_from_dpad = from_dpad;
         if self.next_fire.is_some_and(|t| now >= t) {
             self.next_fire = Some(now + NAV_REPEAT);
             return Self::action_for(direction);
@@ -463,6 +497,7 @@ impl NavStepper {
 
     pub fn reset(&mut self) {
         self.direction = 0;
+        self.direction_from_dpad = false;
         self.next_fire = None;
         self.neutral_since = None;
     }
@@ -1851,6 +1886,83 @@ mod tests {
         };
         assert_eq!(
             stepper.update(&down, now, true, true),
+            Some(NavAction::Down)
+        );
+    }
+
+    #[test]
+    fn nav_stepper_dpad_fast_retap_fires_each_press() {
+        // Digital D-pad: a clean release resets gating at once, so fast
+        // same-direction re-taps (release well under the stick neutral
+        // grace and the initial repeat delay) fire per press.
+        let mut stepper = NavStepper::default();
+        let t0 = Instant::now();
+        let down = PadSample {
+            dpad_down: true,
+            ..Default::default()
+        };
+        let neutral = PadSample::default();
+        assert_eq!(stepper.update(&down, t0, true, true), Some(NavAction::Down));
+        // 20ms release then re-press: must fire again, not stay repeat-gated.
+        assert!(
+            stepper
+                .update(&neutral, t0 + Duration::from_millis(20), true, true)
+                .is_none()
+        );
+        assert_eq!(
+            stepper.update(&down, t0 + Duration::from_millis(40), true, true),
+            Some(NavAction::Down)
+        );
+        // And a third tap in quick succession.
+        assert!(
+            stepper
+                .update(&neutral, t0 + Duration::from_millis(60), true, true)
+                .is_none()
+        );
+        assert_eq!(
+            stepper.update(&down, t0 + Duration::from_millis(80), true, true),
+            Some(NavAction::Down)
+        );
+    }
+
+    #[test]
+    fn nav_stepper_stick_fast_retap_stays_gated() {
+        // Analog stick: the same quick release/press pattern must stay on
+        // the repeat schedule (neutral grace bridges stick flicker).
+        let mut stepper = NavStepper::default();
+        let t0 = Instant::now();
+        let down = PadSample {
+            stick_y: 0.9,
+            ..Default::default()
+        };
+        let neutral = PadSample::default();
+        assert_eq!(stepper.update(&down, t0, true, true), Some(NavAction::Down));
+        assert!(
+            stepper
+                .update(&neutral, t0 + Duration::from_millis(20), true, true)
+                .is_none()
+        );
+        assert!(
+            stepper
+                .update(&down, t0 + Duration::from_millis(40), true, true)
+                .is_none(),
+            "stick re-press inside grace + initial delay must stay gated"
+        );
+        // After a deliberate (grace-held) release, the next press fires anew.
+        let mut stepper = NavStepper::default();
+        assert_eq!(stepper.update(&down, t0, true, true), Some(NavAction::Down));
+        assert!(
+            stepper
+                .update(&neutral, t0 + Duration::from_millis(20), true, true)
+                .is_none()
+        );
+        assert!(
+            stepper
+                .update(&neutral, t0 + Duration::from_millis(130), true, true)
+                .is_none()
+        );
+        assert_eq!(
+            stepper.update(&down, t0 + Duration::from_millis(140), true, true),
             Some(NavAction::Down)
         );
     }
