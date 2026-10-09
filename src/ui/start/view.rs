@@ -645,21 +645,6 @@ struct StripAnim {
     started: Instant,
 }
 
-/// Selected-title crossfade under the horizontal art row (`None` = settled).
-///
-/// Rides the strip scroll clock (same duration, retargetable) so the
-/// full-width title swaps with the art instead of snapping. Like `strip_anim`
-/// it never blocks nav: [`State::animating`] deliberately ignores it.
-#[derive(Debug, Clone)]
-struct TitleAnim {
-    from_idx: usize,
-    to_idx: usize,
-    /// Scroll direction (-1 | 1) for the drift.
-    dir: i32,
-    duration_ms: u64,
-    started: Instant,
-}
-
 /// Directional slide+fade when swapping the immersive games-strip orientation.
 ///
 /// The old orientation slides out along its scroll axis while fading out; at
@@ -843,7 +828,6 @@ pub struct State {
     anim: Option<SlideAnim>,
     dock_anim: Option<DockAnim>,
     strip_anim: Option<StripAnim>,
-    title_anim: Option<TitleAnim>,
     /// In-flight immersive orientation transition (`None` = settled on prefs layout).
     layout_transition: Option<LayoutTransitionAnim>,
     /// In-flight section index chase (None = settled on position_section_at).
@@ -1056,7 +1040,6 @@ impl Default for State {
             anim: None,
             dock_anim: None,
             strip_anim: None,
-            title_anim: None,
             layout_transition: None,
             position_section: None,
             position_section_at: 0.0,
@@ -1433,7 +1416,6 @@ impl State {
         self.anim = None;
         self.dock_anim = None;
         self.strip_anim = None;
-        self.title_anim = None;
         self.layout_transition = None;
         self.position_bar_last_scroll = None;
         self.position_bar_slide = None;
@@ -1526,7 +1508,6 @@ impl State {
         self.anim.is_some()
             || self.dock_anim.is_some()
             || self.strip_anim.is_some()
-            || self.title_anim.is_some()
             || self.layout_transition.is_some()
             || self.transition.is_some()
             || self.transition_phase.is_some()
@@ -1624,7 +1605,6 @@ impl State {
         let len = self.rows.len();
         if len < 1 {
             self.strip_anim = None;
-            self.title_anim = None;
             self.sync_position_section(now, crate::ui::start::vstrip::STRIP_ANIM_MS);
             return;
         }
@@ -1639,7 +1619,6 @@ impl State {
         let delta = to - from;
         if delta.abs() < 0.01 {
             self.strip_anim = None;
-            self.title_anim = None;
             self.sync_position_section(now, crate::ui::start::vstrip::STRIP_ANIM_MS);
             return;
         }
@@ -1654,62 +1633,7 @@ impl State {
             duration_ms,
             started: now,
         });
-        self.begin_title_anim(from_visual, now, duration_ms);
         self.sync_position_section(now, duration_ms);
-    }
-
-    /// Selected-title crossfade on the strip clock (called from [`Self::begin_strip_anim`]).
-    ///
-    /// Chains from the incoming title when retargeting mid-flight; clears when
-    /// the index did not actually change so the title snaps with the strip.
-    fn begin_title_anim(&mut self, from_visual: f32, now: Instant, duration_ms: u64) {
-        let len = self.rows.len();
-        if len < 1 {
-            self.title_anim = None;
-            return;
-        }
-        // In-flight: the shown title is the incoming one. Settled: the caller-passed prior index.
-        let from_idx = self
-            .title_anim
-            .as_ref()
-            .map(|anim| anim.to_idx)
-            .unwrap_or_else(|| from_visual.round().clamp(0.0, len as f32 - 1.0) as usize)
-            .min(len - 1);
-        let to_idx = self.game_selected.min(len - 1);
-        let dir = (to_idx as isize - from_idx as isize).signum() as i32;
-        if dir == 0 {
-            self.title_anim = None;
-            return;
-        }
-        self.title_anim = Some(TitleAnim {
-            from_idx,
-            to_idx,
-            dir,
-            duration_ms,
-            started: now,
-        });
-    }
-
-    /// Selected-title crossfade visual: `(prev_idx, old_op, new_op, old_dx, new_dx)`.
-    ///
-    /// The outgoing title fades out while the incoming fades in over the strip
-    /// clock, with a slight drift in scroll direction. `None` when settled or
-    /// out of range (render the incoming title only). Opacities compose with
-    /// the layout-transition multiplier upstream (both scale the title fade).
-    pub fn title_crossfade_visual(&self, now: Instant) -> Option<(usize, f32, f32, f32, f32)> {
-        let anim = self.title_anim.as_ref()?;
-        let len = self.rows.len();
-        if anim.from_idx >= len || anim.to_idx >= len || anim.from_idx == anim.to_idx {
-            return None;
-        }
-        use crate::ui::start::vstrip::{
-            title_crossfade_drift, title_crossfade_opacity, title_crossfade_t,
-        };
-        let elapsed = now.saturating_duration_since(anim.started).as_millis() as u64;
-        let t = title_crossfade_t(elapsed, anim.duration_ms);
-        let (old_op, new_op) = title_crossfade_opacity(t);
-        let (old_dx, new_dx) = title_crossfade_drift(t, anim.dir as f32);
-        Some((anim.from_idx, old_op, new_op, old_dx, new_dx))
     }
 
     /// Begin the orientation transition after an actual layout change. No-op when
@@ -1887,7 +1811,6 @@ impl State {
         self.dock_expanded = false;
         self.dock_anim = None;
         self.strip_anim = None;
-        self.title_anim = None;
         self.layout_transition = None;
         self.position_bar_last_scroll = None;
         self.position_bar_slide = None;
@@ -1999,7 +1922,6 @@ impl State {
         use crate::ui::start::mode::TransitionPhase;
         self.dock_anim = None;
         self.strip_anim = None;
-        self.title_anim = None;
         self.position_bar_last_scroll = None;
         self.position_bar_slide = None;
         self.snap_position_section();
@@ -3111,14 +3033,6 @@ impl State {
             let elapsed = now.saturating_duration_since(anim.started);
             if elapsed >= Duration::from_millis(anim.duration_ms) {
                 self.strip_anim = None;
-            } else {
-                busy = true;
-            }
-        }
-        if let Some(anim) = self.title_anim.as_ref() {
-            let elapsed = now.saturating_duration_since(anim.started);
-            if elapsed >= Duration::from_millis(anim.duration_ms) {
-                self.title_anim = None;
             } else {
                 busy = true;
             }
@@ -5238,11 +5152,15 @@ pub(crate) fn update_required_badge(
 }
 
 /// Meta under a game title: plain path, or stacked `Label: value` lines.
+///
+/// `align` places the block inside its column: centered for horizontal
+/// in-slot text, start-aligned for the vertical side column.
 pub(crate) fn game_subtitle_block<'a>(
     subtitle: &'a StartSubtitle,
     value_color: Color,
     label_color: Color,
     value_size: f32,
+    align: Alignment,
 ) -> Element<'a, StartMessage> {
     match subtitle {
         StartSubtitle::Plain(plain) => text(plain.as_str())
@@ -5250,9 +5168,10 @@ pub(crate) fn game_subtitle_block<'a>(
             .color(value_color)
             .wrapping(Wrapping::Word)
             .width(Fill)
+            .align_x(align)
             .into(),
         StartSubtitle::Labeled(lines) => {
-            let mut col = column![].spacing(2).width(Fill);
+            let mut col = column![].spacing(2).width(Fill).align_x(align);
             for line in lines {
                 col = col.push(
                     row![
@@ -5431,7 +5350,13 @@ fn game_row(
                 .as_ref()
                 .is_some_and(|sub| !(row.update_required && sub.is_steam_fallback()));
             if show_meta && let Some(sub) = row.subtitle.as_ref() {
-                game_subtitle_block(sub, sub_color, theme::alpha(sub_color, 0.8), 12.0)
+                game_subtitle_block(
+                    sub,
+                    sub_color,
+                    theme::alpha(sub_color, 0.8),
+                    12.0,
+                    Alignment::Start,
+                )
             } else {
                 text(" ")
                     .size(13.0)
@@ -6247,33 +6172,43 @@ mod tests {
     }
 
     #[test]
-    fn begin_strip_anim_starts_title_crossfade_on_same_clock() {
+    fn strip_scroll_carries_the_selected_title() {
+        // Titles live inside their slot now, so the strip scroll *is* the
+        // title animation — no separate crossfade clock exists to drift out
+        // of sync with the card.
         let mut state = State {
             rows: title_rows(5),
             game_selected: 3,
             ..Default::default()
         };
         let now = Instant::now();
+        assert!((state.strip_scroll(now) - 3.0).abs() < 0.01);
         state.begin_strip_anim(2.0, now);
-        let title = state
-            .title_anim
-            .as_ref()
-            .expect("title crossfade rides the strip clock");
-        assert_eq!((title.from_idx, title.to_idx, title.dir), (2, 3, 1));
-        assert_eq!(title.duration_ms, crate::ui::start::vstrip::STRIP_ANIM_MS);
-        // Backward step drifts the other way.
+        let anim = state.strip_anim.as_ref().expect("settled step animates");
+        assert_eq!(anim.duration_ms, crate::ui::start::vstrip::STRIP_ANIM_MS);
+        // Visual chases 2 -> 3 on the strip clock, so each slot's title and
+        // meta travel with its art.
+        assert!((state.strip_scroll(now) - 2.0).abs() < 0.01);
+        let mid = now + Duration::from_millis(crate::ui::start::vstrip::STRIP_ANIM_MS / 2);
+        let s = state.strip_scroll(mid);
+        assert!(s > 2.0 && s < 3.0);
+        let done = now + Duration::from_millis(crate::ui::start::vstrip::STRIP_ANIM_MS + 16);
+        state.tick_anim(done);
+        assert!(state.strip_anim.is_none());
+        assert!((state.strip_scroll(done) - 3.0).abs() < 0.01);
+        // Backward steps work the same (no direction special-case left).
         let mut back = State {
             rows: title_rows(5),
             game_selected: 1,
             ..Default::default()
         };
         back.begin_strip_anim(2.0, now);
-        let title = back.title_anim.as_ref().expect("backward step animates");
-        assert_eq!((title.from_idx, title.to_idx, title.dir), (2, 1, -1));
+        let anim = back.strip_anim.as_ref().expect("backward step animates");
+        assert!((anim.from - 2.0).abs() < 0.01 && (anim.to - 1.0).abs() < 0.01);
     }
 
     #[test]
-    fn title_crossfade_visual_tracks_strip_ease_and_settles() {
+    fn strip_anim_retarget_chases_and_clears_on_noop() {
         let mut state = State {
             rows: title_rows(5),
             game_selected: 3,
@@ -6281,47 +6216,17 @@ mod tests {
         };
         let now = Instant::now();
         state.begin_strip_anim(2.0, now);
-        // Start: old fully on, new at zero drifted into the scroll direction.
-        let (prev, old_op, new_op, old_dx, new_dx) =
-            state.title_crossfade_visual(now).expect("crossfade live");
-        assert_eq!(prev, 2);
-        assert!((old_op - 1.0).abs() < 0.001 && new_op.abs() < 0.001);
-        assert!(old_dx.abs() < 0.001 && new_dx > 0.0);
-        // Mid-flight: both partially visible, opacities sum to one.
-        let mid = now + Duration::from_millis(crate::ui::start::vstrip::STRIP_ANIM_MS / 2);
-        let (_, old_op, new_op, _, _) = state.title_crossfade_visual(mid).expect("crossfade mid");
-        assert!(old_op > 0.0 && old_op < 1.0);
-        assert!((old_op + new_op - 1.0).abs() < 0.001);
-        // Past the end the tick settles and the visual retires (incoming only).
-        let done = now + Duration::from_millis(crate::ui::start::vstrip::STRIP_ANIM_MS + 16);
-        state.tick_anim(done);
-        assert!(state.title_anim.is_none());
-        assert!(state.title_crossfade_visual(done).is_none());
-    }
-
-    #[test]
-    fn title_anim_retarget_chains_from_incoming_and_clears_on_noop() {
-        let mut state = State {
-            rows: title_rows(5),
-            game_selected: 3,
-            ..Default::default()
-        };
-        let now = Instant::now();
-        state.begin_strip_anim(2.0, now);
-        // Rapid second step mid-flight: title chains from the incoming index.
+        // Rapid second step mid-flight retargets from the live visual.
         let mid = now + Duration::from_millis(crate::ui::start::vstrip::STRIP_ANIM_MS / 2);
         state.game_selected = 4;
         state.begin_strip_anim(0.0, mid);
-        let title = state
-            .title_anim
-            .as_ref()
-            .expect("retarget keeps title anim");
-        assert_eq!((title.from_idx, title.to_idx, title.dir), (3, 4, 1));
+        let anim = state.strip_anim.as_ref().expect("retarget keeps anim");
+        assert!((anim.to - 4.0).abs() < 0.01);
         assert_eq!(
-            title.duration_ms,
+            anim.duration_ms,
             crate::ui::start::vstrip::STRIP_ANIM_CATCHUP_MS
         );
-        // Same index (no strip motion): title clears so nothing crossfades.
+        // Same index (no strip motion): nothing animates.
         let mut same = State {
             rows: title_rows(5),
             game_selected: 2,
@@ -6329,11 +6234,10 @@ mod tests {
         };
         same.begin_strip_anim(2.0, now);
         assert!(same.strip_anim.is_none());
-        assert!(same.title_anim.is_none());
     }
 
     #[test]
-    fn title_anim_never_blocks_nav_but_keeps_frames() {
+    fn strip_anim_never_blocks_nav_but_keeps_frames() {
         let mut state = State {
             rows: title_rows(5),
             game_selected: 2,
@@ -6342,29 +6246,13 @@ mod tests {
         let now = Instant::now();
         state.game_selected = 3;
         state.begin_strip_anim(2.0, now);
-        assert!(state.title_anim.is_some());
-        // Retargetable chase: pad nav is not gated while the title crossfades.
+        assert!(state.strip_anim.is_some());
+        // Retargetable chase: pad nav is not gated while the strip animates.
         assert!(!state.animating());
         assert!(state.move_selection(1).is_some());
         assert_eq!(state.game_selected, 4);
-        // ... but frames keep flowing until the crossfade settles.
+        // ... but frames keep flowing until the scroll settles.
         assert!(state.needs_frames());
-    }
-
-    #[test]
-    fn title_crossfade_visual_none_when_stale() {
-        let mut state = State {
-            rows: title_rows(5),
-            game_selected: 3,
-            ..Default::default()
-        };
-        let now = Instant::now();
-        state.begin_strip_anim(2.0, now);
-        assert!(state.title_crossfade_visual(now).is_some());
-        // Catalog shrank past the outgoing index: render incoming only.
-        state.rows.truncate(2);
-        state.game_selected = 1;
-        assert!(state.title_crossfade_visual(now).is_none());
     }
 
     #[test]

@@ -38,72 +38,64 @@ const OUTER_PEEK: f32 = 0.40;
 const ASPECT: f32 = 220.0 / 330.0;
 const CENTER_H_MIN: f32 = 180.0;
 const CENTER_H_MAX: f32 = 420.0;
-/// Gap between horizontal art and the title block below it.
+/// Gap between horizontal art and its in-slot title/meta below it.
 pub const H_TEXT_GAP: f32 = 8.0;
-/// Reserved height for the horizontal in-slot text (neighbor titles + meta).
+/// Reserved height for the horizontal in-slot text (every slot's title + meta).
 ///
-/// Budget (unselected sizes, 1.3x line height): title 22px (28.6) + 6 +
-/// two meta lines at 14px (38.4 incl. spacing 2) + 6 + update badge (~21)
-/// = ~100. The selected 39px title lives in a separate full-width layer
-/// below the strip (see [`H_SELECTED_TITLE_RESERVE`]), so only neighbors
-/// carry this budget: [`slot_child_size_h`] weights it in with `|distance|`
-/// (0 at the selection, full from `|d| >= 1`) and [`metrics_for_width`]
-/// reserves it **under the shared art centerline** — art is anchored at the
-/// strip top and in-slot text hangs below the art (see [`slot_y_offset_h`]).
+/// Budget (1.3x line height): title 22px (28.6) + 6 + two meta lines at 14px
+/// (38.4 incl. spacing 2) + 6 + update badge (~21) = ~100. The selection
+/// carries it too: its title rides **inside** the slot like every other
+/// cover, so titles animate with the card instead of in a separate
+/// full-width crossfade layer. [`slot_child_size_h`] adds it to every
+/// slot box and [`metrics_for_width`] reserves it under the shared art
+/// centerline (art is anchored at the strip top — see [`slot_y_offset_h`]).
 pub const H_TEXT_RESERVE: f32 = 100.0;
-/// Reserved height for the full-width selected-title layer below the strip.
-///
-/// Budget (selected sizes, 1.3x line height): title 39px (50.7) + 6 +
-/// two meta lines at 16px (43.6 incl. spacing 2) + 6 + update badge (~23)
-/// = ~129.2; 132 keeps a few px of margin. Stage-width centered, so long
-/// titles never collide with neighbors.
-pub const H_SELECTED_TITLE_RESERVE: f32 = 132.0;
-/// Gap between the horizontal strip (art + in-slot text) and the
-/// full-width selected-title layer below it.
-///
-/// Matches [`H_TEXT_GAP`] so the selected title sits as tight to the strip
-/// as neighbor in-slot titles do to their art (see [`H_TITLE_TO_BAR_MIN`]
-/// for the one extra case: the strip reserving room under the art
-/// centerline for a neighbor column).
-pub const H_STRIP_TO_TITLE_GAP: f32 = H_TEXT_GAP;
 /// Top clearance kept above the horizontal strip (clock capsule + art-row drop).
 ///
-/// Sizing only: the layout anchors the ART ROW (not the strip+title block)
+/// Sizing only: the layout anchors the ART ROW (not the strip block)
 /// mid-region via [`horizontal_block_lead`], so the shrunken capsules sit
-/// ~100px lower than block-centering would place them while the title layer
-/// keeps its position above the rail. Layout adds the lead on top of its own
-/// clock pad, so this reserve stays conservative.
+/// lower than block-centering would place them while the in-slot titles
+/// keep their position above the rail. Layout adds the lead on top of its
+/// own clock pad, so this reserve stays conservative.
 pub const H_TOP_RESERVE: f32 = 170.0;
 /// Vertical room kept for the position rail + footer hints island in horizontal mode.
 const H_RAIL_RESERVE: f32 = 120.0;
 const H_FOOTER_RESERVE: f32 = 72.0;
-/// Minimum gap from the selected-title bottom to the position rail top.
+/// Top pad the horizontal layout places above the strip (clock clearance).
+///
+/// Must match `immersive::STRIP_TOP_PAD`, which is what actually positions the
+/// block; used here to decide whether the floor-size slot still fits.
+pub const H_TOP_PAD: f32 = 44.0;
+/// Vertical room the strip deliberately leaves unsized, below the in-slot titles.
+///
+/// The art row is centered in the region by [`horizontal_block_lead`], so a
+/// capsule only needs to fit art + in-slot text — without this reserve the
+/// room the removed full-width title layer used to claim would inflate every
+/// capsule instead of becoming breathing room, and the row would read
+/// cramped against the rail.
+const H_ROW_BREATHING_ROOM: f32 = 140.0;
+/// Minimum gap from the strip bottom (in-slot titles) to the position rail top.
 ///
 /// Matches the slack the old block-centering left (~18px at 1080p); the
 /// art-row lead never eats into it, so the rail always clears the titles.
 pub const H_TITLE_TO_BAR_MIN: f32 = 18.0;
-/// Offset between the art-row visual center and the strip+title block center.
-///
-/// The strip holds the selected art only (its centerline sits half a capsule
-/// below the strip top), so the block below the art is just the
-/// strip→title gap plus the full-width title layer
-/// (`H_STRIP_TO_TITLE_GAP` + `H_SELECTED_TITLE_RESERVE`); shifting the block
-/// down by up to half that stack centers the ART ROW (not the block) in the
-/// region above the rail. Neighbor in-slot text (`H_TEXT_*`) lives inside the
-/// strip under the shared art centerline and never pads the selected art.
-pub const H_ART_CENTER_OFFSET: f32 = (H_STRIP_TO_TITLE_GAP + H_SELECTED_TITLE_RESERVE) * 0.5;
-/// Peak horizontal drift of the selected-title crossfade (logical px, in scroll direction).
-pub const TITLE_DRIFT_PX: f32 = 28.0;
 
-/// Top lead for the horizontal strip+title block.
+/// Top lead for the horizontal strip block.
 ///
 /// Centers the block in `region_h` (space above the rail, after `top_pad`
-/// clock clearance), then drops it by up to [`H_ART_CENTER_OFFSET`] so the
-/// ART ROW lands centered instead of riding high. The drop never eats the
-/// `min_bar_gap` below the titles. Pure so unit tests can pin the geometry.
-pub fn horizontal_block_lead(region_h: f32, block_h: f32, top_pad: f32, min_bar_gap: f32) -> f32 {
+/// clock clearance), then drops it by up to half the in-slot text stack
+/// (`text_h`, i.e. [`StripMetrics::h_text_budget`]) so the ART ROW lands
+/// centered instead of riding high. The drop never eats the `min_bar_gap`
+/// below the titles. Pure so unit tests can pin the geometry.
+pub fn horizontal_block_lead(
+    region_h: f32,
+    block_h: f32,
+    text_h: f32,
+    top_pad: f32,
+    min_bar_gap: f32,
+) -> f32 {
     let slack = (region_h - top_pad - block_h - min_bar_gap).max(0.0);
-    top_pad + slack * 0.5 + H_ART_CENTER_OFFSET.min(slack * 0.5)
+    top_pad + slack * 0.5 + (text_h * 0.5).min(slack * 0.5)
 }
 
 /// Resolution-derived strip geometry for layout + slot art sizing.
@@ -224,53 +216,46 @@ pub fn metrics_for_height(stage_h: f32) -> StripMetrics {
 /// Derive capsule size + stride so the strip fits 3 full heroes + outer peeks in `stage_w`.
 ///
 /// Unlike [`metrics_for_height`], the capsule size comes from the **vertical**
-/// room (`stage_h` minus top clearance, position rail, and footer island):
-/// the selected art plus the slim in-slot text, plus the separate full-width
-/// selected-title layer below the strip, must fit. The horizontal room
-/// instead decides how many neighbors are shown (see [`neighbors_for_width`]),
-/// so wide screens show more items instead of bigger ones.
+/// room (`stage_h` minus top clearance, position rail, and footer island).
+/// Every horizontal slot is art + in-slot text (the selection included), so
+/// the strip is exactly the selection's box and the horizontal room instead
+/// decides how many neighbors are shown (see [`neighbors_for_width`]) — wide
+/// screens show more items instead of bigger ones.
 pub fn metrics_for_width(stage_w: f32, stage_h: f32) -> StripMetrics {
     let _ = stage_w;
     let stage_h = stage_h.max(480.0);
     let avail_h = (stage_h - H_RAIL_RESERVE - H_FOOTER_RESERVE - H_TOP_RESERVE).max(240.0);
-    // Art is anchored at the strip top ([`slot_y_offset_h`]), so a neighbor's
-    // in-slot title hangs `art / 2 + budget` below the shared centerline.
-    // Stages too short for that even at the smallest capsule keep the
-    // selection's art height and go art-only rather than push the
-    // selected-title layer into the position rail.
+    // Every horizontal slot is art + the same in-slot text (the selection
+    // included), so the strip is exactly the selection's box and nothing clips.
+    // Stages too short for art + text even at the floor capsule drop the text
+    // instead of pushing the strip into the position rail.
     let full_budget = H_TEXT_GAP + H_TEXT_RESERVE;
-    let block_room = (avail_h - (H_STRIP_TO_TITLE_GAP + H_SELECTED_TITLE_RESERVE)).max(1.0);
-    // Strip height the anchor rule asks for at the floor capsule size.
-    let strip_h_for = |budget: f32| {
-        let half_selected = CENTER_H_MIN * SELECTED_SCALE * 0.5;
-        half_selected + half_selected.max(CENTER_H_MIN * SCALE_AT_1 * 0.5 + budget)
-    };
-    let h_text_budget = if strip_h_for(full_budget) <= block_room {
+    let region_h = stage_h - H_RAIL_RESERVE - H_FOOTER_RESERVE;
+    let h_text_budget = if region_h
+        >= H_TOP_PAD + CENTER_H_MIN * SELECTED_SCALE + full_budget + H_TITLE_TO_BAR_MIN
+    {
         full_budget
     } else {
         0.0
     };
-    let overhead = h_text_budget + (H_STRIP_TO_TITLE_GAP + H_SELECTED_TITLE_RESERVE);
-    let from_h = (avail_h - overhead) / SELECTED_SCALE;
-    let center_h = from_h.clamp(CENTER_H_MIN, CENTER_H_MAX);
+    // Capsules claim only the vertical room the row needs; the remainder is
+    // the art row's centering slack ([`horizontal_block_lead`]) plus
+    // [`H_ROW_BREATHING_ROOM`] below the titles, so cover size stays stable
+    // instead of growing into whatever the stage happens to have spare.
+    let capsule_h = (avail_h - h_text_budget - H_ROW_BREATHING_ROOM).max(1.0);
+    let center_h = (capsule_h / SELECTED_SCALE).clamp(CENTER_H_MIN, CENTER_H_MAX);
     let center_w = center_h * ASPECT;
     // Reference stride = first step (selected → neighbor); layout uses [`slot_x_offset`].
     let stride = unit_stride(0.0, center_w);
-    // Strip holds the selected art with no in-slot padding so the full-width
-    // title sits one text gap below the art bottoms (like neighbor in-slot
-    // titles). Art is anchored at the strip top (see [`slot_y_offset_h`]),
-    // so the strip is the selected art plus the deepest reach below its
-    // centerline: a neighbor's in-slot title, or the selection's own bottom
-    // half (same rule as `strip_h_for` above, at the resolved capsule size).
-    let selected_art_h = center_h * SELECTED_SCALE;
-    let below_center = (selected_art_h * 0.5).max(center_h * SCALE_AT_1 * 0.5 + h_text_budget);
+    // Art is anchored at the strip top ([`slot_y_offset_h`]), so the strip is
+    // exactly the selection's box — the tallest slot — and nothing clips.
     StripMetrics {
         center_w,
         center_h,
         selected_scale: SELECTED_SCALE,
         stride,
         slot_w: center_w * SELECTED_SCALE,
-        slot_h: selected_art_h * 0.5 + below_center,
+        slot_h: center_h * SELECTED_SCALE + h_text_budget,
         h_text_budget,
     }
 }
@@ -346,25 +331,19 @@ pub fn slot_child_size(metrics: &StripMetrics, distance: f32) -> Size {
 /// Layout box for a horizontal strip child at `distance`.
 ///
 /// Width is fixed (selected art width) so the scroll grid stays stable while
-/// art scales. The in-slot text reserve fades in with `|distance|`: the
-/// selection shows art only (its 39px title lives in the separate full-width
-/// layer below the strip), immediate neighbors carry the full slim in-slot
-/// text (neighbor 22px titles + meta), outer peeks keep the neighbor budget
-/// so the grid never shifts. Weighting by `|d|` keeps the height continuous
-/// mid-scroll instead of popping 100px at the halfway point (see
-/// `strip_slot_stacked`: art-only slots use zero inter-block spacing to
-/// match the art-only child height exactly).
+/// art scales. **Every** slot — the selection included — is art plus the
+/// same in-slot title + meta, so titles ride along with their card instead
+/// of crossfading in a separate full-width layer; only the art height
+/// changes with distance, which keeps the row continuous mid-scroll. The
+/// budget is [`StripMetrics::h_text_budget`], `0` on stages too short to
+/// afford it (every slot then goes art-only).
 ///
 /// The box is measured from the art **top** — [`slot_y_offset_h`] places
 /// that edge, not the box center, so art stays on the shared centerline.
-/// The budget is [`StripMetrics::h_text_budget`], which is `0` on stages
-/// too short to afford in-slot titles (neighbors go art-only there).
 pub fn slot_child_size_h(metrics: &StripMetrics, distance: f32) -> Size {
-    let scale = scale_at_distance(distance);
-    let text_w = distance.abs().clamp(0.0, 1.0);
     Size::new(
         metrics.center_w * metrics.selected_scale,
-        metrics.center_h * scale + metrics.h_text_budget * text_w,
+        metrics.center_h * scale_at_distance(distance) + metrics.h_text_budget,
     )
 }
 
@@ -408,32 +387,6 @@ pub fn strip_scroll(from: f32, to: f32, started: Instant, now: Instant, duration
         .clamp(0.0, 1.0);
     let e = ease_out_cubic(t);
     from + (to - from) * e
-}
-
-/// Eased 0..=1 progress of the selected-title crossfade (same ease as the strip scroll).
-pub fn title_crossfade_t(elapsed_ms: u64, duration_ms: u64) -> f32 {
-    ease_out_cubic((elapsed_ms as f32 / duration_ms.max(1) as f32).clamp(0.0, 1.0))
-}
-
-/// (outgoing, incoming) title opacities at eased progress `t`: old fades out
-/// while new fades in.
-pub fn title_crossfade_opacity(t: f32) -> (f32, f32) {
-    let t = t.clamp(0.0, 1.0);
-    (1.0 - t, t)
-}
-
-/// (outgoing, incoming) title X drift at eased progress `t`: the incoming
-/// title slides in from the scroll direction while the outgoing drifts away.
-/// `dir` is -1 | 0 | 1 (0 = fade only, no drift).
-pub fn title_crossfade_drift(t: f32, dir: f32) -> (f32, f32) {
-    let t = t.clamp(0.0, 1.0);
-    // NB: f32::signum maps +0.0 to 1.0, so zero needs an explicit guard.
-    let d = if dir == 0.0 {
-        0.0
-    } else {
-        dir.signum().clamp(-1.0, 1.0)
-    };
-    (-d * TITLE_DRIFT_PX * t, d * TITLE_DRIFT_PX * (1.0 - t))
 }
 
 pub struct VStrip<'a, Message, Theme = iced::Theme, Renderer = iced::Renderer> {
@@ -767,39 +720,120 @@ mod tests {
 
     #[test]
     fn horizontal_metrics_come_from_vertical_room() {
-        // 1080p: selected art + separate title layer fits with top clearance
-        // + rail + footer reserves. Art is anchored at the strip top, so the
-        // strip is the selected art plus the deepest reach below its
-        // centerline — a neighbor's in-slot title, or the selection's own
-        // bottom half, whichever reaches further down.
+        // 1080p: the strip fits with top clearance + rail + footer reserves.
+        // Art is anchored at the strip top and every slot (the selection
+        // included) is art + the same in-slot text, so the strip is exactly
+        // the selection's box and nothing clips.
         let h = metrics_for_width(1920.0, 1080.0);
+        // Cover size is held steady across resolutions: the room the removed
+        // title layer claimed becomes breathing room, not bigger capsules.
         assert!(h.center_h < CENTER_H_MAX && h.center_h > CENTER_H_MIN);
         assert!((h.slot_w - h.center_w * SELECTED_SCALE).abs() < 0.01);
         assert!((h.h_text_budget - (H_TEXT_GAP + H_TEXT_RESERVE)).abs() < 0.001);
         let selected_art = h.center_h * SELECTED_SCALE;
-        let below_center = h.center_h * SCALE_AT_1 * 0.5 + h.h_text_budget;
-        assert!((h.slot_h - (selected_art * 0.5 + below_center)).abs() < 0.01);
-        // 1080p: the neighbor column reaches past the selection's own bottom.
-        assert!(below_center > selected_art * 0.5);
-        let block_h = h.slot_h + H_STRIP_TO_TITLE_GAP + H_SELECTED_TITLE_RESERVE;
-        assert!(block_h + H_RAIL_RESERVE + H_FOOTER_RESERVE <= 1080.0 + 0.01);
-        // Short stage: too tight for art + in-slot titles under the
-        // centerline, so neighbors go art-only (like the outer peeks) rather
-        // than push the title layer into the rail. Capsules stay at floor size.
+        assert!((h.slot_h - (selected_art + h.h_text_budget)).abs() < 0.01);
+        assert!(h.slot_h + H_RAIL_RESERVE + H_FOOTER_RESERVE <= 1080.0 + 0.01);
+        // 720p still affords in-slot text, but needs a smaller capsule and must
+        // still clear the rail by H_TITLE_TO_BAR_MIN.
         let short = metrics_for_width(1280.0, 720.0);
-        assert!(short.center_h <= h.center_h);
-        assert!((short.center_h - CENTER_H_MIN).abs() < 0.001);
-        assert_eq!(short.h_text_budget, 0.0);
-        let short_selected = short.center_h * SELECTED_SCALE;
-        assert!((short.slot_h - short_selected).abs() < 0.01);
-        let short_block = short.slot_h + H_STRIP_TO_TITLE_GAP + H_SELECTED_TITLE_RESERVE;
-        assert!(short_block + H_RAIL_RESERVE + H_FOOTER_RESERVE <= 720.0 + 0.01);
-        // Tall stage: clamped, never blows up on large monitors; the selected
-        // art owns the strip, so the title keeps its one-gap relationship.
+        assert!(short.center_h < h.center_h);
+        assert!(short.center_h >= CENTER_H_MIN);
+        assert!((short.h_text_budget - (H_TEXT_GAP + H_TEXT_RESERVE)).abs() < 0.001);
+        assert!(
+            (short.slot_h - (short.center_h * SELECTED_SCALE + short.h_text_budget)).abs() < 0.01
+        );
+        let short_region = 720.0 - H_RAIL_RESERVE - H_FOOTER_RESERVE;
+        assert!(
+            H_TOP_PAD + short.slot_h + H_TITLE_TO_BAR_MIN <= short_region + 0.01,
+            "slot_h={}",
+            short.slot_h
+        );
+        // Art-only stage: too short for art + text even at the floor capsule, so
+        // every slot drops its text rather than push the strip into the rail.
+        let tiny = metrics_for_width(1280.0, 600.0);
+        assert!((tiny.center_h - CENTER_H_MIN).abs() < 0.001);
+        assert_eq!(tiny.h_text_budget, 0.0);
+        assert!((tiny.slot_h - tiny.center_h * SELECTED_SCALE).abs() < 0.01);
+        // Tall stage: clamped, never blows up on large monitors.
         let tall = metrics_for_width(2560.0, 2160.0);
         assert!((tall.center_h - CENTER_H_MAX).abs() < 0.001);
         assert!((tall.h_text_budget - (H_TEXT_GAP + H_TEXT_RESERVE)).abs() < 0.001);
-        assert!((tall.slot_h - tall.center_h * SELECTED_SCALE).abs() < 0.01);
+        assert!((tall.slot_h - (tall.center_h * SELECTED_SCALE + tall.h_text_budget)).abs() < 0.01);
+    }
+
+    #[test]
+    fn horizontal_capsule_size_is_stable_across_resolutions() {
+        // Removing the full-width title layer freed vertical room, but cover
+        // size must not inflate into it (that would drop a visible neighbor per
+        // side and flatten resolution scaling).
+        let base = metrics_for_width(1920.0, 1080.0);
+        // Shorter stages shrink; taller ones may still grow up to the clamp
+        // (pre-existing scaling), but never past it.
+        for h in [720.0_f32, 900.0, 1080.0, 1440.0, 2160.0] {
+            let m = metrics_for_width(1920.0, h);
+            assert!(
+                m.center_h <= CENTER_H_MAX && m.center_h >= CENTER_H_MIN,
+                "h={h} center_h={}",
+                m.center_h
+            );
+        }
+        for h in [720.0_f32, 900.0, 1080.0] {
+            let m = metrics_for_width(1920.0, h);
+            assert!(m.center_h <= base.center_h + 0.01, "h={h}");
+        }
+        // 1080p keeps the pre-change capsule size (art ~470px).
+        assert!(
+            (base.center_h * SELECTED_SCALE - 470.0).abs() < 1.0,
+            "art={}",
+            base.center_h * SELECTED_SCALE
+        );
+        // Neighbors per side are preserved at 1080p.
+        assert!(
+            (3..=MAX_NEIGHBORS).contains(&neighbors_for_width(1920.0, base.center_w)),
+            "n={}",
+            neighbors_for_width(1920.0, base.center_w)
+        );
+    }
+
+    #[test]
+    fn every_slot_carries_the_same_text_budget() {
+        // The selection's title rides in-slot like every other cover, so all
+        // slot boxes reserve the same text height — no size pop between the
+        // selection and a neighbor (the old art-only selection box).
+        let m = metrics_for_width(1920.0, 1080.0);
+        let max_w = m.center_w * SELECTED_SCALE;
+        for d in [0.0_f32, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0] {
+            let child = slot_child_size_h(&m, d);
+            let art_h = m.center_h * scale_at_distance(d);
+            assert!(
+                (child.height - (art_h + m.h_text_budget)).abs() < 0.01,
+                "d={d}"
+            );
+            assert!((child.width - max_w).abs() < 0.01, "d={d}");
+            // Slot box never exceeds the strip (art anchored at the top).
+            let bottom = slot_y_offset_h(d, &m) + child.height;
+            assert!(bottom <= m.slot_h + 0.01, "d={d} bottom={bottom}");
+        }
+        // Mid-scroll stays continuous (no height pop at the halfway point).
+        let mid = slot_child_size_h(&m, 0.5).height;
+        let end0 = slot_child_size_h(&m, 0.0).height;
+        let end1 = slot_child_size_h(&m, 1.0).height;
+        let (lo, hi) = if end0 < end1 {
+            (end0, end1)
+        } else {
+            (end1, end0)
+        };
+        assert!(mid > lo && mid < hi, "mid={mid} lo={lo} hi={hi}");
+        // Art-only stages shrink every box to just the art.
+        let tiny = metrics_for_width(1280.0, 600.0);
+        assert_eq!(tiny.h_text_budget, 0.0);
+        for d in [0.0_f32, 1.0, 3.0] {
+            let art_h = tiny.center_h * scale_at_distance(d);
+            assert!(
+                (slot_child_size_h(&tiny, d).height - art_h).abs() < 0.01,
+                "d={d}"
+            );
+        }
     }
 
     #[test]
@@ -824,8 +858,9 @@ mod tests {
             assert!(top >= -0.01, "d={d} top={top}");
             assert!(bottom <= m.slot_h + 0.01, "d={d} bottom={bottom}");
         }
-        // Selection is art-only, so its art is flush with the strip top and
-        // neighbors hang below it by exactly their own height difference.
+        // The selection's art is flush with the strip top; every other art
+        // hangs below it by exactly its own height difference (so the whole
+        // row — titles included — shares one centerline).
         let selected_art = m.center_h * SELECTED_SCALE;
         assert!(slot_y_offset_h(0.0, &m).abs() < 0.01);
         for d in [0.5_f32, 1.0, 2.0, 3.0, 5.0] {
@@ -836,11 +871,11 @@ mod tests {
             );
         }
         // Art-only stages keep the same relationship (text budget is 0).
-        let short = metrics_for_width(1280.0, 720.0);
+        let tiny = metrics_for_width(1280.0, 600.0);
         for d in [0.0_f32, 1.0, 2.0] {
-            let art_h = short.center_h * scale_at_distance(d);
+            let art_h = tiny.center_h * scale_at_distance(d);
             assert!(
-                (slot_y_offset_h(d, &short) + art_h * 0.5 - short.slot_h * 0.5).abs() < 0.01,
+                (slot_y_offset_h(d, &tiny) + art_h * 0.5 - tiny.slot_h * 0.5).abs() < 0.01,
                 "d={d}"
             );
         }
@@ -863,40 +898,6 @@ mod tests {
             assert!(n >= prev, "w={w} n={n} prev={prev}");
             prev = n;
         }
-    }
-
-    #[test]
-    fn horizontal_child_boxes_share_a_fixed_width() {
-        let m = metrics_for_width(1920.0, 1080.0);
-        let max_w = m.center_w * SELECTED_SCALE;
-        let text_full = m.h_text_budget;
-        for d in [0.0_f32, 1.0, 2.0, 3.0, 4.0] {
-            let child = slot_child_size_h(&m, d);
-            assert!((child.width - max_w).abs() < 0.01, "d={d}");
-            // In-slot text fades in with |d|: art-only at the selection,
-            // full neighbor budget from |d| >= 1 (continuous mid-scroll).
-            let w = d.abs().clamp(0.0, 1.0);
-            let art_h = m.center_h * scale_at_distance(d);
-            assert!(
-                (child.height - (art_h + text_full * w)).abs() < 0.01,
-                "d={d}"
-            );
-        }
-        // Selection is art-only (its title lives in the full-width layer);
-        // the strip is sized by the deeper art-centered neighbor column.
-        let art0 = m.center_h * SELECTED_SCALE;
-        assert!((slot_child_size_h(&m, 0.0).height - art0).abs() < 0.01);
-        assert!(m.slot_h >= art0);
-        // Mid-scroll stays continuous (no 100px pop at the halfway point).
-        let mid = slot_child_size_h(&m, 0.5).height;
-        let end0 = slot_child_size_h(&m, 0.0).height;
-        let end1 = slot_child_size_h(&m, 1.0).height;
-        let (lo, hi) = if end0 < end1 {
-            (end0, end1)
-        } else {
-            (end1, end0)
-        };
-        assert!(mid > lo && mid < hi, "mid={mid} lo={lo} hi={hi}");
     }
 
     #[test]
@@ -974,133 +975,79 @@ mod tests {
     }
 
     #[test]
-    fn title_crossfade_endpoints_and_ease() {
-        let (old0, new0) = title_crossfade_opacity(title_crossfade_t(0, STRIP_ANIM_MS));
-        assert!((old0 - 1.0).abs() < 0.001 && new0.abs() < 0.001);
-        let (old1, new1) = title_crossfade_opacity(title_crossfade_t(STRIP_ANIM_MS, STRIP_ANIM_MS));
-        assert!(old1.abs() < 0.001 && (new1 - 1.0).abs() < 0.001);
-        // Ease-out runs ahead of linear at midpoint (matches the strip scroll feel).
-        let mid = title_crossfade_t(STRIP_ANIM_MS / 2, STRIP_ANIM_MS);
-        assert!(mid > 0.5 && mid < 1.0);
-        let (old_m, new_m) = title_crossfade_opacity(mid);
-        assert!((old_m + new_m - 1.0).abs() < 0.001);
-        assert!(new_m > 0.5);
-        // Past the end clamps (tick settles, but sampling must stay sane).
-        assert!((title_crossfade_t(STRIP_ANIM_MS * 4, STRIP_ANIM_MS) - 1.0).abs() < 0.001);
-        let (old_c, new_c) = title_crossfade_opacity(2.0);
-        assert!(old_c.abs() < 0.001 && (new_c - 1.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn title_drift_follows_scroll_direction() {
-        let t = 0.5;
-        let (old_dx, new_dx) = title_crossfade_drift(t, 1.0);
-        assert!(old_dx < 0.0 && new_dx > 0.0);
-        assert!((old_dx.abs() + new_dx.abs() - TITLE_DRIFT_PX).abs() < 0.01);
-        let (old_dx, new_dx) = title_crossfade_drift(t, -1.0);
-        assert!(old_dx > 0.0 && new_dx < 0.0);
-        // Fade-only when direction is unknown.
-        let (old_dx, new_dx) = title_crossfade_drift(t, 0.0);
-        assert!(old_dx.abs() < 0.001 && new_dx.abs() < 0.001);
-        // Incoming settles at zero drift (no resting offset); outgoing has left.
-        let (old_dx, new_dx) = title_crossfade_drift(1.0, 1.0);
-        assert!(old_dx.abs() > 0.0 && new_dx.abs() < 0.001);
-        let (old_dx, new_dx) = title_crossfade_drift(0.0, 1.0);
-        assert!(old_dx.abs() < 0.001 && (new_dx - TITLE_DRIFT_PX).abs() < 0.001);
-    }
-
-    #[test]
-    fn selected_title_gap_matches_in_slot_text_gap() {
-        // The full-width selected title must sit as tight to the art row as
-        // neighbor in-slot titles do (strip spacing == in-slot art→text gap).
-        assert!((H_STRIP_TO_TITLE_GAP - H_TEXT_GAP).abs() < 0.001);
-    }
-
-    #[test]
-    fn selected_title_follows_the_strip_without_clipping_in_slot_text() {
-        // Regression: the strip→title gap constant was always 8px, but the
-        // selected art bottom sat ~108px above the title top because the
-        // strip container carried the neighbor in-slot text reserve while the
-        // selected slot showed art only (plus centering slack when meta was
-        // absent). Art is now anchored at the strip top, so the title still
-        // follows the strip immediately (no centering slack) and what sits
-        // between the art and the title is only the strip room a neighbor
-        // column needs under the shared centerline.
+    fn in_slot_title_follows_art_by_one_gap() {
+        // Every slot — the selection included — spaces art→title by the same
+        // `H_TEXT_GAP`, so titles sit tight under their card and the row reads
+        // uniformly instead of the selection owning a separate layer.
         let m = metrics_for_width(1920.0, 1080.0);
-        let selected_art = m.center_h * SELECTED_SCALE;
+        for d in [0.0_f32, 1.0, 2.0] {
+            let art_h = m.center_h * scale_at_distance(d);
+            let top = slot_y_offset_h(d, &m);
+            let child = slot_child_size_h(&m, d).height;
+            // `strip_slot_stacked` adds H_TEXT_GAP between the art cell and
+            // the label, so the text stack starts one gap below the art.
+            let text_top = top + art_h + H_TEXT_GAP;
+            assert!(text_top > top + art_h - 0.01, "d={d}");
+            // The box holds art + gap + reserved text (no clipping); the budget
+            // already includes the gap.
+            assert!(
+                art_h + m.h_text_budget <= child + 0.01,
+                "d={d} art={art_h} child={child}"
+            );
+        }
+        // Text reserve fits the measured worst case (22px title + two 14px meta
+        // lines + the Update badge) so meta presence never pushes the row.
+        let text_lines = 22.0 * 1.3 + 6.0 + (14.0 * 1.3 * 2.0 + 2.0) + 6.0 + 21.0;
         assert!(
-            (slot_child_size_h(&m, 0.0).height - selected_art).abs() < 0.01,
-            "child0={}",
-            slot_child_size_h(&m, 0.0).height
-        );
-        let neighbor_art = m.center_h * SCALE_AT_1;
-        assert!(
-            (m.slot_h - (selected_art * 0.5 + neighbor_art * 0.5 + m.h_text_budget)).abs() < 0.01,
-            "slot_h={}",
-            m.slot_h
-        );
-        // Selected child top-aligns its art (art-only slot uses zero
-        // inter-block spacing), the title layer top-aligns its text, so the
-        // visual gap is the strip remainder plus the strip→title gap.
-        let gap = (m.slot_h - selected_art) + H_STRIP_TO_TITLE_GAP;
-        assert!(gap >= H_TEXT_GAP - 0.01, "gap={gap}");
-        assert!(gap < 40.0, "gap={gap}");
-        // Neighbors keep the same one-gap relationship in-slot.
-        let neighbor_child = slot_child_size_h(&m, 1.0).height;
-        assert!(
-            (neighbor_child - (neighbor_art + m.h_text_budget)).abs() < 0.01,
-            "neighbor={neighbor_child}"
-        );
-        // Title reserve still fits the measured worst case (39px title + two
-        // 16px meta lines + badge) so meta presence never moves the title top.
-        let title_lines = 39.0 * 1.3 + 6.0 + (16.0 * 1.3 * 2.0 + 2.0) + 6.0 + 25.0;
-        assert!(
-            H_SELECTED_TITLE_RESERVE >= title_lines - 0.5,
-            "reserve={} need={title_lines}",
-            H_SELECTED_TITLE_RESERVE
+            H_TEXT_RESERVE >= text_lines - 0.5,
+            "reserve={} need={text_lines}",
+            H_TEXT_RESERVE
         );
     }
 
     #[test]
     fn horizontal_block_lead_drops_art_row_without_eating_rail_gap() {
         // 1080p: the strip anchors the ART ROW at its top, so the lead can
-        // center the art (not the strip+title block) in the region; the title
-        // follows one gap below the strip and the rail keeps its minimum gap.
+        // center the art (not the whole strip block) in the region, and the
+        // rail keeps its minimum gap under the in-slot titles.
         let m = metrics_for_width(1920.0, 1080.0);
-        let block_h = m.slot_h + H_STRIP_TO_TITLE_GAP + H_SELECTED_TITLE_RESERVE;
+        let block_h = m.slot_h;
         // Layout region above the rail: stage minus rail height + footer pad.
         let region_h = 1080.0 - 120.0 - 64.0;
-        let lead = horizontal_block_lead(region_h, block_h, 44.0, H_TITLE_TO_BAR_MIN);
-        // block = 489 (art + neighbor reach below the centerline) + 8 + 132 =
-        // 629; slack = 205; lead = 44 + 103 + 70 = 217.
-        assert!((block_h - 629.0).abs() < 1.0, "block={block_h}");
-        assert!((lead - 217.0).abs() < 1.0, "lead={lead}");
-        // Rail gap never eaten (the shrunken block leaves real slack).
+        let lead =
+            horizontal_block_lead(region_h, block_h, m.h_text_budget, 44.0, H_TITLE_TO_BAR_MIN);
+        // Art is the tallest element and sits at the strip top, so the block
+        // is art + text reserve with no separate title layer stacked below.
+        assert!(
+            (block_h - (m.center_h * SELECTED_SCALE + m.h_text_budget)).abs() < 0.01,
+            "block={block_h}"
+        );
         let rail_gap = region_h - lead - block_h;
         assert!(rail_gap >= H_TITLE_TO_BAR_MIN - 0.01, "gap={rail_gap}");
-        // Art is flush with the strip top, so the lead's art-center math is
-        // exact and the title sits the strip remainder + one text gap below.
+        // Art center lands mid-region.
         let art_h = m.center_h * m.selected_scale;
         let art_center = lead + art_h * 0.5;
         assert!(
             (art_center - region_h * 0.5).abs() < 20.0,
             "art_center={art_center}"
         );
-        let title_top = lead + m.slot_h + H_STRIP_TO_TITLE_GAP;
+        // Titles stay clear of the rail.
+        let text_bottom = lead + block_h;
         assert!(
-            title_top - (lead + art_h) >= H_TEXT_GAP - 0.01,
-            "title_top={title_top}"
+            text_bottom <= region_h - H_TITLE_TO_BAR_MIN + 0.01,
+            "text_bottom={text_bottom} region={region_h}"
         );
     }
 
     #[test]
     fn horizontal_block_lead_centers_art_on_tall_stages() {
-        // Clamped capsules leave real slack: the full offset applies and the
-        // art center lands mid-region (within top-pad/rail asymmetry).
+        // Clamped capsules leave real slack: the full text offset applies and
+        // the art center lands mid-region (within top-pad/rail asymmetry).
         let m = metrics_for_width(2560.0, 2160.0);
-        let block_h = m.slot_h + H_STRIP_TO_TITLE_GAP + H_SELECTED_TITLE_RESERVE;
+        let block_h = m.slot_h;
         let region_h = 2160.0 - 120.0 - 64.0;
-        let lead = horizontal_block_lead(region_h, block_h, 44.0, H_TITLE_TO_BAR_MIN);
+        let lead =
+            horizontal_block_lead(region_h, block_h, m.h_text_budget, 44.0, H_TITLE_TO_BAR_MIN);
         let art_h = m.center_h * m.selected_scale;
         assert!(
             (lead + art_h * 0.5 - region_h * 0.5).abs() < 16.0,
@@ -1112,10 +1059,10 @@ mod tests {
     #[test]
     fn horizontal_block_lead_clamps_on_short_stages() {
         // Block taller than the region: lead floors at the clock pad (never negative).
-        let lead = horizontal_block_lead(536.0, 519.6, 44.0, H_TITLE_TO_BAR_MIN);
+        let lead = horizontal_block_lead(536.0, 519.6, 108.0, 44.0, H_TITLE_TO_BAR_MIN);
         assert!((lead - 44.0).abs() < 0.001, "lead={lead}");
         // Degenerate regions cannot panic or go negative.
-        assert!(horizontal_block_lead(0.0, 700.0, 44.0, 18.0) >= 44.0 - 0.001);
+        assert!(horizontal_block_lead(0.0, 700.0, 108.0, 44.0, 18.0) >= 44.0 - 0.001);
     }
 
     #[test]
