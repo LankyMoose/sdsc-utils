@@ -678,8 +678,10 @@ fn strip_slot<'a>(
     if orientation == StripOrientation::Horizontal {
         // Selected title lives in the full-width layer below the strip;
         // outer peeks (|offset| >= 2) show art only. Only immediate neighbors
-        // keep a small in-slot title so adjacent slots can never overlap.
-        let show_text = !selected && sel_offset.abs() < 2;
+        // keep a small in-slot title so adjacent slots can never overlap —
+        // and only where the strip budgeted room for it (short stages go
+        // art-only rather than clipping, see `metrics_for_width`).
+        let show_text = !selected && sel_offset.abs() < 2 && metrics.h_text_budget > 0.0;
         return strip_slot_stacked(
             row, muted, fade, dim, capsule, max_art_w, art_w, art_h, show_text,
         );
@@ -1111,8 +1113,11 @@ fn strip_capsule<'a>(
         theme::alpha(theme::LINE, 0.45 * fade)
     };
     let border_w = if selected { 2.0 } else { 1.0 };
+    // No fill: the slot fade rides on the art (see `art_fade`), so an
+    // opaque card behind it would read as a grey plate fading in instead
+    // of the art dissolving into the backdrop. The border already fades.
     let frame = move |_theme: &iced::Theme| iced::widget::container::Style {
-        background: Some(iced::Background::Color(theme::CONTENT)),
+        background: None,
         border: iced::Border {
             color: border,
             width: border_w,
