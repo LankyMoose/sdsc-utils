@@ -17,6 +17,8 @@ use crate::controller::hid::poll::{
 };
 use crate::controller::hid::worker::HidWorkerHandle;
 use crate::controller::known::KnownControllers;
+#[cfg(feature = "dev-emulate")]
+use crate::controller::model::PowerState;
 use crate::controller::model::{Connection, ControllerStatus};
 use crate::games::launch;
 use crate::games::process_match::{self, RunningSession};
@@ -372,13 +374,17 @@ pub struct App {
 // Entry points
 // ---------------------------------------------------------------------------
 
+/// Standalone in-process daemon (no service attached).
+///
+/// The `dev_mode` argument only exists in `dev-emulate` builds; the default
+/// keeps call sites free of `cfg` noise.
 #[cfg(feature = "dev-emulate")]
 pub fn run(dev_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     run_app(dev_mode)
 }
 
 #[cfg(not(feature = "dev-emulate"))]
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(_dev_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     run_app()
 }
 
@@ -419,6 +425,11 @@ fn run_app(
 
 fn run_app_as_client() -> Result<(), Box<dyn std::error::Error>> {
     crate::platform::wgpu_diag::log_adapters_at_boot();
+    // Client mode has no local HID, so the emulator never runs here — dev_mode
+    // stays off even in a dev-emulate build.
+    #[cfg(feature = "dev-emulate")]
+    let boot = || App::boot(false, true);
+    #[cfg(not(feature = "dev-emulate"))]
     let boot = || App::boot(true);
     iced::daemon(boot, App::update, App::view)
         .subscription(App::subscription)

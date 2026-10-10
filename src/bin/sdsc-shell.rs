@@ -34,7 +34,9 @@ fn main() -> ExitCode {
     } else {
         // Standalone / developer path: full in-process daemon.
         crash_restart::arm_tray_mode();
-        match app::run() {
+        // `--dev` only does anything in a `dev-emulate` build; harmless otherwise.
+        let dev = args.iter().any(|a| a == "--dev");
+        match app::run(dev) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 app_log::error(format!("shell standalone exited: {err}"));
