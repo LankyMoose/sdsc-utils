@@ -5150,26 +5150,30 @@ impl App {
         match msg {
             ServiceMessage::Controllers(controllers) => {
                 // Service already ran session + HID; refresh shell UI only when changed.
-                if !crate::session::controllers_equivalent(&self.session.controllers, &controllers)
-                {
-                    self.session.controllers = controllers;
-                    if self
-                        .start_state
-                        .powering_off
-                        .as_ref()
-                        .is_some_and(|s| !self.session.controllers.iter().any(|c| c.serial == *s))
-                    {
-                        self.start_state.powering_off = None;
-                    }
-                    self.sync_popup_rows();
-                    if self.start_visible {
-                        self.refresh_start_controllers();
-                    }
-                }
+                // A live add/remove changes the popup row count, so refit while open.
+                let fit =
+                    if !crate::session::controllers_equivalent(
+                        &self.session.controllers,
+                        &controllers,
+                    ) {
+                        self.session.controllers = controllers;
+                        if self.start_state.powering_off.as_ref().is_some_and(|s| {
+                            !self.session.controllers.iter().any(|c| c.serial == *s)
+                        }) {
+                            self.start_state.powering_off = None;
+                        }
+                        let fit = self.sync_popup_rows_and_fit();
+                        if self.start_visible {
+                            self.refresh_start_controllers();
+                        }
+                        fit
+                    } else {
+                        Task::none()
+                    };
                 #[cfg(debug_assertions)]
                 note_client_hitch_controllers(self.session.controllers.len());
                 self.sync_client_input_hot();
-                Task::none()
+                fit
             }
             ServiceMessage::Effects(effects) => self.apply_session_effects(effects),
             ServiceMessage::PadInput(edge) => {

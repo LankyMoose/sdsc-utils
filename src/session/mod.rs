@@ -293,6 +293,11 @@ impl DeviceSession {
         effects.push(SessionEffect::SetTray {
             connected: self.controllers.len(),
         });
+        // Live membership or the remembered set changed, so the popup's row
+        // list may have grown or shrunk — rebuild it and resize while open.
+        // The shell maps this to `sync_popup_rows_and_fit`; the service
+        // forwards it (it already owns the tray via `SetTray`).
+        effects.push(SessionEffect::SyncPopup);
         if !events.is_empty() || open_start_after_toast {
             effects.push(SessionEffect::QueueNotifications {
                 events,
@@ -628,6 +633,61 @@ mod tests {
                 }
             )),
             "Bluetooth arrival should latch an open in Bluetooth mode"
+        );
+    }
+
+    fn has_popup_sync(effects: &[SessionEffect]) -> bool {
+        effects
+            .iter()
+            .any(|e| matches!(e, SessionEffect::SyncPopup))
+    }
+
+    #[test]
+    fn membership_gain_emits_popup_sync() {
+        // 0→1 grows the popup by a row: the shell must resize while open.
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        assert!(
+            has_popup_sync(&effects),
+            "connect must emit SyncPopup, got {effects:?}"
+        );
+    }
+
+    #[test]
+    fn membership_loss_emits_popup_sync() {
+        // 1→0 shrinks the popup by a row: the shell must resize while open.
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let _ = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        let effects = session.apply_controllers(Vec::new(), ctx(false));
+        assert!(
+            has_popup_sync(&effects),
+            "disconnect must emit SyncPopup, got {effects:?}"
+        );
+    }
+
+    #[test]
+    fn reconnecting_a_forgotten_pad_emits_popup_sync() {
+        // Forgetting drops the remembered row; reconnecting re-adds the live
+        // row. Both change the row count, so both must resize the popup.
+        let mut session = session_with(false, StartAutoOpen::Any);
+        session.known.remember(&bt_pad("aa"));
+        assert!(session.known.forget("aa"));
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        assert!(
+            has_popup_sync(&effects),
+            "forgotten-pad reconnect must emit SyncPopup, got {effects:?}"
+        );
+    }
+
+    #[test]
+    fn unchanged_snapshot_emits_no_popup_sync() {
+        // Same pad, same readings: no row change, so no pointless resize.
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let _ = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        assert!(
+            !has_popup_sync(&effects),
+            "equivalent snapshot must not emit SyncPopup, got {effects:?}"
         );
     }
 
