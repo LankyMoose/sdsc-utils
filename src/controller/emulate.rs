@@ -1,4 +1,4 @@
-//! Developer-only controller presets (feature `dev-emulate`).
+//! Developer-only controller presets (debug builds only).
 
 use crate::controller::dualsense::battery::{LOW_BATTERY_PERCENT, dualsense_status};
 use crate::controller::model::Connection;

@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Lightbar spectrum editor bars and handles are rounded; the saturation square has rounded corners.
 - Remember is now a pin toggle icon in the popup row.
+- The developer emulator and other debug-only tooling ship in every non-release build (`cfg(debug_assertions)`) instead of behind the `dev-emulate` Cargo feature or a `--dev` flag — a plain `cargo run` now has the Configure → Developer section. Release builds still exclude it.
+- Horizontal immersive Start centers every cover by its art (neighbors no longer ride above the selection) and fades neighbors to transparent instead of grey.
+
+### Fixed
+
+- Horizontal immersive Start draws the selected game's title and subtitle inside its cover, like its neighbors, so they scroll with the card instead of crossfading in a separate full-width layer.
 
 ## [1.6.1] - 2026-10-07
 

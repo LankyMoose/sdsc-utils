@@ -11,7 +11,7 @@
 | Debug build (every binary) | `cargo build` |
 | Release build | `cargo build --release` |
 | Run (service + matching shell) | `cargo run` |
-| Run with dev emulator | `cargo run --features dev-emulate -- --dev` |
+| Run (developer UI included) | `cargo run` |
 | List connected controllers | `sdsc-utils --list-controllers` |
 
 ## Project structure
@@ -62,7 +62,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **macOS**: `tray-icon` (no default features). Input monitoring may be prompted by macOS.
 - **Linux**: `tray-icon` with `gtk` feature. Requires `libhidapi` / udev rules for DualSense access.
 - **Graphics backend**: on Windows boot sets `WGPU_BACKEND=vulkan,dx12` (Vulkan preferred, DX12 fallback) unless the env var is already set; `wgpu_diag::alpha_composite()` reports whether transparent windows will composite. See `notes/ui-refresh.md`.
-- **Developer emulator**: Build with `dev-emulate` feature: `cargo run --features dev-emulate -- --dev`. This adds a Developer section in Configure with emulated controllers and battery analytics presets.
+- **Developer emulator**: Always compiled in non-release builds (`cfg(debug_assertions)`) — a plain `cargo run` already has it. Configure → Developer holds emulated controller and battery analytics presets. Release builds (`cargo build --release`) compile it out; no Cargo feature or CLI flag exists.
 
 ## Directory ownership
 
@@ -72,7 +72,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 | `src/service/` | Service process: owns HID worker + tray, spawns `sdsc-shell`, talks to it over IPC |
 | `src/session/` | Pure device session (no windows/HWND): presence, notify, analytics, Start-open policy; emits `SessionEffect`s the UI applies |
 | `src/ipc/` | Service ↔ shell pipe transport (Windows named pipe / Unix socket) |
-| `src/controller/` | HID polling + worker (`hid/`), DualSense protocol (`dualsense/`: battery, lightbar, rumble, input, identity), known controllers, `dev-emulate` emulation |
+| `src/controller/` | HID polling + worker (`hid/`), DualSense protocol (`dualsense/`: battery, lightbar, rumble, input, identity), known controllers, debug-only `emulate` emulation |
 | `src/domain/` | Pure logic: battery colors/spectrum math, pad gestures/chords, protocol helpers |
 | `src/games/` | Steam library scan, game launch, process matching |
 | `src/persist/` | `prefs.json`, `controllers.json`, `analytics.json`, `steam_library.json`, paths |
@@ -86,7 +86,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Clippy `-D warnings` is active in CI**. Any new `#[allow(clippy::...)]` must be justified; otherwise the build will fail on PR.
 - **The `single-instance` crate ensures only one run**. If you add GUI windows, make sure they're owned correctly or you'll get "single instance" exits.
 - **Windows .exe icon is generated from SVG at build time** via `build.rs`. If the SVG changes, the icon rebuilds automatically (rerun-if-changed is set).
-- **`--dev` flag only works when built with `dev-emulate` feature**. Without it, `--dev` is a no-op.
+- **Debug-only code is gated by `cfg(debug_assertions)`, not a Cargo feature**. The Developer emulator, HID diagnostics, and verbose logging ship in every non-release build. `scripts/ci.sh` lints *both* profiles (`--release` included) because release compiles out whole items that debug compiles — a debug-only clean build does not prove a clean release.
 - **Lightbar color reassertion every ~5 seconds** means if you overwrite the lightbar via another tool (e.g., Steam Input), the app will re-apply its color. This is intentional but worth noting when debugging "stuck" colors. (Incremental-poll work narrows this to change/new/30s-backstop; see `notes/hot-enumeration-freeze.md` for the Steam test watch.)
 - **Hot enumeration freeze**: while input is hot (`input_hot=1`, e.g. Start open with a stable pad), `refresh_devices()` is deferred up to `HOT_ENUM_MAX_DEFER` (20s heartbeat cap) and service cold polls are gated off — plus the OS arrival watcher (Windows `CM_Register_Notification`, Linux `/dev` snapshot; see `notes/device-arrival-watch.md`) fires list-only refresh hints so newly-connected pads surface in ~1s. Pre-existing freeze documented in `notes/hot-enumeration-freeze.md`; any poll/sampling change must still be validated with a Start-open + second-connect test, not just tray-idle.
 - **Battery step mapping is Linux-midpoint**. Windows may report different percentages; the app maps firmware steps → percentages via the fixed mid-point formula.

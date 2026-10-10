@@ -198,7 +198,7 @@ impl AnalyticsStore {
         if !crate::controller::dualsense::identity::is_storable_serial(serial) {
             return false;
         }
-        #[cfg(not(feature = "dev-emulate"))]
+        #[cfg(not(debug_assertions))]
         if serial.starts_with("emu-") {
             return false;
         }
@@ -239,7 +239,7 @@ impl AnalyticsStore {
     }
 
     /// Developer helper: seed full drain/charge step chains so ETA UI can be checked.
-    #[cfg(feature = "dev-emulate")]
+    #[cfg(debug_assertions)]
     pub fn dev_seed_estimates(&mut self, serial: &str) {
         if !Self::is_storable_serial(serial) {
             return;
@@ -264,7 +264,7 @@ impl AnalyticsStore {
     }
 
     /// Developer helper: credit active time on the in-progress bucket.
-    #[cfg(feature = "dev-emulate")]
+    #[cfg(debug_assertions)]
     pub fn dev_credit_active(&mut self, serial: &str, extra: Duration) {
         let Some(record) = self.by_serial.get_mut(serial) else {
             return;

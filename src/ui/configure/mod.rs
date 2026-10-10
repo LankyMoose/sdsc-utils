@@ -9,7 +9,7 @@ mod spectrum;
 use coverage::CoverageChart;
 use spectrum::{BAR_HEIGHT, HUE_HEIGHT, HueBar, SV_HEIGHT, SpectrumBar, SvSquare};
 
-#[cfg(feature = "dev-emulate")]
+#[cfg(debug_assertions)]
 use crate::controller::emulate::Preset;
 use crate::games::steam::LAST_KNOWN_COMPATIBLE_STEAM_VERSION;
 use crate::persist::analytics::{
@@ -90,8 +90,12 @@ pub enum Section {
     Notifications,
     Lightbar,
     Analytics,
+    /// Live controller readings. Only listed in the sidebar for debug builds
+    /// (see [`Section::all`]), but the variant exists in both so the pad-input
+    /// view stays reachable from code and tests.
     PadInput,
-    #[cfg(feature = "dev-emulate")]
+    /// Debug-only emulated controllers + analytics presets.
+    #[cfg(debug_assertions)]
     Developer,
     /// Debug-only renderer diagnostics (window stress test).
     #[cfg(debug_assertions)]
@@ -107,7 +111,7 @@ impl Section {
             Self::Lightbar => "Lightbar colors",
             Self::Analytics => "Analytics",
             Self::PadInput => "Pad input",
-            #[cfg(feature = "dev-emulate")]
+            #[cfg(debug_assertions)]
             Self::Developer => "Developer",
             #[cfg(debug_assertions)]
             Self::Diagnostics => "Diagnostics",
@@ -122,45 +126,38 @@ impl Section {
             Self::Lightbar => "Lightbar color as the battery drains",
             Self::Analytics => "Learned charge and play times",
             Self::PadInput => "Live controller readings",
-            #[cfg(feature = "dev-emulate")]
+            #[cfg(debug_assertions)]
             Self::Developer => "Emulated controllers and analytics",
             #[cfg(debug_assertions)]
             Self::Diagnostics => "Renderer stress testing",
         }
     }
 
-    fn all(show_developer: bool) -> Vec<Self> {
-        #[cfg(feature = "dev-emulate")]
+    /// Sidebar sections. `PadInput` / `Developer` / `Diagnostics` are
+    /// debug-only and compiled out of release builds entirely.
+    fn all() -> Vec<Self> {
+        #[cfg(debug_assertions)]
         {
-            let mut sections = vec![
+            vec![
                 Self::System,
                 Self::StartScreen,
                 Self::Notifications,
                 Self::Lightbar,
                 Self::Analytics,
-            ];
-            if show_developer {
-                sections.push(Self::PadInput);
-                sections.push(Self::Developer);
-            }
-            #[cfg(debug_assertions)]
-            sections.push(Self::Diagnostics);
-            sections
+                Self::PadInput,
+                Self::Developer,
+                Self::Diagnostics,
+            ]
         }
-        #[cfg(not(feature = "dev-emulate"))]
+        #[cfg(not(debug_assertions))]
         {
-            let _ = show_developer;
-            #[cfg_attr(not(debug_assertions), allow(unused_mut))]
-            let mut sections = vec![
+            vec![
                 Self::System,
                 Self::StartScreen,
                 Self::Notifications,
                 Self::Lightbar,
                 Self::Analytics,
-            ];
-            #[cfg(debug_assertions)]
-            sections.push(Self::Diagnostics);
-            sections
+            ]
         }
     }
 }
@@ -198,7 +195,6 @@ pub struct ConfigureSettings {
     pub start_screen_haptics_strength: u8,
     #[cfg(windows)]
     pub autostart: bool,
-    pub show_developer: bool,
     pub extra_steam_paths: Vec<PathBuf>,
     pub steam_path_error: Option<String>,
 }
@@ -290,7 +286,7 @@ pub enum ConfigureMessage {
     HueChanged(f32),
     SaturationValueChanged(f32, f32),
     ResetSpectrum,
-    #[cfg(feature = "dev-emulate")]
+    #[cfg(debug_assertions)]
     DeveloperPreset(Preset),
     /// Debug-only: start the renderer window stress test (Diagnostics section).
     #[cfg(debug_assertions)]
@@ -609,7 +605,7 @@ pub fn view<'a>(
     .width(Fill)
     .height(Fill);
 
-    let sidebar = container(sidebar(state.section, settings.show_developer))
+    let sidebar = container(sidebar(state.section))
         .width(Length::Fixed(SIDEBAR_WIDTH))
         .height(Fill)
         .style(theme::glass(sidebar_radius()));
@@ -676,7 +672,7 @@ fn sidebar_radius() -> f32 {
 }
 
 /// Floating glass rail: app title (drag handle) over pill tabs.
-fn sidebar<'a>(active: Section, show_developer: bool) -> Element<'a, ConfigureMessage> {
+fn sidebar<'a>(active: Section) -> Element<'a, ConfigureMessage> {
     let title = mouse_area(
         container(
             row![
@@ -702,31 +698,31 @@ fn sidebar<'a>(active: Section, show_developer: bool) -> Element<'a, ConfigureMe
     .on_press(ConfigureMessage::DragWindow)
     .interaction(mouse::Interaction::Grab);
 
-    let tabs = Section::all(show_developer).into_iter().fold(
-        Column::new().spacing(2).width(Fill),
-        |list, section| {
-            let selected = active == section;
-            list.push(
-                button(
-                    row![
-                        container(space())
-                            .width(Length::Fixed(3.0))
-                            .height(Length::Fixed(14.0))
-                            .style(theme::nav_marker(selected)),
-                        text(section.title())
-                            .size(theme::type_scale::BODY)
-                            .font(if selected { semibold() } else { Font::DEFAULT }),
-                    ]
-                    .spacing(10)
-                    .align_y(Alignment::Center),
+    let tabs =
+        Section::all()
+            .into_iter()
+            .fold(Column::new().spacing(2).width(Fill), |list, section| {
+                let selected = active == section;
+                list.push(
+                    button(
+                        row![
+                            container(space())
+                                .width(Length::Fixed(3.0))
+                                .height(Length::Fixed(14.0))
+                                .style(theme::nav_marker(selected)),
+                            text(section.title())
+                                .size(theme::type_scale::BODY)
+                                .font(if selected { semibold() } else { Font::DEFAULT }),
+                        ]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([8, 10])
+                    .width(Fill)
+                    .on_press(ConfigureMessage::SelectSection(section))
+                    .style(theme::nav_item(selected)),
                 )
-                .padding([8, 10])
-                .width(Fill)
-                .on_press(ConfigureMessage::SelectSection(section))
-                .style(theme::nav_item(selected)),
-            )
-        },
-    );
+            });
 
     column![title, tabs]
         .spacing(4)
@@ -846,7 +842,7 @@ fn section_content<'a>(
         Section::Lightbar => lightbar_view(state, settings),
         Section::Analytics => analytics_view(settings, analytics),
         Section::PadInput => pad_input_view(pad_input),
-        #[cfg(feature = "dev-emulate")]
+        #[cfg(debug_assertions)]
         Section::Developer => developer_view(),
         #[cfg(debug_assertions)]
         Section::Diagnostics => diagnostics_view(),
@@ -1596,7 +1592,7 @@ fn pad_input_view<'a>(panel: &'a PadInputPanel) -> Element<'a, ConfigureMessage>
     items.into()
 }
 
-#[cfg(feature = "dev-emulate")]
+#[cfg(debug_assertions)]
 fn developer_view<'a>() -> Element<'a, ConfigureMessage> {
     let mut list = Column::new().spacing(4).width(Fill);
 
@@ -1636,7 +1632,7 @@ fn developer_view<'a>() -> Element<'a, ConfigureMessage> {
     list.into()
 }
 
-#[cfg(feature = "dev-emulate")]
+#[cfg(debug_assertions)]
 fn dev_preset_button<'a>(preset: Preset) -> Element<'a, ConfigureMessage> {
     button(text(preset.menu_label()).size(13.0).width(Fill))
         .padding([7, 10])
@@ -1651,6 +1647,24 @@ fn dev_preset_button<'a>(preset: Preset) -> Element<'a, ConfigureMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidebar_lists_developer_sections_in_debug_builds_only() {
+        // No flag, no pref: the sidebar follows the build profile, so a plain
+        // `cargo run` already exposes the emulator.
+        let sections = Section::all();
+        assert!(sections.contains(&Section::PadInput));
+        #[cfg(debug_assertions)]
+        {
+            assert!(sections.contains(&Section::Developer));
+            assert!(sections.contains(&Section::Diagnostics));
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            // Release compiles the variants out; the list must not name them.
+            assert!(sections.len() == 5, "sections={sections:?}");
+        }
+    }
 
     #[test]
     fn suggested_percent_lands_in_the_widest_gap() {
@@ -1702,7 +1716,6 @@ mod tests {
             start_screen_haptics_strength: 80,
             #[cfg(windows)]
             autostart: false,
-            show_developer: false,
             extra_steam_paths: Vec::new(),
             steam_path_error: None,
         };

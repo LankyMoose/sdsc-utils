@@ -84,9 +84,9 @@ pub fn prepare_shell_exe() -> Result<PathBuf, String> {
 }
 
 /// `cargo run` only builds the default binary (`sdsc-utils`), so the sibling
-/// `sdsc-shell` — which renders all UI — can be stale or built without the
-/// same features (e.g. `dev-emulate`). When this process was launched by
-/// `cargo run`, rebuild the shell once with the matching profile/features
+/// `sdsc-shell` — which renders all UI — can be stale or built for a different
+/// profile (release shells lose the debug-only emulator). When this process was
+/// launched by `cargo run`, rebuild the shell once for the matching profile
 /// before it is spawned. Installed, MSIX, and portable builds never see the
 /// `CARGO*` runtime env, so this is a no-op for them.
 fn sync_shell_under_cargo_run() {
@@ -96,7 +96,6 @@ fn sync_shell_under_cargo_run() {
             std::env::var_os("CARGO_PKG_NAME").as_deref(),
             std::env::var_os("CARGO_MANIFEST_DIR").as_deref(),
             cfg!(debug_assertions),
-            cfg!(feature = "dev-emulate"),
         ) else {
             return;
         };
@@ -141,7 +140,6 @@ fn cargo_run_shell_build(
     pkg_name: Option<&std::ffi::OsStr>,
     manifest_dir: Option<&std::ffi::OsStr>,
     debug: bool,
-    dev_emulate: bool,
 ) -> Option<Vec<String>> {
     // Guard against inheriting another package's `cargo run` env.
     if pkg_name? != env!("CARGO_PKG_NAME") {
@@ -157,10 +155,6 @@ fn cargo_run_shell_build(
     ];
     if !debug {
         args.push("--release".to_string());
-    }
-    if dev_emulate {
-        args.push("--features".to_string());
-        args.push("dev-emulate".to_string());
     }
     Some(args)
 }
@@ -342,25 +336,22 @@ mod tests {
 
     #[test]
     fn shell_sync_skipped_outside_cargo_run() {
-        assert_eq!(cargo_run_shell_build(None, None, true, false), None);
+        assert_eq!(cargo_run_shell_build(None, None, true), None);
         let dir = std::ffi::OsStr::new("C:/repo");
-        assert_eq!(cargo_run_shell_build(None, Some(dir), true, false), None);
+        assert_eq!(cargo_run_shell_build(None, Some(dir), true), None);
         let name = std::ffi::OsStr::new(env!("CARGO_PKG_NAME"));
-        assert_eq!(cargo_run_shell_build(Some(name), None, true, false), None);
+        assert_eq!(cargo_run_shell_build(Some(name), None, true), None);
     }
 
     #[test]
     fn shell_sync_skipped_for_other_packages() {
         let other = std::ffi::OsStr::new("some-other-crate");
         let dir = std::ffi::OsStr::new("C:/repo");
-        assert_eq!(
-            cargo_run_shell_build(Some(other), Some(dir), true, false),
-            None
-        );
+        assert_eq!(cargo_run_shell_build(Some(other), Some(dir), true), None);
     }
 
     #[test]
-    fn shell_sync_matches_profile_and_features() {
+    fn shell_sync_matches_the_profile_of_this_build() {
         let name = std::ffi::OsStr::new(env!("CARGO_PKG_NAME"));
         let dir = std::ffi::OsStr::new("repo");
         let manifest = Path::new("repo")
@@ -368,15 +359,15 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
-        let debug = cargo_run_shell_build(Some(name), Some(dir), true, false).unwrap();
+        let debug = cargo_run_shell_build(Some(name), Some(dir), true).unwrap();
         assert_eq!(
             debug,
             ["build", "--bin", "sdsc-shell", "--manifest-path", &manifest]
         );
 
-        let release_dev = cargo_run_shell_build(Some(name), Some(dir), false, true).unwrap();
+        let release = cargo_run_shell_build(Some(name), Some(dir), false).unwrap();
         assert_eq!(
-            release_dev,
+            release,
             [
                 "build",
                 "--bin",
@@ -384,8 +375,6 @@ mod tests {
                 "--manifest-path",
                 &manifest,
                 "--release",
-                "--features",
-                "dev-emulate",
             ]
         );
     }

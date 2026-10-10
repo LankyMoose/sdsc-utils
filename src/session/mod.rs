@@ -384,11 +384,11 @@ pub fn controllers_equivalent(a: &[ControllerStatus], b: &[ControllerStatus]) ->
 }
 
 fn is_emulated_serial(serial: &str) -> bool {
-    #[cfg(feature = "dev-emulate")]
+    #[cfg(debug_assertions)]
     {
         crate::controller::emulate::is_emulated(serial)
     }
-    #[cfg(not(feature = "dev-emulate"))]
+    #[cfg(not(debug_assertions))]
     {
         let _ = serial;
         false

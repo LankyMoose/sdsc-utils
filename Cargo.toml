@@ -32,7 +32,6 @@ path = "src/bin/gen_msix_logos.rs"
 
 [features]
 default = []
-dev-emulate = []
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.24.2", default-features = false }

@@ -94,7 +94,7 @@ cargo build --release
 
 This builds every binary. Run `target/release/sdsc-utils` (`.exe` on Windows); it is the background service and starts the UI process, `sdsc-shell`, from the same folder, so keep the two together.
 
-Release builds do **not** include the developer emulator (`dev-emulate` is off by default).
+Release builds do **not** include the developer emulator (it is compiled only into debug builds).
 
 Package identity: `package.name` in `Cargo.toml` is `sdsc-utils`; display name is `DISPLAY_NAME` in `src/app_meta.rs` (runtime paths follow the package name).
 
@@ -119,17 +119,17 @@ cargo run --release
 ./target/release/sdsc-utils
 ```
 
-`cargo run` only compiles `sdsc-utils`, so when started that way it also rebuilds `sdsc-shell` (same profile and features) before launching it. You never end up with a stale UI.
+`cargo run` only compiles `sdsc-utils`, so when started that way it also rebuilds `sdsc-shell` (same profile) before launching it. You never end up with a stale UI.
 
-### Developer emulator (optional)
+### Developer emulator
 
-For testing notifications without real hardware, build with the `dev-emulate` feature and pass `--dev`:
+For testing notifications without real hardware, just run a debug build:
 
 ```bash
-cargo run --features dev-emulate -- --dev
+cargo run
 ```
 
-That unlocks a **Developer** section in the **Configure** window with emulated controller presets (low battery, charging, fully charged, etc.) and **battery analytics** presets (seed estimates, plug/charge/drain/pause/resume steps with time fast-forward). Emulation is not compiled into normal release binaries.
+That unlocks a **Developer** section in the **Configure** window with emulated controller presets (low battery, charging, fully charged, etc.) and **battery analytics** presets (seed estimates, plug/charge/drain/pause/resume steps with time fast-forward). The emulator is compiled into every non-release build, so there is no flag to pass; release binaries (`cargo build --release`) never include it.
 
 ### CLI
 
@@ -140,7 +140,8 @@ That unlocks a **Developer** section in the **Configure** window with emulated c
 | `--install-autostart` | Windows: enable login autostart for this build |
 | `--uninstall-autostart` | Windows: disable that autostart entry |
 | `--list-controllers` | Print connected DualSense pads and exit |
-| `--dev` | Enable Developer controls in Configure (only when built with `--features dev-emulate`) |
+
+Developer controls need no flag: they are compiled into every non-release build.
 
 ## Windows notes
 

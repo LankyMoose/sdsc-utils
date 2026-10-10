@@ -28,4 +28,12 @@ cargo test --all-targets
 echo "==> cargo build"
 cargo build
 
+# Debug-only code (developer emulator, HID diagnostics, log levels) is behind
+# cfg(debug_assertions), so the release half of that split needs its own gate.
+echo "==> cargo clippy --release --all-targets -- -D warnings"
+cargo clippy --release --all-targets -- -D warnings
+
+echo "==> cargo build --release"
+cargo build --release
+
 echo "CI checks passed."

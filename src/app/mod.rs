@@ -9,7 +9,7 @@
 use crate::controller::dualsense::identity as dualsense;
 use crate::controller::dualsense::lightbar;
 use crate::controller::dualsense::rumble::MotorPulse;
-#[cfg(feature = "dev-emulate")]
+#[cfg(debug_assertions)]
 use crate::controller::emulate::{self, Preset};
 use crate::controller::hid::poll::{
     BATTERY_INTERVAL, LIVENESS_INTERVAL, PRESENCE_INTERVAL, PRESENCE_INTERVAL_EMPTY,
@@ -17,7 +17,7 @@ use crate::controller::hid::poll::{
 };
 use crate::controller::hid::worker::HidWorkerHandle;
 use crate::controller::known::KnownControllers;
-#[cfg(feature = "dev-emulate")]
+#[cfg(debug_assertions)]
 use crate::controller::model::PowerState;
 use crate::controller::model::{Connection, ControllerStatus};
 use crate::games::launch;
@@ -361,12 +361,10 @@ pub struct App {
     /// Bumped on every spectrum edit; stale SpectrumCommit messages are ignored.
     spectrum_generation: u64,
 
-    #[cfg(feature = "dev-emulate")]
-    dev_mode: bool,
-    #[cfg(feature = "dev-emulate")]
+    #[cfg(debug_assertions)]
     emulating: bool,
     /// Percent to restore after AnalyticsPause (list is empty while paused).
-    #[cfg(feature = "dev-emulate")]
+    #[cfg(debug_assertions)]
     dev_paused_percent: Option<u8>,
 }
 
@@ -376,15 +374,10 @@ pub struct App {
 
 /// Standalone in-process daemon (no service attached).
 ///
-/// The `dev_mode` argument only exists in `dev-emulate` builds; the default
-/// keeps call sites free of `cfg` noise.
-#[cfg(feature = "dev-emulate")]
-pub fn run(dev_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    run_app(dev_mode)
-}
-
-#[cfg(not(feature = "dev-emulate"))]
-pub fn run(_dev_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// Developer tooling (Configure → Developer, emulated controllers) is compiled
+/// in for every non-release build, so a plain `cargo run` already has it — no
+/// flag needed. Release builds drop it at compile time.
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     run_app()
 }
 
@@ -402,14 +395,9 @@ pub fn run_shell_client() -> Result<(), Box<dyn std::error::Error>> {
     run_app_as_client()
 }
 
-fn run_app(
-    #[cfg(feature = "dev-emulate")] dev_mode: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     crate::platform::wgpu_diag::log_adapters_at_boot();
 
-    #[cfg(feature = "dev-emulate")]
-    let boot = move || App::boot(dev_mode, false);
-    #[cfg(not(feature = "dev-emulate"))]
     let boot = || App::boot(false);
 
     iced::daemon(boot, App::update, App::view)
@@ -425,11 +413,7 @@ fn run_app(
 
 fn run_app_as_client() -> Result<(), Box<dyn std::error::Error>> {
     crate::platform::wgpu_diag::log_adapters_at_boot();
-    // Client mode has no local HID, so the emulator never runs here — dev_mode
-    // stays off even in a dev-emulate build.
-    #[cfg(feature = "dev-emulate")]
-    let boot = || App::boot(false, true);
-    #[cfg(not(feature = "dev-emulate"))]
+    // Client mode has no local HID owner, so the emulator has nothing to feed.
     let boot = || App::boot(true);
     iced::daemon(boot, App::update, App::view)
         .subscription(App::subscription)
@@ -446,10 +430,7 @@ fn run_app_as_client() -> Result<(), Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 
 impl App {
-    fn boot(
-        #[cfg(feature = "dev-emulate")] dev_mode: bool,
-        client_mode: bool,
-    ) -> (Self, Task<Message>) {
+    fn boot(client_mode: bool) -> (Self, Task<Message>) {
         let prefs = Prefs::load();
         let known = KnownControllers::load();
         let analytics = AnalyticsStore::load();
@@ -557,11 +538,9 @@ impl App {
             start_cold_load_remaining: true,
             steam_scan_deferred_for_promote: false,
             spectrum_generation: 0,
-            #[cfg(feature = "dev-emulate")]
-            dev_mode,
-            #[cfg(feature = "dev-emulate")]
+            #[cfg(debug_assertions)]
             emulating: false,
-            #[cfg(feature = "dev-emulate")]
+            #[cfg(debug_assertions)]
             dev_paused_percent: None,
         };
 
@@ -1517,7 +1496,7 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn on_tick(&mut self) -> Task<Message> {
-        #[cfg(feature = "dev-emulate")]
+        #[cfg(debug_assertions)]
         if self.emulating {
             return Task::none();
         }
@@ -1575,7 +1554,7 @@ impl App {
     }
 
     fn request_refresh(&mut self) -> Task<Message> {
-        #[cfg(feature = "dev-emulate")]
+        #[cfg(debug_assertions)]
         if self.emulating {
             return Task::none();
         }
@@ -1608,7 +1587,7 @@ impl App {
         self.refreshing.store(false, Ordering::SeqCst);
         self.last_battery_poll = Instant::now();
 
-        #[cfg(feature = "dev-emulate")]
+        #[cfg(debug_assertions)]
         if self.emulating {
             return Task::none();
         }
@@ -2035,16 +2014,6 @@ impl App {
             steam_path_error: self.configure_state.steam_path_error.clone(),
             #[cfg(windows)]
             autostart: autostart::is_enabled(),
-            show_developer: {
-                #[cfg(feature = "dev-emulate")]
-                {
-                    self.dev_mode
-                }
-                #[cfg(not(feature = "dev-emulate"))]
-                {
-                    false
-                }
-            },
         }
     }
 
@@ -2313,7 +2282,7 @@ impl App {
                 let next = self.configure_state.reset();
                 self.apply_spectrum(next)
             }
-            #[cfg(feature = "dev-emulate")]
+            #[cfg(debug_assertions)]
             ConfigureMessage::DeveloperPreset(preset) => self.apply_dev_preset(preset),
             // Hide first so DWM cannot flash the default (white) brush while the
             // wgpu surface is torn down; keep id until WindowClosed.
@@ -2496,7 +2465,7 @@ impl App {
         }
     }
 
-    #[cfg(feature = "dev-emulate")]
+    #[cfg(debug_assertions)]
     fn apply_dev_preset(&mut self, preset: Preset) -> Task<Message> {
         if preset == Preset::Clear {
             self.emulating = false;
@@ -6576,11 +6545,11 @@ fn delay(duration: Duration) -> impl Future<Output = ()> + Send {
 }
 
 fn is_emulated_serial(serial: &str) -> bool {
-    #[cfg(feature = "dev-emulate")]
+    #[cfg(debug_assertions)]
     {
         emulate::is_emulated(serial)
     }
-    #[cfg(not(feature = "dev-emulate"))]
+    #[cfg(not(debug_assertions))]
     {
         let _ = serial;
         false

@@ -32,11 +32,11 @@ fn main() -> ExitCode {
             }
         }
     } else {
-        // Standalone / developer path: full in-process daemon.
+        // Standalone / developer path: full in-process daemon. Developer
+        // tooling (emulated controllers) is compiled into debug builds, so
+        // this needs no flag.
         crash_restart::arm_tray_mode();
-        // `--dev` only does anything in a `dev-emulate` build; harmless otherwise.
-        let dev = args.iter().any(|a| a == "--dev");
-        match app::run(dev) {
+        match app::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 app_log::error(format!("shell standalone exited: {err}"));
