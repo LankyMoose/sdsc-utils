@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Horizontal immersive Start draws the selected game's title and subtitle inside its cover, like its neighbors, so they scroll with the card instead of crossfading in a separate full-width layer.
+- Intermittent test failure (~1 run in 150) from a shared-global race: the art-worker's shutdown test wiped the process-wide icon cache while a concurrent icon-cache test was mid-assertion, so a successful decode reported as missing. The shutdown test now takes the same lock the other cache tests use.
 
 ## [1.6.1] - 2026-10-07
 
