@@ -456,6 +456,50 @@ fn run_app_as_client() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Sync the remembered store with the fleet's remember flags, so
+/// disconnected pads appear in the normal remembered-but-off list and
+/// forgotten ones do not survive a restart.
+///
+/// `previous` is the fleet as it was *before* the command. Pads that
+/// `emulate::prune` dropped are absent from `current` by now, so they can only
+/// be found here — without them a forgotten pad would leave the fleet but stay
+/// on disk, and reappear on the next boot.
+///
+/// Connected pads are written too: a pad is only *listed* after an unplug, but
+/// a connected pad's level and link should still be current if it is unplugged
+/// later.
+///
+/// Returns whether anything changed, so the caller decides about saving.
+#[cfg(debug_assertions)]
+fn sync_remembered_emulated(
+    previous: &[emulate::EmulatedPad],
+    current: &[emulate::EmulatedPad],
+    known: &mut crate::controller::known::KnownControllers,
+) -> bool {
+    let mut changed = false;
+    for pad in current {
+        if pad.remembered {
+            changed |= known.remember(&pad.status);
+        } else {
+            // Forgetting takes effect in the store straight away, exactly as
+            // `toggle_remember` does for real hardware: the pad may still be on
+            // screen while connected, but it is no longer remembered, so an
+            // unplug leaves nothing behind.
+            changed |= known.forget(pad.serial());
+        }
+    }
+    // Pads that left the fleet were pruned, and pruning only ever drops pads
+    // that are both unplugged and forgotten — so make sure they are gone from
+    // the store too, or they would still come back after a restart.
+    for pad in previous {
+        if current.iter().any(|p| p.serial() == pad.serial()) {
+            continue;
+        }
+        changed |= known.forget(pad.serial());
+    }
+    changed
+}
+
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
@@ -2612,35 +2656,6 @@ impl App {
         live
     }
 
-    /// Sync the remembered store with the fleet's remember flags, so
-    /// disconnected pads appear in the normal remembered-but-off list and
-    /// forgotten ones do not survive a restart.
-    ///
-    /// Connected pads are written too: a pad is only *listed* after an unplug,
-    /// but a connected pad's level and link should still be current if it is
-    /// unplugged later.
-    #[cfg(debug_assertions)]
-    fn remember_emulated(&mut self) {
-        let pads: Vec<ControllerStatus> = self
-            .emulated_pads
-            .iter()
-            .filter(|p| p.remembered)
-            .map(|p| p.status.clone())
-            .collect();
-        let mut changed = false;
-        for pad in &pads {
-            changed |= self.session.known.remember(pad);
-        }
-        // Forgotten pads must also *leave* the store, or they would still come
-        // back after a restart.
-        for pad in self.emulated_pads.iter().filter(|p| !p.remembered) {
-            changed |= self.session.known.forget(pad.serial());
-        }
-        if changed {
-            self.session.known.save();
-        }
-    }
-
     #[cfg(debug_assertions)]
     fn apply_emulator_command(&mut self, command: EmulatorCommand) -> Task<Message> {
         let fleet = self.emulated_pads.clone();
@@ -2702,9 +2717,13 @@ impl App {
             }
             // The popup's remember pin, for an emulated pad. Only takes effect
             // on unplug; `prune` then removes it if it is already off.
+            //
+            // Publishes: forgetting removes the pad from the remembered list
+            // the popup draws from, so those rows must be rebuilt or the pad
+            // lingers there until something else triggers a sync.
             EmulatorCommand::SetRemembered(serial, remembered) => {
                 let next = emulate::update(&fleet, serial, |p| p.remembered = *remembered);
-                (emulate::prune(next), false, false)
+                (emulate::prune(next), true, false)
             }
             EmulatorCommand::SeedAnalytics(serial) => {
                 self.session.analytics.dev_seed_estimates(serial);
@@ -2742,8 +2761,13 @@ impl App {
             }
         };
 
+        // `previous` is captured before the swap so `remember_emulated` can
+        // see pads that `prune` dropped.
+        let previous = std::mem::take(&mut self.emulated_pads);
         self.emulated_pads = next_fleet;
-        self.remember_emulated();
+        if sync_remembered_emulated(&previous, &self.emulated_pads, &mut self.session.known) {
+            self.session.known.save();
+        }
 
         // Analytics state only means anything once it is recording.
         if analytics && !self.session.prefs.analytics_enabled {
@@ -6763,4 +6787,118 @@ fn chord_held_on_any_pad(
     readings
         .iter()
         .any(|r| required.iter().all(|c| r.sample.held.contains(c)))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+    use crate::controller::known::KnownControllers;
+    use crate::controller::model::Connection;
+
+    /// The forget sequence end to end: prune drops the pad from the fleet, and
+    /// the store must drop it too.
+    ///
+    /// This is the case that was broken twice: the prune ran *before* the
+    /// store sync, so the forgotten pad was already gone from `current` by the
+    /// time anything looked for it, and it stayed in `controllers.json` — the
+    /// row vanished from the tab and came back on the next launch.
+    #[test]
+    fn forgetting_an_unplugged_pad_clears_it_from_the_store() {
+        let mut known = KnownControllers::default();
+        let before = vec![emulate::new_pad(&[], 50, Connection::Bluetooth)];
+        sync_remembered_emulated(&[], &before, &mut known);
+        assert!(known.is_remembered("emu-1"), "a live pad is persisted");
+
+        // Forget it: flag flips, prune removes it, and both happen before the
+        // sync sees the fleet.
+        let edited = emulate::update(&before, "emu-1", |p| p.remembered = false);
+        let after = emulate::prune(edited);
+        assert!(
+            after.is_empty(),
+            "off + forgotten means gone from the fleet"
+        );
+
+        assert!(sync_remembered_emulated(&before, &after, &mut known));
+        assert!(
+            !known.is_remembered("emu-1"),
+            "a forgotten pad must leave controllers.json, not just stop being written"
+        );
+    }
+
+    /// The other direction: unplugging a pad that was forgotten earlier. Here
+    /// the pad is still in the fleet at forget time (it was connected), so it
+    /// is the *unplug* that removes it from the store.
+    #[test]
+    fn unplugging_a_forgotten_pad_clears_it_from_the_store() {
+        let mut known = KnownControllers::default();
+        let plugged = emulate::update(
+            std::slice::from_ref(&emulate::new_pad(&[], 50, Connection::Bluetooth)),
+            "emu-1",
+            |p| p.connected = true,
+        );
+        sync_remembered_emulated(&[], &plugged, &mut known);
+
+        // Forget while connected: stays in the fleet, drops from the store.
+        let forgotten = emulate::update(&plugged, "emu-1", |p| p.remembered = false);
+        assert_eq!(emulate::prune(forgotten.clone()).len(), 1, "live pads stay");
+        sync_remembered_emulated(&plugged, &forgotten, &mut known);
+        assert!(!known.is_remembered("emu-1"));
+
+        // Now unplug it: prune removes it, and it must stay out of the store.
+        let unplugged = emulate::prune(emulate::update(&forgotten, "emu-1", |p| {
+            p.connected = false;
+        }));
+        assert!(unplugged.is_empty());
+        sync_remembered_emulated(&forgotten, &unplugged, &mut known);
+        assert!(!known.is_remembered("emu-1"));
+    }
+
+    /// A pad that is merely unplugged stays remembered, so it returns after a
+    /// restart — the whole point of the pin.
+    #[test]
+    fn an_unplugged_remembered_pad_survives_for_the_next_boot() {
+        let mut known = KnownControllers::default();
+        let plugged = emulate::update(
+            std::slice::from_ref(&emulate::new_pad(&[], 50, Connection::Bluetooth)),
+            "emu-1",
+            |p| p.connected = true,
+        );
+        let unplugged = emulate::prune(emulate::update(&plugged, "emu-1", |p| {
+            p.connected = false;
+        }));
+        assert_eq!(unplugged.len(), 1);
+        sync_remembered_emulated(&plugged, &unplugged, &mut known);
+        assert!(known.is_remembered("emu-1"));
+
+        let remembered = vec![(
+            known.remembered_disconnected(&[])[0].serial.clone(),
+            50,
+            Connection::Bluetooth,
+        )];
+        assert_eq!(
+            emulate::rehydrate(&remembered).len(),
+            1,
+            "it must come back after a restart"
+        );
+    }
+
+    /// Removing one pad must not disturb the others.
+    #[test]
+    fn removing_one_pad_leaves_the_rest_remembered() {
+        let mut known = KnownControllers::default();
+        let a = emulate::new_pad(&[], 50, Connection::Bluetooth);
+        let both = vec![a.clone(), emulate::new_pad(&[a], 70, Connection::Usb)];
+        sync_remembered_emulated(&[], &both, &mut known);
+
+        let edited = emulate::update(&both, "emu-1", |p| p.remembered = false);
+        let after = emulate::prune(edited);
+        sync_remembered_emulated(&both, &after, &mut known);
+
+        assert!(!known.is_remembered("emu-1"));
+        assert!(known.is_remembered("emu-2"), "the other pad is untouched");
+    }
 }
