@@ -23,6 +23,9 @@ pub const GAME_SVG: &str = include_str!("../../assets/icons/game.svg");
 pub const BUG_SVG: &str = include_str!("../../assets/icons/bug.svg");
 pub const GITHUB_SVG: &str = include_str!("../../assets/icons/github.svg");
 pub const MICROSOFT_STORE_SVG: &str = include_str!("../../assets/icons/microsoft-store.svg");
+/// Indeterminate arc; rotated by [`crate::ui::configure`] for pending states.
+#[allow(dead_code)] // debug-only pending indicator
+pub const SPINNER_SVG: &str = include_str!("../../assets/icons/spinner.svg");
 
 /// Canonical DualSense body fill in [`DUALSENSE_SVG`].
 pub const BODY_HEX: &str = "#EBEBF0";

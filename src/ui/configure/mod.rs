@@ -225,13 +225,12 @@ pub enum EmulatorCommand {
     /// Spawn a pad on the lowest free slot, remembered but disconnected.
     AddPad,
     RemovePad(String),
-    /// Live drag preview — repaints the tab only, publishes nothing.
-    PreviewPercent(String, u8),
-    /// Publish the previewed battery level (slider release).
+    /// Live drag preview — repaints the tab only.
     ///
-    /// Committing is what lets the normal preference-driven reactions fire, so
-    /// it is deliberately not wired to the slider's continuous `on_change`.
-    CommitPercent(String),
+    /// Publication is debounced by the daemon (publishing is what lets the
+    /// normal preference-driven reactions fire), so this never spams per
+    /// frame; a spinner marks the wait.
+    PreviewPercent(String, u8),
     SetPercent(String, u8),
     SetState(String, PowerState),
     SetConnection(String, Connection),
@@ -243,6 +242,16 @@ pub enum EmulatorCommand {
     StepCharge(String),
     /// Credit active time and walk one step down the drain cycle.
     StepDrain(String),
+}
+
+/// A battery level previewed but not yet published (`None` when settled).
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingEmulatorChange {
+    pub serial: String,
+    pub percent: u8,
+    /// Frame counter driving the pending spinner.
+    pub tick: u32,
 }
 
 /// Live DualSense / gamepad readings for the Pad input debug tab.
@@ -552,6 +561,7 @@ pub fn view<'a>(
     analytics: &'a AnalyticsPanel,
     pad_input: &'a PadInputPanel,
     #[cfg(debug_assertions)] emulators: &'a [EmulatedPad],
+    #[cfg(debug_assertions)] pending: Option<&PendingEmulatorChange>,
 ) -> Element<'a, ConfigureMessage> {
     // Section heading doubles as the drag handle for the undecorated window.
     let heading = mouse_area(
@@ -643,7 +653,7 @@ pub fn view<'a>(
             #[cfg(debug_assertions)]
             {
                 scroll(section_content(
-                    state, settings, analytics, pad_input, emulators,
+                    state, settings, analytics, pad_input, emulators, pending,
                 ))
                 .into()
             }
@@ -937,6 +947,7 @@ fn section_content<'a>(
     analytics: &'a AnalyticsPanel,
     pad_input: &'a PadInputPanel,
     #[cfg(debug_assertions)] emulators: &'a [EmulatedPad],
+    #[cfg(debug_assertions)] pending: Option<&PendingEmulatorChange>,
 ) -> Element<'a, ConfigureMessage> {
     match state.section {
         Section::System => system_settings_view(settings),
@@ -946,7 +957,7 @@ fn section_content<'a>(
         Section::Analytics => analytics_view(settings, analytics),
         Section::PadInput => pad_input_view(pad_input),
         #[cfg(debug_assertions)]
-        Section::Emulators => emulators_view(state, emulators),
+        Section::Emulators => emulators_view(state, emulators, pending),
         #[cfg(debug_assertions)]
         Section::Diagnostics => diagnostics_view(),
     }
@@ -1708,6 +1719,7 @@ fn pad_input_view<'a>(panel: &'a PadInputPanel) -> Element<'a, ConfigureMessage>
 fn emulators_view<'a>(
     state: &'a ConfigureState,
     fleet: &'a [EmulatedPad],
+    pending: Option<&PendingEmulatorChange>,
 ) -> Element<'a, ConfigureMessage> {
     let selected = state.emulator_selected.min(fleet.len().saturating_sub(1));
 
@@ -1738,9 +1750,26 @@ fn emulators_view<'a>(
             .align_y(Alignment::Center),
     );
     if let Some(pad) = fleet.get(selected) {
-        sections = sections.push(emulator_detail(pad));
+        let pending_for_pad = pending.filter(|p| p.serial == pad.serial());
+        sections = sections.push(emulator_detail(pad, pending_for_pad));
     }
     sections.into()
+}
+
+/// Indeterminate arc for a value that is previewed but not yet published.
+#[cfg(debug_assertions)]
+fn pending_spinner<'a>(tick: u32) -> Element<'a, ConfigureMessage> {
+    // The commit tick is the only clock running here, so the angle steps off
+    // the frame counter instead of wall time.
+    let angle = (tick % 12) as f32 * 30.0;
+    svg(svg::Handle::from_memory(svg_icon::SPINNER_SVG.as_bytes()))
+        .width(Length::Fixed(14.0))
+        .height(Length::Fixed(14.0))
+        .rotation(angle)
+        .style(|_theme, _status| svg::Style {
+            color: Some(theme::MUTED),
+        })
+        .into()
 }
 
 #[cfg(debug_assertions)]
@@ -1820,7 +1849,10 @@ fn emulator_row<'a>(
 
 /// Per-pad editor: connection, battery level, charge state, link, analytics.
 #[cfg(debug_assertions)]
-fn emulator_detail<'a>(pad: &'a EmulatedPad) -> Element<'a, ConfigureMessage> {
+fn emulator_detail<'a>(
+    pad: &'a EmulatedPad,
+    pending: Option<&PendingEmulatorChange>,
+) -> Element<'a, ConfigureMessage> {
     let serial = pad.serial().to_string();
     let mut rows = vec![toggle_row(
         "Connected",
@@ -1831,15 +1863,17 @@ fn emulator_detail<'a>(pad: &'a EmulatedPad) -> Element<'a, ConfigureMessage> {
         },
     )];
 
-    // Battery slider snaps to the levels a DualSense actually reports: dragging
-    // previews (repaints the tab only) and publishing waits for the release, so
-    // a drag cannot spam preference-driven toasts or Start opens.
+    // Battery slider snaps to the levels a DualSense actually reports. Dragging
+    // previews; the daemon debounces publication by a second (so a drag cannot
+    // spam preference-driven toasts or Start opens) and spins while it waits.
     let level = crate::controller::dualsense::battery::level_from_percent(pad.status.percent);
     let preview_serial = pad.serial().to_string();
-    let release_serial = pad.serial().to_string();
     rows.push(slider_row(
         "Battery",
-        format!("{}%", pad.status.percent),
+        match pending {
+            Some(p) => format!("{}% · applying…", p.percent),
+            None => format!("{}%", pad.status.percent),
+        },
         slider(0.0..=MAX_EMU_LEVEL as f32, level as f32, move |value| {
             ConfigureMessage::Emulator(EmulatorCommand::PreviewPercent(
                 preview_serial.clone(),
@@ -1850,11 +1884,23 @@ fn emulator_detail<'a>(pad: &'a EmulatedPad) -> Element<'a, ConfigureMessage> {
             ))
         })
         .step(1.0_f32)
-        .on_release(ConfigureMessage::Emulator(EmulatorCommand::CommitPercent(
-            release_serial,
-        )))
         .style(theme::slider),
     ));
+
+    if let Some(p) = pending {
+        rows.push(
+            row![
+                pending_spinner(p.tick),
+                text("Waiting a moment before applying, so a drag can't repeat the notification.")
+                    .size(11.0)
+                    .color(theme::DIM)
+                    .width(Fill),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into(),
+        );
+    }
 
     let mut state_options = Vec::new();
     for option in [
@@ -2055,9 +2101,17 @@ mod tests {
         // panicking on the detail card.
         for selected in [0, 1, 99] {
             state.emulator_selected = selected;
-            drop(emulators_view(&state, &empty));
-            drop(emulators_view(&state, &fleet));
+            drop(emulators_view(&state, &empty, None));
+            drop(emulators_view(&state, &fleet, None));
         }
+        // A pending change renders the spinner + "applying" state.
+        let pending = PendingEmulatorChange {
+            serial: "emu-1".into(),
+            percent: 75,
+            tick: 3,
+        };
+        state.emulator_selected = 0;
+        drop(emulators_view(&state, &fleet, Some(&pending)));
     }
 
     #[test]

@@ -9,6 +9,7 @@
 use crate::controller::dualsense::identity as dualsense;
 use crate::controller::dualsense::lightbar;
 use crate::controller::dualsense::rumble::MotorPulse;
+
 /// Battery level a freshly created emulated pad starts at.
 #[cfg(debug_assertions)]
 const DEFAULT_EMU_PERCENT: u8 = 50;
@@ -126,6 +127,11 @@ const START_SELECTION_SYNC_RETRIES: u8 = 40;
 pub enum Message {
     /// Periodic presence scan.
     Tick,
+    /// Debounce clock for a previewed emulated-pad battery level.
+    ///
+    /// Only subscribed while a preview is pending.
+    #[cfg(debug_assertions)]
+    EmulatorCommitTick,
     /// Result of a background `poll_controllers` call.
     PollResult(Result<Vec<ControllerStatus>, String>),
     /// Result of a background process-image snapshot (running badge).
@@ -372,7 +378,28 @@ pub struct App {
     /// [`App::live_controllers`].
     #[cfg(debug_assertions)]
     emulated_pads: Vec<emulate::EmulatedPad>,
+    /// Battery levels previewed but not yet published, keyed by serial.
+    #[cfg(debug_assertions)]
+    pending_emulator_commits: std::collections::HashMap<String, PendingEmulatorCommit>,
 }
+
+/// A battery level the slider previewed, waiting out its debounce.
+///
+/// Publishing runs the normal connect/notify path, so it is deliberately
+/// debounced: a drag must not emit a toast (or open Start) per frame.
+#[cfg(debug_assertions)]
+struct PendingEmulatorCommit {
+    deadline: Instant,
+    /// Advanced by the commit tick so the pending spinner animates.
+    tick: u32,
+}
+
+/// Quiet period after the last battery-slider change before it publishes.
+#[cfg(debug_assertions)]
+const EMULATOR_COMMIT_DEBOUNCE: Duration = Duration::from_secs(1);
+/// How often the debounce is re-checked (and the pending spinner advanced).
+#[cfg(debug_assertions)]
+const EMULATOR_COMMIT_POLL: Duration = Duration::from_millis(100);
 
 // ---------------------------------------------------------------------------
 // Entry points
@@ -546,6 +573,8 @@ impl App {
             spectrum_generation: 0,
             #[cfg(debug_assertions)]
             emulated_pads: Vec::new(),
+            #[cfg(debug_assertions)]
+            pending_emulator_commits: std::collections::HashMap::new(),
         };
 
         // Show the tray immediately (standalone only — service owns the tray in client mode).
@@ -767,6 +796,14 @@ impl App {
             ));
         }
 
+        // Only spun up while a previewed emulated battery level is waiting out
+        // its debounce — an idle app subscribes to nothing extra.
+        #[cfg(debug_assertions)]
+        if !self.pending_emulator_commits.is_empty() {
+            subscriptions
+                .push(iced::time::every(EMULATOR_COMMIT_POLL).map(|_| Message::EmulatorCommitTick));
+        }
+
         if self.toast_message.is_some() || self.toast_machine.wants_frames() {
             // Tick for the whole toast lifetime so content swaps present, and while
             // Placing so the placement failsafe can fire without a Shown event.
@@ -842,6 +879,8 @@ impl App {
                 &self.pad_input_panel,
                 #[cfg(debug_assertions)]
                 &self.emulated_pads,
+                #[cfg(debug_assertions)]
+                self.pending_emulator_change().as_ref(),
             )
             .map(Message::Configure);
         }
@@ -892,6 +931,8 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => self.on_tick(),
+            #[cfg(debug_assertions)]
+            Message::EmulatorCommitTick => self.on_emulator_commit_tick(),
             Message::PollResult(result) => self.on_poll_result(result),
             Message::ProcessEnumResult(result) => self.on_process_enum_result(result),
             Message::CloseGameDone(result) => self.on_close_game_done(result),
@@ -2476,6 +2517,56 @@ impl App {
         }
     }
 
+    /// Publish previewed battery levels whose debounce has elapsed.
+    ///
+    /// Advances the spinner every tick and commits once a pad has been quiet for
+    /// [`EMULATOR_COMMIT_DEBOUNCE`]. Only subscribed while something is pending.
+    #[cfg(debug_assertions)]
+    fn on_emulator_commit_tick(&mut self) -> Task<Message> {
+        if self.pending_emulator_commits.is_empty() {
+            return Task::none();
+        }
+        let now = Instant::now();
+        // Advance spinner frames even before anything is due.
+        for pending in self.pending_emulator_commits.values_mut() {
+            pending.tick = pending.tick.wrapping_add(1);
+        }
+        let due: Vec<String> = self
+            .pending_emulator_commits
+            .iter()
+            .filter(|(_, p)| now >= p.deadline)
+            .map(|(serial, _)| serial.clone())
+            .collect();
+        if due.is_empty() {
+            return Task::none();
+        }
+        for serial in &due {
+            self.pending_emulator_commits.remove(serial);
+        }
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: emulator debounce committed {}",
+            due.len()
+        ));
+        self.last_battery_poll = Instant::now();
+        self.apply_controllers(self.live_controllers())
+    }
+
+    /// The emulated pad whose battery level is waiting out its debounce.
+    ///
+    /// Only the pad the Controllers tab has selected can show its spinner, so this
+    /// resolves the selection to a concrete change.
+    #[cfg(debug_assertions)]
+    fn pending_emulator_change(&self) -> Option<configure_view::PendingEmulatorChange> {
+        let selected = self.configure_state.emulator_selected;
+        let pad = self.emulated_pads.get(selected)?;
+        let pending = self.pending_emulator_commits.get(pad.serial())?;
+        Some(configure_view::PendingEmulatorChange {
+            serial: pad.serial().to_string(),
+            percent: pad.status.percent,
+            tick: pending.tick,
+        })
+    }
+
     /// True while any emulated pad is plugged in — HID polling stands down so
     /// the emulator is the only source of live controllers.
     #[cfg(debug_assertions)]
@@ -2544,17 +2635,18 @@ impl App {
                 self.session.known.forget(serial);
                 (next, true, false)
             }
-            // Preview repaints the tab only; publishing waits for the release so
-            // a drag cannot spam toasts or Start opens.
+            // Preview repaints the tab only. Publishing is deferred to the
+            // debounce timer so a drag cannot spam toasts or Start opens.
             EmulatorCommand::PreviewPercent(serial, percent) => {
                 let next = emulate::update(&fleet, serial, |p| p.status.percent = *percent);
+                self.pending_emulator_commits.insert(
+                    serial.clone(),
+                    PendingEmulatorCommit {
+                        deadline: Instant::now() + EMULATOR_COMMIT_DEBOUNCE,
+                        tick: 0,
+                    },
+                );
                 (next, false, false)
-            }
-            EmulatorCommand::CommitPercent(serial) => {
-                let Some(_) = find(serial) else {
-                    return Task::none();
-                };
-                (fleet, true, false)
             }
             EmulatorCommand::SetPercent(serial, percent) => {
                 let next = emulate::update(&fleet, serial, |p| p.status.percent = *percent);
