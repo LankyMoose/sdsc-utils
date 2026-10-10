@@ -10,6 +10,9 @@ use coverage::CoverageChart;
 use spectrum::{BAR_HEIGHT, HUE_HEIGHT, HueBar, SV_HEIGHT, SpectrumBar, SvSquare};
 
 #[cfg(debug_assertions)]
+#[cfg(debug_assertions)]
+use crate::controller::emulate::EmulatedPad;
+#[cfg(debug_assertions)]
 use crate::controller::model::{Connection, PowerState};
 use crate::games::steam::LAST_KNOWN_COMPATIBLE_STEAM_VERSION;
 use crate::persist::analytics::{
@@ -212,37 +215,28 @@ pub struct ConfigureSettings {
     pub steam_path_error: Option<String>,
 }
 
-/// Live emulated-pad snapshot for the Controllers debug tab.
+/// Edit applied to the emulated fleet (Controllers debug tab).
 ///
-/// Rebuilt from the session each frame, so it always reflects what the rest of
-/// the app sees. Commands address a pad by serial, never by row index, so a
-/// concurrent removal cannot retarget an action.
-#[cfg(debug_assertions)]
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct EmulatorsPanel {
-    pub pads: Vec<EmulatorPad>,
-}
-
-/// One emulated DualSense as the session currently reports it.
-#[cfg(debug_assertions)]
-#[derive(Debug, Clone, PartialEq)]
-pub struct EmulatorPad {
-    pub serial: String,
-    pub percent: u8,
-    pub state: PowerState,
-    pub connection: Connection,
-}
-
-/// Edit applied to the emulated pad set (Controllers debug tab).
+/// Every variant carries the pad's serial so an action can never land on the
+/// wrong pad after the list shifts.
 #[cfg(debug_assertions)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum EmulatorCommand {
-    /// Spawn a new pad on the lowest free slot.
+    /// Spawn a pad on the lowest free slot, remembered but disconnected.
     AddPad,
     RemovePad(String),
+    /// Live drag preview — repaints the tab only, publishes nothing.
+    PreviewPercent(String, u8),
+    /// Publish the previewed battery level (slider release).
+    ///
+    /// Committing is what lets the normal preference-driven reactions fire, so
+    /// it is deliberately not wired to the slider's continuous `on_change`.
+    CommitPercent(String),
     SetPercent(String, u8),
     SetState(String, PowerState),
     SetConnection(String, Connection),
+    /// Plug in / unplug — runs the real connect or disconnect path.
+    SetConnected(String, bool),
     /// Seed typical charge/play samples so ETA estimates exist.
     SeedAnalytics(String),
     /// Credit active time and walk one step up the charge cycle.
@@ -557,7 +551,7 @@ pub fn view<'a>(
     settings: &ConfigureSettings,
     analytics: &'a AnalyticsPanel,
     pad_input: &'a PadInputPanel,
-    #[cfg(debug_assertions)] emulators: &'a EmulatorsPanel,
+    #[cfg(debug_assertions)] emulators: &'a [EmulatedPad],
 ) -> Element<'a, ConfigureMessage> {
     // Section heading doubles as the drag handle for the undecorated window.
     let heading = mouse_area(
@@ -942,7 +936,7 @@ fn section_content<'a>(
     settings: &ConfigureSettings,
     analytics: &'a AnalyticsPanel,
     pad_input: &'a PadInputPanel,
-    #[cfg(debug_assertions)] emulators: &'a EmulatorsPanel,
+    #[cfg(debug_assertions)] emulators: &'a [EmulatedPad],
 ) -> Element<'a, ConfigureMessage> {
     match state.section {
         Section::System => system_settings_view(settings),
@@ -1704,19 +1698,20 @@ fn pad_input_view<'a>(panel: &'a PadInputPanel) -> Element<'a, ConfigureMessage>
     items.into()
 }
 
-/// Controllers tab (debug only): the live emulated-pad list plus per-pad
-/// controls. Rows address pads by serial; the detail card edits whichever pad
-/// `state.emulator_selected` points at.
+/// Controllers tab (debug only): the emulated fleet plus per-pad controls.
+///
+/// Pads start remembered but disconnected; switching one on publishes it and
+/// runs the ordinary connect path (toasts, Start-open policy). Rows address
+/// pads by serial; the detail card edits whichever pad `state.emulator_selected`
+/// points at.
 #[cfg(debug_assertions)]
 fn emulators_view<'a>(
     state: &'a ConfigureState,
-    panel: &'a EmulatorsPanel,
+    fleet: &'a [EmulatedPad],
 ) -> Element<'a, ConfigureMessage> {
-    let selected = state
-        .emulator_selected
-        .min(panel.pads.len().saturating_sub(1));
+    let selected = state.emulator_selected.min(fleet.len().saturating_sub(1));
 
-    let list: Element<'a, ConfigureMessage> = if panel.pads.is_empty() {
+    let list: Element<'a, ConfigureMessage> = if fleet.is_empty() {
         container(
             text("No emulated controllers. Add one to drive the app without hardware.")
                 .size(13.0)
@@ -1729,8 +1724,7 @@ fn emulators_view<'a>(
     } else {
         group(
             None,
-            panel
-                .pads
+            fleet
                 .iter()
                 .enumerate()
                 .map(|(index, pad)| emulator_row(index, pad, index == selected))
@@ -1743,7 +1737,7 @@ fn emulators_view<'a>(
             .width(Fill)
             .align_y(Alignment::Center),
     );
-    if let Some(pad) = panel.pads.get(selected) {
+    if let Some(pad) = fleet.get(selected) {
         sections = sections.push(emulator_detail(pad));
     }
     sections.into()
@@ -1758,59 +1752,109 @@ fn add_pad_button<'a>() -> Element<'a, ConfigureMessage> {
         .into()
 }
 
-/// One pad in the list: identity, link, charge state, and level.
+/// One pad in the list: connection switch, identity, link, state, and level.
 #[cfg(debug_assertions)]
 fn emulator_row<'a>(
     index: usize,
-    pad: &'a EmulatorPad,
+    pad: &'a EmulatedPad,
     selected: bool,
 ) -> Element<'a, ConfigureMessage> {
-    let meta = format!("{} · {}", pad.connection.as_str(), pad.state.as_str());
-    button(
-        row![
-            text(pad.serial.clone())
-                .size(theme::type_scale::BODY)
-                .font(if selected { semibold() } else { Font::DEFAULT })
-                .color(theme::INK)
-                .width(Length::Fixed(64.0)),
-            text(meta)
-                .size(theme::type_scale::META)
-                .color(theme::DIM)
-                .width(Fill),
-            text(format!("{}%", pad.percent))
-                .size(theme::type_scale::BODY)
-                .color(theme::MUTED),
-            container(space())
-                .width(Length::Fixed(8.0))
-                .height(Length::Fixed(14.0))
-                .style(theme::nav_marker(selected)),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center),
-    )
-    .padding([9, 10])
+    let serial = pad.serial().to_string();
+    let toggle = toggler(pad.connected)
+        .size(18.0)
+        .on_toggle(move |connected| {
+            ConfigureMessage::Emulator(EmulatorCommand::SetConnected(serial.clone(), connected))
+        })
+        .style(theme::toggle);
+
+    let meta = if pad.connected {
+        format!(
+            "{} · {}",
+            pad.status.connection.as_str(),
+            pad.status.state.as_str()
+        )
+    } else {
+        "off".to_string()
+    };
+
+    // The switch sits *beside* the row button rather than inside it: nested
+    // pressables fight over the click and the outer button wins.
+    row![
+        button(
+            row![
+                text(pad.serial().to_string())
+                    .size(theme::type_scale::BODY)
+                    .font(if selected { semibold() } else { Font::DEFAULT })
+                    .color(if pad.connected {
+                        theme::INK
+                    } else {
+                        theme::DIM
+                    })
+                    .width(Length::Fixed(64.0)),
+                text(meta)
+                    .size(theme::type_scale::META)
+                    .color(theme::DIM)
+                    .width(Fill),
+                text(format!("{}%", pad.status.percent))
+                    .size(theme::type_scale::BODY)
+                    .color(theme::MUTED),
+                container(space())
+                    .width(Length::Fixed(8.0))
+                    .height(Length::Fixed(14.0))
+                    .style(theme::nav_marker(selected)),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .padding([9, 10])
+        .width(Fill)
+        .on_press(ConfigureMessage::SelectEmulator(index))
+        .style(theme::nav_item(selected)),
+        toggle,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
     .width(Fill)
-    .on_press(ConfigureMessage::SelectEmulator(index))
-    .style(theme::nav_item(selected))
     .into()
 }
 
-/// Per-pad editor: battery level, charge state, link, and analytics actions.
+/// Per-pad editor: connection, battery level, charge state, link, analytics.
 #[cfg(debug_assertions)]
-fn emulator_detail<'a>(pad: &'a EmulatorPad) -> Element<'a, ConfigureMessage> {
-    let serial = pad.serial.clone();
-    let mut rows = vec![slider_row(
+fn emulator_detail<'a>(pad: &'a EmulatedPad) -> Element<'a, ConfigureMessage> {
+    let serial = pad.serial().to_string();
+    let mut rows = vec![toggle_row(
+        "Connected",
+        Some("Off pads stay remembered but are not published to the app"),
+        pad.connected,
+        move |connected| {
+            ConfigureMessage::Emulator(EmulatorCommand::SetConnected(serial.clone(), connected))
+        },
+    )];
+
+    // Battery slider snaps to the levels a DualSense actually reports: dragging
+    // previews (repaints the tab only) and publishing waits for the release, so
+    // a drag cannot spam preference-driven toasts or Start opens.
+    let level = crate::controller::dualsense::battery::level_from_percent(pad.status.percent);
+    let preview_serial = pad.serial().to_string();
+    let release_serial = pad.serial().to_string();
+    rows.push(slider_row(
         "Battery",
-        format!("{}%", pad.percent),
-        slider(0.0..=100.0, f32::from(pad.percent), move |value| {
-            ConfigureMessage::Emulator(EmulatorCommand::SetPercent(
-                serial.clone(),
-                value.round() as u8,
+        format!("{}%", pad.status.percent),
+        slider(0.0..=MAX_EMU_LEVEL as f32, level as f32, move |value| {
+            ConfigureMessage::Emulator(EmulatorCommand::PreviewPercent(
+                preview_serial.clone(),
+                crate::controller::dualsense::battery::percent_from_level(
+                    value.round() as u8,
+                    PowerState::Discharging,
+                ),
             ))
         })
         .step(1.0_f32)
+        .on_release(ConfigureMessage::Emulator(EmulatorCommand::CommitPercent(
+            release_serial,
+        )))
         .style(theme::slider),
-    )];
+    ));
 
     let mut state_options = Vec::new();
     for option in [
@@ -1818,7 +1862,7 @@ fn emulator_detail<'a>(pad: &'a EmulatorPad) -> Element<'a, ConfigureMessage> {
         PowerState::Charging,
         PowerState::Complete,
     ] {
-        let value_serial = pad.serial.clone();
+        let value_serial = pad.serial().to_string();
         state_options.push(
             button(text(power_state_label(option)).size(12.0))
                 .padding([6, 10])
@@ -1826,7 +1870,7 @@ fn emulator_detail<'a>(pad: &'a EmulatorPad) -> Element<'a, ConfigureMessage> {
                     value_serial,
                     option,
                 )))
-                .style(theme::chip(option == pad.state))
+                .style(theme::chip(option == pad.status.state))
                 .into(),
         );
     }
@@ -1834,7 +1878,7 @@ fn emulator_detail<'a>(pad: &'a EmulatorPad) -> Element<'a, ConfigureMessage> {
 
     let mut link_options = Vec::new();
     for option in [Connection::Usb, Connection::Bluetooth] {
-        let value_serial = pad.serial.clone();
+        let value_serial = pad.serial().to_string();
         link_options.push(
             button(text(option.as_str()).size(12.0))
                 .padding([6, 10])
@@ -1842,16 +1886,16 @@ fn emulator_detail<'a>(pad: &'a EmulatorPad) -> Element<'a, ConfigureMessage> {
                     value_serial,
                     option,
                 )))
-                .style(theme::chip(option == pad.connection))
+                .style(theme::chip(option == pad.status.connection))
                 .into(),
         );
     }
     rows.push(segmented_row("Connection", link_options));
 
-    let seed_serial = pad.serial.clone();
-    let charge_serial = pad.serial.clone();
-    let drain_serial = pad.serial.clone();
-    let remove_serial = pad.serial.clone();
+    let seed_serial = pad.serial().to_string();
+    let charge_serial = pad.serial().to_string();
+    let drain_serial = pad.serial().to_string();
+    let remove_serial = pad.serial().to_string();
     rows.push(
         column![
             text("Battery analytics")
@@ -1895,8 +1939,12 @@ fn emulator_detail<'a>(pad: &'a EmulatorPad) -> Element<'a, ConfigureMessage> {
         .into(),
     );
 
-    group(Some(format!("Emulating {}", pad.serial)), rows)
+    group(Some(format!("Emulating {}", pad.serial())), rows)
 }
+
+/// Highest battery level the DualSense reports (10 → 100%).
+#[cfg(debug_assertions)]
+const MAX_EMU_LEVEL: u8 = 10;
 
 #[cfg(debug_assertions)]
 fn power_state_label(state: PowerState) -> &'static str {
@@ -1974,34 +2022,41 @@ mod tests {
 
     #[test]
     #[cfg(debug_assertions)]
-    fn emulators_view_builds_for_empty_and_populated_panels() {
+    fn emulators_view_builds_for_empty_and_populated_fleets() {
         // Building the element tree is the only offline check that the new
         // Controllers tab composes without panicking.
         let mut state = ConfigureState::new(BatterySpectrum::default_spectrum());
-        let empty = EmulatorsPanel::default();
-        let panel = EmulatorsPanel {
-            pads: vec![
-                EmulatorPad {
-                    serial: "emu-1".into(),
-                    percent: 50,
-                    state: PowerState::Discharging,
-                    connection: Connection::Usb,
-                },
-                EmulatorPad {
-                    serial: "emu-2".into(),
-                    percent: 100,
-                    state: PowerState::Complete,
-                    connection: Connection::Bluetooth,
-                },
-            ],
+        let empty: [EmulatedPad; 0] = [];
+        let on = EmulatedPad {
+            status: crate::controller::dualsense::battery::dualsense_status(
+                1,
+                "DualSense",
+                Connection::Usb,
+                "emu-1".into(),
+                50,
+                PowerState::Discharging,
+            ),
+            connected: true,
         };
+        let off = EmulatedPad {
+            status: crate::controller::dualsense::battery::dualsense_status(
+                2,
+                "DualSense",
+                Connection::Bluetooth,
+                "emu-2".into(),
+                100,
+                PowerState::Complete,
+            ),
+            connected: false,
+        };
+        let fleet = [on, off];
 
-        // Empty list shows the hint instead of a detail card; out-of-range
-        // selection clamps rather than panicking.
+        // Empty fleet shows the hint; out-of-range selection clamps rather than
+        // panicking on the detail card.
         for selected in [0, 1, 99] {
             state.emulator_selected = selected;
             drop(emulators_view(&state, &empty));
-            drop(emulators_view(&state, &panel));
+            drop(emulators_view(&state, &fleet));
         }
     }
 
