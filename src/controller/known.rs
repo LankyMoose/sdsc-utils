@@ -291,6 +291,44 @@ mod tests {
         assert!(!store.is_remembered(""));
     }
 
+    /// The bug this guards: an emulated pad added in one run was remembered
+    /// (so it lingered in the popup's controller list) but was never fed back
+    /// into the Controllers-tab fleet, leaving it listed nowhere it could be
+    /// edited. Rehydration reads the remembered store at boot.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn emulated_pads_survive_into_the_fleet() {
+        let mut store = KnownControllers::default();
+        store.remember(&pad("emu-1", 40, Connection::Bluetooth));
+        store.remember(&pad("REAL-xyz", 70, Connection::Usb));
+
+        // `remembered_disconnected` is the boot-time view (no live list yet).
+        let remembered: Vec<(String, u8, Connection)> = store
+            .remembered_disconnected(&[])
+            .into_iter()
+            .map(|r| {
+                (
+                    r.serial.clone(),
+                    r.percent,
+                    Connection::from_label(&r.connection).expect("persisted link parses"),
+                )
+            })
+            .collect();
+
+        let fleet = crate::controller::emulate::rehydrate(&remembered);
+        let serials: Vec<&str> = fleet.iter().map(|p| p.serial()).collect();
+        assert_eq!(
+            serials,
+            vec!["emu-1"],
+            "real hardware is not an emulated pad"
+        );
+        assert_eq!(fleet[0].status.percent, 40);
+        assert!(
+            !fleet[0].connected,
+            "a remembered pad is not a plugged-in one"
+        );
+    }
+
     #[test]
     fn sync_from_live_updates_only_remembered() {
         let mut store = KnownControllers::default();

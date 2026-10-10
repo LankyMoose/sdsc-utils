@@ -276,17 +276,6 @@ impl AnalyticsStore {
         self.dirty = true;
     }
 
-    /// Developer helper: the bucket a paused pad should resume into.
-    ///
-    /// Pause keeps the in-progress bucket (a disconnect only stops accrual), so
-    /// Resume has to come back at the same level *and* in the same direction or
-    /// analytics treats it as a fresh cycle and the learned time is lost.
-    #[cfg(debug_assertions)]
-    pub fn dev_resume_target(&self, serial: &str) -> Option<(BucketDirection, u8)> {
-        let progress = self.in_progress(serial)?;
-        Some((progress.direction, progress.percent))
-    }
-
     /// Observe a poll snapshot. When `enabled` is false, do nothing.
     pub fn observe(
         &mut self,
@@ -1246,55 +1235,6 @@ mod tests {
         let sample = store.by_serial["a"].drain_steps[0].samples_ms[0];
         // ~6 minutes total across sittings, not the gap.
         assert!((5 * 60 * 1000..15 * 60 * 1000).contains(&sample));
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    fn dev_resume_target_reports_the_live_bucket_across_a_pause() {
-        let mut store = AnalyticsStore::default();
-        // Nothing recorded yet — Resume has no bucket to rejoin.
-        assert_eq!(store.dev_resume_target("a"), None);
-
-        let draining = vec![pad("a", 35, PowerState::Discharging)];
-        let t0 = connect_past_grace(&mut store, &draining, ms(1_000));
-        let t = accrue(&mut store, "a", 35, PowerState::Discharging, t0, 3);
-
-        // Pause = unplug. The bucket is kept, so Resume knows where to land.
-        observe_enabled(&mut store, &draining, &[], t + Duration::from_secs(90));
-        assert_eq!(
-            store.dev_resume_target("a"),
-            Some((BucketDirection::Drain, 35)),
-            "pause must not lose the bucket Resume depends on",
-        );
-
-        // Resuming at a different level would read as a fresh cycle, so the
-        // target must carry the percent as well as the direction.
-        observe_enabled(&mut store, &[], &draining, t + Duration::from_secs(120));
-        assert_eq!(
-            store.dev_resume_target("a"),
-            Some((BucketDirection::Drain, 35))
-        );
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    fn dev_resume_target_tracks_a_charging_bucket() {
-        let mut store = AnalyticsStore::default();
-        let charging = vec![pad("a", 40, PowerState::Charging)];
-        let t0 = connect_past_grace(&mut store, &charging, ms(1_000));
-        accrue(&mut store, "a", 40, PowerState::Charging, t0, 3);
-        assert_eq!(
-            store.dev_resume_target("a"),
-            Some((BucketDirection::Charge, 40)),
-            "direction must distinguish a charge bucket from a drain bucket",
-        );
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    fn dev_resume_target_is_none_for_unseen_serials() {
-        let store = AnalyticsStore::default();
-        assert_eq!(store.dev_resume_target("nope"), None);
     }
 
     #[test]

@@ -81,11 +81,7 @@ pub fn state_for(connection: Connection, percent: u8) -> PowerState {
 /// Starts **disconnected**: a fresh pad is remembered but not live, so it does
 /// not fire a connect toast or open Start until you switch it on.
 pub fn new_pad(fleet: &[EmulatedPad], percent: u8, connection: Connection) -> EmulatedPad {
-    let taken: Vec<usize> = fleet
-        .iter()
-        .filter_map(|p| p.serial().strip_prefix(SERIAL_PREFIX))
-        .filter_map(|n| n.parse::<usize>().ok())
-        .collect();
+    let taken: Vec<usize> = fleet.iter().map(|p| slot_of(p.serial())).collect();
     let index = (1..=taken.len() + 1)
         .find(|n| !taken.contains(n))
         .unwrap_or(1);
@@ -93,6 +89,40 @@ pub fn new_pad(fleet: &[EmulatedPad], percent: u8, connection: Connection) -> Em
         status: pad(index, percent, connection),
         connected: false,
     }
+}
+
+/// Rebuild the fleet from remembered controllers, so pads added in a previous
+/// run come back after a restart.
+///
+/// Callers pass only the emulated records; real hardware is not this fleet's
+/// business, and the remembered store keeps no charge state to restore. Every
+/// pad comes back **disconnected**: a remembered pad is not a plugged-in one,
+/// and reconnecting here would fire connect toasts and open Start unbidden at
+/// boot. Each keeps its remembered level and link, so it resumes where it was
+/// left rather than at the `AddPad` default.
+pub fn rehydrate(remembered: &[(String, u8, Connection)]) -> Vec<EmulatedPad> {
+    let mut fleet: Vec<EmulatedPad> = remembered
+        .iter()
+        .filter(|(serial, _, _)| is_emulated(serial))
+        .map(|(serial, percent, connection)| EmulatedPad {
+            // Number by the pad's own slot so the rebuilt fleet keeps the
+            // identity its serial implies; `pad` re-derives charge state from
+            // the link (the remembered store persists no state).
+            status: pad(slot_of(serial), *percent, *connection),
+            connected: false,
+        })
+        .collect();
+    // Order by slot so emu-2 precedes emu-10.
+    fleet.sort_by_key(|p| slot_of(p.serial()));
+    fleet
+}
+
+/// Slot number encoded in an `emu-N` serial; non-emulated serials sort last.
+fn slot_of(serial: &str) -> usize {
+    serial
+        .strip_prefix(SERIAL_PREFIX)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(usize::MAX)
 }
 
 /// Edit the pad with `serial` in place; unknown serials are a no-op.
@@ -323,6 +353,58 @@ mod tests {
         let unplugged = set_link(&full, PRIMARY_SERIAL, Connection::Bluetooth);
         assert_eq!(unplugged[0].status.state, PowerState::Discharging);
         assert_eq!(unplugged[0].status.percent, 100);
+    }
+
+    #[test]
+    fn rehydrate_restores_remembered_pads_disconnected() {
+        // A pad added in a previous run is in the remembered store but not the
+        // live fleet; it must come back in the tab, and must not come back
+        // plugged in (that would fire a connect toast at boot).
+        let remembered = [
+            ("emu-1".to_string(), 40, Connection::Bluetooth),
+            ("emu-2".to_string(), 90, Connection::Usb),
+        ];
+        let fleet = rehydrate(&remembered);
+        assert_eq!(fleet.len(), 2);
+        assert!(fleet.iter().all(|p| !p.connected));
+        assert!(
+            live(&fleet).is_empty(),
+            "nothing is published until switched on"
+        );
+
+        // Level and link are remembered, not reset to the AddPad default.
+        assert_eq!(fleet[0].status.percent, 40);
+        assert_eq!(fleet[0].status.connection, Connection::Bluetooth);
+        assert_eq!(fleet[0].status.state, PowerState::Discharging);
+        assert_eq!(fleet[1].status.percent, 90);
+        assert_eq!(fleet[1].status.connection, Connection::Usb);
+        assert_eq!(fleet[1].status.state, PowerState::Charging);
+    }
+
+    #[test]
+    fn rehydrate_ignores_real_hardware_and_orders_by_slot() {
+        // Real hardware belongs to HID, not the emulator fleet.
+        let remembered = [
+            ("emu-10".to_string(), 50, Connection::Bluetooth),
+            ("REAL-abc".to_string(), 50, Connection::Usb),
+            ("emu-2".to_string(), 50, Connection::Bluetooth),
+        ];
+        let fleet = rehydrate(&remembered);
+        let serials: Vec<&str> = fleet.iter().map(|p| p.serial()).collect();
+        assert_eq!(
+            serials,
+            vec!["emu-2", "emu-10"],
+            "slot order, not string order"
+        );
+
+        // The rebuilt slots must not collide with what new_pad hands out.
+        let next = new_pad(&fleet, 50, Connection::Bluetooth);
+        assert_eq!(next.serial(), "emu-1", "slot 1 is the first free one");
+    }
+
+    #[test]
+    fn rehydrate_of_nothing_is_empty() {
+        assert!(rehydrate(&[]).is_empty());
     }
 
     #[test]

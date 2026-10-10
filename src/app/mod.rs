@@ -486,6 +486,27 @@ impl App {
         set_shell_client_hitch_mode(client_mode);
 
         let configure_state = ConfigureState::new(prefs.spectrum.clone());
+
+        // Rebuild the Controllers-tab fleet from remembered emulated serials,
+        // so a pad added in a previous run is still listed after a restart
+        // instead of lingering only in the popup's remembered list. Must be
+        // read before `known` moves into the session; all pads come back
+        // disconnected.
+        #[cfg(debug_assertions)]
+        let emulated_pads = {
+            let remembered = known
+                .remembered_disconnected(&[])
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.serial.clone(),
+                        r.percent,
+                        Connection::from_label(&r.connection).unwrap_or(Connection::Bluetooth),
+                    )
+                })
+                .collect::<Vec<_>>();
+            emulate::rehydrate(&remembered)
+        };
         let session = crate::session::DeviceSession::new(prefs, known, analytics);
 
         let last_discovered = hid_worker
@@ -570,7 +591,7 @@ impl App {
             steam_scan_deferred_for_promote: false,
             spectrum_generation: 0,
             #[cfg(debug_assertions)]
-            emulated_pads: Vec::new(),
+            emulated_pads,
             #[cfg(debug_assertions)]
             pending_emulator_commits: std::collections::HashMap::new(),
         };
@@ -2669,31 +2690,6 @@ impl App {
             EmulatorCommand::SeedAnalytics(serial) => {
                 self.session.analytics.dev_seed_estimates(serial);
                 (fleet, false, true)
-            }
-            // Pause = unplug. Analytics keeps the in-progress bucket and simply
-            // stops accruing, so a paused cycle can be resumed intact later.
-            EmulatorCommand::PauseAnalytics(serial) => {
-                let next = emulate::update(&fleet, serial, |p| p.connected = false);
-                self.pending_emulator_commits.remove(serial);
-                (next, true, false)
-            }
-            // Resume = replug *into the same bucket*. Coming back at a different
-            // level or direction would be read as a fresh cycle, discarding the
-            // active time already credited, so restore both from the store.
-            EmulatorCommand::ResumeAnalytics(serial) => {
-                let target = self.session.analytics.dev_resume_target(serial);
-                let next = emulate::update(&fleet, serial, |p| {
-                    p.connected = true;
-                    if let Some((direction, percent)) = target {
-                        p.status.percent = percent;
-                        p.status.connection = match direction {
-                            analytics::BucketDirection::Drain => Connection::Bluetooth,
-                            analytics::BucketDirection::Charge => Connection::Usb,
-                        };
-                        p.status.state = emulate::state_for(p.status.connection, percent);
-                    }
-                });
-                (next, true, true)
             }
             EmulatorCommand::StepCharge(serial) => {
                 let Some(pad) = find(serial) else {
