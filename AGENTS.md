@@ -82,7 +82,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 
 ## Common gotchas for agents
 
-- **Intermittent test failure? Check shared globals before anything else.** `cargo test` runs tests on N threads in one process, so any `static`/`OnceLock`/`LazyLock` is shared. Reproduce with `--test-threads=16` in a loop rather than re-running (see `notes/flaky-tests.md`). Any test that mutates a process-global must take that global's test lock — `art_worker::shutdown()` wipes the shared `icon_cache` via `wipe_art_caches()`, which is exactly how it used to flake.
+- **Intermittent test failure? Check shared globals before anything else.** `cargo test` runs tests on N threads in one process, so any `static`/`OnceLock`/`LazyLock` is shared. Reproduce with `--test-threads=16` in a loop rather than re-running (see `notes/flaky-tests.md`). Any test that mutates a process-global must take that global's test lock — `art_worker::shutdown()` wipes the shared `icon_cache` via `wipe_art_caches()`, and `domain::color::set_active_spectrum` swaps the process-wide `SPECTRUM`. Locks are `icon_cache::with_cache_lock` and `color::with_spectrum_lock`.
 - **`cargo fmt --all -- --check` must run before `cargo clippy --all-targets -- -D warnings`**. Clippy can emit warnings that fmt would have reformatted; running fmt first avoids the "clippy fixes fmt" cycle.
 - **Clippy `-D warnings` is active in CI**. Any new `#[allow(clippy::...)]` must be justified; otherwise the build will fail on PR.
 - **The `single-instance` crate ensures only one run**. If you add GUI windows, make sure they're owned correctly or you'll get "single instance" exits.

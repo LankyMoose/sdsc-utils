@@ -238,6 +238,10 @@ pub enum EmulatorCommand {
     SetConnected(String, bool),
     /// Seed typical charge/play samples so ETA estimates exist.
     SeedAnalytics(String),
+    /// Unplug to pause accrual — the in-progress bucket is kept.
+    PauseAnalytics(String),
+    /// Replug into the same bucket, so credited time survives the pause.
+    ResumeAnalytics(String),
     /// Credit active time and walk one step up the charge cycle.
     StepCharge(String),
     /// Credit active time and walk one step down the drain cycle.
@@ -1973,6 +1977,8 @@ fn analytics_block<'a>(pad: &EmulatedPad) -> Element<'a, ConfigureMessage> {
     let seed_serial = pad.serial().to_string();
     let charge_serial = pad.serial().to_string();
     let drain_serial = pad.serial().to_string();
+    let pause_serial = pad.serial().to_string();
+    let resume_serial = pad.serial().to_string();
     column![
         text("Battery analytics")
             .size(theme::type_scale::CAPTION + 1.0)
@@ -1998,6 +2004,25 @@ fn analytics_block<'a>(pad: &EmulatedPad) -> Element<'a, ConfigureMessage> {
                 .padding([6, 10])
                 .on_press(ConfigureMessage::Emulator(EmulatorCommand::StepDrain(
                     drain_serial,
+                )))
+                .style(theme::secondary),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+        // Pause/Resume sit apart from the cycle walk: they are about *when*
+        // time is counted, not about moving the level. Resume replugs into the
+        // same in-progress bucket so credited time survives the gap.
+        row![
+            button(text("Pause recording").size(12.0))
+                .padding([6, 10])
+                .on_press(ConfigureMessage::Emulator(EmulatorCommand::PauseAnalytics(
+                    pause_serial,
+                )))
+                .style(theme::secondary),
+            button(text("Resume recording").size(12.0))
+                .padding([6, 10])
+                .on_press(ConfigureMessage::Emulator(EmulatorCommand::ResumeAnalytics(
+                    resume_serial,
                 )))
                 .style(theme::secondary),
         ]
@@ -2117,6 +2142,12 @@ mod tests {
         // An unknown expansion is simply not drawn.
         state.expanded_emulators.insert("emu-9".into());
         drop(emulators_view(&state, &fleet, &pending));
+        // Pause/Resume buttons render for a connected and a disconnected pad
+        // alike; they are plain commands, so state does not change the tree.
+        assert!(
+            EmulatorCommand::PauseAnalytics("emu-1".into())
+                != EmulatorCommand::ResumeAnalytics("emu-1".into())
+        );
     }
 
     #[test]

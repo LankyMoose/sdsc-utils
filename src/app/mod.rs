@@ -2670,6 +2670,31 @@ impl App {
                 self.session.analytics.dev_seed_estimates(serial);
                 (fleet, false, true)
             }
+            // Pause = unplug. Analytics keeps the in-progress bucket and simply
+            // stops accruing, so a paused cycle can be resumed intact later.
+            EmulatorCommand::PauseAnalytics(serial) => {
+                let next = emulate::update(&fleet, serial, |p| p.connected = false);
+                self.pending_emulator_commits.remove(serial);
+                (next, true, false)
+            }
+            // Resume = replug *into the same bucket*. Coming back at a different
+            // level or direction would be read as a fresh cycle, discarding the
+            // active time already credited, so restore both from the store.
+            EmulatorCommand::ResumeAnalytics(serial) => {
+                let target = self.session.analytics.dev_resume_target(serial);
+                let next = emulate::update(&fleet, serial, |p| {
+                    p.connected = true;
+                    if let Some((direction, percent)) = target {
+                        p.status.percent = percent;
+                        p.status.connection = match direction {
+                            analytics::BucketDirection::Drain => Connection::Bluetooth,
+                            analytics::BucketDirection::Charge => Connection::Usb,
+                        };
+                        p.status.state = emulate::state_for(p.status.connection, percent);
+                    }
+                });
+                (next, true, true)
+            }
             EmulatorCommand::StepCharge(serial) => {
                 let Some(pad) = find(serial) else {
                     return Task::none();

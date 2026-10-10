@@ -62,10 +62,15 @@ and never reach the cache, so they needed nothing.
 - **Any test that mutates a shared global takes that global's test lock**, even
   if the assertion it makes looks unrelated. `shutdown()` wiping a cache is the
   canonical surprise.
-- **Grep for the lock's name** (`with_cache_lock`) to find every participant,
-  then check each one actually takes it. `with_isolated_cache`'s own comment
+- **Grep for the lock's name** (`with_cache_lock`, `with_spectrum_lock`) to find
+  every participant, then check each one actually takes it. Give the global a
+  named lock *before* the second test needs it — a lock nothing else calls yet
+  is the cheapest possible time to add one. `with_isolated_cache`'s own comment
   already admitted the hazard: *"do not bump clear_epoch (that is Exit-only and
-  races parallel view tests that decode into the shared process cache)"*.
+  races parallel view tests that decode into the shared process cache"*.
+- **A latent hazard is still worth locking.** `domain::color`'s `SPECTRUM` could
+  not fail a test *at the time* (nothing else read it), but the fix is one line
+  and the next color-reading test would otherwise inherit the flake silently.
 - **Suspicious slowness is evidence.** A run that takes 4× longer is a wider
   race window, not a slower test.
 
@@ -77,10 +82,7 @@ Checked while chasing this, so they need not be re-checked:
   clocks (`let now = Instant::now(); ... now + Duration::from_millis(n)`),
   which are immune to scheduling. `motion`, `backdrop` and `layout` advance
   fixed `Duration`s explicitly.
-- **`domain::color`'s `SPECTRUM`.** `active_spectrum_is_used` does mutate a
-  process-global and reset it — a genuine smell — but no *test* other than
-  itself reads `color_for_battery_percent`, so it cannot currently fail another
-  test. Left alone; revisit if a color-reading test is added.
+- **`domain::color`'s `SPECTRUM`.** `active_spectrum_is_used` mutated a process-global and reset it — a real hazard. It now takes `color::with_spectrum_lock`, so the next color-reading test has a lock to take by name.
 - **`HashMap`/`HashSet` iteration order.** SipHash randomizes per process, so an
   order-dependent test would fail on *some* fraction of 400 runs, not 1-in-150.
 - **Pure-load stress.** 8 spinners on 16 cores changed nothing; the failure

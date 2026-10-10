@@ -334,6 +334,20 @@ fn active_spectrum() -> &'static Mutex<BatterySpectrum> {
     SPECTRUM.get_or_init(|| Mutex::new(BatterySpectrum::default_spectrum()))
 }
 
+/// Hold while installing a different active spectrum in tests.
+///
+/// The active spectrum is process-global, so a test that swaps it in can hand
+/// its colors to any concurrently-running test that reads through
+/// [`color_for_battery_percent`]. Every test that calls either this or
+/// [`color_for_battery_percent`] must take this lock. (`icon_cache` has the
+/// same hazard and the same remedy — see its `with_cache_lock`.)
+#[cfg(test)]
+pub fn with_spectrum_lock<R>(f: impl FnOnce() -> R) -> R {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
 /// Install the spectrum used by [`color_for_battery_percent`].
 pub fn set_active_spectrum(spectrum: BatterySpectrum) {
     if let Ok(mut guard) = active_spectrum().lock() {
@@ -420,16 +434,18 @@ mod tests {
 
     #[test]
     fn active_spectrum_is_used() {
-        set_active_spectrum(
-            BatterySpectrum::from_stops(vec![
-                GradientStop::new(100, Rgb::new(0, 255, 0)),
-                GradientStop::new(50, Rgb::new(255, 255, 0)),
-                GradientStop::new(0, Rgb::new(255, 0, 0)),
-            ])
-            .unwrap(),
-        );
-        assert_eq!(color_for_battery_percent(100), Rgb::new(0, 255, 0));
-        set_active_spectrum(BatterySpectrum::default_spectrum());
+        with_spectrum_lock(|| {
+            set_active_spectrum(
+                BatterySpectrum::from_stops(vec![
+                    GradientStop::new(100, Rgb::new(0, 255, 0)),
+                    GradientStop::new(50, Rgb::new(255, 255, 0)),
+                    GradientStop::new(0, Rgb::new(255, 0, 0)),
+                ])
+                .unwrap(),
+            );
+            assert_eq!(color_for_battery_percent(100), Rgb::new(0, 255, 0));
+            set_active_spectrum(BatterySpectrum::default_spectrum());
+        });
     }
 
     #[test]
