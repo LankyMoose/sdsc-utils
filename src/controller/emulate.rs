@@ -28,7 +28,8 @@ pub fn is_emulated(serial: &str) -> bool {
     serial.starts_with(SERIAL_PREFIX)
 }
 
-/// One emulated DualSense and whether it is currently plugged in.
+/// One emulated DualSense, whether it is plugged in, and whether it is
+/// remembered across restarts.
 ///
 /// `ControllerStatus` has no `PartialEq`, so identity is the serial — which is
 /// what callers actually compare on.
@@ -37,6 +38,13 @@ pub struct EmulatedPad {
     pub status: ControllerStatus,
     /// Pads start disconnected; publishing one runs the real connect path.
     pub connected: bool,
+    /// Whether the pad persists to `controllers.json` when unplugged — the
+    /// same "remembered" pin a real controller has in the popup.
+    ///
+    /// Forgetting a pad only takes effect once it is also unplugged: while it
+    /// is still connected it stays on screen like any live pad, it simply
+    /// stops being written to the remembered store.
+    pub remembered: bool,
 }
 
 impl EmulatedPad {
@@ -88,7 +96,22 @@ pub fn new_pad(fleet: &[EmulatedPad], percent: u8, connection: Connection) -> Em
     EmulatedPad {
         status: pad(index, percent, connection),
         connected: false,
+        remembered: true,
     }
+}
+
+/// Drop pads that are no longer worth listing.
+///
+/// A pad is dropped when it is **unplugged and forgotten** — that is exactly
+/// what the popup's remember pin means for real hardware, and it is why the
+/// two events are symmetric: forgetting an unplugged pad removes it now, and
+/// unplugging an already-forgotten pad removes it then. A pad that is merely
+/// unplugged stays listed so the user can plug it back in.
+pub fn prune(fleet: Vec<EmulatedPad>) -> Vec<EmulatedPad> {
+    fleet
+        .into_iter()
+        .filter(|p| p.connected || p.remembered)
+        .collect()
 }
 
 /// Rebuild the fleet from remembered controllers, so pads added in a previous
@@ -110,6 +133,9 @@ pub fn rehydrate(remembered: &[(String, u8, Connection)]) -> Vec<EmulatedPad> {
             // the link (the remembered store persists no state).
             status: pad(slot_of(serial), *percent, *connection),
             connected: false,
+            // Only remembered pads are ever written to `controllers.json`, so
+            // anything read back from it is remembered by construction.
+            remembered: true,
         })
         .collect();
     // Order by slot so emu-2 precedes emu-10.
@@ -210,9 +236,80 @@ mod tests {
         let pad = first();
         assert_eq!(pad.serial(), PRIMARY_SERIAL);
         assert!(!pad.connected);
+        assert!(pad.remembered, "a pad persists until it is forgotten");
         assert_eq!(pad.status.percent, 50);
         // Nothing is published until it is switched on.
         assert!(live(std::slice::from_ref(&pad)).is_empty());
+    }
+
+    /// Forgetting an unplugged pad removes it immediately.
+    #[test]
+    fn forgetting_an_unplugged_pad_removes_it() {
+        let pad = first();
+        assert!(!pad.connected);
+        let next = prune(update(std::slice::from_ref(&pad), PRIMARY_SERIAL, |p| {
+            p.remembered = false
+        }));
+        assert!(next.is_empty(), "off and forgotten means gone");
+    }
+
+    /// Unplugging a forgotten pad removes it too — the same end state, reached
+    /// from the other side. This is what makes the pair symmetric.
+    #[test]
+    fn unplugging_a_forgotten_pad_removes_it() {
+        let plugged = update(std::slice::from_ref(&first()), PRIMARY_SERIAL, |p| {
+            p.connected = true;
+            p.remembered = false;
+        });
+        assert_eq!(plugged.len(), 1, "forgetting does not drop a live pad");
+        let unplugged = prune(update(&plugged, PRIMARY_SERIAL, |p| p.connected = false));
+        assert!(unplugged.is_empty());
+    }
+
+    #[test]
+    fn forgetting_a_live_pad_keeps_it_until_unplugged() {
+        let plugged = update(std::slice::from_ref(&first()), PRIMARY_SERIAL, |p| {
+            p.connected = true;
+        });
+        // While plugged in it stays listed, like any connected controller.
+        assert_eq!(prune(plugged).len(), 1);
+    }
+
+    #[test]
+    fn unplugping_a_remembered_pad_keeps_it() {
+        let plugged = update(std::slice::from_ref(&first()), PRIMARY_SERIAL, |p| {
+            p.connected = true;
+        });
+        let unplugged = prune(update(&plugged, PRIMARY_SERIAL, |p| p.connected = false));
+        assert_eq!(
+            unplugged.len(),
+            1,
+            "an unplugged but remembered pad can be plugged back in"
+        );
+        assert!(unplugged[0].remembered);
+    }
+
+    #[test]
+    fn re_remembering_restores_the_pad() {
+        let pad = first();
+        let forgotten = prune(update(std::slice::from_ref(&pad), PRIMARY_SERIAL, |p| {
+            p.remembered = false
+        }));
+        assert!(forgotten.is_empty());
+        // Nothing left to re-remember — the pad is gone, so a new one is needed.
+        assert!(live(&forgotten).is_empty());
+    }
+
+    #[test]
+    fn prune_leaves_other_pads_alone() {
+        let a = update(std::slice::from_ref(&first()), PRIMARY_SERIAL, |p| {
+            p.remembered = false;
+        });
+        let b = new_pad(&a, 70, Connection::Usb);
+        let fleet = vec![a[0].clone(), b.clone()];
+        let next = prune(fleet);
+        let serials: Vec<&str> = next.iter().map(|p| p.serial()).collect();
+        assert_eq!(serials, vec!["emu-2"], "only the off+forgotten pad goes");
     }
 
     #[test]

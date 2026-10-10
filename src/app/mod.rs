@@ -2612,18 +2612,29 @@ impl App {
         live
     }
 
-    /// Remember every emulated pad, so disconnected ones appear in the normal
-    /// remembered-but-off list instead of only in the debug tab.
+    /// Sync the remembered store with the fleet's remember flags, so
+    /// disconnected pads appear in the normal remembered-but-off list and
+    /// forgotten ones do not survive a restart.
+    ///
+    /// Connected pads are written too: a pad is only *listed* after an unplug,
+    /// but a connected pad's level and link should still be current if it is
+    /// unplugged later.
     #[cfg(debug_assertions)]
     fn remember_emulated(&mut self) {
         let pads: Vec<ControllerStatus> = self
             .emulated_pads
             .iter()
+            .filter(|p| p.remembered)
             .map(|p| p.status.clone())
             .collect();
         let mut changed = false;
         for pad in &pads {
             changed |= self.session.known.remember(pad);
+        }
+        // Forgotten pads must also *leave* the store, or they would still come
+        // back after a restart.
+        for pad in self.emulated_pads.iter().filter(|p| !p.remembered) {
+            changed |= self.session.known.forget(pad.serial());
         }
         if changed {
             self.session.known.save();
@@ -2685,7 +2696,15 @@ impl App {
                     // commit cannot fire against a pad that is no longer live.
                     self.pending_emulator_commits.remove(serial);
                 }
-                (next, true, false)
+                // Unplugging a forgotten pad removes it — same as forgetting an
+                // unplugged pad. Either way the two together mean "gone".
+                (emulate::prune(next), true, false)
+            }
+            // The popup's remember pin, for an emulated pad. Only takes effect
+            // on unplug; `prune` then removes it if it is already off.
+            EmulatorCommand::SetRemembered(serial, remembered) => {
+                let next = emulate::update(&fleet, serial, |p| p.remembered = *remembered);
+                (emulate::prune(next), false, false)
             }
             EmulatorCommand::SeedAnalytics(serial) => {
                 self.session.analytics.dev_seed_estimates(serial);

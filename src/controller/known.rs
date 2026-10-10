@@ -327,6 +327,39 @@ mod tests {
             !fleet[0].connected,
             "a remembered pad is not a plugged-in one"
         );
+        assert!(
+            fleet[0].remembered,
+            "anything read back from the store is remembered by construction"
+        );
+    }
+
+    /// Forgetting a pad must *remove* it from the store, not merely stop it
+    /// being updated — otherwise it would still reappear after a restart.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn forgetting_a_pad_keeps_it_out_of_the_next_boot() {
+        let mut store = KnownControllers::default();
+        store.remember(&pad("emu-1", 40, Connection::Bluetooth));
+        assert!(store.is_remembered("emu-1"));
+
+        assert!(store.forget("emu-1"));
+        assert!(!store.is_remembered("emu-1"));
+
+        let remembered: Vec<(String, u8, Connection)> = store
+            .remembered_disconnected(&[])
+            .into_iter()
+            .map(|r| {
+                (
+                    r.serial.clone(),
+                    r.percent,
+                    Connection::from_label(&r.connection).expect("parses"),
+                )
+            })
+            .collect();
+        assert!(
+            crate::controller::emulate::rehydrate(&remembered).is_empty(),
+            "a forgotten pad must not come back after a restart"
+        );
     }
 
     #[test]

@@ -236,6 +236,9 @@ pub enum EmulatorCommand {
     SetConnection(String, Connection),
     /// Plug in / unplug — runs the real connect or disconnect path.
     SetConnected(String, bool),
+    /// Keep the pad across restarts (the popup's remember pin). A pad that is
+    /// both unplugged and forgotten is dropped from the list.
+    SetRemembered(String, bool),
     /// Seed typical charge/play samples so ETA estimates exist.
     SeedAnalytics(String),
     /// Credit active time and walk one step up the charge cycle.
@@ -1816,8 +1819,10 @@ fn emulator_row<'a>(
             pad.status.connection.as_str(),
             pad.status.state.as_str()
         )
-    } else {
+    } else if pad.remembered {
         "off".to_string()
+    } else {
+        "off · forgotten".to_string()
     };
 
     let chevron_serial = serial.clone();
@@ -1863,16 +1868,42 @@ fn emulator_row<'a>(
             .into();
     }
 
+    let remember_serial = pad.serial().to_string();
     let controls = column![
         battery_row(pad, pending),
         connection_row(pad),
         analytics_block(pad),
-        button(text("Remove controller").size(12.0))
+        row![
+            // Same pin the popup offers real controllers: forget keeps the pad
+            // off the remembered list, and once it is also unplugged the row
+            // goes away.
+            button(
+                text(if pad.remembered {
+                    "Forget this controller"
+                } else {
+                    "Remember this controller"
+                })
+                .size(12.0)
+            )
             .padding([6, 10])
-            .on_press(ConfigureMessage::Emulator(EmulatorCommand::RemovePad(
-                serial,
+            .on_press(ConfigureMessage::Emulator(EmulatorCommand::SetRemembered(
+                remember_serial,
+                !pad.remembered,
             )))
-            .style(theme::danger),
+            .style(if pad.remembered {
+                theme::secondary
+            } else {
+                theme::danger
+            }),
+            button(text("Remove controller").size(12.0))
+                .padding([6, 10])
+                .on_press(ConfigureMessage::Emulator(EmulatorCommand::RemovePad(
+                    serial,
+                )))
+                .style(theme::danger),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
     ]
     .spacing(12)
     .padding(iced::Padding {
@@ -2117,6 +2148,9 @@ mod tests {
         // An unknown expansion is simply not drawn.
         state.expanded_emulators.insert("emu-9".into());
         drop(emulators_view(&state, &fleet, &pending));
+        // The forget/remember button label follows the pad's remembered flag.
+        let forgotten = emulate::update(&fleet, "emu-1", |p| p.remembered = false);
+        drop(emulators_view(&state, &forgotten, &[]));
     }
 
     #[test]
