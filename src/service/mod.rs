@@ -68,7 +68,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut gesture_detectors = GestureDetectorBank::default();
     let mut chord_release_gate = ChordReleaseGate::default();
     let mut pending_open_start = false;
-    let mut last_client_count = 0usize;
+    // Newest client id already sent the snapshot; see `send_to_newcomers`.
+    let mut pushed_watermark: u64 = 0;
 
     // Forward hid-worker pad edges over IPC (and run reopen gesture while shell is down).
     // Deep enough to ride out shell-frame hitches without dropping taps.
@@ -138,31 +139,37 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // Chord may still be held across the restart — require release.
                 chord_release_gate.arm();
                 gesture_detectors.reset();
-                last_client_count = 0;
                 shell = spawn_shell()?;
             }
         }
 
-        let clients = pipe.client_count();
-        if clients > 0 && last_client_count == 0 {
-            // Shell just attached — push live pad list (earlier Controllers IPC may have
-            // been dropped while client_count was 0) then flush a latched OpenStart.
-            // Keep the latch until ReportStartVisible(true): a brief connect (or a
-            // message sent before the shell's recv loop is live) must not clear it.
-            let _ = pipe.send(ServiceMessage::Controllers(session.controllers.clone()));
-            // Restore the shell's start-screen selection after a shell restart
-            // (service process lifetime only — never touches disk).
+        // Push the live snapshot only to transports that connected since the
+        // last push — usually the shell's broadcast receiver landing after its
+        // command connection (which wins the attach race and is never read).
+        // Newcomers are detected by watermark, not by count: disconnects only
+        // prune, and ids are monotonic, so a respawned shell is always newer.
+        // Keep the OpenStart latch until ReportStartVisible(true): a brief
+        // connect (or a message sent before the shell's recv loop is live)
+        // must not clear it.
+        if pipe.has_newcomers(pushed_watermark) {
             let stored = session.start_selection.clone();
-            let _ = pipe.send(ServiceMessage::StartSelection {
-                game_key: stored.game_key,
-                controller_key: stored.controller_key,
-            });
-            if pending_open_start {
-                app_log::info("service: flushing latched OpenStart (shell up)");
-                let _ = pipe.send(ServiceMessage::Effects(vec![SessionEffect::OpenStart]));
+            let mut batch = vec![
+                ServiceMessage::Controllers(session.controllers.clone()),
+                // Restore the shell's start-screen selection after a shell
+                // restart (service process lifetime only — never touches disk).
+                ServiceMessage::StartSelection {
+                    game_key: stored.game_key,
+                    controller_key: stored.controller_key,
+                },
+            ];
+            let latched = pending_open_start;
+            if latched {
+                batch.push(ServiceMessage::Effects(vec![SessionEffect::OpenStart]));
+            }
+            if pipe.send_to_newcomers(&batch, &mut pushed_watermark) > 0 && latched {
+                app_log::info("service: flushing latched OpenStart (new transport)");
             }
         }
-        last_client_count = clients;
 
         if last_persist_check.elapsed() >= Duration::from_secs(2) {
             last_persist_check = Instant::now();

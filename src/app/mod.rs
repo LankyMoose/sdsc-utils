@@ -120,6 +120,11 @@ const STEAM_SCAN_IDLE_FALLBACK: Duration = Duration::from_secs(2);
 /// Shell-client retries for the service-owned start selection (`ClientIpcSync`
 /// ticks every 250ms, so this covers ~10s before falling back to defaults).
 const START_SELECTION_SYNC_RETRIES: u8 = 40;
+/// Shell-client retries for the boot-time controller pull (same ~10s window).
+/// Covers the attach race where the service's initial Controllers push lands on
+/// the command connection before the broadcast receiver attaches: without a
+/// pull the shell stays empty, never sets input-hot, and no PadInput arrives.
+const CONTROLLERS_SYNC_RETRIES: u8 = 40;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -353,6 +358,10 @@ pub struct App {
     start_selection_sync_pending: bool,
     /// Boot-request attempts sent so far (stops at [`START_SELECTION_SYNC_RETRIES`]).
     start_selection_sync_attempts: u8,
+    /// True until the service answers our boot-time controller pull (client mode).
+    controllers_sync_pending: bool,
+    /// Controller-pull attempts sent so far (stops at [`CONTROLLERS_SYNC_RETRIES`]).
+    controllers_sync_attempts: u8,
 
     toast_window: Option<window::Id>,
     toast_message: Option<ToastMessage>,
@@ -504,6 +513,13 @@ fn sync_remembered_emulated(
 // App
 // ---------------------------------------------------------------------------
 
+/// Whether the shell should (re)send its boot-time controller pull: client
+/// mode, still waiting for an answer, still showing no controllers, and
+/// attempts remaining. Unit-testable without an [`App`].
+fn controllers_pull_due(client_mode: bool, pending: bool, empty: bool, attempts: u8) -> bool {
+    client_mode && pending && empty && attempts < CONTROLLERS_SYNC_RETRIES
+}
+
 impl App {
     fn boot(client_mode: bool) -> (Self, Task<Message>) {
         let prefs = Prefs::load();
@@ -624,6 +640,8 @@ impl App {
             start_selection_dirty: false,
             start_selection_sync_pending: false,
             start_selection_sync_attempts: 0,
+            controllers_sync_pending: false,
+            controllers_sync_attempts: 0,
             toast_window: None,
             toast_message: None,
             toast_queue: VecDeque::new(),
@@ -650,6 +668,11 @@ impl App {
             // `ClientIpcSync` in case the shell's recv loop is not live yet.
             let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RequestStartSelection);
             app.start_selection_sync_pending = true;
+            // Pull the live controller list on the same retry loop. The service
+            // re-pushes Controllers on every new transport, but this closes the
+            // loop when that push raced the broadcast receiver's attach.
+            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::ListControllers);
+            app.controllers_sync_pending = true;
         }
         #[cfg(all(windows, debug_assertions))]
         start_hitch_hotkey_worker();
@@ -1406,6 +1429,7 @@ impl App {
             Message::ClientIpcSync => {
                 self.sync_client_input_hot();
                 self.maybe_request_start_selection();
+                self.maybe_request_controllers();
                 Task::none()
             }
             Message::Service(msg) => self.on_service_message(msg),
@@ -1818,6 +1842,28 @@ impl App {
         }
         self.start_selection_sync_attempts += 1;
         let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RequestStartSelection);
+    }
+
+    /// Retry the boot-time controller pull until the service answers (via
+    /// `ControllerList` or a `Controllers` push) or attempts run out.
+    ///
+    /// Only pulls while the shell still shows no controllers: an empty shell
+    /// never sets input-hot, so no PadInput edges ever arrive to heal it.
+    fn maybe_request_controllers(&mut self) {
+        let empty = self.session.controllers.is_empty();
+        if controllers_pull_due(
+            self.client_mode,
+            self.controllers_sync_pending,
+            empty,
+            self.controllers_sync_attempts,
+        ) {
+            self.controllers_sync_attempts += 1;
+            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::ListControllers);
+        } else if !empty || self.controllers_sync_attempts >= CONTROLLERS_SYNC_RETRIES {
+            // Synced via a Controllers push, or out of attempts — stop pulling.
+            // (Standalone shells never pull: pending is only armed in client mode.)
+            self.controllers_sync_pending = false;
+        }
     }
 
     /// Apply a service-stored selection to the start lists (keys → indices).
@@ -5148,32 +5194,11 @@ impl App {
     fn on_service_message(&mut self, msg: crate::ipc::ServiceMessage) -> Task<Message> {
         use crate::ipc::ServiceMessage;
         match msg {
-            ServiceMessage::Controllers(controllers) => {
-                // Service already ran session + HID; refresh shell UI only when changed.
-                // A live add/remove changes the popup row count, so refit while open.
-                let fit =
-                    if !crate::session::controllers_equivalent(
-                        &self.session.controllers,
-                        &controllers,
-                    ) {
-                        self.session.controllers = controllers;
-                        if self.start_state.powering_off.as_ref().is_some_and(|s| {
-                            !self.session.controllers.iter().any(|c| c.serial == *s)
-                        }) {
-                            self.start_state.powering_off = None;
-                        }
-                        let fit = self.sync_popup_rows_and_fit();
-                        if self.start_visible {
-                            self.refresh_start_controllers();
-                        }
-                        fit
-                    } else {
-                        Task::none()
-                    };
-                #[cfg(debug_assertions)]
-                note_client_hitch_controllers(self.session.controllers.len());
-                self.sync_client_input_hot();
-                fit
+            ServiceMessage::Controllers(controllers) => self.apply_service_controllers(controllers),
+            ServiceMessage::ControllerList(Ok(controllers)) => {
+                // Reply to the boot-time pull (see `maybe_request_controllers`).
+                self.controllers_sync_pending = false;
+                self.apply_service_controllers(controllers)
             }
             ServiceMessage::Effects(effects) => self.apply_session_effects(effects),
             ServiceMessage::PadInput(edge) => {
@@ -5221,9 +5246,39 @@ impl App {
             }
             ServiceMessage::Shutdown => self.update(Message::Exit),
             ServiceMessage::Ack
-            | ServiceMessage::ControllerList(_)
+            | ServiceMessage::ControllerList(Err(_))
             | ServiceMessage::LightbarSet { .. } => Task::none(),
         }
+    }
+
+    /// Apply a service-owned controller snapshot (push or pull reply).
+    ///
+    /// Service already ran session + HID; refresh shell UI only when changed.
+    /// A live add/remove changes the popup row count, so refit while open.
+    fn apply_service_controllers(&mut self, controllers: Vec<ControllerStatus>) -> Task<Message> {
+        let fit =
+            if !crate::session::controllers_equivalent(&self.session.controllers, &controllers) {
+                self.session.controllers = controllers;
+                if self
+                    .start_state
+                    .powering_off
+                    .as_ref()
+                    .is_some_and(|s| !self.session.controllers.iter().any(|c| c.serial == *s))
+                {
+                    self.start_state.powering_off = None;
+                }
+                let fit = self.sync_popup_rows_and_fit();
+                if self.start_visible {
+                    self.refresh_start_controllers();
+                }
+                fit
+            } else {
+                Task::none()
+            };
+        #[cfg(debug_assertions)]
+        note_client_hitch_controllers(self.session.controllers.len());
+        self.sync_client_input_hot();
+        fit
     }
 
     fn on_pad_input(&mut self, edge: crate::domain::pad::InputEdge) -> Task<Message> {
@@ -6802,6 +6857,37 @@ mod tests {
     use super::*;
     use crate::controller::known::KnownControllers;
     use crate::controller::model::Connection;
+
+    /// Boot-time controller pull: only in client mode, while still waiting and
+    /// still empty, with attempts remaining.
+    ///
+    /// This is the self-heal for the attach race where the service's initial
+    /// Controllers push lands on the command connection before the broadcast
+    /// receiver attaches: an empty shell never sets input-hot, so no PadInput
+    /// edges ever arrive to heal it.
+    #[test]
+    fn controllers_pull_due_only_while_empty_and_waiting() {
+        assert!(controllers_pull_due(true, true, true, 0));
+        assert!(controllers_pull_due(
+            true,
+            true,
+            true,
+            CONTROLLERS_SYNC_RETRIES - 1
+        ));
+        // Standalone shells own HID — never pull.
+        assert!(!controllers_pull_due(false, true, true, 0));
+        // Answered already (or stopped): no more pulls.
+        assert!(!controllers_pull_due(true, false, true, 0));
+        // A Controllers push synced us: the retry loop stands down.
+        assert!(!controllers_pull_due(true, true, false, 0));
+        // Out of attempts: fall back to broadcast-only.
+        assert!(!controllers_pull_due(
+            true,
+            true,
+            true,
+            CONTROLLERS_SYNC_RETRIES
+        ));
+    }
 
     /// The forget sequence end to end: prune drops the pad from the fleet, and
     /// the store must drop it too.
