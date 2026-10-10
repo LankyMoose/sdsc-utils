@@ -62,7 +62,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **macOS**: `tray-icon` (no default features). Input monitoring may be prompted by macOS.
 - **Linux**: `tray-icon` with `gtk` feature. Requires `libhidapi` / udev rules for DualSense access.
 - **Graphics backend**: on Windows boot sets `WGPU_BACKEND=vulkan,dx12` (Vulkan preferred, DX12 fallback) unless the env var is already set; `wgpu_diag::alpha_composite()` reports whether transparent windows will composite. See `notes/ui-refresh.md`.
-- **Developer emulator**: Always compiled in non-release builds (`cfg(debug_assertions)`) — a plain `cargo run` already has it. Configure groups the debug tools under a **Developer mode** caption: **Controllers** (live emulated-pad list; commands are `EmulatorCommand` and address pads by serial, never row index), **Pad input**, **Diagnostics**. Release builds (`cargo build --release`) compile them out; no Cargo feature or CLI flag exists.
+- **Developer emulator**: Always compiled in non-release builds (`cfg(debug_assertions)`) — a plain `cargo run` already has it. Configure groups the debug tools under a **Developer mode** caption: **Controllers** (one row per emulated pad with a chevron that expands its controls inline; `EmulatorCommand` addresses pads by serial, never row index), **Pad input**, **Diagnostics**. Battery edits preview and debounce by 1s *only while the pad is connected* — a disconnected pad is not published, so it applies immediately. Release builds (`cargo build --release`) compile them out; no Cargo feature or CLI flag exists.
 
 ## Directory ownership
 

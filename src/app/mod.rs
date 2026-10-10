@@ -880,7 +880,7 @@ impl App {
                 #[cfg(debug_assertions)]
                 &self.emulated_pads,
                 #[cfg(debug_assertions)]
-                self.pending_emulator_change().as_ref(),
+                &self.pending_emulator_changes(),
             )
             .map(Message::Configure);
         }
@@ -2332,8 +2332,10 @@ impl App {
             #[cfg(debug_assertions)]
             ConfigureMessage::Emulator(command) => self.apply_emulator_command(command),
             #[cfg(debug_assertions)]
-            ConfigureMessage::SelectEmulator(index) => {
-                self.configure_state.emulator_selected = index;
+            ConfigureMessage::ToggleEmulator(serial) => {
+                if !self.configure_state.expanded_emulators.remove(&serial) {
+                    self.configure_state.expanded_emulators.insert(serial);
+                }
                 Task::none()
             }
             // Hide first so DWM cannot flash the default (white) brush while the
@@ -2556,15 +2558,18 @@ impl App {
     /// Only the pad the Controllers tab has selected can show its spinner, so this
     /// resolves the selection to a concrete change.
     #[cfg(debug_assertions)]
-    fn pending_emulator_change(&self) -> Option<configure_view::PendingEmulatorChange> {
-        let selected = self.configure_state.emulator_selected;
-        let pad = self.emulated_pads.get(selected)?;
-        let pending = self.pending_emulator_commits.get(pad.serial())?;
-        Some(configure_view::PendingEmulatorChange {
-            serial: pad.serial().to_string(),
-            percent: pad.status.percent,
-            tick: pending.tick,
-        })
+    fn pending_emulator_changes(&self) -> Vec<configure_view::PendingEmulatorChange> {
+        self.emulated_pads
+            .iter()
+            .filter_map(|pad| {
+                let pending = self.pending_emulator_commits.get(pad.serial())?;
+                Some(configure_view::PendingEmulatorChange {
+                    serial: pad.serial().to_string(),
+                    percent: pad.status.percent,
+                    tick: pending.tick,
+                })
+            })
+            .collect()
     }
 
     /// True while any emulated pad is plugged in — HID polling stands down so
@@ -2635,17 +2640,21 @@ impl App {
                 self.session.known.forget(serial);
                 (next, true, false)
             }
-            // Preview repaints the tab only. Publishing is deferred to the
-            // debounce timer so a drag cannot spam toasts or Start opens.
+            // Preview repaints the tab only. Publishing is debounced so a drag
+            // cannot spam toasts or Start opens — but only for a *connected*
+            // pad, since a disconnected one is not published at all.
             EmulatorCommand::PreviewPercent(serial, percent) => {
                 let next = emulate::update(&fleet, serial, |p| p.status.percent = *percent);
-                self.pending_emulator_commits.insert(
-                    serial.clone(),
-                    PendingEmulatorCommit {
-                        deadline: Instant::now() + EMULATOR_COMMIT_DEBOUNCE,
-                        tick: 0,
-                    },
-                );
+                let connected = find(serial).is_some_and(|p| p.connected);
+                if connected {
+                    self.pending_emulator_commits.insert(
+                        serial.clone(),
+                        PendingEmulatorCommit {
+                            deadline: Instant::now() + EMULATOR_COMMIT_DEBOUNCE,
+                            tick: 0,
+                        },
+                    );
+                }
                 (next, false, false)
             }
             EmulatorCommand::SetPercent(serial, percent) => {

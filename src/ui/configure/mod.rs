@@ -343,9 +343,10 @@ pub enum ConfigureMessage {
     ResetSpectrum,
     #[cfg(debug_assertions)]
     Emulator(EmulatorCommand),
-    /// Select a pad row in the Controllers tab.
+    /// Serial of a row whose controls are expanded.
+    /// Expand a pad row.
     #[cfg(debug_assertions)]
-    SelectEmulator(usize),
+    ToggleEmulator(String),
     /// Debug-only: start the renderer window stress test (Diagnostics section).
     #[cfg(debug_assertions)]
     RunWindowStress,
@@ -366,9 +367,10 @@ pub struct ConfigureState {
     pub error: Option<String>,
     pub show_changelog: bool,
     pub steam_path_error: Option<String>,
-    /// Selected emulated pad (Controllers tab); clamped to the pad list.
+    /// Serials of expanded pad rows (Controllers tab), keyed so rows stay
+    /// independently expandable as pads come and go.
     #[cfg(debug_assertions)]
-    pub emulator_selected: usize,
+    pub expanded_emulators: std::collections::HashSet<String>,
 }
 
 impl ConfigureState {
@@ -384,7 +386,7 @@ impl ConfigureState {
             show_changelog: false,
             steam_path_error: None,
             #[cfg(debug_assertions)]
-            emulator_selected: 0,
+            expanded_emulators: std::collections::HashSet::new(),
         };
         state.sync_hsv();
         state
@@ -561,7 +563,7 @@ pub fn view<'a>(
     analytics: &'a AnalyticsPanel,
     pad_input: &'a PadInputPanel,
     #[cfg(debug_assertions)] emulators: &'a [EmulatedPad],
-    #[cfg(debug_assertions)] pending: Option<&PendingEmulatorChange>,
+    #[cfg(debug_assertions)] pending: &[PendingEmulatorChange],
 ) -> Element<'a, ConfigureMessage> {
     // Section heading doubles as the drag handle for the undecorated window.
     let heading = mouse_area(
@@ -947,7 +949,7 @@ fn section_content<'a>(
     analytics: &'a AnalyticsPanel,
     pad_input: &'a PadInputPanel,
     #[cfg(debug_assertions)] emulators: &'a [EmulatedPad],
-    #[cfg(debug_assertions)] pending: Option<&PendingEmulatorChange>,
+    #[cfg(debug_assertions)] pending: &[PendingEmulatorChange],
 ) -> Element<'a, ConfigureMessage> {
     match state.section {
         Section::System => system_settings_view(settings),
@@ -1709,51 +1711,46 @@ fn pad_input_view<'a>(panel: &'a PadInputPanel) -> Element<'a, ConfigureMessage>
     items.into()
 }
 
-/// Controllers tab (debug only): the emulated fleet plus per-pad controls.
+/// Controllers tab (debug only): the emulated fleet, one compact row per pad.
 ///
-/// Pads start remembered but disconnected; switching one on publishes it and
-/// runs the ordinary connect path (toasts, Start-open policy). Rows address
-/// pads by serial; the detail card edits whichever pad `state.emulator_selected`
-/// points at.
+/// Each row carries its own disclosure chevron; expanding a row reveals that
+/// pad's controls inline, so several pads can be adjusted at once. Rows
+/// address pads by serial, and `pending` carries the debounce state for
+/// whichever pads are mid-publish.
 #[cfg(debug_assertions)]
 fn emulators_view<'a>(
     state: &'a ConfigureState,
     fleet: &'a [EmulatedPad],
-    pending: Option<&PendingEmulatorChange>,
+    pending: &[PendingEmulatorChange],
 ) -> Element<'a, ConfigureMessage> {
-    let selected = state.emulator_selected.min(fleet.len().saturating_sub(1));
+    let mut sections = Column::new().spacing(14).width(Fill);
 
-    let list: Element<'a, ConfigureMessage> = if fleet.is_empty() {
-        container(
-            text("No emulated controllers. Add one to drive the app without hardware.")
-                .size(13.0)
-                .color(theme::DIM),
-        )
-        .padding(16)
-        .width(Fill)
-        .style(theme::glass(theme::radius::MD))
-        .into()
-    } else {
-        group(
-            None,
-            fleet
-                .iter()
-                .enumerate()
-                .map(|(index, pad)| emulator_row(index, pad, index == selected))
-                .collect(),
-        )
-    };
-
-    let mut sections = Column::new().spacing(14).width(Fill).push(list).push(
-        row![space().width(Fill), add_pad_button()]
+    if fleet.is_empty() {
+        sections = sections.push(
+            container(
+                text("No emulated controllers. Add one to drive the app without hardware.")
+                    .size(13.0)
+                    .color(theme::DIM),
+            )
+            .padding(16)
             .width(Fill)
-            .align_y(Alignment::Center),
-    );
-    if let Some(pad) = fleet.get(selected) {
-        let pending_for_pad = pending.filter(|p| p.serial == pad.serial());
-        sections = sections.push(emulator_detail(pad, pending_for_pad));
+            .style(theme::glass(theme::radius::MD)),
+        );
+    } else {
+        for pad in fleet {
+            let expanded = state.expanded_emulators.contains(pad.serial());
+            let pad_pending = pending.iter().find(|p| p.serial == pad.serial());
+            sections = sections.push(emulator_row(pad, expanded, pad_pending));
+        }
     }
-    sections.into()
+
+    sections
+        .push(
+            row![space().width(Fill), add_pad_button()]
+                .width(Fill)
+                .align_y(Alignment::Center),
+        )
+        .into()
 }
 
 /// Indeterminate arc for a value that is previewed but not yet published.
@@ -1772,6 +1769,19 @@ fn pending_spinner<'a>(tick: u32) -> Element<'a, ConfigureMessage> {
         .into()
 }
 
+/// Disclosure chevron; rotated a quarter turn when the row is open.
+#[cfg(debug_assertions)]
+fn chevron<'a>(open: bool) -> Element<'a, ConfigureMessage> {
+    svg(svg::Handle::from_memory(svg_icon::CHEVRON_SVG.as_bytes()))
+        .width(Length::Fixed(14.0))
+        .height(Length::Fixed(14.0))
+        .rotation(if open { 90.0 } else { 0.0 })
+        .style(|_theme, _status| svg::Style {
+            color: Some(theme::DIM),
+        })
+        .into()
+}
+
 #[cfg(debug_assertions)]
 fn add_pad_button<'a>() -> Element<'a, ConfigureMessage> {
     button(text("+ Add controller").size(13.0))
@@ -1781,18 +1791,22 @@ fn add_pad_button<'a>() -> Element<'a, ConfigureMessage> {
         .into()
 }
 
-/// One pad in the list: connection switch, identity, link, state, and level.
+/// One pad: header row (disclosure, identity, level, connect switch) plus,
+/// when open, that pad's controls inline.
 #[cfg(debug_assertions)]
 fn emulator_row<'a>(
-    index: usize,
-    pad: &'a EmulatedPad,
-    selected: bool,
+    pad: &EmulatedPad,
+    expanded: bool,
+    pending: Option<&PendingEmulatorChange>,
 ) -> Element<'a, ConfigureMessage> {
     let serial = pad.serial().to_string();
     let toggle = toggler(pad.connected)
         .size(18.0)
-        .on_toggle(move |connected| {
-            ConfigureMessage::Emulator(EmulatorCommand::SetConnected(serial.clone(), connected))
+        .on_toggle({
+            let serial = serial.clone();
+            move |connected| {
+                ConfigureMessage::Emulator(EmulatorCommand::SetConnected(serial.clone(), connected))
+            }
         })
         .style(theme::toggle);
 
@@ -1806,14 +1820,15 @@ fn emulator_row<'a>(
         "off".to_string()
     };
 
-    // The switch sits *beside* the row button rather than inside it: nested
-    // pressables fight over the click and the outer button wins.
-    row![
+    let chevron_serial = serial.clone();
+    // The switch and the chevron sit *beside* the header button rather than
+    // inside it: nested pressables fight over the click and the outer wins.
+    let header = row![
         button(
             row![
+                chevron(expanded),
                 text(pad.serial().to_string())
                     .size(theme::type_scale::BODY)
-                    .font(if selected { semibold() } else { Font::DEFAULT })
                     .color(if pad.connected {
                         theme::INK
                     } else {
@@ -1827,66 +1842,84 @@ fn emulator_row<'a>(
                 text(format!("{}%", pad.status.percent))
                     .size(theme::type_scale::BODY)
                     .color(theme::MUTED),
-                container(space())
-                    .width(Length::Fixed(8.0))
-                    .height(Length::Fixed(14.0))
-                    .style(theme::nav_marker(selected)),
             ]
             .spacing(10)
             .align_y(Alignment::Center),
         )
         .padding([9, 10])
         .width(Fill)
-        .on_press(ConfigureMessage::SelectEmulator(index))
-        .style(theme::nav_item(selected)),
+        .on_press(ConfigureMessage::ToggleEmulator(chevron_serial))
+        .style(theme::nav_item(expanded)),
         toggle,
     ]
     .spacing(10)
     .align_y(Alignment::Center)
-    .width(Fill)
-    .into()
+    .width(Fill);
+
+    if !expanded {
+        return container(header)
+            .width(Fill)
+            .style(theme::glass(theme::radius::SM))
+            .into();
+    }
+
+    let controls = column![
+        battery_row(pad, pending),
+        state_row(pad),
+        connection_row(pad),
+        analytics_block(pad),
+        button(text("Remove controller").size(12.0))
+            .padding([6, 10])
+            .on_press(ConfigureMessage::Emulator(EmulatorCommand::RemovePad(
+                serial,
+            )))
+            .style(theme::danger),
+    ]
+    .spacing(12)
+    .padding(iced::Padding {
+        top: 4.0,
+        right: 12.0,
+        bottom: 12.0,
+        left: 12.0,
+    })
+    .width(Fill);
+
+    container(column![header, controls].spacing(0).width(Fill))
+        .width(Fill)
+        .style(theme::glass(theme::radius::SM))
+        .into()
 }
 
-/// Per-pad editor: connection, battery level, charge state, link, analytics.
+/// Battery slider, snapped to the levels a DualSense reports.
+///
+/// A connected pad debounces publication by a second (so a drag cannot spam
+/// preference-driven toasts or Start opens) and spins while it waits; a
+/// disconnected pad has nothing to publish to, so it applies immediately.
 #[cfg(debug_assertions)]
-fn emulator_detail<'a>(
-    pad: &'a EmulatedPad,
+fn battery_row<'a>(
+    pad: &EmulatedPad,
     pending: Option<&PendingEmulatorChange>,
 ) -> Element<'a, ConfigureMessage> {
-    let serial = pad.serial().to_string();
-    let mut rows = vec![toggle_row(
-        "Connected",
-        Some("Off pads stay remembered but are not published to the app"),
-        pad.connected,
-        move |connected| {
-            ConfigureMessage::Emulator(EmulatorCommand::SetConnected(serial.clone(), connected))
-        },
-    )];
-
-    // Battery slider snaps to the levels a DualSense actually reports. Dragging
-    // previews; the daemon debounces publication by a second (so a drag cannot
-    // spam preference-driven toasts or Start opens) and spins while it waits.
     let level = crate::controller::dualsense::battery::level_from_percent(pad.status.percent);
     let preview_serial = pad.serial().to_string();
-    rows.push(slider_row(
-        "Battery",
-        match pending {
-            Some(p) => format!("{}% · applying…", p.percent),
-            None => format!("{}%", pad.status.percent),
-        },
-        slider(0.0..=MAX_EMU_LEVEL as f32, level as f32, move |value| {
-            ConfigureMessage::Emulator(EmulatorCommand::PreviewPercent(
-                preview_serial.clone(),
-                crate::controller::dualsense::battery::percent_from_level(
-                    value.round() as u8,
-                    PowerState::Discharging,
-                ),
-            ))
-        })
-        .step(1.0_f32)
-        .style(theme::slider),
-    ));
+    let slider = slider(0.0..=MAX_EMU_LEVEL as f32, level as f32, move |value| {
+        ConfigureMessage::Emulator(EmulatorCommand::PreviewPercent(
+            preview_serial.clone(),
+            crate::controller::dualsense::battery::percent_from_level(
+                value.round() as u8,
+                PowerState::Discharging,
+            ),
+        ))
+    })
+    .step(1.0_f32)
+    .style(theme::slider);
 
+    let label = match pending {
+        Some(p) => format!("{}% · applying…", p.percent),
+        None => format!("{}%", pad.status.percent),
+    };
+
+    let mut rows = vec![slider_row("Battery", label, slider)];
     if let Some(p) = pending {
         rows.push(
             row![
@@ -1901,91 +1934,90 @@ fn emulator_detail<'a>(
             .into(),
         );
     }
+    Column::with_children(rows).spacing(12).width(Fill).into()
+}
 
-    let mut state_options = Vec::new();
+/// Exclusive choice chips (charge state, connection).
+#[cfg(debug_assertions)]
+fn state_row<'a>(pad: &EmulatedPad) -> Element<'a, ConfigureMessage> {
+    let mut options = Vec::new();
     for option in [
         PowerState::Discharging,
         PowerState::Charging,
         PowerState::Complete,
     ] {
-        let value_serial = pad.serial().to_string();
-        state_options.push(
+        let serial = pad.serial().to_string();
+        options.push(
             button(text(power_state_label(option)).size(12.0))
                 .padding([6, 10])
                 .on_press(ConfigureMessage::Emulator(EmulatorCommand::SetState(
-                    value_serial,
-                    option,
+                    serial, option,
                 )))
                 .style(theme::chip(option == pad.status.state))
                 .into(),
         );
     }
-    rows.push(segmented_row("Charge state", state_options));
+    segmented_row("Charge state", options)
+}
 
-    let mut link_options = Vec::new();
+#[cfg(debug_assertions)]
+fn connection_row<'a>(pad: &EmulatedPad) -> Element<'a, ConfigureMessage> {
+    let mut options = Vec::new();
     for option in [Connection::Usb, Connection::Bluetooth] {
-        let value_serial = pad.serial().to_string();
-        link_options.push(
+        let serial = pad.serial().to_string();
+        options.push(
             button(text(option.as_str()).size(12.0))
                 .padding([6, 10])
                 .on_press(ConfigureMessage::Emulator(EmulatorCommand::SetConnection(
-                    value_serial,
-                    option,
+                    serial, option,
                 )))
                 .style(theme::chip(option == pad.status.connection))
                 .into(),
         );
     }
-    rows.push(segmented_row("Connection", link_options));
+    segmented_row("Connection", options)
+}
 
+/// Battery-analytics actions for one pad.
+#[cfg(debug_assertions)]
+fn analytics_block<'a>(pad: &EmulatedPad) -> Element<'a, ConfigureMessage> {
     let seed_serial = pad.serial().to_string();
     let charge_serial = pad.serial().to_string();
     let drain_serial = pad.serial().to_string();
-    let remove_serial = pad.serial().to_string();
-    rows.push(
-        column![
-            text("Battery analytics")
-                .size(theme::type_scale::CAPTION + 1.0)
-                .font(semibold())
-                .color(theme::DIM),
-            text("Seed fills typical charge and play samples; each step credits active time and walks the cycle.")
-                .size(11.0)
-                .color(theme::DIM),
-            row![
-                button(text("Seed estimates").size(12.0))
-                    .padding([6, 10])
-                    .on_press(ConfigureMessage::Emulator(EmulatorCommand::SeedAnalytics(
-                        seed_serial,
-                    )))
-                    .style(theme::secondary),
-                button(text("Charge +15m").size(12.0))
-                    .padding([6, 10])
-                    .on_press(ConfigureMessage::Emulator(EmulatorCommand::StepCharge(
-                        charge_serial,
-                    )))
-                    .style(theme::secondary),
-                button(text("Drain +25m").size(12.0))
-                    .padding([6, 10])
-                    .on_press(ConfigureMessage::Emulator(EmulatorCommand::StepDrain(
-                        drain_serial,
-                    )))
-                    .style(theme::secondary),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-            button(text("Remove controller").size(12.0))
+    column![
+        text("Battery analytics")
+            .size(theme::type_scale::CAPTION + 1.0)
+            .font(semibold())
+            .color(theme::DIM),
+        text("Seed fills typical charge and play samples; each step credits active time and walks the cycle.")
+            .size(11.0)
+            .color(theme::DIM),
+        row![
+            button(text("Seed estimates").size(12.0))
                 .padding([6, 10])
-                .on_press(ConfigureMessage::Emulator(EmulatorCommand::RemovePad(
-                    remove_serial,
+                .on_press(ConfigureMessage::Emulator(EmulatorCommand::SeedAnalytics(
+                    seed_serial,
                 )))
-                .style(theme::danger),
+                .style(theme::secondary),
+            button(text("Charge +15m").size(12.0))
+                .padding([6, 10])
+                .on_press(ConfigureMessage::Emulator(EmulatorCommand::StepCharge(
+                    charge_serial,
+                )))
+                .style(theme::secondary),
+            button(text("Drain +25m").size(12.0))
+                .padding([6, 10])
+                .on_press(ConfigureMessage::Emulator(EmulatorCommand::StepDrain(
+                    drain_serial,
+                )))
+                .style(theme::secondary),
         ]
-        .spacing(6)
-        .width(Fill)
-        .into(),
-    );
-
-    group(Some(format!("Emulating {}", pad.serial())), rows)
+        .spacing(8)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(6)
+    .width(Fill)
+    .into()
 }
 
 /// Highest battery level the DualSense reports (10 → 100%).
@@ -2073,45 +2105,34 @@ mod tests {
         // Controllers tab composes without panicking.
         let mut state = ConfigureState::new(BatterySpectrum::default_spectrum());
         let empty: [EmulatedPad; 0] = [];
-        let on = EmulatedPad {
+        let pad = |serial: &str, connected: bool, percent: u8| EmulatedPad {
             status: crate::controller::dualsense::battery::dualsense_status(
                 1,
                 "DualSense",
                 Connection::Usb,
-                "emu-1".into(),
-                50,
+                serial.to_string(),
+                percent,
                 PowerState::Discharging,
             ),
-            connected: true,
+            connected,
         };
-        let off = EmulatedPad {
-            status: crate::controller::dualsense::battery::dualsense_status(
-                2,
-                "DualSense",
-                Connection::Bluetooth,
-                "emu-2".into(),
-                100,
-                PowerState::Complete,
-            ),
-            connected: false,
-        };
-        let fleet = [on, off];
-
-        // Empty fleet shows the hint; out-of-range selection clamps rather than
-        // panicking on the detail card.
-        for selected in [0, 1, 99] {
-            state.emulator_selected = selected;
-            drop(emulators_view(&state, &empty, None));
-            drop(emulators_view(&state, &fleet, None));
-        }
-        // A pending change renders the spinner + "applying" state.
-        let pending = PendingEmulatorChange {
+        let fleet = [pad("emu-1", true, 50), pad("emu-2", false, 100)];
+        let pending = [PendingEmulatorChange {
             serial: "emu-1".into(),
             percent: 75,
             tick: 3,
-        };
-        state.emulator_selected = 0;
-        drop(emulators_view(&state, &fleet, Some(&pending)));
+        }];
+
+        // Empty fleet shows the hint; rows build collapsed, expanded, and
+        // mid-debounce alike.
+        drop(emulators_view(&state, &empty, &[]));
+        drop(emulators_view(&state, &fleet, &[]));
+        drop(emulators_view(&state, &fleet, &pending));
+        state.expanded_emulators.insert("emu-1".into());
+        drop(emulators_view(&state, &fleet, &[]));
+        // An unknown expansion is simply not drawn.
+        state.expanded_emulators.insert("emu-9".into());
+        drop(emulators_view(&state, &fleet, &pending));
     }
 
     #[test]

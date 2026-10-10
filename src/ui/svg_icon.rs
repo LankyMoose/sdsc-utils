@@ -26,6 +26,9 @@ pub const MICROSOFT_STORE_SVG: &str = include_str!("../../assets/icons/microsoft
 /// Indeterminate arc; rotated by [`crate::ui::configure`] for pending states.
 #[allow(dead_code)] // debug-only pending indicator
 pub const SPINNER_SVG: &str = include_str!("../../assets/icons/spinner.svg");
+/// Disclosure chevron; rotated 90° when a row is expanded.
+#[allow(dead_code)] // debug-only disclosure control
+pub const CHEVRON_SVG: &str = include_str!("../../assets/icons/chevron.svg");
 
 /// Canonical DualSense body fill in [`DUALSENSE_SVG`].
 pub const BODY_HEX: &str = "#EBEBF0";

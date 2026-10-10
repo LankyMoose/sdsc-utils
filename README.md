@@ -131,7 +131,7 @@ cargo run
 
 That unlocks a **Developer mode** group in the **Configure** window — separated from the shipped settings by a caption — containing:
 
-- **Controllers** — the emulated fleet. New pads are created remembered but **disconnected**, so adding one is quiet; the per-pad switch (in the row or the detail card) plugs them in and out through the normal connect/disconnect path, so toasts and the Start-open preference fire exactly as they would for real hardware. Per pad you can also set the battery level (snapped to the levels a DualSense actually reports; changes apply after a one-second pause, marked by a spinner), charge state and connection, and drive battery analytics (seed estimates, or walk the charge/drain cycle with active time credited).
+- **Controllers** — the emulated fleet, one row per pad. New pads are created remembered but **disconnected**, so adding one is quiet; the per-pad switch plugs them in and out through the normal connect/disconnect path, so toasts and the Start-open preference fire exactly as they would for real hardware. The chevron expands a row's controls inline — battery level (snapped to the levels a DualSense actually reports; a connected pad applies changes after a one-second pause marked by a spinner), charge state, connection, battery analytics (seed estimates, or walk the charge/drain cycle), and remove.
 - **Pad input** — live DualSense/gamepad readings.
 - **Diagnostics** — renderer stress test.
 
