@@ -19,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Lightbar spectrum editor bars and handles are rounded; the saturation square has rounded corners.
 - Remember is now a pin toggle icon in the popup row.
-- The developer emulator and other debug-only tooling ship in every non-release build (`cfg(debug_assertions)`) instead of behind the `dev-emulate` Cargo feature or a `--dev` flag — a plain `cargo run` now has the Configure → Developer section. Release builds still exclude it.
+- The developer emulator and other debug-only tooling ship in every non-release build (`cfg(debug_assertions)`) instead of behind the `dev-emulate` Cargo feature or a `--dev` flag — a plain `cargo run` now has the Configure → Controllers section. Release builds still exclude it.
+- Configure's debug tools move under a **Developer mode** caption so they are clearly separated from the shipped settings.
+- **Developer mode:** the Developer tab is now **Controllers**, with a live list of emulated controllers you can add, remove, and drive per pad: battery level slider, charge-state and connection pickers, and battery-analytics actions (seed estimates, walk the charge/drain cycle). Commands address pads by serial, so an action can never land on the wrong pad.
 - Horizontal immersive Start centers every cover by its art (neighbors no longer ride above the selection) and fades neighbors to transparent instead of grey.
 
 ### Fixed

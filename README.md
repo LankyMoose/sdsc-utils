@@ -129,7 +129,13 @@ For testing notifications without real hardware, just run a debug build:
 cargo run
 ```
 
-That unlocks a **Developer** section in the **Configure** window with emulated controller presets (low battery, charging, fully charged, etc.) and **battery analytics** presets (seed estimates, plug/charge/drain/pause/resume steps with time fast-forward). The emulator is compiled into every non-release build, so there is no flag to pass; release binaries (`cargo build --release`) never include it.
+That unlocks a **Developer mode** group in the **Configure** window — separated from the shipped settings by a caption — containing:
+
+- **Controllers** — the live list of emulated controllers. Add one, remove it, set its battery level, pick its charge state and connection, and drive battery analytics for that pad (seed estimates, or walk the charge/drain cycle with active time credited).
+- **Pad input** — live DualSense/gamepad readings.
+- **Diagnostics** — renderer stress test.
+
+The emulator is compiled into every non-release build, so there is no flag to pass; release binaries (`cargo build --release`) never include it.
 
 ### CLI
 

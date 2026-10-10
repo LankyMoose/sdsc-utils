@@ -10,7 +10,7 @@ use coverage::CoverageChart;
 use spectrum::{BAR_HEIGHT, HUE_HEIGHT, HueBar, SV_HEIGHT, SpectrumBar, SvSquare};
 
 #[cfg(debug_assertions)]
-use crate::controller::emulate::Preset;
+use crate::controller::model::{Connection, PowerState};
 use crate::games::steam::LAST_KNOWN_COMPATIBLE_STEAM_VERSION;
 use crate::persist::analytics::{
     BucketDirection, ControllerAnalytics, InProgressBucket, StepCoverage, format_duration_short,
@@ -94,9 +94,9 @@ pub enum Section {
     /// (see [`Section::all`]), but the variant exists in both so the pad-input
     /// view stays reachable from code and tests.
     PadInput,
-    /// Debug-only emulated controllers + analytics presets.
+    /// Debug-only emulated controllers.
     #[cfg(debug_assertions)]
-    Developer,
+    Emulators,
     /// Debug-only renderer diagnostics (window stress test).
     #[cfg(debug_assertions)]
     Diagnostics,
@@ -112,7 +112,7 @@ impl Section {
             Self::Analytics => "Analytics",
             Self::PadInput => "Pad input",
             #[cfg(debug_assertions)]
-            Self::Developer => "Developer",
+            Self::Emulators => "Controllers",
             #[cfg(debug_assertions)]
             Self::Diagnostics => "Diagnostics",
         }
@@ -127,13 +127,26 @@ impl Section {
             Self::Analytics => "Learned charge and play times",
             Self::PadInput => "Live controller readings",
             #[cfg(debug_assertions)]
-            Self::Developer => "Emulated controllers and analytics",
+            Self::Emulators => "Emulated controllers",
             #[cfg(debug_assertions)]
             Self::Diagnostics => "Renderer stress testing",
         }
     }
 
-    /// Sidebar sections. `PadInput` / `Developer` / `Diagnostics` are
+    /// Compiled out of release builds; the sidebar labels the group.
+    fn is_debug_only(self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            matches!(self, Self::PadInput | Self::Emulators | Self::Diagnostics)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = self;
+            false
+        }
+    }
+
+    /// Sidebar sections. `PadInput` / `Emulators` / `Diagnostics` are
     /// debug-only and compiled out of release builds entirely.
     fn all() -> Vec<Self> {
         #[cfg(debug_assertions)]
@@ -145,7 +158,7 @@ impl Section {
                 Self::Lightbar,
                 Self::Analytics,
                 Self::PadInput,
-                Self::Developer,
+                Self::Emulators,
                 Self::Diagnostics,
             ]
         }
@@ -197,6 +210,45 @@ pub struct ConfigureSettings {
     pub autostart: bool,
     pub extra_steam_paths: Vec<PathBuf>,
     pub steam_path_error: Option<String>,
+}
+
+/// Live emulated-pad snapshot for the Controllers debug tab.
+///
+/// Rebuilt from the session each frame, so it always reflects what the rest of
+/// the app sees. Commands address a pad by serial, never by row index, so a
+/// concurrent removal cannot retarget an action.
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EmulatorsPanel {
+    pub pads: Vec<EmulatorPad>,
+}
+
+/// One emulated DualSense as the session currently reports it.
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmulatorPad {
+    pub serial: String,
+    pub percent: u8,
+    pub state: PowerState,
+    pub connection: Connection,
+}
+
+/// Edit applied to the emulated pad set (Controllers debug tab).
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmulatorCommand {
+    /// Spawn a new pad on the lowest free slot.
+    AddPad,
+    RemovePad(String),
+    SetPercent(String, u8),
+    SetState(String, PowerState),
+    SetConnection(String, Connection),
+    /// Seed typical charge/play samples so ETA estimates exist.
+    SeedAnalytics(String),
+    /// Credit active time and walk one step up the charge cycle.
+    StepCharge(String),
+    /// Credit active time and walk one step down the drain cycle.
+    StepDrain(String),
 }
 
 /// Live DualSense / gamepad readings for the Pad input debug tab.
@@ -287,7 +339,10 @@ pub enum ConfigureMessage {
     SaturationValueChanged(f32, f32),
     ResetSpectrum,
     #[cfg(debug_assertions)]
-    DeveloperPreset(Preset),
+    Emulator(EmulatorCommand),
+    /// Select a pad row in the Controllers tab.
+    #[cfg(debug_assertions)]
+    SelectEmulator(usize),
     /// Debug-only: start the renderer window stress test (Diagnostics section).
     #[cfg(debug_assertions)]
     RunWindowStress,
@@ -308,6 +363,9 @@ pub struct ConfigureState {
     pub error: Option<String>,
     pub show_changelog: bool,
     pub steam_path_error: Option<String>,
+    /// Selected emulated pad (Controllers tab); clamped to the pad list.
+    #[cfg(debug_assertions)]
+    pub emulator_selected: usize,
 }
 
 impl ConfigureState {
@@ -322,6 +380,8 @@ impl ConfigureState {
             error: None,
             show_changelog: false,
             steam_path_error: None,
+            #[cfg(debug_assertions)]
+            emulator_selected: 0,
         };
         state.sync_hsv();
         state
@@ -497,6 +557,7 @@ pub fn view<'a>(
     settings: &ConfigureSettings,
     analytics: &'a AnalyticsPanel,
     pad_input: &'a PadInputPanel,
+    #[cfg(debug_assertions)] emulators: &'a EmulatorsPanel,
 ) -> Element<'a, ConfigureMessage> {
     // Section heading doubles as the drag handle for the undecorated window.
     let heading = mouse_area(
@@ -584,7 +645,19 @@ pub fn view<'a>(
         .width(Fill)
         .height(Fill)
         .into(),
-        _ => scroll(section_content(state, settings, analytics, pad_input)).into(),
+        _ => {
+            #[cfg(debug_assertions)]
+            {
+                scroll(section_content(
+                    state, settings, analytics, pad_input, emulators,
+                ))
+                .into()
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                scroll(section_content(state, settings, analytics, pad_input)).into()
+            }
+        }
     };
 
     let content = column![
@@ -698,10 +771,26 @@ fn sidebar<'a>(active: Section) -> Element<'a, ConfigureMessage> {
     .on_press(ConfigureMessage::DragWindow)
     .interaction(mouse::Interaction::Grab);
 
+    // Debug-only tabs are grouped under one caption so a debug build never reads
+    // as if the tools ship to users.
+    let mut labeled = false;
     let tabs =
         Section::all()
             .into_iter()
             .fold(Column::new().spacing(2).width(Fill), |list, section| {
+                let list = if section.is_debug_only() && !labeled {
+                    #[cfg(debug_assertions)]
+                    {
+                        list.push(debug_group_label())
+                    }
+                    #[cfg(not(debug_assertions))]
+                    {
+                        list
+                    }
+                } else {
+                    list
+                };
+                labeled |= section.is_debug_only();
                 let selected = active == section;
                 list.push(
                     button(
@@ -731,13 +820,32 @@ fn sidebar<'a>(active: Section) -> Element<'a, ConfigureMessage> {
         .into()
 }
 
+/// Caption separating the shipped tabs from the debug-only tools below it.
+#[cfg(debug_assertions)]
+fn debug_group_label<'a>() -> Element<'a, ConfigureMessage> {
+    container(
+        text("Developer mode")
+            .size(theme::type_scale::CAPTION)
+            .font(semibold())
+            .color(theme::DIM),
+    )
+    .padding(iced::Padding {
+        top: 10.0,
+        right: 0.0,
+        bottom: 4.0,
+        left: 10.0,
+    })
+    .width(Fill)
+    .into()
+}
+
 // ---------------------------------------------------------------------------
 // Settings rows & groups
 // ---------------------------------------------------------------------------
 
 /// Glass card holding related rows, with an optional caption above it.
 fn group<'a>(
-    caption: Option<&'static str>,
+    caption: Option<String>,
     rows: Vec<Element<'a, ConfigureMessage>>,
 ) -> Element<'a, ConfigureMessage> {
     let card = container(Column::with_children(rows).spacing(14).width(Fill))
@@ -834,6 +942,7 @@ fn section_content<'a>(
     settings: &ConfigureSettings,
     analytics: &'a AnalyticsPanel,
     pad_input: &'a PadInputPanel,
+    #[cfg(debug_assertions)] emulators: &'a EmulatorsPanel,
 ) -> Element<'a, ConfigureMessage> {
     match state.section {
         Section::System => system_settings_view(settings),
@@ -843,7 +952,7 @@ fn section_content<'a>(
         Section::Analytics => analytics_view(settings, analytics),
         Section::PadInput => pad_input_view(pad_input),
         #[cfg(debug_assertions)]
-        Section::Developer => developer_view(),
+        Section::Emulators => emulators_view(state, emulators),
         #[cfg(debug_assertions)]
         Section::Diagnostics => diagnostics_view(),
     }
@@ -852,7 +961,7 @@ fn section_content<'a>(
 #[cfg(debug_assertions)]
 fn diagnostics_view<'a>() -> Element<'a, ConfigureMessage> {
     group(
-        Some("Renderer stress test"),
+        Some("Renderer stress test".to_string()),
         vec![
             note(
                 "Runs rapid toast + cold Start + configure + edit churn (the wgpu atlas-crash shape) for about a minute to shake out renderer crashes. Takes over window open/close while running — don't drive the UI at the same time, then check app.log for PANIC lines.",
@@ -881,7 +990,7 @@ fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, Configu
     };
 
     let data = group(
-        Some("Data"),
+        Some("Data".to_string()),
         vec![
             note("Preferences, remembered controllers, analytics, and logs stay on this PC."),
             action_button("Open data folder", ConfigureMessage::OpenDataFolder),
@@ -892,7 +1001,7 @@ fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, Configu
     if startup.is_empty() {
         data
     } else {
-        column![group(Some("Startup"), startup), data]
+        column![group(Some("Startup".to_string()), startup), data]
             .spacing(18)
             .width(Fill)
             .into()
@@ -1007,7 +1116,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             .into(),
         );
     }
-    groups = groups.push(group(Some("Opening"), opening));
+    groups = groups.push(group(Some("Opening".to_string()), opening));
 
     if settings.start_screen_enabled {
         let mut immersive = vec![
@@ -1107,7 +1216,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             .step(5.0_f32)
             .style(theme::slider),
         ));
-        groups = groups.push(group(Some("Immersive"), immersive));
+        groups = groups.push(group(Some("Immersive".to_string()), immersive));
 
         let mut feedback = vec![toggle_row(
             "UI sounds",
@@ -1145,7 +1254,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
                 .style(theme::slider),
             ));
         }
-        groups = groups.push(group(Some("Feedback"), feedback));
+        groups = groups.push(group(Some("Feedback".to_string()), feedback));
     }
 
     groups = groups.push(
@@ -1179,7 +1288,10 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         library_rows.push(note(err.clone()));
     }
     library_rows.push(action_button("Add folder…", ConfigureMessage::AddSteamPath));
-    groups = groups.push(group(Some("Extra Steam libraries"), library_rows));
+    groups = groups.push(group(
+        Some("Extra Steam libraries".to_string()),
+        library_rows,
+    ));
 
     groups.into()
 }
@@ -1203,7 +1315,7 @@ fn notifications_view<'a>(
         };
 
     let connection = group(
-        Some("Connection"),
+        Some("Connection".to_string()),
         vec![
             toggle(
                 "Connected",
@@ -1247,12 +1359,12 @@ fn notifications_view<'a>(
         NotificationSetting::Charged,
     ));
 
-    let mut items = column![connection, group(Some("Battery"), battery_rows)]
+    let mut items = column![connection, group(Some("Battery".to_string()), battery_rows)]
         .spacing(18)
         .width(Fill);
     if any_notification_enabled(settings) {
         items = items.push(group(
-            Some("Toast position"),
+            Some("Toast position".to_string()),
             vec![toast_position_view(settings, accent)],
         ));
     }
@@ -1514,10 +1626,10 @@ fn lightbar_view<'a>(
     if let Some(error) = state.error.as_deref() {
         gradient.push(text(error).size(12.0).color(theme::WARNING).into());
     }
-    content = content.push(group(Some("Gradient"), gradient));
+    content = content.push(group(Some("Gradient".to_string()), gradient));
 
     content = content.push(group(
-        Some("Selected stop color"),
+        Some("Selected stop color".to_string()),
         vec![
             sv.into(),
             hue.into(),
@@ -1592,54 +1704,229 @@ fn pad_input_view<'a>(panel: &'a PadInputPanel) -> Element<'a, ConfigureMessage>
     items.into()
 }
 
+/// Controllers tab (debug only): the live emulated-pad list plus per-pad
+/// controls. Rows address pads by serial; the detail card edits whichever pad
+/// `state.emulator_selected` points at.
 #[cfg(debug_assertions)]
-fn developer_view<'a>() -> Element<'a, ConfigureMessage> {
-    let mut list = Column::new().spacing(4).width(Fill);
+fn emulators_view<'a>(
+    state: &'a ConfigureState,
+    panel: &'a EmulatorsPanel,
+) -> Element<'a, ConfigureMessage> {
+    let selected = state
+        .emulator_selected
+        .min(panel.pads.len().saturating_sub(1));
 
-    list = list.push(text("Controllers").size(12.0).color(theme::DIM));
-    for preset in [
-        Preset::Discharging50,
-        Preset::LowBattery,
-        Preset::Charging,
-        Preset::FullyCharged,
-        Preset::ChargeCompleteStep,
-        Preset::TwoPads,
-        Preset::Clear,
-    ] {
-        list = list.push(dev_preset_button(preset));
-    }
+    let list: Element<'a, ConfigureMessage> = if panel.pads.is_empty() {
+        container(
+            text("No emulated controllers. Add one to drive the app without hardware.")
+                .size(13.0)
+                .color(theme::DIM),
+        )
+        .padding(16)
+        .width(Fill)
+        .style(theme::glass(theme::radius::MD))
+        .into()
+    } else {
+        group(
+            None,
+            panel
+                .pads
+                .iter()
+                .enumerate()
+                .map(|(index, pad)| emulator_row(index, pad, index == selected))
+                .collect(),
+        )
+    };
 
-    list = list.push(space().height(Length::Fixed(6.0)));
-    list = list.push(text("Battery analytics").size(12.0).color(theme::DIM));
-    list = list.push(
-        text("Enable is toggled on automatically. Seed shows est. in the ring; other steps walk a timed cycle.")
-            .size(11.0)
-            .color(theme::DIM),
+    let mut sections = Column::new().spacing(14).width(Fill).push(list).push(
+        row![space().width(Fill), add_pad_button()]
+            .width(Fill)
+            .align_y(Alignment::Center),
     );
-    for preset in [
-        Preset::AnalyticsSeedEstimates,
-        Preset::AnalyticsPlugEmpty,
-        Preset::AnalyticsChargeAdvance,
-        Preset::AnalyticsUnplugFull,
-        Preset::AnalyticsDrainAdvance,
-        Preset::AnalyticsPause,
-        Preset::AnalyticsResume,
-        Preset::AnalyticsPlugMidDrain,
-    ] {
-        list = list.push(dev_preset_button(preset));
+    if let Some(pad) = panel.pads.get(selected) {
+        sections = sections.push(emulator_detail(pad));
     }
-
-    list.into()
+    sections.into()
 }
 
 #[cfg(debug_assertions)]
-fn dev_preset_button<'a>(preset: Preset) -> Element<'a, ConfigureMessage> {
-    button(text(preset.menu_label()).size(13.0).width(Fill))
-        .padding([7, 10])
-        .width(Fill)
-        .on_press(ConfigureMessage::DeveloperPreset(preset))
-        .style(theme::secondary)
+fn add_pad_button<'a>() -> Element<'a, ConfigureMessage> {
+    button(text("+ Add controller").size(13.0))
+        .padding([7, 14])
+        .on_press(ConfigureMessage::Emulator(EmulatorCommand::AddPad))
+        .style(theme::primary)
         .into()
+}
+
+/// One pad in the list: identity, link, charge state, and level.
+#[cfg(debug_assertions)]
+fn emulator_row<'a>(
+    index: usize,
+    pad: &'a EmulatorPad,
+    selected: bool,
+) -> Element<'a, ConfigureMessage> {
+    let meta = format!("{} · {}", pad.connection.as_str(), pad.state.as_str());
+    button(
+        row![
+            text(pad.serial.clone())
+                .size(theme::type_scale::BODY)
+                .font(if selected { semibold() } else { Font::DEFAULT })
+                .color(theme::INK)
+                .width(Length::Fixed(64.0)),
+            text(meta)
+                .size(theme::type_scale::META)
+                .color(theme::DIM)
+                .width(Fill),
+            text(format!("{}%", pad.percent))
+                .size(theme::type_scale::BODY)
+                .color(theme::MUTED),
+            container(space())
+                .width(Length::Fixed(8.0))
+                .height(Length::Fixed(14.0))
+                .style(theme::nav_marker(selected)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .padding([9, 10])
+    .width(Fill)
+    .on_press(ConfigureMessage::SelectEmulator(index))
+    .style(theme::nav_item(selected))
+    .into()
+}
+
+/// Per-pad editor: battery level, charge state, link, and analytics actions.
+#[cfg(debug_assertions)]
+fn emulator_detail<'a>(pad: &'a EmulatorPad) -> Element<'a, ConfigureMessage> {
+    let serial = pad.serial.clone();
+    let mut rows = vec![slider_row(
+        "Battery",
+        format!("{}%", pad.percent),
+        slider(0.0..=100.0, f32::from(pad.percent), move |value| {
+            ConfigureMessage::Emulator(EmulatorCommand::SetPercent(
+                serial.clone(),
+                value.round() as u8,
+            ))
+        })
+        .step(1.0_f32)
+        .style(theme::slider),
+    )];
+
+    let mut state_options = Vec::new();
+    for option in [
+        PowerState::Discharging,
+        PowerState::Charging,
+        PowerState::Complete,
+    ] {
+        let value_serial = pad.serial.clone();
+        state_options.push(
+            button(text(power_state_label(option)).size(12.0))
+                .padding([6, 10])
+                .on_press(ConfigureMessage::Emulator(EmulatorCommand::SetState(
+                    value_serial,
+                    option,
+                )))
+                .style(theme::chip(option == pad.state))
+                .into(),
+        );
+    }
+    rows.push(segmented_row("Charge state", state_options));
+
+    let mut link_options = Vec::new();
+    for option in [Connection::Usb, Connection::Bluetooth] {
+        let value_serial = pad.serial.clone();
+        link_options.push(
+            button(text(option.as_str()).size(12.0))
+                .padding([6, 10])
+                .on_press(ConfigureMessage::Emulator(EmulatorCommand::SetConnection(
+                    value_serial,
+                    option,
+                )))
+                .style(theme::chip(option == pad.connection))
+                .into(),
+        );
+    }
+    rows.push(segmented_row("Connection", link_options));
+
+    let seed_serial = pad.serial.clone();
+    let charge_serial = pad.serial.clone();
+    let drain_serial = pad.serial.clone();
+    let remove_serial = pad.serial.clone();
+    rows.push(
+        column![
+            text("Battery analytics")
+                .size(theme::type_scale::CAPTION + 1.0)
+                .font(semibold())
+                .color(theme::DIM),
+            text("Seed fills typical charge and play samples; each step credits active time and walks the cycle.")
+                .size(11.0)
+                .color(theme::DIM),
+            row![
+                button(text("Seed estimates").size(12.0))
+                    .padding([6, 10])
+                    .on_press(ConfigureMessage::Emulator(EmulatorCommand::SeedAnalytics(
+                        seed_serial,
+                    )))
+                    .style(theme::secondary),
+                button(text("Charge +15m").size(12.0))
+                    .padding([6, 10])
+                    .on_press(ConfigureMessage::Emulator(EmulatorCommand::StepCharge(
+                        charge_serial,
+                    )))
+                    .style(theme::secondary),
+                button(text("Drain +25m").size(12.0))
+                    .padding([6, 10])
+                    .on_press(ConfigureMessage::Emulator(EmulatorCommand::StepDrain(
+                        drain_serial,
+                    )))
+                    .style(theme::secondary),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            button(text("Remove controller").size(12.0))
+                .padding([6, 10])
+                .on_press(ConfigureMessage::Emulator(EmulatorCommand::RemovePad(
+                    remove_serial,
+                )))
+                .style(theme::danger),
+        ]
+        .spacing(6)
+        .width(Fill)
+        .into(),
+    );
+
+    group(Some(format!("Emulating {}", pad.serial)), rows)
+}
+
+#[cfg(debug_assertions)]
+fn power_state_label(state: PowerState) -> &'static str {
+    match state {
+        PowerState::Discharging => "Discharging",
+        PowerState::Charging => "Charging",
+        PowerState::Complete => "Full",
+        _ => "Other",
+    }
+}
+
+/// Label above a row of exclusive choice chips.
+#[cfg(debug_assertions)]
+fn segmented_row<'a>(
+    label: &'static str,
+    options: Vec<Element<'a, ConfigureMessage>>,
+) -> Element<'a, ConfigureMessage> {
+    column![
+        text(label)
+            .size(theme::type_scale::BODY)
+            .color(theme::INK)
+            .width(Fill),
+        Row::with_children(options)
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .width(Fill),
+    ]
+    .spacing(8)
+    .width(Fill)
+    .into()
 }
 
 // ---------------------------------------------------------------------------
@@ -1649,20 +1936,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sidebar_lists_developer_sections_in_debug_builds_only() {
+    fn sidebar_groups_debug_sections_last_in_debug_builds_only() {
         // No flag, no pref: the sidebar follows the build profile, so a plain
         // `cargo run` already exposes the emulator.
         let sections = Section::all();
         assert!(sections.contains(&Section::PadInput));
         #[cfg(debug_assertions)]
         {
-            assert!(sections.contains(&Section::Developer));
+            assert!(sections.contains(&Section::Emulators));
             assert!(sections.contains(&Section::Diagnostics));
+            // Debug tools sit after everything a release build ships, and the
+            // group is contiguous so the "Developer mode" caption labels once.
+            let shipped = [
+                Section::System,
+                Section::StartScreen,
+                Section::Notifications,
+                Section::Lightbar,
+                Section::Analytics,
+            ];
+            let first_debug = sections
+                .iter()
+                .position(|s| s.is_debug_only())
+                .expect("debug tabs present");
+            assert_eq!(&sections[..first_debug], &shipped[..]);
+            assert!(
+                sections[first_debug..].iter().all(|s| s.is_debug_only()),
+                "debug group must be contiguous: {sections:?}"
+            );
+            assert_eq!(first_debug, shipped.len());
         }
         #[cfg(not(debug_assertions))]
         {
             // Release compiles the variants out; the list must not name them.
             assert!(sections.len() == 5, "sections={sections:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn emulators_view_builds_for_empty_and_populated_panels() {
+        // Building the element tree is the only offline check that the new
+        // Controllers tab composes without panicking.
+        let mut state = ConfigureState::new(BatterySpectrum::default_spectrum());
+        let empty = EmulatorsPanel::default();
+        let panel = EmulatorsPanel {
+            pads: vec![
+                EmulatorPad {
+                    serial: "emu-1".into(),
+                    percent: 50,
+                    state: PowerState::Discharging,
+                    connection: Connection::Usb,
+                },
+                EmulatorPad {
+                    serial: "emu-2".into(),
+                    percent: 100,
+                    state: PowerState::Complete,
+                    connection: Connection::Bluetooth,
+                },
+            ],
+        };
+
+        // Empty list shows the hint instead of a detail card; out-of-range
+        // selection clamps rather than panicking.
+        for selected in [0, 1, 99] {
+            state.emulator_selected = selected;
+            drop(emulators_view(&state, &empty));
+            drop(emulators_view(&state, &panel));
         }
     }
 

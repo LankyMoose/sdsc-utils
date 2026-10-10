@@ -10,7 +10,7 @@ use crate::controller::dualsense::identity as dualsense;
 use crate::controller::dualsense::lightbar;
 use crate::controller::dualsense::rumble::MotorPulse;
 #[cfg(debug_assertions)]
-use crate::controller::emulate::{self, Preset};
+use crate::controller::emulate;
 use crate::controller::hid::poll::{
     BATTERY_INTERVAL, LIVENESS_INTERVAL, PRESENCE_INTERVAL, PRESENCE_INTERVAL_EMPTY,
     UNREAD_RETRY_INTERVAL,
@@ -40,6 +40,8 @@ use crate::platform::ui_sound::{self, UiSoundKind};
 #[cfg(windows)]
 use crate::platform::win32;
 use crate::ui::color::{self, BatterySpectrum};
+#[cfg(debug_assertions)]
+use crate::ui::configure::EmulatorCommand;
 use crate::ui::configure::{
     self as configure_view, AnalyticsPadRow, AnalyticsPanel, ConfigureMessage, ConfigureSettings,
     ConfigureState, NotificationSetting, PadInputPanel, Section,
@@ -361,11 +363,11 @@ pub struct App {
     /// Bumped on every spectrum edit; stale SpectrumCommit messages are ignored.
     spectrum_generation: u64,
 
+    /// Snapshot of the emulated pads shown in Configure → Controllers.
+    /// Refreshed whenever a command runs or controllers change, so the panel
+    /// never needs to reach into the session while rendering.
     #[cfg(debug_assertions)]
-    emulating: bool,
-    /// Percent to restore after AnalyticsPause (list is empty while paused).
-    #[cfg(debug_assertions)]
-    dev_paused_percent: Option<u8>,
+    emulators_panel_cache: configure_view::EmulatorsPanel,
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +376,7 @@ pub struct App {
 
 /// Standalone in-process daemon (no service attached).
 ///
-/// Developer tooling (Configure → Developer, emulated controllers) is compiled
+/// Developer tooling (Configure → Controllers, emulated pads) is compiled
 /// in for every non-release build, so a plain `cargo run` already has it — no
 /// flag needed. Release builds drop it at compile time.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -539,9 +541,7 @@ impl App {
             steam_scan_deferred_for_promote: false,
             spectrum_generation: 0,
             #[cfg(debug_assertions)]
-            emulating: false,
-            #[cfg(debug_assertions)]
-            dev_paused_percent: None,
+            emulators_panel_cache: configure_view::EmulatorsPanel::default(),
         };
 
         // Show the tray immediately (standalone only — service owns the tray in client mode).
@@ -836,6 +836,8 @@ impl App {
                 &self.configure_settings(),
                 &self.analytics_panel,
                 &self.pad_input_panel,
+                #[cfg(debug_assertions)]
+                &self.emulators_panel_cache,
             )
             .map(Message::Configure);
         }
@@ -1497,7 +1499,7 @@ impl App {
 
     fn on_tick(&mut self) -> Task<Message> {
         #[cfg(debug_assertions)]
-        if self.emulating {
+        if self.emulating() {
             return Task::none();
         }
 
@@ -1555,7 +1557,7 @@ impl App {
 
     fn request_refresh(&mut self) -> Task<Message> {
         #[cfg(debug_assertions)]
-        if self.emulating {
+        if self.emulating() {
             return Task::none();
         }
 
@@ -1588,7 +1590,7 @@ impl App {
         self.last_battery_poll = Instant::now();
 
         #[cfg(debug_assertions)]
-        if self.emulating {
+        if self.emulating() {
             return Task::none();
         }
 
@@ -2283,7 +2285,12 @@ impl App {
                 self.apply_spectrum(next)
             }
             #[cfg(debug_assertions)]
-            ConfigureMessage::DeveloperPreset(preset) => self.apply_dev_preset(preset),
+            ConfigureMessage::Emulator(command) => self.apply_emulator_command(command),
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SelectEmulator(index) => {
+                self.configure_state.emulator_selected = index;
+                Task::none()
+            }
             // Hide first so DWM cannot flash the default (white) brush while the
             // wgpu surface is torn down; keep id until WindowClosed.
             ConfigureMessage::Close => match self.configure_window {
@@ -2465,105 +2472,110 @@ impl App {
         }
     }
 
+    /// Emulated-pad snapshot for the Configure → Controllers tab.
     #[cfg(debug_assertions)]
-    fn apply_dev_preset(&mut self, preset: Preset) -> Task<Message> {
-        if preset == Preset::Clear {
-            self.emulating = false;
-            self.dev_paused_percent = None;
-            let task = self.apply_controllers(Vec::new());
-            self.last_battery_poll = Instant::now();
-            return task.chain(self.request_refresh());
+    fn emulators_panel(&self) -> configure_view::EmulatorsPanel {
+        configure_view::EmulatorsPanel {
+            pads: emulate::emulated_pads(&self.session.controllers)
+                .into_iter()
+                .map(|c| configure_view::EmulatorPad {
+                    serial: c.serial,
+                    percent: c.percent,
+                    state: c.state,
+                    connection: c.connection,
+                })
+                .collect(),
         }
+    }
 
-        if preset.is_analytics() && !self.session.prefs.analytics_enabled {
+    /// True while any emulated pad is published — HID polling stands down so
+    /// the emulator is the only source of controllers.
+    #[cfg(debug_assertions)]
+    fn emulating(&self) -> bool {
+        self.session
+            .controllers
+            .iter()
+            .any(|c| emulate::is_emulated(&c.serial))
+    }
+
+    #[cfg(debug_assertions)]
+    fn apply_emulator_command(&mut self, command: EmulatorCommand) -> Task<Message> {
+        let current = self.session.controllers.clone();
+        let find = |serial: &str| current.iter().find(|c| c.serial == serial).cloned();
+
+        let (next, touches_analytics) = match &command {
+            EmulatorCommand::AddPad => (
+                emulate::add(&current, 50, PowerState::Discharging, Connection::Usb),
+                false,
+            ),
+            EmulatorCommand::RemovePad(serial) => (emulate::remove(&current, serial), false),
+            EmulatorCommand::SetPercent(serial, percent) => (
+                emulate::update(&current, serial, |c| c.percent = *percent),
+                false,
+            ),
+            EmulatorCommand::SetState(serial, state) => (
+                emulate::update(&current, serial, |c| c.state = *state),
+                true,
+            ),
+            EmulatorCommand::SetConnection(serial, connection) => (
+                emulate::update(&current, serial, |c| c.connection = *connection),
+                false,
+            ),
+            EmulatorCommand::SeedAnalytics(serial) => {
+                self.session.analytics.dev_seed_estimates(serial);
+                (current.clone(), true)
+            }
+            EmulatorCommand::StepCharge(serial) => {
+                let Some(pad) = find(serial) else {
+                    return Task::none();
+                };
+                self.session
+                    .analytics
+                    .dev_credit_active(serial, emulate::CHARGE_STEP_TIME);
+                let (percent, state) = emulate::step_charge(&pad);
+                (
+                    emulate::update(&current, serial, |c| {
+                        c.percent = percent;
+                        c.state = state;
+                    }),
+                    true,
+                )
+            }
+            EmulatorCommand::StepDrain(serial) => {
+                let Some(pad) = find(serial) else {
+                    return Task::none();
+                };
+                self.session
+                    .analytics
+                    .dev_credit_active(serial, emulate::DRAIN_STEP_TIME);
+                let (percent, state) = emulate::step_drain(&pad);
+                (
+                    emulate::update(&current, serial, |c| {
+                        c.percent = percent;
+                        c.state = state;
+                    }),
+                    true,
+                )
+            }
+        };
+
+        // Analytics state only means something once it is recording.
+        if touches_analytics && !self.session.prefs.analytics_enabled {
             self.session.prefs.analytics_enabled = true;
             self.session.prefs.save();
-            app_log::info("analytics enabled for developer preset");
+            app_log::info("analytics enabled for developer emulator");
         }
 
-        // Credit active time before state edges that may finish a cycle.
-        if matches!(
-            preset,
-            Preset::AnalyticsChargeAdvance
-                | Preset::AnalyticsDrainAdvance
-                | Preset::AnalyticsPlugMidDrain
-        ) {
-            let credit = if preset == Preset::AnalyticsChargeAdvance {
-                Duration::from_secs(15 * 60)
-            } else {
-                Duration::from_secs(25 * 60)
-            };
-            self.session
-                .analytics
-                .dev_credit_active(emulate::PRIMARY_SERIAL, credit);
-        }
-
-        if preset == Preset::AnalyticsSeedEstimates {
-            self.session
-                .analytics
-                .dev_seed_estimates(emulate::PRIMARY_SERIAL);
+        if touches_analytics {
             self.session.analytics.save();
             self.refresh_analytics_panel();
         }
-
-        if preset == Preset::AnalyticsPause {
-            self.dev_paused_percent = self
-                .session
-                .controllers
-                .iter()
-                .find(|c| c.serial == emulate::PRIMARY_SERIAL)
-                .map(|c| c.percent)
-                .or(self.dev_paused_percent);
-        }
-
-        // Unplug-from-full needs a Complete → Discharging edge.
-        let ensure_complete =
-            preset == Preset::AnalyticsUnplugFull
-                && !self.session.controllers.iter().any(|c| {
-                    c.serial == emulate::PRIMARY_SERIAL && c.state == PowerState::Complete
-                });
-
-        let next = if preset == Preset::AnalyticsResume {
-            let percent = self
-                .dev_paused_percent
-                .or_else(|| {
-                    self.session
-                        .analytics
-                        .in_progress(emulate::PRIMARY_SERIAL)
-                        .map(|p| p.percent)
-                })
-                .unwrap_or(60);
-            vec![crate::controller::dualsense::battery::dualsense_status(
-                1,
-                "DualSense",
-                Connection::Bluetooth,
-                emulate::PRIMARY_SERIAL.to_string(),
-                percent,
-                PowerState::Discharging,
-            )]
-        } else {
-            emulate::apply_preset(preset, &self.session.controllers)
-        };
-
-        self.emulating = true;
-        self.session.analytics.save();
-        self.refresh_analytics_panel();
-
-        if ensure_complete {
-            let complete = vec![crate::controller::dualsense::battery::dualsense_status(
-                1,
-                "DualSense",
-                Connection::Usb,
-                emulate::PRIMARY_SERIAL.to_string(),
-                100,
-                PowerState::Complete,
-            )];
-            let first = self.apply_controllers(complete);
-            let second = self.apply_controllers(next);
-            return first.chain(second);
-        }
-
-        self.apply_controllers(next)
+        self.last_battery_poll = Instant::now();
+        let task = self.apply_controllers(next);
+        // `apply_controllers` mutates the session synchronously, so the snapshot
+        // is only accurate once it returns.
+        self.emulators_panel_cache = self.emulators_panel();
+        task
     }
 
     // -----------------------------------------------------------------------
