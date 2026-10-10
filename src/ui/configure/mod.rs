@@ -11,7 +11,7 @@ use spectrum::{BAR_HEIGHT, HUE_HEIGHT, HueBar, SV_HEIGHT, SpectrumBar, SvSquare}
 
 #[cfg(debug_assertions)]
 #[cfg(debug_assertions)]
-use crate::controller::emulate::EmulatedPad;
+use crate::controller::emulate::{self, EmulatedPad};
 #[cfg(debug_assertions)]
 use crate::controller::model::{Connection, PowerState};
 use crate::games::steam::LAST_KNOWN_COMPATIBLE_STEAM_VERSION;
@@ -231,8 +231,8 @@ pub enum EmulatorCommand {
     /// normal preference-driven reactions fire), so this never spams per
     /// frame; a spinner marks the wait.
     PreviewPercent(String, u8),
-    SetPercent(String, u8),
-    SetState(String, PowerState),
+    /// Move the pad to a link — USB or Bluetooth. The charge state follows:
+    /// see [`crate::controller::emulate::state_for`].
     SetConnection(String, Connection),
     /// Plug in / unplug — runs the real connect or disconnect path.
     SetConnected(String, bool),
@@ -1865,7 +1865,6 @@ fn emulator_row<'a>(
 
     let controls = column![
         battery_row(pad, pending),
-        state_row(pad),
         connection_row(pad),
         analytics_block(pad),
         button(text("Remove controller").size(12.0))
@@ -1937,45 +1936,35 @@ fn battery_row<'a>(
     Column::with_children(rows).spacing(12).width(Fill).into()
 }
 
-/// Exclusive choice chips (charge state, connection).
-#[cfg(debug_assertions)]
-fn state_row<'a>(pad: &EmulatedPad) -> Element<'a, ConfigureMessage> {
-    let mut options = Vec::new();
-    for option in [
-        PowerState::Discharging,
-        PowerState::Charging,
-        PowerState::Complete,
-    ] {
-        let serial = pad.serial().to_string();
-        options.push(
-            button(text(power_state_label(option)).size(12.0))
-                .padding([6, 10])
-                .on_press(ConfigureMessage::Emulator(EmulatorCommand::SetState(
-                    serial, option,
-                )))
-                .style(theme::chip(option == pad.status.state))
-                .into(),
-        );
-    }
-    segmented_row("Charge state", options)
-}
-
+/// The pad's link, and the charge state that follows from it.
+///
+/// Only the link is a control: USB charges (reporting `Complete` once topped
+/// off), Bluetooth runs down. A separate charge-state picker would let the
+/// emulator describe states real hardware cannot be in.
 #[cfg(debug_assertions)]
 fn connection_row<'a>(pad: &EmulatedPad) -> Element<'a, ConfigureMessage> {
     let mut options = Vec::new();
     for option in [Connection::Usb, Connection::Bluetooth] {
         let serial = pad.serial().to_string();
+        let derived = emulate::state_for(option, pad.status.percent);
         options.push(
-            button(text(option.as_str()).size(12.0))
-                .padding([6, 10])
-                .on_press(ConfigureMessage::Emulator(EmulatorCommand::SetConnection(
-                    serial, option,
-                )))
-                .style(theme::chip(option == pad.status.connection))
-                .into(),
+            column![
+                button(text(option.as_str()).size(12.0))
+                    .padding([6, 10])
+                    .on_press(ConfigureMessage::Emulator(EmulatorCommand::SetConnection(
+                        serial, option,
+                    )))
+                    .style(theme::chip(option == pad.status.connection)),
+                text(power_state_label(derived))
+                    .size(10.0)
+                    .color(theme::DIM),
+            ]
+            .spacing(4)
+            .align_x(Alignment::Center)
+            .into(),
         );
     }
-    segmented_row("Connection", options)
+    segmented_row("Link", options)
 }
 
 /// Battery-analytics actions for one pad.
@@ -2105,18 +2094,13 @@ mod tests {
         // Controllers tab composes without panicking.
         let mut state = ConfigureState::new(BatterySpectrum::default_spectrum());
         let empty: [EmulatedPad; 0] = [];
-        let pad = |serial: &str, connected: bool, percent: u8| EmulatedPad {
-            status: crate::controller::dualsense::battery::dualsense_status(
-                1,
-                "DualSense",
-                Connection::Usb,
-                serial.to_string(),
-                percent,
-                PowerState::Discharging,
-            ),
-            connected,
-        };
-        let fleet = [pad("emu-1", true, 50), pad("emu-2", false, 100)];
+        // Build the fixture through the emulator's own constructors so the
+        // pads obey the link/state invariant, and cover every link state the
+        // picker can label: charging, complete, discharging.
+        let plugged = emulate::new_pad(&[], 50, Connection::Usb);
+        let mut fleet = emulate::set_percent(std::slice::from_ref(&plugged), "emu-1", 100);
+        fleet.push(emulate::new_pad(&fleet, 20, Connection::Bluetooth));
+        fleet = emulate::update(&fleet, "emu-1", |p| p.connected = true);
         let pending = [PendingEmulatorChange {
             serial: "emu-1".into(),
             percent: 75,

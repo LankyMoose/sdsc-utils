@@ -49,27 +49,38 @@ pub fn serial_for(index: usize) -> String {
     format!("{SERIAL_PREFIX}{index}")
 }
 
-fn pad(index: usize, percent: u8, state: PowerState, connection: Connection) -> ControllerStatus {
+fn pad(index: usize, percent: u8, connection: Connection) -> ControllerStatus {
     dualsense_status(
         index,
         "DualSense",
         connection,
         serial_for(index),
         percent,
-        state,
+        state_for(connection, percent),
     )
 }
 
-/// Create a pad on the lowest free `emu-N` slot.
+/// Charge state a pad reports on a given link at a given level.
+///
+/// The firmware has no independent "charging" switch: a pad on USB draws
+/// power (reporting `Complete` once it tops off), one on Bluetooth runs
+/// down. Deriving it keeps the emulator from describing combinations real
+/// hardware cannot be in — there is no such thing as a discharging USB pad
+/// or a charging Bluetooth one — so the UI exposes the link alone.
+pub fn state_for(connection: Connection, percent: u8) -> PowerState {
+    match connection {
+        Connection::Usb if percent >= 100 => PowerState::Complete,
+        Connection::Usb => PowerState::Charging,
+        Connection::Bluetooth => PowerState::Discharging,
+    }
+}
+
+/// Create a pad on the lowest free `emu-N` slot. Its charge state follows
+/// from the link.
 ///
 /// Starts **disconnected**: a fresh pad is remembered but not live, so it does
 /// not fire a connect toast or open Start until you switch it on.
-pub fn new_pad(
-    fleet: &[EmulatedPad],
-    percent: u8,
-    state: PowerState,
-    connection: Connection,
-) -> EmulatedPad {
+pub fn new_pad(fleet: &[EmulatedPad], percent: u8, connection: Connection) -> EmulatedPad {
     let taken: Vec<usize> = fleet
         .iter()
         .filter_map(|p| p.serial().strip_prefix(SERIAL_PREFIX))
@@ -79,7 +90,7 @@ pub fn new_pad(
         .find(|n| !taken.contains(n))
         .unwrap_or(1);
     EmulatedPad {
-        status: pad(index, percent, state, connection),
+        status: pad(index, percent, connection),
         connected: false,
     }
 }
@@ -98,6 +109,23 @@ pub fn update(
     next
 }
 
+/// Set the battery level, re-deriving the charge state (a USB pad dragged to
+/// 100% becomes `Complete`, not still `Charging`).
+pub fn set_percent(fleet: &[EmulatedPad], serial: &str, percent: u8) -> Vec<EmulatedPad> {
+    update(fleet, serial, |p| {
+        p.status.percent = percent;
+        p.status.state = state_for(p.status.connection, percent);
+    })
+}
+
+/// Move a pad to a new link, re-deriving its charge state.
+pub fn set_link(fleet: &[EmulatedPad], serial: &str, connection: Connection) -> Vec<EmulatedPad> {
+    update(fleet, serial, |p| {
+        p.status.connection = connection;
+        p.status.state = state_for(connection, p.status.percent);
+    })
+}
+
 /// The connected pads — the list to publish as the live controller snapshot.
 pub fn live(fleet: &[EmulatedPad]) -> Vec<ControllerStatus> {
     fleet
@@ -107,36 +135,36 @@ pub fn live(fleet: &[EmulatedPad]) -> Vec<ControllerStatus> {
         .collect()
 }
 
-/// Next `(percent, state)` for one analytics charge advance.
+/// Next `(percent, connection, state)` for one analytics charge advance.
 ///
-/// Discharging pads plug in at their current level; charging pads step up and
-/// land on `Complete` at 100.
-pub fn step_charge(pad: &ControllerStatus) -> (u8, PowerState) {
-    if pad.state.is_discharging() {
-        return (pad.percent, PowerState::Charging);
-    }
-    let next = pad.percent.saturating_add(STEP_PERCENT).min(100);
-    if next >= 100 {
-        (100, PowerState::Complete)
+/// Plugs the pad in at its current level; charging pads step up and land on
+/// `Complete` at 100.
+pub fn step_charge(pad: &ControllerStatus) -> (u8, Connection, PowerState) {
+    let percent = if pad.state.is_discharging() {
+        pad.percent
     } else {
-        (next, PowerState::Charging)
-    }
+        pad.percent.saturating_add(STEP_PERCENT).min(100)
+    };
+    (
+        percent,
+        Connection::Usb,
+        state_for(Connection::Usb, percent),
+    )
 }
 
-/// Next `(percent, state)` for one analytics drain advance.
+/// Next `(percent, connection, state)` for one analytics drain advance.
 ///
-/// Charging/Complete pads unplug at their current level; discharging pads step
-/// down to the low-battery floor.
-pub fn step_drain(pad: &ControllerStatus) -> (u8, PowerState) {
-    if pad.state.is_discharging() {
-        let next = pad
-            .percent
+/// Unplugs the pad at its current level; discharging pads step down to the
+/// low-battery floor.
+pub fn step_drain(pad: &ControllerStatus) -> (u8, Connection, PowerState) {
+    let percent = if pad.state.is_discharging() {
+        pad.percent
             .saturating_sub(STEP_PERCENT)
-            .max(LOW_BATTERY_PERCENT);
-        (next, PowerState::Discharging)
+            .max(LOW_BATTERY_PERCENT)
     } else {
-        (pad.percent, PowerState::Discharging)
-    }
+        pad.percent
+    };
+    (percent, Connection::Bluetooth, PowerState::Discharging)
 }
 
 #[cfg(test)]
@@ -144,7 +172,7 @@ mod tests {
     use super::*;
 
     fn first() -> EmulatedPad {
-        new_pad(&[], 50, PowerState::Discharging, Connection::Usb)
+        new_pad(&[], 50, Connection::Bluetooth)
     }
 
     #[test]
@@ -160,28 +188,18 @@ mod tests {
     #[test]
     fn new_pad_uses_lowest_free_slot_and_reuses_holes() {
         let a = first();
-        let b = new_pad(
-            std::slice::from_ref(&a),
-            80,
-            PowerState::Charging,
-            Connection::Bluetooth,
-        );
+        let b = new_pad(std::slice::from_ref(&a), 80, Connection::Bluetooth);
         assert_eq!(b.serial(), "emu-2");
 
         let without_a = vec![b.clone()];
-        let reused = new_pad(&without_a, 10, PowerState::Discharging, Connection::Usb);
+        let reused = new_pad(&without_a, 10, Connection::Bluetooth);
         assert_eq!(reused.serial(), PRIMARY_SERIAL);
     }
 
     #[test]
     fn live_publishes_only_connected_pads() {
         let a = first();
-        let b = new_pad(
-            std::slice::from_ref(&a),
-            80,
-            PowerState::Charging,
-            Connection::Usb,
-        );
+        let b = new_pad(std::slice::from_ref(&a), 80, Connection::Usb);
         let fleet = update(&[a, b], "emu-1", |p| p.connected = true);
         let live_pads = live(&fleet);
         assert_eq!(live_pads.len(), 1);
@@ -190,11 +208,22 @@ mod tests {
     }
 
     #[test]
+    fn charge_state_follows_the_link() {
+        // The firmware has no independent charging switch; the link implies it.
+        assert_eq!(state_for(Connection::Bluetooth, 5), PowerState::Discharging);
+        assert_eq!(
+            state_for(Connection::Bluetooth, 100),
+            PowerState::Discharging
+        );
+        assert_eq!(state_for(Connection::Usb, 5), PowerState::Charging);
+        assert_eq!(state_for(Connection::Usb, 99), PowerState::Charging);
+        // A topped-off USB pad reports Complete, not Charging.
+        assert_eq!(state_for(Connection::Usb, 100), PowerState::Complete);
+    }
+
+    #[test]
     fn update_edits_the_named_pad_only() {
-        let fleet = [
-            first(),
-            new_pad(&[first()], 80, PowerState::Charging, Connection::Usb),
-        ];
+        let fleet = [first(), new_pad(&[first()], 80, Connection::Usb)];
         let next = update(&fleet, "emu-2", |p| {
             p.status.percent = 33;
             p.status.state = PowerState::Complete;
@@ -216,14 +245,17 @@ mod tests {
     fn charge_step_plugs_in_then_walks_up_to_complete() {
         let mut pad = first().status;
         // Discharging pad plugs in at its current level.
-        let (percent, state) = step_charge(&pad);
+        let (percent, connection, state) = step_charge(&pad);
         pad.percent = percent;
+        pad.connection = connection;
         pad.state = state;
+        assert_eq!(pad.connection, Connection::Usb);
         assert_eq!((pad.percent, pad.state), (50, PowerState::Charging));
 
         for _ in 0..10 {
-            let (next_percent, next_state) = step_charge(&pad);
+            let (next_percent, next_connection, next_state) = step_charge(&pad);
             pad.percent = next_percent;
+            pad.connection = next_connection;
             pad.state = next_state;
             if pad.state == PowerState::Complete {
                 break;
@@ -237,22 +269,60 @@ mod tests {
     fn drain_step_unplugs_then_walks_down_to_the_floor() {
         let mut pad = first().status;
         pad.state = PowerState::Complete;
+        pad.connection = Connection::Usb;
         pad.percent = 100;
         // Complete pad unplugs at its current level.
-        let (percent, state) = step_drain(&pad);
+        let (percent, connection, state) = step_drain(&pad);
+        assert_eq!(connection, Connection::Bluetooth);
         assert_eq!((percent, state), (100, PowerState::Discharging));
 
         pad.percent = percent;
+        pad.connection = connection;
         pad.state = state;
         for _ in 0..10 {
-            let (next_percent, next_state) = step_drain(&pad);
+            let (next_percent, next_connection, next_state) = step_drain(&pad);
             pad.percent = next_percent;
+            pad.connection = next_connection;
             pad.state = next_state;
             if pad.percent == LOW_BATTERY_PERCENT {
                 break;
             }
         }
         assert_eq!(pad.percent, LOW_BATTERY_PERCENT);
+        assert_eq!(pad.state, PowerState::Discharging);
+    }
+
+    #[test]
+    fn set_percent_re_derives_the_charge_state() {
+        let pad = new_pad(&[], 95, Connection::Usb);
+        assert_eq!(pad.status.state, PowerState::Charging);
+
+        // Dragging a USB pad to the top means it is done charging.
+        let full = set_percent(std::slice::from_ref(&pad), PRIMARY_SERIAL, 100);
+        assert_eq!(full[0].status.state, PowerState::Complete);
+        // Dropping back below the top puts it on charge again.
+        let back = set_percent(&full, PRIMARY_SERIAL, 95);
+        assert_eq!(back[0].status.state, PowerState::Charging);
+        // A Bluetooth pad is discharging either way.
+        let bt = set_link(&back, PRIMARY_SERIAL, Connection::Bluetooth);
+        let bt = set_percent(&bt, PRIMARY_SERIAL, 100);
+        assert_eq!(bt[0].status.state, PowerState::Discharging);
+    }
+
+    #[test]
+    fn set_link_re_derives_the_charge_state() {
+        let pad = new_pad(&[], 60, Connection::Bluetooth);
+        assert_eq!(pad.status.state, PowerState::Discharging);
+
+        let plugged = set_link(std::slice::from_ref(&pad), PRIMARY_SERIAL, Connection::Usb);
+        assert_eq!(plugged[0].status.state, PowerState::Charging);
+        // Level is untouched; only the link and what follows from it move.
+        assert_eq!(plugged[0].status.percent, 60);
+
+        let full = set_percent(&plugged, PRIMARY_SERIAL, 100);
+        let unplugged = set_link(&full, PRIMARY_SERIAL, Connection::Bluetooth);
+        assert_eq!(unplugged[0].status.state, PowerState::Discharging);
+        assert_eq!(unplugged[0].status.percent, 100);
     }
 
     #[test]

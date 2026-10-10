@@ -22,8 +22,6 @@ use crate::controller::hid::poll::{
 };
 use crate::controller::hid::worker::HidWorkerHandle;
 use crate::controller::known::KnownControllers;
-#[cfg(debug_assertions)]
-use crate::controller::model::PowerState;
 use crate::controller::model::{Connection, ControllerStatus};
 use crate::games::launch;
 use crate::games::process_match::{self, RunningSession};
@@ -2620,12 +2618,7 @@ impl App {
         // policy, analytics edges); `analytics` covers the charge/drain walk.
         let (next_fleet, publish, analytics) = match &command {
             EmulatorCommand::AddPad => {
-                let pad = emulate::new_pad(
-                    &fleet,
-                    DEFAULT_EMU_PERCENT,
-                    PowerState::Discharging,
-                    Connection::Usb,
-                );
+                let pad = emulate::new_pad(&fleet, DEFAULT_EMU_PERCENT, Connection::Bluetooth);
                 let mut next = fleet.clone();
                 next.push(pad);
                 // Remembered but disconnected: no toast, no Start window.
@@ -2638,13 +2631,14 @@ impl App {
                     .cloned()
                     .collect::<Vec<_>>();
                 self.session.known.forget(serial);
+                self.pending_emulator_commits.remove(serial);
                 (next, true, false)
             }
             // Preview repaints the tab only. Publishing is debounced so a drag
             // cannot spam toasts or Start opens — but only for a *connected*
             // pad, since a disconnected one is not published at all.
             EmulatorCommand::PreviewPercent(serial, percent) => {
-                let next = emulate::update(&fleet, serial, |p| p.status.percent = *percent);
+                let next = emulate::set_percent(&fleet, serial, *percent);
                 let connected = find(serial).is_some_and(|p| p.connected);
                 if connected {
                     self.pending_emulator_commits.insert(
@@ -2657,21 +2651,19 @@ impl App {
                 }
                 (next, false, false)
             }
-            EmulatorCommand::SetPercent(serial, percent) => {
-                let next = emulate::update(&fleet, serial, |p| p.status.percent = *percent);
-                (next, true, false)
-            }
-            EmulatorCommand::SetState(serial, state) => {
-                let next = emulate::update(&fleet, serial, |p| p.status.state = *state);
-                (next, true, true)
-            }
+            // Plugging in or unplugging is a charge edge, so it credits
+            // analytics the same way stepping the cycle does.
             EmulatorCommand::SetConnection(serial, connection) => {
-                let next = emulate::update(&fleet, serial, |p| p.status.connection = *connection);
-                (next, true, false)
+                (emulate::set_link(&fleet, serial, *connection), true, true)
             }
             // Plugging in or unplugging is a real connect/disconnect edge.
             EmulatorCommand::SetConnected(serial, connected) => {
                 let next = emulate::update(&fleet, serial, |p| p.connected = *connected);
+                if !connected {
+                    // Nothing left to publish to; drop the armed timer so the
+                    // commit cannot fire against a pad that is no longer live.
+                    self.pending_emulator_commits.remove(serial);
+                }
                 (next, true, false)
             }
             EmulatorCommand::SeedAnalytics(serial) => {
@@ -2685,9 +2677,10 @@ impl App {
                 self.session
                     .analytics
                     .dev_credit_active(pad.serial(), emulate::CHARGE_STEP_TIME);
-                let (percent, state) = emulate::step_charge(&pad.status);
+                let (percent, connection, state) = emulate::step_charge(&pad.status);
                 let next = emulate::update(&fleet, serial, |p| {
                     p.status.percent = percent;
+                    p.status.connection = connection;
                     p.status.state = state;
                 });
                 (next, true, true)
@@ -2699,9 +2692,10 @@ impl App {
                 self.session
                     .analytics
                     .dev_credit_active(pad.serial(), emulate::DRAIN_STEP_TIME);
-                let (percent, state) = emulate::step_drain(&pad.status);
+                let (percent, connection, state) = emulate::step_drain(&pad.status);
                 let next = emulate::update(&fleet, serial, |p| {
                     p.status.percent = percent;
+                    p.status.connection = connection;
                     p.status.state = state;
                 });
                 (next, true, true)
