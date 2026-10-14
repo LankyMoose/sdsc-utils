@@ -1783,6 +1783,42 @@ impl State {
         self.position_bar_show(now).1
     }
 
+    /// Opacity for one slot's selected-hero cue overlay (the black box over
+    /// the art carrying Playing/membership + face hints).
+    ///
+    /// 0 when the slot is out of range or the list is hidden; otherwise
+    /// proximity (`1 - |dist|`) times `list_opacity`, so the box crossfades
+    /// with the strip scroll instead of popping. The target selection fades
+    /// in on arrival; the strip chase's fade-out party (`strip_anim.from`,
+    /// once settled elsewhere) fades out on departure. Slots the chase
+    /// merely passes through (multi-index jumps) stay quiet — only `from`
+    /// and the target ever render. Pure for tests; sampled every frame like
+    /// the other strip visuals. Opacity-only, so reduced motion leaves it
+    /// animating.
+    pub(crate) fn hero_overlay_alpha(
+        &self,
+        idx: usize,
+        selected: usize,
+        dist: f32,
+        list_opacity: f32,
+    ) -> f32 {
+        let base = (1.0 - dist.abs()).clamp(0.0, 1.0) * list_opacity.clamp(0.0, 1.0);
+        if base <= 0.01 {
+            return 0.0;
+        }
+        if idx == selected {
+            return base;
+        }
+        if let Some(anim) = &self.strip_anim {
+            let from_idx = anim.from.round().max(0.0) as usize;
+            let to_idx = anim.to.round().max(0.0) as usize;
+            if from_idx != to_idx && idx == from_idx {
+                return base;
+            }
+        }
+        0.0
+    }
+
     /// In-flight show/hide clock. The canvas samples this at draw time.
     /// `None` while pinned: the rail draws settled at (1, 1), never mid-hide.
     /// `None` under reduced motion too: the bar snaps to its settled slide
@@ -3986,13 +4022,17 @@ pub(crate) fn immersive_dock_row_hints(
 }
 
 /// Edit-mode membership mark for the immersive hero meta column.
-pub(crate) fn immersive_game_membership_label(row: &StartRow) -> Element<'static, StartMessage> {
+pub(crate) fn immersive_game_membership_label(
+    row: &StartRow,
+    alpha: f32,
+) -> Element<'static, StartMessage> {
+    let a = alpha.clamp(0.0, 1.0);
     let in_lib = row.in_catalog();
     let mark = if in_lib { "✓" } else { "○" };
     let mark_color = if in_lib {
-        theme::ACCENT
+        theme::alpha(theme::ACCENT, a)
     } else {
-        theme::alpha(theme::MUTED, 0.7)
+        theme::alpha(theme::MUTED, 0.7 * a)
     };
     let label = if in_lib {
         "In library"
@@ -4002,7 +4042,9 @@ pub(crate) fn immersive_game_membership_label(row: &StartRow) -> Element<'static
     // Match [`action_hint_dock`] label size + color.
     row![
         text(mark).size(14.0).color(mark_color),
-        text(label).size(13.0).color(theme::alpha(theme::INK, 0.85)),
+        text(label)
+            .size(13.0)
+            .color(theme::alpha(theme::INK, 0.85 * a)),
     ]
     .spacing(6)
     .align_y(Alignment::Center)
@@ -4012,9 +4054,12 @@ pub(crate) fn immersive_game_membership_label(row: &StartRow) -> Element<'static
 /// Launch / Close game / edit face cues beside the immersive selected hero.
 ///
 /// Layout-stable (`action_cluster_dock`) so veil/Float cannot resize the meta column.
+/// `alpha` fades the whole cluster with the strip scroll (see
+/// [`State::hero_overlay_alpha`]); other callers pass 1.0.
 pub(crate) fn immersive_game_hints(
     row: &StartRow,
     state: &State,
+    alpha: f32,
 ) -> Element<'static, StartMessage> {
     let hint = RowHintState::for_selected(state, true);
     let mut actions = Vec::new();
@@ -4075,6 +4120,10 @@ pub(crate) fn immersive_game_hints(
             hint.held,
             hint.press_anim,
         ));
+    }
+    let a = alpha.clamp(0.0, 1.0);
+    for h in actions.iter_mut() {
+        h.alpha = a;
     }
     action_cluster_dock(&actions)
 }
@@ -4562,6 +4611,10 @@ struct ActionHint {
     pressed: bool,
     /// 0..=1 animated press amount (drives layout-stable scale).
     press_t: f32,
+    /// Overall fade multiplier (1 = opaque). The immersive selected-hero
+    /// overlay animates this with the strip scroll so the black cue box
+    /// fades instead of popping; every other surface leaves it at 1.
+    alpha: f32,
 }
 
 /// Empty browse Games list: "press [△] to edit" with the standard ringed face glyph.
@@ -4604,6 +4657,7 @@ fn face_hint(
         armed_t: 0.0,
         pressed: face.held(held),
         press_t: press_anim.for_face(face),
+        alpha: 1.0,
     }
 }
 
@@ -4623,6 +4677,7 @@ fn face_hold_hint(
         armed_t,
         pressed: face.held(held),
         press_t: press_anim.for_face(face),
+        alpha: 1.0,
     }
 }
 
@@ -4919,7 +4974,7 @@ fn text_glyph_circle(
         RingStyle::Idle
     };
     let stack = iced::widget::stack![
-        action_ring(style, idle_radius),
+        action_ring(style, idle_radius, 1.0),
         container(text(glyph).size(12.0).color(theme::ACCENT))
             .width(Length::Fixed(HOLD_RING_SIZE))
             .height(Length::Fixed(HOLD_RING_SIZE))
@@ -5139,6 +5194,7 @@ fn action_hint(hint: &ActionHint, flat: bool) -> Element<'static, StartMessage> 
 }
 
 fn action_hint_dock(hint: &ActionHint) -> Element<'static, StartMessage> {
+    let a = hint.alpha.clamp(0.0, 1.0);
     let glyph: Element<'static, StartMessage> = if let Some(face) = hint.face {
         let style = if let Some(progress) = hint.hold {
             RingStyle::Hold {
@@ -5150,11 +5206,11 @@ fn action_hint_dock(hint: &ActionHint) -> Element<'static, StartMessage> {
         } else {
             RingStyle::Idle
         };
-        face_glyph_dock(face, style)
+        face_glyph_dock(face, style, a)
     } else {
         text(hint.text_glyph.unwrap_or("?"))
             .size(14.0)
-            .color(theme::ACCENT)
+            .color(theme::alpha(theme::ACCENT, a))
             .into()
     };
 
@@ -5163,17 +5219,18 @@ fn action_hint_dock(hint: &ActionHint) -> Element<'static, StartMessage> {
         glyph,
         text(hint.label)
             .size(13.0)
-            .color(theme::alpha(theme::INK, 0.85)),
+            .color(theme::alpha(theme::INK, 0.85 * a)),
     ]
     .spacing(6)
     .align_y(Alignment::Center)
     .into()
 }
 
-fn face_svg(face: FaceButton, size: f32) -> Element<'static, StartMessage> {
+fn face_svg(face: FaceButton, size: f32, alpha: f32) -> Element<'static, StartMessage> {
     svg(svg::Handle::from_memory(face.svg().as_bytes()))
         .width(Length::Fixed(size))
         .height(Length::Fixed(size))
+        .opacity(alpha.clamp(0.0, 1.0))
         .into()
 }
 
@@ -5190,7 +5247,7 @@ fn face_glyph(
     press_t: f32,
     flat: bool,
 ) -> Element<'static, StartMessage> {
-    let stack = face_glyph_stack(face, style);
+    let stack = face_glyph_stack(face, style, 1.0);
     if flat {
         return stack;
     }
@@ -5202,18 +5259,26 @@ fn face_glyph(
 }
 
 /// Dock-safe glyph: same art, no Float (scaled Float becomes an overlay and breaks row height).
-fn face_glyph_dock(face: FaceButton, style: RingStyle) -> Element<'static, StartMessage> {
-    face_glyph_stack(face, style)
+fn face_glyph_dock(
+    face: FaceButton,
+    style: RingStyle,
+    alpha: f32,
+) -> Element<'static, StartMessage> {
+    face_glyph_stack(face, style, alpha)
 }
 
-fn face_glyph_stack(face: FaceButton, style: RingStyle) -> Element<'static, StartMessage> {
+fn face_glyph_stack(
+    face: FaceButton,
+    style: RingStyle,
+    alpha: f32,
+) -> Element<'static, StartMessage> {
     let half = HOLD_RING_SIZE / 2.0;
     let max_radius = half - 2.5; // leave room for ~2.5px stroke
     let idle_radius = max_radius / PRESSED_SCALE;
     let glyph_size = FACE_GLYPH_SIZE * (idle_radius / (half - 2.0));
     iced::widget::stack![
-        action_ring(style, idle_radius),
-        container(face_svg(face, glyph_size))
+        action_ring(style, idle_radius, alpha),
+        container(face_svg(face, glyph_size, alpha))
             .width(Length::Fixed(HOLD_RING_SIZE))
             .height(Length::Fixed(HOLD_RING_SIZE))
             .center_x(Fill)
@@ -5224,16 +5289,21 @@ fn face_glyph_stack(face: FaceButton, style: RingStyle) -> Element<'static, Star
     .into()
 }
 
-fn action_ring(style: RingStyle, radius: f32) -> Element<'static, StartMessage> {
-    iced::widget::canvas(ActionRing { style, radius })
-        .width(Length::Fixed(HOLD_RING_SIZE))
-        .height(Length::Fixed(HOLD_RING_SIZE))
-        .into()
+fn action_ring(style: RingStyle, radius: f32, alpha: f32) -> Element<'static, StartMessage> {
+    iced::widget::canvas(ActionRing {
+        style,
+        radius,
+        alpha: alpha.clamp(0.0, 1.0),
+    })
+    .width(Length::Fixed(HOLD_RING_SIZE))
+    .height(Length::Fixed(HOLD_RING_SIZE))
+    .into()
 }
 
 struct ActionRing {
     style: RingStyle,
     radius: f32,
+    alpha: f32,
 }
 
 impl canvas::Program<StartMessage> for ActionRing {
@@ -5256,14 +5326,16 @@ impl canvas::Program<StartMessage> for ActionRing {
             RingStyle::Pressed => {
                 frame.stroke(
                     &track,
-                    Stroke::default().with_width(2.5).with_color(theme::ACCENT),
+                    Stroke::default()
+                        .with_width(2.5)
+                        .with_color(theme::alpha(theme::ACCENT, self.alpha)),
                 );
             }
             RingStyle::Idle => {
                 frame.stroke(
                     &track,
                     Stroke::default().with_width(2.0).with_color(Color {
-                        a: 0.25,
+                        a: 0.25 * self.alpha,
                         ..theme::MUTED
                     }),
                 );
@@ -5272,7 +5344,7 @@ impl canvas::Program<StartMessage> for ActionRing {
                 frame.stroke(
                     &track,
                     Stroke::default().with_width(2.0).with_color(Color {
-                        a: 0.25,
+                        a: 0.25 * self.alpha,
                         ..theme::MUTED
                     }),
                 );
@@ -5296,6 +5368,10 @@ impl canvas::Program<StartMessage> for ActionRing {
                         }
                     });
                     let arc_color = lerp_color(theme::ACCENT, theme::MUTED, armed_t);
+                    let arc_color = Color {
+                        a: arc_color.a * self.alpha,
+                        ..arc_color
+                    };
                     frame.stroke(
                         &arc,
                         Stroke::default().with_width(2.5).with_color(arc_color),
@@ -5853,6 +5929,54 @@ mod tests {
         state.sync_navbar_pinned(false, idle);
         state.tick_anim(idle);
         assert!(state.position_bar_slide.is_some());
+    }
+
+    #[test]
+    fn hero_overlay_crossfades_with_strip_scroll() {
+        let state = State::default();
+        // At rest: only the selection shows, fully opaque with the list.
+        assert!((state.hero_overlay_alpha(3, 3, 0.0, 1.0) - 1.0).abs() < 0.001);
+        assert_eq!(state.hero_overlay_alpha(2, 3, -1.0, 1.0), 0.0);
+        assert_eq!(state.hero_overlay_alpha(4, 3, 1.0, 1.0), 0.0);
+        // Hidden list: nothing shows.
+        assert_eq!(state.hero_overlay_alpha(3, 3, 0.0, 0.0), 0.0);
+        // Mid-scroll alpha tracks proximity times list opacity.
+        assert!((state.hero_overlay_alpha(3, 3, 0.4, 0.5) - 0.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn hero_overlay_fades_out_the_departed_slot() {
+        let mut state = State::default();
+        let now = Instant::now();
+        state.strip_anim = Some(StripAnim {
+            from: 2.0,
+            to: 3.0,
+            duration_ms: 200,
+            started: now,
+        });
+        // Target fades in, departed slot fades out, by the same proximity rule.
+        assert!((state.hero_overlay_alpha(3, 3, 0.4, 1.0) - 0.6).abs() < 0.001);
+        assert!((state.hero_overlay_alpha(2, 3, -0.6, 1.0) - 0.4).abs() < 0.001);
+        // A near slot that is neither party stays quiet even inside the window.
+        assert_eq!(state.hero_overlay_alpha(4, 3, 0.9, 1.0), 0.0);
+    }
+
+    #[test]
+    fn hero_overlay_skips_pass_through_slots_on_jumps() {
+        let mut state = State::default();
+        let now = Instant::now();
+        state.strip_anim = Some(StripAnim {
+            from: 0.0,
+            to: 5.0,
+            duration_ms: 200,
+            started: now,
+        });
+        // Intermediate slots never render, even crossing center mid-jump.
+        assert_eq!(state.hero_overlay_alpha(2, 5, 0.0, 1.0), 0.0);
+        assert_eq!(state.hero_overlay_alpha(3, 5, -0.2, 1.0), 0.0);
+        // Only `from` (out) and the target (in) participate.
+        assert!((state.hero_overlay_alpha(0, 5, -0.3, 1.0) - 0.7).abs() < 0.001);
+        assert!((state.hero_overlay_alpha(5, 5, 0.3, 1.0) - 0.7).abs() < 0.001);
     }
 
     #[test]

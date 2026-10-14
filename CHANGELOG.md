@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Developer mode:** emulated controllers get the same **remember** pin real controllers have. A pad's row offers "Forget this controller"; forgetting takes effect immediately — the pad leaves the remembered list and from disk, exactly as `toggle_remember` behaves for real hardware. A pad that is both unplugged and forgotten disappears from the tab, so the two are symmetric: forget an unplugged pad and it goes now, unplug a forgotten pad and it goes then. A merely unplugged pad stays listed so you can plug it back in.
 - Horizontal immersive Start centers every cover by its art (neighbors no longer ride above the selection) and fades neighbors to transparent instead of grey.
 - Horizontal immersive strip: neighbor covers now sag downward with distance (cover-flow arc mirroring the vertical strip), keeping clock clearance.
+- Immersive selected-hero cue box (Playing/membership + face hints over the art) now crossfades with the strip scroll instead of popping in and out.
 
 ### Fixed
 

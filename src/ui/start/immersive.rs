@@ -504,8 +504,12 @@ fn games_stage(
         // >= 2) render their title + meta at their own art width (see
         // `strip_slot_stacked`), so every visible cover carries its labels.
         let sel_offset = idx as isize - selected as isize;
-        let overlay = if selected_slot && list_opacity > 0.85 {
-            Some(hero_hint_overlay(row, state))
+        // The cue box crossfades with the strip scroll (see
+        // `State::hero_overlay_alpha`): the target fades in on arrival, the
+        // departed slot fades out, pass-through slots stay quiet.
+        let overlay_alpha = state.hero_overlay_alpha(idx, selected, dist, list_opacity);
+        let overlay = if overlay_alpha > 0.01 {
+            Some((hero_hint_overlay(row, state, overlay_alpha), overlay_alpha))
         } else {
             None
         };
@@ -618,7 +622,15 @@ fn games_stage(
 }
 
 /// Membership / Playing + face cues stacked on the selected hero art.
-fn hero_hint_overlay<'a>(row: &'a StartRow, state: &'a State) -> Element<'a, StartMessage> {
+///
+/// `alpha` (from [`State::hero_overlay_alpha`]) fades the whole box with the
+/// strip scroll; layout is unchanged by it, so the fade never reflows art.
+fn hero_hint_overlay<'a>(
+    row: &'a StartRow,
+    state: &'a State,
+    alpha: f32,
+) -> Element<'a, StartMessage> {
+    let a = alpha.clamp(0.0, 1.0);
     let running = state
         .running_target
         .as_ref()
@@ -629,13 +641,21 @@ fn hero_hint_overlay<'a>(row: &'a StartRow, state: &'a State) -> Element<'a, Sta
         .is_some_and(|t| t == &row.target);
     let mut col = column![].spacing(10).align_x(Alignment::Center);
     if state.editing {
-        col = col.push(immersive_game_membership_label(row));
+        col = col.push(immersive_game_membership_label(row, a));
     } else if closing {
-        col = col.push(text("Closing").size(15.0).color(theme::MUTED));
+        col = col.push(
+            text("Closing")
+                .size(15.0)
+                .color(theme::alpha(theme::MUTED, a)),
+        );
     } else if running {
-        col = col.push(text("Playing").size(15.0).color(theme::ACCENT));
+        col = col.push(
+            text("Playing")
+                .size(15.0)
+                .color(theme::alpha(theme::ACCENT, a)),
+        );
     }
-    col = col.push(immersive_game_hints(row, state));
+    col = col.push(immersive_game_hints(row, state, a));
     col.into()
 }
 
@@ -664,7 +684,7 @@ fn strip_slot<'a>(
     scale: f32,
     fade: f32,
     metrics: &StripMetrics,
-    overlay: Option<Element<'a, StartMessage>>,
+    overlay: Option<(Element<'a, StartMessage>, f32)>,
     orientation: StripOrientation,
     sel_offset: isize,
     dist: f32,
@@ -964,7 +984,7 @@ fn strip_capsule<'a>(
     muted: bool,
     hero_ready: bool,
     fade: f32,
-    overlay: Option<Element<'a, StartMessage>>,
+    overlay: Option<(Element<'a, StartMessage>, f32)>,
 ) -> Element<'a, StartMessage> {
     // Subtle radius: image uses border_radius; card border matches for the ring.
     const HERO_RADIUS: f32 = 3.0;
@@ -1024,7 +1044,8 @@ fn strip_capsule<'a>(
         ..iced::widget::container::Style::default()
     };
 
-    if let Some(hints) = overlay {
+    if let Some((hints, overlay_alpha)) = overlay {
+        let box_alpha = overlay_alpha.clamp(0.0, 1.0);
         let footer = container(hints)
             .width(Fill)
             .center_x(Fill)
@@ -1034,10 +1055,10 @@ fn strip_capsule<'a>(
                 bottom: 10.0,
                 left: 12.0,
             })
-            .style(|_theme: &iced::Theme| iced::widget::container::Style {
+            .style(move |_theme: &iced::Theme| iced::widget::container::Style {
                 background: Some(iced::Background::Color(theme::alpha(
                     iced::Color::BLACK,
-                    0.82,
+                    0.82 * box_alpha,
                 ))),
                 border: iced::Border {
                     radius: iced::border::Radius {
