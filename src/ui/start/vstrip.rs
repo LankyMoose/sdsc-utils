@@ -75,6 +75,11 @@ pub const H_TITLE_SELECTED_SIZE: f32 = 28.0;
 /// same point size. The wrap width carries this fudge so the selection keeps
 /// the neighbor's line breaks instead of spilling an extra word per line.
 pub const H_TITLE_BOLD_FUDGE: f32 = 1.06;
+/// Outer-peek in-slot title size (`|offset| >= 2`).
+///
+/// Smaller than [`H_TITLE_SIZE`] so longer titles fit the shared text budget
+/// at the narrower outer wrap widths (see [`h_outer_wrap_width`]).
+pub const H_TITLE_OUTER_SIZE: f32 = 18.0;
 /// Reserved height for the horizontal in-slot text (every slot's title + meta).
 ///
 /// Budget (1.3x line height): two-line selected title at 28px (72.8) + 6 +
@@ -185,6 +190,20 @@ pub fn h_title_wrap_width_at(center_w: f32, distance: f32) -> f32 {
         .min(center_w * SELECTED_SCALE)
 }
 
+/// Wrap width for an outer-peek slot's in-slot title (`|offset| >= 2`).
+///
+/// Outer titles span exactly their own art width
+/// (`center_w * scale_at_distance(|offset|)`): at every step outward the two
+/// adjacent half-widths fit the stride with [`STRIDE_GAP`] to spare, so
+/// titles can never overlap — unlike same-wrap neighbor widths, which exceed
+/// the 1→2 stride. Keyed on the stable integer offset (not the fractional
+/// scroll `dist`) so breaks never reflow mid-scroll; outer slots keep this
+/// narrower wrap (and smaller type) while gliding, exactly like neighbors
+/// keep theirs.
+pub fn h_outer_wrap_width(center_w: f32, sel_offset: isize) -> f32 {
+    center_w * scale_at_distance(sel_offset.abs() as f32)
+}
+
 /// Interpolated meta size under a horizontal title (14 neighbor → 16 selected).
 pub fn h_meta_size_at(distance: f32) -> f32 {
     14.0 + 2.0 * h_title_selectionness(distance)
@@ -228,11 +247,11 @@ pub struct StripMetrics {
     pub stride: f32,
     pub slot_w: f32,
     pub slot_h: f32,
-    /// Art→text gap + text budget for horizontal **neighbor** slots.
+    /// Art→text gap + text budget for horizontal slots.
     ///
     /// `0.0` on stages too short to afford it (below ~815px of block room),
-    /// where neighbors go art-only — like the outer peeks — instead of
-    /// pushing the selected-title layer into the position rail.
+    /// where every slot goes art-only instead of pushing the in-slot titles
+    /// into the position rail.
     /// See [`metrics_for_width`].
     pub h_text_budget: f32,
 }
@@ -1194,13 +1213,12 @@ mod tests {
 
     #[test]
     fn outer_peek_titles_would_overlap_at_neighbor_wrap() {
-        // Regression pin for the art-only rule (`show_text` is false at
-        // `|offset| >= 2`): same-wrap neighbor titles are wider than the
-        // 1→2 stride, so a d=2 title would overlap its d=1 neighbor by ~21px
-        // at 1080p. Narrowing d=2 to its own art width would fit, but the
-        // breaks would reflow mid-scroll (1→2 width change) and break the
-        // same-wrap guarantee — so outer peeks stay art-only. Their slot
-        // boxes still carry the shared text budget (art stays centered).
+        // Pin for why outer peeks can't reuse the same-wrap neighbor width:
+        // neighbor titles are wider than the 1→2 stride, so a d=2 title at
+        // that width would overlap its d=1 neighbor by ~21px at 1080p.
+        // Outer peeks instead use their own narrower art-width wrap (see
+        // `outer_wrap_fits_stride_at_every_step`). Their slot boxes still
+        // carry the shared text budget (art stays centered).
         let m = metrics_for_width(1920.0, 1080.0);
         let neighbor_wrap = m.center_w * SCALE_AT_1;
         let stride_12 = unit_stride(1.0, m.center_w);
@@ -1216,6 +1234,52 @@ mod tests {
             let bottom = slot_y_offset_h(d, &m) + arc_offset_y(d) + slot_child_size_h(&m, d).height;
             assert!(bottom <= m.slot_h + 0.01, "d={d} bottom={bottom}");
         }
+    }
+
+    #[test]
+    fn outer_wrap_fits_stride_at_every_step() {
+        // Outer titles span their own art width: at every outward step the
+        // two adjacent half-widths fit the stride with room to spare, so
+        // outer titles can never overlap each other or the d=1 neighbor.
+        // (Own-art widths are the capsule widths, so the spare is exactly
+        // STRIDE_GAP by construction; assert 8 to pin it against drift.)
+        for center_w in [
+            CENTER_H_MIN * ASPECT,
+            metrics_for_width(1920.0, 1080.0).center_w,
+        ] {
+            let neighbor_wrap = center_w * SCALE_AT_1;
+            let outer2 = h_outer_wrap_width(center_w, 2);
+            assert!((outer2 - center_w * scale_at_distance(2.0)).abs() < 0.01);
+            let stride_12 = unit_stride(1.0, center_w);
+            assert!(
+                (outer2 + neighbor_wrap) * 0.5 + 8.0 <= stride_12,
+                "wrap={outer2}+{neighbor_wrap} stride={stride_12}"
+            );
+            for d in [2_isize, 3, 4] {
+                let w0 = h_outer_wrap_width(center_w, d);
+                let w1 = h_outer_wrap_width(center_w, d + 1);
+                let stride = unit_stride(d as f32, center_w);
+                assert!(
+                    (w0 + w1) * 0.5 + 8.0 <= stride,
+                    "d={d} wraps={w0}+{w1} stride={stride}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn outer_text_fits_reserve() {
+        // A heavy outer stack — 3-line 18px title + 2-line 14px meta +
+        // Update badge — fits the shared reserve, so showing text on outer
+        // peeks never clips at the strip edge.
+        let title3 = H_TITLE_OUTER_SIZE * 1.3 * 3.0;
+        let meta2 = 14.0 * 1.3 * 2.0 + 2.0;
+        let badge = 25.0;
+        let need = title3 + 6.0 + meta2 + 6.0 + badge;
+        assert!(
+            need <= H_TEXT_RESERVE,
+            "need={need} reserve={H_TEXT_RESERVE}"
+        );
     }
 
     #[test]

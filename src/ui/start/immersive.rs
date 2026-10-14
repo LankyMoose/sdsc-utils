@@ -499,9 +499,10 @@ fn games_stage(
         let fade = vstrip::opacity_at_distance(dist) * list_opacity;
         let row = &state.rows[idx];
         let selected_slot = idx == selected;
-        // Integer offset from the selection: horizontal outer peeks (|offset|
-        // >= 2) show art only so small titles can never overlap. Stable
-        // across the scroll animation (unlike the fractional `dist`).
+        // Integer offset from the selection: stable across the scroll
+        // animation (unlike the fractional `dist`). Outer peeks (|offset|
+        // >= 2) render their title + meta at their own art width (see
+        // `strip_slot_stacked`), so every visible cover carries its labels.
         let sel_offset = idx as isize - selected as isize;
         let overlay = if selected_slot && list_opacity > 0.85 {
             Some(hero_hint_overlay(row, state))
@@ -688,12 +689,14 @@ fn strip_slot<'a>(
     let art_h = metrics.center_h * scale;
 
     if orientation == StripOrientation::Horizontal {
-        // Every slot carries its in-slot title + meta — the selection included,
-        // so titles ride along with their card like the vertical layout's side
-        // column (no separate full-width crossfade layer). Outer peeks
-        // (|offset| >= 2) stay art-only so small titles can never overlap,
-        // and stages too short for the text budget go art-only too.
-        let show_text = sel_offset.abs() < 2 && metrics.h_text_budget > 0.0;
+        // Every slot carries its in-slot title + meta — the selection and
+        // the outer peeks included — so titles ride along with their card
+        // like the vertical layout's side column (no separate full-width
+        // crossfade layer). Outer peeks (`|offset| >= 2`) use their own
+        // narrower art-width wrap + smaller type (see `strip_slot_stacked`)
+        // so adjacent titles can never overlap; stages too short for the
+        // text budget go art-only.
+        let show_text = metrics.h_text_budget > 0.0;
         return strip_slot_stacked(
             row,
             muted,
@@ -706,6 +709,7 @@ fn strip_slot<'a>(
             show_text,
             metrics.center_w,
             dist,
+            sel_offset,
         );
     }
 
@@ -837,15 +841,17 @@ fn status_block<'a>(
 }
 
 /// Horizontal item: art on top with a small centered title + meta below it.
-/// Every slot that shows text uses this same block — the selection included,
-/// so its title animates with the card exactly like its neighbors — and outer
-/// peeks stay art-only. Titles wrap (`Wrapping::Word`) inside an interpolated
-/// width ([`vstrip::h_title_wrap_width_at`]): size, bounds, and color glide
-/// with the fractional scroll `dist` so both keep the same line breaks and
-/// adjacent slots can never overlap (wrap widths stay narrower than the slot
-/// stride). `Weight` cannot interpolate, so bold flips at the halfway point
-/// when both sides render near-identical sizes. Launch/Close/edit cues still
-/// overlay the capsule via `strip_capsule`.
+/// Every slot that shows text uses this same block — the selection, the
+/// neighbors, and the outer peeks — so each title animates with its card
+/// exactly like the others. Inner slots (`|offset| < 2`) share the same-wrap
+/// neighbor bounds ([`vstrip::h_title_wrap_width_at`]); outer peeks use
+/// their own narrower art-width wrap ([`vstrip::h_outer_wrap_width`]) at
+/// [`vstrip::H_TITLE_OUTER_SIZE`] so adjacent titles can never overlap.
+/// Titles wrap (`Wrapping::Word`) inside a per-slot fixed width keyed on the
+/// stable integer offset, so breaks never reflow mid-scroll. `Weight` cannot
+/// interpolate, so bold flips at the halfway point when both sides render
+/// near-identical sizes. Launch/Close/edit cues still overlay the capsule
+/// via `strip_capsule`.
 #[allow(clippy::too_many_arguments)]
 fn strip_slot_stacked<'a>(
     row: &'a StartRow,
@@ -859,6 +865,7 @@ fn strip_slot_stacked<'a>(
     show_text: bool,
     center_w: f32,
     dist: f32,
+    sel_offset: isize,
 ) -> Element<'a, StartMessage> {
     let art_w = art_w.max(1.0);
     let label: Element<'_, StartMessage> = if show_text {
@@ -870,10 +877,21 @@ fn strip_slot_stacked<'a>(
         // Continuous selectionness from the fractional scroll distance: size,
         // wrap width, and color ease with the art instead of popping on the
         // first frame (the old `selected: bool` flipped instantly while the
-        // strip eased over ~200ms).
+        // strip eased over ~200ms). Outer peeks keep their own narrower wrap
+        // and smaller type throughout the glide (keyed on the integer offset,
+        // which is stable across the animation).
+        let outer = sel_offset.abs() >= 2;
         let t = vstrip::h_title_selectionness(dist);
-        let wrap_w = vstrip::h_title_wrap_width_at(center_w, dist).max(1.0);
-        let size = vstrip::h_title_size_at(dist);
+        let wrap_w = if outer {
+            vstrip::h_outer_wrap_width(center_w, sel_offset).max(1.0)
+        } else {
+            vstrip::h_title_wrap_width_at(center_w, dist).max(1.0)
+        };
+        let size = if outer {
+            vstrip::H_TITLE_OUTER_SIZE
+        } else {
+            vstrip::h_title_size_at(dist)
+        };
         // Weight has no fractional step in iced: flip mid-scroll where both
         // sides are near-identical sizes so the pop hides in the glide.
         let bold = t > 0.5;
@@ -908,12 +926,10 @@ fn strip_slot_stacked<'a>(
             .center_x(Length::Fixed(max_art_w))
             .into()
     } else {
-        // Art only: outer peeks stay quiet so small titles can never overlap
-        // (same-wrap neighbor titles are wider than the 1→2 stride — see
-        // `outer_peek_titles_would_overlap`). Zero-height (no inter-block
-        // spacing); the slot box still carries the shared text budget (see
-        // `slot_child_size_h`), so the art stays on the shared centerline
-        // and the box bottom still meets the strip bottom.
+        // Art only on stages too short for the text budget: zero-height (no
+        // inter-block spacing); the slot box still carries the shared text
+        // budget (see `slot_child_size_h`), so the art stays on the shared
+        // centerline and the box bottom still meets the strip bottom.
         container(space())
             .width(Length::Fixed(max_art_w))
             .height(Length::Shrink)
