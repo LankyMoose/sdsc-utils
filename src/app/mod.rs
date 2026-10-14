@@ -10,10 +10,6 @@ use crate::controller::dualsense::identity as dualsense;
 use crate::controller::dualsense::lightbar;
 use crate::controller::dualsense::rumble::MotorPulse;
 
-/// Battery level a freshly created emulated pad starts at.
-#[cfg(debug_assertions)]
-const DEFAULT_EMU_PERCENT: u8 = 50;
-
 #[cfg(debug_assertions)]
 use crate::controller::emulate;
 use crate::controller::hid::poll::{
@@ -117,14 +113,11 @@ const START_UNFOCUS_GRACE: Duration = Duration::from_millis(150);
 const START_CURSOR_IDLE_HIDE: Duration = Duration::from_secs(2);
 /// Kick Steam scan if Start never opened / settled (tray-only boot).
 const STEAM_SCAN_IDLE_FALLBACK: Duration = Duration::from_secs(2);
-/// Shell-client retries for the service-owned start selection (`ClientIpcSync`
-/// ticks every 250ms, so this covers ~10s before falling back to defaults).
-const START_SELECTION_SYNC_RETRIES: u8 = 40;
-/// Shell-client retries for the boot-time controller pull (same ~10s window).
-/// Covers the attach race where the service's initial Controllers push lands on
-/// the command connection before the broadcast receiver attaches: without a
-/// pull the shell stays empty, never sets input-hot, and no PadInput arrives.
-const CONTROLLERS_SYNC_RETRIES: u8 = 40;
+/// Shell-client retries for the retained snapshot pull (same ~10s window).
+/// The snapshot carries live + remembered + prefs + analytics + selection in
+/// one rev-gated message; this closes the attach race where the service's
+/// newcomer push lands before the broadcast receiver is live.
+const SNAPSHOT_SYNC_RETRIES: u8 = 40;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -354,14 +347,13 @@ pub struct App {
     start_selection_shadow: Option<crate::session::StartSelection>,
     /// True once this shell lifetime reported a selection (local is newest).
     start_selection_dirty: bool,
-    /// True until the first stored selection arrives (boot request retries).
-    start_selection_sync_pending: bool,
-    /// Boot-request attempts sent so far (stops at [`START_SELECTION_SYNC_RETRIES`]).
-    start_selection_sync_attempts: u8,
-    /// True until the service answers our boot-time controller pull (client mode).
-    controllers_sync_pending: bool,
-    /// Controller-pull attempts sent so far (stops at [`CONTROLLERS_SYNC_RETRIES`]).
-    controllers_sync_attempts: u8,
+    /// Last retained-snapshot rev applied from the service (client mode).
+    /// Stale (`rev <= applied`) snapshots are ignored; 0 means none yet.
+    snapshot_rev_applied: u64,
+    /// True until the first retained snapshot arrives (boot request retries).
+    snapshot_sync_pending: bool,
+    /// Snapshot-pull attempts sent so far (stops at [`SNAPSHOT_SYNC_RETRIES`]).
+    snapshot_sync_attempts: u8,
 
     toast_window: Option<window::Id>,
     toast_message: Option<ToastMessage>,
@@ -394,11 +386,15 @@ pub struct App {
 ///
 /// Publishing runs the normal connect/notify path, so it is deliberately
 /// debounced: a drag must not emit a toast (or open Start) per frame.
+/// In client mode the previewed level lives here (the tab fleet is derived
+/// from the service snapshot); in standalone it mirrors the fleet edit.
 #[cfg(debug_assertions)]
 struct PendingEmulatorCommit {
     deadline: Instant,
     /// Advanced by the commit tick so the pending spinner animates.
     tick: u32,
+    /// Previewed level, shown in the tab until the commit lands.
+    percent: u8,
 }
 
 /// Quiet period after the last battery-slider change before it publishes.
@@ -424,14 +420,43 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// Iced shell attached to the HID/tray service (no local DualSense HID owner).
 pub fn run_shell_client() -> Result<(), Box<dyn std::error::Error>> {
     crate::platform::app_log::info("shell: client mode (service owns HID + tray)");
-    // Wait for the service endpoint only — do not TCP-connect here. A probe connect
-    // registers as a shell client and can steal a latched OpenStart before iced boots.
+    // Wait for the service endpoint before the first TCP connect. A bare
+    // probe connect would register as a shell client and could steal a
+    // latched OpenStart before iced boots — so the one connection opened
+    // here is handshook, verified, and seeded into the command client
+    // (never dropped).
+    let mut ready = false;
     for _ in 0..50 {
         if crate::ipc::service_endpoint_ready() {
+            ready = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    if !ready {
+        return Err("shell: no service endpoint (service not running); quitting".into());
+    }
+    // Strict version gate: a shell that cannot prove its service speaks the
+    // same IPC protocol quits instead of limping on half-understood messages.
+    // (An unversioned pre-handshake service never answers: timeout → quit.)
+    let mut client = crate::ipc::PipeClient::connect()
+        .map_err(|e| format!("shell: no service (connect failed: {e}); quitting"))?;
+    let (protocol, version) = client
+        .handshake(std::time::Duration::from_secs(3))
+        .map_err(|e| format!("shell: version handshake failed ({e}); quitting"))?;
+    if protocol != crate::ipc::IPC_PROTOCOL_VERSION {
+        return Err(format!(
+            "shell: ipc protocol mismatch (shell {} vs service {protocol} v{version}); quitting",
+            crate::ipc::IPC_PROTOCOL_VERSION
+        )
+        .into());
+    }
+    crate::platform::app_log::info(format!(
+        "shell: service handshake ok (protocol {protocol} v{version})"
+    ));
+    // Hand the verified connection to the command client instead of dropping
+    // it: no throwaway probe that could steal a latched newcomer message.
+    crate::ipc::seed_command_client(client);
     run_app_as_client()
 }
 
@@ -465,60 +490,9 @@ fn run_app_as_client() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Sync the remembered store with the fleet's remember flags, so
-/// disconnected pads appear in the normal remembered-but-off list and
-/// forgotten ones do not survive a restart.
-///
-/// `previous` is the fleet as it was *before* the command. Pads that
-/// `emulate::prune` dropped are absent from `current` by now, so they can only
-/// be found here — without them a forgotten pad would leave the fleet but stay
-/// on disk, and reappear on the next boot.
-///
-/// Connected pads are written too: a pad is only *listed* after an unplug, but
-/// a connected pad's level and link should still be current if it is unplugged
-/// later.
-///
-/// Returns whether anything changed, so the caller decides about saving.
-#[cfg(debug_assertions)]
-fn sync_remembered_emulated(
-    previous: &[emulate::EmulatedPad],
-    current: &[emulate::EmulatedPad],
-    known: &mut crate::controller::known::KnownControllers,
-) -> bool {
-    let mut changed = false;
-    for pad in current {
-        if pad.remembered {
-            changed |= known.remember(&pad.status);
-        } else {
-            // Forgetting takes effect in the store straight away, exactly as
-            // `toggle_remember` does for real hardware: the pad may still be on
-            // screen while connected, but it is no longer remembered, so an
-            // unplug leaves nothing behind.
-            changed |= known.forget(pad.serial());
-        }
-    }
-    // Pads that left the fleet were pruned, and pruning only ever drops pads
-    // that are both unplugged and forgotten — so make sure they are gone from
-    // the store too, or they would still come back after a restart.
-    for pad in previous {
-        if current.iter().any(|p| p.serial() == pad.serial()) {
-            continue;
-        }
-        changed |= known.forget(pad.serial());
-    }
-    changed
-}
-
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
-
-/// Whether the shell should (re)send its boot-time controller pull: client
-/// mode, still waiting for an answer, still showing no controllers, and
-/// attempts remaining. Unit-testable without an [`App`].
-fn controllers_pull_due(client_mode: bool, pending: bool, empty: bool, attempts: u8) -> bool {
-    client_mode && pending && empty && attempts < CONTROLLERS_SYNC_RETRIES
-}
 
 impl App {
     fn boot(client_mode: bool) -> (Self, Task<Message>) {
@@ -638,10 +612,9 @@ impl App {
             start_opened_at: None,
             start_selection_shadow: None,
             start_selection_dirty: false,
-            start_selection_sync_pending: false,
-            start_selection_sync_attempts: 0,
-            controllers_sync_pending: false,
-            controllers_sync_attempts: 0,
+            snapshot_rev_applied: 0,
+            snapshot_sync_pending: false,
+            snapshot_sync_attempts: 0,
             toast_window: None,
             toast_message: None,
             toast_queue: VecDeque::new(),
@@ -663,16 +636,12 @@ impl App {
             app.create_tray();
         }
         if client_mode {
-            // Ask the service for the stored start selection (survives shell
-            // restarts). The reply arrives on the IPC broadcast; retries ride
+            // Pull the retained snapshot (live + remembered + prefs +
+            // analytics + selection, one rev). This is the single convergent
+            // path that heals stale boot-time disk copies; retries ride
             // `ClientIpcSync` in case the shell's recv loop is not live yet.
-            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RequestStartSelection);
-            app.start_selection_sync_pending = true;
-            // Pull the live controller list on the same retry loop. The service
-            // re-pushes Controllers on every new transport, but this closes the
-            // loop when that push raced the broadcast receiver's attach.
-            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::ListControllers);
-            app.controllers_sync_pending = true;
+            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RequestSnapshot);
+            app.snapshot_sync_pending = true;
         }
         #[cfg(all(windows, debug_assertions))]
         start_hitch_hotkey_worker();
@@ -1051,7 +1020,11 @@ impl App {
                     self.clear_start_nav_diag();
                     self.consume_reopen_gesture_chord();
                     let sync = self.sync_toast_zorder();
-                    if self.session.start_auto_open_pending
+                    // Standalone only: the service owns the auto-open latch in
+                    // client mode (`pending_open_start` + `OpenStart` effects)
+                    // and this shell's flag never arms there.
+                    if !self.client_mode
+                        && self.session.start_auto_open_pending
                         && self.session.prefs.start_screen_enabled
                         && self.session.prefs.start_screen_auto_open.auto_opens()
                         && crate::session::has_start_presence(
@@ -1428,8 +1401,7 @@ impl App {
             }
             Message::ClientIpcSync => {
                 self.sync_client_input_hot();
-                self.maybe_request_start_selection();
-                self.maybe_request_controllers();
+                self.maybe_request_snapshot();
                 Task::none()
             }
             Message::Service(msg) => self.on_service_message(msg),
@@ -1584,7 +1556,11 @@ impl App {
 
             Message::Exit => {
                 crate::controller::hid::diag::diag_info("ui-diag: process exit begin");
-                self.session.known.save();
+                // Single-writer: the service owns `controllers.json`; a client
+                // save here would race it with a stale copy.
+                if !self.client_mode {
+                    self.session.known.save();
+                }
                 // Drop every Start image Handle before iced tears down the GPU atlas.
                 self.start_visible = false;
                 self.start_nav_ready = false;
@@ -1809,7 +1785,10 @@ impl App {
                     }
                 }
                 SessionEffect::RefreshAnalyticsPanel => {
-                    if self.client_mode {
+                    // Records arrive via the retained snapshot in client mode
+                    // (single-writer: the service owns `analytics.json`); only
+                    // standalone reloads from disk.
+                    if !self.client_mode {
                         self.session.analytics = AnalyticsStore::load();
                     }
                     self.refresh_analytics_panel();
@@ -1829,41 +1808,36 @@ impl App {
         }
     }
 
-    /// Retry the stored-selection request until the service answers, this shell
-    /// reports its own selection (local is then newest), or attempts run out
-    /// (old service — fall back to current behavior).
-    fn maybe_request_start_selection(&mut self) {
-        if !self.client_mode || !self.start_selection_sync_pending || self.start_selection_dirty {
-            return;
+    /// Persist prefs: standalone writes directly; client mode sends an
+    /// absolute intent and converges on the snapshot echo (single-writer:
+    /// the service owns `prefs.json`). Local mutation is kept for
+    /// responsiveness (sliders); the service validates and wins.
+    fn save_prefs(&self) {
+        if self.client_mode {
+            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetPrefs {
+                prefs: self.session.prefs.clone(),
+            });
+        } else {
+            self.save_prefs();
         }
-        if self.start_selection_sync_attempts >= START_SELECTION_SYNC_RETRIES {
-            self.start_selection_sync_pending = false;
-            return;
-        }
-        self.start_selection_sync_attempts += 1;
-        let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RequestStartSelection);
     }
 
-    /// Retry the boot-time controller pull until the service answers (via
-    /// `ControllerList` or a `Controllers` push) or attempts run out.
-    ///
-    /// Only pulls while the shell still shows no controllers: an empty shell
-    /// never sets input-hot, so no PadInput edges ever arrive to heal it.
-    fn maybe_request_controllers(&mut self) {
-        let empty = self.session.controllers.is_empty();
-        if controllers_pull_due(
-            self.client_mode,
-            self.controllers_sync_pending,
-            empty,
-            self.controllers_sync_attempts,
-        ) {
-            self.controllers_sync_attempts += 1;
-            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::ListControllers);
-        } else if !empty || self.controllers_sync_attempts >= CONTROLLERS_SYNC_RETRIES {
-            // Synced via a Controllers push, or out of attempts — stop pulling.
-            // (Standalone shells never pull: pending is only armed in client mode.)
-            self.controllers_sync_pending = false;
+    /// Retry the retained-snapshot pull until the first snapshot lands or
+    /// attempts run out (no service — the handshake already failed, so this
+    /// is just the attach race with the broadcast receiver).
+    fn maybe_request_snapshot(&mut self) {
+        if !self.client_mode || !self.snapshot_sync_pending || self.snapshot_rev_applied > 0 {
+            if self.snapshot_rev_applied > 0 {
+                self.snapshot_sync_pending = false;
+            }
+            return;
         }
+        if self.snapshot_sync_attempts >= SNAPSHOT_SYNC_RETRIES {
+            self.snapshot_sync_pending = false;
+            return;
+        }
+        self.snapshot_sync_attempts += 1;
+        let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RequestSnapshot);
     }
 
     /// Apply a service-stored selection to the start lists (keys → indices).
@@ -1897,12 +1871,11 @@ impl App {
             return;
         }
         self.start_selection_shadow = Some(selection);
-        // Local nav is newer than any queued service reply — stop sync retries and
-        // ignore a stale `StartSelection` that arrives afterwards.
+        // Local nav is newer than any snapshot selection: the snapshot path
+        // keeps `dirty` until a shell restart.
         self.start_selection_dirty = true;
-        self.start_selection_sync_pending = false;
         let shadow = self.start_selection_shadow.clone().unwrap_or_default();
-        let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::ReportStartSelection {
+        let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetStartSelection {
             game_key: shadow.game_key,
             controller_key: shadow.controller_key,
         });
@@ -2275,14 +2248,14 @@ impl App {
                     NotificationSetting::Low => self.session.prefs.notify_low = enabled,
                     NotificationSetting::Charged => self.session.prefs.notify_charged = enabled,
                 }
-                self.session.prefs.save();
+                self.save_prefs();
                 Task::none()
             }
             ConfigureMessage::SetLowBatteryPercent(percent) => {
                 let percent = clamp_low_battery_percent(percent);
                 if self.session.prefs.low_battery_percent != percent {
                     self.session.prefs.low_battery_percent = percent;
-                    self.session.prefs.save();
+                    self.save_prefs();
                     self.sync_low_battery();
                     return self.sync_popup_rows_and_fit();
                 }
@@ -2290,18 +2263,18 @@ impl App {
             }
             ConfigureMessage::SetToastPosition(position) => {
                 self.session.prefs.toast_position = position;
-                self.session.prefs.save();
+                self.save_prefs();
                 self.show_position_preview()
             }
             ConfigureMessage::SetAnalyticsEnabled(enabled) => {
                 self.session.prefs.analytics_enabled = enabled;
-                self.session.prefs.save();
+                self.save_prefs();
                 self.refresh_analytics_panel();
                 self.sync_popup_rows_and_fit()
             }
             ConfigureMessage::SetLightbarEnabled(enabled) => {
                 self.session.prefs.lightbar_enabled = enabled;
-                self.session.prefs.save();
+                self.save_prefs();
                 lightbar::set_enabled(enabled);
                 self.sync_low_battery();
                 if enabled {
@@ -2313,7 +2286,7 @@ impl App {
             }
             ConfigureMessage::SetStartScreenEnabled(enabled) => {
                 self.session.prefs.start_screen_enabled = enabled;
-                self.session.prefs.save();
+                self.save_prefs();
                 if !enabled && self.start_visible {
                     return self.close_start_screen();
                 }
@@ -2378,7 +2351,7 @@ impl App {
             ConfigureMessage::RemoveSteamPath(index) => {
                 if index < self.session.prefs.extra_steam_paths.len() {
                     self.session.prefs.extra_steam_paths.remove(index);
-                    self.session.prefs.save();
+                    self.save_prefs();
                     self.configure_state.steam_path_error = None;
                     return self.refresh_steam_library();
                 }
@@ -2484,7 +2457,7 @@ impl App {
             return Task::none();
         }
 
-        self.session.prefs.save();
+        self.save_prefs();
 
         if !lightbar::is_enabled() {
             return Task::none();
@@ -2581,11 +2554,15 @@ impl App {
         self.start_state.powering_off = Some(serial.to_string());
         // Reconnect after user power-off should open Start again (not ghost-flap cooldown),
         // but only when this was the last pad — a sibling must not look like a fresh 0→1.
-        if crate::session::should_skip_connect_cooldown_on_power_off(
-            &self.session.controllers,
-            serial,
-            self.session.prefs.start_screen_auto_open.includes_usb(),
-        ) {
+        // Standalone only: in client mode the service marks on receipt, and
+        // this shell never evaluates cooldowns.
+        if !self.client_mode
+            && crate::session::should_skip_connect_cooldown_on_power_off(
+                &self.session.controllers,
+                serial,
+                self.session.prefs.start_screen_auto_open.includes_usb(),
+            )
+        {
             self.session.mark_skip_connect_cooldown();
         }
         if self.client_mode {
@@ -2600,28 +2577,87 @@ impl App {
     }
 
     fn toggle_remember(&mut self, serial: &str) -> Task<Message> {
+        #[cfg(debug_assertions)]
+        if is_emulated_serial(serial) {
+            // Emulated pads: the service owns the fleet. The pin rides the
+            // fleet intent (the fleet flag — not just the store — decides
+            // what survives an unplug).
+            if self.client_mode {
+                let remembered = !self
+                    .emulated_pads
+                    .iter()
+                    .find(|p| p.serial() == serial)
+                    .is_some_and(|p| p.remembered);
+                let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::Emu {
+                    command: EmulatorCommand::SetRemembered(serial.to_string(), remembered),
+                });
+            }
+            return Task::none();
+        }
+        #[cfg(not(debug_assertions))]
         if is_emulated_serial(serial) {
             return Task::none();
         }
 
+        // Optimistic local update for responsiveness; the service is the
+        // authority and the snapshot echo converges (single-writer: the
+        // service owns `controllers.json`).
+        let remembered;
         if self.session.known.is_remembered(serial) {
             self.session.known.forget(serial);
+            remembered = false;
         } else if let Some(controller) =
             self.session.controllers.iter().find(|c| c.serial == serial)
         {
             self.session.known.remember(controller);
+            remembered = true;
+        } else {
+            return Task::none();
         }
 
-        self.session.known.save();
+        if self.client_mode {
+            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetRemembered {
+                serial: serial.to_string(),
+                remembered,
+            });
+        } else {
+            self.session.known.save();
+        }
         self.sync_popup_rows_and_fit()
     }
 
     fn set_nickname(&mut self, serial: &str, nickname: Option<String>) -> Task<Message> {
+        #[cfg(debug_assertions)]
+        if is_emulated_serial(serial) {
+            // Nicknames live in the remembered store only (no fleet flag),
+            // so the generic intent suffices in client mode.
+            if self.client_mode {
+                if self.session.known.nickname(serial).map(str::to_string) != nickname {
+                    let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetNickname {
+                        serial: serial.to_string(),
+                        nickname: nickname.clone(),
+                    });
+                    // Optimistic echo for the tab/popup until the snapshot lands.
+                    self.session.known.set_nickname(serial, nickname);
+                    return self.sync_popup_rows_and_fit();
+                }
+                return Task::none();
+            }
+            return Task::none();
+        }
+        #[cfg(not(debug_assertions))]
         if is_emulated_serial(serial) {
             return Task::none();
         }
-        if self.session.known.set_nickname(serial, nickname) {
-            self.session.known.save();
+        if self.session.known.set_nickname(serial, nickname.clone()) {
+            if self.client_mode {
+                let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetNickname {
+                    serial: serial.to_string(),
+                    nickname,
+                });
+            } else {
+                self.session.known.save();
+            }
             self.sync_popup_rows_and_fit()
         } else {
             Task::none()
@@ -2632,6 +2668,9 @@ impl App {
     ///
     /// Advances the spinner every tick and commits once a pad has been quiet for
     /// [`EMULATOR_COMMIT_DEBOUNCE`]. Only subscribed while something is pending.
+    ///
+    /// Client mode sends the settled level as an intent (the service owns the
+    /// fleet); standalone publishes through the local session.
     #[cfg(debug_assertions)]
     fn on_emulator_commit_tick(&mut self) -> Task<Message> {
         if self.pending_emulator_commits.is_empty() {
@@ -2642,22 +2681,30 @@ impl App {
         for pending in self.pending_emulator_commits.values_mut() {
             pending.tick = pending.tick.wrapping_add(1);
         }
-        let due: Vec<String> = self
+        let due: Vec<(String, u8)> = self
             .pending_emulator_commits
             .iter()
             .filter(|(_, p)| now >= p.deadline)
-            .map(|(serial, _)| serial.clone())
+            .map(|(serial, p)| (serial.clone(), p.percent))
             .collect();
         if due.is_empty() {
             return Task::none();
         }
-        for serial in &due {
+        for (serial, _) in &due {
             self.pending_emulator_commits.remove(serial);
         }
         crate::controller::hid::diag::diag_info(format!(
             "ui-diag: emulator debounce committed {}",
             due.len()
         ));
+        if self.client_mode {
+            for (serial, percent) in due {
+                let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::Emu {
+                    command: EmulatorCommand::PreviewPercent(serial, percent),
+                });
+            }
+            return Task::none();
+        }
         self.last_battery_poll = Instant::now();
         self.apply_controllers(self.live_controllers())
     }
@@ -2665,7 +2712,9 @@ impl App {
     /// The emulated pad whose battery level is waiting out its debounce.
     ///
     /// Only the pad the Controllers tab has selected can show its spinner, so this
-    /// resolves the selection to a concrete change.
+    /// resolves the selection to a concrete change. Percent comes from the
+    /// preview overlay (client mode commits it on debounce; standalone mirrors
+    /// the fleet edit into the overlay — see `PreviewPercent` below).
     #[cfg(debug_assertions)]
     fn pending_emulator_changes(&self) -> Vec<configure_view::PendingEmulatorChange> {
         self.emulated_pads
@@ -2674,11 +2723,54 @@ impl App {
                 let pending = self.pending_emulator_commits.get(pad.serial())?;
                 Some(configure_view::PendingEmulatorChange {
                     serial: pad.serial().to_string(),
-                    percent: pad.status.percent,
+                    percent: pending.percent,
                     tick: pending.tick,
                 })
             })
             .collect()
+    }
+
+    /// Developer emulator edit in client mode: the service owns the fleet,
+    /// so every edit except the drag preview crosses IPC as an intent and
+    /// the tab fleet re-derives from the snapshot echo. The preview stays
+    /// local (repaint only) until the debounce commits it the same way.
+    #[cfg(debug_assertions)]
+    fn apply_emulator_command_via_service(&mut self, command: EmulatorCommand) -> Task<Message> {
+        match command {
+            EmulatorCommand::PreviewPercent(serial, percent) => {
+                self.pending_emulator_commits.insert(
+                    serial,
+                    PendingEmulatorCommit {
+                        deadline: Instant::now() + EMULATOR_COMMIT_DEBOUNCE,
+                        tick: 0,
+                        percent,
+                    },
+                );
+                Task::none()
+            }
+            EmulatorCommand::RemovePad(serial) => {
+                self.pending_emulator_commits.remove(&serial);
+                let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::Emu {
+                    command: EmulatorCommand::RemovePad(serial),
+                });
+                Task::none()
+            }
+            EmulatorCommand::SetConnected(serial, connected) => {
+                if !connected {
+                    // Nothing left to publish to; drop the armed timer so the
+                    // commit cannot fire against a pad that is no longer live.
+                    self.pending_emulator_commits.remove(&serial);
+                }
+                let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::Emu {
+                    command: EmulatorCommand::SetConnected(serial, connected),
+                });
+                Task::none()
+            }
+            command => {
+                let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::Emu { command });
+                Task::none()
+            }
+        }
     }
 
     /// True while any emulated pad is plugged in — HID polling stands down so
@@ -2704,6 +2796,9 @@ impl App {
 
     #[cfg(debug_assertions)]
     fn apply_emulator_command(&mut self, command: EmulatorCommand) -> Task<Message> {
+        if self.client_mode {
+            return self.apply_emulator_command_via_service(command);
+        }
         let fleet = self.emulated_pads.clone();
         let find = |serial: &str| fleet.iter().find(|p| p.serial() == serial).cloned();
 
@@ -2711,7 +2806,7 @@ impl App {
         // policy, analytics edges); `analytics` covers the charge/drain walk.
         let (next_fleet, publish, analytics) = match &command {
             EmulatorCommand::AddPad => {
-                let pad = emulate::new_pad(&fleet, DEFAULT_EMU_PERCENT, Connection::Bluetooth);
+                let pad = emulate::new_pad(&fleet, emulate::DEFAULT_PERCENT, Connection::Bluetooth);
                 let mut next = fleet.clone();
                 next.push(pad);
                 // Remembered but disconnected: no toast, no Start window.
@@ -2739,6 +2834,7 @@ impl App {
                         PendingEmulatorCommit {
                             deadline: Instant::now() + EMULATOR_COMMIT_DEBOUNCE,
                             tick: 0,
+                            percent: *percent,
                         },
                     );
                 }
@@ -2811,14 +2907,18 @@ impl App {
         // see pads that `prune` dropped.
         let previous = std::mem::take(&mut self.emulated_pads);
         self.emulated_pads = next_fleet;
-        if sync_remembered_emulated(&previous, &self.emulated_pads, &mut self.session.known) {
+        if emulate::sync_remembered_emulated(
+            &previous,
+            &self.emulated_pads,
+            &mut self.session.known,
+        ) {
             self.session.known.save();
         }
 
         // Analytics state only means anything once it is recording.
         if analytics && !self.session.prefs.analytics_enabled {
             self.session.prefs.analytics_enabled = true;
-            self.session.prefs.save();
+            self.save_prefs();
             app_log::info("analytics enabled for developer emulator");
         }
         if analytics {
@@ -3551,7 +3651,7 @@ impl App {
         }
         self.configure_state.steam_path_error = None;
         self.session.prefs.extra_steam_paths.push(path);
-        self.session.prefs.save();
+        self.save_prefs();
         self.refresh_steam_library()
     }
 
@@ -3603,13 +3703,13 @@ impl App {
 
     fn apply_start_screen_always_immersive(&mut self, enabled: bool) -> Task<Message> {
         self.session.prefs.start_screen_always_immersive = enabled;
-        self.session.prefs.save();
+        self.save_prefs();
         Task::none()
     }
 
     fn apply_start_screen_clock(&mut self, enabled: bool) -> Task<Message> {
         self.session.prefs.start_screen_clock_enabled = enabled;
-        self.session.prefs.save();
+        self.save_prefs();
         Task::none()
     }
 
@@ -3625,7 +3725,7 @@ impl App {
         }
         let from = self.session.prefs.start_screen_immersive_layout;
         self.session.prefs.start_screen_immersive_layout = layout;
-        self.session.prefs.save();
+        self.save_prefs();
         // Covers both the Configure pick-list and the Start drawer dropdown:
         // animate only on an actual change, showing the old orientation
         // through the first half of the transition.
@@ -3642,7 +3742,7 @@ impl App {
         {
             self.session.prefs.start_screen_inactive_secs = inactive;
             self.session.prefs.start_screen_sleep_secs = sleep;
-            self.session.prefs.save();
+            self.save_prefs();
         }
         Task::none()
     }
@@ -3655,7 +3755,7 @@ impl App {
         {
             self.session.prefs.start_screen_inactive_secs = inactive;
             self.session.prefs.start_screen_sleep_secs = sleep;
-            self.session.prefs.save();
+            self.save_prefs();
         }
         Task::none()
     }
@@ -3664,7 +3764,7 @@ impl App {
         let percent = clamp_start_screen_inactive_dim_percent(percent);
         if self.session.prefs.start_screen_inactive_dim_percent != percent {
             self.session.prefs.start_screen_inactive_dim_percent = percent;
-            self.session.prefs.save();
+            self.save_prefs();
         }
         Task::none()
     }
@@ -3678,7 +3778,13 @@ impl App {
             return Task::none();
         }
         self.session.prefs.start_screen_auto_open = mode;
-        self.session.prefs.save();
+        self.save_prefs();
+        if self.client_mode {
+            // Service owns Start-open policy: it re-evaluates the USB scope
+            // on the `SetPrefs` intent and sends `CloseStart` when USB pads
+            // no longer qualify. Never double-apply locally.
+            return Task::none();
+        }
         if !mode.auto_opens() {
             // Disabling auto-open clears any latched auto-open; never opens
             // or closes here.
@@ -3689,7 +3795,7 @@ impl App {
             return Task::none();
         }
         // Scope flip may CloseStart when USB pads no longer qualify; never opens.
-        // Client mode: service reloads prefs within ~2s and applies the same rule.
+        // Standalone only (client mode returned above).
         let ctx = crate::session::ApplyContext {
             start_visible: self.start_visible,
             fullscreen: start_input::foreground_is_exclusive_fullscreen(),
@@ -3702,7 +3808,7 @@ impl App {
 
     fn apply_start_screen_sounds(&mut self, enabled: bool) -> Task<Message> {
         self.session.prefs.start_screen_sounds_enabled = enabled;
-        self.session.prefs.save();
+        self.save_prefs();
         if enabled {
             self.play_start_sound(UiSoundKind::Nav);
         }
@@ -3713,7 +3819,7 @@ impl App {
         let volume = clamp_start_screen_sound_volume(volume);
         if self.session.prefs.start_screen_sound_volume != volume {
             self.session.prefs.start_screen_sound_volume = volume;
-            self.session.prefs.save();
+            self.save_prefs();
             if self.session.prefs.start_screen_sounds_enabled {
                 self.play_start_sound(UiSoundKind::Nav);
             }
@@ -3723,7 +3829,7 @@ impl App {
 
     fn apply_start_screen_haptics(&mut self, enabled: bool) -> Task<Message> {
         self.session.prefs.start_screen_haptics_enabled = enabled;
-        self.session.prefs.save();
+        self.save_prefs();
         if enabled {
             self.preview_haptic_all(MotorPulse::NAV);
         } else if self.client_mode {
@@ -3738,7 +3844,7 @@ impl App {
         let strength = clamp_start_screen_haptics_strength(strength);
         if self.session.prefs.start_screen_haptics_strength != strength {
             self.session.prefs.start_screen_haptics_strength = strength;
-            self.session.prefs.save();
+            self.save_prefs();
             if self.session.prefs.start_screen_haptics_enabled {
                 self.preview_haptic_all(MotorPulse::NAV);
             }
@@ -4901,7 +5007,7 @@ impl App {
             return None;
         }
         self.session.prefs.games_sort_mode = self.session.prefs.games_sort_mode.cycle();
-        self.session.prefs.save();
+        self.save_prefs();
         self.refresh_start_rows();
         if self.start_state.immersive {
             self.start_state
@@ -4928,7 +5034,7 @@ impl App {
             return None;
         }
         self.session.prefs.show_all_controllers = show_all;
-        self.session.prefs.save();
+        self.save_prefs();
         app_log::hid_trace(format!(
             "start-controllers: show_all={}",
             u8::from(show_all)
@@ -5194,12 +5300,6 @@ impl App {
     fn on_service_message(&mut self, msg: crate::ipc::ServiceMessage) -> Task<Message> {
         use crate::ipc::ServiceMessage;
         match msg {
-            ServiceMessage::Controllers(controllers) => self.apply_service_controllers(controllers),
-            ServiceMessage::ControllerList(Ok(controllers)) => {
-                // Reply to the boot-time pull (see `maybe_request_controllers`).
-                self.controllers_sync_pending = false;
-                self.apply_service_controllers(controllers)
-            }
             ServiceMessage::Effects(effects) => self.apply_session_effects(effects),
             ServiceMessage::PadInput(edge) => {
                 #[cfg(debug_assertions)]
@@ -5223,62 +5323,92 @@ impl App {
                 events,
                 open_start_after_toast,
             } => self.queue_notifications(events, open_start_after_toast),
-            ServiceMessage::StartSelection {
-                game_key,
-                controller_key,
-            } => {
-                if self.start_selection_dirty {
-                    // This shell already reported its own selection — local is
-                    // newer than this (possibly queued) reply.
-                    return Task::none();
-                }
-                self.start_selection_sync_pending = false;
-                let selection = crate::session::StartSelection {
-                    game_key,
-                    controller_key,
-                };
-                if self.apply_start_selection(&selection) && self.start_visible {
-                    self.scroll_start_selection_into_view()
-                        .chain(self.warm_start_art_task())
-                } else {
-                    Task::none()
-                }
-            }
             ServiceMessage::Shutdown => self.update(Message::Exit),
+            // Broadcast copy of a handshake reply (for another transport);
+            // the handshake path consumes its own. Nothing to apply.
+            ServiceMessage::Version { .. } => Task::none(),
+            ServiceMessage::Snapshot(snap) => self.apply_snapshot(&snap),
             ServiceMessage::Ack
-            | ServiceMessage::ControllerList(Err(_))
+            | ServiceMessage::ControllerList(_)
             | ServiceMessage::LightbarSet { .. } => Task::none(),
         }
     }
 
-    /// Apply a service-owned controller snapshot (push or pull reply).
+    /// Apply the retained service snapshot wholesale (client mode).
     ///
-    /// Service already ran session + HID; refresh shell UI only when changed.
-    /// A live add/remove changes the popup row count, so refit while open.
-    fn apply_service_controllers(&mut self, controllers: Vec<ControllerStatus>) -> Task<Message> {
-        let fit =
-            if !crate::session::controllers_equivalent(&self.session.controllers, &controllers) {
-                self.session.controllers = controllers;
-                if self
-                    .start_state
-                    .powering_off
-                    .as_ref()
-                    .is_some_and(|s| !self.session.controllers.iter().any(|c| c.serial == *s))
-                {
-                    self.start_state.powering_off = None;
-                }
-                let fit = self.sync_popup_rows_and_fit();
-                if self.start_visible {
-                    self.refresh_start_controllers();
-                }
-                fit
-            } else {
-                Task::none()
-            };
+    /// Rev-gated: stale or duplicate snapshots are ignored. Replaces live
+    /// rows, remembered records, nicknames, prefs, analytics records, and the
+    /// stored selection in one step so keys and the rows they point at always
+    /// arrive together. This is the convergent path that heals stale
+    /// boot-time disk copies (full-charge + unplug class).
+    fn apply_snapshot(&mut self, snap: &crate::session::SessionSnapshot) -> Task<Message> {
+        if snap.rev <= self.snapshot_rev_applied {
+            return Task::none();
+        }
+        self.snapshot_rev_applied = snap.rev;
+        self.snapshot_sync_pending = false;
+
+        self.session.controllers = snap.live.clone();
+        self.session
+            .known
+            .apply_snapshot(snap.remembered.clone(), snap.nicknames.clone());
+        self.session.prefs = snap.prefs.clone();
+        color::set_active_spectrum(self.session.prefs.spectrum.clone());
+        lightbar::set_enabled(self.session.prefs.lightbar_enabled);
+        self.session
+            .analytics
+            .apply_snapshot(snap.analytics.clone());
+        self.refresh_analytics_panel();
+        #[cfg(debug_assertions)]
+        self.derive_emu_fleet_from_snapshot(snap);
+
+        // Stored selection: local nav wins while dirty (the reporting
+        // shell already holds the value it sent via `SetStartSelection`).
+        let mut select_task = Task::none();
+        if !self.start_selection_dirty
+            && self.apply_start_selection(&snap.selection)
+            && self.start_visible
+        {
+            select_task = self
+                .scroll_start_selection_into_view()
+                .chain(self.warm_start_art_task());
+        }
+
+        if self
+            .start_state
+            .powering_off
+            .as_ref()
+            .is_some_and(|s| !self.session.controllers.iter().any(|c| c.serial == *s))
+        {
+            self.start_state.powering_off = None;
+        }
+        let fit = self.sync_popup_rows_and_fit();
+        if self.start_visible {
+            self.refresh_start_controllers();
+        }
         #[cfg(debug_assertions)]
         note_client_hitch_controllers(self.session.controllers.len());
         self.sync_client_input_hot();
-        fit
+        fit.chain(select_task)
+    }
+
+    /// Rebuild the Controllers-tab fleet from the snapshot (client mode).
+    ///
+    /// The service owns the fleet; this shell keeps a derived view for the
+    /// debug tab only: remembered `emu-` records rehydrate disconnected,
+    /// live rows mark connected (with the service's level/link/state), and
+    /// the local drag-preview overlay repaints on top. Anything the snapshot
+    /// no longer contains (pruned pads) drops the overlay with it.
+    #[cfg(debug_assertions)]
+    fn derive_emu_fleet_from_snapshot(&mut self, snap: &crate::session::SessionSnapshot) {
+        let previews: std::collections::HashMap<String, u8> = self
+            .pending_emulator_commits
+            .iter()
+            .map(|(serial, pending)| (serial.clone(), pending.percent))
+            .collect();
+        self.emulated_pads = emulate::derive_view_fleet(&snap.live, &snap.remembered, &previews);
+        self.pending_emulator_commits
+            .retain(|serial, _| self.emulated_pads.iter().any(|p| p.serial() == serial));
     }
 
     fn on_pad_input(&mut self, edge: crate::domain::pad::InputEdge) -> Task<Message> {
@@ -6421,6 +6551,43 @@ impl Drop for InputEdgeBindGuard {
     }
 }
 
+/// Connect to the service and prove it speaks our IPC protocol.
+///
+/// Retries connects for ~5s (service may be restarting under crash-restart);
+/// once connected there is exactly one handshake attempt — a timeout means
+/// an unversioned pre-handshake service, a mismatch means mixed binaries.
+/// Either way the caller quits; retrying cannot fix a version gap.
+fn ipc_connect_with_handshake() -> Result<crate::ipc::PipeClient, String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match crate::ipc::PipeClient::connect() {
+            Ok(mut client) => match client.handshake(Duration::from_secs(2)) {
+                Ok((protocol, version)) => {
+                    if protocol != crate::ipc::IPC_PROTOCOL_VERSION {
+                        return Err(format!(
+                            "ipc protocol mismatch (shell {} vs service {protocol} v{version})",
+                            crate::ipc::IPC_PROTOCOL_VERSION
+                        ));
+                    }
+                    crate::platform::app_log::info(format!(
+                        "shell: ipc receive connected (protocol {protocol} v{version})"
+                    ));
+                    return Ok(client);
+                }
+                Err(err) => {
+                    return Err(format!("version handshake failed ({err})"));
+                }
+            },
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    return Err("no service (connect failed)".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
 /// Shell-client: drain service IPC messages into iced.
 ///
 /// Blocking TCP reads run on a dedicated thread. Doing them inside the
@@ -6433,10 +6600,18 @@ fn service_message_stream() -> impl Stream<Item = Message> {
             .name("sdsc-ipc-recv".into())
             .spawn(move || {
                 loop {
-                    let client = loop {
-                        match crate::ipc::PipeClient::connect() {
-                            Ok(c) => break c,
-                            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+                    // (Re)connect with a version handshake. No service within
+                    // budget, or a protocol mismatch / unversioned service,
+                    // means quit — a shell must never limp along on
+                    // half-understood messages.
+                    let client = match ipc_connect_with_handshake() {
+                        Ok(c) => c,
+                        Err(reason) => {
+                            crate::platform::app_log::error(format!("shell: {reason}; exiting"));
+                            // Distinct code so the service does not respawn a
+                            // shell it cannot talk to (see service shell-exit
+                            // backoff).
+                            std::process::exit(3);
                         }
                     };
                     let Ok(mut reader) = client.try_clone_reader() else {
@@ -6444,7 +6619,6 @@ fn service_message_stream() -> impl Stream<Item = Message> {
                     };
                     // Keep the write half alive so the server does not see EOF on accept.
                     let _keep_alive = client;
-                    crate::platform::app_log::info("shell: ipc receive connected");
                     loop {
                         match reader.recv() {
                             Ok(msg) => {
@@ -6858,37 +7032,6 @@ mod tests {
     use crate::controller::known::KnownControllers;
     use crate::controller::model::Connection;
 
-    /// Boot-time controller pull: only in client mode, while still waiting and
-    /// still empty, with attempts remaining.
-    ///
-    /// This is the self-heal for the attach race where the service's initial
-    /// Controllers push lands on the command connection before the broadcast
-    /// receiver attaches: an empty shell never sets input-hot, so no PadInput
-    /// edges ever arrive to heal it.
-    #[test]
-    fn controllers_pull_due_only_while_empty_and_waiting() {
-        assert!(controllers_pull_due(true, true, true, 0));
-        assert!(controllers_pull_due(
-            true,
-            true,
-            true,
-            CONTROLLERS_SYNC_RETRIES - 1
-        ));
-        // Standalone shells own HID — never pull.
-        assert!(!controllers_pull_due(false, true, true, 0));
-        // Answered already (or stopped): no more pulls.
-        assert!(!controllers_pull_due(true, false, true, 0));
-        // A Controllers push synced us: the retry loop stands down.
-        assert!(!controllers_pull_due(true, true, false, 0));
-        // Out of attempts: fall back to broadcast-only.
-        assert!(!controllers_pull_due(
-            true,
-            true,
-            true,
-            CONTROLLERS_SYNC_RETRIES
-        ));
-    }
-
     /// The forget sequence end to end: prune drops the pad from the fleet, and
     /// the store must drop it too.
     ///
@@ -6900,7 +7043,7 @@ mod tests {
     fn forgetting_an_unplugged_pad_clears_it_from_the_store() {
         let mut known = KnownControllers::default();
         let before = vec![emulate::new_pad(&[], 50, Connection::Bluetooth)];
-        sync_remembered_emulated(&[], &before, &mut known);
+        emulate::sync_remembered_emulated(&[], &before, &mut known);
         assert!(known.is_remembered("emu-1"), "a live pad is persisted");
 
         // Forget it: flag flips, prune removes it, and both happen before the
@@ -6912,7 +7055,9 @@ mod tests {
             "off + forgotten means gone from the fleet"
         );
 
-        assert!(sync_remembered_emulated(&before, &after, &mut known));
+        assert!(emulate::sync_remembered_emulated(
+            &before, &after, &mut known
+        ));
         assert!(
             !known.is_remembered("emu-1"),
             "a forgotten pad must leave controllers.json, not just stop being written"
@@ -6930,12 +7075,12 @@ mod tests {
             "emu-1",
             |p| p.connected = true,
         );
-        sync_remembered_emulated(&[], &plugged, &mut known);
+        emulate::sync_remembered_emulated(&[], &plugged, &mut known);
 
         // Forget while connected: stays in the fleet, drops from the store.
         let forgotten = emulate::update(&plugged, "emu-1", |p| p.remembered = false);
         assert_eq!(emulate::prune(forgotten.clone()).len(), 1, "live pads stay");
-        sync_remembered_emulated(&plugged, &forgotten, &mut known);
+        emulate::sync_remembered_emulated(&plugged, &forgotten, &mut known);
         assert!(!known.is_remembered("emu-1"));
 
         // Now unplug it: prune removes it, and it must stay out of the store.
@@ -6943,7 +7088,7 @@ mod tests {
             p.connected = false;
         }));
         assert!(unplugged.is_empty());
-        sync_remembered_emulated(&forgotten, &unplugged, &mut known);
+        emulate::sync_remembered_emulated(&forgotten, &unplugged, &mut known);
         assert!(!known.is_remembered("emu-1"));
     }
 
@@ -6961,7 +7106,7 @@ mod tests {
             p.connected = false;
         }));
         assert_eq!(unplugged.len(), 1);
-        sync_remembered_emulated(&plugged, &unplugged, &mut known);
+        emulate::sync_remembered_emulated(&plugged, &unplugged, &mut known);
         assert!(known.is_remembered("emu-1"));
 
         let remembered = vec![(
@@ -6982,11 +7127,11 @@ mod tests {
         let mut known = KnownControllers::default();
         let a = emulate::new_pad(&[], 50, Connection::Bluetooth);
         let both = vec![a.clone(), emulate::new_pad(&[a], 70, Connection::Usb)];
-        sync_remembered_emulated(&[], &both, &mut known);
+        emulate::sync_remembered_emulated(&[], &both, &mut known);
 
         let edited = emulate::update(&both, "emu-1", |p| p.remembered = false);
         let after = emulate::prune(edited);
-        sync_remembered_emulated(&both, &after, &mut known);
+        emulate::sync_remembered_emulated(&both, &after, &mut known);
 
         assert!(!known.is_remembered("emu-1"));
         assert!(known.is_remembered("emu-2"), "the other pad is untouched");

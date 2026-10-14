@@ -1,12 +1,25 @@
 //! Named-pipe IPC between the HID/tray service and the iced shell.
 //!
 //! Length-prefixed JSON frames (`u32` LE length + UTF-8 JSON body).
+//!
+//! Strict protocol, no cross-version compat:
+//! - [`IPC_PROTOCOL_VERSION`] gates everything. Bump on any breaking
+//!   `ShellCommand` / `ServiceMessage` change.
+//! - The first frame on every connection MUST be `GetVersion` (see
+//!   `PipeClient::handshake`). Anything else — including a connection that
+//!   stays silent — is dropped without registering. Unversioned shells
+//!   (1.6.1 and earlier) therefore can never attach, and are additionally
+//!   swept by the service at startup (it broadcasts `Shutdown` before
+//!   spawning its own shell; pre-handshake shells honor it).
+//! - The shell handshakes on boot and every reconnect and quits (exit code
+//!   3) on mismatch or when no service answers.
 
 use crate::controller::model::ControllerStatus;
 use crate::domain::color::Rgb;
 use crate::domain::pad::InputEdge;
 use crate::persist::notify::NotifyEvent;
-use crate::session::SessionEffect;
+use crate::persist::prefs::Prefs;
+use crate::session::{SessionEffect, SessionSnapshot};
 use crate::ui::layout::TrayAnchor;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -22,6 +35,12 @@ pub const PIPE_NAME: &str = "/tmp/sdsc-utils-ipc.sock";
 /// Env var the service sets so the shell knows to attach instead of owning HID.
 /// Value is the loopback TCP port (Windows) or the socket path (Unix).
 pub const SHELL_PIPE_ENV: &str = "SDSC_UTILS_PIPE";
+
+/// IPC protocol version. Bump on any breaking `ShellCommand` /
+/// `ServiceMessage` change. The shell handshakes on every connect and quits
+/// on mismatch (or when no service answers) — mismatched peers never limp
+/// along on half-understood messages.
+pub const IPC_PROTOCOL_VERSION: u32 = 1;
 
 /// Shell → service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,16 +82,43 @@ pub enum ShellCommand {
     SetLightbarAll {
         color: Rgb,
     },
-    /// Reload prefs / known from disk after the shell saves them.
-    ReloadPersist,
-    /// Start-screen selection changed (stable keys; service stores in memory).
-    ReportStartSelection {
+    /// Absolute prefs write (shell → service). The service validates
+    /// (`Prefs::normalized`), persists, and broadcasts the snapshot echo.
+    /// Single-writer: the shell in client mode never writes `prefs.json`.
+    SetPrefs {
+        prefs: Prefs,
+    },
+    /// Absolute remember/forget pin (shell → service). Remembering resolves
+    /// against the service's live list; unknown serials are a no-op echo.
+    SetRemembered {
+        serial: String,
+        remembered: bool,
+    },
+    /// Absolute nickname write (shell → service; `None` clears).
+    SetNickname {
+        serial: String,
+        nickname: Option<String>,
+    },
+    /// Start-screen selection changed (stable keys; service stores in memory
+    /// and folds it into the retained snapshot for shell restarts).
+    SetStartSelection {
         game_key: Option<String>,
         controller_key: Option<String>,
     },
-    /// Shell (re)start: ask the service for the stored start selection.
-    RequestStartSelection,
+    /// Shell (re)start: ask the service for the retained session snapshot —
+    /// the single convergent pull (live + remembered + prefs + analytics +
+    /// selection under one rev).
+    RequestSnapshot,
+    /// Handshake probe: ask the service for its IPC protocol version.
+    GetVersion,
     Ping,
+    /// Developer emulator edit (debug-only). The service owns the fleet;
+    /// the shell sends edits and renders the snapshot echo. Release builds
+    /// have no sender and no fleet: the service ignores it.
+    #[cfg(debug_assertions)]
+    Emu {
+        command: crate::controller::emulate::EmulatorCommand,
+    },
 }
 
 /// Service → shell (and CLI replies).
@@ -80,8 +126,6 @@ pub enum ShellCommand {
 pub enum ServiceMessage {
     /// Session effects to apply in the shell.
     Effects(Vec<SessionEffect>),
-    /// Full live controller snapshot after a poll.
-    Controllers(Vec<ControllerStatus>),
     /// Pad input edge (report-rate).
     PadInput(InputEdge),
     /// Tray asked to open the popup.
@@ -101,12 +145,16 @@ pub enum ServiceMessage {
         events: Vec<NotifyEvent>,
         open_start_after_toast: bool,
     },
-    /// Stored start-screen selection (reply to `RequestStartSelection` and
-    /// proactive push when the shell attaches).
-    StartSelection {
-        game_key: Option<String>,
-        controller_key: Option<String>,
-    },
+    /// Retained session snapshot (reply to `RequestSnapshot`, push on change,
+    /// proactive push when the shell attaches). The shell renders popup,
+    /// Start dock, prefs-dependent UI, and analytics views from this — never
+    /// from its own boot-time disk copies. Boxed: the snapshot is KBs next
+    /// to unit/send-small sibling variants.
+    Snapshot(Box<SessionSnapshot>),
+    /// Reply to [`ShellCommand::GetVersion`]: the service's IPC protocol and
+    /// build version. The shell quits unless `protocol` matches
+    /// [`IPC_PROTOCOL_VERSION`].
+    Version { protocol: u32, version: String },
 }
 
 fn encode_frame(value: &impl Serialize) -> Result<Vec<u8>, String> {
@@ -146,6 +194,16 @@ pub fn recv_message<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -> Re
     read_frame(reader)
 }
 
+/// Read one length-prefixed frame as an untyped JSON value.
+///
+/// Framing primitive used by the version handshake (which must skip
+/// interleaved broadcasts on its way to the `Version` reply). All other
+/// reads are strictly typed: undecodable frames are connection errors, not
+/// something to skip over.
+pub fn recv_value<R: Read>(reader: &mut R) -> Result<serde_json::Value, String> {
+    read_frame(reader)
+}
+
 /// Path / name used for the pipe (overridable via env for tests).
 pub fn pipe_endpoint() -> String {
     std::env::var(SHELL_PIPE_ENV).unwrap_or_else(|_| PIPE_NAME.to_string())
@@ -155,25 +213,55 @@ pub fn pipe_endpoint() -> String {
 static CMD_CLIENT: Mutex<Option<PipeClient>> = Mutex::new(None);
 
 /// Send a command to the running service, reconnecting if needed.
+///
+/// The first frame on a fresh connection is always the version handshake —
+/// a service that fails it is one this process must not talk to.
 pub fn send_command(cmd: &ShellCommand) -> Result<(), String> {
     let mut guard = CMD_CLIENT
         .lock()
         .map_err(|_| "ipc command lock poisoned".to_string())?;
     if guard.is_none() {
-        *guard = Some(PipeClient::connect()?);
+        let mut client = PipeClient::connect()?;
+        let (protocol, version) = client.handshake(std::time::Duration::from_secs(2))?;
+        ensure_protocol(protocol, &version)?;
+        *guard = Some(client);
     }
     match guard.as_mut().unwrap().send_command(cmd) {
         Ok(()) => Ok(()),
-        Err(err) => {
-            // One reconnect attempt.
+        Err(_) => {
+            // One reconnect attempt (with handshake).
             *guard = None;
             let mut client = PipeClient::connect()?;
+            let (protocol, version) = client.handshake(std::time::Duration::from_secs(2))?;
+            ensure_protocol(protocol, &version)?;
             let result = client.send_command(cmd);
             if result.is_ok() {
                 *guard = Some(client);
             }
-            result.map_err(|_| err)
+            result
         }
+    }
+}
+
+/// Reject a handshake answer that is not our protocol. Mismatched peers
+/// never exchange another frame.
+pub fn ensure_protocol(protocol: u32, version: &str) -> Result<(), String> {
+    if protocol != IPC_PROTOCOL_VERSION {
+        return Err(format!(
+            "ipc protocol mismatch (local {IPC_PROTOCOL_VERSION} vs service {protocol} v{version})"
+        ));
+    }
+    Ok(())
+}
+
+/// Seed the cached command client with an already-handshook connection.
+///
+/// Shell boot verifies the service before iced starts, then hands that
+/// connection over here instead of dropping it — no throwaway probe that
+/// could steal a latched newcomer message on its way out.
+pub fn seed_command_client(client: PipeClient) {
+    if let Ok(mut guard) = CMD_CLIENT.lock() {
+        *guard = Some(client);
     }
 }
 
@@ -230,13 +318,13 @@ mod tests {
     }
 
     #[test]
-    fn report_start_selection_round_trip() {
-        let cmd = ShellCommand::ReportStartSelection {
+    fn set_start_selection_round_trip() {
+        let cmd = ShellCommand::SetStartSelection {
             game_key: Some("steam:440".to_string()),
             controller_key: Some("pad-a".to_string()),
         };
         match frame_round_trip(&cmd) {
-            ShellCommand::ReportStartSelection {
+            ShellCommand::SetStartSelection {
                 game_key,
                 controller_key,
             } => {
@@ -248,50 +336,149 @@ mod tests {
     }
 
     #[test]
-    fn request_start_selection_round_trip() {
-        match frame_round_trip(&ShellCommand::RequestStartSelection) {
-            ShellCommand::RequestStartSelection => {}
+    fn set_prefs_remember_nickname_round_trip() {
+        let prefs = Prefs::default();
+        match frame_round_trip(&ShellCommand::SetPrefs {
+            prefs: prefs.clone(),
+        }) {
+            ShellCommand::SetPrefs { prefs: decoded } => {
+                assert_eq!(
+                    serde_json::to_value(&decoded).unwrap(),
+                    serde_json::to_value(&prefs).unwrap()
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        match frame_round_trip(&ShellCommand::SetRemembered {
+            serial: "abc".into(),
+            remembered: true,
+        }) {
+            ShellCommand::SetRemembered { serial, remembered } => {
+                assert_eq!(serial, "abc");
+                assert!(remembered);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        match frame_round_trip(&ShellCommand::SetNickname {
+            serial: "abc".into(),
+            nickname: Some("Couch".into()),
+        }) {
+            ShellCommand::SetNickname { serial, nickname } => {
+                assert_eq!(serial, "abc");
+                assert_eq!(nickname.as_deref(), Some("Couch"));
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }
 
     #[test]
-    fn service_start_selection_round_trip() {
-        let msg = ServiceMessage::StartSelection {
-            game_key: None,
-            controller_key: Some("pad-a".to_string()),
+    fn selection_lives_in_snapshot_not_its_own_message() {
+        // Cutover: stored selection travels folded into the retained
+        // snapshot (one rev, keys meet rows). There is intentionally no
+        // `ServiceMessage::StartSelection` anymore.
+        use crate::session::SessionSnapshot;
+        let snap = SessionSnapshot {
+            rev: 3,
+            live: Vec::new(),
+            remembered: Vec::new(),
+            nicknames: Default::default(),
+            prefs: crate::persist::prefs::Prefs::default(),
+            selection: StartSelection {
+                game_key: Some("steam:440".to_string()),
+                controller_key: None,
+            },
+            analytics: Default::default(),
+        };
+        match frame_round_trip(&ServiceMessage::Snapshot(Box::new(snap))) {
+            ServiceMessage::Snapshot(decoded) => {
+                assert_eq!(decoded.rev, 3);
+                assert_eq!(decoded.selection.game_key.as_deref(), Some("steam:440"));
+                assert_eq!(decoded.selection.controller_key, None);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_message_round_trips() {
+        use crate::session::SessionSnapshot;
+        let snap = SessionSnapshot {
+            rev: 7,
+            live: Vec::new(),
+            remembered: Vec::new(),
+            nicknames: Default::default(),
+            prefs: crate::persist::prefs::Prefs::default(),
+            selection: StartSelection::default(),
+            analytics: Default::default(),
+        };
+        let msg = ServiceMessage::Snapshot(Box::new(snap));
+        match frame_round_trip(&msg) {
+            ServiceMessage::Snapshot(decoded) => assert_eq!(decoded.rev, 7),
+            other => panic!("unexpected message: {other:?}"),
+        }
+        match frame_round_trip(&ShellCommand::RequestSnapshot) {
+            ShellCommand::RequestSnapshot => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn version_handshake_round_trips() {
+        match frame_round_trip(&ShellCommand::GetVersion) {
+            ShellCommand::GetVersion => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let msg = ServiceMessage::Version {
+            protocol: IPC_PROTOCOL_VERSION,
+            version: "1.7.0".to_string(),
         };
         match frame_round_trip(&msg) {
-            ServiceMessage::StartSelection {
-                game_key,
-                controller_key,
-            } => {
-                assert_eq!(game_key, None);
-                assert_eq!(controller_key.as_deref(), Some("pad-a"));
+            ServiceMessage::Version { protocol, version } => {
+                assert_eq!(protocol, IPC_PROTOCOL_VERSION);
+                assert_eq!(version, "1.7.0");
             }
             other => panic!("unexpected message: {other:?}"),
         }
     }
 
     #[test]
-    fn start_selection_converts_to_session_keys() {
-        let selection = StartSelection {
-            game_key: Some("steam:440".to_string()),
-            controller_key: None,
+    fn protocol_version_is_nonzero() {
+        // Zero is reserved for pre-handshake (unversioned) peers, which never
+        // answer GetVersion and therefore fail the handshake by timeout.
+        const { assert!(IPC_PROTOCOL_VERSION > 0) }
+    }
+
+    #[test]
+    fn ensure_protocol_rejects_gaps() {
+        assert!(ensure_protocol(IPC_PROTOCOL_VERSION, "x").is_ok());
+        let err = ensure_protocol(IPC_PROTOCOL_VERSION + 1, "future")
+            .expect_err("must reject newer service");
+        assert!(err.contains("mismatch"), "unexpected error: {err}");
+        let err = ensure_protocol(0, "1.6.1").expect_err("must reject unversioned");
+        assert!(err.contains("mismatch"), "unexpected error: {err}");
+    }
+
+    /// Developer emulator edits cross IPC as intents (debug-only).
+    #[test]
+    #[cfg(debug_assertions)]
+    fn emu_command_round_trips() {
+        let cmd = ShellCommand::Emu {
+            command: crate::controller::emulate::EmulatorCommand::SetConnected(
+                "emu-1".to_string(),
+                true,
+            ),
         };
-        let msg = ServiceMessage::StartSelection {
-            game_key: selection.game_key.clone(),
-            controller_key: selection.controller_key.clone(),
-        };
-        match msg {
-            ServiceMessage::StartSelection {
-                game_key,
-                controller_key,
-            } => {
-                assert_eq!(game_key.as_deref(), Some("steam:440"));
-                assert_eq!(controller_key, None);
+        match frame_round_trip(&cmd) {
+            ShellCommand::Emu { command } => {
+                assert_eq!(
+                    command,
+                    crate::controller::emulate::EmulatorCommand::SetConnected(
+                        "emu-1".to_string(),
+                        true
+                    )
+                );
             }
-            other => panic!("unexpected message: {other:?}"),
+            other => panic!("unexpected command: {other:?}"),
         }
     }
 }

@@ -100,9 +100,7 @@ pub fn save(games: &[SteamGame], steam_root: Option<&Path>) {
     };
     match serde_json::to_vec_pretty(&cache) {
         Ok(bytes) => {
-            if let Err(err) = fs::write(&path, bytes) {
-                app_log::warn(format!("failed to write steam library cache: {err}"));
-            } else {
+            if crate::persist::atomic::write_atomic_logged("steam library cache", &path, &bytes) {
                 crate::controller::hid::diag::diag_info(format!(
                     "ui-diag: steam library cache save n={}",
                     games.len()

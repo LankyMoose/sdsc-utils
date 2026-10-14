@@ -215,37 +215,11 @@ pub struct ConfigureSettings {
     pub steam_path_error: Option<String>,
 }
 
-/// Edit applied to the emulated fleet (Controllers debug tab).
-///
-/// Every variant carries the pad's serial so an action can never land on the
-/// wrong pad after the list shifts.
+/// Edit applied to the emulated fleet — owned by
+/// [`crate::controller::emulate`], re-exported here so existing UI paths keep
+/// compiling. Debug-only.
 #[cfg(debug_assertions)]
-#[derive(Debug, Clone, PartialEq)]
-pub enum EmulatorCommand {
-    /// Spawn a pad on the lowest free slot, remembered but disconnected.
-    AddPad,
-    RemovePad(String),
-    /// Live drag preview — repaints the tab only.
-    ///
-    /// Publication is debounced by the daemon (publishing is what lets the
-    /// normal preference-driven reactions fire), so this never spams per
-    /// frame; a spinner marks the wait.
-    PreviewPercent(String, u8),
-    /// Move the pad to a link — USB or Bluetooth. The charge state follows:
-    /// see [`crate::controller::emulate::state_for`].
-    SetConnection(String, Connection),
-    /// Plug in / unplug — runs the real connect or disconnect path.
-    SetConnected(String, bool),
-    /// Keep the pad across restarts (the popup's remember pin). A pad that is
-    /// both unplugged and forgotten is dropped from the list.
-    SetRemembered(String, bool),
-    /// Seed typical charge/play samples so ETA estimates exist.
-    SeedAnalytics(String),
-    /// Credit active time and walk one step up the charge cycle.
-    StepCharge(String),
-    /// Credit active time and walk one step down the drain cycle.
-    StepDrain(String),
-}
+pub use crate::controller::emulate::EmulatorCommand;
 
 /// A battery level previewed but not yet published (`None` when settled).
 #[cfg(debug_assertions)]

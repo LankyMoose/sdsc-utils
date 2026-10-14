@@ -221,6 +221,14 @@ fn set_lightbar_cli(rgb_args: &[String]) -> ExitCode {
     let color = sdsc_utils::domain::color::Rgb::new(r, g, b);
 
     if let Ok(mut client) = ipc::PipeClient::connect() {
+        // Hello first: the service drops connections that open with anything else.
+        let hello = client
+            .handshake(std::time::Duration::from_secs(3))
+            .and_then(|(protocol, version)| ipc::ensure_protocol(protocol, &version));
+        if let Err(err) = hello {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
         if let Err(err) = client.send_command(&ipc::ShellCommand::SetLightbarAll { color }) {
             eprintln!("error: {err}");
             return ExitCode::FAILURE;

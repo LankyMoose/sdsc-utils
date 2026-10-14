@@ -5,7 +5,10 @@
 //! plan (`u32` LE length + JSON). Supports multiple concurrent clients so the
 //! CLI can talk to the service while the shell stays connected.
 
-use super::{SHELL_PIPE_ENV, ServiceMessage, ShellCommand, recv_message, send_message};
+use super::{
+    SHELL_PIPE_ENV, ServiceMessage, ShellCommand, ensure_protocol, recv_message, recv_value,
+    send_message,
+};
 use crate::controller::model::ControllerStatus;
 use crate::persist::paths;
 use std::io::{BufReader, Write};
@@ -120,14 +123,16 @@ impl PipeServer {
     }
 
     /// Send `msgs` only to transports that connected after `watermark` last
-    /// advanced, then advance it past every client seen.
+    /// advanced, then advance it past every client reached.
     ///
     /// The shell's command connection always wins the attach race and nobody
     /// reads its socket, so the initial snapshot (Controllers, StartSelection,
     /// latched OpenStart) must go to the newcomer (the broadcast receiver
     /// landing second), not just on the 0 to 1 transition. Existing clients
     /// already hold that state (pushes are equivalence-gated there). Returns
-    /// how many transports were messaged. Dead newcomers are pruned.
+    /// how many transports were messaged. Dead newcomers are pruned WITHOUT
+    /// advancing past them, so a dropped probe can never steal a latched
+    /// message meant for the real shell.
     pub fn send_to_newcomers(&self, msgs: &[ServiceMessage], watermark: &mut u64) -> usize {
         let Ok(mut guard) = self.clients.lock() else {
             return 0;
@@ -135,8 +140,8 @@ impl PipeServer {
         let mut reached = 0usize;
         let mut seen = *watermark;
         guard.retain(|c| {
-            seen = seen.max(c.id);
             if c.id <= *watermark {
+                seen = seen.max(c.id);
                 return true;
             }
             for msg in msgs {
@@ -144,6 +149,7 @@ impl PipeServer {
                     return false;
                 }
             }
+            seen = seen.max(c.id);
             reached += 1;
             true
         });
@@ -192,17 +198,47 @@ impl PipeServerHandle {
 fn accept_loop(listener: TcpListener, cmd_tx: Sender<ShellCommand>, clients: ClientList) {
     let _ = listener.set_nonblocking(false);
     loop {
-        let Ok((stream, _)) = listener.accept() else {
+        let Ok((mut stream, _)) = listener.accept() else {
             thread::sleep(Duration::from_millis(50));
             continue;
         };
         let _ = stream.set_nodelay(true);
+        // Strict hello: the first frame on any connection must be GetVersion
+        // (see `PipeClient::handshake`). Anything else — a pre-handshake
+        // shell, a foreign peer, or silence past the deadline — is dropped
+        // before registering, so it can never observe broadcasts, count as a
+        // client, or advance the newcomer watermark.
+        let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let hello_ok = matches!(
+            recv_message::<_, ShellCommand>(&mut stream),
+            Ok(ShellCommand::GetVersion)
+        );
+        let _ = stream.set_read_timeout(None);
+        if !hello_ok {
+            continue;
+        }
         let mut writer = match stream.try_clone() {
             Ok(s) => s,
             Err(_) => continue,
         };
+        // Answer the hello right here on the accepting socket — not via
+        // broadcast. Broadcasts only reach registered clients, and this
+        // transport registers below; a broadcast reply could never be
+        // observed by its own hello. (This is also why the service's command
+        // handler has no `GetVersion` arm: hellos never reach it.)
+        if send_message(
+            &mut writer,
+            &ServiceMessage::Version {
+                protocol: super::IPC_PROTOCOL_VERSION,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+        )
+        .is_err()
+        {
+            continue;
+        }
         let mut reader = BufReader::new(stream);
-        let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
         let (msg_tx, msg_rx) = mpsc::channel::<ServiceMessage>();
         if let Ok(mut guard) = clients.lock() {
             guard.push(ClientEntry { id, tx: msg_tx });
@@ -210,6 +246,8 @@ fn accept_loop(listener: TcpListener, cmd_tx: Sender<ShellCommand>, clients: Cli
         let cmd_tx2 = cmd_tx.clone();
         let clients_reader = Arc::clone(&clients);
         thread::spawn(move || {
+            // Strictly typed past the hello: a corrupt frame is a broken
+            // peer, not something to skip — drop the connection.
             while let Ok(cmd) = recv_message::<_, ShellCommand>(&mut reader) {
                 if cmd_tx2.send(cmd).is_err() {
                     break;
@@ -272,11 +310,39 @@ impl PipeClient {
     }
 
     pub fn request_list_controllers(&mut self) -> Result<Vec<ControllerStatus>, String> {
+        let (protocol, version) = self.handshake(Duration::from_secs(3))?;
+        ensure_protocol(protocol, &version)?;
         self.send_command(&ShellCommand::ListControllers)?;
         match super::recv_matching(self, |m| matches!(m, ServiceMessage::ControllerList(_)))? {
             ServiceMessage::ControllerList(result) => result,
             other => Err(format!("unexpected ipc reply: {other:?}")),
         }
+    }
+
+    /// Version handshake: prove the service speaks [`super::IPC_PROTOCOL_VERSION`].
+    ///
+    /// Sends `GetVersion` (the mandatory first frame on any connection),
+    /// waits up to `timeout` for the `Version` reply (skipping interleaved
+    /// broadcasts), then clears the read deadline. Returns the service's
+    /// `(protocol, version)` — the caller quits unless the protocol matches.
+    /// An old service that predates the handshake never answers: that
+    /// surfaces as a timeout, and the caller quits.
+    pub fn handshake(&mut self, timeout: Duration) -> Result<(u32, String), String> {
+        self.send_command(&ShellCommand::GetVersion)?;
+        self.stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| format!("ipc handshake timeout setup: {e}"))?;
+        let result = loop {
+            let value = recv_value(&mut self.stream).map_err(|e| format!("ipc handshake: {e}"))?;
+            match serde_json::from_value::<ServiceMessage>(value) {
+                Ok(ServiceMessage::Version { protocol, version }) => {
+                    break Ok((protocol, version));
+                }
+                Ok(_) | Err(_) => continue,
+            }
+        };
+        let _ = self.stream.set_read_timeout(None);
+        result
     }
 }
 
@@ -293,6 +359,7 @@ impl PipeClientReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::recv_message;
     use std::net::TcpListener;
 
     /// A live server without [`PipeServer::start`] (which publishes the port
@@ -332,9 +399,16 @@ mod tests {
     #[test]
     fn newcomer_sync_reaches_late_receiver() {
         let (server, port) = spawn_test_server();
-        let unread = TcpStream::connect(("127.0.0.1", port)).expect("connect cmd");
+        let mut unread = TcpStream::connect(("127.0.0.1", port)).expect("connect cmd");
         let mut receiver = TcpStream::connect(("127.0.0.1", port)).expect("connect recv");
+        // Every connection opens with the version hello (see `PipeClient::handshake`).
+        send_message(&mut unread, &ShellCommand::GetVersion).expect("hello cmd");
+        send_message(&mut receiver, &ShellCommand::GetVersion).expect("hello recv");
         wait_for_count(&server, 2);
+
+        // The hello is answered directly on each socket (not broadcast).
+        let hello: ServiceMessage = recv_message(&mut receiver).expect("hello reply");
+        assert!(matches!(hello, ServiceMessage::Version { .. }));
 
         let mut watermark = 0u64;
         let reached = server.send_to_newcomers(&[ServiceMessage::Ack], &mut watermark);
@@ -355,9 +429,63 @@ mod tests {
     #[test]
     fn disconnect_prunes_client_count() {
         let (server, port) = spawn_test_server();
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        send_message(&mut stream, &ShellCommand::GetVersion).expect("hello");
         wait_for_count(&server, 1);
         drop(stream);
         wait_for_count(&server, 0);
+    }
+
+    /// A connection whose first frame is not the version hello is dropped
+    /// before registering: unversioned shells can never observe broadcasts,
+    /// count as clients, or advance the newcomer watermark.
+    #[test]
+    fn non_hello_first_frame_is_dropped_unregistered() {
+        let (server, port) = spawn_test_server();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        send_message(&mut stream, &ShellCommand::Ping).expect("non-hello");
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(server.client_count(), 0);
+        // The server hung up: further reads fail.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let mut buf = [0u8; 1];
+        use std::io::Read;
+        assert!(stream.read_exact(&mut buf).is_err());
+    }
+
+    /// End-to-end handshake: the accepting socket answers the hello
+    /// directly, proving the service speaks our protocol.
+    #[test]
+    fn handshake_ok_against_live_server() {
+        let (_server, port) = spawn_test_server();
+        let raw = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let mut client = PipeClient { stream: raw };
+        let (protocol, version) = client.handshake(Duration::from_secs(5)).expect("handshake");
+        assert_eq!(protocol, crate::ipc::IPC_PROTOCOL_VERSION);
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// A service that predates the handshake never answers: the client must
+    /// fail fast (the shell quits) rather than hang. Emulated with a raw
+    /// listener that accepts and stays silent — the pre-handshake shape.
+    #[test]
+    fn handshake_times_out_when_service_predates_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local port").port();
+        thread::spawn(move || {
+            // Hold one accepted connection open without ever replying.
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(5));
+                drop(stream);
+            }
+        });
+        let raw = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let mut client = PipeClient { stream: raw };
+        let err = client
+            .handshake(Duration::from_millis(300))
+            .expect_err("must time out");
+        assert!(err.contains("handshake"), "unexpected error: {err}");
     }
 }

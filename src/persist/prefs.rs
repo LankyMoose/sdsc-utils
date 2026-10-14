@@ -441,12 +441,16 @@ impl Prefs {
         prefs.start_screen_gesture = default_gesture();
         match serde_json::to_vec_pretty(&prefs) {
             Ok(bytes) => {
-                if let Err(err) = fs::write(&path, bytes) {
-                    app_log::warn(format!("failed to write prefs: {err}"));
-                }
+                let _ = crate::persist::atomic::write_atomic_logged("prefs", &path, &bytes);
             }
             Err(err) => app_log::warn(format!("failed to serialize prefs: {err}")),
         }
+    }
+
+    /// Clamp numeric prefs and force the reopen chord to PS.
+    pub fn normalized(mut self) -> Self {
+        self.normalize();
+        self
     }
 
     /// Clamp numeric prefs and force the reopen chord to PS.

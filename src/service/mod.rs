@@ -48,8 +48,34 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     lightbar::set_enabled(prefs.lightbar_enabled);
 
     let mut session = DeviceSession::new(prefs, known, analytics);
+    // Developer emulator fleet (debug-only): remembered `emu-` pads come
+    // back disconnected, exactly like the shell's former boot rehydrate —
+    // but owned here, so there is a single writer for `controllers.json`.
+    #[cfg(debug_assertions)]
+    {
+        let remembered: Vec<(String, u8, crate::controller::model::Connection)> = session
+            .known
+            .remembered_disconnected(&[])
+            .into_iter()
+            .map(|r| {
+                (
+                    r.serial.clone(),
+                    r.percent,
+                    crate::controller::model::Connection::from_label(&r.connection)
+                        .unwrap_or(crate::controller::model::Connection::Bluetooth),
+                )
+            })
+            .collect();
+        session.emu_fleet = crate::controller::emulate::rehydrate(&remembered);
+    }
     let hid_worker = HidWorkerHandle::start();
     let pipe = PipeServer::start()?;
+    // Kill shells left over from a previous install before spawning ours.
+    // An unversioned pre-handshake shell (1.6.1 and earlier) reconnects
+    // forever and would otherwise attach to this service; it understands
+    // `Shutdown`, so let stragglers attach, tell them to quit, and only then
+    // spawn the matching shell (which can never catch this broadcast).
+    shutdown_stale_shells(&pipe);
     let mut tray = tray::create_tray(&[]);
     let mut shell = spawn_shell()?;
     let mut last_discovered = hid_worker.presence_paths();
@@ -70,6 +96,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut pending_open_start = false;
     // Newest client id already sent the snapshot; see `send_to_newcomers`.
     let mut pushed_watermark: u64 = 0;
+    // Last retained-snapshot rev broadcast to all clients (change-pushes).
+    let mut last_snapshot_rev: u64 = 0;
+    // Recent shell exit times (crash-loop backoff) and whether the service
+    // still manages the shell (false after a protocol-quit or repeated
+    // crashes — tray/HID continue headless).
+    let mut shell_exits: Vec<Instant> = Vec::new();
+    let mut shell_managed = true;
 
     // Forward hid-worker pad edges over IPC (and run reopen gesture while shell is down).
     // Deep enough to ride out shell-frame hitches without dropping taps.
@@ -130,16 +163,40 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(windows)]
         pump_win_messages();
 
-        if last_shell_check.elapsed() >= Duration::from_secs(1) {
+        if shell_managed && last_shell_check.elapsed() >= Duration::from_secs(1) {
             last_shell_check = Instant::now();
             if let Some(status) = shell.try_wait()? {
-                app_log::warn(format!(
-                    "service: shell exited ({status}); respawning without reopening HID"
-                ));
-                // Chord may still be held across the restart — require release.
-                chord_release_gate.arm();
-                gesture_detectors.reset();
-                shell = spawn_shell()?;
+                // Exit code 3 is the shell's deliberate protocol-quit (version
+                // mismatch / no service): respawning the same binary would loop
+                // forever. Stay headless and say how to fix it.
+                if status.code() == Some(3) {
+                    app_log::error(
+                        "service: shell quit on IPC version mismatch; not respawning \
+                         (reinstall/restart matched binaries, then relaunch)",
+                    );
+                    shell_managed = false;
+                } else {
+                    app_log::warn(format!(
+                        "service: shell exited ({status}); respawning without reopening HID"
+                    ));
+                    // Chord may still be held across the restart — require release.
+                    chord_release_gate.arm();
+                    gesture_detectors.reset();
+                    // Back off on rapid exits (crash loop): a shell that dies
+                    // instantly three times running is never going to survive
+                    // the fourth second. Tray/HID keep running headless.
+                    shell_exits.push(Instant::now());
+                    shell_exits.retain(|t| t.elapsed() < Duration::from_secs(15));
+                    if shell_exits.len() > 3 {
+                        app_log::error(
+                            "service: shell exiting repeatedly; not respawning \
+                             (relaunch the app to try again)",
+                        );
+                        shell_managed = false;
+                    } else {
+                        shell = spawn_shell()?;
+                    }
+                }
             }
         }
 
@@ -152,22 +209,20 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         // connect (or a message sent before the shell's recv loop is live)
         // must not clear it.
         if pipe.has_newcomers(pushed_watermark) {
-            let stored = session.start_selection.clone();
-            let mut batch = vec![
-                ServiceMessage::Controllers(session.controllers.clone()),
-                // Restore the shell's start-screen selection after a shell
-                // restart (service process lifetime only — never touches disk).
-                ServiceMessage::StartSelection {
-                    game_key: stored.game_key,
-                    controller_key: stored.controller_key,
-                },
-            ];
+            // Retained snapshot only: live + remembered + prefs + analytics
+            // + stored selection arrive together under one rev, so a
+            // restarted shell converges without waiting for the next HID
+            // edge (and keys always meet the rows they point at).
+            let mut batch = vec![ServiceMessage::Snapshot(Box::new(session.snapshot()))];
             let latched = pending_open_start;
             if latched {
                 batch.push(ServiceMessage::Effects(vec![SessionEffect::OpenStart]));
             }
-            if pipe.send_to_newcomers(&batch, &mut pushed_watermark) > 0 && latched {
-                app_log::info("service: flushing latched OpenStart (new transport)");
+            if pipe.send_to_newcomers(&batch, &mut pushed_watermark) > 0 {
+                last_snapshot_rev = session.snapshot_rev();
+                if latched {
+                    app_log::info("service: flushing latched OpenStart (new transport)");
+                }
             }
         }
 
@@ -203,6 +258,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &mut session,
                     &hid_worker,
                     &pipe,
+                    &mut tray,
+                    &mut pending_open_start,
                     &mut start_visible,
                     &shell_input_hot,
                     &mut gesture_detectors,
@@ -272,7 +329,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             if presence.is_empty() && !session.controllers.is_empty() {
                 lightbar::sync_lightbar_claims(std::iter::empty::<&str>());
                 session.clear_missed_polls();
+                // HID is gone but emulated pads (debug-only) may still be
+                // live — publish those, not an empty list.
+                #[cfg(debug_assertions)]
+                let cleared = with_emu_live(&[], &session);
                 let effects = session.apply_controllers(
+                    #[cfg(debug_assertions)]
+                    cleared,
+                    #[cfg(not(debug_assertions))]
                     Vec::new(),
                     ApplyContext {
                         start_visible,
@@ -281,8 +345,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         lightbar_enabled: lightbar::is_enabled(),
                     },
                 );
-                // Shell refreshes compact Controllers from Controllers IPC only.
-                let _ = pipe.send(ServiceMessage::Controllers(session.controllers.clone()));
+                // Retained snapshot (rev-gated change-push at loop end) is the
+                // shell's only live-rows path now — no `Controllers` push.
                 dispatch_effects(
                     &mut session,
                     &hid_worker,
@@ -313,6 +377,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             session
                                 .notify
                                 .queue_launch_quiet(hid_worker.take_launch_serials());
+                            #[cfg(debug_assertions)]
+                            let controllers = with_emu_live(&controllers, &session);
                             let effects = session.on_poll_result(
                                 controllers,
                                 ApplyContext {
@@ -322,8 +388,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     lightbar_enabled: lightbar::is_enabled(),
                                 },
                             );
-                            let _ =
-                                pipe.send(ServiceMessage::Controllers(session.controllers.clone()));
+                            // Snapshot change-push at loop end covers the shell.
                             dispatch_effects(
                                 &mut session,
                                 &hid_worker,
@@ -342,13 +407,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Hot path: every service loop (~16ms) so silence drops update Start quickly.
         // Skip when HID presence is empty — stale live_pads must not re-add pads.
         if nav_priority && !last_discovered.is_empty() {
-            let live = hid_worker.live_controllers();
+            let hid_live = hid_worker.live_controllers();
             // Always clear streaks for seen pads, even when the snapshot is
             // equivalent and evaluation is skipped (else a recovered pad's
             // stale streak drops it instantly on its next stall).
-            session.mark_seen(live.iter().map(|c| c.serial.as_str()));
+            session.mark_seen(hid_live.iter().map(|c| c.serial.as_str()));
             if hot_path_wait_for_first_sample(
-                live.is_empty(),
+                hid_live.is_empty(),
                 !last_discovered.is_empty(),
                 session.controllers.is_empty(),
             ) {
@@ -357,30 +422,50 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "service: hot path waiting for live battery sample",
                     );
                 }
-            } else if !controllers_equivalent(&session.controllers, &live) || presence_changed {
-                apply_hot_path_lightbar(&hid_worker, &session.controllers, &live);
-                last_battery_poll = Instant::now();
-                session
-                    .notify
-                    .queue_launch_quiet(hid_worker.take_launch_serials());
-                let effects = session.on_poll_result(
-                    live,
-                    ApplyContext {
-                        start_visible,
-                        fullscreen: start_input::foreground_is_exclusive_fullscreen(),
-                        now: Instant::now(),
-                        lightbar_enabled: lightbar::is_enabled(),
-                    },
-                );
-                let _ = pipe.send(ServiceMessage::Controllers(session.controllers.clone()));
-                dispatch_effects(
-                    &mut session,
-                    &hid_worker,
-                    &pipe,
-                    &mut tray,
-                    effects,
-                    &mut pending_open_start,
-                );
+            } else {
+                // Gate on the merged snapshot (hardware + emulator): with an
+                // emulated pad connected the HID-only list is never
+                // equivalent, and without this the hot path would re-apply
+                // every 16ms. Lightbar stays hardware-only — emu pads have
+                // no lamp to drive.
+                #[cfg(debug_assertions)]
+                let live = with_emu_live(&hid_live, &session);
+                #[cfg(not(debug_assertions))]
+                let live = hid_live;
+                if !controllers_equivalent(&session.controllers, &live) || presence_changed {
+                    #[cfg(debug_assertions)]
+                    let hid_only: Vec<ControllerStatus> = live
+                        .iter()
+                        .filter(|c| !crate::controller::emulate::is_emulated(&c.serial))
+                        .cloned()
+                        .collect();
+                    #[cfg(debug_assertions)]
+                    apply_hot_path_lightbar(&hid_worker, &session.controllers, &hid_only);
+                    #[cfg(not(debug_assertions))]
+                    apply_hot_path_lightbar(&hid_worker, &session.controllers, &live);
+                    last_battery_poll = Instant::now();
+                    session
+                        .notify
+                        .queue_launch_quiet(hid_worker.take_launch_serials());
+                    let effects = session.on_poll_result(
+                        live,
+                        ApplyContext {
+                            start_visible,
+                            fullscreen: start_input::foreground_is_exclusive_fullscreen(),
+                            now: Instant::now(),
+                            lightbar_enabled: lightbar::is_enabled(),
+                        },
+                    );
+                    // Snapshot change-push at loop end covers the shell.
+                    dispatch_effects(
+                        &mut session,
+                        &hid_worker,
+                        &pipe,
+                        &mut tray,
+                        effects,
+                        &mut pending_open_start,
+                    );
+                }
             }
         }
 
@@ -441,6 +526,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(windows)]
         pump_win_messages();
 
+        // Converge the shell's retained snapshot on any session change from
+        // this iteration (poll applies, persist reloads, selection reports).
+        push_snapshot_if_changed(&session, &pipe, &mut last_snapshot_rev);
+
         thread::sleep(Duration::from_millis(16));
     }
 }
@@ -450,11 +539,20 @@ enum LoopControl {
     Quit,
 }
 
+/// One shell command: HID proxies, session intents, Start visibility.
+/// Carries the service loop's shared state by parameter (single call site);
+/// a `LoopState` struct split is the natural cleanup if this grows again.
+///
+/// `tray` / `pending_open_start` are only touched by the debug-only emulator
+/// arm; the underscore names keep release builds (no emulator) quiet.
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
     cmd: ShellCommand,
     session: &mut DeviceSession,
     hid_worker: &HidWorkerHandle,
     pipe: &PipeServer,
+    _tray: &mut Option<tray_icon::TrayIcon>,
+    _pending_open_start: &mut bool,
     start_visible: &mut bool,
     shell_input_hot: &Arc<AtomicBool>,
     gesture_detectors: &mut GestureDetectorBank,
@@ -537,8 +635,30 @@ fn handle_command(
             }
             Ok(LoopControl::Continue)
         }
-        ShellCommand::ReloadPersist => {
-            if let Some(effects) = reload_persist(session, *start_visible) {
+        ShellCommand::SetPrefs { prefs } => {
+            // Service is the prefs authority: validate, persist via the
+            // snapshot rev path, and mirror the disk-reload side effects
+            // (spectrum, lightbar, USB-scope close) so shell edits and
+            // hand-edits converge through one code path.
+            let scope_before = (
+                session.prefs.start_screen_auto_open.includes_usb(),
+                session.prefs.start_screen_auto_open.auto_opens(),
+            );
+            session.apply_prefs(prefs.normalized());
+            session.prefs.save();
+            color::set_active_spectrum(session.prefs.spectrum.clone());
+            lightbar::set_enabled(session.prefs.lightbar_enabled);
+            let scope_after = (
+                session.prefs.start_screen_auto_open.includes_usb(),
+                session.prefs.start_screen_auto_open.auto_opens(),
+            );
+            if scope_after.1 && scope_before.0 != scope_after.0 {
+                let effects = session.reevaluate_start_presence(ApplyContext {
+                    start_visible: *start_visible,
+                    fullscreen: start_input::foreground_is_exclusive_fullscreen(),
+                    now: Instant::now(),
+                    lightbar_enabled: lightbar::is_enabled(),
+                });
                 let ui_effects: Vec<SessionEffect> = effects
                     .into_iter()
                     .filter(|e| {
@@ -554,28 +674,208 @@ fn handle_command(
                     let _ = pipe.send(ServiceMessage::Effects(ui_effects));
                 }
             }
+            session.echo_intent();
             Ok(LoopControl::Continue)
         }
-        ShellCommand::ReportStartSelection {
+        ShellCommand::SetRemembered { serial, remembered } => {
+            let live = session.controllers.clone();
+            session.set_remembered(&serial, remembered, &live);
+            session.known.save();
+            session.echo_intent();
+            Ok(LoopControl::Continue)
+        }
+        ShellCommand::SetNickname { serial, nickname } => {
+            session.set_nickname(&serial, nickname);
+            session.known.save();
+            session.echo_intent();
+            Ok(LoopControl::Continue)
+        }
+        ShellCommand::SetStartSelection {
             game_key,
             controller_key,
         } => {
             // In-memory only for the service process lifetime — never persisted.
+            // Folded into the retained snapshot (no separate echo: the
+            // reporting shell already holds the value; newcomers get it via
+            // the snapshot).
             session.remember_start_selection(StartSelection {
                 game_key,
                 controller_key,
             });
             Ok(LoopControl::Continue)
         }
-        ShellCommand::RequestStartSelection => {
-            let stored = session.start_selection.clone();
-            let _ = pipe.send(ServiceMessage::StartSelection {
-                game_key: stored.game_key,
-                controller_key: stored.controller_key,
-            });
+        ShellCommand::RequestSnapshot => {
+            let _ = pipe.send(ServiceMessage::Snapshot(Box::new(session.snapshot())));
             Ok(LoopControl::Continue)
         }
+        // Developer emulator edit (debug-only): the service owns the fleet.
+        // The variant itself is debug-gated, so release needs no arm here.
+        #[cfg(debug_assertions)]
+        ShellCommand::Emu { command } => {
+            apply_emu_command(
+                command,
+                session,
+                hid_worker,
+                pipe,
+                _tray,
+                _pending_open_start,
+                *start_visible,
+            );
+            Ok(LoopControl::Continue)
+        }
+        // Transport-level hello, already answered on the accepting socket;
+        // a repeat mid-connection means nothing.
+        ShellCommand::GetVersion => Ok(LoopControl::Continue),
     }
+}
+
+/// Apply one developer-emulator edit to the service-owned fleet (debug-only).
+///
+/// Mirrors the shell's standalone emulator path: fleet transition, remembered
+/// sync + save, analytics/prefs side effects, then publish of the merged
+/// (hardware + emulator) live list through the normal session path so toasts,
+/// Start policy, tray, and analytics edges all fire. The snapshot echo at the
+/// loop end converges the shell (whose tab fleet is a pure derivation of the
+/// snapshot, plus its local drag preview).
+#[cfg(debug_assertions)]
+#[allow(clippy::too_many_arguments)]
+fn apply_emu_command(
+    command: crate::controller::emulate::EmulatorCommand,
+    session: &mut DeviceSession,
+    hid_worker: &HidWorkerHandle,
+    pipe: &PipeServer,
+    tray: &mut Option<tray_icon::TrayIcon>,
+    pending_open_start: &mut bool,
+    start_visible: bool,
+) {
+    use crate::controller::emulate::{self, EmulatorCommand};
+    use crate::controller::model::Connection;
+
+    let fleet = session.emu_fleet.clone();
+    let find = |serial: &str| fleet.iter().find(|p| p.serial() == serial).cloned();
+
+    // `publish` runs the normal connect/disconnect path; `analytics` covers
+    // the charge/drain walk. `PreviewPercent` arrives debounced-committed
+    // (shell drag preview stays local), so it publishes like any level set.
+    let (next_fleet, publish, analytics) = match &command {
+        EmulatorCommand::AddPad => {
+            let pad = emulate::new_pad(&fleet, emulate::DEFAULT_PERCENT, Connection::Bluetooth);
+            let mut next = fleet.clone();
+            next.push(pad);
+            // Remembered but disconnected: no toast, no Start window.
+            (next, false, false)
+        }
+        EmulatorCommand::RemovePad(serial) => {
+            let next = fleet
+                .iter()
+                .filter(|p| p.serial() != serial)
+                .cloned()
+                .collect::<Vec<_>>();
+            // The pruned pad leaves the remembered store via the sync below
+            // (previous vs current), same as the shell path.
+            (next, true, false)
+        }
+        EmulatorCommand::PreviewPercent(serial, percent) => {
+            (emulate::set_percent(&fleet, serial, *percent), true, false)
+        }
+        // Plugging in or unplugging is a charge edge, so it credits
+        // analytics the same way stepping the cycle does.
+        EmulatorCommand::SetConnection(serial, connection) => {
+            (emulate::set_link(&fleet, serial, *connection), true, true)
+        }
+        // Plugging in or unplugging is a real connect/disconnect edge.
+        // Unplugging a forgotten pad removes it — same as forgetting an
+        // unplugged pad. Either way the two together mean "gone".
+        EmulatorCommand::SetConnected(serial, connected) => {
+            let next = emulate::update(&fleet, serial, |p| p.connected = *connected);
+            (emulate::prune(next), true, false)
+        }
+        // The popup's remember pin, for an emulated pad. Only takes effect
+        // on unplug; `prune` then removes it if it is already off.
+        EmulatorCommand::SetRemembered(serial, remembered) => {
+            let next = emulate::update(&fleet, serial, |p| p.remembered = *remembered);
+            (emulate::prune(next), true, false)
+        }
+        EmulatorCommand::SeedAnalytics(serial) => {
+            session.analytics.dev_seed_estimates(serial);
+            (fleet, false, true)
+        }
+        EmulatorCommand::StepCharge(serial) => {
+            let Some(pad) = find(serial) else {
+                return;
+            };
+            session
+                .analytics
+                .dev_credit_active(pad.serial(), emulate::CHARGE_STEP_TIME);
+            let (percent, connection, state) = emulate::step_charge(&pad.status);
+            let next = emulate::update(&fleet, serial, |p| {
+                p.status.percent = percent;
+                p.status.connection = connection;
+                p.status.state = state;
+            });
+            (next, true, true)
+        }
+        EmulatorCommand::StepDrain(serial) => {
+            let Some(pad) = find(serial) else {
+                return;
+            };
+            session
+                .analytics
+                .dev_credit_active(pad.serial(), emulate::DRAIN_STEP_TIME);
+            let (percent, connection, state) = emulate::step_drain(&pad.status);
+            let next = emulate::update(&fleet, serial, |p| {
+                p.status.percent = percent;
+                p.status.connection = connection;
+                p.status.state = state;
+            });
+            (next, true, true)
+        }
+    };
+
+    // `previous` is captured before the swap so pruned pads still leave the
+    // remembered store (forgetting must delete the record, not merely stop
+    // writing it).
+    let previous = std::mem::replace(&mut session.emu_fleet, next_fleet);
+    if emulate::sync_remembered_emulated(&previous, &session.emu_fleet, &mut session.known) {
+        session.known.save();
+    }
+
+    // Analytics state only means anything once it is recording.
+    if analytics && !session.prefs.analytics_enabled {
+        session.prefs.analytics_enabled = true;
+        session.prefs.save();
+        app_log::info("analytics enabled for developer emulator");
+    }
+    if analytics {
+        session.analytics.save();
+    }
+    // Always echo: some edits (added-but-disconnected pads, seeded
+    // estimates, disconnected percent commits) change no live row, so the
+    // change-push would otherwise never carry them to the shell.
+    session.echo_intent();
+
+    if !publish {
+        return;
+    }
+    // Merged live: hardware truth minus stale emu rows plus the fleet's
+    // connected pads. Never touches HID sampling state.
+    let mut merged: Vec<ControllerStatus> = session
+        .controllers
+        .iter()
+        .filter(|c| !emulate::is_emulated(&c.serial))
+        .cloned()
+        .collect();
+    merged.extend(emulate::live(&session.emu_fleet));
+    let effects = session.apply_controllers(
+        merged,
+        ApplyContext {
+            start_visible,
+            fullscreen: start_input::foreground_is_exclusive_fullscreen(),
+            now: Instant::now(),
+            lightbar_enabled: lightbar::is_enabled(),
+        },
+    );
+    dispatch_effects(session, hid_worker, pipe, tray, effects, pending_open_start);
 }
 
 fn dispatch_effects(
@@ -743,8 +1043,10 @@ fn reload_persist(session: &mut DeviceSession, start_visible: bool) -> Option<Ve
     let usb_changed = prefs.start_screen_auto_open.auto_opens() && scope_changed;
     color::set_active_spectrum(prefs.spectrum.clone());
     lightbar::set_enabled(prefs.lightbar_enabled);
-    session.prefs = prefs;
-    session.known = KnownControllers::load();
+    // Route through the rev-bumping setters so the retained snapshot (and the
+    // shell rendering from it) converges on external prefs/known edits.
+    session.apply_prefs(prefs);
+    session.apply_known(KnownControllers::load());
     if !usb_changed {
         return None;
     }
@@ -754,6 +1056,52 @@ fn reload_persist(session: &mut DeviceSession, start_visible: bool) -> Option<Ve
         now: Instant::now(),
         lightbar_enabled: lightbar::is_enabled(),
     }))
+}
+
+/// Broadcast `Shutdown` to anything attached before our shell exists.
+///
+/// Stragglers can only be leftovers from a previous install: our shell has
+/// not been spawned yet, and transient CLI calls are near-instant (a CLI
+/// caught mid-call errors cleanly on the unexpected message). The 100ms
+/// reconnect cadence of pre-handshake shells means a 250ms window catches
+/// several attach cycles; the matching shell is spawned afterwards and can
+/// never observe this broadcast.
+fn shutdown_stale_shells(pipe: &PipeServer) {
+    thread::sleep(Duration::from_millis(250));
+    if pipe.client_count() == 0 {
+        return;
+    }
+    app_log::info(format!(
+        "service: shutting down {} stale pre-spawn client(s)",
+        pipe.client_count()
+    ));
+    let _ = pipe.send(ServiceMessage::Shutdown);
+    thread::sleep(Duration::from_millis(250));
+}
+
+/// Broadcast the retained snapshot when its rev advanced (change-push).
+///
+/// Cheap per-loop check (`u64` compare); the clone + send happen only on
+/// actual session changes (same cadence as the existing `Controllers`
+/// pushes). Keeps the shell's rendered state convergent without polling.
+fn push_snapshot_if_changed(session: &DeviceSession, pipe: &PipeServer, last: &mut u64) {
+    let rev = session.snapshot_rev();
+    if rev != *last {
+        *last = rev;
+        let _ = pipe.send(ServiceMessage::Snapshot(Box::new(session.snapshot())));
+    }
+}
+
+/// Merge connected emulated pads into a HID live snapshot (debug-only).
+///
+/// The session's live list is hardware + emulator; every ingestion merges so
+/// either source alone drives toasts, Start policy, and analytics. Release
+/// builds have no fleet: callers pass HID snapshots through unchanged.
+#[cfg(debug_assertions)]
+fn with_emu_live(hid: &[ControllerStatus], session: &DeviceSession) -> Vec<ControllerStatus> {
+    let mut merged = hid.to_vec();
+    merged.extend(crate::controller::emulate::live(&session.emu_fleet));
+    merged
 }
 
 /// Apply connect / battery-color lightbar via exclusive SetRgb while input is hot.
@@ -923,5 +1271,43 @@ mod tests {
             reopen_gesture_outcome(false, true, false, true),
             ReopenGestureOutcome::Idle
         );
+    }
+
+    /// Every ingestion merges hardware + emulator: with a pad connected the
+    /// merged list carries both, and with none connected HID passes through.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn emu_merge_keeps_hardware_and_emulator() {
+        use crate::controller::dualsense::battery::dualsense_status;
+        use crate::controller::emulate;
+        use crate::controller::model::{Connection, PowerState};
+        use crate::persist::analytics::AnalyticsStore;
+        use crate::persist::prefs::Prefs;
+
+        let hid = vec![dualsense_status(
+            1,
+            "DualSense",
+            Connection::Usb,
+            "REAL-1".to_string(),
+            80,
+            PowerState::Charging,
+        )];
+        let mut session = DeviceSession::new(
+            Prefs::default(),
+            KnownControllers::default(),
+            AnalyticsStore::default(),
+        );
+        let passthrough = with_emu_live(&hid, &session);
+        assert_eq!(passthrough.len(), 1);
+        assert_eq!(passthrough[0].serial, "REAL-1");
+
+        let pad = emulate::new_pad(&[], emulate::DEFAULT_PERCENT, Connection::Bluetooth);
+        session.emu_fleet = emulate::update(std::slice::from_ref(&pad), "emu-1", |p| {
+            p.connected = true;
+        });
+        let merged = with_emu_live(&hid, &session);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|c| c.serial == "REAL-1"));
+        assert!(merged.iter().any(|c| c.serial == "emu-1"));
     }
 }

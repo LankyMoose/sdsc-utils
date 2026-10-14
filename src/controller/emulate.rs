@@ -10,6 +10,8 @@
 //! dock can tell emulated pads from real hardware.
 
 use crate::controller::dualsense::battery::{LOW_BATTERY_PERCENT, dualsense_status};
+#[cfg(debug_assertions)]
+use crate::controller::known::KnownControllers;
 use crate::controller::model::Connection;
 use crate::controller::model::{ControllerStatus, PowerState};
 use std::time::Duration;
@@ -17,6 +19,8 @@ use std::time::Duration;
 pub const SERIAL_PREFIX: &str = "emu-";
 /// Serial of the first emulated pad. Analytics helpers default to it.
 pub const PRIMARY_SERIAL: &str = "emu-1";
+/// Default battery level for a freshly added pad.
+pub const DEFAULT_PERCENT: u8 = 50;
 /// Battery step for one analytics charge/drain advance.
 pub const STEP_PERCENT: u8 = 20;
 /// Active time credited by a charge advance (a full charge cycle is ~2h).
@@ -143,6 +147,45 @@ pub fn rehydrate(remembered: &[(String, u8, Connection)]) -> Vec<EmulatedPad> {
     fleet
 }
 
+/// Rebuild the Controllers-tab view fleet from service snapshot data.
+///
+/// The service owns the fleet; the shell keeps this derived view only:
+/// remembered `emu-` records rehydrate disconnected, live rows mark
+/// connected (adopting the service's level/link/state), and the local drag
+/// preview repaints on top. Anything the snapshot no longer contains
+/// (pruned pads) is gone — previews for missing pads are dropped with it.
+/// Pure so the shell stays convergent without owning anything.
+#[cfg(debug_assertions)]
+pub fn derive_view_fleet(
+    live: &[ControllerStatus],
+    remembered: &[crate::controller::known::KnownController],
+    previews: &std::collections::HashMap<String, u8>,
+) -> Vec<EmulatedPad> {
+    let records: Vec<(String, u8, Connection)> = remembered
+        .iter()
+        .filter(|r| is_emulated(&r.serial))
+        .map(|r| {
+            (
+                r.serial.clone(),
+                r.percent,
+                Connection::from_label(&r.connection).unwrap_or(Connection::Bluetooth),
+            )
+        })
+        .collect();
+    let mut fleet = rehydrate(&records);
+    for pad in &mut fleet {
+        if let Some(status) = live.iter().find(|c| c.serial == pad.serial()) {
+            pad.connected = true;
+            pad.status = status.clone();
+        }
+        if let Some(percent) = previews.get(pad.serial()) {
+            pad.status.percent = *percent;
+            pad.status.state = state_for(pad.status.connection, *percent);
+        }
+    }
+    fleet
+}
+
 /// Slot number encoded in an `emu-N` serial; non-emulated serials sort last.
 fn slot_of(serial: &str) -> usize {
     serial
@@ -189,6 +232,81 @@ pub fn live(fleet: &[EmulatedPad]) -> Vec<ControllerStatus> {
         .filter(|p| p.connected)
         .map(|p| p.status.clone())
         .collect()
+}
+
+/// Edit applied to the emulated fleet (Controllers debug tab).
+///
+/// Every variant carries the pad's serial so an action can never land on the
+/// wrong pad after the list shifts. Lives here (not in the UI) so the shell
+/// can send it as an intent and the service can own the fleet; the UI
+/// re-exports it. Debug-only: release builds compile the emulator out.
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum EmulatorCommand {
+    /// Spawn a pad on the lowest free slot, remembered but disconnected.
+    AddPad,
+    RemovePad(String),
+    /// Battery-level commit (shell drag preview stays local and debounced;
+    /// only the settled value crosses IPC). Re-derives the charge state.
+    PreviewPercent(String, u8),
+    /// Move the pad to a link — USB or Bluetooth. The charge state follows:
+    /// see [`state_for`].
+    SetConnection(String, Connection),
+    /// Plug in / unplug — runs the real connect or disconnect path.
+    SetConnected(String, bool),
+    /// Keep the pad across restarts (the popup's remember pin). A pad that is
+    /// both unplugged and forgotten is dropped from the list.
+    SetRemembered(String, bool),
+    /// Seed typical charge/play samples so ETA estimates exist.
+    SeedAnalytics(String),
+    /// Credit active time and walk one step up the charge cycle.
+    StepCharge(String),
+    /// Credit active time and walk one step down the drain cycle.
+    StepDrain(String),
+}
+
+/// Sync the remembered store with the fleet's remember flags, so
+/// disconnected pads appear in the normal remembered-but-off list and
+/// forgotten ones do not survive a restart.
+///
+/// `previous` is the fleet as it was *before* the command. Pads that
+/// `prune` dropped are absent from `current` by now, so they can only
+/// be found here — without them a forgotten pad would leave the fleet but stay
+/// on disk, and reappear on the next boot.
+///
+/// Connected pads are written too: a pad is only *listed* after an unplug, but
+/// a connected pad's level and link should still be current if it is unplugged
+/// later.
+///
+/// Returns whether anything changed, so the caller decides about saving.
+#[cfg(debug_assertions)]
+pub fn sync_remembered_emulated(
+    previous: &[EmulatedPad],
+    current: &[EmulatedPad],
+    known: &mut KnownControllers,
+) -> bool {
+    let mut changed = false;
+    for pad in current {
+        if pad.remembered {
+            changed |= known.remember(&pad.status);
+        } else {
+            // Forgetting takes effect in the store straight away, exactly as
+            // `toggle_remember` does for real hardware: the pad may still be on
+            // screen while connected, but it is no longer remembered, so an
+            // unplug leaves nothing behind.
+            changed |= known.forget(pad.serial());
+        }
+    }
+    // Pads that left the fleet were pruned, and pruning only ever drops pads
+    // that are both unplugged and forgotten — so make sure they are gone from
+    // the store too, or they would still come back after a restart.
+    for pad in previous {
+        if current.iter().any(|p| p.serial() == pad.serial()) {
+            continue;
+        }
+        changed |= known.forget(pad.serial());
+    }
+    changed
 }
 
 /// Next `(percent, connection, state)` for one analytics charge advance.
@@ -510,5 +628,76 @@ mod tests {
         assert!(is_emulated("emu-42"));
         assert!(!is_emulated("REAL-1"));
         assert!(!is_emulated(""));
+    }
+
+    #[cfg(debug_assertions)]
+    fn known_record(
+        serial: &str,
+        percent: u8,
+        connection: &str,
+    ) -> crate::controller::known::KnownController {
+        crate::controller::known::KnownController {
+            serial: serial.to_string(),
+            product: "DualSense".to_string(),
+            connection: connection.to_string(),
+            percent,
+            kind: crate::controller::model::ControllerKind::DualSense,
+        }
+    }
+
+    /// The snapshot-derived tab fleet: disconnected pads rehydrate from the
+    /// remembered store, live rows mark connected with service truth.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn derive_view_fleet_marks_live_connected() {
+        let remembered = vec![
+            known_record("emu-1", 40, "Bluetooth"),
+            known_record("emu-2", 90, "USB"),
+            known_record("REAL-1", 50, "USB"),
+        ];
+        let live = vec![dualsense_status(
+            1,
+            "DualSense",
+            Connection::Bluetooth,
+            "emu-1".to_string(),
+            45,
+            PowerState::Discharging,
+        )];
+        let fleet = derive_view_fleet(&live, &remembered, &std::collections::HashMap::new());
+        assert_eq!(fleet.len(), 2, "real hardware is not fleet business");
+        let emu1 = fleet.iter().find(|p| p.serial() == "emu-1").unwrap();
+        assert!(emu1.connected);
+        assert_eq!(emu1.status.percent, 45, "live service truth wins");
+        let emu2 = fleet.iter().find(|p| p.serial() == "emu-2").unwrap();
+        assert!(!emu2.connected);
+        assert_eq!(emu2.status.percent, 90);
+        assert!(emu2.remembered);
+    }
+
+    /// Drag preview repaints on top of the derived fleet without touching it.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn derive_view_fleet_overlays_previews() {
+        let remembered = vec![known_record("emu-1", 40, "Bluetooth")];
+        let previews = std::collections::HashMap::from([("emu-1".to_string(), 70u8)]);
+        let fleet = derive_view_fleet(&[], &remembered, &previews);
+        assert_eq!(fleet[0].status.percent, 70);
+        assert_eq!(fleet[0].status.state, PowerState::Discharging);
+        // A preview for a pad the snapshot no longer contains is dropped by
+        // the caller (retain); the derivation itself just has no row for it.
+        let ghost = std::collections::HashMap::from([("emu-9".to_string(), 70u8)]);
+        let fleet = derive_view_fleet(&[], &remembered, &ghost);
+        assert_eq!(fleet.len(), 1);
+        assert_eq!(fleet[0].status.percent, 40, "no overlay without a row");
+    }
+
+    /// Emulator commands survive the shell→service IPC hop.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn emulator_command_is_serializable() {
+        let cmd = EmulatorCommand::SetConnected("emu-1".to_string(), true);
+        let encoded = serde_json::to_vec(&cmd).expect("encode");
+        let decoded: EmulatorCommand = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(decoded, cmd);
     }
 }

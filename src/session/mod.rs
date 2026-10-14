@@ -14,9 +14,9 @@ pub use gate::{
 
 use crate::controller::dualsense::identity::normalize_identity;
 use crate::controller::dualsense::lightbar;
-use crate::controller::known::KnownControllers;
+use crate::controller::known::{KnownController, KnownControllers};
 use crate::controller::model::ControllerStatus;
-use crate::persist::analytics::AnalyticsStore;
+use crate::persist::analytics::{AnalyticsStore, SerialRecord};
 use crate::persist::notify::{NotifyEvent, NotifyTracker};
 use crate::persist::prefs::Prefs;
 use crate::platform::app_log;
@@ -38,6 +38,38 @@ pub const MIN_CONNECT_STRETCH: Duration = Duration::from_secs(2);
 pub struct StartSelection {
     pub game_key: Option<String>,
     pub controller_key: Option<String>,
+}
+
+/// Retained service→shell state: one message, one revision.
+///
+/// The service is the sole owner of this truth (live pads, remembered pads,
+/// prefs, analytics records, stored start selection). The shell renders
+/// purely from the last snapshot it applied and mutates only via intents.
+/// New shared state later means a new `#[serde(default)]` field here — not
+/// another shadow copy with its own sync loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    /// Monotonic revision; the shell applies wholesale iff `rev` is newer.
+    #[serde(default)]
+    pub rev: u64,
+    /// Live HID controllers.
+    #[serde(default)]
+    pub live: Vec<ControllerStatus>,
+    /// Remembered pads (connected or not).
+    #[serde(default)]
+    pub remembered: Vec<KnownController>,
+    /// Nicknames by serial.
+    #[serde(default)]
+    pub nicknames: HashMap<String, String>,
+    /// Full prefs (service-validated).
+    #[serde(default)]
+    pub prefs: Prefs,
+    /// Stored start-screen selection (service process lifetime only).
+    #[serde(default)]
+    pub selection: StartSelection,
+    /// Learned analytics records (shell recomputes ETAs/panel rows locally).
+    #[serde(default)]
+    pub analytics: HashMap<String, SerialRecord>,
 }
 
 /// Side effects the shell must perform after a session step.
@@ -95,6 +127,14 @@ pub struct DeviceSession {
     /// Last start-screen selection reported by the shell (service process
     /// lifetime only — never persisted to disk).
     pub start_selection: StartSelection,
+    /// Monotonic revision for the retained snapshot (see [`SessionSnapshot`]).
+    /// Bumped on every mutation that changes snapshot content.
+    snapshot_rev: u64,
+    /// Developer emulator fleet (debug-only, service-owned in client mode).
+    /// The shell never touches this: it renders the fleet derived from the
+    /// snapshot and sends edits as intents. Release builds have no fleet.
+    #[cfg(debug_assertions)]
+    pub emu_fleet: Vec<crate::controller::emulate::EmulatedPad>,
 }
 
 impl DeviceSession {
@@ -112,6 +152,9 @@ impl DeviceSession {
             missed_poll_since: HashMap::new(),
             start_auto_open_pending: false,
             start_selection: StartSelection::default(),
+            snapshot_rev: 1,
+            #[cfg(debug_assertions)]
+            emu_fleet: Vec::new(),
         }
     }
 
@@ -138,7 +181,94 @@ impl DeviceSession {
 
     /// Remember the shell's start-screen selection (in memory only).
     pub fn remember_start_selection(&mut self, selection: StartSelection) {
-        self.start_selection = selection;
+        if self.start_selection != selection {
+            self.start_selection = selection;
+            self.bump_snapshot_rev();
+        }
+    }
+
+    /// Current snapshot revision (monotonic; starts at 1).
+    pub fn snapshot_rev(&self) -> u64 {
+        self.snapshot_rev
+    }
+
+    fn bump_snapshot_rev(&mut self) {
+        self.snapshot_rev = self.snapshot_rev.saturating_add(1).max(1);
+    }
+
+    /// Build the retained snapshot the shell renders from.
+    pub fn snapshot(&self) -> SessionSnapshot {
+        let (remembered, nicknames) = self.known.export_snapshot();
+        SessionSnapshot {
+            rev: self.snapshot_rev,
+            live: self.controllers.clone(),
+            remembered,
+            nicknames,
+            prefs: self.prefs.clone(),
+            selection: self.start_selection.clone(),
+            analytics: self.analytics.export_snapshot(),
+        }
+    }
+
+    /// Replace prefs wholesale (service-validated) and bump the snapshot rev
+    /// when anything changed. Prefer this over assigning `session.prefs`
+    /// directly so the shell always converges.
+    pub fn apply_prefs(&mut self, prefs: Prefs) {
+        // Prefs has no PartialEq; compare the serialized form.
+        let before = serde_json::to_vec(&self.prefs).unwrap_or_default();
+        let after = serde_json::to_vec(&prefs).unwrap_or_default();
+        self.prefs = prefs;
+        if before != after {
+            self.bump_snapshot_rev();
+        }
+    }
+
+    /// Replace the remembered store wholesale (disk reload path) and bump the
+    /// snapshot rev when anything changed.
+    pub fn apply_known(&mut self, known: KnownControllers) {
+        let (before_r, before_n) = self.known.export_snapshot();
+        let (after_r, after_n) = known.export_snapshot();
+        self.known = known;
+        if before_r != after_r || before_n != after_n {
+            self.bump_snapshot_rev();
+        }
+    }
+
+    /// Force the snapshot rev forward (intent receipt echo).
+    ///
+    /// The service calls this after every mutating shell intent so the shell
+    /// always converges — even when the intent was a no-op (e.g. remembering
+    /// an already-remembered pad, or a pref write that changed nothing). The
+    /// broadcast snapshot reconciles any optimistic shell state to service
+    /// truth within one service loop.
+    pub fn echo_intent(&mut self) {
+        self.bump_snapshot_rev();
+    }
+
+    /// Apply a shell remember/forget intent (service side).
+    ///
+    /// Remembering resolves against the service's own live list (source of
+    /// truth); an unknown serial is a no-op. Returns true when stored data
+    /// changed.
+    pub fn set_remembered(
+        &mut self,
+        serial: &str,
+        remembered: bool,
+        live: &[ControllerStatus],
+    ) -> bool {
+        if remembered {
+            live.iter()
+                .find(|c| c.serial == serial)
+                .is_some_and(|c| self.known.remember(c))
+        } else {
+            self.known.forget(serial)
+        }
+    }
+
+    /// Apply a shell nickname intent (service side, absolute: `None` clears).
+    /// Returns true when stored data changed.
+    pub fn set_nickname(&mut self, serial: &str, nickname: Option<String>) -> bool {
+        self.known.set_nickname(serial, nickname)
     }
 
     pub fn cooldown_active(&self, now: Instant) -> bool {
@@ -261,6 +391,9 @@ impl DeviceSession {
         }
 
         effects.push(SessionEffect::SaveKnown);
+        // Live membership or remembered fields changed: the retained snapshot
+        // the shell renders from must advance too.
+        self.bump_snapshot_rev();
         let want_auto_open = presence_edge.is_some_and(|(prev_present, next_present)| {
             should_auto_open_start(
                 self.prefs.start_screen_enabled && self.prefs.start_screen_auto_open.auto_opens(),
@@ -435,6 +568,17 @@ mod tests {
             serial.to_string(),
             50,
             PowerState::Discharging,
+        )
+    }
+
+    fn usb_pad_at(serial: &str, percent: u8, state: PowerState) -> ControllerStatus {
+        dualsense_status(
+            1,
+            "DualSense",
+            Connection::Usb,
+            serial.to_string(),
+            percent,
+            state,
         )
     }
 
@@ -723,5 +867,149 @@ mod tests {
             Some("manual:xyz")
         );
         assert_eq!(session.start_selection.controller_key, None);
+    }
+
+    /// Regression for the 2026-10-14 incident (shell showed a stale remembered
+    /// `%` after full-charge + USB unplug while service/disk were correct).
+    ///
+    /// Service truth: `95% Charging → 100% Complete → disconnected` must leave
+    /// the remembered record at 100%, and the retained snapshot the shell
+    /// renders from must carry that 100% — not the boot-time value.
+    #[test]
+    fn full_charge_then_unplug_snapshot_carries_100() {
+        let mut session = session_with(false, StartAutoOpen::Any);
+        // Boot-time state: pad remembered at 95%.
+        session
+            .known
+            .remember(&usb_pad_at("pad-1", 95, PowerState::Charging));
+        let rev_boot = session.snapshot_rev();
+        let snap_boot = session.snapshot();
+        assert_eq!(
+            snap_boot
+                .remembered
+                .iter()
+                .find(|r| r.serial == "pad-1")
+                .map(|r| r.percent),
+            Some(95),
+            "boot snapshot reflects the boot-time remembered %"
+        );
+
+        // Charge walk to full, then unplug.
+        let _ = session.apply_controllers(
+            vec![usb_pad_at("pad-1", 95, PowerState::Charging)],
+            ctx(false),
+        );
+        let _ = session.apply_controllers(
+            vec![usb_pad_at("pad-1", 100, PowerState::Complete)],
+            ctx(false),
+        );
+        let _ = session.apply_controllers(Vec::new(), ctx(false));
+
+        let remembered = session.known.remembered_disconnected(&session.controllers);
+        assert_eq!(remembered.len(), 1);
+        assert_eq!(remembered[0].percent, 100);
+
+        let snap = session.snapshot();
+        assert!(
+            snap.rev > rev_boot,
+            "snapshot rev must advance past boot ({} <= {})",
+            snap.rev,
+            rev_boot
+        );
+        assert_eq!(
+            snap.remembered
+                .iter()
+                .find(|r| r.serial == "pad-1")
+                .map(|r| r.percent),
+            Some(100),
+            "shell-facing snapshot must carry 100, not the boot-time 95"
+        );
+        assert!(snap.live.is_empty(), "pad was unplugged");
+    }
+
+    #[test]
+    fn snapshot_rev_bumps_on_selection_and_prefs() {
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let rev0 = session.snapshot_rev();
+        session.remember_start_selection(StartSelection {
+            game_key: Some("steam:440".to_string()),
+            controller_key: None,
+        });
+        assert!(session.snapshot_rev() > rev0);
+        assert_eq!(
+            session.snapshot().selection.game_key.as_deref(),
+            Some("steam:440")
+        );
+        // Same value again: no bump.
+        let rev1 = session.snapshot_rev();
+        session.remember_start_selection(StartSelection {
+            game_key: Some("steam:440".to_string()),
+            controller_key: None,
+        });
+        assert_eq!(session.snapshot_rev(), rev1);
+
+        // Prefs change bumps; identical prefs do not.
+        let mut prefs = session.prefs.clone();
+        prefs.notify_low = !prefs.notify_low;
+        session.apply_prefs(prefs);
+        assert!(session.snapshot_rev() > rev1);
+        let rev2 = session.snapshot_rev();
+        session.apply_prefs(session.prefs.clone());
+        assert_eq!(session.snapshot_rev(), rev2);
+    }
+
+    #[test]
+    fn snapshot_round_trips_over_json() {
+        // The snapshot is the retained IPC payload: it must survive a
+        // service→shell JSON hop with defaults intact.
+        let mut session = session_with(false, StartAutoOpen::Any);
+        session
+            .known
+            .remember(&usb_pad_at("pad-1", 100, PowerState::Complete));
+        let snap = session.snapshot();
+        let encoded = serde_json::to_vec(&snap).expect("encode snapshot");
+        let decoded: SessionSnapshot = serde_json::from_slice(&encoded).expect("decode snapshot");
+        assert_eq!(decoded.rev, snap.rev);
+        assert_eq!(decoded.remembered.len(), snap.remembered.len());
+        assert_eq!(decoded.remembered[0].percent, 100);
+        // Sparse payloads decode with defaults (forward-compat).
+        let sparse: SessionSnapshot = serde_json::from_str("{}").expect("sparse");
+        assert_eq!(sparse.rev, 0);
+        assert!(sparse.live.is_empty());
+    }
+
+    #[test]
+    fn set_remembered_resolves_against_service_live() {
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let live = vec![usb_pad_at("pad-1", 60, PowerState::Discharging)];
+        // Remembering a live pad stores it; unknown serials are a no-op.
+        assert!(session.set_remembered("pad-1", true, &live));
+        assert!(session.known.is_remembered("pad-1"));
+        assert!(!session.set_remembered("ghost", true, &live));
+        assert!(!session.known.is_remembered("ghost"));
+        // Forgetting drops the record (re-add would need live again).
+        assert!(session.set_remembered("pad-1", false, &live));
+        assert!(!session.known.is_remembered("pad-1"));
+        assert!(!session.set_remembered("pad-1", false, &live));
+    }
+
+    #[test]
+    fn set_nickname_is_absolute() {
+        let mut session = session_with(false, StartAutoOpen::Any);
+        assert!(session.set_nickname("pad-1", Some("Couch".into())));
+        assert_eq!(session.known.nickname("pad-1"), Some("Couch"));
+        assert!(!session.set_nickname("pad-1", Some("Couch".into())));
+        assert!(session.set_nickname("pad-1", None));
+        assert_eq!(session.known.nickname("pad-1"), None);
+    }
+
+    #[test]
+    fn echo_intent_advances_rev_for_noop_convergence() {
+        // Even a no-op intent must echo a newer rev so an optimistic shell
+        // reconciles to service truth instead of sticking.
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let rev = session.snapshot_rev();
+        session.echo_intent();
+        assert!(session.snapshot_rev() > rev);
     }
 }

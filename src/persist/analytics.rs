@@ -71,15 +71,15 @@ pub struct StepSample {
 
 /// New persisted fields need `#[serde(default)]` (or the oldest-shape fixture fails).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct SerialRecord {
+pub struct SerialRecord {
     #[serde(default)]
-    last_seen_ms: u64,
+    pub last_seen_ms: u64,
     #[serde(default)]
-    drain_steps: Vec<StepSample>,
+    pub drain_steps: Vec<StepSample>,
     #[serde(default)]
-    charge_steps: Vec<StepSample>,
+    pub charge_steps: Vec<StepSample>,
     #[serde(default)]
-    in_progress: Option<InProgressBucket>,
+    pub in_progress: Option<InProgressBucket>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,14 +173,32 @@ impl AnalyticsStore {
         };
         match serde_json::to_vec_pretty(&file) {
             Ok(bytes) => {
-                if let Err(err) = fs::write(&path, bytes) {
-                    app_log::warn(format!("failed to write analytics: {err}"));
-                    return;
+                if crate::persist::atomic::write_atomic_logged("analytics", &path, &bytes) {
+                    self.dirty = false;
                 }
-                self.dirty = false;
             }
             Err(err) => app_log::warn(format!("failed to serialize analytics: {err}")),
         }
+    }
+
+    /// Export learned per-serial records for the service→shell snapshot.
+    ///
+    /// Runtime-only fields (`last_tick_ms`, grace clocks) stay behind; the
+    /// shell recomputes ETAs/panel rows from the records.
+    pub fn export_snapshot(&self) -> HashMap<String, SerialRecord> {
+        self.by_serial.clone()
+    }
+
+    /// Replace learned records wholesale from a service snapshot (shell side).
+    ///
+    /// Never marks dirty: the shell in client mode must not write
+    /// `analytics.json` (single-writer: service owns the file).
+    pub fn apply_snapshot(&mut self, records: HashMap<String, SerialRecord>) {
+        self.by_serial = records;
+        self.dirty = false;
+        self.last_tick_ms = None;
+        self.connected_at_ms.clear();
+        self.grace_reconciled.clear();
     }
 
     /// Wipe learned analytics (kept for tests / future tooling; Settings no longer exposes this).

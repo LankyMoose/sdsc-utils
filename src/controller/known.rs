@@ -136,14 +136,50 @@ impl KnownControllers {
 
         match serde_json::to_vec_pretty(&file) {
             Ok(bytes) => {
-                if let Err(err) = fs::write(&path, bytes) {
-                    app_log::warn(format!("failed to write controllers: {err}"));
-                    return;
+                if crate::persist::atomic::write_atomic_logged("controllers", &path, &bytes) {
+                    self.dirty = false;
                 }
-                self.dirty = false;
             }
             Err(err) => app_log::warn(format!("failed to serialize controllers: {err}")),
         }
+    }
+
+    /// Export remembered records + nicknames for the service→shell snapshot.
+    pub fn export_snapshot(&self) -> (Vec<KnownController>, HashMap<String, String>) {
+        let mut controllers: Vec<_> = self.by_serial.values().cloned().collect();
+        controllers.sort_by(|a, b| a.serial.cmp(&b.serial));
+        (controllers, self.nicknames.clone())
+    }
+
+    /// Replace remembered records + nicknames wholesale from a service
+    /// snapshot (shell side).
+    ///
+    /// Never marks dirty: the shell in client mode must not write
+    /// `controllers.json` (single-writer: service owns the file).
+    pub fn apply_snapshot(
+        &mut self,
+        remembered: Vec<KnownController>,
+        nicknames: HashMap<String, String>,
+    ) {
+        let mut by_serial = HashMap::new();
+        for record in remembered {
+            if is_storable_serial(&record.serial) {
+                by_serial.insert(record.serial.clone(), record);
+            }
+        }
+        let mut clean_nicknames = HashMap::new();
+        for (serial, name) in nicknames {
+            if !is_storable_serial(&serial) {
+                continue;
+            }
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                clean_nicknames.insert(serial, trimmed.to_string());
+            }
+        }
+        self.by_serial = by_serial;
+        self.nicknames = clean_nicknames;
+        self.dirty = false;
     }
 
     pub fn is_remembered(&self, serial: &str) -> bool {
