@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Horizontal immersive Start centers every cover by its art (neighbors no longer ride above the selection) and fades neighbors to transparent instead of grey.
 - Horizontal immersive strip: neighbor covers now sag downward with distance (cover-flow arc mirroring the vertical strip), keeping clock clearance.
 - Immersive selected-hero cue box (Playing/membership + face hints over the art) now crossfades with the strip scroll instead of popping in and out.
+- Start hint rings (face-button circles + hold-progress arcs) render as SVG instead of per-glyph `canvas` layers: static states rasterize once, hold sweeps mint a bounded handle set, so steady-state frames do no vector work.
 
 ### Fixed
 

@@ -3,6 +3,7 @@ pub mod carousel;
 pub mod clock;
 pub mod cursor_hide;
 pub mod gesture;
+pub mod hint_ring;
 pub mod icon_cache;
 pub mod idle;
 pub mod immersive;

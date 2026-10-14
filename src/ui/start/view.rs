@@ -4974,7 +4974,7 @@ fn text_glyph_circle(
         RingStyle::Idle
     };
     let stack = iced::widget::stack![
-        action_ring(style, idle_radius, 1.0),
+        ring_element(style, idle_radius, 1.0),
         container(text(glyph).size(12.0).color(theme::ACCENT))
             .width(Length::Fixed(HOLD_RING_SIZE))
             .height(Length::Fixed(HOLD_RING_SIZE))
@@ -5277,7 +5277,7 @@ fn face_glyph_stack(
     let idle_radius = max_radius / PRESSED_SCALE;
     let glyph_size = FACE_GLYPH_SIZE * (idle_radius / (half - 2.0));
     iced::widget::stack![
-        action_ring(style, idle_radius, alpha),
+        ring_element(style, idle_radius, alpha),
         container(face_svg(face, glyph_size, alpha))
             .width(Length::Fixed(HOLD_RING_SIZE))
             .height(Length::Fixed(HOLD_RING_SIZE))
@@ -5289,98 +5289,21 @@ fn face_glyph_stack(
     .into()
 }
 
-fn action_ring(style: RingStyle, radius: f32, alpha: f32) -> Element<'static, StartMessage> {
-    iced::widget::canvas(ActionRing {
-        style,
-        radius,
-        alpha: alpha.clamp(0.0, 1.0),
-    })
-    .width(Length::Fixed(HOLD_RING_SIZE))
-    .height(Length::Fixed(HOLD_RING_SIZE))
-    .into()
-}
-
-struct ActionRing {
-    style: RingStyle,
-    radius: f32,
-    alpha: f32,
-}
-
-impl canvas::Program<StartMessage> for ActionRing {
-    type State = ();
-
-    fn draw(
-        &self,
-        _state: &Self::State,
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        let center = Point::new(bounds.width / 2.0, bounds.height / 2.0);
-        let radius = self.radius;
-        let track = Path::circle(center, radius);
-
-        match self.style {
-            RingStyle::Pressed => {
-                frame.stroke(
-                    &track,
-                    Stroke::default()
-                        .with_width(2.5)
-                        .with_color(theme::alpha(theme::ACCENT, self.alpha)),
-                );
-            }
-            RingStyle::Idle => {
-                frame.stroke(
-                    &track,
-                    Stroke::default().with_width(2.0).with_color(Color {
-                        a: 0.25 * self.alpha,
-                        ..theme::MUTED
-                    }),
-                );
-            }
-            RingStyle::Hold { progress, armed_t } => {
-                frame.stroke(
-                    &track,
-                    Stroke::default().with_width(2.0).with_color(Color {
-                        a: 0.25 * self.alpha,
-                        ..theme::MUTED
-                    }),
-                );
-                if progress > 0.01 {
-                    let start = -std::f32::consts::FRAC_PI_2;
-                    let end = start + progress * std::f32::consts::TAU;
-                    let steps = ((progress * 48.0).ceil() as usize).max(2);
-                    let arc = Path::new(|builder| {
-                        for i in 0..=steps {
-                            let t = i as f32 / steps as f32;
-                            let a = start + (end - start) * t;
-                            let p = Point::new(
-                                center.x + radius * a.cos(),
-                                center.y + radius * a.sin(),
-                            );
-                            if i == 0 {
-                                builder.move_to(p);
-                            } else {
-                                builder.line_to(p);
-                            }
-                        }
-                    });
-                    let arc_color = lerp_color(theme::ACCENT, theme::MUTED, armed_t);
-                    let arc_color = Color {
-                        a: arc_color.a * self.alpha,
-                        ..arc_color
-                    };
-                    frame.stroke(
-                        &arc,
-                        Stroke::default().with_width(2.5).with_color(arc_color),
-                    );
-                }
-            }
-        }
-        vec![frame.into_geometry()]
-    }
+/// Face-button ring as SVG instead of `canvas` (see `hint_ring`): identical
+/// stroked circle + hold arc, but static states rasterize once and every
+/// later frame is an atlas hit instead of a rebuilt tiny-skia layer.
+fn ring_element(style: RingStyle, radius: f32, alpha: f32) -> Element<'static, StartMessage> {
+    use crate::ui::start::hint_ring::{RingKind, ring_svg};
+    let kind = match style {
+        RingStyle::Pressed => RingKind::Pressed,
+        RingStyle::Idle => RingKind::Idle,
+        RingStyle::Hold { progress, armed_t } => RingKind::Hold { progress, armed_t },
+    };
+    svg(ring_svg(kind, radius, HOLD_RING_SIZE))
+        .width(Length::Fixed(HOLD_RING_SIZE))
+        .height(Length::Fixed(HOLD_RING_SIZE))
+        .opacity(alpha.clamp(0.0, 1.0))
+        .into()
 }
 
 fn skeleton_bar(width: f32, height: f32) -> Element<'static, StartMessage> {
