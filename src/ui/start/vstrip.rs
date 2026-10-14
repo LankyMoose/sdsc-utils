@@ -44,6 +44,17 @@ pub const V_TITLE_SELECTED_SIZE: f32 = 39.0;
 pub const V_TITLE_BOLD_FUDGE: f32 = 1.06;
 /// Rightward arc offset per index unit of distance from center.
 pub const ARC_PX: f32 = 14.0;
+/// Downward arc offset per index unit of distance from center (horizontal mode).
+///
+/// Mirrors [`ARC_PX`] onto the Y axis: neighbors sag downward with distance
+/// (cover-flow sag), keeping top clock clearance. To flip the arc upward
+/// (neighbors rise), set [`H_ARC_SIGN`] to `-1.0`.
+pub const H_ARC_PX: f32 = 14.0;
+/// Sign of the horizontal arc ([`H_ARC_PX`] / [`arc_offset_y`]).
+///
+/// `+1.0` = sag down (+Y, default, keeps clock clearance);
+/// `-1.0` = rise up (-Y). Flip this const to swap the arc direction.
+pub const H_ARC_SIGN: f32 = 1.0;
 /// Constant edge gap between adjacent capsules (negative = slight overlap / denser stream).
 const STRIDE_GAP: f32 = 12.0;
 /// Fraction of the outer (`|d| = 2`) card visible at the viewport edge.
@@ -67,14 +78,17 @@ pub const H_TITLE_BOLD_FUDGE: f32 = 1.06;
 /// Reserved height for the horizontal in-slot text (every slot's title + meta).
 ///
 /// Budget (1.3x line height): two-line selected title at 28px (72.8) + 6 +
-/// two meta lines at 16px (43.6 incl. spacing 2) + 6 + update badge (~21) =
-/// ~150. Neighbor titles (22px) fit the same budget with room to spare. The
-/// selection carries it too: its title rides **inside** the slot like every
-/// other cover, so titles animate with the card instead of in a separate
-/// full-width crossfade layer. [`slot_child_size_h`] adds it to every
-/// slot box and [`metrics_for_width`] reserves it under the shared art
-/// centerline (art is anchored at the strip top — see [`slot_y_offset_h`]).
-pub const H_TEXT_RESERVE: f32 = 150.0;
+/// two meta lines at 16px (43.6 incl. spacing 2) + 6 + update badge (~23:
+/// 13px line + 6 padding + border) = ~152. The reserve carries ~8px of
+/// slack past that measured worst case for paragraph rounding, so the
+/// selection's badge never clips at the strip edge. Neighbor titles (22px)
+/// fit the same budget with room to spare. The selection carries it too:
+/// its title rides **inside** the slot like every other cover, so titles
+/// animate with the card instead of in a separate full-width crossfade
+/// layer. [`slot_child_size_h`] adds it to every slot box and
+/// [`metrics_for_width`] reserves it under the shared art centerline (art
+/// is anchored at the strip top — see [`slot_y_offset_h`]).
+pub const H_TEXT_RESERVE: f32 = 160.0;
 /// Top clearance kept above the horizontal strip (clock capsule + art-row drop).
 ///
 /// Sizing only: the layout anchors the ART ROW (not the strip block)
@@ -98,9 +112,9 @@ pub const H_TOP_PAD: f32 = 44.0;
 /// room the removed full-width title layer used to claim would inflate every
 /// capsule instead of becoming breathing room, and the row would read
 /// cramped against the rail. Sized so `h_text_budget + breathing` stays
-/// constant when the text reserve grows for wrapped two-line titles: cover
-/// size holds steady instead of shrinking into the new budget.
-const H_ROW_BREATHING_ROOM: f32 = 90.0;
+/// constant (248) when the text reserve grows for wrapped two-line titles:
+/// cover size holds steady instead of shrinking into the new budget.
+const H_ROW_BREATHING_ROOM: f32 = 80.0;
 /// Minimum gap from the strip bottom (in-slot titles) to the position rail top.
 ///
 /// Matches the slack the old block-centering left (~18px at 1080p); the
@@ -423,6 +437,16 @@ pub fn arc_offset_x(distance: f32) -> f32 {
     ARC_PX * distance.abs()
 }
 
+/// Downward Y offset (logical px) for a signed horizontal-strip distance.
+///
+/// Mirror of [`arc_offset_x`]: neighbors sag downward (`+Y`, cover-flow sag)
+/// with distance from center. Sign comes from [`H_ARC_SIGN`] — flip it to
+/// `-1.0` to arc upward instead. Applied on top of the [`slot_y_offset_h`]
+/// art-centerline anchor in the horizontal layout arm only.
+pub fn arc_offset_y(distance: f32) -> f32 {
+    H_ARC_SIGN * H_ARC_PX * distance.abs()
+}
+
 /// Layout box for a strip child at `distance`.
 ///
 /// Capsule height/width follow [`scale_at_distance`]; the title column glides
@@ -608,10 +632,12 @@ where
                 StripOrientation::Horizontal => {
                     // Art is the vertical anchor: the strip top is the selected
                     // art's top, so every art shares one centerline and
-                    // in-slot titles hang below the art from there.
+                    // in-slot titles hang below the art from there. The arc
+                    // sags neighbors downward on top of that anchor
+                    // (cover-flow sag, keeps clock clearance).
                     let x = size.width * 0.5 + slot_x_offset(dist, self.metrics.center_w)
                         - child_size.width * 0.5;
-                    let y = slot_y_offset_h(dist, &self.metrics);
+                    let y = slot_y_offset_h(dist, &self.metrics) + arc_offset_y(dist);
                     iced::Point::new(x, y)
                 }
             };
@@ -802,6 +828,48 @@ mod tests {
         assert!((arc_offset_x(0.0)).abs() < 0.001);
         assert!((arc_offset_x(1.0) - ARC_PX).abs() < 0.001);
         assert!((arc_offset_x(-2.0) - 2.0 * ARC_PX).abs() < 0.001);
+    }
+
+    #[test]
+    fn h_arc_grows_with_distance() {
+        assert!((arc_offset_y(0.0)).abs() < 0.001);
+        assert!((arc_offset_y(1.0) - H_ARC_SIGN * H_ARC_PX).abs() < 0.001);
+        assert!((arc_offset_y(-2.0) - H_ARC_SIGN * 2.0 * H_ARC_PX).abs() < 0.001);
+        // Mirrors the vertical arc magnitude (sign carries the direction).
+        assert!((arc_offset_y(1.0).abs() - arc_offset_x(1.0).abs()).abs() < 0.001);
+        assert!((arc_offset_y(-2.0).abs() - arc_offset_x(-2.0).abs()).abs() < 0.001);
+    }
+
+    #[test]
+    fn horizontal_arc_sags_below_centerline() {
+        // The arc rides on top of the art-centerline anchor: base centers art
+        // on the shared midline ([`slot_y_offset_h`]), the arc sags neighbors
+        // downward from there. Selection stays on the line; neighbors drop by
+        // exactly the arc offset.
+        let m = metrics_for_width(1920.0, 1080.0);
+        let midline = m.center_h * SELECTED_SCALE * 0.5;
+        assert!(arc_offset_y(0.0).abs() < 0.001);
+        for d in [0.5_f32, 1.0, 2.0, 3.0, 5.0] {
+            let art_h = m.center_h * scale_at_distance(d);
+            let base_top = slot_y_offset_h(d, &m);
+            // Base anchor still centers art (invariant preserved).
+            assert!(
+                (base_top + art_h * 0.5 - midline).abs() < 0.01,
+                "d={d} base_top={base_top}"
+            );
+            // Final layout y = base + arc, so art center sits one arc below
+            // the midline (downward sag, +Y).
+            let y = base_top + arc_offset_y(d);
+            assert!(
+                (y + art_h * 0.5 - midline - arc_offset_y(d)).abs() < 0.01,
+                "d={d} y={y}"
+            );
+            assert!(y >= base_top - 0.01, "d={d}");
+            // Sign convention: default sags down.
+            assert!(arc_offset_y(d) >= -0.001, "d={d}");
+        }
+        // Symmetric in distance (both sides sag equally).
+        assert!((arc_offset_y(2.0) - arc_offset_y(-2.0)).abs() < 0.001);
     }
 
     #[test]
@@ -1110,13 +1178,79 @@ mod tests {
         // Text reserve fits the measured worst case (two-line 28px selected
         // title + two 16px meta lines + the Update badge) so meta presence
         // never pushes the row. Neighbor single-line 22px titles fit with room.
+        // Badge: 13px selected label at 1.3x line height + 6 padding + 2
+        // border (conservative — the border paints on the container edge).
+        // The old `+ 21.0` underestimated it, clipping ~2px off the
+        // selection's badge at the strip edge.
+        let badge_h = 13.0 * 1.3 + 6.0 + 2.0;
         let text_lines =
-            H_TITLE_SELECTED_SIZE * 1.3 * 2.0 + 6.0 + (16.0 * 1.3 * 2.0 + 2.0) + 6.0 + 21.0;
+            H_TITLE_SELECTED_SIZE * 1.3 * 2.0 + 6.0 + (16.0 * 1.3 * 2.0 + 2.0) + 6.0 + badge_h;
         assert!(
-            H_TEXT_RESERVE >= text_lines - 0.5,
+            H_TEXT_RESERVE >= text_lines + 5.0,
             "reserve={} need={text_lines}",
             H_TEXT_RESERVE
         );
+    }
+
+    #[test]
+    fn outer_peek_titles_would_overlap_at_neighbor_wrap() {
+        // Regression pin for the art-only rule (`show_text` is false at
+        // `|offset| >= 2`): same-wrap neighbor titles are wider than the
+        // 1→2 stride, so a d=2 title would overlap its d=1 neighbor by ~21px
+        // at 1080p. Narrowing d=2 to its own art width would fit, but the
+        // breaks would reflow mid-scroll (1→2 width change) and break the
+        // same-wrap guarantee — so outer peeks stay art-only. Their slot
+        // boxes still carry the shared text budget (art stays centered).
+        let m = metrics_for_width(1920.0, 1080.0);
+        let neighbor_wrap = m.center_w * SCALE_AT_1;
+        let stride_12 = unit_stride(1.0, m.center_w);
+        assert!(
+            neighbor_wrap > stride_12,
+            "wrap={neighbor_wrap} stride={stride_12}"
+        );
+        // Holds at every capsule size (floor included): 0.15 * center_w > gap.
+        let floor_w = CENTER_H_MIN * ASPECT;
+        assert!(floor_w * SCALE_AT_1 > unit_stride(1.0, floor_w));
+        // But the shared box still fits the strip (no geometry clipping).
+        for d in [2.0_f32, 3.0, 5.0] {
+            let bottom = slot_y_offset_h(d, &m) + arc_offset_y(d) + slot_child_size_h(&m, d).height;
+            assert!(bottom <= m.slot_h + 0.01, "d={d} bottom={bottom}");
+        }
+    }
+
+    #[test]
+    fn text_reserve_growth_holds_capsule_size() {
+        // Growing the text reserve must not shrink covers or push the rail:
+        // `h_text_budget + breathing` stays constant, so the capsule is
+        // identical and only the strip grows (rail gap absorbs it).
+        assert!((H_TEXT_GAP + H_TEXT_RESERVE + H_ROW_BREATHING_ROOM - 248.0).abs() < 0.01);
+        let m = metrics_for_width(1920.0, 1080.0);
+        // 1080p cover size is unchanged (art ~470px).
+        assert!(
+            (m.center_h * SELECTED_SCALE - 470.0).abs() < 1.0,
+            "art={}",
+            m.center_h * SELECTED_SCALE
+        );
+        assert!((m.slot_h - (m.center_h * SELECTED_SCALE + m.h_text_budget)).abs() < 0.01);
+        // Rail gap survives the taller strip at 1080p and 720p.
+        for (w, h) in [(1920.0_f32, 1080.0_f32), (1280.0, 720.0)] {
+            let sm = metrics_for_width(w, h);
+            let region = h - H_RAIL_RESERVE - H_FOOTER_RESERVE;
+            let lead = horizontal_block_lead(
+                region,
+                sm.slot_h,
+                sm.h_text_budget,
+                H_TOP_PAD,
+                H_TITLE_TO_BAR_MIN,
+            );
+            assert!(
+                region - lead - sm.slot_h >= H_TITLE_TO_BAR_MIN - 0.01,
+                "w={w} h={h} gap={}",
+                region - lead - sm.slot_h
+            );
+        }
+        // Ultrawide still shows the full neighbor fan (capsule unchanged).
+        assert_eq!(neighbors_for_width(3440.0, m.center_w), MAX_NEIGHBORS);
     }
 
     #[test]

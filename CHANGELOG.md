@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Toasts are rounded glass cards with a soft shadow and a rounded accent rail.
 - Settings window is larger (720×520) with a floating sidebar, grouped cards, and consistent toggles and sliders.
 - `SDSC_DEBUG_OPEN` (debug builds): open specific windows at boot; quiet mode moves them to the secondary monitor without focus and mutes sounds/haptics.
+- Immersive Start settings gains a position-rail visibility selector (`When navigating` default / `Always on`, persisted): `Always on` keeps the section rail visible instead of auto-hiding it after navigation idle.
+- Immersive Start settings gains a **Reduced motion** selector (`System` default / `On` / `Off`, persisted): when effective, all Start-screen movement snaps instantly — carousel/dock/strip slides, drawer travel, rail slide, layout-transition travel, status-chip travel, backdrop pan/zoom, press glides — while fades, dims, and veils keep animating. `System` follows Windows' "Show animations" accessibility toggle live (other OSes have no probe and treat `System` as reduced).
+- **Developer mode (debug-only):** Diagnostics gains a non-persisted "Display layout bounding boxes" toggle (or F9) that outlines Start-screen and Settings-drawer containers (magenta) and fixed/clamped-width elements (cyan) for layout debugging. Off by default, never saved; compiled out of release builds.
 
 ### Changed
 
@@ -26,12 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fixed:** emulated controllers added via the Developer emulator no longer appear in the normal controller lists after a restart while vanishing from the Controllers tab. The tab's fleet is now rebuilt from remembered emulated serials at startup, restoring each pad's level and link — switched off, so a restart never fires a connect toast or opens Start unbidden.
 - **Developer mode:** emulated controllers get the same **remember** pin real controllers have. A pad's row offers "Forget this controller"; forgetting takes effect immediately — the pad leaves the remembered list and from disk, exactly as `toggle_remember` behaves for real hardware. A pad that is both unplugged and forgotten disappears from the tab, so the two are symmetric: forget an unplugged pad and it goes now, unplug a forgotten pad and it goes then. A merely unplugged pad stays listed so you can plug it back in.
 - Horizontal immersive Start centers every cover by its art (neighbors no longer ride above the selection) and fades neighbors to transparent instead of grey.
+- Horizontal immersive strip: neighbor covers now sag downward with distance (cover-flow arc mirroring the vertical strip), keeping clock clearance.
 
 ### Fixed
 
 - Horizontal immersive Start draws the selected game's title and subtitle inside its cover, like its neighbors, so they scroll with the card instead of crossfading in a separate full-width layer.
 - Shell no longer shows a stale remembered battery `%` after a full-charge + USB unplug (service/disk were already correct): the service now publishes one rev-gated retained snapshot (live + remembered + prefs + analytics + start selection) on change, newcomer attach, and request, and the shell renders popup, Start dock, and disconnected ETAs purely from it instead of boot-time disk copies. Shell mutations travel as intents; service owns all data files (atomic writes). IPC is versioned with a handshake — mismatched shells quit instead of limping.
 - Intermittent test failure (~1 run in 150) from a shared-global race: the art-worker's shutdown test wiped the process-wide icon cache while a concurrent icon-cache test was mid-assertion, so a successful decode reported as missing. The shutdown test now takes the same lock the other cache tests use.
+- Horizontal immersive Start no longer clips the selected game's Update badge (or long two-line title + meta stacks) at the strip edge: the in-slot text reserve grows 150 → 160 with breathing room reduced equally, so cover size and neighbor counts are unchanged. Outer-peek cards stay art-only by design (same-wrap titles would overlap).
 
 ## [1.6.1] - 2026-10-07
 

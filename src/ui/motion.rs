@@ -3,8 +3,22 @@
 //! Immersive Start established the feel (ease-in-out veils, ease-out reveals,
 //! a 32 ms per-frame cap so a UI stall cannot skip the start of a curve). Every
 //! animated surface should build on these instead of re-deriving them.
+//!
+//! ## Reduced motion
+//!
+//! Movement (travel, slide, zoom, reflow) is gated by the effective
+//! reduce-motion flag ([`reduced_motion_effective`]); opacity (fades, dims,
+//! veils) is never gated and keeps its own durations. Call sites snap
+//! movement — durations to 0 via [`movement_duration_ms`], offsets to 0 via
+//! [`movement_offset`], scales to 1 via [`movement_scale`] — while opacity
+//! clocks run unchanged. The OS probe ([`system_animations_enabled`]) reads
+//! Windows' "Show animations" toggle (`SPI_GETCLIENTAREAANIMATION`); every
+//! other OS has no equivalent probe and reports animations off (documented in
+//! `notes/ui-refresh.md`), so `System` means reduced motion there.
 
 use std::time::Duration;
+
+use crate::persist::prefs::ReducedMotion;
 
 /// Per-frame cap on animation time advance. A stalled frame (atlas upload,
 /// HWND resize) advances at most this much so curves never skip their start.
@@ -67,6 +81,67 @@ pub fn advance_capped(
     (new_elapsed, progress, capped)
 }
 
+/// Whether the OS chrome shows window animations.
+///
+/// Windows: the Settings → Accessibility → "Show animations" toggle, read via
+/// `SystemParametersInfo(SPI_GETCLIENTAREAANIMATION)`. A failed probe reports
+/// animations on (full motion) so a transient API error cannot freeze the UI.
+///
+/// Non-Windows: no equivalent probe exists; reports animations off, so the
+/// `System` preference means reduced motion there (see `notes/ui-refresh.md`).
+pub fn system_animations_enabled() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+        };
+        use windows::core::BOOL;
+        let mut enabled = BOOL(0);
+        let ok = unsafe {
+            SystemParametersInfoW(
+                SPI_GETCLIENTAREAANIMATION,
+                0,
+                Some(std::ptr::addr_of_mut!(enabled).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+        };
+        // A failed probe must not freeze the UI: fall back to full motion.
+        ok.is_ok() && enabled.as_bool()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Effective reduce-motion gate for a [`ReducedMotion`] preference.
+///
+/// `On` skips movement, `Off` always animates, `System` follows the OS toggle
+/// (inverted: OS animations off ⇒ reduce motion on).
+pub fn reduced_motion_effective(pref: ReducedMotion) -> bool {
+    match pref {
+        ReducedMotion::On => true,
+        ReducedMotion::Off => false,
+        ReducedMotion::System => !system_animations_enabled(),
+    }
+}
+
+/// Movement duration under the gate: 0 settles instantly. Opacity keeps its
+/// own clock — never route a fade/dim/veil duration through this.
+pub fn movement_duration_ms(normal_ms: u64, reduced: bool) -> u64 {
+    if reduced { 0 } else { normal_ms }
+}
+
+/// Movement travel under the gate: 0 removes the slide/pan with no reflow.
+pub fn movement_offset(px: f32, reduced: bool) -> f32 {
+    if reduced { 0.0 } else { px }
+}
+
+/// Movement zoom under the gate: 1 renders unscaled.
+pub fn movement_scale(scale: f32, reduced: bool) -> f32 {
+    if reduced { 1.0 } else { scale }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +181,26 @@ mod tests {
         assert_eq!(progress, 1.0);
         let (_, progress, _) = advance_capped(Duration::ZERO, MAX_FRAME_DT, Duration::ZERO);
         assert_eq!(progress, 1.0);
+    }
+
+    #[test]
+    fn reduced_motion_effective_follows_pref_and_probe() {
+        assert!(reduced_motion_effective(ReducedMotion::On));
+        assert!(!reduced_motion_effective(ReducedMotion::Off));
+        // System is the inverted OS probe (deterministic per machine, whatever it is).
+        assert_eq!(
+            reduced_motion_effective(ReducedMotion::System),
+            !system_animations_enabled()
+        );
+    }
+
+    #[test]
+    fn movement_helpers_snap_under_gate() {
+        assert_eq!(movement_duration_ms(220, false), 220);
+        assert_eq!(movement_duration_ms(220, true), 0);
+        assert!((movement_offset(72.0, false) - 72.0).abs() < f32::EPSILON);
+        assert!((movement_offset(72.0, true) - 0.0).abs() < f32::EPSILON);
+        assert!((movement_scale(0.88, false) - 0.88).abs() < f32::EPSILON);
+        assert!((movement_scale(0.88, true) - 1.0).abs() < f32::EPSILON);
     }
 }

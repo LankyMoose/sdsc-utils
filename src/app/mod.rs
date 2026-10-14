@@ -27,9 +27,9 @@ use crate::persist::analytics::{self, AnalyticsStore};
 use crate::persist::notify::NotifyEvent;
 use crate::persist::paths;
 use crate::persist::prefs::{
-    Prefs, StartAutoOpen, clamp_low_battery_percent, clamp_start_screen_haptics_strength,
-    clamp_start_screen_idle_timeouts, clamp_start_screen_inactive_dim_percent,
-    clamp_start_screen_sound_volume,
+    NavbarVisibility, Prefs, ReducedMotion, StartAutoOpen, clamp_low_battery_percent,
+    clamp_start_screen_haptics_strength, clamp_start_screen_idle_timeouts,
+    clamp_start_screen_inactive_dim_percent, clamp_start_screen_sound_volume,
 };
 use crate::platform::app_log;
 #[cfg(windows)]
@@ -194,6 +194,9 @@ pub enum Message {
     /// UI work can be screenshotted without clicking through the tray.
     #[cfg(debug_assertions)]
     DebugOpen(String),
+    /// Debug-only: flip the layout-bounding-box overlay (Diagnostics toggle or F9).
+    #[cfg(debug_assertions)]
+    ToggleDebugLayoutBounds,
 
     PlaceToast {
         id: window::Id,
@@ -268,6 +271,10 @@ pub struct App {
     /// Debug-only window stress test in flight (Diagnostics section).
     #[cfg(debug_assertions)]
     stress_running: bool,
+    /// Debug-only layout-bounds overlay (Diagnostics toggle / F9). Shell-local
+    /// UI state: never persisted, never sent over IPC.
+    #[cfg(debug_assertions)]
+    pub debug_layout_bounds: bool,
     configure_state: ConfigureState,
     /// Snapshot for the Analytics settings tab (refreshed with controller/analytics changes).
     analytics_panel: AnalyticsPanel,
@@ -569,6 +576,8 @@ impl App {
             configure_window: None,
             #[cfg(debug_assertions)]
             stress_running: false,
+            #[cfg(debug_assertions)]
+            debug_layout_bounds: false,
             configure_state,
             analytics_panel: AnalyticsPanel::default(),
             pad_input_panel: PadInputPanel::default(),
@@ -770,6 +779,10 @@ impl App {
             iced::event::listen_with(|event, _status, id| match event {
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
                 iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
+                    #[cfg(debug_assertions)]
+                    if key == keyboard::Key::Named(keyboard::key::Named::F9) {
+                        return Some(Message::ToggleDebugLayoutBounds);
+                    }
                     let action = match key {
                         keyboard::Key::Named(keyboard::key::Named::Escape) => {
                             Some(StartKeyAction::Cancel)
@@ -936,6 +949,8 @@ impl App {
                 &self.emulated_pads,
                 #[cfg(debug_assertions)]
                 &self.pending_emulator_changes(),
+                #[cfg(debug_assertions)]
+                self.debug_layout_bounds,
             )
             .map(Message::Configure);
         }
@@ -956,6 +971,8 @@ impl App {
                 stage_h,
                 stage_w,
                 &settings_snapshot,
+                #[cfg(debug_assertions)]
+                self.debug_layout_bounds,
             )
             .map(Message::Start);
             let start = match self.immersive_toast_overlay() {
@@ -984,8 +1001,23 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Effective reduce-motion gate (prefs choice vs OS "Show animations"
+        // toggle): synced on every update so pad/keyboard/mouse-initiated
+        // anims gate instantly, even with an idle Start (no StartFrame) or
+        // prefs freshly arrived via snapshot. Re-syncing while set is a
+        // no-op (chases are already settled); StartFrame re-syncs too so an
+        // OS-toggle flip lands mid-session.
+        self.start_state
+            .sync_reduced_motion(crate::ui::motion::reduced_motion_effective(
+                self.session.prefs.reduced_motion,
+            ));
         match message {
             Message::Tick => self.on_tick(),
+            #[cfg(debug_assertions)]
+            Message::ToggleDebugLayoutBounds => {
+                self.debug_layout_bounds = !self.debug_layout_bounds;
+                Task::none()
+            }
             #[cfg(debug_assertions)]
             Message::EmulatorCommitTick => self.on_emulator_commit_tick(),
             Message::PollResult(result) => self.on_poll_result(result),
@@ -1107,6 +1139,10 @@ impl App {
                         .chain(raise_window_topmost(id))
                         .chain(self.sync_toast_zorder());
                     if self.start_state.immersive {
+                        // Re-show the position rail on every immersive open.
+                        // Warm opens skip begin_cold_load; cold opens refresh
+                        // the hide clock to visible time. Pinned is a no-op.
+                        self.start_state.note_position_bar_scroll(now);
                         self.start_state.arm_cold_ambient(now);
                         // Cache miss: need metadata before art/list can land — scan now.
                         // Cache hit: Preparing chip first; Steam kicks when art-ready handoff runs.
@@ -1217,6 +1253,21 @@ impl App {
             Message::StartFrame => {
                 let now = Instant::now();
                 self.start_state.steam_scan_pending = self.steam_scan_pending;
+                // Prefs-owned pin for the immersive position rail (heals across
+                // snapshot syncs / restarts; the apply path syncs immediately).
+                self.start_state.sync_navbar_pinned(
+                    matches!(
+                        self.session.prefs.start_screen_navbar,
+                        NavbarVisibility::AlwaysOn
+                    ),
+                    now,
+                );
+                // Effective reduce-motion gate (also synced per-update): an OS
+                // "Show animations" flip lands on the next frame mid-session.
+                self.start_state
+                    .sync_reduced_motion(crate::ui::motion::reduced_motion_effective(
+                        self.session.prefs.reduced_motion,
+                    ));
                 let was_cold = self.start_state.cold_load_active;
                 let _ = self.start_state.tick_anim(now);
                 let task = if was_cold && !self.start_state.cold_load_active {
@@ -1818,7 +1869,7 @@ impl App {
                 prefs: self.session.prefs.clone(),
             });
         } else {
-            self.save_prefs();
+            self.session.prefs.save();
         }
     }
 
@@ -2132,6 +2183,8 @@ impl App {
             start_screen_always_immersive: self.session.prefs.start_screen_always_immersive,
             start_screen_immersive_layout: self.session.prefs.start_screen_immersive_layout,
             start_screen_clock_enabled: self.session.prefs.start_screen_clock_enabled,
+            start_screen_navbar: self.session.prefs.start_screen_navbar,
+            reduced_motion: self.session.prefs.reduced_motion,
             start_screen_inactive_secs: self.session.prefs.start_screen_inactive_secs,
             start_screen_sleep_secs: self.session.prefs.start_screen_sleep_secs,
             start_screen_inactive_dim_percent: self.session.prefs.start_screen_inactive_dim_percent,
@@ -2304,6 +2357,10 @@ impl App {
             ConfigureMessage::SetImmersiveLayout(layout) => {
                 self.apply_start_screen_immersive_layout(layout)
             }
+            ConfigureMessage::SetNavbarVisibility(navbar) => self.apply_start_screen_navbar(navbar),
+            ConfigureMessage::SetReducedMotion(mode) => {
+                self.apply_start_screen_reduced_motion(mode)
+            }
             ConfigureMessage::SetStartScreenInactiveSecs(secs) => {
                 self.apply_start_screen_inactive_secs(secs)
             }
@@ -2365,6 +2422,12 @@ impl App {
                 self.stress_running = true;
                 app_log::info("stress: window stress test started from Diagnostics");
                 Task::done(Message::StressWindows(0))
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugLayoutBounds(enabled) => {
+                // Shell-local overlay only: deliberately no save_prefs / disk I/O.
+                self.debug_layout_bounds = enabled;
+                Task::none()
             }
             ConfigureMessage::OpenExternalLink(url) => {
                 if let Err(err) = launch::launch_target(url, "") {
@@ -3691,6 +3754,8 @@ impl App {
             always_immersive: self.session.prefs.start_screen_always_immersive,
             clock_enabled: self.session.prefs.start_screen_clock_enabled,
             immersive_layout: self.session.prefs.start_screen_immersive_layout,
+            navbar: self.session.prefs.start_screen_navbar,
+            reduced_motion: self.session.prefs.reduced_motion,
             inactive_secs: self.session.prefs.start_screen_inactive_secs,
             sleep_secs: self.session.prefs.start_screen_sleep_secs,
             inactive_dim_percent: self.session.prefs.start_screen_inactive_dim_percent,
@@ -3731,6 +3796,38 @@ impl App {
         // through the first half of the transition.
         self.start_state
             .begin_layout_transition(from, layout, Instant::now());
+        Task::none()
+    }
+
+    fn apply_start_screen_navbar(&mut self, navbar: NavbarVisibility) -> Task<Message> {
+        // Picking from the menu collapses it, even when re-picking the
+        // current value.
+        self.start_state.settings.close_menus();
+        if self.session.prefs.start_screen_navbar == navbar {
+            return Task::none();
+        }
+        self.session.prefs.start_screen_navbar = navbar;
+        self.save_prefs();
+        // Pin (or release) the position rail immediately; while pinned the
+        // show path stays (1, 1) and the tick hide-timer is skipped.
+        self.start_state
+            .sync_navbar_pinned(matches!(navbar, NavbarVisibility::AlwaysOn), Instant::now());
+        Task::none()
+    }
+
+    fn apply_start_screen_reduced_motion(&mut self, mode: ReducedMotion) -> Task<Message> {
+        // Picking from the menu collapses it, even when re-picking the
+        // current value.
+        self.start_state.settings.close_menus();
+        if self.session.prefs.reduced_motion == mode {
+            return Task::none();
+        }
+        self.session.prefs.reduced_motion = mode;
+        self.save_prefs();
+        // Gate (or release) movement immediately; enabling also settles any
+        // in-flight chase to its target.
+        self.start_state
+            .sync_reduced_motion(crate::ui::motion::reduced_motion_effective(mode));
         Task::none()
     }
 
@@ -3872,6 +3969,14 @@ impl App {
         self.refresh_start_controllers();
 
         self.prepare_start_nav_on_open(false);
+        // Pin state for the first paint (before the first StartFrame tick).
+        self.start_state.sync_navbar_pinned(
+            matches!(
+                self.session.prefs.start_screen_navbar,
+                NavbarVisibility::AlwaysOn
+            ),
+            Instant::now(),
+        );
         // Shell restart: resolve the service-stored keys (reported before the
         // restart) back to indices now that rows/controllers are rebuilt.
         // NOTE: no scroll_to here — the fresh window's scrollables do not exist
@@ -3963,7 +4068,7 @@ impl App {
         if self.start_cold_load_remaining {
             // Compact uses skeletons + deferred Steam — no cold-load ceremony.
             if immersive {
-                self.start_state.begin_cold_load();
+                self.start_state.begin_cold_load(Instant::now());
             }
         }
         let (id, open) = window::open(window::Settings {
@@ -4146,6 +4251,9 @@ impl App {
                 .begin_transition_phase(start_mode::TransitionPhase::EnterImmersive, now);
             self.start_state.prime_backdrop_for_enter(now);
             self.start_state.arm_enter_reveal(now);
+            // Promote settle re-shows the position rail (the transition-phase
+            // begin above cleared it). Pinned is a no-op show.
+            self.start_state.note_position_bar_scroll(now);
             if !self.start_state.try_arm_enter_reveal_when_art_ready(now) {
                 crate::controller::hid::diag::diag_info(format!(
                     "ui-diag: start immersive enter art hold (promote) steam_scan={} list_hidden=1",
@@ -4780,6 +4888,11 @@ impl App {
             StartMessage::ToggleLayoutMenu => self.toggle_start_selector_menu(
                 crate::ui::start::settings::SettingsRow::ImmersiveLayout,
             ),
+            StartMessage::ToggleNavbarMenu => {
+                self.toggle_start_selector_menu(crate::ui::start::settings::SettingsRow::Navbar)
+            }
+            StartMessage::ToggleReducedMotionMenu => self
+                .toggle_start_selector_menu(crate::ui::start::settings::SettingsRow::ReducedMotion),
             StartMessage::SetAlwaysImmersive(enabled) => {
                 self.apply_start_screen_always_immersive(enabled)
             }
@@ -4787,6 +4900,8 @@ impl App {
             StartMessage::SetImmersiveLayout(layout) => {
                 self.apply_start_screen_immersive_layout(layout)
             }
+            StartMessage::SetNavbarVisibility(navbar) => self.apply_start_screen_navbar(navbar),
+            StartMessage::SetReducedMotion(mode) => self.apply_start_screen_reduced_motion(mode),
             StartMessage::SetInactiveSecs(secs) => self.apply_start_screen_inactive_secs(secs),
             StartMessage::SetSleepSecs(secs) => self.apply_start_screen_sleep_secs(secs),
             StartMessage::SetInactiveDimPercent(percent) => {
@@ -5355,6 +5470,19 @@ impl App {
         self.session.prefs = snap.prefs.clone();
         color::set_active_spectrum(self.session.prefs.spectrum.clone());
         lightbar::set_enabled(self.session.prefs.lightbar_enabled);
+        // Service-owned prefs may flip the navbar pin while Start is open.
+        self.start_state.sync_navbar_pinned(
+            matches!(
+                self.session.prefs.start_screen_navbar,
+                NavbarVisibility::AlwaysOn
+            ),
+            Instant::now(),
+        );
+        // ...or the effective reduce-motion gate (prefs and/or OS toggle).
+        self.start_state
+            .sync_reduced_motion(crate::ui::motion::reduced_motion_effective(
+                self.session.prefs.reduced_motion,
+            ));
         self.session
             .analytics
             .apply_snapshot(snap.analytics.clone());

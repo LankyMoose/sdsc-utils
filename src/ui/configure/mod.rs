@@ -20,7 +20,8 @@ use crate::persist::analytics::{
 };
 use crate::persist::prefs::{
     AUTO_OPEN_MODES, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout, LOW_BATTERY_PERCENT_MAX,
-    LOW_BATTERY_PERCENT_MIN, StartAutoOpen, ToastPosition,
+    LOW_BATTERY_PERCENT_MIN, NAVBAR_MODES, NavbarVisibility, REDUCED_MOTION_MODES, ReducedMotion,
+    StartAutoOpen, ToastPosition,
 };
 use crate::platform::app_meta::{DISPLAY_NAME, PKG_VERSION};
 use crate::ui::color::{BatterySpectrum, hsv_to_rgb};
@@ -202,6 +203,8 @@ pub struct ConfigureSettings {
     pub start_screen_always_immersive: bool,
     pub start_screen_immersive_layout: ImmersiveLayout,
     pub start_screen_clock_enabled: bool,
+    pub start_screen_navbar: NavbarVisibility,
+    pub reduced_motion: ReducedMotion,
     pub start_screen_inactive_secs: u32,
     pub start_screen_sleep_secs: u32,
     pub start_screen_inactive_dim_percent: u8,
@@ -292,6 +295,8 @@ pub enum ConfigureMessage {
     SetStartScreenAlwaysImmersive(bool),
     SetImmersiveLayout(ImmersiveLayout),
     SetStartScreenClock(bool),
+    SetNavbarVisibility(NavbarVisibility),
+    SetReducedMotion(ReducedMotion),
     SetStartScreenInactiveSecs(u32),
     SetStartScreenSleepSecs(u32),
     SetStartScreenInactiveDimPercent(u8),
@@ -327,6 +332,10 @@ pub enum ConfigureMessage {
     /// Debug-only: start the renderer window stress test (Diagnostics section).
     #[cfg(debug_assertions)]
     RunWindowStress,
+    /// Debug-only: outline Start/drawer containers + fixed-width elements.
+    /// Shell-local only (never persisted); see Diagnostics.
+    #[cfg(debug_assertions)]
+    SetDebugLayoutBounds(bool),
     /// Begin an OS window drag (title-bar press on the undecorated window).
     DragWindow,
     Close,
@@ -541,6 +550,7 @@ pub fn view<'a>(
     pad_input: &'a PadInputPanel,
     #[cfg(debug_assertions)] emulators: &'a [EmulatedPad],
     #[cfg(debug_assertions)] pending: &[PendingEmulatorChange],
+    #[cfg(debug_assertions)] debug_layout_bounds: bool,
 ) -> Element<'a, ConfigureMessage> {
     // Section heading doubles as the drag handle for the undecorated window.
     let heading = mouse_area(
@@ -632,7 +642,13 @@ pub fn view<'a>(
             #[cfg(debug_assertions)]
             {
                 scroll(section_content(
-                    state, settings, analytics, pad_input, emulators, pending,
+                    state,
+                    settings,
+                    analytics,
+                    pad_input,
+                    emulators,
+                    pending,
+                    debug_layout_bounds,
                 ))
                 .into()
             }
@@ -927,6 +943,7 @@ fn section_content<'a>(
     pad_input: &'a PadInputPanel,
     #[cfg(debug_assertions)] emulators: &'a [EmulatedPad],
     #[cfg(debug_assertions)] pending: &[PendingEmulatorChange],
+    #[cfg(debug_assertions)] debug_layout_bounds: bool,
 ) -> Element<'a, ConfigureMessage> {
     match state.section {
         Section::System => system_settings_view(settings),
@@ -938,13 +955,13 @@ fn section_content<'a>(
         #[cfg(debug_assertions)]
         Section::Emulators => emulators_view(state, emulators, pending),
         #[cfg(debug_assertions)]
-        Section::Diagnostics => diagnostics_view(),
+        Section::Diagnostics => diagnostics_view(debug_layout_bounds),
     }
 }
 
 #[cfg(debug_assertions)]
-fn diagnostics_view<'a>() -> Element<'a, ConfigureMessage> {
-    group(
+fn diagnostics_view<'a>(debug_layout_bounds: bool) -> Element<'a, ConfigureMessage> {
+    let stress = group(
         Some("Renderer stress test".to_string()),
         vec![
             note(
@@ -956,7 +973,22 @@ fn diagnostics_view<'a>() -> Element<'a, ConfigureMessage> {
                 .style(theme::primary)
                 .into(),
         ],
-    )
+    );
+    let bounds = group(
+        Some("Layout bounding boxes".to_string()),
+        vec![
+            toggle_row(
+                "Display layout bounding boxes",
+                Some("Outlines Start + drawer containers and fixed widths (F9)"),
+                debug_layout_bounds,
+                ConfigureMessage::SetDebugLayoutBounds,
+            ),
+            note(
+                "Debug-only overlay, off at boot and never saved: magenta outlines containers, cyan outlines fixed / clamped-width elements.",
+            ),
+        ],
+    );
+    column![stress, bounds].spacing(18).width(Fill).into()
 }
 
 fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
@@ -1062,6 +1094,18 @@ impl std::fmt::Display for ImmersiveLayout {
     }
 }
 
+impl std::fmt::Display for NavbarVisibility {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl std::fmt::Display for ReducedMotion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
     let mut groups = Column::new().spacing(18).width(Fill);
 
@@ -1131,6 +1175,56 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
                     IMMERSIVE_LAYOUT_MODES,
                     Some(settings.start_screen_immersive_layout),
                     ConfigureMessage::SetImmersiveLayout,
+                )
+                .text_size(13.0)
+                .padding([7, 10])
+                .width(Length::Fixed(200.0))
+                .style(theme::pick_list)
+                .menu_style(theme::pick_list_menu),
+            ]
+            .spacing(16)
+            .align_y(Alignment::Center)
+            .into(),
+            row![
+                column![
+                    text("Position rail")
+                        .size(theme::type_scale::BODY)
+                        .color(theme::INK),
+                    text("Section indicator visibility")
+                        .size(12.0)
+                        .color(theme::DIM),
+                ]
+                .spacing(2)
+                .width(Fill),
+                pick_list(
+                    NAVBAR_MODES,
+                    Some(settings.start_screen_navbar),
+                    ConfigureMessage::SetNavbarVisibility,
+                )
+                .text_size(13.0)
+                .padding([7, 10])
+                .width(Length::Fixed(200.0))
+                .style(theme::pick_list)
+                .menu_style(theme::pick_list_menu),
+            ]
+            .spacing(16)
+            .align_y(Alignment::Center)
+            .into(),
+            row![
+                column![
+                    text("Reduced motion")
+                        .size(theme::type_scale::BODY)
+                        .color(theme::INK),
+                    text("Skip movement animations")
+                        .size(12.0)
+                        .color(theme::DIM),
+                ]
+                .spacing(2)
+                .width(Fill),
+                pick_list(
+                    REDUCED_MOTION_MODES,
+                    Some(settings.reduced_motion),
+                    ConfigureMessage::SetReducedMotion,
                 )
                 .text_size(13.0)
                 .padding([7, 10])
@@ -2128,6 +2222,15 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
+    fn diagnostics_view_builds_with_bounds_on_and_off() {
+        // The layout-bounds toggle must compose in both states without
+        // panicking; the flag itself stays shell-local (never persisted).
+        drop(super::diagnostics_view(false));
+        drop(super::diagnostics_view(true));
+    }
+
+    #[test]
     fn suggested_percent_lands_in_the_widest_gap() {
         let spectrum = BatterySpectrum::default_spectrum();
         let percent = suggested_stop_percent(&spectrum);
@@ -2168,6 +2271,8 @@ mod tests {
             start_screen_always_immersive: false,
             start_screen_immersive_layout: ImmersiveLayout::Vertical,
             start_screen_clock_enabled: true,
+            start_screen_navbar: NavbarVisibility::WhenNavigating,
+            reduced_motion: ReducedMotion::System,
             start_screen_inactive_secs: 60,
             start_screen_sleep_secs: 300,
             start_screen_inactive_dim_percent: 50,

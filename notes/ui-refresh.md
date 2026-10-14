@@ -24,6 +24,12 @@ Goal: bring the tray popup, Settings (configure), toasts, and compact Start up t
 - Motion: ease-in-out veils, `WidthReveal`, staggered slide-in/out chips, crossfades; 32 ms frame-dt cap.
 - Hints: PS face glyphs in floating capsules.
 
+## Reduced motion
+
+Start settings → Immersive → **Reduced motion** (`System` default / `On` / `Off`, persisted as `reduced_motion` in `prefs.json`, `snake_case`). Policy: **movement vs opacity**. When the effective gate is on, all *movement* snaps — travel/slide offsets to 0 (`motion::movement_offset`), zoom scales to 1 (`motion::movement_scale`), chase durations to 0 — while *opacity* (fades, dims, veils, position-bar `OPACITY_MS`, popup stagger fades) keeps its clocks. Gated today: compact carousel (`request_slide` snap), immersive strip chase (`STRIP_ANIM_MS`, incl. the position-rail section chase), controllers dock travel + stage scale (`dock_stage_scale` → 1; `dock_stage_dim` veil stays), settings drawer (`DRAWER_ANIM_MS`; compact modal already instant), position-bar show/hide slide (`FADE_MS`; `OPACITY_MS` kept), layout-transition travel (fade kept, nav unblocks), chrome-status stack reflow + `ExitRight` travel (`CHROME_STATUS_EXIT_TRAVEL_PX`; exit fade kept), backdrop ken-burns pose (frozen at Cover/centered; selection crossfade kept), face-glyph press glide (snapped, end states identical). Untouched by design: enter/exit veils, cold black, idle/sleep dims, art crossfades, spinners, toast slide-in (functional: carries the card into view).
+
+Per-OS probe (`motion::system_animations_enabled`): Windows reads the real toggle — Settings → Accessibility → "Show animations" via `SystemParametersInfo(SPI_GETCLIENTAREAANIMATION)`; a failed probe falls back to full motion so an API error can never freeze the UI. macOS/Linux have no equivalent probe and report animations **off**, so `System` means reduced motion there. `Off` always animates; `On` always reduces. State carries the resolved bool (`State::reduced_motion`, synced per-update + per StartFrame + on snapshot/apply via `sync_reduced_motion`, which also settles in-flight chases when enabling).
+
 ## Legacy gaps (pre-refresh)
 
 `RADIUS` 2 / `RADIUS_SM` 1 (0 on chips, toasts, tabs); 1px `framed` LINE outline + header rules + list separators; flat `BASE_BG`/`CONTENT`; accent-blue selection (tabs/chips @ 28%); stock checkbox/slider/pick_list/scrollbar; 12–14px type; no motion outside the toast slide; Settings 420×400 with a 120px sidebar; Start-screen prefs duplicated between `configure/mod.rs` and `start/settings.rs`.

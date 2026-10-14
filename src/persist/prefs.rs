@@ -138,6 +138,68 @@ impl ImmersiveLayout {
 pub const IMMERSIVE_LAYOUT_MODES: [ImmersiveLayout; 2] =
     [ImmersiveLayout::Vertical, ImmersiveLayout::Horizontal];
 
+/// Immersive position-rail visibility.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavbarVisibility {
+    /// Auto-hide after 2s idle (default).
+    #[default]
+    WhenNavigating,
+    /// Rail stays pinned visible; the hide timer is skipped.
+    AlwaysOn,
+}
+
+impl NavbarVisibility {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::WhenNavigating => Self::AlwaysOn,
+            Self::AlwaysOn => Self::WhenNavigating,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WhenNavigating => "When navigating",
+            Self::AlwaysOn => "Always on",
+        }
+    }
+}
+
+pub const NAVBAR_MODES: [NavbarVisibility; 2] =
+    [NavbarVisibility::WhenNavigating, NavbarVisibility::AlwaysOn];
+
+/// Start-screen reduce-motion preference.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReducedMotion {
+    /// Follow the OS "Show animations" toggle (default).
+    #[default]
+    System,
+    /// Always skip movement animations (keep opacity fades).
+    On,
+    /// Always animate, ignoring the OS toggle.
+    Off,
+}
+
+impl ReducedMotion {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::System => Self::On,
+            Self::On => Self::Off,
+            Self::Off => Self::System,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::On => "On",
+            Self::Off => "Off",
+        }
+    }
+}
+
+pub const REDUCED_MOTION_MODES: [ReducedMotion; 3] =
+    [ReducedMotion::System, ReducedMotion::On, ReducedMotion::Off];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Prefs {
     #[serde(default = "default_true")]
@@ -209,6 +271,12 @@ pub struct Prefs {
     pub show_all_controllers: bool,
     #[serde(default)]
     pub start_screen_immersive_layout: ImmersiveLayout,
+    /// Immersive position-rail visibility (default hides after 2s idle).
+    #[serde(default)]
+    pub start_screen_navbar: NavbarVisibility,
+    /// Start-screen movement animations (default follows the OS toggle).
+    #[serde(default)]
+    pub reduced_motion: ReducedMotion,
     #[serde(default)]
     pub extra_steam_paths: Vec<std::path::PathBuf>,
 }
@@ -359,6 +427,8 @@ impl Default for Prefs {
             games_sort_mode: GamesSortMode::default(),
             show_all_controllers: false,
             start_screen_immersive_layout: ImmersiveLayout::default(),
+            start_screen_navbar: NavbarVisibility::default(),
+            reduced_motion: ReducedMotion::default(),
             extra_steam_paths: Vec::new(),
         }
     }
@@ -814,5 +884,86 @@ mod tests {
             ImmersiveLayout::Vertical
         );
         assert!(Prefs::default().extra_steam_paths.is_empty());
+    }
+
+    #[test]
+    fn navbar_visibility_round_trips() {
+        let prefs = Prefs {
+            start_screen_navbar: NavbarVisibility::AlwaysOn,
+            ..Prefs::default()
+        };
+        let encoded = serde_json::to_string(&prefs).unwrap();
+        let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.start_screen_navbar, NavbarVisibility::AlwaysOn);
+    }
+
+    #[test]
+    fn older_prefs_default_to_when_navigating_navbar() {
+        let prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(prefs.start_screen_navbar, NavbarVisibility::WhenNavigating);
+        assert_eq!(
+            Prefs::default().start_screen_navbar,
+            NavbarVisibility::WhenNavigating
+        );
+        assert_eq!(
+            NavbarVisibility::WhenNavigating.cycle(),
+            NavbarVisibility::AlwaysOn
+        );
+        assert_eq!(
+            NavbarVisibility::AlwaysOn.cycle(),
+            NavbarVisibility::WhenNavigating
+        );
+        assert_eq!(NavbarVisibility::WhenNavigating.label(), "When navigating");
+        assert_eq!(NavbarVisibility::AlwaysOn.label(), "Always on");
+        assert_eq!(
+            serde_json::to_string(&NavbarVisibility::WhenNavigating).unwrap(),
+            r#""when_navigating""#
+        );
+        assert_eq!(
+            serde_json::to_string(&NavbarVisibility::AlwaysOn).unwrap(),
+            r#""always_on""#
+        );
+    }
+
+    #[test]
+    fn reduced_motion_round_trips() {
+        let prefs = Prefs {
+            reduced_motion: ReducedMotion::On,
+            ..Prefs::default()
+        };
+        let encoded = serde_json::to_string(&prefs).unwrap();
+        let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.reduced_motion, ReducedMotion::On);
+    }
+
+    #[test]
+    fn older_prefs_default_to_system_reduced_motion() {
+        let prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(prefs.reduced_motion, ReducedMotion::System);
+        assert_eq!(Prefs::default().reduced_motion, ReducedMotion::System);
+        assert_eq!(ReducedMotion::System.cycle(), ReducedMotion::On);
+        assert_eq!(ReducedMotion::On.cycle(), ReducedMotion::Off);
+        assert_eq!(ReducedMotion::Off.cycle(), ReducedMotion::System);
+        assert_eq!(ReducedMotion::System.label(), "System");
+        assert_eq!(ReducedMotion::On.label(), "On");
+        assert_eq!(ReducedMotion::Off.label(), "Off");
+        assert_eq!(
+            serde_json::to_string(&ReducedMotion::System).unwrap(),
+            r#""system""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ReducedMotion::On).unwrap(),
+            r#""on""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ReducedMotion::Off).unwrap(),
+            r#""off""#
+        );
+        // Every committed value round-trips through the modes table.
+        for mode in REDUCED_MOTION_MODES {
+            let encoded = serde_json::to_string(&mode).unwrap();
+            let decoded: ReducedMotion = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, mode);
+        }
     }
 }

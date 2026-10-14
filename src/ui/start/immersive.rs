@@ -96,6 +96,7 @@ pub fn view<'a>(
     stage_w: f32,
     settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
     immersive_layout: ImmersiveLayout,
+    #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
     let dock_p = state.dock_progress(now);
     let veil = transition_top_veil(state, now);
@@ -121,8 +122,12 @@ pub fn view<'a>(
             stage_h,
             stage_w,
             immersive_layout,
+            #[cfg(debug_assertions)]
+            debug_bounds,
         )
     };
+    #[cfg(debug_assertions)]
+    let body = crate::ui::debug_bounds::wrap(body, debug_bounds);
 
     let footer_capsule = container(footer_hint(
         state,
@@ -140,7 +145,7 @@ pub fn view<'a>(
     .style(theme::immersive_footer_capsule);
 
     // Full-bleed stage + dock; footer hints overlay the bottom.
-    let footer_overlay = column![
+    let footer_overlay: Element<'_, StartMessage> = column![
         space().height(Fill),
         container(footer_capsule)
             .width(Fill)
@@ -153,9 +158,13 @@ pub fn view<'a>(
             }),
     ]
     .width(Fill)
-    .height(Fill);
+    .height(Fill)
+    .into();
+    #[cfg(debug_assertions)]
+    let footer_overlay: Element<'_, StartMessage> =
+        crate::ui::debug_bounds::wrap(footer_overlay, debug_bounds);
 
-    let mut chrome_layers: Vec<Element<'_, StartMessage>> = vec![body, footer_overlay.into()];
+    let mut chrome_layers: Vec<Element<'_, StartMessage>> = vec![body, footer_overlay];
     if clock_enabled {
         // Center-top clock widget (system locale time). Digits carry no descenders,
         // so the font line box holds empty descender space below the baseline and
@@ -173,7 +182,7 @@ pub fn view<'a>(
             left: 16.0,
         })
         .style(theme::immersive_footer_capsule);
-        let clock_overlay = column![
+        let clock_overlay: Element<'_, StartMessage> = column![
             container(clock_capsule)
                 .width(Fill)
                 .center_x(Fill)
@@ -186,8 +195,12 @@ pub fn view<'a>(
             space().height(Fill),
         ]
         .width(Fill)
-        .height(Fill);
-        chrome_layers.push(clock_overlay.into());
+        .height(Fill)
+        .into();
+        #[cfg(debug_assertions)]
+        let clock_overlay: Element<'_, StartMessage> =
+            crate::ui::debug_bounds::wrap(clock_overlay, debug_bounds);
+        chrome_layers.push(clock_overlay);
     }
     let chrome_status = state.chrome_load_status(now);
     if !chrome_status.is_empty() {
@@ -216,6 +229,8 @@ pub fn view<'a>(
         .width(Fill)
         .height(Fill)
         .into();
+        #[cfg(debug_assertions)]
+        let scan_overlay = crate::ui::debug_bounds::wrap(scan_overlay, debug_bounds);
         chrome_layers.push(scan_overlay);
     }
 
@@ -229,6 +244,8 @@ pub fn view<'a>(
             state,
             settings_snapshot,
             settings_p,
+            #[cfg(debug_assertions)]
+            debug_bounds,
         ));
     }
     // Idle/sleep wash sits above settings; ceremony veil stays on top.
@@ -329,8 +346,9 @@ fn stage_with_dock<'a>(
     stage_h: f32,
     stage_w: f32,
     immersive_layout: ImmersiveLayout,
+    #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
-    let scale = dock_stage_scale(dock_p);
+    let scale = crate::ui::motion::movement_scale(dock_stage_scale(dock_p), state.reduced_motion);
     let dim = dock_stage_dim(dock_p);
 
     // Backdrop lives in the games stage (scales with dock), not the full window.
@@ -348,6 +366,8 @@ fn stage_with_dock<'a>(
     if list_op > 0.01 {
         let strip: Element<'_, StartMessage> =
             games_stage(state, now, stage_h, stage_w, list_op, transition_layout);
+        #[cfg(debug_assertions)]
+        let strip = crate::ui::debug_bounds::wrap(strip, debug_bounds);
         // Float paints above veils — skip the slide while flattening (same as
         // the dock scale); sub-pixel offsets skip the extra layer. No scale
         // punch: the directional travel carries the motion.
@@ -401,8 +421,10 @@ fn stage_with_dock<'a>(
     }
 
     let dock = controllers_dock_host(state, spectrum, dock_p);
+    #[cfg(debug_assertions)]
+    let dock: Element<'_, StartMessage> = crate::ui::debug_bounds::wrap_fixed(dock, debug_bounds);
     // Top-right floating capsule — same inset as footer (EDGE_PAD / 10).
-    let dock_overlay = row![
+    let dock_overlay: Element<'_, StartMessage> = row![
         space().width(Fill),
         column![dock, space().height(Fill),]
             .height(Fill)
@@ -414,8 +436,12 @@ fn stage_with_dock<'a>(
             }),
     ]
     .width(Fill)
-    .height(Fill);
-    layers.push(dock_overlay.into());
+    .height(Fill)
+    .into();
+    #[cfg(debug_assertions)]
+    let dock_overlay: Element<'_, StartMessage> =
+        crate::ui::debug_bounds::wrap(dock_overlay, debug_bounds);
+    layers.push(dock_overlay);
 
     stack(layers).width(Fill).height(Fill).into()
 }
@@ -882,11 +908,12 @@ fn strip_slot_stacked<'a>(
             .center_x(Length::Fixed(max_art_w))
             .into()
     } else {
-        // Art only: selected text lives in the full-width layer, outer peeks
-        // stay quiet. Zero-height (no inter-block spacing) so the art bottom
-        // meets the strip bottom and the title layer below sits one text gap
-        // away — matching neighbor in-slot titles. Geometry matches
-        // `slot_child_size_h` at `|d| = 0` (art only, zero text weight).
+        // Art only: outer peeks stay quiet so small titles can never overlap
+        // (same-wrap neighbor titles are wider than the 1→2 stride — see
+        // `outer_peek_titles_would_overlap`). Zero-height (no inter-block
+        // spacing); the slot box still carries the shared text budget (see
+        // `slot_child_size_h`), so the art stays on the shared centerline
+        // and the box bottom still meets the strip bottom.
         container(space())
             .width(Length::Fixed(max_art_w))
             .height(Length::Shrink)

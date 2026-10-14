@@ -4,7 +4,9 @@ use crate::controller::dualsense::lightbar;
 use crate::controller::model::PowerState;
 use crate::games::GameEntry;
 use crate::games::steam::SteamGame;
-use crate::persist::prefs::{GamesSortMode, ImmersiveLayout, StartAutoOpen};
+use crate::persist::prefs::{
+    GamesSortMode, ImmersiveLayout, NavbarVisibility, ReducedMotion, StartAutoOpen,
+};
 use crate::ui::color::BatterySpectrum;
 use crate::ui::layout as window_layout;
 use crate::ui::percent_ring::{self, POPUP_SIZE};
@@ -119,9 +121,13 @@ pub enum StartMessage {
     SetAutoOpen(StartAutoOpen),
     ToggleAutoOpenMenu,
     ToggleLayoutMenu,
+    ToggleNavbarMenu,
+    ToggleReducedMotionMenu,
     SetAlwaysImmersive(bool),
     SetClock(bool),
     SetImmersiveLayout(ImmersiveLayout),
+    SetNavbarVisibility(NavbarVisibility),
+    SetReducedMotion(ReducedMotion),
     SetInactiveSecs(u32),
     SetSleepSecs(u32),
     SetInactiveDimPercent(u8),
@@ -838,6 +844,14 @@ pub struct State {
     position_bar_last_scroll: Option<Instant>,
     /// Slide in from the left / out to the left. None = settled.
     position_bar_slide: Option<PositionSlideAnim>,
+    /// NavbarVisibility::AlwaysOn pins the rail at (1, 1) (hide timer skipped).
+    /// Synced from prefs by the shell (see `sync_navbar_pinned`).
+    pub navbar_pinned: bool,
+    /// Effective reduce-motion gate (prefs choice resolved against the OS
+    /// "Show animations" toggle; see `crate::ui::motion`). Synced from prefs
+    /// by the shell (see `sync_reduced_motion`). While set, movement snaps
+    /// (durations to 0, offsets to 0, scales to 1) and only opacity animates.
+    pub reduced_motion: bool,
     /// Seconds for ambient shader time uniform.
     pub ambient_time: f32,
     /// Incoming backdrop land/crossfade (`started = None` = waiting for peek art).
@@ -1045,6 +1059,8 @@ impl Default for State {
             position_section_at: 0.0,
             position_bar_last_scroll: None,
             position_bar_slide: None,
+            navbar_pinned: false,
+            reduced_motion: false,
             ambient_time: 0.0,
             backdrop_current: None,
             backdrop_outgoing: None,
@@ -1060,6 +1076,20 @@ impl Default for State {
 
 impl State {
     pub fn set_rows(&mut self, rows: Vec<StartRow>) {
+        // Background rebuilds (Steam-scan reorder, sort change) can permute
+        // the catalog without moving the selection: re-show the position rail
+        // so the new order is oriented. Any play-key sequence change counts
+        // (reorder or membership); disabled-only refreshes keep keys and stay
+        // quiet. Immersive only — the open-path refresh runs while immersive
+        // is still false, so this never fires before `reset_to_games`. Pinned
+        // (`AlwaysOn`) is a no-op show; reduced motion snaps the slide
+        // downstream (the trigger only starts the chase).
+        let order_changed = self.rows.len() != rows.len()
+            || self
+                .rows
+                .iter()
+                .zip(rows.iter())
+                .any(|(a, b)| a.play_key != b.play_key);
         self.rows = rows;
         if self.rows.is_empty() {
             self.game_selected = 0;
@@ -1086,6 +1116,9 @@ impl State {
             }
         }
         self.snap_position_section();
+        if order_changed && self.immersive {
+            self.note_position_bar_scroll(Instant::now());
+        }
     }
 
     pub fn set_controllers(&mut self, controllers: Vec<StartControllerRow>) {
@@ -1451,8 +1484,9 @@ impl State {
     }
 
     /// Toggle Options settings. Compact opens instantly; immersive slides the drawer.
+    /// Reduced motion opens the drawer instantly too (no drawer travel).
     pub fn request_settings(&mut self, open: bool, now: Instant) -> bool {
-        let animate = self.immersive;
+        let animate = self.immersive && !self.reduced_motion;
         if self.settings.request(open, now, animate) {
             if open {
                 self.replace_confirm = None;
@@ -1553,6 +1587,27 @@ impl State {
         if self.dock_anim.is_none() && self.dock_expanded == expanded {
             return false;
         }
+        // Reduced motion: snap the dock (no travel); the stage scale gate
+        // below keeps the games stage at 1x while open.
+        if self.reduced_motion {
+            let snapped = self.dock_anim.is_some();
+            let changed = self.dock_expanded != expanded;
+            self.dock_expanded = expanded;
+            self.slide = if expanded {
+                StartSlide::Controllers
+            } else {
+                StartSlide::Games
+            };
+            if expanded {
+                self.editing = false;
+                self.edit_anchor_play_key = None;
+            }
+            self.replace_confirm = None;
+            self.manual_add = None;
+            self.cross_progress = 0.0;
+            self.dock_anim = None;
+            return changed || snapped;
+        }
         let from = self.dock_progress(now);
         self.dock_expanded = expanded;
         self.slide = if expanded {
@@ -1608,6 +1663,12 @@ impl State {
             self.sync_position_section(now, crate::ui::start::vstrip::STRIP_ANIM_MS);
             return;
         }
+        // Reduced motion: snap the strip (and the position rail) to the selection.
+        if self.reduced_motion {
+            self.strip_anim = None;
+            self.sync_position_section(now, 0);
+            return;
+        }
         let catching_up = self.strip_anim.is_some();
         // Mid-flight: chase from the live eased scroll. Settled: use caller's prior index.
         let from = if catching_up {
@@ -1639,6 +1700,8 @@ impl State {
     /// Begin the orientation transition after an actual layout change. No-op when
     /// `from == to` so settings opens / redraws never animate. Replaces any
     /// in-flight transition (layout switches are rare; latest target wins).
+    /// Reduced motion skips the transition: the new orientation renders
+    /// immediately with no slide or fade.
     pub fn begin_layout_transition(
         &mut self,
         from: ImmersiveLayout,
@@ -1646,6 +1709,10 @@ impl State {
         now: Instant,
     ) {
         if from == to {
+            return;
+        }
+        if self.reduced_motion {
+            self.layout_transition = None;
             return;
         }
         self.layout_transition = Some(LayoutTransitionAnim {
@@ -1670,6 +1737,11 @@ impl State {
         let Some(anim) = &self.layout_transition else {
             return (current, 1.0, 0.0, 0.0);
         };
+        // Reduced motion (e.g. enabled mid-transition): no travel, only the
+        // crossfade opacity.
+        if self.reduced_motion {
+            return (current, layout_transition_opacity(1.0), 0.0, 0.0);
+        }
         let elapsed_ms = now.saturating_duration_since(anim.started).as_millis() as u64;
         let eased = layout_transition_eased(elapsed_ms);
         let layout = if eased < 0.5 { anim.from } else { anim.to };
@@ -1712,7 +1784,13 @@ impl State {
     }
 
     /// In-flight show/hide clock. The canvas samples this at draw time.
+    /// `None` while pinned: the rail draws settled at (1, 1), never mid-hide.
+    /// `None` under reduced motion too: the bar snaps to its settled slide
+    /// while opacity still eases (see `position_bar_show`).
     pub(crate) fn position_bar_motion(&self) -> Option<crate::ui::start::position::ShowHide> {
+        if self.navbar_pinned || self.reduced_motion {
+            return None;
+        }
         self.position_bar_slide
             .as_ref()
             .map(|anim| crate::ui::start::position::ShowHide {
@@ -1724,10 +1802,22 @@ impl State {
     }
 
     fn position_bar_show(&self, now: Instant) -> (f32, f32) {
+        use crate::ui::motion::movement_duration_ms;
         use crate::ui::start::position::{FADE_MS, OPACITY_MS, show_hide_amount};
+        // AlwaysOn: the rail stays (1, 1); the hide timer is skipped in `tick_anim`.
+        if self.navbar_pinned {
+            return (1.0, 1.0);
+        }
         if let Some(anim) = &self.position_bar_slide {
             let elapsed = now.saturating_duration_since(anim.started).as_secs_f32() * 1000.0;
-            let slide = show_hide_amount(anim.from, anim.to, elapsed, FADE_MS);
+            // Reduced motion snaps the slide (duration 0) while opacity keeps
+            // its shorter OPACITY_MS clock.
+            let slide = show_hide_amount(
+                anim.from,
+                anim.to,
+                elapsed,
+                movement_duration_ms(FADE_MS, self.reduced_motion),
+            );
             let opacity = show_hide_amount(anim.opacity_from, anim.to, elapsed, OPACITY_MS);
             return (slide, opacity);
         }
@@ -1776,9 +1866,56 @@ impl State {
         });
     }
 
+    /// Sync the AlwaysOn pin from prefs. Enabling snaps any in-flight hide
+    /// back to visible and stamps the scroll clock so the rail draws (1, 1)
+    /// even before the next scroll; disabling releases the hide timer.
+    pub fn sync_navbar_pinned(&mut self, always_on: bool, now: Instant) {
+        self.navbar_pinned = always_on;
+        if always_on {
+            if self
+                .position_bar_slide
+                .as_ref()
+                .is_some_and(|anim| anim.to < 0.5)
+            {
+                self.position_bar_slide = None;
+            }
+            if self.position_bar_last_scroll.is_none() {
+                self.position_bar_last_scroll = Some(now);
+            }
+        }
+    }
+
+    /// Sync the effective reduce-motion gate from prefs. Enabling snaps
+    /// in-flight movement chases to their settled targets (selection, dock,
+    /// and slide state already sit target-side; only the visual chase is
+    /// dropped) so the gate takes effect immediately. Opacity clocks
+    /// (fades, dims, veils, position-bar show/hide) are untouched.
+    pub fn sync_reduced_motion(&mut self, reduced: bool) {
+        self.reduced_motion = reduced;
+        if !reduced {
+            return;
+        }
+        if let Some(anim) = self.anim.take() {
+            self.slide = anim.to;
+        }
+        // Dock/strip state is set target-side at request time; drop the chase.
+        self.dock_anim = None;
+        self.strip_anim = None;
+        self.layout_transition = None;
+        if let Some(anim) = self.position_section.take() {
+            self.position_section_at = anim.to;
+        }
+    }
+
     fn sync_position_section(&mut self, now: Instant, duration_ms: u64) {
         self.note_position_bar_scroll(now);
         let target = self.position_section_target();
+        // Reduced motion snaps the rail labels (and the bar) to the section.
+        if self.reduced_motion {
+            self.position_section = None;
+            self.position_section_at = target;
+            return;
+        }
         let current = self.position_section_visual(now);
         if (current - target).abs() < 0.004 {
             self.position_section = None;
@@ -1982,11 +2119,17 @@ impl State {
     }
 
     /// Begin the process-first Start load ceremony (immersive ambient + dock; compact skips).
-    pub fn begin_cold_load(&mut self) {
+    ///
+    /// Re-shows the position rail: runs after the `reset_to_games` /
+    /// transition-phase clears on the open path, so the rail is up on enter.
+    /// Pinned (`AlwaysOn`) is a no-op show; reduced motion snaps the slide
+    /// downstream (the trigger only starts the chase).
+    pub fn begin_cold_load(&mut self, now: Instant) {
         self.cold_load_active = true;
         self.cold_ambient_started = None;
         self.games_list_reveal_at = None;
         self.enter_list_hold_started = None;
+        self.note_position_bar_scroll(now);
         crate::controller::hid::diag::diag_info("ui-diag: start cold load begin");
     }
 
@@ -2240,9 +2383,20 @@ impl State {
         }
     }
 
-    fn chrome_status_item_visual(item: &ChromeStatusItem, now: Instant) -> ChromeStatusVisual {
+    fn chrome_status_item_visual(
+        &self,
+        item: &ChromeStatusItem,
+        now: Instant,
+    ) -> ChromeStatusVisual {
+        use crate::ui::motion::movement_offset;
         use crate::ui::start::mode::{CHROME_STATUS_EXIT_MS, phase_progress};
-        let stack_slot = Self::chrome_status_display_slot(item, now);
+        // Reduced motion snaps stack reflow; ExitRight keeps its fade but
+        // loses its travel.
+        let stack_slot = if self.reduced_motion {
+            item.stack_slot
+        } else {
+            Self::chrome_status_display_slot(item, now)
+        };
         let (exit_x, opacity, success) = match item.phase {
             ChromeStatusPhase::In | ChromeStatusPhase::Active => (0.0, 1.0, false),
             ChromeStatusPhase::Success => (0.0, 1.0, true),
@@ -2252,7 +2406,7 @@ impl State {
                     CHROME_STATUS_EXIT_MS,
                 );
                 // Full fade by the end so any remainder past travel is gone.
-                (t, 1.0 - t, true)
+                (movement_offset(t, self.reduced_motion), 1.0 - t, true)
             }
         };
         ChromeStatusVisual {
@@ -2268,7 +2422,7 @@ impl State {
     pub fn chrome_load_status(&self, now: Instant) -> Vec<ChromeStatusVisual> {
         self.chrome_status
             .iter()
-            .map(|i| Self::chrome_status_item_visual(i, now))
+            .map(|i| self.chrome_status_item_visual(i, now))
             .collect()
     }
 
@@ -2729,16 +2883,28 @@ impl State {
     }
 
     /// Visual params for the incoming backdrop: `(opacity, scale, ox_norm, oy_norm)`.
+    /// Reduced motion freezes the ken-burns pose at rest (Cover, centered);
+    /// the selection crossfade opacity is unchanged.
     pub fn backdrop_incoming_visual(&self, now: Instant) -> Option<(f32, f32, f32, f32)> {
+        use crate::ui::motion::{movement_offset, movement_scale};
         use crate::ui::start::mode::{
             art_fade_progress, backdrop_pose_offset, backdrop_pose_scale, enter_art_fade_progress,
         };
         let row = self.rows.get(self.game_selected)?;
         row.backdrop_icon()?;
+        let still = |elapsed_ms: u64| {
+            let scale = movement_scale(backdrop_pose_scale(elapsed_ms), self.reduced_motion);
+            let (ox, oy) = backdrop_pose_offset(elapsed_ms);
+            (
+                scale,
+                movement_offset(ox, self.reduced_motion),
+                movement_offset(oy, self.reduced_motion),
+            )
+        };
         match &self.backdrop_current {
             Some((key, None)) if key == &row.play_key => {
-                let (ox, oy) = backdrop_pose_offset(0);
-                Some((0.0, backdrop_pose_scale(0), ox, oy))
+                let (scale, ox, oy) = still(0);
+                Some((0.0, scale, ox, oy))
             }
             Some((key, Some(started))) if key == &row.play_key => {
                 let elapsed = now.saturating_duration_since(*started).as_millis() as u64;
@@ -2749,12 +2915,11 @@ impl State {
                 } else {
                     art_fade_progress(elapsed)
                 };
-                let scale = backdrop_pose_scale(elapsed);
-                let (ox, oy) = backdrop_pose_offset(elapsed);
+                let (scale, ox, oy) = still(elapsed);
                 Some((opacity, scale, ox, oy))
             }
             // No state, or stale key after compact nav — still paint current art.
-            None | Some(_) => Some((1.0, backdrop_pose_scale(0), 0.0, 0.0)),
+            None | Some(_) => Some((1.0, still(0).0, 0.0, 0.0)),
         }
     }
 
@@ -2879,6 +3044,7 @@ impl State {
 
     /// Selection changed: park prior art as solid underlay and land the new one.
     pub fn reset_backdrop_fade(&mut self) {
+        use crate::ui::motion::{movement_offset, movement_scale};
         use crate::ui::start::mode::{backdrop_pose_offset, backdrop_pose_scale};
         let now = Instant::now();
         self.splash_reveal_pending = false;
@@ -2886,15 +3052,24 @@ impl State {
         self.enter_splash_fade = false;
         self.splash_opaque = false;
         // Freeze full ken-burns pose — pan snap-to-center was a visible navigate glitch.
+        // Reduced motion parks at rest (Cover, centered) instead.
         let (frozen_scale, frozen_ox, frozen_oy) = match &self.backdrop_current {
             Some((_, Some(started))) => {
                 let elapsed = now.saturating_duration_since(*started).as_millis() as u64;
                 let (ox, oy) = backdrop_pose_offset(elapsed);
-                (backdrop_pose_scale(elapsed).max(1.0), ox, oy)
+                (
+                    movement_scale(backdrop_pose_scale(elapsed).max(1.0), self.reduced_motion),
+                    movement_offset(ox, self.reduced_motion),
+                    movement_offset(oy, self.reduced_motion),
+                )
             }
             _ => {
                 let (ox, oy) = backdrop_pose_offset(0);
-                (backdrop_pose_scale(0).max(1.0), ox, oy)
+                (
+                    movement_scale(backdrop_pose_scale(0).max(1.0), self.reduced_motion),
+                    movement_offset(ox, self.reduced_motion),
+                    movement_offset(oy, self.reduced_motion),
+                )
             }
         };
         if let Some((prev_key, _)) = self.backdrop_current.take() {
@@ -2968,12 +3143,17 @@ impl State {
     }
 
     /// Advance pressed-scale and armed-color hint animations (~100ms).
+    /// Reduced motion snaps press feedback instead of gliding (end states identical).
     pub fn tick_hint_anims(&mut self, now: Instant) {
-        let dt = self
-            .hint_anim_tick
-            .map(|t| now.saturating_duration_since(t).as_secs_f32())
-            .unwrap_or(0.0)
-            .min(0.05);
+        // Full-step dt snaps every approach below to its target in one tick.
+        let dt = if self.reduced_motion {
+            1.0
+        } else {
+            self.hint_anim_tick
+                .map(|t| now.saturating_duration_since(t).as_secs_f32())
+                .unwrap_or(0.0)
+                .min(0.05)
+        };
         self.hint_anim_tick = Some(now);
         if dt <= 0.0 {
             return;
@@ -3065,18 +3245,22 @@ impl State {
                 busy = true;
             }
         } else if let Some(last) = self.position_bar_last_scroll {
-            use crate::ui::start::position::HIDE_AFTER_MS;
-            let elapsed = now.saturating_duration_since(last).as_millis() as u64;
-            if elapsed >= HIDE_AFTER_MS {
-                self.position_bar_slide = Some(PositionSlideAnim {
-                    from: 1.0,
-                    opacity_from: 1.0,
-                    to: 0.0,
-                    started: now,
-                });
-                busy = true;
-            } else {
-                busy = true;
+            // NavbarVisibility::AlwaysOn pins the rail at (1, 1): skip the
+            // hide timer entirely while pinned.
+            if !self.navbar_pinned {
+                use crate::ui::start::position::HIDE_AFTER_MS;
+                let elapsed = now.saturating_duration_since(last).as_millis() as u64;
+                if elapsed >= HIDE_AFTER_MS {
+                    self.position_bar_slide = Some(PositionSlideAnim {
+                        from: 1.0,
+                        opacity_from: 1.0,
+                        to: 0.0,
+                        started: now,
+                    });
+                    busy = true;
+                } else {
+                    busy = true;
+                }
             }
         }
         // Continuous ken-burns + pending splash decode both need frames.
@@ -3114,12 +3298,27 @@ impl State {
     /// Request a slide target. Interruptible: restarts from the current scroll position.
     /// No-op if already at / animating toward `to`.
     /// Returns `true` when a transition started or completed instantly after a move.
+    /// Reduced motion snaps the carousel (no pane travel).
     pub fn request_slide(&mut self, to: StartSlide, now: Instant) -> bool {
         if self.anim.as_ref().is_some_and(|a| a.to == to) {
             return false;
         }
         if self.anim.is_none() && self.slide == to {
             return false;
+        }
+        if self.reduced_motion {
+            let snapped = self.anim.is_some();
+            let changed = self.slide != to;
+            self.replace_confirm = None;
+            self.manual_add = None;
+            self.cross_progress = 0.0;
+            if to != StartSlide::Games {
+                self.editing = false;
+                self.edit_anchor_play_key = None;
+            }
+            self.slide = to;
+            self.anim = None;
+            return changed || snapped;
         }
 
         let from_x = self.slide_scroll_x(now);
@@ -3615,6 +3814,7 @@ pub fn view<'a>(
     stage_h: f32,
     stage_w: f32,
     settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
+    #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
     use crate::ui::start::mode::TransitionPhase;
     if matches!(
@@ -3645,6 +3845,8 @@ pub fn view<'a>(
             stage_w,
             settings_snapshot,
             settings_snapshot.immersive_layout,
+            #[cfg(debug_assertions)]
+            debug_bounds,
         );
     }
 
@@ -3670,6 +3872,8 @@ pub fn view<'a>(
         promote_gesture,
         flat_hints,
         primary,
+        #[cfg(debug_assertions)]
+        debug_bounds,
     );
     let with_veil = crate::ui::start::immersive::compact_transition_overlay(compact, veil, false);
     let settings_p = state.settings.progress(now);
@@ -3680,7 +3884,13 @@ pub fn view<'a>(
     // subtree state. The closed top layer is inert space: it draws nothing and
     // captures no input, so events reach the lists below unchanged.
     let settings_layer: Element<'_, StartMessage> = if state.settings.visible(now) {
-        crate::ui::start::settings::compact_overlay(state, settings_snapshot, settings_p)
+        crate::ui::start::settings::compact_overlay(
+            state,
+            settings_snapshot,
+            settings_p,
+            #[cfg(debug_assertions)]
+            debug_bounds,
+        )
     } else {
         space().width(Fill).height(Fill).into()
     };
@@ -3690,6 +3900,7 @@ pub fn view<'a>(
         .into()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compact_chrome<'a>(
     state: &'a State,
     spectrum: &BatterySpectrum,
@@ -3698,8 +3909,11 @@ fn compact_chrome<'a>(
     promote_gesture: &'a [crate::domain::gesture::GestureControl],
     flat_hints: bool,
     steam_scan_banner: Option<SteamScanBannerVisual>,
+    #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
     let header = slide_header(state.slide_progress(now), steam_scan_banner, now);
+    #[cfg(debug_assertions)]
+    let header: Element<'_, StartMessage> = crate::ui::debug_bounds::wrap(header, debug_bounds);
 
     let body = if state.manual_add.is_some() {
         manual_add_view(state)
@@ -3708,15 +3922,20 @@ fn compact_chrome<'a>(
     } else {
         carousel_body(state, spectrum, now)
     };
+    let body = container(body).width(Fill).height(Fill);
+    #[cfg(debug_assertions)]
+    let body = crate::ui::debug_bounds::wrap(body.into(), debug_bounds);
 
     let hint = footer_hint(state, false, always_immersive, promote_gesture, flat_hints);
+    #[cfg(debug_assertions)]
+    let hint: Element<'_, StartMessage> = crate::ui::debug_bounds::wrap(hint, debug_bounds);
     #[cfg(debug_assertions)]
     let diag = diag_report_bar();
     #[cfg(not(debug_assertions))]
     let diag: Element<'_, StartMessage> = space().height(Length::Fixed(0.0)).into();
 
     chrome::window(
-        column![header, container(body).width(Fill).height(Fill), diag, hint,]
+        column![header, body, diag, hint,]
             .spacing(10)
             .padding([PAD_Y, PADDING])
             .width(Fill)
@@ -5613,6 +5832,122 @@ mod tests {
     }
 
     #[test]
+    fn navbar_pin_holds_rail_visible_and_skips_hide_timer() {
+        use crate::ui::start::position::HIDE_AFTER_MS;
+        let mut state = State::default();
+        let now = Instant::now();
+        // Unpinned and never scrolled: rail hidden.
+        assert_eq!(state.position_bar_show(now), (0.0, 0.0));
+        // Pinning stamps the clock and holds (1, 1) with no motion.
+        state.sync_navbar_pinned(true, now);
+        assert!(state.navbar_pinned);
+        assert!(state.position_bar_last_scroll.is_some());
+        assert_eq!(state.position_bar_show(now), (1.0, 1.0));
+        assert!(state.position_bar_motion().is_none());
+        // The hide timer never fires while pinned, however idle.
+        let idle = now + Duration::from_millis(HIDE_AFTER_MS + 5_000);
+        state.tick_anim(idle);
+        assert!(state.position_bar_slide.is_none());
+        assert_eq!(state.position_bar_show(idle), (1.0, 1.0));
+        // Releasing the pin restores auto-hide from the stamped clock.
+        state.sync_navbar_pinned(false, idle);
+        state.tick_anim(idle);
+        assert!(state.position_bar_slide.is_some());
+    }
+
+    #[test]
+    fn cold_load_begin_shows_rail_after_reset() {
+        use crate::ui::start::position::FADE_MS;
+        // Open-path order: reset_to_games clears, begin_cold_load re-shows.
+        let mut state = State {
+            immersive: true,
+            ..State::default()
+        };
+        let now = Instant::now();
+        state.note_position_bar_scroll(now);
+        assert!(state.position_bar_last_scroll.is_some());
+        state.reset_to_games();
+        assert!(state.position_bar_last_scroll.is_none());
+        assert_eq!(state.position_bar_show(now), (0.0, 0.0));
+        let open = now + Duration::from_millis(50);
+        state.begin_cold_load(open);
+        assert!(state.position_bar_last_scroll.is_some());
+        // Show chase eases to resting (not instant).
+        let settled = open + Duration::from_millis(FADE_MS + 50);
+        assert_eq!(state.position_bar_show(settled), (1.0, 1.0));
+    }
+
+    #[test]
+    fn cold_load_begin_is_noop_show_when_pinned() {
+        let mut state = State {
+            immersive: true,
+            ..State::default()
+        };
+        let now = Instant::now();
+        state.sync_navbar_pinned(true, now);
+        state.begin_cold_load(now);
+        assert_eq!(state.position_bar_show(now), (1.0, 1.0));
+        assert!(state.position_bar_slide.is_none());
+        assert!(state.position_bar_motion().is_none());
+    }
+
+    #[test]
+    fn set_rows_reorder_shows_rail_when_immersive() {
+        use crate::ui::start::position::FADE_MS;
+        let mut state = State {
+            rows: vec![
+                game_row_with("steam:1"),
+                game_row_with("steam:2"),
+                game_row_with("steam:3"),
+            ],
+            immersive: true,
+            ..State::default()
+        };
+        // Same-order rebuild (disabled-only refresh) stays hidden.
+        state.set_rows(vec![
+            game_row_with("steam:1"),
+            game_row_with("steam:2"),
+            game_row_with("steam:3"),
+        ]);
+        assert!(state.position_bar_last_scroll.is_none());
+        // Reorder (Steam-scan reorder / sort change) re-shows.
+        state.set_rows(vec![
+            game_row_with("steam:3"),
+            game_row_with("steam:1"),
+            game_row_with("steam:2"),
+        ]);
+        assert!(state.position_bar_last_scroll.is_some());
+        let settled = Instant::now() + Duration::from_millis(FADE_MS + 50);
+        assert_eq!(state.position_bar_show(settled), (1.0, 1.0));
+        // Membership change re-shows too.
+        let mut added = State {
+            rows: vec![game_row_with("steam:1"), game_row_with("steam:2")],
+            immersive: true,
+            ..State::default()
+        };
+        added.set_rows(vec![
+            game_row_with("steam:1"),
+            game_row_with("steam:2"),
+            game_row_with("steam:3"),
+        ]);
+        assert!(added.position_bar_last_scroll.is_some());
+    }
+
+    #[test]
+    fn set_rows_reorder_stays_hidden_when_compact() {
+        // The open-path refresh runs while immersive is still false, so a
+        // reorder there must not show before `reset_to_games`.
+        let mut state = State {
+            rows: vec![game_row_with("steam:1"), game_row_with("steam:2")],
+            ..State::default()
+        };
+        assert!(!state.immersive);
+        state.set_rows(vec![game_row_with("steam:2"), game_row_with("steam:1")]);
+        assert!(state.position_bar_last_scroll.is_none());
+        assert_eq!(state.position_bar_show(Instant::now()), (0.0, 0.0));
+    }
+
+    #[test]
     fn request_settings_preserves_list_scroll_offsets() {
         // Compact settings open/close must not disturb the Games/Controllers
         // list scroll offsets (or selections): the compact view keeps a
@@ -6320,6 +6655,117 @@ mod tests {
         assert_eq!(layout, ImmersiveLayout::Horizontal);
         assert_eq!(opacity, 1.0);
         assert!(dx.abs() < 1e-6 && dy.abs() < 1e-6);
+    }
+
+    /// Reduced motion snaps every movement chase to its target while opacity
+    /// clocks keep easing.
+    #[test]
+    fn reduced_motion_snaps_movement_keeps_opacity() {
+        use crate::persist::prefs::ImmersiveLayout;
+        use crate::ui::start::mode::{
+            CHROME_STATUS_EXIT_MS, CHROME_STATUS_STEP_HOLD_MS, CHROME_STATUS_SUCCESS_HOLD_MS,
+        };
+        let now = Instant::now();
+        let mut state = State {
+            immersive: true,
+            reduced_motion: true,
+            ..State::default()
+        };
+        // Compact carousel: snaps to the pane, no travel anim.
+        assert!(state.request_slide(StartSlide::Controllers, now));
+        assert_eq!(state.slide, StartSlide::Controllers);
+        assert!(state.anim.is_none());
+        assert!(!state.request_slide(StartSlide::Controllers, now));
+        // Immersive dock: snaps open, no travel anim (stage scale gates to 1 at render).
+        assert!(state.request_dock(true, now));
+        assert!(state.dock_expanded);
+        assert_eq!(state.slide, StartSlide::Controllers);
+        assert!(state.dock_anim.is_none());
+        // Layout transition never starts; a pre-existing one renders settled.
+        state.begin_layout_transition(ImmersiveLayout::Vertical, ImmersiveLayout::Horizontal, now);
+        assert!(state.layout_transition.is_none());
+        state.layout_transition = Some(LayoutTransitionAnim {
+            from: ImmersiveLayout::Vertical,
+            to: ImmersiveLayout::Horizontal,
+            started: now,
+        });
+        let (layout, opacity, dx, dy) = state
+            .layout_transition_visual(ImmersiveLayout::Horizontal, now + Duration::from_millis(10));
+        assert_eq!(layout, ImmersiveLayout::Horizontal);
+        assert_eq!(opacity, 1.0);
+        assert!(dx.abs() < 1e-6 && dy.abs() < 1e-6);
+        state.layout_transition = None;
+        // Position bar: slide snaps (duration 0 settles on the first frame)
+        // while opacity still eases over OPACITY_MS.
+        state.note_position_bar_scroll(now);
+        assert!(state.position_bar_slide.is_some());
+        assert!(state.position_bar_motion().is_none());
+        let (slide, opacity) = state.position_bar_show(now + Duration::from_millis(16));
+        assert!((slide - 1.0).abs() < 1e-6);
+        assert!(opacity > 0.0 && opacity < 1.0);
+        // Chrome status exit: no travel, fade kept.
+        state.begin_chrome_status(ChromeStatusKind::PreparingArt, now);
+        state.note_chrome_status_success(ChromeStatusKind::PreparingArt, now);
+        let hold = CHROME_STATUS_SUCCESS_HOLD_MS + CHROME_STATUS_STEP_HOLD_MS;
+        let t_exit = now + Duration::from_millis(hold);
+        state.tick_chrome_status(t_exit);
+        let mid =
+            state.chrome_load_status(t_exit + Duration::from_millis(CHROME_STATUS_EXIT_MS / 2));
+        assert_eq!(mid.len(), 1);
+        assert!(mid[0].exit_x.abs() < 1e-6);
+        assert!(mid[0].opacity > 0.0 && mid[0].opacity < 1.0);
+        // Enabling mid-flight settles slide/dock/strip chases to target.
+        let mut moving = State {
+            immersive: true,
+            ..State::default()
+        };
+        assert!(moving.request_slide(StartSlide::Controllers, now));
+        assert!(moving.anim.is_some());
+        moving.sync_reduced_motion(true);
+        assert!(moving.reduced_motion);
+        assert_eq!(moving.slide, StartSlide::Controllers);
+        assert!(moving.anim.is_none());
+        assert!(moving.dock_anim.is_none());
+        assert!(moving.strip_anim.is_none());
+        assert!(moving.layout_transition.is_none());
+        // Disabling never creates or clears chases by itself.
+        moving.sync_reduced_motion(false);
+        assert!(!moving.reduced_motion);
+    }
+
+    #[test]
+    fn reduced_motion_snaps_strip_and_hint_press() {
+        let now = Instant::now();
+        let mut state = State {
+            rows: (0..5)
+                .map(|i| StartRow {
+                    title: format!("g{i}"),
+                    subtitle: None,
+                    target: format!("t{i}"),
+                    args: String::new(),
+                    play_key: format!("k{i}"),
+                    icon: None,
+                    icon_source: None,
+                    backdrop_path: None,
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                    disabled: false,
+                    played_at_ms: None,
+                })
+                .collect(),
+            game_selected: 3,
+            reduced_motion: true,
+            ..Default::default()
+        };
+        state.begin_strip_anim(2.0, now);
+        assert!(state.strip_anim.is_none());
+        assert!((state.strip_scroll(now) - 3.0).abs() < 0.01);
+        assert!(state.position_section.is_none());
+        // Press feedback snaps to held instead of gliding over ~100 ms.
+        state.held.cross = true;
+        state.tick_hint_anims(now);
+        assert!((state.press_anim.cross - 1.0).abs() < 1e-6);
     }
 
     #[test]

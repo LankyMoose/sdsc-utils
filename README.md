@@ -133,7 +133,7 @@ That unlocks a **Developer mode** group in the **Configure** window — separate
 
 - **Controllers** — the emulated fleet, one row per pad. New pads are created remembered but **disconnected**, so adding one is quiet; the per-pad switch plugs them in and out through the normal connect/disconnect path, so toasts and the Start-open preference fire exactly as they would for real hardware. Pads are remembered across restarts and come back switched off at their last level. The chevron expands a row's controls inline — battery level (snapped to the levels a DualSense actually reports; a connected pad applies changes after a one-second pause marked by a spinner, and unplugging cancels a pending one), link (USB charges, Bluetooth runs down — the charge state follows from it, as on real hardware), battery analytics (seed estimates, or walk the charge/drain cycle), the remember pin, and remove. Forgetting a pad drops it from the remembered list; once it is also unplugged the row goes away.
 - **Pad input** — live DualSense/gamepad readings.
-- **Diagnostics** — renderer stress test.
+- **Diagnostics** — renderer stress test, plus a layout-bounding-boxes overlay (toggle or F9) that outlines Start and Settings-drawer containers (magenta) and fixed-width elements (cyan). Debug-only, off by default, never saved.
 
 The emulator is compiled into every non-release build, so there is no flag to pass; release binaries (`cargo build --release`) never include it.
 

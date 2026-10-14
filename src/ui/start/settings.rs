@@ -1,7 +1,8 @@
 //! In-window Start Screen settings (Options): compact modal / immersive right drawer.
 
 use crate::persist::prefs::{
-    AUTO_OPEN_MODES, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout, START_SCREEN_IDLE_SECS_STEPS,
+    AUTO_OPEN_MODES, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout, NAVBAR_MODES, NavbarVisibility,
+    REDUCED_MOTION_MODES, ReducedMotion, START_SCREEN_IDLE_SECS_STEPS,
     START_SCREEN_SLEEP_SECS_STEPS, StartAutoOpen, format_timeout_duration, min_sleep_secs_for_idle,
     secs_step_index,
 };
@@ -55,6 +56,8 @@ pub struct StartSettingsSnapshot {
     pub always_immersive: bool,
     pub clock_enabled: bool,
     pub immersive_layout: ImmersiveLayout,
+    pub navbar: NavbarVisibility,
+    pub reduced_motion: ReducedMotion,
     pub inactive_secs: u32,
     pub sleep_secs: u32,
     pub inactive_dim_percent: u8,
@@ -71,6 +74,8 @@ pub enum SettingsRow {
     AlwaysImmersive,
     Clock,
     ImmersiveLayout,
+    Navbar,
+    ReducedMotion,
     IdleSecs,
     SleepSecs,
     IdleDim,
@@ -86,11 +91,13 @@ impl SettingsRow {
     /// everywhere (visibly), and reordering here reorders all three together.
     /// To add a row: append/reorder here, extend `visible()` + `section_before()`
     /// / `gap_before()` + the `panel_view` build match + `kind()`/dispatch arms.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::AutoOpen,
         Self::AlwaysImmersive,
         Self::Clock,
         Self::ImmersiveLayout,
+        Self::Navbar,
+        Self::ReducedMotion,
         Self::IdleSecs,
         Self::SleepSecs,
         Self::IdleDim,
@@ -109,6 +116,8 @@ impl SettingsRow {
             | Self::AlwaysImmersive
             | Self::Clock
             | Self::ImmersiveLayout
+            | Self::Navbar
+            | Self::ReducedMotion
             | Self::IdleSecs
             | Self::SleepSecs
             | Self::IdleDim
@@ -122,7 +131,7 @@ impl SettingsRow {
     pub fn focusable(snapshot: &StartSettingsSnapshot) -> Vec<Self> {
         debug_assert!(
             {
-                let mut seen = [false; 11];
+                let mut seen = [false; 13];
                 let mut dup = false;
                 for row in Self::ALL {
                     let idx = row as usize;
@@ -151,6 +160,8 @@ impl SettingsRow {
             Self::Sounds => Some("Feedback"),
             Self::Clock
             | Self::ImmersiveLayout
+            | Self::Navbar
+            | Self::ReducedMotion
             | Self::IdleSecs
             | Self::SleepSecs
             | Self::IdleDim
@@ -168,6 +179,8 @@ impl SettingsRow {
             Self::AutoOpen
             | Self::Clock
             | Self::ImmersiveLayout
+            | Self::Navbar
+            | Self::ReducedMotion
             | Self::IdleSecs
             | Self::SleepSecs
             | Self::IdleDim
@@ -190,7 +203,9 @@ impl SettingsRow {
     /// Widget kind for a row, declared once; confirm/nudge dispatch over it.
     pub fn kind(self) -> RowKind {
         match self {
-            Self::AutoOpen | Self::ImmersiveLayout => RowKind::Selector,
+            Self::AutoOpen | Self::ImmersiveLayout | Self::Navbar | Self::ReducedMotion => {
+                RowKind::Selector
+            }
             Self::AlwaysImmersive | Self::Clock | Self::Sounds | Self::Haptics => RowKind::Toggle,
             Self::IdleSecs
             | Self::SleepSecs
@@ -227,6 +242,8 @@ impl SettingsRow {
         match self {
             Self::AutoOpen => StartMessage::ToggleAutoOpenMenu,
             Self::ImmersiveLayout => StartMessage::ToggleLayoutMenu,
+            Self::Navbar => StartMessage::ToggleNavbarMenu,
+            Self::ReducedMotion => StartMessage::ToggleReducedMotionMenu,
             row => unreachable!("{row:?} is not a selector row"),
         }
     }
@@ -236,6 +253,8 @@ impl SettingsRow {
         match self {
             Self::AutoOpen => AUTO_OPEN_MODES.len(),
             Self::ImmersiveLayout => IMMERSIVE_LAYOUT_MODES.len(),
+            Self::Navbar => NAVBAR_MODES.len(),
+            Self::ReducedMotion => REDUCED_MOTION_MODES.len(),
             row => unreachable!("{row:?} is not a selector row"),
         }
     }
@@ -251,6 +270,14 @@ impl SettingsRow {
                 .iter()
                 .position(|&m| m == snapshot.immersive_layout)
                 .unwrap_or(0),
+            Self::Navbar => NAVBAR_MODES
+                .iter()
+                .position(|&m| m == snapshot.navbar)
+                .unwrap_or(0),
+            Self::ReducedMotion => REDUCED_MOTION_MODES
+                .iter()
+                .position(|&m| m == snapshot.reduced_motion)
+                .unwrap_or(0),
             row => unreachable!("{row:?} is not a selector row"),
         }
     }
@@ -260,6 +287,8 @@ impl SettingsRow {
         match self {
             Self::AutoOpen => AUTO_OPEN_MODES[index].label(),
             Self::ImmersiveLayout => IMMERSIVE_LAYOUT_MODES[index].label(),
+            Self::Navbar => NAVBAR_MODES[index].label(),
+            Self::ReducedMotion => REDUCED_MOTION_MODES[index].label(),
             row => unreachable!("{row:?} is not a selector row"),
         }
     }
@@ -273,6 +302,12 @@ impl SettingsRow {
             Self::ImmersiveLayout => IMMERSIVE_LAYOUT_MODES
                 .get(index)
                 .is_some_and(|&m| m == snapshot.immersive_layout),
+            Self::Navbar => NAVBAR_MODES
+                .get(index)
+                .is_some_and(|&m| m == snapshot.navbar),
+            Self::ReducedMotion => REDUCED_MOTION_MODES
+                .get(index)
+                .is_some_and(|&m| m == snapshot.reduced_motion),
             row => unreachable!("{row:?} is not a selector row"),
         }
     }
@@ -286,6 +321,12 @@ impl SettingsRow {
             }
             Self::ImmersiveLayout => StartMessage::SetImmersiveLayout(
                 IMMERSIVE_LAYOUT_MODES[index.min(IMMERSIVE_LAYOUT_MODES.len() - 1)],
+            ),
+            Self::Navbar => {
+                StartMessage::SetNavbarVisibility(NAVBAR_MODES[index.min(NAVBAR_MODES.len() - 1)])
+            }
+            Self::ReducedMotion => StartMessage::SetReducedMotion(
+                REDUCED_MOTION_MODES[index.min(REDUCED_MOTION_MODES.len() - 1)],
             ),
             row => unreachable!("{row:?} is not a selector row"),
         }
@@ -303,6 +344,8 @@ impl SettingsRow {
             Self::ImmersiveLayout => {
                 StartMessage::SetImmersiveLayout(snapshot.immersive_layout.cycle())
             }
+            Self::Navbar => StartMessage::SetNavbarVisibility(snapshot.navbar.cycle()),
+            Self::ReducedMotion => StartMessage::SetReducedMotion(snapshot.reduced_motion.cycle()),
             row => unreachable!("{row:?} is not a selector row"),
         }
     }
@@ -390,6 +433,8 @@ pub fn settings_nav_cue(row: SettingsRow) -> SettingsCue {
         | SettingsRow::AlwaysImmersive
         | SettingsRow::Clock
         | SettingsRow::ImmersiveLayout
+        | SettingsRow::Navbar
+        | SettingsRow::ReducedMotion
         | SettingsRow::IdleSecs
         | SettingsRow::SleepSecs
         | SettingsRow::IdleDim => SettingsCue::Full,
@@ -875,6 +920,7 @@ pub fn panel_view<'a>(
     state: &'a State,
     snapshot: &StartSettingsSnapshot,
     immersive: bool,
+    #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
     let focus_rows = SettingsRow::focusable(snapshot);
     let focus = state.settings.focus.min(focus_rows.len().saturating_sub(1));
@@ -923,7 +969,7 @@ pub fn panel_view<'a>(
             items = items.push(section_label(section, ty.section));
         }
         let focused = focus_rows.get(focus) == Some(&row);
-        items = items.push(match row {
+        let widget: Element<'_, StartMessage> = match row {
             SettingsRow::AutoOpen => selector_row(
                 "Auto open:",
                 snapshot.auto_open.label(),
@@ -951,6 +997,20 @@ pub fn panel_view<'a>(
                 focused,
                 ty,
                 SettingsRow::ImmersiveLayout.open_menu(),
+            ),
+            SettingsRow::Navbar => selector_row(
+                "Navbar",
+                snapshot.navbar.label(),
+                focused,
+                ty,
+                SettingsRow::Navbar.open_menu(),
+            ),
+            SettingsRow::ReducedMotion => selector_row(
+                "Reduced motion",
+                snapshot.reduced_motion.label(),
+                focused,
+                ty,
+                SettingsRow::ReducedMotion.open_menu(),
             ),
             SettingsRow::IdleSecs => {
                 let snap_for_msg = snapshot.clone();
@@ -1024,15 +1084,20 @@ pub fn panel_view<'a>(
                     move |value| SettingsRow::HapticsStrength.slider_select(&snap_for_msg, value),
                 )
             }
-        });
+        };
         #[cfg(debug_assertions)]
         built_rows.push(row);
         // Expanded dropdown panel: every option selectable, highlight follows
         // the menu. Renders after its selector row wherever it sits, so rows
         // below shift from this table position (not a hardcoded sequence).
         if let Some(panel) = selector_menu_panel(state.settings.menu, row, snapshot, ty) {
+            #[cfg(debug_assertions)]
+            let panel = crate::ui::debug_bounds::wrap(panel, debug_bounds);
             items = items.push(panel);
         }
+        #[cfg(debug_assertions)]
+        let widget = crate::ui::debug_bounds::wrap(widget, debug_bounds);
+        items = items.push(widget);
     }
     #[cfg(debug_assertions)]
     debug_assert_eq!(
@@ -1056,6 +1121,12 @@ pub fn panel_view<'a>(
     .width(Fill)
     .height(Fill);
 
+    #[cfg(debug_assertions)]
+    let header: Element<'_, StartMessage> =
+        crate::ui::debug_bounds::wrap(header.into(), debug_bounds);
+    #[cfg(debug_assertions)]
+    let list: Element<'_, StartMessage> = crate::ui::debug_bounds::wrap(list.into(), debug_bounds);
+
     let pad = if immersive { 20.0 } else { 16.0 };
     container(
         column![header, list]
@@ -1074,17 +1145,26 @@ pub fn compact_overlay<'a>(
     state: &'a State,
     snapshot: &StartSettingsSnapshot,
     progress: f32,
+    #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
     let dim = scrim_dim(progress);
-    let card = container(
-        container(theme::framed(panel_view(state, snapshot, false)))
-            .width(Length::Fixed(MODAL_W))
-            .max_height(COMPACT_MODAL_MAX_H),
-    )
-    .width(Fill)
-    .height(Fill)
-    .center_x(Fill)
-    .center_y(Fill);
+    let modal = container(theme::framed(panel_view(
+        state,
+        snapshot,
+        false,
+        #[cfg(debug_assertions)]
+        debug_bounds,
+    )))
+    .width(Length::Fixed(MODAL_W))
+    .max_height(COMPACT_MODAL_MAX_H);
+    #[cfg(debug_assertions)]
+    let modal: Element<'_, StartMessage> =
+        crate::ui::debug_bounds::wrap_fixed(modal.into(), debug_bounds);
+    let card = container(modal)
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill);
 
     stack_scrim(dim, card)
 }
@@ -1094,13 +1174,23 @@ pub fn immersive_drawer<'a>(
     state: &'a State,
     snapshot: &StartSettingsSnapshot,
     progress: f32,
+    #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
     let dim = scrim_dim(progress);
     let w = drawer_width(progress);
-    let panel = container(panel_view(state, snapshot, true))
-        .width(Length::Fixed(DRAWER_W))
-        .height(Fill)
-        .style(theme::immersive_island_radius(0.0));
+    let panel = container(panel_view(
+        state,
+        snapshot,
+        true,
+        #[cfg(debug_assertions)]
+        debug_bounds,
+    ))
+    .width(Length::Fixed(DRAWER_W))
+    .height(Fill)
+    .style(theme::immersive_island_radius(0.0));
+    #[cfg(debug_assertions)]
+    let panel: Element<'_, StartMessage> =
+        crate::ui::debug_bounds::wrap_fixed(panel.into(), debug_bounds);
 
     let revealed = crate::ui::reveal::width_reveal(panel, DRAWER_W, w).height(Fill);
     let drawer = row![space().width(Fill), revealed].width(Fill).height(Fill);
@@ -1336,6 +1426,8 @@ mod tests {
             always_immersive: false,
             clock_enabled: true,
             immersive_layout: ImmersiveLayout::Vertical,
+            navbar: NavbarVisibility::WhenNavigating,
+            reduced_motion: ReducedMotion::System,
             inactive_secs: 30,
             sleep_secs: 120,
             inactive_dim_percent: 50,
@@ -1354,6 +1446,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
+    fn panel_view_builds_with_bounds_on_and_off() {
+        // The bounds overlay must compose over the drawer rows in both
+        // states (including an open dropdown menu) without panicking.
+        let snapshot = snap(true, true);
+        let state = State::default();
+        drop(panel_view(&state, &snapshot, false, false));
+        drop(panel_view(&state, &snapshot, false, true));
+        drop(panel_view(&state, &snapshot, true, true));
+        let mut menu_open = State::default();
+        menu_open.settings.menu = Some((SettingsRow::AutoOpen, 0));
+        drop(panel_view(&menu_open, &snapshot, true, true));
+        drop(compact_overlay(&state, &snapshot, 1.0, true));
+        drop(immersive_drawer(&state, &snapshot, 1.0, true));
+    }
+
+    #[test]
     fn focusable_lists_selectors_in_order() {
         let rows = SettingsRow::focusable(&snap(true, true));
         assert_eq!(
@@ -1363,6 +1472,8 @@ mod tests {
                 SettingsRow::AlwaysImmersive,
                 SettingsRow::Clock,
                 SettingsRow::ImmersiveLayout,
+                SettingsRow::Navbar,
+                SettingsRow::ReducedMotion,
                 SettingsRow::IdleSecs,
                 SettingsRow::SleepSecs,
                 SettingsRow::IdleDim,
@@ -1450,7 +1561,12 @@ mod tests {
     #[test]
     fn selector_highlight_wraps_generically() {
         let s = snap(true, true);
-        for row in [SettingsRow::AutoOpen, SettingsRow::ImmersiveLayout] {
+        for row in [
+            SettingsRow::AutoOpen,
+            SettingsRow::ImmersiveLayout,
+            SettingsRow::Navbar,
+            SettingsRow::ReducedMotion,
+        ] {
             let count = row.selector_count() as isize;
             assert!(count >= 2);
             // Wrap-around in both directions from the ends.
@@ -1476,6 +1592,26 @@ mod tests {
             assert!(row.selector_selected(h, &v));
             assert!(
                 matches!(row.selector_select(h), StartMessage::SetImmersiveLayout(l) if l == layout)
+            );
+        }
+        for navbar in NAVBAR_MODES {
+            let mut v = snap(true, true);
+            v.navbar = navbar;
+            let row = SettingsRow::Navbar;
+            let h = row.initial_highlight(&v);
+            assert!(row.selector_selected(h, &v));
+            assert!(
+                matches!(row.selector_select(h), StartMessage::SetNavbarVisibility(n) if n == navbar)
+            );
+        }
+        for motion in REDUCED_MOTION_MODES {
+            let mut v = snap(true, true);
+            v.reduced_motion = motion;
+            let row = SettingsRow::ReducedMotion;
+            let h = row.initial_highlight(&v);
+            assert!(row.selector_selected(h, &v));
+            assert!(
+                matches!(row.selector_select(h), StartMessage::SetReducedMotion(m) if m == motion)
             );
         }
     }
@@ -1585,7 +1721,7 @@ mod tests {
     #[test]
     fn triple_agreement_focusable_panel_bounds() {
         // The single table lists every variant exactly once, in display order.
-        assert_eq!(SettingsRow::ALL.len(), 11);
+        assert_eq!(SettingsRow::ALL.len(), 13);
         {
             let mut sorted = SettingsRow::ALL;
             sorted.sort_by_key(|row| *row as usize);
@@ -1623,6 +1759,8 @@ mod tests {
                     None,
                     Some(SettingsRow::AutoOpen),
                     Some(SettingsRow::ImmersiveLayout),
+                    Some(SettingsRow::Navbar),
+                    Some(SettingsRow::ReducedMotion),
                 ] {
                     let layout_rows: Vec<SettingsRow> = layout_items(&s, menu)
                         .iter()
@@ -1759,6 +1897,14 @@ mod tests {
         assert!(matches!(
             confirm_message(SettingsRow::ImmersiveLayout, &base),
             Some(StartMessage::ToggleLayoutMenu)
+        ));
+        assert!(matches!(
+            confirm_message(SettingsRow::Navbar, &base),
+            Some(StartMessage::ToggleNavbarMenu)
+        ));
+        assert!(matches!(
+            confirm_message(SettingsRow::ReducedMotion, &base),
+            Some(StartMessage::ToggleReducedMotionMenu)
         ));
         // Toggles always flip, from either state.
         for on in [false, true] {
@@ -1938,6 +2084,39 @@ mod tests {
                 );
             }
         }
+        for (navbar, cycled) in [
+            (NavbarVisibility::WhenNavigating, NavbarVisibility::AlwaysOn),
+            (NavbarVisibility::AlwaysOn, NavbarVisibility::WhenNavigating),
+        ] {
+            let mut s = base.clone();
+            s.navbar = navbar;
+            for delta in [1, -1] {
+                assert!(
+                    matches!(
+                        nudge_message(SettingsRow::Navbar, &s, delta),
+                        Some(StartMessage::SetNavbarVisibility(v)) if v == cycled
+                    ),
+                    "Navbar {navbar:?} delta {delta}"
+                );
+            }
+        }
+        for (motion, cycled) in [
+            (ReducedMotion::System, ReducedMotion::On),
+            (ReducedMotion::On, ReducedMotion::Off),
+            (ReducedMotion::Off, ReducedMotion::System),
+        ] {
+            let mut s = base.clone();
+            s.reduced_motion = motion;
+            for delta in [1, -1] {
+                assert!(
+                    matches!(
+                        nudge_message(SettingsRow::ReducedMotion, &s, delta),
+                        Some(StartMessage::SetReducedMotion(v)) if v == cycled
+                    ),
+                    "ReducedMotion {motion:?} delta {delta}"
+                );
+            }
+        }
     }
 
     /// Pinned nudge matrix for the five slider rows: limits stick (None),
@@ -2074,7 +2253,12 @@ mod tests {
     #[test]
     fn mouse_builders_use_confirm_constructors() {
         let s = snap(true, true);
-        for row in [SettingsRow::AutoOpen, SettingsRow::ImmersiveLayout] {
+        for row in [
+            SettingsRow::AutoOpen,
+            SettingsRow::ImmersiveLayout,
+            SettingsRow::Navbar,
+            SettingsRow::ReducedMotion,
+        ] {
             let header = row.open_menu();
             let confirm = confirm_message(row, &s).expect("selector confirm opens the menu");
             assert_eq!(
