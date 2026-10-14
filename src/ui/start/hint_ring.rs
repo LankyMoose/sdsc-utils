@@ -24,6 +24,10 @@ use crate::ui::theme;
 pub const PROGRESS_STEPS: u32 = 48;
 /// Armed-blend quantization steps for the hold arc color.
 pub const ARMED_STEPS: u32 = 8;
+/// Idle/hold track alpha. Raised past the old canvas 0.25: resvg
+/// anti-aliasing leaves fewer fully-covered pixels on a 2px ring than the
+/// tiny-skia strokes did, so 0.25 rendered visibly dimmer — one knob to tune.
+pub const IDLE_TRACK_ALPHA: f32 = 0.40;
 
 /// Which ring to draw (mirrors `RingStyle` in `view.rs` without depending on it).
 #[derive(Debug, Clone, Copy)]
@@ -60,7 +64,9 @@ fn ring_string(kind: RingKind, radius: f32, box_size: f32) -> String {
     let c = box_size / 2.0;
     let (track_w, track) = match kind {
         RingKind::Pressed => (2.5, theme::alpha(theme::ACCENT, 1.0)),
-        RingKind::Idle | RingKind::Hold { .. } => (2.0, theme::alpha(theme::MUTED, 0.25)),
+        RingKind::Idle | RingKind::Hold { .. } => {
+            (2.0, theme::alpha(theme::MUTED, IDLE_TRACK_ALPHA))
+        }
     };
     let mut out = format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{box_size:.2}\" height=\"{box_size:.2}\" viewBox=\"0 0 {box_size:.2} {box_size:.2}\">\
@@ -71,26 +77,36 @@ fn ring_string(kind: RingKind, radius: f32, box_size: f32) -> String {
         let q = (progress.clamp(0.0, 1.0) * PROGRESS_STEPS as f32).round() as u32;
         if q > 0 {
             let qa = (armed_t.clamp(0.0, 1.0) * ARMED_STEPS as f32).round() as u32;
-            let arc = hold_arc_color(qa);
-            out.push_str(&arc_path(q, radius, c, &hex(arc)));
+            let arc = hex(hold_arc_color(qa));
+            if q >= PROGRESS_STEPS {
+                // A full sweep has identical start/end points, which SVG
+                // renders as *nothing* — emit a full circle instead, or a
+                // completed hold would show only the dim track.
+                out.push_str(&format!(
+                    "<circle cx=\"{c:.2}\" cy=\"{c:.2}\" r=\"{radius:.2}\" fill=\"none\" stroke=\"{arc}\" stroke-width=\"2.50\"/>"
+                ));
+            } else {
+                out.push_str(&arc_path(q, radius, c, &arc));
+            }
         }
     }
     out.push_str("</svg>");
     out
 }
 
-/// Hold arc color: ACCENT → MUTED over the quantized armed blend (integer
-/// math so identical inputs always format identically).
+/// Hold arc color: ACCENT → INK over the quantized armed blend (integer
+/// math so identical inputs always format identically). A fully-armed hold
+/// reads white-hot, matching the documented "toward ink" intent.
 fn hold_arc_color(qa: u32) -> iced::Color {
     let t = (qa.min(ARMED_STEPS) as f32 / ARMED_STEPS as f32).clamp(0.0, 1.0);
     let lerp = |a: f32, b: f32| a + (b - a) * t;
     let full = theme::ACCENT;
-    let dim = theme::MUTED;
+    let hot = theme::INK;
     iced::Color {
-        r: lerp(full.r, dim.r),
-        g: lerp(full.g, dim.g),
-        b: lerp(full.b, dim.b),
-        a: lerp(full.a, dim.a),
+        r: lerp(full.r, hot.r),
+        g: lerp(full.g, hot.g),
+        b: lerp(full.b, hot.b),
+        a: lerp(full.a, hot.a),
     }
 }
 
@@ -204,9 +220,117 @@ mod tests {
         // Half sweep and beyond set the large-arc flag.
         assert!(arc_path(24, RADIUS, 16.0, "#ffffffff").contains("0 0 1"));
         assert!(arc_path(36, RADIUS, 16.0, "#ffffffff").contains("0 1 1"));
-        // Armed endpoints hit the exact theme colors.
+        // Armed endpoints hit the exact theme colors (white-hot at full arm).
         assert_eq!(hex(hold_arc_color(0)), hex(theme::ACCENT));
-        assert_eq!(hex(hold_arc_color(ARMED_STEPS)), hex(theme::MUTED));
+        assert_eq!(hex(hold_arc_color(ARMED_STEPS)), hex(theme::INK));
+    }
+
+    /// Full sweeps render a complete circle, not the degenerate same-point
+    /// arc (which SVG omits): a finished hold must show a full bright ring.
+    #[test]
+    fn full_hold_renders_complete_circle() {
+        let xml = ring_string(
+            RingKind::Hold {
+                progress: 1.0,
+                armed_t: 1.0,
+            },
+            RADIUS,
+            SIZE,
+        );
+        assert!(!xml.contains("<path"), "{xml}");
+        assert!(
+            xml.contains(&format!(
+                "<circle cx=\"16.00\" cy=\"16.00\" r=\"12.27\" fill=\"none\" stroke=\"{}\"",
+                hex(theme::INK)
+            )),
+            "{xml}"
+        );
+    }
+
+    /// Rasterize with the same resvg the app renders through and measure
+    /// pixels: symmetry (centering), ink mass (completeness), peak alpha
+    /// (baked lightness). Catches visual regressions no string assert can.
+    mod pixels {
+        use super::*;
+        use resvg::tiny_skia::Pixmap;
+
+        const SCALE: f32 = 4.0;
+
+        fn rasterize(kind: RingKind) -> Pixmap {
+            let xml = ring_string(kind, RADIUS, SIZE);
+            let tree =
+                resvg::usvg::Tree::from_data(xml.as_bytes(), &resvg::usvg::Options::default())
+                    .expect("ring svg must parse");
+            let size = (SIZE * SCALE) as u32;
+            let mut pixmap = Pixmap::new(size, size).expect("pixmap");
+            resvg::render(
+                &tree,
+                resvg::tiny_skia::Transform::from_scale(SCALE, SCALE),
+                &mut pixmap.as_mut(),
+            );
+            pixmap
+        }
+
+        fn alpha_mass(pixmap: &Pixmap, x0: u32, x1: u32) -> u32 {
+            let w = pixmap.width();
+            pixmap
+                .pixels()
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| {
+                    let x = (*i as u32) % w;
+                    x >= x0 && x < x1
+                })
+                .map(|(_, p)| p.alpha() as u32)
+                .sum()
+        }
+
+        fn total_mass(pixmap: &Pixmap) -> u32 {
+            pixmap.pixels().iter().map(|p| p.alpha() as u32).sum()
+        }
+
+        /// Idle and pressed rings are left/right symmetric: the circle is
+        /// horizontally centered in its box.
+        #[test]
+        fn rings_are_horizontally_centered() {
+            for kind in [RingKind::Idle, RingKind::Pressed] {
+                let pixmap = rasterize(kind);
+                let w = pixmap.width();
+                let left = alpha_mass(&pixmap, 0, w / 2);
+                let right = alpha_mass(&pixmap, w / 2, w);
+                let diff = left.abs_diff(right) as f32 / left.max(1) as f32;
+                assert!(diff < 0.02, "kind={kind:?} left={left} right={right}");
+                assert!(left > 0, "kind={kind:?} rendered nothing");
+            }
+        }
+
+        /// A finished hold carries the same ink as the pressed full circle:
+        /// the completion ring actually draws.
+        #[test]
+        fn full_hold_matches_pressed_ink_mass() {
+            let full = rasterize(RingKind::Hold {
+                progress: 1.0,
+                armed_t: 1.0,
+            });
+            let pressed = rasterize(RingKind::Pressed);
+            let (a, b) = (total_mass(&full), total_mass(&pressed));
+            let diff = a.abs_diff(b) as f32 / b.max(1) as f32;
+            assert!(diff < 0.10, "full={a} pressed={b}");
+        }
+
+        /// The baked idle track alpha survives rasterization: fully-covered
+        /// ring pixels land near `IDLE_TRACK_ALPHA`, so the ring cannot
+        /// silently darken (or lighten) again.
+        #[test]
+        fn idle_track_lightness_is_pinned() {
+            let pixmap = rasterize(RingKind::Idle);
+            let peak = pixmap.pixels().iter().map(|p| p.alpha()).max().unwrap_or(0);
+            let expect = (IDLE_TRACK_ALPHA * 255.0).round() as i16;
+            assert!(
+                (peak as i16 - expect).abs() <= 25,
+                "peak={peak} expect~{expect}"
+            );
+        }
     }
 
     /// Ring viewport matches the canvas box so layout is unchanged.
