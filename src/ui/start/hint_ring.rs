@@ -37,6 +37,18 @@ pub enum RingKind {
     Hold { progress: f32, armed_t: f32 },
 }
 
+/// Pictogram box for a ring slot: the face art scaled by the idle-ring
+/// ratio, snapped to whole pixels. A fractional box centers at a fractional
+/// offset, and the atlas entry then resamples asymmetrically — the button
+/// icon reads off-center inside its (exactly symmetric) ring on every hint.
+pub fn pictogram_size(box_size: f32, pressed_scale: f32, glyph_size: f32) -> f32 {
+    let half = box_size / 2.0;
+    // Mirror `face_glyph_stack`: idle radius is inset so full press stays
+    // in-slot; the pictogram scales by its ratio to the glyph box.
+    let idle_radius = (half - 2.5) / pressed_scale;
+    (glyph_size * (idle_radius / (half - 2.0))).round()
+}
+
 /// SVG handle for `kind` at `radius` in a `box_size` viewport.
 ///
 /// Byte-deterministic: identical inputs always produce identical bytes, hence
@@ -330,6 +342,69 @@ mod tests {
                 (peak as i16 - expect).abs() <= 25,
                 "peak={peak} expect~{expect}"
             );
+        }
+
+        /// Composed glyph (ring + centered face pictogram, exactly like
+        /// `face_glyph_stack`): pictogram ink stays concentric with the ring.
+        /// A fractional pictogram box (15.78px → 8.11px offset) resamples its
+        /// atlas entry asymmetrically against the exact ring, reading
+        /// off-center on every hint — whole pixels keep them concentric.
+        #[test]
+        fn pictogram_stays_concentric_with_ring() {
+            let glyph = crate::ui::start::hint_ring::pictogram_size(SIZE, 1.1, 18.0);
+            // Whole pixels, exact centered offset: the regression pin itself.
+            assert_eq!(glyph.fract(), 0.0, "glyph={glyph}");
+            assert_eq!(((SIZE - glyph) / 2.0).fract(), 0.0);
+            let gap_fixed = composed_gap(glyph);
+            assert!(gap_fixed < 0.15, "gap={gap_fixed}");
+            // Diagnosis pin: the legacy fractional box skewed measurably worse.
+            let legacy = 18.0 * (((SIZE / 2.0) - 2.5) / 1.1 / ((SIZE / 2.0) - 2.0));
+            let gap_legacy = composed_gap(legacy);
+            assert!(
+                gap_legacy > gap_fixed,
+                "legacy={gap_legacy} fixed={gap_fixed}"
+            );
+        }
+
+        /// Blue-vs-grey centroid gap (real px) for a pictogram of `glyph_box`
+        /// composited at its centered offset over the idle ring.
+        fn composed_gap(glyph_box: f32) -> f32 {
+            use resvg::tiny_skia::Transform;
+            let ring = rasterize(RingKind::Idle);
+            let art = resvg::usvg::Tree::from_data(
+                crate::ui::svg_icon::FACE_CIRCLE_SVG.as_bytes(),
+                &resvg::usvg::Options::default(),
+            )
+            .expect("pictogram must parse");
+            let offset = (SIZE - glyph_box) / 2.0;
+            let s = glyph_box / 24.0 * SCALE;
+            let t = Transform::from_row(s, 0.0, 0.0, s, offset * SCALE, offset * SCALE);
+            let dim = (SIZE * SCALE) as u32;
+            let mut art_px = Pixmap::new(dim, dim).expect("pixmap");
+            resvg::render(&art, t, &mut art_px.as_mut());
+            let (cx_blue, _) = centroid(&art_px, true);
+            let (cx_grey, _) = centroid(&ring, false);
+            (cx_blue - cx_grey).abs() / SCALE
+        }
+
+        /// Centroid-x (pixmap px) of blue pictogram ink (`blue_only`) or the
+        /// grey ring ink, weighted by alpha.
+        fn centroid(pixmap: &Pixmap, blue_only: bool) -> (f32, f32) {
+            let (mut sx, mut sy, mut m) = (0.0f64, 0.0f64, 0.0f64);
+            for (i, p) in pixmap.pixels().iter().enumerate() {
+                let r = p.red() as f32;
+                let b = p.blue() as f32;
+                let is_blue = b > r + 40.0;
+                if is_blue != blue_only || p.alpha() < 8 {
+                    continue;
+                }
+                let m_add = p.alpha() as f64;
+                sx += ((i as u32 % pixmap.width()) as f64) * m_add;
+                sy += ((i as u32 / pixmap.width()) as f64) * m_add;
+                m += m_add;
+            }
+            assert!(m > 0.0, "no ink class matched");
+            (sx as f32 / m as f32, sy as f32 / m as f32)
         }
     }
 

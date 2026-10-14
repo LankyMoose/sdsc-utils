@@ -5272,10 +5272,11 @@ fn face_glyph_stack(
     style: RingStyle,
     alpha: f32,
 ) -> Element<'static, StartMessage> {
-    let half = HOLD_RING_SIZE / 2.0;
-    let max_radius = half - 2.5; // leave room for ~2.5px stroke
-    let idle_radius = max_radius / PRESSED_SCALE;
-    let glyph_size = FACE_GLYPH_SIZE * (idle_radius / (half - 2.0));
+    // Leave room for ~2.5px stroke: idle radius is inset so full press stays
+    // in-slot. Pictogram box comes snapped to whole pixels (see helper).
+    let idle_radius = (HOLD_RING_SIZE / 2.0 - 2.5) / PRESSED_SCALE;
+    let glyph_size =
+        crate::ui::start::hint_ring::pictogram_size(HOLD_RING_SIZE, PRESSED_SCALE, FACE_GLYPH_SIZE);
     iced::widget::stack![
         ring_element(style, idle_radius, alpha),
         container(face_svg(face, glyph_size, alpha))
