@@ -494,6 +494,7 @@ fn games_stage(
                 overlay,
                 orientation,
                 sel_offset,
+                dist,
             ),
         ));
     }
@@ -639,6 +640,7 @@ fn strip_slot<'a>(
     overlay: Option<Element<'a, StartMessage>>,
     orientation: StripOrientation,
     sel_offset: isize,
+    dist: f32,
 ) -> Element<'a, StartMessage> {
     let muted = editing && !row.in_catalog();
     let disabled = row.disabled && !editing;
@@ -667,42 +669,53 @@ fn strip_slot<'a>(
         // and stages too short for the text budget go art-only too.
         let show_text = sel_offset.abs() < 2 && metrics.h_text_budget > 0.0;
         return strip_slot_stacked(
-            row, muted, fade, dim, capsule, max_art_w, art_w, art_h, show_text,
+            row,
+            muted,
+            fade,
+            dim,
+            capsule,
+            max_art_w,
+            art_w,
+            art_h,
+            show_text,
+            metrics.center_w,
+            dist,
         );
     }
 
-    let title_size = if selected { 39.0 } else { 22.0 };
+    let t = vstrip::title_selectionness(dist);
+    let title_size = vstrip::v_title_size_at(dist);
+    let text_w = vstrip::v_title_text_width_at(dist).max(1.0);
+    // Weight has no fractional step in iced: flip mid-scroll where both sides
+    // are near-identical sizes so the pop hides in the glide.
+    let bold = t > 0.5;
     let title_alpha = if muted { 0.55 * fade } else { fade * dim };
     // Selected titles are large; pull back from pure white for less glare.
-    let title_color = if selected {
-        theme::alpha(theme::mix(theme::INK, theme::MUTED, 0.28), title_alpha)
-    } else {
-        theme::alpha(theme::MUTED, 0.85 * title_alpha)
-    };
+    let selected_rgb = theme::mix(theme::INK, theme::MUTED, 0.28);
+    let base_rgb = theme::mix(theme::MUTED, selected_rgb, t);
+    let title_color = theme::alpha(base_rgb, title_alpha * (0.85 + 0.15 * t));
     let title_string = if row.skeleton {
         "…".into()
     } else {
         row.title.clone()
-    };
-    let title_weight = if selected {
-        Weight::Bold
-    } else {
-        Weight::Normal
     };
 
     let title = text(title_string)
         .size(title_size)
         .color(title_color)
         .font(Font {
-            weight: title_weight,
+            weight: if bold { Weight::Bold } else { Weight::Normal },
             ..Font::DEFAULT
-        });
+        })
+        .width(Length::Fixed(text_w))
+        .align_x(Alignment::Start)
+        .wrapping(iced::widget::text::Wrapping::Word);
 
     let sub_alpha = if muted { 0.55 * fade } else { 0.9 * fade * dim };
     let mut titles = column![title].spacing(6);
     // Stacked `Played:` / `Last played:` + optional Update pill.
     // Disabled rows show "Not installed" instead of meta.
-    titles = titles.push(status_block(row, selected, muted, fade, sub_alpha, None));
+    titles = titles.push(status_block(row, bold, muted, fade, sub_alpha, None));
 
     let label: Element<'_, StartMessage> = container(titles)
         .width(Fill)
@@ -800,10 +813,13 @@ fn status_block<'a>(
 /// Horizontal item: art on top with a small centered title + meta below it.
 /// Every slot that shows text uses this same block — the selection included,
 /// so its title animates with the card exactly like its neighbors — and outer
-/// peeks stay art-only. Titles stay bound to the art width, which is always
-/// narrower than the slot spacing (edge gap `STRIDE_GAP` to spare), so
-/// adjacent slots can never overlap. Single-line, clipped; Launch/Close/edit
-/// cues still overlay the capsule via `strip_capsule`.
+/// peeks stay art-only. Titles wrap (`Wrapping::Word`) inside an interpolated
+/// width ([`vstrip::h_title_wrap_width_at`]): size, bounds, and color glide
+/// with the fractional scroll `dist` so both keep the same line breaks and
+/// adjacent slots can never overlap (wrap widths stay narrower than the slot
+/// stride). `Weight` cannot interpolate, so bold flips at the halfway point
+/// when both sides render near-identical sizes. Launch/Close/edit cues still
+/// overlay the capsule via `strip_capsule`.
 #[allow(clippy::too_many_arguments)]
 fn strip_slot_stacked<'a>(
     row: &'a StartRow,
@@ -815,6 +831,8 @@ fn strip_slot_stacked<'a>(
     art_w: f32,
     art_h: f32,
     show_text: bool,
+    center_w: f32,
+    dist: f32,
 ) -> Element<'a, StartMessage> {
     let art_w = art_w.max(1.0);
     let label: Element<'_, StartMessage> = if show_text {
@@ -823,29 +841,40 @@ fn strip_slot_stacked<'a>(
         } else {
             row.title.clone()
         };
+        // Continuous selectionness from the fractional scroll distance: size,
+        // wrap width, and color ease with the art instead of popping on the
+        // first frame (the old `selected: bool` flipped instantly while the
+        // strip eased over ~200ms).
+        let t = vstrip::h_title_selectionness(dist);
+        let wrap_w = vstrip::h_title_wrap_width_at(center_w, dist).max(1.0);
+        let size = vstrip::h_title_size_at(dist);
+        // Weight has no fractional step in iced: flip mid-scroll where both
+        // sides are near-identical sizes so the pop hides in the glide.
+        let bold = t > 0.5;
         let title_alpha = if muted { 0.55 * fade } else { fade * dim };
+        // Selected titles are large; pull back from pure white for less glare.
+        let selected_rgb = theme::mix(theme::INK, theme::MUTED, 0.28);
+        let base_rgb = theme::mix(theme::MUTED, selected_rgb, t);
+        let title_color = theme::alpha(base_rgb, title_alpha * (0.85 + 0.15 * t));
         let title = text(title_string)
-            .size(22.0)
-            .color(theme::alpha(theme::MUTED, 0.85 * title_alpha))
+            .size(size)
+            .color(title_color)
             .font(Font {
-                weight: Weight::Normal,
+                weight: if bold { Weight::Bold } else { Weight::Normal },
                 ..Font::DEFAULT
             })
-            .width(Length::Fixed(art_w))
+            .width(Length::Fixed(wrap_w))
             .align_x(Alignment::Center)
-            .wrapping(iced::widget::text::Wrapping::None);
-        let title: Element<'_, StartMessage> = container(title)
-            .width(Length::Fixed(art_w))
-            .clip(true)
-            .into();
+            .wrapping(iced::widget::text::Wrapping::Word);
+        let title: Element<'_, StartMessage> = container(title).width(Length::Fixed(wrap_w)).into();
 
         let sub_alpha = if muted { 0.55 * fade } else { 0.9 * fade * dim };
         let text_block = column![
             title,
-            status_block(row, false, muted, fade, sub_alpha, Some(art_w))
+            status_block(row, bold, muted, fade, sub_alpha, Some(wrap_w))
         ]
         .spacing(6)
-        .width(Length::Fixed(art_w))
+        .width(Length::Fixed(wrap_w))
         .align_x(Alignment::Center);
         // Center the (possibly narrower) text under the art within the fixed slot.
         container(text_block)

@@ -26,8 +26,22 @@ pub const SELECTED_SCALE: f32 = 1.42;
 pub const SCALE_AT_1: f32 = 0.88;
 /// Scale at `|d| = 2` (outer peek cards).
 pub const SCALE_AT_2: f32 = 0.58;
-/// Neighbor title + subtitle column width.
+/// Neighbor title + subtitle column width (includes the label padding).
 pub const TITLE_COL: f32 = 480.0;
+/// Label padding inside the vertical title column (left 14 + right 8 in
+/// immersive.rs). Text widths are measured inside this padding so neighbor
+/// titles wrap exactly where they do today.
+pub const V_TITLE_PAD: f32 = 22.0;
+/// Neighbor side-column title size; the selection runs larger (see
+/// [`V_TITLE_SELECTED_SIZE`]) but keeps the same wrap via
+/// [`v_title_text_width_at`].
+pub const V_TITLE_SIZE: f32 = 22.0;
+/// Selected side-column title size (larger than [`V_TITLE_SIZE`]).
+pub const V_TITLE_SELECTED_SIZE: f32 = 39.0;
+/// Selected titles render bold, which runs slightly wider than regular at the
+/// same point size. The wrap width carries this fudge so the selection keeps
+/// the neighbor's line breaks instead of spilling an extra word per line.
+pub const V_TITLE_BOLD_FUDGE: f32 = 1.06;
 /// Rightward arc offset per index unit of distance from center.
 pub const ARC_PX: f32 = 14.0;
 /// Constant edge gap between adjacent capsules (negative = slight overlap / denser stream).
@@ -40,16 +54,27 @@ const CENTER_H_MIN: f32 = 180.0;
 const CENTER_H_MAX: f32 = 420.0;
 /// Gap between horizontal art and its in-slot title/meta below it.
 pub const H_TEXT_GAP: f32 = 8.0;
+/// Neighbor in-slot title size; the selection runs larger (see
+/// [`H_TITLE_SELECTED_SIZE`]) but keeps the same wrap via
+/// [`h_title_wrap_width`].
+pub const H_TITLE_SIZE: f32 = 22.0;
+/// Selected in-slot title size (larger than [`H_TITLE_SIZE`]).
+pub const H_TITLE_SELECTED_SIZE: f32 = 28.0;
+/// Selected titles render bold, which runs slightly wider than regular at the
+/// same point size. The wrap width carries this fudge so the selection keeps
+/// the neighbor's line breaks instead of spilling an extra word per line.
+pub const H_TITLE_BOLD_FUDGE: f32 = 1.06;
 /// Reserved height for the horizontal in-slot text (every slot's title + meta).
 ///
-/// Budget (1.3x line height): title 22px (28.6) + 6 + two meta lines at 14px
-/// (38.4 incl. spacing 2) + 6 + update badge (~21) = ~100. The selection
-/// carries it too: its title rides **inside** the slot like every other
-/// cover, so titles animate with the card instead of in a separate
+/// Budget (1.3x line height): two-line selected title at 28px (72.8) + 6 +
+/// two meta lines at 16px (43.6 incl. spacing 2) + 6 + update badge (~21) =
+/// ~150. Neighbor titles (22px) fit the same budget with room to spare. The
+/// selection carries it too: its title rides **inside** the slot like every
+/// other cover, so titles animate with the card instead of in a separate
 /// full-width crossfade layer. [`slot_child_size_h`] adds it to every
 /// slot box and [`metrics_for_width`] reserves it under the shared art
 /// centerline (art is anchored at the strip top — see [`slot_y_offset_h`]).
-pub const H_TEXT_RESERVE: f32 = 100.0;
+pub const H_TEXT_RESERVE: f32 = 150.0;
 /// Top clearance kept above the horizontal strip (clock capsule + art-row drop).
 ///
 /// Sizing only: the layout anchors the ART ROW (not the strip block)
@@ -72,8 +97,10 @@ pub const H_TOP_PAD: f32 = 44.0;
 /// capsule only needs to fit art + in-slot text — without this reserve the
 /// room the removed full-width title layer used to claim would inflate every
 /// capsule instead of becoming breathing room, and the row would read
-/// cramped against the rail.
-const H_ROW_BREATHING_ROOM: f32 = 140.0;
+/// cramped against the rail. Sized so `h_text_budget + breathing` stays
+/// constant when the text reserve grows for wrapped two-line titles: cover
+/// size holds steady instead of shrinking into the new budget.
+const H_ROW_BREATHING_ROOM: f32 = 90.0;
 /// Minimum gap from the strip bottom (in-slot titles) to the position rail top.
 ///
 /// Matches the slack the old block-centering left (~18px at 1080p); the
@@ -96,6 +123,86 @@ pub fn horizontal_block_lead(
 ) -> f32 {
     let slack = (region_h - top_pad - block_h - min_bar_gap).max(0.0);
     top_pad + slack * 0.5 + (text_h * 0.5).min(slack * 0.5)
+}
+
+/// Wrap width for a horizontal in-slot title.
+///
+/// Neighbor titles span exactly their rest art width
+/// (`center_w * SCALE_AT_1`); the selection's bounds expand proportionally to
+/// its larger (bold) type — `width / size` stays constant — so both wrap to
+/// the same line breaks (e.g. "Control Ultimate Edition" keeps 'Edition' on
+/// the second line either way). Fixed reference widths (not the live
+/// fractional `art_w`) so the breaks never reflow mid-scroll, and always
+/// narrower than the slot stride so adjacent titles cannot overlap.
+pub fn h_title_wrap_width(center_w: f32, selected: bool) -> f32 {
+    h_title_wrap_width_at(center_w, if selected { 0.0 } else { 1.0 })
+}
+
+/// Selectionness of a slot from its fractional scroll distance: 1 at the
+/// center, 0 at / past the first neighbor. Drives the continuous title-size /
+/// wrap-width / color glide so text animates with the art instead of popping
+/// on the first frame (a `selected: bool` flips instantly while the strip
+/// eases over [`STRIP_ANIM_MS`]).
+pub fn title_selectionness(distance: f32) -> f32 {
+    (1.0 - distance.abs().clamp(0.0, 1.0)).clamp(0.0, 1.0)
+}
+
+/// Selectionness of a horizontal slot (see [`title_selectionness`]).
+pub fn h_title_selectionness(distance: f32) -> f32 {
+    title_selectionness(distance)
+}
+
+/// Interpolated in-slot title size for a fractional scroll distance.
+pub fn h_title_size_at(distance: f32) -> f32 {
+    let t = h_title_selectionness(distance);
+    H_TITLE_SIZE + (H_TITLE_SELECTED_SIZE - H_TITLE_SIZE) * t
+}
+
+/// Interpolated wrap width for a fractional scroll distance.
+///
+/// Tracks [`h_title_size_at`] proportionally (plus the bold-fudge ramp) so
+/// `width / size` stays on the same wrap from neighbor through mid-scroll to
+/// selected — no reflow pop while the strip eases.
+pub fn h_title_wrap_width_at(center_w: f32, distance: f32) -> f32 {
+    let t = h_title_selectionness(distance);
+    let neighbor_w = center_w * SCALE_AT_1;
+    let size = h_title_size_at(distance);
+    (neighbor_w * (size / H_TITLE_SIZE) * (1.0 + (H_TITLE_BOLD_FUDGE - 1.0) * t))
+        .min(center_w * SELECTED_SCALE)
+}
+
+/// Interpolated meta size under a horizontal title (14 neighbor → 16 selected).
+pub fn h_meta_size_at(distance: f32) -> f32 {
+    14.0 + 2.0 * h_title_selectionness(distance)
+}
+
+/// Interpolated side-column title size for a fractional scroll distance
+/// (portrait mode): 22 at / past the first neighbor, 39 at the center.
+pub fn v_title_size_at(distance: f32) -> f32 {
+    let t = title_selectionness(distance);
+    V_TITLE_SIZE + (V_TITLE_SELECTED_SIZE - V_TITLE_SIZE) * t
+}
+
+/// Interpolated side-column title text width (inside [`V_TITLE_PAD`]) for a
+/// fractional scroll distance.
+///
+/// The neighbor width is exactly today's net column (`TITLE_COL` minus
+/// padding), so resting neighbors wrap where they always have; the selection's
+/// bounds expand proportionally to its larger (bold) type so both keep the
+/// same line breaks through mid-scroll — the portrait mirror of
+/// [`h_title_wrap_width_at`].
+pub fn v_title_text_width_at(distance: f32) -> f32 {
+    let t = title_selectionness(distance);
+    let neighbor_w = TITLE_COL - V_TITLE_PAD;
+    neighbor_w * (v_title_size_at(distance) / V_TITLE_SIZE) * (1.0 + (V_TITLE_BOLD_FUDGE - 1.0) * t)
+}
+
+/// Full side-column width (text + padding) for slot geometry at `distance`.
+/// Neighbors keep [`TITLE_COL`]; the selection widens to hold its same-wrap
+/// bounds, extending right into free backdrop space (rows stack vertically,
+/// so no neighbor can collide).
+pub fn v_title_col_at(distance: f32) -> f32 {
+    v_title_text_width_at(distance) + V_TITLE_PAD
 }
 
 /// Resolution-derived strip geometry for layout + slot art sizing.
@@ -207,7 +314,7 @@ pub fn metrics_for_height(stage_h: f32) -> StripMetrics {
         center_h,
         selected_scale: SELECTED_SCALE,
         stride,
-        slot_w: center_w * SELECTED_SCALE + TITLE_COL,
+        slot_w: center_w * SELECTED_SCALE + v_title_col_at(0.0),
         slot_h: center_h,
         h_text_budget: H_TEXT_GAP + H_TEXT_RESERVE,
     }
@@ -318,14 +425,19 @@ pub fn arc_offset_x(distance: f32) -> f32 {
 
 /// Layout box for a strip child at `distance`.
 ///
-/// Capsule height/width follow [`scale_at_distance`]; the title column stays
-/// [`TITLE_COL`] so outer peeks (`|d| = 2`) do not force needless wraps.
+/// Capsule height/width follow [`scale_at_distance`]; the title column glides
+/// from [`TITLE_COL`] (neighbors and outer peeks, so `|d| = 2` never forces
+/// needless wraps) to the selection's wider same-wrap bounds (see
+/// [`v_title_col_at`]).
 pub fn slot_child_size(metrics: &StripMetrics, distance: f32) -> Size {
     let scale = scale_at_distance(distance);
     let max_art_w = metrics.center_w * metrics.selected_scale;
     let art_w = metrics.center_w * scale;
     let inset = ((max_art_w - art_w) * 0.5).max(0.0);
-    Size::new(inset + art_w + TITLE_COL, metrics.center_h * scale)
+    Size::new(
+        inset + art_w + v_title_col_at(distance),
+        metrics.center_h * scale,
+    )
 }
 
 /// Layout box for a horizontal strip child at `distance`.
@@ -995,14 +1107,93 @@ mod tests {
                 "d={d} art={art_h} child={child}"
             );
         }
-        // Text reserve fits the measured worst case (22px title + two 14px meta
-        // lines + the Update badge) so meta presence never pushes the row.
-        let text_lines = 22.0 * 1.3 + 6.0 + (14.0 * 1.3 * 2.0 + 2.0) + 6.0 + 21.0;
+        // Text reserve fits the measured worst case (two-line 28px selected
+        // title + two 16px meta lines + the Update badge) so meta presence
+        // never pushes the row. Neighbor single-line 22px titles fit with room.
+        let text_lines =
+            H_TITLE_SELECTED_SIZE * 1.3 * 2.0 + 6.0 + (16.0 * 1.3 * 2.0 + 2.0) + 6.0 + 21.0;
         assert!(
             H_TEXT_RESERVE >= text_lines - 0.5,
             "reserve={} need={text_lines}",
             H_TEXT_RESERVE
         );
+    }
+
+    #[test]
+    fn horizontal_title_wrap_keeps_same_breaks() {
+        // The selection's bounds expand proportionally to its larger (bold)
+        // type so `width / size` stays constant and line breaks never shift
+        // between neighbor and selected (e.g. "Control Ultimate Edition"
+        // keeps 'Edition' on the second line either way).
+        let center_w = 220.0;
+        let neighbor_w = h_title_wrap_width(center_w, false);
+        let selected_w = h_title_wrap_width(center_w, true);
+        // Neighbor spans exactly its rest art width.
+        assert!((neighbor_w - center_w * SCALE_AT_1).abs() < 0.01);
+        // Selected expands, but stays inside its own (widest) art.
+        assert!(selected_w > neighbor_w);
+        assert!(selected_w <= center_w * SELECTED_SCALE + 0.01);
+        // Same wrap: width per point-size matches modulo the bold fudge.
+        let neighbor_per_pt = neighbor_w / H_TITLE_SIZE;
+        let selected_per_pt = selected_w / (H_TITLE_SELECTED_SIZE * H_TITLE_BOLD_FUDGE);
+        assert!(
+            (neighbor_per_pt - selected_per_pt).abs() < 0.01,
+            "neighbor={neighbor_per_pt} selected={selected_per_pt}"
+        );
+        // Adjacent titles cannot overlap: half-widths fit the first stride
+        // with the edge gap to spare.
+        let stride = unit_stride(0.0, center_w);
+        assert!(
+            (selected_w + neighbor_w) * 0.5 < stride,
+            "ws={selected_w} wn={neighbor_w} stride={stride}"
+        );
+        // Fixed reference widths: independent of the live fractional scale,
+        // so breaks never reflow mid-scroll.
+        let m = metrics_for_width(1920.0, 1080.0);
+        assert!((h_title_wrap_width(m.center_w, false) - m.center_w * SCALE_AT_1).abs() < 0.01);
+    }
+
+    #[test]
+    fn horizontal_title_size_glides_with_scroll() {
+        // Regression: title size/weight/wrap used `selected: bool` and popped
+        // on the first frame while art eased over STRIP_ANIM_MS. Now every
+        // text attribute rides the fractional `dist` like scale/fade do.
+        assert!((h_title_selectionness(0.0) - 1.0).abs() < 0.001);
+        assert!((h_title_selectionness(1.0) - 0.0).abs() < 0.001);
+        assert!((h_title_selectionness(-1.0) - 0.0).abs() < 0.001);
+        assert!((h_title_selectionness(0.5) - 0.5).abs() < 0.001);
+        assert!((h_title_selectionness(2.0) - 0.0).abs() < 0.001);
+        // Endpoints match the bool helper.
+        let center_w = 220.0;
+        assert!((h_title_size_at(0.0) - H_TITLE_SELECTED_SIZE).abs() < 0.001);
+        assert!((h_title_size_at(1.0) - H_TITLE_SIZE).abs() < 0.001);
+        assert!(
+            (h_title_wrap_width_at(center_w, 0.0) - h_title_wrap_width(center_w, true)).abs()
+                < 0.01
+        );
+        assert!(
+            (h_title_wrap_width_at(center_w, 1.0) - h_title_wrap_width(center_w, false)).abs()
+                < 0.01
+        );
+        // Mid-scroll interpolates and keeps the same wrap ratio (width per
+        // point-size ramps only by the bold fudge, like the endpoints).
+        let mid_size = h_title_size_at(0.5);
+        assert!(mid_size > H_TITLE_SIZE && mid_size < H_TITLE_SELECTED_SIZE);
+        let mid_w = h_title_wrap_width_at(center_w, 0.5);
+        assert!(mid_w > center_w * SCALE_AT_1 && mid_w < h_title_wrap_width(center_w, true));
+        for d in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            let t = h_title_selectionness(d);
+            let size = h_title_size_at(d);
+            let w = h_title_wrap_width_at(center_w, d);
+            let per_pt = w / (size * (1.0 + (H_TITLE_BOLD_FUDGE - 1.0) * t));
+            let neighbor_per_pt = (center_w * SCALE_AT_1) / H_TITLE_SIZE;
+            assert!(
+                (per_pt - neighbor_per_pt).abs() < 0.02,
+                "d={d} per_pt={per_pt}"
+            );
+        }
+        assert!((h_meta_size_at(0.0) - 16.0).abs() < 0.001);
+        assert!((h_meta_size_at(1.0) - 14.0).abs() < 0.001);
     }
 
     #[test]
@@ -1074,12 +1265,48 @@ mod tests {
         let art_w = m.center_w * scale;
         let inset = ((max_art_w - art_w) * 0.5).max(0.0);
         let title_w = d2.width - inset - art_w;
+        // Outer peeks keep the full neighbor column (never shrink it).
         assert!((title_w - TITLE_COL).abs() < 0.01);
-        assert!(d2.width > m.slot_w * SCALE_AT_2 + 1.0);
+        // The selection owns the wider same-wrap column, and the strip is
+        // exactly its box.
+        assert!(v_title_col_at(0.0) > TITLE_COL);
         assert!((slot_child_size(&m, 0.0).width - m.slot_w).abs() < 0.01);
+        assert!((m.slot_w - (max_art_w + v_title_col_at(0.0))).abs() < 0.01);
         for d in [0.0_f32, 1.0, 2.0] {
             let row = slot_child_size(&m, d);
             assert!(arc_offset_x(d) + row.width <= m.slot_w + 0.01);
+        }
+    }
+
+    #[test]
+    fn vertical_title_wrap_keeps_same_breaks() {
+        // Portrait mirror of the horizontal same-wrap guarantee: the neighbor
+        // text width is exactly today's net column, and the selection's bounds
+        // expand proportionally to its larger (bold) type.
+        let neighbor_w = v_title_text_width_at(1.0);
+        assert!((neighbor_w - (TITLE_COL - V_TITLE_PAD)).abs() < 0.01);
+        let selected_w = v_title_text_width_at(0.0);
+        assert!(selected_w > neighbor_w);
+        let neighbor_per_pt = neighbor_w / V_TITLE_SIZE;
+        let selected_per_pt = selected_w / (V_TITLE_SELECTED_SIZE * V_TITLE_BOLD_FUDGE);
+        assert!(
+            (neighbor_per_pt - selected_per_pt).abs() < 0.01,
+            "neighbor={neighbor_per_pt} selected={selected_per_pt}"
+        );
+        assert!((v_title_size_at(0.0) - V_TITLE_SELECTED_SIZE).abs() < 0.001);
+        assert!((v_title_size_at(1.0) - V_TITLE_SIZE).abs() < 0.001);
+        assert!((v_title_size_at(2.0) - V_TITLE_SIZE).abs() < 0.001);
+        // Mid-scroll interpolates with the same wrap ratio (plus the bold
+        // ramp), so breaks never reflow while the strip eases.
+        let mid_size = v_title_size_at(0.5);
+        assert!(mid_size > V_TITLE_SIZE && mid_size < V_TITLE_SELECTED_SIZE);
+        for d in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            let t = title_selectionness(d);
+            let size = v_title_size_at(d);
+            let w = v_title_text_width_at(d);
+            let per_pt = w / (size * (1.0 + (V_TITLE_BOLD_FUDGE - 1.0) * t));
+            let expected = (TITLE_COL - V_TITLE_PAD) / V_TITLE_SIZE;
+            assert!((per_pt - expected).abs() < 0.02, "d={d} per_pt={per_pt}");
         }
     }
 }
