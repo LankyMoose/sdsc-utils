@@ -1259,14 +1259,21 @@ impl State {
         let sections = games_row_sections(self);
         let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
             + separator_offset_above(&sections, self.game_selected);
+        let viewport = self.scrolls.viewport(StartListId::Games);
         let y = scroll_y_center_top(
             row_top,
             ROW_HEIGHT,
             self.scrolls.offset(StartListId::Games),
-            self.scrolls.viewport(StartListId::Games),
+            viewport,
             false,
         )?;
-        Some((StartListId::Games.scroll_id(), y))
+        // Clamp to the real content range: iced silently clamps an
+        // overshooting target, leaving the tracker holding a phantom offset
+        // that reads as a late snap when re-issued.
+        Some((
+            StartListId::Games.scroll_id(),
+            y.min(self.games_max_scroll(viewport)),
+        ))
     }
 
     /// Always scroll so the games selection is as centered as the list allows.
@@ -1280,14 +1287,63 @@ impl State {
         let sections = games_row_sections(self);
         let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
             + separator_offset_above(&sections, self.game_selected);
+        let viewport = self.scrolls.viewport(StartListId::Games);
         let y = scroll_y_center_top(
             row_top,
             ROW_HEIGHT,
             self.scrolls.offset(StartListId::Games),
-            self.scrolls.viewport(StartListId::Games),
+            viewport,
             true,
         )?;
-        Some((StartListId::Games.scroll_id(), y))
+        Some((
+            StartListId::Games.scroll_id(),
+            y.min(self.games_max_scroll(viewport)),
+        ))
+    }
+
+    /// Max scroll offset for the compact games list (content minus viewport,
+    /// floored) under the given viewport (same estimate fallback as the
+    /// reveal math when iced has not reported bounds yet).
+    pub(crate) fn games_max_scroll(&self, viewport_h: f32) -> f32 {
+        let viewport_h = if viewport_h <= 1.0 {
+            estimated_list_viewport_h()
+        } else {
+            viewport_h
+        };
+        let rows = self.rows.len();
+        if rows == 0 {
+            return 0.0;
+        }
+        let sections = games_row_sections(self);
+        let seps = sections.windows(2).filter(|w| w[0] != w[1]).count();
+        let content = rows as f32 * ROW_HEIGHT
+            + seps as f32 * SECTION_SEP_H
+            + rows.saturating_add(seps).saturating_sub(1) as f32 * ROW_GAP;
+        (content - viewport_h).max(0.0)
+    }
+
+    /// Demote-reveal geometry for `ui-diag`: (selected, rows, row_top,
+    /// raw reported viewport, computed center target). Settle logs this and
+    /// completion logs it again — a drift in viewport or row_top between the
+    /// two is the snap's signature.
+    pub(crate) fn games_reveal_debug(&self) -> Option<(usize, usize, f32, f32, f32)> {
+        if self.slide != StartSlide::Games
+            || self.rows.is_empty()
+            || self.game_selected >= self.rows.len()
+        {
+            return None;
+        }
+        let sections = games_row_sections(self);
+        let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
+            + separator_offset_above(&sections, self.game_selected);
+        let (_, y) = self.selection_scroll_y_center_prefer()?;
+        Some((
+            self.game_selected,
+            self.rows.len(),
+            row_top,
+            self.scrolls.viewport(StartListId::Games),
+            y,
+        ))
     }
 
     /// Scroll target that makes the current slide's selection visible on open.
@@ -6738,6 +6794,42 @@ mod tests {
         let y = scroll_y_center_top(1.0 * stride, ROW_HEIGHT, 0.0, 300.0, true).unwrap();
         let expected = (1.0_f32 * stride - (300.0 - ROW_HEIGHT) / 2.0).max(0.0);
         assert!((y - expected).abs() < 0.1);
+    }
+
+    #[test]
+    fn center_prefer_clamps_to_content_max() {
+        // 20 same-letter rows: no separators, content = 20*104 + 19*8.
+        let mut state = State {
+            rows: (0..20)
+                .map(|i| game_row_with(&format!("same{i}")))
+                .collect(),
+            ..State::default()
+        };
+        state.record_list_scroll(StartListId::Games, 0.0, 400.0);
+        let content = 20.0 * ROW_HEIGHT + 19.0 * ROW_GAP;
+        let max = content - 400.0;
+        // Mid list: raw center stands.
+        state.game_selected = 5;
+        let (_, y) = state.selection_scroll_y_center_prefer().unwrap();
+        assert!((y - (5.0 * (ROW_HEIGHT + ROW_GAP) - (400.0 - ROW_HEIGHT) / 2.0)).abs() < 0.1);
+        assert!(y < max);
+        // Near the end the raw center overshoots: clamp to max (what iced
+        // would silently clamp to, desyncing the tracker).
+        state.game_selected = 19;
+        let (_, y) = state.selection_scroll_y_center_prefer().unwrap();
+        assert!((y - max).abs() < 0.1);
+    }
+
+    #[test]
+    fn center_prefer_short_list_clamps_to_zero() {
+        let mut state = State {
+            rows: vec![game_row_with("solo-a"), game_row_with("solo-b")],
+            ..State::default()
+        };
+        state.record_list_scroll(StartListId::Games, 0.0, 400.0);
+        state.game_selected = 1;
+        let (_, y) = state.selection_scroll_y_center_prefer().unwrap();
+        assert!((y - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]

@@ -4808,11 +4808,23 @@ impl App {
                     "ui-diag: start immersive transition phase={} done",
                     phase.label()
                 ));
-                // Center backstop: the deferred settle scroll usually landed
-                // it invisibly one tick after settle; this only fires when
-                // that op dropped, landing the correct final state (centered,
-                // never bottom-pinned) even if visibly.
-                Some(self.scroll_start_selection_for_open())
+                // Center backstop, conditional: the deferred + mount
+                // corrections usually landed it invisibly behind the veil. A
+                // match issues nothing, so a correct reveal can never snap
+                // here; a real mismatch still lands centered (visibly, but
+                // correctly) and the log line marks it.
+                if let Some((id, target)) = self.start_state.open_reveal_scroll() {
+                    let offset = start_view::StartListId::from_scroll_id(&id)
+                        .map(|list| self.start_state.list_offset(list))
+                        .unwrap_or(target);
+                    if (target - offset).abs() > 2.0 {
+                        crate::controller::hid::diag::diag_info(format!(
+                            "ui-diag: start demote reveal backstop offset={offset:.0} target={target:.0}"
+                        ));
+                        return Some(self.scroll_start_selection_for_open());
+                    }
+                }
+                None
             }
             start_mode::TransitionPhase::Resizing => None,
         }
@@ -4963,6 +4975,11 @@ impl App {
             // EnterCompact completion re-centers as backstop.
             let immediate = self.scroll_start_selection_for_open();
             self.stow_deferred_settle_scroll();
+            if let Some((sel, rows, row_top, vh, y)) = self.start_state.games_reveal_debug() {
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start demote reveal settle sel={sel} rows={rows} row_top={row_top:.0} vh={vh:.0} y={y:.0}"
+                ));
+            }
             snap.chain(focus).chain(immediate)
         }
     }
@@ -4980,12 +4997,28 @@ impl App {
         }
     }
 
-    /// Issue a stowed settle scroll once, then drop it.
+    /// Issue the stowed settle scroll once, then drop it. Recomputes at fire
+    /// time: the remount's first `on_scroll` may have reported the real
+    /// viewport since settle, and centering against a stale/estimate viewport
+    /// lands off-center (visible as a snap when the completion backstop
+    /// re-issues it after the lift). Falls back to the stowed target when
+    /// nothing is computable.
     fn take_deferred_settle_scroll(&mut self) -> Option<Task<Message>> {
-        let (list, y) = self.deferred_settle_scroll.take()?;
+        let (list, stowed_y) = self.deferred_settle_scroll.take()?;
         if !self.start_visible {
             return None;
         }
+        let y = match self.start_state.open_reveal_scroll() {
+            Some((id, y)) if start_view::StartListId::from_scroll_id(&id) == Some(list) => y,
+            _ => stowed_y,
+        };
+        if (y - stowed_y).abs() > 0.5 {
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start demote reveal deferred list={list:?} vh={:.0} y={y:.0} (stowed {stowed_y:.0})",
+                self.start_state.list_viewport(list)
+            ));
+        }
+        self.start_state.note_scroll_y(&list.scroll_id(), y);
         Some(operation::scroll_to(
             list.scroll_id(),
             operation::AbsoluteOffset {
@@ -5543,6 +5576,18 @@ impl App {
             StartMessage::GamesScrolled(y, viewport_h) => {
                 self.start_state
                     .record_list_scroll(start_view::StartListId::Games, y, viewport_h);
+                // Demote remount correction: fresh reports carry the real
+                // viewport (settle math may have used a stale/estimate one).
+                // Re-land the center invisibly behind the enter veil instead
+                // of snapping at lift end. Nav is blocked while the phase is
+                // live, so reports here are mount/scroll_to echoes, never
+                // user browsing.
+                if matches!(
+                    self.start_state.transition_phase.map(|(p, _)| p),
+                    Some(start_mode::TransitionPhase::EnterCompact)
+                ) {
+                    return self.correct_demoted_games_reveal(y);
+                }
                 Task::none()
             }
             StartMessage::ControllersScrolled(y, viewport_h) => {
@@ -5819,6 +5864,29 @@ impl App {
             operation::AbsoluteOffset {
                 x: None,
                 y: Some(y),
+            },
+        )
+    }
+
+    /// Re-issue the demote center when a fresh mount report disagrees with it.
+    /// Converges in one step: the correction's own echo reports the target
+    /// back, inside tolerance, and no further op issues.
+    fn correct_demoted_games_reveal(&mut self, reported_y: f32) -> Task<Message> {
+        let Some((id, target)) = self.start_state.selection_scroll_y_center_prefer() else {
+            return Task::none();
+        };
+        if (target - reported_y).abs() <= 2.0 {
+            return Task::none();
+        }
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start demote reveal correct reported={reported_y:.0} target={target:.0}"
+        ));
+        self.start_state.note_scroll_y(&id, target);
+        operation::scroll_to(
+            id,
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(target),
             },
         )
     }
