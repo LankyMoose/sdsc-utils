@@ -277,6 +277,17 @@ pub struct Prefs {
     /// Start-screen movement animations (default follows the OS toggle).
     #[serde(default)]
     pub reduced_motion: ReducedMotion,
+    /// Throttle immersive Start to anim-driven frames only (default off = always 60Hz).
+    /// When on, an idle immersive Start subscribes to no `StartFrame` tick;
+    /// backdrop ken-burns freeze until input/nav/art wakes frames.
+    #[serde(default)]
+    pub perf_throttle_immersive: bool,
+    /// Renderer antialiasing (default on). Boot-only: applies on restart.
+    #[serde(default = "default_true")]
+    pub perf_antialiasing: bool,
+    /// Vsync present mode (default on). Boot-only: applies on restart.
+    #[serde(default = "default_true")]
+    pub perf_vsync: bool,
     #[serde(default)]
     pub extra_steam_paths: Vec<std::path::PathBuf>,
 }
@@ -400,6 +411,17 @@ pub fn clamp_start_screen_idle_timeouts(idle_secs: u32, sleep_secs: u32) -> (u32
     (idle, sleep)
 }
 
+/// True when the live renderer prefs differ from the boot values, i.e. the UI
+/// must reload to apply them (AA/vsync are boot-only iced settings).
+pub fn renderer_restart_needed(
+    cur_aa: bool,
+    cur_vsync: bool,
+    boot_aa: bool,
+    boot_vsync: bool,
+) -> bool {
+    cur_aa != boot_aa || cur_vsync != boot_vsync
+}
+
 impl Default for Prefs {
     fn default() -> Self {
         Self {
@@ -429,6 +451,9 @@ impl Default for Prefs {
             start_screen_immersive_layout: ImmersiveLayout::default(),
             start_screen_navbar: NavbarVisibility::default(),
             reduced_motion: ReducedMotion::default(),
+            perf_throttle_immersive: false,
+            perf_antialiasing: true,
+            perf_vsync: true,
             extra_steam_paths: Vec::new(),
         }
     }
@@ -965,5 +990,39 @@ mod tests {
             let decoded: ReducedMotion = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, mode);
         }
+    }
+
+    #[test]
+    fn perf_prefs_round_trip() {
+        let prefs = Prefs {
+            perf_throttle_immersive: true,
+            perf_antialiasing: false,
+            perf_vsync: false,
+            ..Prefs::default()
+        };
+        let encoded = serde_json::to_string(&prefs).unwrap();
+        let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
+        assert!(decoded.perf_throttle_immersive);
+        assert!(!decoded.perf_antialiasing);
+        assert!(!decoded.perf_vsync);
+    }
+
+    #[test]
+    fn older_prefs_default_perf_flags() {
+        let prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(!prefs.perf_throttle_immersive);
+        assert!(prefs.perf_antialiasing);
+        assert!(prefs.perf_vsync);
+        assert!(!Prefs::default().perf_throttle_immersive);
+        assert!(Prefs::default().perf_antialiasing);
+        assert!(Prefs::default().perf_vsync);
+    }
+
+    #[test]
+    fn renderer_restart_needed_only_on_boot_mismatch() {
+        assert!(!renderer_restart_needed(true, true, true, true));
+        assert!(renderer_restart_needed(false, true, true, true));
+        assert!(renderer_restart_needed(true, false, true, true));
+        assert!(renderer_restart_needed(false, false, true, true));
     }
 }

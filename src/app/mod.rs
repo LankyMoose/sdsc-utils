@@ -30,6 +30,7 @@ use crate::persist::prefs::{
     NavbarVisibility, Prefs, ReducedMotion, StartAutoOpen, clamp_low_battery_percent,
     clamp_start_screen_haptics_strength, clamp_start_screen_idle_timeouts,
     clamp_start_screen_inactive_dim_percent, clamp_start_screen_sound_volume,
+    renderer_restart_needed,
 };
 use crate::platform::app_log;
 #[cfg(windows)]
@@ -101,6 +102,13 @@ const PAD_POLL_ACTIVE: Duration = Duration::from_millis(4);
 /// UI animation tick (~60Hz). Prefer this over `window::frames()` so an
 /// AlwaysOnTop toast cannot starve other iced windows on Windows (iced#3108).
 const UI_TICK: Duration = Duration::from_millis(16);
+/// Feedback delay between the reload click (button flips to "Reloading…")
+/// and the actual shell exit.
+const RELOAD_FEEDBACK_DELAY: Duration = Duration::from_millis(700);
+/// How long a restore stays in its settle window after relaunch: row
+/// rebuilds re-pin the persisted selection by key instead of trusting the
+/// index-clamped position (see scan-done). Never used for offsets.
+const SCROLL_RESTORE_AUTHORITY: Duration = Duration::from_secs(30);
 /// Process/catalog running checks are expensive; never run them at pad-poll rate.
 const RUNNING_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const PAD_POLL_STALL_MS: u128 = 80;
@@ -210,6 +218,10 @@ pub enum Message {
     ToastFrame,
     /// Redraw the controller popup while an Identify ring flash is running.
     IdentifyFrame,
+    /// Drive the reload-button spinner while a renderer reload is queued.
+    RendererReloadTick,
+    /// Fire the queued renderer reload (short feedback delay after the click).
+    RendererReloadDue,
     /// Slow utility-ambient drift tick (≤2fps, only while a utility window is
     /// visible — popup, Settings, or non-immersive Start). Toasts excluded.
     UtilityAmbientTick,
@@ -222,6 +234,103 @@ pub enum Message {
     SpectrumCommit(u64),
 
     Exit,
+}
+
+impl Message {
+    /// True for user-originated input: pad, mouse, keyboard, tray, and file
+    /// pickers. While a renderer reload is queued, `update()` drops these so
+    /// nothing can act in the feedback window before exit.
+    ///
+    /// Deliberately exhaustive (no wildcard): a new variant fails to compile
+    /// here until it is classified as input or system. Ticks, background
+    /// results, window lifecycle, and service convergence are system.
+    ///
+    /// Tray Quit is NOT input: quitting cancels the reload and must always
+    /// work (the service-quit path funnels through `Shutdown`, which clears
+    /// the restore record the same way).
+    fn is_user_input(&self) -> bool {
+        match self {
+            Message::Tick => false,
+            #[cfg(debug_assertions)]
+            Message::EmulatorCommitTick => false,
+            Message::PollResult(_) | Message::ProcessEnumResult(_) | Message::CloseGameDone(_) => {
+                false
+            }
+            Message::TrayMenu(id) => id.as_str() != QUIT_ID,
+            Message::TrayLeftClick(_) => true,
+            Message::WindowClosed(_)
+            | Message::WindowUnfocused(_)
+            | Message::PopupOpened(_)
+            | Message::PlacePopup { .. }
+            | Message::ConfigureOpened(_)
+            | Message::StartOpened(_)
+            | Message::StartFrame
+            | Message::StartArtEvent(_)
+            | Message::StartImmersiveSettled => false,
+            Message::Popup(_)
+            | Message::Configure(_)
+            | Message::Start(_)
+            | Message::StartCursorActivity(_)
+            | Message::PadInput(_) => true,
+            Message::StartKey { .. } => true,
+            Message::ClientIpcSync => false,
+            Message::Service(msg) => service_message_is_input(msg),
+            Message::ManualFilePicked(_)
+            | Message::ManualIconPicked(_)
+            | Message::SteamPathPicked(_) => true,
+            Message::SteamScanDone(_)
+            | Message::SteamScanIdleFallback
+            | Message::SteamScanAfterSettle => false,
+            #[cfg(debug_assertions)]
+            Message::StressWindows(_) => true,
+            #[cfg(debug_assertions)]
+            Message::DebugOpen(_) => true,
+            #[cfg(debug_assertions)]
+            Message::ToggleDebugLayoutBounds => true,
+            Message::PlaceToast { .. }
+            | Message::ToastShown { .. }
+            | Message::ToastFrame
+            | Message::IdentifyFrame
+            | Message::RendererReloadTick
+            | Message::RendererReloadDue
+            | Message::UtilityAmbientTick
+            | Message::ToastDismiss(_)
+            | Message::ToastHideDeferred
+            | Message::SpectrumCommit(_) => false,
+            Message::Exit => false,
+        }
+    }
+}
+
+/// True for service-originated messages that stem from user input and must be
+/// dropped while a renderer reload is queued. Session convergence (snapshot,
+/// notifications, persistence, tray sync) flows untouched; `Shutdown` flows
+/// and cancels the reload via the record cleanup there.
+fn service_message_is_input(msg: &crate::ipc::ServiceMessage) -> bool {
+    use crate::ipc::ServiceMessage;
+    use crate::session::SessionEffect;
+    match msg {
+        ServiceMessage::PadInput(_) => true,
+        ServiceMessage::TrayOpenPopup { .. } | ServiceMessage::TrayOpenSettings => true,
+        // Only the Start-visibility effects originate from user/gesture input
+        // (reopen chord, auto-open policy on presence change). The rest is
+        // background session convergence.
+        ServiceMessage::Effects(effects) => effects.iter().any(|effect| {
+            matches!(
+                effect,
+                SessionEffect::OpenStart
+                    | SessionEffect::CloseStart
+                    | SessionEffect::ClearStartLatch
+            )
+        }),
+        ServiceMessage::Shutdown
+        | ServiceMessage::Notifications { .. }
+        | ServiceMessage::Version { .. }
+        | ServiceMessage::Snapshot(_)
+        | ServiceMessage::Ack
+        | ServiceMessage::ControllerList(_)
+        | ServiceMessage::LightbarSet { .. } => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,6 +470,35 @@ pub struct App {
     snapshot_sync_pending: bool,
     /// Snapshot-pull attempts sent so far (stops at [`SNAPSHOT_SYNC_RETRIES`]).
     snapshot_sync_attempts: u8,
+    /// Renderer prefs at boot (AA/vsync are boot-only iced settings).
+    renderer_boot_aa: bool,
+    renderer_boot_vsync: bool,
+    /// True while exiting for a renderer-pref reload (keeps the restore
+    /// record; plain Quit clears it so a relaunch starts clean).
+    restarting_for_renderer: bool,
+    /// Reload button pressed, restart due after a short feedback delay.
+    /// Disables the button and spins both reload buttons until exit.
+    renderer_reload_queued: bool,
+    /// One-shot immersive override for the next `open_start_screen` (reload
+    /// restore reopens the pre-restart presentation even when the
+    /// always-immersive pref would open compact).
+    force_immersive_open: Option<bool>,
+    /// One-shot nav-reset bypass for the next `open_start_screen`. Reload
+    /// restore sets all UI state (drawer, scrolls, selections) BEFORE
+    /// opening; the open path must not `reset_to_games()` it away.
+    restore_preserve_nav: bool,
+    /// Saved list offsets (games / controllers / settings drawer) to re-apply
+    /// on `StartOpened`, when the scrollables exist. One-shot per window
+    /// open and never re-asserted: once rows rebuild, offsets go stale and
+    /// only the persisted selection stays authoritative. The drawer offset
+    /// applies once here; the drawer is row-independent, so scans and
+    /// snapshots must leave it alone.
+    pending_scroll_restore: Option<(f32, f32, f32)>,
+    /// Settle window after a restore during which row rebuilds re-pin the
+    /// persisted selection by key (see `SCROLL_RESTORE_AUTHORITY`).
+    scroll_restore_until: Option<Instant>,
+    /// Saved Configure content offset, applied once on `ConfigureOpened`.
+    pending_configure_scroll: Option<f32>,
 
     toast_window: Option<window::Id>,
     toast_message: Option<ToastMessage>,
@@ -470,6 +608,15 @@ pub fn run_shell_client() -> Result<(), Box<dyn std::error::Error>> {
 fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     crate::platform::wgpu_diag::log_adapters_at_boot();
 
+    // Boot-only renderer prefs: iced `Settings` cannot flip at runtime, so the
+    // shell reads them before the daemon builds. `App::boot` re-loads the same
+    // file for session state; prefs win over any `ICED_PRESENT_MODE` env.
+    let prefs = Prefs::load();
+    let settings = iced::Settings {
+        antialiasing: prefs.perf_antialiasing,
+        vsync: prefs.perf_vsync,
+        ..iced::Settings::default()
+    };
     let boot = || App::boot(false);
 
     iced::daemon(boot, App::update, App::view)
@@ -477,7 +624,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .title(App::title)
         .theme(App::theme)
         .style(App::style)
-        .antialiasing(true)
+        .settings(settings)
         .run()?;
 
     Ok(())
@@ -485,6 +632,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_app_as_client() -> Result<(), Box<dyn std::error::Error>> {
     crate::platform::wgpu_diag::log_adapters_at_boot();
+    let prefs = Prefs::load();
+    let settings = iced::Settings {
+        antialiasing: prefs.perf_antialiasing,
+        vsync: prefs.perf_vsync,
+        ..iced::Settings::default()
+    };
     // Client mode has no local HID owner, so the emulator has nothing to feed.
     let boot = || App::boot(true);
     iced::daemon(boot, App::update, App::view)
@@ -492,7 +645,7 @@ fn run_app_as_client() -> Result<(), Box<dyn std::error::Error>> {
         .title(App::title)
         .theme(App::theme)
         .style(App::style)
-        .antialiasing(true)
+        .settings(settings)
         .run()?;
     Ok(())
 }
@@ -549,6 +702,9 @@ impl App {
             emulate::rehydrate(&remembered)
         };
         let session = crate::session::DeviceSession::new(prefs, known, analytics);
+        // Boot-only renderer prefs (iced Settings); a later change auto-restarts.
+        let (renderer_boot_aa, renderer_boot_vsync) =
+            (session.prefs.perf_antialiasing, session.prefs.perf_vsync);
 
         let last_discovered = hid_worker
             .as_ref()
@@ -624,6 +780,15 @@ impl App {
             snapshot_rev_applied: 0,
             snapshot_sync_pending: false,
             snapshot_sync_attempts: 0,
+            renderer_boot_aa,
+            renderer_boot_vsync,
+            restarting_for_renderer: false,
+            renderer_reload_queued: false,
+            force_immersive_open: None,
+            restore_preserve_nav: false,
+            pending_scroll_restore: None,
+            scroll_restore_until: None,
+            pending_configure_scroll: None,
             toast_window: None,
             toast_message: None,
             toast_queue: VecDeque::new(),
@@ -659,6 +824,12 @@ impl App {
         app.refresh_analytics_panel();
         app.seed_steam_library_from_cache();
 
+        // Renderer-pref restart: reopen to the pre-restart UI state.
+        // Consumed once; stale (>120s) records are ignored by `take()`.
+        let restart_restore = crate::persist::restart_ui::take()
+            .map(|rs| app.apply_restart_ui(rs))
+            .unwrap_or_else(Task::none);
+
         let toast_boot = app
             .ensure_toast_window()
             .chain(app.maybe_show_crash_restart_toast());
@@ -667,7 +838,12 @@ impl App {
             Message::SteamScanIdleFallback
         });
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
-        let mut task = Task::batch([app.request_refresh(), toast_boot, steam_fallback]);
+        let mut task = Task::batch([
+            app.request_refresh(),
+            toast_boot,
+            steam_fallback,
+            restart_restore,
+        ]);
         #[cfg(debug_assertions)]
         if let Ok(spec) = std::env::var(DEBUG_OPEN_ENV) {
             // Let the tray / toast window settle before opening on top of them.
@@ -878,6 +1054,11 @@ impl App {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::ToastFrame));
         }
 
+        // Transient: animate the reload-button spinner until the queued exit.
+        if self.renderer_reload_queued {
+            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::RendererReloadTick));
+        }
+
         if self.popup_state.identify_flash_active()
             || self.start_state.identify_flash_active()
             || (self.popup_window.is_some() && self.popup_state.entrance_active(Instant::now()))
@@ -1011,6 +1192,16 @@ impl App {
             .sync_reduced_motion(crate::ui::motion::reduced_motion_effective(
                 self.session.prefs.reduced_motion,
             ));
+        self.start_state
+            .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
+        // Renderer reload queued: drop all user input (pad / mouse /
+        // keyboard / tray / pickers, shell and service originated) so nothing
+        // can act in the feedback window before exit. Window lifecycle,
+        // ticks, and service convergence flow untouched; Tray Quit still
+        // exits (and cancels the reload).
+        if self.renderer_reload_queued && message.is_user_input() {
+            return Task::none();
+        }
         match message {
             Message::Tick => self.on_tick(),
             #[cfg(debug_assertions)]
@@ -1119,7 +1310,21 @@ impl App {
             }
             Message::Popup(message) => self.on_popup_message(message),
 
-            Message::ConfigureOpened(id) => focus_window(id),
+            Message::ConfigureOpened(id) => {
+                let mut task = focus_window(id);
+                // Renderer-reload restore: re-apply the saved content offset
+                // once, now that the scrollable exists.
+                if let Some(y) = self.pending_configure_scroll.take() {
+                    task = task.chain(operation::scroll_to(
+                        configure_view::content_scroll_id(),
+                        operation::AbsoluteOffset {
+                            x: None,
+                            y: Some(y),
+                        },
+                    ));
+                }
+                task
+            }
             Message::Configure(message) => self.on_configure_message(message),
 
             Message::StartOpened(id) => {
@@ -1138,6 +1343,24 @@ impl App {
                     let mut task = focus_window(id)
                         .chain(raise_window_topmost(id))
                         .chain(self.sync_toast_zorder());
+                    // Settings restore first: the drawer/modal scroll lands
+                    // before the list reveals, art kicks, and scan below.
+                    // Games/controllers follow after the branch.
+                    let mut pending_lists = None;
+                    if let Some((games_y, controllers_y, settings_y)) =
+                        self.pending_scroll_restore.take()
+                    {
+                        let settings_id = start_view::StartListId::Settings.scroll_id();
+                        self.start_state.note_scroll_y(&settings_id, settings_y);
+                        task = task.chain(operation::scroll_to(
+                            settings_id,
+                            operation::AbsoluteOffset {
+                                x: None,
+                                y: Some(settings_y),
+                            },
+                        ));
+                        pending_lists = Some((games_y, controllers_y));
+                    }
                     if self.start_state.immersive {
                         // Re-show the position rail on every immersive open.
                         // Warm opens skip begin_cold_load; cold opens refresh
@@ -1191,6 +1414,11 @@ impl App {
                         if !self.steam_by_id.is_empty() {
                             task = task.chain(self.warm_start_art_task());
                         }
+                    }
+                    // Restored lists land after the branch above (which may
+                    // reveal the selection first); the saved offsets win.
+                    if let Some((games_y, controllers_y)) = pending_lists {
+                        task = task.chain(self.restore_game_lists(games_y, controllers_y));
                     }
                     task
                 } else {
@@ -1268,6 +1496,8 @@ impl App {
                     .sync_reduced_motion(crate::ui::motion::reduced_motion_effective(
                         self.session.prefs.reduced_motion,
                     ));
+                self.start_state
+                    .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
                 let was_cold = self.start_state.cold_load_active;
                 let _ = self.start_state.tick_anim(now);
                 let task = if was_cold && !self.start_state.cold_load_active {
@@ -1582,6 +1812,9 @@ impl App {
                 self.start_state.tick_identify_flash();
                 Task::none()
             }
+            // Redraw only: the wall-clock spinner phase advances in `view`.
+            Message::RendererReloadTick => Task::none(),
+            Message::RendererReloadDue => self.restart_shell_for_renderer(),
             Message::UtilityAmbientTick => {
                 crate::ui::backdrop::note_utility_tick();
                 Task::none()
@@ -1607,6 +1840,11 @@ impl App {
 
             Message::Exit => {
                 crate::controller::hid::diag::diag_info("ui-diag: process exit begin");
+                // A renderer-pref restart keeps its restore record; a plain
+                // Quit clears it so the next launch starts clean.
+                if !self.restarting_for_renderer {
+                    crate::persist::restart_ui::clear();
+                }
                 // Single-writer: the service owns `controllers.json`; a client
                 // save here would race it with a stale copy.
                 if !self.client_mode {
@@ -1948,7 +2186,7 @@ impl App {
     }
 
     fn sync_client_input_hot(&mut self) {
-        if !self.client_mode {
+        if !self.client_mode || self.renderer_reload_queued {
             return;
         }
         let hot = self.shell_wants_pad_input();
@@ -2185,6 +2423,16 @@ impl App {
             start_screen_clock_enabled: self.session.prefs.start_screen_clock_enabled,
             start_screen_navbar: self.session.prefs.start_screen_navbar,
             reduced_motion: self.session.prefs.reduced_motion,
+            perf_throttle_immersive: self.session.prefs.perf_throttle_immersive,
+            perf_antialiasing: self.session.prefs.perf_antialiasing,
+            perf_vsync: self.session.prefs.perf_vsync,
+            perf_restart_needed: renderer_restart_needed(
+                self.session.prefs.perf_antialiasing,
+                self.session.prefs.perf_vsync,
+                self.renderer_boot_aa,
+                self.renderer_boot_vsync,
+            ),
+            perf_reload_queued: self.renderer_reload_queued,
             start_screen_inactive_secs: self.session.prefs.start_screen_inactive_secs,
             start_screen_sleep_secs: self.session.prefs.start_screen_sleep_secs,
             start_screen_inactive_dim_percent: self.session.prefs.start_screen_inactive_dim_percent,
@@ -2292,6 +2540,10 @@ impl App {
                 }
                 scroll_top
             }
+            ConfigureMessage::ContentScrolled(y) => {
+                self.configure_state.content_scroll_y = y;
+                Task::none()
+            }
             ConfigureMessage::SetNotification(setting, enabled) => {
                 match setting {
                     NotificationSetting::Connect => self.session.prefs.notify_connect = enabled,
@@ -2361,6 +2613,12 @@ impl App {
             ConfigureMessage::SetReducedMotion(mode) => {
                 self.apply_start_screen_reduced_motion(mode)
             }
+            ConfigureMessage::SetPerfThrottleImmersive(enabled) => {
+                self.apply_perf_throttle_immersive(enabled)
+            }
+            ConfigureMessage::SetPerfAntialiasing(enabled) => self.apply_perf_antialiasing(enabled),
+            ConfigureMessage::SetPerfVsync(enabled) => self.apply_perf_vsync(enabled),
+            ConfigureMessage::ReloadUi => self.reload_ui_for_renderer(),
             ConfigureMessage::SetStartScreenInactiveSecs(secs) => {
                 self.apply_start_screen_inactive_secs(secs)
             }
@@ -3569,7 +3827,25 @@ impl App {
         self.start_state.note_steam_scan_banner_success(now);
         self.match_path_cache.clear();
         self.refresh_start_rows();
-        self.prepare_immersive_library_task()
+        // Rows just rebuilt (order may have changed): while the restore
+        // settle window is fresh, re-pin the persisted selection by key
+        // (index clamping alone can leave the highlight on the wrong row)
+        // and reveal it. Row-independent state (drawer, config) is untouched.
+        let mut task = self.prepare_immersive_library_task();
+        if self.start_visible
+            && !self.start_selection_dirty
+            && self
+                .scroll_restore_until
+                .is_some_and(|until| Instant::now() < until)
+            && let Some(shadow) = self.start_selection_shadow.clone()
+            && self.apply_start_selection(&shadow)
+        {
+            task = task.chain(
+                self.scroll_start_selection_into_view()
+                    .chain(self.warm_start_art_task()),
+            );
+        }
+        task
     }
 
     /// First Start HWND of the process has finished ambient+status; later opens are warm.
@@ -3763,6 +4039,12 @@ impl App {
             sound_volume: self.session.prefs.start_screen_sound_volume,
             haptics_enabled: self.session.prefs.start_screen_haptics_enabled,
             haptics_strength: self.session.prefs.start_screen_haptics_strength,
+            perf_throttle_immersive: self.session.prefs.perf_throttle_immersive,
+            perf_antialiasing: self.session.prefs.perf_antialiasing,
+            perf_vsync: self.session.prefs.perf_vsync,
+            perf_aa_boot: self.renderer_boot_aa,
+            perf_vsync_boot: self.renderer_boot_vsync,
+            perf_reload_queued: self.renderer_reload_queued,
         }
     }
 
@@ -3829,6 +4111,239 @@ impl App {
         self.start_state
             .sync_reduced_motion(crate::ui::motion::reduced_motion_effective(mode));
         Task::none()
+    }
+
+    fn apply_perf_throttle_immersive(&mut self, enabled: bool) -> Task<Message> {
+        if self.session.prefs.perf_throttle_immersive == enabled {
+            return Task::none();
+        }
+        self.session.prefs.perf_throttle_immersive = enabled;
+        self.save_prefs();
+        self.start_state.sync_perf_throttle(enabled);
+        Task::none()
+    }
+
+    fn apply_perf_antialiasing(&mut self, enabled: bool) -> Task<Message> {
+        if self.session.prefs.perf_antialiasing == enabled {
+            return Task::none();
+        }
+        self.session.prefs.perf_antialiasing = enabled;
+        self.save_prefs();
+        Task::none()
+    }
+
+    fn apply_perf_vsync(&mut self, enabled: bool) -> Task<Message> {
+        if self.session.prefs.perf_vsync == enabled {
+            return Task::none();
+        }
+        self.session.prefs.perf_vsync = enabled;
+        self.save_prefs();
+        Task::none()
+    }
+
+    /// Explicit UI reload for boot-only renderer prefs (AA/vsync are baked
+    /// into the iced/wgpu renderer at boot; iced 0.14 exposes no runtime
+    /// flip). The reload button shows only while prefs differ from the boot
+    /// values. Queues the restart after a short feedback delay so the button
+    /// can flip to its disabled "Reloading…" state; repeat presses no-op.
+    fn reload_ui_for_renderer(&mut self) -> Task<Message> {
+        if self.renderer_reload_queued {
+            return Task::none();
+        }
+        if !renderer_restart_needed(
+            self.session.prefs.perf_antialiasing,
+            self.session.prefs.perf_vsync,
+            self.renderer_boot_aa,
+            self.renderer_boot_vsync,
+        ) {
+            return Task::none();
+        }
+        self.renderer_reload_queued = true;
+        if self.client_mode {
+            // Stop pad edges at the service for the feedback window (in
+            // flight ones die in the input gate). Fresh boot re-arms via
+            // `sync_client_input_hot`; the sync is suppressed while queued.
+            self.client_input_hot = false;
+            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetInputHot { hot: false });
+        }
+        Task::perform(delay(RELOAD_FEEDBACK_DELAY), |()| {
+            Message::RendererReloadDue
+        })
+    }
+
+    /// Fire a queued renderer reload. Re-checks the dirty predicate (a toggle
+    /// flipped back during the feedback delay cancels the restart).
+    fn restart_shell_for_renderer(&mut self) -> Task<Message> {
+        self.renderer_reload_queued = false;
+        if !renderer_restart_needed(
+            self.session.prefs.perf_antialiasing,
+            self.session.prefs.perf_vsync,
+            self.renderer_boot_aa,
+            self.renderer_boot_vsync,
+        ) {
+            return Task::none();
+        }
+        app_log::info("perf: renderer prefs changed; reloading UI to apply");
+        // Snapshot the shell UI so the respawned process reopens to the same
+        // state (windows, selection, scroll offsets). Written before Exit
+        // clears Start state; consumed once at boot when fresh.
+        crate::persist::restart_ui::save(&self.capture_restart_ui());
+        self.restarting_for_renderer = true;
+        if !self.client_mode {
+            // No service to respawn us (standalone shell): relaunch detached
+            // first. The shell holds no single-instance guard, so a brief
+            // overlap while the old process exits is safe. If the relaunch
+            // fails, stay running on the old renderer rather than quitting.
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    if let Err(err) = std::process::Command::new(&exe).spawn() {
+                        app_log::error(format!("perf: relaunch failed: {err}"));
+                        return Task::none();
+                    }
+                }
+                Err(err) => {
+                    app_log::error(format!("perf: current_exe failed: {err}"));
+                    return Task::none();
+                }
+            }
+        }
+        // Client mode: the service respawns the shell within ~1s with the new
+        // iced Settings. `SetPrefs` was already piped when the toggle flipped,
+        // so the respawned shell boots on the saved values.
+        self.update(Message::Exit)
+    }
+
+    /// Snapshot the shell UI for a renderer-pref reload (see `restart_ui`).
+    fn capture_restart_ui(&self) -> crate::persist::restart_ui::RestartUiState {
+        use crate::persist::restart_ui::RestartUiState;
+        RestartUiState {
+            saved_at_ms: RestartUiState::now_ms(),
+            start_visible: self.start_visible,
+            start_immersive: self.start_state.immersive,
+            start_on_controllers: matches!(self.start_state.slide, StartSlide::Controllers),
+            game_key: self
+                .start_state
+                .rows
+                .get(self.start_state.game_selected)
+                .map(|r| r.play_key.clone()),
+            controller_key: self
+                .start_state
+                .controllers
+                .get(self.start_state.controller_selected)
+                .map(|r| r.serial.clone()),
+            games_scroll_y: self.start_state.list_offset(start_view::StartListId::Games),
+            controllers_scroll_y: self
+                .start_state
+                .list_offset(start_view::StartListId::Controllers),
+            settings_scroll_y: self
+                .start_state
+                .list_offset(start_view::StartListId::Settings),
+            settings_open: self.start_state.settings.open,
+            settings_focus: self.start_state.settings.focus,
+            configure_open: self.configure_window.is_some(),
+            configure_section: Some(self.configure_state.section),
+            configure_scroll_y: self.configure_state.content_scroll_y,
+            popup_open: self.popup_window.is_some(),
+            popup_anchor: Some(self.tray_anchor),
+        }
+    }
+
+    /// Reopen to a consumed restart record (renderer-pref restart only).
+    /// Settings state restores FIRST, before any window opens or list
+    /// rebuilds: the Start open path resets nav state (`reset_to_games`),
+    /// which would wipe restored drawer/scroll/selection state. The restore
+    /// open bypasses that reset (see `restore_preserve_nav`) and resolves
+    /// selections from the shadow keys instead. Scroll offsets land on
+    /// `StartOpened`/`ConfigureOpened`, when the scrollables exist.
+    fn apply_restart_ui(
+        &mut self,
+        rs: crate::persist::restart_ui::RestartUiState,
+    ) -> Task<Message> {
+        // --- Settings state first (drawer, configure, anchor). ---
+        if let Some(anchor) = rs.popup_anchor {
+            self.tray_anchor = anchor;
+        }
+        if rs.configure_open {
+            if let Some(section) = rs.configure_section {
+                // No scroll-to here: the content scrollable is not mounted
+                // yet, so the op would be dropped. Section applies now; the
+                // saved offset lands on `ConfigureOpened`.
+                self.configure_state.select_section(section);
+            }
+            self.configure_state.content_scroll_y = rs.configure_scroll_y;
+            self.pending_configure_scroll = Some(rs.configure_scroll_y);
+        }
+        if rs.start_visible && self.session.prefs.start_screen_enabled {
+            if rs.game_key.is_some() || rs.controller_key.is_some() {
+                // Fresh boot: local nav is never dirty, so the service
+                // snapshot (when it lands) still wins with newer truth.
+                self.start_selection_shadow = Some(crate::session::StartSelection {
+                    game_key: rs.game_key,
+                    controller_key: rs.controller_key,
+                });
+            }
+            // Reopen the pre-restart presentation (a manually promoted
+            // immersive Start must not come back compact).
+            self.force_immersive_open = Some(rs.start_immersive);
+            // Bypass the open-time nav reset below; everything it would
+            // clear is restored here instead.
+            self.restore_preserve_nav = true;
+            if rs.start_on_controllers {
+                self.start_state.slide = StartSlide::Controllers;
+            }
+            if rs.settings_open {
+                self.start_state.request_settings(true, Instant::now());
+                // Instant restore: no drawer travel on boot.
+                self.start_state.settings.anim = None;
+            }
+            self.start_state.settings.focus = rs.settings_focus;
+            self.start_state.sync_settings_scroll(rs.settings_scroll_y);
+            self.pending_scroll_restore = Some((
+                rs.games_scroll_y,
+                rs.controllers_scroll_y,
+                rs.settings_scroll_y,
+            ));
+            // Settle window for selection re-pinning after row rebuilds (the
+            // offsets themselves are one-shot and never re-asserted).
+            self.scroll_restore_until = Some(Instant::now() + SCROLL_RESTORE_AUTHORITY);
+        }
+        // --- Windows after: configure + start first, popup last. ---
+        let mut task = Task::none();
+        if rs.configure_open {
+            task = task.chain(self.open_configure());
+        }
+        if rs.start_visible && self.session.prefs.start_screen_enabled {
+            task = task.chain(self.open_start_screen());
+        }
+        if rs.popup_open {
+            task = task.chain(self.open_popup());
+        }
+        task
+    }
+
+    /// Re-apply saved games/controllers offsets once, after the settings
+    /// scroll and the branch reveal above — the saved offsets win. Never
+    /// re-asserted afterwards: once rows rebuild, offsets go stale and only
+    /// the persisted selection stays authoritative. Unmounted ids (immersive
+    /// strip/dock) are dropped by iced; the tracker sync still stands for
+    /// reveal-math fallbacks.
+    fn restore_game_lists(&mut self, games_y: f32, controllers_y: f32) -> Task<Message> {
+        Task::batch([
+            self.restore_one_list(start_view::StartListId::Games, games_y),
+            self.restore_one_list(start_view::StartListId::Controllers, controllers_y),
+        ])
+    }
+
+    fn restore_one_list(&mut self, list: start_view::StartListId, y: f32) -> Task<Message> {
+        let id = list.scroll_id();
+        self.start_state.note_scroll_y(&id, y);
+        operation::scroll_to(
+            id,
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
+        )
     }
 
     fn apply_start_screen_inactive_secs(&mut self, secs: u32) -> Task<Message> {
@@ -3968,7 +4483,15 @@ impl App {
         self.refresh_start_rows();
         self.refresh_start_controllers();
 
-        self.prepare_start_nav_on_open(false);
+        // Restore opens bypass the nav reset: reload restore already set
+        // drawer/scroll/selection state above, and `reset_to_games` would
+        // wipe it (drawer close, scroll zero, selections zeroed). Pad nav
+        // arming still runs either way.
+        if std::mem::take(&mut self.restore_preserve_nav) {
+            self.pad_nav.prepare_on_open(false);
+        } else {
+            self.prepare_start_nav_on_open(false);
+        }
         // Pin state for the first paint (before the first StartFrame tick).
         self.start_state.sync_navbar_pinned(
             matches!(
@@ -3977,6 +4500,8 @@ impl App {
             ),
             Instant::now(),
         );
+        self.start_state
+            .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
         // Shell restart: resolve the service-stored keys (reported before the
         // restart) back to indices now that rows/controllers are rebuilt.
         // NOTE: no scroll_to here — the fresh window's scrollables do not exist
@@ -4031,10 +4556,12 @@ impl App {
             return Task::none();
         }
 
-        let immersive = matches!(
-            start_mode::on_open(self.session.prefs.start_screen_always_immersive),
-            start_mode::ImmersiveTransition::OpenImmersive
-        );
+        let immersive = self.force_immersive_open.take().unwrap_or_else(|| {
+            matches!(
+                start_mode::on_open(self.session.prefs.start_screen_always_immersive),
+                start_mode::ImmersiveTransition::OpenImmersive
+            )
+        });
         self.start_state.immersive = immersive;
         self.clear_start_activity();
         let (size, position) = if immersive {
@@ -4913,6 +5440,10 @@ impl App {
             StartMessage::SetHapticsStrength(strength) => {
                 self.apply_start_screen_haptics_strength(strength)
             }
+            StartMessage::SetPerfThrottle(enabled) => self.apply_perf_throttle_immersive(enabled),
+            StartMessage::SetPerfAntialiasing(enabled) => self.apply_perf_antialiasing(enabled),
+            StartMessage::SetPerfVsync(enabled) => self.apply_perf_vsync(enabled),
+            StartMessage::ReloadUi => self.reload_ui_for_renderer(),
             #[cfg(debug_assertions)]
             StartMessage::ReportLightbarFailure => {
                 self.mark_hitch_now("lightbar");
@@ -5438,7 +5969,14 @@ impl App {
                 events,
                 open_start_after_toast,
             } => self.queue_notifications(events, open_start_after_toast),
-            ServiceMessage::Shutdown => self.update(Message::Exit),
+            ServiceMessage::Shutdown => {
+                // A service quit cancels a queued reload: no restart, and no
+                // restore record left behind for the next launch.
+                crate::persist::restart_ui::clear();
+                self.restarting_for_renderer = false;
+                self.renderer_reload_queued = false;
+                self.update(Message::Exit)
+            }
             // Broadcast copy of a handshake reply (for another transport);
             // the handshake path consumes its own. Nothing to apply.
             ServiceMessage::Version { .. } => Task::none(),
@@ -5483,6 +6021,9 @@ impl App {
             .sync_reduced_motion(crate::ui::motion::reduced_motion_effective(
                 self.session.prefs.reduced_motion,
             ));
+        // ...or the immersive idle-throttle gate.
+        self.start_state
+            .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
         self.session
             .analytics
             .apply_snapshot(snap.analytics.clone());
@@ -5492,6 +6033,9 @@ impl App {
 
         // Stored selection: local nav wins while dirty (the reporting
         // shell already holds the value it sent via `SetStartSelection`).
+        // The reveal scrolls to the resolved selection, so post-reorder
+        // snapshots stay anchored to the persisted keys rather than to
+        // stale restore offsets (which are never re-asserted).
         let mut select_task = Task::none();
         if !self.start_selection_dirty
             && self.apply_start_selection(&snap.selection)
@@ -7159,6 +7703,31 @@ mod tests {
     use super::*;
     use crate::controller::known::KnownControllers;
     use crate::controller::model::Connection;
+
+    #[test]
+    fn reload_gate_classifies_input_vs_system() {
+        // User input drops while queued.
+        assert!(Message::TrayMenu("settings".into()).is_user_input());
+        assert!(Message::TrayLeftClick(TrayAnchor::default()).is_user_input());
+        // ...except Quit, which cancels the reload.
+        assert!(!Message::TrayMenu(crate::ui::tray::QUIT_ID.into()).is_user_input());
+        assert!(!Message::Exit.is_user_input());
+        assert!(!Message::Tick.is_user_input());
+        assert!(!Message::RendererReloadTick.is_user_input());
+        assert!(!Message::RendererReloadDue.is_user_input());
+        assert!(service_message_is_input(
+            &crate::ipc::ServiceMessage::TrayOpenSettings
+        ));
+        assert!(!service_message_is_input(
+            &crate::ipc::ServiceMessage::Shutdown
+        ));
+        assert!(service_message_is_input(
+            &crate::ipc::ServiceMessage::Effects(vec![crate::session::SessionEffect::OpenStart])
+        ));
+        assert!(!service_message_is_input(
+            &crate::ipc::ServiceMessage::Effects(vec![crate::session::SessionEffect::SaveKnown])
+        ));
+    }
 
     /// The forget sequence end to end: prune drops the pad from the fleet, and
     /// the store must drop it too.

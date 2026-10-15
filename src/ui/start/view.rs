@@ -19,7 +19,8 @@ use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Float, button, column, container, row, scrollable, space, stack, svg, text, text_input,
+    Float, button, column, container, keyed_column, row, scrollable, space, stack, svg, text,
+    text_input,
 };
 use iced::{
     Alignment, Background, Border, Color, ContentFit, Element, Fill, Font, Length, Padding, Point,
@@ -135,6 +136,11 @@ pub enum StartMessage {
     SetSoundVolume(u8),
     SetHaptics(bool),
     SetHapticsStrength(u8),
+    SetPerfThrottle(bool),
+    SetPerfAntialiasing(bool),
+    SetPerfVsync(bool),
+    /// Reload the UI to apply boot-only renderer prefs (AA/vsync).
+    ReloadUi,
     /// Mouse-only: stamp lightbar-miss hitch for multi-session diag.
     #[cfg(debug_assertions)]
     ReportLightbarFailure,
@@ -852,6 +858,9 @@ pub struct State {
     /// by the shell (see `sync_reduced_motion`). While set, movement snaps
     /// (durations to 0, offsets to 0, scales to 1) and only opacity animates.
     pub reduced_motion: bool,
+    /// Perf toggle: throttle idle immersive Start to anim-driven frames only
+    /// (default off = legacy always-60Hz). Synced from prefs by the shell.
+    pub perf_throttle_immersive: bool,
     /// Seconds for ambient shader time uniform.
     pub ambient_time: f32,
     /// Incoming backdrop land/crossfade (`started = None` = waiting for peek art).
@@ -1061,6 +1070,7 @@ impl Default for State {
             position_bar_slide: None,
             navbar_pinned: false,
             reduced_motion: false,
+            perf_throttle_immersive: false,
             ambient_time: 0.0,
             backdrop_current: None,
             backdrop_outgoing: None,
@@ -1547,7 +1557,7 @@ impl State {
             || self.transition_phase.is_some()
             || self.backdrop_current.is_some()
             || self.backdrop_outgoing.is_some()
-            || self.immersive
+            || (self.immersive && !self.perf_throttle_immersive)
             || self.cold_load_active
             || self.triangle_progress > 0.0
             || self.cross_progress > 0.0
@@ -1560,6 +1570,54 @@ impl State {
             || self.art_awaiting_paint
             || !self.chrome_status.is_empty()
             || self.games_list_reveal_at.is_some()
+            || self.position_section.is_some()
+            || self.position_bar_slide.is_some()
+            || (self.position_bar_last_scroll.is_some() && !self.navbar_pinned)
+            || self.idle_dim_anim.is_some()
+            || self.enter_reveal.is_some()
+            || self.splash_reveal_pending
+            || self.enter_splash_fade
+    }
+
+    /// True while immersive Start has anim/visual work that must keep frames
+    /// flowing under the idle throttle (excludes the bare-immersive idle arm).
+    /// Used to document the gated-vs-ungated `needs_frames()` contract; the
+    /// subscription itself consults `needs_frames()` (which gates only the
+    /// bare `immersive` arm behind `perf_throttle_immersive`).
+    pub fn immersive_anim_active(&self) -> bool {
+        self.anim.is_some()
+            || self.dock_anim.is_some()
+            || self.strip_anim.is_some()
+            || self.layout_transition.is_some()
+            || self.transition.is_some()
+            || self.transition_phase.is_some()
+            || self.backdrop_current.is_some()
+            || self.backdrop_outgoing.is_some()
+            || self.cold_load_active
+            || self.triangle_progress > 0.0
+            || self.cross_progress > 0.0
+            || self.replace_confirm.is_some()
+            || self.manual_add.is_some()
+            || self.settings.open
+            || self.settings.anim.is_some()
+            || self.hint_anims_need_frames()
+            || self.identify_flash_active()
+            || self.art_awaiting_paint
+            || !self.chrome_status.is_empty()
+            || self.games_list_reveal_at.is_some()
+            || self.position_section.is_some()
+            || self.position_bar_slide.is_some()
+            || (self.position_bar_last_scroll.is_some() && !self.navbar_pinned)
+            || self.idle_dim_anim.is_some()
+            || self.enter_reveal.is_some()
+            || self.splash_reveal_pending
+            || self.enter_splash_fade
+    }
+
+    /// Sync the immersive idle-throttle gate from prefs (no anim snapping;
+    /// the next subscription evaluation simply stops/starts `StartFrame`).
+    pub fn sync_perf_throttle(&mut self, throttle: bool) {
+        self.perf_throttle_immersive = throttle;
     }
 
     /// Immersive dock width progress 0..=1 (eased while animating).
@@ -4307,6 +4365,23 @@ fn carousel_body<'a>(
     .into()
 }
 
+/// Stable `keyed_column` key for a Start list row.
+///
+/// iced 0.14 keyed columns require `Copy` keys, so the `play_key` / serial
+/// string is hashed (deterministic FNV-1a 64) instead of used directly.
+/// Equal strings map to equal keys across rebuilds, so a Steam-scan reorder
+/// keeps per-row widget state instead of rebuilding all nodes positionally.
+pub(crate) fn list_key(s: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for byte in s.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 fn games_list(state: &State) -> Element<'_, StartMessage> {
     if state.rows.is_empty() {
         let empty: Element<'_, StartMessage> = if state.editing {
@@ -4324,21 +4399,21 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
             .center_y(Fill)
             .into();
     }
-    let items = state.rows.iter().enumerate().fold(
-        column![].spacing(ROW_GAP).width(Fill),
-        |col, (index, row)| {
-            let selected = index == state.game_selected;
-            let running = !state.editing
-                && state
-                    .running_target
-                    .as_ref()
-                    .is_some_and(|t| t == &row.target);
-            let closing = !state.editing
-                && state
-                    .closing_target
-                    .as_ref()
-                    .is_some_and(|t| t == &row.target);
-            col.push(game_row(
+    let items = keyed_column(state.rows.iter().enumerate().map(|(index, row)| {
+        let selected = index == state.game_selected;
+        let running = !state.editing
+            && state
+                .running_target
+                .as_ref()
+                .is_some_and(|t| t == &row.target);
+        let closing = !state.editing
+            && state
+                .closing_target
+                .as_ref()
+                .is_some_and(|t| t == &row.target);
+        (
+            list_key(&row.play_key),
+            game_row(
                 index,
                 row,
                 selected,
@@ -4346,9 +4421,11 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
                 closing,
                 state.editing,
                 RowHintState::for_selected(state, selected),
-            ))
-        },
-    );
+            ),
+        )
+    }))
+    .spacing(ROW_GAP)
+    .width(Fill);
     scrollable(items)
         .id(games_scroll_id())
         .height(Fill)
@@ -4374,16 +4451,16 @@ fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element
         .center_y(Fill)
         .into();
     }
-    let items = state.controllers.iter().enumerate().fold(
-        column![].spacing(ROW_GAP).width(Fill),
-        |col, (index, row)| {
-            let selected = index == state.controller_selected;
-            let powering_off = row.connected
-                && state
-                    .powering_off
-                    .as_ref()
-                    .is_some_and(|s| s == &row.serial);
-            col.push(controller_row(
+    let items = keyed_column(state.controllers.iter().enumerate().map(|(index, row)| {
+        let selected = index == state.controller_selected;
+        let powering_off = row.connected
+            && state
+                .powering_off
+                .as_ref()
+                .is_some_and(|s| s == &row.serial);
+        (
+            list_key(&row.serial),
+            controller_row(
                 index,
                 row,
                 selected,
@@ -4391,9 +4468,11 @@ fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element
                 spectrum,
                 state.ring_flash_white(&row.serial),
                 RowHintState::for_selected(state, selected),
-            ))
-        },
-    );
+            ),
+        )
+    }))
+    .spacing(ROW_GAP)
+    .width(Fill);
     scrollable(items)
         .id(controllers_scroll_id())
         .height(Fill)
@@ -5993,6 +6072,108 @@ mod tests {
         state.set_rows(vec![game_row_with("steam:2"), game_row_with("steam:1")]);
         assert!(state.position_bar_last_scroll.is_none());
         assert_eq!(state.position_bar_show(Instant::now()), (0.0, 0.0));
+    }
+
+    #[test]
+    fn immersive_throttle_gates_idle_but_not_anims() {
+        // Idle immersive: ungated (legacy) needs frames, gated does not.
+        let idle = State {
+            immersive: true,
+            ..State::default()
+        };
+        assert!(!idle.perf_throttle_immersive);
+        assert!(idle.needs_frames());
+        assert!(!idle.immersive_anim_active());
+        let mut throttled = State {
+            immersive: true,
+            ..State::default()
+        };
+        throttled.sync_perf_throttle(true);
+        assert!(!throttled.needs_frames());
+        assert!(!throttled.immersive_anim_active());
+        // Any anim keeps frames in both modes.
+        let now = Instant::now();
+        let mut ungated = State {
+            immersive: true,
+            ..State::default()
+        };
+        ungated.game_selected = 1;
+        ungated.begin_strip_anim(0.0, now);
+        assert!(ungated.needs_frames());
+        assert!(ungated.immersive_anim_active());
+        let mut gated = State {
+            immersive: true,
+            ..State::default()
+        };
+        gated.sync_perf_throttle(true);
+        gated.game_selected = 1;
+        gated.begin_strip_anim(0.0, now);
+        assert!(gated.needs_frames());
+        assert!(gated.immersive_anim_active());
+
+        let mut ungated = State {
+            immersive: true,
+            ..State::default()
+        };
+        ungated.request_dock(true, now);
+        assert!(ungated.needs_frames());
+        assert!(ungated.immersive_anim_active());
+        let mut gated = State {
+            immersive: true,
+            ..State::default()
+        };
+        gated.sync_perf_throttle(true);
+        gated.request_dock(true, now);
+        assert!(gated.needs_frames());
+        assert!(gated.immersive_anim_active());
+
+        let mut ungated = State {
+            immersive: true,
+            ..State::default()
+        };
+        ungated.replace_confirm = Some(crate::ui::start::view::ReplaceConfirm {
+            running_title: "a".into(),
+            next_title: "b".into(),
+            next_index: 0,
+        });
+        assert!(ungated.needs_frames());
+        assert!(ungated.immersive_anim_active());
+        let mut gated = State {
+            immersive: true,
+            ..State::default()
+        };
+        gated.sync_perf_throttle(true);
+        gated.replace_confirm = Some(crate::ui::start::view::ReplaceConfirm {
+            running_title: "a".into(),
+            next_title: "b".into(),
+            next_index: 0,
+        });
+        assert!(gated.needs_frames());
+        assert!(gated.immersive_anim_active());
+        // Compact (non-immersive) idle never needs frames either way.
+        let compact = State::default();
+        assert!(!compact.needs_frames());
+        let mut compact_throttled = State::default();
+        compact_throttled.sync_perf_throttle(true);
+        assert!(!compact_throttled.needs_frames());
+    }
+
+    #[test]
+    fn list_keys_are_stable_across_reorder() {
+        // Same play_key / serial maps to the same key after a reorder, and
+        // distinct keys stay distinct (keyed_column continuity).
+        let before = ["steam:1", "steam:2", "steam:3"];
+        let after = ["steam:3", "steam:1", "steam:2"];
+        for key in before {
+            assert_eq!(list_key(key), list_key(key));
+        }
+        let mut keys: std::collections::HashSet<u64> = before.iter().map(|k| list_key(k)).collect();
+        assert_eq!(keys.len(), before.len());
+        for key in after {
+            assert!(keys.remove(&list_key(key)));
+        }
+        assert!(keys.is_empty());
+        assert_ne!(list_key("serial-a"), list_key("serial-b"));
     }
 
     #[test]

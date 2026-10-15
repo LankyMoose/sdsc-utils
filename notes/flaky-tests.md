@@ -1,7 +1,7 @@
 # Flaky tests: shared global state vs. test threads
 
 How to diagnose a test that fails intermittently in CI but never locally, and the
-one real instance of it in this repo.
+real instances of it in this repo.
 
 ## Symptom
 
@@ -73,6 +73,41 @@ and never reach the cache, so they needed nothing.
   and the next color-reading test would otherwise inherit the flake silently.
 - **Suspicious slowness is evidence.** A run that takes 4× longer is a wider
   race window, not a slower test.
+
+## Second instance: atomic temp-file scan vs. sibling test (open)
+
+Observed 2026-10-15 during the perf/reload work: `bash scripts/ci.sh` reported
+`582 passed; 1 failed` with only this failure:
+
+```
+---- persist::atomic::tests::write_atomic_leaves_no_temp_files stdout ----
+temp files left behind: [".sdsc-tmp-18124-1792045052481873900.json"]
+```
+
+Re-running the suite passed; the test also passes in isolation and across
+repeated full-`--lib` runs (3/3). The leftover name carries the *same pid* as
+the failing test process, which rules out cross-process collision
+(`cargo test --all-targets` runs several binaries, but the test filters by
+`std::process::id()`).
+
+Mechanism (`src/persist/atomic.rs`): `temp_path()` creates
+`.sdsc-tmp-{pid}-{nanos}.json` in the **destination's parent directory**, and
+the test's `scratch()` puts its destination directly in `std::env::temp_dir()`
+— so the "no leftovers" scan covers the whole shared system temp dir. The
+sibling test `write_atomic_creates_and_overwrites` (same module, same parent
+dir, parallel thread) performs two atomic writes; if either temp file exists
+during the scan window, the scan fails. Same-process thread interleaving, not
+load: no lock or retry discipline exists between the two tests.
+
+Suggested fix (not yet done): give each test a **private subdir** under the
+system temp dir (e.g. `temp_dir()/sdsc-atomic-{name}-{pid}-{nanos}/file.json`)
+and scan only that subdir. That removes cross-test visibility entirely and
+needs no serialization. Do NOT "fix" it with scan-then-retry — that would mask
+a genuine temp-leak regression, which is what the test exists to catch.
+
+Generalized rule: **a test that scans a shared directory for leftovers must
+scope the scan to a directory only it uses.** The pid filter is necessary but
+not sufficient — threads share the process.
 
 ## Not the cause (ruled out)
 

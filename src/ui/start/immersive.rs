@@ -15,7 +15,7 @@ use crate::ui::start::view::{
 use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics, StripOrientation};
 use crate::ui::theme;
 use iced::font::Weight;
-use iced::widget::{Float, column, container, row, shader, space, stack, text};
+use iced::widget::{Float, column, container, keyed_column, row, shader, space, stack, text};
 use iced::{Alignment, Element, Fill, Font, Length, Padding, Vector};
 use std::time::Instant;
 
@@ -1116,26 +1116,34 @@ fn controllers_dock_host<'a>(
     // Nested rounded-rect: inner = outer − pad (never the same as the island).
     let row_radius = (island_radius - pad).max(0.0);
 
-    let mut list = column![].spacing(row_gap).width(Length::Fixed(DOCK_MAX_W));
-    if state.controllers.is_empty() {
-        list = list.push(dock_empty_row(details_w, row_h));
+    let list: Element<'_, StartMessage> = if state.controllers.is_empty() {
+        column![dock_empty_row(details_w, row_h)]
+            .spacing(row_gap)
+            .width(Length::Fixed(DOCK_MAX_W))
+            .into()
     } else {
-        for (i, row) in state.controllers.iter().enumerate() {
+        keyed_column(state.controllers.iter().enumerate().map(|(i, row)| {
             let selected =
                 i == state.controller_selected && matches!(state.slide, StartSlide::Controllers);
-            list = list.push(dock_controller_row(
-                row,
-                spectrum,
-                selected,
-                state.ring_flash_white(&row.serial),
-                details_w,
-                dock_progress,
-                row_h,
-                row_radius,
-                state,
-            ));
-        }
-    }
+            (
+                crate::ui::start::view::list_key(&row.serial),
+                dock_controller_row(
+                    row,
+                    spectrum,
+                    selected,
+                    state.ring_flash_white(&row.serial),
+                    details_w,
+                    dock_progress,
+                    row_h,
+                    row_radius,
+                    state,
+                ),
+            )
+        }))
+        .spacing(row_gap)
+        .width(Length::Fixed(DOCK_MAX_W))
+        .into()
+    };
 
     let full = container(list)
         .padding(Padding {

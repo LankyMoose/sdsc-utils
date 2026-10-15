@@ -35,7 +35,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, Element, Fill, Font, Length};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Logical width of the configure window.
 pub const WIDTH: f32 = 720.0;
@@ -87,7 +87,7 @@ pub fn content_scroll_id() -> iced::widget::Id {
     iced::widget::Id::new("configure-content-scroll")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Section {
     System,
     StartScreen,
@@ -205,6 +205,13 @@ pub struct ConfigureSettings {
     pub start_screen_clock_enabled: bool,
     pub start_screen_navbar: NavbarVisibility,
     pub reduced_motion: ReducedMotion,
+    pub perf_throttle_immersive: bool,
+    pub perf_antialiasing: bool,
+    pub perf_vsync: bool,
+    /// Renderer prefs differ from the boot values (reload button shows).
+    pub perf_restart_needed: bool,
+    /// Reload queued (button disabled, spinner shown until exit).
+    pub perf_reload_queued: bool,
     pub start_screen_inactive_secs: u32,
     pub start_screen_sleep_secs: u32,
     pub start_screen_inactive_dim_percent: u8,
@@ -297,6 +304,13 @@ pub enum ConfigureMessage {
     SetStartScreenClock(bool),
     SetNavbarVisibility(NavbarVisibility),
     SetReducedMotion(ReducedMotion),
+    SetPerfThrottleImmersive(bool),
+    SetPerfAntialiasing(bool),
+    SetPerfVsync(bool),
+    /// Reload the UI to apply boot-only renderer prefs (AA/vsync).
+    ReloadUi,
+    /// Content scroll offset report (persisted for renderer-reload restore).
+    ContentScrolled(f32),
     SetStartScreenInactiveSecs(u32),
     SetStartScreenSleepSecs(u32),
     SetStartScreenInactiveDimPercent(u8),
@@ -353,6 +367,8 @@ pub struct ConfigureState {
     pub error: Option<String>,
     pub show_changelog: bool,
     pub steam_path_error: Option<String>,
+    /// Tracked content-scroll offset (restored after a renderer reload).
+    pub content_scroll_y: f32,
     /// Serials of expanded pad rows (Controllers tab), keyed so rows stay
     /// independently expandable as pads come and go.
     #[cfg(debug_assertions)]
@@ -371,6 +387,7 @@ impl ConfigureState {
             error: None,
             show_changelog: false,
             steam_path_error: None,
+            content_scroll_y: 0.0,
             #[cfg(debug_assertions)]
             expanded_emulators: std::collections::HashSet::new(),
         };
@@ -621,6 +638,7 @@ pub fn view<'a>(
         .style(theme::scrollbar)
         .height(Fill)
         .width(Fill)
+        .on_scroll(|viewport| ConfigureMessage::ContentScrolled(viewport.absolute_offset().y))
     };
 
     let content_pane: Element<'_, ConfigureMessage> = match state.section {
@@ -928,6 +946,49 @@ fn action_button<'a>(
         .padding([7, 14])
         .on_press(message)
         .style(theme::secondary)
+        .into()
+}
+
+/// Renderer-pref reload button. Width follows its contents; both states are
+/// left-aligned like the other action buttons. Disabled with a spinner once
+/// queued so a second click cannot queue another restart.
+fn reload_button(queued: bool) -> Element<'static, ConfigureMessage> {
+    let content: Element<'_, ConfigureMessage> = if queued {
+        row![text("Reloading…").size(13.0), reload_spinner(),]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into()
+    } else {
+        text("Reload UI to apply changes").size(13.0).into()
+    };
+    button(content)
+        .padding([7, 14])
+        .on_press_maybe((!queued).then_some(ConfigureMessage::ReloadUi))
+        .style(theme::secondary)
+        .into()
+}
+
+/// Wall-clock indeterminate spinner for the queued reload button. The
+/// `RendererReloadTick` subscription redraws at 60Hz while queued, so the
+/// SVG rotation sweeps smoothly for the short feedback delay. Phase comes
+/// from a process-local epoch: `Instant::now().elapsed()` at view time is
+/// always ~zero and would render a frozen spinner.
+fn reload_spinner() -> Element<'static, ConfigureMessage> {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    let angle = Instant::now()
+        .saturating_duration_since(epoch)
+        .as_millis()
+        .rem_euclid(1000) as f32
+        / 1000.0
+        * 360.0;
+    svg(svg::Handle::from_memory(svg_icon::SPINNER_SVG.as_bytes()))
+        .width(Length::Fixed(14.0))
+        .height(Length::Fixed(14.0))
+        .rotation(angle)
+        .style(|_theme, _status| svg::Style {
+            color: Some(theme::MUTED),
+        })
         .into()
 }
 
@@ -1333,6 +1394,31 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             ));
         }
         groups = groups.push(group(Some("Feedback".to_string()), feedback));
+
+        let mut performance = vec![
+            toggle_row(
+                "Save power when idle",
+                Some("Let the fullscreen Start screen rest when nothing is moving"),
+                settings.perf_throttle_immersive,
+                ConfigureMessage::SetPerfThrottleImmersive,
+            ),
+            toggle_row(
+                "Antialiasing",
+                Some("Smoother edges"),
+                settings.perf_antialiasing,
+                ConfigureMessage::SetPerfAntialiasing,
+            ),
+            toggle_row(
+                "Vsync",
+                Some("Sync to display; off may tear"),
+                settings.perf_vsync,
+                ConfigureMessage::SetPerfVsync,
+            ),
+        ];
+        if settings.perf_restart_needed {
+            performance.push(reload_button(settings.perf_reload_queued));
+        }
+        groups = groups.push(group(Some("Performance".to_string()), performance));
     }
 
     groups = groups.push(
@@ -2273,6 +2359,11 @@ mod tests {
             start_screen_clock_enabled: true,
             start_screen_navbar: NavbarVisibility::WhenNavigating,
             reduced_motion: ReducedMotion::System,
+            perf_throttle_immersive: false,
+            perf_antialiasing: true,
+            perf_vsync: true,
+            perf_restart_needed: false,
+            perf_reload_queued: false,
             start_screen_inactive_secs: 60,
             start_screen_sleep_secs: 300,
             start_screen_inactive_dim_percent: 50,

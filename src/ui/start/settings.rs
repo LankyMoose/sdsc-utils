@@ -11,12 +11,14 @@ use crate::ui::start::view::{ScrollReveal, StartMessage, State, scroll_y_to_reve
 use crate::ui::theme;
 use iced::font::Weight;
 use iced::widget::text::Wrapping;
-use iced::widget::{column, container, mouse_area, row, scrollable, slider, space, text, toggler};
+use iced::widget::{
+    button, column, container, mouse_area, row, scrollable, slider, space, text, toggler,
+};
 use iced::{Alignment, Element, Fill, Font, Length, Padding};
 use std::time::{Duration, Instant};
 
 /// Immersive settings drawer content width (full height).
-pub const DRAWER_W: f32 = 400.0;
+pub const DRAWER_W: f32 = 500.0;
 /// Compact modal width (~window × 0.75).
 pub const MODAL_W: f32 = 576.0;
 const DRAWER_ANIM_MS: u64 = 220;
@@ -65,6 +67,14 @@ pub struct StartSettingsSnapshot {
     pub sound_volume: u8,
     pub haptics_enabled: bool,
     pub haptics_strength: u8,
+    pub perf_throttle_immersive: bool,
+    pub perf_antialiasing: bool,
+    pub perf_vsync: bool,
+    /// Boot values for the renderer prefs (reload row shows while live differs).
+    pub perf_aa_boot: bool,
+    pub perf_vsync_boot: bool,
+    /// Reload queued (row disabled, spinner shown until exit).
+    pub perf_reload_queued: bool,
 }
 
 /// Focusable rows in the Start settings list (dynamic when sounds/haptics off).
@@ -83,6 +93,11 @@ pub enum SettingsRow {
     SoundVolume,
     Haptics,
     HapticsStrength,
+    PerfThrottle,
+    PerfAntialiasing,
+    PerfVsync,
+    /// Reload action, visible only while renderer prefs differ from boot.
+    PerfReload,
 }
 
 impl SettingsRow {
@@ -91,7 +106,7 @@ impl SettingsRow {
     /// everywhere (visibly), and reordering here reorders all three together.
     /// To add a row: append/reorder here, extend `visible()` + `section_before()`
     /// / `gap_before()` + the `panel_view` build match + `kind()`/dispatch arms.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 17] = [
         Self::AutoOpen,
         Self::AlwaysImmersive,
         Self::Clock,
@@ -105,6 +120,10 @@ impl SettingsRow {
         Self::SoundVolume,
         Self::Haptics,
         Self::HapticsStrength,
+        Self::PerfThrottle,
+        Self::PerfAntialiasing,
+        Self::PerfVsync,
+        Self::PerfReload,
     ];
 
     /// Conditional visibility shared by ALL THREE paths (focus order, panel
@@ -122,7 +141,16 @@ impl SettingsRow {
             | Self::SleepSecs
             | Self::IdleDim
             | Self::Sounds
-            | Self::Haptics => true,
+            | Self::Haptics
+            | Self::PerfThrottle
+            | Self::PerfAntialiasing
+            | Self::PerfVsync => true,
+            Self::PerfReload => crate::persist::prefs::renderer_restart_needed(
+                snapshot.perf_antialiasing,
+                snapshot.perf_vsync,
+                snapshot.perf_aa_boot,
+                snapshot.perf_vsync_boot,
+            ),
             Self::SoundVolume => snapshot.sounds_enabled,
             Self::HapticsStrength => snapshot.haptics_enabled,
         }
@@ -131,7 +159,7 @@ impl SettingsRow {
     pub fn focusable(snapshot: &StartSettingsSnapshot) -> Vec<Self> {
         debug_assert!(
             {
-                let mut seen = [false; 13];
+                let mut seen = [false; 17];
                 let mut dup = false;
                 for row in Self::ALL {
                     let idx = row as usize;
@@ -158,6 +186,7 @@ impl SettingsRow {
             Self::AutoOpen => Some("Opening"),
             Self::AlwaysImmersive => Some("Immersive"),
             Self::Sounds => Some("Feedback"),
+            Self::PerfThrottle => Some("Performance"),
             Self::Clock
             | Self::ImmersiveLayout
             | Self::Navbar
@@ -167,7 +196,10 @@ impl SettingsRow {
             | Self::IdleDim
             | Self::SoundVolume
             | Self::Haptics
-            | Self::HapticsStrength => None,
+            | Self::HapticsStrength
+            | Self::PerfAntialiasing
+            | Self::PerfVsync
+            | Self::PerfReload => None,
         }
     }
 
@@ -175,7 +207,7 @@ impl SettingsRow {
     /// opens the Immersive / Feedback section after the previous block).
     fn gap_before(self) -> bool {
         match self {
-            Self::AlwaysImmersive | Self::Sounds => true,
+            Self::AlwaysImmersive | Self::Sounds | Self::PerfThrottle => true,
             Self::AutoOpen
             | Self::Clock
             | Self::ImmersiveLayout
@@ -186,7 +218,10 @@ impl SettingsRow {
             | Self::IdleDim
             | Self::SoundVolume
             | Self::Haptics
-            | Self::HapticsStrength => false,
+            | Self::HapticsStrength
+            | Self::PerfAntialiasing
+            | Self::PerfVsync
+            | Self::PerfReload => false,
         }
     }
 
@@ -195,6 +230,7 @@ impl SettingsRow {
     fn height(self, ty: TypeScale) -> f32 {
         match self.kind() {
             RowKind::Toggle => toggle_row_h(ty.toggle),
+            RowKind::Action => action_row_h(),
             RowKind::Selector => selector_row_h(ty.helper, ty.toggle),
             RowKind::Slider => slider_row_h(ty.helper),
         }
@@ -206,7 +242,14 @@ impl SettingsRow {
             Self::AutoOpen | Self::ImmersiveLayout | Self::Navbar | Self::ReducedMotion => {
                 RowKind::Selector
             }
-            Self::AlwaysImmersive | Self::Clock | Self::Sounds | Self::Haptics => RowKind::Toggle,
+            Self::AlwaysImmersive
+            | Self::Clock
+            | Self::Sounds
+            | Self::Haptics
+            | Self::PerfThrottle
+            | Self::PerfAntialiasing
+            | Self::PerfVsync => RowKind::Toggle,
+            Self::PerfReload => RowKind::Action,
             Self::IdleSecs
             | Self::SleepSecs
             | Self::IdleDim
@@ -222,6 +265,9 @@ impl SettingsRow {
             Self::Clock => snapshot.clock_enabled,
             Self::Sounds => snapshot.sounds_enabled,
             Self::Haptics => snapshot.haptics_enabled,
+            Self::PerfThrottle => snapshot.perf_throttle_immersive,
+            Self::PerfAntialiasing => snapshot.perf_antialiasing,
+            Self::PerfVsync => snapshot.perf_vsync,
             row => unreachable!("{row:?} is not a toggle row"),
         }
     }
@@ -233,6 +279,9 @@ impl SettingsRow {
             Self::Clock => StartMessage::SetClock(on),
             Self::Sounds => StartMessage::SetSounds(on),
             Self::Haptics => StartMessage::SetHaptics(on),
+            Self::PerfThrottle => StartMessage::SetPerfThrottle(on),
+            Self::PerfAntialiasing => StartMessage::SetPerfAntialiasing(on),
+            Self::PerfVsync => StartMessage::SetPerfVsync(on),
             row => unreachable!("{row:?} is not a toggle row"),
         }
     }
@@ -404,6 +453,8 @@ pub enum RowKind {
     Toggle,
     Selector,
     Slider,
+    /// One-shot action button (reload UI). Confirm runs it; nudge ignores it.
+    Action,
 }
 
 /// Which half of the nav cue the pad path should play for a settings row.
@@ -437,7 +488,11 @@ pub fn settings_nav_cue(row: SettingsRow) -> SettingsCue {
         | SettingsRow::ReducedMotion
         | SettingsRow::IdleSecs
         | SettingsRow::SleepSecs
-        | SettingsRow::IdleDim => SettingsCue::Full,
+        | SettingsRow::IdleDim
+        | SettingsRow::PerfThrottle
+        | SettingsRow::PerfAntialiasing
+        | SettingsRow::PerfVsync
+        | SettingsRow::PerfReload => SettingsCue::Full,
     }
 }
 
@@ -675,6 +730,8 @@ pub fn confirm_message(row: SettingsRow, snapshot: &StartSettingsSnapshot) -> Op
         // Selectors open the dropdown; picking happens from the menu highlight.
         RowKind::Selector => Some(row.open_menu()),
         RowKind::Toggle => Some(row.set_toggle(!row.toggle_value(snapshot))),
+        // The reload action applies pending renderer prefs immediately.
+        RowKind::Action => Some(StartMessage::ReloadUi),
         // Sliders step with Left/Right; Cross does nothing.
         RowKind::Slider => None,
     }
@@ -702,6 +759,8 @@ pub fn nudge_message(
                 Some(row.set_toggle(want_on))
             }
         }
+        // Actions only run on Confirm; directionals leave them alone.
+        RowKind::Action => None,
         RowKind::Slider => {
             let step = if delta < 0 { -1isize } else { 1isize };
             row.nudge_slider(snapshot, step)
@@ -812,6 +871,16 @@ pub fn focus_row_bounds(
 
 fn toggle_row_h(toggle: f32) -> f32 {
     ROW_PAD * 2.0 + toggle.max(22.0)
+}
+
+/// Fixed inner height of the reload action button. The row (`action_row_h`)
+/// and the button are both fixed, so the shared bounds geometry agrees with
+/// the built widget by construction regardless of font metrics; the label
+/// and spinner always fit with room to spare in both type scales.
+const ACTION_BUTTON_H: f32 = 30.0;
+
+fn action_row_h() -> f32 {
+    ROW_PAD * 2.0 + ACTION_BUTTON_H
 }
 
 /// Fixed height of the cycle-row option viewport: one option visible.
@@ -1084,6 +1153,33 @@ pub fn panel_view<'a>(
                     move |value| SettingsRow::HapticsStrength.slider_select(&snap_for_msg, value),
                 )
             }
+            SettingsRow::PerfThrottle => toggle_row(
+                "Save power when idle",
+                SettingsRow::PerfThrottle.toggle_value(snapshot),
+                focused,
+                ty,
+                |on| SettingsRow::PerfThrottle.set_toggle(on),
+            ),
+            SettingsRow::PerfAntialiasing => toggle_row(
+                "Antialiasing",
+                SettingsRow::PerfAntialiasing.toggle_value(snapshot),
+                focused,
+                ty,
+                |on| SettingsRow::PerfAntialiasing.set_toggle(on),
+            ),
+            SettingsRow::PerfVsync => toggle_row(
+                "Vsync",
+                SettingsRow::PerfVsync.toggle_value(snapshot),
+                focused,
+                ty,
+                |on| SettingsRow::PerfVsync.set_toggle(on),
+            ),
+            SettingsRow::PerfReload => action_row(
+                "Reload UI to apply changes",
+                focused,
+                ty,
+                snapshot.perf_reload_queued,
+            ),
         };
         #[cfg(debug_assertions)]
         built_rows.push(row);
@@ -1277,6 +1373,53 @@ fn toggle_row(
     .into()
 }
 
+/// Full-width reload action. Row and button heights are fixed
+/// ([`action_row_h`]) so the shared bounds geometry agrees with the built
+/// widget by construction. Content is left-aligned like every other row, and
+/// the idle label and the queued ("Reloading…" + spinner) state share the
+/// same box, so swapping states never moves layout. Disabled once queued so
+/// a second press cannot queue another restart.
+fn action_row(
+    label: &'static str,
+    focused: bool,
+    ty: TypeScale,
+    queued: bool,
+) -> Element<'static, StartMessage> {
+    let content: Element<'_, StartMessage> = if queued {
+        container(
+            row![
+                text("Reloading…").size(ty.body),
+                crate::ui::start::view::scan_spinner(14.0, Instant::now(), 1.0),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .width(Fill)
+        .center_x(Fill)
+        .into()
+    } else {
+        text(label)
+            .size(ty.body)
+            .width(Fill)
+            .align_x(Alignment::Center)
+            .into()
+    };
+    container(
+        button(content)
+            .width(Fill)
+            .height(Length::Fixed(ACTION_BUTTON_H))
+            .padding([4, 12])
+            .on_press_maybe((!queued).then_some(StartMessage::ReloadUi))
+            .style(theme::primary),
+    )
+    .padding(ROW_PAD)
+    .width(Fill)
+    .height(Length::Fixed(action_row_h()))
+    .align_y(Alignment::Center)
+    .style(focus_style(focused))
+    .into()
+}
+
 /// Dropdown selector header: label left, current option in a fixed-height
 /// clipped viewport right so only the selected option displays.
 /// Click (or pad Cross) toggles the menu; `toggle` opens/closes it.
@@ -1435,6 +1578,12 @@ mod tests {
             sound_volume: 60,
             haptics_enabled: haptics,
             haptics_strength: 60,
+            perf_throttle_immersive: false,
+            perf_antialiasing: true,
+            perf_vsync: true,
+            perf_aa_boot: true,
+            perf_vsync_boot: true,
+            perf_reload_queued: false,
         }
     }
 
@@ -1460,6 +1609,15 @@ mod tests {
         drop(panel_view(&menu_open, &snapshot, true, true));
         drop(compact_overlay(&state, &snapshot, 1.0, true));
         drop(immersive_drawer(&state, &snapshot, 1.0, true));
+        // Dirty + queued renderer prefs: the reload action row (both states)
+        // must build without panicking.
+        let mut dirty = snapshot.clone();
+        dirty.perf_vsync = false;
+        drop(panel_view(&state, &dirty, false, false));
+        drop(panel_view(&state, &dirty, true, true));
+        dirty.perf_reload_queued = true;
+        drop(panel_view(&state, &dirty, false, false));
+        drop(panel_view(&state, &dirty, true, true));
     }
 
     #[test]
@@ -1481,6 +1639,9 @@ mod tests {
                 SettingsRow::SoundVolume,
                 SettingsRow::Haptics,
                 SettingsRow::HapticsStrength,
+                SettingsRow::PerfThrottle,
+                SettingsRow::PerfAntialiasing,
+                SettingsRow::PerfVsync,
             ]
         );
     }
@@ -1721,7 +1882,7 @@ mod tests {
     #[test]
     fn triple_agreement_focusable_panel_bounds() {
         // The single table lists every variant exactly once, in display order.
-        assert_eq!(SettingsRow::ALL.len(), 13);
+        assert_eq!(SettingsRow::ALL.len(), 17);
         {
             let mut sorted = SettingsRow::ALL;
             sorted.sort_by_key(|row| *row as usize);
@@ -1944,6 +2105,33 @@ mod tests {
                 ),
                 "Haptics confirm from {on}"
             );
+            s = base.clone();
+            s.perf_throttle_immersive = on;
+            assert!(
+                matches!(
+                    confirm_message(SettingsRow::PerfThrottle, &s),
+                    Some(StartMessage::SetPerfThrottle(v)) if v == !on
+                ),
+                "PerfThrottle confirm from {on}"
+            );
+            s = base.clone();
+            s.perf_antialiasing = on;
+            assert!(
+                matches!(
+                    confirm_message(SettingsRow::PerfAntialiasing, &s),
+                    Some(StartMessage::SetPerfAntialiasing(v)) if v == !on
+                ),
+                "PerfAntialiasing confirm from {on}"
+            );
+            s = base.clone();
+            s.perf_vsync = on;
+            assert!(
+                matches!(
+                    confirm_message(SettingsRow::PerfVsync, &s),
+                    Some(StartMessage::SetPerfVsync(v)) if v == !on
+                ),
+                "PerfVsync confirm from {on}"
+            );
         }
         // Sliders never confirm.
         for row in [
@@ -1960,7 +2148,33 @@ mod tests {
         }
     }
 
-    /// Pinned nudge matrix for the four toggle rows: left = off, right = on,
+    /// The reload action appears only while renderer prefs differ from boot
+    /// (last row), confirms into the reload message, and ignores nudges.
+    #[test]
+    fn perf_reload_row_shows_only_when_dirty() {
+        let clean = snap(true, true);
+        let rows = SettingsRow::focusable(&clean);
+        assert!(!rows.contains(&SettingsRow::PerfReload));
+        assert!(!SettingsRow::PerfReload.visible(&clean));
+
+        let mut dirty = clean.clone();
+        dirty.perf_vsync = false;
+        assert!(SettingsRow::PerfReload.visible(&dirty));
+        let rows = SettingsRow::focusable(&dirty);
+        assert_eq!(rows.last(), Some(&SettingsRow::PerfReload));
+        assert!(matches!(
+            confirm_message(SettingsRow::PerfReload, &dirty),
+            Some(StartMessage::ReloadUi)
+        ));
+        assert!(nudge_message(SettingsRow::PerfReload, &dirty, 1).is_none());
+        assert!(nudge_message(SettingsRow::PerfReload, &dirty, -1).is_none());
+
+        // Flipped back to boot: gone again.
+        dirty.perf_vsync = true;
+        assert!(!SettingsRow::PerfReload.visible(&dirty));
+    }
+
+    /// Pinned nudge matrix for the toggle rows: left = off, right = on,
     /// silent None when already at the requested state. Both states × both deltas.
     #[test]
     fn pin_nudge_toggles_both_directions() {
@@ -2272,6 +2486,9 @@ mod tests {
             (SettingsRow::Clock, s.clock_enabled),
             (SettingsRow::Sounds, s.sounds_enabled),
             (SettingsRow::Haptics, s.haptics_enabled),
+            (SettingsRow::PerfThrottle, s.perf_throttle_immersive),
+            (SettingsRow::PerfAntialiasing, s.perf_antialiasing),
+            (SettingsRow::PerfVsync, s.perf_vsync),
         ] {
             // The toggler reads the same value confirm flips...
             assert_eq!(row.toggle_value(&s), on, "{row:?} toggler read");
