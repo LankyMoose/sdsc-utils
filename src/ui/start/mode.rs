@@ -43,12 +43,9 @@ pub enum TransitionPhase {
 
 /// Shared duration for darken-immersive / reveal-compact / cold ambient.
 pub const VEIL_TRANSITION_MS: u64 = 300;
-/// Fast promote/demote segment, shared: the exit blackout and the HWND
-/// growth/shrink use one duration so the joints stay even.
+/// Fast promote/demote segment, shared: exit fades, enter fades, and the
+/// HWND growth/shrink all use one duration so the joints stay even.
 pub const SWIFT_SEGMENT_MS: u64 = 150;
-/// Growth/shrink fraction where the enter phase begins: the veil starts
-/// lifting while the window finishes morphing beneath it (no dead beats).
-pub const RESIZE_SETTLE_AT: f32 = 0.5;
 /// EnterImmersive top-veil lift (ease-in-out); matches splash length so one ceremony covers both.
 pub const ENTER_REVEAL_MS: u64 = crate::ui::motion::SLOW_MS;
 pub const ENTER_IMMERSIVE_MS: u64 = ENTER_REVEAL_MS;
@@ -86,8 +83,8 @@ pub const GAMES_LIST_FADE_MS: u64 = ART_FADE_MS;
 pub const ENTER_REVEAL_MAX_FRAME_MS: u64 = crate::ui::motion::MAX_FRAME_DT_MS;
 /// Legacy grow-segment fraction (unused by the single top-veil enter path).
 pub const ENTER_GROW_END: f32 = 0.28;
-pub const EXIT_IMMERSIVE_MS: u64 = VEIL_TRANSITION_MS;
-pub const ENTER_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
+pub const EXIT_IMMERSIVE_MS: u64 = SWIFT_SEGMENT_MS;
+pub const ENTER_COMPACT_MS: u64 = SWIFT_SEGMENT_MS;
 /// Opacity crossfade between game backdrops (selection change; not enter veil).
 pub const ART_FADE_MS: u64 = crate::ui::motion::SLOW_MS;
 /// Shared ken-burns period for zoom + pan (burn-in drift while splash is held).
@@ -588,8 +585,8 @@ mod tests {
         );
         assert_eq!(ENTER_IMMERSIVE_MS, ENTER_REVEAL_MS);
         assert_eq!(ENTER_REVEAL_MS, ART_FADE_MS);
-        assert_eq!(EXIT_IMMERSIVE_MS, VEIL_TRANSITION_MS);
-        assert_eq!(ENTER_COMPACT_MS, VEIL_TRANSITION_MS);
+        assert_eq!(EXIT_IMMERSIVE_MS, SWIFT_SEGMENT_MS);
+        assert_eq!(ENTER_COMPACT_MS, SWIFT_SEGMENT_MS);
         assert!((ease_in_cubic(0.0) - 0.0).abs() < 0.001);
         assert!((ease_in_cubic(1.0) - 1.0).abs() < 0.001);
         assert!(ease_in_cubic(0.5) < 0.5);

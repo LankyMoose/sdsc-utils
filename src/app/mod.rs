@@ -1440,7 +1440,7 @@ impl App {
                     Task::none()
                 }
             }
-            Message::StartImmersiveSettled => self.finish_start_immersive_transition(true),
+            Message::StartImmersiveSettled => self.finish_start_immersive_transition(),
             Message::StartArtEvent(ev) => {
                 use crate::ui::start::art_worker::ArtEventKind;
                 if !crate::ui::start::icon_cache::art_warm_is_current(ev.generation) {
@@ -4685,6 +4685,13 @@ impl App {
             to_pos: cover.origin(),
             started: now,
         });
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start promote growth {}x{} -> {}x{}",
+            compact.width,
+            compact.height,
+            cover.size().width,
+            cover.size().height
+        ));
         // Decode under ExitCompact blackout so settle is more often a warm hit.
         self.prewarm_immersive_art_for_promote();
         steam
@@ -4735,6 +4742,10 @@ impl App {
             to_pos,
             started: now,
         });
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start demote shrink {}x{} -> {}x{}",
+            from_size.width, from_size.height, compact.width, compact.height
+        ));
         Task::none()
     }
 
@@ -4791,11 +4802,10 @@ impl App {
     /// One animated-resize step (either direction). Returns `None` when no
     /// animation is running (normal tick flow continues).
     ///
-    /// Mid-growth (`t >= RESIZE_SETTLE_AT`) settles early without snapping:
-    /// the enter veil starts lifting while the window finishes growing
-    /// beneath it. Completion issues the exact target geometry plus settle
-    /// (a no-op when early settle already ran), so a degraded animation
-    /// heals instead of stranding the wrong presentation in a window.
+    /// Completion issues the exact target geometry chained into settle, so
+    /// the enter veil only ever lifts on exact geometry — never mid-morph.
+    /// (Settling mid-growth revealed chrome at the wrong size with a snap
+    /// jump at the end.)
     fn tick_resize_anim(&mut self, now: Instant) -> Option<Task<Message>> {
         let anim = self.start_resize_anim?;
         let Some(id) = self.start_window.filter(|_| self.start_visible) else {
@@ -4810,7 +4820,10 @@ impl App {
         );
         if t >= 1.0 {
             self.start_resize_anim = None;
-            crate::controller::hid::diag::diag_info("ui-diag: start resize anim done");
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start resize anim done size={}x{}",
+                anim.to_size.width, anim.to_size.height
+            ));
             let exact = window::resize(id, anim.to_size).chain(move_window(id, anim.to_pos));
             if self.start_state.transition.is_none()
                 && matches!(
@@ -4823,10 +4836,6 @@ impl App {
                 self.start_state.clear_transition_phase();
             }
             return Some(exact.chain(Task::done(Message::StartImmersiveSettled)));
-        }
-        if t >= start_mode::RESIZE_SETTLE_AT && self.start_state.transition.is_some() {
-            crate::controller::hid::diag::diag_info("ui-diag: start resize early settle");
-            return Some(self.finish_start_immersive_transition(false));
         }
         let eased = start_mode::ease_in_out_cubic(t);
         let size = Size::new(
@@ -4871,7 +4880,7 @@ impl App {
         window::resize(id, size).chain(move_window(id, position))
     }
 
-    fn finish_start_immersive_transition(&mut self, snap: bool) -> Task<Message> {
+    fn finish_start_immersive_transition(&mut self) -> Task<Message> {
         let Some(transition) = self.start_state.transition.take() else {
             return Task::none();
         };
@@ -4884,14 +4893,10 @@ impl App {
         self.start_state.slide = StartSlide::Games;
         // Dock/strip anims cleared via transition phase begin + request_dock defaults.
         let now = Instant::now();
-        // Exact snap first (when asked): stepped tasks can coalesce, so the
-        // full settle re-asserts geometry before flipping presentation —
-        // immersive chrome can never land in a compact window (or vice
-        // versa). The early (mid-growth) settle skips it so growth continues
-        // smoothly underneath; completion snaps exact instead.
-        let snap: Task<Message> = if !snap {
-            Task::none()
-        } else if immersive {
+        // Exact snap first: stepped tasks can coalesce, so settle re-asserts
+        // geometry before flipping presentation — immersive chrome can never
+        // land in a compact window (or vice versa).
+        let snap: Task<Message> = if immersive {
             self.snap_promote_target()
         } else {
             self.snap_compact_target()
