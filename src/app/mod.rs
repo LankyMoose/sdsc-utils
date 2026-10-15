@@ -343,6 +343,16 @@ pub enum StartKeyAction {
     Cancel,
 }
 
+/// Animated promote growth endpoints: centered compact → monitor cover.
+#[derive(Debug, Clone, Copy)]
+struct ResizeAnim {
+    from_size: Size,
+    to_size: Size,
+    from_pos: Point,
+    to_pos: Point,
+    started: Instant,
+}
+
 pub struct App {
     session: crate::session::DeviceSession,
     games: GamesCatalog,
@@ -392,6 +402,19 @@ pub struct App {
     start_window: Option<window::Id>,
     /// True only while Start is revealed (warm HWND may exist while false).
     start_visible: bool,
+    /// Last Start-window paint (for the transition paint-gap witness;
+    /// `Cell` because `view()` only gets `&self`).
+    last_start_paint_at: std::cell::Cell<Option<Instant>>,
+    /// Whether that paint happened with a transition ceremony live (gates the
+    /// witness so idle gaps never log).
+    last_start_paint_active: std::cell::Cell<bool>,
+    /// Demote-settle scroll stowed for the next tick, when the remounted
+    /// list exists. Fires once, then clears.
+    deferred_settle_scroll: Option<(start_view::StartListId, f32)>,
+    /// Animated promote growth (compact → cover) while `transition` is
+    /// `Promoting` / phase is `Resizing`. Stepped resizes keep presenting;
+    /// content holds black so joints are invisible.
+    start_resize_anim: Option<ResizeAnim>,
     /// False until Start is revealed and ready — blocks pad nav / sounds early.
     start_nav_ready: bool,
     start_state: start_view::State,
@@ -739,9 +762,13 @@ impl App {
             pad_input_panel: PadInputPanel::default(),
             start_window: None,
             start_visible: false,
+            last_start_paint_at: std::cell::Cell::new(None),
+            last_start_paint_active: std::cell::Cell::new(false),
+            deferred_settle_scroll: None,
             start_nav_ready: false,
             start_state: start_view::State::default(),
             start_monitor_cover: None,
+            start_resize_anim: None,
             start_last_activity: Instant::now(),
             start_cursor_last_active: Instant::now(),
             start_cursor_hidden: false,
@@ -1137,6 +1164,32 @@ impl App {
         }
 
         if Some(window) == self.start_window {
+            // Paint-gap witness (black-lockup forensics): while a transition
+            // ceremony is live the window must repaint ~60Hz. A gap here
+            // means paints starved while logic ran ahead — the render/present
+            // side, never the state machine. Armed only across live phases,
+            // so idle gaps never log.
+            let paint_now = Instant::now();
+            let paint_active = self.start_state.transition_phase.is_some()
+                || self.start_state.transition.is_some();
+            if paint_active
+                && self.last_start_paint_active.get()
+                && let Some(last) = self.last_start_paint_at.get()
+            {
+                let gap_ms = paint_now.saturating_duration_since(last).as_millis() as u64;
+                if gap_ms > 250 {
+                    let phase = self
+                        .start_state
+                        .transition_phase
+                        .map(|(p, _)| p.label())
+                        .unwrap_or("none");
+                    crate::controller::hid::diag::diag_info(format!(
+                        "ui-diag: start paint gap gap_ms={gap_ms} phase={phase}"
+                    ));
+                }
+            }
+            self.last_start_paint_at.set(Some(paint_now));
+            self.last_start_paint_active.set(paint_active);
             let cover = self.start_monitor_cover.map(|c| (c.width, c.height));
             let stage_w = cover.map(|(w, _)| w).unwrap_or(1920.0);
             let stage_h = cover.map(|(_, h)| h).unwrap_or(1080.0);
@@ -1499,7 +1552,25 @@ impl App {
                 self.start_state
                     .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
                 let was_cold = self.start_state.cold_load_active;
-                let _ = self.start_state.tick_anim(now);
+                // Frozen exit: while the outgoing presentation is on screen
+                // (promote/demote first half + resize blackout), its clocks
+                // stop — strip/dock/slide chases, hint presses, chrome status,
+                // idle timers and ambient time all hold their pre-transition
+                // frame instead of repainting (and reflowing) under the veil.
+                // Phase/veil/resize progress is wall-clock, so nothing the
+                // ceremony needs stops. Enter phases keep ticking (the new UI
+                // animates in by design).
+                let exiting = matches!(
+                    self.start_state.transition_phase.map(|(p, _)| p),
+                    Some(
+                        start_mode::TransitionPhase::ExitCompact
+                            | start_mode::TransitionPhase::ExitImmersive
+                            | start_mode::TransitionPhase::Resizing
+                    )
+                );
+                if !exiting {
+                    let _ = self.start_state.tick_anim(now);
+                }
                 let task = if was_cold && !self.start_state.cold_load_active {
                     self.note_cold_load_finished()
                 } else {
@@ -1519,14 +1590,16 @@ impl App {
                         return task.chain(self.complete_replace_confirm());
                     }
                 }
-                self.sync_start_held();
-                self.start_state.tick_hint_anims(now);
-                self.tick_start_cursor_idle(now);
-                if self.tick_start_idle(now) {
-                    self.pad_nav.prepare_on_open(false);
-                    crate::controller::hid::diag::diag_info(
-                        "ui-diag: start idle pad re-arm after sleep wake",
-                    );
+                if !exiting {
+                    self.sync_start_held();
+                    self.start_state.tick_hint_anims(now);
+                    self.tick_start_cursor_idle(now);
+                    if self.tick_start_idle(now) {
+                        self.pad_nav.prepare_on_open(false);
+                        crate::controller::hid::diag::diag_info(
+                            "ui-diag: start idle pad re-arm after sleep wake",
+                        );
+                    }
                 }
                 task
             }
@@ -4656,8 +4729,29 @@ impl App {
         self.clear_start_activity();
         self.arm_chord_release_latch();
         crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
+        let now = Instant::now();
         self.start_state
-            .begin_transition_phase(start_mode::TransitionPhase::ExitCompact, Instant::now());
+            .begin_transition_phase(start_mode::TransitionPhase::ExitCompact, now);
+        // Growth waits for the exit fade: the window holds its size while the
+        // outgoing chrome dims in place (frozen, no reflow), then morphs under
+        // the opaque Resizing blackout. The morph clock starts there, so every
+        // segment runs its full specified duration.
+        self.start_state.transition = Some(start_mode::StartTransition::Promoting);
+        let compact = Size::new(start_view::WIDTH, start_view::HEIGHT);
+        self.start_resize_anim = Some(ResizeAnim {
+            from_size: compact,
+            to_size: cover.size(),
+            from_pos: cover.center_for(compact),
+            to_pos: cover.origin(),
+            started: now,
+        });
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start promote growth {}x{} -> {}x{}",
+            compact.width,
+            compact.height,
+            cover.size().width,
+            cover.size().height
+        ));
         // Decode under ExitCompact blackout so settle is more often a warm hit.
         self.prewarm_immersive_art_for_promote();
         steam
@@ -4679,20 +4773,142 @@ impl App {
         self.arm_chord_release_latch();
         crate::controller::hid::diag::diag_info("ui-diag: start immersive leave");
         self.clear_start_activity();
+        let now = Instant::now();
         self.start_state
-            .begin_transition_phase(start_mode::TransitionPhase::ExitImmersive, Instant::now());
+            .begin_transition_phase(start_mode::TransitionPhase::ExitImmersive, now);
+        // Shrink waits for the exit fade (mirror of promote): the window holds
+        // its size while immersive dims in place, then morphs under black.
+        self.start_state.transition = Some(start_mode::StartTransition::Demoting);
+        let compact = Size::new(start_view::WIDTH, start_view::HEIGHT);
+        let cover = self.start_monitor_cover.or_else(primary_monitor_cover);
+        let (from_size, from_pos, to_pos) = match cover {
+            Some(cover) => (cover.size(), cover.origin(), cover.center_for(compact)),
+            None => (
+                compact,
+                Point::new(
+                    ((1920.0 - compact.width) / 2.0).max(0.0),
+                    ((1080.0 - compact.height) / 2.0).max(0.0),
+                ),
+                Point::new(
+                    ((1920.0 - compact.width) / 2.0).max(0.0),
+                    ((1080.0 - compact.height) / 2.0).max(0.0),
+                ),
+            ),
+        };
+        self.start_resize_anim = Some(ResizeAnim {
+            from_size,
+            to_size: compact,
+            from_pos,
+            to_pos,
+            started: now,
+        });
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start demote shrink {}x{} -> {}x{}",
+            from_size.width, from_size.height, compact.width, compact.height
+        ));
         Task::none()
     }
 
     fn tick_immersive_transition_phase(&mut self, now: Instant) -> Option<Task<Message>> {
+        // Deferred settle scroll (demote): fires once on the tick after
+        // settle, when the remounted list exists (a same-tick op can drop
+        // against the pre-swap tree — the StartOpened pattern).
+        if let Some(scroll) = self.take_deferred_settle_scroll() {
+            return match self.tick_immersive_transition_phase_inner(now) {
+                Some(task) => Some(scroll.chain(task)),
+                None => Some(scroll),
+            };
+        }
+        self.tick_immersive_transition_phase_inner(now)
+    }
+
+    fn tick_immersive_transition_phase_inner(&mut self, now: Instant) -> Option<Task<Message>> {
+        // Strand recovery: Resizing advances only via the morph driver — with
+        // no anim (lost settle message) wall-clock completion can never fire
+        // and the window would sit on black forever. Settle directly while a
+        // transition is live; otherwise drop the orphaned blackout and paint
+        // current state. Age-gated: right after a normal morph completion the
+        // driver is also gone (Settled message still in flight), and settling
+        // there would double-settle every transition — only a strand persists
+        // past morph-spec + grace.
+        if matches!(
+            self.start_state.transition_phase.map(|(p, _)| p),
+            Some(start_mode::TransitionPhase::Resizing)
+        ) && self.start_resize_anim.is_none()
+        {
+            let age_ms = self
+                .start_state
+                .transition_phase
+                .map(|(_, started)| now.saturating_duration_since(started).as_millis() as u64)
+                .unwrap_or(0);
+            if age_ms <= start_mode::RESIZE_MS.saturating_add(1000) {
+                return None;
+            }
+            if !self.start_visible {
+                self.start_state.transition = None;
+                self.start_state.clear_transition_phase();
+                return Some(Task::none());
+            }
+            if self.start_state.transition.is_some() {
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: start resizing strand, settling directly",
+                );
+                return Some(self.finish_start_immersive_transition());
+            }
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: start resizing orphan, clearing blackout",
+            );
+            self.start_state.clear_transition_phase();
+            return Some(Task::none());
+        }
+        // The HWND morph runs only under the opaque Resizing blackout, never
+        // under the exit fade: the outgoing chrome holds its window size (and
+        // frozen clocks) through the fade, so nothing reflows mid-exit. The
+        // morph's `started` resets when Resizing begins, guaranteeing the
+        // full specified duration. (Resizing never finishes by timer.)
+        let exiting = matches!(
+            self.start_state.transition_phase.map(|(p, _)| p),
+            Some(start_mode::TransitionPhase::ExitCompact)
+                | Some(start_mode::TransitionPhase::ExitImmersive)
+        );
+        if !exiting && let Some(task) = self.tick_resize_anim(now) {
+            return Some(task);
+        }
         if !self.start_state.phase_finished(now) {
             return None;
         }
-        let phase = self.start_state.transition_phase.map(|(p, _)| p)?;
+        let (phase, started) = self.start_state.transition_phase?;
+        // Overrun witness for the next forensics: completions are wall-clock,
+        // so a phase ending far past its spec means ticks starved (the black
+        // window outlived the ceremony in paint-time, not logic-time).
+        let elapsed_ms = now.saturating_duration_since(started).as_millis() as u64;
+        let allowance_ms = match phase {
+            // Art hold (up to ENTER_ART_HOLD_MAX_MS) precedes the lift.
+            start_mode::TransitionPhase::EnterImmersive => {
+                crate::ui::start::mode::ENTER_ART_HOLD_MAX_MS
+                    + crate::ui::start::mode::ENTER_REVEAL_MS
+                    + 1000
+            }
+            _ => phase.duration_ms().saturating_add(1000),
+        };
+        if elapsed_ms > allowance_ms {
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start phase overrun phase={} elapsed_ms={elapsed_ms} spec_ms={}",
+                phase.label(),
+                phase.duration_ms()
+            ));
+        }
         match phase {
-            start_mode::TransitionPhase::ExitCompact => Some(self.perform_immersive_resize(true)),
-            start_mode::TransitionPhase::ExitImmersive => {
-                Some(self.perform_immersive_resize(false))
+            // Exit fade done over a static window: start the morph now, under
+            // black (or settle directly if the morph already ran).
+            start_mode::TransitionPhase::ExitCompact
+            | start_mode::TransitionPhase::ExitImmersive => {
+                if let Some(anim) = self.start_resize_anim.as_mut() {
+                    anim.started = now;
+                    self.start_state
+                        .begin_transition_phase(start_mode::TransitionPhase::Resizing, now);
+                }
+                None
             }
             start_mode::TransitionPhase::EnterImmersive => {
                 self.start_state.clear_transition_phase();
@@ -4702,7 +4918,11 @@ impl App {
                     "ui-diag: start immersive transition phase={} done",
                     phase.label()
                 ));
-                Some(self.flush_deferred_steam_scan_after_promote())
+                // Second exact snap: stepped tasks can coalesce, so re-assert
+                // the cover here (~one reveal after settle) — a no-op when
+                // already exact, a heal when the animation lost steps.
+                let resnap = self.snap_promote_target();
+                Some(resnap.chain(self.flush_deferred_steam_scan_after_promote()))
             }
             start_mode::TransitionPhase::EnterCompact => {
                 self.start_state.clear_transition_phase();
@@ -4711,66 +4931,141 @@ impl App {
                     "ui-diag: start immersive transition phase={} done",
                     phase.label()
                 ));
-                // After the Float scale veil clears, force the compact list onto the selection
-                // (stale tracked offset from pre-promote often makes into-view a no-op).
-                Some(self.scroll_start_selection_for_open())
+                // Center backstop, conditional: the deferred + mount
+                // corrections usually landed it invisibly behind the veil. A
+                // match issues nothing, so a correct reveal can never snap
+                // here; a real mismatch still lands centered (visibly, but
+                // correctly) and the log line marks it.
+                if let Some((id, target)) = self.start_state.open_reveal_scroll() {
+                    let offset = start_view::StartListId::from_scroll_id(&id)
+                        .map(|list| self.start_state.list_offset(list))
+                        .unwrap_or(target);
+                    if (target - offset).abs() > 2.0 {
+                        crate::controller::hid::diag::diag_info(format!(
+                            "ui-diag: start demote reveal backstop offset={offset:.0} target={target:.0}"
+                        ));
+                        return Some(self.scroll_start_selection_for_open());
+                    }
+                }
+                None
             }
             start_mode::TransitionPhase::Resizing => None,
         }
     }
 
-    fn perform_immersive_resize(&mut self, promoting: bool) -> Task<Message> {
+    /// One animated-resize step (either direction). Returns `None` when no
+    /// animation is running (normal tick flow continues). Only ticked during
+    /// the opaque Resizing phase — never under an exit fade — with `started`
+    /// reset at Resizing begin, so the morph always runs its full duration.
+    ///
+    /// Completion issues the exact target geometry chained into settle, so
+    /// the enter veil only ever lifts on exact geometry — never mid-morph.
+    /// (Settling mid-growth revealed chrome at the wrong size with a snap
+    /// jump at the end.)
+    fn tick_resize_anim(&mut self, now: Instant) -> Option<Task<Message>> {
+        let anim = self.start_resize_anim?;
         let Some(id) = self.start_window.filter(|_| self.start_visible) else {
+            self.start_resize_anim = None;
+            self.start_state.transition = None;
             self.start_state.clear_transition_phase();
+            return Some(Task::none());
+        };
+        let t = start_mode::phase_progress_linear(
+            now.saturating_duration_since(anim.started).as_millis() as u64,
+            start_mode::RESIZE_MS,
+        );
+        if t >= 1.0 {
+            self.start_resize_anim = None;
+            let elapsed_ms = now.saturating_duration_since(anim.started).as_millis() as u64;
+            // Overrun witness: the morph is wall-clock, so finishing far past
+            // spec means ticks starved mid-morph (black outlived the ceremony).
+            if elapsed_ms > start_mode::RESIZE_MS.saturating_add(1000) {
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start resize overrun elapsed_ms={elapsed_ms} spec_ms={}",
+                    start_mode::RESIZE_MS
+                ));
+            }
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start resize anim done size={}x{}",
+                anim.to_size.width, anim.to_size.height
+            ));
+            let exact = window::resize(id, anim.to_size).chain(move_window(id, anim.to_pos));
+            if self.start_state.transition.is_none()
+                && matches!(
+                    self.start_state.transition_phase.map(|(p, _)| p),
+                    Some(start_mode::TransitionPhase::Resizing)
+                )
+            {
+                // Orphaned black tail (settle already ran or was skipped):
+                // clear it so the settled chrome paints.
+                self.start_state.clear_transition_phase();
+            }
+            return Some(exact.chain(Task::done(Message::StartImmersiveSettled)));
+        }
+        let eased = start_mode::ease_in_out_cubic(t);
+        let size = Size::new(
+            anim.from_size.width + (anim.to_size.width - anim.from_size.width) * eased,
+            anim.from_size.height + (anim.to_size.height - anim.from_size.height) * eased,
+        );
+        let pos = Point::new(
+            anim.from_pos.x + (anim.to_pos.x - anim.from_pos.x) * eased,
+            anim.from_pos.y + (anim.to_pos.y - anim.from_pos.y) * eased,
+        );
+        Some(window::resize(id, size).chain(move_window(id, pos)))
+    }
+
+    /// Exact snap to the promote target (cover). Stepped tasks can coalesce,
+    /// so settle re-asserts: a degraded animation heals here instead of
+    /// leaving immersive chrome in a compact window.
+    fn snap_promote_target(&self) -> Task<Message> {
+        let (Some(id), Some(cover)) = (
+            self.start_window.filter(|_| self.start_visible),
+            self.start_monitor_cover,
+        ) else {
             return Task::none();
         };
-        let transition = if promoting {
-            start_mode::StartTransition::Promoting
-        } else {
-            start_mode::StartTransition::Demoting
+        window::resize(id, cover.size()).chain(move_window(id, cover.origin()))
+    }
+
+    /// Exact snap to the demote target (centered compact). Same heal as
+    /// [`snap_promote_target`] for the shrink direction.
+    fn snap_compact_target(&self) -> Task<Message> {
+        let Some(id) = self.start_window.filter(|_| self.start_visible) else {
+            return Task::none();
         };
-        self.start_state.transition = Some(transition);
-        self.start_state
-            .begin_transition_phase(start_mode::TransitionPhase::Resizing, Instant::now());
-        if promoting {
-            let cover = self.start_monitor_cover.unwrap_or_else(|| {
-                primary_monitor_cover().unwrap_or(MonitorCover {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 1920.0,
-                    height: 1080.0,
-                })
-            });
-            self.start_monitor_cover = Some(cover);
-            window::resize(id, cover.size())
-                .chain(move_window(id, cover.origin()))
-                .chain(Task::done(Message::StartImmersiveSettled))
-        } else {
-            let size = Size::new(start_view::WIDTH, start_view::HEIGHT);
-            let position = self
-                .start_monitor_cover
-                .or_else(primary_monitor_cover)
-                .map(|cover| cover.center_for(size))
-                .unwrap_or(Point::new(
-                    ((1920.0 - size.width) / 2.0).max(0.0),
-                    ((1080.0 - size.height) / 2.0).max(0.0),
-                ));
-            window::resize(id, size)
-                .chain(move_window(id, position))
-                .chain(Task::done(Message::StartImmersiveSettled))
-        }
+        let size = Size::new(start_view::WIDTH, start_view::HEIGHT);
+        let position = self
+            .start_monitor_cover
+            .or_else(primary_monitor_cover)
+            .map(|cover| cover.center_for(size))
+            .unwrap_or(Point::new(
+                ((1920.0 - size.width) / 2.0).max(0.0),
+                ((1080.0 - size.height) / 2.0).max(0.0),
+            ));
+        window::resize(id, size).chain(move_window(id, position))
     }
 
     fn finish_start_immersive_transition(&mut self) -> Task<Message> {
         let Some(transition) = self.start_state.transition.take() else {
             return Task::none();
         };
+        // The animation already resolved (or never ran); never leave a stale
+        // driver behind to resize a settled window.
+        self.start_resize_anim = None;
         let immersive = start_mode::settle_immersive(transition);
         self.start_state.immersive = immersive;
         self.start_state.dock_expanded = false;
         self.start_state.slide = StartSlide::Games;
         // Dock/strip anims cleared via transition phase begin + request_dock defaults.
         let now = Instant::now();
+        // Exact snap first: stepped tasks can coalesce, so settle re-asserts
+        // geometry before flipping presentation — immersive chrome can never
+        // land in a compact window (or vice versa).
+        let snap: Task<Message> = if immersive {
+            self.snap_promote_target()
+        } else {
+            self.snap_compact_target()
+        };
         if immersive {
             // Keep ambient_time; open aperture + chrome.
             // Lift onto ambient+dock immediately (cold-style); list stays hidden until art sync.
@@ -4806,12 +5101,65 @@ impl App {
             .map(|id| focus_window(id).chain(raise_window_topmost(id)))
             .unwrap_or_else(Task::none);
         if immersive {
-            focus.chain(self.warm_immersive_art_task())
+            snap.chain(focus).chain(self.warm_immersive_art_task())
         } else {
-            // Center selection as soon as compact chrome exists; EnterCompact completion
-            // re-centers once the scale Float is gone (see tick_immersive_transition_phase).
-            focus.chain(self.scroll_start_selection_for_open())
+            // Center selection as soon as compact chrome exists: issue now
+            // (may drop against the pre-swap tree) AND stow for the next
+            // tick, when the remounted list exists (StartOpened pattern).
+            // EnterCompact completion re-centers as backstop.
+            let immediate = self.scroll_start_selection_for_open();
+            self.stow_deferred_settle_scroll();
+            if let Some((sel, rows, row_top, vh, y)) = self.start_state.games_reveal_debug() {
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start demote reveal settle sel={sel} rows={rows} row_top={row_top:.0} vh={vh:.0} y={y:.0}"
+                ));
+            }
+            snap.chain(focus).chain(immediate)
         }
+    }
+
+    /// Stow the open-time reveal for the tick after settle: the compact list
+    /// remounts under the new tree, so a same-tick `scroll_to` can drop.
+    /// Fires once (next tick, still behind the opaque lift), then clears.
+    fn stow_deferred_settle_scroll(&mut self) {
+        let Some((id, y)) = self.start_state.open_reveal_scroll() else {
+            self.deferred_settle_scroll = None;
+            return;
+        };
+        if let Some(list) = start_view::StartListId::from_scroll_id(&id) {
+            self.deferred_settle_scroll = Some((list, y));
+        }
+    }
+
+    /// Issue the stowed settle scroll once, then drop it. Recomputes at fire
+    /// time: the remount's first `on_scroll` may have reported the real
+    /// viewport since settle, and centering against a stale/estimate viewport
+    /// lands off-center (visible as a snap when the completion backstop
+    /// re-issues it after the lift). Falls back to the stowed target when
+    /// nothing is computable.
+    fn take_deferred_settle_scroll(&mut self) -> Option<Task<Message>> {
+        let (list, stowed_y) = self.deferred_settle_scroll.take()?;
+        if !self.start_visible {
+            return None;
+        }
+        let y = match self.start_state.open_reveal_scroll() {
+            Some((id, y)) if start_view::StartListId::from_scroll_id(&id) == Some(list) => y,
+            _ => stowed_y,
+        };
+        if (y - stowed_y).abs() > 0.5 {
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start demote reveal deferred list={list:?} vh={:.0} y={y:.0} (stowed {stowed_y:.0})",
+                self.start_state.list_viewport(list)
+            ));
+        }
+        self.start_state.note_scroll_y(&list.scroll_id(), y);
+        Some(operation::scroll_to(
+            list.scroll_id(),
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
+        ))
     }
 
     /// Arm the debounced release latch and mark any locally visible chord consumed.
@@ -4980,6 +5328,12 @@ impl App {
         self.start_revealed_at = None;
         self.start_state.immersive = false;
         self.start_state.clear_immersive_session();
+        // Drop any in-flight promote/demote ceremony (animated growth must
+        // not keep resizing a closing window; reopen starts clean).
+        self.start_state.transition = None;
+        self.start_state.clear_transition_phase();
+        self.start_resize_anim = None;
+        self.deferred_settle_scroll = None;
         // Invalidate in-flight art events; keep caches for fast reopen.
         // Process Exit is what wipes to a blank slate (`art_worker::shutdown`).
         let generation = crate::ui::start::icon_cache::bump_art_warm_generation();
@@ -5265,6 +5619,9 @@ impl App {
                 if self.start_state.overlay_blocking() || self.start_state.transition.is_some() {
                     return Task::none();
                 }
+                // User took over post-settle browsing: a stowed settle
+                // scroll is moot (its target predates this slide change).
+                self.deferred_settle_scroll = None;
                 if self.start_state.editing {
                     // Slide-switch discards the draft (cancel-equivalent): revive
                     // the pre-edit anchor game, else nearest-enabled, so the
@@ -5295,6 +5652,8 @@ impl App {
                 if self.start_state.overlay_blocking() || self.start_state.transition.is_some() {
                     return Task::none();
                 }
+                // Same stowed-scroll drop as PrevSlide (user took over).
+                self.deferred_settle_scroll = None;
                 if self.start_state.editing {
                     // Same cancel-equivalent discard as PrevSlide (see above).
                     let anchor = self.start_state.edit_anchor_play_key.clone();
@@ -5351,6 +5710,18 @@ impl App {
             StartMessage::GamesScrolled(y, viewport_h) => {
                 self.start_state
                     .record_list_scroll(start_view::StartListId::Games, y, viewport_h);
+                // Demote remount correction: fresh reports carry the real
+                // viewport (settle math may have used a stale/estimate one).
+                // Re-land the center invisibly behind the enter veil instead
+                // of snapping at lift end. Nav is blocked while the phase is
+                // live, so reports here are mount/scroll_to echoes, never
+                // user browsing.
+                if matches!(
+                    self.start_state.transition_phase.map(|(p, _)| p),
+                    Some(start_mode::TransitionPhase::EnterCompact)
+                ) {
+                    return self.correct_demoted_games_reveal(y);
+                }
                 Task::none()
             }
             StartMessage::ControllersScrolled(y, viewport_h) => {
@@ -5627,6 +5998,29 @@ impl App {
             operation::AbsoluteOffset {
                 x: None,
                 y: Some(y),
+            },
+        )
+    }
+
+    /// Re-issue the demote center when a fresh mount report disagrees with it.
+    /// Converges in one step: the correction's own echo reports the target
+    /// back, inside tolerance, and no further op issues.
+    fn correct_demoted_games_reveal(&mut self, reported_y: f32) -> Task<Message> {
+        let Some((id, target)) = self.start_state.selection_scroll_y_center_prefer() else {
+            return Task::none();
+        };
+        if (target - reported_y).abs() <= 2.0 {
+            return Task::none();
+        }
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start demote reveal correct reported={reported_y:.0} target={target:.0}"
+        ));
+        self.start_state.note_scroll_y(&id, target);
+        operation::scroll_to(
+            id,
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(target),
             },
         )
     }
@@ -7208,7 +7602,19 @@ fn pad_input_edge_stream() -> impl Stream<Item = Message> {
         let (tx, mut rx) = iced::futures::channel::mpsc::channel(128);
         start_input::bind_input_edge_sender(tx);
         let _guard = InputEdgeBindGuard;
-        while let Some(edge) = rx.next().await {
+        while let Some(first) = rx.next().await {
+            // Conflate to the latest buffered edge: readings are absolute
+            // state, so intermediates are stale by definition. Without this,
+            // a saturated loop pays a full nav/update/view cycle per queued
+            // edge after it recovers — a backlog spree that prolongs the
+            // stall instead of ending it. Normally the buffer holds ≤1 and
+            // this is a no-op (taps are never at risk when the loop is
+            // healthy; when saturated they are already being dropped at
+            // try_send).
+            let mut edge = first;
+            while let Ok(next) = rx.try_recv() {
+                edge = next;
+            }
             if output.send(Message::PadInput(edge)).await.is_err() {
                 break;
             }

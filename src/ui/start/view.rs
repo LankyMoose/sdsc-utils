@@ -24,7 +24,7 @@ use iced::widget::{
 };
 use iced::{
     Alignment, Background, Border, Color, ContentFit, Element, Fill, Font, Length, Padding, Point,
-    Rectangle, Renderer, Theme,
+    Rectangle, Renderer, Size, Theme,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -73,6 +73,10 @@ const PRESSED_SCALE: f32 = 1.1;
 /// Pressed grow and armed-color transitions.
 const HINT_ANIM: Duration = Duration::from_millis(crate::ui::motion::FAST_MS);
 const ROW_GAP: f32 = 8.0;
+/// Height of a games-list section separator (centered label + fading hairlines).
+const SECTION_SEP_H: f32 = 30.0;
+/// Size of the section separator label.
+const SECTION_SEP_TEXT: f32 = 14.0;
 const ROW_ACTION_SPACING: f32 = 14.0;
 /// Body width inside outer padding — dual-pane strip unit.
 const PANE_W: f32 = WIDTH - 2.0 * PADDING;
@@ -689,12 +693,25 @@ struct PositionSlideAnim {
     started: Instant,
 }
 
-/// Frame-capped EnterImmersive veil clock (armed once the window can paint).
+/// Wall-clock EnterImmersive veil clock (armed once the window can paint).
+///
+/// Progress derives from the arm [`Instant`], so the lift lasts exactly
+/// [`ENTER_REVEAL_MS`](crate::ui::start::mode::ENTER_REVEAL_MS) no matter the
+/// frame rate — a stall jumps time-correctly along the curve instead of
+/// stretching the phase past its specified duration.
 #[derive(Debug, Clone)]
 struct EnterRevealClock {
-    elapsed_ms: u64,
     armed: bool,
-    last_tick: Option<Instant>,
+    armed_at: Option<Instant>,
+}
+
+impl EnterRevealClock {
+    fn elapsed_ms(&self, now: Instant) -> u64 {
+        match (self.armed, self.armed_at) {
+            (true, Some(at)) => now.saturating_duration_since(at).as_millis() as u64,
+            _ => 0,
+        }
+    }
 }
 
 /// Eased immersive idle/sleep dim crossfade.
@@ -1208,13 +1225,23 @@ impl State {
     pub fn selection_scroll_y(&self, direction: ScrollReveal) -> Option<(iced::widget::Id, f32)> {
         match self.slide {
             StartSlide::Games => {
-                let y = scroll_y_to_reveal(
-                    self.game_selected,
-                    self.rows.len(),
+                if self.rows.is_empty() || self.game_selected >= self.rows.len() {
+                    return None;
+                }
+                let sections = games_row_sections(self);
+                let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
+                    + separator_offset_above(&sections, self.game_selected);
+                let viewport = self.scrolls.viewport(StartListId::Games);
+                let viewport = if viewport <= 1.0 {
+                    estimated_list_viewport_h()
+                } else {
+                    viewport
+                };
+                let y = scroll_y_to_reveal_bounds(
+                    row_top,
                     ROW_HEIGHT,
-                    ROW_GAP,
                     self.scrolls.offset(StartListId::Games),
-                    self.scrolls.viewport(StartListId::Games),
+                    viewport,
                     direction,
                 )?;
                 Some((StartListId::Games.scroll_id(), y))
@@ -1239,16 +1266,27 @@ impl State {
         if self.slide != StartSlide::Games {
             return None;
         }
-        let y = scroll_y_center(
-            self.game_selected,
-            self.rows.len(),
+        if self.rows.is_empty() || self.game_selected >= self.rows.len() {
+            return None;
+        }
+        let sections = games_row_sections(self);
+        let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
+            + separator_offset_above(&sections, self.game_selected);
+        let viewport = self.scrolls.viewport(StartListId::Games);
+        let y = scroll_y_center_top(
+            row_top,
             ROW_HEIGHT,
-            ROW_GAP,
             self.scrolls.offset(StartListId::Games),
-            self.scrolls.viewport(StartListId::Games),
+            viewport,
             false,
         )?;
-        Some((StartListId::Games.scroll_id(), y))
+        // Clamp to the real content range: iced silently clamps an
+        // overshooting target, leaving the tracker holding a phantom offset
+        // that reads as a late snap when re-issued.
+        Some((
+            StartListId::Games.scroll_id(),
+            y.min(self.games_max_scroll(viewport)),
+        ))
     }
 
     /// Always scroll so the games selection is as centered as the list allows.
@@ -1256,16 +1294,69 @@ impl State {
         if self.slide != StartSlide::Games {
             return None;
         }
-        let y = scroll_y_center(
-            self.game_selected,
-            self.rows.len(),
+        if self.rows.is_empty() || self.game_selected >= self.rows.len() {
+            return None;
+        }
+        let sections = games_row_sections(self);
+        let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
+            + separator_offset_above(&sections, self.game_selected);
+        let viewport = self.scrolls.viewport(StartListId::Games);
+        let y = scroll_y_center_top(
+            row_top,
             ROW_HEIGHT,
-            ROW_GAP,
             self.scrolls.offset(StartListId::Games),
-            self.scrolls.viewport(StartListId::Games),
+            viewport,
             true,
         )?;
-        Some((StartListId::Games.scroll_id(), y))
+        Some((
+            StartListId::Games.scroll_id(),
+            y.min(self.games_max_scroll(viewport)),
+        ))
+    }
+
+    /// Max scroll offset for the compact games list (content minus viewport,
+    /// floored) under the given viewport (same estimate fallback as the
+    /// reveal math when iced has not reported bounds yet).
+    pub(crate) fn games_max_scroll(&self, viewport_h: f32) -> f32 {
+        let viewport_h = if viewport_h <= 1.0 {
+            estimated_list_viewport_h()
+        } else {
+            viewport_h
+        };
+        let rows = self.rows.len();
+        if rows == 0 {
+            return 0.0;
+        }
+        let sections = games_row_sections(self);
+        let seps = sections.windows(2).filter(|w| w[0] != w[1]).count();
+        let content = rows as f32 * ROW_HEIGHT
+            + seps as f32 * SECTION_SEP_H
+            + rows.saturating_add(seps).saturating_sub(1) as f32 * ROW_GAP;
+        (content - viewport_h).max(0.0)
+    }
+
+    /// Demote-reveal geometry for `ui-diag`: (selected, rows, row_top,
+    /// raw reported viewport, computed center target). Settle logs this and
+    /// completion logs it again — a drift in viewport or row_top between the
+    /// two is the snap's signature.
+    pub(crate) fn games_reveal_debug(&self) -> Option<(usize, usize, f32, f32, f32)> {
+        if self.slide != StartSlide::Games
+            || self.rows.is_empty()
+            || self.game_selected >= self.rows.len()
+        {
+            return None;
+        }
+        let sections = games_row_sections(self);
+        let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
+            + separator_offset_above(&sections, self.game_selected);
+        let (_, y) = self.selection_scroll_y_center_prefer()?;
+        Some((
+            self.game_selected,
+            self.rows.len(),
+            row_top,
+            self.scrolls.viewport(StartListId::Games),
+            y,
+        ))
     }
 
     /// Scroll target that makes the current slide's selection visible on open.
@@ -2159,9 +2250,8 @@ impl State {
         self.transition_phase = Some((phase, now));
         if matches!(phase, TransitionPhase::EnterImmersive) {
             self.enter_reveal = Some(EnterRevealClock {
-                elapsed_ms: 0,
                 armed: false,
-                last_tick: None,
+                armed_at: None,
             });
             // Hide strip until art sync / timeout begins the list reveal (cold + promote).
             self.games_list_reveal_at = None;
@@ -2202,8 +2292,7 @@ impl State {
             return;
         }
         clock.armed = true;
-        clock.last_tick = Some(now);
-        clock.elapsed_ms = 0;
+        clock.armed_at = Some(now);
         crate::controller::hid::diag::diag_info("ui-diag: start immersive enter reveal armed");
     }
 
@@ -2729,32 +2818,11 @@ impl State {
         self.arm_enter_reveal(now);
     }
 
-    /// Advance the capped EnterImmersive clock. Call once per StartFrame.
-    pub fn advance_enter_reveal(&mut self, now: Instant) {
-        use crate::ui::start::mode::ENTER_REVEAL_MAX_FRAME_MS;
-        let Some(clock) = self.enter_reveal.as_mut() else {
-            return;
-        };
-        if !clock.armed {
-            return;
-        }
-        let last = clock.last_tick.unwrap_or(now);
-        let raw_ms = now.saturating_duration_since(last).as_millis() as u64;
-        let dt = raw_ms.min(ENTER_REVEAL_MAX_FRAME_MS);
-        if raw_ms > ENTER_REVEAL_MAX_FRAME_MS {
-            crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: start immersive enter reveal capped raw_ms={raw_ms}"
-            ));
-        }
-        clock.elapsed_ms = clock.elapsed_ms.saturating_add(dt);
-        clock.last_tick = Some(now);
-    }
-
-    /// EnterImmersive veil alpha from the capped clock (1 = solid, 0 = clear).
-    pub fn enter_veil_amount(&self) -> f32 {
+    /// EnterImmersive veil alpha from the wall-clock reveal time (1 = solid, 0 = clear).
+    pub fn enter_veil_amount(&self, now: Instant) -> f32 {
         use crate::ui::start::mode::enter_veil_amount;
         match &self.enter_reveal {
-            Some(clock) if clock.armed => enter_veil_amount(clock.elapsed_ms),
+            Some(clock) if clock.armed => enter_veil_amount(clock.elapsed_ms(now)),
             Some(_) => 1.0,
             None => 0.0,
         }
@@ -2773,7 +2841,7 @@ impl State {
                 .enter_reveal
                 .as_ref()
                 .filter(|c| c.armed)
-                .map(|c| c.elapsed_ms)
+                .map(|c| c.elapsed_ms(now))
                 .unwrap_or(0);
             return phase_progress_linear(elapsed, ENTER_REVEAL_MS);
         }
@@ -2795,7 +2863,7 @@ impl State {
                 .enter_reveal
                 .as_ref()
                 .filter(|c| c.armed)
-                .map(|c| c.elapsed_ms)
+                .map(|c| c.elapsed_ms(now))
                 .unwrap_or(0);
             return phase_progress_linear(elapsed, ENTER_REVEAL_MS);
         }
@@ -2819,7 +2887,7 @@ impl State {
             return self
                 .enter_reveal
                 .as_ref()
-                .is_some_and(|c| c.armed && c.elapsed_ms >= dur);
+                .is_some_and(|c| c.armed && c.elapsed_ms(now) >= dur);
         }
         now.saturating_duration_since(started) >= Duration::from_millis(dur)
     }
@@ -3269,7 +3337,6 @@ impl State {
     pub fn tick_anim(&mut self, now: Instant) -> bool {
         self.maybe_force_enter_reveal_after_art_hold(now);
         let _ = self.try_arm_enter_reveal_when_art_ready(now);
-        self.advance_enter_reveal(now);
         self.try_start_pending_splash_reveal(now);
         self.tick_chrome_status(now);
         let mut busy = false;
@@ -3657,24 +3724,18 @@ fn estimated_list_viewport_h() -> f32 {
     (HEIGHT - 2.0 * PAD_Y - HEADER_HEIGHT - 1.0 - 30.0 - FOOTER_HEIGHT).max(120.0)
 }
 
-/// Center `index` in the viewport.
+/// Center a row at known content `row_top` in the viewport.
 ///
 /// When `force` is false, returns `None` if the row is already fully visible.
-pub(crate) fn scroll_y_center(
-    index: usize,
-    len: usize,
+/// Callers with a uniform index stride pass `index * (row_h + gap)`; the
+/// compact games list adds [`separator_offset_above`] for section dividers.
+pub(crate) fn scroll_y_center_top(
+    row_top: f32,
     row_h: f32,
-    gap: f32,
     scroll_y: f32,
     viewport_h: f32,
     force: bool,
 ) -> Option<f32> {
-    if len == 0 || index >= len {
-        return None;
-    }
-    let stride = row_h + gap;
-    let row_top = index as f32 * stride;
-    let row_bottom = row_top + row_h;
     let viewport_h = if viewport_h <= 1.0 {
         estimated_list_viewport_h()
     } else {
@@ -3683,7 +3744,7 @@ pub(crate) fn scroll_y_center(
     if !force {
         let view_top = scroll_y;
         let view_bottom = scroll_y + viewport_h;
-        if row_top >= view_top && row_bottom <= view_bottom {
+        if row_top >= view_top && row_top + row_h <= view_bottom {
             return None;
         }
     }
@@ -3911,16 +3972,35 @@ pub fn view<'a>(
     #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
     use crate::ui::start::mode::TransitionPhase;
-    if matches!(
-        state.transition_phase.map(|(p, _)| p),
-        Some(TransitionPhase::Resizing)
-    ) || state.transition.is_some()
+    let phase = state.transition_phase.map(|(p, _)| p);
+    // Animated growth/shrink holds opaque black: the window stretches
+    // underneath and both joints (exit-veil end, enter-veil start) are
+    // black-on-black. The box carries the window radius itself so corners
+    // stay rounded throughout (it would cover the chrome backdrop).
+    if matches!(phase, Some(TransitionPhase::Resizing)) {
+        return container(space())
+            .width(Fill)
+            .height(Fill)
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(Color::BLACK)),
+                border: Border {
+                    radius: crate::ui::chrome::window_radius().into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            })
+            .into();
+    }
+    if state.transition.is_some()
+        && !matches!(
+            phase,
+            Some(TransitionPhase::ExitCompact) | Some(TransitionPhase::ExitImmersive)
+        )
     {
         return crate::ui::start::immersive::veil_view(state, now);
     }
 
     let chrome_status = state.chrome_load_status(now);
-    let phase = state.transition_phase.map(|(p, _)| p);
     let show_immersive = state.immersive
         || matches!(
             phase,
@@ -3948,7 +4028,13 @@ pub fn view<'a>(
     // scrollable is not remounted (and scroll reset) when promote begins.
     let veil = match phase {
         Some(TransitionPhase::ExitCompact) => state.phase_progress(now),
-        Some(TransitionPhase::EnterCompact) => 1.0 - state.phase_progress(now),
+        // Ease-IN (not out): the veil stays near-opaque for the first ~50ms
+        // while the remounted list lands its deferred scroll invisibly,
+        // then lifts. Ease-out dropped 70% in that window, exposing the
+        // landing as a snap right at the end.
+        Some(TransitionPhase::EnterCompact) => {
+            1.0 - crate::ui::start::mode::ease_in_cubic(state.phase_progress_linear(now))
+        }
         _ => 0.0,
     };
     // Flat hints under the dim veil — Float face glyphs would paint above it.
@@ -3988,6 +4074,9 @@ pub fn view<'a>(
     } else {
         space().width(Fill).height(Fill).into()
     };
+    // Frozen exit: the window holds its size through the exit fade, so the
+    // outgoing chrome never reflows — the morph runs later, under the opaque
+    // Resizing blackout. The tree shape is unchanged (no remount/scroll reset).
     stack![with_veil, settings_layer]
         .width(Fill)
         .height(Fill)
@@ -4382,6 +4471,124 @@ pub(crate) fn list_key(s: &str) -> u64 {
     hash
 }
 
+/// Section index for each games row in list order under the current section
+/// mode (same [`games_section_mode`] the immersive rail uses).
+fn games_row_sections(state: &State) -> Vec<usize> {
+    let mode = state.games_section_mode();
+    let now_ms = crate::ui::start::position::now_ms();
+    let utc_offset = crate::ui::start::position::local_utc_offset_secs();
+    state
+        .rows
+        .iter()
+        .map(|row| {
+            crate::ui::start::position::section_index(
+                mode,
+                &row.title,
+                row.played_at_ms,
+                now_ms,
+                utc_offset,
+            )
+        })
+        .collect()
+}
+
+/// Extra stacked height above row `index` from section separators: one
+/// [`SECTION_SEP_H`] block (+ column gap) per section change at or before it.
+/// Separators render *between* sections only, so the first row never shifts.
+fn separator_offset_above(sections: &[usize], index: usize) -> f32 {
+    let end = index.min(sections.len().saturating_sub(1));
+    let mut changes = 0;
+    for j in 1..=end {
+        if sections[j] != sections[j - 1] {
+            changes += 1;
+        }
+    }
+    changes as f32 * (SECTION_SEP_H + ROW_GAP)
+}
+
+/// Full-width section separator: centered label with a hairline on either
+/// side, vertically aligned. Each rule fades from [`theme::LINE`] at the text
+/// to transparent at the far edge (same fade language as the immersive rail).
+/// Only emitted between non-empty sections.
+fn section_separator(label: &'static str) -> Element<'static, StartMessage> {
+    container(
+        row![
+            iced::widget::canvas(SeparatorFade { solid_right: true })
+                .width(Fill)
+                .height(Fill),
+            text(label)
+                .size(SECTION_SEP_TEXT)
+                .font(Font {
+                    weight: Weight::Semibold,
+                    ..Font::DEFAULT
+                })
+                .color(theme::DIM),
+            iced::widget::canvas(SeparatorFade { solid_right: false })
+                .width(Fill)
+                .height(Fill),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .padding([0, 8])
+    .width(Fill)
+    .height(Length::Fixed(SECTION_SEP_H))
+    .into()
+}
+
+/// One side of a [`section_separator`]: a 1.5px rule (immersive-rail weight)
+/// with a linear alpha fade. `solid_right` puts the solid end by the label.
+struct SeparatorFade {
+    solid_right: bool,
+}
+
+impl canvas::Program<StartMessage> for SeparatorFade {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let w = bounds.width;
+        let h = bounds.height;
+        if w < 8.0 || h <= 0.0 {
+            return Vec::new();
+        }
+        let mut frame = Frame::new(renderer, bounds.size());
+        let (edge, solid) = if self.solid_right {
+            (
+                Color {
+                    a: 0.0,
+                    ..theme::LINE
+                },
+                theme::LINE,
+            )
+        } else {
+            (
+                theme::LINE,
+                Color {
+                    a: 0.0,
+                    ..theme::LINE
+                },
+            )
+        };
+        let fade = canvas::gradient::Linear::new(Point::new(0.0, 0.0), Point::new(w, 0.0))
+            .add_stop(0.0, edge)
+            .add_stop(1.0, solid);
+        let thickness = 1.5;
+        frame.fill_rectangle(
+            Point::new(0.0, (h - thickness) * 0.5),
+            Size::new(w, thickness),
+            fade,
+        );
+        vec![frame.into_geometry()]
+    }
+}
+
 fn games_list(state: &State) -> Element<'_, StartMessage> {
     if state.rows.is_empty() {
         let empty: Element<'_, StartMessage> = if state.editing {
@@ -4399,7 +4606,28 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
             .center_y(Fill)
             .into();
     }
-    let items = keyed_column(state.rows.iter().enumerate().map(|(index, row)| {
+    let labels = crate::ui::start::position::labels(state.games_section_mode());
+    let mut entries: Vec<(u64, Element<'_, StartMessage>)> =
+        Vec::with_capacity(state.rows.len() * 2);
+    let mut last_section: Option<usize> = None;
+    for (index, row) in state.rows.iter().enumerate() {
+        let section = crate::ui::start::position::section_index(
+            state.games_section_mode(),
+            &row.title,
+            row.played_at_ms,
+            crate::ui::start::position::now_ms(),
+            crate::ui::start::position::local_utc_offset_secs(),
+        );
+        // Between non-empty sections only: the row at hand proves its own
+        // section non-empty, and the first row never takes a separator.
+        if last_section.is_some_and(|prev| prev != section) {
+            let label = labels.get(section).copied().unwrap_or("");
+            entries.push((
+                list_key(&format!("compact-section-{index}-{section}")),
+                section_separator(label),
+            ));
+        }
+        last_section = Some(section);
         let selected = index == state.game_selected;
         let running = !state.editing
             && state
@@ -4411,7 +4639,7 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
                 .closing_target
                 .as_ref()
                 .is_some_and(|t| t == &row.target);
-        (
+        entries.push((
             list_key(&row.play_key),
             game_row(
                 index,
@@ -4422,10 +4650,9 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
                 state.editing,
                 RowHintState::for_selected(state, selected),
             ),
-        )
-    }))
-    .spacing(ROW_GAP)
-    .width(Fill);
+        ));
+    }
+    let items = keyed_column(entries).spacing(ROW_GAP).width(Fill);
     scrollable(items)
         .id(games_scroll_id())
         .height(Fill)
@@ -6551,14 +6778,66 @@ mod tests {
     fn scroll_y_center_when_out_of_view() {
         let gap = ROW_GAP;
         let stride = ROW_HEIGHT + gap;
-        assert!(scroll_y_center(1, 20, ROW_HEIGHT, gap, 0.0, 300.0, false).is_none());
-        let y = scroll_y_center(5, 20, ROW_HEIGHT, gap, 0.0, 300.0, false).unwrap();
+        assert!(scroll_y_center_top(1.0 * stride, ROW_HEIGHT, 0.0, 300.0, false).is_none());
+        let y = scroll_y_center_top(5.0 * stride, ROW_HEIGHT, 0.0, 300.0, false).unwrap();
         let expected = 5.0 * stride - (300.0 - ROW_HEIGHT) / 2.0;
         assert!((y - expected).abs() < 0.1);
         // Force recenters even when already visible.
-        let y = scroll_y_center(1, 20, ROW_HEIGHT, gap, 0.0, 300.0, true).unwrap();
+        let y = scroll_y_center_top(1.0 * stride, ROW_HEIGHT, 0.0, 300.0, true).unwrap();
         let expected = (1.0_f32 * stride - (300.0 - ROW_HEIGHT) / 2.0).max(0.0);
         assert!((y - expected).abs() < 0.1);
+    }
+
+    #[test]
+    fn center_prefer_clamps_to_content_max() {
+        // 20 same-letter rows: no separators, content = 20*104 + 19*8.
+        let mut state = State {
+            rows: (0..20)
+                .map(|i| game_row_with(&format!("same{i}")))
+                .collect(),
+            ..State::default()
+        };
+        state.record_list_scroll(StartListId::Games, 0.0, 400.0);
+        let content = 20.0 * ROW_HEIGHT + 19.0 * ROW_GAP;
+        let max = content - 400.0;
+        // Mid list: raw center stands.
+        state.game_selected = 5;
+        let (_, y) = state.selection_scroll_y_center_prefer().unwrap();
+        assert!((y - (5.0 * (ROW_HEIGHT + ROW_GAP) - (400.0 - ROW_HEIGHT) / 2.0)).abs() < 0.1);
+        assert!(y < max);
+        // Near the end the raw center overshoots: clamp to max (what iced
+        // would silently clamp to, desyncing the tracker).
+        state.game_selected = 19;
+        let (_, y) = state.selection_scroll_y_center_prefer().unwrap();
+        assert!((y - max).abs() < 0.1);
+    }
+
+    #[test]
+    fn center_prefer_short_list_clamps_to_zero() {
+        let mut state = State {
+            rows: vec![game_row_with("solo-a"), game_row_with("solo-b")],
+            ..State::default()
+        };
+        state.record_list_scroll(StartListId::Games, 0.0, 400.0);
+        state.game_selected = 1;
+        let (_, y) = state.selection_scroll_y_center_prefer().unwrap();
+        assert!((y - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn separator_offsets_count_section_changes() {
+        // No changes → no shift, first row never shifts.
+        assert!((separator_offset_above(&[5, 5, 5], 0) - 0.0).abs() < f32::EPSILON);
+        assert!((separator_offset_above(&[5, 5, 5], 2) - 0.0).abs() < f32::EPSILON);
+        // One divider between sections 0 and 1 shifts rows at/after index 2.
+        let step = SECTION_SEP_H + ROW_GAP;
+        let sections = [0, 0, 1, 1];
+        assert!((separator_offset_above(&sections, 0) - 0.0).abs() < f32::EPSILON);
+        assert!((separator_offset_above(&sections, 1) - 0.0).abs() < f32::EPSILON);
+        assert!((separator_offset_above(&sections, 2) - step).abs() < f32::EPSILON);
+        assert!((separator_offset_above(&sections, 3) - step).abs() < f32::EPSILON);
+        // Empty list never shifts.
+        assert!((separator_offset_above(&[], 0) - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -7533,11 +7812,11 @@ mod tests {
         let mut state = State::default();
         let now = Instant::now();
         state.begin_transition_phase(TransitionPhase::EnterImmersive, now);
-        assert!((state.enter_veil_amount() - 1.0).abs() < 0.001);
+        assert!((state.enter_veil_amount(now) - 1.0).abs() < 0.001);
         assert!(!state.phase_finished(now + Duration::from_millis(500)));
-        // Wall time alone must not advance the capped clock.
-        state.advance_enter_reveal(now + Duration::from_millis(200));
-        assert!((state.enter_veil_amount() - 1.0).abs() < 0.001);
+        // Wall time alone must not lift the veil before arming.
+        let later = now + Duration::from_millis(200);
+        assert!((state.enter_veil_amount(later) - 1.0).abs() < 0.001);
     }
 
     #[test]
@@ -7581,7 +7860,7 @@ mod tests {
             assert!(!state.enter_art_sync_ready());
             assert!(!state.try_arm_enter_reveal_when_art_ready(now));
             assert!(!state.enter_reveal_armed());
-            assert!((state.enter_veil_amount() - 1.0).abs() < 0.001);
+            assert!((state.enter_veil_amount(now) - 1.0).abs() < 0.001);
 
             assert!(icon_cache::hero_for_path(&hero).is_some());
             assert!(icon_cache::backdrop_for_path(&bd).is_some());
@@ -7718,43 +7997,35 @@ mod tests {
     }
 
     #[test]
-    fn enter_reveal_ease_in_out_midpoint_and_stall_cap() {
-        use crate::ui::start::mode::{ENTER_REVEAL_MAX_FRAME_MS, ENTER_REVEAL_MS, TransitionPhase};
+    fn enter_reveal_wall_clock_midpoint_and_exact_duration() {
+        use crate::ui::start::mode::{ENTER_REVEAL_MS, TransitionPhase, enter_veil_amount};
         let mut state = State::default();
         let t0 = Instant::now();
         state.begin_transition_phase(TransitionPhase::EnterImmersive, t0);
         state.arm_enter_reveal(t0);
-        assert!((state.enter_veil_amount() - 1.0).abs() < 0.001);
+        assert!((state.enter_veil_amount(t0) - 1.0).abs() < 0.001);
 
-        // A 200ms stall advances only one capped step.
-        let mut now = t0 + Duration::from_millis(200);
-        state.advance_enter_reveal(now);
-        let after_stall = state.enter_reveal.as_ref().unwrap().elapsed_ms;
-        assert_eq!(after_stall, ENTER_REVEAL_MAX_FRAME_MS);
+        // A 200ms stall jumps time-correctly along the curve (no per-frame
+        // cap stretching the phase past its specified duration).
+        let stalled = t0 + Duration::from_millis(200);
+        assert!((state.enter_veil_amount(stalled) - enter_veil_amount(200)).abs() < 0.001);
+        assert!(!state.phase_finished(stalled));
 
-        // Walk exactly to midpoint (capped steps) so ease-in-out lands at ~0.5.
-        let midpoint = ENTER_REVEAL_MS / 2;
-        while state.enter_reveal.as_ref().unwrap().elapsed_ms < midpoint {
-            let remain = midpoint - state.enter_reveal.as_ref().unwrap().elapsed_ms;
-            let step = remain.min(ENTER_REVEAL_MAX_FRAME_MS);
-            now += Duration::from_millis(step);
-            state.advance_enter_reveal(now);
-        }
-        assert_eq!(state.enter_reveal.as_ref().unwrap().elapsed_ms, midpoint);
-        let mid = state.enter_veil_amount();
-        assert!((mid - 0.5).abs() < 0.02, "mid veil={mid}");
+        // Midpoint lands at ~0.5 veil by wall clock.
+        let mid = t0 + Duration::from_millis(ENTER_REVEAL_MS / 2);
+        assert!((state.enter_veil_amount(mid) - 0.5).abs() < 0.02);
 
-        while !state.phase_finished(now) {
-            now += Duration::from_millis(ENTER_REVEAL_MAX_FRAME_MS);
-            state.advance_enter_reveal(now);
-        }
-        assert!(state.enter_veil_amount() < 0.01);
+        // The lift lasts exactly its specified duration.
+        assert!(!state.phase_finished(t0 + Duration::from_millis(ENTER_REVEAL_MS - 1)));
+        let done = t0 + Duration::from_millis(ENTER_REVEAL_MS);
+        assert!(state.phase_finished(done));
+        assert!(state.enter_veil_amount(done) < 0.01);
     }
 
     #[test]
     fn enter_paints_cached_splash_opaque_under_veil() {
         icon_cache::with_cache_lock(|| {
-            use crate::ui::start::mode::{ENTER_REVEAL_MAX_FRAME_MS, TransitionPhase};
+            use crate::ui::start::mode::{ENTER_REVEAL_MS, TransitionPhase};
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
@@ -7780,8 +8051,7 @@ mod tests {
 
             let mut now = t0;
             while !state.phase_finished(now) {
-                now += Duration::from_millis(ENTER_REVEAL_MAX_FRAME_MS);
-                state.advance_enter_reveal(now);
+                now += Duration::from_millis(ENTER_REVEAL_MS / 8);
                 state.try_start_pending_splash_reveal(now);
                 let (opacity, _, _, _) = state.backdrop_incoming_visual(now).unwrap();
                 assert!((opacity - 1.0).abs() < 0.001);
@@ -7805,7 +8075,7 @@ mod tests {
     fn cold_start_late_art_fades_ambient_to_splash() {
         icon_cache::with_cache_lock(|| {
             use crate::ui::start::mode::{
-                ART_FADE_MS, ENTER_REVEAL_MAX_FRAME_MS, TransitionPhase, enter_art_fade_progress,
+                ART_FADE_MS, ENTER_REVEAL_MS, TransitionPhase, enter_art_fade_progress,
             };
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
@@ -7826,8 +8096,7 @@ mod tests {
 
             let mut now = t0;
             while !state.phase_finished(now) {
-                now += Duration::from_millis(ENTER_REVEAL_MAX_FRAME_MS);
-                state.advance_enter_reveal(now);
+                now += Duration::from_millis(ENTER_REVEAL_MS / 8);
             }
             state.clear_transition_phase();
 

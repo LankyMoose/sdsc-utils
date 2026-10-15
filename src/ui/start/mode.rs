@@ -41,9 +41,14 @@ pub enum TransitionPhase {
     EnterCompact,
 }
 
-/// Shared duration for darken-compact / darken-immersive / reveal-compact.
+/// Shared duration for darken-immersive / reveal-compact / cold ambient.
 pub const VEIL_TRANSITION_MS: u64 = 300;
-pub const EXIT_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
+/// Fast promote/demote segment, shared: exit fades and enter fades use one
+/// duration so the joints stay even.
+pub const SWIFT_SEGMENT_MS: u64 = 150;
+/// HWND growth/shrink morph, run under the opaque blackout. Deliberately a
+/// touch faster than the fades (invisible anyway) so the ceremony stays snappy.
+pub const RESIZE_MS: u64 = 100;
 /// EnterImmersive top-veil lift (ease-in-out); matches splash length so one ceremony covers both.
 pub const ENTER_REVEAL_MS: u64 = crate::ui::motion::SLOW_MS;
 pub const ENTER_IMMERSIVE_MS: u64 = ENTER_REVEAL_MS;
@@ -77,12 +82,10 @@ pub const STEAM_SCAN_BANNER_OUT_MS: u64 = CHROME_STATUS_EXIT_MS;
 pub const STEAM_SCAN_SUCCESS_HOLD_MS: u64 = CHROME_STATUS_SUCCESS_HOLD_MS;
 /// Immersive cold: fade the games strip in once artwork is ready.
 pub const GAMES_LIST_FADE_MS: u64 = ART_FADE_MS;
-/// Cap per StartFrame so a UI stall cannot skip the start of the enter curve.
-pub const ENTER_REVEAL_MAX_FRAME_MS: u64 = crate::ui::motion::MAX_FRAME_DT_MS;
 /// Legacy grow-segment fraction (unused by the single top-veil enter path).
 pub const ENTER_GROW_END: f32 = 0.28;
-pub const EXIT_IMMERSIVE_MS: u64 = VEIL_TRANSITION_MS;
-pub const ENTER_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
+pub const EXIT_IMMERSIVE_MS: u64 = SWIFT_SEGMENT_MS;
+pub const ENTER_COMPACT_MS: u64 = SWIFT_SEGMENT_MS;
 /// Opacity crossfade between game backdrops (selection change; not enter veil).
 pub const ART_FADE_MS: u64 = crate::ui::motion::SLOW_MS;
 /// Shared ken-burns period for zoom + pan (burn-in drift while splash is held).
@@ -103,7 +106,7 @@ pub const BACKDROP_PAN_OVERFLOW_CAP: f32 = 0.92;
 impl TransitionPhase {
     pub fn duration_ms(self) -> u64 {
         match self {
-            Self::ExitCompact => EXIT_COMPACT_MS,
+            Self::ExitCompact => SWIFT_SEGMENT_MS,
             Self::Resizing => 0,
             Self::EnterImmersive => ENTER_IMMERSIVE_MS,
             Self::ExitImmersive => EXIT_IMMERSIVE_MS,
@@ -566,7 +569,11 @@ mod tests {
 
     #[test]
     fn phase_durations() {
-        assert_eq!(TransitionPhase::ExitCompact.duration_ms(), EXIT_COMPACT_MS);
+        assert_eq!(TransitionPhase::ExitCompact.duration_ms(), SWIFT_SEGMENT_MS);
+        // One shared fast segment for exit blackout + enter fades.
+        assert_eq!(SWIFT_SEGMENT_MS, 150);
+        // The invisible morph runs a touch faster.
+        assert_eq!(RESIZE_MS, 100);
         assert_eq!(
             TransitionPhase::EnterImmersive.duration_ms(),
             ENTER_IMMERSIVE_MS
@@ -581,8 +588,8 @@ mod tests {
         );
         assert_eq!(ENTER_IMMERSIVE_MS, ENTER_REVEAL_MS);
         assert_eq!(ENTER_REVEAL_MS, ART_FADE_MS);
-        assert_eq!(EXIT_IMMERSIVE_MS, VEIL_TRANSITION_MS);
-        assert_eq!(ENTER_COMPACT_MS, VEIL_TRANSITION_MS);
+        assert_eq!(EXIT_IMMERSIVE_MS, SWIFT_SEGMENT_MS);
+        assert_eq!(ENTER_COMPACT_MS, SWIFT_SEGMENT_MS);
         assert!((ease_in_cubic(0.0) - 0.0).abs() < 0.001);
         assert!((ease_in_cubic(1.0) - 1.0).abs() < 0.001);
         assert!(ease_in_cubic(0.5) < 0.5);
