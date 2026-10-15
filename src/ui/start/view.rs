@@ -1348,12 +1348,21 @@ impl State {
         ) {
             return false;
         }
-        if now.saturating_duration_since(hold.queued_at)
-            > Duration::from_millis(crate::ui::start::mode::REVEAL_HOLD_TIMEOUT_MS)
-        {
+        if self.reveal_hold_timed_out(now) {
             return false;
         }
         self.hold_selected(hold.list) == hold.selected
+    }
+
+    /// True while a queued reveal sits unconfirmed past its deadline.
+    /// Expiry restarts the lift (instead of popping the veil) with a
+    /// backstop scroll under the fresh blackout.
+    pub fn reveal_hold_timed_out(&self, now: Instant) -> bool {
+        let Some(hold) = self.reveal_hold else {
+            return false;
+        };
+        now.saturating_duration_since(hold.queued_at)
+            > Duration::from_millis(crate::ui::start::mode::REVEAL_HOLD_TIMEOUT_MS)
     }
 
     /// Max scroll offset for a compact list (content minus viewport,
@@ -6511,9 +6520,11 @@ mod tests {
         assert!(!state.enter_compact_hold_active(now));
         state.game_selected = 0;
         assert!(state.enter_compact_hold_active(now));
-        // Expired → no gate.
+        // Expired → no gate (and times out for the lift restart).
         let late = now + Duration::from_millis(REVEAL_HOLD_TIMEOUT_MS + 1);
         assert!(!state.enter_compact_hold_active(late));
+        assert!(state.reveal_hold_timed_out(late));
+        assert!(!state.reveal_hold_timed_out(now));
     }
 
     #[test]

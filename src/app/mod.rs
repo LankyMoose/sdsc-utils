@@ -5854,11 +5854,40 @@ impl App {
     /// drifted, timed out, hid, or left the enter phase).
     fn flush_pending_reveal(&mut self) -> Option<Task<Message>> {
         let hold = self.start_state.reveal_hold?;
-        if !self.start_visible || !self.start_state.enter_compact_hold_active(Instant::now()) {
-            crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: start reveal dropped list={:?} target={:.0}",
-                hold.list, hold.y
-            ));
+        let now = Instant::now();
+        if !self.start_visible || !self.start_state.enter_compact_hold_active(now) {
+            // Timeout with the selection untouched (not drift/phase-leave):
+            // the scroll never confirmed, so restart the lift from opaque
+            // and land the backstop under the fresh blackout instead of
+            // popping the veil.
+            let selected = match hold.list {
+                start_view::StartListId::Games => self.start_state.game_selected,
+                start_view::StartListId::Controllers => self.start_state.controller_selected,
+                start_view::StartListId::Settings => usize::MAX,
+            };
+            if self.start_visible
+                && selected == hold.selected
+                && self.start_state.reveal_hold_timed_out(now)
+                && matches!(
+                    self.start_state.transition_phase.map(|(p, _)| p),
+                    Some(start_mode::TransitionPhase::EnterCompact)
+                )
+            {
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start reveal timeout list={:?} target={:.0}, restarting lift",
+                    hold.list, hold.y
+                ));
+                self.start_state.reveal_hold = None;
+                self.start_state
+                    .begin_transition_phase(start_mode::TransitionPhase::EnterCompact, now);
+                return Some(self.scroll_start_selection_into_view());
+            }
+            if self.start_state.reveal_hold.is_some() {
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start reveal dropped list={:?} target={:.0}",
+                    hold.list, hold.y
+                ));
+            }
             self.start_state.reveal_hold = None;
             return None;
         }
@@ -5871,16 +5900,23 @@ impl App {
         ))
     }
 
-    /// Clear a reveal hold when the mount reports its target back.
+    /// Clear a reveal hold when the mount reports its target back. Restarts
+    /// the lift from opaque so the veil never pops mid-release.
     fn confirm_pending_reveal(&mut self, list: start_view::StartListId, reported_y: f32) {
-        if let Some(hold) = self.start_state.reveal_hold
-            && hold.list == list
-            && (reported_y - hold.y).abs() <= 2.0
-        {
-            crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: start reveal confirmed list={list:?} y={reported_y:.0}"
-            ));
-            self.start_state.reveal_hold = None;
+        let confirmed = matches!(self.start_state.reveal_hold, Some(hold) if hold.list == list && (reported_y - hold.y).abs() <= 2.0);
+        if !confirmed {
+            return;
+        }
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start reveal confirmed list={list:?} y={reported_y:.0}"
+        ));
+        self.start_state.reveal_hold = None;
+        if matches!(
+            self.start_state.transition_phase.map(|(p, _)| p),
+            Some(start_mode::TransitionPhase::EnterCompact)
+        ) {
+            self.start_state
+                .begin_transition_phase(start_mode::TransitionPhase::EnterCompact, Instant::now());
         }
     }
 
