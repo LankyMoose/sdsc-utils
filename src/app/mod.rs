@@ -4742,7 +4742,7 @@ impl App {
     }
 
     /// Promote growth, stepped: centered compact → monitor cover over
-    /// `RESIZE_ANIM_MS`, eased. Small resizes keep presenting (one big resize
+    /// `SWIFT_SEGMENT_MS`, eased. Small resizes keep presenting (one big resize
     /// stalls surface recreation); content holds black throughout.
     fn begin_promote_resize(&mut self) -> Task<Message> {
         if self.start_window.filter(|_| self.start_visible).is_none() {
@@ -4827,7 +4827,7 @@ impl App {
         };
         let t = start_mode::phase_progress_linear(
             now.saturating_duration_since(anim.started).as_millis() as u64,
-            start_mode::RESIZE_ANIM_MS,
+            start_mode::SWIFT_SEGMENT_MS,
         );
         if t >= 1.0 {
             self.start_resize_anim = None;
