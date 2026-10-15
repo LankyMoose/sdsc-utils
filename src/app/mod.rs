@@ -4789,6 +4789,34 @@ impl App {
     }
 
     fn tick_immersive_transition_phase_inner(&mut self, now: Instant) -> Option<Task<Message>> {
+        // Strand recovery: Resizing advances only via the morph driver — with
+        // no anim (lost settle message) wall-clock completion can never fire
+        // and the window would sit on black forever. Settle directly while a
+        // transition is live; otherwise drop the orphaned blackout and paint
+        // current state. This never fires in normal flow (the exit arm only
+        // enters Resizing with a driver attached).
+        if matches!(
+            self.start_state.transition_phase.map(|(p, _)| p),
+            Some(start_mode::TransitionPhase::Resizing)
+        ) && self.start_resize_anim.is_none()
+        {
+            if !self.start_visible {
+                self.start_state.transition = None;
+                self.start_state.clear_transition_phase();
+                return Some(Task::none());
+            }
+            if self.start_state.transition.is_some() {
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: start resizing strand, settling directly",
+                );
+                return Some(self.finish_start_immersive_transition());
+            }
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: start resizing orphan, clearing blackout",
+            );
+            self.start_state.clear_transition_phase();
+            return Some(Task::none());
+        }
         // The HWND morph runs only under the opaque Resizing blackout, never
         // under the exit fade: the outgoing chrome holds its window size (and
         // frozen clocks) through the fade, so nothing reflows mid-exit. The
@@ -4805,7 +4833,27 @@ impl App {
         if !self.start_state.phase_finished(now) {
             return None;
         }
-        let phase = self.start_state.transition_phase.map(|(p, _)| p)?;
+        let (phase, started) = self.start_state.transition_phase?;
+        // Overrun witness for the next forensics: completions are wall-clock,
+        // so a phase ending far past its spec means ticks starved (the black
+        // window outlived the ceremony in paint-time, not logic-time).
+        let elapsed_ms = now.saturating_duration_since(started).as_millis() as u64;
+        let allowance_ms = match phase {
+            // Art hold (up to ENTER_ART_HOLD_MAX_MS) precedes the lift.
+            start_mode::TransitionPhase::EnterImmersive => {
+                crate::ui::start::mode::ENTER_ART_HOLD_MAX_MS
+                    + crate::ui::start::mode::ENTER_REVEAL_MS
+                    + 1000
+            }
+            _ => phase.duration_ms().saturating_add(1000),
+        };
+        if elapsed_ms > allowance_ms {
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start phase overrun phase={} elapsed_ms={elapsed_ms} spec_ms={}",
+                phase.label(),
+                phase.duration_ms()
+            ));
+        }
         match phase {
             // Exit fade done over a static window: start the morph now, under
             // black (or settle directly if the morph already ran).
@@ -4884,6 +4932,15 @@ impl App {
         );
         if t >= 1.0 {
             self.start_resize_anim = None;
+            let elapsed_ms = now.saturating_duration_since(anim.started).as_millis() as u64;
+            // Overrun witness: the morph is wall-clock, so finishing far past
+            // spec means ticks starved mid-morph (black outlived the ceremony).
+            if elapsed_ms > start_mode::SWIFT_SEGMENT_MS.saturating_add(1000) {
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start resize overrun elapsed_ms={elapsed_ms} spec_ms={}",
+                    start_mode::SWIFT_SEGMENT_MS
+                ));
+            }
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: start resize anim done size={}x{}",
                 anim.to_size.width, anim.to_size.height
@@ -7501,7 +7558,19 @@ fn pad_input_edge_stream() -> impl Stream<Item = Message> {
         let (tx, mut rx) = iced::futures::channel::mpsc::channel(128);
         start_input::bind_input_edge_sender(tx);
         let _guard = InputEdgeBindGuard;
-        while let Some(edge) = rx.next().await {
+        while let Some(first) = rx.next().await {
+            // Conflate to the latest buffered edge: readings are absolute
+            // state, so intermediates are stale by definition. Without this,
+            // a saturated loop pays a full nav/update/view cycle per queued
+            // edge after it recovers — a backlog spree that prolongs the
+            // stall instead of ending it. Normally the buffer holds ≤1 and
+            // this is a no-op (taps are never at risk when the loop is
+            // healthy; when saturated they are already being dropped at
+            // try_send).
+            let mut edge = first;
+            while let Ok(next) = rx.try_recv() {
+                edge = next;
+            }
             if output.send(Message::PadInput(edge)).await.is_err() {
                 break;
             }
