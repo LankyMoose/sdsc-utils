@@ -273,7 +273,7 @@ pub fn view<'a>(
 /// Full-bleed blackout — enter uses capped ease-in-out; exit uses ease-out like compact.
 fn transition_top_veil(state: &State, now: Instant) -> f32 {
     match state.transition_phase.map(|(p, _)| p) {
-        Some(TransitionPhase::EnterImmersive) => state.enter_veil_amount(),
+        Some(TransitionPhase::EnterImmersive) => state.enter_veil_amount(now),
         Some(TransitionPhase::ExitImmersive) => state.phase_progress(now).clamp(0.0, 1.0),
         _ => 0.0,
     }

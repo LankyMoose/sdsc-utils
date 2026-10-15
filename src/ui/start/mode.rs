@@ -79,8 +79,6 @@ pub const STEAM_SCAN_BANNER_OUT_MS: u64 = CHROME_STATUS_EXIT_MS;
 pub const STEAM_SCAN_SUCCESS_HOLD_MS: u64 = CHROME_STATUS_SUCCESS_HOLD_MS;
 /// Immersive cold: fade the games strip in once artwork is ready.
 pub const GAMES_LIST_FADE_MS: u64 = ART_FADE_MS;
-/// Cap per StartFrame so a UI stall cannot skip the start of the enter curve.
-pub const ENTER_REVEAL_MAX_FRAME_MS: u64 = crate::ui::motion::MAX_FRAME_DT_MS;
 /// Legacy grow-segment fraction (unused by the single top-veil enter path).
 pub const ENTER_GROW_END: f32 = 0.28;
 pub const EXIT_IMMERSIVE_MS: u64 = SWIFT_SEGMENT_MS;

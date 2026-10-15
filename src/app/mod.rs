@@ -1518,7 +1518,25 @@ impl App {
                 self.start_state
                     .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
                 let was_cold = self.start_state.cold_load_active;
-                let _ = self.start_state.tick_anim(now);
+                // Frozen exit: while the outgoing presentation is on screen
+                // (promote/demote first half + resize blackout), its clocks
+                // stop — strip/dock/slide chases, hint presses, chrome status,
+                // idle timers and ambient time all hold their pre-transition
+                // frame instead of repainting (and reflowing) under the veil.
+                // Phase/veil/resize progress is wall-clock, so nothing the
+                // ceremony needs stops. Enter phases keep ticking (the new UI
+                // animates in by design).
+                let exiting = matches!(
+                    self.start_state.transition_phase.map(|(p, _)| p),
+                    Some(
+                        start_mode::TransitionPhase::ExitCompact
+                            | start_mode::TransitionPhase::ExitImmersive
+                            | start_mode::TransitionPhase::Resizing
+                    )
+                );
+                if !exiting {
+                    let _ = self.start_state.tick_anim(now);
+                }
                 let task = if was_cold && !self.start_state.cold_load_active {
                     self.note_cold_load_finished()
                 } else {
@@ -1538,14 +1556,16 @@ impl App {
                         return task.chain(self.complete_replace_confirm());
                     }
                 }
-                self.sync_start_held();
-                self.start_state.tick_hint_anims(now);
-                self.tick_start_cursor_idle(now);
-                if self.tick_start_idle(now) {
-                    self.pad_nav.prepare_on_open(false);
-                    crate::controller::hid::diag::diag_info(
-                        "ui-diag: start idle pad re-arm after sleep wake",
-                    );
+                if !exiting {
+                    self.sync_start_held();
+                    self.start_state.tick_hint_anims(now);
+                    self.tick_start_cursor_idle(now);
+                    if self.tick_start_idle(now) {
+                        self.pad_nav.prepare_on_open(false);
+                        crate::controller::hid::diag::diag_info(
+                            "ui-diag: start idle pad re-arm after sleep wake",
+                        );
+                    }
                 }
                 task
             }
@@ -4678,8 +4698,10 @@ impl App {
         let now = Instant::now();
         self.start_state
             .begin_transition_phase(start_mode::TransitionPhase::ExitCompact, now);
-        // Growth starts at once, under the exit fade (not after it): the
-        // window visibly morphs while dimming instead of beating twice.
+        // Growth waits for the exit fade: the window holds its size while the
+        // outgoing chrome dims in place (frozen, no reflow), then morphs under
+        // the opaque Resizing blackout. The morph clock starts there, so every
+        // segment runs its full specified duration.
         self.start_state.transition = Some(start_mode::StartTransition::Promoting);
         let compact = Size::new(start_view::WIDTH, start_view::HEIGHT);
         self.start_resize_anim = Some(ResizeAnim {
@@ -4720,8 +4742,8 @@ impl App {
         let now = Instant::now();
         self.start_state
             .begin_transition_phase(start_mode::TransitionPhase::ExitImmersive, now);
-        // Shrink starts at once, under the exit veil (mirror of promote):
-        // the window visibly morphs while dimming instead of beating twice.
+        // Shrink waits for the exit fade (mirror of promote): the window holds
+        // its size while immersive dims in place, then morphs under black.
         self.start_state.transition = Some(start_mode::StartTransition::Demoting);
         let compact = Size::new(start_view::WIDTH, start_view::HEIGHT);
         let cover = self.start_monitor_cover.or_else(primary_monitor_cover);
@@ -4767,9 +4789,17 @@ impl App {
     }
 
     fn tick_immersive_transition_phase_inner(&mut self, now: Instant) -> Option<Task<Message>> {
-        // Animated growth/shrink runs every frame (Resizing never finishes
-        // by timer); completion issues the same settle as the old resize.
-        if let Some(task) = self.tick_resize_anim(now) {
+        // The HWND morph runs only under the opaque Resizing blackout, never
+        // under the exit fade: the outgoing chrome holds its window size (and
+        // frozen clocks) through the fade, so nothing reflows mid-exit. The
+        // morph's `started` resets when Resizing begins, guaranteeing the
+        // full specified duration. (Resizing never finishes by timer.)
+        let exiting = matches!(
+            self.start_state.transition_phase.map(|(p, _)| p),
+            Some(start_mode::TransitionPhase::ExitCompact)
+                | Some(start_mode::TransitionPhase::ExitImmersive)
+        );
+        if !exiting && let Some(task) = self.tick_resize_anim(now) {
             return Some(task);
         }
         if !self.start_state.phase_finished(now) {
@@ -4777,11 +4807,12 @@ impl App {
         }
         let phase = self.start_state.transition_phase.map(|(p, _)| p)?;
         match phase {
-            // Growth/shrink started with the exit phase; on exit end, cover
-            // any animation tail with black (or nothing if already settled).
+            // Exit fade done over a static window: start the morph now, under
+            // black (or settle directly if the morph already ran).
             start_mode::TransitionPhase::ExitCompact
             | start_mode::TransitionPhase::ExitImmersive => {
-                if self.start_resize_anim.is_some() {
+                if let Some(anim) = self.start_resize_anim.as_mut() {
+                    anim.started = now;
                     self.start_state
                         .begin_transition_phase(start_mode::TransitionPhase::Resizing, now);
                 }
@@ -4831,7 +4862,9 @@ impl App {
     }
 
     /// One animated-resize step (either direction). Returns `None` when no
-    /// animation is running (normal tick flow continues).
+    /// animation is running (normal tick flow continues). Only ticked during
+    /// the opaque Resizing phase — never under an exit fade — with `started`
+    /// reset at Resizing begin, so the morph always runs its full duration.
     ///
     /// Completion issues the exact target geometry chained into settle, so
     /// the enter veil only ever lifts on exact geometry — never mid-morph.

@@ -693,12 +693,25 @@ struct PositionSlideAnim {
     started: Instant,
 }
 
-/// Frame-capped EnterImmersive veil clock (armed once the window can paint).
+/// Wall-clock EnterImmersive veil clock (armed once the window can paint).
+///
+/// Progress derives from the arm [`Instant`], so the lift lasts exactly
+/// [`ENTER_REVEAL_MS`](crate::ui::start::mode::ENTER_REVEAL_MS) no matter the
+/// frame rate — a stall jumps time-correctly along the curve instead of
+/// stretching the phase past its specified duration.
 #[derive(Debug, Clone)]
 struct EnterRevealClock {
-    elapsed_ms: u64,
     armed: bool,
-    last_tick: Option<Instant>,
+    armed_at: Option<Instant>,
+}
+
+impl EnterRevealClock {
+    fn elapsed_ms(&self, now: Instant) -> u64 {
+        match (self.armed, self.armed_at) {
+            (true, Some(at)) => now.saturating_duration_since(at).as_millis() as u64,
+            _ => 0,
+        }
+    }
 }
 
 /// Eased immersive idle/sleep dim crossfade.
@@ -2237,9 +2250,8 @@ impl State {
         self.transition_phase = Some((phase, now));
         if matches!(phase, TransitionPhase::EnterImmersive) {
             self.enter_reveal = Some(EnterRevealClock {
-                elapsed_ms: 0,
                 armed: false,
-                last_tick: None,
+                armed_at: None,
             });
             // Hide strip until art sync / timeout begins the list reveal (cold + promote).
             self.games_list_reveal_at = None;
@@ -2280,8 +2292,7 @@ impl State {
             return;
         }
         clock.armed = true;
-        clock.last_tick = Some(now);
-        clock.elapsed_ms = 0;
+        clock.armed_at = Some(now);
         crate::controller::hid::diag::diag_info("ui-diag: start immersive enter reveal armed");
     }
 
@@ -2807,32 +2818,11 @@ impl State {
         self.arm_enter_reveal(now);
     }
 
-    /// Advance the capped EnterImmersive clock. Call once per StartFrame.
-    pub fn advance_enter_reveal(&mut self, now: Instant) {
-        use crate::ui::start::mode::ENTER_REVEAL_MAX_FRAME_MS;
-        let Some(clock) = self.enter_reveal.as_mut() else {
-            return;
-        };
-        if !clock.armed {
-            return;
-        }
-        let last = clock.last_tick.unwrap_or(now);
-        let raw_ms = now.saturating_duration_since(last).as_millis() as u64;
-        let dt = raw_ms.min(ENTER_REVEAL_MAX_FRAME_MS);
-        if raw_ms > ENTER_REVEAL_MAX_FRAME_MS {
-            crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: start immersive enter reveal capped raw_ms={raw_ms}"
-            ));
-        }
-        clock.elapsed_ms = clock.elapsed_ms.saturating_add(dt);
-        clock.last_tick = Some(now);
-    }
-
-    /// EnterImmersive veil alpha from the capped clock (1 = solid, 0 = clear).
-    pub fn enter_veil_amount(&self) -> f32 {
+    /// EnterImmersive veil alpha from the wall-clock reveal time (1 = solid, 0 = clear).
+    pub fn enter_veil_amount(&self, now: Instant) -> f32 {
         use crate::ui::start::mode::enter_veil_amount;
         match &self.enter_reveal {
-            Some(clock) if clock.armed => enter_veil_amount(clock.elapsed_ms),
+            Some(clock) if clock.armed => enter_veil_amount(clock.elapsed_ms(now)),
             Some(_) => 1.0,
             None => 0.0,
         }
@@ -2851,7 +2841,7 @@ impl State {
                 .enter_reveal
                 .as_ref()
                 .filter(|c| c.armed)
-                .map(|c| c.elapsed_ms)
+                .map(|c| c.elapsed_ms(now))
                 .unwrap_or(0);
             return phase_progress_linear(elapsed, ENTER_REVEAL_MS);
         }
@@ -2873,7 +2863,7 @@ impl State {
                 .enter_reveal
                 .as_ref()
                 .filter(|c| c.armed)
-                .map(|c| c.elapsed_ms)
+                .map(|c| c.elapsed_ms(now))
                 .unwrap_or(0);
             return phase_progress_linear(elapsed, ENTER_REVEAL_MS);
         }
@@ -2897,7 +2887,7 @@ impl State {
             return self
                 .enter_reveal
                 .as_ref()
-                .is_some_and(|c| c.armed && c.elapsed_ms >= dur);
+                .is_some_and(|c| c.armed && c.elapsed_ms(now) >= dur);
         }
         now.saturating_duration_since(started) >= Duration::from_millis(dur)
     }
@@ -3347,7 +3337,6 @@ impl State {
     pub fn tick_anim(&mut self, now: Instant) -> bool {
         self.maybe_force_enter_reveal_after_art_hold(now);
         let _ = self.try_arm_enter_reveal_when_art_ready(now);
-        self.advance_enter_reveal(now);
         self.try_start_pending_splash_reveal(now);
         self.tick_chrome_status(now);
         let mut busy = false;
@@ -4085,6 +4074,9 @@ pub fn view<'a>(
     } else {
         space().width(Fill).height(Fill).into()
     };
+    // Frozen exit: the window holds its size through the exit fade, so the
+    // outgoing chrome never reflows — the morph runs later, under the opaque
+    // Resizing blackout. The tree shape is unchanged (no remount/scroll reset).
     stack![with_veil, settings_layer]
         .width(Fill)
         .height(Fill)
@@ -7820,11 +7812,11 @@ mod tests {
         let mut state = State::default();
         let now = Instant::now();
         state.begin_transition_phase(TransitionPhase::EnterImmersive, now);
-        assert!((state.enter_veil_amount() - 1.0).abs() < 0.001);
+        assert!((state.enter_veil_amount(now) - 1.0).abs() < 0.001);
         assert!(!state.phase_finished(now + Duration::from_millis(500)));
-        // Wall time alone must not advance the capped clock.
-        state.advance_enter_reveal(now + Duration::from_millis(200));
-        assert!((state.enter_veil_amount() - 1.0).abs() < 0.001);
+        // Wall time alone must not lift the veil before arming.
+        let later = now + Duration::from_millis(200);
+        assert!((state.enter_veil_amount(later) - 1.0).abs() < 0.001);
     }
 
     #[test]
@@ -7868,7 +7860,7 @@ mod tests {
             assert!(!state.enter_art_sync_ready());
             assert!(!state.try_arm_enter_reveal_when_art_ready(now));
             assert!(!state.enter_reveal_armed());
-            assert!((state.enter_veil_amount() - 1.0).abs() < 0.001);
+            assert!((state.enter_veil_amount(now) - 1.0).abs() < 0.001);
 
             assert!(icon_cache::hero_for_path(&hero).is_some());
             assert!(icon_cache::backdrop_for_path(&bd).is_some());
@@ -8005,43 +7997,35 @@ mod tests {
     }
 
     #[test]
-    fn enter_reveal_ease_in_out_midpoint_and_stall_cap() {
-        use crate::ui::start::mode::{ENTER_REVEAL_MAX_FRAME_MS, ENTER_REVEAL_MS, TransitionPhase};
+    fn enter_reveal_wall_clock_midpoint_and_exact_duration() {
+        use crate::ui::start::mode::{ENTER_REVEAL_MS, TransitionPhase, enter_veil_amount};
         let mut state = State::default();
         let t0 = Instant::now();
         state.begin_transition_phase(TransitionPhase::EnterImmersive, t0);
         state.arm_enter_reveal(t0);
-        assert!((state.enter_veil_amount() - 1.0).abs() < 0.001);
+        assert!((state.enter_veil_amount(t0) - 1.0).abs() < 0.001);
 
-        // A 200ms stall advances only one capped step.
-        let mut now = t0 + Duration::from_millis(200);
-        state.advance_enter_reveal(now);
-        let after_stall = state.enter_reveal.as_ref().unwrap().elapsed_ms;
-        assert_eq!(after_stall, ENTER_REVEAL_MAX_FRAME_MS);
+        // A 200ms stall jumps time-correctly along the curve (no per-frame
+        // cap stretching the phase past its specified duration).
+        let stalled = t0 + Duration::from_millis(200);
+        assert!((state.enter_veil_amount(stalled) - enter_veil_amount(200)).abs() < 0.001);
+        assert!(!state.phase_finished(stalled));
 
-        // Walk exactly to midpoint (capped steps) so ease-in-out lands at ~0.5.
-        let midpoint = ENTER_REVEAL_MS / 2;
-        while state.enter_reveal.as_ref().unwrap().elapsed_ms < midpoint {
-            let remain = midpoint - state.enter_reveal.as_ref().unwrap().elapsed_ms;
-            let step = remain.min(ENTER_REVEAL_MAX_FRAME_MS);
-            now += Duration::from_millis(step);
-            state.advance_enter_reveal(now);
-        }
-        assert_eq!(state.enter_reveal.as_ref().unwrap().elapsed_ms, midpoint);
-        let mid = state.enter_veil_amount();
-        assert!((mid - 0.5).abs() < 0.02, "mid veil={mid}");
+        // Midpoint lands at ~0.5 veil by wall clock.
+        let mid = t0 + Duration::from_millis(ENTER_REVEAL_MS / 2);
+        assert!((state.enter_veil_amount(mid) - 0.5).abs() < 0.02);
 
-        while !state.phase_finished(now) {
-            now += Duration::from_millis(ENTER_REVEAL_MAX_FRAME_MS);
-            state.advance_enter_reveal(now);
-        }
-        assert!(state.enter_veil_amount() < 0.01);
+        // The lift lasts exactly its specified duration.
+        assert!(!state.phase_finished(t0 + Duration::from_millis(ENTER_REVEAL_MS - 1)));
+        let done = t0 + Duration::from_millis(ENTER_REVEAL_MS);
+        assert!(state.phase_finished(done));
+        assert!(state.enter_veil_amount(done) < 0.01);
     }
 
     #[test]
     fn enter_paints_cached_splash_opaque_under_veil() {
         icon_cache::with_cache_lock(|| {
-            use crate::ui::start::mode::{ENTER_REVEAL_MAX_FRAME_MS, TransitionPhase};
+            use crate::ui::start::mode::{ENTER_REVEAL_MS, TransitionPhase};
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
@@ -8067,8 +8051,7 @@ mod tests {
 
             let mut now = t0;
             while !state.phase_finished(now) {
-                now += Duration::from_millis(ENTER_REVEAL_MAX_FRAME_MS);
-                state.advance_enter_reveal(now);
+                now += Duration::from_millis(ENTER_REVEAL_MS / 8);
                 state.try_start_pending_splash_reveal(now);
                 let (opacity, _, _, _) = state.backdrop_incoming_visual(now).unwrap();
                 assert!((opacity - 1.0).abs() < 0.001);
@@ -8092,7 +8075,7 @@ mod tests {
     fn cold_start_late_art_fades_ambient_to_splash() {
         icon_cache::with_cache_lock(|| {
             use crate::ui::start::mode::{
-                ART_FADE_MS, ENTER_REVEAL_MAX_FRAME_MS, TransitionPhase, enter_art_fade_progress,
+                ART_FADE_MS, ENTER_REVEAL_MS, TransitionPhase, enter_art_fade_progress,
             };
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
@@ -8113,8 +8096,7 @@ mod tests {
 
             let mut now = t0;
             while !state.phase_finished(now) {
-                now += Duration::from_millis(ENTER_REVEAL_MAX_FRAME_MS);
-                state.advance_enter_reveal(now);
+                now += Duration::from_millis(ENTER_REVEAL_MS / 8);
             }
             state.clear_transition_phase();
 
