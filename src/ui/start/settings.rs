@@ -36,7 +36,11 @@ const CONTENT_PAD_X: f32 = 4.0;
 const HEADER_LIST_GAP: f32 = 8.0;
 /// Height of the spacer between settings sections (shared by `space_gap` and
 /// `focus_row_bounds` so geometry can't drift from the built layout).
-const SECTION_GAP_H: f32 = 8.0;
+const SECTION_GAP_H: f32 = 16.0;
+/// Inner spacing between a row label and its helper line.
+const HELPER_GAP: f32 = 2.0;
+/// Gap between a section caption and its hairline rule.
+const SECTION_RULE_GAP: f32 = 6.0;
 /// Spacing between options inside an expanded dropdown panel (shared by
 /// `selector_menu_panel` stacking and `menu_panel_h` geometry).
 const MENU_OPTION_GAP: f32 = 4.0;
@@ -225,14 +229,21 @@ impl SettingsRow {
         }
     }
 
+    /// Helper line under the row label, mirroring Configure → Start screen
+    /// copy so the drawer explains itself the same way Settings does.
+    fn helper(self) -> Option<&'static str> {
+        row_helper(self)
+    }
+
     /// Estimated row height, sharing the same `*_row_h` fns (and through them
     /// the same constants) as the builders so geometry can't drift.
     fn height(self, ty: TypeScale) -> f32 {
+        let helper = row_helper(self).is_some();
         match self.kind() {
-            RowKind::Toggle => toggle_row_h(ty.toggle),
+            RowKind::Toggle => toggle_row_h(ty, helper),
             RowKind::Action => action_row_h(),
-            RowKind::Selector => selector_row_h(ty.helper, ty.toggle),
-            RowKind::Slider => slider_row_h(ty.helper),
+            RowKind::Selector => selector_row_h(ty, helper),
+            RowKind::Slider => slider_row_h(ty, helper),
         }
     }
 
@@ -803,6 +814,35 @@ fn step_in_table(value: u32, table: &[u32], step: isize) -> Option<u32> {
     (next != value).then_some(next)
 }
 
+/// Helper line under a settings row label, mirroring Configure → Start
+/// screen copy (single source for the drawer; Configure keeps its own
+/// literals). `None` where Configure itself shows no helper.
+fn row_helper(row: SettingsRow) -> Option<&'static str> {
+    match row {
+        SettingsRow::AutoOpen => Some("When a controller connects"),
+        SettingsRow::AlwaysImmersive => {
+            Some("Open full screen; Circle closes instead of going back")
+        }
+        SettingsRow::Clock => None,
+        SettingsRow::ImmersiveLayout => Some("Orientation of the games strip"),
+        SettingsRow::Navbar => Some("Section indicator visibility"),
+        SettingsRow::ReducedMotion => Some("Skip movement animations"),
+        SettingsRow::IdleSecs => Some("Fullscreen dims after this long idle"),
+        SettingsRow::SleepSecs => Some("Fullscreen sleeps after this long idle"),
+        SettingsRow::IdleDim => Some("Brightness while idle"),
+        SettingsRow::Sounds => None,
+        SettingsRow::SoundVolume => None,
+        SettingsRow::Haptics => None,
+        SettingsRow::HapticsStrength => None,
+        SettingsRow::PerfThrottle => {
+            Some("Let the fullscreen Start screen rest when nothing is moving")
+        }
+        SettingsRow::PerfAntialiasing => Some("Smoother edges"),
+        SettingsRow::PerfVsync => Some("Sync to display; off may tear"),
+        SettingsRow::PerfReload => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TypeScale {
     title: f32,
@@ -855,7 +895,7 @@ pub fn focus_row_bounds(
     let mut y = CONTENT_PAD_Y;
     for item in layout_items(snapshot, menu) {
         let h = match item {
-            LayoutItem::Section(_) => ty.section,
+            LayoutItem::Section(_) => section_block_h(ty.section),
             LayoutItem::Gap => SECTION_GAP_H,
             LayoutItem::Row(row) => row.height(ty),
             LayoutItem::Menu(row) => menu_panel_h(row.selector_count(), ty.body),
@@ -869,8 +909,17 @@ pub fn focus_row_bounds(
     None
 }
 
-fn toggle_row_h(toggle: f32) -> f32 {
-    ROW_PAD * 2.0 + toggle.max(22.0)
+/// Line height estimate for a text size (matches `menu_option_h` convention).
+fn text_line_h(size: f32) -> f32 {
+    (size * 1.25).max(22.0)
+}
+
+fn toggle_row_h(ty: TypeScale, helper: bool) -> f32 {
+    let mut content = text_line_h(ty.body).max(ty.toggle);
+    if helper {
+        content += HELPER_GAP + ty.helper * 1.25;
+    }
+    ROW_PAD * 2.0 + content
 }
 
 /// Fixed inner height of the reload action button. The row (`action_row_h`)
@@ -888,14 +937,18 @@ fn cycle_viewport_h(helper: f32) -> f32 {
     helper * 1.5
 }
 
-fn cycle_row_h(helper: f32, toggle: f32) -> f32 {
-    ROW_PAD * 2.0 + cycle_viewport_h(helper).max(toggle).max(22.0)
+fn cycle_row_h(ty: TypeScale, helper: bool) -> f32 {
+    let mut content = cycle_viewport_h(ty.helper).max(ty.toggle).max(22.0);
+    if helper {
+        content = content.max(text_line_h(ty.body) + HELPER_GAP + ty.helper * 1.25);
+    }
+    ROW_PAD * 2.0 + content
 }
 
 /// Fixed height of a dropdown selector header row (same clipped single-option
 /// viewport as [`cycle_row_h`]).
-fn selector_row_h(helper: f32, toggle: f32) -> f32 {
-    cycle_row_h(helper, toggle)
+fn selector_row_h(ty: TypeScale, helper: bool) -> f32 {
+    cycle_row_h(ty, helper)
 }
 
 /// Estimated height of one expanded dropdown option row.
@@ -918,9 +971,13 @@ fn menu_panel_h(option_count: usize, body: f32) -> f32 {
     panel_h
 }
 
-fn slider_row_h(label: f32) -> f32 {
-    // Label + gap + slider track (iced default is a bit taller than a tight 22px guess).
-    ROW_PAD * 2.0 + label + SLIDER_INNER_GAP + 26.0
+fn slider_row_h(ty: TypeScale, helper: bool) -> f32 {
+    // Title line + gap + slider track (iced default is a bit taller than a tight 22px guess).
+    let mut content = ty.helper + SLIDER_INNER_GAP + 26.0;
+    if helper {
+        content += HELPER_GAP + ty.helper * 1.25;
+    }
+    ROW_PAD * 2.0 + content
 }
 
 /// Expanded dropdown panel height below `row` when it owns the open menu.
@@ -1041,6 +1098,7 @@ pub fn panel_view<'a>(
         let widget: Element<'_, StartMessage> = match row {
             SettingsRow::AutoOpen => selector_row(
                 "Auto open:",
+                SettingsRow::AutoOpen.helper(),
                 snapshot.auto_open.label(),
                 focused,
                 ty,
@@ -1048,6 +1106,7 @@ pub fn panel_view<'a>(
             ),
             SettingsRow::AlwaysImmersive => toggle_row(
                 "Always immersive",
+                SettingsRow::AlwaysImmersive.helper(),
                 SettingsRow::AlwaysImmersive.toggle_value(snapshot),
                 focused,
                 ty,
@@ -1055,6 +1114,7 @@ pub fn panel_view<'a>(
             ),
             SettingsRow::Clock => toggle_row(
                 "Display clock",
+                SettingsRow::Clock.helper(),
                 SettingsRow::Clock.toggle_value(snapshot),
                 focused,
                 ty,
@@ -1062,6 +1122,7 @@ pub fn panel_view<'a>(
             ),
             SettingsRow::ImmersiveLayout => selector_row(
                 "Layout",
+                SettingsRow::ImmersiveLayout.helper(),
                 snapshot.immersive_layout.label(),
                 focused,
                 ty,
@@ -1069,6 +1130,7 @@ pub fn panel_view<'a>(
             ),
             SettingsRow::Navbar => selector_row(
                 "Navbar",
+                SettingsRow::Navbar.helper(),
                 snapshot.navbar.label(),
                 focused,
                 ty,
@@ -1076,6 +1138,7 @@ pub fn panel_view<'a>(
             ),
             SettingsRow::ReducedMotion => selector_row(
                 "Reduced motion",
+                SettingsRow::ReducedMotion.helper(),
                 snapshot.reduced_motion.label(),
                 focused,
                 ty,
@@ -1085,6 +1148,7 @@ pub fn panel_view<'a>(
                 let snap_for_msg = snapshot.clone();
                 slider_row(
                     format!("Idle after {}", format_timeout_duration(idle_secs)),
+                    SettingsRow::IdleSecs.helper(),
                     focused,
                     ty,
                     0.0..=idle_max,
@@ -1096,6 +1160,7 @@ pub fn panel_view<'a>(
                 let snap_for_msg = snapshot.clone();
                 slider_row(
                     format!("Sleep after {}", format_timeout_duration(sleep_secs)),
+                    SettingsRow::SleepSecs.helper(),
                     focused,
                     ty,
                     0.0..=sleep_max,
@@ -1108,6 +1173,7 @@ pub fn panel_view<'a>(
                 let snap_for_msg = snapshot.clone();
                 slider_row(
                     format!("Idle dim {dim}%"),
+                    SettingsRow::IdleDim.helper(),
                     focused,
                     ty,
                     0.0..=100.0,
@@ -1117,6 +1183,7 @@ pub fn panel_view<'a>(
             }
             SettingsRow::Sounds => toggle_row(
                 "UI sounds",
+                SettingsRow::Sounds.helper(),
                 SettingsRow::Sounds.toggle_value(snapshot),
                 focused,
                 ty,
@@ -1127,6 +1194,7 @@ pub fn panel_view<'a>(
                 let snap_for_msg = snapshot.clone();
                 slider_row(
                     format!("Volume {volume}%"),
+                    SettingsRow::SoundVolume.helper(),
                     focused,
                     ty,
                     0.0..=100.0,
@@ -1136,6 +1204,7 @@ pub fn panel_view<'a>(
             }
             SettingsRow::Haptics => toggle_row(
                 "Controller haptics",
+                SettingsRow::Haptics.helper(),
                 SettingsRow::Haptics.toggle_value(snapshot),
                 focused,
                 ty,
@@ -1146,6 +1215,7 @@ pub fn panel_view<'a>(
                 let snap_for_msg = snapshot.clone();
                 slider_row(
                     format!("Strength {strength}%"),
+                    SettingsRow::HapticsStrength.helper(),
                     focused,
                     ty,
                     0.0..=100.0,
@@ -1155,6 +1225,7 @@ pub fn panel_view<'a>(
             }
             SettingsRow::PerfThrottle => toggle_row(
                 "Save power when idle",
+                SettingsRow::PerfThrottle.helper(),
                 SettingsRow::PerfThrottle.toggle_value(snapshot),
                 focused,
                 ty,
@@ -1162,6 +1233,7 @@ pub fn panel_view<'a>(
             ),
             SettingsRow::PerfAntialiasing => toggle_row(
                 "Antialiasing",
+                SettingsRow::PerfAntialiasing.helper(),
                 SettingsRow::PerfAntialiasing.toggle_value(snapshot),
                 focused,
                 ty,
@@ -1169,6 +1241,7 @@ pub fn panel_view<'a>(
             ),
             SettingsRow::PerfVsync => toggle_row(
                 "Vsync",
+                SettingsRow::PerfVsync.helper(),
                 SettingsRow::PerfVsync.toggle_value(snapshot),
                 focused,
                 ty,
@@ -1320,15 +1393,34 @@ fn space_gap() -> Element<'static, StartMessage> {
         .into()
 }
 
+/// Estimated height of a section header block (caption + gap + 1px hairline),
+/// sharing [`SECTION_RULE_GAP`] with the built widget so geometry agrees.
+fn section_block_h(section: f32) -> f32 {
+    section + SECTION_RULE_GAP + 1.0
+}
+
+/// Section header: DIM semibold caption (Configure group-caption language)
+/// over a LINE hairline, so sections read as groups instead of loose rows.
+fn section_block(label: &'static str, size: f32) -> Element<'static, StartMessage> {
+    column![
+        text(label)
+            .size(size)
+            .font(Font {
+                weight: Weight::Semibold,
+                ..Font::DEFAULT
+            })
+            .color(theme::DIM),
+        container(space().height(Length::Fixed(1.0)))
+            .width(Fill)
+            .style(theme::configure_header_rule),
+    ]
+    .spacing(SECTION_RULE_GAP)
+    .width(Fill)
+    .into()
+}
+
 fn section_label(label: &'static str, size: f32) -> Element<'static, StartMessage> {
-    text(label)
-        .size(size)
-        .font(Font {
-            weight: Weight::Semibold,
-            ..Font::DEFAULT
-        })
-        .color(theme::MUTED)
-        .into()
+    section_block(label, size)
 }
 
 fn focus_style(focused: bool) -> impl Fn(&iced::Theme) -> container::Style {
@@ -1351,14 +1443,26 @@ fn focus_style(focused: bool) -> impl Fn(&iced::Theme) -> container::Style {
 
 fn toggle_row(
     label: &'static str,
+    helper: Option<&'static str>,
     checked: bool,
     focused: bool,
     ty: TypeScale,
     message: fn(bool) -> StartMessage,
 ) -> Element<'static, StartMessage> {
+    let mut label_col = column![text(label).size(ty.body).color(theme::INK).width(Fill),]
+        .spacing(HELPER_GAP)
+        .width(Fill);
+    if let Some(helper) = helper {
+        label_col = label_col.push(
+            text(helper)
+                .size(ty.helper)
+                .color(theme::DIM)
+                .wrapping(Wrapping::None),
+        );
+    }
     container(
         row![
-            text(label).size(ty.body).color(theme::INK).width(Fill),
+            label_col,
             toggler(checked)
                 .size(ty.toggle)
                 .on_toggle(message)
@@ -1425,6 +1529,7 @@ fn action_row(
 /// Click (or pad Cross) toggles the menu; `toggle` opens/closes it.
 fn selector_row(
     label: &'static str,
+    helper: Option<&'static str>,
     value_label: &'static str,
     focused: bool,
     ty: TypeScale,
@@ -1432,10 +1537,21 @@ fn selector_row(
 ) -> Element<'static, StartMessage> {
     // Fixed-height clipped viewport: only the selected option displays.
     let viewport_h = cycle_viewport_h(ty.helper);
+    let mut label_col = column![text(label).size(ty.body).color(theme::INK).width(Fill),]
+        .spacing(HELPER_GAP)
+        .width(Fill);
+    if let Some(helper) = helper {
+        label_col = label_col.push(
+            text(helper)
+                .size(ty.helper)
+                .color(theme::DIM)
+                .wrapping(Wrapping::None),
+        );
+    }
     mouse_area(
         container(
             row![
-                text(label).size(ty.body).color(theme::INK),
+                label_col,
                 container(
                     container(
                         text(value_label)
@@ -1532,6 +1648,7 @@ fn option_row(
 
 fn slider_row(
     label: String,
+    helper: Option<&'static str>,
     focused: bool,
     ty: TypeScale,
     range: std::ops::RangeInclusive<f32>,
@@ -1543,20 +1660,27 @@ fn slider_row(
     } else {
         5.0_f32
     };
-    container(
-        column![
-            text(label).size(ty.helper).color(theme::MUTED),
-            slider(range, value, on_change)
-                .step(step)
-                .style(theme::slider),
-        ]
+    let mut content = column![text(label).size(ty.helper).color(theme::MUTED),]
         .spacing(SLIDER_INNER_GAP)
-        .width(Fill),
-    )
-    .padding(ROW_PAD)
-    .width(Fill)
-    .style(focus_style(focused))
-    .into()
+        .width(Fill);
+    if let Some(helper) = helper {
+        content = content.push(
+            text(helper)
+                .size(ty.helper)
+                .color(theme::DIM)
+                .wrapping(Wrapping::None),
+        );
+    }
+    content = content.push(
+        slider(range, value, on_change)
+            .step(step)
+            .style(theme::slider),
+    );
+    container(content)
+        .padding(ROW_PAD)
+        .width(Fill)
+        .style(focus_style(focused))
+        .into()
 }
 
 #[cfg(test)]
