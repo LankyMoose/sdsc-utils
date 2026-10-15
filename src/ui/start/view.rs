@@ -24,7 +24,7 @@ use iced::widget::{
 };
 use iced::{
     Alignment, Background, Border, Color, ContentFit, Element, Fill, Font, Length, Padding, Point,
-    Rectangle, Renderer, Theme,
+    Rectangle, Renderer, Size, Theme,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -73,8 +73,10 @@ const PRESSED_SCALE: f32 = 1.1;
 /// Pressed grow and armed-color transitions.
 const HINT_ANIM: Duration = Duration::from_millis(crate::ui::motion::FAST_MS);
 const ROW_GAP: f32 = 8.0;
-/// Height of a games-list section separator (centered label + hairlines).
-const SECTION_SEP_H: f32 = 28.0;
+/// Height of a games-list section separator (centered label + fading hairlines).
+const SECTION_SEP_H: f32 = 30.0;
+/// Size of the section separator label.
+const SECTION_SEP_TEXT: f32 = 14.0;
 const ROW_ACTION_SPACING: f32 = 14.0;
 /// Body width inside outer padding — dual-pane strip unit.
 const PANE_W: f32 = WIDTH - 2.0 * PADDING;
@@ -4432,17 +4434,25 @@ fn separator_offset_above(sections: &[usize], index: usize) -> f32 {
 }
 
 /// Full-width section separator: centered label with a hairline on either
-/// side, vertically aligned. Only emitted between non-empty sections.
+/// side, vertically aligned. Each rule fades from [`theme::LINE`] at the text
+/// to transparent at the far edge (same fade language as the immersive rail).
+/// Only emitted between non-empty sections.
 fn section_separator(label: &'static str) -> Element<'static, StartMessage> {
     container(
         row![
-            container(space().height(Length::Fixed(1.0)))
+            iced::widget::canvas(SeparatorFade { solid_right: true })
                 .width(Fill)
-                .style(theme::configure_header_rule),
-            text(label).size(12.0).color(theme::DIM),
-            container(space().height(Length::Fixed(1.0)))
+                .height(Fill),
+            text(label)
+                .size(SECTION_SEP_TEXT)
+                .font(Font {
+                    weight: Weight::Semibold,
+                    ..Font::DEFAULT
+                })
+                .color(theme::DIM),
+            iced::widget::canvas(SeparatorFade { solid_right: false })
                 .width(Fill)
-                .style(theme::configure_header_rule),
+                .height(Fill),
         ]
         .spacing(10)
         .align_y(Alignment::Center),
@@ -4451,6 +4461,59 @@ fn section_separator(label: &'static str) -> Element<'static, StartMessage> {
     .width(Fill)
     .height(Length::Fixed(SECTION_SEP_H))
     .into()
+}
+
+/// One side of a [`section_separator`]: a 1.5px rule (immersive-rail weight)
+/// with a linear alpha fade. `solid_right` puts the solid end by the label.
+struct SeparatorFade {
+    solid_right: bool,
+}
+
+impl canvas::Program<StartMessage> for SeparatorFade {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let w = bounds.width;
+        let h = bounds.height;
+        if w < 8.0 || h <= 0.0 {
+            return Vec::new();
+        }
+        let mut frame = Frame::new(renderer, bounds.size());
+        let (edge, solid) = if self.solid_right {
+            (
+                Color {
+                    a: 0.0,
+                    ..theme::LINE
+                },
+                theme::LINE,
+            )
+        } else {
+            (
+                theme::LINE,
+                Color {
+                    a: 0.0,
+                    ..theme::LINE
+                },
+            )
+        };
+        let fade = canvas::gradient::Linear::new(Point::new(0.0, 0.0), Point::new(w, 0.0))
+            .add_stop(0.0, edge)
+            .add_stop(1.0, solid);
+        let thickness = 1.5;
+        frame.fill_rectangle(
+            Point::new(0.0, (h - thickness) * 0.5),
+            Size::new(w, thickness),
+            fade,
+        );
+        vec![frame.into_geometry()]
+    }
 }
 
 fn games_list(state: &State) -> Element<'_, StartMessage> {
