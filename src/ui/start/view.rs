@@ -3926,17 +3926,24 @@ pub fn view<'a>(
     settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
     #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
-    use crate::ui::start::mode::TransitionPhase;
-    if matches!(
-        state.transition_phase.map(|(p, _)| p),
-        Some(TransitionPhase::Resizing)
-    ) || state.transition.is_some()
+    use crate::ui::start::mode::{StartTransition, TransitionPhase};
+    let phase = state.transition_phase.map(|(p, _)| p);
+    // Promote growth holds opaque black: the window stretches underneath and
+    // both joints (ExitCompact end, EnterImmersive start) are black-on-black.
+    if state.transition == Some(StartTransition::Promoting)
+        && matches!(phase, Some(TransitionPhase::Resizing))
     {
+        return container(space())
+            .width(Fill)
+            .height(Fill)
+            .style(theme::immersive_dim(1.0))
+            .into();
+    }
+    if matches!(phase, Some(TransitionPhase::Resizing)) || state.transition.is_some() {
         return crate::ui::start::immersive::veil_view(state, now);
     }
 
     let chrome_status = state.chrome_load_status(now);
-    let phase = state.transition_phase.map(|(p, _)| p);
     let show_immersive = state.immersive
         || matches!(
             phase,

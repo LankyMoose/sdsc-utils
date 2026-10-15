@@ -44,6 +44,10 @@ pub enum TransitionPhase {
 /// Shared duration for darken-compact / darken-immersive / reveal-compact.
 pub const VEIL_TRANSITION_MS: u64 = 300;
 pub const EXIT_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
+/// Promote HWND growth: centered 768×600 → monitor cover, eased. Small steps
+/// keep presenting (one big resize stalls surface recreation); content holds
+/// solid black throughout so the growth joints are invisible.
+pub const RESIZE_ANIM_MS: u64 = VEIL_TRANSITION_MS;
 /// EnterImmersive top-veil lift (ease-in-out); matches splash length so one ceremony covers both.
 pub const ENTER_REVEAL_MS: u64 = crate::ui::motion::SLOW_MS;
 pub const ENTER_IMMERSIVE_MS: u64 = ENTER_REVEAL_MS;
@@ -567,6 +571,8 @@ mod tests {
     #[test]
     fn phase_durations() {
         assert_eq!(TransitionPhase::ExitCompact.duration_ms(), EXIT_COMPACT_MS);
+        // Promote growth matches the veil segments so black joints stay even.
+        assert_eq!(RESIZE_ANIM_MS, VEIL_TRANSITION_MS);
         assert_eq!(
             TransitionPhase::EnterImmersive.duration_ms(),
             ENTER_IMMERSIVE_MS

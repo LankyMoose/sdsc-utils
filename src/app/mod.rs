@@ -343,6 +343,16 @@ pub enum StartKeyAction {
     Cancel,
 }
 
+/// Animated promote growth endpoints: centered compact → monitor cover.
+#[derive(Debug, Clone, Copy)]
+struct ResizeAnim {
+    from_size: Size,
+    to_size: Size,
+    from_pos: Point,
+    to_pos: Point,
+    started: Instant,
+}
+
 pub struct App {
     session: crate::session::DeviceSession,
     games: GamesCatalog,
@@ -392,6 +402,10 @@ pub struct App {
     start_window: Option<window::Id>,
     /// True only while Start is revealed (warm HWND may exist while false).
     start_visible: bool,
+    /// Animated promote growth (compact → cover) while `transition` is
+    /// `Promoting` / phase is `Resizing`. Stepped resizes keep presenting;
+    /// content holds black so joints are invisible.
+    start_resize_anim: Option<ResizeAnim>,
     /// False until Start is revealed and ready — blocks pad nav / sounds early.
     start_nav_ready: bool,
     start_state: start_view::State,
@@ -742,6 +756,7 @@ impl App {
             start_nav_ready: false,
             start_state: start_view::State::default(),
             start_monitor_cover: None,
+            start_resize_anim: None,
             start_last_activity: Instant::now(),
             start_cursor_last_active: Instant::now(),
             start_cursor_hidden: false,
@@ -4685,12 +4700,17 @@ impl App {
     }
 
     fn tick_immersive_transition_phase(&mut self, now: Instant) -> Option<Task<Message>> {
+        // Animated promote growth runs every frame (Resizing never finishes
+        // by timer); completion issues the same settle as the demote resize.
+        if let Some(task) = self.tick_promote_resize(now) {
+            return Some(task);
+        }
         if !self.start_state.phase_finished(now) {
             return None;
         }
         let phase = self.start_state.transition_phase.map(|(p, _)| p)?;
         match phase {
-            start_mode::TransitionPhase::ExitCompact => Some(self.perform_immersive_resize(true)),
+            start_mode::TransitionPhase::ExitCompact => Some(self.begin_promote_resize()),
             start_mode::TransitionPhase::ExitImmersive => {
                 Some(self.perform_immersive_resize(false))
             }
@@ -4717,6 +4737,71 @@ impl App {
             }
             start_mode::TransitionPhase::Resizing => None,
         }
+    }
+
+    /// Promote growth, stepped: centered compact → monitor cover over
+    /// [`RESIZE_ANIM_MS`], eased. Small resizes keep presenting (one big
+    /// resize stalls surface recreation); content holds black throughout.
+    fn begin_promote_resize(&mut self) -> Task<Message> {
+        if self.start_window.filter(|_| self.start_visible).is_none() {
+            self.start_state.clear_transition_phase();
+            return Task::none();
+        };
+        let cover = self.start_monitor_cover.unwrap_or_else(|| {
+            primary_monitor_cover().unwrap_or(MonitorCover {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            })
+        });
+        self.start_monitor_cover = Some(cover);
+        self.start_state.transition = Some(start_mode::StartTransition::Promoting);
+        let now = Instant::now();
+        self.start_state
+            .begin_transition_phase(start_mode::TransitionPhase::Resizing, now);
+        let compact = Size::new(start_view::WIDTH, start_view::HEIGHT);
+        self.start_resize_anim = Some(ResizeAnim {
+            from_size: compact,
+            to_size: cover.size(),
+            from_pos: cover.center_for(compact),
+            to_pos: cover.origin(),
+            started: now,
+        });
+        crate::controller::hid::diag::diag_info("ui-diag: start promote resize begin");
+        // First step immediately so growth starts on the ExitCompact end frame.
+        self.tick_promote_resize(now).unwrap_or_else(Task::none)
+    }
+
+    /// One animated-growth step. Returns `None` when no growth is running
+    /// (normal tick flow continues); completion resolves to the shared settle.
+    fn tick_promote_resize(&mut self, now: Instant) -> Option<Task<Message>> {
+        let anim = self.start_resize_anim?;
+        let Some(id) = self.start_window.filter(|_| self.start_visible) else {
+            self.start_resize_anim = None;
+            self.start_state.transition = None;
+            self.start_state.clear_transition_phase();
+            return Some(Task::none());
+        };
+        let t = start_mode::phase_progress_linear(
+            now.saturating_duration_since(anim.started).as_millis() as u64,
+            start_mode::RESIZE_ANIM_MS,
+        );
+        if t >= 1.0 {
+            self.start_resize_anim = None;
+            crate::controller::hid::diag::diag_info("ui-diag: start promote resize done");
+            return Some(Task::done(Message::StartImmersiveSettled));
+        }
+        let eased = start_mode::ease_in_out_cubic(t);
+        let size = Size::new(
+            anim.from_size.width + (anim.to_size.width - anim.from_size.width) * eased,
+            anim.from_size.height + (anim.to_size.height - anim.from_size.height) * eased,
+        );
+        let pos = Point::new(
+            anim.from_pos.x + (anim.to_pos.x - anim.from_pos.x) * eased,
+            anim.from_pos.y + (anim.to_pos.y - anim.from_pos.y) * eased,
+        );
+        Some(window::resize(id, size).chain(move_window(id, pos)))
     }
 
     fn perform_immersive_resize(&mut self, promoting: bool) -> Task<Message> {
@@ -4980,6 +5065,11 @@ impl App {
         self.start_revealed_at = None;
         self.start_state.immersive = false;
         self.start_state.clear_immersive_session();
+        // Drop any in-flight promote/demote ceremony (animated growth must
+        // not keep resizing a closing window; reopen starts clean).
+        self.start_state.transition = None;
+        self.start_state.clear_transition_phase();
+        self.start_resize_anim = None;
         // Invalidate in-flight art events; keep caches for fast reopen.
         // Process Exit is what wipes to a blank slate (`art_worker::shutdown`).
         let generation = crate::ui::start::icon_cache::bump_art_warm_generation();
