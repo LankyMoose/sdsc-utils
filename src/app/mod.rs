@@ -402,6 +402,10 @@ pub struct App {
     start_window: Option<window::Id>,
     /// True only while Start is revealed (warm HWND may exist while false).
     start_visible: bool,
+    /// Open-time list reveal awaiting a fresh mount: (list, target y,
+    /// selection index). Re-issued behind the enter veil until the mount
+    /// reports back; dropped on selection drift / slide change / close.
+    pending_reveal_scroll: Option<(start_view::StartListId, f32, usize)>,
     /// Animated promote growth (compact → cover) while `transition` is
     /// `Promoting` / phase is `Resizing`. Stepped resizes keep presenting;
     /// content holds black so joints are invisible.
@@ -753,6 +757,7 @@ impl App {
             pad_input_panel: PadInputPanel::default(),
             start_window: None,
             start_visible: false,
+            pending_reveal_scroll: None,
             start_nav_ready: false,
             start_state: start_view::State::default(),
             start_monitor_cover: None,
@@ -4750,13 +4755,20 @@ impl App {
     }
 
     fn tick_immersive_transition_phase(&mut self, now: Instant) -> Option<Task<Message>> {
+        // Queued open-time reveal re-issues behind the enter veil until the
+        // fresh mount reports back (kills the demote scroll snap).
+        let reveal = self.flush_pending_reveal();
+        let with_reveal = |reveal: Option<Task<Message>>, task: Task<Message>| match reveal {
+            Some(reveal) => reveal.chain(task),
+            None => task,
+        };
         // Animated growth/shrink runs every frame (Resizing never finishes
         // by timer); completion issues the same settle as the old resize.
         if let Some(task) = self.tick_resize_anim(now) {
-            return Some(task);
+            return Some(with_reveal(reveal, task));
         }
         if !self.start_state.phase_finished(now) {
-            return None;
+            return reveal;
         }
         let phase = self.start_state.transition_phase.map(|(p, _)| p)?;
         match phase {
@@ -4768,7 +4780,7 @@ impl App {
                     self.start_state
                         .begin_transition_phase(start_mode::TransitionPhase::Resizing, now);
                 }
-                None
+                reveal
             }
             start_mode::TransitionPhase::EnterImmersive => {
                 self.start_state.clear_transition_phase();
@@ -4782,7 +4794,10 @@ impl App {
                 // the cover here (~one reveal after settle) — a no-op when
                 // already exact, a heal when the animation lost steps.
                 let resnap = self.snap_promote_target();
-                Some(resnap.chain(self.flush_deferred_steam_scan_after_promote()))
+                Some(with_reveal(
+                    reveal,
+                    resnap.chain(self.flush_deferred_steam_scan_after_promote()),
+                ))
             }
             start_mode::TransitionPhase::EnterCompact => {
                 self.start_state.clear_transition_phase();
@@ -4793,9 +4808,9 @@ impl App {
                 ));
                 // After the Float scale veil clears, force the compact list onto the selection
                 // (stale tracked offset from pre-promote often makes into-view a no-op).
-                Some(self.scroll_start_selection_for_open())
+                Some(with_reveal(reveal, self.scroll_start_selection_for_open()))
             }
-            start_mode::TransitionPhase::Resizing => None,
+            start_mode::TransitionPhase::Resizing => reveal,
         }
     }
 
@@ -4938,10 +4953,11 @@ impl App {
         if immersive {
             snap.chain(focus).chain(self.warm_immersive_art_task())
         } else {
-            // Center selection as soon as compact chrome exists; EnterCompact completion
-            // re-centers once the scale Float is gone (see tick_immersive_transition_phase).
-            snap.chain(focus)
-                .chain(self.scroll_start_selection_for_open())
+            // Center selection as soon as compact chrome exists; the op is
+            // queued (not just issued) so a dropped same-tick scroll lands
+            // behind the veil instead of snapping at enter completion.
+            // EnterCompact completion re-centers once the Float is gone.
+            snap.chain(focus).chain(self.queue_start_selection_reveal())
         }
     }
 
@@ -5116,6 +5132,7 @@ impl App {
         self.start_state.transition = None;
         self.start_state.clear_transition_phase();
         self.start_resize_anim = None;
+        self.pending_reveal_scroll = None;
         // Invalidate in-flight art events; keep caches for fast reopen.
         // Process Exit is what wipes to a blank slate (`art_worker::shutdown`).
         let generation = crate::ui::start::icon_cache::bump_art_warm_generation();
@@ -5401,6 +5418,9 @@ impl App {
                 if self.start_state.overlay_blocking() || self.start_state.transition.is_some() {
                     return Task::none();
                 }
+                // User took over post-settle browsing: a queued open-time
+                // reveal is moot (its target predates this slide change).
+                self.pending_reveal_scroll = None;
                 if self.start_state.editing {
                     // Slide-switch discards the draft (cancel-equivalent): revive
                     // the pre-edit anchor game, else nearest-enabled, so the
@@ -5431,6 +5451,8 @@ impl App {
                 if self.start_state.overlay_blocking() || self.start_state.transition.is_some() {
                     return Task::none();
                 }
+                // Same queued-reveal drop as PrevSlide (user took over).
+                self.pending_reveal_scroll = None;
                 if self.start_state.editing {
                     // Same cancel-equivalent discard as PrevSlide (see above).
                     let anchor = self.start_state.edit_anchor_play_key.clone();
@@ -5765,6 +5787,68 @@ impl App {
                 y: Some(y),
             },
         )
+    }
+
+    /// Demote-settle reveal: the compact list remounts under the new tree,
+    /// so a same-tick `scroll_to` can drop (and the mount's own zero report
+    /// clobbers the optimistic offset, teeing up a visible snap when the
+    /// enter phase re-centers). Issue it now AND queue it: ticks re-issue
+    /// behind the opaque lift until the mount reports back.
+    fn queue_start_selection_reveal(&mut self) -> Task<Message> {
+        let Some((id, y)) = self.start_state.open_reveal_scroll() else {
+            return Task::none();
+        };
+        self.start_state.note_scroll_y(&id, y);
+        if let Some(list) = start_view::StartListId::from_scroll_id(&id) {
+            let selected = match list {
+                start_view::StartListId::Games => self.start_state.game_selected,
+                start_view::StartListId::Controllers => self.start_state.controller_selected,
+                start_view::StartListId::Settings => usize::MAX,
+            };
+            self.pending_reveal_scroll = Some((list, y, selected));
+        }
+        operation::scroll_to(
+            id,
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
+        )
+    }
+
+    /// Re-issue a queued open-time reveal while the enter veil still covers
+    /// the fresh mount. Drops itself when the selection drifted (user moved
+    /// on), the slide changed context, Start hid, or the enter phase ended.
+    fn flush_pending_reveal(&mut self) -> Option<Task<Message>> {
+        let (list, y, selected) = self.pending_reveal_scroll?;
+        if !self.start_visible {
+            self.pending_reveal_scroll = None;
+            return None;
+        }
+        let still_entering = matches!(
+            self.start_state.transition_phase.map(|(p, _)| p),
+            Some(start_mode::TransitionPhase::EnterCompact)
+        );
+        if !still_entering {
+            self.pending_reveal_scroll = None;
+            return None;
+        }
+        let current = match list {
+            start_view::StartListId::Games => self.start_state.game_selected,
+            start_view::StartListId::Controllers => self.start_state.controller_selected,
+            start_view::StartListId::Settings => usize::MAX,
+        };
+        if current != selected {
+            self.pending_reveal_scroll = None;
+            return None;
+        }
+        Some(operation::scroll_to(
+            list.scroll_id(),
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
+        ))
     }
 
     fn toggle_start_edit(&mut self) -> Option<Task<Message>> {
