@@ -1550,7 +1550,7 @@ fn analytics_view<'a>(
                 settings.analytics_enabled,
                 ConfigureMessage::SetAnalyticsEnabled,
             ),
-            note("Local only. Full charge / full drain are estimated totals for a complete cycle. Remaining time on the tray uses your current (or last-known) percent. Mid-cycle unplug or charge does not wipe learned steps."),
+            note("Local only. Full charge / full drain are estimated totals for a complete cycle. Remaining time on the tray uses your current (or last-known) percent. Mid-cycle unplug or charge does not wipe learned steps. Times round down to 5–30 minute steps."),
         ],
     ));
 
@@ -1572,6 +1572,75 @@ fn analytics_view<'a>(
     }
 
     items.into()
+}
+
+/// Measured / estimated step counts for a coverage chart.
+fn coverage_counts(steps: &[StepCoverage]) -> (usize, usize) {
+    let measured = steps.iter().filter(|s| s.typical_ms.is_some()).count();
+    let estimated = steps
+        .iter()
+        .filter(|s| s.typical_ms.is_none() && s.speculative)
+        .count();
+    (measured, estimated)
+}
+
+/// One labeled coverage chart: heading with measured/total status, the bar
+/// strip, high→low axis captions, and a solid / faded / grey legend.
+fn coverage_chart_block<'a>(
+    title: &'static str,
+    steps: &[StepCoverage],
+    axis_start: &'static str,
+    axis_end: &'static str,
+    accent: iced::Color,
+    drain: bool,
+) -> Element<'a, ConfigureMessage> {
+    let (measured, _) = coverage_counts(steps);
+    let status = if steps.is_empty() || measured == 0 {
+        "Learning…".to_string()
+    } else {
+        format!("{measured} of {} steps measured", steps.len())
+    };
+    let faded = iced::Color { a: 0.35, ..accent };
+    column![
+        row![
+            text(title).size(11.0).color(theme::DIM).width(Fill),
+            text(status).size(11.0).color(theme::DIM),
+        ]
+        .align_y(Alignment::Center),
+        canvas_widget(CoverageChart {
+            steps: steps.to_vec(),
+            drain,
+        })
+        .width(Fill)
+        .height(Length::Fixed(COVERAGE_HEIGHT)),
+        row![
+            text(axis_start).size(11.0).color(theme::DIM).width(Fill),
+            text(axis_end).size(11.0).color(theme::DIM),
+        ],
+        row![
+            coverage_legend_swatch(accent),
+            text("Measured").size(11.0).color(theme::DIM),
+            coverage_legend_swatch(faded),
+            text("Estimated").size(11.0).color(theme::DIM),
+            coverage_legend_swatch(theme::LINE),
+            text("No data").size(11.0).color(theme::DIM),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(4)
+    .width(Fill)
+    .into()
+}
+
+fn coverage_legend_swatch(color: iced::Color) -> Element<'static, ConfigureMessage> {
+    container(
+        space()
+            .width(Length::Fixed(10.0))
+            .height(Length::Fixed(10.0)),
+    )
+    .style(theme::swatch(color))
+    .into()
 }
 
 fn analytics_pad_card<'a>(row: &'a AnalyticsPadRow) -> Element<'a, ConfigureMessage> {
@@ -1602,33 +1671,42 @@ fn analytics_pad_card<'a>(row: &'a AnalyticsPadRow) -> Element<'a, ConfigureMess
         );
 
     if let Some(progress) = row.in_progress.as_ref() {
+        let elapsed = format_duration_short(Duration::from_millis(progress.active_ms));
         let label = match progress.direction {
-            BucketDirection::Drain => format!("Recording drain at {}%", progress.percent),
-            BucketDirection::Charge => format!("Recording charge at {}%", progress.percent),
+            BucketDirection::Drain => {
+                format!(
+                    "Recording drain at {}% · {elapsed} so far",
+                    progress.percent
+                )
+            }
+            BucketDirection::Charge => {
+                format!(
+                    "Recording charge at {}% · {elapsed} so far",
+                    progress.percent
+                )
+            }
         };
         col = col.push(text(label).size(12.0).color(theme::DIM));
     }
 
     col = col
         .push(space().height(Length::Fixed(4.0)))
-        .push(text("Play coverage").size(11.0).color(theme::DIM))
-        .push(
-            canvas_widget(CoverageChart {
-                steps: row.drain_coverage.clone(),
-                drain: true,
-            })
-            .width(Fill)
-            .height(Length::Fixed(COVERAGE_HEIGHT)),
-        )
-        .push(text("Charge coverage").size(11.0).color(theme::DIM))
-        .push(
-            canvas_widget(CoverageChart {
-                steps: row.charge_coverage.clone(),
-                drain: false,
-            })
-            .width(Fill)
-            .height(Length::Fixed(COVERAGE_HEIGHT)),
-        );
+        .push(coverage_chart_block(
+            "Play coverage",
+            &row.drain_coverage,
+            "100%",
+            "5%",
+            theme::ACCENT,
+            true,
+        ))
+        .push(coverage_chart_block(
+            "Charge coverage",
+            &row.charge_coverage,
+            "5%",
+            "100%",
+            theme::SUCCESS,
+            false,
+        ));
 
     container(col)
         .padding(GROUP_PAD)
@@ -2322,6 +2400,32 @@ mod tests {
         let percent = suggested_stop_percent(&spectrum);
         assert!(percent > 0 && percent < 100);
         assert!(!spectrum.stops.iter().any(|stop| stop.percent == percent));
+    }
+
+    #[test]
+    fn coverage_counts_split_measured_estimated_unknown() {
+        let steps = vec![
+            StepCoverage {
+                from_percent: 100,
+                to_percent: 95,
+                typical_ms: Some(60_000),
+                speculative: false,
+            },
+            StepCoverage {
+                from_percent: 95,
+                to_percent: 85,
+                typical_ms: None,
+                speculative: true,
+            },
+            StepCoverage {
+                from_percent: 85,
+                to_percent: 75,
+                typical_ms: None,
+                speculative: false,
+            },
+        ];
+        assert_eq!(coverage_counts(&steps), (1, 1));
+        assert_eq!(coverage_counts(&[]), (0, 0));
     }
 
     #[test]
