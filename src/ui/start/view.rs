@@ -3926,20 +3926,27 @@ pub fn view<'a>(
     settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
     #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
-    use crate::ui::start::mode::{StartTransition, TransitionPhase};
+    use crate::ui::start::mode::TransitionPhase;
     let phase = state.transition_phase.map(|(p, _)| p);
-    // Promote growth holds opaque black: the window stretches underneath and
-    // both joints (ExitCompact end, EnterImmersive start) are black-on-black.
-    if state.transition == Some(StartTransition::Promoting)
-        && matches!(phase, Some(TransitionPhase::Resizing))
-    {
+    // Animated growth/shrink holds opaque black: the window stretches
+    // underneath and both joints (exit-veil end, enter-veil start) are
+    // black-on-black. The box carries the window radius itself so corners
+    // stay rounded throughout (it would cover the chrome backdrop).
+    if matches!(phase, Some(TransitionPhase::Resizing)) {
         return container(space())
             .width(Fill)
             .height(Fill)
-            .style(theme::immersive_dim(1.0))
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(Color::BLACK)),
+                border: Border {
+                    radius: crate::ui::chrome::window_radius().into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            })
             .into();
     }
-    if matches!(phase, Some(TransitionPhase::Resizing)) || state.transition.is_some() {
+    if state.transition.is_some() {
         return crate::ui::start::immersive::veil_view(state, now);
     }
 

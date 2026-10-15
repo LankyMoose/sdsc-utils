@@ -4700,9 +4700,9 @@ impl App {
     }
 
     fn tick_immersive_transition_phase(&mut self, now: Instant) -> Option<Task<Message>> {
-        // Animated promote growth runs every frame (Resizing never finishes
-        // by timer); completion issues the same settle as the demote resize.
-        if let Some(task) = self.tick_promote_resize(now) {
+        // Animated growth/shrink runs every frame (Resizing never finishes
+        // by timer); completion issues the same settle as the old resize.
+        if let Some(task) = self.tick_resize_anim(now) {
             return Some(task);
         }
         if !self.start_state.phase_finished(now) {
@@ -4711,9 +4711,7 @@ impl App {
         let phase = self.start_state.transition_phase.map(|(p, _)| p)?;
         match phase {
             start_mode::TransitionPhase::ExitCompact => Some(self.begin_promote_resize()),
-            start_mode::TransitionPhase::ExitImmersive => {
-                Some(self.perform_immersive_resize(false))
-            }
+            start_mode::TransitionPhase::ExitImmersive => Some(self.begin_demote_resize()),
             start_mode::TransitionPhase::EnterImmersive => {
                 self.start_state.clear_transition_phase();
                 // Veil phase over — begin held ambient→splash on this same clock tick.
@@ -4722,7 +4720,11 @@ impl App {
                     "ui-diag: start immersive transition phase={} done",
                     phase.label()
                 ));
-                Some(self.flush_deferred_steam_scan_after_promote())
+                // Second exact snap: stepped tasks can coalesce, so re-assert
+                // the cover here (~one reveal after settle) — a no-op when
+                // already exact, a heal when the animation lost steps.
+                let resnap = self.snap_promote_target();
+                Some(resnap.chain(self.flush_deferred_steam_scan_after_promote()))
             }
             start_mode::TransitionPhase::EnterCompact => {
                 self.start_state.clear_transition_phase();
@@ -4740,8 +4742,8 @@ impl App {
     }
 
     /// Promote growth, stepped: centered compact → monitor cover over
-    /// [`RESIZE_ANIM_MS`], eased. Small resizes keep presenting (one big
-    /// resize stalls surface recreation); content holds black throughout.
+    /// `RESIZE_ANIM_MS`, eased. Small resizes keep presenting (one big resize
+    /// stalls surface recreation); content holds black throughout.
     fn begin_promote_resize(&mut self) -> Task<Message> {
         if self.start_window.filter(|_| self.start_visible).is_none() {
             self.start_state.clear_transition_phase();
@@ -4770,12 +4772,52 @@ impl App {
         });
         crate::controller::hid::diag::diag_info("ui-diag: start promote resize begin");
         // First step immediately so growth starts on the ExitCompact end frame.
-        self.tick_promote_resize(now).unwrap_or_else(Task::none)
+        self.tick_resize_anim(now).unwrap_or_else(Task::none)
     }
 
-    /// One animated-growth step. Returns `None` when no growth is running
-    /// (normal tick flow continues); completion resolves to the shared settle.
-    fn tick_promote_resize(&mut self, now: Instant) -> Option<Task<Message>> {
+    /// Demote shrink, stepped: the reverse of [`begin_promote_resize`].
+    /// Content holds black; the EnterCompact veil lifts onto compact chrome.
+    fn begin_demote_resize(&mut self) -> Task<Message> {
+        if self.start_window.filter(|_| self.start_visible).is_none() {
+            self.start_state.clear_transition_phase();
+            return Task::none();
+        };
+        let cover = self.start_monitor_cover.or_else(primary_monitor_cover);
+        self.start_state.transition = Some(start_mode::StartTransition::Demoting);
+        let now = Instant::now();
+        self.start_state
+            .begin_transition_phase(start_mode::TransitionPhase::Resizing, now);
+        let compact = Size::new(start_view::WIDTH, start_view::HEIGHT);
+        let (from_size, from_pos, to_pos) = match cover {
+            Some(cover) => (cover.size(), cover.origin(), cover.center_for(compact)),
+            None => (
+                compact,
+                Point::new(
+                    ((1920.0 - compact.width) / 2.0).max(0.0),
+                    ((1080.0 - compact.height) / 2.0).max(0.0),
+                ),
+                Point::new(
+                    ((1920.0 - compact.width) / 2.0).max(0.0),
+                    ((1080.0 - compact.height) / 2.0).max(0.0),
+                ),
+            ),
+        };
+        self.start_resize_anim = Some(ResizeAnim {
+            from_size,
+            to_size: compact,
+            from_pos,
+            to_pos,
+            started: now,
+        });
+        crate::controller::hid::diag::diag_info("ui-diag: start demote resize begin");
+        // First step immediately so shrinking starts on the ExitImmersive end frame.
+        self.tick_resize_anim(now).unwrap_or_else(Task::none)
+    }
+
+    /// One animated-resize step (either direction). Returns `None` when no
+    /// animation is running (normal tick flow continues); completion resolves
+    /// to the shared settle, which snaps exact geometry.
+    fn tick_resize_anim(&mut self, now: Instant) -> Option<Task<Message>> {
         let anim = self.start_resize_anim?;
         let Some(id) = self.start_window.filter(|_| self.start_visible) else {
             self.start_resize_anim = None;
@@ -4789,7 +4831,7 @@ impl App {
         );
         if t >= 1.0 {
             self.start_resize_anim = None;
-            crate::controller::hid::diag::diag_info("ui-diag: start promote resize done");
+            crate::controller::hid::diag::diag_info("ui-diag: start resize anim done");
             return Some(Task::done(Message::StartImmersiveSettled));
         }
         let eased = start_mode::ease_in_out_cubic(t);
@@ -4804,58 +4846,54 @@ impl App {
         Some(window::resize(id, size).chain(move_window(id, pos)))
     }
 
-    fn perform_immersive_resize(&mut self, promoting: bool) -> Task<Message> {
-        let Some(id) = self.start_window.filter(|_| self.start_visible) else {
-            self.start_state.clear_transition_phase();
+    /// Exact snap to the promote target (cover). Stepped tasks can coalesce,
+    /// so settle re-asserts: a degraded animation heals here instead of
+    /// leaving immersive chrome in a compact window.
+    fn snap_promote_target(&self) -> Task<Message> {
+        let (Some(id), Some(cover)) = (
+            self.start_window.filter(|_| self.start_visible),
+            self.start_monitor_cover,
+        ) else {
             return Task::none();
         };
-        let transition = if promoting {
-            start_mode::StartTransition::Promoting
-        } else {
-            start_mode::StartTransition::Demoting
+        window::resize(id, cover.size()).chain(move_window(id, cover.origin()))
+    }
+
+    /// Exact snap to the demote target (centered compact). Same heal as
+    /// [`snap_promote_target`] for the shrink direction.
+    fn snap_compact_target(&self) -> Task<Message> {
+        let Some(id) = self.start_window.filter(|_| self.start_visible) else {
+            return Task::none();
         };
-        self.start_state.transition = Some(transition);
-        self.start_state
-            .begin_transition_phase(start_mode::TransitionPhase::Resizing, Instant::now());
-        if promoting {
-            let cover = self.start_monitor_cover.unwrap_or_else(|| {
-                primary_monitor_cover().unwrap_or(MonitorCover {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 1920.0,
-                    height: 1080.0,
-                })
-            });
-            self.start_monitor_cover = Some(cover);
-            window::resize(id, cover.size())
-                .chain(move_window(id, cover.origin()))
-                .chain(Task::done(Message::StartImmersiveSettled))
-        } else {
-            let size = Size::new(start_view::WIDTH, start_view::HEIGHT);
-            let position = self
-                .start_monitor_cover
-                .or_else(primary_monitor_cover)
-                .map(|cover| cover.center_for(size))
-                .unwrap_or(Point::new(
-                    ((1920.0 - size.width) / 2.0).max(0.0),
-                    ((1080.0 - size.height) / 2.0).max(0.0),
-                ));
-            window::resize(id, size)
-                .chain(move_window(id, position))
-                .chain(Task::done(Message::StartImmersiveSettled))
-        }
+        let size = Size::new(start_view::WIDTH, start_view::HEIGHT);
+        let position = self
+            .start_monitor_cover
+            .or_else(primary_monitor_cover)
+            .map(|cover| cover.center_for(size))
+            .unwrap_or(Point::new(
+                ((1920.0 - size.width) / 2.0).max(0.0),
+                ((1080.0 - size.height) / 2.0).max(0.0),
+            ));
+        window::resize(id, size).chain(move_window(id, position))
     }
 
     fn finish_start_immersive_transition(&mut self) -> Task<Message> {
         let Some(transition) = self.start_state.transition.take() else {
             return Task::none();
         };
+        // The animation already resolved (or never ran); never leave a stale
+        // driver behind to resize a settled window.
+        self.start_resize_anim = None;
         let immersive = start_mode::settle_immersive(transition);
         self.start_state.immersive = immersive;
         self.start_state.dock_expanded = false;
         self.start_state.slide = StartSlide::Games;
         // Dock/strip anims cleared via transition phase begin + request_dock defaults.
         let now = Instant::now();
+        // Exact snap first: stepped tasks can coalesce, so settle re-asserts
+        // geometry before flipping presentation — immersive chrome can never
+        // land in a compact window (or vice versa).
+        let snap: Task<Message>;
         if immersive {
             // Keep ambient_time; open aperture + chrome.
             // Lift onto ambient+dock immediately (cold-style); list stays hidden until art sync.
@@ -4876,7 +4914,9 @@ impl App {
                 "ui-diag: start immersive settle promote backdrop re-arm sel={}",
                 self.start_state.game_selected
             ));
+            snap = self.snap_promote_target();
         } else {
+            snap = self.snap_compact_target();
             self.start_monitor_cover = None;
             self.clear_start_activity();
             self.start_state.clear_backdrop_transition();
@@ -4891,11 +4931,12 @@ impl App {
             .map(|id| focus_window(id).chain(raise_window_topmost(id)))
             .unwrap_or_else(Task::none);
         if immersive {
-            focus.chain(self.warm_immersive_art_task())
+            snap.chain(focus).chain(self.warm_immersive_art_task())
         } else {
             // Center selection as soon as compact chrome exists; EnterCompact completion
             // re-centers once the scale Float is gone (see tick_immersive_transition_phase).
-            focus.chain(self.scroll_start_selection_for_open())
+            snap.chain(focus)
+                .chain(self.scroll_start_selection_for_open())
         }
     }
 

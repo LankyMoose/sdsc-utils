@@ -41,13 +41,14 @@ pub enum TransitionPhase {
     EnterCompact,
 }
 
-/// Shared duration for darken-compact / darken-immersive / reveal-compact.
+/// Shared duration for darken-immersive / reveal-compact / cold ambient.
 pub const VEIL_TRANSITION_MS: u64 = 300;
-pub const EXIT_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
-/// Promote HWND growth: centered 768×600 → monitor cover, eased. Small steps
+/// Compact fade to black before promote growth (trimmed: growth covers the joint).
+pub const EXIT_COMPACT_MS: u64 = 200;
+/// Animated HWND growth/shrink: compact ⇄ monitor cover, eased. Small steps
 /// keep presenting (one big resize stalls surface recreation); content holds
-/// solid black throughout so the growth joints are invisible.
-pub const RESIZE_ANIM_MS: u64 = VEIL_TRANSITION_MS;
+/// black throughout so the growth joints are invisible.
+pub const RESIZE_ANIM_MS: u64 = 220;
 /// EnterImmersive top-veil lift (ease-in-out); matches splash length so one ceremony covers both.
 pub const ENTER_REVEAL_MS: u64 = crate::ui::motion::SLOW_MS;
 pub const ENTER_IMMERSIVE_MS: u64 = ENTER_REVEAL_MS;
@@ -571,8 +572,10 @@ mod tests {
     #[test]
     fn phase_durations() {
         assert_eq!(TransitionPhase::ExitCompact.duration_ms(), EXIT_COMPACT_MS);
-        // Promote growth matches the veil segments so black joints stay even.
-        assert_eq!(RESIZE_ANIM_MS, VEIL_TRANSITION_MS);
+        // Growth/shrink is trimmed below the veil segments; exit-compact is
+        // decoupled since growth covers that joint.
+        assert_eq!(RESIZE_ANIM_MS, 220);
+        assert_eq!(EXIT_COMPACT_MS, 200);
         assert_eq!(
             TransitionPhase::EnterImmersive.duration_ms(),
             ENTER_IMMERSIVE_MS
