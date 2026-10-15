@@ -816,6 +816,9 @@ pub struct State {
     pub settings: crate::ui::start::settings::SettingsPanel,
     pub triangle_progress: f32,
     pub cross_progress: f32,
+    /// Open-time reveal hold: the enter veil stays shut until the fresh
+    /// mount reports the queued target back (or the hold times out).
+    pub reveal_hold: Option<RevealHold>,
     /// Face buttons currently held (pad OR keyboard) for action-hint press styling.
     pub held: FaceHeld,
     /// Reopen chord fully held (for immersive-toggle hint press styling).
@@ -1008,6 +1011,21 @@ impl ListScrollTracker {
     }
 }
 
+/// Open-time list reveal awaiting a fresh mount: re-issued behind the enter
+/// veil until the mount reports the target back (or the hold times out).
+/// The enter veil stays shut while the hold is live, so a late scroll can
+/// never snap visibly.
+#[derive(Debug, Clone, Copy)]
+pub struct RevealHold {
+    pub list: StartListId,
+    /// Target offset, clamped to the scrollable range at queue time.
+    pub y: f32,
+    /// Selection index the target was computed for (drift drops the hold).
+    pub selected: usize,
+    /// When the hold was queued (bounds the black extension).
+    pub queued_at: Instant,
+}
+
 /// How to pin a selection that has left the viewport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrollReveal {
@@ -1052,6 +1070,7 @@ impl Default for State {
             settings: crate::ui::start::settings::SettingsPanel::default(),
             triangle_progress: 0.0,
             cross_progress: 0.0,
+            reveal_hold: None,
             held: FaceHeld::default(),
             reopen_chord_held: false,
             press_anim: FacePressAnim::default(),
@@ -1306,6 +1325,66 @@ impl State {
             StartSlide::Games => self.selection_scroll_y_center_prefer(),
             StartSlide::Controllers => self.selection_scroll_y(ScrollReveal::Either),
         }
+    }
+
+    /// Selection index a reveal hold targets (per list).
+    fn hold_selected(&self, list: StartListId) -> usize {
+        match list {
+            StartListId::Games => self.game_selected,
+            StartListId::Controllers => self.controller_selected,
+            StartListId::Settings => usize::MAX,
+        }
+    }
+
+    /// True while the enter veil must stay shut for a queued reveal: hold
+    /// present, still entering, unexpired, selection unchanged.
+    pub fn enter_compact_hold_active(&self, now: Instant) -> bool {
+        let Some(hold) = self.reveal_hold else {
+            return false;
+        };
+        if !matches!(
+            self.transition_phase.map(|(p, _)| p),
+            Some(crate::ui::start::mode::TransitionPhase::EnterCompact)
+        ) {
+            return false;
+        }
+        if now.saturating_duration_since(hold.queued_at)
+            > Duration::from_millis(crate::ui::start::mode::REVEAL_HOLD_TIMEOUT_MS)
+        {
+            return false;
+        }
+        self.hold_selected(hold.list) == hold.selected
+    }
+
+    /// Max scroll offset for a compact list (content minus viewport,
+    /// floored). Queued targets clamp here so mount-applied offsets always
+    /// match later reports (an overshooting target would clamp silently and
+    /// never confirm).
+    pub(crate) fn compact_list_max_scroll(&self, list: StartListId) -> f32 {
+        let viewport_h = {
+            let reported = self.scrolls.viewport(list);
+            if reported <= 1.0 {
+                estimated_list_viewport_h()
+            } else {
+                reported
+            }
+        };
+        let content = match list {
+            StartListId::Games => {
+                let seps = games_row_sections(self);
+                let seps = seps.windows(2).filter(|w| w[0] != w[1]).count();
+                let rows = self.rows.len();
+                rows as f32 * ROW_HEIGHT
+                    + seps as f32 * SECTION_SEP_H
+                    + rows.saturating_add(seps).saturating_sub(1) as f32 * ROW_GAP
+            }
+            StartListId::Controllers => {
+                let rows = self.controllers.len();
+                rows as f32 * CONTROLLER_ROW_HEIGHT + rows.saturating_sub(1) as f32 * ROW_GAP
+            }
+            StartListId::Settings => return f32::MAX,
+        };
+        (content - viewport_h).max(0.0)
     }
 
     /// Select the row matching `play_key`, or the first row if missing / empty.
@@ -3983,6 +4062,9 @@ pub fn view<'a>(
     // scrollable is not remounted (and scroll reset) when promote begins.
     let veil = match phase {
         Some(TransitionPhase::ExitCompact) => state.phase_progress(now),
+        // A live reveal hold pins the veil shut until the fresh mount
+        // reports the queued scroll back (or the hold times out).
+        Some(TransitionPhase::EnterCompact) if state.enter_compact_hold_active(now) => 1.0,
         Some(TransitionPhase::EnterCompact) => 1.0 - state.phase_progress(now),
         _ => 0.0,
     };
@@ -6402,6 +6484,52 @@ mod tests {
         assert!(!state.note_scroll_y(&unknown, 999.0));
         assert!((state.list_offset(StartListId::Games) - 220.0).abs() < f32::EPSILON);
         assert!((state.list_offset(StartListId::Controllers) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn reveal_hold_gates_enter_veil_until_report_or_timeout() {
+        use crate::ui::start::mode::{REVEAL_HOLD_TIMEOUT_MS, TransitionPhase};
+        let now = Instant::now();
+        let mut state = State::default();
+        // No hold → no gate.
+        state.begin_transition_phase(TransitionPhase::EnterCompact, now);
+        assert!(!state.enter_compact_hold_active(now));
+        // Hold outside the enter phase → no gate.
+        state.reveal_hold = Some(RevealHold {
+            list: StartListId::Games,
+            y: 300.0,
+            selected: 0,
+            queued_at: now,
+        });
+        state.clear_transition_phase();
+        assert!(!state.enter_compact_hold_active(now));
+        // Hold in phase, fresh, selection matching → gate.
+        state.begin_transition_phase(TransitionPhase::EnterCompact, now);
+        assert!(state.enter_compact_hold_active(now));
+        // Selection drifted → no gate.
+        state.game_selected = 4;
+        assert!(!state.enter_compact_hold_active(now));
+        state.game_selected = 0;
+        assert!(state.enter_compact_hold_active(now));
+        // Expired → no gate.
+        let late = now + Duration::from_millis(REVEAL_HOLD_TIMEOUT_MS + 1);
+        assert!(!state.enter_compact_hold_active(late));
+    }
+
+    #[test]
+    fn compact_max_scroll_clamps_short_lists_to_zero() {
+        let mut state = State::default();
+        // Empty / short lists cannot scroll: queued targets clamp to 0 so
+        // mount reports always confirm.
+        assert!((state.compact_list_max_scroll(StartListId::Games) - 0.0).abs() < f32::EPSILON);
+        state.rows = vec![game_row_with("steam:1"), game_row_with("steam:2")];
+        assert!((state.compact_list_max_scroll(StartListId::Games) - 0.0).abs() < f32::EPSILON);
+        // Long list scrolls: content minus viewport.
+        state.rows = (0..20)
+            .map(|i| game_row_with(&format!("steam:{i}")))
+            .collect();
+        let max = state.compact_list_max_scroll(StartListId::Games);
+        assert!(max > 0.0);
     }
 
     #[test]

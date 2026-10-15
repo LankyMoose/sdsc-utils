@@ -46,6 +46,9 @@ pub const VEIL_TRANSITION_MS: u64 = 300;
 /// Fast promote/demote segment, shared: exit fades, enter fades, and the
 /// HWND growth/shrink all use one duration so the joints stay even.
 pub const SWIFT_SEGMENT_MS: u64 = 150;
+/// Max time the enter veil stays shut waiting for a queued reveal
+/// (bounds the black extension when reports never confirm).
+pub const REVEAL_HOLD_TIMEOUT_MS: u64 = 500;
 /// EnterImmersive top-veil lift (ease-in-out); matches splash length so one ceremony covers both.
 pub const ENTER_REVEAL_MS: u64 = crate::ui::motion::SLOW_MS;
 pub const ENTER_IMMERSIVE_MS: u64 = ENTER_REVEAL_MS;
