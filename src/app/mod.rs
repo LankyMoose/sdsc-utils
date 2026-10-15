@@ -4807,9 +4807,12 @@ impl App {
                     "ui-diag: start immersive transition phase={} done",
                     phase.label()
                 ));
-                // After the Float scale veil clears, force the compact list onto the selection
-                // (stale tracked offset from pre-promote often makes into-view a no-op).
-                Some(with_reveal(reveal, self.scroll_start_selection_for_open()))
+                // After the veil clears, only scroll if the selection is
+                // actually out of view: the hold already landed the
+                // open-time reveal invisibly when reports flowed, and a
+                // forced re-center would nudge visibly at lift end over
+                // estimate-vs-real viewport drift.
+                Some(with_reveal(reveal, self.scroll_start_selection_into_view()))
             }
             start_mode::TransitionPhase::Resizing => reveal,
         }
@@ -5510,6 +5513,14 @@ impl App {
             StartMessage::GamesScrolled(y, viewport_h) => {
                 self.start_state
                     .record_list_scroll(start_view::StartListId::Games, y, viewport_h);
+                if let Some(hold) = self.start_state.reveal_hold
+                    && hold.list == start_view::StartListId::Games
+                {
+                    crate::controller::hid::diag::diag_info(format!(
+                        "ui-diag: start reveal report list=Games y={y:.0} vh={viewport_h:.0} target={:.0}",
+                        hold.y
+                    ));
+                }
                 self.confirm_pending_reveal(start_view::StartListId::Games, y);
                 Task::none()
             }
@@ -5519,6 +5530,14 @@ impl App {
                     y,
                     viewport_h,
                 );
+                if let Some(hold) = self.start_state.reveal_hold
+                    && hold.list == start_view::StartListId::Controllers
+                {
+                    crate::controller::hid::diag::diag_info(format!(
+                        "ui-diag: start reveal report list=Controllers y={y:.0} vh={viewport_h:.0} target={:.0}",
+                        hold.y
+                    ));
+                }
                 self.confirm_pending_reveal(start_view::StartListId::Controllers, y);
                 Task::none()
             }
@@ -5810,9 +5829,13 @@ impl App {
                 start_view::StartListId::Controllers => self.start_state.controller_selected,
                 start_view::StartListId::Settings => usize::MAX,
             };
+            let clamped = y.min(max);
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start reveal queue list={list:?} y={y:.0} clamped={clamped:.0} max={max:.0}"
+            ));
             self.start_state.reveal_hold = Some(start_view::RevealHold {
                 list,
-                y: y.min(max),
+                y: clamped,
                 selected,
                 queued_at: Instant::now(),
             });
@@ -5832,6 +5855,10 @@ impl App {
     fn flush_pending_reveal(&mut self) -> Option<Task<Message>> {
         let hold = self.start_state.reveal_hold?;
         if !self.start_visible || !self.start_state.enter_compact_hold_active(Instant::now()) {
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start reveal dropped list={:?} target={:.0}",
+                hold.list, hold.y
+            ));
             self.start_state.reveal_hold = None;
             return None;
         }
@@ -5850,6 +5877,9 @@ impl App {
             && hold.list == list
             && (reported_y - hold.y).abs() <= 2.0
         {
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start reveal confirmed list={list:?} y={reported_y:.0}"
+            ));
             self.start_state.reveal_hold = None;
         }
     }
