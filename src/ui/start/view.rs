@@ -4074,7 +4074,13 @@ pub fn view<'a>(
         // A live reveal hold pins the veil shut until the fresh mount
         // reports the queued scroll back (or the hold times out).
         Some(TransitionPhase::EnterCompact) if state.enter_compact_hold_active(now) => 1.0,
-        Some(TransitionPhase::EnterCompact) => 1.0 - state.phase_progress(now),
+        // Ease-IN (not out): the veil stays near-opaque for the first ~50ms
+        // while the remounted list teleports to its queued scroll invisibly,
+        // then lifts. Ease-out dropped 70% in that window, exposing the
+        // landing as a snap right at the end.
+        Some(TransitionPhase::EnterCompact) => {
+            1.0 - crate::ui::start::mode::ease_in_cubic(state.phase_progress_linear(now))
+        }
         _ => 0.0,
     };
     // Flat hints under the dim veil — Float face glyphs would paint above it.
