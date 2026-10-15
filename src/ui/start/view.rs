@@ -74,8 +74,12 @@ const PRESSED_SCALE: f32 = 1.1;
 const HINT_ANIM: Duration = Duration::from_millis(crate::ui::motion::FAST_MS);
 const ROW_GAP: f32 = 8.0;
 const ROW_ACTION_SPACING: f32 = 14.0;
-/// Body width inside outer padding — dual-pane strip unit.
-const PANE_W: f32 = WIDTH - 2.0 * PADDING;
+/// Always-on position rail width (reuses immersive [`position::WIDTH`]).
+const COMPACT_BAR_W: f32 = crate::ui::start::position::WIDTH;
+/// Gap between the rail and the carousel.
+const COMPACT_BAR_GAP: f32 = 12.0;
+/// Carousel pane width beside the rail.
+const COMPACT_PANE_W: f32 = WIDTH - 2.0 * PADDING - COMPACT_BAR_W - COMPACT_BAR_GAP;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StartSlide {
@@ -3428,7 +3432,7 @@ impl State {
             return false;
         }
 
-        let duration_ms = ((SLIDE_ANIM_MS as f32) * (distance / PANE_W))
+        let duration_ms = ((SLIDE_ANIM_MS as f32) * (distance / COMPACT_PANE_W))
             .round()
             .clamp(SLIDE_ANIM_MIN_MS as f32, SLIDE_ANIM_MS as f32) as u64;
 
@@ -3506,7 +3510,7 @@ impl State {
         self.controllers.get(self.controller_selected)
     }
 
-    /// Horizontal scroll of the dual-pane strip (0 = Games, PANE_W = Controllers).
+    /// Horizontal scroll of the dual-pane strip (0 = Games, COMPACT_PANE_W = Controllers).
     fn slide_scroll_x(&self, now: Instant) -> f32 {
         let Some(anim) = self.anim.as_ref() else {
             return slide_x(self.slide);
@@ -3520,7 +3524,7 @@ impl State {
 
     /// 0 = fully on Games, 1 = fully on Controllers (follows the carousel ease).
     pub(crate) fn slide_progress(&self, now: Instant) -> f32 {
-        (self.slide_scroll_x(now) / PANE_W).clamp(0.0, 1.0)
+        (self.slide_scroll_x(now) / COMPACT_PANE_W).clamp(0.0, 1.0)
     }
 }
 
@@ -3573,7 +3577,7 @@ pub fn layout_transition_offset(eased: f32, layout: ImmersiveLayout) -> (f32, f3
 fn slide_x(slide: StartSlide) -> f32 {
     match slide {
         StartSlide::Games => 0.0,
-        StartSlide::Controllers => PANE_W,
+        StartSlide::Controllers => COMPACT_PANE_W,
     }
 }
 
@@ -3910,7 +3914,50 @@ pub fn view<'a>(
     settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
     #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
-    use crate::ui::start::mode::TransitionPhase;
+    use crate::ui::start::mode::{TransitionPhase, promote_holds_compact};
+    // Promote holds compact chrome under solid black across the HWND resize.
+    // Previously this returned `veil_view` (ambient only), producing a
+    // black -> ambient -> black flash: ExitCompact ends at veil=1, Resizing
+    // showed ambient, EnterImmersive restarts at veil=1. Black-on-black
+    // resize is invisible; ambient in the middle is not. Demote keeps the
+    // existing veil-only path (it looks good and shrinks to a small window).
+    if promote_holds_compact(state.transition) {
+        let chrome_status = state.chrome_load_status(now);
+        let primary = chrome_status
+            .iter()
+            .find(|v| !v.success && v.exit_x < 0.01)
+            .copied()
+            .or_else(|| chrome_status.first().copied());
+        let compact = compact_chrome(
+            state,
+            spectrum,
+            now,
+            always_immersive,
+            promote_gesture,
+            true,
+            primary,
+            #[cfg(debug_assertions)]
+            debug_bounds,
+        );
+        let with_veil =
+            crate::ui::start::immersive::compact_transition_overlay(compact, 1.0, false);
+        let settings_p = state.settings.progress(now);
+        let settings_layer: Element<'_, StartMessage> = if state.settings.visible(now) {
+            crate::ui::start::settings::compact_overlay(
+                state,
+                settings_snapshot,
+                settings_p,
+                #[cfg(debug_assertions)]
+                debug_bounds,
+            )
+        } else {
+            space().width(Fill).height(Fill).into()
+        };
+        return stack![with_veil, settings_layer]
+            .width(Fill)
+            .height(Fill)
+            .into();
+    }
     if matches!(
         state.transition_phase.map(|(p, _)| p),
         Some(TransitionPhase::Resizing)
@@ -4014,7 +4061,14 @@ fn compact_chrome<'a>(
     } else if state.replace_confirm.is_some() {
         replace_confirm_view(state)
     } else {
-        carousel_body(state, spectrum, now)
+        row![
+            compact_position_bar(state, now),
+            carousel_body(state, spectrum, now),
+        ]
+        .spacing(COMPACT_BAR_GAP)
+        .width(Fill)
+        .height(Fill)
+        .into()
     };
     let body = container(body).width(Fill).height(Fill);
     #[cfg(debug_assertions)]
@@ -4356,13 +4410,29 @@ fn carousel_body<'a>(
     let scroll = state.slide_scroll_x(now);
     crate::ui::start::carousel::carousel(
         scroll,
-        PANE_W,
+        COMPACT_PANE_W,
         games_list(state),
         controllers_list(state, spectrum),
     )
-    .width(Length::Fixed(PANE_W))
+    .width(Length::Fixed(COMPACT_PANE_W))
     .height(Fill)
     .into()
+}
+
+/// Always-on vertical position rail for compact (reuses the immersive bar,
+/// pinned at full show — no auto-hide). Driven by the games section even on
+/// the Controllers pane so the layout never reflows on slide change.
+fn compact_position_bar(state: &State, now: Instant) -> Element<'_, StartMessage> {
+    let mode = state.games_section_mode();
+    crate::ui::start::position::view(crate::ui::start::position::BarSpec {
+        labels: crate::ui::start::position::labels(mode),
+        visual: state.position_section_visual(now),
+        reveal: 1.0,
+        show_opacity: 1.0,
+        slide: 1.0,
+        motion: None,
+        orientation: crate::ui::start::vstrip::StripOrientation::Vertical,
+    })
 }
 
 /// Stable `keyed_column` key for a Start list row.
@@ -4431,6 +4501,9 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
         .height(Fill)
         .width(Fill)
         .spacing(8)
+        .direction(iced::widget::scrollable::Direction::Vertical(
+            iced::widget::scrollable::Scrollbar::hidden(),
+        ))
         .on_scroll(|viewport| {
             let y = viewport.absolute_offset().y;
             StartMessage::GamesScrolled(y, viewport.bounds().height)
@@ -4478,6 +4551,9 @@ fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element
         .height(Fill)
         .width(Fill)
         .spacing(8)
+        .direction(iced::widget::scrollable::Direction::Vertical(
+            iced::widget::scrollable::Scrollbar::hidden(),
+        ))
         .on_scroll(|viewport| {
             let y = viewport.absolute_offset().y;
             StartMessage::ControllersScrolled(y, viewport.bounds().height)
