@@ -43,9 +43,12 @@ pub enum TransitionPhase {
 
 /// Shared duration for darken-immersive / reveal-compact / cold ambient.
 pub const VEIL_TRANSITION_MS: u64 = 300;
-/// Fast promote/demote segment, shared: exit fades, enter fades, and the
-/// HWND growth/shrink all use one duration so the joints stay even.
+/// Fast promote/demote segment, shared: exit fades and enter fades use one
+/// duration so the joints stay even.
 pub const SWIFT_SEGMENT_MS: u64 = 150;
+/// HWND growth/shrink morph, run under the opaque blackout. Deliberately a
+/// touch faster than the fades (invisible anyway) so the ceremony stays snappy.
+pub const RESIZE_MS: u64 = 100;
 /// EnterImmersive top-veil lift (ease-in-out); matches splash length so one ceremony covers both.
 pub const ENTER_REVEAL_MS: u64 = crate::ui::motion::SLOW_MS;
 pub const ENTER_IMMERSIVE_MS: u64 = ENTER_REVEAL_MS;
@@ -567,8 +570,10 @@ mod tests {
     #[test]
     fn phase_durations() {
         assert_eq!(TransitionPhase::ExitCompact.duration_ms(), SWIFT_SEGMENT_MS);
-        // One shared fast segment for exit blackout + growth/shrink.
+        // One shared fast segment for exit blackout + enter fades.
         assert_eq!(SWIFT_SEGMENT_MS, 150);
+        // The invisible morph runs a touch faster.
+        assert_eq!(RESIZE_MS, 100);
         assert_eq!(
             TransitionPhase::EnterImmersive.duration_ms(),
             ENTER_IMMERSIVE_MS

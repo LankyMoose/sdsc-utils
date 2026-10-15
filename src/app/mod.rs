@@ -402,6 +402,12 @@ pub struct App {
     start_window: Option<window::Id>,
     /// True only while Start is revealed (warm HWND may exist while false).
     start_visible: bool,
+    /// Last Start-window paint (for the transition paint-gap witness;
+    /// `Cell` because `view()` only gets `&self`).
+    last_start_paint_at: std::cell::Cell<Option<Instant>>,
+    /// Whether that paint happened with a transition ceremony live (gates the
+    /// witness so idle gaps never log).
+    last_start_paint_active: std::cell::Cell<bool>,
     /// Demote-settle scroll stowed for the next tick, when the remounted
     /// list exists. Fires once, then clears.
     deferred_settle_scroll: Option<(start_view::StartListId, f32)>,
@@ -756,6 +762,8 @@ impl App {
             pad_input_panel: PadInputPanel::default(),
             start_window: None,
             start_visible: false,
+            last_start_paint_at: std::cell::Cell::new(None),
+            last_start_paint_active: std::cell::Cell::new(false),
             deferred_settle_scroll: None,
             start_nav_ready: false,
             start_state: start_view::State::default(),
@@ -1156,6 +1164,32 @@ impl App {
         }
 
         if Some(window) == self.start_window {
+            // Paint-gap witness (black-lockup forensics): while a transition
+            // ceremony is live the window must repaint ~60Hz. A gap here
+            // means paints starved while logic ran ahead — the render/present
+            // side, never the state machine. Armed only across live phases,
+            // so idle gaps never log.
+            let paint_now = Instant::now();
+            let paint_active = self.start_state.transition_phase.is_some()
+                || self.start_state.transition.is_some();
+            if paint_active
+                && self.last_start_paint_active.get()
+                && let Some(last) = self.last_start_paint_at.get()
+            {
+                let gap_ms = paint_now.saturating_duration_since(last).as_millis() as u64;
+                if gap_ms > 250 {
+                    let phase = self
+                        .start_state
+                        .transition_phase
+                        .map(|(p, _)| p.label())
+                        .unwrap_or("none");
+                    crate::controller::hid::diag::diag_info(format!(
+                        "ui-diag: start paint gap gap_ms={gap_ms} phase={phase}"
+                    ));
+                }
+            }
+            self.last_start_paint_at.set(Some(paint_now));
+            self.last_start_paint_active.set(paint_active);
             let cover = self.start_monitor_cover.map(|c| (c.width, c.height));
             let stage_w = cover.map(|(w, _)| w).unwrap_or(1920.0);
             let stage_h = cover.map(|(_, h)| h).unwrap_or(1080.0);
@@ -4793,13 +4827,23 @@ impl App {
         // no anim (lost settle message) wall-clock completion can never fire
         // and the window would sit on black forever. Settle directly while a
         // transition is live; otherwise drop the orphaned blackout and paint
-        // current state. This never fires in normal flow (the exit arm only
-        // enters Resizing with a driver attached).
+        // current state. Age-gated: right after a normal morph completion the
+        // driver is also gone (Settled message still in flight), and settling
+        // there would double-settle every transition — only a strand persists
+        // past morph-spec + grace.
         if matches!(
             self.start_state.transition_phase.map(|(p, _)| p),
             Some(start_mode::TransitionPhase::Resizing)
         ) && self.start_resize_anim.is_none()
         {
+            let age_ms = self
+                .start_state
+                .transition_phase
+                .map(|(_, started)| now.saturating_duration_since(started).as_millis() as u64)
+                .unwrap_or(0);
+            if age_ms <= start_mode::RESIZE_MS.saturating_add(1000) {
+                return None;
+            }
             if !self.start_visible {
                 self.start_state.transition = None;
                 self.start_state.clear_transition_phase();
@@ -4928,17 +4972,17 @@ impl App {
         };
         let t = start_mode::phase_progress_linear(
             now.saturating_duration_since(anim.started).as_millis() as u64,
-            start_mode::SWIFT_SEGMENT_MS,
+            start_mode::RESIZE_MS,
         );
         if t >= 1.0 {
             self.start_resize_anim = None;
             let elapsed_ms = now.saturating_duration_since(anim.started).as_millis() as u64;
             // Overrun witness: the morph is wall-clock, so finishing far past
             // spec means ticks starved mid-morph (black outlived the ceremony).
-            if elapsed_ms > start_mode::SWIFT_SEGMENT_MS.saturating_add(1000) {
+            if elapsed_ms > start_mode::RESIZE_MS.saturating_add(1000) {
                 crate::controller::hid::diag::diag_info(format!(
                     "ui-diag: start resize overrun elapsed_ms={elapsed_ms} spec_ms={}",
-                    start_mode::SWIFT_SEGMENT_MS
+                    start_mode::RESIZE_MS
                 ));
             }
             crate::controller::hid::diag::diag_info(format!(
