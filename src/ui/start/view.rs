@@ -3946,7 +3946,12 @@ pub fn view<'a>(
             })
             .into();
     }
-    if state.transition.is_some() {
+    if state.transition.is_some()
+        && !matches!(
+            phase,
+            Some(TransitionPhase::ExitCompact) | Some(TransitionPhase::ExitImmersive)
+        )
+    {
         return crate::ui::start::immersive::veil_view(state, now);
     }
 

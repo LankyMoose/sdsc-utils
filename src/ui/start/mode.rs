@@ -46,6 +46,9 @@ pub const VEIL_TRANSITION_MS: u64 = 300;
 /// Fast promote/demote segment, shared: the exit blackout and the HWND
 /// growth/shrink use one duration so the joints stay even.
 pub const SWIFT_SEGMENT_MS: u64 = 150;
+/// Growth/shrink fraction where the enter phase begins: the veil starts
+/// lifting while the window finishes morphing beneath it (no dead beats).
+pub const RESIZE_SETTLE_AT: f32 = 0.5;
 /// EnterImmersive top-veil lift (ease-in-out); matches splash length so one ceremony covers both.
 pub const ENTER_REVEAL_MS: u64 = crate::ui::motion::SLOW_MS;
 pub const ENTER_IMMERSIVE_MS: u64 = ENTER_REVEAL_MS;
