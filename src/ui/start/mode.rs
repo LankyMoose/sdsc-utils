@@ -215,14 +215,6 @@ pub fn settle_immersive(transition: StartTransition) -> bool {
     matches!(transition, StartTransition::Promoting)
 }
 
-/// True while the HWND resizes for promote: hold compact chrome under solid
-/// black instead of `veil_view` (ambient only). ExitCompact ends at veil=1
-/// and EnterImmersive restarts at veil=1, so black-on-black resize is
-/// invisible; ambient in the middle flashes. Demote keeps veil-only.
-pub fn promote_holds_compact(transition: Option<StartTransition>) -> bool {
-    matches!(transition, Some(StartTransition::Promoting))
-}
-
 /// Right while immersive: expand dock when collapsed.
 pub fn dock_expand_target(expanded: bool) -> Option<bool> {
     if expanded { None } else { Some(true) }
@@ -479,9 +471,6 @@ mod tests {
         assert!(demote_blocked(false, Some(TransitionPhase::Resizing)));
         assert!(settle_immersive(StartTransition::Promoting));
         assert!(!settle_immersive(StartTransition::Demoting));
-        assert!(promote_holds_compact(Some(StartTransition::Promoting)));
-        assert!(!promote_holds_compact(Some(StartTransition::Demoting)));
-        assert!(!promote_holds_compact(None));
     }
 
     #[test]

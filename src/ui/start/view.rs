@@ -73,13 +73,11 @@ const PRESSED_SCALE: f32 = 1.1;
 /// Pressed grow and armed-color transitions.
 const HINT_ANIM: Duration = Duration::from_millis(crate::ui::motion::FAST_MS);
 const ROW_GAP: f32 = 8.0;
+/// Height of a games-list section separator (centered label + hairlines).
+const SECTION_SEP_H: f32 = 28.0;
 const ROW_ACTION_SPACING: f32 = 14.0;
-/// Always-on position rail width (reuses immersive [`position::WIDTH`]).
-const COMPACT_BAR_W: f32 = crate::ui::start::position::WIDTH;
-/// Gap between the rail and the carousel.
-const COMPACT_BAR_GAP: f32 = 12.0;
-/// Carousel pane width beside the rail.
-const COMPACT_PANE_W: f32 = WIDTH - 2.0 * PADDING - COMPACT_BAR_W - COMPACT_BAR_GAP;
+/// Body width inside outer padding — dual-pane strip unit.
+const PANE_W: f32 = WIDTH - 2.0 * PADDING;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StartSlide {
@@ -1212,13 +1210,23 @@ impl State {
     pub fn selection_scroll_y(&self, direction: ScrollReveal) -> Option<(iced::widget::Id, f32)> {
         match self.slide {
             StartSlide::Games => {
-                let y = scroll_y_to_reveal(
-                    self.game_selected,
-                    self.rows.len(),
+                if self.rows.is_empty() || self.game_selected >= self.rows.len() {
+                    return None;
+                }
+                let sections = games_row_sections(self);
+                let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
+                    + separator_offset_above(&sections, self.game_selected);
+                let viewport = self.scrolls.viewport(StartListId::Games);
+                let viewport = if viewport <= 1.0 {
+                    estimated_list_viewport_h()
+                } else {
+                    viewport
+                };
+                let y = scroll_y_to_reveal_bounds(
+                    row_top,
                     ROW_HEIGHT,
-                    ROW_GAP,
                     self.scrolls.offset(StartListId::Games),
-                    self.scrolls.viewport(StartListId::Games),
+                    viewport,
                     direction,
                 )?;
                 Some((StartListId::Games.scroll_id(), y))
@@ -1243,11 +1251,15 @@ impl State {
         if self.slide != StartSlide::Games {
             return None;
         }
-        let y = scroll_y_center(
-            self.game_selected,
-            self.rows.len(),
+        if self.rows.is_empty() || self.game_selected >= self.rows.len() {
+            return None;
+        }
+        let sections = games_row_sections(self);
+        let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
+            + separator_offset_above(&sections, self.game_selected);
+        let y = scroll_y_center_top(
+            row_top,
             ROW_HEIGHT,
-            ROW_GAP,
             self.scrolls.offset(StartListId::Games),
             self.scrolls.viewport(StartListId::Games),
             false,
@@ -1260,11 +1272,15 @@ impl State {
         if self.slide != StartSlide::Games {
             return None;
         }
-        let y = scroll_y_center(
-            self.game_selected,
-            self.rows.len(),
+        if self.rows.is_empty() || self.game_selected >= self.rows.len() {
+            return None;
+        }
+        let sections = games_row_sections(self);
+        let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
+            + separator_offset_above(&sections, self.game_selected);
+        let y = scroll_y_center_top(
+            row_top,
             ROW_HEIGHT,
-            ROW_GAP,
             self.scrolls.offset(StartListId::Games),
             self.scrolls.viewport(StartListId::Games),
             true,
@@ -3432,7 +3448,7 @@ impl State {
             return false;
         }
 
-        let duration_ms = ((SLIDE_ANIM_MS as f32) * (distance / COMPACT_PANE_W))
+        let duration_ms = ((SLIDE_ANIM_MS as f32) * (distance / PANE_W))
             .round()
             .clamp(SLIDE_ANIM_MIN_MS as f32, SLIDE_ANIM_MS as f32) as u64;
 
@@ -3510,7 +3526,7 @@ impl State {
         self.controllers.get(self.controller_selected)
     }
 
-    /// Horizontal scroll of the dual-pane strip (0 = Games, COMPACT_PANE_W = Controllers).
+    /// Horizontal scroll of the dual-pane strip (0 = Games, PANE_W = Controllers).
     fn slide_scroll_x(&self, now: Instant) -> f32 {
         let Some(anim) = self.anim.as_ref() else {
             return slide_x(self.slide);
@@ -3524,7 +3540,7 @@ impl State {
 
     /// 0 = fully on Games, 1 = fully on Controllers (follows the carousel ease).
     pub(crate) fn slide_progress(&self, now: Instant) -> f32 {
-        (self.slide_scroll_x(now) / COMPACT_PANE_W).clamp(0.0, 1.0)
+        (self.slide_scroll_x(now) / PANE_W).clamp(0.0, 1.0)
     }
 }
 
@@ -3577,7 +3593,7 @@ pub fn layout_transition_offset(eased: f32, layout: ImmersiveLayout) -> (f32, f3
 fn slide_x(slide: StartSlide) -> f32 {
     match slide {
         StartSlide::Games => 0.0,
-        StartSlide::Controllers => COMPACT_PANE_W,
+        StartSlide::Controllers => PANE_W,
     }
 }
 
@@ -3661,24 +3677,18 @@ fn estimated_list_viewport_h() -> f32 {
     (HEIGHT - 2.0 * PAD_Y - HEADER_HEIGHT - 1.0 - 30.0 - FOOTER_HEIGHT).max(120.0)
 }
 
-/// Center `index` in the viewport.
+/// Center a row at known content `row_top` in the viewport.
 ///
 /// When `force` is false, returns `None` if the row is already fully visible.
-pub(crate) fn scroll_y_center(
-    index: usize,
-    len: usize,
+/// Callers with a uniform index stride pass `index * (row_h + gap)`; the
+/// compact games list adds [`separator_offset_above`] for section dividers.
+pub(crate) fn scroll_y_center_top(
+    row_top: f32,
     row_h: f32,
-    gap: f32,
     scroll_y: f32,
     viewport_h: f32,
     force: bool,
 ) -> Option<f32> {
-    if len == 0 || index >= len {
-        return None;
-    }
-    let stride = row_h + gap;
-    let row_top = index as f32 * stride;
-    let row_bottom = row_top + row_h;
     let viewport_h = if viewport_h <= 1.0 {
         estimated_list_viewport_h()
     } else {
@@ -3687,7 +3697,7 @@ pub(crate) fn scroll_y_center(
     if !force {
         let view_top = scroll_y;
         let view_bottom = scroll_y + viewport_h;
-        if row_top >= view_top && row_bottom <= view_bottom {
+        if row_top >= view_top && row_top + row_h <= view_bottom {
             return None;
         }
     }
@@ -3914,50 +3924,7 @@ pub fn view<'a>(
     settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
     #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
-    use crate::ui::start::mode::{TransitionPhase, promote_holds_compact};
-    // Promote holds compact chrome under solid black across the HWND resize.
-    // Previously this returned `veil_view` (ambient only), producing a
-    // black -> ambient -> black flash: ExitCompact ends at veil=1, Resizing
-    // showed ambient, EnterImmersive restarts at veil=1. Black-on-black
-    // resize is invisible; ambient in the middle is not. Demote keeps the
-    // existing veil-only path (it looks good and shrinks to a small window).
-    if promote_holds_compact(state.transition) {
-        let chrome_status = state.chrome_load_status(now);
-        let primary = chrome_status
-            .iter()
-            .find(|v| !v.success && v.exit_x < 0.01)
-            .copied()
-            .or_else(|| chrome_status.first().copied());
-        let compact = compact_chrome(
-            state,
-            spectrum,
-            now,
-            always_immersive,
-            promote_gesture,
-            true,
-            primary,
-            #[cfg(debug_assertions)]
-            debug_bounds,
-        );
-        let with_veil =
-            crate::ui::start::immersive::compact_transition_overlay(compact, 1.0, false);
-        let settings_p = state.settings.progress(now);
-        let settings_layer: Element<'_, StartMessage> = if state.settings.visible(now) {
-            crate::ui::start::settings::compact_overlay(
-                state,
-                settings_snapshot,
-                settings_p,
-                #[cfg(debug_assertions)]
-                debug_bounds,
-            )
-        } else {
-            space().width(Fill).height(Fill).into()
-        };
-        return stack![with_veil, settings_layer]
-            .width(Fill)
-            .height(Fill)
-            .into();
-    }
+    use crate::ui::start::mode::TransitionPhase;
     if matches!(
         state.transition_phase.map(|(p, _)| p),
         Some(TransitionPhase::Resizing)
@@ -4061,14 +4028,7 @@ fn compact_chrome<'a>(
     } else if state.replace_confirm.is_some() {
         replace_confirm_view(state)
     } else {
-        row![
-            compact_position_bar(state, now),
-            carousel_body(state, spectrum, now),
-        ]
-        .spacing(COMPACT_BAR_GAP)
-        .width(Fill)
-        .height(Fill)
-        .into()
+        carousel_body(state, spectrum, now)
     };
     let body = container(body).width(Fill).height(Fill);
     #[cfg(debug_assertions)]
@@ -4410,29 +4370,13 @@ fn carousel_body<'a>(
     let scroll = state.slide_scroll_x(now);
     crate::ui::start::carousel::carousel(
         scroll,
-        COMPACT_PANE_W,
+        PANE_W,
         games_list(state),
         controllers_list(state, spectrum),
     )
-    .width(Length::Fixed(COMPACT_PANE_W))
+    .width(Length::Fixed(PANE_W))
     .height(Fill)
     .into()
-}
-
-/// Always-on vertical position rail for compact (reuses the immersive bar,
-/// pinned at full show — no auto-hide). Driven by the games section even on
-/// the Controllers pane so the layout never reflows on slide change.
-fn compact_position_bar(state: &State, now: Instant) -> Element<'_, StartMessage> {
-    let mode = state.games_section_mode();
-    crate::ui::start::position::view(crate::ui::start::position::BarSpec {
-        labels: crate::ui::start::position::labels(mode),
-        visual: state.position_section_visual(now),
-        reveal: 1.0,
-        show_opacity: 1.0,
-        slide: 1.0,
-        motion: None,
-        orientation: crate::ui::start::vstrip::StripOrientation::Vertical,
-    })
 }
 
 /// Stable `keyed_column` key for a Start list row.
@@ -4452,6 +4396,63 @@ pub(crate) fn list_key(s: &str) -> u64 {
     hash
 }
 
+/// Section index for each games row in list order under the current section
+/// mode (same [`games_section_mode`] the immersive rail uses).
+fn games_row_sections(state: &State) -> Vec<usize> {
+    let mode = state.games_section_mode();
+    let now_ms = crate::ui::start::position::now_ms();
+    let utc_offset = crate::ui::start::position::local_utc_offset_secs();
+    state
+        .rows
+        .iter()
+        .map(|row| {
+            crate::ui::start::position::section_index(
+                mode,
+                &row.title,
+                row.played_at_ms,
+                now_ms,
+                utc_offset,
+            )
+        })
+        .collect()
+}
+
+/// Extra stacked height above row `index` from section separators: one
+/// [`SECTION_SEP_H`] block (+ column gap) per section change at or before it.
+/// Separators render *between* sections only, so the first row never shifts.
+fn separator_offset_above(sections: &[usize], index: usize) -> f32 {
+    let end = index.min(sections.len().saturating_sub(1));
+    let mut changes = 0;
+    for j in 1..=end {
+        if sections[j] != sections[j - 1] {
+            changes += 1;
+        }
+    }
+    changes as f32 * (SECTION_SEP_H + ROW_GAP)
+}
+
+/// Full-width section separator: centered label with a hairline on either
+/// side, vertically aligned. Only emitted between non-empty sections.
+fn section_separator(label: &'static str) -> Element<'static, StartMessage> {
+    container(
+        row![
+            container(space().height(Length::Fixed(1.0)))
+                .width(Fill)
+                .style(theme::configure_header_rule),
+            text(label).size(12.0).color(theme::DIM),
+            container(space().height(Length::Fixed(1.0)))
+                .width(Fill)
+                .style(theme::configure_header_rule),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .padding([0, 8])
+    .width(Fill)
+    .height(Length::Fixed(SECTION_SEP_H))
+    .into()
+}
+
 fn games_list(state: &State) -> Element<'_, StartMessage> {
     if state.rows.is_empty() {
         let empty: Element<'_, StartMessage> = if state.editing {
@@ -4469,7 +4470,28 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
             .center_y(Fill)
             .into();
     }
-    let items = keyed_column(state.rows.iter().enumerate().map(|(index, row)| {
+    let labels = crate::ui::start::position::labels(state.games_section_mode());
+    let mut entries: Vec<(u64, Element<'_, StartMessage>)> =
+        Vec::with_capacity(state.rows.len() * 2);
+    let mut last_section: Option<usize> = None;
+    for (index, row) in state.rows.iter().enumerate() {
+        let section = crate::ui::start::position::section_index(
+            state.games_section_mode(),
+            &row.title,
+            row.played_at_ms,
+            crate::ui::start::position::now_ms(),
+            crate::ui::start::position::local_utc_offset_secs(),
+        );
+        // Between non-empty sections only: the row at hand proves its own
+        // section non-empty, and the first row never takes a separator.
+        if last_section.is_some_and(|prev| prev != section) {
+            let label = labels.get(section).copied().unwrap_or("");
+            entries.push((
+                list_key(&format!("compact-section-{index}-{section}")),
+                section_separator(label),
+            ));
+        }
+        last_section = Some(section);
         let selected = index == state.game_selected;
         let running = !state.editing
             && state
@@ -4481,7 +4503,7 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
                 .closing_target
                 .as_ref()
                 .is_some_and(|t| t == &row.target);
-        (
+        entries.push((
             list_key(&row.play_key),
             game_row(
                 index,
@@ -4492,18 +4514,14 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
                 state.editing,
                 RowHintState::for_selected(state, selected),
             ),
-        )
-    }))
-    .spacing(ROW_GAP)
-    .width(Fill);
+        ));
+    }
+    let items = keyed_column(entries).spacing(ROW_GAP).width(Fill);
     scrollable(items)
         .id(games_scroll_id())
         .height(Fill)
         .width(Fill)
         .spacing(8)
-        .direction(iced::widget::scrollable::Direction::Vertical(
-            iced::widget::scrollable::Scrollbar::hidden(),
-        ))
         .on_scroll(|viewport| {
             let y = viewport.absolute_offset().y;
             StartMessage::GamesScrolled(y, viewport.bounds().height)
@@ -4551,9 +4569,6 @@ fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element
         .height(Fill)
         .width(Fill)
         .spacing(8)
-        .direction(iced::widget::scrollable::Direction::Vertical(
-            iced::widget::scrollable::Scrollbar::hidden(),
-        ))
         .on_scroll(|viewport| {
             let y = viewport.absolute_offset().y;
             StartMessage::ControllersScrolled(y, viewport.bounds().height)
@@ -6627,14 +6642,30 @@ mod tests {
     fn scroll_y_center_when_out_of_view() {
         let gap = ROW_GAP;
         let stride = ROW_HEIGHT + gap;
-        assert!(scroll_y_center(1, 20, ROW_HEIGHT, gap, 0.0, 300.0, false).is_none());
-        let y = scroll_y_center(5, 20, ROW_HEIGHT, gap, 0.0, 300.0, false).unwrap();
+        assert!(scroll_y_center_top(1.0 * stride, ROW_HEIGHT, 0.0, 300.0, false).is_none());
+        let y = scroll_y_center_top(5.0 * stride, ROW_HEIGHT, 0.0, 300.0, false).unwrap();
         let expected = 5.0 * stride - (300.0 - ROW_HEIGHT) / 2.0;
         assert!((y - expected).abs() < 0.1);
         // Force recenters even when already visible.
-        let y = scroll_y_center(1, 20, ROW_HEIGHT, gap, 0.0, 300.0, true).unwrap();
+        let y = scroll_y_center_top(1.0 * stride, ROW_HEIGHT, 0.0, 300.0, true).unwrap();
         let expected = (1.0_f32 * stride - (300.0 - ROW_HEIGHT) / 2.0).max(0.0);
         assert!((y - expected).abs() < 0.1);
+    }
+
+    #[test]
+    fn separator_offsets_count_section_changes() {
+        // No changes → no shift, first row never shifts.
+        assert!((separator_offset_above(&[5, 5, 5], 0) - 0.0).abs() < f32::EPSILON);
+        assert!((separator_offset_above(&[5, 5, 5], 2) - 0.0).abs() < f32::EPSILON);
+        // One divider between sections 0 and 1 shifts rows at/after index 2.
+        let step = SECTION_SEP_H + ROW_GAP;
+        let sections = [0, 0, 1, 1];
+        assert!((separator_offset_above(&sections, 0) - 0.0).abs() < f32::EPSILON);
+        assert!((separator_offset_above(&sections, 1) - 0.0).abs() < f32::EPSILON);
+        assert!((separator_offset_above(&sections, 2) - step).abs() < f32::EPSILON);
+        assert!((separator_offset_above(&sections, 3) - step).abs() < f32::EPSILON);
+        // Empty list never shifts.
+        assert!((separator_offset_above(&[], 0) - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]
