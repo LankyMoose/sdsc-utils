@@ -761,7 +761,7 @@ fn strip_slot<'a>(
         .align_x(Alignment::Start)
         .wrapping(iced::widget::text::Wrapping::Word);
 
-    let sub_alpha = if muted { 0.55 * fade } else { 0.9 * fade * dim };
+    let sub_alpha = if muted { 0.55 * fade } else { fade * dim };
     let mut titles = column![title].spacing(6);
     // Stacked `Played:` / `Last played:` + optional Update pill.
     // Disabled rows show "Not installed" instead of meta.
@@ -843,7 +843,7 @@ fn status_block<'a>(
     let mut status = column![].spacing(6).width(width).align_x(align);
     if show_meta && let Some(sub) = row.subtitle.as_ref() {
         let value_color = theme::alpha(theme::MUTED, sub_alpha);
-        let label_color = theme::alpha(theme::MUTED, sub_alpha * 0.8);
+        let label_color = theme::alpha(theme::MUTED, sub_alpha);
         // One shared subtitle block: horizontal slots center it under the
         // title, the vertical side column keeps it left-aligned.
         let sub_block = game_subtitle_block(sub, value_color, label_color, meta_size, align);
@@ -932,7 +932,7 @@ fn strip_slot_stacked<'a>(
             .wrapping(iced::widget::text::Wrapping::Word);
         let title: Element<'_, StartMessage> = container(title).width(Length::Fixed(wrap_w)).into();
 
-        let sub_alpha = if muted { 0.55 * fade } else { 0.9 * fade * dim };
+        let sub_alpha = if muted { 0.55 * fade } else { fade * dim };
         let text_block = column![
             title,
             status_block(row, bold, muted, fade, sub_alpha, Some(wrap_w))

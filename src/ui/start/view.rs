@@ -6037,13 +6037,7 @@ fn game_row(
                 .as_ref()
                 .is_some_and(|sub| !(row.update_required && sub.is_steam_fallback()));
             if show_meta && let Some(sub) = row.subtitle.as_ref() {
-                game_subtitle_block(
-                    sub,
-                    sub_color,
-                    theme::alpha(sub_color, 0.8),
-                    12.0,
-                    Alignment::Start,
-                )
+                game_subtitle_block(sub, sub_color, sub_color, 12.0, Alignment::Start)
             } else {
                 text(" ")
                     .size(13.0)
