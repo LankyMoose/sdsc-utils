@@ -706,6 +706,38 @@ impl SettingsPanel {
         let reveal_h = (row_top + row_h + REVEAL_INSET) - reveal_top;
         scroll_y_to_reveal_bounds(reveal_top, reveal_h, self.scroll_y, viewport_h, direction)
     }
+
+    /// Absolute scroll Y to reveal the trailing [`SettingsRow::PerfReload`]
+    /// row after it mounts (an AA/vsync toggle dirtied the renderer prefs).
+    /// Focus stays on the toggle, so this targets the reload row explicitly
+    /// rather than the focused row. Returns `None` when the row is absent
+    /// (prefs clean) or already fully visible.
+    pub fn reload_scroll_y(
+        &self,
+        snapshot: &StartSettingsSnapshot,
+        immersive: bool,
+        direction: ScrollReveal,
+    ) -> Option<f32> {
+        let rows = SettingsRow::focusable(snapshot);
+        let idx = rows
+            .iter()
+            .position(|&row| row == SettingsRow::PerfReload)?;
+        let (row_top, row_h) = focus_row_bounds(idx, snapshot, immersive, self.menu_row())?;
+        let viewport_h = if self.viewport_h <= 1.0 {
+            if immersive {
+                720.0
+            } else {
+                COMPACT_VIEWPORT_FALLBACK
+            }
+        } else {
+            self.viewport_h
+        };
+        // Same focus-ring inset as `focus_scroll_y`, no top pin: the reload
+        // row is always trailing, so it can only ever need a downward reveal.
+        let reveal_top = (row_top - REVEAL_INSET).max(0.0);
+        let reveal_h = (row_top + row_h + REVEAL_INSET) - reveal_top;
+        scroll_y_to_reveal_bounds(reveal_top, reveal_h, self.scroll_y, viewport_h, direction)
+    }
 }
 
 pub fn settings_scroll_id() -> iced::widget::Id {
@@ -2142,6 +2174,61 @@ mod tests {
                 .focus_scroll_y(&s, false, ScrollReveal::Down)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn reload_scroll_reveals_trailing_row_only_when_dirty() {
+        let clean = snap(true, true);
+        assert!(
+            !SettingsRow::focusable(&clean).contains(&SettingsRow::PerfReload),
+            "reload row hidden while prefs match boot"
+        );
+        // Focus stays on the toggle that dirtied the prefs (PerfVsync here).
+        let toggle_focus = SettingsRow::focusable(&clean)
+            .iter()
+            .position(|&row| row == SettingsRow::PerfVsync)
+            .unwrap();
+        let panel = SettingsPanel {
+            open: true,
+            focus: toggle_focus,
+            viewport_h: 200.0,
+            scroll_y: 0.0,
+            ..SettingsPanel::default()
+        };
+        assert!(
+            panel
+                .reload_scroll_y(&clean, false, ScrollReveal::Either)
+                .is_none(),
+            "clean prefs: no reload row, no scroll"
+        );
+        let mut dirty = clean.clone();
+        dirty.perf_vsync = false;
+        let rows = SettingsRow::focusable(&dirty);
+        assert_eq!(
+            rows.last(),
+            Some(&SettingsRow::PerfReload),
+            "reload row mounts trailing when dirty"
+        );
+        for immersive in [false, true] {
+            let y = panel
+                .reload_scroll_y(&dirty, immersive, ScrollReveal::Either)
+                .expect("trailing reload row should need a reveal from the top");
+            let (row_top, row_h) =
+                focus_row_bounds(rows.len() - 1, &dirty, immersive, None).unwrap();
+            let expected = (row_top + row_h + REVEAL_INSET - 200.0).max(0.0);
+            assert!(
+                (y - expected).abs() < 0.5,
+                "immersive={immersive} y={y} expected={expected}"
+            );
+            let mut settled = panel.clone();
+            settled.scroll_y = y;
+            assert!(
+                settled
+                    .reload_scroll_y(&dirty, immersive, ScrollReveal::Either)
+                    .is_none(),
+                "immersive={immersive}: settled reveal is a no-op"
+            );
+        }
     }
 
     #[test]

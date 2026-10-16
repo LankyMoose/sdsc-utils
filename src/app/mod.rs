@@ -4202,7 +4202,7 @@ impl App {
         }
         self.session.prefs.perf_antialiasing = enabled;
         self.save_prefs();
-        Task::none()
+        self.scroll_perf_reload_into_view()
     }
 
     fn apply_perf_vsync(&mut self, enabled: bool) -> Task<Message> {
@@ -4211,7 +4211,7 @@ impl App {
         }
         self.session.prefs.perf_vsync = enabled;
         self.save_prefs();
-        Task::none()
+        self.scroll_perf_reload_into_view()
     }
 
     /// Explicit UI reload for boot-only renderer prefs (AA/vsync are baked
@@ -6913,6 +6913,42 @@ impl App {
             .settings
             .focus_scroll_y(&snapshot, immersive, direction)
         else {
+            return Task::none();
+        };
+        self.start_state.sync_settings_scroll(y);
+        operation::scroll_to(
+            crate::ui::start::settings::settings_scroll_id(),
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
+        )
+    }
+
+    /// Reveal the trailing reload row after an AA/vsync toggle dirtied the
+    /// renderer prefs (the row mounts below the viewport while focus stays
+    /// on the toggle). No-op when prefs are clean again (unmount needs no
+    /// scroll; nav clamps focus), when the settings surface is closed (e.g.
+    /// the Configure pick-list path), or when the row is already visible.
+    fn scroll_perf_reload_into_view(&mut self) -> Task<Message> {
+        if !self.start_state.settings.open {
+            return Task::none();
+        }
+        let snapshot = self.start_settings_snapshot();
+        if !renderer_restart_needed(
+            snapshot.perf_antialiasing,
+            snapshot.perf_vsync,
+            snapshot.perf_aa_boot,
+            snapshot.perf_vsync_boot,
+        ) {
+            return Task::none();
+        }
+        let immersive = self.start_state.immersive;
+        let Some(y) = self.start_state.settings.reload_scroll_y(
+            &snapshot,
+            immersive,
+            start_view::ScrollReveal::Either,
+        ) else {
             return Task::none();
         };
         self.start_state.sync_settings_scroll(y);
