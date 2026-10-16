@@ -1229,19 +1229,42 @@ impl State {
                     return None;
                 }
                 let sections = games_row_sections(self);
-                let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
+                let math_row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
                     + separator_offset_above(&sections, self.game_selected);
                 // Scrolling up (or either way) to a row that opens its section
                 // must also bring the section title into view — pin to the
                 // header top, not the row top (navigating back to the first row
                 // otherwise strands its header above the viewport).
-                let reveal_top = if matches!(direction, ScrollReveal::Up | ScrollReveal::Either)
-                    && is_section_start(&sections, self.game_selected)
-                {
-                    header_top_for_row(&sections, self.game_selected)
-                } else {
-                    row_top
-                };
+                //
+                // Fix B: the stuck header collapses to zero height. Exactly one
+                // header is collapsed whenever the list is non-empty, so actual
+                // content is math content minus one header (stable). Up to a
+                // section start pins to the math header top, which already
+                // equals the collapsed header's actual position; every other
+                // reveal uses the collapsed-aware actual row top. The actual top
+                // resolves against the first section (stable reference — start 0
+                // sits at or before every row, so it always subtracts exactly
+                // the single collapsed header without chasing the live sticky,
+                // which would oscillate in the 30px handoff window).
+                let first_sticky = sections.first().copied();
+                let (reveal_top, reveal_h) =
+                    if matches!(direction, ScrollReveal::Up | ScrollReveal::Either)
+                        && is_section_start(&sections, self.game_selected)
+                    {
+                        let header_top = header_top_for_row(&sections, self.game_selected);
+                        let math_h = math_row_top - header_top + ROW_HEIGHT;
+                        (header_top, math_h - SECTION_SEP_H)
+                    } else {
+                        (
+                            actual_row_top_for_sticky(
+                                math_row_top,
+                                &sections,
+                                first_sticky,
+                                self.game_selected,
+                            ),
+                            ROW_HEIGHT,
+                        )
+                    };
                 let viewport = self.scrolls.viewport(StartListId::Games);
                 let viewport = if viewport <= 1.0 {
                     estimated_list_viewport_h()
@@ -1250,7 +1273,7 @@ impl State {
                 };
                 let y = scroll_y_to_reveal_bounds(
                     reveal_top,
-                    row_top - reveal_top + ROW_HEIGHT,
+                    reveal_h,
                     self.scrolls.offset(StartListId::Games),
                     viewport,
                     direction,
@@ -1281,8 +1304,15 @@ impl State {
             return None;
         }
         let sections = games_row_sections(self);
-        let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
+        let math_row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
             + separator_offset_above(&sections, self.game_selected);
+        // Fix B: collapsed-aware actual top via the stable first-section reference.
+        let row_top = actual_row_top_for_sticky(
+            math_row_top,
+            &sections,
+            sections.first().copied(),
+            self.game_selected,
+        );
         let viewport = self.scrolls.viewport(StartListId::Games);
         let y = scroll_y_center_top(
             row_top,
@@ -1309,8 +1339,15 @@ impl State {
             return None;
         }
         let sections = games_row_sections(self);
-        let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
+        let math_row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
             + separator_offset_above(&sections, self.game_selected);
+        // Fix B: collapsed-aware actual top via the stable first-section reference.
+        let row_top = actual_row_top_for_sticky(
+            math_row_top,
+            &sections,
+            sections.first().copied(),
+            self.game_selected,
+        );
         let viewport = self.scrolls.viewport(StartListId::Games);
         let y = scroll_y_center_top(
             row_top,
@@ -1342,9 +1379,13 @@ impl State {
         let between = sections.windows(2).filter(|w| w[0] != w[1]).count();
         // One header per section: the first row's header plus one per change.
         let seps = between + 1;
-        let content = rows as f32 * ROW_HEIGHT
+        let math_content = rows as f32 * ROW_HEIGHT
             + seps as f32 * SECTION_SEP_H
             + rows.saturating_add(seps).saturating_sub(1) as f32 * ROW_GAP;
+        // Fix B: exactly one header (the stuck one) collapses to zero height,
+        // so actual content is math content minus one header. Gaps are unchanged
+        // (the collapsed entry keeps its `keyed_column` spacing neighbors).
+        let content = math_content - SECTION_SEP_H;
         (content - viewport_h).max(0.0)
     }
 
@@ -1360,8 +1401,15 @@ impl State {
             return None;
         }
         let sections = games_row_sections(self);
-        let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
+        let math_row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
             + separator_offset_above(&sections, self.game_selected);
+        // Fix B: report the actual (collapsed) row top so settle/completion logs match layout.
+        let row_top = actual_row_top_for_sticky(
+            math_row_top,
+            &sections,
+            sections.first().copied(),
+            self.game_selected,
+        );
         let (_, y) = self.selection_scroll_y_center_prefer()?;
         Some((
             self.game_selected,
@@ -4539,11 +4587,50 @@ fn header_top_for_row(sections: &[usize], index: usize) -> f32 {
     (row_top - (SECTION_SEP_H + ROW_GAP)).max(0.0)
 }
 
+/// First row index of `sticky` section (`None` when empty / unknown).
+fn sticky_start_index(sections: &[usize], sticky: Option<usize>) -> Option<usize> {
+    let sticky = sticky?;
+    sections.iter().position(|&s| s == sticky)
+}
+
+/// True when the collapsed sticky header sits at or before `row_index`, so the
+/// actual content row sits one [`SECTION_SEP_H`] above its math position.
+/// Exactly one header is collapsed whenever the list is non-empty, so actual
+/// content height is always math height minus one header (stable); rows before
+/// the sticky start are unaffected, rows at/after it shift up by the header.
+fn collapsed_before_row(sections: &[usize], sticky: Option<usize>, row_index: usize) -> bool {
+    sticky_start_index(sections, sticky).is_some_and(|start| start <= row_index)
+}
+
+/// Actual content y of row `row_index` given the math top and current sticky.
+/// Math positions assume every header keeps its slot; the layout collapses the
+/// stuck header to zero height, saving exactly [`SECTION_SEP_H`] for rows at
+/// or after the sticky start (gaps are unchanged — the collapsed entry keeps
+/// its `keyed_column` spacing neighbors).
+fn actual_row_top_for_sticky(
+    math_row_top: f32,
+    sections: &[usize],
+    sticky: Option<usize>,
+    row_index: usize,
+) -> f32 {
+    if collapsed_before_row(sections, sticky, row_index) {
+        (math_row_top - SECTION_SEP_H).max(0.0)
+    } else {
+        math_row_top
+    }
+}
+
 /// Section pinned at the top of the viewport for `offset_y`: the last section
 /// whose header starts at or above the offset. The pinned bar shows this
 /// section until the next section's header reaches the top and supersedes it;
-/// the stuck section's in-list header keeps its layout slot but renders blank
-/// so the label never doubles.
+/// the stuck section's in-list header collapses to zero height so the pinned
+/// bar carries its label without doubling layout height (fix B: collapse the
+/// reserved bounds instead of keeping a blank `SECTION_SEP_H` slot, which left
+/// a 38px pinned+blank+gap stack above an anchored row vs the normal 8px gap).
+/// Scroll math still resolves stickiness against the stable math frame
+/// ([`separator_offset_above`] / [`header_top_for_row`]); actual content
+/// positions subtract the single collapsed header via
+/// [`collapsed_before_row`] / [`actual_row_top_for_sticky`].
 fn sticky_section_for_offset(sections: &[usize], offset_y: f32) -> Option<usize> {
     if sections.is_empty() {
         return None;
@@ -4681,13 +4768,16 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
         // its own section non-empty.
         if last_section != Some(section) {
             let label = labels.get(section).copied().unwrap_or("");
-            // The stuck section's in-list header keeps its slot (positions and
-            // scroll math are unchanged) but renders blank — the pinned bar
-            // carries its label, so keeping the text would double it.
+            // The stuck section's in-list header collapses to zero height — the
+            // pinned bar carries its label, so keeping the 30px slot would double
+            // it and leave a 38px pinned+blank+gap stack above an anchored row
+            // (vs the normal 8px gap). Collapsing keeps exactly one collapsed
+            // header at all times, so content height is math height minus one
+            // header (stable; see `actual_row_top_for_sticky`).
             let header: Element<'_, StartMessage> = if Some(section) == sticky {
                 container(space())
                     .width(Fill)
-                    .height(Length::Fixed(SECTION_SEP_H))
+                    .height(Length::Fixed(0.0))
                     .into()
             } else {
                 section_separator(label)
@@ -6862,7 +6952,8 @@ mod tests {
 
     #[test]
     fn center_prefer_clamps_to_content_max() {
-        // 20 same-letter rows: one section header, content = 20*104 + 30 + 20*8.
+        // 20 same-letter rows: one section header, collapsed to zero height.
+        // Actual content = 20*104 + 20*8 (math content minus one header).
         let mut state = State {
             rows: (0..20)
                 .map(|i| game_row_with(&format!("same{i}")))
@@ -6870,16 +6961,13 @@ mod tests {
             ..State::default()
         };
         state.record_list_scroll(StartListId::Games, 0.0, 400.0);
-        let content = 20.0 * ROW_HEIGHT + SECTION_SEP_H + 20.0 * ROW_GAP;
+        let content = 20.0 * ROW_HEIGHT + 20.0 * ROW_GAP;
         let max = content - 400.0;
-        // Mid list: raw center stands.
+        // Mid list: raw center stands (actual row top = math minus collapsed header).
         state.game_selected = 5;
         let (_, y) = state.selection_scroll_y_center_prefer().unwrap();
         assert!(
-            (y - (5.0 * (ROW_HEIGHT + ROW_GAP) + (SECTION_SEP_H + ROW_GAP)
-                - (400.0 - ROW_HEIGHT) / 2.0))
-                .abs()
-                < 0.1
+            (y - (5.0 * (ROW_HEIGHT + ROW_GAP) + ROW_GAP - (400.0 - ROW_HEIGHT) / 2.0)).abs() < 0.1
         );
         assert!(y < max);
         // Near the end the raw center overshoots: clamp to max (what iced
@@ -6959,15 +7047,43 @@ mod tests {
         state.game_selected = 0;
         let (_, y) = state.selection_scroll_y(ScrollReveal::Up).unwrap();
         assert!((y - 0.0).abs() < f32::EPSILON);
-        // Mid-section rows still pin to the row itself.
+        // Mid-section rows still pin to the row itself (actual = math minus collapsed header).
         state.game_selected = 1;
         let (_, y) = state.selection_scroll_y(ScrollReveal::Up).unwrap();
-        assert!((y - (1.0 * (ROW_HEIGHT + ROW_GAP) + (SECTION_SEP_H + ROW_GAP))).abs() < 0.1);
-        // Scrolling down keeps the row-bottom target (header rides along).
+        assert!((y - (1.0 * (ROW_HEIGHT + ROW_GAP) + ROW_GAP)).abs() < 0.1);
+        // Scrolling down with room: the collapsed header already fits, so no
+        // spurious 4px scroll (math row_bottom 404 vs actual 374 in a 400 viewport).
         state.record_list_scroll(StartListId::Games, 0.0, 400.0);
         state.game_selected = 2;
+        assert!(state.selection_scroll_y(ScrollReveal::Down).is_none());
+        // Tighter viewport still needs a scroll, targeted at the actual
+        // (collapsed) row: 270 + 104 - 300 = 74, not the math 104.
+        state.record_list_scroll(StartListId::Games, 0.0, 300.0);
+        state.game_selected = 2;
         let (_, y) = state.selection_scroll_y(ScrollReveal::Down).unwrap();
-        assert!((y - (300.0 + ROW_HEIGHT - 400.0)).abs() < 0.1);
+        assert!((y - 74.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn collapsed_sticky_leaves_normal_gap() {
+        // Math frame still counts one header (+ gap) above the first row.
+        let sections = [0, 0, 1, 1];
+        let step = SECTION_SEP_H + ROW_GAP;
+        assert!((separator_offset_above(&sections, 0) - step).abs() < f32::EPSILON);
+        // The stuck header collapses, so the actual first row sits one normal
+        // gap below the pinned bar — not a header + gap stack.
+        assert_eq!(sticky_start_index(&sections, Some(0)), Some(0));
+        assert!(collapsed_before_row(&sections, Some(0), 0));
+        assert!(!collapsed_before_row(&sections, Some(1), 0));
+        assert!(collapsed_before_row(&sections, Some(1), 2));
+        let math_row_top = separator_offset_above(&sections, 0);
+        assert!(
+            (actual_row_top_for_sticky(math_row_top, &sections, Some(0), 0) - ROW_GAP).abs()
+                < f32::EPSILON
+        );
+        // Empty list never collapses.
+        assert!(!collapsed_before_row(&[], None, 0));
+        assert_eq!(sticky_start_index(&[], None), None);
     }
 
     #[test]
