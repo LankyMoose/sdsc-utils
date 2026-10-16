@@ -138,6 +138,48 @@ impl ImmersiveLayout {
 pub const IMMERSIVE_LAYOUT_MODES: [ImmersiveLayout; 2] =
     [ImmersiveLayout::Vertical, ImmersiveLayout::Horizontal];
 
+/// How the start screen restores the game highlight (game axis only;
+/// controller selection persistence is out of scope and never gated).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartSelectionMode {
+    /// Match the stored `play_key` (default; survives reorders).
+    #[default]
+    ByGame,
+    /// Clamp the stored row index (`index.min(len - 1)`).
+    ByPosition,
+}
+
+impl StartSelectionMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::ByGame => Self::ByPosition,
+            Self::ByPosition => Self::ByGame,
+        }
+    }
+    pub fn next(self) -> Self {
+        self.cycle()
+    }
+    pub fn prev(self) -> Self {
+        self.cycle()
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ByGame => "By game",
+            Self::ByPosition => "By position",
+        }
+    }
+}
+
+impl std::fmt::Display for StartSelectionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+pub const SELECTION_MODES: [StartSelectionMode; 2] =
+    [StartSelectionMode::ByGame, StartSelectionMode::ByPosition];
+
 /// Immersive position-rail visibility.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -266,6 +308,14 @@ pub struct Prefs {
     /// Start-screen games list sort (default last played).
     #[serde(default)]
     pub games_sort_mode: GamesSortMode,
+    /// Remember the start-screen game highlight across shell restarts
+    /// (default on). Off keeps the clamped index and never re-pins by key.
+    /// Game axis only; the controller axis is never gated.
+    #[serde(default = "default_true")]
+    pub start_selection_persist: bool,
+    /// How the game highlight restores when persistence is on (default by game).
+    #[serde(default)]
+    pub start_selection_mode: StartSelectionMode,
     /// Controllers slide: include remembered disconnected pads (default off).
     #[serde(default)]
     pub show_all_controllers: bool,
@@ -447,6 +497,8 @@ impl Default for Prefs {
             start_screen_haptics_enabled: true,
             start_screen_haptics_strength: default_start_screen_haptics_strength(),
             games_sort_mode: GamesSortMode::default(),
+            start_selection_persist: true,
+            start_selection_mode: StartSelectionMode::default(),
             show_all_controllers: false,
             start_screen_immersive_layout: ImmersiveLayout::default(),
             start_screen_navbar: NavbarVisibility::default(),
@@ -727,6 +779,62 @@ mod tests {
     fn older_prefs_default_show_all_controllers_off() {
         let prefs: Prefs = serde_json::from_str("{}").unwrap();
         assert!(!prefs.show_all_controllers);
+    }
+
+    #[test]
+    fn older_prefs_default_selection_persist_on_by_game() {
+        let prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(prefs.start_selection_persist);
+        assert_eq!(prefs.start_selection_mode, StartSelectionMode::ByGame);
+        assert_eq!(
+            Prefs::default().start_selection_mode,
+            StartSelectionMode::ByGame
+        );
+    }
+
+    #[test]
+    fn selection_mode_cycles_and_labels() {
+        assert_eq!(
+            StartSelectionMode::ByGame.cycle(),
+            StartSelectionMode::ByPosition
+        );
+        assert_eq!(
+            StartSelectionMode::ByPosition.cycle(),
+            StartSelectionMode::ByGame
+        );
+        assert_eq!(
+            StartSelectionMode::ByGame.next(),
+            StartSelectionMode::ByPosition
+        );
+        assert_eq!(
+            StartSelectionMode::ByPosition.prev(),
+            StartSelectionMode::ByGame
+        );
+        assert_eq!(StartSelectionMode::ByGame.label(), "By game");
+        assert_eq!(StartSelectionMode::ByPosition.label(), "By position");
+        assert_eq!(
+            serde_json::to_string(&StartSelectionMode::ByGame).unwrap(),
+            r#""by_game""#
+        );
+        assert_eq!(
+            serde_json::to_string(&StartSelectionMode::ByPosition).unwrap(),
+            r#""by_position""#
+        );
+        for mode in SELECTION_MODES {
+            let encoded = serde_json::to_string(&mode).unwrap();
+            let decoded: StartSelectionMode = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, mode);
+        }
+    }
+
+    #[test]
+    fn explicit_selection_persist_off_stays_off() {
+        let prefs: Prefs = serde_json::from_str(r#"{"start_selection_persist":false}"#).unwrap();
+        assert!(!prefs.start_selection_persist);
+        let prefs: Prefs =
+            serde_json::from_str(r#"{"start_selection_mode":"by_position"}"#).unwrap();
+        assert!(prefs.start_selection_persist);
+        assert_eq!(prefs.start_selection_mode, StartSelectionMode::ByPosition);
     }
 
     #[test]

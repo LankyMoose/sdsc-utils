@@ -40,7 +40,10 @@ pub const SHELL_PIPE_ENV: &str = "SDSC_UTILS_PIPE";
 /// `ServiceMessage` change. The shell handshakes on every connect and quits
 /// on mismatch (or when no service answers) — mismatched peers never limp
 /// along on half-understood messages.
-pub const IPC_PROTOCOL_VERSION: u32 = 1;
+///
+/// v2: `SetStartSelection` carries `game_index` (by-position restore) and the
+/// snapshot prefs carry `start_selection_persist` / `start_selection_mode`.
+pub const IPC_PROTOCOL_VERSION: u32 = 2;
 
 /// Shell → service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,11 +102,15 @@ pub enum ShellCommand {
         serial: String,
         nickname: Option<String>,
     },
-    /// Start-screen selection changed (stable keys; service stores in memory
-    /// and folds it into the retained snapshot for shell restarts).
+    /// Start-screen selection changed (stable keys + game row index; service
+    /// stores in memory and folds it into the retained snapshot for shell
+    /// restarts). `game_index` serves by-position restore only; there is no
+    /// controller index (controller persistence is out of scope).
     SetStartSelection {
         game_key: Option<String>,
         controller_key: Option<String>,
+        #[serde(default)]
+        game_index: Option<usize>,
     },
     /// Shell (re)start: ask the service for the retained session snapshot —
     /// the single convergent pull (live + remembered + prefs + analytics +
@@ -322,14 +329,29 @@ mod tests {
         let cmd = ShellCommand::SetStartSelection {
             game_key: Some("steam:440".to_string()),
             controller_key: Some("pad-a".to_string()),
+            game_index: Some(2),
         };
         match frame_round_trip(&cmd) {
             ShellCommand::SetStartSelection {
                 game_key,
                 controller_key,
+                game_index,
             } => {
                 assert_eq!(game_key.as_deref(), Some("steam:440"));
                 assert_eq!(controller_key.as_deref(), Some("pad-a"));
+                assert_eq!(game_index, Some(2));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        // Pre-v2 payloads (no game_index) still decode.
+        match frame_round_trip(
+            &serde_json::from_str::<ShellCommand>(
+                r#"{"SetStartSelection":{"game_key":"steam:440","controller_key":null}}"#,
+            )
+            .expect("legacy literal parses"),
+        ) {
+            ShellCommand::SetStartSelection { game_index, .. } => {
+                assert_eq!(game_index, None);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -386,6 +408,7 @@ mod tests {
             selection: StartSelection {
                 game_key: Some("steam:440".to_string()),
                 controller_key: None,
+                game_index: None,
             },
             analytics: Default::default(),
         };

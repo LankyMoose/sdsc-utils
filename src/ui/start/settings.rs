@@ -2,9 +2,9 @@
 
 use crate::persist::prefs::{
     AUTO_OPEN_MODES, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout, NAVBAR_MODES, NavbarVisibility,
-    REDUCED_MOTION_MODES, ReducedMotion, START_SCREEN_IDLE_SECS_STEPS,
-    START_SCREEN_SLEEP_SECS_STEPS, StartAutoOpen, format_timeout_duration, min_sleep_secs_for_idle,
-    secs_step_index,
+    REDUCED_MOTION_MODES, ReducedMotion, SELECTION_MODES, START_SCREEN_IDLE_SECS_STEPS,
+    START_SCREEN_SLEEP_SECS_STEPS, StartAutoOpen, StartSelectionMode, format_timeout_duration,
+    min_sleep_secs_for_idle, secs_step_index,
 };
 use crate::ui::layout as window_layout;
 use crate::ui::start::view::{ScrollReveal, StartMessage, State, scroll_y_to_reveal_bounds};
@@ -59,6 +59,8 @@ const COMPACT_MODAL_MAX_H: f32 = 528.0;
 #[derive(Debug, Clone)]
 pub struct StartSettingsSnapshot {
     pub auto_open: StartAutoOpen,
+    pub selection_persist: bool,
+    pub selection_mode: StartSelectionMode,
     pub always_immersive: bool,
     pub clock_enabled: bool,
     pub immersive_layout: ImmersiveLayout,
@@ -85,6 +87,8 @@ pub struct StartSettingsSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
     AutoOpen,
+    SelectionPersist,
+    SelectionMode,
     AlwaysImmersive,
     Clock,
     ImmersiveLayout,
@@ -110,8 +114,10 @@ impl SettingsRow {
     /// everywhere (visibly), and reordering here reorders all three together.
     /// To add a row: append/reorder here, extend `visible()` + `section_before()`
     /// / `gap_before()` + the `panel_view` build match + `kind()`/dispatch arms.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 19] = [
         Self::AutoOpen,
+        Self::SelectionPersist,
+        Self::SelectionMode,
         Self::AlwaysImmersive,
         Self::Clock,
         Self::ImmersiveLayout,
@@ -136,6 +142,7 @@ impl SettingsRow {
     pub fn visible(self, snapshot: &StartSettingsSnapshot) -> bool {
         match self {
             Self::AutoOpen
+            | Self::SelectionPersist
             | Self::AlwaysImmersive
             | Self::Clock
             | Self::ImmersiveLayout
@@ -157,13 +164,14 @@ impl SettingsRow {
             ),
             Self::SoundVolume => snapshot.sounds_enabled,
             Self::HapticsStrength => snapshot.haptics_enabled,
+            Self::SelectionMode => snapshot.selection_persist,
         }
     }
 
     pub fn focusable(snapshot: &StartSettingsSnapshot) -> Vec<Self> {
         debug_assert!(
             {
-                let mut seen = [false; 17];
+                let mut seen = [false; 19];
                 let mut dup = false;
                 for row in Self::ALL {
                     let idx = row as usize;
@@ -185,13 +193,19 @@ impl SettingsRow {
 
     /// Section label rendered immediately before this row, if any. Anchored to
     /// the row so inserting/reordering rows carries its section along.
+    ///
+    /// Selection restores on open, so it gets its own section immediately
+    /// after Opening (Opening-adjacent, before Immersive) rather than joining
+    /// either neighbor.
     fn section_before(self) -> Option<&'static str> {
         match self {
             Self::AutoOpen => Some("Opening"),
+            Self::SelectionPersist => Some("Selection"),
             Self::AlwaysImmersive => Some("Immersive"),
             Self::Sounds => Some("Feedback"),
             Self::PerfThrottle => Some("Performance"),
             Self::Clock
+            | Self::SelectionMode
             | Self::ImmersiveLayout
             | Self::Navbar
             | Self::ReducedMotion
@@ -211,8 +225,11 @@ impl SettingsRow {
     /// opens the Immersive / Feedback section after the previous block).
     fn gap_before(self) -> bool {
         match self {
-            Self::AlwaysImmersive | Self::Sounds | Self::PerfThrottle => true,
+            Self::SelectionPersist | Self::AlwaysImmersive | Self::Sounds | Self::PerfThrottle => {
+                true
+            }
             Self::AutoOpen
+            | Self::SelectionMode
             | Self::Clock
             | Self::ImmersiveLayout
             | Self::Navbar
@@ -250,10 +267,13 @@ impl SettingsRow {
     /// Widget kind for a row, declared once; confirm/nudge dispatch over it.
     pub fn kind(self) -> RowKind {
         match self {
-            Self::AutoOpen | Self::ImmersiveLayout | Self::Navbar | Self::ReducedMotion => {
-                RowKind::Selector
-            }
-            Self::AlwaysImmersive
+            Self::AutoOpen
+            | Self::SelectionMode
+            | Self::ImmersiveLayout
+            | Self::Navbar
+            | Self::ReducedMotion => RowKind::Selector,
+            Self::SelectionPersist
+            | Self::AlwaysImmersive
             | Self::Clock
             | Self::Sounds
             | Self::Haptics
@@ -272,6 +292,7 @@ impl SettingsRow {
     /// Current on/off for toggle rows.
     fn toggle_value(self, snapshot: &StartSettingsSnapshot) -> bool {
         match self {
+            Self::SelectionPersist => snapshot.selection_persist,
             Self::AlwaysImmersive => snapshot.always_immersive,
             Self::Clock => snapshot.clock_enabled,
             Self::Sounds => snapshot.sounds_enabled,
@@ -286,6 +307,7 @@ impl SettingsRow {
     /// Toggle message constructor for toggle rows.
     fn set_toggle(self, on: bool) -> StartMessage {
         match self {
+            Self::SelectionPersist => StartMessage::SetSelectionPersist(on),
             Self::AlwaysImmersive => StartMessage::SetAlwaysImmersive(on),
             Self::Clock => StartMessage::SetClock(on),
             Self::Sounds => StartMessage::SetSounds(on),
@@ -301,6 +323,7 @@ impl SettingsRow {
     fn open_menu(self) -> StartMessage {
         match self {
             Self::AutoOpen => StartMessage::ToggleAutoOpenMenu,
+            Self::SelectionMode => StartMessage::ToggleSelectionModeMenu,
             Self::ImmersiveLayout => StartMessage::ToggleLayoutMenu,
             Self::Navbar => StartMessage::ToggleNavbarMenu,
             Self::ReducedMotion => StartMessage::ToggleReducedMotionMenu,
@@ -312,6 +335,7 @@ impl SettingsRow {
     pub fn selector_count(self) -> usize {
         match self {
             Self::AutoOpen => AUTO_OPEN_MODES.len(),
+            Self::SelectionMode => SELECTION_MODES.len(),
             Self::ImmersiveLayout => IMMERSIVE_LAYOUT_MODES.len(),
             Self::Navbar => NAVBAR_MODES.len(),
             Self::ReducedMotion => REDUCED_MOTION_MODES.len(),
@@ -325,6 +349,10 @@ impl SettingsRow {
             Self::AutoOpen => AUTO_OPEN_MODES
                 .iter()
                 .position(|&m| m == snapshot.auto_open)
+                .unwrap_or(0),
+            Self::SelectionMode => SELECTION_MODES
+                .iter()
+                .position(|&m| m == snapshot.selection_mode)
                 .unwrap_or(0),
             Self::ImmersiveLayout => IMMERSIVE_LAYOUT_MODES
                 .iter()
@@ -346,6 +374,7 @@ impl SettingsRow {
     pub fn selector_label(self, index: usize) -> &'static str {
         match self {
             Self::AutoOpen => AUTO_OPEN_MODES[index].label(),
+            Self::SelectionMode => SELECTION_MODES[index].label(),
             Self::ImmersiveLayout => IMMERSIVE_LAYOUT_MODES[index].label(),
             Self::Navbar => NAVBAR_MODES[index].label(),
             Self::ReducedMotion => REDUCED_MOTION_MODES[index].label(),
@@ -359,6 +388,9 @@ impl SettingsRow {
             Self::AutoOpen => AUTO_OPEN_MODES
                 .get(index)
                 .is_some_and(|&m| m == snapshot.auto_open),
+            Self::SelectionMode => SELECTION_MODES
+                .get(index)
+                .is_some_and(|&m| m == snapshot.selection_mode),
             Self::ImmersiveLayout => IMMERSIVE_LAYOUT_MODES
                 .get(index)
                 .is_some_and(|&m| m == snapshot.immersive_layout),
@@ -379,6 +411,9 @@ impl SettingsRow {
             Self::AutoOpen => {
                 StartMessage::SetAutoOpen(AUTO_OPEN_MODES[index.min(AUTO_OPEN_MODES.len() - 1)])
             }
+            Self::SelectionMode => StartMessage::SetSelectionMode(
+                SELECTION_MODES[index.min(SELECTION_MODES.len() - 1)],
+            ),
             Self::ImmersiveLayout => StartMessage::SetImmersiveLayout(
                 IMMERSIVE_LAYOUT_MODES[index.min(IMMERSIVE_LAYOUT_MODES.len() - 1)],
             ),
@@ -400,6 +435,11 @@ impl SettingsRow {
                 snapshot.auto_open.next()
             } else {
                 snapshot.auto_open.prev()
+            }),
+            Self::SelectionMode => StartMessage::SetSelectionMode(if delta > 0 {
+                snapshot.selection_mode.next()
+            } else {
+                snapshot.selection_mode.prev()
             }),
             Self::ImmersiveLayout => {
                 StartMessage::SetImmersiveLayout(snapshot.immersive_layout.cycle())
@@ -492,6 +532,8 @@ pub fn settings_nav_cue(row: SettingsRow) -> SettingsCue {
         // Apply rumbles at the new strength; nav covers sound only.
         SettingsRow::Haptics | SettingsRow::HapticsStrength => SettingsCue::SoundOnly,
         SettingsRow::AutoOpen
+        | SettingsRow::SelectionPersist
+        | SettingsRow::SelectionMode
         | SettingsRow::AlwaysImmersive
         | SettingsRow::Clock
         | SettingsRow::ImmersiveLayout
@@ -852,6 +894,8 @@ fn step_in_table(value: u32, table: &[u32], step: isize) -> Option<u32> {
 fn row_helper(row: SettingsRow) -> Option<&'static str> {
     match row {
         SettingsRow::AutoOpen => Some("When a controller connects"),
+        SettingsRow::SelectionPersist => Some("Keep the game highlight across restarts"),
+        SettingsRow::SelectionMode => Some("Match the game, or its position"),
         SettingsRow::AlwaysImmersive => {
             Some("Open full screen; Circle closes instead of going back")
         }
@@ -1143,6 +1187,22 @@ pub fn panel_view<'a>(
                 focused,
                 ty,
                 |on| SettingsRow::AlwaysImmersive.set_toggle(on),
+            ),
+            SettingsRow::SelectionPersist => toggle_row(
+                "Remember selection",
+                SettingsRow::SelectionPersist.helper(),
+                SettingsRow::SelectionPersist.toggle_value(snapshot),
+                focused,
+                ty,
+                |on| SettingsRow::SelectionPersist.set_toggle(on),
+            ),
+            SettingsRow::SelectionMode => selector_row(
+                "Restore by",
+                SettingsRow::SelectionMode.helper(),
+                snapshot.selection_mode.label(),
+                focused,
+                ty,
+                SettingsRow::SelectionMode.open_menu(),
             ),
             SettingsRow::Clock => toggle_row(
                 "Display clock",
@@ -1722,6 +1782,8 @@ mod tests {
     fn snap(sounds: bool, haptics: bool) -> StartSettingsSnapshot {
         StartSettingsSnapshot {
             auto_open: StartAutoOpen::Any,
+            selection_persist: true,
+            selection_mode: StartSelectionMode::ByGame,
             always_immersive: false,
             clock_enabled: true,
             immersive_layout: ImmersiveLayout::Vertical,
@@ -1783,6 +1845,8 @@ mod tests {
             rows,
             vec![
                 SettingsRow::AutoOpen,
+                SettingsRow::SelectionPersist,
+                SettingsRow::SelectionMode,
                 SettingsRow::AlwaysImmersive,
                 SettingsRow::Clock,
                 SettingsRow::ImmersiveLayout,
@@ -1800,6 +1864,32 @@ mod tests {
                 SettingsRow::PerfVsync,
             ]
         );
+    }
+
+    #[test]
+    fn selection_mode_hidden_while_persist_off() {
+        let mut s = snap(true, true);
+        assert!(SettingsRow::focusable(&s).contains(&SettingsRow::SelectionMode));
+        s.selection_persist = false;
+        let rows = SettingsRow::focusable(&s);
+        assert!(!rows.contains(&SettingsRow::SelectionMode));
+        assert!(rows.contains(&SettingsRow::SelectionPersist));
+    }
+
+    #[test]
+    fn selection_mode_confirm_opens_menu_nudge_cycles() {
+        let s = snap(true, true);
+        let msg = confirm_message(SettingsRow::SelectionMode, &s).unwrap();
+        assert!(matches!(msg, StartMessage::ToggleSelectionModeMenu));
+        for delta in [1, -1] {
+            let msg = nudge_message(SettingsRow::SelectionMode, &s, delta).unwrap();
+            assert!(matches!(
+                msg,
+                StartMessage::SetSelectionMode(StartSelectionMode::ByPosition)
+            ));
+        }
+        let msg = confirm_message(SettingsRow::SelectionPersist, &s).unwrap();
+        assert!(matches!(msg, StartMessage::SetSelectionPersist(false)));
     }
 
     #[test]
@@ -2038,7 +2128,7 @@ mod tests {
     #[test]
     fn triple_agreement_focusable_panel_bounds() {
         // The single table lists every variant exactly once, in display order.
-        assert_eq!(SettingsRow::ALL.len(), 17);
+        assert_eq!(SettingsRow::ALL.len(), 19);
         {
             let mut sorted = SettingsRow::ALL;
             sorted.sort_by_key(|row| *row as usize);
@@ -2075,6 +2165,7 @@ mod tests {
                 for menu in [
                     None,
                     Some(SettingsRow::AutoOpen),
+                    Some(SettingsRow::SelectionMode),
                     Some(SettingsRow::ImmersiveLayout),
                     Some(SettingsRow::Navbar),
                     Some(SettingsRow::ReducedMotion),
@@ -2267,6 +2358,10 @@ mod tests {
             Some(StartMessage::ToggleAutoOpenMenu)
         ));
         assert!(matches!(
+            confirm_message(SettingsRow::SelectionMode, &base),
+            Some(StartMessage::ToggleSelectionModeMenu)
+        ));
+        assert!(matches!(
             confirm_message(SettingsRow::ImmersiveLayout, &base),
             Some(StartMessage::ToggleLayoutMenu)
         ));
@@ -2280,6 +2375,15 @@ mod tests {
         ));
         // Toggles always flip, from either state.
         for on in [false, true] {
+            let mut s = base.clone();
+            s.selection_persist = on;
+            assert!(
+                matches!(
+                    confirm_message(SettingsRow::SelectionPersist, &s),
+                    Some(StartMessage::SetSelectionPersist(v)) if v == !on
+                ),
+                "SelectionPersist confirm from {on}"
+            );
             let mut s = base.clone();
             s.always_immersive = on;
             assert!(
