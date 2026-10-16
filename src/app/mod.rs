@@ -394,6 +394,26 @@ pub struct App {
     /// UI state: never persisted, never sent over IPC.
     #[cfg(debug_assertions)]
     pub debug_layout_bounds: bool,
+    /// Debug-only ambient pulse + ken-burns tuning (Diagnostics sliders).
+    /// Shell-local UI state: never persisted, never sent over IPC; defaults
+    /// reproduce release visuals. Mirrored into the process-wide tuning
+    /// atomics (`ui::shader::ambient`, `ui::start::mode`) on every edit.
+    #[cfg(debug_assertions)]
+    debug_ambient_freq: f32,
+    #[cfg(debug_assertions)]
+    debug_ambient_veil_freq: f32,
+    #[cfg(debug_assertions)]
+    debug_ambient_gain: f32,
+    #[cfg(debug_assertions)]
+    debug_ambient_grain: f32,
+    #[cfg(debug_assertions)]
+    debug_ambient_time_scale: f32,
+    #[cfg(debug_assertions)]
+    debug_kenburns_amp: f32,
+    #[cfg(debug_assertions)]
+    debug_kenburns_pan: f32,
+    #[cfg(debug_assertions)]
+    debug_kenburns_speed: f32,
     configure_state: ConfigureState,
     /// Snapshot for the Analytics settings tab (refreshed with controller/analytics changes).
     analytics_panel: AnalyticsPanel,
@@ -724,6 +744,8 @@ impl App {
                 .collect::<Vec<_>>();
             emulate::rehydrate(&remembered)
         };
+        #[cfg(debug_assertions)]
+        let debug_tune = crate::ui::configure::DebugAmbientTune::default();
         let session = crate::session::DeviceSession::new(prefs, known, analytics);
         // Boot-only renderer prefs (iced Settings); a later change auto-restarts.
         let (renderer_boot_aa, renderer_boot_vsync) =
@@ -757,6 +779,22 @@ impl App {
             stress_running: false,
             #[cfg(debug_assertions)]
             debug_layout_bounds: false,
+            #[cfg(debug_assertions)]
+            debug_ambient_freq: debug_tune.pulse_freq,
+            #[cfg(debug_assertions)]
+            debug_ambient_veil_freq: debug_tune.veil_freq,
+            #[cfg(debug_assertions)]
+            debug_ambient_gain: debug_tune.pulse_gain,
+            #[cfg(debug_assertions)]
+            debug_ambient_grain: debug_tune.grain_gain,
+            #[cfg(debug_assertions)]
+            debug_ambient_time_scale: debug_tune.time_scale,
+            #[cfg(debug_assertions)]
+            debug_kenburns_amp: debug_tune.kenburns_amp,
+            #[cfg(debug_assertions)]
+            debug_kenburns_pan: debug_tune.kenburns_pan,
+            #[cfg(debug_assertions)]
+            debug_kenburns_speed: debug_tune.kenburns_speed,
             configure_state,
             analytics_panel: AnalyticsPanel::default(),
             pad_input_panel: PadInputPanel::default(),
@@ -1148,6 +1186,17 @@ impl App {
         }
 
         if Some(window) == self.configure_window {
+            #[cfg(debug_assertions)]
+            let debug_tune = crate::ui::configure::DebugAmbientTune {
+                pulse_freq: self.debug_ambient_freq,
+                veil_freq: self.debug_ambient_veil_freq,
+                pulse_gain: self.debug_ambient_gain,
+                grain_gain: self.debug_ambient_grain,
+                time_scale: self.debug_ambient_time_scale,
+                kenburns_amp: self.debug_kenburns_amp,
+                kenburns_pan: self.debug_kenburns_pan,
+                kenburns_speed: self.debug_kenburns_speed,
+            };
             return configure_view::view(
                 &self.configure_state,
                 &self.configure_settings(),
@@ -1159,6 +1208,8 @@ impl App {
                 &self.pending_emulator_changes(),
                 #[cfg(debug_assertions)]
                 self.debug_layout_bounds,
+                #[cfg(debug_assertions)]
+                &debug_tune,
             )
             .map(Message::Configure);
         }
@@ -1247,6 +1298,12 @@ impl App {
             ));
         self.start_state
             .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
+        // Debug tuning keep-alive follows the shell-local fields (the tuning
+        // arms below re-sync too, since this runs before the match).
+        #[cfg(debug_assertions)]
+        {
+            self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+        }
         // Renderer reload queued: drop all user input (pad / mouse /
         // keyboard / tray / pickers, shell and service originated) so nothing
         // can act in the feedback window before exit. Window lifecycle,
@@ -2760,6 +2817,78 @@ impl App {
                 self.debug_layout_bounds = enabled;
                 Task::none()
             }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugAmbientFreq(v) => {
+                self.debug_ambient_freq = v.clamp(0.0, 5.0);
+                crate::ui::shader::ambient::set_pulse_freq(self.debug_ambient_freq);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugAmbientVeilFreq(v) => {
+                self.debug_ambient_veil_freq = v.clamp(0.0, 8.0);
+                crate::ui::shader::ambient::set_veil_freq(self.debug_ambient_veil_freq);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugAmbientGain(v) => {
+                self.debug_ambient_gain = v.clamp(0.0, 3.0);
+                crate::ui::shader::ambient::set_pulse_gain(self.debug_ambient_gain);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugAmbientGrain(v) => {
+                self.debug_ambient_grain = v.clamp(0.0, 5.0);
+                crate::ui::shader::ambient::set_grain_gain(self.debug_ambient_grain);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugAmbientTimeScale(v) => {
+                self.debug_ambient_time_scale = v.clamp(0.0, 4.0);
+                crate::ui::shader::ambient::set_time_scale(self.debug_ambient_time_scale);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugKenburnsAmp(v) => {
+                self.debug_kenburns_amp = v.clamp(0.0, 5.0);
+                crate::ui::start::mode::set_kenburns_amp_scale(self.debug_kenburns_amp);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugKenburnsPan(v) => {
+                self.debug_kenburns_pan = v.clamp(0.0, 5.0);
+                crate::ui::start::mode::set_kenburns_pan_scale(self.debug_kenburns_pan);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugKenburnsSpeed(v) => {
+                self.debug_kenburns_speed = v.clamp(0.0, 8.0);
+                crate::ui::start::mode::set_kenburns_speed(self.debug_kenburns_speed);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::ResetDebugAmbientTuning => {
+                let defaults = crate::ui::configure::DebugAmbientTune::default();
+                self.debug_ambient_freq = defaults.pulse_freq;
+                self.debug_ambient_veil_freq = defaults.veil_freq;
+                self.debug_ambient_gain = defaults.pulse_gain;
+                self.debug_ambient_grain = defaults.grain_gain;
+                self.debug_ambient_time_scale = defaults.time_scale;
+                self.debug_kenburns_amp = defaults.kenburns_amp;
+                self.debug_kenburns_pan = defaults.kenburns_pan;
+                self.debug_kenburns_speed = defaults.kenburns_speed;
+                crate::ui::shader::ambient::reset_ambient_tuning();
+                crate::ui::start::mode::reset_kenburns_tuning();
+                self.start_state.ambient_tuning_keepalive = false;
+                Task::none()
+            }
             ConfigureMessage::OpenExternalLink(url) => {
                 if let Err(err) = launch::launch_target(url, "") {
                     app_log::warn(format!("open external link failed: {err}"));
@@ -2825,6 +2954,22 @@ impl App {
                 None => Task::none(),
             },
         }
+    }
+
+    /// True while any debug ambient/ken-burns tuning differs from shipped
+    /// behavior (drives the Start keep-alive so tuning repaints under idle
+    /// throttle). Shell-local only.
+    #[cfg(debug_assertions)]
+    fn debug_tuning_active(&self) -> bool {
+        let defaults = crate::ui::configure::DebugAmbientTune::default();
+        self.debug_ambient_freq != defaults.pulse_freq
+            || self.debug_ambient_veil_freq != defaults.veil_freq
+            || self.debug_ambient_gain != defaults.pulse_gain
+            || self.debug_ambient_grain != defaults.grain_gain
+            || self.debug_ambient_time_scale != defaults.time_scale
+            || self.debug_kenburns_amp != defaults.kenburns_amp
+            || self.debug_kenburns_pan != defaults.kenburns_pan
+            || self.debug_kenburns_speed != defaults.kenburns_speed
     }
 
     fn apply_spectrum_maybe(&mut self, spectrum: Option<BatterySpectrum>) -> Task<Message> {

@@ -880,6 +880,12 @@ pub struct State {
     pub perf_throttle_immersive: bool,
     /// Seconds for ambient shader time uniform.
     pub ambient_time: f32,
+    /// Debug-only ambient/ken-burns tuning active (Diagnostics sliders).
+    /// While set, immersive keeps frames flowing even under the idle
+    /// throttle so tuning (including freeze toggles) repaints immediately.
+    /// Shell-local, never persisted; synced from the shell each update.
+    #[cfg(debug_assertions)]
+    pub ambient_tuning_keepalive: bool,
     /// Incoming backdrop land/crossfade (`started = None` = waiting for peek art).
     backdrop_current: Option<(String, Option<Instant>)>,
     /// Outgoing backdrop during cover-crossfade: `(play_key, scale, ox_norm, oy_norm)`.
@@ -1089,6 +1095,8 @@ impl Default for State {
             reduced_motion: false,
             perf_throttle_immersive: false,
             ambient_time: 0.0,
+            #[cfg(debug_assertions)]
+            ambient_tuning_keepalive: false,
             backdrop_current: None,
             backdrop_outgoing: None,
             identify_flash: None,
@@ -1710,6 +1718,7 @@ impl State {
             || self.backdrop_current.is_some()
             || self.backdrop_outgoing.is_some()
             || (self.immersive && !self.perf_throttle_immersive)
+            || (self.immersive && self.debug_tuning_keepalive())
             || self.cold_load_active
             || self.triangle_progress > 0.0
             || self.cross_progress > 0.0
@@ -1745,6 +1754,7 @@ impl State {
             || self.transition_phase.is_some()
             || self.backdrop_current.is_some()
             || self.backdrop_outgoing.is_some()
+            || self.debug_tuning_keepalive()
             || self.cold_load_active
             || self.triangle_progress > 0.0
             || self.cross_progress > 0.0
@@ -1770,6 +1780,19 @@ impl State {
     /// the next subscription evaluation simply stops/starts `StartFrame`).
     pub fn sync_perf_throttle(&mut self, throttle: bool) {
         self.perf_throttle_immersive = throttle;
+    }
+
+    /// Debug tuning keep-alive (see [`State::ambient_tuning_keepalive`]).
+    /// Release: always false (no tuning exists).
+    fn debug_tuning_keepalive(&self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            self.ambient_tuning_keepalive
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
+        }
     }
 
     /// Immersive dock width progress 0..=1 (eased while animating).
@@ -3511,7 +3534,8 @@ impl State {
             || self.transition_phase.is_some()
             || self.cold_load_active
         {
-            self.ambient_time += 1.0 / 60.0;
+            // Debug time scale applied (release always advances 1/60).
+            self.ambient_time += crate::ui::shader::ambient::ambient_tick_dt();
             busy = true;
         }
         busy
@@ -6539,6 +6563,24 @@ mod tests {
         let mut compact_throttled = State::default();
         compact_throttled.sync_perf_throttle(true);
         assert!(!compact_throttled.needs_frames());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_tuning_keepalive_overrides_idle_throttle() {
+        // Tuning (incl. freeze toggles) repaints even under the idle
+        // throttle; clearing it restores the throttle gate.
+        let mut throttled = State {
+            immersive: true,
+            ..State::default()
+        };
+        throttled.sync_perf_throttle(true);
+        assert!(!throttled.needs_frames());
+        throttled.ambient_tuning_keepalive = true;
+        assert!(throttled.needs_frames());
+        assert!(throttled.immersive_anim_active());
+        throttled.ambient_tuning_keepalive = false;
+        assert!(!throttled.needs_frames());
     }
 
     #[test]

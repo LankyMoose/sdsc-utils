@@ -9,6 +9,10 @@ struct Uniforms {
     // x, y = widget size in physical px; z = corner radius in physical px
     // (0 = square, fully opaque — immersive). w unused.
     mask: vec4<f32>,
+    // Dev-only tuning (debug builds): x = pulse freq rad/s (1.4),
+    // y = veil freq rad/s (3.2), z = pulse gain scale (1.0),
+    // w = grain gain scale (1.0). Release builds always send defaults.
+    tune: vec4<f32>,
 }
 
 // Signed distance to a rounded rect of half-size `half` centred at the origin.
@@ -57,8 +61,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let glow_c = vec2<f32>(-0.35, 0.05);
     let glow_d = length(centered - glow_c);
     let glow = exp(-glow_d * glow_d * 2.8);
-    let pulse = 0.5 + 0.5 * sin(u.time * 1.4);
-    color += u.accent.rgb * glow * (0.10 + 0.04 * pulse);
+    let pulse = 0.5 + 0.5 * sin(u.time * u.tune.x);
+    color += u.accent.rgb * glow * (0.10 + 0.04 * pulse) * u.tune.z;
 
     // Secondary cooler lift toward the center stage.
     let stage_glow = exp(-length(centered - vec2<f32>(0.15, 0.0)) * 1.6);
@@ -69,11 +73,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     color = mix(color, u.base_bg.rgb * 0.72, dock_x * 0.65);
 
     // Very soft animated grain.
-    let grain = (hash21(uv * vec2<f32>(960.0, 540.0) + u.time * 12.0) - 0.5) * 0.03;
+    let grain = (hash21(uv * vec2<f32>(960.0, 540.0) + u.time * 12.0) - 0.5) * 0.03 * u.tune.w;
     color += grain;
 
     // Accent breath while veiling (promote/demote).
-    let veil_pulse = 0.5 + 0.5 * sin(u.time * 3.2);
+    let veil_pulse = 0.5 + 0.5 * sin(u.time * u.tune.y);
     let accent_wash = u.accent.rgb * (0.05 + 0.07 * veil_pulse) * u.veil;
     color = mix(color, color + accent_wash, u.veil);
 

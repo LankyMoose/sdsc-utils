@@ -4,9 +4,19 @@ use crate::ui::theme;
 use iced::mouse;
 use iced::widget::shader::{self, Viewport};
 use iced::{Color, Rectangle};
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static PIPELINE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Defaults reproducing current visuals (also the release behavior).
+pub const DEFAULT_PULSE_FREQ: f32 = 1.4;
+pub const DEFAULT_VEIL_FREQ: f32 = 3.2;
+pub const DEFAULT_PULSE_GAIN: f32 = 1.0;
+pub const DEFAULT_GRAIN_GAIN: f32 = 1.0;
+/// CPU time advance multiplier (`tick_anim`); 0 freezes the pulse.
+pub const DEFAULT_TIME_SCALE: f32 = 1.0;
 
 /// Reset one-shot pipeline diag (process Exit) so the next run logs again.
 pub fn reset_pipeline_diag() {
@@ -28,6 +38,159 @@ pub struct AmbientUniforms {
     /// `[width_px, height_px, corner_radius_px, _]`. Filled in `prepare` from
     /// the widget bounds × scale; radius 0 keeps the output opaque and square.
     pub mask: [f32; 4],
+    /// Dev-only tuning tail (appended last so existing offsets stay stable):
+    /// `[pulse_freq, veil_freq, pulse_gain, grain_gain]`. Release builds
+    /// always send [`DEFAULT_PULSE_FREQ`] et al; debug builds read the
+    /// process-wide tuning atomics (see [`set_pulse_freq`]).
+    pub tune: [f32; 4],
+}
+
+#[cfg(debug_assertions)]
+static PULSE_FREQ_BITS: AtomicU32 = AtomicU32::new(DEFAULT_PULSE_FREQ.to_bits());
+#[cfg(debug_assertions)]
+static VEIL_FREQ_BITS: AtomicU32 = AtomicU32::new(DEFAULT_VEIL_FREQ.to_bits());
+#[cfg(debug_assertions)]
+static PULSE_GAIN_BITS: AtomicU32 = AtomicU32::new(DEFAULT_PULSE_GAIN.to_bits());
+#[cfg(debug_assertions)]
+static GRAIN_GAIN_BITS: AtomicU32 = AtomicU32::new(DEFAULT_GRAIN_GAIN.to_bits());
+#[cfg(debug_assertions)]
+static TIME_SCALE_BITS: AtomicU32 = AtomicU32::new(DEFAULT_TIME_SCALE.to_bits());
+
+/// Current pulse frequency (rad/s). Release: always [`DEFAULT_PULSE_FREQ`].
+pub fn pulse_freq() -> f32 {
+    #[cfg(debug_assertions)]
+    {
+        f32::from_bits(PULSE_FREQ_BITS.load(Ordering::Relaxed))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        DEFAULT_PULSE_FREQ
+    }
+}
+
+/// Current veil frequency (rad/s). Release: always [`DEFAULT_VEIL_FREQ`].
+pub fn veil_freq() -> f32 {
+    #[cfg(debug_assertions)]
+    {
+        f32::from_bits(VEIL_FREQ_BITS.load(Ordering::Relaxed))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        DEFAULT_VEIL_FREQ
+    }
+}
+
+/// Current pulse gain scale. Release: always [`DEFAULT_PULSE_GAIN`].
+pub fn pulse_gain() -> f32 {
+    #[cfg(debug_assertions)]
+    {
+        f32::from_bits(PULSE_GAIN_BITS.load(Ordering::Relaxed))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        DEFAULT_PULSE_GAIN
+    }
+}
+
+/// Current grain gain scale. Release: always [`DEFAULT_GRAIN_GAIN`].
+pub fn grain_gain() -> f32 {
+    #[cfg(debug_assertions)]
+    {
+        f32::from_bits(GRAIN_GAIN_BITS.load(Ordering::Relaxed))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        DEFAULT_GRAIN_GAIN
+    }
+}
+
+/// Current CPU time advance multiplier. Release: always [`DEFAULT_TIME_SCALE`].
+pub fn time_scale() -> f32 {
+    #[cfg(debug_assertions)]
+    {
+        f32::from_bits(TIME_SCALE_BITS.load(Ordering::Relaxed))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        DEFAULT_TIME_SCALE
+    }
+}
+
+/// Per-frame ambient time advance (debug `time_scale` applied).
+pub fn ambient_tick_dt() -> f32 {
+    const DT: f32 = 1.0 / 60.0;
+    DT * time_scale()
+}
+
+/// True while any ambient tuning differs from the shipped defaults.
+#[cfg(debug_assertions)]
+pub fn tuning_active() -> bool {
+    pulse_freq() != DEFAULT_PULSE_FREQ
+        || veil_freq() != DEFAULT_VEIL_FREQ
+        || pulse_gain() != DEFAULT_PULSE_GAIN
+        || grain_gain() != DEFAULT_GRAIN_GAIN
+        || time_scale() != DEFAULT_TIME_SCALE
+}
+
+/// Debug-only setters (Diagnostics sliders; shell-local, never persisted).
+/// Values are clamped to the slider ranges.
+#[cfg(debug_assertions)]
+pub fn set_pulse_freq(v: f32) {
+    PULSE_FREQ_BITS.store(v.clamp(0.0, 5.0).to_bits(), Ordering::Relaxed);
+}
+#[cfg(debug_assertions)]
+pub fn set_veil_freq(v: f32) {
+    VEIL_FREQ_BITS.store(v.clamp(0.0, 8.0).to_bits(), Ordering::Relaxed);
+}
+#[cfg(debug_assertions)]
+pub fn set_pulse_gain(v: f32) {
+    PULSE_GAIN_BITS.store(v.clamp(0.0, 3.0).to_bits(), Ordering::Relaxed);
+}
+#[cfg(debug_assertions)]
+pub fn set_grain_gain(v: f32) {
+    GRAIN_GAIN_BITS.store(v.clamp(0.0, 5.0).to_bits(), Ordering::Relaxed);
+}
+#[cfg(debug_assertions)]
+pub fn set_time_scale(v: f32) {
+    TIME_SCALE_BITS.store(v.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
+}
+/// Restore shipped behavior (Diagnostics reset).
+#[cfg(debug_assertions)]
+pub fn reset_ambient_tuning() {
+    set_pulse_freq(DEFAULT_PULSE_FREQ);
+    set_veil_freq(DEFAULT_VEIL_FREQ);
+    set_pulse_gain(DEFAULT_PULSE_GAIN);
+    set_grain_gain(DEFAULT_GRAIN_GAIN);
+    set_time_scale(DEFAULT_TIME_SCALE);
+}
+
+/// Test lock for the process-wide tuning globals (see `notes/flaky-tests.md`):
+/// any debug test that mutates tuning must hold this while asserting, and
+/// tests that assert shipped-default visuals must hold it too. Release tests
+/// compile it to a pass-through (no tuning exists there).
+#[cfg(test)]
+pub(crate) fn with_tune_test_lock<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(debug_assertions)]
+    {
+        static TUNE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = TUNE_TEST_LOCK.lock().unwrap();
+        reset_ambient_tuning_for_test();
+        let result = f();
+        reset_ambient_tuning_for_test();
+        result
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        f()
+    }
+}
+#[cfg(all(test, debug_assertions))]
+fn reset_ambient_tuning_for_test() {
+    PULSE_FREQ_BITS.store(DEFAULT_PULSE_FREQ.to_bits(), Ordering::Relaxed);
+    VEIL_FREQ_BITS.store(DEFAULT_VEIL_FREQ.to_bits(), Ordering::Relaxed);
+    PULSE_GAIN_BITS.store(DEFAULT_PULSE_GAIN.to_bits(), Ordering::Relaxed);
+    GRAIN_GAIN_BITS.store(DEFAULT_GRAIN_GAIN.to_bits(), Ordering::Relaxed);
+    TIME_SCALE_BITS.store(DEFAULT_TIME_SCALE.to_bits(), Ordering::Relaxed);
 }
 
 impl AmbientUniforms {
@@ -41,6 +204,7 @@ impl AmbientUniforms {
             veil: veil.clamp(0.0, 1.0),
             aperture: aperture.clamp(0.0, 1.0),
             mask: [0.0; 4],
+            tune: [pulse_freq(), veil_freq(), pulse_gain(), grain_gain()],
         }
     }
 
@@ -242,8 +406,9 @@ mod tests {
 
     #[test]
     fn uniforms_size_matches_wgsl_layout() {
-        // 3 × vec4 colors + 4 × f32 + vec4 mask (16-byte aligned).
-        assert_eq!(std::mem::size_of::<AmbientUniforms>(), 80);
+        // 3 × vec4 colors + 4 × f32 + vec4 mask + vec4 dev-tune tail
+        // (16-byte aligned; the tail keeps existing field offsets stable).
+        assert_eq!(std::mem::size_of::<AmbientUniforms>(), 96);
     }
 
     #[test]
@@ -258,5 +423,44 @@ mod tests {
         assert_eq!(u.mask, [570.0, 300.0, 18.0, 0.0]);
         let square = AmbientUniforms::from_theme(0.0, 0.0, 0.0, 1.0).with_mask(&bounds, 2.0, -1.0);
         assert_eq!(square.mask[2], 0.0);
+    }
+
+    #[test]
+    fn tune_tail_defaults_reproduce_release() {
+        with_tune_test_lock(|| {
+            let u = AmbientUniforms::from_theme(0.0, 0.0, 0.0, 1.0);
+            assert_eq!(
+                u.tune,
+                [
+                    DEFAULT_PULSE_FREQ,
+                    DEFAULT_VEIL_FREQ,
+                    DEFAULT_PULSE_GAIN,
+                    DEFAULT_GRAIN_GAIN
+                ]
+            );
+            assert!((ambient_tick_dt() - 1.0 / 60.0).abs() < 1e-6);
+            #[cfg(debug_assertions)]
+            assert!(!tuning_active());
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn tune_setters_flow_into_uniforms_and_tick() {
+        with_tune_test_lock(|| {
+            set_pulse_freq(0.7);
+            set_veil_freq(1.1);
+            set_pulse_gain(2.0);
+            set_grain_gain(0.0);
+            set_time_scale(0.0);
+            assert!(tuning_active());
+            let u = AmbientUniforms::from_theme(0.0, 0.0, 0.0, 1.0);
+            assert_eq!(u.tune, [0.7, 1.1, 2.0, 0.0]);
+            // Frozen time scale stops the CPU clock (freeze toggle path).
+            assert!(ambient_tick_dt().abs() < 1e-6);
+            // Setters clamp to the Diagnostics slider ranges.
+            set_pulse_freq(99.0);
+            assert!((pulse_freq() - 5.0).abs() < 1e-6);
+        });
     }
 }

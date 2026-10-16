@@ -241,6 +241,46 @@ pub struct PendingEmulatorChange {
     pub tick: u32,
 }
 
+/// Debug-only ambient pulse + ken-burns tuning snapshot (Diagnostics tab).
+/// Shell-local only: never persisted, defaults (shipped visuals) at boot.
+/// Constructed from the shell's tuning fields on every view.
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Copy)]
+pub struct DebugAmbientTune {
+    /// Accent-bloom pulse frequency, rad/s (shipped 1.4).
+    pub pulse_freq: f32,
+    /// Veil pulse frequency, rad/s (shipped 3.2).
+    pub veil_freq: f32,
+    /// Pulse gain scale (shipped 1.0).
+    pub pulse_gain: f32,
+    /// Grain gain scale (shipped 1.0).
+    pub grain_gain: f32,
+    /// CPU time advance multiplier; 0 freezes the pulse (shipped 1.0).
+    pub time_scale: f32,
+    /// Ken-burns zoom-excursion multiplier (shipped 1.0).
+    pub kenburns_amp: f32,
+    /// Ken-burns pan-travel multiplier (shipped 1.0).
+    pub kenburns_pan: f32,
+    /// Ken-burns pose-clock speed; 0 freezes drift (shipped 1.0).
+    pub kenburns_speed: f32,
+}
+
+#[cfg(debug_assertions)]
+impl Default for DebugAmbientTune {
+    fn default() -> Self {
+        Self {
+            pulse_freq: crate::ui::shader::ambient::DEFAULT_PULSE_FREQ,
+            veil_freq: crate::ui::shader::ambient::DEFAULT_VEIL_FREQ,
+            pulse_gain: crate::ui::shader::ambient::DEFAULT_PULSE_GAIN,
+            grain_gain: crate::ui::shader::ambient::DEFAULT_GRAIN_GAIN,
+            time_scale: crate::ui::shader::ambient::DEFAULT_TIME_SCALE,
+            kenburns_amp: crate::ui::start::mode::DEFAULT_KENBURNS_AMP_SCALE,
+            kenburns_pan: crate::ui::start::mode::DEFAULT_KENBURNS_PAN_SCALE,
+            kenburns_speed: crate::ui::start::mode::DEFAULT_KENBURNS_SPEED,
+        }
+    }
+}
+
 /// Live DualSense / gamepad readings for the Pad input debug tab.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PadInputPanel {
@@ -350,6 +390,28 @@ pub enum ConfigureMessage {
     /// Shell-local only (never persisted); see Diagnostics.
     #[cfg(debug_assertions)]
     SetDebugLayoutBounds(bool),
+    /// Debug-only ambient tuning sliders (Diagnostics; shell-local, never
+    /// persisted). Ranges match the clamps in `ui::shader::ambient` /
+    /// `ui::start::mode`.
+    #[cfg(debug_assertions)]
+    SetDebugAmbientFreq(f32),
+    #[cfg(debug_assertions)]
+    SetDebugAmbientVeilFreq(f32),
+    #[cfg(debug_assertions)]
+    SetDebugAmbientGain(f32),
+    #[cfg(debug_assertions)]
+    SetDebugAmbientGrain(f32),
+    #[cfg(debug_assertions)]
+    SetDebugAmbientTimeScale(f32),
+    #[cfg(debug_assertions)]
+    SetDebugKenburnsAmp(f32),
+    #[cfg(debug_assertions)]
+    SetDebugKenburnsPan(f32),
+    #[cfg(debug_assertions)]
+    SetDebugKenburnsSpeed(f32),
+    /// Debug-only: restore shipped ambient + ken-burns behavior.
+    #[cfg(debug_assertions)]
+    ResetDebugAmbientTuning,
     /// Begin an OS window drag (title-bar press on the undecorated window).
     DragWindow,
     Close,
@@ -560,6 +622,9 @@ pub fn suggested_stop_percent(spectrum: &BatterySpectrum) -> u8 {
 // View
 // ---------------------------------------------------------------------------
 
+/// Debug-only params push `view` / `section_content` past the argument limit
+/// (same precedent as `immersive::view`); release stays under it.
+#[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     state: &'a ConfigureState,
     settings: &ConfigureSettings,
@@ -568,6 +633,7 @@ pub fn view<'a>(
     #[cfg(debug_assertions)] emulators: &'a [EmulatedPad],
     #[cfg(debug_assertions)] pending: &[PendingEmulatorChange],
     #[cfg(debug_assertions)] debug_layout_bounds: bool,
+    #[cfg(debug_assertions)] debug_tune: &DebugAmbientTune,
 ) -> Element<'a, ConfigureMessage> {
     // Section heading doubles as the drag handle for the undecorated window.
     let heading = mouse_area(
@@ -667,6 +733,7 @@ pub fn view<'a>(
                     emulators,
                     pending,
                     debug_layout_bounds,
+                    debug_tune,
                 ))
                 .into()
             }
@@ -997,6 +1064,7 @@ fn note<'a>(body: impl text::IntoFragment<'a>) -> Element<'a, ConfigureMessage> 
     text(body).size(12.0).color(theme::DIM).into()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn section_content<'a>(
     state: &'a ConfigureState,
     settings: &ConfigureSettings,
@@ -1005,6 +1073,7 @@ fn section_content<'a>(
     #[cfg(debug_assertions)] emulators: &'a [EmulatedPad],
     #[cfg(debug_assertions)] pending: &[PendingEmulatorChange],
     #[cfg(debug_assertions)] debug_layout_bounds: bool,
+    #[cfg(debug_assertions)] debug_tune: &DebugAmbientTune,
 ) -> Element<'a, ConfigureMessage> {
     match state.section {
         Section::System => system_settings_view(settings),
@@ -1016,12 +1085,15 @@ fn section_content<'a>(
         #[cfg(debug_assertions)]
         Section::Emulators => emulators_view(state, emulators, pending),
         #[cfg(debug_assertions)]
-        Section::Diagnostics => diagnostics_view(debug_layout_bounds),
+        Section::Diagnostics => diagnostics_view(debug_layout_bounds, debug_tune),
     }
 }
 
 #[cfg(debug_assertions)]
-fn diagnostics_view<'a>(debug_layout_bounds: bool) -> Element<'a, ConfigureMessage> {
+fn diagnostics_view<'a>(
+    debug_layout_bounds: bool,
+    tune: &DebugAmbientTune,
+) -> Element<'a, ConfigureMessage> {
     let stress = group(
         Some("Renderer stress test".to_string()),
         vec![
@@ -1049,7 +1121,136 @@ fn diagnostics_view<'a>(debug_layout_bounds: bool) -> Element<'a, ConfigureMessa
             ),
         ],
     );
-    column![stress, bounds].spacing(18).width(Fill).into()
+    let tuning = group(
+        Some("Ambient pulse + movement".to_string()),
+        vec![
+            note(
+                "Temporary tuning for the immersive background pulse and ken-burns drift. Debug-only: defaults reproduce release visuals, off at boot, never saved. Open immersive Start to see changes live (frames keep flowing while tuned, even with idle throttle on).",
+            ),
+            slider_row(
+                "Pulse speed",
+                freq_label(tune.pulse_freq),
+                slider(
+                    0.0..=5.0,
+                    tune.pulse_freq,
+                    ConfigureMessage::SetDebugAmbientFreq,
+                )
+                .step(0.05_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
+                "Veil pulse speed",
+                freq_label(tune.veil_freq),
+                slider(
+                    0.0..=8.0,
+                    tune.veil_freq,
+                    ConfigureMessage::SetDebugAmbientVeilFreq,
+                )
+                .step(0.05_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
+                "Pulse gain",
+                gain_label(tune.pulse_gain),
+                slider(
+                    0.0..=3.0,
+                    tune.pulse_gain,
+                    ConfigureMessage::SetDebugAmbientGain,
+                )
+                .step(0.05_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
+                "Grain",
+                gain_label(tune.grain_gain),
+                slider(
+                    0.0..=5.0,
+                    tune.grain_gain,
+                    ConfigureMessage::SetDebugAmbientGrain,
+                )
+                .step(0.05_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
+                "Time scale",
+                time_label(tune.time_scale),
+                slider(
+                    0.0..=4.0,
+                    tune.time_scale,
+                    ConfigureMessage::SetDebugAmbientTimeScale,
+                )
+                .step(0.05_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
+                "Zoom excursion",
+                gain_label(tune.kenburns_amp),
+                slider(
+                    0.0..=5.0,
+                    tune.kenburns_amp,
+                    ConfigureMessage::SetDebugKenburnsAmp,
+                )
+                .step(0.1_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
+                "Pan travel",
+                gain_label(tune.kenburns_pan),
+                slider(
+                    0.0..=5.0,
+                    tune.kenburns_pan,
+                    ConfigureMessage::SetDebugKenburnsPan,
+                )
+                .step(0.1_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
+                "Drift speed",
+                time_label(tune.kenburns_speed),
+                slider(
+                    0.0..=8.0,
+                    tune.kenburns_speed,
+                    ConfigureMessage::SetDebugKenburnsSpeed,
+                )
+                .step(0.1_f32)
+                .style(theme::slider),
+            ),
+            action_button(
+                "Reset ambient tuning",
+                ConfigureMessage::ResetDebugAmbientTuning,
+            ),
+        ],
+    );
+    column![stress, tuning, bounds]
+        .spacing(18)
+        .width(Fill)
+        .into()
+}
+
+/// Frequency label with its pulse period (what you actually see).
+#[cfg(debug_assertions)]
+fn freq_label(v: f32) -> String {
+    if v < 0.01 {
+        "frozen".to_string()
+    } else {
+        format!("{v:.2}/s · {:.1}s", std::f32::consts::TAU / v)
+    }
+}
+
+/// Plain multiplier label.
+#[cfg(debug_assertions)]
+fn gain_label(v: f32) -> String {
+    format!("{v:.2}×")
+}
+
+/// Multiplier label where 0 means frozen.
+#[cfg(debug_assertions)]
+fn time_label(v: f32) -> String {
+    if v < 0.01 {
+        "frozen".to_string()
+    } else {
+        format!("{v:.2}×")
+    }
 }
 
 fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
@@ -2390,8 +2591,15 @@ mod tests {
     fn diagnostics_view_builds_with_bounds_on_and_off() {
         // The layout-bounds toggle must compose in both states without
         // panicking; the flag itself stays shell-local (never persisted).
-        drop(super::diagnostics_view(false));
-        drop(super::diagnostics_view(true));
+        // Default tuning must also compose (and reproduce release visuals).
+        let tune = super::DebugAmbientTune::default();
+        drop(super::diagnostics_view(false, &tune));
+        drop(super::diagnostics_view(true, &tune));
+        let mut tuned = tune;
+        tuned.pulse_freq = 0.0;
+        tuned.time_scale = 0.0;
+        tuned.kenburns_amp = 5.0;
+        drop(super::diagnostics_view(false, &tuned));
     }
 
     #[test]

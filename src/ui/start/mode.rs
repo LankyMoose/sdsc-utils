@@ -1,5 +1,8 @@
 //! Pure start-screen presentation transitions (compact ↔ immersive) and dock focus.
 
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicU32, Ordering};
+
 /// Windowed launcher vs fullscreen console stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StartPresentation {
@@ -102,6 +105,104 @@ pub const BACKDROP_PAN_STAGE_X: f32 = 0.012;
 pub const BACKDROP_PAN_STAGE_Y: f32 = 0.035;
 /// Never spend more than this fraction of real Cover+zoom overflow (black-edge safety).
 pub const BACKDROP_PAN_OVERFLOW_CAP: f32 = 0.92;
+
+/// Dev-only ken-burns tuning defaults (multiplier of shipped behavior).
+pub const DEFAULT_KENBURNS_AMP_SCALE: f32 = 1.0;
+pub const DEFAULT_KENBURNS_PAN_SCALE: f32 = 1.0;
+/// Pose-clock speed multiplier (0 freezes drift).
+pub const DEFAULT_KENBURNS_SPEED: f32 = 1.0;
+
+#[cfg(debug_assertions)]
+static KENBURNS_AMP_BITS: AtomicU32 = AtomicU32::new(DEFAULT_KENBURNS_AMP_SCALE.to_bits());
+#[cfg(debug_assertions)]
+static KENBURNS_PAN_BITS: AtomicU32 = AtomicU32::new(DEFAULT_KENBURNS_PAN_SCALE.to_bits());
+#[cfg(debug_assertions)]
+static KENBURNS_SPEED_BITS: AtomicU32 = AtomicU32::new(DEFAULT_KENBURNS_SPEED.to_bits());
+
+/// Zoom-excursion multiplier. Release: always [`DEFAULT_KENBURNS_AMP_SCALE`].
+pub fn kenburns_amp_scale() -> f32 {
+    #[cfg(debug_assertions)]
+    {
+        f32::from_bits(KENBURNS_AMP_BITS.load(Ordering::Relaxed))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        DEFAULT_KENBURNS_AMP_SCALE
+    }
+}
+
+/// Pan-travel multiplier (still capped by overflow headroom, so no black
+/// edges). Release: always [`DEFAULT_KENBURNS_PAN_SCALE`].
+pub fn kenburns_pan_scale() -> f32 {
+    #[cfg(debug_assertions)]
+    {
+        f32::from_bits(KENBURNS_PAN_BITS.load(Ordering::Relaxed))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        DEFAULT_KENBURNS_PAN_SCALE
+    }
+}
+
+/// Pose-clock speed multiplier. Release: always [`DEFAULT_KENBURNS_SPEED`].
+pub fn kenburns_speed() -> f32 {
+    #[cfg(debug_assertions)]
+    {
+        f32::from_bits(KENBURNS_SPEED_BITS.load(Ordering::Relaxed))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        DEFAULT_KENBURNS_SPEED
+    }
+}
+
+/// True while any ken-burns tuning differs from the shipped defaults.
+#[cfg(debug_assertions)]
+pub fn kenburns_tuning_active() -> bool {
+    kenburns_amp_scale() != DEFAULT_KENBURNS_AMP_SCALE
+        || kenburns_pan_scale() != DEFAULT_KENBURNS_PAN_SCALE
+        || kenburns_speed() != DEFAULT_KENBURNS_SPEED
+}
+
+/// Debug-only setters (Diagnostics sliders; shell-local, never persisted).
+#[cfg(debug_assertions)]
+pub fn set_kenburns_amp_scale(v: f32) {
+    KENBURNS_AMP_BITS.store(v.clamp(0.0, 5.0).to_bits(), Ordering::Relaxed);
+}
+#[cfg(debug_assertions)]
+pub fn set_kenburns_pan_scale(v: f32) {
+    KENBURNS_PAN_BITS.store(v.clamp(0.0, 5.0).to_bits(), Ordering::Relaxed);
+}
+#[cfg(debug_assertions)]
+pub fn set_kenburns_speed(v: f32) {
+    KENBURNS_SPEED_BITS.store(v.clamp(0.0, 8.0).to_bits(), Ordering::Relaxed);
+}
+/// Restore shipped behavior (Diagnostics reset).
+#[cfg(debug_assertions)]
+pub fn reset_kenburns_tuning() {
+    set_kenburns_amp_scale(DEFAULT_KENBURNS_AMP_SCALE);
+    set_kenburns_pan_scale(DEFAULT_KENBURNS_PAN_SCALE);
+    set_kenburns_speed(DEFAULT_KENBURNS_SPEED);
+}
+
+/// Test lock for the process-wide ken-burns globals (see
+/// `notes/flaky-tests.md`). Release tests compile it to a pass-through.
+#[cfg(test)]
+pub(crate) fn with_pose_test_lock<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(debug_assertions)]
+    {
+        static POSE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = POSE_TEST_LOCK.lock().unwrap();
+        reset_kenburns_tuning();
+        let result = f();
+        reset_kenburns_tuning();
+        result
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        f()
+    }
+}
 
 impl TransitionPhase {
     pub fn duration_ms(self) -> u64 {
@@ -280,15 +381,16 @@ pub fn enter_art_fade_progress(elapsed_ms: u64) -> f32 {
 }
 
 fn backdrop_pose_theta(elapsed_ms: u64) -> f32 {
-    elapsed_ms as f32 / BACKDROP_ZOOM_PERIOD_MS as f32 * std::f32::consts::TAU
+    elapsed_ms as f32 / BACKDROP_ZOOM_PERIOD_MS as f32 * std::f32::consts::TAU * kenburns_speed()
 }
 
 /// Continuous ken-burns scale (always ≥ [`BACKDROP_SCALE_MIN`]).
 ///
 /// Starts at the zoom floor (centered pan) and eases out — `-cos` so velocity is 0 at t=0.
+/// Debug builds scale the excursion via [`kenburns_amp_scale`] (1.0 = shipped).
 pub fn backdrop_pose_scale(elapsed_ms: u64) -> f32 {
     let wave = -backdrop_pose_theta(elapsed_ms).cos();
-    (BACKDROP_SCALE_BASE + BACKDROP_SCALE_AMP * wave).max(BACKDROP_SCALE_MIN)
+    (BACKDROP_SCALE_BASE + BACKDROP_SCALE_AMP * kenburns_amp_scale() * wave).max(BACKDROP_SCALE_MIN)
 }
 
 /// Normalized pan offsets in `[-1, 1]`, locked to the zoom period.
@@ -314,8 +416,10 @@ pub fn backdrop_pose_pixels(
 ) -> (f32, f32) {
     let avail_x = (drawn_w - stage_w).max(0.0) * 0.5 * BACKDROP_PAN_OVERFLOW_CAP;
     let avail_y = (drawn_h - stage_h).max(0.0) * 0.5 * BACKDROP_PAN_OVERFLOW_CAP;
-    let headroom_x = (stage_w * BACKDROP_PAN_STAGE_X).min(avail_x);
-    let headroom_y = (stage_h * BACKDROP_PAN_STAGE_Y).min(avail_y);
+    // Debug builds scale travel via [`kenburns_pan_scale`] (1.0 = shipped);
+    // the overflow cap still applies, so boosted pan can never show edges.
+    let headroom_x = (stage_w * BACKDROP_PAN_STAGE_X * kenburns_pan_scale()).min(avail_x);
+    let headroom_y = (stage_h * BACKDROP_PAN_STAGE_Y * kenburns_pan_scale()).min(avail_y);
     (
         ox_norm.clamp(-1.0, 1.0) * headroom_x,
         oy_norm.clamp(-1.0, 1.0) * headroom_y,
@@ -531,6 +635,12 @@ mod tests {
 
     #[test]
     fn backdrop_pose_helpers() {
+        with_pose_test_lock(|| {
+            backdrop_pose_helpers_inner();
+        });
+    }
+
+    fn backdrop_pose_helpers_inner() {
         const {
             assert!(BACKDROP_SCALE_MIN >= 1.0);
             assert!(BACKDROP_SCALE_BASE - BACKDROP_SCALE_AMP <= BACKDROP_SCALE_MIN + 0.001);
@@ -565,6 +675,41 @@ mod tests {
         const {
             assert!(BACKDROP_PAN_STAGE_X < BACKDROP_PAN_STAGE_Y);
         }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn kenburns_tuning_scales_pose_without_breaking_safety() {
+        with_pose_test_lock(|| {
+            assert!(!kenburns_tuning_active());
+            // Amp 0 parks zoom at base; the min floor still holds.
+            set_kenburns_amp_scale(0.0);
+            assert!(kenburns_tuning_active());
+            let half = BACKDROP_ZOOM_PERIOD_MS / 2;
+            assert!((backdrop_pose_scale(half) - BACKDROP_SCALE_BASE).abs() < 0.001);
+            assert!(backdrop_pose_scale(half) >= BACKDROP_SCALE_MIN);
+            // Amp 5x widens the excursion around the same base.
+            set_kenburns_amp_scale(5.0);
+            let peak = BACKDROP_SCALE_BASE + BACKDROP_SCALE_AMP * 5.0;
+            assert!((backdrop_pose_scale(half) - peak).abs() < 0.001);
+            // Pan 0 freezes travel; boosted pan still respects overflow caps.
+            set_kenburns_pan_scale(0.0);
+            assert_eq!(
+                backdrop_pose_pixels(1.0, -1.0, 220.0, 110.0, 200.0, 100.0),
+                (0.0, 0.0)
+            );
+            set_kenburns_pan_scale(5.0);
+            let (px, _) = backdrop_pose_pixels(1.0, 0.0, 800.0, 110.0, 200.0, 100.0);
+            let avail = (800.0 - 200.0) * 0.5 * BACKDROP_PAN_OVERFLOW_CAP;
+            assert!(px <= avail + 0.001);
+            assert!(px > 200.0 * BACKDROP_PAN_STAGE_X);
+            // Speed 0 freezes the pose clock; 2x reaches the quarter turn early.
+            set_kenburns_speed(0.0);
+            assert_eq!(backdrop_pose_offset(half), backdrop_pose_offset(0));
+            set_kenburns_speed(2.0);
+            let (x1, _) = backdrop_pose_offset(BACKDROP_ZOOM_PERIOD_MS / 8);
+            assert!(x1 > 0.9);
+        });
     }
 
     #[test]
