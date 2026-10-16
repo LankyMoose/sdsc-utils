@@ -693,6 +693,7 @@ fn handle_command(
         ShellCommand::SetStartSelection {
             game_key,
             controller_key,
+            game_index,
         } => {
             // In-memory only for the service process lifetime — never persisted.
             // Folded into the retained snapshot (no separate echo: the
@@ -701,6 +702,7 @@ fn handle_command(
             session.remember_start_selection(StartSelection {
                 game_key,
                 controller_key,
+                game_index,
             });
             Ok(LoopControl::Continue)
         }

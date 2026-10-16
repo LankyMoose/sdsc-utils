@@ -45,6 +45,10 @@ pub struct RestartUiState {
     pub game_key: Option<String>,
     #[serde(default)]
     pub controller_key: Option<String>,
+    /// Selected game row index at capture (by-position restore only; there is
+    /// no controller index — controller persistence is out of scope).
+    #[serde(default)]
+    pub game_index: Option<usize>,
     /// Tracked list offsets (games / controllers / settings drawer).
     #[serde(default)]
     pub games_scroll_y: f32,
@@ -132,6 +136,7 @@ mod tests {
             start_on_controllers: true,
             game_key: Some("steam:440".into()),
             controller_key: None,
+            game_index: Some(2),
             games_scroll_y: 220.0,
             controllers_scroll_y: 0.0,
             settings_scroll_y: 42.0,
@@ -153,6 +158,7 @@ mod tests {
         assert!(decoded.start_immersive);
         assert!(decoded.start_on_controllers);
         assert_eq!(decoded.game_key.as_deref(), Some("steam:440"));
+        assert_eq!(decoded.game_index, Some(2));
         assert!((decoded.games_scroll_y - 220.0).abs() < f32::EPSILON);
         assert_eq!(decoded.settings_focus, 3);
         assert!((decoded.configure_scroll_y - 120.0).abs() < f32::EPSILON);
@@ -163,6 +169,7 @@ mod tests {
         let decoded: RestartUiState = serde_json::from_str(r#"{"saved_at_ms":1000}"#).unwrap();
         assert!(!decoded.start_visible);
         assert!(decoded.game_key.is_none());
+        assert!(decoded.game_index.is_none());
         assert!(!decoded.settings_open);
         assert!(!decoded.configure_open);
         assert!(!decoded.popup_open);

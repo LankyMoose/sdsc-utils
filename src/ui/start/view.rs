@@ -6,6 +6,7 @@ use crate::games::GameEntry;
 use crate::games::steam::SteamGame;
 use crate::persist::prefs::{
     GamesSortMode, ImmersiveLayout, NavbarVisibility, ReducedMotion, StartAutoOpen,
+    StartSelectionMode,
 };
 use crate::ui::color::BatterySpectrum;
 use crate::ui::layout as window_layout;
@@ -128,6 +129,9 @@ pub enum StartMessage {
     ToggleLayoutMenu,
     ToggleNavbarMenu,
     ToggleReducedMotionMenu,
+    ToggleSelectionModeMenu,
+    SetSelectionPersist(bool),
+    SetSelectionMode(StartSelectionMode),
     SetAlwaysImmersive(bool),
     SetClock(bool),
     SetImmersiveLayout(ImmersiveLayout),
@@ -1563,22 +1567,51 @@ impl State {
 
     /// Resolve service-stored keys to indices after a shell restart.
     ///
-    /// `None` keys leave that axis untouched; unknown keys (or empty lists)
-    /// fall back to 0. Returns true when an index moved.
+    /// Game axis honors the persistence prefs; the controller axis is never
+    /// gated (controller persistence is out of scope):
+    /// - `persist_enabled == false` → game axis is a no-op (keeps the clamped
+    ///   index; callers additionally skip report + scan re-pin).
+    /// - [`StartSelectionMode::ByGame`] → current key lookup (unknown → 0).
+    /// - [`StartSelectionMode::ByPosition`] → `index.min(len - 1)` clamp;
+    ///   missing index keeps the clamped index, never 0.
+    ///
+    /// `None` keys leave that axis untouched. Returns true when an index moved.
     pub fn resolve_start_selection(
         &mut self,
         game_key: Option<&str>,
         controller_key: Option<&str>,
+        persist_enabled: bool,
+        selection_mode: StartSelectionMode,
+        game_index: Option<usize>,
     ) -> bool {
         let mut changed = false;
-        if let Some(key) = game_key {
-            let index = if self.rows.is_empty() {
-                0
-            } else {
-                self.rows
-                    .iter()
-                    .position(|r| r.play_key == key)
-                    .unwrap_or(0)
+        if persist_enabled {
+            let index = match selection_mode {
+                StartSelectionMode::ByGame => {
+                    if let Some(key) = game_key {
+                        if self.rows.is_empty() {
+                            0
+                        } else {
+                            self.rows
+                                .iter()
+                                .position(|r| r.play_key == key)
+                                .unwrap_or(0)
+                        }
+                    } else {
+                        // No key: axis untouched.
+                        self.game_selected
+                    }
+                }
+                StartSelectionMode::ByPosition => {
+                    if self.rows.is_empty() {
+                        0
+                    } else if let Some(i) = game_index {
+                        i.min(self.rows.len() - 1)
+                    } else {
+                        // No index: keep the clamped position, never 0.
+                        self.game_selected.min(self.rows.len() - 1)
+                    }
+                }
             };
             if index != self.game_selected {
                 self.game_selected = index;
@@ -6742,11 +6775,23 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(state.resolve_start_selection(Some("steam:3"), Some("bb")));
+        assert!(state.resolve_start_selection(
+            Some("steam:3"),
+            Some("bb"),
+            true,
+            StartSelectionMode::ByGame,
+            None,
+        ));
         assert_eq!(state.game_selected, 2);
         assert_eq!(state.controller_selected, 1);
         // Resolving the same keys again is a no-op.
-        assert!(!state.resolve_start_selection(Some("steam:3"), Some("bb")));
+        assert!(!state.resolve_start_selection(
+            Some("steam:3"),
+            Some("bb"),
+            true,
+            StartSelectionMode::ByGame,
+            None,
+        ));
     }
 
     #[test]
@@ -6758,7 +6803,13 @@ mod tests {
             ..Default::default()
         };
         // Unknown game key (uninstalled since the service stored it).
-        assert!(state.resolve_start_selection(Some("steam:gone"), None));
+        assert!(state.resolve_start_selection(
+            Some("steam:gone"),
+            None,
+            true,
+            StartSelectionMode::ByGame,
+            None,
+        ));
         assert_eq!(state.game_selected, 0);
         assert_eq!(state.controller_selected, 0);
         // Unknown controller serial.
@@ -6768,7 +6819,13 @@ mod tests {
             controller_row_with("bb", true),
         ];
         state.controller_selected = 1;
-        assert!(state.resolve_start_selection(None, Some("zz")));
+        assert!(state.resolve_start_selection(
+            None,
+            Some("zz"),
+            true,
+            StartSelectionMode::ByGame,
+            None,
+        ));
         assert_eq!(state.controller_selected, 0);
     }
 
@@ -6784,11 +6841,19 @@ mod tests {
             controller_selected: 1,
             ..Default::default()
         };
-        assert!(!state.resolve_start_selection(None, None));
+        assert!(
+            !state.resolve_start_selection(None, None, true, StartSelectionMode::ByGame, None,)
+        );
         assert_eq!(state.game_selected, 1);
         assert_eq!(state.controller_selected, 1);
         // One axis only.
-        assert!(state.resolve_start_selection(Some("steam:1"), None));
+        assert!(state.resolve_start_selection(
+            Some("steam:1"),
+            None,
+            true,
+            StartSelectionMode::ByGame,
+            None,
+        ));
         assert_eq!(state.game_selected, 0);
         assert_eq!(state.controller_selected, 1);
     }
@@ -6796,9 +6861,89 @@ mod tests {
     #[test]
     fn resolve_start_selection_empty_lists_stay_zero() {
         let mut state = State::default();
-        assert!(!state.resolve_start_selection(Some("steam:1"), Some("aa")));
+        assert!(!state.resolve_start_selection(
+            Some("steam:1"),
+            Some("aa"),
+            true,
+            StartSelectionMode::ByGame,
+            None,
+        ));
         assert_eq!(state.game_selected, 0);
         assert_eq!(state.controller_selected, 0);
+    }
+
+    #[test]
+    fn resolve_start_selection_disabled_leaves_game_axis_untouched() {
+        let mut state = State {
+            rows: vec![game_row_with("steam:1"), game_row_with("steam:2")],
+            controllers: vec![
+                controller_row_with("aa", true),
+                controller_row_with("bb", true),
+            ],
+            game_selected: 1,
+            ..Default::default()
+        };
+        // Disabled: game key + index are ignored (clamped index kept)…
+        assert!(!state.resolve_start_selection(
+            Some("steam:1"),
+            None,
+            false,
+            StartSelectionMode::ByGame,
+            Some(0),
+        ));
+        assert_eq!(state.game_selected, 1);
+        // …while the controller axis still resolves (never gated).
+        assert!(state.resolve_start_selection(
+            Some("steam:1"),
+            Some("bb"),
+            false,
+            StartSelectionMode::ByGame,
+            Some(0),
+        ));
+        assert_eq!(state.game_selected, 1);
+        assert_eq!(state.controller_selected, 1);
+    }
+
+    #[test]
+    fn resolve_start_selection_by_position_clamps() {
+        let mut state = State {
+            rows: vec![
+                game_row_with("steam:1"),
+                game_row_with("steam:2"),
+                game_row_with("steam:3"),
+            ],
+            controllers: vec![controller_row_with("aa", true)],
+            ..Default::default()
+        };
+        // Stored index restores directly, ignoring the key.
+        assert!(state.resolve_start_selection(
+            Some("steam:1"),
+            None,
+            true,
+            StartSelectionMode::ByPosition,
+            Some(2),
+        ));
+        assert_eq!(state.game_selected, 2);
+        // Out-of-range index clamps to the last row.
+        state.game_selected = 0;
+        assert!(state.resolve_start_selection(
+            None,
+            None,
+            true,
+            StartSelectionMode::ByPosition,
+            Some(99),
+        ));
+        assert_eq!(state.game_selected, 2);
+        // …while a missing index keeps the clamped position, never 0.
+        state.game_selected = 1;
+        assert!(!state.resolve_start_selection(
+            Some("steam:gone"),
+            None,
+            true,
+            StartSelectionMode::ByPosition,
+            None,
+        ));
+        assert_eq!(state.game_selected, 1);
     }
 
     #[test]

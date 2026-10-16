@@ -16,6 +16,7 @@ The service is the sole owner of `DeviceSession` truth (live pads, remembered pa
 ## IPC discipline (no cross-version shims)
 
 - `IPC_PROTOCOL_VERSION` (`src/ipc/mod.rs`): bump on any breaking change. First frame on every connection must be `GetVersion`; anything else is dropped unregistered. Shell handshakes on boot (seeding the command client) and every reconnect, quitting (exit 3) on mismatch or dead service. Service sweeps pre-spawn stragglers with `Shutdown` at startup (kills ≤1.6.1 shells), never respawns code-3 shells, backs off on rapid exits.
+- v2 (game-selection persistence): `SetStartSelection` carries `game_index` (by-position restore; no controller index — the controller axis is out of scope) and prefs carry `start_selection_persist` (default on) + `start_selection_mode` (`by_game` default). Game-axis resolve honors both; disabled skips report + scan re-pin.
 - Newcomer watermark advances only past reached transports (a dropped probe can't steal a latched `OpenStart`).
 - User-data compat (`#[serde(default)]` prefs/known/analytics JSON) is fully supported — that is the compat that matters.
 

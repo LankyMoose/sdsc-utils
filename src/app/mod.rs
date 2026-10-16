@@ -27,10 +27,10 @@ use crate::persist::analytics::{self, AnalyticsStore};
 use crate::persist::notify::NotifyEvent;
 use crate::persist::paths;
 use crate::persist::prefs::{
-    NavbarVisibility, Prefs, ReducedMotion, StartAutoOpen, clamp_low_battery_percent,
-    clamp_start_screen_haptics_strength, clamp_start_screen_idle_timeouts,
-    clamp_start_screen_inactive_dim_percent, clamp_start_screen_sound_volume,
-    renderer_restart_needed,
+    NavbarVisibility, Prefs, ReducedMotion, StartAutoOpen, StartSelectionMode,
+    clamp_low_battery_percent, clamp_start_screen_haptics_strength,
+    clamp_start_screen_idle_timeouts, clamp_start_screen_inactive_dim_percent,
+    clamp_start_screen_sound_volume, renderer_restart_needed,
 };
 use crate::platform::app_log;
 #[cfg(windows)]
@@ -2203,31 +2203,47 @@ impl App {
     }
 
     /// Apply a service-stored selection to the start lists (keys → indices).
-    /// Returns true when an index moved.
+    /// Game-axis resolve honors the persistence prefs; the controller axis is
+    /// never gated. Returns true when an index moved.
     fn apply_start_selection(&mut self, selection: &crate::session::StartSelection) -> bool {
         self.start_selection_shadow = Some(selection.clone());
         self.start_state.resolve_start_selection(
             selection.game_key.as_deref(),
             selection.controller_key.as_deref(),
+            self.session.prefs.start_selection_persist,
+            self.session.prefs.start_selection_mode,
+            selection.game_index,
         )
     }
 
     /// Report a selection change to the service (client mode, Start visible).
     /// Close resets indices via `reset_to_games` after hiding, so those never report.
+    ///
+    /// Game axis only reports while persistence is on: with it off the
+    /// shadowed game values are re-sent (never cleared), so a game-only nav
+    /// change is a no-op send while controller changes still report.
     fn report_start_selection_changed(
         &mut self,
         game_key: &Option<String>,
         controller_key: &Option<String>,
+        game_index: Option<usize>,
     ) {
         if !self.client_mode || !self.start_visible {
             return;
         }
+        let (game_key, game_index) = if self.session.prefs.start_selection_persist {
+            (game_key.clone(), game_index)
+        } else {
+            let shadow = self.start_selection_shadow.clone().unwrap_or_default();
+            (shadow.game_key, shadow.game_index)
+        };
         if game_key.is_none() && controller_key.is_none() {
             return;
         }
         let selection = crate::session::StartSelection {
-            game_key: game_key.clone(),
+            game_key,
             controller_key: controller_key.clone(),
+            game_index,
         };
         if self.start_selection_shadow.as_ref() == Some(&selection) {
             return;
@@ -2240,6 +2256,7 @@ impl App {
         let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetStartSelection {
             game_key: shadow.game_key,
             controller_key: shadow.controller_key,
+            game_index: shadow.game_index,
         });
     }
 
@@ -2491,6 +2508,8 @@ impl App {
             lightbar_enabled: self.session.prefs.lightbar_enabled,
             start_screen_enabled: self.session.prefs.start_screen_enabled,
             start_screen_auto_open: self.session.prefs.start_screen_auto_open,
+            start_selection_persist: self.session.prefs.start_selection_persist,
+            start_selection_mode: self.session.prefs.start_selection_mode,
             start_screen_always_immersive: self.session.prefs.start_screen_always_immersive,
             start_screen_immersive_layout: self.session.prefs.start_screen_immersive_layout,
             start_screen_clock_enabled: self.session.prefs.start_screen_clock_enabled,
@@ -2673,6 +2692,10 @@ impl App {
             ConfigureMessage::SetStartScreenAutoOpen(enabled) => {
                 self.apply_start_screen_auto_open(enabled)
             }
+            ConfigureMessage::SetSelectionPersist(enabled) => {
+                self.apply_start_selection_persist(enabled)
+            }
+            ConfigureMessage::SetSelectionMode(mode) => self.apply_start_selection_mode(mode),
             ConfigureMessage::SetStartScreenAlwaysImmersive(enabled) => {
                 self.apply_start_screen_always_immersive(enabled)
             }
@@ -3417,8 +3440,13 @@ impl App {
             self.start_state
                 .select_game_by_play_key_or_keep(edit_pin.as_deref());
         } else if let Some(selection) = self.start_selection_shadow.clone() {
-            self.start_state
-                .resolve_start_selection(selection.game_key.as_deref(), None);
+            self.start_state.resolve_start_selection(
+                selection.game_key.as_deref(),
+                None,
+                self.session.prefs.start_selection_persist,
+                self.session.prefs.start_selection_mode,
+                selection.game_index,
+            );
         }
     }
 
@@ -3584,9 +3612,16 @@ impl App {
         }
         self.start_state.set_controllers(rows);
         // Keep a restored selection pinned to its pad across membership changes.
+        // Controller axis only (never gated by the game-axis persist pref):
+        // the game axis resolves as disabled so it stays untouched.
         if let Some(selection) = self.start_selection_shadow.clone() {
-            self.start_state
-                .resolve_start_selection(None, selection.controller_key.as_deref());
+            self.start_state.resolve_start_selection(
+                None,
+                selection.controller_key.as_deref(),
+                false,
+                StartSelectionMode::ByGame,
+                None,
+            );
         }
     }
 
@@ -3907,6 +3942,7 @@ impl App {
         let mut task = self.prepare_immersive_library_task();
         if self.start_visible
             && !self.start_selection_dirty
+            && self.session.prefs.start_selection_persist
             && self
                 .scroll_restore_until
                 .is_some_and(|until| Instant::now() < until)
@@ -4100,6 +4136,8 @@ impl App {
     fn start_settings_snapshot(&self) -> crate::ui::start::settings::StartSettingsSnapshot {
         crate::ui::start::settings::StartSettingsSnapshot {
             auto_open: self.session.prefs.start_screen_auto_open,
+            selection_persist: self.session.prefs.start_selection_persist,
+            selection_mode: self.session.prefs.start_selection_mode,
             always_immersive: self.session.prefs.start_screen_always_immersive,
             clock_enabled: self.session.prefs.start_screen_clock_enabled,
             immersive_layout: self.session.prefs.start_screen_immersive_layout,
@@ -4299,6 +4337,7 @@ impl App {
                 .rows
                 .get(self.start_state.game_selected)
                 .map(|r| r.play_key.clone()),
+            game_index: Some(self.start_state.game_selected),
             controller_key: self
                 .start_state
                 .controllers
@@ -4353,6 +4392,7 @@ impl App {
                 self.start_selection_shadow = Some(crate::session::StartSelection {
                     game_key: rs.game_key,
                     controller_key: rs.controller_key,
+                    game_index: rs.game_index,
                 });
             }
             // Reopen the pre-restart presentation (a manually promoted
@@ -4491,6 +4531,31 @@ impl App {
         self.apply_session_effects(effects)
     }
 
+    /// Game-axis selection persistence master switch (drawer toggle +
+    /// Configure toggle share this path). Turning it off stops reports and
+    /// re-pins; turning it on re-pins from the shadow on the next rebuild.
+    fn apply_start_selection_persist(&mut self, enabled: bool) -> Task<Message> {
+        if self.session.prefs.start_selection_persist == enabled {
+            return Task::none();
+        }
+        self.session.prefs.start_selection_persist = enabled;
+        self.save_prefs();
+        Task::none()
+    }
+
+    /// Game-axis restore mode (drawer dropdown + Configure pick-list share
+    /// this path). Picking from the menu collapses it, even when re-picking
+    /// the current value.
+    fn apply_start_selection_mode(&mut self, mode: StartSelectionMode) -> Task<Message> {
+        self.start_state.settings.close_menus();
+        if self.session.prefs.start_selection_mode == mode {
+            return Task::none();
+        }
+        self.session.prefs.start_selection_mode = mode;
+        self.save_prefs();
+        Task::none()
+    }
+
     fn apply_start_screen_sounds(&mut self, enabled: bool) -> Task<Message> {
         self.session.prefs.start_screen_sounds_enabled = enabled;
         self.save_prefs();
@@ -4588,6 +4653,9 @@ impl App {
             && self.start_state.resolve_start_selection(
                 selection.game_key.as_deref(),
                 selection.controller_key.as_deref(),
+                self.session.prefs.start_selection_persist,
+                self.session.prefs.start_selection_mode,
+                selection.game_index,
             )
         {
             restored_art = self.warm_start_art_task();
@@ -5427,12 +5495,14 @@ impl App {
             self.start_state.selected_controller_key(),
         );
         let task = self.on_start_message_inner(message);
-        let after = (
-            self.start_state.selected_game_key(),
-            self.start_state.selected_controller_key(),
-        );
-        if after != before {
-            self.report_start_selection_changed(&after.0, &after.1);
+        let after_game = self.start_state.selected_game_key();
+        let after_controller = self.start_state.selected_controller_key();
+        if after_game != before.0 || after_controller != before.1 {
+            self.report_start_selection_changed(
+                &after_game,
+                &after_controller,
+                Some(self.start_state.game_selected),
+            );
         }
         task
     }
@@ -5780,6 +5850,12 @@ impl App {
                 Task::none()
             }
             StartMessage::SetAutoOpen(mode) => self.apply_start_screen_auto_open(mode),
+            StartMessage::SetSelectionPersist(enabled) => {
+                self.apply_start_selection_persist(enabled)
+            }
+            StartMessage::SetSelectionMode(mode) => self.apply_start_selection_mode(mode),
+            StartMessage::ToggleSelectionModeMenu => self
+                .toggle_start_selector_menu(crate::ui::start::settings::SettingsRow::SelectionMode),
             StartMessage::ToggleAutoOpenMenu => {
                 self.toggle_start_selector_menu(crate::ui::start::settings::SettingsRow::AutoOpen)
             }

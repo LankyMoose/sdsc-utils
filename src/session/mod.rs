@@ -32,12 +32,18 @@ pub const MIN_CONNECT_STRETCH: Duration = Duration::from_secs(2);
 /// Start-screen selection owned in memory by the service process.
 ///
 /// Stable keys (never indices): game rows resolve via `play_key`, controller
-/// rows via pad serial. Survives shell restarts, dies with the service, and is
-/// never written to disk.
+/// rows via pad serial. `game_index` is the game-axis row position at report
+/// time, used only when the `by_position` selection mode is on (clamped to
+/// `index.min(len - 1)`; missing keeps the clamped index, never 0). There is
+/// deliberately no `controller_index`: controller persistence is out of
+/// scope. Survives shell restarts, dies with the service, and is never
+/// written to disk.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartSelection {
     pub game_key: Option<String>,
     pub controller_key: Option<String>,
+    #[serde(default)]
+    pub game_index: Option<usize>,
 }
 
 /// Retained service→shell state: one message, one revision.
@@ -841,6 +847,7 @@ mod tests {
         assert_eq!(session.start_selection, StartSelection::default());
         assert_eq!(session.start_selection.game_key, None);
         assert_eq!(session.start_selection.controller_key, None);
+        assert_eq!(session.start_selection.game_index, None);
     }
 
     #[test]
@@ -849,6 +856,7 @@ mod tests {
         session.remember_start_selection(StartSelection {
             game_key: Some("steam:440".to_string()),
             controller_key: Some("pad-a".to_string()),
+            game_index: Some(2),
         });
         assert_eq!(
             session.start_selection.game_key.as_deref(),
@@ -858,15 +866,18 @@ mod tests {
             session.start_selection.controller_key.as_deref(),
             Some("pad-a")
         );
+        assert_eq!(session.start_selection.game_index, Some(2));
         session.remember_start_selection(StartSelection {
             game_key: Some("manual:xyz".to_string()),
             controller_key: None,
+            game_index: None,
         });
         assert_eq!(
             session.start_selection.game_key.as_deref(),
             Some("manual:xyz")
         );
         assert_eq!(session.start_selection.controller_key, None);
+        assert_eq!(session.start_selection.game_index, None);
     }
 
     /// Regression for the 2026-10-14 incident (shell showed a stale remembered
@@ -934,6 +945,7 @@ mod tests {
         session.remember_start_selection(StartSelection {
             game_key: Some("steam:440".to_string()),
             controller_key: None,
+            game_index: Some(1),
         });
         assert!(session.snapshot_rev() > rev0);
         assert_eq!(
@@ -945,6 +957,7 @@ mod tests {
         session.remember_start_selection(StartSelection {
             game_key: Some("steam:440".to_string()),
             controller_key: None,
+            game_index: Some(1),
         });
         assert_eq!(session.snapshot_rev(), rev1);
 
