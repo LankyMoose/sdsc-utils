@@ -1231,6 +1231,17 @@ impl State {
                 let sections = games_row_sections(self);
                 let row_top = self.game_selected as f32 * (ROW_HEIGHT + ROW_GAP)
                     + separator_offset_above(&sections, self.game_selected);
+                // Scrolling up (or either way) to a row that opens its section
+                // must also bring the section title into view — pin to the
+                // header top, not the row top (navigating back to the first row
+                // otherwise strands its header above the viewport).
+                let reveal_top = if matches!(direction, ScrollReveal::Up | ScrollReveal::Either)
+                    && is_section_start(&sections, self.game_selected)
+                {
+                    header_top_for_row(&sections, self.game_selected)
+                } else {
+                    row_top
+                };
                 let viewport = self.scrolls.viewport(StartListId::Games);
                 let viewport = if viewport <= 1.0 {
                     estimated_list_viewport_h()
@@ -1238,8 +1249,8 @@ impl State {
                     viewport
                 };
                 let y = scroll_y_to_reveal_bounds(
-                    row_top,
-                    ROW_HEIGHT,
+                    reveal_top,
+                    row_top - reveal_top + ROW_HEIGHT,
                     self.scrolls.offset(StartListId::Games),
                     viewport,
                     direction,
@@ -1328,7 +1339,9 @@ impl State {
             return 0.0;
         }
         let sections = games_row_sections(self);
-        let seps = sections.windows(2).filter(|w| w[0] != w[1]).count();
+        let between = sections.windows(2).filter(|w| w[0] != w[1]).count();
+        // One header per section: the first row's header plus one per change.
+        let seps = between + 1;
         let content = rows as f32 * ROW_HEIGHT
             + seps as f32 * SECTION_SEP_H
             + rows.saturating_add(seps).saturating_sub(1) as f32 * ROW_GAP;
@@ -3720,8 +3733,9 @@ pub fn scroll_y_to_reveal_bounds(
 
 /// Approximate list viewport when iced has not reported bounds yet.
 fn estimated_list_viewport_h() -> f32 {
-    // Window minus vertical chrome: pads, header, rule, column gaps, footer.
-    (HEIGHT - 2.0 * PAD_Y - HEADER_HEIGHT - 1.0 - 30.0 - FOOTER_HEIGHT).max(120.0)
+    // Window minus vertical chrome: pads, header, rule, column gaps, footer,
+    // and the pinned sticky section title above the games list.
+    (HEIGHT - 2.0 * PAD_Y - HEADER_HEIGHT - 1.0 - 30.0 - FOOTER_HEIGHT - SECTION_SEP_H).max(120.0)
 }
 
 /// Center a row at known content `row_top` in the viewport.
@@ -4493,23 +4507,66 @@ fn games_row_sections(state: &State) -> Vec<usize> {
 }
 
 /// Extra stacked height above row `index` from section separators: one
-/// [`SECTION_SEP_H`] block (+ column gap) per section change at or before it.
-/// Separators render *between* sections only, so the first row never shifts.
+/// [`SECTION_SEP_H`] block (+ column gap) per section header at or before it.
+/// Every section opens with a header — including the first — so the first row
+/// already sits below one separator.
 fn separator_offset_above(sections: &[usize], index: usize) -> f32 {
+    if sections.is_empty() {
+        return 0.0;
+    }
     let end = index.min(sections.len().saturating_sub(1));
-    let mut changes = 0;
+    let mut headers = 1;
     for j in 1..=end {
         if sections[j] != sections[j - 1] {
-            changes += 1;
+            headers += 1;
         }
     }
-    changes as f32 * (SECTION_SEP_H + ROW_GAP)
+    headers as f32 * (SECTION_SEP_H + ROW_GAP)
+}
+
+/// True when row `index` opens its section (always true for the first row).
+fn is_section_start(sections: &[usize], index: usize) -> bool {
+    match sections.get(index) {
+        None => false,
+        Some(section) => index == 0 || sections.get(index - 1) != Some(section),
+    }
+}
+
+/// Content y of the header that opens the section of row `index`
+/// (the row sits one [`SECTION_SEP_H`] block + gap below it).
+fn header_top_for_row(sections: &[usize], index: usize) -> f32 {
+    let row_top = index as f32 * (ROW_HEIGHT + ROW_GAP) + separator_offset_above(sections, index);
+    (row_top - (SECTION_SEP_H + ROW_GAP)).max(0.0)
+}
+
+/// Section pinned at the top of the viewport for `offset_y`: the last section
+/// whose header starts at or above the offset. The pinned bar shows this
+/// section until the next section's header reaches the top and supersedes it;
+/// the stuck section's in-list header keeps its layout slot but renders blank
+/// so the label never doubles.
+fn sticky_section_for_offset(sections: &[usize], offset_y: f32) -> Option<usize> {
+    if sections.is_empty() {
+        return None;
+    }
+    let mut current = sections[0];
+    for (index, &section) in sections.iter().enumerate() {
+        if !is_section_start(sections, index) {
+            continue;
+        }
+        if header_top_for_row(sections, index) <= offset_y + 0.5 {
+            current = section;
+        } else {
+            break;
+        }
+    }
+    Some(current)
 }
 
 /// Full-width section separator: centered label with a hairline on either
 /// side, vertically aligned. Each rule fades from [`theme::LINE`] at the text
 /// to transparent at the far edge (same fade language as the immersive rail).
-/// Only emitted between non-empty sections.
+/// Emitted for every section — including the first — so the compact list
+/// always shows its current section title.
 fn section_separator(label: &'static str) -> Element<'static, StartMessage> {
     container(
         row![
@@ -4606,25 +4663,38 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
             .center_y(Fill)
             .into();
     }
+    // One timestamp for every row: the same section values the scroll math
+    // (`games_row_sections`) uses, so headers and offsets can never disagree.
+    let sections = games_row_sections(state);
     let labels = crate::ui::start::position::labels(state.games_section_mode());
+    // Sticky current-section title: pinned in-flow above the list (it takes
+    // layout space, like web-dev `sticky`) and remains in view until the next
+    // section's header reaches the top and supersedes it.
+    let sticky = sticky_section_for_offset(&sections, state.scrolls.offset(StartListId::Games));
     let mut entries: Vec<(u64, Element<'_, StartMessage>)> =
         Vec::with_capacity(state.rows.len() * 2);
     let mut last_section: Option<usize> = None;
     for (index, row) in state.rows.iter().enumerate() {
-        let section = crate::ui::start::position::section_index(
-            state.games_section_mode(),
-            &row.title,
-            row.played_at_ms,
-            crate::ui::start::position::now_ms(),
-            crate::ui::start::position::local_utc_offset_secs(),
-        );
-        // Between non-empty sections only: the row at hand proves its own
-        // section non-empty, and the first row never takes a separator.
-        if last_section.is_some_and(|prev| prev != section) {
+        let section = sections.get(index).copied().unwrap_or(0);
+        // Every section opens with a header — including the first — so the
+        // list always shows its current section title. The row at hand proves
+        // its own section non-empty.
+        if last_section != Some(section) {
             let label = labels.get(section).copied().unwrap_or("");
+            // The stuck section's in-list header keeps its slot (positions and
+            // scroll math are unchanged) but renders blank — the pinned bar
+            // carries its label, so keeping the text would double it.
+            let header: Element<'_, StartMessage> = if Some(section) == sticky {
+                container(space())
+                    .width(Fill)
+                    .height(Length::Fixed(SECTION_SEP_H))
+                    .into()
+            } else {
+                section_separator(label)
+            };
             entries.push((
                 list_key(&format!("compact-section-{index}-{section}")),
-                section_separator(label),
+                header,
             ));
         }
         last_section = Some(section);
@@ -4653,7 +4723,7 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
         ));
     }
     let items = keyed_column(entries).spacing(ROW_GAP).width(Fill);
-    scrollable(items)
+    let list: Element<'_, StartMessage> = scrollable(items)
         .id(games_scroll_id())
         .height(Fill)
         .width(Fill)
@@ -4662,7 +4732,9 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
             let y = viewport.absolute_offset().y;
             StartMessage::GamesScrolled(y, viewport.bounds().height)
         })
-        .into()
+        .into();
+    let pinned = section_separator(labels.get(sticky.unwrap_or(0)).copied().unwrap_or(""));
+    column![pinned, list].width(Fill).height(Fill).into()
 }
 
 fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element<'a, StartMessage> {
@@ -6790,7 +6862,7 @@ mod tests {
 
     #[test]
     fn center_prefer_clamps_to_content_max() {
-        // 20 same-letter rows: no separators, content = 20*104 + 19*8.
+        // 20 same-letter rows: one section header, content = 20*104 + 30 + 20*8.
         let mut state = State {
             rows: (0..20)
                 .map(|i| game_row_with(&format!("same{i}")))
@@ -6798,12 +6870,17 @@ mod tests {
             ..State::default()
         };
         state.record_list_scroll(StartListId::Games, 0.0, 400.0);
-        let content = 20.0 * ROW_HEIGHT + 19.0 * ROW_GAP;
+        let content = 20.0 * ROW_HEIGHT + SECTION_SEP_H + 20.0 * ROW_GAP;
         let max = content - 400.0;
         // Mid list: raw center stands.
         state.game_selected = 5;
         let (_, y) = state.selection_scroll_y_center_prefer().unwrap();
-        assert!((y - (5.0 * (ROW_HEIGHT + ROW_GAP) - (400.0 - ROW_HEIGHT) / 2.0)).abs() < 0.1);
+        assert!(
+            (y - (5.0 * (ROW_HEIGHT + ROW_GAP) + (SECTION_SEP_H + ROW_GAP)
+                - (400.0 - ROW_HEIGHT) / 2.0))
+                .abs()
+                < 0.1
+        );
         assert!(y < max);
         // Near the end the raw center overshoots: clamp to max (what iced
         // would silently clamp to, desyncing the tracker).
@@ -6826,18 +6903,71 @@ mod tests {
 
     #[test]
     fn separator_offsets_count_section_changes() {
-        // No changes → no shift, first row never shifts.
-        assert!((separator_offset_above(&[5, 5, 5], 0) - 0.0).abs() < f32::EPSILON);
-        assert!((separator_offset_above(&[5, 5, 5], 2) - 0.0).abs() < f32::EPSILON);
-        // One divider between sections 0 and 1 shifts rows at/after index 2.
+        // One header per section: same-section rows share the first header.
         let step = SECTION_SEP_H + ROW_GAP;
+        assert!((separator_offset_above(&[5, 5, 5], 0) - step).abs() < f32::EPSILON);
+        assert!((separator_offset_above(&[5, 5, 5], 2) - step).abs() < f32::EPSILON);
+        // One header for the first section plus one divider between sections
+        // 0 and 1 shifts rows at/after index 2 by two steps.
         let sections = [0, 0, 1, 1];
-        assert!((separator_offset_above(&sections, 0) - 0.0).abs() < f32::EPSILON);
-        assert!((separator_offset_above(&sections, 1) - 0.0).abs() < f32::EPSILON);
-        assert!((separator_offset_above(&sections, 2) - step).abs() < f32::EPSILON);
-        assert!((separator_offset_above(&sections, 3) - step).abs() < f32::EPSILON);
+        assert!((separator_offset_above(&sections, 0) - step).abs() < f32::EPSILON);
+        assert!((separator_offset_above(&sections, 1) - step).abs() < f32::EPSILON);
+        assert!((separator_offset_above(&sections, 2) - 2.0 * step).abs() < f32::EPSILON);
+        assert!((separator_offset_above(&sections, 3) - 2.0 * step).abs() < f32::EPSILON);
         // Empty list never shifts.
         assert!((separator_offset_above(&[], 0) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn sticky_section_tracks_header_tops() {
+        // Headers open rows 0 and 2: tops at 0 and 262.
+        let sections = [0, 0, 1, 1];
+        assert_eq!(header_top_for_row(&sections, 0), 0.0);
+        assert!((header_top_for_row(&sections, 2) - 262.0).abs() < f32::EPSILON);
+        assert!(is_section_start(&sections, 0));
+        assert!(!is_section_start(&sections, 1));
+        assert!(is_section_start(&sections, 2));
+        assert!(!is_section_start(&[], 0));
+        // Empty list pins nothing.
+        assert_eq!(sticky_section_for_offset(&[], 0.0), None);
+        // First section sticks until the second header reaches the top.
+        assert_eq!(sticky_section_for_offset(&sections, 0.0), Some(0));
+        assert_eq!(sticky_section_for_offset(&sections, 100.0), Some(0));
+        assert_eq!(sticky_section_for_offset(&sections, 261.4), Some(0));
+        assert_eq!(sticky_section_for_offset(&sections, 262.0), Some(1));
+        assert_eq!(sticky_section_for_offset(&sections, 900.0), Some(1));
+    }
+
+    #[test]
+    fn up_reveal_to_section_start_includes_header() {
+        // Alphabetical sections: a1/a2 share one header, b1 opens the next.
+        let mut state = State {
+            rows: ["a1", "a2", "b1"]
+                .iter()
+                .map(|s| game_row_with(s))
+                .collect(),
+            sort_mode: GamesSortMode::Alphabetical,
+            ..State::default()
+        };
+        // Scrolled deep: navigating back up must land on header tops.
+        state.record_list_scroll(StartListId::Games, 500.0, 400.0);
+        state.game_selected = 2;
+        let (_, y) = state.selection_scroll_y(ScrollReveal::Up).unwrap();
+        assert!((y - header_top_for_row(&[1, 1, 2], 2)).abs() < 0.1);
+        assert!((y - 262.0).abs() < 0.1);
+        // First row: its header is the list top.
+        state.game_selected = 0;
+        let (_, y) = state.selection_scroll_y(ScrollReveal::Up).unwrap();
+        assert!((y - 0.0).abs() < f32::EPSILON);
+        // Mid-section rows still pin to the row itself.
+        state.game_selected = 1;
+        let (_, y) = state.selection_scroll_y(ScrollReveal::Up).unwrap();
+        assert!((y - (1.0 * (ROW_HEIGHT + ROW_GAP) + (SECTION_SEP_H + ROW_GAP))).abs() < 0.1);
+        // Scrolling down keeps the row-bottom target (header rides along).
+        state.record_list_scroll(StartListId::Games, 0.0, 400.0);
+        state.game_selected = 2;
+        let (_, y) = state.selection_scroll_y(ScrollReveal::Down).unwrap();
+        assert!((y - (300.0 + ROW_HEIGHT - 400.0)).abs() < 0.1);
     }
 
     #[test]

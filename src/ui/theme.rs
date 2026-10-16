@@ -56,13 +56,13 @@ pub const RADIUS_SM: f32 = 1.0;
 /// for a panel and its children.
 pub mod radius {
     /// Small controls: chips, inputs, swatches.
-    pub const SM: f32 = 8.0;
+    pub const SM: f32 = 4.0;
     /// Rows and inner cards (immersive dock rows).
-    pub const MD: f32 = 12.0;
+    pub const MD: f32 = 6.0;
     /// Cards and grouped panels.
-    pub const LG: f32 = 16.0;
+    pub const LG: f32 = 8.0;
     /// Floating islands (immersive footer capsule).
-    pub const XL: f32 = 20.0;
+    pub const XL: f32 = 10.0;
     /// Fully round ends — iced clamps to half the shorter side.
     pub const PILL: f32 = 999.0;
 }

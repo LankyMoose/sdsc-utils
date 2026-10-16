@@ -171,7 +171,7 @@ pub fn view<'a>(
         // the glyphs sit ~1px high: top padding runs 1px deeper to compensate
         // (optical centering; total capsule height is unchanged).
         let clock_capsule = container(
-            text(crate::ui::start::clock::clock_text())
+            text(crate::ui::start::clock::clock_text().to_ascii_uppercase())
                 .size(18.0)
                 .color(theme::alpha(theme::INK, 0.72)),
         )
