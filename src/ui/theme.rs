@@ -209,12 +209,12 @@ pub fn modal_card(_theme: &Theme) -> container::Style {
     }
 }
 
-/// Floating dropdown panel over the Start settings list. Lifted above the
-/// row surfaces behind it but darker than the first pass (0.10 washed out);
-/// same radius language and hairline, softer shadow than [`modal_card`].
+/// Floating dropdown panel over the Start settings list. Lifted just above
+/// the base surface; same radius language and hairline, softer shadow than
+/// [`modal_card`].
 pub fn menu_panel(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(lighten(BASE_BG, 0.07))),
+        background: Some(Background::Color(lighten(BASE_BG, 0.04))),
         text_color: Some(INK),
         border: Border {
             color: GLASS_HAIRLINE,

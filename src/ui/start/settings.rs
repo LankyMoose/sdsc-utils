@@ -28,6 +28,10 @@ const COL_GAP: f32 = 6.0;
 const MENU_PANEL_PAD: f32 = 4.0;
 /// Gap between scrollable content and the embedded scrollbar (matches Configure/Popup).
 const SCROLL_GAP: f32 = 8.0;
+/// Width of the default vertical scrollbar thumb. The drawer keeps iced's
+/// default scrollable direction config, so the thumb overlays the content's
+/// right edge (no reserved lane) whenever the list overflows its viewport.
+const SCROLLBAR_RESERVE: f32 = 10.0;
 /// Padding inside the settings scrollable content (must match `panel_view` list padding).
 /// Kept in the same ballpark as [`REVEAL_INSET`] — just enough for the focus ring.
 const CONTENT_PAD_Y: f32 = 8.0;
@@ -1102,6 +1106,37 @@ fn layout_items(snapshot: &StartSettingsSnapshot) -> Vec<LayoutItem> {
     items
 }
 
+/// Right inset for the floating dropdown panel: content padding, plus the
+/// scrollbar thumb width when the list overflows (the thumb overlays the
+/// content edge, so the panel must stop short of it like rows do).
+fn menu_overlay_right_pad(content_h: f32, viewport_h: f32) -> f32 {
+    CONTENT_PAD_X
+        + if content_h > viewport_h {
+            SCROLLBAR_RESERVE
+        } else {
+            0.0
+        }
+}
+
+/// Total scrollable content height: top/bottom content padding plus one gap
+/// between stacked items. Decides scrollbar visibility for the overlay inset.
+fn settings_content_h(snapshot: &StartSettingsSnapshot, immersive: bool) -> f32 {
+    let ty = TypeScale::for_mode(immersive);
+    let items = layout_items(snapshot);
+    let mut h = CONTENT_PAD_Y * 2.0;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            h += COL_GAP;
+        }
+        h += match item {
+            LayoutItem::Section(_) => section_block_h(ty.section),
+            LayoutItem::Gap => SECTION_GAP_H,
+            LayoutItem::Row(row) => row.height(ty),
+        };
+    }
+    h
+}
+
 /// Vertical offset (from the scrollable viewport top) for the floating
 /// dropdown panel of the menu-owning row.
 ///
@@ -1150,6 +1185,7 @@ fn menu_overlay(
         state.settings.viewport_h
     };
     let y = menu_overlay_y(row_top, row_h, panel_h, state.settings.scroll_y, viewport_h);
+    let right_pad = menu_overlay_right_pad(settings_content_h(snapshot, immersive), viewport_h);
     let panel = selector_menu_panel(state.settings.menu, menu_row, snapshot, ty)?;
     #[cfg(debug_assertions)]
     let panel = crate::ui::debug_bounds::wrap(panel, debug_bounds);
@@ -1158,7 +1194,7 @@ fn menu_overlay(
             space::Space::new().width(Fill).height(Length::Fixed(y)),
             container(panel).width(Fill).padding(Padding {
                 top: 0.0,
-                right: CONTENT_PAD_X,
+                right: right_pad,
                 bottom: 0.0,
                 left: CONTENT_PAD_X,
             }),
@@ -2141,6 +2177,34 @@ mod tests {
         assert!((menu_overlay_y(300.0, 40.0, 120.0, 200.0, 600.0) - 140.0).abs() < f32::EPSILON);
         // Row scrolled past the top: clamps to the viewport top.
         assert!((menu_overlay_y(50.0, 40.0, 120.0, 200.0, 600.0) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn menu_overlay_right_pad_clears_the_scrollbar_only_when_overflowing() {
+        // Short list, no scrollbar: symmetric content padding.
+        assert!((menu_overlay_right_pad(200.0, 600.0) - CONTENT_PAD_X).abs() < f32::EPSILON);
+        // Overflowing list: the thumb overlays the content edge, so the
+        // panel stops short of it like rows do.
+        assert!(
+            (menu_overlay_right_pad(900.0, 600.0) - (CONTENT_PAD_X + SCROLLBAR_RESERVE)).abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn settings_content_h_covers_rows_gaps_and_pads() {
+        let s = snap(true, true);
+        let ty = TypeScale::for_mode(false);
+        let rows_h: f32 = SettingsRow::focusable(&s)
+            .iter()
+            .map(|row| row.height(ty))
+            .sum();
+        let h = settings_content_h(&s, false);
+        assert!(h > rows_h, "pads + gaps add height");
+        assert!(
+            h < rows_h + 400.0,
+            "content height stays in a sane band, got {h} for rows {rows_h}"
+        );
     }
 
     #[test]
