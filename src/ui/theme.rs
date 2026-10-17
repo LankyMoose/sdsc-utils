@@ -209,6 +209,27 @@ pub fn modal_card(_theme: &Theme) -> container::Style {
     }
 }
 
+/// Floating dropdown panel over the Start settings list. Slightly lifted
+/// from [`modal_card`] so options read above the rows behind them; same
+/// radius language and hairline, softer shadow.
+pub fn menu_panel(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(lighten(BASE_BG, 0.10))),
+        text_color: Some(INK),
+        border: Border {
+            color: GLASS_HAIRLINE,
+            width: 1.0,
+            radius: radius::LG.into(),
+        },
+        shadow: iced::Shadow {
+            color: alpha(Color::BLACK, 0.35),
+            offset: iced::Vector::new(0.0, 6.0),
+            blur_radius: 16.0,
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Wrap in-window modal content in a [`modal_card`]. Window roots use
 /// [`crate::ui::chrome::window`] instead.
 pub fn framed<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {

@@ -12,7 +12,7 @@ use crate::ui::theme;
 use iced::font::Weight;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, column, container, mouse_area, row, scrollable, slider, space, text, toggler,
+    button, column, container, mouse_area, row, scrollable, slider, space, stack, text, toggler,
 };
 use iced::{Alignment, Element, Fill, Font, Length, Padding};
 use std::time::{Duration, Instant};
@@ -727,7 +727,7 @@ impl SettingsPanel {
         immersive: bool,
         direction: ScrollReveal,
     ) -> Option<f32> {
-        let (row_top, row_h) = focus_row_bounds(self.focus, snapshot, immersive, self.menu_row())?;
+        let (row_top, row_h) = focus_row_bounds(self.focus, snapshot, immersive)?;
         let viewport_h = if self.viewport_h <= 1.0 {
             if immersive {
                 720.0
@@ -766,7 +766,7 @@ impl SettingsPanel {
         let idx = rows
             .iter()
             .position(|&row| row == SettingsRow::PerfReload)?;
-        let (row_top, row_h) = focus_row_bounds(idx, snapshot, immersive, self.menu_row())?;
+        let (row_top, row_h) = focus_row_bounds(idx, snapshot, immersive)?;
         let viewport_h = if self.viewport_h <= 1.0 {
             if immersive {
                 720.0
@@ -954,13 +954,14 @@ impl TypeScale {
 
 /// Estimated `(top, height)` of the focused row inside the scrollable content.
 ///
-/// The open selector dropdown (`menu`) expands its panel in place, shifting
-/// every row below it down (panel padding + one option row per mode).
+/// Dropdown panels float over the list ([`menu_overlay`]) instead of living
+/// in the flow, so row bounds never move when a menu opens or closes.
+/// Stacking mirrors `panel_view`: one COL_GAP between every child, heights
+/// from the shared `*_row_h` fns / section + gap constants.
 pub fn focus_row_bounds(
     focus: usize,
     snapshot: &StartSettingsSnapshot,
     immersive: bool,
-    menu: Option<SettingsRow>,
 ) -> Option<(f32, f32)> {
     let rows = SettingsRow::focusable(snapshot);
     let target = *rows.get(focus)?;
@@ -969,14 +970,13 @@ pub fn focus_row_bounds(
     // Content padding is inside the scrollable — offsets are absolute in that content.
     // Title lives in the static header (not scrolled).
     // Stacking mirrors `panel_view`: one COL_GAP between every child, heights
-    // from the shared `*_row_h` fns / `menu_panel_h` / section + gap constants.
+    // from the shared `*_row_h` fns / section + gap constants.
     let mut y = CONTENT_PAD_Y;
-    for item in layout_items(snapshot, menu) {
+    for item in layout_items(snapshot) {
         let h = match item {
             LayoutItem::Section(_) => section_block_h(ty.section),
             LayoutItem::Gap => SECTION_GAP_H,
             LayoutItem::Row(row) => row.height(ty),
-            LayoutItem::Menu(row) => menu_panel_h(row.selector_count(), ty.body),
         };
         let top = y;
         y += h + COL_GAP;
@@ -1035,9 +1035,8 @@ fn menu_option_h(body: f32) -> f32 {
 }
 
 /// Estimated height of an expanded dropdown panel: padding top/bottom + one
-/// option row per mode with spacing between (matches `panel_view` stacking:
-/// `selector_menu_panel` uses the same [`MENU_PANEL_PAD`] and
-/// [`MENU_OPTION_GAP`]).
+/// option row per mode with spacing between (matches `menu_panel_h` geometry
+/// used by the floating [`menu_overlay`]).
 fn menu_panel_h(option_count: usize, body: f32) -> f32 {
     let mut panel_h = MENU_PANEL_PAD * 2.0;
     for i in 0..option_count {
@@ -1058,35 +1057,23 @@ fn slider_row_h(ty: TypeScale, helper: bool) -> f32 {
     ROW_PAD * 2.0 + content
 }
 
-/// Expanded dropdown panel height below `row` when it owns the open menu.
-/// Generic over the selector option list so bounds and rendering share it.
-fn menu_panel_h_for(row: SettingsRow, menu: Option<SettingsRow>, body: f32) -> Option<f32> {
-    if menu == Some(row) && row.kind() == RowKind::Selector {
-        Some(menu_panel_h(row.selector_count(), body))
-    } else {
-        None
-    }
-}
-
 /// One stacked entry in the scrollable settings list. `Row` entries are the
 /// focusable rows from [`SettingsRow::ALL`]; `Section`/`Gap` are the static
-/// separators anchored to the row that follows them; `Menu` is the expanded
-/// dropdown panel rendered immediately after its selector row, wherever that
-/// row sits in the table.
+/// separators anchored to the row that follows them. Dropdown panels are NOT
+/// layout items: they float over the list ([`menu_overlay`]) so opening one
+/// never shifts rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayoutItem {
     Section(&'static str),
     Gap,
     Row(SettingsRow),
-    Menu(SettingsRow),
 }
 
 /// Full stacking order of the scrollable list, derived from the single row
 /// table: visible rows in [`SettingsRow::ALL`] order, each with its anchored
-/// section/gap prefix and its trailing dropdown panel (when that selector
-/// owns the open menu). `panel_view` and `focus_row_bounds` both consume this
+/// section/gap prefix. `panel_view` and `focus_row_bounds` both consume this
 /// shape (widgets vs. heights) so the three orderings agree by construction.
-fn layout_items(snapshot: &StartSettingsSnapshot, menu: Option<SettingsRow>) -> Vec<LayoutItem> {
+fn layout_items(snapshot: &StartSettingsSnapshot) -> Vec<LayoutItem> {
     let mut items = Vec::new();
     for row in SettingsRow::ALL
         .iter()
@@ -1100,11 +1087,6 @@ fn layout_items(snapshot: &StartSettingsSnapshot, menu: Option<SettingsRow>) -> 
             items.push(LayoutItem::Section(section));
         }
         items.push(LayoutItem::Row(row));
-        // Dropdown panel renders after its selector row wherever it sits;
-        // the shift for every row below derives from this table position.
-        if menu_panel_h_for(row, menu, 0.0).is_some() {
-            items.push(LayoutItem::Menu(row));
-        }
     }
     debug_assert_eq!(
         items
@@ -1118,6 +1100,73 @@ fn layout_items(snapshot: &StartSettingsSnapshot, menu: Option<SettingsRow>) -> 
         "layout rows must match focusable order"
     );
     items
+}
+
+/// Vertical offset (from the scrollable viewport top) for the floating
+/// dropdown panel of the menu-owning row.
+///
+/// Pure geometry so it stays unit-testable: the panel hangs below its row,
+/// flips above it when it would overflow the viewport bottom and fits above,
+/// and clamps into view otherwise.
+fn menu_overlay_y(row_top: f32, row_h: f32, panel_h: f32, scroll_y: f32, viewport_h: f32) -> f32 {
+    let row_visible_top = row_top - scroll_y;
+    let below = row_visible_top + row_h;
+    let fits_below = below + panel_h <= viewport_h;
+    let fits_above = row_visible_top - panel_h >= 0.0;
+    let y = if fits_below || !fits_above {
+        below
+    } else {
+        row_visible_top - panel_h
+    };
+    y.clamp(0.0, (viewport_h - panel_h).max(0.0))
+}
+
+/// Floating dropdown panel for the open selector menu, if any.
+///
+/// Overlays the list at a fixed position derived from the menu row's content
+/// bounds and the live scroll offset — opening a menu never shifts rows, and
+/// the panel tracks its row while scrolling. `None` when no menu is open or
+/// the menu row left the focusable list.
+fn menu_overlay(
+    state: &State,
+    snapshot: &StartSettingsSnapshot,
+    immersive: bool,
+    #[cfg(debug_assertions)] debug_bounds: bool,
+) -> Option<Element<'static, StartMessage>> {
+    let (menu_row, _) = state.settings.menu?;
+    let ty = TypeScale::for_mode(immersive);
+    let idx = SettingsRow::focusable(snapshot)
+        .iter()
+        .position(|&row| row == menu_row)?;
+    let (row_top, row_h) = focus_row_bounds(idx, snapshot, immersive)?;
+    let panel_h = menu_panel_h(menu_row.selector_count(), ty.body);
+    let viewport_h = if state.settings.viewport_h <= 1.0 {
+        if immersive {
+            720.0
+        } else {
+            COMPACT_VIEWPORT_FALLBACK
+        }
+    } else {
+        state.settings.viewport_h
+    };
+    let y = menu_overlay_y(row_top, row_h, panel_h, state.settings.scroll_y, viewport_h);
+    let panel = selector_menu_panel(state.settings.menu, menu_row, snapshot, ty)?;
+    #[cfg(debug_assertions)]
+    let panel = crate::ui::debug_bounds::wrap(panel, debug_bounds);
+    Some(
+        column![
+            space::Space::new().width(Fill).height(Length::Fixed(y)),
+            container(panel).width(Fill).padding(Padding {
+                top: 0.0,
+                right: CONTENT_PAD_X,
+                bottom: 0.0,
+                left: CONTENT_PAD_X,
+            }),
+        ]
+        .width(Fill)
+        .height(Fill)
+        .into(),
+    )
 }
 
 pub fn panel_view<'a>(
@@ -1353,14 +1402,6 @@ pub fn panel_view<'a>(
         #[cfg(debug_assertions)]
         let widget = crate::ui::debug_bounds::wrap(widget, debug_bounds);
         items = items.push(widget);
-        // Expanded dropdown panel: every option selectable, highlight follows
-        // the menu. Renders after its selector row wherever it sits, so rows
-        // below shift from this table position (not a hardcoded sequence).
-        if let Some(panel) = selector_menu_panel(state.settings.menu, row, snapshot, ty) {
-            #[cfg(debug_assertions)]
-            let panel = crate::ui::debug_bounds::wrap(panel, debug_bounds);
-            items = items.push(panel);
-        }
     }
     #[cfg(debug_assertions)]
     debug_assert_eq!(
@@ -1388,7 +1429,21 @@ pub fn panel_view<'a>(
     let header: Element<'_, StartMessage> =
         crate::ui::debug_bounds::wrap(header.into(), debug_bounds);
     #[cfg(debug_assertions)]
-    let list: Element<'_, StartMessage> = crate::ui::debug_bounds::wrap(list.into(), debug_bounds);
+    let list = crate::ui::debug_bounds::wrap(list.into(), debug_bounds);
+
+    // Float the open dropdown over the list at its row's position (see
+    // `menu_overlay`): rows never shift when a menu opens or closes.
+    let mut layer = stack![list];
+    if let Some(overlay) = menu_overlay(
+        state,
+        snapshot,
+        immersive,
+        #[cfg(debug_assertions)]
+        debug_bounds,
+    ) {
+        layer = layer.push(overlay);
+    }
+    let list = layer.width(Fill).height(Fill);
 
     let pad = if immersive { 20.0 } else { 16.0 };
     container(
@@ -1700,7 +1755,7 @@ fn selector_menu_panel(
         container(options)
             .padding(MENU_PANEL_PAD)
             .width(Fill)
-            .style(theme::modal_card)
+            .style(theme::menu_panel)
             .into(),
     )
 }
@@ -2067,69 +2122,62 @@ mod tests {
     #[test]
     fn focus_row_bounds_increases_with_focus() {
         let s = snap(true, true);
-        let (y0, _) = focus_row_bounds(0, &s, false, None).unwrap();
+        let (y0, _) = focus_row_bounds(0, &s, false).unwrap();
         let last = SettingsRow::focusable(&s).len() - 1;
-        let (y_last, _) = focus_row_bounds(last, &s, false, None).unwrap();
+        let (y_last, _) = focus_row_bounds(last, &s, false).unwrap();
         assert!(y_last > y0);
         assert!(y0 >= CONTENT_PAD_Y);
     }
 
     #[test]
-    fn focus_row_bounds_grows_with_expanded_auto_open_menu() {
-        let s = snap(true, true);
-        // AutoOpen is focus 0; with the menu open everything below shifts
-        // down by one option row per mode.
-        let (closed_top, _) = focus_row_bounds(0, &s, false, None).unwrap();
-        let (open_top, _) = focus_row_bounds(0, &s, false, Some(SettingsRow::AutoOpen)).unwrap();
-        assert!((closed_top - open_top).abs() < f32::EPSILON);
-        let always = SettingsRow::focusable(&s)
-            .iter()
-            .position(|&r| r == SettingsRow::AlwaysImmersive)
-            .unwrap();
-        let (closed_y, _) = focus_row_bounds(always, &s, false, None).unwrap();
-        let (open_y, _) = focus_row_bounds(always, &s, false, Some(SettingsRow::AutoOpen)).unwrap();
-        // Expanded panel: padding top/bottom + one option row per mode with
-        // spacing between, slotted into the column stacking.
-        let expected =
-            menu_panel_h(AUTO_OPEN_MODES.len(), TypeScale::for_mode(false).body) + COL_GAP;
-        assert!((open_y - closed_y - expected).abs() < 0.5);
+    fn menu_overlay_y_hangs_below_flips_above_and_clamps() {
+        // Plenty of room: below the row.
+        assert!((menu_overlay_y(100.0, 40.0, 120.0, 0.0, 600.0) - 140.0).abs() < f32::EPSILON);
+        // Row near the bottom, room above: flips above the row.
+        assert!((menu_overlay_y(500.0, 40.0, 120.0, 0.0, 600.0) - 380.0).abs() < f32::EPSILON);
+        // No room either way: clamps into view.
+        assert!((menu_overlay_y(500.0, 40.0, 900.0, 0.0, 600.0) - 0.0).abs() < f32::EPSILON);
+        // Scrolled list: position tracks the visible row top.
+        assert!((menu_overlay_y(300.0, 40.0, 120.0, 200.0, 600.0) - 140.0).abs() < f32::EPSILON);
+        // Row scrolled past the top: clamps to the viewport top.
+        assert!((menu_overlay_y(50.0, 40.0, 120.0, 200.0, 600.0) - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn focus_row_bounds_grows_with_expanded_layout_menu() {
+    fn focus_row_bounds_ignores_open_menus() {
+        // Panels float: row bounds are identical with any menu open.
         let s = snap(true, true);
-        // Layout menu expands below the ImmersiveLayout row: rows above it
-        // (e.g. AutoOpen) do not move, rows below it (e.g. IdleSecs) shift.
-        let (closed_top, _) = focus_row_bounds(0, &s, false, None).unwrap();
-        let (open_top, _) =
-            focus_row_bounds(0, &s, false, Some(SettingsRow::ImmersiveLayout)).unwrap();
-        assert!((closed_top - open_top).abs() < f32::EPSILON);
-        let layout = SettingsRow::focusable(&s)
-            .iter()
-            .position(|&r| r == SettingsRow::ImmersiveLayout)
-            .unwrap();
-        let (closed_layout, _) = focus_row_bounds(layout, &s, false, None).unwrap();
-        let (open_layout, _) =
-            focus_row_bounds(layout, &s, false, Some(SettingsRow::ImmersiveLayout)).unwrap();
-        assert!((closed_layout - open_layout).abs() < f32::EPSILON);
-        let idle = SettingsRow::focusable(&s)
+        let focusable = SettingsRow::focusable(&s);
+        let idle = focusable
             .iter()
             .position(|&r| r == SettingsRow::IdleSecs)
             .unwrap();
-        let (closed_y, _) = focus_row_bounds(idle, &s, false, None).unwrap();
-        let (open_y, _) =
-            focus_row_bounds(idle, &s, false, Some(SettingsRow::ImmersiveLayout)).unwrap();
-        let expected = menu_panel_h(
-            IMMERSIVE_LAYOUT_MODES.len(),
-            TypeScale::for_mode(false).body,
-        ) + COL_GAP;
-        assert!((open_y - closed_y - expected).abs() < 0.5);
+        let (y, h) = focus_row_bounds(idle, &s, false).unwrap();
+        assert!(y > 0.0 && h > 0.0);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn menu_overlay_tracks_open_menu_only() {
+        let s = snap(true, true);
+        let mut state = State::default();
+        // Closed: no overlay.
+        assert!(menu_overlay(&state, &s, false, false).is_none());
+        // Open on a visible row: overlay present.
+        state.settings.menu = Some((SettingsRow::AutoOpen, 0));
+        assert!(menu_overlay(&state, &s, false, false).is_some());
+        // Open on a row that left the focusable list: no overlay.
+        let mut hidden = s.clone();
+        hidden.selection_persist = false;
+        state.settings.menu = Some((SettingsRow::SelectionMode, 0));
+        assert!(menu_overlay(&state, &hidden, false, false).is_none());
     }
 
     /// Triple agreement: focusable order == layout (panel build) order ==
-    /// bounds geometry order, for every sounds/haptics visibility combo and
-    /// every menu state. Every focusable row must resolve `Some` bounds, with
-    /// strictly increasing tops matching focus order.
+    /// bounds geometry order, for every sounds/haptics visibility combo.
+    /// Every focusable row must resolve `Some` bounds, with strictly
+    /// increasing tops matching focus order. Dropdown panels float, so row
+    /// geometry never depends on menu state.
     #[test]
     fn triple_agreement_focusable_panel_bounds() {
         // The single table lists every variant exactly once, in display order.
@@ -2165,8 +2213,8 @@ mod tests {
                         .collect::<Vec<_>>(),
                     "focusable must be the visible table projection (sounds={sounds} haptics={haptics})"
                 );
-                // Menu open/closed per selector: layout row order never changes
-                // (the panel inserts after its selector wherever it sits).
+                // Layout row order never depends on menu state: dropdown
+                // panels float over the list instead of living in the flow.
                 for menu in [
                     None,
                     Some(SettingsRow::AutoOpen),
@@ -2175,7 +2223,7 @@ mod tests {
                     Some(SettingsRow::Navbar),
                     Some(SettingsRow::ReducedMotion),
                 ] {
-                    let layout_rows: Vec<SettingsRow> = layout_items(&s, menu)
+                    let layout_rows: Vec<SettingsRow> = layout_items(&s)
                         .iter()
                         .filter_map(|item| match item {
                             LayoutItem::Row(row) => Some(*row),
@@ -2190,7 +2238,7 @@ mod tests {
                         let mut prev_top: Option<f32> = None;
                         for (focus, row) in focusable.iter().enumerate() {
                             let (top, h) =
-                                focus_row_bounds(focus, &s, immersive, menu).unwrap_or_else(
+                                focus_row_bounds(focus, &s, immersive).unwrap_or_else(
                                     || {
                                         panic!(
                                             "every focusable row resolves bounds (row={row:?} sounds={sounds} haptics={haptics} menu={menu:?} immersive={immersive})"
@@ -2213,34 +2261,6 @@ mod tests {
                                 "bounds height uses the shared row height (row={row:?})"
                             );
                         }
-                        // Menu-shift derives from the table position: rows at or
-                        // above the menu owner don't move; rows below shift by
-                        // exactly panel + one column gap.
-                        if let Some(menu_row) = menu {
-                            let ty = TypeScale::for_mode(immersive);
-                            let expected =
-                                menu_panel_h(menu_row.selector_count(), ty.body) + COL_GAP;
-                            let owner_idx =
-                                focusable.iter().position(|&row| row == menu_row).unwrap();
-                            for (focus, _) in focusable.iter().enumerate() {
-                                let (closed, _) =
-                                    focus_row_bounds(focus, &s, immersive, None).unwrap();
-                                let (open, _) =
-                                    focus_row_bounds(focus, &s, immersive, menu).unwrap();
-                                if focus <= owner_idx {
-                                    assert!(
-                                        (open - closed).abs() < f32::EPSILON,
-                                        "rows at/above the menu don't move (focus={focus} menu={menu:?})"
-                                    );
-                                } else {
-                                    assert!(
-                                        (open - closed - expected).abs() < 0.5,
-                                        "rows below shift by panel+gap (focus={focus} menu={menu:?} shift={} expected={expected})",
-                                        open - closed
-                                    );
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -2257,7 +2277,7 @@ mod tests {
             scroll_y: 0.0,
             ..SettingsPanel::default()
         };
-        let (row_top, row_h) = focus_row_bounds(panel.focus, &s, false, None).unwrap();
+        let (row_top, row_h) = focus_row_bounds(panel.focus, &s, false).unwrap();
         let y = panel
             .focus_scroll_y(&s, false, ScrollReveal::Down)
             .expect("last row should need a reveal from the top");
@@ -2309,8 +2329,7 @@ mod tests {
             let y = panel
                 .reload_scroll_y(&dirty, immersive, ScrollReveal::Either)
                 .expect("trailing reload row should need a reveal from the top");
-            let (row_top, row_h) =
-                focus_row_bounds(rows.len() - 1, &dirty, immersive, None).unwrap();
+            let (row_top, row_h) = focus_row_bounds(rows.len() - 1, &dirty, immersive).unwrap();
             let expected = (row_top + row_h + REVEAL_INSET - 200.0).max(0.0);
             assert!(
                 (y - expected).abs() < 0.5,
