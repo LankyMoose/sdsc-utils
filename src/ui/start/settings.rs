@@ -18,7 +18,7 @@ use iced::{Alignment, Element, Fill, Font, Length, Padding};
 use std::time::{Duration, Instant};
 
 /// Immersive settings drawer content width (full height).
-pub const DRAWER_W: f32 = 500.0;
+pub const DRAWER_W: f32 = 600.0;
 /// Compact modal width (~window × 0.75).
 pub const MODAL_W: f32 = 576.0;
 const DRAWER_ANIM_MS: u64 = 220;
@@ -28,10 +28,12 @@ const COL_GAP: f32 = 6.0;
 const MENU_PANEL_PAD: f32 = 4.0;
 /// Gap between scrollable content and the embedded scrollbar (matches Configure/Popup).
 const SCROLL_GAP: f32 = 8.0;
-/// Width of the default vertical scrollbar thumb. The drawer keeps iced's
-/// default scrollable direction config, so the thumb overlays the content's
-/// right edge (no reserved lane) whenever the list overflows its viewport.
-const SCROLLBAR_RESERVE: f32 = 10.0;
+/// Full scrollbar lane the drawer scrollable reserves on the right while
+/// overflowing: iced's default 10px thumb plus the `.spacing(SCROLL_GAP)`
+/// lane set on the scrollable itself (that `spacing` call configures the
+/// scrollbar, not item gaps — items use COL_GAP). Rows end at this lane, so
+/// the floating panel must too: same width as the control row.
+const SCROLLBAR_LANE: f32 = 10.0 + SCROLL_GAP;
 /// Padding inside the settings scrollable content (must match `panel_view` list padding).
 /// Kept in the same ballpark as [`REVEAL_INSET`] — just enough for the focus ring.
 const CONTENT_PAD_Y: f32 = 8.0;
@@ -1107,12 +1109,12 @@ fn layout_items(snapshot: &StartSettingsSnapshot) -> Vec<LayoutItem> {
 }
 
 /// Right inset for the floating dropdown panel: content padding, plus the
-/// scrollbar thumb width when the list overflows (the thumb overlays the
-/// content edge, so the panel must stop short of it like rows do).
+/// scrollbar lane when the list overflows (the thumb + spacing reserve the
+/// lane, so rows end short of it — the panel matches the control width).
 fn menu_overlay_right_pad(content_h: f32, viewport_h: f32) -> f32 {
     CONTENT_PAD_X
         + if content_h > viewport_h {
-            SCROLLBAR_RESERVE
+            SCROLLBAR_LANE
         } else {
             0.0
         }
@@ -2183,10 +2185,10 @@ mod tests {
     fn menu_overlay_right_pad_clears_the_scrollbar_only_when_overflowing() {
         // Short list, no scrollbar: symmetric content padding.
         assert!((menu_overlay_right_pad(200.0, 600.0) - CONTENT_PAD_X).abs() < f32::EPSILON);
-        // Overflowing list: the thumb overlays the content edge, so the
-        // panel stops short of it like rows do.
+        // Overflowing list: thumb + spacing reserve the lane, so the
+        // panel stops short of it exactly like rows do.
         assert!(
-            (menu_overlay_right_pad(900.0, 600.0) - (CONTENT_PAD_X + SCROLLBAR_RESERVE)).abs()
+            (menu_overlay_right_pad(900.0, 600.0) - (CONTENT_PAD_X + SCROLLBAR_LANE)).abs()
                 < f32::EPSILON
         );
     }
