@@ -108,6 +108,19 @@ pub fn view<'a>(
     let program = AmbientProgram::new(state.ambient_time, dock_p, 0.0, 1.0);
     let atmosphere = shader(program).width(Fill).height(Fill);
 
+    // Debug R3 hide: pure ambient background, no chrome at all (tuning panel
+    // included). Matches the standalone preview window layer for layer.
+    #[cfg(debug_assertions)]
+    if state.ambient_tune_open && state.ambient_tune_hide_chrome {
+        return stack![
+            atmosphere,
+            shader(VignetteProgram::new(0.55)).width(Fill).height(Fill),
+        ]
+        .width(Fill)
+        .height(Fill)
+        .into();
+    }
+
     let body: Element<'_, StartMessage> = if state.manual_add.is_some() {
         modal_card(manual_add_view(state))
     } else if state.replace_confirm.is_some() {
@@ -248,6 +261,12 @@ pub fn view<'a>(
             debug_bounds,
         ));
     }
+    // Debug tuning panel above chrome (drawer stays closed while it is open).
+    // Same stacking discipline as the drawer: chrome never remounts.
+    #[cfg(debug_assertions)]
+    if state.ambient_tune_open && !state.ambient_tune_hide_chrome {
+        layers.push(crate::ui::start::ambient_tune::tuning_overlay(state));
+    }
     // Idle/sleep wash sits above settings; ceremony veil stays on top.
     if idle_veil > 0.001 {
         layers.push(
@@ -358,7 +377,17 @@ fn stage_with_dock<'a>(
     let (transition_layout, transition_opacity, transition_dx, transition_dy) =
         state.layout_transition_visual(immersive_layout, now);
     let list_op = (state.games_list_opacity(now) * transition_opacity).clamp(0.0, 1.0);
-    let mut stage_layers = if list_op > 0.01 {
+    // Debug tuning hides splash art (WYSIWYG ambience) but keeps the stage
+    // vignette so the layer matches the standalone preview exactly.
+    // Untuned paths are untouched (including the art-less cold-load stage).
+    let mut stage_layers = if state.ambient_tuning_active() {
+        vec![
+            shader(VignetteProgram::new(0.55))
+                .width(Fill)
+                .height(Fill)
+                .into(),
+        ]
+    } else if list_op > 0.01 {
         stage_backdrop_layers(state, now)
     } else {
         Vec::new()

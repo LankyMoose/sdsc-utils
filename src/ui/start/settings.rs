@@ -87,6 +87,10 @@ pub struct StartSettingsSnapshot {
     pub perf_vsync_boot: bool,
     /// Reload queued (row disabled, spinner shown until exit).
     pub perf_reload_queued: bool,
+    /// Whether the Start window is immersive (the in-drawer "tune ambience"
+    /// entry is immersive-only: the tuning panel previews the immersive-rate
+    /// background, which compact's slow-drift backdrop cannot show).
+    pub immersive: bool,
 }
 
 /// Focusable rows in the Start settings list (dynamic when sounds/haptics off).
@@ -112,6 +116,9 @@ pub enum SettingsRow {
     PerfVsync,
     /// Reload action, visible only while renderer prefs differ from boot.
     PerfReload,
+    /// Debug-only entry opening the in-immersive ambience tuning panel.
+    #[cfg(debug_assertions)]
+    TuneAmbience,
 }
 
 impl SettingsRow {
@@ -120,7 +127,11 @@ impl SettingsRow {
     /// everywhere (visibly), and reordering here reorders all three together.
     /// To add a row: append/reorder here, extend `visible()` + `section_before()`
     /// / `gap_before()` + the `panel_view` build match + `kind()`/dispatch arms.
-    pub const ALL: [Self; 19] = [
+    #[cfg(debug_assertions)]
+    pub const ROW_COUNT: usize = 20;
+    #[cfg(not(debug_assertions))]
+    pub const ROW_COUNT: usize = 19;
+    pub const ALL: [Self; Self::ROW_COUNT] = [
         Self::AutoOpen,
         Self::SelectionPersist,
         Self::SelectionMode,
@@ -140,6 +151,8 @@ impl SettingsRow {
         Self::PerfAntialiasing,
         Self::PerfVsync,
         Self::PerfReload,
+        #[cfg(debug_assertions)]
+        Self::TuneAmbience,
     ];
 
     /// Conditional visibility shared by ALL THREE paths (focus order, panel
@@ -173,13 +186,15 @@ impl SettingsRow {
             Self::SoundVolume => snapshot.sounds_enabled,
             Self::HapticsStrength => snapshot.haptics_enabled,
             Self::SelectionMode => snapshot.selection_persist,
+            #[cfg(debug_assertions)]
+            Self::TuneAmbience => snapshot.immersive,
         }
     }
 
     pub fn focusable(snapshot: &StartSettingsSnapshot) -> Vec<Self> {
         debug_assert!(
             {
-                let mut seen = [false; 19];
+                let mut seen = [false; Self::ROW_COUNT];
                 let mut dup = false;
                 for row in Self::ALL {
                     let idx = row as usize;
@@ -212,6 +227,8 @@ impl SettingsRow {
             Self::AlwaysImmersive => Some("Immersive"),
             Self::Sounds => Some("Feedback"),
             Self::PerfThrottle => Some("Performance"),
+            #[cfg(debug_assertions)]
+            Self::TuneAmbience => Some("Ambience"),
             Self::Clock
             | Self::SelectionMode
             | Self::ImmersiveLayout
@@ -236,6 +253,8 @@ impl SettingsRow {
             Self::SelectionPersist | Self::AlwaysImmersive | Self::Sounds | Self::PerfThrottle => {
                 true
             }
+            #[cfg(debug_assertions)]
+            Self::TuneAmbience => true,
             Self::AutoOpen
             | Self::SelectionMode
             | Self::Clock
@@ -289,6 +308,8 @@ impl SettingsRow {
             | Self::PerfAntialiasing
             | Self::PerfVsync => RowKind::Toggle,
             Self::PerfReload => RowKind::Action,
+            #[cfg(debug_assertions)]
+            Self::TuneAmbience => RowKind::Action,
             Self::IdleSecs
             | Self::SleepSecs
             | Self::IdleDim
@@ -554,6 +575,8 @@ pub fn settings_nav_cue(row: SettingsRow) -> SettingsCue {
         | SettingsRow::PerfAntialiasing
         | SettingsRow::PerfVsync
         | SettingsRow::PerfReload => SettingsCue::Full,
+        #[cfg(debug_assertions)]
+        SettingsRow::TuneAmbience => SettingsCue::Full,
     }
 }
 
@@ -819,6 +842,10 @@ pub fn scrim_dim(progress: f32) -> f32 {
 
 /// Confirm on the focused row (toggle / activate button).
 pub fn confirm_message(row: SettingsRow, snapshot: &StartSettingsSnapshot) -> Option<StartMessage> {
+    #[cfg(debug_assertions)]
+    if row == SettingsRow::TuneAmbience {
+        return Some(StartMessage::OpenAmbientTuning);
+    }
     match row.kind() {
         // Selectors open the dropdown; picking happens from the menu highlight.
         RowKind::Selector => Some(row.open_menu()),
@@ -924,6 +951,8 @@ fn row_helper(row: SettingsRow) -> Option<&'static str> {
         SettingsRow::PerfAntialiasing => Some("Smoother edges"),
         SettingsRow::PerfVsync => Some("Sync to display; off may tear"),
         SettingsRow::PerfReload => None,
+        #[cfg(debug_assertions)]
+        SettingsRow::TuneAmbience => Some("Preview and tune the ambient background live"),
     }
 }
 
@@ -1434,6 +1463,26 @@ pub fn panel_view<'a>(
                 ty,
                 snapshot.perf_reload_queued,
             ),
+            #[cfg(debug_assertions)]
+            SettingsRow::TuneAmbience => container(
+                button(
+                    text("Tune ambience")
+                        .size(ty.body)
+                        .width(Fill)
+                        .align_x(Alignment::Center),
+                )
+                .width(Fill)
+                .height(Length::Fixed(ACTION_BUTTON_H))
+                .padding([4, 12])
+                .on_press(StartMessage::OpenAmbientTuning)
+                .style(theme::primary),
+            )
+            .padding(ROW_PAD)
+            .width(Fill)
+            .height(Length::Fixed(action_row_h()))
+            .align_y(Alignment::Center)
+            .style(focus_style(focused))
+            .into(),
         };
         #[cfg(debug_assertions)]
         built_rows.push(row);
@@ -1897,6 +1946,7 @@ mod tests {
             perf_aa_boot: true,
             perf_vsync_boot: true,
             perf_reload_queued: false,
+            immersive: false,
         }
     }
 
@@ -1931,6 +1981,11 @@ mod tests {
         dirty.perf_reload_queued = true;
         drop(panel_view(&state, &dirty, false, false));
         drop(panel_view(&state, &dirty, true, true));
+        // Immersive-only debug entry: the trailing "tune ambience" action
+        // row must build (compact never lists it).
+        let mut immersive = snapshot.clone();
+        immersive.immersive = true;
+        drop(panel_view(&state, &immersive, true, true));
     }
 
     #[test]
@@ -1972,6 +2027,23 @@ mod tests {
         let rows = SettingsRow::focusable(&s);
         assert!(!rows.contains(&SettingsRow::SelectionMode));
         assert!(!rows.contains(&SettingsRow::SelectionPersist));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn tune_ambience_row_is_immersive_only_and_trailing() {
+        // Compact never offers the tuning entry (the panel previews the
+        // immersive-rate background); immersive lists it last, after the
+        // Performance block, and Confirm opens the tuning panel.
+        let compact = snap(true, true);
+        assert!(!compact.immersive);
+        assert!(!SettingsRow::focusable(&compact).contains(&SettingsRow::TuneAmbience));
+        let mut immersive = snap(true, true);
+        immersive.immersive = true;
+        let rows = SettingsRow::focusable(&immersive);
+        assert_eq!(rows.last(), Some(&SettingsRow::TuneAmbience));
+        let msg = confirm_message(SettingsRow::TuneAmbience, &immersive).unwrap();
+        assert!(matches!(msg, StartMessage::OpenAmbientTuning));
     }
 
     #[test]
@@ -2247,7 +2319,7 @@ mod tests {
     #[test]
     fn triple_agreement_focusable_panel_bounds() {
         // The single table lists every variant exactly once, in display order.
-        assert_eq!(SettingsRow::ALL.len(), 19);
+        assert_eq!(SettingsRow::ALL.len(), SettingsRow::ROW_COUNT);
         {
             let mut sorted = SettingsRow::ALL;
             sorted.sort_by_key(|row| *row as usize);

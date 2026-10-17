@@ -368,6 +368,10 @@ pub struct App {
     /// immersive"): immersive-rate background without opening Start.
     #[cfg(debug_assertions)]
     preview_window: Option<window::Id>,
+    /// Debug-only R3 release latch for the tuning chrome toggle (holding R3
+    /// must not strobe the hide/show).
+    #[cfg(debug_assertions)]
+    ambient_r3_latched: bool,
     /// Debug-only window stress test in flight (Diagnostics section).
     #[cfg(debug_assertions)]
     stress_running: bool,
@@ -682,6 +686,8 @@ impl App {
             configure_window: None,
             #[cfg(debug_assertions)]
             preview_window: None,
+            #[cfg(debug_assertions)]
+            ambient_r3_latched: false,
             #[cfg(debug_assertions)]
             stress_running: false,
             #[cfg(debug_assertions)]
@@ -1165,6 +1171,19 @@ impl App {
                 self.debug_layout_bounds,
             )
             .map(Message::Start);
+            // Debug R3 hide shows pure ambience: no toast composite either.
+            #[cfg(debug_assertions)]
+            let start = if self.start_state.ambient_tuning_active()
+                && self.start_state.ambient_tune_hide_chrome
+            {
+                start
+            } else {
+                match self.immersive_toast_overlay() {
+                    Some(toast) => stack![start, toast].width(Fill).height(Fill).into(),
+                    None => start,
+                }
+            };
+            #[cfg(not(debug_assertions))]
             let start = match self.immersive_toast_overlay() {
                 Some(toast) => stack![start, toast].width(Fill).height(Fill).into(),
                 None => start,
@@ -1640,7 +1659,9 @@ impl App {
                     return match action {
                         StartKeyAction::Up if pressed => {
                             self.cancel_start_holds();
-                            if self.start_state.settings.open {
+                            if self.start_state.ambient_tuning_active() {
+                                self.on_ambient_tuning_nav(Some(NavAction::Up))
+                            } else if self.start_state.settings.open {
                                 self.on_start_settings_nav(Some(NavAction::Up))
                             } else if self.immersive_horizontal_games_nav() {
                                 // Horizontal Games strip scrolls Left/Right only.
@@ -1651,7 +1672,9 @@ impl App {
                         }
                         StartKeyAction::Down if pressed => {
                             self.cancel_start_holds();
-                            if self.start_state.settings.open {
+                            if self.start_state.ambient_tuning_active() {
+                                self.on_ambient_tuning_nav(Some(NavAction::Down))
+                            } else if self.start_state.settings.open {
                                 self.on_start_settings_nav(Some(NavAction::Down))
                             } else if self.immersive_horizontal_games_nav() {
                                 // Horizontal Games strip scrolls Left/Right only.
@@ -1666,7 +1689,9 @@ impl App {
                                     || self.start_state.settings.open) =>
                         {
                             self.cancel_start_holds();
-                            if self.start_state.settings.open {
+                            if self.start_state.ambient_tuning_active() {
+                                self.on_ambient_tuning_nav(Some(NavAction::PrevSlide))
+                            } else if self.start_state.settings.open {
                                 self.on_start_settings_nav(Some(NavAction::PrevSlide))
                             } else if self.immersive_horizontal_games_nav() {
                                 self.on_start_message(StartMessage::MoveUp)
@@ -1680,7 +1705,9 @@ impl App {
                                     || self.start_state.settings.open) =>
                         {
                             self.cancel_start_holds();
-                            if self.start_state.settings.open {
+                            if self.start_state.ambient_tuning_active() {
+                                self.on_ambient_tuning_nav(Some(NavAction::NextSlide))
+                            } else if self.start_state.settings.open {
                                 self.on_start_settings_nav(Some(NavAction::NextSlide))
                             } else if self.immersive_horizontal_games_nav() {
                                 self.on_start_message(StartMessage::MoveDown)
@@ -1698,7 +1725,9 @@ impl App {
                                 Task::none()
                             } else if !pressed {
                                 self.cancel_start_holds();
-                                if self.start_state.settings.open {
+                                if self.start_state.ambient_tuning_active() {
+                                    self.on_ambient_tuning_nav(Some(NavAction::Confirm))
+                                } else if self.start_state.settings.open {
                                     self.on_start_settings_nav(Some(NavAction::Confirm))
                                 } else {
                                     self.on_start_message(StartMessage::Confirm)
@@ -1712,7 +1741,9 @@ impl App {
                             self.sync_start_held();
                             if !pressed {
                                 self.cancel_start_holds();
-                                if self.start_state.settings.any_menu_open() {
+                                if self.start_state.ambient_tuning_active() {
+                                    self.on_ambient_tuning_nav(Some(NavAction::Cancel))
+                                } else if self.start_state.settings.any_menu_open() {
                                     // Expanded dropdown owns Cancel: Esc closes the
                                     // menu only, exactly like pad Circle — not the
                                     // whole settings surface.
@@ -2815,25 +2846,7 @@ impl App {
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::ResetDebugAmbientTuning => {
-                let defaults = crate::ui::configure::DebugAmbientTune::default();
-                self.debug_ambient_freq = defaults.pulse_freq;
-                self.debug_ambient_veil_freq = defaults.veil_freq;
-                self.debug_ambient_pulse_min = defaults.pulse_min;
-                self.debug_ambient_pulse_max = defaults.pulse_max;
-                self.debug_ambient_orb_speed = defaults.orb_speed;
-                self.debug_ambient_glow_hue = defaults.glow_hue;
-                self.debug_ambient_orb_min_x = defaults.orb_min_x;
-                self.debug_ambient_orb_max_x = defaults.orb_max_x;
-                self.debug_ambient_orb_min_y = defaults.orb_min_y;
-                self.debug_ambient_orb_max_y = defaults.orb_max_y;
-                self.debug_ambient_grain = defaults.grain_gain;
-                self.debug_ambient_time_scale = defaults.time_scale;
-                self.debug_kenburns_amp = defaults.kenburns_amp;
-                self.debug_kenburns_pan = defaults.kenburns_pan;
-                self.debug_kenburns_speed = defaults.kenburns_speed;
-                crate::ui::shader::ambient::reset_ambient_tuning();
-                crate::ui::start::mode::reset_kenburns_tuning();
-                self.start_state.ambient_tuning_keepalive = false;
+                self.reset_debug_tuning();
                 Task::none()
             }
             #[cfg(debug_assertions)]
@@ -2956,6 +2969,250 @@ impl App {
             kenburns_amp: self.debug_kenburns_amp,
             kenburns_pan: self.debug_kenburns_pan,
             kenburns_speed: self.debug_kenburns_speed,
+        }
+    }
+
+    /// Restore shipped ambient + ken-burns tuning (Diagnostics Reset and the
+    /// in-immersive tuning panel share this; never persisted).
+    #[cfg(debug_assertions)]
+    fn reset_debug_tuning(&mut self) {
+        let defaults = crate::ui::configure::DebugAmbientTune::default();
+        self.debug_ambient_freq = defaults.pulse_freq;
+        self.debug_ambient_veil_freq = defaults.veil_freq;
+        self.debug_ambient_pulse_min = defaults.pulse_min;
+        self.debug_ambient_pulse_max = defaults.pulse_max;
+        self.debug_ambient_orb_speed = defaults.orb_speed;
+        self.debug_ambient_glow_hue = defaults.glow_hue;
+        self.debug_ambient_orb_min_x = defaults.orb_min_x;
+        self.debug_ambient_orb_max_x = defaults.orb_max_x;
+        self.debug_ambient_orb_min_y = defaults.orb_min_y;
+        self.debug_ambient_orb_max_y = defaults.orb_max_y;
+        self.debug_ambient_grain = defaults.grain_gain;
+        self.debug_ambient_time_scale = defaults.time_scale;
+        self.debug_kenburns_amp = defaults.kenburns_amp;
+        self.debug_kenburns_pan = defaults.kenburns_pan;
+        self.debug_kenburns_speed = defaults.kenburns_speed;
+        crate::ui::shader::ambient::reset_ambient_tuning();
+        crate::ui::start::mode::reset_kenburns_tuning();
+        self.start_state.ambient_tuning_keepalive = false;
+    }
+
+    /// Apply one absolute tuning commit from the in-immersive tuning panel
+    /// (pad nudge or mouse drag): mirror into the shell fields (drives the
+    /// keep-alive + Settings sliders) and the process-wide tuning atomics
+    /// (drives the shader). Ranges match the Diagnostics sliders; the
+    /// setters clamp defensively.
+    #[cfg(debug_assertions)]
+    fn apply_ambient_tune(
+        &mut self,
+        param: crate::ui::start::ambient_tune::AmbientTuneParam,
+        value: f32,
+    ) -> Task<Message> {
+        use crate::ui::start::ambient_tune::AmbientTuneParam as P;
+        match param {
+            P::PulseFreq => {
+                self.debug_ambient_freq = value.clamp(0.0, 5.0);
+                crate::ui::shader::ambient::set_pulse_freq(self.debug_ambient_freq);
+            }
+            P::PulseMin => {
+                self.debug_ambient_pulse_min = value.clamp(0.0, 0.6);
+                crate::ui::shader::ambient::set_pulse_min(self.debug_ambient_pulse_min);
+            }
+            P::PulseMax => {
+                self.debug_ambient_pulse_max = value.clamp(0.0, 0.6);
+                crate::ui::shader::ambient::set_pulse_max(self.debug_ambient_pulse_max);
+            }
+            P::GlowHue => {
+                self.debug_ambient_glow_hue = value.clamp(0.0, 360.0);
+                crate::ui::shader::ambient::set_glow_hue(self.debug_ambient_glow_hue);
+            }
+            P::OrbSpeed => {
+                self.debug_ambient_orb_speed = value.clamp(0.0, 3.0);
+                crate::ui::shader::ambient::set_orb_speed(self.debug_ambient_orb_speed);
+            }
+            P::OrbMinX => {
+                self.debug_ambient_orb_min_x = value.clamp(-1.0, 1.0);
+                crate::ui::shader::ambient::set_orb_min_x(self.debug_ambient_orb_min_x);
+            }
+            P::OrbMaxX => {
+                self.debug_ambient_orb_max_x = value.clamp(-1.0, 1.0);
+                crate::ui::shader::ambient::set_orb_max_x(self.debug_ambient_orb_max_x);
+            }
+            P::OrbMinY => {
+                self.debug_ambient_orb_min_y = value.clamp(-1.0, 1.0);
+                crate::ui::shader::ambient::set_orb_min_y(self.debug_ambient_orb_min_y);
+            }
+            P::OrbMaxY => {
+                self.debug_ambient_orb_max_y = value.clamp(-1.0, 1.0);
+                crate::ui::shader::ambient::set_orb_max_y(self.debug_ambient_orb_max_y);
+            }
+            P::VeilFreq => {
+                self.debug_ambient_veil_freq = value.clamp(0.0, 8.0);
+                crate::ui::shader::ambient::set_veil_freq(self.debug_ambient_veil_freq);
+            }
+            P::Grain => {
+                self.debug_ambient_grain = value.clamp(0.0, 5.0);
+                crate::ui::shader::ambient::set_grain_gain(self.debug_ambient_grain);
+            }
+            P::TimeScale => {
+                self.debug_ambient_time_scale = value.clamp(0.0, 4.0);
+                crate::ui::shader::ambient::set_time_scale(self.debug_ambient_time_scale);
+            }
+        }
+        self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+        Task::none()
+    }
+
+    /// Open the in-immersive tuning panel: drawer closes, panel resets.
+    #[cfg(debug_assertions)]
+    fn open_ambient_tuning(&mut self) -> Task<Message> {
+        self.ambient_r3_latched = false;
+        self.start_state.request_ambient_tuning(true);
+        self.start_state.request_settings(false, Instant::now());
+        crate::controller::hid::diag::diag_info("ui-diag: start ambient tuning open");
+        Task::none()
+    }
+
+    /// Close the tuning panel; `reopen_drawer` returns to the drawer.
+    #[cfg(debug_assertions)]
+    fn close_ambient_tuning(&mut self, reopen_drawer: bool) -> Task<Message> {
+        self.ambient_r3_latched = false;
+        self.start_state.request_ambient_tuning(false);
+        if reopen_drawer {
+            self.start_state.request_settings(true, Instant::now());
+        }
+        crate::controller::hid::diag::diag_info("ui-diag: start ambient tuning close");
+        Task::none()
+    }
+
+    /// R3 rising edge while tuning: toggle all on-screen elements (panel
+    /// included) for a clean preview. Release-latched so holding R3 cannot
+    /// strobe. Pad-only (R3 has no NavAction); tuning-scoped.
+    #[cfg(debug_assertions)]
+    fn toggle_ambient_chrome_from_r3(
+        &mut self,
+        readings: &[start_input::NavReading],
+    ) -> Option<Task<Message>> {
+        if !self.start_visible
+            || !self.start_state.immersive
+            || !self.start_state.ambient_tuning_active()
+        {
+            return None;
+        }
+        let held = readings
+            .iter()
+            .any(|r| r.sample.held.contains(&gesture::GestureControl::R3));
+        if held && !self.ambient_r3_latched {
+            self.ambient_r3_latched = true;
+            self.start_state.ambient_tune_hide_chrome = !self.start_state.ambient_tune_hide_chrome;
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start ambient chrome hidden={}",
+                self.start_state.ambient_tune_hide_chrome as u8
+            ));
+            self.play_start_cue(UiSoundKind::Nav);
+            return Some(Task::none());
+        }
+        if !held {
+            self.ambient_r3_latched = false;
+        }
+        None
+    }
+
+    /// Scroll the tuning list to keep the focused row in view.
+    #[cfg(debug_assertions)]
+    fn scroll_ambient_tune_into_view(&self) -> Task<Message> {
+        use crate::ui::start::ambient_tune::{TuneRow, tune_reveal_y};
+        let focus = self
+            .start_state
+            .ambient_tune_focus
+            .min(TuneRow::count().saturating_sub(1));
+        let Some(y) = tune_reveal_y(
+            focus,
+            self.start_state.ambient_tune_scroll_y,
+            self.start_state.ambient_tune_viewport_h,
+        ) else {
+            return Task::none();
+        };
+        operation::scroll_to(
+            crate::ui::start::ambient_tune::tune_scroll_id(),
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
+        )
+    }
+
+    /// Pad/keyboard nav while the tuning panel is open. Mirrors the settings
+    /// drawer dispatch: Up/Down move focus, Left/Right nudge sliders, Cross
+    /// confirms buttons, Circle closes back to the drawer. Release stub:
+    /// the panel cannot open there.
+    fn on_ambient_tuning_nav(&mut self, action: Option<NavAction>) -> Task<Message> {
+        #[cfg(debug_assertions)]
+        {
+            use crate::ui::start::ambient_tune::TuneRow;
+            let Some(action) = action else {
+                return Task::none();
+            };
+            match action {
+                NavAction::Up => {
+                    if self.start_state.move_ambient_tune_focus(-1) {
+                        self.play_start_cue(UiSoundKind::Nav);
+                        return self.scroll_ambient_tune_into_view();
+                    }
+                    Task::none()
+                }
+                NavAction::Down => {
+                    if self.start_state.move_ambient_tune_focus(1) {
+                        self.play_start_cue(UiSoundKind::Nav);
+                        return self.scroll_ambient_tune_into_view();
+                    }
+                    Task::none()
+                }
+                NavAction::PrevSlide | NavAction::NextSlide => {
+                    let delta = if matches!(action, NavAction::PrevSlide) {
+                        -1
+                    } else {
+                        1
+                    };
+                    let focus = self
+                        .start_state
+                        .ambient_tune_focus
+                        .min(TuneRow::count().saturating_sub(1));
+                    if let TuneRow::Param(param) = TuneRow::ALL[focus]
+                        && let Some(next) = param.nudge(delta)
+                    {
+                        self.play_start_cue(UiSoundKind::Nav);
+                        return self.apply_ambient_tune(param, next);
+                    }
+                    Task::none()
+                }
+                NavAction::Confirm => {
+                    let focus = self
+                        .start_state
+                        .ambient_tune_focus
+                        .min(TuneRow::count().saturating_sub(1));
+                    match TuneRow::ALL[focus] {
+                        TuneRow::Reset => {
+                            self.play_start_cue(UiSoundKind::Action);
+                            self.reset_debug_tuning();
+                            Task::none()
+                        }
+                        TuneRow::Done => {
+                            self.play_start_cue(UiSoundKind::Action);
+                            self.close_ambient_tuning(true)
+                        }
+                        TuneRow::Param(_) => Task::none(),
+                    }
+                }
+                NavAction::Cancel => self.close_ambient_tuning(true),
+                NavAction::ToggleSettings => self.close_ambient_tuning(false),
+                _ => Task::none(),
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = action;
+            Task::none()
         }
     }
 
@@ -4137,6 +4394,7 @@ impl App {
             perf_aa_boot: self.renderer_boot_aa,
             perf_vsync_boot: self.renderer_boot_vsync,
             perf_reload_queued: self.renderer_reload_queued,
+            immersive: self.start_state.immersive,
         }
     }
 
@@ -4750,6 +5008,10 @@ impl App {
         else {
             return steam;
         };
+        // The tuning panel is immersive-settled chrome: never carry it
+        // across a window morph (drawer stays closed; reopen from the drawer).
+        #[cfg(debug_assertions)]
+        self.start_state.request_ambient_tuning(false);
         let cover = primary_monitor_cover().unwrap_or(MonitorCover {
             x: 0.0,
             y: 0.0,
@@ -4801,6 +5063,9 @@ impl App {
         else {
             return Task::none();
         };
+        // Same as promote: the tuning panel never survives a window morph.
+        #[cfg(debug_assertions)]
+        self.start_state.request_ambient_tuning(false);
         self.arm_chord_release_latch();
         crate::controller::hid::diag::diag_info("ui-diag: start immersive leave");
         self.clear_start_activity();
@@ -5355,6 +5620,9 @@ impl App {
         self.start_nav_ready = false;
         self.start_revealed_at = None;
         self.start_state.immersive = false;
+        // Tuning is immersive-settled state: never reopen with it on.
+        #[cfg(debug_assertions)]
+        self.start_state.request_ambient_tuning(false);
         self.start_state.clear_immersive_session();
         // Drop any in-flight promote/demote ceremony (animated growth must
         // not keep resizing a closing window; reopen starts clean).
@@ -5826,6 +6094,22 @@ impl App {
             StartMessage::SetPerfAntialiasing(enabled) => self.apply_perf_antialiasing(enabled),
             StartMessage::SetPerfVsync(enabled) => self.apply_perf_vsync(enabled),
             StartMessage::ReloadUi => self.reload_ui_for_renderer(),
+            #[cfg(debug_assertions)]
+            StartMessage::OpenAmbientTuning => self.open_ambient_tuning(),
+            #[cfg(debug_assertions)]
+            StartMessage::CloseAmbientTuning => self.close_ambient_tuning(true),
+            #[cfg(debug_assertions)]
+            StartMessage::SetAmbientTune(param, value) => self.apply_ambient_tune(param, value),
+            #[cfg(debug_assertions)]
+            StartMessage::ResetAmbientTuning => {
+                self.reset_debug_tuning();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            StartMessage::AmbientTuneScrolled(y, h) => {
+                self.start_state.sync_ambient_tune_scroll(y, h);
+                Task::none()
+            }
             #[cfg(debug_assertions)]
             StartMessage::ReportLightbarFailure => {
                 self.mark_hitch_now("lightbar");
@@ -6524,6 +6808,13 @@ impl App {
             return toggle;
         }
 
+        // Debug R3: hide/show all chrome while tuning (pad-only; R3 carries
+        // no NavAction). Tuning-scoped, so it never fires in normal chrome.
+        #[cfg(debug_assertions)]
+        if let Some(task) = self.toggle_ambient_chrome_from_r3(readings) {
+            return task;
+        }
+
         let animating = self.start_state.animating();
         // Mid-slide: keep Left/Right nav live for interruptible request_slide,
         // but skip controller-row rebuilds (those hitch the UI thread).
@@ -6625,7 +6916,17 @@ impl App {
             .or(tick.triangle_completed_pad.as_ref());
         self.set_haptic_pad_from_id(haptic_pad);
 
-        let nav_task = if tick.action == Some(NavAction::ToggleSettings) {
+        let nav_task = if self.start_state.ambient_tuning_active() {
+            // Debug tuning panel owns pad nav while open: Up/Down focus,
+            // Left/Right nudge, Cross confirm, Circle done. Holds reset so
+            // game close / power-off cannot arm under the panel, and
+            // overlay_blocking already parks the message-driven game paths.
+            self.start_state.cross_progress = 0.0;
+            self.start_state.triangle_progress = 0.0;
+            self.keyboard_cross_hold.reset();
+            self.start_state.tick_hint_anims(now);
+            self.on_ambient_tuning_nav(tick.action)
+        } else if tick.action == Some(NavAction::ToggleSettings) {
             self.start_state.tick_hint_anims(now);
             self.on_start_message(StartMessage::ToggleSettings)
         } else if settings_open {

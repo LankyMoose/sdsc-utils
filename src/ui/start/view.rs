@@ -157,6 +157,21 @@ pub enum StartMessage {
     SetPerfVsync(bool),
     /// Reload the UI to apply boot-only renderer prefs (AA/vsync).
     ReloadUi,
+    /// Debug-only: open the in-immersive ambience tuning panel.
+    #[cfg(debug_assertions)]
+    OpenAmbientTuning,
+    /// Debug-only: close the tuning panel (the shell reopens the drawer).
+    #[cfg(debug_assertions)]
+    CloseAmbientTuning,
+    /// Debug-only: absolute tuning commit from the tuning panel (pad + mouse).
+    #[cfg(debug_assertions)]
+    SetAmbientTune(crate::ui::start::ambient_tune::AmbientTuneParam, f32),
+    /// Debug-only: restore shipped tuning from the tuning panel.
+    #[cfg(debug_assertions)]
+    ResetAmbientTuning,
+    /// Debug-only: tuning list scroll report (focus-follow + viewport track).
+    #[cfg(debug_assertions)]
+    AmbientTuneScrolled(f32, f32),
     /// Mouse-only: stamp lightbar-miss hitch for multi-session diag.
     #[cfg(debug_assertions)]
     ReportLightbarFailure,
@@ -896,6 +911,23 @@ pub struct State {
     /// advances the clock by capped wall-clock deltas (never fixed steps per
     /// call) so report-rate pad edges sharing the tick cannot fast-forward it.
     ambient_last_tick: Option<Instant>,
+    /// Debug-only in-immersive ambience tuning panel ("tune ambience").
+    /// While open the drawer stays closed, splash art is hidden, and R3
+    /// toggles all chrome (including the panel) for a clean preview.
+    #[cfg(debug_assertions)]
+    pub ambient_tune_open: bool,
+    /// Debug-only R3 chrome hide while tuning (panel included; R3 restores).
+    #[cfg(debug_assertions)]
+    pub ambient_tune_hide_chrome: bool,
+    /// Debug-only tuning panel focus (pad Up/Down, wraps).
+    #[cfg(debug_assertions)]
+    pub ambient_tune_focus: usize,
+    /// Debug-only tuning list scroll offset + viewport (focus-follow).
+    #[cfg(debug_assertions)]
+    pub ambient_tune_scroll_y: f32,
+    /// Debug-only tuning list viewport height (focus-follow fallback).
+    #[cfg(debug_assertions)]
+    pub ambient_tune_viewport_h: f32,
     /// Debug-only ambient/ken-burns tuning active (Diagnostics sliders).
     /// While set, immersive keeps frames flowing even under the idle
     /// throttle so tuning (including freeze toggles) repaints immediately.
@@ -1112,6 +1144,16 @@ impl Default for State {
             perf_throttle_immersive: false,
             ambient_time: 0.0,
             ambient_last_tick: None,
+            #[cfg(debug_assertions)]
+            ambient_tune_open: false,
+            #[cfg(debug_assertions)]
+            ambient_tune_hide_chrome: false,
+            #[cfg(debug_assertions)]
+            ambient_tune_focus: 0,
+            #[cfg(debug_assertions)]
+            ambient_tune_scroll_y: 0.0,
+            #[cfg(debug_assertions)]
+            ambient_tune_viewport_h: 0.0,
             #[cfg(debug_assertions)]
             ambient_tuning_keepalive: false,
             backdrop_current: None,
@@ -1697,6 +1739,7 @@ impl State {
             || self.manual_add.is_some()
             || self.settings.open
             || self.settings.anim.is_some()
+            || self.ambient_tuning_active()
     }
 
     /// Toggle Options settings. Compact opens instantly; immersive slides the drawer.
@@ -1765,6 +1808,7 @@ impl State {
             || self.backdrop_outgoing.is_some()
             || (self.immersive && !self.perf_throttle_immersive)
             || (self.immersive && self.debug_tuning_keepalive())
+            || self.ambient_tuning_active()
             || self.cold_load_active
             || self.triangle_progress > 0.0
             || self.cross_progress > 0.0
@@ -1801,6 +1845,7 @@ impl State {
             || self.backdrop_current.is_some()
             || self.backdrop_outgoing.is_some()
             || self.debug_tuning_keepalive()
+            || self.ambient_tuning_active()
             || self.cold_load_active
             || self.triangle_progress > 0.0
             || self.cross_progress > 0.0
@@ -1826,6 +1871,51 @@ impl State {
     /// the next subscription evaluation simply stops/starts `StartFrame`).
     pub fn sync_perf_throttle(&mut self, throttle: bool) {
         self.perf_throttle_immersive = throttle;
+    }
+
+    /// In-immersive ambience tuning panel visible (debug "tune ambience").
+    /// Release: always false (no tuning exists).
+    pub fn ambient_tuning_active(&self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            self.ambient_tune_open
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
+        }
+    }
+
+    /// Open/close the tuning panel (debug-only "tune ambience"). The chrome
+    /// hide never survives a close (hide implies open); opening resets
+    /// focus/scroll.
+    #[cfg(debug_assertions)]
+    pub fn request_ambient_tuning(&mut self, open: bool) {
+        self.ambient_tune_open = open;
+        self.ambient_tune_hide_chrome = false;
+        if open {
+            self.ambient_tune_focus = 0;
+            self.ambient_tune_scroll_y = 0.0;
+        }
+    }
+
+    /// Move tuning focus with wrap (debug-only pad/keyboard nav).
+    #[cfg(debug_assertions)]
+    pub fn move_ambient_tune_focus(&mut self, delta: isize) -> bool {
+        let n = crate::ui::start::ambient_tune::TuneRow::count().max(1) as isize;
+        let next = (self.ambient_tune_focus as isize + delta).rem_euclid(n) as usize;
+        if next == self.ambient_tune_focus {
+            return false;
+        }
+        self.ambient_tune_focus = next;
+        true
+    }
+
+    /// Sync tuning list scroll report (debug-only focus-follow + viewport).
+    #[cfg(debug_assertions)]
+    pub fn sync_ambient_tune_scroll(&mut self, y: f32, viewport_h: f32) {
+        self.ambient_tune_scroll_y = y;
+        self.ambient_tune_viewport_h = viewport_h;
     }
 
     /// Debug tuning keep-alive (see [`State::ambient_tuning_keepalive`]).
@@ -6639,6 +6729,38 @@ mod tests {
         let mut compact_throttled = State::default();
         compact_throttled.sync_perf_throttle(true);
         assert!(!compact_throttled.needs_frames());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn ambient_tuning_panel_blocks_overlays_and_needs_frames() {
+        // Opening the tuning panel blocks game nav like other modals, and
+        // keeps frames flowing even under the idle throttle so the live
+        // preview never freezes.
+        let mut state = State {
+            immersive: true,
+            ..State::default()
+        };
+        state.sync_perf_throttle(true);
+        assert!(!state.ambient_tuning_active());
+        assert!(!state.needs_frames());
+        assert!(!state.overlay_blocking());
+        state.request_ambient_tuning(true);
+        assert!(state.ambient_tuning_active());
+        assert!(state.needs_frames());
+        assert!(state.immersive_anim_active());
+        assert!(state.overlay_blocking());
+        // Focus wraps; hide toggle is independent of focus.
+        assert!(state.move_ambient_tune_focus(1));
+        assert_eq!(state.ambient_tune_focus, 1);
+        assert!(state.move_ambient_tune_focus(-1));
+        assert_eq!(state.ambient_tune_focus, 0);
+        state.ambient_tune_hide_chrome = true;
+        assert!(state.overlay_blocking());
+        state.request_ambient_tuning(false);
+        assert!(!state.ambient_tuning_active());
+        assert!(!state.needs_frames());
+        assert!(!state.overlay_blocking());
     }
 
     #[cfg(debug_assertions)]

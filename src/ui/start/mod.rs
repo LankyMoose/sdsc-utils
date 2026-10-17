@@ -1,3 +1,5 @@
+#[cfg(debug_assertions)]
+pub mod ambient_tune;
 pub mod art_worker;
 pub mod carousel;
 pub mod clock;
