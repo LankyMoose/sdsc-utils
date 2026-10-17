@@ -76,6 +76,14 @@ const HINT_ANIM: Duration = Duration::from_millis(crate::ui::motion::FAST_MS);
 const ROW_GAP: f32 = 8.0;
 /// Height of a games-list section separator (centered label + fading hairlines).
 const SECTION_SEP_H: f32 = 30.0;
+/// Right gutter that keeps the pinned section title exactly as wide as the
+/// in-list titles: the games scrollable embeds its scrollbar (`.spacing(8)`
+/// in [`games_list`]), so iced reserves `scrollbar width (10, iced default —
+/// the list sets no custom width) + margin × 2 (0) + spacing (8)` of layout
+/// space beside overflowing content. Only applied while the list actually
+/// overflows (see `games_max_scroll`); otherwise the gutter would mismatch
+/// in the other direction.
+const PINNED_SCROLL_GUTTER: f32 = 18.0;
 /// Size of the section separator label.
 const SECTION_SEP_TEXT: f32 = 14.0;
 const ROW_ACTION_SPACING: f32 = 14.0;
@@ -4880,7 +4888,23 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
             StartMessage::GamesScrolled(y, viewport.bounds().height)
         })
         .into();
-    let pinned = section_separator(labels.get(sticky.unwrap_or(0)).copied().unwrap_or(""));
+    let pinned_label = labels.get(sticky.unwrap_or(0)).copied().unwrap_or("");
+    // Width-match the in-list titles: when the list overflows, the embedded
+    // scrollbar narrows scrollable content by PINNED_SCROLL_GUTTER while the
+    // pinned bar (a sibling of the scrollable) keeps full width, stretching
+    // its fade rules. No gutter when everything fits (no scrollbar reserved).
+    let gutter = if state.games_max_scroll(state.scrolls.viewport(StartListId::Games)) > 0.0 {
+        PINNED_SCROLL_GUTTER
+    } else {
+        0.0
+    };
+    let pinned: Element<'_, StartMessage> = container(section_separator(pinned_label))
+        .padding(Padding {
+            right: gutter,
+            ..Padding::ZERO
+        })
+        .width(Fill)
+        .into();
     column![pinned, list].width(Fill).height(Fill).into()
 }
 
