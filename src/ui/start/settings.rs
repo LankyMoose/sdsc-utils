@@ -142,7 +142,6 @@ impl SettingsRow {
     pub fn visible(self, snapshot: &StartSettingsSnapshot) -> bool {
         match self {
             Self::AutoOpen
-            | Self::SelectionPersist
             | Self::AlwaysImmersive
             | Self::Clock
             | Self::ImmersiveLayout
@@ -156,6 +155,9 @@ impl SettingsRow {
             | Self::PerfThrottle
             | Self::PerfAntialiasing
             | Self::PerfVsync => true,
+            // Hidden feature: selection persistence is always off (no UI).
+            // The row, its logic, and the mode gate stay wired underneath.
+            Self::SelectionPersist => false,
             Self::PerfReload => crate::persist::prefs::renderer_restart_needed(
                 snapshot.perf_antialiasing,
                 snapshot.perf_vsync,
@@ -1340,7 +1342,7 @@ pub fn panel_view<'a>(
                 |on| SettingsRow::PerfVsync.set_toggle(on),
             ),
             SettingsRow::PerfReload => action_row(
-                "Reload UI to apply changes",
+                "Restart app to apply changes",
                 focused,
                 ty,
                 snapshot.perf_reload_queued,
@@ -1348,6 +1350,9 @@ pub fn panel_view<'a>(
         };
         #[cfg(debug_assertions)]
         built_rows.push(row);
+        #[cfg(debug_assertions)]
+        let widget = crate::ui::debug_bounds::wrap(widget, debug_bounds);
+        items = items.push(widget);
         // Expanded dropdown panel: every option selectable, highlight follows
         // the menu. Renders after its selector row wherever it sits, so rows
         // below shift from this table position (not a hardcoded sequence).
@@ -1356,9 +1361,6 @@ pub fn panel_view<'a>(
             let panel = crate::ui::debug_bounds::wrap(panel, debug_bounds);
             items = items.push(panel);
         }
-        #[cfg(debug_assertions)]
-        let widget = crate::ui::debug_bounds::wrap(widget, debug_bounds);
-        items = items.push(widget);
     }
     #[cfg(debug_assertions)]
     debug_assert_eq!(
@@ -1572,7 +1574,7 @@ fn toggle_row(
 /// Full-width reload action. Row and button heights are fixed
 /// ([`action_row_h`]) so the shared bounds geometry agrees with the built
 /// widget by construction. Content is left-aligned like every other row, and
-/// the idle label and the queued ("Reloading…" + spinner) state share the
+/// the idle label and the queued ("Restarting…" + spinner) state share the
 /// same box, so swapping states never moves layout. Disabled once queued so
 /// a second press cannot queue another restart.
 fn action_row(
@@ -1584,7 +1586,7 @@ fn action_row(
     let content: Element<'_, StartMessage> = if queued {
         container(
             row![
-                text("Reloading…").size(ty.body),
+                text("Restarting…").size(ty.body),
                 crate::ui::start::view::scan_spinner(14.0, Instant::now(), 1.0),
             ]
             .spacing(8)
@@ -1845,7 +1847,7 @@ mod tests {
             rows,
             vec![
                 SettingsRow::AutoOpen,
-                SettingsRow::SelectionPersist,
+                // SelectionPersist is a hidden row (never focusable).
                 SettingsRow::SelectionMode,
                 SettingsRow::AlwaysImmersive,
                 SettingsRow::Clock,
@@ -1867,13 +1869,16 @@ mod tests {
     }
 
     #[test]
-    fn selection_mode_hidden_while_persist_off() {
+    fn selection_rows_follow_the_hidden_persist_flag() {
+        // SelectionPersist is always hidden (no UI); SelectionMode renders
+        // only while the hidden flag is on.
         let mut s = snap(true, true);
         assert!(SettingsRow::focusable(&s).contains(&SettingsRow::SelectionMode));
+        assert!(!SettingsRow::focusable(&s).contains(&SettingsRow::SelectionPersist));
         s.selection_persist = false;
         let rows = SettingsRow::focusable(&s);
         assert!(!rows.contains(&SettingsRow::SelectionMode));
-        assert!(rows.contains(&SettingsRow::SelectionPersist));
+        assert!(!rows.contains(&SettingsRow::SelectionPersist));
     }
 
     #[test]

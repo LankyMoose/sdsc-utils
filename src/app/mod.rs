@@ -100,7 +100,7 @@ const PAD_POLL_ACTIVE: Duration = Duration::from_millis(4);
 /// UI animation tick (~60Hz). Prefer this over `window::frames()` so an
 /// AlwaysOnTop toast cannot starve other iced windows on Windows (iced#3108).
 const UI_TICK: Duration = Duration::from_millis(16);
-/// Feedback delay between the reload click (button flips to "Reloading…")
+/// Feedback delay between the reload click (button flips to "Restarting…")
 /// and the actual app exit.
 const RELOAD_FEEDBACK_DELAY: Duration = Duration::from_millis(700);
 /// How long a restore stays in its settle window after relaunch: row
@@ -2251,8 +2251,6 @@ impl App {
             lightbar_enabled: self.session.prefs.lightbar_enabled,
             start_screen_enabled: self.session.prefs.start_screen_enabled,
             start_screen_auto_open: self.session.prefs.start_screen_auto_open,
-            start_selection_persist: self.session.prefs.start_selection_persist,
-            start_selection_mode: self.session.prefs.start_selection_mode,
             start_screen_always_immersive: self.session.prefs.start_screen_always_immersive,
             start_screen_immersive_layout: self.session.prefs.start_screen_immersive_layout,
             start_screen_clock_enabled: self.session.prefs.start_screen_clock_enabled,
@@ -2435,10 +2433,6 @@ impl App {
             ConfigureMessage::SetStartScreenAutoOpen(enabled) => {
                 self.apply_start_screen_auto_open(enabled)
             }
-            ConfigureMessage::SetSelectionPersist(enabled) => {
-                self.apply_start_selection_persist(enabled)
-            }
-            ConfigureMessage::SetSelectionMode(mode) => self.apply_start_selection_mode(mode),
             ConfigureMessage::SetStartScreenAlwaysImmersive(enabled) => {
                 self.apply_start_screen_always_immersive(enabled)
             }

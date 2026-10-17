@@ -21,7 +21,7 @@ use crate::persist::analytics::{
 use crate::persist::prefs::{
     AUTO_OPEN_MODES, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout, LOW_BATTERY_PERCENT_MAX,
     LOW_BATTERY_PERCENT_MIN, NAVBAR_MODES, NavbarVisibility, REDUCED_MOTION_MODES, ReducedMotion,
-    SELECTION_MODES, StartAutoOpen, StartSelectionMode, ToastPosition,
+    StartAutoOpen, ToastPosition,
 };
 use crate::platform::app_meta::{DISPLAY_NAME, PKG_VERSION};
 use crate::ui::color::{BatterySpectrum, hsv_to_rgb};
@@ -200,8 +200,6 @@ pub struct ConfigureSettings {
     pub lightbar_enabled: bool,
     pub start_screen_enabled: bool,
     pub start_screen_auto_open: StartAutoOpen,
-    pub start_selection_persist: bool,
-    pub start_selection_mode: StartSelectionMode,
     pub start_screen_always_immersive: bool,
     pub start_screen_immersive_layout: ImmersiveLayout,
     pub start_screen_clock_enabled: bool,
@@ -341,8 +339,6 @@ pub enum ConfigureMessage {
     SetLightbarEnabled(bool),
     SetStartScreenEnabled(bool),
     SetStartScreenAutoOpen(StartAutoOpen),
-    SetSelectionPersist(bool),
-    SetSelectionMode(StartSelectionMode),
     SetStartScreenAlwaysImmersive(bool),
     SetImmersiveLayout(ImmersiveLayout),
     SetStartScreenClock(bool),
@@ -1025,12 +1021,12 @@ fn action_button<'a>(
 /// queued so a second click cannot queue another restart.
 fn reload_button(queued: bool) -> Element<'static, ConfigureMessage> {
     let content: Element<'_, ConfigureMessage> = if queued {
-        row![text("Reloading…").size(13.0), reload_spinner(),]
+        row![text("Restarting…").size(13.0), reload_spinner(),]
             .spacing(8)
             .align_y(Alignment::Center)
             .into()
     } else {
-        text("Reload UI to apply changes").size(13.0).into()
+        text("Restart app to apply changes").size(13.0).into()
     };
     button(content)
         .padding([7, 14])
@@ -1409,41 +1405,6 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             .align_y(Alignment::Center)
             .into(),
         );
-        opening.push(toggle_row(
-            "Remember game selection",
-            Some("Keep the game highlight across restarts"),
-            settings.start_selection_persist,
-            ConfigureMessage::SetSelectionPersist,
-        ));
-        if settings.start_selection_persist {
-            opening.push(
-                row![
-                    column![
-                        text("Restore by")
-                            .size(theme::type_scale::BODY)
-                            .color(theme::INK),
-                        text("Match the game, or its position")
-                            .size(12.0)
-                            .color(theme::DIM),
-                    ]
-                    .spacing(2)
-                    .width(Fill),
-                    pick_list(
-                        SELECTION_MODES,
-                        Some(settings.start_selection_mode),
-                        ConfigureMessage::SetSelectionMode,
-                    )
-                    .text_size(13.0)
-                    .padding([7, 10])
-                    .width(Length::Fixed(280.0))
-                    .style(theme::pick_list)
-                    .menu_style(theme::pick_list_menu),
-                ]
-                .spacing(16)
-                .align_y(Alignment::Center)
-                .into(),
-            );
-        }
     }
     groups = groups.push(group(Some("Opening".to_string()), opening));
 
@@ -2705,8 +2666,6 @@ mod tests {
             lightbar_enabled: true,
             start_screen_enabled: false,
             start_screen_auto_open: StartAutoOpen::Any,
-            start_selection_persist: true,
-            start_selection_mode: StartSelectionMode::ByGame,
             start_screen_always_immersive: false,
             start_screen_immersive_layout: ImmersiveLayout::Vertical,
             start_screen_clock_enabled: true,

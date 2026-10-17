@@ -308,10 +308,11 @@ pub struct Prefs {
     /// Start-screen games list sort (default last played).
     #[serde(default)]
     pub games_sort_mode: GamesSortMode,
-    /// Remember the start-screen game highlight across shell restarts
-    /// (default on). Off keeps the clamped index and never re-pins by key.
+    /// Remember the start-screen game highlight across shell restarts.
+    /// Hidden feature, always off: no UI exposes it and `normalize` forces
+    /// it off on load. Off keeps the clamped index and never re-pins by key.
     /// Game axis only; the controller axis is never gated.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub start_selection_persist: bool,
     /// How the game highlight restores when persistence is on (default by game).
     #[serde(default)]
@@ -497,7 +498,9 @@ impl Default for Prefs {
             start_screen_haptics_enabled: true,
             start_screen_haptics_strength: default_start_screen_haptics_strength(),
             games_sort_mode: GamesSortMode::default(),
-            start_selection_persist: true,
+            // Hidden feature: selection persistence is always off (no UI).
+            // `normalize` forces it off so older prefs files converge too.
+            start_selection_persist: false,
             start_selection_mode: StartSelectionMode::default(),
             show_all_controllers: false,
             start_screen_immersive_layout: ImmersiveLayout::default(),
@@ -594,13 +597,15 @@ impl Prefs {
         }
     }
 
-    /// Clamp numeric prefs and force the reopen chord to PS.
+    /// Clamp numeric prefs, force the reopen chord to PS, and force the
+    /// hidden selection-persistence feature off.
     pub fn normalized(mut self) -> Self {
         self.normalize();
         self
     }
 
-    /// Clamp numeric prefs and force the reopen chord to PS.
+    /// Clamp numeric prefs, force the reopen chord to PS, and force the
+    /// hidden selection-persistence feature off.
     fn normalize(&mut self) {
         self.low_battery_percent = clamp_low_battery_percent(self.low_battery_percent);
         self.start_screen_sound_volume =
@@ -616,6 +621,7 @@ impl Prefs {
         self.start_screen_inactive_secs = inactive;
         self.start_screen_sleep_secs = sleep;
         self.start_screen_gesture = default_gesture();
+        self.start_selection_persist = false;
     }
 }
 
@@ -782,9 +788,9 @@ mod tests {
     }
 
     #[test]
-    fn older_prefs_default_selection_persist_on_by_game() {
+    fn older_prefs_default_selection_persist_off_by_game() {
         let prefs: Prefs = serde_json::from_str("{}").unwrap();
-        assert!(prefs.start_selection_persist);
+        assert!(!prefs.start_selection_persist);
         assert_eq!(prefs.start_selection_mode, StartSelectionMode::ByGame);
         assert_eq!(
             Prefs::default().start_selection_mode,
@@ -828,12 +834,17 @@ mod tests {
     }
 
     #[test]
-    fn explicit_selection_persist_off_stays_off() {
+    fn selection_persist_is_always_off() {
+        // Raw files may still carry `true`; `normalize` (load path) forces it off.
         let prefs: Prefs = serde_json::from_str(r#"{"start_selection_persist":false}"#).unwrap();
+        assert!(!prefs.start_selection_persist);
+        let prefs: Prefs = serde_json::from_str::<Prefs>(r#"{"start_selection_persist":true}"#)
+            .unwrap()
+            .normalized();
         assert!(!prefs.start_selection_persist);
         let prefs: Prefs =
             serde_json::from_str(r#"{"start_selection_mode":"by_position"}"#).unwrap();
-        assert!(prefs.start_selection_persist);
+        assert!(!prefs.start_selection_persist);
         assert_eq!(prefs.start_selection_mode, StartSelectionMode::ByPosition);
     }
 

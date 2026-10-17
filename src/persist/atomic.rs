@@ -68,31 +68,41 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn scratch(name: &str) -> std::path::PathBuf {
+        // Unique subdir per test: parallel tests share the process (and its
+        // temp-file prefix), so scanning the shared temp root would see a
+        // sibling test's in-flight temp file.
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!(
-            "sdsc-atomic-{name}-{nanos}-{}.json",
-            std::process::id()
-        ))
+        let dir =
+            std::env::temp_dir().join(format!("sdsc-atomic-{name}-{nanos}-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        dir.join("store.json")
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = fs::remove_file(path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
     }
 
     #[test]
     fn write_atomic_creates_and_overwrites() {
         let path = scratch("basic");
-        let _ = fs::remove_file(&path);
+        cleanup(&path);
         write_atomic(&path, b"{\"a\":1}").expect("first write");
         assert_eq!(fs::read(&path).unwrap(), b"{\"a\":1}");
         write_atomic(&path, b"{\"a\":2,\"b\":[1,2,3]}").expect("overwrite");
         assert_eq!(fs::read(&path).unwrap(), b"{\"a\":2,\"b\":[1,2,3]}");
-        let _ = fs::remove_file(&path);
+        cleanup(&path);
     }
 
     #[test]
     fn write_atomic_leaves_no_temp_files() {
         let path = scratch("notemp");
-        let _ = fs::remove_file(&path);
+        cleanup(&path);
         write_atomic(&path, b"{}").expect("write");
         let parent = path.parent().unwrap();
         let prefix = format!(".sdsc-tmp-{}-", std::process::id());
@@ -106,6 +116,6 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
-        let _ = fs::remove_file(&path);
+        cleanup(&path);
     }
 }
