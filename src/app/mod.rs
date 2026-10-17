@@ -161,6 +161,18 @@ pub enum Message {
 
     ConfigureOpened(window::Id),
     Configure(ConfigureMessage),
+    /// Debug-only standalone ambient preview window opened.
+    #[cfg(debug_assertions)]
+    AmbientPreviewOpened(window::Id),
+    /// Debug-only 60Hz preview clock (only while the preview window is open).
+    #[cfg(debug_assertions)]
+    AmbientPreviewTick,
+    /// Debug-only: begin an OS drag of the undecorated preview window.
+    #[cfg(debug_assertions)]
+    PreviewDrag,
+    /// Debug-only: close the ambient preview window.
+    #[cfg(debug_assertions)]
+    PreviewClose,
 
     StartOpened(window::Id),
     /// Drive start-screen slide / Triangle-hold animation frames.
@@ -262,6 +274,10 @@ impl Message {
             | Message::StartFrame
             | Message::StartArtEvent(_)
             | Message::StartImmersiveSettled => false,
+            #[cfg(debug_assertions)]
+            Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
+            #[cfg(debug_assertions)]
+            Message::PreviewDrag | Message::PreviewClose => true,
             Message::Popup(_)
             | Message::Configure(_)
             | Message::Start(_)
@@ -348,6 +364,10 @@ pub struct App {
     popup_rows: Vec<ControllerRow>,
 
     configure_window: Option<window::Id>,
+    /// Debug-only standalone ambient preview window (Diagnostics "View
+    /// immersive"): immersive-rate background without opening Start.
+    #[cfg(debug_assertions)]
+    preview_window: Option<window::Id>,
     /// Debug-only window stress test in flight (Diagnostics section).
     #[cfg(debug_assertions)]
     stress_running: bool,
@@ -364,7 +384,21 @@ pub struct App {
     #[cfg(debug_assertions)]
     debug_ambient_veil_freq: f32,
     #[cfg(debug_assertions)]
-    debug_ambient_gain: f32,
+    debug_ambient_pulse_min: f32,
+    #[cfg(debug_assertions)]
+    debug_ambient_pulse_max: f32,
+    #[cfg(debug_assertions)]
+    debug_ambient_orb_speed: f32,
+    #[cfg(debug_assertions)]
+    debug_ambient_glow_hue: f32,
+    #[cfg(debug_assertions)]
+    debug_ambient_orb_min_x: f32,
+    #[cfg(debug_assertions)]
+    debug_ambient_orb_max_x: f32,
+    #[cfg(debug_assertions)]
+    debug_ambient_orb_min_y: f32,
+    #[cfg(debug_assertions)]
+    debug_ambient_orb_max_y: f32,
     #[cfg(debug_assertions)]
     debug_ambient_grain: f32,
     #[cfg(debug_assertions)]
@@ -647,6 +681,8 @@ impl App {
             popup_rows: Vec::new(),
             configure_window: None,
             #[cfg(debug_assertions)]
+            preview_window: None,
+            #[cfg(debug_assertions)]
             stress_running: false,
             #[cfg(debug_assertions)]
             debug_layout_bounds: false,
@@ -655,7 +691,21 @@ impl App {
             #[cfg(debug_assertions)]
             debug_ambient_veil_freq: debug_tune.veil_freq,
             #[cfg(debug_assertions)]
-            debug_ambient_gain: debug_tune.pulse_gain,
+            debug_ambient_pulse_min: debug_tune.pulse_min,
+            #[cfg(debug_assertions)]
+            debug_ambient_pulse_max: debug_tune.pulse_max,
+            #[cfg(debug_assertions)]
+            debug_ambient_orb_speed: debug_tune.orb_speed,
+            #[cfg(debug_assertions)]
+            debug_ambient_glow_hue: debug_tune.glow_hue,
+            #[cfg(debug_assertions)]
+            debug_ambient_orb_min_x: debug_tune.orb_min_x,
+            #[cfg(debug_assertions)]
+            debug_ambient_orb_max_x: debug_tune.orb_max_x,
+            #[cfg(debug_assertions)]
+            debug_ambient_orb_min_y: debug_tune.orb_min_y,
+            #[cfg(debug_assertions)]
+            debug_ambient_orb_max_y: debug_tune.orb_max_y,
             #[cfg(debug_assertions)]
             debug_ambient_grain: debug_tune.grain_gain,
             #[cfg(debug_assertions)]
@@ -839,6 +889,10 @@ impl App {
     }
 
     fn title(&self, window: window::Id) -> String {
+        #[cfg(debug_assertions)]
+        if Some(window) == self.preview_window {
+            return "Ambient preview".to_string();
+        }
         if Some(window) == self.configure_window {
             "Settings".to_string()
         } else if Some(window) == self.start_window {
@@ -1009,6 +1063,16 @@ impl App {
             );
         }
 
+        // Standalone ambient preview (debug Diagnostics "View immersive"):
+        // 60Hz immersive-rate clock, only while the preview is open.
+        #[cfg(debug_assertions)]
+        if self.preview_window.is_some() {
+            subscriptions.push(
+                iced::time::every(crate::ui::ambient_preview::PREVIEW_TICK)
+                    .map(|_| Message::AmbientPreviewTick),
+            );
+        }
+
         if self.session.prefs.start_screen_enabled {
             subscriptions.push(
                 Subscription::run(crate::ui::start::art_worker::event_stream)
@@ -1030,18 +1094,14 @@ impl App {
             .map(Message::Popup);
         }
 
+        #[cfg(debug_assertions)]
+        if Some(window) == self.preview_window {
+            return crate::ui::ambient_preview::view(Message::PreviewDrag, Message::PreviewClose);
+        }
+
         if Some(window) == self.configure_window {
             #[cfg(debug_assertions)]
-            let debug_tune = crate::ui::configure::DebugAmbientTune {
-                pulse_freq: self.debug_ambient_freq,
-                veil_freq: self.debug_ambient_veil_freq,
-                pulse_gain: self.debug_ambient_gain,
-                grain_gain: self.debug_ambient_grain,
-                time_scale: self.debug_ambient_time_scale,
-                kenburns_amp: self.debug_kenburns_amp,
-                kenburns_pan: self.debug_kenburns_pan,
-                kenburns_speed: self.debug_kenburns_speed,
-            };
+            let debug_tune = self.debug_tune_snapshot();
             return configure_view::view(
                 &self.configure_state,
                 &self.configure_settings(),
@@ -1219,6 +1279,10 @@ impl App {
                     // Recreate so iced keeps a warm compositor for popup/Settings.
                     self.ensure_toast_window()
                 } else {
+                    #[cfg(debug_assertions)]
+                    if Some(id) == self.preview_window {
+                        self.preview_window = None;
+                    }
                     Task::none()
                 }
             }
@@ -1278,6 +1342,26 @@ impl App {
                 task
             }
             Message::Configure(message) => self.on_configure_message(message),
+
+            #[cfg(debug_assertions)]
+            Message::AmbientPreviewOpened(id) => focus_window(id),
+            #[cfg(debug_assertions)]
+            Message::AmbientPreviewTick => {
+                crate::ui::ambient_preview::note_preview_tick();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            Message::PreviewDrag => match self.preview_window {
+                Some(id) => window::drag(id),
+                None => Task::none(),
+            },
+            #[cfg(debug_assertions)]
+            Message::PreviewClose => match self.preview_window {
+                // Hide first so DWM cannot flash while the surface tears down;
+                // keep id until WindowClosed (same as Settings).
+                Some(id) => window::set_mode(id, window::Mode::Hidden).chain(window::close(id)),
+                None => Task::none(),
+            },
 
             Message::StartOpened(id) => {
                 if Some(id) == self.start_window && self.start_visible {
@@ -2423,6 +2507,36 @@ impl App {
             .chain(self.sync_toast_zorder())
     }
 
+    /// Debug-only standalone ambient preview (Diagnostics "View immersive"):
+    /// immersive-rate background in its own window, no Start required.
+    #[cfg(debug_assertions)]
+    fn open_ambient_preview(&mut self) -> Task<Message> {
+        if let Some(id) = self.preview_window {
+            return focus_window(id);
+        }
+
+        let (id, open) = window::open(window::Settings {
+            size: Size::new(
+                crate::ui::ambient_preview::WIDTH,
+                crate::ui::ambient_preview::HEIGHT,
+            ),
+            position: window::Position::Centered,
+            visible: open_visible(),
+            transparent: crate::ui::chrome::transparent_windows(),
+            resizable: false,
+            decorations: false,
+            // AlwaysOnTop like Settings so it stays beside Settings while tuning.
+            level: window::Level::AlwaysOnTop,
+            exit_on_close_request: true,
+            platform_specific: window_platform_specific(),
+            ..window::Settings::default()
+        });
+
+        self.preview_window = Some(id);
+        open.map(Message::AmbientPreviewOpened)
+            .chain(self.sync_toast_zorder())
+    }
+
     fn on_configure_message(&mut self, message: ConfigureMessage) -> Task<Message> {
         match message {
             ConfigureMessage::SelectSection(section) => {
@@ -2609,9 +2723,58 @@ impl App {
                 Task::none()
             }
             #[cfg(debug_assertions)]
-            ConfigureMessage::SetDebugAmbientGain(v) => {
-                self.debug_ambient_gain = v.clamp(0.0, 3.0);
-                crate::ui::shader::ambient::set_pulse_gain(self.debug_ambient_gain);
+            ConfigureMessage::SetDebugAmbientPulseMin(v) => {
+                self.debug_ambient_pulse_min = v.clamp(0.0, 0.6);
+                crate::ui::shader::ambient::set_pulse_min(self.debug_ambient_pulse_min);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugAmbientPulseMax(v) => {
+                self.debug_ambient_pulse_max = v.clamp(0.0, 0.6);
+                crate::ui::shader::ambient::set_pulse_max(self.debug_ambient_pulse_max);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugAmbientOrbSpeed(v) => {
+                self.debug_ambient_orb_speed = v.clamp(0.0, 3.0);
+                crate::ui::shader::ambient::set_orb_speed(self.debug_ambient_orb_speed);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugAmbientGlowHue(v) => {
+                self.debug_ambient_glow_hue = v.clamp(0.0, 360.0);
+                crate::ui::shader::ambient::set_glow_hue(self.debug_ambient_glow_hue);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugAmbientOrbMinX(v) => {
+                self.debug_ambient_orb_min_x = v.clamp(-1.0, 1.0);
+                crate::ui::shader::ambient::set_orb_min_x(self.debug_ambient_orb_min_x);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugAmbientOrbMaxX(v) => {
+                self.debug_ambient_orb_max_x = v.clamp(-1.0, 1.0);
+                crate::ui::shader::ambient::set_orb_max_x(self.debug_ambient_orb_max_x);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugAmbientOrbMinY(v) => {
+                self.debug_ambient_orb_min_y = v.clamp(-1.0, 1.0);
+                crate::ui::shader::ambient::set_orb_min_y(self.debug_ambient_orb_min_y);
+                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::SetDebugAmbientOrbMaxY(v) => {
+                self.debug_ambient_orb_max_y = v.clamp(-1.0, 1.0);
+                crate::ui::shader::ambient::set_orb_max_y(self.debug_ambient_orb_max_y);
                 self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
@@ -2655,7 +2818,14 @@ impl App {
                 let defaults = crate::ui::configure::DebugAmbientTune::default();
                 self.debug_ambient_freq = defaults.pulse_freq;
                 self.debug_ambient_veil_freq = defaults.veil_freq;
-                self.debug_ambient_gain = defaults.pulse_gain;
+                self.debug_ambient_pulse_min = defaults.pulse_min;
+                self.debug_ambient_pulse_max = defaults.pulse_max;
+                self.debug_ambient_orb_speed = defaults.orb_speed;
+                self.debug_ambient_glow_hue = defaults.glow_hue;
+                self.debug_ambient_orb_min_x = defaults.orb_min_x;
+                self.debug_ambient_orb_max_x = defaults.orb_max_x;
+                self.debug_ambient_orb_min_y = defaults.orb_min_y;
+                self.debug_ambient_orb_max_y = defaults.orb_max_y;
                 self.debug_ambient_grain = defaults.grain_gain;
                 self.debug_ambient_time_scale = defaults.time_scale;
                 self.debug_kenburns_amp = defaults.kenburns_amp;
@@ -2666,6 +2836,16 @@ impl App {
                 self.start_state.ambient_tuning_keepalive = false;
                 Task::none()
             }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::ExportDebugAmbientTune => {
+                let json = self.debug_tune_snapshot().export_json();
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: ambient tune export {json}"
+                ));
+                iced::clipboard::write(json)
+            }
+            #[cfg(debug_assertions)]
+            ConfigureMessage::OpenAmbientPreview => self.open_ambient_preview(),
             ConfigureMessage::OpenExternalLink(url) => {
                 if let Err(err) = launch::launch_target(url, "") {
                     app_log::warn(format!("open external link failed: {err}"));
@@ -2741,12 +2921,42 @@ impl App {
         let defaults = crate::ui::configure::DebugAmbientTune::default();
         self.debug_ambient_freq != defaults.pulse_freq
             || self.debug_ambient_veil_freq != defaults.veil_freq
-            || self.debug_ambient_gain != defaults.pulse_gain
+            || self.debug_ambient_pulse_min != defaults.pulse_min
+            || self.debug_ambient_pulse_max != defaults.pulse_max
+            || self.debug_ambient_orb_speed != defaults.orb_speed
+            || self.debug_ambient_glow_hue != defaults.glow_hue
+            || self.debug_ambient_orb_min_x != defaults.orb_min_x
+            || self.debug_ambient_orb_max_x != defaults.orb_max_x
+            || self.debug_ambient_orb_min_y != defaults.orb_min_y
+            || self.debug_ambient_orb_max_y != defaults.orb_max_y
             || self.debug_ambient_grain != defaults.grain_gain
             || self.debug_ambient_time_scale != defaults.time_scale
             || self.debug_kenburns_amp != defaults.kenburns_amp
             || self.debug_kenburns_pan != defaults.kenburns_pan
             || self.debug_kenburns_speed != defaults.kenburns_speed
+    }
+
+    /// Current Diagnostics tuning snapshot (single construction site for the
+    /// Settings view and the JSON export).
+    #[cfg(debug_assertions)]
+    fn debug_tune_snapshot(&self) -> crate::ui::configure::DebugAmbientTune {
+        crate::ui::configure::DebugAmbientTune {
+            pulse_freq: self.debug_ambient_freq,
+            veil_freq: self.debug_ambient_veil_freq,
+            pulse_min: self.debug_ambient_pulse_min,
+            pulse_max: self.debug_ambient_pulse_max,
+            orb_speed: self.debug_ambient_orb_speed,
+            glow_hue: self.debug_ambient_glow_hue,
+            orb_min_x: self.debug_ambient_orb_min_x,
+            orb_max_x: self.debug_ambient_orb_max_x,
+            orb_min_y: self.debug_ambient_orb_min_y,
+            orb_max_y: self.debug_ambient_orb_max_y,
+            grain_gain: self.debug_ambient_grain,
+            time_scale: self.debug_ambient_time_scale,
+            kenburns_amp: self.debug_kenburns_amp,
+            kenburns_pan: self.debug_kenburns_pan,
+            kenburns_speed: self.debug_kenburns_speed,
+        }
     }
 
     fn apply_spectrum_maybe(&mut self, spectrum: Option<BatterySpectrum>) -> Task<Message> {

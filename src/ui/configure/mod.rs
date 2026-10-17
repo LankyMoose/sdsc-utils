@@ -245,16 +245,28 @@ pub struct PendingEmulatorChange {
 /// Shell-local only: never persisted, defaults (shipped visuals) at boot.
 /// Constructed from the shell's tuning fields on every view.
 #[cfg(debug_assertions)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct DebugAmbientTune {
     /// Accent-bloom pulse frequency, rad/s (shipped 1.4).
     pub pulse_freq: f32,
     /// Veil pulse frequency, rad/s (shipped 3.2).
     pub veil_freq: f32,
-    /// Pulse gain scale (shipped 1.0).
-    pub pulse_gain: f32,
+    /// Accent-bloom strength floor (shipped 0.10).
+    pub pulse_min: f32,
+    /// Accent-bloom strength ceiling (shipped 0.14).
+    pub pulse_max: f32,
     /// Grain gain scale (shipped 1.0).
     pub grain_gain: f32,
+    /// Orb drift speed, rad/s (shipped 0.3; static until bounds separate).
+    pub orb_speed: f32,
+    /// Glow hue shift, degrees (shipped 0.0).
+    pub glow_hue: f32,
+    /// Orb X wander bounds in centered uv (shipped -0.35, -0.35).
+    pub orb_min_x: f32,
+    pub orb_max_x: f32,
+    /// Orb Y wander bounds in centered uv (shipped 0.05, 0.05).
+    pub orb_min_y: f32,
+    pub orb_max_y: f32,
     /// CPU time advance multiplier; 0 freezes the pulse (shipped 1.0).
     pub time_scale: f32,
     /// Ken-burns zoom-excursion multiplier (shipped 1.0).
@@ -266,13 +278,30 @@ pub struct DebugAmbientTune {
 }
 
 #[cfg(debug_assertions)]
+impl DebugAmbientTune {
+    /// Pretty JSON snapshot of the current slider values (Diagnostics
+    /// "Export as JSON"; also logged to `app.log` so the numbers survive
+    /// even when the clipboard is unavailable).
+    pub fn export_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+#[cfg(debug_assertions)]
 impl Default for DebugAmbientTune {
     fn default() -> Self {
         Self {
             pulse_freq: crate::ui::shader::ambient::DEFAULT_PULSE_FREQ,
             veil_freq: crate::ui::shader::ambient::DEFAULT_VEIL_FREQ,
-            pulse_gain: crate::ui::shader::ambient::DEFAULT_PULSE_GAIN,
+            pulse_min: crate::ui::shader::ambient::DEFAULT_PULSE_MIN,
+            pulse_max: crate::ui::shader::ambient::DEFAULT_PULSE_MAX,
             grain_gain: crate::ui::shader::ambient::DEFAULT_GRAIN_GAIN,
+            orb_speed: crate::ui::shader::ambient::DEFAULT_ORB_SPEED,
+            glow_hue: crate::ui::shader::ambient::DEFAULT_GLOW_HUE,
+            orb_min_x: crate::ui::shader::ambient::DEFAULT_ORB_MIN_X,
+            orb_max_x: crate::ui::shader::ambient::DEFAULT_ORB_MAX_X,
+            orb_min_y: crate::ui::shader::ambient::DEFAULT_ORB_MIN_Y,
+            orb_max_y: crate::ui::shader::ambient::DEFAULT_ORB_MAX_Y,
             time_scale: crate::ui::shader::ambient::DEFAULT_TIME_SCALE,
             kenburns_amp: crate::ui::start::mode::DEFAULT_KENBURNS_AMP_SCALE,
             kenburns_pan: crate::ui::start::mode::DEFAULT_KENBURNS_PAN_SCALE,
@@ -398,7 +427,21 @@ pub enum ConfigureMessage {
     #[cfg(debug_assertions)]
     SetDebugAmbientVeilFreq(f32),
     #[cfg(debug_assertions)]
-    SetDebugAmbientGain(f32),
+    SetDebugAmbientPulseMin(f32),
+    #[cfg(debug_assertions)]
+    SetDebugAmbientPulseMax(f32),
+    #[cfg(debug_assertions)]
+    SetDebugAmbientOrbSpeed(f32),
+    #[cfg(debug_assertions)]
+    SetDebugAmbientGlowHue(f32),
+    #[cfg(debug_assertions)]
+    SetDebugAmbientOrbMinX(f32),
+    #[cfg(debug_assertions)]
+    SetDebugAmbientOrbMaxX(f32),
+    #[cfg(debug_assertions)]
+    SetDebugAmbientOrbMinY(f32),
+    #[cfg(debug_assertions)]
+    SetDebugAmbientOrbMaxY(f32),
     #[cfg(debug_assertions)]
     SetDebugAmbientGrain(f32),
     #[cfg(debug_assertions)]
@@ -412,6 +455,14 @@ pub enum ConfigureMessage {
     /// Debug-only: restore shipped ambient + ken-burns behavior.
     #[cfg(debug_assertions)]
     ResetDebugAmbientTuning,
+    /// Debug-only: copy the current tuning sliders as JSON to the clipboard
+    /// (also logged to `app.log`).
+    #[cfg(debug_assertions)]
+    ExportDebugAmbientTune,
+    /// Debug-only: open the standalone ambient preview window (immersive-rate
+    /// background without opening Start).
+    #[cfg(debug_assertions)]
+    OpenAmbientPreview,
     /// Begin an OS window drag (title-bar press on the undecorated window).
     DragWindow,
     Close,
@@ -1125,7 +1176,7 @@ fn diagnostics_view<'a>(
         Some("Ambient pulse + movement".to_string()),
         vec![
             note(
-                "Temporary tuning for the immersive background pulse and ken-burns drift. Debug-only: defaults reproduce release visuals, off at boot, never saved. Open immersive Start to see changes live (frames keep flowing while tuned, even with idle throttle on).",
+                "Temporary tuning for the immersive background pulse, orb drift, and ken-burns. Debug-only: defaults reproduce release visuals, off at boot, never saved. Open the ambient preview (View immersive below) or immersive Start to see changes live (frames keep flowing while tuned, even with idle throttle on). Drag the preview to move it; right-click it to close.",
             ),
             slider_row(
                 "Pulse speed",
@@ -1139,23 +1190,100 @@ fn diagnostics_view<'a>(
                 .style(theme::slider),
             ),
             slider_row(
+                "Pulse min",
+                strength_label(tune.pulse_min),
+                slider(
+                    0.0..=0.6,
+                    tune.pulse_min,
+                    ConfigureMessage::SetDebugAmbientPulseMin,
+                )
+                .step(0.005_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
+                "Pulse max",
+                strength_label(tune.pulse_max),
+                slider(
+                    0.0..=0.6,
+                    tune.pulse_max,
+                    ConfigureMessage::SetDebugAmbientPulseMax,
+                )
+                .step(0.005_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
+                "Glow hue",
+                hue_label(tune.glow_hue),
+                slider(
+                    0.0..=360.0,
+                    tune.glow_hue,
+                    ConfigureMessage::SetDebugAmbientGlowHue,
+                )
+                .step(1.0_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
+                "Orb speed",
+                freq_label(tune.orb_speed),
+                slider(
+                    0.0..=3.0,
+                    tune.orb_speed,
+                    ConfigureMessage::SetDebugAmbientOrbSpeed,
+                )
+                .step(0.05_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
+                "Orb min X",
+                coord_label(tune.orb_min_x),
+                slider(
+                    -1.0..=1.0,
+                    tune.orb_min_x,
+                    ConfigureMessage::SetDebugAmbientOrbMinX,
+                )
+                .step(0.01_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
+                "Orb max X",
+                coord_label(tune.orb_max_x),
+                slider(
+                    -1.0..=1.0,
+                    tune.orb_max_x,
+                    ConfigureMessage::SetDebugAmbientOrbMaxX,
+                )
+                .step(0.01_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
+                "Orb min Y",
+                coord_label(tune.orb_min_y),
+                slider(
+                    -1.0..=1.0,
+                    tune.orb_min_y,
+                    ConfigureMessage::SetDebugAmbientOrbMinY,
+                )
+                .step(0.01_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
+                "Orb max Y",
+                coord_label(tune.orb_max_y),
+                slider(
+                    -1.0..=1.0,
+                    tune.orb_max_y,
+                    ConfigureMessage::SetDebugAmbientOrbMaxY,
+                )
+                .step(0.01_f32)
+                .style(theme::slider),
+            ),
+            slider_row(
                 "Veil pulse speed",
                 freq_label(tune.veil_freq),
                 slider(
                     0.0..=8.0,
                     tune.veil_freq,
                     ConfigureMessage::SetDebugAmbientVeilFreq,
-                )
-                .step(0.05_f32)
-                .style(theme::slider),
-            ),
-            slider_row(
-                "Pulse gain",
-                gain_label(tune.pulse_gain),
-                slider(
-                    0.0..=3.0,
-                    tune.pulse_gain,
-                    ConfigureMessage::SetDebugAmbientGain,
                 )
                 .step(0.05_f32)
                 .style(theme::slider),
@@ -1215,6 +1343,12 @@ fn diagnostics_view<'a>(
                 .step(0.1_f32)
                 .style(theme::slider),
             ),
+            row![
+                action_button("Export as JSON", ConfigureMessage::ExportDebugAmbientTune,),
+                action_button("View immersive", ConfigureMessage::OpenAmbientPreview,),
+            ]
+            .spacing(8)
+            .into(),
             action_button(
                 "Reset ambient tuning",
                 ConfigureMessage::ResetDebugAmbientTuning,
@@ -1241,6 +1375,24 @@ fn freq_label(v: f32) -> String {
 #[cfg(debug_assertions)]
 fn gain_label(v: f32) -> String {
     format!("{v:.2}×")
+}
+
+/// Absolute strength label (pulse min/max are shader addends, not multipliers).
+#[cfg(debug_assertions)]
+fn strength_label(v: f32) -> String {
+    format!("{v:.3}")
+}
+
+/// Hue-shift label in degrees.
+#[cfg(debug_assertions)]
+fn hue_label(v: f32) -> String {
+    format!("{v:.0}°")
+}
+
+/// Centered-uv coordinate label for orb bounds.
+#[cfg(debug_assertions)]
+fn coord_label(v: f32) -> String {
+    format!("{v:.2}")
 }
 
 /// Multiplier label where 0 means frozen.
@@ -2600,6 +2752,34 @@ mod tests {
         tuned.time_scale = 0.0;
         tuned.kenburns_amp = 5.0;
         drop(super::diagnostics_view(false, &tuned));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn ambient_tune_export_json_carries_slider_values() {
+        // The Diagnostics "Export as JSON" snapshot must carry every slider
+        // value (this is what gets pasted back for tuning numbers).
+        let tune = super::DebugAmbientTune::default();
+        let value: serde_json::Value =
+            serde_json::from_str(&tune.export_json()).expect("export is valid JSON");
+        let freq = value
+            .get("pulse_freq")
+            .and_then(serde_json::Value::as_f64)
+            .expect("pulse_freq present");
+        assert!((freq - f64::from(crate::ui::shader::ambient::DEFAULT_PULSE_FREQ)).abs() < 1e-6);
+        for key in [
+            "pulse_min",
+            "pulse_max",
+            "orb_speed",
+            "glow_hue",
+            "orb_min_x",
+            "orb_max_x",
+            "orb_min_y",
+            "orb_max_y",
+            "kenburns_speed",
+        ] {
+            assert!(value.get(key).is_some(), "missing {key}");
+        }
     }
 
     #[test]

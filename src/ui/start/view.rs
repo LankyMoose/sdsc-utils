@@ -892,6 +892,10 @@ pub struct State {
     pub perf_throttle_immersive: bool,
     /// Seconds for ambient shader time uniform.
     pub ambient_time: f32,
+    /// Last wall-clock stamp advancing [`Self::ambient_time`]. `tick_anim`
+    /// advances the clock by capped wall-clock deltas (never fixed steps per
+    /// call) so report-rate pad edges sharing the tick cannot fast-forward it.
+    ambient_last_tick: Option<Instant>,
     /// Debug-only ambient/ken-burns tuning active (Diagnostics sliders).
     /// While set, immersive keeps frames flowing even under the idle
     /// throttle so tuning (including freeze toggles) repaints immediately.
@@ -1107,6 +1111,7 @@ impl Default for State {
             reduced_motion: false,
             perf_throttle_immersive: false,
             ambient_time: 0.0,
+            ambient_last_tick: None,
             #[cfg(debug_assertions)]
             ambient_tuning_keepalive: false,
             backdrop_current: None,
@@ -3570,13 +3575,27 @@ impl State {
         if self.cold_load_active {
             busy = true;
         }
+        // Ambient clock runs on wall-clock deltas (capped per frame), never on
+        // call count: StartFrame (60Hz) and report-rate pad edges share this
+        // `tick_anim`, and fixed steps per call would fast-forward time
+        // whenever edges outnumber frames. All callers share one stamp, so
+        // their advances telescope to exactly the wall clock.
+        let ambient_dt = match self.ambient_last_tick {
+            Some(last) => crate::ui::shader::ambient::ambient_dt_for_elapsed(
+                now.saturating_duration_since(last),
+            ),
+            // First frame after boot: one nominal step (matches the old
+            // fixed-step open frame).
+            None => crate::ui::shader::ambient::ambient_tick_dt(),
+        };
+        self.ambient_last_tick = Some(now);
         if self.immersive
             || self.transition.is_some()
             || self.transition_phase.is_some()
             || self.cold_load_active
         {
-            // Debug time scale applied (release always advances 1/60).
-            self.ambient_time += crate::ui::shader::ambient::ambient_tick_dt();
+            // Debug time scale applied (release always advances wall-clock).
+            self.ambient_time += ambient_dt;
             busy = true;
         }
         busy
@@ -7618,6 +7637,52 @@ mod tests {
 
     /// Reduced motion snaps every movement chase to its target while opacity
     /// clocks keep easing.
+    #[test]
+    fn immersive_ambient_tracks_wall_clock_not_call_count() {
+        // Pins the "same speed" contract the ambient preview relies on: the
+        // clock advances by capped wall-clock deltas, so report-rate pad
+        // edges sharing `tick_anim` with StartFrame cannot fast-forward it.
+        // Reduced motion never gates the ambient clock.
+        crate::ui::shader::ambient::with_tune_test_lock(|| {
+            let nominal = crate::ui::shader::ambient::ambient_tick_dt();
+            let t0 = Instant::now();
+            for reduced in [false, true] {
+                let mut state = State {
+                    immersive: true,
+                    reduced_motion: reduced,
+                    ..State::default()
+                };
+                // First frame: one nominal step (matches the old open frame).
+                state.tick_anim(t0);
+                assert!(
+                    (state.ambient_time - nominal).abs() < 1e-6,
+                    "reduced={reduced}"
+                );
+                // One 16ms frame: exactly 16ms of ambient time.
+                state.tick_anim(t0 + Duration::from_millis(16));
+                assert!(
+                    (state.ambient_time - nominal - 0.016).abs() < 1e-6,
+                    "reduced={reduced}"
+                );
+                // Ten ticks with no elapsed wall-clock (edge burst / saturated
+                // loop recovery) advance nothing further.
+                for _ in 0..10 {
+                    state.tick_anim(t0 + Duration::from_millis(16));
+                }
+                assert!(
+                    (state.ambient_time - nominal - 0.016).abs() < 1e-6,
+                    "reduced={reduced}"
+                );
+                // Long gaps clamp to one frame instead of jumping.
+                state.tick_anim(t0 + Duration::from_secs(10));
+                assert!(
+                    (state.ambient_time - nominal - 0.016 - 0.032).abs() < 1e-6,
+                    "reduced={reduced}"
+                );
+            }
+        });
+    }
+
     #[test]
     fn reduced_motion_snaps_movement_keeps_opacity() {
         use crate::persist::prefs::ImmersiveLayout;
