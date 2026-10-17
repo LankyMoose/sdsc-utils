@@ -23,10 +23,6 @@ name = "sdsc-utils"
 path = "src/bin/sdsc-utils.rs"
 
 [[bin]]
-name = "sdsc-shell"
-path = "src/bin/sdsc-shell.rs"
-
-[[bin]]
 name = "gen_msix_logos"
 path = "src/bin/gen_msix_logos.rs"
 

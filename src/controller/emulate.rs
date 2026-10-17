@@ -147,45 +147,6 @@ pub fn rehydrate(remembered: &[(String, u8, Connection)]) -> Vec<EmulatedPad> {
     fleet
 }
 
-/// Rebuild the Controllers-tab view fleet from service snapshot data.
-///
-/// The service owns the fleet; the shell keeps this derived view only:
-/// remembered `emu-` records rehydrate disconnected, live rows mark
-/// connected (adopting the service's level/link/state), and the local drag
-/// preview repaints on top. Anything the snapshot no longer contains
-/// (pruned pads) is gone — previews for missing pads are dropped with it.
-/// Pure so the shell stays convergent without owning anything.
-#[cfg(debug_assertions)]
-pub fn derive_view_fleet(
-    live: &[ControllerStatus],
-    remembered: &[crate::controller::known::KnownController],
-    previews: &std::collections::HashMap<String, u8>,
-) -> Vec<EmulatedPad> {
-    let records: Vec<(String, u8, Connection)> = remembered
-        .iter()
-        .filter(|r| is_emulated(&r.serial))
-        .map(|r| {
-            (
-                r.serial.clone(),
-                r.percent,
-                Connection::from_label(&r.connection).unwrap_or(Connection::Bluetooth),
-            )
-        })
-        .collect();
-    let mut fleet = rehydrate(&records);
-    for pad in &mut fleet {
-        if let Some(status) = live.iter().find(|c| c.serial == pad.serial()) {
-            pad.connected = true;
-            pad.status = status.clone();
-        }
-        if let Some(percent) = previews.get(pad.serial()) {
-            pad.status.percent = *percent;
-            pad.status.state = state_for(pad.status.connection, *percent);
-        }
-    }
-    fleet
-}
-
 /// Slot number encoded in an `emu-N` serial; non-emulated serials sort last.
 fn slot_of(serial: &str) -> usize {
     serial
@@ -628,76 +589,5 @@ mod tests {
         assert!(is_emulated("emu-42"));
         assert!(!is_emulated("REAL-1"));
         assert!(!is_emulated(""));
-    }
-
-    #[cfg(debug_assertions)]
-    fn known_record(
-        serial: &str,
-        percent: u8,
-        connection: &str,
-    ) -> crate::controller::known::KnownController {
-        crate::controller::known::KnownController {
-            serial: serial.to_string(),
-            product: "DualSense".to_string(),
-            connection: connection.to_string(),
-            percent,
-            kind: crate::controller::model::ControllerKind::DualSense,
-        }
-    }
-
-    /// The snapshot-derived tab fleet: disconnected pads rehydrate from the
-    /// remembered store, live rows mark connected with service truth.
-    #[test]
-    #[cfg(debug_assertions)]
-    fn derive_view_fleet_marks_live_connected() {
-        let remembered = vec![
-            known_record("emu-1", 40, "Bluetooth"),
-            known_record("emu-2", 90, "USB"),
-            known_record("REAL-1", 50, "USB"),
-        ];
-        let live = vec![dualsense_status(
-            1,
-            "DualSense",
-            Connection::Bluetooth,
-            "emu-1".to_string(),
-            45,
-            PowerState::Discharging,
-        )];
-        let fleet = derive_view_fleet(&live, &remembered, &std::collections::HashMap::new());
-        assert_eq!(fleet.len(), 2, "real hardware is not fleet business");
-        let emu1 = fleet.iter().find(|p| p.serial() == "emu-1").unwrap();
-        assert!(emu1.connected);
-        assert_eq!(emu1.status.percent, 45, "live service truth wins");
-        let emu2 = fleet.iter().find(|p| p.serial() == "emu-2").unwrap();
-        assert!(!emu2.connected);
-        assert_eq!(emu2.status.percent, 90);
-        assert!(emu2.remembered);
-    }
-
-    /// Drag preview repaints on top of the derived fleet without touching it.
-    #[test]
-    #[cfg(debug_assertions)]
-    fn derive_view_fleet_overlays_previews() {
-        let remembered = vec![known_record("emu-1", 40, "Bluetooth")];
-        let previews = std::collections::HashMap::from([("emu-1".to_string(), 70u8)]);
-        let fleet = derive_view_fleet(&[], &remembered, &previews);
-        assert_eq!(fleet[0].status.percent, 70);
-        assert_eq!(fleet[0].status.state, PowerState::Discharging);
-        // A preview for a pad the snapshot no longer contains is dropped by
-        // the caller (retain); the derivation itself just has no row for it.
-        let ghost = std::collections::HashMap::from([("emu-9".to_string(), 70u8)]);
-        let fleet = derive_view_fleet(&[], &remembered, &ghost);
-        assert_eq!(fleet.len(), 1);
-        assert_eq!(fleet[0].status.percent, 40, "no overlay without a row");
-    }
-
-    /// Emulator commands survive the shell→service IPC hop.
-    #[test]
-    #[cfg(debug_assertions)]
-    fn emulator_command_is_serializable() {
-        let cmd = EmulatorCommand::SetConnected("emu-1".to_string(), true);
-        let encoded = serde_json::to_vec(&cmd).expect("encode");
-        let decoded: EmulatorCommand = serde_json::from_slice(&encoded).expect("decode");
-        assert_eq!(decoded, cmd);
     }
 }

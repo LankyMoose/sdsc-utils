@@ -37,9 +37,6 @@ static INPUT_SNAPSHOT: OnceLock<Arc<Mutex<InputSnapshot>>> = OnceLock::new();
 static INPUT_EDGE_TX: Mutex<Option<iced::futures::channel::mpsc::Sender<InputEdge>>> =
     Mutex::new(None);
 
-/// Service-process bridge: forwards edges over IPC when the shell is a separate process.
-static SERVICE_EDGE_TX: Mutex<Option<std::sync::mpsc::SyncSender<InputEdge>>> = Mutex::new(None);
-
 /// One pad-input publication from the hid-worker (replaces UI PadPoll timer).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InputEdge {
@@ -83,31 +80,12 @@ pub fn clear_input_edge_sender() {
     }
 }
 
-/// Install a sync sender so the HID/tray service can forward edges over IPC.
-pub fn bind_service_edge_sender(tx: std::sync::mpsc::SyncSender<InputEdge>) {
-    if let Ok(mut guard) = SERVICE_EDGE_TX.lock() {
-        *guard = Some(tx);
-    }
-}
-
-/// Clear the service edge sender (shutdown).
-pub fn clear_service_edge_sender() {
-    if let Ok(mut guard) = SERVICE_EDGE_TX.lock() {
-        *guard = None;
-    }
-}
-
-/// Push a sample edge to the UI / service bridge (no-op when nothing is listening).
+/// Push a sample edge to the UI bridge (no-op when nothing is listening).
 pub fn push_input_edge(edge: InputEdge) {
     if let Ok(mut guard) = INPUT_EDGE_TX.lock()
         && let Some(tx) = guard.as_mut()
     {
         // Prefer a fresh sample over blocking the HID thread.
-        let _ = tx.try_send(edge.clone());
-    }
-    if let Ok(guard) = SERVICE_EDGE_TX.lock()
-        && let Some(tx) = guard.as_ref()
-    {
         let _ = tx.try_send(edge);
     }
 }

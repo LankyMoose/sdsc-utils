@@ -181,26 +181,6 @@ impl AnalyticsStore {
         }
     }
 
-    /// Export learned per-serial records for the service→shell snapshot.
-    ///
-    /// Runtime-only fields (`last_tick_ms`, grace clocks) stay behind; the
-    /// shell recomputes ETAs/panel rows from the records.
-    pub fn export_snapshot(&self) -> HashMap<String, SerialRecord> {
-        self.by_serial.clone()
-    }
-
-    /// Replace learned records wholesale from a service snapshot (shell side).
-    ///
-    /// Never marks dirty: the shell in client mode must not write
-    /// `analytics.json` (single-writer: service owns the file).
-    pub fn apply_snapshot(&mut self, records: HashMap<String, SerialRecord>) {
-        self.by_serial = records;
-        self.dirty = false;
-        self.last_tick_ms = None;
-        self.connected_at_ms.clear();
-        self.grace_reconciled.clear();
-    }
-
     /// Wipe learned analytics (kept for tests / future tooling; Settings no longer exposes this).
     #[allow(dead_code)]
     pub fn clear(&mut self) {

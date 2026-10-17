@@ -56,7 +56,7 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 
 **Recommended (Windows):** install from the [Microsoft Store](https://apps.microsoft.com/) once the listing is live (search for **SDSC Utils**). Store installs are signed by Microsoft and update automatically through the Store / `winget`.
 
-**Advanced:** portable builds are attached to [GitHub Releases](https://github.com/LankyMoose/sdsc-utils/releases) as a single `sdsc-utils.exe`. The first launch unpacks the UI program into `%APPDATA%\sdsc-utils\shell`. That executable is **not** Authenticode-signed. Browsers and Windows SmartScreen often warn on uncommon unsigned downloads — that is expected. There is no in-app auto-update for the portable build; download the next release manually when you want it.
+**Advanced:** portable builds are attached to [GitHub Releases](https://github.com/LankyMoose/sdsc-utils/releases) as a single `sdsc-utils.exe` (tray + HID + UI in one process, no bundled extras). That executable is **not** Authenticode-signed. Browsers and Windows SmartScreen often warn on uncommon unsigned downloads — that is expected. There is no in-app auto-update for the portable build; download the next release manually when you want it.
 
 ## Features
 
@@ -75,7 +75,7 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 - Lightbar color blends across a customizable **2–5 stop spectrum** (default **blue → purple → red**) as battery drops (reasserted about every 5 seconds); edit via tray **Settings** with a left-hand tab list. An **Enable lightbar** toggle (on by default) pauses battery-driven colors and the low-battery pulse while leaving Identify available. The Lightbar panel stays fully expanded when active: drag stops along the bar, click empty areas to add stops (up to 5), and drag a stop away to remove it (down to 2). Changes apply immediately.
 - At **low battery while discharging** (same configurable threshold as the toast; default ≤5%), the lightbar periodically pulses **orange**
 - Icons live in `assets/icons/` (SVG) and are rasterized at build/runtime
-- UI shell is an **iced** daemon (tray via `tray-icon`); Configure, controller popup, and toasts are iced windows
+- UI is an **iced** daemon (tray via `tray-icon`); Configure, controller popup, and toasts are iced windows
 - Single-instance (second launch exits quietly)
 - Logs to a file (see Troubleshooting)
 
@@ -92,7 +92,7 @@ Requires Rust **1.88+** (edition 2024).
 cargo build --release
 ```
 
-This builds every binary. Run `target/release/sdsc-utils` (`.exe` on Windows); it is the background service and starts the UI process, `sdsc-shell`, from the same folder, so keep the two together.
+This builds every binary. Run `target/release/sdsc-utils` (`.exe` on Windows); it is the whole app — tray, controller monitoring, and UI in one process.
 
 Release builds do **not** include the developer emulator (it is compiled only into debug builds).
 
@@ -118,8 +118,6 @@ cargo run --release
 # or
 ./target/release/sdsc-utils
 ```
-
-`cargo run` only compiles `sdsc-utils`, so when started that way it also rebuilds `sdsc-shell` (same profile) before launching it. You never end up with a stale UI.
 
 ### Developer emulator
 
@@ -208,7 +206,7 @@ git tag v1.6.1
 git push origin v1.6.1
 ```
 
-The release workflow attaches one portable `sdsc-utils.exe` (the UI shell is bundled inside it) and `sdsc-utils.msix` to the GitHub Release for that tag. Upload the MSIX to Partner Center for Store distribution. You can also run the **Release** workflow manually (`workflow_dispatch`).
+The release workflow attaches one portable `sdsc-utils.exe` and `sdsc-utils.msix` to the GitHub Release for that tag. Upload the MSIX to Partner Center for Store distribution. You can also run the **Release** workflow manually (`workflow_dispatch`).
 
 ## Privacy policy
 

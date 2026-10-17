@@ -1,6 +1,5 @@
 //! Atomic JSON store writes: temp file + rename so readers never see a
-//! truncated body (the `analytics.json EOF` class from concurrent
-//! service/shell writes, and single-writer races with the 2s reload).
+//! truncated body (the `analytics.json EOF` class from concurrent writers).
 
 use crate::platform::app_log;
 use std::fs;

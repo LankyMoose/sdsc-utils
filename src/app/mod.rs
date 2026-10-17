@@ -1,4 +1,4 @@
-//! iced `daemon` shell for the DualSense battery tray app.
+//! iced `daemon` app for the DualSense battery tray.
 //!
 //! The daemon boots windowless: it owns the tray icon and only opens windows on
 //! demand (controller popup, configure window, overlay toast). The toast window
@@ -81,8 +81,6 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(debug_assertions)]
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -103,7 +101,7 @@ const PAD_POLL_ACTIVE: Duration = Duration::from_millis(4);
 /// AlwaysOnTop toast cannot starve other iced windows on Windows (iced#3108).
 const UI_TICK: Duration = Duration::from_millis(16);
 /// Feedback delay between the reload click (button flips to "Reloading…")
-/// and the actual shell exit.
+/// and the actual app exit.
 const RELOAD_FEEDBACK_DELAY: Duration = Duration::from_millis(700);
 /// How long a restore stays in its settle window after relaunch: row
 /// rebuilds re-pin the persisted selection by key instead of trusting the
@@ -121,11 +119,6 @@ const START_UNFOCUS_GRACE: Duration = Duration::from_millis(150);
 const START_CURSOR_IDLE_HIDE: Duration = Duration::from_secs(2);
 /// Kick Steam scan if Start never opened / settled (tray-only boot).
 const STEAM_SCAN_IDLE_FALLBACK: Duration = Duration::from_secs(2);
-/// Shell-client retries for the retained snapshot pull (same ~10s window).
-/// The snapshot carries live + remembered + prefs + analytics + selection in
-/// one rev-gated message; this closes the attach race where the service's
-/// newcomer push lands before the broadcast receiver is live.
-const SNAPSHOT_SYNC_RETRIES: u8 = 40;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -180,10 +173,6 @@ pub enum Message {
     },
     /// Pad input edge from the hid-worker (report-rate; replaces UI PadPoll timer).
     PadInput(crate::domain::pad::InputEdge),
-    /// Client mode: reconcile shell-side pad-input hot flag with the service.
-    ClientIpcSync,
-    /// Message from the HID/tray service (shell-client mode).
-    Service(crate::ipc::ServiceMessage),
     ManualFilePicked(Option<PathBuf>),
     ManualIconPicked(Option<PathBuf>),
     SteamPathPicked(Option<PathBuf>),
@@ -243,11 +232,10 @@ impl Message {
     ///
     /// Deliberately exhaustive (no wildcard): a new variant fails to compile
     /// here until it is classified as input or system. Ticks, background
-    /// results, window lifecycle, and service convergence are system.
+    /// results, and window lifecycle are system.
     ///
     /// Tray Quit is NOT input: quitting cancels the reload and must always
-    /// work (the service-quit path funnels through `Shutdown`, which clears
-    /// the restore record the same way).
+    /// work.
     fn is_user_input(&self) -> bool {
         match self {
             Message::Tick => false,
@@ -273,8 +261,6 @@ impl Message {
             | Message::StartCursorActivity(_)
             | Message::PadInput(_) => true,
             Message::StartKey { .. } => true,
-            Message::ClientIpcSync => false,
-            Message::Service(msg) => service_message_is_input(msg),
             Message::ManualFilePicked(_)
             | Message::ManualIconPicked(_)
             | Message::SteamPathPicked(_) => true,
@@ -299,37 +285,6 @@ impl Message {
             | Message::SpectrumCommit(_) => false,
             Message::Exit => false,
         }
-    }
-}
-
-/// True for service-originated messages that stem from user input and must be
-/// dropped while a renderer reload is queued. Session convergence (snapshot,
-/// notifications, persistence, tray sync) flows untouched; `Shutdown` flows
-/// and cancels the reload via the record cleanup there.
-fn service_message_is_input(msg: &crate::ipc::ServiceMessage) -> bool {
-    use crate::ipc::ServiceMessage;
-    use crate::session::SessionEffect;
-    match msg {
-        ServiceMessage::PadInput(_) => true,
-        ServiceMessage::TrayOpenPopup { .. } | ServiceMessage::TrayOpenSettings => true,
-        // Only the Start-visibility effects originate from user/gesture input
-        // (reopen chord, auto-open policy on presence change). The rest is
-        // background session convergence.
-        ServiceMessage::Effects(effects) => effects.iter().any(|effect| {
-            matches!(
-                effect,
-                SessionEffect::OpenStart
-                    | SessionEffect::CloseStart
-                    | SessionEffect::ClearStartLatch
-            )
-        }),
-        ServiceMessage::Shutdown
-        | ServiceMessage::Notifications { .. }
-        | ServiceMessage::Version { .. }
-        | ServiceMessage::Snapshot(_)
-        | ServiceMessage::Ack
-        | ServiceMessage::ControllerList(_)
-        | ServiceMessage::LightbarSet { .. } => false,
     }
 }
 
@@ -368,12 +323,7 @@ pub struct App {
     /// True while a background battery poll is in flight.
     refreshing: Arc<AtomicBool>,
     /// Serializes DualSense HID for the daemon (never on the UI thread).
-    /// `None` in shell-client mode (service owns HID).
-    hid_worker: Option<HidWorkerHandle>,
-    /// True when this process is the iced shell attached to the service.
-    client_mode: bool,
-    /// Last [`ShellCommand::SetInputHot`] sent to the service (client mode).
-    client_input_hot: bool,
+    hid_worker: HidWorkerHandle,
 
     tray_icon: Option<TrayIcon>,
     tray_anchor: TrayAnchor,
@@ -390,12 +340,12 @@ pub struct App {
     /// Debug-only window stress test in flight (Diagnostics section).
     #[cfg(debug_assertions)]
     stress_running: bool,
-    /// Debug-only layout-bounds overlay (Diagnostics toggle / F9). Shell-local
-    /// UI state: never persisted, never sent over IPC.
+    /// Debug-only layout-bounds overlay (Diagnostics toggle / F9). Local UI
+    /// state: never persisted.
     #[cfg(debug_assertions)]
     pub debug_layout_bounds: bool,
     /// Debug-only ambient pulse + ken-burns tuning (Diagnostics sliders).
-    /// Shell-local UI state: never persisted, never sent over IPC; defaults
+    /// Local UI state: never persisted; defaults
     /// reproduce release visuals. Mirrored into the process-wide tuning
     /// atomics (`ui::shader::ambient`, `ui::start::mode`) on every edit.
     #[cfg(debug_assertions)]
@@ -502,17 +452,9 @@ pub struct App {
     nav_not_ready_warned: bool,
     /// When the start window was opened (for not-ready timing).
     start_opened_at: Option<Instant>,
-    /// Mirror of the service-owned start selection (client mode only).
+    /// Last applied start-screen selection (restart restores, row rebuilds
+    /// re-pin by key while the restore settle window is fresh).
     start_selection_shadow: Option<crate::session::StartSelection>,
-    /// True once this shell lifetime reported a selection (local is newest).
-    start_selection_dirty: bool,
-    /// Last retained-snapshot rev applied from the service (client mode).
-    /// Stale (`rev <= applied`) snapshots are ignored; 0 means none yet.
-    snapshot_rev_applied: u64,
-    /// True until the first retained snapshot arrives (boot request retries).
-    snapshot_sync_pending: bool,
-    /// Snapshot-pull attempts sent so far (stops at [`SNAPSHOT_SYNC_RETRIES`]).
-    snapshot_sync_attempts: u8,
     /// Renderer prefs at boot (AA/vsync are boot-only iced settings).
     renderer_boot_aa: bool,
     renderer_boot_vsync: bool,
@@ -574,8 +516,7 @@ pub struct App {
 ///
 /// Publishing runs the normal connect/notify path, so it is deliberately
 /// debounced: a drag must not emit a toast (or open Start) per frame.
-/// In client mode the previewed level lives here (the tab fleet is derived
-/// from the service snapshot); in standalone it mirrors the fleet edit.
+/// The previewed level lives here until the debounce commits it.
 #[cfg(debug_assertions)]
 struct PendingEmulatorCommit {
     deadline: Instant,
@@ -596,63 +537,16 @@ const EMULATOR_COMMIT_POLL: Duration = Duration::from_millis(100);
 // Entry points
 // ---------------------------------------------------------------------------
 
-/// Standalone in-process daemon (no service attached).
+/// In-process daemon: tray, HID, session, and iced UI in one process.
 ///
 /// Developer tooling (Configure → Controllers, emulated pads) is compiled
 /// in for every non-release build, so a plain `cargo run` already has it — no
 /// flag needed. Release builds drop it at compile time.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    run_app()
-}
-
-/// Iced shell attached to the HID/tray service (no local DualSense HID owner).
-pub fn run_shell_client() -> Result<(), Box<dyn std::error::Error>> {
-    crate::platform::app_log::info("shell: client mode (service owns HID + tray)");
-    // Wait for the service endpoint before the first TCP connect. A bare
-    // probe connect would register as a shell client and could steal a
-    // latched OpenStart before iced boots — so the one connection opened
-    // here is handshook, verified, and seeded into the command client
-    // (never dropped).
-    let mut ready = false;
-    for _ in 0..50 {
-        if crate::ipc::service_endpoint_ready() {
-            ready = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    if !ready {
-        return Err("shell: no service endpoint (service not running); quitting".into());
-    }
-    // Strict version gate: a shell that cannot prove its service speaks the
-    // same IPC protocol quits instead of limping on half-understood messages.
-    // (An unversioned pre-handshake service never answers: timeout → quit.)
-    let mut client = crate::ipc::PipeClient::connect()
-        .map_err(|e| format!("shell: no service (connect failed: {e}); quitting"))?;
-    let (protocol, version) = client
-        .handshake(std::time::Duration::from_secs(3))
-        .map_err(|e| format!("shell: version handshake failed ({e}); quitting"))?;
-    if protocol != crate::ipc::IPC_PROTOCOL_VERSION {
-        return Err(format!(
-            "shell: ipc protocol mismatch (shell {} vs service {protocol} v{version}); quitting",
-            crate::ipc::IPC_PROTOCOL_VERSION
-        )
-        .into());
-    }
-    crate::platform::app_log::info(format!(
-        "shell: service handshake ok (protocol {protocol} v{version})"
-    ));
-    // Hand the verified connection to the command client instead of dropping
-    // it: no throwaway probe that could steal a latched newcomer message.
-    crate::ipc::seed_command_client(client);
-    run_app_as_client()
-}
-
-fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     crate::platform::wgpu_diag::log_adapters_at_boot();
 
     // Boot-only renderer prefs: iced `Settings` cannot flip at runtime, so the
-    // shell reads them before the daemon builds. `App::boot` re-loads the same
+    // app reads them before the daemon builds. `App::boot` re-loads the same
     // file for session state; prefs win over any `ICED_PRESENT_MODE` env.
     let prefs = Prefs::load();
     let settings = iced::Settings {
@@ -660,7 +554,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         vsync: prefs.perf_vsync,
         ..iced::Settings::default()
     };
-    let boot = || App::boot(false);
+    let boot = App::boot;
 
     iced::daemon(boot, App::update, App::view)
         .subscription(App::subscription)
@@ -670,26 +564,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .settings(settings)
         .run()?;
 
-    Ok(())
-}
-
-fn run_app_as_client() -> Result<(), Box<dyn std::error::Error>> {
-    crate::platform::wgpu_diag::log_adapters_at_boot();
-    let prefs = Prefs::load();
-    let settings = iced::Settings {
-        antialiasing: prefs.perf_antialiasing,
-        vsync: prefs.perf_vsync,
-        ..iced::Settings::default()
-    };
-    // Client mode has no local HID owner, so the emulator has nothing to feed.
-    let boot = || App::boot(true);
-    iced::daemon(boot, App::update, App::view)
-        .subscription(App::subscription)
-        .title(App::title)
-        .theme(App::theme)
-        .style(App::style)
-        .settings(settings)
-        .run()?;
     Ok(())
 }
 
@@ -698,7 +572,7 @@ fn run_app_as_client() -> Result<(), Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 
 impl App {
-    fn boot(client_mode: bool) -> (Self, Task<Message>) {
+    fn boot() -> (Self, Task<Message>) {
         let prefs = Prefs::load();
         let known = KnownControllers::load();
         let analytics = AnalyticsStore::load();
@@ -707,20 +581,10 @@ impl App {
         lightbar::set_enabled(prefs.lightbar_enabled);
 
         #[cfg(windows)]
-        if !client_mode {
-            autostart::ensure_quiet_entry();
-        }
+        autostart::ensure_quiet_entry();
 
-        let (hid_worker, identifying) = if client_mode {
-            (None, Arc::new(AtomicBool::new(false)))
-        } else {
-            let worker = HidWorkerHandle::start();
-            let identifying = worker.identifying();
-            (Some(worker), identifying)
-        };
-
-        #[cfg(debug_assertions)]
-        set_shell_client_hitch_mode(client_mode);
+        let hid_worker = HidWorkerHandle::start();
+        let identifying = hid_worker.identifying();
 
         let configure_state = ConfigureState::new(prefs.spectrum.clone());
 
@@ -751,10 +615,7 @@ impl App {
         let (renderer_boot_aa, renderer_boot_vsync) =
             (session.prefs.perf_antialiasing, session.prefs.perf_vsync);
 
-        let last_discovered = hid_worker
-            .as_ref()
-            .map(|w| w.presence_paths())
-            .unwrap_or_default();
+        let last_discovered = hid_worker.presence_paths();
         let mut app = Self {
             session,
             games,
@@ -764,8 +625,6 @@ impl App {
             identifying,
             refreshing: Arc::new(AtomicBool::new(false)),
             hid_worker,
-            client_mode,
-            client_input_hot: false,
             tray_icon: None,
             tray_anchor: TrayAnchor::default(),
             popup_window: None,
@@ -841,10 +700,6 @@ impl App {
             nav_not_ready_warned: false,
             start_opened_at: None,
             start_selection_shadow: None,
-            start_selection_dirty: false,
-            snapshot_rev_applied: 0,
-            snapshot_sync_pending: false,
-            snapshot_sync_attempts: 0,
             renderer_boot_aa,
             renderer_boot_vsync,
             restarting_for_renderer: false,
@@ -870,18 +725,8 @@ impl App {
             pending_emulator_commits: std::collections::HashMap::new(),
         };
 
-        // Show the tray immediately (standalone only — service owns the tray in client mode).
-        if !client_mode {
-            app.create_tray();
-        }
-        if client_mode {
-            // Pull the retained snapshot (live + remembered + prefs +
-            // analytics + selection, one rev). This is the single convergent
-            // path that heals stale boot-time disk copies; retries ride
-            // `ClientIpcSync` in case the shell's recv loop is not live yet.
-            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RequestSnapshot);
-            app.snapshot_sync_pending = true;
-        }
+        // Show the tray immediately; the daemon owns it for its whole lifetime.
+        app.create_tray();
         #[cfg(all(windows, debug_assertions))]
         start_hitch_hotkey_worker();
         app.sync_popup_rows();
@@ -1077,26 +922,17 @@ impl App {
             }),
         ];
 
-        if !self.client_mode {
-            subscriptions.push(
-                iced::time::every(
-                    if self.session.prefs.start_screen_enabled
-                        && self.session.controllers.is_empty()
-                    {
-                        PRESENCE_INTERVAL_EMPTY
-                    } else {
-                        PRESENCE_INTERVAL
-                    },
-                )
-                .map(|_| Message::Tick),
-            );
-            subscriptions.push(Subscription::run(tray_events_mapped));
-        } else {
-            subscriptions.push(Subscription::run(service_message_stream));
-            subscriptions.push(
-                iced::time::every(Duration::from_millis(250)).map(|_| Message::ClientIpcSync),
-            );
-        }
+        subscriptions.push(
+            iced::time::every(
+                if self.session.prefs.start_screen_enabled && self.session.controllers.is_empty() {
+                    PRESENCE_INTERVAL_EMPTY
+                } else {
+                    PRESENCE_INTERVAL
+                },
+            )
+            .map(|_| Message::Tick),
+        );
+        subscriptions.push(Subscription::run(tray_events_mapped));
 
         if self.toast_message.is_some() {
             subscriptions.push(Subscription::run_with(
@@ -1131,21 +967,14 @@ impl App {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::IdentifyFrame));
         }
 
-        if !self.client_mode {
-            let pad_input_live = self.configure_window.is_some()
-                && self.configure_state.section == Section::PadInput;
-            let pad_listening = pad_input_live
-                || (self.session.prefs.start_screen_enabled
-                    && !self.session.controllers.is_empty());
-            if let Some(w) = self.hid_worker.as_ref() {
-                w.set_input_hot(pad_listening);
-            }
-            if pad_listening {
-                subscriptions.push(Subscription::run(pad_input_edge_stream));
-            }
+        let pad_input_live =
+            self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
+        let pad_listening = pad_input_live
+            || (self.session.prefs.start_screen_enabled && !self.session.controllers.is_empty());
+        self.hid_worker.set_input_hot(pad_listening);
+        if pad_listening {
+            subscriptions.push(Subscription::run(pad_input_edge_stream));
         }
-        // Client mode: reopen gesture stays on the service; pad edges only when
-        // Start / Settings pad-input need them (see shell_wants_pad_input).
 
         if self.start_visible && (self.start_state.needs_frames() || self.steam_scan_in_flight()) {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::StartFrame));
@@ -1298,17 +1127,16 @@ impl App {
             ));
         self.start_state
             .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
-        // Debug tuning keep-alive follows the shell-local fields (the tuning
+        // Debug tuning keep-alive follows the local fields (the tuning
         // arms below re-sync too, since this runs before the match).
         #[cfg(debug_assertions)]
         {
             self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
         }
         // Renderer reload queued: drop all user input (pad / mouse /
-        // keyboard / tray / pickers, shell and service originated) so nothing
-        // can act in the feedback window before exit. Window lifecycle,
-        // ticks, and service convergence flow untouched; Tray Quit still
-        // exits (and cancels the reload).
+        // keyboard / tray / pickers) so nothing can act in the feedback
+        // window before exit. Window lifecycle and ticks flow untouched;
+        // Tray Quit still exits (and cancels the reload).
         if self.renderer_reload_queued && message.is_user_input() {
             return Task::none();
         }
@@ -1346,18 +1174,14 @@ impl App {
                 } else if Some(id) == self.start_window {
                     self.start_window = None;
                     self.start_visible = false;
-                    self.report_start_visible(false);
-                    self.sync_client_input_hot();
                     self.start_nav_ready = false;
                     self.pad_nav.reset();
                     self.clear_start_nav_diag();
                     self.consume_reopen_gesture_chord();
                     let sync = self.sync_toast_zorder();
-                    // Standalone only: the service owns the auto-open latch in
-                    // client mode (`pending_open_start` + `OpenStart` effects)
-                    // and this shell's flag never arms there.
-                    if !self.client_mode
-                        && self.session.start_auto_open_pending
+                    // The auto-open latch survives a close so a pending
+                    // open can retry once presence still qualifies.
+                    if self.session.start_auto_open_pending
                         && self.session.prefs.start_screen_enabled
                         && self.session.prefs.start_screen_auto_open.auto_opens()
                         && crate::session::has_start_presence(
@@ -1810,12 +1634,6 @@ impl App {
                     self.on_pad_input(edge)
                 }
             }
-            Message::ClientIpcSync => {
-                self.sync_client_input_hot();
-                self.maybe_request_snapshot();
-                Task::none()
-            }
-            Message::Service(msg) => self.on_service_message(msg),
             Message::ManualFilePicked(path) => self.on_manual_file_picked(path),
             Message::ManualIconPicked(path) => self.on_manual_icon_picked(path),
             Message::SteamPathPicked(path) => self.on_steam_path_picked(path),
@@ -1944,7 +1762,7 @@ impl App {
             }
             // Redraw only: the wall-clock spinner phase advances in `view`.
             Message::RendererReloadTick => Task::none(),
-            Message::RendererReloadDue => self.restart_shell_for_renderer(),
+            Message::RendererReloadDue => self.restart_app_for_renderer(),
             Message::UtilityAmbientTick => {
                 crate::ui::backdrop::note_utility_tick();
                 Task::none()
@@ -1975,11 +1793,7 @@ impl App {
                 if !self.restarting_for_renderer {
                     crate::persist::restart_ui::clear();
                 }
-                // Single-writer: the service owns `controllers.json`; a client
-                // save here would race it with a stale copy.
-                if !self.client_mode {
-                    self.session.known.save();
-                }
+                self.session.known.save();
                 // Drop every Start image Handle before iced tears down the GPU atlas.
                 self.start_visible = false;
                 self.start_nav_ready = false;
@@ -1991,13 +1805,7 @@ impl App {
                 let _ = crate::ui::start::icon_cache::bump_art_warm_generation();
                 crate::ui::start::art_worker::shutdown();
                 crate::domain::pad::clear_input_edge_sender();
-                if self.client_mode {
-                    crate::ipc::clear_command_client();
-                } else {
-                    if let Some(w) = self.hid_worker.as_ref() {
-                        w.shutdown();
-                    }
-                }
+                self.hid_worker.shutdown();
                 self.tray_icon.take();
                 crate::controller::hid::diag::diag_info("ui-diag: process exit complete");
                 iced::exit()
@@ -2034,11 +1842,7 @@ impl App {
             return Task::none();
         }
 
-        let discovered = self
-            .hid_worker
-            .as_ref()
-            .map(|w| w.presence_paths())
-            .unwrap_or_default();
+        let discovered = self.hid_worker.presence_paths();
 
         let membership_changed = discovered != self.last_discovered;
         self.last_discovered = discovered;
@@ -2105,10 +1909,7 @@ impl App {
             .iter()
             .map(|c| c.serial.clone())
             .collect();
-        let Some(worker) = self.hid_worker.clone() else {
-            self.refreshing.store(false, Ordering::SeqCst);
-            return Task::none();
-        };
+        let worker = self.hid_worker.clone();
         Task::perform(worker.poll(previously_connected), Message::PollResult)
     }
 
@@ -2123,11 +1924,9 @@ impl App {
 
         match result {
             Ok(controllers) => {
-                if let Some(worker) = self.hid_worker.as_ref() {
-                    self.session
-                        .notify
-                        .queue_launch_quiet(worker.take_launch_serials());
-                }
+                self.session
+                    .notify
+                    .queue_launch_quiet(self.hid_worker.take_launch_serials());
                 let ctx = crate::session::ApplyContext {
                     start_visible: self.start_visible,
                     fullscreen: start_input::foreground_is_exclusive_fullscreen(),
@@ -2153,22 +1952,10 @@ impl App {
         for effect in effects {
             match effect {
                 SessionEffect::SetTray { connected: _ } => {
-                    if !self.client_mode {
-                        tasks.push(self.apply_tray());
-                    } else {
-                        tasks.push(self.sync_popup_rows_and_fit());
-                    }
+                    tasks.push(self.apply_tray());
                 }
                 SessionEffect::SetLowBatteryTargets { targets } => {
-                    if self.client_mode {
-                        let _ = crate::ipc::send_command(
-                            &crate::ipc::ShellCommand::SetLowBatteryTargets { targets },
-                        );
-                    } else {
-                        if let Some(w) = self.hid_worker.as_ref() {
-                            w.set_low_battery_targets(targets);
-                        }
-                    }
+                    self.hid_worker.set_low_battery_targets(targets);
                 }
                 SessionEffect::QueueNotifications {
                     events,
@@ -2177,11 +1964,11 @@ impl App {
                     tasks.push(self.queue_notifications(events, open_start_after_toast));
                 }
                 SessionEffect::OpenStart => {
-                    // Service may fire the reopen chord during the connect-toast
+                    // The reopen chord may fire during the connect-toast
                     // latch; the toast's own AfterToast::OpenStart still opens Start.
                     if self.toast_machine.suppresses_reopen_gesture() {
                         crate::controller::hid::diag::diag_info(
-                            "ui-diag: service OpenStart ignored (toast OpenStart pending)",
+                            "ui-diag: OpenStart ignored (toast OpenStart pending)",
                         );
                     } else {
                         tasks.push(self.open_start_screen());
@@ -2194,22 +1981,13 @@ impl App {
                     self.toast_machine.clear_after();
                 }
                 SessionEffect::SaveKnown => {
-                    if !self.client_mode {
-                        self.session.known.save();
-                    }
+                    self.session.known.save();
                 }
                 SessionEffect::SaveAnalytics => {
-                    if !self.client_mode {
-                        self.session.analytics.save();
-                    }
+                    self.session.analytics.save();
                 }
                 SessionEffect::RefreshAnalyticsPanel => {
-                    // Records arrive via the retained snapshot in client mode
-                    // (single-writer: the service owns `analytics.json`); only
-                    // standalone reloads from disk.
-                    if !self.client_mode {
-                        self.session.analytics = AnalyticsStore::load();
-                    }
+                    self.session.analytics = AnalyticsStore::load();
                     self.refresh_analytics_panel();
                 }
                 SessionEffect::SyncPopup => {
@@ -2220,46 +1998,12 @@ impl App {
         Task::batch(tasks)
     }
 
-    fn report_start_visible(&self, visible: bool) {
-        if self.client_mode {
-            let _ =
-                crate::ipc::send_command(&crate::ipc::ShellCommand::ReportStartVisible { visible });
-        }
-    }
-
-    /// Persist prefs: standalone writes directly; client mode sends an
-    /// absolute intent and converges on the snapshot echo (single-writer:
-    /// the service owns `prefs.json`). Local mutation is kept for
-    /// responsiveness (sliders); the service validates and wins.
+    /// Persist prefs to disk (single writer: this process owns `prefs.json`).
     fn save_prefs(&self) {
-        if self.client_mode {
-            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetPrefs {
-                prefs: self.session.prefs.clone(),
-            });
-        } else {
-            self.session.prefs.save();
-        }
+        self.session.prefs.save();
     }
 
-    /// Retry the retained-snapshot pull until the first snapshot lands or
-    /// attempts run out (no service — the handshake already failed, so this
-    /// is just the attach race with the broadcast receiver).
-    fn maybe_request_snapshot(&mut self) {
-        if !self.client_mode || !self.snapshot_sync_pending || self.snapshot_rev_applied > 0 {
-            if self.snapshot_rev_applied > 0 {
-                self.snapshot_sync_pending = false;
-            }
-            return;
-        }
-        if self.snapshot_sync_attempts >= SNAPSHOT_SYNC_RETRIES {
-            self.snapshot_sync_pending = false;
-            return;
-        }
-        self.snapshot_sync_attempts += 1;
-        let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RequestSnapshot);
-    }
-
-    /// Apply a service-stored selection to the start lists (keys → indices).
+    /// Apply a stored selection to the start lists (keys → indices).
     /// Game-axis resolve honors the persistence prefs; the controller axis is
     /// never gated. Returns true when an index moved.
     fn apply_start_selection(&mut self, selection: &crate::session::StartSelection) -> bool {
@@ -2273,52 +2017,8 @@ impl App {
         )
     }
 
-    /// Report a selection change to the service (client mode, Start visible).
-    /// Close resets indices via `reset_to_games` after hiding, so those never report.
-    ///
-    /// Game axis only reports while persistence is on: with it off the
-    /// shadowed game values are re-sent (never cleared), so a game-only nav
-    /// change is a no-op send while controller changes still report.
-    fn report_start_selection_changed(
-        &mut self,
-        game_key: &Option<String>,
-        controller_key: &Option<String>,
-        game_index: Option<usize>,
-    ) {
-        if !self.client_mode || !self.start_visible {
-            return;
-        }
-        let (game_key, game_index) = if self.session.prefs.start_selection_persist {
-            (game_key.clone(), game_index)
-        } else {
-            let shadow = self.start_selection_shadow.clone().unwrap_or_default();
-            (shadow.game_key, shadow.game_index)
-        };
-        if game_key.is_none() && controller_key.is_none() {
-            return;
-        }
-        let selection = crate::session::StartSelection {
-            game_key,
-            controller_key: controller_key.clone(),
-            game_index,
-        };
-        if self.start_selection_shadow.as_ref() == Some(&selection) {
-            return;
-        }
-        self.start_selection_shadow = Some(selection);
-        // Local nav is newer than any snapshot selection: the snapshot path
-        // keeps `dirty` until a shell restart.
-        self.start_selection_dirty = true;
-        let shadow = self.start_selection_shadow.clone().unwrap_or_default();
-        let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetStartSelection {
-            game_key: shadow.game_key,
-            controller_key: shadow.controller_key,
-            game_index: shadow.game_index,
-        });
-    }
-
-    /// True when the shell (not the service) should receive live pad-input edges.
-    fn shell_wants_pad_input(&self) -> bool {
+    /// True when live pad-input edges should drive Start / diagnostics.
+    fn wants_pad_input(&self) -> bool {
         // Debug quiet mode: HID input is focus-independent, so a pad press during
         // a game must never drive Start (navigate / launch).
         if crate::platform::debug_quiet::enabled() {
@@ -2330,20 +2030,6 @@ impl App {
             || (self.start_visible
                 && self.session.prefs.start_screen_enabled
                 && !self.session.controllers.is_empty())
-    }
-
-    fn sync_client_input_hot(&mut self) {
-        if !self.client_mode || self.renderer_reload_queued {
-            return;
-        }
-        let hot = self.shell_wants_pad_input();
-        if self.client_input_hot == hot {
-            return;
-        }
-        self.client_input_hot = hot;
-        if crate::ipc::send_command(&crate::ipc::ShellCommand::SetInputHot { hot }).is_err() {
-            self.client_input_hot = !hot;
-        }
     }
 
     /// Apply a controller snapshot through the session (used by presence clear + emulate).
@@ -2836,7 +2522,7 @@ impl App {
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugLayoutBounds(enabled) => {
-                // Shell-local overlay only: deliberately no save_prefs / disk I/O.
+                // Local overlay only: deliberately no save_prefs / disk I/O.
                 self.debug_layout_bounds = enabled;
                 Task::none()
             }
@@ -2981,7 +2667,7 @@ impl App {
 
     /// True while any debug ambient/ken-burns tuning differs from shipped
     /// behavior (drives the Start keep-alive so tuning repaints under idle
-    /// throttle). Shell-local only.
+    /// throttle). Local only.
     #[cfg(debug_assertions)]
     fn debug_tuning_active(&self) -> bool {
         let defaults = crate::ui::configure::DebugAmbientTune::default();
@@ -3043,14 +2729,7 @@ impl App {
         }
 
         for (serial, color) in targets {
-            if self.client_mode {
-                let _ =
-                    crate::ipc::send_command(&crate::ipc::ShellCommand::SetRgb { serial, color });
-            } else {
-                if let Some(w) = self.hid_worker.as_ref() {
-                    w.set_rgb(serial, color);
-                }
-            }
+            self.hid_worker.set_rgb(serial, color);
         }
         Task::none()
     }
@@ -3076,17 +2755,8 @@ impl App {
             return false;
         }
 
-        if self.client_mode {
-            crate::ipc::send_command(&crate::ipc::ShellCommand::Identify {
-                serial: serial.to_string(),
-                percent: controller.percent,
-            })
-            .is_ok()
-        } else {
-            self.hid_worker
-                .as_ref()
-                .is_some_and(|w| w.identify(serial.to_string(), controller.percent))
-        }
+        self.hid_worker
+            .identify(serial.to_string(), controller.percent)
     }
 
     fn power_off(&mut self, serial: &str) {
@@ -3116,44 +2786,21 @@ impl App {
         self.start_state.powering_off = Some(serial.to_string());
         // Reconnect after user power-off should open Start again (not ghost-flap cooldown),
         // but only when this was the last pad — a sibling must not look like a fresh 0→1.
-        // Standalone only: in client mode the service marks on receipt, and
-        // this shell never evaluates cooldowns.
-        if !self.client_mode
-            && crate::session::should_skip_connect_cooldown_on_power_off(
-                &self.session.controllers,
-                serial,
-                self.session.prefs.start_screen_auto_open.includes_usb(),
-            )
-        {
+        if crate::session::should_skip_connect_cooldown_on_power_off(
+            &self.session.controllers,
+            serial,
+            self.session.prefs.start_screen_auto_open.includes_usb(),
+        ) {
             self.session.mark_skip_connect_cooldown();
         }
-        if self.client_mode {
-            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::PowerOff {
-                serial: serial.to_string(),
-            });
-        } else {
-            if let Some(w) = self.hid_worker.as_ref() {
-                w.power_off(serial.to_string());
-            }
-        }
+        self.hid_worker.power_off(serial.to_string());
     }
 
     fn toggle_remember(&mut self, serial: &str) -> Task<Message> {
         #[cfg(debug_assertions)]
         if is_emulated_serial(serial) {
-            // Emulated pads: the service owns the fleet. The pin rides the
-            // fleet intent (the fleet flag — not just the store — decides
-            // what survives an unplug).
-            if self.client_mode {
-                let remembered = !self
-                    .emulated_pads
-                    .iter()
-                    .find(|p| p.serial() == serial)
-                    .is_some_and(|p| p.remembered);
-                let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::Emu {
-                    command: EmulatorCommand::SetRemembered(serial.to_string(), remembered),
-                });
-            }
+            // Emulated pads ride the fleet path (`apply_emulator_command`
+            // with `SetRemembered`); the popup pin is a no-op here.
             return Task::none();
         }
         #[cfg(not(debug_assertions))]
@@ -3161,50 +2808,26 @@ impl App {
             return Task::none();
         }
 
-        // Optimistic local update for responsiveness; the service is the
-        // authority and the snapshot echo converges (single-writer: the
-        // service owns `controllers.json`).
-        let remembered;
+        // The session is the authority; `controllers.json` is written on change.
         if self.session.known.is_remembered(serial) {
             self.session.known.forget(serial);
-            remembered = false;
         } else if let Some(controller) =
             self.session.controllers.iter().find(|c| c.serial == serial)
         {
             self.session.known.remember(controller);
-            remembered = true;
         } else {
             return Task::none();
         }
 
-        if self.client_mode {
-            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetRemembered {
-                serial: serial.to_string(),
-                remembered,
-            });
-        } else {
-            self.session.known.save();
-        }
+        self.session.known.save();
         self.sync_popup_rows_and_fit()
     }
 
     fn set_nickname(&mut self, serial: &str, nickname: Option<String>) -> Task<Message> {
         #[cfg(debug_assertions)]
         if is_emulated_serial(serial) {
-            // Nicknames live in the remembered store only (no fleet flag),
-            // so the generic intent suffices in client mode.
-            if self.client_mode {
-                if self.session.known.nickname(serial).map(str::to_string) != nickname {
-                    let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetNickname {
-                        serial: serial.to_string(),
-                        nickname: nickname.clone(),
-                    });
-                    // Optimistic echo for the tab/popup until the snapshot lands.
-                    self.session.known.set_nickname(serial, nickname);
-                    return self.sync_popup_rows_and_fit();
-                }
-                return Task::none();
-            }
+            // Emulated-pad nicknames ride the fleet path; the direct pin is
+            // a no-op here.
             return Task::none();
         }
         #[cfg(not(debug_assertions))]
@@ -3212,14 +2835,7 @@ impl App {
             return Task::none();
         }
         if self.session.known.set_nickname(serial, nickname.clone()) {
-            if self.client_mode {
-                let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetNickname {
-                    serial: serial.to_string(),
-                    nickname,
-                });
-            } else {
-                self.session.known.save();
-            }
+            self.session.known.save();
             self.sync_popup_rows_and_fit()
         } else {
             Task::none()
@@ -3230,9 +2846,7 @@ impl App {
     ///
     /// Advances the spinner every tick and commits once a pad has been quiet for
     /// [`EMULATOR_COMMIT_DEBOUNCE`]. Only subscribed while something is pending.
-    ///
-    /// Client mode sends the settled level as an intent (the service owns the
-    /// fleet); standalone publishes through the local session.
+    /// Committed levels publish through the local session.
     #[cfg(debug_assertions)]
     fn on_emulator_commit_tick(&mut self) -> Task<Message> {
         if self.pending_emulator_commits.is_empty() {
@@ -3259,14 +2873,6 @@ impl App {
             "ui-diag: emulator debounce committed {}",
             due.len()
         ));
-        if self.client_mode {
-            for (serial, percent) in due {
-                let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::Emu {
-                    command: EmulatorCommand::PreviewPercent(serial, percent),
-                });
-            }
-            return Task::none();
-        }
         self.last_battery_poll = Instant::now();
         self.apply_controllers(self.live_controllers())
     }
@@ -3275,8 +2881,7 @@ impl App {
     ///
     /// Only the pad the Controllers tab has selected can show its spinner, so this
     /// resolves the selection to a concrete change. Percent comes from the
-    /// preview overlay (client mode commits it on debounce; standalone mirrors
-    /// the fleet edit into the overlay — see `PreviewPercent` below).
+    /// preview overlay, committed on debounce (see `PreviewPercent` below).
     #[cfg(debug_assertions)]
     fn pending_emulator_changes(&self) -> Vec<configure_view::PendingEmulatorChange> {
         self.emulated_pads
@@ -3290,49 +2895,6 @@ impl App {
                 })
             })
             .collect()
-    }
-
-    /// Developer emulator edit in client mode: the service owns the fleet,
-    /// so every edit except the drag preview crosses IPC as an intent and
-    /// the tab fleet re-derives from the snapshot echo. The preview stays
-    /// local (repaint only) until the debounce commits it the same way.
-    #[cfg(debug_assertions)]
-    fn apply_emulator_command_via_service(&mut self, command: EmulatorCommand) -> Task<Message> {
-        match command {
-            EmulatorCommand::PreviewPercent(serial, percent) => {
-                self.pending_emulator_commits.insert(
-                    serial,
-                    PendingEmulatorCommit {
-                        deadline: Instant::now() + EMULATOR_COMMIT_DEBOUNCE,
-                        tick: 0,
-                        percent,
-                    },
-                );
-                Task::none()
-            }
-            EmulatorCommand::RemovePad(serial) => {
-                self.pending_emulator_commits.remove(&serial);
-                let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::Emu {
-                    command: EmulatorCommand::RemovePad(serial),
-                });
-                Task::none()
-            }
-            EmulatorCommand::SetConnected(serial, connected) => {
-                if !connected {
-                    // Nothing left to publish to; drop the armed timer so the
-                    // commit cannot fire against a pad that is no longer live.
-                    self.pending_emulator_commits.remove(&serial);
-                }
-                let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::Emu {
-                    command: EmulatorCommand::SetConnected(serial, connected),
-                });
-                Task::none()
-            }
-            command => {
-                let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::Emu { command });
-                Task::none()
-            }
-        }
     }
 
     /// True while any emulated pad is plugged in — HID polling stands down so
@@ -3358,9 +2920,6 @@ impl App {
 
     #[cfg(debug_assertions)]
     fn apply_emulator_command(&mut self, command: EmulatorCommand) -> Task<Message> {
-        if self.client_mode {
-            return self.apply_emulator_command_via_service(command);
-        }
         let fleet = self.emulated_pads.clone();
         let find = |serial: &str| fleet.iter().find(|p| p.serial() == serial).cloned();
 
@@ -4086,7 +3645,6 @@ impl App {
         // and reveal it. Row-independent state (drawer, config) is untouched.
         let mut task = self.prepare_immersive_library_task();
         if self.start_visible
-            && !self.start_selection_dirty
             && self.session.prefs.start_selection_persist
             && self
                 .scroll_restore_until
@@ -4415,13 +3973,6 @@ impl App {
             return Task::none();
         }
         self.renderer_reload_queued = true;
-        if self.client_mode {
-            // Stop pad edges at the service for the feedback window (in
-            // flight ones die in the input gate). Fresh boot re-arms via
-            // `sync_client_input_hot`; the sync is suppressed while queued.
-            self.client_input_hot = false;
-            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::SetInputHot { hot: false });
-        }
         Task::perform(delay(RELOAD_FEEDBACK_DELAY), |()| {
             Message::RendererReloadDue
         })
@@ -4429,7 +3980,7 @@ impl App {
 
     /// Fire a queued renderer reload. Re-checks the dirty predicate (a toggle
     /// flipped back during the feedback delay cancels the restart).
-    fn restart_shell_for_renderer(&mut self) -> Task<Message> {
+    fn restart_app_for_renderer(&mut self) -> Task<Message> {
         self.renderer_reload_queued = false;
         if !renderer_restart_needed(
             self.session.prefs.perf_antialiasing,
@@ -4440,36 +3991,35 @@ impl App {
             return Task::none();
         }
         app_log::info("perf: renderer prefs changed; reloading UI to apply");
-        // Snapshot the shell UI so the respawned process reopens to the same
+        // Snapshot the app UI so the relaunched process reopens to the same
         // state (windows, selection, scroll offsets). Written before Exit
         // clears Start state; consumed once at boot when fresh.
         crate::persist::restart_ui::save(&self.capture_restart_ui());
         self.restarting_for_renderer = true;
-        if !self.client_mode {
-            // No service to respawn us (standalone shell): relaunch detached
-            // first. The shell holds no single-instance guard, so a brief
-            // overlap while the old process exits is safe. If the relaunch
-            // fails, stay running on the old renderer rather than quitting.
-            match std::env::current_exe() {
-                Ok(exe) => {
-                    if let Err(err) = std::process::Command::new(&exe).spawn() {
-                        app_log::error(format!("perf: relaunch failed: {err}"));
-                        return Task::none();
-                    }
-                }
-                Err(err) => {
-                    app_log::error(format!("perf: current_exe failed: {err}"));
+        // Relaunch detached first: the `--replace` child waits out this
+        // process's single-instance guard while it exits. If the relaunch
+        // fails, stay running on the old renderer rather than quitting.
+        match std::env::current_exe() {
+            Ok(exe) => {
+                // `--replace`: the child retries the single-instance guard
+                // while this process exits (see `sdsc-utils` main).
+                if let Err(err) = std::process::Command::new(&exe)
+                    .arg(crate::platform::app_meta::REPLACE_FLAG)
+                    .spawn()
+                {
+                    app_log::error(format!("perf: relaunch failed: {err}"));
                     return Task::none();
                 }
             }
+            Err(err) => {
+                app_log::error(format!("perf: current_exe failed: {err}"));
+                return Task::none();
+            }
         }
-        // Client mode: the service respawns the shell within ~1s with the new
-        // iced Settings. `SetPrefs` was already piped when the toggle flipped,
-        // so the respawned shell boots on the saved values.
         self.update(Message::Exit)
     }
 
-    /// Snapshot the shell UI for a renderer-pref reload (see `restart_ui`).
+    /// Snapshot the app UI for a renderer-pref reload (see `restart_ui`).
     fn capture_restart_ui(&self) -> crate::persist::restart_ui::RestartUiState {
         use crate::persist::restart_ui::RestartUiState;
         RestartUiState {
@@ -4532,8 +4082,8 @@ impl App {
         }
         if rs.start_visible && self.session.prefs.start_screen_enabled {
             if rs.game_key.is_some() || rs.controller_key.is_some() {
-                // Fresh boot: local nav is never dirty, so the service
-                // snapshot (when it lands) still wins with newer truth.
+                // Fresh boot: seed the shadow from the restore record so row
+                // rebuilds re-pin the pre-restart selection by key.
                 self.start_selection_shadow = Some(crate::session::StartSelection {
                     game_key: rs.game_key,
                     controller_key: rs.controller_key,
@@ -4649,12 +4199,6 @@ impl App {
         }
         self.session.prefs.start_screen_auto_open = mode;
         self.save_prefs();
-        if self.client_mode {
-            // Service owns Start-open policy: it re-evaluates the USB scope
-            // on the `SetPrefs` intent and sends `CloseStart` when USB pads
-            // no longer qualify. Never double-apply locally.
-            return Task::none();
-        }
         if !mode.auto_opens() {
             // Disabling auto-open clears any latched auto-open; never opens
             // or closes here.
@@ -4665,7 +4209,6 @@ impl App {
             return Task::none();
         }
         // Scope flip may CloseStart when USB pads no longer qualify; never opens.
-        // Standalone only (client mode returned above).
         let ctx = crate::session::ApplyContext {
             start_visible: self.start_visible,
             fullscreen: start_input::foreground_is_exclusive_fullscreen(),
@@ -4727,10 +4270,8 @@ impl App {
         self.save_prefs();
         if enabled {
             self.preview_haptic_all(MotorPulse::NAV);
-        } else if self.client_mode {
-            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RumbleStopAll);
-        } else if let Some(w) = self.hid_worker.as_ref() {
-            w.rumble_stop_all();
+        } else {
+            self.hid_worker.rumble_stop_all();
         }
         Task::none()
     }
@@ -4785,8 +4326,8 @@ impl App {
         );
         self.start_state
             .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
-        // Shell restart: resolve the service-stored keys (reported before the
-        // restart) back to indices now that rows/controllers are rebuilt.
+        // App restart: resolve the stored shadow keys back to indices now
+        // that rows/controllers are rebuilt.
         // NOTE: no scroll_to here — the fresh window's scrollables do not exist
         // yet, so a scroll_to batched with window::open targets a not-mounted
         // id and is dropped by iced (compact-reopen bug: tracked offset said
@@ -4807,8 +4348,9 @@ impl App {
         }
 
         // Already open: re-focus; force running restore in case a game started.
-        // Duplicate OpenStart (service glitch before ReportStartVisible) must
-        // re-arm the release latch so the opening press cannot promote.
+        // Duplicate OpenStart (e.g. a second effect before the first open
+        // lands) must re-arm the release latch so the opening press cannot
+        // promote.
         if self.start_visible
             && let Some(id) = self.start_window
         {
@@ -4898,8 +4440,6 @@ impl App {
         });
         self.start_window = Some(id);
         self.start_visible = true;
-        self.report_start_visible(true);
-        self.sync_client_input_hot();
         self.session.start_auto_open_pending = false;
         crate::platform::wgpu_diag::note_start_open();
         Task::batch([badge, restored_art, open.map(Message::StartOpened)])
@@ -5377,8 +4917,7 @@ impl App {
 
     /// Arm the debounced release latch and mark any locally visible chord consumed.
     ///
-    /// In client mode the HID snapshot lives in the service process, so
-    /// [`read_nav_readings`] is usually Missing — leave detectors alone (do not
+    /// When no fresh readings are published, leave detectors alone (do not
     /// reset/disarm). Live pad edges while latched call `consume_pending_match`.
     fn arm_chord_release_latch(&mut self) {
         self.chord_release_gate.arm();
@@ -5392,7 +4931,7 @@ impl App {
                 self.gesture_detectors.consume_pending_match(&readings);
             }
             start_input::NavReadingsOutcome::Missing { .. } => {
-                // Shell has no local snapshot — resetting would disarm detectors
+                // No fresh readings — resetting would disarm detectors
                 // and let the same press promote after a one-sample gap.
             }
         }
@@ -5535,8 +5074,6 @@ impl App {
         // Clear visibility before any hide task so Resting toast RaiseInteractive
         // cannot resurface Start while the hide is in flight.
         self.start_visible = false;
-        self.report_start_visible(false);
-        self.sync_client_input_hot();
         self.start_nav_ready = false;
         self.start_revealed_at = None;
         self.start_state.immersive = false;
@@ -5555,13 +5092,7 @@ impl App {
         self.start_monitor_cover = None;
         self.clear_start_activity();
         self.haptic_pad_serial = None;
-        if self.client_mode {
-            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::RumbleStopAll);
-        } else {
-            if let Some(w) = self.hid_worker.as_ref() {
-                w.rumble_stop_all();
-            }
-        }
+        self.hid_worker.rumble_stop_all();
         self.pad_nav.reset();
         self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
@@ -5601,9 +5132,6 @@ impl App {
         let start_open = self.start_visible;
         let nav_ready = self.start_nav_ready;
         let controllers = self.session.controllers.len();
-        if self.client_mode {
-            note_client_hitch_controllers(controllers);
-        }
         stamp_hitch_report(
             kind,
             "button",
@@ -5632,24 +5160,8 @@ impl App {
     }
 
     /// All Start selection changes funnel through here (mouse, keyboard, pad).
-    /// Snapshots stable keys around the inner handler and reports net changes
-    /// to the service so the selection survives shell restarts.
     fn on_start_message(&mut self, message: StartMessage) -> Task<Message> {
-        let before = (
-            self.start_state.selected_game_key(),
-            self.start_state.selected_controller_key(),
-        );
-        let task = self.on_start_message_inner(message);
-        let after_game = self.start_state.selected_game_key();
-        let after_controller = self.start_state.selected_controller_key();
-        if after_game != before.0 || after_controller != before.1 {
-            self.report_start_selection_changed(
-                &after_game,
-                &after_controller,
-                Some(self.start_state.game_selected),
-            );
-        }
-        task
+        self.on_start_message_inner(message)
     }
 
     fn on_start_message_inner(&mut self, message: StartMessage) -> Task<Message> {
@@ -6099,18 +5611,8 @@ impl App {
         if right == 0 && left == 0 {
             return;
         }
-        if self.client_mode {
-            let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::Rumble {
-                serial: serial.clone(),
-                right,
-                left,
-                duration_ms: duration.as_millis() as u64,
-            });
-        } else {
-            if let Some(w) = self.hid_worker.as_ref() {
-                w.rumble(serial.clone(), right, left, duration.as_millis() as u64);
-            }
-        }
+        self.hid_worker
+            .rumble(serial.clone(), right, left, duration.as_millis() as u64);
     }
 
     /// Preview haptic on every connected DualSense (settings toggle / strength slider).
@@ -6127,16 +5629,8 @@ impl App {
         }
         let ms = duration.as_millis() as u64;
         for controller in &self.session.controllers {
-            if self.client_mode {
-                let _ = crate::ipc::send_command(&crate::ipc::ShellCommand::Rumble {
-                    serial: controller.serial.clone(),
-                    right,
-                    left,
-                    duration_ms: ms,
-                });
-            } else if let Some(w) = self.hid_worker.as_ref() {
-                w.rumble(controller.serial.clone(), right, left, ms);
-            }
+            self.hid_worker
+                .rumble(controller.serial.clone(), right, left, ms);
         }
     }
 
@@ -6558,146 +6052,6 @@ impl App {
         is_manual_target_missing(&row.target)
     }
 
-    fn on_service_message(&mut self, msg: crate::ipc::ServiceMessage) -> Task<Message> {
-        use crate::ipc::ServiceMessage;
-        match msg {
-            ServiceMessage::Effects(effects) => self.apply_session_effects(effects),
-            ServiceMessage::PadInput(edge) => {
-                #[cfg(debug_assertions)]
-                note_client_hitch_pad_edge(&edge, self.session.controllers.len());
-                if self.shell_wants_pad_input() {
-                    self.on_pad_input(edge)
-                } else {
-                    Task::none()
-                }
-            }
-            ServiceMessage::TrayOpenPopup { anchor } => {
-                app_log::info("shell: apply tray open popup");
-                self.tray_anchor = anchor;
-                self.toggle_popup()
-            }
-            ServiceMessage::TrayOpenSettings => {
-                app_log::info("shell: apply tray open settings");
-                self.open_configure()
-            }
-            ServiceMessage::Notifications {
-                events,
-                open_start_after_toast,
-            } => self.queue_notifications(events, open_start_after_toast),
-            ServiceMessage::Shutdown => {
-                // A service quit cancels a queued reload: no restart, and no
-                // restore record left behind for the next launch.
-                crate::persist::restart_ui::clear();
-                self.restarting_for_renderer = false;
-                self.renderer_reload_queued = false;
-                self.update(Message::Exit)
-            }
-            // Broadcast copy of a handshake reply (for another transport);
-            // the handshake path consumes its own. Nothing to apply.
-            ServiceMessage::Version { .. } => Task::none(),
-            ServiceMessage::Snapshot(snap) => self.apply_snapshot(&snap),
-            ServiceMessage::Ack
-            | ServiceMessage::ControllerList(_)
-            | ServiceMessage::LightbarSet { .. } => Task::none(),
-        }
-    }
-
-    /// Apply the retained service snapshot wholesale (client mode).
-    ///
-    /// Rev-gated: stale or duplicate snapshots are ignored. Replaces live
-    /// rows, remembered records, nicknames, prefs, analytics records, and the
-    /// stored selection in one step so keys and the rows they point at always
-    /// arrive together. This is the convergent path that heals stale
-    /// boot-time disk copies (full-charge + unplug class).
-    fn apply_snapshot(&mut self, snap: &crate::session::SessionSnapshot) -> Task<Message> {
-        if snap.rev <= self.snapshot_rev_applied {
-            return Task::none();
-        }
-        self.snapshot_rev_applied = snap.rev;
-        self.snapshot_sync_pending = false;
-
-        self.session.controllers = snap.live.clone();
-        self.session
-            .known
-            .apply_snapshot(snap.remembered.clone(), snap.nicknames.clone());
-        self.session.prefs = snap.prefs.clone();
-        color::set_active_spectrum(self.session.prefs.spectrum.clone());
-        lightbar::set_enabled(self.session.prefs.lightbar_enabled);
-        // Service-owned prefs may flip the navbar pin while Start is open.
-        self.start_state.sync_navbar_pinned(
-            matches!(
-                self.session.prefs.start_screen_navbar,
-                NavbarVisibility::AlwaysOn
-            ),
-            Instant::now(),
-        );
-        // ...or the effective reduce-motion gate (prefs and/or OS toggle).
-        self.start_state
-            .sync_reduced_motion(crate::ui::motion::reduced_motion_effective(
-                self.session.prefs.reduced_motion,
-            ));
-        // ...or the immersive idle-throttle gate.
-        self.start_state
-            .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
-        self.session
-            .analytics
-            .apply_snapshot(snap.analytics.clone());
-        self.refresh_analytics_panel();
-        #[cfg(debug_assertions)]
-        self.derive_emu_fleet_from_snapshot(snap);
-
-        // Stored selection: local nav wins while dirty (the reporting
-        // shell already holds the value it sent via `SetStartSelection`).
-        // The reveal scrolls to the resolved selection, so post-reorder
-        // snapshots stay anchored to the persisted keys rather than to
-        // stale restore offsets (which are never re-asserted).
-        let mut select_task = Task::none();
-        if !self.start_selection_dirty
-            && self.apply_start_selection(&snap.selection)
-            && self.start_visible
-        {
-            select_task = self
-                .scroll_start_selection_into_view()
-                .chain(self.warm_start_art_task());
-        }
-
-        if self
-            .start_state
-            .powering_off
-            .as_ref()
-            .is_some_and(|s| !self.session.controllers.iter().any(|c| c.serial == *s))
-        {
-            self.start_state.powering_off = None;
-        }
-        let fit = self.sync_popup_rows_and_fit();
-        if self.start_visible {
-            self.refresh_start_controllers();
-        }
-        #[cfg(debug_assertions)]
-        note_client_hitch_controllers(self.session.controllers.len());
-        self.sync_client_input_hot();
-        fit.chain(select_task)
-    }
-
-    /// Rebuild the Controllers-tab fleet from the snapshot (client mode).
-    ///
-    /// The service owns the fleet; this shell keeps a derived view for the
-    /// debug tab only: remembered `emu-` records rehydrate disconnected,
-    /// live rows mark connected (with the service's level/link/state), and
-    /// the local drag-preview overlay repaints on top. Anything the snapshot
-    /// no longer contains (pruned pads) drops the overlay with it.
-    #[cfg(debug_assertions)]
-    fn derive_emu_fleet_from_snapshot(&mut self, snap: &crate::session::SessionSnapshot) {
-        let previews: std::collections::HashMap<String, u8> = self
-            .pending_emulator_commits
-            .iter()
-            .map(|(serial, pending)| (serial.clone(), pending.percent))
-            .collect();
-        self.emulated_pads = emulate::derive_view_fleet(&snap.live, &snap.remembered, &previews);
-        self.pending_emulator_commits
-            .retain(|serial, _| self.emulated_pads.iter().any(|p| p.serial() == serial));
-    }
-
     fn on_pad_input(&mut self, edge: crate::domain::pad::InputEdge) -> Task<Message> {
         let poll_started = Instant::now();
         let start_open = self.start_visible;
@@ -6752,13 +6106,20 @@ impl App {
 
         let pad_input_open =
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
-        let listening = self.shell_wants_pad_input();
+        let listening = self.wants_pad_input();
 
         if pad_input_open {
             self.apply_pad_input_panel_from_readings(&readings);
         }
 
         if !listening {
+            // Start is closed and the PadInput tab is not open: the only
+            // live consumer is the reopen chord (PS press to open Start).
+            // Edges only arrive here while pads are connected, so this is
+            // exactly the "PS to open" path — never drop it.
+            if !start_open {
+                return self.on_reopen_gesture(&readings);
+            }
             return Task::none();
         }
 
@@ -6880,7 +6241,7 @@ impl App {
         self.start_state.reopen_chord_held = start_mode::promote_gesture_usable(&gesture)
             && chord_held_on_any_pad(&gesture, readings);
 
-        // Reopen chord toggles compact ↔ immersive (service only listens when closed).
+        // Reopen chord toggles compact ↔ immersive while Start is open.
         if let Some(toggle) = self.try_toggle_immersive_from_gesture(readings) {
             return toggle;
         }
@@ -7449,14 +6810,13 @@ impl App {
             connect_open_start && self.session.prefs.start_screen_always_immersive;
         // Immersive auto-open never shows a Connected toast (cold-launch via
         // launch_quiet and hot connects must match). Session already filters,
-        // but drop any that slipped through (service race) so behaviour is
-        // bullet-proof.
+        // but drop any that slipped through so behaviour is bullet-proof.
         if immersive_connect {
             let before = events.len();
             events.retain(|event| event.body != "Connected");
             if events.len() != before {
                 crate::controller::hid::diag::diag_info(
-                    "ui-diag: connect toast suppressed (immersive auto-open, shell)",
+                    "ui-diag: connect toast suppressed (immersive auto-open)",
                 );
             }
             let open = self.open_start_screen();
@@ -7886,240 +7246,28 @@ impl Drop for InputEdgeBindGuard {
     }
 }
 
-/// Connect to the service and prove it speaks our IPC protocol.
-///
-/// Retries connects for ~5s (service may be restarting under crash-restart);
-/// once connected there is exactly one handshake attempt — a timeout means
-/// an unversioned pre-handshake service, a mismatch means mixed binaries.
-/// Either way the caller quits; retrying cannot fix a version gap.
-fn ipc_connect_with_handshake() -> Result<crate::ipc::PipeClient, String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match crate::ipc::PipeClient::connect() {
-            Ok(mut client) => match client.handshake(Duration::from_secs(2)) {
-                Ok((protocol, version)) => {
-                    if protocol != crate::ipc::IPC_PROTOCOL_VERSION {
-                        return Err(format!(
-                            "ipc protocol mismatch (shell {} vs service {protocol} v{version})",
-                            crate::ipc::IPC_PROTOCOL_VERSION
-                        ));
-                    }
-                    crate::platform::app_log::info(format!(
-                        "shell: ipc receive connected (protocol {protocol} v{version})"
-                    ));
-                    return Ok(client);
-                }
-                Err(err) => {
-                    return Err(format!("version handshake failed ({err})"));
-                }
-            },
-            Err(_) => {
-                if Instant::now() >= deadline {
-                    return Err("no service (connect failed)".to_string());
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-    }
-}
-
-/// Shell-client: drain service IPC messages into iced.
-///
-/// Blocking TCP reads run on a dedicated thread. Doing them inside the
-/// `stream::channel` future would stall iced's UI poll (same thread polls the
-/// runner and the output receiver), so tray/Settings messages would never apply.
-fn service_message_stream() -> impl Stream<Item = Message> {
-    stream::channel(128, async move |mut output| {
-        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel(128);
-        let _ = std::thread::Builder::new()
-            .name("sdsc-ipc-recv".into())
-            .spawn(move || {
-                loop {
-                    // (Re)connect with a version handshake. No service within
-                    // budget, or a protocol mismatch / unversioned service,
-                    // means quit — a shell must never limp along on
-                    // half-understood messages.
-                    let client = match ipc_connect_with_handshake() {
-                        Ok(c) => c,
-                        Err(reason) => {
-                            crate::platform::app_log::error(format!("shell: {reason}; exiting"));
-                            // Distinct code so the service does not respawn a
-                            // shell it cannot talk to (see service shell-exit
-                            // backoff).
-                            std::process::exit(3);
-                        }
-                    };
-                    let Ok(mut reader) = client.try_clone_reader() else {
-                        continue;
-                    };
-                    // Keep the write half alive so the server does not see EOF on accept.
-                    let _keep_alive = client;
-                    loop {
-                        match reader.recv() {
-                            Ok(msg) => {
-                                let droppable =
-                                    matches!(&msg, crate::ipc::ServiceMessage::PadInput(_));
-                                match tx.try_send(msg) {
-                                    Ok(()) => {}
-                                    Err(err) if err.is_full() => {
-                                        if droppable {
-                                            // Prefer a fresh pad sample over blocking HID→UI.
-                                        } else {
-                                            let msg = err.into_inner();
-                                            // Controllers / tray / effects: wait for a free slot.
-                                            let mut msg = msg;
-                                            loop {
-                                                match tx.try_send(msg) {
-                                                    Ok(()) => break,
-                                                    Err(e) if e.is_full() => {
-                                                        msg = e.into_inner();
-                                                        std::thread::sleep(Duration::from_millis(
-                                                            1,
-                                                        ));
-                                                    }
-                                                    Err(_) => return,
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(_) => return,
-                                }
-                            }
-                            Err(err) => {
-                                crate::platform::app_log::warn(format!(
-                                    "shell: ipc receive disconnected: {err}"
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-
-        while let Some(msg) = rx.next().await {
-            if output.send(Message::Service(msg)).await.is_err() {
-                break;
-            }
-        }
-    })
-}
-
-/// Shell-client hitch context: local `INPUT_SNAPSHOT` is never published (service
-/// owns HID). F7/F8 must stamp from the last IPC pad/controllers view instead.
-#[cfg(debug_assertions)]
-static SHELL_CLIENT_HITCH: AtomicBool = AtomicBool::new(false);
-
-#[cfg(debug_assertions)]
-#[derive(Clone)]
-struct ClientHitchPadCtx {
-    pads: usize,
-    reason: &'static str,
-    seq: u64,
-    received_at: Instant,
-    controllers: usize,
-}
-
-#[cfg(debug_assertions)]
-static CLIENT_HITCH_PAD: Mutex<Option<ClientHitchPadCtx>> = Mutex::new(None);
-
-#[cfg(debug_assertions)]
-fn set_shell_client_hitch_mode(client: bool) {
-    SHELL_CLIENT_HITCH.store(client, Ordering::Relaxed);
-    if !client && let Ok(mut guard) = CLIENT_HITCH_PAD.lock() {
-        *guard = None;
-    }
-}
-
-#[cfg(debug_assertions)]
-fn note_client_hitch_pad_edge(edge: &crate::domain::pad::InputEdge, controllers: usize) {
-    if !SHELL_CLIENT_HITCH.load(Ordering::Relaxed) {
-        return;
-    }
-    if let Ok(mut guard) = CLIENT_HITCH_PAD.lock() {
-        *guard = Some(ClientHitchPadCtx {
-            pads: edge.pad_count.max(edge.readings.len()),
-            reason: edge.reason.as_str(),
-            seq: edge.seq,
-            received_at: Instant::now(),
-            controllers,
-        });
-    }
-}
-
-#[cfg(debug_assertions)]
-fn note_client_hitch_controllers(controllers: usize) {
-    if !SHELL_CLIENT_HITCH.load(Ordering::Relaxed) {
-        return;
-    }
-    if let Ok(mut guard) = CLIENT_HITCH_PAD.lock() {
-        match guard.as_mut() {
-            Some(ctx) => {
-                ctx.controllers = controllers;
-                // Keep pad/seq/age from the last live PadInput edge when present.
-                if ctx.pads == 0 {
-                    ctx.pads = controllers;
-                    ctx.reason = "ServiceControllers";
-                    ctx.received_at = Instant::now();
-                }
-            }
-            None => {
-                *guard = Some(ClientHitchPadCtx {
-                    pads: controllers,
-                    reason: "ServiceControllers",
-                    seq: 0,
-                    received_at: Instant::now(),
-                    controllers,
-                });
-            }
-        }
-    }
-}
-
-/// Stamp a hitch mark using the shared input snapshot (safe off the UI thread).
-///
-/// In shell-client mode the local snapshot stays `NeverPublished`; use the last
-/// IPC pad/controllers context and include `client=1`.
+/// Hitch context: the shared input snapshot (`INPUT_SNAPSHOT`) is the
+/// single source F7/F8 stamps read from (safe off the UI thread).
 #[cfg(debug_assertions)]
 fn stamp_hitch_report(kind: &str, source: &str, extra: Option<String>) {
-    let client = SHELL_CLIENT_HITCH.load(Ordering::Relaxed);
-    let (pads, reason, age_ms, seq, client_suffix) = if client {
-        match CLIENT_HITCH_PAD.lock().ok().and_then(|g| g.clone()) {
-            Some(ctx) => (
-                ctx.pads,
-                ctx.reason,
-                ctx.received_at.elapsed().as_millis(),
-                ctx.seq,
-                format!(" client=1 controllers={}", ctx.controllers),
-            ),
-            None => (
-                0,
-                "NoClientCtx",
-                0,
-                0,
-                " client=1 controllers=0".to_string(),
-            ),
-        }
-    } else {
-        let (pads, reason, age_ms, seq) = match start_input::read_nav_readings() {
-            start_input::NavReadingsOutcome::Readings { readings, meta } => (
-                readings.len(),
-                meta.reason.as_str(),
-                meta.published_at.elapsed().as_millis(),
-                meta.seq,
-            ),
-            start_input::NavReadingsOutcome::Missing { meta } => (
-                0,
-                meta.reason.as_str(),
-                meta.published_at.elapsed().as_millis(),
-                meta.seq,
-            ),
-        };
-        (pads, reason, age_ms, seq, String::new())
+    let (pads, reason, age_ms, seq) = match start_input::read_nav_readings() {
+        start_input::NavReadingsOutcome::Readings { readings, meta } => (
+            readings.len(),
+            meta.reason.as_str(),
+            meta.published_at.elapsed().as_millis(),
+            meta.seq,
+        ),
+        start_input::NavReadingsOutcome::Missing { meta } => (
+            0,
+            meta.reason.as_str(),
+            meta.published_at.elapsed().as_millis(),
+            meta.seq,
+        ),
     };
     let ctx = crate::controller::hid::diag::failure_context();
     let extra = extra.map(|e| format!(" {e}")).unwrap_or_default();
     app_log::mark_hitch(format!(
-        "kind={kind} source={source}{extra}{client_suffix} pads={pads} reason={reason} age_ms={age_ms} seq={seq} {ctx}"
+        "kind={kind} source={source}{extra} pads={pads} reason={reason} age_ms={age_ms} seq={seq} {ctx}"
     ));
 }
 
@@ -8378,18 +7526,6 @@ mod tests {
         assert!(!Message::Tick.is_user_input());
         assert!(!Message::RendererReloadTick.is_user_input());
         assert!(!Message::RendererReloadDue.is_user_input());
-        assert!(service_message_is_input(
-            &crate::ipc::ServiceMessage::TrayOpenSettings
-        ));
-        assert!(!service_message_is_input(
-            &crate::ipc::ServiceMessage::Shutdown
-        ));
-        assert!(service_message_is_input(
-            &crate::ipc::ServiceMessage::Effects(vec![crate::session::SessionEffect::OpenStart])
-        ));
-        assert!(!service_message_is_input(
-            &crate::ipc::ServiceMessage::Effects(vec![crate::session::SessionEffect::SaveKnown])
-        ));
     }
 
     /// The forget sequence end to end: prune drops the pad from the fleet, and
