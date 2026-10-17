@@ -465,6 +465,24 @@ pub fn sort_edit_rows(rows: &mut [StartRow]) {
     });
 }
 
+/// Edit-checklist order under the active browse sort: A–Z, or last-played
+/// newest-first with the same A–Z + `play_key` tiebreaks as browse
+/// ([`crate::games::GamesCatalog::merge_sorted`]). `played_at_ms` must be
+/// populated before calling (see `App::edit_checklist_rows`); `None` sorts
+/// as never-played, matching browse.
+pub fn sort_edit_rows_by_mode(rows: &mut [StartRow], mode: GamesSortMode) {
+    match mode {
+        GamesSortMode::Alphabetical => sort_edit_rows(rows),
+        GamesSortMode::LastPlayed => rows.sort_by(|a, b| {
+            b.played_at_ms
+                .unwrap_or(0)
+                .cmp(&a.played_at_ms.unwrap_or(0))
+                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+                .then_with(|| a.play_key.cmp(&b.play_key))
+        }),
+    }
+}
+
 fn steam_icon_source(game: &SteamGame) -> Option<IconSource> {
     game.icon_path.as_ref().map(|p| IconSource::File(p.clone()))
 }
@@ -1575,6 +1593,28 @@ impl State {
         None
     }
 
+    /// Cancel-exit preferred key (call after leaving edit mode, on the
+    /// rebuilt browse rows).
+    ///
+    /// Keeps navigation: the checklist `cursor_key` when it is still present
+    /// in the restored catalog, else the pre-edit `anchor_key` (e.g. the
+    /// cursor sat on a toggled-off Steam game or a newly added manual, both
+    /// absent from browse). `None` when neither survives — the caller then
+    /// falls back to the nearest-enabled rule inside
+    /// [`Self::resolve_edit_exit_selection`]. Presence alone decides here;
+    /// enabled-ness stays with `resolve_edit_exit_selection`, so a disabled
+    /// cursor still holds its neighborhood instead of jumping to the anchor.
+    pub fn cancel_exit_target_key(
+        &self,
+        cursor_key: Option<&str>,
+        anchor_key: Option<&str>,
+    ) -> Option<String> {
+        cursor_key
+            .filter(|key| self.rows.iter().any(|r| r.play_key == *key))
+            .or_else(|| anchor_key.filter(|key| self.rows.iter().any(|r| r.play_key == *key)))
+            .map(str::to_string)
+    }
+
     /// Browse-space edit-exit selection resolution (call after leaving edit
     /// mode, on the rebuilt browse rows).
     ///
@@ -1586,9 +1626,10 @@ impl State {
     /// it down the list.
     ///
     /// Save exits pass the [`Self::edit_exit_target_key`] cursor target;
-    /// cancel/discard exits pass the pre-edit anchor (the catalog is restored,
-    /// so the anchor revives the pre-edit game when still present+enabled,
-    /// else the same nearest rule applies). Empty rows land on index 0 and
+    /// cancel/discard exits pass [`Self::cancel_exit_target_key`]
+    /// (cursor-first, anchor fallback — the catalog is restored, so a missing
+    /// cursor revives the pre-edit game when still present, else the same
+    /// nearest rule applies). Empty rows land on index 0 and
     /// the existing empty-games view shows; all-disabled non-empty rows keep
     /// the clamped index (`set_rows` parity — launch stays blocked).
     pub fn resolve_edit_exit_selection(&mut self, preferred_key: Option<&str>) {
@@ -2119,7 +2160,7 @@ impl State {
     }
 
     pub(crate) fn games_section_mode(&self) -> crate::ui::start::position::SectionMode {
-        if self.editing || matches!(self.sort_mode, GamesSortMode::Alphabetical) {
+        if matches!(self.sort_mode, GamesSortMode::Alphabetical) {
             crate::ui::start::position::SectionMode::Alphabetical
         } else {
             crate::ui::start::position::SectionMode::LastPlayed
@@ -4461,14 +4502,8 @@ pub(crate) fn immersive_game_hints(
             hint.held,
             hint.press_anim,
         ));
-        if matches!(row.edit, Some(EditRow::Manual { .. })) {
-            actions.push(face_hint(
-                FaceButton::Square,
-                "Edit",
-                hint.held,
-                hint.press_anim,
-            ));
-        }
+        // Square cycles sort in edit too — manual Edit is mouse-only
+        // (the Edit button below).
     } else if closing {
         actions.push(face_hint(
             FaceButton::Cross,
@@ -4508,7 +4543,26 @@ pub(crate) fn immersive_game_hints(
     for h in actions.iter_mut() {
         h.alpha = a;
     }
-    action_cluster_dock(&actions)
+    let cluster = action_cluster_dock(&actions);
+    // Manual Edit is mouse-only (Square cycles sort in edit too).
+    if state.editing && matches!(row.edit, Some(EditRow::Manual { .. })) {
+        row![
+            cluster,
+            button(
+                text("Edit")
+                    .size(13.0)
+                    .color(theme::alpha(theme::ACCENT, a))
+            )
+            .padding([4, 10])
+            .on_press(StartMessage::EditManual)
+            .style(theme::ghost),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        cluster
+    }
 }
 
 /// Mouse + global hotkey hitch markers (not pad-navigable). Stamps `HITCH_MARK` in the logs.
@@ -5443,11 +5497,32 @@ pub(crate) fn footer_hint<'a>(
                 let actions = action_cluster(&hints, flat_hints);
                 if state.editing {
                     (
-                        button(text("Add shortcut…").size(14.0).color(theme::ACCENT))
-                            .padding([6, 12])
-                            .on_press(StartMessage::AddShortcut)
-                            .style(theme::ghost)
-                            .into(),
+                        footer_secondary_row(
+                            Some(face_cycle_toggle(
+                                FaceButton::Square,
+                                press.held,
+                                press.press_anim,
+                                &[
+                                    (
+                                        "Last played",
+                                        matches!(state.sort_mode, GamesSortMode::LastPlayed),
+                                    ),
+                                    (
+                                        "A–Z",
+                                        matches!(state.sort_mode, GamesSortMode::Alphabetical),
+                                    ),
+                                ],
+                                flat_hints,
+                            )),
+                            Some(
+                                button(text("Add shortcut…").size(14.0).color(theme::ACCENT))
+                                    .padding([6, 12])
+                                    .on_press(StartMessage::AddShortcut)
+                                    .style(theme::ghost)
+                                    .into(),
+                            ),
+                            None,
+                        ),
                         actions,
                     )
                 } else {
@@ -6277,14 +6352,8 @@ fn game_row(
                 hint.held,
                 hint.press_anim,
             ));
-            if matches!(row.edit, Some(EditRow::Manual { .. })) {
-                actions.push(face_hint(
-                    FaceButton::Square,
-                    "Edit",
-                    hint.held,
-                    hint.press_anim,
-                ));
-            }
+            // Square cycles sort in edit too — manual Edit is mouse-only
+            // (the Edit button below).
         } else {
             if closing {
                 actions.push(face_hint(
@@ -6319,6 +6388,15 @@ fn game_row(
             }
         }
         content = content.push(action_cluster_spaced(&actions, ROW_ACTION_SPACING, false));
+        // Manual Edit is mouse-only (Square cycles sort in edit too).
+        if editing && matches!(row.edit, Some(EditRow::Manual { .. })) {
+            content = content.push(
+                button(text("Edit").size(14.0).color(theme::ACCENT))
+                    .padding([6, 12])
+                    .on_press(StartMessage::EditManual)
+                    .style(theme::ghost),
+            );
+        }
     }
 
     // Pad/keyboard navigate — no mouse press/hover on list rows (edit actions stay clickable).
@@ -8103,6 +8181,35 @@ mod tests {
     }
 
     #[test]
+    fn sort_edit_rows_by_mode_last_played_matches_browse() {
+        use crate::persist::prefs::GamesSortMode;
+        // Last-played checklist: newest first, then A–Z, then play_key —
+        // the same order as browse `merge_sorted`.
+        let mut rows = vec![
+            edit_check_row("steam:1", "Bravo", true),
+            edit_check_row("steam:2", "Alpha", true),
+            edit_check_row("steam:3", "Charlie", true),
+        ];
+        rows[0].played_at_ms = Some(100);
+        rows[1].played_at_ms = Some(300);
+        rows[2].played_at_ms = None;
+        sort_edit_rows_by_mode(&mut rows, GamesSortMode::LastPlayed);
+        let keys: Vec<_> = rows.iter().map(|r| r.play_key.as_str()).collect();
+        assert_eq!(keys, vec!["steam:2", "steam:1", "steam:3"]);
+        // Alphabetical mode ignores played time.
+        sort_edit_rows_by_mode(&mut rows, GamesSortMode::Alphabetical);
+        let keys: Vec<_> = rows.iter().map(|r| r.play_key.as_str()).collect();
+        assert_eq!(keys, vec!["steam:2", "steam:1", "steam:3"]);
+        // Tie on played falls back to A–Z.
+        rows[0].played_at_ms = Some(500);
+        rows[1].played_at_ms = Some(500);
+        rows[2].played_at_ms = Some(500);
+        sort_edit_rows_by_mode(&mut rows, GamesSortMode::LastPlayed);
+        let keys: Vec<_> = rows.iter().map(|r| r.play_key.as_str()).collect();
+        assert_eq!(keys, vec!["steam:2", "steam:1", "steam:3"]);
+    }
+
+    #[test]
     fn select_game_by_play_key_or_keep_pins_across_rebuild() {
         let mut state = State {
             rows: vec![
@@ -8282,13 +8389,84 @@ mod tests {
     }
 
     #[test]
+    fn cancel_exit_target_prefers_cursor_over_anchor() {
+        let state = State {
+            rows: vec![
+                test_row("a", false, None),
+                test_row("b", false, None),
+                test_row("c", false, None),
+            ],
+            ..Default::default()
+        };
+        // Navigated mid-edit: cursor survives in the restored catalog.
+        assert_eq!(
+            state
+                .cancel_exit_target_key(Some("k-c"), Some("k-a"))
+                .as_deref(),
+            Some("k-c")
+        );
+        // Cursor on a toggled-off / newly added game (absent from browse):
+        // fall back to the pre-edit anchor.
+        assert_eq!(
+            state
+                .cancel_exit_target_key(Some("k-gone"), Some("k-a"))
+                .as_deref(),
+            Some("k-a")
+        );
+        // Neither survives: nearest-enabled rule downstream (`None`).
+        assert_eq!(
+            state.cancel_exit_target_key(Some("k-gone"), Some("k-missing")),
+            None
+        );
+        assert_eq!(state.cancel_exit_target_key(None, None), None);
+    }
+
+    #[test]
+    fn cancel_keeps_navigated_cursor_instead_of_anchor() {
+        // Regression: enter edit, move selection, Circle must not jump back
+        // to the pre-edit game — cancel discards membership changes but keeps
+        // navigation, exactly like save.
+        let browse = vec![
+            test_row("a", false, None),
+            test_row("b", false, None),
+            test_row("c", false, None),
+        ];
+        let mut state = State {
+            rows: browse.clone(),
+            game_selected: 0,
+            ..Default::default()
+        };
+        state.capture_edit_anchor();
+        let anchor = state.edit_anchor_play_key.clone();
+        assert_eq!(anchor.as_deref(), Some("k-a"));
+        // Checklist order differs; user navigates to another game mid-edit.
+        state.editing = true;
+        state.set_rows(vec![
+            test_row("c", false, None),
+            test_row("a", false, None),
+            test_row("b", false, None),
+        ]);
+        state.select_game_by_play_key_or_keep(Some("k-c"));
+        assert_eq!(state.game_selected, 0);
+        let cursor = state.selected_game_key();
+        // Cancel: catalog restored (same browse rows here), cursor survives.
+        state.editing = false;
+        state.edit_anchor_play_key.take();
+        state.set_rows(browse);
+        let target = state.cancel_exit_target_key(cursor.as_deref(), anchor.as_deref());
+        assert_eq!(target.as_deref(), Some("k-c"));
+        state.resolve_edit_exit_selection(target.as_deref());
+        assert_eq!(state.game_selected, 2);
+    }
+
+    #[test]
     fn edit_session_leaves_sort_and_section_mode_untouched() {
         use crate::persist::prefs::GamesSortMode;
         // Regression: entering/exiting edit mode (save AND cancel, with
-        // toggles in between) must not re-sort the games list. The stored
-        // sort always mirrors prefs — `cycle_games_sort` refuses while
-        // editing and `refresh_start_rows` re-syncs on every rebuild — and
-        // these State transitions (the unit-testable half) preserve it.
+        // toggles in between) must not re-sort the games list by itself. The
+        // stored sort always mirrors prefs — `cycle_games_sort` stays live
+        // while editing and `refresh_start_rows` re-syncs on every rebuild —
+        // and these State transitions (the unit-testable half) preserve it.
         for sort in [GamesSortMode::LastPlayed, GamesSortMode::Alphabetical] {
             let mut state = State {
                 rows: vec![test_row("b", false, None), test_row("a", false, None)],
@@ -8304,7 +8482,7 @@ mod tests {
                 edit_check_row("steam:1", "B", true),
                 edit_check_row("steam:2", "A", true),
             ];
-            sort_edit_rows(&mut checklist);
+            sort_edit_rows_by_mode(&mut checklist, sort);
             state.set_rows(checklist);
             state.select_game_by_play_key_or_keep(state.edit_anchor_play_key.clone().as_deref());
             assert_eq!(state.sort_mode, sort);

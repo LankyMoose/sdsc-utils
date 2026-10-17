@@ -3639,14 +3639,13 @@ impl App {
     }
 
     fn refresh_start_rows(&mut self) {
-        // Edit enter/exit must never re-sort: `sort_mode` always mirrors the
-        // prefs sort here. The only prefs-sort writer is `cycle_games_sort`,
-        // which refuses while editing, so the mode is byte-identical before
-        // entering and after exiting (save and cancel paths).
+        // Sort persists across edit enter/exit: `sort_mode` always mirrors the
+        // prefs sort here, and `cycle_games_sort` stays live while editing, so
+        // a mid-edit sort change carries into the browse list on save/cancel.
         self.start_state.sort_mode = self.session.prefs.games_sort_mode;
         // Pin the edit cursor by stable key across the rebuild: toggles,
-        // manual adds, and Steam-scan reorders shift A–Z checklist indices, so
-        // a bare index would drift to a different game mid-edit.
+        // manual adds, sort cycles, and Steam-scan reorders shift checklist
+        // indices, so a bare index would drift to a different game mid-edit.
         let edit_pin = if self.start_state.editing {
             self.start_state.selected_game_key()
         } else {
@@ -3720,17 +3719,29 @@ impl App {
 
     fn edit_checklist_rows(&self) -> Vec<start_view::StartRow> {
         let catalog = self.edit_catalog();
+        let sort_mode = self.session.prefs.games_sort_mode;
         let mut rows: Vec<_> = self
             .steam_by_id
             .values()
-            .map(|game| start_view::StartRow::steam_edit(game, catalog.contains_steam(game.appid)))
+            .map(|game| {
+                let mut row =
+                    start_view::StartRow::steam_edit(game, catalog.contains_steam(game.appid));
+                let catalog_ms = catalog
+                    .last_played(&crate::games::GameEntry::Steam { appid: game.appid })
+                    .unwrap_or(0);
+                let steam_ms = game.last_played_unix.unwrap_or(0).saturating_mul(1000);
+                row.played_at_ms =
+                    (catalog_ms.max(steam_ms) > 0).then_some(catalog_ms.max(steam_ms));
+                row
+            })
             .collect();
         for entry in &catalog.entries {
-            if let Some(row) = start_view::StartRow::manual_edit(entry) {
+            if let Some(mut row) = start_view::StartRow::manual_edit(entry) {
+                row.played_at_ms = catalog.last_played(entry);
                 rows.push(row);
             }
         }
-        start_view::sort_edit_rows(&mut rows);
+        start_view::sort_edit_rows_by_mode(&mut rows, sort_mode);
         rows
     }
 
@@ -3766,8 +3777,8 @@ impl App {
         self.start_state.editing = false;
         self.start_state.edit_anchor_play_key = None;
         self.refresh_start_rows();
-        // `refresh_start_rows` re-syncs `sort_mode` from prefs (edit never
-        // mutates sort), so only the selection needs resolving here.
+        // `refresh_start_rows` re-syncs `sort_mode` from prefs (a mid-edit
+        // sort cycle persists), so only the selection needs resolving here.
         self.start_state
             .resolve_edit_exit_selection(target.as_deref());
         self.scroll_start_selection_to_center(false)
@@ -3775,15 +3786,18 @@ impl App {
     }
 
     fn cancel_start_edit(&mut self) -> Task<Message> {
-        // Cancel restores the pre-edit catalog, so revive the pre-edit
-        // (anchor) game when still present+enabled, else the same
-        // nearest-enabled-above / after rule (`None` anchor + empty rows →
-        // the existing empty-games view shows).
+        // Cancel discards membership changes but keeps navigation: the cursor
+        // game survives when still in the restored catalog, else the pre-edit
+        // anchor revives, else the nearest-enabled rule applies.
+        let cursor = self.start_state.selected_game_key();
         let anchor = self.start_state.edit_anchor_play_key.take();
         self.discard_edit_draft();
         self.refresh_start_rows();
+        let target = self
+            .start_state
+            .cancel_exit_target_key(cursor.as_deref(), anchor.as_deref());
         self.start_state
-            .resolve_edit_exit_selection(anchor.as_deref());
+            .resolve_edit_exit_selection(target.as_deref());
         self.scroll_start_selection_to_center(true)
             .chain(self.warm_start_art_task())
     }
@@ -5896,15 +5910,19 @@ impl App {
                 // scroll is moot (its target predates this slide change).
                 self.deferred_settle_scroll = None;
                 if self.start_state.editing {
-                    // Slide-switch discards the draft (cancel-equivalent): revive
-                    // the pre-edit anchor game, else nearest-enabled, so the
-                    // stale edit-mode index (checklist order) never lands on
-                    // the wrong browse row.
+                    // Slide-switch discards the draft (cancel-equivalent): keep
+                    // navigation like cancel (cursor first, anchor fallback) so
+                    // the stale edit-mode index (checklist order) never lands
+                    // on the wrong browse row.
+                    let cursor = self.start_state.selected_game_key();
                     let anchor = self.start_state.edit_anchor_play_key.clone();
                     self.discard_edit_draft();
                     self.refresh_start_rows();
+                    let target = self
+                        .start_state
+                        .cancel_exit_target_key(cursor.as_deref(), anchor.as_deref());
                     self.start_state
-                        .resolve_edit_exit_selection(anchor.as_deref());
+                        .resolve_edit_exit_selection(target.as_deref());
                 }
                 let now = Instant::now();
                 if self.start_state.immersive {
@@ -5929,11 +5947,15 @@ impl App {
                 self.deferred_settle_scroll = None;
                 if self.start_state.editing {
                     // Same cancel-equivalent discard as PrevSlide (see above).
+                    let cursor = self.start_state.selected_game_key();
                     let anchor = self.start_state.edit_anchor_play_key.clone();
                     self.discard_edit_draft();
                     self.refresh_start_rows();
+                    let target = self
+                        .start_state
+                        .cancel_exit_target_key(cursor.as_deref(), anchor.as_deref());
                     self.start_state
-                        .resolve_edit_exit_selection(anchor.as_deref());
+                        .resolve_edit_exit_selection(target.as_deref());
                 }
                 let now = Instant::now();
                 if self.start_state.immersive {
@@ -6317,10 +6339,9 @@ impl App {
     }
 
     fn cycle_games_sort(&mut self) -> Option<Task<Message>> {
-        if self.start_state.editing
-            || self.start_state.slide != StartSlide::Games
-            || self.start_state.overlay_blocking()
-        {
+        // Sort stays live in edit mode: the checklist re-sorts under the same
+        // mode and the prefs write persists across save/cancel.
+        if self.start_state.slide != StartSlide::Games || self.start_state.overlay_blocking() {
             return None;
         }
         self.session.prefs.games_sort_mode = self.session.prefs.games_sort_mode.cycle();

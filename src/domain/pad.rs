@@ -518,7 +518,7 @@ impl EdgeButton {
         match self {
             Self::Cross => Some(NavAction::Confirm),
             Self::Circle => Some(NavAction::Cancel),
-            // Browse: sort. Edit: remapped to EditManual in PadNavBank.
+            // Sort stays on Square in browse and edit; manual Edit is mouse-only.
             Self::Square => Some(NavAction::CycleSort),
             // Browse: enter edit. Edit: save (ToggleEdit commits).
             Self::Triangle => Some(NavAction::ToggleEdit),
@@ -1345,7 +1345,9 @@ impl PadNavBank {
     /// games (remapped to Up/Down here) while L2/R2 keep their slide actions;
     /// Up/Down are suppressed (Left/Right only).
     /// `replace_confirm` switches to Cross-hold / Circle-cancel mode.
-    /// `editing` when true: Triangle saves (ToggleEdit); Square is EditManual.
+    /// `_editing` is retained for call-site compatibility (Triangle saves via
+    /// ToggleEdit in both modes); Square still cycles sort and manual Edit is
+    /// mouse-only via the row Edit button.
     /// `hold_cross_close` (games browse, running row): Cross hold closes the game.
     /// `hold_triangle_power` (controllers, selected row shows Power off): Triangle hold powers off Bluetooth.
     #[allow(clippy::too_many_arguments)]
@@ -1357,7 +1359,7 @@ impl PadNavBank {
         horizontal_nav: bool,
         horizontal_games_nav: bool,
         replace_confirm: bool,
-        editing: bool,
+        _editing: bool,
         hold_cross_close: bool,
         hold_triangle_power: bool,
     ) -> PadTickResult {
@@ -1523,8 +1525,7 @@ impl PadNavBank {
                 {
                     None
                 }
-                // Edit mode: Square edits the selected manual (was Triangle).
-                NavAction::CycleSort if editing => Some(NavAction::Triangle),
+                // Square cycles sort in browse and edit alike.
                 other => Some(other),
             });
 
@@ -2821,8 +2822,8 @@ mod tests {
         // Edit mode on the horizontal Games strip: Left/Right must scroll
         // games (Up/Down moves) instead of PrevSlide/NextSlide, which would
         // discard the edit draft via the dock collapse/expand handlers.
-        // Up/Down stay suppressed, L2/R2 keep slide switching, and the edit
-        // face remaps (Square -> EditManual, Triangle -> save) are untouched.
+        // Up/Down stay suppressed, L2/R2 keep slide switching, Square still
+        // cycles sort and Triangle still saves (ToggleEdit) in edit mode.
         let mut bank = PadNavBank::default();
         bank.prepare_on_open(true);
         let now = Instant::now();
@@ -2907,7 +2908,7 @@ mod tests {
             Some(NavAction::NextSlide)
         );
 
-        // Edit face remaps untouched: Square (CycleSort) -> Triangle (EditManual).
+        // Square still cycles sort in edit mode (manual Edit is mouse-only).
         assert!(
             tick_games_editing(&mut bank, PadSample::default(), now)
                 .action
@@ -2920,7 +2921,7 @@ mod tests {
         assert!(tick_games_editing(&mut bank, square, now).action.is_none());
         assert_eq!(
             tick_games_editing(&mut bank, PadSample::default(), now).action,
-            Some(NavAction::Triangle)
+            Some(NavAction::CycleSort)
         );
 
         // Triangle still saves (ToggleEdit) in edit mode on the horizontal strip.
