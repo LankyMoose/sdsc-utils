@@ -6,6 +6,7 @@ pub mod debug_quiet;
 pub mod device_watch;
 pub mod file_icon;
 pub mod packaged;
+pub mod prev_instance;
 pub mod ui_sound;
 pub mod wgpu_diag;
 #[cfg(windows)]

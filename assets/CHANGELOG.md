@@ -5,6 +5,8 @@
 - Extra Steam library folder support
 ### Changed
 - Toast position setting moved to the Notifications tab
+- Relaunching the app now replaces the running instance instead of exiting quietly
+- Windows Task Manager description now reads `SDSC Utils {version}`
 ### Fixed
 - Position bar now briefly shows when changing sort in immersive mode
 

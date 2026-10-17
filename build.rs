@@ -33,7 +33,7 @@ fn main() {
         res.set("ProductName", DISPLAY_NAME);
         res.set(
             "FileDescription",
-            "Show DualSense controller battery levels in the system tray",
+            &format!("{DISPLAY_NAME} {}", env!("CARGO_PKG_VERSION")),
         );
         if let Err(err) = res.compile() {
             // Missing Windows SDK / RC tooling should not block non-icon builds in CI-like envs.

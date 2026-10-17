@@ -93,8 +93,8 @@ fn main() -> ExitCode {
 
     // The guard must be held for the whole process lifetime. A renderer
     // reload (`--replace`) spawns its successor before exiting, so the child
-    // retries briefly while the parent releases the guard; an ordinary
-    // second launch exits at once.
+    // waits briefly while the parent exits. A fresh launch instead
+    // terminates the predecessor and takes over (see `prev_instance`).
     let _instance = match acquire_single_instance(replacing) {
         Ok(instance) => instance,
         Err(code) => return code,
@@ -110,10 +110,31 @@ fn main() -> ExitCode {
     }
 }
 
-/// Acquire the single-instance guard, retrying briefly for `--replace`.
+/// Acquire the single-instance guard.
+///
+/// A fresh tray launch takes over: it terminates the running predecessor,
+/// then retries while the OS releases the guard. A `--replace` child is
+/// spawned by its gracefully-exiting parent, so it only waits.
 fn acquire_single_instance(replacing: bool) -> Result<SingleInstance, ExitCode> {
-    let attempts = if replacing { 100 } else { 1 };
+    // Fast path: no predecessor holds the guard.
+    match SingleInstance::new(PKG_NAME) {
+        Ok(instance) if instance.is_single() => return Ok(instance),
+        Ok(_) => {}
+        Err(err) => {
+            app_log::error(format!("single-instance init failed: {err}"));
+            return Err(ExitCode::FAILURE);
+        }
+    }
+
+    if !replacing {
+        sdsc_utils::platform::prev_instance::terminate_previous_instances();
+    }
+
+    // The predecessor needs a moment to die and release the guard (killed
+    // takeover, or gracefully-exiting `--replace` parent).
+    let attempts = if replacing { 100 } else { 50 };
     for _ in 0..attempts {
+        std::thread::sleep(std::time::Duration::from_millis(100));
         match SingleInstance::new(PKG_NAME) {
             Ok(instance) => {
                 if instance.is_single() {
@@ -125,10 +146,14 @@ fn acquire_single_instance(replacing: bool) -> Result<SingleInstance, ExitCode> 
                 return Err(ExitCode::FAILURE);
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    app_log::info("another instance is already running; exiting");
-    Err(ExitCode::SUCCESS)
+    if replacing {
+        app_log::info("another instance is already running; exiting");
+        Err(ExitCode::SUCCESS)
+    } else {
+        app_log::error("another instance is already running and did not exit; giving up");
+        Err(ExitCode::FAILURE)
+    }
 }
 
 fn print_help() {

@@ -38,7 +38,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 
 ## Key binaries & entrypoints
 
-- `src/bin/sdsc-utils.rs` — the app: tray, HID, session, and iced UI in one process (the default binary). Internal `--replace` argv lets a renderer-pref reload successor retry the single-instance guard while the parent exits.
+- `src/bin/sdsc-utils.rs` — the app: tray, HID, session, and iced UI in one process (the default binary). Internal `--replace` argv lets a renderer-pref reload successor retry the single-instance guard while the parent exits; a fresh launch instead terminates the predecessor and takes over (`src/platform/prev_instance.rs`).
 - `src/bin/gen_msix_logos.rs` — MSIX logo generator
 - Plain `cargo build` builds **all** binaries. `cargo run` runs the whole app; there is no second process to keep in sync.
 - `src/lib.rs` — re-exports all internal modules (`app`, `controller`, `domain`, `games`, `persist`, `platform`, `session`, `ui`)
@@ -47,7 +47,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 
 - **Battery steps**: DualSense firmware reports battery in 11 coarse steps (0–10). Percentages use the Linux mid-point mapping (step 0 → 5%, step 9 → 95%, step 10/full → 100%). See `src/controller/dualsense/battery.rs` or the README.
 - **Lightbar color**: Blue → Purple → Red gradient as battery drops; reasserted every ~5 seconds. Low-battery pulse (orange) when ≤5% while discharging.
-- **Single instance**: The app enforces single-instance via the `single-instance` crate. Second launch exits quietly.
+- **Single instance with takeover**: the app enforces single-instance via the `single-instance` crate. A fresh tray launch terminates the running predecessor and takes over; only the internal `--replace` child waits for its gracefully-exiting parent.
 - **No async runtime**: iced already runs its executor on Tokio (see the `tokio` feature in `Cargo.toml`); app code programs against iced `Task`/`Subscription` plus the dedicated HID worker thread. Do not add an explicit Tokio dependency — blocking `hidapi` I/O must stay off the UI executor (see the cutover plan discussion).
 - **Windows features**: `tray-icon` builds differ per OS — root `Cargo.toml` has `[target.'cfg(windows)'.dependencies]`, `[target.'cfg(target_os = "macos")']`, `[target.'cfg(target_os = "linux")']` sections.
 - **No telemetry**: All data stays local (`prefs.json`, `controllers.json`, `analytics.json`, `app.log`).
@@ -81,7 +81,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Intermittent test failure? Check shared globals before anything else.** `cargo test` runs tests on N threads in one process, so any `static`/`OnceLock`/`LazyLock` is shared. Reproduce with `--test-threads=16` in a loop rather than re-running (see `notes/flaky-tests.md`). Any test that mutates a process-global must take that global's test lock — `art_worker::shutdown()` wipes the shared `icon_cache` via `wipe_art_caches()`, and `domain::color::set_active_spectrum` swaps the process-wide `SPECTRUM`. Locks are `icon_cache::with_cache_lock` and `color::with_spectrum_lock`.
 - **`cargo fmt --all -- --check` must run before `cargo clippy --all-targets -- -D warnings`**. Clippy can emit warnings that fmt would have reformatted; running fmt first avoids the "clippy fixes fmt" cycle.
 - **Clippy `-D warnings` is active in CI**. Any new `#[allow(clippy::...)]` must be justified; otherwise the build will fail on PR.
-- **The `single-instance` crate ensures only one run**. If you add GUI windows, make sure they're owned correctly or you'll get "single instance" exits.
+- **The `single-instance` crate ensures only one run, with takeover**. A fresh launch kills the predecessor (`platform::prev_instance`) — if you add GUI windows, make sure they're owned correctly or you'll get "single instance" exits.
 - **Windows .exe icon is generated from SVG at build time** via `build.rs`. If the SVG changes, the icon rebuilds automatically (rerun-if-changed is set).
 - **Debug-only code is gated by `cfg(debug_assertions)`, not a Cargo feature**. The Developer emulator, HID diagnostics, and verbose logging ship in every non-release build. `scripts/ci.sh` lints *both* profiles (`--release` included) because release compiles out whole items that debug compiles — a debug-only clean build does not prove a clean release.
 - **Lightbar color reassertion every ~5 seconds** means if you overwrite the lightbar via another tool (e.g., Steam Input), the app will re-apply its color. This is intentional but worth noting when debugging "stuck" colors. (Incremental-poll work narrows this to change/new/30s-backstop; see `notes/hot-enumeration-freeze.md` for the Steam test watch.)
