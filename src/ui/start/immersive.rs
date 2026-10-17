@@ -1,5 +1,6 @@
 //! Fullscreen console-style presentation of the start screen.
 
+use crate::persist::prefs::ImmersiveLayout;
 use crate::ui::color::BatterySpectrum;
 use crate::ui::percent_ring;
 use crate::ui::shader::{AmbientProgram, VignetteProgram};
@@ -11,16 +12,24 @@ use crate::ui::start::view::{
     immersive_game_membership_label, manual_add_view, replace_confirm_view, scan_status_chip,
     scan_status_stack, update_required_badge,
 };
-use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics};
+use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics, StripOrientation};
 use crate::ui::theme;
 use iced::font::Weight;
-use iced::widget::{Float, column, container, row, shader, space, stack, text};
-use iced::{Alignment, Element, Fill, Font, Length, Padding};
+use iced::widget::{Float, column, container, keyed_column, row, shader, space, stack, text};
+use iced::{Alignment, Element, Fill, Font, Length, Padding, Vector};
 use std::time::Instant;
 
 const EDGE_PAD: f32 = 16.0;
 /// ~1″ inset for the games strip from the left window edge (96 logical px / inch).
 const STRIP_AFTER_BAR: f32 = 12.0;
+/// Gap between the horizontal position rail and the footer hints island below it.
+const BAR_ABOVE_FOOTER: f32 = 64.0;
+/// Top spacing above the horizontal strip: minimum clock-capsule clearance.
+///
+/// The art-row lead ([`vstrip::horizontal_block_lead`]) stacks the centering
+/// drop on top of this pad, so the visual top gap runs deeper while the rail
+/// keeps its minimum gap below the titles.
+const STRIP_TOP_PAD: f32 = vstrip::H_TOP_PAD;
 /// Minimum gap from ring outer edge → peek column edge (also sizes peek width for max ring).
 const DOCK_RING_INSET: f32 = 6.0;
 const DOCK_RING_MIN: f32 = 52.0;
@@ -84,7 +93,10 @@ pub fn view<'a>(
     clock_enabled: bool,
     promote_gesture: &'a [crate::domain::gesture::GestureControl],
     stage_h: f32,
+    stage_w: f32,
     settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
+    immersive_layout: ImmersiveLayout,
+    #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
     let dock_p = state.dock_progress(now);
     let veil = transition_top_veil(state, now);
@@ -96,13 +108,39 @@ pub fn view<'a>(
     let program = AmbientProgram::new(state.ambient_time, dock_p, 0.0, 1.0);
     let atmosphere = shader(program).width(Fill).height(Fill);
 
+    // Debug R3 hide: pure ambient background, no chrome at all (tuning panel
+    // included). Matches the standalone preview window layer for layer.
+    #[cfg(debug_assertions)]
+    if state.ambient_tune_open && state.ambient_tune_hide_chrome {
+        return stack![
+            atmosphere,
+            shader(VignetteProgram::new(0.55)).width(Fill).height(Fill),
+        ]
+        .width(Fill)
+        .height(Fill)
+        .into();
+    }
+
     let body: Element<'_, StartMessage> = if state.manual_add.is_some() {
         modal_card(manual_add_view(state))
     } else if state.replace_confirm.is_some() {
         modal_card(replace_confirm_view(state))
     } else {
-        stage_with_dock(state, spectrum, now, dock_p, flat, stage_h)
+        stage_with_dock(
+            state,
+            spectrum,
+            now,
+            dock_p,
+            flat,
+            stage_h,
+            stage_w,
+            immersive_layout,
+            #[cfg(debug_assertions)]
+            debug_bounds,
+        )
     };
+    #[cfg(debug_assertions)]
+    let body = crate::ui::debug_bounds::wrap(body, debug_bounds);
 
     let footer_capsule = container(footer_hint(
         state,
@@ -120,7 +158,7 @@ pub fn view<'a>(
     .style(theme::immersive_footer_capsule);
 
     // Full-bleed stage + dock; footer hints overlay the bottom.
-    let footer_overlay = column![
+    let footer_overlay: Element<'_, StartMessage> = column![
         space().height(Fill),
         container(footer_capsule)
             .width(Fill)
@@ -133,16 +171,20 @@ pub fn view<'a>(
             }),
     ]
     .width(Fill)
-    .height(Fill);
+    .height(Fill)
+    .into();
+    #[cfg(debug_assertions)]
+    let footer_overlay: Element<'_, StartMessage> =
+        crate::ui::debug_bounds::wrap(footer_overlay, debug_bounds);
 
-    let mut chrome_layers: Vec<Element<'_, StartMessage>> = vec![body, footer_overlay.into()];
+    let mut chrome_layers: Vec<Element<'_, StartMessage>> = vec![body, footer_overlay];
     if clock_enabled {
         // Center-top clock widget (system locale time). Digits carry no descenders,
         // so the font line box holds empty descender space below the baseline and
         // the glyphs sit ~1px high: top padding runs 1px deeper to compensate
         // (optical centering; total capsule height is unchanged).
         let clock_capsule = container(
-            text(crate::ui::start::clock::clock_text())
+            text(crate::ui::start::clock::clock_text().to_ascii_uppercase())
                 .size(18.0)
                 .color(theme::alpha(theme::INK, 0.72)),
         )
@@ -153,7 +195,7 @@ pub fn view<'a>(
             left: 16.0,
         })
         .style(theme::immersive_footer_capsule);
-        let clock_overlay = column![
+        let clock_overlay: Element<'_, StartMessage> = column![
             container(clock_capsule)
                 .width(Fill)
                 .center_x(Fill)
@@ -166,8 +208,12 @@ pub fn view<'a>(
             space().height(Fill),
         ]
         .width(Fill)
-        .height(Fill);
-        chrome_layers.push(clock_overlay.into());
+        .height(Fill)
+        .into();
+        #[cfg(debug_assertions)]
+        let clock_overlay: Element<'_, StartMessage> =
+            crate::ui::debug_bounds::wrap(clock_overlay, debug_bounds);
+        chrome_layers.push(clock_overlay);
     }
     let chrome_status = state.chrome_load_status(now);
     if !chrome_status.is_empty() {
@@ -182,7 +228,7 @@ pub fn view<'a>(
                 (visual, chip)
             })
             .collect();
-        let scan_overlay = column![
+        let scan_overlay: Element<'_, StartMessage> = column![
             space().height(Fill),
             container(scan_status_stack(chips, chip_h, bottom_inset))
                 .width(Fill)
@@ -194,8 +240,11 @@ pub fn view<'a>(
                 }),
         ]
         .width(Fill)
-        .height(Fill);
-        chrome_layers.push(scan_overlay.into());
+        .height(Fill)
+        .into();
+        #[cfg(debug_assertions)]
+        let scan_overlay = crate::ui::debug_bounds::wrap(scan_overlay, debug_bounds);
+        chrome_layers.push(scan_overlay);
     }
 
     let chrome = stack(chrome_layers).width(Fill).height(Fill);
@@ -208,7 +257,15 @@ pub fn view<'a>(
             state,
             settings_snapshot,
             settings_p,
+            #[cfg(debug_assertions)]
+            debug_bounds,
         ));
+    }
+    // Debug tuning panel above chrome (drawer stays closed while it is open).
+    // Same stacking discipline as the drawer: chrome never remounts.
+    #[cfg(debug_assertions)]
+    if state.ambient_tune_open && !state.ambient_tune_hide_chrome {
+        layers.push(crate::ui::start::ambient_tune::tuning_overlay(state));
     }
     // Idle/sleep wash sits above settings; ceremony veil stays on top.
     if idle_veil > 0.001 {
@@ -235,7 +292,7 @@ pub fn view<'a>(
 /// Full-bleed blackout — enter uses capped ease-in-out; exit uses ease-out like compact.
 fn transition_top_veil(state: &State, now: Instant) -> f32 {
     match state.transition_phase.map(|(p, _)| p) {
-        Some(TransitionPhase::EnterImmersive) => state.enter_veil_amount(),
+        Some(TransitionPhase::EnterImmersive) => state.enter_veil_amount(now),
         Some(TransitionPhase::ExitImmersive) => state.phase_progress(now).clamp(0.0, 1.0),
         _ => 0.0,
     }
@@ -298,6 +355,7 @@ fn backdrop_layer(
     backdrop_art(art.0, opacity, scale, ox_norm, oy_norm).into()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage_with_dock<'a>(
     state: &'a State,
     spectrum: &BatterySpectrum,
@@ -305,19 +363,60 @@ fn stage_with_dock<'a>(
     dock_p: f32,
     flat: bool,
     stage_h: f32,
+    stage_w: f32,
+    immersive_layout: ImmersiveLayout,
+    #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
-    let scale = dock_stage_scale(dock_p);
+    let scale = crate::ui::motion::movement_scale(dock_stage_scale(dock_p), state.reduced_motion);
     let dim = dock_stage_dim(dock_p);
 
     // Backdrop lives in the games stage (scales with dock), not the full window.
-    let list_op = state.games_list_opacity(now);
-    let mut stage_layers = if list_op > 0.01 {
+    // A layout change slides the old orientation out along its scroll axis
+    // while fading it; the orientation swaps at the midpoint, then the new one
+    // slides in from the opposite side while fading back in.
+    let (transition_layout, transition_opacity, transition_dx, transition_dy) =
+        state.layout_transition_visual(immersive_layout, now);
+    let list_op = (state.games_list_opacity(now) * transition_opacity).clamp(0.0, 1.0);
+    // Debug tuning hides splash art (WYSIWYG ambience) but keeps the stage
+    // vignette so the layer matches the standalone preview exactly.
+    // Untuned paths are untouched (including the art-less cold-load stage).
+    let mut stage_layers = if state.ambient_tuning_active() {
+        vec![
+            shader(VignetteProgram::new(0.55))
+                .width(Fill)
+                .height(Fill)
+                .into(),
+        ]
+    } else if list_op > 0.01 {
         stage_backdrop_layers(state, now)
     } else {
         Vec::new()
     };
     if list_op > 0.01 {
-        stage_layers.push(games_stage(state, now, stage_h, list_op));
+        let strip: Element<'_, StartMessage> =
+            games_stage(state, now, stage_h, stage_w, list_op, transition_layout);
+        #[cfg(debug_assertions)]
+        let strip = crate::ui::debug_bounds::wrap(strip, debug_bounds);
+        // Float paints above veils — skip the slide while flattening (same as
+        // the dock scale); sub-pixel offsets skip the extra layer. No scale
+        // punch: the directional travel carries the motion.
+        let strip: Element<'_, StartMessage> = if !flat
+            && (transition_dx.abs() >= 0.5 || transition_dy.abs() >= 0.5)
+        {
+            container(
+                Float::new(strip)
+                    .translate(move |_bounds, _viewport| Vector::new(transition_dx, transition_dy)),
+            )
+            .width(Fill)
+            .height(Fill)
+            .center_x(Fill)
+            .center_y(Fill)
+            .style(theme::immersive_stage)
+            .into()
+        } else {
+            strip
+        };
+        stage_layers.push(strip);
     }
     let stage = stack(stage_layers).width(Fill).height(Fill);
 
@@ -351,8 +450,10 @@ fn stage_with_dock<'a>(
     }
 
     let dock = controllers_dock_host(state, spectrum, dock_p);
+    #[cfg(debug_assertions)]
+    let dock: Element<'_, StartMessage> = crate::ui::debug_bounds::wrap_fixed(dock, debug_bounds);
     // Top-right floating capsule — same inset as footer (EDGE_PAD / 10).
-    let dock_overlay = row![
+    let dock_overlay: Element<'_, StartMessage> = row![
         space().width(Fill),
         column![dock, space().height(Fill),]
             .height(Fill)
@@ -364,8 +465,12 @@ fn stage_with_dock<'a>(
             }),
     ]
     .width(Fill)
-    .height(Fill);
-    layers.push(dock_overlay.into());
+    .height(Fill)
+    .into();
+    #[cfg(debug_assertions)]
+    let dock_overlay: Element<'_, StartMessage> =
+        crate::ui::debug_bounds::wrap(dock_overlay, debug_bounds);
+    layers.push(dock_overlay);
 
     stack(layers).width(Fill).height(Fill).into()
 }
@@ -387,20 +492,35 @@ fn games_stage(
     state: &State,
     now: Instant,
     stage_h: f32,
+    stage_w: f32,
     list_opacity: f32,
+    immersive_layout: ImmersiveLayout,
 ) -> Element<'_, StartMessage> {
     if state.rows.is_empty() {
         return empty_games(state);
     }
 
     let list_opacity = list_opacity.clamp(0.0, 1.0);
-    let metrics = vstrip::metrics_for_height(stage_h);
+    let orientation = match immersive_layout {
+        ImmersiveLayout::Vertical => StripOrientation::Vertical,
+        ImmersiveLayout::Horizontal => StripOrientation::Horizontal,
+    };
+    let metrics = match immersive_layout {
+        ImmersiveLayout::Vertical => vstrip::metrics_for_height(stage_h),
+        ImmersiveLayout::Horizontal => vstrip::metrics_for_width(stage_w, stage_h),
+    };
+    // Horizontal shows as many neighbors as fit the stage width (up to MAX);
+    // vertical keeps the fixed 5-item strip.
+    let neighbors = match immersive_layout {
+        ImmersiveLayout::Vertical => NEIGHBORS,
+        ImmersiveLayout::Horizontal => vstrip::neighbors_for_width(stage_w, metrics.center_w),
+    };
     let selected = state.game_selected.min(state.rows.len().saturating_sub(1));
     let visual = state.strip_scroll(now);
     let len = state.rows.len();
 
-    let mut items = Vec::with_capacity(vstrip::VISIBLE);
-    for delta in -NEIGHBORS..=NEIGHBORS {
+    let mut items = Vec::with_capacity((neighbors * 2 + 1).max(0) as usize);
+    for delta in -neighbors..=neighbors {
         let Some((idx, dist)) = vstrip::visual_slot(visual, delta, len) else {
             continue;
         };
@@ -408,8 +528,17 @@ fn games_stage(
         let fade = vstrip::opacity_at_distance(dist) * list_opacity;
         let row = &state.rows[idx];
         let selected_slot = idx == selected;
-        let overlay = if selected_slot && list_opacity > 0.85 {
-            Some(hero_hint_overlay(row, state))
+        // Integer offset from the selection: stable across the scroll
+        // animation (unlike the fractional `dist`). Outer peeks (|offset|
+        // >= 2) render their title + meta at their own art width (see
+        // `strip_slot_stacked`), so every visible cover carries its labels.
+        let sel_offset = idx as isize - selected as isize;
+        // The cue box crossfades with the strip scroll (see
+        // `State::hero_overlay_alpha`): the target fades in on arrival, the
+        // departed slot fades out, pass-through slots stay quiet.
+        let overlay_alpha = state.hero_overlay_alpha(idx, selected, dist, list_opacity);
+        let overlay = if overlay_alpha > 0.01 {
+            Some((hero_hint_overlay(row, state, overlay_alpha), overlay_alpha))
         } else {
             None
         };
@@ -423,13 +552,18 @@ fn games_stage(
                 fade,
                 &metrics,
                 overlay,
+                orientation,
+                sel_offset,
+                dist,
             ),
         ));
     }
 
-    let strip = vstrip::vstrip(metrics, items)
-        .width(Length::Fixed(metrics.slot_w))
-        .height(Fill);
+    let strip = vstrip::vstrip(metrics, items).orientation(orientation);
+    let strip = match immersive_layout {
+        ImmersiveLayout::Vertical => strip.width(Length::Fixed(metrics.slot_w)).height(Fill),
+        ImmersiveLayout::Horizontal => strip.width(Fill).height(Length::Fixed(metrics.slot_h)),
+    };
 
     let mode = state.games_section_mode();
 
@@ -440,32 +574,92 @@ fn games_stage(
         show_opacity: state.position_bar_opacity(now),
         slide: state.position_bar_slide(now),
         motion: state.position_bar_motion(),
+        orientation,
     });
 
-    // Titles sit beside heroes; Launch/Close/edit cues overlay the selected capsule.
-    row![
-        container(bar).padding(Padding {
-            top: 0.0,
-            right: 0.0,
-            bottom: 0.0,
-            left: EDGE_PAD,
-        }),
-        container(strip).padding(Padding {
-            top: 0.0,
-            right: 0.0,
-            bottom: 0.0,
-            left: STRIP_AFTER_BAR,
-        }),
-        space().width(Fill),
-    ]
-    .spacing(0)
-    .width(Fill)
-    .height(Fill)
-    .into()
+    match immersive_layout {
+        ImmersiveLayout::Vertical => {
+            // Titles sit beside heroes; Launch/Close/edit cues overlay the selected capsule.
+            row![
+                container(bar).padding(Padding {
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: EDGE_PAD,
+                }),
+                container(strip).padding(Padding {
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: STRIP_AFTER_BAR,
+                }),
+                space().width(Fill),
+            ]
+            .spacing(0)
+            .width(Fill)
+            .height(Fill)
+            .into()
+        }
+        ImmersiveLayout::Horizontal => {
+            // Art-row-first anchoring: the strip top sits at `lead` so the ART
+            // ROW centers between the screen top and the rail. Every slot —
+            // the selection included — is art + its in-slot title/meta, so
+            // the strip *is* the block (no separate title layer to stack) and
+            // the rail keeps its minimum gap under the in-slot titles.
+            let block_h = metrics.slot_h;
+            let region_h =
+                (stage_h - (crate::ui::start::position::WIDTH + BAR_ABOVE_FOOTER)).max(1.0);
+            let lead = vstrip::horizontal_block_lead(
+                region_h,
+                block_h,
+                metrics.h_text_budget,
+                STRIP_TOP_PAD,
+                vstrip::H_TITLE_TO_BAR_MIN,
+            );
+            column![
+                container(
+                    column![
+                        space().height(Length::Fixed(lead)),
+                        strip,
+                        space().height(Fill),
+                    ]
+                    .spacing(0)
+                    .width(Fill)
+                    .height(Fill),
+                )
+                .width(Fill)
+                .height(Fill)
+                .padding(Padding {
+                    top: 0.0,
+                    right: EDGE_PAD,
+                    bottom: 0.0,
+                    left: EDGE_PAD,
+                }),
+                container(bar).padding(Padding {
+                    top: 0.0,
+                    right: EDGE_PAD,
+                    bottom: BAR_ABOVE_FOOTER,
+                    left: EDGE_PAD,
+                }),
+            ]
+            .spacing(0)
+            .width(Fill)
+            .height(Fill)
+            .into()
+        }
+    }
 }
 
 /// Membership / Playing + face cues stacked on the selected hero art.
-fn hero_hint_overlay<'a>(row: &'a StartRow, state: &'a State) -> Element<'a, StartMessage> {
+///
+/// `alpha` (from [`State::hero_overlay_alpha`]) fades the whole box with the
+/// strip scroll; layout is unchanged by it, so the fade never reflows art.
+fn hero_hint_overlay<'a>(
+    row: &'a StartRow,
+    state: &'a State,
+    alpha: f32,
+) -> Element<'a, StartMessage> {
+    let a = alpha.clamp(0.0, 1.0);
     let running = state
         .running_target
         .as_ref()
@@ -476,13 +670,21 @@ fn hero_hint_overlay<'a>(row: &'a StartRow, state: &'a State) -> Element<'a, Sta
         .is_some_and(|t| t == &row.target);
     let mut col = column![].spacing(10).align_x(Alignment::Center);
     if state.editing {
-        col = col.push(immersive_game_membership_label(row));
+        col = col.push(immersive_game_membership_label(row, a));
     } else if closing {
-        col = col.push(text("Closing").size(15.0).color(theme::MUTED));
+        col = col.push(
+            text("Closing")
+                .size(15.0)
+                .color(theme::alpha(theme::MUTED, a)),
+        );
     } else if running {
-        col = col.push(text("Playing").size(15.0).color(theme::ACCENT));
+        col = col.push(
+            text("Playing")
+                .size(15.0)
+                .color(theme::alpha(theme::ACCENT, a)),
+        );
     }
-    col = col.push(immersive_game_hints(row, state));
+    col = col.push(immersive_game_hints(row, state, a));
     col.into()
 }
 
@@ -503,6 +705,7 @@ fn empty_games(state: &State) -> Element<'_, StartMessage> {
         .into()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn strip_slot<'a>(
     row: &'a StartRow,
     selected: bool,
@@ -510,7 +713,10 @@ fn strip_slot<'a>(
     scale: f32,
     fade: f32,
     metrics: &StripMetrics,
-    overlay: Option<Element<'a, StartMessage>>,
+    overlay: Option<(Element<'a, StartMessage>, f32)>,
+    orientation: StripOrientation,
+    sel_offset: isize,
+    dist: f32,
 ) -> Element<'a, StartMessage> {
     let muted = editing && !row.in_catalog();
     let disabled = row.disabled && !editing;
@@ -525,67 +731,70 @@ fn strip_slot<'a>(
         overlay,
     );
 
-    let title_size = if selected { 39.0 } else { 22.0 };
+    // Explicit pixel size so vstrip scale actually enlarges the hero.
+    // Inset smaller art so every capsule shares the selected art centerline.
+    let max_art_w = metrics.center_w * metrics.selected_scale;
+    let art_w = metrics.center_w * scale;
+    let art_h = metrics.center_h * scale;
+
+    if orientation == StripOrientation::Horizontal {
+        // Every slot carries its in-slot title + meta — the selection and
+        // the outer peeks included — so titles ride along with their card
+        // like the vertical layout's side column (no separate full-width
+        // crossfade layer). Outer peeks (`|offset| >= 2`) use their own
+        // narrower art-width wrap + smaller type (see `strip_slot_stacked`)
+        // so adjacent titles can never overlap; stages too short for the
+        // text budget go art-only.
+        let show_text = metrics.h_text_budget > 0.0;
+        return strip_slot_stacked(
+            row,
+            muted,
+            fade,
+            dim,
+            capsule,
+            max_art_w,
+            art_w,
+            art_h,
+            show_text,
+            metrics.center_w,
+            dist,
+            sel_offset,
+        );
+    }
+
+    let t = vstrip::title_selectionness(dist);
+    let title_size = vstrip::v_title_size_at(dist);
+    let text_w = vstrip::v_title_text_width_at(dist).max(1.0);
+    // Weight has no fractional step in iced: flip mid-scroll where both sides
+    // are near-identical sizes so the pop hides in the glide.
+    let bold = t > 0.5;
     let title_alpha = if muted { 0.55 * fade } else { fade * dim };
     // Selected titles are large; pull back from pure white for less glare.
-    let title_color = if selected {
-        theme::alpha(theme::mix(theme::INK, theme::MUTED, 0.28), title_alpha)
-    } else {
-        theme::alpha(theme::MUTED, 0.85 * title_alpha)
-    };
-    let title = text(if row.skeleton {
+    let selected_rgb = theme::mix(theme::INK, theme::MUTED, 0.28);
+    let base_rgb = theme::mix(theme::MUTED, selected_rgb, t);
+    let title_color = theme::alpha(base_rgb, title_alpha * (0.85 + 0.15 * t));
+    let title_string = if row.skeleton {
         "…".into()
     } else {
         row.title.clone()
-    })
-    .size(title_size)
-    .color(title_color)
-    .font(Font {
-        weight: if selected {
-            Weight::Bold
-        } else {
-            Weight::Normal
-        },
-        ..Font::DEFAULT
-    });
+    };
 
-    let sub_alpha = if muted { 0.55 * fade } else { 0.9 * fade * dim };
+    let title = text(title_string)
+        .size(title_size)
+        .color(title_color)
+        .font(Font {
+            weight: if bold { Weight::Bold } else { Weight::Normal },
+            ..Font::DEFAULT
+        })
+        .width(Length::Fixed(text_w))
+        .align_x(Alignment::Start)
+        .wrapping(iced::widget::text::Wrapping::Word);
+
+    let sub_alpha = if muted { 0.55 * fade } else { fade * dim };
     let mut titles = column![title].spacing(6);
     // Stacked `Played:` / `Last played:` + optional Update pill.
     // Disabled rows show "Not installed" instead of meta.
-    if disabled {
-        let meta_size = if selected { 16.0 } else { 14.0 };
-        let mut status = column![].spacing(6).width(Fill);
-        status = status.push(
-            text("Not installed")
-                .size(meta_size)
-                .color(theme::alpha(theme::MUTED, 0.7 * fade)),
-        );
-        titles = titles.push(status);
-    } else {
-        let show_meta = row
-            .subtitle
-            .as_ref()
-            .is_some_and(|sub| !(row.update_required && sub.is_steam_fallback()));
-        if show_meta || row.update_required {
-            let meta_size = if selected { 16.0 } else { 14.0 };
-            let mut status = column![].spacing(6).width(Fill);
-            if show_meta && let Some(sub) = row.subtitle.as_ref() {
-                let value_color = theme::alpha(theme::MUTED, sub_alpha);
-                let label_color = theme::alpha(theme::MUTED, sub_alpha * 0.8);
-                status = status.push(game_subtitle_block(
-                    sub,
-                    value_color,
-                    label_color,
-                    meta_size,
-                ));
-            }
-            if row.update_required {
-                status = status.push(update_required_badge(selected, muted, fade, true));
-            }
-            titles = titles.push(status);
-        }
-    }
+    titles = titles.push(status_block(row, bold, muted, fade, sub_alpha, None));
 
     let label: Element<'_, StartMessage> = container(titles)
         .width(Fill)
@@ -599,11 +808,6 @@ fn strip_slot<'a>(
         })
         .into();
 
-    // Explicit pixel size so vstrip scale actually enlarges the hero.
-    // Inset smaller art so every capsule shares the selected art centerline.
-    let max_art_w = metrics.center_w * metrics.selected_scale;
-    let art_w = metrics.center_w * scale;
-    let art_h = metrics.center_h * scale;
     let inset = ((max_art_w - art_w) * 0.5).max(0.0);
     let body = row![
         space().width(Length::Fixed(inset)),
@@ -621,13 +825,195 @@ fn strip_slot<'a>(
     container(body).width(Fill).height(Fill).into()
 }
 
+/// Meta under a game title: "Not installed", or `Played:` / `Last played:`
+/// plus the Update pill. `fixed_w` centers the block in a fixed width: the art
+/// width for horizontal slots (so adjacent slots cannot overlap); `None` keeps
+/// the vertical side-column behavior (fill width, left-aligned).
+fn status_block<'a>(
+    row: &'a StartRow,
+    selected: bool,
+    muted: bool,
+    fade: f32,
+    sub_alpha: f32,
+    fixed_w: Option<f32>,
+) -> Element<'a, StartMessage> {
+    let width = match fixed_w {
+        Some(w) => Length::Fixed(w),
+        None => Fill,
+    };
+    let align = match fixed_w {
+        Some(_) => Alignment::Center,
+        None => Alignment::Start,
+    };
+    if row.disabled {
+        let meta_size = if selected { 16.0 } else { 14.0 };
+        let not_installed = text("Not installed")
+            .size(meta_size)
+            .color(theme::alpha(theme::MUTED, 0.7 * fade));
+        if fixed_w.is_some() {
+            let label: Element<'_, StartMessage> =
+                not_installed.width(width).align_x(Alignment::Center).into();
+            return column![label].spacing(6).width(width).align_x(align).into();
+        }
+        return column![not_installed]
+            .spacing(6)
+            .width(width)
+            .align_x(align)
+            .into();
+    }
+    let show_meta = row
+        .subtitle
+        .as_ref()
+        .is_some_and(|sub| !(row.update_required && sub.is_steam_fallback()));
+    if !(show_meta || row.update_required) {
+        return space().width(width).height(Length::Fixed(0.0)).into();
+    }
+    let meta_size = if selected { 16.0 } else { 14.0 };
+    let mut status = column![].spacing(6).width(width).align_x(align);
+    if show_meta && let Some(sub) = row.subtitle.as_ref() {
+        let value_color = theme::alpha(theme::MUTED, sub_alpha);
+        let label_color = theme::alpha(theme::MUTED, sub_alpha);
+        // One shared subtitle block: horizontal slots center it under the
+        // title, the vertical side column keeps it left-aligned.
+        let sub_block = game_subtitle_block(sub, value_color, label_color, meta_size, align);
+        status = status.push(sub_block);
+    }
+    if row.update_required {
+        let badge: Element<'_, StartMessage> = update_required_badge(selected, muted, fade, true);
+        if fixed_w.is_some() {
+            status = status.push(container(badge).width(Fill).center_x(Fill));
+        } else {
+            status = status.push(badge);
+        }
+    }
+    status.into()
+}
+
+/// Horizontal item: art on top with a small centered title + meta below it.
+/// Every slot that shows text uses this same block — the selection, the
+/// neighbors, and the outer peeks — so each title animates with its card
+/// exactly like the others. Inner slots (`|offset| < 2`) share the same-wrap
+/// neighbor bounds ([`vstrip::h_title_wrap_width_at`]); outer peeks use
+/// their own narrower art-width wrap ([`vstrip::h_outer_wrap_width`]) at
+/// [`vstrip::H_TITLE_OUTER_SIZE`] so adjacent titles can never overlap.
+/// Titles wrap (`Wrapping::Word`) inside a per-slot fixed width keyed on the
+/// stable integer offset, so breaks never reflow mid-scroll. `Weight` cannot
+/// interpolate, so bold flips at the halfway point when both sides render
+/// near-identical sizes. Launch/Close/edit cues still overlay the capsule
+/// via `strip_capsule`.
+#[allow(clippy::too_many_arguments)]
+fn strip_slot_stacked<'a>(
+    row: &'a StartRow,
+    muted: bool,
+    fade: f32,
+    dim: f32,
+    capsule: Element<'a, StartMessage>,
+    max_art_w: f32,
+    art_w: f32,
+    art_h: f32,
+    show_text: bool,
+    center_w: f32,
+    dist: f32,
+    sel_offset: isize,
+) -> Element<'a, StartMessage> {
+    let art_w = art_w.max(1.0);
+    let label: Element<'_, StartMessage> = if show_text {
+        let title_string = if row.skeleton {
+            "…".into()
+        } else {
+            row.title.clone()
+        };
+        // Continuous selectionness from the fractional scroll distance: size,
+        // wrap width, and color ease with the art instead of popping on the
+        // first frame (the old `selected: bool` flipped instantly while the
+        // strip eased over ~200ms). Outer peeks keep their own narrower wrap
+        // and smaller type throughout the glide (keyed on the integer offset,
+        // which is stable across the animation).
+        let outer = sel_offset.abs() >= 2;
+        let t = vstrip::h_title_selectionness(dist);
+        let wrap_w = if outer {
+            vstrip::h_outer_wrap_width(center_w, sel_offset).max(1.0)
+        } else {
+            vstrip::h_title_wrap_width_at(center_w, dist).max(1.0)
+        };
+        let size = if outer {
+            vstrip::H_TITLE_OUTER_SIZE
+        } else {
+            vstrip::h_title_size_at(dist)
+        };
+        // Weight has no fractional step in iced: flip mid-scroll where both
+        // sides are near-identical sizes so the pop hides in the glide.
+        let bold = t > 0.5;
+        let title_alpha = if muted { 0.55 * fade } else { fade * dim };
+        // Selected titles are large; pull back from pure white for less glare.
+        let selected_rgb = theme::mix(theme::INK, theme::MUTED, 0.28);
+        let base_rgb = theme::mix(theme::MUTED, selected_rgb, t);
+        let title_color = theme::alpha(base_rgb, title_alpha * (0.85 + 0.15 * t));
+        let title = text(title_string)
+            .size(size)
+            .color(title_color)
+            .font(Font {
+                weight: if bold { Weight::Bold } else { Weight::Normal },
+                ..Font::DEFAULT
+            })
+            .width(Length::Fixed(wrap_w))
+            .align_x(Alignment::Center)
+            .wrapping(iced::widget::text::Wrapping::Word);
+        let title: Element<'_, StartMessage> = container(title).width(Length::Fixed(wrap_w)).into();
+
+        let sub_alpha = if muted { 0.55 * fade } else { fade * dim };
+        let text_block = column![
+            title,
+            status_block(row, bold, muted, fade, sub_alpha, Some(wrap_w))
+        ]
+        .spacing(6)
+        .width(Length::Fixed(wrap_w))
+        .align_x(Alignment::Center);
+        // Center the (possibly narrower) text under the art within the fixed slot.
+        container(text_block)
+            .width(Length::Fixed(max_art_w))
+            .center_x(Length::Fixed(max_art_w))
+            .into()
+    } else {
+        // Art only on stages too short for the text budget: zero-height (no
+        // inter-block spacing); the slot box still carries the shared text
+        // budget (see `slot_child_size_h`), so the art stays on the shared
+        // centerline and the box bottom still meets the strip bottom.
+        container(space())
+            .width(Length::Fixed(max_art_w))
+            .height(Length::Shrink)
+            .into()
+    };
+
+    let art_cell = container(capsule)
+        .width(Length::Fixed(art_w))
+        .height(Length::Fixed(art_h));
+    // Fixed-width cell so every slot shares the same horizontal centerline.
+    let art = container(art_cell)
+        .width(Length::Fixed(max_art_w))
+        .center_x(Length::Fixed(max_art_w));
+
+    // Art-only slots carry no text gap (their child box is art-only too);
+    // text slots keep the art→text gap so neighbor titles sit one gap below
+    // the art like the selected title does below the strip.
+    let body_gap = if show_text { vstrip::H_TEXT_GAP } else { 0.0 };
+    let body = column![art, label]
+        .spacing(body_gap)
+        .width(Length::Fixed(max_art_w))
+        .height(Fill)
+        .align_x(Alignment::Center);
+
+    // Pad/keyboard navigate the strip — presentational slot (no mouse press/hover).
+    container(body).width(Fill).height(Fill).into()
+}
+
 fn strip_capsule<'a>(
     row: &'a StartRow,
     selected: bool,
     muted: bool,
     hero_ready: bool,
     fade: f32,
-    overlay: Option<Element<'a, StartMessage>>,
+    overlay: Option<(Element<'a, StartMessage>, f32)>,
 ) -> Element<'a, StartMessage> {
     // Subtle radius: image uses border_radius; card border matches for the ring.
     const HERO_RADIUS: f32 = 3.0;
@@ -674,8 +1060,11 @@ fn strip_capsule<'a>(
         theme::alpha(theme::LINE, 0.45 * fade)
     };
     let border_w = if selected { 2.0 } else { 1.0 };
+    // No fill: the slot fade rides on the art (see `art_fade`), so an
+    // opaque card behind it would read as a grey plate fading in instead
+    // of the art dissolving into the backdrop. The border already fades.
     let frame = move |_theme: &iced::Theme| iced::widget::container::Style {
-        background: Some(iced::Background::Color(theme::CONTENT)),
+        background: None,
         border: iced::Border {
             color: border,
             width: border_w,
@@ -684,7 +1073,8 @@ fn strip_capsule<'a>(
         ..iced::widget::container::Style::default()
     };
 
-    if let Some(hints) = overlay {
+    if let Some((hints, overlay_alpha)) = overlay {
+        let box_alpha = overlay_alpha.clamp(0.0, 1.0);
         let footer = container(hints)
             .width(Fill)
             .center_x(Fill)
@@ -694,10 +1084,10 @@ fn strip_capsule<'a>(
                 bottom: 10.0,
                 left: 12.0,
             })
-            .style(|_theme: &iced::Theme| iced::widget::container::Style {
+            .style(move |_theme: &iced::Theme| iced::widget::container::Style {
                 background: Some(iced::Background::Color(theme::alpha(
                     iced::Color::BLACK,
-                    0.82,
+                    0.82 * box_alpha,
                 ))),
                 border: iced::Border {
                     radius: iced::border::Radius {
@@ -755,26 +1145,34 @@ fn controllers_dock_host<'a>(
     // Nested rounded-rect: inner = outer − pad (never the same as the island).
     let row_radius = (island_radius - pad).max(0.0);
 
-    let mut list = column![].spacing(row_gap).width(Length::Fixed(DOCK_MAX_W));
-    if state.controllers.is_empty() {
-        list = list.push(dock_empty_row(details_w, row_h));
+    let list: Element<'_, StartMessage> = if state.controllers.is_empty() {
+        column![dock_empty_row(details_w, row_h)]
+            .spacing(row_gap)
+            .width(Length::Fixed(DOCK_MAX_W))
+            .into()
     } else {
-        for (i, row) in state.controllers.iter().enumerate() {
+        keyed_column(state.controllers.iter().enumerate().map(|(i, row)| {
             let selected =
                 i == state.controller_selected && matches!(state.slide, StartSlide::Controllers);
-            list = list.push(dock_controller_row(
-                row,
-                spectrum,
-                selected,
-                state.ring_flash_white(&row.serial),
-                details_w,
-                dock_progress,
-                row_h,
-                row_radius,
-                state,
-            ));
-        }
-    }
+            (
+                crate::ui::start::view::list_key(&row.serial),
+                dock_controller_row(
+                    row,
+                    spectrum,
+                    selected,
+                    state.ring_flash_white(&row.serial),
+                    details_w,
+                    dock_progress,
+                    row_h,
+                    row_radius,
+                    state,
+                ),
+            )
+        }))
+        .spacing(row_gap)
+        .width(Length::Fixed(DOCK_MAX_W))
+        .into()
+    };
 
     let full = container(list)
         .padding(Padding {
@@ -787,7 +1185,7 @@ fn controllers_dock_host<'a>(
 
     // Shrink so the floating island sizes to its rows (Fill collapses to 0 off a Fill parent).
     let revealed =
-        crate::ui::start::reveal::width_reveal(full, DOCK_MAX_W, visible_w).height(Length::Shrink);
+        crate::ui::reveal::width_reveal(full, DOCK_MAX_W, visible_w).height(Length::Shrink);
 
     container(revealed)
         .padding(Padding {
@@ -864,10 +1262,11 @@ fn dock_controller_row<'a>(
     row_radius: f32,
     state: &State,
 ) -> Element<'a, StartMessage> {
-    let powering_off = state
-        .powering_off
-        .as_ref()
-        .is_some_and(|s| s == &row.serial);
+    let powering_off = row.connected
+        && state
+            .powering_off
+            .as_ref()
+            .is_some_and(|s| s == &row.serial);
     let ring_color = if flash_white {
         theme::from_rgb(crate::controller::dualsense::lightbar::IDENTIFY_FLASH)
     } else if row.connected && !powering_off {

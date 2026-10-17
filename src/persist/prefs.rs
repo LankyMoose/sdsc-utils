@@ -112,6 +112,136 @@ pub const AUTO_OPEN_MODES: [StartAutoOpen; 3] = [
     StartAutoOpen::Any,
 ];
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImmersiveLayout {
+    #[default]
+    Vertical,
+    Horizontal,
+}
+
+impl ImmersiveLayout {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Vertical => Self::Horizontal,
+            Self::Horizontal => Self::Vertical,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Vertical => "Vertical",
+            Self::Horizontal => "Horizontal",
+        }
+    }
+}
+
+pub const IMMERSIVE_LAYOUT_MODES: [ImmersiveLayout; 2] =
+    [ImmersiveLayout::Vertical, ImmersiveLayout::Horizontal];
+
+/// How the start screen restores the game highlight (game axis only;
+/// controller selection persistence is out of scope and never gated).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartSelectionMode {
+    /// Match the stored `play_key` (default; survives reorders).
+    #[default]
+    ByGame,
+    /// Clamp the stored row index (`index.min(len - 1)`).
+    ByPosition,
+}
+
+impl StartSelectionMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::ByGame => Self::ByPosition,
+            Self::ByPosition => Self::ByGame,
+        }
+    }
+    pub fn next(self) -> Self {
+        self.cycle()
+    }
+    pub fn prev(self) -> Self {
+        self.cycle()
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ByGame => "By game",
+            Self::ByPosition => "By position",
+        }
+    }
+}
+
+impl std::fmt::Display for StartSelectionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+pub const SELECTION_MODES: [StartSelectionMode; 2] =
+    [StartSelectionMode::ByGame, StartSelectionMode::ByPosition];
+
+/// Immersive position-rail visibility.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavbarVisibility {
+    /// Auto-hide after 2s idle (default).
+    #[default]
+    WhenNavigating,
+    /// Rail stays pinned visible; the hide timer is skipped.
+    AlwaysOn,
+}
+
+impl NavbarVisibility {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::WhenNavigating => Self::AlwaysOn,
+            Self::AlwaysOn => Self::WhenNavigating,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WhenNavigating => "When navigating",
+            Self::AlwaysOn => "Always on",
+        }
+    }
+}
+
+pub const NAVBAR_MODES: [NavbarVisibility; 2] =
+    [NavbarVisibility::WhenNavigating, NavbarVisibility::AlwaysOn];
+
+/// Start-screen reduce-motion preference.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReducedMotion {
+    /// Follow the OS "Show animations" toggle (default).
+    #[default]
+    System,
+    /// Always skip movement animations (keep opacity fades).
+    On,
+    /// Always animate, ignoring the OS toggle.
+    Off,
+}
+
+impl ReducedMotion {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::System => Self::On,
+            Self::On => Self::Off,
+            Self::Off => Self::System,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::On => "On",
+            Self::Off => "Off",
+        }
+    }
+}
+
+pub const REDUCED_MOTION_MODES: [ReducedMotion; 3] =
+    [ReducedMotion::System, ReducedMotion::On, ReducedMotion::Off];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Prefs {
     #[serde(default = "default_true")]
@@ -178,9 +308,39 @@ pub struct Prefs {
     /// Start-screen games list sort (default last played).
     #[serde(default)]
     pub games_sort_mode: GamesSortMode,
+    /// Remember the start-screen game highlight across shell restarts.
+    /// Hidden feature, always off: no UI exposes it and `normalize` forces
+    /// it off on load. Off keeps the clamped index and never re-pins by key.
+    /// Game axis only; the controller axis is never gated.
+    #[serde(default)]
+    pub start_selection_persist: bool,
+    /// How the game highlight restores when persistence is on (default by game).
+    #[serde(default)]
+    pub start_selection_mode: StartSelectionMode,
     /// Controllers slide: include remembered disconnected pads (default off).
     #[serde(default)]
     pub show_all_controllers: bool,
+    #[serde(default)]
+    pub start_screen_immersive_layout: ImmersiveLayout,
+    /// Immersive position-rail visibility (default hides after 2s idle).
+    #[serde(default)]
+    pub start_screen_navbar: NavbarVisibility,
+    /// Start-screen movement animations (default follows the OS toggle).
+    #[serde(default)]
+    pub reduced_motion: ReducedMotion,
+    /// Throttle immersive Start to anim-driven frames only (default off = always 60Hz).
+    /// When on, an idle immersive Start subscribes to no `StartFrame` tick;
+    /// backdrop ken-burns freeze until input/nav/art wakes frames.
+    #[serde(default)]
+    pub perf_throttle_immersive: bool,
+    /// Renderer antialiasing (default on). Boot-only: applies on restart.
+    #[serde(default = "default_true")]
+    pub perf_antialiasing: bool,
+    /// Vsync present mode (default on). Boot-only: applies on restart.
+    #[serde(default = "default_true")]
+    pub perf_vsync: bool,
+    #[serde(default)]
+    pub extra_steam_paths: Vec<std::path::PathBuf>,
 }
 
 fn default_true() -> bool {
@@ -302,6 +462,17 @@ pub fn clamp_start_screen_idle_timeouts(idle_secs: u32, sleep_secs: u32) -> (u32
     (idle, sleep)
 }
 
+/// True when the live renderer prefs differ from the boot values, i.e. the UI
+/// must reload to apply them (AA/vsync are boot-only iced settings).
+pub fn renderer_restart_needed(
+    cur_aa: bool,
+    cur_vsync: bool,
+    boot_aa: bool,
+    boot_vsync: bool,
+) -> bool {
+    cur_aa != boot_aa || cur_vsync != boot_vsync
+}
+
 impl Default for Prefs {
     fn default() -> Self {
         Self {
@@ -327,7 +498,18 @@ impl Default for Prefs {
             start_screen_haptics_enabled: true,
             start_screen_haptics_strength: default_start_screen_haptics_strength(),
             games_sort_mode: GamesSortMode::default(),
+            // Hidden feature: selection persistence is always off (no UI).
+            // `normalize` forces it off so older prefs files converge too.
+            start_selection_persist: false,
+            start_selection_mode: StartSelectionMode::default(),
             show_all_controllers: false,
+            start_screen_immersive_layout: ImmersiveLayout::default(),
+            start_screen_navbar: NavbarVisibility::default(),
+            reduced_motion: ReducedMotion::default(),
+            perf_throttle_immersive: false,
+            perf_antialiasing: true,
+            perf_vsync: true,
+            extra_steam_paths: Vec::new(),
         }
     }
 }
@@ -409,15 +591,21 @@ impl Prefs {
         prefs.start_screen_gesture = default_gesture();
         match serde_json::to_vec_pretty(&prefs) {
             Ok(bytes) => {
-                if let Err(err) = fs::write(&path, bytes) {
-                    app_log::warn(format!("failed to write prefs: {err}"));
-                }
+                let _ = crate::persist::atomic::write_atomic_logged("prefs", &path, &bytes);
             }
             Err(err) => app_log::warn(format!("failed to serialize prefs: {err}")),
         }
     }
 
-    /// Clamp numeric prefs and force the reopen chord to PS.
+    /// Clamp numeric prefs, force the reopen chord to PS, and force the
+    /// hidden selection-persistence feature off.
+    pub fn normalized(mut self) -> Self {
+        self.normalize();
+        self
+    }
+
+    /// Clamp numeric prefs, force the reopen chord to PS, and force the
+    /// hidden selection-persistence feature off.
     fn normalize(&mut self) {
         self.low_battery_percent = clamp_low_battery_percent(self.low_battery_percent);
         self.start_screen_sound_volume =
@@ -433,6 +621,7 @@ impl Prefs {
         self.start_screen_inactive_secs = inactive;
         self.start_screen_sleep_secs = sleep;
         self.start_screen_gesture = default_gesture();
+        self.start_selection_persist = false;
     }
 }
 
@@ -599,6 +788,67 @@ mod tests {
     }
 
     #[test]
+    fn older_prefs_default_selection_persist_off_by_game() {
+        let prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(!prefs.start_selection_persist);
+        assert_eq!(prefs.start_selection_mode, StartSelectionMode::ByGame);
+        assert_eq!(
+            Prefs::default().start_selection_mode,
+            StartSelectionMode::ByGame
+        );
+    }
+
+    #[test]
+    fn selection_mode_cycles_and_labels() {
+        assert_eq!(
+            StartSelectionMode::ByGame.cycle(),
+            StartSelectionMode::ByPosition
+        );
+        assert_eq!(
+            StartSelectionMode::ByPosition.cycle(),
+            StartSelectionMode::ByGame
+        );
+        assert_eq!(
+            StartSelectionMode::ByGame.next(),
+            StartSelectionMode::ByPosition
+        );
+        assert_eq!(
+            StartSelectionMode::ByPosition.prev(),
+            StartSelectionMode::ByGame
+        );
+        assert_eq!(StartSelectionMode::ByGame.label(), "By game");
+        assert_eq!(StartSelectionMode::ByPosition.label(), "By position");
+        assert_eq!(
+            serde_json::to_string(&StartSelectionMode::ByGame).unwrap(),
+            r#""by_game""#
+        );
+        assert_eq!(
+            serde_json::to_string(&StartSelectionMode::ByPosition).unwrap(),
+            r#""by_position""#
+        );
+        for mode in SELECTION_MODES {
+            let encoded = serde_json::to_string(&mode).unwrap();
+            let decoded: StartSelectionMode = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, mode);
+        }
+    }
+
+    #[test]
+    fn selection_persist_is_always_off() {
+        // Raw files may still carry `true`; `normalize` (load path) forces it off.
+        let prefs: Prefs = serde_json::from_str(r#"{"start_selection_persist":false}"#).unwrap();
+        assert!(!prefs.start_selection_persist);
+        let prefs: Prefs = serde_json::from_str::<Prefs>(r#"{"start_selection_persist":true}"#)
+            .unwrap()
+            .normalized();
+        assert!(!prefs.start_selection_persist);
+        let prefs: Prefs =
+            serde_json::from_str(r#"{"start_selection_mode":"by_position"}"#).unwrap();
+        assert!(!prefs.start_selection_persist);
+        assert_eq!(prefs.start_selection_mode, StartSelectionMode::ByPosition);
+    }
+
+    #[test]
     fn missing_start_screen_always_immersive_defaults_on() {
         let prefs: Prefs =
             serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":["ps"]}"#)
@@ -744,5 +994,154 @@ mod tests {
         assert!(Prefs::default().start_screen_clock_enabled);
         let prefs: Prefs = serde_json::from_str(r#"{"start_screen_clock_enabled":false}"#).unwrap();
         assert!(!prefs.start_screen_clock_enabled);
+    }
+
+    #[test]
+    fn immersive_layout_round_trips_with_extra_steam_paths() {
+        let prefs = Prefs {
+            start_screen_immersive_layout: ImmersiveLayout::Horizontal,
+            extra_steam_paths: vec![PathBuf::from("/steam/extra")],
+            ..Prefs::default()
+        };
+        let encoded = serde_json::to_string(&prefs).unwrap();
+        let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.start_screen_immersive_layout,
+            ImmersiveLayout::Horizontal
+        );
+        assert_eq!(
+            decoded.extra_steam_paths,
+            vec![PathBuf::from("/steam/extra")]
+        );
+    }
+
+    #[test]
+    fn older_prefs_default_to_vertical_layout_and_no_extra_paths() {
+        let prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            prefs.start_screen_immersive_layout,
+            ImmersiveLayout::Vertical
+        );
+        assert!(prefs.extra_steam_paths.is_empty());
+        assert_eq!(
+            Prefs::default().start_screen_immersive_layout,
+            ImmersiveLayout::Vertical
+        );
+        assert!(Prefs::default().extra_steam_paths.is_empty());
+    }
+
+    #[test]
+    fn navbar_visibility_round_trips() {
+        let prefs = Prefs {
+            start_screen_navbar: NavbarVisibility::AlwaysOn,
+            ..Prefs::default()
+        };
+        let encoded = serde_json::to_string(&prefs).unwrap();
+        let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.start_screen_navbar, NavbarVisibility::AlwaysOn);
+    }
+
+    #[test]
+    fn older_prefs_default_to_when_navigating_navbar() {
+        let prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(prefs.start_screen_navbar, NavbarVisibility::WhenNavigating);
+        assert_eq!(
+            Prefs::default().start_screen_navbar,
+            NavbarVisibility::WhenNavigating
+        );
+        assert_eq!(
+            NavbarVisibility::WhenNavigating.cycle(),
+            NavbarVisibility::AlwaysOn
+        );
+        assert_eq!(
+            NavbarVisibility::AlwaysOn.cycle(),
+            NavbarVisibility::WhenNavigating
+        );
+        assert_eq!(NavbarVisibility::WhenNavigating.label(), "When navigating");
+        assert_eq!(NavbarVisibility::AlwaysOn.label(), "Always on");
+        assert_eq!(
+            serde_json::to_string(&NavbarVisibility::WhenNavigating).unwrap(),
+            r#""when_navigating""#
+        );
+        assert_eq!(
+            serde_json::to_string(&NavbarVisibility::AlwaysOn).unwrap(),
+            r#""always_on""#
+        );
+    }
+
+    #[test]
+    fn reduced_motion_round_trips() {
+        let prefs = Prefs {
+            reduced_motion: ReducedMotion::On,
+            ..Prefs::default()
+        };
+        let encoded = serde_json::to_string(&prefs).unwrap();
+        let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.reduced_motion, ReducedMotion::On);
+    }
+
+    #[test]
+    fn older_prefs_default_to_system_reduced_motion() {
+        let prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(prefs.reduced_motion, ReducedMotion::System);
+        assert_eq!(Prefs::default().reduced_motion, ReducedMotion::System);
+        assert_eq!(ReducedMotion::System.cycle(), ReducedMotion::On);
+        assert_eq!(ReducedMotion::On.cycle(), ReducedMotion::Off);
+        assert_eq!(ReducedMotion::Off.cycle(), ReducedMotion::System);
+        assert_eq!(ReducedMotion::System.label(), "System");
+        assert_eq!(ReducedMotion::On.label(), "On");
+        assert_eq!(ReducedMotion::Off.label(), "Off");
+        assert_eq!(
+            serde_json::to_string(&ReducedMotion::System).unwrap(),
+            r#""system""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ReducedMotion::On).unwrap(),
+            r#""on""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ReducedMotion::Off).unwrap(),
+            r#""off""#
+        );
+        // Every committed value round-trips through the modes table.
+        for mode in REDUCED_MOTION_MODES {
+            let encoded = serde_json::to_string(&mode).unwrap();
+            let decoded: ReducedMotion = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, mode);
+        }
+    }
+
+    #[test]
+    fn perf_prefs_round_trip() {
+        let prefs = Prefs {
+            perf_throttle_immersive: true,
+            perf_antialiasing: false,
+            perf_vsync: false,
+            ..Prefs::default()
+        };
+        let encoded = serde_json::to_string(&prefs).unwrap();
+        let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
+        assert!(decoded.perf_throttle_immersive);
+        assert!(!decoded.perf_antialiasing);
+        assert!(!decoded.perf_vsync);
+    }
+
+    #[test]
+    fn older_prefs_default_perf_flags() {
+        let prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(!prefs.perf_throttle_immersive);
+        assert!(prefs.perf_antialiasing);
+        assert!(prefs.perf_vsync);
+        assert!(!Prefs::default().perf_throttle_immersive);
+        assert!(Prefs::default().perf_antialiasing);
+        assert!(Prefs::default().perf_vsync);
+    }
+
+    #[test]
+    fn renderer_restart_needed_only_on_boot_mismatch() {
+        assert!(!renderer_restart_needed(true, true, true, true));
+        assert!(renderer_restart_needed(false, true, true, true));
+        assert!(renderer_restart_needed(true, false, true, true));
+        assert!(renderer_restart_needed(false, false, true, true));
     }
 }

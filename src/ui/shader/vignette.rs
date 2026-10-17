@@ -18,6 +18,10 @@ pub fn reset_pipeline_diag() {
 pub struct VignetteUniforms {
     pub strength: f32,
     pub _pad: [f32; 3],
+    /// `[width_px, height_px, corner_radius_px, _]`. Filled in `prepare`
+    /// from the widget bounds × scale; radius 0 keeps the output square
+    /// (today's immersive behavior).
+    pub mask: [f32; 4],
 }
 
 impl VignetteUniforms {
@@ -25,20 +29,42 @@ impl VignetteUniforms {
         Self {
             strength: strength.clamp(0.0, 1.0),
             _pad: [0.0; 3],
+            mask: [0.0; 4],
         }
+    }
+
+    /// Copy with the corner mask resolved for a widget of `bounds` (logical)
+    /// at `scale`; `radius` is logical px.
+    fn with_mask(mut self, bounds: &Rectangle, scale: f32, radius: f32) -> Self {
+        self.mask = [
+            bounds.width * scale,
+            bounds.height * scale,
+            radius.max(0.0) * scale,
+            0.0,
+        ];
+        self
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct VignetteProgram {
     pub uniforms: VignetteUniforms,
+    /// Logical corner radius for transparent rounded windows (0 = square).
+    pub corner_radius: f32,
 }
 
 impl VignetteProgram {
     pub fn new(strength: f32) -> Self {
         Self {
             uniforms: VignetteUniforms::new(strength),
+            corner_radius: 0.0,
         }
+    }
+
+    /// Mask the output to a rounded rect (transparent corners).
+    pub fn rounded(mut self, radius: f32) -> Self {
+        self.corner_radius = radius.max(0.0);
+        self
     }
 }
 
@@ -54,6 +80,7 @@ impl<Message> shader::Program<Message> for VignetteProgram {
     ) -> Self::Primitive {
         VignettePrimitive {
             uniforms: self.uniforms,
+            corner_radius: self.corner_radius,
         }
     }
 }
@@ -61,6 +88,7 @@ impl<Message> shader::Program<Message> for VignetteProgram {
 #[derive(Debug)]
 pub struct VignettePrimitive {
     uniforms: VignetteUniforms,
+    corner_radius: f32,
 }
 
 impl shader::Primitive for VignettePrimitive {
@@ -71,10 +99,13 @@ impl shader::Primitive for VignettePrimitive {
         pipeline: &mut VignettePipeline,
         _device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _bounds: &Rectangle,
-        _viewport: &Viewport,
+        bounds: &Rectangle,
+        viewport: &Viewport,
     ) {
-        pipeline.update(queue, &self.uniforms);
+        let uniforms = self
+            .uniforms
+            .with_mask(bounds, viewport.scale_factor(), self.corner_radius);
+        pipeline.update(queue, &uniforms);
     }
 
     fn draw(&self, pipeline: &VignettePipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
@@ -193,7 +224,22 @@ mod tests {
     }
 
     #[test]
-    fn uniforms_size_is_16_bytes() {
-        assert_eq!(std::mem::size_of::<VignetteUniforms>(), 16);
+    fn uniforms_size_matches_wgsl_layout() {
+        // strength + pad vec4 + mask vec4 (16-byte aligned).
+        assert_eq!(std::mem::size_of::<VignetteUniforms>(), 32);
+    }
+
+    #[test]
+    fn mask_scales_to_physical_pixels() {
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 380.0,
+            height: 200.0,
+        };
+        let u = VignetteUniforms::new(0.55).with_mask(&bounds, 1.5, 12.0);
+        assert_eq!(u.mask, [570.0, 300.0, 18.0, 0.0]);
+        // Default (immersive) stays square.
+        assert_eq!(VignetteUniforms::new(0.55).mask, [0.0; 4]);
     }
 }

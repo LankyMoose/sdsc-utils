@@ -43,7 +43,6 @@ impl Connection {
         matches!(self, Self::Bluetooth)
     }
 
-    #[allow(dead_code)]
     pub fn from_label(label: &str) -> Option<Self> {
         match label {
             "USB" | "usb" => Some(Self::Usb),

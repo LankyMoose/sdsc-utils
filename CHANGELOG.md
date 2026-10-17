@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Unified "immersive" visual language across the app: floating glass cards, rounded corners, and the same ambient shader backdrop in the controllers popup, Settings, toasts, and compact Start.
+- Presentation now prefers Vulkan with DX12 as fallback, so transparent rounded windows composite correctly; on DX12-only systems the settings window falls back to a rounded, opaque DWM frame.
+- Toasts are rounded glass cards with a soft shadow and a rounded accent rail.
+- Settings window is larger (720×520) with a floating sidebar, grouped cards, and consistent toggles and sliders.
+- `SDSC_DEBUG_OPEN` (debug builds): open specific windows at boot; quiet mode moves them to the secondary monitor without focus and mutes sounds/haptics.
+- Immersive Start settings gains a position-rail visibility selector (`When navigating` default / `Always on`, persisted): `Always on` keeps the section rail visible instead of auto-hiding it after navigation idle.
+- Immersive Start settings gains a **Reduced motion** selector (`System` default / `On` / `Off`, persisted): when effective, all Start-screen movement snaps instantly — carousel/dock/strip slides, drawer travel, rail slide, layout-transition travel, status-chip travel, backdrop pan/zoom, press glides — while fades, dims, and veils keep animating. `System` follows Windows' "Show animations" accessibility toggle live (other OSes have no probe and treat `System` as reduced).
+- **Developer mode (debug-only):** Diagnostics gains a non-persisted "Display layout bounding boxes" toggle (or F9) that outlines Start-screen and Settings-drawer containers (magenta) and fixed/clamped-width elements (cyan) for layout debugging. Off by default, never saved; compiled out of release builds.
+
+### Changed
+
+- Lightbar spectrum editor bars and handles are rounded; the saturation square has rounded corners.
+- Remember is now a pin toggle icon in the popup row.
+- The developer emulator and other debug-only tooling ship in every non-release build (`cfg(debug_assertions)`) instead of behind the `dev-emulate` Cargo feature or a `--dev` flag — a plain `cargo run` now has the Configure → Controllers section. Release builds still exclude it.
+- Configure's debug tools move under a **Developer mode** caption so they are clearly separated from the shipped settings.
+- **Developer mode:** the Developer tab is now **Controllers**, with a compact row per emulated controller you can add, remove, and drive: a connection switch, and a chevron that expands that pad's controls inline — a battery slider that snaps to the levels a DualSense actually reports, a link picker (USB charges, Bluetooth runs down), and battery-analytics actions (seed estimates, walk the charge/drain cycle). Commands address pads by serial, so an action can never land on the wrong pad.
+- **Developer mode:** a pad's **charge state is derived from its link**, the way the hardware reports it — USB charges (and reports full once it tops off), Bluetooth discharges. There is no separate charge-state picker, so the emulator can no longer describe states real hardware cannot be in; each link chip shows the state it implies. New emulated controllers are created remembered but **disconnected**, so adding one does not fire a connect toast or open Start. A per-pad switch plugs them in and out through the normal connect/disconnect path, so toasts and the Start-open preference behave as they would for real hardware. Battery changes on a **connected** pad are previewed and published after a one-second debounce, with a spinner while they wait, so a drag cannot spam preference-driven notifications; a disconnected pad is not published at all, so its slider applies immediately. Unplugging a pad mid-debounce cancels the pending change.
+- **Fixed:** emulated controllers added via the Developer emulator no longer appear in the normal controller lists after a restart while vanishing from the Controllers tab. The tab's fleet is now rebuilt from remembered emulated serials at startup, restoring each pad's level and link — switched off, so a restart never fires a connect toast or opens Start unbidden.
+- **Developer mode:** emulated controllers get the same **remember** pin real controllers have. A pad's row offers "Forget this controller"; forgetting takes effect immediately — the pad leaves the remembered list and from disk, exactly as `toggle_remember` behaves for real hardware. A pad that is both unplugged and forgotten disappears from the tab, so the two are symmetric: forget an unplugged pad and it goes now, unplug a forgotten pad and it goes then. A merely unplugged pad stays listed so you can plug it back in.
+- Horizontal immersive Start centers every cover by its art (neighbors no longer ride above the selection) and fades neighbors to transparent instead of grey.
+- Horizontal immersive strip: neighbor covers now sag downward with distance (cover-flow arc mirroring the vertical strip), keeping clock clearance.
+- Immersive selected-hero cue box (Playing/membership + face hints over the art) now crossfades with the strip scroll instead of popping in and out.
+- Single process: tray, DualSense HID, session, and the iced UI now run in one `sdsc-utils` process instead of a service + shell pair over IPC. The `sdsc-shell` binary, the `src/ipc` transport, the `src/service` host loop, and the portable shell-bundling are gone; packaging (MSIX, portable, release workflow) ships one exe. The retained-snapshot / intent-sync protocol is replaced by direct calls into `DeviceSession`; renderer-pref reload relaunches with an internal `--replace` flag that retries the single-instance guard while the old process exits.
+- Start hint rings (face-button circles + hold-progress arcs) render as SVG instead of per-glyph `canvas` layers: static states rasterize once, hold sweeps mint a bounded handle set, so steady-state frames do no vector work. Hold arcs complete to a full white-hot ring at 100% (a same-point arc draws nothing in SVG) blending ACCENT → INK while armed, and the idle track is lightened to compensate resvg AA coverage. The face pictogram box snaps to whole pixels so the button icon stays concentric with its ring.
+
+### Fixed
+
+- Horizontal immersive Start draws the selected game's title and subtitle inside its cover, like its neighbors, so they scroll with the card instead of crossfading in a separate full-width layer.
+- Popup no longer shows a stale remembered battery `%` after a full-charge + USB unplug (disk was already correct): remembered records now converge through the single in-process session instead of boot-time copies.
+- Intermittent test failure (~1 run in 150) from a shared-global race: the art-worker's shutdown test wiped the process-wide icon cache while a concurrent icon-cache test was mid-assertion, so a successful decode reported as missing. The shutdown test now takes the same lock the other cache tests use.
+- Horizontal immersive Start no longer clips the selected game's Update badge (or long two-line title + meta stacks) at the strip edge: the in-slot text reserve grows 150 → 160 with breathing room reduced equally, so cover size and neighbor counts are unchanged. Outer-peek cards (`d>=2`) now show their title + subtitle too, at their own art-width wrap in smaller type so adjacent titles can never overlap (previously art-only by design).
+
 ## [1.6.1] - 2026-10-07
 
 ### Added

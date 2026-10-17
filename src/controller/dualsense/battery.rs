@@ -208,6 +208,26 @@ pub fn percent_from_level(level: u8, state: PowerState) -> u8 {
     }
 }
 
+/// Every percent a DualSense can actually report: the firmware's 11 coarse
+/// levels mid-pointed by [`percent_from_level`].
+///
+/// UI that must land on an observable value (the developer emulator's battery
+/// slider) should pick from this rather than any 0–100 integer.
+pub const OBSERVABLE_PERCENTS: [u8; MAX_POWER_LEVEL as usize + 1] =
+    [5, 15, 25, 35, 45, 55, 65, 75, 85, 95, 100];
+
+/// Inverse of [`percent_from_level`]: the firmware level whose 10% bucket
+/// contains `percent`.
+///
+/// Level `L` covers `L*10 … L*10+9`, so 12% and 15% both come from level 1.
+/// Clamps into range; 100% is the full level.
+pub fn level_from_percent(percent: u8) -> u8 {
+    match percent {
+        100 => MAX_POWER_LEVEL,
+        p => (u16::from(p) / 10).min(9) as u8,
+    }
+}
+
 fn request_full_bt_report(device: &HidDevice) -> Result<(), hidapi::HidError> {
     let mut feature = vec![0u8; CALIBRATION_FEATURE_SIZE];
     feature[0] = CALIBRATION_FEATURE_REPORT;
@@ -341,6 +361,45 @@ fn power_off_bluetooth_unlocked_timed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observable_percents_are_the_firmware_midpoints() {
+        // The only values a DualSense can actually report.
+        assert_eq!(
+            OBSERVABLE_PERCENTS,
+            [5, 15, 25, 35, 45, 55, 65, 75, 85, 95, 100]
+        );
+        for (level, percent) in OBSERVABLE_PERCENTS.iter().enumerate() {
+            assert_eq!(
+                percent_from_level(level as u8, PowerState::Discharging),
+                *percent,
+                "level {level}"
+            );
+        }
+        // Fully charged is the only other reported value.
+        assert_eq!(percent_from_level(0, PowerState::Complete), 100);
+    }
+
+    #[test]
+    fn level_from_percent_inverts_the_mapping() {
+        for (level, percent) in OBSERVABLE_PERCENTS.iter().enumerate() {
+            assert_eq!(
+                level_from_percent(*percent),
+                level as u8,
+                "percent {percent}"
+            );
+        }
+        // Values inside a bucket map to that bucket's level, not the midpoint below.
+        assert_eq!(level_from_percent(0), 0);
+        assert_eq!(level_from_percent(4), 0);
+        assert_eq!(level_from_percent(9), 0);
+        assert_eq!(level_from_percent(10), 1);
+        assert_eq!(level_from_percent(14), 1);
+        assert_eq!(level_from_percent(57), 5);
+        assert_eq!(level_from_percent(99), 9);
+        // Anything past the last midpoint is the full level.
+        assert_eq!(level_from_percent(100), MAX_POWER_LEVEL);
+    }
 
     #[test]
     fn parse_battery_from_usb_and_bt_reports() {

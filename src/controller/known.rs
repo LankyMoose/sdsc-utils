@@ -136,11 +136,9 @@ impl KnownControllers {
 
         match serde_json::to_vec_pretty(&file) {
             Ok(bytes) => {
-                if let Err(err) = fs::write(&path, bytes) {
-                    app_log::warn(format!("failed to write controllers: {err}"));
-                    return;
+                if crate::persist::atomic::write_atomic_logged("controllers", &path, &bytes) {
+                    self.dirty = false;
                 }
-                self.dirty = false;
             }
             Err(err) => app_log::warn(format!("failed to serialize controllers: {err}")),
         }
@@ -289,6 +287,77 @@ mod tests {
         assert!(!store.remember(&pad("", 50, Connection::Usb)));
         assert!(!store.is_remembered("unknown"));
         assert!(!store.is_remembered(""));
+    }
+
+    /// The bug this guards: an emulated pad added in one run was remembered
+    /// (so it lingered in the popup's controller list) but was never fed back
+    /// into the Controllers-tab fleet, leaving it listed nowhere it could be
+    /// edited. Rehydration reads the remembered store at boot.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn emulated_pads_survive_into_the_fleet() {
+        let mut store = KnownControllers::default();
+        store.remember(&pad("emu-1", 40, Connection::Bluetooth));
+        store.remember(&pad("REAL-xyz", 70, Connection::Usb));
+
+        // `remembered_disconnected` is the boot-time view (no live list yet).
+        let remembered: Vec<(String, u8, Connection)> = store
+            .remembered_disconnected(&[])
+            .into_iter()
+            .map(|r| {
+                (
+                    r.serial.clone(),
+                    r.percent,
+                    Connection::from_label(&r.connection).expect("persisted link parses"),
+                )
+            })
+            .collect();
+
+        let fleet = crate::controller::emulate::rehydrate(&remembered);
+        let serials: Vec<&str> = fleet.iter().map(|p| p.serial()).collect();
+        assert_eq!(
+            serials,
+            vec!["emu-1"],
+            "real hardware is not an emulated pad"
+        );
+        assert_eq!(fleet[0].status.percent, 40);
+        assert!(
+            !fleet[0].connected,
+            "a remembered pad is not a plugged-in one"
+        );
+        assert!(
+            fleet[0].remembered,
+            "anything read back from the store is remembered by construction"
+        );
+    }
+
+    /// Forgetting a pad must *remove* it from the store, not merely stop it
+    /// being updated — otherwise it would still reappear after a restart.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn forgetting_a_pad_keeps_it_out_of_the_next_boot() {
+        let mut store = KnownControllers::default();
+        store.remember(&pad("emu-1", 40, Connection::Bluetooth));
+        assert!(store.is_remembered("emu-1"));
+
+        assert!(store.forget("emu-1"));
+        assert!(!store.is_remembered("emu-1"));
+
+        let remembered: Vec<(String, u8, Connection)> = store
+            .remembered_disconnected(&[])
+            .into_iter()
+            .map(|r| {
+                (
+                    r.serial.clone(),
+                    r.percent,
+                    Connection::from_label(&r.connection).expect("parses"),
+                )
+            })
+            .collect();
+        assert!(
+            crate::controller::emulate::rehydrate(&remembered).is_empty(),
+            "a forgotten pad must not come back after a restart"
+        );
     }
 
     #[test]

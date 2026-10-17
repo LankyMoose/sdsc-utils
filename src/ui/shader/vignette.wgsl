@@ -4,6 +4,9 @@ struct Uniforms {
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
+    // x, y = widget size in physical px; z = corner radius in physical px
+    // (0 = square — immersive). w unused.
+    mask: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -38,7 +41,18 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // Prefer max for a rectangular frame; light corner boost without a hard box.
     let edge = max(ax, ay);
     let corner = ax * ay;
-    let alpha = clamp(edge * 0.55 + corner * 0.20, 0.0, 0.50) * clamp(u.strength, 0.0, 1.0);
+    var alpha = clamp(edge * 0.55 + corner * 0.20, 0.0, 0.50) * clamp(u.strength, 0.0, 1.0);
+    // Rounded window corners (transparent windows): fade the overlay out with
+    // a 1px AA edge so it never paints over the masked-transparent corners.
+    let r = u.mask.z;
+    if (r > 0.0) {
+        let size = u.mask.xy;
+        let q = uv * size - size * 0.5;
+        let half = size * 0.5;
+        let d_q = abs(q) - half + vec2<f32>(r, r);
+        let d = length(max(d_q, vec2<f32>(0.0, 0.0))) + min(max(d_q.x, d_q.y), 0.0) - r;
+        alpha *= clamp(0.5 - d, 0.0, 1.0);
+    }
     // Straight-alpha black; pipeline uses ALPHA_BLENDING.
     return vec4<f32>(0.0, 0.0, 0.0, alpha);
 }

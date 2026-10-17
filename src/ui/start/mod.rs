@@ -1,15 +1,17 @@
+#[cfg(debug_assertions)]
+pub mod ambient_tune;
 pub mod art_worker;
 pub mod carousel;
 pub mod clock;
 pub mod cursor_hide;
 pub mod gesture;
+pub mod hint_ring;
 pub mod icon_cache;
 pub mod idle;
 pub mod immersive;
 pub mod input;
 pub mod mode;
 pub mod position;
-pub mod reveal;
 pub mod settings;
 pub mod translate;
 pub mod view;

@@ -15,7 +15,7 @@ pub const SCREEN_MARGIN: f32 = 8.0;
 pub const TOAST_SLIDE_DURATION: std::time::Duration = std::time::Duration::from_millis(250);
 /// Max wall time applied per toast animation frame (~2× the ~16ms UI tick).
 /// Caps a stalled frame so slide-in cannot jump to the rest pose in one tick.
-pub const TOAST_SLIDE_MAX_FRAME_DT: std::time::Duration = std::time::Duration::from_millis(32);
+pub const TOAST_SLIDE_MAX_FRAME_DT: std::time::Duration = crate::ui::motion::MAX_FRAME_DT;
 
 /// Screen rectangle of the tray icon, in physical pixels.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
@@ -102,6 +102,67 @@ pub fn show_toast_without_activate<Message: Send + 'static>(id: window::Id) -> T
         window::set_mode(id, window::Mode::Windowed)
             .chain(window::set_level(id, window::Level::AlwaysOnTop))
     }
+}
+
+/// Debug quiet mode: relocate to the secondary monitor and show without
+/// activating (see [`crate::platform::debug_quiet`]).
+#[cfg(windows)]
+fn quiet_show<Message: Send + 'static>(id: window::Id, show: bool) -> Task<Message> {
+    window::run(id, move |window| {
+        use window::raw_window_handle::RawWindowHandle;
+
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
+            return;
+        };
+        let hwnd = win32_handle.hwnd.get();
+        unsafe {
+            win32::move_to_secondary_monitor(hwnd);
+            if show {
+                win32::apply_noactivate_exstyle(hwnd, true);
+                win32::ShowWindow(hwnd, win32::SW_SHOWNOACTIVATE);
+            }
+        }
+    })
+    .discard()
+}
+
+/// Give a UI window focus (`window::gain_focus`). In debug quiet mode it is
+/// shown on the secondary monitor without activation instead.
+pub fn focus_window<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+    #[cfg(windows)]
+    if crate::platform::debug_quiet::enabled() {
+        return quiet_show(id, true);
+    }
+    window::gain_focus(id)
+}
+
+/// Show a hidden UI window (`Mode::Windowed`). Quiet mode: no activation,
+/// secondary monitor.
+pub fn show_window<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+    #[cfg(windows)]
+    if crate::platform::debug_quiet::enabled() {
+        return quiet_show(id, true);
+    }
+    window::set_mode(id, window::Mode::Windowed)
+}
+
+/// Move a window (`window::move_to`, primary-monitor logical coords). Quiet
+/// mode re-applies the secondary-monitor offset after the move.
+pub fn move_window<Message: Send + 'static>(id: window::Id, position: Point) -> Task<Message> {
+    #[cfg(windows)]
+    if crate::platform::debug_quiet::enabled() {
+        return window::move_to(id, position).chain(quiet_show(id, false));
+    }
+    window::move_to(id, position)
+}
+
+/// Whether newly opened UI windows should start visible (false in quiet mode
+/// so they never activate on creation; [`focus_window`] shows them).
+pub fn open_visible() -> bool {
+    !crate::platform::debug_quiet::enabled()
 }
 
 /// Re-assert toast topmost (e.g. after Settings / Start / popup open or close).
@@ -359,9 +420,7 @@ pub fn toast_local_in_cover(
     Point::new(placement.x - cover.x, screen_y - cover.y)
 }
 
-pub fn ease_out_cubic(progress: f32) -> f32 {
-    1.0 - (1.0 - progress).powi(3)
-}
+pub use crate::ui::motion::ease_out_cubic;
 
 /// Advance toast slide elapsed with a per-frame cap so a UI stall cannot skip
 /// the rest of the animation in one tick.
@@ -372,15 +431,7 @@ pub fn advance_toast_slide(
     raw_dt: std::time::Duration,
     duration: std::time::Duration,
 ) -> (std::time::Duration, f32, bool) {
-    let capped = raw_dt > TOAST_SLIDE_MAX_FRAME_DT;
-    let dt = raw_dt.min(TOAST_SLIDE_MAX_FRAME_DT);
-    let new_elapsed = elapsed.saturating_add(dt);
-    let progress = if duration.is_zero() {
-        1.0
-    } else {
-        (new_elapsed.as_secs_f32() / duration.as_secs_f32()).min(1.0)
-    };
-    (new_elapsed, progress, capped)
+    crate::ui::motion::advance_capped(elapsed, raw_dt, duration)
 }
 
 /// Primary-monitor full cover in logical pixels (taskbar included).
@@ -514,7 +565,7 @@ pub fn overlay_platform_specific() -> window::settings::PlatformSpecific {
         drag_and_drop: false,
         skip_taskbar: true,
         undecorated_shadow: false,
-        corner_preference: window::settings::platform::CornerPreference::DoNotRound,
+        corner_preference: crate::ui::chrome::corner_preference(),
     }
 }
 
@@ -531,7 +582,7 @@ pub fn window_platform_specific() -> window::settings::PlatformSpecific {
         // Match the popup: DWM undecorated shadows flash white on close when the
         // wgpu surface is destroyed before the HWND is gone.
         undecorated_shadow: false,
-        corner_preference: window::settings::platform::CornerPreference::DoNotRound,
+        corner_preference: crate::ui::chrome::corner_preference(),
     }
 }
 

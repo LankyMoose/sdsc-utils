@@ -71,15 +71,15 @@ pub struct StepSample {
 
 /// New persisted fields need `#[serde(default)]` (or the oldest-shape fixture fails).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct SerialRecord {
+pub struct SerialRecord {
     #[serde(default)]
-    last_seen_ms: u64,
+    pub last_seen_ms: u64,
     #[serde(default)]
-    drain_steps: Vec<StepSample>,
+    pub drain_steps: Vec<StepSample>,
     #[serde(default)]
-    charge_steps: Vec<StepSample>,
+    pub charge_steps: Vec<StepSample>,
     #[serde(default)]
-    in_progress: Option<InProgressBucket>,
+    pub in_progress: Option<InProgressBucket>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,11 +173,9 @@ impl AnalyticsStore {
         };
         match serde_json::to_vec_pretty(&file) {
             Ok(bytes) => {
-                if let Err(err) = fs::write(&path, bytes) {
-                    app_log::warn(format!("failed to write analytics: {err}"));
-                    return;
+                if crate::persist::atomic::write_atomic_logged("analytics", &path, &bytes) {
+                    self.dirty = false;
                 }
-                self.dirty = false;
             }
             Err(err) => app_log::warn(format!("failed to serialize analytics: {err}")),
         }
@@ -198,7 +196,7 @@ impl AnalyticsStore {
         if !crate::controller::dualsense::identity::is_storable_serial(serial) {
             return false;
         }
-        #[cfg(not(feature = "dev-emulate"))]
+        #[cfg(not(debug_assertions))]
         if serial.starts_with("emu-") {
             return false;
         }
@@ -239,7 +237,7 @@ impl AnalyticsStore {
     }
 
     /// Developer helper: seed full drain/charge step chains so ETA UI can be checked.
-    #[cfg(feature = "dev-emulate")]
+    #[cfg(debug_assertions)]
     pub fn dev_seed_estimates(&mut self, serial: &str) {
         if !Self::is_storable_serial(serial) {
             return;
@@ -264,7 +262,7 @@ impl AnalyticsStore {
     }
 
     /// Developer helper: credit active time on the in-progress bucket.
-    #[cfg(feature = "dev-emulate")]
+    #[cfg(debug_assertions)]
     pub fn dev_credit_active(&mut self, serial: &str, extra: Duration) {
         let Some(record) = self.by_serial.get_mut(serial) else {
             return;

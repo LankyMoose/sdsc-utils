@@ -5,7 +5,8 @@
 //! Nothing is drawn through a label, and there is no thumb. The active section
 //! stays vertically centered. Neighbors fall off in scale and opacity, and the
 //! column translates vertically over the strip-scroll duration (no X offset).
-//! Show/hide slides in from the left and out to the left ([`HIDE_AFTER_MS`]
+//! Show/hide slides in from the left and out to the left for the vertical rail
+//! (from the bottom and out to the bottom for the horizontal rail; [`HIDE_AFTER_MS`]
 //! idle, then [`FADE_MS`]). Opacity uses the shorter [`OPACITY_MS`], so it
 //! leads the slide and finishes first.
 
@@ -15,6 +16,7 @@ use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::{Element, Font, Length, Pixels, Point, Rectangle, Renderer, Theme, Vector};
 
 use crate::ui::layout::ease_out_cubic;
+use crate::ui::start::vstrip::StripOrientation;
 use crate::ui::theme;
 
 /// Column width for the centered label stack (room for mono uppercase labels).
@@ -63,11 +65,14 @@ pub struct BarSpec {
     pub reveal: f32,
     /// Settled show/hide opacity, used when [`motion`](Self::motion) is `None`.
     pub show_opacity: f32,
-    /// 0 = slid off the left edge, 1 = resting. Used when [`motion`](Self::motion) is `None`.
+    /// 0 = slid off the edge, 1 = resting. Used when [`motion`](Self::motion) is `None`.
+    /// Vertical slides off the left edge; horizontal slides off the bottom edge.
     pub slide: f32,
     /// In-flight show/hide. Draw samples this every frame so the slide is not
     /// stuck to the 16ms UI tick.
     pub motion: Option<ShowHide>,
+    /// Strip axis this bar tracks. Defaults to [`StripOrientation::Vertical`].
+    pub orientation: StripOrientation,
 }
 
 /// One show/hide chase. `to` is 0 (hide) or 1 (show).
@@ -296,9 +301,13 @@ pub fn local_utc_offset_secs() -> i32 {
 }
 
 pub fn view<Message: 'static>(spec: BarSpec) -> Element<'static, Message> {
+    let (width, height) = match spec.orientation {
+        StripOrientation::Vertical => (Length::Fixed(WIDTH), Length::Fill),
+        StripOrientation::Horizontal => (Length::Fill, Length::Fixed(WIDTH)),
+    };
     iced::widget::canvas(PositionBar { spec })
-        .width(Length::Fixed(WIDTH))
-        .height(Length::Fill)
+        .width(width)
+        .height(height)
         .into()
 }
 
@@ -336,82 +345,26 @@ impl<Message> canvas::Program<Message> for PositionBar {
         let (slide, show_opacity) = self.spec.slide_opacity_at(std::time::Instant::now());
         let opacity = (self.spec.reveal * show_opacity).clamp(0.0, 1.0);
         let slide = slide.clamp(0.0, 1.0);
-        if opacity < 0.01 || slide < 0.01 || bounds.height < 8.0 || self.spec.labels.is_empty() {
+        // The scroll axis needs room; the cross axis is always the fixed 120px rail.
+        let scroll_len = match self.spec.orientation {
+            StripOrientation::Vertical => bounds.height,
+            StripOrientation::Horizontal => bounds.width,
+        };
+        if opacity < 0.01 || slide < 0.01 || scroll_len < 8.0 || self.spec.labels.is_empty() {
             return Vec::new();
         }
         let mut frame = Frame::new(renderer, bounds.size());
         // Clip to the column, then shift gap lines and labels together so
-        // show/hide travels off the left edge.
+        // show/hide travels off the bar edge (left for vertical, bottom for horizontal).
         let region = Rectangle::new(Point::ORIGIN, bounds.size());
-        frame.with_clip(region, |frame| {
-            frame.translate(Vector::new((slide - 1.0) * bounds.width, 0.0));
-
-            let count = self.spec.labels.len();
-            let center_y = bounds.height * 0.5;
-            let axis_x = column_axis(bounds.width);
-            let visual = self.spec.visual.clamp(0.0, (count - 1) as f32);
-            let base_h = base_h_for_bar(bounds.height);
-            let placed = label_positions(count, visual, center_y, base_h);
-
-            // One vertical line in the gap between each pair of sections, on the
-            // same axis as the labels. No line through a label, and no thumb.
-            for i in 0..count.saturating_sub(1) {
-                let Some((rel0, rel1)) = gap_line(i, count, visual, base_h) else {
-                    continue;
-                };
-                let y0 = center_y + rel0;
-                let y1 = center_y + rel1;
-                if y1 < -8.0 || y0 > bounds.height + 8.0 {
-                    continue;
-                }
-                let mid_dist = (i as f32 + 0.5) - visual;
-                let local_op = opacity_at_distance(mid_dist) * opacity;
-                if local_op < 0.02 {
-                    continue;
-                }
-                let line = Path::line(Point::new(axis_x, y0), Point::new(axis_x, y1));
-                frame.stroke(
-                    &line,
-                    Stroke::default()
-                        .with_width(1.5)
-                        .with_color(theme::alpha(theme::MUTED, 0.55 * local_op)),
-                );
-            }
-
-            for (i, dist, y) in placed {
-                if y < -12.0 || y > bounds.height + 12.0 {
-                    continue;
-                }
-                let label = self.spec.labels[i];
-                let scale = scale_at_distance(dist);
-                let local_op = opacity_at_distance(dist) * opacity;
-                if local_op < 0.02 {
-                    continue;
-                }
-                let active = dist.abs() < 0.35;
-
-                let mut text = canvas::Text::from(label);
-                text.content = label.to_ascii_uppercase();
-                // Same vertical axis as the gap lines, centered on the column.
-                text.position = Point::new(axis_x, y);
-                text.color = if active {
-                    theme::alpha(theme::INK, local_op)
-                } else {
-                    theme::alpha(theme::MUTED, 0.78 * local_op)
-                };
-                text.size = Pixels(BASE_TEXT * scale);
-                text.font = Font::MONOSPACE;
-                text.max_width = LABEL_MAX_WIDTH;
-                text.align_x = Horizontal::Center.into();
-                text.align_y = Vertical::Center;
-                // Outlines land in the same mesh as the gap lines. fill_text goes
-                // through the glyph rasterizer, which snaps each glyph to a whole
-                // pixel, so the labels stepped while the lines glided.
-                text.draw_with(|path, color| {
-                    frame.fill(&path, color);
-                });
-            }
-        });
+        match self.spec.orientation {
+            StripOrientation::Vertical => frame.with_clip(region, |frame| {
+                draw_vertical(frame, &self.spec, bounds, opacity, slide);
+            }),
+            StripOrientation::Horizontal => frame.with_clip(region, |frame| {
+                draw_horizontal(frame, &self.spec, bounds, opacity, slide);
+            }),
+        }
         vec![frame.into_geometry()]
     }
 
@@ -427,6 +380,128 @@ impl<Message> canvas::Program<Message> for PositionBar {
             mouse::Interaction::None
         }
     }
+}
+
+/// Vertical rail: labels centered on the column axis, neighbors above/below.
+fn draw_vertical(frame: &mut Frame, spec: &BarSpec, bounds: Rectangle, opacity: f32, slide: f32) {
+    frame.translate(Vector::new((slide - 1.0) * bounds.width, 0.0));
+
+    let count = spec.labels.len();
+    let center_y = bounds.height * 0.5;
+    let axis_x = column_axis(bounds.width);
+    let visual = spec.visual.clamp(0.0, (count - 1) as f32);
+    let base_h = base_h_for_bar(bounds.height);
+    let placed = label_positions(count, visual, center_y, base_h);
+
+    // One vertical line in the gap between each pair of sections, on the
+    // same axis as the labels. No line through a label, and no thumb.
+    for i in 0..count.saturating_sub(1) {
+        let Some((rel0, rel1)) = gap_line(i, count, visual, base_h) else {
+            continue;
+        };
+        let y0 = center_y + rel0;
+        let y1 = center_y + rel1;
+        if y1 < -8.0 || y0 > bounds.height + 8.0 {
+            continue;
+        }
+        stroke_gap_line(frame, axis_x, y0, axis_x, y1, i, visual, opacity);
+    }
+
+    for (i, dist, y) in placed {
+        if y < -12.0 || y > bounds.height + 12.0 {
+            continue;
+        }
+        draw_label(frame, spec.labels[i], Point::new(axis_x, y), dist, opacity);
+    }
+}
+
+/// Horizontal rail: same scale/opacity/gap math with X↔Y swapped. The selected
+/// label is horizontally centered, neighbors offset left/right.
+fn draw_horizontal(frame: &mut Frame, spec: &BarSpec, bounds: Rectangle, opacity: f32, slide: f32) {
+    frame.translate(Vector::new(0.0, (1.0 - slide) * bounds.height));
+
+    let count = spec.labels.len();
+    let center_x = bounds.width * 0.5;
+    let axis_y = column_axis(bounds.height);
+    let visual = spec.visual.clamp(0.0, (count - 1) as f32);
+    let base_w = base_h_for_bar(bounds.width);
+    let placed = label_positions(count, visual, center_x, base_w);
+
+    // One horizontal line in the gap between each pair of sections, on the
+    // same axis as the labels. No line through a label, and no thumb.
+    for i in 0..count.saturating_sub(1) {
+        let Some((rel0, rel1)) = gap_line(i, count, visual, base_w) else {
+            continue;
+        };
+        let x0 = center_x + rel0;
+        let x1 = center_x + rel1;
+        if x1 < -8.0 || x0 > bounds.width + 8.0 {
+            continue;
+        }
+        stroke_gap_line(frame, x0, axis_y, x1, axis_y, i, visual, opacity);
+    }
+
+    for (i, dist, x) in placed {
+        if x < -12.0 || x > bounds.width + 12.0 {
+            continue;
+        }
+        draw_label(frame, spec.labels[i], Point::new(x, axis_y), dist, opacity);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stroke_gap_line(
+    frame: &mut Frame,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    index: usize,
+    visual: f32,
+    opacity: f32,
+) {
+    let mid_dist = (index as f32 + 0.5) - visual;
+    let local_op = opacity_at_distance(mid_dist) * opacity;
+    if local_op < 0.02 {
+        return;
+    }
+    let line = Path::line(Point::new(x0, y0), Point::new(x1, y1));
+    frame.stroke(
+        &line,
+        Stroke::default()
+            .with_width(1.5)
+            .with_color(theme::alpha(theme::MUTED, 0.55 * local_op)),
+    );
+}
+
+fn draw_label(frame: &mut Frame, label: &str, position: Point, dist: f32, opacity: f32) {
+    let scale = scale_at_distance(dist);
+    let local_op = opacity_at_distance(dist) * opacity;
+    if local_op < 0.02 {
+        return;
+    }
+    let active = dist.abs() < 0.35;
+
+    let mut text = canvas::Text::from(label);
+    text.content = label.to_ascii_uppercase();
+    // Same axis as the gap lines, centered on the rail.
+    text.position = position;
+    text.color = if active {
+        theme::alpha(theme::INK, local_op)
+    } else {
+        theme::alpha(theme::MUTED, 0.78 * local_op)
+    };
+    text.size = Pixels(BASE_TEXT * scale);
+    text.font = Font::MONOSPACE;
+    text.max_width = LABEL_MAX_WIDTH;
+    text.align_x = Horizontal::Center.into();
+    text.align_y = Vertical::Center;
+    // Outlines land in the same mesh as the gap lines. fill_text goes
+    // through the glyph rasterizer, which snaps each glyph to a whole
+    // pixel, so the labels stepped while the lines glided.
+    text.draw_with(|path, color| {
+        frame.fill(&path, color);
+    });
 }
 
 fn alpha_index(title: &str) -> usize {

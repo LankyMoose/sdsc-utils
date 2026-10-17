@@ -393,7 +393,13 @@ mod release {
     ) {
     }
 
+    /// No-op guard. Implements `Drop` like the debug counterpart so call sites
+    /// can `drop()` it explicitly in both profiles (`clippy::drop_non_drop`).
     pub struct OpGuard;
+
+    impl Drop for OpGuard {
+        fn drop(&mut self) {}
+    }
 
     pub fn enter_op(_name: &'static str) -> OpGuard {
         OpGuard

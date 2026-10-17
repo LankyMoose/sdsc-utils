@@ -102,9 +102,7 @@ impl GamesCatalog {
         }
         match serde_json::to_vec_pretty(self) {
             Ok(bytes) => {
-                if let Err(err) = fs::write(&path, bytes) {
-                    app_log::warn(format!("failed to write games: {err}"));
-                }
+                crate::persist::atomic::write_atomic_logged("games", &path, &bytes);
             }
             Err(err) => app_log::warn(format!("failed to serialize games: {err}")),
         }

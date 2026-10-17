@@ -172,6 +172,142 @@ unsafe extern "system" {
         flags: u32,
     ) -> i32;
     pub fn RedrawWindow(hwnd: isize, rect: *const Rect, region: isize, flags: u32) -> i32;
+    pub fn EnumDisplayMonitors(
+        hdc: isize,
+        clip: *const Rect,
+        callback: unsafe extern "system" fn(isize, isize, *mut Rect, isize) -> i32,
+        data: isize,
+    ) -> i32;
+}
+
+pub const SWP_NOZORDER: u32 = 0x0004;
+pub const MONITORINFOF_PRIMARY: u32 = 0x0001;
+
+/// Full bounds of every monitor, primary flagged (physical pixels).
+pub fn monitor_bounds() -> Vec<(Rect, bool)> {
+    unsafe extern "system" fn collect(monitor: isize, _: isize, _: *mut Rect, data: isize) -> i32 {
+        // SAFETY: `data` is the `&mut Vec` passed below, alive for the call.
+        let out = unsafe { &mut *(data as *mut Vec<(Rect, bool)>) };
+        let mut info = MonitorInfo {
+            size: std::mem::size_of::<MonitorInfo>() as u32,
+            ..MonitorInfo::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
+            out.push((info.monitor, info.flags & MONITORINFOF_PRIMARY != 0));
+        }
+        1
+    }
+    let mut out: Vec<(Rect, bool)> = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(
+            0,
+            std::ptr::null(),
+            collect,
+            &mut out as *mut Vec<(Rect, bool)> as isize,
+        );
+    }
+    out
+}
+
+/// Target top-left for moving a window at `win` on `primary` to the same
+/// relative spot on `secondary`, clamped so it stays fully on `secondary`
+/// where it fits. `None` when the window is not on `primary`.
+pub fn relocate_to_secondary(win: Rect, primary: Rect, secondary: Rect) -> Option<(i32, i32)> {
+    let cx = (win.left + win.right) / 2;
+    let cy = (win.top + win.bottom) / 2;
+    let on_primary =
+        cx >= primary.left && cx < primary.right && cy >= primary.top && cy < primary.bottom;
+    if !on_primary {
+        return None;
+    }
+    let w = win.right - win.left;
+    let h = win.bottom - win.top;
+    let clamp = |v: i32, lo: i32, hi: i32| if hi < lo { lo } else { v.clamp(lo, hi) };
+    let x = clamp(
+        secondary.left + (win.left - primary.left),
+        secondary.left,
+        secondary.right - w,
+    );
+    let y = clamp(
+        secondary.top + (win.top - primary.top),
+        secondary.top,
+        secondary.bottom - h,
+    );
+    Some((x, y))
+}
+
+/// Move `hwnd` from the primary to the first secondary monitor (no activation,
+/// no z-order change). No-op on single-monitor setups or when already off primary.
+///
+/// # Safety
+/// `hwnd` must be a valid Win32 window handle owned by this process.
+pub unsafe fn move_to_secondary_monitor(hwnd: isize) {
+    let monitors = monitor_bounds();
+    let Some(primary) = monitors.iter().find(|(_, p)| *p).map(|(r, _)| *r) else {
+        return;
+    };
+    let Some(secondary) = monitors.iter().find(|(_, p)| !*p).map(|(r, _)| *r) else {
+        return;
+    };
+    let mut win = Rect::default();
+    if unsafe { GetWindowRect(hwnd, &mut win) } == 0 {
+        return;
+    }
+    if let Some((x, y)) = relocate_to_secondary(win, primary, secondary) {
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                0,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod relocate_tests {
+    use super::*;
+
+    fn r(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
+        Rect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn keeps_relative_position_on_secondary() {
+        let primary = r(0, 0, 1920, 1080);
+        let secondary = r(1920, 0, 3840, 1080);
+        let win = r(100, 200, 500, 600);
+        assert_eq!(
+            relocate_to_secondary(win, primary, secondary),
+            Some((2020, 200))
+        );
+    }
+
+    #[test]
+    fn clamps_onto_smaller_secondary_and_ignores_off_primary() {
+        let primary = r(0, 0, 2560, 1440);
+        let secondary = r(-1920, 0, 0, 1080);
+        // Bottom-right of a big primary lands clamped inside the smaller one.
+        let win = r(2160, 1240, 2560, 1440);
+        assert_eq!(
+            relocate_to_secondary(win, primary, secondary),
+            Some((-400, 880))
+        );
+        // Already on the secondary: leave it alone.
+        assert_eq!(
+            relocate_to_secondary(r(-1000, 100, -600, 500), primary, secondary),
+            None
+        );
+    }
 }
 
 #[link(name = "shcore")]

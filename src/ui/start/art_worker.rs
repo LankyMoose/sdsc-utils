@@ -478,14 +478,20 @@ mod tests {
 
     #[test]
     fn shutdown_joins_and_allows_restart() {
-        ensure_started();
-        assert!(MAILBOX.lock().unwrap().is_some());
-        shutdown();
-        assert!(MAILBOX.lock().unwrap().is_none());
-        assert!(JOIN.lock().unwrap().is_none());
-        ensure_started();
-        assert!(MAILBOX.lock().unwrap().is_some());
-        shutdown();
+        // shutdown() wipes the shared process icon cache, so hold the same
+        // lock the icon-cache/view tests take — otherwise a concurrent
+        // `with_isolated_cache` can decode, have its entries wiped mid-test,
+        // and fail on a perfectly correct decode.
+        icon_cache::with_cache_lock(|| {
+            ensure_started();
+            assert!(MAILBOX.lock().unwrap().is_some());
+            shutdown();
+            assert!(MAILBOX.lock().unwrap().is_none());
+            assert!(JOIN.lock().unwrap().is_none());
+            ensure_started();
+            assert!(MAILBOX.lock().unwrap().is_some());
+            shutdown();
+        });
     }
 
     #[test]

@@ -28,11 +28,11 @@ jobs:
       - name: Build release
         run: cargo build --release
 
-      - name: Bundle portable exe
+      - name: Stage portable exe
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path target/portable | Out-Null
-          ./target/release/bundle-portable.exe target/release/sdsc-utils.exe target/release/sdsc-shell.exe target/portable/sdsc-utils.exe
+          Copy-Item target/release/sdsc-utils.exe target/portable/sdsc-utils.exe
 
       - name: Upload portable exe
         uses: actions/upload-artifact@v4

@@ -56,7 +56,7 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 
 **Recommended (Windows):** install from the [Microsoft Store](https://apps.microsoft.com/) once the listing is live (search for **SDSC Utils**). Store installs are signed by Microsoft and update automatically through the Store / `winget`.
 
-**Advanced:** portable builds are attached to [GitHub Releases](https://github.com/LankyMoose/sdsc-utils/releases) as a single `sdsc-utils.exe`. The first launch unpacks the UI program into `%APPDATA%\sdsc-utils\shell`. That executable is **not** Authenticode-signed. Browsers and Windows SmartScreen often warn on uncommon unsigned downloads — that is expected. There is no in-app auto-update for the portable build; download the next release manually when you want it.
+**Advanced:** portable builds are attached to [GitHub Releases](https://github.com/LankyMoose/sdsc-utils/releases) as a single `sdsc-utils.exe` (tray + HID + UI in one process, no bundled extras). That executable is **not** Authenticode-signed. Browsers and Windows SmartScreen often warn on uncommon unsigned downloads — that is expected. There is no in-app auto-update for the portable build; download the next release manually when you want it.
 
 ## Features
 
@@ -75,7 +75,7 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 - Lightbar color blends across a customizable **2–5 stop spectrum** (default **blue → purple → red**) as battery drops (reasserted about every 5 seconds); edit via tray **Settings** with a left-hand tab list. An **Enable lightbar** toggle (on by default) pauses battery-driven colors and the low-battery pulse while leaving Identify available. The Lightbar panel stays fully expanded when active: drag stops along the bar, click empty areas to add stops (up to 5), and drag a stop away to remove it (down to 2). Changes apply immediately.
 - At **low battery while discharging** (same configurable threshold as the toast; default ≤5%), the lightbar periodically pulses **orange**
 - Icons live in `assets/icons/` (SVG) and are rasterized at build/runtime
-- UI shell is an **iced** daemon (tray via `tray-icon`); Configure, controller popup, and toasts are iced windows
+- UI is an **iced** daemon (tray via `tray-icon`); Configure, controller popup, and toasts are iced windows
 - Single-instance (second launch exits quietly)
 - Logs to a file (see Troubleshooting)
 
@@ -92,9 +92,9 @@ Requires Rust **1.88+** (edition 2024).
 cargo build --release
 ```
 
-Binary: `target/release/sdsc-utils` (`.exe` on Windows).
+This builds every binary. Run `target/release/sdsc-utils` (`.exe` on Windows); it is the whole app — tray, controller monitoring, and UI in one process.
 
-Release builds do **not** include the developer emulator (`dev-emulate` is off by default).
+Release builds do **not** include the developer emulator (it is compiled only into debug builds).
 
 Package identity: `package.name` in `Cargo.toml` is `sdsc-utils`; display name is `DISPLAY_NAME` in `src/app_meta.rs` (runtime paths follow the package name).
 
@@ -107,7 +107,7 @@ git config core.hooksPath .githooks
 ```
 
 - **pre-commit** — runs `cargo fmt --all` and re-stages already-staged `.rs` files.
-- **pre-push** — runs the same checklist as CI (`scripts/ci.sh`: fmt check, clippy `-D warnings`, tests) on **every** branch you push.
+- **pre-push** — runs the same checklist as CI (`scripts/ci.sh`: fmt check, clippy `-D warnings`, tests, debug build) on **every** branch you push.
 
 Bypass with `git commit --no-verify` or `git push --no-verify` when needed. You can also run checks manually: `bash scripts/ci.sh`.
 
@@ -119,15 +119,21 @@ cargo run --release
 ./target/release/sdsc-utils
 ```
 
-### Developer emulator (optional)
+### Developer emulator
 
-For testing notifications without real hardware, build with the `dev-emulate` feature and pass `--dev`:
+For testing notifications without real hardware, just run a debug build:
 
 ```bash
-cargo run --features dev-emulate -- --dev
+cargo run
 ```
 
-That unlocks a **Developer** section in the **Configure** window with emulated controller presets (low battery, charging, fully charged, etc.) and **battery analytics** presets (seed estimates, plug/charge/drain/pause/resume steps with time fast-forward). Emulation is not compiled into normal release binaries.
+That unlocks a **Developer mode** group in the **Configure** window — separated from the shipped settings by a caption — containing:
+
+- **Controllers** — the emulated fleet, one row per pad. New pads are created remembered but **disconnected**, so adding one is quiet; the per-pad switch plugs them in and out through the normal connect/disconnect path, so toasts and the Start-open preference fire exactly as they would for real hardware. Pads are remembered across restarts and come back switched off at their last level. The chevron expands a row's controls inline — battery level (snapped to the levels a DualSense actually reports; a connected pad applies changes after a one-second pause marked by a spinner, and unplugging cancels a pending one), link (USB charges, Bluetooth runs down — the charge state follows from it, as on real hardware), battery analytics (seed estimates, or walk the charge/drain cycle), the remember pin, and remove. Forgetting a pad drops it from the remembered list; once it is also unplugged the row goes away.
+- **Pad input** — live DualSense/gamepad readings.
+- **Diagnostics** — renderer stress test, plus a layout-bounding-boxes overlay (toggle or F9) that outlines Start and Settings-drawer containers (magenta) and fixed-width elements (cyan). Debug-only, off by default, never saved.
+
+The emulator is compiled into every non-release build, so there is no flag to pass; release binaries (`cargo build --release`) never include it.
 
 ### CLI
 
@@ -138,7 +144,8 @@ That unlocks a **Developer** section in the **Configure** window with emulated c
 | `--install-autostart` | Windows: enable login autostart for this build |
 | `--uninstall-autostart` | Windows: disable that autostart entry |
 | `--list-controllers` | Print connected DualSense pads and exit |
-| `--dev` | Enable Developer controls in Configure (only when built with `--features dev-emulate`) |
+
+Developer controls need no flag: they are compiled into every non-release build.
 
 ## Windows notes
 
@@ -199,7 +206,7 @@ git tag v1.6.1
 git push origin v1.6.1
 ```
 
-The release workflow attaches one portable `sdsc-utils.exe` (the UI shell is bundled inside it) and `sdsc-utils.msix` to the GitHub Release for that tag. Upload the MSIX to Partner Center for Store distribution. You can also run the **Release** workflow manually (`workflow_dispatch`).
+The release workflow attaches one portable `sdsc-utils.exe` and `sdsc-utils.msix` to the GitHub Release for that tag. Upload the MSIX to Partner Center for Store distribution. You can also run the **Release** workflow manually (`workflow_dispatch`).
 
 ## Privacy policy
 

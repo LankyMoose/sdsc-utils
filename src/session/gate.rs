@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 /// How long a pad missing from polls stays held before the session drops it.
 ///
-/// Wall-time (not miss-count) so the ~16ms service hot path tolerates the same
+/// Wall-time (not miss-count) so the ~16ms hot path tolerates the same
 /// radio stalls as the 5s cold poll: a ~200ms input silence never reaches the
 /// session, while a genuinely gone pad still drops on the next cold poll.
 pub const POLL_MISS_HOLD: Duration = Duration::from_secs(2);

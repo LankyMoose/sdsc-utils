@@ -1,18 +1,16 @@
 //! Pure device session: presence, notify, analytics, start-open policy.
 //!
-//! No `window::Id`, no HWND. The iced shell (and later the named-pipe shell)
-//! applies [`SessionEffect`] values.
+//! No `window::Id`, no HWND. The iced app applies [`SessionEffect`] values.
 
 mod gate;
 
 pub use gate::{
-    ConnectCooldownDecision, connect_cooldown_on_empty, has_start_presence,
+    ConnectCooldownDecision, POLL_MISS_HOLD, connect_cooldown_on_empty, has_start_presence,
     reconcile_poll_with_hold, should_auto_close_start, should_auto_open_start,
     should_defer_auto_open_start, should_flush_latched_start,
     should_skip_connect_cooldown_on_power_off, take_skip_connect_cooldown,
 };
 
-use crate::controller::dualsense::identity::normalize_identity;
 use crate::controller::dualsense::lightbar;
 use crate::controller::known::KnownControllers;
 use crate::controller::model::ControllerStatus;
@@ -29,7 +27,23 @@ pub const START_CONNECT_COOLDOWN: Duration = Duration::from_secs(5);
 /// Nonempty stretch shorter than this is an arrival blip — do not arm ghost cooldown.
 pub const MIN_CONNECT_STRETCH: Duration = Duration::from_secs(2);
 
-/// Side effects the shell must perform after a session step.
+/// Start-screen selection held in memory (never written to disk).
+///
+/// Stable keys (never indices): game rows resolve via `play_key`, controller
+/// rows via pad serial. `game_index` is the game-axis row position at report
+/// time, used only when the `by_position` selection mode is on (clamped to
+/// `index.min(len - 1)`; missing keeps the clamped index, never 0). There is
+/// deliberately no `controller_index`: controller persistence is out of
+/// scope. Dies with the process, and is never written to disk.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartSelection {
+    pub game_key: Option<String>,
+    pub controller_key: Option<String>,
+    #[serde(default)]
+    pub game_index: Option<usize>,
+}
+
+/// Side effects the app must perform after a session step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionEffect {
     /// Update tray icon / tooltip from the live controller count.
@@ -58,7 +72,7 @@ pub enum SessionEffect {
     SyncPopup,
 }
 
-/// Inputs the shell provides when applying a poll snapshot (UI facts only).
+/// Inputs the app provides when applying a poll snapshot (UI facts only).
 #[derive(Debug, Clone, Copy)]
 pub struct ApplyContext {
     pub start_visible: bool,
@@ -104,17 +118,10 @@ impl DeviceSession {
         self.missed_poll_since.clear();
     }
 
-    /// Clear miss streaks for pads seen in the latest snapshot.
-    ///
-    /// Must run on *every* ingestion, not just on change: the hot path skips
-    /// evaluation when the live snapshot is equivalent, and a held pad's clone
-    /// is identical — so a recovered pad's streak would otherwise survive until
-    /// the next stall drops it instantly with no hold.
-    pub fn mark_seen(&mut self, serials: impl IntoIterator<Item = impl AsRef<str>>) {
-        for serial in serials {
-            self.missed_poll_since
-                .remove(&normalize_identity(serial.as_ref()));
-        }
+    /// True while at least one previously-seen pad is inside the miss-hold
+    /// window (present before, missing from the latest poll, hold unexpired).
+    pub fn has_poll_misses(&self) -> bool {
+        !self.missed_poll_since.is_empty()
     }
 
     pub fn mark_skip_connect_cooldown(&mut self) {
@@ -273,6 +280,9 @@ impl DeviceSession {
         effects.push(SessionEffect::SetTray {
             connected: self.controllers.len(),
         });
+        // Live membership or the remembered set changed, so the popup's row
+        // list may have grown or shrunk — rebuild it and resize while open.
+        effects.push(SessionEffect::SyncPopup);
         if !events.is_empty() || open_start_after_toast {
             effects.push(SessionEffect::QueueNotifications {
                 events,
@@ -364,11 +374,11 @@ pub fn controllers_equivalent(a: &[ControllerStatus], b: &[ControllerStatus]) ->
 }
 
 fn is_emulated_serial(serial: &str) -> bool {
-    #[cfg(feature = "dev-emulate")]
+    #[cfg(debug_assertions)]
     {
         crate::controller::emulate::is_emulated(serial)
     }
-    #[cfg(not(feature = "dev-emulate"))]
+    #[cfg(not(debug_assertions))]
     {
         let _ = serial;
         false
@@ -410,6 +420,17 @@ mod tests {
             serial.to_string(),
             50,
             PowerState::Discharging,
+        )
+    }
+
+    fn usb_pad_at(serial: &str, percent: u8, state: PowerState) -> ControllerStatus {
+        dualsense_status(
+            1,
+            "DualSense",
+            Connection::Usb,
+            serial.to_string(),
+            percent,
+            state,
         )
     }
 
@@ -504,39 +525,6 @@ mod tests {
     }
 
     #[test]
-    fn mark_seen_clears_stale_streak_so_next_stall_holds() {
-        use std::time::Duration;
-
-        // Regression: the hot path skips evaluation when the live snapshot is
-        // equivalent (a held clone is identical), so a recovered pad's streak
-        // survived and its next stall dropped instantly with no hold.
-        let mut session = session_with(false, StartAutoOpen::Any);
-        let pad_a = bt_pad("aa");
-        let pad_b = bt_pad("bb");
-        let t0 = Instant::now();
-        let ctx_at = |now: Instant| ApplyContext {
-            start_visible: false,
-            fullscreen: false,
-            now,
-            lightbar_enabled: false,
-        };
-        let _ = session.apply_controllers(vec![pad_a.clone(), pad_b.clone()], ctx_at(t0));
-
-        // Stale streak as left by a recovered-then-unevaluated stall.
-        session
-            .missed_poll_since
-            .insert("bb".to_string(), t0 - Duration::from_secs(36));
-        // Fresh sighting on every hot loop clears it, evaluation or not.
-        session.mark_seen(["bb"]);
-        assert!(session.missed_poll_since.is_empty());
-
-        // The next stall therefore holds instead of dropping instantly.
-        let effects = session.on_poll_result(vec![pad_a.clone()], ctx_at(t0));
-        assert_eq!(session.controllers.len(), 2);
-        assert!(!queued_bodies(&effects).contains(&"Disconnected".to_string()));
-    }
-
-    #[test]
     fn hot_path_stall_within_hold_keeps_pad_quiet() {
         use std::time::Duration;
 
@@ -575,6 +563,36 @@ mod tests {
     }
 
     #[test]
+    fn poll_miss_flag_tracks_hold_lifecycle() {
+        use std::time::Duration;
+
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let pad_a = bt_pad("aa");
+        let t0 = Instant::now();
+        let ctx_at = |now: Instant| ApplyContext {
+            start_visible: false,
+            fullscreen: false,
+            now,
+            lightbar_enabled: false,
+        };
+        let _ = session.apply_controllers(vec![pad_a.clone()], ctx_at(t0));
+        assert!(!session.has_poll_misses());
+
+        // First miss: held, flag set (drives the app-side absence recheck).
+        let _ = session.on_poll_result(vec![], ctx_at(t0 + Duration::from_millis(100)));
+        assert_eq!(session.controllers.len(), 1);
+        assert!(session.has_poll_misses());
+
+        // Hold expiry drops the pad and clears the flag (no recheck loop).
+        let _ = session.on_poll_result(
+            vec![],
+            ctx_at(t0 + crate::session::POLL_MISS_HOLD + Duration::from_millis(500)),
+        );
+        assert!(session.controllers.is_empty());
+        assert!(!session.has_poll_misses());
+    }
+
+    #[test]
     fn bluetooth_mode_ignores_usb_only_presence() {
         // USB-only arrival is not qualifying presence in Bluetooth mode:
         // no open, and the toast stays a plain notification.
@@ -609,5 +627,90 @@ mod tests {
             )),
             "Bluetooth arrival should latch an open in Bluetooth mode"
         );
+    }
+
+    fn has_popup_sync(effects: &[SessionEffect]) -> bool {
+        effects
+            .iter()
+            .any(|e| matches!(e, SessionEffect::SyncPopup))
+    }
+
+    #[test]
+    fn membership_gain_emits_popup_sync() {
+        // 0→1 grows the popup by a row: the shell must resize while open.
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        assert!(
+            has_popup_sync(&effects),
+            "connect must emit SyncPopup, got {effects:?}"
+        );
+    }
+
+    #[test]
+    fn membership_loss_emits_popup_sync() {
+        // 1→0 shrinks the popup by a row: the shell must resize while open.
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let _ = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        let effects = session.apply_controllers(Vec::new(), ctx(false));
+        assert!(
+            has_popup_sync(&effects),
+            "disconnect must emit SyncPopup, got {effects:?}"
+        );
+    }
+
+    #[test]
+    fn reconnecting_a_forgotten_pad_emits_popup_sync() {
+        // Forgetting drops the remembered row; reconnecting re-adds the live
+        // row. Both change the row count, so both must resize the popup.
+        let mut session = session_with(false, StartAutoOpen::Any);
+        session.known.remember(&bt_pad("aa"));
+        assert!(session.known.forget("aa"));
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        assert!(
+            has_popup_sync(&effects),
+            "forgotten-pad reconnect must emit SyncPopup, got {effects:?}"
+        );
+    }
+
+    #[test]
+    fn unchanged_snapshot_emits_no_popup_sync() {
+        // Same pad, same readings: no row change, so no pointless resize.
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let _ = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
+        assert!(
+            !has_popup_sync(&effects),
+            "equivalent snapshot must not emit SyncPopup, got {effects:?}"
+        );
+    }
+
+    /// Regression for the 2026-10-14 incident (popup showed a stale remembered
+    /// `%` after full-charge + USB unplug while disk was correct).
+    ///
+    /// `95% Charging → 100% Complete → disconnected` must leave the
+    /// remembered record at 100%, not the boot-time 95%.
+    #[test]
+    fn full_charge_then_unplug_remembered_carries_100() {
+        let mut session = session_with(false, StartAutoOpen::Any);
+        // Boot-time state: pad remembered at 95%.
+        session
+            .known
+            .remember(&usb_pad_at("pad-1", 95, PowerState::Charging));
+
+        // Charge walk to full, then unplug.
+        let _ = session.apply_controllers(
+            vec![usb_pad_at("pad-1", 95, PowerState::Charging)],
+            ctx(false),
+        );
+        let _ = session.apply_controllers(
+            vec![usb_pad_at("pad-1", 100, PowerState::Complete)],
+            ctx(false),
+        );
+        let _ = session.apply_controllers(Vec::new(), ctx(false));
+
+        let remembered = session.known.remembered_disconnected(&session.controllers);
+        assert_eq!(remembered.len(), 1);
+        assert_eq!(remembered[0].percent, 100);
+        assert!(session.controllers.is_empty(), "pad was unplugged");
     }
 }

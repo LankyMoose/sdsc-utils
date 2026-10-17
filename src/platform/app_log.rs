@@ -138,10 +138,7 @@ pub fn session_uptime_ms() -> u128 {
 #[allow(dead_code)] // hitch UI / hotkeys (debug builds)
 pub fn mark_hitch(extra: impl AsRef<str>) {
     #[cfg(not(debug_assertions))]
-    {
-        let _ = extra;
-        return;
-    }
+    let _ = extra;
     #[cfg(debug_assertions)]
     {
         let sid = session_id();

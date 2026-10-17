@@ -1,5 +1,8 @@
 //! Pure start-screen presentation transitions (compact ↔ immersive) and dock focus.
 
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicU32, Ordering};
+
 /// Windowed launcher vs fullscreen console stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StartPresentation {
@@ -41,11 +44,16 @@ pub enum TransitionPhase {
     EnterCompact,
 }
 
-/// Shared duration for darken-compact / darken-immersive / reveal-compact.
+/// Shared duration for darken-immersive / reveal-compact / cold ambient.
 pub const VEIL_TRANSITION_MS: u64 = 300;
-pub const EXIT_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
+/// Fast promote/demote segment, shared: exit fades and enter fades use one
+/// duration so the joints stay even.
+pub const SWIFT_SEGMENT_MS: u64 = 150;
+/// HWND growth/shrink morph, run under the opaque blackout. Deliberately a
+/// touch faster than the fades (invisible anyway) so the ceremony stays snappy.
+pub const RESIZE_MS: u64 = 100;
 /// EnterImmersive top-veil lift (ease-in-out); matches splash length so one ceremony covers both.
-pub const ENTER_REVEAL_MS: u64 = 450;
+pub const ENTER_REVEAL_MS: u64 = crate::ui::motion::SLOW_MS;
 pub const ENTER_IMMERSIVE_MS: u64 = ENTER_REVEAL_MS;
 /// Max time to hold a solid enter veil waiting for selected splash + strip heroes.
 pub const ENTER_ART_HOLD_MAX_MS: u64 = 3000;
@@ -57,9 +65,9 @@ pub const STEAM_SCAN_MIN_MS: u64 = 2000;
 /// Immersive kicks Steam on art-ready (Preparing success) instead — no settle delay.
 pub const STEAM_SCAN_SETTLE_DELAY_MS: u64 = 1000;
 /// Slide a chrome status chip in (below → its stack slot) / stack reflow.
-pub const CHROME_STATUS_IN_MS: u64 = 280;
+pub const CHROME_STATUS_IN_MS: u64 = crate::ui::motion::BASE_MS;
 /// Slide-right exit duration once the batch clears.
-pub const CHROME_STATUS_EXIT_MS: u64 = 280;
+pub const CHROME_STATUS_EXIT_MS: u64 = crate::ui::motion::BASE_MS;
 /// Hold each success checkmark before the batch may clear.
 pub const CHROME_STATUS_SUCCESS_HOLD_MS: u64 = 500;
 /// Extra pause after every chip is Success before staggered ExitRight.
@@ -77,14 +85,12 @@ pub const STEAM_SCAN_BANNER_OUT_MS: u64 = CHROME_STATUS_EXIT_MS;
 pub const STEAM_SCAN_SUCCESS_HOLD_MS: u64 = CHROME_STATUS_SUCCESS_HOLD_MS;
 /// Immersive cold: fade the games strip in once artwork is ready.
 pub const GAMES_LIST_FADE_MS: u64 = ART_FADE_MS;
-/// Cap per StartFrame so a UI stall cannot skip the start of the enter curve.
-pub const ENTER_REVEAL_MAX_FRAME_MS: u64 = 32;
 /// Legacy grow-segment fraction (unused by the single top-veil enter path).
 pub const ENTER_GROW_END: f32 = 0.28;
-pub const EXIT_IMMERSIVE_MS: u64 = VEIL_TRANSITION_MS;
-pub const ENTER_COMPACT_MS: u64 = VEIL_TRANSITION_MS;
+pub const EXIT_IMMERSIVE_MS: u64 = SWIFT_SEGMENT_MS;
+pub const ENTER_COMPACT_MS: u64 = SWIFT_SEGMENT_MS;
 /// Opacity crossfade between game backdrops (selection change; not enter veil).
-pub const ART_FADE_MS: u64 = 450;
+pub const ART_FADE_MS: u64 = crate::ui::motion::SLOW_MS;
 /// Shared ken-burns period for zoom + pan (burn-in drift while splash is held).
 pub const BACKDROP_ZOOM_PERIOD_MS: u64 = 30_000;
 /// Mid scale between min zoom and peak (must stay > 1 for Cover pan headroom).
@@ -100,10 +106,108 @@ pub const BACKDROP_PAN_STAGE_Y: f32 = 0.035;
 /// Never spend more than this fraction of real Cover+zoom overflow (black-edge safety).
 pub const BACKDROP_PAN_OVERFLOW_CAP: f32 = 0.92;
 
+/// Dev-only ken-burns tuning defaults (multiplier of shipped behavior).
+pub const DEFAULT_KENBURNS_AMP_SCALE: f32 = 1.0;
+pub const DEFAULT_KENBURNS_PAN_SCALE: f32 = 1.0;
+/// Pose-clock speed multiplier (0 freezes drift).
+pub const DEFAULT_KENBURNS_SPEED: f32 = 1.0;
+
+#[cfg(debug_assertions)]
+static KENBURNS_AMP_BITS: AtomicU32 = AtomicU32::new(DEFAULT_KENBURNS_AMP_SCALE.to_bits());
+#[cfg(debug_assertions)]
+static KENBURNS_PAN_BITS: AtomicU32 = AtomicU32::new(DEFAULT_KENBURNS_PAN_SCALE.to_bits());
+#[cfg(debug_assertions)]
+static KENBURNS_SPEED_BITS: AtomicU32 = AtomicU32::new(DEFAULT_KENBURNS_SPEED.to_bits());
+
+/// Zoom-excursion multiplier. Release: always [`DEFAULT_KENBURNS_AMP_SCALE`].
+pub fn kenburns_amp_scale() -> f32 {
+    #[cfg(debug_assertions)]
+    {
+        f32::from_bits(KENBURNS_AMP_BITS.load(Ordering::Relaxed))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        DEFAULT_KENBURNS_AMP_SCALE
+    }
+}
+
+/// Pan-travel multiplier (still capped by overflow headroom, so no black
+/// edges). Release: always [`DEFAULT_KENBURNS_PAN_SCALE`].
+pub fn kenburns_pan_scale() -> f32 {
+    #[cfg(debug_assertions)]
+    {
+        f32::from_bits(KENBURNS_PAN_BITS.load(Ordering::Relaxed))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        DEFAULT_KENBURNS_PAN_SCALE
+    }
+}
+
+/// Pose-clock speed multiplier. Release: always [`DEFAULT_KENBURNS_SPEED`].
+pub fn kenburns_speed() -> f32 {
+    #[cfg(debug_assertions)]
+    {
+        f32::from_bits(KENBURNS_SPEED_BITS.load(Ordering::Relaxed))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        DEFAULT_KENBURNS_SPEED
+    }
+}
+
+/// True while any ken-burns tuning differs from the shipped defaults.
+#[cfg(debug_assertions)]
+pub fn kenburns_tuning_active() -> bool {
+    kenburns_amp_scale() != DEFAULT_KENBURNS_AMP_SCALE
+        || kenburns_pan_scale() != DEFAULT_KENBURNS_PAN_SCALE
+        || kenburns_speed() != DEFAULT_KENBURNS_SPEED
+}
+
+/// Debug-only setters (Diagnostics sliders; shell-local, never persisted).
+#[cfg(debug_assertions)]
+pub fn set_kenburns_amp_scale(v: f32) {
+    KENBURNS_AMP_BITS.store(v.clamp(0.0, 5.0).to_bits(), Ordering::Relaxed);
+}
+#[cfg(debug_assertions)]
+pub fn set_kenburns_pan_scale(v: f32) {
+    KENBURNS_PAN_BITS.store(v.clamp(0.0, 5.0).to_bits(), Ordering::Relaxed);
+}
+#[cfg(debug_assertions)]
+pub fn set_kenburns_speed(v: f32) {
+    KENBURNS_SPEED_BITS.store(v.clamp(0.0, 8.0).to_bits(), Ordering::Relaxed);
+}
+/// Restore shipped behavior (Diagnostics reset).
+#[cfg(debug_assertions)]
+pub fn reset_kenburns_tuning() {
+    set_kenburns_amp_scale(DEFAULT_KENBURNS_AMP_SCALE);
+    set_kenburns_pan_scale(DEFAULT_KENBURNS_PAN_SCALE);
+    set_kenburns_speed(DEFAULT_KENBURNS_SPEED);
+}
+
+/// Test lock for the process-wide ken-burns globals (see
+/// `notes/flaky-tests.md`). Release tests compile it to a pass-through.
+#[cfg(test)]
+pub(crate) fn with_pose_test_lock<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(debug_assertions)]
+    {
+        static POSE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = POSE_TEST_LOCK.lock().unwrap();
+        reset_kenburns_tuning();
+        let result = f();
+        reset_kenburns_tuning();
+        result
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        f()
+    }
+}
+
 impl TransitionPhase {
     pub fn duration_ms(self) -> u64 {
         match self {
-            Self::ExitCompact => EXIT_COMPACT_MS,
+            Self::ExitCompact => SWIFT_SEGMENT_MS,
             Self::Resizing => 0,
             Self::EnterImmersive => ENTER_IMMERSIVE_MS,
             Self::ExitImmersive => EXIT_IMMERSIVE_MS,
@@ -244,36 +348,15 @@ pub fn dock_panel_width(progress: f32, peek: f32, expanded: f32) -> f32 {
 
 /// Ease-out cubic progress 0..=1 for elapsed/duration.
 pub fn phase_progress(elapsed_ms: u64, duration_ms: u64) -> f32 {
-    if duration_ms == 0 {
-        return 1.0;
-    }
-    let t = (elapsed_ms as f32 / duration_ms as f32).clamp(0.0, 1.0);
-    1.0 - (1.0 - t).powi(3)
+    crate::ui::motion::ease_out_cubic(phase_progress_linear(elapsed_ms, duration_ms))
 }
 
 /// Linear 0..=1 elapsed fraction (no easing).
 pub fn phase_progress_linear(elapsed_ms: u64, duration_ms: u64) -> f32 {
-    if duration_ms == 0 {
-        return 1.0;
-    }
-    (elapsed_ms as f32 / duration_ms as f32).clamp(0.0, 1.0)
+    crate::ui::motion::progress_linear(elapsed_ms, duration_ms)
 }
 
-/// Ease-in cubic — slow start.
-pub fn ease_in_cubic(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * t
-}
-
-/// Ease-in-out cubic — smooth enter-immersive veil lift.
-pub fn ease_in_out_cubic(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    if t < 0.5 {
-        4.0 * t * t * t
-    } else {
-        1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
-    }
-}
+pub use crate::ui::motion::{ease_in_cubic, ease_in_out_cubic};
 
 /// Content/veil reveal after HWND settle (0 = veiled, 1 = clear).
 pub fn settle_reveal(elapsed_ms: u64, duration_ms: u64) -> f32 {
@@ -298,15 +381,16 @@ pub fn enter_art_fade_progress(elapsed_ms: u64) -> f32 {
 }
 
 fn backdrop_pose_theta(elapsed_ms: u64) -> f32 {
-    elapsed_ms as f32 / BACKDROP_ZOOM_PERIOD_MS as f32 * std::f32::consts::TAU
+    elapsed_ms as f32 / BACKDROP_ZOOM_PERIOD_MS as f32 * std::f32::consts::TAU * kenburns_speed()
 }
 
 /// Continuous ken-burns scale (always ≥ [`BACKDROP_SCALE_MIN`]).
 ///
 /// Starts at the zoom floor (centered pan) and eases out — `-cos` so velocity is 0 at t=0.
+/// Debug builds scale the excursion via [`kenburns_amp_scale`] (1.0 = shipped).
 pub fn backdrop_pose_scale(elapsed_ms: u64) -> f32 {
     let wave = -backdrop_pose_theta(elapsed_ms).cos();
-    (BACKDROP_SCALE_BASE + BACKDROP_SCALE_AMP * wave).max(BACKDROP_SCALE_MIN)
+    (BACKDROP_SCALE_BASE + BACKDROP_SCALE_AMP * kenburns_amp_scale() * wave).max(BACKDROP_SCALE_MIN)
 }
 
 /// Normalized pan offsets in `[-1, 1]`, locked to the zoom period.
@@ -332,8 +416,10 @@ pub fn backdrop_pose_pixels(
 ) -> (f32, f32) {
     let avail_x = (drawn_w - stage_w).max(0.0) * 0.5 * BACKDROP_PAN_OVERFLOW_CAP;
     let avail_y = (drawn_h - stage_h).max(0.0) * 0.5 * BACKDROP_PAN_OVERFLOW_CAP;
-    let headroom_x = (stage_w * BACKDROP_PAN_STAGE_X).min(avail_x);
-    let headroom_y = (stage_h * BACKDROP_PAN_STAGE_Y).min(avail_y);
+    // Debug builds scale travel via [`kenburns_pan_scale`] (1.0 = shipped);
+    // the overflow cap still applies, so boosted pan can never show edges.
+    let headroom_x = (stage_w * BACKDROP_PAN_STAGE_X * kenburns_pan_scale()).min(avail_x);
+    let headroom_y = (stage_h * BACKDROP_PAN_STAGE_Y * kenburns_pan_scale()).min(avail_y);
     (
         ox_norm.clamp(-1.0, 1.0) * headroom_x,
         oy_norm.clamp(-1.0, 1.0) * headroom_y,
@@ -549,6 +635,12 @@ mod tests {
 
     #[test]
     fn backdrop_pose_helpers() {
+        with_pose_test_lock(|| {
+            backdrop_pose_helpers_inner();
+        });
+    }
+
+    fn backdrop_pose_helpers_inner() {
         const {
             assert!(BACKDROP_SCALE_MIN >= 1.0);
             assert!(BACKDROP_SCALE_BASE - BACKDROP_SCALE_AMP <= BACKDROP_SCALE_MIN + 0.001);
@@ -585,9 +677,48 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn kenburns_tuning_scales_pose_without_breaking_safety() {
+        with_pose_test_lock(|| {
+            assert!(!kenburns_tuning_active());
+            // Amp 0 parks zoom at base; the min floor still holds.
+            set_kenburns_amp_scale(0.0);
+            assert!(kenburns_tuning_active());
+            let half = BACKDROP_ZOOM_PERIOD_MS / 2;
+            assert!((backdrop_pose_scale(half) - BACKDROP_SCALE_BASE).abs() < 0.001);
+            assert!(backdrop_pose_scale(half) >= BACKDROP_SCALE_MIN);
+            // Amp 5x widens the excursion around the same base.
+            set_kenburns_amp_scale(5.0);
+            let peak = BACKDROP_SCALE_BASE + BACKDROP_SCALE_AMP * 5.0;
+            assert!((backdrop_pose_scale(half) - peak).abs() < 0.001);
+            // Pan 0 freezes travel; boosted pan still respects overflow caps.
+            set_kenburns_pan_scale(0.0);
+            assert_eq!(
+                backdrop_pose_pixels(1.0, -1.0, 220.0, 110.0, 200.0, 100.0),
+                (0.0, 0.0)
+            );
+            set_kenburns_pan_scale(5.0);
+            let (px, _) = backdrop_pose_pixels(1.0, 0.0, 800.0, 110.0, 200.0, 100.0);
+            let avail = (800.0 - 200.0) * 0.5 * BACKDROP_PAN_OVERFLOW_CAP;
+            assert!(px <= avail + 0.001);
+            assert!(px > 200.0 * BACKDROP_PAN_STAGE_X);
+            // Speed 0 freezes the pose clock; 2x reaches the quarter turn early.
+            set_kenburns_speed(0.0);
+            assert_eq!(backdrop_pose_offset(half), backdrop_pose_offset(0));
+            set_kenburns_speed(2.0);
+            let (x1, _) = backdrop_pose_offset(BACKDROP_ZOOM_PERIOD_MS / 8);
+            assert!(x1 > 0.9);
+        });
+    }
+
     #[test]
     fn phase_durations() {
-        assert_eq!(TransitionPhase::ExitCompact.duration_ms(), EXIT_COMPACT_MS);
+        assert_eq!(TransitionPhase::ExitCompact.duration_ms(), SWIFT_SEGMENT_MS);
+        // One shared fast segment for exit blackout + enter fades.
+        assert_eq!(SWIFT_SEGMENT_MS, 150);
+        // The invisible morph runs a touch faster.
+        assert_eq!(RESIZE_MS, 100);
         assert_eq!(
             TransitionPhase::EnterImmersive.duration_ms(),
             ENTER_IMMERSIVE_MS
@@ -602,8 +733,8 @@ mod tests {
         );
         assert_eq!(ENTER_IMMERSIVE_MS, ENTER_REVEAL_MS);
         assert_eq!(ENTER_REVEAL_MS, ART_FADE_MS);
-        assert_eq!(EXIT_IMMERSIVE_MS, VEIL_TRANSITION_MS);
-        assert_eq!(ENTER_COMPACT_MS, VEIL_TRANSITION_MS);
+        assert_eq!(EXIT_IMMERSIVE_MS, SWIFT_SEGMENT_MS);
+        assert_eq!(ENTER_COMPACT_MS, SWIFT_SEGMENT_MS);
         assert!((ease_in_cubic(0.0) - 0.0).abs() < 0.001);
         assert!((ease_in_cubic(1.0) - 1.0).abs() < 0.001);
         assert!(ease_in_cubic(0.5) < 0.5);

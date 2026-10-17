@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared local + GitHub Actions checklist (fmt, clippy, test).
+# Shared local + GitHub Actions checklist (fmt, clippy, test, build).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,5 +22,18 @@ cargo clippy --all-targets -- -D warnings
 
 echo "==> cargo test --all-targets"
 cargo test --all-targets
+
+# Test builds don't refresh target/debug/*.exe; build every binary so a green
+# run leaves a runnable sdsc-utils that matches the checked source.
+echo "==> cargo build"
+cargo build
+
+# Debug-only code (developer emulator, HID diagnostics, log levels) is behind
+# cfg(debug_assertions), so the release half of that split needs its own gate.
+echo "==> cargo clippy --release --all-targets -- -D warnings"
+cargo clippy --release --all-targets -- -D warnings
+
+echo "==> cargo build --release"
+cargo build --release
 
 echo "CI checks passed."

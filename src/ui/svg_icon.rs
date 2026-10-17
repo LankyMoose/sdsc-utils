@@ -14,6 +14,7 @@ pub const CLOSE_SVG: &str = include_str!("../../assets/icons/close.svg");
 #[allow(dead_code)] // available for title-bar chrome
 pub const MINIMIZE_SVG: &str = include_str!("../../assets/icons/minimize.svg");
 pub const CHECK_SVG: &str = include_str!("../../assets/icons/check.svg");
+pub const PIN_SVG: &str = include_str!("../../assets/icons/pin.svg");
 pub const FACE_CROSS_SVG: &str = include_str!("../../assets/icons/face-cross.svg");
 pub const FACE_CIRCLE_SVG: &str = include_str!("../../assets/icons/face-circle.svg");
 pub const FACE_TRIANGLE_SVG: &str = include_str!("../../assets/icons/face-triangle.svg");
@@ -22,6 +23,12 @@ pub const GAME_SVG: &str = include_str!("../../assets/icons/game.svg");
 pub const BUG_SVG: &str = include_str!("../../assets/icons/bug.svg");
 pub const GITHUB_SVG: &str = include_str!("../../assets/icons/github.svg");
 pub const MICROSOFT_STORE_SVG: &str = include_str!("../../assets/icons/microsoft-store.svg");
+/// Indeterminate arc; rotated by [`crate::ui::configure`] for pending states.
+#[allow(dead_code)] // debug-only pending indicator
+pub const SPINNER_SVG: &str = include_str!("../../assets/icons/spinner.svg");
+/// Disclosure chevron; rotated 90° when a row is expanded.
+#[allow(dead_code)] // debug-only disclosure control
+pub const CHEVRON_SVG: &str = include_str!("../../assets/icons/chevron.svg");
 
 /// Canonical DualSense body fill in [`DUALSENSE_SVG`].
 pub const BODY_HEX: &str = "#EBEBF0";
