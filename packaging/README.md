@@ -18,7 +18,7 @@ cargo build --release
 
 Requires the Windows SDK (`makeappx.exe`). Logos are generated into `packaging/Assets/` at pack time (`cargo run --bin gen_msix_logos`).
 
-The MSIX layout keeps `sdsc-utils.exe` and `sdsc-shell.exe` side by side. The GitHub portable download is a separate file: `bundle-portable` appends the shell onto a copy of the service exe, and the service unpacks it on first launch when no sibling shell is present.
+The MSIX layout ships the single `sdsc-utils.exe` (tray + HID + UI in one process). The GitHub portable download is the same exe copied to `target/portable/`.
 
 ## Store submission
 

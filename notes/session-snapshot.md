@@ -1,6 +1,11 @@
 # Service-owned session snapshot protocol (1.7.0)
 
-**Status:** implemented. **When to read:** touching service↔shell state sync, adding shared state, changing IPC, debugging stale shell UI. Index: [README.md](README.md).
+> **Superseded by the single-process cutover** (`task/single-process-cutover`):
+> there is no service↔shell split anymore, so no snapshot protocol, intents,
+> handshake, or IPC version. Kept as history for the design rationale.
+> The surviving rules: one process owns `DeviceSession` truth, `HidWorker`
+> owns all HID I/O off the UI thread, and data files have a single writer.
+> Index: [README.md](README.md).
 
 ## Rule
 

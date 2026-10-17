@@ -1,12 +1,12 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-//! SDSC Utils service — owns DualSense HID, tray, and session; spawns the iced shell.
+//! SDSC Utils — tray, DualSense HID, session, and iced UI in one process.
 
 use sdsc_utils::platform::app_log;
-use sdsc_utils::platform::app_meta::{DISPLAY_NAME, PKG_NAME, PKG_VERSION};
+use sdsc_utils::platform::app_meta::{DISPLAY_NAME, PKG_NAME, PKG_VERSION, REPLACE_FLAG};
 use sdsc_utils::platform::autostart;
 use sdsc_utils::platform::crash_restart;
-use sdsc_utils::{controller, ipc, service};
+use sdsc_utils::{app, controller};
 use single_instance::SingleInstance;
 use std::env;
 use std::io::{self, Write};
@@ -21,10 +21,11 @@ fn main() -> ExitCode {
         return crash_restart::run_relauncher();
     }
 
+    let replacing = args.iter().any(|a| a == REPLACE_FLAG);
     let test_crash_toast = args.iter().any(|a| a == "--test-crash-toast");
     let args: Vec<String> = args
         .into_iter()
-        .filter(|a| a != "--test-crash-toast")
+        .filter(|a| a != REPLACE_FLAG && a != "--test-crash-toast")
         .collect();
     if test_crash_toast {
         crash_restart::request_notice();
@@ -90,26 +91,44 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let instance = match SingleInstance::new(PKG_NAME) {
+    // The guard must be held for the whole process lifetime. A renderer
+    // reload (`--replace`) spawns its successor before exiting, so the child
+    // retries briefly while the parent releases the guard; an ordinary
+    // second launch exits at once.
+    let _instance = match acquire_single_instance(replacing) {
         Ok(instance) => instance,
-        Err(err) => {
-            app_log::error(format!("single-instance init failed: {err}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
-    if !instance.is_single() {
-        app_log::info("another instance is already running; exiting");
-        return ExitCode::SUCCESS;
-    }
 
     crash_restart::arm_tray_mode();
 
-    if let Err(err) = service::run() {
-        app_log::error(format!("service exited with error: {err}"));
+    if let Err(err) = app::run() {
+        app_log::error(format!("app exited with error: {err}"));
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Acquire the single-instance guard, retrying briefly for `--replace`.
+fn acquire_single_instance(replacing: bool) -> Result<SingleInstance, ExitCode> {
+    let attempts = if replacing { 100 } else { 1 };
+    for _ in 0..attempts {
+        match SingleInstance::new(PKG_NAME) {
+            Ok(instance) => {
+                if instance.is_single() {
+                    return Ok(instance);
+                }
+            }
+            Err(err) => {
+                app_log::error(format!("single-instance init failed: {err}"));
+                return Err(ExitCode::FAILURE);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    app_log::info("another instance is already running; exiting");
+    Err(ExitCode::SUCCESS)
 }
 
 fn print_help() {
@@ -127,7 +146,7 @@ fn print_help() {
         "      --set-lightbar R G B   Set lightbar RGB (0-255) on all connected pads and exit"
     );
     println!();
-    println!("With no options, starts the HID/tray service and spawns sdsc-shell.");
+    println!("With no options, starts the app (tray + HID + UI in one process).");
 }
 
 fn attach_console_for_cli() {
@@ -150,20 +169,6 @@ fn attach_console_for_cli() {
 }
 
 fn list_controllers_cli() -> ExitCode {
-    // Prefer talking to a running service so we don't open a second HidApi.
-    if let Ok(mut client) = ipc::PipeClient::connect() {
-        match client.request_list_controllers() {
-            Ok(statuses) => {
-                print_controllers(&statuses);
-                return ExitCode::SUCCESS;
-            }
-            Err(err) => {
-                eprintln!("error: ipc list failed: {err}");
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-
     match controller::hid::poll::poll_controllers(&[]) {
         Ok(statuses) => {
             print_controllers(&statuses);
@@ -219,44 +224,6 @@ fn set_lightbar_cli(rgb_args: &[String]) -> ExitCode {
     };
 
     let color = sdsc_utils::domain::color::Rgb::new(r, g, b);
-
-    if let Ok(mut client) = ipc::PipeClient::connect() {
-        // Hello first: the service drops connections that open with anything else.
-        let hello = client
-            .handshake(std::time::Duration::from_secs(3))
-            .and_then(|(protocol, version)| ipc::ensure_protocol(protocol, &version));
-        if let Err(err) = hello {
-            eprintln!("error: {err}");
-            return ExitCode::FAILURE;
-        }
-        if let Err(err) = client.send_command(&ipc::ShellCommand::SetLightbarAll { color }) {
-            eprintln!("error: {err}");
-            return ExitCode::FAILURE;
-        }
-        match ipc::recv_matching(&mut client, |m| {
-            matches!(m, ipc::ServiceMessage::LightbarSet { .. })
-        }) {
-            Ok(ipc::ServiceMessage::LightbarSet { count }) => {
-                if count == 0 {
-                    eprintln!("error: no DualSense controllers found");
-                    return ExitCode::FAILURE;
-                }
-                println!(
-                    "Set lightbar to {} on {count} controller(s).",
-                    color.to_hex()
-                );
-                return ExitCode::SUCCESS;
-            }
-            Ok(other) => {
-                eprintln!("error: unexpected reply {other:?}");
-                return ExitCode::FAILURE;
-            }
-            Err(err) => {
-                eprintln!("error: {err}");
-                return ExitCode::FAILURE;
-            }
-        }
-    }
 
     let any_gamepad = hidapi::HidApi::new()
         .ok()

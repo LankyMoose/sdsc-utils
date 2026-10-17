@@ -24,7 +24,7 @@ echo "==> cargo test --all-targets"
 cargo test --all-targets
 
 # Test builds don't refresh target/debug/*.exe; build every binary so a green
-# run leaves runnable sdsc-utils + sdsc-shell that match the checked source.
+# run leaves a runnable sdsc-utils that matches the checked source.
 echo "==> cargo build"
 cargo build
 
