@@ -10,12 +10,12 @@ struct Uniforms {
     // (0 = square, fully opaque — immersive). w unused.
     mask: vec4<f32>,
     // Dev-only tuning (debug builds):
-    // tune  = pulse freq rad/s (1.4), veil freq rad/s (3.2),
-    //         pulse min (0.10), pulse max (0.14).
-    // tune2 = grain gain (1.0), orb drift speed rad/s (0.3),
+    // tune  = pulse freq rad/s (0.85), veil freq rad/s (3.2),
+    //         pulse min (0.02), pulse max (0.08).
+    // tune2 = grain gain (0.6), orb drift speed rad/s (0.3),
     //         glow hue shift deg (0.0), unused.
     // tune3 = orb bounds in centered uv (-1..1):
-    //         min_x, max_x, min_y, max_y ((-0.35,-0.35,0.05,0.05) = static).
+    //         min_x, max_x, min_y, max_y ((-0.35,0.35,-0.05,0.05) drift box).
     // Release builds always send defaults.
     tune: vec4<f32>,
     tune2: vec4<f32>,
@@ -93,7 +93,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 
     // Drifting accent orb: Lissajous wander inside the tuned bounds
     // (`tune3` = min_x, max_x, min_y, max_y in centered uv). Speed 0 parks
-    // at the bounds center; equal min/max reproduces the static shipped orb.
+    // at the bounds center; shipped bounds drift in a wide shallow box.
     let orb_speed = u.tune2.y;
     let ox_m = 0.5 + 0.5 * sin(u.time * orb_speed);
     let oy_m = 0.5 + 0.5 * sin(u.time * orb_speed * 0.83);

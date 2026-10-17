@@ -25,17 +25,17 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 /// Starting ambient phase. In `ambient.wgsl`, time only drives the accent-bloom
-/// breath (`0.5 + 0.5·sin(t·1.4)`) and grain; `t = 0` holds the breath exactly
-/// mid-swing and matches immersive Start's first frame (`ambient_time` starts
-/// at 0), so a freshly opened utility window looks like a still of the same
-/// atmosphere before the slow drift carries it.
+/// breath and grain; `t = 0` holds the breath exactly mid-swing and matches
+/// immersive Start's first frame (`ambient_time` starts at 0), so a freshly
+/// opened utility window looks like a still of the same atmosphere before
+/// the slow drift carries it.
 pub const FROZEN_TIME: f32 = 0.0;
 
 /// Shell tick period for the utility clock (≤2fps redraws while visible).
 pub const UTILITY_TICK: Duration = Duration::from_millis(500);
 
-/// Utility ambient time runs at 1/8 real-time: one full-rate breath (~4.5s)
-/// stretches to ~36s. Same amplitude as immersive, barely-there pace.
+/// Utility ambient time runs at 1/8 real-time: one full-rate breath (~7.4s)
+/// stretches to ~59s. Same amplitude as immersive, barely-there pace.
 pub const UTILITY_TIME_RATE: f32 = 0.125;
 
 /// Advance per [`UTILITY_TICK`] while a utility window is visible.
@@ -73,7 +73,8 @@ mod tests {
     #[test]
     fn frozen_breath_sits_mid_swing() {
         // Mirrors `pulse` in ambient.wgsl at the opening phase.
-        let pulse = 0.5 + 0.5 * (FROZEN_TIME * 1.4).sin();
+        let pulse =
+            0.5 + 0.5 * (FROZEN_TIME * crate::ui::shader::ambient::DEFAULT_PULSE_FREQ).sin();
         assert!((pulse - 0.5).abs() < 1e-6);
     }
 
@@ -88,9 +89,9 @@ mod tests {
 
     #[test]
     fn utility_drift_stays_subtle() {
-        // One full-rate breath (2π/1.4 ≈ 4.49 utility-seconds) must take
+        // One full-rate breath (2π/0.85 ≈ 7.39 utility-seconds) must take
         // dozens of real seconds at the drift rate.
-        let breath_secs = std::f32::consts::TAU / 1.4;
+        let breath_secs = std::f32::consts::TAU / crate::ui::shader::ambient::DEFAULT_PULSE_FREQ;
         let real_secs = breath_secs / UTILITY_TIME_RATE;
         assert!(real_secs > 30.0);
         // And the tick itself stays at/above a 500ms period (≤2fps).

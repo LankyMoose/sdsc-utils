@@ -247,24 +247,24 @@ pub struct PendingEmulatorChange {
 #[cfg(debug_assertions)]
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct DebugAmbientTune {
-    /// Accent-bloom pulse frequency, rad/s (shipped 1.4).
+    /// Accent-bloom pulse frequency, rad/s (shipped 0.85).
     pub pulse_freq: f32,
     /// Veil pulse frequency, rad/s (shipped 3.2).
     pub veil_freq: f32,
-    /// Accent-bloom strength floor (shipped 0.10).
+    /// Accent-bloom strength floor (shipped 0.02).
     pub pulse_min: f32,
-    /// Accent-bloom strength ceiling (shipped 0.14).
+    /// Accent-bloom strength ceiling (shipped 0.08).
     pub pulse_max: f32,
-    /// Grain gain scale (shipped 1.0).
+    /// Grain gain scale (shipped 0.6).
     pub grain_gain: f32,
-    /// Orb drift speed, rad/s (shipped 0.3; static until bounds separate).
+    /// Orb drift speed, rad/s (shipped 0.3).
     pub orb_speed: f32,
     /// Glow hue shift, degrees (shipped 0.0).
     pub glow_hue: f32,
-    /// Orb X wander bounds in centered uv (shipped -0.35, -0.35).
+    /// Orb X wander bounds in centered uv (shipped -0.35, 0.35).
     pub orb_min_x: f32,
     pub orb_max_x: f32,
-    /// Orb Y wander bounds in centered uv (shipped 0.05, 0.05).
+    /// Orb Y wander bounds in centered uv (shipped -0.05, 0.05).
     pub orb_min_y: f32,
     pub orb_max_y: f32,
     /// CPU time advance multiplier; 0 freezes the pulse (shipped 1.0).

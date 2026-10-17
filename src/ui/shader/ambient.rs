@@ -11,23 +11,24 @@ use std::time::Duration;
 
 static PIPELINE_LOGGED: AtomicBool = AtomicBool::new(false);
 
-/// Defaults reproducing current visuals (also the release behavior).
-pub const DEFAULT_PULSE_FREQ: f32 = 1.4;
+/// Defaults: locked-in Diagnostics tuning export (also the release behavior).
+/// pulse 0.85 rad/s (~7.4s breath), bloom 0.02–0.08, grain 0.6, orb drifting
+/// in a wide shallow box (±0.35 x, ±0.05 y at 0.3 rad/s), hue unshifted.
+pub const DEFAULT_PULSE_FREQ: f32 = 0.85;
 pub const DEFAULT_VEIL_FREQ: f32 = 3.2;
 /// Accent-bloom strength floor (pulse trough).
-pub const DEFAULT_PULSE_MIN: f32 = 0.10;
+pub const DEFAULT_PULSE_MIN: f32 = 0.02;
 /// Accent-bloom strength ceiling (pulse peak).
-pub const DEFAULT_PULSE_MAX: f32 = 0.14;
-pub const DEFAULT_GRAIN_GAIN: f32 = 1.0;
-/// Orb drift speed, rad/s. Shipped bounds are a static point, so this only
-/// matters once min/max separate (0 parks at the bounds center).
+pub const DEFAULT_PULSE_MAX: f32 = 0.08;
+pub const DEFAULT_GRAIN_GAIN: f32 = 0.6;
+/// Orb drift speed, rad/s (0 parks at the bounds center).
 pub const DEFAULT_ORB_SPEED: f32 = 0.3;
 /// Glow hue shift, degrees (0 = theme accent untouched).
 pub const DEFAULT_GLOW_HUE: f32 = 0.0;
-/// Static shipped orb position in centered uv (min == max = no drift).
+/// Shipped orb wander bounds in centered uv (wide shallow drift).
 pub const DEFAULT_ORB_MIN_X: f32 = -0.35;
-pub const DEFAULT_ORB_MAX_X: f32 = -0.35;
-pub const DEFAULT_ORB_MIN_Y: f32 = 0.05;
+pub const DEFAULT_ORB_MAX_X: f32 = 0.34999996;
+pub const DEFAULT_ORB_MIN_Y: f32 = -0.05000002;
 pub const DEFAULT_ORB_MAX_Y: f32 = 0.05;
 /// CPU time advance multiplier (`tick_anim`); 0 freezes the pulse.
 pub const DEFAULT_TIME_SCALE: f32 = 1.0;
@@ -634,9 +635,11 @@ mod tests {
                     DEFAULT_ORB_MAX_Y
                 ]
             );
-            // Static shipped orb: equal min/max reproduces the old glow center.
+            // Locked-in orb: wide shallow drift box (±0.35 x, ±0.05 y).
             assert!((u.tune3[0] + 0.35).abs() < 1e-6);
-            assert!((u.tune3[2] - 0.05).abs() < 1e-6);
+            assert!((u.tune3[1] - 0.34999996).abs() < 1e-6);
+            assert!((u.tune3[2] + 0.05000002).abs() < 1e-6);
+            assert!((u.tune3[3] - 0.05).abs() < 1e-6);
             assert!((ambient_tick_dt() - 1.0 / 60.0).abs() < 1e-6);
             assert!(!tuning_active());
         });
