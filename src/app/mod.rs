@@ -124,6 +124,13 @@ const STEAM_SCAN_IDLE_FALLBACK: Duration = Duration::from_secs(2);
 pub enum Message {
     /// Periodic presence scan.
     Tick,
+    /// OS device arrival/removal hint (event-driven wake; see
+    /// `presence_hint_stream`). Handled like `Tick` but fires immediately
+    /// instead of waiting for the next presence cadence.
+    PresenceHint,
+    /// Follow-up poll after a suspected absence (see
+    /// `maybe_schedule_absence_recheck`).
+    AbsenceRecheck,
     /// Debounce clock for a previewed emulated-pad battery level.
     ///
     /// Only subscribed while a preview is pending.
@@ -238,7 +245,7 @@ impl Message {
     /// work.
     fn is_user_input(&self) -> bool {
         match self {
-            Message::Tick => false,
+            Message::Tick | Message::PresenceHint | Message::AbsenceRecheck => false,
             #[cfg(debug_assertions)]
             Message::EmulatorCommitTick => false,
             Message::PollResult(_) | Message::ProcessEnumResult(_) | Message::CloseGameDone(_) => {
@@ -322,6 +329,10 @@ pub struct App {
     identifying: Arc<AtomicBool>,
     /// True while a background battery poll is in flight.
     refreshing: Arc<AtomicBool>,
+    /// An absence-recheck poll is already queued (one-shot; see
+    /// `maybe_schedule_absence_recheck`). Prevents a miss from scheduling
+    /// a recheck per liveness tick while a pad flaps.
+    absence_recheck_pending: bool,
     /// Serializes DualSense HID for the daemon (never on the UI thread).
     hid_worker: HidWorkerHandle,
 
@@ -624,6 +635,7 @@ impl App {
             last_battery_poll: Instant::now(),
             identifying,
             refreshing: Arc::new(AtomicBool::new(false)),
+            absence_recheck_pending: false,
             hid_worker,
             tray_icon: None,
             tray_anchor: TrayAnchor::default(),
@@ -933,6 +945,10 @@ impl App {
             .map(|_| Message::Tick),
         );
         subscriptions.push(Subscription::run(tray_events_mapped));
+        // OS device arrival/removal wake (event-driven; the Tick timer above
+        // is only a backstop). Always subscribed like tray events: the stream
+        // owns its watcher registration for the process lifetime.
+        subscriptions.push(Subscription::run(presence_hint_stream));
 
         if self.toast_message.is_some() {
             subscriptions.push(Subscription::run_with(
@@ -1142,6 +1158,8 @@ impl App {
         }
         match message {
             Message::Tick => self.on_tick(),
+            Message::PresenceHint => self.on_presence_hint(),
+            Message::AbsenceRecheck => self.on_absence_recheck(),
             #[cfg(debug_assertions)]
             Message::ToggleDebugLayoutBounds => {
                 self.debug_layout_bounds = !self.debug_layout_bounds;
@@ -1832,6 +1850,61 @@ impl App {
     // Controller polling
     // -----------------------------------------------------------------------
 
+    /// OS arrival/removal hint: poll immediately instead of waiting for the
+    /// next `Tick`. The poll refreshes the device list itself, so this is
+    /// race-free even if the worker has not processed its own hint yet.
+    fn on_presence_hint(&mut self) -> Task<Message> {
+        #[cfg(debug_assertions)]
+        if self.emulating() {
+            return Task::none();
+        }
+
+        if self.identifying.load(Ordering::SeqCst) || self.refreshing.load(Ordering::SeqCst) {
+            return Task::none();
+        }
+
+        self.last_discovered = self.hid_worker.presence_paths();
+        self.request_refresh()
+    }
+
+    /// Follow-up poll after a suspected absence. The miss-hold window
+    /// (`POLL_MISS_HOLD`) is shorter than the liveness cadence, so without
+    /// this every first miss would cost a full extra liveness tick before the
+    /// drop confirms. One-shot per absence (guarded by
+    /// `absence_recheck_pending`); the hold still owns correctness, this only
+    /// shortens the tail.
+    fn on_absence_recheck(&mut self) -> Task<Message> {
+        self.absence_recheck_pending = false;
+        #[cfg(debug_assertions)]
+        if self.emulating() {
+            return Task::none();
+        }
+
+        if self.identifying.load(Ordering::SeqCst) || self.refreshing.load(Ordering::SeqCst) {
+            return Task::none();
+        }
+
+        if !self.session.has_poll_misses() {
+            return Task::none();
+        }
+
+        self.request_refresh()
+    }
+
+    /// Queue one [`Message::AbsenceRecheck`] at hold expiry when a pad is
+    /// currently held across a miss. No-op when nothing is missing or a
+    /// recheck is already queued.
+    fn maybe_schedule_absence_recheck(&mut self) -> Task<Message> {
+        if self.absence_recheck_pending || !self.session.has_poll_misses() {
+            return Task::none();
+        }
+        self.absence_recheck_pending = true;
+        Task::perform(
+            delay(crate::session::POLL_MISS_HOLD + Duration::from_millis(200)),
+            |()| Message::AbsenceRecheck,
+        )
+    }
+
     fn on_tick(&mut self) -> Task<Message> {
         #[cfg(debug_assertions)]
         if self.emulating() {
@@ -1934,11 +2007,12 @@ impl App {
                     lightbar_enabled: lightbar::is_enabled(),
                 };
                 let effects = self.session.on_poll_result(controllers, ctx);
-                self.apply_session_effects(effects)
+                let effects_task = self.apply_session_effects(effects);
+                Task::batch([effects_task, self.maybe_schedule_absence_recheck()])
             }
             Err(err) => {
                 app_log::warn(format!("refresh failed: {err}"));
-                Task::none()
+                self.maybe_schedule_absence_recheck()
             }
         }
     }
@@ -7238,6 +7312,32 @@ impl Drop for InputEdgeBindGuard {
     fn drop(&mut self) {
         start_input::clear_input_edge_sender();
     }
+}
+
+/// OS device arrival/removal wake for iced.
+///
+/// Bridges the `device_watch` callback (fires on a system thread) into the
+/// iced runtime so arrivals poll immediately instead of waiting for the next
+/// `Tick`. Like `tray_events`, this stream is subscribed for the whole process
+/// lifetime, so exactly one watcher registration exists. Platforms without a
+/// watcher (macOS) never fire; the `Tick` backstop covers them.
+fn presence_hint_stream() -> impl Stream<Item = Message> {
+    stream::channel(16, async move |mut output| {
+        let (tx, mut rx) = iced::futures::channel::mpsc::channel::<()>(16);
+        // `try_send` takes `&mut self`; the watcher callback is `Fn`, so
+        // share the sender behind a mutex (uncontended: one watcher, one drain).
+        let tx = std::sync::Mutex::new(tx);
+        let _watched = crate::platform::device_watch::spawn_arrival_watcher(move || {
+            if let Ok(mut guard) = tx.lock() {
+                let _ = guard.try_send(());
+            }
+        });
+        while rx.next().await.is_some() {
+            if output.send(Message::PresenceHint).await.is_err() {
+                break;
+            }
+        }
+    })
 }
 
 /// Hitch context: the shared input snapshot (`INPUT_SNAPSHOT`) is the

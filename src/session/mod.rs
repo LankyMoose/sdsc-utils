@@ -5,7 +5,7 @@
 mod gate;
 
 pub use gate::{
-    ConnectCooldownDecision, connect_cooldown_on_empty, has_start_presence,
+    ConnectCooldownDecision, POLL_MISS_HOLD, connect_cooldown_on_empty, has_start_presence,
     reconcile_poll_with_hold, should_auto_close_start, should_auto_open_start,
     should_defer_auto_open_start, should_flush_latched_start,
     should_skip_connect_cooldown_on_power_off, take_skip_connect_cooldown,
@@ -116,6 +116,12 @@ impl DeviceSession {
 
     pub fn clear_missed_polls(&mut self) {
         self.missed_poll_since.clear();
+    }
+
+    /// True while at least one previously-seen pad is inside the miss-hold
+    /// window (present before, missing from the latest poll, hold unexpired).
+    pub fn has_poll_misses(&self) -> bool {
+        !self.missed_poll_since.is_empty()
     }
 
     pub fn mark_skip_connect_cooldown(&mut self) {
@@ -554,6 +560,36 @@ mod tests {
         );
         assert_eq!(session.controllers.len(), 1);
         assert!(queued_bodies(&effects).contains(&"Disconnected".to_string()));
+    }
+
+    #[test]
+    fn poll_miss_flag_tracks_hold_lifecycle() {
+        use std::time::Duration;
+
+        let mut session = session_with(false, StartAutoOpen::Any);
+        let pad_a = bt_pad("aa");
+        let t0 = Instant::now();
+        let ctx_at = |now: Instant| ApplyContext {
+            start_visible: false,
+            fullscreen: false,
+            now,
+            lightbar_enabled: false,
+        };
+        let _ = session.apply_controllers(vec![pad_a.clone()], ctx_at(t0));
+        assert!(!session.has_poll_misses());
+
+        // First miss: held, flag set (drives the app-side absence recheck).
+        let _ = session.on_poll_result(vec![], ctx_at(t0 + Duration::from_millis(100)));
+        assert_eq!(session.controllers.len(), 1);
+        assert!(session.has_poll_misses());
+
+        // Hold expiry drops the pad and clears the flag (no recheck loop).
+        let _ = session.on_poll_result(
+            vec![],
+            ctx_at(t0 + crate::session::POLL_MISS_HOLD + Duration::from_millis(500)),
+        );
+        assert!(session.controllers.is_empty());
+        assert!(!session.has_poll_misses());
     }
 
     #[test]

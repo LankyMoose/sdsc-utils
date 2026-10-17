@@ -51,8 +51,13 @@ use std::time::{Duration, Instant};
 
 const PULSE_SAMPLE_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const SLOW_CMD_LOG_MS: u128 = 20;
-/// Background input wake when nothing is listening (command wait only).
-const BACKGROUND_POLL: Duration = Duration::from_millis(50);
+/// Cold-idle presence heartbeat: how long the worker blocks when input is not
+/// live and no output is pending. Refreshes the device list on timeout so
+/// arrival still works on platforms without an OS watcher (macOS); watcher
+/// hints (`RefreshPresence`) cover the fast path everywhere else. One
+/// `refresh_devices` (~10ms) per 2s is ~40x cheaper than the old 50ms sample
+/// loop it replaces — never sample here, battery comes from Poll on demand.
+const COLD_PRESENCE_HEARTBEAT: Duration = Duration::from_secs(2);
 /// Active input wake ≈ one wired DualSense report (`bInterval` 4).
 const ACTIVE_POLL: Duration = Duration::from_millis(4);
 /// While waiting for the next Identify flash, still sample this often.
@@ -82,6 +87,35 @@ fn refresh_overdue_at(last_refresh: Option<Instant>, now: Instant, max_age: Dura
 /// `last`, evaluated at `now`.
 fn backoff_skip_at(fails: u32, last: Instant, now: Instant) -> bool {
     fails >= OPEN_BACKOFF_THRESHOLD && now.saturating_duration_since(last) < OPEN_BACKOFF_WINDOW
+}
+
+/// Cold-idle heartbeat: refresh soon when no handles are open (first connect
+/// depends on it where no OS watcher runs), otherwise the hot-enumeration
+/// heartbeat cap is plenty (App liveness polls refresh sooner anyway).
+fn cold_heartbeat_timeout(devices_empty: bool) -> Duration {
+    if devices_empty {
+        COLD_PRESENCE_HEARTBEAT
+    } else {
+        HOT_ENUM_MAX_DEFER
+    }
+}
+
+/// Pure check: an `input_hot` store only needs to wake the worker when the
+/// value actually flips (steady-state subscription rebuilds must not spam
+/// the command channel and defeat cold-idle blocking).
+fn hot_store_wakes(previous: bool, next: bool) -> bool {
+    previous != next
+}
+
+/// Pure cold-idle wait: a pending low-battery pulse deadline wins, otherwise
+/// the presence heartbeat bounds the block; 1ms floor for clock skew.
+fn idle_timeout_for(pulse_wake: Option<Instant>, devices_empty: bool, now: Instant) -> Duration {
+    let heartbeat = cold_heartbeat_timeout(devices_empty);
+    pulse_wake
+        .map(|t| t.saturating_duration_since(now))
+        .unwrap_or(heartbeat)
+        .min(heartbeat)
+        .max(Duration::from_millis(1))
 }
 
 /// Consecutive open failures per HID path (ghost devices linger in Windows
@@ -123,6 +157,9 @@ enum HidCmd {
     /// OS arrival/removal hint (device_watch): refresh the device list only.
     /// Sampling opens newcomers; session ticks pick up membership.
     RefreshPresence,
+    /// Prompt the loop to re-evaluate without other work (e.g. `input_hot`
+    /// flipped while cold-idle in a long heartbeat block). No HID I/O.
+    Wake,
     Shutdown,
 }
 
@@ -887,9 +924,13 @@ impl HidWorkerHandle {
         out
     }
 
-    /// Elevate input sampling to ~60 Hz while start-nav needs it.
+    /// Elevate input sampling to ~60 Hz while start-nav needs it. Wakes the
+    /// worker on transitions: a bare atomic store would sit unnoticed until
+    /// the cold-idle heartbeat (up to 20s) expires.
     pub fn set_input_hot(&self, hot: bool) {
-        self.input_hot.store(hot, Ordering::Relaxed);
+        if hot_store_wakes(self.input_hot.swap(hot, Ordering::Relaxed), hot) {
+            let _ = self.tx.send(HidCmd::Wake);
+        }
     }
 
     pub fn input_hot(&self) -> bool {
@@ -1633,6 +1674,7 @@ fn handle_cmd(
     input_hot: bool,
 ) -> bool {
     match cmd {
+        HidCmd::Wake => false,
         HidCmd::Shutdown => {
             *pending_power_off = None;
             abort_identify(session, cache, identifying);
@@ -2077,6 +2119,7 @@ fn worker_loop(
                     HidCmd::RumbleStopAll => "RumbleStopAll",
                     HidCmd::SetLowBatteryTargets { .. } => "SetLowBatteryTargets",
                     HidCmd::RefreshPresence => "RefreshPresence",
+                    HidCmd::Wake => "Wake",
                     HidCmd::Shutdown => "Shutdown",
                 };
                 if handle_cmd(
@@ -2147,13 +2190,13 @@ fn worker_loop(
             continue;
         }
 
-        // Idle: wait for a command, presence wake, or next pulse tick.
-        let idle_timeout = pulse
-            .wake_at()
-            .map(|t| t.saturating_duration_since(Instant::now()))
-            .unwrap_or(BACKGROUND_POLL)
-            .min(BACKGROUND_POLL)
-            .max(Duration::from_millis(1));
+        // Cold idle: input is not live and no output is pending (the branch
+        // above owns hot / Identify / rumble / pulse-imminent / power-off).
+        // Block until the next command, arrival hint, pulse deadline, or
+        // presence heartbeat — never sample here. Battery/liveness come from
+        // Poll on App demand, which refreshes the list itself.
+        let idle_timeout =
+            idle_timeout_for(pulse.wake_at(), cache.devices.is_empty(), Instant::now());
         match rx.recv_timeout(idle_timeout) {
             Ok(cmd) => {
                 in_cmd = match &cmd {
@@ -2165,6 +2208,7 @@ fn worker_loop(
                     HidCmd::RumbleStopAll => "RumbleStopAll",
                     HidCmd::SetLowBatteryTargets { .. } => "SetLowBatteryTargets",
                     HidCmd::RefreshPresence => "RefreshPresence",
+                    HidCmd::Wake => "Wake",
                     HidCmd::Shutdown => "Shutdown",
                 };
                 if handle_cmd(
@@ -2188,14 +2232,13 @@ fn worker_loop(
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                sample_all_inputs(
-                    &mut cache,
-                    &live_pads,
-                    &input_snapshot,
-                    hot,
-                    &last_noisy_log,
-                    None,
-                );
+                if pulse.wake_at().is_none() {
+                    // Heartbeat: keep presence fresh on platforms without an
+                    // OS arrival watcher (macOS); watcher hints cover the rest.
+                    let _ = cache.refresh_device_list();
+                }
+                // Else: pulse deadline reached — loop around so pulse.tick()
+                // at the top advances the schedule (no sampling while cold).
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -2419,8 +2462,52 @@ mod tests {
     fn presence_enum_interval_empty_is_fast_open_is_slow() {
         assert_eq!(presence_enum_interval(true, true), PRESENCE_INTERVAL_EMPTY);
         assert_eq!(presence_enum_interval(true, false), PRESENCE_INTERVAL_EMPTY);
-        // Hot + open must not use the 500ms EMPTY cadence (hidapi_refresh stall).
+        // Hot + open must not use the EMPTY cadence (hidapi_refresh stall).
         assert_eq!(presence_enum_interval(false, true), PRESENCE_INTERVAL);
         assert_eq!(presence_enum_interval(false, false), PRESENCE_INTERVAL);
+    }
+
+    #[test]
+    fn hot_store_wakes_only_on_flip() {
+        assert!(hot_store_wakes(false, true));
+        assert!(hot_store_wakes(true, false));
+        assert!(!hot_store_wakes(false, false));
+        assert!(!hot_store_wakes(true, true));
+    }
+
+    #[test]
+    fn cold_heartbeat_is_short_empty_long_open() {
+        // Empty: first-connect depends on it where no OS watcher runs.
+        assert_eq!(cold_heartbeat_timeout(true), COLD_PRESENCE_HEARTBEAT);
+        // Open but cold: App liveness polls refresh sooner anyway.
+        assert_eq!(cold_heartbeat_timeout(false), HOT_ENUM_MAX_DEFER);
+        assert!(COLD_PRESENCE_HEARTBEAT < HOT_ENUM_MAX_DEFER);
+    }
+
+    #[test]
+    fn idle_timeout_prefers_pulse_deadline_then_heartbeat() {
+        let now = Instant::now();
+        // No pulse: heartbeat by open state.
+        assert_eq!(idle_timeout_for(None, true, now), COLD_PRESENCE_HEARTBEAT);
+        assert_eq!(idle_timeout_for(None, false, now), HOT_ENUM_MAX_DEFER);
+        // Pulse deadline sooner than heartbeat wins (pulse gap cadence, not 50ms).
+        let soon = now + Duration::from_millis(400);
+        assert_eq!(
+            idle_timeout_for(Some(soon), true, now),
+            Duration::from_millis(400)
+        );
+        // Pulse deadline past the heartbeat is capped.
+        let far = now + Duration::from_secs(60);
+        assert_eq!(
+            idle_timeout_for(Some(far), true, now),
+            COLD_PRESENCE_HEARTBEAT
+        );
+        assert_eq!(idle_timeout_for(Some(far), false, now), HOT_ENUM_MAX_DEFER);
+        // Elapsed deadline floors at 1ms (never busy-spins on zero).
+        let past = now - Duration::from_millis(10);
+        assert_eq!(
+            idle_timeout_for(Some(past), true, now),
+            Duration::from_millis(1)
+        );
     }
 }
