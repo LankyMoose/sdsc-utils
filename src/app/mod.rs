@@ -6113,6 +6113,13 @@ impl App {
         }
 
         if !listening {
+            // Start is closed and the PadInput tab is not open: the only
+            // live consumer is the reopen chord (PS press to open Start).
+            // Edges only arrive here while pads are connected, so this is
+            // exactly the "PS to open" path — never drop it.
+            if !start_open {
+                return self.on_reopen_gesture(&readings);
+            }
             return Task::none();
         }
 
