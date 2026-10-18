@@ -30,3 +30,21 @@ jobs:
       - name: Format, Clippy, Test
         shell: bash
         run: bash scripts/ci.sh
+
+  msrv:
+    name: MSRV floor
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Must track `rust-version` in Cargo.toml. Only a compile check:
+          # it enforces the floor claim against the exact committed
+          # dependency set, nothing more.
+          toolchain: 1.88
+
+      - name: Check MSRV floor
+        shell: bash
+        run: cargo +1.88 check --locked --all-targets
