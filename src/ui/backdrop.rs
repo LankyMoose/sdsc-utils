@@ -52,9 +52,7 @@ pub fn utility_time() -> f32 {
 /// shell's slow-tick handler; a no-op visually unless a utility window is
 /// open (no tick subscription exists otherwise, so idle windows stay still).
 pub fn note_utility_tick() {
-    let _ = UTILITY_TIME_BITS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
-        Some((f32::from_bits(bits) + UTILITY_DT).to_bits())
-    });
+    crate::ui::shader::ambient::advance_time_bits(&UTILITY_TIME_BITS, UTILITY_DT);
 }
 
 /// Full-bleed backdrop layer (iris fully open, no veil, no dock push), masked
