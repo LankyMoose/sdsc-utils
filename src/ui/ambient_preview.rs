@@ -57,9 +57,7 @@ fn note_preview_tick_at(now: Instant) {
         // Poisoned (a test panicked mid-tick): fall back to nominal.
         Err(_) => crate::ui::shader::ambient::ambient_tick_dt(),
     };
-    let _ = PREVIEW_TIME_BITS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
-        Some((f32::from_bits(bits) + dt).to_bits())
-    });
+    crate::ui::shader::ambient::advance_time_bits(&PREVIEW_TIME_BITS, dt);
 }
 
 /// Full-bleed immersive-rate backdrop: ambient atmosphere plus the same

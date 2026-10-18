@@ -248,6 +248,24 @@ pub fn ambient_dt_for_elapsed(elapsed: Duration) -> f32 {
     elapsed.min(crate::ui::motion::MAX_FRAME_DT).as_secs_f32() * time_scale()
 }
 
+/// Atomically add `dt` seconds to an `f32`-as-bits clock.
+///
+/// Deliberately a `compare_exchange` retry loop instead of
+/// `AtomicU32::fetch_update` (renamed to `try_update` in Rust 1.99): the
+/// loop compiles warning-free from MSRV (1.88) through latest stable, while
+/// the new name breaks older toolchains and the old name errors under
+/// `-D warnings` on new ones.
+pub fn advance_time_bits(clock: &AtomicU32, dt: f32) {
+    let mut bits = clock.load(Ordering::Relaxed);
+    loop {
+        let next = (f32::from_bits(bits) + dt).to_bits();
+        match clock.compare_exchange_weak(bits, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => bits = actual,
+        }
+    }
+}
+
 /// True while any ambient tuning differs from the shipped defaults.
 #[cfg(debug_assertions)]
 pub fn tuning_active() -> bool {
