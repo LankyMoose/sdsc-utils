@@ -4,9 +4,7 @@ use crate::ui::theme;
 use iced::mouse;
 use iced::widget::shader::{self, Viewport};
 use iced::{Color, Rectangle};
-#[cfg(debug_assertions)]
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 static PIPELINE_LOGGED: AtomicBool = AtomicBool::new(false);
