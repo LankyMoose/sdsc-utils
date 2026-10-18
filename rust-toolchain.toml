@@ -1,0 +1,13 @@
+# Single source of truth for the Rust toolchain, local and CI alike.
+#
+# - `rust-version` in Cargo.toml (1.88) is the MSRV *floor* and stays: the
+#   code must keep building there (let-chains need 1.88).
+# - This file pins the *actual* compiler everyone builds and tests with, so
+#   a new stable release can never again break CI while local dev still sits
+#   on the previous one (the 1.99 `fetch_update` rename did exactly that).
+# - CI (dtolnay/rust-toolchain with no `toolchain:` input) follows this file.
+# - Bump deliberately: edit the channel, run scripts/ci.sh, commit. The bump
+#   PR itself surfaces any new lints under -D warnings. Never float `stable`.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy", "rust-src"]
