@@ -2,12 +2,12 @@
 #
 # - `rust-version` in Cargo.toml (1.88) is the MSRV *floor* and stays: the
 #   code must keep building there (let-chains need 1.88).
-# - This file pins the *actual* compiler everyone builds and tests with, so
-#   a new stable release can never again break CI while local dev still sits
-#   on the previous one (the 1.99 `fetch_update` rename did exactly that).
-# - CI (dtolnay/rust-toolchain with no `toolchain:` input) follows this file.
-# - Bump deliberately: edit the channel, run scripts/ci.sh, commit. The bump
-#   PR itself surfaces any new lints under -D warnings. Never float `stable`.
+# - This file pins the *actual* compiler local dev builds and tests with
+#   (rustup auto-installs it). CI does NOT follow this file — the dtolnay
+#   action defaults to floating `stable` — so ci.yml pins the same version
+#   explicitly via its `toolchain:` input. Bump BOTH files together.
+# - Bump deliberately: edit both pins, run scripts/ci.sh, commit. The bump
+#   commit itself surfaces any new lints under -D warnings. Never float.
 [toolchain]
 channel = "1.99.1"
 components = ["rustfmt", "clippy", "rust-src"]

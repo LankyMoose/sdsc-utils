@@ -18,6 +18,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          # Pinned to rust-toolchain.toml: the action defaults to floating
+          # `stable`, which broke CI on the 1.99 fetch_update rename while
+          # local dev lagged behind. Bump both files together.
+          toolchain: 1.99.1
           components: rustfmt, clippy
 
       - name: Cache cargo

@@ -53,7 +53,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **No telemetry**: All data stays local (`prefs.json`, `controllers.json`, `analytics.json`, `app.log`).
 - **Git hooks** (`git config core.hooksPath .githooks`): pre-commit runs `cargo fmt --all` and re-stages staged `.rs` files; pre-push runs `scripts/ci.sh`. Bypass with `--no-verify`.
 - **CI**: GitHub Actions `ci.yml` runs `bash scripts/ci.sh` on push/PR. The script does fmt → clippy → test → build in order.
-- **Toolchain is pinned**: `rust-toolchain.toml` names the exact compiler local dev and CI both use (rustup auto-installs it; the dtolnay action follows the file). `rust-version` in `Cargo.toml` (1.88) is only the MSRV floor — never float or "sync" the pin to it. Bump the pin deliberately (edit file → run `scripts/ci.sh` → commit) so new-compiler lints surface in the bump commit, not as surprise CI failures.
+- **Toolchain is pinned**: `rust-toolchain.toml` names the exact compiler for local dev (rustup auto-installs it); `ci.yml` pins the same version explicitly via the dtolnay `toolchain:` input (the action defaults to floating `stable`, it does not follow the file). `rust-version` in `Cargo.toml` (1.88) is only the MSRV floor — never float or "sync" the pins to it. Bump deliberately (both pins → run `scripts/ci.sh` → commit) so new-compiler lints surface in the bump commit, not as surprise CI failures.
 
 ## Platform-specific notes
 
