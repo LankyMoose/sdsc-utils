@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::platform::file_icon::FileIconCache;
-use crate::platform::host::{Host, Icons};
+use crate::platform::host::Host;
 use crate::ui::svg_icon::SvgRasterCache;
 
 /// Owned warm-generation counter for Start art prefetches.
@@ -297,7 +297,7 @@ impl IconCache {
             state.clear_epoch
         ));
         drop(state);
-        Host::clear(&self.shell);
+        Host::icon_clear(&self.shell);
         self.svg.clear_all();
     }
 
@@ -835,7 +835,7 @@ fn decode_file_sized(
 }
 
 fn decode_shell(path: &Path, size: u32, cache: &FileIconCache) -> Option<(u32, u32, Vec<u8>)> {
-    let (width, height, pixels) = Host::get(cache, path, size)?;
+    let (width, height, pixels) = Host::icon_get(cache, path, size)?;
     crate::controller::hid::diag::diag_info(format!(
         "ui-diag: icon handle shell={} src={width}x{height} dst={width}x{height} size={size}",
         path.display()

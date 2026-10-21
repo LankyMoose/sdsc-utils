@@ -31,11 +31,11 @@ use crate::games::process_match::RunningSession;
 use crate::games::process_match::SeenCache;
 use crate::games::steam::SteamGame;
 use crate::persist::analytics::AnalyticsStore;
-use crate::persist::notify::NotifyEvent;
 use crate::persist::prefs::{NavbarVisibility, Prefs};
 use crate::platform::app_log;
 use crate::platform::host::{Autostart as _, Host, Hotkeys as _, Watcher as _};
 use crate::platform::ui_sound::{SoundHub, UiSoundKind};
+use crate::session::notify::NotifyEvent;
 use crate::ui::configure::{
     self as configure_view, AnalyticsPanel, ConfigureMessage, ConfigureState, PadInputPanel,
     Section,
@@ -85,9 +85,6 @@ const SPECTRUM_DEBOUNCE: Duration = Duration::from_millis(150);
 const DEBUG_OPEN_ENV: &str = crate::platform::debug_quiet::DEBUG_OPEN_ENV;
 /// How long an overlay toast stays on screen.
 const TOAST_LIFETIME: Duration = Duration::from_secs(5);
-/// DualSense poll rate while pad input is live (~one wired report).
-#[allow(dead_code)] // documentation / parity with worker ACTIVE_POLL
-const PAD_POLL_ACTIVE: Duration = Duration::from_millis(4);
 /// UI animation tick (~60Hz). Prefer this over `window::frames()` so an
 /// AlwaysOnTop toast cannot starve other iced windows on Windows (iced#3108).
 const UI_TICK: Duration = Duration::from_millis(16);
@@ -2331,15 +2328,6 @@ impl App {
     // -----------------------------------------------------------------------
     // Start screen
     // -----------------------------------------------------------------------
-
-    /// True when HID/UI input sampling should run at the active (~report-rate) rate.
-    #[allow(dead_code)] // kept for callers / diagnostics that still want the hot predicate
-    fn pad_input_hot(&self) -> bool {
-        self.start_visible
-            || (self.configure_window.is_some()
-                && self.configure_state.section == Section::PadInput)
-            || (self.session.prefs.start_screen_enabled && !self.session.controllers.is_empty())
-    }
 
     fn queue_notifications(
         &mut self,

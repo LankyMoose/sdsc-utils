@@ -179,35 +179,51 @@ pub trait Autostart {
     fn ensure_quiet_entry();
 }
 
-/// Shell icon extraction for local files.
-pub trait Icons {
-    /// Square RGBA icon for `path`, or `None` when extraction fails.
-    ///
-    /// Reads through the Start image layer's owned
-    /// [`crate::platform::file_icon::FileIconCache`]
-    /// (see [`crate::ui::start::icon_cache::IconCache`]); no process-global.
-    fn get(
-        cache: &crate::platform::file_icon::FileIconCache,
-        path: &std::path::Path,
-        size: u32,
-    ) -> Option<(u32, u32, Vec<u8>)>;
-    /// Drop every cached shell extract (process Exit).
-    fn clear(cache: &crate::platform::file_icon::FileIconCache);
-}
-
-/// App data-directory locations.
-pub trait Paths {
-    /// Directory for prefs, controllers, analytics (and the log file).
-    fn data_dir() -> std::path::PathBuf;
-    /// Create the data directory and open it in the OS file manager.
-    fn open_data_folder() -> Result<(), String>;
-}
-
 /// Default host: delegates verbatim to the existing platform implementations.
 ///
 /// Non-Windows behavior is inherited from the existing per-platform stubs
 /// (`false` / `Err` / `None`), unchanged.
 pub struct Host;
+
+/// Shell icon extraction for local files.
+///
+/// Single implementation; plain associated functions on [`Host`] (no trait:
+/// there is only one backend and no mock callers).
+///
+/// Reads through the Start image layer's owned
+/// [`crate::platform::file_icon::FileIconCache`]
+/// (see [`crate::ui::start::icon_cache::IconCache`]); no process-global.
+impl Host {
+    /// Square RGBA icon for `path`, or `None` when extraction fails.
+    pub fn icon_get(
+        cache: &crate::platform::file_icon::FileIconCache,
+        path: &std::path::Path,
+        size: u32,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        cache.rgba_for_path(path, size)
+    }
+
+    /// Drop every cached shell extract (process Exit).
+    pub fn icon_clear(cache: &crate::platform::file_icon::FileIconCache) {
+        cache.clear_all();
+    }
+}
+
+/// App data-directory locations.
+///
+/// Single implementation delegating verbatim to [`crate::persist::paths`];
+/// plain associated functions on [`Host`] (no trait: one backend, no mocks).
+impl Host {
+    /// Directory for prefs, controllers, analytics (and the log file).
+    pub fn data_dir() -> std::path::PathBuf {
+        crate::persist::paths::data_dir()
+    }
+
+    /// Create the data directory and open it in the OS file manager.
+    pub fn open_data_folder() -> Result<(), String> {
+        crate::persist::paths::open_data_folder()
+    }
+}
 
 impl Watcher for Host {
     fn spawn<F>(on_event: F) -> bool
@@ -237,30 +253,6 @@ impl Autostart for Host {
 
     fn ensure_quiet_entry() {
         crate::platform::autostart::ensure_quiet_entry();
-    }
-}
-
-impl Icons for Host {
-    fn get(
-        cache: &crate::platform::file_icon::FileIconCache,
-        path: &std::path::Path,
-        size: u32,
-    ) -> Option<(u32, u32, Vec<u8>)> {
-        cache.rgba_for_path(path, size)
-    }
-
-    fn clear(cache: &crate::platform::file_icon::FileIconCache) {
-        cache.clear_all();
-    }
-}
-
-impl Paths for Host {
-    fn data_dir() -> std::path::PathBuf {
-        crate::persist::paths::data_dir()
-    }
-
-    fn open_data_folder() -> Result<(), String> {
-        crate::persist::paths::open_data_folder()
     }
 }
 
