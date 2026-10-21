@@ -1,8 +1,11 @@
 pub mod analytics;
 pub mod atomic;
+pub mod catalog;
 pub mod json;
+pub mod known;
 pub mod notify;
 pub mod paths;
 pub mod prefs;
 pub mod restart_ui;
 pub mod steam_library;
+pub mod store;
