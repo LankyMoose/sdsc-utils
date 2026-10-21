@@ -1,8 +1,8 @@
 //! Host platform abstraction (additive, no behavior change).
 //!
 //! Safe wrappers and traits that delegate verbatim to the existing platform
-//! implementations. No call sites are rewired here; this module only offers
-//! the seam future refactors can target.
+//! implementations. UI call sites in [`crate::ui::layout`] / [`crate::ui::start`]
+//! go through this seam instead of touching Win32 directly.
 //!
 //! Window functions take a raw `isize` HWND, matching [`crate::platform::win32`].
 //! An `HWND` is an opaque handle-table value, not a pointer, so a stale value
@@ -190,5 +190,137 @@ impl Paths for Host {
 
     fn open_data_folder() -> Result<(), String> {
         crate::persist::paths::open_data_folder()
+    }
+}
+
+/// System clock / locale formatting.
+pub trait Clock {
+    /// Seconds to add to UTC to get local time (`local = utc + offset`).
+    fn local_utc_offset_secs() -> i32;
+    /// System locale short time (e.g. `7:06 pm` or `19:06`), no seconds.
+    ///
+    /// `None` when the locale API is unavailable or fails; callers fall back
+    /// to 12h am/pm formatting.
+    fn locale_time() -> Option<String>;
+}
+
+/// Monitor / cursor placement queries.
+pub trait Monitors {
+    /// Whether the system cursor is currently on the primary monitor.
+    fn cursor_on_primary_monitor() -> bool;
+}
+
+impl Clock for Host {
+    fn local_utc_offset_secs() -> i32 {
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+            const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+            const TIME_ZONE_ID_INVALID: u32 = 0xFFFF_FFFF;
+            // SAFETY: `GetTimeZoneInformation` writes only to the caller-owned
+            // `info` out-param; an invalid zone returns
+            // `TIME_ZONE_ID_INVALID` instead of touching memory.
+            unsafe {
+                let mut info = TIME_ZONE_INFORMATION::default();
+                let id = GetTimeZoneInformation(&mut info);
+                if id == TIME_ZONE_ID_INVALID {
+                    return 0;
+                }
+                // Windows Bias: UTC = local + bias(minutes). DaylightBias is negative.
+                let mut bias = info.Bias;
+                if id == TIME_ZONE_ID_DAYLIGHT {
+                    bias += info.DaylightBias;
+                } else {
+                    bias += info.StandardBias;
+                }
+                bias.saturating_mul(-60)
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    }
+
+    fn locale_time() -> Option<String> {
+        #[cfg(windows)]
+        {
+            use windows::Win32::Globalization::{
+                GetTimeFormatW, LOCALE_USER_DEFAULT, TIME_NOSECONDS,
+            };
+            use windows::core::PCWSTR;
+
+            // Passing no time uses the current local time; a null format uses the
+            // user's short-time locale format. First call queries the required length
+            // (including the null terminator).
+            // SAFETY: both calls pass either null or a caller-owned buffer with
+            // its exact length; the API only reads the user locale, never caller
+            // memory beyond `buf`.
+            unsafe {
+                let needed = GetTimeFormatW(
+                    LOCALE_USER_DEFAULT,
+                    TIME_NOSECONDS.0,
+                    None,
+                    PCWSTR::null(),
+                    None,
+                );
+                if needed <= 0 {
+                    return None;
+                }
+                let mut buf = vec![0u16; needed as usize];
+                let written = GetTimeFormatW(
+                    LOCALE_USER_DEFAULT,
+                    TIME_NOSECONDS.0,
+                    None,
+                    PCWSTR::null(),
+                    Some(&mut buf[..]),
+                );
+                if written <= 0 {
+                    return None;
+                }
+                // `written` includes the null terminator; strip it before decoding.
+                let len = (written as usize).saturating_sub(1);
+                String::from_utf16(&buf[..len])
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+}
+
+impl Monitors for Host {
+    fn cursor_on_primary_monitor() -> bool {
+        #[cfg(windows)]
+        {
+            // SAFETY: `GetCursorPos` writes only to the caller-owned `point`;
+            // `MonitorFromPoint` takes coordinates by value and returns an
+            // opaque monitor handle compared by equality only.
+            unsafe {
+                let mut point = crate::platform::win32::Point::default();
+                if crate::platform::win32::GetCursorPos(&mut point) == 0 {
+                    return false;
+                }
+                let primary = crate::platform::win32::MonitorFromPoint(
+                    crate::platform::win32::Point { x: 0, y: 0 },
+                    crate::platform::win32::MONITOR_DEFAULTTOPRIMARY,
+                );
+                if primary == 0 {
+                    return false;
+                }
+                let under_cursor = crate::platform::win32::MonitorFromPoint(
+                    point,
+                    crate::platform::win32::MONITOR_DEFAULTTONULL,
+                );
+                under_cursor != 0 && under_cursor == primary
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
     }
 }

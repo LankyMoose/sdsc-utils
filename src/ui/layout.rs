@@ -1,6 +1,7 @@
 //! Popup / toast placement and iced window platform settings.
 
 use crate::persist::prefs::ToastPosition;
+use crate::platform::host::{self, Monitors as _};
 #[cfg(windows)]
 use crate::platform::win32;
 use crate::ui::toast::view as toast_view;
@@ -90,10 +91,8 @@ pub fn show_toast_without_activate<Message: Send + 'static>(id: window::Id) -> T
                 return;
             };
             let hwnd = win32_handle.hwnd.get();
-            unsafe {
-                win32::apply_noactivate_exstyle(hwnd, true);
-                win32::ShowWindow(hwnd, win32::SW_SHOWNOACTIVATE);
-            }
+            host::set_no_activate(hwnd, true);
+            host::show_window(hwnd);
         })
         .discard()
     }
@@ -179,9 +178,7 @@ pub fn set_toast_topmost<Message: Send + 'static>(id: window::Id) -> Task<Messag
                 return;
             };
             let hwnd = win32_handle.hwnd.get();
-            unsafe {
-                win32::apply_noactivate_exstyle(hwnd, true);
-            }
+            host::set_no_activate(hwnd, true);
         })
         .discard()
     }
@@ -205,9 +202,7 @@ pub fn raise_window_topmost<Message: Send + 'static>(id: window::Id) -> Task<Mes
                 return;
             };
             let hwnd = win32_handle.hwnd.get();
-            unsafe {
-                win32::raise_topmost(hwnd);
-            }
+            host::focus(hwnd);
         })
         .discard()
     }
@@ -299,9 +294,7 @@ pub fn hide_toast<Message: Send + 'static>(id: window::Id) -> Task<Message> {
                 return;
             };
             let hwnd = win32_handle.hwnd.get();
-            unsafe {
-                win32::ShowWindow(hwnd, win32::SW_HIDE);
-            }
+            host::hide(hwnd);
         })
         .discard()
     }
@@ -450,29 +443,12 @@ pub fn primary_monitor_cover() -> Option<MonitorCover> {
 ///
 /// Used for immersive Start idle cursor hide — secondary monitors keep a visible
 /// cursor even while Start covers the primary.
+///
+/// Delegates to the [`Host`](crate::platform::host::Host) monitors seam; the
+/// Windows branch compares the cursor's monitor against the primary verbatim,
+/// other platforms return `false`.
 pub fn cursor_on_primary_monitor() -> bool {
-    #[cfg(windows)]
-    {
-        unsafe {
-            let mut point = win32::Point::default();
-            if win32::GetCursorPos(&mut point) == 0 {
-                return false;
-            }
-            let primary = win32::MonitorFromPoint(
-                win32::Point { x: 0, y: 0 },
-                win32::MONITOR_DEFAULTTOPRIMARY,
-            );
-            if primary == 0 {
-                return false;
-            }
-            let under_cursor = win32::MonitorFromPoint(point, win32::MONITOR_DEFAULTTONULL);
-            under_cursor != 0 && under_cursor == primary
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    crate::platform::host::Host::cursor_on_primary_monitor()
 }
 
 /// Primary-monitor toast target in logical pixels.
