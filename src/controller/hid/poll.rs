@@ -15,25 +15,25 @@ use hidapi::{DeviceInfo, HidApi};
 use std::time::{Duration, Instant};
 
 /// How often to scan for DualSense connect/disconnect when pads are already known.
-pub const PRESENCE_INTERVAL: Duration = Duration::from_secs(3);
+pub const PRESENCE_INTERVAL: Duration = Policy::DEFAULT.presence;
 /// Slower presence backstop while the tray is empty. Arrivals wake the app via
 /// the OS device watcher (`PresenceHint`), so this only bounds the blind
 /// window on platforms without a watcher (macOS) — 2s keeps first-connect
 /// snappy without the old 500ms wakeups.
-pub const PRESENCE_INTERVAL_EMPTY: Duration = Duration::from_secs(2);
+pub const PRESENCE_INTERVAL_EMPTY: Duration = Policy::DEFAULT.presence_empty;
 /// How often to re-read battery / lightbar when membership is stable and pads are readable.
-pub const BATTERY_INTERVAL: Duration = Duration::from_secs(60);
+pub const BATTERY_INTERVAL: Duration = Policy::DEFAULT.battery;
 /// While the tray shows connected pads, re-probe often so a powered-off BT pad
 /// (still lingering in the HID list) is dropped quickly — and so lightbar RGB is
 /// reasserted if another HID writer overwrote the bar.
-pub const LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
+pub const LIVENESS_INTERVAL: Duration = Policy::DEFAULT.liveness;
 /// When HID lists pads but battery reads keep failing, retry sooner than BATTERY_INTERVAL.
-pub const UNREAD_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+pub const UNREAD_RETRY_INTERVAL: Duration = Policy::DEFAULT.unread_retry;
 /// Hot-sample battery newer than this skips the blocking read on liveness ticks.
 /// Sampling runs while input is live (hot); when cold-idle the worker blocks
 /// and stable pads cost zero HID reads until the next poll. Blocking reads are
 /// reserved for new serials and stale pads.
-pub const POLL_LIVE_BATTERY_STALE: Duration = Duration::from_secs(30);
+pub const POLL_LIVE_BATTERY_STALE: Duration = Policy::DEFAULT.poll_live_battery_stale;
 
 /// Opened pad after a successful battery read (device dropped before lightbar).
 struct PolledPad {

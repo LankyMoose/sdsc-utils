@@ -23,7 +23,7 @@ pub fn diag_info(message: impl AsRef<str>) {
 }
 
 /// Investigation-volume line → `app.log` WARN (no-op in release).
-#[allow(dead_code)]
+/// Used by hid-worker rumble paths.
 pub fn diag_warn(message: impl AsRef<str>) {
     #[cfg(debug_assertions)]
     crate::platform::app_log::warn(message);

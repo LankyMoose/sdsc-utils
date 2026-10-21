@@ -30,6 +30,7 @@ use crate::controller::dualsense::lightbar::{
 };
 use crate::controller::dualsense::rumble;
 use crate::controller::hid::launch_paths::LaunchPaths;
+use crate::controller::hid::policy::Policy;
 use crate::controller::hid::poll::{
     self, POLL_LIVE_BATTERY_STALE, PRESENCE_INTERVAL, PRESENCE_INTERVAL_EMPTY,
 };
@@ -49,34 +50,34 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const PULSE_SAMPLE_LOG_INTERVAL: Duration = Duration::from_secs(1);
-const SLOW_CMD_LOG_MS: u128 = 20;
+const PULSE_SAMPLE_LOG_INTERVAL: Duration = Policy::DEFAULT.pulse_sample_log_interval;
+const SLOW_CMD_LOG_MS: u128 = Policy::DEFAULT.slow_cmd_log_ms;
 /// Cold-idle presence heartbeat: how long the worker blocks when input is not
 /// live and no output is pending. Refreshes the device list on timeout so
 /// arrival still works on platforms without an OS watcher (macOS); watcher
 /// hints (`RefreshPresence`) cover the fast path everywhere else. One
 /// `refresh_devices` (~10ms) per 2s is ~40x cheaper than the old 50ms sample
 /// loop it replaces — never sample here, battery comes from Poll on demand.
-const COLD_PRESENCE_HEARTBEAT: Duration = Duration::from_secs(2);
+const COLD_PRESENCE_HEARTBEAT: Duration = Policy::DEFAULT.cold_heartbeat;
 /// Active input wake ≈ one wired DualSense report (`bInterval` 4).
-const ACTIVE_POLL: Duration = Duration::from_millis(4);
+const ACTIVE_POLL: Duration = Policy::DEFAULT.active_poll;
 /// While waiting for the next Identify flash, still sample this often.
-const IDENTIFY_SAMPLE_POLL: Duration = Duration::from_millis(4);
+const IDENTIFY_SAMPLE_POLL: Duration = Policy::DEFAULT.identify_sample_poll;
 const IDENTIFY_WRITES: u32 = IDENTIFY_FLASH_COUNT * 2;
-const SAMPLE_STALL_MS: u128 = 100;
+const SAMPLE_STALL_MS: u128 = Policy::DEFAULT.sample_stall_ms;
 /// Consecutive sample timeouts before dropping a pad from the hot-path live map
 /// (~200ms at [`ACTIVE_POLL`] / wired report interval). HID handle stays open.
-const LIVE_SILENCE_TIMEOUTS: u32 = 50;
+const LIVE_SILENCE_TIMEOUTS: u32 = Policy::DEFAULT.live_silence_threshold;
 /// Upper bound on hot enumeration deferral: force `refresh_devices()` at least
 /// this often even while input is hot. Bounds the arrival blind window on every
 /// OS (see notes/hot-enumeration-freeze.md); a routine refresh costs ~10ms.
-pub const HOT_ENUM_MAX_DEFER: Duration = Duration::from_secs(20);
+pub const HOT_ENUM_MAX_DEFER: Duration = Policy::DEFAULT.hot_enum_max_defer;
 /// Minimum gap between OS arrival-hint refreshes (burst collapse).
-const REFRESH_HINT_THROTTLE: Duration = Duration::from_secs(1);
+const REFRESH_HINT_THROTTLE: Duration = Policy::DEFAULT.refresh_hint_throttle;
 /// Consecutive open failures before a path backs off (ghost-path churn guard).
-const OPEN_BACKOFF_THRESHOLD: u32 = 3;
+const OPEN_BACKOFF_THRESHOLD: u32 = Policy::DEFAULT.open_backoff_threshold;
 /// How long a backed-off path is skipped (re-probed sooner on list change).
-const OPEN_BACKOFF_WINDOW: Duration = Duration::from_secs(5);
+const OPEN_BACKOFF_WINDOW: Duration = Policy::DEFAULT.open_backoff_window;
 
 /// Pure decision: is the last enumeration older than `max_age` (or never ran)?
 fn refresh_overdue_at(last_refresh: Option<Instant>, now: Instant, max_age: Duration) -> bool {

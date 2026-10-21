@@ -77,12 +77,6 @@ pub enum Effect {
     PlaceShow,
     /// Move toast along the slide path (`progress` 0..=1).
     Move { progress: f32, dismissing: bool },
-    /// Per-frame slide dt was capped (debug).
-    SlideDtCapped {
-        raw_ms: u128,
-        progress: f32,
-        dismissing: bool,
-    },
     /// Toast presentation finished; clear message / hide or hand off.
     Finished,
     /// Open the start screen now (toast may still be Resting).
@@ -397,16 +391,8 @@ fn step_slide(
     placing_frames: u32,
     dismissing: bool,
 ) -> (State, Vec<Effect>) {
-    let (new_elapsed, progress, capped) =
-        advance_toast_slide(elapsed, raw_dt, TOAST_SLIDE_DURATION);
+    let (new_elapsed, progress, _) = advance_toast_slide(elapsed, raw_dt, TOAST_SLIDE_DURATION);
     let mut effects = Vec::new();
-    if capped {
-        effects.push(Effect::SlideDtCapped {
-            raw_ms: raw_dt.as_millis(),
-            progress,
-            dismissing,
-        });
-    }
     effects.push(Effect::Move {
         progress,
         dismissing,

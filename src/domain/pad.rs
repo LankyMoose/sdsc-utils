@@ -4,6 +4,7 @@
 //! by [`crate::controller::hid::worker`]. The worker interleaves Identify lightbar writes with
 //! short input reads on the same handle so nav stays live during flashes.
 
+use crate::controller::hid::policy::Policy;
 use crate::domain::gesture::{GestureControl, GestureDetector};
 use hidapi::HidDevice;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -23,7 +24,7 @@ const NAV_REPEAT: Duration = Duration::from_millis(90);
 /// press after a real release still fires at once.
 const NAV_NEUTRAL_GRACE: Duration = Duration::from_millis(100);
 /// One wired DualSense report interval (`bInterval` 4). Block this long when the queue is empty.
-pub const INPUT_REPORT_WAIT_MS: i32 = 4;
+pub const INPUT_REPORT_WAIT_MS: i32 = Policy::DEFAULT.report_wait_ms;
 
 /// Owned pad-input unit: the hid-worker publication (snapshot) plus the
 /// async edge bridge the iced subscription drains.

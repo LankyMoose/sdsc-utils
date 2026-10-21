@@ -211,16 +211,6 @@ impl App {
                 progress,
                 dismissing,
             } => self.effect_toast_move(progress, dismissing),
-            ToastEffect::SlideDtCapped {
-                raw_ms,
-                progress,
-                dismissing,
-            } => {
-                crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: toast slide dt capped ms={raw_ms} progress={progress:.2} dismissing={dismissing}"
-                ));
-                Task::none()
-            }
             ToastEffect::OpenStart => self.effect_open_start(),
             ToastEffect::Finished => self.effect_toast_finished(),
             ToastEffect::RaiseInteractive { focus } => self.raise_interactive_ui_above_toast(focus),

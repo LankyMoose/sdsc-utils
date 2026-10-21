@@ -134,13 +134,6 @@ pub const fn from_rgb(value: Rgb) -> Color {
     rgb(value.r, value.g, value.b)
 }
 
-/// Convert an iced [`Color`] back into a lightbar [`Rgb`].
-#[allow(dead_code)]
-pub fn to_rgb(color: Color) -> Rgb {
-    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-    Rgb::new(channel(color.r), channel(color.g), channel(color.b))
-}
-
 fn base_palette() -> Palette {
     Palette {
         background: BASE_BG,
@@ -692,7 +685,7 @@ pub fn secondary(_theme: &Theme, status: button::Status) -> button::Style {
 }
 
 /// Outlined destructive button.
-#[allow(dead_code)]
+/// Used by configure manual-row dialogs.
 pub fn danger(_theme: &Theme, status: button::Status) -> button::Style {
     match status {
         button::Status::Active => button::Style {
@@ -727,18 +720,6 @@ pub fn danger(_theme: &Theme, status: button::Status) -> button::Style {
             },
             ..button_base(Some(BASE_BG), DIM, RADIUS_SM)
         },
-    }
-}
-
-/// A whole-row button that only tints on hover.
-#[allow(dead_code)]
-pub fn row_button(_theme: &Theme, status: button::Status) -> button::Style {
-    match status {
-        button::Status::Active => button_base(None, INK, RADIUS_SM),
-        button::Status::Hovered | button::Status::Pressed => {
-            button_base(Some(PANEL_HOVER), INK, RADIUS_SM)
-        }
-        button::Status::Disabled => button_base(None, DIM, RADIUS_SM),
     }
 }
 
