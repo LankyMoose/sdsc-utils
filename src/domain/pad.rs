@@ -5,10 +5,6 @@
 //! short input reads on the same handle so nav stays live during flashes.
 
 use crate::domain::gesture::{GestureControl, GestureDetector};
-use crate::domain::protocol::{
-    BT_REPORT_FULL, BT_REPORT_SIZE, BT_REPORT_TRUNCATED, CALIBRATION_FEATURE_REPORT,
-    CALIBRATION_FEATURE_SIZE, USB_REPORT_ID, USB_REPORT_SIZE,
-};
 use hidapi::HidDevice;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -28,8 +24,6 @@ const NAV_REPEAT: Duration = Duration::from_millis(90);
 const NAV_NEUTRAL_GRACE: Duration = Duration::from_millis(100);
 /// One wired DualSense report interval (`bInterval` 4). Block this long when the queue is empty.
 pub const INPUT_REPORT_WAIT_MS: i32 = 4;
-/// Cap on non-blocking drains per wake (32 = default Windows HID buffer depth).
-const INPUT_DRAIN_CAP: usize = 32;
 
 static INPUT_SNAPSHOT: OnceLock<Arc<Mutex<InputSnapshot>>> = OnceLock::new();
 
@@ -903,25 +897,6 @@ pub enum ShortSampleOutcome {
     Fail(SampleFail),
 }
 
-fn sample_summary(sample: &PadSample) -> String {
-    format!(
-        "ok stick_x={:.2} stick_y={:.2} l2={} r2={} cross={} circle={} square={} triangle={} options={} dpad_u={} dpad_d={} dpad_l={} dpad_r={}",
-        sample.stick_x,
-        sample.stick_y,
-        u8::from(sample.l2),
-        u8::from(sample.r2),
-        u8::from(sample.cross),
-        u8::from(sample.circle),
-        u8::from(sample.square),
-        u8::from(sample.triangle),
-        u8::from(sample.options),
-        u8::from(sample.dpad_up),
-        u8::from(sample.dpad_down),
-        u8::from(sample.dpad_left),
-        u8::from(sample.dpad_right),
-    )
-}
-
 /// Merge a drained batch: newest sticks, OR digital buttons / triggers / D-pad.
 ///
 /// Latches a tap that went down and up inside one wake so the next wake can see the release.
@@ -947,151 +922,11 @@ pub fn merge_nav_samples(batch: &[PadSample]) -> Option<PadSample> {
     Some(out)
 }
 
-fn latch_diag(batch: &[PadSample], merged: &PadSample) {
-    let Some(last) = batch.last() else {
-        return;
-    };
-    let latched = (merged.cross && !last.cross)
-        || (merged.circle && !last.circle)
-        || (merged.square && !last.square)
-        || (merged.triangle && !last.triangle)
-        || (merged.options && !last.options)
-        || (merged.l2 && !last.l2)
-        || (merged.r2 && !last.r2);
-    if latched {
-        crate::controller::hid::diag::diag_info(format!(
-            "hid-diag: drain latched buttons n={} cross={} circle={} square={} triangle={}",
-            batch.len(),
-            u8::from(merged.cross && !last.cross),
-            u8::from(merged.circle && !last.circle),
-            u8::from(merged.square && !last.square),
-            u8::from(merged.triangle && !last.triangle),
-        ));
-    }
-}
-
-/// One DualSense report read (optional block). Used by the drain loop.
-#[allow(clippy::too_many_arguments)]
-fn read_one_report(
-    device: &HidDevice,
-    is_bluetooth: bool,
-    serial: &str,
-    bus: &str,
-    report_size: usize,
-    timeout_ms: i32,
-    requested_full: &mut bool,
-    started: Instant,
-) -> Result<
-    Option<(
-        PadSample,
-        Option<crate::controller::dualsense::battery::BatteryReading>,
-    )>,
-    SampleFail,
-> {
-    let mut buf = vec![0u8; report_size];
-    let n = {
-        let _op = crate::controller::hid::diag::enter_op("read_timeout");
-        match device.read_timeout(&mut buf, timeout_ms) {
-            Ok(n) => n,
-            Err(err) => {
-                drop(_op);
-                let fail = if err.to_string().to_lowercase().contains("timeout") {
-                    SampleFail::Timeout
-                } else {
-                    SampleFail::Io
-                };
-                if fail == SampleFail::Timeout && timeout_ms == 0 {
-                    return Ok(None);
-                }
-                if fail == SampleFail::Timeout {
-                    crate::controller::hid::diag::diag_info(format!(
-                        "hid-diag: sample timeout keep_handle serial={serial} bus={bus}"
-                    ));
-                    return Err(SampleFail::Timeout);
-                }
-                crate::controller::hid::diag::trace_read(
-                    "sample",
-                    serial,
-                    bus,
-                    started.elapsed().as_millis(),
-                    &format!("fail={} err={err}", fail.as_str()),
-                    false,
-                );
-                return Err(fail);
-            }
-        }
-    };
-    if n == 0 {
-        return Ok(None);
-    }
-
-    if is_bluetooth && buf[0] == BT_REPORT_TRUNCATED {
-        if !*requested_full {
-            let mut feature = vec![0u8; CALIBRATION_FEATURE_SIZE];
-            feature[0] = CALIBRATION_FEATURE_REPORT;
-            let feature_result = {
-                let _op = crate::controller::hid::diag::enter_op("get_feature_report");
-                device.get_feature_report(&mut feature)
-            };
-            match feature_result {
-                Ok(_) => {
-                    *requested_full = true;
-                    return Ok(None);
-                }
-                Err(err) => {
-                    crate::controller::hid::diag::trace_read(
-                        "sample",
-                        serial,
-                        bus,
-                        started.elapsed().as_millis(),
-                        &format!("fail=feature err={err}"),
-                        false,
-                    );
-                    return Err(SampleFail::Feature);
-                }
-            }
-        }
-        crate::controller::hid::diag::trace_read(
-            "sample",
-            serial,
-            bus,
-            started.elapsed().as_millis(),
-            "fail=truncated",
-            false,
-        );
-        return Err(SampleFail::Truncated);
-    }
-
-    let expected = if is_bluetooth {
-        BT_REPORT_FULL
-    } else {
-        USB_REPORT_ID
-    };
-    if buf[0] != expected {
-        crate::controller::hid::diag::trace_read(
-            "sample",
-            serial,
-            bus,
-            started.elapsed().as_millis(),
-            &format!("fail=bad_report id=0x{:02x} n={n}", buf[0]),
-            false,
-        );
-        return Err(SampleFail::BadReport);
-    }
-
-    let sample =
-        crate::controller::dualsense::input::parse_report(&buf, if is_bluetooth { 1 } else { 0 });
-    let battery =
-        crate::controller::dualsense::battery::parse_battery_from_report(&buf[..n], is_bluetooth);
-    Ok(Some((sample, battery)))
-}
-
 /// Drain queued DualSense reports, wait one report interval, then drain again.
 ///
-/// Newest sticks win; digital buttons are OR'd across the batch so a tap that
-/// released inside the drain still appears held for one snapshot. The blocking
-/// wait runs even after a non-empty zero-timeout drain so the hot path paces to
-/// the pad's report clock instead of busy-spinning.
+/// Compat wrapper over [`crate::controller::hid::sample::drain_sample`] so
+/// existing callers keep working unchanged; HID I/O lives in
+/// `controller::hid::sample` behind `HidTransport`, pure merge types stay here.
 ///
 /// Never call from the UI thread. Truncated BT: one feature request (one-time) + retry.
 pub fn read_device_sample_short(
@@ -1100,103 +935,11 @@ pub fn read_device_sample_short(
     serial: &str,
     input_hot: bool,
 ) -> ShortSampleOutcome {
-    let bus = if is_bluetooth { "bt" } else { "usb" };
-    let report_size = if is_bluetooth {
-        BT_REPORT_SIZE
-    } else {
-        USB_REPORT_SIZE
-    };
-    let mut requested_full = false;
-    let started = Instant::now();
-    let mut batch: Vec<PadSample> = Vec::new();
-    let mut battery = None;
-
-    let drain_queued =
-        |batch: &mut Vec<PadSample>,
-         battery: &mut Option<crate::controller::dualsense::battery::BatteryReading>,
-         requested_full: &mut bool|
-         -> Result<(), SampleFail> {
-            for _ in 0..INPUT_DRAIN_CAP {
-                match read_one_report(
-                    device,
-                    is_bluetooth,
-                    serial,
-                    bus,
-                    report_size,
-                    0,
-                    requested_full,
-                    started,
-                )? {
-                    Some((sample, batt)) => {
-                        batch.push(sample);
-                        if batt.is_some() {
-                            *battery = batt;
-                        }
-                    }
-                    None => break,
-                }
-            }
-            Ok(())
-        };
-
-    // Drain anything already queued (immediate).
-    if let Err(fail) = drain_queued(&mut batch, &mut battery, &mut requested_full) {
-        return match fail {
-            SampleFail::Timeout => ShortSampleOutcome::Timeout,
-            other => ShortSampleOutcome::Fail(other),
-        };
-    }
-
-    // Always wait one report interval so a non-empty drain cannot busy-spin the
-    // worker: pace to the pad's report clock, and merge any report that arrives.
-    match read_one_report(
-        device,
-        is_bluetooth,
-        serial,
-        bus,
-        report_size,
-        INPUT_REPORT_WAIT_MS,
-        &mut requested_full,
-        started,
-    ) {
-        Ok(Some((sample, batt))) => {
-            batch.push(sample);
-            if batt.is_some() {
-                battery = batt;
-            }
-        }
-        Ok(None) | Err(SampleFail::Timeout) => {
-            if batch.is_empty() {
-                return ShortSampleOutcome::Timeout;
-            }
-        }
-        Err(other) => return ShortSampleOutcome::Fail(other),
-    }
-    if let Err(fail) = drain_queued(&mut batch, &mut battery, &mut requested_full) {
-        return match fail {
-            SampleFail::Timeout => ShortSampleOutcome::Timeout,
-            other => ShortSampleOutcome::Fail(other),
-        };
-    }
-
-    let Some(merged) = merge_nav_samples(&batch) else {
-        return ShortSampleOutcome::Timeout;
-    };
-    latch_diag(&batch, &merged);
-
     let _ = input_hot;
-    crate::controller::hid::diag::trace_read(
-        "sample",
-        serial,
-        bus,
-        started.elapsed().as_millis(),
-        &format!("{} drain_n={}", sample_summary(&merged), batch.len()),
-        true,
-    );
-    ShortSampleOutcome::Ok {
-        sample: merged,
-        battery,
-    }
+    let policy = crate::controller::hid::policy::Policy::default();
+    let transport = crate::controller::hid::transport::HidapiTransport(device);
+    let mut opts = crate::controller::hid::sample::SampleOpts::new(is_bluetooth, serial);
+    crate::controller::hid::sample::drain_sample(&transport, &mut opts, &policy)
 }
 
 /// Build a nav reading from a HID sample + device identity.

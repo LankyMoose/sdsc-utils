@@ -1053,7 +1053,14 @@ fn sample_one(
     };
     let outcome = {
         let open = cache.devices.get(&key).expect("ensure inserted");
-        start_input::read_device_sample_short(&open.device, is_bluetooth, serial, input_hot)
+        let transport = crate::controller::hid::transport::HidapiTransport(&open.device);
+        let mut opts = crate::controller::hid::sample::SampleOpts::new(is_bluetooth, serial);
+        let _ = input_hot;
+        crate::controller::hid::sample::drain_sample(
+            &transport,
+            &mut opts,
+            &crate::controller::hid::policy::Policy::default(),
+        )
     };
     match outcome {
         ShortSampleOutcome::Ok { sample, battery } => {
