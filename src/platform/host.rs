@@ -171,6 +171,8 @@ pub trait Autostart {
     fn uninstall() -> Result<(), String>;
     /// Whether the autostart entry is currently enabled.
     fn is_enabled() -> bool;
+    /// Enable or disable the autostart entry.
+    fn set_enabled(enabled: bool) -> Result<(), String>;
     /// Replace a leftover Startup `.cmd` with a silent `.lnk` (fixes console
     /// flash on login). Safe to call on every launch; no-op when packaged
     /// or off Windows.
@@ -227,6 +229,10 @@ impl Autostart for Host {
 
     fn is_enabled() -> bool {
         crate::platform::autostart::is_enabled()
+    }
+
+    fn set_enabled(enabled: bool) -> Result<(), String> {
+        crate::platform::autostart::set_enabled(enabled)
     }
 
     fn ensure_quiet_entry() {
