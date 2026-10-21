@@ -41,6 +41,10 @@ mod active {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    /// Intentional: 1s debug-only diag cache. The release lightbar claim
+    /// verdict in `dualsense::lightbar` (`STEAM_CLAIM_CACHE_TTL`, 3s) is a
+    /// separate strategy cache with a longer TTL — different purpose,
+    /// different TTL; neither should be "unified".
     const STEAM_REFRESH: Duration = Duration::from_secs(1);
     const SLOW_OP_MS: u128 = 50;
     const WATCHDOG_POLL: Duration = Duration::from_millis(100);

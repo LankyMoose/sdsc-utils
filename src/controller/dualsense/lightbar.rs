@@ -1,7 +1,7 @@
 //! DualSense lightbar HID output.
 
 use crate::controller::dualsense::identity::{
-    self as dualsense, is_dualsense_device, is_dualsense_gamepad, normalize_identity,
+    self as dualsense, HidIoLock, is_dualsense_device, is_dualsense_gamepad, normalize_identity,
     resolve_device_identity,
 };
 use crate::domain::color::Rgb;
@@ -15,6 +15,11 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Steam claim verdict cache.
+///
+/// Intentional: 3s release claim cache. The debug-only hid-diag Steam scan in
+/// `hid::diag` (`STEAM_REFRESH`, 1s) is a separate verbose-logging cache with a
+/// shorter TTL — different purpose, different TTL; neither should be "unified".
 const STEAM_CLAIM_CACHE_TTL: Duration = Duration::from_secs(3);
 
 /// Phase timings for hid-worker metrics (enumerate / open / io).
@@ -662,8 +667,15 @@ fn build_bt_report(
 
 /// Apply a color to every connected DualSense (CLI / debug).
 /// Clears claims so each pad receives a fresh `LIGHT_OUT` then RGB.
-pub fn apply_lightbar_all(color: Rgb, claims: &ClaimStore) -> Result<usize, String> {
-    let _guard = dualsense::lock_hid()?;
+///
+/// Takes the caller's `&HidIoLock` (CLI one-shots use a local
+/// `HidIoLock::new()`); the timed variant below assumes the lock is held.
+pub fn apply_lightbar_all(
+    lock: &HidIoLock,
+    color: Rgb,
+    claims: &ClaimStore,
+) -> Result<usize, String> {
+    let _guard = lock.lock()?;
     apply_lightbar_all_timed(color, claims).0
 }
 

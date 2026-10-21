@@ -977,9 +977,7 @@ pub fn read_device_sample_short(
     device: &HidDevice,
     is_bluetooth: bool,
     serial: &str,
-    input_hot: bool,
 ) -> ShortSampleOutcome {
-    let _ = input_hot;
     let policy = crate::controller::hid::policy::Policy::default();
     let transport = crate::controller::hid::transport::HidapiTransport(device);
     let mut opts = crate::controller::hid::sample::SampleOpts::new(is_bluetooth, serial);

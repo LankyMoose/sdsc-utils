@@ -176,6 +176,12 @@ impl AnalyticsStore {
         self.save();
     }
 
+    /// Whether a serial is worth persisting analytics for.
+    ///
+    /// Single source of truth for the base check is
+    /// [`crate::controller::dualsense::identity::is_storable_serial`]
+    /// (rejects empty / `"unknown"`); this only adds the release-only
+    /// `emu-` developer-pad filter on top. Behavior identical.
     pub fn is_storable_serial(serial: &str) -> bool {
         if !crate::controller::dualsense::identity::is_storable_serial(serial) {
             return false;

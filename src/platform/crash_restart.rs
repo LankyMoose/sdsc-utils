@@ -28,8 +28,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Owned tray-arm flag for crash restart.
 ///
-/// Owned by the crash boot in the binary root (`Box::leak`ed in `main` so the
-/// panic hook can hold a `&'static` borrow); pass `&CrashArmed` to
+/// Owned by the crash boot in the binary root (`OnceLock` static in `main`,
+/// so the panic hook can hold a `&'static` borrow); pass `&CrashArmed` to
 /// [`arm_tray_mode`] / [`schedule_from_panic`]. No process-global.
 pub struct CrashArmed(AtomicBool);
 

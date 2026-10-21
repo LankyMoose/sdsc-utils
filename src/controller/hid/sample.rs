@@ -282,3 +282,41 @@ fn latch_diag(batch: &[PadSample], merged: &PadSample) {
         ));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controller::hid::transport::MockTransport;
+    use crate::domain::protocol::{USB_REPORT_ID, USB_REPORT_SIZE};
+
+    /// Transport seam proof: one canned USB report drains to a parsed sample.
+    #[test]
+    fn drain_sample_parses_canned_usb_report() {
+        let mut report = vec![0u8; USB_REPORT_SIZE];
+        report[0] = USB_REPORT_ID;
+        report[1] = 128;
+        report[2] = 128;
+        report[3] = 128;
+        report[4] = 128;
+        // D-pad neutral (0x08) + Cross (0x20).
+        report[8] = 0x28;
+        // Battery level 5, discharging -> 55%.
+        report[53] = 0x05;
+
+        let transport = MockTransport::new();
+        transport.push_read(Ok(report));
+
+        let mut opts = SampleOpts::new(false, "test-serial");
+        let policy = Policy::default();
+        match drain_sample(&transport, &mut opts, &policy) {
+            ShortSampleOutcome::Ok { sample, battery } => {
+                assert!(sample.cross);
+                assert!(!sample.circle);
+                let reading = battery.expect("battery parsed from same report");
+                assert_eq!(reading.percent, 55);
+                assert!(reading.connection.is_usb());
+            }
+            other => panic!("expected Ok sample, got {other:?}"),
+        }
+    }
+}

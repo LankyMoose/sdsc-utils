@@ -2,9 +2,11 @@
 //!
 //! Gathers the timeout / interval / threshold consts currently scattered
 //! across `hid::worker`, `hid::poll` and `domain::pad` into one `Policy`
-//! struct. `Policy::default()` reproduces the current values exactly; call
-//! sites still use the original consts. Later commits migrate helpers to
-//! take `&Policy` without changing timing.
+//! struct. `Policy::default()` reproduces the current values exactly;
+//! `poll_controllers` / `poll_controllers_timed` / `poll_controllers_with_api`
+//! take `&Policy` (callers pass `&Policy::default()`). Remaining call sites
+//! still use the original consts; later commits migrate them the same way
+//! without changing timing.
 
 use std::time::Duration;
 
