@@ -10,11 +10,9 @@
 use crate::controller::dualsense::battery::LOW_BATTERY_PERCENT;
 use crate::controller::model::{ControllerStatus, PowerState};
 use crate::persist::json;
-use crate::platform::app_log;
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -131,10 +129,7 @@ pub struct AnalyticsStore {
 impl AnalyticsStore {
     pub fn load() -> Self {
         let path = store_path();
-        let Ok(bytes) = fs::read(&path) else {
-            return Self::default();
-        };
-        let Some(root) = json::parse_object(&path, &bytes) else {
+        let Some(root) = crate::persist::store::load_object(&path) else {
             return Self::default();
         };
         Self::from_root(&path, root)
@@ -162,22 +157,11 @@ impl AnalyticsStore {
             return;
         }
         let path = store_path();
-        if let Some(parent) = path.parent()
-            && let Err(err) = fs::create_dir_all(parent)
-        {
-            app_log::warn(format!("failed to create analytics dir: {err}"));
-            return;
-        }
         let file = AnalyticsFile {
             controllers: self.by_serial.clone(),
         };
-        match serde_json::to_vec_pretty(&file) {
-            Ok(bytes) => {
-                if crate::persist::atomic::write_atomic_logged("analytics", &path, &bytes) {
-                    self.dirty = false;
-                }
-            }
-            Err(err) => app_log::warn(format!("failed to serialize analytics: {err}")),
+        if crate::persist::store::save_pretty("analytics", &path, &file) {
+            self.dirty = false;
         }
     }
 

@@ -580,21 +580,10 @@ impl Prefs {
 
     pub fn save(&self) {
         let path = prefs_path();
-        if let Some(parent) = path.parent()
-            && let Err(err) = fs::create_dir_all(parent)
-        {
-            app_log::warn(format!("failed to create prefs dir: {err}"));
-            return;
-        }
         // Rewrite stale custom / empty chords as PS on disk.
         let mut prefs = self.clone();
         prefs.start_screen_gesture = default_gesture();
-        match serde_json::to_vec_pretty(&prefs) {
-            Ok(bytes) => {
-                let _ = crate::persist::atomic::write_atomic_logged("prefs", &path, &bytes);
-            }
-            Err(err) => app_log::warn(format!("failed to serialize prefs: {err}")),
-        }
+        crate::persist::store::save_pretty("prefs", &path, &prefs);
     }
 
     /// Clamp numeric prefs, force the reopen chord to PS, and force the

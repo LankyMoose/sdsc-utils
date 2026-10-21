@@ -3,11 +3,9 @@
 use crate::controller::dualsense::identity::is_storable_serial;
 use crate::controller::model::ControllerStatus;
 use crate::persist::json;
-use crate::platform::app_log;
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// New persisted fields need `#[serde(default)]` (or the oldest-shape fixture fails).
@@ -67,10 +65,7 @@ impl KnownController {
 impl KnownControllers {
     pub fn load() -> Self {
         let path = store_path();
-        let Ok(bytes) = fs::read(&path) else {
-            return Self::default();
-        };
-        let Some(root) = json::parse_object(&path, &bytes) else {
+        let Some(root) = crate::persist::store::load_object(&path) else {
             return Self::default();
         };
         Self::from_root(&path, root)
@@ -120,13 +115,6 @@ impl KnownControllers {
             return;
         }
         let path = store_path();
-        if let Some(parent) = path.parent()
-            && let Err(err) = fs::create_dir_all(parent)
-        {
-            app_log::warn(format!("failed to create controllers dir: {err}"));
-            return;
-        }
-
         let mut controllers: Vec<_> = self.by_serial.values().cloned().collect();
         controllers.sort_by(|a, b| a.serial.cmp(&b.serial));
         let file = KnownFile {
@@ -134,13 +122,8 @@ impl KnownControllers {
             nicknames: self.nicknames.clone(),
         };
 
-        match serde_json::to_vec_pretty(&file) {
-            Ok(bytes) => {
-                if crate::persist::atomic::write_atomic_logged("controllers", &path, &bytes) {
-                    self.dirty = false;
-                }
-            }
-            Err(err) => app_log::warn(format!("failed to serialize controllers: {err}")),
+        if crate::persist::store::save_pretty("controllers", &path, &file) {
+            self.dirty = false;
         }
     }
 

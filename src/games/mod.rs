@@ -6,11 +6,9 @@ pub mod steam;
 
 use crate::persist::json;
 use crate::persist::prefs::GamesSortMode;
-use crate::platform::app_log;
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -68,10 +66,7 @@ pub struct GamesCatalog {
 impl GamesCatalog {
     pub fn load() -> Self {
         let path = store_path();
-        let Ok(bytes) = fs::read(&path) else {
-            return Self::default();
-        };
-        let Some(root) = json::parse_object(&path, &bytes) else {
+        let Some(root) = crate::persist::store::load_object(&path) else {
             return Self::default();
         };
         Self::from_root(&path, root)
@@ -94,18 +89,7 @@ impl GamesCatalog {
 
     pub fn save(&self) {
         let path = store_path();
-        if let Some(parent) = path.parent()
-            && let Err(err) = fs::create_dir_all(parent)
-        {
-            app_log::warn(format!("failed to create games dir: {err}"));
-            return;
-        }
-        match serde_json::to_vec_pretty(self) {
-            Ok(bytes) => {
-                crate::persist::atomic::write_atomic_logged("games", &path, &bytes);
-            }
-            Err(err) => app_log::warn(format!("failed to serialize games: {err}")),
-        }
+        crate::persist::store::save_pretty("games", &path, self);
     }
 
     pub fn contains_steam(&self, appid: u32) -> bool {

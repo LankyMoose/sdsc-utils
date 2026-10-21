@@ -3,6 +3,7 @@
 //! No `window::Id`, no HWND. The iced app applies [`SessionEffect`] values.
 
 mod gate;
+pub mod notify;
 
 pub use gate::{
     ConnectCooldownDecision, POLL_MISS_HOLD, connect_cooldown_on_empty, has_start_presence,
@@ -15,9 +16,9 @@ use crate::controller::dualsense::lightbar;
 use crate::controller::known::KnownControllers;
 use crate::controller::model::ControllerStatus;
 use crate::persist::analytics::AnalyticsStore;
-use crate::persist::notify::{NotifyEvent, NotifyTracker};
 use crate::persist::prefs::Prefs;
 use crate::platform::app_log;
+use crate::session::notify::{NotifyEvent, NotifyTracker};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
