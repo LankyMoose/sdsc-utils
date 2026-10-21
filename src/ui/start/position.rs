@@ -15,6 +15,7 @@ use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::{Element, Font, Length, Pixels, Point, Rectangle, Renderer, Theme, Vector};
 
+use crate::platform::host::{Clock as _, Host};
 use crate::ui::layout::ease_out_cubic;
 use crate::ui::start::vstrip::StripOrientation;
 use crate::ui::theme;
@@ -272,32 +273,11 @@ pub fn now_ms() -> u64 {
 }
 
 /// Seconds to add to UTC to get local time (`local = utc + offset`).
+///
+/// Delegates to the [`Host`] clock seam; the Windows branch reads the system
+/// timezone verbatim, other platforms return 0.
 pub fn local_utc_offset_secs() -> i32 {
-    #[cfg(windows)]
-    {
-        use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
-        const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
-        const TIME_ZONE_ID_INVALID: u32 = 0xFFFF_FFFF;
-        unsafe {
-            let mut info = TIME_ZONE_INFORMATION::default();
-            let id = GetTimeZoneInformation(&mut info);
-            if id == TIME_ZONE_ID_INVALID {
-                return 0;
-            }
-            // Windows Bias: UTC = local + bias(minutes). DaylightBias is negative.
-            let mut bias = info.Bias;
-            if id == TIME_ZONE_ID_DAYLIGHT {
-                bias += info.DaylightBias;
-            } else {
-                bias += info.StandardBias;
-            }
-            bias.saturating_mul(-60)
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        0
-    }
+    Host::local_utc_offset_secs()
 }
 
 pub fn view<Message: 'static>(spec: BarSpec) -> Element<'static, Message> {

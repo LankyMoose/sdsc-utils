@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
+use crate::platform::host::{Host, Icons};
+
 /// Owned warm-generation counter for Start art prefetches.
 ///
 /// Bumped on each selection warm so UI can ignore stale ArtEvents.
@@ -816,7 +818,7 @@ fn decode_file_sized(
 }
 
 fn decode_shell(path: &Path, size: u32) -> Option<(u32, u32, Vec<u8>)> {
-    let (width, height, pixels) = crate::platform::file_icon::rgba_for_path(path, size)?;
+    let (width, height, pixels) = Host::get(path, size)?;
     crate::controller::hid::diag::diag_info(format!(
         "ui-diag: icon handle shell={} src={width}x{height} dst={width}x{height} size={size}",
         path.display()
