@@ -6,7 +6,7 @@
 //! as the taskbar clock. Other platforms fall back to 12h am/pm.
 //! Updates whenever immersive redraws (which ticks continuously).
 
-use crate::platform::host::{Clock as _, Host};
+use crate::platform::host::Host;
 use crate::ui::start::position::{local_utc_offset_secs, now_ms};
 
 /// Format 24h hour/minute as 12h `h:mm am/pm` (no leading zero on the hour,

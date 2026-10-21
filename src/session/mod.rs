@@ -16,7 +16,6 @@ use crate::controller::known::KnownControllers;
 use crate::controller::model::ControllerStatus;
 use crate::persist::analytics::AnalyticsStore;
 use crate::persist::prefs::Prefs;
-use crate::platform::app_log;
 use crate::session::notify::{NotifyEvent, NotifyTracker};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -64,10 +63,12 @@ pub enum SessionEffect {
     ClearStartLatch,
     /// Persist remembered controllers / nicknames.
     SaveKnown,
-    /// Persist analytics store.
-    SaveAnalytics,
-    /// Rebuild Settings → Analytics panel from the store.
-    RefreshAnalyticsPanel,
+    /// Persist analytics store and rebuild Settings → Analytics panel.
+    ///
+    /// These two always co-occur (analytics is observed on every snapshot
+    /// when enabled), so they are one effect: save first, then reload and
+    /// refresh the panel from what was just written.
+    SyncAnalytics,
     /// Rebuild popup rows (and resize if open).
     SyncPopup,
 }
@@ -175,8 +176,7 @@ impl DeviceSession {
             };
             self.analytics
                 .observe(&previous, next, true, keep, std::time::SystemTime::now());
-            effects.push(SessionEffect::SaveAnalytics);
-            effects.push(SessionEffect::RefreshAnalyticsPanel);
+            effects.push(SessionEffect::SyncAnalytics);
         }
 
         if !controllers_changed && !known_changed {
@@ -383,15 +383,6 @@ fn is_emulated_serial(serial: &str) -> bool {
         let _ = serial;
         false
     }
-}
-
-/// Log helper kept so callers that only warn on empty effects stay quiet.
-#[allow(dead_code)]
-pub fn log_apply(effects: &[SessionEffect]) {
-    if effects.is_empty() {
-        return;
-    }
-    app_log::info(format!("session: apply effects={}", effects.len()));
 }
 
 #[cfg(test)]

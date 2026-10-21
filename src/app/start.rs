@@ -856,7 +856,7 @@ impl App {
 
 impl App {
     pub(crate) fn seed_steam_library_from_cache(&mut self) {
-        let Some(cache) = crate::persist::steam_library::load() else {
+        let Some(cache) = crate::games::steam::load_library_cache() else {
             return;
         };
         self.steam_installed = Some(cache.games.iter().map(|g| g.appid).collect());
@@ -950,7 +950,7 @@ impl App {
                 // (reinstall / license restored re-enables the row).
                 self.launch_blocked_steam.clear();
                 let root = steam::steam_root().ok().flatten();
-                crate::persist::steam_library::save(&games, root.as_deref());
+                crate::games::steam::save_library_cache(&games, root.as_deref());
             }
             Err(err) => {
                 steam::warn_scan_error(&err);
@@ -2590,7 +2590,7 @@ impl App {
         let target = session.target.clone();
         crate::controller::hid::diag::diag_info(format!("ui-diag: game closing target={target}"));
         Task::perform(
-            spawn_blocking(move || process_match::close_matching(&match_paths)),
+            spawn_blocking(move || launch::close_matching(&match_paths)),
             |res: Result<Result<(), String>, String>| {
                 Message::CloseGameDone(res.unwrap_or_else(Err))
             },

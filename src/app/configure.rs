@@ -16,7 +16,7 @@ use crate::persist::paths;
 use crate::persist::prefs::{clamp_low_battery_percent, renderer_restart_needed};
 use crate::platform::app_log;
 #[cfg(windows)]
-use crate::platform::host::{Autostart as _, Host};
+use crate::platform::host::Host;
 #[cfg(debug_assertions)]
 use crate::platform::ui_sound::UiSoundKind;
 use crate::ui::color::{self, BatterySpectrum};

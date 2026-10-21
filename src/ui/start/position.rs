@@ -15,7 +15,7 @@ use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::{Element, Font, Length, Pixels, Point, Rectangle, Renderer, Theme, Vector};
 
-use crate::platform::host::{Clock as _, Host};
+use crate::platform::host::Host;
 use crate::ui::layout::ease_out_cubic;
 use crate::ui::start::vstrip::StripOrientation;
 use crate::ui::theme;

@@ -33,7 +33,7 @@ use crate::games::steam::SteamGame;
 use crate::persist::analytics::AnalyticsStore;
 use crate::persist::prefs::{NavbarVisibility, Prefs};
 use crate::platform::app_log;
-use crate::platform::host::{Autostart as _, Host, Hotkeys as _, Watcher as _};
+use crate::platform::host::Host;
 use crate::platform::ui_sound::{SoundHub, UiSoundKind};
 use crate::session::notify::NotifyEvent;
 use crate::ui::configure::{
@@ -2166,10 +2166,8 @@ impl App {
                 SessionEffect::SaveKnown => {
                     self.session.known.save();
                 }
-                SessionEffect::SaveAnalytics => {
+                SessionEffect::SyncAnalytics => {
                     self.session.analytics.save();
-                }
-                SessionEffect::RefreshAnalyticsPanel => {
                     self.session.analytics = AnalyticsStore::load();
                     self.refresh_analytics_panel();
                 }

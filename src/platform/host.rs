@@ -1,6 +1,6 @@
 //! Host platform abstraction (additive, no behavior change).
 //!
-//! Safe wrappers and traits that delegate verbatim to the existing platform
+//! Safe wrappers that delegate verbatim to the existing platform
 //! implementations. App ([`crate::app`]) and UI ([`crate::ui::layout`] /
 //! [`crate::ui::start`]) call sites go through this seam instead of touching
 //! Win32 directly.
@@ -11,8 +11,10 @@
 //! HWNDs obtained from iced/winit `RawWindowHandle` inside a `window::run`
 //! closure, where the window is live and owned by this process.
 //!
-//! Trait impls delegate to the existing cross-platform functions, whose
-//! non-Windows stubs (`false` / `Err` / `None`) are preserved verbatim.
+//! Single implementation, plain inherent `pub fn` on [`Host`]: there is one
+//! backend and zero mocks, so no traits are needed. Methods delegate to the
+//! existing cross-platform functions, whose non-Windows stubs (`false` / `Err`
+//! / `None`) are preserved verbatim.
 
 /// Show a window without activating it (so a game keeps focus).
 pub fn show_window(hwnd: isize) {
@@ -155,30 +157,6 @@ pub fn invalidate_hwnd(hwnd: isize) {
     }
 }
 
-/// OS device arrival/removal watcher (trigger, not truth).
-pub trait Watcher {
-    /// Spawn the watcher; `true` when one is running.
-    fn spawn<F>(on_event: F) -> bool
-    where
-        F: Fn() + Send + Sync + 'static;
-}
-
-/// Launch-at-login entry.
-pub trait Autostart {
-    /// Create the autostart entry.
-    fn install() -> Result<(), String>;
-    /// Remove the autostart entry (including legacy entries).
-    fn uninstall() -> Result<(), String>;
-    /// Whether the autostart entry is currently enabled.
-    fn is_enabled() -> bool;
-    /// Enable or disable the autostart entry.
-    fn set_enabled(enabled: bool) -> Result<(), String>;
-    /// Replace a leftover Startup `.cmd` with a silent `.lnk` (fixes console
-    /// flash on login). Safe to call on every launch; no-op when packaged
-    /// or off Windows.
-    fn ensure_quiet_entry();
-}
-
 /// Default host: delegates verbatim to the existing platform implementations.
 ///
 /// Non-Windows behavior is inherited from the existing per-platform stubs
@@ -225,76 +203,56 @@ impl Host {
     }
 }
 
-impl Watcher for Host {
-    fn spawn<F>(on_event: F) -> bool
+/// OS device arrival/removal watcher (trigger, not truth) plus the
+/// launch-at-login entry: single implementation, plain associated functions
+/// on [`Host`] (no traits: one backend, no mocks).
+impl Host {
+    /// Spawn the watcher; `true` when one is running.
+    pub fn spawn<F>(on_event: F) -> bool
     where
         F: Fn() + Send + Sync + 'static,
     {
         crate::platform::device_watch::spawn_arrival_watcher(on_event)
     }
-}
 
-impl Autostart for Host {
-    fn install() -> Result<(), String> {
+    /// Create the autostart entry.
+    pub fn install() -> Result<(), String> {
         crate::platform::autostart::install()
     }
 
-    fn uninstall() -> Result<(), String> {
+    /// Remove the autostart entry (including legacy entries).
+    pub fn uninstall() -> Result<(), String> {
         crate::platform::autostart::uninstall()
     }
 
-    fn is_enabled() -> bool {
+    /// Whether the autostart entry is currently enabled.
+    pub fn is_enabled() -> bool {
         crate::platform::autostart::is_enabled()
     }
 
-    fn set_enabled(enabled: bool) -> Result<(), String> {
+    /// Enable or disable the autostart entry.
+    pub fn set_enabled(enabled: bool) -> Result<(), String> {
         crate::platform::autostart::set_enabled(enabled)
     }
 
-    fn ensure_quiet_entry() {
+    /// Replace a leftover Startup `.cmd` with a silent `.lnk` (fixes console
+    /// flash on login). Safe to call on every launch; no-op when packaged
+    /// or off Windows.
+    pub fn ensure_quiet_entry() {
         crate::platform::autostart::ensure_quiet_entry();
     }
 }
 
-/// System clock / locale formatting.
-pub trait Clock {
-    /// Seconds to add to UTC to get local time (`local = utc + offset`).
-    fn local_utc_offset_secs() -> i32;
-    /// System locale short time (e.g. `7:06 pm` or `19:06`), no seconds.
-    ///
-    /// `None` when the locale API is unavailable or fails; callers fall back
-    /// to 12h am/pm formatting.
-    fn locale_time() -> Option<String>;
-}
-
+/// System clock / locale formatting plus physical-pixel monitor queries:
+/// single implementation, plain associated functions on [`Host`] (no traits:
+/// one backend, no mocks).
+///
 /// Physical-pixel monitor rect as `(left, top, right, bottom)`.
 pub type PxRect = (i32, i32, i32, i32);
 
-/// Monitor / cursor placement queries.
-pub trait Monitors {
-    /// Whether the system cursor is currently on the primary monitor.
-    fn cursor_on_primary_monitor() -> bool;
-    /// Primary monitor + work-area geometry for UI cover math.
-    ///
-    /// Returns `(monitor_rect, work_rect, dpi_scale, foreground_covers_monitor)`
-    /// in physical pixels; the caller converts to logical [`crate::ui::layout`]
-    /// cover rects so no UI type crosses this seam. `None` off Windows or when
-    /// the monitor query fails (callers fall back to the iced-provided size).
-    fn primary_metrics() -> Option<(PxRect, PxRect, f32, bool)>;
-
-    /// Foreground-window geometry for the exclusive-fullscreen predicate.
-    ///
-    /// Returns `(width, height, monitor_width, monitor_height, style)` in
-    /// physical pixels plus Win32 `GWL_STYLE` bits; the caller maps this onto
-    /// [`crate::domain::pad::ForegroundWindowFacts`] and applies the pure
-    /// [`crate::domain::pad::is_exclusive_fullscreen`] predicate, so no Win32
-    /// type crosses this seam. `None` off Windows or when the foreground
-    /// query fails (callers treat as not-fullscreen).
-    fn foreground_facts() -> Option<(i32, i32, i32, i32, isize)>;
-}
-
-impl Clock for Host {
-    fn local_utc_offset_secs() -> i32 {
+impl Host {
+    /// Seconds to add to UTC to get local time (`local = utc + offset`).
+    pub fn local_utc_offset_secs() -> i32 {
         #[cfg(windows)]
         {
             use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
@@ -325,7 +283,11 @@ impl Clock for Host {
         }
     }
 
-    fn locale_time() -> Option<String> {
+    /// System locale short time (e.g. `7:06 pm` or `19:06`), no seconds.
+    ///
+    /// `None` when the locale API is unavailable or fails; callers fall back
+    /// to 12h am/pm formatting.
+    pub fn locale_time() -> Option<String> {
         #[cfg(windows)]
         {
             use windows::Win32::Globalization::{
@@ -373,10 +335,9 @@ impl Clock for Host {
             None
         }
     }
-}
 
-impl Monitors for Host {
-    fn cursor_on_primary_monitor() -> bool {
+    /// Whether the system cursor is currently on the primary monitor.
+    pub fn cursor_on_primary_monitor() -> bool {
         #[cfg(windows)]
         {
             // SAFETY: `GetCursorPos` writes only to the caller-owned `point`;
@@ -407,7 +368,13 @@ impl Monitors for Host {
         }
     }
 
-    fn primary_metrics() -> Option<(PxRect, PxRect, f32, bool)> {
+    /// Primary monitor + work-area geometry for UI cover math.
+    ///
+    /// Returns `(monitor_rect, work_rect, dpi_scale, foreground_covers_monitor)`
+    /// in physical pixels; the caller converts to logical [`crate::ui::layout`]
+    /// cover rects so no UI type crosses this seam. `None` off Windows or when
+    /// the monitor query fails (callers fall back to the iced-provided size).
+    pub fn primary_metrics() -> Option<(PxRect, PxRect, f32, bool)> {
         #[cfg(windows)]
         {
             // SAFETY: `MonitorFromPoint` takes coordinates by value and returns
@@ -473,7 +440,15 @@ impl Monitors for Host {
         }
     }
 
-    fn foreground_facts() -> Option<(i32, i32, i32, i32, isize)> {
+    /// Foreground-window geometry for the exclusive-fullscreen predicate.
+    ///
+    /// Returns `(width, height, monitor_width, monitor_height, style)` in
+    /// physical pixels plus Win32 `GWL_STYLE` bits; the caller maps this onto
+    /// [`crate::domain::pad::ForegroundWindowFacts`] and applies the pure
+    /// [`crate::domain::pad::is_exclusive_fullscreen`] predicate, so no Win32
+    /// type crosses this seam. `None` off Windows or when the foreground
+    /// query fails (callers treat as not-fullscreen).
+    pub fn foreground_facts() -> Option<(i32, i32, i32, i32, isize)> {
         #[cfg(windows)]
         {
             // SAFETY: `GetForegroundWindow` returns an opaque handle compared
@@ -524,52 +499,6 @@ impl Monitors for Host {
     }
 }
 
-/// Global hotkeys: the toast Escape dismiss plus the debug-only hitch markers
-/// (F7 lightbar / F8 input, compiled out of release builds).
-///
-/// `RegisterHotKey` binds to the calling thread's message queue, so the whole
-/// lifecycle (register → pump → unregister) lives on one worker thread owned by
-/// the caller in [`crate::app`]; this trait only wraps the Win32 verbs.
-/// Non-Windows stubs (`false` / `None` / `0` / no-op) are preserved verbatim —
-/// off Windows the callers keep their `pending()` / no-watcher fallbacks.
-pub trait Hotkeys {
-    /// Toast Escape-dismiss hotkey id.
-    const ESCAPE_ID: i32;
-    /// Debug hitch-marker ids (F7 lightbar / F8 input).
-    #[cfg(debug_assertions)]
-    const HITCH_LIGHTBAR_ID: i32;
-    /// Debug hitch-marker ids (F7 lightbar / F8 input).
-    #[cfg(debug_assertions)]
-    const HITCH_INPUT_ID: i32;
-
-    /// Register the toast Escape hotkey on the calling thread; `true` on success.
-    fn register_escape() -> bool;
-    /// Remove the toast Escape hotkey.
-    fn unregister_escape();
-    /// Register the debug lightbar-hitch hotkey (F7) on the calling thread.
-    #[cfg(debug_assertions)]
-    fn register_hitch_lightbar() -> bool;
-    /// Register the debug input-hitch hotkey (F8) on the calling thread.
-    #[cfg(debug_assertions)]
-    fn register_hitch_input() -> bool;
-    /// Remove the debug lightbar-hitch hotkey.
-    #[cfg(debug_assertions)]
-    fn unregister_hitch_lightbar();
-    /// Remove the debug input-hitch hotkey.
-    #[cfg(debug_assertions)]
-    fn unregister_hitch_input();
-    /// Block for the next `WM_HOTKEY` on the calling thread and return its id.
-    ///
-    /// Non-hotkey messages are skipped internally (the verbatim `continue`);
-    /// `None` when the pump quits (`WM_QUIT`) or errors.
-    fn next_hotkey() -> Option<i32>;
-    /// OS id of the calling thread (quit-guard target; `0` stub off Windows).
-    fn current_thread_id() -> u32;
-    /// RAII poster: unblocks a [`Hotkeys::next_hotkey`] pump on `thread_id`
-    /// when dropped (toast dismissed by some other means).
-    fn quit_guard(thread_id: u32) -> QuitGuard;
-}
-
 /// Posts `WM_QUIT` to a hotkey pump when the awaiting future is dropped.
 ///
 /// Mirrors [`crate::platform::win32::ThreadQuitGuard`] through the host seam
@@ -600,15 +529,37 @@ impl Drop for QuitGuard {
     }
 }
 
-#[cfg(windows)]
-impl Hotkeys for Host {
-    const ESCAPE_ID: i32 = crate::platform::win32::HOTKEY_ID;
-    #[cfg(debug_assertions)]
-    const HITCH_LIGHTBAR_ID: i32 = crate::platform::win32::HOTKEY_ID_LIGHTBAR_HITCH;
-    #[cfg(debug_assertions)]
-    const HITCH_INPUT_ID: i32 = crate::platform::win32::HOTKEY_ID_INPUT_HITCH;
+/// Global hotkeys: the toast Escape dismiss plus the debug-only hitch markers
+/// (F7 lightbar / F8 input, compiled out of release builds).
+///
+/// `RegisterHotKey` binds to the calling thread's message queue, so the whole
+/// lifecycle (register → pump → unregister) lives on one worker thread owned by
+/// the caller in [`crate::app`]; these methods only wrap the Win32 verbs.
+/// Non-Windows stubs (`false` / `None` / `0` / no-op) are preserved verbatim —
+/// off Windows the callers keep their `pending()` / no-watcher fallbacks.
+impl Host {
+    /// Toast Escape-dismiss hotkey id.
+    #[cfg(windows)]
+    pub const ESCAPE_ID: i32 = crate::platform::win32::HOTKEY_ID;
+    /// Toast Escape-dismiss hotkey id (`0` stub off Windows).
+    #[cfg(not(windows))]
+    pub const ESCAPE_ID: i32 = 0;
+    /// Debug hitch-marker id (F7 lightbar).
+    #[cfg(all(debug_assertions, windows))]
+    pub const HITCH_LIGHTBAR_ID: i32 = crate::platform::win32::HOTKEY_ID_LIGHTBAR_HITCH;
+    /// Debug hitch-marker id (F7 lightbar; `1` stub off Windows).
+    #[cfg(all(debug_assertions, not(windows)))]
+    pub const HITCH_LIGHTBAR_ID: i32 = 1;
+    /// Debug hitch-marker id (F8 input).
+    #[cfg(all(debug_assertions, windows))]
+    pub const HITCH_INPUT_ID: i32 = crate::platform::win32::HOTKEY_ID_INPUT_HITCH;
+    /// Debug hitch-marker id (F8 input; `2` stub off Windows).
+    #[cfg(all(debug_assertions, not(windows)))]
+    pub const HITCH_INPUT_ID: i32 = 2;
 
-    fn register_escape() -> bool {
+    /// Register the toast Escape hotkey on the calling thread; `true` on success.
+    #[cfg(windows)]
+    pub fn register_escape() -> bool {
         // SAFETY: `hwnd` 0 binds the hotkey to the calling thread's queue;
         // plain integer params, no memory access.
         unsafe {
@@ -621,16 +572,29 @@ impl Hotkeys for Host {
         }
     }
 
-    fn unregister_escape() {
+    /// Register the toast Escape hotkey on the calling thread (`false` stub off Windows).
+    #[cfg(not(windows))]
+    pub fn register_escape() -> bool {
+        false
+    }
+
+    /// Remove the toast Escape hotkey.
+    #[cfg(windows)]
+    pub fn unregister_escape() {
         // SAFETY: integer id only; failure is a return code.
         unsafe {
             crate::platform::win32::UnregisterHotKey(0, Self::ESCAPE_ID);
         }
     }
 
-    #[cfg(debug_assertions)]
-    fn register_hitch_lightbar() -> bool {
-        // SAFETY: same contract as [`Hotkeys::register_escape`].
+    /// Remove the toast Escape hotkey (no-op stub off Windows).
+    #[cfg(not(windows))]
+    pub fn unregister_escape() {}
+
+    /// Register the debug lightbar-hitch hotkey (F7) on the calling thread.
+    #[cfg(all(debug_assertions, windows))]
+    pub fn register_hitch_lightbar() -> bool {
+        // SAFETY: same contract as [`Host::register_escape`].
         unsafe {
             crate::platform::win32::RegisterHotKey(
                 0,
@@ -641,9 +605,17 @@ impl Hotkeys for Host {
         }
     }
 
-    #[cfg(debug_assertions)]
-    fn register_hitch_input() -> bool {
-        // SAFETY: same contract as [`Hotkeys::register_escape`].
+    /// Register the debug lightbar-hitch hotkey (F7) on the calling thread
+    /// (`false` stub off Windows).
+    #[cfg(all(debug_assertions, not(windows)))]
+    pub fn register_hitch_lightbar() -> bool {
+        false
+    }
+
+    /// Register the debug input-hitch hotkey (F8) on the calling thread.
+    #[cfg(all(debug_assertions, windows))]
+    pub fn register_hitch_input() -> bool {
+        // SAFETY: same contract as [`Host::register_escape`].
         unsafe {
             crate::platform::win32::RegisterHotKey(
                 0,
@@ -654,23 +626,45 @@ impl Hotkeys for Host {
         }
     }
 
-    #[cfg(debug_assertions)]
-    fn unregister_hitch_lightbar() {
+    /// Register the debug input-hitch hotkey (F8) on the calling thread
+    /// (`false` stub off Windows).
+    #[cfg(all(debug_assertions, not(windows)))]
+    pub fn register_hitch_input() -> bool {
+        false
+    }
+
+    /// Remove the debug lightbar-hitch hotkey.
+    #[cfg(all(debug_assertions, windows))]
+    pub fn unregister_hitch_lightbar() {
         // SAFETY: integer id only; failure is a return code.
         unsafe {
             crate::platform::win32::UnregisterHotKey(0, Self::HITCH_LIGHTBAR_ID);
         }
     }
 
-    #[cfg(debug_assertions)]
-    fn unregister_hitch_input() {
+    /// Remove the debug lightbar-hitch hotkey (no-op stub off Windows).
+    #[cfg(all(debug_assertions, not(windows)))]
+    pub fn unregister_hitch_lightbar() {}
+
+    /// Remove the debug input-hitch hotkey.
+    #[cfg(all(debug_assertions, windows))]
+    pub fn unregister_hitch_input() {
         // SAFETY: integer id only; failure is a return code.
         unsafe {
             crate::platform::win32::UnregisterHotKey(0, Self::HITCH_INPUT_ID);
         }
     }
 
-    fn next_hotkey() -> Option<i32> {
+    /// Remove the debug input-hitch hotkey (no-op stub off Windows).
+    #[cfg(all(debug_assertions, not(windows)))]
+    pub fn unregister_hitch_input() {}
+
+    /// Block for the next `WM_HOTKEY` on the calling thread and return its id.
+    ///
+    /// Non-hotkey messages are skipped internally (the verbatim `continue`);
+    /// `None` when the pump quits (`WM_QUIT`) or errors.
+    #[cfg(windows)]
+    pub fn next_hotkey() -> Option<i32> {
         // SAFETY: `message` is caller-owned; `GetMessageW` with null filters
         // pumps this thread's queue and writes only to `message`. Returns 0
         // on `WM_QUIT`, negative on error — both end the pump like the
@@ -686,55 +680,29 @@ impl Hotkeys for Host {
         }
     }
 
-    fn current_thread_id() -> u32 {
+    /// Block for the next `WM_HOTKEY` on the calling thread (`None` stub off
+    /// Windows: callers keep their `pending()` / no-watcher fallbacks).
+    #[cfg(not(windows))]
+    pub fn next_hotkey() -> Option<i32> {
+        None
+    }
+
+    /// OS id of the calling thread (quit-guard target; `0` stub off Windows).
+    #[cfg(windows)]
+    pub fn current_thread_id() -> u32 {
         // SAFETY: returns the calling thread's OS id; no memory access.
         unsafe { crate::platform::win32::GetCurrentThreadId() }
     }
 
-    fn quit_guard(thread_id: u32) -> QuitGuard {
-        QuitGuard(thread_id)
-    }
-}
-
-#[cfg(not(windows))]
-impl Hotkeys for Host {
-    const ESCAPE_ID: i32 = 0;
-    #[cfg(debug_assertions)]
-    const HITCH_LIGHTBAR_ID: i32 = 1;
-    #[cfg(debug_assertions)]
-    const HITCH_INPUT_ID: i32 = 2;
-
-    fn register_escape() -> bool {
-        false
-    }
-
-    fn unregister_escape() {}
-
-    #[cfg(debug_assertions)]
-    fn register_hitch_lightbar() -> bool {
-        false
-    }
-
-    #[cfg(debug_assertions)]
-    fn register_hitch_input() -> bool {
-        false
-    }
-
-    #[cfg(debug_assertions)]
-    fn unregister_hitch_lightbar() {}
-
-    #[cfg(debug_assertions)]
-    fn unregister_hitch_input() {}
-
-    fn next_hotkey() -> Option<i32> {
-        None
-    }
-
-    fn current_thread_id() -> u32 {
+    /// OS id of the calling thread (`0` stub off Windows).
+    #[cfg(not(windows))]
+    pub fn current_thread_id() -> u32 {
         0
     }
 
-    fn quit_guard(thread_id: u32) -> QuitGuard {
+    /// RAII poster: unblocks a [`Host::next_hotkey`] pump on `thread_id`
+    /// when dropped (toast dismissed by some other means).
+    pub fn quit_guard(thread_id: u32) -> QuitGuard {
         QuitGuard(thread_id)
     }
 }

@@ -14,55 +14,7 @@ use crate::persist::{atomic, json};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use std::fs;
-use std::marker::PhantomData;
-use std::path::{Path, PathBuf};
-
-/// Generic file-backed JSON store.
-///
-/// `T` is the whole-file shape. Lenient stores (controllers / games /
-/// analytics) keep their `from_root` decoders and only route I/O through here.
-pub struct Store<T> {
-    label: &'static str,
-    path: PathBuf,
-    _marker: PhantomData<T>,
-}
-
-impl<T> Store<T> {
-    /// Create a store for `path`; `label` appears in warn/diagnostic lines.
-    pub fn new(label: &'static str, path: PathBuf) -> Self {
-        Self {
-            label,
-            path,
-            _marker: PhantomData,
-        }
-    }
-
-    /// File this store reads and writes.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Human label used in log lines.
-    pub fn label(&self) -> &'static str {
-        self.label
-    }
-}
-
-impl<T: DeserializeOwned + Default> Store<T> {
-    /// Load the whole file, or `T::default()` when missing/unreadable/corrupt.
-    ///
-    /// No backup is taken: sibling-keeping stores use [`load_object`] instead.
-    pub fn load_or_default(&self) -> T {
-        load_or_default(&self.path)
-    }
-}
-
-impl<T: Serialize> Store<T> {
-    /// Serialize `value` pretty and commit atomically. Returns success.
-    pub fn save_pretty(&self, value: &T) -> bool {
-        save_pretty(self.label, &self.path, value)
-    }
-}
+use std::path::Path;
 
 /// Load a whole JSON file, or `Default` on any failure (missing, I/O error,
 /// corrupt JSON, shape mismatch). Warns through `app_log`, takes no backup.
@@ -108,6 +60,7 @@ pub fn save_pretty<T: Serialize>(label: &str, path: &Path, value: &T) -> bool {
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+    use std::path::PathBuf;
 
     #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
     struct Sample {
@@ -123,34 +76,6 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("sdsc-store-{name}-{nanos}.json"))
-    }
-
-    #[test]
-    fn round_trip_through_store_struct() {
-        let path = scratch("struct");
-        let _ = fs::remove_file(&path);
-        let store = Store::<Sample>::new("sample", path.clone());
-        assert_eq!(store.load_or_default(), Sample::default());
-        assert!(store.save_pretty(&Sample {
-            name: "x".into(),
-            count: 3,
-        }));
-        assert_eq!(
-            store.load_or_default(),
-            Sample {
-                name: "x".into(),
-                count: 3,
-            }
-        );
-        // Pretty JSON stays byte-compatible with direct `to_vec_pretty`.
-        let raw = fs::read(&path).unwrap();
-        let expected = serde_json::to_vec_pretty(&Sample {
-            name: "x".into(),
-            count: 3,
-        })
-        .unwrap();
-        assert_eq!(raw, expected);
-        let _ = fs::remove_file(&path);
     }
 
     #[test]

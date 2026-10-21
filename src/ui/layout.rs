@@ -1,7 +1,7 @@
 //! Popup / toast placement and iced window platform settings.
 
 use crate::persist::prefs::ToastPosition;
-use crate::platform::host::{self, Host, Monitors as _};
+use crate::platform::host::{self, Host};
 use crate::ui::toast::view as toast_view;
 
 use iced::{Point, Size, Task, window};

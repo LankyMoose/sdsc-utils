@@ -39,7 +39,7 @@ use crate::domain::pad::{
     self as start_input, InputHub, NavReading, ShortSampleOutcome, SnapshotMeta, SnapshotReason,
 };
 use crate::platform::app_log;
-use crate::platform::host::{Host, Watcher as _};
+use crate::platform::host::Host;
 use hidapi::{BusType, HidApi, HidDevice};
 use iced::futures::channel::oneshot;
 use std::collections::HashMap;
