@@ -4,5 +4,4 @@ pub mod json;
 pub mod paths;
 pub mod prefs;
 pub mod restart_ui;
-pub mod steam_library;
 pub mod store;

@@ -1440,10 +1440,10 @@ pub fn is_exclusive_fullscreen(facts: ForegroundWindowFacts) -> bool {
 
 /// Whether the foreground window looks like exclusive fullscreen.
 ///
-/// Geometry comes from [`crate::platform::host::Monitors::foreground_facts`];
+/// Geometry comes from [`crate::platform::host::Host::foreground_facts`];
 /// the predicate stays pure ([`is_exclusive_fullscreen`]) for tests.
 pub fn foreground_is_exclusive_fullscreen() -> bool {
-    use crate::platform::host::{Host, Monitors as _};
+    use crate::platform::host::Host;
     let Some((width, height, monitor_width, monitor_height, style)) = Host::foreground_facts()
     else {
         return false;
