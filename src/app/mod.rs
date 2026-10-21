@@ -34,7 +34,7 @@ use crate::persist::notify::NotifyEvent;
 use crate::persist::prefs::{NavbarVisibility, Prefs};
 use crate::platform::app_log;
 use crate::platform::host::{Autostart as _, Host, Hotkeys as _, Watcher as _};
-use crate::platform::ui_sound::UiSoundKind;
+use crate::platform::ui_sound::{SoundHub, UiSoundKind};
 use crate::ui::configure::{
     self as configure_view, AnalyticsPanel, ConfigureMessage, ConfigureState, PadInputPanel,
     Section,
@@ -366,6 +366,9 @@ pub struct App {
     /// Owned Start-art decode unit (single-flight mailbox + iced event sink;
     /// no process-global).
     art: Arc<ArtOwner>,
+    /// Owned UI-sound worker handle (lazy worker spawn on first play;
+    /// no process-global).
+    sound: SoundHub,
 
     tray_icon: Option<TrayIcon>,
     tray_anchor: TrayAnchor,
@@ -655,6 +658,7 @@ impl App {
         let claims = hid_worker.claims();
         claims.set_enabled(prefs.lightbar_enabled);
         let art = Arc::new(ArtOwner::new());
+        let sound = SoundHub::new();
 
         let configure_state = ConfigureState::new(prefs.spectrum.clone());
 
@@ -700,6 +704,7 @@ impl App {
             input_hub,
             claims,
             art,
+            sound,
             tray_icon: None,
             tray_anchor: TrayAnchor::default(),
             popup_window: None,
