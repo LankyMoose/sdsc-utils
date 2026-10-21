@@ -28,6 +28,7 @@ use crate::controller::model::Connection;
 use crate::controller::model::ControllerStatus;
 use crate::games::GamesCatalog;
 use crate::games::process_match::RunningSession;
+use crate::games::process_match::SeenCache;
 use crate::games::steam::SteamGame;
 use crate::persist::analytics::AnalyticsStore;
 use crate::persist::notify::NotifyEvent;
@@ -493,6 +494,9 @@ pub struct App {
     process_enum_inflight: bool,
     /// Cached `match_paths_for_target` results (cleared on Steam library refresh).
     match_path_cache: HashMap<String, Vec<PathBuf>>,
+    /// First-sight cache for missing Steam installdir warnings (never
+    /// cleared; later sights stay silent for the process lifetime).
+    seen_cache: SeenCache,
     steam_by_id: HashMap<u32, SteamGame>,
     /// True until the first `SteamScanDone` (Ok or Err).
     steam_scan_pending: bool,
@@ -783,6 +787,7 @@ impl App {
             last_running_check: None,
             process_enum_inflight: false,
             match_path_cache: HashMap::new(),
+            seen_cache: SeenCache::new(),
             steam_by_id: HashMap::new(),
             steam_scan_pending: true,
             steam_scan_started: None,

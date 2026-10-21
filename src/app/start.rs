@@ -2485,7 +2485,7 @@ impl App {
         if let Some(paths) = self.match_path_cache.get(target) {
             return paths.clone();
         }
-        let paths = process_match::match_paths_for_target(target);
+        let paths = process_match::match_paths_for_target(target, &self.seen_cache);
         self.match_path_cache
             .insert(target.to_string(), paths.clone());
         paths

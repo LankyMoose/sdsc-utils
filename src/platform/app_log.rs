@@ -5,6 +5,7 @@
 //!   **debug builds only** (`cfg(debug_assertions)`)
 
 use crate::platform::app_meta::{DISPLAY_NAME, PKG_NAME, PKG_VERSION};
+use crate::platform::crash_restart::CrashArmed;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,8 @@ const MAX_HID_TRACE_BYTES: u64 = 16_000_000;
 /// infrastructure with ~130 call sites across the HID worker thread, persist
 /// atomic writes, session notify, and platform bring-up — threading `&LogHandles`
 /// through all of them would churn far beyond the app root for no behavior
-/// gain. The binary owns init ordering (`app_log::init()` first in `main`);
+/// gain. The binary owns init ordering (`app_log::init(armed)` first in
+/// `main`, with the boot-owned `&'static CrashArmed`);
 /// everything else logs through the free functions, which delegate here.
 pub struct LogHandles {
     log_path: Mutex<Option<PathBuf>>,
@@ -43,7 +45,7 @@ impl LogHandles {
         }
     }
 
-    pub fn init(&self) {
+    pub fn init(&self, crash_armed: &'static CrashArmed) {
         let path = log_file_path("app.log");
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -62,7 +64,7 @@ impl LogHandles {
             }
         }
 
-        install_panic_hook();
+        install_panic_hook(crash_armed);
 
         let session_id = epoch_ms() as u64;
         self.session_id.store(session_id, Ordering::Relaxed);
@@ -200,8 +202,8 @@ impl Default for LogHandles {
 // Rotation, paths, and formats are unchanged; see `LogHandles` docs.
 static HANDLES: LogHandles = LogHandles::new();
 
-pub fn init() {
-    HANDLES.init();
+pub fn init(crash_armed: &'static CrashArmed) {
+    HANDLES.init(crash_armed);
 }
 
 /// Log panics to `app.log` (and stderr when available). Needed because
@@ -209,7 +211,7 @@ pub fn init() {
 ///
 /// Also appends a capped backtrace so GPU/renderer panics (e.g. iced atlas
 /// `create_view`) can be attributed without a debugger.
-fn install_panic_hook() {
+fn install_panic_hook(crash_armed: &'static CrashArmed) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let location = info
@@ -228,7 +230,7 @@ fn install_panic_hook() {
         append_panic_line(&line);
         append_panic_line(&crate::platform::wgpu_diag::context_line());
         append_panic_line(&format!("PANIC_BACKTRACE {}", panic_backtrace_capped()));
-        crate::platform::crash_restart::schedule_from_panic();
+        crate::platform::crash_restart::schedule_from_panic(crash_armed);
         let _ = writeln!(std::io::stderr(), "{line}");
         previous(info);
     }));

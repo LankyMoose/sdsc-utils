@@ -5,7 +5,7 @@
 use sdsc_utils::platform::app_log;
 use sdsc_utils::platform::app_meta::{DISPLAY_NAME, PKG_NAME, PKG_VERSION, REPLACE_FLAG};
 use sdsc_utils::platform::autostart;
-use sdsc_utils::platform::crash_restart;
+use sdsc_utils::platform::crash_restart::{self, CrashArmed};
 use sdsc_utils::{app, controller};
 use single_instance::SingleInstance;
 use std::env;
@@ -13,7 +13,12 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    app_log::init();
+    // Crash boot owns the tray-arm flag: leaked so the panic hook (installed
+    // by `app_log::init`, `'static` by `set_hook` contract) borrows it for
+    // the process lifetime. CLI paths never arm it (see below); only the
+    // tray path calls `arm_tray_mode`.
+    let crash_armed: &'static CrashArmed = Box::leak(Box::new(CrashArmed::new()));
+    app_log::init(crash_armed);
 
     let args: Vec<String> = env::args().skip(1).collect();
 
@@ -100,7 +105,7 @@ fn main() -> ExitCode {
         Err(code) => return code,
     };
 
-    crash_restart::arm_tray_mode();
+    crash_restart::arm_tray_mode(crash_armed);
 
     if let Err(err) = app::run() {
         app_log::error(format!("app exited with error: {err}"));
