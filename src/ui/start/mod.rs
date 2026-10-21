@@ -10,6 +10,7 @@ pub mod icon_cache;
 pub mod idle;
 pub mod immersive;
 pub mod input;
+pub mod list;
 pub mod mode;
 pub mod position;
 pub mod row;

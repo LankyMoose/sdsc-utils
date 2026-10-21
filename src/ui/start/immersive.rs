@@ -1159,7 +1159,7 @@ fn controllers_dock_host<'a>(
             let selected =
                 i == state.controller_selected && matches!(state.slide, StartSlide::Controllers);
             (
-                crate::ui::start::view::list_key(&row.serial),
+                crate::ui::start::list::list_key(&row.serial),
                 dock_controller_row(
                     row,
                     spectrum,
