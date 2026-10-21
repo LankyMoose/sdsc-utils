@@ -13,6 +13,7 @@ mod toast;
 
 use crate::controller::dualsense::lightbar;
 use crate::controller::dualsense::rumble::MotorPulse;
+use crate::domain::color::SpectrumService;
 
 #[cfg(debug_assertions)]
 use crate::controller::emulate;
@@ -43,7 +44,6 @@ use crate::platform::autostart;
 use crate::platform::ui_sound::{self, UiSoundKind};
 #[cfg(windows)]
 use crate::platform::win32;
-use crate::ui::color;
 use crate::ui::configure::{
     self as configure_view, AnalyticsPanel, ConfigureMessage, ConfigureState, PadInputPanel,
     Section,
@@ -364,6 +364,9 @@ pub struct App {
     absence_recheck_pending: bool,
     /// Serializes DualSense HID for the daemon (never on the UI thread).
     hid_worker: HidWorkerHandle,
+    /// Owned battery spectrum shared with the HID worker (clone-then-release
+    /// reads; never held across HID writes).
+    spectrum: SpectrumService,
 
     tray_icon: Option<TrayIcon>,
     tray_anchor: TrayAnchor,
@@ -642,13 +645,13 @@ impl App {
         let known = KnownControllers::load();
         let analytics = AnalyticsStore::load();
         let games = GamesCatalog::load();
-        color::set_active_spectrum(prefs.spectrum.clone());
+        let spectrum = SpectrumService::new(prefs.spectrum.clone());
         lightbar::set_enabled(prefs.lightbar_enabled);
 
         #[cfg(windows)]
         autostart::ensure_quiet_entry();
 
-        let hid_worker = HidWorkerHandle::start();
+        let hid_worker = HidWorkerHandle::start(spectrum.clone());
         let identifying = hid_worker.identifying();
 
         let configure_state = ConfigureState::new(prefs.spectrum.clone());
@@ -691,6 +694,7 @@ impl App {
             refreshing: Arc::new(AtomicBool::new(false)),
             absence_recheck_pending: false,
             hid_worker,
+            spectrum,
             tray_icon: None,
             tray_anchor: TrayAnchor::default(),
             popup_window: None,

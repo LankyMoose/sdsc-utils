@@ -3,7 +3,7 @@
 use serde::de::{Deserializer, Error as DeError, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rgb {
@@ -329,26 +329,21 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
         .clamp(0.0, 255.0) as u8
 }
 
-/// Owned battery-spectrum unit: the process-wide RGB mapping readers
-/// (`hid/poll.rs`, `hid/worker.rs`) sample and writers (`app/mod.rs`,
-/// `configure.rs`) install.
+/// Owned battery-spectrum unit: the RGB mapping HID readers (`hid/poll.rs`,
+/// `hid/worker.rs`) sample and writers (`app/mod.rs`, `configure.rs`) install.
 ///
-/// Future injection point: construct one `SpectrumService` in the app root
-/// and pass `&SpectrumService` down instead of using the process-global
-/// [`GLOBAL`] shim below.
+/// Owned by the app root (`App::spectrum`) and cloned into the HID worker.
+/// `color_at` clones under the lock then releases before computing, so the
+/// lock is never held across a downstream HID write.
 #[derive(Clone)]
 pub struct SpectrumService {
     inner: Arc<Mutex<BatterySpectrum>>,
-    #[cfg(test)]
-    test_lock: Arc<Mutex<()>>,
 }
 
 impl SpectrumService {
     pub fn new(initial: BatterySpectrum) -> Self {
         Self {
             inner: Arc::new(Mutex::new(initial)),
-            #[cfg(test)]
-            test_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -370,52 +365,12 @@ impl SpectrumService {
             .unwrap_or_else(|_| BatterySpectrum::default_spectrum());
         spectrum.color_at_percent(percent)
     }
-
-    /// Hold while mutating the service in tests (avoids races with
-    /// parallel tests that read the shared instance).
-    ///
-    /// Owns the test lock that the free [`with_spectrum_lock`] shim
-    /// delegates to, so existing call sites keep working unchanged.
-    #[cfg(test)]
-    pub fn with_test_lock<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _guard = self.test_lock.lock().unwrap_or_else(|e| e.into_inner());
-        f()
-    }
 }
 
 impl Default for SpectrumService {
     fn default() -> Self {
         Self::new(BatterySpectrum::default_spectrum())
     }
-}
-
-// Thin compat shim: process-global instance until call sites take `&SpectrumService`.
-static GLOBAL: LazyLock<SpectrumService> = LazyLock::new(SpectrumService::default);
-
-fn active_service() -> &'static SpectrumService {
-    &GLOBAL
-}
-
-/// Hold while installing a different active spectrum in tests.
-///
-/// The active spectrum is process-global, so a test that swaps it in can hand
-/// its colors to any concurrently-running test that reads through
-/// [`color_for_battery_percent`]. Every test that calls either this or
-/// [`color_for_battery_percent`] must take this lock. (`icon_cache` has the
-/// same hazard and the same remedy — see its `with_cache_lock`.)
-#[cfg(test)]
-pub fn with_spectrum_lock<R>(f: impl FnOnce() -> R) -> R {
-    active_service().with_test_lock(f)
-}
-
-/// Install the spectrum used by [`color_for_battery_percent`].
-pub fn set_active_spectrum(spectrum: BatterySpectrum) {
-    active_service().set(spectrum);
-}
-
-/// Map battery percent through the active RGB spectrum.
-pub fn color_for_battery_percent(percent: u8) -> Rgb {
-    active_service().color_at(percent)
 }
 
 pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Rgb {
@@ -488,18 +443,20 @@ mod tests {
 
     #[test]
     fn active_spectrum_is_used() {
-        with_spectrum_lock(|| {
-            set_active_spectrum(
-                BatterySpectrum::from_stops(vec![
-                    GradientStop::new(100, Rgb::new(0, 255, 0)),
-                    GradientStop::new(50, Rgb::new(255, 255, 0)),
-                    GradientStop::new(0, Rgb::new(255, 0, 0)),
-                ])
-                .unwrap(),
-            );
-            assert_eq!(color_for_battery_percent(100), Rgb::new(0, 255, 0));
-            set_active_spectrum(BatterySpectrum::default_spectrum());
-        });
+        let service = SpectrumService::new(
+            BatterySpectrum::from_stops(vec![
+                GradientStop::new(100, Rgb::new(0, 255, 0)),
+                GradientStop::new(50, Rgb::new(255, 255, 0)),
+                GradientStop::new(0, Rgb::new(255, 0, 0)),
+            ])
+            .unwrap(),
+        );
+        assert_eq!(service.color_at(100), Rgb::new(0, 255, 0));
+        service.set(BatterySpectrum::default_spectrum());
+        assert_eq!(
+            service.color_at(100),
+            BatterySpectrum::default_spectrum().color_at_percent(100)
+        );
     }
 
     #[test]

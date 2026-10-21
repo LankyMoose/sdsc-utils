@@ -34,7 +34,7 @@ use crate::controller::hid::poll::{
     self, POLL_LIVE_BATTERY_STALE, PRESENCE_INTERVAL, PRESENCE_INTERVAL_EMPTY,
 };
 use crate::controller::model::ControllerStatus;
-use crate::domain::color::{Rgb, color_for_battery_percent};
+use crate::domain::color::{Rgb, SpectrumService};
 use crate::domain::pad::{
     self as start_input, InputSnapshot, NavReading, ShortSampleOutcome, SnapshotMeta,
     SnapshotReason,
@@ -202,6 +202,7 @@ struct DeviceCache {
     presence: Arc<Mutex<Vec<String>>>,
     launch_paths: LaunchPaths,
     launch_serials: Arc<Mutex<Vec<String>>>,
+    spectrum: SpectrumService,
 }
 
 /// Last battery + product label observed while sampling (hot path).
@@ -217,6 +218,7 @@ impl DeviceCache {
     fn new(
         presence: Arc<Mutex<Vec<String>>>,
         launch_serials: Arc<Mutex<Vec<String>>>,
+        spectrum: SpectrumService,
     ) -> Result<Self, String> {
         let api = HidApi::new().map_err(|e| e.to_string())?;
         let mut cache = Self {
@@ -228,6 +230,7 @@ impl DeviceCache {
             presence,
             launch_paths: LaunchPaths::new(),
             launch_serials,
+            spectrum,
         };
         let _ = cache.refresh_device_list();
         Ok(cache)
@@ -762,7 +765,13 @@ impl LowBatteryPulse {
     }
 
     /// Advance the pulse schedule. Returns true when an RGB write ran.
-    fn tick(&mut self, cache: &mut DeviceCache, identifying: bool, now: Instant) -> bool {
+    fn tick(
+        &mut self,
+        cache: &mut DeviceCache,
+        spectrum: &SpectrumService,
+        identifying: bool,
+        now: Instant,
+    ) -> bool {
         if self.targets.is_empty() {
             return false;
         }
@@ -791,7 +800,7 @@ impl LowBatteryPulse {
                     return false;
                 }
                 let (serial, percent) = self.targets[index].clone();
-                let color = color_for_battery_percent(percent);
+                let color = spectrum.color_at(percent);
                 let _ = write_rgb_exclusive(cache, &serial, color);
                 let next = index + 1;
                 if next < self.targets.len() {
@@ -824,10 +833,11 @@ pub struct HidWorkerHandle {
     live_pads: Arc<Mutex<HashMap<String, LivePadStatus>>>,
     /// Serials resolved from HID paths present at first enum (suppress Connected toast).
     launch_serials: Arc<Mutex<Vec<String>>>,
+    spectrum: SpectrumService,
 }
 
 impl HidWorkerHandle {
-    pub fn start() -> Self {
+    pub fn start(spectrum: SpectrumService) -> Self {
         let (tx, rx) = mpsc::channel::<HidCmd>();
         let identifying = Arc::new(AtomicBool::new(false));
         let identifying_worker = Arc::clone(&identifying);
@@ -839,6 +849,7 @@ impl HidWorkerHandle {
         let live_pads_worker = Arc::clone(&live_pads);
         let launch_serials = Arc::new(Mutex::new(Vec::new()));
         let launch_serials_worker = Arc::clone(&launch_serials);
+        let spectrum_worker = spectrum.clone();
         // Fresh worker start resets the owned input hub (seq restarts at 0).
         start_input::set_input_snapshot(Arc::new(Mutex::new(InputSnapshot::default())));
         let input_snapshot = start_input::snapshot_mutex();
@@ -858,6 +869,7 @@ impl HidWorkerHandle {
                     presence_worker,
                     live_pads_worker,
                     launch_serials_worker,
+                    spectrum_worker,
                 );
             })
             .expect("spawn hid-worker");
@@ -869,6 +881,7 @@ impl HidWorkerHandle {
             presence,
             live_pads,
             launch_serials,
+            spectrum,
         };
         // OS arrival/removal watcher (Windows/Linux; no-op elsewhere): fires
         // throttled list-only refresh hints so hot enumeration cannot freeze
@@ -885,6 +898,11 @@ impl HidWorkerHandle {
 
     pub fn identifying(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.identifying)
+    }
+
+    /// Owned battery spectrum shared with the worker thread.
+    pub fn spectrum(&self) -> SpectrumService {
+        self.spectrum.clone()
     }
 
     /// Latest DualSense gamepad HID paths from the worker's throttled refresh.
@@ -1359,6 +1377,7 @@ fn maybe_log_sample_stall(
 #[allow(clippy::too_many_arguments)]
 fn begin_identify(
     cache: &mut DeviceCache,
+    spectrum: &SpectrumService,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
     snapshot: &Mutex<InputSnapshot>,
     serial: String,
@@ -1367,7 +1386,7 @@ fn begin_identify(
     last_noisy_log: &Mutex<Instant>,
     input_hot: bool,
 ) -> Option<IdentifySession> {
-    let normal = color_for_battery_percent(percent);
+    let normal = spectrum.color_at(percent);
     log_cmd_begin("Identify", snapshot);
     let started = Instant::now();
     let (result, timing) = {
@@ -1654,6 +1673,7 @@ fn handle_cmd(
     cmd: HidCmd,
     session: &mut Option<IdentifySession>,
     cache: &mut DeviceCache,
+    spectrum: &SpectrumService,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
     rumble: &mut RumbleCache,
     active_rumble: &mut Vec<ActiveRumble>,
@@ -1690,6 +1710,7 @@ fn handle_cmd(
             identifying.store(true, Ordering::SeqCst);
             *session = begin_identify(
                 cache,
+                spectrum,
                 live_pads,
                 snapshot,
                 serial,
@@ -1810,7 +1831,7 @@ fn handle_cmd(
             let (result, timing) = {
                 let _op = crate::controller::hid::diag::enter_op("cmd_Poll");
                 let _ = cache.refresh_device_list();
-                poll_incremental(cache, live_pads, &previously, &mut quiet)
+                poll_incremental(cache, spectrum, live_pads, &previously, &mut quiet)
             };
             for serial in quiet {
                 cache.queue_launch_serial(serial);
@@ -1838,6 +1859,7 @@ fn handle_cmd(
 /// poll misses are left alone so sampling (not a map wipe) owns liveness.
 fn poll_incremental(
     cache: &mut DeviceCache,
+    spectrum: &SpectrumService,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
     previously: &[String],
     launch_quiet: &mut Vec<String>,
@@ -2015,7 +2037,13 @@ fn poll_incremental(
         status.index = i + 1;
     }
 
-    poll::reassert_lightbar_for_pads(&cache.api, previously, statuses.iter(), &mut timing);
+    poll::reassert_lightbar_for_pads(
+        &cache.api,
+        spectrum,
+        previously,
+        statuses.iter(),
+        &mut timing,
+    );
     (Ok(statuses), timing)
 }
 
@@ -2029,14 +2057,18 @@ fn worker_loop(
     presence: Arc<Mutex<Vec<String>>>,
     live_pads: Arc<Mutex<HashMap<String, LivePadStatus>>>,
     launch_serials: Arc<Mutex<Vec<String>>>,
+    spectrum: SpectrumService,
 ) {
-    let mut cache = match DeviceCache::new(presence, launch_serials) {
+    let mut cache = match DeviceCache::new(presence, launch_serials, spectrum) {
         Ok(c) => c,
         Err(err) => {
             app_log::warn(format!("hid-worker: HidApi init failed: {err}"));
             return;
         }
     };
+    // Owned copy for HID color reads; cloned (never held across writes) so the
+    // `&mut cache` borrows below never alias the spectrum borrow.
+    let spectrum = cache.spectrum.clone();
     // Clear claims poisoned by prior no-op writes on input-cache handles.
     lightbar::forget_all_claims();
     let mut rumble = RumbleCache::new();
@@ -2067,7 +2099,7 @@ fn worker_loop(
             );
         }
         let identifying_now = session.is_some() || identifying.load(Ordering::SeqCst);
-        if pulse.tick(&mut cache, identifying_now, now) {
+        if pulse.tick(&mut cache, &spectrum, identifying_now, now) {
             in_cmd = "LowBatteryPulse";
         }
         maybe_log_sample_stall(
@@ -2117,6 +2149,7 @@ fn worker_loop(
                     cmd,
                     &mut session,
                     &mut cache,
+                    &spectrum,
                     &live_pads,
                     &mut rumble,
                     &mut active_rumble,
@@ -2206,6 +2239,7 @@ fn worker_loop(
                     cmd,
                     &mut session,
                     &mut cache,
+                    &spectrum,
                     &live_pads,
                     &mut rumble,
                     &mut active_rumble,
@@ -2406,7 +2440,8 @@ mod tests {
     fn ghost_path_backoff_clears_on_success_and_refresh() {
         let presence = Arc::new(Mutex::new(Vec::new()));
         let launch_serials = Arc::new(Mutex::new(Vec::new()));
-        let mut cache = DeviceCache::new(presence, launch_serials).expect("hidapi init");
+        let mut cache = DeviceCache::new(presence, launch_serials, SpectrumService::default())
+            .expect("hidapi init");
         let ghost = "ghost-path".to_string();
         cache.note_open_result(&ghost, false);
         cache.note_open_result(&ghost, false);
