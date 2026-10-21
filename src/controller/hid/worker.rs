@@ -25,7 +25,7 @@ use crate::controller::dualsense::identity::{
     product_name, resolve_device_identity,
 };
 use crate::controller::dualsense::lightbar::{
-    self, HidPhaseTiming, IDENTIFY_FLASH_COUNT, IDENTIFY_FLASH_MS, LOW_BATTERY_ORANGE,
+    self, ClaimStore, HidPhaseTiming, IDENTIFY_FLASH_COUNT, IDENTIFY_FLASH_MS, LOW_BATTERY_ORANGE,
     LOW_BATTERY_PULSE_GAP_MS, LOW_BATTERY_PULSE_ON_MS,
 };
 use crate::controller::dualsense::rumble;
@@ -202,6 +202,7 @@ struct DeviceCache {
     launch_paths: LaunchPaths,
     launch_serials: Arc<Mutex<Vec<String>>>,
     spectrum: SpectrumService,
+    claims: Arc<ClaimStore>,
 }
 
 /// Last battery + product label observed while sampling (hot path).
@@ -218,6 +219,7 @@ impl DeviceCache {
         presence: Arc<Mutex<Vec<String>>>,
         launch_serials: Arc<Mutex<Vec<String>>>,
         spectrum: SpectrumService,
+        claims: Arc<ClaimStore>,
     ) -> Result<Self, String> {
         let api = HidApi::new().map_err(|e| e.to_string())?;
         let mut cache = Self {
@@ -230,6 +232,7 @@ impl DeviceCache {
             launch_paths: LaunchPaths::new(),
             launch_serials,
             spectrum,
+            claims,
         };
         let _ = cache.refresh_device_list();
         Ok(cache)
@@ -768,6 +771,7 @@ impl LowBatteryPulse {
         &mut self,
         cache: &mut DeviceCache,
         spectrum: &SpectrumService,
+        claims: &ClaimStore,
         identifying: bool,
         now: Instant,
     ) -> bool {
@@ -776,7 +780,7 @@ impl LowBatteryPulse {
         }
         match self.phase {
             PulsePhase::Gap { until } if now >= until => {
-                if identifying || !lightbar::is_enabled() {
+                if identifying || !claims.is_enabled() {
                     // Reschedule gap without writing — Identify / disable owns the bar.
                     self.phase = PulsePhase::Gap {
                         until: now + Duration::from_millis(LOW_BATTERY_PULSE_GAP_MS),
@@ -784,7 +788,7 @@ impl LowBatteryPulse {
                     return false;
                 }
                 let (serial, _) = &self.targets[0];
-                let _ = write_rgb_exclusive(cache, serial, LOW_BATTERY_ORANGE);
+                let _ = write_rgb_exclusive(cache, claims, serial, LOW_BATTERY_ORANGE);
                 self.phase = PulsePhase::Orange {
                     index: 0,
                     until: now + Duration::from_millis(LOW_BATTERY_PULSE_ON_MS),
@@ -792,7 +796,7 @@ impl LowBatteryPulse {
                 true
             }
             PulsePhase::Orange { index, until } if now >= until => {
-                if identifying || !lightbar::is_enabled() {
+                if identifying || !claims.is_enabled() {
                     self.phase = PulsePhase::Gap {
                         until: now + Duration::from_millis(LOW_BATTERY_PULSE_GAP_MS),
                     };
@@ -800,11 +804,11 @@ impl LowBatteryPulse {
                 }
                 let (serial, percent) = self.targets[index].clone();
                 let color = spectrum.color_at(percent);
-                let _ = write_rgb_exclusive(cache, &serial, color);
+                let _ = write_rgb_exclusive(cache, claims, &serial, color);
                 let next = index + 1;
                 if next < self.targets.len() {
                     let (serial, _) = &self.targets[next];
-                    let _ = write_rgb_exclusive(cache, serial, LOW_BATTERY_ORANGE);
+                    let _ = write_rgb_exclusive(cache, claims, serial, LOW_BATTERY_ORANGE);
                     self.phase = PulsePhase::Orange {
                         index: next,
                         until: now + Duration::from_millis(LOW_BATTERY_PULSE_ON_MS),
@@ -836,6 +840,9 @@ pub struct HidWorkerHandle {
     /// Owned pad-input publication + edge bridge shared with the worker thread
     /// and the iced subscription (no process-global).
     input_hub: Arc<InputHub>,
+    /// Owned lightbar-claim unit shared with the worker thread and the
+    /// presence-empty fast path (no process-global).
+    claims: Arc<ClaimStore>,
 }
 
 impl HidWorkerHandle {
@@ -855,6 +862,9 @@ impl HidWorkerHandle {
         // Fresh worker start owns a new input hub (seq restarts at 0).
         let input_hub = Arc::new(InputHub::new());
         let input_hub_worker = Arc::clone(&input_hub);
+        // Fresh worker start owns the lightbar-claim unit.
+        let claims = Arc::new(ClaimStore::new());
+        let claims_worker = Arc::clone(&claims);
         let last_noisy_log = Arc::new(Mutex::new(Instant::now() - PULSE_SAMPLE_LOG_INTERVAL));
         let last_noisy_log_worker = Arc::clone(&last_noisy_log);
 
@@ -872,6 +882,7 @@ impl HidWorkerHandle {
                     live_pads_worker,
                     launch_serials_worker,
                     spectrum_worker,
+                    claims_worker,
                 );
             })
             .expect("spawn hid-worker");
@@ -885,6 +896,7 @@ impl HidWorkerHandle {
             launch_serials,
             spectrum,
             input_hub,
+            claims,
         };
         // OS arrival/removal watcher (Windows/Linux; no-op elsewhere): fires
         // throttled list-only refresh hints so hot enumeration cannot freeze
@@ -911,6 +923,11 @@ impl HidWorkerHandle {
     /// Owned pad-input hub shared with the worker thread and the iced subscription.
     pub fn input_hub(&self) -> Arc<InputHub> {
         Arc::clone(&self.input_hub)
+    }
+
+    /// Owned lightbar-claim unit shared with the worker thread.
+    pub fn claims(&self) -> Arc<ClaimStore> {
+        Arc::clone(&self.claims)
     }
 
     /// Latest DualSense gamepad HID paths from the worker's throttled refresh.
@@ -1046,15 +1063,17 @@ fn identify_flash_color(step: u32, normal: Rgb) -> Rgb {
 /// every SetRgb while start-nav is sampling).
 fn write_rgb_exclusive(
     cache: &mut DeviceCache,
+    claims: &ClaimStore,
     serial: &str,
     color: Rgb,
 ) -> (Result<(), String>, HidPhaseTiming) {
     cache.drop_serial(serial);
-    let (result, mut timing) = lightbar::apply_lightbar_rgb_timed(&cache.api, serial, color);
+    let (result, mut timing) =
+        lightbar::apply_lightbar_rgb_timed(&cache.api, serial, color, claims);
     if result.is_err() {
         // Stale device list — refresh once and retry.
         if cache.refresh_device_list().is_ok() {
-            let (retry, t2) = lightbar::apply_lightbar_rgb_timed(&cache.api, serial, color);
+            let (retry, t2) = lightbar::apply_lightbar_rgb_timed(&cache.api, serial, color, claims);
             timing.add_assign(t2);
             return (retry, timing);
         }
@@ -1391,6 +1410,7 @@ fn maybe_log_sample_stall(
 fn begin_identify(
     cache: &mut DeviceCache,
     spectrum: &SpectrumService,
+    claims: &ClaimStore,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
     hub: &InputHub,
     serial: String,
@@ -1404,7 +1424,7 @@ fn begin_identify(
     let started = Instant::now();
     let (result, timing) = {
         let _op = crate::controller::hid::diag::enter_op("cmd_Identify");
-        write_rgb_exclusive(cache, &serial, identify_flash_color(0, normal))
+        write_rgb_exclusive(cache, claims, &serial, identify_flash_color(0, normal))
     };
     if let Err(err) = result {
         app_log::warn(format!("identify failed for {serial}: {err}"));
@@ -1431,9 +1451,11 @@ fn begin_identify(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn advance_identify(
     session: &mut Option<IdentifySession>,
     cache: &mut DeviceCache,
+    claims: &ClaimStore,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
     hub: &InputHub,
     identifying: &AtomicBool,
@@ -1475,7 +1497,7 @@ fn advance_identify(
     let serial = s.serial.clone();
     let (result, t) = {
         let _op = crate::controller::hid::diag::enter_op("cmd_IdentifyFlash");
-        write_rgb_exclusive(cache, &serial, color)
+        write_rgb_exclusive(cache, claims, &serial, color)
     };
     s.timing.add_assign(t);
     s.flashes += 1;
@@ -1510,20 +1532,25 @@ fn abort_identify(
     }
 }
 
-fn stop_all_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>) {
+fn stop_all_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>, claims: &ClaimStore) {
     for (serial, open) in rumble.devices.iter() {
-        let _ = rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, serial);
+        let _ = rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, serial, claims);
     }
     active.clear();
     rumble.drop_all();
 }
 
 /// Stop motors and drop the rumble handle for one pad only.
-fn stop_rumble_for_serial(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>, serial: &str) {
+fn stop_rumble_for_serial(
+    rumble: &mut RumbleCache,
+    active: &mut Vec<ActiveRumble>,
+    serial: &str,
+    claims: &ClaimStore,
+) {
     let target = normalize_identity(serial);
     active.retain(|e| normalize_identity(&e.serial) != target);
     if let Some(open) = rumble.devices.get(&target) {
-        let _ = rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, &target);
+        let _ = rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, &target, claims);
     }
     rumble.drop_serial(&target);
 }
@@ -1544,6 +1571,7 @@ fn readings_without_power_off_target(readings: Vec<NavReading>, serial: &str) ->
 fn write_rumble_pulse(
     cache: &mut DeviceCache,
     rumble: &mut RumbleCache,
+    claims: &ClaimStore,
     serial: &str,
     right: u8,
     left: u8,
@@ -1561,7 +1589,14 @@ fn write_rumble_pulse(
         match rumble.ensure(&cache.api, &target) {
             Ok(open) => {
                 let is_bt = open.is_bluetooth;
-                match rumble::set_rumble_on_device(&open.device, is_bt, &target, right, left) {
+                match rumble::set_rumble_on_device(
+                    &open.device,
+                    is_bt,
+                    &target,
+                    right,
+                    left,
+                    claims,
+                ) {
                     Ok(()) => {
                         crate::controller::hid::diag::diag_info(format!(
                             "hid-diag: rumble ok serial={target} r={right} l={left} bt={}",
@@ -1598,13 +1633,25 @@ fn write_rumble_pulse(
             );
             rumble.fallback_warned = true;
         }
-        return rumble::set_rumble_on_device(&open.device, open.is_bluetooth, &target, right, left)
-            .map_err(|e| e.to_string());
+        return rumble::set_rumble_on_device(
+            &open.device,
+            open.is_bluetooth,
+            &target,
+            right,
+            left,
+            claims,
+        )
+        .map_err(|e| e.to_string());
     }
     Err(format!("rumble: no handle for {target}"))
 }
 
-fn expire_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>, now: Instant) {
+fn expire_rumble(
+    rumble: &mut RumbleCache,
+    active: &mut Vec<ActiveRumble>,
+    claims: &ClaimStore,
+    now: Instant,
+) {
     let mut still = Vec::with_capacity(active.len());
     for entry in active.drain(..) {
         if entry.stop_at > now {
@@ -1612,7 +1659,12 @@ fn expire_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>, now: 
             continue;
         }
         if let Some(open) = rumble.devices.get(&normalize_identity(&entry.serial)) {
-            let _ = rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, &entry.serial);
+            let _ = rumble::stop_rumble_on_device(
+                &open.device,
+                open.is_bluetooth,
+                &entry.serial,
+                claims,
+            );
         }
     }
     *active = still;
@@ -1624,6 +1676,7 @@ fn execute_power_off(
     serial: &str,
     session: &mut Option<IdentifySession>,
     cache: &mut DeviceCache,
+    claims: &ClaimStore,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
     rumble: &mut RumbleCache,
     active_rumble: &mut Vec<ActiveRumble>,
@@ -1635,7 +1688,7 @@ fn execute_power_off(
     if session.as_ref().is_some_and(|s| s.serial == serial) {
         abort_identify(session, cache, identifying);
     }
-    stop_rumble_for_serial(rumble, active_rumble, serial);
+    stop_rumble_for_serial(rumble, active_rumble, serial, claims);
     // Exclusive feature-report open needs this pad's input handle released only.
     cache.drop_serial(serial);
     forget_live_pad(live_pads, serial);
@@ -1688,6 +1741,7 @@ fn handle_cmd(
     session: &mut Option<IdentifySession>,
     cache: &mut DeviceCache,
     spectrum: &SpectrumService,
+    claims: &ClaimStore,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
     rumble: &mut RumbleCache,
     active_rumble: &mut Vec<ActiveRumble>,
@@ -1703,7 +1757,7 @@ fn handle_cmd(
         HidCmd::Shutdown => {
             *pending_power_off = None;
             abort_identify(session, cache, identifying);
-            stop_all_rumble(rumble, active_rumble);
+            stop_all_rumble(rumble, active_rumble, claims);
             pulse.set_targets(Vec::new());
             cache.drop_all();
             if let Ok(mut guard) = live_pads.lock() {
@@ -1725,6 +1779,7 @@ fn handle_cmd(
             *session = begin_identify(
                 cache,
                 spectrum,
+                claims,
                 live_pads,
                 hub,
                 serial,
@@ -1754,6 +1809,7 @@ fn handle_cmd(
                 &serial,
                 session,
                 cache,
+                claims,
                 live_pads,
                 rumble,
                 active_rumble,
@@ -1770,11 +1826,11 @@ fn handle_cmd(
             }
             log_cmd_begin("SetRgb", hub);
             let started = Instant::now();
-            let (result, timing) = write_rgb_exclusive(cache, &serial, color);
+            let (result, timing) = write_rgb_exclusive(cache, claims, &serial, color);
             if let Err(err) = result {
                 app_log::warn(format!("lightbar write failed for {serial}: {err}"));
             } else {
-                lightbar::note_lightbar_applied(&serial, color);
+                claims.note_applied(&serial, color);
             }
             log_cmd(
                 "SetRgb",
@@ -1795,7 +1851,7 @@ fn handle_cmd(
             let target = normalize_identity(&serial);
             // Retrigger: replace any pending stop for this serial.
             active_rumble.retain(|e| normalize_identity(&e.serial) != target);
-            match write_rumble_pulse(cache, rumble, &target, right, left) {
+            match write_rumble_pulse(cache, rumble, claims, &target, right, left) {
                 Ok(()) => {
                     if duration_ms > 0 && (right > 0 || left > 0) {
                         active_rumble.push(ActiveRumble {
@@ -1803,8 +1859,12 @@ fn handle_cmd(
                             stop_at: Instant::now() + Duration::from_millis(duration_ms),
                         });
                     } else if let Some(open) = rumble.devices.get(&target) {
-                        let _ =
-                            rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, &target);
+                        let _ = rumble::stop_rumble_on_device(
+                            &open.device,
+                            open.is_bluetooth,
+                            &target,
+                            claims,
+                        );
                     }
                 }
                 Err(err) => {
@@ -1816,7 +1876,7 @@ fn handle_cmd(
             false
         }
         HidCmd::RumbleStopAll => {
-            stop_all_rumble(rumble, active_rumble);
+            stop_all_rumble(rumble, active_rumble, claims);
             false
         }
         HidCmd::SetLowBatteryTargets { targets } => {
@@ -1845,7 +1905,7 @@ fn handle_cmd(
             let (result, timing) = {
                 let _op = crate::controller::hid::diag::enter_op("cmd_Poll");
                 let _ = cache.refresh_device_list();
-                poll_incremental(cache, spectrum, live_pads, &previously, &mut quiet)
+                poll_incremental(cache, spectrum, claims, live_pads, &previously, &mut quiet)
             };
             for serial in quiet {
                 cache.queue_launch_serial(serial);
@@ -1874,6 +1934,7 @@ fn handle_cmd(
 fn poll_incremental(
     cache: &mut DeviceCache,
     spectrum: &SpectrumService,
+    claims: &ClaimStore,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
     previously: &[String],
     launch_quiet: &mut Vec<String>,
@@ -1907,7 +1968,7 @@ fn poll_incremental(
     timing.enumerate_ms += enum_started.elapsed().as_millis();
 
     if devices.is_empty() {
-        lightbar::sync_lightbar_claims(std::iter::empty::<&str>());
+        claims.sync(std::iter::empty::<&str>());
         return (Ok(Vec::new()), timing);
     }
 
@@ -2054,6 +2115,7 @@ fn poll_incremental(
     poll::reassert_lightbar_for_pads(
         &cache.api,
         spectrum,
+        claims,
         previously,
         statuses.iter(),
         &mut timing,
@@ -2072,19 +2134,24 @@ fn worker_loop(
     live_pads: Arc<Mutex<HashMap<String, LivePadStatus>>>,
     launch_serials: Arc<Mutex<Vec<String>>>,
     spectrum: SpectrumService,
+    claims: Arc<ClaimStore>,
 ) {
-    let mut cache = match DeviceCache::new(presence, launch_serials, spectrum) {
+    let mut cache = match DeviceCache::new(presence, launch_serials, spectrum, Arc::clone(&claims))
+    {
         Ok(c) => c,
         Err(err) => {
             app_log::warn(format!("hid-worker: HidApi init failed: {err}"));
             return;
         }
     };
-    // Owned copy for HID color reads; cloned (never held across writes) so the
-    // `&mut cache` borrows below never alias the spectrum borrow.
+    // Owned copies for HID color reads + lightbar claims; cloned (never held
+    // across writes) so the `&mut cache` borrows below never alias the
+    // borrowed values.
     let spectrum = cache.spectrum.clone();
+    let claims_owned = cache.claims.clone();
+    let claims: &ClaimStore = &claims_owned;
     // Clear claims poisoned by prior no-op writes on input-cache handles.
-    lightbar::forget_all_claims();
+    claims.forget_all();
     let mut rumble = RumbleCache::new();
     let mut active_rumble: Vec<ActiveRumble> = Vec::new();
     let mut pending_power_off: Option<PendingPowerOff> = None;
@@ -2097,12 +2164,13 @@ fn worker_loop(
         crate::controller::hid::diag::note_progress("worker_loop");
         let hot = input_hot.load(Ordering::Relaxed);
         let now = Instant::now();
-        expire_rumble(&mut rumble, &mut active_rumble, now);
+        expire_rumble(&mut rumble, &mut active_rumble, claims, now);
         for serial in take_due_power_offs(&mut pending_power_off, &active_rumble, now) {
             execute_power_off(
                 &serial,
                 &mut session,
                 &mut cache,
+                claims,
                 &live_pads,
                 &mut rumble,
                 &mut active_rumble,
@@ -2113,7 +2181,7 @@ fn worker_loop(
             );
         }
         let identifying_now = session.is_some() || identifying.load(Ordering::SeqCst);
-        if pulse.tick(&mut cache, &spectrum, identifying_now, now) {
+        if pulse.tick(&mut cache, &spectrum, claims, identifying_now, now) {
             in_cmd = "LowBatteryPulse";
         }
         maybe_log_sample_stall(&input_hub, hot, in_cmd, &mut stall_logged, &last_noisy_log);
@@ -2126,6 +2194,7 @@ fn worker_loop(
             advance_identify(
                 &mut session,
                 &mut cache,
+                claims,
                 &live_pads,
                 &input_hub,
                 &identifying,
@@ -2158,6 +2227,7 @@ fn worker_loop(
                     &mut session,
                     &mut cache,
                     &spectrum,
+                    claims,
                     &live_pads,
                     &mut rumble,
                     &mut active_rumble,
@@ -2248,6 +2318,7 @@ fn worker_loop(
                     &mut session,
                     &mut cache,
                     &spectrum,
+                    claims,
                     &live_pads,
                     &mut rumble,
                     &mut active_rumble,
@@ -2448,8 +2519,13 @@ mod tests {
     fn ghost_path_backoff_clears_on_success_and_refresh() {
         let presence = Arc::new(Mutex::new(Vec::new()));
         let launch_serials = Arc::new(Mutex::new(Vec::new()));
-        let mut cache = DeviceCache::new(presence, launch_serials, SpectrumService::default())
-            .expect("hidapi init");
+        let mut cache = DeviceCache::new(
+            presence,
+            launch_serials,
+            SpectrumService::default(),
+            Arc::new(ClaimStore::new()),
+        )
+        .expect("hidapi init");
         let ghost = "ghost-path".to_string();
         cache.note_open_result(&ghost, false);
         cache.note_open_result(&ghost, false);

@@ -5,7 +5,6 @@
 use super::{App, Message, SPECTRUM_DEBOUNCE, delay, is_emulated_serial};
 #[cfg(debug_assertions)]
 use super::{EMULATOR_COMMIT_DEBOUNCE, PendingEmulatorCommit};
-use crate::controller::dualsense::lightbar;
 #[cfg(debug_assertions)]
 use crate::controller::emulate;
 #[cfg(debug_assertions)]
@@ -241,7 +240,7 @@ impl App {
             ConfigureMessage::SetLightbarEnabled(enabled) => {
                 self.session.prefs.lightbar_enabled = enabled;
                 self.save_prefs();
-                lightbar::set_enabled(enabled);
+                self.claims.set_enabled(enabled);
                 self.sync_low_battery();
                 if enabled {
                     // Re-apply spectrum colors now that automatic writes are back on.
@@ -854,7 +853,7 @@ impl App {
 
         self.save_prefs();
 
-        if !lightbar::is_enabled() {
+        if !self.claims.is_enabled() {
             return Task::none();
         }
 

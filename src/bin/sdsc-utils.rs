@@ -195,7 +195,8 @@ fn attach_console_for_cli() {
 
 fn list_controllers_cli() -> ExitCode {
     let spectrum = sdsc_utils::domain::color::SpectrumService::default();
-    match controller::hid::poll::poll_controllers(&[], &spectrum) {
+    let claims = sdsc_utils::controller::dualsense::lightbar::ClaimStore::new();
+    match controller::hid::poll::poll_controllers(&[], &spectrum, &claims) {
         Ok(statuses) => {
             print_controllers(&statuses);
             ExitCode::SUCCESS
@@ -259,7 +260,10 @@ fn set_lightbar_cli(rgb_args: &[String]) -> ExitCode {
         eprintln!("error: no DualSense controllers found");
         return ExitCode::FAILURE;
     }
-    match controller::dualsense::lightbar::apply_lightbar_all(color) {
+    match controller::dualsense::lightbar::apply_lightbar_all(
+        color,
+        &controller::dualsense::lightbar::ClaimStore::new(),
+    ) {
         Ok(0) => {
             eprintln!("error: no DualSense controllers found");
             ExitCode::FAILURE
