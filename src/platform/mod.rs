@@ -5,6 +5,7 @@ pub mod crash_restart;
 pub mod debug_quiet;
 pub mod device_watch;
 pub mod file_icon;
+pub mod host;
 pub mod packaged;
 pub mod prev_instance;
 pub mod steam_watch;
