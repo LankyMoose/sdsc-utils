@@ -16,7 +16,7 @@ use crate::persist::paths;
 use crate::persist::prefs::{clamp_low_battery_percent, renderer_restart_needed};
 use crate::platform::app_log;
 #[cfg(windows)]
-use crate::platform::autostart;
+use crate::platform::host::{Autostart as _, Host};
 #[cfg(debug_assertions)]
 use crate::platform::ui_sound::UiSoundKind;
 use crate::ui::color::{self, BatterySpectrum};
@@ -73,7 +73,7 @@ impl App {
             extra_steam_paths: self.session.prefs.extra_steam_paths.clone(),
             steam_path_error: self.configure_state.steam_path_error.clone(),
             #[cfg(windows)]
-            autostart: autostart::is_enabled(),
+            autostart: Host::is_enabled(),
         }
     }
 
@@ -475,7 +475,7 @@ impl App {
             }
             #[cfg(windows)]
             ConfigureMessage::SetAutostart(enabled) => {
-                if let Err(err) = autostart::set_enabled(enabled) {
+                if let Err(err) = Host::set_enabled(enabled) {
                     app_log::error(format!("autostart toggle failed: {err}"));
                 }
                 Task::none()
