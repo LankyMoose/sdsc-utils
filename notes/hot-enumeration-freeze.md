@@ -1,6 +1,6 @@
 # Hot enumeration freeze hides second-pad connects (open)
 
-**Status:** open (latent, pre-existing — NOT introduced by the incremental-poll work).
+**Status:** open (latent, pre-existing — NOT introduced by the incremental-poll work). Update in 1.7.0-architecture: the blind window is now bounded — `HOT_ENUM_MAX_DEFER` (20s heartbeat cap, `hid/worker.rs`) forces a refresh while hot, and the OS device-arrival watcher (`device_watch.rs`) fires list-only refresh hints (~1s). The test-matrix lessons below still apply.
 **When to read:** a pad connected while Start is open / input is hot never appears
 (no toast, no tray, no sample opens) until input goes cold. Index: [README.md](README.md).
 
@@ -84,7 +84,7 @@ repeated hold lines, rare `caller=lightbar` writes.
   button press — logs alone cannot distinguish "invisible to enumeration"
   from "enumerated but unreadable".
 
-## Fix directions (NOT implemented)
+## Fix directions (all three landed in 1.7.0-architecture; kept for rationale)
 
 - Slow heartbeat refresh while hot (e.g. force `refresh_devices()` every
   15–30s even when deferred) — bounds the blind window without putting a

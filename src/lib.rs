@@ -1,4 +1,4 @@
-//! SDSC Utils shared library — domain, HID, session, and IPC.
+//! SDSC Utils shared library — domain, HID, and session.
 
 pub mod app;
 pub mod controller;

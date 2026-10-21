@@ -2058,8 +2058,10 @@ impl App {
                 };
 
         if membership_changed || battery_due || liveness_due || unread_retry {
-            // Reassert lightbar on every poll (~5s liveness included) so other HID
-            // writers (game launchers, etc.) do not keep the bar after a one-shot overwrite.
+            // Request a refresh when membership/battery/liveness is due. The lightbar
+            // reassert itself is gated downstream (new pad / color change / 30s
+            // backstop), so other HID writers cannot keep the bar after a one-shot
+            // overwrite without churning every liveness tick.
             self.request_refresh()
         } else {
             Task::none()

@@ -72,11 +72,11 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 - **Battery analytics** (off by default): learns each DualSense battery step for charge and play, shows remaining-time estimates after one qualifying step (interpolating within the current percent bucket; refining as more steps are observed; mid-cycle unplug/charge does not wipe history), and draws per-controller coverage charts in Settings → Analytics (local `analytics.json` only; open the data folder from Settings → System to inspect or delete files)
 - Detects controllers connecting/disconnecting within a few seconds
 - **Start screen** (Settings → Start screen): headline quick-launch when the first DualSense connects — curated Steam games and manual shortcuts, Games ↔ Controllers tabs (L2/R2), DualSense and keyboard nav. Cross/Enter launches; Circle/Escape closes; Square edits the catalog (Steam checklist + Add shortcut); Options toggles Last played ↔ A–Z; Controllers tab supports Identify and Bluetooth power-off. Opens with an empty catalog. Optional UI sounds with volume and controller haptics with strength. Any connected pad can drive the UI (inputs are not merged across pads). Reopen / promote with the **PS** (Guide) button. Catalog lives in `games.json` under the data folder
-- Lightbar color blends across a customizable **2–5 stop spectrum** (default **blue → purple → red**) as battery drops (reasserted about every 5 seconds); edit via tray **Settings** with a left-hand tab list. An **Enable lightbar** toggle (on by default) pauses battery-driven colors and the low-battery pulse while leaving Identify available. The Lightbar panel stays fully expanded when active: drag stops along the bar, click empty areas to add stops (up to 5), and drag a stop away to remove it (down to 2). Changes apply immediately.
+- Lightbar color blends across a customizable **2–5 stop spectrum** (default **blue → purple → red**) as battery drops (reapplied on change, plus a slow ~30s backstop); edit via tray **Settings** with a left-hand tab list. An **Enable lightbar** toggle (on by default) pauses battery-driven colors and the low-battery pulse while leaving Identify available. The Lightbar panel stays fully expanded when active: drag stops along the bar, click empty areas to add stops (up to 5), and drag a stop away to remove it (down to 2). Changes apply immediately.
 - At **low battery while discharging** (same configurable threshold as the toast; default ≤5%), the lightbar periodically pulses **orange**
 - Icons live in `assets/icons/` (SVG) and are rasterized at build/runtime
 - UI is an **iced** daemon (tray via `tray-icon`); Configure, controller popup, and toasts are iced windows
-- Single-instance (second launch exits quietly)
+- Single-instance with takeover (a fresh launch terminates the running predecessor and takes over; only the internal `--replace` child waits)
 - Logs to a file (see Troubleshooting)
 
 ## Compatible hardware
@@ -96,7 +96,7 @@ This builds every binary. Run `target/release/sdsc-utils` (`.exe` on Windows); i
 
 Release builds do **not** include the developer emulator (it is compiled only into debug builds).
 
-Package identity: `package.name` in `Cargo.toml` is `sdsc-utils`; display name is `DISPLAY_NAME` in `src/app_meta.rs` (runtime paths follow the package name).
+Package identity: `package.name` in `Cargo.toml` is `sdsc-utils`; display name is `DISPLAY_NAME` in `src/platform/app_meta.rs` (runtime paths follow the package name).
 
 ### Local git hooks (all branches)
 
@@ -144,13 +144,14 @@ The emulator is compiled into every non-release build, so there is no flag to pa
 | `--install-autostart` | Windows: enable login autostart for this build |
 | `--uninstall-autostart` | Windows: disable that autostart entry |
 | `--list-controllers` | Print connected DualSense pads and exit |
+| `--set-lightbar R G B` | Force-apply a lightbar color to connected pads and exit |
 
 Developer controls need no flag: they are compiled into every non-release build.
 
 ## Windows notes
 
 - Release builds use the Windows subsystem (no console window for the tray app).
-- The `.exe` and tray share the same DualSense SVG icon (rasterized at build time via `winres`).
+- The `.exe` and tray share the same DualSense SVG icon (rasterized at build time via `resvg`, embedded with `winres`).
 - Log file: `%APPDATA%\sdsc-utils\app.log` (grep `hid-worker:` for DualSense HID timing: `enumerate_ms` / `open_ms` / `io_ms` / `total_ms` per poll, Identify, lightbar). Start-screen pad input is sampled on the hid-worker thread and read as a snapshot on PadPoll (UI never opens DualSense HID).
 - Prefs file: `%APPDATA%\sdsc-utils\prefs.json` (notification toggles/threshold/position + lightbar spectrum/enabled + analytics opt-in)
 - Remembered controllers: `%APPDATA%\sdsc-utils\controllers.json` (remembered pads + nicknames)

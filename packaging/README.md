@@ -26,4 +26,4 @@ See [STORE.md](STORE.md) for the Partner Center checklist (account, listing copy
 
 ## Autostart
 
-`desktop:StartupTask` TaskId `SdscUtilsStartup` must stay in sync with [`src/autostart.rs`](../src/autostart.rs). Manifest default is `Enabled="false"` (user opts in via Settings).
+`desktop:StartupTask` TaskId `SdscUtilsStartup` must stay in sync with [`src/platform/autostart.rs`](../src/platform/autostart.rs). Manifest default is `Enabled="false"` (user opts in via Settings).

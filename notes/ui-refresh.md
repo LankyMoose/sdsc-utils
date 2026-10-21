@@ -57,4 +57,4 @@ Per-OS probe (`motion::system_animations_enabled`): Windows reads the real toggl
 
 ## Risks
 
-GPU/power from backdrops in background windows (hence nearly static); per-window shader pipelines + atlas creation; DWM rounding absent on Windows 10; `clippy -D warnings`; `start/view.rs` (6.4k lines) refactors kept separate from restyles.
+GPU/power from backdrops in background windows (hence nearly static); per-window shader pipelines + atlas creation; DWM rounding absent on Windows 10; `clippy -D warnings`; `start/view.rs` (~8.6k lines; `list.rs` split out) refactors kept separate from restyles.

@@ -6,8 +6,12 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Write `bytes` to `path` atomically: fsync'd temp file in the same
+/// Write `bytes` to `path` atomically: temp file in the same
 /// directory, then renamed over the destination.
+///
+/// No `fsync` is performed: the guarantee is that readers never see a
+/// half-written body, not durability across a crash (single desktop process,
+/// same volume).
 ///
 /// `fs::rename` replaces the destination on both Windows
 /// (`MOVEFILE_REPLACE_EXISTING`) and Unix, so readers either see the old

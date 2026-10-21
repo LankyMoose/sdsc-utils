@@ -27,10 +27,11 @@ the only driver. No async runtime, no second process.
   steps → midpoints in `battery.rs:percent_from_level`).
 - Dispatch is hardcoded: `hid/poll.rs` filters by `driver::is_gamepad` then calls
   `dualsense::product_name` / `read_battery` directly. `dualsense`/`lightbar`
-  strings appear in 40+ files including `ui/`.
+  strings appear in ~40 files including `ui/`.
 - What already helps: UI mostly reads `ControllerStatus`; `Connection` is generic;
-  `Policy` + `HidTransport` + `HidIoLock` are now threaded (not global), so a
-  second family reuses the cadence/lock plumbing.
+  `Policy` + `HidIoLock` are now threaded (not global) and `HidTransport`
+  covers the sample drain in tests (production poll/lightbar still use `hidapi`
+  directly), so a second family reuses the cadence/lock plumbing.
 
 ## Proposed shape
 

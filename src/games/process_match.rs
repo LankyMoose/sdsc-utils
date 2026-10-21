@@ -458,6 +458,9 @@ fn close_matching_windows(match_paths: &[PathBuf]) -> Result<(), String> {
         pids: HashSet<u32>,
     }
 
+    // SAFETY: `EnumWindows` invokes this on the calling thread with the `lparam`
+    // we pass below; `state` outlives the enumeration and is only read, never
+    // moved. The other `unsafe` calls take handles/pointers by value.
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
         let state = unsafe { &*(lparam.0 as *const EnumState) };
         if unsafe { IsWindowVisible(hwnd) }.as_bool() {
