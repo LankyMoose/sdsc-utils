@@ -33,11 +33,8 @@ use crate::persist::analytics::AnalyticsStore;
 use crate::persist::notify::NotifyEvent;
 use crate::persist::prefs::{NavbarVisibility, Prefs};
 use crate::platform::app_log;
-#[cfg(windows)]
-use crate::platform::autostart;
+use crate::platform::host::{Autostart as _, Host, Hotkeys as _, Watcher as _};
 use crate::platform::ui_sound::UiSoundKind;
-#[cfg(windows)]
-use crate::platform::win32;
 use crate::ui::configure::{
     self as configure_view, AnalyticsPanel, ConfigureMessage, ConfigureState, PadInputPanel,
     Section,
@@ -650,7 +647,7 @@ impl App {
         let spectrum = SpectrumService::new(prefs.spectrum.clone());
 
         #[cfg(windows)]
-        autostart::ensure_quiet_entry();
+        Host::ensure_quiet_entry();
 
         let hid_worker = HidWorkerHandle::start(spectrum.clone());
         let identifying = hid_worker.identifying();
@@ -2483,7 +2480,7 @@ fn presence_hint_stream() -> impl Stream<Item = Message> {
         // `try_send` takes `&mut self`; the watcher callback is `Fn`, so
         // share the sender behind a mutex (uncontended: one watcher, one drain).
         let tx = std::sync::Mutex::new(tx);
-        let _watched = crate::platform::device_watch::spawn_arrival_watcher(move || {
+        let _watched = Host::spawn(move || {
             if let Ok(mut guard) = tx.lock() {
                 let _ = guard.try_send(());
             }
@@ -2528,38 +2525,22 @@ fn start_hitch_hotkey_worker(hub: Arc<InputHub>) {
     use std::sync::OnceLock;
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
-        thread::spawn(move || unsafe {
-            if win32::RegisterHotKey(
-                0,
-                win32::HOTKEY_ID_LIGHTBAR_HITCH,
-                win32::MOD_NOREPEAT,
-                win32::VK_F7,
-            ) == 0
-            {
+        thread::spawn(move || {
+            if !Host::register_hitch_lightbar() {
                 app_log::warn("hitch hotkey: failed to register F7");
                 return;
             }
-            if win32::RegisterHotKey(
-                0,
-                win32::HOTKEY_ID_INPUT_HITCH,
-                win32::MOD_NOREPEAT,
-                win32::VK_F8,
-            ) == 0
-            {
+            if !Host::register_hitch_input() {
                 app_log::warn("hitch hotkey: failed to register F8");
-                win32::UnregisterHotKey(0, win32::HOTKEY_ID_LIGHTBAR_HITCH);
+                Host::unregister_hitch_lightbar();
                 return;
             }
             app_log::info("hitch hotkeys armed: F7=lightbar F8=input");
 
-            let mut message = win32::Message::default();
-            while win32::GetMessageW(&mut message, 0, 0, 0) > 0 {
-                if message.message != win32::WM_HOTKEY {
-                    continue;
-                }
-                let kind = if message.w_param == win32::HOTKEY_ID_LIGHTBAR_HITCH as usize {
+            while let Some(id) = Host::next_hotkey() {
+                let kind = if id == Host::HITCH_LIGHTBAR_ID {
                     "lightbar"
-                } else if message.w_param == win32::HOTKEY_ID_INPUT_HITCH as usize {
+                } else if id == Host::HITCH_INPUT_ID {
                     "input"
                 } else {
                     continue;
@@ -2568,8 +2549,8 @@ fn start_hitch_hotkey_worker(hub: Arc<InputHub>) {
                 stamp_hitch_report(&hub, kind, "hotkey", None);
             }
 
-            win32::UnregisterHotKey(0, win32::HOTKEY_ID_LIGHTBAR_HITCH);
-            win32::UnregisterHotKey(0, win32::HOTKEY_ID_INPUT_HITCH);
+            Host::unregister_hitch_lightbar();
+            Host::unregister_hitch_input();
         });
     });
 }
@@ -2591,28 +2572,27 @@ async fn wait_for_escape() -> Option<()> {
     let (id_sender, id_receiver) = std::sync::mpsc::channel();
     let (sender, receiver) = oneshot::channel();
 
-    thread::spawn(move || unsafe {
+    thread::spawn(move || {
         // `RegisterHotKey` binds to the calling thread's message queue, so the
         // whole lifecycle has to live on this worker.
-        let _ = id_sender.send(win32::GetCurrentThreadId());
-        if win32::RegisterHotKey(0, win32::HOTKEY_ID, win32::MOD_NOREPEAT, win32::VK_ESCAPE) == 0 {
+        let _ = id_sender.send(Host::current_thread_id());
+        if !Host::register_escape() {
             return;
         }
 
-        let mut message = win32::Message::default();
-        while win32::GetMessageW(&mut message, 0, 0, 0) > 0 {
-            if message.message == win32::WM_HOTKEY && message.w_param == win32::HOTKEY_ID as usize {
+        while let Some(id) = Host::next_hotkey() {
+            if id == Host::ESCAPE_ID {
                 let _ = sender.send(());
                 break;
             }
         }
 
-        win32::UnregisterHotKey(0, win32::HOTKEY_ID);
+        Host::unregister_escape();
     });
 
     // Posting `WM_QUIT` unblocks `GetMessageW` when the toast is dismissed by
     // some other means and this future is dropped.
-    let _guard = win32::ThreadQuitGuard(id_receiver.recv().unwrap_or(0));
+    let _guard = Host::quit_guard(id_receiver.recv().unwrap_or(0));
     receiver.await.ok()
 }
 
