@@ -77,7 +77,7 @@ use iced::mouse;
 use iced::widget::{Float, container, operation, space, stack};
 use iced::{Element, Fill, Point, Size, Subscription, Task, Theme, Vector, stream, window};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -109,6 +109,10 @@ const RELOAD_FEEDBACK_DELAY: Duration = Duration::from_millis(700);
 const SCROLL_RESTORE_AUTHORITY: Duration = Duration::from_secs(30);
 /// Process/catalog running checks are expensive; never run them at pad-poll rate.
 const RUNNING_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Closed-Start cadence for the running-badge wall-clock tick (open Start
+/// refreshes at `RUNNING_CHECK_INTERVAL` through pad polls already). Slower
+/// keeps background process scans cheap during real gameplay.
+const RUNNING_CHECK_CLOSED_INTERVAL: Duration = Duration::from_secs(5);
 const PAD_POLL_STALL_MS: u128 = 80;
 const PAD_POLL_SLOW_MS: u128 = 20;
 const SNAPSHOT_STALE_MS: u128 = 100;
@@ -140,6 +144,13 @@ pub enum Message {
     PollResult(Result<Vec<ControllerStatus>, String>),
     /// Result of a background process-image snapshot (running badge).
     ProcessEnumResult(Result<Vec<(u32, PathBuf)>, String>),
+    /// Steam `Apps` registry changed (see `platform::steam_watch`): re-read
+    /// the session verdict now instead of waiting for the next badge tick.
+    SteamAppsChanged,
+    /// Wall-clock tick for the running-game badge. Owns live sessions while
+    /// Start is closed / pad-idle so a failed launch cannot freeze `Playing`
+    /// until the next open.
+    RunningBadgeTick,
     /// Background game-close finished (WM_CLOSE + terminate); badge refresh clears "Closing".
     CloseGameDone(Result<(), String>),
 
@@ -260,9 +271,11 @@ impl Message {
             Message::Tick | Message::PresenceHint | Message::AbsenceRecheck => false,
             #[cfg(debug_assertions)]
             Message::EmulatorCommitTick => false,
-            Message::PollResult(_) | Message::ProcessEnumResult(_) | Message::CloseGameDone(_) => {
-                false
-            }
+            Message::PollResult(_)
+            | Message::ProcessEnumResult(_)
+            | Message::RunningBadgeTick
+            | Message::SteamAppsChanged
+            | Message::CloseGameDone(_) => false,
             Message::TrayMenu(id) => id.as_str() != QUIT_ID,
             Message::TrayLeftClick(_) => true,
             Message::WindowClosed(_)
@@ -464,6 +477,9 @@ pub struct App {
     /// Last armed-pad face held snapshot (merged with keyboard in [`Self::sync_start_held`]).
     pad_held: FaceHeld,
     running_session: Option<RunningSession>,
+    /// Steam appids whose install dir failed pre-flight (missing/empty):
+    /// launch is blocked and the row dims until the next successful scan.
+    launch_blocked_steam: HashSet<u32>,
     /// Match paths for the target currently showing "Closing" (cleared on process exit).
     closing_match_paths: Vec<PathBuf>,
     /// Throttle for process enumeration / catalog restore (not pad UI).
@@ -748,6 +764,7 @@ impl App {
             cancel_key_held: false,
             pad_held: FaceHeld::default(),
             running_session: None,
+            launch_blocked_steam: HashSet::new(),
             closing_match_paths: Vec::new(),
             last_running_check: None,
             process_enum_inflight: false,
@@ -1086,6 +1103,20 @@ impl App {
             );
         }
 
+        // Wall-clock owner for the running-game badge: pad edges only flow
+        // while Start is open and pads are live, so without this a failed
+        // immersive launch (Start auto-closed) would freeze `Playing` until
+        // the next open. Only subscribed while a session is alive.
+        if self.running_session.is_some() {
+            let interval = if self.start_visible {
+                RUNNING_CHECK_INTERVAL
+            } else {
+                RUNNING_CHECK_CLOSED_INTERVAL
+            };
+            subscriptions.push(iced::time::every(interval).map(|_| Message::RunningBadgeTick));
+            subscriptions.push(Subscription::run(steam_apps_watch_stream));
+        }
+
         Subscription::batch(subscriptions)
     }
 
@@ -1248,6 +1279,8 @@ impl App {
             Message::EmulatorCommitTick => self.on_emulator_commit_tick(),
             Message::PollResult(result) => self.on_poll_result(result),
             Message::ProcessEnumResult(result) => self.on_process_enum_result(result),
+            Message::SteamAppsChanged => self.refresh_running_badge_inner(true),
+            Message::RunningBadgeTick => self.refresh_running_badge(),
             Message::CloseGameDone(result) => self.on_close_game_done(result),
 
             Message::TrayMenu(id) => match id.as_str() {
@@ -3699,6 +3732,11 @@ impl App {
         }
         match entry {
             crate::games::GameEntry::Steam { appid } => {
+                // Pre-flight failures dim the row until a fresh scan proves
+                // the install back.
+                if self.launch_blocked_steam.contains(appid) {
+                    return true;
+                }
                 // Unknown scan (None) keeps rows enabled; known scan disables missing.
                 match self.steam_installed.as_deref() {
                     Some(ids) => !ids.contains(appid),
@@ -3882,24 +3920,25 @@ impl App {
         self.refresh_running_badge_inner(false)
     }
 
-    fn refresh_running_badge_inner(&mut self, _force: bool) -> Task<Message> {
+    fn refresh_running_badge_inner(&mut self, force: bool) -> Task<Message> {
         let now = Instant::now();
 
-        // Optimistic UI during Steam/game start — no process enumeration.
-        if let Some(session) = self.running_session.as_ref()
-            && now.duration_since(session.launched_at) < process_match::LAUNCH_GRACE
-        {
-            self.start_state.running_target = Some(session.target.clone());
-            return Task::none();
-        }
-
+        // No grace early-return: enums run from launch onward (throttled) so
+        // a Steam handoff that never spawns a process fast-fails instead of
+        // holding `Playing` blind for `LAUNCH_GRACE`. Optimism lives in
+        // `apply_running_badge_from_images` via `decide_running_badge`, which
+        // also means a reopen after the window spawns a real check instead of
+        // re-asserting the stale badge.
         if self.process_enum_inflight {
             return Task::none();
         }
 
-        if self
-            .last_running_check
-            .is_some_and(|t| now.duration_since(t) < RUNNING_CHECK_INTERVAL)
+        // Registry-watch events bypass the cadence (rare: a few per launch /
+        // exit) so real launches confirm immediately; ticks stay throttled.
+        if !force
+            && self
+                .last_running_check
+                .is_some_and(|t| now.duration_since(t) < RUNNING_CHECK_INTERVAL)
         {
             return Task::none();
         }
@@ -3932,32 +3971,37 @@ impl App {
         let now = Instant::now();
 
         if let Some(session) = self.running_session.as_mut() {
-            if process_match::any_matching_in_images(&session.match_paths, images) {
-                session.miss_since = None;
-                self.start_state.running_target = Some(session.target.clone());
+            let process_matched =
+                process_match::any_matching_in_images(&session.match_paths, images);
+            // Steam's own running flag (Windows registry; None = unknown /
+            // off-platform / non-Steam target). Authoritative when present:
+            // it covers launcher/JVM games path matching cannot see, and it
+            // never flips for license-refused launches.
+            let steam_running =
+                steam_appid_from_target(&session.target).and_then(steam::is_appid_running);
+            let was_matched = session.matched;
+            if process_match::decide_running_badge(session, now, process_matched, steam_running) {
+                // Stamp last-played on the false→true confirm edge only:
+                // failed handoffs (Steam error, never a process) must not
+                // pollute Last Played sort/metadata.
+                let confirm_key = if !was_matched && session.matched {
+                    session.play_key.clone()
+                } else {
+                    None
+                };
+                if let Some(play_key) = confirm_key {
+                    self.touch_last_played(&play_key);
+                }
+                self.sync_launch_badges();
                 // Keep any unrelated Closing visible; don't clear it here.
                 return;
             }
-
-            match session.miss_since {
-                None => {
-                    session.miss_since = Some(now);
-                    self.start_state.running_target = Some(session.target.clone());
-                    return;
-                }
-                Some(since) if now.duration_since(since) < process_match::MISS_CLEAR => {
-                    self.start_state.running_target = Some(session.target.clone());
-                    return;
-                }
-                Some(_) => {
-                    let target = session.target.clone();
-                    app_log::info(format!("running session cleared (process miss): {target}"));
-                    self.running_session = None;
-                    self.start_state.running_target = None;
-                }
-            }
+            let target = session.target.clone();
+            app_log::info(format!("running session cleared (process miss): {target}"));
+            self.running_session = None;
+            self.sync_launch_badges();
         } else {
-            self.start_state.running_target = None;
+            self.sync_launch_badges();
         }
 
         // "Closing" stays until its process actually exits (or paths were empty).
@@ -4011,24 +4055,52 @@ impl App {
             .as_ref()
             .is_some_and(|s| s.matches_target(&target))
         {
-            self.start_state.running_target = Some(target);
+            // A live process matches the session target: confirm it.
+            if let Some(session) = self.running_session.as_mut() {
+                session.matched = true;
+            }
+            self.sync_launch_badges();
             return;
         }
         let match_paths = path_sets[idx].clone();
         app_log::info(format!("running session restored: {target}"));
         self.running_session = Some(RunningSession::restored(title, target.clone(), match_paths));
-        self.start_state.running_target = Some(target);
+        self.sync_launch_badges();
     }
 
-    fn begin_running_session(&mut self, title: String, target: String) {
+    fn begin_running_session(&mut self, title: String, target: String, play_key: String) {
         let match_paths = self.cached_match_paths(&target);
         if match_paths.is_empty() {
             app_log::warn(format!(
                 "running session: empty match_paths for {target} (badge may clear after grace)"
             ));
         }
-        self.running_session = Some(RunningSession::new(title, target.clone(), match_paths));
-        self.start_state.running_target = Some(target);
+        self.running_session = Some(RunningSession::new(
+            title,
+            target.clone(),
+            match_paths,
+            Some(play_key),
+        ));
+        self.sync_launch_badges();
+    }
+
+    /// Mirror the launch session into Start badges: a confirmed session
+    /// (`matched`: process or Steam verdict) shows Running, a live but
+    /// unconfirmed one shows Launching, no session clears both.
+    fn sync_launch_badges(&mut self) {
+        if let Some(session) = self.running_session.as_ref() {
+            let target = session.target.clone();
+            if session.matched {
+                self.start_state.running_target = Some(target);
+                self.start_state.launching_target = None;
+            } else {
+                self.start_state.running_target = None;
+                self.start_state.launching_target = Some(target);
+            }
+        } else {
+            self.start_state.running_target = None;
+            self.start_state.launching_target = None;
+        }
     }
 
     fn touch_last_played(&mut self, play_key: &str) {
@@ -4045,7 +4117,7 @@ impl App {
         self.start_state.closing_target = Some(session.target.clone());
         self.closing_match_paths = session.match_paths.clone();
         self.running_session = None;
-        self.start_state.running_target = None;
+        self.sync_launch_badges();
         self.start_state.cross_progress = 0.0;
         let match_paths = session.match_paths.clone();
         let target = session.target.clone();
@@ -4173,6 +4245,9 @@ impl App {
             Ok(games) => {
                 self.steam_installed = Some(games.iter().map(|g| g.appid).collect());
                 self.steam_by_id = games.iter().map(|g| (g.appid, g.clone())).collect();
+                // A fresh scan is ground truth again: drop pre-flight blocks
+                // (reinstall / license restored re-enables the row).
+                self.launch_blocked_steam.clear();
                 let root = steam::steam_root().ok().flatten();
                 crate::persist::steam_library::save(&games, root.as_deref());
             }
@@ -6587,6 +6662,23 @@ impl App {
             return false;
         }
 
+        // Steam pre-flight (revoked license / wiped files, e.g. an expired
+        // alpha): the manifest can linger while the install dir is missing
+        // or empty, and ShellExecute would happily hand off to a Steam error
+        // dialog. Block before creating a running session so `Playing`
+        // never parks on a game that cannot spawn a process.
+        if let Some(appid) = steam_appid_from_target(&row.target)
+            && !steam::install_ready_for_appid(appid)
+        {
+            app_log::warn(format!(
+                "launch blocked (steam install not ready): {} (appid {appid})",
+                row.title
+            ));
+            self.launch_blocked_steam.insert(appid);
+            self.refresh_start_rows();
+            return false;
+        }
+
         if let Some(session) = self.running_session.as_ref() {
             if session.matches_target(&row.target) {
                 return false;
@@ -6600,13 +6692,14 @@ impl App {
                 return true;
             }
             self.running_session = None;
-            self.start_state.running_target = None;
+            self.sync_launch_badges();
         }
 
         match launch::launch_target(&row.target, &row.args) {
             Ok(()) => {
-                self.touch_last_played(&row.play_key);
-                self.begin_running_session(row.title, row.target);
+                // No last-played stamp here: it lands on the first confirm
+                // (process or Steam verdict) in `apply_running_badge_from_images`.
+                self.begin_running_session(row.title, row.target, row.play_key);
                 true
             }
             Err(err) => {
@@ -7844,6 +7937,31 @@ impl Drop for InputEdgeBindGuard {
     fn drop(&mut self) {
         start_input::clear_input_edge_sender();
     }
+}
+
+/// Steam `Apps` registry watch for iced.
+///
+/// Bridges the `steam_watch` thread (fires on a system wait) into the iced
+/// runtime so a `Running` flip re-reads the badge immediately instead of
+/// waiting for the next tick. Like `tray_events`, the guard lives as long as
+/// the stream: dropping the subscription (session cleared) stops the thread.
+fn steam_apps_watch_stream() -> impl Stream<Item = Message> {
+    stream::channel(16, async move |mut output| {
+        let (tx, mut rx) = iced::futures::channel::mpsc::channel::<()>(16);
+        // `try_send` takes `&mut self`; the watcher callback is `Fn`, so
+        // share the sender behind a mutex (uncontended: one watcher, one drain).
+        let tx = std::sync::Mutex::new(tx);
+        let _watched = crate::platform::steam_watch::spawn_steam_apps_watcher(move || {
+            if let Ok(mut guard) = tx.lock() {
+                let _ = guard.try_send(());
+            }
+        });
+        while rx.next().await.is_some() {
+            if output.send(Message::SteamAppsChanged).await.is_err() {
+                break;
+            }
+        }
+    })
 }
 
 /// OS device arrival/removal wake for iced.

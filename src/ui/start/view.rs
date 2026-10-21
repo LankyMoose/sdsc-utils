@@ -862,6 +862,10 @@ pub struct State {
     pub controller_selected: usize,
     pub controllers: Vec<StartControllerRow>,
     pub running_target: Option<String>,
+    /// Target with a live launch session not yet confirmed running (no
+    /// process match, no Steam `Running` verdict). Shows "Launching" instead
+    /// of "Running" until the session confirms or clears.
+    pub launching_target: Option<String>,
     /// Target currently being closed (WM_CLOSE sent, waiting for process exit).
     /// Shows "Closing" immediately instead of clearing to nothing.
     pub closing_target: Option<String>,
@@ -1130,6 +1134,7 @@ impl Default for State {
             controller_selected: 0,
             controllers: Vec::new(),
             running_target: None,
+            launching_target: None,
             closing_target: None,
             powering_off: None,
             replace_confirm: None,
@@ -1186,7 +1191,30 @@ impl Default for State {
     }
 }
 
+/// Launch/close badge for a game row (see [`State::launch_status`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchStatus {
+    Closing,
+    Launching,
+    Running,
+}
+
 impl State {
+    /// Launch/close badge for a row target. Precedence is Closing, then
+    /// Launching (session alive but unconfirmed), then Running. Callers gate
+    /// on `!editing` themselves (edit mode owns the hints).
+    pub fn launch_status(&self, target: &str) -> Option<LaunchStatus> {
+        if self.closing_target.as_deref() == Some(target) {
+            Some(LaunchStatus::Closing)
+        } else if self.launching_target.as_deref() == Some(target) {
+            Some(LaunchStatus::Launching)
+        } else if self.running_target.as_deref() == Some(target) {
+            Some(LaunchStatus::Running)
+        } else {
+            None
+        }
+    }
+
     pub fn set_rows(&mut self, rows: Vec<StartRow>) {
         // Background rebuilds (Steam-scan reorder, sort change) can permute
         // the catalog without moving the selection: re-show the position rail
@@ -4487,10 +4515,11 @@ pub(crate) fn immersive_game_hints(
 ) -> Element<'static, StartMessage> {
     let hint = RowHintState::for_selected(state, true);
     let mut actions = Vec::new();
-    let closing = state
-        .closing_target
-        .as_ref()
-        .is_some_and(|t| t == &row.target);
+    let status = if state.editing {
+        None
+    } else {
+        state.launch_status(&row.target)
+    };
     if state.editing {
         let label = match row.edit.as_ref() {
             Some(EditRow::Manual { .. }) => "Remove",
@@ -4504,10 +4533,17 @@ pub(crate) fn immersive_game_hints(
         ));
         // Square cycles sort in edit too — manual Edit is mouse-only
         // (the Edit button below).
-    } else if closing {
+    } else if status == Some(LaunchStatus::Closing) {
         actions.push(face_hint(
             FaceButton::Cross,
             "Closing…",
+            hint.held,
+            hint.press_anim,
+        ));
+    } else if status == Some(LaunchStatus::Launching) {
+        actions.push(face_hint(
+            FaceButton::Cross,
+            "Launching…",
             hint.held,
             hint.press_anim,
         ));
@@ -4518,11 +4554,7 @@ pub(crate) fn immersive_game_hints(
             hint.held,
             hint.press_anim,
         ));
-    } else if state
-        .running_target
-        .as_ref()
-        .is_some_and(|t| t == &row.target)
-    {
+    } else if status == Some(LaunchStatus::Running) {
         actions.push(face_hold_hint(
             FaceButton::Cross,
             "Close game",
@@ -5017,24 +5049,18 @@ fn games_list(state: &State) -> Element<'_, StartMessage> {
         }
         last_section = Some(section);
         let selected = index == state.game_selected;
-        let running = !state.editing
-            && state
-                .running_target
-                .as_ref()
-                .is_some_and(|t| t == &row.target);
-        let closing = !state.editing
-            && state
-                .closing_target
-                .as_ref()
-                .is_some_and(|t| t == &row.target);
+        let status = if state.editing {
+            None
+        } else {
+            state.launch_status(&row.target)
+        };
         entries.push((
             list_key(&row.play_key),
             game_row(
                 index,
                 row,
                 selected,
-                running,
-                closing,
+                status,
                 state.editing,
                 RowHintState::for_selected(state, selected),
             ),
@@ -6178,11 +6204,13 @@ fn game_row(
     _index: usize,
     row: &StartRow,
     selected: bool,
-    running: bool,
-    closing: bool,
+    status: Option<LaunchStatus>,
     editing: bool,
     hint: RowHintState,
 ) -> Element<'_, StartMessage> {
+    let running = status == Some(LaunchStatus::Running);
+    let launching = status == Some(LaunchStatus::Launching);
+    let closing = status == Some(LaunchStatus::Closing);
     let muted = editing && !row.in_catalog();
     let disabled = row.disabled && !editing;
     let title_color = if disabled {
@@ -6262,7 +6290,7 @@ fn game_row(
             .wrapping(Wrapping::None);
 
         // Update badge sits on the title row in compact (immersive keeps it under meta).
-        let title: Element<'_, StartMessage> = if !running && row.update_required {
+        let title: Element<'_, StartMessage> = if !running && !launching && row.update_required {
             row![
                 title_text,
                 update_required_badge(selected, muted, 1.0, false),
@@ -6279,6 +6307,13 @@ fn game_row(
             text("Closing")
                 .size(13.0)
                 .color(theme::MUTED)
+                .wrapping(Wrapping::None)
+                .width(Fill)
+                .into()
+        } else if launching {
+            text("Launching")
+                .size(13.0)
+                .color(theme::ACCENT)
                 .wrapping(Wrapping::None)
                 .width(Fill)
                 .into()
@@ -6359,6 +6394,13 @@ fn game_row(
                 actions.push(face_hint(
                     FaceButton::Cross,
                     "Closing…",
+                    hint.held,
+                    hint.press_anim,
+                ));
+            } else if launching {
+                actions.push(face_hint(
+                    FaceButton::Cross,
+                    "Launching…",
                     hint.held,
                     hint.press_anim,
                 ));
@@ -7018,6 +7060,31 @@ mod tests {
             disabled: false,
             played_at_ms: None,
         }
+    }
+
+    #[test]
+    fn launch_status_precedence_closing_launching_running() {
+        let mut state = State::default();
+        assert_eq!(state.launch_status("steam://rungameid/1"), None);
+        state.running_target = Some("steam://rungameid/1".into());
+        assert_eq!(
+            state.launch_status("steam://rungameid/1"),
+            Some(LaunchStatus::Running)
+        );
+        // Unconfirmed session outranks a stale Running badge.
+        state.launching_target = Some("steam://rungameid/1".into());
+        assert_eq!(
+            state.launch_status("steam://rungameid/1"),
+            Some(LaunchStatus::Launching)
+        );
+        // Closing outranks both.
+        state.closing_target = Some("steam://rungameid/1".into());
+        assert_eq!(
+            state.launch_status("steam://rungameid/1"),
+            Some(LaunchStatus::Closing)
+        );
+        // Other targets unaffected.
+        assert_eq!(state.launch_status("steam://rungameid/2"), None);
     }
 
     #[test]

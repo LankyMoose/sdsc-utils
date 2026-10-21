@@ -5,8 +5,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Keep an optimistic session this long after launch even if process match fails.
+/// Outer optimistic bound for a catalog launch (slow Steam starts).
+/// New launches fast-fail via [`LAUNCH_FAST_FAIL`]; this bound now only
+/// backdates [`RunningSession::restored`] past any optimism.
 pub const LAUNCH_GRACE: Duration = Duration::from_secs(45);
+/// Never-matched sessions hold `Playing` optimistically only this long while
+/// background polls run. Past this the normal miss logic applies, so a Steam
+/// handoff that never spawns a process (revoked license, missing exe) clears
+/// in ~`FAST_FAIL` + `MISS_CLEAR` instead of ~`GRACE` + `MISS_CLEAR`. Slow
+/// starters that spawn later are rescued by catalog restore.
+pub const LAUNCH_FAST_FAIL: Duration = Duration::from_secs(20);
+/// Steam-reported idle verdict shortens the optimistic window: a launch Steam
+/// itself never flags running (revoked license, missing binaries — the
+/// Wanderburg shape) clears in ~`STEAM_LAUNCH_FAIL` + `MISS_CLEAR`. Generic
+/// targets without a Steam verdict keep `LAUNCH_FAST_FAIL`.
+pub const STEAM_LAUNCH_FAIL: Duration = Duration::from_secs(10);
 /// After grace, clear only after this many consecutive failed matches.
 pub const MISS_CLEAR: Duration = Duration::from_secs(4);
 
@@ -18,6 +31,16 @@ pub struct RunningSession {
     /// Absolute exe paths and/or directory roots to match against process images.
     pub match_paths: Vec<PathBuf>,
     pub launched_at: Instant,
+    /// True once a live process matched this session. Never-matched sessions
+    /// fast-fail (see [`LAUNCH_FAST_FAIL`]); matched-then-gone sessions clear
+    /// via the sticky-miss logic immediately, even inside the window.
+    pub matched: bool,
+    /// Catalog play key to stamp when this session first confirms running.
+    /// `Some` for sessions born from a Start launch, `None` for restored
+    /// sessions (externally started games keep today's behavior: no stamp).
+    /// Stamping on confirm — not at handoff — keeps failed launches out of
+    /// Last Played sort/metadata.
+    pub play_key: Option<String>,
     /// First consecutive miss after grace; cleared when a match is seen again.
     pub miss_since: Option<Instant>,
 }
@@ -27,12 +50,19 @@ impl RunningSession {
         self.target == target
     }
 
-    pub fn new(title: String, target: String, match_paths: Vec<PathBuf>) -> Self {
+    pub fn new(
+        title: String,
+        target: String,
+        match_paths: Vec<PathBuf>,
+        play_key: Option<String>,
+    ) -> Self {
         Self {
             title,
             target,
             match_paths,
             launched_at: Instant::now(),
+            matched: false,
+            play_key,
             miss_since: None,
         }
     }
@@ -46,8 +76,48 @@ impl RunningSession {
             launched_at: Instant::now()
                 .checked_sub(LAUNCH_GRACE + Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
+            matched: true,
+            play_key: None,
             miss_since: None,
         }
+    }
+}
+
+/// Pure badge decision for one fresh process snapshot.
+///
+/// Returns true to keep showing `Playing`, false to clear the session.
+/// `steam_running` is Steam's own verdict (`Some` on Windows for known Steam
+/// targets, `None` = unknown/off-platform/non-Steam): `Some(true)` is
+/// authoritative (covers launcher/JVM games path matching cannot see),
+/// `Some(false)` shortens the optimistic window to [`STEAM_LAUNCH_FAIL`],
+/// `None` keeps the generic [`LAUNCH_FAST_FAIL`] window.
+pub fn decide_running_badge(
+    session: &mut RunningSession,
+    now: Instant,
+    process_matched: bool,
+    steam_running: Option<bool>,
+) -> bool {
+    if process_matched || steam_running == Some(true) {
+        session.matched = true;
+        session.miss_since = None;
+        return true;
+    }
+    let fail_after = if steam_running == Some(false) {
+        STEAM_LAUNCH_FAIL
+    } else {
+        LAUNCH_FAST_FAIL
+    };
+    if !session.matched && now.duration_since(session.launched_at) < fail_after {
+        session.miss_since = None;
+        return true;
+    }
+    match session.miss_since {
+        None => {
+            session.miss_since = Some(now);
+            true
+        }
+        Some(since) if now.duration_since(since) < MISS_CLEAR => true,
+        Some(_) => false,
     }
 }
 
@@ -408,5 +478,99 @@ mod tests {
         // Non-existent path still yields basename-style entry via PathBuf.
         let paths = match_paths_for_target("C:\\Games\\Demo\\game.exe");
         assert!(!paths.is_empty());
+    }
+
+    #[test]
+    fn fast_fail_window_ordering() {
+        assert!(MISS_CLEAR < STEAM_LAUNCH_FAIL);
+        assert!(STEAM_LAUNCH_FAIL < LAUNCH_FAST_FAIL);
+        assert!(LAUNCH_FAST_FAIL < LAUNCH_GRACE);
+    }
+
+    fn badge_session() -> RunningSession {
+        RunningSession::new(
+            "T".to_string(),
+            "steam://rungameid/1".to_string(),
+            Vec::new(),
+            Some("steam:1".to_string()),
+        )
+    }
+
+    #[test]
+    fn running_session_carries_play_key_for_confirm_stamp() {
+        // Launch-born sessions carry the key so the first confirm stamps it.
+        assert_eq!(badge_session().play_key.as_deref(), Some("steam:1"));
+        // Restored sessions (externally started) never stamp.
+        let restored = RunningSession::restored(
+            "T".to_string(),
+            "steam://rungameid/1".to_string(),
+            Vec::new(),
+        );
+        assert_eq!(restored.play_key, None);
+    }
+
+    #[test]
+    fn decide_confirms_on_process_or_steam_verdict() {
+        let now = Instant::now();
+        // Process match confirms immediately.
+        let mut session = badge_session();
+        assert!(decide_running_badge(&mut session, now, true, None));
+        assert!(session.matched);
+        assert!(session.miss_since.is_none());
+
+        // Steam verdict confirms with no visible process (launcher/JVM case).
+        let mut session = badge_session();
+        assert!(decide_running_badge(&mut session, now, false, Some(true)));
+        assert!(session.matched);
+        assert!(session.miss_since.is_none());
+
+        // Restored sessions come from a live match: never optimistic, but a
+        // live process keeps them.
+        let mut restored = RunningSession::restored(
+            "T".to_string(),
+            "steam://rungameid/1".to_string(),
+            Vec::new(),
+        );
+        assert!(restored.matched);
+        assert!(decide_running_badge(&mut restored, now, true, None));
+    }
+
+    #[test]
+    fn decide_holds_fresh_launches_then_clears() {
+        let now = Instant::now();
+        // Fresh launch holds optimistically under every verdict.
+        for verdict in [None, Some(false), Some(true)] {
+            let mut session = badge_session();
+            assert!(decide_running_badge(&mut session, now, false, verdict));
+            assert!(session.miss_since.is_none());
+        }
+
+        // Steam idle verdict expires first: misses arm, then clear.
+        let mut session = badge_session();
+        session.launched_at = now - STEAM_LAUNCH_FAIL - Duration::from_secs(1);
+        assert!(decide_running_badge(&mut session, now, false, Some(false)));
+        assert!(session.miss_since.is_some());
+        session.miss_since = Some(now - MISS_CLEAR - Duration::from_secs(1));
+        assert!(!decide_running_badge(&mut session, now, false, Some(false)));
+
+        // Unknown verdict keeps the longer generic window at the same age.
+        let mut session = badge_session();
+        session.launched_at = now - STEAM_LAUNCH_FAIL - Duration::from_secs(1);
+        assert!(decide_running_badge(&mut session, now, false, None));
+        assert!(session.miss_since.is_none());
+
+        // A seen match ends optimism: misses count immediately.
+        let mut session = badge_session();
+        session.matched = true;
+        assert!(decide_running_badge(&mut session, now, false, None));
+        assert!(session.miss_since.is_some());
+        session.miss_since = Some(now - MISS_CLEAR - Duration::from_secs(1));
+        assert!(!decide_running_badge(&mut session, now, false, None));
+
+        // A late process rescues an armed session.
+        let mut session = badge_session();
+        session.miss_since = Some(now - MISS_CLEAR - Duration::from_secs(1));
+        assert!(decide_running_badge(&mut session, now, true, None));
+        assert!(session.miss_since.is_none());
     }
 }

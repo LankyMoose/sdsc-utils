@@ -745,6 +745,51 @@ pub fn install_dir_for_appid(appid: u32) -> Option<PathBuf> {
     None
 }
 
+/// True when a Steam appid has a non-empty install directory on disk.
+///
+/// Pre-flight for catalog launches: a manifest (`steamapps/appmanifest_*`)
+/// can linger after files are removed (or for license-less entries such as
+/// an expired alpha), and [`install_dir_for_appid`] alone only proves the
+/// manifest resolves. An empty/missing directory can never spawn a game
+/// process, so launching it would only park the running badge through the
+/// optimistic window.
+pub fn install_ready_for_appid(appid: u32) -> bool {
+    let Some(dir) = install_dir_for_appid(appid) else {
+        return false;
+    };
+    dir_has_entries(&dir)
+}
+
+fn dir_has_entries(dir: &Path) -> bool {
+    fs::read_dir(dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+/// Steam's own running verdict from `HKCU\Software\Valve\Steam\Apps\<appid>\Running`.
+///
+/// `Some(true)` = Steam reports the app running (authoritative: covers
+/// launcher/JVM games path matching cannot see). `Some(false)` = Steam knows
+/// the app and reports it idle — a launch that never flips this (revoked
+/// license) never spawns a process. `None` = unknown: non-Windows, Steam not
+/// installed, or no such app key/value.
+#[cfg(windows)]
+pub fn is_appid_running(appid: u32) -> Option<bool> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+    let key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(format!(r"Software\Valve\Steam\Apps\{appid}"))
+        .ok()?;
+    let running: u32 = key.get_value("Running").ok()?;
+    Some(running != 0)
+}
+
+/// No running verdict off Windows (the flag is Windows-client-only).
+#[cfg(not(windows))]
+pub fn is_appid_running(_appid: u32) -> Option<bool> {
+    None
+}
+
 fn format_playtime(minutes: u32) -> String {
     if minutes < 60 {
         format!("{minutes} min")
@@ -1125,6 +1170,44 @@ mod tests {
         assert_eq!(ymd_from_unix_days(20_363), Some((2025, 10, 2)));
         // 1970-01-01
         assert_eq!(ymd_from_unix_days(0), Some((1970, 1, 1)));
+    }
+
+    #[test]
+    fn dir_has_entries_cases() {
+        let base = std::env::temp_dir().join(format!(
+            "sdsc-steam-ready-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // Missing directory is never launchable.
+        assert!(!dir_has_entries(&base.join("does-not-exist")));
+
+        // An emptied install dir (wiped files, lingering manifest) is not ready.
+        let empty = base.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(!dir_has_entries(&empty));
+
+        // Any surviving file keeps the pre-flight green; the fast-fail
+        // backstop covers license refusals with files still on disk.
+        fs::write(empty.join("game.exe"), b"fake").unwrap();
+        assert!(dir_has_entries(&empty));
+
+        // No manifest anywhere resolves: not ready (covers the None branch
+        // without touching the registry).
+        assert!(!install_ready_for_appid(u32::MAX));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn appid_running_unknown_is_none() {
+        // No such app key resolves: unknown, never a verdict (read-only:
+        // tests never write Steam keys).
+        assert_eq!(is_appid_running(u32::MAX), None);
     }
 
     #[test]

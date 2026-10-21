@@ -7,10 +7,10 @@ use crate::ui::shader::{AmbientProgram, VignetteProgram};
 use crate::ui::start::mode::{TransitionPhase, dock_panel_width, dock_stage_dim, dock_stage_scale};
 use crate::ui::start::translate::backdrop_art;
 use crate::ui::start::view::{
-    StartControllerRow, StartMessage, StartRow, StartSlide, State, empty_games_browse_prompt,
-    footer_hint, game_subtitle_block, immersive_dock_row_hints, immersive_game_hints,
-    immersive_game_membership_label, manual_add_view, replace_confirm_view, scan_status_chip,
-    scan_status_stack, update_required_badge,
+    LaunchStatus, StartControllerRow, StartMessage, StartRow, StartSlide, State,
+    empty_games_browse_prompt, footer_hint, game_subtitle_block, immersive_dock_row_hints,
+    immersive_game_hints, immersive_game_membership_label, manual_add_view, replace_confirm_view,
+    scan_status_chip, scan_status_stack, update_required_badge,
 };
 use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics, StripOrientation};
 use crate::ui::theme;
@@ -660,24 +660,27 @@ fn hero_hint_overlay<'a>(
     alpha: f32,
 ) -> Element<'a, StartMessage> {
     let a = alpha.clamp(0.0, 1.0);
-    let running = state
-        .running_target
-        .as_ref()
-        .is_some_and(|t| t == &row.target);
-    let closing = state
-        .closing_target
-        .as_ref()
-        .is_some_and(|t| t == &row.target);
+    let status = if state.editing {
+        None
+    } else {
+        state.launch_status(&row.target)
+    };
     let mut col = column![].spacing(10).align_x(Alignment::Center);
     if state.editing {
         col = col.push(immersive_game_membership_label(row, a));
-    } else if closing {
+    } else if status == Some(LaunchStatus::Closing) {
         col = col.push(
             text("Closing")
                 .size(15.0)
                 .color(theme::alpha(theme::MUTED, a)),
         );
-    } else if running {
+    } else if status == Some(LaunchStatus::Launching) {
+        col = col.push(
+            text("Launching")
+                .size(15.0)
+                .color(theme::alpha(theme::ACCENT, a)),
+        );
+    } else if status == Some(LaunchStatus::Running) {
         col = col.push(
             text("Playing")
                 .size(15.0)
