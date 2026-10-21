@@ -55,6 +55,7 @@ use crate::ui::layout::{
     window_hwnd,
 };
 use crate::ui::popup::{self as popup_view, ControllerRow, PopupMessage};
+use crate::ui::start::art_worker::ArtOwner;
 use crate::ui::start::cursor_hide;
 use crate::ui::start::gesture::{self, ChordReleaseGate, ChordReleaseTick};
 use crate::ui::start::input::{
@@ -374,6 +375,9 @@ pub struct App {
     /// Owned lightbar-claim unit shared with the HID worker (presence-empty
     /// fast path syncs through this clone; no process-global).
     claims: Arc<ClaimStore>,
+    /// Owned Start-art decode unit (single-flight mailbox + iced event sink;
+    /// no process-global).
+    art: Arc<ArtOwner>,
 
     tray_icon: Option<TrayIcon>,
     tray_anchor: TrayAnchor,
@@ -662,6 +666,7 @@ impl App {
         let input_hub = hid_worker.input_hub();
         let claims = hid_worker.claims();
         claims.set_enabled(prefs.lightbar_enabled);
+        let art = Arc::new(ArtOwner::new());
 
         let configure_state = ConfigureState::new(prefs.spectrum.clone());
 
@@ -706,6 +711,7 @@ impl App {
             spectrum,
             input_hub,
             claims,
+            art,
             tray_icon: None,
             tray_anchor: TrayAnchor::default(),
             popup_window: None,
@@ -1116,8 +1122,11 @@ impl App {
 
         if self.session.prefs.start_screen_enabled {
             subscriptions.push(
-                Subscription::run(crate::ui::start::art_worker::event_stream)
-                    .map(Message::StartArtEvent),
+                Subscription::run_with(
+                    self.art.clone(),
+                    crate::ui::start::art_worker::event_stream,
+                )
+                .map(Message::StartArtEvent),
             );
         }
 
@@ -1922,7 +1931,7 @@ impl App {
                     row.icon = None;
                 }
                 let _ = crate::ui::start::icon_cache::bump_art_warm_generation();
-                crate::ui::start::art_worker::shutdown();
+                self.art.shutdown();
                 // Idempotent with `InputEdgeBindGuard::drop` (subscription
                 // teardown also clears).
                 self.input_hub.clear();
@@ -3043,7 +3052,7 @@ impl App {
         let near = self.start_state.art_near_set_circular(circular);
         let prefetch = self.start_state.art_retain_set_circular(circular);
         self.start_state.art_awaiting_paint = true;
-        crate::ui::start::art_worker::submit(crate::ui::start::art_worker::ArtJob {
+        self.art.submit(crate::ui::start::art_worker::ArtJob {
             generation,
             selected_backdrop,
             selected_hero,
@@ -4433,9 +4442,9 @@ impl App {
         self.start_resize_anim = None;
         self.deferred_settle_scroll = None;
         // Invalidate in-flight art events; keep caches for fast reopen.
-        // Process Exit is what wipes to a blank slate (`art_worker::shutdown`).
+        // Process Exit is what wipes to a blank slate (`ArtOwner::shutdown`).
         let generation = crate::ui::start::icon_cache::bump_art_warm_generation();
-        crate::ui::start::art_worker::cancel_jobs(generation);
+        self.art.cancel(generation);
         self.start_state.art_awaiting_paint = false;
         self.start_monitor_cover = None;
         self.clear_start_activity();

@@ -20,7 +20,7 @@ pub mod vstrip;
 
 /// Wipe every Start-related image cache to a blank slate (process Exit).
 ///
-/// Called from [`art_worker::shutdown`] (before and after join). Also resets
+/// Called from [`art_worker::ArtOwner::shutdown`] (before and after join). Also resets
 /// immersive shader one-shot diag state so the next process logs cleanly.
 pub fn wipe_art_caches() {
     icon_cache::clear_all();
