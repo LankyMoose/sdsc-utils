@@ -39,6 +39,7 @@ use crate::domain::pad::{
     self as start_input, InputHub, NavReading, ShortSampleOutcome, SnapshotMeta, SnapshotReason,
 };
 use crate::platform::app_log;
+use crate::platform::host::{Host, Watcher as _};
 use hidapi::{BusType, HidApi, HidDevice};
 use iced::futures::channel::oneshot;
 use std::collections::HashMap;
@@ -901,7 +902,7 @@ impl HidWorkerHandle {
         // OS arrival/removal watcher (Windows/Linux; no-op elsewhere): fires
         // throttled list-only refresh hints so hot enumeration cannot freeze
         // discovery indefinitely. Heartbeat cap covers the rest.
-        let watched = crate::platform::device_watch::spawn_arrival_watcher({
+        let watched = Host::spawn({
             let handle = handle.clone();
             move || handle.notify_device_list_changed()
         });

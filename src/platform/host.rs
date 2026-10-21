@@ -289,6 +289,16 @@ pub trait Monitors {
     /// cover rects so no UI type crosses this seam. `None` off Windows or when
     /// the monitor query fails (callers fall back to the iced-provided size).
     fn primary_metrics() -> Option<(PxRect, PxRect, f32, bool)>;
+
+    /// Foreground-window geometry for the exclusive-fullscreen predicate.
+    ///
+    /// Returns `(width, height, monitor_width, monitor_height, style)` in
+    /// physical pixels plus Win32 `GWL_STYLE` bits; the caller maps this onto
+    /// [`crate::domain::pad::ForegroundWindowFacts`] and applies the pure
+    /// [`crate::domain::pad::is_exclusive_fullscreen`] predicate, so no Win32
+    /// type crosses this seam. `None` off Windows or when the foreground
+    /// query fails (callers treat as not-fullscreen).
+    fn foreground_facts() -> Option<(i32, i32, i32, i32, isize)>;
 }
 
 impl Clock for Host {
@@ -463,6 +473,56 @@ impl Monitors for Host {
                     scale,
                     foreground_covers_monitor,
                 ))
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    fn foreground_facts() -> Option<(i32, i32, i32, i32, isize)> {
+        #[cfg(windows)]
+        {
+            // SAFETY: `GetForegroundWindow` returns an opaque handle compared
+            // against 0 only; `GetWindowRect` / `MonitorFromPoint` /
+            // `GetMonitorInfoW` / `GetWindowLongW` read foreground geometry
+            // and write only to the caller-owned `rect` / `info` out-params.
+            // Verbatim the former `domain::pad` block, now behind this seam.
+            unsafe {
+                let hwnd = crate::platform::win32::GetForegroundWindow();
+                if hwnd == 0 {
+                    return None;
+                }
+                let mut rect = crate::platform::win32::Rect::default();
+                if crate::platform::win32::GetWindowRect(hwnd, &mut rect) == 0 {
+                    return None;
+                }
+                let width = rect.right - rect.left;
+                let height = rect.bottom - rect.top;
+                let point = crate::platform::win32::Point {
+                    x: rect.left,
+                    y: rect.top,
+                };
+                let monitor = crate::platform::win32::MonitorFromPoint(
+                    point,
+                    crate::platform::win32::MONITOR_DEFAULTTOPRIMARY,
+                );
+                if monitor == 0 {
+                    return None;
+                }
+                let mut info = crate::platform::win32::MonitorInfo {
+                    size: std::mem::size_of::<crate::platform::win32::MonitorInfo>() as u32,
+                    ..Default::default()
+                };
+                if crate::platform::win32::GetMonitorInfoW(monitor, &mut info) == 0 {
+                    return None;
+                }
+                let mon_w = info.monitor.right - info.monitor.left;
+                let mon_h = info.monitor.bottom - info.monitor.top;
+                let style =
+                    crate::platform::win32::GetWindowLongW(hwnd, crate::platform::win32::GWL_STYLE);
+                Some((width, height, mon_w, mon_h, style))
             }
         }
         #[cfg(not(windows))]
