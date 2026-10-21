@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 /// Outer optimistic bound for a catalog launch (slow Steam starts).
@@ -150,15 +150,42 @@ pub fn match_paths_for_target(target: &str) -> Vec<PathBuf> {
 }
 
 fn log_missing_steam_installdir(appid: u32) {
-    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
-    let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let seen = guard.get_or_insert_with(HashSet::new);
-    if seen.insert(appid) {
+    if SEEN.insert(appid) {
         crate::platform::app_log::warn(format!(
             "steam installdir missing for appid {appid}; running match paths empty"
         ));
     }
 }
+
+/// Owned first-sight cache for missing Steam installdir warnings.
+///
+/// Future injection point: pass `&SeenCache` into
+/// [`match_paths_for_target`] / `log_missing_steam_installdir` instead of
+/// using the process-global below.
+pub struct SeenCache(Mutex<HashSet<u32>>);
+
+impl SeenCache {
+    pub fn new() -> Self {
+        Self(Mutex::new(HashSet::new()))
+    }
+
+    /// Record `appid`; returns true on first sight (caller should log).
+    pub fn insert(&self, appid: u32) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(appid)
+    }
+}
+
+impl Default for SeenCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Thin compat shim: process-global instance until call sites take `&SeenCache`.
+static SEEN: LazyLock<SeenCache> = LazyLock::new(SeenCache::new);
 
 fn steam_appid(target: &str) -> Option<u32> {
     let rest = target.strip_prefix("steam://rungameid/")?;

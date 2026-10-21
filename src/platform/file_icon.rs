@@ -13,15 +13,65 @@ struct CacheKey {
     size: u32,
 }
 
-static CACHE: LazyLock<Mutex<HashMap<CacheKey, Option<IconRgba>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CACHE: LazyLock<FileIconCache> = LazyLock::new(FileIconCache::new);
+
+/// Owned shell-icon extract cache.
+///
+/// Future injection point owned by the Start image layer: construct one
+/// `FileIconCache` there and pass `&FileIconCache` down instead of using the
+/// process-global [`CACHE`] shim below.
+pub struct FileIconCache {
+    inner: Mutex<HashMap<CacheKey, Option<IconRgba>>>,
+}
+
+impl FileIconCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return a square RGBA icon for `path`, or `None` if extraction fails.
+    ///
+    /// Results are cached (including failures) so start-screen refreshes stay cheap.
+    /// Cache keys include `size` so list and hero tiers do not collide.
+    pub fn rgba_for_path(&self, path: &Path, size: u32) -> Option<(u32, u32, Vec<u8>)> {
+        let key = CacheKey {
+            path: path.to_path_buf(),
+            size,
+        };
+        {
+            let cache = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = cache.get(&key) {
+                return entry.clone();
+            }
+        }
+        let extracted = extract_icon_rgba(path, size);
+        let mut cache = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(key, extracted.clone());
+        extracted
+    }
+
+    /// Drop every cached shell extract (process Exit).
+    pub fn clear_all(&self) {
+        let mut cache = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let n = cache.len();
+        cache.clear();
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: file icon cache clear entries={n}"
+        ));
+    }
+}
+
+impl Default for FileIconCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Drop every cached shell extract (process Exit).
 pub fn clear_all() {
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let n = cache.len();
-    cache.clear();
-    crate::controller::hid::diag::diag_info(format!("ui-diag: file icon cache clear entries={n}"));
+    CACHE.clear_all();
 }
 
 /// Return a square RGBA icon for `path`, or `None` if extraction fails.
@@ -29,20 +79,7 @@ pub fn clear_all() {
 /// Results are cached (including failures) so start-screen refreshes stay cheap.
 /// Cache keys include `size` so list and hero tiers do not collide.
 pub fn rgba_for_path(path: &Path, size: u32) -> Option<(u32, u32, Vec<u8>)> {
-    let key = CacheKey {
-        path: path.to_path_buf(),
-        size,
-    };
-    {
-        let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = cache.get(&key) {
-            return entry.clone();
-        }
-    }
-    let extracted = extract_icon_rgba(path, size);
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    cache.insert(key, extracted.clone());
-    extracted
+    CACHE.rgba_for_path(path, size)
 }
 
 #[cfg(windows)]
