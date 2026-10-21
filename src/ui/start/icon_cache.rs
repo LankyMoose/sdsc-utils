@@ -18,8 +18,47 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
+/// Owned warm-generation counter for Start art prefetches.
+///
 /// Bumped on each selection warm so UI can ignore stale ArtEvents.
-static ART_WARM_GEN: AtomicU64 = AtomicU64::new(0);
+/// Future owner is the Start image layer: construct one `ArtWarmGen` there and
+/// pass `&ArtWarmGen` down instead of using the process-global
+/// [`ART_WARM_GEN`] shim below.
+pub struct ArtWarmGen {
+    inner: AtomicU64,
+}
+
+impl ArtWarmGen {
+    pub const fn new() -> Self {
+        Self {
+            inner: AtomicU64::new(0),
+        }
+    }
+
+    /// Start a new warm generation (UI ignores ArtEvents from older gens).
+    pub fn bump(&self) -> u64 {
+        self.inner.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// True while `generation` is still the latest warm request.
+    pub fn is_current(&self, generation: u64) -> bool {
+        self.inner.load(Ordering::Relaxed) == generation
+    }
+
+    /// Reset to gen 0 (process Exit; paired with the icon-cache wipe).
+    pub fn reset(&self) {
+        self.inner.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Default for ArtWarmGen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Thin compat shim: process-global instance until call sites take `&ArtWarmGen`.
+static ART_WARM_GEN: ArtWarmGen = ArtWarmGen::new();
 
 /// Display cell is 48×72; upload at 2× for Cover scaling.
 pub const CACHE_W: u32 = 96;
@@ -207,7 +246,343 @@ impl CacheState {
     }
 }
 
-static CACHE: LazyLock<Mutex<CacheState>> = LazyLock::new(|| Mutex::new(CacheState::new()));
+/// Owned Start image cache (list / hero / backdrop tiers + pins + epoch).
+///
+/// Future owner is the Start image layer: construct one `IconCache` there and
+/// pass `&IconCache` down instead of using the process-global [`CACHE`] shim
+/// below.
+pub struct IconCache {
+    inner: Mutex<CacheState>,
+    #[cfg(test)]
+    test_lock: Mutex<()>,
+}
+
+impl IconCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(CacheState::new()),
+            #[cfg(test)]
+            test_lock: Mutex::new(()),
+        }
+    }
+
+    /// Drop every cached handle and clear pins (process Exit).
+    ///
+    /// In-flight worker decodes that finish after this call are not re-inserted.
+    /// The free [`clear_all`] shim additionally resets the [`ArtWarmGen`] so the
+    /// next process starts at gen 0.
+    pub fn clear_all(&self) {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let n = state.map.len();
+        state.map.clear();
+        state.pins = None;
+        state.tick = 0;
+        state.clear_epoch = state.clear_epoch.wrapping_add(1);
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: icon cache clear entries={n} epoch={}",
+            state.clear_epoch
+        ));
+    }
+
+    /// Update the pin set for the selection window. Does **not** drop unpinned entries;
+    /// LRU trims them when a tier exceeds its cap.
+    pub fn pin_art_window(&self, set: ArtRetainSet) {
+        let keys = set.into_keys();
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.pins = Some(keys);
+        state.trim_tier(Tier::List);
+        state.trim_tier(Tier::Hero);
+        state.trim_tier(Tier::Backdrop);
+        let pinned = state.pins.as_ref().map(|p| p.len()).unwrap_or(0);
+        let kept = state.map.len();
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: icon cache pin pinned={pinned} cached={kept}"
+        ));
+    }
+
+    /// Cached handle for a raster image path (Steam art or custom icon). Quiet on miss.
+    pub fn handle_for_path(&self, path: &Path) -> Option<Handle> {
+        self.lookup(CacheKey::File(path.to_path_buf()), false, || {
+            decode_file(path, false)
+        })
+    }
+
+    /// Like [`IconCache::handle_for_path`], but logs a warn when a user-chosen file fails to decode.
+    pub fn handle_for_path_warn(&self, path: &Path) -> Option<Handle> {
+        self.lookup(CacheKey::File(path.to_path_buf()), true, || {
+            decode_file(path, true)
+        })
+    }
+
+    /// Cached handle for a shell-extracted icon (exe / lnk target).
+    pub fn handle_for_shell(&self, path: &Path) -> Option<Handle> {
+        self.lookup(CacheKey::Shell(path.to_path_buf()), false, || {
+            decode_shell(path, CACHE_H)
+        })
+    }
+
+    /// Shell extract that always stores (add-shortcut dialog probe).
+    pub fn handle_for_shell_pinned(&self, path: &Path) -> Option<Handle> {
+        self.lookup(CacheKey::Shell(path.to_path_buf()), true, || {
+            decode_shell(path, CACHE_H)
+        })
+    }
+
+    /// Immersive hero handle for a raster path (worker / preload only).
+    pub fn hero_for_path(&self, path: &Path) -> Option<Handle> {
+        self.lookup(CacheKey::HeroFile(path.to_path_buf()), false, || {
+            decode_file_sized(path, HERO_W, HERO_H, false)
+        })
+    }
+
+    /// Immersive hero handle for a shell-extracted icon (worker / preload only).
+    pub fn hero_for_shell(&self, path: &Path) -> Option<Handle> {
+        self.lookup(CacheKey::HeroShell(path.to_path_buf()), false, || {
+            decode_shell(path, HERO_H)
+        })
+    }
+
+    /// Immersive landscape backdrop handle (worker / preload only).
+    pub fn backdrop_for_path(&self, path: &Path) -> Option<Handle> {
+        self.lookup(CacheKey::BackdropFile(path.to_path_buf()), false, || {
+            decode_file_sized(path, BACKDROP_W, BACKDROP_H, false)
+        })
+    }
+
+    /// Peek list-tier raster — never decodes on the calling thread.
+    pub fn icon_cached(&self, path: &Path) -> Option<Handle> {
+        self.peek(CacheKey::File(path.to_path_buf()))
+    }
+
+    /// Peek list-tier shell extract — never decodes.
+    pub fn icon_shell_cached(&self, path: &Path) -> Option<Handle> {
+        self.peek(CacheKey::Shell(path.to_path_buf()))
+    }
+
+    /// Peek hero raster — never decodes on the calling thread.
+    pub fn hero_cached(&self, path: &Path) -> Option<Handle> {
+        self.peek(CacheKey::HeroFile(path.to_path_buf()))
+    }
+
+    /// Peek hero shell extract — never decodes.
+    pub fn hero_shell_cached(&self, path: &Path) -> Option<Handle> {
+        self.peek(CacheKey::HeroShell(path.to_path_buf()))
+    }
+
+    /// Peek backdrop — never decodes on the calling thread.
+    pub fn backdrop_cached(&self, path: &Path) -> Option<Handle> {
+        self.peek(CacheKey::BackdropFile(path.to_path_buf()))
+    }
+
+    /// Warm the cache for list-tier raster paths (blocking / tests).
+    pub fn prepare_paths<I, P>(&self, paths: I)
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        for path in paths {
+            let _ = self.handle_for_path(path.as_ref());
+        }
+    }
+
+    /// Warm immersive hero + backdrop tiers (blocking / tests).
+    pub fn prepare_immersive(
+        &self,
+        hero_paths: impl IntoIterator<Item = impl AsRef<Path>>,
+        backdrop_paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    ) {
+        let mut heroes = 0u32;
+        let mut backdrops = 0u32;
+        for path in backdrop_paths {
+            if self.backdrop_for_path(path.as_ref()).is_some() {
+                backdrops += 1;
+            }
+        }
+        for path in hero_paths {
+            if self.hero_for_path(path.as_ref()).is_some() {
+                heroes += 1;
+            }
+        }
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: immersive art prepare heroes={heroes} backdrops={backdrops}"
+        ));
+    }
+
+    /// Drop paths already in the process cache. Returns `(heroes, backdrops, skipped)`.
+    pub fn filter_uncached_immersive(
+        &self,
+        hero_paths: impl IntoIterator<Item = PathBuf>,
+        backdrop_paths: impl IntoIterator<Item = PathBuf>,
+    ) -> (Vec<PathBuf>, Vec<PathBuf>, usize) {
+        let mut skipped = 0usize;
+        let mut heroes = Vec::new();
+        for path in hero_paths {
+            if self.hero_cached(&path).is_some() {
+                skipped += 1;
+            } else {
+                heroes.push(path);
+            }
+        }
+        let mut backdrops = Vec::new();
+        for path in backdrop_paths {
+            if self.backdrop_cached(&path).is_some() {
+                skipped += 1;
+            } else {
+                backdrops.push(path);
+            }
+        }
+        (heroes, backdrops, skipped)
+    }
+
+    /// Drop list-tier paths already cached. Returns `(files, shells, skipped)`.
+    pub fn filter_uncached_list(
+        &self,
+        file_paths: impl IntoIterator<Item = PathBuf>,
+        shell_paths: impl IntoIterator<Item = PathBuf>,
+    ) -> (Vec<PathBuf>, Vec<PathBuf>, usize) {
+        let mut skipped = 0usize;
+        let mut files = Vec::new();
+        for path in file_paths {
+            if self.icon_cached(&path).is_some() {
+                skipped += 1;
+            } else {
+                files.push(path);
+            }
+        }
+        let mut shells = Vec::new();
+        for path in shell_paths {
+            if self.icon_shell_cached(&path).is_some() {
+                skipped += 1;
+            } else {
+                shells.push(path);
+            }
+        }
+        (files, shells, skipped)
+    }
+
+    fn peek(&self, key: CacheKey) -> Option<Handle> {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if state.map.contains_key(&key) {
+            state.touch(&key);
+            return state.map.get(&key).and_then(|e| e.handle.clone());
+        }
+        None
+    }
+
+    fn lookup(
+        &self,
+        key: CacheKey,
+        force_pin: bool,
+        load: impl FnOnce() -> Option<(u32, u32, Vec<u8>)>,
+    ) -> Option<Handle> {
+        let epoch_at_start = {
+            let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if state.map.contains_key(&key) {
+                state.touch(&key);
+                return state.map.get(&key).and_then(|e| e.handle.clone());
+            }
+            // When pins are active, skip decode for unpinned keys that would only be
+            // dropped immediately (tier already at cap with no unpinned victims).
+            if !force_pin
+                && state.pins.is_some()
+                && !state.is_pinned(&key)
+                && state.tier_count(key.tier()) >= key.tier().cap()
+                && state
+                    .map
+                    .iter()
+                    .filter(|(k, _)| k.tier() == key.tier() && !state.is_pinned(k))
+                    .count()
+                    == 0
+            {
+                return None;
+            }
+            state.clear_epoch
+        };
+        let pixels = load();
+        let handle = pixels.map(|(w, h, px)| Handle::from_rgba(w, h, px));
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if state.clear_epoch != epoch_at_start {
+            // Wiped while decoding — discard so close/exit stay at a blank slate.
+            return None;
+        }
+        if let Some(existing) = state.map.get(&key) {
+            return existing.handle.clone();
+        }
+        if force_pin && let Some(pins) = state.pins.as_mut() {
+            pins.insert(key.clone());
+        }
+        let tick = state.next_tick();
+        let tier = key.tier();
+        state.map.insert(
+            key,
+            CacheEntry {
+                handle: handle.clone(),
+                tick,
+            },
+        );
+        state.trim_tier(tier);
+        handle
+    }
+
+    /// Hold while mutating the cache in tests (avoids clear/decode races).
+    ///
+    /// Owns the test lock that the free [`with_cache_lock`] shim delegates to,
+    /// so existing call sites keep working unchanged.
+    #[cfg(test)]
+    pub fn with_test_lock<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.test_lock.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
+    /// Direct mutex access for the in-module tests (same signature as before,
+    /// so `CACHE.lock()` call sites keep working unchanged).
+    #[cfg(test)]
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, CacheState>> {
+        self.inner.lock()
+    }
+}
+
+impl Default for IconCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Single owner for all Start image caches (list / hero / backdrop + warm gen).
+///
+/// Future owner is the Start image layer: construct one `ArtCaches` there and
+/// pass `&ArtCaches` (or its `&IconCache` / `&ArtWarmGen` handles) down instead
+/// of using the process-global [`CACHE`] / [`ART_WARM_GEN`] shims below.
+pub struct ArtCaches {
+    /// Decoded iced image handles, pins, and LRU state.
+    pub icons: IconCache,
+    /// Selection-warm generation (stale-event guard).
+    pub warm: ArtWarmGen,
+}
+
+impl ArtCaches {
+    pub fn new() -> Self {
+        Self {
+            icons: IconCache::new(),
+            warm: ArtWarmGen::new(),
+        }
+    }
+
+    /// Drop every cached handle, clear pins, and reset the warm generation.
+    pub fn clear_all(&self) {
+        self.icons.clear_all();
+        self.warm.reset();
+    }
+}
+
+impl Default for ArtCaches {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Thin compat shim: process-global instance until call sites take `&IconCache`.
+static CACHE: LazyLock<IconCache> = LazyLock::new(IconCache::new);
 
 /// Catalog indices within `radius` of `selected`.
 ///
@@ -260,12 +635,12 @@ pub fn fit_within(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) 
 
 /// Start a new warm generation (UI ignores ArtEvents from older gens).
 pub fn bump_art_warm_generation() -> u64 {
-    ART_WARM_GEN.fetch_add(1, Ordering::Relaxed) + 1
+    ART_WARM_GEN.bump()
 }
 
 /// True while `generation` is still the latest warm request.
 pub fn art_warm_is_current(generation: u64) -> bool {
-    ART_WARM_GEN.load(Ordering::Relaxed) == generation
+    ART_WARM_GEN.is_current(generation)
 }
 
 /// Drop every cached handle and clear pins (process Exit).
@@ -273,33 +648,14 @@ pub fn art_warm_is_current(generation: u64) -> bool {
 /// In-flight worker decodes that finish after this call are not re-inserted.
 /// Also resets the art-warm generation so the next process starts at gen 0.
 pub fn clear_all() {
-    let mut state = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let n = state.map.len();
-    state.map.clear();
-    state.pins = None;
-    state.tick = 0;
-    state.clear_epoch = state.clear_epoch.wrapping_add(1);
-    ART_WARM_GEN.store(0, Ordering::Relaxed);
-    crate::controller::hid::diag::diag_info(format!(
-        "ui-diag: icon cache clear entries={n} epoch={}",
-        state.clear_epoch
-    ));
+    CACHE.clear_all();
+    ART_WARM_GEN.reset();
 }
 
 /// Update the pin set for the selection window. Does **not** drop unpinned entries;
 /// LRU trims them when a tier exceeds its cap.
 pub fn pin_art_window(set: ArtRetainSet) {
-    let keys = set.into_keys();
-    let mut state = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    state.pins = Some(keys);
-    state.trim_tier(Tier::List);
-    state.trim_tier(Tier::Hero);
-    state.trim_tier(Tier::Backdrop);
-    let pinned = state.pins.as_ref().map(|p| p.len()).unwrap_or(0);
-    let kept = state.map.len();
-    crate::controller::hid::diag::diag_info(format!(
-        "ui-diag: icon cache pin pinned={pinned} cached={kept}"
-    ));
+    CACHE.pin_art_window(set);
 }
 
 /// Compatibility alias used by older call sites / tests.
@@ -309,76 +665,62 @@ pub fn retain_art_window(set: ArtRetainSet) {
 
 /// Cached handle for a raster image path (Steam art or custom icon). Quiet on miss.
 pub fn handle_for_path(path: &Path) -> Option<Handle> {
-    lookup(CacheKey::File(path.to_path_buf()), false, || {
-        decode_file(path, false)
-    })
+    CACHE.handle_for_path(path)
 }
 
 /// Like [`handle_for_path`], but logs a warn when a user-chosen file fails to decode.
 pub fn handle_for_path_warn(path: &Path) -> Option<Handle> {
-    lookup(CacheKey::File(path.to_path_buf()), true, || {
-        decode_file(path, true)
-    })
+    CACHE.handle_for_path_warn(path)
 }
 
 /// Cached handle for a shell-extracted icon (exe / lnk target).
 pub fn handle_for_shell(path: &Path) -> Option<Handle> {
-    lookup(CacheKey::Shell(path.to_path_buf()), false, || {
-        decode_shell(path, CACHE_H)
-    })
+    CACHE.handle_for_shell(path)
 }
 
 /// Shell extract that always stores (add-shortcut dialog probe).
 pub fn handle_for_shell_pinned(path: &Path) -> Option<Handle> {
-    lookup(CacheKey::Shell(path.to_path_buf()), true, || {
-        decode_shell(path, CACHE_H)
-    })
+    CACHE.handle_for_shell_pinned(path)
 }
 
 /// Immersive hero handle for a raster path (worker / preload only).
 pub fn hero_for_path(path: &Path) -> Option<Handle> {
-    lookup(CacheKey::HeroFile(path.to_path_buf()), false, || {
-        decode_file_sized(path, HERO_W, HERO_H, false)
-    })
+    CACHE.hero_for_path(path)
 }
 
 /// Immersive hero handle for a shell-extracted icon (worker / preload only).
 pub fn hero_for_shell(path: &Path) -> Option<Handle> {
-    lookup(CacheKey::HeroShell(path.to_path_buf()), false, || {
-        decode_shell(path, HERO_H)
-    })
+    CACHE.hero_for_shell(path)
 }
 
 /// Immersive landscape backdrop handle (worker / preload only).
 pub fn backdrop_for_path(path: &Path) -> Option<Handle> {
-    lookup(CacheKey::BackdropFile(path.to_path_buf()), false, || {
-        decode_file_sized(path, BACKDROP_W, BACKDROP_H, false)
-    })
+    CACHE.backdrop_for_path(path)
 }
 
 /// Peek list-tier raster — never decodes on the calling thread.
 pub fn icon_cached(path: &Path) -> Option<Handle> {
-    peek(CacheKey::File(path.to_path_buf()))
+    CACHE.icon_cached(path)
 }
 
 /// Peek list-tier shell extract — never decodes.
 pub fn icon_shell_cached(path: &Path) -> Option<Handle> {
-    peek(CacheKey::Shell(path.to_path_buf()))
+    CACHE.icon_shell_cached(path)
 }
 
 /// Peek hero raster — never decodes on the calling thread.
 pub fn hero_cached(path: &Path) -> Option<Handle> {
-    peek(CacheKey::HeroFile(path.to_path_buf()))
+    CACHE.hero_cached(path)
 }
 
 /// Peek hero shell extract — never decodes.
 pub fn hero_shell_cached(path: &Path) -> Option<Handle> {
-    peek(CacheKey::HeroShell(path.to_path_buf()))
+    CACHE.hero_shell_cached(path)
 }
 
 /// Peek backdrop — never decodes on the calling thread.
 pub fn backdrop_cached(path: &Path) -> Option<Handle> {
-    peek(CacheKey::BackdropFile(path.to_path_buf()))
+    CACHE.backdrop_cached(path)
 }
 
 /// Warm the cache for list-tier raster paths (blocking / tests).
@@ -387,9 +729,7 @@ where
     I: IntoIterator<Item = P>,
     P: AsRef<Path>,
 {
-    for path in paths {
-        let _ = handle_for_path(path.as_ref());
-    }
+    CACHE.prepare_paths(paths);
 }
 
 /// Warm immersive hero + backdrop tiers (blocking / tests).
@@ -397,21 +737,7 @@ pub fn prepare_immersive(
     hero_paths: impl IntoIterator<Item = impl AsRef<Path>>,
     backdrop_paths: impl IntoIterator<Item = impl AsRef<Path>>,
 ) {
-    let mut heroes = 0u32;
-    let mut backdrops = 0u32;
-    for path in backdrop_paths {
-        if backdrop_for_path(path.as_ref()).is_some() {
-            backdrops += 1;
-        }
-    }
-    for path in hero_paths {
-        if hero_for_path(path.as_ref()).is_some() {
-            heroes += 1;
-        }
-    }
-    crate::controller::hid::diag::diag_info(format!(
-        "ui-diag: immersive art prepare heroes={heroes} backdrops={backdrops}"
-    ));
+    CACHE.prepare_immersive(hero_paths, backdrop_paths);
 }
 
 /// Drop paths already in the process cache. Returns `(heroes, backdrops, skipped)`.
@@ -419,24 +745,7 @@ pub fn filter_uncached_immersive(
     hero_paths: impl IntoIterator<Item = PathBuf>,
     backdrop_paths: impl IntoIterator<Item = PathBuf>,
 ) -> (Vec<PathBuf>, Vec<PathBuf>, usize) {
-    let mut skipped = 0usize;
-    let mut heroes = Vec::new();
-    for path in hero_paths {
-        if hero_cached(&path).is_some() {
-            skipped += 1;
-        } else {
-            heroes.push(path);
-        }
-    }
-    let mut backdrops = Vec::new();
-    for path in backdrop_paths {
-        if backdrop_cached(&path).is_some() {
-            skipped += 1;
-        } else {
-            backdrops.push(path);
-        }
-    }
-    (heroes, backdrops, skipped)
+    CACHE.filter_uncached_immersive(hero_paths, backdrop_paths)
 }
 
 /// Drop list-tier paths already cached. Returns `(files, shells, skipped)`.
@@ -444,24 +753,7 @@ pub fn filter_uncached_list(
     file_paths: impl IntoIterator<Item = PathBuf>,
     shell_paths: impl IntoIterator<Item = PathBuf>,
 ) -> (Vec<PathBuf>, Vec<PathBuf>, usize) {
-    let mut skipped = 0usize;
-    let mut files = Vec::new();
-    for path in file_paths {
-        if icon_cached(&path).is_some() {
-            skipped += 1;
-        } else {
-            files.push(path);
-        }
-    }
-    let mut shells = Vec::new();
-    for path in shell_paths {
-        if icon_shell_cached(&path).is_some() {
-            skipped += 1;
-        } else {
-            shells.push(path);
-        }
-    }
-    (files, shells, skipped)
+    CACHE.filter_uncached_list(file_paths, shell_paths)
 }
 
 /// Pull the selected cover out of a neighbor backdrop list so it can decode first.
@@ -482,69 +774,6 @@ pub fn split_selected_backdrop(
         }
     }
     (found.or(Some(sel)), rest)
-}
-
-fn peek(key: CacheKey) -> Option<Handle> {
-    let mut state = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if state.map.contains_key(&key) {
-        state.touch(&key);
-        return state.map.get(&key).and_then(|e| e.handle.clone());
-    }
-    None
-}
-
-fn lookup(
-    key: CacheKey,
-    force_pin: bool,
-    load: impl FnOnce() -> Option<(u32, u32, Vec<u8>)>,
-) -> Option<Handle> {
-    let epoch_at_start = {
-        let mut state = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if state.map.contains_key(&key) {
-            state.touch(&key);
-            return state.map.get(&key).and_then(|e| e.handle.clone());
-        }
-        // When pins are active, skip decode for unpinned keys that would only be
-        // dropped immediately (tier already at cap with no unpinned victims).
-        if !force_pin
-            && state.pins.is_some()
-            && !state.is_pinned(&key)
-            && state.tier_count(key.tier()) >= key.tier().cap()
-            && state
-                .map
-                .iter()
-                .filter(|(k, _)| k.tier() == key.tier() && !state.is_pinned(k))
-                .count()
-                == 0
-        {
-            return None;
-        }
-        state.clear_epoch
-    };
-    let pixels = load();
-    let handle = pixels.map(|(w, h, px)| Handle::from_rgba(w, h, px));
-    let mut state = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if state.clear_epoch != epoch_at_start {
-        // Wiped while decoding — discard so close/exit stay at a blank slate.
-        return None;
-    }
-    if let Some(existing) = state.map.get(&key) {
-        return existing.handle.clone();
-    }
-    if force_pin && let Some(pins) = state.pins.as_mut() {
-        pins.insert(key.clone());
-    }
-    let tick = state.next_tick();
-    let tier = key.tier();
-    state.map.insert(
-        key,
-        CacheEntry {
-            handle: handle.clone(),
-            tick,
-        },
-    );
-    state.trim_tier(tier);
-    handle
 }
 
 fn decode_file(path: &Path, warn_on_fail: bool) -> Option<(u32, u32, Vec<u8>)> {
@@ -598,10 +827,7 @@ fn decode_shell(path: &Path, size: u32) -> Option<(u32, u32, Vec<u8>)> {
 /// Hold while mutating the process-wide icon cache in tests (avoids clear/decode races).
 #[cfg(test)]
 pub fn with_cache_lock<R>(f: impl FnOnce() -> R) -> R {
-    use std::sync::Mutex as StdMutex;
-    static LOCK: StdMutex<()> = StdMutex::new(());
-    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    f()
+    CACHE.with_test_lock(f)
 }
 
 #[cfg(test)]

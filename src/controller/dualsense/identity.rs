@@ -16,20 +16,47 @@ const HID_USAGE_GAMEPAD: u16 = 0x05;
 const PAIRING_INFO_FEATURE_REPORT: u8 = 0x09;
 const PAIRING_INFO_FEATURE_SIZE: usize = 20;
 
-/// Serializes all DualSense HID open/read/write/close (battery, lightbar, power-off).
-static HID_IO_LOCK: Mutex<()> = Mutex::new(());
+/// Owned serial lock for all DualSense HID open/read/write/close.
+///
+/// Future injection point: own a `HidIoLock` in the HID worker / app root and
+/// pass `&HidIoLock` down instead of using the process-global [`HID_IO_LOCK`]
+/// shim below.
+pub struct HidIoLock(Mutex<()>);
+
+impl HidIoLock {
+    pub const fn new() -> Self {
+        Self(Mutex::new(()))
+    }
+
+    /// Hold the lock for a closure (CLI one-shots).
+    pub fn with_lock<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
+    /// Take the lock; returns an error string if poisoned.
+    pub fn lock(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+        self.0.lock().map_err(|_| "HID lock poisoned".to_string())
+    }
+}
+
+impl Default for HidIoLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Thin compat shim: process-global instance until call sites take `&HidIoLock`.
+static HID_IO_LOCK: HidIoLock = HidIoLock::new();
 
 /// Hold the DualSense HID I/O lock for a closure (CLI one-shots only).
 pub fn with_hid_lock<T>(f: impl FnOnce() -> T) -> T {
-    let _guard = HID_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    f()
+    HID_IO_LOCK.with_lock(f)
 }
 
 /// Try to take the HID lock; returns an error string if poisoned.
 pub fn lock_hid() -> Result<std::sync::MutexGuard<'static, ()>, String> {
-    HID_IO_LOCK
-        .lock()
-        .map_err(|_| "HID lock poisoned".to_string())
+    HID_IO_LOCK.lock()
 }
 
 pub fn product_name(product_id: u16) -> &'static str {
