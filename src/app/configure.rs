@@ -189,7 +189,7 @@ impl App {
                     },
                 );
                 if section == Section::PadInput {
-                    match start_input::read_nav_readings() {
+                    match self.input_hub.read() {
                         start_input::NavReadingsOutcome::Readings { readings, .. } => {
                             self.apply_pad_input_panel_from_readings(&readings);
                         }
