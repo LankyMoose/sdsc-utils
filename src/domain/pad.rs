@@ -1424,86 +1424,39 @@ pub struct ForegroundWindowFacts {
     pub style: isize,
 }
 
+/// Win32 `GWL_STYLE` bits for the fullscreen predicate (values match
+/// `WS_CAPTION` / `WS_THICKFRAME`). Kept here so this pure predicate needs
+/// no Win32 import; the live query lives behind `Host::foreground_facts`.
+const WS_CAPTION: isize = 0x00C0_0000;
+const WS_THICKFRAME: isize = 0x0004_0000;
+
 /// True only for borderless cover-monitor windows (not ordinary maximized framed apps).
 pub fn is_exclusive_fullscreen(facts: ForegroundWindowFacts) -> bool {
     if facts.width < facts.monitor_width || facts.height < facts.monitor_height {
         return false;
     }
     // Maximized framed windows keep WS_CAPTION / WS_THICKFRAME; exclusive FS usually does not.
-    let framed =
-        (facts.style & crate_win32_caption()) != 0 || (facts.style & crate_win32_thickframe()) != 0;
+    let framed = (facts.style & WS_CAPTION) != 0 || (facts.style & WS_THICKFRAME) != 0;
     !framed
 }
 
-fn crate_win32_caption() -> isize {
-    #[cfg(windows)]
-    {
-        crate::platform::win32::WS_CAPTION
-    }
-    #[cfg(not(windows))]
-    {
-        0x00C0_0000
-    }
-}
-
-fn crate_win32_thickframe() -> isize {
-    #[cfg(windows)]
-    {
-        crate::platform::win32::WS_THICKFRAME
-    }
-    #[cfg(not(windows))]
-    {
-        0x0004_0000
-    }
-}
-
 /// Whether the foreground window looks like exclusive fullscreen.
+///
+/// Geometry comes from [`crate::platform::host::Monitors::foreground_facts`];
+/// the predicate stays pure ([`is_exclusive_fullscreen`]) for tests.
 pub fn foreground_is_exclusive_fullscreen() -> bool {
-    #[cfg(windows)]
-    {
-        use crate::platform::win32;
-        unsafe {
-            let hwnd = win32::GetForegroundWindow();
-            if hwnd == 0 {
-                return false;
-            }
-            let mut rect = win32::Rect::default();
-            if win32::GetWindowRect(hwnd, &mut rect) == 0 {
-                return false;
-            }
-            let width = rect.right - rect.left;
-            let height = rect.bottom - rect.top;
-            let point = win32::Point {
-                x: rect.left,
-                y: rect.top,
-            };
-            let monitor = win32::MonitorFromPoint(point, win32::MONITOR_DEFAULTTOPRIMARY);
-            if monitor == 0 {
-                return false;
-            }
-            let mut info = win32::MonitorInfo {
-                size: std::mem::size_of::<win32::MonitorInfo>() as u32,
-                ..Default::default()
-            };
-            if win32::GetMonitorInfoW(monitor, &mut info) == 0 {
-                return false;
-            }
-            let mon_w = info.monitor.right - info.monitor.left;
-            let mon_h = info.monitor.bottom - info.monitor.top;
-            let style = win32::GetWindowLongW(hwnd, win32::GWL_STYLE);
-            is_exclusive_fullscreen(ForegroundWindowFacts {
-                width,
-                height,
-                monitor_width: mon_w,
-                monitor_height: mon_h,
-                style,
-            })
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    use crate::platform::host::{Host, Monitors as _};
+    let Some((width, height, monitor_width, monitor_height, style)) = Host::foreground_facts()
+    else {
+        return false;
+    };
+    is_exclusive_fullscreen(ForegroundWindowFacts {
+        width,
+        height,
+        monitor_width,
+        monitor_height,
+        style,
+    })
 }
 
 #[cfg(test)]
@@ -1780,7 +1733,7 @@ mod tests {
             height: 1080,
             monitor_width: 1920,
             monitor_height: 1080,
-            style: crate_win32_caption() | crate_win32_thickframe(),
+            style: WS_CAPTION | WS_THICKFRAME,
         };
         assert!(!is_exclusive_fullscreen(facts));
     }
