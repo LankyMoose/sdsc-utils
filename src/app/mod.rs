@@ -27,7 +27,6 @@ use crate::controller::known::KnownControllers;
 #[cfg(debug_assertions)]
 use crate::controller::model::Connection;
 use crate::controller::model::ControllerStatus;
-use crate::games::launch;
 use crate::games::process_match::{self, RunningSession};
 use crate::games::steam::{self, SteamGame};
 use crate::games::{self, GamesCatalog};
@@ -63,7 +62,7 @@ use crate::ui::start::input::{
     NavSource, PadNavBank,
 };
 use crate::ui::start::mode::{self as start_mode, StartPresentation};
-use crate::ui::start::view::{self as start_view, ReplaceConfirm, StartMessage, StartSlide};
+use crate::ui::start::view::{self as start_view, StartMessage, StartSlide};
 use crate::ui::theme;
 use crate::ui::toast::ToastMessage;
 use crate::ui::toast::machine::{self as toast_machine, AfterToast};
@@ -2393,56 +2392,6 @@ impl App {
         )
     }
 
-    fn refresh_start_rows(&mut self) {
-        // Sort persists across edit enter/exit: `sort_mode` always mirrors the
-        // prefs sort here, and `cycle_games_sort` stays live while editing, so
-        // a mid-edit sort change carries into the browse list on save/cancel.
-        self.start_state.sort_mode = self.session.prefs.games_sort_mode;
-        // Pin the edit cursor by stable key across the rebuild: toggles,
-        // manual adds, sort cycles, and Steam-scan reorders shift checklist
-        // indices, so a bare index would drift to a different game mid-edit.
-        let edit_pin = if self.start_state.editing {
-            self.start_state.selected_game_key()
-        } else {
-            None
-        };
-        let rows = if self.start_state.editing {
-            self.edit_checklist_rows()
-        } else {
-            self.display_catalog()
-                .iter()
-                .map(|entry| {
-                    let mut row = start_view::StartRow::from_entry(
-                        entry,
-                        &self.steam_by_id,
-                        self.steam_scan_pending,
-                    );
-                    row.played_at_ms = self.effective_played_ms(entry);
-                    row.disabled = self.is_entry_disabled(entry, &row);
-                    row
-                })
-                .collect()
-        };
-        self.start_state.set_rows(rows);
-        if self.start_state.editing {
-            // Keep the cursor on the same checklist game; a removed manual
-            // keeps the clamped neighbor. Never fall back to 0 or re-pin the
-            // IPC shadow here: the shadow still holds the pre-toggle key while
-            // a toggle message is in flight, which would yank the cursor
-            // (manual removal's key is already gone → shadow fallback is 0).
-            self.start_state
-                .select_game_by_play_key_or_keep(edit_pin.as_deref());
-        } else if let Some(selection) = self.start_selection_shadow.clone() {
-            self.start_state.resolve_start_selection(
-                selection.game_key.as_deref(),
-                None,
-                self.session.prefs.start_selection_persist,
-                self.session.prefs.start_selection_mode,
-                selection.game_index,
-            );
-        }
-    }
-
     /// True when scan proves this entry is no longer installed (disabled row).
     fn is_entry_disabled(
         &self,
@@ -2503,63 +2452,6 @@ impl App {
         }
         start_view::sort_edit_rows_by_mode(&mut rows, sort_mode);
         rows
-    }
-
-    fn discard_edit_draft(&mut self) {
-        self.edit_draft = None;
-        self.start_state.editing = false;
-        self.start_state.edit_anchor_play_key = None;
-        self.start_state.manual_add = None;
-    }
-
-    fn enter_start_edit(&mut self) -> Task<Message> {
-        self.start_state.capture_edit_anchor();
-        self.edit_draft = Some(self.games.clone());
-        self.start_state.editing = true;
-        self.refresh_start_rows();
-        let key = self.start_state.edit_anchor_play_key.clone();
-        self.start_state.select_game_by_play_key(key.as_deref());
-        self.scroll_start_selection_to_center(true)
-            .chain(self.warm_start_art_task())
-    }
-
-    fn commit_start_edit(&mut self) -> Task<Message> {
-        // Resolve the exit target while still on the checklist rows: keep the
-        // cursor game when still toggled-on, else nearest toggled-on above /
-        // after (`None` when the draft catalog is empty → empty view shows).
-        // The anchor is intentionally NOT used here: the user may have
-        // navigated mid-edit and the cursor must persist.
-        let target = self.start_state.edit_exit_target_key();
-        if let Some(draft) = self.edit_draft.take() {
-            self.games = draft;
-            self.games.save();
-        }
-        self.start_state.editing = false;
-        self.start_state.edit_anchor_play_key = None;
-        self.refresh_start_rows();
-        // `refresh_start_rows` re-syncs `sort_mode` from prefs (a mid-edit
-        // sort cycle persists), so only the selection needs resolving here.
-        self.start_state
-            .resolve_edit_exit_selection(target.as_deref());
-        self.scroll_start_selection_to_center(false)
-            .chain(self.warm_start_art_task())
-    }
-
-    fn cancel_start_edit(&mut self) -> Task<Message> {
-        // Cancel discards membership changes but keeps navigation: the cursor
-        // game survives when still in the restored catalog, else the pre-edit
-        // anchor revives, else the nearest-enabled rule applies.
-        let cursor = self.start_state.selected_game_key();
-        let anchor = self.start_state.edit_anchor_play_key.take();
-        self.discard_edit_draft();
-        self.refresh_start_rows();
-        let target = self
-            .start_state
-            .cancel_exit_target_key(cursor.as_deref(), anchor.as_deref());
-        self.start_state
-            .resolve_edit_exit_selection(target.as_deref());
-        self.scroll_start_selection_to_center(true)
-            .chain(self.warm_start_art_task())
     }
 
     fn refresh_start_controllers(&mut self) {
@@ -3175,11 +3067,6 @@ impl App {
         }
         self.refresh_start_rows();
         self.scroll_start_selection_into_view()
-    }
-
-    fn cancel_manual_add(&mut self) -> Task<Message> {
-        self.start_state.manual_add = None;
-        Task::none()
     }
 
     fn start_settings_snapshot(&self) -> crate::ui::start::settings::StartSettingsSnapshot {
@@ -4614,20 +4501,6 @@ impl App {
         self.start_state.held = held;
     }
 
-    fn toggle_start_edit(&mut self) -> Option<Task<Message>> {
-        if self.start_state.slide != StartSlide::Games
-            || self.start_state.overlay_blocking()
-            || self.start_state.animating()
-        {
-            return None;
-        }
-        Some(if self.start_state.editing {
-            self.commit_start_edit()
-        } else {
-            self.enter_start_edit()
-        })
-    }
-
     fn cycle_games_sort(&mut self) -> Option<Task<Message>> {
         // Sort stays live in edit mode: the checklist re-sorts under the same
         // mode and the prefs write persists across save/cancel.
@@ -4671,24 +4544,6 @@ impl App {
         Some(self.scroll_start_selection_into_view())
     }
 
-    fn pick_manual_shortcut(&mut self) -> Task<Message> {
-        self.start_file_dialog_open = true;
-        self.pick_file_dialog(
-            "Programs",
-            &["exe", "lnk", "url"],
-            Message::ManualFilePicked,
-        )
-    }
-
-    fn pick_manual_icon(&mut self) -> Task<Message> {
-        self.start_file_dialog_open = true;
-        self.pick_file_dialog(
-            "Images",
-            &["png", "jpg", "jpeg", "ico", "webp"],
-            Message::ManualIconPicked,
-        )
-    }
-
     /// Native file picker; on Windows parents to Start so it clears immersive cover.
     fn pick_file_dialog(
         &self,
@@ -4730,39 +4585,6 @@ impl App {
         })
     }
 
-    fn begin_manual_edit(&mut self) -> Task<Message> {
-        if !self.start_state.editing || self.start_state.overlay_blocking() {
-            return Task::none();
-        }
-        let Some(row) = self
-            .start_state
-            .rows
-            .get(self.start_state.game_selected)
-            .cloned()
-        else {
-            return Task::none();
-        };
-        let Some(start_view::EditRow::Manual { id }) = row.edit.as_ref() else {
-            return Task::none();
-        };
-        let icon_path = self.edit_catalog().entries.iter().find_map(|e| match e {
-            crate::games::GameEntry::Manual { id: mid, icon, .. } if mid == id => {
-                icon.as_ref().map(PathBuf::from)
-            }
-            _ => None,
-        });
-        let shell_icon = start_view::probe_shell_icon(&row.target);
-        self.start_state.manual_add = Some(start_view::ManualAddDraft {
-            edit_id: Some(id.clone()),
-            target: row.target,
-            title: row.title,
-            args: row.args,
-            icon_path,
-            shell_icon,
-        });
-        Task::none()
-    }
-
     fn edit_toggle_selected(&mut self) -> Option<Task<Message>> {
         let row = self
             .start_state
@@ -4786,48 +4608,6 @@ impl App {
         }
     }
 
-    fn on_start_confirm(&mut self) -> Task<Message> {
-        if self.start_state.manual_add.is_some() {
-            self.play_start_cue(UiSoundKind::Action);
-            return self.confirm_manual_add();
-        }
-        // Replace confirm requires hold-Cross / hold-Enter (see pad poll / key hold).
-        if self.start_state.replace_confirm.is_some() {
-            return Task::none();
-        }
-        match self.start_state.slide {
-            StartSlide::Games if self.start_state.editing => match self.edit_toggle_selected() {
-                Some(task) => {
-                    self.play_start_cue(UiSoundKind::Action);
-                    task
-                }
-                None => Task::none(),
-            },
-            StartSlide::Games => {
-                if self.launch_selected() {
-                    self.play_start_cue(UiSoundKind::Action);
-                    if self.start_state.immersive {
-                        return self.close_start_screen();
-                    }
-                }
-                Task::none()
-            }
-            StartSlide::Controllers => {
-                if let Some(row) = self.start_state.selected_controller()
-                    && row.connected
-                {
-                    let serial = row.serial.clone();
-                    if self.identify(&serial) {
-                        self.popup_state.begin_identify_flash(&serial);
-                        self.start_state.begin_identify_flash(&serial);
-                        self.play_start_cue(UiSoundKind::Action);
-                    }
-                }
-                Task::none()
-            }
-        }
-    }
-
     fn complete_replace_confirm(&mut self) -> Task<Message> {
         let Some(confirm) = self.start_state.replace_confirm.take() else {
             return Task::none();
@@ -4841,90 +4621,6 @@ impl App {
             return close_task.chain(self.close_start_screen());
         }
         close_task
-    }
-
-    /// Launch the selected game. Returns true when launch, replace-confirm, or a real attempt ran.
-    fn launch_selected(&mut self) -> bool {
-        let Some(row) = self
-            .start_state
-            .rows
-            .get(self.start_state.game_selected)
-            .cloned()
-        else {
-            return false;
-        };
-
-        // Don't relaunch while this row is still closing.
-        if self
-            .start_state
-            .closing_target
-            .as_ref()
-            .is_some_and(|t| t == &row.target)
-        {
-            return false;
-        }
-
-        // Disabled rows never launch (uninstalled Steam or missing manual target).
-        // Re-validate at launch time so a stale row (scan race / immediate launch
-        // after uninstall) fails gracefully instead of opening Steam / error popup.
-        if row.disabled || self.is_row_invalid_now(&row) {
-            app_log::warn(format!(
-                "launch blocked (no longer installed): {} ({})",
-                row.title, row.target
-            ));
-            // Refresh disabled flags so the row dims immediately.
-            self.refresh_start_rows();
-            return false;
-        }
-
-        // Steam pre-flight (revoked license / wiped files, e.g. an expired
-        // alpha): the manifest can linger while the install dir is missing
-        // or empty, and ShellExecute would happily hand off to a Steam error
-        // dialog. Block before creating a running session so `Playing`
-        // never parks on a game that cannot spawn a process.
-        if let Some(appid) = steam_appid_from_target(&row.target)
-            && !steam::install_ready_for_appid(appid)
-        {
-            app_log::warn(format!(
-                "launch blocked (steam install not ready): {} (appid {appid})",
-                row.title
-            ));
-            self.launch_blocked_steam.insert(appid);
-            self.refresh_start_rows();
-            return false;
-        }
-
-        if let Some(session) = self.running_session.as_ref() {
-            if session.matches_target(&row.target) {
-                return false;
-            }
-            if process_match::any_matching_running(&session.match_paths) {
-                self.start_state.replace_confirm = Some(ReplaceConfirm {
-                    running_title: session.title.clone(),
-                    next_title: row.title.clone(),
-                    next_index: self.start_state.game_selected,
-                });
-                return true;
-            }
-            self.running_session = None;
-            self.sync_launch_badges();
-        }
-
-        match launch::launch_target(&row.target, &row.args) {
-            Ok(()) => {
-                // No last-played stamp here: it lands on the first confirm
-                // (process or Steam verdict) in `apply_running_badge_from_images`.
-                self.begin_running_session(row.title, row.target, row.play_key);
-                true
-            }
-            Err(err) => {
-                app_log::warn(format!("launch failed for {}: {err}", row.target));
-                // Immediate-launch race (uninstalled between scan and press):
-                // refresh so the row dims instead of staying launchable.
-                self.refresh_start_rows();
-                false
-            }
-        }
     }
 
     /// Re-validate a row at press time (scan may be stale for immediate launches).
