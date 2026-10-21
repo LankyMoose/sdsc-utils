@@ -11,7 +11,7 @@ mod popup;
 mod start;
 mod toast;
 
-use crate::controller::dualsense::lightbar;
+use crate::controller::dualsense::lightbar::ClaimStore;
 use crate::controller::dualsense::rumble::MotorPulse;
 use crate::domain::color::SpectrumService;
 use crate::domain::pad::InputHub;
@@ -371,6 +371,9 @@ pub struct App {
     /// Owned pad-input hub shared with the HID worker thread and the
     /// pad-input subscription (no process-global).
     input_hub: Arc<InputHub>,
+    /// Owned lightbar-claim unit shared with the HID worker (presence-empty
+    /// fast path syncs through this clone; no process-global).
+    claims: Arc<ClaimStore>,
 
     tray_icon: Option<TrayIcon>,
     tray_anchor: TrayAnchor,
@@ -650,7 +653,6 @@ impl App {
         let analytics = AnalyticsStore::load();
         let games = GamesCatalog::load();
         let spectrum = SpectrumService::new(prefs.spectrum.clone());
-        lightbar::set_enabled(prefs.lightbar_enabled);
 
         #[cfg(windows)]
         autostart::ensure_quiet_entry();
@@ -658,6 +660,8 @@ impl App {
         let hid_worker = HidWorkerHandle::start(spectrum.clone());
         let identifying = hid_worker.identifying();
         let input_hub = hid_worker.input_hub();
+        let claims = hid_worker.claims();
+        claims.set_enabled(prefs.lightbar_enabled);
 
         let configure_state = ConfigureState::new(prefs.spectrum.clone());
 
@@ -701,6 +705,7 @@ impl App {
             hid_worker,
             spectrum,
             input_hub,
+            claims,
             tray_icon: None,
             tray_anchor: TrayAnchor::default(),
             popup_window: None,
@@ -2023,7 +2028,7 @@ impl App {
         if membership_changed && self.last_discovered.is_empty() {
             // Presence-only clear never runs HID poll; drop claims so reconnect
             // always gets LIGHT_OUT + RGB. Skip the one-miss hold — the device is gone.
-            lightbar::sync_lightbar_claims(std::iter::empty::<&str>());
+            self.claims.sync(std::iter::empty::<&str>());
             self.session.clear_missed_polls();
             let task = if self.session.controllers.is_empty() {
                 Task::none()
@@ -2102,7 +2107,7 @@ impl App {
                     start_visible: self.start_visible,
                     fullscreen: start_input::foreground_is_exclusive_fullscreen(),
                     now: Instant::now(),
-                    lightbar_enabled: lightbar::is_enabled(),
+                    lightbar_enabled: self.claims.is_enabled(),
                 };
                 let effects = self.session.on_poll_result(controllers, ctx);
                 let effects_task = self.apply_session_effects(effects);
@@ -2210,14 +2215,14 @@ impl App {
             start_visible: self.start_visible,
             fullscreen: start_input::foreground_is_exclusive_fullscreen(),
             now: Instant::now(),
-            lightbar_enabled: lightbar::is_enabled(),
+            lightbar_enabled: self.claims.is_enabled(),
         };
         let effects = self.session.apply_controllers(controllers, ctx);
         self.apply_session_effects(effects)
     }
 
     fn sync_low_battery(&mut self) {
-        if let Some(effect) = self.session.refresh_low_battery() {
+        if let Some(effect) = self.session.refresh_low_battery(self.claims.is_enabled()) {
             let _ = self.apply_session_effects(vec![effect]);
         }
     }
@@ -3546,7 +3551,7 @@ impl App {
             start_visible: self.start_visible,
             fullscreen: start_input::foreground_is_exclusive_fullscreen(),
             now: Instant::now(),
-            lightbar_enabled: lightbar::is_enabled(),
+            lightbar_enabled: self.claims.is_enabled(),
         };
         let effects = self.session.reevaluate_start_presence(ctx);
         self.apply_session_effects(effects)

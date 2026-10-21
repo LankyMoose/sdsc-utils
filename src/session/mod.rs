@@ -12,7 +12,6 @@ pub use gate::{
     should_skip_connect_cooldown_on_power_off, take_skip_connect_cooldown,
 };
 
-use crate::controller::dualsense::lightbar;
 use crate::controller::known::KnownControllers;
 use crate::controller::model::ControllerStatus;
 use crate::persist::analytics::AnalyticsStore;
@@ -353,9 +352,9 @@ impl DeviceSession {
     }
 
     /// Recompute low-battery targets after prefs / lightbar enable changes.
-    pub fn refresh_low_battery(&mut self) -> Option<SessionEffect> {
+    pub fn refresh_low_battery(&mut self, lightbar_enabled: bool) -> Option<SessionEffect> {
         let mut effects = Vec::new();
-        self.sync_low_battery(lightbar::is_enabled(), &mut effects);
+        self.sync_low_battery(lightbar_enabled, &mut effects);
         effects.into_iter().next()
     }
 }

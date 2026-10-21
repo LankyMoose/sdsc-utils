@@ -5,7 +5,7 @@
 use crate::controller::driver;
 use crate::controller::dualsense::battery;
 use crate::controller::dualsense::identity::{self as dualsense, hid_serial, is_storable_serial};
-use crate::controller::dualsense::lightbar::{self, HidPhaseTiming};
+use crate::controller::dualsense::lightbar::{self, ClaimStore, HidPhaseTiming};
 use crate::controller::hid::launch_paths::LaunchPaths;
 use crate::controller::model::ControllerStatus;
 use crate::domain::color::SpectrumService;
@@ -88,6 +88,7 @@ fn status_from_reading(
 pub fn poll_controllers(
     previously_connected: &[String],
     spectrum: &SpectrumService,
+    claims: &ClaimStore,
 ) -> Result<Vec<ControllerStatus>, String> {
     dualsense::with_hid_lock(|| {
         let api = HidApi::new().map_err(|e| e.to_string())?;
@@ -95,6 +96,7 @@ pub fn poll_controllers(
         poll_controllers_with_api(
             &api,
             spectrum,
+            claims,
             previously_connected,
             &mut timing,
             None,
@@ -110,6 +112,7 @@ pub fn poll_controllers(
 pub fn poll_controllers_timed(
     api: &HidApi,
     spectrum: &SpectrumService,
+    claims: &ClaimStore,
     previously_connected: &[String],
     launch: Option<&mut LaunchPaths>,
     launch_quiet: Option<&mut Vec<String>>,
@@ -118,6 +121,7 @@ pub fn poll_controllers_timed(
     let result = poll_controllers_with_api(
         api,
         spectrum,
+        claims,
         previously_connected,
         &mut timing,
         launch,
@@ -129,6 +133,7 @@ pub fn poll_controllers_timed(
 fn poll_controllers_with_api(
     api: &HidApi,
     spectrum: &SpectrumService,
+    claims: &ClaimStore,
     previously_connected: &[String],
     timing: &mut HidPhaseTiming,
     mut launch: Option<&mut LaunchPaths>,
@@ -142,7 +147,7 @@ fn poll_controllers_with_api(
     timing.enumerate_ms += enum_started.elapsed().as_millis();
 
     if devices.is_empty() {
-        lightbar::sync_lightbar_claims(std::iter::empty::<&str>());
+        claims.sync(std::iter::empty::<&str>());
         return Ok(Vec::new());
     }
 
@@ -228,6 +233,7 @@ fn poll_controllers_with_api(
     reassert_lightbar_for_pads(
         api,
         spectrum,
+        claims,
         previously_connected,
         pads.iter().map(|p| &p.status),
         timing,
@@ -241,18 +247,19 @@ fn poll_controllers_with_api(
 pub(crate) fn reassert_lightbar_for_pads<'a>(
     api: &HidApi,
     spectrum: &SpectrumService,
+    claims: &ClaimStore,
     previously_connected: &[String],
     statuses: impl Iterator<Item = &'a ControllerStatus>,
     timing: &mut HidPhaseTiming,
 ) {
     let statuses: Vec<&'a ControllerStatus> = statuses.collect();
-    lightbar::sync_lightbar_claims(
+    claims.sync(
         statuses
             .iter()
             .filter(|p| p.supports_lightbar)
             .map(|p| p.serial.as_str()),
     );
-    if !lightbar::is_enabled() {
+    if !claims.is_enabled() {
         return;
     }
     let previous: std::collections::HashSet<String> = previously_connected
@@ -267,20 +274,20 @@ pub(crate) fn reassert_lightbar_for_pads<'a>(
         let serial_key = dualsense::normalize_identity(&pad.serial);
         let color = spectrum.color_at(pad.percent);
         if !previous.contains(&serial_key) {
-            lightbar::prepare_connect_apply(&pad.serial);
-        } else if !lightbar::lightbar_reassert_due(&pad.serial, color) {
+            claims.prepare_connect(&pad.serial);
+        } else if !claims.reassert_due(&pad.serial, color) {
             // Stable pad, recently applied: skip the open-write-close so the
             // 5s liveness tick stops churning every bar (color changes, new
             // pads, and the 30s backstop still write).
             continue;
         }
         // Fresh open for lightbar (do not reuse the battery-read handle).
-        let (result, t) = lightbar::apply_lightbar_rgb_timed(api, &pad.serial, color);
+        let (result, t) = lightbar::apply_lightbar_rgb_timed(api, &pad.serial, color, claims);
         timing.add_assign(t);
         if let Err(err) = result {
             lightbar::warn_lightbar(&pad.product, err);
         } else {
-            lightbar::note_lightbar_applied(&pad.serial, color);
+            claims.note_applied(&pad.serial, color);
         }
     }
 }
