@@ -8,7 +8,7 @@ use crate::controller::dualsense::identity::{self as dualsense, hid_serial, is_s
 use crate::controller::dualsense::lightbar::{self, HidPhaseTiming};
 use crate::controller::hid::launch_paths::LaunchPaths;
 use crate::controller::model::ControllerStatus;
-use crate::domain::color::color_for_battery_percent;
+use crate::domain::color::SpectrumService;
 use crate::platform::app_log;
 use hidapi::{DeviceInfo, HidApi};
 use std::time::{Duration, Instant};
@@ -85,11 +85,21 @@ fn status_from_reading(
 /// Serials not in that set are treated as fresh connects: claim is cleared so
 /// `LIGHT_OUT` + RGB always run (needed after a presence-only disconnect that
 /// never synced claims).
-pub fn poll_controllers(previously_connected: &[String]) -> Result<Vec<ControllerStatus>, String> {
+pub fn poll_controllers(
+    previously_connected: &[String],
+    spectrum: &SpectrumService,
+) -> Result<Vec<ControllerStatus>, String> {
     dualsense::with_hid_lock(|| {
         let api = HidApi::new().map_err(|e| e.to_string())?;
         let mut timing = HidPhaseTiming::default();
-        poll_controllers_with_api(&api, previously_connected, &mut timing, None, None)
+        poll_controllers_with_api(
+            &api,
+            spectrum,
+            previously_connected,
+            &mut timing,
+            None,
+            None,
+        )
     })
 }
 
@@ -99,18 +109,26 @@ pub fn poll_controllers(previously_connected: &[String]) -> Result<Vec<Controlle
 /// are appended to `launch_quiet` on a successful battery read (no Connected toast).
 pub fn poll_controllers_timed(
     api: &HidApi,
+    spectrum: &SpectrumService,
     previously_connected: &[String],
     launch: Option<&mut LaunchPaths>,
     launch_quiet: Option<&mut Vec<String>>,
 ) -> (Result<Vec<ControllerStatus>, String>, HidPhaseTiming) {
     let mut timing = HidPhaseTiming::default();
-    let result =
-        poll_controllers_with_api(api, previously_connected, &mut timing, launch, launch_quiet);
+    let result = poll_controllers_with_api(
+        api,
+        spectrum,
+        previously_connected,
+        &mut timing,
+        launch,
+        launch_quiet,
+    );
     (result, timing)
 }
 
 fn poll_controllers_with_api(
     api: &HidApi,
+    spectrum: &SpectrumService,
     previously_connected: &[String],
     timing: &mut HidPhaseTiming,
     mut launch: Option<&mut LaunchPaths>,
@@ -209,6 +227,7 @@ fn poll_controllers_with_api(
 
     reassert_lightbar_for_pads(
         api,
+        spectrum,
         previously_connected,
         pads.iter().map(|p| &p.status),
         timing,
@@ -221,6 +240,7 @@ fn poll_controllers_with_api(
 /// Shared by full and incremental polls so CLI and daemon behave alike.
 pub(crate) fn reassert_lightbar_for_pads<'a>(
     api: &HidApi,
+    spectrum: &SpectrumService,
     previously_connected: &[String],
     statuses: impl Iterator<Item = &'a ControllerStatus>,
     timing: &mut HidPhaseTiming,
@@ -245,7 +265,7 @@ pub(crate) fn reassert_lightbar_for_pads<'a>(
             continue;
         }
         let serial_key = dualsense::normalize_identity(&pad.serial);
-        let color = color_for_battery_percent(pad.percent);
+        let color = spectrum.color_at(pad.percent);
         if !previous.contains(&serial_key) {
             lightbar::prepare_connect_apply(&pad.serial);
         } else if !lightbar::lightbar_reassert_due(&pad.serial, color) {

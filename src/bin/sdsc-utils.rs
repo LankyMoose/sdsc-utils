@@ -194,7 +194,8 @@ fn attach_console_for_cli() {
 }
 
 fn list_controllers_cli() -> ExitCode {
-    match controller::hid::poll::poll_controllers(&[]) {
+    let spectrum = sdsc_utils::domain::color::SpectrumService::default();
+    match controller::hid::poll::poll_controllers(&[], &spectrum) {
         Ok(statuses) => {
             print_controllers(&statuses);
             ExitCode::SUCCESS

@@ -839,7 +839,7 @@ impl App {
     /// Update in-memory spectrum immediately; debounce prefs save + HID write.
     pub(crate) fn apply_spectrum(&mut self, spectrum: BatterySpectrum) -> Task<Message> {
         self.session.prefs.spectrum = spectrum.clone();
-        color::set_active_spectrum(spectrum);
+        self.spectrum.set(spectrum);
         self.spectrum_generation = self.spectrum_generation.wrapping_add(1);
         let generation = self.spectrum_generation;
         Task::perform(delay(SPECTRUM_DEBOUNCE), move |_| {
@@ -863,12 +863,7 @@ impl App {
             .controllers
             .iter()
             .filter(|c| !is_emulated_serial(&c.serial))
-            .map(|c| {
-                (
-                    c.serial.clone(),
-                    self.session.prefs.spectrum.color_at_percent(c.percent),
-                )
-            })
+            .map(|c| (c.serial.clone(), self.spectrum.color_at(c.percent)))
             .collect();
 
         if targets.is_empty() {
