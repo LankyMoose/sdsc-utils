@@ -130,38 +130,70 @@ struct CacheKey {
     colors: ColorMap,
 }
 
-static RASTER_CACHE: LazyLock<Mutex<HashMap<CacheKey, Vec<u8>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Owned SVG raster cache.
+///
+/// Future injection point owned by the Start image layer: construct one
+/// `SvgRasterCache` there and pass `&SvgRasterCache` down instead of using the
+/// process-global `RASTER_CACHE` shim below.
+pub struct SvgRasterCache {
+    inner: Mutex<HashMap<CacheKey, Vec<u8>>>,
+}
+
+impl SvgRasterCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Rasterize an SVG into straight RGBA (`size × size × 4`).
+    pub fn rasterize(&self, svg: &str, size: u32, colors: &ColorMap) -> Result<Vec<u8>, String> {
+        if size == 0 {
+            return Err("svg rasterize size must be > 0".into());
+        }
+
+        let key = CacheKey {
+            svg: svg.to_string(),
+            size,
+            colors: colors.clone(),
+        };
+        if let Ok(cache) = self.inner.lock()
+            && let Some(hit) = cache.get(&key)
+        {
+            return Ok(hit.clone());
+        }
+
+        let rgba = rasterize_uncached(svg, size, colors)?;
+        if let Ok(mut cache) = self.inner.lock() {
+            cache.insert(key, rgba.clone());
+        }
+        Ok(rgba)
+    }
+
+    /// Drop every cached SVG raster (process Exit).
+    pub fn clear_all(&self) {
+        if let Ok(mut cache) = self.inner.lock() {
+            cache.clear();
+        }
+    }
+}
+
+impl Default for SvgRasterCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static RASTER_CACHE: LazyLock<SvgRasterCache> = LazyLock::new(SvgRasterCache::new);
 
 /// Drop every cached SVG raster (process Exit).
 pub fn clear_cache() {
-    if let Ok(mut cache) = RASTER_CACHE.lock() {
-        cache.clear();
-    }
+    RASTER_CACHE.clear_all();
 }
 
 /// Rasterize an SVG into straight RGBA (`size × size × 4`).
 pub fn rasterize(svg: &str, size: u32, colors: &ColorMap) -> Result<Vec<u8>, String> {
-    if size == 0 {
-        return Err("svg rasterize size must be > 0".into());
-    }
-
-    let key = CacheKey {
-        svg: svg.to_string(),
-        size,
-        colors: colors.clone(),
-    };
-    if let Ok(cache) = RASTER_CACHE.lock()
-        && let Some(hit) = cache.get(&key)
-    {
-        return Ok(hit.clone());
-    }
-
-    let rgba = rasterize_uncached(svg, size, colors)?;
-    if let Ok(mut cache) = RASTER_CACHE.lock() {
-        cache.insert(key, rgba.clone());
-    }
-    Ok(rgba)
+    RASTER_CACHE.rasterize(svg, size, colors)
 }
 
 fn rasterize_uncached(svg: &str, size: u32, colors: &ColorMap) -> Result<Vec<u8>, String> {
