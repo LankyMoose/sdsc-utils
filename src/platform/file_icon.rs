@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
 /// Cached RGBA pixels for a filesystem path (width × height × 4).
 type IconRgba = (u32, u32, Vec<u8>);
@@ -13,13 +13,12 @@ struct CacheKey {
     size: u32,
 }
 
-static CACHE: LazyLock<FileIconCache> = LazyLock::new(FileIconCache::new);
-
 /// Owned shell-icon extract cache.
 ///
-/// Future injection point owned by the Start image layer: construct one
-/// `FileIconCache` there and pass `&FileIconCache` down instead of using the
-/// process-global [`CACHE`] shim below.
+/// Owned by the Start image layer ([`crate::ui::start::icon_cache::IconCache`]:
+/// constructed in `IconCache::new`, passed as `&FileIconCache` to
+/// [`crate::platform::host::Host`] shell-icon reads) — no process-global
+/// instance.
 pub struct FileIconCache {
     inner: Mutex<HashMap<CacheKey, Option<IconRgba>>>,
 }
@@ -67,19 +66,6 @@ impl Default for FileIconCache {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Drop every cached shell extract (process Exit).
-pub fn clear_all() {
-    CACHE.clear_all();
-}
-
-/// Return a square RGBA icon for `path`, or `None` if extraction fails.
-///
-/// Results are cached (including failures) so start-screen refreshes stay cheap.
-/// Cache keys include `size` so list and hero tiers do not collide.
-pub fn rgba_for_path(path: &Path, size: u32) -> Option<(u32, u32, Vec<u8>)> {
-    CACHE.rgba_for_path(path, size)
 }
 
 #[cfg(windows)]

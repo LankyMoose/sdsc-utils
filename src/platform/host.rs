@@ -180,9 +180,17 @@ pub trait Autostart {
 /// Shell icon extraction for local files.
 pub trait Icons {
     /// Square RGBA icon for `path`, or `None` when extraction fails.
-    fn get(path: &std::path::Path, size: u32) -> Option<(u32, u32, Vec<u8>)>;
+    ///
+    /// Reads through the Start image layer's owned
+    /// [`crate::platform::file_icon::FileIconCache`]
+    /// (see [`crate::ui::start::icon_cache::IconCache`]); no process-global.
+    fn get(
+        cache: &crate::platform::file_icon::FileIconCache,
+        path: &std::path::Path,
+        size: u32,
+    ) -> Option<(u32, u32, Vec<u8>)>;
     /// Drop every cached shell extract (process Exit).
-    fn clear();
+    fn clear(cache: &crate::platform::file_icon::FileIconCache);
 }
 
 /// App data-directory locations.
@@ -227,12 +235,16 @@ impl Autostart for Host {
 }
 
 impl Icons for Host {
-    fn get(path: &std::path::Path, size: u32) -> Option<(u32, u32, Vec<u8>)> {
-        crate::platform::file_icon::rgba_for_path(path, size)
+    fn get(
+        cache: &crate::platform::file_icon::FileIconCache,
+        path: &std::path::Path,
+        size: u32,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        cache.rgba_for_path(path, size)
     }
 
-    fn clear() {
-        crate::platform::file_icon::clear_all();
+    fn clear(cache: &crate::platform::file_icon::FileIconCache) {
+        cache.clear_all();
     }
 }
 

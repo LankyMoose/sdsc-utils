@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
+use crate::platform::file_icon::FileIconCache;
 use crate::platform::host::{Host, Icons};
+use crate::ui::svg_icon::SvgRasterCache;
 
 /// Owned warm-generation counter for Start art prefetches.
 ///
@@ -250,11 +252,17 @@ impl CacheState {
 
 /// Owned Start image cache (list / hero / backdrop tiers + pins + epoch).
 ///
-/// Future owner is the Start image layer: construct one `IconCache` there and
-/// pass `&IconCache` down instead of using the process-global [`CACHE`] shim
-/// below.
+/// Owns the Start image layer's decode-source caches alongside the iced
+/// handles: shell-extracted icons ([`FileIconCache`], read through the
+/// [`Host`] safe wrapper) and SVG rasters ([`SvgRasterCache`]). Constructed
+/// in `IconCache::new`; no process-global leaf instances.
 pub struct IconCache {
     inner: Mutex<CacheState>,
+    /// Shell-extracted exe/lnk icons backing [`IconCache::handle_for_shell`].
+    shell: FileIconCache,
+    /// SVG raster cache (wiped on Exit for blank-slate parity; no runtime
+    /// decode callers — tray / iced views use `svg::Handle::from_memory`).
+    svg: SvgRasterCache,
     #[cfg(test)]
     test_lock: Mutex<()>,
 }
@@ -263,6 +271,8 @@ impl IconCache {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(CacheState::new()),
+            shell: FileIconCache::new(),
+            svg: SvgRasterCache::new(),
             #[cfg(test)]
             test_lock: Mutex::new(()),
         }
@@ -270,9 +280,11 @@ impl IconCache {
 
     /// Drop every cached handle and clear pins (process Exit).
     ///
-    /// In-flight worker decodes that finish after this call are not re-inserted.
-    /// The free [`clear_all`] shim additionally resets the [`ArtWarmGen`] so the
-    /// next process starts at gen 0.
+    /// Also wipes the owned shell-extract and SVG raster caches, in the same
+    /// order as the former `wipe_art_caches` sequence (handles → shell →
+    /// SVG). In-flight worker decodes that finish after this call are not
+    /// re-inserted. The free [`clear_all`] shim additionally resets the
+    /// [`ArtWarmGen`] so the next process starts at gen 0.
     pub fn clear_all(&self) {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let n = state.map.len();
@@ -284,6 +296,9 @@ impl IconCache {
             "ui-diag: icon cache clear entries={n} epoch={}",
             state.clear_epoch
         ));
+        drop(state);
+        Host::clear(&self.shell);
+        self.svg.clear_all();
     }
 
     /// Update the pin set for the selection window. Does **not** drop unpinned entries;
@@ -319,14 +334,14 @@ impl IconCache {
     /// Cached handle for a shell-extracted icon (exe / lnk target).
     pub fn handle_for_shell(&self, path: &Path) -> Option<Handle> {
         self.lookup(CacheKey::Shell(path.to_path_buf()), false, || {
-            decode_shell(path, CACHE_H)
+            decode_shell(path, CACHE_H, &self.shell)
         })
     }
 
     /// Shell extract that always stores (add-shortcut dialog probe).
     pub fn handle_for_shell_pinned(&self, path: &Path) -> Option<Handle> {
         self.lookup(CacheKey::Shell(path.to_path_buf()), true, || {
-            decode_shell(path, CACHE_H)
+            decode_shell(path, CACHE_H, &self.shell)
         })
     }
 
@@ -340,7 +355,7 @@ impl IconCache {
     /// Immersive hero handle for a shell-extracted icon (worker / preload only).
     pub fn hero_for_shell(&self, path: &Path) -> Option<Handle> {
         self.lookup(CacheKey::HeroShell(path.to_path_buf()), false, || {
-            decode_shell(path, HERO_H)
+            decode_shell(path, HERO_H, &self.shell)
         })
     }
 
@@ -552,8 +567,10 @@ impl Default for IconCache {
 
 /// Single owner for all Start image caches (list / hero / backdrop + warm gen).
 ///
-/// Future owner is the Start image layer: construct one `ArtCaches` there and
-/// pass `&ArtCaches` (or its `&IconCache` / `&ArtWarmGen` handles) down instead
+/// Bundles the decoded-handle cache (which itself owns the shell-extract and
+/// SVG raster leaf caches) with the selection-warm generation. Future owner
+/// is the Start image layer: construct one `ArtCaches` there and pass
+/// `&ArtCaches` (or its `&IconCache` / `&ArtWarmGen` handles) down instead
 /// of using the process-global [`CACHE`] / [`ART_WARM_GEN`] shims below.
 pub struct ArtCaches {
     /// Decoded iced image handles, pins, and LRU state.
@@ -817,8 +834,8 @@ fn decode_file_sized(
     Some((rgba.width(), rgba.height(), rgba.into_raw()))
 }
 
-fn decode_shell(path: &Path, size: u32) -> Option<(u32, u32, Vec<u8>)> {
-    let (width, height, pixels) = Host::get(path, size)?;
+fn decode_shell(path: &Path, size: u32, cache: &FileIconCache) -> Option<(u32, u32, Vec<u8>)> {
+    let (width, height, pixels) = Host::get(cache, path, size)?;
     crate::controller::hid::diag::diag_info(format!(
         "ui-diag: icon handle shell={} src={width}x{height} dst={width}x{height} size={size}",
         path.display()
