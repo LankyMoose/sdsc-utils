@@ -23,8 +23,10 @@ pub mod vstrip;
 /// Called from [`art_worker::ArtOwner::shutdown`] (before and after join). Also resets
 /// immersive shader one-shot diag state so the next process logs cleanly.
 pub fn wipe_art_caches() {
+    use crate::platform::host::{Host, Icons as _};
+
     icon_cache::clear_all();
-    crate::platform::file_icon::clear_all();
+    Host::clear();
     crate::ui::svg_icon::clear_cache();
     crate::ui::shader::ambient::reset_pipeline_diag();
     crate::ui::shader::vignette::reset_pipeline_diag();

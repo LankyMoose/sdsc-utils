@@ -1,8 +1,9 @@
 //! Host platform abstraction (additive, no behavior change).
 //!
 //! Safe wrappers and traits that delegate verbatim to the existing platform
-//! implementations. UI call sites in [`crate::ui::layout`] / [`crate::ui::start`]
-//! go through this seam instead of touching Win32 directly.
+//! implementations. App ([`crate::app`]) and UI ([`crate::ui::layout`] /
+//! [`crate::ui::start`]) call sites go through this seam instead of touching
+//! Win32 directly.
 //!
 //! Window functions take a raw `isize` HWND, matching [`crate::platform::win32`].
 //! An `HWND` is an opaque handle-table value, not a pointer, so a stale value
@@ -116,6 +117,44 @@ pub fn set_no_activate(hwnd: isize, topmost: bool) {
     }
 }
 
+/// Move `hwnd` from the primary to the first secondary monitor (debug quiet
+/// mode: windows never activate on creation; see
+/// [`crate::platform::debug_quiet`]).
+///
+/// No-op on single-monitor setups or when already off primary.
+pub fn move_to_secondary_monitor(hwnd: isize) {
+    #[cfg(windows)]
+    {
+        // SAFETY: same contract as [`show_window`]: opaque HWND from a
+        // `window::run` closure on the UI thread; delegates verbatim to the
+        // existing `win32::move_to_secondary_monitor` block.
+        unsafe {
+            crate::platform::win32::move_to_secondary_monitor(hwnd);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+    }
+}
+
+/// Force Win32 to repaint `hwnd` (helps iced pick up a new toast view).
+pub fn invalidate_hwnd(hwnd: isize) {
+    #[cfg(windows)]
+    {
+        // SAFETY: same contract as [`show_window`]: opaque HWND from a
+        // `window::run` closure on the UI thread; `RedrawWindow` only marks
+        // the frame dirty, it never dereferences caller memory.
+        unsafe {
+            crate::platform::win32::invalidate_hwnd(hwnd);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+    }
+}
+
 /// OS device arrival/removal watcher (trigger, not truth).
 pub trait Watcher {
     /// Spawn the watcher; `true` when one is running.
@@ -132,12 +171,18 @@ pub trait Autostart {
     fn uninstall() -> Result<(), String>;
     /// Whether the autostart entry is currently enabled.
     fn is_enabled() -> bool;
+    /// Replace a leftover Startup `.cmd` with a silent `.lnk` (fixes console
+    /// flash on login). Safe to call on every launch; no-op when packaged
+    /// or off Windows.
+    fn ensure_quiet_entry();
 }
 
 /// Shell icon extraction for local files.
 pub trait Icons {
     /// Square RGBA icon for `path`, or `None` when extraction fails.
     fn get(path: &std::path::Path, size: u32) -> Option<(u32, u32, Vec<u8>)>;
+    /// Drop every cached shell extract (process Exit).
+    fn clear();
 }
 
 /// App data-directory locations.
@@ -175,11 +220,19 @@ impl Autostart for Host {
     fn is_enabled() -> bool {
         crate::platform::autostart::is_enabled()
     }
+
+    fn ensure_quiet_entry() {
+        crate::platform::autostart::ensure_quiet_entry();
+    }
 }
 
 impl Icons for Host {
     fn get(path: &std::path::Path, size: u32) -> Option<(u32, u32, Vec<u8>)> {
         crate::platform::file_icon::rgba_for_path(path, size)
+    }
+
+    fn clear() {
+        crate::platform::file_icon::clear_all();
     }
 }
 
@@ -204,10 +257,20 @@ pub trait Clock {
     fn locale_time() -> Option<String>;
 }
 
+/// Physical-pixel monitor rect as `(left, top, right, bottom)`.
+pub type PxRect = (i32, i32, i32, i32);
+
 /// Monitor / cursor placement queries.
 pub trait Monitors {
     /// Whether the system cursor is currently on the primary monitor.
     fn cursor_on_primary_monitor() -> bool;
+    /// Primary monitor + work-area geometry for UI cover math.
+    ///
+    /// Returns `(monitor_rect, work_rect, dpi_scale, foreground_covers_monitor)`
+    /// in physical pixels; the caller converts to logical [`crate::ui::layout`]
+    /// cover rects so no UI type crosses this seam. `None` off Windows or when
+    /// the monitor query fails (callers fall back to the iced-provided size).
+    fn primary_metrics() -> Option<(PxRect, PxRect, f32, bool)>;
 }
 
 impl Clock for Host {
@@ -322,5 +385,286 @@ impl Monitors for Host {
         {
             false
         }
+    }
+
+    fn primary_metrics() -> Option<(PxRect, PxRect, f32, bool)> {
+        #[cfg(windows)]
+        {
+            // SAFETY: `MonitorFromPoint` takes coordinates by value and returns
+            // an opaque monitor handle compared by equality only; `GetMonitorInfoW`
+            // and `GetDpiForMonitor` write only to the caller-owned `info` /
+            // `dpi_*` out-params; `GetForegroundWindow` / `GetWindowRect` only
+            // read the foreground geometry, never caller memory beyond `rect`.
+            unsafe {
+                let monitor = crate::platform::win32::MonitorFromPoint(
+                    crate::platform::win32::Point { x: 0, y: 0 },
+                    crate::platform::win32::MONITOR_DEFAULTTOPRIMARY,
+                );
+                if monitor == 0 {
+                    return None;
+                }
+
+                let mut info = crate::platform::win32::MonitorInfo {
+                    size: std::mem::size_of::<crate::platform::win32::MonitorInfo>() as u32,
+                    monitor: crate::platform::win32::Rect::default(),
+                    work: crate::platform::win32::Rect::default(),
+                    flags: 0,
+                };
+                if crate::platform::win32::GetMonitorInfoW(monitor, &mut info) == 0 {
+                    return None;
+                }
+
+                let mut dpi_x = 0u32;
+                let mut dpi_y = 0u32;
+                let dpi_ok = crate::platform::win32::GetDpiForMonitor(
+                    monitor,
+                    crate::platform::win32::MDT_EFFECTIVE_DPI,
+                    &mut dpi_x,
+                    &mut dpi_y,
+                ) == 0
+                    && dpi_x > 0;
+                let scale = if dpi_ok { dpi_x as f32 / 96.0 } else { 1.0 };
+
+                let to_tuple = |rect: crate::platform::win32::Rect| {
+                    (rect.left, rect.top, rect.right, rect.bottom)
+                };
+
+                let foreground = crate::platform::win32::GetForegroundWindow();
+                let mut foreground_rect = crate::platform::win32::Rect::default();
+                let got_foreground = foreground != 0
+                    && crate::platform::win32::GetWindowRect(foreground, &mut foreground_rect) != 0;
+                let foreground_covers_monitor = got_foreground
+                    && foreground_rect.left <= info.monitor.left + 2
+                    && foreground_rect.top <= info.monitor.top + 2
+                    && foreground_rect.right >= info.monitor.right - 2
+                    && foreground_rect.bottom >= info.monitor.bottom - 2;
+
+                Some((
+                    to_tuple(info.monitor),
+                    to_tuple(info.work),
+                    scale,
+                    foreground_covers_monitor,
+                ))
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+}
+
+/// Global hotkeys: the toast Escape dismiss plus the debug-only hitch markers
+/// (F7 lightbar / F8 input, compiled out of release builds).
+///
+/// `RegisterHotKey` binds to the calling thread's message queue, so the whole
+/// lifecycle (register → pump → unregister) lives on one worker thread owned by
+/// the caller in [`crate::app`]; this trait only wraps the Win32 verbs.
+/// Non-Windows stubs (`false` / `None` / `0` / no-op) are preserved verbatim —
+/// off Windows the callers keep their `pending()` / no-watcher fallbacks.
+pub trait Hotkeys {
+    /// Toast Escape-dismiss hotkey id.
+    const ESCAPE_ID: i32;
+    /// Debug hitch-marker ids (F7 lightbar / F8 input).
+    #[cfg(debug_assertions)]
+    const HITCH_LIGHTBAR_ID: i32;
+    /// Debug hitch-marker ids (F7 lightbar / F8 input).
+    #[cfg(debug_assertions)]
+    const HITCH_INPUT_ID: i32;
+
+    /// Register the toast Escape hotkey on the calling thread; `true` on success.
+    fn register_escape() -> bool;
+    /// Remove the toast Escape hotkey.
+    fn unregister_escape();
+    /// Register the debug lightbar-hitch hotkey (F7) on the calling thread.
+    #[cfg(debug_assertions)]
+    fn register_hitch_lightbar() -> bool;
+    /// Register the debug input-hitch hotkey (F8) on the calling thread.
+    #[cfg(debug_assertions)]
+    fn register_hitch_input() -> bool;
+    /// Remove the debug lightbar-hitch hotkey.
+    #[cfg(debug_assertions)]
+    fn unregister_hitch_lightbar();
+    /// Remove the debug input-hitch hotkey.
+    #[cfg(debug_assertions)]
+    fn unregister_hitch_input();
+    /// Block for the next `WM_HOTKEY` on the calling thread and return its id.
+    ///
+    /// Non-hotkey messages are skipped internally (the verbatim `continue`);
+    /// `None` when the pump quits (`WM_QUIT`) or errors.
+    fn next_hotkey() -> Option<i32>;
+    /// OS id of the calling thread (quit-guard target; `0` stub off Windows).
+    fn current_thread_id() -> u32;
+    /// RAII poster: unblocks a [`Hotkeys::next_hotkey`] pump on `thread_id`
+    /// when dropped (toast dismissed by some other means).
+    fn quit_guard(thread_id: u32) -> QuitGuard;
+}
+
+/// Posts `WM_QUIT` to a hotkey pump when the awaiting future is dropped.
+///
+/// Mirrors [`crate::platform::win32::ThreadQuitGuard`] through the host seam
+/// so [`crate::app`] never names the Win32 type directly.
+pub struct QuitGuard(u32);
+
+impl Drop for QuitGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            if self.0 != 0 {
+                // SAFETY: posts to a thread id, never touches memory; `0`
+                // (no worker yet) is ignored, matching `ThreadQuitGuard`.
+                unsafe {
+                    crate::platform::win32::PostThreadMessageW(
+                        self.0,
+                        crate::platform::win32::WM_QUIT,
+                        0,
+                        0,
+                    );
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = self.0;
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Hotkeys for Host {
+    const ESCAPE_ID: i32 = crate::platform::win32::HOTKEY_ID;
+    #[cfg(debug_assertions)]
+    const HITCH_LIGHTBAR_ID: i32 = crate::platform::win32::HOTKEY_ID_LIGHTBAR_HITCH;
+    #[cfg(debug_assertions)]
+    const HITCH_INPUT_ID: i32 = crate::platform::win32::HOTKEY_ID_INPUT_HITCH;
+
+    fn register_escape() -> bool {
+        // SAFETY: `hwnd` 0 binds the hotkey to the calling thread's queue;
+        // plain integer params, no memory access.
+        unsafe {
+            crate::platform::win32::RegisterHotKey(
+                0,
+                Self::ESCAPE_ID,
+                crate::platform::win32::MOD_NOREPEAT,
+                crate::platform::win32::VK_ESCAPE,
+            ) != 0
+        }
+    }
+
+    fn unregister_escape() {
+        // SAFETY: integer id only; failure is a return code.
+        unsafe {
+            crate::platform::win32::UnregisterHotKey(0, Self::ESCAPE_ID);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn register_hitch_lightbar() -> bool {
+        // SAFETY: same contract as [`Hotkeys::register_escape`].
+        unsafe {
+            crate::platform::win32::RegisterHotKey(
+                0,
+                Self::HITCH_LIGHTBAR_ID,
+                crate::platform::win32::MOD_NOREPEAT,
+                crate::platform::win32::VK_F7,
+            ) != 0
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn register_hitch_input() -> bool {
+        // SAFETY: same contract as [`Hotkeys::register_escape`].
+        unsafe {
+            crate::platform::win32::RegisterHotKey(
+                0,
+                Self::HITCH_INPUT_ID,
+                crate::platform::win32::MOD_NOREPEAT,
+                crate::platform::win32::VK_F8,
+            ) != 0
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn unregister_hitch_lightbar() {
+        // SAFETY: integer id only; failure is a return code.
+        unsafe {
+            crate::platform::win32::UnregisterHotKey(0, Self::HITCH_LIGHTBAR_ID);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn unregister_hitch_input() {
+        // SAFETY: integer id only; failure is a return code.
+        unsafe {
+            crate::platform::win32::UnregisterHotKey(0, Self::HITCH_INPUT_ID);
+        }
+    }
+
+    fn next_hotkey() -> Option<i32> {
+        // SAFETY: `message` is caller-owned; `GetMessageW` with null filters
+        // pumps this thread's queue and writes only to `message`. Returns 0
+        // on `WM_QUIT`, negative on error — both end the pump like the
+        // verbatim `> 0` loop they replace.
+        unsafe {
+            let mut message = crate::platform::win32::Message::default();
+            while crate::platform::win32::GetMessageW(&mut message, 0, 0, 0) > 0 {
+                if message.message == crate::platform::win32::WM_HOTKEY {
+                    return Some(message.w_param as i32);
+                }
+            }
+            None
+        }
+    }
+
+    fn current_thread_id() -> u32 {
+        // SAFETY: returns the calling thread's OS id; no memory access.
+        unsafe { crate::platform::win32::GetCurrentThreadId() }
+    }
+
+    fn quit_guard(thread_id: u32) -> QuitGuard {
+        QuitGuard(thread_id)
+    }
+}
+
+#[cfg(not(windows))]
+impl Hotkeys for Host {
+    const ESCAPE_ID: i32 = 0;
+    #[cfg(debug_assertions)]
+    const HITCH_LIGHTBAR_ID: i32 = 1;
+    #[cfg(debug_assertions)]
+    const HITCH_INPUT_ID: i32 = 2;
+
+    fn register_escape() -> bool {
+        false
+    }
+
+    fn unregister_escape() {}
+
+    #[cfg(debug_assertions)]
+    fn register_hitch_lightbar() -> bool {
+        false
+    }
+
+    #[cfg(debug_assertions)]
+    fn register_hitch_input() -> bool {
+        false
+    }
+
+    #[cfg(debug_assertions)]
+    fn unregister_hitch_lightbar() {}
+
+    #[cfg(debug_assertions)]
+    fn unregister_hitch_input() {}
+
+    fn next_hotkey() -> Option<i32> {
+        None
+    }
+
+    fn current_thread_id() -> u32 {
+        0
+    }
+
+    fn quit_guard(thread_id: u32) -> QuitGuard {
+        QuitGuard(thread_id)
     }
 }
