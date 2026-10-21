@@ -28,8 +28,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Owned tray-arm flag for crash restart.
 ///
-/// Future injection point: own a `CrashArmed` in the app root and pass
-/// `&CrashArmed` to the panic hook instead of using the process-global below.
+/// Owned by the crash boot in the binary root (`Box::leak`ed in `main` so the
+/// panic hook can hold a `&'static` borrow); pass `&CrashArmed` to
+/// [`arm_tray_mode`] / [`schedule_from_panic`]. No process-global.
 pub struct CrashArmed(AtomicBool);
 
 impl CrashArmed {
@@ -53,9 +54,6 @@ impl Default for CrashArmed {
         Self::new()
     }
 }
-
-// Thin compat shim: process-global instance until the panic hook takes `&CrashArmed`.
-static ARMED: CrashArmed = CrashArmed::new();
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct RestartBudget {
@@ -106,13 +104,13 @@ pub fn take_pending_notice() -> bool {
 }
 
 /// Call once tray mode is about to start (`app::run`). CLI paths stay unarmed.
-pub fn arm_tray_mode() {
-    ARMED.arm_tray_mode();
+pub fn arm_tray_mode(armed: &CrashArmed) {
+    armed.arm_tray_mode();
 }
 
 /// From the panic hook: spawn a detached `--crash-relaunch` helper if armed.
-pub fn schedule_from_panic() {
-    if !ARMED.should_schedule_from_panic() {
+pub fn schedule_from_panic(armed: &CrashArmed) {
+    if !armed.should_schedule_from_panic() {
         return;
     }
 

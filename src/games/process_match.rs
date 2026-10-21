@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Outer optimistic bound for a catalog launch (slow Steam starts).
@@ -122,7 +122,7 @@ pub fn decide_running_badge(
 }
 
 /// Resolve match paths for a catalog launch target (best-effort).
-pub fn match_paths_for_target(target: &str) -> Vec<PathBuf> {
+pub fn match_paths_for_target(target: &str, seen: &SeenCache) -> Vec<PathBuf> {
     let trimmed = target.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -132,7 +132,7 @@ pub fn match_paths_for_target(target: &str) -> Vec<PathBuf> {
         return match crate::games::steam::install_dir_for_appid(appid) {
             Some(dir) => vec![dir],
             None => {
-                log_missing_steam_installdir(appid);
+                log_missing_steam_installdir(appid, seen);
                 Vec::new()
             }
         };
@@ -149,8 +149,8 @@ pub fn match_paths_for_target(target: &str) -> Vec<PathBuf> {
     Vec::new()
 }
 
-fn log_missing_steam_installdir(appid: u32) {
-    if SEEN.insert(appid) {
+fn log_missing_steam_installdir(appid: u32, seen: &SeenCache) {
+    if seen.insert(appid) {
         crate::platform::app_log::warn(format!(
             "steam installdir missing for appid {appid}; running match paths empty"
         ));
@@ -159,9 +159,10 @@ fn log_missing_steam_installdir(appid: u32) {
 
 /// Owned first-sight cache for missing Steam installdir warnings.
 ///
-/// Future injection point: pass `&SeenCache` into
-/// [`match_paths_for_target`] / `log_missing_steam_installdir` instead of
-/// using the process-global below.
+/// Owned by the app root (`App::seen_cache`); pass `&SeenCache` into
+/// [`match_paths_for_target`] / `log_missing_steam_installdir`. First sight
+/// logs, later sights stay silent for the process lifetime (never cleared,
+/// matching the previous process-global behavior).
 pub struct SeenCache(Mutex<HashSet<u32>>);
 
 impl SeenCache {
@@ -183,9 +184,6 @@ impl Default for SeenCache {
         Self::new()
     }
 }
-
-// Thin compat shim: process-global instance until call sites take `&SeenCache`.
-static SEEN: LazyLock<SeenCache> = LazyLock::new(SeenCache::new);
 
 fn steam_appid(target: &str) -> Option<u32> {
     let rest = target.strip_prefix("steam://rungameid/")?;
@@ -503,8 +501,17 @@ mod tests {
     #[test]
     fn match_paths_manual_file() {
         // Non-existent path still yields basename-style entry via PathBuf.
-        let paths = match_paths_for_target("C:\\Games\\Demo\\game.exe");
+        let seen = SeenCache::new();
+        let paths = match_paths_for_target("C:\\Games\\Demo\\game.exe", &seen);
         assert!(!paths.is_empty());
+    }
+
+    #[test]
+    fn seen_cache_dedups_first_sight() {
+        let seen = SeenCache::new();
+        assert!(seen.insert(42));
+        assert!(!seen.insert(42));
+        assert!(seen.insert(7));
     }
 
     #[test]
