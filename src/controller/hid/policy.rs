@@ -53,29 +53,35 @@ pub struct Policy {
     pub pulse_sample_log_interval: Duration,
 }
 
+impl Policy {
+    /// Single source of truth for every HID cadence (const-evaluable so the
+    /// legacy module consts below can alias it without call-site churn).
+    pub const DEFAULT: Policy = Policy {
+        report_wait_ms: 4,
+        drain_cap: 32,
+        live_silence_threshold: 50,
+        poll_live_battery_stale: Duration::from_secs(30),
+        presence: Duration::from_secs(3),
+        presence_empty: Duration::from_secs(2),
+        battery: Duration::from_secs(60),
+        liveness: Duration::from_secs(5),
+        unread_retry: Duration::from_secs(15),
+        hot_enum_max_defer: Duration::from_secs(20),
+        cold_heartbeat: Duration::from_secs(2),
+        refresh_hint_throttle: Duration::from_secs(1),
+        open_backoff_threshold: 3,
+        open_backoff_window: Duration::from_secs(5),
+        active_poll: Duration::from_millis(4),
+        identify_sample_poll: Duration::from_millis(4),
+        sample_stall_ms: 100,
+        slow_cmd_log_ms: 20,
+        pulse_sample_log_interval: Duration::from_secs(1),
+    };
+}
+
 impl Default for Policy {
     fn default() -> Self {
-        Self {
-            report_wait_ms: 4,
-            drain_cap: 32,
-            live_silence_threshold: 50,
-            poll_live_battery_stale: Duration::from_secs(30),
-            presence: Duration::from_secs(3),
-            presence_empty: Duration::from_secs(2),
-            battery: Duration::from_secs(60),
-            liveness: Duration::from_secs(5),
-            unread_retry: Duration::from_secs(15),
-            hot_enum_max_defer: Duration::from_secs(20),
-            cold_heartbeat: Duration::from_secs(2),
-            refresh_hint_throttle: Duration::from_secs(1),
-            open_backoff_threshold: 3,
-            open_backoff_window: Duration::from_secs(5),
-            active_poll: Duration::from_millis(4),
-            identify_sample_poll: Duration::from_millis(4),
-            sample_stall_ms: 100,
-            slow_cmd_log_ms: 20,
-            pulse_sample_log_interval: Duration::from_secs(1),
-        }
+        Self::DEFAULT
     }
 }
 
