@@ -18,8 +18,12 @@ const MAX_HID_TRACE_BYTES: u64 = 16_000_000;
 
 /// Owned file-logger handles (log paths + session clock).
 ///
-/// Future injection point: construct one `LogHandles` at startup and pass
-/// `&LogHandles` down instead of using the process-global below.
+/// Intentionally process-global (see `HANDLES` below): logging is cross-cutting
+/// infrastructure with ~130 call sites across the HID worker thread, persist
+/// atomic writes, session notify, and platform bring-up — threading `&LogHandles`
+/// through all of them would churn far beyond the app root for no behavior
+/// gain. The binary owns init ordering (`app_log::init()` first in `main`);
+/// everything else logs through the free functions, which delegate here.
 pub struct LogHandles {
     log_path: Mutex<Option<PathBuf>>,
     #[cfg(debug_assertions)]
@@ -189,7 +193,11 @@ impl Default for LogHandles {
     }
 }
 
-// Thin compat shim: process-global instance until call sites take `&LogHandles`.
+// Intentional remainder: process-global logger instance. `init` (called first
+// by the binary) fills the paths/session clock; the free `info`/`warn`/`error`
+// /`hid_trace` shims below delegate here so deep modules (HID worker, persist,
+// platform bring-up) log without threading `&LogHandles` through every frame.
+// Rotation, paths, and formats are unchanged; see `LogHandles` docs.
 static HANDLES: LogHandles = LogHandles::new();
 
 pub fn init() {

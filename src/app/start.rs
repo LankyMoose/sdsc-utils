@@ -24,7 +24,7 @@ use crate::persist::prefs::{
     renderer_restart_needed,
 };
 use crate::platform::app_log;
-use crate::platform::ui_sound::{self, UiSoundKind};
+use crate::platform::ui_sound::UiSoundKind;
 use crate::ui::configure::{PadInputPanel, Section};
 use crate::ui::layout::{
     MonitorCover, cursor_on_primary_monitor, focus_window, move_window, open_visible,
@@ -1106,7 +1106,7 @@ impl App {
             return;
         }
         let volume = f32::from(self.session.prefs.start_screen_sound_volume) / 100.0;
-        ui_sound::play(kind, volume);
+        self.sound.play(kind, volume);
     }
 
     /// Sound + optional pad haptic for a start-screen cue.

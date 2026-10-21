@@ -41,8 +41,10 @@ enum Cmd {
 
 /// Owned UI-sound worker handle.
 ///
-/// Future injection point: own a `SoundHub` in the app root and pass
-/// `&SoundHub` to callers instead of using the process-global below.
+/// Owned by the app root (`App::sound`); callers go through
+/// `App::play_start_sound` / `play_start_cue`, never a process-global.
+/// The worker thread spawns lazily on the first `play` (see
+/// [`SoundHub::sender`]); a construction without playback spawns nothing.
 pub struct SoundHub {
     tx: OnceLock<Option<Sender<Cmd>>>,
 }
@@ -108,12 +110,4 @@ impl Default for SoundHub {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// Thin compat shim: process-global instance until call sites take `&SoundHub`.
-static HUB: SoundHub = SoundHub::new();
-
-/// Play an embedded cue at `volume` in 0.0..=1.0. No-ops when volume is ~0.
-pub fn play(kind: UiSoundKind, volume: f32) {
-    HUB.play(kind, volume);
 }
