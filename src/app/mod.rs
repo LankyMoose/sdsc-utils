@@ -5834,7 +5834,7 @@ fn presence_hint_stream() -> impl Stream<Item = Message> {
     })
 }
 
-/// Hitch context: the shared input snapshot (`INPUT_SNAPSHOT`) is the
+/// Hitch context: the owned input hub snapshot (`InputHub`) is the
 /// single source F7/F8 stamps read from (safe off the UI thread).
 #[cfg(debug_assertions)]
 fn stamp_hitch_report(kind: &str, source: &str, extra: Option<String>) {

@@ -839,8 +839,9 @@ impl HidWorkerHandle {
         let live_pads_worker = Arc::clone(&live_pads);
         let launch_serials = Arc::new(Mutex::new(Vec::new()));
         let launch_serials_worker = Arc::clone(&launch_serials);
-        let input_snapshot = Arc::new(Mutex::new(InputSnapshot::default()));
-        start_input::set_input_snapshot(Arc::clone(&input_snapshot));
+        // Fresh worker start resets the owned input hub (seq restarts at 0).
+        start_input::set_input_snapshot(Arc::new(Mutex::new(InputSnapshot::default())));
+        let input_snapshot = start_input::snapshot_mutex();
         let last_noisy_log = Arc::new(Mutex::new(Instant::now() - PULSE_SAMPLE_LOG_INTERVAL));
         let last_noisy_log_worker = Arc::clone(&last_noisy_log);
 
@@ -1168,25 +1169,8 @@ fn publish_snapshot(
     let now_empty = readings.is_empty();
     let pad_count = readings.len();
 
-    let meta = if let Ok(mut guard) = snapshot.lock() {
-        guard.seq = guard.seq.saturating_add(1);
-        guard.published_at = Instant::now();
-        guard.reason = reason;
-        guard.readings = readings.clone();
-        SnapshotMeta {
-            published_at: guard.published_at,
-            seq: guard.seq,
-            reason: guard.reason,
-            pad_count: guard.readings.len(),
-        }
-    } else {
-        SnapshotMeta {
-            published_at: Instant::now(),
-            seq: 0,
-            reason,
-            pad_count,
-        }
-    };
+    // Store through the owned hub (single snapshot lock for write + meta, as before).
+    let meta = start_input::input_hub().publish(readings.clone(), reason);
 
     if emit_edge {
         start_input::push_input_edge(start_input::InputEdge::from_snapshot(readings, &meta));
@@ -2041,7 +2025,7 @@ fn worker_loop(
     identifying: Arc<AtomicBool>,
     input_hot: Arc<AtomicBool>,
     last_noisy_log: Arc<Mutex<Instant>>,
-    input_snapshot: Arc<Mutex<InputSnapshot>>,
+    input_snapshot: &'static Mutex<InputSnapshot>,
     presence: Arc<Mutex<Vec<String>>>,
     live_pads: Arc<Mutex<HashMap<String, LivePadStatus>>>,
     launch_serials: Arc<Mutex<Vec<String>>>,
@@ -2076,7 +2060,7 @@ fn worker_loop(
                 &live_pads,
                 &mut rumble,
                 &mut active_rumble,
-                &input_snapshot,
+                input_snapshot,
                 &identifying,
                 &last_noisy_log,
                 hot,
@@ -2087,7 +2071,7 @@ fn worker_loop(
             in_cmd = "LowBatteryPulse";
         }
         maybe_log_sample_stall(
-            &input_snapshot,
+            input_snapshot,
             hot,
             in_cmd,
             &mut stall_logged,
@@ -2103,7 +2087,7 @@ fn worker_loop(
                 &mut session,
                 &mut cache,
                 &live_pads,
-                &input_snapshot,
+                input_snapshot,
                 &identifying,
                 &last_noisy_log,
                 hot,
@@ -2138,7 +2122,7 @@ fn worker_loop(
                     &mut active_rumble,
                     &mut pending_power_off,
                     &mut pulse,
-                    &input_snapshot,
+                    input_snapshot,
                     &identifying,
                     &last_noisy_log,
                     hot,
@@ -2170,7 +2154,7 @@ fn worker_loop(
                     .wake_at
                     .saturating_duration_since(Instant::now())
                     .min(IDENTIFY_SAMPLE_POLL);
-                sample_serial_into_snapshot(&mut cache, &live_pads, &input_snapshot, &serial, hot);
+                sample_serial_into_snapshot(&mut cache, &live_pads, input_snapshot, &serial, hot);
                 if !until_flash.is_zero() {
                     thread::sleep(until_flash.min(ACTIVE_POLL));
                 }
@@ -2178,7 +2162,7 @@ fn worker_loop(
                 sample_all_inputs(
                     &mut cache,
                     &live_pads,
-                    &input_snapshot,
+                    input_snapshot,
                     hot,
                     &last_noisy_log,
                     None,
@@ -2227,7 +2211,7 @@ fn worker_loop(
                     &mut active_rumble,
                     &mut pending_power_off,
                     &mut pulse,
-                    &input_snapshot,
+                    input_snapshot,
                     &identifying,
                     &last_noisy_log,
                     hot,

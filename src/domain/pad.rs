@@ -7,7 +7,7 @@
 use crate::domain::gesture::{GestureControl, GestureDetector};
 use hidapi::HidDevice;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 /// Per-axis deadzone applied to each stick before combining (kills rest bias).
@@ -25,11 +25,133 @@ const NAV_NEUTRAL_GRACE: Duration = Duration::from_millis(100);
 /// One wired DualSense report interval (`bInterval` 4). Block this long when the queue is empty.
 pub const INPUT_REPORT_WAIT_MS: i32 = 4;
 
-static INPUT_SNAPSHOT: OnceLock<Arc<Mutex<InputSnapshot>>> = OnceLock::new();
+/// Owned pad-input unit: the hid-worker publication (snapshot) plus the
+/// async edge bridge the iced subscription drains.
+///
+/// Future injection point: construct one `InputHub` in the HID worker /
+/// app root and pass `&InputHub` down instead of using the process-global
+/// [`HUB`] shim below.
+pub struct InputHub {
+    snapshot: Mutex<InputSnapshot>,
+    /// Async bridge: hid-worker `try_send`s edges; iced subscription drains them.
+    edge_tx: Mutex<Option<iced::futures::channel::mpsc::Sender<InputEdge>>>,
+    #[cfg(test)]
+    test_lock: Mutex<()>,
+}
 
-/// Async bridge: hid-worker `try_send`s edges; iced subscription drains them.
-static INPUT_EDGE_TX: Mutex<Option<iced::futures::channel::mpsc::Sender<InputEdge>>> =
-    Mutex::new(None);
+impl InputHub {
+    pub fn new() -> Self {
+        Self {
+            snapshot: Mutex::new(InputSnapshot::default()),
+            edge_tx: Mutex::new(None),
+            #[cfg(test)]
+            test_lock: Mutex::new(()),
+        }
+    }
+
+    /// Direct snapshot access for the hid-worker hot paths that must hold
+    /// one lock across read-modify-write (Identify merge, power-off drop).
+    pub fn snapshot_mutex(&self) -> &Mutex<InputSnapshot> {
+        &self.snapshot
+    }
+
+    /// Store fresh worker readings (bump seq, stamp, replace); returns the
+    /// meta the edge bridge attaches. Lock scope matches the old inline block.
+    pub fn publish(&self, readings: Vec<NavReading>, reason: SnapshotReason) -> SnapshotMeta {
+        if let Ok(mut guard) = self.snapshot.lock() {
+            guard.seq = guard.seq.saturating_add(1);
+            guard.published_at = Instant::now();
+            guard.reason = reason;
+            guard.readings = readings;
+            SnapshotMeta {
+                published_at: guard.published_at,
+                seq: guard.seq,
+                reason: guard.reason,
+                pad_count: guard.readings.len(),
+            }
+        } else {
+            SnapshotMeta {
+                published_at: Instant::now(),
+                seq: 0,
+                reason,
+                pad_count: 0,
+            }
+        }
+    }
+
+    /// PadPoll entry: O(1) clone of hid-worker snapshot (never opens HID on the UI thread).
+    pub fn read(&self) -> NavReadingsOutcome {
+        let Ok(guard) = self.snapshot.lock() else {
+            return NavReadingsOutcome::Missing {
+                meta: SnapshotMeta {
+                    published_at: Instant::now(),
+                    seq: 0,
+                    reason: SnapshotReason::LockPoisoned,
+                    pad_count: 0,
+                },
+            };
+        };
+        let meta = SnapshotMeta {
+            published_at: guard.published_at,
+            seq: guard.seq,
+            reason: guard.reason,
+            pad_count: guard.readings.len(),
+        };
+        if guard.readings.is_empty() {
+            NavReadingsOutcome::Missing { meta }
+        } else {
+            log_source_once(NavSource::Hid, guard.readings.len());
+            NavReadingsOutcome::Readings {
+                readings: guard.readings.clone(),
+                meta,
+            }
+        }
+    }
+
+    /// Install the iced-side sender so the worker can push edges (subscription start).
+    pub fn bind(&self, tx: iced::futures::channel::mpsc::Sender<InputEdge>) {
+        if let Ok(mut guard) = self.edge_tx.lock() {
+            *guard = Some(tx);
+        }
+    }
+
+    /// Clear the iced-side sender (subscription end / shutdown).
+    pub fn clear(&self) {
+        if let Ok(mut guard) = self.edge_tx.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Push a sample edge to the UI bridge (no-op when nothing is listening).
+    pub fn push_edge(&self, edge: InputEdge) {
+        if let Ok(mut guard) = self.edge_tx.lock()
+            && let Some(tx) = guard.as_mut()
+        {
+            // Prefer a fresh sample over blocking the HID thread.
+            let _ = tx.try_send(edge);
+        }
+    }
+
+    /// Hold while mutating the process-wide hub in tests (avoids races with
+    /// parallel tests that publish/read the shared hub).
+    ///
+    /// Owns the test lock that the free [`with_hub_lock`] shim delegates to,
+    /// so existing call sites keep working unchanged.
+    #[cfg(test)]
+    pub fn with_test_lock<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.test_lock.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+}
+
+impl Default for InputHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Thin compat shim: process-global instance until call sites take `&InputHub`.
+static HUB: LazyLock<InputHub> = LazyLock::new(InputHub::new);
 
 /// One pad-input publication from the hid-worker (replaces UI PadPoll timer).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -62,26 +184,23 @@ impl InputEdge {
 
 /// Install the iced-side sender so the worker can push edges (subscription start).
 pub fn bind_input_edge_sender(tx: iced::futures::channel::mpsc::Sender<InputEdge>) {
-    if let Ok(mut guard) = INPUT_EDGE_TX.lock() {
-        *guard = Some(tx);
-    }
+    HUB.bind(tx);
 }
 
 /// Clear the iced-side sender (subscription end / shutdown).
 pub fn clear_input_edge_sender() {
-    if let Ok(mut guard) = INPUT_EDGE_TX.lock() {
-        *guard = None;
-    }
+    HUB.clear();
 }
 
 /// Push a sample edge to the UI bridge (no-op when nothing is listening).
 pub fn push_input_edge(edge: InputEdge) {
-    if let Ok(mut guard) = INPUT_EDGE_TX.lock()
-        && let Some(tx) = guard.as_mut()
-    {
-        // Prefer a fresh sample over blocking the HID thread.
-        let _ = tx.try_send(edge);
-    }
+    HUB.push_edge(edge);
+}
+
+/// Hold while mutating the process-wide input hub in tests.
+#[cfg(test)]
+pub fn with_hub_lock<R>(f: impl FnOnce() -> R) -> R {
+    HUB.with_test_lock(f)
 }
 
 /// Why the worker last published (or cleared) the input snapshot.
@@ -795,47 +914,36 @@ pub fn preferred_reading(readings: &[NavReading]) -> Option<&NavReading> {
 }
 
 /// Install the hid-worker input snapshot (called once at worker start).
+///
+/// Copies the worker's fresh snapshot into the owned hub; later worker
+/// writes go through the hub directly.
 pub fn set_input_snapshot(snapshot: Arc<Mutex<InputSnapshot>>) {
-    let _ = INPUT_SNAPSHOT.set(snapshot);
+    // A poisoned source surfaces as LockPoisoned on the next read, as before
+    // (when the old code installed the poisoned Arc itself).
+    let next = snapshot.lock().map(|g| g.clone()).unwrap_or(InputSnapshot {
+        readings: Vec::new(),
+        published_at: Instant::now(),
+        seq: 0,
+        reason: SnapshotReason::LockPoisoned,
+    });
+    if let Ok(mut dst) = HUB.snapshot.lock() {
+        *dst = next;
+    }
+}
+
+/// Direct access to the owned hub snapshot for the hid-worker hot paths.
+pub fn snapshot_mutex() -> &'static Mutex<InputSnapshot> {
+    HUB.snapshot_mutex()
+}
+
+/// Direct access to the owned input hub (worker publish path).
+pub fn input_hub() -> &'static InputHub {
+    &HUB
 }
 
 /// PadPoll entry: O(1) clone of hid-worker snapshot (never opens HID on the UI thread).
 pub fn read_nav_readings() -> NavReadingsOutcome {
-    let Some(slot) = INPUT_SNAPSHOT.get() else {
-        return NavReadingsOutcome::Missing {
-            meta: SnapshotMeta {
-                published_at: Instant::now(),
-                seq: 0,
-                reason: SnapshotReason::NeverPublished,
-                pad_count: 0,
-            },
-        };
-    };
-    let Ok(guard) = slot.lock() else {
-        return NavReadingsOutcome::Missing {
-            meta: SnapshotMeta {
-                published_at: Instant::now(),
-                seq: 0,
-                reason: SnapshotReason::LockPoisoned,
-                pad_count: 0,
-            },
-        };
-    };
-    let meta = SnapshotMeta {
-        published_at: guard.published_at,
-        seq: guard.seq,
-        reason: guard.reason,
-        pad_count: guard.readings.len(),
-    };
-    if guard.readings.is_empty() {
-        NavReadingsOutcome::Missing { meta }
-    } else {
-        log_source_once(NavSource::Hid, guard.readings.len());
-        NavReadingsOutcome::Readings {
-            readings: guard.readings.clone(),
-            meta,
-        }
-    }
+    HUB.read()
 }
 
 fn log_source_once(source: NavSource, pads: usize) {
@@ -1953,6 +2061,119 @@ mod tests {
             sample,
             source: NavSource::Hid,
         }
+    }
+
+    #[test]
+    fn input_hub_read_missing_before_publish() {
+        let hub = InputHub::new();
+        match hub.read() {
+            NavReadingsOutcome::Missing { meta } => {
+                assert_eq!(meta.seq, 0);
+                assert_eq!(meta.reason, SnapshotReason::NeverPublished);
+                assert_eq!(meta.pad_count, 0);
+            }
+            NavReadingsOutcome::Readings { .. } => panic!("expected Missing before publish"),
+        }
+    }
+
+    #[test]
+    fn input_hub_publish_then_read_bumps_seq() {
+        let hub = InputHub::new();
+        let meta = hub.publish(
+            vec![reading("hid:pad1", PadSample::default())],
+            SnapshotReason::Sample,
+        );
+        assert_eq!(meta.seq, 1);
+        assert_eq!(meta.reason, SnapshotReason::Sample);
+        assert_eq!(meta.pad_count, 1);
+        match hub.read() {
+            NavReadingsOutcome::Readings { readings, meta } => {
+                assert_eq!(readings.len(), 1);
+                assert_eq!(readings[0].id.0, "hid:pad1");
+                assert_eq!(meta.seq, 1);
+            }
+            NavReadingsOutcome::Missing { .. } => panic!("expected Readings after publish"),
+        }
+        let meta = hub.publish(Vec::new(), SnapshotReason::ClearedPowerOff);
+        assert_eq!(meta.seq, 2);
+        match hub.read() {
+            NavReadingsOutcome::Missing { meta } => {
+                assert_eq!(meta.reason, SnapshotReason::ClearedPowerOff);
+                assert_eq!(meta.seq, 2);
+            }
+            NavReadingsOutcome::Readings { .. } => panic!("expected Missing after clear publish"),
+        }
+    }
+
+    #[test]
+    fn input_hub_push_edge_without_listener_is_noop() {
+        let hub = InputHub::new();
+        let edge = InputEdge::from_snapshot(
+            Vec::new(),
+            &SnapshotMeta {
+                published_at: Instant::now(),
+                seq: 7,
+                reason: SnapshotReason::Sample,
+                pad_count: 0,
+            },
+        );
+        hub.push_edge(edge);
+    }
+
+    #[test]
+    fn input_hub_bind_push_clear_edge_bridge() {
+        let hub = InputHub::new();
+        let (tx, mut rx) = iced::futures::channel::mpsc::channel::<InputEdge>(8);
+        hub.bind(tx);
+        let edge = InputEdge::from_snapshot(
+            vec![reading("hid:pad1", PadSample::default())],
+            &SnapshotMeta {
+                published_at: Instant::now(),
+                seq: 3,
+                reason: SnapshotReason::Sample,
+                pad_count: 1,
+            },
+        );
+        hub.push_edge(edge);
+        let got = rx.try_recv().expect("edge bridged while bound");
+        assert_eq!(got.seq, 3);
+        assert_eq!(got.pad_count, 1);
+        hub.clear();
+        hub.push_edge(InputEdge::from_snapshot(
+            Vec::new(),
+            &SnapshotMeta {
+                published_at: Instant::now(),
+                seq: 4,
+                reason: SnapshotReason::Sample,
+                pad_count: 0,
+            },
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn input_hub_global_shims_roundtrip() {
+        with_hub_lock(|| {
+            // Reset through the worker-start shim, then publish through the hub.
+            set_input_snapshot(Arc::new(Mutex::new(InputSnapshot::default())));
+            assert!(matches!(
+                read_nav_readings(),
+                NavReadingsOutcome::Missing { .. }
+            ));
+            input_hub().publish(
+                vec![reading("hid:pad1", PadSample::default())],
+                SnapshotReason::Sample,
+            );
+            match read_nav_readings() {
+                NavReadingsOutcome::Readings { readings, meta } => {
+                    assert_eq!(readings.len(), 1);
+                    assert_eq!(meta.seq, 1);
+                }
+                NavReadingsOutcome::Missing { .. } => panic!("expected Readings after publish"),
+            }
+            // Leave the shared hub clean for other tests.
+            set_input_snapshot(Arc::new(Mutex::new(InputSnapshot::default())));
+        });
     }
 
     fn chord_sample(controls: &[GestureControl]) -> PadSample {
