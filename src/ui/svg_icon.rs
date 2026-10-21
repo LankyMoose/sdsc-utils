@@ -3,7 +3,7 @@
 use resvg::tiny_skia;
 use resvg::usvg;
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
 pub const DUALSENSE_SVG: &str = include_str!("../../assets/icons/dualsense.svg");
 pub const SETTINGS_SVG: &str = include_str!("../../assets/icons/settings.svg");
@@ -132,9 +132,12 @@ struct CacheKey {
 
 /// Owned SVG raster cache.
 ///
-/// Future injection point owned by the Start image layer: construct one
-/// `SvgRasterCache` there and pass `&SvgRasterCache` down instead of using the
-/// process-global `RASTER_CACHE` shim below.
+/// Owned by the Start image layer
+/// ([`crate::ui::start::icon_cache::IconCache`]: constructed in
+/// `IconCache::new`, wiped on process Exit) — no process-global instance.
+/// Runtime tray / iced views use `svg::Handle::from_memory` directly; the
+/// build-time embed (`build.rs`, `gen_msix_logos`) rasterizes through a
+/// short-lived local instance via the `render_dualsense_*` helpers below.
 pub struct SvgRasterCache {
     inner: Mutex<HashMap<CacheKey, Vec<u8>>>,
 }
@@ -184,16 +187,18 @@ impl Default for SvgRasterCache {
     }
 }
 
-static RASTER_CACHE: LazyLock<SvgRasterCache> = LazyLock::new(SvgRasterCache::new);
-
-/// Drop every cached SVG raster (process Exit).
-pub fn clear_cache() {
-    RASTER_CACHE.clear_all();
+#[allow(dead_code)] // used by build.rs
+pub fn render_dualsense_connected_rgba(size: u32) -> Result<Vec<u8>, String> {
+    SvgRasterCache::new().rasterize(
+        DUALSENSE_SVG,
+        size,
+        &ColorMap::dualsense_connected(RgbaColor::from_rgba(ACCENT)),
+    )
 }
 
-/// Rasterize an SVG into straight RGBA (`size × size × 4`).
-pub fn rasterize(svg: &str, size: u32, colors: &ColorMap) -> Result<Vec<u8>, String> {
-    RASTER_CACHE.rasterize(svg, size, colors)
+#[allow(dead_code)] // used by build.rs
+pub fn render_dualsense_dim_rgba(size: u32) -> Result<Vec<u8>, String> {
+    SvgRasterCache::new().rasterize(DUALSENSE_SVG, size, &ColorMap::dualsense_dim())
 }
 
 fn rasterize_uncached(svg: &str, size: u32, colors: &ColorMap) -> Result<Vec<u8>, String> {
@@ -234,32 +239,19 @@ fn straight_rgba_from_premultiplied(premul: &[u8]) -> Vec<u8> {
     out
 }
 
-#[allow(dead_code)] // used by build.rs
-pub fn render_dualsense_connected_rgba(size: u32) -> Result<Vec<u8>, String> {
-    rasterize(
-        DUALSENSE_SVG,
-        size,
-        &ColorMap::dualsense_connected(RgbaColor::from_rgba(ACCENT)),
-    )
-}
-
-#[allow(dead_code)] // used by build.rs
-pub fn render_dualsense_dim_rgba(size: u32) -> Result<Vec<u8>, String> {
-    rasterize(DUALSENSE_SVG, size, &ColorMap::dualsense_dim())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn power_svg_rasterizes_with_alpha() {
-        let rgba = rasterize(
-            POWER_SVG,
-            24,
-            &ColorMap::current_color(RgbaColor::rgb(170, 178, 189)),
-        )
-        .unwrap();
+        let rgba = SvgRasterCache::new()
+            .rasterize(
+                POWER_SVG,
+                24,
+                &ColorMap::current_color(RgbaColor::rgb(170, 178, 189)),
+            )
+            .unwrap();
         assert_eq!(rgba.len(), 24 * 24 * 4);
         assert!(rgba.as_chunks::<4>().0.iter().any(|px| px[3] > 0));
         assert!(rgba.as_chunks::<4>().0.iter().any(|px| px[3] == 0));
@@ -267,18 +259,21 @@ mod tests {
 
     #[test]
     fn dualsense_palette_swap_changes_accent() {
-        let blue = rasterize(
-            DUALSENSE_SVG,
-            32,
-            &ColorMap::dualsense_connected(RgbaColor::rgb(0, 90, 255)),
-        )
-        .unwrap();
-        let red = rasterize(
-            DUALSENSE_SVG,
-            32,
-            &ColorMap::dualsense_connected(RgbaColor::rgb(255, 0, 0)),
-        )
-        .unwrap();
+        let cache = SvgRasterCache::new();
+        let blue = cache
+            .rasterize(
+                DUALSENSE_SVG,
+                32,
+                &ColorMap::dualsense_connected(RgbaColor::rgb(0, 90, 255)),
+            )
+            .unwrap();
+        let red = cache
+            .rasterize(
+                DUALSENSE_SVG,
+                32,
+                &ColorMap::dualsense_connected(RgbaColor::rgb(255, 0, 0)),
+            )
+            .unwrap();
         assert_eq!(blue.len(), 32 * 32 * 4);
         assert!(blue.as_chunks::<4>().0.iter().any(|px| px[3] > 0));
         assert_ne!(blue, red);
