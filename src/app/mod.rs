@@ -20,7 +20,9 @@ use crate::controller::hid::poll::{
 };
 use crate::controller::hid::worker::HidWorkerHandle;
 use crate::controller::known::KnownControllers;
-use crate::controller::model::{Connection, ControllerStatus};
+#[cfg(debug_assertions)]
+use crate::controller::model::Connection;
+use crate::controller::model::ControllerStatus;
 use crate::games::launch;
 use crate::games::process_match::{self, RunningSession};
 use crate::games::steam::{self, SteamGame};
