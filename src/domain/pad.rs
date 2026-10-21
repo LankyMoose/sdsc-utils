@@ -7,7 +7,7 @@
 use crate::domain::gesture::{GestureControl, GestureDetector};
 use hidapi::HidDevice;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Per-axis deadzone applied to each stick before combining (kills rest bias).
@@ -28,15 +28,13 @@ pub const INPUT_REPORT_WAIT_MS: i32 = 4;
 /// Owned pad-input unit: the hid-worker publication (snapshot) plus the
 /// async edge bridge the iced subscription drains.
 ///
-/// Future injection point: construct one `InputHub` in the HID worker /
-/// app root and pass `&InputHub` down instead of using the process-global
-/// [`HUB`] shim below.
+/// Owned by [`crate::controller::hid::worker::HidWorkerHandle`] (one `Arc`
+/// clone moves into the worker thread) and by [`crate::app::App`]; call sites
+/// take `&InputHub` / `&Arc<InputHub>` — no process-global instance.
 pub struct InputHub {
     snapshot: Mutex<InputSnapshot>,
     /// Async bridge: hid-worker `try_send`s edges; iced subscription drains them.
     edge_tx: Mutex<Option<iced::futures::channel::mpsc::Sender<InputEdge>>>,
-    #[cfg(test)]
-    test_lock: Mutex<()>,
 }
 
 impl InputHub {
@@ -44,8 +42,6 @@ impl InputHub {
         Self {
             snapshot: Mutex::new(InputSnapshot::default()),
             edge_tx: Mutex::new(None),
-            #[cfg(test)]
-            test_lock: Mutex::new(()),
         }
     }
 
@@ -131,17 +127,6 @@ impl InputHub {
             let _ = tx.try_send(edge);
         }
     }
-
-    /// Hold while mutating the process-wide hub in tests (avoids races with
-    /// parallel tests that publish/read the shared hub).
-    ///
-    /// Owns the test lock that the free [`with_hub_lock`] shim delegates to,
-    /// so existing call sites keep working unchanged.
-    #[cfg(test)]
-    pub fn with_test_lock<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _guard = self.test_lock.lock().unwrap_or_else(|e| e.into_inner());
-        f()
-    }
 }
 
 impl Default for InputHub {
@@ -150,8 +135,13 @@ impl Default for InputHub {
     }
 }
 
-// Thin compat shim: process-global instance until call sites take `&InputHub`.
-static HUB: LazyLock<InputHub> = LazyLock::new(InputHub::new);
+impl std::hash::Hash for InputHub {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Subscription identity: `Arc` clones share the heap allocation, so
+        // hash the allocation address (stable across clones, distinct per hub).
+        (self as *const Self as usize).hash(state);
+    }
+}
 
 /// One pad-input publication from the hid-worker (replaces UI PadPoll timer).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -180,27 +170,6 @@ impl InputEdge {
             pad_count: self.pad_count,
         }
     }
-}
-
-/// Install the iced-side sender so the worker can push edges (subscription start).
-pub fn bind_input_edge_sender(tx: iced::futures::channel::mpsc::Sender<InputEdge>) {
-    HUB.bind(tx);
-}
-
-/// Clear the iced-side sender (subscription end / shutdown).
-pub fn clear_input_edge_sender() {
-    HUB.clear();
-}
-
-/// Push a sample edge to the UI bridge (no-op when nothing is listening).
-pub fn push_input_edge(edge: InputEdge) {
-    HUB.push_edge(edge);
-}
-
-/// Hold while mutating the process-wide input hub in tests.
-#[cfg(test)]
-pub fn with_hub_lock<R>(f: impl FnOnce() -> R) -> R {
-    HUB.with_test_lock(f)
 }
 
 /// Why the worker last published (or cleared) the input snapshot.
@@ -911,39 +880,6 @@ pub fn preferred_reading(readings: &[NavReading]) -> Option<&NavReading> {
         .iter()
         .find(|r| !sample_nav_resting(&r.sample))
         .or_else(|| readings.first())
-}
-
-/// Install the hid-worker input snapshot (called once at worker start).
-///
-/// Copies the worker's fresh snapshot into the owned hub; later worker
-/// writes go through the hub directly.
-pub fn set_input_snapshot(snapshot: Arc<Mutex<InputSnapshot>>) {
-    // A poisoned source surfaces as LockPoisoned on the next read, as before
-    // (when the old code installed the poisoned Arc itself).
-    let next = snapshot.lock().map(|g| g.clone()).unwrap_or(InputSnapshot {
-        readings: Vec::new(),
-        published_at: Instant::now(),
-        seq: 0,
-        reason: SnapshotReason::LockPoisoned,
-    });
-    if let Ok(mut dst) = HUB.snapshot.lock() {
-        *dst = next;
-    }
-}
-
-/// Direct access to the owned hub snapshot for the hid-worker hot paths.
-pub fn snapshot_mutex() -> &'static Mutex<InputSnapshot> {
-    HUB.snapshot_mutex()
-}
-
-/// Direct access to the owned input hub (worker publish path).
-pub fn input_hub() -> &'static InputHub {
-    &HUB
-}
-
-/// PadPoll entry: O(1) clone of hid-worker snapshot (never opens HID on the UI thread).
-pub fn read_nav_readings() -> NavReadingsOutcome {
-    HUB.read()
 }
 
 fn log_source_once(source: NavSource, pads: usize) {
@@ -2149,31 +2085,6 @@ mod tests {
             },
         ));
         assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn input_hub_global_shims_roundtrip() {
-        with_hub_lock(|| {
-            // Reset through the worker-start shim, then publish through the hub.
-            set_input_snapshot(Arc::new(Mutex::new(InputSnapshot::default())));
-            assert!(matches!(
-                read_nav_readings(),
-                NavReadingsOutcome::Missing { .. }
-            ));
-            input_hub().publish(
-                vec![reading("hid:pad1", PadSample::default())],
-                SnapshotReason::Sample,
-            );
-            match read_nav_readings() {
-                NavReadingsOutcome::Readings { readings, meta } => {
-                    assert_eq!(readings.len(), 1);
-                    assert_eq!(meta.seq, 1);
-                }
-                NavReadingsOutcome::Missing { .. } => panic!("expected Readings after publish"),
-            }
-            // Leave the shared hub clean for other tests.
-            set_input_snapshot(Arc::new(Mutex::new(InputSnapshot::default())));
-        });
     }
 
     fn chord_sample(controls: &[GestureControl]) -> PadSample {

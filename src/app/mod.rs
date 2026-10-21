@@ -14,6 +14,7 @@ mod toast;
 use crate::controller::dualsense::lightbar;
 use crate::controller::dualsense::rumble::MotorPulse;
 use crate::domain::color::SpectrumService;
+use crate::domain::pad::InputHub;
 
 #[cfg(debug_assertions)]
 use crate::controller::emulate;
@@ -367,6 +368,9 @@ pub struct App {
     /// Owned battery spectrum shared with the HID worker (clone-then-release
     /// reads; never held across HID writes).
     spectrum: SpectrumService,
+    /// Owned pad-input hub shared with the HID worker thread and the
+    /// pad-input subscription (no process-global).
+    input_hub: Arc<InputHub>,
 
     tray_icon: Option<TrayIcon>,
     tray_anchor: TrayAnchor,
@@ -653,6 +657,7 @@ impl App {
 
         let hid_worker = HidWorkerHandle::start(spectrum.clone());
         let identifying = hid_worker.identifying();
+        let input_hub = hid_worker.input_hub();
 
         let configure_state = ConfigureState::new(prefs.spectrum.clone());
 
@@ -695,6 +700,7 @@ impl App {
             absence_recheck_pending: false,
             hid_worker,
             spectrum,
+            input_hub,
             tray_icon: None,
             tray_anchor: TrayAnchor::default(),
             popup_window: None,
@@ -817,7 +823,7 @@ impl App {
         // Show the tray immediately; the daemon owns it for its whole lifetime.
         app.create_tray();
         #[cfg(all(windows, debug_assertions))]
-        start_hitch_hotkey_worker();
+        start_hitch_hotkey_worker(app.input_hub.clone());
         app.sync_popup_rows();
         app.sync_low_battery();
         app.refresh_analytics_panel();
@@ -1070,7 +1076,10 @@ impl App {
             || (self.session.prefs.start_screen_enabled && !self.session.controllers.is_empty());
         self.hid_worker.set_input_hot(pad_listening);
         if pad_listening {
-            subscriptions.push(Subscription::run(pad_input_edge_stream));
+            subscriptions.push(Subscription::run_with(
+                self.input_hub.clone(),
+                pad_input_edge_stream,
+            ));
         }
 
         if self.start_visible && (self.start_state.needs_frames() || self.steam_scan_in_flight()) {
@@ -1909,7 +1918,9 @@ impl App {
                 }
                 let _ = crate::ui::start::icon_cache::bump_art_warm_generation();
                 crate::ui::start::art_worker::shutdown();
-                crate::domain::pad::clear_input_edge_sender();
+                // Idempotent with `InputEdgeBindGuard::drop` (subscription
+                // teardown also clears).
+                self.input_hub.clear();
                 self.hid_worker.shutdown();
                 self.tray_icon.take();
                 crate::controller::hid::diag::diag_info("ui-diag: process exit complete");
@@ -4255,7 +4266,7 @@ impl App {
 
     /// Mark the live reopen chord as already matched so a sticky hold cannot fire.
     fn consume_reopen_gesture_chord(&mut self) {
-        match start_input::read_nav_readings() {
+        match self.input_hub.read() {
             start_input::NavReadingsOutcome::Readings { readings, .. } => {
                 self.gesture_detectors.consume_pending_match(&readings);
             }
@@ -4465,6 +4476,7 @@ impl App {
         let nav_ready = self.start_nav_ready;
         let controllers = self.session.controllers.len();
         stamp_hitch_report(
+            &self.input_hub,
             kind,
             "button",
             Some(format!(
@@ -5753,13 +5765,14 @@ fn tray_events_mapped() -> impl Stream<Item = Message> {
 }
 
 /// Bind the hid-worker → iced pad-input edge channel while listening.
-fn pad_input_edge_stream() -> impl Stream<Item = Message> {
+fn pad_input_edge_stream(hub: &Arc<InputHub>) -> impl Stream<Item = Message> + Send + use<> {
     // Deep enough to ride out Start-frame hitches without dropping taps:
     // the worker publishes at report rate while hot.
+    let hub = Arc::clone(hub);
     stream::channel(128, async move |mut output| {
         let (tx, mut rx) = iced::futures::channel::mpsc::channel(128);
-        start_input::bind_input_edge_sender(tx);
-        let _guard = InputEdgeBindGuard;
+        hub.bind(tx);
+        let _guard = InputEdgeBindGuard { hub: hub.clone() };
         while let Some(first) = rx.next().await {
             // Conflate to the latest buffered edge: readings are absolute
             // state, so intermediates are stale by definition. Without this,
@@ -5780,10 +5793,14 @@ fn pad_input_edge_stream() -> impl Stream<Item = Message> {
     })
 }
 
-struct InputEdgeBindGuard;
+struct InputEdgeBindGuard {
+    hub: Arc<InputHub>,
+}
 impl Drop for InputEdgeBindGuard {
     fn drop(&mut self) {
-        start_input::clear_input_edge_sender();
+        // Idempotent with the `Message::Exit` clear below (clearing an
+        // unbound hub is a no-op).
+        self.hub.clear();
     }
 }
 
@@ -5841,8 +5858,8 @@ fn presence_hint_stream() -> impl Stream<Item = Message> {
 /// Hitch context: the owned input hub snapshot (`InputHub`) is the
 /// single source F7/F8 stamps read from (safe off the UI thread).
 #[cfg(debug_assertions)]
-fn stamp_hitch_report(kind: &str, source: &str, extra: Option<String>) {
-    let (pads, reason, age_ms, seq) = match start_input::read_nav_readings() {
+fn stamp_hitch_report(hub: &InputHub, kind: &str, source: &str, extra: Option<String>) {
+    let (pads, reason, age_ms, seq) = match hub.read() {
         start_input::NavReadingsOutcome::Readings { readings, meta } => (
             readings.len(),
             meta.reason.as_str(),
@@ -5866,11 +5883,11 @@ fn stamp_hitch_report(kind: &str, source: &str, extra: Option<String>) {
 /// Global F7 / F8 hitch markers — own Win32 message pump so marks still land if iced is stuck.
 /// Debug builds only (`cfg(debug_assertions)`).
 #[cfg(all(windows, debug_assertions))]
-fn start_hitch_hotkey_worker() {
+fn start_hitch_hotkey_worker(hub: Arc<InputHub>) {
     use std::sync::OnceLock;
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
-        thread::spawn(|| unsafe {
+        thread::spawn(move || unsafe {
             if win32::RegisterHotKey(
                 0,
                 win32::HOTKEY_ID_LIGHTBAR_HITCH,
@@ -5907,7 +5924,7 @@ fn start_hitch_hotkey_worker() {
                     continue;
                 };
                 // Stamp immediately on this thread — do not wait for iced.
-                stamp_hitch_report(kind, "hotkey", None);
+                stamp_hitch_report(&hub, kind, "hotkey", None);
             }
 
             win32::UnregisterHotKey(0, win32::HOTKEY_ID_LIGHTBAR_HITCH);

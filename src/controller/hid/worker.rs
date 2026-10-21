@@ -36,8 +36,7 @@ use crate::controller::hid::poll::{
 use crate::controller::model::ControllerStatus;
 use crate::domain::color::{Rgb, SpectrumService};
 use crate::domain::pad::{
-    self as start_input, InputSnapshot, NavReading, ShortSampleOutcome, SnapshotMeta,
-    SnapshotReason,
+    self as start_input, InputHub, NavReading, ShortSampleOutcome, SnapshotMeta, SnapshotReason,
 };
 use crate::platform::app_log;
 use hidapi::{BusType, HidApi, HidDevice};
@@ -834,6 +833,9 @@ pub struct HidWorkerHandle {
     /// Serials resolved from HID paths present at first enum (suppress Connected toast).
     launch_serials: Arc<Mutex<Vec<String>>>,
     spectrum: SpectrumService,
+    /// Owned pad-input publication + edge bridge shared with the worker thread
+    /// and the iced subscription (no process-global).
+    input_hub: Arc<InputHub>,
 }
 
 impl HidWorkerHandle {
@@ -850,9 +852,9 @@ impl HidWorkerHandle {
         let launch_serials = Arc::new(Mutex::new(Vec::new()));
         let launch_serials_worker = Arc::clone(&launch_serials);
         let spectrum_worker = spectrum.clone();
-        // Fresh worker start resets the owned input hub (seq restarts at 0).
-        start_input::set_input_snapshot(Arc::new(Mutex::new(InputSnapshot::default())));
-        let input_snapshot = start_input::snapshot_mutex();
+        // Fresh worker start owns a new input hub (seq restarts at 0).
+        let input_hub = Arc::new(InputHub::new());
+        let input_hub_worker = Arc::clone(&input_hub);
         let last_noisy_log = Arc::new(Mutex::new(Instant::now() - PULSE_SAMPLE_LOG_INTERVAL));
         let last_noisy_log_worker = Arc::clone(&last_noisy_log);
 
@@ -865,7 +867,7 @@ impl HidWorkerHandle {
                     identifying_worker,
                     input_hot_worker,
                     last_noisy_log_worker,
-                    input_snapshot,
+                    input_hub_worker,
                     presence_worker,
                     live_pads_worker,
                     launch_serials_worker,
@@ -882,6 +884,7 @@ impl HidWorkerHandle {
             live_pads,
             launch_serials,
             spectrum,
+            input_hub,
         };
         // OS arrival/removal watcher (Windows/Linux; no-op elsewhere): fires
         // throttled list-only refresh hints so hot enumeration cannot freeze
@@ -903,6 +906,11 @@ impl HidWorkerHandle {
     /// Owned battery spectrum shared with the worker thread.
     pub fn spectrum(&self) -> SpectrumService {
         self.spectrum.clone()
+    }
+
+    /// Owned pad-input hub shared with the worker thread and the iced subscription.
+    pub fn input_hub(&self) -> Arc<InputHub> {
+        Arc::clone(&self.input_hub)
     }
 
     /// Latest DualSense gamepad HID paths from the worker's throttled refresh.
@@ -1165,15 +1173,15 @@ enum SampleOneResult {
     HardFail,
 }
 
-fn snapshot_age_ms(snapshot: &Mutex<InputSnapshot>) -> u128 {
-    snapshot
+fn snapshot_age_ms(hub: &InputHub) -> u128 {
+    hub.snapshot_mutex()
         .lock()
         .map(|g| g.published_at.elapsed().as_millis())
         .unwrap_or(0)
 }
 
 fn publish_snapshot(
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     readings: Vec<NavReading>,
     reason: SnapshotReason,
     after_cmd: Option<&str>,
@@ -1181,17 +1189,21 @@ fn publish_snapshot(
     emit_edge: bool,
 ) {
     let _op = crate::controller::hid::diag::enter_op("publish_snapshot");
-    let prev_pads = snapshot.lock().map(|g| g.readings.len()).unwrap_or(0);
-    let gap_ms = snapshot_age_ms(snapshot);
+    let prev_pads = hub
+        .snapshot_mutex()
+        .lock()
+        .map(|g| g.readings.len())
+        .unwrap_or(0);
+    let gap_ms = snapshot_age_ms(hub);
     let was_empty = prev_pads == 0;
     let now_empty = readings.is_empty();
     let pad_count = readings.len();
 
     // Store through the owned hub (single snapshot lock for write + meta, as before).
-    let meta = start_input::input_hub().publish(readings.clone(), reason);
+    let meta = hub.publish(readings.clone(), reason);
 
     if emit_edge {
-        start_input::push_input_edge(start_input::InputEdge::from_snapshot(readings, &meta));
+        hub.push_edge(start_input::InputEdge::from_snapshot(readings, &meta));
     }
 
     let clearing = matches!(
@@ -1230,7 +1242,7 @@ fn presence_enum_interval(devices_empty: bool, input_hot: bool) -> Duration {
 fn sample_all_inputs(
     cache: &mut DeviceCache,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     input_hot: bool,
     last_noisy_log: &Mutex<Instant>,
     after_cmd: Option<&str>,
@@ -1241,7 +1253,8 @@ fn sample_all_inputs(
     let serials: Vec<String> = cache.devices.keys().cloned().collect();
     prune_live_pads(live_pads, &serials);
     let cached = serials.len();
-    let prev_by_id: HashMap<String, NavReading> = snapshot
+    let prev_by_id: HashMap<String, NavReading> = hub
+        .snapshot_mutex()
         .lock()
         .map(|g| {
             g.readings
@@ -1284,7 +1297,7 @@ fn sample_all_inputs(
             ));
         }
     }
-    publish_snapshot(snapshot, out, reason, after_cmd, last_noisy_log, input_hot);
+    publish_snapshot(hub, out, reason, after_cmd, last_noisy_log, input_hot);
     let sample_ms = sample_started.elapsed().as_millis();
     if after_ensure_ms >= 50 || sample_ms >= 50 {
         crate::controller::hid::diag::diag_info(format!(
@@ -1298,13 +1311,13 @@ fn sample_all_inputs(
 fn sample_serial_into_snapshot(
     cache: &mut DeviceCache,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     serial: &str,
     input_hot: bool,
 ) {
     match sample_one(cache, live_pads, serial, input_hot) {
         SampleOneResult::Ok(reading) => {
-            let edge = if let Ok(mut guard) = snapshot.lock() {
+            let edge = if let Ok(mut guard) = hub.snapshot_mutex().lock() {
                 guard.seq = guard.seq.saturating_add(1);
                 guard.published_at = Instant::now();
                 guard.reason = SnapshotReason::Identify;
@@ -1326,22 +1339,22 @@ fn sample_serial_into_snapshot(
                 None
             };
             if input_hot && let Some(edge) = edge {
-                start_input::push_input_edge(edge);
+                hub.push_edge(edge);
             }
         }
         SampleOneResult::Timeout | SampleOneResult::Silent | SampleOneResult::HardFail => {}
     }
 }
 
-fn log_cmd_begin(cmd: &str, snapshot: &Mutex<InputSnapshot>) {
-    let since_pub_ms = snapshot_age_ms(snapshot);
+fn log_cmd_begin(cmd: &str, hub: &InputHub) {
+    let since_pub_ms = snapshot_age_ms(hub);
     crate::controller::hid::diag::diag_info(format!(
         "hid-diag: cmd begin={cmd} since_publish_ms={since_pub_ms}"
     ));
 }
 
 fn maybe_log_sample_stall(
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     input_hot: bool,
     in_cmd: &str,
     stall_logged: &mut bool,
@@ -1351,7 +1364,7 @@ fn maybe_log_sample_stall(
         *stall_logged = false;
         return;
     }
-    let gap_ms = snapshot_age_ms(snapshot);
+    let gap_ms = snapshot_age_ms(hub);
     if gap_ms < SAMPLE_STALL_MS {
         *stall_logged = false;
         return;
@@ -1379,7 +1392,7 @@ fn begin_identify(
     cache: &mut DeviceCache,
     spectrum: &SpectrumService,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     serial: String,
     percent: u8,
     identifying: &AtomicBool,
@@ -1387,7 +1400,7 @@ fn begin_identify(
     input_hot: bool,
 ) -> Option<IdentifySession> {
     let normal = spectrum.color_at(percent);
-    log_cmd_begin("Identify", snapshot);
+    log_cmd_begin("Identify", hub);
     let started = Instant::now();
     let (result, timing) = {
         let _op = crate::controller::hid::diag::enter_op("cmd_Identify");
@@ -1406,7 +1419,7 @@ fn begin_identify(
         identifying.store(false, Ordering::SeqCst);
         return None;
     }
-    sample_serial_into_snapshot(cache, live_pads, snapshot, &serial, input_hot);
+    sample_serial_into_snapshot(cache, live_pads, hub, &serial, input_hot);
     Some(IdentifySession {
         serial,
         normal,
@@ -1422,7 +1435,7 @@ fn advance_identify(
     session: &mut Option<IdentifySession>,
     cache: &mut DeviceCache,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     identifying: &AtomicBool,
     last_noisy_log: &Mutex<Instant>,
     input_hot: bool,
@@ -1449,7 +1462,7 @@ fn advance_identify(
         sample_all_inputs(
             cache,
             live_pads,
-            snapshot,
+            hub,
             input_hot,
             last_noisy_log,
             Some("Identify"),
@@ -1457,7 +1470,7 @@ fn advance_identify(
         return;
     }
 
-    log_cmd_begin("IdentifyFlash", snapshot);
+    log_cmd_begin("IdentifyFlash", hub);
     let color = identify_flash_color(s.next_write, s.normal);
     let serial = s.serial.clone();
     let (result, t) = {
@@ -1481,7 +1494,7 @@ fn advance_identify(
         identifying.store(false, Ordering::SeqCst);
         return;
     }
-    sample_serial_into_snapshot(cache, live_pads, snapshot, &serial, input_hot);
+    sample_serial_into_snapshot(cache, live_pads, hub, &serial, input_hot);
     s.next_write += 1;
     s.wake_at = Instant::now() + Duration::from_millis(IDENTIFY_FLASH_MS);
 }
@@ -1614,7 +1627,7 @@ fn execute_power_off(
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
     rumble: &mut RumbleCache,
     active_rumble: &mut Vec<ActiveRumble>,
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     identifying: &AtomicBool,
     last_noisy_log: &Mutex<Instant>,
     input_hot: bool,
@@ -1626,7 +1639,8 @@ fn execute_power_off(
     // Exclusive feature-report open needs this pad's input handle released only.
     cache.drop_serial(serial);
     forget_live_pad(live_pads, serial);
-    let remaining = snapshot
+    let remaining = hub
+        .snapshot_mutex()
         .lock()
         .map(|g| readings_without_power_off_target(g.readings.clone(), serial))
         .unwrap_or_default();
@@ -1641,14 +1655,14 @@ fn execute_power_off(
         SnapshotReason::SamplePartial
     };
     publish_snapshot(
-        snapshot,
+        hub,
         remaining,
         reason,
         Some("PowerOff"),
         last_noisy_log,
         input_hot,
     );
-    log_cmd_begin("PowerOff", snapshot);
+    log_cmd_begin("PowerOff", hub);
     let started = Instant::now();
     let (result, timing) = {
         let _ = cache.refresh_device_list();
@@ -1679,7 +1693,7 @@ fn handle_cmd(
     active_rumble: &mut Vec<ActiveRumble>,
     pending_power_off: &mut Option<PendingPowerOff>,
     pulse: &mut LowBatteryPulse,
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     identifying: &AtomicBool,
     last_noisy_log: &Mutex<Instant>,
     input_hot: bool,
@@ -1696,7 +1710,7 @@ fn handle_cmd(
                 guard.clear();
             }
             publish_snapshot(
-                snapshot,
+                hub,
                 Vec::new(),
                 SnapshotReason::ClearedShutdown,
                 Some("Shutdown"),
@@ -1712,7 +1726,7 @@ fn handle_cmd(
                 cache,
                 spectrum,
                 live_pads,
-                snapshot,
+                hub,
                 serial,
                 percent,
                 identifying,
@@ -1743,7 +1757,7 @@ fn handle_cmd(
                 live_pads,
                 rumble,
                 active_rumble,
-                snapshot,
+                hub,
                 identifying,
                 last_noisy_log,
                 input_hot,
@@ -1754,7 +1768,7 @@ fn handle_cmd(
             if session.as_ref().is_some_and(|s| s.serial == serial) {
                 return false;
             }
-            log_cmd_begin("SetRgb", snapshot);
+            log_cmd_begin("SetRgb", hub);
             let started = Instant::now();
             let (result, timing) = write_rgb_exclusive(cache, &serial, color);
             if let Err(err) = result {
@@ -1825,7 +1839,7 @@ fn handle_cmd(
             // Continuous sampling already reaps dead handles (HardFail), the
             // session hold covers transient read misses, and rumble re-probes
             // on write failure — no mass drop needed.
-            log_cmd_begin("Poll", snapshot);
+            log_cmd_begin("Poll", hub);
             let started = Instant::now();
             let mut quiet = Vec::new();
             let (result, timing) = {
@@ -2053,7 +2067,7 @@ fn worker_loop(
     identifying: Arc<AtomicBool>,
     input_hot: Arc<AtomicBool>,
     last_noisy_log: Arc<Mutex<Instant>>,
-    input_snapshot: &'static Mutex<InputSnapshot>,
+    input_hub: Arc<InputHub>,
     presence: Arc<Mutex<Vec<String>>>,
     live_pads: Arc<Mutex<HashMap<String, LivePadStatus>>>,
     launch_serials: Arc<Mutex<Vec<String>>>,
@@ -2092,7 +2106,7 @@ fn worker_loop(
                 &live_pads,
                 &mut rumble,
                 &mut active_rumble,
-                input_snapshot,
+                &input_hub,
                 &identifying,
                 &last_noisy_log,
                 hot,
@@ -2102,13 +2116,7 @@ fn worker_loop(
         if pulse.tick(&mut cache, &spectrum, identifying_now, now) {
             in_cmd = "LowBatteryPulse";
         }
-        maybe_log_sample_stall(
-            input_snapshot,
-            hot,
-            in_cmd,
-            &mut stall_logged,
-            &last_noisy_log,
-        );
+        maybe_log_sample_stall(&input_hub, hot, in_cmd, &mut stall_logged, &last_noisy_log);
 
         if session
             .as_ref()
@@ -2119,7 +2127,7 @@ fn worker_loop(
                 &mut session,
                 &mut cache,
                 &live_pads,
-                input_snapshot,
+                &input_hub,
                 &identifying,
                 &last_noisy_log,
                 hot,
@@ -2155,7 +2163,7 @@ fn worker_loop(
                     &mut active_rumble,
                     &mut pending_power_off,
                     &mut pulse,
-                    input_snapshot,
+                    &input_hub,
                     &identifying,
                     &last_noisy_log,
                     hot,
@@ -2187,7 +2195,7 @@ fn worker_loop(
                     .wake_at
                     .saturating_duration_since(Instant::now())
                     .min(IDENTIFY_SAMPLE_POLL);
-                sample_serial_into_snapshot(&mut cache, &live_pads, input_snapshot, &serial, hot);
+                sample_serial_into_snapshot(&mut cache, &live_pads, &input_hub, &serial, hot);
                 if !until_flash.is_zero() {
                     thread::sleep(until_flash.min(ACTIVE_POLL));
                 }
@@ -2195,7 +2203,7 @@ fn worker_loop(
                 sample_all_inputs(
                     &mut cache,
                     &live_pads,
-                    input_snapshot,
+                    &input_hub,
                     hot,
                     &last_noisy_log,
                     None,
@@ -2245,7 +2253,7 @@ fn worker_loop(
                     &mut active_rumble,
                     &mut pending_power_off,
                     &mut pulse,
-                    input_snapshot,
+                    &input_hub,
                     &identifying,
                     &last_noisy_log,
                     hot,
