@@ -3,20 +3,14 @@
 use serde::{Deserialize, Serialize};
 
 /// Family of gamepad this status describes.
+///
+/// Single variant today; kept as an enum (not a unit struct) so future
+/// families slot in without churning every constructor and match site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ControllerKind {
     #[default]
     DualSense,
-}
-
-impl ControllerKind {
-    #[allow(dead_code)]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::DualSense => "DualSense",
-        }
-    }
 }
 
 /// How the pad is attached to the host.

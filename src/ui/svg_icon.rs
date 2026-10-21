@@ -11,8 +11,6 @@ pub const IDENTIFY_SVG: &str = include_str!("../../assets/icons/identify.svg");
 pub const POWER_SVG: &str = include_str!("../../assets/icons/power.svg");
 pub const EDIT_SVG: &str = include_str!("../../assets/icons/edit.svg");
 pub const CLOSE_SVG: &str = include_str!("../../assets/icons/close.svg");
-#[allow(dead_code)] // available for title-bar chrome
-pub const MINIMIZE_SVG: &str = include_str!("../../assets/icons/minimize.svg");
 pub const CHECK_SVG: &str = include_str!("../../assets/icons/check.svg");
 pub const PIN_SVG: &str = include_str!("../../assets/icons/pin.svg");
 pub const FACE_CROSS_SVG: &str = include_str!("../../assets/icons/face-cross.svg");
@@ -24,10 +22,8 @@ pub const BUG_SVG: &str = include_str!("../../assets/icons/bug.svg");
 pub const GITHUB_SVG: &str = include_str!("../../assets/icons/github.svg");
 pub const MICROSOFT_STORE_SVG: &str = include_str!("../../assets/icons/microsoft-store.svg");
 /// Indeterminate arc; rotated by [`crate::ui::configure`] for pending states.
-#[allow(dead_code)] // debug-only pending indicator
 pub const SPINNER_SVG: &str = include_str!("../../assets/icons/spinner.svg");
 /// Disclosure chevron; rotated 90° when a row is expanded.
-#[allow(dead_code)] // debug-only disclosure control
 pub const CHEVRON_SVG: &str = include_str!("../../assets/icons/chevron.svg");
 
 /// Canonical DualSense body fill in [`DUALSENSE_SVG`].
@@ -41,7 +37,10 @@ pub const BODY: [u8; 4] = [235, 235, 240, 255];
 pub const BODY_DIM: [u8; 4] = [120, 120, 128, 255];
 pub const SHADE: [u8; 4] = [40, 40, 48, 255];
 pub const SHADE_DIM: [u8; 4] = [70, 70, 78, 255];
-#[allow(dead_code)] // used by build.rs / connected tray embed
+/// Canonical accent fill for the connected DualSense tray/EXE icon.
+///
+/// Read by [`render_dualsense_connected_rgba`], which rasterizes the icons
+/// embedded by `build.rs` (tray + Windows `.exe`) and `gen_msix_logos`.
 pub const ACCENT: [u8; 4] = [0, 90, 255, 255];
 pub const ACCENT_DIM: [u8; 4] = [80, 80, 90, 255];
 
@@ -54,7 +53,7 @@ pub struct RgbaColor {
 }
 
 impl RgbaColor {
-    #[allow(dead_code)]
+    /// Opaque color helper (unit tests; production palettes use [`Self::from_rgba`]).
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b, a: 255 }
     }
@@ -79,7 +78,7 @@ pub struct ColorMap {
 }
 
 impl ColorMap {
-    #[allow(dead_code)]
+    /// Single-accent map (unit tests; production icons use the DualSense maps).
     pub fn current_color(color: RgbaColor) -> Self {
         Self {
             replacements: vec![("currentColor".into(), color.to_hex())],
@@ -187,7 +186,11 @@ impl Default for SvgRasterCache {
     }
 }
 
-#[allow(dead_code)] // used by build.rs
+/// Connected DualSense raster for the tray / Windows `.exe` icon.
+///
+/// Called by `build.rs` (tray bytes + `app.ico`) and `src/bin/gen_msix_logos.rs`
+/// (Store logos); both include this file via `#[path]` so the helper must
+/// stay even though the app itself rasterizes through [`SvgRasterCache`].
 pub fn render_dualsense_connected_rgba(size: u32) -> Result<Vec<u8>, String> {
     SvgRasterCache::new().rasterize(
         DUALSENSE_SVG,
@@ -196,7 +199,7 @@ pub fn render_dualsense_connected_rgba(size: u32) -> Result<Vec<u8>, String> {
     )
 }
 
-#[allow(dead_code)] // used by build.rs
+/// Dim DualSense raster for the disconnected tray icon (see above).
 pub fn render_dualsense_dim_rgba(size: u32) -> Result<Vec<u8>, String> {
     SvgRasterCache::new().rasterize(DUALSENSE_SVG, size, &ColorMap::dualsense_dim())
 }

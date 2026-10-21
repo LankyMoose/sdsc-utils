@@ -6,9 +6,9 @@
 use super::{App, Message, TOAST_LIFETIME, delay};
 use crate::controller::model::Connection;
 use crate::persist::analytics;
-use crate::persist::notify::NotifyEvent;
 use crate::platform::app_log;
 use crate::platform::crash_restart;
+use crate::session::notify::NotifyEvent;
 use crate::ui::layout::{
     focus_window, hide_toast, invalidate_toast, move_window, overlay_platform_specific,
     raise_window_topmost, remount_toast_surface, set_toast_topmost, show_toast_without_activate,
