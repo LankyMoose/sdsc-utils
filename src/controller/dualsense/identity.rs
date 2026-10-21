@@ -18,9 +18,10 @@ const PAIRING_INFO_FEATURE_SIZE: usize = 20;
 
 /// Owned serial lock for all DualSense HID open/read/write/close.
 ///
-/// Future injection point: own a `HidIoLock` in the HID worker / app root and
-/// pass `&HidIoLock` down instead of using the process-global [`HID_IO_LOCK`]
-/// shim below.
+/// Own a `HidIoLock` in the HID worker / app root and pass `&HidIoLock` down
+/// to `poll_controllers` / `apply_lightbar_all`. CLI one-shots construct a
+/// local `HidIoLock::new()`; the daemon worker is exclusive so its lock is
+/// uncontended.
 pub struct HidIoLock(Mutex<()>);
 
 impl HidIoLock {
@@ -44,19 +45,6 @@ impl Default for HidIoLock {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// Thin compat shim: process-global instance until call sites take `&HidIoLock`.
-static HID_IO_LOCK: HidIoLock = HidIoLock::new();
-
-/// Hold the DualSense HID I/O lock for a closure (CLI one-shots only).
-pub fn with_hid_lock<T>(f: impl FnOnce() -> T) -> T {
-    HID_IO_LOCK.with_lock(f)
-}
-
-/// Try to take the HID lock; returns an error string if poisoned.
-pub fn lock_hid() -> Result<std::sync::MutexGuard<'static, ()>, String> {
-    HID_IO_LOCK.lock()
 }
 
 pub fn product_name(product_id: u16) -> &'static str {

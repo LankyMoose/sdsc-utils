@@ -11,13 +11,22 @@ use single_instance::SingleInstance;
 use std::env;
 use std::io::{self, Write};
 use std::process::ExitCode;
+use std::sync::OnceLock;
+
+/// Boot-owned tray-arm flag (no leak). The panic hook needs a `&'static`
+/// borrow (`set_hook` contract); this `OnceLock` provides it via `get_or_init`.
+static CRASH_ARMED: OnceLock<CrashArmed> = OnceLock::new();
+
+fn crash_armed() -> &'static CrashArmed {
+    CRASH_ARMED.get_or_init(CrashArmed::new)
+}
 
 fn main() -> ExitCode {
-    // Crash boot owns the tray-arm flag: leaked so the panic hook (installed
-    // by `app_log::init`, `'static` by `set_hook` contract) borrows it for
+    // Crash boot owns the tray-arm flag: `OnceLock` storage outlives `main`,
+    // so the panic hook (installed by `app_log::init`) can borrow it for
     // the process lifetime. CLI paths never arm it (see below); only the
     // tray path calls `arm_tray_mode`.
-    let crash_armed: &'static CrashArmed = Box::leak(Box::new(CrashArmed::new()));
+    let crash_armed: &'static CrashArmed = crash_armed();
     app_log::init(crash_armed);
 
     let args: Vec<String> = env::args().skip(1).collect();
@@ -201,7 +210,9 @@ fn attach_console_for_cli() {
 fn list_controllers_cli() -> ExitCode {
     let spectrum = sdsc_utils::domain::color::SpectrumService::default();
     let claims = sdsc_utils::controller::dualsense::lightbar::ClaimStore::new();
-    match controller::hid::poll::poll_controllers(&[], &spectrum, &claims) {
+    let lock = sdsc_utils::controller::dualsense::identity::HidIoLock::new();
+    let policy = sdsc_utils::controller::hid::policy::Policy::default();
+    match controller::hid::poll::poll_controllers(&lock, &policy, &[], &spectrum, &claims) {
         Ok(statuses) => {
             print_controllers(&statuses);
             ExitCode::SUCCESS
@@ -266,6 +277,7 @@ fn set_lightbar_cli(rgb_args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     match controller::dualsense::lightbar::apply_lightbar_all(
+        &controller::dualsense::identity::HidIoLock::new(),
         color,
         &controller::dualsense::lightbar::ClaimStore::new(),
     ) {

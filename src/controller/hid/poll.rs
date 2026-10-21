@@ -4,9 +4,10 @@
 
 use crate::controller::driver;
 use crate::controller::dualsense::battery;
-use crate::controller::dualsense::identity::{self as dualsense, hid_serial, is_storable_serial};
+use crate::controller::dualsense::identity::{self as dualsense, HidIoLock, hid_serial};
 use crate::controller::dualsense::lightbar::{self, ClaimStore, HidPhaseTiming};
 use crate::controller::hid::launch_paths::LaunchPaths;
+use crate::controller::hid::policy::Policy;
 use crate::controller::model::ControllerStatus;
 use crate::domain::color::SpectrumService;
 use crate::platform::app_log;
@@ -40,28 +41,15 @@ struct PolledPad {
 }
 
 /// Collapse USB+BT of the same pad, keeping the preferred open handle (USB wins).
-fn dedupe_polled(mut pads: Vec<PolledPad>) -> Vec<PolledPad> {
-    let mut unique: Vec<PolledPad> = Vec::with_capacity(pads.len());
-
-    for pad in pads.drain(..) {
-        if !is_storable_serial(&pad.status.serial) {
-            unique.push(pad);
-            continue;
-        }
-
-        if let Some(existing) = unique
-            .iter_mut()
-            .find(|s| is_storable_serial(&s.status.serial) && s.status.serial == pad.status.serial)
-        {
-            if pad.status.connection.is_usb() && !existing.status.connection.is_usb() {
-                *existing = pad;
-            }
-        } else {
-            unique.push(pad);
-        }
-    }
-
-    unique
+///
+/// Delegates to [`battery::dedupe_statuses`] (single USB-wins implementation);
+/// this is just the `PolledPad` newtype adapter.
+fn dedupe_polled(pads: Vec<PolledPad>) -> Vec<PolledPad> {
+    let statuses: Vec<ControllerStatus> = pads.into_iter().map(|p| p.status).collect();
+    battery::dedupe_statuses(statuses)
+        .into_iter()
+        .map(|status| PolledPad { status })
+        .collect()
 }
 
 fn status_from_reading(
@@ -85,16 +73,25 @@ fn status_from_reading(
 /// Serials not in that set are treated as fresh connects: claim is cleared so
 /// `LIGHT_OUT` + RGB always run (needed after a presence-only disconnect that
 /// never synced claims).
+///
+/// Takes the caller's `&HidIoLock` (CLI one-shots use a local
+/// `HidIoLock::new()`) and `&Policy` (`&Policy::default()` reproduces the
+/// legacy const cadence exactly).
+#[allow(clippy::too_many_arguments)]
 pub fn poll_controllers(
+    lock: &HidIoLock,
+    policy: &Policy,
     previously_connected: &[String],
     spectrum: &SpectrumService,
     claims: &ClaimStore,
 ) -> Result<Vec<ControllerStatus>, String> {
-    dualsense::with_hid_lock(|| {
+    lock.with_lock(|| {
         let api = HidApi::new().map_err(|e| e.to_string())?;
         let mut timing = HidPhaseTiming::default();
         poll_controllers_with_api(
             &api,
+            lock,
+            policy,
             spectrum,
             claims,
             previously_connected,
@@ -105,12 +102,17 @@ pub fn poll_controllers(
     })
 }
 
-/// Daemon worker entry: no outer lock (worker is exclusive). Uses caller's `HidApi`.
+/// Daemon worker entry: uses caller's `HidApi`. The worker thread is
+/// exclusive, so `lock` is uncontended here; it is still threaded through so
+/// CLI and daemon share one `poll_controllers_with_api` seam with no global.
 ///
 /// When `launch` / `launch_quiet` are set, serials for paths present at first enum
 /// are appended to `launch_quiet` on a successful battery read (no Connected toast).
+#[allow(clippy::too_many_arguments)]
 pub fn poll_controllers_timed(
     api: &HidApi,
+    lock: &HidIoLock,
+    policy: &Policy,
     spectrum: &SpectrumService,
     claims: &ClaimStore,
     previously_connected: &[String],
@@ -118,20 +120,27 @@ pub fn poll_controllers_timed(
     launch_quiet: Option<&mut Vec<String>>,
 ) -> (Result<Vec<ControllerStatus>, String>, HidPhaseTiming) {
     let mut timing = HidPhaseTiming::default();
-    let result = poll_controllers_with_api(
-        api,
-        spectrum,
-        claims,
-        previously_connected,
-        &mut timing,
-        launch,
-        launch_quiet,
-    );
+    let result = lock.with_lock(|| {
+        poll_controllers_with_api(
+            api,
+            lock,
+            policy,
+            spectrum,
+            claims,
+            previously_connected,
+            &mut timing,
+            launch,
+            launch_quiet,
+        )
+    });
     (result, timing)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn poll_controllers_with_api(
     api: &HidApi,
+    _lock: &HidIoLock,
+    policy: &Policy,
     spectrum: &SpectrumService,
     claims: &ClaimStore,
     previously_connected: &[String],
@@ -139,6 +148,9 @@ fn poll_controllers_with_api(
     mut launch: Option<&mut LaunchPaths>,
     mut launch_quiet: Option<&mut Vec<String>>,
 ) -> Result<Vec<ControllerStatus>, String> {
+    // Policy seam: `Policy::default()` reproduces the legacy const cadence
+    // exactly; this reference keeps the seam without changing timing.
+    let _ = policy;
     let enum_started = Instant::now();
     let devices: Vec<&DeviceInfo> = api
         .device_list()

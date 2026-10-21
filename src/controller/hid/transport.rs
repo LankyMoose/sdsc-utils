@@ -12,6 +12,11 @@ pub trait HidTransport {
     fn get_feature_report(&self, buf: &mut [u8]) -> Result<usize, String>;
 }
 
+#[cfg(test)]
+use std::collections::VecDeque;
+#[cfg(test)]
+use std::sync::Mutex;
+
 /// Direct `hidapi` delegation (byte-identical behavior).
 pub struct HidapiTransport<'a>(pub &'a hidapi::HidDevice);
 
@@ -27,66 +32,67 @@ impl HidTransport for HidapiTransport<'_> {
     }
 }
 
+/// Canned-report mock for transport/sample unit tests (no HID hardware).
+#[cfg(test)]
+pub(crate) struct MockTransport {
+    reads: Mutex<VecDeque<Result<Vec<u8>, String>>>,
+    features: Mutex<VecDeque<Result<Vec<u8>, String>>>,
+}
+
+#[cfg(test)]
+impl MockTransport {
+    pub(crate) fn new() -> Self {
+        Self {
+            reads: Mutex::new(VecDeque::new()),
+            features: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    pub(crate) fn push_read(&self, v: Result<Vec<u8>, String>) {
+        self.reads.lock().expect("mock lock").push_back(v);
+    }
+}
+
+#[cfg(test)]
+impl HidTransport for MockTransport {
+    fn read_timeout(&self, buf: &mut [u8], _timeout_ms: i32) -> Result<usize, String> {
+        let next = self
+            .reads
+            .lock()
+            .expect("mock lock")
+            .pop_front()
+            .unwrap_or(Ok(Vec::new()));
+        match next {
+            Ok(bytes) => {
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn get_feature_report(&self, buf: &mut [u8]) -> Result<usize, String> {
+        let next = self
+            .features
+            .lock()
+            .expect("mock lock")
+            .pop_front()
+            .unwrap_or(Ok(Vec::new()));
+        match next {
+            Ok(bytes) => {
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
-
-    /// Canned-report mock for future sample tests (no HID hardware).
-    pub struct MockTransport {
-        reads: Mutex<VecDeque<Result<Vec<u8>, String>>>,
-        features: Mutex<VecDeque<Result<Vec<u8>, String>>>,
-    }
-
-    impl MockTransport {
-        pub fn new() -> Self {
-            Self {
-                reads: Mutex::new(VecDeque::new()),
-                features: Mutex::new(VecDeque::new()),
-            }
-        }
-
-        pub fn push_read(&self, v: Result<Vec<u8>, String>) {
-            self.reads.lock().expect("mock lock").push_back(v);
-        }
-    }
-
-    impl HidTransport for MockTransport {
-        fn read_timeout(&self, buf: &mut [u8], _timeout_ms: i32) -> Result<usize, String> {
-            let next = self
-                .reads
-                .lock()
-                .expect("mock lock")
-                .pop_front()
-                .unwrap_or(Ok(Vec::new()));
-            match next {
-                Ok(bytes) => {
-                    let n = bytes.len().min(buf.len());
-                    buf[..n].copy_from_slice(&bytes[..n]);
-                    Ok(n)
-                }
-                Err(e) => Err(e),
-            }
-        }
-
-        fn get_feature_report(&self, buf: &mut [u8]) -> Result<usize, String> {
-            let next = self
-                .features
-                .lock()
-                .expect("mock lock")
-                .pop_front()
-                .unwrap_or(Ok(Vec::new()));
-            match next {
-                Ok(bytes) => {
-                    let n = bytes.len().min(buf.len());
-                    buf[..n].copy_from_slice(&bytes[..n]);
-                    Ok(n)
-                }
-                Err(e) => Err(e),
-            }
-        }
-    }
 
     #[test]
     fn mock_transport_roundtrips() {
