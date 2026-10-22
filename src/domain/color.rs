@@ -1,6 +1,6 @@
 //! Battery-driven lightbar colors.
 
-use crate::AppResult;
+use crate::{AppError, AppResult};
 use serde::de::{Deserializer, Error as DeError, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -137,14 +137,14 @@ impl BatterySpectrum {
         let stop = self
             .stops
             .get_mut(index)
-            .ok_or_else(|| format!("stop index {index} out of range"))?;
+            .ok_or_else(|| AppError::Config(format!("stop index {index} out of range")))?;
         stop.color = color;
         Ok(())
     }
 
     pub fn set_stop_percent(&mut self, index: usize, percent: u8) -> AppResult<usize> {
         if index >= self.stops.len() {
-            return Err(format!("stop index {index} out of range"));
+            return Err(AppError::Config(format!("stop index {index} out of range")));
         }
         let color = self.stops[index].color;
         let occupied: Vec<u8> = self
@@ -154,22 +154,27 @@ impl BatterySpectrum {
             .filter_map(|(i, stop)| (i != index).then_some(stop.percent))
             .collect();
         let percent = unique_percent(&occupied, percent.min(100))
-            .ok_or_else(|| "unable to place stop at a unique percent".to_string())?;
+            .ok_or_else(|| AppError::Config("unable to place stop at a unique percent".into()))?;
         self.stops[index].percent = percent;
         normalize_stops(&mut self.stops)?;
         self.stops
             .iter()
             .position(|stop| stop.percent == percent && stop.color == color)
-            .ok_or_else(|| "failed to relocate stop after reorder".to_string())
+            .ok_or_else(|| AppError::Config("failed to relocate stop after reorder".into()))
     }
 
     pub fn add_stop_at(&mut self, percent: u8) -> AppResult<usize> {
         if self.stops.len() >= Self::MAX_STOPS {
-            return Err(format!("at most {} stops are allowed", Self::MAX_STOPS));
+            return Err(AppError::Config(format!(
+                "at most {} stops are allowed",
+                Self::MAX_STOPS
+            )));
         }
         let percent = percent.min(100);
         if self.stops.iter().any(|stop| stop.percent == percent) {
-            return Err(format!("a stop already exists at {percent}%"));
+            return Err(AppError::Config(format!(
+                "a stop already exists at {percent}%"
+            )));
         }
         let color = self.color_at_percent(percent);
         self.stops.push(GradientStop::new(percent, color));
@@ -177,15 +182,18 @@ impl BatterySpectrum {
         self.stops
             .iter()
             .position(|stop| stop.percent == percent)
-            .ok_or_else(|| "failed to locate newly added stop".to_string())
+            .ok_or_else(|| AppError::Config("failed to locate newly added stop".into()))
     }
 
     pub fn remove_stop(&mut self, index: usize) -> AppResult<usize> {
         if self.stops.len() <= Self::MIN_STOPS {
-            return Err(format!("at least {} stops are required", Self::MIN_STOPS));
+            return Err(AppError::Config(format!(
+                "at least {} stops are required",
+                Self::MIN_STOPS
+            )));
         }
         if index >= self.stops.len() {
-            return Err(format!("stop index {index} out of range"));
+            return Err(AppError::Config(format!("stop index {index} out of range")));
         }
         self.stops.remove(index);
         Ok(index.min(self.stops.len().saturating_sub(1)))
@@ -213,12 +221,12 @@ fn unique_percent(occupied: &[u8], percent: u8) -> Option<u8> {
 
 fn normalize_stops(stops: &mut [GradientStop]) -> AppResult<()> {
     if !(BatterySpectrum::MIN_STOPS..=BatterySpectrum::MAX_STOPS).contains(&stops.len()) {
-        return Err(format!(
+        return Err(AppError::Config(format!(
             "spectrum requires {}-{} stops, got {}",
             BatterySpectrum::MIN_STOPS,
             BatterySpectrum::MAX_STOPS,
             stops.len()
-        ));
+        )));
     }
     for stop in stops.iter_mut() {
         stop.percent = stop.percent.min(100);
@@ -230,7 +238,10 @@ fn normalize_stops(stops: &mut [GradientStop]) -> AppResult<()> {
     });
     for window in stops.windows(2) {
         if window[0].percent == window[1].percent {
-            return Err(format!("duplicate stop percent {}%", window[0].percent));
+            return Err(AppError::Config(format!(
+                "duplicate stop percent {}%",
+                window[0].percent
+            )));
         }
     }
     Ok(())

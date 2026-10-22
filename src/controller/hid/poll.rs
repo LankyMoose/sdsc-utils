@@ -87,7 +87,7 @@ pub fn poll_controllers(
     claims: &ClaimStore,
 ) -> AppResult<Vec<ControllerStatus>> {
     lock.with_lock(|| {
-        let api = HidApi::new().map_err(|e| e.to_string())?;
+        let api = HidApi::new()?;
         let mut timing = HidPhaseTiming::default();
         poll_controllers_with_api(
             &api,

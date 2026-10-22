@@ -1,8 +1,8 @@
 //! Shared DualSense HID identity, device filters, and I/O lock.
 
-use crate::AppResult;
 use crate::controller::model::Serial;
 use crate::platform::app_log;
+use crate::{AppError, AppResult};
 use hidapi::{BusType, DeviceInfo, HidDevice};
 use std::sync::Mutex;
 
@@ -39,7 +39,9 @@ impl HidIoLock {
 
     /// Take the lock; returns an error string if poisoned.
     pub fn lock(&self) -> AppResult<std::sync::MutexGuard<'_, ()>> {
-        self.0.lock().map_err(|_| "HID lock poisoned".to_string())
+        self.0
+            .lock()
+            .map_err(|_| AppError::Hid("HID lock poisoned".into()))
     }
 }
 

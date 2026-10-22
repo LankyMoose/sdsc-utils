@@ -52,7 +52,7 @@ pub(crate) fn read_one_report<T: HidTransport>(
             Ok(n) => n,
             Err(err) => {
                 drop(_op);
-                let fail = if err.to_lowercase().contains("timeout") {
+                let fail = if err.to_string().to_lowercase().contains("timeout") {
                     SampleFail::Timeout
                 } else {
                     SampleFail::Io

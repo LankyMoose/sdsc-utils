@@ -4,7 +4,7 @@
 //! operations `domain::pad` sampling needs so a later commit can move the
 //! report parsing behind it and unit-test with canned reports.
 
-use crate::AppResult;
+use crate::{AppError, AppResult};
 
 /// Minimal blocking HID surface needed for input sampling.
 pub trait HidTransport {
@@ -24,13 +24,11 @@ pub struct HidapiTransport<'a>(pub &'a hidapi::HidDevice);
 
 impl HidTransport for HidapiTransport<'_> {
     fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> AppResult<usize> {
-        self.0
-            .read_timeout(buf, timeout_ms)
-            .map_err(|e| e.to_string())
+        self.0.read_timeout(buf, timeout_ms).map_err(AppError::from)
     }
 
     fn get_feature_report(&self, buf: &mut [u8]) -> AppResult<usize> {
-        self.0.get_feature_report(buf).map_err(|e| e.to_string())
+        self.0.get_feature_report(buf).map_err(AppError::from)
     }
 }
 
@@ -100,10 +98,13 @@ mod tests {
     fn mock_transport_roundtrips() {
         let m = MockTransport::new();
         m.push_read(Ok(vec![1, 2, 3]));
-        m.push_read(Err("timeout".to_string()));
+        m.push_read(Err(AppError::Hid("timeout".into())));
         let mut buf = [0u8; 8];
         assert_eq!(m.read_timeout(&mut buf, 4).expect("read"), 3);
         assert_eq!(&buf[..3], &[1, 2, 3]);
-        assert_eq!(m.read_timeout(&mut buf, 4).unwrap_err(), "timeout");
+        assert_eq!(
+            m.read_timeout(&mut buf, 4).unwrap_err().to_string(),
+            "timeout"
+        );
     }
 }
