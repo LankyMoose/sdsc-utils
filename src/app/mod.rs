@@ -50,7 +50,7 @@ use crate::ui::start::cursor_hide;
 use crate::ui::start::gesture::{self, ChordReleaseGate};
 use crate::ui::start::input::{
     self as start_input, CrossHold, FaceHeld, GestureDetectorBank, NavAction, NavLogSnapshot,
-    NavSource, PadNavBank,
+    PadNavBank,
 };
 use crate::ui::start::mode::{self as start_mode};
 use crate::ui::start::view::{self as start_view, StartMessage};
@@ -509,7 +509,7 @@ pub struct App {
     /// One-shot while every live pad is unarmed (waiting for rest).
     nav_unarmed_warned: bool,
     /// Logged once per start-session which nav backend succeeded.
-    nav_source_logged: Option<NavSource>,
+    nav_source_logged: Option<&'static str>,
     /// Last edge-logged nav snapshot (cleared when start closes).
     last_nav_log: Option<NavLogSnapshot>,
     /// Last PadPoll Instant while start window open (stall detection).
