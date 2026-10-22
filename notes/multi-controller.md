@@ -1,4 +1,4 @@
-# Multi-controller driver seam (spec, not yet implemented)
+# Multi-controller driver seam (implemented in 1.7.0-architecture)
 
 Goal: a fork can add a second controller family (Xbox, DualShock, Switch Pro)
 without touching UI, session, persist, or the DualSense implementation.

@@ -91,9 +91,10 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 
 ## Where to find things
 
-- **HID driver / controller state** → `src/controller/hid/`, `src/controller/driver.rs`, `src/controller/model.rs`, `src/controller/dualsense/`
+- **HID driver / controller state** → `src/controller/hid/` (cadence `policy.rs`, error taxonomy `retry.rs`), `src/controller/driver.rs` (driver registry), `src/controller/model.rs` (`Serial`, `Capabilities`), `src/controller/dualsense/`
 - **Battery step → percentage math** → `src/controller/dualsense/battery.rs`
 - **Battery color spectrum** → `src/domain/color.rs`; lightbar writes / reassert → `src/controller/dualsense/lightbar.rs`
+- **Error type** → `src/app_error.rs` (`AppError` + `AppResult`)
 - **Lightbar spectrum editor (Settings)** → `src/ui/configure/spectrum.rs`, `src/ui/configure/mod.rs`
 - **Theme / shared widget styles** → `src/ui/theme.rs`; restyle plan → `notes/ui-refresh.md`
 - **Start screen / game launcher** → `src/ui/start/` (UI), `src/games/` (Steam scan, launch); immersive mode → `notes/start-immersive.md`
