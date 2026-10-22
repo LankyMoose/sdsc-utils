@@ -122,7 +122,7 @@ pub fn decide_running_badge(
 }
 
 /// Resolve match paths for a catalog launch target (best-effort).
-pub fn match_paths_for_target(target: &str) -> Vec<PathBuf> {
+pub fn match_paths_for_target(target: &str, seen: &SeenCache) -> Vec<PathBuf> {
     let trimmed = target.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -132,7 +132,7 @@ pub fn match_paths_for_target(target: &str) -> Vec<PathBuf> {
         return match crate::games::steam::install_dir_for_appid(appid) {
             Some(dir) => vec![dir],
             None => {
-                log_missing_steam_installdir(appid);
+                log_missing_steam_installdir(appid, seen);
                 Vec::new()
             }
         };
@@ -149,14 +149,39 @@ pub fn match_paths_for_target(target: &str) -> Vec<PathBuf> {
     Vec::new()
 }
 
-fn log_missing_steam_installdir(appid: u32) {
-    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
-    let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let seen = guard.get_or_insert_with(HashSet::new);
+fn log_missing_steam_installdir(appid: u32, seen: &SeenCache) {
     if seen.insert(appid) {
         crate::platform::app_log::warn(format!(
             "steam installdir missing for appid {appid}; running match paths empty"
         ));
+    }
+}
+
+/// Owned first-sight cache for missing Steam installdir warnings.
+///
+/// Owned by the app root (`App::seen_cache`); pass `&SeenCache` into
+/// [`match_paths_for_target`] / `log_missing_steam_installdir`. First sight
+/// logs, later sights stay silent for the process lifetime (never cleared,
+/// matching the previous process-global behavior).
+pub struct SeenCache(Mutex<HashSet<u32>>);
+
+impl SeenCache {
+    pub fn new() -> Self {
+        Self(Mutex::new(HashSet::new()))
+    }
+
+    /// Record `appid`; returns true on first sight (caller should log).
+    pub fn insert(&self, appid: u32) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(appid)
+    }
+}
+
+impl Default for SeenCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -182,20 +207,7 @@ pub fn any_matching_in_images(match_paths: &[PathBuf], images: &[(u32, PathBuf)]
         .any(|(_, path)| path_matches(path, match_paths))
 }
 
-/// Ask matching processes to close (WM_CLOSE), then terminate leftovers.
-pub fn close_matching(match_paths: &[PathBuf]) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        close_matching_windows(match_paths)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = match_paths;
-        Err("process close is Windows-only".into())
-    }
-}
-
-fn path_matches(image: &Path, match_paths: &[PathBuf]) -> bool {
+pub(crate) fn path_matches(image: &Path, match_paths: &[PathBuf]) -> bool {
     // Avoid canonicalize() here — it is far too expensive when scanning many processes.
     let image_s = normalize_path_key(image);
     let image_name = image
@@ -402,67 +414,6 @@ pub fn foreground_process_name() -> Option<String> {
     None
 }
 
-#[cfg(windows)]
-fn matching_pids(match_paths: &[PathBuf]) -> Vec<u32> {
-    if match_paths.is_empty() {
-        return Vec::new();
-    }
-    list_process_images()
-        .into_iter()
-        .filter_map(|(pid, path)| path_matches(&path, match_paths).then_some(pid))
-        .collect()
-}
-
-#[cfg(windows)]
-fn close_matching_windows(match_paths: &[PathBuf]) -> Result<(), String> {
-    use std::collections::HashSet;
-    use std::thread;
-    use std::time::Duration;
-    use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE,
-    };
-
-    let pids: HashSet<u32> = matching_pids(match_paths).into_iter().collect();
-    if pids.is_empty() {
-        return Ok(());
-    }
-
-    struct EnumState {
-        pids: HashSet<u32>,
-    }
-
-    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
-        let state = unsafe { &*(lparam.0 as *const EnumState) };
-        if unsafe { IsWindowVisible(hwnd) }.as_bool() {
-            let mut pid = 0u32;
-            unsafe {
-                GetWindowThreadProcessId(hwnd, Some(&mut pid));
-            }
-            if state.pids.contains(&pid) {
-                let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
-            }
-        }
-        true.into()
-    }
-
-    let state = EnumState { pids: pids.clone() };
-    unsafe {
-        let _ = EnumWindows(Some(enum_proc), LPARAM(&state as *const _ as isize));
-    }
-
-    thread::sleep(Duration::from_millis(800));
-
-    for pid in matching_pids(match_paths) {
-        if let Ok(handle) = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
-            let _ = unsafe { TerminateProcess(handle, 1) };
-            let _ = unsafe { CloseHandle(handle) };
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,8 +427,17 @@ mod tests {
     #[test]
     fn match_paths_manual_file() {
         // Non-existent path still yields basename-style entry via PathBuf.
-        let paths = match_paths_for_target("C:\\Games\\Demo\\game.exe");
+        let seen = SeenCache::new();
+        let paths = match_paths_for_target("C:\\Games\\Demo\\game.exe", &seen);
         assert!(!paths.is_empty());
+    }
+
+    #[test]
+    fn seen_cache_dedups_first_sight() {
+        let seen = SeenCache::new();
+        assert!(seen.insert(42));
+        assert!(!seen.insert(42));
+        assert!(seen.insert(7));
     }
 
     #[test]

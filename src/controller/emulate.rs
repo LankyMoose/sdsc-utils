@@ -53,7 +53,7 @@ pub struct EmulatedPad {
 
 impl EmulatedPad {
     pub fn serial(&self) -> &str {
-        &self.status.serial
+        self.status.serial.as_ref()
     }
 }
 
@@ -409,7 +409,7 @@ mod tests {
         let fleet = update(&[a, b], "emu-1", |p| p.connected = true);
         let live_pads = live(&fleet);
         assert_eq!(live_pads.len(), 1);
-        assert_eq!(live_pads[0].serial, PRIMARY_SERIAL);
+        assert_eq!(live_pads[0].serial.as_ref(), PRIMARY_SERIAL);
         assert_eq!(live_pads[0].percent, 50);
     }
 

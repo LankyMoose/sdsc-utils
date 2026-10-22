@@ -6,6 +6,7 @@
 use crate::platform::app_log;
 use crate::platform::app_meta::PKG_NAME;
 use crate::platform::packaged;
+use crate::{AppError, AppResult};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,7 +40,7 @@ pub fn is_enabled() -> bool {
     }
 }
 
-pub fn set_enabled(enabled: bool) -> Result<(), String> {
+pub fn set_enabled(enabled: bool) -> AppResult<()> {
     if enabled { install() } else { uninstall() }
 }
 
@@ -55,10 +56,12 @@ pub fn ensure_quiet_entry() {
     }
 }
 
-pub fn install() -> Result<(), String> {
+pub fn install() -> AppResult<()> {
     #[cfg(not(windows))]
     {
-        return Err("autostart install is only supported on Windows".into());
+        return Err(AppError::Platform(
+            "autostart install is only supported on Windows".into(),
+        ));
     }
 
     #[cfg(windows)]
@@ -67,10 +70,10 @@ pub fn install() -> Result<(), String> {
             return packaged_set_enabled(true);
         }
 
-        let exe = env::current_exe().map_err(|e| e.to_string())?;
+        let exe = env::current_exe()?;
         let lnk_path = startup_lnk_path()?;
         if let Some(parent) = lnk_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            fs::create_dir_all(parent)?;
         }
 
         let work_dir = exe
@@ -86,10 +89,12 @@ pub fn install() -> Result<(), String> {
     }
 }
 
-pub fn uninstall() -> Result<(), String> {
+pub fn uninstall() -> AppResult<()> {
     #[cfg(not(windows))]
     {
-        return Err("autostart uninstall is only supported on Windows".into());
+        return Err(AppError::Platform(
+            "autostart uninstall is only supported on Windows".into(),
+        ));
     }
 
     #[cfg(windows)]
@@ -132,37 +137,39 @@ fn packaged_is_enabled() -> bool {
 }
 
 #[cfg(windows)]
-fn packaged_set_enabled(enabled: bool) -> Result<(), String> {
+fn packaged_set_enabled(enabled: bool) -> AppResult<()> {
     use windows::ApplicationModel::{StartupTask, StartupTaskState};
     use windows::core::HSTRING;
 
     let task = StartupTask::GetAsync(&HSTRING::from(STARTUP_TASK_ID))
-        .map_err(|e| format!("StartupTask::GetAsync: {e}"))?
+        .map_err(|e| AppError::Platform(format!("StartupTask::GetAsync: {e}")))?
         .get()
-        .map_err(|e| format!("StartupTask::GetAsync wait: {e}"))?;
+        .map_err(|e| AppError::Platform(format!("StartupTask::GetAsync wait: {e}")))?;
 
     if enabled {
         let state = task
             .RequestEnableAsync()
-            .map_err(|e| format!("RequestEnableAsync: {e}"))?
+            .map_err(|e| AppError::Platform(format!("RequestEnableAsync: {e}")))?
             .get()
-            .map_err(|e| format!("RequestEnableAsync wait: {e}"))?;
+            .map_err(|e| AppError::Platform(format!("RequestEnableAsync wait: {e}")))?;
         match state {
             StartupTaskState::Enabled | StartupTaskState::EnabledByPolicy => {
                 app_log::info("packaged StartupTask enabled");
                 Ok(())
             }
-            StartupTaskState::DisabledByUser => {
-                Err("startup was disabled in Task Manager; re-enable it there first".into())
-            }
-            StartupTaskState::DisabledByPolicy => {
-                Err("startup is disabled by system policy".into())
-            }
-            other => Err(format!("could not enable startup (state={other:?})")),
+            StartupTaskState::DisabledByUser => Err(AppError::Platform(
+                "startup was disabled in Task Manager; re-enable it there first".into(),
+            )),
+            StartupTaskState::DisabledByPolicy => Err(AppError::Platform(
+                "startup is disabled by system policy".into(),
+            )),
+            other => Err(AppError::Platform(format!(
+                "could not enable startup (state={other:?})"
+            ))),
         }
     } else {
         task.Disable()
-            .map_err(|e| format!("StartupTask::Disable: {e}"))?;
+            .map_err(|e| AppError::Platform(format!("StartupTask::Disable: {e}")))?;
         app_log::info("packaged StartupTask disabled");
         Ok(())
     }
@@ -176,17 +183,17 @@ enum PackagedStartupState {
 }
 
 #[cfg(windows)]
-fn packaged_task_state() -> Result<PackagedStartupState, String> {
+fn packaged_task_state() -> AppResult<PackagedStartupState> {
     use windows::ApplicationModel::{StartupTask, StartupTaskState};
     use windows::core::HSTRING;
 
     let task = StartupTask::GetAsync(&HSTRING::from(STARTUP_TASK_ID))
-        .map_err(|e| format!("StartupTask::GetAsync: {e}"))?
+        .map_err(|e| AppError::Platform(format!("StartupTask::GetAsync: {e}")))?
         .get()
-        .map_err(|e| format!("StartupTask::GetAsync wait: {e}"))?;
+        .map_err(|e| AppError::Platform(format!("StartupTask::GetAsync wait: {e}")))?;
     let state = task
         .State()
-        .map_err(|e| format!("StartupTask::State: {e}"))?;
+        .map_err(|e| AppError::Platform(format!("StartupTask::State: {e}")))?;
     Ok(match state {
         StartupTaskState::Enabled | StartupTaskState::EnabledByPolicy => {
             PackagedStartupState::Enabled
@@ -217,7 +224,7 @@ fn migrate_legacy_cmd() {
 }
 
 #[cfg(windows)]
-fn create_shortcut(lnk: &Path, target: &Path, work_dir: &Path) -> Result<(), String> {
+fn create_shortcut(lnk: &Path, target: &Path, work_dir: &Path) -> AppResult<()> {
     let script = format!(
         "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{}'); \
          $s.TargetPath = '{}'; \
@@ -239,15 +246,15 @@ fn create_shortcut(lnk: &Path, target: &Path, work_dir: &Path) -> Result<(), Str
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .status()
-        .map_err(|e| format!("failed to run powershell for shortcut: {e}"))?;
+        .map_err(|e| AppError::Platform(format!("failed to run powershell for shortcut: {e}")))?;
 
     if !status.success() {
-        return Err(format!(
+        return Err(AppError::Platform(format!(
             "powershell failed creating shortcut (exit {status})"
-        ));
+        )));
     }
     if !lnk.exists() {
-        return Err("shortcut was not created".into());
+        return Err(AppError::Platform("shortcut was not created".into()));
     }
     Ok(())
 }
@@ -258,9 +265,9 @@ fn ps_single_quoted(s: &str) -> String {
 }
 
 #[cfg(windows)]
-fn remove_if_exists(path: &Path) -> Result<bool, String> {
+fn remove_if_exists(path: &Path) -> AppResult<bool> {
     if path.exists() {
-        fs::remove_file(path).map_err(|e| e.to_string())?;
+        fs::remove_file(path)?;
         Ok(true)
     } else {
         Ok(false)
@@ -268,18 +275,19 @@ fn remove_if_exists(path: &Path) -> Result<bool, String> {
 }
 
 #[cfg(windows)]
-fn startup_lnk_path() -> Result<PathBuf, String> {
+fn startup_lnk_path() -> AppResult<PathBuf> {
     Ok(startup_dir()?.join(format!("{PKG_NAME}.lnk")))
 }
 
 #[cfg(windows)]
-fn startup_cmd_path() -> Result<PathBuf, String> {
+fn startup_cmd_path() -> AppResult<PathBuf> {
     Ok(startup_dir()?.join(format!("{PKG_NAME}.cmd")))
 }
 
 #[cfg(windows)]
-fn startup_dir() -> Result<PathBuf, String> {
-    let appdata = env::var_os("APPDATA").ok_or("APPDATA not set")?;
+fn startup_dir() -> AppResult<PathBuf> {
+    let appdata =
+        env::var_os("APPDATA").ok_or_else(|| AppError::Platform("APPDATA not set".into()))?;
     Ok(PathBuf::from(appdata)
         .join("Microsoft")
         .join("Windows")

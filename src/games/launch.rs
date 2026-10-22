@@ -1,7 +1,9 @@
 //! Launch Steam URLs, executables, and shortcuts.
 
+use crate::{AppError, AppResult};
 #[cfg(not(windows))]
 use std::path::Path;
+use std::path::PathBuf;
 #[cfg(not(windows))]
 use std::process::Command;
 
@@ -9,10 +11,10 @@ use std::process::Command;
 ///
 /// `args` is passed through to the process when non-empty (Windows: ShellExecute
 /// parameters; Unix: whitespace-split argv for file targets).
-pub fn launch_target(target: &str, args: &str) -> Result<(), String> {
+pub fn launch_target(target: &str, args: &str) -> AppResult<()> {
     let trimmed = target.trim();
     if trimmed.is_empty() {
-        return Err("empty launch target".into());
+        return Err(AppError::Games("empty launch target".into()));
     }
     let args = args.trim();
 
@@ -27,7 +29,7 @@ pub fn launch_target(target: &str, args: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn launch_windows(target: &str, args: &str) -> Result<(), String> {
+fn launch_windows(target: &str, args: &str) -> AppResult<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -70,22 +72,22 @@ fn launch_windows(target: &str, args: &str) -> Result<(), String> {
     if result.0 as isize > 32 {
         Ok(())
     } else {
-        Err(format!(
+        Err(AppError::Games(format!(
             "ShellExecute failed for {target} (code {})",
             result.0 as isize
-        ))
+        )))
     }
 }
 
 #[cfg(not(windows))]
-fn launch_unix(target: &str, args: &str) -> Result<(), String> {
+fn launch_unix(target: &str, args: &str) -> AppResult<()> {
     if looks_like_url(target) {
         #[cfg(target_os = "macos")]
         {
             Command::new("open")
                 .arg(target)
                 .spawn()
-                .map_err(|e| format!("failed to open {target}: {e}"))?;
+                .map_err(|e| AppError::Games(format!("failed to open {target}: {e}")))?;
             return Ok(());
         }
         #[cfg(not(target_os = "macos"))]
@@ -93,7 +95,7 @@ fn launch_unix(target: &str, args: &str) -> Result<(), String> {
             Command::new("xdg-open")
                 .arg(target)
                 .spawn()
-                .map_err(|e| format!("failed to open {target}: {e}"))?;
+                .map_err(|e| AppError::Games(format!("failed to open {target}: {e}")))?;
             return Ok(());
         }
     }
@@ -106,13 +108,95 @@ fn launch_unix(target: &str, args: &str) -> Result<(), String> {
         }
     }
     cmd.spawn()
-        .map_err(|e| format!("failed to launch {}: {e}", path.display()))?;
+        .map_err(|e| AppError::Games(format!("failed to launch {}: {e}", path.display())))?;
     Ok(())
 }
 
 #[cfg(not(windows))]
 fn looks_like_url(target: &str) -> bool {
     target.contains("://")
+}
+
+/// Ask matching processes to close (WM_CLOSE), then terminate leftovers.
+///
+/// Moved next to [`launch_target`]: this is the catalog-launch teardown half,
+/// kept in the launch module instead of the match-policy module.
+pub fn close_matching(match_paths: &[PathBuf]) -> AppResult<()> {
+    #[cfg(windows)]
+    {
+        close_matching_windows(match_paths)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = match_paths;
+        Err(AppError::Games("process close is Windows-only".into()))
+    }
+}
+
+#[cfg(windows)]
+fn matching_pids(match_paths: &[PathBuf]) -> Vec<u32> {
+    if match_paths.is_empty() {
+        return Vec::new();
+    }
+    crate::games::process_match::list_process_images()
+        .into_iter()
+        .filter_map(|(pid, path)| {
+            crate::games::process_match::path_matches(&path, match_paths).then_some(pid)
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn close_matching_windows(match_paths: &[PathBuf]) -> AppResult<()> {
+    use std::collections::HashSet;
+    use std::thread;
+    use std::time::Duration;
+    use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE,
+    };
+
+    let pids: HashSet<u32> = matching_pids(match_paths).into_iter().collect();
+    if pids.is_empty() {
+        return Ok(());
+    }
+
+    struct EnumState {
+        pids: HashSet<u32>,
+    }
+
+    // SAFETY: `EnumWindows` invokes this on the calling thread with the `lparam`
+    // we pass below; `state` outlives the enumeration and is only read, never
+    // moved. The other `unsafe` calls take handles/pointers by value.
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        let state = unsafe { &*(lparam.0 as *const EnumState) };
+        if unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            let mut pid = 0u32;
+            unsafe {
+                GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            }
+            if state.pids.contains(&pid) {
+                let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            }
+        }
+        true.into()
+    }
+
+    let state = EnumState { pids: pids.clone() };
+    unsafe {
+        let _ = EnumWindows(Some(enum_proc), LPARAM(&state as *const _ as isize));
+    }
+
+    thread::sleep(Duration::from_millis(800));
+
+    for pid in matching_pids(match_paths) {
+        if let Ok(handle) = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
+            let _ = unsafe { TerminateProcess(handle, 1) };
+            let _ = unsafe { CloseHandle(handle) };
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

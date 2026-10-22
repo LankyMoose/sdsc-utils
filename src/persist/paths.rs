@@ -1,6 +1,7 @@
 //! Shared app data directory helpers.
 
 use crate::platform::app_meta::PKG_NAME;
+use crate::{AppError, AppResult};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -38,9 +39,10 @@ pub fn data_dir() -> PathBuf {
 }
 
 /// Create the data directory if needed and open it in the OS file manager.
-pub fn open_data_folder() -> Result<(), String> {
+pub fn open_data_folder() -> AppResult<()> {
     let dir = data_dir();
-    fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| AppError::Persist(format!("failed to create {}: {e}", dir.display())))?;
 
     #[cfg(windows)]
     {
@@ -48,7 +50,7 @@ pub fn open_data_folder() -> Result<(), String> {
         Command::new("explorer")
             .arg(&dir)
             .spawn()
-            .map_err(|e| format!("failed to open {}: {e}", dir.display()))?;
+            .map_err(|e| AppError::Persist(format!("failed to open {}: {e}", dir.display())))?;
         Ok(())
     }
 
@@ -57,11 +59,11 @@ pub fn open_data_folder() -> Result<(), String> {
         let status = Command::new("open")
             .arg(&dir)
             .status()
-            .map_err(|e| format!("failed to open {}: {e}", dir.display()))?;
+            .map_err(|e| AppError::Persist(format!("failed to open {}: {e}", dir.display())))?;
         if status.success() {
             return Ok(());
         }
-        return Err(format!("open exited with {status}"));
+        return Err(AppError::Persist(format!("open exited with {status}")));
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -69,10 +71,10 @@ pub fn open_data_folder() -> Result<(), String> {
         let status = Command::new("xdg-open")
             .arg(&dir)
             .status()
-            .map_err(|e| format!("failed to open {}: {e}", dir.display()))?;
+            .map_err(|e| AppError::Persist(format!("failed to open {}: {e}", dir.display())))?;
         if status.success() {
             return Ok(());
         }
-        return Err(format!("xdg-open exited with {status}"));
+        return Err(AppError::Persist(format!("xdg-open exited with {status}")));
     }
 }

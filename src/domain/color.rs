@@ -1,9 +1,10 @@
 //! Battery-driven lightbar colors.
 
+use crate::{AppError, AppResult};
 use serde::de::{Deserializer, Error as DeError, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rgb {
@@ -97,7 +98,7 @@ impl BatterySpectrum {
         }
     }
 
-    pub fn from_stops(mut stops: Vec<GradientStop>) -> Result<Self, String> {
+    pub fn from_stops(mut stops: Vec<GradientStop>) -> AppResult<Self> {
         normalize_stops(&mut stops)?;
         Ok(Self { stops })
     }
@@ -132,18 +133,18 @@ impl BatterySpectrum {
         stops[0].color
     }
 
-    pub fn set_stop_color(&mut self, index: usize, color: Rgb) -> Result<(), String> {
+    pub fn set_stop_color(&mut self, index: usize, color: Rgb) -> AppResult<()> {
         let stop = self
             .stops
             .get_mut(index)
-            .ok_or_else(|| format!("stop index {index} out of range"))?;
+            .ok_or_else(|| AppError::Config(format!("stop index {index} out of range")))?;
         stop.color = color;
         Ok(())
     }
 
-    pub fn set_stop_percent(&mut self, index: usize, percent: u8) -> Result<usize, String> {
+    pub fn set_stop_percent(&mut self, index: usize, percent: u8) -> AppResult<usize> {
         if index >= self.stops.len() {
-            return Err(format!("stop index {index} out of range"));
+            return Err(AppError::Config(format!("stop index {index} out of range")));
         }
         let color = self.stops[index].color;
         let occupied: Vec<u8> = self
@@ -153,22 +154,27 @@ impl BatterySpectrum {
             .filter_map(|(i, stop)| (i != index).then_some(stop.percent))
             .collect();
         let percent = unique_percent(&occupied, percent.min(100))
-            .ok_or_else(|| "unable to place stop at a unique percent".to_string())?;
+            .ok_or_else(|| AppError::Config("unable to place stop at a unique percent".into()))?;
         self.stops[index].percent = percent;
         normalize_stops(&mut self.stops)?;
         self.stops
             .iter()
             .position(|stop| stop.percent == percent && stop.color == color)
-            .ok_or_else(|| "failed to relocate stop after reorder".to_string())
+            .ok_or_else(|| AppError::Config("failed to relocate stop after reorder".into()))
     }
 
-    pub fn add_stop_at(&mut self, percent: u8) -> Result<usize, String> {
+    pub fn add_stop_at(&mut self, percent: u8) -> AppResult<usize> {
         if self.stops.len() >= Self::MAX_STOPS {
-            return Err(format!("at most {} stops are allowed", Self::MAX_STOPS));
+            return Err(AppError::Config(format!(
+                "at most {} stops are allowed",
+                Self::MAX_STOPS
+            )));
         }
         let percent = percent.min(100);
         if self.stops.iter().any(|stop| stop.percent == percent) {
-            return Err(format!("a stop already exists at {percent}%"));
+            return Err(AppError::Config(format!(
+                "a stop already exists at {percent}%"
+            )));
         }
         let color = self.color_at_percent(percent);
         self.stops.push(GradientStop::new(percent, color));
@@ -176,15 +182,18 @@ impl BatterySpectrum {
         self.stops
             .iter()
             .position(|stop| stop.percent == percent)
-            .ok_or_else(|| "failed to locate newly added stop".to_string())
+            .ok_or_else(|| AppError::Config("failed to locate newly added stop".into()))
     }
 
-    pub fn remove_stop(&mut self, index: usize) -> Result<usize, String> {
+    pub fn remove_stop(&mut self, index: usize) -> AppResult<usize> {
         if self.stops.len() <= Self::MIN_STOPS {
-            return Err(format!("at least {} stops are required", Self::MIN_STOPS));
+            return Err(AppError::Config(format!(
+                "at least {} stops are required",
+                Self::MIN_STOPS
+            )));
         }
         if index >= self.stops.len() {
-            return Err(format!("stop index {index} out of range"));
+            return Err(AppError::Config(format!("stop index {index} out of range")));
         }
         self.stops.remove(index);
         Ok(index.min(self.stops.len().saturating_sub(1)))
@@ -210,14 +219,14 @@ fn unique_percent(occupied: &[u8], percent: u8) -> Option<u8> {
     None
 }
 
-fn normalize_stops(stops: &mut [GradientStop]) -> Result<(), String> {
+fn normalize_stops(stops: &mut [GradientStop]) -> AppResult<()> {
     if !(BatterySpectrum::MIN_STOPS..=BatterySpectrum::MAX_STOPS).contains(&stops.len()) {
-        return Err(format!(
+        return Err(AppError::Config(format!(
             "spectrum requires {}-{} stops, got {}",
             BatterySpectrum::MIN_STOPS,
             BatterySpectrum::MAX_STOPS,
             stops.len()
-        ));
+        )));
     }
     for stop in stops.iter_mut() {
         stop.percent = stop.percent.min(100);
@@ -229,7 +238,10 @@ fn normalize_stops(stops: &mut [GradientStop]) -> Result<(), String> {
     });
     for window in stops.windows(2) {
         if window[0].percent == window[1].percent {
-            return Err(format!("duplicate stop percent {}%", window[0].percent));
+            return Err(AppError::Config(format!(
+                "duplicate stop percent {}%",
+                window[0].percent
+            )));
         }
     }
     Ok(())
@@ -329,39 +341,48 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
         .clamp(0.0, 255.0) as u8
 }
 
-fn active_spectrum() -> &'static Mutex<BatterySpectrum> {
-    static SPECTRUM: OnceLock<Mutex<BatterySpectrum>> = OnceLock::new();
-    SPECTRUM.get_or_init(|| Mutex::new(BatterySpectrum::default_spectrum()))
-}
-
-/// Hold while installing a different active spectrum in tests.
+/// Owned battery-spectrum unit: the RGB mapping HID readers (`hid/poll.rs`,
+/// `hid/worker.rs`) sample and writers (`app/mod.rs`, `configure.rs`) install.
 ///
-/// The active spectrum is process-global, so a test that swaps it in can hand
-/// its colors to any concurrently-running test that reads through
-/// [`color_for_battery_percent`]. Every test that calls either this or
-/// [`color_for_battery_percent`] must take this lock. (`icon_cache` has the
-/// same hazard and the same remedy — see its `with_cache_lock`.)
-#[cfg(test)]
-pub fn with_spectrum_lock<R>(f: impl FnOnce() -> R) -> R {
-    static LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    f()
+/// Owned by the app root (`App::spectrum`) and cloned into the HID worker.
+/// `color_at` clones under the lock then releases before computing, so the
+/// lock is never held across a downstream HID write.
+#[derive(Clone)]
+pub struct SpectrumService {
+    inner: Arc<Mutex<BatterySpectrum>>,
 }
 
-/// Install the spectrum used by [`color_for_battery_percent`].
-pub fn set_active_spectrum(spectrum: BatterySpectrum) {
-    if let Ok(mut guard) = active_spectrum().lock() {
-        *guard = spectrum;
+impl SpectrumService {
+    pub fn new(initial: BatterySpectrum) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(initial)),
+        }
+    }
+
+    /// Install a replacement spectrum. Holds the lock only for the assign.
+    pub fn set(&self, spectrum: BatterySpectrum) {
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = spectrum;
+        }
+    }
+
+    /// Map battery percent through the held spectrum. Clones under the lock,
+    /// then releases before computing so the lock is never held across a
+    /// downstream HID write.
+    pub fn color_at(&self, percent: u8) -> Rgb {
+        let spectrum = self
+            .inner
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| BatterySpectrum::default_spectrum());
+        spectrum.color_at_percent(percent)
     }
 }
 
-/// Map battery percent through the active RGB spectrum.
-pub fn color_for_battery_percent(percent: u8) -> Rgb {
-    let spectrum = active_spectrum()
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_else(|_| BatterySpectrum::default_spectrum());
-    spectrum.color_at_percent(percent)
+impl Default for SpectrumService {
+    fn default() -> Self {
+        Self::new(BatterySpectrum::default_spectrum())
+    }
 }
 
 pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Rgb {
@@ -434,18 +455,20 @@ mod tests {
 
     #[test]
     fn active_spectrum_is_used() {
-        with_spectrum_lock(|| {
-            set_active_spectrum(
-                BatterySpectrum::from_stops(vec![
-                    GradientStop::new(100, Rgb::new(0, 255, 0)),
-                    GradientStop::new(50, Rgb::new(255, 255, 0)),
-                    GradientStop::new(0, Rgb::new(255, 0, 0)),
-                ])
-                .unwrap(),
-            );
-            assert_eq!(color_for_battery_percent(100), Rgb::new(0, 255, 0));
-            set_active_spectrum(BatterySpectrum::default_spectrum());
-        });
+        let service = SpectrumService::new(
+            BatterySpectrum::from_stops(vec![
+                GradientStop::new(100, Rgb::new(0, 255, 0)),
+                GradientStop::new(50, Rgb::new(255, 255, 0)),
+                GradientStop::new(0, Rgb::new(255, 0, 0)),
+            ])
+            .unwrap(),
+        );
+        assert_eq!(service.color_at(100), Rgb::new(0, 255, 0));
+        service.set(BatterySpectrum::default_spectrum());
+        assert_eq!(
+            service.color_at(100),
+            BatterySpectrum::default_spectrum().color_at_percent(100)
+        );
     }
 
     #[test]

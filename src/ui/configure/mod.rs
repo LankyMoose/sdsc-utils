@@ -549,7 +549,7 @@ impl ConfigureState {
                 Some(self.spectrum.clone())
             }
             Err(err) => {
-                self.error = Some(err);
+                self.error = Some(err.to_string());
                 None
             }
         }
@@ -574,7 +574,7 @@ impl ConfigureState {
                 Some(self.spectrum.clone())
             }
             Err(err) => {
-                self.error = Some(err);
+                self.error = Some(err.to_string());
                 None
             }
         }
@@ -598,7 +598,7 @@ impl ConfigureState {
                     self.select(index);
                     return None;
                 }
-                self.error = Some(err);
+                self.error = Some(err.to_string());
                 None
             }
         }
@@ -613,7 +613,7 @@ impl ConfigureState {
                 Some(self.spectrum.clone())
             }
             Err(err) => {
-                self.error = Some(err);
+                self.error = Some(err.to_string());
                 None
             }
         }

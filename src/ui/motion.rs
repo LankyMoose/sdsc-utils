@@ -97,6 +97,8 @@ pub fn system_animations_enabled() -> bool {
         };
         use windows::core::BOOL;
         let mut enabled = BOOL(0);
+        // SAFETY: `enabled` is caller-owned; `addr_of_mut!` never forms a
+        // temporary reference, and the API writes at most one `BOOL`.
         let ok = unsafe {
             SystemParametersInfoW(
                 SPI_GETCLIENTAREAANIMATION,

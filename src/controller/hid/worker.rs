@@ -18,28 +18,29 @@
 //!
 //! Timing lines (grep `hid-worker:`) record enumerate / open / io / total.
 
-use crate::controller::driver;
+use crate::controller::driver::{self, DRIVERS, RumbleBackend};
 use crate::controller::dualsense::battery;
 use crate::controller::dualsense::identity::{
     hid_serial, is_dualsense_device, is_dualsense_gamepad, is_storable_serial, normalize_identity,
     product_name, resolve_device_identity,
 };
 use crate::controller::dualsense::lightbar::{
-    self, HidPhaseTiming, IDENTIFY_FLASH_COUNT, IDENTIFY_FLASH_MS, LOW_BATTERY_ORANGE,
+    self, ClaimStore, HidPhaseTiming, IDENTIFY_FLASH_COUNT, IDENTIFY_FLASH_MS, LOW_BATTERY_ORANGE,
     LOW_BATTERY_PULSE_GAP_MS, LOW_BATTERY_PULSE_ON_MS,
 };
-use crate::controller::dualsense::rumble;
 use crate::controller::hid::launch_paths::LaunchPaths;
+use crate::controller::hid::policy::Policy;
 use crate::controller::hid::poll::{
     self, POLL_LIVE_BATTERY_STALE, PRESENCE_INTERVAL, PRESENCE_INTERVAL_EMPTY,
 };
-use crate::controller::model::ControllerStatus;
-use crate::domain::color::{Rgb, color_for_battery_percent};
+use crate::controller::model::{ControllerKind, ControllerStatus};
+use crate::domain::color::{Rgb, SpectrumService};
 use crate::domain::pad::{
-    self as start_input, InputSnapshot, NavReading, ShortSampleOutcome, SnapshotMeta,
-    SnapshotReason,
+    self as start_input, InputHub, NavReading, ShortSampleOutcome, SnapshotMeta, SnapshotReason,
 };
 use crate::platform::app_log;
+use crate::platform::host::Host;
+use crate::{AppError, AppResult};
 use hidapi::{BusType, HidApi, HidDevice};
 use iced::futures::channel::oneshot;
 use std::collections::HashMap;
@@ -49,34 +50,34 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const PULSE_SAMPLE_LOG_INTERVAL: Duration = Duration::from_secs(1);
-const SLOW_CMD_LOG_MS: u128 = 20;
+const PULSE_SAMPLE_LOG_INTERVAL: Duration = Policy::DEFAULT.pulse_sample_log_interval;
+const SLOW_CMD_LOG_MS: u128 = Policy::DEFAULT.slow_cmd_log_ms;
 /// Cold-idle presence heartbeat: how long the worker blocks when input is not
 /// live and no output is pending. Refreshes the device list on timeout so
 /// arrival still works on platforms without an OS watcher (macOS); watcher
 /// hints (`RefreshPresence`) cover the fast path everywhere else. One
 /// `refresh_devices` (~10ms) per 2s is ~40x cheaper than the old 50ms sample
 /// loop it replaces — never sample here, battery comes from Poll on demand.
-const COLD_PRESENCE_HEARTBEAT: Duration = Duration::from_secs(2);
+const COLD_PRESENCE_HEARTBEAT: Duration = Policy::DEFAULT.cold_heartbeat;
 /// Active input wake ≈ one wired DualSense report (`bInterval` 4).
-const ACTIVE_POLL: Duration = Duration::from_millis(4);
+const ACTIVE_POLL: Duration = Policy::DEFAULT.active_poll;
 /// While waiting for the next Identify flash, still sample this often.
-const IDENTIFY_SAMPLE_POLL: Duration = Duration::from_millis(4);
+const IDENTIFY_SAMPLE_POLL: Duration = Policy::DEFAULT.identify_sample_poll;
 const IDENTIFY_WRITES: u32 = IDENTIFY_FLASH_COUNT * 2;
-const SAMPLE_STALL_MS: u128 = 100;
+const SAMPLE_STALL_MS: u128 = Policy::DEFAULT.sample_stall_ms;
 /// Consecutive sample timeouts before dropping a pad from the hot-path live map
 /// (~200ms at [`ACTIVE_POLL`] / wired report interval). HID handle stays open.
-const LIVE_SILENCE_TIMEOUTS: u32 = 50;
+const LIVE_SILENCE_TIMEOUTS: u32 = Policy::DEFAULT.live_silence_threshold;
 /// Upper bound on hot enumeration deferral: force `refresh_devices()` at least
 /// this often even while input is hot. Bounds the arrival blind window on every
 /// OS (see notes/hot-enumeration-freeze.md); a routine refresh costs ~10ms.
-pub const HOT_ENUM_MAX_DEFER: Duration = Duration::from_secs(20);
+pub const HOT_ENUM_MAX_DEFER: Duration = Policy::DEFAULT.hot_enum_max_defer;
 /// Minimum gap between OS arrival-hint refreshes (burst collapse).
-const REFRESH_HINT_THROTTLE: Duration = Duration::from_secs(1);
+const REFRESH_HINT_THROTTLE: Duration = Policy::DEFAULT.refresh_hint_throttle;
 /// Consecutive open failures before a path backs off (ghost-path churn guard).
-const OPEN_BACKOFF_THRESHOLD: u32 = 3;
+const OPEN_BACKOFF_THRESHOLD: u32 = Policy::DEFAULT.open_backoff_threshold;
 /// How long a backed-off path is skipped (re-probed sooner on list change).
-const OPEN_BACKOFF_WINDOW: Duration = Duration::from_secs(5);
+const OPEN_BACKOFF_WINDOW: Duration = Policy::DEFAULT.open_backoff_window;
 
 /// Pure decision: is the last enumeration older than `max_age` (or never ran)?
 fn refresh_overdue_at(last_refresh: Option<Instant>, now: Instant, max_age: Duration) -> bool {
@@ -128,7 +129,7 @@ struct OpenBackoff {
 enum HidCmd {
     Poll {
         previously: Vec<String>,
-        reply: oneshot::Sender<Result<Vec<ControllerStatus>, String>>,
+        reply: oneshot::Sender<AppResult<Vec<ControllerStatus>>>,
     },
     Identify {
         serial: String,
@@ -167,6 +168,8 @@ struct OpenDevice {
     device: HidDevice,
     is_bluetooth: bool,
     product: String,
+    /// Driver family that claimed the HID node (dispatches battery/rumble).
+    kind: ControllerKind,
     /// Consecutive [`ShortSampleOutcome::Timeout`] while this pad is sampled.
     /// Stored on the open handle so Identify-only sampling does not age other pads.
     silence_timeouts: u32,
@@ -178,11 +181,17 @@ fn advance_silence_streak(prev: u32) -> (u32, bool) {
     (next, next >= LIVE_SILENCE_TIMEOUTS)
 }
 
-fn open_device(device: HidDevice, is_bluetooth: bool, product: String) -> OpenDevice {
+fn open_device(
+    device: HidDevice,
+    is_bluetooth: bool,
+    product: String,
+    kind: ControllerKind,
+) -> OpenDevice {
     OpenDevice {
         device,
         is_bluetooth,
         product,
+        kind,
         silence_timeouts: 0,
     }
 }
@@ -202,12 +211,16 @@ struct DeviceCache {
     presence: Arc<Mutex<Vec<String>>>,
     launch_paths: LaunchPaths,
     launch_serials: Arc<Mutex<Vec<String>>>,
+    spectrum: SpectrumService,
+    claims: Arc<ClaimStore>,
 }
 
 /// Last battery + product label observed while sampling (hot path).
 struct LivePadStatus {
     product: String,
     reading: battery::BatteryReading,
+    /// Driver family that produced the reading (dispatches status/rumble/power-off).
+    kind: ControllerKind,
     /// When the reading was last confirmed (sample or poll read). Drives the
     /// incremental poll: fresh entries skip the blocking battery read.
     updated_at: Instant,
@@ -217,8 +230,10 @@ impl DeviceCache {
     fn new(
         presence: Arc<Mutex<Vec<String>>>,
         launch_serials: Arc<Mutex<Vec<String>>>,
-    ) -> Result<Self, String> {
-        let api = HidApi::new().map_err(|e| e.to_string())?;
+        spectrum: SpectrumService,
+        claims: Arc<ClaimStore>,
+    ) -> AppResult<Self> {
+        let api = HidApi::new()?;
         let mut cache = Self {
             api,
             devices: HashMap::new(),
@@ -228,6 +243,8 @@ impl DeviceCache {
             presence,
             launch_paths: LaunchPaths::new(),
             launch_serials,
+            spectrum,
+            claims,
         };
         let _ = cache.refresh_device_list();
         Ok(cache)
@@ -240,11 +257,11 @@ impl DeviceCache {
     }
 
     /// Re-enumerate in place (does **not** reconstruct `HidApi`).
-    fn refresh_device_list(&mut self) -> Result<(), String> {
+    fn refresh_device_list(&mut self) -> AppResult<()> {
         let _op = crate::controller::hid::diag::enter_op("hidapi_refresh");
         let started = Instant::now();
         crate::controller::hid::diag::diag_info("hid-diag: hidapi_refresh begin");
-        self.api.refresh_devices().map_err(|e| e.to_string())?;
+        self.api.refresh_devices()?;
         self.last_enum_at = Some(Instant::now());
         self.last_refresh_at = self.last_enum_at;
         let mut paths: Vec<String> = self
@@ -357,6 +374,9 @@ impl DeviceCache {
             }
             let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
             let is_usb = matches!(info.bus_type(), BusType::Usb);
+            let kind = driver::find_for_info(info)
+                .map(|d| d.kind())
+                .unwrap_or_default();
             let replace = match &best {
                 None => true,
                 Some((_, prev_usb)) => is_usb && !*prev_usb,
@@ -367,6 +387,7 @@ impl DeviceCache {
                         device,
                         is_bluetooth,
                         product_name(info.product_id()).to_string(),
+                        kind,
                     ),
                     is_usb,
                 ));
@@ -382,7 +403,7 @@ impl DeviceCache {
     }
 
     /// Open (or reuse) the DualSense matching `serial`. Prefers USB when both exist.
-    fn ensure(&mut self, serial: &str) -> Result<&OpenDevice, String> {
+    fn ensure(&mut self, serial: &str) -> AppResult<&OpenDevice> {
         let target = normalize_identity(serial);
         if self.devices.contains_key(&target) {
             return Ok(self.devices.get(&target).expect("contains"));
@@ -395,7 +416,7 @@ impl DeviceCache {
 
         self.refresh_device_list()?;
         let Some(open) = self.try_open_serial(serial) else {
-            return Err(format!("controller {serial} not found"));
+            return Err(AppError::Hid(format!("controller {serial} not found")));
         };
         self.devices.insert(target.clone(), open);
         Ok(self.devices.get(&target).expect("just inserted"))
@@ -505,6 +526,9 @@ impl DeviceCache {
             }
             let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
             let is_usb = matches!(info.bus_type(), BusType::Usb);
+            let kind = driver::find_for_info(info)
+                .map(|d| d.kind())
+                .unwrap_or_default();
             let replace = match best.get(&identity) {
                 None => true,
                 Some((_, prev_usb)) => is_usb && !*prev_usb,
@@ -517,6 +541,7 @@ impl DeviceCache {
                             device,
                             is_bluetooth,
                             product_name(info.product_id()).to_string(),
+                            kind,
                         ),
                         is_usb,
                     ),
@@ -627,13 +652,16 @@ impl RumbleCache {
         self.devices.remove(&normalize_identity(serial));
     }
 
-    fn ensure<'a>(&'a mut self, api: &HidApi, serial: &str) -> Result<&'a OpenDevice, String> {
+    fn ensure<'a>(&'a mut self, api: &HidApi, serial: &str) -> AppResult<&'a OpenDevice> {
         let target = normalize_identity(serial);
         if self.devices.contains_key(&target) {
             return Ok(self.devices.get(&target).expect("contains"));
         }
-        let open = open_rumble_device(api, &target)
-            .ok_or_else(|| format!("rumble: DualSense {target} not found / open failed"))?;
+        let open = open_rumble_device(api, &target).ok_or_else(|| {
+            AppError::Hid(format!(
+                "rumble: DualSense {target} not found / open failed"
+            ))
+        })?;
         self.devices.insert(target.clone(), open);
         Ok(self.devices.get(&target).expect("just inserted"))
     }
@@ -693,11 +721,15 @@ fn open_rumble_device(api: &HidApi, target: &str) -> Option<OpenDevice> {
             if is_bluetooth {
                 lightbar::prepare_bt_output_mode(&device);
             }
+            let kind = driver::find_for_info(info)
+                .map(|d| d.kind())
+                .unwrap_or_default();
             best = Some((
                 open_device(
                     device,
                     is_bluetooth,
                     product_name(info.product_id()).to_string(),
+                    kind,
                 ),
                 rank,
             ));
@@ -762,13 +794,20 @@ impl LowBatteryPulse {
     }
 
     /// Advance the pulse schedule. Returns true when an RGB write ran.
-    fn tick(&mut self, cache: &mut DeviceCache, identifying: bool, now: Instant) -> bool {
+    fn tick(
+        &mut self,
+        cache: &mut DeviceCache,
+        spectrum: &SpectrumService,
+        claims: &ClaimStore,
+        identifying: bool,
+        now: Instant,
+    ) -> bool {
         if self.targets.is_empty() {
             return false;
         }
         match self.phase {
             PulsePhase::Gap { until } if now >= until => {
-                if identifying || !lightbar::is_enabled() {
+                if identifying || !claims.is_enabled() {
                     // Reschedule gap without writing — Identify / disable owns the bar.
                     self.phase = PulsePhase::Gap {
                         until: now + Duration::from_millis(LOW_BATTERY_PULSE_GAP_MS),
@@ -776,7 +815,7 @@ impl LowBatteryPulse {
                     return false;
                 }
                 let (serial, _) = &self.targets[0];
-                let _ = write_rgb_exclusive(cache, serial, LOW_BATTERY_ORANGE);
+                let _ = write_rgb_exclusive(cache, claims, serial, LOW_BATTERY_ORANGE);
                 self.phase = PulsePhase::Orange {
                     index: 0,
                     until: now + Duration::from_millis(LOW_BATTERY_PULSE_ON_MS),
@@ -784,19 +823,19 @@ impl LowBatteryPulse {
                 true
             }
             PulsePhase::Orange { index, until } if now >= until => {
-                if identifying || !lightbar::is_enabled() {
+                if identifying || !claims.is_enabled() {
                     self.phase = PulsePhase::Gap {
                         until: now + Duration::from_millis(LOW_BATTERY_PULSE_GAP_MS),
                     };
                     return false;
                 }
                 let (serial, percent) = self.targets[index].clone();
-                let color = color_for_battery_percent(percent);
-                let _ = write_rgb_exclusive(cache, &serial, color);
+                let color = spectrum.color_at(percent);
+                let _ = write_rgb_exclusive(cache, claims, &serial, color);
                 let next = index + 1;
                 if next < self.targets.len() {
                     let (serial, _) = &self.targets[next];
-                    let _ = write_rgb_exclusive(cache, serial, LOW_BATTERY_ORANGE);
+                    let _ = write_rgb_exclusive(cache, claims, serial, LOW_BATTERY_ORANGE);
                     self.phase = PulsePhase::Orange {
                         index: next,
                         until: now + Duration::from_millis(LOW_BATTERY_PULSE_ON_MS),
@@ -824,10 +863,17 @@ pub struct HidWorkerHandle {
     live_pads: Arc<Mutex<HashMap<String, LivePadStatus>>>,
     /// Serials resolved from HID paths present at first enum (suppress Connected toast).
     launch_serials: Arc<Mutex<Vec<String>>>,
+    spectrum: SpectrumService,
+    /// Owned pad-input publication + edge bridge shared with the worker thread
+    /// and the iced subscription (no process-global).
+    input_hub: Arc<InputHub>,
+    /// Owned lightbar-claim unit shared with the worker thread and the
+    /// presence-empty fast path (no process-global).
+    claims: Arc<ClaimStore>,
 }
 
 impl HidWorkerHandle {
-    pub fn start() -> Self {
+    pub fn start(spectrum: SpectrumService) -> Self {
         let (tx, rx) = mpsc::channel::<HidCmd>();
         let identifying = Arc::new(AtomicBool::new(false));
         let identifying_worker = Arc::clone(&identifying);
@@ -839,8 +885,13 @@ impl HidWorkerHandle {
         let live_pads_worker = Arc::clone(&live_pads);
         let launch_serials = Arc::new(Mutex::new(Vec::new()));
         let launch_serials_worker = Arc::clone(&launch_serials);
-        let input_snapshot = Arc::new(Mutex::new(InputSnapshot::default()));
-        start_input::set_input_snapshot(Arc::clone(&input_snapshot));
+        let spectrum_worker = spectrum.clone();
+        // Fresh worker start owns a new input hub (seq restarts at 0).
+        let input_hub = Arc::new(InputHub::new());
+        let input_hub_worker = Arc::clone(&input_hub);
+        // Fresh worker start owns the lightbar-claim unit.
+        let claims = Arc::new(ClaimStore::new());
+        let claims_worker = Arc::clone(&claims);
         let last_noisy_log = Arc::new(Mutex::new(Instant::now() - PULSE_SAMPLE_LOG_INTERVAL));
         let last_noisy_log_worker = Arc::clone(&last_noisy_log);
 
@@ -853,10 +904,12 @@ impl HidWorkerHandle {
                     identifying_worker,
                     input_hot_worker,
                     last_noisy_log_worker,
-                    input_snapshot,
+                    input_hub_worker,
                     presence_worker,
                     live_pads_worker,
                     launch_serials_worker,
+                    spectrum_worker,
+                    claims_worker,
                 );
             })
             .expect("spawn hid-worker");
@@ -868,11 +921,14 @@ impl HidWorkerHandle {
             presence,
             live_pads,
             launch_serials,
+            spectrum,
+            input_hub,
+            claims,
         };
         // OS arrival/removal watcher (Windows/Linux; no-op elsewhere): fires
         // throttled list-only refresh hints so hot enumeration cannot freeze
         // discovery indefinitely. Heartbeat cap covers the rest.
-        let watched = crate::platform::device_watch::spawn_arrival_watcher({
+        let watched = Host::spawn({
             let handle = handle.clone();
             move || handle.notify_device_list_changed()
         });
@@ -884,6 +940,21 @@ impl HidWorkerHandle {
 
     pub fn identifying(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.identifying)
+    }
+
+    /// Owned battery spectrum shared with the worker thread.
+    pub fn spectrum(&self) -> SpectrumService {
+        self.spectrum.clone()
+    }
+
+    /// Owned pad-input hub shared with the worker thread and the iced subscription.
+    pub fn input_hub(&self) -> Arc<InputHub> {
+        Arc::clone(&self.input_hub)
+    }
+
+    /// Owned lightbar-claim unit shared with the worker thread.
+    pub fn claims(&self) -> Arc<ClaimStore> {
+        Arc::clone(&self.claims)
     }
 
     /// Latest DualSense gamepad HID paths from the worker's throttled refresh.
@@ -906,15 +977,10 @@ impl HidWorkerHandle {
         };
         let mut out: Vec<ControllerStatus> = guard
             .iter()
-            .map(|(serial, pad)| {
-                battery::dualsense_status(
-                    0,
-                    pad.product.clone(),
-                    pad.reading.connection,
-                    serial.clone(),
-                    pad.reading.percent,
-                    pad.reading.state,
-                )
+            .filter_map(|(serial, pad)| {
+                driver::find_for_kind(pad.kind).map(|d| {
+                    poll::status_from_reading(d, &pad.product, &pad.reading, serial.clone())
+                })
             })
             .collect();
         out.sort_by(|a, b| a.serial.cmp(&b.serial));
@@ -940,13 +1006,12 @@ impl HidWorkerHandle {
     pub fn poll(
         &self,
         previously: Vec<String>,
-    ) -> impl std::future::Future<Output = Result<Vec<ControllerStatus>, String>> + Send + use<>
-    {
+    ) -> impl std::future::Future<Output = AppResult<Vec<ControllerStatus>>> + Send + use<> {
         let (reply, rx) = oneshot::channel();
         let _ = self.tx.send(HidCmd::Poll { previously, reply });
         async move {
             rx.await
-                .map_err(|_| "hid-worker poll cancelled".to_string())?
+                .map_err(|_| AppError::Hid("hid-worker poll cancelled".into()))?
         }
     }
 
@@ -1019,15 +1084,26 @@ fn identify_flash_color(step: u32, normal: Rgb) -> Rgb {
 /// every SetRgb while start-nav is sampling).
 fn write_rgb_exclusive(
     cache: &mut DeviceCache,
+    claims: &ClaimStore,
     serial: &str,
     color: Rgb,
-) -> (Result<(), String>, HidPhaseTiming) {
+) -> (AppResult<()>, HidPhaseTiming) {
     cache.drop_serial(serial);
-    let (result, mut timing) = lightbar::apply_lightbar_rgb_timed(&cache.api, serial, color);
+    // Dispatch through the registry: the first family offering a lightbar
+    // backend owns the write (DualSense today). A future LED family threads
+    // its kind through `HidCmd`; until then the single-backend registry is
+    // exact. Missing serials keep the old "controller not found" shape.
+    let Some(backend) = DRIVERS.iter().copied().find_map(|d| d.lightbar()) else {
+        return (
+            Err(AppError::Hid(format!("controller {serial} not found"))),
+            HidPhaseTiming::default(),
+        );
+    };
+    let (result, mut timing) = backend.apply(&cache.api, serial, color, claims);
     if result.is_err() {
         // Stale device list — refresh once and retry.
         if cache.refresh_device_list().is_ok() {
-            let (retry, t2) = lightbar::apply_lightbar_rgb_timed(&cache.api, serial, color);
+            let (retry, t2) = backend.apply(&cache.api, serial, color, claims);
             timing.add_assign(t2);
             return (retry, timing);
         }
@@ -1047,13 +1123,20 @@ fn sample_one(
         return SampleOneResult::HardFail;
     }
     let key = normalize_identity(serial);
-    let (is_bluetooth, product) = {
+    let (is_bluetooth, product, kind) = {
         let open = cache.devices.get(&key).expect("ensure inserted");
-        (open.is_bluetooth, open.product.clone())
+        (open.is_bluetooth, open.product.clone(), open.kind)
     };
     let outcome = {
         let open = cache.devices.get(&key).expect("ensure inserted");
-        start_input::read_device_sample_short(&open.device, is_bluetooth, serial, input_hot)
+        let transport = crate::controller::hid::transport::HidapiTransport(&open.device);
+        let mut opts = crate::controller::hid::sample::SampleOpts::new(is_bluetooth, serial);
+        let _ = input_hot;
+        crate::controller::hid::sample::drain_sample(
+            &transport,
+            &mut opts,
+            &crate::controller::hid::policy::Policy::default(),
+        )
     };
     match outcome {
         ShortSampleOutcome::Ok { sample, battery } => {
@@ -1061,7 +1144,7 @@ fn sample_one(
                 open.silence_timeouts = 0;
             }
             if let Some(reading) = battery {
-                remember_live_pad(live_pads, serial, product, reading);
+                remember_live_pad(live_pads, serial, product, reading, kind);
             }
             SampleOneResult::Ok(start_input::hid_nav_reading(serial, sample))
         }
@@ -1100,6 +1183,7 @@ fn remember_live_pad(
     serial: &str,
     product: String,
     reading: battery::BatteryReading,
+    kind: ControllerKind,
 ) {
     let key = normalize_identity(serial);
     if let Ok(mut guard) = live_pads.lock() {
@@ -1108,6 +1192,7 @@ fn remember_live_pad(
             LivePadStatus {
                 product,
                 reading,
+                kind,
                 updated_at: Instant::now(),
             },
         );
@@ -1139,15 +1224,15 @@ enum SampleOneResult {
     HardFail,
 }
 
-fn snapshot_age_ms(snapshot: &Mutex<InputSnapshot>) -> u128 {
-    snapshot
+fn snapshot_age_ms(hub: &InputHub) -> u128 {
+    hub.snapshot_mutex()
         .lock()
         .map(|g| g.published_at.elapsed().as_millis())
         .unwrap_or(0)
 }
 
 fn publish_snapshot(
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     readings: Vec<NavReading>,
     reason: SnapshotReason,
     after_cmd: Option<&str>,
@@ -1155,34 +1240,21 @@ fn publish_snapshot(
     emit_edge: bool,
 ) {
     let _op = crate::controller::hid::diag::enter_op("publish_snapshot");
-    let prev_pads = snapshot.lock().map(|g| g.readings.len()).unwrap_or(0);
-    let gap_ms = snapshot_age_ms(snapshot);
+    let prev_pads = hub
+        .snapshot_mutex()
+        .lock()
+        .map(|g| g.readings.len())
+        .unwrap_or(0);
+    let gap_ms = snapshot_age_ms(hub);
     let was_empty = prev_pads == 0;
     let now_empty = readings.is_empty();
     let pad_count = readings.len();
 
-    let meta = if let Ok(mut guard) = snapshot.lock() {
-        guard.seq = guard.seq.saturating_add(1);
-        guard.published_at = Instant::now();
-        guard.reason = reason;
-        guard.readings = readings.clone();
-        SnapshotMeta {
-            published_at: guard.published_at,
-            seq: guard.seq,
-            reason: guard.reason,
-            pad_count: guard.readings.len(),
-        }
-    } else {
-        SnapshotMeta {
-            published_at: Instant::now(),
-            seq: 0,
-            reason,
-            pad_count,
-        }
-    };
+    // Store through the owned hub (single snapshot lock for write + meta, as before).
+    let meta = hub.publish(readings.clone(), reason);
 
     if emit_edge {
-        start_input::push_input_edge(start_input::InputEdge::from_snapshot(readings, &meta));
+        hub.push_edge(start_input::InputEdge::from_snapshot(readings, &meta));
     }
 
     let clearing = matches!(
@@ -1221,7 +1293,7 @@ fn presence_enum_interval(devices_empty: bool, input_hot: bool) -> Duration {
 fn sample_all_inputs(
     cache: &mut DeviceCache,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     input_hot: bool,
     last_noisy_log: &Mutex<Instant>,
     after_cmd: Option<&str>,
@@ -1232,7 +1304,8 @@ fn sample_all_inputs(
     let serials: Vec<String> = cache.devices.keys().cloned().collect();
     prune_live_pads(live_pads, &serials);
     let cached = serials.len();
-    let prev_by_id: HashMap<String, NavReading> = snapshot
+    let prev_by_id: HashMap<String, NavReading> = hub
+        .snapshot_mutex()
         .lock()
         .map(|g| {
             g.readings
@@ -1275,7 +1348,7 @@ fn sample_all_inputs(
             ));
         }
     }
-    publish_snapshot(snapshot, out, reason, after_cmd, last_noisy_log, input_hot);
+    publish_snapshot(hub, out, reason, after_cmd, last_noisy_log, input_hot);
     let sample_ms = sample_started.elapsed().as_millis();
     if after_ensure_ms >= 50 || sample_ms >= 50 {
         crate::controller::hid::diag::diag_info(format!(
@@ -1289,13 +1362,13 @@ fn sample_all_inputs(
 fn sample_serial_into_snapshot(
     cache: &mut DeviceCache,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     serial: &str,
     input_hot: bool,
 ) {
     match sample_one(cache, live_pads, serial, input_hot) {
         SampleOneResult::Ok(reading) => {
-            let edge = if let Ok(mut guard) = snapshot.lock() {
+            let edge = if let Ok(mut guard) = hub.snapshot_mutex().lock() {
                 guard.seq = guard.seq.saturating_add(1);
                 guard.published_at = Instant::now();
                 guard.reason = SnapshotReason::Identify;
@@ -1317,22 +1390,22 @@ fn sample_serial_into_snapshot(
                 None
             };
             if input_hot && let Some(edge) = edge {
-                start_input::push_input_edge(edge);
+                hub.push_edge(edge);
             }
         }
         SampleOneResult::Timeout | SampleOneResult::Silent | SampleOneResult::HardFail => {}
     }
 }
 
-fn log_cmd_begin(cmd: &str, snapshot: &Mutex<InputSnapshot>) {
-    let since_pub_ms = snapshot_age_ms(snapshot);
+fn log_cmd_begin(cmd: &str, hub: &InputHub) {
+    let since_pub_ms = snapshot_age_ms(hub);
     crate::controller::hid::diag::diag_info(format!(
         "hid-diag: cmd begin={cmd} since_publish_ms={since_pub_ms}"
     ));
 }
 
 fn maybe_log_sample_stall(
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     input_hot: bool,
     in_cmd: &str,
     stall_logged: &mut bool,
@@ -1342,7 +1415,7 @@ fn maybe_log_sample_stall(
         *stall_logged = false;
         return;
     }
-    let gap_ms = snapshot_age_ms(snapshot);
+    let gap_ms = snapshot_age_ms(hub);
     if gap_ms < SAMPLE_STALL_MS {
         *stall_logged = false;
         return;
@@ -1368,20 +1441,22 @@ fn maybe_log_sample_stall(
 #[allow(clippy::too_many_arguments)]
 fn begin_identify(
     cache: &mut DeviceCache,
+    spectrum: &SpectrumService,
+    claims: &ClaimStore,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     serial: String,
     percent: u8,
     identifying: &AtomicBool,
     last_noisy_log: &Mutex<Instant>,
     input_hot: bool,
 ) -> Option<IdentifySession> {
-    let normal = color_for_battery_percent(percent);
-    log_cmd_begin("Identify", snapshot);
+    let normal = spectrum.color_at(percent);
+    log_cmd_begin("Identify", hub);
     let started = Instant::now();
     let (result, timing) = {
         let _op = crate::controller::hid::diag::enter_op("cmd_Identify");
-        write_rgb_exclusive(cache, &serial, identify_flash_color(0, normal))
+        write_rgb_exclusive(cache, claims, &serial, identify_flash_color(0, normal))
     };
     if let Err(err) = result {
         app_log::warn(format!("identify failed for {serial}: {err}"));
@@ -1396,7 +1471,7 @@ fn begin_identify(
         identifying.store(false, Ordering::SeqCst);
         return None;
     }
-    sample_serial_into_snapshot(cache, live_pads, snapshot, &serial, input_hot);
+    sample_serial_into_snapshot(cache, live_pads, hub, &serial, input_hot);
     Some(IdentifySession {
         serial,
         normal,
@@ -1408,11 +1483,13 @@ fn begin_identify(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn advance_identify(
     session: &mut Option<IdentifySession>,
     cache: &mut DeviceCache,
+    claims: &ClaimStore,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     identifying: &AtomicBool,
     last_noisy_log: &Mutex<Instant>,
     input_hot: bool,
@@ -1439,7 +1516,7 @@ fn advance_identify(
         sample_all_inputs(
             cache,
             live_pads,
-            snapshot,
+            hub,
             input_hot,
             last_noisy_log,
             Some("Identify"),
@@ -1447,12 +1524,12 @@ fn advance_identify(
         return;
     }
 
-    log_cmd_begin("IdentifyFlash", snapshot);
+    log_cmd_begin("IdentifyFlash", hub);
     let color = identify_flash_color(s.next_write, s.normal);
     let serial = s.serial.clone();
     let (result, t) = {
         let _op = crate::controller::hid::diag::enter_op("cmd_IdentifyFlash");
-        write_rgb_exclusive(cache, &serial, color)
+        write_rgb_exclusive(cache, claims, &serial, color)
     };
     s.timing.add_assign(t);
     s.flashes += 1;
@@ -1471,7 +1548,7 @@ fn advance_identify(
         identifying.store(false, Ordering::SeqCst);
         return;
     }
-    sample_serial_into_snapshot(cache, live_pads, snapshot, &serial, input_hot);
+    sample_serial_into_snapshot(cache, live_pads, hub, &serial, input_hot);
     s.next_write += 1;
     s.wake_at = Instant::now() + Duration::from_millis(IDENTIFY_FLASH_MS);
 }
@@ -1487,20 +1564,37 @@ fn abort_identify(
     }
 }
 
-fn stop_all_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>) {
+/// Rumble backend for a known pad kind (`None` = family lacks motors).
+///
+/// Keys off the pad's kind, never the family name: an all-false-capability
+/// pad resolves to `None` here and no wire write runs.
+fn rumble_backend_for(kind: ControllerKind) -> Option<&'static dyn RumbleBackend> {
+    driver::find_for_kind(kind).and_then(|d| d.rumble())
+}
+
+fn stop_all_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>, claims: &ClaimStore) {
     for (serial, open) in rumble.devices.iter() {
-        let _ = rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, serial);
+        if let Some(backend) = rumble_backend_for(open.kind) {
+            let _ = backend.stop_rumble(&open.device, open.is_bluetooth, serial, claims);
+        }
     }
     active.clear();
     rumble.drop_all();
 }
 
 /// Stop motors and drop the rumble handle for one pad only.
-fn stop_rumble_for_serial(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>, serial: &str) {
+fn stop_rumble_for_serial(
+    rumble: &mut RumbleCache,
+    active: &mut Vec<ActiveRumble>,
+    serial: &str,
+    claims: &ClaimStore,
+) {
     let target = normalize_identity(serial);
     active.retain(|e| normalize_identity(&e.serial) != target);
-    if let Some(open) = rumble.devices.get(&target) {
-        let _ = rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, &target);
+    if let Some(open) = rumble.devices.get(&target)
+        && let Some(backend) = rumble_backend_for(open.kind)
+    {
+        let _ = backend.stop_rumble(&open.device, open.is_bluetooth, &target, claims);
     }
     rumble.drop_serial(&target);
 }
@@ -1521,11 +1615,27 @@ fn readings_without_power_off_target(readings: Vec<NavReading>, serial: &str) ->
 fn write_rumble_pulse(
     cache: &mut DeviceCache,
     rumble: &mut RumbleCache,
+    claims: &ClaimStore,
     serial: &str,
     right: u8,
     left: u8,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let target = normalize_identity(serial);
+
+    // Dispatch through the pad's driver: a family without a rumble backend
+    // fails here before any HID open. Unknown serials fall back to the first
+    // rumble-capable driver (DualSense today), preserving the old behavior of
+    // attempting the write regardless.
+    let kind = cache.devices.get(&target).map(|open| open.kind);
+    let driver = kind
+        .and_then(driver::find_for_kind)
+        .or_else(|| DRIVERS.iter().copied().find(|d| d.capabilities().rumble));
+    let Some(driver) = driver else {
+        return Err(AppError::Hid(format!("rumble: no driver for {target}")));
+    };
+    let Some(backend) = driver.rumble() else {
+        return Err(AppError::Hid(format!("rumble: unsupported for {target}")));
+    };
 
     // Prefer long-lived exclusive rumble handle. On write failure, drop and re-probe.
     for attempt in 0..2u8 {
@@ -1538,7 +1648,7 @@ fn write_rumble_pulse(
         match rumble.ensure(&cache.api, &target) {
             Ok(open) => {
                 let is_bt = open.is_bluetooth;
-                match rumble::set_rumble_on_device(&open.device, is_bt, &target, right, left) {
+                match backend.set_rumble(&open.device, is_bt, &target, right, left, claims) {
                     Ok(()) => {
                         crate::controller::hid::diag::diag_info(format!(
                             "hid-diag: rumble ok serial={target} r={right} l={left} bt={}",
@@ -1575,21 +1685,36 @@ fn write_rumble_pulse(
             );
             rumble.fallback_warned = true;
         }
-        return rumble::set_rumble_on_device(&open.device, open.is_bluetooth, &target, right, left)
-            .map_err(|e| e.to_string());
+        return backend
+            .set_rumble(
+                &open.device,
+                open.is_bluetooth,
+                &target,
+                right,
+                left,
+                claims,
+            )
+            .map_err(AppError::from);
     }
-    Err(format!("rumble: no handle for {target}"))
+    Err(AppError::Hid(format!("rumble: no handle for {target}")))
 }
 
-fn expire_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>, now: Instant) {
+fn expire_rumble(
+    rumble: &mut RumbleCache,
+    active: &mut Vec<ActiveRumble>,
+    claims: &ClaimStore,
+    now: Instant,
+) {
     let mut still = Vec::with_capacity(active.len());
     for entry in active.drain(..) {
         if entry.stop_at > now {
             still.push(entry);
             continue;
         }
-        if let Some(open) = rumble.devices.get(&normalize_identity(&entry.serial)) {
-            let _ = rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, &entry.serial);
+        if let Some(open) = rumble.devices.get(&normalize_identity(&entry.serial))
+            && let Some(backend) = rumble_backend_for(open.kind)
+        {
+            let _ = backend.stop_rumble(&open.device, open.is_bluetooth, &entry.serial, claims);
         }
     }
     *active = still;
@@ -1601,10 +1726,11 @@ fn execute_power_off(
     serial: &str,
     session: &mut Option<IdentifySession>,
     cache: &mut DeviceCache,
+    claims: &ClaimStore,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
     rumble: &mut RumbleCache,
     active_rumble: &mut Vec<ActiveRumble>,
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     identifying: &AtomicBool,
     last_noisy_log: &Mutex<Instant>,
     input_hot: bool,
@@ -1612,11 +1738,17 @@ fn execute_power_off(
     if session.as_ref().is_some_and(|s| s.serial == serial) {
         abort_identify(session, cache, identifying);
     }
-    stop_rumble_for_serial(rumble, active_rumble, serial);
+    // Capture the pad's family before `forget_live_pad` clears it below.
+    let kind = live_pads
+        .lock()
+        .map(|guard| guard.get(&normalize_identity(serial)).map(|pad| pad.kind))
+        .unwrap_or(None);
+    stop_rumble_for_serial(rumble, active_rumble, serial, claims);
     // Exclusive feature-report open needs this pad's input handle released only.
     cache.drop_serial(serial);
     forget_live_pad(live_pads, serial);
-    let remaining = snapshot
+    let remaining = hub
+        .snapshot_mutex()
         .lock()
         .map(|g| readings_without_power_off_target(g.readings.clone(), serial))
         .unwrap_or_default();
@@ -1631,18 +1763,31 @@ fn execute_power_off(
         SnapshotReason::SamplePartial
     };
     publish_snapshot(
-        snapshot,
+        hub,
         remaining,
         reason,
         Some("PowerOff"),
         last_noisy_log,
         input_hot,
     );
-    log_cmd_begin("PowerOff", snapshot);
+    log_cmd_begin("PowerOff", hub);
     let started = Instant::now();
+    // Dispatch through the pad's driver: a family without power-off support
+    // skips the feature report. Unknown serials fall back to the first
+    // power-capable driver (DualSense today), preserving the old behavior of
+    // attempting the write regardless.
     let (result, timing) = {
         let _ = cache.refresh_device_list();
-        battery::power_off_bluetooth_timed(&cache.api, serial)
+        let driver = kind
+            .and_then(driver::find_for_kind)
+            .or_else(|| DRIVERS.iter().copied().find(|d| d.capabilities().power_off));
+        match driver {
+            Some(driver) => driver.power_off(&cache.api, serial),
+            None => (
+                Err(AppError::Hid(format!("power-off: no driver for {serial}"))),
+                HidPhaseTiming::default(),
+            ),
+        }
     };
     match result {
         Ok(()) => app_log::info(format!("power-off sent for {serial}")),
@@ -1663,12 +1808,14 @@ fn handle_cmd(
     cmd: HidCmd,
     session: &mut Option<IdentifySession>,
     cache: &mut DeviceCache,
+    spectrum: &SpectrumService,
+    claims: &ClaimStore,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
     rumble: &mut RumbleCache,
     active_rumble: &mut Vec<ActiveRumble>,
     pending_power_off: &mut Option<PendingPowerOff>,
     pulse: &mut LowBatteryPulse,
-    snapshot: &Mutex<InputSnapshot>,
+    hub: &InputHub,
     identifying: &AtomicBool,
     last_noisy_log: &Mutex<Instant>,
     input_hot: bool,
@@ -1678,14 +1825,14 @@ fn handle_cmd(
         HidCmd::Shutdown => {
             *pending_power_off = None;
             abort_identify(session, cache, identifying);
-            stop_all_rumble(rumble, active_rumble);
+            stop_all_rumble(rumble, active_rumble, claims);
             pulse.set_targets(Vec::new());
             cache.drop_all();
             if let Ok(mut guard) = live_pads.lock() {
                 guard.clear();
             }
             publish_snapshot(
-                snapshot,
+                hub,
                 Vec::new(),
                 SnapshotReason::ClearedShutdown,
                 Some("Shutdown"),
@@ -1699,8 +1846,10 @@ fn handle_cmd(
             identifying.store(true, Ordering::SeqCst);
             *session = begin_identify(
                 cache,
+                spectrum,
+                claims,
                 live_pads,
-                snapshot,
+                hub,
                 serial,
                 percent,
                 identifying,
@@ -1728,10 +1877,11 @@ fn handle_cmd(
                 &serial,
                 session,
                 cache,
+                claims,
                 live_pads,
                 rumble,
                 active_rumble,
-                snapshot,
+                hub,
                 identifying,
                 last_noisy_log,
                 input_hot,
@@ -1742,13 +1892,13 @@ fn handle_cmd(
             if session.as_ref().is_some_and(|s| s.serial == serial) {
                 return false;
             }
-            log_cmd_begin("SetRgb", snapshot);
+            log_cmd_begin("SetRgb", hub);
             let started = Instant::now();
-            let (result, timing) = write_rgb_exclusive(cache, &serial, color);
+            let (result, timing) = write_rgb_exclusive(cache, claims, &serial, color);
             if let Err(err) = result {
                 app_log::warn(format!("lightbar write failed for {serial}: {err}"));
             } else {
-                lightbar::note_lightbar_applied(&serial, color);
+                claims.note_applied(&serial, color);
             }
             log_cmd(
                 "SetRgb",
@@ -1769,16 +1919,18 @@ fn handle_cmd(
             let target = normalize_identity(&serial);
             // Retrigger: replace any pending stop for this serial.
             active_rumble.retain(|e| normalize_identity(&e.serial) != target);
-            match write_rumble_pulse(cache, rumble, &target, right, left) {
+            match write_rumble_pulse(cache, rumble, claims, &target, right, left) {
                 Ok(()) => {
                     if duration_ms > 0 && (right > 0 || left > 0) {
                         active_rumble.push(ActiveRumble {
                             serial: target,
                             stop_at: Instant::now() + Duration::from_millis(duration_ms),
                         });
-                    } else if let Some(open) = rumble.devices.get(&target) {
+                    } else if let Some(open) = rumble.devices.get(&target)
+                        && let Some(backend) = rumble_backend_for(open.kind)
+                    {
                         let _ =
-                            rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, &target);
+                            backend.stop_rumble(&open.device, open.is_bluetooth, &target, claims);
                     }
                 }
                 Err(err) => {
@@ -1790,7 +1942,7 @@ fn handle_cmd(
             false
         }
         HidCmd::RumbleStopAll => {
-            stop_all_rumble(rumble, active_rumble);
+            stop_all_rumble(rumble, active_rumble, claims);
             false
         }
         HidCmd::SetLowBatteryTargets { targets } => {
@@ -1813,13 +1965,13 @@ fn handle_cmd(
             // Continuous sampling already reaps dead handles (HardFail), the
             // session hold covers transient read misses, and rumble re-probes
             // on write failure — no mass drop needed.
-            log_cmd_begin("Poll", snapshot);
+            log_cmd_begin("Poll", hub);
             let started = Instant::now();
             let mut quiet = Vec::new();
             let (result, timing) = {
                 let _op = crate::controller::hid::diag::enter_op("cmd_Poll");
                 let _ = cache.refresh_device_list();
-                poll_incremental(cache, live_pads, &previously, &mut quiet)
+                poll_incremental(cache, spectrum, claims, live_pads, &previously, &mut quiet)
             };
             for serial in quiet {
                 cache.queue_launch_serial(serial);
@@ -1847,10 +1999,12 @@ fn handle_cmd(
 /// poll misses are left alone so sampling (not a map wipe) owns liveness.
 fn poll_incremental(
     cache: &mut DeviceCache,
+    spectrum: &SpectrumService,
+    claims: &ClaimStore,
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
     previously: &[String],
     launch_quiet: &mut Vec<String>,
-) -> (Result<Vec<ControllerStatus>, String>, HidPhaseTiming) {
+) -> (AppResult<Vec<ControllerStatus>>, HidPhaseTiming) {
     let mut timing = HidPhaseTiming::default();
     let now = Instant::now();
 
@@ -1880,7 +2034,7 @@ fn poll_incremental(
     timing.enumerate_ms += enum_started.elapsed().as_millis();
 
     if devices.is_empty() {
-        lightbar::sync_lightbar_claims(std::iter::empty::<&str>());
+        claims.sync(std::iter::empty::<&str>());
         return (Ok(Vec::new()), timing);
     }
 
@@ -1891,42 +2045,38 @@ fn poll_incremental(
         if is_storable_serial(&hint) && cache.devices.contains_key(&key) {
             if let Some((product, reading, at)) = live_snapshot.get(&key)
                 && now.saturating_duration_since(*at) < POLL_LIVE_BATTERY_STALE
+                && let Some(driver) = cache
+                    .devices
+                    .get(&key)
+                    .and_then(|open| driver::find_for_kind(open.kind))
             {
                 if let Some(serial) = cache.launch_paths.take_serial_for_path(&path, &key) {
                     launch_quiet.push(serial);
                 }
-                statuses.push(battery::dualsense_status(
-                    0,
-                    product.clone(),
-                    reading.connection,
-                    key.clone(),
-                    reading.percent,
-                    reading.state,
-                ));
+                statuses.push(poll::status_from_reading(driver, product, reading, key));
                 continue;
             }
             // Stale: fail-fast read on the cached handle (no extra open).
-            let product = cache.devices.get(&key).map(|open| open.product.clone());
             let io_started = Instant::now();
-            let outcome = cache
-                .devices
-                .get(&key)
-                .map(|open| battery::read_battery_fast(&open.device));
+            let stale = cache.devices.get(&key).and_then(|open| {
+                driver::find_for_kind(open.kind).map(|d| {
+                    (
+                        open.product.clone(),
+                        open.kind,
+                        d.read_battery_fast(&open.device),
+                    )
+                })
+            });
             timing.io_ms += io_started.elapsed().as_millis();
-            match (product, outcome) {
-                (Some(product), Some(Ok(reading))) => {
+            match stale {
+                Some((product, kind, Ok(reading))) => {
                     if let Some(serial) = cache.launch_paths.take_serial_for_path(&path, &key) {
                         launch_quiet.push(serial);
                     }
-                    remember_live_pad(live_pads, &key, product.clone(), reading.clone());
-                    statuses.push(battery::dualsense_status(
-                        0,
-                        product,
-                        reading.connection,
-                        key,
-                        reading.percent,
-                        reading.state,
-                    ));
+                    remember_live_pad(live_pads, &key, product.clone(), reading.clone(), kind);
+                    if let Some(driver) = driver::find_for_kind(kind) {
+                        statuses.push(poll::status_from_reading(driver, &product, &reading, key));
+                    }
                     continue;
                 }
                 _ => {
@@ -1940,13 +2090,20 @@ fn poll_incremental(
         // Full probe: new serial, unknown hint, or re-probe after a drop.
         // Re-resolve the device by path (list may have shifted since enumerate).
         let open_started = Instant::now();
-        let probed: Option<(String, String, battery::BatteryReading, u128)> = (|| {
+        let probed: Option<(
+            String,
+            String,
+            battery::BatteryReading,
+            u128,
+            ControllerKind,
+        )> = (|| {
             let api = &cache.api;
             let info = api
                 .device_list()
                 .filter(|d| driver::is_gamepad(d))
                 .find(|d| d.path().to_string_lossy().into_owned() == path)?;
-            let product = product_name(info.product_id()).to_string();
+            let driver = driver::find_for_info(info)?;
+            let product = driver.product_name(info.product_id()).to_string();
             let hid = hid_serial(info);
             let device = match info.open_device(api) {
                 Ok(d) => {
@@ -1975,11 +2132,11 @@ fn poll_incremental(
             };
             let serial = resolve_device_identity(info, &device);
             let io_started = Instant::now();
-            match battery::read_battery(&device) {
+            match driver.read_battery(&device) {
                 Ok(reading) => {
                     let io_ms = io_started.elapsed().as_millis();
                     drop(device);
-                    Some((serial, product, reading, io_ms))
+                    Some((serial, product, reading, io_ms, driver.kind()))
                 }
                 Err(err) => {
                     let io_ms = io_started.elapsed().as_millis();
@@ -2000,21 +2157,19 @@ fn poll_incremental(
             }
         })();
         timing.open_ms += open_started.elapsed().as_millis();
-        let Some((serial, product, reading, io_ms)) = probed else {
+        let Some((serial, product, reading, io_ms, kind)) = probed else {
             continue;
         };
         timing.io_ms += io_ms;
         if let Some(serial) = cache.launch_paths.take_serial_for_path(&path, &serial) {
             launch_quiet.push(serial);
         }
-        remember_live_pad(live_pads, &serial, product.clone(), reading.clone());
-        statuses.push(battery::dualsense_status(
-            0,
-            product,
-            reading.connection,
-            serial,
-            reading.percent,
-            reading.state,
+        remember_live_pad(live_pads, &serial, product.clone(), reading.clone(), kind);
+        let Some(driver) = driver::find_for_kind(kind) else {
+            continue;
+        };
+        statuses.push(poll::status_from_reading(
+            driver, &product, &reading, serial,
         ));
     }
 
@@ -2024,7 +2179,15 @@ fn poll_incremental(
         status.index = i + 1;
     }
 
-    poll::reassert_lightbar_for_pads(&cache.api, previously, statuses.iter(), &mut timing);
+    poll::reassert_lightbar_for_pads(
+        &cache.api,
+        spectrum,
+        claims,
+        previously,
+        statuses.iter(),
+        &mut timing,
+        DRIVERS,
+    );
     (Ok(statuses), timing)
 }
 
@@ -2034,20 +2197,29 @@ fn worker_loop(
     identifying: Arc<AtomicBool>,
     input_hot: Arc<AtomicBool>,
     last_noisy_log: Arc<Mutex<Instant>>,
-    input_snapshot: Arc<Mutex<InputSnapshot>>,
+    input_hub: Arc<InputHub>,
     presence: Arc<Mutex<Vec<String>>>,
     live_pads: Arc<Mutex<HashMap<String, LivePadStatus>>>,
     launch_serials: Arc<Mutex<Vec<String>>>,
+    spectrum: SpectrumService,
+    claims: Arc<ClaimStore>,
 ) {
-    let mut cache = match DeviceCache::new(presence, launch_serials) {
+    let mut cache = match DeviceCache::new(presence, launch_serials, spectrum, Arc::clone(&claims))
+    {
         Ok(c) => c,
         Err(err) => {
             app_log::warn(format!("hid-worker: HidApi init failed: {err}"));
             return;
         }
     };
+    // Owned copies for HID color reads + lightbar claims; cloned (never held
+    // across writes) so the `&mut cache` borrows below never alias the
+    // borrowed values.
+    let spectrum = cache.spectrum.clone();
+    let claims_owned = cache.claims.clone();
+    let claims: &ClaimStore = &claims_owned;
     // Clear claims poisoned by prior no-op writes on input-cache handles.
-    lightbar::forget_all_claims();
+    claims.forget_all();
     let mut rumble = RumbleCache::new();
     let mut active_rumble: Vec<ActiveRumble> = Vec::new();
     let mut pending_power_off: Option<PendingPowerOff> = None;
@@ -2060,32 +2232,27 @@ fn worker_loop(
         crate::controller::hid::diag::note_progress("worker_loop");
         let hot = input_hot.load(Ordering::Relaxed);
         let now = Instant::now();
-        expire_rumble(&mut rumble, &mut active_rumble, now);
+        expire_rumble(&mut rumble, &mut active_rumble, claims, now);
         for serial in take_due_power_offs(&mut pending_power_off, &active_rumble, now) {
             execute_power_off(
                 &serial,
                 &mut session,
                 &mut cache,
+                claims,
                 &live_pads,
                 &mut rumble,
                 &mut active_rumble,
-                &input_snapshot,
+                &input_hub,
                 &identifying,
                 &last_noisy_log,
                 hot,
             );
         }
         let identifying_now = session.is_some() || identifying.load(Ordering::SeqCst);
-        if pulse.tick(&mut cache, identifying_now, now) {
+        if pulse.tick(&mut cache, &spectrum, claims, identifying_now, now) {
             in_cmd = "LowBatteryPulse";
         }
-        maybe_log_sample_stall(
-            &input_snapshot,
-            hot,
-            in_cmd,
-            &mut stall_logged,
-            &last_noisy_log,
-        );
+        maybe_log_sample_stall(&input_hub, hot, in_cmd, &mut stall_logged, &last_noisy_log);
 
         if session
             .as_ref()
@@ -2095,8 +2262,9 @@ fn worker_loop(
             advance_identify(
                 &mut session,
                 &mut cache,
+                claims,
                 &live_pads,
-                &input_snapshot,
+                &input_hub,
                 &identifying,
                 &last_noisy_log,
                 hot,
@@ -2126,12 +2294,14 @@ fn worker_loop(
                     cmd,
                     &mut session,
                     &mut cache,
+                    &spectrum,
+                    claims,
                     &live_pads,
                     &mut rumble,
                     &mut active_rumble,
                     &mut pending_power_off,
                     &mut pulse,
-                    &input_snapshot,
+                    &input_hub,
                     &identifying,
                     &last_noisy_log,
                     hot,
@@ -2163,7 +2333,7 @@ fn worker_loop(
                     .wake_at
                     .saturating_duration_since(Instant::now())
                     .min(IDENTIFY_SAMPLE_POLL);
-                sample_serial_into_snapshot(&mut cache, &live_pads, &input_snapshot, &serial, hot);
+                sample_serial_into_snapshot(&mut cache, &live_pads, &input_hub, &serial, hot);
                 if !until_flash.is_zero() {
                     thread::sleep(until_flash.min(ACTIVE_POLL));
                 }
@@ -2171,7 +2341,7 @@ fn worker_loop(
                 sample_all_inputs(
                     &mut cache,
                     &live_pads,
-                    &input_snapshot,
+                    &input_hub,
                     hot,
                     &last_noisy_log,
                     None,
@@ -2215,12 +2385,14 @@ fn worker_loop(
                     cmd,
                     &mut session,
                     &mut cache,
+                    &spectrum,
+                    claims,
                     &live_pads,
                     &mut rumble,
                     &mut active_rumble,
                     &mut pending_power_off,
                     &mut pulse,
-                    &input_snapshot,
+                    &input_hub,
                     &identifying,
                     &last_noisy_log,
                     hot,
@@ -2377,7 +2549,7 @@ mod tests {
         NavReading {
             id: start_input::PadId(id.to_string()),
             sample: start_input::PadSample::default(),
-            source: start_input::NavSource::Hid,
+            source: start_input::NavSource::HID,
         }
     }
 
@@ -2415,7 +2587,13 @@ mod tests {
     fn ghost_path_backoff_clears_on_success_and_refresh() {
         let presence = Arc::new(Mutex::new(Vec::new()));
         let launch_serials = Arc::new(Mutex::new(Vec::new()));
-        let mut cache = DeviceCache::new(presence, launch_serials).expect("hidapi init");
+        let mut cache = DeviceCache::new(
+            presence,
+            launch_serials,
+            SpectrumService::default(),
+            Arc::new(ClaimStore::new()),
+        )
+        .expect("hidapi init");
         let ghost = "ghost-path".to_string();
         cache.note_open_result(&ghost, false);
         cache.note_open_result(&ghost, false);

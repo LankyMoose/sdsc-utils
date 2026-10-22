@@ -1,9 +1,10 @@
 //! SVG rasterization for tray / UI icons (`resvg`).
 
+use crate::{AppError, AppResult};
 use resvg::tiny_skia;
 use resvg::usvg;
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
 pub const DUALSENSE_SVG: &str = include_str!("../../assets/icons/dualsense.svg");
 pub const SETTINGS_SVG: &str = include_str!("../../assets/icons/settings.svg");
@@ -11,8 +12,6 @@ pub const IDENTIFY_SVG: &str = include_str!("../../assets/icons/identify.svg");
 pub const POWER_SVG: &str = include_str!("../../assets/icons/power.svg");
 pub const EDIT_SVG: &str = include_str!("../../assets/icons/edit.svg");
 pub const CLOSE_SVG: &str = include_str!("../../assets/icons/close.svg");
-#[allow(dead_code)] // available for title-bar chrome
-pub const MINIMIZE_SVG: &str = include_str!("../../assets/icons/minimize.svg");
 pub const CHECK_SVG: &str = include_str!("../../assets/icons/check.svg");
 pub const PIN_SVG: &str = include_str!("../../assets/icons/pin.svg");
 pub const FACE_CROSS_SVG: &str = include_str!("../../assets/icons/face-cross.svg");
@@ -24,10 +23,8 @@ pub const BUG_SVG: &str = include_str!("../../assets/icons/bug.svg");
 pub const GITHUB_SVG: &str = include_str!("../../assets/icons/github.svg");
 pub const MICROSOFT_STORE_SVG: &str = include_str!("../../assets/icons/microsoft-store.svg");
 /// Indeterminate arc; rotated by [`crate::ui::configure`] for pending states.
-#[allow(dead_code)] // debug-only pending indicator
 pub const SPINNER_SVG: &str = include_str!("../../assets/icons/spinner.svg");
 /// Disclosure chevron; rotated 90° when a row is expanded.
-#[allow(dead_code)] // debug-only disclosure control
 pub const CHEVRON_SVG: &str = include_str!("../../assets/icons/chevron.svg");
 
 /// Canonical DualSense body fill in [`DUALSENSE_SVG`].
@@ -41,7 +38,10 @@ pub const BODY: [u8; 4] = [235, 235, 240, 255];
 pub const BODY_DIM: [u8; 4] = [120, 120, 128, 255];
 pub const SHADE: [u8; 4] = [40, 40, 48, 255];
 pub const SHADE_DIM: [u8; 4] = [70, 70, 78, 255];
-#[allow(dead_code)] // used by build.rs / connected tray embed
+/// Canonical accent fill for the connected DualSense tray/EXE icon.
+///
+/// Read by [`render_dualsense_connected_rgba`], which rasterizes the icons
+/// embedded by `build.rs` (tray + Windows `.exe`) and `gen_msix_logos`.
 pub const ACCENT: [u8; 4] = [0, 90, 255, 255];
 pub const ACCENT_DIM: [u8; 4] = [80, 80, 90, 255];
 
@@ -54,7 +54,7 @@ pub struct RgbaColor {
 }
 
 impl RgbaColor {
-    #[allow(dead_code)]
+    /// Opaque color helper (unit tests; production palettes use [`Self::from_rgba`]).
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b, a: 255 }
     }
@@ -79,7 +79,7 @@ pub struct ColorMap {
 }
 
 impl ColorMap {
-    #[allow(dead_code)]
+    /// Single-accent map (unit tests; production icons use the DualSense maps).
     pub fn current_color(color: RgbaColor) -> Self {
         Self {
             replacements: vec![("currentColor".into(), color.to_hex())],
@@ -130,47 +130,88 @@ struct CacheKey {
     colors: ColorMap,
 }
 
-static RASTER_CACHE: LazyLock<Mutex<HashMap<CacheKey, Vec<u8>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Owned SVG raster cache.
+///
+/// Owned by the Start image layer
+/// ([`crate::ui::start::icon_cache::IconCache`]: constructed in
+/// `IconCache::new`, wiped on process Exit) — no process-global instance.
+/// Runtime tray / iced views use `svg::Handle::from_memory` directly; the
+/// build-time embed (`build.rs`, `gen_msix_logos`) rasterizes through a
+/// short-lived local instance via the `render_dualsense_*` helpers below.
+pub struct SvgRasterCache {
+    inner: Mutex<HashMap<CacheKey, Vec<u8>>>,
+}
 
-/// Drop every cached SVG raster (process Exit).
-pub fn clear_cache() {
-    if let Ok(mut cache) = RASTER_CACHE.lock() {
-        cache.clear();
+impl SvgRasterCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Rasterize an SVG into straight RGBA (`size × size × 4`).
+    pub fn rasterize(&self, svg: &str, size: u32, colors: &ColorMap) -> AppResult<Vec<u8>> {
+        if size == 0 {
+            return Err(AppError::Ui("svg rasterize size must be > 0".into()));
+        }
+
+        let key = CacheKey {
+            svg: svg.to_string(),
+            size,
+            colors: colors.clone(),
+        };
+        if let Ok(cache) = self.inner.lock()
+            && let Some(hit) = cache.get(&key)
+        {
+            return Ok(hit.clone());
+        }
+
+        let rgba = rasterize_uncached(svg, size, colors)?;
+        if let Ok(mut cache) = self.inner.lock() {
+            cache.insert(key, rgba.clone());
+        }
+        Ok(rgba)
+    }
+
+    /// Drop every cached SVG raster (process Exit).
+    pub fn clear_all(&self) {
+        if let Ok(mut cache) = self.inner.lock() {
+            cache.clear();
+        }
     }
 }
 
-/// Rasterize an SVG into straight RGBA (`size × size × 4`).
-pub fn rasterize(svg: &str, size: u32, colors: &ColorMap) -> Result<Vec<u8>, String> {
-    if size == 0 {
-        return Err("svg rasterize size must be > 0".into());
+impl Default for SvgRasterCache {
+    fn default() -> Self {
+        Self::new()
     }
+}
 
-    let key = CacheKey {
-        svg: svg.to_string(),
+/// Connected DualSense raster for the tray / Windows `.exe` icon.
+///
+/// Called by `build.rs` (tray bytes + `app.ico`) and `src/bin/gen_msix_logos.rs`
+/// (Store logos); both include this file via `#[path]` so the helper must
+/// stay even though the app itself rasterizes through [`SvgRasterCache`].
+pub fn render_dualsense_connected_rgba(size: u32) -> AppResult<Vec<u8>> {
+    SvgRasterCache::new().rasterize(
+        DUALSENSE_SVG,
         size,
-        colors: colors.clone(),
-    };
-    if let Ok(cache) = RASTER_CACHE.lock()
-        && let Some(hit) = cache.get(&key)
-    {
-        return Ok(hit.clone());
-    }
-
-    let rgba = rasterize_uncached(svg, size, colors)?;
-    if let Ok(mut cache) = RASTER_CACHE.lock() {
-        cache.insert(key, rgba.clone());
-    }
-    Ok(rgba)
+        &ColorMap::dualsense_connected(RgbaColor::from_rgba(ACCENT)),
+    )
 }
 
-fn rasterize_uncached(svg: &str, size: u32, colors: &ColorMap) -> Result<Vec<u8>, String> {
+/// Dim DualSense raster for the disconnected tray icon (see above).
+pub fn render_dualsense_dim_rgba(size: u32) -> AppResult<Vec<u8>> {
+    SvgRasterCache::new().rasterize(DUALSENSE_SVG, size, &ColorMap::dualsense_dim())
+}
+
+fn rasterize_uncached(svg: &str, size: u32, colors: &ColorMap) -> AppResult<Vec<u8>> {
     let tinted = colors.apply(svg);
     let tree = usvg::Tree::from_str(&tinted, &usvg::Options::default())
-        .map_err(|e| format!("parse SVG: {e}"))?;
+        .map_err(|e| AppError::Ui(format!("parse SVG: {e}")))?;
 
     let mut pixmap = tiny_skia::Pixmap::new(size, size)
-        .ok_or_else(|| format!("allocate {size}x{size} pixmap"))?;
+        .ok_or_else(|| AppError::Ui(format!("allocate {size}x{size} pixmap")))?;
 
     let svg_size = tree.size();
     let svg_w = svg_size.width().max(1.0);
@@ -202,32 +243,19 @@ fn straight_rgba_from_premultiplied(premul: &[u8]) -> Vec<u8> {
     out
 }
 
-#[allow(dead_code)] // used by build.rs
-pub fn render_dualsense_connected_rgba(size: u32) -> Result<Vec<u8>, String> {
-    rasterize(
-        DUALSENSE_SVG,
-        size,
-        &ColorMap::dualsense_connected(RgbaColor::from_rgba(ACCENT)),
-    )
-}
-
-#[allow(dead_code)] // used by build.rs
-pub fn render_dualsense_dim_rgba(size: u32) -> Result<Vec<u8>, String> {
-    rasterize(DUALSENSE_SVG, size, &ColorMap::dualsense_dim())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn power_svg_rasterizes_with_alpha() {
-        let rgba = rasterize(
-            POWER_SVG,
-            24,
-            &ColorMap::current_color(RgbaColor::rgb(170, 178, 189)),
-        )
-        .unwrap();
+        let rgba = SvgRasterCache::new()
+            .rasterize(
+                POWER_SVG,
+                24,
+                &ColorMap::current_color(RgbaColor::rgb(170, 178, 189)),
+            )
+            .unwrap();
         assert_eq!(rgba.len(), 24 * 24 * 4);
         assert!(rgba.as_chunks::<4>().0.iter().any(|px| px[3] > 0));
         assert!(rgba.as_chunks::<4>().0.iter().any(|px| px[3] == 0));
@@ -235,18 +263,21 @@ mod tests {
 
     #[test]
     fn dualsense_palette_swap_changes_accent() {
-        let blue = rasterize(
-            DUALSENSE_SVG,
-            32,
-            &ColorMap::dualsense_connected(RgbaColor::rgb(0, 90, 255)),
-        )
-        .unwrap();
-        let red = rasterize(
-            DUALSENSE_SVG,
-            32,
-            &ColorMap::dualsense_connected(RgbaColor::rgb(255, 0, 0)),
-        )
-        .unwrap();
+        let cache = SvgRasterCache::new();
+        let blue = cache
+            .rasterize(
+                DUALSENSE_SVG,
+                32,
+                &ColorMap::dualsense_connected(RgbaColor::rgb(0, 90, 255)),
+            )
+            .unwrap();
+        let red = cache
+            .rasterize(
+                DUALSENSE_SVG,
+                32,
+                &ColorMap::dualsense_connected(RgbaColor::rgb(255, 0, 0)),
+            )
+            .unwrap();
         assert_eq!(blue.len(), 32 * 32 * 4);
         assert!(blue.as_chunks::<4>().0.iter().any(|px| px[3] > 0));
         assert_ne!(blue, red);

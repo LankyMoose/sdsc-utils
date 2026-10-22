@@ -4,6 +4,11 @@
 
 #![allow(dead_code)]
 
+/// Shared error channel: canonical definition lives in `sdsc_utils::app_error`;
+/// this crate compiles `src/ui/svg_icon.rs` via `#[path]`, so the shared
+/// module's names must resolve through `crate::` here too.
+use sdsc_utils::{AppError, AppResult};
+
 #[path = "../ui/svg_icon.rs"]
 mod svg_icon;
 

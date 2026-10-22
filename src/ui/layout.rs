@@ -1,8 +1,7 @@
 //! Popup / toast placement and iced window platform settings.
 
 use crate::persist::prefs::ToastPosition;
-#[cfg(windows)]
-use crate::platform::win32;
+use crate::platform::host::{self, Host};
 use crate::ui::toast::view as toast_view;
 
 use iced::{Point, Size, Task, window};
@@ -90,10 +89,8 @@ pub fn show_toast_without_activate<Message: Send + 'static>(id: window::Id) -> T
                 return;
             };
             let hwnd = win32_handle.hwnd.get();
-            unsafe {
-                win32::apply_noactivate_exstyle(hwnd, true);
-                win32::ShowWindow(hwnd, win32::SW_SHOWNOACTIVATE);
-            }
+            host::set_no_activate(hwnd, true);
+            host::show_window(hwnd);
         })
         .discard()
     }
@@ -118,12 +115,10 @@ fn quiet_show<Message: Send + 'static>(id: window::Id, show: bool) -> Task<Messa
             return;
         };
         let hwnd = win32_handle.hwnd.get();
-        unsafe {
-            win32::move_to_secondary_monitor(hwnd);
-            if show {
-                win32::apply_noactivate_exstyle(hwnd, true);
-                win32::ShowWindow(hwnd, win32::SW_SHOWNOACTIVATE);
-            }
+        host::move_to_secondary_monitor(hwnd);
+        if show {
+            host::set_no_activate(hwnd, true);
+            host::show_window(hwnd);
         }
     })
     .discard()
@@ -179,9 +174,7 @@ pub fn set_toast_topmost<Message: Send + 'static>(id: window::Id) -> Task<Messag
                 return;
             };
             let hwnd = win32_handle.hwnd.get();
-            unsafe {
-                win32::apply_noactivate_exstyle(hwnd, true);
-            }
+            host::set_no_activate(hwnd, true);
         })
         .discard()
     }
@@ -205,9 +198,7 @@ pub fn raise_window_topmost<Message: Send + 'static>(id: window::Id) -> Task<Mes
                 return;
             };
             let hwnd = win32_handle.hwnd.get();
-            unsafe {
-                win32::raise_topmost(hwnd);
-            }
+            host::focus(hwnd);
         })
         .discard()
     }
@@ -254,9 +245,7 @@ pub fn invalidate_toast<Message: Send + 'static>(id: window::Id) -> Task<Message
                 return;
             };
             let hwnd = win32_handle.hwnd.get();
-            unsafe {
-                win32::invalidate_hwnd(hwnd);
-            }
+            host::invalidate_hwnd(hwnd);
         })
         .discard()
     }
@@ -299,9 +288,7 @@ pub fn hide_toast<Message: Send + 'static>(id: window::Id) -> Task<Message> {
                 return;
             };
             let hwnd = win32_handle.hwnd.get();
-            unsafe {
-                win32::ShowWindow(hwnd, win32::SW_HIDE);
-            }
+            host::hide(hwnd);
         })
         .discard()
     }
@@ -450,29 +437,12 @@ pub fn primary_monitor_cover() -> Option<MonitorCover> {
 ///
 /// Used for immersive Start idle cursor hide — secondary monitors keep a visible
 /// cursor even while Start covers the primary.
+///
+/// Delegates to the [`Host`](crate::platform::host::Host) monitors seam; the
+/// Windows branch compares the cursor's monitor against the primary verbatim,
+/// other platforms return `false`.
 pub fn cursor_on_primary_monitor() -> bool {
-    #[cfg(windows)]
-    {
-        unsafe {
-            let mut point = win32::Point::default();
-            if win32::GetCursorPos(&mut point) == 0 {
-                return false;
-            }
-            let primary = win32::MonitorFromPoint(
-                win32::Point { x: 0, y: 0 },
-                win32::MONITOR_DEFAULTTOPRIMARY,
-            );
-            if primary == 0 {
-                return false;
-            }
-            let under_cursor = win32::MonitorFromPoint(point, win32::MONITOR_DEFAULTTONULL);
-            under_cursor != 0 && under_cursor == primary
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    crate::platform::host::Host::cursor_on_primary_monitor()
 }
 
 /// Primary-monitor toast target in logical pixels.
@@ -505,53 +475,21 @@ struct PrimaryMonitorMetrics {
 
 #[cfg(windows)]
 fn primary_monitor_metrics() -> Option<PrimaryMonitorMetrics> {
-    unsafe {
-        let monitor =
-            win32::MonitorFromPoint(win32::Point { x: 0, y: 0 }, win32::MONITOR_DEFAULTTOPRIMARY);
-        if monitor == 0 {
-            return None;
-        }
+    // Geometry comes from the host seam as physical pixels + DPI scale (no UI
+    // type crosses into `platform`); the logical cover conversion stays here.
+    let (monitor, work, scale, foreground_covers_monitor) = Host::primary_metrics()?;
+    let to_cover = |rect: (i32, i32, i32, i32)| MonitorCover {
+        x: rect.0 as f32 / scale,
+        y: rect.1 as f32 / scale,
+        width: (rect.2 - rect.0).max(1) as f32 / scale,
+        height: (rect.3 - rect.1).max(1) as f32 / scale,
+    };
 
-        let mut info = win32::MonitorInfo {
-            size: std::mem::size_of::<win32::MonitorInfo>() as u32,
-            monitor: win32::Rect::default(),
-            work: win32::Rect::default(),
-            flags: 0,
-        };
-        if win32::GetMonitorInfoW(monitor, &mut info) == 0 {
-            return None;
-        }
-
-        let mut dpi_x = 0u32;
-        let mut dpi_y = 0u32;
-        let dpi_ok =
-            win32::GetDpiForMonitor(monitor, win32::MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) == 0
-                && dpi_x > 0;
-        let scale = if dpi_ok { dpi_x as f32 / 96.0 } else { 1.0 };
-
-        let to_cover = |rect: win32::Rect| MonitorCover {
-            x: rect.left as f32 / scale,
-            y: rect.top as f32 / scale,
-            width: (rect.right - rect.left).max(1) as f32 / scale,
-            height: (rect.bottom - rect.top).max(1) as f32 / scale,
-        };
-
-        let foreground = win32::GetForegroundWindow();
-        let mut foreground_rect = win32::Rect::default();
-        let got_foreground =
-            foreground != 0 && win32::GetWindowRect(foreground, &mut foreground_rect) != 0;
-        let foreground_covers_monitor = got_foreground
-            && foreground_rect.left <= info.monitor.left + 2
-            && foreground_rect.top <= info.monitor.top + 2
-            && foreground_rect.right >= info.monitor.right - 2
-            && foreground_rect.bottom >= info.monitor.bottom - 2;
-
-        Some(PrimaryMonitorMetrics {
-            cover: to_cover(info.monitor),
-            work: to_cover(info.work),
-            foreground_covers_monitor,
-        })
-    }
+    Some(PrimaryMonitorMetrics {
+        cover: to_cover(monitor),
+        work: to_cover(work),
+        foreground_covers_monitor,
+    })
 }
 
 fn clamp_axis(value: f32, extent: f32, available: f32) -> f32 {

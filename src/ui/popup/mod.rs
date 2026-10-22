@@ -74,7 +74,7 @@ impl ControllerRow {
         eta: Option<String>,
     ) -> Self {
         Self {
-            serial: controller.serial.clone(),
+            serial: controller.serial.to_string(),
             product: controller.product.clone(),
             nickname,
             connection: controller.connection.to_string(),
@@ -89,8 +89,8 @@ impl ControllerRow {
             remember_enabled,
             low: controller.is_low_battery(low_battery_percent),
             eta,
-            supports_identify: controller.supports_lightbar,
-            supports_power_off: controller.supports_power_off,
+            supports_identify: controller.capabilities.lightbar,
+            supports_power_off: controller.capabilities.power_off,
         }
     }
 
@@ -100,7 +100,7 @@ impl ControllerRow {
         eta: Option<String>,
     ) -> Self {
         Self {
-            serial: controller.serial.clone(),
+            serial: controller.serial.to_string(),
             product: controller.product.clone(),
             nickname,
             connection: controller.connection.clone(),

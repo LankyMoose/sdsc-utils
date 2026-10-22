@@ -4,14 +4,11 @@
 //! by [`crate::controller::hid::worker`]. The worker interleaves Identify lightbar writes with
 //! short input reads on the same handle so nav stays live during flashes.
 
+use crate::controller::hid::policy::Policy;
 use crate::domain::gesture::{GestureControl, GestureDetector};
-use crate::domain::protocol::{
-    BT_REPORT_FULL, BT_REPORT_SIZE, BT_REPORT_TRUNCATED, CALIBRATION_FEATURE_REPORT,
-    CALIBRATION_FEATURE_SIZE, USB_REPORT_ID, USB_REPORT_SIZE,
-};
 use hidapi::HidDevice;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Per-axis deadzone applied to each stick before combining (kills rest bias).
@@ -27,15 +24,125 @@ const NAV_REPEAT: Duration = Duration::from_millis(90);
 /// press after a real release still fires at once.
 const NAV_NEUTRAL_GRACE: Duration = Duration::from_millis(100);
 /// One wired DualSense report interval (`bInterval` 4). Block this long when the queue is empty.
-pub const INPUT_REPORT_WAIT_MS: i32 = 4;
-/// Cap on non-blocking drains per wake (32 = default Windows HID buffer depth).
-const INPUT_DRAIN_CAP: usize = 32;
+pub const INPUT_REPORT_WAIT_MS: i32 = Policy::DEFAULT.report_wait_ms;
 
-static INPUT_SNAPSHOT: OnceLock<Arc<Mutex<InputSnapshot>>> = OnceLock::new();
+/// Owned pad-input unit: the hid-worker publication (snapshot) plus the
+/// async edge bridge the iced subscription drains.
+///
+/// Owned by [`crate::controller::hid::worker::HidWorkerHandle`] (one `Arc`
+/// clone moves into the worker thread) and by [`crate::app::App`]; call sites
+/// take `&InputHub` / `&Arc<InputHub>` — no process-global instance.
+pub struct InputHub {
+    snapshot: Mutex<InputSnapshot>,
+    /// Async bridge: hid-worker `try_send`s edges; iced subscription drains them.
+    edge_tx: Mutex<Option<iced::futures::channel::mpsc::Sender<InputEdge>>>,
+}
 
-/// Async bridge: hid-worker `try_send`s edges; iced subscription drains them.
-static INPUT_EDGE_TX: Mutex<Option<iced::futures::channel::mpsc::Sender<InputEdge>>> =
-    Mutex::new(None);
+impl InputHub {
+    pub fn new() -> Self {
+        Self {
+            snapshot: Mutex::new(InputSnapshot::default()),
+            edge_tx: Mutex::new(None),
+        }
+    }
+
+    /// Direct snapshot access for the hid-worker hot paths that must hold
+    /// one lock across read-modify-write (Identify merge, power-off drop).
+    pub fn snapshot_mutex(&self) -> &Mutex<InputSnapshot> {
+        &self.snapshot
+    }
+
+    /// Store fresh worker readings (bump seq, stamp, replace); returns the
+    /// meta the edge bridge attaches. Lock scope matches the old inline block.
+    pub fn publish(&self, readings: Vec<NavReading>, reason: SnapshotReason) -> SnapshotMeta {
+        if let Ok(mut guard) = self.snapshot.lock() {
+            guard.seq = guard.seq.saturating_add(1);
+            guard.published_at = Instant::now();
+            guard.reason = reason;
+            guard.readings = readings;
+            SnapshotMeta {
+                published_at: guard.published_at,
+                seq: guard.seq,
+                reason: guard.reason,
+                pad_count: guard.readings.len(),
+            }
+        } else {
+            SnapshotMeta {
+                published_at: Instant::now(),
+                seq: 0,
+                reason,
+                pad_count: 0,
+            }
+        }
+    }
+
+    /// PadPoll entry: O(1) clone of hid-worker snapshot (never opens HID on the UI thread).
+    pub fn read(&self) -> NavReadingsOutcome {
+        let Ok(guard) = self.snapshot.lock() else {
+            return NavReadingsOutcome::Missing {
+                meta: SnapshotMeta {
+                    published_at: Instant::now(),
+                    seq: 0,
+                    reason: SnapshotReason::LockPoisoned,
+                    pad_count: 0,
+                },
+            };
+        };
+        let meta = SnapshotMeta {
+            published_at: guard.published_at,
+            seq: guard.seq,
+            reason: guard.reason,
+            pad_count: guard.readings.len(),
+        };
+        if guard.readings.is_empty() {
+            NavReadingsOutcome::Missing { meta }
+        } else {
+            log_source_once(NavSource::HID, guard.readings.len());
+            NavReadingsOutcome::Readings {
+                readings: guard.readings.clone(),
+                meta,
+            }
+        }
+    }
+
+    /// Install the iced-side sender so the worker can push edges (subscription start).
+    pub fn bind(&self, tx: iced::futures::channel::mpsc::Sender<InputEdge>) {
+        if let Ok(mut guard) = self.edge_tx.lock() {
+            *guard = Some(tx);
+        }
+    }
+
+    /// Clear the iced-side sender (subscription end / shutdown).
+    pub fn clear(&self) {
+        if let Ok(mut guard) = self.edge_tx.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Push a sample edge to the UI bridge (no-op when nothing is listening).
+    pub fn push_edge(&self, edge: InputEdge) {
+        if let Ok(mut guard) = self.edge_tx.lock()
+            && let Some(tx) = guard.as_mut()
+        {
+            // Prefer a fresh sample over blocking the HID thread.
+            let _ = tx.try_send(edge);
+        }
+    }
+}
+
+impl Default for InputHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::hash::Hash for InputHub {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Subscription identity: `Arc` clones share the heap allocation, so
+        // hash the allocation address (stable across clones, distinct per hub).
+        (self as *const Self as usize).hash(state);
+    }
+}
 
 /// One pad-input publication from the hid-worker (replaces UI PadPoll timer).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -63,30 +170,6 @@ impl InputEdge {
             reason: self.reason,
             pad_count: self.pad_count,
         }
-    }
-}
-
-/// Install the iced-side sender so the worker can push edges (subscription start).
-pub fn bind_input_edge_sender(tx: iced::futures::channel::mpsc::Sender<InputEdge>) {
-    if let Ok(mut guard) = INPUT_EDGE_TX.lock() {
-        *guard = Some(tx);
-    }
-}
-
-/// Clear the iced-side sender (subscription end / shutdown).
-pub fn clear_input_edge_sender() {
-    if let Ok(mut guard) = INPUT_EDGE_TX.lock() {
-        *guard = None;
-    }
-}
-
-/// Push a sample edge to the UI bridge (no-op when nothing is listening).
-pub fn push_input_edge(edge: InputEdge) {
-    if let Ok(mut guard) = INPUT_EDGE_TX.lock()
-        && let Some(tx) = guard.as_mut()
-    {
-        // Prefer a fresh sample over blocking the HID thread.
-        let _ = tx.try_send(edge);
     }
 }
 
@@ -187,16 +270,17 @@ pub struct PadSample {
 }
 
 /// Which backend produced a start-screen nav sample.
+///
+/// Single-backend stub: HID is the only producer. A unit struct (not an enum)
+/// so `NavReading.source`, `format_line`, `log_source_once`, and the one-shot
+/// `Option<NavSource>` log guard keep working unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum NavSource {
-    Hid,
-}
+pub struct NavSource;
 
 impl NavSource {
+    pub const HID: Self = Self;
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Hid => "hid",
-        }
+        "hid"
     }
 }
 
@@ -800,50 +884,6 @@ pub fn preferred_reading(readings: &[NavReading]) -> Option<&NavReading> {
         .or_else(|| readings.first())
 }
 
-/// Install the hid-worker input snapshot (called once at worker start).
-pub fn set_input_snapshot(snapshot: Arc<Mutex<InputSnapshot>>) {
-    let _ = INPUT_SNAPSHOT.set(snapshot);
-}
-
-/// PadPoll entry: O(1) clone of hid-worker snapshot (never opens HID on the UI thread).
-pub fn read_nav_readings() -> NavReadingsOutcome {
-    let Some(slot) = INPUT_SNAPSHOT.get() else {
-        return NavReadingsOutcome::Missing {
-            meta: SnapshotMeta {
-                published_at: Instant::now(),
-                seq: 0,
-                reason: SnapshotReason::NeverPublished,
-                pad_count: 0,
-            },
-        };
-    };
-    let Ok(guard) = slot.lock() else {
-        return NavReadingsOutcome::Missing {
-            meta: SnapshotMeta {
-                published_at: Instant::now(),
-                seq: 0,
-                reason: SnapshotReason::LockPoisoned,
-                pad_count: 0,
-            },
-        };
-    };
-    let meta = SnapshotMeta {
-        published_at: guard.published_at,
-        seq: guard.seq,
-        reason: guard.reason,
-        pad_count: guard.readings.len(),
-    };
-    if guard.readings.is_empty() {
-        NavReadingsOutcome::Missing { meta }
-    } else {
-        log_source_once(NavSource::Hid, guard.readings.len());
-        NavReadingsOutcome::Readings {
-            readings: guard.readings.clone(),
-            meta,
-        }
-    }
-}
-
 fn log_source_once(source: NavSource, pads: usize) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static LOGGED: AtomicBool = AtomicBool::new(false);
@@ -903,25 +943,6 @@ pub enum ShortSampleOutcome {
     Fail(SampleFail),
 }
 
-fn sample_summary(sample: &PadSample) -> String {
-    format!(
-        "ok stick_x={:.2} stick_y={:.2} l2={} r2={} cross={} circle={} square={} triangle={} options={} dpad_u={} dpad_d={} dpad_l={} dpad_r={}",
-        sample.stick_x,
-        sample.stick_y,
-        u8::from(sample.l2),
-        u8::from(sample.r2),
-        u8::from(sample.cross),
-        u8::from(sample.circle),
-        u8::from(sample.square),
-        u8::from(sample.triangle),
-        u8::from(sample.options),
-        u8::from(sample.dpad_up),
-        u8::from(sample.dpad_down),
-        u8::from(sample.dpad_left),
-        u8::from(sample.dpad_right),
-    )
-}
-
 /// Merge a drained batch: newest sticks, OR digital buttons / triggers / D-pad.
 ///
 /// Latches a tap that went down and up inside one wake so the next wake can see the release.
@@ -947,256 +968,22 @@ pub fn merge_nav_samples(batch: &[PadSample]) -> Option<PadSample> {
     Some(out)
 }
 
-fn latch_diag(batch: &[PadSample], merged: &PadSample) {
-    let Some(last) = batch.last() else {
-        return;
-    };
-    let latched = (merged.cross && !last.cross)
-        || (merged.circle && !last.circle)
-        || (merged.square && !last.square)
-        || (merged.triangle && !last.triangle)
-        || (merged.options && !last.options)
-        || (merged.l2 && !last.l2)
-        || (merged.r2 && !last.r2);
-    if latched {
-        crate::controller::hid::diag::diag_info(format!(
-            "hid-diag: drain latched buttons n={} cross={} circle={} square={} triangle={}",
-            batch.len(),
-            u8::from(merged.cross && !last.cross),
-            u8::from(merged.circle && !last.circle),
-            u8::from(merged.square && !last.square),
-            u8::from(merged.triangle && !last.triangle),
-        ));
-    }
-}
-
-/// One DualSense report read (optional block). Used by the drain loop.
-#[allow(clippy::too_many_arguments)]
-fn read_one_report(
-    device: &HidDevice,
-    is_bluetooth: bool,
-    serial: &str,
-    bus: &str,
-    report_size: usize,
-    timeout_ms: i32,
-    requested_full: &mut bool,
-    started: Instant,
-) -> Result<
-    Option<(
-        PadSample,
-        Option<crate::controller::dualsense::battery::BatteryReading>,
-    )>,
-    SampleFail,
-> {
-    let mut buf = vec![0u8; report_size];
-    let n = {
-        let _op = crate::controller::hid::diag::enter_op("read_timeout");
-        match device.read_timeout(&mut buf, timeout_ms) {
-            Ok(n) => n,
-            Err(err) => {
-                drop(_op);
-                let fail = if err.to_string().to_lowercase().contains("timeout") {
-                    SampleFail::Timeout
-                } else {
-                    SampleFail::Io
-                };
-                if fail == SampleFail::Timeout && timeout_ms == 0 {
-                    return Ok(None);
-                }
-                if fail == SampleFail::Timeout {
-                    crate::controller::hid::diag::diag_info(format!(
-                        "hid-diag: sample timeout keep_handle serial={serial} bus={bus}"
-                    ));
-                    return Err(SampleFail::Timeout);
-                }
-                crate::controller::hid::diag::trace_read(
-                    "sample",
-                    serial,
-                    bus,
-                    started.elapsed().as_millis(),
-                    &format!("fail={} err={err}", fail.as_str()),
-                    false,
-                );
-                return Err(fail);
-            }
-        }
-    };
-    if n == 0 {
-        return Ok(None);
-    }
-
-    if is_bluetooth && buf[0] == BT_REPORT_TRUNCATED {
-        if !*requested_full {
-            let mut feature = vec![0u8; CALIBRATION_FEATURE_SIZE];
-            feature[0] = CALIBRATION_FEATURE_REPORT;
-            let feature_result = {
-                let _op = crate::controller::hid::diag::enter_op("get_feature_report");
-                device.get_feature_report(&mut feature)
-            };
-            match feature_result {
-                Ok(_) => {
-                    *requested_full = true;
-                    return Ok(None);
-                }
-                Err(err) => {
-                    crate::controller::hid::diag::trace_read(
-                        "sample",
-                        serial,
-                        bus,
-                        started.elapsed().as_millis(),
-                        &format!("fail=feature err={err}"),
-                        false,
-                    );
-                    return Err(SampleFail::Feature);
-                }
-            }
-        }
-        crate::controller::hid::diag::trace_read(
-            "sample",
-            serial,
-            bus,
-            started.elapsed().as_millis(),
-            "fail=truncated",
-            false,
-        );
-        return Err(SampleFail::Truncated);
-    }
-
-    let expected = if is_bluetooth {
-        BT_REPORT_FULL
-    } else {
-        USB_REPORT_ID
-    };
-    if buf[0] != expected {
-        crate::controller::hid::diag::trace_read(
-            "sample",
-            serial,
-            bus,
-            started.elapsed().as_millis(),
-            &format!("fail=bad_report id=0x{:02x} n={n}", buf[0]),
-            false,
-        );
-        return Err(SampleFail::BadReport);
-    }
-
-    let sample =
-        crate::controller::dualsense::input::parse_report(&buf, if is_bluetooth { 1 } else { 0 });
-    let battery =
-        crate::controller::dualsense::battery::parse_battery_from_report(&buf[..n], is_bluetooth);
-    Ok(Some((sample, battery)))
-}
-
 /// Drain queued DualSense reports, wait one report interval, then drain again.
 ///
-/// Newest sticks win; digital buttons are OR'd across the batch so a tap that
-/// released inside the drain still appears held for one snapshot. The blocking
-/// wait runs even after a non-empty zero-timeout drain so the hot path paces to
-/// the pad's report clock instead of busy-spinning.
+/// Compat wrapper over [`crate::controller::hid::sample::drain_sample`] so
+/// existing callers keep working unchanged; HID I/O lives in
+/// `controller::hid::sample` behind `HidTransport`, pure merge types stay here.
 ///
 /// Never call from the UI thread. Truncated BT: one feature request (one-time) + retry.
 pub fn read_device_sample_short(
     device: &HidDevice,
     is_bluetooth: bool,
     serial: &str,
-    input_hot: bool,
 ) -> ShortSampleOutcome {
-    let bus = if is_bluetooth { "bt" } else { "usb" };
-    let report_size = if is_bluetooth {
-        BT_REPORT_SIZE
-    } else {
-        USB_REPORT_SIZE
-    };
-    let mut requested_full = false;
-    let started = Instant::now();
-    let mut batch: Vec<PadSample> = Vec::new();
-    let mut battery = None;
-
-    let drain_queued =
-        |batch: &mut Vec<PadSample>,
-         battery: &mut Option<crate::controller::dualsense::battery::BatteryReading>,
-         requested_full: &mut bool|
-         -> Result<(), SampleFail> {
-            for _ in 0..INPUT_DRAIN_CAP {
-                match read_one_report(
-                    device,
-                    is_bluetooth,
-                    serial,
-                    bus,
-                    report_size,
-                    0,
-                    requested_full,
-                    started,
-                )? {
-                    Some((sample, batt)) => {
-                        batch.push(sample);
-                        if batt.is_some() {
-                            *battery = batt;
-                        }
-                    }
-                    None => break,
-                }
-            }
-            Ok(())
-        };
-
-    // Drain anything already queued (immediate).
-    if let Err(fail) = drain_queued(&mut batch, &mut battery, &mut requested_full) {
-        return match fail {
-            SampleFail::Timeout => ShortSampleOutcome::Timeout,
-            other => ShortSampleOutcome::Fail(other),
-        };
-    }
-
-    // Always wait one report interval so a non-empty drain cannot busy-spin the
-    // worker: pace to the pad's report clock, and merge any report that arrives.
-    match read_one_report(
-        device,
-        is_bluetooth,
-        serial,
-        bus,
-        report_size,
-        INPUT_REPORT_WAIT_MS,
-        &mut requested_full,
-        started,
-    ) {
-        Ok(Some((sample, batt))) => {
-            batch.push(sample);
-            if batt.is_some() {
-                battery = batt;
-            }
-        }
-        Ok(None) | Err(SampleFail::Timeout) => {
-            if batch.is_empty() {
-                return ShortSampleOutcome::Timeout;
-            }
-        }
-        Err(other) => return ShortSampleOutcome::Fail(other),
-    }
-    if let Err(fail) = drain_queued(&mut batch, &mut battery, &mut requested_full) {
-        return match fail {
-            SampleFail::Timeout => ShortSampleOutcome::Timeout,
-            other => ShortSampleOutcome::Fail(other),
-        };
-    }
-
-    let Some(merged) = merge_nav_samples(&batch) else {
-        return ShortSampleOutcome::Timeout;
-    };
-    latch_diag(&batch, &merged);
-
-    let _ = input_hot;
-    crate::controller::hid::diag::trace_read(
-        "sample",
-        serial,
-        bus,
-        started.elapsed().as_millis(),
-        &format!("{} drain_n={}", sample_summary(&merged), batch.len()),
-        true,
-    );
-    ShortSampleOutcome::Ok {
-        sample: merged,
-        battery,
-    }
+    let policy = crate::controller::hid::policy::Policy::default();
+    let transport = crate::controller::hid::transport::HidapiTransport(device);
+    let mut opts = crate::controller::hid::sample::SampleOpts::new(is_bluetooth, serial);
+    crate::controller::hid::sample::drain_sample(&transport, &mut opts, &policy)
 }
 
 /// Build a nav reading from a HID sample + device identity.
@@ -1204,7 +991,7 @@ pub fn hid_nav_reading(identity: &str, sample: PadSample) -> NavReading {
     NavReading {
         id: PadId(format!("hid:{identity}")),
         sample,
-        source: NavSource::Hid,
+        source: NavSource::HID,
     }
 }
 
@@ -1637,86 +1424,39 @@ pub struct ForegroundWindowFacts {
     pub style: isize,
 }
 
+/// Win32 `GWL_STYLE` bits for the fullscreen predicate (values match
+/// `WS_CAPTION` / `WS_THICKFRAME`). Kept here so this pure predicate needs
+/// no Win32 import; the live query lives behind `Host::foreground_facts`.
+const WS_CAPTION: isize = 0x00C0_0000;
+const WS_THICKFRAME: isize = 0x0004_0000;
+
 /// True only for borderless cover-monitor windows (not ordinary maximized framed apps).
 pub fn is_exclusive_fullscreen(facts: ForegroundWindowFacts) -> bool {
     if facts.width < facts.monitor_width || facts.height < facts.monitor_height {
         return false;
     }
     // Maximized framed windows keep WS_CAPTION / WS_THICKFRAME; exclusive FS usually does not.
-    let framed =
-        (facts.style & crate_win32_caption()) != 0 || (facts.style & crate_win32_thickframe()) != 0;
+    let framed = (facts.style & WS_CAPTION) != 0 || (facts.style & WS_THICKFRAME) != 0;
     !framed
 }
 
-fn crate_win32_caption() -> isize {
-    #[cfg(windows)]
-    {
-        crate::platform::win32::WS_CAPTION
-    }
-    #[cfg(not(windows))]
-    {
-        0x00C0_0000
-    }
-}
-
-fn crate_win32_thickframe() -> isize {
-    #[cfg(windows)]
-    {
-        crate::platform::win32::WS_THICKFRAME
-    }
-    #[cfg(not(windows))]
-    {
-        0x0004_0000
-    }
-}
-
 /// Whether the foreground window looks like exclusive fullscreen.
+///
+/// Geometry comes from [`crate::platform::host::Host::foreground_facts`];
+/// the predicate stays pure ([`is_exclusive_fullscreen`]) for tests.
 pub fn foreground_is_exclusive_fullscreen() -> bool {
-    #[cfg(windows)]
-    {
-        use crate::platform::win32;
-        unsafe {
-            let hwnd = win32::GetForegroundWindow();
-            if hwnd == 0 {
-                return false;
-            }
-            let mut rect = win32::Rect::default();
-            if win32::GetWindowRect(hwnd, &mut rect) == 0 {
-                return false;
-            }
-            let width = rect.right - rect.left;
-            let height = rect.bottom - rect.top;
-            let point = win32::Point {
-                x: rect.left,
-                y: rect.top,
-            };
-            let monitor = win32::MonitorFromPoint(point, win32::MONITOR_DEFAULTTOPRIMARY);
-            if monitor == 0 {
-                return false;
-            }
-            let mut info = win32::MonitorInfo {
-                size: std::mem::size_of::<win32::MonitorInfo>() as u32,
-                ..Default::default()
-            };
-            if win32::GetMonitorInfoW(monitor, &mut info) == 0 {
-                return false;
-            }
-            let mon_w = info.monitor.right - info.monitor.left;
-            let mon_h = info.monitor.bottom - info.monitor.top;
-            let style = win32::GetWindowLongW(hwnd, win32::GWL_STYLE);
-            is_exclusive_fullscreen(ForegroundWindowFacts {
-                width,
-                height,
-                monitor_width: mon_w,
-                monitor_height: mon_h,
-                style,
-            })
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    use crate::platform::host::Host;
+    let Some((width, height, monitor_width, monitor_height, style)) = Host::foreground_facts()
+    else {
+        return false;
+    };
+    is_exclusive_fullscreen(ForegroundWindowFacts {
+        width,
+        height,
+        monitor_width,
+        monitor_height,
+        style,
+    })
 }
 
 #[cfg(test)]
@@ -1993,7 +1733,7 @@ mod tests {
             height: 1080,
             monitor_width: 1920,
             monitor_height: 1080,
-            style: crate_win32_caption() | crate_win32_thickframe(),
+            style: WS_CAPTION | WS_THICKFRAME,
         };
         assert!(!is_exclusive_fullscreen(facts));
     }
@@ -2208,8 +1948,96 @@ mod tests {
         NavReading {
             id: PadId(id.to_string()),
             sample,
-            source: NavSource::Hid,
+            source: NavSource::HID,
         }
+    }
+
+    #[test]
+    fn input_hub_read_missing_before_publish() {
+        let hub = InputHub::new();
+        match hub.read() {
+            NavReadingsOutcome::Missing { meta } => {
+                assert_eq!(meta.seq, 0);
+                assert_eq!(meta.reason, SnapshotReason::NeverPublished);
+                assert_eq!(meta.pad_count, 0);
+            }
+            NavReadingsOutcome::Readings { .. } => panic!("expected Missing before publish"),
+        }
+    }
+
+    #[test]
+    fn input_hub_publish_then_read_bumps_seq() {
+        let hub = InputHub::new();
+        let meta = hub.publish(
+            vec![reading("hid:pad1", PadSample::default())],
+            SnapshotReason::Sample,
+        );
+        assert_eq!(meta.seq, 1);
+        assert_eq!(meta.reason, SnapshotReason::Sample);
+        assert_eq!(meta.pad_count, 1);
+        match hub.read() {
+            NavReadingsOutcome::Readings { readings, meta } => {
+                assert_eq!(readings.len(), 1);
+                assert_eq!(readings[0].id.0, "hid:pad1");
+                assert_eq!(meta.seq, 1);
+            }
+            NavReadingsOutcome::Missing { .. } => panic!("expected Readings after publish"),
+        }
+        let meta = hub.publish(Vec::new(), SnapshotReason::ClearedPowerOff);
+        assert_eq!(meta.seq, 2);
+        match hub.read() {
+            NavReadingsOutcome::Missing { meta } => {
+                assert_eq!(meta.reason, SnapshotReason::ClearedPowerOff);
+                assert_eq!(meta.seq, 2);
+            }
+            NavReadingsOutcome::Readings { .. } => panic!("expected Missing after clear publish"),
+        }
+    }
+
+    #[test]
+    fn input_hub_push_edge_without_listener_is_noop() {
+        let hub = InputHub::new();
+        let edge = InputEdge::from_snapshot(
+            Vec::new(),
+            &SnapshotMeta {
+                published_at: Instant::now(),
+                seq: 7,
+                reason: SnapshotReason::Sample,
+                pad_count: 0,
+            },
+        );
+        hub.push_edge(edge);
+    }
+
+    #[test]
+    fn input_hub_bind_push_clear_edge_bridge() {
+        let hub = InputHub::new();
+        let (tx, mut rx) = iced::futures::channel::mpsc::channel::<InputEdge>(8);
+        hub.bind(tx);
+        let edge = InputEdge::from_snapshot(
+            vec![reading("hid:pad1", PadSample::default())],
+            &SnapshotMeta {
+                published_at: Instant::now(),
+                seq: 3,
+                reason: SnapshotReason::Sample,
+                pad_count: 1,
+            },
+        );
+        hub.push_edge(edge);
+        let got = rx.try_recv().expect("edge bridged while bound");
+        assert_eq!(got.seq, 3);
+        assert_eq!(got.pad_count, 1);
+        hub.clear();
+        hub.push_edge(InputEdge::from_snapshot(
+            Vec::new(),
+            &SnapshotMeta {
+                published_at: Instant::now(),
+                seq: 4,
+                reason: SnapshotReason::Sample,
+                pad_count: 0,
+            },
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     fn chord_sample(controls: &[GestureControl]) -> PadSample {

@@ -3,6 +3,7 @@
 use crate::controller::dualsense::identity::{
     is_dualsense_device, is_storable_serial, normalize_identity, resolve_device_identity,
 };
+use crate::controller::model::Capabilities;
 use crate::controller::model::ControllerKind;
 use crate::domain::protocol::{
     BT_CONTROL_FEATURE_REPORT, BT_CONTROL_FEATURE_SIZE, BT_CONTROL_FEATURE_SIZE_ALT,
@@ -10,11 +11,30 @@ use crate::domain::protocol::{
     CALIBRATION_FEATURE_REPORT, CALIBRATION_FEATURE_SIZE, USB_REPORT_ID, USB_REPORT_SIZE,
 };
 use crate::platform::app_log;
+use crate::{AppError, AppResult};
 use hidapi::{BusType, HidApi, HidDevice};
 use std::thread;
 use std::time::Duration;
 
-pub use crate::controller::model::{Connection, ControllerStatus, PowerState};
+pub use crate::controller::model::{Connection, ControllerStatus, PowerState, Serial};
+
+/// DualSense battery-state nibble decoding (upper nibble of the power byte).
+///
+/// Moved out of the shared model: only the DualSense impl speaks nibbles —
+/// the shared model takes a plain [`PowerState`], never a nibble.
+impl PowerState {
+    pub fn from_nibble(value: u8) -> Self {
+        match value {
+            0x00 => Self::Discharging,
+            0x01 => Self::Charging,
+            0x02 => Self::Complete,
+            0x0A => Self::AbnormalVoltage,
+            0x0B => Self::AbnormalTemperature,
+            0x0F => Self::ChargingError,
+            _ => Self::Unknown,
+        }
+    }
+}
 const USB_POWER_OFFSET: usize = 53;
 const BT_POWER_OFFSET: usize = 54;
 
@@ -45,14 +65,14 @@ pub(crate) fn dedupe_statuses(mut statuses: Vec<ControllerStatus>) -> Vec<Contro
     let mut unique: Vec<ControllerStatus> = Vec::with_capacity(statuses.len());
 
     for status in statuses.drain(..) {
-        if !is_known_serial(&status.serial) {
+        if !is_known_serial(status.serial.as_ref()) {
             unique.push(status);
             continue;
         }
 
         if let Some(existing) = unique
             .iter_mut()
-            .find(|s| is_known_serial(&s.serial) && s.serial == status.serial)
+            .find(|s| is_known_serial(s.serial.as_ref()) && s.serial == status.serial)
         {
             if status.connection.is_usb() && !existing.connection.is_usb() {
                 *existing = status;
@@ -69,7 +89,7 @@ pub fn dualsense_status(
     index: usize,
     product: impl Into<String>,
     connection: Connection,
-    serial: String,
+    serial: impl Into<Serial>,
     percent: u8,
     state: PowerState,
 ) -> ControllerStatus {
@@ -78,11 +98,10 @@ pub fn dualsense_status(
         kind: ControllerKind::DualSense,
         product: product.into(),
         connection,
-        serial,
+        serial: serial.into(),
         percent,
         state,
-        supports_lightbar: true,
-        supports_power_off: true,
+        capabilities: Capabilities::FULL,
     }
 }
 
@@ -259,7 +278,7 @@ pub fn power_off_bluetooth_timed(
     api: &HidApi,
     serial: &str,
 ) -> (
-    Result<(), String>,
+    AppResult<()>,
     crate::controller::dualsense::lightbar::HidPhaseTiming,
 ) {
     let mut timing = crate::controller::dualsense::lightbar::HidPhaseTiming::default();
@@ -275,7 +294,7 @@ fn power_off_bluetooth_unlocked_timed(
     api: &HidApi,
     serial: &str,
     timing: &mut crate::controller::dualsense::lightbar::HidPhaseTiming,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let enum_started = std::time::Instant::now();
     let target = normalize_identity(serial);
 
@@ -314,9 +333,9 @@ fn power_off_bluetooth_unlocked_timed(
     let candidates = if matched.is_empty() { unknown } else { matched };
 
     if candidates.is_empty() {
-        return Err(format!(
+        return Err(AppError::Hid(format!(
             "Bluetooth controller {serial} not found (power-off is Bluetooth-only)"
-        ));
+        )));
     }
 
     let sizes = [
@@ -348,14 +367,14 @@ fn power_off_bluetooth_unlocked_timed(
     }
     timing.io_ms += io_started.elapsed().as_millis();
 
-    Err(format!(
+    Err(AppError::Hid(format!(
         "power-off feature report failed after {} attempt(s): {}",
         errors.len(),
         errors
             .last()
             .cloned()
             .unwrap_or_else(|| "no attempts".into())
-    ))
+    )))
 }
 
 #[cfg(test)]
@@ -440,7 +459,7 @@ mod tests {
             1,
             "DualSense",
             Connection::Bluetooth,
-            "abc".into(),
+            Serial::from("abc"),
             5,
             PowerState::Discharging,
         );
@@ -458,7 +477,7 @@ mod tests {
             1,
             "DualSense",
             Connection::Usb,
-            "abc".into(),
+            Serial::from("abc"),
             25,
             PowerState::Discharging,
         );
@@ -481,7 +500,7 @@ mod tests {
             0,
             "DualSense",
             Connection::Bluetooth,
-            "444648156926".into(),
+            Serial::from("444648156926"),
             35,
             PowerState::Charging,
         );
@@ -499,7 +518,10 @@ mod tests {
         };
         let merged = dedupe_statuses(vec![bt, usb, other]);
         assert_eq!(merged.len(), 2);
-        let charging = merged.iter().find(|s| s.serial == "444648156926").unwrap();
+        let charging = merged
+            .iter()
+            .find(|s| s.serial.as_ref() == "444648156926")
+            .unwrap();
         assert_eq!(charging.connection, Connection::Usb);
     }
 

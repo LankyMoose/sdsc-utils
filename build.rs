@@ -1,5 +1,14 @@
 //! Build script: embed Windows .exe icon from DualSense SVG (same as tray).
 
+/// Canonical error channel shared with the app (`src/app_error.rs`): this build
+/// script compiles `src/ui/svg_icon.rs` via `#[path]`, so the shared module's
+/// names must resolve through `crate::` here too. Kept as a `#[path]` include
+/// (not a twin) so the messages cannot drift.
+#[allow(dead_code)]
+#[path = "src/app_error.rs"]
+mod app_error;
+use app_error::{AppError, AppResult};
+
 #[allow(dead_code)]
 #[path = "src/ui/svg_icon.rs"]
 mod svg_icon;

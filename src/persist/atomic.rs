@@ -2,43 +2,48 @@
 //! truncated body (the `analytics.json EOF` class from concurrent writers).
 
 use crate::platform::app_log;
+use crate::{AppError, AppResult};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Write `bytes` to `path` atomically: fsync'd temp file in the same
+/// Write `bytes` to `path` atomically: temp file in the same
 /// directory, then renamed over the destination.
+///
+/// No `fsync` is performed: the guarantee is that readers never see a
+/// half-written body, not durability across a crash (single desktop process,
+/// same volume).
 ///
 /// `fs::rename` replaces the destination on both Windows
 /// (`MOVEFILE_REPLACE_EXISTING`) and Unix, so readers either see the old
 /// file or the new file — never a half-written body.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
     if let Some(parent) = path.parent()
         && let Err(err) = fs::create_dir_all(parent)
     {
-        return Err(format!(
+        return Err(AppError::Persist(format!(
             "failed to create dir for {}: {err}",
             path.display()
-        ));
+        )));
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let temp = temp_path(parent);
     match fs::write(&temp, bytes) {
         Ok(()) => {}
         Err(err) => {
-            return Err(format!(
+            return Err(AppError::Persist(format!(
                 "failed to write temp file {}: {err}",
                 temp.display()
-            ));
+            )));
         }
     }
     if let Err(err) = fs::rename(&temp, path) {
         let _ = fs::remove_file(&temp);
-        return Err(format!(
+        return Err(AppError::Persist(format!(
             "failed to rename {} to {}: {err}",
             temp.display(),
             path.display()
-        ));
+        )));
     }
     Ok(())
 }

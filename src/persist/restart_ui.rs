@@ -11,8 +11,7 @@
 //! file (crash between schedule and exit, or an old quit) is ignored by age
 //! and deleted on read.
 
-use crate::persist::{atomic, paths};
-use crate::platform::app_log;
+use crate::persist::paths;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -96,12 +95,7 @@ fn restart_ui_path() -> PathBuf {
 
 /// Persist a restore record (renderer-restart path only).
 pub fn save(state: &RestartUiState) {
-    match serde_json::to_vec_pretty(state) {
-        Ok(bytes) => {
-            let _ = atomic::write_atomic_logged("restart-ui", &restart_ui_path(), &bytes);
-        }
-        Err(err) => app_log::warn(format!("failed to serialize restart-ui: {err}")),
-    }
+    crate::persist::store::save_pretty("restart-ui", &restart_ui_path(), state);
 }
 
 /// Read + delete the restore record. Returns `None` when missing, corrupt,

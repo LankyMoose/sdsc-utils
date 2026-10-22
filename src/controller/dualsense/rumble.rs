@@ -4,8 +4,9 @@
 //! through lightbar's exclusive open-write-close path, and never requests the
 //! Bluetooth calibration feature report.
 
+use crate::controller::driver::RumbleBackend;
 use crate::controller::dualsense::identity::normalize_identity;
-use crate::controller::dualsense::lightbar;
+use crate::controller::dualsense::lightbar::{self, ClaimStore};
 use hidapi::HidDevice;
 use std::time::Duration;
 
@@ -64,6 +65,28 @@ impl MotorPulse {
     }
 }
 
+/// [`crate::controller::driver::RumbleBackend`] for DualSense: the registry's
+/// `Some` arm. Thin delegate over [`set_rumble_on_device`] — the
+/// compatible-vibration payload stays DualSense-private in this file.
+pub struct DualSenseRumbleBackend;
+
+/// Shared backend instance behind [`crate::controller::driver::DUALSENSE`].
+pub static DUALSENSE_RUMBLE: DualSenseRumbleBackend = DualSenseRumbleBackend;
+
+impl RumbleBackend for DualSenseRumbleBackend {
+    fn set_rumble(
+        &self,
+        device: &HidDevice,
+        is_bluetooth: bool,
+        serial: &str,
+        right: u8,
+        left: u8,
+        claims: &ClaimStore,
+    ) -> Result<(), hidapi::HidError> {
+        set_rumble_on_device(device, is_bluetooth, serial, right, left, claims)
+    }
+}
+
 /// Write compatible-vibration motors on an already-open device.
 pub fn set_rumble_on_device(
     device: &HidDevice,
@@ -71,6 +94,7 @@ pub fn set_rumble_on_device(
     serial: &str,
     right: u8,
     left: u8,
+    claims: &ClaimStore,
 ) -> Result<(), hidapi::HidError> {
     let target = normalize_identity(serial);
     lightbar::write_output_report(
@@ -82,6 +106,7 @@ pub fn set_rumble_on_device(
         None,
         false,
         false,
+        claims,
         |common| {
             // Linux hid-playstation / SDL: always set HAPTICS_SELECT when driving
             // motors; use both v1 (flag0 bit0) and v2 (flag2 bit2) so FW ≥2.21 and
@@ -100,8 +125,9 @@ pub fn stop_rumble_on_device(
     device: &HidDevice,
     is_bluetooth: bool,
     serial: &str,
+    claims: &ClaimStore,
 ) -> Result<(), hidapi::HidError> {
-    set_rumble_on_device(device, is_bluetooth, serial, 0, 0)
+    set_rumble_on_device(device, is_bluetooth, serial, 0, 0, claims)
 }
 
 #[cfg(test)]

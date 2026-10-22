@@ -3,6 +3,7 @@
 //! No `window::Id`, no HWND. The iced app applies [`SessionEffect`] values.
 
 mod gate;
+pub mod notify;
 
 pub use gate::{
     ConnectCooldownDecision, POLL_MISS_HOLD, connect_cooldown_on_empty, has_start_presence,
@@ -11,13 +12,11 @@ pub use gate::{
     should_skip_connect_cooldown_on_power_off, take_skip_connect_cooldown,
 };
 
-use crate::controller::dualsense::lightbar;
 use crate::controller::known::KnownControllers;
-use crate::controller::model::ControllerStatus;
+use crate::controller::model::{ControllerStatus, Serial};
 use crate::persist::analytics::AnalyticsStore;
-use crate::persist::notify::{NotifyEvent, NotifyTracker};
 use crate::persist::prefs::Prefs;
-use crate::platform::app_log;
+use crate::session::notify::{NotifyEvent, NotifyTracker};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -64,10 +63,12 @@ pub enum SessionEffect {
     ClearStartLatch,
     /// Persist remembered controllers / nicknames.
     SaveKnown,
-    /// Persist analytics store.
-    SaveAnalytics,
-    /// Rebuild Settings → Analytics panel from the store.
-    RefreshAnalyticsPanel,
+    /// Persist analytics store and rebuild Settings → Analytics panel.
+    ///
+    /// These two always co-occur (analytics is observed on every snapshot
+    /// when enabled), so they are one effect: save first, then reload and
+    /// refresh the panel from what was just written.
+    SyncAnalytics,
     /// Rebuild popup rows (and resize if open).
     SyncPopup,
 }
@@ -93,7 +94,7 @@ pub struct DeviceSession {
     start_connect_cooldown_until: Option<Instant>,
     pub(crate) skip_next_connect_cooldown: bool,
     controllers_nonempty_since: Option<Instant>,
-    missed_poll_since: HashMap<String, Instant>,
+    missed_poll_since: HashMap<Serial, Instant>,
     pub start_auto_open_pending: bool,
 }
 
@@ -175,8 +176,7 @@ impl DeviceSession {
             };
             self.analytics
                 .observe(&previous, next, true, keep, std::time::SystemTime::now());
-            effects.push(SessionEffect::SaveAnalytics);
-            effects.push(SessionEffect::RefreshAnalyticsPanel);
+            effects.push(SessionEffect::SyncAnalytics);
         }
 
         if !controllers_changed && !known_changed {
@@ -339,8 +339,8 @@ impl DeviceSession {
             let threshold = self.prefs.low_battery_percent;
             self.controllers
                 .iter()
-                .filter(|c| c.is_low_battery(threshold) && !is_emulated_serial(&c.serial))
-                .map(|c| (c.serial.clone(), c.percent))
+                .filter(|c| c.is_low_battery(threshold) && !is_emulated_serial(c.serial.as_ref()))
+                .map(|c| (c.serial.to_string(), c.percent))
                 .collect()
         } else {
             Vec::new()
@@ -352,9 +352,9 @@ impl DeviceSession {
     }
 
     /// Recompute low-battery targets after prefs / lightbar enable changes.
-    pub fn refresh_low_battery(&mut self) -> Option<SessionEffect> {
+    pub fn refresh_low_battery(&mut self, lightbar_enabled: bool) -> Option<SessionEffect> {
         let mut effects = Vec::new();
-        self.sync_low_battery(lightbar::is_enabled(), &mut effects);
+        self.sync_low_battery(lightbar_enabled, &mut effects);
         effects.into_iter().next()
     }
 }
@@ -383,15 +383,6 @@ fn is_emulated_serial(serial: &str) -> bool {
         let _ = serial;
         false
     }
-}
-
-/// Log helper kept so callers that only warn on empty effects stay quiet.
-#[allow(dead_code)]
-pub fn log_apply(effects: &[SessionEffect]) {
-    if effects.is_empty() {
-        return;
-    }
-    app_log::info(format!("session: apply effects={}", effects.len()));
 }
 
 #[cfg(test)]

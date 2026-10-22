@@ -6,6 +6,7 @@
 //! as the taskbar clock. Other platforms fall back to 12h am/pm.
 //! Updates whenever immersive redraws (which ticks continuously).
 
+use crate::platform::host::Host;
 use crate::ui::start::position::{local_utc_offset_secs, now_ms};
 
 /// Format 24h hour/minute as 12h `h:mm am/pm` (no leading zero on the hour,
@@ -32,54 +33,12 @@ pub fn local_time_hm() -> (u8, u8) {
     (hour, minute)
 }
 
-/// System locale time (e.g. `7:06 pm` or `19:06`), no seconds.
-///
-/// `None` when the locale API is unavailable or fails; callers fall back
-/// to 12h am/pm [`format_clock`].
-#[cfg(windows)]
-fn windows_locale_time() -> Option<String> {
-    use windows::Win32::Globalization::{GetTimeFormatW, LOCALE_USER_DEFAULT, TIME_NOSECONDS};
-    use windows::core::PCWSTR;
-
-    // Passing no time uses the current local time; a null format uses the
-    // user's short-time locale format. First call queries the required length
-    // (including the null terminator).
-    let needed = unsafe {
-        GetTimeFormatW(
-            LOCALE_USER_DEFAULT,
-            TIME_NOSECONDS.0,
-            None,
-            PCWSTR::null(),
-            None,
-        )
-    };
-    if needed <= 0 {
-        return None;
-    }
-    let mut buf = vec![0u16; needed as usize];
-    let written = unsafe {
-        GetTimeFormatW(
-            LOCALE_USER_DEFAULT,
-            TIME_NOSECONDS.0,
-            None,
-            PCWSTR::null(),
-            Some(&mut buf[..]),
-        )
-    };
-    if written <= 0 {
-        return None;
-    }
-    // `written` includes the null terminator; strip it before decoding.
-    let len = (written as usize).saturating_sub(1);
-    String::from_utf16(&buf[..len])
-        .ok()
-        .filter(|s| !s.is_empty())
-}
-
 /// Well-formatted current system time for the clock widget.
+///
+/// Uses the [`Host`] clock seam (system locale on Windows) and falls back to
+/// 12h am/pm [`format_clock`] when the locale API is unavailable or fails.
 pub fn clock_text() -> String {
-    #[cfg(windows)]
-    if let Some(locale) = windows_locale_time() {
+    if let Some(locale) = Host::locale_time() {
         return locale;
     }
     let (hour, minute) = local_time_hm();

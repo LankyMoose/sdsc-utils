@@ -3,7 +3,7 @@
 pub mod machine;
 pub mod view;
 
-use crate::persist::notify::NotifyEvent;
+use crate::session::notify::NotifyEvent;
 use crate::ui::color::{BatterySpectrum, Rgb};
 use crate::ui::toast::machine::AfterToast;
 use std::collections::VecDeque;
@@ -111,8 +111,8 @@ impl ToastMessage {
 mod tests {
     use super::*;
     use crate::controller::model::{ControllerStatus, PowerState};
-    use crate::persist::notify::NotifyTracker;
     use crate::persist::prefs::Prefs;
+    use crate::session::notify::NotifyTracker;
 
     fn pad(serial: &str, percent: u8) -> ControllerStatus {
         crate::controller::dualsense::battery::dualsense_status(

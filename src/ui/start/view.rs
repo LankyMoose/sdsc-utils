@@ -10,22 +10,21 @@ use crate::persist::prefs::{
 };
 use crate::ui::color::BatterySpectrum;
 use crate::ui::layout as window_layout;
-use crate::ui::percent_ring::{self, POPUP_SIZE};
 use crate::ui::start::icon_cache;
 use crate::ui::start::input::FaceHeld;
+use crate::ui::start::list::{
+    actual_row_top_for_sticky, controllers_list, games_list, games_row_sections,
+    header_top_for_row, is_section_start, separator_offset_above,
+};
 use crate::ui::svg_icon;
 use crate::ui::{chrome, theme};
-use iced::font::Weight;
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::widget::text::Wrapping;
-use iced::widget::{
-    Float, button, column, container, keyed_column, row, scrollable, space, stack, svg, text,
-    text_input,
-};
+use iced::widget::{Float, button, column, container, row, space, stack, svg, text, text_input};
 use iced::{
     Alignment, Background, Border, Color, ContentFit, Element, Fill, Font, Length, Padding, Point,
-    Rectangle, Renderer, Size, Theme,
+    Rectangle, Renderer, Theme,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -59,34 +58,34 @@ const CUE_SIZE: f32 = 14.0;
 /// Width reserved for an L2/R2 cue plus gap while revealed.
 const CUE_SLOT_W: f32 = 30.0;
 /// Title + up to two labeled meta lines (+ update badge).
-const ROW_HEIGHT: f32 = 104.0;
-const CONTROLLER_ROW_HEIGHT: f32 = 100.0;
+pub(crate) const ROW_HEIGHT: f32 = 104.0;
+pub(crate) const CONTROLLER_ROW_HEIGHT: f32 = 100.0;
 /// Horizontal inset; vertical chrome uses [`PAD_Y`].
 const PADDING: f32 = 20.0;
 const PAD_Y: f32 = 8.0;
 /// Portrait cell matching Steam library capsules (2:3).
-const ICON_W: f32 = 48.0;
-const ICON_H: f32 = 72.0;
+pub(crate) const ICON_W: f32 = 48.0;
+pub(crate) const ICON_H: f32 = 72.0;
 const HOLD_RING_SIZE: f32 = 32.0;
 const FACE_GLYPH_SIZE: f32 = 18.0;
 /// Peak scale of a face glyph while its button is pressed (layout size unchanged).
 const PRESSED_SCALE: f32 = 1.1;
 /// Pressed grow and armed-color transitions.
 const HINT_ANIM: Duration = Duration::from_millis(crate::ui::motion::FAST_MS);
-const ROW_GAP: f32 = 8.0;
+pub(crate) const ROW_GAP: f32 = 8.0;
 /// Height of a games-list section separator (centered label + fading hairlines).
-const SECTION_SEP_H: f32 = 30.0;
+pub(crate) const SECTION_SEP_H: f32 = 30.0;
 /// Right gutter that keeps the pinned section title exactly as wide as the
 /// in-list titles: the games scrollable embeds its scrollbar (`.spacing(8)`
-/// in [`games_list`]), so iced reserves `scrollbar width (10, iced default —
+/// in [`games_list`](crate::ui::start::list::games_list)), so iced reserves `scrollbar width (10, iced default —
 /// the list sets no custom width) + margin × 2 (0) + spacing (8)` of layout
 /// space beside overflowing content. Only applied while the list actually
 /// overflows (see `games_max_scroll`); otherwise the gutter would mismatch
 /// in the other direction.
-const PINNED_SCROLL_GUTTER: f32 = 18.0;
+pub(crate) const PINNED_SCROLL_GUTTER: f32 = 18.0;
 /// Size of the section separator label.
-const SECTION_SEP_TEXT: f32 = 14.0;
-const ROW_ACTION_SPACING: f32 = 14.0;
+pub(crate) const SECTION_SEP_TEXT: f32 = 14.0;
+pub(crate) const ROW_ACTION_SPACING: f32 = 14.0;
 /// Body width inside outer padding — dual-pane strip unit.
 const PANE_W: f32 = WIDTH - 2.0 * PADDING;
 
@@ -245,7 +244,7 @@ pub enum EditRow {
 }
 
 impl StartRow {
-    fn launch_hint_label(&self) -> &'static str {
+    pub(crate) fn launch_hint_label(&self) -> &'static str {
         if self.update_required {
             "Update & launch"
         } else {
@@ -565,7 +564,7 @@ struct SlideAnim {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct FacePressAnim {
+pub(crate) struct FacePressAnim {
     cross: f32,
     circle: f32,
     square: f32,
@@ -574,13 +573,13 @@ struct FacePressAnim {
 }
 
 #[derive(Clone, Copy, Default)]
-struct RowHintState {
-    triangle_progress: f32,
-    triangle_armed_t: f32,
-    cross_progress: f32,
-    cross_armed_t: f32,
-    held: FaceHeld,
-    press_anim: FacePressAnim,
+pub(crate) struct RowHintState {
+    pub(crate) triangle_progress: f32,
+    pub(crate) triangle_armed_t: f32,
+    pub(crate) cross_progress: f32,
+    pub(crate) cross_armed_t: f32,
+    pub(crate) held: FaceHeld,
+    pub(crate) press_anim: FacePressAnim,
 }
 
 /// Which chrome surface may light face / Options / reopen-chord press visuals.
@@ -637,7 +636,7 @@ impl HintPress {
 }
 
 impl RowHintState {
-    fn for_selected(state: &State, selected: bool) -> Self {
+    pub(crate) fn for_selected(state: &State, selected: bool) -> Self {
         // Browse row/dock/hero share press with the browse footer — idle while an overlay owns input.
         if selected {
             let press = HintPress::for_owner(state, HintPressOwner::Browse);
@@ -902,7 +901,7 @@ pub struct State {
     /// values via [`State::record_list_scroll`], programmatic `scroll_to`
     /// targets sync optimistically via [`State::note_scroll_y`] (on_scroll lags
     /// a frame). Future lists add a [`StartListId`] variant + geometry below.
-    scrolls: ListScrollTracker,
+    pub(crate) scrolls: ListScrollTracker,
     anim: Option<SlideAnim>,
     dock_anim: Option<DockAnim>,
     strip_anim: Option<StripAnim>,
@@ -3948,14 +3947,6 @@ fn slide_x(slide: StartSlide) -> f32 {
     }
 }
 
-pub fn games_scroll_id() -> iced::widget::Id {
-    StartListId::Games.scroll_id()
-}
-
-pub fn controllers_scroll_id() -> iced::widget::Id {
-    StartListId::Controllers.scroll_id()
-}
-
 /// Compute a new scroll Y so `index` stays fully visible, or `None` if already in view.
 pub(crate) fn scroll_y_to_reveal(
     index: usize,
@@ -4776,374 +4767,6 @@ fn carousel_body<'a>(
     .into()
 }
 
-/// Stable `keyed_column` key for a Start list row.
-///
-/// iced 0.14 keyed columns require `Copy` keys, so the `play_key` / serial
-/// string is hashed (deterministic FNV-1a 64) instead of used directly.
-/// Equal strings map to equal keys across rebuilds, so a Steam-scan reorder
-/// keeps per-row widget state instead of rebuilding all nodes positionally.
-pub(crate) fn list_key(s: &str) -> u64 {
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-    let mut hash = OFFSET;
-    for byte in s.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
-}
-
-/// Section index for each games row in list order under the current section
-/// mode (same [`games_section_mode`] the immersive rail uses).
-fn games_row_sections(state: &State) -> Vec<usize> {
-    let mode = state.games_section_mode();
-    let now_ms = crate::ui::start::position::now_ms();
-    let utc_offset = crate::ui::start::position::local_utc_offset_secs();
-    state
-        .rows
-        .iter()
-        .map(|row| {
-            crate::ui::start::position::section_index(
-                mode,
-                &row.title,
-                row.played_at_ms,
-                now_ms,
-                utc_offset,
-            )
-        })
-        .collect()
-}
-
-/// Extra stacked height above row `index` from section separators: one
-/// [`SECTION_SEP_H`] block (+ column gap) per section header at or before it.
-/// Every section opens with a header — including the first — so the first row
-/// already sits below one separator.
-fn separator_offset_above(sections: &[usize], index: usize) -> f32 {
-    if sections.is_empty() {
-        return 0.0;
-    }
-    let end = index.min(sections.len().saturating_sub(1));
-    let mut headers = 1;
-    for j in 1..=end {
-        if sections[j] != sections[j - 1] {
-            headers += 1;
-        }
-    }
-    headers as f32 * (SECTION_SEP_H + ROW_GAP)
-}
-
-/// True when row `index` opens its section (always true for the first row).
-fn is_section_start(sections: &[usize], index: usize) -> bool {
-    match sections.get(index) {
-        None => false,
-        Some(section) => index == 0 || sections.get(index - 1) != Some(section),
-    }
-}
-
-/// Content y of the header that opens the section of row `index`
-/// (the row sits one [`SECTION_SEP_H`] block + gap below it).
-fn header_top_for_row(sections: &[usize], index: usize) -> f32 {
-    let row_top = index as f32 * (ROW_HEIGHT + ROW_GAP) + separator_offset_above(sections, index);
-    (row_top - (SECTION_SEP_H + ROW_GAP)).max(0.0)
-}
-
-/// First row index of `sticky` section (`None` when empty / unknown).
-fn sticky_start_index(sections: &[usize], sticky: Option<usize>) -> Option<usize> {
-    let sticky = sticky?;
-    sections.iter().position(|&s| s == sticky)
-}
-
-/// True when the collapsed sticky header sits at or before `row_index`, so the
-/// actual content row sits one [`SECTION_SEP_H`] above its math position.
-/// Exactly one header is collapsed whenever the list is non-empty, so actual
-/// content height is always math height minus one header (stable); rows before
-/// the sticky start are unaffected, rows at/after it shift up by the header.
-fn collapsed_before_row(sections: &[usize], sticky: Option<usize>, row_index: usize) -> bool {
-    sticky_start_index(sections, sticky).is_some_and(|start| start <= row_index)
-}
-
-/// Actual content y of row `row_index` given the math top and current sticky.
-/// Math positions assume every header keeps its slot; the layout collapses the
-/// stuck header to zero height, saving exactly [`SECTION_SEP_H`] for rows at
-/// or after the sticky start (gaps are unchanged — the collapsed entry keeps
-/// its `keyed_column` spacing neighbors).
-fn actual_row_top_for_sticky(
-    math_row_top: f32,
-    sections: &[usize],
-    sticky: Option<usize>,
-    row_index: usize,
-) -> f32 {
-    if collapsed_before_row(sections, sticky, row_index) {
-        (math_row_top - SECTION_SEP_H).max(0.0)
-    } else {
-        math_row_top
-    }
-}
-
-/// Section pinned at the top of the viewport for `offset_y`: the last section
-/// whose header starts at or above the offset. The pinned bar shows this
-/// section until the next section's header reaches the top and supersedes it;
-/// the stuck section's in-list header collapses to zero height so the pinned
-/// bar carries its label without doubling layout height (fix B: collapse the
-/// reserved bounds instead of keeping a blank `SECTION_SEP_H` slot, which left
-/// a 38px pinned+blank+gap stack above an anchored row vs the normal 8px gap).
-/// Scroll math still resolves stickiness against the stable math frame
-/// ([`separator_offset_above`] / [`header_top_for_row`]); actual content
-/// positions subtract the single collapsed header via
-/// [`collapsed_before_row`] / [`actual_row_top_for_sticky`].
-fn sticky_section_for_offset(sections: &[usize], offset_y: f32) -> Option<usize> {
-    if sections.is_empty() {
-        return None;
-    }
-    let mut current = sections[0];
-    for (index, &section) in sections.iter().enumerate() {
-        if !is_section_start(sections, index) {
-            continue;
-        }
-        if header_top_for_row(sections, index) <= offset_y + 0.5 {
-            current = section;
-        } else {
-            break;
-        }
-    }
-    Some(current)
-}
-
-/// Full-width section separator: centered label with a hairline on either
-/// side, vertically aligned. Each rule fades from [`theme::LINE`] at the text
-/// to transparent at the far edge (same fade language as the immersive rail).
-/// Emitted for every section — including the first — so the compact list
-/// always shows its current section title.
-fn section_separator(label: &'static str) -> Element<'static, StartMessage> {
-    container(
-        row![
-            iced::widget::canvas(SeparatorFade { solid_right: true })
-                .width(Fill)
-                .height(Fill),
-            text(label)
-                .size(SECTION_SEP_TEXT)
-                .font(Font {
-                    weight: Weight::Semibold,
-                    ..Font::DEFAULT
-                })
-                .color(theme::DIM),
-            iced::widget::canvas(SeparatorFade { solid_right: false })
-                .width(Fill)
-                .height(Fill),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center),
-    )
-    .padding([0, 8])
-    .width(Fill)
-    .height(Length::Fixed(SECTION_SEP_H))
-    .into()
-}
-
-/// One side of a [`section_separator`]: a 1.5px rule (immersive-rail weight)
-/// with a linear alpha fade. `solid_right` puts the solid end by the label.
-struct SeparatorFade {
-    solid_right: bool,
-}
-
-impl canvas::Program<StartMessage> for SeparatorFade {
-    type State = ();
-
-    fn draw(
-        &self,
-        _state: &Self::State,
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<Geometry> {
-        let w = bounds.width;
-        let h = bounds.height;
-        if w < 8.0 || h <= 0.0 {
-            return Vec::new();
-        }
-        let mut frame = Frame::new(renderer, bounds.size());
-        let (edge, solid) = if self.solid_right {
-            (
-                Color {
-                    a: 0.0,
-                    ..theme::LINE
-                },
-                theme::LINE,
-            )
-        } else {
-            (
-                theme::LINE,
-                Color {
-                    a: 0.0,
-                    ..theme::LINE
-                },
-            )
-        };
-        let fade = canvas::gradient::Linear::new(Point::new(0.0, 0.0), Point::new(w, 0.0))
-            .add_stop(0.0, edge)
-            .add_stop(1.0, solid);
-        let thickness = 1.5;
-        frame.fill_rectangle(
-            Point::new(0.0, (h - thickness) * 0.5),
-            Size::new(w, thickness),
-            fade,
-        );
-        vec![frame.into_geometry()]
-    }
-}
-
-fn games_list(state: &State) -> Element<'_, StartMessage> {
-    if state.rows.is_empty() {
-        let empty: Element<'_, StartMessage> = if state.editing {
-            text("No installed Steam games — add a manual shortcut below.")
-                .size(15.0)
-                .color(theme::MUTED)
-                .into()
-        } else {
-            empty_games_browse_prompt(state, 15.0)
-        };
-        return container(empty)
-            .width(Fill)
-            .height(Fill)
-            .center_x(Fill)
-            .center_y(Fill)
-            .into();
-    }
-    // One timestamp for every row: the same section values the scroll math
-    // (`games_row_sections`) uses, so headers and offsets can never disagree.
-    let sections = games_row_sections(state);
-    let labels = crate::ui::start::position::labels(state.games_section_mode());
-    // Sticky current-section title: pinned in-flow above the list (it takes
-    // layout space, like web-dev `sticky`) and remains in view until the next
-    // section's header reaches the top and supersedes it.
-    let sticky = sticky_section_for_offset(&sections, state.scrolls.offset(StartListId::Games));
-    let mut entries: Vec<(u64, Element<'_, StartMessage>)> =
-        Vec::with_capacity(state.rows.len() * 2);
-    let mut last_section: Option<usize> = None;
-    for (index, row) in state.rows.iter().enumerate() {
-        let section = sections.get(index).copied().unwrap_or(0);
-        // Every section opens with a header — including the first — so the
-        // list always shows its current section title. The row at hand proves
-        // its own section non-empty.
-        if last_section != Some(section) {
-            let label = labels.get(section).copied().unwrap_or("");
-            // The stuck section's in-list header collapses to zero height — the
-            // pinned bar carries its label, so keeping the 30px slot would double
-            // it and leave a 38px pinned+blank+gap stack above an anchored row
-            // (vs the normal 8px gap). Collapsing keeps exactly one collapsed
-            // header at all times, so content height is math height minus one
-            // header (stable; see `actual_row_top_for_sticky`).
-            let header: Element<'_, StartMessage> = if Some(section) == sticky {
-                container(space())
-                    .width(Fill)
-                    .height(Length::Fixed(0.0))
-                    .into()
-            } else {
-                section_separator(label)
-            };
-            entries.push((
-                list_key(&format!("compact-section-{index}-{section}")),
-                header,
-            ));
-        }
-        last_section = Some(section);
-        let selected = index == state.game_selected;
-        let status = if state.editing {
-            None
-        } else {
-            state.launch_status(&row.target)
-        };
-        entries.push((
-            list_key(&row.play_key),
-            game_row(
-                index,
-                row,
-                selected,
-                status,
-                state.editing,
-                RowHintState::for_selected(state, selected),
-            ),
-        ));
-    }
-    let items = keyed_column(entries).spacing(ROW_GAP).width(Fill);
-    let list: Element<'_, StartMessage> = scrollable(items)
-        .id(games_scroll_id())
-        .height(Fill)
-        .width(Fill)
-        .spacing(8)
-        .on_scroll(|viewport| {
-            let y = viewport.absolute_offset().y;
-            StartMessage::GamesScrolled(y, viewport.bounds().height)
-        })
-        .into();
-    let pinned_label = labels.get(sticky.unwrap_or(0)).copied().unwrap_or("");
-    // Width-match the in-list titles: when the list overflows, the embedded
-    // scrollbar narrows scrollable content by PINNED_SCROLL_GUTTER while the
-    // pinned bar (a sibling of the scrollable) keeps full width, stretching
-    // its fade rules. No gutter when everything fits (no scrollbar reserved).
-    let gutter = if state.games_max_scroll(state.scrolls.viewport(StartListId::Games)) > 0.0 {
-        PINNED_SCROLL_GUTTER
-    } else {
-        0.0
-    };
-    let pinned: Element<'_, StartMessage> = container(section_separator(pinned_label))
-        .padding(Padding {
-            right: gutter,
-            ..Padding::ZERO
-        })
-        .width(Fill)
-        .into();
-    column![pinned, list].width(Fill).height(Fill).into()
-}
-
-fn controllers_list<'a>(state: &'a State, spectrum: &BatterySpectrum) -> Element<'a, StartMessage> {
-    if state.controllers.is_empty() {
-        return container(
-            text("No DualSense connected")
-                .size(15.0)
-                .color(theme::MUTED),
-        )
-        .width(Fill)
-        .height(Fill)
-        .center_x(Fill)
-        .center_y(Fill)
-        .into();
-    }
-    let items = keyed_column(state.controllers.iter().enumerate().map(|(index, row)| {
-        let selected = index == state.controller_selected;
-        let powering_off = row.connected
-            && state
-                .powering_off
-                .as_ref()
-                .is_some_and(|s| s == &row.serial);
-        (
-            list_key(&row.serial),
-            controller_row(
-                index,
-                row,
-                selected,
-                powering_off,
-                spectrum,
-                state.ring_flash_white(&row.serial),
-                RowHintState::for_selected(state, selected),
-            ),
-        )
-    }))
-    .spacing(ROW_GAP)
-    .width(Fill);
-    scrollable(items)
-        .id(controllers_scroll_id())
-        .height(Fill)
-        .width(Fill)
-        .spacing(8)
-        .on_scroll(|viewport| {
-            let y = viewport.absolute_offset().y;
-            StartMessage::ControllersScrolled(y, viewport.bounds().height)
-        })
-        .into()
-}
-
 pub(crate) fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
     let Some(draft) = state.manual_add.as_ref() else {
         return space().into();
@@ -5311,7 +4934,7 @@ pub(crate) fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
 }
 
 #[derive(Clone, Copy)]
-enum FaceButton {
+pub(crate) enum FaceButton {
     Cross,
     Circle,
     Square,
@@ -5338,7 +4961,7 @@ impl FaceButton {
     }
 }
 
-struct ActionHint {
+pub(crate) struct ActionHint {
     face: Option<FaceButton>,
     text_glyph: Option<&'static str>,
     label: &'static str,
@@ -5381,7 +5004,7 @@ pub(crate) fn empty_games_browse_prompt(
     .into()
 }
 
-fn face_hint(
+pub(crate) fn face_hint(
     face: FaceButton,
     label: &'static str,
     held: FaceHeld,
@@ -5399,7 +5022,7 @@ fn face_hint(
     }
 }
 
-fn face_hold_hint(
+pub(crate) fn face_hold_hint(
     face: FaceButton,
     label: &'static str,
     progress: f32,
@@ -5901,7 +5524,7 @@ fn action_cluster(hints: &[ActionHint], flat: bool) -> Element<'static, StartMes
     action_cluster_spaced(hints, 28.0, flat)
 }
 
-fn action_cluster_spaced(
+pub(crate) fn action_cluster_spaced(
     hints: &[ActionHint],
     spacing: f32,
     flat: bool,
@@ -6066,501 +5689,6 @@ fn ring_element(style: RingStyle, radius: f32, alpha: f32) -> Element<'static, S
         .into()
 }
 
-fn skeleton_bar(width: f32, height: f32) -> Element<'static, StartMessage> {
-    container(space())
-        .width(Length::Fixed(width))
-        .height(Length::Fixed(height))
-        .style(|_theme| container::Style {
-            background: Some(Background::Color(theme::alpha(theme::MUTED, 0.22))),
-            border: Border {
-                radius: theme::RADIUS_SM.into(),
-                ..Default::default()
-            },
-            ..container::Style::default()
-        })
-        .into()
-}
-
-/// Soft pill for pending Steam updates (compact accent; immersive grey).
-pub(crate) fn update_required_badge(
-    selected: bool,
-    muted: bool,
-    fade: f32,
-    immersive: bool,
-) -> Element<'static, StartMessage> {
-    let fade = fade.clamp(0.0, 1.0);
-    let a = if muted { 0.55 * fade } else { fade };
-    let label_size = if selected { 13.0 } else { 11.0 };
-    let (fill, stroke) = if immersive {
-        (
-            theme::alpha(theme::MUTED, 0.22 * a),
-            theme::alpha(theme::MUTED, 0.40 * a),
-        )
-    } else {
-        (
-            theme::alpha(theme::ACCENT, 0.22 * a),
-            theme::alpha(theme::ACCENT, 0.45 * a),
-        )
-    };
-    container(
-        text("Update required")
-            .size(label_size)
-            .color(theme::alpha(theme::INK, 0.92 * a))
-            .font(Font {
-                weight: Weight::Semibold,
-                ..Font::DEFAULT
-            }),
-    )
-    .padding(Padding {
-        top: 3.0,
-        right: 9.0,
-        bottom: 3.0,
-        left: 9.0,
-    })
-    .style(move |_theme: &Theme| container::Style {
-        background: Some(Background::Color(fill)),
-        border: Border {
-            color: stroke,
-            width: 1.0,
-            radius: 999.0.into(),
-        },
-        ..container::Style::default()
-    })
-    .into()
-}
-
-/// Meta under a game title: plain path, or stacked `Label: value` lines.
-///
-/// `align` places the block inside its column: centered for horizontal
-/// in-slot text, start-aligned for the vertical side column.
-pub(crate) fn game_subtitle_block<'a>(
-    subtitle: &'a StartSubtitle,
-    value_color: Color,
-    label_color: Color,
-    value_size: f32,
-    align: Alignment,
-) -> Element<'a, StartMessage> {
-    match subtitle {
-        StartSubtitle::Plain(plain) => text(plain.as_str())
-            .size(value_size)
-            .color(value_color)
-            .wrapping(Wrapping::Word)
-            .width(Fill)
-            .align_x(align)
-            .into(),
-        StartSubtitle::Labeled(lines) => {
-            let mut col = column![].spacing(2).width(Fill).align_x(align);
-            for line in lines {
-                col = col.push(
-                    row![
-                        text(format!("{}:", line.label))
-                            .size(value_size)
-                            .color(label_color),
-                        text(line.value.as_str())
-                            .size(value_size)
-                            .color(value_color)
-                            .wrapping(Wrapping::Word),
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                );
-            }
-            col.into()
-        }
-    }
-}
-
-/// Compact combined status string (tests / fallbacks). UI prefers meta + badge.
-#[cfg(test)]
-fn compact_status_label(row: &StartRow) -> Option<String> {
-    let show_meta = row
-        .subtitle
-        .as_ref()
-        .is_some_and(|sub| !(row.update_required && sub.is_steam_fallback()));
-    match (&row.subtitle, row.update_required, show_meta) {
-        (None, false, _) => None,
-        (None, true, _) | (Some(_), true, false) => Some("Update required".into()),
-        (Some(StartSubtitle::Plain(text)), false, _) => Some(text.clone()),
-        (Some(StartSubtitle::Plain(text)), true, true) => Some(format!("{text} · Update required")),
-        (Some(StartSubtitle::Labeled(lines)), false, _) => Some(
-            lines
-                .iter()
-                .map(|l| format!("{}: {}", l.label, l.value))
-                .collect::<Vec<_>>()
-                .join(" · "),
-        ),
-        (Some(StartSubtitle::Labeled(lines)), true, true) => Some(format!(
-            "{} · Update required",
-            lines
-                .iter()
-                .map(|l| format!("{}: {}", l.label, l.value))
-                .collect::<Vec<_>>()
-                .join(" · ")
-        )),
-    }
-}
-
-fn game_row(
-    _index: usize,
-    row: &StartRow,
-    selected: bool,
-    status: Option<LaunchStatus>,
-    editing: bool,
-    hint: RowHintState,
-) -> Element<'_, StartMessage> {
-    let running = status == Some(LaunchStatus::Running);
-    let launching = status == Some(LaunchStatus::Launching);
-    let closing = status == Some(LaunchStatus::Closing);
-    let muted = editing && !row.in_catalog();
-    let disabled = row.disabled && !editing;
-    let title_color = if disabled {
-        theme::alpha(theme::INK, 0.35)
-    } else if muted {
-        theme::alpha(theme::INK, 0.45)
-    } else {
-        theme::INK
-    };
-    let sub_color = if disabled {
-        theme::alpha(theme::MUTED, 0.45)
-    } else if muted {
-        theme::alpha(theme::MUTED, 0.55)
-    } else {
-        theme::MUTED
-    };
-
-    let icon_inner: Element<'_, StartMessage> = if row.skeleton {
-        container(space())
-            .width(Length::Fixed(ICON_W))
-            .height(Length::Fixed(ICON_H))
-            .style(theme::well)
-            .into()
-    } else {
-        match row.list_icon_live() {
-            Some(icon) => iced::widget::image(icon.0)
-                .width(Length::Fixed(ICON_W))
-                .height(Length::Fixed(ICON_H))
-                .content_fit(ContentFit::Cover)
-                .into(),
-            None => container(
-                svg(svg::Handle::from_memory(svg_icon::GAME_SVG.as_bytes()))
-                    .width(Length::Fixed(ICON_W * 0.5))
-                    .height(Length::Fixed(ICON_W * 0.5))
-                    .style(|_theme, _status| svg::Style {
-                        color: Some(theme::MUTED),
-                    }),
-            )
-            .width(Length::Fixed(ICON_W))
-            .height(Length::Fixed(ICON_H))
-            .center_x(Fill)
-            .center_y(Fill)
-            .style(theme::well)
-            .into(),
-        }
-    };
-
-    let icon = container(icon_inner)
-        .width(Length::Fixed(ICON_W))
-        .height(Length::Fixed(ICON_H))
-        .clip(true)
-        .style(|_| container::Style {
-            border: Border {
-                radius: theme::RADIUS_SM.into(),
-                ..Default::default()
-            },
-            ..container::Style::default()
-        });
-
-    let titles: Element<'_, StartMessage> = if row.skeleton {
-        column![skeleton_bar(220.0, 14.0), skeleton_bar(160.0, 10.0),]
-            .spacing(8)
-            .width(Fill)
-            .into()
-    } else {
-        let title_text = text(&row.title)
-            .size(19.0)
-            .color(title_color)
-            .font(if selected {
-                Font {
-                    weight: Weight::Bold,
-                    ..Font::DEFAULT
-                }
-            } else {
-                Font::DEFAULT
-            })
-            .wrapping(Wrapping::None);
-
-        // Update badge sits on the title row in compact (immersive keeps it under meta).
-        let title: Element<'_, StartMessage> = if !running && !launching && row.update_required {
-            row![
-                title_text,
-                update_required_badge(selected, muted, 1.0, false),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .width(Fill)
-            .into()
-        } else {
-            title_text.width(Fill).into()
-        };
-
-        let status: Element<'_, StartMessage> = if closing {
-            text("Closing")
-                .size(13.0)
-                .color(theme::MUTED)
-                .wrapping(Wrapping::None)
-                .width(Fill)
-                .into()
-        } else if launching {
-            text("Launching")
-                .size(13.0)
-                .color(theme::ACCENT)
-                .wrapping(Wrapping::None)
-                .width(Fill)
-                .into()
-        } else if running {
-            text("Running")
-                .size(13.0)
-                .color(theme::SUCCESS)
-                .wrapping(Wrapping::None)
-                .width(Fill)
-                .into()
-        } else if disabled {
-            text("Not installed")
-                .size(13.0)
-                .color(theme::alpha(theme::MUTED, 0.7))
-                .wrapping(Wrapping::None)
-                .width(Fill)
-                .into()
-        } else {
-            let show_meta = row
-                .subtitle
-                .as_ref()
-                .is_some_and(|sub| !(row.update_required && sub.is_steam_fallback()));
-            if show_meta && let Some(sub) = row.subtitle.as_ref() {
-                game_subtitle_block(sub, sub_color, sub_color, 12.0, Alignment::Start)
-            } else {
-                text(" ")
-                    .size(13.0)
-                    .color(Color::TRANSPARENT)
-                    .wrapping(Wrapping::None)
-                    .width(Fill)
-                    .into()
-            }
-        };
-
-        column![title, status]
-            .spacing(4)
-            .width(Fill)
-            .clip(true)
-            .into()
-    };
-
-    let mut content = row![icon].spacing(14).align_y(Alignment::Center);
-
-    if editing {
-        let mark = if row.in_catalog() { "✓" } else { "○" };
-        let mark_color = if row.in_catalog() {
-            theme::ACCENT
-        } else {
-            theme::alpha(theme::MUTED, 0.55)
-        };
-        content = content.push(
-            text(mark)
-                .size(20.0)
-                .color(mark_color)
-                .width(Length::Fixed(22.0)),
-        );
-    }
-
-    content = content.push(titles);
-
-    if selected {
-        let mut actions = Vec::new();
-        if editing {
-            let label = match row.edit.as_ref() {
-                Some(EditRow::Manual { .. }) => "Remove",
-                Some(EditRow::Steam { .. }) | None => "Toggle",
-            };
-            actions.push(face_hint(
-                FaceButton::Cross,
-                label,
-                hint.held,
-                hint.press_anim,
-            ));
-            // Square cycles sort in edit too — manual Edit is mouse-only
-            // (the Edit button below).
-        } else {
-            if closing {
-                actions.push(face_hint(
-                    FaceButton::Cross,
-                    "Closing…",
-                    hint.held,
-                    hint.press_anim,
-                ));
-            } else if launching {
-                actions.push(face_hint(
-                    FaceButton::Cross,
-                    "Launching…",
-                    hint.held,
-                    hint.press_anim,
-                ));
-            } else if running {
-                actions.push(face_hold_hint(
-                    FaceButton::Cross,
-                    "Close game",
-                    hint.cross_progress,
-                    hint.cross_armed_t,
-                    hint.held,
-                    hint.press_anim,
-                ));
-            } else if disabled {
-                actions.push(face_hint(
-                    FaceButton::Cross,
-                    "Not installed",
-                    hint.held,
-                    hint.press_anim,
-                ));
-            } else {
-                actions.push(face_hint(
-                    FaceButton::Cross,
-                    row.launch_hint_label(),
-                    hint.held,
-                    hint.press_anim,
-                ));
-            }
-        }
-        content = content.push(action_cluster_spaced(&actions, ROW_ACTION_SPACING, false));
-        // Manual Edit is mouse-only (Square cycles sort in edit too).
-        if editing && matches!(row.edit, Some(EditRow::Manual { .. })) {
-            content = content.push(
-                button(text("Edit").size(14.0).color(theme::ACCENT))
-                    .padding([6, 12])
-                    .on_press(StartMessage::EditManual)
-                    .style(theme::ghost),
-            );
-        }
-    }
-
-    // Pad/keyboard navigate — no mouse press/hover on list rows (edit actions stay clickable).
-    container(content.width(Fill).height(Length::Fixed(ROW_HEIGHT)))
-        .padding([0, 12])
-        .width(Fill)
-        .height(Length::Fixed(ROW_HEIGHT))
-        .style(theme::glass_row(selected, theme::radius::MD))
-        .into()
-}
-
-fn controller_row<'a>(
-    _index: usize,
-    row: &'a StartControllerRow,
-    selected: bool,
-    powering_off: bool,
-    spectrum: &BatterySpectrum,
-    ring_flash_white: bool,
-    hint: RowHintState,
-) -> Element<'a, StartMessage> {
-    let ring_color = if ring_flash_white {
-        theme::from_rgb(lightbar::IDENTIFY_FLASH)
-    } else if row.connected && !powering_off {
-        theme::from_rgb(spectrum.color_at_percent(row.percent))
-    } else {
-        theme::DIM
-    };
-    let ring = percent_ring::percent_ring(
-        row.percent,
-        ring_color,
-        POPUP_SIZE * 0.95,
-        row.eta.clone(),
-        1.0,
-    );
-
-    let meta_color = if row.low {
-        theme::WARNING
-    } else {
-        theme::MUTED
-    };
-    let meta_text = if powering_off {
-        "Powering off".to_string()
-    } else {
-        format!("{} · {}", row.connection, row.state)
-    };
-    let meta_text_color = if powering_off {
-        theme::MUTED
-    } else {
-        meta_color
-    };
-    let title_color = if row.connected && !powering_off {
-        theme::INK
-    } else {
-        theme::MUTED
-    };
-    let titles = column![
-        text(&row.title)
-            .size(19.0)
-            .color(title_color)
-            .font(if selected {
-                Font {
-                    weight: Weight::Bold,
-                    ..Font::DEFAULT
-                }
-            } else {
-                Font::DEFAULT
-            }),
-        text(meta_text).size(13.0).color(meta_text_color),
-    ]
-    .spacing(4)
-    .width(Fill)
-    .clip(true);
-
-    let mut content = row![ring, titles].spacing(14).align_y(Alignment::Center);
-
-    if selected && row.connected {
-        // A pad on its way out offers no actions: Identify and Power off are
-        // both dead ends (the worker drops the pad any moment).
-        if powering_off {
-            content = content.push(action_cluster_spaced(
-                &[face_hint(
-                    FaceButton::Triangle,
-                    "Powering off…",
-                    hint.held,
-                    hint.press_anim,
-                )],
-                ROW_ACTION_SPACING,
-                false,
-            ));
-        } else {
-            let mut actions = vec![face_hint(
-                FaceButton::Cross,
-                "Identify",
-                hint.held,
-                hint.press_anim,
-            )];
-            if row.show_power_off() {
-                actions.push(face_hold_hint(
-                    FaceButton::Triangle,
-                    "Power off",
-                    hint.triangle_progress,
-                    hint.triangle_armed_t,
-                    hint.held,
-                    hint.press_anim,
-                ));
-            }
-            content = content.push(action_cluster_spaced(&actions, ROW_ACTION_SPACING, false));
-        }
-    }
-
-    container(
-        content
-            .width(Fill)
-            .height(Length::Fixed(CONTROLLER_ROW_HEIGHT)),
-    )
-    .padding([0, 12])
-    .width(Fill)
-    .height(Length::Fixed(CONTROLLER_ROW_HEIGHT))
-    .style(theme::glass_row(selected, theme::radius::MD))
-    .into()
-}
-
 pub fn controller_title(product: &str, nickname: Option<&str>) -> String {
     nickname
         .filter(|n| !n.is_empty())
@@ -6575,6 +5703,10 @@ pub fn power_state_label(state: PowerState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::start::list::{
+        collapsed_before_row, list_key, sticky_section_for_offset, sticky_start_index,
+    };
+    use crate::ui::start::row::compact_status_label;
 
     fn sample_controller(connected: bool, bluetooth: bool) -> StartControllerRow {
         StartControllerRow {

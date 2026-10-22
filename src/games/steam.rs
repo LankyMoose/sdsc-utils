@@ -6,10 +6,13 @@
 //! `localconfig.vdf` stay on the current text reader until those layouts change;
 //! bump [`LAST_KNOWN_COMPATIBLE_STEAM_VERSION`] after verifying a newer client.
 
+use crate::persist::{json, paths};
 use crate::platform::app_log;
+use crate::{AppError, AppResult};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Steam client package build last verified to scan successfully.
 /// Bump only after a successful check against a newer client.
@@ -83,8 +86,9 @@ pub fn validate_steam_library_path(path: &std::path::Path) -> bool {
 }
 
 /// Installed Steam games, sorted by name.
-pub fn list_installed_games(extra_paths: &[PathBuf]) -> Result<Vec<SteamGame>, String> {
-    let steam_root = steam_root()?.ok_or_else(|| "Steam install not found".to_string())?;
+pub fn list_installed_games(extra_paths: &[PathBuf]) -> AppResult<Vec<SteamGame>> {
+    let steam_root =
+        steam_root()?.ok_or_else(|| AppError::Games("Steam install not found".into()))?;
     let mut library_roots = library_folders(&steam_root)?;
     for path in extra_paths {
         if !validate_steam_library_path(path) {
@@ -242,7 +246,7 @@ pub fn browse_subtitle(game: &SteamGame) -> String {
     }
 }
 
-pub fn steam_root() -> Result<Option<PathBuf>, String> {
+pub fn steam_root() -> AppResult<Option<PathBuf>> {
     #[cfg(windows)]
     {
         use winreg::RegKey;
@@ -269,7 +273,7 @@ pub fn steam_root() -> Result<Option<PathBuf>, String> {
     }
 }
 
-fn library_folders(steam_root: &Path) -> Result<Vec<PathBuf>, String> {
+fn library_folders(steam_root: &Path) -> AppResult<Vec<PathBuf>> {
     let mut roots = vec![steam_root.to_path_buf()];
     #[cfg(debug_assertions)]
     let mut sources: Vec<LibraryFolderSource> = Vec::new();
@@ -904,6 +908,103 @@ pub fn launch_uri(appid: u32) -> String {
 /// Best-effort log helper when a scan fails mid-settings refresh.
 pub fn warn_scan_error(err: &str) {
     app_log::warn(format!("steam library scan: {err}"));
+}
+
+// ---------------------------------------------------------------------------
+// Cached Steam library metadata for fast Start cold open.
+//
+// Moved verbatim from `persist::steam_library`: on-disk path
+// (`steam_library.json`) and format are unchanged, only the module moved so
+// the cache lives next to the scanner that produces it.
+// ---------------------------------------------------------------------------
+
+const STEAM_LIBRARY_CACHE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SteamLibraryCache {
+    pub version: u32,
+    #[serde(default)]
+    pub scanned_at_ms: u64,
+    #[serde(default)]
+    pub steam_root: String,
+    #[serde(default)]
+    pub games: Vec<SteamGame>,
+}
+
+fn steam_library_cache_path() -> PathBuf {
+    paths::data_dir().join("steam_library.json")
+}
+
+fn steam_library_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Drop art paths that no longer exist so cold load does not wait forever.
+fn prune_missing_art_paths(entry: &mut SteamGame) {
+    if entry.icon_path.as_ref().is_some_and(|p| !p.is_file()) {
+        entry.icon_path = None;
+    }
+    if entry.backdrop_path.as_ref().is_some_and(|p| !p.is_file()) {
+        entry.backdrop_path = None;
+    }
+}
+
+/// Load cached library metadata. `None` on miss / bad version / empty.
+pub fn load_library_cache() -> Option<SteamLibraryCache> {
+    let path = steam_library_cache_path();
+    let Some(root) = crate::persist::store::load_object(&path) else {
+        crate::controller::hid::diag::diag_info("ui-diag: steam library cache load hit=0 n=0");
+        return None;
+    };
+    match serde_json::from_value::<SteamLibraryCache>(serde_json::Value::Object(root)) {
+        Ok(mut cache)
+            if cache.version == STEAM_LIBRARY_CACHE_VERSION && !cache.games.is_empty() =>
+        {
+            for entry in &mut cache.games {
+                prune_missing_art_paths(entry);
+            }
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: steam library cache load hit=1 n={}",
+                cache.games.len()
+            ));
+            Some(cache)
+        }
+        Ok(_) => {
+            crate::controller::hid::diag::diag_info("ui-diag: steam library cache load hit=0 n=0");
+            None
+        }
+        Err(err) => {
+            app_log::warn(format!(
+                "failed to decode steam library cache {}: {err}",
+                path.display()
+            ));
+            json::backup_once(&path);
+            crate::controller::hid::diag::diag_info("ui-diag: steam library cache load hit=0 n=0");
+            None
+        }
+    }
+}
+
+/// Rewrite the on-disk cache after a successful live scan.
+pub fn save_library_cache(games: &[SteamGame], steam_root: Option<&Path>) {
+    let path = steam_library_cache_path();
+    let cache = SteamLibraryCache {
+        version: STEAM_LIBRARY_CACHE_VERSION,
+        scanned_at_ms: steam_library_now_ms(),
+        steam_root: steam_root
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        games: games.to_vec(),
+    };
+    if crate::persist::store::save_pretty("steam library cache", &path, &cache) {
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: steam library cache save n={}",
+            games.len()
+        ));
+    }
 }
 
 #[cfg(test)]

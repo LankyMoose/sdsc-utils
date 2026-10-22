@@ -1,6 +1,6 @@
 # Shell stale remembered `%` after full-charge + unplug (2026-10-14)
 
-**Status:** fixed in 1.7.0 (service-owned session + snapshot sync). **When to read:** history of the popup `%` vs toast / `controllers.json` disagreement; service↔shell remembered-state sync. Index: [README.md](README.md).
+**Status:** fixed in 1.7.0; the mechanism section below is pre-single-process-cutover history (no `src/service` / `src/ipc` split remains). **When to read:** history of the popup `%` vs toast / `controllers.json` disagreement. Index: [README.md](README.md).
 
 ## Incident
 

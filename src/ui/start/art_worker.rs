@@ -6,10 +6,10 @@
 use crate::ui::start::icon_cache::{self, ArtRetainSet};
 use iced::futures::channel::mpsc as iced_mpsc;
 use iced::futures::{SinkExt, StreamExt};
+use std::hash::Hash;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 /// Events delivered to the iced UI when decode milestones complete.
@@ -51,92 +51,217 @@ struct EventSink {
     tx: iced_mpsc::UnboundedSender<ArtEvent>,
 }
 
-static MAILBOX: Mutex<Option<Sender<Cmd>>> = Mutex::new(None);
-static JOIN: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
-static EVENT_TX: Mutex<Option<EventSink>> = Mutex::new(None);
-static BIND_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Ensure the worker thread is running (idempotent).
-pub fn ensure_started() {
-    let mut slot = MAILBOX.lock().unwrap_or_else(|e| e.into_inner());
-    if slot.is_some() {
-        return;
-    }
-    let (tx, rx) = mpsc::channel::<Cmd>();
-    let handle = thread::Builder::new()
-        .name("start-art-worker".into())
-        .spawn(move || worker_loop(rx))
-        .expect("spawn start-art-worker");
-    *slot = Some(tx);
-    drop(slot);
-    let mut join = JOIN.lock().unwrap_or_else(|e| e.into_inner());
-    *join = Some(handle);
+struct Inner {
+    mailbox: Option<Sender<Cmd>>,
+    join: Option<thread::JoinHandle<()>>,
+    sink: Option<EventSink>,
+    bind_seq: u64,
 }
 
-/// Bind the iced event sink. Returns a bind id for [`clear_event_sender`].
-pub fn bind_event_sender(tx: iced_mpsc::UnboundedSender<ArtEvent>) -> u64 {
-    let bind_id = BIND_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-    let mut slot = EVENT_TX.lock().unwrap_or_else(|e| e.into_inner());
-    *slot = Some(EventSink { bind_id, tx });
-    bind_id
-}
-
-/// Clear the iced event sink only if `bind_id` is still the active bind.
+/// Owned Start-art unit: single-flight decode mailbox plus the iced event sink.
 ///
-/// Prevents a remount race where the old subscription Drop wipes the new sender.
-pub fn clear_event_sender(bind_id: u64) {
-    let mut slot = EVENT_TX.lock().unwrap_or_else(|e| e.into_inner());
-    if slot.as_ref().is_some_and(|s| s.bind_id == bind_id) {
-        *slot = None;
+/// Owned by the app root (`App::art`) and shared with the iced subscription
+/// via `Arc` (mirrors [`crate::domain::pad::InputHub`]: interior locks, `&self`
+/// / `&Arc<Self>` call sites, no process-global instance).
+pub struct ArtOwner {
+    inner: Mutex<Inner>,
+}
+
+impl ArtOwner {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                mailbox: None,
+                join: None,
+                sink: None,
+                bind_seq: 0,
+            }),
+        }
+    }
+
+    /// Ensure the worker thread is running (idempotent).
+    ///
+    /// Holds the inner lock across spawn so concurrent ensures (UI submit vs
+    /// subscription start on the iced async thread) serialize; the spawn
+    /// itself never touches the lock, so the worker's first emit blocks only
+    /// briefly.
+    pub fn ensure_started(self: &Arc<Self>) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.mailbox.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel::<Cmd>();
+        let owner = Arc::clone(self);
+        let handle = thread::Builder::new()
+            .name("start-art-worker".into())
+            .spawn(move || worker_loop(rx, owner))
+            .expect("spawn start-art-worker");
+        guard.mailbox = Some(tx);
+        guard.join = Some(handle);
+    }
+
+    /// Bind the iced event sink. Returns a bind id for [`ArtOwner::clear`].
+    pub fn bind(&self, tx: iced_mpsc::UnboundedSender<ArtEvent>) -> u64 {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.bind_seq = guard.bind_seq.wrapping_add(1);
+        let bind_id = guard.bind_seq;
+        guard.sink = Some(EventSink { bind_id, tx });
+        bind_id
+    }
+
+    /// Clear the iced event sink only if `bind_id` is still the active bind.
+    ///
+    /// Prevents a remount race where the old subscription Drop wipes the new sender.
+    pub fn clear(&self, bind_id: u64) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.sink.as_ref().is_some_and(|s| s.bind_id == bind_id) {
+            guard.sink = None;
+        }
+    }
+
+    /// Stop in-flight warm work without tearing the thread down (Start close).
+    ///
+    /// Posts an empty job at `generation` so the worker abandons the current order
+    /// after the decode already in flight. Does not change pin/LRU state — reopen
+    /// can still hit warm cache.
+    pub fn cancel(&self, generation: u64) {
+        let tx = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mailbox
+            .clone();
+        let Some(tx) = tx else {
+            return;
+        };
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: art worker cancel gen={generation}"
+        ));
+        let _ = tx.send(Cmd::Job(Box::new(ArtJob {
+            generation,
+            selected_backdrop: None,
+            selected_hero: None,
+            selected_shell: None,
+            near: ArtRetainSet::default(),
+            prefetch: ArtRetainSet::default(),
+        })));
+    }
+
+    /// Stop the worker thread and wipe every Start image cache (app Exit).
+    ///
+    /// Wipes caches **before** joining so a slow final `image::open` cannot leave
+    /// handles in the process cache, and so quit stays responsive.
+    ///
+    /// Ordering: mailbox take → send Shutdown → clear sink → wipe → join → wipe.
+    /// The mailbox/join are extracted under the lock and the lock released
+    /// before wipe/join, so an in-flight worker `emit` (which re-locks) can
+    /// never deadlock the join.
+    pub fn shutdown(&self) {
+        crate::controller::hid::diag::diag_info("ui-diag: art worker shutdown begin");
+        let (tx, handle) = {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = guard.mailbox.take();
+            let handle = guard.join.take();
+            guard.sink = None;
+            (tx, handle)
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(Cmd::Shutdown);
+        }
+        // Blank slate immediately — in-flight decode inserts are rejected via clear_epoch.
+        super::wipe_art_caches();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+        // Second wipe after join: catch anything inserted in the shutdown race window.
+        super::wipe_art_caches();
+        crate::controller::hid::diag::diag_info("ui-diag: art worker shutdown complete");
+    }
+
+    /// Replace any pending job with `job` (latest-wins; worker drains backlog).
+    pub fn submit(self: &Arc<Self>, job: ArtJob) {
+        self.ensure_started();
+        pin_job(&job);
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: art worker job gen={} sel_bd={} near_bd={} prefetch_bd={}",
+            job.generation,
+            u8::from(job.selected_backdrop.is_some()),
+            job.near.backdrops.len(),
+            job.prefetch.backdrops.len(),
+        ));
+        let tx = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mailbox
+            .clone();
+        let Some(tx) = tx else {
+            return;
+        };
+        let _ = tx.send(Cmd::Job(Box::new(job)));
+    }
+
+    fn emit(&self, event: ArtEvent) {
+        let tx = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sink
+            .as_ref()
+            .map(|s| s.tx.clone());
+        if let Some(tx) = tx {
+            let _ = tx.unbounded_send(event);
+        }
     }
 }
 
-/// Stop in-flight warm work without tearing the thread down (Start close).
-///
-/// Posts an empty job at `generation` so the worker abandons the current order
-/// after the decode already in flight. Does not change pin/LRU state — reopen
-/// can still hit warm cache.
-pub fn cancel_jobs(generation: u64) {
-    let guard = MAILBOX.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(tx) = guard.as_ref() else {
-        return;
-    };
-    crate::controller::hid::diag::diag_info(format!("ui-diag: art worker cancel gen={generation}"));
-    let _ = tx.send(Cmd::Job(Box::new(ArtJob {
-        generation,
-        selected_backdrop: None,
-        selected_hero: None,
-        selected_shell: None,
-        near: ArtRetainSet::default(),
-        prefetch: ArtRetainSet::default(),
-    })));
+impl Default for ArtOwner {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-/// Stop the worker thread and wipe every Start image cache (app Exit).
+impl Hash for ArtOwner {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Subscription identity: `Arc` clones share the heap allocation, so
+        // hash the allocation address (stable across clones, distinct per owner).
+        (self as *const Self as usize).hash(state);
+    }
+}
+
+/// iced subscription stream of [`ArtEvent`]s.
 ///
-/// Wipes caches **before** joining so a slow final `image::open` cannot leave
-/// handles in the process cache, and so quit stays responsive.
-pub fn shutdown() {
-    crate::controller::hid::diag::diag_info("ui-diag: art worker shutdown begin");
-    let tx = {
-        let mut slot = MAILBOX.lock().unwrap_or_else(|e| e.into_inner());
-        slot.take()
-    };
-    if let Some(tx) = tx {
-        let _ = tx.send(Cmd::Shutdown);
+/// Binds the owner's sink, ensures the worker is running, and clears the sink
+/// on stream teardown (stale-clear guarded by bind id, so a remount race where
+/// the old subscription Drop fires after the new bind cannot wipe the sender).
+pub fn event_stream(
+    owner: &Arc<ArtOwner>,
+) -> impl iced::futures::Stream<Item = ArtEvent> + Send + use<> {
+    let owner = Arc::clone(owner);
+    iced::stream::channel(32, async move |mut output| {
+        let (tx, mut rx) = iced_mpsc::unbounded();
+        let bind_id = owner.bind(tx);
+        owner.ensure_started();
+        let _guard = EventBindGuard {
+            owner: owner.clone(),
+            bind_id,
+        };
+        while let Some(ev) = rx.next().await {
+            if output.send(ev).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+struct EventBindGuard {
+    owner: Arc<ArtOwner>,
+    bind_id: u64,
+}
+impl Drop for EventBindGuard {
+    fn drop(&mut self) {
+        self.owner.clear(self.bind_id);
     }
-    {
-        let mut ev = EVENT_TX.lock().unwrap_or_else(|e| e.into_inner());
-        *ev = None;
-    }
-    // Blank slate immediately — in-flight decode inserts are rejected via clear_epoch.
-    super::wipe_art_caches();
-    if let Some(handle) = JOIN.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        let _ = handle.join();
-    }
-    // Second wipe after join: catch anything inserted in the shutdown race window.
-    super::wipe_art_caches();
-    crate::controller::hid::diag::diag_info("ui-diag: art worker shutdown complete");
 }
 
 fn pin_job(job: &ArtJob) {
@@ -165,31 +290,6 @@ fn pin_job(job: &ArtJob) {
     icon_cache::pin_art_window(pins);
 }
 
-/// Replace any pending job with `job` (latest-wins; worker drains backlog).
-pub fn submit(job: ArtJob) {
-    ensure_started();
-    pin_job(&job);
-    crate::controller::hid::diag::diag_info(format!(
-        "ui-diag: art worker job gen={} sel_bd={} near_bd={} prefetch_bd={}",
-        job.generation,
-        u8::from(job.selected_backdrop.is_some()),
-        job.near.backdrops.len(),
-        job.prefetch.backdrops.len(),
-    ));
-    let guard = MAILBOX.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(tx) = guard.as_ref() else {
-        return;
-    };
-    let _ = tx.send(Cmd::Job(Box::new(job)));
-}
-
-fn emit(event: ArtEvent) {
-    let guard = EVENT_TX.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(sink) = guard.as_ref() {
-        let _ = sink.tx.unbounded_send(event);
-    }
-}
-
 fn drain_latest(rx: &Receiver<Cmd>, mut current: ArtJob) -> Result<ArtJob, ()> {
     loop {
         match rx.try_recv() {
@@ -210,7 +310,7 @@ fn drain_latest(rx: &Receiver<Cmd>, mut current: ArtJob) -> Result<ArtJob, ()> {
     Ok(current)
 }
 
-fn worker_loop(rx: Receiver<Cmd>) {
+fn worker_loop(rx: Receiver<Cmd>, owner: Arc<ArtOwner>) {
     let mut pending: Option<ArtJob> = None;
     loop {
         let job = match pending.take() {
@@ -227,7 +327,7 @@ fn worker_loop(rx: Receiver<Cmd>) {
             },
         };
 
-        match run_job(&rx, job) {
+        match run_job(&rx, job, &owner) {
             RunOutcome::Done => {}
             // Newer job was already drained out of the mailbox — must keep it.
             RunOutcome::Superseded(next) => pending = Some(*next),
@@ -258,7 +358,7 @@ fn continue_or_switch(
     }
 }
 
-fn run_job(rx: &Receiver<Cmd>, mut job: ArtJob) -> RunOutcome {
+fn run_job(rx: &Receiver<Cmd>, mut job: ArtJob, owner: &ArtOwner) -> RunOutcome {
     let generation = job.generation;
 
     // --- Selected strip portrait first (visible immediately; don't wait on cover) ---
@@ -289,7 +389,7 @@ fn run_job(rx: &Receiver<Cmd>, mut job: ArtJob) -> RunOutcome {
     {
         let _ = icon_cache::backdrop_for_path(&path);
     }
-    emit(ArtEvent {
+    owner.emit(ArtEvent {
         generation,
         kind: ArtEventKind::SelectedReady,
     });
@@ -335,7 +435,7 @@ fn run_job(rx: &Receiver<Cmd>, mut job: ArtJob) -> RunOutcome {
             let _ = icon_cache::handle_for_shell(&path);
         }
     }
-    emit(ArtEvent {
+    owner.emit(ArtEvent {
         generation,
         kind: ArtEventKind::NearReady,
     });
@@ -410,34 +510,12 @@ fn run_job(rx: &Receiver<Cmd>, mut job: ArtJob) -> RunOutcome {
         }
     }
 
-    emit(ArtEvent {
+    owner.emit(ArtEvent {
         generation,
         kind: ArtEventKind::JobDone,
     });
     crate::controller::hid::diag::diag_info(format!("ui-diag: art worker done gen={generation}"));
     RunOutcome::Done
-}
-
-/// iced subscription stream of [`ArtEvent`]s.
-pub fn event_stream() -> impl iced::futures::Stream<Item = ArtEvent> {
-    iced::stream::channel(32, async move |mut output| {
-        let (tx, mut rx) = iced_mpsc::unbounded();
-        let bind_id = bind_event_sender(tx);
-        ensure_started();
-        let _guard = EventBindGuard(bind_id);
-        while let Some(ev) = rx.next().await {
-            if output.send(ev).await.is_err() {
-                break;
-            }
-        }
-    })
-}
-
-struct EventBindGuard(u64);
-impl Drop for EventBindGuard {
-    fn drop(&mut self) {
-        clear_event_sender(self.0);
-    }
 }
 
 #[cfg(test)]
@@ -453,6 +531,24 @@ mod tests {
             near: ArtRetainSet::default(),
             prefetch: ArtRetainSet::default(),
         }
+    }
+
+    fn mailbox_present(owner: &ArtOwner) -> bool {
+        owner
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mailbox
+            .is_some()
+    }
+
+    fn join_present(owner: &ArtOwner) -> bool {
+        owner
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .join
+            .is_some()
     }
 
     #[test]
@@ -483,31 +579,41 @@ mod tests {
         // `with_isolated_cache` can decode, have its entries wiped mid-test,
         // and fail on a perfectly correct decode.
         icon_cache::with_cache_lock(|| {
-            ensure_started();
-            assert!(MAILBOX.lock().unwrap().is_some());
-            shutdown();
-            assert!(MAILBOX.lock().unwrap().is_none());
-            assert!(JOIN.lock().unwrap().is_none());
-            ensure_started();
-            assert!(MAILBOX.lock().unwrap().is_some());
-            shutdown();
+            let owner = Arc::new(ArtOwner::new());
+            owner.ensure_started();
+            assert!(mailbox_present(&owner));
+            owner.shutdown();
+            assert!(!mailbox_present(&owner));
+            assert!(!join_present(&owner));
+            owner.ensure_started();
+            assert!(mailbox_present(&owner));
+            owner.shutdown();
         });
     }
 
     #[test]
-    fn clear_event_sender_ignores_stale_bind_id() {
+    fn clear_ignores_stale_bind_id() {
+        // Owned instance: no cross-test global sink, so no cache lock needed.
+        let owner = ArtOwner::new();
         let (tx_a, _rx_a) = iced_mpsc::unbounded();
         let (tx_b, _rx_b) = iced_mpsc::unbounded();
-        let id_a = bind_event_sender(tx_a);
-        let id_b = bind_event_sender(tx_b);
+        let id_a = owner.bind(tx_a);
+        let id_b = owner.bind(tx_b);
         assert_ne!(id_a, id_b);
-        clear_event_sender(id_a);
+        owner.clear(id_a);
         {
-            let guard = EVENT_TX.lock().unwrap();
-            assert!(guard.is_some(), "newer bind must survive stale clear");
-            assert_eq!(guard.as_ref().unwrap().bind_id, id_b);
+            let guard = owner.inner.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(guard.sink.is_some(), "newer bind must survive stale clear");
+            assert_eq!(guard.sink.as_ref().unwrap().bind_id, id_b);
         }
-        clear_event_sender(id_b);
-        assert!(EVENT_TX.lock().unwrap().is_none());
+        owner.clear(id_b);
+        assert!(
+            owner
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .sink
+                .is_none()
+        );
     }
 }

@@ -46,7 +46,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 ## Conventions & quirks
 
 - **Battery steps**: DualSense firmware reports battery in 11 coarse steps (0–10). Percentages use the Linux mid-point mapping (step 0 → 5%, step 9 → 95%, step 10/full → 100%). See `src/controller/dualsense/battery.rs` or the README.
-- **Lightbar color**: Blue → Purple → Red gradient as battery drops; reasserted every ~5 seconds. Low-battery pulse (orange) when ≤5% while discharging.
+- **Lightbar color**: Blue → Purple → Red gradient as battery drops; reapplied on change (new pad / color-bucket flip) plus a slow ~30s backstop. Low-battery pulse (orange) when ≤5% while discharging.
 - **Single instance with takeover**: the app enforces single-instance via the `single-instance` crate. A fresh tray launch terminates the running predecessor and takes over; only the internal `--replace` child waits for its gracefully-exiting parent.
 - **No async runtime**: iced already runs its executor on Tokio (see the `tokio` feature in `Cargo.toml`); app code programs against iced `Task`/`Subscription` plus the dedicated HID worker thread. Do not add an explicit Tokio dependency — blocking `hidapi` I/O must stay off the UI executor (see the cutover plan discussion).
 - **Windows features**: `tray-icon` builds differ per OS — root `Cargo.toml` has `[target.'cfg(windows)'.dependencies]`, `[target.'cfg(target_os = "macos")']`, `[target.'cfg(target_os = "linux")']` sections.
@@ -85,15 +85,16 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **The `single-instance` crate ensures only one run, with takeover**. A fresh launch kills the predecessor (`platform::prev_instance`) — if you add GUI windows, make sure they're owned correctly or you'll get "single instance" exits.
 - **Windows .exe icon is generated from SVG at build time** via `build.rs`. If the SVG changes, the icon rebuilds automatically (rerun-if-changed is set).
 - **Debug-only code is gated by `cfg(debug_assertions)`, not a Cargo feature**. The Developer emulator, HID diagnostics, and verbose logging ship in every non-release build. `scripts/ci.sh` lints *both* profiles (`--release` included) because release compiles out whole items that debug compiles — a debug-only clean build does not prove a clean release.
-- **Lightbar color reassertion every ~5 seconds** means if you overwrite the lightbar via another tool (e.g., Steam Input), the app will re-apply its color. This is intentional but worth noting when debugging "stuck" colors. (Incremental-poll work narrows this to change/new/30s-backstop; see `notes/hot-enumeration-freeze.md` for the Steam test watch.)
+- **Lightbar color reassertion (change/new-pad plus a slow ~30s backstop)** means if you overwrite the lightbar via another tool (e.g., Steam Input), the app will re-apply its color. This is intentional but worth noting when debugging "stuck" colors.
 - **Hot enumeration freeze**: while input is hot (`input_hot=1`, e.g. Start open with a stable pad), `refresh_devices()` is deferred up to `HOT_ENUM_MAX_DEFER` (20s heartbeat cap) and cold polls are gated off — plus the OS arrival watcher (Windows `CM_Register_Notification`, Linux `/dev` snapshot; see `notes/device-arrival-watch.md`) fires list-only refresh hints so newly-connected pads surface in ~1s. Pre-existing freeze documented in `notes/hot-enumeration-freeze.md`; any poll/sampling change must still be validated with a Start-open + second-connect test, not just tray-idle.
 - **Battery step mapping is Linux-midpoint**. Windows may report different percentages; the app maps firmware steps → percentages via the fixed mid-point formula.
 
 ## Where to find things
 
-- **HID driver / controller state** → `src/controller/hid/`, `src/controller/driver.rs`, `src/controller/model.rs`, `src/controller/dualsense/`
+- **HID driver / controller state** → `src/controller/hid/` (cadence `policy.rs`, error taxonomy `retry.rs`), `src/controller/driver.rs` (driver registry), `src/controller/model.rs` (`Serial`, `Capabilities`), `src/controller/dualsense/`
 - **Battery step → percentage math** → `src/controller/dualsense/battery.rs`
 - **Battery color spectrum** → `src/domain/color.rs`; lightbar writes / reassert → `src/controller/dualsense/lightbar.rs`
+- **Error type** → `src/app_error.rs` (`AppError` + `AppResult`)
 - **Lightbar spectrum editor (Settings)** → `src/ui/configure/spectrum.rs`, `src/ui/configure/mod.rs`
 - **Theme / shared widget styles** → `src/ui/theme.rs`; restyle plan → `notes/ui-refresh.md`
 - **Start screen / game launcher** → `src/ui/start/` (UI), `src/games/` (Steam scan, launch); immersive mode → `notes/start-immersive.md`

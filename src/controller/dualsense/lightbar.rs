@@ -1,21 +1,48 @@
 //! DualSense lightbar HID output.
 
+use crate::controller::driver::LightbarBackend;
 use crate::controller::dualsense::identity::{
-    self as dualsense, is_dualsense_device, is_dualsense_gamepad, normalize_identity,
+    self as dualsense, HidIoLock, is_dualsense_device, is_dualsense_gamepad, normalize_identity,
     resolve_device_identity,
 };
 use crate::domain::color::Rgb;
 use crate::domain::protocol::{CALIBRATION_FEATURE_REPORT, CALIBRATION_FEATURE_SIZE};
 use crate::platform::app_log;
+use crate::{AppError, AppResult};
 use hidapi::{BusType, HidApi, HidDevice};
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Steam claim verdict cache.
+///
+/// Intentional: 3s release claim cache. The debug-only hid-diag Steam scan in
+/// `hid::diag` (`STEAM_REFRESH`, 1s) is a separate verbose-logging cache with a
+/// shorter TTL — different purpose, different TTL; neither should be "unified".
 const STEAM_CLAIM_CACHE_TTL: Duration = Duration::from_secs(3);
+
+/// [`crate::controller::driver::LightbarBackend`] for DualSense: the registry's
+/// `Some` arm. Thin delegate over [`apply_lightbar_rgb_timed`] — report bytes,
+/// CRC seeds, and `LIGHT_OUT` claim setup stay DualSense-private in this file.
+pub struct DualSenseLightbarBackend;
+
+/// Shared backend instance behind [`crate::controller::driver::DUALSENSE`].
+pub static DUALSENSE_LIGHTBAR: DualSenseLightbarBackend = DualSenseLightbarBackend;
+
+impl LightbarBackend for DualSenseLightbarBackend {
+    fn apply(
+        &self,
+        api: &HidApi,
+        serial: &str,
+        color: Rgb,
+        claims: &ClaimStore,
+    ) -> (AppResult<()>, HidPhaseTiming) {
+        apply_lightbar_rgb_timed(api, serial, color, claims)
+    }
+}
 
 /// Phase timings for hid-worker metrics (enumerate / open / io).
 #[derive(Debug, Default, Clone, Copy)]
@@ -81,72 +108,196 @@ pub const LOW_BATTERY_PULSE_ON_MS: u64 = 400;
 pub const LOW_BATTERY_PULSE_GAP_MS: u64 = 1600;
 pub const LOW_BATTERY_ORANGE: Rgb = Rgb::ORANGE;
 
-/// Serializes DualSense lightbar claim tracking (I/O lock lives in [`crate::controller::dualsense::identity`]).
-static BT_OUTPUT_SEQ: AtomicU8 = AtomicU8::new(0);
-/// When false, automatic battery/poll/pulse RGB writes are skipped (Identify / CLI still work).
-static AUTOMATIC_ENABLED: AtomicBool = AtomicBool::new(true);
-/// Serials that have already received a `LIGHT_OUT` claim this connection.
-static CLAIMED_SERIALS: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-/// Last RGB applied per serial (poll reassert / hot SetRgb). Lets the poll loop
-/// skip redundant writes: reassert only on color change or slow backstop.
-static LAST_APPLIED: LazyLock<Mutex<HashMap<String, (Rgb, Instant)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Slow reassert so foreign overwrites (game launchers, etc.) do not stick,
 /// without rewriting every pad on every 5s liveness tick.
 pub const LIGHTBAR_REASSERT_INTERVAL: Duration = Duration::from_secs(30);
-/// Last observed Steam running state; forget claims when it changes.
-static LAST_STEAM_RUNNING: Mutex<Option<bool>> = Mutex::new(None);
+
 struct SteamClaimCache {
     running: bool,
     refreshed_at: Option<Instant>,
 }
-static STEAM_CLAIM_CACHE: Mutex<SteamClaimCache> = Mutex::new(SteamClaimCache {
-    running: false,
-    refreshed_at: None,
-});
-#[cfg(test)]
-static STEAM_CLAIM_TEST_OVERRIDE: Mutex<Option<bool>> = Mutex::new(None);
 
-/// Enable or disable automatic lightbar RGB (poll + low-battery pulse).
-pub fn set_enabled(enabled: bool) {
-    AUTOMATIC_ENABLED.store(enabled, Ordering::SeqCst);
-}
-
-/// Whether automatic lightbar RGB writes should run.
-pub fn is_enabled() -> bool {
-    AUTOMATIC_ENABLED.load(Ordering::SeqCst)
-}
-
-fn next_bt_seq_tag() -> u8 {
-    let seq = BT_OUTPUT_SEQ.fetch_add(1, Ordering::Relaxed) & 0x0F;
-    seq << 4
-}
-
-/// Whether `steam.exe` is running (cached). Used only for lightbar claim strategy —
-/// must work in release (unlike debug-only hid-diag steam tags).
-fn steam_running_for_claim() -> bool {
+/// Owned lightbar-claim unit: claim-once set, last-applied colors, Steam
+/// transition tracking, and the BT output sequence.
+///
+/// Owned by the HID worker (`HidWorkerHandle::claims`) and cloned into the
+/// app root for the presence-empty fast path. Single worker today, so
+/// per-store sequence matches the old global behavior.
+pub struct ClaimStore {
+    claimed: Mutex<HashSet<String>>,
+    applied: Mutex<HashMap<String, (Rgb, Instant)>>,
+    last_steam: Mutex<Option<bool>>,
+    steam_cache: Mutex<SteamClaimCache>,
+    automatic: AtomicBool,
+    bt_seq: AtomicU8,
     #[cfg(test)]
-    if let Ok(guard) = STEAM_CLAIM_TEST_OVERRIDE.lock()
-        && let Some(value) = *guard
-    {
-        return value;
+    test_override: Mutex<Option<bool>>,
+}
+
+impl ClaimStore {
+    pub fn new() -> Self {
+        Self {
+            claimed: Mutex::new(HashSet::new()),
+            applied: Mutex::new(HashMap::new()),
+            last_steam: Mutex::new(None),
+            steam_cache: Mutex::new(SteamClaimCache {
+                running: false,
+                refreshed_at: None,
+            }),
+            automatic: AtomicBool::new(true),
+            bt_seq: AtomicU8::new(0),
+            #[cfg(test)]
+            test_override: Mutex::new(None),
+        }
     }
 
-    let now = Instant::now();
-    if let Ok(mut guard) = STEAM_CLAIM_CACHE.lock() {
-        if guard
-            .refreshed_at
-            .is_some_and(|t| now.duration_since(t) < STEAM_CLAIM_CACHE_TTL)
-        {
-            return guard.running;
-        }
-        let running = detect_steam_running();
-        guard.running = running;
-        guard.refreshed_at = Some(now);
-        return running;
+    /// Enable or disable automatic lightbar RGB (poll + low-battery pulse).
+    pub fn set_enabled(&self, enabled: bool) {
+        self.automatic.store(enabled, Ordering::SeqCst);
     }
-    detect_steam_running()
+
+    /// Whether automatic lightbar RGB writes should run.
+    pub fn is_enabled(&self) -> bool {
+        self.automatic.load(Ordering::SeqCst)
+    }
+
+    fn next_seq_tag(&self) -> u8 {
+        let seq = self.bt_seq.fetch_add(1, Ordering::Relaxed) & 0x0F;
+        seq << 4
+    }
+
+    /// Whether `steam.exe` is running (cached). Used only for lightbar claim strategy —
+    /// must work in release (unlike debug-only hid-diag steam tags).
+    pub fn steam_running(&self) -> bool {
+        #[cfg(test)]
+        if let Ok(guard) = self.test_override.lock()
+            && let Some(value) = *guard
+        {
+            return value;
+        }
+
+        let now = Instant::now();
+        if let Ok(mut guard) = self.steam_cache.lock() {
+            if guard
+                .refreshed_at
+                .is_some_and(|t| now.duration_since(t) < STEAM_CLAIM_CACHE_TTL)
+            {
+                return guard.running;
+            }
+            let running = detect_steam_running();
+            guard.running = running;
+            guard.refreshed_at = Some(now);
+            return running;
+        }
+        detect_steam_running()
+    }
+
+    #[cfg(test)]
+    fn set_test_steam(&self, running: Option<bool>) {
+        if let Ok(mut guard) = self.test_override.lock() {
+            *guard = running;
+        }
+        if let Ok(mut cache) = self.steam_cache.lock() {
+            cache.refreshed_at = None;
+        }
+        if let Ok(mut last) = self.last_steam.lock() {
+            *last = None;
+        }
+    }
+
+    /// Drop claims for pads that are no longer present.
+    pub fn sync(&self, active_serials: impl IntoIterator<Item = impl AsRef<str>>) {
+        let active: HashSet<String> = active_serials
+            .into_iter()
+            .map(|s| normalize_identity(s.as_ref()))
+            .collect();
+        if let Ok(mut claimed) = self.claimed.lock() {
+            claimed.retain(|s| active.contains(s));
+        }
+        if let Ok(mut applied) = self.applied.lock() {
+            applied.retain(|s, _| active.contains(s));
+        }
+    }
+
+    /// Record a successful canonical-color write (poll reassert / hot SetRgb).
+    /// Pulse orange/restore writes must not record: orange is not canonical.
+    pub fn note_applied(&self, serial: &str, color: Rgb) {
+        if let Ok(mut applied) = self.applied.lock() {
+            applied.insert(normalize_identity(serial), (color, Instant::now()));
+        }
+    }
+
+    /// Whether `serial` needs a lightbar write for `color` right now.
+    pub fn reassert_due(&self, serial: &str, color: Rgb) -> bool {
+        let record = self
+            .applied
+            .lock()
+            .map(|guard| guard.get(&normalize_identity(serial)).copied())
+            .unwrap_or(None);
+        reassert_due_at(record, color, Instant::now())
+    }
+
+    /// Drop all `LIGHT_OUT` claims (e.g. CLI force-reapply, hid-worker session start).
+    pub fn forget_all(&self) {
+        if let Ok(mut claimed) = self.claimed.lock() {
+            claimed.clear();
+        }
+        if let Ok(mut applied) = self.applied.lock() {
+            applied.clear();
+        }
+    }
+
+    /// Forget claims when Steam starts or stops so the next write picks the right path.
+    fn sync_steam_transition(&self) {
+        let running = self.steam_running();
+        let Ok(mut last) = self.last_steam.lock() else {
+            return;
+        };
+        match *last {
+            None => *last = Some(running),
+            Some(prev) if prev != running => {
+                self.forget_all();
+                *last = Some(running);
+            }
+            Some(_) => {}
+        }
+    }
+
+    pub(crate) fn forget_one(&self, serial: &str) {
+        if let Ok(mut claimed) = self.claimed.lock() {
+            claimed.remove(&normalize_identity(serial));
+        }
+    }
+
+    pub fn take_claim(&self, serial: &str) -> bool {
+        self.sync_steam_transition();
+        // Steam Input already initialized the lightbar; LIGHT_OUT fights it and leaves
+        // RGB writes as silent no-ops (restored from v0.1.7).
+        if self.steam_running() {
+            return false;
+        }
+
+        let Ok(mut claimed) = self.claimed.lock() else {
+            return true;
+        };
+        claimed.insert(normalize_identity(serial))
+    }
+
+    /// Drop the claim for `serial` so the next apply runs `LIGHT_OUT` then RGB.
+    ///
+    /// Used when a pad newly appears in the live set: presence can clear the tray
+    /// without a HID poll, which would otherwise leave a stale claim and skip
+    /// reclaim on Bluetooth reconnect. No-op for claim strategy while Steam is
+    /// running (`take_claim` skips `LIGHT_OUT`).
+    pub fn prepare_connect(&self, serial: &str) {
+        self.forget_one(serial);
+    }
+}
+
+impl Default for ClaimStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn detect_steam_running() -> bool {
@@ -157,41 +308,6 @@ fn detect_steam_running() -> bool {
     #[cfg(not(windows))]
     {
         false
-    }
-}
-
-#[cfg(test)]
-fn set_steam_running_for_test(running: Option<bool>) {
-    if let Ok(mut guard) = STEAM_CLAIM_TEST_OVERRIDE.lock() {
-        *guard = running;
-    }
-    if let Ok(mut cache) = STEAM_CLAIM_CACHE.lock() {
-        cache.refreshed_at = None;
-    }
-    if let Ok(mut last) = LAST_STEAM_RUNNING.lock() {
-        *last = None;
-    }
-}
-
-/// Drop claims for pads that are no longer present.
-pub fn sync_lightbar_claims(active_serials: impl IntoIterator<Item = impl AsRef<str>>) {
-    let active: HashSet<String> = active_serials
-        .into_iter()
-        .map(|s| normalize_identity(s.as_ref()))
-        .collect();
-    if let Ok(mut claimed) = CLAIMED_SERIALS.lock() {
-        claimed.retain(|s| active.contains(s));
-    }
-    if let Ok(mut applied) = LAST_APPLIED.lock() {
-        applied.retain(|s, _| active.contains(s));
-    }
-}
-
-/// Record a successful canonical-color write (poll reassert / hot SetRgb).
-/// Pulse orange/restore writes must not record: orange is not canonical.
-pub fn note_lightbar_applied(serial: &str, color: Rgb) {
-    if let Ok(mut applied) = LAST_APPLIED.lock() {
-        applied.insert(normalize_identity(serial), (color, Instant::now()));
     }
 }
 
@@ -206,76 +322,10 @@ fn reassert_due_at(record: Option<(Rgb, Instant)>, color: Rgb, now: Instant) -> 
     }
 }
 
-/// Whether `serial` needs a lightbar write for `color` right now.
-pub fn lightbar_reassert_due(serial: &str, color: Rgb) -> bool {
-    let record = LAST_APPLIED
-        .lock()
-        .map(|guard| guard.get(&normalize_identity(serial)).copied())
-        .unwrap_or(None);
-    reassert_due_at(record, color, Instant::now())
-}
-
-/// Drop all `LIGHT_OUT` claims (e.g. CLI force-reapply, hid-worker session start).
-pub fn forget_all_claims() {
-    if let Ok(mut claimed) = CLAIMED_SERIALS.lock() {
-        claimed.clear();
-    }
-    if let Ok(mut applied) = LAST_APPLIED.lock() {
-        applied.clear();
-    }
-}
-
-/// Forget claims when Steam starts or stops so the next write picks the right path.
-fn sync_steam_transition() {
-    let running = steam_running_for_claim();
-    let Ok(mut last) = LAST_STEAM_RUNNING.lock() else {
-        return;
-    };
-    match *last {
-        None => *last = Some(running),
-        Some(prev) if prev != running => {
-            forget_all_claims();
-            *last = Some(running);
-        }
-        Some(_) => {}
-    }
-}
-
-fn take_claim_if_needed(serial: &str) -> bool {
-    sync_steam_transition();
-    // Steam Input already initialized the lightbar; LIGHT_OUT fights it and leaves
-    // RGB writes as silent no-ops (restored from v0.1.7).
-    if steam_running_for_claim() {
-        return false;
-    }
-
-    let Ok(mut claimed) = CLAIMED_SERIALS.lock() else {
-        return true;
-    };
-    claimed.insert(normalize_identity(serial))
-}
-
-fn forget_claim(serial: &str) {
-    if let Ok(mut claimed) = CLAIMED_SERIALS.lock() {
-        claimed.remove(&normalize_identity(serial));
-    }
-}
-
-/// Drop the claim for `serial` so the next apply runs `LIGHT_OUT` then RGB.
-///
-/// Used when a pad newly appears in the live set: presence can clear the tray
-/// without a HID poll, which would otherwise leave a stale claim and skip
-/// reclaim on Bluetooth reconnect. No-op for claim strategy while Steam is
-/// running (`take_claim_if_needed` skips `LIGHT_OUT`).
-pub fn prepare_connect_apply(serial: &str) {
-    forget_claim(serial);
-}
-
 fn is_retryable_write_error(err: &impl std::fmt::Display) -> bool {
-    let text = err.to_string();
-    text.contains("0x000003E5")
-        || text.contains("WaitForSingleObject")
-        || text.contains("Overlapped I/O")
+    // Single classifier lives in `hid::retry` (see its policy table);
+    // this keeps the existing name/signature for the timed-apply caller.
+    crate::controller::hid::retry::is_transient(err)
 }
 
 /// Request calibration so the pad switches to full BT reports / accepts effects (SDL).
@@ -291,13 +341,14 @@ pub fn apply_lightbar_rgb_timed(
     api: &HidApi,
     serial: &str,
     color: Rgb,
-) -> (Result<(), String>, HidPhaseTiming) {
-    let (first, mut timing) = try_apply_by_serial_timed(api, serial, color, false);
+    claims: &ClaimStore,
+) -> (AppResult<()>, HidPhaseTiming) {
+    let (first, mut timing) = try_apply_by_serial_timed(api, serial, color, false, claims);
     match first {
         Ok(()) => (Ok(()), timing),
         Err(err) if is_retryable_write_error(&err) => {
             thread::sleep(WRITE_RETRY_DELAY);
-            let (retry, t2) = try_apply_by_serial_timed(api, serial, color, true);
+            let (retry, t2) = try_apply_by_serial_timed(api, serial, color, true, claims);
             timing.add_assign(t2);
             (retry, timing)
         }
@@ -310,7 +361,8 @@ fn try_apply_by_serial_timed(
     serial: &str,
     color: Rgb,
     retry: bool,
-) -> (Result<(), String>, HidPhaseTiming) {
+    claims: &ClaimStore,
+) -> (AppResult<()>, HidPhaseTiming) {
     let mut timing = HidPhaseTiming::default();
     let enum_started = Instant::now();
     let target = normalize_identity(serial);
@@ -365,15 +417,18 @@ fn try_apply_by_serial_timed(
     timing.open_ms = open_ms;
 
     if candidates.is_empty() {
-        return (Err(format!("controller {serial} not found")), timing);
+        return (
+            Err(AppError::Hid(format!("controller {serial} not found"))),
+            timing,
+        );
     }
     candidates.sort_by_key(|(_, _, rank)| *rank);
 
     let io_started = Instant::now();
-    let mut last_err: Option<String> = None;
+    let mut last_err: Option<AppError> = None;
     let mut any_ok = false;
     // One claim decision for the serial; later interfaces only send RGB.
-    let mut claim = take_claim_if_needed(&target);
+    let mut claim = claims.take_claim(&target);
     for (device, is_bluetooth, _) in candidates {
         if is_bluetooth {
             prepare_bt_output_mode(&device);
@@ -386,6 +441,7 @@ fn try_apply_by_serial_timed(
             "lightbar",
             retry,
             claim,
+            claims,
         ) {
             Ok(()) => {
                 any_ok = true;
@@ -393,8 +449,8 @@ fn try_apply_by_serial_timed(
             }
             Err(err) => {
                 if claim {
-                    forget_claim(&target);
-                    claim = take_claim_if_needed(&target);
+                    claims.forget_one(&target);
+                    claim = claims.take_claim(&target);
                 }
                 last_err = Some(err);
             }
@@ -406,12 +462,13 @@ fn try_apply_by_serial_timed(
         (Ok(()), timing)
     } else {
         (
-            Err(last_err.unwrap_or_else(|| format!("controller {serial} not found"))),
+            Err(last_err.unwrap_or_else(|| AppError::Hid(format!("controller {serial} not found")))),
             timing,
         )
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_on_open_device_inner(
     device: &HidDevice,
     serial: &str,
@@ -420,11 +477,21 @@ fn apply_on_open_device_inner(
     caller: &str,
     retry: bool,
     claim: bool,
-) -> Result<(), String> {
+    claims: &ClaimStore,
+) -> AppResult<()> {
     let target = normalize_identity(serial);
-    match set_lightbar_on_device(device, color, is_bluetooth, claim, &target, caller, retry) {
+    match set_lightbar_on_device(
+        device,
+        color,
+        is_bluetooth,
+        claim,
+        &target,
+        caller,
+        retry,
+        claims,
+    ) {
         Ok(()) => Ok(()),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -437,6 +504,7 @@ fn apply_on_open_device_inner(
 /// initialized the bar and the claim fights it (silent no-op).
 ///
 /// If the claim write fails, RGB is **not** attempted on the same handle.
+#[allow(clippy::too_many_arguments)]
 pub fn set_lightbar_on_device(
     device: &HidDevice,
     color: Rgb,
@@ -445,11 +513,21 @@ pub fn set_lightbar_on_device(
     serial: &str,
     caller: &str,
     retry: bool,
+    claims: &ClaimStore,
 ) -> Result<(), hidapi::HidError> {
     if claim {
-        write_lightbar_claim(device, is_bluetooth, serial, caller, retry)?;
+        write_lightbar_claim(device, is_bluetooth, serial, caller, retry, claims)?;
     }
-    write_lightbar_rgb(device, is_bluetooth, color, serial, caller, claim, retry)
+    write_lightbar_rgb(
+        device,
+        is_bluetooth,
+        color,
+        serial,
+        caller,
+        claim,
+        retry,
+        claims,
+    )
 }
 
 fn write_lightbar_claim(
@@ -458,6 +536,7 @@ fn write_lightbar_claim(
     serial: &str,
     caller: &str,
     retry: bool,
+    claims: &ClaimStore,
 ) -> Result<(), hidapi::HidError> {
     write_output_report(
         device,
@@ -468,6 +547,7 @@ fn write_lightbar_claim(
         None,
         true,
         retry,
+        claims,
         |common| {
             common[OFF_VALID_FLAG2] = OUTPUT_VALID_FLAG2_LIGHTBAR_SETUP;
             common[OFF_LIGHTBAR_SETUP] = OUTPUT_LIGHTBAR_SETUP_LIGHT_OUT;
@@ -475,6 +555,7 @@ fn write_lightbar_claim(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_lightbar_rgb(
     device: &HidDevice,
     is_bluetooth: bool,
@@ -483,6 +564,7 @@ fn write_lightbar_rgb(
     caller: &str,
     claim_needed: bool,
     retry: bool,
+    claims: &ClaimStore,
 ) -> Result<(), hidapi::HidError> {
     write_output_report(
         device,
@@ -493,6 +575,7 @@ fn write_lightbar_rgb(
         Some((color.r, color.g, color.b)),
         claim_needed,
         retry,
+        claims,
         |common| {
             common[OFF_VALID_FLAG1] = OUTPUT_VALID_FLAG1_LIGHTBAR;
             common[OFF_LIGHTBAR_R] = color.r;
@@ -512,6 +595,7 @@ pub(crate) fn write_output_report(
     rgb: Option<(u8, u8, u8)>,
     claim_needed: bool,
     retry: bool,
+    claims: &ClaimStore,
     fill_common: impl FnOnce(&mut [u8]),
 ) -> Result<(), hidapi::HidError> {
     let bus = crate::controller::hid::diag::bus_tag(if is_bluetooth {
@@ -522,7 +606,7 @@ pub(crate) fn write_output_report(
     let started = Instant::now();
     // (bytes_reported, expected_len, transport)
     let result: Result<(usize, usize, &'static str), hidapi::HidError> = if is_bluetooth {
-        let report = build_bt_report(fill_common);
+        let report = build_bt_report(claims, fill_common);
         let _op = crate::controller::hid::diag::enter_op("hid_write");
         // Windows BT + Steam: interrupt `write` with RGB-only (no LIGHT_OUT) is the
         // path that historically updated the bar (v0.1.7). Control `send_output_report`
@@ -579,16 +663,19 @@ pub(crate) fn write_output_report(
             claim_needed,
             retry,
             ms,
-            Err(err.to_string()),
+            Err(AppError::Hid(err.to_string())),
         ),
     }
     result.map(|_| ())
 }
 
-fn build_bt_report(fill_common: impl FnOnce(&mut [u8])) -> [u8; OUTPUT_REPORT_BT_SIZE] {
+fn build_bt_report(
+    claims: &ClaimStore,
+    fill_common: impl FnOnce(&mut [u8]),
+) -> [u8; OUTPUT_REPORT_BT_SIZE] {
     let mut report = [0u8; OUTPUT_REPORT_BT_SIZE];
     report[0] = OUTPUT_REPORT_BT_ID;
-    report[1] = next_bt_seq_tag();
+    report[1] = claims.next_seq_tag();
     report[2] = OUTPUT_REPORT_BT_TAG;
     fill_common(&mut report[3..]);
 
@@ -604,24 +691,30 @@ fn build_bt_report(fill_common: impl FnOnce(&mut [u8])) -> [u8; OUTPUT_REPORT_BT
 
 /// Apply a color to every connected DualSense (CLI / debug).
 /// Clears claims so each pad receives a fresh `LIGHT_OUT` then RGB.
-pub fn apply_lightbar_all(color: Rgb) -> Result<usize, String> {
-    let _guard = dualsense::lock_hid()?;
-    apply_lightbar_all_timed(color).0
+///
+/// Takes the caller's `&HidIoLock` (CLI one-shots use a local
+/// `HidIoLock::new()`); the timed variant below assumes the lock is held.
+pub fn apply_lightbar_all(lock: &HidIoLock, color: Rgb, claims: &ClaimStore) -> AppResult<usize> {
+    let _guard = lock.lock()?;
+    apply_lightbar_all_timed(color, claims).0
 }
 
-pub fn apply_lightbar_all_timed(color: Rgb) -> (Result<usize, String>, HidPhaseTiming) {
+pub fn apply_lightbar_all_timed(
+    color: Rgb,
+    claims: &ClaimStore,
+) -> (AppResult<usize>, HidPhaseTiming) {
     let mut timing = HidPhaseTiming::default();
     let enum_started = Instant::now();
     let api = match HidApi::new() {
         Ok(api) => api,
         Err(e) => {
             timing.enumerate_ms = enum_started.elapsed().as_millis();
-            return (Err(e.to_string()), timing);
+            return (Err(e.into()), timing);
         }
     };
     let mut applied = 0usize;
 
-    forget_all_claims();
+    claims.forget_all();
 
     let mut open_ms = 0u128;
     let mut io_ms = 0u128;
@@ -663,7 +756,7 @@ pub fn apply_lightbar_all_timed(color: Rgb) -> (Result<usize, String>, HidPhaseT
         if is_bluetooth {
             prepare_bt_output_mode(&device);
         }
-        let claim = take_claim_if_needed(&serial);
+        let claim = claims.take_claim(&serial);
         let io_started = Instant::now();
         match apply_on_open_device_inner(
             &device,
@@ -673,11 +766,12 @@ pub fn apply_lightbar_all_timed(color: Rgb) -> (Result<usize, String>, HidPhaseT
             "lightbar_all",
             false,
             claim,
+            claims,
         ) {
             Ok(()) => applied += 1,
             Err(err) => {
                 if claim {
-                    forget_claim(&serial);
+                    claims.forget_one(&serial);
                 }
                 app_log::warn(format!("lightbar write failed: {err}"));
             }
@@ -702,18 +796,10 @@ pub fn warn_lightbar(product: &str, err: impl std::fmt::Display) {
 mod tests {
     use super::*;
 
-    static CLAIM_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_claim_test_lock(f: impl FnOnce()) {
-        let _guard = CLAIM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        f();
-        set_steam_running_for_test(None);
-        forget_all_claims();
-    }
-
     #[test]
     fn bt_claim_report_has_setup_without_rgb() {
-        let report = build_bt_report(|common| {
+        let claims = ClaimStore::new();
+        let report = build_bt_report(&claims, |common| {
             common[OFF_VALID_FLAG2] = OUTPUT_VALID_FLAG2_LIGHTBAR_SETUP;
             common[OFF_LIGHTBAR_SETUP] = OUTPUT_LIGHTBAR_SETUP_LIGHT_OUT;
         });
@@ -735,7 +821,8 @@ mod tests {
 
     #[test]
     fn bt_rgb_report_sets_color_without_setup() {
-        let report = build_bt_report(|common| {
+        let claims = ClaimStore::new();
+        let report = build_bt_report(&claims, |common| {
             common[OFF_VALID_FLAG1] = OUTPUT_VALID_FLAG1_LIGHTBAR;
             common[OFF_LIGHTBAR_R] = 255;
             common[OFF_LIGHTBAR_G] = 100;
@@ -752,43 +839,41 @@ mod tests {
 
     #[test]
     fn claim_once_per_connection() {
-        with_claim_test_lock(|| {
-            set_steam_running_for_test(Some(false));
-            forget_all_claims();
+        let claims = ClaimStore::new();
+        claims.set_test_steam(Some(false));
+        claims.forget_all();
 
-            sync_lightbar_claims(std::iter::empty::<&str>());
-            assert!(take_claim_if_needed("aabbcc"));
-            assert!(!take_claim_if_needed("aabbcc"));
-            assert!(take_claim_if_needed("ddeeff"));
-            sync_lightbar_claims(["ddeeff"]);
-            assert!(!take_claim_if_needed("ddeeff"));
-            assert!(take_claim_if_needed("aabbcc"));
-            sync_lightbar_claims(std::iter::empty::<&str>());
+        claims.sync(std::iter::empty::<&str>());
+        assert!(claims.take_claim("aabbcc"));
+        assert!(!claims.take_claim("aabbcc"));
+        assert!(claims.take_claim("ddeeff"));
+        claims.sync(["ddeeff"]);
+        assert!(!claims.take_claim("ddeeff"));
+        assert!(claims.take_claim("aabbcc"));
+        claims.sync(std::iter::empty::<&str>());
 
-            forget_all_claims();
-            assert!(take_claim_if_needed("aabbcc"));
-            assert!(!take_claim_if_needed("aabbcc"));
-            prepare_connect_apply("aabbcc");
-            assert!(take_claim_if_needed("aabbcc"));
-        });
+        claims.forget_all();
+        assert!(claims.take_claim("aabbcc"));
+        assert!(!claims.take_claim("aabbcc"));
+        claims.prepare_connect("aabbcc");
+        assert!(claims.take_claim("aabbcc"));
     }
 
     #[test]
     fn steam_skips_light_out_claim() {
-        with_claim_test_lock(|| {
-            set_steam_running_for_test(Some(true));
-            forget_all_claims();
-            assert!(!take_claim_if_needed("aabbcc"));
-            assert!(!take_claim_if_needed("aabbcc"));
+        let claims = ClaimStore::new();
+        claims.set_test_steam(Some(true));
+        claims.forget_all();
+        assert!(!claims.take_claim("aabbcc"));
+        assert!(!claims.take_claim("aabbcc"));
 
-            set_steam_running_for_test(Some(false));
-            // Transition clears claims; without Steam we claim once.
-            assert!(take_claim_if_needed("aabbcc"));
-            assert!(!take_claim_if_needed("aabbcc"));
+        claims.set_test_steam(Some(false));
+        // Transition clears claims; without Steam we claim once.
+        assert!(claims.take_claim("aabbcc"));
+        assert!(!claims.take_claim("aabbcc"));
 
-            set_steam_running_for_test(Some(true));
-            assert!(!take_claim_if_needed("aabbcc"));
-        });
+        claims.set_test_steam(Some(true));
+        assert!(!claims.take_claim("aabbcc"));
     }
 
     #[test]

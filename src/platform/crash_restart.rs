@@ -5,6 +5,7 @@
 
 use crate::persist::paths;
 use crate::platform::app_log;
+use crate::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -26,7 +27,34 @@ const BUDGET_MAX: usize = 3;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-static ARMED: AtomicBool = AtomicBool::new(false);
+/// Owned tray-arm flag for crash restart.
+///
+/// Owned by the crash boot in the binary root (`OnceLock` static in `main`,
+/// so the panic hook can hold a `&'static` borrow); pass `&CrashArmed` to
+/// [`arm_tray_mode`] / [`schedule_from_panic`]. No process-global.
+pub struct CrashArmed(AtomicBool);
+
+impl CrashArmed {
+    pub const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// Mark tray mode as running (CLI paths stay unarmed).
+    pub fn arm_tray_mode(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// True when a panic should schedule a delayed relaunch.
+    pub fn should_schedule_from_panic(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for CrashArmed {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct RestartBudget {
@@ -77,13 +105,13 @@ pub fn take_pending_notice() -> bool {
 }
 
 /// Call once tray mode is about to start (`app::run`). CLI paths stay unarmed.
-pub fn arm_tray_mode() {
-    ARMED.store(true, Ordering::SeqCst);
+pub fn arm_tray_mode(armed: &CrashArmed) {
+    armed.arm_tray_mode();
 }
 
 /// From the panic hook: spawn a detached `--crash-relaunch` helper if armed.
-pub fn schedule_from_panic() {
-    if !ARMED.load(Ordering::SeqCst) {
+pub fn schedule_from_panic(armed: &CrashArmed) {
+    if !armed.should_schedule_from_panic() {
         return;
     }
 
@@ -144,10 +172,10 @@ pub fn run_relauncher() -> ExitCode {
 }
 
 /// Returns `Ok(true)` if this attempt is within budget (and records it).
-fn consume_budget() -> Result<bool, String> {
+fn consume_budget() -> AppResult<bool> {
     let path = budget_path();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        fs::create_dir_all(parent)?;
     }
 
     let now = epoch_secs();
@@ -166,9 +194,9 @@ fn consume_budget() -> Result<bool, String> {
     Ok(true)
 }
 
-fn write_budget(path: &std::path::Path, budget: &RestartBudget) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(budget).map_err(|e| e.to_string())?;
-    fs::write(path, bytes).map_err(|e| e.to_string())
+fn write_budget(path: &std::path::Path, budget: &RestartBudget) -> AppResult<()> {
+    let bytes = serde_json::to_vec_pretty(budget).map_err(|e| AppError::Platform(e.to_string()))?;
+    Ok(fs::write(path, bytes)?)
 }
 
 fn epoch_secs() -> u64 {

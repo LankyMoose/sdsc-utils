@@ -1,6 +1,8 @@
 //! Shared DualSense HID identity, device filters, and I/O lock.
 
+use crate::controller::model::Serial;
 use crate::platform::app_log;
+use crate::{AppError, AppResult};
 use hidapi::{BusType, DeviceInfo, HidDevice};
 use std::sync::Mutex;
 
@@ -16,20 +18,37 @@ const HID_USAGE_GAMEPAD: u16 = 0x05;
 const PAIRING_INFO_FEATURE_REPORT: u8 = 0x09;
 const PAIRING_INFO_FEATURE_SIZE: usize = 20;
 
-/// Serializes all DualSense HID open/read/write/close (battery, lightbar, power-off).
-static HID_IO_LOCK: Mutex<()> = Mutex::new(());
+/// Owned serial lock for all DualSense HID open/read/write/close.
+///
+/// Own a `HidIoLock` in the HID worker / app root and pass `&HidIoLock` down
+/// to `poll_controllers` / `apply_lightbar_all`. CLI one-shots construct a
+/// local `HidIoLock::new()`; the daemon worker is exclusive so its lock is
+/// uncontended.
+pub struct HidIoLock(Mutex<()>);
 
-/// Hold the DualSense HID I/O lock for a closure (CLI one-shots only).
-pub fn with_hid_lock<T>(f: impl FnOnce() -> T) -> T {
-    let _guard = HID_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    f()
+impl HidIoLock {
+    pub const fn new() -> Self {
+        Self(Mutex::new(()))
+    }
+
+    /// Hold the lock for a closure (CLI one-shots).
+    pub fn with_lock<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
+    /// Take the lock; returns an error string if poisoned.
+    pub fn lock(&self) -> AppResult<std::sync::MutexGuard<'_, ()>> {
+        self.0
+            .lock()
+            .map_err(|_| AppError::Hid("HID lock poisoned".into()))
+    }
 }
 
-/// Try to take the HID lock; returns an error string if poisoned.
-pub fn lock_hid() -> Result<std::sync::MutexGuard<'static, ()>, String> {
-    HID_IO_LOCK
-        .lock()
-        .map_err(|_| "HID lock poisoned".to_string())
+impl Default for HidIoLock {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub fn product_name(product_id: u16) -> &'static str {
@@ -48,16 +67,12 @@ pub fn hid_serial(info: &DeviceInfo) -> String {
 
 /// True when a serial is a real pad identity (not empty / `"unknown"`).
 pub fn is_storable_serial(serial: &str) -> bool {
-    !serial.is_empty() && serial != "unknown"
+    Serial::from(serial).is_storable()
 }
 
 /// Normalize MAC-style identities so `AA:BB:…` and `aabb…` compare equal.
 pub fn normalize_identity(serial: &str) -> String {
-    serial
-        .chars()
-        .filter(|c| *c != ':' && *c != '-')
-        .flat_map(|c| c.to_lowercase())
-        .collect()
+    Serial::normalize(serial).into_inner()
 }
 
 /// Format a little-endian MAC (as in feature report 0x09) like Windows BT HID serials.
@@ -117,20 +132,6 @@ pub fn is_dualsense_gamepad(d: &DeviceInfo) -> bool {
 
 pub fn is_dualsense_device(d: &DeviceInfo) -> bool {
     is_dualsense_vid_pid(d.vendor_id(), d.product_id())
-}
-
-/// Presence keys for connect/disconnect (HID paths — unique per USB/BT node).
-/// One-shot helper (CLI/tests). The daemon uses [`crate::controller::hid::worker::HidWorkerHandle::presence_paths`].
-#[allow(dead_code)]
-pub fn list_presence_paths() -> Result<Vec<String>, String> {
-    let api = hidapi::HidApi::new().map_err(|e| e.to_string())?;
-    let mut keys: Vec<String> = api
-        .device_list()
-        .filter(|d| is_dualsense_gamepad(d))
-        .map(|d| d.path().to_string_lossy().into_owned())
-        .collect();
-    keys.sort();
-    Ok(keys)
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@
 //!   **debug builds only** (`cfg(debug_assertions)`)
 
 use crate::platform::app_meta::{DISPLAY_NAME, PKG_NAME, PKG_VERSION};
+use crate::platform::crash_restart::CrashArmed;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,44 +17,193 @@ const MAX_LOG_BYTES: u64 = 1_000_000;
 #[cfg(debug_assertions)]
 const MAX_HID_TRACE_BYTES: u64 = 16_000_000;
 
-static LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
-#[cfg(debug_assertions)]
-static HID_TRACE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
-static SESSION_ID: AtomicU64 = AtomicU64::new(0);
-static SESSION_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
-
-pub fn init() {
-    let path = log_file_path("app.log");
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    rotate_if_needed(&path, MAX_LOG_BYTES, "log.1");
-    if let Ok(mut guard) = LOG_PATH.lock() {
-        *guard = Some(path);
-    }
-
+/// Owned file-logger handles (log paths + session clock).
+///
+/// Intentionally process-global (see `HANDLES` below): logging is cross-cutting
+/// infrastructure with ~130 call sites across the HID worker thread, persist
+/// atomic writes, session notify, and platform bring-up — threading `&LogHandles`
+/// through all of them would churn far beyond the app root for no behavior
+/// gain. The binary owns init ordering (`app_log::init(armed)` first in
+/// `main`, with the boot-owned `&'static CrashArmed`);
+/// everything else logs through the free functions, which delegate here.
+pub struct LogHandles {
+    log_path: Mutex<Option<PathBuf>>,
     #[cfg(debug_assertions)]
-    {
-        let trace = log_file_path("hid-trace.log");
-        rotate_if_needed(&trace, MAX_HID_TRACE_BYTES, "log.1");
-        if let Ok(mut guard) = HID_TRACE_PATH.lock() {
-            *guard = Some(trace);
+    hid_trace_path: Mutex<Option<PathBuf>>,
+    session_id: AtomicU64,
+    session_started: Mutex<Option<Instant>>,
+}
+
+impl LogHandles {
+    pub const fn new() -> Self {
+        Self {
+            log_path: Mutex::new(None),
+            #[cfg(debug_assertions)]
+            hid_trace_path: Mutex::new(None),
+            session_id: AtomicU64::new(0),
+            session_started: Mutex::new(None),
         }
     }
 
-    install_panic_hook();
+    pub fn init(&self, crash_armed: &'static CrashArmed) {
+        let path = log_file_path("app.log");
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        rotate_if_needed(&path, MAX_LOG_BYTES, "log.1");
+        if let Ok(mut guard) = self.log_path.lock() {
+            *guard = Some(path);
+        }
 
-    let session_id = epoch_ms() as u64;
-    SESSION_ID.store(session_id, Ordering::Relaxed);
-    if let Ok(mut guard) = SESSION_STARTED.lock() {
-        *guard = Some(Instant::now());
+        #[cfg(debug_assertions)]
+        {
+            let trace = log_file_path("hid-trace.log");
+            rotate_if_needed(&trace, MAX_HID_TRACE_BYTES, "log.1");
+            if let Ok(mut guard) = self.hid_trace_path.lock() {
+                *guard = Some(trace);
+            }
+        }
+
+        install_panic_hook(crash_armed);
+
+        let session_id = epoch_ms() as u64;
+        self.session_id.store(session_id, Ordering::Relaxed);
+        if let Ok(mut guard) = self.session_started.lock() {
+            *guard = Some(Instant::now());
+        }
+
+        self.info(format!(
+            "{DISPLAY_NAME} ({PKG_NAME}) {PKG_VERSION} starting session={session_id}"
+        ));
+        #[cfg(debug_assertions)]
+        self.hid_trace(format!("session start id={session_id}"));
     }
 
-    info(format!(
-        "{DISPLAY_NAME} ({PKG_NAME}) {PKG_VERSION} starting session={session_id}"
-    ));
-    #[cfg(debug_assertions)]
-    hid_trace(format!("session start id={session_id}"));
+    /// Stable id for this process run (epoch ms at init). Appears in both log files.
+    pub fn session_id(&self) -> u64 {
+        self.session_id.load(Ordering::Relaxed)
+    }
+
+    /// Milliseconds since [`LogHandles::init`].
+    pub fn session_uptime_ms(&self) -> u128 {
+        self.session_started
+            .lock()
+            .ok()
+            .and_then(|g| g.map(|t| t.elapsed().as_millis()))
+            .unwrap_or(0)
+    }
+
+    /// User-marked hitch: stamp both logs so short sessions can be aligned later.
+    /// No-op in release builds.
+    pub fn mark_hitch(&self, extra: impl AsRef<str>) {
+        #[cfg(not(debug_assertions))]
+        let _ = extra;
+        #[cfg(debug_assertions)]
+        {
+            let sid = self.session_id();
+            let up_ms = self.session_uptime_ms();
+            let extra = extra.as_ref();
+            let detail = if extra.is_empty() {
+                String::new()
+            } else {
+                format!(" {extra}")
+            };
+            let line = format!("HITCH_MARK session={sid} up_ms={up_ms}{detail}");
+            self.warn(line.clone());
+            self.hid_trace(line);
+        }
+    }
+
+    /// Compact HID diagnostic stream (millisecond timestamps). Prefer for high-rate I/O.
+    /// No-op in release builds.
+    pub fn hid_trace(&self, message: impl AsRef<str>) {
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = message;
+        }
+        #[cfg(debug_assertions)]
+        {
+            let started = Instant::now();
+            let line = format!("[{}] {}\n", epoch_ms(), message.as_ref());
+            if let Ok(guard) = self.hid_trace_path.lock()
+                && let Some(path) = guard.as_ref()
+            {
+                rotate_if_needed(path, MAX_HID_TRACE_BYTES, "log.1");
+            }
+            append_to(&self.hid_trace_path, &line);
+            let ms = started.elapsed().as_millis();
+            if ms >= 50 {
+                let slow = format!("[{}] hid-diag: slow op=hid_trace_io ms={ms}\n", epoch_ms());
+                append_to(&self.hid_trace_path, &slow);
+                self.write_line("INFO", format!("hid-diag: slow op=hid_trace_io ms={ms}"));
+            }
+        }
+    }
+
+    /// Like [`LogHandles::hid_trace`] but never self-reports slow I/O (watchdog / nested use).
+    /// No-op in release builds.
+    pub fn hid_trace_raw(&self, message: impl AsRef<str>) {
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = message;
+        }
+        #[cfg(debug_assertions)]
+        {
+            let line = format!("[{}] {}\n", epoch_ms(), message.as_ref());
+            append_to(&self.hid_trace_path, &line);
+        }
+    }
+
+    pub fn info(&self, message: impl AsRef<str>) {
+        self.write_line("INFO", message);
+    }
+
+    pub fn warn(&self, message: impl AsRef<str>) {
+        self.write_line("WARN", message);
+    }
+
+    pub fn error(&self, message: impl AsRef<str>) {
+        self.write_line("ERROR", message);
+    }
+
+    fn write_line(&self, level: &str, message: impl AsRef<str>) {
+        let line = format!("[{}] {level}: {}\n", epoch_secs(), message.as_ref());
+        append_to(&self.log_path, &line);
+    }
+
+    fn append_panic_line(&self, message: &str) {
+        let line = format!("[{}] ERROR: {message}\n", epoch_secs());
+        let path = self
+            .log_path
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| log_file_path("app.log"));
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.flush();
+        }
+    }
+}
+
+impl Default for LogHandles {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Intentional remainder: process-global logger instance. `init` (called first
+// by the binary) fills the paths/session clock; the free `info`/`warn`/`error`
+// /`hid_trace` shims below delegate here so deep modules (HID worker, persist,
+// platform bring-up) log without threading `&LogHandles` through every frame.
+// Rotation, paths, and formats are unchanged; see `LogHandles` docs.
+static HANDLES: LogHandles = LogHandles::new();
+
+pub fn init(crash_armed: &'static CrashArmed) {
+    HANDLES.init(crash_armed);
 }
 
 /// Log panics to `app.log` (and stderr when available). Needed because
@@ -61,7 +211,7 @@ pub fn init() {
 ///
 /// Also appends a capped backtrace so GPU/renderer panics (e.g. iced atlas
 /// `create_view`) can be attributed without a debugger.
-fn install_panic_hook() {
+fn install_panic_hook(crash_armed: &'static CrashArmed) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let location = info
@@ -80,7 +230,7 @@ fn install_panic_hook() {
         append_panic_line(&line);
         append_panic_line(&crate::platform::wgpu_diag::context_line());
         append_panic_line(&format!("PANIC_BACKTRACE {}", panic_backtrace_capped()));
-        crate::platform::crash_restart::schedule_from_panic();
+        crate::platform::crash_restart::schedule_from_panic(crash_armed);
         let _ = writeln!(std::io::stderr(), "{line}");
         previous(info);
     }));
@@ -102,57 +252,26 @@ fn panic_backtrace_capped() -> String {
 }
 
 fn append_panic_line(message: &str) {
-    let line = format!("[{}] ERROR: {message}\n", epoch_secs());
-    let path = LOG_PATH
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .unwrap_or_else(|| log_file_path("app.log"));
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = file.write_all(line.as_bytes());
-        let _ = file.flush();
-    }
+    HANDLES.append_panic_line(message);
 }
 
 /// Stable id for this process run (epoch ms at init). Appears in both log files.
 #[allow(dead_code)] // hitch marks (debug builds)
 pub fn session_id() -> u64 {
-    SESSION_ID.load(Ordering::Relaxed)
+    HANDLES.session_id()
 }
 
 /// Milliseconds since [`init`].
 #[allow(dead_code)] // hitch marks (debug builds)
 pub fn session_uptime_ms() -> u128 {
-    SESSION_STARTED
-        .lock()
-        .ok()
-        .and_then(|g| g.map(|t| t.elapsed().as_millis()))
-        .unwrap_or(0)
+    HANDLES.session_uptime_ms()
 }
 
 /// User-marked hitch: stamp both logs so short sessions can be aligned later.
 /// No-op in release builds.
 #[allow(dead_code)] // hitch UI / hotkeys (debug builds)
 pub fn mark_hitch(extra: impl AsRef<str>) {
-    #[cfg(not(debug_assertions))]
-    let _ = extra;
-    #[cfg(debug_assertions)]
-    {
-        let sid = session_id();
-        let up_ms = session_uptime_ms();
-        let extra = extra.as_ref();
-        let detail = if extra.is_empty() {
-            String::new()
-        } else {
-            format!(" {extra}")
-        };
-        let line = format!("HITCH_MARK session={sid} up_ms={up_ms}{detail}");
-        warn(line.clone());
-        hid_trace(line);
-    }
+    HANDLES.mark_hitch(extra);
 }
 
 fn log_file_path(file_name: &str) -> PathBuf {
@@ -204,51 +323,18 @@ fn epoch_ms() -> u128 {
         .unwrap_or(0)
 }
 
-fn write_line(level: &str, message: impl AsRef<str>) {
-    let line = format!("[{}] {level}: {}\n", epoch_secs(), message.as_ref());
-    append_to(&LOG_PATH, &line);
-}
-
 /// Compact HID diagnostic stream (millisecond timestamps). Prefer for high-rate I/O.
 /// No-op in release builds.
 #[allow(dead_code)] // called from hid_diag (debug builds)
 pub fn hid_trace(message: impl AsRef<str>) {
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = message;
-    }
-    #[cfg(debug_assertions)]
-    {
-        let started = Instant::now();
-        let line = format!("[{}] {}\n", epoch_ms(), message.as_ref());
-        if let Ok(guard) = HID_TRACE_PATH.lock()
-            && let Some(path) = guard.as_ref()
-        {
-            rotate_if_needed(path, MAX_HID_TRACE_BYTES, "log.1");
-        }
-        append_to(&HID_TRACE_PATH, &line);
-        let ms = started.elapsed().as_millis();
-        if ms >= 50 {
-            let slow = format!("[{}] hid-diag: slow op=hid_trace_io ms={ms}\n", epoch_ms());
-            append_to(&HID_TRACE_PATH, &slow);
-            write_line("INFO", format!("hid-diag: slow op=hid_trace_io ms={ms}"));
-        }
-    }
+    HANDLES.hid_trace(message);
 }
 
 /// Like [`hid_trace`] but never self-reports slow I/O (watchdog / nested use).
 /// No-op in release builds.
 #[allow(dead_code)] // called from hid_diag (debug builds)
 pub fn hid_trace_raw(message: impl AsRef<str>) {
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = message;
-    }
-    #[cfg(debug_assertions)]
-    {
-        let line = format!("[{}] {}\n", epoch_ms(), message.as_ref());
-        append_to(&HID_TRACE_PATH, &line);
-    }
+    HANDLES.hid_trace_raw(message);
 }
 
 fn append_to(path_slot: &Mutex<Option<PathBuf>>, line: &str) {
@@ -261,13 +347,13 @@ fn append_to(path_slot: &Mutex<Option<PathBuf>>, line: &str) {
 }
 
 pub fn info(message: impl AsRef<str>) {
-    write_line("INFO", message);
+    HANDLES.info(message);
 }
 
 pub fn warn(message: impl AsRef<str>) {
-    write_line("WARN", message);
+    HANDLES.warn(message);
 }
 
 pub fn error(message: impl AsRef<str>) {
-    write_line("ERROR", message);
+    HANDLES.error(message);
 }

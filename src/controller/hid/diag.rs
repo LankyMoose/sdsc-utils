@@ -23,7 +23,7 @@ pub fn diag_info(message: impl AsRef<str>) {
 }
 
 /// Investigation-volume line → `app.log` WARN (no-op in release).
-#[allow(dead_code)]
+/// Used by hid-worker rumble paths.
 pub fn diag_warn(message: impl AsRef<str>) {
     #[cfg(debug_assertions)]
     crate::platform::app_log::warn(message);
@@ -34,6 +34,7 @@ pub fn diag_warn(message: impl AsRef<str>) {
 #[cfg(debug_assertions)]
 mod active {
     use super::bus_tag;
+    use crate::AppResult;
     use crate::platform::app_log;
     use hidapi::DeviceInfo;
     use std::sync::Mutex;
@@ -41,6 +42,10 @@ mod active {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    /// Intentional: 1s debug-only diag cache. The release lightbar claim
+    /// verdict in `dualsense::lightbar` (`STEAM_CLAIM_CACHE_TTL`, 3s) is a
+    /// separate strategy cache with a longer TTL — different purpose,
+    /// different TTL; neither should be "unified".
     const STEAM_REFRESH: Duration = Duration::from_secs(1);
     const SLOW_OP_MS: u128 = 50;
     const WATCHDOG_POLL: Duration = Duration::from_millis(100);
@@ -168,7 +173,7 @@ mod active {
         claim_needed: bool,
         retry: bool,
         ms: u128,
-        result: Result<(usize, usize), String>,
+        result: AppResult<(usize, usize)>,
     ) {
         let rgb_part = match rgb {
             Some((r, g, b)) => format!(" rgb={r:02x}{g:02x}{b:02x}"),
@@ -341,6 +346,7 @@ pub use active::{OpGuard, steam_present, steam_tag};
 #[cfg(not(debug_assertions))]
 #[allow(dead_code)]
 mod release {
+    use crate::AppResult;
     use hidapi::DeviceInfo;
 
     pub fn device_fields(_info: &DeviceInfo) -> String {
@@ -379,7 +385,7 @@ mod release {
         _claim_needed: bool,
         _retry: bool,
         _ms: u128,
-        _result: Result<(usize, usize), String>,
+        _result: AppResult<(usize, usize)>,
     ) {
     }
 
