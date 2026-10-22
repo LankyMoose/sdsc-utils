@@ -48,7 +48,7 @@ impl App {
 
     pub(crate) fn on_start_message_inner(&mut self, message: StartMessage) -> Task<Message> {
         // Cold ambient: only Close is live (escape hatch); ignore nav/launch/edit.
-        if self.start_state.cold_load_active && !matches!(message, StartMessage::Close) {
+        if self.start_state.cold_load_active && !start_cold_allows(&message) {
             return Task::none();
         }
         // Layout transition reflows main content: drop navigational messages for its
@@ -57,15 +57,7 @@ impl App {
         // settings-toggle stay live (cancellable chrome), as do deliberate
         // settings commits (open-menu Confirm picks, mouse Set* writes) —
         // only focus moves and slider nudges freeze mid-transition.
-        if self.start_state.layout_transition_active()
-            && matches!(
-                message,
-                StartMessage::MoveUp
-                    | StartMessage::MoveDown
-                    | StartMessage::PrevSlide
-                    | StartMessage::NextSlide
-            )
-        {
+        if self.start_state.layout_transition_active() && start_focus_move_frozen(&message) {
             return Task::none();
         }
         // Keyboard / UI actions other than pure scroll cancel an in-progress hold.
@@ -80,220 +72,15 @@ impl App {
             _ => self.cancel_start_holds(),
         }
         match message {
-            StartMessage::Launch(index) => {
-                if self.start_state.immersive
-                    && index < self.start_state.rows.len()
-                    && index != self.start_state.game_selected
-                {
-                    // Neighbor capsule click selects only (center / Cross launches).
-                    return self.on_start_message(StartMessage::SelectGame(index));
-                }
-                if index < self.start_state.rows.len() {
-                    self.start_state.game_selected = index;
-                }
-                let scroll = self.scroll_start_selection_into_view();
-                if self.start_state.editing {
-                    match self.edit_toggle_selected() {
-                        Some(task) => {
-                            self.play_start_cue(UiSoundKind::Action);
-                            scroll.chain(task)
-                        }
-                        None => scroll,
-                    }
-                } else if self.launch_selected() {
-                    self.play_start_cue(UiSoundKind::Action);
-                    if self.start_state.immersive {
-                        scroll.chain(self.close_start_screen())
-                    } else {
-                        scroll
-                    }
-                } else {
-                    scroll
-                }
-            }
-            StartMessage::SelectGame(index) => {
-                if index >= self.start_state.rows.len() || index == self.start_state.game_selected {
-                    return Task::none();
-                }
-                let prev_game = self.start_state.game_selected;
-                self.start_state.game_selected = index;
-                let mut task = self.scroll_start_selection_into_view();
-                if self.start_state.immersive {
-                    self.start_state
-                        .begin_strip_anim(prev_game as f32, Instant::now());
-                    self.start_state.reset_backdrop_fade();
-                }
-                task = task.chain(self.warm_start_art_task());
-                self.play_start_cue(UiSoundKind::Nav);
-                task
-            }
-            StartMessage::SelectController(index) => {
-                if index < self.start_state.controllers.len()
-                    && self.start_state.controller_selected != index
-                {
-                    self.start_state.controller_selected = index;
-                    self.play_start_cue(UiSoundKind::Nav);
-                }
-                if self.start_state.immersive && !self.start_state.dock_expanded {
-                    let _ = self.start_state.request_dock(true, Instant::now());
-                }
-                self.scroll_start_selection_into_view()
-            }
-            StartMessage::MoveUp => {
-                let prev_game = self.start_state.game_selected;
-                let direction = self.start_state.move_selection(-1);
-                let mut task = self.scroll_start_selection_into_view_dir(
-                    direction.unwrap_or(start_view::ScrollReveal::Up),
-                );
-                if direction.is_some() {
-                    self.play_start_cue(UiSoundKind::Nav);
-                    if matches!(self.start_state.slide, StartSlide::Games)
-                        && self.start_state.game_selected != prev_game
-                    {
-                        if self.start_state.immersive {
-                            self.start_state
-                                .begin_strip_anim(prev_game as f32, Instant::now());
-                            self.start_state.reset_backdrop_fade();
-                        }
-                        task = task.chain(self.warm_start_art_task());
-                    }
-                }
-                task
-            }
-            StartMessage::MoveDown => {
-                let prev_game = self.start_state.game_selected;
-                let direction = self.start_state.move_selection(1);
-                let mut task = self.scroll_start_selection_into_view_dir(
-                    direction.unwrap_or(start_view::ScrollReveal::Down),
-                );
-                if direction.is_some() {
-                    self.play_start_cue(UiSoundKind::Nav);
-                    if matches!(self.start_state.slide, StartSlide::Games)
-                        && self.start_state.game_selected != prev_game
-                    {
-                        if self.start_state.immersive {
-                            self.start_state
-                                .begin_strip_anim(prev_game as f32, Instant::now());
-                            self.start_state.reset_backdrop_fade();
-                        }
-                        task = task.chain(self.warm_start_art_task());
-                    }
-                }
-                task
-            }
+            StartMessage::Launch(index) => self.on_start_launch(index),
+            StartMessage::SelectGame(index) => self.on_start_select_game(index),
+            StartMessage::SelectController(index) => self.on_start_select_controller(index),
+            StartMessage::MoveUp => self.on_start_move(-1),
+            StartMessage::MoveDown => self.on_start_move(1),
             StartMessage::Confirm => self.on_start_confirm(),
-            StartMessage::Close => {
-                if self.start_state.settings.open {
-                    self.play_start_cue(UiSoundKind::Action);
-                    let now = Instant::now();
-                    if self.start_state.request_settings(false, now) {
-                        crate::controller::hid::diag::diag_info("ui-diag: start settings close");
-                    }
-                    Task::none()
-                } else if self.start_state.manual_add.is_some() {
-                    self.play_start_cue(UiSoundKind::Action);
-                    self.cancel_manual_add()
-                } else if self.start_state.replace_confirm.take().is_some() {
-                    self.play_start_cue(UiSoundKind::Action);
-                    Task::none()
-                } else if self.start_state.editing {
-                    self.play_start_cue(UiSoundKind::Action);
-                    self.cancel_start_edit()
-                } else if self.start_visible {
-                    // Immersive + dock open: Circle collapses the drawer first (same as Left).
-                    if self.start_state.immersive
-                        && start_mode::dock_collapse_target(self.start_state.dock_expanded)
-                            .is_some()
-                        && self.start_state.request_dock(false, Instant::now())
-                    {
-                        self.play_start_cue(UiSoundKind::Slide);
-                        crate::controller::hid::diag::diag_info(
-                            "ui-diag: start dock collapse (cancel)",
-                        );
-                        return Task::none();
-                    }
-                    self.play_start_cue(UiSoundKind::Action);
-                    match start_mode::on_cancel(
-                        self.start_presentation(),
-                        self.session.prefs.start_screen_always_immersive,
-                    ) {
-                        start_mode::ImmersiveTransition::Demote => self.leave_start_immersive(),
-                        _ => self.close_start_screen(),
-                    }
-                } else {
-                    Task::none()
-                }
-            }
-            StartMessage::PrevSlide => {
-                if self.start_state.overlay_blocking() || self.start_state.transition.is_some() {
-                    return Task::none();
-                }
-                // User took over post-settle browsing: a stowed settle
-                // scroll is moot (its target predates this slide change).
-                self.deferred_settle_scroll = None;
-                if self.start_state.editing {
-                    // Slide-switch discards the draft (cancel-equivalent): keep
-                    // navigation like cancel (cursor first, anchor fallback) so
-                    // the stale edit-mode index (checklist order) never lands
-                    // on the wrong browse row.
-                    let cursor = self.start_state.selected_game_key();
-                    let anchor = self.start_state.edit_anchor_play_key.clone();
-                    self.discard_edit_draft();
-                    self.refresh_start_rows();
-                    let target = self
-                        .start_state
-                        .cancel_exit_target_key(cursor.as_deref(), anchor.as_deref());
-                    self.start_state
-                        .resolve_edit_exit_selection(target.as_deref());
-                }
-                let now = Instant::now();
-                if self.start_state.immersive {
-                    // Left: collapse controllers island.
-                    if start_mode::dock_collapse_target(self.start_state.dock_expanded).is_some()
-                        && self.start_state.request_dock(false, now)
-                    {
-                        self.play_start_cue(UiSoundKind::Slide);
-                        crate::controller::hid::diag::diag_info("ui-diag: start dock collapse");
-                    }
-                } else if self.start_state.request_slide(StartSlide::Games, now) {
-                    // Left: Controllers → Games only (no wrap). Interruptible mid-anim.
-                    self.play_start_cue(UiSoundKind::Slide);
-                }
-                Task::none()
-            }
-            StartMessage::NextSlide => {
-                if self.start_state.overlay_blocking() || self.start_state.transition.is_some() {
-                    return Task::none();
-                }
-                // Same stowed-scroll drop as PrevSlide (user took over).
-                self.deferred_settle_scroll = None;
-                if self.start_state.editing {
-                    // Same cancel-equivalent discard as PrevSlide (see above).
-                    let cursor = self.start_state.selected_game_key();
-                    let anchor = self.start_state.edit_anchor_play_key.clone();
-                    self.discard_edit_draft();
-                    self.refresh_start_rows();
-                    let target = self
-                        .start_state
-                        .cancel_exit_target_key(cursor.as_deref(), anchor.as_deref());
-                    self.start_state
-                        .resolve_edit_exit_selection(target.as_deref());
-                }
-                let now = Instant::now();
-                if self.start_state.immersive {
-                    // Right: expand controllers island.
-                    if start_mode::dock_expand_target(self.start_state.dock_expanded).is_some()
-                        && self.start_state.request_dock(true, now)
-                    {
-                        self.play_start_cue(UiSoundKind::Slide);
-                        crate::controller::hid::diag::diag_info("ui-diag: start dock expand");
-                    }
-                } else if self.start_state.request_slide(StartSlide::Controllers, now) {
-                    // Right: Games → Controllers only (no wrap). Interruptible mid-anim.
-                    self.play_start_cue(UiSoundKind::Slide);
-                }
-                Task::none()
-            }
+            StartMessage::Close => self.on_start_close(),
+            StartMessage::PrevSlide => self.on_start_slide(false),
+            StartMessage::NextSlide => self.on_start_slide(true),
             StartMessage::ToggleEdit => match self.toggle_start_edit() {
                 Some(task) => {
                     self.play_start_cue(UiSoundKind::Action);
@@ -465,6 +252,192 @@ impl App {
                 Task::none()
             }
         }
+    }
+
+    /// Launch arm: immersive neighbor click selects only; center/Cross launches.
+    /// Editing retargets the click at the checklist toggle instead.
+    pub(crate) fn on_start_launch(&mut self, index: usize) -> Task<Message> {
+        if self.start_state.immersive
+            && index < self.start_state.rows.len()
+            && index != self.start_state.game_selected
+        {
+            // Neighbor capsule click selects only (center / Cross launches).
+            return self.on_start_message(StartMessage::SelectGame(index));
+        }
+        if index < self.start_state.rows.len() {
+            self.start_state.game_selected = index;
+        }
+        let scroll = self.scroll_start_selection_into_view();
+        if self.start_state.editing {
+            match self.edit_toggle_selected() {
+                Some(task) => {
+                    self.play_start_cue(UiSoundKind::Action);
+                    scroll.chain(task)
+                }
+                None => scroll,
+            }
+        } else if self.launch_selected() {
+            self.play_start_cue(UiSoundKind::Action);
+            if self.start_state.immersive {
+                scroll.chain(self.close_start_screen())
+            } else {
+                scroll
+            }
+        } else {
+            scroll
+        }
+    }
+
+    pub(crate) fn on_start_select_game(&mut self, index: usize) -> Task<Message> {
+        if index >= self.start_state.rows.len() || index == self.start_state.game_selected {
+            return Task::none();
+        }
+        let prev_game = self.start_state.game_selected;
+        self.start_state.game_selected = index;
+        let mut task = self.scroll_start_selection_into_view();
+        if self.start_state.immersive {
+            self.start_state
+                .begin_strip_anim(prev_game as f32, Instant::now());
+            self.start_state.reset_backdrop_fade();
+        }
+        task = task.chain(self.warm_start_art_task());
+        self.play_start_cue(UiSoundKind::Nav);
+        task
+    }
+
+    pub(crate) fn on_start_select_controller(&mut self, index: usize) -> Task<Message> {
+        if index < self.start_state.controllers.len()
+            && self.start_state.controller_selected != index
+        {
+            self.start_state.controller_selected = index;
+            self.play_start_cue(UiSoundKind::Nav);
+        }
+        if self.start_state.immersive && !self.start_state.dock_expanded {
+            let _ = self.start_state.request_dock(true, Instant::now());
+        }
+        self.scroll_start_selection_into_view()
+    }
+
+    /// Focus-move arm: `delta` is -1 (up) or +1 (down). Both directions share
+    /// the reveal/art/cue tail; only the fallback scroll direction differs.
+    pub(crate) fn on_start_move(&mut self, delta: i32) -> Task<Message> {
+        let prev_game = self.start_state.game_selected;
+        let direction = self.start_state.move_selection(delta);
+        let mut task =
+            self.scroll_start_selection_into_view_dir(direction.unwrap_or(if delta < 0 {
+                start_view::ScrollReveal::Up
+            } else {
+                start_view::ScrollReveal::Down
+            }));
+        if direction.is_some() {
+            self.play_start_cue(UiSoundKind::Nav);
+            if matches!(self.start_state.slide, StartSlide::Games)
+                && self.start_state.game_selected != prev_game
+            {
+                if self.start_state.immersive {
+                    self.start_state
+                        .begin_strip_anim(prev_game as f32, Instant::now());
+                    self.start_state.reset_backdrop_fade();
+                }
+                task = task.chain(self.warm_start_art_task());
+            }
+        }
+        task
+    }
+
+    /// Close/Cancel arm: unwinds topmost surface first (settings → manual-add
+    /// draft → replace confirm → edit mode → Start itself).
+    pub(crate) fn on_start_close(&mut self) -> Task<Message> {
+        if self.start_state.settings.open {
+            self.play_start_cue(UiSoundKind::Action);
+            let now = Instant::now();
+            if self.start_state.request_settings(false, now) {
+                crate::controller::hid::diag::diag_info("ui-diag: start settings close");
+            }
+            Task::none()
+        } else if self.start_state.manual_add.is_some() {
+            self.play_start_cue(UiSoundKind::Action);
+            self.cancel_manual_add()
+        } else if self.start_state.replace_confirm.take().is_some() {
+            self.play_start_cue(UiSoundKind::Action);
+            Task::none()
+        } else if self.start_state.editing {
+            self.play_start_cue(UiSoundKind::Action);
+            self.cancel_start_edit()
+        } else if self.start_visible {
+            // Immersive + dock open: Circle collapses the drawer first (same as Left).
+            if self.start_state.immersive
+                && start_mode::dock_collapse_target(self.start_state.dock_expanded).is_some()
+                && self.start_state.request_dock(false, Instant::now())
+            {
+                self.play_start_cue(UiSoundKind::Slide);
+                crate::controller::hid::diag::diag_info("ui-diag: start dock collapse (cancel)");
+                return Task::none();
+            }
+            self.play_start_cue(UiSoundKind::Action);
+            match start_mode::on_cancel(
+                self.start_presentation(),
+                self.session.prefs.start_screen_always_immersive,
+            ) {
+                start_mode::ImmersiveTransition::Demote => self.leave_start_immersive(),
+                _ => self.close_start_screen(),
+            }
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Slide-switch arm: `next` is false (Left/Prev) or true (Right/Next).
+    /// Immersive toggles the controllers island; compact moves Games↔Controllers.
+    /// Either way an in-progress edit draft is discarded first and a stowed
+    /// settle scroll is dropped (the user took over post-settle browsing).
+    pub(crate) fn on_start_slide(&mut self, next: bool) -> Task<Message> {
+        if self.start_state.overlay_blocking() || self.start_state.transition.is_some() {
+            return Task::none();
+        }
+        // User took over post-settle browsing: a stowed settle
+        // scroll is moot (its target predates this slide change).
+        self.deferred_settle_scroll = None;
+        if self.start_state.editing {
+            // Slide-switch discards the draft (cancel-equivalent): keep
+            // navigation like cancel (cursor first, anchor fallback) so
+            // the stale edit-mode index (checklist order) never lands
+            // on the wrong browse row.
+            let cursor = self.start_state.selected_game_key();
+            let anchor = self.start_state.edit_anchor_play_key.clone();
+            self.discard_edit_draft();
+            self.refresh_start_rows();
+            let target = self
+                .start_state
+                .cancel_exit_target_key(cursor.as_deref(), anchor.as_deref());
+            self.start_state
+                .resolve_edit_exit_selection(target.as_deref());
+        }
+        let now = Instant::now();
+        if self.start_state.immersive {
+            let target = if next {
+                // Right: expand controllers island.
+                start_mode::dock_expand_target(self.start_state.dock_expanded)
+            } else {
+                // Left: collapse controllers island.
+                start_mode::dock_collapse_target(self.start_state.dock_expanded)
+            };
+            if target.is_some() && self.start_state.request_dock(next, now) {
+                self.play_start_cue(UiSoundKind::Slide);
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start dock {}",
+                    if next { "expand" } else { "collapse" },
+                ));
+            }
+        } else if self
+            .start_state
+            .request_slide(compact_slide_target(next), now)
+        {
+            // Left: Controllers → Games; Right: Games → Controllers. No wrap.
+            // Interruptible mid-anim.
+            self.play_start_cue(UiSoundKind::Slide);
+        }
+        Task::none()
     }
 
     pub(crate) fn scroll_start_selection_into_view(&mut self) -> Task<Message> {
@@ -3967,5 +3940,98 @@ impl App {
             PadInputPanel::default()
         };
         self.pad_input_panel = next;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure dispatch guards (unit-tested; no iced runtime needed).
+//
+// These are the exact predicates `on_start_message_inner` (and its callers)
+// gate on, extracted so the reducer stays a thin dispatch table.
+// ---------------------------------------------------------------------------
+
+/// Cold-ambient gate: only Close is live, everything else is dropped.
+pub(crate) fn start_cold_allows(message: &StartMessage) -> bool {
+    matches!(message, StartMessage::Close)
+}
+
+/// Layout-transition gate: focus moves freeze mid-transition; Confirm /
+/// Cancel / Close and settings commits stay live.
+pub(crate) fn start_focus_move_frozen(message: &StartMessage) -> bool {
+    matches!(
+        message,
+        StartMessage::MoveUp
+            | StartMessage::MoveDown
+            | StartMessage::PrevSlide
+            | StartMessage::NextSlide
+    )
+}
+
+/// Compact slide-switch target: Left goes Controllers → Games, Right goes
+/// Games → Controllers (no wrap).
+pub(crate) fn compact_slide_target(next: bool) -> StartSlide {
+    if next {
+        StartSlide::Controllers
+    } else {
+        StartSlide::Games
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compact_slide_target, start_cold_allows, start_focus_move_frozen};
+    use crate::ui::start::view::StartMessage;
+
+    #[test]
+    fn cold_ambient_allows_only_close() {
+        assert!(start_cold_allows(&StartMessage::Close));
+        for msg in [
+            StartMessage::MoveUp,
+            StartMessage::MoveDown,
+            StartMessage::PrevSlide,
+            StartMessage::NextSlide,
+            StartMessage::Confirm,
+            StartMessage::ToggleEdit,
+            StartMessage::ToggleSettings,
+        ] {
+            assert!(
+                !start_cold_allows(&msg),
+                "{msg:?} must be dropped when cold"
+            );
+        }
+    }
+
+    #[test]
+    fn layout_transition_freezes_only_focus_moves() {
+        for msg in [
+            StartMessage::MoveUp,
+            StartMessage::MoveDown,
+            StartMessage::PrevSlide,
+            StartMessage::NextSlide,
+        ] {
+            assert!(start_focus_move_frozen(&msg));
+        }
+        for msg in [
+            StartMessage::Confirm,
+            StartMessage::Close,
+            StartMessage::ToggleSettings,
+        ] {
+            assert!(
+                !start_focus_move_frozen(&msg),
+                "{msg:?} stays live mid-transition"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_slide_target_has_no_wrap() {
+        assert!(matches!(
+            compact_slide_target(false),
+            crate::ui::start::view::StartSlide::Games
+        ));
+        assert!(matches!(
+            compact_slide_target(true),
+            crate::ui::start::view::StartSlide::Controllers
+        ));
     }
 }

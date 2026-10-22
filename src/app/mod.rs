@@ -1316,75 +1316,8 @@ impl App {
                 self.toggle_popup()
             }
 
-            Message::WindowClosed(id) => {
-                if Some(id) == self.popup_window {
-                    self.popup_window = None;
-                    self.popup_state.cancel();
-                    self.sync_toast_zorder()
-                } else if Some(id) == self.configure_window {
-                    self.configure_window = None;
-                    self.sync_toast_zorder()
-                } else if Some(id) == self.start_window {
-                    self.start_window = None;
-                    self.start_visible = false;
-                    self.start_nav_ready = false;
-                    self.pad_nav.reset();
-                    self.clear_start_nav_diag();
-                    self.consume_reopen_gesture_chord();
-                    let sync = self.sync_toast_zorder();
-                    // The auto-open latch survives a close so a pending
-                    // open can retry once presence still qualifies.
-                    if self.session.start_auto_open_pending
-                        && self.session.prefs.start_screen_enabled
-                        && self.session.prefs.start_screen_auto_open.auto_opens()
-                        && crate::session::has_start_presence(
-                            &self.session.controllers,
-                            self.session.prefs.start_screen_auto_open.includes_usb(),
-                        )
-                    {
-                        crate::controller::hid::diag::diag_info(
-                            "ui-diag: retry start open after close",
-                        );
-                        sync.chain(self.open_start_screen())
-                    } else {
-                        sync
-                    }
-                } else if Some(id) == self.toast_window {
-                    self.toast_window = None;
-                    // Recreate so iced keeps a warm compositor for popup/Settings.
-                    self.ensure_toast_window()
-                } else {
-                    #[cfg(debug_assertions)]
-                    if Some(id) == self.preview_window {
-                        self.preview_window = None;
-                    }
-                    Task::none()
-                }
-            }
-            Message::WindowUnfocused(id) => {
-                // The popup is a transient tray flyout: dismiss it when focus moves away.
-                if Some(id) == self.popup_window && !self.popup_state.is_editing_any() {
-                    self.close_popup()
-                } else if Some(id) == self.start_window && self.start_visible {
-                    // File dialogs (add/edit shortcut, choose image) steal focus — keep the
-                    // start screen open so the modal / draft is not discarded.
-                    if self.start_state.manual_add.is_some() || self.start_file_dialog_open {
-                        Task::none()
-                    } else if self
-                        .start_revealed_at
-                        .is_some_and(|t| t.elapsed() < START_UNFOCUS_GRACE)
-                    {
-                        crate::controller::hid::diag::diag_info(
-                            "ui-diag: start unfocus skipped (reveal grace)",
-                        );
-                        Task::none()
-                    } else {
-                        self.close_start_screen()
-                    }
-                } else {
-                    Task::none()
-                }
-            }
+            Message::WindowClosed(id) => self.on_window_closed(id),
+            Message::WindowUnfocused(id) => self.on_window_unfocused(id),
 
             Message::PopupOpened(id) => self.handle_popup_opened(id),
             Message::PlacePopup { id, scale, monitor } => {
@@ -1429,229 +1362,10 @@ impl App {
                 None => Task::none(),
             },
 
-            Message::StartOpened(id) => {
-                if Some(id) == self.start_window && self.start_visible {
-                    self.start_nav_ready = true;
-                    self.nav_not_ready_warned = false;
-                    let now = Instant::now();
-                    self.start_revealed_at = Some(now);
-                    self.start_state.steam_scan_pending = self.steam_scan_pending;
-                    crate::controller::hid::diag::diag_info(format!(
-                        "ui-diag: start opened id={id:?}"
-                    ));
-                    // Raise/focus after create_renderer has a chance to finish —
-                    // chaining sync on the same turn as window::open correlated
-                    // with atlas create_renderer panics.
-                    let mut task = focus_window(id)
-                        .chain(raise_window_topmost(id))
-                        .chain(self.sync_toast_zorder());
-                    // Settings restore first: the drawer/modal scroll lands
-                    // before the list reveals, art kicks, and scan below.
-                    // Games/controllers follow after the branch.
-                    let mut pending_lists = None;
-                    if let Some((games_y, controllers_y, settings_y)) =
-                        self.pending_scroll_restore.take()
-                    {
-                        let settings_id = start_view::StartListId::Settings.scroll_id();
-                        self.start_state.note_scroll_y(&settings_id, settings_y);
-                        task = task.chain(operation::scroll_to(
-                            settings_id,
-                            operation::AbsoluteOffset {
-                                x: None,
-                                y: Some(settings_y),
-                            },
-                        ));
-                        pending_lists = Some((games_y, controllers_y));
-                    }
-                    if self.start_state.immersive {
-                        // Re-show the position rail on every immersive open.
-                        // Warm opens skip begin_cold_load; cold opens refresh
-                        // the hide clock to visible time. Pinned is a no-op.
-                        self.start_state.note_position_bar_scroll(now);
-                        self.start_state.arm_cold_ambient(now);
-                        // Cache miss: need metadata before art/list can land — scan now.
-                        // Cache hit: Preparing chip first; Steam kicks when art-ready handoff runs.
-                        if self.steam_scan_pending {
-                            task = task.chain(self.maybe_kick_deferred_steam_scan());
-                        }
-                        // Cold: lift the enter veil onto ambient+dock immediately (games list
-                        // stays hidden until art). Warm reopen still waits for art before arming.
-                        if self.start_state.cold_load_active {
-                            self.start_state.arm_enter_reveal(now);
-                            // Cache hit: Preparing chip until art sync; cache miss uses Steam.
-                            if !self.steam_scan_pending {
-                                self.start_state.begin_chrome_status(
-                                    start_view::ChromeStatusKind::PreparingArt,
-                                    now,
-                                );
-                            }
-                        }
-                        self.start_state.prime_backdrop_for_enter(now);
-                        if !self.start_state.try_arm_enter_reveal_when_art_ready(now) {
-                            let open_ms = self
-                                .start_opened_at
-                                .map(|t| now.saturating_duration_since(t).as_millis())
-                                .unwrap_or(0);
-                            crate::controller::hid::diag::diag_info(format!(
-                                "ui-diag: start immersive enter art hold open_ms={open_ms} steam_scan={} cold={}",
-                                u8::from(self.steam_scan_pending),
-                                u8::from(self.start_state.cold_load_active),
-                            ));
-                        } else {
-                            task = task.chain(self.note_cold_load_finished());
-                        }
-                        task = task.chain(self.warm_immersive_art_task());
-                    } else {
-                        // Compact: chrome + skeletons immediately; defer Steam settle.
-                        // The scrollables now exist, so reveal the restored
-                        // selection (a scroll_to sent with window::open would
-                        // have targeted a not-yet-mounted id and been dropped).
-                        task = task.chain(self.scroll_start_selection_for_open());
-                        if self.start_cold_load_remaining {
-                            self.start_cold_load_remaining = false;
-                            task = task.chain(self.schedule_steam_scan_after_settle());
-                        } else if !self.steam_library_refreshed {
-                            task = task.chain(self.schedule_steam_scan_after_settle());
-                        }
-                        if !self.steam_by_id.is_empty() {
-                            task = task.chain(self.warm_start_art_task());
-                        }
-                    }
-                    // Restored lists land after the branch above (which may
-                    // reveal the selection first); the saved offsets win.
-                    if let Some((games_y, controllers_y)) = pending_lists {
-                        task = task.chain(self.restore_game_lists(games_y, controllers_y));
-                    }
-                    task
-                } else {
-                    Task::none()
-                }
-            }
+            Message::StartOpened(id) => self.on_start_opened(id),
             Message::StartImmersiveSettled => self.finish_start_immersive_transition(),
-            Message::StartArtEvent(ev) => {
-                use crate::ui::start::art_worker::ArtEventKind;
-                if !crate::ui::start::icon_cache::art_warm_is_current(ev.generation) {
-                    crate::controller::hid::diag::diag_info(format!(
-                        "ui-diag: art event stale gen={} kind={:?}",
-                        ev.generation, ev.kind
-                    ));
-                    return Task::none();
-                }
-                let now = Instant::now();
-                let armed = match ev.kind {
-                    ArtEventKind::SelectedReady => {
-                        if self.start_state.immersive
-                            && self
-                                .start_state
-                                .rows
-                                .get(self.start_state.game_selected)
-                                .is_some_and(|r| r.backdrop_icon().is_some())
-                        {
-                            self.start_state.note_backdrop_ready(now);
-                        }
-                        let armed = self.start_state.try_arm_enter_reveal_when_art_ready(now);
-                        crate::controller::hid::diag::diag_info(format!(
-                            "ui-diag: immersive art selected ready gen={}",
-                            ev.generation
-                        ));
-                        armed
-                    }
-                    ArtEventKind::NearReady => {
-                        let armed = self.start_state.try_arm_enter_reveal_when_art_ready(now);
-                        crate::controller::hid::diag::diag_info(format!(
-                            "ui-diag: immersive art neighbors ready gen={}",
-                            ev.generation
-                        ));
-                        armed
-                    }
-                    ArtEventKind::JobDone => {
-                        self.start_state.art_awaiting_paint = false;
-                        let armed = self.start_state.try_arm_enter_reveal_when_art_ready(now);
-                        crate::controller::hid::diag::diag_info(format!(
-                            "ui-diag: immersive art warm done gen={}",
-                            ev.generation
-                        ));
-                        armed
-                    }
-                };
-                if armed {
-                    return self.note_cold_load_finished();
-                }
-                // List / hero / backdrop peeks are live — StartFrame redraws pick them up.
-                Task::none()
-            }
-            Message::StartFrame => {
-                let now = Instant::now();
-                self.start_state.steam_scan_pending = self.steam_scan_pending;
-                // Prefs-owned pin for the immersive position rail (heals across
-                // snapshot syncs / restarts; the apply path syncs immediately).
-                self.start_state.sync_navbar_pinned(
-                    matches!(
-                        self.session.prefs.start_screen_navbar,
-                        NavbarVisibility::AlwaysOn
-                    ),
-                    now,
-                );
-                // Effective reduce-motion gate (also synced per-update): an OS
-                // "Show animations" flip lands on the next frame mid-session.
-                self.start_state
-                    .sync_reduced_motion(crate::ui::motion::reduced_motion_effective(
-                        self.session.prefs.reduced_motion,
-                    ));
-                self.start_state
-                    .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
-                let was_cold = self.start_state.cold_load_active;
-                // Frozen exit: while the outgoing presentation is on screen
-                // (promote/demote first half + resize blackout), its clocks
-                // stop — strip/dock/slide chases, hint presses, chrome status,
-                // idle timers and ambient time all hold their pre-transition
-                // frame instead of repainting (and reflowing) under the veil.
-                // Phase/veil/resize progress is wall-clock, so nothing the
-                // ceremony needs stops. Enter phases keep ticking (the new UI
-                // animates in by design).
-                let exiting = matches!(
-                    self.start_state.transition_phase.map(|(p, _)| p),
-                    Some(
-                        start_mode::TransitionPhase::ExitCompact
-                            | start_mode::TransitionPhase::ExitImmersive
-                            | start_mode::TransitionPhase::Resizing
-                    )
-                );
-                if !exiting {
-                    let _ = self.start_state.tick_anim(now);
-                }
-                let task = if was_cold && !self.start_state.cold_load_active {
-                    self.note_cold_load_finished()
-                } else {
-                    Task::none()
-                };
-                if let Some(phase_task) = self.tick_immersive_transition_phase(now) {
-                    return task.chain(phase_task);
-                }
-                // Keyboard-only hold progress when pad poll is not running.
-                if self.start_state.replace_confirm.is_some() {
-                    let (progress, completed) =
-                        self.keyboard_cross_hold.update(self.confirm_key_held, now);
-                    self.start_state.cross_progress = self.start_state.cross_progress.max(progress);
-                    if completed {
-                        self.haptic_pad_serial = None;
-                        self.play_start_cue(UiSoundKind::Hold);
-                        return task.chain(self.complete_replace_confirm());
-                    }
-                }
-                if !exiting {
-                    self.sync_start_held();
-                    self.start_state.tick_hint_anims(now);
-                    self.tick_start_cursor_idle(now);
-                    if self.tick_start_idle(now) {
-                        self.pad_nav.prepare_on_open(false);
-                        crate::controller::hid::diag::diag_info(
-                            "ui-diag: start idle pad re-arm after sleep wake",
-                        );
-                    }
-                }
-                task
-            }
+            Message::StartArtEvent(ev) => self.on_start_art_event(ev),
+            Message::StartFrame => self.on_start_frame(),
             Message::StartCursorActivity(id) => {
                 if Some(id) == self.start_window && self.start_visible {
                     self.note_start_cursor_activity();
@@ -1668,145 +1382,7 @@ impl App {
                 id,
                 action,
                 pressed,
-            } => {
-                // Keyboard is never pad-originated.
-                self.haptic_pad_serial = None;
-                if Some(id) == self.start_window && self.start_visible {
-                    self.note_start_activity();
-                    // Cold ambient: only Cancel/Close is live.
-                    if self.start_state.cold_load_active {
-                        return match action {
-                            StartKeyAction::Cancel if !pressed => {
-                                self.cancel_start_holds();
-                                self.on_start_message(StartMessage::Close)
-                            }
-                            StartKeyAction::Cancel => {
-                                self.cancel_key_held = pressed;
-                                self.sync_start_held();
-                                Task::none()
-                            }
-                            _ => Task::none(),
-                        };
-                    }
-                    // Leftover-chord arming is pad-local; keyboard stays live.
-                    // Layout transition reflows main content: drop keyboard nav for its
-                    // duration. Confirm/Cancel/Close stay live (cancellable chrome).
-                    if pressed
-                        && matches!(
-                            action,
-                            StartKeyAction::Up
-                                | StartKeyAction::Down
-                                | StartKeyAction::Left
-                                | StartKeyAction::Right
-                        )
-                        && self.start_state.layout_transition_active()
-                    {
-                        return Task::none();
-                    }
-                    return match action {
-                        StartKeyAction::Up if pressed => {
-                            self.cancel_start_holds();
-                            if self.start_state.ambient_tuning_active() {
-                                self.on_ambient_tuning_nav(Some(NavAction::Up))
-                            } else if self.start_state.settings.open {
-                                self.on_start_settings_nav(Some(NavAction::Up))
-                            } else if self.immersive_horizontal_games_nav() {
-                                // Horizontal Games strip scrolls Left/Right only.
-                                Task::none()
-                            } else {
-                                self.on_start_message(StartMessage::MoveUp)
-                            }
-                        }
-                        StartKeyAction::Down if pressed => {
-                            self.cancel_start_holds();
-                            if self.start_state.ambient_tuning_active() {
-                                self.on_ambient_tuning_nav(Some(NavAction::Down))
-                            } else if self.start_state.settings.open {
-                                self.on_start_settings_nav(Some(NavAction::Down))
-                            } else if self.immersive_horizontal_games_nav() {
-                                // Horizontal Games strip scrolls Left/Right only.
-                                Task::none()
-                            } else {
-                                self.on_start_message(StartMessage::MoveDown)
-                            }
-                        }
-                        StartKeyAction::Left
-                            if pressed
-                                && (self.start_state.immersive
-                                    || self.start_state.settings.open) =>
-                        {
-                            self.cancel_start_holds();
-                            if self.start_state.ambient_tuning_active() {
-                                self.on_ambient_tuning_nav(Some(NavAction::PrevSlide))
-                            } else if self.start_state.settings.open {
-                                self.on_start_settings_nav(Some(NavAction::PrevSlide))
-                            } else if self.immersive_horizontal_games_nav() {
-                                self.on_start_message(StartMessage::MoveUp)
-                            } else {
-                                self.on_start_message(StartMessage::PrevSlide)
-                            }
-                        }
-                        StartKeyAction::Right
-                            if pressed
-                                && (self.start_state.immersive
-                                    || self.start_state.settings.open) =>
-                        {
-                            self.cancel_start_holds();
-                            if self.start_state.ambient_tuning_active() {
-                                self.on_ambient_tuning_nav(Some(NavAction::NextSlide))
-                            } else if self.start_state.settings.open {
-                                self.on_start_settings_nav(Some(NavAction::NextSlide))
-                            } else if self.immersive_horizontal_games_nav() {
-                                self.on_start_message(StartMessage::MoveDown)
-                            } else {
-                                self.on_start_message(StartMessage::NextSlide)
-                            }
-                        }
-                        StartKeyAction::Confirm => {
-                            self.confirm_key_held = pressed;
-                            self.sync_start_held();
-                            if self.start_state.replace_confirm.is_some() {
-                                if pressed {
-                                    self.pad_nav.cancel_holds();
-                                }
-                                Task::none()
-                            } else if !pressed {
-                                self.cancel_start_holds();
-                                if self.start_state.ambient_tuning_active() {
-                                    self.on_ambient_tuning_nav(Some(NavAction::Confirm))
-                                } else if self.start_state.settings.open {
-                                    self.on_start_settings_nav(Some(NavAction::Confirm))
-                                } else {
-                                    self.on_start_message(StartMessage::Confirm)
-                                }
-                            } else {
-                                Task::none()
-                            }
-                        }
-                        StartKeyAction::Cancel => {
-                            self.cancel_key_held = pressed;
-                            self.sync_start_held();
-                            if !pressed {
-                                self.cancel_start_holds();
-                                if self.start_state.ambient_tuning_active() {
-                                    self.on_ambient_tuning_nav(Some(NavAction::Cancel))
-                                } else if self.start_state.settings.any_menu_open() {
-                                    // Expanded dropdown owns Cancel: Esc closes the
-                                    // menu only, exactly like pad Circle — not the
-                                    // whole settings surface.
-                                    self.on_start_settings_nav(Some(NavAction::Cancel))
-                                } else {
-                                    self.on_start_message(StartMessage::Close)
-                                }
-                            } else {
-                                Task::none()
-                            }
-                        }
-                        _ => Task::none(),
-                    };
-                }
-                Task::none()
-            }
+            } => self.on_start_key(id, action, pressed),
             Message::PadInput(edge) => {
                 if crate::platform::debug_quiet::enabled() {
                     Task::none()
@@ -1832,56 +1408,7 @@ impl App {
             // cold Start + configure + edit churn (the atlas-crash shape),
             // then a final open. Takes over windows; see the variant docs.
             #[cfg(debug_assertions)]
-            Message::StressWindows(step) => {
-                const CYCLES: u8 = 5;
-                const PER_CYCLE: u8 = 6;
-                let total = CYCLES * PER_CYCLE;
-                if step > total {
-                    self.stress_running = false;
-                    return Task::none();
-                }
-                if step == total {
-                    self.stress_running = false;
-                    crate::ui::toast::ToastMessage::enqueue(
-                        &mut self.toast_queue,
-                        crate::ui::toast::ToastMessage::preview(&self.session.prefs.spectrum),
-                    );
-                    return self.show_next_toast().chain(self.open_start_screen());
-                }
-                let next = Message::StressWindows(step + 1);
-                match step % PER_CYCLE {
-                    // Cold open under a live toast.
-                    0 => {
-                        crate::ui::toast::ToastMessage::enqueue(
-                            &mut self.toast_queue,
-                            crate::ui::toast::ToastMessage::preview(&self.session.prefs.spectrum),
-                        );
-                        self.show_next_toast()
-                            .chain(self.open_start_screen())
-                            .chain(Task::perform(delay(Duration::from_secs(2)), move |()| next))
-                    }
-                    // Second cold renderer while toast + Start are live.
-                    1 => self.open_configure().chain(Task::perform(
-                        delay(Duration::from_millis(1500)),
-                        move |()| next,
-                    )),
-                    2..=4 => self
-                        .toggle_start_edit()
-                        .unwrap_or_else(Task::none)
-                        .chain(Task::perform(delay(Duration::from_secs(1)), move |()| next)),
-                    // Tear it all down; toast expiry overlaps the next cold open.
-                    _ => {
-                        let close_cfg = self
-                            .configure_window
-                            .map(window::close)
-                            .unwrap_or_else(Task::none);
-                        let _ = self.toggle_start_edit();
-                        close_cfg
-                            .chain(self.close_start_screen())
-                            .chain(Task::perform(delay(Duration::from_secs(2)), move |()| next))
-                    }
-                }
-            }
+            Message::StressWindows(step) => self.on_stress_windows(step),
 
             #[cfg(debug_assertions)]
             Message::DebugOpen(spec) => self.debug_open(&spec),
@@ -1910,33 +1437,524 @@ impl App {
 
             Message::SpectrumCommit(generation) => self.on_spectrum_commit(generation),
 
-            Message::Exit => {
-                crate::controller::hid::diag::diag_info("ui-diag: process exit begin");
-                // A renderer-pref restart keeps its restore record; a plain
-                // Quit clears it so the next launch starts clean.
-                if !self.restarting_for_renderer {
-                    crate::persist::restart_ui::clear();
+            Message::Exit => self.on_exit(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // update() arms — one focused handler per message group.
+    //
+    // Behavior-preserving split of the former inline match arms; each fn
+    // returns `Task<Message>` exactly like its arm did. No logic change.
+    // -----------------------------------------------------------------------
+
+    fn on_window_closed(&mut self, id: window::Id) -> Task<Message> {
+        if Some(id) == self.popup_window {
+            self.popup_window = None;
+            self.popup_state.cancel();
+            self.sync_toast_zorder()
+        } else if Some(id) == self.configure_window {
+            self.configure_window = None;
+            self.sync_toast_zorder()
+        } else if Some(id) == self.start_window {
+            self.start_window = None;
+            self.start_visible = false;
+            self.start_nav_ready = false;
+            self.pad_nav.reset();
+            self.clear_start_nav_diag();
+            self.consume_reopen_gesture_chord();
+            let sync = self.sync_toast_zorder();
+            // The auto-open latch survives a close so a pending
+            // open can retry once presence still qualifies.
+            if self.session.start_auto_open_pending
+                && self.session.prefs.start_screen_enabled
+                && self.session.prefs.start_screen_auto_open.auto_opens()
+                && crate::session::has_start_presence(
+                    &self.session.controllers,
+                    self.session.prefs.start_screen_auto_open.includes_usb(),
+                )
+            {
+                crate::controller::hid::diag::diag_info("ui-diag: retry start open after close");
+                sync.chain(self.open_start_screen())
+            } else {
+                sync
+            }
+        } else if Some(id) == self.toast_window {
+            self.toast_window = None;
+            // Recreate so iced keeps a warm compositor for popup/Settings.
+            self.ensure_toast_window()
+        } else {
+            #[cfg(debug_assertions)]
+            if Some(id) == self.preview_window {
+                self.preview_window = None;
+            }
+            Task::none()
+        }
+    }
+
+    fn on_window_unfocused(&mut self, id: window::Id) -> Task<Message> {
+        // The popup is a transient tray flyout: dismiss it when focus moves away.
+        if Some(id) == self.popup_window && !self.popup_state.is_editing_any() {
+            self.close_popup()
+        } else if Some(id) == self.start_window && self.start_visible {
+            // File dialogs (add/edit shortcut, choose image) steal focus — keep the
+            // start screen open so the modal / draft is not discarded.
+            if self.start_state.manual_add.is_some() || self.start_file_dialog_open {
+                Task::none()
+            } else if self
+                .start_revealed_at
+                .is_some_and(|t| t.elapsed() < START_UNFOCUS_GRACE)
+            {
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: start unfocus skipped (reveal grace)",
+                );
+                Task::none()
+            } else {
+                self.close_start_screen()
+            }
+        } else {
+            Task::none()
+        }
+    }
+
+    fn on_start_opened(&mut self, id: window::Id) -> Task<Message> {
+        if Some(id) == self.start_window && self.start_visible {
+            self.start_nav_ready = true;
+            self.nav_not_ready_warned = false;
+            let now = Instant::now();
+            self.start_revealed_at = Some(now);
+            self.start_state.steam_scan_pending = self.steam_scan_pending;
+            crate::controller::hid::diag::diag_info(format!("ui-diag: start opened id={id:?}"));
+            // Raise/focus after create_renderer has a chance to finish —
+            // chaining sync on the same turn as window::open correlated
+            // with atlas create_renderer panics.
+            let mut task = focus_window(id)
+                .chain(raise_window_topmost(id))
+                .chain(self.sync_toast_zorder());
+            // Settings restore first: the drawer/modal scroll lands
+            // before the list reveals, art kicks, and scan below.
+            // Games/controllers follow after the branch.
+            let mut pending_lists = None;
+            if let Some((games_y, controllers_y, settings_y)) = self.pending_scroll_restore.take() {
+                let settings_id = start_view::StartListId::Settings.scroll_id();
+                self.start_state.note_scroll_y(&settings_id, settings_y);
+                task = task.chain(operation::scroll_to(
+                    settings_id,
+                    operation::AbsoluteOffset {
+                        x: None,
+                        y: Some(settings_y),
+                    },
+                ));
+                pending_lists = Some((games_y, controllers_y));
+            }
+            if self.start_state.immersive {
+                // Re-show the position rail on every immersive open.
+                // Warm opens skip begin_cold_load; cold opens refresh
+                // the hide clock to visible time. Pinned is a no-op.
+                self.start_state.note_position_bar_scroll(now);
+                self.start_state.arm_cold_ambient(now);
+                // Cache miss: need metadata before art/list can land — scan now.
+                // Cache hit: Preparing chip first; Steam kicks when art-ready handoff runs.
+                if self.steam_scan_pending {
+                    task = task.chain(self.maybe_kick_deferred_steam_scan());
                 }
-                self.session.known.save();
-                // Drop every Start image Handle before iced tears down the GPU atlas.
-                self.start_visible = false;
-                self.start_nav_ready = false;
+                // Cold: lift the enter veil onto ambient+dock immediately (games list
+                // stays hidden until art). Warm reopen still waits for art before arming.
+                if self.start_state.cold_load_active {
+                    self.start_state.arm_enter_reveal(now);
+                    // Cache hit: Preparing chip until art sync; cache miss uses Steam.
+                    if !self.steam_scan_pending {
+                        self.start_state
+                            .begin_chrome_status(start_view::ChromeStatusKind::PreparingArt, now);
+                    }
+                }
+                self.start_state.prime_backdrop_for_enter(now);
+                if !self.start_state.try_arm_enter_reveal_when_art_ready(now) {
+                    let open_ms = self
+                        .start_opened_at
+                        .map(|t| now.saturating_duration_since(t).as_millis())
+                        .unwrap_or(0);
+                    crate::controller::hid::diag::diag_info(format!(
+                        "ui-diag: start immersive enter art hold open_ms={open_ms} steam_scan={} cold={}",
+                        u8::from(self.steam_scan_pending),
+                        u8::from(self.start_state.cold_load_active),
+                    ));
+                } else {
+                    task = task.chain(self.note_cold_load_finished());
+                }
+                task = task.chain(self.warm_immersive_art_task());
+            } else {
+                // Compact: chrome + skeletons immediately; defer Steam settle.
+                // The scrollables now exist, so reveal the restored
+                // selection (a scroll_to sent with window::open would
+                // have targeted a not-yet-mounted id and been dropped).
+                task = task.chain(self.scroll_start_selection_for_open());
+                if self.start_cold_load_remaining {
+                    self.start_cold_load_remaining = false;
+                    task = task.chain(self.schedule_steam_scan_after_settle());
+                } else if !self.steam_library_refreshed {
+                    task = task.chain(self.schedule_steam_scan_after_settle());
+                }
+                if !self.steam_by_id.is_empty() {
+                    task = task.chain(self.warm_start_art_task());
+                }
+            }
+            // Restored lists land after the branch above (which may
+            // reveal the selection first); the saved offsets win.
+            if let Some((games_y, controllers_y)) = pending_lists {
+                task = task.chain(self.restore_game_lists(games_y, controllers_y));
+            }
+            task
+        } else {
+            Task::none()
+        }
+    }
+
+    fn on_start_art_event(&mut self, ev: crate::ui::start::art_worker::ArtEvent) -> Task<Message> {
+        use crate::ui::start::art_worker::ArtEventKind;
+        if !crate::ui::start::icon_cache::art_warm_is_current(ev.generation) {
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: art event stale gen={} kind={:?}",
+                ev.generation, ev.kind
+            ));
+            return Task::none();
+        }
+        let now = Instant::now();
+        let armed = match ev.kind {
+            ArtEventKind::SelectedReady => {
+                if self.start_state.immersive
+                    && self
+                        .start_state
+                        .rows
+                        .get(self.start_state.game_selected)
+                        .is_some_and(|r| r.backdrop_icon().is_some())
+                {
+                    self.start_state.note_backdrop_ready(now);
+                }
+                let armed = self.start_state.try_arm_enter_reveal_when_art_ready(now);
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: immersive art selected ready gen={}",
+                    ev.generation
+                ));
+                armed
+            }
+            ArtEventKind::NearReady => {
+                let armed = self.start_state.try_arm_enter_reveal_when_art_ready(now);
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: immersive art neighbors ready gen={}",
+                    ev.generation
+                ));
+                armed
+            }
+            ArtEventKind::JobDone => {
                 self.start_state.art_awaiting_paint = false;
-                self.start_state.clear_immersive_session();
-                for row in &mut self.start_state.rows {
-                    row.icon = None;
-                }
-                let _ = crate::ui::start::icon_cache::bump_art_warm_generation();
-                self.art.shutdown();
-                // Idempotent with `InputEdgeBindGuard::drop` (subscription
-                // teardown also clears).
-                self.input_hub.clear();
-                self.hid_worker.shutdown();
-                self.tray_icon.take();
-                crate::controller::hid::diag::diag_info("ui-diag: process exit complete");
-                iced::exit()
+                let armed = self.start_state.try_arm_enter_reveal_when_art_ready(now);
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: immersive art warm done gen={}",
+                    ev.generation
+                ));
+                armed
+            }
+        };
+        if armed {
+            return self.note_cold_load_finished();
+        }
+        // List / hero / backdrop peeks are live — StartFrame redraws pick them up.
+        Task::none()
+    }
+
+    fn on_start_frame(&mut self) -> Task<Message> {
+        let now = Instant::now();
+        self.start_state.steam_scan_pending = self.steam_scan_pending;
+        // Prefs-owned pin for the immersive position rail (heals across
+        // snapshot syncs / restarts; the apply path syncs immediately).
+        self.start_state.sync_navbar_pinned(
+            matches!(
+                self.session.prefs.start_screen_navbar,
+                NavbarVisibility::AlwaysOn
+            ),
+            now,
+        );
+        // Effective reduce-motion gate (also synced per-update): an OS
+        // "Show animations" flip lands on the next frame mid-session.
+        self.start_state
+            .sync_reduced_motion(crate::ui::motion::reduced_motion_effective(
+                self.session.prefs.reduced_motion,
+            ));
+        self.start_state
+            .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
+        let was_cold = self.start_state.cold_load_active;
+        // Frozen exit: while the outgoing presentation is on screen
+        // (promote/demote first half + resize blackout), its clocks
+        // stop — strip/dock/slide chases, hint presses, chrome status,
+        // idle timers and ambient time all hold their pre-transition
+        // frame instead of repainting (and reflowing) under the veil.
+        // Phase/veil/resize progress is wall-clock, so nothing the
+        // ceremony needs stops. Enter phases keep ticking (the new UI
+        // animates in by design).
+        let exiting = matches!(
+            self.start_state.transition_phase.map(|(p, _)| p),
+            Some(
+                start_mode::TransitionPhase::ExitCompact
+                    | start_mode::TransitionPhase::ExitImmersive
+                    | start_mode::TransitionPhase::Resizing
+            )
+        );
+        if !exiting {
+            let _ = self.start_state.tick_anim(now);
+        }
+        let task = if was_cold && !self.start_state.cold_load_active {
+            self.note_cold_load_finished()
+        } else {
+            Task::none()
+        };
+        if let Some(phase_task) = self.tick_immersive_transition_phase(now) {
+            return task.chain(phase_task);
+        }
+        // Keyboard-only hold progress when pad poll is not running.
+        if self.start_state.replace_confirm.is_some() {
+            let (progress, completed) = self.keyboard_cross_hold.update(self.confirm_key_held, now);
+            self.start_state.cross_progress = self.start_state.cross_progress.max(progress);
+            if completed {
+                self.haptic_pad_serial = None;
+                self.play_start_cue(UiSoundKind::Hold);
+                return task.chain(self.complete_replace_confirm());
             }
         }
+        if !exiting {
+            self.sync_start_held();
+            self.start_state.tick_hint_anims(now);
+            self.tick_start_cursor_idle(now);
+            if self.tick_start_idle(now) {
+                self.pad_nav.prepare_on_open(false);
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: start idle pad re-arm after sleep wake",
+                );
+            }
+        }
+        task
+    }
+
+    fn on_start_key(
+        &mut self,
+        id: window::Id,
+        action: StartKeyAction,
+        pressed: bool,
+    ) -> Task<Message> {
+        // Keyboard is never pad-originated.
+        self.haptic_pad_serial = None;
+        if Some(id) == self.start_window && self.start_visible {
+            self.note_start_activity();
+            // Cold ambient: only Cancel/Close is live.
+            if self.start_state.cold_load_active {
+                return match action {
+                    StartKeyAction::Cancel if !pressed => {
+                        self.cancel_start_holds();
+                        self.on_start_message(StartMessage::Close)
+                    }
+                    StartKeyAction::Cancel => {
+                        self.cancel_key_held = pressed;
+                        self.sync_start_held();
+                        Task::none()
+                    }
+                    _ => Task::none(),
+                };
+            }
+            // Leftover-chord arming is pad-local; keyboard stays live.
+            // Layout transition reflows main content: drop keyboard nav for its
+            // duration. Confirm/Cancel/Close stay live (cancellable chrome).
+            if pressed
+                && matches!(
+                    action,
+                    StartKeyAction::Up
+                        | StartKeyAction::Down
+                        | StartKeyAction::Left
+                        | StartKeyAction::Right
+                )
+                && self.start_state.layout_transition_active()
+            {
+                return Task::none();
+            }
+            return match action {
+                StartKeyAction::Up if pressed => {
+                    self.cancel_start_holds();
+                    if self.start_state.ambient_tuning_active() {
+                        self.on_ambient_tuning_nav(Some(NavAction::Up))
+                    } else if self.start_state.settings.open {
+                        self.on_start_settings_nav(Some(NavAction::Up))
+                    } else if self.immersive_horizontal_games_nav() {
+                        // Horizontal Games strip scrolls Left/Right only.
+                        Task::none()
+                    } else {
+                        self.on_start_message(StartMessage::MoveUp)
+                    }
+                }
+                StartKeyAction::Down if pressed => {
+                    self.cancel_start_holds();
+                    if self.start_state.ambient_tuning_active() {
+                        self.on_ambient_tuning_nav(Some(NavAction::Down))
+                    } else if self.start_state.settings.open {
+                        self.on_start_settings_nav(Some(NavAction::Down))
+                    } else if self.immersive_horizontal_games_nav() {
+                        // Horizontal Games strip scrolls Left/Right only.
+                        Task::none()
+                    } else {
+                        self.on_start_message(StartMessage::MoveDown)
+                    }
+                }
+                StartKeyAction::Left
+                    if pressed
+                        && (self.start_state.immersive || self.start_state.settings.open) =>
+                {
+                    self.cancel_start_holds();
+                    if self.start_state.ambient_tuning_active() {
+                        self.on_ambient_tuning_nav(Some(NavAction::PrevSlide))
+                    } else if self.start_state.settings.open {
+                        self.on_start_settings_nav(Some(NavAction::PrevSlide))
+                    } else if self.immersive_horizontal_games_nav() {
+                        self.on_start_message(StartMessage::MoveUp)
+                    } else {
+                        self.on_start_message(StartMessage::PrevSlide)
+                    }
+                }
+                StartKeyAction::Right
+                    if pressed
+                        && (self.start_state.immersive || self.start_state.settings.open) =>
+                {
+                    self.cancel_start_holds();
+                    if self.start_state.ambient_tuning_active() {
+                        self.on_ambient_tuning_nav(Some(NavAction::NextSlide))
+                    } else if self.start_state.settings.open {
+                        self.on_start_settings_nav(Some(NavAction::NextSlide))
+                    } else if self.immersive_horizontal_games_nav() {
+                        self.on_start_message(StartMessage::MoveDown)
+                    } else {
+                        self.on_start_message(StartMessage::NextSlide)
+                    }
+                }
+                StartKeyAction::Confirm => {
+                    self.confirm_key_held = pressed;
+                    self.sync_start_held();
+                    if self.start_state.replace_confirm.is_some() {
+                        if pressed {
+                            self.pad_nav.cancel_holds();
+                        }
+                        Task::none()
+                    } else if !pressed {
+                        self.cancel_start_holds();
+                        if self.start_state.ambient_tuning_active() {
+                            self.on_ambient_tuning_nav(Some(NavAction::Confirm))
+                        } else if self.start_state.settings.open {
+                            self.on_start_settings_nav(Some(NavAction::Confirm))
+                        } else {
+                            self.on_start_message(StartMessage::Confirm)
+                        }
+                    } else {
+                        Task::none()
+                    }
+                }
+                StartKeyAction::Cancel => {
+                    self.cancel_key_held = pressed;
+                    self.sync_start_held();
+                    if !pressed {
+                        self.cancel_start_holds();
+                        if self.start_state.ambient_tuning_active() {
+                            self.on_ambient_tuning_nav(Some(NavAction::Cancel))
+                        } else if self.start_state.settings.any_menu_open() {
+                            // Expanded dropdown owns Cancel: Esc closes the
+                            // menu only, exactly like pad Circle — not the
+                            // whole settings surface.
+                            self.on_start_settings_nav(Some(NavAction::Cancel))
+                        } else {
+                            self.on_start_message(StartMessage::Close)
+                        }
+                    } else {
+                        Task::none()
+                    }
+                }
+                _ => Task::none(),
+            };
+        }
+        Task::none()
+    }
+
+    #[cfg(debug_assertions)]
+    fn on_stress_windows(&mut self, step: u8) -> Task<Message> {
+        const CYCLES: u8 = 5;
+        const PER_CYCLE: u8 = 6;
+        let total = CYCLES * PER_CYCLE;
+        if step > total {
+            self.stress_running = false;
+            return Task::none();
+        }
+        if step == total {
+            self.stress_running = false;
+            crate::ui::toast::ToastMessage::enqueue(
+                &mut self.toast_queue,
+                crate::ui::toast::ToastMessage::preview(&self.session.prefs.spectrum),
+            );
+            return self.show_next_toast().chain(self.open_start_screen());
+        }
+        let next = Message::StressWindows(step + 1);
+        match step % PER_CYCLE {
+            // Cold open under a live toast.
+            0 => {
+                crate::ui::toast::ToastMessage::enqueue(
+                    &mut self.toast_queue,
+                    crate::ui::toast::ToastMessage::preview(&self.session.prefs.spectrum),
+                );
+                self.show_next_toast()
+                    .chain(self.open_start_screen())
+                    .chain(Task::perform(delay(Duration::from_secs(2)), move |()| next))
+            }
+            // Second cold renderer while toast + Start are live.
+            1 => self.open_configure().chain(Task::perform(
+                delay(Duration::from_millis(1500)),
+                move |()| next,
+            )),
+            2..=4 => self
+                .toggle_start_edit()
+                .unwrap_or_else(Task::none)
+                .chain(Task::perform(delay(Duration::from_secs(1)), move |()| next)),
+            // Tear it all down; toast expiry overlaps the next cold open.
+            _ => {
+                let close_cfg = self
+                    .configure_window
+                    .map(window::close)
+                    .unwrap_or_else(Task::none);
+                let _ = self.toggle_start_edit();
+                close_cfg
+                    .chain(self.close_start_screen())
+                    .chain(Task::perform(delay(Duration::from_secs(2)), move |()| next))
+            }
+        }
+    }
+
+    fn on_exit(&mut self) -> Task<Message> {
+        crate::controller::hid::diag::diag_info("ui-diag: process exit begin");
+        // A renderer-pref restart keeps its restore record; a plain
+        // Quit clears it so the next launch starts clean.
+        if !self.restarting_for_renderer {
+            crate::persist::restart_ui::clear();
+        }
+        self.session.known.save();
+        // Drop every Start image Handle before iced tears down the GPU atlas.
+        self.start_visible = false;
+        self.start_nav_ready = false;
+        self.start_state.art_awaiting_paint = false;
+        self.start_state.clear_immersive_session();
+        for row in &mut self.start_state.rows {
+            row.icon = None;
+        }
+        let _ = crate::ui::start::icon_cache::bump_art_warm_generation();
+        self.art.shutdown();
+        // Idempotent with `InputEdgeBindGuard::drop` (subscription
+        // teardown also clears).
+        self.input_hub.clear();
+        self.hid_worker.shutdown();
+        self.tray_icon.take();
+        crate::controller::hid::diag::diag_info("ui-diag: process exit complete");
+        iced::exit()
     }
 
     // -----------------------------------------------------------------------
