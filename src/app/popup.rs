@@ -35,13 +35,12 @@ impl App {
     }
 
     pub(crate) fn sync_popup_rows(&mut self) {
-        if self.start_state.powering_off.as_ref().is_some_and(|s| {
-            !self
-                .session
-                .controllers
-                .iter()
-                .any(|c| c.serial.as_ref() == s.as_str())
-        }) {
+        if self
+            .start_state
+            .powering_off
+            .as_ref()
+            .is_some_and(|s| !self.session.controllers.iter().any(|c| c.serial == *s))
+        {
             self.start_state.powering_off = None;
         }
         let threshold = self.session.prefs.low_battery_percent;
@@ -191,7 +190,11 @@ impl App {
             }
             PopupMessage::ToggleRemember(serial) => self.toggle_remember(&serial),
             PopupMessage::BeginEdit(serial) => {
-                let current = self.session.known.nickname(&serial).map(str::to_string);
+                let current = self
+                    .session
+                    .known
+                    .nickname(serial.as_ref())
+                    .map(str::to_string);
                 self.popup_state.begin_edit(&serial, current.as_deref());
                 Task::batch([
                     operation::focus(popup_view::nickname_input_id()),

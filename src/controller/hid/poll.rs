@@ -60,14 +60,14 @@ pub(crate) fn status_from_reading(
     driver: &dyn ControllerDriver,
     product: &str,
     reading: &battery::BatteryReading,
-    serial: String,
+    serial: impl Into<Serial>,
 ) -> ControllerStatus {
     ControllerStatus {
         index: 0,
         kind: driver.kind(),
         product: product.into(),
         connection: reading.connection,
-        serial: Serial::from(serial),
+        serial: serial.into(),
         percent: reading.percent,
         state: reading.state,
         capabilities: driver.capabilities(),
@@ -88,7 +88,7 @@ pub(crate) fn status_from_reading(
 pub fn poll_controllers(
     lock: &HidIoLock,
     policy: &Policy,
-    previously_connected: &[String],
+    previously_connected: &[Serial],
     spectrum: &SpectrumService,
     claims: &ClaimStore,
 ) -> AppResult<Vec<ControllerStatus>> {
@@ -108,7 +108,7 @@ pub fn poll_controllers(
 pub fn poll_controllers_with_drivers(
     lock: &HidIoLock,
     policy: &Policy,
-    previously_connected: &[String],
+    previously_connected: &[Serial],
     spectrum: &SpectrumService,
     claims: &ClaimStore,
     drivers: &[&dyn ControllerDriver],
@@ -144,9 +144,9 @@ pub fn poll_controllers_timed(
     policy: &Policy,
     spectrum: &SpectrumService,
     claims: &ClaimStore,
-    previously_connected: &[String],
+    previously_connected: &[Serial],
     launch: Option<&mut LaunchPaths>,
-    launch_quiet: Option<&mut Vec<String>>,
+    launch_quiet: Option<&mut Vec<Serial>>,
     drivers: &[&dyn ControllerDriver],
 ) -> (AppResult<Vec<ControllerStatus>>, HidPhaseTiming) {
     let mut timing = HidPhaseTiming::default();
@@ -174,10 +174,10 @@ fn poll_controllers_with_api(
     policy: &Policy,
     spectrum: &SpectrumService,
     claims: &ClaimStore,
-    previously_connected: &[String],
+    previously_connected: &[Serial],
     timing: &mut HidPhaseTiming,
     mut launch: Option<&mut LaunchPaths>,
-    mut launch_quiet: Option<&mut Vec<String>>,
+    mut launch_quiet: Option<&mut Vec<Serial>>,
     drivers: &[&dyn ControllerDriver],
 ) -> AppResult<Vec<ControllerStatus>> {
     // Policy seam: `Policy::default()` reproduces the legacy const cadence
@@ -314,7 +314,7 @@ pub(crate) fn reassert_lightbar_for_pads<'a>(
     api: &HidApi,
     spectrum: &SpectrumService,
     claims: &ClaimStore,
-    previously_connected: &[String],
+    previously_connected: &[Serial],
     statuses: impl Iterator<Item = &'a ControllerStatus>,
     timing: &mut HidPhaseTiming,
     drivers: &[&dyn ControllerDriver],
@@ -329,13 +329,13 @@ pub(crate) fn reassert_lightbar_for_pads<'a>(
     if !claims.is_enabled() {
         return;
     }
-    let previous: std::collections::HashSet<String> = previously_connected
+    let previous: std::collections::HashSet<Serial> = previously_connected
         .iter()
-        .map(|s| dualsense::normalize_identity(s))
+        .map(|s| Serial::normalize(s.as_ref()))
         .collect();
 
     for pad in lightbar_targets(drivers, statuses.iter().copied()) {
-        let serial_key = dualsense::normalize_identity(pad.serial.as_ref());
+        let serial_key = Serial::normalize(pad.serial.as_ref());
         let color = spectrum.color_at(pad.percent);
         if !previous.contains(&serial_key) {
             claims.prepare_connect(pad.serial.as_ref());
@@ -382,7 +382,7 @@ mod tests {
         let fake = fake();
         let drivers: &[&dyn ControllerDriver] = &[&fake];
         let reading = fake.canned_reading();
-        let status = status_from_reading(&fake, "FakePad", &reading, "aa:bb:cc".into());
+        let status = status_from_reading(&fake, "FakePad", &reading, Serial::from("aa:bb:cc"));
         assert_eq!(status.product, "FakePad");
         assert_eq!(status.percent, 55);
         assert_eq!(status.state, PowerState::Discharging);
@@ -413,7 +413,7 @@ mod tests {
         assert!(!fake.capabilities().power_off);
         // A full-capability status from the same registry shape still targets.
         let reading = fake.canned_reading();
-        let mut status = status_from_reading(&fake, "FakePad", &reading, "aa".into());
+        let mut status = status_from_reading(&fake, "FakePad", &reading, Serial::from("aa"));
         status.capabilities = crate::controller::model::Capabilities::FULL;
         let drivers: &[&dyn ControllerDriver] = &[&crate::controller::driver::DUALSENSE];
         // kinds match (both DualSense) and the real backend exists.

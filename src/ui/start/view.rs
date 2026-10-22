@@ -1,7 +1,7 @@
 //! Start-screen carousel: Games + Controllers, DualSense / keyboard navigable.
 
 use crate::controller::dualsense::lightbar;
-use crate::controller::model::PowerState;
+use crate::controller::model::{PowerState, Serial};
 use crate::games::GameEntry;
 use crate::games::steam::SteamGame;
 use crate::persist::prefs::{
@@ -522,7 +522,7 @@ pub fn probe_shell_icon(target: &str) -> Option<StartIcon> {
 /// Controller row for the Controllers slide (live or remembered disconnected).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StartControllerRow {
-    pub serial: String,
+    pub serial: Serial,
     pub title: String,
     pub connection: String,
     pub state: String,
@@ -847,7 +847,7 @@ pub struct State {
     pub closing_target: Option<String>,
     /// Controller serial currently being powered off (feature report sent,
     /// waiting for the pad to disappear). Shows "Powering off" the same way.
-    pub powering_off: Option<String>,
+    pub powering_off: Option<Serial>,
     pub replace_confirm: Option<ReplaceConfirm>,
     pub manual_add: Option<ManualAddDraft>,
     /// Options settings panel (compact modal / immersive drawer).
@@ -953,7 +953,7 @@ pub struct State {
 /// Active Identify ring flash for one controller row on the start screen.
 #[derive(Debug, Clone)]
 struct IdentifyFlash {
-    serial: String,
+    serial: Serial,
     started: Instant,
 }
 
@@ -1241,13 +1241,13 @@ impl State {
         let prev_serial = self
             .controllers
             .get(self.controller_selected)
-            .map(|r| r.serial.as_str());
+            .map(|r| &r.serial);
         let next_selected = if controllers.is_empty() {
             0
         } else if let Some(serial) = prev_serial {
             controllers
                 .iter()
-                .position(|r| r.serial == serial)
+                .position(|r| r.serial == *serial)
                 .unwrap_or_else(|| self.controller_selected.min(controllers.len() - 1))
         } else {
             self.controller_selected.min(controllers.len() - 1)
@@ -1667,7 +1667,7 @@ impl State {
     }
 
     /// Current controllers selection as a stable key for service-side memory.
-    pub fn selected_controller_key(&self) -> Option<String> {
+    pub fn selected_controller_key(&self) -> Option<Serial> {
         self.controllers
             .get(self.controller_selected)
             .map(|r| r.serial.clone())
@@ -1732,7 +1732,7 @@ impl State {
             } else {
                 self.controllers
                     .iter()
-                    .position(|r| r.serial == serial)
+                    .position(|r| r.serial.as_ref() == serial)
                     .unwrap_or(0)
             };
             if index != self.controller_selected {
@@ -3514,9 +3514,9 @@ impl State {
     }
 
     /// Start the UI ring flash that mirrors the lightbar Identify pattern.
-    pub fn begin_identify_flash(&mut self, serial: &str) {
+    pub fn begin_identify_flash(&mut self, serial: &Serial) {
         self.identify_flash = Some(IdentifyFlash {
-            serial: serial.to_string(),
+            serial: serial.clone(),
             started: Instant::now(),
         });
     }
@@ -3538,9 +3538,9 @@ impl State {
         }
     }
 
-    pub(crate) fn ring_flash_white(&self, serial: &str) -> bool {
+    pub(crate) fn ring_flash_white(&self, serial: &Serial) -> bool {
         self.identify_flash.as_ref().is_some_and(|flash| {
-            flash.serial == serial
+            flash.serial == *serial
                 && lightbar::identify_flash_is_white(flash.started, Instant::now()) == Some(true)
         })
     }
@@ -4903,7 +4903,7 @@ mod tests {
         state.game_selected = 2;
         state.controller_selected = 1;
         assert_eq!(state.selected_game_key().as_deref(), Some("steam:3"));
-        assert_eq!(state.selected_controller_key().as_deref(), Some("bb"));
+        assert_eq!(state.selected_controller_key(), Some(Serial::from("bb")));
     }
 
     #[test]
@@ -5102,7 +5102,7 @@ mod tests {
             controller_row_with("aa", true),
             controller_row_with("bb", true),
         ]);
-        assert_eq!(state.powering_off.as_deref(), Some("aa"));
+        assert_eq!(state.powering_off.as_ref().map(AsRef::as_ref), Some("aa"));
         // Gone entirely: cleared.
         state.set_controllers(vec![controller_row_with("bb", true)]);
         assert_eq!(state.powering_off, None);

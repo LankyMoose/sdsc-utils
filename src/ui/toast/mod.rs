@@ -3,6 +3,7 @@
 pub mod machine;
 pub mod view;
 
+use crate::controller::model::Serial;
 use crate::session::notify::NotifyEvent;
 use crate::ui::color::{BatterySpectrum, Rgb};
 use crate::ui::toast::machine::AfterToast;
@@ -19,8 +20,8 @@ pub enum ToastTrailing {
 pub struct ToastMessage {
     pub heading: String,
     pub body: String,
-    /// Owning controller serial (empty for preview / crash cards). Coalescing key.
-    pub serial: String,
+    /// Owning controller serial (default/empty for preview / crash cards). Coalescing key.
+    pub serial: Serial,
     pub accent: Rgb,
     pub trailing: ToastTrailing,
     /// Latched at queue time (0→1 Connected → open Start after rest).
@@ -36,7 +37,7 @@ impl ToastMessage {
     /// compact auto-open latch can never be dropped by coalescing. Cards
     /// without a serial (preview / crash) never coalesce.
     pub fn enqueue(queue: &mut VecDeque<ToastMessage>, mut message: ToastMessage) {
-        if !message.serial.is_empty() {
+        if !message.serial.as_ref().is_empty() {
             let mut latched = false;
             queue.retain(|queued| {
                 let same = queued.serial == message.serial && queued.body == message.body;
@@ -72,7 +73,7 @@ impl ToastMessage {
         Self {
             heading: crate::platform::app_meta::DISPLAY_NAME.to_string(),
             body: "Toasts will appear here".to_string(),
-            serial: String::new(),
+            serial: Serial::default(),
             accent: spectrum.color_at_percent(PERCENT),
             trailing: ToastTrailing::Percent {
                 percent: PERCENT,
@@ -92,7 +93,7 @@ impl ToastMessage {
                 crate::platform::app_meta::DISPLAY_NAME
             ),
             body: "Please send app.log from the data directory to the developers.".to_string(),
-            serial: String::new(),
+            serial: Serial::default(),
             accent: ACCENT,
             trailing: ToastTrailing::Bug,
             after: AfterToast::Nothing,
@@ -186,7 +187,7 @@ mod tests {
             heading: format!("DualSense ({serial})"),
             body: body.to_string(),
             percent: Some(percent),
-            serial: serial.to_string(),
+            serial: Serial::from(serial),
             state: PowerState::Discharging,
         }
     }

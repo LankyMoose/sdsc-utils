@@ -1,7 +1,7 @@
 //! DualSense discovery and battery reading.
 
 use crate::controller::dualsense::identity::{
-    is_dualsense_device, is_storable_serial, normalize_identity, resolve_device_identity,
+    is_dualsense_device, is_storable_serial, resolve_device_identity,
 };
 use crate::controller::model::Capabilities;
 use crate::controller::model::ControllerKind;
@@ -296,7 +296,7 @@ fn power_off_bluetooth_unlocked_timed(
     timing: &mut crate::controller::dualsense::lightbar::HidPhaseTiming,
 ) -> AppResult<()> {
     let enum_started = std::time::Instant::now();
-    let target = normalize_identity(serial);
+    let target = Serial::normalize(serial);
 
     let mut matched: Vec<(String, HidDevice)> = Vec::new();
     let mut unknown: Vec<(String, HidDevice)> = Vec::new();
@@ -317,7 +317,7 @@ fn power_off_bluetooth_unlocked_timed(
         };
         open_ms += open_started.elapsed().as_millis();
         let identity = resolve_device_identity(info, &device);
-        if identity == target {
+        if Serial::normalize(identity.as_str()) == target {
             matched.push((path, device));
         } else if !is_known_serial(&identity) {
             // Vendor/audio collections often lack a serial; try after exact matches.
@@ -489,8 +489,8 @@ mod tests {
     #[test]
     fn normalize_identity_strips_separators_and_case() {
         assert_eq!(
-            normalize_identity("AA:BB:CC:DD:EE:FF"),
-            normalize_identity("aa-bb-cc-dd-ee-ff")
+            Serial::normalize("AA:BB:CC:DD:EE:FF"),
+            Serial::normalize("aa-bb-cc-dd-ee-ff")
         );
     }
 

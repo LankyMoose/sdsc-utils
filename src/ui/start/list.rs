@@ -377,7 +377,7 @@ pub(crate) fn controllers_list<'a>(
                 .as_ref()
                 .is_some_and(|s| s == &row.serial);
         (
-            list_key(&row.serial),
+            list_key(row.serial.as_ref()),
             controller_row(
                 index,
                 row,

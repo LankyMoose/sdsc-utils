@@ -284,12 +284,12 @@ mod tests {
         store.remember(&pad("REAL-xyz", 70, Connection::Usb));
 
         // `remembered_disconnected` is the boot-time view (no live list yet).
-        let remembered: Vec<(String, u8, Connection)> = store
+        let remembered: Vec<(Serial, u8, Connection)> = store
             .remembered_disconnected(&[])
             .into_iter()
             .map(|r| {
                 (
-                    r.serial.to_string(),
+                    r.serial.clone(),
                     r.percent,
                     Connection::from_label(&r.connection).expect("persisted link parses"),
                 )
@@ -297,7 +297,7 @@ mod tests {
             .collect();
 
         let fleet = crate::controller::emulate::rehydrate(&remembered);
-        let serials: Vec<&str> = fleet.iter().map(|p| p.serial()).collect();
+        let serials: Vec<&str> = fleet.iter().map(|p| p.serial().as_ref()).collect();
         assert_eq!(
             serials,
             vec!["emu-1"],
@@ -326,12 +326,12 @@ mod tests {
         assert!(store.forget("emu-1"));
         assert!(!store.is_remembered("emu-1"));
 
-        let remembered: Vec<(String, u8, Connection)> = store
+        let remembered: Vec<(Serial, u8, Connection)> = store
             .remembered_disconnected(&[])
             .into_iter()
             .map(|r| {
                 (
-                    r.serial.to_string(),
+                    r.serial.clone(),
                     r.percent,
                     Connection::from_label(&r.connection).expect("parses"),
                 )

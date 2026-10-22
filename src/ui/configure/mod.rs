@@ -13,7 +13,7 @@ use spectrum::{BAR_HEIGHT, HUE_HEIGHT, HueBar, SV_HEIGHT, SpectrumBar, SvSquare}
 #[cfg(debug_assertions)]
 use crate::controller::emulate::{self, EmulatedPad};
 #[cfg(debug_assertions)]
-use crate::controller::model::{Connection, PowerState};
+use crate::controller::model::{Connection, PowerState, Serial};
 use crate::games::steam::LAST_KNOWN_COMPATIBLE_STEAM_VERSION;
 use crate::persist::analytics::{
     BucketDirection, ControllerAnalytics, InProgressBucket, StepCoverage, format_duration_short,
@@ -235,7 +235,7 @@ pub use crate::controller::emulate::EmulatorCommand;
 #[cfg(debug_assertions)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingEmulatorChange {
-    pub serial: String,
+    pub serial: Serial,
     pub percent: u8,
     /// Frame counter driving the pending spinner.
     pub tick: u32,
@@ -411,7 +411,7 @@ pub enum ConfigureMessage {
     /// Serial of a row whose controls are expanded.
     /// Expand a pad row.
     #[cfg(debug_assertions)]
-    ToggleEmulator(String),
+    ToggleEmulator(Serial),
     /// Debug-only: start the renderer window stress test (Diagnostics section).
     #[cfg(debug_assertions)]
     RunWindowStress,
@@ -485,7 +485,7 @@ pub struct ConfigureState {
     /// Serials of expanded pad rows (Controllers tab), keyed so rows stay
     /// independently expandable as pads come and go.
     #[cfg(debug_assertions)]
-    pub expanded_emulators: std::collections::HashSet<String>,
+    pub expanded_emulators: std::collections::HashSet<Serial>,
 }
 
 impl ConfigureState {
@@ -2327,7 +2327,7 @@ fn emulators_view<'a>(
     } else {
         for pad in fleet {
             let expanded = state.expanded_emulators.contains(pad.serial());
-            let pad_pending = pending.iter().find(|p| p.serial == pad.serial());
+            let pad_pending = pending.iter().find(|p| p.serial == *pad.serial());
             sections = sections.push(emulator_row(pad, expanded, pad_pending));
         }
     }
@@ -2387,7 +2387,7 @@ fn emulator_row<'a>(
     expanded: bool,
     pending: Option<&PendingEmulatorChange>,
 ) -> Element<'a, ConfigureMessage> {
-    let serial = pad.serial().to_string();
+    let serial = pad.serial().clone();
     let toggle = toggler(pad.connected)
         .size(18.0)
         .on_toggle({
@@ -2453,7 +2453,7 @@ fn emulator_row<'a>(
             .into();
     }
 
-    let remember_serial = pad.serial().to_string();
+    let remember_serial = pad.serial().clone();
     let controls = column![
         battery_row(pad, pending),
         connection_row(pad),
@@ -2516,7 +2516,7 @@ fn battery_row<'a>(
     pending: Option<&PendingEmulatorChange>,
 ) -> Element<'a, ConfigureMessage> {
     let level = crate::controller::dualsense::battery::level_from_percent(pad.status.percent);
-    let preview_serial = pad.serial().to_string();
+    let preview_serial = pad.serial().clone();
     let slider = slider(0.0..=MAX_EMU_LEVEL as f32, level as f32, move |value| {
         ConfigureMessage::Emulator(EmulatorCommand::PreviewPercent(
             preview_serial.clone(),
@@ -2561,7 +2561,7 @@ fn battery_row<'a>(
 fn connection_row<'a>(pad: &EmulatedPad) -> Element<'a, ConfigureMessage> {
     let mut options = Vec::new();
     for option in [Connection::Usb, Connection::Bluetooth] {
-        let serial = pad.serial().to_string();
+        let serial = pad.serial().clone();
         let derived = emulate::state_for(option, pad.status.percent);
         options.push(
             column![
@@ -2586,9 +2586,9 @@ fn connection_row<'a>(pad: &EmulatedPad) -> Element<'a, ConfigureMessage> {
 /// Battery-analytics actions for one pad.
 #[cfg(debug_assertions)]
 fn analytics_block<'a>(pad: &EmulatedPad) -> Element<'a, ConfigureMessage> {
-    let seed_serial = pad.serial().to_string();
-    let charge_serial = pad.serial().to_string();
-    let drain_serial = pad.serial().to_string();
+    let seed_serial = pad.serial().clone();
+    let charge_serial = pad.serial().clone();
+    let drain_serial = pad.serial().clone();
     column![
         text("Battery analytics")
             .size(theme::type_scale::CAPTION + 1.0)
@@ -2714,9 +2714,10 @@ mod tests {
         // pads obey the link/state invariant, and cover every link state the
         // picker can label: charging, complete, discharging.
         let plugged = emulate::new_pad(&[], 50, Connection::Usb);
-        let mut fleet = emulate::set_percent(std::slice::from_ref(&plugged), "emu-1", 100);
+        let mut fleet =
+            emulate::set_percent(std::slice::from_ref(&plugged), &Serial::from("emu-1"), 100);
         fleet.push(emulate::new_pad(&fleet, 20, Connection::Bluetooth));
-        fleet = emulate::update(&fleet, "emu-1", |p| p.connected = true);
+        fleet = emulate::update(&fleet, &Serial::from("emu-1"), |p| p.connected = true);
         let pending = [PendingEmulatorChange {
             serial: "emu-1".into(),
             percent: 75,
@@ -2734,7 +2735,7 @@ mod tests {
         state.expanded_emulators.insert("emu-9".into());
         drop(emulators_view(&state, &fleet, &pending));
         // The forget/remember button label follows the pad's remembered flag.
-        let forgotten = emulate::update(&fleet, "emu-1", |p| p.remembered = false);
+        let forgotten = emulate::update(&fleet, &Serial::from("emu-1"), |p| p.remembered = false);
         drop(emulators_view(&state, &forgotten, &[]));
     }
 

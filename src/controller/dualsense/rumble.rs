@@ -5,8 +5,8 @@
 //! Bluetooth calibration feature report.
 
 use crate::controller::driver::RumbleBackend;
-use crate::controller::dualsense::identity::normalize_identity;
 use crate::controller::dualsense::lightbar::{self, ClaimStore};
+use crate::controller::model::Serial;
 use hidapi::HidDevice;
 use std::time::Duration;
 
@@ -96,11 +96,11 @@ pub fn set_rumble_on_device(
     left: u8,
     claims: &ClaimStore,
 ) -> Result<(), hidapi::HidError> {
-    let target = normalize_identity(serial);
+    let target = Serial::normalize(serial);
     lightbar::write_output_report(
         device,
         is_bluetooth,
-        &target,
+        target.as_ref(),
         "rumble",
         "motors",
         None,

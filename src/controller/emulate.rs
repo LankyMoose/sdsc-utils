@@ -13,7 +13,7 @@ use crate::controller::dualsense::battery::{LOW_BATTERY_PERCENT, dualsense_statu
 #[cfg(debug_assertions)]
 use crate::controller::known::KnownControllers;
 use crate::controller::model::Connection;
-use crate::controller::model::{ControllerStatus, PowerState};
+use crate::controller::model::{ControllerStatus, PowerState, Serial};
 use std::time::Duration;
 
 pub const SERIAL_PREFIX: &str = "emu-";
@@ -52,13 +52,13 @@ pub struct EmulatedPad {
 }
 
 impl EmulatedPad {
-    pub fn serial(&self) -> &str {
-        self.status.serial.as_ref()
+    pub fn serial(&self) -> &Serial {
+        &self.status.serial
     }
 }
 
-pub fn serial_for(index: usize) -> String {
-    format!("{SERIAL_PREFIX}{index}")
+pub fn serial_for(index: usize) -> Serial {
+    Serial::from(format!("{SERIAL_PREFIX}{index}"))
 }
 
 fn pad(index: usize, percent: u8, connection: Connection) -> ControllerStatus {
@@ -93,7 +93,7 @@ pub fn state_for(connection: Connection, percent: u8) -> PowerState {
 /// Starts **disconnected**: a fresh pad is remembered but not live, so it does
 /// not fire a connect toast or open Start until you switch it on.
 pub fn new_pad(fleet: &[EmulatedPad], percent: u8, connection: Connection) -> EmulatedPad {
-    let taken: Vec<usize> = fleet.iter().map(|p| slot_of(p.serial())).collect();
+    let taken: Vec<usize> = fleet.iter().map(|p| slot_of(p.serial().as_ref())).collect();
     let index = (1..=taken.len() + 1)
         .find(|n| !taken.contains(n))
         .unwrap_or(1);
@@ -127,15 +127,15 @@ pub fn prune(fleet: Vec<EmulatedPad>) -> Vec<EmulatedPad> {
 /// and reconnecting here would fire connect toasts and open Start unbidden at
 /// boot. Each keeps its remembered level and link, so it resumes where it was
 /// left rather than at the `AddPad` default.
-pub fn rehydrate(remembered: &[(String, u8, Connection)]) -> Vec<EmulatedPad> {
+pub fn rehydrate(remembered: &[(Serial, u8, Connection)]) -> Vec<EmulatedPad> {
     let mut fleet: Vec<EmulatedPad> = remembered
         .iter()
-        .filter(|(serial, _, _)| is_emulated(serial))
+        .filter(|(serial, _, _)| is_emulated(serial.as_ref()))
         .map(|(serial, percent, connection)| EmulatedPad {
             // Number by the pad's own slot so the rebuilt fleet keeps the
             // identity its serial implies; `pad` re-derives charge state from
             // the link (the remembered store persists no state).
-            status: pad(slot_of(serial), *percent, *connection),
+            status: pad(slot_of(serial.as_ref()), *percent, *connection),
             connected: false,
             // Only remembered pads are ever written to `controllers.json`, so
             // anything read back from it is remembered by construction.
@@ -143,7 +143,7 @@ pub fn rehydrate(remembered: &[(String, u8, Connection)]) -> Vec<EmulatedPad> {
         })
         .collect();
     // Order by slot so emu-2 precedes emu-10.
-    fleet.sort_by_key(|p| slot_of(p.serial()));
+    fleet.sort_by_key(|p| slot_of(p.serial().as_ref()));
     fleet
 }
 
@@ -158,7 +158,7 @@ fn slot_of(serial: &str) -> usize {
 /// Edit the pad with `serial` in place; unknown serials are a no-op.
 pub fn update(
     fleet: &[EmulatedPad],
-    serial: &str,
+    serial: &Serial,
     edit: impl FnOnce(&mut EmulatedPad),
 ) -> Vec<EmulatedPad> {
     let target = fleet.iter().position(|p| p.serial() == serial);
@@ -171,7 +171,7 @@ pub fn update(
 
 /// Set the battery level, re-deriving the charge state (a USB pad dragged to
 /// 100% becomes `Complete`, not still `Charging`).
-pub fn set_percent(fleet: &[EmulatedPad], serial: &str, percent: u8) -> Vec<EmulatedPad> {
+pub fn set_percent(fleet: &[EmulatedPad], serial: &Serial, percent: u8) -> Vec<EmulatedPad> {
     update(fleet, serial, |p| {
         p.status.percent = percent;
         p.status.state = state_for(p.status.connection, percent);
@@ -179,7 +179,11 @@ pub fn set_percent(fleet: &[EmulatedPad], serial: &str, percent: u8) -> Vec<Emul
 }
 
 /// Move a pad to a new link, re-deriving its charge state.
-pub fn set_link(fleet: &[EmulatedPad], serial: &str, connection: Connection) -> Vec<EmulatedPad> {
+pub fn set_link(
+    fleet: &[EmulatedPad],
+    serial: &Serial,
+    connection: Connection,
+) -> Vec<EmulatedPad> {
     update(fleet, serial, |p| {
         p.status.connection = connection;
         p.status.state = state_for(connection, p.status.percent);
@@ -206,24 +210,24 @@ pub fn live(fleet: &[EmulatedPad]) -> Vec<ControllerStatus> {
 pub enum EmulatorCommand {
     /// Spawn a pad on the lowest free slot, remembered but disconnected.
     AddPad,
-    RemovePad(String),
+    RemovePad(Serial),
     /// Battery-level commit (shell drag preview stays local and debounced;
     /// only the settled value crosses IPC). Re-derives the charge state.
-    PreviewPercent(String, u8),
+    PreviewPercent(Serial, u8),
     /// Move the pad to a link — USB or Bluetooth. The charge state follows:
     /// see [`state_for`].
-    SetConnection(String, Connection),
+    SetConnection(Serial, Connection),
     /// Plug in / unplug — runs the real connect or disconnect path.
-    SetConnected(String, bool),
+    SetConnected(Serial, bool),
     /// Keep the pad across restarts (the popup's remember pin). A pad that is
     /// both unplugged and forgotten is dropped from the list.
-    SetRemembered(String, bool),
+    SetRemembered(Serial, bool),
     /// Seed typical charge/play samples so ETA estimates exist.
-    SeedAnalytics(String),
+    SeedAnalytics(Serial),
     /// Credit active time and walk one step up the charge cycle.
-    StepCharge(String),
+    StepCharge(Serial),
     /// Credit active time and walk one step down the drain cycle.
-    StepDrain(String),
+    StepDrain(Serial),
 }
 
 /// Sync the remembered store with the fleet's remember flags, so
@@ -255,7 +259,7 @@ pub fn sync_remembered_emulated(
             // `toggle_remember` does for real hardware: the pad may still be on
             // screen while connected, but it is no longer remembered, so an
             // unplug leaves nothing behind.
-            changed |= known.forget(pad.serial());
+            changed |= known.forget(pad.serial().as_ref());
         }
     }
     // Pads that left the fleet were pruned, and pruning only ever drops pads
@@ -265,7 +269,7 @@ pub fn sync_remembered_emulated(
         if current.iter().any(|p| p.serial() == pad.serial()) {
             continue;
         }
-        changed |= known.forget(pad.serial());
+        changed |= known.forget(pad.serial().as_ref());
     }
     changed
 }
@@ -313,7 +317,7 @@ mod tests {
     #[test]
     fn new_pads_start_disconnected() {
         let pad = first();
-        assert_eq!(pad.serial(), PRIMARY_SERIAL);
+        assert_eq!(pad.serial().as_ref(), PRIMARY_SERIAL);
         assert!(!pad.connected);
         assert!(pad.remembered, "a pad persists until it is forgotten");
         assert_eq!(pad.status.percent, 50);
@@ -326,9 +330,11 @@ mod tests {
     fn forgetting_an_unplugged_pad_removes_it() {
         let pad = first();
         assert!(!pad.connected);
-        let next = prune(update(std::slice::from_ref(&pad), PRIMARY_SERIAL, |p| {
-            p.remembered = false
-        }));
+        let next = prune(update(
+            std::slice::from_ref(&pad),
+            &Serial::from(PRIMARY_SERIAL),
+            |p| p.remembered = false,
+        ));
         assert!(next.is_empty(), "off and forgotten means gone");
     }
 
@@ -336,30 +342,46 @@ mod tests {
     /// from the other side. This is what makes the pair symmetric.
     #[test]
     fn unplugging_a_forgotten_pad_removes_it() {
-        let plugged = update(std::slice::from_ref(&first()), PRIMARY_SERIAL, |p| {
-            p.connected = true;
-            p.remembered = false;
-        });
+        let plugged = update(
+            std::slice::from_ref(&first()),
+            &Serial::from(PRIMARY_SERIAL),
+            |p| {
+                p.connected = true;
+                p.remembered = false;
+            },
+        );
         assert_eq!(plugged.len(), 1, "forgetting does not drop a live pad");
-        let unplugged = prune(update(&plugged, PRIMARY_SERIAL, |p| p.connected = false));
+        let unplugged = prune(update(&plugged, &Serial::from(PRIMARY_SERIAL), |p| {
+            p.connected = false
+        }));
         assert!(unplugged.is_empty());
     }
 
     #[test]
     fn forgetting_a_live_pad_keeps_it_until_unplugged() {
-        let plugged = update(std::slice::from_ref(&first()), PRIMARY_SERIAL, |p| {
-            p.connected = true;
-        });
+        let plugged = update(
+            std::slice::from_ref(&first()),
+            &Serial::from(PRIMARY_SERIAL),
+            |p| {
+                p.connected = true;
+            },
+        );
         // While plugged in it stays listed, like any connected controller.
         assert_eq!(prune(plugged).len(), 1);
     }
 
     #[test]
     fn unplugping_a_remembered_pad_keeps_it() {
-        let plugged = update(std::slice::from_ref(&first()), PRIMARY_SERIAL, |p| {
-            p.connected = true;
-        });
-        let unplugged = prune(update(&plugged, PRIMARY_SERIAL, |p| p.connected = false));
+        let plugged = update(
+            std::slice::from_ref(&first()),
+            &Serial::from(PRIMARY_SERIAL),
+            |p| {
+                p.connected = true;
+            },
+        );
+        let unplugged = prune(update(&plugged, &Serial::from(PRIMARY_SERIAL), |p| {
+            p.connected = false
+        }));
         assert_eq!(
             unplugged.len(),
             1,
@@ -371,9 +393,11 @@ mod tests {
     #[test]
     fn re_remembering_restores_the_pad() {
         let pad = first();
-        let forgotten = prune(update(std::slice::from_ref(&pad), PRIMARY_SERIAL, |p| {
-            p.remembered = false
-        }));
+        let forgotten = prune(update(
+            std::slice::from_ref(&pad),
+            &Serial::from(PRIMARY_SERIAL),
+            |p| p.remembered = false,
+        ));
         assert!(forgotten.is_empty());
         // Nothing left to re-remember — the pad is gone, so a new one is needed.
         assert!(live(&forgotten).is_empty());
@@ -381,13 +405,17 @@ mod tests {
 
     #[test]
     fn prune_leaves_other_pads_alone() {
-        let a = update(std::slice::from_ref(&first()), PRIMARY_SERIAL, |p| {
-            p.remembered = false;
-        });
+        let a = update(
+            std::slice::from_ref(&first()),
+            &Serial::from(PRIMARY_SERIAL),
+            |p| {
+                p.remembered = false;
+            },
+        );
         let b = new_pad(&a, 70, Connection::Usb);
         let fleet = vec![a[0].clone(), b.clone()];
         let next = prune(fleet);
-        let serials: Vec<&str> = next.iter().map(|p| p.serial()).collect();
+        let serials: Vec<&str> = next.iter().map(|p| p.serial().as_ref()).collect();
         assert_eq!(serials, vec!["emu-2"], "only the off+forgotten pad goes");
     }
 
@@ -395,18 +423,18 @@ mod tests {
     fn new_pad_uses_lowest_free_slot_and_reuses_holes() {
         let a = first();
         let b = new_pad(std::slice::from_ref(&a), 80, Connection::Bluetooth);
-        assert_eq!(b.serial(), "emu-2");
+        assert_eq!(b.serial().as_ref(), "emu-2");
 
         let without_a = vec![b.clone()];
         let reused = new_pad(&without_a, 10, Connection::Bluetooth);
-        assert_eq!(reused.serial(), PRIMARY_SERIAL);
+        assert_eq!(reused.serial().as_ref(), PRIMARY_SERIAL);
     }
 
     #[test]
     fn live_publishes_only_connected_pads() {
         let a = first();
         let b = new_pad(std::slice::from_ref(&a), 80, Connection::Usb);
-        let fleet = update(&[a, b], "emu-1", |p| p.connected = true);
+        let fleet = update(&[a, b], &Serial::from("emu-1"), |p| p.connected = true);
         let live_pads = live(&fleet);
         assert_eq!(live_pads.len(), 1);
         assert_eq!(live_pads[0].serial.as_ref(), PRIMARY_SERIAL);
@@ -430,7 +458,7 @@ mod tests {
     #[test]
     fn update_edits_the_named_pad_only() {
         let fleet = [first(), new_pad(&[first()], 80, Connection::Usb)];
-        let next = update(&fleet, "emu-2", |p| {
+        let next = update(&fleet, &Serial::from("emu-2"), |p| {
             p.status.percent = 33;
             p.status.state = PowerState::Complete;
             p.status.connection = Connection::Bluetooth;
@@ -442,7 +470,7 @@ mod tests {
         assert_eq!(next[1].status.connection, Connection::Bluetooth);
         assert!(next[1].connected);
         // Unknown serial is a no-op.
-        let untouched = update(&fleet, "nope", |p| p.connected = true);
+        let untouched = update(&fleet, &Serial::from("nope"), |p| p.connected = true);
         assert_eq!(untouched.len(), fleet.len());
         assert!(untouched.iter().all(|p| !p.connected));
     }
@@ -504,14 +532,18 @@ mod tests {
         assert_eq!(pad.status.state, PowerState::Charging);
 
         // Dragging a USB pad to the top means it is done charging.
-        let full = set_percent(std::slice::from_ref(&pad), PRIMARY_SERIAL, 100);
+        let full = set_percent(
+            std::slice::from_ref(&pad),
+            &Serial::from(PRIMARY_SERIAL),
+            100,
+        );
         assert_eq!(full[0].status.state, PowerState::Complete);
         // Dropping back below the top puts it on charge again.
-        let back = set_percent(&full, PRIMARY_SERIAL, 95);
+        let back = set_percent(&full, &Serial::from(PRIMARY_SERIAL), 95);
         assert_eq!(back[0].status.state, PowerState::Charging);
         // A Bluetooth pad is discharging either way.
-        let bt = set_link(&back, PRIMARY_SERIAL, Connection::Bluetooth);
-        let bt = set_percent(&bt, PRIMARY_SERIAL, 100);
+        let bt = set_link(&back, &Serial::from(PRIMARY_SERIAL), Connection::Bluetooth);
+        let bt = set_percent(&bt, &Serial::from(PRIMARY_SERIAL), 100);
         assert_eq!(bt[0].status.state, PowerState::Discharging);
     }
 
@@ -520,13 +552,17 @@ mod tests {
         let pad = new_pad(&[], 60, Connection::Bluetooth);
         assert_eq!(pad.status.state, PowerState::Discharging);
 
-        let plugged = set_link(std::slice::from_ref(&pad), PRIMARY_SERIAL, Connection::Usb);
+        let plugged = set_link(
+            std::slice::from_ref(&pad),
+            &Serial::from(PRIMARY_SERIAL),
+            Connection::Usb,
+        );
         assert_eq!(plugged[0].status.state, PowerState::Charging);
         // Level is untouched; only the link and what follows from it move.
         assert_eq!(plugged[0].status.percent, 60);
 
-        let full = set_percent(&plugged, PRIMARY_SERIAL, 100);
-        let unplugged = set_link(&full, PRIMARY_SERIAL, Connection::Bluetooth);
+        let full = set_percent(&plugged, &Serial::from(PRIMARY_SERIAL), 100);
+        let unplugged = set_link(&full, &Serial::from(PRIMARY_SERIAL), Connection::Bluetooth);
         assert_eq!(unplugged[0].status.state, PowerState::Discharging);
         assert_eq!(unplugged[0].status.percent, 100);
     }
@@ -537,8 +573,8 @@ mod tests {
         // live fleet; it must come back in the tab, and must not come back
         // plugged in (that would fire a connect toast at boot).
         let remembered = [
-            ("emu-1".to_string(), 40, Connection::Bluetooth),
-            ("emu-2".to_string(), 90, Connection::Usb),
+            (Serial::from("emu-1"), 40, Connection::Bluetooth),
+            (Serial::from("emu-2"), 90, Connection::Usb),
         ];
         let fleet = rehydrate(&remembered);
         assert_eq!(fleet.len(), 2);
@@ -561,12 +597,12 @@ mod tests {
     fn rehydrate_ignores_real_hardware_and_orders_by_slot() {
         // Real hardware belongs to HID, not the emulator fleet.
         let remembered = [
-            ("emu-10".to_string(), 50, Connection::Bluetooth),
-            ("REAL-abc".to_string(), 50, Connection::Usb),
-            ("emu-2".to_string(), 50, Connection::Bluetooth),
+            (Serial::from("emu-10"), 50, Connection::Bluetooth),
+            (Serial::from("REAL-abc"), 50, Connection::Usb),
+            (Serial::from("emu-2"), 50, Connection::Bluetooth),
         ];
         let fleet = rehydrate(&remembered);
-        let serials: Vec<&str> = fleet.iter().map(|p| p.serial()).collect();
+        let serials: Vec<&str> = fleet.iter().map(|p| p.serial().as_ref()).collect();
         assert_eq!(
             serials,
             vec!["emu-2", "emu-10"],
@@ -575,7 +611,11 @@ mod tests {
 
         // The rebuilt slots must not collide with what new_pad hands out.
         let next = new_pad(&fleet, 50, Connection::Bluetooth);
-        assert_eq!(next.serial(), "emu-1", "slot 1 is the first free one");
+        assert_eq!(
+            next.serial().as_ref(),
+            "emu-1",
+            "slot 1 is the first free one"
+        );
     }
 
     #[test]

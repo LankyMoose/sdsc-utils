@@ -48,7 +48,7 @@ pub enum SessionEffect {
     /// Update tray icon / tooltip from the live controller count.
     SetTray { connected: usize },
     /// Replace hid-worker low-battery pulse targets.
-    SetLowBatteryTargets { targets: Vec<(String, u8)> },
+    SetLowBatteryTargets { targets: Vec<(Serial, u8)> },
     /// Enqueue overlay notification events.
     QueueNotifications {
         events: Vec<NotifyEvent>,
@@ -90,7 +90,7 @@ pub struct DeviceSession {
     pub analytics: AnalyticsStore,
     pub controllers: Vec<ControllerStatus>,
     /// Controllers currently in the critical low-battery bucket (serial, percent).
-    pub low_battery: Vec<(String, u8)>,
+    pub low_battery: Vec<(Serial, u8)>,
     start_connect_cooldown_until: Option<Instant>,
     pub(crate) skip_next_connect_cooldown: bool,
     controllers_nonempty_since: Option<Instant>,
@@ -335,12 +335,12 @@ impl DeviceSession {
     }
 
     fn sync_low_battery(&mut self, lightbar_enabled: bool, effects: &mut Vec<SessionEffect>) {
-        let list: Vec<(String, u8)> = if lightbar_enabled {
+        let list: Vec<(Serial, u8)> = if lightbar_enabled {
             let threshold = self.prefs.low_battery_percent;
             self.controllers
                 .iter()
                 .filter(|c| c.is_low_battery(threshold) && !is_emulated_serial(c.serial.as_ref()))
-                .map(|c| (c.serial.to_string(), c.percent))
+                .map(|c| (c.serial.clone(), c.percent))
                 .collect()
         } else {
             Vec::new()

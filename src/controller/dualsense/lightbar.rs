@@ -2,9 +2,10 @@
 
 use crate::controller::driver::LightbarBackend;
 use crate::controller::dualsense::identity::{
-    self as dualsense, HidIoLock, is_dualsense_device, is_dualsense_gamepad, normalize_identity,
+    self as dualsense, HidIoLock, is_dualsense_device, is_dualsense_gamepad,
     resolve_device_identity,
 };
+use crate::controller::model::Serial;
 use crate::domain::color::Rgb;
 use crate::domain::protocol::{CALIBRATION_FEATURE_REPORT, CALIBRATION_FEATURE_SIZE};
 use crate::platform::app_log;
@@ -124,8 +125,8 @@ struct SteamClaimCache {
 /// app root for the presence-empty fast path. Single worker today, so
 /// per-store sequence matches the old global behavior.
 pub struct ClaimStore {
-    claimed: Mutex<HashSet<String>>,
-    applied: Mutex<HashMap<String, (Rgb, Instant)>>,
+    claimed: Mutex<HashSet<Serial>>,
+    applied: Mutex<HashMap<Serial, (Rgb, Instant)>>,
     last_steam: Mutex<Option<bool>>,
     steam_cache: Mutex<SteamClaimCache>,
     automatic: AtomicBool,
@@ -207,9 +208,9 @@ impl ClaimStore {
 
     /// Drop claims for pads that are no longer present.
     pub fn sync(&self, active_serials: impl IntoIterator<Item = impl AsRef<str>>) {
-        let active: HashSet<String> = active_serials
+        let active: HashSet<Serial> = active_serials
             .into_iter()
-            .map(|s| normalize_identity(s.as_ref()))
+            .map(|s| Serial::normalize(s.as_ref()))
             .collect();
         if let Ok(mut claimed) = self.claimed.lock() {
             claimed.retain(|s| active.contains(s));
@@ -223,7 +224,7 @@ impl ClaimStore {
     /// Pulse orange/restore writes must not record: orange is not canonical.
     pub fn note_applied(&self, serial: &str, color: Rgb) {
         if let Ok(mut applied) = self.applied.lock() {
-            applied.insert(normalize_identity(serial), (color, Instant::now()));
+            applied.insert(Serial::normalize(serial), (color, Instant::now()));
         }
     }
 
@@ -232,7 +233,7 @@ impl ClaimStore {
         let record = self
             .applied
             .lock()
-            .map(|guard| guard.get(&normalize_identity(serial)).copied())
+            .map(|guard| guard.get(&Serial::normalize(serial)).copied())
             .unwrap_or(None);
         reassert_due_at(record, color, Instant::now())
     }
@@ -265,7 +266,7 @@ impl ClaimStore {
 
     pub(crate) fn forget_one(&self, serial: &str) {
         if let Ok(mut claimed) = self.claimed.lock() {
-            claimed.remove(&normalize_identity(serial));
+            claimed.remove(&Serial::normalize(serial));
         }
     }
 
@@ -280,7 +281,7 @@ impl ClaimStore {
         let Ok(mut claimed) = self.claimed.lock() else {
             return true;
         };
-        claimed.insert(normalize_identity(serial))
+        claimed.insert(Serial::normalize(serial))
     }
 
     /// Drop the claim for `serial` so the next apply runs `LIGHT_OUT` then RGB.
@@ -365,7 +366,7 @@ fn try_apply_by_serial_timed(
 ) -> (AppResult<()>, HidPhaseTiming) {
     let mut timing = HidPhaseTiming::default();
     let enum_started = Instant::now();
-    let target = normalize_identity(serial);
+    let target = Serial::normalize(serial);
 
     // Prefer USB gamepad, then BT gamepad, then any other DualSense collection for
     // the same serial (output report 0x31 is not always accepted on the Gamepad
@@ -399,7 +400,7 @@ fn try_apply_by_serial_timed(
             }
         };
         let identity = resolve_device_identity(info, &device);
-        if identity != target {
+        if Serial::normalize(identity.as_str()) != target {
             continue;
         }
         let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
@@ -428,14 +429,14 @@ fn try_apply_by_serial_timed(
     let mut last_err: Option<AppError> = None;
     let mut any_ok = false;
     // One claim decision for the serial; later interfaces only send RGB.
-    let mut claim = claims.take_claim(&target);
+    let mut claim = claims.take_claim(target.as_ref());
     for (device, is_bluetooth, _) in candidates {
         if is_bluetooth {
             prepare_bt_output_mode(&device);
         }
         match apply_on_open_device_inner(
             &device,
-            &target,
+            target.as_ref(),
             color,
             is_bluetooth,
             "lightbar",
@@ -449,8 +450,8 @@ fn try_apply_by_serial_timed(
             }
             Err(err) => {
                 if claim {
-                    claims.forget_one(&target);
-                    claim = claims.take_claim(&target);
+                    claims.forget_one(target.as_ref());
+                    claim = claims.take_claim(target.as_ref());
                 }
                 last_err = Some(err);
             }
@@ -479,13 +480,13 @@ fn apply_on_open_device_inner(
     claim: bool,
     claims: &ClaimStore,
 ) -> AppResult<()> {
-    let target = normalize_identity(serial);
+    let target = Serial::normalize(serial);
     match set_lightbar_on_device(
         device,
         color,
         is_bluetooth,
         claim,
-        &target,
+        target.as_ref(),
         caller,
         retry,
         claims,
