@@ -18,7 +18,7 @@
 //!
 //! Timing lines (grep `hid-worker:`) record enumerate / open / io / total.
 
-use crate::controller::driver;
+use crate::controller::driver::{self, DRIVERS, RumbleBackend};
 use crate::controller::dualsense::battery;
 use crate::controller::dualsense::identity::{
     hid_serial, is_dualsense_device, is_dualsense_gamepad, is_storable_serial, normalize_identity,
@@ -28,13 +28,12 @@ use crate::controller::dualsense::lightbar::{
     self, ClaimStore, HidPhaseTiming, IDENTIFY_FLASH_COUNT, IDENTIFY_FLASH_MS, LOW_BATTERY_ORANGE,
     LOW_BATTERY_PULSE_GAP_MS, LOW_BATTERY_PULSE_ON_MS,
 };
-use crate::controller::dualsense::rumble;
 use crate::controller::hid::launch_paths::LaunchPaths;
 use crate::controller::hid::policy::Policy;
 use crate::controller::hid::poll::{
     self, POLL_LIVE_BATTERY_STALE, PRESENCE_INTERVAL, PRESENCE_INTERVAL_EMPTY,
 };
-use crate::controller::model::ControllerStatus;
+use crate::controller::model::{ControllerKind, ControllerStatus};
 use crate::domain::color::{Rgb, SpectrumService};
 use crate::domain::pad::{
     self as start_input, InputHub, NavReading, ShortSampleOutcome, SnapshotMeta, SnapshotReason,
@@ -169,6 +168,8 @@ struct OpenDevice {
     device: HidDevice,
     is_bluetooth: bool,
     product: String,
+    /// Driver family that claimed the HID node (dispatches battery/rumble).
+    kind: ControllerKind,
     /// Consecutive [`ShortSampleOutcome::Timeout`] while this pad is sampled.
     /// Stored on the open handle so Identify-only sampling does not age other pads.
     silence_timeouts: u32,
@@ -180,11 +181,17 @@ fn advance_silence_streak(prev: u32) -> (u32, bool) {
     (next, next >= LIVE_SILENCE_TIMEOUTS)
 }
 
-fn open_device(device: HidDevice, is_bluetooth: bool, product: String) -> OpenDevice {
+fn open_device(
+    device: HidDevice,
+    is_bluetooth: bool,
+    product: String,
+    kind: ControllerKind,
+) -> OpenDevice {
     OpenDevice {
         device,
         is_bluetooth,
         product,
+        kind,
         silence_timeouts: 0,
     }
 }
@@ -212,6 +219,8 @@ struct DeviceCache {
 struct LivePadStatus {
     product: String,
     reading: battery::BatteryReading,
+    /// Driver family that produced the reading (dispatches status/rumble/power-off).
+    kind: ControllerKind,
     /// When the reading was last confirmed (sample or poll read). Drives the
     /// incremental poll: fresh entries skip the blocking battery read.
     updated_at: Instant,
@@ -365,6 +374,9 @@ impl DeviceCache {
             }
             let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
             let is_usb = matches!(info.bus_type(), BusType::Usb);
+            let kind = driver::find_for_info(info)
+                .map(|d| d.kind())
+                .unwrap_or_default();
             let replace = match &best {
                 None => true,
                 Some((_, prev_usb)) => is_usb && !*prev_usb,
@@ -375,6 +387,7 @@ impl DeviceCache {
                         device,
                         is_bluetooth,
                         product_name(info.product_id()).to_string(),
+                        kind,
                     ),
                     is_usb,
                 ));
@@ -513,6 +526,9 @@ impl DeviceCache {
             }
             let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
             let is_usb = matches!(info.bus_type(), BusType::Usb);
+            let kind = driver::find_for_info(info)
+                .map(|d| d.kind())
+                .unwrap_or_default();
             let replace = match best.get(&identity) {
                 None => true,
                 Some((_, prev_usb)) => is_usb && !*prev_usb,
@@ -525,6 +541,7 @@ impl DeviceCache {
                             device,
                             is_bluetooth,
                             product_name(info.product_id()).to_string(),
+                            kind,
                         ),
                         is_usb,
                     ),
@@ -704,11 +721,15 @@ fn open_rumble_device(api: &HidApi, target: &str) -> Option<OpenDevice> {
             if is_bluetooth {
                 lightbar::prepare_bt_output_mode(&device);
             }
+            let kind = driver::find_for_info(info)
+                .map(|d| d.kind())
+                .unwrap_or_default();
             best = Some((
                 open_device(
                     device,
                     is_bluetooth,
                     product_name(info.product_id()).to_string(),
+                    kind,
                 ),
                 rank,
             ));
@@ -956,15 +977,10 @@ impl HidWorkerHandle {
         };
         let mut out: Vec<ControllerStatus> = guard
             .iter()
-            .map(|(serial, pad)| {
-                battery::dualsense_status(
-                    0,
-                    pad.product.clone(),
-                    pad.reading.connection,
-                    serial.clone(),
-                    pad.reading.percent,
-                    pad.reading.state,
-                )
+            .filter_map(|(serial, pad)| {
+                driver::find_for_kind(pad.kind).map(|d| {
+                    poll::status_from_reading(d, &pad.product, &pad.reading, serial.clone())
+                })
             })
             .collect();
         out.sort_by(|a, b| a.serial.cmp(&b.serial));
@@ -1073,12 +1089,21 @@ fn write_rgb_exclusive(
     color: Rgb,
 ) -> (AppResult<()>, HidPhaseTiming) {
     cache.drop_serial(serial);
-    let (result, mut timing) =
-        lightbar::apply_lightbar_rgb_timed(&cache.api, serial, color, claims);
+    // Dispatch through the registry: the first family offering a lightbar
+    // backend owns the write (DualSense today). A future LED family threads
+    // its kind through `HidCmd`; until then the single-backend registry is
+    // exact. Missing serials keep the old "controller not found" shape.
+    let Some(backend) = DRIVERS.iter().copied().find_map(|d| d.lightbar()) else {
+        return (
+            Err(AppError::Hid(format!("controller {serial} not found"))),
+            HidPhaseTiming::default(),
+        );
+    };
+    let (result, mut timing) = backend.apply(&cache.api, serial, color, claims);
     if result.is_err() {
         // Stale device list — refresh once and retry.
         if cache.refresh_device_list().is_ok() {
-            let (retry, t2) = lightbar::apply_lightbar_rgb_timed(&cache.api, serial, color, claims);
+            let (retry, t2) = backend.apply(&cache.api, serial, color, claims);
             timing.add_assign(t2);
             return (retry, timing);
         }
@@ -1098,9 +1123,9 @@ fn sample_one(
         return SampleOneResult::HardFail;
     }
     let key = normalize_identity(serial);
-    let (is_bluetooth, product) = {
+    let (is_bluetooth, product, kind) = {
         let open = cache.devices.get(&key).expect("ensure inserted");
-        (open.is_bluetooth, open.product.clone())
+        (open.is_bluetooth, open.product.clone(), open.kind)
     };
     let outcome = {
         let open = cache.devices.get(&key).expect("ensure inserted");
@@ -1119,7 +1144,7 @@ fn sample_one(
                 open.silence_timeouts = 0;
             }
             if let Some(reading) = battery {
-                remember_live_pad(live_pads, serial, product, reading);
+                remember_live_pad(live_pads, serial, product, reading, kind);
             }
             SampleOneResult::Ok(start_input::hid_nav_reading(serial, sample))
         }
@@ -1158,6 +1183,7 @@ fn remember_live_pad(
     serial: &str,
     product: String,
     reading: battery::BatteryReading,
+    kind: ControllerKind,
 ) {
     let key = normalize_identity(serial);
     if let Ok(mut guard) = live_pads.lock() {
@@ -1166,6 +1192,7 @@ fn remember_live_pad(
             LivePadStatus {
                 product,
                 reading,
+                kind,
                 updated_at: Instant::now(),
             },
         );
@@ -1537,9 +1564,19 @@ fn abort_identify(
     }
 }
 
+/// Rumble backend for a known pad kind (`None` = family lacks motors).
+///
+/// Keys off the pad's kind, never the family name: an all-false-capability
+/// pad resolves to `None` here and no wire write runs.
+fn rumble_backend_for(kind: ControllerKind) -> Option<&'static dyn RumbleBackend> {
+    driver::find_for_kind(kind).and_then(|d| d.rumble())
+}
+
 fn stop_all_rumble(rumble: &mut RumbleCache, active: &mut Vec<ActiveRumble>, claims: &ClaimStore) {
     for (serial, open) in rumble.devices.iter() {
-        let _ = rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, serial, claims);
+        if let Some(backend) = rumble_backend_for(open.kind) {
+            let _ = backend.stop_rumble(&open.device, open.is_bluetooth, serial, claims);
+        }
     }
     active.clear();
     rumble.drop_all();
@@ -1554,8 +1591,10 @@ fn stop_rumble_for_serial(
 ) {
     let target = normalize_identity(serial);
     active.retain(|e| normalize_identity(&e.serial) != target);
-    if let Some(open) = rumble.devices.get(&target) {
-        let _ = rumble::stop_rumble_on_device(&open.device, open.is_bluetooth, &target, claims);
+    if let Some(open) = rumble.devices.get(&target)
+        && let Some(backend) = rumble_backend_for(open.kind)
+    {
+        let _ = backend.stop_rumble(&open.device, open.is_bluetooth, &target, claims);
     }
     rumble.drop_serial(&target);
 }
@@ -1583,6 +1622,21 @@ fn write_rumble_pulse(
 ) -> AppResult<()> {
     let target = normalize_identity(serial);
 
+    // Dispatch through the pad's driver: a family without a rumble backend
+    // fails here before any HID open. Unknown serials fall back to the first
+    // rumble-capable driver (DualSense today), preserving the old behavior of
+    // attempting the write regardless.
+    let kind = cache.devices.get(&target).map(|open| open.kind);
+    let driver = kind
+        .and_then(driver::find_for_kind)
+        .or_else(|| DRIVERS.iter().copied().find(|d| d.capabilities().rumble));
+    let Some(driver) = driver else {
+        return Err(AppError::Hid(format!("rumble: no driver for {target}")));
+    };
+    let Some(backend) = driver.rumble() else {
+        return Err(AppError::Hid(format!("rumble: unsupported for {target}")));
+    };
+
     // Prefer long-lived exclusive rumble handle. On write failure, drop and re-probe.
     for attempt in 0..2u8 {
         if attempt > 0 {
@@ -1594,14 +1648,7 @@ fn write_rumble_pulse(
         match rumble.ensure(&cache.api, &target) {
             Ok(open) => {
                 let is_bt = open.is_bluetooth;
-                match rumble::set_rumble_on_device(
-                    &open.device,
-                    is_bt,
-                    &target,
-                    right,
-                    left,
-                    claims,
-                ) {
+                match backend.set_rumble(&open.device, is_bt, &target, right, left, claims) {
                     Ok(()) => {
                         crate::controller::hid::diag::diag_info(format!(
                             "hid-diag: rumble ok serial={target} r={right} l={left} bt={}",
@@ -1638,15 +1685,16 @@ fn write_rumble_pulse(
             );
             rumble.fallback_warned = true;
         }
-        return rumble::set_rumble_on_device(
-            &open.device,
-            open.is_bluetooth,
-            &target,
-            right,
-            left,
-            claims,
-        )
-        .map_err(AppError::from);
+        return backend
+            .set_rumble(
+                &open.device,
+                open.is_bluetooth,
+                &target,
+                right,
+                left,
+                claims,
+            )
+            .map_err(AppError::from);
     }
     Err(AppError::Hid(format!("rumble: no handle for {target}")))
 }
@@ -1663,13 +1711,10 @@ fn expire_rumble(
             still.push(entry);
             continue;
         }
-        if let Some(open) = rumble.devices.get(&normalize_identity(&entry.serial)) {
-            let _ = rumble::stop_rumble_on_device(
-                &open.device,
-                open.is_bluetooth,
-                &entry.serial,
-                claims,
-            );
+        if let Some(open) = rumble.devices.get(&normalize_identity(&entry.serial))
+            && let Some(backend) = rumble_backend_for(open.kind)
+        {
+            let _ = backend.stop_rumble(&open.device, open.is_bluetooth, &entry.serial, claims);
         }
     }
     *active = still;
@@ -1693,6 +1738,11 @@ fn execute_power_off(
     if session.as_ref().is_some_and(|s| s.serial == serial) {
         abort_identify(session, cache, identifying);
     }
+    // Capture the pad's family before `forget_live_pad` clears it below.
+    let kind = live_pads
+        .lock()
+        .map(|guard| guard.get(&normalize_identity(serial)).map(|pad| pad.kind))
+        .unwrap_or(None);
     stop_rumble_for_serial(rumble, active_rumble, serial, claims);
     // Exclusive feature-report open needs this pad's input handle released only.
     cache.drop_serial(serial);
@@ -1722,9 +1772,22 @@ fn execute_power_off(
     );
     log_cmd_begin("PowerOff", hub);
     let started = Instant::now();
+    // Dispatch through the pad's driver: a family without power-off support
+    // skips the feature report. Unknown serials fall back to the first
+    // power-capable driver (DualSense today), preserving the old behavior of
+    // attempting the write regardless.
     let (result, timing) = {
         let _ = cache.refresh_device_list();
-        battery::power_off_bluetooth_timed(&cache.api, serial)
+        let driver = kind
+            .and_then(driver::find_for_kind)
+            .or_else(|| DRIVERS.iter().copied().find(|d| d.capabilities().power_off));
+        match driver {
+            Some(driver) => driver.power_off(&cache.api, serial),
+            None => (
+                Err(AppError::Hid(format!("power-off: no driver for {serial}"))),
+                HidPhaseTiming::default(),
+            ),
+        }
     };
     match result {
         Ok(()) => app_log::info(format!("power-off sent for {serial}")),
@@ -1863,13 +1926,11 @@ fn handle_cmd(
                             serial: target,
                             stop_at: Instant::now() + Duration::from_millis(duration_ms),
                         });
-                    } else if let Some(open) = rumble.devices.get(&target) {
-                        let _ = rumble::stop_rumble_on_device(
-                            &open.device,
-                            open.is_bluetooth,
-                            &target,
-                            claims,
-                        );
+                    } else if let Some(open) = rumble.devices.get(&target)
+                        && let Some(backend) = rumble_backend_for(open.kind)
+                    {
+                        let _ =
+                            backend.stop_rumble(&open.device, open.is_bluetooth, &target, claims);
                     }
                 }
                 Err(err) => {
@@ -1984,42 +2045,38 @@ fn poll_incremental(
         if is_storable_serial(&hint) && cache.devices.contains_key(&key) {
             if let Some((product, reading, at)) = live_snapshot.get(&key)
                 && now.saturating_duration_since(*at) < POLL_LIVE_BATTERY_STALE
+                && let Some(driver) = cache
+                    .devices
+                    .get(&key)
+                    .and_then(|open| driver::find_for_kind(open.kind))
             {
                 if let Some(serial) = cache.launch_paths.take_serial_for_path(&path, &key) {
                     launch_quiet.push(serial);
                 }
-                statuses.push(battery::dualsense_status(
-                    0,
-                    product.clone(),
-                    reading.connection,
-                    key.clone(),
-                    reading.percent,
-                    reading.state,
-                ));
+                statuses.push(poll::status_from_reading(driver, product, reading, key));
                 continue;
             }
             // Stale: fail-fast read on the cached handle (no extra open).
-            let product = cache.devices.get(&key).map(|open| open.product.clone());
             let io_started = Instant::now();
-            let outcome = cache
-                .devices
-                .get(&key)
-                .map(|open| battery::read_battery_fast(&open.device));
+            let stale = cache.devices.get(&key).and_then(|open| {
+                driver::find_for_kind(open.kind).map(|d| {
+                    (
+                        open.product.clone(),
+                        open.kind,
+                        d.read_battery_fast(&open.device),
+                    )
+                })
+            });
             timing.io_ms += io_started.elapsed().as_millis();
-            match (product, outcome) {
-                (Some(product), Some(Ok(reading))) => {
+            match stale {
+                Some((product, kind, Ok(reading))) => {
                     if let Some(serial) = cache.launch_paths.take_serial_for_path(&path, &key) {
                         launch_quiet.push(serial);
                     }
-                    remember_live_pad(live_pads, &key, product.clone(), reading.clone());
-                    statuses.push(battery::dualsense_status(
-                        0,
-                        product,
-                        reading.connection,
-                        key,
-                        reading.percent,
-                        reading.state,
-                    ));
+                    remember_live_pad(live_pads, &key, product.clone(), reading.clone(), kind);
+                    if let Some(driver) = driver::find_for_kind(kind) {
+                        statuses.push(poll::status_from_reading(driver, &product, &reading, key));
+                    }
                     continue;
                 }
                 _ => {
@@ -2033,13 +2090,20 @@ fn poll_incremental(
         // Full probe: new serial, unknown hint, or re-probe after a drop.
         // Re-resolve the device by path (list may have shifted since enumerate).
         let open_started = Instant::now();
-        let probed: Option<(String, String, battery::BatteryReading, u128)> = (|| {
+        let probed: Option<(
+            String,
+            String,
+            battery::BatteryReading,
+            u128,
+            ControllerKind,
+        )> = (|| {
             let api = &cache.api;
             let info = api
                 .device_list()
                 .filter(|d| driver::is_gamepad(d))
                 .find(|d| d.path().to_string_lossy().into_owned() == path)?;
-            let product = product_name(info.product_id()).to_string();
+            let driver = driver::find_for_info(info)?;
+            let product = driver.product_name(info.product_id()).to_string();
             let hid = hid_serial(info);
             let device = match info.open_device(api) {
                 Ok(d) => {
@@ -2068,11 +2132,11 @@ fn poll_incremental(
             };
             let serial = resolve_device_identity(info, &device);
             let io_started = Instant::now();
-            match battery::read_battery(&device) {
+            match driver.read_battery(&device) {
                 Ok(reading) => {
                     let io_ms = io_started.elapsed().as_millis();
                     drop(device);
-                    Some((serial, product, reading, io_ms))
+                    Some((serial, product, reading, io_ms, driver.kind()))
                 }
                 Err(err) => {
                     let io_ms = io_started.elapsed().as_millis();
@@ -2093,21 +2157,19 @@ fn poll_incremental(
             }
         })();
         timing.open_ms += open_started.elapsed().as_millis();
-        let Some((serial, product, reading, io_ms)) = probed else {
+        let Some((serial, product, reading, io_ms, kind)) = probed else {
             continue;
         };
         timing.io_ms += io_ms;
         if let Some(serial) = cache.launch_paths.take_serial_for_path(&path, &serial) {
             launch_quiet.push(serial);
         }
-        remember_live_pad(live_pads, &serial, product.clone(), reading.clone());
-        statuses.push(battery::dualsense_status(
-            0,
-            product,
-            reading.connection,
-            serial,
-            reading.percent,
-            reading.state,
+        remember_live_pad(live_pads, &serial, product.clone(), reading.clone(), kind);
+        let Some(driver) = driver::find_for_kind(kind) else {
+            continue;
+        };
+        statuses.push(poll::status_from_reading(
+            driver, &product, &reading, serial,
         ));
     }
 
@@ -2124,6 +2186,7 @@ fn poll_incremental(
         previously,
         statuses.iter(),
         &mut timing,
+        DRIVERS,
     );
     (Ok(statuses), timing)
 }

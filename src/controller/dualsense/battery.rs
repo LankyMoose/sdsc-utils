@@ -3,6 +3,7 @@
 use crate::controller::dualsense::identity::{
     is_dualsense_device, is_storable_serial, normalize_identity, resolve_device_identity,
 };
+use crate::controller::model::Capabilities;
 use crate::controller::model::ControllerKind;
 use crate::domain::protocol::{
     BT_CONTROL_FEATURE_REPORT, BT_CONTROL_FEATURE_SIZE, BT_CONTROL_FEATURE_SIZE_ALT,
@@ -16,6 +17,24 @@ use std::thread;
 use std::time::Duration;
 
 pub use crate::controller::model::{Connection, ControllerStatus, PowerState, Serial};
+
+/// DualSense battery-state nibble decoding (upper nibble of the power byte).
+///
+/// Moved out of the shared model: only the DualSense impl speaks nibbles —
+/// the shared model takes a plain [`PowerState`], never a nibble.
+impl PowerState {
+    pub fn from_nibble(value: u8) -> Self {
+        match value {
+            0x00 => Self::Discharging,
+            0x01 => Self::Charging,
+            0x02 => Self::Complete,
+            0x0A => Self::AbnormalVoltage,
+            0x0B => Self::AbnormalTemperature,
+            0x0F => Self::ChargingError,
+            _ => Self::Unknown,
+        }
+    }
+}
 const USB_POWER_OFFSET: usize = 53;
 const BT_POWER_OFFSET: usize = 54;
 
@@ -82,8 +101,7 @@ pub fn dualsense_status(
         serial: serial.into(),
         percent,
         state,
-        supports_lightbar: true,
-        supports_power_off: true,
+        capabilities: Capabilities::FULL,
     }
 }
 

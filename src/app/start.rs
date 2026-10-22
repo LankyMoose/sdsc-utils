@@ -2330,7 +2330,7 @@ impl App {
                     },
                     percent: c.percent,
                     low: c.is_low_battery(self.session.prefs.low_battery_percent),
-                    bluetooth: c.connection.is_bluetooth() && c.supports_power_off,
+                    bluetooth: c.connection.is_bluetooth() && c.capabilities.power_off,
                     connected: true,
                     eta,
                 }

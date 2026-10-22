@@ -4,6 +4,7 @@
 //! through lightbar's exclusive open-write-close path, and never requests the
 //! Bluetooth calibration feature report.
 
+use crate::controller::driver::RumbleBackend;
 use crate::controller::dualsense::identity::normalize_identity;
 use crate::controller::dualsense::lightbar::{self, ClaimStore};
 use hidapi::HidDevice;
@@ -61,6 +62,28 @@ impl MotorPulse {
         let strength = strength.min(100);
         let scale = |base: u8| -> u8 { ((u16::from(base) * u16::from(strength)) / 100) as u8 };
         (scale(self.right), scale(self.left), self.duration)
+    }
+}
+
+/// [`crate::controller::driver::RumbleBackend`] for DualSense: the registry's
+/// `Some` arm. Thin delegate over [`set_rumble_on_device`] — the
+/// compatible-vibration payload stays DualSense-private in this file.
+pub struct DualSenseRumbleBackend;
+
+/// Shared backend instance behind [`crate::controller::driver::DUALSENSE`].
+pub static DUALSENSE_RUMBLE: DualSenseRumbleBackend = DualSenseRumbleBackend;
+
+impl RumbleBackend for DualSenseRumbleBackend {
+    fn set_rumble(
+        &self,
+        device: &HidDevice,
+        is_bluetooth: bool,
+        serial: &str,
+        right: u8,
+        left: u8,
+        claims: &ClaimStore,
+    ) -> Result<(), hidapi::HidError> {
+        set_rumble_on_device(device, is_bluetooth, serial, right, left, claims)
     }
 }
 
