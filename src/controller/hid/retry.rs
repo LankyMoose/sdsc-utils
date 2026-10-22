@@ -131,4 +131,81 @@ mod tests {
             );
         }
     }
+
+    /// Rumble outlier (`worker::write_rumble_pulse`): `for attempt in 0..2u8`
+    /// retries the exclusive-handle write unconditionally on attempt 0, breaks
+    /// on open failure; gating the `continue` on [`is_transient`] would narrow
+    /// fatal writes 2 -> 1 (timing/behavior change), so it stays unwired.
+    #[test]
+    fn rumble_unconditional_reprobe_would_narrow_if_gated() {
+        fn attempts_gated(write_err: &str) -> u8 {
+            if is_transient(&write_err) { 2 } else { 1 }
+        }
+        const UNCONDITIONAL: u8 = 2;
+        assert_eq!(
+            attempts_gated(
+                "hidapi error: hid_write/WaitForSingleObject: (0x000003E5) Overlapped I/O operation is in progress."
+            ),
+            UNCONDITIONAL
+        );
+        for fatal in [
+            "hidapi error: hid_write failed: device not connected",
+            "hidapi error: open_device: file not found",
+            "rumble: no handle for aabbcc",
+        ] {
+            assert!(!is_transient(&fatal), "must stay fatal: {fatal:?}");
+            assert_eq!(attempts_gated(fatal), 1, "{fatal:?}");
+            assert_ne!(attempts_gated(fatal), UNCONDITIONAL, "{fatal:?}");
+        }
+    }
+
+    /// Power-off outlier (`dualsense::battery::power_off_bluetooth_*`): every
+    /// candidate interface x 2 CRC seeds x 3 report sizes until first `Ok`;
+    /// aborting the sweep on the first fatal [`classify`] would narrow 6 -> 1
+    /// per device (timing/behavior + final `after N attempt(s)` text change),
+    /// so it stays unwired. Sizes/seeds are a variant sweep, not a retry.
+    #[test]
+    fn power_off_matrix_sweep_would_narrow_if_gated() {
+        const SEEDS: usize = 2; // FEATURE_CRC32_SEEDS in battery.rs
+        const SIZES: usize = 3; // BT_CONTROL_FEATURE_SIZE{,_ALT,_PADDED}
+        fn attempts_unconditional(candidates: usize) -> usize {
+            candidates * SEEDS * SIZES
+        }
+        const GATED_FIRST_FATAL: usize = 1;
+        assert_eq!(attempts_unconditional(1), 6);
+        for fatal in [
+            "hidapi error: send_feature_report failed: access denied",
+            "power-off: open failed for \\\\?\\hid#1: hidapi error: open_device: file not found",
+            "power-off feature report failed after 6 attempt(s): hidapi error: nope",
+        ] {
+            assert!(!is_transient(&fatal), "must stay fatal: {fatal:?}");
+            assert_eq!(classify(fatal), ErrorKind::Fatal, "{fatal:?}");
+        }
+        assert_ne!(GATED_FIRST_FATAL, attempts_unconditional(1));
+    }
+
+    /// Open-backoff outlier (`worker::DeviceCache::note_open_result`): counts
+    /// every open failure; counting only transient ones would never suppress
+    /// the Fatal ghost paths backoff exists for (`open_device: file not found`),
+    /// widening opens to every sample. Stays unwired.
+    #[test]
+    fn open_backoff_unconditional_would_widen_if_gated() {
+        assert_eq!(
+            classify("hidapi error: open_device: file not found"),
+            ErrorKind::Fatal
+        );
+        assert!(!is_transient(&"hidapi error: open_device: file not found"));
+        fn counts_gated(err: &str) -> u32 {
+            u32::from(is_transient(&err))
+        }
+        assert_eq!(counts_gated("hidapi error: open_device: file not found"), 0);
+        assert_eq!(
+            crate::controller::hid::policy::Policy::DEFAULT.open_backoff_threshold,
+            3
+        );
+        assert_eq!(
+            crate::controller::hid::policy::Policy::DEFAULT.open_backoff_window,
+            std::time::Duration::from_secs(5)
+        );
+    }
 }
