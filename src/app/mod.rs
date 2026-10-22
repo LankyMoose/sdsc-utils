@@ -26,7 +26,7 @@ use crate::controller::hid::worker::HidWorkerHandle;
 use crate::controller::known::KnownControllers;
 #[cfg(debug_assertions)]
 use crate::controller::model::Connection;
-use crate::controller::model::ControllerStatus;
+use crate::controller::model::{ControllerStatus, Serial};
 use crate::games::GamesCatalog;
 use crate::games::process_match::RunningSession;
 use crate::games::process_match::SeenCache;
@@ -471,7 +471,7 @@ pub struct App {
     gesture_detectors: GestureDetectorBank,
     pad_nav: PadNavBank,
     /// When set, the next start cue may rumble this DualSense serial (pad-originated).
-    haptic_pad_serial: Option<String>,
+    haptic_pad_serial: Option<Serial>,
     /// Keyboard Enter hold for replace-confirm (not folded into pad slots).
     keyboard_cross_hold: CrossHold,
     /// Keyboard Enter held (for hold-to-proceed on replace confirm / Cross press styling).
@@ -581,7 +581,7 @@ pub struct App {
     emulated_pads: Vec<emulate::EmulatedPad>,
     /// Battery levels previewed but not yet published, keyed by serial.
     #[cfg(debug_assertions)]
-    pending_emulator_commits: std::collections::HashMap<String, PendingEmulatorCommit>,
+    pending_emulator_commits: std::collections::HashMap<Serial, PendingEmulatorCommit>,
 }
 
 /// A battery level the slider previewed, waiting out its debounce.
@@ -676,7 +676,7 @@ impl App {
                 .into_iter()
                 .map(|r| {
                     (
-                        r.serial.to_string(),
+                        r.serial.clone(),
                         r.percent,
                         Connection::from_label(&r.connection).unwrap_or(Connection::Bluetooth),
                     )
@@ -1149,7 +1149,7 @@ impl App {
                 &self.popup_state,
                 &self.popup_rows,
                 &self.session.prefs.spectrum,
-                self.start_state.powering_off.as_deref(),
+                self.start_state.powering_off.as_ref(),
             )
             .map(Message::Popup);
         }
@@ -2086,11 +2086,11 @@ impl App {
             return Task::none();
         }
 
-        let previously_connected: Vec<String> = self
+        let previously_connected: Vec<Serial> = self
             .session
             .controllers
             .iter()
-            .map(|c| c.serial.to_string())
+            .map(|c| c.serial.clone())
             .collect();
         let worker = self.hid_worker.clone();
         Task::perform(worker.poll(previously_connected), Message::PollResult)
@@ -2222,13 +2222,13 @@ impl App {
     // Controller actions
     // -----------------------------------------------------------------------
 
-    fn identify(&self, serial: &str) -> bool {
-        if is_emulated_serial(serial) {
+    fn identify(&self, serial: &Serial) -> bool {
+        if is_emulated_serial(serial.as_ref()) {
             app_log::info(format!("identify skipped for emulated controller {serial}"));
             return false;
         }
         // A pad on its way out takes no more commands.
-        if self.start_state.powering_off.as_deref() == Some(serial) {
+        if self.start_state.powering_off.as_ref() == Some(serial) {
             return false;
         }
 
@@ -2236,7 +2236,7 @@ impl App {
             .session
             .controllers
             .iter()
-            .find(|c| c.serial.as_ref() == serial)
+            .find(|c| c.serial == *serial)
         else {
             return false;
         };
@@ -2244,19 +2244,18 @@ impl App {
             return false;
         }
 
-        self.hid_worker
-            .identify(serial.to_string(), controller.percent)
+        self.hid_worker.identify(serial.clone(), controller.percent)
     }
 
-    fn power_off(&mut self, serial: &str) {
-        if is_emulated_serial(serial) {
+    fn power_off(&mut self, serial: &Serial) {
+        if is_emulated_serial(serial.as_ref()) {
             app_log::info(format!(
                 "power-off skipped for emulated controller {serial}"
             ));
             return;
         }
         // Already going away: don't re-send the feature report on repeat holds.
-        if self.start_state.powering_off.as_deref() == Some(serial) {
+        if self.start_state.powering_off.as_ref() == Some(serial) {
             return;
         }
 
@@ -2264,7 +2263,7 @@ impl App {
             .session
             .controllers
             .iter()
-            .find(|c| c.serial.as_ref() == serial)
+            .find(|c| c.serial == *serial)
         else {
             return;
         };
@@ -2277,39 +2276,39 @@ impl App {
         }
 
         // Show "Powering off" immediately (cleared when the pad leaves the list).
-        self.start_state.powering_off = Some(serial.to_string());
+        self.start_state.powering_off = Some(serial.clone());
         // Reconnect after user power-off should open Start again (not ghost-flap cooldown),
         // but only when this was the last pad — a sibling must not look like a fresh 0→1.
         if crate::session::should_skip_connect_cooldown_on_power_off(
             &self.session.controllers,
-            serial,
+            serial.as_ref(),
             self.session.prefs.start_screen_auto_open.includes_usb(),
         ) {
             self.session.mark_skip_connect_cooldown();
         }
-        self.hid_worker.power_off(serial.to_string());
+        self.hid_worker.power_off(serial.clone());
     }
 
-    fn toggle_remember(&mut self, serial: &str) -> Task<Message> {
+    fn toggle_remember(&mut self, serial: &Serial) -> Task<Message> {
         #[cfg(debug_assertions)]
-        if is_emulated_serial(serial) {
+        if is_emulated_serial(serial.as_ref()) {
             // Emulated pads ride the fleet path (`apply_emulator_command`
             // with `SetRemembered`); the popup pin is a no-op here.
             return Task::none();
         }
         #[cfg(not(debug_assertions))]
-        if is_emulated_serial(serial) {
+        if is_emulated_serial(serial.as_ref()) {
             return Task::none();
         }
 
         // The session is the authority; `controllers.json` is written on change.
-        if self.session.known.is_remembered(serial) {
-            self.session.known.forget(serial);
+        if self.session.known.is_remembered(serial.as_ref()) {
+            self.session.known.forget(serial.as_ref());
         } else if let Some(controller) = self
             .session
             .controllers
             .iter()
-            .find(|c| c.serial.as_ref() == serial)
+            .find(|c| c.serial == *serial)
         {
             self.session.known.remember(controller);
         } else {
@@ -2320,18 +2319,22 @@ impl App {
         self.sync_popup_rows_and_fit()
     }
 
-    fn set_nickname(&mut self, serial: &str, nickname: Option<String>) -> Task<Message> {
+    fn set_nickname(&mut self, serial: &Serial, nickname: Option<String>) -> Task<Message> {
         #[cfg(debug_assertions)]
-        if is_emulated_serial(serial) {
+        if is_emulated_serial(serial.as_ref()) {
             // Emulated-pad nicknames ride the fleet path; the direct pin is
             // a no-op here.
             return Task::none();
         }
         #[cfg(not(debug_assertions))]
-        if is_emulated_serial(serial) {
+        if is_emulated_serial(serial.as_ref()) {
             return Task::none();
         }
-        if self.session.known.set_nickname(serial, nickname.clone()) {
+        if self
+            .session
+            .known
+            .set_nickname(serial.as_ref(), nickname.clone())
+        {
             self.session.known.save();
             self.sync_popup_rows_and_fit()
         } else {
@@ -2786,7 +2789,7 @@ mod tests {
 
         // Forget it: flag flips, prune removes it, and both happen before the
         // sync sees the fleet.
-        let edited = emulate::update(&before, "emu-1", |p| p.remembered = false);
+        let edited = emulate::update(&before, &Serial::from("emu-1"), |p| p.remembered = false);
         let after = emulate::prune(edited);
         assert!(
             after.is_empty(),
@@ -2810,19 +2813,19 @@ mod tests {
         let mut known = KnownControllers::default();
         let plugged = emulate::update(
             std::slice::from_ref(&emulate::new_pad(&[], 50, Connection::Bluetooth)),
-            "emu-1",
+            &Serial::from("emu-1"),
             |p| p.connected = true,
         );
         emulate::sync_remembered_emulated(&[], &plugged, &mut known);
 
         // Forget while connected: stays in the fleet, drops from the store.
-        let forgotten = emulate::update(&plugged, "emu-1", |p| p.remembered = false);
+        let forgotten = emulate::update(&plugged, &Serial::from("emu-1"), |p| p.remembered = false);
         assert_eq!(emulate::prune(forgotten.clone()).len(), 1, "live pads stay");
         emulate::sync_remembered_emulated(&plugged, &forgotten, &mut known);
         assert!(!known.is_remembered("emu-1"));
 
         // Now unplug it: prune removes it, and it must stay out of the store.
-        let unplugged = emulate::prune(emulate::update(&forgotten, "emu-1", |p| {
+        let unplugged = emulate::prune(emulate::update(&forgotten, &Serial::from("emu-1"), |p| {
             p.connected = false;
         }));
         assert!(unplugged.is_empty());
@@ -2837,10 +2840,10 @@ mod tests {
         let mut known = KnownControllers::default();
         let plugged = emulate::update(
             std::slice::from_ref(&emulate::new_pad(&[], 50, Connection::Bluetooth)),
-            "emu-1",
+            &Serial::from("emu-1"),
             |p| p.connected = true,
         );
-        let unplugged = emulate::prune(emulate::update(&plugged, "emu-1", |p| {
+        let unplugged = emulate::prune(emulate::update(&plugged, &Serial::from("emu-1"), |p| {
             p.connected = false;
         }));
         assert_eq!(unplugged.len(), 1);
@@ -2848,7 +2851,7 @@ mod tests {
         assert!(known.is_remembered("emu-1"));
 
         let remembered = vec![(
-            known.remembered_disconnected(&[])[0].serial.to_string(),
+            known.remembered_disconnected(&[])[0].serial.clone(),
             50,
             Connection::Bluetooth,
         )];
@@ -2867,7 +2870,7 @@ mod tests {
         let both = vec![a.clone(), emulate::new_pad(&[a], 70, Connection::Usb)];
         emulate::sync_remembered_emulated(&[], &both, &mut known);
 
-        let edited = emulate::update(&both, "emu-1", |p| p.remembered = false);
+        let edited = emulate::update(&both, &Serial::from("emu-1"), |p| p.remembered = false);
         let after = emulate::prune(edited);
         emulate::sync_remembered_emulated(&both, &after, &mut known);
 

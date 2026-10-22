@@ -35,7 +35,7 @@ pub struct NotifyEvent {
     pub heading: String,
     pub body: String,
     pub percent: Option<u8>,
-    pub serial: String,
+    pub serial: Serial,
     pub state: PowerState,
 }
 
@@ -45,9 +45,8 @@ impl NotifyTracker {
     }
 
     /// Mark serials that were already present when the app started (no Connected toast).
-    pub fn queue_launch_quiet(&mut self, serials: impl IntoIterator<Item = String>) {
-        self.launch_quiet
-            .extend(serials.into_iter().map(Serial::from));
+    pub fn queue_launch_quiet(&mut self, serials: impl IntoIterator<Item = Serial>) {
+        self.launch_quiet.extend(serials);
     }
 
     /// Collect overlay toasts for connect / low-battery / charge-complete transitions.
@@ -194,28 +193,28 @@ fn format_event(
             heading,
             body: "Connected".to_string(),
             percent: Some(controller.percent),
-            serial: controller.serial.to_string(),
+            serial: controller.serial.clone(),
             state: controller.state,
         },
         NotifyKind::Disconnect => NotifyEvent {
             heading,
             body: "Disconnected".to_string(),
             percent: Some(controller.percent),
-            serial: controller.serial.to_string(),
+            serial: controller.serial.clone(),
             state: controller.state,
         },
         NotifyKind::Low => NotifyEvent {
             heading,
             body: "Is low".to_string(),
             percent: Some(controller.percent),
-            serial: controller.serial.to_string(),
+            serial: controller.serial.clone(),
             state: controller.state,
         },
         NotifyKind::Charged => NotifyEvent {
             heading,
             body: "Finished charging".to_string(),
             percent: Some(100),
-            serial: controller.serial.to_string(),
+            serial: controller.serial.clone(),
             state: PowerState::Complete,
         },
     }
@@ -297,7 +296,7 @@ mod tests {
         // replaced) must not suppress its much-later return: quiet covers
         // continuously-present pads only.
         let mut tracker = NotifyTracker::new();
-        tracker.queue_launch_quiet(["a".to_string()]);
+        tracker.queue_launch_quiet([Serial::from("a")]);
         let p = prefs(true, true, true);
         let connected = vec![pad(
             "a",
@@ -317,7 +316,7 @@ mod tests {
     #[test]
     fn launch_quiet_skips_connect_for_queued_serial_only() {
         let mut tracker = NotifyTracker::new();
-        tracker.queue_launch_quiet(["a".to_string()]);
+        tracker.queue_launch_quiet([Serial::from("a")]);
         let p = prefs(true, true, true);
         let connected = vec![
             pad(
@@ -343,7 +342,7 @@ mod tests {
     #[test]
     fn launch_quiet_reconnect_after_disconnect_notifies() {
         let mut tracker = NotifyTracker::new();
-        tracker.queue_launch_quiet(["a".to_string()]);
+        tracker.queue_launch_quiet([Serial::from("a")]);
         let p = prefs(true, true, true);
         let connected = vec![pad(
             "a",
@@ -360,7 +359,7 @@ mod tests {
     #[test]
     fn launch_quiet_disconnect_still_notifies() {
         let mut tracker = NotifyTracker::new();
-        tracker.queue_launch_quiet(["a".to_string()]);
+        tracker.queue_launch_quiet([Serial::from("a")]);
         let connected = vec![pad(
             "a",
             40,

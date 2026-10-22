@@ -11,6 +11,7 @@ use crate::controller::emulate;
 use crate::controller::model::Connection;
 #[cfg(debug_assertions)]
 use crate::controller::model::ControllerStatus;
+use crate::controller::model::Serial;
 use crate::games::launch;
 use crate::persist::paths;
 use crate::persist::prefs::{clamp_low_battery_percent, renderer_restart_needed};
@@ -857,12 +858,12 @@ impl App {
             return Task::none();
         }
 
-        let targets: Vec<(String, color::Rgb)> = self
+        let targets: Vec<(Serial, color::Rgb)> = self
             .session
             .controllers
             .iter()
             .filter(|c| !is_emulated_serial(c.serial.as_ref()))
-            .map(|c| (c.serial.to_string(), self.spectrum.color_at(c.percent)))
+            .map(|c| (c.serial.clone(), self.spectrum.color_at(c.percent)))
             .collect();
 
         if targets.is_empty() {
@@ -890,7 +891,7 @@ impl App {
         for pending in self.pending_emulator_commits.values_mut() {
             pending.tick = pending.tick.wrapping_add(1);
         }
-        let due: Vec<(String, u8)> = self
+        let due: Vec<(Serial, u8)> = self
             .pending_emulator_commits
             .iter()
             .filter(|(_, p)| now >= p.deadline)
@@ -922,7 +923,7 @@ impl App {
             .filter_map(|pad| {
                 let pending = self.pending_emulator_commits.get(pad.serial())?;
                 Some(configure_view::PendingEmulatorChange {
-                    serial: pad.serial().to_string(),
+                    serial: pad.serial().clone(),
                     percent: pending.percent,
                     tick: pending.tick,
                 })
@@ -954,7 +955,7 @@ impl App {
     #[cfg(debug_assertions)]
     pub(crate) fn apply_emulator_command(&mut self, command: EmulatorCommand) -> Task<Message> {
         let fleet = self.emulated_pads.clone();
-        let find = |serial: &str| fleet.iter().find(|p| p.serial() == serial).cloned();
+        let find = |serial: &Serial| fleet.iter().find(|p| p.serial() == serial).cloned();
 
         // `publish` runs the normal connect/disconnect path (toasts, Start-open
         // policy, analytics edges); `analytics` covers the charge/drain walk.
@@ -972,7 +973,7 @@ impl App {
                     .filter(|p| p.serial() != serial)
                     .cloned()
                     .collect::<Vec<_>>();
-                self.session.known.forget(serial);
+                self.session.known.forget(serial.as_ref());
                 self.pending_emulator_commits.remove(serial);
                 (next, true, false)
             }
@@ -1022,7 +1023,7 @@ impl App {
                 (emulate::prune(next), true, false)
             }
             EmulatorCommand::SeedAnalytics(serial) => {
-                self.session.analytics.dev_seed_estimates(serial);
+                self.session.analytics.dev_seed_estimates(serial.as_ref());
                 (fleet, false, true)
             }
             EmulatorCommand::StepCharge(serial) => {
@@ -1031,7 +1032,7 @@ impl App {
                 };
                 self.session
                     .analytics
-                    .dev_credit_active(pad.serial(), emulate::CHARGE_STEP_TIME);
+                    .dev_credit_active(pad.serial().as_ref(), emulate::CHARGE_STEP_TIME);
                 let (percent, connection, state) = emulate::step_charge(&pad.status);
                 let next = emulate::update(&fleet, serial, |p| {
                     p.status.percent = percent;
@@ -1046,7 +1047,7 @@ impl App {
                 };
                 self.session
                     .analytics
-                    .dev_credit_active(pad.serial(), emulate::DRAIN_STEP_TIME);
+                    .dev_credit_active(pad.serial().as_ref(), emulate::DRAIN_STEP_TIME);
                 let (percent, connection, state) = emulate::step_drain(&pad.status);
                 let next = emulate::update(&fleet, serial, |p| {
                     p.status.percent = percent;

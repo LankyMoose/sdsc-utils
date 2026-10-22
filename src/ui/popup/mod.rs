@@ -2,7 +2,7 @@
 
 use crate::controller::dualsense::lightbar;
 use crate::controller::known::KnownController;
-use crate::controller::model::ControllerStatus;
+use crate::controller::model::{ControllerStatus, Serial};
 use crate::ui::color::BatterySpectrum;
 use crate::ui::percent_ring::{self, POPUP_SIZE};
 use crate::ui::svg_icon;
@@ -48,7 +48,7 @@ pub fn nickname_input_id() -> iced::widget::Id {
 /// A single controller entry: either live, or remembered-but-disconnected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControllerRow {
-    pub serial: String,
+    pub serial: Serial,
     pub product: String,
     pub nickname: Option<String>,
     pub connection: String,
@@ -74,7 +74,7 @@ impl ControllerRow {
         eta: Option<String>,
     ) -> Self {
         Self {
-            serial: controller.serial.to_string(),
+            serial: controller.serial.clone(),
             product: controller.product.clone(),
             nickname,
             connection: controller.connection.to_string(),
@@ -100,7 +100,7 @@ impl ControllerRow {
         eta: Option<String>,
     ) -> Self {
         Self {
-            serial: controller.serial.to_string(),
+            serial: controller.serial.clone(),
             product: controller.product.clone(),
             nickname,
             connection: controller.connection.clone(),
@@ -139,7 +139,7 @@ impl ControllerRow {
 /// Active Identify ring flash for one controller row.
 #[derive(Debug, Clone)]
 struct IdentifyFlash {
-    serial: String,
+    serial: Serial,
     started: Instant,
 }
 
@@ -147,7 +147,7 @@ struct IdentifyFlash {
 #[derive(Debug, Default)]
 pub struct State {
     /// Serial of the row whose nickname is being edited.
-    pub editing_serial: Option<String>,
+    pub editing_serial: Option<Serial>,
     /// Current nickname draft.
     pub draft: String,
     /// Ring flash started with the last successful Identify.
@@ -179,8 +179,8 @@ impl State {
         entrance_appear(index, elapsed)
     }
 
-    pub fn begin_edit(&mut self, serial: &str, current: Option<&str>) {
-        self.editing_serial = Some(serial.to_string());
+    pub fn begin_edit(&mut self, serial: &Serial, current: Option<&str>) {
+        self.editing_serial = Some(serial.clone());
         self.draft = current.unwrap_or_default().to_string();
     }
 
@@ -192,9 +192,9 @@ impl State {
     }
 
     /// Start the UI ring flash that mirrors the lightbar Identify pattern.
-    pub fn begin_identify_flash(&mut self, serial: &str) {
+    pub fn begin_identify_flash(&mut self, serial: &Serial) {
         self.identify_flash = Some(IdentifyFlash {
-            serial: serial.to_string(),
+            serial: serial.clone(),
             started: Instant::now(),
         });
     }
@@ -216,23 +216,23 @@ impl State {
         }
     }
 
-    fn ring_flash_white(&self, serial: &str) -> bool {
+    fn ring_flash_white(&self, serial: &Serial) -> bool {
         self.identify_flash.as_ref().is_some_and(|flash| {
-            flash.serial == serial
+            flash.serial == *serial
                 && lightbar::identify_flash_is_white(flash.started, Instant::now()) == Some(true)
         })
     }
 
     /// Finish editing and return `(serial, nickname)`; `None` clears the nickname.
-    pub fn commit(&mut self) -> Option<(String, Option<String>)> {
+    pub fn commit(&mut self) -> Option<(Serial, Option<String>)> {
         let serial = self.editing_serial.take()?;
         let draft = std::mem::take(&mut self.draft);
         let trimmed = draft.trim().to_string();
         Some((serial, (!trimmed.is_empty()).then_some(trimmed)))
     }
 
-    pub fn is_editing(&self, serial: &str) -> bool {
-        self.editing_serial.as_deref() == Some(serial)
+    pub fn is_editing(&self, serial: &Serial) -> bool {
+        self.editing_serial.as_ref() == Some(serial)
     }
 
     pub fn is_editing_any(&self) -> bool {
@@ -243,10 +243,10 @@ impl State {
 #[derive(Debug, Clone)]
 pub enum PopupMessage {
     OpenSettings,
-    Identify(String),
-    PowerOff(String),
-    ToggleRemember(String),
-    BeginEdit(String),
+    Identify(Serial),
+    PowerOff(Serial),
+    ToggleRemember(Serial),
+    BeginEdit(Serial),
     DraftChanged(String),
     CommitNickname,
     CancelEdit,
@@ -304,7 +304,7 @@ pub fn view<'a>(
     state: &'a State,
     rows: &'a [ControllerRow],
     spectrum: &BatterySpectrum,
-    powering_off: Option<&str>,
+    powering_off: Option<&Serial>,
 ) -> Element<'a, PopupMessage> {
     let now = Instant::now();
     let connected = rows.iter().filter(|r| r.connected).count();
@@ -351,7 +351,7 @@ pub fn view<'a>(
                         state,
                         entry,
                         spectrum,
-                        entry.connected && powering_off.is_some_and(|s| s == entry.serial),
+                        entry.connected && powering_off.is_some_and(|s| *s == entry.serial),
                         state.row_appear(index, now),
                     ))
                 },

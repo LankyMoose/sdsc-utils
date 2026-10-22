@@ -1,6 +1,5 @@
 //! Pure start-open / connect-cooldown / poll-hold helpers.
 
-use crate::controller::dualsense::identity::normalize_identity;
 use crate::controller::model::{ControllerStatus, Serial};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -68,7 +67,7 @@ pub fn should_skip_connect_cooldown_on_power_off(
     serial: &str,
     include_usb: bool,
 ) -> bool {
-    let target = normalize_identity(serial);
+    let target = Serial::normalize(serial);
     let qualifying: Vec<&ControllerStatus> = controllers
         .iter()
         .filter(|c| include_usb || c.connection.is_bluetooth())
@@ -76,7 +75,7 @@ pub fn should_skip_connect_cooldown_on_power_off(
     qualifying.len() == 1
         && qualifying
             .first()
-            .is_some_and(|c| normalize_identity(c.serial.as_ref()) == target)
+            .is_some_and(|c| Serial::normalize(c.serial.as_ref()) == target)
 }
 
 /// Whether to arm the ghost-flap cooldown after qualifying presence goes empty.

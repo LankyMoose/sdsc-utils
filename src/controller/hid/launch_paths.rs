@@ -1,5 +1,6 @@
 //! Paths present on the first HID enumerate — treat their first read as already connected.
 
+use crate::controller::model::Serial;
 use std::collections::HashSet;
 
 /// Tracks DualSense gamepad HID paths seen at process start until each is identified.
@@ -28,9 +29,11 @@ impl LaunchPaths {
     }
 
     /// If `path` was present at launch, remove it and return `serial` to quiet once.
-    pub fn take_serial_for_path(&mut self, path: &str, serial: &str) -> Option<String> {
+    /// The serial is normalized on the way in (`Serial::normalize` is idempotent,
+    /// so already-normalized map keys pass through unchanged).
+    pub fn take_serial_for_path(&mut self, path: &str, serial: &str) -> Option<Serial> {
         if self.pending.remove(path) {
-            Some(serial.to_string())
+            Some(Serial::normalize(serial))
         } else {
             None
         }
@@ -51,9 +54,11 @@ mod tests {
         let mut launch = LaunchPaths::new();
         launch.on_device_list(["\\\\?\\hid\\a".into(), "\\\\?\\hid\\b".into()]);
         assert_eq!(launch.pending_len(), 2);
+        // The boundary normalizes (`Serial::normalize` is idempotent, so
+        // already-normal map keys pass through unchanged).
         assert_eq!(
             launch.take_serial_for_path("\\\\?\\hid\\a", "serial-a"),
-            Some("serial-a".into())
+            Some(Serial::normalize("serial-a"))
         );
         assert!(
             launch
@@ -62,7 +67,7 @@ mod tests {
         );
         assert_eq!(
             launch.take_serial_for_path("\\\\?\\hid\\b", "serial-b"),
-            Some("serial-b".into())
+            Some(Serial::normalize("serial-b"))
         );
     }
 
@@ -78,7 +83,7 @@ mod tests {
         );
         assert_eq!(
             launch.take_serial_for_path("\\\\?\\hid\\b", "serial-b"),
-            Some("serial-b".into())
+            Some(Serial::normalize("serial-b"))
         );
     }
 

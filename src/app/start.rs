@@ -1171,13 +1171,16 @@ impl App {
         let ms = duration.as_millis() as u64;
         for controller in &self.session.controllers {
             self.hid_worker
-                .rumble(controller.serial.to_string(), right, left, ms);
+                .rumble(controller.serial.clone(), right, left, ms);
         }
     }
 
     pub(crate) fn set_haptic_pad_from_id(&mut self, pad: Option<&start_input::PadId>) {
-        self.haptic_pad_serial =
-            pad.and_then(|id| id.as_str().strip_prefix("hid:").map(|s| s.to_string()));
+        self.haptic_pad_serial = pad.and_then(|id| {
+            id.as_str()
+                .strip_prefix("hid:")
+                .map(crate::controller::model::Serial::normalize)
+        });
     }
 
     pub(crate) fn cancel_start_holds(&mut self) {
@@ -2320,7 +2323,7 @@ impl App {
                     None
                 };
                 start_view::StartControllerRow {
-                    serial: c.serial.to_string(),
+                    serial: c.serial.clone(),
                     title: start_view::controller_title(&c.product, nickname),
                     connection: c.connection.to_string(),
                     state: if c.is_low_battery(self.session.prefs.low_battery_percent) {
@@ -2352,7 +2355,7 @@ impl App {
                     None
                 };
                 rows.push(start_view::StartControllerRow {
-                    serial: controller.serial.to_string(),
+                    serial: controller.serial.clone(),
                     title: start_view::controller_title(&controller.product, nickname),
                     connection: controller.connection.clone(),
                     state: "disconnected".into(),
@@ -2790,7 +2793,7 @@ impl App {
                 .start_state
                 .controllers
                 .get(self.start_state.controller_selected)
-                .map(|r| r.serial.clone()),
+                .map(|r| r.serial.to_string()),
             games_scroll_y: self.start_state.list_offset(start_view::StartListId::Games),
             controllers_scroll_y: self
                 .start_state
