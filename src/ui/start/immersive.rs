@@ -4,13 +4,16 @@ use crate::persist::prefs::ImmersiveLayout;
 use crate::ui::color::BatterySpectrum;
 use crate::ui::percent_ring;
 use crate::ui::shader::{AmbientProgram, VignetteProgram};
+use crate::ui::start::chrome::{
+    empty_games_browse_prompt, footer_hint, immersive_dock_row_hints, immersive_game_hints,
+    immersive_game_membership_label,
+};
 use crate::ui::start::mode::{TransitionPhase, dock_panel_width, dock_stage_dim, dock_stage_scale};
 use crate::ui::start::row::{game_subtitle_block, update_required_badge};
+use crate::ui::start::settings::{manual_add_view, replace_confirm_view};
 use crate::ui::start::translate::backdrop_art;
 use crate::ui::start::view::{
-    LaunchStatus, StartControllerRow, StartMessage, StartRow, StartSlide, State,
-    empty_games_browse_prompt, footer_hint, immersive_dock_row_hints, immersive_game_hints,
-    immersive_game_membership_label, manual_add_view, replace_confirm_view, scan_status_chip,
+    LaunchStatus, StartControllerRow, StartMessage, StartRow, StartSlide, State, scan_status_chip,
     scan_status_stack,
 };
 use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics, StripOrientation};

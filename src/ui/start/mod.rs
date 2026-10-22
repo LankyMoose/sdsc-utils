@@ -2,8 +2,10 @@
 pub mod ambient_tune;
 pub mod art_worker;
 pub mod carousel;
+pub mod chrome;
 pub mod clock;
 pub mod cursor_hide;
+pub mod face;
 pub mod gesture;
 pub mod hint_ring;
 pub mod icon_cache;

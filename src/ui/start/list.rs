@@ -1,13 +1,15 @@
 //! Compact browse lists (Games + Controllers) + section/sticky/scroll-id helpers.
 //!
 //! Behavior-preserving split from [`crate::ui::start::view`]: list bodies live
-//! here, shared scroll math / chrome / state stay in `view` and are imported.
+//! here, shared scroll math / state stay in `view`, the empty-browse prompt in
+//! [`crate::ui::start::chrome`], face hints in [`crate::ui::start::face`].
 
 use crate::ui::color::BatterySpectrum;
+use crate::ui::start::chrome::empty_games_browse_prompt;
 use crate::ui::start::row::{controller_row, game_row};
 use crate::ui::start::view::{
     PINNED_SCROLL_GUTTER, ROW_GAP, ROW_HEIGHT, RowHintState, SECTION_SEP_H, SECTION_SEP_TEXT,
-    StartListId, StartMessage, State, empty_games_browse_prompt,
+    StartListId, StartMessage, State,
 };
 use crate::ui::theme;
 use iced::font::Weight;

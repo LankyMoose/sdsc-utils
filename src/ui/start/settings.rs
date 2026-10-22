@@ -7,14 +7,22 @@ use crate::persist::prefs::{
     min_sleep_secs_for_idle, secs_step_index,
 };
 use crate::ui::layout as window_layout;
-use crate::ui::start::view::{ScrollReveal, StartMessage, State, scroll_y_to_reveal_bounds};
+use crate::ui::start::face::{FaceButton, action_cluster, face_hint, face_hold_hint};
+use crate::ui::start::icon_cache;
+use crate::ui::start::view::{
+    HintPress, HintPressOwner, ICON_H, ICON_W, ScrollReveal, StartIcon, StartMessage, State,
+    scroll_y_to_reveal_bounds,
+};
 use crate::ui::theme;
 use iced::font::Weight;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, column, container, mouse_area, row, scrollable, slider, space, stack, text, toggler,
+    button, column, container, mouse_area, row, scrollable, slider, space, stack, text, text_input,
+    toggler,
 };
-use iced::{Alignment, Element, Fill, Font, Length, Padding};
+use iced::{
+    Alignment, Background, Border, ContentFit, Element, Fill, Font, Length, Padding, Theme,
+};
 use std::time::{Duration, Instant};
 
 /// Immersive settings drawer content width (full height).
@@ -1917,6 +1925,172 @@ fn slider_row(
         .width(Fill)
         .style(focus_style(focused))
         .into()
+}
+
+pub(crate) fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
+    let Some(draft) = state.manual_add.as_ref() else {
+        return space().into();
+    };
+
+    let icon_el: Element<'_, StartMessage> = draft
+        .icon_path
+        .as_ref()
+        .filter(|p| p.is_file())
+        .and_then(|p| icon_cache::handle_for_path_warn(p))
+        .map(|handle| start_icon_image(&StartIcon(handle)))
+        .or_else(|| draft.shell_icon.as_ref().map(start_icon_image))
+        .unwrap_or_else(manual_icon_placeholder);
+
+    let icon_hint = if draft.shell_icon.is_none() && draft.icon_path.is_none() {
+        text("No icon found — choose an image (optional)")
+            .size(12.0)
+            .color(theme::DIM)
+    } else {
+        text(" ").size(12.0).color(theme::DIM)
+    };
+
+    let mut icon_actions = row![].spacing(8).align_y(Alignment::Center);
+    icon_actions = icon_actions.push(
+        button(text("Choose image…").size(13.0))
+            .padding([5, 10])
+            .on_press(StartMessage::ManualPickIcon)
+            .style(theme::ghost),
+    );
+    if draft.icon_path.is_some() {
+        icon_actions = icon_actions.push(
+            button(text("Clear").size(13.0))
+                .padding([5, 10])
+                .on_press(StartMessage::ManualClearIcon)
+                .style(theme::ghost),
+        );
+    }
+
+    container(
+        column![
+            text(if draft.is_edit() {
+                "Edit shortcut"
+            } else {
+                "Add shortcut"
+            })
+            .size(20.0)
+            .color(theme::INK),
+            space().height(6),
+            text_input("Title", &draft.title)
+                .size(14.0)
+                .padding(8)
+                .on_input(StartMessage::ManualAddTitle)
+                .style(theme::input),
+            text(&draft.target).size(12.0).color(theme::MUTED),
+            text_input("Arguments (optional)", &draft.args)
+                .size(14.0)
+                .padding(8)
+                .on_input(StartMessage::ManualAddArgs)
+                .style(theme::input),
+            row![icon_el, column![icon_actions, icon_hint].spacing(6)]
+                .spacing(14)
+                .align_y(Alignment::Center),
+            space().height(8),
+            row![
+                button(text(if draft.is_edit() { "Save" } else { "Add" }).size(14.0))
+                    .padding([6, 14])
+                    .on_press(StartMessage::Confirm)
+                    .style(theme::primary),
+                button(text("Cancel").size(14.0))
+                    .padding([6, 14])
+                    .on_press(StartMessage::Close)
+                    .style(theme::ghost),
+            ]
+            .spacing(10),
+            {
+                let press = HintPress::for_owner(state, HintPressOwner::ManualAdd);
+                action_cluster(
+                    &[
+                        face_hint(
+                            FaceButton::Cross,
+                            if draft.is_edit() { "Save" } else { "Add" },
+                            press.held,
+                            press.press_anim,
+                        ),
+                        face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
+                    ],
+                    false,
+                )
+            },
+        ]
+        .spacing(10)
+        .width(Length::Fixed(420.0))
+        .align_x(Alignment::Start),
+    )
+    .width(Fill)
+    .height(Fill)
+    .center_x(Fill)
+    .center_y(Fill)
+    .into()
+}
+
+fn start_icon_image(icon: &StartIcon) -> Element<'static, StartMessage> {
+    iced::widget::image(icon.0.clone())
+        .width(Length::Fixed(ICON_W))
+        .height(Length::Fixed(ICON_H))
+        .content_fit(ContentFit::Cover)
+        .into()
+}
+
+fn manual_icon_placeholder() -> Element<'static, StartMessage> {
+    container(space())
+        .width(Length::Fixed(ICON_W))
+        .height(Length::Fixed(ICON_H))
+        .style(|_t: &Theme| container::Style {
+            background: Some(Background::Color(theme::alpha(theme::PANEL, 0.85))),
+            border: Border {
+                radius: 6.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+pub(crate) fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
+    let Some(confirm) = state.replace_confirm.as_ref() else {
+        return space().into();
+    };
+    container(
+        column![
+            text("Game already running").size(20.0).color(theme::INK),
+            text(format!(
+                "Close {} and launch {}?",
+                confirm.running_title, confirm.next_title
+            ))
+            .size(14.0)
+            .color(theme::MUTED),
+            space().height(8),
+            {
+                let press = HintPress::for_owner(state, HintPressOwner::ReplaceConfirm);
+                action_cluster(
+                    &[
+                        face_hold_hint(
+                            FaceButton::Cross,
+                            "Proceed",
+                            press.cross_progress,
+                            press.cross_armed_t,
+                            press.held,
+                            press.press_anim,
+                        ),
+                        face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
+                    ],
+                    false,
+                )
+            },
+        ]
+        .spacing(12)
+        .align_x(Alignment::Center),
+    )
+    .width(Fill)
+    .height(Fill)
+    .center_x(Fill)
+    .center_y(Fill)
+    .into()
 }
 
 #[cfg(test)]
