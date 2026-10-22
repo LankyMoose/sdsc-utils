@@ -1,15 +1,15 @@
 //! Compact games + controller list rows (browse slide).
 //!
 //! Behavior-preserving split from [`crate::ui::start::view`]: row bodies live
-//! here, shared face-hint helpers stay in `view` and are imported.
+//! here, shared face-hint helpers come from [`crate::ui::start::face`].
 
 use crate::controller::dualsense::lightbar;
 use crate::ui::color::BatterySpectrum;
 use crate::ui::percent_ring::{self, POPUP_SIZE};
+use crate::ui::start::face::{FaceButton, action_cluster_spaced, face_hint, face_hold_hint};
 use crate::ui::start::view::{
-    CONTROLLER_ROW_HEIGHT, EditRow, FaceButton, ICON_H, ICON_W, LaunchStatus, ROW_ACTION_SPACING,
-    ROW_HEIGHT, RowHintState, StartControllerRow, StartMessage, StartRow, StartSubtitle,
-    action_cluster_spaced, face_hint, face_hold_hint,
+    CONTROLLER_ROW_HEIGHT, EditRow, ICON_H, ICON_W, LaunchStatus, ROW_ACTION_SPACING, ROW_HEIGHT,
+    RowHintState, StartControllerRow, StartMessage, StartRow, StartSubtitle,
 };
 use crate::ui::{svg_icon, theme};
 use iced::font::Weight;
