@@ -97,7 +97,7 @@ impl InputHub {
         if guard.readings.is_empty() {
             NavReadingsOutcome::Missing { meta }
         } else {
-            log_source_once(NavSource::HID, guard.readings.len());
+            log_source_once(NAV_SOURCE_HID, guard.readings.len());
             NavReadingsOutcome::Readings {
                 readings: guard.readings.clone(),
                 meta,
@@ -271,17 +271,13 @@ pub struct PadSample {
 
 /// Which backend produced a start-screen nav sample.
 ///
-/// Single-backend stub: HID is the only producer. A unit struct (not an enum)
-/// so `NavReading.source`, `format_line`, `log_source_once`, and the one-shot
-/// `Option<NavSource>` log guard keep working unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct NavSource;
+/// Single-backend stub: HID is the only producer. A `&'static str` const (not an
+/// enum) so `NavReading.source`, `format_line`, `log_source_once`, and the one-shot
+/// `Option<&'static str>` log guard keep working unchanged.
+pub const NAV_SOURCE_HID: &str = "hid";
 
-impl NavSource {
-    pub const HID: Self = Self;
-    pub fn as_str(self) -> &'static str {
-        "hid"
-    }
+fn default_nav_source() -> &'static str {
+    NAV_SOURCE_HID
 }
 
 /// Stable pad identity for per-controller edge / hold / gesture state.
@@ -298,7 +294,12 @@ impl PadId {
 pub struct NavReading {
     pub id: PadId,
     pub sample: PadSample,
-    pub source: NavSource,
+    // In-memory only (hid-worker snapshot / edge bridge; never persisted — see
+    // `persist::store`, which has no `NavReading` callers). `&'static str`
+    // cannot borrow from a deserializer, so the wire value is ignored and the
+    // single-backend const is restored on deserialize.
+    #[serde(skip_deserializing, default = "default_nav_source")]
+    pub source: &'static str,
 }
 
 /// Coarse stick band for edge-triggered diagnostics (not every poll).
@@ -386,10 +387,10 @@ impl NavLogSnapshot {
         }
     }
 
-    pub fn format_line(self, source: NavSource) -> String {
+    pub fn format_line(self, source: &str) -> String {
         format!(
             "start-nav: src={} cross={} circle={} l2={} r2={} dpad_up={} dpad_down={} dpad_l={} dpad_r={} stick={} resting={}",
-            source.as_str(),
+            source,
             u8::from(self.cross),
             u8::from(self.circle),
             u8::from(self.l2),
@@ -884,13 +885,12 @@ pub fn preferred_reading(readings: &[NavReading]) -> Option<&NavReading> {
         .or_else(|| readings.first())
 }
 
-fn log_source_once(source: NavSource, pads: usize) {
+fn log_source_once(source: &str, pads: usize) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static LOGGED: AtomicBool = AtomicBool::new(false);
     if !LOGGED.swap(true, Ordering::Relaxed) {
         crate::platform::app_log::info(format!(
-            "start-nav: backend={} pads={pads} (hid-worker snapshot)",
-            source.as_str(),
+            "start-nav: backend={source} pads={pads} (hid-worker snapshot)",
         ));
     }
 }
@@ -991,7 +991,7 @@ pub fn hid_nav_reading(identity: &str, sample: PadSample) -> NavReading {
     NavReading {
         id: PadId(format!("hid:{identity}")),
         sample,
-        source: NavSource::HID,
+        source: NAV_SOURCE_HID,
     }
 }
 
@@ -1948,7 +1948,7 @@ mod tests {
         NavReading {
             id: PadId(id.to_string()),
             sample,
-            source: NavSource::HID,
+            source: NAV_SOURCE_HID,
         }
     }
 

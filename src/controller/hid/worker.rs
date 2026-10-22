@@ -2549,7 +2549,7 @@ mod tests {
         NavReading {
             id: start_input::PadId(id.to_string()),
             sample: start_input::PadSample::default(),
-            source: start_input::NavSource::HID,
+            source: start_input::NAV_SOURCE_HID,
         }
     }
 

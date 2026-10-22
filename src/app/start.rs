@@ -3782,7 +3782,7 @@ impl App {
         if self.nav_source_logged.is_none() {
             app_log::info(format!(
                 "start-nav: source={} pads={} id={}",
-                reading.source.as_str(),
+                reading.source,
                 pad_count,
                 reading.id.as_str()
             ));
@@ -3942,7 +3942,7 @@ impl App {
             let held: Vec<_> = reading.sample.held.iter().copied().collect();
             PadInputPanel {
                 has_sample: true,
-                source: reading.source.as_str().to_string(),
+                source: reading.source.to_string(),
                 buttons0: None,
                 cross: reading.sample.cross,
                 circle: reading.sample.circle,
