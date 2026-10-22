@@ -1,5 +1,6 @@
 //! DualSense lightbar HID output.
 
+use crate::controller::driver::LightbarBackend;
 use crate::controller::dualsense::identity::{
     self as dualsense, HidIoLock, is_dualsense_device, is_dualsense_gamepad, normalize_identity,
     resolve_device_identity,
@@ -22,6 +23,26 @@ use std::time::{Duration, Instant};
 /// `hid::diag` (`STEAM_REFRESH`, 1s) is a separate verbose-logging cache with a
 /// shorter TTL — different purpose, different TTL; neither should be "unified".
 const STEAM_CLAIM_CACHE_TTL: Duration = Duration::from_secs(3);
+
+/// [`crate::controller::driver::LightbarBackend`] for DualSense: the registry's
+/// `Some` arm. Thin delegate over [`apply_lightbar_rgb_timed`] — report bytes,
+/// CRC seeds, and `LIGHT_OUT` claim setup stay DualSense-private in this file.
+pub struct DualSenseLightbarBackend;
+
+/// Shared backend instance behind [`crate::controller::driver::DUALSENSE`].
+pub static DUALSENSE_LIGHTBAR: DualSenseLightbarBackend = DualSenseLightbarBackend;
+
+impl LightbarBackend for DualSenseLightbarBackend {
+    fn apply(
+        &self,
+        api: &HidApi,
+        serial: &str,
+        color: Rgb,
+        claims: &ClaimStore,
+    ) -> (AppResult<()>, HidPhaseTiming) {
+        apply_lightbar_rgb_timed(api, serial, color, claims)
+    }
+}
 
 /// Phase timings for hid-worker metrics (enumerate / open / io).
 #[derive(Debug, Default, Clone, Copy)]

@@ -66,18 +66,6 @@ pub enum PowerState {
 }
 
 impl PowerState {
-    pub fn from_nibble(value: u8) -> Self {
-        match value {
-            0x00 => Self::Discharging,
-            0x01 => Self::Charging,
-            0x02 => Self::Complete,
-            0x0A => Self::AbnormalVoltage,
-            0x0B => Self::AbnormalTemperature,
-            0x0F => Self::ChargingError,
-            _ => Self::Unknown,
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Discharging => "discharging",
@@ -95,6 +83,32 @@ impl PowerState {
     }
 }
 
+/// Per-family feature flags (runtime only — never persisted).
+///
+/// A fork adds a family by returning honest flags here (absent backends in
+/// the driver read as all-false); UI branches only on these, never on kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities {
+    pub lightbar: bool,
+    pub rumble: bool,
+    pub power_off: bool,
+}
+
+impl Capabilities {
+    /// Full DualSense feature set (the only driver today).
+    pub const FULL: Self = Self {
+        lightbar: true,
+        rumble: true,
+        power_off: true,
+    };
+    /// No optional backends (fake drivers / future minimal families).
+    pub const NONE: Self = Self {
+        lightbar: false,
+        rumble: false,
+        power_off: false,
+    };
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControllerStatus {
     pub index: usize,
@@ -104,8 +118,7 @@ pub struct ControllerStatus {
     pub serial: Serial,
     pub percent: u8,
     pub state: PowerState,
-    pub supports_lightbar: bool,
-    pub supports_power_off: bool,
+    pub capabilities: Capabilities,
 }
 
 /// Normalized DualSense identity (MAC-style serial, lowercase, no separators).
@@ -246,8 +259,7 @@ mod tests {
             serial: Serial::from("abc123"),
             percent: 50,
             state: PowerState::Discharging,
-            supports_lightbar: true,
-            supports_power_off: true,
+            capabilities: Capabilities::FULL,
         };
         let value = serde_json::to_value(&status).unwrap();
         assert_eq!(

@@ -2240,7 +2240,7 @@ impl App {
         else {
             return false;
         };
-        if !controller.supports_lightbar {
+        if !controller.capabilities.lightbar {
             return false;
         }
 
@@ -2268,7 +2268,7 @@ impl App {
         else {
             return;
         };
-        if !controller.supports_power_off || !controller.connection.is_bluetooth() {
+        if !controller.capabilities.power_off || !controller.connection.is_bluetooth() {
             app_log::warn(format!(
                 "power-off ignored for {serial} ({})",
                 controller.connection

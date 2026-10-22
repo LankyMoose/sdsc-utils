@@ -3,13 +3,13 @@
 //! Also owns the presence / battery / liveness cadence used by the iced daemon.
 
 use crate::AppResult;
-use crate::controller::driver;
+use crate::controller::driver::{self, ControllerDriver, DRIVERS};
 use crate::controller::dualsense::battery;
 use crate::controller::dualsense::identity::{self as dualsense, HidIoLock, hid_serial};
 use crate::controller::dualsense::lightbar::{self, ClaimStore, HidPhaseTiming};
 use crate::controller::hid::launch_paths::LaunchPaths;
 use crate::controller::hid::policy::Policy;
-use crate::controller::model::ControllerStatus;
+use crate::controller::model::{ControllerStatus, Serial};
 use crate::domain::color::SpectrumService;
 use crate::platform::app_log;
 use hidapi::{DeviceInfo, HidApi};
@@ -53,19 +53,25 @@ fn dedupe_polled(pads: Vec<PolledPad>) -> Vec<PolledPad> {
         .collect()
 }
 
-fn status_from_reading(
+/// Poll status construction: the exact shape `poll_controllers_with_api` (and
+/// the worker's incremental poll) publish, built from the dispatching driver
+/// so capabilities always match the family that produced the reading.
+pub(crate) fn status_from_reading(
+    driver: &dyn ControllerDriver,
     product: &str,
     reading: &battery::BatteryReading,
     serial: String,
 ) -> ControllerStatus {
-    battery::dualsense_status(
-        0,
-        product,
-        reading.connection,
-        serial,
-        reading.percent,
-        reading.state,
-    )
+    ControllerStatus {
+        index: 0,
+        kind: driver.kind(),
+        product: product.into(),
+        connection: reading.connection,
+        serial: Serial::from(serial),
+        percent: reading.percent,
+        state: reading.state,
+        capabilities: driver.capabilities(),
+    }
 }
 
 /// Poll connected pads and reassert lightbar RGB where supported.
@@ -86,6 +92,27 @@ pub fn poll_controllers(
     spectrum: &SpectrumService,
     claims: &ClaimStore,
 ) -> AppResult<Vec<ControllerStatus>> {
+    poll_controllers_with_drivers(
+        lock,
+        policy,
+        previously_connected,
+        spectrum,
+        claims,
+        DRIVERS,
+    )
+}
+
+/// Driver-injectable poll seam: production passes [`DRIVERS`]; tests inject a
+/// fake with canned battery/input and no HID.
+#[allow(clippy::too_many_arguments)]
+pub fn poll_controllers_with_drivers(
+    lock: &HidIoLock,
+    policy: &Policy,
+    previously_connected: &[String],
+    spectrum: &SpectrumService,
+    claims: &ClaimStore,
+    drivers: &[&dyn ControllerDriver],
+) -> AppResult<Vec<ControllerStatus>> {
     lock.with_lock(|| {
         let api = HidApi::new()?;
         let mut timing = HidPhaseTiming::default();
@@ -99,6 +126,7 @@ pub fn poll_controllers(
             &mut timing,
             None,
             None,
+            drivers,
         )
     })
 }
@@ -119,6 +147,7 @@ pub fn poll_controllers_timed(
     previously_connected: &[String],
     launch: Option<&mut LaunchPaths>,
     launch_quiet: Option<&mut Vec<String>>,
+    drivers: &[&dyn ControllerDriver],
 ) -> (AppResult<Vec<ControllerStatus>>, HidPhaseTiming) {
     let mut timing = HidPhaseTiming::default();
     let result = lock.with_lock(|| {
@@ -132,6 +161,7 @@ pub fn poll_controllers_timed(
             &mut timing,
             launch,
             launch_quiet,
+            drivers,
         )
     });
     (result, timing)
@@ -148,6 +178,7 @@ fn poll_controllers_with_api(
     timing: &mut HidPhaseTiming,
     mut launch: Option<&mut LaunchPaths>,
     mut launch_quiet: Option<&mut Vec<String>>,
+    drivers: &[&dyn ControllerDriver],
 ) -> AppResult<Vec<ControllerStatus>> {
     // Policy seam: `Policy::default()` reproduces the legacy const cadence
     // exactly; this reference keeps the seam without changing timing.
@@ -167,10 +198,10 @@ fn poll_controllers_with_api(
     let mut pads = Vec::with_capacity(devices.len());
 
     for info in devices {
-        if !driver::is_gamepad(info) {
+        let Some(driver) = drivers.iter().copied().find(|d| d.matches(info)) else {
             continue;
-        }
-        let product = dualsense::product_name(info.product_id());
+        };
+        let product = driver.product_name(info.product_id());
         let hid = hid_serial(info);
 
         let open_started = Instant::now();
@@ -202,7 +233,7 @@ fn poll_controllers_with_api(
         let io_started = Instant::now();
         let path = info.path().to_string_lossy().into_owned();
         let serial = dualsense::resolve_device_identity(info, &device);
-        match battery::read_battery(&device) {
+        match driver.read_battery(&device) {
             Ok(reading) => {
                 timing.io_ms += io_started.elapsed().as_millis();
                 // Drop the read handle before lightbar: DualSense Windows handles that
@@ -217,7 +248,7 @@ fn poll_controllers_with_api(
                     out.push(quiet);
                 }
                 pads.push(PolledPad {
-                    status: status_from_reading(product, &reading, serial),
+                    status: status_from_reading(driver, product, &reading, serial),
                 });
             }
             Err(err) => {
@@ -250,13 +281,35 @@ fn poll_controllers_with_api(
         previously_connected,
         pads.iter().map(|p| &p.status),
         timing,
+        drivers,
     );
 
     Ok(pads.into_iter().map(|p| p.status).collect())
 }
 
+/// Pure dispatch gate: pads whose driver offers a lightbar backend.
+///
+/// No HID, no claims — unit-testable with a fake driver (all-false
+/// capabilities read as an empty target list, so no write path runs).
+pub(crate) fn lightbar_targets<'a>(
+    drivers: &[&'a dyn ControllerDriver],
+    statuses: impl Iterator<Item = &'a ControllerStatus>,
+) -> Vec<&'a ControllerStatus> {
+    statuses
+        .filter(|s| {
+            s.capabilities.lightbar
+                && drivers
+                    .iter()
+                    .copied()
+                    .find(|d| d.kind() == s.kind)
+                    .is_some_and(|d| d.lightbar().is_some())
+        })
+        .collect()
+}
+
 /// Reassert lightbar only where due (new pad, color change, slow backstop).
 /// Shared by full and incremental polls so CLI and daemon behave alike.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reassert_lightbar_for_pads<'a>(
     api: &HidApi,
     spectrum: &SpectrumService,
@@ -264,12 +317,13 @@ pub(crate) fn reassert_lightbar_for_pads<'a>(
     previously_connected: &[String],
     statuses: impl Iterator<Item = &'a ControllerStatus>,
     timing: &mut HidPhaseTiming,
+    drivers: &[&dyn ControllerDriver],
 ) {
     let statuses: Vec<&'a ControllerStatus> = statuses.collect();
     claims.sync(
         statuses
             .iter()
-            .filter(|p| p.supports_lightbar)
+            .filter(|p| p.capabilities.lightbar)
             .map(|p| p.serial.as_ref()),
     );
     if !claims.is_enabled() {
@@ -280,10 +334,7 @@ pub(crate) fn reassert_lightbar_for_pads<'a>(
         .map(|s| dualsense::normalize_identity(s))
         .collect();
 
-    for pad in statuses {
-        if !pad.supports_lightbar {
-            continue;
-        }
+    for pad in lightbar_targets(drivers, statuses.iter().copied()) {
         let serial_key = dualsense::normalize_identity(pad.serial.as_ref());
         let color = spectrum.color_at(pad.percent);
         if !previous.contains(&serial_key) {
@@ -294,14 +345,78 @@ pub(crate) fn reassert_lightbar_for_pads<'a>(
             // pads, and the 30s backstop still write).
             continue;
         }
+        let Some(driver) = drivers.iter().copied().find(|d| d.kind() == pad.kind) else {
+            continue;
+        };
+        let Some(backend) = driver.lightbar() else {
+            continue;
+        };
         // Fresh open for lightbar (do not reuse the battery-read handle).
-        let (result, t) =
-            lightbar::apply_lightbar_rgb_timed(api, pad.serial.as_ref(), color, claims);
+        let (result, t) = backend.apply(api, pad.serial.as_ref(), color, claims);
         timing.add_assign(t);
         if let Err(err) = result {
             lightbar::warn_lightbar(&pad.product, err);
         } else {
             claims.note_applied(pad.serial.as_ref(), color);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controller::driver::FakeDriver;
+    use crate::controller::model::{Connection, PowerState};
+
+    fn fake() -> FakeDriver {
+        FakeDriver {
+            percent: 55,
+            state: PowerState::Discharging,
+            connection: Connection::Bluetooth,
+            cross: true,
+        }
+    }
+
+    #[test]
+    fn fake_driver_poll_builds_status_from_canned_reading() {
+        let fake = fake();
+        let drivers: &[&dyn ControllerDriver] = &[&fake];
+        let reading = fake.canned_reading();
+        let status = status_from_reading(&fake, "FakePad", &reading, "aa:bb:cc".into());
+        assert_eq!(status.product, "FakePad");
+        assert_eq!(status.percent, 55);
+        assert_eq!(status.state, PowerState::Discharging);
+        assert!(status.connection.is_bluetooth());
+        assert_eq!(status.serial.as_ref(), "aa:bb:cc");
+        // Poll publishes exactly these capabilities: all-false for the fake.
+        assert_eq!(
+            status.capabilities,
+            crate::controller::model::Capabilities::NONE
+        );
+        // ... so the lightbar target gate skips it with no HID touched.
+        assert!(lightbar_targets(drivers, std::iter::once(&status)).is_empty());
+    }
+
+    #[test]
+    fn fake_driver_parse_input_returns_canned_sample() {
+        let fake = fake();
+        let sample = fake.parse_input(&[0u8; 64], 0);
+        assert!(sample.cross);
+        assert!(!sample.circle);
+    }
+
+    #[test]
+    fn fake_driver_skips_lightbar_rumble_power_off() {
+        let fake = fake();
+        assert!(fake.lightbar().is_none());
+        assert!(fake.rumble().is_none());
+        assert!(!fake.capabilities().power_off);
+        // A full-capability status from the same registry shape still targets.
+        let reading = fake.canned_reading();
+        let mut status = status_from_reading(&fake, "FakePad", &reading, "aa".into());
+        status.capabilities = crate::controller::model::Capabilities::FULL;
+        let drivers: &[&dyn ControllerDriver] = &[&crate::controller::driver::DUALSENSE];
+        // kinds match (both DualSense) and the real backend exists.
+        assert_eq!(lightbar_targets(drivers, std::iter::once(&status)).len(), 1);
     }
 }
