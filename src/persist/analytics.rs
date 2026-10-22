@@ -8,7 +8,7 @@
 //! leaves the machine.
 
 use crate::controller::dualsense::battery::LOW_BATTERY_PERCENT;
-use crate::controller::model::{ControllerStatus, PowerState};
+use crate::controller::model::{ControllerStatus, PowerState, Serial};
 use crate::persist::json;
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
@@ -83,7 +83,7 @@ pub struct SerialRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct AnalyticsFile {
     #[serde(default)]
-    controllers: HashMap<String, SerialRecord>,
+    controllers: HashMap<Serial, SerialRecord>,
 }
 
 /// One step on the coverage chart.
@@ -117,13 +117,13 @@ pub enum EtaHint {
 
 #[derive(Debug, Clone, Default)]
 pub struct AnalyticsStore {
-    by_serial: HashMap<String, SerialRecord>,
+    by_serial: HashMap<Serial, SerialRecord>,
     dirty: bool,
     last_tick_ms: Option<u64>,
     /// Wall-clock ms when the current connect grace began (runtime only).
-    connected_at_ms: HashMap<String, u64>,
+    connected_at_ms: HashMap<Serial, u64>,
     /// Serials that have been reconciled once after leaving connect grace.
-    grace_reconciled: std::collections::HashSet<String>,
+    grace_reconciled: std::collections::HashSet<Serial>,
 }
 
 impl AnalyticsStore {
@@ -138,7 +138,11 @@ impl AnalyticsStore {
     fn from_root(path: &Path, mut root: Map<String, serde_json::Value>) -> Self {
         let map = json::take_object(&mut root, "controllers");
         let source_len = map.len();
-        let (by_serial, skipped) = json::decode_map_values::<SerialRecord>(map);
+        let (raw, skipped) = json::decode_map_values::<SerialRecord>(map);
+        let by_serial: HashMap<Serial, SerialRecord> = raw
+            .into_iter()
+            .map(|(key, record)| (Serial::from(key), record))
+            .collect();
         if json::total_loss(path, "analytics controllers", source_len, by_serial.len()) {
             return Self::default();
         }
@@ -221,7 +225,7 @@ impl AnalyticsStore {
         if brief_blip {
             return;
         }
-        self.connected_at_ms.insert(serial.to_string(), now_ms);
+        self.connected_at_ms.insert(Serial::from(serial), now_ms);
         self.grace_reconciled.remove(serial);
         self.clear_in_progress(serial, now_ms);
     }
@@ -285,14 +289,14 @@ impl AnalyticsStore {
         self.last_tick_ms = Some(now_ms);
 
         let prev_by: HashMap<&str, &ControllerStatus> =
-            previous.iter().map(|c| (c.serial.as_str(), c)).collect();
+            previous.iter().map(|c| (c.serial.as_ref(), c)).collect();
         let next_by: HashMap<&str, &ControllerStatus> =
-            next.iter().map(|c| (c.serial.as_str(), c)).collect();
+            next.iter().map(|c| (c.serial.as_ref(), c)).collect();
 
         // Heartbeat: accrue only while the pad is present.
         if heartbeat_ok {
             for controller in next {
-                if !Self::is_storable_serial(&controller.serial) {
+                if !Self::is_storable_serial(controller.serial.as_ref()) {
                     continue;
                 }
                 if let Some(record) = self.by_serial.get_mut(&controller.serial)
@@ -309,10 +313,10 @@ impl AnalyticsStore {
 
         // Disconnect: pause accrual (keep in_progress; no commit).
         for prev in previous {
-            if !Self::is_storable_serial(&prev.serial) {
+            if !Self::is_storable_serial(prev.serial.as_ref()) {
                 continue;
             }
-            if next_by.contains_key(prev.serial.as_str()) {
+            if next_by.contains_key(prev.serial.as_ref()) {
                 continue;
             }
             if let Some(record) = self.by_serial.get_mut(&prev.serial) {
@@ -322,10 +326,10 @@ impl AnalyticsStore {
         }
 
         for controller in next {
-            if !Self::is_storable_serial(&controller.serial) {
+            if !Self::is_storable_serial(controller.serial.as_ref()) {
                 continue;
             }
-            let prev = prev_by.get(controller.serial.as_str()).copied();
+            let prev = prev_by.get(controller.serial.as_ref()).copied();
             self.on_controller(prev, controller, now_ms);
         }
 
@@ -338,7 +342,7 @@ impl AnalyticsStore {
         next: &ControllerStatus,
         now_ms: u64,
     ) {
-        let serial = next.serial.as_str();
+        let serial = next.serial.as_ref();
         let previous_last_seen = self.by_serial.get(serial).map(|r| r.last_seen_ms);
         self.ensure_record(serial, now_ms);
 
@@ -354,7 +358,7 @@ impl AnalyticsStore {
         }
 
         if !Self::skips_connect_grace(serial) && !self.grace_reconciled.contains(serial) {
-            self.grace_reconciled.insert(serial.to_string());
+            self.grace_reconciled.insert(Serial::from(serial));
             let progress = self
                 .by_serial
                 .get(serial)
@@ -564,20 +568,22 @@ impl AnalyticsStore {
     }
 
     fn ensure_record(&mut self, serial: &str, now_ms: u64) {
-        self.by_serial.entry(serial.to_string()).or_insert_with(|| {
-            self.dirty = true;
-            SerialRecord {
-                last_seen_ms: now_ms,
-                ..SerialRecord::default()
-            }
-        });
+        self.by_serial
+            .entry(Serial::from(serial))
+            .or_insert_with(|| {
+                self.dirty = true;
+                SerialRecord {
+                    last_seen_ms: now_ms,
+                    ..SerialRecord::default()
+                }
+            });
     }
 
     fn prune(&mut self, now_ms: u64, keep_serial: impl Fn(&str) -> bool) {
         let stale_ms = Duration::from_secs(STALE_SERIAL_DAYS * 24 * 60 * 60).as_millis() as u64;
         let before = self.by_serial.len();
         self.by_serial.retain(|serial, record| {
-            if keep_serial(serial) {
+            if keep_serial(serial.as_ref()) {
                 return true;
             }
             now_ms.saturating_sub(record.last_seen_ms) <= stale_ms
@@ -590,7 +596,7 @@ impl AnalyticsStore {
             let oldest = self
                 .by_serial
                 .iter()
-                .filter(|(serial, _)| !keep_serial(serial))
+                .filter(|(serial, _)| !keep_serial(serial.as_ref()))
                 .min_by_key(|(_, r)| r.last_seen_ms)
                 .map(|(s, _)| s.clone());
             let Some(serial) = oldest else {
@@ -633,10 +639,10 @@ impl AnalyticsStore {
                     return None;
                 }
                 Some(ControllerAnalytics {
-                    serial: serial.clone(),
-                    typical_charge: self.typical_charge(&serial),
-                    typical_play: self.typical_play(&serial),
-                    in_progress: self.in_progress(&serial).cloned(),
+                    serial: serial.to_string(),
+                    typical_charge: self.typical_charge(serial.as_ref()),
+                    typical_play: self.typical_play(serial.as_ref()),
+                    in_progress: self.in_progress(serial.as_ref()).cloned(),
                     drain_coverage: coverage_list(&record.drain_steps, &drain_edges()),
                     charge_coverage: coverage_list(&record.charge_steps, &charge_edges()),
                 })
@@ -646,8 +652,12 @@ impl AnalyticsStore {
 
     pub fn eta_for(&self, controller: &ControllerStatus) -> Option<EtaHint> {
         match controller.state {
-            PowerState::Discharging => self.eta_play_at(&controller.serial, controller.percent),
-            PowerState::Charging => self.eta_charge_at(&controller.serial, controller.percent),
+            PowerState::Discharging => {
+                self.eta_play_at(controller.serial.as_ref(), controller.percent)
+            }
+            PowerState::Charging => {
+                self.eta_charge_at(controller.serial.as_ref(), controller.percent)
+            }
             _ => None,
         }
     }
@@ -1065,6 +1075,44 @@ mod tests {
         );
         assert_eq!(store.by_serial["no_seen"].last_seen_ms, 0);
         assert!(!store.by_serial.contains_key("bad_step"));
+    }
+
+    /// The `Serial` newtype must not change `analytics.json`: per-pad records
+    /// stay keyed by plain serial strings.
+    #[test]
+    fn analytics_file_round_trip_preserves_schema() {
+        let mut store = AnalyticsStore::default();
+        store.by_serial.insert(
+            Serial::from("a"),
+            SerialRecord {
+                last_seen_ms: 42,
+                drain_steps: vec![StepSample {
+                    from_percent: 45,
+                    to_percent: 35,
+                    samples_ms: vec![60_000],
+                }],
+                ..SerialRecord::default()
+            },
+        );
+        let file = AnalyticsFile {
+            controllers: store.by_serial.clone(),
+        };
+        let json = serde_json::to_string(&file).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["controllers"]["a"]["last_seen_ms"], 42);
+        assert_eq!(
+            value["controllers"]["a"]["drain_steps"][0]["from_percent"],
+            45
+        );
+
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"controllers":{"a":{"last_seen_ms":42,"drain_steps":[{"from_percent":45,"to_percent":35,"samples_ms":[60000]}],"charge_steps":[],"in_progress":null}}}"#,
+        )
+        .unwrap();
+        assert_eq!(value, expected);
+
+        let back: AnalyticsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.controllers, file.controllers);
     }
 
     #[test]
@@ -1662,7 +1710,7 @@ mod tests {
         let now = ms(STALE_SERIAL_DAYS * 24 * 60 * 60 + 10_000);
         let now_ms = system_time_ms(now);
         for i in 0..35 {
-            let serial = format!("pad{i:02}");
+            let serial = Serial::from(format!("pad{i:02}"));
             store.by_serial.insert(
                 serial,
                 SerialRecord {

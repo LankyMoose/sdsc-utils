@@ -3,6 +3,7 @@
 //! Intentional Quit does not go through the panic hook, so it never restarts.
 //! A budget file under the app data dir stops crash loops.
 
+use crate::AppResult;
 use crate::persist::paths;
 use crate::platform::app_log;
 use serde::{Deserialize, Serialize};
@@ -171,7 +172,7 @@ pub fn run_relauncher() -> ExitCode {
 }
 
 /// Returns `Ok(true)` if this attempt is within budget (and records it).
-fn consume_budget() -> Result<bool, String> {
+fn consume_budget() -> AppResult<bool> {
     let path = budget_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -193,7 +194,7 @@ fn consume_budget() -> Result<bool, String> {
     Ok(true)
 }
 
-fn write_budget(path: &std::path::Path, budget: &RestartBudget) -> Result<(), String> {
+fn write_budget(path: &std::path::Path, budget: &RestartBudget) -> AppResult<()> {
     let bytes = serde_json::to_vec_pretty(budget).map_err(|e| e.to_string())?;
     fs::write(path, bytes).map_err(|e| e.to_string())
 }

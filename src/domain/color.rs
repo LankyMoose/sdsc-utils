@@ -1,5 +1,6 @@
 //! Battery-driven lightbar colors.
 
+use crate::AppResult;
 use serde::de::{Deserializer, Error as DeError, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -97,7 +98,7 @@ impl BatterySpectrum {
         }
     }
 
-    pub fn from_stops(mut stops: Vec<GradientStop>) -> Result<Self, String> {
+    pub fn from_stops(mut stops: Vec<GradientStop>) -> AppResult<Self> {
         normalize_stops(&mut stops)?;
         Ok(Self { stops })
     }
@@ -132,7 +133,7 @@ impl BatterySpectrum {
         stops[0].color
     }
 
-    pub fn set_stop_color(&mut self, index: usize, color: Rgb) -> Result<(), String> {
+    pub fn set_stop_color(&mut self, index: usize, color: Rgb) -> AppResult<()> {
         let stop = self
             .stops
             .get_mut(index)
@@ -141,7 +142,7 @@ impl BatterySpectrum {
         Ok(())
     }
 
-    pub fn set_stop_percent(&mut self, index: usize, percent: u8) -> Result<usize, String> {
+    pub fn set_stop_percent(&mut self, index: usize, percent: u8) -> AppResult<usize> {
         if index >= self.stops.len() {
             return Err(format!("stop index {index} out of range"));
         }
@@ -162,7 +163,7 @@ impl BatterySpectrum {
             .ok_or_else(|| "failed to relocate stop after reorder".to_string())
     }
 
-    pub fn add_stop_at(&mut self, percent: u8) -> Result<usize, String> {
+    pub fn add_stop_at(&mut self, percent: u8) -> AppResult<usize> {
         if self.stops.len() >= Self::MAX_STOPS {
             return Err(format!("at most {} stops are allowed", Self::MAX_STOPS));
         }
@@ -179,7 +180,7 @@ impl BatterySpectrum {
             .ok_or_else(|| "failed to locate newly added stop".to_string())
     }
 
-    pub fn remove_stop(&mut self, index: usize) -> Result<usize, String> {
+    pub fn remove_stop(&mut self, index: usize) -> AppResult<usize> {
         if self.stops.len() <= Self::MIN_STOPS {
             return Err(format!("at least {} stops are required", Self::MIN_STOPS));
         }
@@ -210,7 +211,7 @@ fn unique_percent(occupied: &[u8], percent: u8) -> Option<u8> {
     None
 }
 
-fn normalize_stops(stops: &mut [GradientStop]) -> Result<(), String> {
+fn normalize_stops(stops: &mut [GradientStop]) -> AppResult<()> {
     if !(BatterySpectrum::MIN_STOPS..=BatterySpectrum::MAX_STOPS).contains(&stops.len()) {
         return Err(format!(
             "spectrum requires {}-{} stops, got {}",

@@ -1,5 +1,6 @@
 //! DualSense lightbar HID output.
 
+use crate::AppResult;
 use crate::controller::dualsense::identity::{
     self as dualsense, HidIoLock, is_dualsense_device, is_dualsense_gamepad, normalize_identity,
     resolve_device_identity,
@@ -321,7 +322,7 @@ pub fn apply_lightbar_rgb_timed(
     serial: &str,
     color: Rgb,
     claims: &ClaimStore,
-) -> (Result<(), String>, HidPhaseTiming) {
+) -> (AppResult<()>, HidPhaseTiming) {
     let (first, mut timing) = try_apply_by_serial_timed(api, serial, color, false, claims);
     match first {
         Ok(()) => (Ok(()), timing),
@@ -341,7 +342,7 @@ fn try_apply_by_serial_timed(
     color: Rgb,
     retry: bool,
     claims: &ClaimStore,
-) -> (Result<(), String>, HidPhaseTiming) {
+) -> (AppResult<()>, HidPhaseTiming) {
     let mut timing = HidPhaseTiming::default();
     let enum_started = Instant::now();
     let target = normalize_identity(serial);
@@ -454,7 +455,7 @@ fn apply_on_open_device_inner(
     retry: bool,
     claim: bool,
     claims: &ClaimStore,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let target = normalize_identity(serial);
     match set_lightbar_on_device(
         device,
@@ -670,11 +671,7 @@ fn build_bt_report(
 ///
 /// Takes the caller's `&HidIoLock` (CLI one-shots use a local
 /// `HidIoLock::new()`); the timed variant below assumes the lock is held.
-pub fn apply_lightbar_all(
-    lock: &HidIoLock,
-    color: Rgb,
-    claims: &ClaimStore,
-) -> Result<usize, String> {
+pub fn apply_lightbar_all(lock: &HidIoLock, color: Rgb, claims: &ClaimStore) -> AppResult<usize> {
     let _guard = lock.lock()?;
     apply_lightbar_all_timed(color, claims).0
 }
@@ -682,7 +679,7 @@ pub fn apply_lightbar_all(
 pub fn apply_lightbar_all_timed(
     color: Rgb,
     claims: &ClaimStore,
-) -> (Result<usize, String>, HidPhaseTiming) {
+) -> (AppResult<usize>, HidPhaseTiming) {
     let mut timing = HidPhaseTiming::default();
     let enum_started = Instant::now();
     let api = match HidApi::new() {

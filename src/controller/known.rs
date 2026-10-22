@@ -1,7 +1,7 @@
 //! Persisted remembered DualSense pads and nicknames (`controllers.json`).
 
 use crate::controller::dualsense::identity::is_storable_serial;
-use crate::controller::model::ControllerStatus;
+use crate::controller::model::{ControllerStatus, Serial};
 use crate::persist::json;
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 /// New persisted fields need `#[serde(default)]` (or the oldest-shape fixture fails).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnownController {
-    pub serial: String,
+    pub serial: Serial,
     pub product: String,
     pub connection: String,
     pub percent: u8,
@@ -24,13 +24,13 @@ struct KnownFile {
     #[serde(default)]
     controllers: Vec<KnownController>,
     #[serde(default)]
-    nicknames: HashMap<String, String>,
+    nicknames: HashMap<Serial, String>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct KnownControllers {
-    by_serial: HashMap<String, KnownController>,
-    nicknames: HashMap<String, String>,
+    by_serial: HashMap<Serial, KnownController>,
+    nicknames: HashMap<Serial, String>,
     dirty: bool,
 }
 
@@ -79,7 +79,7 @@ impl KnownControllers {
             return Self::default();
         }
         json::warn_skipped(path, "controllers", skipped);
-        let nicknames: HashMap<String, String> = json::take_default(&mut root, "nicknames");
+        let nicknames: HashMap<Serial, String> = json::take_default(&mut root, "nicknames");
         Self::from_file(KnownFile {
             controllers,
             nicknames,
@@ -89,13 +89,13 @@ impl KnownControllers {
     fn from_file(file: KnownFile) -> Self {
         let mut by_serial = HashMap::new();
         for record in file.controllers {
-            if is_storable_serial(&record.serial) {
+            if record.serial.is_storable() {
                 by_serial.insert(record.serial.clone(), record);
             }
         }
         let mut nicknames = HashMap::new();
         for (serial, name) in file.nicknames {
-            if !is_storable_serial(&serial) {
+            if !serial.is_storable() {
                 continue;
             }
             let trimmed = name.trim();
@@ -153,7 +153,7 @@ impl KnownControllers {
         }
         match next {
             Some(name) => {
-                self.nicknames.insert(serial.to_string(), name);
+                self.nicknames.insert(Serial::from(serial), name);
             }
             None => {
                 self.nicknames.remove(serial);
@@ -164,7 +164,7 @@ impl KnownControllers {
     }
 
     pub fn remember(&mut self, controller: &ControllerStatus) -> bool {
-        if !is_storable_serial(&controller.serial) {
+        if !controller.serial.is_storable() {
             return false;
         }
         match self.by_serial.get_mut(&controller.serial) {
@@ -199,7 +199,7 @@ impl KnownControllers {
     pub fn sync_from_live(&mut self, live: &[ControllerStatus]) -> bool {
         let mut changed = false;
         for controller in live {
-            if !is_storable_serial(&controller.serial) {
+            if !controller.serial.is_storable() {
                 continue;
             }
             if let Some(record) = self.by_serial.get_mut(&controller.serial)
@@ -220,11 +220,11 @@ impl KnownControllers {
         live: &'a [ControllerStatus],
     ) -> Vec<&'a KnownController> {
         let live_serials: std::collections::HashSet<&str> =
-            live.iter().map(|c| c.serial.as_str()).collect();
+            live.iter().map(|c| c.serial.as_ref()).collect();
         let mut out: Vec<_> = self
             .by_serial
             .values()
-            .filter(|r| !live_serials.contains(r.serial.as_str()))
+            .filter(|r| !live_serials.contains(r.serial.as_ref()))
             .collect();
         out.sort_by(|a, b| a.serial.cmp(&b.serial));
         out
@@ -289,7 +289,7 @@ mod tests {
             .into_iter()
             .map(|r| {
                 (
-                    r.serial.clone(),
+                    r.serial.to_string(),
                     r.percent,
                     Connection::from_label(&r.connection).expect("persisted link parses"),
                 )
@@ -331,7 +331,7 @@ mod tests {
             .into_iter()
             .map(|r| {
                 (
-                    r.serial.clone(),
+                    r.serial.to_string(),
                     r.percent,
                     Connection::from_label(&r.connection).expect("parses"),
                 )
@@ -368,7 +368,7 @@ mod tests {
         let live = vec![pad("live", 60, Connection::Usb)];
         let disconnected = store.remembered_disconnected(&live);
         assert_eq!(disconnected.len(), 1);
-        assert_eq!(disconnected[0].serial, "gone");
+        assert_eq!(disconnected[0].serial.as_ref(), "gone");
     }
 
     #[test]
@@ -433,5 +433,37 @@ mod tests {
         );
         assert!(!store.is_remembered("def"));
         assert!(store.nicknames.is_empty());
+    }
+
+    /// The `Serial` newtype must not change `controllers.json`: serials stay
+    /// plain strings both as record fields and as nickname-map keys.
+    #[test]
+    fn known_file_round_trip_preserves_schema() {
+        let mut store = KnownControllers::default();
+        store.remember(&pad("abc", 40, Connection::Usb));
+        store.set_nickname("abc", Some("Couch".into()));
+        let mut controllers: Vec<_> = store.by_serial.values().cloned().collect();
+        controllers.sort_by(|a, b| a.serial.cmp(&b.serial));
+        let file = KnownFile {
+            controllers,
+            nicknames: store.nicknames.clone(),
+        };
+        let json = serde_json::to_string(&file).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["controllers"][0]["serial"], "abc");
+        assert_eq!(value["nicknames"]["abc"], "Couch");
+
+        // Byte-shape check against the pre-`Serial` layout.
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"controllers":[{"serial":"abc","product":"DualSense","connection":"USB","percent":40,"kind":"dual_sense"}],"nicknames":{"abc":"Couch"}}"#,
+        )
+        .unwrap();
+        assert_eq!(value, expected);
+
+        let back: KnownFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, file);
+        let reloaded = KnownControllers::from_file(back);
+        assert!(reloaded.is_remembered("abc"));
+        assert_eq!(reloaded.nickname("abc"), Some("Couch"));
     }
 }

@@ -13,7 +13,7 @@ pub use gate::{
 };
 
 use crate::controller::known::KnownControllers;
-use crate::controller::model::ControllerStatus;
+use crate::controller::model::{ControllerStatus, Serial};
 use crate::persist::analytics::AnalyticsStore;
 use crate::persist::prefs::Prefs;
 use crate::session::notify::{NotifyEvent, NotifyTracker};
@@ -94,7 +94,7 @@ pub struct DeviceSession {
     start_connect_cooldown_until: Option<Instant>,
     pub(crate) skip_next_connect_cooldown: bool,
     controllers_nonempty_since: Option<Instant>,
-    missed_poll_since: HashMap<String, Instant>,
+    missed_poll_since: HashMap<Serial, Instant>,
     pub start_auto_open_pending: bool,
 }
 
@@ -339,8 +339,8 @@ impl DeviceSession {
             let threshold = self.prefs.low_battery_percent;
             self.controllers
                 .iter()
-                .filter(|c| c.is_low_battery(threshold) && !is_emulated_serial(&c.serial))
-                .map(|c| (c.serial.clone(), c.percent))
+                .filter(|c| c.is_low_battery(threshold) && !is_emulated_serial(c.serial.as_ref()))
+                .map(|c| (c.serial.to_string(), c.percent))
                 .collect()
         } else {
             Vec::new()

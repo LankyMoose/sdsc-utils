@@ -16,6 +16,8 @@
 //! existing cross-platform functions, whose non-Windows stubs (`false` / `Err`
 //! / `None`) are preserved verbatim.
 
+use crate::AppResult;
+
 /// Show a window without activating it (so a game keeps focus).
 pub fn show_window(hwnd: isize) {
     #[cfg(windows)]
@@ -198,7 +200,7 @@ impl Host {
     }
 
     /// Create the data directory and open it in the OS file manager.
-    pub fn open_data_folder() -> Result<(), String> {
+    pub fn open_data_folder() -> AppResult<()> {
         crate::persist::paths::open_data_folder()
     }
 }
@@ -216,12 +218,12 @@ impl Host {
     }
 
     /// Create the autostart entry.
-    pub fn install() -> Result<(), String> {
+    pub fn install() -> AppResult<()> {
         crate::platform::autostart::install()
     }
 
     /// Remove the autostart entry (including legacy entries).
-    pub fn uninstall() -> Result<(), String> {
+    pub fn uninstall() -> AppResult<()> {
         crate::platform::autostart::uninstall()
     }
 
@@ -231,7 +233,7 @@ impl Host {
     }
 
     /// Enable or disable the autostart entry.
-    pub fn set_enabled(enabled: bool) -> Result<(), String> {
+    pub fn set_enabled(enabled: bool) -> AppResult<()> {
         crate::platform::autostart::set_enabled(enabled)
     }
 

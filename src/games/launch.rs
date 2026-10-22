@@ -1,5 +1,6 @@
 //! Launch Steam URLs, executables, and shortcuts.
 
+use crate::AppResult;
 #[cfg(not(windows))]
 use std::path::Path;
 use std::path::PathBuf;
@@ -10,7 +11,7 @@ use std::process::Command;
 ///
 /// `args` is passed through to the process when non-empty (Windows: ShellExecute
 /// parameters; Unix: whitespace-split argv for file targets).
-pub fn launch_target(target: &str, args: &str) -> Result<(), String> {
+pub fn launch_target(target: &str, args: &str) -> AppResult<()> {
     let trimmed = target.trim();
     if trimmed.is_empty() {
         return Err("empty launch target".into());
@@ -28,7 +29,7 @@ pub fn launch_target(target: &str, args: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn launch_windows(target: &str, args: &str) -> Result<(), String> {
+fn launch_windows(target: &str, args: &str) -> AppResult<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -79,7 +80,7 @@ fn launch_windows(target: &str, args: &str) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn launch_unix(target: &str, args: &str) -> Result<(), String> {
+fn launch_unix(target: &str, args: &str) -> AppResult<()> {
     if looks_like_url(target) {
         #[cfg(target_os = "macos")]
         {
@@ -120,7 +121,7 @@ fn looks_like_url(target: &str) -> bool {
 ///
 /// Moved next to [`launch_target`]: this is the catalog-launch teardown half,
 /// kept in the launch module instead of the match-policy module.
-pub fn close_matching(match_paths: &[PathBuf]) -> Result<(), String> {
+pub fn close_matching(match_paths: &[PathBuf]) -> AppResult<()> {
     #[cfg(windows)]
     {
         close_matching_windows(match_paths)
@@ -146,7 +147,7 @@ fn matching_pids(match_paths: &[PathBuf]) -> Vec<u32> {
 }
 
 #[cfg(windows)]
-fn close_matching_windows(match_paths: &[PathBuf]) -> Result<(), String> {
+fn close_matching_windows(match_paths: &[PathBuf]) -> AppResult<()> {
     use std::collections::HashSet;
     use std::thread;
     use std::time::Duration;

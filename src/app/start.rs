@@ -12,6 +12,7 @@ use super::{
     START_CURSOR_IDLE_HIDE, START_NAV_NOT_READY_MS, chord_held_on_any_pad, delay,
     is_manual_target_missing, spawn_blocking, steam_appid_from_target,
 };
+use crate::AppResult;
 use crate::controller::dualsense::rumble::MotorPulse;
 use crate::games::process_match::RunningSession;
 use crate::games::steam::SteamGame;
@@ -930,7 +931,7 @@ impl App {
 
     pub(crate) fn on_steam_scan_done(
         &mut self,
-        result: Result<Vec<SteamGame>, String>,
+        result: AppResult<Vec<SteamGame>>,
     ) -> Task<Message> {
         let scan_ms = self
             .steam_scan_started
@@ -1170,7 +1171,7 @@ impl App {
         let ms = duration.as_millis() as u64;
         for controller in &self.session.controllers {
             self.hid_worker
-                .rumble(controller.serial.clone(), right, left, ms);
+                .rumble(controller.serial.to_string(), right, left, ms);
         }
     }
 
@@ -2309,7 +2310,7 @@ impl App {
             .controllers
             .iter()
             .map(|c| {
-                let nickname = self.session.known.nickname(&c.serial);
+                let nickname = self.session.known.nickname(c.serial.as_ref());
                 let eta = if self.session.prefs.analytics_enabled {
                     self.session
                         .analytics
@@ -2319,7 +2320,7 @@ impl App {
                     None
                 };
                 start_view::StartControllerRow {
-                    serial: c.serial.clone(),
+                    serial: c.serial.to_string(),
                     title: start_view::controller_title(&c.product, nickname),
                     connection: c.connection.to_string(),
                     state: if c.is_low_battery(self.session.prefs.low_battery_percent) {
@@ -2341,17 +2342,17 @@ impl App {
                 .known
                 .remembered_disconnected(&self.session.controllers)
             {
-                let nickname = self.session.known.nickname(&controller.serial);
+                let nickname = self.session.known.nickname(controller.serial.as_ref());
                 let eta = if self.session.prefs.analytics_enabled {
                     self.session
                         .analytics
-                        .eta_play_at(&controller.serial, controller.percent)
+                        .eta_play_at(controller.serial.as_ref(), controller.percent)
                         .map(analytics::format_eta_ring)
                 } else {
                     None
                 };
                 rows.push(start_view::StartControllerRow {
-                    serial: controller.serial.clone(),
+                    serial: controller.serial.to_string(),
                     title: start_view::controller_title(&controller.product, nickname),
                     connection: controller.connection.clone(),
                     state: "disconnected".into(),
@@ -2415,7 +2416,7 @@ impl App {
 
     pub(crate) fn on_process_enum_result(
         &mut self,
-        result: Result<Vec<(u32, PathBuf)>, String>,
+        result: AppResult<Vec<(u32, PathBuf)>>,
     ) -> Task<Message> {
         self.process_enum_inflight = false;
         let images = match result {
@@ -2591,13 +2592,11 @@ impl App {
         crate::controller::hid::diag::diag_info(format!("ui-diag: game closing target={target}"));
         Task::perform(
             spawn_blocking(move || launch::close_matching(&match_paths)),
-            |res: Result<Result<(), String>, String>| {
-                Message::CloseGameDone(res.unwrap_or_else(Err))
-            },
+            |res: AppResult<AppResult<()>>| Message::CloseGameDone(res.unwrap_or_else(Err)),
         )
     }
 
-    pub(crate) fn on_close_game_done(&mut self, result: Result<(), String>) -> Task<Message> {
+    pub(crate) fn on_close_game_done(&mut self, result: AppResult<()>) -> Task<Message> {
         if let Err(err) = result {
             app_log::warn(format!("close game failed: {err}"));
         }

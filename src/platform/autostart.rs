@@ -3,6 +3,7 @@
 //! Portable builds use a Startup-folder `.lnk`. Packaged (MSIX / Store) builds use
 //! the `desktop:StartupTask` declared in `packaging/AppxManifest.xml`.
 
+use crate::AppResult;
 use crate::platform::app_log;
 use crate::platform::app_meta::PKG_NAME;
 use crate::platform::packaged;
@@ -39,7 +40,7 @@ pub fn is_enabled() -> bool {
     }
 }
 
-pub fn set_enabled(enabled: bool) -> Result<(), String> {
+pub fn set_enabled(enabled: bool) -> AppResult<()> {
     if enabled { install() } else { uninstall() }
 }
 
@@ -55,7 +56,7 @@ pub fn ensure_quiet_entry() {
     }
 }
 
-pub fn install() -> Result<(), String> {
+pub fn install() -> AppResult<()> {
     #[cfg(not(windows))]
     {
         return Err("autostart install is only supported on Windows".into());
@@ -86,7 +87,7 @@ pub fn install() -> Result<(), String> {
     }
 }
 
-pub fn uninstall() -> Result<(), String> {
+pub fn uninstall() -> AppResult<()> {
     #[cfg(not(windows))]
     {
         return Err("autostart uninstall is only supported on Windows".into());
@@ -132,7 +133,7 @@ fn packaged_is_enabled() -> bool {
 }
 
 #[cfg(windows)]
-fn packaged_set_enabled(enabled: bool) -> Result<(), String> {
+fn packaged_set_enabled(enabled: bool) -> AppResult<()> {
     use windows::ApplicationModel::{StartupTask, StartupTaskState};
     use windows::core::HSTRING;
 
@@ -176,7 +177,7 @@ enum PackagedStartupState {
 }
 
 #[cfg(windows)]
-fn packaged_task_state() -> Result<PackagedStartupState, String> {
+fn packaged_task_state() -> AppResult<PackagedStartupState> {
     use windows::ApplicationModel::{StartupTask, StartupTaskState};
     use windows::core::HSTRING;
 
@@ -217,7 +218,7 @@ fn migrate_legacy_cmd() {
 }
 
 #[cfg(windows)]
-fn create_shortcut(lnk: &Path, target: &Path, work_dir: &Path) -> Result<(), String> {
+fn create_shortcut(lnk: &Path, target: &Path, work_dir: &Path) -> AppResult<()> {
     let script = format!(
         "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{}'); \
          $s.TargetPath = '{}'; \
@@ -258,7 +259,7 @@ fn ps_single_quoted(s: &str) -> String {
 }
 
 #[cfg(windows)]
-fn remove_if_exists(path: &Path) -> Result<bool, String> {
+fn remove_if_exists(path: &Path) -> AppResult<bool> {
     if path.exists() {
         fs::remove_file(path).map_err(|e| e.to_string())?;
         Ok(true)
@@ -268,17 +269,17 @@ fn remove_if_exists(path: &Path) -> Result<bool, String> {
 }
 
 #[cfg(windows)]
-fn startup_lnk_path() -> Result<PathBuf, String> {
+fn startup_lnk_path() -> AppResult<PathBuf> {
     Ok(startup_dir()?.join(format!("{PKG_NAME}.lnk")))
 }
 
 #[cfg(windows)]
-fn startup_cmd_path() -> Result<PathBuf, String> {
+fn startup_cmd_path() -> AppResult<PathBuf> {
     Ok(startup_dir()?.join(format!("{PKG_NAME}.cmd")))
 }
 
 #[cfg(windows)]
-fn startup_dir() -> Result<PathBuf, String> {
+fn startup_dir() -> AppResult<PathBuf> {
     let appdata = env::var_os("APPDATA").ok_or("APPDATA not set")?;
     Ok(PathBuf::from(appdata)
         .join("Microsoft")

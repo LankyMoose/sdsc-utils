@@ -74,7 +74,7 @@ impl ControllerRow {
         eta: Option<String>,
     ) -> Self {
         Self {
-            serial: controller.serial.clone(),
+            serial: controller.serial.to_string(),
             product: controller.product.clone(),
             nickname,
             connection: controller.connection.to_string(),
@@ -100,7 +100,7 @@ impl ControllerRow {
         eta: Option<String>,
     ) -> Self {
         Self {
-            serial: controller.serial.clone(),
+            serial: controller.serial.to_string(),
             product: controller.product.clone(),
             nickname,
             connection: controller.connection.clone(),

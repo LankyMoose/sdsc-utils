@@ -1,5 +1,6 @@
 //! SVG rasterization for tray / UI icons (`resvg`).
 
+use crate::AppResult;
 use resvg::tiny_skia;
 use resvg::usvg;
 use std::collections::HashMap;
@@ -149,7 +150,7 @@ impl SvgRasterCache {
     }
 
     /// Rasterize an SVG into straight RGBA (`size × size × 4`).
-    pub fn rasterize(&self, svg: &str, size: u32, colors: &ColorMap) -> Result<Vec<u8>, String> {
+    pub fn rasterize(&self, svg: &str, size: u32, colors: &ColorMap) -> AppResult<Vec<u8>> {
         if size == 0 {
             return Err("svg rasterize size must be > 0".into());
         }
@@ -191,7 +192,7 @@ impl Default for SvgRasterCache {
 /// Called by `build.rs` (tray bytes + `app.ico`) and `src/bin/gen_msix_logos.rs`
 /// (Store logos); both include this file via `#[path]` so the helper must
 /// stay even though the app itself rasterizes through [`SvgRasterCache`].
-pub fn render_dualsense_connected_rgba(size: u32) -> Result<Vec<u8>, String> {
+pub fn render_dualsense_connected_rgba(size: u32) -> AppResult<Vec<u8>> {
     SvgRasterCache::new().rasterize(
         DUALSENSE_SVG,
         size,
@@ -200,11 +201,11 @@ pub fn render_dualsense_connected_rgba(size: u32) -> Result<Vec<u8>, String> {
 }
 
 /// Dim DualSense raster for the disconnected tray icon (see above).
-pub fn render_dualsense_dim_rgba(size: u32) -> Result<Vec<u8>, String> {
+pub fn render_dualsense_dim_rgba(size: u32) -> AppResult<Vec<u8>> {
     SvgRasterCache::new().rasterize(DUALSENSE_SVG, size, &ColorMap::dualsense_dim())
 }
 
-fn rasterize_uncached(svg: &str, size: u32, colors: &ColorMap) -> Result<Vec<u8>, String> {
+fn rasterize_uncached(svg: &str, size: u32, colors: &ColorMap) -> AppResult<Vec<u8>> {
     let tinted = colors.apply(svg);
     let tree = usvg::Tree::from_str(&tinted, &usvg::Options::default())
         .map_err(|e| format!("parse SVG: {e}"))?;
