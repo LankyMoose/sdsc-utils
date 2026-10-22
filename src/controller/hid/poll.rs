@@ -2,6 +2,7 @@
 //!
 //! Also owns the presence / battery / liveness cadence used by the iced daemon.
 
+use crate::AppResult;
 use crate::controller::driver;
 use crate::controller::dualsense::battery;
 use crate::controller::dualsense::identity::{self as dualsense, HidIoLock, hid_serial};
@@ -84,7 +85,7 @@ pub fn poll_controllers(
     previously_connected: &[String],
     spectrum: &SpectrumService,
     claims: &ClaimStore,
-) -> Result<Vec<ControllerStatus>, String> {
+) -> AppResult<Vec<ControllerStatus>> {
     lock.with_lock(|| {
         let api = HidApi::new().map_err(|e| e.to_string())?;
         let mut timing = HidPhaseTiming::default();
@@ -118,7 +119,7 @@ pub fn poll_controllers_timed(
     previously_connected: &[String],
     launch: Option<&mut LaunchPaths>,
     launch_quiet: Option<&mut Vec<String>>,
-) -> (Result<Vec<ControllerStatus>, String>, HidPhaseTiming) {
+) -> (AppResult<Vec<ControllerStatus>>, HidPhaseTiming) {
     let mut timing = HidPhaseTiming::default();
     let result = lock.with_lock(|| {
         poll_controllers_with_api(
@@ -147,7 +148,7 @@ fn poll_controllers_with_api(
     timing: &mut HidPhaseTiming,
     mut launch: Option<&mut LaunchPaths>,
     mut launch_quiet: Option<&mut Vec<String>>,
-) -> Result<Vec<ControllerStatus>, String> {
+) -> AppResult<Vec<ControllerStatus>> {
     // Policy seam: `Policy::default()` reproduces the legacy const cadence
     // exactly; this reference keeps the seam without changing timing.
     let _ = policy;
@@ -269,7 +270,7 @@ pub(crate) fn reassert_lightbar_for_pads<'a>(
         statuses
             .iter()
             .filter(|p| p.supports_lightbar)
-            .map(|p| p.serial.as_str()),
+            .map(|p| p.serial.as_ref()),
     );
     if !claims.is_enabled() {
         return;
@@ -283,23 +284,24 @@ pub(crate) fn reassert_lightbar_for_pads<'a>(
         if !pad.supports_lightbar {
             continue;
         }
-        let serial_key = dualsense::normalize_identity(&pad.serial);
+        let serial_key = dualsense::normalize_identity(pad.serial.as_ref());
         let color = spectrum.color_at(pad.percent);
         if !previous.contains(&serial_key) {
-            claims.prepare_connect(&pad.serial);
-        } else if !claims.reassert_due(&pad.serial, color) {
+            claims.prepare_connect(pad.serial.as_ref());
+        } else if !claims.reassert_due(pad.serial.as_ref(), color) {
             // Stable pad, recently applied: skip the open-write-close so the
             // 5s liveness tick stops churning every bar (color changes, new
             // pads, and the 30s backstop still write).
             continue;
         }
         // Fresh open for lightbar (do not reuse the battery-read handle).
-        let (result, t) = lightbar::apply_lightbar_rgb_timed(api, &pad.serial, color, claims);
+        let (result, t) =
+            lightbar::apply_lightbar_rgb_timed(api, pad.serial.as_ref(), color, claims);
         timing.add_assign(t);
         if let Err(err) = result {
             lightbar::warn_lightbar(&pad.product, err);
         } else {
-            claims.note_applied(&pad.serial, color);
+            claims.note_applied(pad.serial.as_ref(), color);
         }
     }
 }

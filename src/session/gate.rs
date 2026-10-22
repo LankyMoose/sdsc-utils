@@ -1,7 +1,7 @@
 //! Pure start-open / connect-cooldown / poll-hold helpers.
 
 use crate::controller::dualsense::identity::normalize_identity;
-use crate::controller::model::ControllerStatus;
+use crate::controller::model::{ControllerStatus, Serial};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -76,7 +76,7 @@ pub fn should_skip_connect_cooldown_on_power_off(
     qualifying.len() == 1
         && qualifying
             .first()
-            .is_some_and(|c| normalize_identity(&c.serial) == target)
+            .is_some_and(|c| normalize_identity(c.serial.as_ref()) == target)
 }
 
 /// Whether to arm the ghost-flap cooldown after qualifying presence goes empty.
@@ -113,10 +113,10 @@ pub fn should_flush_latched_start(pending: bool, start_enabled: bool, already_op
 pub fn reconcile_poll_with_hold(
     previous: &[ControllerStatus],
     polled: Vec<ControllerStatus>,
-    miss_since: &mut HashMap<String, Instant>,
+    miss_since: &mut HashMap<Serial, Instant>,
     now: Instant,
-) -> (Vec<ControllerStatus>, Vec<String>) {
-    let polled_serials: HashSet<String> = polled.iter().map(|c| c.serial.clone()).collect();
+) -> (Vec<ControllerStatus>, Vec<Serial>) {
+    let polled_serials: HashSet<Serial> = polled.iter().map(|c| c.serial.clone()).collect();
 
     // Pads that returned clear their miss streak.
     miss_since.retain(|serial, _| !polled_serials.contains(serial));
@@ -355,7 +355,7 @@ mod tests {
         // First miss starts the hold window.
         let (held_once, held_serials) =
             reconcile_poll_with_hold(&prev, vec![pad("aa:bb")], &mut misses, t0);
-        assert_eq!(held_serials, vec!["cc:dd".to_string()]);
+        assert_eq!(held_serials, vec![Serial::from("cc:dd")]);
         assert_eq!(held_once.len(), 2);
 
         // Still missing inside the window: kept (hot path misses every ~16ms).
@@ -365,7 +365,7 @@ mod tests {
             &mut misses,
             t0 + POLL_MISS_HOLD - Duration::from_millis(100),
         );
-        assert_eq!(held_again, vec!["cc:dd".to_string()]);
+        assert_eq!(held_again, vec![Serial::from("cc:dd")]);
         assert_eq!(held_twice.len(), 2);
 
         // Past the window: accepted drop (covers the 5s cold poll too).
@@ -377,14 +377,14 @@ mod tests {
         );
         assert!(held_after.is_empty());
         assert_eq!(dropped.len(), 1);
-        assert_eq!(dropped[0].serial, "aa:bb");
+        assert_eq!(dropped[0].serial.as_ref(), "aa:bb");
 
         // Drop resets the streak: a later miss holds again from scratch.
         let both = vec![pad("aa:bb"), pad("cc:dd")];
         let t1 = t0 + POLL_MISS_HOLD + Duration::from_secs(1);
         let (reheld, reheld_serials) =
             reconcile_poll_with_hold(&both, vec![pad("aa:bb")], &mut misses, t1);
-        assert_eq!(reheld_serials, vec!["cc:dd".to_string()]);
+        assert_eq!(reheld_serials, vec![Serial::from("cc:dd")]);
         assert_eq!(reheld.len(), 2);
     }
 }

@@ -1,5 +1,6 @@
 //! Shared app data directory helpers.
 
+use crate::AppResult;
 use crate::platform::app_meta::PKG_NAME;
 use std::fs;
 use std::path::PathBuf;
@@ -38,7 +39,7 @@ pub fn data_dir() -> PathBuf {
 }
 
 /// Create the data directory if needed and open it in the OS file manager.
-pub fn open_data_folder() -> Result<(), String> {
+pub fn open_data_folder() -> AppResult<()> {
     let dir = data_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
 

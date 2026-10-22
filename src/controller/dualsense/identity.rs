@@ -1,5 +1,7 @@
 //! Shared DualSense HID identity, device filters, and I/O lock.
 
+use crate::AppResult;
+use crate::controller::model::Serial;
 use crate::platform::app_log;
 use hidapi::{BusType, DeviceInfo, HidDevice};
 use std::sync::Mutex;
@@ -36,7 +38,7 @@ impl HidIoLock {
     }
 
     /// Take the lock; returns an error string if poisoned.
-    pub fn lock(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+    pub fn lock(&self) -> AppResult<std::sync::MutexGuard<'_, ()>> {
         self.0.lock().map_err(|_| "HID lock poisoned".to_string())
     }
 }
@@ -63,16 +65,12 @@ pub fn hid_serial(info: &DeviceInfo) -> String {
 
 /// True when a serial is a real pad identity (not empty / `"unknown"`).
 pub fn is_storable_serial(serial: &str) -> bool {
-    !serial.is_empty() && serial != "unknown"
+    Serial::from(serial).is_storable()
 }
 
 /// Normalize MAC-style identities so `AA:BB:…` and `aabb…` compare equal.
 pub fn normalize_identity(serial: &str) -> String {
-    serial
-        .chars()
-        .filter(|c| *c != ':' && *c != '-')
-        .flat_map(|c| c.to_lowercase())
-        .collect()
+    Serial::normalize(serial).into_inner()
 }
 
 /// Format a little-endian MAC (as in feature report 0x09) like Windows BT HID serials.

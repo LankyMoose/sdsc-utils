@@ -6,6 +6,7 @@
 //! `localconfig.vdf` stay on the current text reader until those layouts change;
 //! bump [`LAST_KNOWN_COMPATIBLE_STEAM_VERSION`] after verifying a newer client.
 
+use crate::AppResult;
 use crate::persist::{json, paths};
 use crate::platform::app_log;
 use std::collections::BTreeMap;
@@ -85,7 +86,7 @@ pub fn validate_steam_library_path(path: &std::path::Path) -> bool {
 }
 
 /// Installed Steam games, sorted by name.
-pub fn list_installed_games(extra_paths: &[PathBuf]) -> Result<Vec<SteamGame>, String> {
+pub fn list_installed_games(extra_paths: &[PathBuf]) -> AppResult<Vec<SteamGame>> {
     let steam_root = steam_root()?.ok_or_else(|| "Steam install not found".to_string())?;
     let mut library_roots = library_folders(&steam_root)?;
     for path in extra_paths {
@@ -244,7 +245,7 @@ pub fn browse_subtitle(game: &SteamGame) -> String {
     }
 }
 
-pub fn steam_root() -> Result<Option<PathBuf>, String> {
+pub fn steam_root() -> AppResult<Option<PathBuf>> {
     #[cfg(windows)]
     {
         use winreg::RegKey;
@@ -271,7 +272,7 @@ pub fn steam_root() -> Result<Option<PathBuf>, String> {
     }
 }
 
-fn library_folders(steam_root: &Path) -> Result<Vec<PathBuf>, String> {
+fn library_folders(steam_root: &Path) -> AppResult<Vec<PathBuf>> {
     let mut roots = vec![steam_root.to_path_buf()];
     #[cfg(debug_assertions)]
     let mut sources: Vec<LibraryFolderSource> = Vec::new();

@@ -97,7 +97,7 @@ impl App {
                         self.session
                             .controllers
                             .iter()
-                            .find(|c| c.serial == row.serial)
+                            .find(|c| c.serial.as_ref() == row.serial.as_str())
                             .map(|c| c.product.to_string())
                     })
                     .unwrap_or_else(|| {
@@ -861,8 +861,8 @@ impl App {
             .session
             .controllers
             .iter()
-            .filter(|c| !is_emulated_serial(&c.serial))
-            .map(|c| (c.serial.clone(), self.spectrum.color_at(c.percent)))
+            .filter(|c| !is_emulated_serial(c.serial.as_ref()))
+            .map(|c| (c.serial.to_string(), self.spectrum.color_at(c.percent)))
             .collect();
 
         if targets.is_empty() {
@@ -944,7 +944,7 @@ impl App {
             .session
             .controllers
             .iter()
-            .filter(|c| !emulate::is_emulated(&c.serial))
+            .filter(|c| !emulate::is_emulated(c.serial.as_ref()))
             .cloned()
             .collect();
         live.extend(emulate::live(&self.emulated_pads));

@@ -18,6 +18,7 @@
 //!
 //! Timing lines (grep `hid-worker:`) record enumerate / open / io / total.
 
+use crate::AppResult;
 use crate::controller::driver;
 use crate::controller::dualsense::battery;
 use crate::controller::dualsense::identity::{
@@ -129,7 +130,7 @@ struct OpenBackoff {
 enum HidCmd {
     Poll {
         previously: Vec<String>,
-        reply: oneshot::Sender<Result<Vec<ControllerStatus>, String>>,
+        reply: oneshot::Sender<AppResult<Vec<ControllerStatus>>>,
     },
     Identify {
         serial: String,
@@ -222,7 +223,7 @@ impl DeviceCache {
         launch_serials: Arc<Mutex<Vec<String>>>,
         spectrum: SpectrumService,
         claims: Arc<ClaimStore>,
-    ) -> Result<Self, String> {
+    ) -> AppResult<Self> {
         let api = HidApi::new().map_err(|e| e.to_string())?;
         let mut cache = Self {
             api,
@@ -247,7 +248,7 @@ impl DeviceCache {
     }
 
     /// Re-enumerate in place (does **not** reconstruct `HidApi`).
-    fn refresh_device_list(&mut self) -> Result<(), String> {
+    fn refresh_device_list(&mut self) -> AppResult<()> {
         let _op = crate::controller::hid::diag::enter_op("hidapi_refresh");
         let started = Instant::now();
         crate::controller::hid::diag::diag_info("hid-diag: hidapi_refresh begin");
@@ -389,7 +390,7 @@ impl DeviceCache {
     }
 
     /// Open (or reuse) the DualSense matching `serial`. Prefers USB when both exist.
-    fn ensure(&mut self, serial: &str) -> Result<&OpenDevice, String> {
+    fn ensure(&mut self, serial: &str) -> AppResult<&OpenDevice> {
         let target = normalize_identity(serial);
         if self.devices.contains_key(&target) {
             return Ok(self.devices.get(&target).expect("contains"));
@@ -634,7 +635,7 @@ impl RumbleCache {
         self.devices.remove(&normalize_identity(serial));
     }
 
-    fn ensure<'a>(&'a mut self, api: &HidApi, serial: &str) -> Result<&'a OpenDevice, String> {
+    fn ensure<'a>(&'a mut self, api: &HidApi, serial: &str) -> AppResult<&'a OpenDevice> {
         let target = normalize_identity(serial);
         if self.devices.contains_key(&target) {
             return Ok(self.devices.get(&target).expect("contains"));
@@ -986,8 +987,7 @@ impl HidWorkerHandle {
     pub fn poll(
         &self,
         previously: Vec<String>,
-    ) -> impl std::future::Future<Output = Result<Vec<ControllerStatus>, String>> + Send + use<>
-    {
+    ) -> impl std::future::Future<Output = AppResult<Vec<ControllerStatus>>> + Send + use<> {
         let (reply, rx) = oneshot::channel();
         let _ = self.tx.send(HidCmd::Poll { previously, reply });
         async move {
@@ -1068,7 +1068,7 @@ fn write_rgb_exclusive(
     claims: &ClaimStore,
     serial: &str,
     color: Rgb,
-) -> (Result<(), String>, HidPhaseTiming) {
+) -> (AppResult<()>, HidPhaseTiming) {
     cache.drop_serial(serial);
     let (result, mut timing) =
         lightbar::apply_lightbar_rgb_timed(&cache.api, serial, color, claims);
@@ -1577,7 +1577,7 @@ fn write_rumble_pulse(
     serial: &str,
     right: u8,
     left: u8,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let target = normalize_identity(serial);
 
     // Prefer long-lived exclusive rumble handle. On write failure, drop and re-probe.
@@ -1940,7 +1940,7 @@ fn poll_incremental(
     live_pads: &Mutex<HashMap<String, LivePadStatus>>,
     previously: &[String],
     launch_quiet: &mut Vec<String>,
-) -> (Result<Vec<ControllerStatus>, String>, HidPhaseTiming) {
+) -> (AppResult<Vec<ControllerStatus>>, HidPhaseTiming) {
     let mut timing = HidPhaseTiming::default();
     let now = Instant::now();
 

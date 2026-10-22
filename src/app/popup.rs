@@ -35,12 +35,13 @@ impl App {
     }
 
     pub(crate) fn sync_popup_rows(&mut self) {
-        if self
-            .start_state
-            .powering_off
-            .as_ref()
-            .is_some_and(|s| !self.session.controllers.iter().any(|c| c.serial == *s))
-        {
+        if self.start_state.powering_off.as_ref().is_some_and(|s| {
+            !self
+                .session
+                .controllers
+                .iter()
+                .any(|c| c.serial.as_ref() == s.as_str())
+        }) {
             self.start_state.powering_off = None;
         }
         let threshold = self.session.prefs.low_battery_percent;
@@ -56,12 +57,12 @@ impl App {
             };
             rows.push(ControllerRow::connected(
                 controller,
-                self.session.known.is_remembered(&controller.serial),
-                dualsense::is_storable_serial(&controller.serial)
-                    && !super::is_emulated_serial(&controller.serial),
+                self.session.known.is_remembered(controller.serial.as_ref()),
+                dualsense::is_storable_serial(controller.serial.as_ref())
+                    && !super::is_emulated_serial(controller.serial.as_ref()),
                 self.session
                     .known
-                    .nickname(&controller.serial)
+                    .nickname(controller.serial.as_ref())
                     .map(str::to_string),
                 threshold,
                 eta,
@@ -75,12 +76,12 @@ impl App {
             let nickname = self
                 .session
                 .known
-                .nickname(&controller.serial)
+                .nickname(controller.serial.as_ref())
                 .map(str::to_string);
             let eta = if self.session.prefs.analytics_enabled {
                 self.session
                     .analytics
-                    .eta_play_at(&controller.serial, controller.percent)
+                    .eta_play_at(controller.serial.as_ref(), controller.percent)
                     .map(analytics::format_eta_ring)
             } else {
                 None

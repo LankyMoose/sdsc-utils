@@ -4,7 +4,7 @@
 //! threshold into the low window. A pad that appears already low does not.
 //! Connect toasts skip serials queued as already present at process launch.
 
-use crate::controller::model::{ControllerStatus, PowerState};
+use crate::controller::model::{ControllerStatus, PowerState, Serial};
 use crate::persist::prefs::Prefs;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -17,9 +17,9 @@ struct SerialFlags {
 
 #[derive(Debug, Default)]
 pub struct NotifyTracker {
-    by_serial: HashMap<String, SerialFlags>,
+    by_serial: HashMap<Serial, SerialFlags>,
     /// Serials already connected at process start — suppress one Connected toast.
-    launch_quiet: HashSet<String>,
+    launch_quiet: HashSet<Serial>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +46,8 @@ impl NotifyTracker {
 
     /// Mark serials that were already present when the app started (no Connected toast).
     pub fn queue_launch_quiet(&mut self, serials: impl IntoIterator<Item = String>) {
-        self.launch_quiet.extend(serials);
+        self.launch_quiet
+            .extend(serials.into_iter().map(Serial::from));
     }
 
     /// Collect overlay toasts for connect / low-battery / charge-complete transitions.
@@ -61,7 +62,11 @@ impl NotifyTracker {
             .collect_events(previous, next, prefs)
             .into_iter()
             .map(|(controller, kind)| {
-                format_event(controller, kind, nickname(&controller.serial).as_deref())
+                format_event(
+                    controller,
+                    kind,
+                    nickname(controller.serial.as_ref()).as_deref(),
+                )
             })
             .collect();
         if prefs.notify_disconnect {
@@ -73,7 +78,7 @@ impl NotifyTracker {
                         format_event(
                             controller,
                             NotifyKind::Disconnect,
-                            nickname(&controller.serial).as_deref(),
+                            nickname(controller.serial.as_ref()).as_deref(),
                         )
                     }),
             );
@@ -88,7 +93,7 @@ impl NotifyTracker {
         prefs: &Prefs,
     ) -> Vec<(&'a ControllerStatus, NotifyKind)> {
         let prev_by_serial: HashMap<&str, &ControllerStatus> =
-            previous.iter().map(|c| (c.serial.as_str(), c)).collect();
+            previous.iter().map(|c| (c.serial.as_ref(), c)).collect();
 
         self.by_serial
             .retain(|serial, _| next.iter().any(|c| c.serial == *serial));
@@ -104,7 +109,7 @@ impl NotifyTracker {
 
         for controller in next {
             let flags = self.by_serial.entry(controller.serial.clone()).or_default();
-            let prev = prev_by_serial.get(controller.serial.as_str()).copied();
+            let prev = prev_by_serial.get(controller.serial.as_ref()).copied();
 
             if prev.is_none() && prefs.notify_connect {
                 if self.launch_quiet.remove(&controller.serial) {
@@ -189,28 +194,28 @@ fn format_event(
             heading,
             body: "Connected".to_string(),
             percent: Some(controller.percent),
-            serial: controller.serial.clone(),
+            serial: controller.serial.to_string(),
             state: controller.state,
         },
         NotifyKind::Disconnect => NotifyEvent {
             heading,
             body: "Disconnected".to_string(),
             percent: Some(controller.percent),
-            serial: controller.serial.clone(),
+            serial: controller.serial.to_string(),
             state: controller.state,
         },
         NotifyKind::Low => NotifyEvent {
             heading,
             body: "Is low".to_string(),
             percent: Some(controller.percent),
-            serial: controller.serial.clone(),
+            serial: controller.serial.to_string(),
             state: controller.state,
         },
         NotifyKind::Charged => NotifyEvent {
             heading,
             body: "Finished charging".to_string(),
             percent: Some(100),
-            serial: controller.serial.clone(),
+            serial: controller.serial.to_string(),
             state: PowerState::Complete,
         },
     }
@@ -331,7 +336,7 @@ mod tests {
 
         let events = tracker.collect_events(&[], &connected, &p);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].0.serial, "b");
+        assert_eq!(events[0].0.serial.as_ref(), "b");
         assert_eq!(events[0].1, NotifyKind::Connect);
     }
 

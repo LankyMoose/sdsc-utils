@@ -1,6 +1,7 @@
 //! Atomic JSON store writes: temp file + rename so readers never see a
 //! truncated body (the `analytics.json EOF` class from concurrent writers).
 
+use crate::AppResult;
 use crate::platform::app_log;
 use std::fs;
 use std::path::Path;
@@ -16,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `fs::rename` replaces the destination on both Windows
 /// (`MOVEFILE_REPLACE_EXISTING`) and Unix, so readers either see the old
 /// file or the new file — never a half-written body.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
     if let Some(parent) = path.parent()
         && let Err(err) = fs::create_dir_all(parent)
     {

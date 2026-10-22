@@ -1,5 +1,10 @@
 //! Build script: embed Windows .exe icon from DualSense SVG (same as tray).
 
+/// Local twin of `sdsc_utils::AppResult`: this crate compiles
+/// `src/ui/svg_icon.rs` via `#[path]`, so the shared module's shorthand must
+/// resolve here too. Canonical definition lives in `src/lib.rs`.
+type AppResult<T> = Result<T, String>;
+
 #[allow(dead_code)]
 #[path = "src/ui/svg_icon.rs"]
 mod svg_icon;

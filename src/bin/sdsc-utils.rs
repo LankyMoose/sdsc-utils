@@ -2,6 +2,7 @@
 
 //! SDSC Utils — tray, DualSense HID, session, and iced UI in one process.
 
+use sdsc_utils::AppResult;
 use sdsc_utils::platform::app_log;
 use sdsc_utils::platform::app_meta::{DISPLAY_NAME, PKG_NAME, PKG_VERSION, REPLACE_FLAG};
 use sdsc_utils::platform::autostart;
@@ -249,7 +250,7 @@ fn set_lightbar_cli(rgb_args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let parse = |s: &str| -> Result<u8, String> {
+    let parse = |s: &str| -> AppResult<u8> {
         s.parse::<u8>()
             .map_err(|_| format!("invalid RGB component '{s}' (expected 0-255)"))
     };

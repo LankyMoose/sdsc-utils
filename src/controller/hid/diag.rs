@@ -34,6 +34,7 @@ pub fn diag_warn(message: impl AsRef<str>) {
 #[cfg(debug_assertions)]
 mod active {
     use super::bus_tag;
+    use crate::AppResult;
     use crate::platform::app_log;
     use hidapi::DeviceInfo;
     use std::sync::Mutex;
@@ -172,7 +173,7 @@ mod active {
         claim_needed: bool,
         retry: bool,
         ms: u128,
-        result: Result<(usize, usize), String>,
+        result: AppResult<(usize, usize)>,
     ) {
         let rgb_part = match rgb {
             Some((r, g, b)) => format!(" rgb={r:02x}{g:02x}{b:02x}"),
@@ -345,6 +346,7 @@ pub use active::{OpGuard, steam_present, steam_tag};
 #[cfg(not(debug_assertions))]
 #[allow(dead_code)]
 mod release {
+    use crate::AppResult;
     use hidapi::DeviceInfo;
 
     pub fn device_fields(_info: &DeviceInfo) -> String {
@@ -383,7 +385,7 @@ mod release {
         _claim_needed: bool,
         _retry: bool,
         _ms: u128,
-        _result: Result<(usize, usize), String>,
+        _result: AppResult<(usize, usize)>,
     ) {
     }
 

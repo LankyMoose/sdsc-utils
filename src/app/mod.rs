@@ -11,6 +11,7 @@ mod popup;
 mod start;
 mod toast;
 
+use crate::AppResult;
 use crate::controller::dualsense::lightbar::ClaimStore;
 use crate::domain::color::SpectrumService;
 use crate::domain::pad::InputHub;
@@ -129,9 +130,9 @@ pub enum Message {
     #[cfg(debug_assertions)]
     EmulatorCommitTick,
     /// Result of a background `poll_controllers` call.
-    PollResult(Result<Vec<ControllerStatus>, String>),
+    PollResult(AppResult<Vec<ControllerStatus>>),
     /// Result of a background process-image snapshot (running badge).
-    ProcessEnumResult(Result<Vec<(u32, PathBuf)>, String>),
+    ProcessEnumResult(AppResult<Vec<(u32, PathBuf)>>),
     /// Steam `Apps` registry changed (see `platform::steam_watch`): re-read
     /// the session verdict now instead of waiting for the next badge tick.
     SteamAppsChanged,
@@ -140,7 +141,7 @@ pub enum Message {
     /// until the next open.
     RunningBadgeTick,
     /// Background game-close finished (WM_CLOSE + terminate); badge refresh clears "Closing".
-    CloseGameDone(Result<(), String>),
+    CloseGameDone(AppResult<()>),
 
     /// A tray menu item was activated.
     TrayMenu(String),
@@ -194,7 +195,7 @@ pub enum Message {
     ManualFilePicked(Option<PathBuf>),
     ManualIconPicked(Option<PathBuf>),
     SteamPathPicked(Option<PathBuf>),
-    SteamScanDone(Result<Vec<SteamGame>, String>),
+    SteamScanDone(AppResult<Vec<SteamGame>>),
     /// Boot idle fallback: start deferred Steam scan if still not kicked.
     SteamScanIdleFallback,
     /// Post-cold settle delay elapsed — kick background Steam refresh.
@@ -675,7 +676,7 @@ impl App {
                 .into_iter()
                 .map(|r| {
                     (
-                        r.serial.clone(),
+                        r.serial.to_string(),
                         r.percent,
                         Connection::from_label(&r.connection).unwrap_or(Connection::Bluetooth),
                     )
@@ -2089,13 +2090,13 @@ impl App {
             .session
             .controllers
             .iter()
-            .map(|c| c.serial.clone())
+            .map(|c| c.serial.to_string())
             .collect();
         let worker = self.hid_worker.clone();
         Task::perform(worker.poll(previously_connected), Message::PollResult)
     }
 
-    fn on_poll_result(&mut self, result: Result<Vec<ControllerStatus>, String>) -> Task<Message> {
+    fn on_poll_result(&mut self, result: AppResult<Vec<ControllerStatus>>) -> Task<Message> {
         self.refreshing.store(false, Ordering::SeqCst);
         self.last_battery_poll = Instant::now();
 
@@ -2231,7 +2232,12 @@ impl App {
             return false;
         }
 
-        let Some(controller) = self.session.controllers.iter().find(|c| c.serial == serial) else {
+        let Some(controller) = self
+            .session
+            .controllers
+            .iter()
+            .find(|c| c.serial.as_ref() == serial)
+        else {
             return false;
         };
         if !controller.supports_lightbar {
@@ -2254,7 +2260,12 @@ impl App {
             return;
         }
 
-        let Some(controller) = self.session.controllers.iter().find(|c| c.serial == serial) else {
+        let Some(controller) = self
+            .session
+            .controllers
+            .iter()
+            .find(|c| c.serial.as_ref() == serial)
+        else {
             return;
         };
         if !controller.supports_power_off || !controller.connection.is_bluetooth() {
@@ -2294,8 +2305,11 @@ impl App {
         // The session is the authority; `controllers.json` is written on change.
         if self.session.known.is_remembered(serial) {
             self.session.known.forget(serial);
-        } else if let Some(controller) =
-            self.session.controllers.iter().find(|c| c.serial == serial)
+        } else if let Some(controller) = self
+            .session
+            .controllers
+            .iter()
+            .find(|c| c.serial.as_ref() == serial)
         {
             self.session.known.remember(controller);
         } else {
@@ -2681,7 +2695,7 @@ fn steam_appid_from_target(target: &str) -> Option<u32> {
 }
 
 /// Run a blocking closure on a worker thread and await its result.
-fn spawn_blocking<T, F>(f: F) -> impl Future<Output = Result<T, String>> + Send
+fn spawn_blocking<T, F>(f: F) -> impl Future<Output = AppResult<T>> + Send
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -2834,7 +2848,7 @@ mod tests {
         assert!(known.is_remembered("emu-1"));
 
         let remembered = vec![(
-            known.remembered_disconnected(&[])[0].serial.clone(),
+            known.remembered_disconnected(&[])[0].serial.to_string(),
             50,
             Connection::Bluetooth,
         )];
