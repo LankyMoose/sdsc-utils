@@ -954,7 +954,7 @@ impl App {
                 crate::games::steam::save_library_cache(&games, root.as_deref());
             }
             Err(err) => {
-                steam::warn_scan_error(&err);
+                steam::warn_scan_error(&err.to_string());
                 // Keep prior successful install list if any; otherwise stay Unknown so
                 // curated Steam rows remain visible.
             }

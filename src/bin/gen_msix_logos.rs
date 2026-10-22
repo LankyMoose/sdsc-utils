@@ -4,10 +4,10 @@
 
 #![allow(dead_code)]
 
-/// Local twin of `sdsc_utils::AppResult`: this crate compiles
-/// `src/ui/svg_icon.rs` via `#[path]`, so the shared module's shorthand must
-/// resolve here too. Canonical definition lives in `src/lib.rs`.
-type AppResult<T> = Result<T, String>;
+/// Shared error channel: canonical definition lives in `sdsc_utils::app_error`;
+/// this crate compiles `src/ui/svg_icon.rs` via `#[path]`, so the shared
+/// module's names must resolve through `crate::` here too.
+use sdsc_utils::{AppError, AppResult};
 
 #[path = "../ui/svg_icon.rs"]
 mod svg_icon;

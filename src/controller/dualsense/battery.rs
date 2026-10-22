@@ -1,6 +1,5 @@
 //! DualSense discovery and battery reading.
 
-use crate::AppResult;
 use crate::controller::dualsense::identity::{
     is_dualsense_device, is_storable_serial, normalize_identity, resolve_device_identity,
 };
@@ -11,6 +10,7 @@ use crate::domain::protocol::{
     CALIBRATION_FEATURE_REPORT, CALIBRATION_FEATURE_SIZE, USB_REPORT_ID, USB_REPORT_SIZE,
 };
 use crate::platform::app_log;
+use crate::{AppError, AppResult};
 use hidapi::{BusType, HidApi, HidDevice};
 use std::thread;
 use std::time::Duration;
@@ -315,9 +315,9 @@ fn power_off_bluetooth_unlocked_timed(
     let candidates = if matched.is_empty() { unknown } else { matched };
 
     if candidates.is_empty() {
-        return Err(format!(
+        return Err(AppError::Hid(format!(
             "Bluetooth controller {serial} not found (power-off is Bluetooth-only)"
-        ));
+        )));
     }
 
     let sizes = [
@@ -349,14 +349,14 @@ fn power_off_bluetooth_unlocked_timed(
     }
     timing.io_ms += io_started.elapsed().as_millis();
 
-    Err(format!(
+    Err(AppError::Hid(format!(
         "power-off feature report failed after {} attempt(s): {}",
         errors.len(),
         errors
             .last()
             .cloned()
             .unwrap_or_else(|| "no attempts".into())
-    ))
+    )))
 }
 
 #[cfg(test)]

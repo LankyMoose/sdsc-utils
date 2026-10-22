@@ -1,6 +1,5 @@
 //! DualSense lightbar HID output.
 
-use crate::AppResult;
 use crate::controller::dualsense::identity::{
     self as dualsense, HidIoLock, is_dualsense_device, is_dualsense_gamepad, normalize_identity,
     resolve_device_identity,
@@ -8,6 +7,7 @@ use crate::controller::dualsense::identity::{
 use crate::domain::color::Rgb;
 use crate::domain::protocol::{CALIBRATION_FEATURE_REPORT, CALIBRATION_FEATURE_SIZE};
 use crate::platform::app_log;
+use crate::{AppError, AppResult};
 use hidapi::{BusType, HidApi, HidDevice};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -397,12 +397,15 @@ fn try_apply_by_serial_timed(
     timing.open_ms = open_ms;
 
     if candidates.is_empty() {
-        return (Err(format!("controller {serial} not found")), timing);
+        return (
+            Err(AppError::Hid(format!("controller {serial} not found"))),
+            timing,
+        );
     }
     candidates.sort_by_key(|(_, _, rank)| *rank);
 
     let io_started = Instant::now();
-    let mut last_err: Option<String> = None;
+    let mut last_err: Option<AppError> = None;
     let mut any_ok = false;
     // One claim decision for the serial; later interfaces only send RGB.
     let mut claim = claims.take_claim(&target);
@@ -439,7 +442,7 @@ fn try_apply_by_serial_timed(
         (Ok(()), timing)
     } else {
         (
-            Err(last_err.unwrap_or_else(|| format!("controller {serial} not found"))),
+            Err(last_err.unwrap_or_else(|| AppError::Hid(format!("controller {serial} not found")))),
             timing,
         )
     }
@@ -468,7 +471,7 @@ fn apply_on_open_device_inner(
         claims,
     ) {
         Ok(()) => Ok(()),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -640,7 +643,7 @@ pub(crate) fn write_output_report(
             claim_needed,
             retry,
             ms,
-            Err(err.to_string()),
+            Err(AppError::Hid(err.to_string())),
         ),
     }
     result.map(|_| ())
@@ -686,7 +689,7 @@ pub fn apply_lightbar_all_timed(
         Ok(api) => api,
         Err(e) => {
             timing.enumerate_ms = enum_started.elapsed().as_millis();
-            return (Err(e.to_string()), timing);
+            return (Err(e.into()), timing);
         }
     };
     let mut applied = 0usize;

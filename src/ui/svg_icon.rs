@@ -1,6 +1,6 @@
 //! SVG rasterization for tray / UI icons (`resvg`).
 
-use crate::AppResult;
+use crate::{AppError, AppResult};
 use resvg::tiny_skia;
 use resvg::usvg;
 use std::collections::HashMap;
@@ -152,7 +152,7 @@ impl SvgRasterCache {
     /// Rasterize an SVG into straight RGBA (`size × size × 4`).
     pub fn rasterize(&self, svg: &str, size: u32, colors: &ColorMap) -> AppResult<Vec<u8>> {
         if size == 0 {
-            return Err("svg rasterize size must be > 0".into());
+            return Err(AppError::Ui("svg rasterize size must be > 0".into()));
         }
 
         let key = CacheKey {
@@ -208,10 +208,10 @@ pub fn render_dualsense_dim_rgba(size: u32) -> AppResult<Vec<u8>> {
 fn rasterize_uncached(svg: &str, size: u32, colors: &ColorMap) -> AppResult<Vec<u8>> {
     let tinted = colors.apply(svg);
     let tree = usvg::Tree::from_str(&tinted, &usvg::Options::default())
-        .map_err(|e| format!("parse SVG: {e}"))?;
+        .map_err(|e| AppError::Ui(format!("parse SVG: {e}")))?;
 
     let mut pixmap = tiny_skia::Pixmap::new(size, size)
-        .ok_or_else(|| format!("allocate {size}x{size} pixmap"))?;
+        .ok_or_else(|| AppError::Ui(format!("allocate {size}x{size} pixmap")))?;
 
     let svg_size = tree.size();
     let svg_w = svg_size.width().max(1.0);

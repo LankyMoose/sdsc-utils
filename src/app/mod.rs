@@ -11,10 +11,10 @@ mod popup;
 mod start;
 mod toast;
 
-use crate::AppResult;
 use crate::controller::dualsense::lightbar::ClaimStore;
 use crate::domain::color::SpectrumService;
 use crate::domain::pad::InputHub;
+use crate::{AppError, AppResult};
 
 #[cfg(debug_assertions)]
 use crate::controller::emulate;
@@ -2707,7 +2707,7 @@ where
     async move {
         receiver
             .await
-            .map_err(|_| "background task was cancelled".to_string())
+            .map_err(|_| AppError::Ui("background task was cancelled".into()))
     }
 }
 

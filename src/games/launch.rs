@@ -1,6 +1,6 @@
 //! Launch Steam URLs, executables, and shortcuts.
 
-use crate::AppResult;
+use crate::{AppError, AppResult};
 #[cfg(not(windows))]
 use std::path::Path;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ use std::process::Command;
 pub fn launch_target(target: &str, args: &str) -> AppResult<()> {
     let trimmed = target.trim();
     if trimmed.is_empty() {
-        return Err("empty launch target".into());
+        return Err(AppError::Games("empty launch target".into()));
     }
     let args = args.trim();
 
@@ -72,10 +72,10 @@ fn launch_windows(target: &str, args: &str) -> AppResult<()> {
     if result.0 as isize > 32 {
         Ok(())
     } else {
-        Err(format!(
+        Err(AppError::Games(format!(
             "ShellExecute failed for {target} (code {})",
             result.0 as isize
-        ))
+        )))
     }
 }
 
@@ -87,7 +87,7 @@ fn launch_unix(target: &str, args: &str) -> AppResult<()> {
             Command::new("open")
                 .arg(target)
                 .spawn()
-                .map_err(|e| format!("failed to open {target}: {e}"))?;
+                .map_err(|e| AppError::Games(format!("failed to open {target}: {e}")))?;
             return Ok(());
         }
         #[cfg(not(target_os = "macos"))]
@@ -95,7 +95,7 @@ fn launch_unix(target: &str, args: &str) -> AppResult<()> {
             Command::new("xdg-open")
                 .arg(target)
                 .spawn()
-                .map_err(|e| format!("failed to open {target}: {e}"))?;
+                .map_err(|e| AppError::Games(format!("failed to open {target}: {e}")))?;
             return Ok(());
         }
     }
@@ -108,7 +108,7 @@ fn launch_unix(target: &str, args: &str) -> AppResult<()> {
         }
     }
     cmd.spawn()
-        .map_err(|e| format!("failed to launch {}: {e}", path.display()))?;
+        .map_err(|e| AppError::Games(format!("failed to launch {}: {e}", path.display())))?;
     Ok(())
 }
 
@@ -129,7 +129,7 @@ pub fn close_matching(match_paths: &[PathBuf]) -> AppResult<()> {
     #[cfg(not(windows))]
     {
         let _ = match_paths;
-        Err("process close is Windows-only".into())
+        Err(AppError::Games("process close is Windows-only".into()))
     }
 }
 

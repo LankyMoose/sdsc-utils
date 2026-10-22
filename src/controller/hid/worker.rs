@@ -18,7 +18,6 @@
 //!
 //! Timing lines (grep `hid-worker:`) record enumerate / open / io / total.
 
-use crate::AppResult;
 use crate::controller::driver;
 use crate::controller::dualsense::battery;
 use crate::controller::dualsense::identity::{
@@ -42,6 +41,7 @@ use crate::domain::pad::{
 };
 use crate::platform::app_log;
 use crate::platform::host::Host;
+use crate::{AppError, AppResult};
 use hidapi::{BusType, HidApi, HidDevice};
 use iced::futures::channel::oneshot;
 use std::collections::HashMap;
@@ -224,7 +224,7 @@ impl DeviceCache {
         spectrum: SpectrumService,
         claims: Arc<ClaimStore>,
     ) -> AppResult<Self> {
-        let api = HidApi::new().map_err(|e| e.to_string())?;
+        let api = HidApi::new()?;
         let mut cache = Self {
             api,
             devices: HashMap::new(),
@@ -252,7 +252,7 @@ impl DeviceCache {
         let _op = crate::controller::hid::diag::enter_op("hidapi_refresh");
         let started = Instant::now();
         crate::controller::hid::diag::diag_info("hid-diag: hidapi_refresh begin");
-        self.api.refresh_devices().map_err(|e| e.to_string())?;
+        self.api.refresh_devices()?;
         self.last_enum_at = Some(Instant::now());
         self.last_refresh_at = self.last_enum_at;
         let mut paths: Vec<String> = self
@@ -403,7 +403,7 @@ impl DeviceCache {
 
         self.refresh_device_list()?;
         let Some(open) = self.try_open_serial(serial) else {
-            return Err(format!("controller {serial} not found"));
+            return Err(AppError::Hid(format!("controller {serial} not found")));
         };
         self.devices.insert(target.clone(), open);
         Ok(self.devices.get(&target).expect("just inserted"))
@@ -640,8 +640,11 @@ impl RumbleCache {
         if self.devices.contains_key(&target) {
             return Ok(self.devices.get(&target).expect("contains"));
         }
-        let open = open_rumble_device(api, &target)
-            .ok_or_else(|| format!("rumble: DualSense {target} not found / open failed"))?;
+        let open = open_rumble_device(api, &target).ok_or_else(|| {
+            AppError::Hid(format!(
+                "rumble: DualSense {target} not found / open failed"
+            ))
+        })?;
         self.devices.insert(target.clone(), open);
         Ok(self.devices.get(&target).expect("just inserted"))
     }
@@ -992,7 +995,7 @@ impl HidWorkerHandle {
         let _ = self.tx.send(HidCmd::Poll { previously, reply });
         async move {
             rx.await
-                .map_err(|_| "hid-worker poll cancelled".to_string())?
+                .map_err(|_| AppError::Hid("hid-worker poll cancelled".into()))?
         }
     }
 
@@ -1643,9 +1646,9 @@ fn write_rumble_pulse(
             left,
             claims,
         )
-        .map_err(|e| e.to_string());
+        .map_err(AppError::from);
     }
-    Err(format!("rumble: no handle for {target}"))
+    Err(AppError::Hid(format!("rumble: no handle for {target}")))
 }
 
 fn expire_rumble(
@@ -2483,7 +2486,7 @@ mod tests {
         NavReading {
             id: start_input::PadId(id.to_string()),
             sample: start_input::PadSample::default(),
-            source: start_input::NavSource::Hid,
+            source: start_input::NavSource::HID,
         }
     }
 

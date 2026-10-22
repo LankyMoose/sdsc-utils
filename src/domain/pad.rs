@@ -97,7 +97,7 @@ impl InputHub {
         if guard.readings.is_empty() {
             NavReadingsOutcome::Missing { meta }
         } else {
-            log_source_once(NavSource::Hid, guard.readings.len());
+            log_source_once(NavSource::HID, guard.readings.len());
             NavReadingsOutcome::Readings {
                 readings: guard.readings.clone(),
                 meta,
@@ -270,16 +270,17 @@ pub struct PadSample {
 }
 
 /// Which backend produced a start-screen nav sample.
+///
+/// Single-backend stub: HID is the only producer. A unit struct (not an enum)
+/// so `NavReading.source`, `format_line`, `log_source_once`, and the one-shot
+/// `Option<NavSource>` log guard keep working unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum NavSource {
-    Hid,
-}
+pub struct NavSource;
 
 impl NavSource {
+    pub const HID: Self = Self;
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Hid => "hid",
-        }
+        "hid"
     }
 }
 
@@ -990,7 +991,7 @@ pub fn hid_nav_reading(identity: &str, sample: PadSample) -> NavReading {
     NavReading {
         id: PadId(format!("hid:{identity}")),
         sample,
-        source: NavSource::Hid,
+        source: NavSource::HID,
     }
 }
 
@@ -1947,7 +1948,7 @@ mod tests {
         NavReading {
             id: PadId(id.to_string()),
             sample,
-            source: NavSource::Hid,
+            source: NavSource::HID,
         }
     }
 

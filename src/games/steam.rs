@@ -6,9 +6,9 @@
 //! `localconfig.vdf` stay on the current text reader until those layouts change;
 //! bump [`LAST_KNOWN_COMPATIBLE_STEAM_VERSION`] after verifying a newer client.
 
-use crate::AppResult;
 use crate::persist::{json, paths};
 use crate::platform::app_log;
+use crate::{AppError, AppResult};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,7 +87,8 @@ pub fn validate_steam_library_path(path: &std::path::Path) -> bool {
 
 /// Installed Steam games, sorted by name.
 pub fn list_installed_games(extra_paths: &[PathBuf]) -> AppResult<Vec<SteamGame>> {
-    let steam_root = steam_root()?.ok_or_else(|| "Steam install not found".to_string())?;
+    let steam_root =
+        steam_root()?.ok_or_else(|| AppError::Games("Steam install not found".into()))?;
     let mut library_roots = library_folders(&steam_root)?;
     for path in extra_paths {
         if !validate_steam_library_path(path) {
