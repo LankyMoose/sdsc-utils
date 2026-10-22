@@ -323,10 +323,9 @@ fn reassert_due_at(record: Option<(Rgb, Instant)>, color: Rgb, now: Instant) -> 
 }
 
 fn is_retryable_write_error(err: &impl std::fmt::Display) -> bool {
-    let text = err.to_string();
-    text.contains("0x000003E5")
-        || text.contains("WaitForSingleObject")
-        || text.contains("Overlapped I/O")
+    // Single classifier lives in `hid::retry` (see its policy table);
+    // this keeps the existing name/signature for the timed-apply caller.
+    crate::controller::hid::retry::is_transient(err)
 }
 
 /// Request calibration so the pad switches to full BT reports / accepts effects (SDL).
