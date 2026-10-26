@@ -1,14 +1,29 @@
 ## 1.7.0
 ### Added
-- Horizontal immersive layout mode for the Start screen
+- Horizontal immersive layout mode for the Start screen (Vertical/Horizontal selector)
 - Changelog viewer (this screen)
 - Extra Steam library folder support
+- Performance settings: idle throttle, antialiasing/vsync toggles, reload action
+- Position-rail visibility selector (When navigating / Always on)
+- Reduced motion selector (System / On / Off)
+- Unified glass theme across popup, Settings, toasts, and Start (Vulkan preferred, DX12 fallback)
 ### Changed
+- Start screen is always the fullscreen console stage (compact window removed; PS opens, Circle/Escape closes, Create toggles controllers)
+- Single process: tray, HID, session, and UI in one sdsc-utils.exe
 - Toast position setting moved to the Notifications tab
 - Relaunching the app now replaces the running instance instead of exiting quietly
 - Windows Task Manager description now reads `SDSC Utils {version}`
+- Controllers surface returns to a rows panel; footer hints reshuffled
+- Battery analytics charts gain captions, legends, and elapsed recording time
+- Steam rows list Last played before Played
 ### Fixed
-- Position bar now briefly shows when changing sort in immersive mode
+- Position bar now shows on open, sort change, and reorder in immersive mode
+- Selected game titles draw in-slot and wrap with shared breaks instead of crossfading
+- Update badge no longer clips at the strip edge; outer peeks show titles
+- Stuck Running badges on failed Steam launches fast-fail instead of parking
+- Stuck Powering off rows clear eagerly and only show while connected
+- Controllers popup refits while open; Auto open hides unless Start is enabled
+- Toasts expire on wall-clock time; Start close restores the cursor
 
 ## 1.6.1
 ### Added

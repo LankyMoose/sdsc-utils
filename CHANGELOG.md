@@ -7,9 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Removed
-
-- Compact Start window: the start screen is always the fullscreen console stage. The `start_screen_always_immersive` pref, the compact/immersive promote/demote morph, L2/R2 slide switching, and the compact titlebar/carousel are gone. The **PS** (Guide) chord opens Start and is a no-op while open; Circle/Escape always closes. The Create (Select) button toggles the controllers surface in its place.
+## [1.7.0] - 2026-10-26
 
 ### Added
 
@@ -21,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Immersive Start settings gains a position-rail visibility selector (`When navigating` default / `Always on`, persisted): `Always on` keeps the section rail visible instead of auto-hiding it after navigation idle.
 - Immersive Start settings gains a **Reduced motion** selector (`System` default / `On` / `Off`, persisted): when effective, all Start-screen movement snaps instantly — surface/strip slides, drawer travel, rail slide, layout-transition travel, status-chip travel, backdrop pan/zoom, press glides — while fades, dims, and veils keep animating. `System` follows Windows' "Show animations" accessibility toggle live (other OSes have no probe and treat `System` as reduced).
 - **Developer mode (debug-only):** Diagnostics gains a non-persisted "Display layout bounding boxes" toggle (or F9) that outlines Start-screen and Settings-drawer containers (magenta) and fixed/clamped-width elements (cyan) for layout debugging. Off by default, never saved; compiled out of release builds.
+- Horizontal immersive layout mode for the Start screen (Vertical default / Horizontal, persisted `start_screen_immersive_layout`): a cover-flow strip with a position bar, a layout selector in Start settings and Configure, and a layout-transition animation that blocks nav while it runs.
+- Configure → System: **View changelog** button opening this release-notes modal (built from `assets/CHANGELOG.md` at compile time).
+- Extra Steam library folders: Configure → Start screen lists remembered library roots with an **Add folder…** picker (validated `steamapps/appmanifest_*.acf`, persisted `extra_steam_paths`; invalid folders are skipped with a warning). The Games strip merges them with the detected Steam install.
+- Performance settings (Start settings drawer + Configure → System): an immersive idle-throttle toggle (default off), renderer antialiasing / vsync toggles (default on, boot-only), and a Reload action that appears only while renderer prefs differ from boot (disabled + spinner while queued, input locked; restores windows, selections, scroll offsets, and drawer state). The immersive settings drawer is wider (600px) and auto-scrolls to reveal the Reload row when a toggle dirties it.
+- **Developer mode (debug-only):** ambient tuning sliders in Diagnostics (pulse min/max, orb drift speed/bounds, glow hue; defaults reproduce the release visuals), a standalone ambient preview window (immersive-rate backdrop + 0.55 vignette, draggable, right-click to close), an in-immersive tuning panel (drawer Ambience action row, pad Up/Down focus with wrap, Cross Reset/Done, R3 hides all chrome), and JSON snapshot export (clipboard + `app.log`).
+- **Developer mode (debug-only):** Diagnostics gains a **Run window stress test** button (~1 minute of toast + cold Start + Configure + edit churn matching the wgpu atlas-crash shape). It takes over window open/close while running; re-press is a no-op via a running guard.
 
 ### Changed
 
@@ -30,13 +34,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configure's debug tools move under a **Developer mode** caption so they are clearly separated from the shipped settings.
 - **Developer mode:** the Developer tab is now **Controllers**, with a compact row per emulated controller you can add, remove, and drive: a connection switch, and a chevron that expands that pad's controls inline — a battery slider that snaps to the levels a DualSense actually reports, a link picker (USB charges, Bluetooth runs down), and battery-analytics actions (seed estimates, walk the charge/drain cycle). Commands address pads by serial, so an action can never land on the wrong pad.
 - **Developer mode:** a pad's **charge state is derived from its link**, the way the hardware reports it — USB charges (and reports full once it tops off), Bluetooth discharges. There is no separate charge-state picker, so the emulator can no longer describe states real hardware cannot be in; each link chip shows the state it implies. New emulated controllers are created remembered but **disconnected**, so adding one does not fire a connect toast or open Start. A per-pad switch plugs them in and out through the normal connect/disconnect path, so toasts and the Start-open preference behave as they would for real hardware. Battery changes on a **connected** pad are previewed and published after a one-second debounce, with a spinner while they wait, so a drag cannot spam preference-driven notifications; a disconnected pad is not published at all, so its slider applies immediately. Unplugging a pad mid-debounce cancels the pending change.
-- **Fixed:** emulated controllers added via the Developer emulator no longer appear in the normal controller lists after a restart while vanishing from the Controllers tab. The tab's fleet is now rebuilt from remembered emulated serials at startup, restoring each pad's level and link — switched off, so a restart never fires a connect toast or opens Start unbidden.
 - **Developer mode:** emulated controllers get the same **remember** pin real controllers have. A pad's row offers "Forget this controller"; forgetting takes effect immediately — the pad leaves the remembered list and from disk, exactly as `toggle_remember` behaves for real hardware. A pad that is both unplugged and forgotten disappears from the tab, so the two are symmetric: forget an unplugged pad and it goes now, unplug a forgotten pad and it goes then. A merely unplugged pad stays listed so you can plug it back in.
 - Horizontal immersive Start centers every cover by its art (neighbors no longer ride above the selection) and fades neighbors to transparent instead of grey.
 - Horizontal immersive strip: neighbor covers now sag downward with distance (cover-flow arc mirroring the vertical strip), keeping clock clearance.
 - Immersive selected-hero cue box (Playing/membership + face hints over the art) now crossfades with the strip scroll instead of popping in and out.
 - Single process: tray, DualSense HID, session, and the iced UI now run in one `sdsc-utils` process instead of a service + shell pair over IPC. The `sdsc-shell` binary, the `src/ipc` transport, the `src/service` host loop, and the portable shell-bundling are gone; packaging (MSIX, portable, release workflow) ships one exe. The retained-snapshot / intent-sync protocol is replaced by direct calls into `DeviceSession`; renderer-pref reload relaunches with an internal `--replace` flag that retries the single-instance guard while the old process exits.
 - Start hint rings (face-button circles + hold-progress arcs) render as SVG instead of per-glyph `canvas` layers: static states rasterize once, hold sweeps mint a bounded handle set, so steady-state frames do no vector work. Hold arcs complete to a full white-hot ring at 100% (a same-point arc draws nothing in SVG) blending ACCENT → INK while armed, and the idle track is lightened to compensate resvg AA coverage. The face pictogram box snaps to whole pixels so the button icon stays concentric with its ring.
+- Toast position setting moves into the Notifications tab (the separate Toast position tab is gone; the corner picker and live preview now live under "Which controller events show a toast").
+- Fresh launches take over the running instance instead of exiting quietly: the predecessor exits and the new process proceeds (the internal `--replace` child retries the single-instance guard while the old process exits). The Windows Task Manager / exe description now reads `SDSC Utils {version}`.
+- Event-driven HID idle: the cold worker blocks on command/hint/pulse/heartbeat instead of sampling every 50ms when empty (no `HidApi` refresh storm); the empty-tray presence backstop relaxes 500ms → 2s with the OS arrival watcher waking iced on device changes; an explicit wake fires on input-hot transitions so Start nav responds immediately; an absence recheck at miss-hold expiry confirms Bluetooth power-off in ~2s instead of waiting out the 5s liveness tick.
+- Start settings form controls are mouse-driven: Left/Right nudging is removed from the drawer, selector menus, and ambient tuning (Up/Down moves focus, Confirm commits). The Configure window needed no change (iced 0.14 sliders only handle Up/Down).
+- Start controllers surface returns to a rows panel (peek ring column expanding to full rows with title, meta, ETA and inline Identify / Power-off hints, width-reveal travel) instead of the rings-strip island. The bottom hints island is a full pill (560 → 680) with Edit and Sort on the left and Select / Start / Close on the right; Circle stays Close while the surface is open.
+- Start edit keeps sort live and navigation intact: Square cycles sort in browse and edit, the edit checklist follows the active mode (A–Z or last-played with recorded `played_at`), sections follow sort, and the sort hint shows in the edit footer; Circle cancel and slide-switch discards keep mid-edit navigation (cursor, pre-edit anchor, then nearest-enabled fallback).
+- Horizontal immersive titles wrap with shared line breaks and glide with the scroll: neighbors and the selection use one reference width that expands with the larger selected type, and size/wrap/color interpolate over the fractional scroll distance instead of popping (portrait side-column titles get the same treatment, 22 → 39 with bold flipping past halfway).
+- Steam game rows list **Last played** before **Played** (`2 Oct 2025 · 81 h`).
+- Battery analytics charts gain axis captions (measured `N of 10` / `Learning` status, 100→5 drain and 5→100 charge endpoints) and a legend in the chart hue; the recording line shows elapsed bucket time and the explainer documents the floored 5–30m duration steps.
+- Start settings rows gain helper lines (DIM, single-line, mirroring Configure copy); bare section labels become DIM semibold captions over a hairline rule (section gap 8 → 16), with pad focus geometry derived from the same helpers.
+- Start game-list subtext renders at full MUTED strength (the 0.9 sub-alpha scale and 0.8 label-color factor are gone).
+
+### Removed
+
+- Compact Start window: the start screen is always the fullscreen console stage. The `start_screen_always_immersive` pref, the compact/immersive promote/demote morph, L2/R2 slide switching, and the compact titlebar/carousel are gone. The **PS** (Guide) chord opens Start and is a no-op while open; Circle/Escape always closes. The Create (Select) button toggles the controllers surface in its place.
 
 ### Fixed
 
@@ -44,6 +62,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Popup no longer shows a stale remembered battery `%` after a full-charge + USB unplug (disk was already correct): remembered records now converge through the single in-process session instead of boot-time copies.
 - Intermittent test failure (~1 run in 150) from a shared-global race: the art-worker's shutdown test wiped the process-wide icon cache while a concurrent icon-cache test was mid-assertion, so a successful decode reported as missing. The shutdown test now takes the same lock the other cache tests use.
 - Horizontal immersive Start no longer clips the selected game's Update badge (or long two-line title + meta stacks) at the strip edge: the in-slot text reserve grows 150 → 160 with breathing room reduced equally, so cover size and neighbor counts are unchanged. Outer-peek cards (`d>=2`) now show their title + subtitle too, at their own art-width wrap in smaller type so adjacent titles can never overlap (previously art-only by design).
+- **Developer mode:** emulated controllers added via the emulator no longer appear in the normal controller lists after a restart while vanishing from the Controllers tab. The tab's fleet is rebuilt from remembered emulated serials at startup, restoring each pad's level and link — switched off, so a restart never fires a connect toast or opens Start unbidden.
+- Immersive position rail shows on open, sort change, and reorder (not just after navigation idle), so the layout/section context is visible when the list changes under you.
+- Stuck `Powering off` rows are cleared eagerly and only render while the pad is still connected, so remembered-disconnected rows never inherit the state on reconnect.
+- Configure → Auto open is only visible while the Start screen is enabled, and its dropdown is widened 190 → 280 so the longer mode labels no longer wrap.
+- Settings pad navigation no longer double-plays cues or drops fast taps: rows play a row-aware cue (sound rows cue haptic-only, haptics rows cue sound-only) and the stepper resets its gating at once on digital D-pad release (sticks keep the neutral grace), so same-direction re-taps fire per press.
+- Controllers popup refits on every membership change while open (connect, disconnect, forgotten reconnect), instead of keeping its boot-time height.
+- Stuck `Running` badges on failed Steam launches are fast-failed (20s generic, 10s on Steam idle verdict, instead of a blind 45s grace): the Steam registry `Running` flag authoritatively confirms/clears sessions with an event-based watcher, the badge tick owns live sessions while Start is closed/idle, `Launching` and `Running` render as separate states, and last-played stamps only on first confirm — never on handoff.
+- Toasts expire on a wall-clock deadline with stall catch-up, so tray-menu modal blocks jump to dismissed/settled instead of pausing the slide clock.
+- Closing Start restores the cursor in two phases (present before HWND destroy, no idle-hide outside the work area, unhide on tray engagement, guarded `ShowCursor` restore on exit), so the pointer is never left hidden.
+- Immersive clock no longer fast-forwards under input load: ticks advance by capped wall-clock deltas instead of fixed steps per call, so report-rate pad edges sharing the tick cannot accelerate ambient time (the debug preview uses the same basis).
 
 ## [1.6.1] - 2026-10-07
 
@@ -457,6 +485,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded DualSense silhouette for the tray and `.exe` icon.
 - Windows CI and tagged release workflow.
 
+[1.7.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.5.2...v1.6.0
 [1.5.2]: https://github.com/LankyMoose/sdsc-utils/compare/v1.5.1...v1.5.2
