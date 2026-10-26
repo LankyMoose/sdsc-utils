@@ -108,6 +108,15 @@ impl GamesCatalog {
             .any(|e| matches!(e, GameEntry::Steam { appid: id } if *id == appid))
     }
 
+    /// Entries-only inequality against an edit draft: true when the draft
+    /// would change the saved games list on commit. `last_played_ms` (live
+    /// launch stamps, including background badge confirmations) and
+    /// `steam_names` (scan refreshes) are deliberately excluded — neither is
+    /// an edit, and counting them would false-dirty the Save prompt.
+    pub fn entries_differ(&self, draft: &Self) -> bool {
+        self.entries != draft.entries
+    }
+
     pub fn toggle_steam(&mut self, appid: u32, enabled: bool) -> bool {
         let present = self.contains_steam(appid);
         if enabled && !present {
@@ -318,6 +327,25 @@ mod tests {
         let catalog: GamesCatalog = serde_json::from_str("{}").unwrap();
         assert!(catalog.entries.is_empty());
         assert!(catalog.last_played_ms.is_empty());
+    }
+
+    #[test]
+    fn entries_differ_tracks_edits_not_background_stamps() {
+        let mut saved = GamesCatalog::default();
+        assert!(saved.toggle_steam(10, true));
+        // Untouched draft: clean.
+        let draft = saved.clone();
+        assert!(!saved.entries_differ(&draft));
+        // Membership toggle dirties.
+        let mut toggled = saved.clone();
+        assert!(toggled.toggle_steam(10, false));
+        assert!(saved.entries_differ(&toggled));
+        // Background stamps must NOT dirty the Save prompt: a launch stamp
+        // or scan-name refresh alone keeps entries identical.
+        let mut stamped = saved.clone();
+        stamped.last_played_ms.insert("steam:10".to_string(), 99);
+        stamped.steam_names.insert(10, "Name".to_string());
+        assert!(!saved.entries_differ(&stamped));
     }
 
     #[test]

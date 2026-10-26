@@ -2044,6 +2044,39 @@ pub(crate) fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
     .into()
 }
 
+/// Save-or-discard guard content: pad hint row only (no mouse buttons —
+/// the choice stays an explicit pad action). The caller wraps this in a
+/// shared overlay card; Cross confirms (discard + leave edit mode),
+/// Circle cancels (keep the draft, keep editing).
+pub(crate) fn edit_confirm_view(state: &State) -> Element<'_, StartMessage> {
+    if state.edit_confirm.is_none() {
+        return space().into();
+    }
+    column![
+        crate::ui::start::overlay::dialog_text(
+            "Discard changes?",
+            "Your games list has unsaved changes.".to_string(),
+            20.0,
+            14.0,
+        ),
+        space().height(8),
+        {
+            let press = HintPress::for_owner(state, HintPressOwner::SaveDiscard);
+            action_cluster(
+                &[
+                    face_hint(FaceButton::Cross, "Discard", press.held, press.press_anim),
+                    face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
+                ],
+                false,
+            )
+        },
+    ]
+    .spacing(12)
+    .align_x(Alignment::Center)
+    .width(Fill)
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

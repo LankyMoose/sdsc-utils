@@ -220,11 +220,129 @@ where
         viewport: &Rectangle,
         offset: Vector,
     ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
-        // Child overlays (if any) keep full-size coordinates; the card's own
-        // draw path is transformed, and dialog cards carry no overlay widgets.
-        self.content
-            .as_widget_mut()
-            .overlay(state, layout, renderer, viewport, offset)
+        if self.is_identity() {
+            return self
+                .content
+                .as_widget_mut()
+                .overlay(state, layout, renderer, viewport, offset);
+        }
+        // Scaled: child overlays (e.g. a pressed glyph's own scale float)
+        // must draw inside this transform, not above it — otherwise they
+        // escape at full size while the card shrinks around them. The
+        // wrapper composes both transforms instead of replacing either.
+        let transformation = self.transformation(layout.bounds());
+        Some(overlay::Element::new(Box::new(ScaleOverlay {
+            content: &mut self.content,
+            state,
+            layout,
+            viewport: *viewport,
+            transformation,
+        })))
+    }
+}
+
+/// Overlay wrapper that composes the card scale around a child overlay's
+/// own transform (mirrors [`iced::widget::Float`]'s overlay, minus
+/// shadow/style which [`Scale`] doesn't carry).
+struct ScaleOverlay<'a, 'b, Message, Theme, Renderer> {
+    content: &'a mut Element<'b, Message, Theme, Renderer>,
+    state: &'a mut widget::Tree,
+    layout: Layout<'a>,
+    viewport: Rectangle,
+    transformation: Transformation,
+}
+
+impl<Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
+    for ScaleOverlay<'_, '_, Message, Theme, Renderer>
+where
+    Renderer: renderer::Renderer,
+{
+    fn layout(&mut self, _renderer: &Renderer, _bounds: Size) -> layout::Node {
+        let bounds = self.layout.bounds() * self.transformation;
+        layout::Node::new(bounds.size()).move_to(bounds.position())
+    }
+
+    fn update(
+        &mut self,
+        event: &Event,
+        _layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        let inverse = self.transformation.inverse();
+        self.content.as_widget_mut().update(
+            self.state,
+            event,
+            self.layout,
+            cursor * inverse,
+            renderer,
+            clipboard,
+            shell,
+            &(self.viewport * inverse),
+        )
+    }
+
+    fn draw(
+        &self,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        _layout: Layout<'_>,
+        cursor: mouse::Cursor,
+    ) {
+        let inverse = self.transformation.inverse();
+        renderer.with_layer(self.viewport, |renderer| {
+            renderer.with_transformation(self.transformation, |renderer| {
+                self.content.as_widget().draw(
+                    self.state,
+                    renderer,
+                    theme,
+                    style,
+                    self.layout,
+                    cursor * inverse,
+                    &(self.viewport * inverse),
+                );
+            });
+        });
+    }
+
+    fn mouse_interaction(
+        &self,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        if !cursor.is_over(layout.bounds()) {
+            return mouse::Interaction::None;
+        }
+        let inverse = self.transformation.inverse();
+        self.content.as_widget().mouse_interaction(
+            self.state,
+            self.layout,
+            cursor * inverse,
+            &(self.viewport * inverse),
+            renderer,
+        )
+    }
+
+    fn overlay<'a>(
+        &'a mut self,
+        _layout: Layout<'_>,
+        renderer: &Renderer,
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            self.state,
+            self.layout,
+            renderer,
+            &(self.viewport * self.transformation.inverse()),
+            self.transformation.translation(),
+        )
+    }
+
+    fn index(&self) -> f32 {
+        self.transformation.scale_factor() * 0.5
     }
 }
 

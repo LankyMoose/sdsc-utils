@@ -77,6 +77,11 @@ impl App {
             StartMessage::Confirm => self.on_start_confirm(),
             StartMessage::Close => self.on_start_close(),
             StartMessage::Noop => Task::none(),
+            StartMessage::DismissEditConfirm => {
+                self.play_start_cue(UiSoundKind::Action);
+                self.start_state.dismiss_edit_confirm(Instant::now());
+                Task::none()
+            }
             StartMessage::ToggleControllers => self.on_toggle_controllers(),
             StartMessage::ToggleEdit => match self.toggle_start_edit() {
                 Some(task) => {
@@ -298,7 +303,8 @@ impl App {
     }
 
     /// Close/Cancel arm: unwinds topmost surface first (settings → manual-add
-    /// draft → replace confirm → edit mode → Start itself).
+    /// draft → replace confirm → save guard → controllers surface → edit
+    /// mode → Start itself).
     pub(crate) fn on_start_close(&mut self) -> Task<Message> {
         if self.start_state.settings.open {
             self.play_start_cue(UiSoundKind::Action);
@@ -316,20 +322,30 @@ impl App {
             self.play_start_cue(UiSoundKind::Action);
             self.start_state.dismiss_replace(Instant::now());
             Task::none()
+        } else if self.start_state.edit_confirm.is_some() {
+            // Second Cancel backs out of the question: draft kept, stay in
+            // edit mode (unwinds through the exit tween like any dismiss).
+            self.play_start_cue(UiSoundKind::Action);
+            self.start_state.dismiss_edit_confirm(Instant::now());
+            Task::none()
+        } else if start_mode::dock_collapse_target(self.start_state.dock_expanded).is_some()
+            && self.start_state.request_dock(false, Instant::now())
+        {
+            // Controllers surface open: Circle/Cancel collapses it first,
+            // preserving any edit draft underneath.
+            self.play_start_cue(UiSoundKind::Slide);
+            crate::controller::hid::diag::diag_info("ui-diag: start controllers collapse (cancel)");
+            Task::none()
         } else if self.start_state.editing {
             self.play_start_cue(UiSoundKind::Action);
-            self.cancel_start_edit()
-        } else if self.start_visible {
-            // Controllers surface open: Circle/Cancel collapses it first.
-            if start_mode::dock_collapse_target(self.start_state.dock_expanded).is_some()
-                && self.start_state.request_dock(false, Instant::now())
-            {
-                self.play_start_cue(UiSoundKind::Slide);
-                crate::controller::hid::diag::diag_info(
-                    "ui-diag: start controllers collapse (cancel)",
-                );
-                return Task::none();
+            if self.edit_draft_dirty() {
+                // Dirty exit asks first; clean exits cancel silently as before.
+                self.start_state.arm_edit_confirm(Instant::now());
+                Task::none()
+            } else {
+                self.cancel_start_edit()
             }
+        } else if self.start_visible {
             self.play_start_cue(UiSoundKind::Action);
             self.close_start_screen()
         } else {
@@ -338,22 +354,14 @@ impl App {
     }
 
     /// Create-toggle arm: flips the controllers surface both ways.
-    /// An in-progress edit draft is discarded first and a stowed
-    /// settle scroll is dropped (the user took over post-settle browsing).
+    /// An in-progress edit draft is preserved underneath (like the settings
+    /// drawer): closing the dock returns to the checklist with the draft
+    /// intact, so either panel opens freely from dirty edit mode.
+    /// A stowed settle scroll is dropped (the user took over post-settle
+    /// browsing).
     pub(crate) fn on_toggle_controllers(&mut self) -> Task<Message> {
         if self.start_state.overlay_blocking() {
             return Task::none();
-        }
-        if self.start_state.editing {
-            let cursor = self.start_state.selected_game_key();
-            let anchor = self.start_state.edit_anchor_play_key.clone();
-            self.discard_edit_draft();
-            self.refresh_start_rows();
-            let target = self
-                .start_state
-                .cancel_exit_target_key(cursor.as_deref(), anchor.as_deref());
-            self.start_state
-                .resolve_edit_exit_selection(target.as_deref());
         }
         let now = Instant::now();
         let next = !self.start_state.dock_expanded;
@@ -494,6 +502,21 @@ impl App {
         self.warm_start_art_task()
     }
 
+    /// True when the edit draft would change the saved games list on
+    /// commit (entries-only: background launch stamps and scan-name
+    /// refreshes don't count — see `GamesCatalog::entries_differ`).
+    pub(crate) fn edit_draft_dirty(&self) -> bool {
+        self.edit_draft
+            .as_ref()
+            .is_some_and(|draft| self.games.entries_differ(draft))
+    }
+
+    /// Save-guard choice: discard the draft and leave edit mode.
+    pub(crate) fn complete_edit_discard(&mut self) -> Task<Message> {
+        self.start_state.clear_edit_confirm();
+        self.cancel_start_edit()
+    }
+
     pub(crate) fn cancel_manual_add(&mut self) -> Task<Message> {
         // Cancel drains through the exit tween (form clears when it
         // settles); reduced motion clears instantly.
@@ -570,6 +593,15 @@ impl App {
     }
 
     pub(crate) fn on_start_confirm(&mut self) -> Task<Message> {
+        // Save guard owns Confirm while open (tap Cross confirms the
+        // discard). Display-only drain must not apply twice.
+        if self.start_state.edit_confirm.is_some() {
+            if self.start_state.edit_confirm_closing() {
+                return Task::none();
+            }
+            self.play_start_cue(UiSoundKind::Action);
+            return self.complete_edit_discard();
+        }
         if self.start_state.manual_add.is_some() {
             self.play_start_cue(UiSoundKind::Action);
             return self.confirm_manual_add();
@@ -1317,13 +1349,16 @@ impl App {
 
         let replace_confirm = self.start_state.replace_confirm.is_some();
         let manual_add = self.start_state.manual_add.is_some();
+        let save_modal = self.start_state.edit_confirm.is_some();
         let settings_open = self.start_state.settings.open;
-        let allow_nav_move = settings_open || (!animating && !replace_confirm && !manual_add);
+        let allow_nav_move =
+            settings_open || (!animating && !replace_confirm && !manual_add && !save_modal);
         let editing = self.start_state.editing;
         // Only when the selected row shows Close game (running target match).
         let hold_cross_close = !editing
             && !replace_confirm
             && !manual_add
+            && !save_modal
             && !settings_open
             && !animating
             && !self.start_state.dock_expanded
@@ -1337,6 +1372,7 @@ impl App {
         let hold_triangle_power = !editing
             && !replace_confirm
             && !manual_add
+            && !save_modal
             && !settings_open
             && !animating
             && self.start_state.dock_expanded
@@ -1403,6 +1439,26 @@ impl App {
             self.keyboard_cross_hold.reset();
             self.start_state.tick_hint_anims(now);
             self.on_ambient_tuning_nav(tick.action)
+        } else if save_modal {
+            // Save guard demands an explicit choice: park nav, holds, and
+            // surface toggles (Start/Options, Create) so nothing bypasses
+            // the modal; only Confirm (discard) and Cancel (back to edit)
+            // stay live.
+            self.start_state.cross_progress = 0.0;
+            self.start_state.triangle_progress = 0.0;
+            self.keyboard_cross_hold.reset();
+            self.start_state.tick_hint_anims(now);
+            if let Some(action) = tick.action {
+                match action {
+                    NavAction::Confirm | NavAction::Cancel => self.on_start_message(match action {
+                        NavAction::Confirm => StartMessage::Confirm,
+                        _ => StartMessage::Close,
+                    }),
+                    _ => Task::none(),
+                }
+            } else {
+                Task::none()
+            }
         } else if tick.action == Some(NavAction::ToggleSettings) {
             self.start_state.tick_hint_anims(now);
             self.on_start_message(StartMessage::ToggleSettings)
@@ -2794,6 +2850,7 @@ impl App {
         self.start_close_armed = false;
         self.start_state.editing = false;
         self.start_state.edit_anchor_play_key = None;
+        self.start_state.clear_edit_confirm();
         self.edit_draft = None;
         self.refresh_start_rows();
         self.refresh_start_controllers();

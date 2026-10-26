@@ -14,7 +14,7 @@ use crate::ui::start::face::FaceButton;
 use crate::ui::start::mode::{TransitionPhase, dock_panel_width, dock_stage_dim, dock_stage_scale};
 use crate::ui::start::overlay;
 use crate::ui::start::row::{game_subtitle_block, update_required_badge};
-use crate::ui::start::settings::{manual_add_view, replace_confirm_view};
+use crate::ui::start::settings::{edit_confirm_view, manual_add_view, replace_confirm_view};
 use crate::ui::start::translate::backdrop_art;
 use crate::ui::start::view::{
     HintPress, HintPressOwner, LaunchStatus, StartControllerRow, StartMessage, StartRow, State,
@@ -40,8 +40,10 @@ const BAR_ABOVE_FOOTER: f32 = 64.0;
 const STRIP_TOP_PAD: f32 = vstrip::H_TOP_PAD;
 /// Form-takeover card height cap (shared builder; confirms size to content).
 const MODAL_CARD_MAX_H: f32 = 520.0;
-/// Compact replace-confirm dialog width (form takeovers keep `MODAL_W`).
+/// Compact replace-confirm dialog width.
 const REPLACE_CONFIRM_W: f32 = 440.0;
+/// Save-guard dialog width (same compact card as the replace confirm).
+const EDIT_CONFIRM_W: f32 = 440.0;
 
 /// Peek ring size bounds: rings grow as the dock expands.
 const DOCK_RING_INSET: f32 = 6.0;
@@ -258,13 +260,15 @@ pub fn view<'a>(
             .into(),
         );
     }
-    // Dialog overlays (manual form below, replace confirm on top): shared
-    // wash + card over the live stage, with a wash-fade + centered 0→1
-    // scale enter/exit tween. Layout always reserves the full-size card
+    // Dialog overlays (manual form, replace confirm, save guard on top):
+    // shared wash + card over the live stage, with a wash-fade + centered
+    // 0→1 scale enter/exit tween. Layout always reserves the full-size card
     // (see `ui::scale`), so nothing reflows; the wrapper never changes
     // shape mid-tween (no remount flash). Above dock/chrome, below
     // drawer/tuning/idle/ceremony. Clicks never reach the dimmed stage:
-    // each wash dismisses (same as Cancel) and each card absorbs.
+    // replace/manual washes dismiss (same as Cancel), the save-guard wash
+    // and a second Cancel back out to edit — only Cross confirms the
+    // discard. Each card absorbs.
     if state.manual_add.is_some() {
         let mp = state.manual_progress(now).clamp(0.0, 1.0);
         layers.push(overlay::wash(overlay::reveal(mp), StartMessage::Close));
@@ -293,6 +297,24 @@ pub fn view<'a>(
                 StartMessage::Noop,
             ),
             rp,
+        )));
+    }
+    if state.edit_confirm.is_some() {
+        let ep = state.edit_confirm_progress(now).clamp(0.0, 1.0);
+        layers.push(overlay::wash(
+            overlay::reveal(ep),
+            StartMessage::DismissEditConfirm,
+        ));
+        layers.push(overlay::centered(Scale::new(
+            overlay::click_shield(
+                overlay::dialog_card(
+                    edit_confirm_view(state),
+                    Length::Fixed(EDIT_CONFIRM_W),
+                    None,
+                ),
+                StartMessage::Noop,
+            ),
+            ep,
         )));
     }
     // Dock slide-out: while the drawer travels in over an open dock, slide

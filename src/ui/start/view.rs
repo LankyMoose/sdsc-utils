@@ -57,6 +57,9 @@ pub enum StartMessage {
     /// Absorb a click with no state change (modal card click shield so
     /// clicks never fall through to the dimmed stage behind a dialog).
     Noop,
+    /// Backdrop click on the save-guard modal: close the modal, stay in
+    /// edit mode (never discards — Discard stays an explicit choice).
+    DismissEditConfirm,
     /// Create (Select): toggle the controllers surface.
     ToggleControllers,
     ToggleEdit,
@@ -611,22 +614,24 @@ impl OwnerPress {
 }
 
 /// Which chrome surface may light face / Options / reopen-chord press visuals.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HintPressOwner {
     Browse,
     Settings,
     ManualAdd,
     ReplaceConfirm,
+    SaveDiscard,
     Dock,
 }
 
 impl HintPressOwner {
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
     const ALL: [Self; Self::COUNT] = [
         Self::Browse,
         Self::Settings,
         Self::ManualAdd,
         Self::ReplaceConfirm,
+        Self::SaveDiscard,
         Self::Dock,
     ];
 
@@ -636,7 +641,8 @@ impl HintPressOwner {
             Self::Settings => 1,
             Self::ManualAdd => 2,
             Self::ReplaceConfirm => 3,
-            Self::Dock => 4,
+            Self::SaveDiscard => 4,
+            Self::Dock => 5,
         }
     }
 
@@ -647,6 +653,8 @@ impl HintPressOwner {
             Self::ManualAdd
         } else if state.replace_confirm.is_some() {
             Self::ReplaceConfirm
+        } else if state.edit_confirm.is_some() {
+            Self::SaveDiscard
         } else if state.dock_expanded {
             Self::Dock
         } else {
@@ -717,6 +725,11 @@ pub struct ReplaceConfirm {
     pub next_title: String,
     pub next_index: usize,
 }
+
+/// Save-or-discard guard for the edit-mode games list. Presence alone is
+/// the modal (static text; dirty state recomputes from the draft live).
+#[derive(Debug, Clone)]
+pub struct EditConfirm;
 
 /// Draft for the edit-mode add/edit-manual modal.
 #[derive(Debug, Clone)]
@@ -916,7 +929,12 @@ pub struct State {
     /// cleared when they settle, so dismissals fade back to the stage.
     replace_anim: Option<overlay::Tween>,
     manual_anim: Option<overlay::Tween>,
+    edit_confirm_anim: Option<overlay::Tween>,
     pub manual_add: Option<ManualAddDraft>,
+    /// Save-or-discard guard for dirty edit exits (Circle/Create with
+    /// changes). Presence is the modal; Cross confirms the discard, Circle
+    /// backs out to edit mode.
+    pub edit_confirm: Option<EditConfirm>,
     /// Options settings panel (right drawer).
     pub settings: crate::ui::start::settings::SettingsPanel,
     pub triangle_progress: f32,
@@ -1158,7 +1176,9 @@ impl Default for State {
             replace_confirm: None,
             replace_anim: None,
             manual_anim: None,
+            edit_confirm_anim: None,
             manual_add: None,
+            edit_confirm: None,
             settings: crate::ui::start::settings::SettingsPanel::default(),
             triangle_progress: 0.0,
             cross_progress: 0.0,
@@ -1574,6 +1594,7 @@ impl State {
         self.dock_expanded = false;
         self.clear_replace();
         self.clear_manual();
+        self.clear_edit_confirm();
         self.settings.reset();
         self.triangle_progress = 0.0;
         self.cross_progress = 0.0;
@@ -1593,6 +1614,7 @@ impl State {
     pub fn overlay_blocking(&self) -> bool {
         self.replace_confirm.is_some()
             || self.manual_add.is_some()
+            || self.edit_confirm.is_some()
             || self.settings.open
             || self.settings.anim.is_some()
             || self.ambient_tuning_active()
@@ -1609,6 +1631,12 @@ impl State {
     pub fn clear_manual(&mut self) {
         self.manual_add = None;
         self.manual_anim = None;
+    }
+
+    /// Drop the save/discard guard and its tween outright.
+    pub fn clear_edit_confirm(&mut self) {
+        self.edit_confirm = None;
+        self.edit_confirm_anim = None;
     }
 
     /// Take the dialog for commit (proceed path owns the content from here).
@@ -1631,6 +1659,11 @@ impl State {
     /// Eased manual-form reveal 0..=1 (same driver as the replace dialog).
     pub fn manual_progress(&self, now: Instant) -> f32 {
         overlay::tween_progress(&self.manual_anim, self.manual_add.is_some(), now)
+    }
+
+    /// Eased save-guard reveal 0..=1 (same driver as the other dialogs).
+    pub fn edit_confirm_progress(&self, now: Instant) -> f32 {
+        overlay::tween_progress(&self.edit_confirm_anim, self.edit_confirm.is_some(), now)
     }
 
     /// Arm the dialog enter tween with content. The tween arms BEFORE the
@@ -1657,6 +1690,17 @@ impl State {
             overlay::tween_to(self.manual_progress(now), 1.0, now)
         };
         self.manual_add = Some(draft);
+    }
+
+    /// Arm the save-guard enter tween (same ordering contract as
+    /// [`Self::arm_replace`]).
+    pub fn arm_edit_confirm(&mut self, now: Instant) {
+        self.edit_confirm_anim = if self.reduced_motion {
+            None
+        } else {
+            overlay::tween_to(self.edit_confirm_progress(now), 1.0, now)
+        };
+        self.edit_confirm = Some(EditConfirm);
     }
 
     /// Start the exit tween, keeping content mounted until it settles (see
@@ -1696,6 +1740,28 @@ impl State {
         self.manual_anim.as_ref().is_some_and(|anim| anim.to < 0.5)
     }
 
+    /// Start the save-guard exit tween (same contract as
+    /// [`Self::dismiss_replace`]): back to the checklist, draft kept.
+    pub fn dismiss_edit_confirm(&mut self, now: Instant) {
+        if self.reduced_motion {
+            self.clear_edit_confirm();
+            return;
+        }
+        let from = self.edit_confirm_progress(now);
+        match overlay::tween_to(from, 0.0, now) {
+            Some(anim) => self.edit_confirm_anim = Some(anim),
+            None => self.clear_edit_confirm(),
+        }
+    }
+
+    /// True while the save guard is display-only drain (choice taken, tween
+    /// running): the choice must not apply twice.
+    pub fn edit_confirm_closing(&self) -> bool {
+        self.edit_confirm_anim
+            .as_ref()
+            .is_some_and(|anim| anim.to < 0.5)
+    }
+
     /// Toggle Options settings drawer.
     /// Reduced motion opens the drawer instantly too (no drawer travel).
     pub fn request_settings(&mut self, open: bool, now: Instant) -> bool {
@@ -1703,6 +1769,7 @@ impl State {
         if self.settings.request(open, now, animate) {
             if open {
                 self.clear_replace();
+                self.clear_edit_confirm();
                 self.cross_progress = 0.0;
                 // Fresh settings open resets the panel offset to 0 internally;
                 // keep the tracker mirror consistent.
@@ -1762,6 +1829,7 @@ impl State {
             || self.cross_progress > 0.0
             || self.replace_confirm.is_some()
             || self.manual_add.is_some()
+            || self.edit_confirm.is_some()
             || self.settings.open
             || self.settings.anim.is_some()
             || self.hint_anims_need_frames()
@@ -1797,6 +1865,7 @@ impl State {
             || self.cross_progress > 0.0
             || self.replace_confirm.is_some()
             || self.manual_add.is_some()
+            || self.edit_confirm.is_some()
             || self.settings.open
             || self.settings.anim.is_some()
             || self.hint_anims_need_frames()
@@ -1895,7 +1964,9 @@ impl State {
         self.dock_expanded || self.dock_anim.is_some()
     }
 
-    /// Request the controllers surface open/close. Exits edit mode when opening.
+    /// Request the controllers surface open/close. An edit draft survives
+    /// underneath (like the settings drawer): closing the dock returns to
+    /// the checklist untouched.
     pub fn request_dock(&mut self, expanded: bool, now: Instant) -> bool {
         let target = if expanded { 1.0 } else { 0.0 };
         if self
@@ -1914,24 +1985,18 @@ impl State {
             let snapped = self.dock_anim.is_some();
             let changed = self.dock_expanded != expanded;
             self.dock_expanded = expanded;
-            if expanded {
-                self.editing = false;
-                self.edit_anchor_play_key = None;
-            }
             self.clear_replace();
             self.clear_manual();
+            self.clear_edit_confirm();
             self.cross_progress = 0.0;
             self.dock_anim = None;
             return changed || snapped;
         }
         let from = self.dock_progress(now);
         self.dock_expanded = expanded;
-        if expanded {
-            self.editing = false;
-            self.edit_anchor_play_key = None;
-        }
         self.clear_replace();
         self.clear_manual();
+        self.clear_edit_confirm();
         self.cross_progress = 0.0;
         if (from - target).abs() < 0.01 {
             self.dock_anim = None;
@@ -3488,6 +3553,9 @@ impl State {
         }
         if overlay::tween_settle(&mut self.manual_anim, now) {
             self.manual_add = None;
+        }
+        if overlay::tween_settle(&mut self.edit_confirm_anim, now) {
+            self.edit_confirm = None;
         }
         let _ = self.settings.tick(now);
         if let Some(anim) = self.strip_anim.as_ref() {
@@ -5170,6 +5238,29 @@ mod tests {
         let modal = HintPress::for_owner(&state, HintPressOwner::ReplaceConfirm);
         assert!((modal.press_anim.cross - 0.0).abs() < 1e-6);
         assert!(!state.hint_anims_need_frames());
+    }
+
+    #[test]
+    fn save_guard_owns_hints_over_dock_and_browse() {
+        let mut state = State {
+            dock_expanded: true,
+            ..Default::default()
+        };
+        state.edit_confirm = Some(EditConfirm);
+        assert_eq!(HintPressOwner::current(&state), HintPressOwner::SaveDiscard);
+        // Settings and the other dialogs still outrank it.
+        state.settings.open = true;
+        assert_eq!(HintPressOwner::current(&state), HintPressOwner::Settings);
+        state.settings.open = false;
+        state.manual_add = Some(ManualAddDraft {
+            edit_id: None,
+            target: String::new(),
+            title: String::new(),
+            args: String::new(),
+            icon_path: None,
+            shell_icon: None,
+        });
+        assert_eq!(HintPressOwner::current(&state), HintPressOwner::ManualAdd);
     }
 
     #[test]
