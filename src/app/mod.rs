@@ -1451,6 +1451,13 @@ impl App {
             self.start_visible = false;
             self.start_close_armed = false;
             self.start_nav_ready = false;
+            // Deferred close teardown: visual state reset here, once the HWND
+            // is actually gone, so no reset frame paints before destroy (see
+            // `close_start_screen`). Also covers the OS-close path, which
+            // bypasses `close_start_screen` entirely.
+            self.start_state.clear_immersive_session();
+            self.start_state.reset_to_games();
+            self.discard_edit_draft();
             // Defensive: an OS-close path bypasses close_start_screen's
             // clear_start_activity, so never leak a Hidden interaction into
             // a later window (the force_cursor gate above is the backstop).

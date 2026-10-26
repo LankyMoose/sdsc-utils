@@ -76,6 +76,7 @@ impl App {
             StartMessage::MoveDown => self.on_start_move(1),
             StartMessage::Confirm => self.on_start_confirm(),
             StartMessage::Close => self.on_start_close(),
+            StartMessage::Noop => Task::none(),
             StartMessage::ToggleControllers => self.on_toggle_controllers(),
             StartMessage::ToggleEdit => match self.toggle_start_edit() {
                 Some(task) => {
@@ -252,7 +253,14 @@ impl App {
             }
         } else if self.launch_selected() {
             self.play_start_cue(UiSoundKind::Action);
-            self.close_start_screen()
+            // A freshly-armed replace confirm stays open on its modal —
+            // closing here would run `reset_to_games()` and wipe it before
+            // its first paint.
+            if self.start_state.replace_confirm.is_none() {
+                self.close_start_screen()
+            } else {
+                Task::none()
+            }
         } else {
             Task::none()
         }
@@ -302,8 +310,11 @@ impl App {
         } else if self.start_state.manual_add.is_some() {
             self.play_start_cue(UiSoundKind::Action);
             self.cancel_manual_add()
-        } else if self.start_state.replace_confirm.take().is_some() {
+        } else if self.start_state.replace_confirm.is_some() {
+            // Cancel unwinds through the exit tween (content clears when it
+            // settles); reduced motion clears instantly.
             self.play_start_cue(UiSoundKind::Action);
+            self.start_state.dismiss_replace(Instant::now());
             Task::none()
         } else if self.start_state.editing {
             self.play_start_cue(UiSoundKind::Action);
@@ -433,7 +444,7 @@ impl App {
         self.edit_draft = None;
         self.start_state.editing = false;
         self.start_state.edit_anchor_play_key = None;
-        self.start_state.manual_add = None;
+        self.start_state.clear_manual();
     }
 
     pub(crate) fn enter_start_edit(&mut self) -> Task<Message> {
@@ -484,7 +495,9 @@ impl App {
     }
 
     pub(crate) fn cancel_manual_add(&mut self) -> Task<Message> {
-        self.start_state.manual_add = None;
+        // Cancel drains through the exit tween (form clears when it
+        // settles); reduced motion clears instantly.
+        self.start_state.dismiss_manual(Instant::now());
         Task::none()
     }
 
@@ -542,14 +555,17 @@ impl App {
             _ => None,
         });
         let shell_icon = start_view::probe_shell_icon(&row.target);
-        self.start_state.manual_add = Some(start_view::ManualAddDraft {
-            edit_id: Some(id.clone()),
-            target: row.target,
-            title: row.title,
-            args: row.args,
-            icon_path,
-            shell_icon,
-        });
+        self.start_state.arm_manual(
+            start_view::ManualAddDraft {
+                edit_id: Some(id.clone()),
+                target: row.target,
+                title: row.title,
+                args: row.args,
+                icon_path,
+                shell_icon,
+            },
+            Instant::now(),
+        );
         Task::none()
     }
 
@@ -586,12 +602,19 @@ impl App {
         }
         if self.launch_selected() {
             self.play_start_cue(UiSoundKind::Action);
+            // Same as `on_start_launch`: keep a fresh replace-confirm modal
+            // alive instead of closing (and wiping) it on the arming update.
+            if self.start_state.replace_confirm.is_some() {
+                return Task::none();
+            }
             return self.close_start_screen();
         }
         Task::none()
     }
 
     /// Launch the selected game. Returns true when launch, replace-confirm, or a real attempt ran.
+    /// Callers must check `replace_confirm` before closing: a `true` from the
+    /// replace arm means "modal armed, stay open", not "launched, close".
     pub(crate) fn launch_selected(&mut self) -> bool {
         let Some(row) = self
             .start_state
@@ -656,11 +679,14 @@ impl App {
                 return false;
             }
             if process_match::any_matching_running(&session.match_paths) {
-                self.start_state.replace_confirm = Some(ReplaceConfirm {
-                    running_title: session.title.clone(),
-                    next_title: row.title.clone(),
-                    next_index: self.start_state.game_selected,
-                });
+                self.start_state.arm_replace(
+                    ReplaceConfirm {
+                        running_title: session.title.clone(),
+                        next_title: row.title.clone(),
+                        next_index: self.start_state.game_selected,
+                    },
+                    Instant::now(),
+                );
                 return true;
             }
             self.running_session = None;
@@ -916,14 +942,17 @@ impl App {
         let target = path.to_string_lossy().into_owned();
         let title = games::title_from_target(&target);
         let shell_icon = start_view::probe_shell_icon(&target);
-        self.start_state.manual_add = Some(start_view::ManualAddDraft {
-            edit_id: None,
-            target,
-            title,
-            args: String::new(),
-            icon_path: None,
-            shell_icon,
-        });
+        self.start_state.arm_manual(
+            start_view::ManualAddDraft {
+                edit_id: None,
+                target,
+                title,
+                args: String::new(),
+                icon_path: None,
+                shell_icon,
+            },
+            Instant::now(),
+        );
         Task::none()
     }
 
@@ -2519,7 +2548,12 @@ impl App {
     }
 
     pub(crate) fn confirm_manual_add(&mut self) -> Task<Message> {
-        let Some(draft) = self.start_state.manual_add.take() else {
+        // Display-only drain (already committed, tween running) must not
+        // apply twice.
+        if self.start_state.manual_closing() {
+            return Task::none();
+        }
+        let Some(draft) = self.start_state.manual_add.clone() else {
             return Task::none();
         };
         let title = draft.title.trim();
@@ -2540,6 +2574,9 @@ impl App {
                 .add_manual(title, draft.target, args, icon);
         }
         self.refresh_start_rows();
+        // Data is committed; the form stays mounted as display-only through
+        // the exit tween and clears when it settles.
+        self.start_state.dismiss_manual(Instant::now());
         Task::none()
     }
 
@@ -3080,7 +3117,6 @@ impl App {
         // Tuning is settled state: never reopen with it on.
         #[cfg(debug_assertions)]
         self.start_state.request_ambient_tuning(false);
-        self.start_state.clear_immersive_session();
         self.start_state.clear_transition_phase();
         // Invalidate in-flight art events; keep caches for fast reopen.
         // Process Exit is what wipes to a blank slate (`ArtOwner::shutdown`).
@@ -3096,8 +3132,17 @@ impl App {
         self.confirm_key_held = false;
         self.cancel_key_held = false;
         self.pad_held = FaceHeld::default();
-        self.start_state.reset_to_games();
-        self.discard_edit_draft();
+        // Visual state (selection, dock, drawer, scrolls, edit draft) resets
+        // in `on_window_closed`, once the HWND is actually gone. Resetting
+        // here would repaint one frame with `game_selected = 0` before the
+        // hide+close lands — a visible selection jump on every close.
+        // No window (never opened / already destroyed): no WindowClosed will
+        // follow, so reset synchronously.
+        if self.start_window.is_none() {
+            self.start_state.clear_immersive_session();
+            self.start_state.reset_to_games();
+            self.discard_edit_draft();
+        }
         self.clear_start_nav_diag();
         // Focus-close often leaves the reopen chord held (e.g. PS); latch until
         // a debounced full release so the next PadPoll cannot immediately reopen.
@@ -3291,7 +3336,7 @@ impl App {
     }
 
     pub(crate) fn complete_replace_confirm(&mut self) -> Task<Message> {
-        let Some(confirm) = self.start_state.replace_confirm.take() else {
+        let Some(confirm) = self.start_state.take_replace() else {
             return Task::none();
         };
         self.keyboard_cross_hold.reset();

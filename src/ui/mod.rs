@@ -12,6 +12,7 @@ pub mod motion;
 pub mod percent_ring;
 pub mod popup;
 pub mod reveal;
+pub mod scale;
 pub mod shader;
 pub mod start;
 pub mod svg_icon;

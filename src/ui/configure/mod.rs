@@ -1581,7 +1581,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
     groups = groups.push(group(Some("Opening".to_string()), opening));
 
     if settings.start_screen_enabled {
-        let mut immersive = vec![
+        let mut display = vec![
             toggle_row(
                 "Display clock",
                 None,
@@ -1668,7 +1668,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         let idle_secs = settings.start_screen_inactive_secs;
         let idle_steps = crate::persist::prefs::START_SCREEN_IDLE_SECS_STEPS;
         let idle_idx = crate::persist::prefs::secs_step_index(idle_secs, idle_steps);
-        immersive.push(slider_row(
+        display.push(slider_row(
             "Idle after",
             crate::persist::prefs::format_timeout_duration(idle_secs),
             slider(
@@ -1697,7 +1697,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             sleep_choices
         };
         let sleep_idx = crate::persist::prefs::secs_step_index(sleep_secs, &sleep_choices);
-        immersive.push(slider_row(
+        display.push(slider_row(
             "Sleep after",
             crate::persist::prefs::format_timeout_duration(sleep_secs),
             slider(
@@ -1713,7 +1713,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         ));
 
         let dim = settings.start_screen_inactive_dim_percent;
-        immersive.push(slider_row(
+        display.push(slider_row(
             "Idle dim",
             format!("{dim}%"),
             slider(0.0..=100.0, f32::from(dim), |value| {
@@ -1722,7 +1722,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             .step(5.0_f32)
             .style(theme::slider),
         ));
-        groups = groups.push(group(Some("Immersive".to_string()), immersive));
+        groups = groups.push(group(Some("Display".to_string()), display));
 
         let mut feedback = vec![toggle_row(
             "UI sounds",
@@ -1817,13 +1817,6 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         ],
     ));
 
-    groups = groups.push(
-        container(note(format!(
-            "Last-known compatible Steam version: {LAST_KNOWN_COMPATIBLE_STEAM_VERSION}"
-        )))
-        .padding([0, 4]),
-    );
-
     let mut library_rows: Vec<Element<'_, ConfigureMessage>> = settings
         .extra_steam_paths
         .iter()
@@ -1852,6 +1845,15 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         Some("Extra Steam libraries".to_string()),
         library_rows,
     ));
+
+    // Compatibility footnote trails the Steam groups so the two library
+    // groups stay adjacent.
+    groups = groups.push(
+        container(note(format!(
+            "Last-known compatible Steam version: {LAST_KNOWN_COMPATIBLE_STEAM_VERSION}"
+        )))
+        .padding([0, 4]),
+    );
 
     groups.into()
 }

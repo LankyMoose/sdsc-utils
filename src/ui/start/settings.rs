@@ -222,13 +222,13 @@ impl SettingsRow {
     /// the row so inserting/reordering rows carries its section along.
     ///
     /// Selection restores on open, so it gets its own section immediately
-    /// after Opening (Opening-adjacent, before Immersive) rather than joining
+    /// after Opening (Opening-adjacent, before Display) rather than joining
     /// either neighbor.
     fn section_before(self) -> Option<&'static str> {
         match self {
             Self::AutoOpen => Some("Opening"),
             Self::SelectionPersist => Some("Selection"),
-            Self::Clock => Some("Immersive"),
+            Self::Clock => Some("Display"),
             Self::Sounds => Some("Feedback"),
             Self::ShowUninstalled => Some("Steam"),
             Self::PerfThrottle => Some("Performance"),
@@ -252,7 +252,7 @@ impl SettingsRow {
     }
 
     /// Whether a section spacer precedes this row's section (i.e. this row
-    /// opens the Immersive / Feedback section after the previous block).
+    /// opens the Display / Feedback section after the previous block).
     fn gap_before(self) -> bool {
         match self {
             Self::SelectionPersist | Self::Clock | Self::Sounds | Self::PerfThrottle => true,
@@ -1878,6 +1878,10 @@ fn slider_row(
         .into()
 }
 
+/// Manual-form content width: inputs, icon row, and buttons size to this;
+/// the overlay card hugs it plus padding (no dead space).
+pub(crate) const MANUAL_FORM_W: f32 = 420.0;
+
 pub(crate) fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
     let Some(draft) = state.manual_add.as_ref() else {
         return space().into();
@@ -1916,66 +1920,63 @@ pub(crate) fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
         );
     }
 
-    container(
-        column![
-            text(if draft.is_edit() {
-                "Edit shortcut"
-            } else {
-                "Add shortcut"
-            })
-            .size(20.0)
-            .color(theme::INK),
-            space().height(6),
-            text_input("Title", &draft.title)
-                .size(14.0)
-                .padding(8)
-                .on_input(StartMessage::ManualAddTitle)
-                .style(theme::input),
-            text(&draft.target).size(12.0).color(theme::MUTED),
-            text_input("Arguments (optional)", &draft.args)
-                .size(14.0)
-                .padding(8)
-                .on_input(StartMessage::ManualAddArgs)
-                .style(theme::input),
-            row![icon_el, column![icon_actions, icon_hint].spacing(6)]
-                .spacing(14)
-                .align_y(Alignment::Center),
-            space().height(8),
-            row![
-                button(text(if draft.is_edit() { "Save" } else { "Add" }).size(14.0))
-                    .padding([6, 14])
-                    .on_press(StartMessage::Confirm)
-                    .style(theme::primary),
-                button(text("Cancel").size(14.0))
-                    .padding([6, 14])
-                    .on_press(StartMessage::Close)
-                    .style(theme::ghost),
-            ]
-            .spacing(10),
-            {
-                let press = HintPress::for_owner(state, HintPressOwner::ManualAdd);
-                action_cluster(
-                    &[
-                        face_hint(
-                            FaceButton::Cross,
-                            if draft.is_edit() { "Save" } else { "Add" },
-                            press.held,
-                            press.press_anim,
-                        ),
-                        face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
-                    ],
-                    false,
-                )
-            },
+    // Plain content column: the overlay card centers it and hugs its width
+    // (the column fixes content at 420px); no Fill wrapper — inside a
+    // shrink-sized card Fill would have nothing to anchor to.
+    column![
+        text(if draft.is_edit() {
+            "Edit shortcut"
+        } else {
+            "Add shortcut"
+        })
+        .size(20.0)
+        .color(theme::INK),
+        space().height(6),
+        text_input("Title", &draft.title)
+            .size(14.0)
+            .padding(8)
+            .on_input(StartMessage::ManualAddTitle)
+            .style(theme::input),
+        text(&draft.target).size(12.0).color(theme::MUTED),
+        text_input("Arguments (optional)", &draft.args)
+            .size(14.0)
+            .padding(8)
+            .on_input(StartMessage::ManualAddArgs)
+            .style(theme::input),
+        row![icon_el, column![icon_actions, icon_hint].spacing(6)]
+            .spacing(14)
+            .align_y(Alignment::Center),
+        space().height(8),
+        row![
+            button(text(if draft.is_edit() { "Save" } else { "Add" }).size(14.0))
+                .padding([6, 14])
+                .on_press(StartMessage::Confirm)
+                .style(theme::primary),
+            button(text("Cancel").size(14.0))
+                .padding([6, 14])
+                .on_press(StartMessage::Close)
+                .style(theme::ghost),
         ]
-        .spacing(10)
-        .width(Length::Fixed(420.0))
-        .align_x(Alignment::Start),
-    )
-    .width(Fill)
-    .height(Fill)
-    .center_x(Fill)
-    .center_y(Fill)
+        .spacing(10),
+        {
+            let press = HintPress::for_owner(state, HintPressOwner::ManualAdd);
+            action_cluster(
+                &[
+                    face_hint(
+                        FaceButton::Cross,
+                        if draft.is_edit() { "Save" } else { "Add" },
+                        press.held,
+                        press.press_anim,
+                    ),
+                    face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
+                ],
+                false,
+            )
+        },
+    ]
+    .spacing(10)
+    .width(Length::Fixed(MANUAL_FORM_W))
+    .align_x(Alignment::Start)
     .into()
 }
 
@@ -2006,41 +2007,40 @@ pub(crate) fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
     let Some(confirm) = state.replace_confirm.as_ref() else {
         return space().into();
     };
-    container(
-        column![
-            text("Game already running").size(20.0).color(theme::INK),
-            text(format!(
+    // Compact dialog content: the caller wraps this in a shared overlay
+    // card over a dimmed stage (no fullscreen takeover).
+    column![
+        crate::ui::start::overlay::dialog_text(
+            "Game already running",
+            format!(
                 "Close {} and launch {}?",
                 confirm.running_title, confirm.next_title
-            ))
-            .size(14.0)
-            .color(theme::MUTED),
-            space().height(8),
-            {
-                let press = HintPress::for_owner(state, HintPressOwner::ReplaceConfirm);
-                action_cluster(
-                    &[
-                        face_hold_hint(
-                            FaceButton::Cross,
-                            "Proceed",
-                            press.cross_progress,
-                            press.cross_armed_t,
-                            press.held,
-                            press.press_anim,
-                        ),
-                        face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
-                    ],
-                    false,
-                )
-            },
-        ]
-        .spacing(12)
-        .align_x(Alignment::Center),
-    )
+            ),
+            20.0,
+            14.0,
+        ),
+        space().height(8),
+        {
+            let press = HintPress::for_owner(state, HintPressOwner::ReplaceConfirm);
+            action_cluster(
+                &[
+                    face_hold_hint(
+                        FaceButton::Cross,
+                        "Proceed",
+                        press.cross_progress,
+                        press.cross_armed_t,
+                        press.held,
+                        press.press_anim,
+                    ),
+                    face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
+                ],
+                false,
+            )
+        },
+    ]
+    .spacing(12)
+    .align_x(Alignment::Center)
     .width(Fill)
-    .height(Fill)
-    .center_x(Fill)
-    .center_y(Fill)
     .into()
 }
 
