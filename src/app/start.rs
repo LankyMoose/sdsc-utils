@@ -141,6 +141,12 @@ impl App {
             StartMessage::ToggleSettings => {
                 let now = Instant::now();
                 let open = !self.start_state.settings.open;
+                // The dock owns the right edge while open: never stack the
+                // drawer over it (Create is likewise blocked while settings
+                // owns input — see `on_toggle_controllers`).
+                if open && self.start_state.dock_open_or_animating() {
+                    return Task::none();
+                }
                 if self.start_state.request_settings(open, now) {
                     self.play_start_cue(UiSoundKind::Action);
                     crate::controller::hid::diag::diag_info(format!(

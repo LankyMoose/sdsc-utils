@@ -194,6 +194,12 @@ pub fn dock_stage_dim(progress: f32) -> f32 {
     progress.clamp(0.0, 1.0) * 0.45
 }
 
+/// Dock panel width from peek ring column to full rows panel.
+pub fn dock_panel_width(progress: f32, peek: f32, expanded: f32) -> f32 {
+    let t = progress.clamp(0.0, 1.0);
+    peek + (expanded - peek) * t
+}
+
 /// Ease-out cubic progress 0..=1 for elapsed/duration.
 pub fn phase_progress(elapsed_ms: u64, duration_ms: u64) -> f32 {
     crate::ui::motion::ease_out_cubic(phase_progress_linear(elapsed_ms, duration_ms))

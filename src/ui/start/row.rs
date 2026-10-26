@@ -1,9 +1,6 @@
-//! Shared strip widgets: update badge, subtitle block, controllers rings strip.
+//! Shared strip widgets: update badge and subtitle block.
 
-use crate::controller::dualsense::lightbar;
-use crate::ui::color::BatterySpectrum;
-use crate::ui::percent_ring;
-use crate::ui::start::view::{StartMessage, StartSubtitle, State};
+use crate::ui::start::view::{StartMessage, StartSubtitle};
 use crate::ui::theme;
 use iced::font::Weight;
 use iced::widget::text::Wrapping;
@@ -89,49 +86,4 @@ pub(crate) fn game_subtitle_block<'a>(
             col.into()
         }
     }
-}
-
-/// Horizontal rings-only controllers strip for the island.
-///
-/// Percentage circles only — no titles, no ETA. The selected pad carries an
-/// accent ring so the strip reads without text.
-pub(crate) fn controllers_rings_strip<'a>(
-    state: &'a State,
-    spectrum: &BatterySpectrum,
-    ring_size: f32,
-) -> Element<'a, StartMessage> {
-    let mut strip = row![].spacing(10).align_y(Alignment::Center);
-    for (i, row) in state.controllers.iter().enumerate() {
-        let selected = i == state.controller_selected;
-        let powering_off = row.connected
-            && state
-                .powering_off
-                .as_ref()
-                .is_some_and(|s| s == &row.serial);
-        let ring_color = if state.ring_flash_white(&row.serial) {
-            theme::from_rgb(lightbar::IDENTIFY_FLASH)
-        } else if row.connected && !powering_off {
-            theme::from_rgb(spectrum.color_at_percent(row.percent))
-        } else {
-            theme::DIM
-        };
-        let ring = percent_ring::percent_ring(row.percent, ring_color, ring_size, None, 0.0);
-        let cell: Element<'a, StartMessage> = if selected {
-            container(ring)
-                .padding(2.0)
-                .style(move |_: &Theme| container::Style {
-                    border: Border {
-                        color: theme::ACCENT,
-                        width: 2.0,
-                        radius: ((ring_size + 4.0) / 2.0).into(),
-                    },
-                    ..container::Style::default()
-                })
-                .into()
-        } else {
-            container(ring).padding(2.0).into()
-        };
-        strip = strip.push(cell);
-    }
-    strip.into()
 }

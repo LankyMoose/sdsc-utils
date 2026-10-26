@@ -509,6 +509,7 @@ pub(crate) enum HintPressOwner {
     Settings,
     ManualAdd,
     ReplaceConfirm,
+    Dock,
 }
 
 impl HintPressOwner {
@@ -519,6 +520,8 @@ impl HintPressOwner {
             Self::ManualAdd
         } else if state.replace_confirm.is_some() {
             Self::ReplaceConfirm
+        } else if state.dock_expanded {
+            Self::Dock
         } else {
             Self::Browse
         }
@@ -552,10 +555,10 @@ impl HintPress {
 }
 
 impl RowHintState {
-    pub(crate) fn for_selected(state: &State, selected: bool) -> Self {
-        // Browse row/dock/hero share press with the browse footer — idle while an overlay owns input.
+    pub(crate) fn for_selected(state: &State, selected: bool, owner: HintPressOwner) -> Self {
+        // Hints light only for the surface that owns input — idle otherwise.
         if selected {
-            let press = HintPress::for_owner(state, HintPressOwner::Browse);
+            let press = HintPress::for_owner(state, owner);
             Self {
                 triangle_progress: press.triangle_progress,
                 triangle_armed_t: press.triangle_armed_t,
@@ -1661,6 +1664,12 @@ impl State {
             return anim.from + (anim.to - anim.from) * e;
         }
         if self.dock_expanded { 1.0 } else { 0.0 }
+    }
+
+    /// True while the controllers surface is open or still traveling
+    /// (used to keep the settings drawer from opening over it).
+    pub fn dock_open_or_animating(&self) -> bool {
+        self.dock_expanded || self.dock_anim.is_some()
     }
 
     /// Request the controllers surface open/close. Exits edit mode when opening.

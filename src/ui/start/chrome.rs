@@ -16,59 +16,14 @@ use crate::ui::start::view::{
     StartControllerRow, StartMessage, StartRow, State,
 };
 use crate::ui::theme;
-use iced::widget::{button, container, row, space, text};
+use iced::widget::{button, container, row, text};
 use iced::{Alignment, Element, Fill, Font, Length};
 
 const IMMERSIVE_FOOTER_HEIGHT: f32 = 44.0;
 /// Gap inside the secondary (left) footer cluster.
 const FOOTER_SECONDARY_GAP: f32 = 14.0;
 /// Immersive split footer min width so left/right packing reads clearly.
-const FOOTER_SPLIT_MIN_W: f32 = 560.0;
-/// Rings diameter in the immersive island.
-pub(crate) const CONTROLLERS_RING: f32 = 36.0;
-
-/// Shared controllers-surface footer: Connected/All toggle left, selected-row
-/// action hints + Back right. Used by the island footer.
-pub(crate) fn controllers_surface_footer<'a>(state: &'a State) -> Element<'a, StartMessage> {
-    let press = HintPress::for_owner(state, HintPressOwner::Browse);
-    let secondary = footer_secondary_row(
-        Some(face_cycle_toggle(
-            FaceButton::Square,
-            press.held,
-            press.press_anim,
-            &[
-                ("Connected", !state.show_all_controllers),
-                ("All", state.show_all_controllers),
-            ],
-            false,
-        )),
-        None,
-        None,
-    );
-    let row_hints: Element<'static, StartMessage> = if let Some(row) = state.selected_controller() {
-        let selected = true;
-        immersive_dock_row_hints(row, state, selected)
-            .unwrap_or_else(|| space().width(Length::Shrink).into())
-    } else {
-        space().width(Length::Shrink).into()
-    };
-    let actions = row![
-        row_hints,
-        action_cluster(
-            &[face_hint(
-                FaceButton::Circle,
-                "Back",
-                press.held,
-                press.press_anim
-            )],
-            false,
-        ),
-    ]
-    .spacing(ROW_ACTION_SPACING)
-    .align_y(Alignment::Center)
-    .into();
-    footer_band(compose_footer_split(secondary, actions), false)
-}
+const FOOTER_SPLIT_MIN_W: f32 = 680.0;
 
 /// Identify / Power-off hints for the selected controllers row.
 /// Uses layout-stable glyphs (no Float scale) so dock row height cannot escape.
@@ -80,7 +35,7 @@ pub(crate) fn immersive_dock_row_hints(
     if !selected || !row.connected {
         return None;
     }
-    let hint = RowHintState::for_selected(state, true);
+    let hint = RowHintState::for_selected(state, true, HintPressOwner::Dock);
     let powering_off = state
         .powering_off
         .as_ref()
@@ -152,7 +107,7 @@ pub(crate) fn immersive_game_hints(
     state: &State,
     alpha: f32,
 ) -> Element<'static, StartMessage> {
-    let hint = RowHintState::for_selected(state, true);
+    let hint = RowHintState::for_selected(state, true, HintPressOwner::Browse);
     let mut actions = Vec::new();
     let status = if state.editing {
         None
@@ -330,13 +285,8 @@ pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a,
     }
 
     let press = HintPress::for_owner(state, HintPressOwner::Browse);
-    // Controllers surface open: Circle collapses it (Back). Otherwise Close
-    // (Cancel while editing).
-    let circle_label = if state.dock_expanded {
-        "Back"
-    } else {
-        crate::ui::start::mode::cancel_circle_label(state.editing)
-    };
+    // Circle closes (Cancel while editing) regardless of the dock state.
+    let circle_label = crate::ui::start::mode::cancel_circle_label(state.editing);
 
     // Split layout: secondary (sort / controllers / Settings) left,
     // primary actions right.
@@ -387,9 +337,19 @@ pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a,
                 actions,
             )
         } else {
+            // Left: Edit + sort. Right: Select + Start + Close.
             (
-                footer_secondary_row(
-                    Some(face_cycle_toggle(
+                row![
+                    action_cluster(
+                        &[face_hint(
+                            FaceButton::Triangle,
+                            "Edit",
+                            press.held,
+                            press.press_anim,
+                        )],
+                        flat_hints,
+                    ),
+                    face_cycle_toggle(
                         FaceButton::Square,
                         press.held,
                         press.press_anim,
@@ -404,21 +364,27 @@ pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a,
                             ),
                         ],
                         flat_hints,
-                    )),
-                    Some(select_toggle_hint(
-                        "Controllers",
-                        press.held,
-                        press.press_anim,
+                    ),
+                ]
+                .spacing(FOOTER_SECONDARY_GAP)
+                .align_y(Alignment::Center)
+                .into(),
+                row![
+                    select_toggle_hint("Controllers", press.held, press.press_anim, flat_hints,),
+                    options_hint_el("Settings", press.held, press.press_anim, flat_hints,),
+                    action_cluster(
+                        &[face_hint(
+                            FaceButton::Circle,
+                            circle_label,
+                            press.held,
+                            press.press_anim,
+                        )],
                         flat_hints,
-                    )),
-                    Some(options_hint_el(
-                        "Settings",
-                        press.held,
-                        press.press_anim,
-                        flat_hints,
-                    )),
-                ),
-                actions,
+                    ),
+                ]
+                .spacing(FOOTER_SECONDARY_GAP)
+                .align_y(Alignment::Center)
+                .into(),
             )
         };
 
@@ -534,7 +500,7 @@ fn footer_band(content: Element<'_, StartMessage>, expand: bool) -> Element<'_, 
 }
 
 /// Square glyph + segmented labels; pad Square cycles (presentational — no mouse).
-fn face_cycle_toggle(
+pub(crate) fn face_cycle_toggle(
     face: FaceButton,
     held: FaceHeld,
     press_anim: FacePressAnim,
