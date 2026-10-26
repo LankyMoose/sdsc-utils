@@ -105,6 +105,7 @@ pub(crate) struct FacePressAnim {
     pub(crate) square: f32,
     pub(crate) triangle: f32,
     pub(crate) options: f32,
+    pub(crate) create: f32,
 }
 
 impl FacePressAnim {
@@ -192,22 +193,6 @@ pub(crate) fn text_glyph_circle(
         let scale = 1.0 + (PRESSED_SCALE - 1.0) * press_t.clamp(0.0, 1.0);
         Float::new(stack).scale(scale).into()
     }
-}
-
-pub(crate) fn text_glyph_capsule(
-    glyph: String,
-    pressed: bool,
-    press_t: f32,
-    flat: bool,
-) -> Element<'static, StartMessage> {
-    hint_text_capsule(
-        text(glyph).size(12.0).color(theme::ACCENT),
-        10.0,
-        0.0,
-        pressed,
-        press_t,
-        flat,
-    )
 }
 
 /// Pill glyph centered in a [`HOLD_RING_SIZE`] slot so height matches face rings.

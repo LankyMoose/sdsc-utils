@@ -1,84 +1,76 @@
-//! Compact chrome + footer assembly for the Start screen.
+//! Start-screen footer + controllers-surface assembly.
 //!
-//! Behavior-preserving split from [`crate::ui::start::view`]: header, footer,
-//! scan-veil root, modal branches, and immersive hint clusters live here.
+//! Split from [`crate::ui::start::view`]: footer hints, the shared
+//! controllers-surface footer, and immersive hint clusters live here.
 //! Face glyph primitives come from [`crate::ui::start::face`], modal bodies
 //! from [`crate::ui::start::settings`], press ownership and state from `view`.
 
 use crate::persist::prefs::GamesSortMode;
-use crate::ui::color::BatterySpectrum;
 use crate::ui::start::face::{
     ActionHint, FaceButton, FacePressAnim, RingStyle, action_cluster, face_glyph, face_glyph_stack,
-    face_hint, face_hold_hint, hint_text_capsule, text_glyph_capsule, text_glyph_circle,
+    face_hint, face_hold_hint, hint_text_capsule,
 };
 use crate::ui::start::input::FaceHeld;
-use crate::ui::start::list::{controllers_list, games_list};
-use crate::ui::start::settings::{manual_add_view, replace_confirm_view};
 use crate::ui::start::view::{
-    EditRow, FOOTER_HEIGHT, HEADER_HEIGHT, HintPress, HintPressOwner, LaunchStatus, PAD_Y, PADDING,
-    PANE_W, ROW_ACTION_SPACING, RowHintState, StartControllerRow, StartMessage, StartRow,
-    StartSlide, State, SteamScanBannerVisual, scan_status_chip, scan_status_slide,
+    EditRow, HintPress, HintPressOwner, LaunchStatus, ROW_ACTION_SPACING, RowHintState,
+    StartControllerRow, StartMessage, StartRow, State,
 };
-use crate::ui::{chrome, theme};
-use iced::widget::{button, column, container, row, space, text};
-use iced::{Alignment, Color, Element, Fill, Font, Length};
-use std::time::Instant;
+use crate::ui::theme;
+use iced::widget::{button, container, row, space, text};
+use iced::{Alignment, Element, Fill, Font, Length};
 
 const IMMERSIVE_FOOTER_HEIGHT: f32 = 44.0;
 /// Gap inside the secondary (left) footer cluster.
 const FOOTER_SECONDARY_GAP: f32 = 14.0;
 /// Immersive split footer min width so left/right packing reads clearly.
 const FOOTER_SPLIT_MIN_W: f32 = 560.0;
-const TITLE_ACTIVE: f32 = 20.0;
-const TITLE_INACTIVE: f32 = 15.0;
-const CUE_SIZE: f32 = 14.0;
-/// Width reserved for an L2/R2 cue plus gap while revealed.
-const CUE_SLOT_W: f32 = 30.0;
+/// Rings diameter in the immersive island.
+pub(crate) const CONTROLLERS_RING: f32 = 36.0;
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn compact_chrome<'a>(
-    state: &'a State,
-    spectrum: &BatterySpectrum,
-    now: Instant,
-    always_immersive: bool,
-    promote_gesture: &'a [crate::domain::gesture::GestureControl],
-    flat_hints: bool,
-    steam_scan_banner: Option<SteamScanBannerVisual>,
-    #[cfg(debug_assertions)] debug_bounds: bool,
-) -> Element<'a, StartMessage> {
-    let header = slide_header(state.slide_progress(now), steam_scan_banner, now);
-    #[cfg(debug_assertions)]
-    let header: Element<'_, StartMessage> = crate::ui::debug_bounds::wrap(header, debug_bounds);
-
-    let body = if state.manual_add.is_some() {
-        manual_add_view(state)
-    } else if state.replace_confirm.is_some() {
-        replace_confirm_view(state)
+/// Shared controllers-surface footer: Connected/All toggle left, selected-row
+/// action hints + Back right. Used by the island footer.
+pub(crate) fn controllers_surface_footer<'a>(state: &'a State) -> Element<'a, StartMessage> {
+    let press = HintPress::for_owner(state, HintPressOwner::Browse);
+    let secondary = footer_secondary_row(
+        Some(face_cycle_toggle(
+            FaceButton::Square,
+            press.held,
+            press.press_anim,
+            &[
+                ("Connected", !state.show_all_controllers),
+                ("All", state.show_all_controllers),
+            ],
+            false,
+        )),
+        None,
+        None,
+    );
+    let row_hints: Element<'static, StartMessage> = if let Some(row) = state.selected_controller() {
+        let selected = true;
+        immersive_dock_row_hints(row, state, selected)
+            .unwrap_or_else(|| space().width(Length::Shrink).into())
     } else {
-        carousel_body(state, spectrum, now)
+        space().width(Length::Shrink).into()
     };
-    let body = container(body).width(Fill).height(Fill);
-    #[cfg(debug_assertions)]
-    let body = crate::ui::debug_bounds::wrap(body.into(), debug_bounds);
-
-    let hint = footer_hint(state, false, always_immersive, promote_gesture, flat_hints);
-    #[cfg(debug_assertions)]
-    let hint: Element<'_, StartMessage> = crate::ui::debug_bounds::wrap(hint, debug_bounds);
-    #[cfg(debug_assertions)]
-    let diag = diag_report_bar();
-    #[cfg(not(debug_assertions))]
-    let diag: Element<'_, StartMessage> = space().height(Length::Fixed(0.0)).into();
-
-    chrome::window(
-        column![header, body, diag, hint,]
-            .spacing(10)
-            .padding([PAD_Y, PADDING])
-            .width(Fill)
-            .height(Fill),
-    )
+    let actions = row![
+        row_hints,
+        action_cluster(
+            &[face_hint(
+                FaceButton::Circle,
+                "Back",
+                press.held,
+                press.press_anim
+            )],
+            false,
+        ),
+    ]
+    .spacing(ROW_ACTION_SPACING)
+    .align_y(Alignment::Center)
+    .into();
+    footer_band(compose_footer_split(secondary, actions), false)
 }
 
-/// Identify / Power-off hints for an immersive dock row (mirrors compact Controllers).
+/// Identify / Power-off hints for the selected controllers row.
 /// Uses layout-stable glyphs (no Float scale) so dock row height cannot escape.
 pub(crate) fn immersive_dock_row_hints(
     row: &StartControllerRow,
@@ -244,10 +236,10 @@ pub(crate) fn immersive_game_hints(
     }
 }
 
-/// Mouse + global hotkey hitch markers (not pad-navigable). Stamps `HITCH_MARK` in the logs.
-/// Debug builds only.
+/// Mouse hitch markers (not pad-navigable). Stamps `HITCH_MARK` in the logs.
+/// Debug builds only. Rendered above the footer capsule.
 #[cfg(debug_assertions)]
-fn diag_report_bar() -> Element<'static, StartMessage> {
+pub(crate) fn diag_report_bar() -> Element<'static, StartMessage> {
     row![
         button(
             text("Report lightbar write failure (F7)")
@@ -267,159 +259,6 @@ fn diag_report_bar() -> Element<'static, StartMessage> {
         .style(theme::ghost),
     ]
     .spacing(8)
-    .into()
-}
-
-/// Header titles and L2/R2 cues interpolate with carousel progress (0 = Games, 1 = Controllers).
-pub(crate) fn slide_header(
-    progress: f32,
-    steam_scan_banner: Option<SteamScanBannerVisual>,
-    now: Instant,
-) -> Element<'static, StartMessage> {
-    slide_header_metrics(
-        progress,
-        HEADER_HEIGHT,
-        TITLE_ACTIVE,
-        TITLE_INACTIVE,
-        CUE_SIZE,
-        CUE_SLOT_W,
-        steam_scan_banner,
-        now,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn slide_header_metrics(
-    progress: f32,
-    height: f32,
-    title_active: f32,
-    title_inactive: f32,
-    cue_size: f32,
-    cue_slot_w: f32,
-    steam_scan_banner: Option<SteamScanBannerVisual>,
-    now: Instant,
-) -> Element<'static, StartMessage> {
-    let games_t = progress;
-    let controllers_t = 1.0 - progress;
-
-    let games_label = text(StartSlide::Games.title())
-        .size(lerp(title_active, title_inactive, games_t))
-        .color(lerp_color(
-            theme::INK,
-            theme::alpha(theme::MUTED, 0.45),
-            games_t,
-        ));
-    let controllers_label = text(StartSlide::Controllers.title())
-        .size(lerp(title_active, title_inactive, controllers_t))
-        .color(lerp_color(
-            theme::INK,
-            theme::alpha(theme::MUTED, 0.45),
-            controllers_t,
-        ));
-
-    let left = row![
-        slide_cue("L2", games_t, Alignment::Start, cue_size, cue_slot_w),
-        games_label,
-    ]
-    .spacing(0)
-    .align_y(Alignment::End);
-
-    let right = row![
-        controllers_label,
-        slide_cue("R2", controllers_t, Alignment::End, cue_size, cue_slot_w),
-    ]
-    .spacing(0)
-    .align_y(Alignment::End);
-
-    let center: Element<'_, StartMessage> = if let Some(visual) = steam_scan_banner {
-        // Full-header clip at the underline; chip rests above it and slides the whole way.
-        let chip_h = 16.0;
-        let progress = (visual.stack_slot + 1.0).clamp(0.0, 1.0);
-        container(scan_status_slide(
-            scan_status_chip(12.0, 11.0, now, visual),
-            progress,
-            chip_h,
-            height,
-            6.0,
-        ))
-        .width(Fill)
-        .align_x(Alignment::Center)
-        .into()
-    } else {
-        space().width(Length::Fixed(8.0)).into()
-    };
-
-    container(
-        row![
-            container(left)
-                .width(Fill)
-                .height(Fill)
-                .align_x(Alignment::Start)
-                .align_y(Alignment::End),
-            center,
-            container(right)
-                .width(Fill)
-                .height(Fill)
-                .align_x(Alignment::End)
-                .align_y(Alignment::End),
-        ]
-        .height(Length::Fixed(height)),
-    )
-    .width(Fill)
-    .height(Length::Fixed(height))
-    .clip(true)
-    .into()
-}
-
-/// Width-revealed + faded L2/R2 cue (`amount` 0 = hidden, 1 = fully shown).
-fn slide_cue(
-    label: &'static str,
-    amount: f32,
-    align: Alignment,
-    cue_size: f32,
-    cue_slot_w: f32,
-) -> Element<'static, StartMessage> {
-    let amount = amount.clamp(0.0, 1.0);
-    let width = cue_slot_w * amount;
-    container(
-        text(label)
-            .size(cue_size)
-            .color(theme::alpha(theme::ACCENT, amount)),
-    )
-    .width(Length::Fixed(width))
-    .align_x(align)
-    .clip(true)
-    .into()
-}
-
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t.clamp(0.0, 1.0)
-}
-
-fn lerp_color(a: Color, b: Color, t: f32) -> Color {
-    let t = t.clamp(0.0, 1.0);
-    Color {
-        r: lerp(a.r, b.r, t),
-        g: lerp(a.g, b.g, t),
-        b: lerp(a.b, b.b, t),
-        a: lerp(a.a, b.a, t),
-    }
-}
-
-fn carousel_body<'a>(
-    state: &'a State,
-    spectrum: &BatterySpectrum,
-    now: Instant,
-) -> Element<'a, StartMessage> {
-    let scroll = state.slide_scroll_x(now);
-    crate::ui::start::carousel::carousel(
-        scroll,
-        PANE_W,
-        games_list(state),
-        controllers_list(state, spectrum),
-    )
-    .width(Length::Fixed(PANE_W))
-    .height(Fill)
     .into()
 }
 
@@ -449,13 +288,7 @@ pub(crate) fn empty_games_browse_prompt(
     .into()
 }
 
-pub(crate) fn footer_hint<'a>(
-    state: &'a State,
-    immersive: bool,
-    always_immersive: bool,
-    promote_gesture: &'a [crate::domain::gesture::GestureControl],
-    flat_hints: bool,
-) -> Element<'a, StartMessage> {
+pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a, StartMessage> {
     // Settings keeps its own footer inside the panel — main chrome footer stays browse/modals.
     if state.manual_add.is_some() {
         let press = HintPress::for_owner(state, HintPressOwner::ManualAdd);
@@ -472,7 +305,6 @@ pub(crate) fn footer_hint<'a>(
                 ],
                 flat_hints,
             ),
-            immersive,
             false,
         );
     }
@@ -493,127 +325,92 @@ pub(crate) fn footer_hint<'a>(
                 ],
                 flat_hints,
             ),
-            immersive,
             false,
         );
     }
 
     let press = HintPress::for_owner(state, HintPressOwner::Browse);
-    let circle_label =
-        crate::ui::start::mode::cancel_circle_label(immersive, always_immersive, state.editing);
-    // Compact footer: reopen chord → Immersive. Immersive demote is Circle (Back) when
-    // always-immersive is off — do not also advertise Compact on the reopen chord.
-    let toggle_label = if !state.editing
-        && !immersive
-        && crate::ui::start::mode::promote_gesture_usable(promote_gesture)
-    {
-        Some("Immersive")
+    // Controllers surface open: Circle collapses it (Back). Otherwise Close
+    // (Cancel while editing).
+    let circle_label = if state.dock_expanded {
+        "Back"
     } else {
-        None
+        crate::ui::start::mode::cancel_circle_label(state.editing)
     };
-    let promote_cue: Option<Element<'a, StartMessage>> = toggle_label.map(|label| {
-        gesture_chord_hint(
-            promote_gesture,
-            label,
-            press.reopen_held,
-            press.reopen_press,
-            flat_hints,
-        )
-    });
 
-    // Split layout: secondary (view / Immersive / Settings) left, primary actions right.
+    // Split layout: secondary (sort / controllers / Settings) left,
+    // primary actions right.
+    let hints = [
+        face_hint(
+            FaceButton::Triangle,
+            if state.editing { "Save" } else { "Edit" },
+            press.held,
+            press.press_anim,
+        ),
+        face_hint(
+            FaceButton::Circle,
+            circle_label,
+            press.held,
+            press.press_anim,
+        ),
+    ];
+    let actions = action_cluster(&hints, flat_hints);
     let (secondary, actions): (Element<'a, StartMessage>, Element<'a, StartMessage>) =
-        match state.slide {
-            StartSlide::Games => {
-                let hints = [
-                    face_hint(
-                        FaceButton::Triangle,
-                        if state.editing { "Save" } else { "Edit" },
-                        press.held,
-                        press.press_anim,
-                    ),
-                    face_hint(
-                        FaceButton::Circle,
-                        circle_label,
-                        press.held,
-                        press.press_anim,
-                    ),
-                ];
-                let actions = action_cluster(&hints, flat_hints);
-                if state.editing {
-                    (
-                        footer_secondary_row(
-                            Some(face_cycle_toggle(
-                                FaceButton::Square,
-                                press.held,
-                                press.press_anim,
-                                &[
-                                    (
-                                        "Last played",
-                                        matches!(state.sort_mode, GamesSortMode::LastPlayed),
-                                    ),
-                                    (
-                                        "A–Z",
-                                        matches!(state.sort_mode, GamesSortMode::Alphabetical),
-                                    ),
-                                ],
-                                flat_hints,
-                            )),
-                            Some(
-                                button(text("Add shortcut…").size(14.0).color(theme::ACCENT))
-                                    .padding([6, 12])
-                                    .on_press(StartMessage::AddShortcut)
-                                    .style(theme::ghost)
-                                    .into(),
-                            ),
-                            None,
-                        ),
-                        actions,
-                    )
-                } else {
-                    (
-                        footer_secondary_row(
-                            Some(face_cycle_toggle(
-                                FaceButton::Square,
-                                press.held,
-                                press.press_anim,
-                                &[
-                                    (
-                                        "Last played",
-                                        matches!(state.sort_mode, GamesSortMode::LastPlayed),
-                                    ),
-                                    (
-                                        "A–Z",
-                                        matches!(state.sort_mode, GamesSortMode::Alphabetical),
-                                    ),
-                                ],
-                                flat_hints,
-                            )),
-                            promote_cue,
-                            Some(options_hint_el(
-                                "Settings",
-                                press.held,
-                                press.press_anim,
-                                flat_hints,
-                            )),
-                        ),
-                        actions,
-                    )
-                }
-            }
-            StartSlide::Controllers => (
+        if state.editing {
+            (
                 footer_secondary_row(
                     Some(face_cycle_toggle(
                         FaceButton::Square,
                         press.held,
                         press.press_anim,
                         &[
-                            ("Connected", !state.show_all_controllers),
-                            ("All", state.show_all_controllers),
+                            (
+                                "Last played",
+                                matches!(state.sort_mode, GamesSortMode::LastPlayed),
+                            ),
+                            (
+                                "A–Z",
+                                matches!(state.sort_mode, GamesSortMode::Alphabetical),
+                            ),
                         ],
                         flat_hints,
                     )),
-                    promote_cue,
+                    Some(
+                        button(text("Add shortcut…").size(14.0).color(theme::ACCENT))
+                            .padding([6, 12])
+                            .on_press(StartMessage::AddShortcut)
+                            .style(theme::ghost)
+                            .into(),
+                    ),
+                    None,
+                ),
+                actions,
+            )
+        } else {
+            (
+                footer_secondary_row(
+                    Some(face_cycle_toggle(
+                        FaceButton::Square,
+                        press.held,
+                        press.press_anim,
+                        &[
+                            (
+                                "Last played",
+                                matches!(state.sort_mode, GamesSortMode::LastPlayed),
+                            ),
+                            (
+                                "A–Z",
+                                matches!(state.sort_mode, GamesSortMode::Alphabetical),
+                            ),
+                        ],
+                        flat_hints,
+                    )),
+                    Some(select_toggle_hint(
+                        "Controllers",
+                        press.held,
+                        press.press_anim,
+                        flat_hints,
+                    )),
                     Some(options_hint_el(
                         "Settings",
                         press.held,
@@ -621,24 +418,16 @@ pub(crate) fn footer_hint<'a>(
                         flat_hints,
                     )),
                 ),
-                action_cluster(
-                    &[face_hint(
-                        FaceButton::Circle,
-                        circle_label,
-                        press.held,
-                        press.press_anim,
-                    )],
-                    flat_hints,
-                ),
-            ),
+                actions,
+            )
         };
 
-    footer_band(compose_footer_split(secondary, actions), immersive, true)
+    footer_band(compose_footer_split(secondary, actions), true)
 }
 
 fn footer_secondary_row<'a>(
     view: Option<Element<'a, StartMessage>>,
-    promote: Option<Element<'a, StartMessage>>,
+    controllers: Option<Element<'a, StartMessage>>,
     settings: Option<Element<'a, StartMessage>>,
 ) -> Element<'a, StartMessage> {
     let mut row = iced::widget::row![]
@@ -647,7 +436,7 @@ fn footer_secondary_row<'a>(
     if let Some(view) = view {
         row = row.push(view);
     }
-    if let Some(cue) = promote {
+    if let Some(cue) = controllers {
         row = row.push(cue);
     }
     if let Some(settings) = settings {
@@ -687,6 +476,36 @@ fn options_hint_el(
         .into()
 }
 
+/// Create (Select) toggle cue with label (footer use). The island uses
+/// the icon-only [`select_capsule`].
+fn select_toggle_hint(
+    label: &'static str,
+    held: FaceHeld,
+    press_anim: FacePressAnim,
+    flat: bool,
+) -> Element<'static, StartMessage> {
+    let glyph = select_capsule(held.create, press_anim.create, flat);
+    row![glyph, text(label).size(14.0).color(theme::MUTED)]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// DualSense Create → SELECT capsule (icon-only use in the island/header;
+/// same metrics as the START capsule so the pair reads as opposites).
+pub(crate) fn select_capsule(
+    pressed: bool,
+    press_t: f32,
+    flat: bool,
+) -> Element<'static, StartMessage> {
+    let label = text("SELECT")
+        .size(12.0)
+        .font(Font::MONOSPACE)
+        .color(theme::ACCENT);
+    // Monospace caps sit high in the em box — nudge down for optical center.
+    hint_text_capsule(label, 10.0, 1.0, pressed, press_t, flat)
+}
+
 /// DualSense Options → START capsule (visual height matches face-ring idle diameter).
 fn start_options_capsule(
     pressed: bool,
@@ -701,59 +520,16 @@ fn start_options_capsule(
     hint_text_capsule(label, 10.0, 1.0, pressed, press_t, flat)
 }
 
-/// Reopen-chord cue: short single control → circle; else one capsule with joined text.
-fn gesture_chord_hint(
-    controls: &[crate::domain::gesture::GestureControl],
-    label: &'static str,
-    pressed: bool,
-    press_t: f32,
-    flat: bool,
-) -> Element<'static, StartMessage> {
-    let glyph = if gesture_uses_circle(controls) {
-        text_glyph_circle(controls[0].as_str(), pressed, press_t, flat)
-    } else {
-        text_glyph_capsule(
-            crate::domain::gesture::format_gesture(controls),
-            pressed,
-            press_t,
-            flat,
-        )
-    };
-    row![glyph, text(label).size(14.0).color(theme::MUTED)]
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .into()
-}
-
-/// Circle for a single control whose label is at most 2 characters (e.g. PS, L3).
-fn gesture_uses_circle(controls: &[crate::domain::gesture::GestureControl]) -> bool {
-    matches!(controls, [c] if c.as_str().chars().count() <= 2)
-}
-
-fn footer_band(
-    content: Element<'_, StartMessage>,
-    immersive: bool,
-    expand_immersive: bool,
-) -> Element<'_, StartMessage> {
-    let height = if immersive {
-        IMMERSIVE_FOOTER_HEIGHT
-    } else {
-        FOOTER_HEIGHT
-    };
-    // Immersive modals: hug the action cluster. Browse split: widen so left/right pack.
-    // Compact: fill the footer band.
+fn footer_band(content: Element<'_, StartMessage>, expand: bool) -> Element<'_, StartMessage> {
+    // Modals: hug the action cluster. Browse split: widen so left/right pack.
     let band = container(content)
-        .height(Length::Fixed(height))
+        .height(Length::Fixed(IMMERSIVE_FOOTER_HEIGHT))
         .align_x(Alignment::Center)
         .align_y(Alignment::Center);
-    if immersive {
-        if expand_immersive {
-            band.width(Length::Fixed(FOOTER_SPLIT_MIN_W)).into()
-        } else {
-            band.into()
-        }
+    if expand {
+        band.width(Length::Fixed(FOOTER_SPLIT_MIN_W)).into()
     } else {
-        band.width(Fill).into()
+        band.into()
     }
 }
 

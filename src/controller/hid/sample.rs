@@ -243,7 +243,7 @@ pub(crate) fn drain_sample<T: HidTransport>(
 
 fn sample_summary(sample: &PadSample) -> String {
     format!(
-        "ok stick_x={:.2} stick_y={:.2} l2={} r2={} cross={} circle={} square={} triangle={} options={} dpad_u={} dpad_d={} dpad_l={} dpad_r={}",
+        "ok stick_x={:.2} stick_y={:.2} l2={} r2={} cross={} circle={} square={} triangle={} options={} create={} dpad_u={} dpad_d={} dpad_l={} dpad_r={}",
         sample.stick_x,
         sample.stick_y,
         u8::from(sample.l2),
@@ -253,6 +253,7 @@ fn sample_summary(sample: &PadSample) -> String {
         u8::from(sample.square),
         u8::from(sample.triangle),
         u8::from(sample.options),
+        u8::from(sample.create),
         u8::from(sample.dpad_up),
         u8::from(sample.dpad_down),
         u8::from(sample.dpad_left),
@@ -269,6 +270,7 @@ fn latch_diag(batch: &[PadSample], merged: &PadSample) {
         || (merged.square && !last.square)
         || (merged.triangle && !last.triangle)
         || (merged.options && !last.options)
+        || (merged.create && !last.create)
         || (merged.l2 && !last.l2)
         || (merged.r2 && !last.r2);
     if latched {

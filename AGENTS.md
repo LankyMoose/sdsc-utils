@@ -74,7 +74,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 | `src/games/` | Steam library scan, game launch, process matching |
 | `src/persist/` | `prefs.json`, `controllers.json`, `analytics.json`, `steam_library.json`, paths |
 | `src/platform/` | Logging, app metadata, autostart, crash-restart, device-arrival watch, file icons, MSIX (`packaged`), UI sounds, wgpu diagnostics, Win32 helpers |
-| `src/ui/` | All iced views + styling: `theme.rs`, `popup/`, `configure/` (Settings), `start/` (compact + immersive Start), `toast/`, `shader/`, `percent_ring.rs`, `layout.rs` (window placement) |
+| `src/ui/` | All iced views + styling: `theme.rs`, `popup/`, `configure/` (Settings), `start/` (fullscreen Start console), `toast/`, `shader/`, `percent_ring.rs`, `layout.rs` (window placement) |
 | Tests | Inline `#[cfg(test)] mod tests` next to the code (no `tests/` dir) |
 
 ## Common gotchas for agents
@@ -97,7 +97,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Error type** → `src/app_error.rs` (`AppError` + `AppResult`)
 - **Lightbar spectrum editor (Settings)** → `src/ui/configure/spectrum.rs`, `src/ui/configure/mod.rs`
 - **Theme / shared widget styles** → `src/ui/theme.rs`; restyle plan → `notes/ui-refresh.md`
-- **Start screen / game launcher** → `src/ui/start/` (UI), `src/games/` (Steam scan, launch); immersive mode → `notes/start-immersive.md`
+- **Start screen / game launcher** → `src/ui/start/` (UI), `src/games/` (Steam scan, launch); behavior → `notes/start-immersive.md`
 - **Toasts** → `src/ui/toast/` (state machine in `machine.rs`); z-order / remount → `notes/windows-toast.md`
 - **Persisted state (prefs/controllers/analytics)** → `src/persist/`
 - **Single instance, tray lifecycle, crash-restart** → `src/bin/sdsc-utils.rs`, `src/platform/crash_restart.rs`

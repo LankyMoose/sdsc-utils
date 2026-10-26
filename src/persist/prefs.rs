@@ -274,10 +274,7 @@ pub struct Prefs {
     /// controller (default).
     #[serde(default)]
     pub start_screen_auto_open: StartAutoOpen,
-    /// Always use immersive Start (never show compact; cancel closes) (default on).
-    #[serde(default = "default_true")]
-    pub start_screen_always_immersive: bool,
-    /// Show the clock widget at the top while immersive Start is visible (default on).
+    /// Show the clock widget at the top while the start screen is visible (default on).
     #[serde(default = "default_true")]
     pub start_screen_clock_enabled: bool,
     /// Immersive idle dim after this many seconds (default 30). Snapped to idle steps.
@@ -289,7 +286,7 @@ pub struct Prefs {
     /// Idle-mode black overlay percent 0–100 (default 50). Sleep is always 100%.
     #[serde(default = "default_start_screen_inactive_dim_percent")]
     pub start_screen_inactive_dim_percent: u8,
-    /// Reopen / promote chord while a pad is connected.
+    /// Reopen chord while a pad is connected.
     /// Always forced to PS on load/save; custom chords are no longer honored.
     #[serde(default = "default_gesture")]
     pub start_screen_gesture: Vec<GestureControl>,
@@ -487,7 +484,6 @@ impl Default for Prefs {
             lightbar_enabled: true,
             start_screen_enabled: true,
             start_screen_auto_open: StartAutoOpen::Any,
-            start_screen_always_immersive: true,
             start_screen_clock_enabled: true,
             start_screen_inactive_secs: default_start_screen_inactive_secs(),
             start_screen_sleep_secs: default_start_screen_sleep_secs(),
@@ -838,21 +834,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_start_screen_always_immersive_defaults_on() {
-        let prefs: Prefs =
-            serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":["ps"]}"#)
-                .unwrap();
-        assert!(prefs.start_screen_always_immersive);
-        assert!(Prefs::default().start_screen_always_immersive);
-    }
-
-    #[test]
-    fn explicit_start_screen_always_immersive_false_stays_off() {
+    fn removed_start_screen_always_immersive_key_is_ignored() {
+        // Old files still carry the key; unknown fields must not fail the load.
         let prefs: Prefs = serde_json::from_str(
             r#"{"start_screen_enabled":true,"start_screen_always_immersive":false}"#,
         )
         .unwrap();
-        assert!(!prefs.start_screen_always_immersive);
+        assert!(prefs.start_screen_enabled);
     }
 
     #[test]

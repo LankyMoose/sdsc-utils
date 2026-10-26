@@ -1,4 +1,4 @@
-//! Window chrome for utility windows (popup, Settings, compact Start).
+//! Window chrome for utility windows (popup, Settings).
 //!
 //! One decision point for the corner strategy (`notes/ui-refresh.md`):
 //!

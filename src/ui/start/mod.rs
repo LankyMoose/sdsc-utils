@@ -1,7 +1,6 @@
 #[cfg(debug_assertions)]
 pub mod ambient_tune;
 pub mod art_worker;
-pub mod carousel;
 pub mod chrome;
 pub mod clock;
 pub mod cursor_hide;
@@ -12,7 +11,6 @@ pub mod icon_cache;
 pub mod idle;
 pub mod immersive;
 pub mod input;
-pub mod list;
 pub mod mode;
 pub mod position;
 pub mod row;

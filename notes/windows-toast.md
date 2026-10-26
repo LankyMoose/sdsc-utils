@@ -42,17 +42,12 @@ Fix: pure presentation state machine in [`src/ui/toast/machine.rs`](../src/ui/to
 
 ### 0→1 Connected vs Start open order
 
-Immersive auto-open suppresses the Connected toast at the session layer
+Auto-open suppresses the Connected toast at the session layer
 (cold-launch `launch_quiet` and hot connects behave identically), so Start
 opens immediately with no toast to race. The shell keeps a second-layer
 filter for service-race leftovers.
 
-Compact auto-open is toast-first: the Connected card latches
-`AfterToast::OpenStart` and presents on the desktop HWND with no competing
-Start window create (the starvation in `Cause` above); Start opens on slide
-rest via the machine effect (exactly once — settle consumes the latch, and
-early dismiss / slide-out finish also emit it). A mid-toast 1→0 clears the
-latch via `ClearStartLatch`, so Start never opens after the pads left.
+Auto-open is immediate: the session strips the Connected card on 0→1 auto-open and opens Start at once, so there is no toast to race. The `AfterToast::OpenStart` latch remains as a second layer for service-race leftovers (a Connected card that slipped through still opens Start on slide rest via the machine effect, exactly once — settle consumes the latch, and early dismiss / slide-out finish also emit it). A mid-toast 1→0 clears the latch via `ClearStartLatch`, so Start never opens after the pads left.
 
 Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: connect toast suppressed (immersive auto-open`, `ui-diag: start open after toast settle`.
 

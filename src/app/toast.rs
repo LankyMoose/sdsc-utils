@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 impl App {
     pub(crate) fn immersive_hosts_toast(&self) -> bool {
-        self.start_visible && self.start_state.immersive
+        self.start_visible
     }
 
     pub(crate) fn toast_eta_for(&self, event: &NotifyEvent) -> Option<String> {
@@ -148,7 +148,7 @@ impl App {
         // Shown starts the slide clock after the HWND is visible at outside_y.
         if next_name == "SlidingIn" && prev == "Placing" {
             self.toast_anim_started = Instant::now();
-            if self.start_visible && self.start_state.immersive {
+            if self.start_visible {
                 let generation = next.generation().or(prev_gen).unwrap_or(0);
                 crate::controller::hid::diag::diag_info(format!(
                     "ui-diag: immersive toast composite gen={generation}"
@@ -162,9 +162,9 @@ impl App {
         self.apply_toast_effects(effects)
     }
 
-    /// Draw the active toast inside immersive Start (cover occludes the toast HWND).
+    /// Draw the active toast inside Start (cover occludes the toast HWND).
     pub(crate) fn immersive_toast_overlay(&self) -> Option<Element<'_, Message>> {
-        if !self.start_visible || !self.start_state.immersive {
+        if !self.start_visible {
             return None;
         }
         let message = self.toast_message.as_ref()?;

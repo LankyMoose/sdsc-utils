@@ -2,24 +2,23 @@
 
 use crate::persist::prefs::ImmersiveLayout;
 use crate::ui::color::BatterySpectrum;
-use crate::ui::percent_ring;
 use crate::ui::shader::{AmbientProgram, VignetteProgram};
 use crate::ui::start::chrome::{
-    empty_games_browse_prompt, footer_hint, immersive_dock_row_hints, immersive_game_hints,
-    immersive_game_membership_label,
+    controllers_surface_footer, empty_games_browse_prompt, footer_hint, immersive_game_hints,
+    immersive_game_membership_label, select_capsule,
 };
-use crate::ui::start::mode::{TransitionPhase, dock_panel_width, dock_stage_dim, dock_stage_scale};
-use crate::ui::start::row::{game_subtitle_block, update_required_badge};
+use crate::ui::start::mode::{TransitionPhase, dock_stage_dim, dock_stage_scale};
+use crate::ui::start::row::{controllers_rings_strip, game_subtitle_block, update_required_badge};
 use crate::ui::start::settings::{manual_add_view, replace_confirm_view};
 use crate::ui::start::translate::backdrop_art;
 use crate::ui::start::view::{
-    LaunchStatus, StartControllerRow, StartMessage, StartRow, StartSlide, State, scan_status_chip,
+    HintPress, HintPressOwner, LaunchStatus, StartMessage, StartRow, State, scan_status_chip,
     scan_status_stack,
 };
 use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics, StripOrientation};
 use crate::ui::theme;
 use iced::font::Weight;
-use iced::widget::{Float, column, container, keyed_column, row, shader, space, stack, text};
+use iced::widget::{Float, column, container, row, shader, space, stack, text};
 use iced::{Alignment, Element, Fill, Font, Length, Padding, Vector};
 use std::time::Instant;
 
@@ -34,68 +33,16 @@ const BAR_ABOVE_FOOTER: f32 = 64.0;
 /// drop on top of this pad, so the visual top gap runs deeper while the rail
 /// keeps its minimum gap below the titles.
 const STRIP_TOP_PAD: f32 = vstrip::H_TOP_PAD;
-/// Minimum gap from ring outer edge → peek column edge (also sizes peek width for max ring).
-const DOCK_RING_INSET: f32 = 6.0;
-const DOCK_RING_MIN: f32 = 52.0;
-const DOCK_RING_MAX: f32 = 68.0;
-/// Peek column = ring cell only (sized for the largest ring + inset).
-const DOCK_PEEK_W: f32 = DOCK_RING_MAX + DOCK_RING_INSET * 2.0;
-/// Wide enough for larger type + inline Identify/Power-off on one row.
-const DOCK_MAX_W: f32 = 560.0;
-/// Expanded row height (peek rows hug the ring).
-const DOCK_ROW_H: f32 = 80.0;
-/// Expanded list gap (peek gap matches island pad — see [`dock_peek_inset`]).
-const DOCK_ROW_GAP: f32 = 8.0;
-/// Reserved trailing width for dock action hints (avoids select flicker).
-const DOCK_HINT_COL_W: f32 = 210.0;
+/// Rings diameter in the controllers island.
+const ISLAND_RING: f32 = crate::ui::start::chrome::CONTROLLERS_RING;
 const MODAL_W: f32 = crate::ui::start::view::WIDTH;
-
-pub fn veil_view(state: &State, now: Instant) -> Element<'_, StartMessage> {
-    let dock = state.dock_progress(now);
-    let program = AmbientProgram::new(state.ambient_time, dock, 1.0, 0.0);
-    stack![
-        shader(program).width(Fill).height(Fill),
-        container(space())
-            .width(Fill)
-            .height(Fill)
-            .style(theme::root),
-    ]
-    .width(Fill)
-    .height(Fill)
-    .into()
-}
-
-/// Compact chrome blackout (`veil_amount` 0 = clear, 1 = solid black). No ambient overlay.
-///
-/// Do **not** wrap chrome in [`Float`] here: iced paints Floats above later stack
-/// siblings (including any veil), so footer/face-hint Floats would sit on top of the fade.
-/// Compact enter/exit is dim-only; scale is omitted for that reason.
-pub fn compact_transition_overlay(
-    compact: Element<'_, StartMessage>,
-    veil_amount: f32,
-    _exiting: bool,
-) -> Element<'_, StartMessage> {
-    let veil = veil_amount.clamp(0.0, 1.0);
-    stack![
-        compact,
-        container(space())
-            .width(Fill)
-            .height(Fill)
-            .style(theme::immersive_dim(veil)),
-    ]
-    .width(Fill)
-    .height(Fill)
-    .into()
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     state: &'a State,
     spectrum: &BatterySpectrum,
     now: Instant,
-    always_immersive: bool,
     clock_enabled: bool,
-    promote_gesture: &'a [crate::domain::gesture::GestureControl],
     stage_h: f32,
     stage_w: f32,
     settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
@@ -108,7 +55,7 @@ pub fn view<'a>(
     let settings_p = state.settings.progress(now);
     // Any Float under a veil paints above it — flatten stage scale + hint presses.
     let flat = veil > 0.001 || idle_veil > 0.001 || settings_p > 0.001;
-    // Chrome stays fully lit; one top veil handles enter/exit (no per-panel dims).
+    // Chrome stays fully lit; one top veil handles the enter (no per-panel dims).
     let program = AmbientProgram::new(state.ambient_time, dock_p, 0.0, 1.0);
     let atmosphere = shader(program).width(Fill).height(Fill);
 
@@ -146,24 +93,23 @@ pub fn view<'a>(
     #[cfg(debug_assertions)]
     let body = crate::ui::debug_bounds::wrap(body, debug_bounds);
 
-    let footer_capsule = container(footer_hint(
-        state,
-        true,
-        always_immersive,
-        promote_gesture,
-        flat,
-    ))
-    .padding(Padding {
-        top: 6.0,
-        right: 16.0,
-        bottom: 6.0,
-        left: 16.0,
-    })
-    .style(theme::immersive_footer_capsule);
+    let footer_capsule = container(footer_hint(state, flat))
+        .padding(Padding {
+            top: 6.0,
+            right: 16.0,
+            bottom: 6.0,
+            left: 16.0,
+        })
+        .style(theme::immersive_footer_capsule);
 
     // Full-bleed stage + dock; footer hints overlay the bottom.
+    #[cfg(debug_assertions)]
+    let diag: Element<'_, StartMessage> = crate::ui::start::chrome::diag_report_bar();
+    #[cfg(not(debug_assertions))]
+    let diag: Element<'_, StartMessage> = space().height(Length::Fixed(0.0)).into();
     let footer_overlay: Element<'_, StartMessage> = column![
         space().height(Fill),
+        diag,
         container(footer_capsule)
             .width(Fill)
             .center_x(Fill)
@@ -293,11 +239,10 @@ pub fn view<'a>(
     stack(layers).width(Fill).height(Fill).into()
 }
 
-/// Full-bleed blackout — enter uses capped ease-in-out; exit uses ease-out like compact.
+/// Full-bleed enter veil — capped ease-in-out while the splash syncs.
 fn transition_top_veil(state: &State, now: Instant) -> f32 {
     match state.transition_phase.map(|(p, _)| p) {
         Some(TransitionPhase::EnterImmersive) => state.enter_veil_amount(now),
-        Some(TransitionPhase::ExitImmersive) => state.phase_progress(now).clamp(0.0, 1.0),
         _ => 0.0,
     }
 }
@@ -453,10 +398,10 @@ fn stage_with_dock<'a>(
         );
     }
 
-    let dock = controllers_dock_host(state, spectrum, dock_p);
+    let dock = controllers_island(state, spectrum, dock_p);
     #[cfg(debug_assertions)]
     let dock: Element<'_, StartMessage> = crate::ui::debug_bounds::wrap_fixed(dock, debug_bounds);
-    // Top-right floating capsule — same inset as footer (EDGE_PAD / 10).
+    // Top-right floating island — same inset as footer (EDGE_PAD / 10).
     let dock_overlay: Element<'_, StartMessage> = row![
         space().width(Fill),
         column![dock, space().height(Fill),]
@@ -886,7 +831,7 @@ fn status_block<'a>(
         status = status.push(sub_block);
     }
     if row.update_required {
-        let badge: Element<'_, StartMessage> = update_required_badge(selected, muted, fade, true);
+        let badge: Element<'_, StartMessage> = update_required_badge(selected, muted, fade);
         if fixed_w.is_some() {
             status = status.push(container(badge).width(Fill).center_x(Fill));
         } else {
@@ -1126,258 +1071,46 @@ fn strip_capsule<'a>(
     }
 }
 
-/// Unified rows at full dock width; [`width_reveal`] scissors peek→expanded (no column desync).
-fn controllers_dock_host<'a>(
+/// Horizontal controllers island: SELECT toggle glyph first, separator, then
+/// the rings-only strip (percentage circles, no text, no pill). Opening the
+/// surface darkens the stage (see `stage_with_dock`) and reveals the island
+/// footer with action hints below.
+fn controllers_island<'a>(
     state: &'a State,
     spectrum: &BatterySpectrum,
     dock_progress: f32,
 ) -> Element<'a, StartMessage> {
     let t = dock_progress.clamp(0.0, 1.0);
-    let row_h = dock_row_h(dock_progress);
-    // Reveal only the list — peek width is exactly the ring column.
-    let visible_w = dock_panel_width(dock_progress, DOCK_PEEK_W, DOCK_MAX_W);
-    let details_w = DOCK_MAX_W - DOCK_PEEK_W;
-
-    // Island pad stays at the peek inset (concentric with rings) through expand.
-    let pad = dock_peek_inset();
-    let pad_y = pad;
-    // Side pad only while expanded (peek stays flush so reveal width == ring column).
-    let pad_x = pad * t;
-    // Peek gap matches island pad; expanded uses the list gap.
-    let row_gap = pad + (DOCK_ROW_GAP - pad) * t;
-    // Peek: concentric with rings (radius = peek_w/2). Expand: pad + row radius so corners nest.
-    let peek_radius = DOCK_PEEK_W * 0.5;
-    let expanded_island = pad + theme::IMMERSIVE_DOCK_ROW_RADIUS;
-    let island_radius = peek_radius + (expanded_island - peek_radius) * t;
-    // Nested rounded-rect: inner = outer − pad (never the same as the island).
-    let row_radius = (island_radius - pad).max(0.0);
-
-    let list: Element<'_, StartMessage> = if state.controllers.is_empty() {
-        column![dock_empty_row(details_w, row_h)]
-            .spacing(row_gap)
-            .width(Length::Fixed(DOCK_MAX_W))
-            .into()
-    } else {
-        keyed_column(state.controllers.iter().enumerate().map(|(i, row)| {
-            let selected =
-                i == state.controller_selected && matches!(state.slide, StartSlide::Controllers);
-            (
-                crate::ui::start::list::list_key(row.serial.as_ref()),
-                dock_controller_row(
-                    row,
-                    spectrum,
-                    selected,
-                    state.ring_flash_white(&row.serial),
-                    details_w,
-                    dock_progress,
-                    row_h,
-                    row_radius,
-                    state,
-                ),
-            )
-        }))
-        .spacing(row_gap)
-        .width(Length::Fixed(DOCK_MAX_W))
-        .into()
-    };
-
-    let full = container(list)
-        .padding(Padding {
-            top: pad_y,
-            right: 0.0,
-            bottom: pad_y,
-            left: 0.0,
-        })
-        .width(Length::Fixed(DOCK_MAX_W));
-
-    // Shrink so the floating island sizes to its rows (Fill collapses to 0 off a Fill parent).
-    let revealed =
-        crate::ui::reveal::width_reveal(full, DOCK_MAX_W, visible_w).height(Length::Shrink);
-
-    container(revealed)
-        .padding(Padding {
-            top: 0.0,
-            right: pad_x,
-            bottom: 0.0,
-            left: pad_x,
-        })
-        .style(theme::immersive_island_radius(island_radius))
-        .clip(true)
-        .into()
-}
-
-fn dock_empty_row<'a>(details_w: f32, row_h: f32) -> Element<'a, StartMessage> {
-    container(
-        row![
-            container(text("—").size(13.0).color(theme::DIM))
-                .width(Length::Fixed(DOCK_PEEK_W))
-                .height(Length::Fixed(row_h))
-                .center_x(Fill)
-                .center_y(Fill),
-            container(text("No controllers").size(13.0).color(theme::DIM))
-                .width(Length::Fixed(details_w))
-                .height(Length::Fixed(row_h))
-                .center_y(Fill)
-                .padding(Padding {
-                    top: 0.0,
-                    right: 16.0,
-                    bottom: 0.0,
-                    left: 4.0,
-                }),
-        ]
-        .width(Length::Fixed(DOCK_MAX_W))
-        .height(Length::Fixed(row_h))
-        .align_y(Alignment::Center),
+    let press = HintPress::for_owner(state, HintPressOwner::Browse);
+    let glyph = select_capsule(press.held.create, press.press_anim.create, true);
+    let strip = controllers_rings_strip(state, spectrum, ISLAND_RING);
+    let sep = container(
+        space()
+            .width(Length::Fixed(1.0))
+            .height(Length::Fixed(28.0)),
     )
-    .width(Length::Fixed(DOCK_MAX_W))
-    .height(Length::Fixed(row_h))
-    .clip(true)
-    .into()
-}
-
-fn dock_ring_size(dock_progress: f32) -> f32 {
-    let t = dock_progress.clamp(0.0, 1.0);
-    DOCK_RING_MIN + (DOCK_RING_MAX - DOCK_RING_MIN) * t
-}
-
-/// Horizontal inset from peek column edge to the peek-sized ring (== island pad / row gap).
-fn dock_peek_inset() -> f32 {
-    (DOCK_PEEK_W - DOCK_RING_MIN).max(0.0) * 0.5
-}
-
-/// Peek rows hug the ring; expanded rows grow for title + meta.
-fn dock_row_h(dock_progress: f32) -> f32 {
-    let t = dock_progress.clamp(0.0, 1.0);
-    let ring = dock_ring_size(dock_progress);
-    ring + (DOCK_ROW_H - ring) * t
-}
-
-/// ETA stays hidden in peek; fades in through the latter part of expand.
-fn dock_eta_reveal(dock_progress: f32) -> f32 {
-    ((dock_progress.clamp(0.0, 1.0) - 0.2) / 0.8).clamp(0.0, 1.0)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn dock_controller_row<'a>(
-    row: &'a StartControllerRow,
-    spectrum: &BatterySpectrum,
-    selected: bool,
-    flash_white: bool,
-    details_w: f32,
-    dock_progress: f32,
-    row_h: f32,
-    row_radius: f32,
-    state: &State,
-) -> Element<'a, StartMessage> {
-    let powering_off = row.connected
-        && state
-            .powering_off
-            .as_ref()
-            .is_some_and(|s| s == &row.serial);
-    let ring_color = if flash_white {
-        theme::from_rgb(crate::controller::dualsense::lightbar::IDENTIFY_FLASH)
-    } else if row.connected && !powering_off {
-        theme::from_rgb(spectrum.color_at_percent(row.percent))
-    } else {
-        theme::DIM
-    };
-    let ring = percent_ring::percent_ring(
-        row.percent,
-        ring_color,
-        dock_ring_size(dock_progress),
-        row.eta.clone(),
-        dock_eta_reveal(dock_progress),
-    );
-    let ring_cell = container(ring)
-        .width(Length::Fixed(DOCK_PEEK_W))
-        .height(Length::Fixed(row_h))
-        .center_x(Fill)
-        .center_y(Fill);
-
-    let title_color = if row.connected && !powering_off {
-        theme::INK
-    } else {
-        theme::MUTED
-    };
-    let meta = if powering_off {
-        theme::MUTED
-    } else if row.low {
-        theme::WARNING
-    } else {
-        theme::MUTED
-    };
-    let meta_text = if powering_off {
-        "Powering off".to_string()
-    } else {
-        format!("{} · {}", row.connection, row.state)
-    };
-    let titles = column![
-        text(&row.title).size(18.0).color(title_color).font(Font {
-            weight: if selected {
-                Weight::Bold
-            } else {
-                Weight::Normal
-            },
-            ..Font::DEFAULT
-        }),
-        text(meta_text).size(13.0).color(meta),
-    ]
-    .spacing(3)
-    .width(Fill);
-
-    // Inline hints; always reserve trailing width so select does not shift titles.
-    let hints: Element<'_, StartMessage> =
-        if let Some(hints) = immersive_dock_row_hints(row, state, selected) {
-            container(hints)
-                .width(Length::Fixed(DOCK_HINT_COL_W))
-                .height(Length::Fixed(row_h))
-                .center_y(Fill)
-                .align_x(Alignment::End)
-                .clip(true)
-                .into()
-        } else {
-            space()
-                .width(Length::Fixed(DOCK_HINT_COL_W))
-                .height(Length::Fixed(row_h))
-                .into()
-        };
-
-    let pad_l = 4.0;
-    let pad_r = 16.0;
-    let gap = 8.0;
-    let inner_w = (details_w - pad_l - pad_r).max(DOCK_HINT_COL_W + 80.0);
-    let titles_w = (inner_w - DOCK_HINT_COL_W - gap).max(80.0);
-    let details_cell = container(
-        row![
-            container(titles)
-                .width(Length::Fixed(titles_w))
-                .height(Length::Fixed(row_h))
-                .center_y(Fill),
-            hints,
-        ]
-        .spacing(gap)
-        .width(Length::Fixed(inner_w))
-        .height(Length::Fixed(row_h))
-        .align_y(Alignment::Center),
-    )
-    .width(Length::Fixed(details_w))
-    .height(Length::Fixed(row_h))
-    .padding(Padding {
-        top: 0.0,
-        right: pad_r,
-        bottom: 0.0,
-        left: pad_l,
+    .style(|_: &iced::Theme| container::Style {
+        background: Some(iced::Background::Color(theme::alpha(theme::LINE, 0.8))),
+        ..container::Style::default()
     });
+    let top = row![glyph, sep, strip]
+        .spacing(10)
+        .align_y(Alignment::Center);
 
-    container(
-        row![ring_cell, details_cell]
-            .width(Length::Fixed(DOCK_MAX_W))
-            .height(Length::Fixed(row_h))
-            .align_y(Alignment::Center),
-    )
-    .width(Length::Fixed(DOCK_MAX_W))
-    .height(Length::Fixed(row_h))
-    .clip(true)
-    .style(theme::immersive_dock_row_surface(selected, row_radius))
-    .into()
+    // Footer appears with the open amount via a culled height reveal (layout
+    // stays put while opening so the island never shifts).
+    let footer: Element<'a, StartMessage> = if t > 0.001 {
+        let bar = controllers_surface_footer(state);
+        crate::ui::reveal::height_reveal(bar, 44.0, 44.0 * t).into()
+    } else {
+        space()
+            .width(Length::Shrink)
+            .height(Length::Fixed(0.0))
+            .into()
+    };
+
+    column![top, footer]
+        .spacing(8)
+        .align_x(Alignment::End)
+        .into()
 }

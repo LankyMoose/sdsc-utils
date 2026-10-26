@@ -50,14 +50,6 @@ impl MonitorCover {
     pub fn origin(self) -> Point {
         Point::new(self.x, self.y)
     }
-
-    /// Center a window of `size` inside this monitor.
-    pub fn center_for(self, size: Size) -> Point {
-        Point::new(
-            self.x + ((self.width - size.width) / 2.0).max(0.0),
-            self.y + ((self.height - size.height) / 2.0).max(0.0),
-        )
-    }
 }
 
 #[derive(Debug, Clone, Copy)]

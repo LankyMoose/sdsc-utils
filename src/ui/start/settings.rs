@@ -1,4 +1,4 @@
-//! In-window Start Screen settings (Options): compact modal / immersive right drawer.
+//! In-window Start Screen settings (Options): right drawer.
 
 use crate::persist::prefs::{
     AUTO_OPEN_MODES, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout, NAVBAR_MODES, NavbarVisibility,
@@ -25,10 +25,8 @@ use iced::{
 };
 use std::time::{Duration, Instant};
 
-/// Immersive settings drawer content width (full height).
+/// Settings drawer content width (full height).
 pub const DRAWER_W: f32 = 600.0;
-/// Compact modal width (~window × 0.75).
-pub const MODAL_W: f32 = 576.0;
 const DRAWER_ANIM_MS: u64 = 220;
 const ROW_PAD: f32 = 10.0;
 const COL_GAP: f32 = 6.0;
@@ -65,9 +63,6 @@ const SLIDER_INNER_GAP: f32 = 4.0;
 const REVEAL_INSET: f32 = 8.0;
 /// If an Up-reveal target sits above this, pin scroll to 0 so section labels stay visible.
 const TOP_PIN_MAX_ROW_TOP: f32 = CONTENT_PAD_Y + 48.0;
-/// Compact modal max content height (matches overlay card).
-const COMPACT_VIEWPORT_FALLBACK: f32 = 480.0;
-const COMPACT_MODAL_MAX_H: f32 = 528.0;
 
 /// Prefs snapshot for the Start settings panel (Enabled stays Configure-only).
 #[derive(Debug, Clone)]
@@ -75,7 +70,6 @@ pub struct StartSettingsSnapshot {
     pub auto_open: StartAutoOpen,
     pub selection_persist: bool,
     pub selection_mode: StartSelectionMode,
-    pub always_immersive: bool,
     pub clock_enabled: bool,
     pub immersive_layout: ImmersiveLayout,
     pub navbar: NavbarVisibility,
@@ -95,10 +89,6 @@ pub struct StartSettingsSnapshot {
     pub perf_vsync_boot: bool,
     /// Reload queued (row disabled, spinner shown until exit).
     pub perf_reload_queued: bool,
-    /// Whether the Start window is immersive (the in-drawer "tune ambience"
-    /// entry is immersive-only: the tuning panel previews the immersive-rate
-    /// background, which compact's slow-drift backdrop cannot show).
-    pub immersive: bool,
 }
 
 /// Focusable rows in the Start settings list (dynamic when sounds/haptics off).
@@ -107,7 +97,6 @@ pub enum SettingsRow {
     AutoOpen,
     SelectionPersist,
     SelectionMode,
-    AlwaysImmersive,
     Clock,
     ImmersiveLayout,
     Navbar,
@@ -136,14 +125,13 @@ impl SettingsRow {
     /// To add a row: append/reorder here, extend `visible()` + `section_before()`
     /// / `gap_before()` + the `panel_view` build match + `kind()`/dispatch arms.
     #[cfg(debug_assertions)]
-    pub const ROW_COUNT: usize = 20;
-    #[cfg(not(debug_assertions))]
     pub const ROW_COUNT: usize = 19;
+    #[cfg(not(debug_assertions))]
+    pub const ROW_COUNT: usize = 18;
     pub const ALL: [Self; Self::ROW_COUNT] = [
         Self::AutoOpen,
         Self::SelectionPersist,
         Self::SelectionMode,
-        Self::AlwaysImmersive,
         Self::Clock,
         Self::ImmersiveLayout,
         Self::Navbar,
@@ -169,7 +157,6 @@ impl SettingsRow {
     pub fn visible(self, snapshot: &StartSettingsSnapshot) -> bool {
         match self {
             Self::AutoOpen
-            | Self::AlwaysImmersive
             | Self::Clock
             | Self::ImmersiveLayout
             | Self::Navbar
@@ -195,7 +182,7 @@ impl SettingsRow {
             Self::HapticsStrength => snapshot.haptics_enabled,
             Self::SelectionMode => snapshot.selection_persist,
             #[cfg(debug_assertions)]
-            Self::TuneAmbience => snapshot.immersive,
+            Self::TuneAmbience => true,
         }
     }
 
@@ -232,13 +219,12 @@ impl SettingsRow {
         match self {
             Self::AutoOpen => Some("Opening"),
             Self::SelectionPersist => Some("Selection"),
-            Self::AlwaysImmersive => Some("Immersive"),
+            Self::Clock => Some("Immersive"),
             Self::Sounds => Some("Feedback"),
             Self::PerfThrottle => Some("Performance"),
             #[cfg(debug_assertions)]
             Self::TuneAmbience => Some("Ambience"),
-            Self::Clock
-            | Self::SelectionMode
+            Self::SelectionMode
             | Self::ImmersiveLayout
             | Self::Navbar
             | Self::ReducedMotion
@@ -258,14 +244,11 @@ impl SettingsRow {
     /// opens the Immersive / Feedback section after the previous block).
     fn gap_before(self) -> bool {
         match self {
-            Self::SelectionPersist | Self::AlwaysImmersive | Self::Sounds | Self::PerfThrottle => {
-                true
-            }
+            Self::SelectionPersist | Self::Clock | Self::Sounds | Self::PerfThrottle => true,
             #[cfg(debug_assertions)]
             Self::TuneAmbience => true,
             Self::AutoOpen
             | Self::SelectionMode
-            | Self::Clock
             | Self::ImmersiveLayout
             | Self::Navbar
             | Self::ReducedMotion
@@ -308,7 +291,6 @@ impl SettingsRow {
             | Self::Navbar
             | Self::ReducedMotion => RowKind::Selector,
             Self::SelectionPersist
-            | Self::AlwaysImmersive
             | Self::Clock
             | Self::Sounds
             | Self::Haptics
@@ -330,7 +312,6 @@ impl SettingsRow {
     fn toggle_value(self, snapshot: &StartSettingsSnapshot) -> bool {
         match self {
             Self::SelectionPersist => snapshot.selection_persist,
-            Self::AlwaysImmersive => snapshot.always_immersive,
             Self::Clock => snapshot.clock_enabled,
             Self::Sounds => snapshot.sounds_enabled,
             Self::Haptics => snapshot.haptics_enabled,
@@ -345,7 +326,6 @@ impl SettingsRow {
     fn set_toggle(self, on: bool) -> StartMessage {
         match self {
             Self::SelectionPersist => StartMessage::SetSelectionPersist(on),
-            Self::AlwaysImmersive => StartMessage::SetAlwaysImmersive(on),
             Self::Clock => StartMessage::SetClock(on),
             Self::Sounds => StartMessage::SetSounds(on),
             Self::Haptics => StartMessage::SetHaptics(on),
@@ -571,7 +551,6 @@ pub fn settings_nav_cue(row: SettingsRow) -> SettingsCue {
         SettingsRow::AutoOpen
         | SettingsRow::SelectionPersist
         | SettingsRow::SelectionMode
-        | SettingsRow::AlwaysImmersive
         | SettingsRow::Clock
         | SettingsRow::ImmersiveLayout
         | SettingsRow::Navbar
@@ -761,16 +740,11 @@ impl SettingsPanel {
     pub fn focus_scroll_y(
         &self,
         snapshot: &StartSettingsSnapshot,
-        immersive: bool,
         direction: ScrollReveal,
     ) -> Option<f32> {
-        let (row_top, row_h) = focus_row_bounds(self.focus, snapshot, immersive)?;
+        let (row_top, row_h) = focus_row_bounds(self.focus, snapshot)?;
         let viewport_h = if self.viewport_h <= 1.0 {
-            if immersive {
-                720.0
-            } else {
-                COMPACT_VIEWPORT_FALLBACK
-            }
+            720.0
         } else {
             self.viewport_h
         };
@@ -796,20 +770,15 @@ impl SettingsPanel {
     pub fn reload_scroll_y(
         &self,
         snapshot: &StartSettingsSnapshot,
-        immersive: bool,
         direction: ScrollReveal,
     ) -> Option<f32> {
         let rows = SettingsRow::focusable(snapshot);
         let idx = rows
             .iter()
             .position(|&row| row == SettingsRow::PerfReload)?;
-        let (row_top, row_h) = focus_row_bounds(idx, snapshot, immersive)?;
+        let (row_top, row_h) = focus_row_bounds(idx, snapshot)?;
         let viewport_h = if self.viewport_h <= 1.0 {
-            if immersive {
-                720.0
-            } else {
-                COMPACT_VIEWPORT_FALLBACK
-            }
+            720.0
         } else {
             self.viewport_h
         };
@@ -939,9 +908,6 @@ fn row_helper(row: SettingsRow) -> Option<&'static str> {
         SettingsRow::AutoOpen => Some("When a controller connects"),
         SettingsRow::SelectionPersist => Some("Keep the game highlight across restarts"),
         SettingsRow::SelectionMode => Some("Match the game, or its position"),
-        SettingsRow::AlwaysImmersive => {
-            Some("Open full screen; Circle closes instead of going back")
-        }
         SettingsRow::Clock => None,
         SettingsRow::ImmersiveLayout => Some("Orientation of the games strip"),
         SettingsRow::Navbar => Some("Section indicator visibility"),
@@ -974,23 +940,13 @@ struct TypeScale {
 }
 
 impl TypeScale {
-    fn for_mode(immersive: bool) -> Self {
-        if immersive {
-            Self {
-                title: 26.0,
-                section: 15.0,
-                body: 16.0,
-                helper: 14.0,
-                toggle: 22.0,
-            }
-        } else {
-            Self {
-                title: 18.0,
-                section: 12.0,
-                body: 13.0,
-                helper: 12.0,
-                toggle: 16.0,
-            }
+    fn drawer() -> Self {
+        Self {
+            title: 26.0,
+            section: 15.0,
+            body: 16.0,
+            helper: 14.0,
+            toggle: 22.0,
         }
     }
 }
@@ -1001,15 +957,11 @@ impl TypeScale {
 /// in the flow, so row bounds never move when a menu opens or closes.
 /// Stacking mirrors `panel_view`: one COL_GAP between every child, heights
 /// from the shared `*_row_h` fns / section + gap constants.
-pub fn focus_row_bounds(
-    focus: usize,
-    snapshot: &StartSettingsSnapshot,
-    immersive: bool,
-) -> Option<(f32, f32)> {
+pub fn focus_row_bounds(focus: usize, snapshot: &StartSettingsSnapshot) -> Option<(f32, f32)> {
     let rows = SettingsRow::focusable(snapshot);
     let target = *rows.get(focus)?;
     debug_assert!(target.visible(snapshot));
-    let ty = TypeScale::for_mode(immersive);
+    let ty = TypeScale::drawer();
     // Content padding is inside the scrollable — offsets are absolute in that content.
     // Title lives in the static header (not scrolled).
     // Stacking mirrors `panel_view`: one COL_GAP between every child, heights
@@ -1159,8 +1111,8 @@ fn menu_overlay_right_pad(content_h: f32, viewport_h: f32) -> f32 {
 
 /// Total scrollable content height: top/bottom content padding plus one gap
 /// between stacked items. Decides scrollbar visibility for the overlay inset.
-fn settings_content_h(snapshot: &StartSettingsSnapshot, immersive: bool) -> f32 {
-    let ty = TypeScale::for_mode(immersive);
+fn settings_content_h(snapshot: &StartSettingsSnapshot) -> f32 {
+    let ty = TypeScale::drawer();
     let items = layout_items(snapshot);
     let mut h = CONTENT_PAD_Y * 2.0;
     for (i, item) in items.iter().enumerate() {
@@ -1204,27 +1156,22 @@ fn menu_overlay_y(row_top: f32, row_h: f32, panel_h: f32, scroll_y: f32, viewpor
 fn menu_overlay(
     state: &State,
     snapshot: &StartSettingsSnapshot,
-    immersive: bool,
     #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Option<Element<'static, StartMessage>> {
     let (menu_row, _) = state.settings.menu?;
-    let ty = TypeScale::for_mode(immersive);
+    let ty = TypeScale::drawer();
     let idx = SettingsRow::focusable(snapshot)
         .iter()
         .position(|&row| row == menu_row)?;
-    let (row_top, row_h) = focus_row_bounds(idx, snapshot, immersive)?;
+    let (row_top, row_h) = focus_row_bounds(idx, snapshot)?;
     let panel_h = menu_panel_h(menu_row.selector_count(), ty.body);
     let viewport_h = if state.settings.viewport_h <= 1.0 {
-        if immersive {
-            720.0
-        } else {
-            COMPACT_VIEWPORT_FALLBACK
-        }
+        720.0
     } else {
         state.settings.viewport_h
     };
     let y = menu_overlay_y(row_top, row_h, panel_h, state.settings.scroll_y, viewport_h);
-    let right_pad = menu_overlay_right_pad(settings_content_h(snapshot, immersive), viewport_h);
+    let right_pad = menu_overlay_right_pad(settings_content_h(snapshot), viewport_h);
     let panel = selector_menu_panel(state.settings.menu, menu_row, snapshot, ty)?;
     #[cfg(debug_assertions)]
     let panel = crate::ui::debug_bounds::wrap(panel, debug_bounds);
@@ -1247,12 +1194,11 @@ fn menu_overlay(
 pub fn panel_view<'a>(
     state: &'a State,
     snapshot: &StartSettingsSnapshot,
-    immersive: bool,
     #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
     let focus_rows = SettingsRow::focusable(snapshot);
     let focus = state.settings.focus.min(focus_rows.len().saturating_sub(1));
-    let ty = TypeScale::for_mode(immersive);
+    let ty = TypeScale::drawer();
 
     let header = column![
         text("Settings")
@@ -1305,14 +1251,6 @@ pub fn panel_view<'a>(
                 focused,
                 ty,
                 SettingsRow::AutoOpen.open_menu(),
-            ),
-            SettingsRow::AlwaysImmersive => toggle_row(
-                "Always immersive",
-                SettingsRow::AlwaysImmersive.helper(),
-                SettingsRow::AlwaysImmersive.toggle_value(snapshot),
-                focused,
-                ty,
-                |on| SettingsRow::AlwaysImmersive.set_toggle(on),
             ),
             SettingsRow::SelectionPersist => toggle_row(
                 "Remember selection",
@@ -1532,7 +1470,6 @@ pub fn panel_view<'a>(
     if let Some(overlay) = menu_overlay(
         state,
         snapshot,
-        immersive,
         #[cfg(debug_assertions)]
         debug_bounds,
     ) {
@@ -1540,49 +1477,19 @@ pub fn panel_view<'a>(
     }
     let list = layer.width(Fill).height(Fill);
 
-    let pad = if immersive { 20.0 } else { 16.0 };
     container(
         column![header, list]
             .spacing(HEADER_LIST_GAP)
             .width(Fill)
             .height(Fill),
     )
-    .padding(pad)
+    .padding(20.0)
     .width(Fill)
     .height(Fill)
     .into()
 }
 
-/// Compact: dim scrim + centered modal over full chrome.
-pub fn compact_overlay<'a>(
-    state: &'a State,
-    snapshot: &StartSettingsSnapshot,
-    progress: f32,
-    #[cfg(debug_assertions)] debug_bounds: bool,
-) -> Element<'a, StartMessage> {
-    let dim = scrim_dim(progress);
-    let modal = container(theme::framed(panel_view(
-        state,
-        snapshot,
-        false,
-        #[cfg(debug_assertions)]
-        debug_bounds,
-    )))
-    .width(Length::Fixed(MODAL_W))
-    .max_height(COMPACT_MODAL_MAX_H);
-    #[cfg(debug_assertions)]
-    let modal: Element<'_, StartMessage> =
-        crate::ui::debug_bounds::wrap_fixed(modal.into(), debug_bounds);
-    let card = container(modal)
-        .width(Fill)
-        .height(Fill)
-        .center_x(Fill)
-        .center_y(Fill);
-
-    stack_scrim(dim, card)
-}
-
-/// Immersive: full-height right drawer over chrome (square corners).
+/// Full-height right drawer over chrome (square corners).
 pub fn immersive_drawer<'a>(
     state: &'a State,
     snapshot: &StartSettingsSnapshot,
@@ -1594,7 +1501,6 @@ pub fn immersive_drawer<'a>(
     let panel = container(panel_view(
         state,
         snapshot,
-        true,
         #[cfg(debug_assertions)]
         debug_bounds,
     ))
@@ -2102,7 +2008,6 @@ mod tests {
             auto_open: StartAutoOpen::Any,
             selection_persist: true,
             selection_mode: StartSelectionMode::ByGame,
-            always_immersive: false,
             clock_enabled: true,
             immersive_layout: ImmersiveLayout::Vertical,
             navbar: NavbarVisibility::WhenNavigating,
@@ -2120,7 +2025,6 @@ mod tests {
             perf_aa_boot: true,
             perf_vsync_boot: true,
             perf_reload_queued: false,
-            immersive: false,
         }
     }
 
@@ -2138,28 +2042,23 @@ mod tests {
         // states (including an open dropdown menu) without panicking.
         let snapshot = snap(true, true);
         let state = State::default();
-        drop(panel_view(&state, &snapshot, false, false));
-        drop(panel_view(&state, &snapshot, false, true));
-        drop(panel_view(&state, &snapshot, true, true));
+        drop(panel_view(&state, &snapshot, false));
+        drop(panel_view(&state, &snapshot, true));
         let mut menu_open = State::default();
         menu_open.settings.menu = Some((SettingsRow::AutoOpen, 0));
-        drop(panel_view(&menu_open, &snapshot, true, true));
-        drop(compact_overlay(&state, &snapshot, 1.0, true));
+        drop(panel_view(&menu_open, &snapshot, true));
         drop(immersive_drawer(&state, &snapshot, 1.0, true));
         // Dirty + queued renderer prefs: the reload action row (both states)
         // must build without panicking.
         let mut dirty = snapshot.clone();
         dirty.perf_vsync = false;
-        drop(panel_view(&state, &dirty, false, false));
-        drop(panel_view(&state, &dirty, true, true));
+        drop(panel_view(&state, &dirty, false));
+        drop(panel_view(&state, &dirty, true));
         dirty.perf_reload_queued = true;
-        drop(panel_view(&state, &dirty, false, false));
-        drop(panel_view(&state, &dirty, true, true));
-        // Immersive-only debug entry: the trailing "tune ambience" action
-        // row must build (compact never lists it).
-        let mut immersive = snapshot.clone();
-        immersive.immersive = true;
-        drop(panel_view(&state, &immersive, true, true));
+        drop(panel_view(&state, &dirty, false));
+        drop(panel_view(&state, &dirty, true));
+        // Debug entry: the trailing "tune ambience" action row must build.
+        drop(panel_view(&state, &snapshot, true));
     }
 
     #[test]
@@ -2171,7 +2070,6 @@ mod tests {
                 SettingsRow::AutoOpen,
                 // SelectionPersist is a hidden row (never focusable).
                 SettingsRow::SelectionMode,
-                SettingsRow::AlwaysImmersive,
                 SettingsRow::Clock,
                 SettingsRow::ImmersiveLayout,
                 SettingsRow::Navbar,
@@ -2186,6 +2084,8 @@ mod tests {
                 SettingsRow::PerfThrottle,
                 SettingsRow::PerfAntialiasing,
                 SettingsRow::PerfVsync,
+                #[cfg(debug_assertions)]
+                SettingsRow::TuneAmbience,
             ]
         );
     }
@@ -2205,18 +2105,13 @@ mod tests {
 
     #[test]
     #[cfg(debug_assertions)]
-    fn tune_ambience_row_is_immersive_only_and_trailing() {
-        // Compact never offers the tuning entry (the panel previews the
-        // immersive-rate background); immersive lists it last, after the
-        // Performance block, and Confirm opens the tuning panel.
-        let compact = snap(true, true);
-        assert!(!compact.immersive);
-        assert!(!SettingsRow::focusable(&compact).contains(&SettingsRow::TuneAmbience));
-        let mut immersive = snap(true, true);
-        immersive.immersive = true;
-        let rows = SettingsRow::focusable(&immersive);
+    fn tune_ambience_row_is_trailing() {
+        // The tuning entry lists last, after the Performance block, and
+        // Confirm opens the tuning panel.
+        let snapshot = snap(true, true);
+        let rows = SettingsRow::focusable(&snapshot);
         assert_eq!(rows.last(), Some(&SettingsRow::TuneAmbience));
-        let msg = confirm_message(SettingsRow::TuneAmbience, &immersive).unwrap();
+        let msg = confirm_message(SettingsRow::TuneAmbience, &snapshot).unwrap();
         assert!(matches!(msg, StartMessage::OpenAmbientTuning));
     }
 
@@ -2380,9 +2275,10 @@ mod tests {
     fn nudge_toggles_left_off_right_on() {
         let s = snap(true, true);
         assert!(nudge_message(SettingsRow::Clock, &s, 1).is_none());
-        assert!(nudge_message(SettingsRow::AlwaysImmersive, &s, -1).is_none());
-        let msg = nudge_message(SettingsRow::AlwaysImmersive, &s, 1).unwrap();
-        assert!(matches!(msg, StartMessage::SetAlwaysImmersive(true)));
+        let mut off = s.clone();
+        off.sounds_enabled = false;
+        let msg = nudge_message(SettingsRow::Sounds, &off, 1).unwrap();
+        assert!(matches!(msg, StartMessage::SetSounds(true)));
         let msg = nudge_message(SettingsRow::Clock, &s, -1).unwrap();
         assert!(matches!(msg, StartMessage::SetClock(false)));
         let msg = confirm_message(SettingsRow::Clock, &s).unwrap();
@@ -2406,9 +2302,9 @@ mod tests {
     #[test]
     fn focus_row_bounds_increases_with_focus() {
         let s = snap(true, true);
-        let (y0, _) = focus_row_bounds(0, &s, false).unwrap();
+        let (y0, _) = focus_row_bounds(0, &s).unwrap();
         let last = SettingsRow::focusable(&s).len() - 1;
-        let (y_last, _) = focus_row_bounds(last, &s, false).unwrap();
+        let (y_last, _) = focus_row_bounds(last, &s).unwrap();
         assert!(y_last > y0);
         assert!(y0 >= CONTENT_PAD_Y);
     }
@@ -2442,12 +2338,12 @@ mod tests {
     #[test]
     fn settings_content_h_covers_rows_gaps_and_pads() {
         let s = snap(true, true);
-        let ty = TypeScale::for_mode(false);
+        let ty = TypeScale::drawer();
         let rows_h: f32 = SettingsRow::focusable(&s)
             .iter()
             .map(|row| row.height(ty))
             .sum();
-        let h = settings_content_h(&s, false);
+        let h = settings_content_h(&s);
         assert!(h > rows_h, "pads + gaps add height");
         assert!(
             h < rows_h + 400.0,
@@ -2464,7 +2360,7 @@ mod tests {
             .iter()
             .position(|&r| r == SettingsRow::IdleSecs)
             .unwrap();
-        let (y, h) = focus_row_bounds(idle, &s, false).unwrap();
+        let (y, h) = focus_row_bounds(idle, &s).unwrap();
         assert!(y > 0.0 && h > 0.0);
     }
 
@@ -2474,15 +2370,15 @@ mod tests {
         let s = snap(true, true);
         let mut state = State::default();
         // Closed: no overlay.
-        assert!(menu_overlay(&state, &s, false, false).is_none());
+        assert!(menu_overlay(&state, &s, false).is_none());
         // Open on a visible row: overlay present.
         state.settings.menu = Some((SettingsRow::AutoOpen, 0));
-        assert!(menu_overlay(&state, &s, false, false).is_some());
+        assert!(menu_overlay(&state, &s, false).is_some());
         // Open on a row that left the focusable list: no overlay.
         let mut hidden = s.clone();
         hidden.selection_persist = false;
         state.settings.menu = Some((SettingsRow::SelectionMode, 0));
-        assert!(menu_overlay(&state, &hidden, false, false).is_none());
+        assert!(menu_overlay(&state, &hidden, false).is_none());
     }
 
     /// Triple agreement: focusable order == layout (panel build) order ==
@@ -2546,33 +2442,30 @@ mod tests {
                         layout_rows, focusable,
                         "layout rows must match focusable (sounds={sounds} haptics={haptics} menu={menu:?})"
                     );
-                    for immersive in [false, true] {
-                        let mut prev_top: Option<f32> = None;
-                        for (focus, row) in focusable.iter().enumerate() {
-                            let (top, h) =
-                                focus_row_bounds(focus, &s, immersive).unwrap_or_else(
-                                    || {
-                                        panic!(
-                                            "every focusable row resolves bounds (row={row:?} sounds={sounds} haptics={haptics} menu={menu:?} immersive={immersive})"
-                                        )
-                                    },
-                                );
-                            assert!(top >= CONTENT_PAD_Y - f32::EPSILON);
-                            assert!(h > 0.0);
-                            if let Some(prev) = prev_top {
-                                assert!(
-                                    top > prev,
-                                    "bounds tops follow focus order (row={row:?} top={top} prev={prev} menu={menu:?})"
-                                );
-                            }
-                            prev_top = Some(top);
-                            // Row height matches the shared per-kind fn.
-                            let ty = TypeScale::for_mode(immersive);
+                    let mut prev_top: Option<f32> = None;
+                    for (focus, row) in focusable.iter().enumerate() {
+                        let (top, h) = focus_row_bounds(focus, &s).unwrap_or_else(
+                            || {
+                                panic!(
+                                    "every focusable row resolves bounds (row={row:?} sounds={sounds} haptics={haptics} menu={menu:?})"
+                                )
+                            },
+                        );
+                        assert!(top >= CONTENT_PAD_Y - f32::EPSILON);
+                        assert!(h > 0.0);
+                        if let Some(prev) = prev_top {
                             assert!(
-                                (h - row.height(ty)).abs() < f32::EPSILON,
-                                "bounds height uses the shared row height (row={row:?})"
+                                top > prev,
+                                "bounds tops follow focus order (row={row:?} top={top} prev={prev} menu={menu:?})"
                             );
                         }
+                        prev_top = Some(top);
+                        // Row height matches the shared per-kind fn.
+                        let ty = TypeScale::drawer();
+                        assert!(
+                            (h - row.height(ty)).abs() < f32::EPSILON,
+                            "bounds height uses the shared row height (row={row:?})"
+                        );
                     }
                 }
             }
@@ -2589,19 +2482,15 @@ mod tests {
             scroll_y: 0.0,
             ..SettingsPanel::default()
         };
-        let (row_top, row_h) = focus_row_bounds(panel.focus, &s, false).unwrap();
+        let (row_top, row_h) = focus_row_bounds(panel.focus, &s).unwrap();
         let y = panel
-            .focus_scroll_y(&s, false, ScrollReveal::Down)
+            .focus_scroll_y(&s, ScrollReveal::Down)
             .expect("last row should need a reveal from the top");
         // Pinned so row bottom + reveal inset sits on the viewport bottom.
         let expected = (row_top + row_h + REVEAL_INSET - 200.0).max(0.0);
         assert!((y - expected).abs() < 0.5, "y={y} expected={expected}");
         panel.scroll_y = y;
-        assert!(
-            panel
-                .focus_scroll_y(&s, false, ScrollReveal::Down)
-                .is_none()
-        );
+        assert!(panel.focus_scroll_y(&s, ScrollReveal::Down).is_none());
     }
 
     #[test]
@@ -2625,35 +2514,37 @@ mod tests {
         };
         assert!(
             panel
-                .reload_scroll_y(&clean, false, ScrollReveal::Either)
+                .reload_scroll_y(&clean, ScrollReveal::Either)
                 .is_none(),
             "clean prefs: no reload row, no scroll"
         );
         let mut dirty = clean.clone();
         dirty.perf_vsync = false;
         let rows = SettingsRow::focusable(&dirty);
-        assert_eq!(
-            rows.last(),
-            Some(&SettingsRow::PerfReload),
-            "reload row mounts trailing when dirty"
-        );
-        for immersive in [false, true] {
+        assert!(rows.contains(&SettingsRow::PerfReload));
+        // Debug TuneAmbience trails it; release ends at the reload row.
+        #[cfg(debug_assertions)]
+        assert_eq!(rows.last(), Some(&SettingsRow::TuneAmbience));
+        #[cfg(not(debug_assertions))]
+        assert_eq!(rows.last(), Some(&SettingsRow::PerfReload));
+        {
             let y = panel
-                .reload_scroll_y(&dirty, immersive, ScrollReveal::Either)
+                .reload_scroll_y(&dirty, ScrollReveal::Either)
                 .expect("trailing reload row should need a reveal from the top");
-            let (row_top, row_h) = focus_row_bounds(rows.len() - 1, &dirty, immersive).unwrap();
+            let reload_idx = rows
+                .iter()
+                .position(|&row| row == SettingsRow::PerfReload)
+                .unwrap();
+            let (row_top, row_h) = focus_row_bounds(reload_idx, &dirty).unwrap();
             let expected = (row_top + row_h + REVEAL_INSET - 200.0).max(0.0);
-            assert!(
-                (y - expected).abs() < 0.5,
-                "immersive={immersive} y={y} expected={expected}"
-            );
+            assert!((y - expected).abs() < 0.5, "y={y} expected={expected}");
             let mut settled = panel.clone();
             settled.scroll_y = y;
             assert!(
                 settled
-                    .reload_scroll_y(&dirty, immersive, ScrollReveal::Either)
+                    .reload_scroll_y(&dirty, ScrollReveal::Either)
                     .is_none(),
-                "immersive={immersive}: settled reveal is a no-op"
+                "settled reveal is a no-op"
             );
         }
     }
@@ -2669,7 +2560,7 @@ mod tests {
             ..SettingsPanel::default()
         };
         let y = panel
-            .focus_scroll_y(&s, false, ScrollReveal::Up)
+            .focus_scroll_y(&s, ScrollReveal::Up)
             .expect("first row should pin scroll to top");
         assert!((y - 0.0).abs() < f32::EPSILON);
     }
@@ -2719,15 +2610,6 @@ mod tests {
                     Some(StartMessage::SetSelectionPersist(v)) if v == !on
                 ),
                 "SelectionPersist confirm from {on}"
-            );
-            let mut s = base.clone();
-            s.always_immersive = on;
-            assert!(
-                matches!(
-                    confirm_message(SettingsRow::AlwaysImmersive, &s),
-                    Some(StartMessage::SetAlwaysImmersive(v)) if v == !on
-                ),
-                "AlwaysImmersive confirm from {on}"
             );
             s = base.clone();
             s.clock_enabled = on;
@@ -2812,6 +2694,11 @@ mod tests {
         dirty.perf_vsync = false;
         assert!(SettingsRow::PerfReload.visible(&dirty));
         let rows = SettingsRow::focusable(&dirty);
+        assert!(rows.contains(&SettingsRow::PerfReload));
+        // Debug TuneAmbience trails it; release ends at the reload row.
+        #[cfg(debug_assertions)]
+        assert_eq!(rows.last(), Some(&SettingsRow::TuneAmbience));
+        #[cfg(not(debug_assertions))]
         assert_eq!(rows.last(), Some(&SettingsRow::PerfReload));
         assert!(matches!(
             confirm_message(SettingsRow::PerfReload, &dirty),
@@ -2832,21 +2719,6 @@ mod tests {
         let base = snap(true, true);
         for on in [false, true] {
             let mut s = base.clone();
-            s.always_immersive = on;
-            if on {
-                assert!(nudge_message(SettingsRow::AlwaysImmersive, &s, 1).is_none());
-                assert!(matches!(
-                    nudge_message(SettingsRow::AlwaysImmersive, &s, -1),
-                    Some(StartMessage::SetAlwaysImmersive(false))
-                ));
-            } else {
-                assert!(matches!(
-                    nudge_message(SettingsRow::AlwaysImmersive, &s, 1),
-                    Some(StartMessage::SetAlwaysImmersive(true))
-                ));
-                assert!(nudge_message(SettingsRow::AlwaysImmersive, &s, -1).is_none());
-            }
-            s = base.clone();
             s.clock_enabled = on;
             if on {
                 assert!(nudge_message(SettingsRow::Clock, &s, 1).is_none());
@@ -3133,7 +3005,6 @@ mod tests {
             );
         }
         for (row, on) in [
-            (SettingsRow::AlwaysImmersive, s.always_immersive),
             (SettingsRow::Clock, s.clock_enabled),
             (SettingsRow::Sounds, s.sounds_enabled),
             (SettingsRow::Haptics, s.haptics_enabled),

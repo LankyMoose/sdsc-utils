@@ -34,7 +34,7 @@ impl ToastMessage {
     /// A flapping pad otherwise queues `Connected` faster than cards can drain.
     /// Same `(serial, body)` keeps only the newest (fresh percent/eta wins);
     /// a usurped `AfterToast::OpenStart` transfers to the replacement so the
-    /// compact auto-open latch can never be dropped by coalescing. Cards
+    /// auto-open latch can never be dropped by coalescing. Cards
     /// without a serial (preview / crash) never coalesce.
     pub fn enqueue(queue: &mut VecDeque<ToastMessage>, mut message: ToastMessage) {
         if !message.serial.as_ref().is_empty() {

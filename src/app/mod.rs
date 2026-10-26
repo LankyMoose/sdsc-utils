@@ -52,7 +52,6 @@ use crate::ui::start::input::{
     self as start_input, CrossHold, FaceHeld, GestureDetectorBank, NavAction, NavLogSnapshot,
     PadNavBank,
 };
-use crate::ui::start::mode::{self as start_mode};
 use crate::ui::start::view::{self as start_view, StartMessage};
 use crate::ui::theme;
 use crate::ui::toast::ToastMessage;
@@ -67,7 +66,7 @@ use iced::futures::channel::{mpsc, oneshot};
 use iced::keyboard;
 use iced::mouse;
 use iced::widget::{container, operation, space, stack};
-use iced::{Element, Fill, Point, Size, Subscription, Task, Theme, stream, window};
+use iced::{Element, Fill, Size, Subscription, Task, Theme, stream, window};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -175,12 +174,10 @@ pub enum Message {
     PreviewClose,
 
     StartOpened(window::Id),
-    /// Drive start-screen slide / Triangle-hold animation frames.
+    /// Drive start-screen animation frames.
     StartFrame,
-    /// Mouse move/button/wheel on a window — resets immersive activity (cursor + idle/sleep).
+    /// Mouse move/button/wheel on a window — resets start activity (cursor + idle/sleep).
     StartCursorActivity(window::Id),
-    /// HWND resize finished — apply immersive flag after promote/demote veil.
-    StartImmersiveSettled,
     /// Single-flight art worker milestone (selected / near / job done).
     StartArtEvent(crate::ui::start::art_worker::ArtEvent),
     Start(StartMessage),
@@ -198,8 +195,6 @@ pub enum Message {
     SteamScanDone(AppResult<Vec<SteamGame>>),
     /// Boot idle fallback: start deferred Steam scan if still not kicked.
     SteamScanIdleFallback,
-    /// Post-cold settle delay elapsed — kick background Steam refresh.
-    SteamScanAfterSettle,
     /// Debug-only window stress driver (Diagnostics section in Settings):
     /// rapid toast + cold Start + configure + edit churn to shake out
     /// renderer (e.g. wgpu atlas) crashes. Takes over windows while running.
@@ -274,8 +269,7 @@ impl Message {
             | Message::ConfigureOpened(_)
             | Message::StartOpened(_)
             | Message::StartFrame
-            | Message::StartArtEvent(_)
-            | Message::StartImmersiveSettled => false,
+            | Message::StartArtEvent(_) => false,
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
             #[cfg(debug_assertions)]
@@ -289,9 +283,7 @@ impl Message {
             Message::ManualFilePicked(_)
             | Message::ManualIconPicked(_)
             | Message::SteamPathPicked(_) => true,
-            Message::SteamScanDone(_)
-            | Message::SteamScanIdleFallback
-            | Message::SteamScanAfterSettle => false,
+            Message::SteamScanDone(_) | Message::SteamScanIdleFallback => false,
             #[cfg(debug_assertions)]
             Message::StressWindows(_) => true,
             #[cfg(debug_assertions)]
@@ -321,16 +313,6 @@ pub enum StartKeyAction {
     Right,
     Confirm,
     Cancel,
-}
-
-/// Animated promote growth endpoints: centered compact → monitor cover.
-#[derive(Debug, Clone, Copy)]
-struct ResizeAnim {
-    from_size: Size,
-    to_size: Size,
-    from_pos: Point,
-    to_pos: Point,
-    started: Instant,
 }
 
 pub struct App {
@@ -444,27 +426,20 @@ pub struct App {
     /// Whether that paint happened with a transition ceremony live (gates the
     /// witness so idle gaps never log).
     last_start_paint_active: std::cell::Cell<bool>,
-    /// Demote-settle scroll stowed for the next tick, when the remounted
-    /// list exists. Fires once, then clears.
-    deferred_settle_scroll: Option<(start_view::StartListId, f32)>,
-    /// Animated promote growth (compact → cover) while `transition` is
-    /// `Promoting` / phase is `Resizing`. Stepped resizes keep presenting;
-    /// content holds black so joints are invisible.
-    start_resize_anim: Option<ResizeAnim>,
     /// False until Start is revealed and ready — blocks pad nav / sounds early.
     start_nav_ready: bool,
     start_state: start_view::State,
-    /// Monitor covered while immersive (used to center compact on demote).
+    /// Monitor covered by the Start window (stage size for the view).
     start_monitor_cover: Option<MonitorCover>,
-    /// Last user activity on Start (mouse / keyboard / pad) for immersive idle/sleep.
+    /// Last user activity on Start (mouse / keyboard / pad) for idle/sleep.
     start_last_activity: Instant,
-    /// Last mouse activity on Start (immersive cursor hide only — pad must not unhide).
+    /// Last mouse activity on Start (cursor hide only — pad must not unhide).
     start_cursor_last_active: Instant,
     /// When true, Start view forces [`mouse::Interaction::Hidden`].
     start_cursor_hidden: bool,
     /// True while an rfd picker is open from the start screen (suppress unfocus-close).
     start_file_dialog_open: bool,
-    /// After open / hide / promote: ignore reopen until a debounced full release.
+    /// After open / hide: ignore reopen until a debounced full release.
     chord_release_gate: ChordReleaseGate,
     /// When Start was last revealed (unfocus grace).
     start_revealed_at: Option<Instant>,
@@ -536,21 +511,13 @@ pub struct App {
     /// Reload button pressed, restart due after a short feedback delay.
     /// Disables the button and spins both reload buttons until exit.
     renderer_reload_queued: bool,
-    /// One-shot immersive override for the next `open_start_screen` (reload
-    /// restore reopens the pre-restart presentation even when the
-    /// always-immersive pref would open compact).
-    force_immersive_open: Option<bool>,
     /// One-shot nav-reset bypass for the next `open_start_screen`. Reload
     /// restore sets all UI state (drawer, scrolls, selections) BEFORE
     /// opening; the open path must not `reset_to_games()` it away.
     restore_preserve_nav: bool,
-    /// Saved list offsets (games / controllers / settings drawer) to re-apply
-    /// on `StartOpened`, when the scrollables exist. One-shot per window
-    /// open and never re-asserted: once rows rebuild, offsets go stale and
-    /// only the persisted selection stays authoritative. The drawer offset
-    /// applies once here; the drawer is row-independent, so scans and
-    /// snapshots must leave it alone.
-    pending_scroll_restore: Option<(f32, f32, f32)>,
+    /// Saved settings-drawer offset to re-apply on `StartOpened`, when the
+    /// scrollable exists. One-shot per window open and never re-asserted.
+    pending_settings_scroll: Option<f32>,
     /// Settle window after a restore during which row rebuilds re-pin the
     /// persisted selection by key (see `SCROLL_RESTORE_AUTHORITY`).
     scroll_restore_until: Option<Instant>,
@@ -568,8 +535,6 @@ pub struct App {
     toast_machine: toast_machine::State,
     /// True until the first Start HWND of this process finishes its cold-load ceremony.
     start_cold_load_remaining: bool,
-    /// Compact Steam settle fired during promote ceremony — kick after EnterImmersive.
-    steam_scan_deferred_for_promote: bool,
 
     /// Bumped on every spectrum edit; stale SpectrumCommit messages are ignored.
     spectrum_generation: u64,
@@ -761,11 +726,9 @@ impl App {
             start_visible: false,
             last_start_paint_at: std::cell::Cell::new(None),
             last_start_paint_active: std::cell::Cell::new(false),
-            deferred_settle_scroll: None,
             start_nav_ready: false,
             start_state: start_view::State::default(),
             start_monitor_cover: None,
-            start_resize_anim: None,
             start_last_activity: Instant::now(),
             start_cursor_last_active: Instant::now(),
             start_cursor_hidden: false,
@@ -806,9 +769,8 @@ impl App {
             renderer_boot_vsync,
             restarting_for_renderer: false,
             renderer_reload_queued: false,
-            force_immersive_open: None,
             restore_preserve_nav: false,
-            pending_scroll_restore: None,
+            pending_settings_scroll: None,
             scroll_restore_until: None,
             pending_configure_scroll: None,
             toast_window: None,
@@ -819,7 +781,6 @@ impl App {
             toast_anim_started: Instant::now(),
             toast_machine: toast_machine::State::Idle,
             start_cold_load_remaining: true,
-            steam_scan_deferred_for_promote: false,
             spectrum_generation: 0,
             #[cfg(debug_assertions)]
             emulated_pads,
@@ -906,10 +867,7 @@ impl App {
                 "start" => tasks.push(self.open_start_screen()),
                 "start-controllers" => {
                     tasks.push(self.open_start_screen());
-                    self.start_state.request_slide(
-                        crate::ui::start::view::StartSlide::Controllers,
-                        Instant::now(),
-                    );
+                    self.start_state.request_dock(true, Instant::now());
                 }
                 "start-edit" => {
                     tasks.push(self.open_start_screen());
@@ -1093,10 +1051,7 @@ impl App {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::StartFrame));
         }
 
-        if self.popup_window.is_some()
-            || self.configure_window.is_some()
-            || (self.start_visible && !self.start_state.immersive)
-        {
+        if self.popup_window.is_some() || self.configure_window.is_some() {
             // Slow utility-ambient drift (backdrop.rs): ≤2fps redraws only while
             // a utility window is actually visible; hidden/idle windows never
             // tick, so they never redraw for this.
@@ -1180,14 +1135,13 @@ impl App {
         }
 
         if Some(window) == self.start_window {
-            // Paint-gap witness (black-lockup forensics): while a transition
+            // Paint-gap witness (black-lockup forensics): while the enter
             // ceremony is live the window must repaint ~60Hz. A gap here
             // means paints starved while logic ran ahead — the render/present
             // side, never the state machine. Armed only across live phases,
             // so idle gaps never log.
             let paint_now = Instant::now();
-            let paint_active = self.start_state.transition_phase.is_some()
-                || self.start_state.transition.is_some();
+            let paint_active = self.start_state.transition_phase.is_some();
             if paint_active
                 && self.last_start_paint_active.get()
                 && let Some(last) = self.last_start_paint_at.get()
@@ -1214,10 +1168,7 @@ impl App {
                 &self.start_state,
                 &self.session.prefs.spectrum,
                 Instant::now(),
-                self.session.prefs.start_screen_always_immersive,
                 self.session.prefs.start_screen_clock_enabled,
-                // Prefs always normalize to PS on load/save.
-                &self.session.prefs.start_screen_gesture,
                 stage_h,
                 stage_w,
                 &settings_snapshot,
@@ -1363,7 +1314,6 @@ impl App {
             },
 
             Message::StartOpened(id) => self.on_start_opened(id),
-            Message::StartImmersiveSettled => self.finish_start_immersive_transition(),
             Message::StartArtEvent(ev) => self.on_start_art_event(ev),
             Message::StartFrame => self.on_start_frame(),
             Message::StartCursorActivity(id) => {
@@ -1395,7 +1345,7 @@ impl App {
             Message::SteamPathPicked(path) => self.on_steam_path_picked(path),
             Message::SteamScanDone(result) => self.on_steam_scan_done(result),
             Message::SteamScanIdleFallback => {
-                // Only when Start screen is off — otherwise StartOpened / settle owns the kick
+                // Only when Start screen is off — otherwise StartOpened owns the kick
                 // so Scanning/Preparing stay visible on first open.
                 if self.session.prefs.start_screen_enabled {
                     Task::none()
@@ -1403,7 +1353,6 @@ impl App {
                     self.maybe_kick_deferred_steam_scan()
                 }
             }
-            Message::SteamScanAfterSettle => self.maybe_kick_deferred_steam_scan(),
             // Debug-only renderer stress driver: 5 fast cycles of toast +
             // cold Start + configure + edit churn (the atlas-crash shape),
             // then a final open. Takes over windows; see the variant docs.
@@ -1531,79 +1480,46 @@ impl App {
             let mut task = focus_window(id)
                 .chain(raise_window_topmost(id))
                 .chain(self.sync_toast_zorder());
-            // Settings restore first: the drawer/modal scroll lands
-            // before the list reveals, art kicks, and scan below.
-            // Games/controllers follow after the branch.
-            let mut pending_lists = None;
-            if let Some((games_y, controllers_y, settings_y)) = self.pending_scroll_restore.take() {
-                let settings_id = start_view::StartListId::Settings.scroll_id();
-                self.start_state.note_scroll_y(&settings_id, settings_y);
-                task = task.chain(operation::scroll_to(
-                    settings_id,
-                    operation::AbsoluteOffset {
-                        x: None,
-                        y: Some(settings_y),
-                    },
+            // Settings restore first: the drawer scroll lands
+            // before art kicks and scan below.
+            if let Some(settings_y) = self.pending_settings_scroll.take() {
+                task = task.chain(self.restore_settings_scroll(settings_y));
+            }
+            // Re-show the position rail on every open.
+            // Warm opens skip begin_cold_load; cold opens refresh
+            // the hide clock to visible time. Pinned is a no-op.
+            self.start_state.note_position_bar_scroll(now);
+            self.start_state.arm_cold_ambient(now);
+            // Cache miss: need metadata before art/list can land — scan now.
+            // Cache hit: Preparing chip first; Steam kicks when art-ready handoff runs.
+            if self.steam_scan_pending {
+                task = task.chain(self.maybe_kick_deferred_steam_scan());
+            }
+            // Cold: lift the enter veil onto ambient+dock immediately (games list
+            // stays hidden until art). Warm reopen still waits for art before arming.
+            if self.start_state.cold_load_active {
+                self.start_state.arm_enter_reveal(now);
+                // Cache hit: Preparing chip until art sync; cache miss uses Steam.
+                if !self.steam_scan_pending {
+                    self.start_state
+                        .begin_chrome_status(start_view::ChromeStatusKind::PreparingArt, now);
+                }
+            }
+            self.start_state.prime_backdrop_for_enter(now);
+            if !self.start_state.try_arm_enter_reveal_when_art_ready(now) {
+                let open_ms = self
+                    .start_opened_at
+                    .map(|t| now.saturating_duration_since(t).as_millis())
+                    .unwrap_or(0);
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start immersive enter art hold open_ms={open_ms} steam_scan={} cold={}",
+                    u8::from(self.steam_scan_pending),
+                    u8::from(self.start_state.cold_load_active),
                 ));
-                pending_lists = Some((games_y, controllers_y));
-            }
-            if self.start_state.immersive {
-                // Re-show the position rail on every immersive open.
-                // Warm opens skip begin_cold_load; cold opens refresh
-                // the hide clock to visible time. Pinned is a no-op.
-                self.start_state.note_position_bar_scroll(now);
-                self.start_state.arm_cold_ambient(now);
-                // Cache miss: need metadata before art/list can land — scan now.
-                // Cache hit: Preparing chip first; Steam kicks when art-ready handoff runs.
-                if self.steam_scan_pending {
-                    task = task.chain(self.maybe_kick_deferred_steam_scan());
-                }
-                // Cold: lift the enter veil onto ambient+dock immediately (games list
-                // stays hidden until art). Warm reopen still waits for art before arming.
-                if self.start_state.cold_load_active {
-                    self.start_state.arm_enter_reveal(now);
-                    // Cache hit: Preparing chip until art sync; cache miss uses Steam.
-                    if !self.steam_scan_pending {
-                        self.start_state
-                            .begin_chrome_status(start_view::ChromeStatusKind::PreparingArt, now);
-                    }
-                }
-                self.start_state.prime_backdrop_for_enter(now);
-                if !self.start_state.try_arm_enter_reveal_when_art_ready(now) {
-                    let open_ms = self
-                        .start_opened_at
-                        .map(|t| now.saturating_duration_since(t).as_millis())
-                        .unwrap_or(0);
-                    crate::controller::hid::diag::diag_info(format!(
-                        "ui-diag: start immersive enter art hold open_ms={open_ms} steam_scan={} cold={}",
-                        u8::from(self.steam_scan_pending),
-                        u8::from(self.start_state.cold_load_active),
-                    ));
-                } else {
-                    task = task.chain(self.note_cold_load_finished());
-                }
-                task = task.chain(self.warm_immersive_art_task());
             } else {
-                // Compact: chrome + skeletons immediately; defer Steam settle.
-                // The scrollables now exist, so reveal the restored
-                // selection (a scroll_to sent with window::open would
-                // have targeted a not-yet-mounted id and been dropped).
-                task = task.chain(self.scroll_start_selection_for_open());
-                if self.start_cold_load_remaining {
-                    self.start_cold_load_remaining = false;
-                    task = task.chain(self.schedule_steam_scan_after_settle());
-                } else if !self.steam_library_refreshed {
-                    task = task.chain(self.schedule_steam_scan_after_settle());
-                }
-                if !self.steam_by_id.is_empty() {
-                    task = task.chain(self.warm_start_art_task());
-                }
+                task = task.chain(self.note_cold_load_finished());
             }
-            // Restored lists land after the branch above (which may
-            // reveal the selection first); the saved offsets win.
-            if let Some((games_y, controllers_y)) = pending_lists {
-                task = task.chain(self.restore_game_lists(games_y, controllers_y));
-            }
+            task = task.chain(self.warm_immersive_art_task());
             task
         } else {
             Task::none()
@@ -1622,12 +1538,11 @@ impl App {
         let now = Instant::now();
         let armed = match ev.kind {
             ArtEventKind::SelectedReady => {
-                if self.start_state.immersive
-                    && self
-                        .start_state
-                        .rows
-                        .get(self.start_state.game_selected)
-                        .is_some_and(|r| r.backdrop_icon().is_some())
+                if self
+                    .start_state
+                    .rows
+                    .get(self.start_state.game_selected)
+                    .is_some_and(|r| r.backdrop_icon().is_some())
                 {
                     self.start_state.note_backdrop_ready(now);
                 }
@@ -1684,31 +1599,13 @@ impl App {
         self.start_state
             .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
         let was_cold = self.start_state.cold_load_active;
-        // Frozen exit: while the outgoing presentation is on screen
-        // (promote/demote first half + resize blackout), its clocks
-        // stop — strip/dock/slide chases, hint presses, chrome status,
-        // idle timers and ambient time all hold their pre-transition
-        // frame instead of repainting (and reflowing) under the veil.
-        // Phase/veil/resize progress is wall-clock, so nothing the
-        // ceremony needs stops. Enter phases keep ticking (the new UI
-        // animates in by design).
-        let exiting = matches!(
-            self.start_state.transition_phase.map(|(p, _)| p),
-            Some(
-                start_mode::TransitionPhase::ExitCompact
-                    | start_mode::TransitionPhase::ExitImmersive
-                    | start_mode::TransitionPhase::Resizing
-            )
-        );
-        if !exiting {
-            let _ = self.start_state.tick_anim(now);
-        }
+        self.start_state.tick_anim(now);
         let task = if was_cold && !self.start_state.cold_load_active {
             self.note_cold_load_finished()
         } else {
             Task::none()
         };
-        if let Some(phase_task) = self.tick_immersive_transition_phase(now) {
+        if let Some(phase_task) = self.tick_enter_phase(now) {
             return task.chain(phase_task);
         }
         // Keyboard-only hold progress when pad poll is not running.
@@ -1721,16 +1618,14 @@ impl App {
                 return task.chain(self.complete_replace_confirm());
             }
         }
-        if !exiting {
-            self.sync_start_held();
-            self.start_state.tick_hint_anims(now);
-            self.tick_start_cursor_idle(now);
-            if self.tick_start_idle(now) {
-                self.pad_nav.prepare_on_open(false);
-                crate::controller::hid::diag::diag_info(
-                    "ui-diag: start idle pad re-arm after sleep wake",
-                );
-            }
+        self.sync_start_held();
+        self.start_state.tick_hint_anims(now);
+        self.tick_start_cursor_idle(now);
+        if self.tick_start_idle(now) {
+            self.pad_nav.prepare_on_open(false);
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: start idle pad re-arm after sleep wake",
+            );
         }
         task
     }
@@ -1802,34 +1697,32 @@ impl App {
                         self.on_start_message(StartMessage::MoveDown)
                     }
                 }
-                StartKeyAction::Left
-                    if pressed
-                        && (self.start_state.immersive || self.start_state.settings.open) =>
-                {
+                StartKeyAction::Left if pressed => {
                     self.cancel_start_holds();
                     if self.start_state.ambient_tuning_active() {
-                        self.on_ambient_tuning_nav(Some(NavAction::PrevSlide))
+                        self.on_ambient_tuning_nav(Some(NavAction::Left))
                     } else if self.start_state.settings.open {
-                        self.on_start_settings_nav(Some(NavAction::PrevSlide))
-                    } else if self.immersive_horizontal_games_nav() {
+                        self.on_start_settings_nav(Some(NavAction::Left))
+                    } else if self.immersive_horizontal_games_nav()
+                        || self.start_state.dock_expanded
+                    {
                         self.on_start_message(StartMessage::MoveUp)
                     } else {
-                        self.on_start_message(StartMessage::PrevSlide)
+                        Task::none()
                     }
                 }
-                StartKeyAction::Right
-                    if pressed
-                        && (self.start_state.immersive || self.start_state.settings.open) =>
-                {
+                StartKeyAction::Right if pressed => {
                     self.cancel_start_holds();
                     if self.start_state.ambient_tuning_active() {
-                        self.on_ambient_tuning_nav(Some(NavAction::NextSlide))
+                        self.on_ambient_tuning_nav(Some(NavAction::Right))
                     } else if self.start_state.settings.open {
-                        self.on_start_settings_nav(Some(NavAction::NextSlide))
-                    } else if self.immersive_horizontal_games_nav() {
+                        self.on_start_settings_nav(Some(NavAction::Right))
+                    } else if self.immersive_horizontal_games_nav()
+                        || self.start_state.dock_expanded
+                    {
                         self.on_start_message(StartMessage::MoveDown)
                     } else {
-                        self.on_start_message(StartMessage::NextSlide)
+                        Task::none()
                     }
                 }
                 StartKeyAction::Confirm => {
@@ -2371,12 +2264,10 @@ impl App {
     ) -> Task<Message> {
         let connect_open_start =
             open_start_after && events.iter().any(|event| event.body == "Connected");
-        let immersive_connect =
-            connect_open_start && self.session.prefs.start_screen_always_immersive;
-        // Immersive auto-open never shows a Connected toast (cold-launch via
+        // Auto-open never shows a Connected toast (cold-launch via
         // launch_quiet and hot connects must match). Session already filters,
         // but drop any that slipped through so behaviour is bullet-proof.
-        if immersive_connect {
+        if connect_open_start {
             let before = events.len();
             events.retain(|event| event.body != "Connected");
             if events.len() != before {
@@ -2397,7 +2288,7 @@ impl App {
             }
             return open.chain(self.show_next_toast());
         }
-        // Compact auto-open is toast-first: latch Start onto the toast settle so
+        // Auto-open is toast-first: latch Start onto the toast settle so
         // the Connected card always presents (the toast machine emits OpenStart
         // exactly once — on rest, early dismiss, or slide-out finish).
         for event in events {

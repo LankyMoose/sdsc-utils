@@ -239,14 +239,16 @@ pub enum NavAction {
     Down,
     Confirm,
     Cancel,
-    PrevSlide,
-    NextSlide,
+    Left,
+    Right,
     ToggleEdit,
     CycleSort,
     /// Triangle edge — edit selected manual while in edit mode.
     Triangle,
     /// Options — open/close Start settings.
     ToggleSettings,
+    /// Create (Select) — open/close the controllers surface.
+    ToggleControllers,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -265,6 +267,7 @@ pub struct PadSample {
     pub square: bool,
     pub triangle: bool,
     pub options: bool,
+    pub create: bool,
     pub l2: bool,
     pub r2: bool,
 }
@@ -428,15 +431,15 @@ pub struct NavStepper {
 impl NavStepper {
     fn action_for(direction: i8) -> Option<NavAction> {
         match direction {
-            -2 => Some(NavAction::PrevSlide),
+            -2 => Some(NavAction::Left),
             -1 => Some(NavAction::Up),
             1 => Some(NavAction::Down),
-            2 => Some(NavAction::NextSlide),
+            2 => Some(NavAction::Right),
             _ => None,
         }
     }
 
-    /// `horizontal`: immersive left/right slides. Compact keeps vertical-only (L2/R2 slides).
+    /// `horizontal`: left/right move. Vertical-only keeps Up/Down.
     /// `allow_vertical`: false on the horizontal Games strip where Up/Down are
     /// suppressed — vertical stick wobble must not enter direction state, or a
     /// held-Left stick oscillating Left↔Up/Down would fire immediately on every
@@ -573,31 +576,28 @@ pub enum EdgeButton {
     Square,
     Triangle,
     Options,
-    L2,
-    R2,
+    Create,
 }
 
 impl EdgeButton {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 6] = [
         Self::Cross,
         Self::Circle,
         Self::Square,
         Self::Triangle,
         Self::Options,
-        Self::L2,
-        Self::R2,
+        Self::Create,
     ];
 
-    /// Face + Options: activate on release. L2/R2: activate on press (compact slides).
-    const RELEASE_FIRE: [Self; 5] = [
+    /// Face + Options + Create: activate on release.
+    const RELEASE_FIRE: [Self; 6] = [
         Self::Cross,
         Self::Circle,
         Self::Square,
         Self::Triangle,
         Self::Options,
+        Self::Create,
     ];
-
-    const PRESS_FIRE: [Self; 2] = [Self::L2, Self::R2];
 
     fn action(self) -> Option<NavAction> {
         match self {
@@ -608,9 +608,8 @@ impl EdgeButton {
             // Browse: enter edit. Edit: save (ToggleEdit commits).
             Self::Triangle => Some(NavAction::ToggleEdit),
             Self::Options => Some(NavAction::ToggleSettings),
-            // Compact carousel: L2/R2 change slides. Immersive filters these out in PadNavBank.
-            Self::L2 => Some(NavAction::PrevSlide),
-            Self::R2 => Some(NavAction::NextSlide),
+            // Create (Select): toggle the controllers surface.
+            Self::Create => Some(NavAction::ToggleControllers),
         }
     }
 
@@ -621,13 +620,12 @@ impl EdgeButton {
             Self::Square => sample.square,
             Self::Triangle => sample.triangle,
             Self::Options => sample.options,
-            Self::L2 => sample.l2,
-            Self::R2 => sample.r2,
+            Self::Create => sample.create,
         }
     }
 }
 
-/// Face/Options fire on release; L2/R2 on press. `hold_owned` never fires here.
+/// Face/Options/Create fire on release. `hold_owned` never fires here.
 #[derive(Debug, Clone, Default)]
 pub struct ButtonEdges {
     cross: bool,
@@ -635,14 +633,14 @@ pub struct ButtonEdges {
     square: bool,
     triangle: bool,
     options: bool,
-    l2: bool,
-    r2: bool,
-    /// Face/Options that went down but were cancelled by a foreign face press.
+    create: bool,
+    /// Face/Options/Create that went down but were cancelled by a foreign face press.
     cancel_cross: bool,
     cancel_circle: bool,
     cancel_square: bool,
     cancel_triangle: bool,
     cancel_options: bool,
+    cancel_create: bool,
 }
 
 impl ButtonEdges {
@@ -653,8 +651,7 @@ impl ButtonEdges {
             EdgeButton::Square => self.square,
             EdgeButton::Triangle => self.triangle,
             EdgeButton::Options => self.options,
-            EdgeButton::L2 => self.l2,
-            EdgeButton::R2 => self.r2,
+            EdgeButton::Create => self.create,
         }
     }
 
@@ -665,7 +662,7 @@ impl ButtonEdges {
             EdgeButton::Square => self.cancel_square,
             EdgeButton::Triangle => self.cancel_triangle,
             EdgeButton::Options => self.cancel_options,
-            EdgeButton::L2 | EdgeButton::R2 => false,
+            EdgeButton::Create => self.cancel_create,
         }
     }
 
@@ -676,7 +673,7 @@ impl ButtonEdges {
             EdgeButton::Square => self.cancel_square = value,
             EdgeButton::Triangle => self.cancel_triangle = value,
             EdgeButton::Options => self.cancel_options = value,
-            EdgeButton::L2 | EdgeButton::R2 => {}
+            EdgeButton::Create => self.cancel_create = value,
         }
     }
 
@@ -687,13 +684,13 @@ impl ButtonEdges {
             .any(|&b| Some(b) != except && b.held(sample) && !self.prev_held(b))
     }
 
-    /// L2/R2: rising edge. Face/Options: falling edge unless cancelled or `hold_owned`.
+    /// Release edges for face/Options/Create unless cancelled or `hold_owned`.
     pub fn update(
         &mut self,
         sample: &PadSample,
         hold_owned: Option<EdgeButton>,
     ) -> Option<NavAction> {
-        // Foreign face/Options press cancels other held face/Options pending releases.
+        // Foreign face/Options/Create press cancels other held pending releases.
         for &b in &EdgeButton::RELEASE_FIRE {
             let now = b.held(sample);
             let was = self.prev_held(b);
@@ -707,13 +704,6 @@ impl ButtonEdges {
         }
 
         let mut action = None;
-        for &b in &EdgeButton::PRESS_FIRE {
-            let now = b.held(sample);
-            let was = self.prev_held(b);
-            if now && !was && action.is_none() {
-                action = b.action();
-            }
-        }
         for &b in &EdgeButton::RELEASE_FIRE {
             let now = b.held(sample);
             let was = self.prev_held(b);
@@ -737,15 +727,14 @@ impl ButtonEdges {
         self.square = sample.square;
         self.triangle = sample.triangle;
         self.options = sample.options;
-        self.l2 = sample.l2;
-        self.r2 = sample.r2;
+        self.create = sample.create;
     }
 
     pub fn clear(&mut self) {
         *self = Self::default();
     }
 
-    /// Mark every currently held face/Options so its pending release will not fire.
+    /// Mark every currently held face/Options/Create so its pending release will not fire.
     pub fn cancel_held_releases(&mut self) {
         for &b in &EdgeButton::RELEASE_FIRE {
             if self.prev_held(b) {
@@ -867,6 +856,7 @@ pub fn sample_nav_resting(sample: &PadSample) -> bool {
         && !sample.square
         && !sample.triangle
         && !sample.options
+        && !sample.create
         && !sample.l2
         && !sample.r2
         && !sample.dpad_up
@@ -955,6 +945,7 @@ pub fn merge_nav_samples(batch: &[PadSample]) -> Option<PadSample> {
         out.square |= s.square;
         out.triangle |= s.triangle;
         out.options |= s.options;
+        out.create |= s.create;
         out.l2 |= s.l2;
         out.r2 |= s.r2;
         out.dpad_up |= s.dpad_up;
@@ -1041,7 +1032,7 @@ pub struct PadNavBank {
     arm_new_pads: bool,
 }
 
-/// Which face / Options buttons are currently held (OR across armed pads).
+/// Which face / Options / Create buttons are currently held (OR across armed pads).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FaceHeld {
     pub cross: bool,
@@ -1049,6 +1040,7 @@ pub struct FaceHeld {
     pub square: bool,
     pub triangle: bool,
     pub options: bool,
+    pub create: bool,
 }
 
 impl FaceHeld {
@@ -1059,6 +1051,7 @@ impl FaceHeld {
             square: sample.square,
             triangle: sample.triangle,
             options: sample.options,
+            create: sample.create,
         }
     }
 
@@ -1069,6 +1062,7 @@ impl FaceHeld {
             square: self.square || other.square,
             triangle: self.triangle || other.triangle,
             options: self.options || other.options,
+            create: self.create || other.create,
         }
     }
 }
@@ -1126,11 +1120,10 @@ impl PadNavBank {
 
     /// Sync presence, update every pad's edge/hold state, emit at most one action.
     ///
-    /// `allow_nav_move` gates D-pad/stick repeats (false while a slide animates).
-    /// `horizontal_nav`: immersive left/right slides (and suppress L2/R2). Compact uses L2/R2.
+    /// `allow_nav_move` gates D-pad/stick repeats (false while chrome animates).
+    /// `horizontal_nav`: immersive left/right move on the strip. Triggers are inert.
     /// `horizontal_games_nav`: horizontal immersive Games strip — left/right scroll
-    /// games (remapped to Up/Down here) while L2/R2 keep their slide actions;
-    /// Up/Down are suppressed (Left/Right only).
+    /// games (remapped to Up/Down here); Up/Down are suppressed (Left/Right only).
     /// `replace_confirm` switches to Cross-hold / Circle-cancel mode.
     /// `_editing` is retained for call-site compatibility (Triangle saves via
     /// ToggleEdit in both modes); Square still cycles sort and manual Edit is
@@ -1286,11 +1279,10 @@ impl PadNavBank {
                 None
             };
             // Horizontal Games strip: left/right scroll games, so stepper slide
-            // actions become vertical moves (L2/R2 keep PrevSlide/NextSlide below).
-            // Up/Down do nothing here — scrolling is Left/Right only.
+            // actions become vertical moves. Up/Down do nothing here.
             let nav = nav.and_then(|action| match action {
-                NavAction::PrevSlide if horizontal_games_nav => Some(NavAction::Up),
-                NavAction::NextSlide if horizontal_games_nav => Some(NavAction::Down),
+                NavAction::Left if horizontal_games_nav => Some(NavAction::Up),
+                NavAction::Right if horizontal_games_nav => Some(NavAction::Down),
                 NavAction::Up | NavAction::Down if horizontal_games_nav => None,
                 other => Some(other),
             });
@@ -1304,17 +1296,6 @@ impl PadNavBank {
             }
 
             let edge = slot.button_edges.update(&reading.sample, hold_owned);
-            let edge = edge.and_then(|action| match action {
-                // Immersive: slides are left/right — ignore trigger edges, except
-                // on the horizontal Games strip where L2/R2 own slide switching.
-                NavAction::PrevSlide | NavAction::NextSlide
-                    if horizontal_nav && !horizontal_games_nav =>
-                {
-                    None
-                }
-                // Square cycles sort in browse and edit alike.
-                other => Some(other),
-            });
 
             if let Some(action) = nav
                 && nav_action.is_none()
@@ -1385,7 +1366,7 @@ impl GestureDetectorBank {
     }
 
     /// Mark every live pad as already armed so the current/sticky hold cannot
-    /// reopen the start screen (e.g. after open / close / promote).
+    /// reopen the start screen (e.g. after open / close).
     pub fn consume_pending_match(&mut self, readings: &[NavReading]) {
         let live: HashSet<PadId> = readings.iter().map(|r| r.id.clone()).collect();
         self.detectors.retain(|id, _| live.contains(id));
@@ -1574,7 +1555,7 @@ mod tests {
         };
         assert_eq!(
             stepper.update(&left, now, true, true),
-            Some(NavAction::PrevSlide)
+            Some(NavAction::Left)
         );
         assert!(stepper.update(&left, now, true, true).is_none());
 
@@ -1585,7 +1566,7 @@ mod tests {
         };
         assert_eq!(
             stepper.update(&right, now, true, true),
-            Some(NavAction::NextSlide)
+            Some(NavAction::Right)
         );
     }
 
@@ -1697,7 +1678,7 @@ mod tests {
         };
         assert_eq!(
             stepper.update(&diag, now, true, true),
-            Some(NavAction::NextSlide)
+            Some(NavAction::Right)
         );
         stepper.reset();
         let diag_v = PadSample {
@@ -1860,13 +1841,27 @@ mod tests {
     }
 
     #[test]
-    fn button_edges_l2_r2_fire_slide_actions_on_press() {
+    fn button_edges_create_fires_toggle_controllers_on_release() {
+        let mut edges = ButtonEdges::default();
+        let held = PadSample {
+            create: true,
+            ..Default::default()
+        };
+        assert!(edges.update(&held, None).is_none());
+        assert_eq!(
+            edges.update(&PadSample::default(), None),
+            Some(NavAction::ToggleControllers)
+        );
+    }
+
+    #[test]
+    fn button_edges_l2_r2_are_inert() {
         let mut edges = ButtonEdges::default();
         let r2 = PadSample {
             r2: true,
             ..Default::default()
         };
-        assert_eq!(edges.update(&r2, None), Some(NavAction::NextSlide));
+        assert!(edges.update(&r2, None).is_none());
         assert!(edges.update(&r2, None).is_none());
         assert!(edges.update(&PadSample::default(), None).is_none());
 
@@ -1874,22 +1869,24 @@ mod tests {
             l2: true,
             ..Default::default()
         };
-        assert_eq!(edges.update(&l2, None), Some(NavAction::PrevSlide));
+        assert!(edges.update(&l2, None).is_none());
+        assert!(edges.update(&PadSample::default(), None).is_none());
     }
 
     #[test]
-    fn button_edges_sync_then_held_r2_does_not_fire() {
+    fn button_edges_sync_then_held_create_fires_on_release() {
         let mut edges = ButtonEdges::default();
         let held = PadSample {
-            r2: true,
+            create: true,
             ..Default::default()
         };
         edges.sync(&held);
         assert!(edges.update(&held, None).is_none());
         let released = PadSample::default();
-        assert!(edges.update(&released, None).is_none());
-        assert_eq!(edges.update(&held, None), Some(NavAction::NextSlide));
-        assert!(edges.update(&released, None).is_none());
+        assert_eq!(
+            edges.update(&released, None),
+            Some(NavAction::ToggleControllers)
+        );
     }
 
     #[test]
@@ -1928,6 +1925,14 @@ mod tests {
         assert!(sample_nav_resting(&PadSample::default()));
         assert!(!sample_nav_resting(&PadSample {
             r2: true,
+            ..Default::default()
+        }));
+        assert!(!sample_nav_resting(&PadSample {
+            create: true,
+            ..Default::default()
+        }));
+        assert!(!sample_nav_resting(&PadSample {
+            options: true,
             ..Default::default()
         }));
         assert!(!sample_nav_resting(&PadSample {
@@ -2052,6 +2057,7 @@ mod tests {
                 GestureControl::Square => sample.square = true,
                 GestureControl::Triangle => sample.triangle = true,
                 GestureControl::Options => sample.options = true,
+                GestureControl::Create => sample.create = true,
                 _ => {}
             }
         }
@@ -2597,7 +2603,7 @@ mod tests {
     }
 
     #[test]
-    fn tick_horizontal_games_nav_keeps_trigger_slides() {
+    fn tick_horizontal_games_nav_triggers_are_inert() {
         let mut bank = PadNavBank::default();
         bank.prepare_on_open(true);
         let now = Instant::now();
@@ -2612,10 +2618,7 @@ mod tests {
             l2: true,
             ..Default::default()
         };
-        assert_eq!(
-            tick_games(&mut bank, l2, now, true).action,
-            Some(NavAction::PrevSlide)
-        );
+        assert!(tick_games(&mut bank, l2, now, true).action.is_none());
         assert!(
             tick_games(&mut bank, PadSample::default(), now, true)
                 .action
@@ -2625,10 +2628,7 @@ mod tests {
             r2: true,
             ..Default::default()
         };
-        assert_eq!(
-            tick_games(&mut bank, r2, now, true).action,
-            Some(NavAction::NextSlide)
-        );
+        assert!(tick_games(&mut bank, r2, now, true).action.is_none());
     }
 
     fn tick_games_editing(bank: &mut PadNavBank, sample: PadSample, now: Instant) -> PadTickResult {
@@ -2648,9 +2648,7 @@ mod tests {
     #[test]
     fn tick_horizontal_games_nav_editing_left_right_move_selection() {
         // Edit mode on the horizontal Games strip: Left/Right must scroll
-        // games (Up/Down moves) instead of PrevSlide/NextSlide, which would
-        // discard the edit draft via the dock collapse/expand handlers.
-        // Up/Down stay suppressed, L2/R2 keep slide switching, Square still
+        // games (Up/Down moves). Up/Down stay suppressed, Square still
         // cycles sort and Triangle still saves (ToggleEdit) in edit mode.
         let mut bank = PadNavBank::default();
         bank.prepare_on_open(true);
@@ -2708,7 +2706,7 @@ mod tests {
         };
         assert!(tick_games_editing(&mut bank, down, now).action.is_none());
 
-        // L2/R2 keep slide switching in edit mode.
+        // L2/R2 are inert in edit mode.
         assert!(
             tick_games_editing(&mut bank, PadSample::default(), now)
                 .action
@@ -2718,10 +2716,7 @@ mod tests {
             l2: true,
             ..Default::default()
         };
-        assert_eq!(
-            tick_games_editing(&mut bank, l2, now).action,
-            Some(NavAction::PrevSlide)
-        );
+        assert!(tick_games_editing(&mut bank, l2, now).action.is_none());
         assert!(
             tick_games_editing(&mut bank, PadSample::default(), now)
                 .action
@@ -2731,10 +2726,7 @@ mod tests {
             r2: true,
             ..Default::default()
         };
-        assert_eq!(
-            tick_games_editing(&mut bank, r2, now).action,
-            Some(NavAction::NextSlide)
-        );
+        assert!(tick_games_editing(&mut bank, r2, now).action.is_none());
 
         // Square still cycles sort in edit mode (manual Edit is mouse-only).
         assert!(
@@ -2769,19 +2761,19 @@ mod tests {
     }
 
     #[test]
-    fn tick_vertical_immersive_suppresses_trigger_slides() {
+    fn tick_vertical_suppresses_triggers() {
         let mut bank = PadNavBank::default();
         bank.prepare_on_open(true);
         let now = Instant::now();
 
-        // Left/right still switch slides; triggers stay suppressed.
+        // Triggers stay suppressed.
         let left = PadSample {
             dpad_left: true,
             ..Default::default()
         };
         assert_eq!(
             tick_games(&mut bank, left, now, false).action,
-            Some(NavAction::PrevSlide)
+            Some(NavAction::Left)
         );
         assert!(
             tick_games(&mut bank, PadSample::default(), now, false)
@@ -2812,7 +2804,7 @@ mod tests {
         };
         assert_eq!(
             stepper.update(&left, t0, true, false),
-            Some(NavAction::PrevSlide)
+            Some(NavAction::Left)
         );
         // Alternate pure-left / left+slight-up every 10ms across the initial
         // delay: no wobble tick may fire.
@@ -2839,7 +2831,7 @@ mod tests {
                 true,
                 false
             ),
-            Some(NavAction::PrevSlide)
+            Some(NavAction::Left)
         );
         fires += 1;
         // Then every NAV_REPEAT (90ms): +370ms fires, midpoints stay gated.
@@ -2855,7 +2847,7 @@ mod tests {
                 true,
                 false
             ),
-            Some(NavAction::PrevSlide)
+            Some(NavAction::Left)
         );
         fires += 1;
         assert_eq!(fires, 3);
@@ -2863,7 +2855,7 @@ mod tests {
 
     #[test]
     fn tick_horizontal_games_nav_left_wobble_stays_gated() {
-        // End-to-end: horizontal Games strip maps stepper slides to Up/Down and
+        // End-to-end: horizontal Games strip maps stepper Left/Right to Up/Down and
         // drops raw Up/Down; alternating left / left+slight-up must scroll games
         // at gated repeat rate, not once per wobble flip.
         let mut bank = PadNavBank::default();
@@ -3026,7 +3018,7 @@ mod tests {
         };
         assert_eq!(
             stepper.update(&left, t0, true, false),
-            Some(NavAction::PrevSlide)
+            Some(NavAction::Left)
         );
         // Brief neutral then opposite: direction change always fires at once.
         assert!(
@@ -3041,7 +3033,7 @@ mod tests {
         );
         assert_eq!(
             stepper.update(&right, t0 + Duration::from_millis(30), true, false),
-            Some(NavAction::NextSlide)
+            Some(NavAction::Right)
         );
         // Same-direction re-press inside the grace stays gated (dropout, not
         // release): pre-fix the brief neutral above reset state and this fired.
@@ -3086,7 +3078,7 @@ mod tests {
         // Fresh press fires at once.
         assert_eq!(
             stepper.update(&left, t0 + Duration::from_millis(460), true, false),
-            Some(NavAction::PrevSlide)
+            Some(NavAction::Left)
         );
     }
 }
