@@ -13,6 +13,7 @@ use crate::controller::model::Connection;
 use crate::controller::model::ControllerStatus;
 use crate::controller::model::Serial;
 use crate::games::launch;
+use crate::games::steam;
 use crate::persist::paths;
 use crate::persist::prefs::{clamp_low_battery_percent, renderer_restart_needed};
 use crate::platform::app_log;
@@ -72,6 +73,12 @@ impl App {
             start_screen_haptics_strength: self.session.prefs.start_screen_haptics_strength,
             extra_steam_paths: self.session.prefs.extra_steam_paths.clone(),
             steam_path_error: self.configure_state.steam_path_error.clone(),
+            show_uninstalled_games: self.session.prefs.show_uninstalled_games,
+            steam_syncing: self.steam_scan_started.is_some(),
+            steam_last_synced_label: steam::format_library_synced(
+                self.steam_last_synced_ms,
+                steam::library_now_ms(),
+            ),
             #[cfg(windows)]
             autostart: Host::is_enabled(),
         }
@@ -329,6 +336,10 @@ impl App {
                 }
                 Task::none()
             }
+            ConfigureMessage::SetShowUninstalledGames(enabled) => {
+                self.apply_show_uninstalled_games(enabled)
+            }
+            ConfigureMessage::SyncSteamLibrary => self.sync_steam_library_now(),
             #[cfg(debug_assertions)]
             ConfigureMessage::RunWindowStress => {
                 if self.stress_running {

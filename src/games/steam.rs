@@ -85,6 +85,22 @@ pub fn validate_steam_library_path(path: &std::path::Path) -> bool {
     })
 }
 
+/// Join up to a handful of skip names for a log line; caps length so one
+/// broken library cannot flood `app.log` on every scan.
+fn capped_list(names: &[String]) -> String {
+    const MAX_SHOWN: usize = 5;
+    let mut out = names
+        .iter()
+        .take(MAX_SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > MAX_SHOWN {
+        out.push_str(&format!(" (and {} more)", names.len() - MAX_SHOWN));
+    }
+    out
+}
+
 /// Installed Steam games, sorted by name.
 pub fn list_installed_games(extra_paths: &[PathBuf]) -> AppResult<Vec<SteamGame>> {
     let steam_root =
@@ -105,10 +121,17 @@ pub fn list_installed_games(extra_paths: &[PathBuf]) -> AppResult<Vec<SteamGame>
     }
     let play_by_id = load_play_stats(&steam_root);
     let mut by_id: BTreeMap<u32, SteamGame> = BTreeMap::new();
+    // Skipped manifests, for the end-of-scan summary: a curated appid whose
+    // manifest lands here renders as a name-less fallback row, so every skip
+    // is diagnosable from `app.log` without attaching a debugger.
+    let mut unreadable_roots: Vec<String> = Vec::new();
+    let mut unreadable_manifests: Vec<String> = Vec::new();
+    let mut unparsed_manifests: Vec<String> = Vec::new();
 
-    for root in library_roots {
+    for root in &library_roots {
         let steamapps = root.join("steamapps");
         let Ok(entries) = fs::read_dir(&steamapps) else {
+            unreadable_roots.push(steamapps.display().to_string());
             continue;
         };
         for entry in entries.flatten() {
@@ -120,9 +143,11 @@ pub fn list_installed_games(extra_paths: &[PathBuf]) -> AppResult<Vec<SteamGame>
                 continue;
             }
             let Ok(text) = fs::read_to_string(&path) else {
+                unreadable_manifests.push(name.to_string());
                 continue;
             };
             let Some(meta) = parse_appmanifest_meta(&text) else {
+                unparsed_manifests.push(name.to_string());
                 continue;
             };
             let play = play_by_id.get(&meta.appid).cloned().unwrap_or_default();
@@ -147,6 +172,31 @@ pub fn list_installed_games(extra_paths: &[PathBuf]) -> AppResult<Vec<SteamGame>
 
     let mut games: Vec<_> = by_id.into_values().collect();
     games.sort_by_key(|a| a.name.to_lowercase());
+
+    app_log::info(format!(
+        "steam scan: games={} roots={} skipped_manifests={}",
+        games.len(),
+        library_roots.len(),
+        unreadable_manifests.len() + unparsed_manifests.len(),
+    ));
+    if !unreadable_roots.is_empty() {
+        app_log::warn(format!(
+            "steam scan: unreadable library steamapps dir(s): {}",
+            capped_list(&unreadable_roots),
+        ));
+    }
+    if !unreadable_manifests.is_empty() {
+        app_log::warn(format!(
+            "steam scan: unreadable manifest(s) (name unknown, rows fall back): {}",
+            capped_list(&unreadable_manifests),
+        ));
+    }
+    if !unparsed_manifests.is_empty() {
+        app_log::warn(format!(
+            "steam scan: manifest(s) missing appid/name (rows fall back): {}",
+            capped_list(&unparsed_manifests),
+        ));
+    }
 
     #[cfg(debug_assertions)]
     {
@@ -794,6 +844,63 @@ pub fn is_appid_running(_appid: u32) -> Option<bool> {
     None
 }
 
+/// Installed appids from `HKCU\Software\Valve\Steam\Apps` (`Installed != 0`).
+///
+/// Cheap membership signal for change detection: no filesystem walk, so the
+/// registry watcher can tell installs/uninstalls apart from `Running` flips
+/// without a full library scan. Sorted, deduplicated. Unreadable keys and
+/// non-numeric subkeys are skipped.
+#[cfg(windows)]
+pub fn registry_installed_appids() -> Vec<u32> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+    let Ok(apps) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(r"Software\Valve\Steam\Apps")
+    else {
+        return Vec::new();
+    };
+    let mut ids: Vec<u32> = Vec::new();
+    for name in apps.enum_keys().flatten() {
+        let Ok(appid) = name.parse::<u32>() else {
+            continue;
+        };
+        let installed: bool = apps
+            .open_subkey(name)
+            .ok()
+            .and_then(|key| key.get_value::<u32, _>("Installed").ok())
+            .is_some_and(|v| v != 0);
+        if installed {
+            ids.push(appid);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// No registry off Windows (change detection is Windows-only, like the scan).
+#[cfg(not(windows))]
+pub fn registry_installed_appids() -> Vec<u32> {
+    Vec::new()
+}
+
+/// Store page for an appid.
+///
+/// Verified dispatchable two ways: the client's URL controller handles the
+/// `store/` command (`CSteamURLController::ExecuteSteamURL` in `SteamUI.dll`),
+/// and the client itself emits `steam://store/%u` as its failure-response
+/// action for unlaunchable apps. This is also Steam's own fallback for a
+/// game action that fails because the app isn't installed, so it covers
+/// owned-but-uninstalled games (store page carries install affordances)
+/// and unknown appids alike.
+///
+/// Note: no verified external URI deep-links a specific *library* details
+/// page — `steam://nav/…` is internal-only (absent from the URL controller's
+/// table), and the wiki's `steam://open/games/…` form has no binary
+/// evidence in the current client.
+pub fn store_page_uri(appid: u32) -> String {
+    format!("steam://store/{appid}")
+}
+
 fn format_playtime(minutes: u32) -> String {
     if minutes < 60 {
         format!("{minutes} min")
@@ -940,6 +1047,37 @@ fn steam_library_now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Current wall-clock milliseconds, for stamping/displaying sync times.
+pub(crate) fn library_now_ms() -> u64 {
+    steam_library_now_ms()
+}
+
+/// Human "last synced" label for Settings.
+///
+/// `None` (no successful seed/scan yet and no cache) renders
+/// "Never synced". Pure so the relative math is unit-testable.
+pub fn format_library_synced(synced_ms: Option<u64>, now_ms: u64) -> String {
+    let Some(synced_ms) = synced_ms.filter(|&t| t > 0) else {
+        return "Never synced".into();
+    };
+    let ago_secs = now_ms.saturating_sub(synced_ms) / 1000;
+    if ago_secs < 60 {
+        return "Last synced just now".into();
+    }
+    if ago_secs < 3600 {
+        let mins = ago_secs / 60;
+        return format!("Last synced {mins} min ago");
+    }
+    if ago_secs < 172_800 {
+        let hours = ago_secs / 3600;
+        return format!("Last synced {hours} h ago");
+    }
+    match format_last_played_date(synced_ms / 1000) {
+        Some(date) => format!("Last synced {date}"),
+        None => "Last synced a while ago".into(),
+    }
 }
 
 /// Drop art paths that no longer exist so cold load does not wait forever.
@@ -1309,6 +1447,41 @@ mod tests {
         // No such app key resolves: unknown, never a verdict (read-only:
         // tests never write Steam keys).
         assert_eq!(is_appid_running(u32::MAX), None);
+    }
+
+    #[test]
+    fn view_uris_format() {
+        assert_eq!(store_page_uri(570), "steam://store/570");
+    }
+
+    #[test]
+    fn registry_installed_appids_is_sorted_unique() {
+        // Read-only walk; asserts the contract (sorted, no duplicates) on
+        // every OS — empty off Windows.
+        let ids = registry_installed_appids();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
+    }
+
+    #[test]
+    fn format_library_synced_buckets() {
+        let now = 1_760_000_000_000u64;
+        assert_eq!(format_library_synced(None, now), "Never synced");
+        assert_eq!(format_library_synced(Some(0), now), "Never synced");
+        assert_eq!(
+            format_library_synced(Some(now - 10_000), now),
+            "Last synced just now"
+        );
+        assert_eq!(
+            format_library_synced(Some(now - 5 * 60_000), now),
+            "Last synced 5 min ago"
+        );
+        assert_eq!(
+            format_library_synced(Some(now - 3 * 3_600_000), now),
+            "Last synced 3 h ago"
+        );
+        let old = format_library_synced(Some(now - 10 * 86_400_000), now);
+        assert!(old.starts_with("Last synced "), "{old}");
+        assert!(!old.ends_with("ago"), "{old}");
     }
 
     #[test]

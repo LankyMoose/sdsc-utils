@@ -12,6 +12,7 @@ pub mod idle;
 pub mod immersive;
 pub mod input;
 pub mod mode;
+pub mod overlay;
 pub mod position;
 pub mod row;
 pub mod settings;

@@ -13,6 +13,7 @@ use crate::ui::layout as window_layout;
 use crate::ui::start::face::FacePressAnim;
 use crate::ui::start::icon_cache;
 use crate::ui::start::input::FaceHeld;
+use crate::ui::start::overlay;
 use crate::ui::svg_icon;
 use crate::ui::theme;
 use iced::mouse;
@@ -53,6 +54,12 @@ pub enum StartMessage {
     MoveDown,
     Confirm,
     Close,
+    /// Absorb a click with no state change (modal card click shield so
+    /// clicks never fall through to the dimmed stage behind a dialog).
+    Noop,
+    /// Backdrop click on the save-guard modal: close the modal, stay in
+    /// edit mode (never discards — Discard stays an explicit choice).
+    DismissEditConfirm,
     /// Create (Select): toggle the controllers surface.
     ToggleControllers,
     ToggleEdit,
@@ -93,6 +100,9 @@ pub enum StartMessage {
     SetPerfVsync(bool),
     /// Reload the UI to apply boot-only renderer prefs (AA/vsync).
     ReloadUi,
+    SetShowUninstalledGames(bool),
+    /// Rescan the Steam library now (no-op while a scan is in flight).
+    SyncSteamLibrary,
     /// Debug-only: open the in-immersive ambience tuning panel.
     #[cfg(debug_assertions)]
     OpenAmbientTuning,
@@ -166,9 +176,15 @@ pub struct StartRow {
     pub skeleton: bool,
     /// Steam install has an update pending (`StateFlags` update-required).
     pub update_required: bool,
-    /// Scan determined this target is no longer installed (Steam uninstalled or
-    /// manual file missing). Row is dimmed and cannot launch.
+    /// Scan determined this target cannot launch (manual file missing). Row is
+    /// dimmed and cannot launch. Steam rows are never disabled: unlaunchable
+    /// ones stay enabled with `view_in_steam` set.
     pub disabled: bool,
+    /// Steam row Steam cannot launch: Cross opens the game's store page
+    /// instead (`Some(appid)`). Set for scan-proven-uninstalled rows and
+    /// pre-flight-blocked rows; `None` for launchable rows, skeletons, and
+    /// manual entries. Rows with this set stay enabled and navigable.
+    pub view_in_steam: Option<u32>,
     /// Effective last-played time (catalog touch or Steam), milliseconds. `None` = never.
     pub played_at_ms: Option<u64>,
 }
@@ -182,7 +198,9 @@ pub enum EditRow {
 
 impl StartRow {
     pub(crate) fn launch_hint_label(&self) -> &'static str {
-        if self.update_required {
+        if self.view_in_steam.is_some() {
+            "View in Steam"
+        } else if self.update_required {
             "Update & launch"
         } else {
             "Launch"
@@ -193,6 +211,8 @@ impl StartRow {
         entry: &GameEntry,
         steam_by_id: &HashMap<u32, SteamGame>,
         steam_scan_pending: bool,
+        remembered_name: Option<&str>,
+        known_missing: bool,
     ) -> Self {
         match entry {
             GameEntry::Steam { appid } => {
@@ -213,6 +233,7 @@ impl StartRow {
                         skeleton: false,
                         update_required: game.update_required,
                         disabled: false,
+                        view_in_steam: None,
                         played_at_ms: None,
                     }
                 } else if steam_scan_pending {
@@ -229,12 +250,25 @@ impl StartRow {
                         skeleton: true,
                         update_required: false,
                         disabled: false,
+                        view_in_steam: None,
                         played_at_ms: None,
                     }
                 } else {
+                    // Live scan missed this appid: prefer the last-known name
+                    // over the bare `Steam {appid}` fallback, and explain why
+                    // instead of leaking the launch URI as the subtitle.
+                    let title = remembered_name
+                        .filter(|name| !name.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("Steam {appid}"));
+                    let subtitle = if known_missing {
+                        StartSubtitle::Plain("Not installed".into())
+                    } else {
+                        StartSubtitle::Plain("Steam".into())
+                    };
                     Self {
-                        title: format!("Steam {appid}"),
-                        subtitle: Some(StartSubtitle::Plain(format!("steam://rungameid/{appid}"))),
+                        title,
+                        subtitle: Some(subtitle),
                         target: crate::games::steam::launch_uri(*appid),
                         args: String::new(),
                         play_key: entry.play_key(),
@@ -244,9 +278,12 @@ impl StartRow {
                         edit: None,
                         skeleton: false,
                         update_required: false,
-                        // Disabled is resolved in refresh (needs installed list);
-                        // default to enabled here so unknown-scan fallbacks stay launchable.
+                        // Rows the scan proved missing stay enabled: Cross
+                        // opens the game's store page (`view_in_steam`)
+                        // instead of launching. Unknown-scan fallbacks stay
+                        // launchable via the rungameid target.
                         disabled: false,
+                        view_in_steam: known_missing.then_some(*appid),
                         played_at_ms: None,
                     }
                 }
@@ -272,6 +309,7 @@ impl StartRow {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 }
             }
@@ -298,10 +336,35 @@ impl StartRow {
             skeleton: false,
             update_required: game.update_required,
             disabled: false,
+            view_in_steam: None,
             played_at_ms: None,
         }
     }
 
+    /// Edit-checklist row for a curated Steam app the live scan missed
+    /// (uninstalled). Carries the last-known title so it can be untoggled;
+    /// Cross toggles membership here, never View in Steam.
+    pub fn steam_uninstalled(appid: u32, title: String, played_at_ms: Option<u64>) -> Self {
+        Self {
+            title,
+            subtitle: Some(StartSubtitle::Plain("Not installed".into())),
+            target: crate::games::steam::launch_uri(appid),
+            args: String::new(),
+            play_key: format!("steam:{appid}"),
+            icon: None,
+            icon_source: None,
+            backdrop_path: None,
+            edit: Some(EditRow::Steam {
+                appid,
+                in_catalog: true,
+            }),
+            skeleton: false,
+            update_required: false,
+            disabled: false,
+            view_in_steam: None,
+            played_at_ms,
+        }
+    }
     pub fn manual_edit(entry: &GameEntry) -> Option<Self> {
         let GameEntry::Manual {
             id,
@@ -327,6 +390,7 @@ impl StartRow {
             skeleton: false,
             update_required: false,
             disabled: false,
+            view_in_steam: None,
             played_at_ms: None,
         })
     }
@@ -502,17 +566,86 @@ pub(crate) struct RowHintState {
     pub(crate) press_anim: FacePressAnim,
 }
 
+/// Press-chase display state owned by one surface. `held` stays global
+/// input truth; each surface owns its chase, and hidden surfaces relax to
+/// idle every tick — so a surface switch starts clean with no transition
+/// resets: the new surface chases live input up from zero instead of
+/// inheriting the old surface's decaying flash.
+#[derive(Debug, Clone, Copy, Default)]
+struct OwnerPress {
+    anim: FacePressAnim,
+    triangle_armed: f32,
+    cross_armed: f32,
+}
+
+impl OwnerPress {
+    fn needs_frames(&self, held: FaceHeld, triangle_armed: bool, cross_armed: bool) -> bool {
+        const EPS: f32 = 0.001;
+        let press = [
+            (held.cross, self.anim.cross),
+            (held.circle, self.anim.circle),
+            (held.square, self.anim.square),
+            (held.triangle, self.anim.triangle),
+            (held.options, self.anim.options),
+            (held.create, self.anim.create),
+        ];
+        if press
+            .iter()
+            .any(|&(held, t)| (held && t < 1.0 - EPS) || (!held && t > EPS))
+        {
+            return true;
+        }
+        (triangle_armed && self.triangle_armed < 1.0 - EPS)
+            || (!triangle_armed && self.triangle_armed > EPS)
+            || (cross_armed && self.cross_armed < 1.0 - EPS)
+            || (!cross_armed && self.cross_armed > EPS)
+    }
+
+    fn tick(&mut self, held: FaceHeld, triangle_armed: bool, cross_armed: bool, dt: f32) {
+        approach_anim(&mut self.anim.cross, held.cross, dt);
+        approach_anim(&mut self.anim.circle, held.circle, dt);
+        approach_anim(&mut self.anim.square, held.square, dt);
+        approach_anim(&mut self.anim.triangle, held.triangle, dt);
+        approach_anim(&mut self.anim.options, held.options, dt);
+        approach_anim(&mut self.anim.create, held.create, dt);
+        approach_anim(&mut self.triangle_armed, triangle_armed, dt);
+        approach_anim(&mut self.cross_armed, cross_armed, dt);
+    }
+}
+
 /// Which chrome surface may light face / Options / reopen-chord press visuals.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HintPressOwner {
     Browse,
     Settings,
     ManualAdd,
     ReplaceConfirm,
+    SaveDiscard,
     Dock,
 }
 
 impl HintPressOwner {
+    const COUNT: usize = 6;
+    const ALL: [Self; Self::COUNT] = [
+        Self::Browse,
+        Self::Settings,
+        Self::ManualAdd,
+        Self::ReplaceConfirm,
+        Self::SaveDiscard,
+        Self::Dock,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Browse => 0,
+            Self::Settings => 1,
+            Self::ManualAdd => 2,
+            Self::ReplaceConfirm => 3,
+            Self::SaveDiscard => 4,
+            Self::Dock => 5,
+        }
+    }
+
     fn current(state: &State) -> Self {
         if state.settings.open || state.settings.anim.is_some() {
             Self::Settings
@@ -520,6 +653,8 @@ impl HintPressOwner {
             Self::ManualAdd
         } else if state.replace_confirm.is_some() {
             Self::ReplaceConfirm
+        } else if state.edit_confirm.is_some() {
+            Self::SaveDiscard
         } else if state.dock_expanded {
             Self::Dock
         } else {
@@ -543,13 +678,14 @@ impl HintPress {
         if HintPressOwner::current(state) != owner {
             return Self::default();
         }
+        let slot = &state.press_slots[owner.index()];
         Self {
             held: state.held,
-            press_anim: state.press_anim,
+            press_anim: slot.anim,
             triangle_progress: state.triangle_progress,
-            triangle_armed_t: state.triangle_armed_anim,
+            triangle_armed_t: slot.triangle_armed,
             cross_progress: state.cross_progress,
-            cross_armed_t: state.cross_armed_anim,
+            cross_armed_t: slot.cross_armed,
         }
     }
 }
@@ -589,6 +725,11 @@ pub struct ReplaceConfirm {
     pub next_title: String,
     pub next_index: usize,
 }
+
+/// Save-or-discard guard for the edit-mode games list. Presence alone is
+/// the modal (static text; dirty state recomputes from the draft live).
+#[derive(Debug, Clone)]
+pub struct EditConfirm;
 
 /// Draft for the edit-mode add/edit-manual modal.
 #[derive(Debug, Clone)]
@@ -783,7 +924,17 @@ pub struct State {
     /// waiting for the pad to disappear). Shows "Powering off" the same way.
     pub powering_off: Option<Serial>,
     pub replace_confirm: Option<ReplaceConfirm>,
+    /// In-flight dialog tweens (`None` = settled on content presence; see
+    /// [`overlay::Tween`]). Content stays mounted through exit tweens and is
+    /// cleared when they settle, so dismissals fade back to the stage.
+    replace_anim: Option<overlay::Tween>,
+    manual_anim: Option<overlay::Tween>,
+    edit_confirm_anim: Option<overlay::Tween>,
     pub manual_add: Option<ManualAddDraft>,
+    /// Save-or-discard guard for dirty edit exits (Circle/Create with
+    /// changes). Presence is the modal; Cross confirms the discard, Circle
+    /// backs out to edit mode.
+    pub edit_confirm: Option<EditConfirm>,
     /// Options settings panel (right drawer).
     pub settings: crate::ui::start::settings::SettingsPanel,
     pub triangle_progress: f32,
@@ -791,13 +942,9 @@ pub struct State {
     /// Face buttons currently held (pad OR keyboard) for action-hint press styling.
     pub held: FaceHeld,
 
-    /// Animated 0..=1 press amounts per face (drives pressed scale).
-    press_anim: FacePressAnim,
-
-    /// Animated 0..=1 toward white-ish hold arc once triangle hold is armed.
-    triangle_armed_anim: f32,
-    /// Animated 0..=1 toward white-ish hold arc once cross hold is armed.
-    cross_armed_anim: f32,
+    /// Per-surface press-chase state, keyed by [`HintPressOwner`]. Only the
+    /// live surface chases live input; hidden slots relax to idle.
+    press_slots: [OwnerPress; HintPressOwner::COUNT],
     hint_anim_tick: Option<Instant>,
     pub editing: bool,
     pub sort_mode: GamesSortMode,
@@ -1027,16 +1174,16 @@ impl Default for State {
             closing_target: None,
             powering_off: None,
             replace_confirm: None,
+            replace_anim: None,
+            manual_anim: None,
+            edit_confirm_anim: None,
             manual_add: None,
+            edit_confirm: None,
             settings: crate::ui::start::settings::SettingsPanel::default(),
             triangle_progress: 0.0,
             cross_progress: 0.0,
             held: FaceHeld::default(),
-
-            press_anim: FacePressAnim::default(),
-
-            triangle_armed_anim: 0.0,
-            cross_armed_anim: 0.0,
+            press_slots: [OwnerPress::default(); HintPressOwner::COUNT],
             hint_anim_tick: None,
             editing: false,
             sort_mode: GamesSortMode::default(),
@@ -1445,15 +1592,14 @@ impl State {
         self.position_bar_slide = None;
         self.snap_position_section();
         self.dock_expanded = false;
-        self.replace_confirm = None;
-        self.manual_add = None;
+        self.clear_replace();
+        self.clear_manual();
+        self.clear_edit_confirm();
         self.settings.reset();
         self.triangle_progress = 0.0;
         self.cross_progress = 0.0;
         self.held = FaceHeld::default();
-        self.press_anim = FacePressAnim::default();
-        self.triangle_armed_anim = 0.0;
-        self.cross_armed_anim = 0.0;
+        self.press_slots = [OwnerPress::default(); HintPressOwner::COUNT];
         self.hint_anim_tick = None;
         self.editing = false;
         self.edit_anchor_play_key = None;
@@ -1468,9 +1614,152 @@ impl State {
     pub fn overlay_blocking(&self) -> bool {
         self.replace_confirm.is_some()
             || self.manual_add.is_some()
+            || self.edit_confirm.is_some()
             || self.settings.open
             || self.settings.anim.is_some()
             || self.ambient_tuning_active()
+    }
+
+    /// Drop the replace dialog and its tween outright (replaced by another
+    /// surface, or torn down with the window).
+    pub fn clear_replace(&mut self) {
+        self.replace_confirm = None;
+        self.replace_anim = None;
+    }
+
+    /// Drop the manual form and its tween outright.
+    pub fn clear_manual(&mut self) {
+        self.manual_add = None;
+        self.manual_anim = None;
+    }
+
+    /// Drop the save/discard guard and its tween outright.
+    pub fn clear_edit_confirm(&mut self) {
+        self.edit_confirm = None;
+        self.edit_confirm_anim = None;
+    }
+
+    /// Take the dialog for commit (proceed path owns the content from here).
+    /// Returns `None` while an exit tween is running — the commit already
+    /// happened, the tween is display-only.
+    pub fn take_replace(&mut self) -> Option<ReplaceConfirm> {
+        if self.replace_anim.as_ref().is_some_and(|anim| anim.to < 0.5) {
+            return None;
+        }
+        self.replace_anim = None;
+        self.replace_confirm.take()
+    }
+
+    /// Eased dialog reveal 0..=1 (enter and exit tweens share the drawer /
+    /// dock `ease_out_cubic` chase; settled = content presence).
+    pub fn replace_progress(&self, now: Instant) -> f32 {
+        overlay::tween_progress(&self.replace_anim, self.replace_confirm.is_some(), now)
+    }
+
+    /// Eased manual-form reveal 0..=1 (same driver as the replace dialog).
+    pub fn manual_progress(&self, now: Instant) -> f32 {
+        overlay::tween_progress(&self.manual_anim, self.manual_add.is_some(), now)
+    }
+
+    /// Eased save-guard reveal 0..=1 (same driver as the other dialogs).
+    pub fn edit_confirm_progress(&self, now: Instant) -> f32 {
+        overlay::tween_progress(&self.edit_confirm_anim, self.edit_confirm.is_some(), now)
+    }
+
+    /// Arm the dialog enter tween with content. The tween arms BEFORE the
+    /// content lands so `from` reads the absent state (0) — arming after
+    /// would read presence (1) and the dialog would pop in with no tween.
+    /// No visual reset: the dialog owns a fresh chase slot (hidden slots
+    /// relax to idle every tick), so its hints start clean while routing
+    /// state (`held`, hold progress) carries over untouched.
+    pub fn arm_replace(&mut self, confirm: ReplaceConfirm, now: Instant) {
+        self.replace_anim = if self.reduced_motion {
+            None
+        } else {
+            overlay::tween_to(self.replace_progress(now), 1.0, now)
+        };
+        self.replace_confirm = Some(confirm);
+    }
+
+    /// Arm the manual-form enter tween with content (same ordering contract
+    /// as [`Self::arm_replace`]).
+    pub fn arm_manual(&mut self, draft: ManualAddDraft, now: Instant) {
+        self.manual_anim = if self.reduced_motion {
+            None
+        } else {
+            overlay::tween_to(self.manual_progress(now), 1.0, now)
+        };
+        self.manual_add = Some(draft);
+    }
+
+    /// Arm the save-guard enter tween (same ordering contract as
+    /// [`Self::arm_replace`]).
+    pub fn arm_edit_confirm(&mut self, now: Instant) {
+        self.edit_confirm_anim = if self.reduced_motion {
+            None
+        } else {
+            overlay::tween_to(self.edit_confirm_progress(now), 1.0, now)
+        };
+        self.edit_confirm = Some(EditConfirm);
+    }
+
+    /// Start the exit tween, keeping content mounted until it settles (see
+    /// `tick_anim`). Reduced motion (or an already-hidden dialog) clears
+    /// instantly. The draining card keeps its own slot, so the dismiss
+    /// press decays on the card — never on the surface underneath.
+    pub fn dismiss_replace(&mut self, now: Instant) {
+        if self.reduced_motion {
+            self.clear_replace();
+            return;
+        }
+        let from = self.replace_progress(now);
+        match overlay::tween_to(from, 0.0, now) {
+            Some(anim) => self.replace_anim = Some(anim),
+            None => self.clear_replace(),
+        }
+    }
+
+    /// Start the manual-form exit tween (same contract as
+    /// [`Self::dismiss_replace`]). Commits apply their data first and keep
+    /// the form mounted as display-only until the tween settles.
+    pub fn dismiss_manual(&mut self, now: Instant) {
+        if self.reduced_motion {
+            self.clear_manual();
+            return;
+        }
+        let from = self.manual_progress(now);
+        match overlay::tween_to(from, 0.0, now) {
+            Some(anim) => self.manual_anim = Some(anim),
+            None => self.clear_manual(),
+        }
+    }
+
+    /// True while the manual form is display-only drain (committed or
+    /// cancelled, tween running): commits must not apply twice.
+    pub fn manual_closing(&self) -> bool {
+        self.manual_anim.as_ref().is_some_and(|anim| anim.to < 0.5)
+    }
+
+    /// Start the save-guard exit tween (same contract as
+    /// [`Self::dismiss_replace`]): back to the checklist, draft kept.
+    pub fn dismiss_edit_confirm(&mut self, now: Instant) {
+        if self.reduced_motion {
+            self.clear_edit_confirm();
+            return;
+        }
+        let from = self.edit_confirm_progress(now);
+        match overlay::tween_to(from, 0.0, now) {
+            Some(anim) => self.edit_confirm_anim = Some(anim),
+            None => self.clear_edit_confirm(),
+        }
+    }
+
+    /// True while the save guard is display-only drain (choice taken, tween
+    /// running): the choice must not apply twice.
+    pub fn edit_confirm_closing(&self) -> bool {
+        self.edit_confirm_anim
+            .as_ref()
+            .is_some_and(|anim| anim.to < 0.5)
     }
 
     /// Toggle Options settings drawer.
@@ -1479,7 +1768,8 @@ impl State {
         let animate = !self.reduced_motion;
         if self.settings.request(open, now, animate) {
             if open {
-                self.replace_confirm = None;
+                self.clear_replace();
+                self.clear_edit_confirm();
                 self.cross_progress = 0.0;
                 // Fresh settings open resets the panel offset to 0 internally;
                 // keep the tracker mirror consistent.
@@ -1539,6 +1829,7 @@ impl State {
             || self.cross_progress > 0.0
             || self.replace_confirm.is_some()
             || self.manual_add.is_some()
+            || self.edit_confirm.is_some()
             || self.settings.open
             || self.settings.anim.is_some()
             || self.hint_anims_need_frames()
@@ -1574,6 +1865,7 @@ impl State {
             || self.cross_progress > 0.0
             || self.replace_confirm.is_some()
             || self.manual_add.is_some()
+            || self.edit_confirm.is_some()
             || self.settings.open
             || self.settings.anim.is_some()
             || self.hint_anims_need_frames()
@@ -1672,7 +1964,9 @@ impl State {
         self.dock_expanded || self.dock_anim.is_some()
     }
 
-    /// Request the controllers surface open/close. Exits edit mode when opening.
+    /// Request the controllers surface open/close. An edit draft survives
+    /// underneath (like the settings drawer): closing the dock returns to
+    /// the checklist untouched.
     pub fn request_dock(&mut self, expanded: bool, now: Instant) -> bool {
         let target = if expanded { 1.0 } else { 0.0 };
         if self
@@ -1691,24 +1985,18 @@ impl State {
             let snapped = self.dock_anim.is_some();
             let changed = self.dock_expanded != expanded;
             self.dock_expanded = expanded;
-            if expanded {
-                self.editing = false;
-                self.edit_anchor_play_key = None;
-            }
-            self.replace_confirm = None;
-            self.manual_add = None;
+            self.clear_replace();
+            self.clear_manual();
+            self.clear_edit_confirm();
             self.cross_progress = 0.0;
             self.dock_anim = None;
             return changed || snapped;
         }
         let from = self.dock_progress(now);
         self.dock_expanded = expanded;
-        if expanded {
-            self.editing = false;
-            self.edit_anchor_play_key = None;
-        }
-        self.replace_confirm = None;
-        self.manual_add = None;
+        self.clear_replace();
+        self.clear_manual();
+        self.clear_edit_confirm();
         self.cross_progress = 0.0;
         if (from - target).abs() < 0.01 {
             self.dock_anim = None;
@@ -3200,31 +3488,24 @@ impl State {
     }
 
     fn hint_anims_need_frames(&self) -> bool {
-        const EPS: f32 = 0.001;
-        let press = [
-            (self.held.cross, self.press_anim.cross),
-            (self.held.circle, self.press_anim.circle),
-            (self.held.square, self.press_anim.square),
-            (self.held.triangle, self.press_anim.triangle),
-            (self.held.options, self.press_anim.options),
-            (self.held.create, self.press_anim.create),
-        ];
-        if press
-            .iter()
-            .any(|&(held, t)| (held && t < 1.0 - EPS) || (!held && t > EPS))
-        {
-            return true;
-        }
+        let current = HintPressOwner::current(self);
         let triangle_armed = self.triangle_progress >= 1.0;
         let cross_armed = self.cross_progress >= 1.0;
-        (triangle_armed && self.triangle_armed_anim < 1.0 - EPS)
-            || (!triangle_armed && self.triangle_armed_anim > EPS)
-            || (cross_armed && self.cross_armed_anim < 1.0 - EPS)
-            || (!cross_armed && self.cross_armed_anim > EPS)
+        HintPressOwner::ALL.iter().any(|&owner| {
+            let slot = &self.press_slots[owner.index()];
+            if owner == current {
+                slot.needs_frames(self.held, triangle_armed, cross_armed)
+            } else {
+                // Hidden slots relax to idle; they need frames until settled.
+                slot.needs_frames(FaceHeld::default(), false, false)
+            }
+        })
     }
 
     /// Advance pressed-scale and armed-color hint animations (~100ms).
     /// Reduced motion snaps press feedback instead of gliding (end states identical).
+    /// Only the live surface chases live input; hidden slots relax to idle,
+    /// so no surface ever inherits another's decaying press visuals.
     pub fn tick_hint_anims(&mut self, now: Instant) {
         // Full-step dt snaps every approach below to its target in one tick.
         let dt = if self.reduced_motion {
@@ -3239,18 +3520,18 @@ impl State {
         if dt <= 0.0 {
             return;
         }
-        approach_anim(&mut self.press_anim.cross, self.held.cross, dt);
-        approach_anim(&mut self.press_anim.circle, self.held.circle, dt);
-        approach_anim(&mut self.press_anim.square, self.held.square, dt);
-        approach_anim(&mut self.press_anim.triangle, self.held.triangle, dt);
-        approach_anim(&mut self.press_anim.options, self.held.options, dt);
-        approach_anim(&mut self.press_anim.create, self.held.create, dt);
-        approach_anim(
-            &mut self.triangle_armed_anim,
-            self.triangle_progress >= 1.0,
-            dt,
-        );
-        approach_anim(&mut self.cross_armed_anim, self.cross_progress >= 1.0, dt);
+        let current = HintPressOwner::current(self);
+        let held = self.held;
+        let triangle_armed = self.triangle_progress >= 1.0;
+        let cross_armed = self.cross_progress >= 1.0;
+        for owner in HintPressOwner::ALL {
+            let slot = &mut self.press_slots[owner.index()];
+            if owner == current {
+                slot.tick(held, triangle_armed, cross_armed, dt);
+            } else {
+                slot.tick(FaceHeld::default(), false, false, dt);
+            }
+        }
     }
 
     pub fn tick_anim(&mut self, now: Instant) {
@@ -3264,6 +3545,17 @@ impl State {
                 self.dock_expanded = anim.to >= 0.5;
                 self.dock_anim = None;
             }
+        }
+        // Dialog exit tweens: content stays mounted through the fade so
+        // dismissals settle back onto the stage instead of blinking out.
+        if overlay::tween_settle(&mut self.replace_anim, now) {
+            self.replace_confirm = None;
+        }
+        if overlay::tween_settle(&mut self.manual_anim, now) {
+            self.manual_add = None;
+        }
+        if overlay::tween_settle(&mut self.edit_confirm_anim, now) {
+            self.edit_confirm = None;
         }
         let _ = self.settings.tick(now);
         if let Some(anim) = self.strip_anim.as_ref() {
@@ -3596,7 +3888,7 @@ pub(crate) fn scan_status_chip<'a>(
         (ChromeStatusKind::PreparingArt, true) => "Artwork ready",
         (ChromeStatusKind::PreparingArt, false) => "Preparing artwork…",
         (ChromeStatusKind::SteamLibrary, true) => "Steam library synced",
-        (ChromeStatusKind::SteamLibrary, false) => "Scanning Steam library…",
+        (ChromeStatusKind::SteamLibrary, false) => "Syncing Steam library…",
     };
     row![
         icon,
@@ -4045,6 +4337,7 @@ mod tests {
             skeleton: false,
             update_required: false,
             disabled: false,
+            view_in_steam: None,
             played_at_ms: None,
         }
     }
@@ -4308,7 +4601,7 @@ mod tests {
     fn from_entry_skeleton_while_scan_pending() {
         let entry = GameEntry::Steam { appid: 1371980 };
         let empty = HashMap::new();
-        let row = StartRow::from_entry(&entry, &empty, true);
+        let row = StartRow::from_entry(&entry, &empty, true, None, false);
         assert!(row.skeleton);
         assert!(row.title.is_empty());
         assert!(row.icon.is_none());
@@ -4320,16 +4613,52 @@ mod tests {
     fn from_entry_appid_fallback_after_scan() {
         let entry = GameEntry::Steam { appid: 1371980 };
         let empty = HashMap::new();
-        let row = StartRow::from_entry(&entry, &empty, false);
+        let row = StartRow::from_entry(&entry, &empty, false, None, false);
         assert!(!row.skeleton);
         assert_eq!(row.title, "Steam 1371980");
         assert!(row.icon.is_none());
         assert_eq!(row.play_key, "steam:1371980");
         assert!(matches!(
             row.subtitle.as_ref(),
-            Some(StartSubtitle::Plain(uri)) if uri == "steam://rungameid/1371980"
+            Some(StartSubtitle::Plain(label)) if label == "Steam"
         ));
         assert!(!row.target.is_empty());
+        // Unknown scan: no proven absence, so the row stays launchable.
+        assert_eq!(row.view_in_steam, None);
+        assert_eq!(row.launch_hint_label(), "Launch");
+    }
+
+    #[test]
+    fn from_entry_prefers_remembered_name_and_explains_missing() {
+        let entry = GameEntry::Steam { appid: 1314000 };
+        let empty = HashMap::new();
+        // Proven uninstalled: last-known title, "Not installed" subtitle,
+        // Cross routes to View in Steam instead of launching.
+        let row = StartRow::from_entry(
+            &entry,
+            &empty,
+            false,
+            Some("Achilles: Legends Untold"),
+            true,
+        );
+        assert!(!row.skeleton);
+        assert_eq!(row.title, "Achilles: Legends Untold");
+        assert!(matches!(
+            row.subtitle.as_ref(),
+            Some(StartSubtitle::Plain(label)) if label == "Not installed"
+        ));
+        assert_eq!(row.target, "steam://rungameid/1314000");
+        assert_eq!(row.view_in_steam, Some(1314000));
+        assert_eq!(row.launch_hint_label(), "View in Steam");
+        // Blank remembered names never blank the title.
+        let blank = StartRow::from_entry(&entry, &empty, false, Some("   "), true);
+        assert_eq!(blank.title, "Steam 1314000");
+        assert_eq!(blank.view_in_steam, Some(1314000));
+        // Remembered name without proven absence: title only, still launches.
+        let unsure = StartRow::from_entry(&entry, &empty, false, Some("Achilles"), false);
+        assert_eq!(unsure.title, "Achilles");
+        assert_eq!(unsure.view_in_steam, None);
+        assert_eq!(unsure.launch_hint_label(), "Launch");
     }
 
     #[test]
@@ -4349,7 +4678,7 @@ mod tests {
                 update_required: true,
             },
         );
-        let row = StartRow::from_entry(&entry, &map, true);
+        let row = StartRow::from_entry(&entry, &map, true, None, false);
         assert!(!row.skeleton);
         assert_eq!(row.title, "Path of Exile");
         assert!(
@@ -4360,6 +4689,26 @@ mod tests {
         assert!(row.update_required);
         assert_eq!(row.launch_hint_label(), "Update & launch");
         assert!(row.icon.is_none());
+    }
+
+    #[test]
+    fn steam_uninstalled_row_is_toggleable_not_viewable() {
+        let row = StartRow::steam_uninstalled(1314000, "Achilles: Legends Untold".into(), Some(99));
+        assert_eq!(row.title, "Achilles: Legends Untold");
+        assert_eq!(row.play_key, "steam:1314000");
+        assert_eq!(row.target, "steam://rungameid/1314000");
+        assert!(matches!(
+            row.edit,
+            Some(EditRow::Steam {
+                appid: 1314000,
+                in_catalog: true
+            })
+        ));
+        // Edit mode owns Cross (toggle): never View in Steam, never disabled.
+        assert_eq!(row.view_in_steam, None);
+        assert!(!row.disabled);
+        assert!(!row.skeleton);
+        assert_eq!(row.played_at_ms, Some(99));
     }
 
     #[test]
@@ -4392,6 +4741,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 },
                 StartRow {
@@ -4407,6 +4757,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 },
                 StartRow {
@@ -4422,6 +4773,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 },
             ],
@@ -4467,6 +4819,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -4511,6 +4864,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -4539,6 +4893,7 @@ mod tests {
                 skeleton: false,
                 update_required: false,
                 disabled: false,
+                view_in_steam: None,
                 played_at_ms: None,
             })
             .collect()
@@ -4824,6 +5179,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -4838,7 +5194,73 @@ mod tests {
         // Press feedback snaps to held instead of gliding over ~100 ms.
         state.held.cross = true;
         state.tick_hint_anims(now);
-        assert!((state.press_anim.cross - 1.0).abs() < 1e-6);
+        let press = HintPress::for_owner(&state, HintPressOwner::Browse);
+        assert!((press.press_anim.cross - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn press_chase_is_per_surface_with_no_flash_on_switch() {
+        // Reduced motion snaps chases so the test asserts slot ownership,
+        // not glide timing.
+        let now = Instant::now();
+        let mut state = State {
+            reduced_motion: true,
+            ..Default::default()
+        };
+        // Hold Cross on Browse: the Browse slot lights.
+        state.held.cross = true;
+        state.tick_hint_anims(now);
+        let browse = HintPress::for_owner(&state, HintPressOwner::Browse);
+        assert!((browse.press_anim.cross - 1.0).abs() < 1e-6);
+        // Arm the dialog mid-hold (finger never lifts): the modal slot
+        // starts idle — the old surface's chase must not leak across.
+        state.arm_replace(
+            ReplaceConfirm {
+                running_title: "A".to_string(),
+                next_title: "B".to_string(),
+                next_index: 0,
+            },
+            now,
+        );
+        let modal = HintPress::for_owner(&state, HintPressOwner::ReplaceConfirm);
+        assert!((modal.press_anim.cross - 0.0).abs() < 1e-6);
+        // The hidden Browse surface is gated idle even mid-hold.
+        let browse = HintPress::for_owner(&state, HintPressOwner::Browse);
+        assert!((browse.press_anim.cross - 0.0).abs() < 1e-6);
+        // Next tick: the modal chases live held up from zero while Browse
+        // relaxes back to idle.
+        state.tick_hint_anims(now);
+        let modal = HintPress::for_owner(&state, HintPressOwner::ReplaceConfirm);
+        assert!((modal.press_anim.cross - 1.0).abs() < 1e-6);
+        // Release: every slot settles idle and frames stop.
+        state.held = FaceHeld::default();
+        state.tick_hint_anims(now);
+        let modal = HintPress::for_owner(&state, HintPressOwner::ReplaceConfirm);
+        assert!((modal.press_anim.cross - 0.0).abs() < 1e-6);
+        assert!(!state.hint_anims_need_frames());
+    }
+
+    #[test]
+    fn save_guard_owns_hints_over_dock_and_browse() {
+        let mut state = State {
+            dock_expanded: true,
+            ..Default::default()
+        };
+        state.edit_confirm = Some(EditConfirm);
+        assert_eq!(HintPressOwner::current(&state), HintPressOwner::SaveDiscard);
+        // Settings and the other dialogs still outrank it.
+        state.settings.open = true;
+        assert_eq!(HintPressOwner::current(&state), HintPressOwner::Settings);
+        state.settings.open = false;
+        state.manual_add = Some(ManualAddDraft {
+            edit_id: None,
+            target: String::new(),
+            title: String::new(),
+            args: String::new(),
+            icon_path: None,
+            shell_icon: None,
+        });
+        assert_eq!(HintPressOwner::current(&state), HintPressOwner::ManualAdd);
     }
 
     #[test]
@@ -4871,6 +5293,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -4964,6 +5387,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -4993,6 +5417,7 @@ mod tests {
             skeleton: false,
             update_required: false,
             disabled,
+            view_in_steam: None,
             played_at_ms,
         }
     }
@@ -5038,6 +5463,7 @@ mod tests {
             skeleton: false,
             update_required: false,
             disabled: false,
+            view_in_steam: None,
             played_at_ms: None,
         }
     }
@@ -5413,6 +5839,7 @@ mod tests {
                 skeleton: false,
                 update_required: false,
                 disabled: false,
+                view_in_steam: None,
                 played_at_ms: None,
             }],
             game_selected: 0,
@@ -5548,6 +5975,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 }],
                 game_selected: 0,
@@ -5595,6 +6023,7 @@ mod tests {
                 skeleton: true,
                 update_required: false,
                 disabled: false,
+                view_in_steam: None,
                 played_at_ms: None,
             }],
             game_selected: 0,
@@ -5645,6 +6074,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 }],
                 game_selected: 0,
@@ -5682,6 +6112,7 @@ mod tests {
                 skeleton: true,
                 update_required: false,
                 disabled: false,
+                view_in_steam: None,
                 played_at_ms: None,
             }],
             game_selected: 0,
@@ -5851,6 +6282,7 @@ mod tests {
                         skeleton: false,
                         update_required: false,
                         disabled: false,
+                        view_in_steam: None,
                         played_at_ms: None,
                     },
                     StartRow {
@@ -5866,6 +6298,7 @@ mod tests {
                         skeleton: false,
                         update_required: false,
                         disabled: false,
+                        view_in_steam: None,
                         played_at_ms: None,
                     },
                 ],
@@ -5936,6 +6369,7 @@ mod tests {
                         skeleton: false,
                         update_required: false,
                         disabled: false,
+                        view_in_steam: None,
                         played_at_ms: None,
                     },
                     StartRow {
@@ -5951,6 +6385,7 @@ mod tests {
                         skeleton: false,
                         update_required: false,
                         disabled: false,
+                        view_in_steam: None,
                         played_at_ms: None,
                     },
                 ],
@@ -6009,6 +6444,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -6042,6 +6478,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -6091,6 +6528,7 @@ mod tests {
                 skeleton: false,
                 update_required: false,
                 disabled: false,
+                view_in_steam: None,
                 played_at_ms: None,
             };
             assert!(row.list_icon_live().is_none());

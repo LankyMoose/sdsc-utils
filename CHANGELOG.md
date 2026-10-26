@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-10-27
+
+### Added
+
+- Uninstalled Steam games stay on the Start screen with their real titles (remembered from the last library scan) instead of vanishing or showing a bare `Steam {appid}`; a **Show uninstalled games** toggle (default on) lives in the Start settings drawer and Configure → Start screen.
+- **View in Steam** action for Steam rows (opens the game's store page).
+- Dirty edit guard: pressing Circle with unsaved games-list changes asks **Discard changes?** — Cross (Discard) throws the draft away and leaves edit mode, Circle (Cancel) keeps editing. Clean exits still cancel silently.
+
+### Changed
+
+- Steam library auto-resyncs when installs change (registry watcher) and re-checks whenever Start opens; manual Sync stays.
+- Launching a second game while another runs asks in a compact confirm dialog over the live stage.
+- The controllers panel and the settings drawer both open over a dirty edit draft without discarding it; Circle collapses the dock before exiting edit mode.
+
+### Fixed
+
+- Start/Options and Create presses no longer bypass the discard-confirm modal.
+- Pressed hint glyphs shrink with a closing dialog instead of lingering at full size (dialog tweens now compose with glyph press states).
+
 ## [1.7.0] - 2026-10-26
 
 ### Added
@@ -485,6 +504,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded DualSense silhouette for the tray and `.exe` icon.
 - Windows CI and tagged release workflow.
 
+[1.7.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.5.2...v1.6.0

@@ -4,6 +4,7 @@ use crate::controller::dualsense::lightbar;
 use crate::persist::prefs::ImmersiveLayout;
 use crate::ui::color::BatterySpectrum;
 use crate::ui::percent_ring;
+use crate::ui::scale::Scale;
 use crate::ui::shader::{AmbientProgram, VignetteProgram};
 use crate::ui::start::chrome::{
     empty_games_browse_prompt, face_cycle_toggle, footer_hint, immersive_dock_row_hints,
@@ -11,8 +12,9 @@ use crate::ui::start::chrome::{
 };
 use crate::ui::start::face::FaceButton;
 use crate::ui::start::mode::{TransitionPhase, dock_panel_width, dock_stage_dim, dock_stage_scale};
+use crate::ui::start::overlay;
 use crate::ui::start::row::{game_subtitle_block, update_required_badge};
-use crate::ui::start::settings::{manual_add_view, replace_confirm_view};
+use crate::ui::start::settings::{edit_confirm_view, manual_add_view, replace_confirm_view};
 use crate::ui::start::translate::backdrop_art;
 use crate::ui::start::view::{
     HintPress, HintPressOwner, LaunchStatus, StartControllerRow, StartMessage, StartRow, State,
@@ -36,7 +38,12 @@ const BAR_ABOVE_FOOTER: f32 = 64.0;
 /// drop on top of this pad, so the visual top gap runs deeper while the rail
 /// keeps its minimum gap below the titles.
 const STRIP_TOP_PAD: f32 = vstrip::H_TOP_PAD;
-const MODAL_W: f32 = crate::ui::start::view::WIDTH;
+/// Form-takeover card height cap (shared builder; confirms size to content).
+const MODAL_CARD_MAX_H: f32 = 520.0;
+/// Compact replace-confirm dialog width.
+const REPLACE_CONFIRM_W: f32 = 440.0;
+/// Save-guard dialog width (same compact card as the replace confirm).
+const EDIT_CONFIRM_W: f32 = 440.0;
 
 /// Peek ring size bounds: rings grow as the dock expands.
 const DOCK_RING_INSET: f32 = 6.0;
@@ -85,23 +92,20 @@ pub fn view<'a>(
         .into();
     }
 
-    let body: Element<'_, StartMessage> = if state.manual_add.is_some() {
-        modal_card(manual_add_view(state))
-    } else if state.replace_confirm.is_some() {
-        modal_card(replace_confirm_view(state))
-    } else {
-        stage_with_dock(
-            state,
-            now,
-            dock_p,
-            flat,
-            stage_h,
-            stage_w,
-            immersive_layout,
-            #[cfg(debug_assertions)]
-            debug_bounds,
-        )
-    };
+    // The stage always stays mounted: both dialogs (manual form, replace
+    // confirm) are wash + card overlays layered further below, sharing the
+    // overlay builder, so the games strip stays visible behind them.
+    let body: Element<'_, StartMessage> = stage_with_dock(
+        state,
+        now,
+        dock_p,
+        flat,
+        stage_h,
+        stage_w,
+        immersive_layout,
+        #[cfg(debug_assertions)]
+        debug_bounds,
+    );
     #[cfg(debug_assertions)]
     let body = crate::ui::debug_bounds::wrap(body, debug_bounds);
 
@@ -114,7 +118,10 @@ pub fn view<'a>(
         })
         .style(theme::immersive_footer_pill);
 
-    // Full-bleed stage + dock; footer hints overlay the bottom.
+    // Full-bleed stage + dock; footer hints overlay the bottom. Under the
+    // replace-confirm modal the island keeps its (inert) browse hints —
+    // `footer_hint` has no modal arm, and ownership forces idle press
+    // visuals — while the card owns the only live Proceed/Cancel row.
     #[cfg(debug_assertions)]
     let diag: Element<'_, StartMessage> = crate::ui::start::chrome::diag_report_bar();
     #[cfg(not(debug_assertions))]
@@ -214,13 +221,15 @@ pub fn view<'a>(
 
     let mut layers: Vec<Element<'_, StartMessage>> = vec![base.into()];
     // Surface-open dim + dock below the drawer: the drawer and its scrim
-    // stay on top of the island. Always pushed (empty placeholders under
-    // modals) so the drawer never shifts tree position and loses scroll.
+    // stay on top of the island. Always pushed so the drawer never shifts
+    // tree position and loses scroll.
     // While the drawer travels in over an open dock, the island slides off
     // the right edge on the drawer's eased travel clock (`Float` offsets
     // paint without touching layout, so nothing reflows; user input keeps
     // the two exclusive, so this only runs on the restore path).
-    if state.manual_add.is_none() && state.replace_confirm.is_none() {
+    // Dialogs keep the stage + dock mounted behind their dims so they read
+    // as overlays, not screen swaps.
+    {
         let dock_dim = dock_stage_dim(dock_p);
         if dock_dim > 0.01 {
             layers.push(
@@ -250,19 +259,63 @@ pub fn view<'a>(
             .translate(move |_, _| Vector::new(settings_p * (DOCK_MAX_W + EDGE_PAD), 0.0))
             .into(),
         );
-    } else {
-        layers.push(
-            space()
-                .width(Length::Fixed(0.0))
-                .height(Length::Fixed(0.0))
-                .into(),
-        );
-        layers.push(
-            space()
-                .width(Length::Fixed(0.0))
-                .height(Length::Fixed(0.0))
-                .into(),
-        );
+    }
+    // Dialog overlays (manual form, replace confirm, save guard on top):
+    // shared wash + card over the live stage, with a wash-fade + centered
+    // 0→1 scale enter/exit tween. Layout always reserves the full-size card
+    // (see `ui::scale`), so nothing reflows; the wrapper never changes
+    // shape mid-tween (no remount flash). Above dock/chrome, below
+    // drawer/tuning/idle/ceremony. Clicks never reach the dimmed stage:
+    // replace/manual washes dismiss (same as Cancel), the save-guard wash
+    // and a second Cancel back out to edit — only Cross confirms the
+    // discard. Each card absorbs.
+    if state.manual_add.is_some() {
+        let mp = state.manual_progress(now).clamp(0.0, 1.0);
+        layers.push(overlay::wash(overlay::reveal(mp), StartMessage::Close));
+        layers.push(overlay::centered(Scale::new(
+            overlay::click_shield(
+                overlay::dialog_card(
+                    manual_add_view(state),
+                    Length::Shrink,
+                    Some(MODAL_CARD_MAX_H),
+                ),
+                StartMessage::Noop,
+            ),
+            mp,
+        )));
+    }
+    if state.replace_confirm.is_some() {
+        let rp = state.replace_progress(now).clamp(0.0, 1.0);
+        layers.push(overlay::wash(overlay::reveal(rp), StartMessage::Close));
+        layers.push(overlay::centered(Scale::new(
+            overlay::click_shield(
+                overlay::dialog_card(
+                    replace_confirm_view(state),
+                    Length::Fixed(REPLACE_CONFIRM_W),
+                    None,
+                ),
+                StartMessage::Noop,
+            ),
+            rp,
+        )));
+    }
+    if state.edit_confirm.is_some() {
+        let ep = state.edit_confirm_progress(now).clamp(0.0, 1.0);
+        layers.push(overlay::wash(
+            overlay::reveal(ep),
+            StartMessage::DismissEditConfirm,
+        ));
+        layers.push(overlay::centered(Scale::new(
+            overlay::click_shield(
+                overlay::dialog_card(
+                    edit_confirm_view(state),
+                    Length::Fixed(EDIT_CONFIRM_W),
+                    None,
+                ),
+                StartMessage::Noop,
+            ),
+            ep,
+        )));
     }
     // Dock slide-out: while the drawer travels in over an open dock, slide
     // the island off the right edge on the drawer's eased travel clock.
@@ -489,19 +542,6 @@ fn dock_overlay<'a>(
     let dock_overlay: Element<'_, StartMessage> =
         crate::ui::debug_bounds::wrap(dock_overlay, debug_bounds);
     dock_overlay
-}
-
-fn modal_card(inner: Element<'_, StartMessage>) -> Element<'_, StartMessage> {
-    container(
-        container(theme::framed(inner))
-            .width(Length::Fixed(MODAL_W))
-            .max_height(520.0),
-    )
-    .width(Fill)
-    .height(Fill)
-    .center_x(Fill)
-    .center_y(Fill)
-    .into()
 }
 
 fn games_stage(

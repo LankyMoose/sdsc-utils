@@ -89,6 +89,9 @@ pub struct StartSettingsSnapshot {
     pub perf_vsync_boot: bool,
     /// Reload queued (row disabled, spinner shown until exit).
     pub perf_reload_queued: bool,
+    pub show_uninstalled_games: bool,
+    /// Library scan in flight (sync row shows "Syncing…", disabled).
+    pub steam_syncing: bool,
 }
 
 /// Focusable rows in the Start settings list (dynamic when sounds/haptics off).
@@ -113,6 +116,8 @@ pub enum SettingsRow {
     PerfVsync,
     /// Reload action, visible only while renderer prefs differ from boot.
     PerfReload,
+    ShowUninstalled,
+    SyncSteam,
     /// Debug-only entry opening the in-immersive ambience tuning panel.
     #[cfg(debug_assertions)]
     TuneAmbience,
@@ -125,9 +130,9 @@ impl SettingsRow {
     /// To add a row: append/reorder here, extend `visible()` + `section_before()`
     /// / `gap_before()` + the `panel_view` build match + `kind()`/dispatch arms.
     #[cfg(debug_assertions)]
-    pub const ROW_COUNT: usize = 19;
+    pub const ROW_COUNT: usize = 21;
     #[cfg(not(debug_assertions))]
-    pub const ROW_COUNT: usize = 18;
+    pub const ROW_COUNT: usize = 20;
     pub const ALL: [Self; Self::ROW_COUNT] = [
         Self::AutoOpen,
         Self::SelectionPersist,
@@ -147,6 +152,8 @@ impl SettingsRow {
         Self::PerfAntialiasing,
         Self::PerfVsync,
         Self::PerfReload,
+        Self::ShowUninstalled,
+        Self::SyncSteam,
         #[cfg(debug_assertions)]
         Self::TuneAmbience,
     ];
@@ -168,7 +175,9 @@ impl SettingsRow {
             | Self::Haptics
             | Self::PerfThrottle
             | Self::PerfAntialiasing
-            | Self::PerfVsync => true,
+            | Self::PerfVsync
+            | Self::ShowUninstalled
+            | Self::SyncSteam => true,
             // Hidden feature: selection persistence is always off (no UI).
             // The row, its logic, and the mode gate stay wired underneath.
             Self::SelectionPersist => false,
@@ -213,14 +222,15 @@ impl SettingsRow {
     /// the row so inserting/reordering rows carries its section along.
     ///
     /// Selection restores on open, so it gets its own section immediately
-    /// after Opening (Opening-adjacent, before Immersive) rather than joining
+    /// after Opening (Opening-adjacent, before Display) rather than joining
     /// either neighbor.
     fn section_before(self) -> Option<&'static str> {
         match self {
             Self::AutoOpen => Some("Opening"),
             Self::SelectionPersist => Some("Selection"),
-            Self::Clock => Some("Immersive"),
+            Self::Clock => Some("Display"),
             Self::Sounds => Some("Feedback"),
+            Self::ShowUninstalled => Some("Steam"),
             Self::PerfThrottle => Some("Performance"),
             #[cfg(debug_assertions)]
             Self::TuneAmbience => Some("Ambience"),
@@ -236,15 +246,17 @@ impl SettingsRow {
             | Self::HapticsStrength
             | Self::PerfAntialiasing
             | Self::PerfVsync
-            | Self::PerfReload => None,
+            | Self::PerfReload
+            | Self::SyncSteam => None,
         }
     }
 
     /// Whether a section spacer precedes this row's section (i.e. this row
-    /// opens the Immersive / Feedback section after the previous block).
+    /// opens the Display / Feedback section after the previous block).
     fn gap_before(self) -> bool {
         match self {
             Self::SelectionPersist | Self::Clock | Self::Sounds | Self::PerfThrottle => true,
+            Self::ShowUninstalled => true,
             #[cfg(debug_assertions)]
             Self::TuneAmbience => true,
             Self::AutoOpen
@@ -260,7 +272,8 @@ impl SettingsRow {
             | Self::HapticsStrength
             | Self::PerfAntialiasing
             | Self::PerfVsync
-            | Self::PerfReload => false,
+            | Self::PerfReload
+            | Self::SyncSteam => false,
         }
     }
 
@@ -294,10 +307,11 @@ impl SettingsRow {
             | Self::Clock
             | Self::Sounds
             | Self::Haptics
+            | Self::ShowUninstalled
             | Self::PerfThrottle
             | Self::PerfAntialiasing
             | Self::PerfVsync => RowKind::Toggle,
-            Self::PerfReload => RowKind::Action,
+            Self::PerfReload | Self::SyncSteam => RowKind::Action,
             #[cfg(debug_assertions)]
             Self::TuneAmbience => RowKind::Action,
             Self::IdleSecs
@@ -315,6 +329,7 @@ impl SettingsRow {
             Self::Clock => snapshot.clock_enabled,
             Self::Sounds => snapshot.sounds_enabled,
             Self::Haptics => snapshot.haptics_enabled,
+            Self::ShowUninstalled => snapshot.show_uninstalled_games,
             Self::PerfThrottle => snapshot.perf_throttle_immersive,
             Self::PerfAntialiasing => snapshot.perf_antialiasing,
             Self::PerfVsync => snapshot.perf_vsync,
@@ -329,6 +344,7 @@ impl SettingsRow {
             Self::Clock => StartMessage::SetClock(on),
             Self::Sounds => StartMessage::SetSounds(on),
             Self::Haptics => StartMessage::SetHaptics(on),
+            Self::ShowUninstalled => StartMessage::SetShowUninstalledGames(on),
             Self::PerfThrottle => StartMessage::SetPerfThrottle(on),
             Self::PerfAntialiasing => StartMessage::SetPerfAntialiasing(on),
             Self::PerfVsync => StartMessage::SetPerfVsync(on),
@@ -560,7 +576,9 @@ pub fn settings_nav_cue(row: SettingsRow) -> SettingsCue {
         | SettingsRow::PerfThrottle
         | SettingsRow::PerfAntialiasing
         | SettingsRow::PerfVsync
-        | SettingsRow::PerfReload => SettingsCue::Full,
+        | SettingsRow::PerfReload
+        | SettingsRow::ShowUninstalled
+        | SettingsRow::SyncSteam => SettingsCue::Full,
         #[cfg(debug_assertions)]
         SettingsRow::TuneAmbience => SettingsCue::Full,
     }
@@ -826,8 +844,12 @@ pub fn confirm_message(row: SettingsRow, snapshot: &StartSettingsSnapshot) -> Op
         // Selectors open the dropdown; picking happens from the menu highlight.
         RowKind::Selector => Some(row.open_menu()),
         RowKind::Toggle => Some(row.set_toggle(!row.toggle_value(snapshot))),
-        // The reload action applies pending renderer prefs immediately.
-        RowKind::Action => Some(StartMessage::ReloadUi),
+        // Actions run their own message on Confirm.
+        RowKind::Action => Some(match row {
+            SettingsRow::PerfReload => StartMessage::ReloadUi,
+            SettingsRow::SyncSteam => StartMessage::SyncSteamLibrary,
+            row => unreachable!("{row:?} is not an action row"),
+        }),
         // Sliders are mouse-driven; Cross does nothing.
         RowKind::Slider => None,
     }
@@ -923,6 +945,10 @@ fn row_helper(row: SettingsRow) -> Option<&'static str> {
         SettingsRow::PerfThrottle => {
             Some("Let the fullscreen Start screen rest when nothing is moving")
         }
+        SettingsRow::ShowUninstalled => {
+            Some("Keep owned-but-uninstalled games listed with a View in Steam action")
+        }
+        SettingsRow::SyncSteam => None,
         SettingsRow::PerfAntialiasing => Some("Smoother edges"),
         SettingsRow::PerfVsync => Some("Sync to display; off may tear"),
         SettingsRow::PerfReload => None,
@@ -1404,9 +1430,27 @@ pub fn panel_view<'a>(
             ),
             SettingsRow::PerfReload => action_row(
                 "Restart app to apply changes",
+                "Restarting…",
                 focused,
                 ty,
                 snapshot.perf_reload_queued,
+                StartMessage::ReloadUi,
+            ),
+            SettingsRow::ShowUninstalled => toggle_row(
+                "Show uninstalled games",
+                SettingsRow::ShowUninstalled.helper(),
+                SettingsRow::ShowUninstalled.toggle_value(snapshot),
+                focused,
+                ty,
+                |on| SettingsRow::ShowUninstalled.set_toggle(on),
+            ),
+            SettingsRow::SyncSteam => action_row(
+                "Sync Steam library",
+                "Syncing…",
+                focused,
+                ty,
+                snapshot.steam_syncing,
+                StartMessage::SyncSteamLibrary,
             ),
             #[cfg(debug_assertions)]
             SettingsRow::TuneAmbience => container(
@@ -1626,22 +1670,24 @@ fn toggle_row(
     .into()
 }
 
-/// Full-width reload action. Row and button heights are fixed
+/// Full-width one-shot action. Row and button heights are fixed
 /// ([`action_row_h`]) so the shared bounds geometry agrees with the built
 /// widget by construction. Content is left-aligned like every other row, and
-/// the idle label and the queued ("Restarting…" + spinner) state share the
+/// the idle label and the queued (busy label + spinner) state share the
 /// same box, so swapping states never moves layout. Disabled once queued so
-/// a second press cannot queue another restart.
+/// a second press cannot queue another run.
 fn action_row(
     label: &'static str,
+    busy_label: &'static str,
     focused: bool,
     ty: TypeScale,
     queued: bool,
+    message: StartMessage,
 ) -> Element<'static, StartMessage> {
     let content: Element<'_, StartMessage> = if queued {
         container(
             row![
-                text("Restarting…").size(ty.body),
+                text(busy_label).size(ty.body),
                 crate::ui::start::view::scan_spinner(14.0, Instant::now(), 1.0),
             ]
             .spacing(8)
@@ -1662,7 +1708,7 @@ fn action_row(
             .width(Fill)
             .height(Length::Fixed(ACTION_BUTTON_H))
             .padding([4, 12])
-            .on_press_maybe((!queued).then_some(StartMessage::ReloadUi))
+            .on_press_maybe((!queued).then_some(message))
             .style(theme::primary),
     )
     .padding(ROW_PAD)
@@ -1832,6 +1878,10 @@ fn slider_row(
         .into()
 }
 
+/// Manual-form content width: inputs, icon row, and buttons size to this;
+/// the overlay card hugs it plus padding (no dead space).
+pub(crate) const MANUAL_FORM_W: f32 = 420.0;
+
 pub(crate) fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
     let Some(draft) = state.manual_add.as_ref() else {
         return space().into();
@@ -1870,66 +1920,63 @@ pub(crate) fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
         );
     }
 
-    container(
-        column![
-            text(if draft.is_edit() {
-                "Edit shortcut"
-            } else {
-                "Add shortcut"
-            })
-            .size(20.0)
-            .color(theme::INK),
-            space().height(6),
-            text_input("Title", &draft.title)
-                .size(14.0)
-                .padding(8)
-                .on_input(StartMessage::ManualAddTitle)
-                .style(theme::input),
-            text(&draft.target).size(12.0).color(theme::MUTED),
-            text_input("Arguments (optional)", &draft.args)
-                .size(14.0)
-                .padding(8)
-                .on_input(StartMessage::ManualAddArgs)
-                .style(theme::input),
-            row![icon_el, column![icon_actions, icon_hint].spacing(6)]
-                .spacing(14)
-                .align_y(Alignment::Center),
-            space().height(8),
-            row![
-                button(text(if draft.is_edit() { "Save" } else { "Add" }).size(14.0))
-                    .padding([6, 14])
-                    .on_press(StartMessage::Confirm)
-                    .style(theme::primary),
-                button(text("Cancel").size(14.0))
-                    .padding([6, 14])
-                    .on_press(StartMessage::Close)
-                    .style(theme::ghost),
-            ]
-            .spacing(10),
-            {
-                let press = HintPress::for_owner(state, HintPressOwner::ManualAdd);
-                action_cluster(
-                    &[
-                        face_hint(
-                            FaceButton::Cross,
-                            if draft.is_edit() { "Save" } else { "Add" },
-                            press.held,
-                            press.press_anim,
-                        ),
-                        face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
-                    ],
-                    false,
-                )
-            },
+    // Plain content column: the overlay card centers it and hugs its width
+    // (the column fixes content at 420px); no Fill wrapper — inside a
+    // shrink-sized card Fill would have nothing to anchor to.
+    column![
+        text(if draft.is_edit() {
+            "Edit shortcut"
+        } else {
+            "Add shortcut"
+        })
+        .size(20.0)
+        .color(theme::INK),
+        space().height(6),
+        text_input("Title", &draft.title)
+            .size(14.0)
+            .padding(8)
+            .on_input(StartMessage::ManualAddTitle)
+            .style(theme::input),
+        text(&draft.target).size(12.0).color(theme::MUTED),
+        text_input("Arguments (optional)", &draft.args)
+            .size(14.0)
+            .padding(8)
+            .on_input(StartMessage::ManualAddArgs)
+            .style(theme::input),
+        row![icon_el, column![icon_actions, icon_hint].spacing(6)]
+            .spacing(14)
+            .align_y(Alignment::Center),
+        space().height(8),
+        row![
+            button(text(if draft.is_edit() { "Save" } else { "Add" }).size(14.0))
+                .padding([6, 14])
+                .on_press(StartMessage::Confirm)
+                .style(theme::primary),
+            button(text("Cancel").size(14.0))
+                .padding([6, 14])
+                .on_press(StartMessage::Close)
+                .style(theme::ghost),
         ]
-        .spacing(10)
-        .width(Length::Fixed(420.0))
-        .align_x(Alignment::Start),
-    )
-    .width(Fill)
-    .height(Fill)
-    .center_x(Fill)
-    .center_y(Fill)
+        .spacing(10),
+        {
+            let press = HintPress::for_owner(state, HintPressOwner::ManualAdd);
+            action_cluster(
+                &[
+                    face_hint(
+                        FaceButton::Cross,
+                        if draft.is_edit() { "Save" } else { "Add" },
+                        press.held,
+                        press.press_anim,
+                    ),
+                    face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
+                ],
+                false,
+            )
+        },
+    ]
+    .spacing(10)
+    .width(Length::Fixed(MANUAL_FORM_W))
+    .align_x(Alignment::Start)
     .into()
 }
 
@@ -1960,41 +2007,73 @@ pub(crate) fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
     let Some(confirm) = state.replace_confirm.as_ref() else {
         return space().into();
     };
-    container(
-        column![
-            text("Game already running").size(20.0).color(theme::INK),
-            text(format!(
+    // Compact dialog content: the caller wraps this in a shared overlay
+    // card over a dimmed stage (no fullscreen takeover).
+    column![
+        crate::ui::start::overlay::dialog_text(
+            "Game already running",
+            format!(
                 "Close {} and launch {}?",
                 confirm.running_title, confirm.next_title
-            ))
-            .size(14.0)
-            .color(theme::MUTED),
-            space().height(8),
-            {
-                let press = HintPress::for_owner(state, HintPressOwner::ReplaceConfirm);
-                action_cluster(
-                    &[
-                        face_hold_hint(
-                            FaceButton::Cross,
-                            "Proceed",
-                            press.cross_progress,
-                            press.cross_armed_t,
-                            press.held,
-                            press.press_anim,
-                        ),
-                        face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
-                    ],
-                    false,
-                )
-            },
-        ]
-        .spacing(12)
-        .align_x(Alignment::Center),
-    )
+            ),
+            20.0,
+            14.0,
+        ),
+        space().height(8),
+        {
+            let press = HintPress::for_owner(state, HintPressOwner::ReplaceConfirm);
+            action_cluster(
+                &[
+                    face_hold_hint(
+                        FaceButton::Cross,
+                        "Proceed",
+                        press.cross_progress,
+                        press.cross_armed_t,
+                        press.held,
+                        press.press_anim,
+                    ),
+                    face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
+                ],
+                false,
+            )
+        },
+    ]
+    .spacing(12)
+    .align_x(Alignment::Center)
     .width(Fill)
-    .height(Fill)
-    .center_x(Fill)
-    .center_y(Fill)
+    .into()
+}
+
+/// Save-or-discard guard content: pad hint row only (no mouse buttons —
+/// the choice stays an explicit pad action). The caller wraps this in a
+/// shared overlay card; Cross confirms (discard + leave edit mode),
+/// Circle cancels (keep the draft, keep editing).
+pub(crate) fn edit_confirm_view(state: &State) -> Element<'_, StartMessage> {
+    if state.edit_confirm.is_none() {
+        return space().into();
+    }
+    column![
+        crate::ui::start::overlay::dialog_text(
+            "Discard changes?",
+            "Your games list has unsaved changes.".to_string(),
+            20.0,
+            14.0,
+        ),
+        space().height(8),
+        {
+            let press = HintPress::for_owner(state, HintPressOwner::SaveDiscard);
+            action_cluster(
+                &[
+                    face_hint(FaceButton::Cross, "Discard", press.held, press.press_anim),
+                    face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
+                ],
+                false,
+            )
+        },
+    ]
+    .spacing(12)
+    .align_x(Alignment::Center)
+    .width(Fill)
     .into()
 }
 
@@ -2024,6 +2103,8 @@ mod tests {
             perf_aa_boot: true,
             perf_vsync_boot: true,
             perf_reload_queued: false,
+            show_uninstalled_games: true,
+            steam_syncing: false,
         }
     }
 
@@ -2083,10 +2164,36 @@ mod tests {
                 SettingsRow::PerfThrottle,
                 SettingsRow::PerfAntialiasing,
                 SettingsRow::PerfVsync,
+                SettingsRow::ShowUninstalled,
+                SettingsRow::SyncSteam,
                 #[cfg(debug_assertions)]
                 SettingsRow::TuneAmbience,
             ]
         );
+    }
+
+    #[test]
+    fn steam_rows_toggle_sync_and_section() {
+        let s = snap(true, true);
+        let rows = SettingsRow::focusable(&s);
+        assert!(rows.contains(&SettingsRow::ShowUninstalled));
+        assert!(rows.contains(&SettingsRow::SyncSteam));
+        // Steam section opens on the toggle row; the sync row continues it.
+        assert_eq!(SettingsRow::ShowUninstalled.section_before(), Some("Steam"));
+        assert!(SettingsRow::ShowUninstalled.gap_before());
+        assert_eq!(SettingsRow::SyncSteam.section_before(), None);
+        assert!(!SettingsRow::SyncSteam.gap_before());
+        // Confirm flips the toggle; nudges set it directionally.
+        let msg = confirm_message(SettingsRow::ShowUninstalled, &s).unwrap();
+        assert!(matches!(msg, StartMessage::SetShowUninstalledGames(false)));
+        let msg = nudge_message(SettingsRow::ShowUninstalled, &s, -1).unwrap();
+        assert!(matches!(msg, StartMessage::SetShowUninstalledGames(false)));
+        assert!(nudge_message(SettingsRow::ShowUninstalled, &s, 1).is_none());
+        // Confirm syncs; directionals leave the action alone.
+        let msg = confirm_message(SettingsRow::SyncSteam, &s).unwrap();
+        assert!(matches!(msg, StartMessage::SyncSteamLibrary));
+        assert!(nudge_message(SettingsRow::SyncSteam, &s, 1).is_none());
+        assert!(nudge_message(SettingsRow::SyncSteam, &s, -1).is_none());
     }
 
     #[test]
@@ -2345,7 +2452,7 @@ mod tests {
         let h = settings_content_h(&s);
         assert!(h > rows_h, "pads + gaps add height");
         assert!(
-            h < rows_h + 400.0,
+            h < rows_h + 600.0,
             "content height stays in a sane band, got {h} for rows {rows_h}"
         );
     }

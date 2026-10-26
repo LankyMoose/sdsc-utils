@@ -244,46 +244,11 @@ pub(crate) fn empty_games_browse_prompt(
 }
 
 pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a, StartMessage> {
-    // Settings keeps its own footer inside the panel — main chrome footer stays browse/modals.
-    if state.manual_add.is_some() {
-        let press = HintPress::for_owner(state, HintPressOwner::ManualAdd);
-        let label = if state.manual_add.as_ref().is_some_and(|d| d.is_edit()) {
-            "Save"
-        } else {
-            "Add"
-        };
-        return footer_band(
-            action_cluster(
-                &[
-                    face_hint(FaceButton::Cross, label, press.held, press.press_anim),
-                    face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
-                ],
-                flat_hints,
-            ),
-            false,
-        );
-    }
-    if state.replace_confirm.is_some() {
-        let press = HintPress::for_owner(state, HintPressOwner::ReplaceConfirm);
-        return footer_band(
-            action_cluster(
-                &[
-                    face_hold_hint(
-                        FaceButton::Cross,
-                        "Proceed",
-                        press.cross_progress,
-                        press.cross_armed_t,
-                        press.held,
-                        press.press_anim,
-                    ),
-                    face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
-                ],
-                flat_hints,
-            ),
-            false,
-        );
-    }
-
+    // Settings keeps its own footer inside the panel. Dialog cards own
+    // their hint rows (manual form and replace confirm both render live
+    // hints inside the card), so the island never mirrors modal state:
+    // there are deliberately no dialog arms here, and ownership forces
+    // idle press visuals behind either dim.
     let press = HintPress::for_owner(state, HintPressOwner::Browse);
     // Circle closes (Cancel while editing) regardless of the dock state.
     let circle_label = crate::ui::start::mode::cancel_circle_label(state.editing);

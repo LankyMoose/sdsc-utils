@@ -35,7 +35,7 @@ pub const CHROME_STATUS_STEP_HOLD_MS: u64 = 180;
 /// Delay between each chip starting ExitRight (bottom-first).
 pub const CHROME_STATUS_STAGGER_MS: u64 = 70;
 /// Horizontal travel for ExitRight (logical px). Must clear the widest status chip
-/// past the window's right edge (labels like "Scanning Steam library…").
+/// past the window's right edge (labels like "Syncing Steam library…").
 pub const CHROME_STATUS_EXIT_TRAVEL_PX: f32 = 520.0;
 /// Cold: fade the games strip in once artwork is ready.
 pub const GAMES_LIST_FADE_MS: u64 = ART_FADE_MS;

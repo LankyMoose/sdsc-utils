@@ -222,6 +222,11 @@ pub struct ConfigureSettings {
     pub autostart: bool,
     pub extra_steam_paths: Vec<PathBuf>,
     pub steam_path_error: Option<String>,
+    pub show_uninstalled_games: bool,
+    /// A library scan is in flight (sync button shows "Syncing…", disabled).
+    pub steam_syncing: bool,
+    /// Preformatted "Last synced …" / "Never synced" label.
+    pub steam_last_synced_label: String,
 }
 
 /// Edit applied to the emulated fleet — owned by
@@ -391,6 +396,8 @@ pub enum ConfigureMessage {
     CloseChangelog,
     AddSteamPath,
     RemoveSteamPath(usize),
+    SetShowUninstalledGames(bool),
+    SyncSteamLibrary,
     #[cfg(windows)]
     SetAutostart(bool),
     SelectStop(usize),
@@ -1065,6 +1072,21 @@ fn action_button<'a>(
         .into()
 }
 
+/// Steam library sync button. Disabled with a waiting label while a scan is
+/// in flight so a second click cannot queue another scan.
+fn sync_button(syncing: bool) -> Element<'static, ConfigureMessage> {
+    let label = if syncing {
+        "Syncing…"
+    } else {
+        "Sync Steam library"
+    };
+    button(text(label).size(13.0))
+        .padding([7, 14])
+        .on_press_maybe((!syncing).then_some(ConfigureMessage::SyncSteamLibrary))
+        .style(theme::secondary)
+        .into()
+}
+
 /// Renderer-pref reload button. Width follows its contents; both states are
 /// left-aligned like the other action buttons. Disabled with a spinner once
 /// queued so a second click cannot queue another restart.
@@ -1559,7 +1581,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
     groups = groups.push(group(Some("Opening".to_string()), opening));
 
     if settings.start_screen_enabled {
-        let mut immersive = vec![
+        let mut display = vec![
             toggle_row(
                 "Display clock",
                 None,
@@ -1646,7 +1668,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         let idle_secs = settings.start_screen_inactive_secs;
         let idle_steps = crate::persist::prefs::START_SCREEN_IDLE_SECS_STEPS;
         let idle_idx = crate::persist::prefs::secs_step_index(idle_secs, idle_steps);
-        immersive.push(slider_row(
+        display.push(slider_row(
             "Idle after",
             crate::persist::prefs::format_timeout_duration(idle_secs),
             slider(
@@ -1675,7 +1697,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             sleep_choices
         };
         let sleep_idx = crate::persist::prefs::secs_step_index(sleep_secs, &sleep_choices);
-        immersive.push(slider_row(
+        display.push(slider_row(
             "Sleep after",
             crate::persist::prefs::format_timeout_duration(sleep_secs),
             slider(
@@ -1691,7 +1713,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         ));
 
         let dim = settings.start_screen_inactive_dim_percent;
-        immersive.push(slider_row(
+        display.push(slider_row(
             "Idle dim",
             format!("{dim}%"),
             slider(0.0..=100.0, f32::from(dim), |value| {
@@ -1700,7 +1722,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             .step(5.0_f32)
             .style(theme::slider),
         ));
-        groups = groups.push(group(Some("Immersive".to_string()), immersive));
+        groups = groups.push(group(Some("Display".to_string()), display));
 
         let mut feedback = vec![toggle_row(
             "UI sounds",
@@ -1766,12 +1788,34 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         groups = groups.push(group(Some("Performance".to_string()), performance));
     }
 
-    groups = groups.push(
-        container(note(format!(
-            "Last-known compatible Steam version: {LAST_KNOWN_COMPATIBLE_STEAM_VERSION}"
-        )))
-        .padding([0, 4]),
-    );
+    groups = groups.push(group(
+        Some("Steam".to_string()),
+        vec![
+            toggle_row(
+                "Show uninstalled games",
+                Some("Keep owned-but-uninstalled games listed with a View in Steam action"),
+                settings.show_uninstalled_games,
+                ConfigureMessage::SetShowUninstalledGames,
+            ),
+            row![
+                column![
+                    text("Library sync")
+                        .size(theme::type_scale::BODY)
+                        .color(theme::INK),
+                    text(settings.steam_last_synced_label.clone())
+                        .size(12.0)
+                        .color(theme::DIM),
+                ]
+                .spacing(2)
+                .width(Fill),
+                sync_button(settings.steam_syncing),
+            ]
+            .spacing(16)
+            .align_y(Alignment::Center)
+            .into(),
+            note("Installs and uninstalls resync automatically; the button forces a rescan now."),
+        ],
+    ));
 
     let mut library_rows: Vec<Element<'_, ConfigureMessage>> = settings
         .extra_steam_paths
@@ -1801,6 +1845,15 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         Some("Extra Steam libraries".to_string()),
         library_rows,
     ));
+
+    // Compatibility footnote trails the Steam groups so the two library
+    // groups stay adjacent.
+    groups = groups.push(
+        container(note(format!(
+            "Last-known compatible Steam version: {LAST_KNOWN_COMPATIBLE_STEAM_VERSION}"
+        )))
+        .padding([0, 4]),
+    );
 
     groups.into()
 }
@@ -2859,9 +2912,16 @@ mod tests {
             autostart: false,
             extra_steam_paths: Vec::new(),
             steam_path_error: None,
+            show_uninstalled_games: true,
+            steam_syncing: false,
+            steam_last_synced_label: "Never synced".to_string(),
         };
         let _disabled_el = start_screen_view(&settings);
         settings.start_screen_enabled = true;
         let _enabled_el = start_screen_view(&settings);
+        settings.steam_syncing = true;
+        settings.show_uninstalled_games = false;
+        settings.steam_path_error = Some("No Steam library found in that folder".to_string());
+        let _syncing_el = start_screen_view(&settings);
     }
 }

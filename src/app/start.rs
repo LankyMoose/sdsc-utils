@@ -76,6 +76,12 @@ impl App {
             StartMessage::MoveDown => self.on_start_move(1),
             StartMessage::Confirm => self.on_start_confirm(),
             StartMessage::Close => self.on_start_close(),
+            StartMessage::Noop => Task::none(),
+            StartMessage::DismissEditConfirm => {
+                self.play_start_cue(UiSoundKind::Action);
+                self.start_state.dismiss_edit_confirm(Instant::now());
+                Task::none()
+            }
             StartMessage::ToggleControllers => self.on_toggle_controllers(),
             StartMessage::ToggleEdit => match self.toggle_start_edit() {
                 Some(task) => {
@@ -196,6 +202,10 @@ impl App {
                 self.apply_start_screen_haptics_strength(strength)
             }
             StartMessage::SetPerfThrottle(enabled) => self.apply_perf_throttle_immersive(enabled),
+            StartMessage::SetShowUninstalledGames(enabled) => {
+                self.apply_show_uninstalled_games(enabled)
+            }
+            StartMessage::SyncSteamLibrary => self.sync_steam_library_now(),
             StartMessage::SetPerfAntialiasing(enabled) => self.apply_perf_antialiasing(enabled),
             StartMessage::SetPerfVsync(enabled) => self.apply_perf_vsync(enabled),
             StartMessage::ReloadUi => self.reload_ui_for_renderer(),
@@ -248,7 +258,14 @@ impl App {
             }
         } else if self.launch_selected() {
             self.play_start_cue(UiSoundKind::Action);
-            self.close_start_screen()
+            // A freshly-armed replace confirm stays open on its modal —
+            // closing here would run `reset_to_games()` and wipe it before
+            // its first paint.
+            if self.start_state.replace_confirm.is_none() {
+                self.close_start_screen()
+            } else {
+                Task::none()
+            }
         } else {
             Task::none()
         }
@@ -286,7 +303,8 @@ impl App {
     }
 
     /// Close/Cancel arm: unwinds topmost surface first (settings → manual-add
-    /// draft → replace confirm → edit mode → Start itself).
+    /// draft → replace confirm → save guard → controllers surface → edit
+    /// mode → Start itself).
     pub(crate) fn on_start_close(&mut self) -> Task<Message> {
         if self.start_state.settings.open {
             self.play_start_cue(UiSoundKind::Action);
@@ -298,23 +316,36 @@ impl App {
         } else if self.start_state.manual_add.is_some() {
             self.play_start_cue(UiSoundKind::Action);
             self.cancel_manual_add()
-        } else if self.start_state.replace_confirm.take().is_some() {
+        } else if self.start_state.replace_confirm.is_some() {
+            // Cancel unwinds through the exit tween (content clears when it
+            // settles); reduced motion clears instantly.
             self.play_start_cue(UiSoundKind::Action);
+            self.start_state.dismiss_replace(Instant::now());
+            Task::none()
+        } else if self.start_state.edit_confirm.is_some() {
+            // Second Cancel backs out of the question: draft kept, stay in
+            // edit mode (unwinds through the exit tween like any dismiss).
+            self.play_start_cue(UiSoundKind::Action);
+            self.start_state.dismiss_edit_confirm(Instant::now());
+            Task::none()
+        } else if start_mode::dock_collapse_target(self.start_state.dock_expanded).is_some()
+            && self.start_state.request_dock(false, Instant::now())
+        {
+            // Controllers surface open: Circle/Cancel collapses it first,
+            // preserving any edit draft underneath.
+            self.play_start_cue(UiSoundKind::Slide);
+            crate::controller::hid::diag::diag_info("ui-diag: start controllers collapse (cancel)");
             Task::none()
         } else if self.start_state.editing {
             self.play_start_cue(UiSoundKind::Action);
-            self.cancel_start_edit()
-        } else if self.start_visible {
-            // Controllers surface open: Circle/Cancel collapses it first.
-            if start_mode::dock_collapse_target(self.start_state.dock_expanded).is_some()
-                && self.start_state.request_dock(false, Instant::now())
-            {
-                self.play_start_cue(UiSoundKind::Slide);
-                crate::controller::hid::diag::diag_info(
-                    "ui-diag: start controllers collapse (cancel)",
-                );
-                return Task::none();
+            if self.edit_draft_dirty() {
+                // Dirty exit asks first; clean exits cancel silently as before.
+                self.start_state.arm_edit_confirm(Instant::now());
+                Task::none()
+            } else {
+                self.cancel_start_edit()
             }
+        } else if self.start_visible {
             self.play_start_cue(UiSoundKind::Action);
             self.close_start_screen()
         } else {
@@ -323,22 +354,14 @@ impl App {
     }
 
     /// Create-toggle arm: flips the controllers surface both ways.
-    /// An in-progress edit draft is discarded first and a stowed
-    /// settle scroll is dropped (the user took over post-settle browsing).
+    /// An in-progress edit draft is preserved underneath (like the settings
+    /// drawer): closing the dock returns to the checklist with the draft
+    /// intact, so either panel opens freely from dirty edit mode.
+    /// A stowed settle scroll is dropped (the user took over post-settle
+    /// browsing).
     pub(crate) fn on_toggle_controllers(&mut self) -> Task<Message> {
         if self.start_state.overlay_blocking() {
             return Task::none();
-        }
-        if self.start_state.editing {
-            let cursor = self.start_state.selected_game_key();
-            let anchor = self.start_state.edit_anchor_play_key.clone();
-            self.discard_edit_draft();
-            self.refresh_start_rows();
-            let target = self
-                .start_state
-                .cancel_exit_target_key(cursor.as_deref(), anchor.as_deref());
-            self.start_state
-                .resolve_edit_exit_selection(target.as_deref());
         }
         let now = Instant::now();
         let next = !self.start_state.dock_expanded;
@@ -378,13 +401,29 @@ impl App {
             self.display_catalog()
                 .iter()
                 .map(|entry| {
+                    let (remembered, known_missing) = match entry {
+                        crate::games::GameEntry::Steam { appid } => (
+                            self.games.steam_display_name(*appid),
+                            matches!(&self.steam_installed, Some(ids) if !ids.contains(appid)),
+                        ),
+                        crate::games::GameEntry::Manual { .. } => (None, false),
+                    };
                     let mut row = start_view::StartRow::from_entry(
                         entry,
                         &self.steam_by_id,
                         self.steam_scan_pending,
+                        remembered,
+                        known_missing,
                     );
                     row.played_at_ms = self.effective_played_ms(entry);
                     row.disabled = self.is_entry_disabled(entry, &row);
+                    // Pre-flight failures (manifest lingers, files gone) keep
+                    // their scanned title but route Cross to View in Steam.
+                    if let crate::games::GameEntry::Steam { appid } = entry
+                        && self.launch_blocked_steam.contains(appid)
+                    {
+                        row.view_in_steam = Some(*appid);
+                    }
                     row
                 })
                 .collect()
@@ -413,7 +452,7 @@ impl App {
         self.edit_draft = None;
         self.start_state.editing = false;
         self.start_state.edit_anchor_play_key = None;
-        self.start_state.manual_add = None;
+        self.start_state.clear_manual();
     }
 
     pub(crate) fn enter_start_edit(&mut self) -> Task<Message> {
@@ -463,8 +502,25 @@ impl App {
         self.warm_start_art_task()
     }
 
+    /// True when the edit draft would change the saved games list on
+    /// commit (entries-only: background launch stamps and scan-name
+    /// refreshes don't count — see `GamesCatalog::entries_differ`).
+    pub(crate) fn edit_draft_dirty(&self) -> bool {
+        self.edit_draft
+            .as_ref()
+            .is_some_and(|draft| self.games.entries_differ(draft))
+    }
+
+    /// Save-guard choice: discard the draft and leave edit mode.
+    pub(crate) fn complete_edit_discard(&mut self) -> Task<Message> {
+        self.start_state.clear_edit_confirm();
+        self.cancel_start_edit()
+    }
+
     pub(crate) fn cancel_manual_add(&mut self) -> Task<Message> {
-        self.start_state.manual_add = None;
+        // Cancel drains through the exit tween (form clears when it
+        // settles); reduced motion clears instantly.
+        self.start_state.dismiss_manual(Instant::now());
         Task::none()
     }
 
@@ -522,18 +578,30 @@ impl App {
             _ => None,
         });
         let shell_icon = start_view::probe_shell_icon(&row.target);
-        self.start_state.manual_add = Some(start_view::ManualAddDraft {
-            edit_id: Some(id.clone()),
-            target: row.target,
-            title: row.title,
-            args: row.args,
-            icon_path,
-            shell_icon,
-        });
+        self.start_state.arm_manual(
+            start_view::ManualAddDraft {
+                edit_id: Some(id.clone()),
+                target: row.target,
+                title: row.title,
+                args: row.args,
+                icon_path,
+                shell_icon,
+            },
+            Instant::now(),
+        );
         Task::none()
     }
 
     pub(crate) fn on_start_confirm(&mut self) -> Task<Message> {
+        // Save guard owns Confirm while open (tap Cross confirms the
+        // discard). Display-only drain must not apply twice.
+        if self.start_state.edit_confirm.is_some() {
+            if self.start_state.edit_confirm_closing() {
+                return Task::none();
+            }
+            self.play_start_cue(UiSoundKind::Action);
+            return self.complete_edit_discard();
+        }
         if self.start_state.manual_add.is_some() {
             self.play_start_cue(UiSoundKind::Action);
             return self.confirm_manual_add();
@@ -566,12 +634,19 @@ impl App {
         }
         if self.launch_selected() {
             self.play_start_cue(UiSoundKind::Action);
+            // Same as `on_start_launch`: keep a fresh replace-confirm modal
+            // alive instead of closing (and wiping) it on the arming update.
+            if self.start_state.replace_confirm.is_some() {
+                return Task::none();
+            }
             return self.close_start_screen();
         }
         Task::none()
     }
 
     /// Launch the selected game. Returns true when launch, replace-confirm, or a real attempt ran.
+    /// Callers must check `replace_confirm` before closing: a `true` from the
+    /// replace arm means "modal armed, stay open", not "launched, close".
     pub(crate) fn launch_selected(&mut self) -> bool {
         let Some(row) = self
             .start_state
@@ -592,15 +667,24 @@ impl App {
             return false;
         }
 
-        // Disabled rows never launch (uninstalled Steam or missing manual target).
-        // Re-validate at launch time so a stale row (scan race / immediate launch
-        // after uninstall) fails gracefully instead of opening Steam / error popup.
+        // Uninstalled Steam rows stay enabled: Cross opens the game's store
+        // page in Steam instead of launching. Fire-and-forget: no running
+        // session, badges, or last-played stamp.
+        if let Some(appid) = row.view_in_steam {
+            return self.open_view_in_steam(appid, &row.title);
+        }
+
+        // Disabled rows never launch (missing manual target). Steam rows are
+        // never disabled — unlaunchable ones route through `view_in_steam`
+        // above — but re-validate at launch time so a stale row (scan race /
+        // immediate launch after uninstall) fails gracefully instead of
+        // opening Steam / error popup.
         if row.disabled || self.is_row_invalid_now(&row) {
             app_log::warn(format!(
                 "launch blocked (no longer installed): {} ({})",
                 row.title, row.target
             ));
-            // Refresh disabled flags so the row dims immediately.
+            // Refresh so the row converts to View in Steam immediately.
             self.refresh_start_rows();
             return false;
         }
@@ -608,8 +692,8 @@ impl App {
         // Steam pre-flight (revoked license / wiped files, e.g. an expired
         // alpha): the manifest can linger while the install dir is missing
         // or empty, and ShellExecute would happily hand off to a Steam error
-        // dialog. Block before creating a running session so `Playing`
-        // never parks on a game that cannot spawn a process.
+        // dialog. Route to View in Steam instead, so `Playing` never parks
+        // on a game that cannot spawn a process.
         if let Some(appid) = steam_appid_from_target(&row.target)
             && !steam::install_ready_for_appid(appid)
         {
@@ -619,7 +703,7 @@ impl App {
             ));
             self.launch_blocked_steam.insert(appid);
             self.refresh_start_rows();
-            return false;
+            return self.open_view_in_steam(appid, &row.title);
         }
 
         if let Some(session) = self.running_session.as_ref() {
@@ -627,11 +711,14 @@ impl App {
                 return false;
             }
             if process_match::any_matching_running(&session.match_paths) {
-                self.start_state.replace_confirm = Some(ReplaceConfirm {
-                    running_title: session.title.clone(),
-                    next_title: row.title.clone(),
-                    next_index: self.start_state.game_selected,
-                });
+                self.start_state.arm_replace(
+                    ReplaceConfirm {
+                        running_title: session.title.clone(),
+                        next_title: row.title.clone(),
+                        next_index: self.start_state.game_selected,
+                    },
+                    Instant::now(),
+                );
                 return true;
             }
             self.running_session = None;
@@ -648,8 +735,24 @@ impl App {
             Err(err) => {
                 app_log::warn(format!("launch failed for {}: {err}", row.target));
                 // Immediate-launch race (uninstalled between scan and press):
-                // refresh so the row dims instead of staying launchable.
+                // refresh so the row converts to View in Steam.
                 self.refresh_start_rows();
+                false
+            }
+        }
+    }
+
+    /// Open the Steam store page for an unlaunchable appid.
+    /// Returns true when Steam accepted the URI (callers close Start).
+    pub(crate) fn open_view_in_steam(&mut self, appid: u32, title: &str) -> bool {
+        let uri = steam::store_page_uri(appid);
+        match launch::launch_target(&uri, "") {
+            Ok(()) => {
+                app_log::info(format!("view in steam: {title} ({uri})"));
+                true
+            }
+            Err(err) => {
+                app_log::warn(format!("view in steam failed for {uri}: {err}"));
                 false
             }
         }
@@ -661,6 +764,10 @@ impl App {
         let Some(cache) = crate::games::steam::load_library_cache() else {
             return;
         };
+        if self.games.remember_steam_names(&cache.games) {
+            self.games.save();
+        }
+        self.steam_last_synced_ms = (cache.scanned_at_ms > 0).then_some(cache.scanned_at_ms);
         self.steam_installed = Some(cache.games.iter().map(|g| g.appid).collect());
         self.steam_by_id = cache.games.into_iter().map(|g| (g.appid, g)).collect();
         self.steam_scan_pending = false;
@@ -711,6 +818,48 @@ impl App {
         self.refresh_steam_library()
     }
 
+    /// Registry-watch callback: badges refresh every time, but a full
+    /// library rescan only runs when the installed set actually changed.
+    ///
+    /// The `Apps` key fires on `Running` flips too (every launch/exit), so
+    /// an unconditional rescan would re-walk the libraries twice per play
+    /// session. Comparing the cheap registry membership snapshot against
+    /// the last successful scan filters those out; installs, uninstalls,
+    /// and license changes still rescan within a second or so.
+    pub(crate) fn on_steam_apps_changed(&mut self) -> Task<Message> {
+        let mut task = self.refresh_running_badge_inner(true);
+        if let Some(resync) = self.steam_library_resync_task() {
+            task = task.chain(resync);
+        }
+        task
+    }
+
+    /// Rescan when the registry installed-set disagrees with the last scan.
+    ///
+    /// `None` when already current, still unknown (first scan owns that),
+    /// or a scan is already in flight. Besides the registry watcher, Start
+    /// open calls this: changes made while the app was closed (or while no
+    /// watcher event fired) would otherwise stay stale, since the deferred
+    /// boot scan runs only once per process.
+    pub(crate) fn steam_library_resync_task(&mut self) -> Option<Task<Message>> {
+        if self.steam_installed.is_none() || self.steam_scan_started.is_some() {
+            return None;
+        }
+        let mut registry = steam::registry_installed_appids();
+        registry.sort_unstable();
+        let mut known = self.steam_installed.clone().unwrap_or_default();
+        known.sort_unstable();
+        if registry == known {
+            return None;
+        }
+        app_log::info(format!(
+            "steam library changed: registry installed={} known={} — rescanning",
+            registry.len(),
+            known.len()
+        ));
+        Some(self.refresh_steam_library())
+    }
+
     pub(crate) fn on_steam_scan_done(
         &mut self,
         result: AppResult<Vec<SteamGame>>,
@@ -727,6 +876,10 @@ impl App {
         self.steam_library_refreshed = true;
         match result {
             Ok(games) => {
+                if self.games.remember_steam_names(&games) {
+                    self.games.save();
+                }
+                self.steam_last_synced_ms = Some(steam::library_now_ms());
                 self.steam_installed = Some(games.iter().map(|g| g.appid).collect());
                 self.steam_by_id = games.iter().map(|g| (g.appid, g.clone())).collect();
                 // A fresh scan is ground truth again: drop pre-flight blocks
@@ -821,14 +974,17 @@ impl App {
         let target = path.to_string_lossy().into_owned();
         let title = games::title_from_target(&target);
         let shell_icon = start_view::probe_shell_icon(&target);
-        self.start_state.manual_add = Some(start_view::ManualAddDraft {
-            edit_id: None,
-            target,
-            title,
-            args: String::new(),
-            icon_path: None,
-            shell_icon,
-        });
+        self.start_state.arm_manual(
+            start_view::ManualAddDraft {
+                edit_id: None,
+                target,
+                title,
+                args: String::new(),
+                icon_path: None,
+                shell_icon,
+            },
+            Instant::now(),
+        );
         Task::none()
     }
 
@@ -1193,13 +1349,16 @@ impl App {
 
         let replace_confirm = self.start_state.replace_confirm.is_some();
         let manual_add = self.start_state.manual_add.is_some();
+        let save_modal = self.start_state.edit_confirm.is_some();
         let settings_open = self.start_state.settings.open;
-        let allow_nav_move = settings_open || (!animating && !replace_confirm && !manual_add);
+        let allow_nav_move =
+            settings_open || (!animating && !replace_confirm && !manual_add && !save_modal);
         let editing = self.start_state.editing;
         // Only when the selected row shows Close game (running target match).
         let hold_cross_close = !editing
             && !replace_confirm
             && !manual_add
+            && !save_modal
             && !settings_open
             && !animating
             && !self.start_state.dock_expanded
@@ -1213,6 +1372,7 @@ impl App {
         let hold_triangle_power = !editing
             && !replace_confirm
             && !manual_add
+            && !save_modal
             && !settings_open
             && !animating
             && self.start_state.dock_expanded
@@ -1279,6 +1439,26 @@ impl App {
             self.keyboard_cross_hold.reset();
             self.start_state.tick_hint_anims(now);
             self.on_ambient_tuning_nav(tick.action)
+        } else if save_modal {
+            // Save guard demands an explicit choice: park nav, holds, and
+            // surface toggles (Start/Options, Create) so nothing bypasses
+            // the modal; only Confirm (discard) and Cancel (back to edit)
+            // stay live.
+            self.start_state.cross_progress = 0.0;
+            self.start_state.triangle_progress = 0.0;
+            self.keyboard_cross_hold.reset();
+            self.start_state.tick_hint_anims(now);
+            if let Some(action) = tick.action {
+                match action {
+                    NavAction::Confirm | NavAction::Cancel => self.on_start_message(match action {
+                        NavAction::Confirm => StartMessage::Confirm,
+                        _ => StartMessage::Close,
+                    }),
+                    _ => Task::none(),
+                }
+            } else {
+                Task::none()
+            }
         } else if tick.action == Some(NavAction::ToggleSettings) {
             self.start_state.tick_hint_anims(now);
             self.on_start_message(StartMessage::ToggleSettings)
@@ -1545,7 +1725,27 @@ impl App {
             perf_aa_boot: self.renderer_boot_aa,
             perf_vsync_boot: self.renderer_boot_vsync,
             perf_reload_queued: self.renderer_reload_queued,
+            show_uninstalled_games: self.session.prefs.show_uninstalled_games,
+            steam_syncing: self.steam_scan_started.is_some(),
         }
+    }
+
+    pub(crate) fn apply_show_uninstalled_games(&mut self, enabled: bool) -> Task<Message> {
+        if self.session.prefs.show_uninstalled_games != enabled {
+            self.session.prefs.show_uninstalled_games = enabled;
+            self.save_prefs();
+            self.refresh_start_rows();
+        }
+        Task::none()
+    }
+
+    /// Manual library rescan from Settings (drawer or Configure). No-op
+    /// while a scan is already in flight.
+    pub(crate) fn sync_steam_library_now(&mut self) -> Task<Message> {
+        if self.steam_scan_started.is_some() {
+            return Task::none();
+        }
+        self.refresh_steam_library()
     }
 
     pub(crate) fn apply_start_screen_clock(&mut self, enabled: bool) -> Task<Message> {
@@ -1950,15 +2150,23 @@ impl App {
 
     pub(crate) fn display_catalog(&self) -> Vec<crate::games::GameEntry> {
         let steam_by_id = &self.steam_by_id;
-        // Keep uninstalled Steam entries so rows can render disabled instead of
-        // vanishing. Disabled is resolved per-row in refresh_start_rows.
+        // Keep uninstalled Steam entries so rows can render as View in Steam
+        // instead of vanishing — unless the user opted out (and the scan
+        // proved absence; unknown scans keep everything launchable).
+        // Launchability is resolved per-row in refresh_start_rows.
+        let installed_filter = if self.session.prefs.show_uninstalled_games {
+            None
+        } else {
+            self.steam_installed.as_deref()
+        };
         self.games.merge_sorted(
-            None,
+            installed_filter,
             self.session.prefs.games_sort_mode,
             |entry| match entry {
                 crate::games::GameEntry::Steam { appid } => steam_by_id
                     .get(appid)
                     .map(|g| g.name.clone())
+                    .or_else(|| self.games.steam_display_name(*appid).map(str::to_string))
                     .unwrap_or_else(|| format!("Steam {appid}")),
                 crate::games::GameEntry::Manual { title, .. } => title.clone(),
             },
@@ -1978,7 +2186,12 @@ impl App {
         )
     }
 
-    /// True when scan proves this entry is no longer installed (disabled row).
+    /// True when this entry provably cannot launch (disabled row).
+    ///
+    /// Steam entries are never disabled: scan-missing rows become View in
+    /// Steam rows (`view_in_steam`, set in [`Self::refresh_start_rows`] /
+    /// [`StartRow::from_entry`]) and stay navigable. Only manual entries
+    /// with provably-missing targets dim.
     pub(crate) fn is_entry_disabled(
         &self,
         entry: &crate::games::GameEntry,
@@ -1988,18 +2201,7 @@ impl App {
             return false;
         }
         match entry {
-            crate::games::GameEntry::Steam { appid } => {
-                // Pre-flight failures dim the row until a fresh scan proves
-                // the install back.
-                if self.launch_blocked_steam.contains(appid) {
-                    return true;
-                }
-                // Unknown scan (None) keeps rows enabled; known scan disables missing.
-                match self.steam_installed.as_deref() {
-                    Some(ids) => !ids.contains(appid),
-                    None => false,
-                }
-            }
+            crate::games::GameEntry::Steam { .. } => false,
             crate::games::GameEntry::Manual { target, .. } => is_manual_target_missing(target),
         }
     }
@@ -2030,6 +2232,26 @@ impl App {
                 row
             })
             .collect();
+        // Curated-but-uninstalled games surface as toggled-on rows (last-known
+        // title) so they can be untoggled — previously they were invisible
+        // here. Hidden entirely when the user opts out of uninstalled games.
+        if self.session.prefs.show_uninstalled_games {
+            for entry in &catalog.entries {
+                if let crate::games::GameEntry::Steam { appid } = entry
+                    && !self.steam_by_id.contains_key(appid)
+                {
+                    let title = catalog
+                        .steam_display_name(*appid)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("Steam {appid}"));
+                    rows.push(start_view::StartRow::steam_uninstalled(
+                        *appid,
+                        title,
+                        catalog.last_played(entry),
+                    ));
+                }
+            }
+        }
         for entry in &catalog.entries {
             if let Some(mut row) = start_view::StartRow::manual_edit(entry) {
                 row.played_at_ms = catalog.last_played(entry);
@@ -2382,7 +2604,12 @@ impl App {
     }
 
     pub(crate) fn confirm_manual_add(&mut self) -> Task<Message> {
-        let Some(draft) = self.start_state.manual_add.take() else {
+        // Display-only drain (already committed, tween running) must not
+        // apply twice.
+        if self.start_state.manual_closing() {
+            return Task::none();
+        }
+        let Some(draft) = self.start_state.manual_add.clone() else {
             return Task::none();
         };
         let title = draft.title.trim();
@@ -2403,6 +2630,9 @@ impl App {
                 .add_manual(title, draft.target, args, icon);
         }
         self.refresh_start_rows();
+        // Data is committed; the form stays mounted as display-only through
+        // the exit tween and clears when it settles.
+        self.start_state.dismiss_manual(Instant::now());
         Task::none()
     }
 
@@ -2620,6 +2850,7 @@ impl App {
         self.start_close_armed = false;
         self.start_state.editing = false;
         self.start_state.edit_anchor_play_key = None;
+        self.start_state.clear_edit_confirm();
         self.edit_draft = None;
         self.refresh_start_rows();
         self.refresh_start_controllers();
@@ -2943,7 +3174,6 @@ impl App {
         // Tuning is settled state: never reopen with it on.
         #[cfg(debug_assertions)]
         self.start_state.request_ambient_tuning(false);
-        self.start_state.clear_immersive_session();
         self.start_state.clear_transition_phase();
         // Invalidate in-flight art events; keep caches for fast reopen.
         // Process Exit is what wipes to a blank slate (`ArtOwner::shutdown`).
@@ -2959,8 +3189,17 @@ impl App {
         self.confirm_key_held = false;
         self.cancel_key_held = false;
         self.pad_held = FaceHeld::default();
-        self.start_state.reset_to_games();
-        self.discard_edit_draft();
+        // Visual state (selection, dock, drawer, scrolls, edit draft) resets
+        // in `on_window_closed`, once the HWND is actually gone. Resetting
+        // here would repaint one frame with `game_selected = 0` before the
+        // hide+close lands — a visible selection jump on every close.
+        // No window (never opened / already destroyed): no WindowClosed will
+        // follow, so reset synchronously.
+        if self.start_window.is_none() {
+            self.start_state.clear_immersive_session();
+            self.start_state.reset_to_games();
+            self.discard_edit_draft();
+        }
         self.clear_start_nav_diag();
         // Focus-close often leaves the reopen chord held (e.g. PS); latch until
         // a debounced full release so the next PadPoll cannot immediately reopen.
@@ -3154,7 +3393,7 @@ impl App {
     }
 
     pub(crate) fn complete_replace_confirm(&mut self) -> Task<Message> {
-        let Some(confirm) = self.start_state.replace_confirm.take() else {
+        let Some(confirm) = self.start_state.take_replace() else {
             return Task::none();
         };
         self.keyboard_cross_hold.reset();

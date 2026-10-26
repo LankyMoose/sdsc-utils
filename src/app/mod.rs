@@ -467,7 +467,8 @@ pub struct App {
     pad_held: FaceHeld,
     running_session: Option<RunningSession>,
     /// Steam appids whose install dir failed pre-flight (missing/empty):
-    /// launch is blocked and the row dims until the next successful scan.
+    /// launch routes to View in Steam until the next successful scan proves
+    /// the install back (which clears this set).
     launch_blocked_steam: HashSet<u32>,
     /// Match paths for the target currently showing "Closing" (cleared on process exit).
     closing_match_paths: Vec<PathBuf>,
@@ -481,6 +482,10 @@ pub struct App {
     /// cleared; later sights stay silent for the process lifetime).
     seen_cache: SeenCache,
     steam_by_id: HashMap<u32, SteamGame>,
+    /// Wall-clock ms of the last successful library seed/scan (cache
+    /// `scanned_at_ms` or live scan time). Shown as "Last synced" in
+    /// Settings. `None` before the first success.
+    steam_last_synced_ms: Option<u64>,
     /// True until the first `SteamScanDone` (Ok or Err).
     steam_scan_pending: bool,
     /// Wall clock when the current Steam library scan was kicked off (debug timing).
@@ -767,6 +772,8 @@ impl App {
             match_path_cache: HashMap::new(),
             seen_cache: SeenCache::new(),
             steam_by_id: HashMap::new(),
+
+            steam_last_synced_ms: None,
             steam_scan_pending: true,
             steam_scan_started: None,
             steam_library_refreshed: false,
@@ -1275,7 +1282,7 @@ impl App {
             Message::EmulatorCommitTick => self.on_emulator_commit_tick(),
             Message::PollResult(result) => self.on_poll_result(result),
             Message::ProcessEnumResult(result) => self.on_process_enum_result(result),
-            Message::SteamAppsChanged => self.refresh_running_badge_inner(true),
+            Message::SteamAppsChanged => self.on_steam_apps_changed(),
             Message::RunningBadgeTick => self.refresh_running_badge(),
             Message::CloseGameDone(result) => self.on_close_game_done(result),
 
@@ -1444,6 +1451,13 @@ impl App {
             self.start_visible = false;
             self.start_close_armed = false;
             self.start_nav_ready = false;
+            // Deferred close teardown: visual state reset here, once the HWND
+            // is actually gone, so no reset frame paints before destroy (see
+            // `close_start_screen`). Also covers the OS-close path, which
+            // bypasses `close_start_screen` entirely.
+            self.start_state.clear_immersive_session();
+            self.start_state.reset_to_games();
+            self.discard_edit_draft();
             // Defensive: an OS-close path bypasses close_start_screen's
             // clear_start_activity, so never leak a Hidden interaction into
             // a later window (the force_cursor gate above is the backstop).
@@ -1533,6 +1547,11 @@ impl App {
             // Cache hit: Preparing chip first; Steam kicks when art-ready handoff runs.
             if self.steam_scan_pending {
                 task = task.chain(self.maybe_kick_deferred_steam_scan());
+            } else if let Some(resync) = self.steam_library_resync_task() {
+                // Warm reopen: install/uninstall while closed (or a missed
+                // watcher event) would otherwise stay stale — the deferred
+                // boot scan runs only once per process.
+                task = task.chain(resync);
             }
             // Cold: lift the enter veil onto ambient+dock immediately (games list
             // stays hidden until art). Warm reopen still waits for art before arming.
