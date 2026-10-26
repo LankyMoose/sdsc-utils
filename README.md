@@ -6,37 +6,49 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 
 ## Screenshots
 
-<p align="center">
-  <img src="assets/screenshots/start-immersive-mode.png" alt="Immersive Start screen / Game launcher" width="640" />
-</p>
-
-<p align="center">Immersive Start screen / Game launcher</p>
+Current as of 1.7.0 (`assets/screenshots/1.7.0/`; previous sets are kept under `assets/screenshots/<version>/`).
 
 <p align="center">
-  <img src="assets/screenshots/controller-list.png" alt="Controller popup with battery rings and ETA" width="420" />
+  <img src="assets/screenshots/1.7.0/start-idle.png" alt="Start screen game launcher" width="640" />
 </p>
 
-<p align="center">Controller popup — battery %, remaining-time estimate, Identify / Turn off, and Remember</p>
+<p align="center">Start screen — fullscreen game launcher with Playing status, footer hints, clock, and controller battery rings</p>
 
 <p align="center">
-  <img src="assets/screenshots/configuration-lightbar.png" alt="Settings lightbar spectrum editor" width="520" />
+  <img src="assets/screenshots/1.7.0/start-settings.png" alt="Start screen settings drawer" width="640" />
 </p>
 
-<p align="center">Settings → Lightbar — enable toggle, multi-stop spectrum, and color picker</p>
+<p align="center">Start settings drawer — Opening, Immersive (layout, position rail, reduced motion), Feedback, and Performance sections</p>
 
 <p align="center">
-  <img src="assets/screenshots/configuration-notifications.png" alt="Settings notifications" width="360" />
-  &nbsp;
-  <img src="assets/screenshots/configuration-toasts.png" alt="Settings toast position" width="360" />
+  <img src="assets/screenshots/1.7.0/controllers-popup.png" alt="Controller popup with battery rings and ETA" width="420" />
 </p>
 
-<p align="center">Notifications and toast corner placement</p>
+<p align="center">Controller popup — battery %, remaining-time estimate, remember pin, nicknames, and Identify / Turn off</p>
 
 <p align="center">
-  <img src="assets/screenshots/configuration-analytics.png" alt="Settings battery analytics" width="520" />
+  <img src="assets/screenshots/1.7.0/config-tab-system.png" alt="Settings System tab" width="520" />
 </p>
 
-<p align="center">Settings → Analytics — opt-in local charge/drain learning and coverage charts</p>
+<p align="center">Settings → System — autostart, open data folder, changelog viewer, and app version</p>
+
+<p align="center">
+  <img src="assets/screenshots/1.7.0/config-tab-notifications.png" alt="Settings Notifications tab" width="520" />
+</p>
+
+<p align="center">Settings → Notifications — connect/disconnect and battery toggles, low-battery threshold, and toast position picker</p>
+
+<p align="center">
+  <img src="assets/screenshots/1.7.0/config-tab-lightbar.png" alt="Settings lightbar spectrum editor" width="520" />
+</p>
+
+<p align="center">Settings → Lightbar colors — enable toggle, multi-stop gradient editor, and per-stop colors</p>
+
+<p align="center">
+  <img src="assets/screenshots/1.7.0/config-tab-analytics.png" alt="Settings battery analytics" width="520" />
+</p>
+
+<p align="center">Settings → Analytics — opt-in local charge/drain learning with measured/estimated coverage charts</p>
 
 ## Download
 
@@ -48,16 +60,16 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 
 - Tray icon with a DualSense silhouette
 - Tooltip shows how many controllers are connected
-- Left-click the tray icon for a dark controller popup with battery state, optional **nicknames** (pencil icon beside each name), **Identify** / Bluetooth **Turn off** icon actions, and an opt-in **Remember** checkbox; right-click for **Settings** and **Exit**
+- Left-click the tray icon for a dark controller popup with battery state, optional **nicknames** (pencil icon beside each name), **Identify** / Bluetooth **Turn off** icon actions, and an opt-in **Remember** pin icon; right-click for **Settings** and **Exit**
 - **Remember** a controller to keep it in the popup after disconnect with its last-known charge % (off by default)
 - Assign a **nickname** to any pad with a known serial; nicknames survive forgetting a pad and are used in the popup and overlay toasts
 - Bluetooth **Turn off** sends the DualSense soft power-off command (same idea as holding the PS button)
 - Steam-style overlay toasts when a pad **connects**, **disconnects**, hits **low battery** (at or below a configurable % while discharging; default ≤5%), or **finishes charging** (tray → **Settings**; on by default)
 - Toasts appear in any configurable screen corner as always-on-top cards and dismiss on click or automatically after five seconds
-- Dark **iced** Configure window for notification (including low-battery %), toast-position, autostart, lightbar, start-screen (System tab), and **opt-in battery analytics** settings
+- Dark **iced** Configure window with a floating sidebar: System (autostart, data folder, changelog viewer), Start screen, Notifications (including low-battery % and toast position), Lightbar colors, Analytics (opt-in), and Pad input
 - **Battery analytics** (off by default): learns each DualSense battery step for charge and play, shows remaining-time estimates after one qualifying step (interpolating within the current percent bucket; refining as more steps are observed; mid-cycle unplug/charge does not wipe history), and draws per-controller coverage charts in Settings → Analytics (local `analytics.json` only; open the data folder from Settings → System to inspect or delete files)
 - Detects controllers connecting/disconnecting within a few seconds
-- **Start screen** (Settings → Start screen): fullscreen console quick-launch when the first DualSense connects — curated Steam games and manual shortcuts, DualSense and keyboard nav. Cross/Enter launches (a successful launch closes Start); Circle/Escape closes; Triangle edits the catalog; Square toggles Last played ↔ A–Z; Options opens Start settings; Create (Select) toggles the controllers surface (battery rings, Identify, Bluetooth power-off). Opens with an empty catalog. Optional UI sounds with volume and controller haptics with strength. Any connected pad can drive the UI (inputs are not merged across pads). Reopen with the **PS** (Guide) button. Catalog lives in `games.json` under the data folder
+- **Start screen** (Settings → Start screen): fullscreen console quick-launch when the first DualSense connects — curated Steam games and manual shortcuts, DualSense and keyboard nav, vertical or horizontal games layout with position rail. Cross/Enter launches (a successful launch closes Start); Circle/Escape closes; Triangle edits the catalog; Square toggles Last played ↔ A–Z; Options opens Start settings; Create (Select) toggles the controllers surface (battery rings, Identify, Bluetooth power-off). Opens with an empty catalog. Optional UI sounds with volume and controller haptics with strength. Any connected pad can drive the UI (inputs are not merged across pads). Reopen with the **PS** (Guide) button. Catalog lives in `games.json` under the data folder
 - Lightbar color blends across a customizable **2–5 stop spectrum** (default **blue → purple → red**) as battery drops (reapplied on change, plus a slow ~30s backstop); edit via tray **Settings** with a left-hand tab list. An **Enable lightbar** toggle (on by default) pauses battery-driven colors and the low-battery pulse while leaving Identify available. The Lightbar panel stays fully expanded when active: drag stops along the bar, click empty areas to add stops (up to 5), and drag a stop away to remove it (down to 2). Changes apply immediately.
 - At **low battery while discharging** (same configurable threshold as the toast; default ≤5%), the lightbar periodically pulses **orange**
 - Icons live in `assets/icons/` (SVG) and are rasterized at build/runtime
@@ -175,7 +187,7 @@ DualSense firmware reports battery in **11 coarse steps** (0–10). Percentages 
 - **Log file**
   - Windows: `%APPDATA%\sdsc-utils\app.log`
   - Unix: `$XDG_STATE_HOME/sdsc-utils/app.log` or `~/.local/state/sdsc-utils/app.log`
-- **Second launch does nothing** — only one instance is allowed; the second process exits after logging.
+- **Second launch takes over** — only one instance runs; launching again terminates the running predecessor and takes over (no silent exit).
 - **Exe icon looks stale in Explorer** — rebuild release, then refresh the folder or restart Explorer (Windows caches icons).
 - **Controller not listed** — wait a few seconds after power-on (presence is scanned every 3s); check the log if open/read fails.
 - **Tray slow to show disconnect** — fixed in 0.1.2 (faster liveness probes). Bluetooth pads can linger in Windows HID briefly after power-off.

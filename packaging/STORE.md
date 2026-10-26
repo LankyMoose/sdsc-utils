@@ -45,7 +45,7 @@ Unofficial third-party utility — not affiliated with, endorsed by, or sponsore
 - **Compatibility (body):** Works with DualSense wireless controllers and DualSense Edge wireless controllers.
 - **Disclaimer:** Unofficial. DualSense, DualSense Edge, PlayStation, and related marks are trademarks of Sony Interactive Entertainment Inc. This app is not affiliated with, endorsed by, or sponsored by Sony.
 - **Privacy policy URL:** the Privacy policy section of the GitHub README (`https://github.com/LankyMoose/sdsc-utils#privacy-policy`).
-- **Screenshots:** use `assets/screenshots/` (controller popup, start screen Games / edit / Controllers, Settings lightbar / notifications / toasts / analytics).
+- **Screenshots:** use `assets/screenshots/1.7.0/` (controllers popup, Start screen / settings drawer, Settings System / Notifications / Lightbar / Analytics tabs). Older sets are archived under `assets/screenshots/<version>/`.
 - **Age rating:** complete the questionnaire (expect Everyone / suitable for all ages for this utility).
 
 ## Capabilities justification
