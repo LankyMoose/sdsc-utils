@@ -174,6 +174,9 @@ pub enum Message {
     PreviewClose,
 
     StartOpened(window::Id),
+    /// Deferred Start HWND destruction (second close phase; see
+    /// `start_close_armed`). Lets the cursor-restore present land first.
+    FinishStartClose,
     /// Drive start-screen animation frames.
     StartFrame,
     /// Mouse move/button/wheel on a window — resets start activity (cursor + idle/sleep).
@@ -268,6 +271,7 @@ impl Message {
             | Message::PlacePopup { .. }
             | Message::ConfigureOpened(_)
             | Message::StartOpened(_)
+            | Message::FinishStartClose
             | Message::StartFrame
             | Message::StartArtEvent(_) => false,
             #[cfg(debug_assertions)]
@@ -420,6 +424,12 @@ pub struct App {
     start_window: Option<window::Id>,
     /// True only while Start is revealed (warm HWND may exist while false).
     start_visible: bool,
+    /// Close is two-phase when the cursor was hidden: the flag clears
+    /// immediately, but HWND destruction waits one loop pass
+    /// (`FinishStartClose`) so a rebuild pushes the restored cursor to the
+    /// OS first. Destroying a hidden-cursor window skips that push and
+    /// leaks a global `ShowCursor(FALSE)` (winit only pushes on change).
+    start_close_armed: bool,
     /// Last Start-window paint (for the transition paint-gap witness;
     /// `Cell` because `view()` only gets `&self`).
     last_start_paint_at: std::cell::Cell<Option<Instant>>,
@@ -531,6 +541,12 @@ pub struct App {
     toast_placement: Option<ToastPlacement>,
     /// Last frame Instant for capped slide dt (set on ToastShown / dismiss / each frame).
     toast_anim_started: Instant,
+    /// Wall-clock deadline for the active toast (`TOAST_LIFETIME` after show).
+    /// The `ToastDismiss` delay task already fires on a worker thread, but its
+    /// delivery stalls while the iced loop is blocked (e.g. native tray-menu
+    /// modal loop). This deadline lets the first `ToastFrame` after resume
+    /// dismiss immediately instead of extending the lifetime by the stall.
+    toast_expire_at: Option<Instant>,
     /// Pure toast / deferred-Start presentation machine.
     toast_machine: toast_machine::State,
     /// True until the first Start HWND of this process finishes its cold-load ceremony.
@@ -724,6 +740,7 @@ impl App {
             pad_input_panel: PadInputPanel::default(),
             start_window: None,
             start_visible: false,
+            start_close_armed: false,
             last_start_paint_at: std::cell::Cell::new(None),
             last_start_paint_active: std::cell::Cell::new(false),
             start_nav_ready: false,
@@ -779,6 +796,7 @@ impl App {
             toast_generation: 0,
             toast_placement: None,
             toast_anim_started: Instant::now(),
+            toast_expire_at: None,
             toast_machine: toast_machine::State::Idle,
             start_cold_load_remaining: true,
             spectrum_generation: 0,
@@ -1193,7 +1211,11 @@ impl App {
                 Some(toast) => stack![start, toast].width(Fill).height(Fill).into(),
                 None => start,
             };
-            return cursor_hide::force_cursor(start, self.start_cursor_hidden).into();
+            return cursor_hide::force_cursor(
+                start,
+                self.start_cursor_hidden && self.start_visible,
+            )
+            .into();
         }
 
         if Some(window) == self.toast_window {
@@ -1258,12 +1280,23 @@ impl App {
             Message::CloseGameDone(result) => self.on_close_game_done(result),
 
             Message::TrayMenu(id) => match id.as_str() {
-                SETTINGS_ID => self.open_configure(),
+                SETTINGS_ID => {
+                    // Tray engaged while Start is up: the press never reaches
+                    // Start (taskbar sits above the cover), so unhide here or
+                    // the native menu opens under a hidden cursor.
+                    if self.start_visible {
+                        self.note_start_cursor_activity();
+                    }
+                    self.open_configure()
+                }
                 QUIT_ID => self.update(Message::Exit),
                 _ => Task::none(),
             },
             Message::TrayLeftClick(anchor) => {
                 self.tray_anchor = anchor;
+                if self.start_visible {
+                    self.note_start_cursor_activity();
+                }
                 self.toggle_popup()
             }
 
@@ -1314,6 +1347,7 @@ impl App {
             },
 
             Message::StartOpened(id) => self.on_start_opened(id),
+            Message::FinishStartClose => self.finish_start_close(),
             Message::StartArtEvent(ev) => self.on_start_art_event(ev),
             Message::StartFrame => self.on_start_frame(),
             Message::StartCursorActivity(id) => {
@@ -1408,7 +1442,12 @@ impl App {
         } else if Some(id) == self.start_window {
             self.start_window = None;
             self.start_visible = false;
+            self.start_close_armed = false;
             self.start_nav_ready = false;
+            // Defensive: an OS-close path bypasses close_start_screen's
+            // clear_start_activity, so never leak a Hidden interaction into
+            // a later window (the force_cursor gate above is the backstop).
+            self.set_start_cursor_hidden(false);
             self.pad_nav.reset();
             self.clear_start_nav_diag();
             self.consume_reopen_gesture_chord();
@@ -1825,6 +1864,15 @@ impl App {
 
     fn on_exit(&mut self) -> Task<Message> {
         crate::controller::hid::diag::diag_info("ui-diag: process exit begin");
+        // Quitting while the cursor is idle-hidden would leak a global
+        // ShowCursor(FALSE) past process death (winit only restores on
+        // change, and there is no later present). Restore only when the
+        // OS reports hidden so a balanced counter is never disturbed.
+        #[cfg(windows)]
+        if self.start_cursor_hidden && !crate::platform::win32::cursor_visible().unwrap_or(true) {
+            crate::controller::hid::diag::diag_info("ui-diag: exit cursor restore");
+            unsafe { crate::platform::win32::show_cursor(true) };
+        }
         // A renderer-pref restart keeps its restore record; a plain
         // Quit clears it so the next launch starts clean.
         if !self.restarting_for_renderer {

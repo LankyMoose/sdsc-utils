@@ -18,6 +18,8 @@ pub const WM_QUIT: u32 = 0x0012;
 pub const MONITOR_DEFAULTTONULL: u32 = 0;
 pub const MONITOR_DEFAULTTOPRIMARY: u32 = 1;
 pub const MDT_EFFECTIVE_DPI: u32 = 0;
+/// `CURSORINFO.flags` value reporting a visible cursor.
+pub const CURSOR_SHOWING: u32 = 0x0000_0001;
 
 pub const GWL_STYLE: i32 = -16;
 pub const GWL_EXSTYLE: i32 = -20;
@@ -60,6 +62,16 @@ pub struct MonitorInfo {
     pub monitor: Rect,
     pub work: Rect,
     pub flags: u32,
+}
+
+/// Mirrors Win32 `CURSORINFO` for [`GetCursorInfo`].
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct CursorInfo {
+    pub size: u32,
+    pub flags: u32,
+    pub cursor: isize,
+    pub pos: Point,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -159,6 +171,8 @@ unsafe extern "system" {
     pub fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
     pub fn GetForegroundWindow() -> isize;
     pub fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
+    pub fn ShowCursor(show: i32) -> i32;
+    pub fn GetCursorInfo(info: *mut CursorInfo) -> i32;
     pub fn GetWindowLongW(hwnd: isize, index: i32) -> isize;
     pub fn SetWindowLongW(hwnd: isize, index: i32, value: isize) -> isize;
     pub fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
@@ -178,6 +192,32 @@ unsafe extern "system" {
         callback: unsafe extern "system" fn(isize, isize, *mut Rect, isize) -> i32,
         data: isize,
     ) -> i32;
+}
+
+/// Whether the OS currently reports the cursor as visible (`None` when the
+/// probe fails; callers treat failure as visible so a balanced `ShowCursor`
+/// display counter is never disturbed).
+pub fn cursor_visible() -> Option<bool> {
+    let mut info = CursorInfo {
+        size: std::mem::size_of::<CursorInfo>() as u32,
+        ..CursorInfo::default()
+    };
+    // SAFETY: `info` is caller-owned with `size` initialized as required.
+    if unsafe { GetCursorInfo(&mut info) } == 0 {
+        return None;
+    }
+    Some(info.flags & CURSOR_SHOWING != 0)
+}
+
+/// One `ShowCursor` step toward visible; returns the new display count.
+/// Call only when [`cursor_visible`] reports hidden — each call must pair
+/// with a prior hide or the system-wide counter drifts.
+///
+/// # Safety
+/// Safe to call on any thread: `ShowCursor` takes no handles and only
+/// adjusts the calling thread's display counter by one step.
+pub unsafe fn show_cursor(visible: bool) -> i32 {
+    unsafe { ShowCursor(i32::from(visible)) }
 }
 
 pub const SWP_NOZORDER: u32 = 0x0004;

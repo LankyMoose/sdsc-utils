@@ -1220,7 +1220,8 @@ impl App {
                 .start_state
                 .selected_controller()
                 .is_some_and(|row| row.show_power_off());
-        // Left/right move. Settings: Left/Right nudge sliders.
+        // Left/right move. Settings ignores Left/Right (form controls are
+        // mouse-driven); Up/Down moves focus.
         let horizontal_nav = true;
         // Horizontal Games strip: left/right scroll games.
         let horizontal_games_nav = self.immersive_horizontal_games_nav();
@@ -1821,10 +1822,10 @@ impl App {
         let Some(action) = action else {
             return Task::none();
         };
-        // Layout transition reflows main content: drop focus moves + slider nudges
+        // Layout transition reflows main content: drop focus moves
         // (pad and keyboard alike) while it runs; Confirm/Cancel stay live, and
         // an open-menu Confirm still commits — deliberate picks are never
-        // frozen, only navigation is.
+        // frozen, only navigation is. Left/Right are no-ops in settings.
         if self.start_state.layout_transition_active()
             && matches!(
                 action,
@@ -1867,19 +1868,9 @@ impl App {
                 Task::none()
             }
             NavAction::Left | NavAction::Right => {
-                let delta = if matches!(action, NavAction::Left) {
-                    -1
-                } else {
-                    1
-                };
-                let Some(row) = self.start_state.settings.focused_row(&snapshot) else {
-                    return Task::none();
-                };
-                if let Some(msg) = crate::ui::start::settings::nudge_message(row, &snapshot, delta)
-                {
-                    self.play_start_settings_cue(row, UiSoundKind::Nav);
-                    return self.on_start_message(msg);
-                }
+                // Form controls are mouse-driven: Left/Right never nudge
+                // sliders, cycle selectors, or flip toggles. Up/Down moves
+                // focus, Confirm opens/commits, mouse drag adjusts sliders.
                 Task::none()
             }
             NavAction::Confirm => {
@@ -1914,13 +1905,13 @@ impl App {
         };
         let count = row.selector_count() as isize;
         match action {
-            NavAction::Up | NavAction::Left => {
+            NavAction::Up => {
                 let next = (highlight as isize - 1).rem_euclid(count) as usize;
                 self.start_state.settings.set_menu_highlight(next);
                 self.play_start_cue(UiSoundKind::Nav);
                 self.scroll_settings_focus_into_view(start_view::ScrollReveal::Either)
             }
-            NavAction::Down | NavAction::Right => {
+            NavAction::Down => {
                 let next = (highlight as isize + 1).rem_euclid(count) as usize;
                 self.start_state.settings.set_menu_highlight(next);
                 self.play_start_cue(UiSoundKind::Nav);
@@ -2625,6 +2616,8 @@ impl App {
         if !self.session.prefs.start_screen_enabled {
             return Task::none();
         }
+        // An explicit open wins over a pending deferred destroy.
+        self.start_close_armed = false;
         self.start_state.editing = false;
         self.start_state.edit_anchor_play_key = None;
         self.edit_draft = None;
@@ -2847,6 +2840,14 @@ impl App {
             self.set_start_cursor_hidden(false);
             return;
         }
+        // The cover spans the full monitor including the taskbar, but
+        // taskbar input never reaches Start — hiding there strands the
+        // cursor with no self-unhide path (notably across a blocking
+        // tray-menu modal loop).
+        if !crate::platform::host::Host::cursor_in_work_area() {
+            self.set_start_cursor_hidden(false);
+            return;
+        }
         let idle = now.saturating_duration_since(self.start_cursor_last_active);
         if idle >= START_CURSOR_IDLE_HIDE {
             self.set_start_cursor_hidden(true);
@@ -2925,6 +2926,15 @@ impl App {
     }
 
     pub(crate) fn close_start_screen(&mut self) -> Task<Message> {
+        // A close arriving while a deferred destroy is armed is already
+        // handled: the armed phase owns the teardown.
+        if self.start_close_armed {
+            return Task::none();
+        }
+        // Capture before clear: destroying a hidden-cursor window skips the
+        // restore present (winit only pushes on change) and leaks a global
+        // ShowCursor(FALSE). The armed phase below lets the restore land.
+        let was_hidden = self.start_cursor_hidden;
         // Clear visibility before any hide task so Resting toast RaiseInteractive
         // cannot resurface Start while the hide is in flight.
         self.start_visible = false;
@@ -2955,6 +2965,30 @@ impl App {
         // Focus-close often leaves the reopen chord held (e.g. PS); latch until
         // a debounced full release so the next PadPoll cannot immediately reopen.
         self.arm_chord_release_latch();
+        if was_hidden && self.start_window.is_some() {
+            // Deferred destroy: the flag already cleared above, so the next
+            // loop pass rebuilds with a visible interaction and pushes the
+            // restore to the OS before FinishStartClose tears down the HWND.
+            crate::controller::hid::diag::diag_info("ui-diag: start close armed (cursor restore)");
+            self.start_close_armed = true;
+            return Task::done(Message::FinishStartClose);
+        }
+        self.hide_and_close_start_window()
+    }
+
+    /// Second close phase: destroy the Start HWND after the cursor-restore
+    /// present has landed (see `start_close_armed`).
+    pub(crate) fn finish_start_close(&mut self) -> Task<Message> {
+        if !self.start_close_armed {
+            return Task::none();
+        }
+        self.start_close_armed = false;
+        self.hide_and_close_start_window()
+    }
+
+    /// Hide-then-close the Start HWND (avoids a DWM default-brush flash
+    /// while the wgpu surface tears down). No-op without a window.
+    fn hide_and_close_start_window(&mut self) -> Task<Message> {
         match self.start_window {
             Some(id) => {
                 crate::controller::hid::diag::diag_info("ui-diag: start close");

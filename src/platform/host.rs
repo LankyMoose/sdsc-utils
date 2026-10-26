@@ -370,6 +370,36 @@ impl Host {
         }
     }
 
+    /// Whether the cursor is inside the primary monitor's work area
+    /// (excludes the taskbar strip and other reserved chrome).
+    ///
+    /// The Start cover spans the full monitor including the taskbar, but
+    /// taskbar input never reaches Start — hiding there strands the cursor
+    /// with no self-unhide path (notably across a blocking tray-menu modal
+    /// loop). `false` off Windows or when the query fails (fail visible).
+    pub fn cursor_in_work_area() -> bool {
+        #[cfg(windows)]
+        {
+            // SAFETY: `GetCursorPos` writes only to the caller-owned `point`.
+            unsafe {
+                let mut point = crate::platform::win32::Point::default();
+                if crate::platform::win32::GetCursorPos(&mut point) == 0 {
+                    return false;
+                }
+                let Some(((ml, mt, mr, mb), (wl, wt, wr, wb), _, _)) = Self::primary_metrics()
+                else {
+                    return false;
+                };
+                let on_primary = point.x >= ml && point.x < mr && point.y >= mt && point.y < mb;
+                on_primary && point.x >= wl && point.x < wr && point.y >= wt && point.y < wb
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     /// Primary monitor + work-area geometry for UI cover math.
     ///
     /// Returns `(monitor_rect, work_rect, dpi_scale, foreground_covers_monitor)`

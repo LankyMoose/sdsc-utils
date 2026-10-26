@@ -745,9 +745,9 @@ impl App {
     }
 
     /// Pad/keyboard nav while the tuning panel is open. Mirrors the settings
-    /// drawer dispatch: Up/Down move focus, Left/Right nudge sliders, Cross
-    /// confirms buttons, Circle closes back to the drawer. Release stub:
-    /// the panel cannot open there.
+    /// drawer dispatch: Up/Down move focus, Cross confirms buttons, Circle
+    /// closes back to the drawer. Sliders are mouse-driven (no Left/Right
+    /// nudging). Release stub: the panel cannot open there.
     pub(crate) fn on_ambient_tuning_nav(&mut self, action: Option<NavAction>) -> Task<Message> {
         #[cfg(debug_assertions)]
         {
@@ -771,21 +771,7 @@ impl App {
                     Task::none()
                 }
                 NavAction::Left | NavAction::Right => {
-                    let delta = if matches!(action, NavAction::Left) {
-                        -1
-                    } else {
-                        1
-                    };
-                    let focus = self
-                        .start_state
-                        .ambient_tune_focus
-                        .min(TuneRow::count().saturating_sub(1));
-                    if let TuneRow::Param(param) = TuneRow::ALL[focus]
-                        && let Some(next) = param.nudge(delta)
-                    {
-                        self.play_start_cue(UiSoundKind::Nav);
-                        return self.apply_ambient_tune(param, next);
-                    }
+                    // Form controls are mouse-driven: no Left/Right nudging.
                     Task::none()
                 }
                 NavAction::Confirm => {

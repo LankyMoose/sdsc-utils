@@ -14,6 +14,7 @@ use crate::ui::layout::{
     raise_window_topmost, remount_toast_surface, set_toast_topmost, show_toast_without_activate,
     slide_y, toast_local_in_cover, toast_placement,
 };
+use crate::ui::motion::MAX_FRAME_DT;
 use crate::ui::toast::ToastMessage;
 use crate::ui::toast::machine::{self as toast_machine, Effect as ToastEffect};
 use crate::ui::toast::view as toast_view;
@@ -111,6 +112,11 @@ impl App {
         ));
         self.toast_message = Some(message);
 
+        // Wall-clock deadline: the delay worker below fires on time, but its
+        // delivery stalls while the iced loop is blocked (tray-menu modal
+        // loop). The first ToastFrame after resume checks this and dismisses
+        // immediately instead of extending the lifetime by the stall.
+        self.toast_expire_at = Some(Instant::now() + TOAST_LIFETIME);
         let expire = Task::perform(delay(TOAST_LIFETIME), move |()| {
             Message::ToastDismiss(generation)
         });
@@ -260,6 +266,7 @@ impl App {
 
     pub(crate) fn effect_toast_finished(&mut self) -> Task<Message> {
         let _ = self.toast_message.take();
+        self.toast_expire_at = None;
         // Invalidate any in-flight expiry for this toast.
         self.toast_generation = self.toast_generation.wrapping_add(1);
         self.toast_placement = None;
@@ -393,11 +400,53 @@ impl App {
 
     pub(crate) fn handle_toast_frame(&mut self) -> Task<Message> {
         let Some(generation) = self.toast_machine.generation() else {
+            self.toast_expire_at = None;
             return Task::none();
         };
         let now = Instant::now();
         let raw_dt = now.saturating_duration_since(self.toast_anim_started);
         self.toast_anim_started = now;
+        // Wall-clock expiry: the delay worker fires on time but delivery
+        // stalls while the iced loop is blocked (tray-menu modal loop).
+        // Dismiss on the first frame after resume instead of extending the
+        // lifetime by the stall.
+        if let Some(deadline) = self.toast_expire_at
+            && now >= deadline
+        {
+            self.toast_expire_at = None;
+            return self.toast_step(toast_machine::Event::Dismiss { generation });
+        }
+        if self.toast_machine.is_resting() {
+            return Task::none();
+        }
+        // Stall catch-up: each frame caps at 32ms so a blocked loop resumes
+        // smoothly from the frozen pose. After a tray-menu stall raw_dt is
+        // seconds; replay capped steps in this one tick so the pose jumps to
+        // its wall-clock position (occasionally jumpy by design).
+        if raw_dt > MAX_FRAME_DT {
+            let steps =
+                usize::try_from((raw_dt.as_millis() / MAX_FRAME_DT.as_millis()).clamp(1, 64))
+                    .unwrap_or(64)
+                    .clamp(1, 64);
+            let mut task = self.toast_step(toast_machine::Event::Frame {
+                generation,
+                raw_dt: MAX_FRAME_DT,
+            });
+            for _ in 1..steps {
+                let current = match self.toast_machine.generation() {
+                    Some(current) if current == generation => current,
+                    _ => break,
+                };
+                if !self.toast_machine.wants_frames() || self.toast_machine.is_resting() {
+                    break;
+                }
+                task = task.chain(self.toast_step(toast_machine::Event::Frame {
+                    generation: current,
+                    raw_dt: MAX_FRAME_DT,
+                }));
+            }
+            return task;
+        }
         self.toast_step(toast_machine::Event::Frame { generation, raw_dt })
     }
 

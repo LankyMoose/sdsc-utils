@@ -493,8 +493,7 @@ impl SettingsRow {
     /// Absolute-value commit for slider rows (mouse drag): maps the widget's
     /// f32 position back onto the committed value with the same tables and
     /// rounding the panel positions use. The apply side re-clamps (idle/sleep
-    /// pair, percent ranges) exactly as for pad nudges, so both origins
-    /// commit identically.
+    /// pair, percent ranges), so mouse commits land on the same values.
     fn slider_select(self, snapshot: &StartSettingsSnapshot, value: f32) -> StartMessage {
         match self {
             Self::IdleSecs => {
@@ -829,17 +828,19 @@ pub fn confirm_message(row: SettingsRow, snapshot: &StartSettingsSnapshot) -> Op
         RowKind::Toggle => Some(row.set_toggle(!row.toggle_value(snapshot))),
         // The reload action applies pending renderer prefs immediately.
         RowKind::Action => Some(StartMessage::ReloadUi),
-        // Sliders step with Left/Right; Cross does nothing.
+        // Sliders are mouse-driven; Cross does nothing.
         RowKind::Slider => None,
     }
 }
 
-/// Left/Right on the focused row (`delta` −1 = left, +1 = right).
+/// Programmatic row nudge (`delta` −1 = left, +1 = right).
 ///
-/// Sliders step; toggles set off on left and on on right (no-op if already there).
-/// Auto open and Layout quick-cycle without opening the menu
-/// (Confirm opens the menu for direct picking instead). With a menu open,
-/// directionals move the highlight and Confirm picks / Cancel closes.
+/// No longer wired to Left/Right nav (form controls are mouse-driven);
+/// retained for tests. Sliders step; toggles set off on left and on on
+/// right (no-op if already there). Auto open and Layout quick-cycle without
+/// opening the menu (Confirm opens the menu for direct picking instead).
+/// With a menu open, Up/Down move the highlight and Confirm picks /
+/// Cancel closes.
 pub fn nudge_message(
     row: SettingsRow,
     snapshot: &StartSettingsSnapshot,
@@ -1217,11 +1218,9 @@ pub fn panel_view<'a>(
     // order, each with its anchored gap/section prefix and its trailing
     // dropdown panel (when that selector owns the open menu). Exhaustive by
     // construction: a new SettingsRow variant fails to compile here until its
-    // widget is declared. Messages route through the same row constructors
-    // as the pad paths — `open_menu` is what confirm yields, `set_toggle`
+    // widget is declared. `open_menu` is what confirm yields, `set_toggle`
     // is the confirm flip, `selector_select` is the menu-nav commit, and
-    // `slider_select` is the absolute-value nudge equivalent — so mouse
-    // and pad commits can't drift apart.
+    // `slider_select` is the mouse-drag commit.
     let idle_secs = snapshot.inactive_secs;
     let idle_idx = secs_step_index(idle_secs, START_SCREEN_IDLE_SECS_STEPS);
     let idle_max = START_SCREEN_IDLE_SECS_STEPS.len().saturating_sub(1) as f32;
