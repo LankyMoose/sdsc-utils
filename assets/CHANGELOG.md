@@ -1,3 +1,14 @@
+## 1.7.1
+### Added
+- Uninstalled Steam games stay listed with their real titles (Show uninstalled games toggle, default on)
+- View in Steam action for Steam rows
+- Discard-changes guard when leaving edit mode with unsaved changes
+### Changed
+- Steam library auto-resyncs on install changes and whenever Start opens
+- Controllers panel and settings drawer open over dirty edits without discarding
+### Fixed
+- Start/Options and Create no longer bypass the discard-confirm modal
+
 ## 1.7.0
 ### Added
 - Horizontal immersive layout mode for the Start screen (Vertical/Horizontal selector)
