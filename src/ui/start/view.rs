@@ -93,6 +93,9 @@ pub enum StartMessage {
     SetPerfVsync(bool),
     /// Reload the UI to apply boot-only renderer prefs (AA/vsync).
     ReloadUi,
+    SetShowUninstalledGames(bool),
+    /// Rescan the Steam library now (no-op while a scan is in flight).
+    SyncSteamLibrary,
     /// Debug-only: open the in-immersive ambience tuning panel.
     #[cfg(debug_assertions)]
     OpenAmbientTuning,
@@ -166,9 +169,15 @@ pub struct StartRow {
     pub skeleton: bool,
     /// Steam install has an update pending (`StateFlags` update-required).
     pub update_required: bool,
-    /// Scan determined this target is no longer installed (Steam uninstalled or
-    /// manual file missing). Row is dimmed and cannot launch.
+    /// Scan determined this target cannot launch (manual file missing). Row is
+    /// dimmed and cannot launch. Steam rows are never disabled: unlaunchable
+    /// ones stay enabled with `view_in_steam` set.
     pub disabled: bool,
+    /// Steam row Steam cannot launch: Cross opens the game's store page
+    /// instead (`Some(appid)`). Set for scan-proven-uninstalled rows and
+    /// pre-flight-blocked rows; `None` for launchable rows, skeletons, and
+    /// manual entries. Rows with this set stay enabled and navigable.
+    pub view_in_steam: Option<u32>,
     /// Effective last-played time (catalog touch or Steam), milliseconds. `None` = never.
     pub played_at_ms: Option<u64>,
 }
@@ -182,7 +191,9 @@ pub enum EditRow {
 
 impl StartRow {
     pub(crate) fn launch_hint_label(&self) -> &'static str {
-        if self.update_required {
+        if self.view_in_steam.is_some() {
+            "View in Steam"
+        } else if self.update_required {
             "Update & launch"
         } else {
             "Launch"
@@ -193,6 +204,8 @@ impl StartRow {
         entry: &GameEntry,
         steam_by_id: &HashMap<u32, SteamGame>,
         steam_scan_pending: bool,
+        remembered_name: Option<&str>,
+        known_missing: bool,
     ) -> Self {
         match entry {
             GameEntry::Steam { appid } => {
@@ -213,6 +226,7 @@ impl StartRow {
                         skeleton: false,
                         update_required: game.update_required,
                         disabled: false,
+                        view_in_steam: None,
                         played_at_ms: None,
                     }
                 } else if steam_scan_pending {
@@ -229,12 +243,25 @@ impl StartRow {
                         skeleton: true,
                         update_required: false,
                         disabled: false,
+                        view_in_steam: None,
                         played_at_ms: None,
                     }
                 } else {
+                    // Live scan missed this appid: prefer the last-known name
+                    // over the bare `Steam {appid}` fallback, and explain why
+                    // instead of leaking the launch URI as the subtitle.
+                    let title = remembered_name
+                        .filter(|name| !name.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("Steam {appid}"));
+                    let subtitle = if known_missing {
+                        StartSubtitle::Plain("Not installed".into())
+                    } else {
+                        StartSubtitle::Plain("Steam".into())
+                    };
                     Self {
-                        title: format!("Steam {appid}"),
-                        subtitle: Some(StartSubtitle::Plain(format!("steam://rungameid/{appid}"))),
+                        title,
+                        subtitle: Some(subtitle),
                         target: crate::games::steam::launch_uri(*appid),
                         args: String::new(),
                         play_key: entry.play_key(),
@@ -244,9 +271,12 @@ impl StartRow {
                         edit: None,
                         skeleton: false,
                         update_required: false,
-                        // Disabled is resolved in refresh (needs installed list);
-                        // default to enabled here so unknown-scan fallbacks stay launchable.
+                        // Rows the scan proved missing stay enabled: Cross
+                        // opens the game's store page (`view_in_steam`)
+                        // instead of launching. Unknown-scan fallbacks stay
+                        // launchable via the rungameid target.
                         disabled: false,
+                        view_in_steam: known_missing.then_some(*appid),
                         played_at_ms: None,
                     }
                 }
@@ -272,6 +302,7 @@ impl StartRow {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 }
             }
@@ -298,10 +329,35 @@ impl StartRow {
             skeleton: false,
             update_required: game.update_required,
             disabled: false,
+            view_in_steam: None,
             played_at_ms: None,
         }
     }
 
+    /// Edit-checklist row for a curated Steam app the live scan missed
+    /// (uninstalled). Carries the last-known title so it can be untoggled;
+    /// Cross toggles membership here, never View in Steam.
+    pub fn steam_uninstalled(appid: u32, title: String, played_at_ms: Option<u64>) -> Self {
+        Self {
+            title,
+            subtitle: Some(StartSubtitle::Plain("Not installed".into())),
+            target: crate::games::steam::launch_uri(appid),
+            args: String::new(),
+            play_key: format!("steam:{appid}"),
+            icon: None,
+            icon_source: None,
+            backdrop_path: None,
+            edit: Some(EditRow::Steam {
+                appid,
+                in_catalog: true,
+            }),
+            skeleton: false,
+            update_required: false,
+            disabled: false,
+            view_in_steam: None,
+            played_at_ms,
+        }
+    }
     pub fn manual_edit(entry: &GameEntry) -> Option<Self> {
         let GameEntry::Manual {
             id,
@@ -327,6 +383,7 @@ impl StartRow {
             skeleton: false,
             update_required: false,
             disabled: false,
+            view_in_steam: None,
             played_at_ms: None,
         })
     }
@@ -3596,7 +3653,7 @@ pub(crate) fn scan_status_chip<'a>(
         (ChromeStatusKind::PreparingArt, true) => "Artwork ready",
         (ChromeStatusKind::PreparingArt, false) => "Preparing artwork…",
         (ChromeStatusKind::SteamLibrary, true) => "Steam library synced",
-        (ChromeStatusKind::SteamLibrary, false) => "Scanning Steam library…",
+        (ChromeStatusKind::SteamLibrary, false) => "Syncing Steam library…",
     };
     row![
         icon,
@@ -4045,6 +4102,7 @@ mod tests {
             skeleton: false,
             update_required: false,
             disabled: false,
+            view_in_steam: None,
             played_at_ms: None,
         }
     }
@@ -4308,7 +4366,7 @@ mod tests {
     fn from_entry_skeleton_while_scan_pending() {
         let entry = GameEntry::Steam { appid: 1371980 };
         let empty = HashMap::new();
-        let row = StartRow::from_entry(&entry, &empty, true);
+        let row = StartRow::from_entry(&entry, &empty, true, None, false);
         assert!(row.skeleton);
         assert!(row.title.is_empty());
         assert!(row.icon.is_none());
@@ -4320,16 +4378,52 @@ mod tests {
     fn from_entry_appid_fallback_after_scan() {
         let entry = GameEntry::Steam { appid: 1371980 };
         let empty = HashMap::new();
-        let row = StartRow::from_entry(&entry, &empty, false);
+        let row = StartRow::from_entry(&entry, &empty, false, None, false);
         assert!(!row.skeleton);
         assert_eq!(row.title, "Steam 1371980");
         assert!(row.icon.is_none());
         assert_eq!(row.play_key, "steam:1371980");
         assert!(matches!(
             row.subtitle.as_ref(),
-            Some(StartSubtitle::Plain(uri)) if uri == "steam://rungameid/1371980"
+            Some(StartSubtitle::Plain(label)) if label == "Steam"
         ));
         assert!(!row.target.is_empty());
+        // Unknown scan: no proven absence, so the row stays launchable.
+        assert_eq!(row.view_in_steam, None);
+        assert_eq!(row.launch_hint_label(), "Launch");
+    }
+
+    #[test]
+    fn from_entry_prefers_remembered_name_and_explains_missing() {
+        let entry = GameEntry::Steam { appid: 1314000 };
+        let empty = HashMap::new();
+        // Proven uninstalled: last-known title, "Not installed" subtitle,
+        // Cross routes to View in Steam instead of launching.
+        let row = StartRow::from_entry(
+            &entry,
+            &empty,
+            false,
+            Some("Achilles: Legends Untold"),
+            true,
+        );
+        assert!(!row.skeleton);
+        assert_eq!(row.title, "Achilles: Legends Untold");
+        assert!(matches!(
+            row.subtitle.as_ref(),
+            Some(StartSubtitle::Plain(label)) if label == "Not installed"
+        ));
+        assert_eq!(row.target, "steam://rungameid/1314000");
+        assert_eq!(row.view_in_steam, Some(1314000));
+        assert_eq!(row.launch_hint_label(), "View in Steam");
+        // Blank remembered names never blank the title.
+        let blank = StartRow::from_entry(&entry, &empty, false, Some("   "), true);
+        assert_eq!(blank.title, "Steam 1314000");
+        assert_eq!(blank.view_in_steam, Some(1314000));
+        // Remembered name without proven absence: title only, still launches.
+        let unsure = StartRow::from_entry(&entry, &empty, false, Some("Achilles"), false);
+        assert_eq!(unsure.title, "Achilles");
+        assert_eq!(unsure.view_in_steam, None);
+        assert_eq!(unsure.launch_hint_label(), "Launch");
     }
 
     #[test]
@@ -4349,7 +4443,7 @@ mod tests {
                 update_required: true,
             },
         );
-        let row = StartRow::from_entry(&entry, &map, true);
+        let row = StartRow::from_entry(&entry, &map, true, None, false);
         assert!(!row.skeleton);
         assert_eq!(row.title, "Path of Exile");
         assert!(
@@ -4360,6 +4454,26 @@ mod tests {
         assert!(row.update_required);
         assert_eq!(row.launch_hint_label(), "Update & launch");
         assert!(row.icon.is_none());
+    }
+
+    #[test]
+    fn steam_uninstalled_row_is_toggleable_not_viewable() {
+        let row = StartRow::steam_uninstalled(1314000, "Achilles: Legends Untold".into(), Some(99));
+        assert_eq!(row.title, "Achilles: Legends Untold");
+        assert_eq!(row.play_key, "steam:1314000");
+        assert_eq!(row.target, "steam://rungameid/1314000");
+        assert!(matches!(
+            row.edit,
+            Some(EditRow::Steam {
+                appid: 1314000,
+                in_catalog: true
+            })
+        ));
+        // Edit mode owns Cross (toggle): never View in Steam, never disabled.
+        assert_eq!(row.view_in_steam, None);
+        assert!(!row.disabled);
+        assert!(!row.skeleton);
+        assert_eq!(row.played_at_ms, Some(99));
     }
 
     #[test]
@@ -4392,6 +4506,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 },
                 StartRow {
@@ -4407,6 +4522,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 },
                 StartRow {
@@ -4422,6 +4538,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 },
             ],
@@ -4467,6 +4584,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -4511,6 +4629,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -4539,6 +4658,7 @@ mod tests {
                 skeleton: false,
                 update_required: false,
                 disabled: false,
+                view_in_steam: None,
                 played_at_ms: None,
             })
             .collect()
@@ -4824,6 +4944,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -4871,6 +4992,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -4964,6 +5086,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -4993,6 +5116,7 @@ mod tests {
             skeleton: false,
             update_required: false,
             disabled,
+            view_in_steam: None,
             played_at_ms,
         }
     }
@@ -5038,6 +5162,7 @@ mod tests {
             skeleton: false,
             update_required: false,
             disabled: false,
+            view_in_steam: None,
             played_at_ms: None,
         }
     }
@@ -5413,6 +5538,7 @@ mod tests {
                 skeleton: false,
                 update_required: false,
                 disabled: false,
+                view_in_steam: None,
                 played_at_ms: None,
             }],
             game_selected: 0,
@@ -5548,6 +5674,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 }],
                 game_selected: 0,
@@ -5595,6 +5722,7 @@ mod tests {
                 skeleton: true,
                 update_required: false,
                 disabled: false,
+                view_in_steam: None,
                 played_at_ms: None,
             }],
             game_selected: 0,
@@ -5645,6 +5773,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 }],
                 game_selected: 0,
@@ -5682,6 +5811,7 @@ mod tests {
                 skeleton: true,
                 update_required: false,
                 disabled: false,
+                view_in_steam: None,
                 played_at_ms: None,
             }],
             game_selected: 0,
@@ -5851,6 +5981,7 @@ mod tests {
                         skeleton: false,
                         update_required: false,
                         disabled: false,
+                        view_in_steam: None,
                         played_at_ms: None,
                     },
                     StartRow {
@@ -5866,6 +5997,7 @@ mod tests {
                         skeleton: false,
                         update_required: false,
                         disabled: false,
+                        view_in_steam: None,
                         played_at_ms: None,
                     },
                 ],
@@ -5936,6 +6068,7 @@ mod tests {
                         skeleton: false,
                         update_required: false,
                         disabled: false,
+                        view_in_steam: None,
                         played_at_ms: None,
                     },
                     StartRow {
@@ -5951,6 +6084,7 @@ mod tests {
                         skeleton: false,
                         update_required: false,
                         disabled: false,
+                        view_in_steam: None,
                         played_at_ms: None,
                     },
                 ],
@@ -6009,6 +6143,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -6042,6 +6177,7 @@ mod tests {
                     skeleton: false,
                     update_required: false,
                     disabled: false,
+                    view_in_steam: None,
                     played_at_ms: None,
                 })
                 .collect(),
@@ -6091,6 +6227,7 @@ mod tests {
                 skeleton: false,
                 update_required: false,
                 disabled: false,
+                view_in_steam: None,
                 played_at_ms: None,
             };
             assert!(row.list_icon_live().is_none());

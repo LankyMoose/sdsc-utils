@@ -61,6 +61,14 @@ pub struct GamesCatalog {
     /// Unix millis of last successful launch, keyed by [`GameEntry::play_key`].
     #[serde(default)]
     pub last_played_ms: BTreeMap<String, u64>,
+    /// Last-known display names for Steam appids, keyed by appid.
+    ///
+    /// Refreshed from every successful library scan/seed and consulted when
+    /// the live scan misses a curated appid, so uninstalled rows keep their
+    /// real title instead of the `Steam {appid}` fallback. Pruned to
+    /// curated-or-scanned appids so the map cannot grow without bound.
+    #[serde(default)]
+    pub steam_names: BTreeMap<u32, String>,
 }
 
 impl GamesCatalog {
@@ -81,9 +89,11 @@ impl GamesCatalog {
         }
         json::warn_skipped(path, "game entries", skipped);
         let last_played_ms = json::take_default(&mut root, "last_played_ms");
+        let steam_names = json::take_default(&mut root, "steam_names");
         Self {
             entries,
             last_played_ms,
+            steam_names,
         }
     }
 
@@ -106,10 +116,51 @@ impl GamesCatalog {
         } else if !enabled && present {
             self.entries
                 .retain(|e| !matches!(e, GameEntry::Steam { appid: id } if *id == appid));
+            self.steam_names.remove(&appid);
             true
         } else {
             false
         }
+    }
+
+    /// Remember display names from a library scan/seed. Returns true when the
+    /// map changed (caller can skip the disk write otherwise).
+    ///
+    /// Names for appids that are neither curated nor scanned are pruned, so
+    /// never-curated installs do not accumulate here forever.
+    pub fn remember_steam_names(&mut self, games: &[steam::SteamGame]) -> bool {
+        let mut changed = false;
+        for game in games {
+            let name = game.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            match self.steam_names.get(&game.appid) {
+                Some(existing) if existing == name => {}
+                _ => {
+                    self.steam_names.insert(game.appid, name.to_string());
+                    changed = true;
+                }
+            }
+        }
+        let before = self.steam_names.len();
+        let curated: Vec<u32> = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                GameEntry::Steam { appid } => Some(*appid),
+                GameEntry::Manual { .. } => None,
+            })
+            .collect();
+        self.steam_names.retain(|appid, _| {
+            curated.contains(appid) || games.iter().any(|game| &game.appid == appid)
+        });
+        changed || self.steam_names.len() != before
+    }
+
+    /// Last-known display name for a Steam appid the live scan missed.
+    pub fn steam_display_name(&self, appid: u32) -> Option<&str> {
+        self.steam_names.get(&appid).map(String::as_str)
     }
 
     pub fn add_manual(
@@ -443,5 +494,69 @@ mod tests {
         };
         assert!(catalog.remove_manual_id(&id));
         assert!(!catalog.last_played_ms.contains_key(&format!("manual:{id}")));
+    }
+
+    fn steam_game(appid: u32, name: &str) -> steam::SteamGame {
+        steam::SteamGame {
+            appid,
+            name: name.into(),
+            icon_path: None,
+            backdrop_path: None,
+            playtime_minutes: None,
+            last_played_unix: None,
+            size_bytes: None,
+            update_required: false,
+        }
+    }
+
+    #[test]
+    fn steam_names_roundtrip_through_json() {
+        let mut catalog = GamesCatalog::default();
+        catalog.toggle_steam(10, true);
+        assert!(catalog.remember_steam_names(&[steam_game(10, "Counter-Strike")]));
+        let json = serde_json::to_string(&catalog).unwrap();
+        let back: GamesCatalog = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, catalog);
+        assert_eq!(back.steam_display_name(10), Some("Counter-Strike"));
+    }
+
+    #[test]
+    fn older_shape_without_steam_names_loads() {
+        let catalog = catalog_from_str(
+            r#"{
+                "entries": [{"kind":"steam","appid":10}],
+                "last_played_ms": {}
+            }"#,
+        );
+        assert!(catalog.steam_names.is_empty());
+        assert_eq!(catalog.steam_display_name(10), None);
+    }
+
+    #[test]
+    fn remember_steam_names_upserts_and_prunes() {
+        let mut catalog = GamesCatalog::default();
+        catalog.toggle_steam(10, true);
+        // First sight records; identical re-scan is a no-op.
+        assert!(catalog.remember_steam_names(&[steam_game(10, "Old Name")]));
+        assert!(!catalog.remember_steam_names(&[steam_game(10, "Old Name")]));
+        // Rename updates.
+        assert!(catalog.remember_steam_names(&[steam_game(10, "New Name")]));
+        assert_eq!(catalog.steam_display_name(10), Some("New Name"));
+        // Empty scan names are ignored, never blanking a known title.
+        assert!(!catalog.remember_steam_names(&[steam_game(10, "   ")]));
+        assert_eq!(catalog.steam_display_name(10), Some("New Name"));
+        // Never-curated installs are remembered while scanned, pruned once
+        // neither curated nor scanned.
+        assert!(
+            catalog
+                .remember_steam_names(&[steam_game(10, "New Name"), steam_game(99, "Stranger"),])
+        );
+        assert_eq!(catalog.steam_display_name(99), Some("Stranger"));
+        assert!(catalog.remember_steam_names(&[steam_game(10, "New Name")]));
+        assert_eq!(catalog.steam_display_name(99), None);
+        assert_eq!(catalog.steam_display_name(10), Some("New Name"));
+        // Untoggling drops the name so uninstalled rows fall back cleanly.
+        assert!(catalog.toggle_steam(10, false));
+        assert_eq!(catalog.steam_display_name(10), None);
     }
 }

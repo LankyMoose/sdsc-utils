@@ -305,6 +305,12 @@ pub struct Prefs {
     /// Start-screen games list sort (default last played).
     #[serde(default)]
     pub games_sort_mode: GamesSortMode,
+    /// Show owned-but-uninstalled Steam games in the start screen and the
+    /// edit checklist (default on). Off hides them; the catalog keeps them
+    /// so toggling back on restores them. Unprovable rows (scan unknown)
+    /// always stay visible.
+    #[serde(default = "default_true")]
+    pub show_uninstalled_games: bool,
     /// Remember the start-screen game highlight across shell restarts.
     /// Hidden feature, always off: no UI exposes it and `normalize` forces
     /// it off on load. Off keeps the clamped index and never re-pins by key.
@@ -494,6 +500,7 @@ impl Default for Prefs {
             start_screen_haptics_enabled: true,
             start_screen_haptics_strength: default_start_screen_haptics_strength(),
             games_sort_mode: GamesSortMode::default(),
+            show_uninstalled_games: true,
             // Hidden feature: selection persistence is always off (no UI).
             // `normalize` forces it off so older prefs files converge too.
             start_selection_persist: false,
@@ -1005,6 +1012,21 @@ mod tests {
             ImmersiveLayout::Vertical
         );
         assert!(Prefs::default().extra_steam_paths.is_empty());
+    }
+
+    #[test]
+    fn show_uninstalled_games_defaults_on_and_round_trips() {
+        // Current behavior is preserved: uninstalled rows stay visible
+        // unless the user opts out.
+        let prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(prefs.show_uninstalled_games);
+        assert!(Prefs::default().show_uninstalled_games);
+        let off = Prefs {
+            show_uninstalled_games: false,
+            ..Prefs::default()
+        };
+        let decoded: Prefs = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!decoded.show_uninstalled_games);
     }
 
     #[test]

@@ -222,6 +222,11 @@ pub struct ConfigureSettings {
     pub autostart: bool,
     pub extra_steam_paths: Vec<PathBuf>,
     pub steam_path_error: Option<String>,
+    pub show_uninstalled_games: bool,
+    /// A library scan is in flight (sync button shows "Syncing…", disabled).
+    pub steam_syncing: bool,
+    /// Preformatted "Last synced …" / "Never synced" label.
+    pub steam_last_synced_label: String,
 }
 
 /// Edit applied to the emulated fleet — owned by
@@ -391,6 +396,8 @@ pub enum ConfigureMessage {
     CloseChangelog,
     AddSteamPath,
     RemoveSteamPath(usize),
+    SetShowUninstalledGames(bool),
+    SyncSteamLibrary,
     #[cfg(windows)]
     SetAutostart(bool),
     SelectStop(usize),
@@ -1061,6 +1068,21 @@ fn action_button<'a>(
     button(text(label).size(13.0))
         .padding([7, 14])
         .on_press(message)
+        .style(theme::secondary)
+        .into()
+}
+
+/// Steam library sync button. Disabled with a waiting label while a scan is
+/// in flight so a second click cannot queue another scan.
+fn sync_button(syncing: bool) -> Element<'static, ConfigureMessage> {
+    let label = if syncing {
+        "Syncing…"
+    } else {
+        "Sync Steam library"
+    };
+    button(text(label).size(13.0))
+        .padding([7, 14])
+        .on_press_maybe((!syncing).then_some(ConfigureMessage::SyncSteamLibrary))
         .style(theme::secondary)
         .into()
 }
@@ -1765,6 +1787,35 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         }
         groups = groups.push(group(Some("Performance".to_string()), performance));
     }
+
+    groups = groups.push(group(
+        Some("Steam".to_string()),
+        vec![
+            toggle_row(
+                "Show uninstalled games",
+                Some("Keep owned-but-uninstalled games listed with a View in Steam action"),
+                settings.show_uninstalled_games,
+                ConfigureMessage::SetShowUninstalledGames,
+            ),
+            row![
+                column![
+                    text("Library sync")
+                        .size(theme::type_scale::BODY)
+                        .color(theme::INK),
+                    text(settings.steam_last_synced_label.clone())
+                        .size(12.0)
+                        .color(theme::DIM),
+                ]
+                .spacing(2)
+                .width(Fill),
+                sync_button(settings.steam_syncing),
+            ]
+            .spacing(16)
+            .align_y(Alignment::Center)
+            .into(),
+            note("Installs and uninstalls resync automatically; the button forces a rescan now."),
+        ],
+    ));
 
     groups = groups.push(
         container(note(format!(
@@ -2859,9 +2910,16 @@ mod tests {
             autostart: false,
             extra_steam_paths: Vec::new(),
             steam_path_error: None,
+            show_uninstalled_games: true,
+            steam_syncing: false,
+            steam_last_synced_label: "Never synced".to_string(),
         };
         let _disabled_el = start_screen_view(&settings);
         settings.start_screen_enabled = true;
         let _enabled_el = start_screen_view(&settings);
+        settings.steam_syncing = true;
+        settings.show_uninstalled_games = false;
+        settings.steam_path_error = Some("No Steam library found in that folder".to_string());
+        let _syncing_el = start_screen_view(&settings);
     }
 }
