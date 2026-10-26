@@ -258,10 +258,10 @@ impl DeviceSession {
                 ctx.fullscreen,
             )
         });
-        // When presence newly opens immersive Start, suppress the Connected toast
+        // When presence newly opens Start, suppress the Connected toast
         // entirely. Cold-launch already suppresses via launch_quiet; hot connects
-        // must match so behaviour is identical. Compact keeps the toast (HWND).
-        if want_auto_open && self.prefs.start_screen_always_immersive {
+        // must match so behaviour is identical.
+        if want_auto_open {
             let before = events.len();
             events.retain(|event| event.body != "Connected");
             if events.len() != before {
@@ -434,11 +434,10 @@ mod tests {
         }
     }
 
-    fn session_with(immersive: bool, mode: StartAutoOpen) -> DeviceSession {
+    fn session_with(mode: StartAutoOpen) -> DeviceSession {
         let prefs = Prefs {
             start_screen_enabled: true,
             start_screen_auto_open: mode,
-            start_screen_always_immersive: immersive,
             notify_connect: true,
             analytics_enabled: false,
             ..Prefs::default()
@@ -469,39 +468,20 @@ mod tests {
     }
 
     #[test]
-    fn immersive_auto_open_suppresses_connected_toast() {
-        let mut session = session_with(true, StartAutoOpen::Any);
+    fn auto_open_suppresses_connected_toast() {
+        let mut session = session_with(StartAutoOpen::Any);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
         assert!(has_open_start(&effects));
         assert!(
             !queued_bodies(&effects).contains(&"Connected".to_string()),
-            "immersive open must not queue Connected, got {:?}",
+            "auto-open must not queue Connected, got {:?}",
             queued_bodies(&effects)
         );
     }
 
     #[test]
-    fn compact_auto_open_keeps_connected_toast() {
-        let mut session = session_with(false, StartAutoOpen::Any);
-        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
-        assert!(!has_open_start(&effects));
-        assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
-        // Deferred open latched for after-toast.
-        assert!(
-            effects.iter().any(|e| matches!(
-                e,
-                SessionEffect::QueueNotifications {
-                    open_start_after_toast: true,
-                    ..
-                }
-            )),
-            "compact should defer open until toast"
-        );
-    }
-
-    #[test]
-    fn immersive_no_suppress_when_already_open() {
-        let mut session = session_with(true, StartAutoOpen::Any);
+    fn no_suppress_when_already_open() {
+        let mut session = session_with(StartAutoOpen::Any);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(true));
         assert!(!has_open_start(&effects));
         assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
@@ -509,7 +489,7 @@ mod tests {
 
     #[test]
     fn auto_open_never_never_opens_but_still_toasts() {
-        let mut session = session_with(true, StartAutoOpen::Never);
+        let mut session = session_with(StartAutoOpen::Never);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
         assert!(!has_open_start(&effects));
         assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
@@ -519,7 +499,7 @@ mod tests {
     fn hot_path_stall_within_hold_keeps_pad_quiet() {
         use std::time::Duration;
 
-        let mut session = session_with(false, StartAutoOpen::Any);
+        let mut session = session_with(StartAutoOpen::Any);
         let pad_a = bt_pad("aa");
         let pad_b = bt_pad("bb");
         let t0 = Instant::now();
@@ -557,7 +537,7 @@ mod tests {
     fn poll_miss_flag_tracks_hold_lifecycle() {
         use std::time::Duration;
 
-        let mut session = session_with(false, StartAutoOpen::Any);
+        let mut session = session_with(StartAutoOpen::Any);
         let pad_a = bt_pad("aa");
         let t0 = Instant::now();
         let ctx_at = |now: Instant| ApplyContext {
@@ -587,7 +567,7 @@ mod tests {
     fn bluetooth_mode_ignores_usb_only_presence() {
         // USB-only arrival is not qualifying presence in Bluetooth mode:
         // no open, and the toast stays a plain notification.
-        let mut session = session_with(false, StartAutoOpen::Bluetooth);
+        let mut session = session_with(StartAutoOpen::Bluetooth);
         let effects = session.apply_controllers(vec![usb_pad("usb:1")], ctx(false));
         assert!(!has_open_start(&effects));
         assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
@@ -605,18 +585,13 @@ mod tests {
 
     #[test]
     fn bluetooth_mode_opens_on_bluetooth_arrival() {
-        let mut session = session_with(false, StartAutoOpen::Bluetooth);
+        let mut session = session_with(StartAutoOpen::Bluetooth);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
-        assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
+        assert!(has_open_start(&effects));
         assert!(
-            effects.iter().any(|e| matches!(
-                e,
-                SessionEffect::QueueNotifications {
-                    open_start_after_toast: true,
-                    ..
-                }
-            )),
-            "Bluetooth arrival should latch an open in Bluetooth mode"
+            !queued_bodies(&effects).contains(&"Connected".to_string()),
+            "auto-open suppresses Connected, got {:?}",
+            queued_bodies(&effects)
         );
     }
 
@@ -629,7 +604,7 @@ mod tests {
     #[test]
     fn membership_gain_emits_popup_sync() {
         // 0→1 grows the popup by a row: the shell must resize while open.
-        let mut session = session_with(false, StartAutoOpen::Any);
+        let mut session = session_with(StartAutoOpen::Any);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
         assert!(
             has_popup_sync(&effects),
@@ -640,7 +615,7 @@ mod tests {
     #[test]
     fn membership_loss_emits_popup_sync() {
         // 1→0 shrinks the popup by a row: the shell must resize while open.
-        let mut session = session_with(false, StartAutoOpen::Any);
+        let mut session = session_with(StartAutoOpen::Any);
         let _ = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
         let effects = session.apply_controllers(Vec::new(), ctx(false));
         assert!(
@@ -653,7 +628,7 @@ mod tests {
     fn reconnecting_a_forgotten_pad_emits_popup_sync() {
         // Forgetting drops the remembered row; reconnecting re-adds the live
         // row. Both change the row count, so both must resize the popup.
-        let mut session = session_with(false, StartAutoOpen::Any);
+        let mut session = session_with(StartAutoOpen::Any);
         session.known.remember(&bt_pad("aa"));
         assert!(session.known.forget("aa"));
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
@@ -666,7 +641,7 @@ mod tests {
     #[test]
     fn unchanged_snapshot_emits_no_popup_sync() {
         // Same pad, same readings: no row change, so no pointless resize.
-        let mut session = session_with(false, StartAutoOpen::Any);
+        let mut session = session_with(StartAutoOpen::Any);
         let _ = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
         assert!(
@@ -682,7 +657,7 @@ mod tests {
     /// remembered record at 100%, not the boot-time 95%.
     #[test]
     fn full_charge_then_unplug_remembered_carries_100() {
-        let mut session = session_with(false, StartAutoOpen::Any);
+        let mut session = session_with(StartAutoOpen::Any);
         // Boot-time state: pad remembered at 95%.
         session
             .known

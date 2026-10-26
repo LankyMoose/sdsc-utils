@@ -49,7 +49,6 @@ impl App {
             lightbar_enabled: self.session.prefs.lightbar_enabled,
             start_screen_enabled: self.session.prefs.start_screen_enabled,
             start_screen_auto_open: self.session.prefs.start_screen_auto_open,
-            start_screen_always_immersive: self.session.prefs.start_screen_always_immersive,
             start_screen_immersive_layout: self.session.prefs.start_screen_immersive_layout,
             start_screen_clock_enabled: self.session.prefs.start_screen_clock_enabled,
             start_screen_navbar: self.session.prefs.start_screen_navbar,
@@ -260,9 +259,6 @@ impl App {
             }
             ConfigureMessage::SetStartScreenAutoOpen(enabled) => {
                 self.apply_start_screen_auto_open(enabled)
-            }
-            ConfigureMessage::SetStartScreenAlwaysImmersive(enabled) => {
-                self.apply_start_screen_always_immersive(enabled)
             }
             ConfigureMessage::SetStartScreenClock(enabled) => {
                 self.apply_start_screen_clock(enabled)
@@ -702,10 +698,7 @@ impl App {
         &mut self,
         readings: &[start_input::NavReading],
     ) -> Option<Task<Message>> {
-        if !self.start_visible
-            || !self.start_state.immersive
-            || !self.start_state.ambient_tuning_active()
-        {
+        if !self.start_visible || !self.start_state.ambient_tuning_active() {
             return None;
         }
         let held = readings
@@ -777,8 +770,8 @@ impl App {
                     }
                     Task::none()
                 }
-                NavAction::PrevSlide | NavAction::NextSlide => {
-                    let delta = if matches!(action, NavAction::PrevSlide) {
+                NavAction::Left | NavAction::Right => {
+                    let delta = if matches!(action, NavAction::Left) {
                         -1
                     } else {
                         1

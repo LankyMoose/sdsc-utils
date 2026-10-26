@@ -358,6 +358,11 @@ pub fn immersive_footer_capsule(theme: &Theme) -> container::Style {
     immersive_island(theme)
 }
 
+/// Bottom hints island: full-capsule variant of the footer pill.
+pub fn immersive_footer_pill(theme: &Theme) -> container::Style {
+    glass(radius::PILL)(theme)
+}
+
 /// Configure content area below the title bar.
 pub fn configure_body(theme: &Theme) -> container::Style {
     content(theme)

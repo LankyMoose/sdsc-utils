@@ -1,4 +1,4 @@
-//! DualSense reopen / promote chord (fixed PS) and rising-edge detectors.
+//! DualSense reopen chord (fixed PS) and rising-edge detectors.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 /// Chord must stay absent this long before a sticky-hold latch clears.
 ///
 /// Longer than one HID wake / contact bounce; shorter than a deliberate
-/// release-and-press for promote / reopen.
+/// release-and-press for reopen.
 pub const CHORD_RELEASE_DEBOUNCE: Duration = Duration::from_millis(64);
 
 /// Digital DualSense controls that can appear in a reopen gesture.
@@ -126,11 +126,11 @@ pub enum ChordReleaseTick {
     Open,
 }
 
-/// After open / close / promote, ignore the sticky chord until it has been
+/// After open / close, ignore the sticky chord until it has been
 /// continuously absent for [`CHORD_RELEASE_DEBOUNCE`].
 ///
 /// A one-sample gap (report glitch / bounce) cancels the pending release and
-/// keeps the latch so the same physical press cannot reopen or promote.
+/// keeps the latch so the same physical press cannot reopen.
 #[derive(Debug, Clone, Default)]
 pub struct ChordReleaseGate {
     latched: bool,

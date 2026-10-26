@@ -200,7 +200,6 @@ pub struct ConfigureSettings {
     pub lightbar_enabled: bool,
     pub start_screen_enabled: bool,
     pub start_screen_auto_open: StartAutoOpen,
-    pub start_screen_always_immersive: bool,
     pub start_screen_immersive_layout: ImmersiveLayout,
     pub start_screen_clock_enabled: bool,
     pub start_screen_navbar: NavbarVisibility,
@@ -368,7 +367,6 @@ pub enum ConfigureMessage {
     SetLightbarEnabled(bool),
     SetStartScreenEnabled(bool),
     SetStartScreenAutoOpen(StartAutoOpen),
-    SetStartScreenAlwaysImmersive(bool),
     SetImmersiveLayout(ImmersiveLayout),
     SetStartScreenClock(bool),
     SetNavbarVisibility(NavbarVisibility),
@@ -1562,12 +1560,6 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
 
     if settings.start_screen_enabled {
         let mut immersive = vec![
-            toggle_row(
-                "Always immersive",
-                Some("Open full screen; Circle closes instead of going back"),
-                settings.start_screen_always_immersive,
-                ConfigureMessage::SetStartScreenAlwaysImmersive,
-            ),
             toggle_row(
                 "Display clock",
                 None,
@@ -2847,7 +2839,6 @@ mod tests {
             lightbar_enabled: true,
             start_screen_enabled: false,
             start_screen_auto_open: StartAutoOpen::Any,
-            start_screen_always_immersive: false,
             start_screen_immersive_layout: ImmersiveLayout::Vertical,
             start_screen_clock_enabled: true,
             start_screen_navbar: NavbarVisibility::WhenNavigating,

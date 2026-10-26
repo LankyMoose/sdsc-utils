@@ -1,58 +1,21 @@
-//! Pure start-screen presentation transitions (compact ↔ immersive) and dock focus.
+//! Pure start-screen timing (enter ceremony) and controllers-surface focus.
+//!
+//! The start screen is always the fullscreen console stage; there is no
+//! windowed presentation and no promote/demote morph.
 
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Windowed launcher vs fullscreen console stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StartPresentation {
-    #[default]
-    Compact,
-    Immersive,
-}
-
-/// Outcome of an open / chord / cancel edge for the start window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImmersiveTransition {
-    OpenCompact,
-    OpenImmersive,
-    Promote,
-    Demote,
-    Close,
-    Noop,
-}
-
-/// In-flight HWND resize between compact and immersive layouts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartTransition {
-    Promoting,
-    Demoting,
-}
-
-/// Choreographed phases around the hard HWND resize.
+/// Enter ceremony phase around opening the start window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionPhase {
-    /// Compact chrome fading out; still compact HWND size.
-    ExitCompact,
-    /// Veil only while HWND resizes (matches [`StartTransition`]).
-    Resizing,
-    /// Immersive aperture/chrome opening after promote settle.
+    /// Top-veil lift after open (holds for splash art sync).
     EnterImmersive,
-    /// Immersive aperture/chrome closing before demote resize.
-    ExitImmersive,
-    /// Compact chrome fading in after demote settle.
-    EnterCompact,
 }
 
-/// Shared duration for darken-immersive / reveal-compact / cold ambient.
+/// Shared duration for darken veils and the cold ambient ease.
 pub const VEIL_TRANSITION_MS: u64 = 300;
-/// Fast promote/demote segment, shared: exit fades and enter fades use one
-/// duration so the joints stay even.
-pub const SWIFT_SEGMENT_MS: u64 = 150;
-/// HWND growth/shrink morph, run under the opaque blackout. Deliberately a
-/// touch faster than the fades (invisible anyway) so the ceremony stays snappy.
-pub const RESIZE_MS: u64 = 100;
-/// EnterImmersive top-veil lift (ease-in-out); matches splash length so one ceremony covers both.
+/// Enter top-veil lift (ease-in-out); matches splash length so one ceremony covers both.
 pub const ENTER_REVEAL_MS: u64 = crate::ui::motion::SLOW_MS;
 pub const ENTER_IMMERSIVE_MS: u64 = ENTER_REVEAL_MS;
 /// Max time to hold a solid enter veil waiting for selected splash + strip heroes.
@@ -61,9 +24,6 @@ pub const ENTER_ART_HOLD_MAX_MS: u64 = 3000;
 pub const COLD_AMBIENT_MS: u64 = VEIL_TRANSITION_MS;
 /// Minimum wall time for a live Steam library scan/refresh so chrome spinners stay readable.
 pub const STEAM_SCAN_MIN_MS: u64 = 2000;
-/// After compact cold chrome settles, wait this long before kicking a background Steam refresh.
-/// Immersive kicks Steam on art-ready (Preparing success) instead — no settle delay.
-pub const STEAM_SCAN_SETTLE_DELAY_MS: u64 = 1000;
 /// Slide a chrome status chip in (below → its stack slot) / stack reflow.
 pub const CHROME_STATUS_IN_MS: u64 = crate::ui::motion::BASE_MS;
 /// Slide-right exit duration once the batch clears.
@@ -77,18 +37,8 @@ pub const CHROME_STATUS_STAGGER_MS: u64 = 70;
 /// Horizontal travel for ExitRight (logical px). Must clear the widest status chip
 /// past the window's right edge (labels like "Scanning Steam library…").
 pub const CHROME_STATUS_EXIT_TRAVEL_PX: f32 = 520.0;
-/// Legacy aliases.
-pub const CHROME_STATUS_FADE_MS: u64 = CHROME_STATUS_EXIT_MS;
-pub const CHROME_STATUS_LIFT_MS: u64 = CHROME_STATUS_IN_MS;
-pub const STEAM_SCAN_BANNER_IN_MS: u64 = CHROME_STATUS_IN_MS;
-pub const STEAM_SCAN_BANNER_OUT_MS: u64 = CHROME_STATUS_EXIT_MS;
-pub const STEAM_SCAN_SUCCESS_HOLD_MS: u64 = CHROME_STATUS_SUCCESS_HOLD_MS;
-/// Immersive cold: fade the games strip in once artwork is ready.
+/// Cold: fade the games strip in once artwork is ready.
 pub const GAMES_LIST_FADE_MS: u64 = ART_FADE_MS;
-/// Legacy grow-segment fraction (unused by the single top-veil enter path).
-pub const ENTER_GROW_END: f32 = 0.28;
-pub const EXIT_IMMERSIVE_MS: u64 = SWIFT_SEGMENT_MS;
-pub const ENTER_COMPACT_MS: u64 = SWIFT_SEGMENT_MS;
 /// Opacity crossfade between game backdrops (selection change; not enter veil).
 pub const ART_FADE_MS: u64 = crate::ui::motion::SLOW_MS;
 /// Shared ken-burns period for zoom + pan (burn-in drift while splash is held).
@@ -207,116 +157,20 @@ pub(crate) fn with_pose_test_lock<R>(f: impl FnOnce() -> R) -> R {
 impl TransitionPhase {
     pub fn duration_ms(self) -> u64 {
         match self {
-            Self::ExitCompact => SWIFT_SEGMENT_MS,
-            Self::Resizing => 0,
             Self::EnterImmersive => ENTER_IMMERSIVE_MS,
-            Self::ExitImmersive => EXIT_IMMERSIVE_MS,
-            Self::EnterCompact => ENTER_COMPACT_MS,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::ExitCompact => "exit_compact",
-            Self::Resizing => "resizing",
             Self::EnterImmersive => "enter_immersive",
-            Self::ExitImmersive => "exit_immersive",
-            Self::EnterCompact => "enter_compact",
         }
     }
 }
 
-/// Cold open / first reopen: immersive when always-immersive pref is on.
-pub fn on_open(always_immersive: bool) -> ImmersiveTransition {
-    if always_immersive {
-        ImmersiveTransition::OpenImmersive
-    } else {
-        ImmersiveTransition::OpenCompact
-    }
-}
-
-/// Reopen-chord while Start is already visible: promote compact, or demote immersive
-/// when always-immersive is off (toggle). Always-immersive stays put (no compact).
-pub fn on_reopen_chord(
-    presentation: StartPresentation,
-    always_immersive: bool,
-) -> ImmersiveTransition {
-    match presentation {
-        StartPresentation::Compact => ImmersiveTransition::Promote,
-        StartPresentation::Immersive if always_immersive => ImmersiveTransition::Noop,
-        StartPresentation::Immersive => ImmersiveTransition::Demote,
-    }
-}
-
-/// Circle / Escape after modals are cleared.
-///
-/// When `always_immersive`, immersive cancel closes Start instead of demoting to compact.
-pub fn on_cancel(presentation: StartPresentation, always_immersive: bool) -> ImmersiveTransition {
-    match presentation {
-        StartPresentation::Immersive if always_immersive => ImmersiveTransition::Close,
-        StartPresentation::Immersive => ImmersiveTransition::Demote,
-        StartPresentation::Compact => ImmersiveTransition::Close,
-    }
-}
-
 /// Footer Circle label for the main (non-modal) start chrome.
-pub fn cancel_circle_label(immersive: bool, always_immersive: bool, editing: bool) -> &'static str {
-    if editing {
-        "Cancel"
-    } else if immersive && !always_immersive {
-        "Back"
-    } else {
-        "Close"
-    }
-}
-
-/// True when the reopen chord is exactly Circle (Cancel owns that button).
-pub fn chord_is_circle_only(gesture: &[crate::domain::gesture::GestureControl]) -> bool {
-    matches!(gesture, [crate::domain::gesture::GestureControl::Circle])
-}
-
-/// Compact footer can show an enter-immersive cue for this chord.
-pub fn promote_gesture_usable(gesture: &[crate::domain::gesture::GestureControl]) -> bool {
-    !gesture.is_empty() && !chord_is_circle_only(gesture)
-}
-
-/// Begin promote only from compact with no in-flight transition.
-pub fn begin_promote(immersive: bool, transitioning: bool) -> Option<StartTransition> {
-    if immersive || transitioning {
-        None
-    } else {
-        Some(StartTransition::Promoting)
-    }
-}
-
-/// True when demote must wait (HWND resize / already exiting). [`TransitionPhase::EnterImmersive`] is interruptible.
-pub fn demote_blocked(hwnd_transition: bool, phase: Option<TransitionPhase>) -> bool {
-    if hwnd_transition {
-        return true;
-    }
-    match phase {
-        None | Some(TransitionPhase::EnterImmersive) => false,
-        Some(
-            TransitionPhase::ExitCompact
-            | TransitionPhase::Resizing
-            | TransitionPhase::ExitImmersive
-            | TransitionPhase::EnterCompact,
-        ) => true,
-    }
-}
-
-/// Begin demote from immersive when not [`demote_blocked`].
-pub fn begin_demote(immersive: bool, blocked: bool) -> Option<StartTransition> {
-    if !immersive || blocked {
-        None
-    } else {
-        Some(StartTransition::Demoting)
-    }
-}
-
-/// After resize settles: target `immersive` flag for the transition.
-pub fn settle_immersive(transition: StartTransition) -> bool {
-    matches!(transition, StartTransition::Promoting)
+pub fn cancel_circle_label(editing: bool) -> &'static str {
+    if editing { "Cancel" } else { "Close" }
 }
 
 /// Right while immersive: expand dock when collapsed.
@@ -329,18 +183,18 @@ pub fn dock_collapse_target(expanded: bool) -> Option<bool> {
     if !expanded { None } else { Some(false) }
 }
 
-/// Stage scale while the controllers drawer opens (1 → ~12% smaller).
+/// Stage scale while the controllers surface opens (1 → ~12% smaller).
 pub fn dock_stage_scale(progress: f32) -> f32 {
     let t = progress.clamp(0.0, 1.0);
     1.0 - 0.12 * t
 }
 
-/// Dim overlay alpha over the games stage while the drawer opens.
+/// Dim overlay alpha over the games stage while the controllers surface opens.
 pub fn dock_stage_dim(progress: f32) -> f32 {
     progress.clamp(0.0, 1.0) * 0.45
 }
 
-/// Overlay drawer width from thin peek → expanded panel.
+/// Dock panel width from peek ring column to full rows panel.
 pub fn dock_panel_width(progress: f32, peek: f32, expanded: f32) -> f32 {
     let t = progress.clamp(0.0, 1.0);
     peek + (expanded - peek) * t
@@ -426,158 +280,14 @@ pub fn backdrop_pose_pixels(
     )
 }
 
-/// Early EnterImmersive grow segment progress, or `None` once iris/chrome begin.
-pub fn enter_grow_progress(phase_progress: f32) -> Option<f32> {
-    let t = phase_progress.clamp(0.0, 1.0);
-    if t < ENTER_GROW_END {
-        Some((t / ENTER_GROW_END).clamp(0.0, 1.0))
-    } else {
-        None
-    }
-}
-
-/// Remap EnterImmersive progress so iris/chrome run over the post-grow remainder.
-pub fn enter_immersive_chrome_progress(phase_progress: f32) -> f32 {
-    let t = phase_progress.clamp(0.0, 1.0);
-    if t <= ENTER_GROW_END {
-        0.0
-    } else {
-        ((t - ENTER_GROW_END) / (1.0 - ENTER_GROW_END).max(0.001)).clamp(0.0, 1.0)
-    }
-}
-
-/// Island → fill scale during the compact-grow segment.
-pub fn enter_grow_scale(grow: f32, island: f32) -> f32 {
-    let g = grow.clamp(0.0, 1.0);
-    let island = island.clamp(0.12, 0.95);
-    island + (1.0 - island) * g
-}
-
-/// Veil during grow: starts solid, lifts mid-segment, returns near-black before iris.
-pub fn enter_grow_veil(grow: f32) -> f32 {
-    let g = grow.clamp(0.0, 1.0);
-    if g < 0.5 {
-        1.0 - 0.4 * (g * 2.0)
-    } else {
-        0.6 + 0.38 * ((g - 0.5) * 2.0)
-    }
-}
-
-/// Promote enter: aperture 0→1 from phase progress.
-pub fn enter_aperture(progress: f32) -> f32 {
-    progress.clamp(0.0, 1.0)
-}
-
-/// Demote exit: aperture 1→0 from phase progress.
-pub fn exit_aperture(progress: f32) -> f32 {
-    1.0 - progress.clamp(0.0, 1.0)
-}
-
-/// Chrome scale during enter immersive (0.94 → 1.0).
-pub fn enter_chrome_scale(progress: f32) -> f32 {
-    0.94 + 0.06 * progress.clamp(0.0, 1.0)
-}
-
-/// Chrome scale during exit immersive (1.0 → 0.96).
-pub fn exit_chrome_scale(progress: f32) -> f32 {
-    1.0 - 0.04 * progress.clamp(0.0, 1.0)
-}
-
-/// Staggered chrome opacity: header leads, footer lags slightly.
-pub fn chrome_stagger(progress: f32, lag: f32) -> f32 {
-    ((progress - lag) / (1.0 - lag).max(0.001)).clamp(0.0, 1.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::gesture::GestureControl;
 
     #[test]
-    fn open_follows_immersive_pref() {
-        assert_eq!(on_open(false), ImmersiveTransition::OpenCompact);
-        assert_eq!(on_open(true), ImmersiveTransition::OpenImmersive);
-    }
-
-    #[test]
-    fn chord_toggles_when_not_always_immersive() {
-        assert_eq!(
-            on_reopen_chord(StartPresentation::Compact, false),
-            ImmersiveTransition::Promote
-        );
-        assert_eq!(
-            on_reopen_chord(StartPresentation::Immersive, false),
-            ImmersiveTransition::Demote
-        );
-        assert_eq!(
-            on_reopen_chord(StartPresentation::Immersive, true),
-            ImmersiveTransition::Noop
-        );
-        assert_eq!(
-            on_reopen_chord(StartPresentation::Compact, true),
-            ImmersiveTransition::Promote
-        );
-    }
-
-    #[test]
-    fn cancel_demotes_or_closes() {
-        assert_eq!(
-            on_cancel(StartPresentation::Immersive, false),
-            ImmersiveTransition::Demote
-        );
-        assert_eq!(
-            on_cancel(StartPresentation::Immersive, true),
-            ImmersiveTransition::Close
-        );
-        assert_eq!(
-            on_cancel(StartPresentation::Compact, false),
-            ImmersiveTransition::Close
-        );
-        assert_eq!(
-            on_cancel(StartPresentation::Compact, true),
-            ImmersiveTransition::Close
-        );
-        assert_eq!(cancel_circle_label(true, false, false), "Back");
-        assert_eq!(cancel_circle_label(true, true, false), "Close");
-        assert_eq!(cancel_circle_label(false, false, false), "Close");
-        assert_eq!(cancel_circle_label(true, false, true), "Cancel");
-        assert!(promote_gesture_usable(&[GestureControl::Ps]));
-        assert!(!promote_gesture_usable(&[]));
-        assert!(!promote_gesture_usable(&[GestureControl::Circle]));
-    }
-
-    #[test]
-    fn circle_only_chord_detected() {
-        assert!(chord_is_circle_only(&[GestureControl::Circle]));
-        assert!(!chord_is_circle_only(&[GestureControl::Ps]));
-        assert!(!chord_is_circle_only(&[
-            GestureControl::Circle,
-            GestureControl::Ps
-        ]));
-        assert!(!chord_is_circle_only(&[]));
-    }
-
-    #[test]
-    fn promote_demote_settle_ordering() {
-        assert_eq!(
-            begin_promote(false, false),
-            Some(StartTransition::Promoting)
-        );
-        assert_eq!(begin_promote(true, false), None);
-        assert_eq!(begin_promote(false, true), None);
-        assert_eq!(begin_demote(true, false), Some(StartTransition::Demoting));
-        assert_eq!(begin_demote(false, false), None);
-        assert_eq!(begin_demote(true, true), None);
-        assert!(!demote_blocked(false, None));
-        assert!(!demote_blocked(
-            false,
-            Some(TransitionPhase::EnterImmersive)
-        ));
-        assert!(demote_blocked(true, Some(TransitionPhase::EnterImmersive)));
-        assert!(demote_blocked(false, Some(TransitionPhase::ExitImmersive)));
-        assert!(demote_blocked(false, Some(TransitionPhase::Resizing)));
-        assert!(settle_immersive(StartTransition::Promoting));
-        assert!(!settle_immersive(StartTransition::Demoting));
+    fn cancel_label_is_close_unless_editing() {
+        assert_eq!(cancel_circle_label(false), "Close");
+        assert_eq!(cancel_circle_label(true), "Cancel");
     }
 
     #[test]
@@ -594,8 +304,6 @@ mod tests {
         assert!((dock_stage_scale(1.0) - 0.88).abs() < 0.001);
         assert!((dock_stage_dim(0.0) - 0.0).abs() < 0.001);
         assert!((dock_stage_dim(1.0) - 0.45).abs() < 0.001);
-        assert!((dock_panel_width(0.0, 72.0, 340.0) - 72.0).abs() < 0.001);
-        assert!((dock_panel_width(1.0, 72.0, 340.0) - 340.0).abs() < 0.001);
     }
 
     #[test]
@@ -607,14 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn aperture_and_chrome_choreography() {
-        assert!((enter_aperture(0.0) - 0.0).abs() < 0.001);
-        assert!((enter_aperture(1.0) - 1.0).abs() < 0.001);
-        assert!((exit_aperture(0.0) - 1.0).abs() < 0.001);
-        assert!((exit_aperture(1.0) - 0.0).abs() < 0.001);
-        assert!((enter_chrome_scale(0.0) - 0.94).abs() < 0.001);
-        assert!((enter_chrome_scale(1.0) - 1.0).abs() < 0.001);
-        assert!(chrome_stagger(0.2, 0.15) < chrome_stagger(0.8, 0.15));
+    fn art_fades_use_eased_curves() {
         assert!((art_fade_progress(0) - 0.0).abs() < 0.001);
         assert!((art_fade_progress(ART_FADE_MS) - 1.0).abs() < 0.001);
         assert!((enter_art_fade_progress(0) - 0.0).abs() < 0.001);
@@ -622,15 +323,6 @@ mod tests {
         assert!((enter_art_fade_progress(ART_FADE_MS / 2) - 0.5).abs() < 0.001);
         // Ease-out is already ~0.875 at midpoint — enter splash must stay near half.
         assert!(art_fade_progress(ART_FADE_MS / 2) > 0.8);
-        assert!(enter_grow_progress(0.0).is_some());
-        assert!(enter_grow_progress(ENTER_GROW_END).is_none());
-        assert!((enter_immersive_chrome_progress(ENTER_GROW_END) - 0.0).abs() < 0.001);
-        assert!((enter_immersive_chrome_progress(1.0) - 1.0).abs() < 0.001);
-        assert!((enter_grow_scale(0.0, 0.4) - 0.4).abs() < 0.001);
-        assert!((enter_grow_scale(1.0, 0.4) - 1.0).abs() < 0.001);
-        assert!((enter_grow_veil(0.0) - 1.0).abs() < 0.001);
-        assert!(enter_grow_veil(0.5) < enter_grow_veil(0.0));
-        assert!(enter_grow_veil(1.0) > enter_grow_veil(0.5));
     }
 
     #[test]
@@ -714,27 +406,12 @@ mod tests {
 
     #[test]
     fn phase_durations() {
-        assert_eq!(TransitionPhase::ExitCompact.duration_ms(), SWIFT_SEGMENT_MS);
-        // One shared fast segment for exit blackout + enter fades.
-        assert_eq!(SWIFT_SEGMENT_MS, 150);
-        // The invisible morph runs a touch faster.
-        assert_eq!(RESIZE_MS, 100);
         assert_eq!(
             TransitionPhase::EnterImmersive.duration_ms(),
             ENTER_IMMERSIVE_MS
         );
-        assert_eq!(
-            TransitionPhase::ExitImmersive.duration_ms(),
-            EXIT_IMMERSIVE_MS
-        );
-        assert_eq!(
-            TransitionPhase::EnterCompact.duration_ms(),
-            ENTER_COMPACT_MS
-        );
         assert_eq!(ENTER_IMMERSIVE_MS, ENTER_REVEAL_MS);
         assert_eq!(ENTER_REVEAL_MS, ART_FADE_MS);
-        assert_eq!(EXIT_IMMERSIVE_MS, SWIFT_SEGMENT_MS);
-        assert_eq!(ENTER_COMPACT_MS, SWIFT_SEGMENT_MS);
         assert!((ease_in_cubic(0.0) - 0.0).abs() < 0.001);
         assert!((ease_in_cubic(1.0) - 1.0).abs() < 0.001);
         assert!(ease_in_cubic(0.5) < 0.5);

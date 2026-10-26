@@ -231,7 +231,7 @@ pub fn browse_meta_subtitle(game: &SteamGame) -> String {
     }
 }
 
-/// Compact browse subtitle: meta plus optional Update.
+/// Browse subtitle: meta plus optional Update.
 ///
 /// Example: `2 Oct 2025 · 82 h · Update required`.
 pub fn browse_subtitle(game: &SteamGame) -> String {

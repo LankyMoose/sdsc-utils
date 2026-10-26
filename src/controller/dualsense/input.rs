@@ -131,6 +131,7 @@ pub fn parse_report(buf: &[u8], base: usize) -> PadSample {
         square,
         triangle,
         options,
+        create,
         l2,
         r2,
     }

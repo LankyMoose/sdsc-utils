@@ -252,3 +252,68 @@ No `last_op=hidapi_new` / `slow op=hidapi_new ms=5xxx` in this window — felt h
 - BT writes still log `ok bytes=547 expected=78` (see [windows-bt-lightbar.md](windows-bt-lightbar.md)).
 - Shorter `slow op=hidapi_new ms=50–166` also appear; user-visible multi-second freezes match the **~5010ms** completions.
 - Pre-watchdog Hitch 1 `Identify total_ms=6791` is consistent with a ~5s `hidapi_new` buried inside Identify flash reopen/enumerate.
+
+---
+
+## Session `1792985422518` (2026-10-26 — heartbeat `hidapi_refresh` 5s stall)
+
+Single process (post-cutover; no shell/service split). Same machine/pad as prior
+sessions: DualSense BT serial `444648156926`, `steam=1`. F8 mark landed **4s
+after** the stall (`Sample age_ms=1` at mark — pipeline already recovered), so
+the felt hitch was the stall below, marked late.
+
+```text
+[1792985487] INFO: hid-diag: cmd begin=Poll since_publish_ms=0
+[1792985487] INFO: hid-diag: hidapi_refresh begin
+[1792985487] WARN: hid-diag: worker stall kind=op last_op=hidapi_refresh gap_ms=307 tier=250
+[1792985487] WARN: hid-diag: worker stall kind=op last_op=hidapi_refresh gap_ms=508 tier=500
+[1792985488] WARN: hid-diag: worker stall kind=op last_op=hidapi_refresh gap_ms=1011 tier=1000
+[1792985489] WARN: hid-diag: worker stall kind=op last_op=hidapi_refresh gap_ms=2014 tier=2000
+[1792985492] WARN: hid-diag: worker stall kind=op last_op=hidapi_refresh gap_ms=5025 tier=5000
+[1792985492] INFO: hid-diag: hidapi_refresh end ms=5073
+[1792985492] INFO: hid-diag: slow op=hidapi_refresh ms=5073
+[1792985492] INFO: hid-diag: slow op=cmd_Poll ms=5074
+[1792985492] INFO: hid-worker: cmd=Poll enumerate_ms=0 open_ms=0 io_ms=0 total_ms=5074
+[1792985492] INFO: hid-diag: sample stalled gap_ms=5075 in_cmd=none
+[1792985492] INFO: ui-diag: pad-input stall gap_ms=5059
+[1792985496] WARN: HITCH_MARK session=1792985422518 up_ms=73521 kind=input source=hotkey pads=1 reason=Sample age_ms=1 seq=35535 steam=1 fg=sdsc-utils.exe fs=0
+```
+
+### Mechanism
+
+The hot-deferral from cause D is working (`hidapi_refresh deferred input_hot=1`
+throughout the session), but `HOT_ENUM_MAX_DEFER` (20s heartbeat cap,
+[`policy.rs`](../src/controller/hid/policy.rs), `worker.rs:433-448`
+`ensure_all_pads`) punched through: once the cap went overdue, the blocking
+`HidApi::refresh_devices()` ran **on the sample thread inside a Poll command**
+(`total_ms=5074`, all of it the refresh). The ~4ms sample loop and UI pad-input
+both starved for 5s. This is the heartbeat fix from
+[hot-enumeration-freeze.md](hot-enumeration-freeze.md) working as designed for
+discovery but carrying the old blocking cost.
+
+### Chronic layer (same session)
+
+Normal refreshes cost **70–72ms** (129× `slow op=hidapi_refresh ms=70|71|72`),
+each producing an ~80–117ms `pad-input`/`sample` stall roughly every 6s.
+Tolerable per-incident, but it means the sample loop already pays a ~100ms
+jitter tax on every presence cadence — the 5s outlier is the same tax at
+Windows-enum scale.
+
+### Unknown (not in the logs)
+
+*Why* Windows took 5s for this one enum: no device arrival/removal is recorded
+around `:487–:492`, no `err=`/access-denied, `steam=1` throughout. Candidates
+(BT-stack hiccup, USB enum stall, Steam holding handles) are unconfirmed —
+deliberately not patched blind.
+
+### Proposed structural fix (for a follow-up agent — NOT implemented here)
+
+Move `refresh_devices()` off the sample path: run enumeration on a dedicated
+enum thread (or as an async job) with latest-wins handoff to the worker, so a
+slow Windows enum can never starve sampling. Touch points:
+`worker.rs` `refresh_device_list` / `ensure_all_pads`, `policy.rs`
+`hot_enum_max_defer` (keep the 20s bound on the *blind window*, just not on the
+sample thread), arrival-hint throttle. Acceptance: a synthetic/real >1s enum
+shows no `sample stalled` / `pad-input stall` beyond the chronic ~100ms, and
+second-pad discovery latency stays ~1s via the arrival watcher. No code changed
+for this incident; existing watchdog + `enter_op` diagnostics caught it cleanly.

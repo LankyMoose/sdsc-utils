@@ -43,6 +43,21 @@ Cold Start open under a live toast present path.
 
 **Release (`1790503175`, v1.4.1):** same `create_view` label; no `ui-diag` (release). After relaunch, `start-nav` live.
 
+**Crash C (session `1792992062`, 2026-10-26, debug):** same signature, new timing —
+empty-atlas `create_view` failure inside `create_renderer`, **5ms after Start
+cold open** (`wgpu-diag: last_start_open=5ms`):
+
+1. 46s idle (`sample stalled gap_ms=45995`), then 0→1 connect → auto-open
+2. `start immersive enter` → `start cold open` → 5ms later `PANIC`
+3. Backtrace: `Atlas::with_size → Atlas::new → Cache::new → create_cache →
+   create_image_cache → Renderer::new → create_renderer` (identical to A/B)
+
+So the failure is the new window's renderer construction racing cold open,
+not toast teardown (A) or a live-toast present path (B). No `err=` on any HID
+op; `steam=1` throughout (not implicated — same as prior sessions).
+Recovery held: `crash-restart: scheduled → launching` in ~3s + notice toast.
+Predicted adapter was Vulkan on RTX 4070 SUPER (`alpha_composite=true`).
+
 Upstream: Cosmic / iced apps hit the same atlas `create_view` invalid pattern after GPU device faults (e.g. NVIDIA Xid) — device already dead, then atlas create panics.
 
 ## Repro matrix (manual)

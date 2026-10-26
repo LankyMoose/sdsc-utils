@@ -33,10 +33,7 @@ pub struct RestartUiState {
     /// Start window was visible.
     #[serde(default = "default_false")]
     pub start_visible: bool,
-    /// Start was immersive (fullscreen), regardless of the always-immersive pref.
-    #[serde(default = "default_false")]
-    pub start_immersive: bool,
-    /// Start was on the Controllers slide.
+    /// Controllers surface was open.
     #[serde(default = "default_false")]
     pub start_on_controllers: bool,
     /// Selected game / controller keys (re-resolved after rows rebuild).
@@ -48,11 +45,7 @@ pub struct RestartUiState {
     /// no controller index — controller persistence is out of scope).
     #[serde(default)]
     pub game_index: Option<usize>,
-    /// Tracked list offsets (games / controllers / settings drawer).
-    #[serde(default)]
-    pub games_scroll_y: f32,
-    #[serde(default)]
-    pub controllers_scroll_y: f32,
+    /// Tracked settings-drawer offset.
     #[serde(default)]
     pub settings_scroll_y: f32,
     /// Start settings drawer was open + focused row.
@@ -126,13 +119,10 @@ mod tests {
         RestartUiState {
             saved_at_ms: 1_000_000,
             start_visible: true,
-            start_immersive: true,
             start_on_controllers: true,
             game_key: Some("steam:440".into()),
             controller_key: None,
             game_index: Some(2),
-            games_scroll_y: 220.0,
-            controllers_scroll_y: 0.0,
             settings_scroll_y: 42.0,
             settings_open: true,
             settings_focus: 3,
@@ -149,11 +139,9 @@ mod tests {
         let encoded = serde_json::to_string(&state()).unwrap();
         let decoded: RestartUiState = serde_json::from_str(&encoded).unwrap();
         assert!(decoded.start_visible);
-        assert!(decoded.start_immersive);
         assert!(decoded.start_on_controllers);
         assert_eq!(decoded.game_key.as_deref(), Some("steam:440"));
         assert_eq!(decoded.game_index, Some(2));
-        assert!((decoded.games_scroll_y - 220.0).abs() < f32::EPSILON);
         assert_eq!(decoded.settings_focus, 3);
         assert!((decoded.configure_scroll_y - 120.0).abs() < f32::EPSILON);
     }

@@ -7,7 +7,7 @@
 Rounded glass cards (iced `container` with `border.radius` on a
 `transparent: true` window) render the radius correctly, but the pixels
 outside the curve are opaque black instead of the desktop behind the
-window. Affects popup, configure, compact Start, and toasts — anywhere we
+window. Affects popup, configure, Start, and toasts — anywhere we
 rely on per-pixel alpha.
 
 ## Root cause

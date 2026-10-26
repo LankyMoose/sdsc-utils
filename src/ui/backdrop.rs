@@ -1,4 +1,4 @@
-//! Slow-drift atmosphere for utility windows (popup, Settings, compact Start).
+//! Slow-drift atmosphere for utility windows (popup, Settings).
 //!
 //! Same shader as immersive Start ([`AmbientProgram`]) but with **slow time**:
 //! the shell nudges a process-wide utility clock at [`UTILITY_TICK`] (≤2fps)

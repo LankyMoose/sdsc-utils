@@ -7,15 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- Compact Start window: the start screen is always the fullscreen console stage. The `start_screen_always_immersive` pref, the compact/immersive promote/demote morph, L2/R2 slide switching, and the compact titlebar/carousel are gone. The **PS** (Guide) chord opens Start and is a no-op while open; Circle/Escape always closes. The Create (Select) button toggles the controllers surface in its place.
+
 ### Added
 
-- Unified "immersive" visual language across the app: floating glass cards, rounded corners, and the same ambient shader backdrop in the controllers popup, Settings, toasts, and compact Start.
+- Unified "immersive" visual language across the app: floating glass cards, rounded corners, and the same ambient shader backdrop in the controllers popup, Settings, toasts, and Start.
 - Presentation now prefers Vulkan with DX12 as fallback, so transparent rounded windows composite correctly; on DX12-only systems the settings window falls back to a rounded, opaque DWM frame.
 - Toasts are rounded glass cards with a soft shadow and a rounded accent rail.
 - Settings window is larger (720×520) with a floating sidebar, grouped cards, and consistent toggles and sliders.
 - `SDSC_DEBUG_OPEN` (debug builds): open specific windows at boot; quiet mode moves them to the secondary monitor without focus and mutes sounds/haptics.
 - Immersive Start settings gains a position-rail visibility selector (`When navigating` default / `Always on`, persisted): `Always on` keeps the section rail visible instead of auto-hiding it after navigation idle.
-- Immersive Start settings gains a **Reduced motion** selector (`System` default / `On` / `Off`, persisted): when effective, all Start-screen movement snaps instantly — carousel/dock/strip slides, drawer travel, rail slide, layout-transition travel, status-chip travel, backdrop pan/zoom, press glides — while fades, dims, and veils keep animating. `System` follows Windows' "Show animations" accessibility toggle live (other OSes have no probe and treat `System` as reduced).
+- Immersive Start settings gains a **Reduced motion** selector (`System` default / `On` / `Off`, persisted): when effective, all Start-screen movement snaps instantly — surface/strip slides, drawer travel, rail slide, layout-transition travel, status-chip travel, backdrop pan/zoom, press glides — while fades, dims, and veils keep animating. `System` follows Windows' "Show animations" accessibility toggle live (other OSes have no probe and treat `System` as reduced).
 - **Developer mode (debug-only):** Diagnostics gains a non-persisted "Display layout bounding boxes" toggle (or F9) that outlines Start-screen and Settings-drawer containers (magenta) and fixed/clamped-width elements (cyan) for layout debugging. Off by default, never saved; compiled out of release builds.
 
 ### Changed

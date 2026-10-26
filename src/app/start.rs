@@ -8,9 +8,9 @@ use super::Win32DialogParent;
 use super::stamp_hitch_report;
 use super::{
     App, Message, PAD_POLL_SLOW_MS, PAD_POLL_STALL_MS, RELOAD_FEEDBACK_DELAY,
-    RUNNING_CHECK_INTERVAL, ResizeAnim, SCROLL_RESTORE_AUTHORITY, SNAPSHOT_STALE_MS,
-    START_CURSOR_IDLE_HIDE, START_NAV_NOT_READY_MS, chord_held_on_any_pad, delay,
-    is_manual_target_missing, spawn_blocking, steam_appid_from_target,
+    RUNNING_CHECK_INTERVAL, SCROLL_RESTORE_AUTHORITY, SNAPSHOT_STALE_MS, START_CURSOR_IDLE_HIDE,
+    START_NAV_NOT_READY_MS, chord_held_on_any_pad, delay, is_manual_target_missing, spawn_blocking,
+    steam_appid_from_target,
 };
 use crate::AppResult;
 use crate::controller::dualsense::rumble::MotorPulse;
@@ -28,15 +28,15 @@ use crate::platform::app_log;
 use crate::platform::ui_sound::UiSoundKind;
 use crate::ui::configure::{PadInputPanel, Section};
 use crate::ui::layout::{
-    MonitorCover, cursor_on_primary_monitor, focus_window, move_window, open_visible,
-    overlay_platform_specific, primary_monitor_cover, raise_window_topmost, window_hwnd,
+    MonitorCover, cursor_on_primary_monitor, focus_window, open_visible, overlay_platform_specific,
+    primary_monitor_cover, window_hwnd,
 };
 use crate::ui::start::gesture::{self, ChordReleaseTick};
 use crate::ui::start::input::{self as start_input, FaceHeld, NavAction, NavLogSnapshot};
-use crate::ui::start::mode::{self as start_mode, StartPresentation};
-use crate::ui::start::view::{self as start_view, ReplaceConfirm, StartMessage, StartSlide};
+use crate::ui::start::mode::{self as start_mode};
+use crate::ui::start::view::{self as start_view, ReplaceConfirm, StartMessage};
 use iced::widget::operation;
-use iced::{Point, Size, Task, window};
+use iced::{Task, window};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -62,9 +62,7 @@ impl App {
         }
         // Keyboard / UI actions other than pure scroll cancel an in-progress hold.
         match &message {
-            StartMessage::GamesScrolled(..)
-            | StartMessage::ControllersScrolled(..)
-            | StartMessage::SettingsScrolled(..)
+            StartMessage::SettingsScrolled(..)
             | StartMessage::ManualAddTitle(_)
             | StartMessage::ManualAddArgs(_) => {}
             #[cfg(debug_assertions)]
@@ -74,13 +72,11 @@ impl App {
         match message {
             StartMessage::Launch(index) => self.on_start_launch(index),
             StartMessage::SelectGame(index) => self.on_start_select_game(index),
-            StartMessage::SelectController(index) => self.on_start_select_controller(index),
             StartMessage::MoveUp => self.on_start_move(-1),
             StartMessage::MoveDown => self.on_start_move(1),
             StartMessage::Confirm => self.on_start_confirm(),
             StartMessage::Close => self.on_start_close(),
-            StartMessage::PrevSlide => self.on_start_slide(false),
-            StartMessage::NextSlide => self.on_start_slide(true),
+            StartMessage::ToggleControllers => self.on_toggle_controllers(),
             StartMessage::ToggleEdit => match self.toggle_start_edit() {
                 Some(task) => {
                     self.play_start_cue(UiSoundKind::Action);
@@ -110,31 +106,6 @@ impl App {
                     self.play_start_cue(UiSoundKind::Action);
                 }
                 task
-            }
-            StartMessage::GamesScrolled(y, viewport_h) => {
-                self.start_state
-                    .record_list_scroll(start_view::StartListId::Games, y, viewport_h);
-                // Demote remount correction: fresh reports carry the real
-                // viewport (settle math may have used a stale/estimate one).
-                // Re-land the center invisibly behind the enter veil instead
-                // of snapping at lift end. Nav is blocked while the phase is
-                // live, so reports here are mount/scroll_to echoes, never
-                // user browsing.
-                if matches!(
-                    self.start_state.transition_phase.map(|(p, _)| p),
-                    Some(start_mode::TransitionPhase::EnterCompact)
-                ) {
-                    return self.correct_demoted_games_reveal(y);
-                }
-                Task::none()
-            }
-            StartMessage::ControllersScrolled(y, viewport_h) => {
-                self.start_state.record_list_scroll(
-                    start_view::StartListId::Controllers,
-                    y,
-                    viewport_h,
-                );
-                Task::none()
             }
             StartMessage::SettingsScrolled(y, viewport_h) => {
                 self.start_state.record_list_scroll(
@@ -170,6 +141,12 @@ impl App {
             StartMessage::ToggleSettings => {
                 let now = Instant::now();
                 let open = !self.start_state.settings.open;
+                // The dock owns the right edge while open: never stack the
+                // drawer over it (Create is likewise blocked while settings
+                // owns input — see `on_toggle_controllers`).
+                if open && self.start_state.dock_open_or_animating() {
+                    return Task::none();
+                }
                 if self.start_state.request_settings(open, now) {
                     self.play_start_cue(UiSoundKind::Action);
                     crate::controller::hid::diag::diag_info(format!(
@@ -201,9 +178,6 @@ impl App {
             }
             StartMessage::ToggleReducedMotionMenu => self
                 .toggle_start_selector_menu(crate::ui::start::settings::SettingsRow::ReducedMotion),
-            StartMessage::SetAlwaysImmersive(enabled) => {
-                self.apply_start_screen_always_immersive(enabled)
-            }
             StartMessage::SetClock(enabled) => self.apply_start_screen_clock(enabled),
             StartMessage::SetImmersiveLayout(layout) => {
                 self.apply_start_screen_immersive_layout(layout)
@@ -254,37 +228,29 @@ impl App {
         }
     }
 
-    /// Launch arm: immersive neighbor click selects only; center/Cross launches.
+    /// Launch arm: neighbor click selects only; center/Cross launches.
     /// Editing retargets the click at the checklist toggle instead.
     pub(crate) fn on_start_launch(&mut self, index: usize) -> Task<Message> {
-        if self.start_state.immersive
-            && index < self.start_state.rows.len()
-            && index != self.start_state.game_selected
-        {
+        if index < self.start_state.rows.len() && index != self.start_state.game_selected {
             // Neighbor capsule click selects only (center / Cross launches).
             return self.on_start_message(StartMessage::SelectGame(index));
         }
         if index < self.start_state.rows.len() {
             self.start_state.game_selected = index;
         }
-        let scroll = self.scroll_start_selection_into_view();
         if self.start_state.editing {
             match self.edit_toggle_selected() {
                 Some(task) => {
                     self.play_start_cue(UiSoundKind::Action);
-                    scroll.chain(task)
+                    task
                 }
-                None => scroll,
+                None => Task::none(),
             }
         } else if self.launch_selected() {
             self.play_start_cue(UiSoundKind::Action);
-            if self.start_state.immersive {
-                scroll.chain(self.close_start_screen())
-            } else {
-                scroll
-            }
+            self.close_start_screen()
         } else {
-            scroll
+            Task::none()
         }
     }
 
@@ -294,51 +260,25 @@ impl App {
         }
         let prev_game = self.start_state.game_selected;
         self.start_state.game_selected = index;
-        let mut task = self.scroll_start_selection_into_view();
-        if self.start_state.immersive {
-            self.start_state
-                .begin_strip_anim(prev_game as f32, Instant::now());
-            self.start_state.reset_backdrop_fade();
-        }
-        task = task.chain(self.warm_start_art_task());
+        self.start_state
+            .begin_strip_anim(prev_game as f32, Instant::now());
+        self.start_state.reset_backdrop_fade();
+        let task = self.warm_start_art_task();
         self.play_start_cue(UiSoundKind::Nav);
         task
     }
 
-    pub(crate) fn on_start_select_controller(&mut self, index: usize) -> Task<Message> {
-        if index < self.start_state.controllers.len()
-            && self.start_state.controller_selected != index
-        {
-            self.start_state.controller_selected = index;
-            self.play_start_cue(UiSoundKind::Nav);
-        }
-        if self.start_state.immersive && !self.start_state.dock_expanded {
-            let _ = self.start_state.request_dock(true, Instant::now());
-        }
-        self.scroll_start_selection_into_view()
-    }
-
-    /// Focus-move arm: `delta` is -1 (up) or +1 (down). Both directions share
-    /// the reveal/art/cue tail; only the fallback scroll direction differs.
+    /// Focus-move arm: `delta` is -1 (up) or +1 (down).
     pub(crate) fn on_start_move(&mut self, delta: i32) -> Task<Message> {
         let prev_game = self.start_state.game_selected;
         let direction = self.start_state.move_selection(delta);
-        let mut task =
-            self.scroll_start_selection_into_view_dir(direction.unwrap_or(if delta < 0 {
-                start_view::ScrollReveal::Up
-            } else {
-                start_view::ScrollReveal::Down
-            }));
+        let mut task = Task::none();
         if direction.is_some() {
             self.play_start_cue(UiSoundKind::Nav);
-            if matches!(self.start_state.slide, StartSlide::Games)
-                && self.start_state.game_selected != prev_game
-            {
-                if self.start_state.immersive {
-                    self.start_state
-                        .begin_strip_anim(prev_game as f32, Instant::now());
-                    self.start_state.reset_backdrop_fade();
-                }
+            if !self.start_state.dock_expanded && self.start_state.game_selected != prev_game {
+                self.start_state
+                    .begin_strip_anim(prev_game as f32, Instant::now());
+                self.start_state.reset_backdrop_fade();
                 task = task.chain(self.warm_start_art_task());
             }
         }
@@ -365,44 +305,31 @@ impl App {
             self.play_start_cue(UiSoundKind::Action);
             self.cancel_start_edit()
         } else if self.start_visible {
-            // Immersive + dock open: Circle collapses the drawer first (same as Left).
-            if self.start_state.immersive
-                && start_mode::dock_collapse_target(self.start_state.dock_expanded).is_some()
+            // Controllers surface open: Circle/Cancel collapses it first.
+            if start_mode::dock_collapse_target(self.start_state.dock_expanded).is_some()
                 && self.start_state.request_dock(false, Instant::now())
             {
                 self.play_start_cue(UiSoundKind::Slide);
-                crate::controller::hid::diag::diag_info("ui-diag: start dock collapse (cancel)");
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: start controllers collapse (cancel)",
+                );
                 return Task::none();
             }
             self.play_start_cue(UiSoundKind::Action);
-            match start_mode::on_cancel(
-                self.start_presentation(),
-                self.session.prefs.start_screen_always_immersive,
-            ) {
-                start_mode::ImmersiveTransition::Demote => self.leave_start_immersive(),
-                _ => self.close_start_screen(),
-            }
+            self.close_start_screen()
         } else {
             Task::none()
         }
     }
 
-    /// Slide-switch arm: `next` is false (Left/Prev) or true (Right/Next).
-    /// Immersive toggles the controllers island; compact moves Games↔Controllers.
-    /// Either way an in-progress edit draft is discarded first and a stowed
+    /// Create-toggle arm: flips the controllers surface both ways.
+    /// An in-progress edit draft is discarded first and a stowed
     /// settle scroll is dropped (the user took over post-settle browsing).
-    pub(crate) fn on_start_slide(&mut self, next: bool) -> Task<Message> {
-        if self.start_state.overlay_blocking() || self.start_state.transition.is_some() {
+    pub(crate) fn on_toggle_controllers(&mut self) -> Task<Message> {
+        if self.start_state.overlay_blocking() {
             return Task::none();
         }
-        // User took over post-settle browsing: a stowed settle
-        // scroll is moot (its target predates this slide change).
-        self.deferred_settle_scroll = None;
         if self.start_state.editing {
-            // Slide-switch discards the draft (cancel-equivalent): keep
-            // navigation like cancel (cursor first, anchor fallback) so
-            // the stale edit-mode index (checklist order) never lands
-            // on the wrong browse row.
             let cursor = self.start_state.selected_game_key();
             let anchor = self.start_state.edit_anchor_play_key.clone();
             self.discard_edit_draft();
@@ -414,112 +341,20 @@ impl App {
                 .resolve_edit_exit_selection(target.as_deref());
         }
         let now = Instant::now();
-        if self.start_state.immersive {
-            let target = if next {
-                // Right: expand controllers island.
-                start_mode::dock_expand_target(self.start_state.dock_expanded)
-            } else {
-                // Left: collapse controllers island.
-                start_mode::dock_collapse_target(self.start_state.dock_expanded)
-            };
-            if target.is_some() && self.start_state.request_dock(next, now) {
-                self.play_start_cue(UiSoundKind::Slide);
-                crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: start dock {}",
-                    if next { "expand" } else { "collapse" },
-                ));
-            }
-        } else if self
-            .start_state
-            .request_slide(compact_slide_target(next), now)
-        {
-            // Left: Controllers → Games; Right: Games → Controllers. No wrap.
-            // Interruptible mid-anim.
+        let next = !self.start_state.dock_expanded;
+        let target = if next {
+            start_mode::dock_expand_target(self.start_state.dock_expanded)
+        } else {
+            start_mode::dock_collapse_target(self.start_state.dock_expanded)
+        };
+        if target.is_some() && self.start_state.request_dock(next, now) {
             self.play_start_cue(UiSoundKind::Slide);
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: start controllers {} (create)",
+                if next { "open" } else { "close" },
+            ));
         }
         Task::none()
-    }
-
-    pub(crate) fn scroll_start_selection_into_view(&mut self) -> Task<Message> {
-        self.scroll_start_selection_into_view_dir(start_view::ScrollReveal::Either)
-    }
-
-    pub(crate) fn scroll_start_selection_into_view_dir(
-        &mut self,
-        direction: start_view::ScrollReveal,
-    ) -> Task<Message> {
-        let Some((id, y)) = self.start_state.selection_scroll_y(direction) else {
-            return Task::none();
-        };
-        self.start_state.note_scroll_y(&id, y);
-        operation::scroll_to(
-            id,
-            operation::AbsoluteOffset {
-                x: None,
-                y: Some(y),
-            },
-        )
-    }
-
-    pub(crate) fn scroll_start_selection_to_center(&mut self, force: bool) -> Task<Message> {
-        let target = if force {
-            self.start_state.selection_scroll_y_center_prefer()
-        } else {
-            self.start_state.selection_scroll_y_center()
-        };
-        let Some((id, y)) = target else {
-            return Task::none();
-        };
-        self.start_state.note_scroll_y(&id, y);
-        operation::scroll_to(
-            id,
-            operation::AbsoluteOffset {
-                x: None,
-                y: Some(y),
-            },
-        )
-    }
-
-    /// Open-time reveal for the current slide's selection (Games force-centers,
-    /// Controllers pins bidirectionally). Must run only once the window's
-    /// scrollables exist (`StartOpened`, re-focus, post-resize settle) — never
-    /// batched with `window::open`. No-op when already in view; harmless when
-    /// immersive (strip/dock own the selection, the compact id is unmounted).
-    pub(crate) fn scroll_start_selection_for_open(&mut self) -> Task<Message> {
-        let Some((id, y)) = self.start_state.open_reveal_scroll() else {
-            return Task::none();
-        };
-        self.start_state.note_scroll_y(&id, y);
-        operation::scroll_to(
-            id,
-            operation::AbsoluteOffset {
-                x: None,
-                y: Some(y),
-            },
-        )
-    }
-
-    /// Re-issue the demote center when a fresh mount report disagrees with it.
-    /// Converges in one step: the correction's own echo reports the target
-    /// back, inside tolerance, and no further op issues.
-    pub(crate) fn correct_demoted_games_reveal(&mut self, reported_y: f32) -> Task<Message> {
-        let Some((id, target)) = self.start_state.selection_scroll_y_center_prefer() else {
-            return Task::none();
-        };
-        if (target - reported_y).abs() <= 2.0 {
-            return Task::none();
-        }
-        crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start demote reveal correct reported={reported_y:.0} target={target:.0}"
-        ));
-        self.start_state.note_scroll_y(&id, target);
-        operation::scroll_to(
-            id,
-            operation::AbsoluteOffset {
-                x: None,
-                y: Some(target),
-            },
-        )
     }
 }
 
@@ -588,8 +423,7 @@ impl App {
         self.refresh_start_rows();
         let key = self.start_state.edit_anchor_play_key.clone();
         self.start_state.select_game_by_play_key(key.as_deref());
-        self.scroll_start_selection_to_center(true)
-            .chain(self.warm_start_art_task())
+        self.warm_start_art_task()
     }
 
     pub(crate) fn commit_start_edit(&mut self) -> Task<Message> {
@@ -610,8 +444,7 @@ impl App {
         // sort cycle persists), so only the selection needs resolving here.
         self.start_state
             .resolve_edit_exit_selection(target.as_deref());
-        self.scroll_start_selection_to_center(false)
-            .chain(self.warm_start_art_task())
+        self.warm_start_art_task()
     }
 
     pub(crate) fn cancel_start_edit(&mut self) -> Task<Message> {
@@ -627,8 +460,7 @@ impl App {
             .cancel_exit_target_key(cursor.as_deref(), anchor.as_deref());
         self.start_state
             .resolve_edit_exit_selection(target.as_deref());
-        self.scroll_start_selection_to_center(true)
-            .chain(self.warm_start_art_task())
+        self.warm_start_art_task()
     }
 
     pub(crate) fn cancel_manual_add(&mut self) -> Task<Message> {
@@ -637,7 +469,7 @@ impl App {
     }
 
     pub(crate) fn toggle_start_edit(&mut self) -> Option<Task<Message>> {
-        if self.start_state.slide != StartSlide::Games
+        if self.start_state.dock_expanded
             || self.start_state.overlay_blocking()
             || self.start_state.animating()
         {
@@ -710,37 +542,33 @@ impl App {
         if self.start_state.replace_confirm.is_some() {
             return Task::none();
         }
-        match self.start_state.slide {
-            StartSlide::Games if self.start_state.editing => match self.edit_toggle_selected() {
+        if self.start_state.dock_expanded {
+            if let Some(row) = self.start_state.selected_controller()
+                && row.connected
+            {
+                let serial = row.serial.clone();
+                if self.identify(&serial) {
+                    self.popup_state.begin_identify_flash(&serial);
+                    self.start_state.begin_identify_flash(&serial);
+                    self.play_start_cue(UiSoundKind::Action);
+                }
+            }
+            return Task::none();
+        }
+        if self.start_state.editing {
+            return match self.edit_toggle_selected() {
                 Some(task) => {
                     self.play_start_cue(UiSoundKind::Action);
                     task
                 }
                 None => Task::none(),
-            },
-            StartSlide::Games => {
-                if self.launch_selected() {
-                    self.play_start_cue(UiSoundKind::Action);
-                    if self.start_state.immersive {
-                        return self.close_start_screen();
-                    }
-                }
-                Task::none()
-            }
-            StartSlide::Controllers => {
-                if let Some(row) = self.start_state.selected_controller()
-                    && row.connected
-                {
-                    let serial = row.serial.clone();
-                    if self.identify(&serial) {
-                        self.popup_state.begin_identify_flash(&serial);
-                        self.start_state.begin_identify_flash(&serial);
-                        self.play_start_cue(UiSoundKind::Action);
-                    }
-                }
-                Task::none()
-            }
+            };
         }
+        if self.launch_selected() {
+            self.play_start_cue(UiSoundKind::Action);
+            return self.close_start_screen();
+        }
+        Task::none()
     }
 
     /// Launch the selected game. Returns true when launch, replace-confirm, or a real attempt ran.
@@ -878,28 +706,9 @@ impl App {
     /// Kick the first live Steam scan/refresh this process. Idempotent.
     pub(crate) fn maybe_kick_deferred_steam_scan(&mut self) -> Task<Message> {
         if self.steam_library_refreshed || self.steam_scan_started.is_some() {
-            self.steam_scan_deferred_for_promote = false;
             return Task::none();
         }
-        if self.immersive_transition_busy() {
-            self.steam_scan_deferred_for_promote = true;
-            crate::controller::hid::diag::diag_info(
-                "ui-diag: steam scan defer during promote ceremony",
-            );
-            return Task::none();
-        }
-        self.steam_scan_deferred_for_promote = false;
         self.refresh_steam_library()
-    }
-
-    /// Drain a Steam kick that was deferred across promote ExitCompact→EnterImmersive.
-    pub(crate) fn flush_deferred_steam_scan_after_promote(&mut self) -> Task<Message> {
-        if !self.steam_scan_deferred_for_promote {
-            return Task::none();
-        }
-        self.steam_scan_deferred_for_promote = false;
-        crate::controller::hid::diag::diag_info("ui-diag: steam scan flush after promote enter");
-        self.maybe_kick_deferred_steam_scan()
     }
 
     pub(crate) fn on_steam_scan_done(
@@ -940,8 +749,8 @@ impl App {
         self.refresh_start_rows();
         // Rows just rebuilt (order may have changed): while the restore
         // settle window is fresh, re-pin the persisted selection by key
-        // (index clamping alone can leave the highlight on the wrong row)
-        // and reveal it. Row-independent state (drawer, config) is untouched.
+        // (index clamping alone can leave the highlight on the wrong row).
+        // Row-independent state (drawer, config) is untouched.
         let mut task = self.prepare_immersive_library_task();
         if self.start_visible
             && self.session.prefs.start_selection_persist
@@ -951,10 +760,7 @@ impl App {
             && let Some(shadow) = self.start_selection_shadow.clone()
             && self.apply_start_selection(&shadow)
         {
-            task = task.chain(
-                self.scroll_start_selection_into_view()
-                    .chain(self.warm_start_art_task()),
-            );
+            task = task.chain(self.warm_start_art_task());
         }
         task
     }
@@ -983,30 +789,20 @@ impl App {
         });
     }
 
-    /// Pre-warm immersive art under ExitCompact blackout (linear strip window).
-    pub(crate) fn prewarm_immersive_art_for_promote(&mut self) {
-        crate::controller::hid::diag::diag_info(
-            "ui-diag: art warm promote prewarm (exit_compact linear)",
-        );
-        self.request_start_art_circular(false);
-    }
-
     pub(crate) fn warm_start_art_task(&mut self) -> Task<Message> {
         self.request_start_art();
         Task::none()
     }
 
-    /// After promote settle: skip gen bump when selection art is ready or still decoding.
+    /// After open: skip gen bump when selection art is ready or still decoding.
     pub(crate) fn warm_immersive_art_task(&mut self) -> Task<Message> {
         if self.start_state.enter_art_sync_ready() {
-            crate::controller::hid::diag::diag_info(
-                "ui-diag: art warm skip (promote settle already sync)",
-            );
+            crate::controller::hid::diag::diag_info("ui-diag: art warm skip (open already sync)");
             return Task::none();
         }
         if self.start_state.art_awaiting_paint {
             crate::controller::hid::diag::diag_info(
-                "ui-diag: art warm skip (promote settle in flight)",
+                "ui-diag: art warm skip (open still in flight)",
             );
             return Task::none();
         }
@@ -1312,19 +1108,16 @@ impl App {
         self.on_reopen_gesture(&readings)
     }
 
-    /// True when left/right should scroll the Games strip instead of switching
-    /// slides: horizontal immersive layout on the Games slide with no overlays
+    /// True when left/right should scroll the Games strip: horizontal layout
+    /// with the controllers surface closed and no overlays
     /// (settings / replace-confirm / manual-add) open. Edit mode is a mode,
     /// not an overlay, so it stays included: left/right move selection (all
-    /// rows are enabled in the checklist) while Up/Down are suppressed and
-    /// L2/R2 keep slide switching.
+    /// rows are enabled in the checklist) while Up/Down are suppressed.
     pub(crate) fn immersive_horizontal_games_nav(&self) -> bool {
-        self.start_state.immersive
-            && matches!(
-                self.session.prefs.start_screen_immersive_layout,
-                crate::persist::prefs::ImmersiveLayout::Horizontal
-            )
-            && matches!(self.start_state.slide, StartSlide::Games)
+        matches!(
+            self.session.prefs.start_screen_immersive_layout,
+            crate::persist::prefs::ImmersiveLayout::Horizontal
+        ) && !self.start_state.dock_expanded
             && !self.start_state.settings.open
             && self.start_state.replace_confirm.is_none()
             && self.start_state.manual_add.is_none()
@@ -1353,7 +1146,7 @@ impl App {
             return Task::none();
         }
 
-        // Cold ambient: no pad nav / promote / launch (keyboard Escape still closes).
+        // Cold ambient: no pad nav / launch (keyboard Escape still closes).
         if self.start_state.cold_load_active {
             if pad_active {
                 self.note_start_activity();
@@ -1365,14 +1158,8 @@ impl App {
             self.note_start_activity();
         }
 
-        let gesture = gesture::default_gesture();
-        self.start_state.reopen_chord_held = start_mode::promote_gesture_usable(&gesture)
-            && chord_held_on_any_pad(&gesture, readings);
-
-        // Reopen chord toggles compact ↔ immersive while Start is open.
-        if let Some(toggle) = self.try_toggle_immersive_from_gesture(readings) {
-            return toggle;
-        }
+        // Reopen chord while open is swallowed (PS opens when closed).
+        self.swallow_reopen_chord_while_open(readings);
 
         // Debug R3: hide/show all chrome while tuning (pad-only; R3 carries
         // no NavAction). Tuning-scoped, so it never fires in normal chrome.
@@ -1382,8 +1169,7 @@ impl App {
         }
 
         let animating = self.start_state.animating();
-        // Mid-slide: keep Left/Right nav live for interruptible request_slide,
-        // but skip controller-row rebuilds (those hitch the UI thread).
+        // Mid-anim: skip controller-row rebuilds (those hitch the UI thread).
         let badge_task = if !animating {
             let controllers_started = Instant::now();
             self.refresh_start_controllers();
@@ -1403,7 +1189,7 @@ impl App {
             Task::none()
         };
 
-        let _ = self.start_state.tick_anim(now);
+        self.start_state.tick_anim(now);
 
         let replace_confirm = self.start_state.replace_confirm.is_some();
         let manual_add = self.start_state.manual_add.is_some();
@@ -1416,7 +1202,7 @@ impl App {
             && !manual_add
             && !settings_open
             && !animating
-            && matches!(self.start_state.slide, StartSlide::Games)
+            && !self.start_state.dock_expanded
             && self.start_state.running_target.as_ref().is_some_and(|t| {
                 self.start_state
                     .rows
@@ -1429,14 +1215,14 @@ impl App {
             && !manual_add
             && !settings_open
             && !animating
-            && matches!(self.start_state.slide, StartSlide::Controllers)
+            && self.start_state.dock_expanded
             && self
                 .start_state
                 .selected_controller()
                 .is_some_and(|row| row.show_power_off());
-        // Immersive: left/right slides. Settings: Left/Right nudge sliders (compact too).
-        let horizontal_nav = self.start_state.immersive || settings_open;
-        // Horizontal Games strip: left/right scroll games, L2/R2 switch slides.
+        // Left/right move. Settings: Left/Right nudge sliders.
+        let horizontal_nav = true;
+        // Horizontal Games strip: left/right scroll games.
         let horizontal_games_nav = self.immersive_horizontal_games_nav();
         let tick = self.pad_nav.tick(
             readings,
@@ -1495,6 +1281,9 @@ impl App {
         } else if tick.action == Some(NavAction::ToggleSettings) {
             self.start_state.tick_hint_anims(now);
             self.on_start_message(StartMessage::ToggleSettings)
+        } else if tick.action == Some(NavAction::ToggleControllers) {
+            self.start_state.tick_hint_anims(now);
+            self.on_start_message(StartMessage::ToggleControllers)
         } else if settings_open {
             self.start_state.cross_progress = 0.0;
             self.start_state.triangle_progress = 0.0;
@@ -1505,8 +1294,14 @@ impl App {
             self.start_state.tick_hint_anims(now);
             if let Some(action) = tick.action {
                 match action {
-                    NavAction::PrevSlide => self.on_start_message(StartMessage::PrevSlide),
-                    NavAction::NextSlide => self.on_start_message(StartMessage::NextSlide),
+                    NavAction::Up => self.on_start_message(StartMessage::MoveUp),
+                    NavAction::Down => self.on_start_message(StartMessage::MoveDown),
+                    // Left/Right while chrome animates: move the selection.
+                    NavAction::Left => self.on_start_message(StartMessage::MoveUp),
+                    NavAction::Right => self.on_start_message(StartMessage::MoveDown),
+                    NavAction::ToggleControllers => {
+                        self.on_start_message(StartMessage::ToggleControllers)
+                    }
                     NavAction::Cancel => self.on_start_message(StartMessage::Close),
                     _ => Task::none(),
                 }
@@ -1592,8 +1387,17 @@ impl App {
                     NavAction::Down => self.on_start_message(StartMessage::MoveDown),
                     NavAction::Confirm => self.on_start_message(StartMessage::Confirm),
                     NavAction::Cancel => self.on_start_message(StartMessage::Close),
-                    NavAction::PrevSlide => self.on_start_message(StartMessage::PrevSlide),
-                    NavAction::NextSlide => self.on_start_message(StartMessage::NextSlide),
+                    // Left/Right: controllers selection when open, else ignore.
+                    NavAction::Left if self.start_state.dock_expanded => {
+                        self.on_start_message(StartMessage::MoveUp)
+                    }
+                    NavAction::Right if self.start_state.dock_expanded => {
+                        self.on_start_message(StartMessage::MoveDown)
+                    }
+                    NavAction::Left | NavAction::Right => Task::none(),
+                    NavAction::ToggleControllers => {
+                        self.on_start_message(StartMessage::ToggleControllers)
+                    }
                     NavAction::ToggleEdit => self.on_start_message(StartMessage::ToggleEdit),
                     NavAction::CycleSort => self.on_start_message(StartMessage::CycleSort),
                     NavAction::Triangle if self.start_state.editing => {
@@ -1668,21 +1472,17 @@ impl App {
         }
     }
 
-    /// Rising-edge reopen chord while Start is open → promote or demote (not when always-immersive).
-    pub(crate) fn try_toggle_immersive_from_gesture(
-        &mut self,
-        readings: &[start_input::NavReading],
-    ) -> Option<Task<Message>> {
+    /// Rising-edge reopen chord while Start is open is swallowed (PS opens when
+    /// closed). Still consumes the sticky hold through the release gate so the
+    /// opening press cannot immediately re-fire.
+    pub(crate) fn swallow_reopen_chord_while_open(&mut self, readings: &[start_input::NavReading]) {
         if !self.start_visible || readings.is_empty() {
-            return None;
+            return;
         }
-        if self.start_state.overlay_blocking() || self.start_state.transition.is_some() {
-            return None;
+        if self.start_state.overlay_blocking() {
+            return;
         }
         let required = gesture::default_gesture();
-        if start_mode::chord_is_circle_only(&required) {
-            return None;
-        }
         let chord_held = chord_held_on_any_pad(&required, readings);
         let now = Instant::now();
         let (tick, glitch) = self.chord_release_gate.tick(chord_held, now);
@@ -1694,30 +1494,10 @@ impl App {
                 if chord_held {
                     self.gesture_detectors.consume_pending_match(readings);
                 }
-                return None;
             }
-            ChordReleaseTick::Cleared => {
+            ChordReleaseTick::Cleared | ChordReleaseTick::Open => {
                 let _ = self.gesture_detectors.update(&required, readings);
-                return None;
             }
-            ChordReleaseTick::Open => {}
-        }
-        if !self.gesture_detectors.update(&required, readings) {
-            return None;
-        }
-        let always = self.session.prefs.start_screen_always_immersive;
-        match start_mode::on_reopen_chord(self.start_presentation(), always) {
-            start_mode::ImmersiveTransition::Promote => {
-                crate::controller::hid::diag::diag_info(
-                    "ui-diag: reopen gesture promote immersive",
-                );
-                Some(self.enter_start_immersive())
-            }
-            start_mode::ImmersiveTransition::Demote => {
-                crate::controller::hid::diag::diag_info("ui-diag: reopen gesture demote immersive");
-                Some(self.leave_start_immersive())
-            }
-            _ => None,
         }
     }
 }
@@ -1747,7 +1527,6 @@ impl App {
             auto_open: self.session.prefs.start_screen_auto_open,
             selection_persist: self.session.prefs.start_selection_persist,
             selection_mode: self.session.prefs.start_selection_mode,
-            always_immersive: self.session.prefs.start_screen_always_immersive,
             clock_enabled: self.session.prefs.start_screen_clock_enabled,
             immersive_layout: self.session.prefs.start_screen_immersive_layout,
             navbar: self.session.prefs.start_screen_navbar,
@@ -1765,14 +1544,7 @@ impl App {
             perf_aa_boot: self.renderer_boot_aa,
             perf_vsync_boot: self.renderer_boot_vsync,
             perf_reload_queued: self.renderer_reload_queued,
-            immersive: self.start_state.immersive,
         }
-    }
-
-    pub(crate) fn apply_start_screen_always_immersive(&mut self, enabled: bool) -> Task<Message> {
-        self.session.prefs.start_screen_always_immersive = enabled;
-        self.save_prefs();
-        Task::none()
     }
 
     pub(crate) fn apply_start_screen_clock(&mut self, enabled: bool) -> Task<Message> {
@@ -1993,11 +1765,10 @@ impl App {
         direction: start_view::ScrollReveal,
     ) -> Task<Message> {
         let snapshot = self.start_settings_snapshot();
-        let immersive = self.start_state.immersive;
         let Some(y) = self
             .start_state
             .settings
-            .focus_scroll_y(&snapshot, immersive, direction)
+            .focus_scroll_y(&snapshot, direction)
         else {
             return Task::none();
         };
@@ -2029,12 +1800,11 @@ impl App {
         ) {
             return Task::none();
         }
-        let immersive = self.start_state.immersive;
-        let Some(y) = self.start_state.settings.reload_scroll_y(
-            &snapshot,
-            immersive,
-            start_view::ScrollReveal::Either,
-        ) else {
+        let Some(y) = self
+            .start_state
+            .settings
+            .reload_scroll_y(&snapshot, start_view::ScrollReveal::Either)
+        else {
             return Task::none();
         };
         self.start_state.sync_settings_scroll(y);
@@ -2058,7 +1828,7 @@ impl App {
         if self.start_state.layout_transition_active()
             && matches!(
                 action,
-                NavAction::Up | NavAction::Down | NavAction::PrevSlide | NavAction::NextSlide
+                NavAction::Up | NavAction::Down | NavAction::Left | NavAction::Right
             )
         {
             return Task::none();
@@ -2096,8 +1866,8 @@ impl App {
                 }
                 Task::none()
             }
-            NavAction::PrevSlide | NavAction::NextSlide => {
-                let delta = if matches!(action, NavAction::PrevSlide) {
+            NavAction::Left | NavAction::Right => {
+                let delta = if matches!(action, NavAction::Left) {
                     -1
                 } else {
                     1
@@ -2144,13 +1914,13 @@ impl App {
         };
         let count = row.selector_count() as isize;
         match action {
-            NavAction::Up | NavAction::PrevSlide => {
+            NavAction::Up | NavAction::Left => {
                 let next = (highlight as isize - 1).rem_euclid(count) as usize;
                 self.start_state.settings.set_menu_highlight(next);
                 self.play_start_cue(UiSoundKind::Nav);
                 self.scroll_settings_focus_into_view(start_view::ScrollReveal::Either)
             }
-            NavAction::Down | NavAction::NextSlide => {
+            NavAction::Down | NavAction::Right => {
                 let next = (highlight as isize + 1).rem_euclid(count) as usize;
                 self.start_state.settings.set_menu_highlight(next);
                 self.play_start_cue(UiSoundKind::Nav);
@@ -2614,17 +2384,6 @@ impl App {
         self.maybe_kick_deferred_steam_scan()
     }
 
-    /// Compact-only: wait [`STEAM_SCAN_SETTLE_DELAY_MS`] then kick a live refresh (idempotent).
-    pub(crate) fn schedule_steam_scan_after_settle(&mut self) -> Task<Message> {
-        if self.steam_library_refreshed || self.steam_scan_started.is_some() {
-            return Task::none();
-        }
-        let delay_ms = crate::ui::start::mode::STEAM_SCAN_SETTLE_DELAY_MS;
-        Task::perform(delay(Duration::from_millis(delay_ms)), |()| {
-            Message::SteamScanAfterSettle
-        })
-    }
-
     /// Pin ±ART_WINDOW and enqueue a latest-wins decode job on the art worker.
     pub(crate) fn prepare_immersive_library_task(&mut self) -> Task<Message> {
         self.request_start_art();
@@ -2653,7 +2412,7 @@ impl App {
                 .add_manual(title, draft.target, args, icon);
         }
         self.refresh_start_rows();
-        self.scroll_start_selection_into_view()
+        Task::none()
     }
 
     pub(crate) fn apply_perf_throttle_immersive(&mut self, enabled: bool) -> Task<Message> {
@@ -2754,8 +2513,7 @@ impl App {
         RestartUiState {
             saved_at_ms: RestartUiState::now_ms(),
             start_visible: self.start_visible,
-            start_immersive: self.start_state.immersive,
-            start_on_controllers: matches!(self.start_state.slide, StartSlide::Controllers),
+            start_on_controllers: self.start_state.dock_expanded,
             game_key: self
                 .start_state
                 .rows
@@ -2767,10 +2525,6 @@ impl App {
                 .controllers
                 .get(self.start_state.controller_selected)
                 .map(|r| r.serial.to_string()),
-            games_scroll_y: self.start_state.list_offset(start_view::StartListId::Games),
-            controllers_scroll_y: self
-                .start_state
-                .list_offset(start_view::StartListId::Controllers),
             settings_scroll_y: self
                 .start_state
                 .list_offset(start_view::StartListId::Settings),
@@ -2819,14 +2573,11 @@ impl App {
                     game_index: rs.game_index,
                 });
             }
-            // Reopen the pre-restart presentation (a manually promoted
-            // immersive Start must not come back compact).
-            self.force_immersive_open = Some(rs.start_immersive);
             // Bypass the open-time nav reset below; everything it would
             // clear is restored here instead.
             self.restore_preserve_nav = true;
             if rs.start_on_controllers {
-                self.start_state.slide = StartSlide::Controllers;
+                self.start_state.dock_expanded = true;
             }
             if rs.settings_open {
                 self.start_state.request_settings(true, Instant::now());
@@ -2835,11 +2586,7 @@ impl App {
             }
             self.start_state.settings.focus = rs.settings_focus;
             self.start_state.sync_settings_scroll(rs.settings_scroll_y);
-            self.pending_scroll_restore = Some((
-                rs.games_scroll_y,
-                rs.controllers_scroll_y,
-                rs.settings_scroll_y,
-            ));
+            self.pending_settings_scroll = Some(rs.settings_scroll_y);
             // Settle window for selection re-pinning after row rebuilds (the
             // offsets themselves are one-shot and never re-asserted).
             self.scroll_restore_until = Some(Instant::now() + SCROLL_RESTORE_AUTHORITY);
@@ -2858,31 +2605,16 @@ impl App {
         task
     }
 
-    /// Re-apply saved games/controllers offsets once, after the settings
-    /// scroll and the branch reveal above — the saved offsets win. Never
-    /// re-asserted afterwards: once rows rebuild, offsets go stale and only
-    /// the persisted selection stays authoritative. Unmounted ids (immersive
-    /// strip/dock) are dropped by iced; the tracker sync still stands for
-    /// reveal-math fallbacks.
-    pub(crate) fn restore_game_lists(&mut self, games_y: f32, controllers_y: f32) -> Task<Message> {
-        Task::batch([
-            self.restore_one_list(start_view::StartListId::Games, games_y),
-            self.restore_one_list(start_view::StartListId::Controllers, controllers_y),
-        ])
-    }
-
-    pub(crate) fn restore_one_list(
-        &mut self,
-        list: start_view::StartListId,
-        y: f32,
-    ) -> Task<Message> {
-        let id = list.scroll_id();
-        self.start_state.note_scroll_y(&id, y);
+    /// Re-apply the saved settings offset once, on `StartOpened` when the
+    /// scrollable exists. Never re-asserted afterwards.
+    pub(crate) fn restore_settings_scroll(&mut self, settings_y: f32) -> Task<Message> {
+        let id = start_view::StartListId::Settings.scroll_id();
+        self.start_state.note_scroll_y(&id, settings_y);
         operation::scroll_to(
             id,
             operation::AbsoluteOffset {
                 x: None,
-                y: Some(y),
+                y: Some(settings_y),
             },
         )
     }
@@ -2920,12 +2652,6 @@ impl App {
             .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
         // App restart: resolve the stored shadow keys back to indices now
         // that rows/controllers are rebuilt.
-        // NOTE: no scroll_to here — the fresh window's scrollables do not exist
-        // yet, so a scroll_to batched with window::open targets a not-mounted
-        // id and is dropped by iced (compact-reopen bug: tracked offset said
-        // "centered" while the real viewport stayed at 0). Selection indices
-        // are restored now; the scroll_to reveal runs on StartOpened, when the
-        // view exists (see scroll_start_selection_for_open).
         let mut restored_art = Task::none();
         if let Some(selection) = self.start_selection_shadow.clone()
             && self.start_state.resolve_start_selection(
@@ -2942,7 +2668,7 @@ impl App {
         // Already open: re-focus; force running restore in case a game started.
         // Duplicate OpenStart (e.g. a second effect before the first open
         // lands) must re-arm the release latch so the opening press cannot
-        // promote.
+        // re-fire.
         if self.start_visible
             && let Some(id) = self.start_window
         {
@@ -2950,9 +2676,7 @@ impl App {
             self.last_running_check = None;
             self.arm_chord_release_latch();
             let badge = self.refresh_running_badge();
-            // Scrollable already mounted — reveal is live here.
-            let reveal = self.scroll_start_selection_for_open();
-            return Task::batch([badge, focus_window(id), reveal]);
+            return Task::batch([badge, focus_window(id)]);
         }
 
         // Mark the current chord consumed (do not reset): a held PS from power-on
@@ -2976,47 +2700,25 @@ impl App {
             return Task::none();
         }
 
-        let immersive = self.force_immersive_open.take().unwrap_or_else(|| {
-            matches!(
-                start_mode::on_open(self.session.prefs.start_screen_always_immersive),
-                start_mode::ImmersiveTransition::OpenImmersive
-            )
+        let cover = primary_monitor_cover().unwrap_or(MonitorCover {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
         });
-        self.start_state.immersive = immersive;
+        self.start_monitor_cover = Some(cover);
         self.clear_start_activity();
-        let (size, position) = if immersive {
-            let cover = primary_monitor_cover().unwrap_or(MonitorCover {
-                x: 0.0,
-                y: 0.0,
-                width: 1920.0,
-                height: 1080.0,
-            });
-            self.start_monitor_cover = Some(cover);
-            // Enter veil stays solid until StartOpened arms the capped clock.
-            self.start_state.begin_transition_phase(
-                start_mode::TransitionPhase::EnterImmersive,
-                Instant::now(),
-            );
-            crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
-            (cover.size(), window::Position::Specific(cover.origin()))
-        } else {
-            self.start_monitor_cover = None;
-            (
-                Size::new(start_view::WIDTH, start_view::HEIGHT),
-                window::Position::Centered,
-            )
-        };
+        // Enter veil stays solid until StartOpened arms the capped clock.
+        self.start_state
+            .begin_transition_phase(start_mode::TransitionPhase::EnterImmersive, Instant::now());
+        crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
+        let size = cover.size();
+        let position = window::Position::Specific(cover.origin());
 
         self.start_nav_ready = false;
-        crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start cold open immersive={}",
-            u8::from(immersive)
-        ));
+        crate::controller::hid::diag::diag_info("ui-diag: start cold open");
         if self.start_cold_load_remaining {
-            // Compact uses skeletons + deferred Steam — no cold-load ceremony.
-            if immersive {
-                self.start_state.begin_cold_load(Instant::now());
-            }
+            self.start_state.begin_cold_load(Instant::now());
         }
         let (id, open) = window::open(window::Settings {
             size,
@@ -3037,218 +2739,19 @@ impl App {
         Task::batch([badge, restored_art, open.map(Message::StartOpened)])
     }
 
-    pub(crate) fn start_presentation(&self) -> StartPresentation {
-        if self.start_state.immersive {
-            StartPresentation::Immersive
-        } else {
-            StartPresentation::Compact
-        }
-    }
-
-    pub(crate) fn immersive_transition_busy(&self) -> bool {
-        self.start_state.transition.is_some() || self.start_state.transition_phase.is_some()
-    }
-
-    pub(crate) fn enter_start_immersive(&mut self) -> Task<Message> {
-        let Some(_id) = self.start_window.filter(|_| self.start_visible) else {
-            return Task::none();
-        };
-        // Promote is never the process-first ceremony.
-        let steam = if self.start_state.cold_load_active {
-            self.note_cold_load_finished()
-        } else {
-            Task::none()
-        };
-        let Some(_transition) =
-            start_mode::begin_promote(self.start_state.immersive, self.immersive_transition_busy())
-        else {
-            return steam;
-        };
-        // The tuning panel is immersive-settled chrome: never carry it
-        // across a window morph (drawer stays closed; reopen from the drawer).
-        #[cfg(debug_assertions)]
-        self.start_state.request_ambient_tuning(false);
-        let cover = primary_monitor_cover().unwrap_or(MonitorCover {
-            x: 0.0,
-            y: 0.0,
-            width: 1920.0,
-            height: 1080.0,
-        });
-        self.start_monitor_cover = Some(cover);
-        self.clear_start_activity();
-        self.arm_chord_release_latch();
-        crate::controller::hid::diag::diag_info("ui-diag: start immersive enter");
-        let now = Instant::now();
-        self.start_state
-            .begin_transition_phase(start_mode::TransitionPhase::ExitCompact, now);
-        // Growth waits for the exit fade: the window holds its size while the
-        // outgoing chrome dims in place (frozen, no reflow), then morphs under
-        // the opaque Resizing blackout. The morph clock starts there, so every
-        // segment runs its full specified duration.
-        self.start_state.transition = Some(start_mode::StartTransition::Promoting);
-        let compact = Size::new(start_view::WIDTH, start_view::HEIGHT);
-        self.start_resize_anim = Some(ResizeAnim {
-            from_size: compact,
-            to_size: cover.size(),
-            from_pos: cover.center_for(compact),
-            to_pos: cover.origin(),
-            started: now,
-        });
-        crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start promote growth {}x{} -> {}x{}",
-            compact.width,
-            compact.height,
-            cover.size().width,
-            cover.size().height
-        ));
-        // Decode under ExitCompact blackout so settle is more often a warm hit.
-        self.prewarm_immersive_art_for_promote();
-        steam
-    }
-
-    pub(crate) fn leave_start_immersive(&mut self) -> Task<Message> {
-        let Some(_id) = self.start_window.filter(|_| self.start_visible) else {
-            return Task::none();
-        };
-        // EnterImmersive veil is interruptible; HWND resize / ExitImmersive are not.
-        let blocked = start_mode::demote_blocked(
-            self.start_state.transition.is_some(),
-            self.start_state.transition_phase.map(|(p, _)| p),
-        );
-        let Some(_transition) = start_mode::begin_demote(self.start_state.immersive, blocked)
-        else {
-            return Task::none();
-        };
-        // Same as promote: the tuning panel never survives a window morph.
-        #[cfg(debug_assertions)]
-        self.start_state.request_ambient_tuning(false);
-        self.arm_chord_release_latch();
-        crate::controller::hid::diag::diag_info("ui-diag: start immersive leave");
-        self.clear_start_activity();
-        let now = Instant::now();
-        self.start_state
-            .begin_transition_phase(start_mode::TransitionPhase::ExitImmersive, now);
-        // Shrink waits for the exit fade (mirror of promote): the window holds
-        // its size while immersive dims in place, then morphs under black.
-        self.start_state.transition = Some(start_mode::StartTransition::Demoting);
-        let compact = Size::new(start_view::WIDTH, start_view::HEIGHT);
-        let cover = self.start_monitor_cover.or_else(primary_monitor_cover);
-        let (from_size, from_pos, to_pos) = match cover {
-            Some(cover) => (cover.size(), cover.origin(), cover.center_for(compact)),
-            None => (
-                compact,
-                Point::new(
-                    ((1920.0 - compact.width) / 2.0).max(0.0),
-                    ((1080.0 - compact.height) / 2.0).max(0.0),
-                ),
-                Point::new(
-                    ((1920.0 - compact.width) / 2.0).max(0.0),
-                    ((1080.0 - compact.height) / 2.0).max(0.0),
-                ),
-            ),
-        };
-        self.start_resize_anim = Some(ResizeAnim {
-            from_size,
-            to_size: compact,
-            from_pos,
-            to_pos,
-            started: now,
-        });
-        crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start demote shrink {}x{} -> {}x{}",
-            from_size.width, from_size.height, compact.width, compact.height
-        ));
-        Task::none()
-    }
-
-    pub(crate) fn tick_immersive_transition_phase(
-        &mut self,
-        now: Instant,
-    ) -> Option<Task<Message>> {
-        // Deferred settle scroll (demote): fires once on the tick after
-        // settle, when the remounted list exists (a same-tick op can drop
-        // against the pre-swap tree — the StartOpened pattern).
-        if let Some(scroll) = self.take_deferred_settle_scroll() {
-            return match self.tick_immersive_transition_phase_inner(now) {
-                Some(task) => Some(scroll.chain(task)),
-                None => Some(scroll),
-            };
-        }
-        self.tick_immersive_transition_phase_inner(now)
-    }
-
-    pub(crate) fn tick_immersive_transition_phase_inner(
-        &mut self,
-        now: Instant,
-    ) -> Option<Task<Message>> {
-        // Strand recovery: Resizing advances only via the morph driver — with
-        // no anim (lost settle message) wall-clock completion can never fire
-        // and the window would sit on black forever. Settle directly while a
-        // transition is live; otherwise drop the orphaned blackout and paint
-        // current state. Age-gated: right after a normal morph completion the
-        // driver is also gone (Settled message still in flight), and settling
-        // there would double-settle every transition — only a strand persists
-        // past morph-spec + grace.
-        if matches!(
-            self.start_state.transition_phase.map(|(p, _)| p),
-            Some(start_mode::TransitionPhase::Resizing)
-        ) && self.start_resize_anim.is_none()
-        {
-            let age_ms = self
-                .start_state
-                .transition_phase
-                .map(|(_, started)| now.saturating_duration_since(started).as_millis() as u64)
-                .unwrap_or(0);
-            if age_ms <= start_mode::RESIZE_MS.saturating_add(1000) {
-                return None;
-            }
-            if !self.start_visible {
-                self.start_state.transition = None;
-                self.start_state.clear_transition_phase();
-                return Some(Task::none());
-            }
-            if self.start_state.transition.is_some() {
-                crate::controller::hid::diag::diag_info(
-                    "ui-diag: start resizing strand, settling directly",
-                );
-                return Some(self.finish_start_immersive_transition());
-            }
-            crate::controller::hid::diag::diag_info(
-                "ui-diag: start resizing orphan, clearing blackout",
-            );
-            self.start_state.clear_transition_phase();
-            return Some(Task::none());
-        }
-        // The HWND morph runs only under the opaque Resizing blackout, never
-        // under the exit fade: the outgoing chrome holds its window size (and
-        // frozen clocks) through the fade, so nothing reflows mid-exit. The
-        // morph's `started` resets when Resizing begins, guaranteeing the
-        // full specified duration. (Resizing never finishes by timer.)
-        let exiting = matches!(
-            self.start_state.transition_phase.map(|(p, _)| p),
-            Some(start_mode::TransitionPhase::ExitCompact)
-                | Some(start_mode::TransitionPhase::ExitImmersive)
-        );
-        if !exiting && let Some(task) = self.tick_resize_anim(now) {
-            return Some(task);
-        }
+    /// Advance the enter ceremony: once the veil clock finishes, clear the
+    /// phase and begin any held splash reveal on the same tick.
+    pub(crate) fn tick_enter_phase(&mut self, now: Instant) -> Option<Task<Message>> {
         if !self.start_state.phase_finished(now) {
             return None;
         }
         let (phase, started) = self.start_state.transition_phase?;
-        // Overrun witness for the next forensics: completions are wall-clock,
-        // so a phase ending far past its spec means ticks starved (the black
-        // window outlived the ceremony in paint-time, not logic-time).
+        // Overrun witness: completion is wall-clock, so ending far past spec
+        // means ticks starved (the window outlived the ceremony in paint-time).
         let elapsed_ms = now.saturating_duration_since(started).as_millis() as u64;
-        let allowance_ms = match phase {
-            // Art hold (up to ENTER_ART_HOLD_MAX_MS) precedes the lift.
-            start_mode::TransitionPhase::EnterImmersive => {
-                crate::ui::start::mode::ENTER_ART_HOLD_MAX_MS
-                    + crate::ui::start::mode::ENTER_REVEAL_MS
-                    + 1000
-            }
-            _ => phase.duration_ms().saturating_add(1000),
-        };
+        let allowance_ms = crate::ui::start::mode::ENTER_ART_HOLD_MAX_MS
+            + crate::ui::start::mode::ENTER_REVEAL_MS
+            + 1000;
         if elapsed_ms > allowance_ms {
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: start phase overrun phase={} elapsed_ms={elapsed_ms} spec_ms={}",
@@ -3256,268 +2759,14 @@ impl App {
                 phase.duration_ms()
             ));
         }
-        match phase {
-            // Exit fade done over a static window: start the morph now, under
-            // black (or settle directly if the morph already ran).
-            start_mode::TransitionPhase::ExitCompact
-            | start_mode::TransitionPhase::ExitImmersive => {
-                if let Some(anim) = self.start_resize_anim.as_mut() {
-                    anim.started = now;
-                    self.start_state
-                        .begin_transition_phase(start_mode::TransitionPhase::Resizing, now);
-                }
-                None
-            }
-            start_mode::TransitionPhase::EnterImmersive => {
-                self.start_state.clear_transition_phase();
-                // Veil phase over — begin held ambient→splash on this same clock tick.
-                self.start_state.try_start_pending_splash_reveal(now);
-                crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: start immersive transition phase={} done",
-                    phase.label()
-                ));
-                // Second exact snap: stepped tasks can coalesce, so re-assert
-                // the cover here (~one reveal after settle) — a no-op when
-                // already exact, a heal when the animation lost steps.
-                let resnap = self.snap_promote_target();
-                Some(resnap.chain(self.flush_deferred_steam_scan_after_promote()))
-            }
-            start_mode::TransitionPhase::EnterCompact => {
-                self.start_state.clear_transition_phase();
-                self.start_state.ambient_time = 0.0;
-                crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: start immersive transition phase={} done",
-                    phase.label()
-                ));
-                // Center backstop, conditional: the deferred + mount
-                // corrections usually landed it invisibly behind the veil. A
-                // match issues nothing, so a correct reveal can never snap
-                // here; a real mismatch still lands centered (visibly, but
-                // correctly) and the log line marks it.
-                if let Some((id, target)) = self.start_state.open_reveal_scroll() {
-                    let offset = start_view::StartListId::from_scroll_id(&id)
-                        .map(|list| self.start_state.list_offset(list))
-                        .unwrap_or(target);
-                    if (target - offset).abs() > 2.0 {
-                        crate::controller::hid::diag::diag_info(format!(
-                            "ui-diag: start demote reveal backstop offset={offset:.0} target={target:.0}"
-                        ));
-                        return Some(self.scroll_start_selection_for_open());
-                    }
-                }
-                None
-            }
-            start_mode::TransitionPhase::Resizing => None,
-        }
-    }
-
-    /// One animated-resize step (either direction). Returns `None` when no
-    /// animation is running (normal tick flow continues). Only ticked during
-    /// the opaque Resizing phase — never under an exit fade — with `started`
-    /// reset at Resizing begin, so the morph always runs its full duration.
-    ///
-    /// Completion issues the exact target geometry chained into settle, so
-    /// the enter veil only ever lifts on exact geometry — never mid-morph.
-    /// (Settling mid-growth revealed chrome at the wrong size with a snap
-    /// jump at the end.)
-    pub(crate) fn tick_resize_anim(&mut self, now: Instant) -> Option<Task<Message>> {
-        let anim = self.start_resize_anim?;
-        let Some(id) = self.start_window.filter(|_| self.start_visible) else {
-            self.start_resize_anim = None;
-            self.start_state.transition = None;
-            self.start_state.clear_transition_phase();
-            return Some(Task::none());
-        };
-        let t = start_mode::phase_progress_linear(
-            now.saturating_duration_since(anim.started).as_millis() as u64,
-            start_mode::RESIZE_MS,
-        );
-        if t >= 1.0 {
-            self.start_resize_anim = None;
-            let elapsed_ms = now.saturating_duration_since(anim.started).as_millis() as u64;
-            // Overrun witness: the morph is wall-clock, so finishing far past
-            // spec means ticks starved mid-morph (black outlived the ceremony).
-            if elapsed_ms > start_mode::RESIZE_MS.saturating_add(1000) {
-                crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: start resize overrun elapsed_ms={elapsed_ms} spec_ms={}",
-                    start_mode::RESIZE_MS
-                ));
-            }
-            crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: start resize anim done size={}x{}",
-                anim.to_size.width, anim.to_size.height
-            ));
-            let exact = window::resize(id, anim.to_size).chain(move_window(id, anim.to_pos));
-            if self.start_state.transition.is_none()
-                && matches!(
-                    self.start_state.transition_phase.map(|(p, _)| p),
-                    Some(start_mode::TransitionPhase::Resizing)
-                )
-            {
-                // Orphaned black tail (settle already ran or was skipped):
-                // clear it so the settled chrome paints.
-                self.start_state.clear_transition_phase();
-            }
-            return Some(exact.chain(Task::done(Message::StartImmersiveSettled)));
-        }
-        let eased = start_mode::ease_in_out_cubic(t);
-        let size = Size::new(
-            anim.from_size.width + (anim.to_size.width - anim.from_size.width) * eased,
-            anim.from_size.height + (anim.to_size.height - anim.from_size.height) * eased,
-        );
-        let pos = Point::new(
-            anim.from_pos.x + (anim.to_pos.x - anim.from_pos.x) * eased,
-            anim.from_pos.y + (anim.to_pos.y - anim.from_pos.y) * eased,
-        );
-        Some(window::resize(id, size).chain(move_window(id, pos)))
-    }
-
-    /// Exact snap to the promote target (cover). Stepped tasks can coalesce,
-    /// so settle re-asserts: a degraded animation heals here instead of
-    /// leaving immersive chrome in a compact window.
-    pub(crate) fn snap_promote_target(&self) -> Task<Message> {
-        let (Some(id), Some(cover)) = (
-            self.start_window.filter(|_| self.start_visible),
-            self.start_monitor_cover,
-        ) else {
-            return Task::none();
-        };
-        window::resize(id, cover.size()).chain(move_window(id, cover.origin()))
-    }
-
-    /// Exact snap to the demote target (centered compact). Same heal as
-    /// [`snap_promote_target`] for the shrink direction.
-    pub(crate) fn snap_compact_target(&self) -> Task<Message> {
-        let Some(id) = self.start_window.filter(|_| self.start_visible) else {
-            return Task::none();
-        };
-        let size = Size::new(start_view::WIDTH, start_view::HEIGHT);
-        let position = self
-            .start_monitor_cover
-            .or_else(primary_monitor_cover)
-            .map(|cover| cover.center_for(size))
-            .unwrap_or(Point::new(
-                ((1920.0 - size.width) / 2.0).max(0.0),
-                ((1080.0 - size.height) / 2.0).max(0.0),
-            ));
-        window::resize(id, size).chain(move_window(id, position))
-    }
-
-    pub(crate) fn finish_start_immersive_transition(&mut self) -> Task<Message> {
-        let Some(transition) = self.start_state.transition.take() else {
-            return Task::none();
-        };
-        // The animation already resolved (or never ran); never leave a stale
-        // driver behind to resize a settled window.
-        self.start_resize_anim = None;
-        let immersive = start_mode::settle_immersive(transition);
-        self.start_state.immersive = immersive;
-        self.start_state.dock_expanded = false;
-        self.start_state.slide = StartSlide::Games;
-        // Dock/strip anims cleared via transition phase begin + request_dock defaults.
-        let now = Instant::now();
-        // Exact snap first: stepped tasks can coalesce, so settle re-asserts
-        // geometry before flipping presentation — immersive chrome can never
-        // land in a compact window (or vice versa).
-        let snap: Task<Message> = if immersive {
-            self.snap_promote_target()
-        } else {
-            self.snap_compact_target()
-        };
-        if immersive {
-            // Keep ambient_time; open aperture + chrome.
-            // Lift onto ambient+dock immediately (cold-style); list stays hidden until art sync.
-            self.start_state
-                .begin_transition_phase(start_mode::TransitionPhase::EnterImmersive, now);
-            self.start_state.prime_backdrop_for_enter(now);
-            self.start_state.arm_enter_reveal(now);
-            // Promote settle re-shows the position rail (the transition-phase
-            // begin above cleared it). Pinned is a no-op show.
-            self.start_state.note_position_bar_scroll(now);
-            if !self.start_state.try_arm_enter_reveal_when_art_ready(now) {
-                crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: start immersive enter art hold (promote) steam_scan={} list_hidden=1",
-                    u8::from(self.steam_scan_pending)
-                ));
-            }
-            crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: start immersive settle promote backdrop re-arm sel={}",
-                self.start_state.game_selected
-            ));
-        } else {
-            self.start_monitor_cover = None;
-            self.clear_start_activity();
-            self.start_state.clear_backdrop_transition();
-            self.start_state
-                .begin_transition_phase(start_mode::TransitionPhase::EnterCompact, now);
-        }
-        self.arm_chord_release_latch();
-        let kind = if immersive { "promote" } else { "demote" };
-        crate::controller::hid::diag::diag_info(format!("ui-diag: start immersive settle {kind}"));
-        let focus = self
-            .start_window
-            .map(|id| focus_window(id).chain(raise_window_topmost(id)))
-            .unwrap_or_else(Task::none);
-        if immersive {
-            snap.chain(focus).chain(self.warm_immersive_art_task())
-        } else {
-            // Center selection as soon as compact chrome exists: issue now
-            // (may drop against the pre-swap tree) AND stow for the next
-            // tick, when the remounted list exists (StartOpened pattern).
-            // EnterCompact completion re-centers as backstop.
-            let immediate = self.scroll_start_selection_for_open();
-            self.stow_deferred_settle_scroll();
-            if let Some((sel, rows, row_top, vh, y)) = self.start_state.games_reveal_debug() {
-                crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: start demote reveal settle sel={sel} rows={rows} row_top={row_top:.0} vh={vh:.0} y={y:.0}"
-                ));
-            }
-            snap.chain(focus).chain(immediate)
-        }
-    }
-
-    /// Stow the open-time reveal for the tick after settle: the compact list
-    /// remounts under the new tree, so a same-tick `scroll_to` can drop.
-    /// Fires once (next tick, still behind the opaque lift), then clears.
-    pub(crate) fn stow_deferred_settle_scroll(&mut self) {
-        let Some((id, y)) = self.start_state.open_reveal_scroll() else {
-            self.deferred_settle_scroll = None;
-            return;
-        };
-        if let Some(list) = start_view::StartListId::from_scroll_id(&id) {
-            self.deferred_settle_scroll = Some((list, y));
-        }
-    }
-
-    /// Issue the stowed settle scroll once, then drop it. Recomputes at fire
-    /// time: the remount's first `on_scroll` may have reported the real
-    /// viewport since settle, and centering against a stale/estimate viewport
-    /// lands off-center (visible as a snap when the completion backstop
-    /// re-issues it after the lift). Falls back to the stowed target when
-    /// nothing is computable.
-    pub(crate) fn take_deferred_settle_scroll(&mut self) -> Option<Task<Message>> {
-        let (list, stowed_y) = self.deferred_settle_scroll.take()?;
-        if !self.start_visible {
-            return None;
-        }
-        let y = match self.start_state.open_reveal_scroll() {
-            Some((id, y)) if start_view::StartListId::from_scroll_id(&id) == Some(list) => y,
-            _ => stowed_y,
-        };
-        if (y - stowed_y).abs() > 0.5 {
-            crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: start demote reveal deferred list={list:?} vh={:.0} y={y:.0} (stowed {stowed_y:.0})",
-                self.start_state.list_viewport(list)
-            ));
-        }
-        self.start_state.note_scroll_y(&list.scroll_id(), y);
-        Some(operation::scroll_to(
-            list.scroll_id(),
-            operation::AbsoluteOffset {
-                x: None,
-                y: Some(y),
-            },
-        ))
+        self.start_state.clear_transition_phase();
+        // Veil phase over — begin held ambient→splash on this same clock tick.
+        self.start_state.try_start_pending_splash_reveal(now);
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start enter phase={} done",
+            phase.label()
+        ));
+        None
     }
 
     /// Arm the debounced release latch and mark any locally visible chord consumed.
@@ -3537,7 +2786,7 @@ impl App {
             }
             start_input::NavReadingsOutcome::Missing { .. } => {
                 // No fresh readings — resetting would disarm detectors
-                // and let the same press promote after a one-sample gap.
+                // and let the same press reopen after a one-sample gap.
             }
         }
     }
@@ -3568,7 +2817,7 @@ impl App {
         self.wake_start_idle(now, false);
     }
 
-    /// Reset activity clocks without treating it as a sleep-wake (open/promote/close).
+    /// Reset activity clocks without treating it as a sleep-wake (open/close).
     pub(crate) fn clear_start_activity(&mut self) {
         let now = Instant::now();
         self.start_last_activity = now;
@@ -3590,7 +2839,7 @@ impl App {
     }
 
     pub(crate) fn tick_start_cursor_idle(&mut self, now: Instant) {
-        if !self.start_visible || !self.start_state.immersive {
+        if !self.start_visible {
             self.set_start_cursor_hidden(false);
             return;
         }
@@ -3607,7 +2856,7 @@ impl App {
     /// Wake idle/sleep overlay toward Active. `from_sleep` marks pad-gated wake.
     pub(crate) fn wake_start_idle(&mut self, now: Instant, from_sleep: bool) {
         use crate::ui::start::idle::IdlePhase;
-        if !self.start_visible || !self.start_state.immersive {
+        if !self.start_visible {
             return;
         }
         if matches!(self.start_state.idle_phase, IdlePhase::Active)
@@ -3634,12 +2883,12 @@ impl App {
     pub(crate) fn tick_start_idle(&mut self, now: Instant) -> bool {
         use crate::ui::start::idle::{self as start_idle};
 
-        if !self.start_visible || !self.start_state.immersive {
+        if !self.start_visible {
             self.start_state.reset_idle_dim();
             return false;
         }
-        // Don't advance idle during promote/demote ceremony.
-        if self.start_state.transition_phase.is_some() || self.start_state.transition.is_some() {
+        // Don't advance idle during the enter ceremony.
+        if self.start_state.transition_phase.is_some() {
             let clear_gate = self.start_state.tick_idle_dim(now);
             return clear_gate;
         }
@@ -3681,17 +2930,11 @@ impl App {
         self.start_visible = false;
         self.start_nav_ready = false;
         self.start_revealed_at = None;
-        self.start_state.immersive = false;
-        // Tuning is immersive-settled state: never reopen with it on.
+        // Tuning is settled state: never reopen with it on.
         #[cfg(debug_assertions)]
         self.start_state.request_ambient_tuning(false);
         self.start_state.clear_immersive_session();
-        // Drop any in-flight promote/demote ceremony (animated growth must
-        // not keep resizing a closing window; reopen starts clean).
-        self.start_state.transition = None;
         self.start_state.clear_transition_phase();
-        self.start_resize_anim = None;
-        self.deferred_settle_scroll = None;
         // Invalidate in-flight art events; keep caches for fast reopen.
         // Process Exit is what wipes to a blank slate (`ArtOwner::shutdown`).
         let generation = crate::ui::start::icon_cache::bump_art_warm_generation();
@@ -3775,31 +3018,28 @@ impl App {
     pub(crate) fn cycle_games_sort(&mut self) -> Option<Task<Message>> {
         // Sort stays live in edit mode: the checklist re-sorts under the same
         // mode and the prefs write persists across save/cancel.
-        if self.start_state.slide != StartSlide::Games || self.start_state.overlay_blocking() {
+        if self.start_state.dock_expanded || self.start_state.overlay_blocking() {
             return None;
         }
         self.session.prefs.games_sort_mode = self.session.prefs.games_sort_mode.cycle();
         self.save_prefs();
         self.refresh_start_rows();
-        if self.start_state.immersive {
-            self.start_state
-                .note_position_bar_scroll(std::time::Instant::now());
-        }
-        Some(self.scroll_start_selection_into_view())
+        self.start_state
+            .note_position_bar_scroll(std::time::Instant::now());
+        Some(self.warm_start_art_task())
     }
 
     pub(crate) fn on_start_cycle_sort(&mut self) -> Option<Task<Message>> {
-        match self.start_state.slide {
-            StartSlide::Games => self.cycle_games_sort(),
-            StartSlide::Controllers => {
-                let next = !self.session.prefs.show_all_controllers;
-                self.set_show_all_controllers(next)
-            }
+        if self.start_state.dock_expanded {
+            let next = !self.session.prefs.show_all_controllers;
+            self.set_show_all_controllers(next)
+        } else {
+            self.cycle_games_sort()
         }
     }
 
     pub(crate) fn set_show_all_controllers(&mut self, show_all: bool) -> Option<Task<Message>> {
-        if self.start_state.slide != StartSlide::Controllers
+        if !self.start_state.dock_expanded
             || self.start_state.overlay_blocking()
             || self.session.prefs.show_all_controllers == show_all
         {
@@ -3812,7 +3052,7 @@ impl App {
             u8::from(show_all)
         ));
         self.refresh_start_controllers();
-        Some(self.scroll_start_selection_into_view())
+        Some(Task::none())
     }
 
     /// Native file picker; on Windows parents to Start so it clears immersive cover.
@@ -3873,7 +3113,7 @@ impl App {
         };
         if changed {
             self.refresh_start_rows();
-            Some(self.scroll_start_selection_into_view())
+            Some(Task::none())
         } else {
             None
         }
@@ -3888,7 +3128,7 @@ impl App {
         self.start_state.cross_progress = 0.0;
         let close_task = self.close_running_game();
         self.start_state.game_selected = confirm.next_index;
-        if self.launch_selected() && self.start_state.immersive {
+        if self.launch_selected() {
             return close_task.chain(self.close_start_screen());
         }
         close_task
@@ -3956,30 +3196,14 @@ pub(crate) fn start_cold_allows(message: &StartMessage) -> bool {
 }
 
 /// Layout-transition gate: focus moves freeze mid-transition; Confirm /
-/// Cancel / Close and settings commits stay live.
+/// Cancel / Close, settings-toggle, and controllers-toggle stay live.
 pub(crate) fn start_focus_move_frozen(message: &StartMessage) -> bool {
-    matches!(
-        message,
-        StartMessage::MoveUp
-            | StartMessage::MoveDown
-            | StartMessage::PrevSlide
-            | StartMessage::NextSlide
-    )
-}
-
-/// Compact slide-switch target: Left goes Controllers → Games, Right goes
-/// Games → Controllers (no wrap).
-pub(crate) fn compact_slide_target(next: bool) -> StartSlide {
-    if next {
-        StartSlide::Controllers
-    } else {
-        StartSlide::Games
-    }
+    matches!(message, StartMessage::MoveUp | StartMessage::MoveDown)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_slide_target, start_cold_allows, start_focus_move_frozen};
+    use super::{start_cold_allows, start_focus_move_frozen};
     use crate::ui::start::view::StartMessage;
 
     #[test]
@@ -3988,11 +3212,10 @@ mod tests {
         for msg in [
             StartMessage::MoveUp,
             StartMessage::MoveDown,
-            StartMessage::PrevSlide,
-            StartMessage::NextSlide,
             StartMessage::Confirm,
             StartMessage::ToggleEdit,
             StartMessage::ToggleSettings,
+            StartMessage::ToggleControllers,
         ] {
             assert!(
                 !start_cold_allows(&msg),
@@ -4003,35 +3226,19 @@ mod tests {
 
     #[test]
     fn layout_transition_freezes_only_focus_moves() {
-        for msg in [
-            StartMessage::MoveUp,
-            StartMessage::MoveDown,
-            StartMessage::PrevSlide,
-            StartMessage::NextSlide,
-        ] {
+        for msg in [StartMessage::MoveUp, StartMessage::MoveDown] {
             assert!(start_focus_move_frozen(&msg));
         }
         for msg in [
             StartMessage::Confirm,
             StartMessage::Close,
             StartMessage::ToggleSettings,
+            StartMessage::ToggleControllers,
         ] {
             assert!(
                 !start_focus_move_frozen(&msg),
                 "{msg:?} stays live mid-transition"
             );
         }
-    }
-
-    #[test]
-    fn compact_slide_target_has_no_wrap() {
-        assert!(matches!(
-            compact_slide_target(false),
-            crate::ui::start::view::StartSlide::Games
-        ));
-        assert!(matches!(
-            compact_slide_target(true),
-            crate::ui::start::view::StartSlide::Controllers
-        ));
     }
 }
