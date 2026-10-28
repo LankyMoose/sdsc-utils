@@ -73,7 +73,7 @@ impl App {
             start_screen_haptics_strength: self.session.prefs.start_screen_haptics_strength,
             extra_steam_paths: self.session.prefs.extra_steam_paths.clone(),
             steam_path_error: self.configure_state.steam_path_error.clone(),
-            show_uninstalled_games: self.session.prefs.show_uninstalled_games,
+            show_uninstalled_games: self.session.prefs.show_uninstalled_games_enabled(),
             steam_syncing: self.steam_scan_started.is_some(),
             steam_last_synced_label: steam::format_library_synced(
                 self.steam_last_synced_ms,

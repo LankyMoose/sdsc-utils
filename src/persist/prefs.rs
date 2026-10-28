@@ -306,11 +306,18 @@ pub struct Prefs {
     #[serde(default)]
     pub games_sort_mode: GamesSortMode,
     /// Show owned-but-uninstalled Steam games in the start screen and the
-    /// edit checklist (default on). Off hides them; the catalog keeps them
-    /// so toggling back on restores them. Unprovable rows (scan unknown)
-    /// always stay visible.
-    #[serde(default = "default_true")]
-    pub show_uninstalled_games: bool,
+    /// edit checklist (default off). `None` means the user never set it —
+    /// new installs and pre-1.7.1 files alike — so unset always follows the
+    /// current default; `Some` is an explicit choice and wins. Skipped on
+    /// save while unset so a mere save never fabricates a choice. Old files
+    /// that already carry a bool keep it (`false` was always explicit;
+    /// `true` may be a saved default, kept on conservatively).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_opt_bool"
+    )]
+    pub show_uninstalled_games: Option<bool>,
     /// Remember the start-screen game highlight across shell restarts.
     /// Hidden feature, always off: no UI exposes it and `normalize` forces
     /// it off on load. Off keeps the clamped index and never re-pins by key.
@@ -348,6 +355,47 @@ pub struct Prefs {
 
 fn default_true() -> bool {
     true
+}
+
+/// Deserialize an optional bool that older files may carry as a bare bool:
+/// missing → `None` (via `#[serde(default)]`, this fn is never called),
+/// `null` → `None`, `true`/`false` → `Some`.
+fn de_opt_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptBool;
+    impl<'de> serde::de::Visitor<'de> for OptBool {
+        type Value = Option<bool>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a bool or null")
+        }
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: serde::Deserializer<'de>,
+        {
+            serde::Deserialize::deserialize(deserializer)
+        }
+        fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Some(v))
+        }
+    }
+    deserializer.deserialize_option(OptBool)
 }
 
 fn default_low_battery_percent() -> u8 {
@@ -500,7 +548,7 @@ impl Default for Prefs {
             start_screen_haptics_enabled: true,
             start_screen_haptics_strength: default_start_screen_haptics_strength(),
             games_sort_mode: GamesSortMode::default(),
-            show_uninstalled_games: true,
+            show_uninstalled_games: None,
             // Hidden feature: selection persistence is always off (no UI).
             // `normalize` forces it off so older prefs files converge too.
             start_selection_persist: false,
@@ -594,6 +642,12 @@ impl Prefs {
     pub fn normalized(mut self) -> Self {
         self.normalize();
         self
+    }
+
+    /// Effective show-uninstalled state: an explicit user choice wins,
+    /// unset follows the current default (off).
+    pub fn show_uninstalled_games_enabled(&self) -> bool {
+        self.show_uninstalled_games.unwrap_or(false)
     }
 
     /// Clamp numeric prefs, force the reopen chord to PS, and force the
@@ -1015,18 +1069,32 @@ mod tests {
     }
 
     #[test]
-    fn show_uninstalled_games_defaults_on_and_round_trips() {
-        // Current behavior is preserved: uninstalled rows stay visible
-        // unless the user opts out.
+    fn show_uninstalled_games_defaults_off_until_set() {
+        // Unset (new installs and pre-toggle files) follows the default:
+        // off. An explicit choice round-trips and survives a save.
         let prefs: Prefs = serde_json::from_str("{}").unwrap();
-        assert!(prefs.show_uninstalled_games);
-        assert!(Prefs::default().show_uninstalled_games);
-        let off = Prefs {
-            show_uninstalled_games: false,
+        assert_eq!(prefs.show_uninstalled_games, None);
+        assert!(!prefs.show_uninstalled_games_enabled());
+        assert!(!Prefs::default().show_uninstalled_games_enabled());
+        // Old files carrying a bare bool keep it (`false` was always an
+        // explicit opt-out; `true` may be a saved default, kept on).
+        let off: Prefs = serde_json::from_str(r#"{"show_uninstalled_games":false}"#).unwrap();
+        assert_eq!(off.show_uninstalled_games, Some(false));
+        assert!(!off.show_uninstalled_games_enabled());
+        let on: Prefs = serde_json::from_str(r#"{"show_uninstalled_games":true}"#).unwrap();
+        assert_eq!(on.show_uninstalled_games, Some(true));
+        assert!(on.show_uninstalled_games_enabled());
+        // Unset stays absent on disk (a save never fabricates a choice);
+        // set values persist.
+        let encoded = serde_json::to_string(&Prefs::default()).unwrap();
+        assert!(!encoded.contains("show_uninstalled_games"));
+        let chosen = Prefs {
+            show_uninstalled_games: Some(true),
             ..Prefs::default()
         };
-        let decoded: Prefs = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
-        assert!(!decoded.show_uninstalled_games);
+        let decoded: Prefs =
+            serde_json::from_str(&serde_json::to_string(&chosen).unwrap()).unwrap();
+        assert!(decoded.show_uninstalled_games_enabled());
     }
 
     #[test]

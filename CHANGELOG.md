@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Show uninstalled games** now defaults off: the toggle only takes effect once set, so pre-existing installs (which never recorded a choice) follow the new default while explicit on/off choices are preserved.
+
 ## [1.7.1] - 2026-10-27
 
 ### Added
