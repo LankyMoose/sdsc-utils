@@ -846,7 +846,7 @@ impl App {
         app.create_tray();
         // Forensics line: which binary, which install flavor, and whether the
         // boot check is armed. Dev log only, so the usual triage questions
-        // (version? mock or real? packaged?) answer themselves.
+        // (version? packaged?) answer themselves.
         crate::platform::updater::diag_update(format!(
             "{} {} starting packaged={} update_boot_check={}",
             crate::platform::app_meta::DISPLAY_NAME,
@@ -1340,7 +1340,18 @@ impl App {
             #[cfg(debug_assertions)]
             Message::EmulatorCommitTick => self.on_emulator_commit_tick(),
             Message::PollResult(result) => self.on_poll_result(result),
-            Message::BootUpdateCheck => self.start_update_check("boot"),
+            Message::BootUpdateCheck => {
+                // A manual or open-triggered check already ran (or is
+                // running): the boot check stands down, no second check.
+                if matches!(self.update_status, UpdateStatus::Idle) {
+                    self.start_update_check("boot")
+                } else {
+                    crate::platform::updater::diag_update(
+                        "update check (boot): skipped, already checked",
+                    );
+                    Task::none()
+                }
+            }
             Message::UpdateCheckDone(result) => self.on_update_check_done(result),
             Message::UpdateSpin => Task::none(),
             Message::UpdateNotifyDone(_) => self.on_update_notify_done(),

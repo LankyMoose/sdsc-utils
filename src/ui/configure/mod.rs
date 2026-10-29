@@ -28,13 +28,15 @@ use crate::platform::updater::UpdateStatus;
 use crate::ui::color::{BatterySpectrum, hsv_to_rgb};
 use crate::ui::svg_icon;
 use crate::ui::{chrome, theme};
+#[cfg(debug_assertions)]
+use iced::Degrees;
 use iced::font::Weight;
 use iced::mouse;
 use iced::widget::{
     Column, Row, button, canvas as canvas_widget, column, container, hover, mouse_area, pick_list,
     row, scrollable, slider, space, stack, svg, text, toggler, tooltip,
 };
-use iced::{Alignment, Color, Element, Fill, Font, Length};
+use iced::{Alignment, Color, Element, Fill, Font, Length, Radians};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -68,8 +70,8 @@ const CONTENT_WIDTH: f32 = WIDTH
 const COVERAGE_HEIGHT: f32 = 56.0;
 /// Vertical distance outside the bar that arms stop removal (matches softbuffer UI).
 const ICON_SIZE: f32 = 16.0;
-/// Footer store / GitHub marks — slightly larger so the Store logo stays readable.
-const FOOTER_ICON_SIZE: f32 = 20.0;
+/// Version-store / GitHub marks — slightly larger so the Store logo stays readable.
+const LINK_ICON_SIZE: f32 = 20.0;
 /// Representative toast aspect for the position diagram (max width / typical height).
 const TOAST_ASPECT: f32 = crate::ui::toast::view::WIDTH / crate::ui::toast::view::HEIGHT;
 const POSITION_TOAST_W: f32 = 56.0;
@@ -785,20 +787,7 @@ pub fn view<'a>(
     };
 
     let content_pane: Element<'_, ConfigureMessage> = match state.section {
-        Section::System => column![
-            scroll(system_settings_view(settings)),
-            container(system_footer())
-                .padding(iced::Padding {
-                    top: 0.0,
-                    right: CONTENT_PADDING,
-                    bottom: 12.0,
-                    left: CONTENT_PADDING,
-                })
-                .width(Fill),
-        ]
-        .width(Fill)
-        .height(Fill)
-        .into(),
+        Section::System => scroll(system_settings_view(settings)).into(),
         _ => {
             #[cfg(debug_assertions)]
             {
@@ -1156,23 +1145,33 @@ fn reload_button(queued: bool) -> Element<'static, ConfigureMessage> {
 /// SVG rotation sweeps smoothly for the short feedback delay. Phase comes
 /// from a process-local epoch: `Instant::now().elapsed()` at view time is
 /// always ~zero and would render a frozen spinner.
+///
+/// `rotation()` takes radians: one steady turn per [`SPINNER_PERIOD_MS`].
+/// Passing degrees here aliased backwards at these frame rates.
 fn reload_spinner() -> Element<'static, ConfigureMessage> {
     static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let epoch = *EPOCH.get_or_init(Instant::now);
-    let angle = Instant::now()
-        .saturating_duration_since(epoch)
-        .as_millis()
-        .rem_euclid(1000) as f32
-        / 1000.0
-        * 360.0;
+    let elapsed_ms = Instant::now().saturating_duration_since(epoch).as_millis();
     svg(svg::Handle::from_memory(svg_icon::SPINNER_SVG.as_bytes()))
         .width(Length::Fixed(14.0))
         .height(Length::Fixed(14.0))
-        .rotation(angle)
+        .rotation(spinner_radians(elapsed_ms))
         .style(|_theme, _status| svg::Style {
             color: Some(theme::MUTED),
         })
         .into()
+}
+
+/// One spinner revolution period. Slow enough to read as rotation at the
+/// 20Hz update-check tick (and the 60Hz reload tick).
+const SPINNER_PERIOD_MS: u64 = 1200;
+
+/// Wall-clock spinner phase in radians (pure, unit-tested).
+fn spinner_radians(elapsed_ms: u128) -> Radians {
+    Radians(
+        elapsed_ms.rem_euclid(u128::from(SPINNER_PERIOD_MS)) as f32 / SPINNER_PERIOD_MS as f32
+            * std::f32::consts::TAU,
+    )
 }
 
 /// Dim explanatory paragraph.
@@ -1523,8 +1522,8 @@ fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, Configu
     }
 }
 
-/// Settings → System → Version: installed version, release check state,
-/// and the boot-check opt-out. The footer no longer shows the version.
+/// Settings → System → Version: installed version with project links,
+/// release check state, and the boot-check opt-out.
 fn version_group<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
     let mut rows: Vec<Element<'a, ConfigureMessage>> = vec![
         row![
@@ -1532,7 +1531,21 @@ fn version_group<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessa
                 .size(theme::type_scale::BODY)
                 .color(theme::INK)
                 .width(Fill),
+            link_button(
+                svg_icon::GITHUB_SVG,
+                // Match Microsoft Store bag main fill (`#F2F2F2`).
+                Some(theme::rgb(0xF2, 0xF2, 0xF2)),
+                "GitHub",
+                GITHUB_URL,
+            ),
+            link_button(
+                svg_icon::MICROSOFT_STORE_SVG,
+                None,
+                "Microsoft Store",
+                MICROSOFT_STORE_URL,
+            ),
         ]
+        .spacing(4)
         .align_y(Alignment::Center)
         .width(Fill)
         .into(),
@@ -1550,8 +1563,7 @@ fn version_group<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessa
                 row![
                     text("Checking for latest version…")
                         .size(theme::type_scale::BODY)
-                        .color(theme::INK)
-                        .width(Fill),
+                        .color(theme::INK),
                     reload_spinner(),
                 ]
                 .spacing(8)
@@ -1593,16 +1605,15 @@ fn version_group<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessa
         UpdateStatus::UpToDate => {
             rows.push(
                 row![
+                    text("Up to date")
+                        .size(theme::type_scale::BODY)
+                        .color(theme::INK),
                     svg(svg::Handle::from_memory(svg_icon::CHECK_SVG.as_bytes()))
                         .width(Length::Fixed(14.0))
                         .height(Length::Fixed(14.0))
                         .style(|_theme, _status| svg::Style {
                             color: Some(theme::ACCENT),
                         }),
-                    text("Up to date")
-                        .size(theme::type_scale::BODY)
-                        .color(theme::INK)
-                        .width(Fill),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center)
@@ -1631,34 +1642,7 @@ fn version_group<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessa
     group(Some("Version".to_string()), rows)
 }
 
-fn system_footer<'a>() -> Element<'a, ConfigureMessage> {
-    let links = row![
-        footer_link_button(
-            svg_icon::GITHUB_SVG,
-            // Match Microsoft Store bag main fill (`#F2F2F2`).
-            Some(theme::rgb(0xF2, 0xF2, 0xF2)),
-            "GitHub",
-            GITHUB_URL,
-        ),
-        footer_link_button(
-            svg_icon::MICROSOFT_STORE_SVG,
-            None,
-            "Microsoft Store",
-            MICROSOFT_STORE_URL,
-        ),
-    ]
-    .spacing(4)
-    .align_y(Alignment::Center);
-
-    Row::new()
-        .spacing(0)
-        .width(Fill)
-        .align_y(Alignment::Center)
-        .push(links)
-        .into()
-}
-
-fn footer_link_button<'a>(
+fn link_button<'a>(
     source: &'static str,
     tint: Option<Color>,
     tip: &'static str,
@@ -1666,8 +1650,8 @@ fn footer_link_button<'a>(
 ) -> Element<'a, ConfigureMessage> {
     let icon = |opacity: f32| {
         svg(svg::Handle::from_memory(source.as_bytes()))
-            .width(Length::Fixed(FOOTER_ICON_SIZE))
-            .height(Length::Fixed(FOOTER_ICON_SIZE))
+            .width(Length::Fixed(LINK_ICON_SIZE))
+            .height(Length::Fixed(LINK_ICON_SIZE))
             .opacity(opacity)
             .style(move |_theme, _status| svg::Style { color: tint })
     };
@@ -2584,8 +2568,8 @@ fn emulators_view<'a>(
 #[cfg(debug_assertions)]
 fn pending_spinner<'a>(tick: u32) -> Element<'a, ConfigureMessage> {
     // The commit tick is the only clock running here, so the angle steps off
-    // the frame counter instead of wall time.
-    let angle = (tick % 12) as f32 * 30.0;
+    // the frame counter instead of wall time (30° per 100ms tick).
+    let angle = Radians::from(Degrees((tick % 12) as f32 * 30.0));
     svg(svg::Handle::from_memory(svg_icon::SPINNER_SVG.as_bytes()))
         .width(Length::Fixed(14.0))
         .height(Length::Fixed(14.0))
@@ -2602,7 +2586,7 @@ fn chevron<'a>(open: bool) -> Element<'a, ConfigureMessage> {
     svg(svg::Handle::from_memory(svg_icon::CHEVRON_SVG.as_bytes()))
         .width(Length::Fixed(14.0))
         .height(Length::Fixed(14.0))
-        .rotation(if open { 90.0 } else { 0.0 })
+        .rotation(Radians::from(Degrees(if open { 90.0 } else { 0.0 })))
         .style(|_theme, _status| svg::Style {
             color: Some(theme::DIM),
         })
@@ -2904,6 +2888,21 @@ fn segmented_row<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spinner_radians_sweeps_one_turn_per_period() {
+        assert_eq!(spinner_radians(0).0, 0.0);
+        let half = spinner_radians(u128::from(SPINNER_PERIOD_MS) / 2).0;
+        assert!((half - std::f32::consts::PI).abs() < 1e-4);
+        // Wraps exactly: no jump at the cycle boundary.
+        assert_eq!(spinner_radians(u128::from(SPINNER_PERIOD_MS)).0, 0.0);
+        assert_eq!(
+            spinner_radians(u128::from(SPINNER_PERIOD_MS) + 100).0,
+            spinner_radians(100).0
+        );
+        // Monotonic within a period (no backwards aliasing).
+        assert!(spinner_radians(100).0 < spinner_radians(200).0);
+    }
 
     #[test]
     fn sidebar_groups_debug_sections_last_in_debug_builds_only() {

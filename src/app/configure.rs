@@ -24,6 +24,7 @@ use crate::platform::host::Host;
 use crate::platform::packaged;
 #[cfg(debug_assertions)]
 use crate::platform::ui_sound::UiSoundKind;
+use crate::platform::updater::UpdateStatus;
 use crate::ui::color::{self, BatterySpectrum};
 #[cfg(debug_assertions)]
 use crate::ui::configure::EmulatorCommand;
@@ -144,8 +145,16 @@ impl App {
     }
 
     pub(crate) fn open_configure(&mut self) -> Task<Message> {
+        // Opening Settings with no check yet starts one, so fast openers
+        // never sit on "Never checked" (the boot check stands down once
+        // anything ran or is running).
+        let check = if matches!(self.update_status, UpdateStatus::Idle) {
+            self.start_update_check("open")
+        } else {
+            Task::none()
+        };
         if let Some(id) = self.configure_window {
-            return focus_window(id);
+            return focus_window(id).chain(check);
         }
 
         self.configure_state
@@ -170,6 +179,7 @@ impl App {
         self.configure_window = Some(id);
         open.map(Message::ConfigureOpened)
             .chain(self.sync_toast_zorder())
+            .chain(check)
     }
 
     /// Debug-only standalone ambient preview (Diagnostics "View immersive"):

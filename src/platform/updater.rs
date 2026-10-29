@@ -15,8 +15,9 @@ use std::time::Duration;
 /// GitHub Releases API for the newest published release.
 pub const RELEASES_API_URL: &str =
     "https://api.github.com/repos/LankyMoose/sdsc-utils/releases/latest";
-/// Delay after tray boot before the automatic check (lets cold start settle).
-pub const UPDATE_BOOT_DELAY: Duration = Duration::from_secs(10);
+/// Delay after tray boot before the automatic check (lets cold start settle,
+/// without making fast Settings openers wait on "Never checked").
+pub const UPDATE_BOOT_DELAY: Duration = Duration::from_secs(5);
 /// Spinner redraw cadence while a check is in flight.
 pub const UPDATE_SPIN_TICK: Duration = Duration::from_millis(50);
 /// Network timeout for the release API call.
@@ -67,160 +68,6 @@ pub fn show_update_notification(tag: &str) {
         app_log::warn(format!("update notification failed: {err}"));
     } else {
         diag_update(format!("update notify: handed to OS for {tag}"));
-    }
-}
-
-/// Debug-only mock of the GitHub `releases/latest` endpoint (std only, no
-/// dependencies). Serves `sdsc-utils --mock-releases` and the `fetch_from_url`
-/// tests below: every response sleeps first so the checking spinner and the
-/// once-per-version notify path are exercisable locally.
-///
-/// Query knobs on `GET /releases/latest` (all optional):
-/// - `tag`: reported `tag_name` (default `v9.9.9`, always newer in dev);
-/// - `status`: HTTP status (default 200; e.g. 500 exercises the Failed card);
-/// - `delay_ms`: artificial delay before responding (default 300).
-#[cfg(debug_assertions)]
-pub mod mock {
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::{TcpListener, TcpStream};
-    use std::time::Duration;
-
-    /// Default `--mock-releases` port (loopback only).
-    pub const DEFAULT_PORT: u16 = 8751;
-    /// Artificial delay before every mock response.
-    pub const DEFAULT_DELAY_MS: u64 = 300;
-    /// Default reported tag (newer than any shipped version).
-    const DEFAULT_TAG: &str = "v9.9.9";
-    /// Largest request line we parse (dev tool, but stay bounded).
-    const MAX_REQUEST_LINE: usize = 8192;
-
-    struct Query {
-        tag: String,
-        status: u16,
-        delay_ms: u64,
-    }
-
-    /// Blocking: serve mock releases on 127.0.0.1 until the process exits.
-    /// Entry point for `sdsc-utils --mock-releases [port]`.
-    pub fn serve(port: u16) -> std::io::Result<()> {
-        let listener = TcpListener::bind(("127.0.0.1", port))?;
-        println!(
-            "mock releases at http://127.0.0.1:{port}/releases/latest[?tag=v9.9.9&status=200&delay_ms=300]"
-        );
-        println!("run the app with SDSC_UPDATE_URL set to that address");
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => handle_connection(stream),
-                Err(err) => eprintln!("mock releases: connection failed: {err}"),
-            }
-        }
-        Ok(())
-    }
-
-    /// Test helper: serve exactly `requests` connections on an ephemeral
-    /// loopback port, then exit. Returns the port and join handle (join it so
-    /// no server thread outlives the test).
-    pub fn spawn_test_server(requests: usize) -> (u16, std::thread::JoinHandle<()>) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock server");
-        let port = listener.local_addr().expect("mock addr").port();
-        let handle = std::thread::spawn(move || {
-            for stream in listener.incoming().take(requests).flatten() {
-                handle_connection(stream);
-            }
-        });
-        (port, handle)
-    }
-
-    fn handle_connection(mut stream: TcpStream) {
-        let request_line = {
-            let mut reader = BufReader::new(&mut stream);
-            let mut line = String::new();
-            // Request line plus header drain; anything unreadable ends it.
-            if reader.read_line(&mut line).is_err() {
-                return;
-            }
-            loop {
-                let mut header = String::new();
-                match reader.read_line(&mut header) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) if header.trim().is_empty() => break,
-                    Ok(_) => {}
-                }
-            }
-            line
-        };
-        if request_line.len() > MAX_REQUEST_LINE {
-            return;
-        }
-        let query = parse_query(&request_line);
-        std::thread::sleep(Duration::from_millis(query.delay_ms));
-        let (status, body) = mock_response(&query, &request_line);
-        let response = format!(
-            "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            reason_phrase(status),
-            body.len(),
-        );
-        let _ = stream.write_all(response.as_bytes());
-    }
-
-    fn parse_query(request_line: &str) -> Query {
-        let mut query = Query {
-            tag: DEFAULT_TAG.to_string(),
-            status: 200,
-            delay_ms: DEFAULT_DELAY_MS,
-        };
-        let path = request_line.split_whitespace().nth(1).unwrap_or("");
-        let params = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-        for pair in params.split('&') {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            match key {
-                "tag" if !value.is_empty() => query.tag = value.to_string(),
-                "status" => {
-                    if let Ok(status) = value.parse::<u16>() {
-                        query.status = status;
-                    }
-                }
-                "delay_ms" => {
-                    if let Ok(delay) = value.parse::<u64>() {
-                        query.delay_ms = delay;
-                    }
-                }
-                _ => {}
-            }
-        }
-        query
-    }
-
-    /// Only `GET /releases/latest` is served; anything else is a 404.
-    /// `?status=` overrides the status for the endpoint itself.
-    fn mock_response(query: &Query, request_line: &str) -> (u16, String) {
-        let mut parts = request_line.split_whitespace();
-        let is_get = parts.next() == Some("GET");
-        let is_endpoint = parts
-            .next()
-            .is_some_and(|path| path.split('?').next() == Some("/releases/latest"));
-        if !is_get || !is_endpoint {
-            return (404, r#"{"message":"mock: unknown endpoint"}"#.to_string());
-        }
-        if query.status != 200 {
-            return (query.status, r#"{"message":"mock error"}"#.to_string());
-        }
-        let body = format!(
-            "{{\"tag_name\":\"{}\",\"html_url\":\"https://github.com/LankyMoose/sdsc-utils/releases/tag/{}\"}}",
-            query.tag, query.tag,
-        );
-        (200, body)
-    }
-
-    fn reason_phrase(status: u16) -> &'static str {
-        match status {
-            200 => "OK",
-            403 => "Forbidden",
-            404 => "Not Found",
-            429 => "Too Many Requests",
-            500 => "Internal Server Error",
-            _ => "Error",
-        }
     }
 }
 
@@ -290,28 +137,18 @@ fn validate_release_url(url: &str) -> Option<String> {
 
 /// Blocking: fetch the latest release from GitHub. Run through
 /// `spawn_blocking`, never on the UI thread.
-///
-/// Debug builds honor `SDSC_UPDATE_URL` (a full `releases/latest` URL, served
-/// by `sdsc-utils --mock-releases`) so the check is testable without hitting
-/// GitHub. Release builds always use [`RELEASES_API_URL`].
 pub fn fetch_latest() -> AppResult<ReleaseInfo> {
-    fetch_from_url(&releases_url())
-}
-
-fn releases_url() -> String {
+    // Debug-only: hold the Checking/spinner state briefly so the
+    // in-flight UI is observable (real fetches finish in ~100ms).
+    // Compiled out of release builds entirely.
     #[cfg(debug_assertions)]
-    if let Ok(url) = std::env::var("SDSC_UPDATE_URL")
-        && !url.trim().is_empty()
-    {
-        return url;
-    }
-    RELEASES_API_URL.to_string()
-}
-
-fn fetch_from_url(url: &str) -> AppResult<ReleaseInfo> {
+    std::thread::sleep(Duration::from_secs(2));
     let started = std::time::Instant::now();
-    diag_update(format!("update check: requesting {}", url_host(url)));
-    let request = ureq::get(url)
+    diag_update(format!(
+        "update check: requesting {}",
+        url_host(RELEASES_API_URL)
+    ));
+    let request = ureq::get(RELEASES_API_URL)
         .header("User-Agent", format!("{PKG_NAME}/{PKG_VERSION}"))
         .header("Accept", "application/vnd.github+json")
         .config()
@@ -448,51 +285,5 @@ mod tests {
         );
         // Not JSON at all.
         assert!(release_from_json("not json").is_err());
-    }
-
-    /// Each mock test binds its own ephemeral loopback port (no shared
-    /// state), so parallel test threads cannot interfere.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn fetch_from_url_serves_mock_release() {
-        let (port, handle) = mock::spawn_test_server(1);
-        let info = fetch_from_url(&format!("http://127.0.0.1:{port}/releases/latest")).unwrap();
-        handle.join().expect("mock server");
-        assert_eq!(info.tag, "v9.9.9");
-        assert_eq!(info.version, (9, 9, 9));
-        assert!(is_newer(&info.tag, PKG_VERSION));
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn fetch_from_url_reflects_tag_and_status() {
-        let (port, handle) = mock::spawn_test_server(2);
-        let base = format!("http://127.0.0.1:{port}/releases/latest");
-        let info = fetch_from_url(&format!("{base}?tag=v1.0.0")).unwrap();
-        assert_eq!(info.tag, "v1.0.0");
-        assert!(!is_newer(&info.tag, PKG_VERSION));
-        assert!(fetch_from_url(&format!("{base}?status=500")).is_err());
-        handle.join().expect("mock server");
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn fetch_from_url_rejects_unknown_endpoint() {
-        let (port, handle) = mock::spawn_test_server(1);
-        assert!(fetch_from_url(&format!("http://127.0.0.1:{port}/nope")).is_err());
-        handle.join().expect("mock server");
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn mock_response_carries_the_artificial_delay() {
-        // Lower bound only: `sleep` never returns early, scheduling only adds.
-        let started = std::time::Instant::now();
-        let (port, handle) = mock::spawn_test_server(1);
-        let _ = fetch_from_url(&format!(
-            "http://127.0.0.1:{port}/releases/latest?delay_ms=300"
-        ));
-        handle.join().expect("mock server");
-        assert!(started.elapsed() >= Duration::from_millis(200));
     }
 }
