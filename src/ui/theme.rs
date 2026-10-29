@@ -109,6 +109,14 @@ pub const fn alpha(color: Color, alpha: f32) -> Color {
     Color { a: alpha, ..color }
 }
 
+/// Scale an existing color's alpha by `factor` (e.g. toast card opacity).
+pub const fn scale_alpha(color: Color, factor: f32) -> Color {
+    Color {
+        a: color.a * factor,
+        ..color
+    }
+}
+
 /// Linear blend of two colors (`t` = 0 keeps `a`, 1 keeps `b`).
 pub const fn mix(a: Color, b: Color, t: f32) -> Color {
     Color {
@@ -442,17 +450,21 @@ pub fn swatch(color: Color) -> impl Fn(&Theme) -> container::Style {
 }
 
 /// Toast card: glass over the desktop, rounded, soft shadow.
-pub fn toast_card(_accent: Color) -> impl Fn(&Theme) -> container::Style {
+///
+/// `opacity` (0..=1) fades the whole card uniformly — fill, hairline, and
+/// shadow scale together so the card reads as one translucent surface.
+pub fn toast_card(opacity: f32) -> impl Fn(&Theme) -> container::Style {
+    let opacity = opacity.clamp(0.0, 1.0);
     move |_theme| container::Style {
-        background: Some(Background::Color(GLASS_FILL)),
+        background: Some(Background::Color(scale_alpha(GLASS_FILL, opacity))),
         text_color: Some(INK),
         border: Border {
-            color: GLASS_HAIRLINE,
+            color: scale_alpha(GLASS_HAIRLINE, opacity),
             width: 1.0,
             radius: radius::LG.into(),
         },
         shadow: iced::Shadow {
-            color: alpha(Color::BLACK, 0.4),
+            color: alpha(Color::BLACK, 0.4 * opacity),
             offset: iced::Vector::new(0.0, 6.0),
             blur_radius: 18.0,
         },
@@ -461,7 +473,8 @@ pub fn toast_card(_accent: Color) -> impl Fn(&Theme) -> container::Style {
 }
 
 /// Vertical accent rail drawn down the left edge of a toast.
-pub fn rail(accent: Color) -> impl Fn(&Theme) -> container::Style {
+pub fn rail(accent: Color, opacity: f32) -> impl Fn(&Theme) -> container::Style {
+    let accent = scale_alpha(accent, opacity.clamp(0.0, 1.0));
     move |_theme| container::Style {
         background: Some(Background::Color(accent)),
         border: Border {

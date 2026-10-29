@@ -75,6 +75,42 @@ impl App {
         self.show_next_toast()
     }
 
+    /// Opacity multiplier for toast cards (whole card, from the opacity pref).
+    pub(crate) fn toast_opacity(&self) -> f32 {
+        f32::from(self.session.prefs.toast_opacity) / 100.0
+    }
+
+    /// One-shot "running in the tray" toast on manual starts.
+    /// Login (autostart) launches, `--replace` reloads, and crash
+    /// relaunches stay quiet. Packaged builds cannot carry the login flag
+    /// on their StartupTask, so an enabled startup task implies a possible
+    /// login launch and stays quiet too.
+    pub(crate) fn maybe_show_startup_notice(&mut self) -> Task<Message> {
+        if !self.session.prefs.notify_startup {
+            return Task::none();
+        }
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        let launched_at_login = argv
+            .iter()
+            .any(|a| a == crate::platform::app_meta::LOGIN_FLAG);
+        let replacing = argv
+            .iter()
+            .any(|a| a == crate::platform::app_meta::REPLACE_FLAG);
+        if launched_at_login || replacing {
+            return Task::none();
+        }
+        if crash_restart::has_pending_notice() {
+            return Task::none();
+        }
+        #[cfg(windows)]
+        if crate::platform::packaged::is_packaged() && crate::platform::autostart::is_enabled() {
+            return Task::none();
+        }
+        app_log::info("startup: manual-launch notice toast");
+        ToastMessage::enqueue(&mut self.toast_queue, ToastMessage::startup());
+        self.show_next_toast()
+    }
+
     pub(crate) fn create_toast_window(&mut self) -> (window::Id, Task<window::Id>) {
         let (id, open) = window::open(window::Settings {
             size: Size::new(toast_view::WIDTH, toast_view::HEIGHT),
@@ -182,6 +218,7 @@ impl App {
             message,
             self.toast_generation,
             Message::ToastDismiss(self.toast_generation),
+            self.toast_opacity(),
         );
         // Layout at (0,0), then Float-translate into cover-local pose. Non-zero
         // translate (or a tiny nudge) puts the card in the overlay band above the

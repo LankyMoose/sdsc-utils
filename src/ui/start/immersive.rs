@@ -1381,6 +1381,7 @@ fn dock_controller_row<'a>(
         dock_ring_size(dock_progress),
         row.eta.clone(),
         dock_eta_reveal(dock_progress),
+        1.0,
     );
     let ring_cell = container(ring)
         .width(Length::Fixed(DOCK_PEEK_W))

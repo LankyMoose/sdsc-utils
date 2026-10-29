@@ -16,6 +16,10 @@ pub const LOW_BATTERY_PERCENT_MAX: u8 = 35;
 /// DualSense-observable mid-points within the low-battery threshold range.
 const LOW_BATTERY_OBSERVABLE: [u8; 4] = [5, 15, 25, 35];
 
+/// Inclusive bounds for the toast card opacity slider (whole card, percent).
+pub const TOAST_OPACITY_MIN: u8 = 20;
+pub const TOAST_OPACITY_MAX: u8 = 100;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToastPosition {
@@ -256,6 +260,18 @@ pub struct Prefs {
     pub low_battery_percent: u8,
     #[serde(default)]
     pub toast_position: ToastPosition,
+    /// Toast card opacity percent (whole card: fill, text, rail, ring).
+    /// 100 reproduces the shipped glass look; the slider floors at 20.
+    #[serde(default = "default_toast_opacity")]
+    pub toast_opacity: u8,
+    /// Show a "running in the tray" toast on manual starts (default on).
+    /// Login (autostart) launches stay quiet.
+    #[serde(default = "default_true")]
+    pub notify_startup: bool,
+    /// Keep the Settings window above other windows (default on).
+    /// Off restores a normal window; toasts may then starve its presents.
+    #[serde(default = "default_true")]
+    pub configure_always_on_top: bool,
     #[serde(default)]
     pub spectrum: BatterySpectrum,
     /// Opt-in local charge/play duration analytics (default off).
@@ -402,6 +418,10 @@ fn default_low_battery_percent() -> u8 {
     LOW_BATTERY_PERCENT
 }
 
+fn default_toast_opacity() -> u8 {
+    TOAST_OPACITY_MAX
+}
+
 fn default_start_screen_sound_volume() -> u8 {
     60
 }
@@ -443,6 +463,11 @@ pub fn clamp_low_battery_percent(value: u8) -> u8 {
 
 pub fn clamp_start_screen_sound_volume(value: u8) -> u8 {
     value.min(100)
+}
+
+/// Clamp the toast opacity slider into its allowed range.
+pub fn clamp_toast_opacity(value: u8) -> u8 {
+    value.clamp(TOAST_OPACITY_MIN, TOAST_OPACITY_MAX)
 }
 
 pub fn clamp_start_screen_haptics_strength(value: u8) -> u8 {
@@ -533,6 +558,9 @@ impl Default for Prefs {
             notify_disconnect: true,
             low_battery_percent: LOW_BATTERY_PERCENT,
             toast_position: ToastPosition::default(),
+            toast_opacity: default_toast_opacity(),
+            notify_startup: true,
+            configure_always_on_top: true,
             spectrum: BatterySpectrum::default_spectrum(),
             analytics_enabled: false,
             lightbar_enabled: true,
@@ -654,6 +682,7 @@ impl Prefs {
     /// hidden selection-persistence feature off.
     fn normalize(&mut self) {
         self.low_battery_percent = clamp_low_battery_percent(self.low_battery_percent);
+        self.toast_opacity = clamp_toast_opacity(self.toast_opacity);
         self.start_screen_sound_volume =
             clamp_start_screen_sound_volume(self.start_screen_sound_volume);
         self.start_screen_haptics_strength =
@@ -767,6 +796,21 @@ mod tests {
         assert_eq!(clamp_start_screen_haptics_strength(60), 60);
         assert_eq!(clamp_start_screen_haptics_strength(100), 100);
         assert_eq!(clamp_start_screen_haptics_strength(255), 100);
+    }
+
+    #[test]
+    fn older_prefs_default_toast_opacity_startup_and_on_top() {
+        let prefs: Prefs = serde_json::from_str(r#"{"notify_low":true}"#).unwrap();
+        assert_eq!(prefs.toast_opacity, TOAST_OPACITY_MAX);
+        assert!(prefs.notify_startup);
+        assert!(prefs.configure_always_on_top);
+    }
+
+    #[test]
+    fn clamp_toast_opacity_bounds() {
+        assert_eq!(clamp_toast_opacity(0), TOAST_OPACITY_MIN);
+        assert_eq!(clamp_toast_opacity(50), 50);
+        assert_eq!(clamp_toast_opacity(255), TOAST_OPACITY_MAX);
     }
 
     #[test]

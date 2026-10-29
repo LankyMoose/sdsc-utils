@@ -25,14 +25,17 @@ const BUG_ICON_SIZE: f32 = 36.0;
 ///
 /// `generation` changes the layout width by 1px so iced/wgpu cannot keep the
 /// previous toast's surface when messages are chained on one window.
+/// `opacity` (0..=1) fades the entire card uniformly (toast opacity pref).
 pub fn view<'a, Message>(
     message: &'a ToastMessage,
     generation: u64,
     on_dismiss: Message,
+    opacity: f32,
 ) -> Element<'a, Message>
 where
     Message: Clone + 'a,
 {
+    let opacity = opacity.clamp(0.0, 1.0);
     let accent = theme::from_rgb(message.accent);
     let width = WIDTH
         + if generation.is_multiple_of(2) {
@@ -44,16 +47,16 @@ where
     let rail = container(space())
         .width(Length::Fixed(RAIL_WIDTH))
         .height(Fill)
-        .style(theme::rail(accent));
+        .style(theme::rail(accent, opacity));
 
     let body = column![
         text(message.heading.as_str())
             .size(HEADING_SIZE)
-            .color(theme::INK)
+            .color(theme::scale_alpha(theme::INK, opacity))
             .width(Fill),
         text(message.body.as_str())
             .size(BODY_SIZE)
-            .color(theme::MUTED)
+            .color(theme::scale_alpha(theme::MUTED, opacity))
             .width(Fill),
     ]
     .spacing(4)
@@ -63,18 +66,23 @@ where
         ToastTrailing::Percent { percent, eta } => row![
             rail,
             body,
-            percent_ring::percent_ring(*percent, accent, TOAST_SIZE, eta.clone(), 1.0)
+            percent_ring::percent_ring(*percent, accent, TOAST_SIZE, eta.clone(), 1.0, opacity)
         ]
         .spacing(PADDING)
         .align_y(Alignment::Center)
         .height(Fill)
         .into(),
-        ToastTrailing::Bug => {
-            let icon = svg(svg::Handle::from_memory(svg_icon::BUG_SVG.as_bytes()))
+        trailing @ (ToastTrailing::Bug | ToastTrailing::Check) => {
+            let source = if matches!(trailing, ToastTrailing::Check) {
+                svg_icon::CHECK_SVG
+            } else {
+                svg_icon::BUG_SVG
+            };
+            let icon = svg(svg::Handle::from_memory(source.as_bytes()))
                 .width(Length::Fixed(BUG_ICON_SIZE))
                 .height(Length::Fixed(BUG_ICON_SIZE))
                 .style(move |_theme, _status| svg::Style {
-                    color: Some(accent),
+                    color: Some(theme::scale_alpha(accent, opacity)),
                 });
             row![rail, icon, body]
                 .spacing(PADDING)
@@ -88,7 +96,7 @@ where
         .padding(PADDING)
         .width(Fill)
         .height(Fill)
-        .style(theme::toast_card(accent));
+        .style(theme::toast_card(opacity));
 
     mouse_area(
         container(card)

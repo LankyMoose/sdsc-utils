@@ -104,6 +104,11 @@ pub fn take_pending_notice() -> bool {
     true
 }
 
+/// Peek whether a crash-restart notice is pending (no consume).
+pub fn has_pending_notice() -> bool {
+    read_budget().notice
+}
+
 /// Call once tray mode is about to start (`app::run`). CLI paths stay unarmed.
 pub fn arm_tray_mode(armed: &CrashArmed) {
     armed.arm_tray_mode();

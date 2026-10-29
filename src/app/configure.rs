@@ -15,7 +15,9 @@ use crate::controller::model::Serial;
 use crate::games::launch;
 use crate::games::steam;
 use crate::persist::paths;
-use crate::persist::prefs::{clamp_low_battery_percent, renderer_restart_needed};
+use crate::persist::prefs::{
+    clamp_low_battery_percent, clamp_toast_opacity, renderer_restart_needed,
+};
 use crate::platform::app_log;
 #[cfg(windows)]
 use crate::platform::host::Host;
@@ -37,6 +39,15 @@ use iced::{Size, Task, window};
 #[cfg(debug_assertions)]
 use std::time::Instant;
 
+/// Settings window level honoring the System → Window opt-out.
+fn configure_level(always_on_top: bool) -> window::Level {
+    if always_on_top {
+        window::Level::AlwaysOnTop
+    } else {
+        window::Level::Normal
+    }
+}
+
 impl App {
     pub(crate) fn configure_settings(&self) -> ConfigureSettings {
         ConfigureSettings {
@@ -46,6 +57,9 @@ impl App {
             notify_disconnect: self.session.prefs.notify_disconnect,
             low_battery_percent: self.session.prefs.low_battery_percent,
             toast_position: self.session.prefs.toast_position,
+            toast_opacity: self.session.prefs.toast_opacity,
+            notify_startup: self.session.prefs.notify_startup,
+            configure_always_on_top: self.session.prefs.configure_always_on_top,
             analytics_enabled: self.session.prefs.analytics_enabled,
             lightbar_enabled: self.session.prefs.lightbar_enabled,
             start_screen_enabled: self.session.prefs.start_screen_enabled,
@@ -140,9 +154,10 @@ impl App {
             transparent: crate::ui::chrome::transparent_windows(),
             resizable: false,
             decorations: false,
-            // AlwaysOnTop like Start: a Normal Settings window loses presents to the
-            // toast on Windows even when the toast is demoted (iced#3320).
-            level: window::Level::AlwaysOnTop,
+            // AlwaysOnTop by default (opt-out via System → Window): a Normal
+            // Settings window loses presents to the toast on Windows even
+            // when the toast is demoted (iced#3320).
+            level: configure_level(self.session.prefs.configure_always_on_top),
             exit_on_close_request: true,
             platform_specific: window_platform_specific(),
             ..window::Settings::default()
@@ -219,6 +234,7 @@ impl App {
                     }
                     NotificationSetting::Low => self.session.prefs.notify_low = enabled,
                     NotificationSetting::Charged => self.session.prefs.notify_charged = enabled,
+                    NotificationSetting::Startup => self.session.prefs.notify_startup = enabled,
                 }
                 self.save_prefs();
                 Task::none()
@@ -237,6 +253,24 @@ impl App {
                 self.session.prefs.toast_position = position;
                 self.save_prefs();
                 self.show_position_preview()
+            }
+            ConfigureMessage::SetToastOpacity(opacity) => {
+                let opacity = clamp_toast_opacity(opacity);
+                if self.session.prefs.toast_opacity != opacity {
+                    self.session.prefs.toast_opacity = opacity;
+                    self.save_prefs();
+                    return self.show_position_preview();
+                }
+                Task::none()
+            }
+            ConfigureMessage::SetConfigureAlwaysOnTop(enabled) => {
+                self.session.prefs.configure_always_on_top = enabled;
+                self.save_prefs();
+                match self.configure_window {
+                    Some(id) => window::set_level(id, configure_level(enabled))
+                        .chain(self.sync_toast_zorder()),
+                    None => Task::none(),
+                }
             }
             ConfigureMessage::SetAnalyticsEnabled(enabled) => {
                 self.session.prefs.analytics_enabled = enabled;

@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 pub enum ToastTrailing {
     Percent { percent: u8, eta: Option<String> },
     Bug,
+    Check,
 }
 
 #[derive(Debug, Clone)]
@@ -100,10 +101,24 @@ impl ToastMessage {
         }
     }
 
+    /// Shown once on manual starts (login launches stay quiet).
+    pub fn startup() -> Self {
+        // Matches `theme::ACCENT` (#4141FB).
+        const ACCENT: Rgb = Rgb::new(0x41, 0x41, 0xFB);
+        Self {
+            heading: format!("{} is running", crate::platform::app_meta::DISPLAY_NAME),
+            body: "Right-click the tray icon for Settings.".to_string(),
+            serial: Serial::default(),
+            accent: ACCENT,
+            trailing: ToastTrailing::Check,
+            after: AfterToast::Nothing,
+        }
+    }
+
     pub fn percent(&self) -> u8 {
         match &self.trailing {
             ToastTrailing::Percent { percent, .. } => *percent,
-            ToastTrailing::Bug => 0,
+            ToastTrailing::Bug | ToastTrailing::Check => 0,
         }
     }
 }
@@ -180,6 +195,15 @@ mod tests {
         assert!(matches!(message.trailing, ToastTrailing::Bug));
         assert!(message.heading.contains("crashed and restarted"));
         assert!(message.body.contains("app.log"));
+    }
+
+    #[test]
+    fn startup_notice_uses_check_trailing() {
+        let message = ToastMessage::startup();
+        assert!(matches!(message.trailing, ToastTrailing::Check));
+        assert!(message.heading.contains("is running"));
+        assert!(message.body.contains("tray"));
+        assert_eq!(message.percent(), 0);
     }
 
     fn notify(serial: &str, body: &str, percent: u8) -> NotifyEvent {
