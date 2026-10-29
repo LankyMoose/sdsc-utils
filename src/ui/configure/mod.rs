@@ -24,6 +24,7 @@ use crate::persist::prefs::{
     StartAutoOpen, TOAST_OPACITY_MAX, TOAST_OPACITY_MIN, ToastPosition,
 };
 use crate::platform::app_meta::{DISPLAY_NAME, PKG_VERSION};
+use crate::platform::updater::UpdateStatus;
 use crate::ui::color::{BatterySpectrum, hsv_to_rgb};
 use crate::ui::svg_icon;
 use crate::ui::{chrome, theme};
@@ -227,6 +228,12 @@ pub struct ConfigureSettings {
     pub extra_steam_paths: Vec<PathBuf>,
     pub steam_path_error: Option<String>,
     pub show_uninstalled_games: bool,
+    /// Settings → System → Version card state.
+    pub update: UpdateStatus,
+    /// Check GitHub releases at boot (System → Version toggle).
+    pub update_boot_check: bool,
+    /// MSIX/Store identity: the update button opens the Store, not releases.
+    pub is_packaged: bool,
     /// A library scan is in flight (sync button shows "Syncing…", disabled).
     pub steam_syncing: bool,
     /// Preformatted "Last synced …" / "Never synced" label.
@@ -400,6 +407,12 @@ pub enum ConfigureMessage {
     SetStartScreenHapticsStrength(u8),
     OpenDataFolder,
     OpenExternalLink(&'static str),
+    /// Open a runtime-provided URL (validated https release page).
+    OpenUrl(String),
+    /// Begin a GitHub release check (Settings → System → Version).
+    CheckForUpdates,
+    /// Boot-time release check opt-out (Settings → System → Version).
+    SetUpdateBootCheck(bool),
     OpenChangelog,
     CloseChangelog,
     AddSteamPath,
@@ -1080,6 +1093,30 @@ fn action_button<'a>(
         .into()
 }
 
+/// Secondary action button with a runtime-provided label (release tags).
+fn action_button_owned(
+    label: String,
+    message: ConfigureMessage,
+) -> Element<'static, ConfigureMessage> {
+    button(text(label).size(13.0))
+        .padding([7, 14])
+        .on_press(message)
+        .style(theme::secondary)
+        .into()
+}
+
+/// Primary action button with a runtime-provided label (the update action).
+fn primary_button_owned(
+    label: String,
+    message: ConfigureMessage,
+) -> Element<'static, ConfigureMessage> {
+    button(text(label).size(13.0))
+        .padding([7, 14])
+        .on_press(message)
+        .style(theme::primary)
+        .into()
+}
+
 /// Steam library sync button. Disabled with a waiting label while a scan is
 /// in flight so a second click cannot queue another scan.
 fn sync_button(syncing: bool) -> Element<'static, ConfigureMessage> {
@@ -1466,14 +1503,132 @@ fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, Configu
         )],
     );
 
+    let version = version_group(settings);
+
     if startup.is_empty() {
-        column![window, data].spacing(18).width(Fill).into()
-    } else {
-        column![group(Some("Startup".to_string()), startup), window, data]
+        column![version, window, data]
             .spacing(18)
             .width(Fill)
             .into()
+    } else {
+        column![
+            version,
+            group(Some("Startup".to_string()), startup),
+            window,
+            data
+        ]
+        .spacing(18)
+        .width(Fill)
+        .into()
     }
+}
+
+/// Settings → System → Version: installed version, release check state,
+/// and the boot-check opt-out. The footer no longer shows the version.
+fn version_group<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
+    let mut rows: Vec<Element<'a, ConfigureMessage>> = vec![
+        row![
+            text(format!("{DISPLAY_NAME} {PKG_VERSION}"))
+                .size(theme::type_scale::BODY)
+                .color(theme::INK)
+                .width(Fill),
+        ]
+        .align_y(Alignment::Center)
+        .width(Fill)
+        .into(),
+    ];
+    match &settings.update {
+        UpdateStatus::Idle => {
+            rows.push(note("Never checked for updates this session."));
+            rows.push(action_button(
+                "Check for updates",
+                ConfigureMessage::CheckForUpdates,
+            ));
+        }
+        UpdateStatus::Checking => {
+            rows.push(
+                row![
+                    text("Checking for latest version…")
+                        .size(theme::type_scale::BODY)
+                        .color(theme::INK)
+                        .width(Fill),
+                    reload_spinner(),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .width(Fill)
+                .into(),
+            );
+        }
+        UpdateStatus::Available(info) => {
+            rows.push(
+                text(format!("{} is available", info.tag))
+                    .size(theme::type_scale::BODY)
+                    .color(theme::INK)
+                    .into(),
+            );
+            let update = if settings.is_packaged {
+                (
+                    "Open in Microsoft Store".to_string(),
+                    ConfigureMessage::OpenExternalLink(MICROSOFT_STORE_URL),
+                )
+            } else {
+                (
+                    format!("Download {}", info.tag),
+                    ConfigureMessage::OpenUrl(info.url.clone()),
+                )
+            };
+            rows.push(
+                row![
+                    action_button_owned(
+                        format!("View release {}", info.tag),
+                        ConfigureMessage::OpenUrl(info.url.clone()),
+                    ),
+                    primary_button_owned(update.0, update.1),
+                ]
+                .spacing(8)
+                .into(),
+            );
+        }
+        UpdateStatus::UpToDate => {
+            rows.push(
+                row![
+                    svg(svg::Handle::from_memory(svg_icon::CHECK_SVG.as_bytes()))
+                        .width(Length::Fixed(14.0))
+                        .height(Length::Fixed(14.0))
+                        .style(|_theme, _status| svg::Style {
+                            color: Some(theme::ACCENT),
+                        }),
+                    text("Up to date")
+                        .size(theme::type_scale::BODY)
+                        .color(theme::INK)
+                        .width(Fill),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .width(Fill)
+                .into(),
+            );
+            rows.push(action_button(
+                "Check for updates",
+                ConfigureMessage::CheckForUpdates,
+            ));
+        }
+        UpdateStatus::Failed(reason) => {
+            rows.push(note(reason.clone()));
+            rows.push(action_button(
+                "Try again",
+                ConfigureMessage::CheckForUpdates,
+            ));
+        }
+    }
+    rows.push(toggle_row(
+        "Check for updates at startup",
+        Some("Compares this version against the latest GitHub release"),
+        settings.update_boot_check,
+        ConfigureMessage::SetUpdateBootCheck,
+    ));
+    group(Some("Version".to_string()), rows)
 }
 
 fn system_footer<'a>() -> Element<'a, ConfigureMessage> {
@@ -1495,17 +1650,11 @@ fn system_footer<'a>() -> Element<'a, ConfigureMessage> {
     .spacing(4)
     .align_y(Alignment::Center);
 
-    let version = text(format!("{DISPLAY_NAME} {PKG_VERSION}"))
-        .size(12.0)
-        .color(theme::DIM);
-
     Row::new()
         .spacing(0)
         .width(Fill)
         .align_y(Alignment::Center)
         .push(links)
-        .push(space().width(Fill))
-        .push(version)
         .into()
 }
 
@@ -2963,6 +3112,9 @@ mod tests {
             show_uninstalled_games: true,
             steam_syncing: false,
             steam_last_synced_label: "Never synced".to_string(),
+            update: UpdateStatus::Idle,
+            update_boot_check: true,
+            is_packaged: false,
         };
         let _disabled_el = start_screen_view(&settings);
         settings.start_screen_enabled = true;

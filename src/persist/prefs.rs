@@ -276,6 +276,10 @@ pub struct Prefs {
     /// Off restores a normal window; toasts may then starve its presents.
     #[serde(default = "default_true")]
     pub configure_always_on_top: bool,
+    /// Check GitHub releases for a newer version at boot (default on).
+    /// The manual check in Settings → System → Version always runs.
+    #[serde(default = "default_true")]
+    pub update_boot_check: bool,
     #[serde(default)]
     pub spectrum: BatterySpectrum,
     /// Opt-in local charge/play duration analytics (default off).
@@ -565,6 +569,7 @@ impl Default for Prefs {
             toast_opacity: default_toast_opacity(),
             notify_startup: true,
             configure_always_on_top: true,
+            update_boot_check: true,
             spectrum: BatterySpectrum::default_spectrum(),
             analytics_enabled: false,
             lightbar_enabled: true,
@@ -808,6 +813,7 @@ mod tests {
         assert_eq!(prefs.toast_opacity, TOAST_OPACITY_DEFAULT);
         assert!(prefs.notify_startup);
         assert!(prefs.configure_always_on_top);
+        assert!(prefs.update_boot_check);
     }
 
     #[test]

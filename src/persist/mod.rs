@@ -5,3 +5,4 @@ pub mod paths;
 pub mod prefs;
 pub mod restart_ui;
 pub mod store;
+pub mod updater;

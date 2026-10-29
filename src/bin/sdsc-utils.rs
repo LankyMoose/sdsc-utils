@@ -95,6 +95,12 @@ fn main() -> ExitCode {
         return list_controllers_cli();
     }
 
+    #[cfg(debug_assertions)]
+    if let Some(idx) = args.iter().position(|a| a == "--mock-releases") {
+        attach_console_for_cli();
+        return mock_releases_cli(&args[idx + 1..]);
+    }
+
     if let Some(idx) = args.iter().position(|a| a == "--set-lightbar") {
         attach_console_for_cli();
         return set_lightbar_cli(&args[idx + 1..]);
@@ -242,6 +248,26 @@ fn print_controllers(statuses: &[controller::model::ControllerStatus]) {
                 s.percent,
                 s.state.as_str()
             );
+        }
+    }
+}
+
+/// Debug-only: mock GitHub releases endpoint for update-check testing.
+/// Release builds reject `--mock-releases` as an unknown argument (the
+/// dispatch above is compiled out there too).
+#[cfg(debug_assertions)]
+fn mock_releases_cli(rest: &[String]) -> ExitCode {
+    use sdsc_utils::platform::updater::mock;
+
+    let port = rest
+        .first()
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or(mock::DEFAULT_PORT);
+    match mock::serve(port) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: mock releases failed: {err}");
+            ExitCode::FAILURE
         }
     }
 }
