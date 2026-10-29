@@ -79,6 +79,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(not(windows))]
 use tray_icon::TrayIcon;
 
 /// Debounce spectrum prefs save + HID apply after the last color edit.
@@ -371,6 +372,12 @@ pub struct App {
     /// no process-global).
     sound: SoundHub,
 
+    /// Windows: handle to the dedicated tray thread (icon, menu, and modal
+    /// menu loop live there so a stuck menu cannot wedge the iced thread).
+    /// Other platforms own tray-icon directly (their toolkits require it).
+    #[cfg(windows)]
+    tray_icon: Option<tray::TrayHandle>,
+    #[cfg(not(windows))]
     tray_icon: Option<TrayIcon>,
     tray_anchor: TrayAnchor,
 
@@ -1986,6 +1993,11 @@ impl App {
     }
 
     fn apply_tray(&mut self) -> Task<Message> {
+        #[cfg(windows)]
+        if let Some(handle) = self.tray_icon.as_ref() {
+            tray::apply_tray(handle, &self.session.controllers);
+        }
+        #[cfg(not(windows))]
         if let Some(tray_icon) = self.tray_icon.as_mut() {
             tray::apply_tray(tray_icon, &self.session.controllers);
         }
