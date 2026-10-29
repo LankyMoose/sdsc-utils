@@ -54,7 +54,7 @@ Current as of 1.7.0 (`assets/screenshots/1.7.0/`; previous sets are kept under `
 
 **Recommended (Windows):** install from the [Microsoft Store](https://apps.microsoft.com/) once the listing is live (search for **SDSC Utils**). Store installs are signed by Microsoft and update automatically through the Store / `winget`.
 
-**Advanced:** portable builds are attached to [GitHub Releases](https://github.com/LankyMoose/sdsc-utils/releases) as a single `sdsc-utils.exe` (tray + HID + UI in one process, no bundled extras). That executable is **not** Authenticode-signed. Browsers and Windows SmartScreen often warn on uncommon unsigned downloads — that is expected. There is no in-app auto-update for the portable build; download the next release manually when you want it.
+**Advanced:** portable builds are attached to [GitHub Releases](https://github.com/LankyMoose/sdsc-utils/releases) as a single `sdsc-utils.exe` (tray + HID + UI in one process, no bundled extras). That executable is **not** Authenticode-signed. Browsers and Windows SmartScreen often warn on uncommon unsigned downloads — that is expected. The app checks the release feed for new versions (Settings → System → Version) and notifies once per version, but it never downloads or installs anything itself; download the next release manually when you want it.
 
 ## Features
 
@@ -201,8 +201,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 CI builds on Windows. To publish a binary + MSIX artifact:
 
 ```bash
-git tag v1.7.2
-git push origin v1.7.2
+git tag v1.7.3
+git push origin v1.7.3
 ```
 
 The release workflow attaches one portable `sdsc-utils.exe` and `sdsc-utils.msix` to the GitHub Release for that tag. Upload the MSIX to Partner Center for Store distribution. You can also run the **Release** workflow manually (`workflow_dispatch`).
@@ -211,7 +211,7 @@ The release workflow attaches one portable `sdsc-utils.exe` and `sdsc-utils.msix
 
 This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
 
-Battery status, notification preferences, lightbar colors, remembered controllers, and (when enabled) battery analytics stay on the local machine (`prefs.json`, `controllers.json`, `analytics.json`, and `app.log` under the app data directory). Toasts are rendered locally by the app. There is no telemetry, account, or network API.
+Battery status, notification preferences, lightbar colors, remembered controllers, and (when enabled) battery analytics stay on the local machine (`prefs.json`, `controllers.json`, `analytics.json`, and `app.log` under the app data directory). Toasts are rendered locally by the app. There is no telemetry, account, or analytics network API. The only network call is the release check: at boot (opt out in Settings → System → Version) and when you press "Check for updates", the app fetches the public GitHub release feed to compare version numbers. It sends nothing but a standard app user-agent and never downloads files by itself.
 
 ## License
 
