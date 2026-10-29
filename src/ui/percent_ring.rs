@@ -34,7 +34,9 @@ const ETA_BLOCK_NUDGE_Y: f32 = 0.04;
 ///
 /// Labels use iced `text` widgets (not canvas `fill_text`) so glyph color stays uniform.
 /// `eta_reveal` (0..=1) fades/clips the estimate and eases percent type size (0 = peek / hidden).
-/// `opacity` (0..=1) fades the whole ring uniformly (toast card opacity); pass 1.0 elsewhere.
+/// `opacity` (0..=1) is the toast card opacity; ring and labels are content
+/// layers, so they saturate at full strength above the glass point
+/// (see [`theme::toast_content_opacity`]). Pass 1.0 outside toasts.
 pub fn percent_ring<'a, Message: 'a>(
     percent: u8,
     color: Color,
@@ -44,7 +46,7 @@ pub fn percent_ring<'a, Message: 'a>(
     opacity: f32,
 ) -> Element<'a, Message> {
     let percent = percent.min(100);
-    let opacity = opacity.clamp(0.0, 1.0);
+    let opacity = theme::toast_content_opacity(opacity.clamp(0.0, 1.0));
     let reveal = if eta.is_some() {
         eta_reveal.clamp(0.0, 1.0)
     } else {

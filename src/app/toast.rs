@@ -75,7 +75,7 @@ impl App {
         self.show_next_toast()
     }
 
-    /// Opacity multiplier for toast cards (whole card, from the opacity pref).
+    /// Opacity for toast cards (card opacity pref, 0.2–1.0).
     pub(crate) fn toast_opacity(&self) -> f32 {
         f32::from(self.session.prefs.toast_opacity) / 100.0
     }

@@ -19,6 +19,9 @@ const LOW_BATTERY_OBSERVABLE: [u8; 4] = [5, 15, 25, 35];
 /// Inclusive bounds for the toast card opacity slider (whole card, percent).
 pub const TOAST_OPACITY_MIN: u8 = 20;
 pub const TOAST_OPACITY_MAX: u8 = 100;
+/// Default slider value: reproduces the shipped glass look (fill ≈ 0.6,
+/// content fully opaque); 100 is a fully opaque card.
+pub const TOAST_OPACITY_DEFAULT: u8 = 60;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -260,8 +263,9 @@ pub struct Prefs {
     pub low_battery_percent: u8,
     #[serde(default)]
     pub toast_position: ToastPosition,
-    /// Toast card opacity percent (whole card: fill, text, rail, ring).
-    /// 100 reproduces the shipped glass look; the slider floors at 20.
+    /// Toast card opacity percent (whole card). 100 is fully opaque;
+    /// the default reproduces the shipped glass look (fill ≈ 0.6,
+    /// text/rail/ring fully opaque).
     #[serde(default = "default_toast_opacity")]
     pub toast_opacity: u8,
     /// Show a "running in the tray" toast on manual starts (default on).
@@ -419,7 +423,7 @@ fn default_low_battery_percent() -> u8 {
 }
 
 fn default_toast_opacity() -> u8 {
-    TOAST_OPACITY_MAX
+    TOAST_OPACITY_DEFAULT
 }
 
 fn default_start_screen_sound_volume() -> u8 {
@@ -801,7 +805,7 @@ mod tests {
     #[test]
     fn older_prefs_default_toast_opacity_startup_and_on_top() {
         let prefs: Prefs = serde_json::from_str(r#"{"notify_low":true}"#).unwrap();
-        assert_eq!(prefs.toast_opacity, TOAST_OPACITY_MAX);
+        assert_eq!(prefs.toast_opacity, TOAST_OPACITY_DEFAULT);
         assert!(prefs.notify_startup);
         assert!(prefs.configure_always_on_top);
     }

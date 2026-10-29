@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Toast **Opacity** slider (Configure → Notifications → Toast): fades the entire card from 20–100%, defaulting to the current glass look; position changes and opacity edits both preview live.
+- Toast **Opacity** slider (Configure → Notifications → Toast): sets the card's true opacity from 20–100% (100 is fully opaque), defaulting to 60 to match the current glass look; position changes and opacity edits both preview live.
 - Settings **Always on top** toggle (Configure → System → Window, default on): turn it off to let Settings behave as a normal window (toasts may starve its presents while one is up).
 - Manual starts now show an "SDSC Utils is running" toast pointing at the tray icon; login (autostart) launches stay quiet, with a **Startup notice** toggle (Configure → Notifications → Startup) to turn it off. The Startup shortcut now passes a login flag so the two can be told apart (existing entries migrate on boot).
 

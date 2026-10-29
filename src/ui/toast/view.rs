@@ -25,7 +25,8 @@ const BUG_ICON_SIZE: f32 = 36.0;
 ///
 /// `generation` changes the layout width by 1px so iced/wgpu cannot keep the
 /// previous toast's surface when messages are chained on one window.
-/// `opacity` (0..=1) fades the entire card uniformly (toast opacity pref).
+/// `opacity` (0..=1) is the card's true opacity: the fill fades linearly to
+/// it, while text/rail/ring saturate at full strength above the glass point.
 pub fn view<'a, Message>(
     message: &'a ToastMessage,
     generation: u64,
@@ -36,6 +37,7 @@ where
     Message: Clone + 'a,
 {
     let opacity = opacity.clamp(0.0, 1.0);
+    let content = theme::toast_content_opacity(opacity);
     let accent = theme::from_rgb(message.accent);
     let width = WIDTH
         + if generation.is_multiple_of(2) {
@@ -52,11 +54,11 @@ where
     let body = column![
         text(message.heading.as_str())
             .size(HEADING_SIZE)
-            .color(theme::scale_alpha(theme::INK, opacity))
+            .color(theme::scale_alpha(theme::INK, content))
             .width(Fill),
         text(message.body.as_str())
             .size(BODY_SIZE)
-            .color(theme::scale_alpha(theme::MUTED, opacity))
+            .color(theme::scale_alpha(theme::MUTED, content))
             .width(Fill),
     ]
     .spacing(4)
@@ -82,7 +84,7 @@ where
                 .width(Length::Fixed(BUG_ICON_SIZE))
                 .height(Length::Fixed(BUG_ICON_SIZE))
                 .style(move |_theme, _status| svg::Style {
-                    color: Some(theme::scale_alpha(accent, opacity)),
+                    color: Some(theme::scale_alpha(accent, content)),
                 });
             row![rail, icon, body]
                 .spacing(PADDING)
