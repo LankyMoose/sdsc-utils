@@ -63,6 +63,7 @@ jobs:
             target/portable/sdsc-utils.exe
             target/portable/sdsc-utils.exe.minisig
             target/portable/sdsc-utils.exe.sha256
+            minisign.pub
 
       - name: Pack MSIX
         shell: pwsh
@@ -84,5 +85,6 @@ jobs:
             target/portable/sdsc-utils.exe
             target/portable/sdsc-utils.exe.minisig
             target/portable/sdsc-utils.exe.sha256
+            minisign.pub
             target/msix/sdsc-utils.msix
           generate_release_notes: true
