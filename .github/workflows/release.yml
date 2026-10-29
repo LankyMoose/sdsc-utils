@@ -34,11 +34,35 @@ jobs:
           New-Item -ItemType Directory -Force -Path target/portable | Out-Null
           Copy-Item target/release/sdsc-utils.exe target/portable/sdsc-utils.exe
 
+      - name: Sign portable exe (minisign)
+        shell: pwsh
+        env:
+          MINISIGN_PRIVATE_KEY: ${{ secrets.MINISIGN_PRIVATE_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          # Pinned signer; --root keeps the repo toolchain untouched.
+          cargo install rsign2 --version 0.6.7 --locked --root "$env:RUNNER_TEMP\rsign"
+          $rsign = "$env:RUNNER_TEMP\rsign\bin\rsign.exe"
+          $keyFile = Join-Path $env:RUNNER_TEMP "minisign.key"
+          try {
+            # Never print the secret. GitHub masks secrets.* in logs, but
+            # multiline keys get no partial-mask guarantee — write directly.
+            [IO.File]::WriteAllText($keyFile, $env:MINISIGN_PRIVATE_KEY)
+            & $rsign sign -s $keyFile -x target/portable/sdsc-utils.exe.minisig --passwordless target/portable/sdsc-utils.exe
+            $hash = (Get-FileHash target/portable/sdsc-utils.exe -Algorithm SHA256).Hash.ToLower()
+            "$hash  sdsc-utils.exe" | Out-File -Encoding ascii -NoNewline target/portable/sdsc-utils.exe.sha256
+          } finally {
+            if (Test-Path $keyFile) { Remove-Item $keyFile -Force }
+          }
+
       - name: Upload portable exe
         uses: actions/upload-artifact@v4
         with:
           name: sdsc-utils-windows
-          path: target/portable/sdsc-utils.exe
+          path: |
+            target/portable/sdsc-utils.exe
+            target/portable/sdsc-utils.exe.minisig
+            target/portable/sdsc-utils.exe.sha256
 
       - name: Pack MSIX
         shell: pwsh
@@ -58,5 +82,7 @@ jobs:
         with:
           files: |
             target/portable/sdsc-utils.exe
+            target/portable/sdsc-utils.exe.minisig
+            target/portable/sdsc-utils.exe.sha256
             target/msix/sdsc-utils.msix
           generate_release_notes: true
