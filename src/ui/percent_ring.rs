@@ -34,14 +34,19 @@ const ETA_BLOCK_NUDGE_Y: f32 = 0.04;
 ///
 /// Labels use iced `text` widgets (not canvas `fill_text`) so glyph color stays uniform.
 /// `eta_reveal` (0..=1) fades/clips the estimate and eases percent type size (0 = peek / hidden).
+/// `opacity` (0..=1) is the toast card opacity; ring and labels are content
+/// layers, so they saturate at full strength above the glass point
+/// (see [`theme::toast_content_opacity`]). Pass 1.0 outside toasts.
 pub fn percent_ring<'a, Message: 'a>(
     percent: u8,
     color: Color,
     size: f32,
     eta: Option<String>,
     eta_reveal: f32,
+    opacity: f32,
 ) -> Element<'a, Message> {
     let percent = percent.min(100);
+    let opacity = theme::toast_content_opacity(opacity.clamp(0.0, 1.0));
     let reveal = if eta.is_some() {
         eta_reveal.clamp(0.0, 1.0)
     } else {
@@ -53,6 +58,7 @@ pub fn percent_ring<'a, Message: 'a>(
         percent,
         color,
         size,
+        opacity,
     })
     .width(Length::Fixed(size))
     .height(Length::Fixed(size));
@@ -62,7 +68,7 @@ pub fn percent_ring<'a, Message: 'a>(
     let percent_label = text(format!("{percent}%"))
         .size(percent_size)
         .line_height(Pixels(percent_size))
-        .color(theme::INK);
+        .color(theme::scale_alpha(theme::INK, opacity));
 
     let labels: Element<'a, Message> = if let Some(eta) = eta.as_ref().filter(|_| reveal > 0.001) {
         let eta_size = eta_text_size(size, eta);
@@ -74,7 +80,7 @@ pub fn percent_ring<'a, Message: 'a>(
                 text(eta.clone())
                     .size(eta_size)
                     .line_height(Pixels(eta_size))
-                    .color(theme::alpha(theme::MUTED, reveal)),
+                    .color(theme::alpha(theme::MUTED, reveal * opacity)),
             )
             .width(Fill)
             .height(Length::Fixed(eta_line_h))
@@ -145,6 +151,7 @@ struct PercentRing {
     percent: u8,
     color: Color,
     size: f32,
+    opacity: f32,
 }
 
 impl PercentRing {
@@ -174,13 +181,13 @@ impl<Message> canvas::Program<Message> for PercentRing {
 
         let percent = self.percent.min(100);
         let track = canvas::Stroke::default()
-            .with_color(theme::alpha(self.color, 0.28))
+            .with_color(theme::alpha(self.color, 0.28 * self.opacity))
             .with_width(stroke_width)
             .with_line_cap(canvas::LineCap::Round);
         frame.stroke(&Path::circle(center, radius), track);
 
         let fill = canvas::Stroke::default()
-            .with_color(self.color)
+            .with_color(theme::scale_alpha(self.color, self.opacity))
             .with_width(stroke_width)
             .with_line_cap(canvas::LineCap::Round);
         match filled_end_angle(percent) {

@@ -830,7 +830,8 @@ impl App {
 
         let toast_boot = app
             .ensure_toast_window()
-            .chain(app.maybe_show_crash_restart_toast());
+            .chain(app.maybe_show_crash_restart_toast())
+            .chain(app.maybe_show_startup_notice());
         // Live Steam scan kicks on StartOpened (or idle fallback when Start is disabled).
         let steam_fallback = Task::perform(delay(STEAM_SCAN_IDLE_FALLBACK), |()| {
             Message::SteamScanIdleFallback
@@ -1235,6 +1236,7 @@ impl App {
                     message,
                     self.toast_generation,
                     Message::ToastDismiss(self.toast_generation),
+                    self.toast_opacity(),
                 ),
                 None => toast_view::empty(),
             };

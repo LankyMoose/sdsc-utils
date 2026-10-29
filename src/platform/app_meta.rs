@@ -8,3 +8,8 @@ pub const DISPLAY_NAME: &str = "SDSC Utils";
 /// The parent is still exiting and holds the single-instance guard, so the
 /// child retries acquiring it briefly instead of quitting as a duplicate.
 pub const REPLACE_FLAG: &str = "--replace";
+
+/// Undocumented internal argv: login launch via the Startup entry.
+/// The autostart shortcut passes this so a login boot can stay quiet
+/// (no startup notice toast); manual launches never carry it.
+pub const LOGIN_FLAG: &str = "--started-at-login";

@@ -21,7 +21,7 @@ use crate::persist::analytics::{
 use crate::persist::prefs::{
     AUTO_OPEN_MODES, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout, LOW_BATTERY_PERCENT_MAX,
     LOW_BATTERY_PERCENT_MIN, NAVBAR_MODES, NavbarVisibility, REDUCED_MOTION_MODES, ReducedMotion,
-    StartAutoOpen, ToastPosition,
+    StartAutoOpen, TOAST_OPACITY_MAX, TOAST_OPACITY_MIN, ToastPosition,
 };
 use crate::platform::app_meta::{DISPLAY_NAME, PKG_VERSION};
 use crate::ui::color::{BatterySpectrum, hsv_to_rgb};
@@ -185,6 +185,7 @@ pub enum NotificationSetting {
     Disconnect,
     Low,
     Charged,
+    Startup,
 }
 
 /// Read-only snapshot of app preferences shown by the configure window.
@@ -196,6 +197,9 @@ pub struct ConfigureSettings {
     pub notify_disconnect: bool,
     pub low_battery_percent: u8,
     pub toast_position: ToastPosition,
+    pub toast_opacity: u8,
+    pub notify_startup: bool,
+    pub configure_always_on_top: bool,
     pub analytics_enabled: bool,
     pub lightbar_enabled: bool,
     pub start_screen_enabled: bool,
@@ -368,6 +372,10 @@ pub enum ConfigureMessage {
     SetNotification(NotificationSetting, bool),
     SetLowBatteryPercent(u8),
     SetToastPosition(ToastPosition),
+    SetToastOpacity(u8),
+    /// Opacity slider drag released: preview the new card opacity once.
+    PreviewToastOpacity,
+    SetConfigureAlwaysOnTop(bool),
     SetAnalyticsEnabled(bool),
     SetLightbarEnabled(bool),
     SetStartScreenEnabled(bool),
@@ -1448,10 +1456,20 @@ fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, Configu
         ],
     );
 
+    let window = group(
+        Some("Window".to_string()),
+        vec![toggle_row(
+            "Always on top",
+            Some("Keep Settings above other windows"),
+            settings.configure_always_on_top,
+            ConfigureMessage::SetConfigureAlwaysOnTop,
+        )],
+    );
+
     if startup.is_empty() {
-        data
+        column![window, data].spacing(18).width(Fill).into()
     } else {
-        column![group(Some("Startup".to_string()), startup), data]
+        column![group(Some("Startup".to_string()), startup), window, data]
             .spacing(18)
             .width(Fill)
             .into()
@@ -1863,6 +1881,7 @@ fn any_notification_enabled(settings: &ConfigureSettings) -> bool {
         || settings.notify_disconnect
         || settings.notify_low
         || settings.notify_charged
+        || settings.notify_startup
 }
 
 fn notifications_view<'a>(
@@ -1921,13 +1940,39 @@ fn notifications_view<'a>(
         NotificationSetting::Charged,
     ));
 
-    let mut items = column![connection, group(Some("Battery".to_string()), battery_rows)]
-        .spacing(18)
-        .width(Fill);
+    let mut items = column![
+        connection,
+        group(Some("Battery".to_string()), battery_rows),
+        group(
+            Some("Startup".to_string()),
+            vec![toggle(
+                "Startup notice",
+                "When the app starts from a manual launch",
+                settings.notify_startup,
+                NotificationSetting::Startup,
+            )],
+        ),
+    ]
+    .spacing(18)
+    .width(Fill);
     if any_notification_enabled(settings) {
         items = items.push(group(
-            Some("Toast position".to_string()),
-            vec![toast_position_view(settings, accent)],
+            Some("Toast".to_string()),
+            vec![
+                toast_position_view(settings, accent),
+                slider_row(
+                    "Opacity",
+                    format!("{}%", settings.toast_opacity),
+                    slider(
+                        f32::from(TOAST_OPACITY_MIN)..=f32::from(TOAST_OPACITY_MAX),
+                        f32::from(settings.toast_opacity),
+                        |value| ConfigureMessage::SetToastOpacity(value.round() as u8),
+                    )
+                    .step(5.0_f32)
+                    .on_release(ConfigureMessage::PreviewToastOpacity)
+                    .style(theme::slider),
+                ),
+            ],
         ));
     }
     items.into()
@@ -2888,6 +2933,9 @@ mod tests {
             notify_disconnect: true,
             low_battery_percent: 20,
             toast_position: ToastPosition::BottomRight,
+            toast_opacity: 100,
+            notify_startup: true,
+            configure_always_on_top: true,
             analytics_enabled: false,
             lightbar_enabled: true,
             start_screen_enabled: false,

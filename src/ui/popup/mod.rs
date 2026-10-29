@@ -438,6 +438,7 @@ fn controller_row<'a>(
         POPUP_SIZE,
         entry.eta.clone(),
         1.0,
+        1.0,
     );
 
     let name: Element<'_, PopupMessage> = if state.is_editing(&entry.serial) {

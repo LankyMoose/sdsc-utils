@@ -4,7 +4,7 @@
 //! the `desktop:StartupTask` declared in `packaging/AppxManifest.xml`.
 
 use crate::platform::app_log;
-use crate::platform::app_meta::PKG_NAME;
+use crate::platform::app_meta::{LOGIN_FLAG, PKG_NAME};
 use crate::platform::packaged;
 use crate::{AppError, AppResult};
 use std::env;
@@ -53,6 +53,7 @@ pub fn ensure_quiet_entry() {
             return;
         }
         migrate_legacy_cmd();
+        ensure_login_flag();
     }
 }
 
@@ -223,15 +224,73 @@ fn migrate_legacy_cmd() {
     }
 }
 
+/// Rewrite a Startup shortcut that predates the login flag, so login
+/// launches carry it and stay quiet for the startup notice. Runs on every
+/// boot; a no-op once the flag is present. Best-effort: failures only log.
+#[cfg(windows)]
+fn ensure_login_flag() {
+    let Ok(lnk_path) = startup_lnk_path() else {
+        return;
+    };
+    if !lnk_path.exists() {
+        return;
+    }
+    match shortcut_has_login_flag(&lnk_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            app_log::info(format!(
+                "autostart: adding login flag to {}",
+                lnk_path.display()
+            ));
+            if let Err(err) = install() {
+                app_log::warn(format!("autostart: login-flag migration failed: {err}"));
+            }
+        }
+        Err(err) => {
+            app_log::warn(format!("autostart: could not read shortcut args: {err}"));
+        }
+    }
+}
+
+/// True when the shortcut already passes the login flag.
+#[cfg(windows)]
+fn shortcut_has_login_flag(lnk: &Path) -> AppResult<bool> {
+    let script = format!(
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.Arguments",
+        ps_single_quoted(&lnk.to_string_lossy()),
+    );
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| AppError::Platform(format!("failed to read shortcut args: {e}")))?;
+    if !output.status.success() {
+        return Err(AppError::Platform(
+            "powershell failed reading shortcut args".into(),
+        ));
+    }
+    let args = String::from_utf8_lossy(&output.stdout);
+    Ok(args.split_whitespace().any(|a| a == LOGIN_FLAG))
+}
+
 #[cfg(windows)]
 fn create_shortcut(lnk: &Path, target: &Path, work_dir: &Path) -> AppResult<()> {
     let script = format!(
         "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{}'); \
          $s.TargetPath = '{}'; \
+         $s.Arguments = '{}'; \
          $s.WorkingDirectory = '{}'; \
          $s.Save()",
         ps_single_quoted(&lnk.to_string_lossy()),
         ps_single_quoted(&target.to_string_lossy()),
+        LOGIN_FLAG,
         ps_single_quoted(&work_dir.to_string_lossy()),
     );
 

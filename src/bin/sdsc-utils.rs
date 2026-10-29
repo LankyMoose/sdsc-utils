@@ -3,7 +3,9 @@
 //! SDSC Utils — tray, DualSense HID, session, and iced UI in one process.
 
 use sdsc_utils::platform::app_log;
-use sdsc_utils::platform::app_meta::{DISPLAY_NAME, PKG_NAME, PKG_VERSION, REPLACE_FLAG};
+use sdsc_utils::platform::app_meta::{
+    DISPLAY_NAME, LOGIN_FLAG, PKG_NAME, PKG_VERSION, REPLACE_FLAG,
+};
 use sdsc_utils::platform::autostart;
 use sdsc_utils::platform::crash_restart::{self, CrashArmed};
 use sdsc_utils::{AppError, AppResult};
@@ -40,7 +42,7 @@ fn main() -> ExitCode {
     let test_crash_toast = args.iter().any(|a| a == "--test-crash-toast");
     let args: Vec<String> = args
         .into_iter()
-        .filter(|a| a != REPLACE_FLAG && a != "--test-crash-toast")
+        .filter(|a| a != REPLACE_FLAG && a != LOGIN_FLAG && a != "--test-crash-toast")
         .collect();
     if test_crash_toast {
         crash_restart::request_notice();

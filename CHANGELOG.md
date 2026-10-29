@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.2] - 2026-10-29
+
+### Added
+
+- Toast **Opacity** slider (Configure → Notifications → Toast): sets the card's true opacity from 20–100% (100 is fully opaque), defaulting to 60 to match the current glass look; previews once on slider release.
+- Settings **Always on top** toggle (Configure → System → Window, default on): turn it off to let Settings behave as a normal window (toasts may starve its presents while one is up).
+- Manual starts now show an "SDSC Utils is running" toast pointing at the tray icon; login (autostart) launches stay quiet, with a **Startup notice** toggle (Configure → Notifications → Startup) to turn it off. The Startup shortcut now passes a login flag so the two can be told apart (existing entries migrate on boot).
+
+### Changed
+
+- **Show uninstalled games** now defaults off: the toggle only takes effect once set, so pre-existing installs (which never recorded a choice) follow the new default while explicit on/off choices are preserved.
+
+### Fixed
+
+- Slow cold opens no longer leave "Preparing artwork…" stuck when art lands after the hold-timeout reveal, and timeout re-fires no longer restart a live splash fade (no more visible re-fade).
+
 ## [1.7.1] - 2026-10-27
 
 ### Added
@@ -504,6 +520,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded DualSense silhouette for the tray and `.exe` icon.
 - Windows CI and tagged release workflow.
 
+[1.7.2]: https://github.com/LankyMoose/sdsc-utils/compare/v1.7.1...v1.7.2
 [1.7.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.6.0...v1.6.1

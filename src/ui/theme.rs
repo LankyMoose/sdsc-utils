@@ -109,6 +109,14 @@ pub const fn alpha(color: Color, alpha: f32) -> Color {
     Color { a: alpha, ..color }
 }
 
+/// Scale an existing color's alpha by `factor` (e.g. toast card opacity).
+pub const fn scale_alpha(color: Color, factor: f32) -> Color {
+    Color {
+        a: color.a * factor,
+        ..color
+    }
+}
+
 /// Linear blend of two colors (`t` = 0 keeps `a`, 1 keeps `b`).
 pub const fn mix(a: Color, b: Color, t: f32) -> Color {
     Color {
@@ -442,17 +450,24 @@ pub fn swatch(color: Color) -> impl Fn(&Theme) -> container::Style {
 }
 
 /// Toast card: glass over the desktop, rounded, soft shadow.
-pub fn toast_card(_accent: Color) -> impl Fn(&Theme) -> container::Style {
+///
+/// `opacity` (0..=1) is the card's true opacity: the fill fades linearly
+/// to it (1.0 = fully opaque card), while content layers (text, rail,
+/// ring, hairline, shadow) saturate at [`TOAST_CONTENT_FULL`] so the
+/// default slider value reproduces the shipped glass look.
+pub fn toast_card(opacity: f32) -> impl Fn(&Theme) -> container::Style {
+    let opacity = opacity.clamp(0.0, 1.0);
+    let content = toast_content_opacity(opacity);
     move |_theme| container::Style {
-        background: Some(Background::Color(GLASS_FILL)),
+        background: Some(Background::Color(alpha(darken(BASE_BG, 0.55), opacity))),
         text_color: Some(INK),
         border: Border {
-            color: GLASS_HAIRLINE,
+            color: scale_alpha(GLASS_HAIRLINE, content),
             width: 1.0,
             radius: radius::LG.into(),
         },
         shadow: iced::Shadow {
-            color: alpha(Color::BLACK, 0.4),
+            color: alpha(Color::BLACK, 0.4 * content),
             offset: iced::Vector::new(0.0, 6.0),
             blur_radius: 18.0,
         },
@@ -460,8 +475,20 @@ pub fn toast_card(_accent: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// Slider value (0..=1) at which toast content layers are fully opaque.
+/// Matches the shipped glass fill, so the default slider value keeps
+/// text/rail/ring at full strength while the fill stays translucent.
+pub const TOAST_CONTENT_FULL: f32 = 0.6;
+
+/// Content-layer opacity for a toast card opacity: 1.0 at and above
+/// [`TOAST_CONTENT_FULL`], scaling down proportionally below it.
+pub fn toast_content_opacity(opacity: f32) -> f32 {
+    (opacity / TOAST_CONTENT_FULL).clamp(0.0, 1.0)
+}
+
 /// Vertical accent rail drawn down the left edge of a toast.
-pub fn rail(accent: Color) -> impl Fn(&Theme) -> container::Style {
+pub fn rail(accent: Color, opacity: f32) -> impl Fn(&Theme) -> container::Style {
+    let accent = scale_alpha(accent, toast_content_opacity(opacity.clamp(0.0, 1.0)));
     move |_theme| container::Style {
         background: Some(Background::Color(accent)),
         border: Border {

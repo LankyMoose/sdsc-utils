@@ -1725,14 +1725,16 @@ impl App {
             perf_aa_boot: self.renderer_boot_aa,
             perf_vsync_boot: self.renderer_boot_vsync,
             perf_reload_queued: self.renderer_reload_queued,
-            show_uninstalled_games: self.session.prefs.show_uninstalled_games,
+            show_uninstalled_games: self.session.prefs.show_uninstalled_games_enabled(),
             steam_syncing: self.steam_scan_started.is_some(),
         }
     }
 
     pub(crate) fn apply_show_uninstalled_games(&mut self, enabled: bool) -> Task<Message> {
-        if self.session.prefs.show_uninstalled_games != enabled {
-            self.session.prefs.show_uninstalled_games = enabled;
+        if self.session.prefs.show_uninstalled_games_enabled() != enabled {
+            // An explicit choice: record `Some` so later default changes
+            // never override it.
+            self.session.prefs.show_uninstalled_games = Some(enabled);
             self.save_prefs();
             self.refresh_start_rows();
         }
@@ -2154,7 +2156,7 @@ impl App {
         // instead of vanishing — unless the user opted out (and the scan
         // proved absence; unknown scans keep everything launchable).
         // Launchability is resolved per-row in refresh_start_rows.
-        let installed_filter = if self.session.prefs.show_uninstalled_games {
+        let installed_filter = if self.session.prefs.show_uninstalled_games_enabled() {
             None
         } else {
             self.steam_installed.as_deref()
@@ -2235,7 +2237,7 @@ impl App {
         // Curated-but-uninstalled games surface as toggled-on rows (last-known
         // title) so they can be untoggled — previously they were invisible
         // here. Hidden entirely when the user opts out of uninstalled games.
-        if self.session.prefs.show_uninstalled_games {
+        if self.session.prefs.show_uninstalled_games_enabled() {
             for entry in &catalog.entries {
                 if let crate::games::GameEntry::Steam { appid } = entry
                     && !self.steam_by_id.contains_key(appid)
