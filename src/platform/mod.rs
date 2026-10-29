@@ -10,6 +10,7 @@ pub mod packaged;
 pub mod prev_instance;
 pub mod steam_watch;
 pub mod ui_sound;
+pub mod updater;
 pub mod wgpu_diag;
 #[cfg(windows)]
 pub mod win32;

@@ -10,6 +10,7 @@ mod configure;
 mod popup;
 mod start;
 mod toast;
+mod update;
 
 use crate::controller::dualsense::lightbar::ClaimStore;
 use crate::domain::color::SpectrumService;
@@ -33,9 +34,11 @@ use crate::games::process_match::SeenCache;
 use crate::games::steam::SteamGame;
 use crate::persist::analytics::AnalyticsStore;
 use crate::persist::prefs::{NavbarVisibility, Prefs};
+use crate::persist::updater::UpdaterState;
 use crate::platform::app_log;
 use crate::platform::host::Host;
 use crate::platform::ui_sound::{SoundHub, UiSoundKind};
+use crate::platform::updater::UpdateStatus;
 use crate::session::notify::NotifyEvent;
 use crate::ui::configure::{
     self as configure_view, AnalyticsPanel, ConfigureMessage, ConfigureState, PadInputPanel,
@@ -76,6 +79,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(not(windows))]
 use tray_icon::TrayIcon;
 
 /// Debounce spectrum prefs save + HID apply after the last color edit.
@@ -239,6 +243,15 @@ pub enum Message {
     /// Debounced spectrum prefs save + lightbar HID apply.
     SpectrumCommit(u64),
 
+    /// Delayed boot update check fired (see `UPDATE_BOOT_DELAY`).
+    BootUpdateCheck,
+    /// Result of a background GitHub release fetch.
+    UpdateCheckDone(AppResult<crate::platform::updater::ReleaseInfo>),
+    /// Spinner redraw while an update check is in flight.
+    UpdateSpin,
+    /// Native update notification delivered (fire-and-forget).
+    UpdateNotifyDone(AppResult<()>),
+
     Exit,
 }
 
@@ -303,7 +316,11 @@ impl Message {
             | Message::UtilityAmbientTick
             | Message::ToastDismiss(_)
             | Message::ToastHideDeferred
-            | Message::SpectrumCommit(_) => false,
+            | Message::SpectrumCommit(_)
+            | Message::BootUpdateCheck
+            | Message::UpdateCheckDone(_)
+            | Message::UpdateSpin
+            | Message::UpdateNotifyDone(_) => false,
             Message::Exit => false,
         }
     }
@@ -355,6 +372,12 @@ pub struct App {
     /// no process-global).
     sound: SoundHub,
 
+    /// Windows: handle to the dedicated tray thread (icon, menu, and modal
+    /// menu loop live there so a stuck menu cannot wedge the iced thread).
+    /// Other platforms own tray-icon directly (their toolkits require it).
+    #[cfg(windows)]
+    tray_icon: Option<tray::TrayHandle>,
+    #[cfg(not(windows))]
     tray_icon: Option<TrayIcon>,
     tray_anchor: TrayAnchor,
 
@@ -559,6 +582,10 @@ pub struct App {
 
     /// Bumped on every spectrum edit; stale SpectrumCommit messages are ignored.
     spectrum_generation: u64,
+    /// GitHub-release update check state (Settings → System → Version).
+    update_status: UpdateStatus,
+    /// Once-per-version notification record (`updater.json`).
+    updater_state: UpdaterState,
 
     /// Emulated pads the developer emulator knows about, connected or not.
     /// Debug-only; the session sees the connected slice via
@@ -807,6 +834,8 @@ impl App {
             toast_machine: toast_machine::State::Idle,
             start_cold_load_remaining: true,
             spectrum_generation: 0,
+            update_status: UpdateStatus::Idle,
+            updater_state: UpdaterState::load(),
             #[cfg(debug_assertions)]
             emulated_pads,
             #[cfg(debug_assertions)]
@@ -815,6 +844,16 @@ impl App {
 
         // Show the tray immediately; the daemon owns it for its whole lifetime.
         app.create_tray();
+        // Forensics line: which binary, which install flavor, and whether the
+        // boot check is armed. Dev log only, so the usual triage questions
+        // (version? packaged?) answer themselves.
+        crate::platform::updater::diag_update(format!(
+            "{} {} starting packaged={} update_boot_check={}",
+            crate::platform::app_meta::DISPLAY_NAME,
+            crate::platform::app_meta::PKG_VERSION,
+            u8::from(crate::platform::packaged::is_packaged()),
+            u8::from(app.session.prefs.update_boot_check),
+        ));
         #[cfg(all(windows, debug_assertions))]
         start_hitch_hotkey_worker(app.input_hub.clone());
         app.sync_popup_rows();
@@ -836,12 +875,21 @@ impl App {
         let steam_fallback = Task::perform(delay(STEAM_SCAN_IDLE_FALLBACK), |()| {
             Message::SteamScanIdleFallback
         });
+        // Automatic release check (opt-out in Settings → System → Version).
+        let update_boot = if app.session.prefs.update_boot_check {
+            Task::perform(delay(crate::platform::updater::UPDATE_BOOT_DELAY), |()| {
+                Message::BootUpdateCheck
+            })
+        } else {
+            Task::none()
+        };
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut task = Task::batch([
             app.request_refresh(),
             toast_boot,
             steam_fallback,
             restart_restore,
+            update_boot,
         ]);
         #[cfg(debug_assertions)]
         if let Ok(spec) = std::env::var(DEBUG_OPEN_ENV) {
@@ -1052,6 +1100,15 @@ impl App {
         // Transient: animate the reload-button spinner until the queued exit.
         if self.renderer_reload_queued {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::RendererReloadTick));
+        }
+
+        // Transient: redraw the Version-card spinner while a release check
+        // is in flight (the message itself is a no-op).
+        if matches!(self.update_status, UpdateStatus::Checking) {
+            subscriptions.push(
+                iced::time::every(crate::platform::updater::UPDATE_SPIN_TICK)
+                    .map(|_| Message::UpdateSpin),
+            );
         }
 
         if self.popup_state.identify_flash_active()
@@ -1283,25 +1340,44 @@ impl App {
             #[cfg(debug_assertions)]
             Message::EmulatorCommitTick => self.on_emulator_commit_tick(),
             Message::PollResult(result) => self.on_poll_result(result),
+            Message::BootUpdateCheck => {
+                // A manual or open-triggered check already ran (or is
+                // running): the boot check stands down, no second check.
+                if matches!(self.update_status, UpdateStatus::Idle) {
+                    self.start_update_check("boot")
+                } else {
+                    crate::platform::updater::diag_update(
+                        "update check (boot): skipped, already checked",
+                    );
+                    Task::none()
+                }
+            }
+            Message::UpdateCheckDone(result) => self.on_update_check_done(result),
+            Message::UpdateSpin => Task::none(),
+            Message::UpdateNotifyDone(_) => self.on_update_notify_done(),
             Message::ProcessEnumResult(result) => self.on_process_enum_result(result),
             Message::SteamAppsChanged => self.on_steam_apps_changed(),
             Message::RunningBadgeTick => self.refresh_running_badge(),
             Message::CloseGameDone(result) => self.on_close_game_done(result),
 
-            Message::TrayMenu(id) => match id.as_str() {
-                SETTINGS_ID => {
-                    // Tray engaged while Start is up: the press never reaches
-                    // Start (taskbar sits above the cover), so unhide here or
-                    // the native menu opens under a hidden cursor.
-                    if self.start_visible {
-                        self.note_start_cursor_activity();
+            Message::TrayMenu(id) => {
+                crate::controller::hid::diag::diag_info(format!("ui-diag: tray menu {id}"));
+                match id.as_str() {
+                    SETTINGS_ID => {
+                        // Tray engaged while Start is up: the press never reaches
+                        // Start (taskbar sits above the cover), so unhide here or
+                        // the native menu opens under a hidden cursor.
+                        if self.start_visible {
+                            self.note_start_cursor_activity();
+                        }
+                        self.open_configure()
                     }
-                    self.open_configure()
+                    QUIT_ID => self.update(Message::Exit),
+                    _ => Task::none(),
                 }
-                QUIT_ID => self.update(Message::Exit),
-                _ => Task::none(),
-            },
+            }
             Message::TrayLeftClick(anchor) => {
+                crate::controller::hid::diag::diag_info("ui-diag: tray left-click");
                 self.tray_anchor = anchor;
                 if self.start_visible {
                     self.note_start_cursor_activity();
@@ -1928,6 +2004,11 @@ impl App {
     }
 
     fn apply_tray(&mut self) -> Task<Message> {
+        #[cfg(windows)]
+        if let Some(handle) = self.tray_icon.as_ref() {
+            tray::apply_tray(handle, &self.session.controllers);
+        }
+        #[cfg(not(windows))]
         if let Some(tray_icon) = self.tray_icon.as_mut() {
             tray::apply_tray(tray_icon, &self.session.controllers);
         }

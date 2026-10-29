@@ -24,16 +24,19 @@ use crate::persist::prefs::{
     StartAutoOpen, TOAST_OPACITY_MAX, TOAST_OPACITY_MIN, ToastPosition,
 };
 use crate::platform::app_meta::{DISPLAY_NAME, PKG_VERSION};
+use crate::platform::updater::UpdateStatus;
 use crate::ui::color::{BatterySpectrum, hsv_to_rgb};
 use crate::ui::svg_icon;
 use crate::ui::{chrome, theme};
+#[cfg(debug_assertions)]
+use iced::Degrees;
 use iced::font::Weight;
 use iced::mouse;
 use iced::widget::{
     Column, Row, button, canvas as canvas_widget, column, container, hover, mouse_area, pick_list,
     row, scrollable, slider, space, stack, svg, text, toggler, tooltip,
 };
-use iced::{Alignment, Color, Element, Fill, Font, Length};
+use iced::{Alignment, Color, Element, Fill, Font, Length, Radians};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -67,8 +70,8 @@ const CONTENT_WIDTH: f32 = WIDTH
 const COVERAGE_HEIGHT: f32 = 56.0;
 /// Vertical distance outside the bar that arms stop removal (matches softbuffer UI).
 const ICON_SIZE: f32 = 16.0;
-/// Footer store / GitHub marks — slightly larger so the Store logo stays readable.
-const FOOTER_ICON_SIZE: f32 = 20.0;
+/// Version-store / GitHub marks — slightly larger so the Store logo stays readable.
+const LINK_ICON_SIZE: f32 = 20.0;
 /// Representative toast aspect for the position diagram (max width / typical height).
 const TOAST_ASPECT: f32 = crate::ui::toast::view::WIDTH / crate::ui::toast::view::HEIGHT;
 const POSITION_TOAST_W: f32 = 56.0;
@@ -227,6 +230,12 @@ pub struct ConfigureSettings {
     pub extra_steam_paths: Vec<PathBuf>,
     pub steam_path_error: Option<String>,
     pub show_uninstalled_games: bool,
+    /// Settings → System → Version card state.
+    pub update: UpdateStatus,
+    /// Check GitHub releases at boot (System → Version toggle).
+    pub update_boot_check: bool,
+    /// MSIX/Store identity: the update button opens the Store, not releases.
+    pub is_packaged: bool,
     /// A library scan is in flight (sync button shows "Syncing…", disabled).
     pub steam_syncing: bool,
     /// Preformatted "Last synced …" / "Never synced" label.
@@ -400,6 +409,12 @@ pub enum ConfigureMessage {
     SetStartScreenHapticsStrength(u8),
     OpenDataFolder,
     OpenExternalLink(&'static str),
+    /// Open a runtime-provided URL (validated https release page).
+    OpenUrl(String),
+    /// Begin a GitHub release check (Settings → System → Version).
+    CheckForUpdates,
+    /// Boot-time release check opt-out (Settings → System → Version).
+    SetUpdateBootCheck(bool),
     OpenChangelog,
     CloseChangelog,
     AddSteamPath,
@@ -772,20 +787,7 @@ pub fn view<'a>(
     };
 
     let content_pane: Element<'_, ConfigureMessage> = match state.section {
-        Section::System => column![
-            scroll(system_settings_view(settings)),
-            container(system_footer())
-                .padding(iced::Padding {
-                    top: 0.0,
-                    right: CONTENT_PADDING,
-                    bottom: 12.0,
-                    left: CONTENT_PADDING,
-                })
-                .width(Fill),
-        ]
-        .width(Fill)
-        .height(Fill)
-        .into(),
+        Section::System => scroll(system_settings_view(settings)).into(),
         _ => {
             #[cfg(debug_assertions)]
             {
@@ -1080,6 +1082,30 @@ fn action_button<'a>(
         .into()
 }
 
+/// Secondary action button with a runtime-provided label (release tags).
+fn action_button_owned(
+    label: String,
+    message: ConfigureMessage,
+) -> Element<'static, ConfigureMessage> {
+    button(text(label).size(13.0))
+        .padding([7, 14])
+        .on_press(message)
+        .style(theme::secondary)
+        .into()
+}
+
+/// Primary action button with a runtime-provided label (the update action).
+fn primary_button_owned(
+    label: String,
+    message: ConfigureMessage,
+) -> Element<'static, ConfigureMessage> {
+    button(text(label).size(13.0))
+        .padding([7, 14])
+        .on_press(message)
+        .style(theme::primary)
+        .into()
+}
+
 /// Steam library sync button. Disabled with a waiting label while a scan is
 /// in flight so a second click cannot queue another scan.
 fn sync_button(syncing: bool) -> Element<'static, ConfigureMessage> {
@@ -1119,23 +1145,33 @@ fn reload_button(queued: bool) -> Element<'static, ConfigureMessage> {
 /// SVG rotation sweeps smoothly for the short feedback delay. Phase comes
 /// from a process-local epoch: `Instant::now().elapsed()` at view time is
 /// always ~zero and would render a frozen spinner.
+///
+/// `rotation()` takes radians: one steady turn per [`SPINNER_PERIOD_MS`].
+/// Passing degrees here aliased backwards at these frame rates.
 fn reload_spinner() -> Element<'static, ConfigureMessage> {
     static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let epoch = *EPOCH.get_or_init(Instant::now);
-    let angle = Instant::now()
-        .saturating_duration_since(epoch)
-        .as_millis()
-        .rem_euclid(1000) as f32
-        / 1000.0
-        * 360.0;
+    let elapsed_ms = Instant::now().saturating_duration_since(epoch).as_millis();
     svg(svg::Handle::from_memory(svg_icon::SPINNER_SVG.as_bytes()))
         .width(Length::Fixed(14.0))
         .height(Length::Fixed(14.0))
-        .rotation(angle)
+        .rotation(spinner_radians(elapsed_ms))
         .style(|_theme, _status| svg::Style {
             color: Some(theme::MUTED),
         })
         .into()
+}
+
+/// One spinner revolution period. Slow enough to read as rotation at the
+/// 20Hz update-check tick (and the 60Hz reload tick).
+const SPINNER_PERIOD_MS: u64 = 1200;
+
+/// Wall-clock spinner phase in radians (pure, unit-tested).
+fn spinner_radians(elapsed_ms: u128) -> Radians {
+    Radians(
+        elapsed_ms.rem_euclid(u128::from(SPINNER_PERIOD_MS)) as f32 / SPINNER_PERIOD_MS as f32
+            * std::f32::consts::TAU,
+    )
 }
 
 /// Dim explanatory paragraph.
@@ -1466,50 +1502,147 @@ fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, Configu
         )],
     );
 
+    let version = version_group(settings);
+
     if startup.is_empty() {
-        column![window, data].spacing(18).width(Fill).into()
-    } else {
-        column![group(Some("Startup".to_string()), startup), window, data]
+        column![version, window, data]
             .spacing(18)
             .width(Fill)
             .into()
+    } else {
+        column![
+            version,
+            group(Some("Startup".to_string()), startup),
+            window,
+            data
+        ]
+        .spacing(18)
+        .width(Fill)
+        .into()
     }
 }
 
-fn system_footer<'a>() -> Element<'a, ConfigureMessage> {
-    let links = row![
-        footer_link_button(
-            svg_icon::GITHUB_SVG,
-            // Match Microsoft Store bag main fill (`#F2F2F2`).
-            Some(theme::rgb(0xF2, 0xF2, 0xF2)),
-            "GitHub",
-            GITHUB_URL,
-        ),
-        footer_link_button(
-            svg_icon::MICROSOFT_STORE_SVG,
-            None,
-            "Microsoft Store",
-            MICROSOFT_STORE_URL,
-        ),
-    ]
-    .spacing(4)
-    .align_y(Alignment::Center);
-
-    let version = text(format!("{DISPLAY_NAME} {PKG_VERSION}"))
-        .size(12.0)
-        .color(theme::DIM);
-
-    Row::new()
-        .spacing(0)
-        .width(Fill)
+/// Settings → System → Version: installed version with project links,
+/// release check state, and the boot-check opt-out.
+fn version_group<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
+    let mut rows: Vec<Element<'a, ConfigureMessage>> = vec![
+        row![
+            text(format!("{DISPLAY_NAME} {PKG_VERSION}"))
+                .size(theme::type_scale::BODY)
+                .color(theme::INK)
+                .width(Fill),
+            link_button(
+                svg_icon::GITHUB_SVG,
+                // Match Microsoft Store bag main fill (`#F2F2F2`).
+                Some(theme::rgb(0xF2, 0xF2, 0xF2)),
+                "GitHub",
+                GITHUB_URL,
+            ),
+            link_button(
+                svg_icon::MICROSOFT_STORE_SVG,
+                None,
+                "Microsoft Store",
+                MICROSOFT_STORE_URL,
+            ),
+        ]
+        .spacing(4)
         .align_y(Alignment::Center)
-        .push(links)
-        .push(space().width(Fill))
-        .push(version)
-        .into()
+        .width(Fill)
+        .into(),
+    ];
+    match &settings.update {
+        UpdateStatus::Idle => {
+            rows.push(note("Never checked for updates this session."));
+            rows.push(action_button(
+                "Check for updates",
+                ConfigureMessage::CheckForUpdates,
+            ));
+        }
+        UpdateStatus::Checking => {
+            rows.push(
+                row![
+                    text("Checking for latest version…")
+                        .size(theme::type_scale::BODY)
+                        .color(theme::INK),
+                    reload_spinner(),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .width(Fill)
+                .into(),
+            );
+        }
+        UpdateStatus::Available(info) => {
+            rows.push(
+                text(format!("{} is available", info.tag))
+                    .size(theme::type_scale::BODY)
+                    .color(theme::INK)
+                    .into(),
+            );
+            let update = if settings.is_packaged {
+                (
+                    "Open in Microsoft Store".to_string(),
+                    ConfigureMessage::OpenExternalLink(MICROSOFT_STORE_URL),
+                )
+            } else {
+                (
+                    format!("Download {}", info.tag),
+                    ConfigureMessage::OpenUrl(info.url.clone()),
+                )
+            };
+            rows.push(
+                row![
+                    action_button_owned(
+                        format!("View release {}", info.tag),
+                        ConfigureMessage::OpenUrl(info.url.clone()),
+                    ),
+                    primary_button_owned(update.0, update.1),
+                ]
+                .spacing(8)
+                .into(),
+            );
+        }
+        UpdateStatus::UpToDate => {
+            rows.push(
+                row![
+                    text("Up to date")
+                        .size(theme::type_scale::BODY)
+                        .color(theme::INK),
+                    svg(svg::Handle::from_memory(svg_icon::CHECK_SVG.as_bytes()))
+                        .width(Length::Fixed(14.0))
+                        .height(Length::Fixed(14.0))
+                        .style(|_theme, _status| svg::Style {
+                            color: Some(theme::ACCENT),
+                        }),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .width(Fill)
+                .into(),
+            );
+            rows.push(action_button(
+                "Check for updates",
+                ConfigureMessage::CheckForUpdates,
+            ));
+        }
+        UpdateStatus::Failed(reason) => {
+            rows.push(note(reason.clone()));
+            rows.push(action_button(
+                "Try again",
+                ConfigureMessage::CheckForUpdates,
+            ));
+        }
+    }
+    rows.push(toggle_row(
+        "Check for updates at startup",
+        Some("Compares this version against the latest GitHub release"),
+        settings.update_boot_check,
+        ConfigureMessage::SetUpdateBootCheck,
+    ));
+    group(Some("Version".to_string()), rows)
 }
 
-fn footer_link_button<'a>(
+fn link_button<'a>(
     source: &'static str,
     tint: Option<Color>,
     tip: &'static str,
@@ -1517,8 +1650,8 @@ fn footer_link_button<'a>(
 ) -> Element<'a, ConfigureMessage> {
     let icon = |opacity: f32| {
         svg(svg::Handle::from_memory(source.as_bytes()))
-            .width(Length::Fixed(FOOTER_ICON_SIZE))
-            .height(Length::Fixed(FOOTER_ICON_SIZE))
+            .width(Length::Fixed(LINK_ICON_SIZE))
+            .height(Length::Fixed(LINK_ICON_SIZE))
             .opacity(opacity)
             .style(move |_theme, _status| svg::Style { color: tint })
     };
@@ -2435,8 +2568,8 @@ fn emulators_view<'a>(
 #[cfg(debug_assertions)]
 fn pending_spinner<'a>(tick: u32) -> Element<'a, ConfigureMessage> {
     // The commit tick is the only clock running here, so the angle steps off
-    // the frame counter instead of wall time.
-    let angle = (tick % 12) as f32 * 30.0;
+    // the frame counter instead of wall time (30° per 100ms tick).
+    let angle = Radians::from(Degrees((tick % 12) as f32 * 30.0));
     svg(svg::Handle::from_memory(svg_icon::SPINNER_SVG.as_bytes()))
         .width(Length::Fixed(14.0))
         .height(Length::Fixed(14.0))
@@ -2453,7 +2586,7 @@ fn chevron<'a>(open: bool) -> Element<'a, ConfigureMessage> {
     svg(svg::Handle::from_memory(svg_icon::CHEVRON_SVG.as_bytes()))
         .width(Length::Fixed(14.0))
         .height(Length::Fixed(14.0))
-        .rotation(if open { 90.0 } else { 0.0 })
+        .rotation(Radians::from(Degrees(if open { 90.0 } else { 0.0 })))
         .style(|_theme, _status| svg::Style {
             color: Some(theme::DIM),
         })
@@ -2757,6 +2890,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn spinner_radians_sweeps_one_turn_per_period() {
+        assert_eq!(spinner_radians(0).0, 0.0);
+        let half = spinner_radians(u128::from(SPINNER_PERIOD_MS) / 2).0;
+        assert!((half - std::f32::consts::PI).abs() < 1e-4);
+        // Wraps exactly: no jump at the cycle boundary.
+        assert_eq!(spinner_radians(u128::from(SPINNER_PERIOD_MS)).0, 0.0);
+        assert_eq!(
+            spinner_radians(u128::from(SPINNER_PERIOD_MS) + 100).0,
+            spinner_radians(100).0
+        );
+        // Monotonic within a period (no backwards aliasing).
+        assert!(spinner_radians(100).0 < spinner_radians(200).0);
+    }
+
+    #[test]
     fn sidebar_groups_debug_sections_last_in_debug_builds_only() {
         // No flag, no pref: the sidebar follows the build profile, so a plain
         // `cargo run` already exposes the emulator.
@@ -2963,6 +3111,9 @@ mod tests {
             show_uninstalled_games: true,
             steam_syncing: false,
             steam_last_synced_label: "Never synced".to_string(),
+            update: UpdateStatus::Idle,
+            update_boot_check: true,
+            is_packaged: false,
         };
         let _disabled_el = start_screen_view(&settings);
         settings.start_screen_enabled = true;

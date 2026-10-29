@@ -1,3 +1,11 @@
+## 1.7.3
+### Added
+- GitHub release check with once-per-version notification (System, Version section)
+- GitHub / Store links in the Version row (footer removed)
+### Fixed
+- Tray menu runs on its own thread (right-click at boot no longer freezes the app)
+- Spinner rotation corrected (was degrees-as-radians, spun backwards)
+
 ## 1.7.2
 ### Added
 - Toast opacity slider (Notifications, Toast section, 20-100, default 60)

@@ -8,7 +8,12 @@ mod embedded {
 const SIZE: u32 = 32;
 
 pub fn icon_for_controllers(controllers: &[ControllerStatus]) -> Icon {
-    let connected = !controllers.is_empty();
+    icon_for_connected(!controllers.is_empty())
+}
+
+/// Icon from connection presence alone. The tray thread owns the `Icon`
+/// (built there); only plain data crosses threads.
+pub fn icon_for_connected(connected: bool) -> Icon {
     let rgba = if connected {
         embedded::CONNECTED_RGBA
     } else {

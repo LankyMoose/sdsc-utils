@@ -21,8 +21,10 @@ use crate::persist::prefs::{
 use crate::platform::app_log;
 #[cfg(windows)]
 use crate::platform::host::Host;
+use crate::platform::packaged;
 #[cfg(debug_assertions)]
 use crate::platform::ui_sound::UiSoundKind;
+use crate::platform::updater::UpdateStatus;
 use crate::ui::color::{self, BatterySpectrum};
 #[cfg(debug_assertions)]
 use crate::ui::configure::EmulatorCommand;
@@ -88,6 +90,9 @@ impl App {
             extra_steam_paths: self.session.prefs.extra_steam_paths.clone(),
             steam_path_error: self.configure_state.steam_path_error.clone(),
             show_uninstalled_games: self.session.prefs.show_uninstalled_games_enabled(),
+            update: self.update_status.clone(),
+            update_boot_check: self.session.prefs.update_boot_check,
+            is_packaged: packaged::is_packaged(),
             steam_syncing: self.steam_scan_started.is_some(),
             steam_last_synced_label: steam::format_library_synced(
                 self.steam_last_synced_ms,
@@ -140,8 +145,16 @@ impl App {
     }
 
     pub(crate) fn open_configure(&mut self) -> Task<Message> {
+        // Opening Settings with no check yet starts one, so fast openers
+        // never sit on "Never checked" (the boot check stands down once
+        // anything ran or is running).
+        let check = if matches!(self.update_status, UpdateStatus::Idle) {
+            self.start_update_check("open")
+        } else {
+            Task::none()
+        };
         if let Some(id) = self.configure_window {
-            return focus_window(id);
+            return focus_window(id).chain(check);
         }
 
         self.configure_state
@@ -166,6 +179,7 @@ impl App {
         self.configure_window = Some(id);
         open.map(Message::ConfigureOpened)
             .chain(self.sync_toast_zorder())
+            .chain(check)
     }
 
     /// Debug-only standalone ambient preview (Diagnostics "View immersive"):
@@ -513,6 +527,24 @@ impl App {
                 if let Err(err) = launch::launch_target(url, "") {
                     app_log::warn(format!("open external link failed: {err}"));
                 }
+                Task::none()
+            }
+            ConfigureMessage::OpenUrl(url) => {
+                // Release URLs are allowlisted at fetch time; re-check the
+                // scheme here so a future caller cannot open arbitrary links.
+                if url.starts_with("https://") {
+                    if let Err(err) = launch::launch_target(&url, "") {
+                        app_log::warn(format!("open url failed: {err}"));
+                    }
+                } else {
+                    app_log::warn("open url blocked: non-https link");
+                }
+                Task::none()
+            }
+            ConfigureMessage::CheckForUpdates => self.start_update_check("manual"),
+            ConfigureMessage::SetUpdateBootCheck(enabled) => {
+                self.session.prefs.update_boot_check = enabled;
+                self.save_prefs();
                 Task::none()
             }
             #[cfg(windows)]

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.3] - 2026-10-29
+
+### Added
+
+- GitHub release check (Configure → System → Version): boot + manual checks with spinner, up-to-date/available/failed states, View release / Microsoft Store buttons, GitHub + Store links in the Version row, and a boot-check opt-out. New versions fire one native OS notification each; the app never downloads or installs anything itself.
+
+### Fixed
+
+- Tray icon, menu, and modal menu loop run on a dedicated thread: right-clicking during boot toast placement held the iced loop in `NtUserTrackPopupMenuEx` until the process was killed (`APPLICATION_HANG`). A stuck menu now costs one thread while HID, toasts, and Settings keep running.
+- Spinner rotation math uses radians: the old degrees-as-radians value spun ~57x too fast and aliased backwards. The disclosure chevron is a true quarter turn again.
+
 ## [1.7.2] - 2026-10-29
 
 ### Added
@@ -520,6 +531,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded DualSense silhouette for the tray and `.exe` icon.
 - Windows CI and tagged release workflow.
 
+[1.7.3]: https://github.com/LankyMoose/sdsc-utils/compare/v1.7.2...v1.7.3
 [1.7.2]: https://github.com/LankyMoose/sdsc-utils/compare/v1.7.1...v1.7.2
 [1.7.1]: https://github.com/LankyMoose/sdsc-utils/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/LankyMoose/sdsc-utils/compare/v1.6.1...v1.7.0
