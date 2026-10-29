@@ -177,7 +177,6 @@ impl App {
                 let close = self.close_popup();
                 close.chain(self.open_configure())
             }
-            PopupMessage::Quit => self.update(Message::Exit),
             PopupMessage::Identify(serial) => {
                 if self.identify(&serial) {
                     self.popup_state.begin_identify_flash(&serial);

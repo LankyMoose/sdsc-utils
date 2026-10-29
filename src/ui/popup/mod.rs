@@ -243,9 +243,6 @@ impl State {
 #[derive(Debug, Clone)]
 pub enum PopupMessage {
     OpenSettings,
-    /// Quit the app (mirrors the tray menu Exit; reachable even if the
-    /// native menu ever wedges on its tray thread).
-    Quit,
     Identify(Serial),
     PowerOff(Serial),
     ToggleRemember(Serial),
@@ -334,12 +331,6 @@ pub fn view<'a>(
             theme::MUTED,
             "Settings",
             PopupMessage::OpenSettings,
-        ),
-        icon_button(
-            svg_icon::POWER_SVG,
-            theme::MUTED,
-            "Quit",
-            PopupMessage::Quit,
         ),
     ]
     .align_y(Alignment::Center)
