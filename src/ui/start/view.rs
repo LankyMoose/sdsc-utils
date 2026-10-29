@@ -2854,6 +2854,27 @@ impl State {
         }
     }
 
+    /// Art actually synced for the enter sequence: complete the Preparing
+    /// chip if it is still on the rail. Idempotent (no chip, or already
+    /// success, is a no-op) — safe on every art event and timeout re-fire.
+    /// Without this, a reveal-before-chip ordering (slow cold opens where
+    /// the hold timeout reveals first and the chip begins after) leaves
+    /// "Preparing artwork…" stuck: the reveal-timestamp guard above never
+    /// re-runs once set.
+    pub fn note_enter_art_synced(&mut self, now: Instant) {
+        if self.enter_art_sync_ready()
+            && self.chrome_status_has_kind(ChromeStatusKind::PreparingArt)
+        {
+            self.note_chrome_status_success(ChromeStatusKind::PreparingArt, now);
+        }
+    }
+
+    /// True while the enter backdrop already shows this key (fade running
+    /// or opaque): restarting its clock would visibly hitch the splash.
+    fn enter_backdrop_live(&self, key: &str) -> bool {
+        matches!(&self.backdrop_current, Some((k, Some(_))) if k == key)
+    }
+
     /// Selected splash + visible strip heroes are decoded (matches idle Steam-scan pre-warm).
     pub fn enter_art_sync_ready(&self) -> bool {
         use crate::ui::start::vstrip::NEIGHBORS;
@@ -2901,6 +2922,7 @@ impl State {
                 self.begin_games_list_reveal(now);
                 if let Some(row) = self.rows.get(self.game_selected)
                     && row.backdrop_icon().is_some()
+                    && !self.enter_backdrop_live(&row.play_key)
                 {
                     self.start_enter_splash_fade(row.play_key.clone(), now);
                 }
@@ -2916,6 +2938,9 @@ impl State {
                 }
                 return true;
             }
+            // Art landing after the reveal (timeout revealed first): nothing
+            // re-reveals, but the Preparing chip still needs completing.
+            self.note_enter_art_synced(now);
             return false;
         }
         if !self.enter_art_sync_ready() {
@@ -2930,6 +2955,7 @@ impl State {
             self.begin_games_list_reveal(now);
             if let Some(row) = self.rows.get(self.game_selected)
                 && row.backdrop_icon().is_some()
+                && !self.enter_backdrop_live(&row.play_key)
             {
                 self.start_enter_splash_fade(row.play_key.clone(), now);
             }
@@ -2943,6 +2969,7 @@ impl State {
         self.begin_games_list_reveal(now);
         if let Some(row) = self.rows.get(self.game_selected)
             && row.backdrop_icon().is_some()
+            && !self.enter_backdrop_live(&row.play_key)
         {
             self.reveal_cached_opaque(row.play_key.clone(), now);
         }
@@ -2970,8 +2997,10 @@ impl State {
                     "ui-diag: start immersive enter art hold timeout ms={hold_ms} cold=1"
                 ));
                 self.begin_games_list_reveal(now);
+                self.note_enter_art_synced(now);
                 if let Some(row) = self.rows.get(self.game_selected)
                     && row.backdrop_icon().is_some()
+                    && !self.enter_backdrop_live(&row.play_key)
                 {
                     self.start_enter_splash_fade(row.play_key.clone(), now);
                 }
@@ -2995,6 +3024,7 @@ impl State {
             self.begin_games_list_reveal(now);
             if let Some(row) = self.rows.get(self.game_selected)
                 && row.backdrop_icon().is_some()
+                && !self.enter_backdrop_live(&row.play_key)
             {
                 self.start_enter_splash_fade(row.play_key.clone(), now);
             }
@@ -3019,6 +3049,7 @@ impl State {
         self.begin_games_list_reveal(now);
         if let Some(row) = self.rows.get(self.game_selected)
             && row.backdrop_icon().is_some()
+            && !self.enter_backdrop_live(&row.play_key)
         {
             self.reveal_cached_opaque(row.play_key.clone(), now);
         }
@@ -6126,6 +6157,121 @@ mod tests {
         let later = t0 + Duration::from_millis(ENTER_ART_HOLD_MAX_MS + 10);
         state.maybe_force_enter_reveal_after_art_hold(later);
         assert!(state.games_list_reveal_at.is_some());
+    }
+
+    #[test]
+    fn preparing_chip_completes_when_art_syncs_after_timeout_reveal() {
+        // Slow cold open: the hold timeout reveals first, the Preparing
+        // chip begins after, art lands last. The chip must still complete
+        // (previously stuck on "Preparing artwork…" — the reveal-timestamp
+        // guard never re-ran once set).
+        icon_cache::with_cache_lock(|| {
+            use crate::ui::start::mode::TransitionPhase;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("sdsc-enter-chip-after-reveal-{n}"));
+            let _ = std::fs::create_dir_all(&dir);
+            let hero = dir.join("hero.png");
+            let bd = dir.join("bd.png");
+            write_tiny_png(&hero);
+            write_tiny_png(&bd);
+            assert!(icon_cache::hero_for_path(&hero).is_some());
+            assert!(icon_cache::backdrop_for_path(&bd).is_some());
+
+            let mut state = State {
+                rows: vec![StartRow {
+                    title: "g".into(),
+                    subtitle: None,
+                    target: "t".into(),
+                    args: String::new(),
+                    play_key: "k".into(),
+                    icon: None,
+                    icon_source: Some(IconSource::File(hero.clone())),
+                    backdrop_path: Some(bd.clone()),
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                    disabled: false,
+                    view_in_steam: None,
+                    played_at_ms: None,
+                }],
+                game_selected: 0,
+                ..Default::default()
+            };
+            let now = Instant::now();
+            state.begin_transition_phase(TransitionPhase::EnterImmersive, now);
+            state.arm_enter_reveal(now);
+            state.begin_games_list_reveal(now);
+            state.begin_chrome_status(ChromeStatusKind::PreparingArt, now);
+            // Art event after the reveal: nothing re-reveals, chip completes.
+            assert!(!state.try_arm_enter_reveal_when_art_ready(now));
+            let item = state
+                .chrome_status
+                .iter()
+                .find(|i| i.kind == ChromeStatusKind::PreparingArt)
+                .expect("preparing chip");
+            assert!(matches!(item.phase, ChromeStatusPhase::Success));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn cold_timeout_refire_does_not_restart_live_splash() {
+        // The cold timeout re-firing after the reveal (ambient armed late)
+        // must not reset a running splash fade for the same key — that
+        // reset was the visible "re-fade" on slow cold opens.
+        icon_cache::with_cache_lock(|| {
+            use crate::ui::start::mode::{ENTER_ART_HOLD_MAX_MS, TransitionPhase};
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("sdsc-enter-splash-refire-{n}"));
+            let _ = std::fs::create_dir_all(&dir);
+            let hero = dir.join("hero.png");
+            let bd = dir.join("bd.png");
+            write_tiny_png(&hero);
+            write_tiny_png(&bd);
+            assert!(icon_cache::hero_for_path(&hero).is_some());
+            assert!(icon_cache::backdrop_for_path(&bd).is_some());
+
+            let mut state = State {
+                rows: vec![StartRow {
+                    title: "g".into(),
+                    subtitle: None,
+                    target: "t".into(),
+                    args: String::new(),
+                    play_key: "k".into(),
+                    icon: None,
+                    icon_source: Some(IconSource::File(hero.clone())),
+                    backdrop_path: Some(bd.clone()),
+                    edit: None,
+                    skeleton: false,
+                    update_required: false,
+                    disabled: false,
+                    view_in_steam: None,
+                    played_at_ms: None,
+                }],
+                game_selected: 0,
+                ..Default::default()
+            };
+            let t0 = Instant::now();
+            state.begin_transition_phase(TransitionPhase::EnterImmersive, t0);
+            state.begin_cold_load(t0);
+            // Reveal + splash already running for this key (first timeout /
+            // art event got there first).
+            state.begin_games_list_reveal(t0);
+            state.backdrop_current = Some(("k".to_string(), Some(t0)));
+            state.cold_ambient_started = Some(t0);
+            let later = t0 + Duration::from_millis(ENTER_ART_HOLD_MAX_MS + 10);
+            state.maybe_force_enter_reveal_after_art_hold(later);
+            // Cold load still finishes, but the splash clock is untouched.
+            assert!(!state.cold_load_active);
+            assert_eq!(state.backdrop_current, Some(("k".to_string(), Some(t0))));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
