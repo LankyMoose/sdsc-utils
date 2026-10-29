@@ -373,6 +373,8 @@ pub enum ConfigureMessage {
     SetLowBatteryPercent(u8),
     SetToastPosition(ToastPosition),
     SetToastOpacity(u8),
+    /// Opacity slider drag released: preview the new card opacity once.
+    PreviewToastOpacity,
     SetConfigureAlwaysOnTop(bool),
     SetAnalyticsEnabled(bool),
     SetLightbarEnabled(bool),
@@ -1967,6 +1969,7 @@ fn notifications_view<'a>(
                         |value| ConfigureMessage::SetToastOpacity(value.round() as u8),
                     )
                     .step(5.0_f32)
+                    .on_release(ConfigureMessage::PreviewToastOpacity)
                     .style(theme::slider),
                 ),
             ],

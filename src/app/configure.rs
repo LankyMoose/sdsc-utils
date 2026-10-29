@@ -259,10 +259,10 @@ impl App {
                 if self.session.prefs.toast_opacity != opacity {
                     self.session.prefs.toast_opacity = opacity;
                     self.save_prefs();
-                    return self.show_position_preview();
                 }
                 Task::none()
             }
+            ConfigureMessage::PreviewToastOpacity => self.show_position_preview(),
             ConfigureMessage::SetConfigureAlwaysOnTop(enabled) => {
                 self.session.prefs.configure_always_on_top = enabled;
                 self.save_prefs();
