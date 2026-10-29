@@ -1,3 +1,13 @@
+## 1.7.2
+### Added
+- Toast opacity slider (Notifications, Toast section, 20-100, default 60)
+- Settings always-on-top toggle (System, Window section, default on)
+- Running-in-the-tray toast on manual starts, quiet on login launches
+### Changed
+- Show uninstalled games now defaults off, explicit choices preserved
+### Fixed
+- Preparing artwork chip completes on slow cold opens, no splash re-fade
+
 ## 1.7.1
 ### Added
 - Uninstalled Steam games stay listed with their real titles (Show uninstalled games toggle, default on)
