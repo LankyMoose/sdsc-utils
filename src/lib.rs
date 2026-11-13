@@ -19,6 +19,7 @@ impl From<hidapi::HidError> for AppError {
 }
 
 pub mod app;
+pub mod browser;
 pub mod controller;
 pub mod domain;
 pub mod games;
