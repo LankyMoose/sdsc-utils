@@ -462,6 +462,9 @@ pub struct App {
     /// False until Start is revealed and ready — blocks pad nav / sounds early.
     start_nav_ready: bool,
     start_state: start_view::State,
+    /// Multi-app foreground/background manager (in-Start browser today;
+    /// games launch out of Start so they join only with an engine backend).
+    apps: crate::browser::AppManager,
     /// Monitor covered by the Start window (stage size for the view).
     start_monitor_cover: Option<MonitorCover>,
     /// Last user activity on Start (mouse / keyboard / pad) for idle/sleep.
@@ -777,6 +780,7 @@ impl App {
             last_start_paint_active: std::cell::Cell::new(false),
             start_nav_ready: false,
             start_state: start_view::State::default(),
+            apps: crate::browser::AppManager::new(),
             start_monitor_cover: None,
             start_last_activity: Instant::now(),
             start_cursor_last_active: Instant::now(),
@@ -1813,6 +1817,8 @@ impl App {
                         self.on_ambient_tuning_nav(Some(NavAction::Up))
                     } else if self.start_state.settings.open {
                         self.on_start_settings_nav(Some(NavAction::Up))
+                    } else if self.start_state.browser.session.is_open() {
+                        self.scroll_browser(-crate::ui::start::view::BROWSER_SCROLL_STEP)
                     } else if self.immersive_horizontal_games_nav() {
                         // Horizontal Games strip scrolls Left/Right only.
                         Task::none()
@@ -1826,6 +1832,8 @@ impl App {
                         self.on_ambient_tuning_nav(Some(NavAction::Down))
                     } else if self.start_state.settings.open {
                         self.on_start_settings_nav(Some(NavAction::Down))
+                    } else if self.start_state.browser.session.is_open() {
+                        self.scroll_browser(crate::ui::start::view::BROWSER_SCROLL_STEP)
                     } else if self.immersive_horizontal_games_nav() {
                         // Horizontal Games strip scrolls Left/Right only.
                         Task::none()
@@ -1873,6 +1881,8 @@ impl App {
                         self.cancel_start_holds();
                         if self.start_state.ambient_tuning_active() {
                             self.on_ambient_tuning_nav(Some(NavAction::Confirm))
+                        } else if self.start_state.browser.session.is_open() {
+                            self.on_start_message(StartMessage::BrowserNavigate)
                         } else if self.start_state.settings.open {
                             self.on_start_settings_nav(Some(NavAction::Confirm))
                         } else {

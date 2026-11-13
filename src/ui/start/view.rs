@@ -11,6 +11,7 @@ use crate::persist::prefs::{
 use crate::ui::color::BatterySpectrum;
 use crate::ui::layout as window_layout;
 use crate::ui::start::face::FacePressAnim;
+use crate::ui::start::face::{FaceButton, action_cluster, face_hint};
 use crate::ui::start::icon_cache;
 use crate::ui::start::input::FaceHeld;
 use crate::ui::start::overlay;
@@ -19,7 +20,9 @@ use crate::ui::theme;
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::widget::text::Wrapping;
-use iced::widget::{Float, column, container, row, space, stack, svg, text};
+use iced::widget::{
+    Float, button, column, container, row, scrollable, space, stack, svg, text, text_input,
+};
 use iced::{Alignment, Color, Element, Fill, Length, Point, Rectangle, Renderer, Theme};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -62,6 +65,18 @@ pub enum StartMessage {
     DismissEditConfirm,
     /// Create (Select): toggle the controllers surface.
     ToggleControllers,
+    /// Browser: toggle the in-Start reader surface (Servo offscreen target;
+    /// phase-1 fetch backend with system-browser fallback).
+    ToggleBrowser,
+    BrowserUrlChanged(String),
+    BrowserNavigate,
+    BrowserFetched {
+        generation: u64,
+        result: Result<crate::browser::FetchedPage, String>,
+    },
+    BrowserOpenExternal,
+    BrowserReload,
+    BrowserScrolled(f32),
     ToggleEdit,
     CycleSort,
     AddShortcut,
@@ -618,6 +633,7 @@ impl OwnerPress {
 pub(crate) enum HintPressOwner {
     Browse,
     Settings,
+    Browser,
     ManualAdd,
     ReplaceConfirm,
     SaveDiscard,
@@ -625,10 +641,11 @@ pub(crate) enum HintPressOwner {
 }
 
 impl HintPressOwner {
-    const COUNT: usize = 6;
+    const COUNT: usize = 7;
     const ALL: [Self; Self::COUNT] = [
         Self::Browse,
         Self::Settings,
+        Self::Browser,
         Self::ManualAdd,
         Self::ReplaceConfirm,
         Self::SaveDiscard,
@@ -639,16 +656,19 @@ impl HintPressOwner {
         match self {
             Self::Browse => 0,
             Self::Settings => 1,
-            Self::ManualAdd => 2,
-            Self::ReplaceConfirm => 3,
-            Self::SaveDiscard => 4,
-            Self::Dock => 5,
+            Self::Browser => 2,
+            Self::ManualAdd => 3,
+            Self::ReplaceConfirm => 4,
+            Self::SaveDiscard => 5,
+            Self::Dock => 6,
         }
     }
 
     fn current(state: &State) -> Self {
         if state.settings.open || state.settings.anim.is_some() {
             Self::Settings
+        } else if state.browser.session.is_open() {
+            Self::Browser
         } else if state.manual_add.is_some() {
             Self::ManualAdd
         } else if state.replace_confirm.is_some() {
@@ -747,6 +767,137 @@ impl ManualAddDraft {
     pub fn is_edit(&self) -> bool {
         self.edit_id.is_some()
     }
+}
+
+/// In-Start reader browser panel. The URL draft and body scroll offset live
+/// here; load lifecycle (generation-guarded suspend/resume) lives in
+/// [`crate::browser::BrowserSession`].
+#[derive(Debug, Clone, Default)]
+pub struct BrowserPanel {
+    pub session: crate::browser::BrowserSession,
+    pub draft: String,
+    pub scroll_y: f32,
+}
+
+impl BrowserPanel {
+    pub fn toggle(&mut self) {
+        if self.session.is_open() {
+            self.session.close_surface();
+        } else {
+            self.session.open_surface();
+        }
+    }
+
+    pub fn close_surface(&mut self) {
+        self.session.close_surface();
+    }
+
+    pub fn note_scrolled(&mut self, y: f32) {
+        self.scroll_y = y.max(0.0);
+    }
+
+    /// Step the body scroll (pad Up/Down); returns the new absolute offset.
+    pub fn scroll_by(&mut self, delta: f32) -> f32 {
+        self.scroll_y = (self.scroll_y + delta).max(0.0);
+        self.scroll_y
+    }
+}
+
+/// Scrollable id for the browser body (pad scroll + `on_scroll` reports).
+pub fn browser_scroll_id() -> iced::widget::Id {
+    iced::widget::Id::new("start-browser-body")
+}
+
+/// Fixed card width for the browser overlay (dialog family sizing).
+pub const BROWSER_CARD_W: f32 = 600.0;
+/// Pad Up/Down body scroll step.
+pub const BROWSER_SCROLL_STEP: f32 = 240.0;
+
+/// In-Start reader browser card: URL row, readable body, reload / external /
+/// close actions. Mounted as a centered dialog over the live stage (same
+/// wash + card builder as manual/replace), below the settings drawer.
+pub fn browser_view(state: &State) -> Element<'_, StartMessage> {
+    let panel = &state.browser;
+    let session = &panel.session;
+    let status = if session.loading() {
+        "Loading…".to_string()
+    } else if let Some(err) = session.error() {
+        format!("Error: {err}")
+    } else if session.has_content() {
+        session.title().unwrap_or_else(|| session.url()).to_string()
+    } else {
+        "Reader view — type a URL and press Go.".to_string()
+    };
+    let body_text = if session.error().is_none() && session.has_content() {
+        session.body()
+    } else if !session.loading() && !session.has_content() {
+        "Fetches the page and strips it to text — a fast path for guides and docs. \
+         Pages that need JavaScript will not render here; use “Open in system browser”."
+    } else {
+        ""
+    };
+    let press = HintPress::for_owner(state, HintPressOwner::Browser);
+    column![
+        row![
+            text("Browser").size(18.0).color(theme::INK),
+            space().width(Fill),
+            text(status).size(12.0).color(theme::MUTED),
+        ]
+        .align_y(Alignment::Center),
+        space().height(4),
+        row![
+            text_input("https://…", &panel.draft)
+                .size(14.0)
+                .padding(8)
+                .on_input(StartMessage::BrowserUrlChanged)
+                .on_submit(StartMessage::BrowserNavigate)
+                .style(theme::input),
+            button(text("Go").size(14.0))
+                .padding([8, 14])
+                .on_press(StartMessage::BrowserNavigate)
+                .style(theme::primary),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+        space().height(8),
+        scrollable(
+            text(body_text)
+                .size(13.0)
+                .color(theme::INK)
+                .wrapping(Wrapping::Word)
+                .width(Fill)
+        )
+        .id(browser_scroll_id())
+        .on_scroll(|viewport| StartMessage::BrowserScrolled(viewport.absolute_offset().y))
+        .height(Length::Fill),
+        space().height(8),
+        row![
+            button(text("Reload").size(14.0))
+                .padding([6, 14])
+                .on_press(StartMessage::BrowserReload)
+                .style(theme::ghost),
+            button(text("Open in system browser").size(14.0))
+                .padding([6, 14])
+                .on_press(StartMessage::BrowserOpenExternal)
+                .style(theme::ghost),
+            button(text("Close").size(14.0))
+                .padding([6, 14])
+                .on_press(StartMessage::ToggleBrowser)
+                .style(theme::ghost),
+        ]
+        .spacing(10),
+        action_cluster(
+            &[
+                face_hint(FaceButton::Cross, "Go", press.held, press.press_anim),
+                face_hint(FaceButton::Circle, "Close", press.held, press.press_anim),
+            ],
+            false,
+        ),
+    ]
+    .spacing(4)
+    .width(Length::Fixed(BROWSER_CARD_W))
+    .align_x(Alignment::Start)
+    .into()
 }
 
 #[derive(Debug, Clone)]
@@ -937,6 +1088,9 @@ pub struct State {
     pub edit_confirm: Option<EditConfirm>,
     /// Options settings panel (right drawer).
     pub settings: crate::ui::start::settings::SettingsPanel,
+    /// In-Start reader browser surface (Servo offscreen target; phase-1
+    /// fetch backend). Open = dialog overlay above the stage.
+    pub browser: BrowserPanel,
     pub triangle_progress: f32,
     pub cross_progress: f32,
     /// Face buttons currently held (pad OR keyboard) for action-hint press styling.
@@ -1179,6 +1333,7 @@ impl Default for State {
             edit_confirm_anim: None,
             manual_add: None,
             edit_confirm: None,
+            browser: BrowserPanel::default(),
             settings: crate::ui::start::settings::SettingsPanel::default(),
             triangle_progress: 0.0,
             cross_progress: 0.0,
@@ -1592,6 +1747,7 @@ impl State {
         self.position_bar_slide = None;
         self.snap_position_section();
         self.dock_expanded = false;
+        self.browser.close_surface();
         self.clear_replace();
         self.clear_manual();
         self.clear_edit_confirm();
@@ -1615,6 +1771,7 @@ impl State {
         self.replace_confirm.is_some()
             || self.manual_add.is_some()
             || self.edit_confirm.is_some()
+            || self.browser.session.is_open()
             || self.settings.open
             || self.settings.anim.is_some()
             || self.ambient_tuning_active()

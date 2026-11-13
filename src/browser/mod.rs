@@ -15,6 +15,8 @@
 
 use std::collections::HashMap;
 
+pub mod fetch;
+
 /// Stable app identity. Keys mirror the Start convention of stable play keys
 /// (never row indices): games resolve via catalog `play_key`, the browser via
 /// a fixed id so suspend/resume survives row reorder.
@@ -71,6 +73,121 @@ pub enum AppEffect {
 struct AppRecord {
     kind: AppKind,
     suspended: bool,
+}
+
+/// A fetched reader page: the URL that was actually loaded plus the
+/// extracted title and body text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchedPage {
+    pub url: String,
+    pub title: Option<String>,
+    pub body: String,
+}
+
+/// In-Start browser surface state. Pure data: the iced view owns the URL
+/// draft and scroll offset, this owns load lifecycle with a generation
+/// counter so late worker results are ignored after suspend/close —
+/// the same stale-generation discipline as the Start art worker.
+#[derive(Debug, Clone, Default)]
+pub struct BrowserSession {
+    open: bool,
+    url: String,
+    title: Option<String>,
+    body: String,
+    loading: bool,
+    generation: u64,
+    error: Option<String>,
+}
+
+impl BrowserSession {
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    pub fn open_surface(&mut self) {
+        self.open = true;
+    }
+
+    /// Hide the surface and cancel any in-flight load. Cached page text is
+    /// kept so reopening (resume) paints instantly — the background-suspend
+    /// half of the multi-app contract.
+    pub fn close_surface(&mut self) {
+        self.open = false;
+        self.cancel_load();
+    }
+
+    /// Background suspend without hiding: cancels in-flight work, keeps the
+    /// cached page for an instant resume.
+    pub fn cancel_load(&mut self) {
+        if self.loading {
+            self.loading = false;
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+
+    /// Begin loading `url`. Returns the generation the worker result must
+    /// carry to be applied.
+    pub fn begin_load(&mut self, url: String) -> u64 {
+        self.url = url;
+        self.title = None;
+        self.body.clear();
+        self.error = None;
+        self.loading = true;
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+
+    /// Apply a worker result. Returns false (ignored) when the generation
+    /// no longer matches — the load was suspended or superseded.
+    pub fn apply_fetched(&mut self, generation: u64, page: FetchedPage) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.loading = false;
+        self.url = page.url;
+        self.title = page.title;
+        self.body = page.body;
+        self.error = None;
+        true
+    }
+
+    pub fn apply_failed(&mut self, generation: u64, error: String) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.loading = false;
+        self.error = Some(error);
+        true
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    pub fn loading(&self) -> bool {
+        self.loading
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// True once a page (or a load error) is on screen.
+    pub fn has_content(&self) -> bool {
+        !self.body.is_empty() || self.error.is_some()
+    }
 }
 
 /// Foreground + suspended-background manager. One app is active; every other
@@ -360,5 +477,56 @@ mod tests {
             id: BROWSER_APP_ID.to_string(),
             url: "https://example.com".to_string(),
         }));
+    }
+
+    fn page(url: &str) -> FetchedPage {
+        FetchedPage {
+            url: url.to_string(),
+            title: Some("T".to_string()),
+            body: "body".to_string(),
+        }
+    }
+
+    #[test]
+    fn session_applies_matching_generation_only() {
+        let mut s = BrowserSession::default();
+        s.open_surface();
+        let generation = s.begin_load("https://example.com".to_string());
+        assert!(s.loading());
+        // Stale worker result (superseded load) is ignored.
+        assert!(!s.apply_fetched(generation.wrapping_add(1), page("https://stale.test")));
+        assert!(s.loading());
+        assert!(s.apply_fetched(generation, page("https://example.com")));
+        assert!(!s.loading());
+        assert_eq!(s.body(), "body");
+        assert!(s.has_content());
+    }
+
+    #[test]
+    fn session_close_cancels_in_flight_but_keeps_url() {
+        let mut s = BrowserSession::default();
+        s.open_surface();
+        let generation = s.begin_load("https://example.com".to_string());
+        assert!(s.apply_fetched(generation, page("https://example.com")));
+        // Suspend mid-load of page 2: late result ignored, target URL kept,
+        // loader parked — reopen resumes from a coherent idle state.
+        let generation2 = s.begin_load("https://example.com/2".to_string());
+        let _ = generation2;
+        s.close_surface();
+        assert!(!s.is_open());
+        assert!(!s.loading());
+        assert!(!s.apply_fetched(generation2, page("https://example.com/2")));
+        assert_eq!(s.url(), "https://example.com/2");
+    }
+
+    #[test]
+    fn session_failure_surfaces_error() {
+        let mut s = BrowserSession::default();
+        s.open_surface();
+        let generation = s.begin_load("https://down.test".to_string());
+        assert!(s.apply_failed(generation, "fetch failed: dns".to_string()));
+        assert!(!s.loading());
+        assert_eq!(s.error(), Some("fetch failed: dns"));
+        assert!(s.has_content());
     }
 }

@@ -302,7 +302,7 @@ pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a,
                 actions,
             )
         } else {
-            // Left: Edit + sort. Right: Select + Start + Close.
+            // Left: Edit + sort + Browser. Right: Select + Start + Close.
             (
                 row![
                     action_cluster(
@@ -330,6 +330,10 @@ pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a,
                         ],
                         flat_hints,
                     ),
+                    button(text("Browser…").size(14.0).color(theme::ACCENT))
+                        .padding([6, 12])
+                        .on_press(StartMessage::ToggleBrowser)
+                        .style(theme::ghost),
                 ]
                 .spacing(FOOTER_SECONDARY_GAP)
                 .align_y(Alignment::Center)

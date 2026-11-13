@@ -18,7 +18,7 @@ use crate::ui::start::settings::{edit_confirm_view, manual_add_view, replace_con
 use crate::ui::start::translate::backdrop_art;
 use crate::ui::start::view::{
     HintPress, HintPressOwner, LaunchStatus, StartControllerRow, StartMessage, StartRow, State,
-    scan_status_chip, scan_status_stack,
+    browser_view, scan_status_chip, scan_status_stack,
 };
 use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics, StripOrientation};
 use crate::ui::theme;
@@ -315,6 +315,23 @@ pub fn view<'a>(
                 StartMessage::Noop,
             ),
             ep,
+        )));
+    }
+    // In-Start browser surface: wash + wide card over the live stage (same
+    // dialog family as manual/replace). Wash click toggles it closed, exactly
+    // like Circle/Cancel; the card absorbs clicks. Above modals (a fresh
+    // browser open never underlaps them), below the settings drawer.
+    if state.browser.session.is_open() {
+        layers.push(overlay::wash(
+            overlay::reveal(1.0),
+            StartMessage::ToggleBrowser,
+        ));
+        layers.push(overlay::centered(Scale::new(
+            overlay::click_shield(
+                overlay::dialog_card(browser_view(state), Length::Shrink, Some(MODAL_CARD_MAX_H)),
+                StartMessage::Noop,
+            ),
+            1.0,
         )));
     }
     // Dock slide-out: while the drawer travels in over an open dock, slide

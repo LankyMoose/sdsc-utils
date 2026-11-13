@@ -83,6 +83,21 @@ impl App {
                 Task::none()
             }
             StartMessage::ToggleControllers => self.on_toggle_controllers(),
+            StartMessage::ToggleBrowser => self.on_toggle_browser(),
+            StartMessage::BrowserUrlChanged(draft) => {
+                self.start_state.browser.draft = draft;
+                Task::none()
+            }
+            StartMessage::BrowserNavigate => self.on_browser_navigate(),
+            StartMessage::BrowserFetched { generation, result } => {
+                self.on_browser_fetched(generation, result)
+            }
+            StartMessage::BrowserOpenExternal => self.on_browser_open_external(),
+            StartMessage::BrowserReload => self.on_browser_reload(),
+            StartMessage::BrowserScrolled(y) => {
+                self.start_state.browser.note_scrolled(y);
+                Task::none()
+            }
             StartMessage::ToggleEdit => match self.toggle_start_edit() {
                 Some(task) => {
                     self.play_start_cue(UiSoundKind::Action);
@@ -313,6 +328,11 @@ impl App {
                 crate::controller::hid::diag::diag_info("ui-diag: start settings close");
             }
             Task::none()
+        } else if self.start_state.browser.session.is_open() {
+            // Browser surface open: Cancel closes it first (overlay priority:
+            // settings → browser → manual → replace → edit → dock → close).
+            self.play_start_cue(UiSoundKind::Action);
+            self.close_browser_surface()
         } else if self.start_state.manual_add.is_some() {
             self.play_start_cue(UiSoundKind::Action);
             self.cancel_manual_add()
@@ -378,6 +398,138 @@ impl App {
             ));
         }
         Task::none()
+    }
+
+    /// Browser toggle: foreground the browser app through the multi-app
+    /// manager and open the surface; toggling again suspends (close cancels
+    /// in-flight work but keeps the cached page for an instant resume).
+    pub(crate) fn on_toggle_browser(&mut self) -> Task<Message> {
+        if self.start_state.browser.session.is_open() {
+            return self.close_browser_surface();
+        }
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Action);
+        let _ = self.apps.open_app(
+            crate::browser::BROWSER_APP_ID.to_string(),
+            crate::browser::AppKind::Browser { url: None },
+        );
+        self.start_state.browser.session.open_surface();
+        crate::controller::hid::diag::diag_info("ui-diag: start browser open");
+        Task::none()
+    }
+
+    pub(crate) fn close_browser_surface(&mut self) -> Task<Message> {
+        let _ = self.apps.close_app(crate::browser::BROWSER_APP_ID);
+        self.start_state.browser.close_surface();
+        crate::controller::hid::diag::diag_info("ui-diag: start browser close (suspend)");
+        Task::none()
+    }
+
+    /// Kick a reader fetch off the UI thread. Generation-guarded: closing or
+    /// suspending before the worker lands drops the result.
+    pub(crate) fn on_browser_navigate(&mut self) -> Task<Message> {
+        let draft = self.start_state.browser.draft.clone();
+        let current = self.start_state.browser.session.url().to_string();
+        let raw = if draft.trim().is_empty() {
+            current
+        } else {
+            draft
+        };
+        let url = crate::browser::fetch::normalize_url(&raw);
+        if url.is_empty() {
+            return Task::none();
+        }
+        self.start_state.browser.draft = url.clone();
+        self.start_state.browser.scroll_y = 0.0;
+        let generation = self.start_state.browser.session.begin_load(url.clone());
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Nav);
+        crate::controller::hid::diag::diag_info("ui-diag: start browser navigate");
+        Task::perform(
+            async move { spawn_blocking(move || crate::browser::fetch::fetch_readable(&url)).await },
+            move |result| match result {
+                Ok(Ok(page)) => Message::Start(StartMessage::BrowserFetched {
+                    generation,
+                    result: Ok(page),
+                }),
+                Ok(Err(err)) => Message::Start(StartMessage::BrowserFetched {
+                    generation,
+                    result: Err(err),
+                }),
+                Err(err) => Message::Start(StartMessage::BrowserFetched {
+                    generation,
+                    result: Err(err.to_string()),
+                }),
+            },
+        )
+    }
+
+    pub(crate) fn on_browser_fetched(
+        &mut self,
+        generation: u64,
+        result: Result<crate::browser::FetchedPage, String>,
+    ) -> Task<Message> {
+        match result {
+            Ok(page) => {
+                if self
+                    .start_state
+                    .browser
+                    .session
+                    .apply_fetched(generation, page)
+                {
+                    self.note_start_activity();
+                }
+            }
+            Err(err) => {
+                if self
+                    .start_state
+                    .browser
+                    .session
+                    .apply_failed(generation, err)
+                {
+                    self.note_start_activity();
+                }
+            }
+        }
+        Task::none()
+    }
+
+    pub(crate) fn on_browser_reload(&mut self) -> Task<Message> {
+        if self.start_state.browser.session.url().is_empty() {
+            return self.on_browser_navigate();
+        }
+        self.start_state.browser.draft = self.start_state.browser.session.url().to_string();
+        self.on_browser_navigate()
+    }
+
+    /// Escape hatch for pages the reader backend cannot render.
+    pub(crate) fn on_browser_open_external(&mut self) -> Task<Message> {
+        let session = &self.start_state.browser.session;
+        let raw = if session.url().is_empty() {
+            self.start_state.browser.draft.clone()
+        } else {
+            session.url().to_string()
+        };
+        let url = crate::browser::fetch::normalize_url(&raw);
+        if url.is_empty() {
+            return Task::none();
+        }
+        if let Err(err) = launch::launch_target(&url, "") {
+            app_log::warn(format!("start-browser: external open failed: {err}"));
+        }
+        Task::none()
+    }
+
+    /// Pad/keyboard body scroll for the open browser surface.
+    pub(crate) fn scroll_browser(&mut self, delta: f32) -> Task<Message> {
+        let y = self.start_state.browser.scroll_by(delta);
+        operation::scroll_to(
+            start_view::browser_scroll_id(),
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
+        )
     }
 }
 
@@ -1275,6 +1427,7 @@ impl App {
             crate::persist::prefs::ImmersiveLayout::Horizontal
         ) && !self.start_state.dock_expanded
             && !self.start_state.settings.open
+            && !self.start_state.browser.session.is_open()
             && self.start_state.replace_confirm.is_none()
             && self.start_state.manual_add.is_none()
     }
@@ -1351,14 +1504,16 @@ impl App {
         let manual_add = self.start_state.manual_add.is_some();
         let save_modal = self.start_state.edit_confirm.is_some();
         let settings_open = self.start_state.settings.open;
-        let allow_nav_move =
-            settings_open || (!animating && !replace_confirm && !manual_add && !save_modal);
+        let browser_open = self.start_state.browser.session.is_open();
+        let allow_nav_move = settings_open
+            || (!animating && !replace_confirm && !manual_add && !save_modal && !browser_open);
         let editing = self.start_state.editing;
         // Only when the selected row shows Close game (running target match).
         let hold_cross_close = !editing
             && !replace_confirm
             && !manual_add
             && !save_modal
+            && !browser_open
             && !settings_open
             && !animating
             && !self.start_state.dock_expanded
@@ -1373,6 +1528,7 @@ impl App {
             && !replace_confirm
             && !manual_add
             && !save_modal
+            && !browser_open
             && !settings_open
             && !animating
             && self.start_state.dock_expanded
@@ -1471,6 +1627,25 @@ impl App {
             self.keyboard_cross_hold.reset();
             self.start_state.tick_hint_anims(now);
             self.on_start_settings_nav(tick.action)
+        } else if browser_open {
+            // Browser surface owns pad input while open: Up/Down scroll the
+            // body, Cross re-goes the URL, Circle closes. Game nav, holds,
+            // and surface toggles stay parked (same discipline as modals).
+            self.start_state.cross_progress = 0.0;
+            self.start_state.triangle_progress = 0.0;
+            self.keyboard_cross_hold.reset();
+            self.start_state.tick_hint_anims(now);
+            match tick.action {
+                Some(NavAction::Up) => {
+                    self.scroll_browser(-crate::ui::start::view::BROWSER_SCROLL_STEP)
+                }
+                Some(NavAction::Down) => {
+                    self.scroll_browser(crate::ui::start::view::BROWSER_SCROLL_STEP)
+                }
+                Some(NavAction::Confirm) => self.on_start_message(StartMessage::BrowserNavigate),
+                Some(NavAction::Cancel) => self.on_start_message(StartMessage::Close),
+                _ => Task::none(),
+            }
         } else if animating {
             self.start_state.tick_hint_anims(now);
             if let Some(action) = tick.action {
@@ -3177,6 +3352,9 @@ impl App {
         #[cfg(debug_assertions)]
         self.start_state.request_ambient_tuning(false);
         self.start_state.clear_transition_phase();
+        // Background suspend: an in-flight browser fetch is cancelled (the
+        // cached page survives for an instant resume via the surface toggle).
+        self.start_state.browser.session.cancel_load();
         // Invalidate in-flight art events; keep caches for fast reopen.
         // Process Exit is what wipes to a blank slate (`ArtOwner::shutdown`).
         let generation = crate::ui::start::icon_cache::bump_art_warm_generation();
