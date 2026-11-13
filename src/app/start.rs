@@ -1505,8 +1505,14 @@ impl App {
         let save_modal = self.start_state.edit_confirm.is_some();
         let settings_open = self.start_state.settings.open;
         let browser_open = self.start_state.browser.session.is_open();
-        let allow_nav_move = settings_open
-            || (!animating && !replace_confirm && !manual_add && !save_modal && !browser_open);
+        let allow_nav_move = start_nav_move_allowed(
+            settings_open,
+            browser_open,
+            animating,
+            replace_confirm,
+            manual_add,
+            save_modal,
+        );
         let editing = self.start_state.editing;
         // Only when the selected row shows Close game (running target match).
         let hold_cross_close = !editing
@@ -3648,6 +3654,22 @@ pub(crate) fn start_cold_allows(message: &StartMessage) -> bool {
     matches!(message, StartMessage::Close)
 }
 
+/// Whether pad directionals flow into the nav stepper. Settings and the
+/// browser own them (settings focus / browser body scroll); otherwise
+/// they park while chrome animates or a modal owns input. The stepper
+/// suppresses directionals entirely when false, so a surface that consumes
+/// Up/Down (browser scroll) must keep this true.
+pub(crate) fn start_nav_move_allowed(
+    settings_open: bool,
+    browser_open: bool,
+    animating: bool,
+    replace_confirm: bool,
+    manual_add: bool,
+    save_modal: bool,
+) -> bool {
+    settings_open || browser_open || (!animating && !replace_confirm && !manual_add && !save_modal)
+}
+
 /// Layout-transition gate: focus moves freeze mid-transition; Confirm /
 /// Cancel / Close, settings-toggle, and controllers-toggle stay live.
 pub(crate) fn start_focus_move_frozen(message: &StartMessage) -> bool {
@@ -3675,6 +3697,31 @@ mod tests {
                 "{msg:?} must be dropped when cold"
             );
         }
+    }
+
+    #[test]
+    fn browser_open_keeps_nav_movement_flowing() {
+        // Regression: the browser consumes pad Up/Down for body scroll via
+        // the stepper, which suppresses directionals when movement is
+        // parked. Settings behaves the same (focus moves).
+        assert!(super::start_nav_move_allowed(
+            true, false, false, false, false, false
+        ));
+        assert!(super::start_nav_move_allowed(
+            false, true, false, false, false, false
+        ));
+        assert!(super::start_nav_move_allowed(
+            false, true, true, true, true, true
+        ));
+        assert!(!super::start_nav_move_allowed(
+            false, false, true, false, false, false
+        ));
+        assert!(!super::start_nav_move_allowed(
+            false, false, false, true, false, false
+        ));
+        assert!(super::start_nav_move_allowed(
+            false, false, false, false, false, false
+        ));
     }
 
     #[test]
