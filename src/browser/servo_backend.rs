@@ -88,6 +88,12 @@ struct Shared {
     /// reused.
     ids: HashMap<servo::accesskit::NodeId, u64>,
     next_id: u64,
+    /// Last commanded scroll, for the AX refresh heuristic: a settled scroll
+    /// after big movement usually means the layout underneath shifted too.
+    last_scroll_at: Option<Instant>,
+    /// Last AX refresh (full re-request), and the scroll offset it saw.
+    last_refresh_at: Instant,
+    scroll_at_refresh: (f32, f32),
     /// Last scroll offset sent to the UI (diffed like the tree).
     last_sent_scroll: (f32, f32),
     /// Document extent (max far corner seen, page pixels). Bounds the
@@ -445,6 +451,9 @@ fn run(
         last_sent_scroll: (0.0, 0.0),
         ids: HashMap::new(),
         next_id: 0,
+        last_scroll_at: None,
+        last_refresh_at: Instant::now(),
+        scroll_at_refresh: (0.0, 0.0),
         content: None,
         last_url: None,
         ax_debug: std::env::var("SDSC_AX_DEBUG").is_ok(),
@@ -481,6 +490,7 @@ fn run(
                 servo.spin_event_loop();
             }
             check_load_timeout(&shared);
+            maybe_refresh_ax(&webview, &shared);
             std::thread::sleep(if suspended { SUSPENDED_IDLE } else { SPIN_IDLE });
         }
     }
@@ -529,6 +539,9 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             // silent unless nodes join/leave (see `emit_tree`).
             let (sx, sy) = state.scroll;
             set_scroll(&mut state, (sx + dx, sy + dy));
+            if dx != 0.0 || dy != 0.0 {
+                state.last_scroll_at = Some(Instant::now());
+            }
             emit_tree(&mut state);
         }
         EngineCommand::Key(event) => {
@@ -614,6 +627,9 @@ fn clear_tree(state: &mut Shared) {
         state.handle.emit(EngineEvent::A11yTree(Vec::new()));
     }
     state.content = None;
+    state.last_scroll_at = None;
+    state.last_refresh_at = Instant::now();
+    state.scroll_at_refresh = (0.0, 0.0);
     if state.scroll != (0.0, 0.0) {
         state.scroll = (0.0, 0.0);
         state.last_sent_scroll = (0.0, 0.0);
@@ -642,6 +658,38 @@ fn doc_key(url: &str) -> &str {
     url.split('#').next().unwrap_or(url)
 }
 
+/// Re-request the accessibility tree when the mirror is likely stale:
+/// single-sighting rects freeze while the page keeps reflowing underneath
+/// them, and Servo does not reliably re-send. Capped cadence; toggling the
+/// feed forces a full re-send whose upserts refresh every rect in place.
+const AX_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
+/// Scroll distance since the last refresh that demands a re-request once
+/// movement settles (reflows usually follow big scrolls).
+const AX_REFRESH_SCROLL_DIST: f32 = 400.0;
+/// Quiet period after the last scroll input before a scroll-driven refresh.
+const AX_REFRESH_SETTLE: Duration = Duration::from_millis(1200);
+
+/// Drop the mirrored tree and re-request it, re-baselining every rect.
+/// Scroll is kept (same document, same position); nodes/ids/extent rebuild
+/// from the full re-send. Brief outline flicker while the tree streams back
+/// in — bounded by the cadence above.
+fn refresh_ax_tree(webview: &WebView, shared: &Rc<RefCell<Shared>>, reason: &str) {
+    {
+        let mut state = shared.borrow_mut();
+        state.nodes.clear();
+        state.ids.clear();
+        state.last_emitted = Vec::new();
+        state.content = None;
+        state.handle.emit(EngineEvent::A11yTree(Vec::new()));
+        state.last_scroll_at = None;
+        state.last_refresh_at = Instant::now();
+        state.scroll_at_refresh = state.scroll;
+    }
+    webview.set_accessibility_active(false);
+    webview.set_accessibility_active(true);
+    crate::platform::app_log::info(format!("servo-engine: AX refresh ({reason})"));
+}
+
 /// Clamp a tracked offset to the physically possible range: pages never sit
 /// above/left of origin, nor past extent-viewport. `None` extent (no
 /// bounded node seen yet) means no upper bound.
@@ -654,6 +702,39 @@ fn clamp_scroll(scroll: (f32, f32), content: Option<(f32, f32)>) -> (f32, f32) {
         None => (f32::INFINITY, f32::INFINITY),
     };
     (scroll.0.clamp(0.0, max_x), scroll.1.clamp(0.0, max_y))
+}
+
+/// Re-request the tree when the mirror is likely stale: single-sighting
+/// rects freeze while the page keeps reflowing underneath them, and Servo
+/// does not reliably re-send. Either a settled scroll that moved far since
+/// the last refresh (reflows usually follow big scrolls), or a plain
+/// interval backstop for image loads while reading. Skipped while
+/// suspended, empty, or mid-load (fresh loads stream their own tree).
+fn maybe_refresh_ax(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
+    let now = Instant::now();
+    let reason = {
+        let state = shared.borrow();
+        if state.suspended || state.nodes.is_empty() || state.load_started_at.is_some() {
+            return;
+        }
+        let scrolled_far = state.last_scroll_at.is_some_and(|t| {
+            now.saturating_duration_since(t) >= AX_REFRESH_SETTLE
+                && (state.scroll.0 - state.scroll_at_refresh.0)
+                    .hypot(state.scroll.1 - state.scroll_at_refresh.1)
+                    >= AX_REFRESH_SCROLL_DIST
+        });
+        let interval = now.saturating_duration_since(state.last_refresh_at) >= AX_REFRESH_INTERVAL;
+        if scrolled_far {
+            Some("scroll-settled")
+        } else if interval {
+            Some("interval")
+        } else {
+            None
+        }
+    };
+    if let Some(reason) = reason {
+        refresh_ax_tree(webview, shared, reason);
+    }
 }
 
 /// Update the tracked scroll offset and report it when it moves, so the UI
