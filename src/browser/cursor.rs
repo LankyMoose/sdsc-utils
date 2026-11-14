@@ -35,8 +35,13 @@ pub enum FocusKind {
 pub const SNAP_RADIUS: f32 = 100.0;
 /// D-pad nudge step in page pixels.
 pub const NUDGE_STEP: f32 = 32.0;
-/// Left-stick cursor speed at full deflection, px/s.
-pub const CURSOR_SPEED: f32 = 900.0;
+/// Left-stick cursor acceleration at full deflection, px/s^2.
+pub const CURSOR_ACCEL: f32 = 7000.0;
+/// Left-stick cursor top speed, px/s.
+pub const CURSOR_MAX_SPEED: f32 = 1400.0;
+/// Velocity decay rate (exponential friction, per second). The cursor glides
+/// a little after release instead of stopping dead.
+pub const CURSOR_FRICTION: f32 = 7.0;
 /// Magnetic pull rate (exponential approach per second) once docked: the
 /// cursor glides to the element's center instead of teleporting.
 pub const MAGNET_PULL_PER_SEC: f32 = 14.0;
@@ -59,6 +64,8 @@ pub enum JumpDir {
 pub struct Cursor {
     pub x: f32,
     pub y: f32,
+    pub vx: f32,
+    pub vy: f32,
     /// Attached focusable id, if docked.
     pub attached: Option<u64>,
     /// Magnetic mode (L3 toggles): snap + glide to nearby elements.
@@ -72,6 +79,8 @@ impl Cursor {
         Self {
             x: VIEWPORT_W / 2.0,
             y: VIEWPORT_H / 2.0,
+            vx: 0.0,
+            vy: 0.0,
             attached: None,
             magnet: true,
             visible: true,
@@ -89,10 +98,31 @@ impl Cursor {
         self.y = (self.y + dy).clamp(0.0, VIEWPORT_H);
     }
 
-    /// Analog velocity step: `axis` in [-1, 1] over `dt_secs`. In magnetic
-    /// mode the point glides toward the docked element instead of jumping.
+    /// Analog velocity step: the stick accelerates a velocity vector and
+    /// friction decays it, so the cursor glides full-360° with momentum and
+    /// settles instead of stopping dead. Detaches on manual input; re-snaps
+    /// (magnetic mode) and glides to the dock afterwards.
     pub fn advance(&mut self, lx: f32, ly: f32, dt_secs: f32, options: &[Focusable]) {
-        self.move_by(lx * CURSOR_SPEED * dt_secs, ly * CURSOR_SPEED * dt_secs);
+        if lx != 0.0 || ly != 0.0 {
+            self.attached = None;
+            self.vx =
+                (self.vx + lx * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
+            self.vy =
+                (self.vy + ly * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
+        }
+        let damp = (-CURSOR_FRICTION * dt_secs).exp();
+        self.vx *= damp;
+        self.vy *= damp;
+        if self.vx.abs() < 1.0 {
+            self.vx = 0.0;
+        }
+        if self.vy.abs() < 1.0 {
+            self.vy = 0.0;
+        }
+        if self.vx != 0.0 || self.vy != 0.0 {
+            self.x = (self.x + self.vx * dt_secs).clamp(0.0, VIEWPORT_W);
+            self.y = (self.y + self.vy * dt_secs).clamp(0.0, VIEWPORT_H);
+        }
         if self.magnet {
             self.snap(options);
             self.glide(dt_secs, options);
@@ -115,7 +145,8 @@ impl Cursor {
         self.y += (ty - self.y) * t;
     }
 
-    /// Nudge for D-pad taps, then snap.
+    /// Nudge for D-pad taps, then snap. Discrete step: kills velocity so a
+    /// tap never inherits drift.
     pub fn nudge(&mut self, dir: JumpDir, options: &[Focusable]) {
         let (dx, dy) = match dir {
             JumpDir::Up => (0.0, -NUDGE_STEP),
@@ -124,6 +155,8 @@ impl Cursor {
             JumpDir::Right => (NUDGE_STEP, 0.0),
         };
         self.move_by(dx, dy);
+        self.vx = 0.0;
+        self.vy = 0.0;
         self.snap(options);
     }
 
@@ -222,6 +255,9 @@ impl Cursor {
             self.x = (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W);
             self.y = (item.y + item.h / 2.0).clamp(0.0, VIEWPORT_H);
             self.attached = Some(id);
+            // Teleport, not flick: a jump carries no momentum.
+            self.vx = 0.0;
+            self.vy = 0.0;
         }
     }
 
@@ -320,7 +356,40 @@ mod tests {
     }
 
     #[test]
-    fn magnet_off_leaves_free_cursor_alone() {
+    fn diagonal_stick_moves_both_axes_proportionally() {
+        let mut c = Cursor::new();
+        c.advance(0.5, -0.5, 0.1, &[]);
+        assert!(c.x > 400.0, "right, x={}", c.x);
+        assert!(c.y < 300.0, "up, y={}", c.y);
+        // Roughly equal magnitude: no axis snapping.
+        let dx = c.x - 400.0;
+        let dy = 300.0 - c.y;
+        assert!(
+            (dx - dy).abs() < dx * 0.2,
+            "diagonal should stay diagonal: dx={dx} dy={dy}"
+        );
+    }
+
+    #[test]
+    fn velocity_builds_and_friction_settles() {
+        let mut c = Cursor::new();
+        c.advance(1.0, 0.0, 0.05, &[]);
+        let v1 = c.vx;
+        assert!(v1 > 0.0);
+        c.advance(1.0, 0.0, 0.05, &[]);
+        assert!(c.vx > v1, "holding the stick keeps accelerating");
+        // Release: friction bleeds velocity without input.
+        let mut last_x = c.x;
+        for _ in 0..60 {
+            c.advance(0.0, 0.0, 0.016, &[]);
+            assert!(c.x >= last_x, "glide never reverses");
+            last_x = c.x;
+        }
+        assert_eq!(c.vx, 0.0, "friction must fully settle");
+    }
+
+    #[test]
+    fn advance_respects_magnet_flag() {
         let mut c = Cursor::new();
         c.magnet = false;
         let items = [link(1, 100.0, 100.0)];

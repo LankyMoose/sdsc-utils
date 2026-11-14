@@ -1074,6 +1074,17 @@ pub fn combined_stick(lx: f32, ly: f32, rx: f32, ry: f32) -> (f32, f32) {
     }
 }
 
+/// Gentle per-axis deadzone for the split cursor/scroll sticks. Deliberately
+/// softer than the nav path (0.9): the browser cursor needs proportional
+/// control from a light touch, not a 90%-throw gate. No residual term —
+/// each stick stands alone.
+pub fn soft_stick(x: f32, y: f32) -> (f32, f32) {
+    const DEADZONE: f32 = 0.12;
+    let x = if x.abs() < DEADZONE { 0.0 } else { x };
+    let y = if y.abs() < DEADZONE { 0.0 } else { y };
+    (x, y)
+}
+
 /// Per-pad edge / hold / arming state for start-screen navigation.
 #[derive(Debug, Clone, Default)]
 struct PadSlot {
