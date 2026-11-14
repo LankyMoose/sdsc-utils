@@ -272,6 +272,7 @@ fn collect_focusables(shared: &mut Shared) -> (Vec<Focusable>, (f32, f32)) {
         nodes,
         ids,
         next_id,
+        ax_debug,
         ..
     } = &mut *shared;
     for (nid, stored) in nodes.iter() {
@@ -300,6 +301,12 @@ fn collect_focusables(shared: &mut Shared) -> (Vec<Focusable>, (f32, f32)) {
             item.id = *ids.entry(*nid).or_insert_with(|| {
                 let id = *next_id;
                 *next_id += 1;
+                if *ax_debug {
+                    crate::platform::app_log::info(format!(
+                        "servo-ax map #{id} <= {nid:?} role={:?}",
+                        stored.role
+                    ));
+                }
                 id
             });
             out.push(item);

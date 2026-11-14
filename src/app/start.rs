@@ -793,19 +793,21 @@ impl App {
         let scroll = panel.scroll_offset;
         std::thread::spawn(move || {
             let dir = crate::persist::paths::data_dir().join("shots");
-            if std::fs::create_dir_all(&dir).is_err() {
+            if let Err(err) = std::fs::create_dir_all(&dir) {
+                app_log::warn(format!("shot skipped: cannot create {dir:?}: {err}"));
                 return;
             }
             let path = dir.join(format!("shot-{ms}.png"));
-            if image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8).is_ok() {
-                app_log::info(format!(
+            match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
+                Ok(()) => app_log::info(format!(
                     "shot saved path={} cursor=({:.0},{:.0}) magnet={magnet} dock={dock:?} rect={rect} wells={wells} scroll=({:.0},{:.0})",
                     path.display(),
                     cursor.0,
                     cursor.1,
                     scroll.0,
                     scroll.1,
-                ));
+                )),
+                Err(err) => app_log::warn(format!("shot failed path={}: {err}", path.display())),
             }
         });
     }
