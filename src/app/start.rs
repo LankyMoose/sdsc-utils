@@ -1505,14 +1505,7 @@ impl App {
         let save_modal = self.start_state.edit_confirm.is_some();
         let settings_open = self.start_state.settings.open;
         let browser_open = self.start_state.browser.session.is_open();
-        let allow_nav_move = start_nav_move_allowed(
-            settings_open,
-            browser_open,
-            animating,
-            replace_confirm,
-            manual_add,
-            save_modal,
-        );
+        let allow_nav_move = start_nav_move_allowed(&self.start_state);
         let editing = self.start_state.editing;
         // Only when the selected row shows Close game (running target match).
         let hold_cross_close = !editing
@@ -3654,20 +3647,19 @@ pub(crate) fn start_cold_allows(message: &StartMessage) -> bool {
     matches!(message, StartMessage::Close)
 }
 
-/// Whether pad directionals flow into the nav stepper. Settings and the
-/// browser own them (settings focus / browser body scroll); otherwise
-/// they park while chrome animates or a modal owns input. The stepper
-/// suppresses directionals entirely when false, so a surface that consumes
-/// Up/Down (browser scroll) must keep this true.
-pub(crate) fn start_nav_move_allowed(
-    settings_open: bool,
-    browser_open: bool,
-    animating: bool,
-    replace_confirm: bool,
-    manual_add: bool,
-    save_modal: bool,
-) -> bool {
-    settings_open || browser_open || (!animating && !replace_confirm && !manual_add && !save_modal)
+/// Whether pad directionals flow into the nav stepper, read off live Start
+/// state. Settings and the browser own directionals (settings focus moves /
+/// browser body scroll); otherwise they park while chrome animates or a
+/// modal owns input. The stepper suppresses directionals entirely when
+/// false, so a surface that consumes Up/Down (browser scroll) must keep
+/// this true.
+pub(crate) fn start_nav_move_allowed(state: &start_view::State) -> bool {
+    state.settings.open
+        || state.browser.session.is_open()
+        || (!state.animating()
+            && state.replace_confirm.is_none()
+            && state.manual_add.is_none()
+            && state.edit_confirm.is_none())
 }
 
 /// Layout-transition gate: focus moves freeze mid-transition; Confirm /
@@ -3701,27 +3693,38 @@ mod tests {
 
     #[test]
     fn browser_open_keeps_nav_movement_flowing() {
+        use super::start_nav_move_allowed;
+        use crate::ui::start::view::{EditConfirm, ManualAddDraft, ReplaceConfirm, State};
         // Regression: the browser consumes pad Up/Down for body scroll via
         // the stepper, which suppresses directionals when movement is
         // parked. Settings behaves the same (focus moves).
-        assert!(super::start_nav_move_allowed(
-            true, false, false, false, false, false
-        ));
-        assert!(super::start_nav_move_allowed(
-            false, true, false, false, false, false
-        ));
-        assert!(super::start_nav_move_allowed(
-            false, true, true, true, true, true
-        ));
-        assert!(!super::start_nav_move_allowed(
-            false, false, true, false, false, false
-        ));
-        assert!(!super::start_nav_move_allowed(
-            false, false, false, true, false, false
-        ));
-        assert!(super::start_nav_move_allowed(
-            false, false, false, false, false, false
-        ));
+        let mut state = State::default();
+        assert!(start_nav_move_allowed(&state));
+        state.settings.open = true;
+        assert!(start_nav_move_allowed(&state));
+        state.settings.open = false;
+        state.browser.session.open_surface();
+        assert!(start_nav_move_allowed(&state));
+        state.browser.session.close_surface();
+        state.manual_add = Some(ManualAddDraft {
+            edit_id: None,
+            target: String::new(),
+            title: String::new(),
+            args: String::new(),
+            icon_path: None,
+            shell_icon: None,
+        });
+        assert!(!start_nav_move_allowed(&state));
+        state.manual_add = None;
+        state.replace_confirm = Some(ReplaceConfirm {
+            running_title: String::new(),
+            next_title: String::new(),
+            next_index: 0,
+        });
+        assert!(!start_nav_move_allowed(&state));
+        state.replace_confirm = None;
+        state.edit_confirm = Some(EditConfirm);
+        assert!(!start_nav_move_allowed(&state));
     }
 
     #[test]
