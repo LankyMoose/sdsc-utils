@@ -427,14 +427,31 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                 Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(dx, dy))),
                 WebViewPoint::Device(DevicePoint::new(w as f32 / 2.0, h as f32 / 2.0)),
             );
-            // Destructure the reborrow so the two maps borrow disjointly
-            // (`RefMut` field borrows don't split on their own).
-            let Shared {
-                focusables,
-                last_emitted,
-                ..
-            } = &mut *state;
-            shift_tree(focusables, last_emitted, dx, dy);
+            // Stick-noise-scale deltas would random-walk the cached rects
+            // if integrated; genuine scrolls are orders of magnitude bigger.
+            if dx.abs() < 0.25 && dy.abs() < 0.25 {
+                return;
+            }
+            // The UI only refreshes on A11yTree events, and pure scrolling
+            // never produces a Servo update — re-emit the shifted list so
+            // outlines track the page. Silent (count never changes here) to
+            // avoid log spam at scroll-tick rates; `try_send` + subscription
+            // conflation absorb bursts while the stick is held.
+            let fresh: Vec<Focusable> = {
+                // Destructure the reborrow so the two maps borrow disjointly
+                // (`RefCell` field borrows don't split on their own).
+                let Shared {
+                    focusables,
+                    last_emitted,
+                    ..
+                } = &mut *state;
+                shift_tree(focusables, last_emitted, dx, dy);
+                let mut fresh: Vec<Focusable> = focusables.values().cloned().collect();
+                fresh.sort_by_key(|o| o.id);
+                *last_emitted = fresh.clone();
+                fresh
+            };
+            state.handle.emit(EngineEvent::A11yTree(fresh));
         }
         EngineCommand::Key(event) => {
             if shared.borrow().suspended {
