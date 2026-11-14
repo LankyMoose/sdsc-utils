@@ -37,6 +37,17 @@ touching `src/browser/`, the Start browser surface, or the `servo-engine` featur
 - `Message::BrowserEngine` is system-class (like ticks, not input): frames
   must not reset idle-dim/cursor-hide.
 
+## Startup ordering contract (Windows, NVIDIA)
+
+Worker-thread WGL context creation segfaults inside `nvoglv64.dll` once
+any Vulkan is initialized in the process — but is fine before it (proven by
+scratch probes). So `App::boot` blocks on the engine's context-ready signal
+(up to 15s, then falls back to reader-only) and `wgpu_diag` adapter logging
+(which creates a wgpu Instance) moved after it. `WGPU_BACKEND` stays
+Vulkan-first (transparency needs it); DX12-only also dodges the crash but
+loses alpha compositing. `SDSC_NO_ENGINE=1` forces the reader path without
+spawning the worker.
+
 ## Build prerequisites (Windows)
 
 Servo's SpiderMonkey/ICU needs Clang + Python at build time and the MSVC C++
