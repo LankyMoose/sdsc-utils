@@ -54,6 +54,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Git hooks** (`git config core.hooksPath .githooks`): pre-commit runs `cargo fmt --all` and re-stages staged `.rs` files; pre-push runs `scripts/ci.sh`. Bypass with `--no-verify`.
 - **CI**: GitHub Actions `ci.yml` runs `bash scripts/ci.sh` on push/PR (fmt → clippy → test → build, debug + release), plus an MSRV-floor job (`cargo +1.88 check --locked --all-targets`) enforcing the `rust-version` claim in `Cargo.toml`.
 - **Toolchain is pinned**: `rust-toolchain.toml` names the exact compiler for local dev (rustup auto-installs it); `ci.yml` pins the same version explicitly via the dtolnay `toolchain:` input (the action defaults to floating `stable`, it does not follow the file). `rust-version` in `Cargo.toml` (1.88) is only the MSRV floor — never float or "sync" the pins to it. Bump deliberately (both pins → run `scripts/ci.sh` → commit) so new-compiler lints surface in the bump commit, not as surprise CI failures.
+- **Stylo thread stack**: `.cargo/config.toml` sets `SERVO_STYLE_THREAD_STACK_SIZE_KB=1024` (applies to every build automatically). Servo's default 512 KiB style threads overflow on real-world restyle storms (typing into Google autocomplete aborts the process). Changing the value needs `cargo clean -p stylo` (at least) — Cargo does not track env changes in fingerprints. Only affects `servo-engine` feature builds.
 
 ## Platform-specific notes
 

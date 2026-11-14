@@ -50,14 +50,22 @@ spawning the worker.
 
 ## Build prerequisites (Windows)
 
-Servo's SpiderMonkey/ICU needs Clang + Python at build time and the MSVC C++
-runtime import lib at link time:
+Servo's SpiderMonkey/ICU needs Clang + Python at build time, the MSVC C++
+runtime import lib at link time, and a bumped Stylo thread stack:
 
 - LLVM 23 (winget `LLVM.LLVM`) for `clang`/`libclang` (`LIBCLANG_PATH`).
 - Python 3.13 (winget `Python.Python.3.13`).
 - BuildTools ≥ 17.14 (MSVC 14.44): older STLs lack the `__std_*` vectorized
   helpers mozjs/ICU reference → LNK2019. `build.rs` links `msvcprt` on
   Windows MSVC for the same reason (proven by the spike link).
+- `.cargo/config.toml` sets `SERVO_STYLE_THREAD_STACK_SIZE_KB=1024`
+  (Stylo reads it at *compile time*). Servo's default 512 KiB style threads
+  overflow on real-world restyle storms — typing into Google's autocomplete
+  box aborts the process (`StyleThread has overflowed its stack`), while
+  passive loads never push that deep. 1024 matches the platform default
+  thread stack; the extra is address-space reserve. Changing the value
+  needs a `cargo clean -p stylo` (at least) to take effect, since Cargo
+  does not track env changes in fingerprints.
 
 ## Feature flag
 
