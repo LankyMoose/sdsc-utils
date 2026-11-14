@@ -30,6 +30,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "accesskit_consumer"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f950720ce064757a1b629caad3a408e8d2c63bb01f29b8a3ff8daa331053ffeb"
+dependencies = [
+ "accesskit",
+ "hashbrown 0.16.1",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7053,6 +7063,7 @@ dependencies = [
 name = "sdsc-utils"
 version = "1.7.3"
 dependencies = [
+ "accesskit_consumer",
  "bytemuck",
  "crc32fast",
  "dpi",

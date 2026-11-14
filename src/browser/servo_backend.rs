@@ -12,6 +12,7 @@
 //! loses), so Start chrome, toasts, and veils composite above the page.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -64,11 +65,12 @@ struct Shared {
     generation: u64,
     load_started_at: Option<Instant>,
     logged_first_frame: bool,
-    /// Focusables keyed by accesskit node id. Servo sends incremental
-    /// updates, so this map is the accumulated truth: upsert nodes that
-    /// arrive, drop ids that arrive non-focusable, ignore empty (focus-only)
-    /// heartbeats, clear on navigate.
-    focusables: std::collections::HashMap<u64, Focusable>,
+    /// Mirrored accessibility tree. Servo sends incremental updates, so the
+    /// backend keeps a real consumer mirror (parent/child structure
+    /// included): removals drop with their subtree instead of lingering as
+    /// ghosts. Empty (focus-only) heartbeats are ignored; the mirror resets
+    /// on document change (see `clear_tree`).
+    tree: Option<accesskit_consumer::Tree>,
     /// Last list sent to the UI (diffed to avoid spamming identical trees).
     last_emitted: Vec<Focusable>,
     visible: bool,
@@ -81,6 +83,11 @@ struct Shared {
     /// driven scrolls (anchors, JS) are invisible to us and self-heal only
     /// via fresh bounds — a known gap.
     scroll: (f32, f32),
+    /// Stable numeric ids for live accesskit nodes (the UI keys attachments
+    /// by u64; accesskit ids are UUIDs). Pruned with each walk, cleared on
+    /// document change, never reused.
+    ids: HashMap<accesskit_consumer::NodeId, u64>,
+    next_id: u64,
     /// Last scroll offset sent to the UI (diffed like the tree).
     last_sent_scroll: (f32, f32),
     /// Document extent (max far corner seen, page pixels). Bounds the
@@ -177,90 +184,119 @@ impl WebViewDelegate for Delegate {
         _webview: WebView,
         update: servo::accesskit::TreeUpdate,
     ) {
-        // Servo sends incremental updates (plus empty focus-only heartbeats),
-        // so the backend owns the accumulated map: upsert changed nodes,
-        // drop ids that arrive non-focusable, ignore empties, clear on
-        // navigate (see `apply_command`). Replaces the whole list each time
-        // flickered as pages streamed their trees in.
+        // Servo sends incremental updates, so the backend mirrors the tree in
+        // a real consumer (structure included): removals drop with their
+        // subtree instead of lingering as ghosts. Empty (focus-only)
+        // heartbeats are ignored; the mirror resets on document change.
         if update.nodes.is_empty() {
             return;
         }
         let mut shared = self.shared.borrow_mut();
-        for (id, node) in &update.nodes {
-            // Document extent for scroll clamping: max far corner over every
-            // bounded node (RootWebArea included). Only grows per document;
-            // reset on document change (see `clear_tree`).
-            if let Some(rect) = node.bounds() {
-                let extent = shared.content.get_or_insert((0.0, 0.0));
-                extent.0 = extent.0.max(rect.x1 as f32);
-                extent.1 = extent.1.max(rect.y1 as f32);
-            }
-            // Role-typed actionables, plus anything Servo marks clickable
-            // (Click action): div-buttons, image links, custom controls.
-            let clickable = node.supports_action(servo::accesskit::Action::Click);
-            let kind =
-                focusable_kind(node.role()).or_else(|| clickable.then_some(FocusKind::Other));
-            let kept = kind.and_then(|kind| {
-                node.bounds().and_then(|rect| {
-                    let (w, h) = (rect.width() as f32, rect.height() as f32);
-                    // Non-zero area and smaller than the viewport: a
-                    // full-page click listener is not a snap target.
-                    (w > 0.0
-                        && h > 0.0
-                        && w <= VIEWPORT_WIDTH as f32
-                        && h <= VIEWPORT_HEIGHT as f32)
-                        .then_some(Focusable {
-                            id: id.0,
-                            x: rect.x0 as f32,
-                            y: rect.y0 as f32,
-                            w,
-                            h,
-                            kind,
-                        })
-                })
-            });
-            if shared.ax_debug {
-                let bounds = node.bounds();
-                let verdict = match (&kept, bounds) {
-                    (Some(_), _) => "kept",
-                    (None, None) => "drop:nobounds",
-                    (None, Some(rect))
-                        if rect.width() as f32 > VIEWPORT_WIDTH as f32
-                            || rect.height() as f32 > VIEWPORT_HEIGHT as f32 =>
-                    {
-                        "drop:oversize"
-                    }
-                    (None, Some(_)) => "drop:role",
-                };
-                let b = bounds
-                    .map(|r| {
-                        format!(
-                            "({},{}) {}x{}",
-                            r.x0 as i32,
-                            r.y0 as i32,
-                            r.width() as i32,
-                            r.height() as i32
-                        )
-                    })
-                    .unwrap_or_else(|| "-".to_string());
-                crate::platform::app_log::info(format!(
-                    "servo-ax node id={} role={:?} clickable={clickable} bounds={b} verdict={verdict}",
-                    id.0,
-                    node.role()
-                ));
-            }
-            match kept {
-                Some(item) => {
-                    shared.focusables.insert(item.id, item);
+        match shared.tree.as_mut() {
+            Some(tree) => tree.update_and_process_changes(update, &mut NoChanges),
+            None => {
+                if update.tree.is_none() {
+                    // No root yet (the first update is normally a full
+                    // snapshot); wait for it rather than panicking the
+                    // worker inside Tree::new.
+                    return;
                 }
-                None => {
-                    shared.focusables.remove(&id.0);
-                }
+                shared.tree = Some(accesskit_consumer::Tree::new(update, false));
             }
         }
         // Publish the translated tree (diffed + logged inside).
         emit_tree(&mut shared);
     }
+}
+
+/// Walk the mirrored tree and collect snap targets, plus the document extent
+/// (max far corner over every bounded node) for scroll clamping. Sorted by
+/// id so diffing is stable.
+fn collect_focusables(shared: &mut Shared) -> (Vec<Focusable>, (f32, f32)) {
+    let mut out = Vec::new();
+    let mut extent = (0.0f32, 0.0f32);
+    let Shared {
+        tree,
+        ids,
+        next_id,
+        ax_debug,
+        ..
+    } = &mut *shared;
+    let Some(tree) = tree.as_ref() else {
+        return (out, extent);
+    };
+    let mut live = HashSet::new();
+    let mut stack = vec![tree.state().root()];
+    while let Some(node) = stack.pop() {
+        live.insert(node.id());
+        let role = node.role();
+        if let Some(rect) = node.bounding_box() {
+            extent.0 = extent.0.max(rect.x1 as f32);
+            extent.1 = extent.1.max(rect.y1 as f32);
+        }
+        // Role-typed actionables. Clickability is logged for diagnosis but
+        // not filtered on: untyped clickable containers are usually page
+        // chrome, not targets.
+        let clickable = node.is_clickable(&|_| accesskit_consumer::FilterResult::Include);
+        let kept = focusable_kind(role).and_then(|kind| {
+            node.bounding_box().and_then(|rect| {
+                let (w, h) = (rect.width() as f32, rect.height() as f32);
+                // Non-zero area and smaller than the viewport: a
+                // full-page container is not a snap target.
+                (w > 0.0 && h > 0.0 && w <= VIEWPORT_WIDTH as f32 && h <= VIEWPORT_HEIGHT as f32)
+                    .then_some(Focusable {
+                        id: 0,
+                        x: rect.x0 as f32,
+                        y: rect.y0 as f32,
+                        w,
+                        h,
+                        kind,
+                    })
+            })
+        });
+        if *ax_debug {
+            let bounds = node.bounding_box();
+            let verdict = match (&kept, bounds) {
+                (Some(_), _) => "kept",
+                (None, None) => "drop:nobounds",
+                (None, Some(rect))
+                    if rect.width() as f32 > VIEWPORT_WIDTH as f32
+                        || rect.height() as f32 > VIEWPORT_HEIGHT as f32 =>
+                {
+                    "drop:oversize"
+                }
+                (None, Some(_)) => "drop:role",
+            };
+            let b = bounds
+                .map(|r| {
+                    format!(
+                        "({},{}) {}x{}",
+                        r.x0 as i32,
+                        r.y0 as i32,
+                        r.width() as i32,
+                        r.height() as i32
+                    )
+                })
+                .unwrap_or_else(|| "-".to_string());
+            crate::platform::app_log::info(format!(
+                "servo-ax node id={:?} role={role:?} clickable={clickable} bounds={b} verdict={verdict}",
+                node.id(),
+            ));
+        }
+        if let Some(mut item) = kept {
+            // Stable numeric id for the UI (accesskit ids are UUIDs).
+            item.id = *ids.entry(node.id()).or_insert_with(|| {
+                let id = *next_id;
+                *next_id += 1;
+                id
+            });
+            out.push(item);
+        }
+        stack.extend(node.children());
+    }
+    ids.retain(|k, _| live.contains(k));
+    out.sort_by_key(|o| o.id);
+    (out, extent)
 }
 
 /// Actionable accesskit roles, mapped to cursor kinds. Covers every HTML
@@ -378,12 +414,14 @@ fn run(
         generation: 0,
         load_started_at: None,
         logged_first_frame: false,
-        focusables: std::collections::HashMap::new(),
+        tree: None,
         last_emitted: Vec::new(),
         visible: false,
         suspended: true,
         scroll: (0.0, 0.0),
         last_sent_scroll: (0.0, 0.0),
+        ids: HashMap::new(),
+        next_id: 0,
         content: None,
         last_url: None,
         ax_debug: std::env::var("SDSC_AX_DEBUG").is_ok(),
@@ -546,8 +584,8 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
 /// content extent. Session history does not reliably restore scroll, and
 /// stale anything misplaces every outline (observed in testing).
 fn clear_tree(state: &mut Shared) {
-    if !state.focusables.is_empty() {
-        state.focusables.clear();
+    if state.tree.is_some() {
+        state.tree = None;
         state.last_emitted = Vec::new();
         state.handle.emit(EngineEvent::A11yTree(Vec::new()));
     }
@@ -561,28 +599,33 @@ fn clear_tree(state: &mut Shared) {
     }
 }
 
-/// Viewport-space snapshot of the cached document tree: rects translated by
+/// Viewport-space snapshot of a sorted focusable list: rects translated by
 /// the tracked scroll offset (Servo reports document-relative bounds and
-/// never re-emits them on scroll). Sorted by id so diffing is stable.
-fn translate_tree(
-    focusables: &std::collections::HashMap<u64, Focusable>,
-    scroll: (f32, f32),
-) -> Vec<Focusable> {
-    let mut out: Vec<Focusable> = focusables
-        .values()
-        .map(|o| Focusable {
-            id: o.id,
-            x: o.x - scroll.0,
-            y: o.y - scroll.1,
-            w: o.w,
-            h: o.h,
-            kind: o.kind,
-        })
-        .collect();
-    out.sort_by_key(|o| o.id);
-    out
+/// never re-emits them on scroll). Order-preserving, so the walk order
+/// (sorted by id) survives for stable diffing.
+fn translate_tree(mut items: Vec<Focusable>, scroll: (f32, f32)) -> Vec<Focusable> {
+    for o in items.iter_mut() {
+        o.x -= scroll.0;
+        o.y -= scroll.1;
+    }
+    items
 }
 
+/// No-op change handler: the backend re-walks the whole mirror per update
+/// instead of reacting to deltas (0.37 has no plain `update`).
+struct NoChanges;
+
+impl accesskit_consumer::TreeChangeHandler for NoChanges {
+    fn node_added(&mut self, _node: &accesskit_consumer::Node) {}
+    fn node_updated(&mut self, _old: &accesskit_consumer::Node, _new: &accesskit_consumer::Node) {}
+    fn node_removed(&mut self, _node: &accesskit_consumer::Node) {}
+    fn focus_moved(
+        &mut self,
+        _old: Option<&accesskit_consumer::Node>,
+        _new: Option<&accesskit_consumer::Node>,
+    ) {
+    }
+}
 /// Document identity for history comparison: URL minus fragment.
 /// Same-document traffic (fragment jumps, some pushState) must not clear
 /// the tree; anything else is a new document.
@@ -622,7 +665,13 @@ fn set_scroll(state: &mut Shared, scroll: (f32, f32)) {
 /// Diff + publish the translated tree. Logs only when the set size changes
 /// so scroll ticks (which move rects without adding nodes) stay silent.
 fn emit_tree(shared: &mut Shared) {
-    let fresh = translate_tree(&shared.focusables, shared.scroll);
+    let (focusables, extent) = collect_focusables(shared);
+    // Extent only grows per document (reset by `clear_tree`).
+    shared.content = Some(match shared.content {
+        Some(prev) => (prev.0.max(extent.0), prev.1.max(extent.1)),
+        None => extent,
+    });
+    let fresh = translate_tree(focusables, shared.scroll);
     if fresh == shared.last_emitted {
         return;
     }
@@ -665,7 +714,6 @@ fn check_load_timeout(shared: &Rc<RefCell<Shared>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn item(id: u64, x: f32, y: f32) -> Focusable {
         Focusable {
@@ -700,15 +748,11 @@ mod tests {
     }
 
     #[test]
-    fn translate_shifts_by_scroll_and_sorts() {
-        let map: HashMap<u64, Focusable> = [(2, item(2, 100.0, 800.0)), (1, item(1, 0.0, 0.0))]
-            .into_iter()
-            .collect();
-        let out = translate_tree(&map, (0.0, 240.0));
+    fn translate_shifts_by_scroll_and_preserves_order() {
+        let items = vec![item(2, 100.0, 800.0), item(1, 0.0, 0.0)];
+        let out = translate_tree(items, (0.0, 240.0));
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].id, 1);
-        assert_eq!((out[0].x, out[0].y), (0.0, -240.0));
-        assert_eq!(out[1].id, 2);
-        assert_eq!((out[1].x, out[1].y), (100.0, 560.0));
+        assert_eq!((out[0].x, out[0].y), (100.0, 560.0));
+        assert_eq!((out[1].x, out[1].y), (0.0, -240.0));
     }
 }
