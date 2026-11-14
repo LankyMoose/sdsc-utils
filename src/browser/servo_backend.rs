@@ -83,6 +83,11 @@ struct Shared {
     scroll: (f32, f32),
     /// Last scroll offset sent to the UI (diffed like the tree).
     last_sent_scroll: (f32, f32),
+    /// Document extent (max far corner seen, page pixels). Bounds the
+    /// tracked scroll: pages can't scroll past origin or past
+    /// extent-viewport, but commanded deltas arrive regardless (clamped
+    /// no-ops at edges, overshoot while held). Reset on document change.
+    content: Option<(f32, f32)>,
     /// Verbose per-node AX diagnostics (`SDSC_AX_DEBUG=1`): role, bounds,
     /// and keep/drop verdict for every node in each tree update.
     ax_debug: bool,
@@ -158,6 +163,14 @@ impl WebViewDelegate for Delegate {
         }
         let mut shared = self.shared.borrow_mut();
         for (id, node) in &update.nodes {
+            // Document extent for scroll clamping: max far corner over every
+            // bounded node (RootWebArea included). Only grows per document;
+            // reset on document change (see `clear_tree`).
+            if let Some(rect) = node.bounds() {
+                let extent = shared.content.get_or_insert((0.0, 0.0));
+                extent.0 = extent.0.max(rect.x1 as f32);
+                extent.1 = extent.1.max(rect.y1 as f32);
+            }
             // Role-typed actionables, plus anything Servo marks clickable
             // (Click action): div-buttons, image links, custom controls.
             let clickable = node.supports_action(servo::accesskit::Action::Click);
@@ -347,6 +360,7 @@ fn run(
         suspended: true,
         scroll: (0.0, 0.0),
         last_sent_scroll: (0.0, 0.0),
+        content: None,
         ax_debug: std::env::var("SDSC_AX_DEBUG").is_ok(),
     }));
     let webview = WebViewBuilder::new(&servo, ctx.clone())
@@ -395,9 +409,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                     crate::platform::app_log::info(format!("servo-engine: navigate {url}"));
                     state.generation = generation;
                     state.load_started_at = Some(Instant::now());
-                    // Fresh page, fresh tree, zero scroll: drops the old
-                    // page's nodes so no stale outline survives.
-                    set_scroll(&mut state, (0.0, 0.0));
+                    // Fresh page: clear_tree drops nodes, scroll and extent.
                     clear_tree(&mut state);
                     state
                         .handle
@@ -446,10 +458,8 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             if state.suspended {
                 return;
             }
-            // History travel swaps the document: same staleness as navigate,
-            // and the offset does not reliably restore — reset it, or every
-            // translated outline lands wrong.
-            set_scroll(&mut state, (0.0, 0.0));
+            // History travel swaps the document: clear_tree drops nodes,
+            // scroll and extent (no reliable scroll restore to keep).
             clear_tree(&mut state);
             webview.go_back(1);
         }
@@ -458,7 +468,6 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             if state.suspended {
                 return;
             }
-            set_scroll(&mut state, (0.0, 0.0));
             clear_tree(&mut state);
             webview.go_forward(1);
         }
@@ -504,14 +513,22 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
     }
 }
 
-/// Drop the accumulated tree (fresh page, history travel): stale outlines
-/// must never survive a document change.
+/// Document changed (fresh load or history travel): drop nodes, scroll and
+/// content extent. Session history does not reliably restore scroll, and
+/// stale anything misplaces every outline (observed in testing).
 fn clear_tree(state: &mut Shared) {
-    if state.focusables.is_empty() {
-        return;
-    }
     state.focusables.clear();
     state.last_emitted = Vec::new();
+    state.content = None;
+    if state.scroll != (0.0, 0.0) {
+        state.scroll = (0.0, 0.0);
+        state.last_sent_scroll = (0.0, 0.0);
+        state
+            .handle
+            .emit(EngineEvent::ScrollOffset { x: 0.0, y: 0.0 });
+    }
+    // Emit the empty tree even when already empty: the UI may hold rects
+    // translated by a now-reset scroll.
     state.handle.emit(EngineEvent::A11yTree(Vec::new()));
 }
 
@@ -537,17 +554,32 @@ fn translate_tree(
     out
 }
 
+/// Clamp a tracked offset to the physically possible range: pages never sit
+/// above/left of origin, nor past extent-viewport. `None` extent (no
+/// bounded node seen yet) means no upper bound.
+fn clamp_scroll(scroll: (f32, f32), content: Option<(f32, f32)>) -> (f32, f32) {
+    let (max_x, max_y) = match content {
+        Some((w, h)) => (
+            (w - VIEWPORT_WIDTH as f32).max(0.0),
+            (h - VIEWPORT_HEIGHT as f32).max(0.0),
+        ),
+        None => (f32::INFINITY, f32::INFINITY),
+    };
+    (scroll.0.clamp(0.0, max_x), scroll.1.clamp(0.0, max_y))
+}
+
 /// Update the tracked scroll offset and report it when it moves, so the UI
 /// overlay can correlate cursor against targets.
 fn set_scroll(state: &mut Shared, scroll: (f32, f32)) {
-    if state.scroll == scroll {
+    let clamped = clamp_scroll(scroll, state.content);
+    if state.scroll == clamped {
         return;
     }
-    state.scroll = scroll;
-    state.last_sent_scroll = scroll;
+    state.scroll = clamped;
+    state.last_sent_scroll = clamped;
     state.handle.emit(EngineEvent::ScrollOffset {
-        x: scroll.0,
-        y: scroll.1,
+        x: clamped.0,
+        y: clamped.1,
     });
 }
 
@@ -608,6 +640,19 @@ mod tests {
             h: 30.0,
             kind: FocusKind::Link,
         }
+    }
+
+    #[test]
+    fn clamp_scroll_pins_to_possible_range() {
+        // No extent known yet: anything non-negative passes.
+        assert_eq!(clamp_scroll((100.0, 200.0), None), (100.0, 200.0));
+        // Negative is never real (pages sit at/after origin).
+        assert_eq!(clamp_scroll((-57.0, -74.0), None), (0.0, 0.0));
+        // Known 800x2481 document on an 800x600 viewport.
+        let content = Some((800.0, 2481.0));
+        assert_eq!(clamp_scroll((0.0, 2573.0), content), (0.0, 1881.0));
+        assert_eq!(clamp_scroll((-225.0, 100.0), content), (0.0, 100.0));
+        assert_eq!(clamp_scroll((0.0, 1881.0), content), (0.0, 1881.0));
     }
 
     #[test]
