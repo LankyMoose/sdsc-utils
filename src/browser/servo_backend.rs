@@ -88,6 +88,10 @@ struct Shared {
     /// extent-viewport, but commanded deltas arrive regardless (clamped
     /// no-ops at edges, overshoot while held). Reset on document change.
     content: Option<(f32, f32)>,
+    /// Fragment-stripped URL of the current document. History entries are
+    /// compared against it: a new document clears the tree, same-document
+    /// fragment/pushState traffic keeps it (no flash, no stale nodes).
+    last_url: Option<String>,
     /// Verbose per-node AX diagnostics (`SDSC_AX_DEBUG=1`): role, bounds,
     /// and keep/drop verdict for every node in each tree update.
     ax_debug: bool,
@@ -124,9 +128,28 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_url_changed(&self, _webview: WebView, url: url::Url) {
-        self.shared.borrow().handle.emit(EngineEvent::UrlChanged {
+        let mut shared = self.shared.borrow_mut();
+        // Redirects land here: track the real document identity so the
+        // history comparison below stays consistent.
+        shared.last_url = Some(doc_key(url.as_str()).to_string());
+        shared.handle.emit(EngineEvent::UrlChanged {
             url: url.to_string(),
         });
+    }
+
+    fn notify_history_changed(&self, _webview: WebView, entries: Vec<url::Url>, current: usize) {
+        // Client-side navigation (link click, redirect, form submit, JS):
+        // a new document arrives through no EngineCommand. Same-document
+        // traffic (fragments) keeps the tree; anything else clears it.
+        let Some(url) = entries.get(current) else {
+            return;
+        };
+        let mut shared = self.shared.borrow_mut();
+        let key = doc_key(url.as_str());
+        if shared.last_url.as_deref() != Some(key) {
+            shared.last_url = Some(key.to_string());
+            clear_tree(&mut shared);
+        }
     }
 
     fn notify_page_title_changed(&self, _webview: WebView, title: Option<String>) {
@@ -361,6 +384,7 @@ fn run(
         scroll: (0.0, 0.0),
         last_sent_scroll: (0.0, 0.0),
         content: None,
+        last_url: None,
         ax_debug: std::env::var("SDSC_AX_DEBUG").is_ok(),
     }));
     let webview = WebViewBuilder::new(&servo, ctx.clone())
@@ -410,6 +434,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                     state.generation = generation;
                     state.load_started_at = Some(Instant::now());
                     // Fresh page: clear_tree drops nodes, scroll and extent.
+                    state.last_url = Some(doc_key(&url).to_string());
                     clear_tree(&mut state);
                     state
                         .handle
@@ -517,8 +542,11 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
 /// content extent. Session history does not reliably restore scroll, and
 /// stale anything misplaces every outline (observed in testing).
 fn clear_tree(state: &mut Shared) {
-    state.focusables.clear();
-    state.last_emitted = Vec::new();
+    if !state.focusables.is_empty() {
+        state.focusables.clear();
+        state.last_emitted = Vec::new();
+        state.handle.emit(EngineEvent::A11yTree(Vec::new()));
+    }
     state.content = None;
     if state.scroll != (0.0, 0.0) {
         state.scroll = (0.0, 0.0);
@@ -527,9 +555,6 @@ fn clear_tree(state: &mut Shared) {
             .handle
             .emit(EngineEvent::ScrollOffset { x: 0.0, y: 0.0 });
     }
-    // Emit the empty tree even when already empty: the UI may hold rects
-    // translated by a now-reset scroll.
-    state.handle.emit(EngineEvent::A11yTree(Vec::new()));
 }
 
 /// Viewport-space snapshot of the cached document tree: rects translated by
@@ -552,6 +577,13 @@ fn translate_tree(
         .collect();
     out.sort_by_key(|o| o.id);
     out
+}
+
+/// Document identity for history comparison: URL minus fragment.
+/// Same-document traffic (fragment jumps, some pushState) must not clear
+/// the tree; anything else is a new document.
+fn doc_key(url: &str) -> &str {
+    url.split('#').next().unwrap_or(url)
 }
 
 /// Clamp a tracked offset to the physically possible range: pages never sit
@@ -640,6 +672,14 @@ mod tests {
             h: 30.0,
             kind: FocusKind::Link,
         }
+    }
+
+    #[test]
+    fn doc_key_strips_fragments_only() {
+        assert_eq!(doc_key("https://google.com/"), "https://google.com/");
+        assert_eq!(doc_key("https://x.test/p#frag"), "https://x.test/p");
+        assert_eq!(doc_key("https://x.test/p?q=1#frag"), "https://x.test/p?q=1");
+        assert_eq!(doc_key("https://x.test/p?q=1"), "https://x.test/p?q=1");
     }
 
     #[test]
