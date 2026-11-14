@@ -197,6 +197,17 @@ impl WebViewDelegate for Delegate {
             return;
         }
         let mut shared = self.shared.borrow_mut();
+        crate::platform::app_log::info(format!(
+            "servo-ax update tree_id={:?} nodes={} tree={} mirror={}",
+            update.tree_id,
+            update.nodes.len(),
+            update.tree.is_some(),
+            if shared.tree.is_some() {
+                "live"
+            } else {
+                "pending"
+            },
+        ));
         if shared.tree.is_none() {
             if update.tree_id != servo::accesskit::TreeId::ROOT || update.tree.is_none() {
                 // Subtree (or rootless) update before the root snapshot:
