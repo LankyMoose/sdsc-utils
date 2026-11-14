@@ -64,7 +64,13 @@ struct Shared {
     generation: u64,
     load_started_at: Option<Instant>,
     logged_first_frame: bool,
-    last_focusables: Vec<Focusable>,
+    /// Focusables keyed by accesskit node id. Servo sends incremental
+    /// updates, so this map is the accumulated truth: upsert nodes that
+    /// arrive, drop ids that arrive non-focusable, ignore empty (focus-only)
+    /// heartbeats, clear on navigate.
+    focusables: std::collections::HashMap<u64, Focusable>,
+    /// Last list sent to the UI (diffed to avoid spamming identical trees).
+    last_emitted: Vec<Focusable>,
     visible: bool,
     suspended: bool,
 }
@@ -129,35 +135,54 @@ impl WebViewDelegate for Delegate {
         _webview: WebView,
         update: servo::accesskit::TreeUpdate,
     ) {
-        let mut focusables = Vec::new();
-        for (id, node) in &update.nodes {
-            let Some(kind) = focusable_kind(node.role()) else {
-                continue;
-            };
-            let Some(rect) = node.bounds() else {
-                continue;
-            };
-            // Skip zero-area and absurdly large nodes (full-page containers).
-            let (w, h) = (rect.width() as f32, rect.height() as f32);
-            if w <= 0.0 || h <= 0.0 {
-                continue;
-            }
-            focusables.push(Focusable {
-                id: id.0,
-                x: rect.x0 as f32,
-                y: rect.y0 as f32,
-                w,
-                h,
-                kind,
-            });
+        // Servo sends incremental updates (plus empty focus-only heartbeats),
+        // so the backend owns the accumulated map: upsert changed nodes,
+        // drop ids that arrive non-focusable, ignore empties, clear on
+        // navigate (see `apply_command`). Replaces the whole list each time
+        // flickered as pages streamed their trees in.
+        if update.nodes.is_empty() {
+            return;
         }
         let mut shared = self.shared.borrow_mut();
-        if shared.last_focusables != focusables {
-            shared.last_focusables = focusables.clone();
+        for (id, node) in &update.nodes {
+            match focusable_kind(node.role()).and_then(|kind| {
+                node.bounds().and_then(|rect| {
+                    let (w, h) = (rect.width() as f32, rect.height() as f32);
+                    (w > 0.0 && h > 0.0).then_some(Focusable {
+                        id: id.0,
+                        x: rect.x0 as f32,
+                        y: rect.y0 as f32,
+                        w,
+                        h,
+                        kind,
+                    })
+                })
+            }) {
+                Some(item) => {
+                    shared.focusables.insert(item.id, item);
+                }
+                None => {
+                    shared.focusables.remove(&id.0);
+                }
+            }
+        }
+        let mut focusables: Vec<Focusable> = shared.focusables.values().cloned().collect();
+        focusables.sort_by_key(|o| o.id);
+        if focusables != shared.last_emitted {
+            let sample = focusables
+                .first()
+                .map(|o| {
+                    format!(
+                        " first=({},{} {}x{})",
+                        o.x as i32, o.y as i32, o.w as i32, o.h as i32
+                    )
+                })
+                .unwrap_or_default();
             crate::platform::app_log::info(format!(
-                "servo-engine: a11y focusables={}",
+                "servo-engine: a11y focusables={}{sample}",
                 focusables.len()
             ));
+            shared.last_emitted = focusables.clone();
             shared.handle.emit(EngineEvent::A11yTree(focusables));
         }
     }
@@ -251,7 +276,8 @@ fn run(
         generation: 0,
         load_started_at: None,
         logged_first_frame: false,
-        last_focusables: Vec::new(),
+        focusables: std::collections::HashMap::new(),
+        last_emitted: Vec::new(),
         visible: false,
         suspended: true,
     }));
@@ -301,6 +327,13 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                     crate::platform::app_log::info(format!("servo-engine: navigate {url}"));
                     state.generation = generation;
                     state.load_started_at = Some(Instant::now());
+                    // Fresh page, fresh tree: drop the old page's nodes so
+                    // no stale outline survives the navigation.
+                    if !state.focusables.is_empty() {
+                        state.focusables.clear();
+                        state.last_emitted = Vec::new();
+                        state.handle.emit(EngineEvent::A11yTree(Vec::new()));
+                    }
                     state
                         .handle
                         .emit(EngineEvent::UrlChanged { url: url.clone() });
