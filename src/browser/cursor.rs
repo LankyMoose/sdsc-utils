@@ -389,6 +389,35 @@ mod tests {
     }
 
     #[test]
+    fn neutral_ticks_decay_velocity_so_reversal_is_immediate() {
+        // Regression: velocity used to freeze on neutral ticks (the UI
+        // skipped integration), so pushing left after releasing right kept
+        // drifting right until the stale velocity bled off.
+        let mut c = Cursor::new();
+        c.magnet = false;
+        for _ in 0..10 {
+            c.advance(1.0, 0.0, 0.016, &[]);
+        }
+        assert!(c.vx > 0.0);
+        let released_x = c.x;
+        // Neutral ticks: friction decays to a stop; glide carries forward
+        // while decaying, never reverses.
+        for _ in 0..120 {
+            c.advance(0.0, 0.0, 0.016, &[]);
+            assert!(c.x >= released_x - 0.001);
+        }
+        assert_eq!(c.vx, 0.0, "friction must fully settle");
+        let settled_x = c.x;
+        assert!(
+            settled_x > released_x,
+            "glide carries forward while decaying"
+        );
+        // Opposite push moves the correct way on the first tick.
+        c.advance(-1.0, 0.0, 0.016, &[]);
+        assert!(c.x < settled_x, "x={} settled={}", c.x, settled_x);
+    }
+
+    #[test]
     fn advance_respects_magnet_flag() {
         let mut c = Cursor::new();
         c.magnet = false;

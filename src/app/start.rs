@@ -718,8 +718,10 @@ impl App {
     }
 
     /// Per-poll analog layer for the engine browser: left stick moves the
-    /// virtual cursor (magnetic snap), right stick scrolls. No-op without an
-    /// engine (reader mode has edge-only input).
+    /// virtual cursor (magnetic snap), right stick scrolls. Runs on every
+    /// pad tick — including neutral ones — so friction always decays the
+    /// cursor velocity; otherwise a released stick would freeze mid-glide
+    /// and resume in the stale direction on the next push.
     pub(crate) fn tick_browser_cursor(
         &mut self,
         readings: &[start_input::NavReading],
@@ -729,15 +731,6 @@ impl App {
             return;
         };
         let sample = &reading.sample;
-        if sample.lstick_x == 0.0
-            && sample.lstick_y == 0.0
-            && sample.rstick_x == 0.0
-            && sample.rstick_y == 0.0
-        {
-            // Still stamp the clock so a later deflection starts clean.
-            self.start_state.browser.analog_at = Some(now);
-            return;
-        }
         let (dx, dy) = self.start_state.browser.advance_stick(
             sample.lstick_x,
             sample.lstick_y,

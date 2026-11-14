@@ -822,9 +822,11 @@ impl BrowserPanel {
     }
 
     /// Integrate one analog pad sample: left stick moves the cursor
-    /// (magnetic snap + glide when enabled), right stick scrolls. Returns
-    /// the scroll delta in page pixels for this step; `dt` is clamped so
-    /// background gaps cannot teleport either axis.
+    /// (magnetic snap + glide when enabled), right stick scrolls. Runs every
+    /// tick, including neutral ones, so friction and glide converge even
+    /// with no deflection — a released stick must decay, not freeze.
+    /// Returns the scroll delta in page pixels for this step; `dt` is
+    /// clamped so background gaps cannot teleport either axis.
     pub fn advance_stick(
         &mut self,
         lx: f32,
@@ -839,9 +841,7 @@ impl BrowserPanel {
             .map(|t| now.saturating_duration_since(t).as_secs_f32().min(0.1))
             .unwrap_or(0.0);
         self.analog_at = Some(now);
-        if lx != 0.0 || ly != 0.0 {
-            self.cursor.advance(lx, ly, dt, &self.focusables);
-        }
+        self.cursor.advance(lx, ly, dt, &self.focusables);
         (rx * SCROLL_SPEED * dt, ry * SCROLL_SPEED * dt)
     }
 
