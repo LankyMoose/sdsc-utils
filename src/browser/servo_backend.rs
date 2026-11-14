@@ -255,8 +255,9 @@ impl WebViewDelegate for Delegate {
                     .flat_map(|s| s.chars().take(40))
                     .collect();
                 crate::platform::app_log::info(format!(
-                    "servo-ax node id={id:?} role={:?} bounds={b} verdict={verdict} name={name:?}",
-                    node.role(),
+                    "servo-ax node id={id:?} role={role:?} bounds={b} kids={kids} verdict={verdict} name={name:?}",
+                    role = node.role(),
+                    kids = node.children().len(),
                 ));
             }
         }
