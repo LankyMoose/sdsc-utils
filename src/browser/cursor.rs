@@ -30,9 +30,10 @@ pub enum FocusKind {
     Other,
 }
 
-/// Snap radius in page pixels: magnetism only engages this close to a
-/// focusable. Outside it the stick drives free-form.
-pub const SNAP_RADIUS: f32 = 100.0;
+/// Gravity radius in page pixels: magnetism only pulls this close to a
+/// focusable. Outside it the stick drives free-form. Halved from 100: the
+/// old range grabbed across unrelated links.
+pub const SNAP_RADIUS: f32 = 50.0;
 /// D-pad nudge step in page pixels.
 pub const NUDGE_STEP: f32 = 32.0;
 /// Left-stick cursor acceleration at full deflection, px/s^2.
@@ -40,13 +41,21 @@ pub const CURSOR_ACCEL: f32 = 7000.0;
 /// Left-stick cursor top speed, px/s.
 pub const CURSOR_MAX_SPEED: f32 = 1400.0;
 /// Velocity decay rate (exponential friction, per second). The cursor glides
-/// a little after release instead of stopping dead.
-pub const CURSOR_FRICTION: f32 = 7.0;
+/// a little after release instead of stopping dead. Doubled from 7: the old
+/// value felt slippery and let the magnet yank at high speed.
+pub const CURSOR_FRICTION: f32 = 14.0;
 /// Magnetic pull cap, as acceleration: exactly one quarter of stick
 /// thrust, so holding the stick past ~25% deflection always overpowers the
 /// magnet at any range, while lighter touches get captured. Falls off
 /// linearly to zero at the snap radius edge.
 pub const PULL_MAX_ACCEL: f32 = CURSOR_ACCEL * 0.25;
+/// Dock entry/exit pads in page pixels: the outline engages when the point
+/// enters an element's rect + ACQUIRE_PAD and holds until it leaves +
+/// HOLD_PAD, so edge dither never flickers the wrap. Gravity (SNAP_RADIUS)
+/// reaches further than the outline — the dot visibly glides in and the
+/// wrap only pops once it actually arrives.
+pub const ACQUIRE_PAD: f32 = 8.0;
+pub const HOLD_PAD: f32 = 24.0;
 /// Right-stick scroll speed at full deflection, px/s.
 pub const SCROLL_SPEED: f32 = 1500.0;
 /// Engine viewport the cursor space matches (see `servo_backend`).
@@ -111,22 +120,19 @@ impl Cursor {
             (self.vx + lx * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
         self.vy =
             (self.vy + ly * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
-        if self.magnet {
-            if let Some((id, tx, ty, edge, clen)) = Self::nearest_within(self.x, self.y, options) {
-                self.attached = Some(id);
-                // Gravity, not teleport: pull toward the element center with
-                // a magnitude that falls off to zero at the snap radius
-                // edge. Direction normalizes by *center* distance — the edge
-                // distance drives the falloff only. (Normalizing by the edge
-                // distance inflated the pull up to 6x when the cursor sat
-                // just outside a rect, which read as an instant snap.)
-                if clen > 0.5 {
-                    let strength = PULL_MAX_ACCEL * (1.0 - edge / SNAP_RADIUS);
-                    self.vx += ((tx - self.x) / clen) * strength * dt_secs;
-                    self.vy += ((ty - self.y) / clen) * strength * dt_secs;
-                }
-            } else {
-                self.attached = None;
+        if self.magnet
+            && let Some((_, tx, ty, edge, clen)) = Self::nearest_within(self.x, self.y, options)
+        {
+            // Gravity, not teleport: pull toward the element center with
+            // a magnitude that falls off quadratically to zero at the
+            // snap radius edge — soft capture from afar, firm center.
+            // Direction normalizes by *center* distance; the edge
+            // distance drives the falloff only.
+            if clen > 0.5 {
+                let fall = (1.0 - edge / SNAP_RADIUS).max(0.0);
+                let strength = PULL_MAX_ACCEL * fall * fall;
+                self.vx += ((tx - self.x) / clen) * strength * dt_secs;
+                self.vy += ((ty - self.y) / clen) * strength * dt_secs;
             }
         }
         let damp = (-CURSOR_FRICTION * dt_secs).exp();
@@ -141,6 +147,11 @@ impl Cursor {
         if self.vx != 0.0 || self.vy != 0.0 {
             self.x = (self.x + self.vx * dt_secs).clamp(0.0, VIEWPORT_W);
             self.y = (self.y + self.vy * dt_secs).clamp(0.0, VIEWPORT_H);
+        }
+        // Docking is arrival-based (see `snap`): the outline only engages
+        // once the gliding point actually reaches an element.
+        if self.magnet {
+            self.snap(options);
         }
     }
 
@@ -233,20 +244,26 @@ impl Cursor {
         }
     }
 
-    /// Attach when the free point rests near an element. Keeps the current
-    /// attachment while the point stays inside its expanded bounds.
+    /// Dock when the point actually arrives: attach to the nearest element
+    /// whose rect (expanded by [`ACQUIRE_PAD`]) contains the point. Holding
+    /// is stickier than acquiring ([`HOLD_PAD`]) so edge dither never
+    /// flickers the outline. Gravity reaches further than the outline — the
+    /// dot visibly glides in before the wrap pops.
     pub fn snap(&mut self, options: &[Focusable]) {
         if let Some(id) = self.attached
             && let Some(item) = options.iter().find(|o| o.id == id)
-            && self.inside_expanded(item, SNAP_RADIUS)
+            && self.inside_expanded(item, HOLD_PAD)
         {
             return;
         }
         self.attached = None;
         let mut best: Option<(u64, f32)> = None;
         for item in options {
-            let d = self.edge_distance(item);
-            if d <= SNAP_RADIUS && best.is_none_or(|(_, bd)| d < bd) {
+            if !self.inside_expanded(item, ACQUIRE_PAD) {
+                continue;
+            }
+            let d = (item.x + item.w / 2.0 - self.x).hypot(item.y + item.h / 2.0 - self.y);
+            if best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((item.id, d));
             }
         }
@@ -263,12 +280,16 @@ impl Cursor {
         }
     }
 
-    /// Point to click: attached element center, else the free cursor.
+    /// Point to click: attached element center; else the gravity well's
+    /// center while falling in; else the free cursor.
     pub fn click_point(&self, options: &[Focusable]) -> (f32, f32) {
         if let Some(id) = self.attached
             && let Some(item) = options.iter().find(|o| o.id == id)
         {
             return (item.x + item.w / 2.0, item.y + item.h / 2.0);
+        }
+        if let Some((_, tx, ty, _, _)) = Self::nearest_within(self.x, self.y, options) {
+            return (tx, ty);
         }
         (self.x, self.y)
     }
@@ -299,24 +320,6 @@ impl Cursor {
             && self.x <= item.x + item.w + pad
             && self.y >= item.y - pad
             && self.y <= item.y + item.h + pad
-    }
-
-    fn edge_distance(&self, item: &Focusable) -> f32 {
-        let dx = if self.x < item.x {
-            item.x - self.x
-        } else if self.x > item.x + item.w {
-            self.x - (item.x + item.w)
-        } else {
-            0.0
-        };
-        let dy = if self.y < item.y {
-            item.y - self.y
-        } else if self.y > item.y + item.h {
-            self.y - (item.y + item.h)
-        } else {
-            0.0
-        };
-        dx.hypot(dy)
     }
 }
 
@@ -366,7 +369,8 @@ mod tests {
     fn snap_picks_nearest_on_overlap() {
         let mut c = Cursor::new();
         let items = [link(1, 100.0, 100.0), link(2, 140.0, 100.0)];
-        c.x = 235.0;
+        // Inside both rects (+pad): docks the nearer center (190 vs 150).
+        c.x = 180.0;
         c.y = 115.0;
         c.snap(&items);
         assert_eq!(c.attached, Some(2));
@@ -463,35 +467,37 @@ mod tests {
     }
 
     #[test]
-    fn magnet_on_glides_toward_dock() {
+    fn dock_requires_arrival_outline_follows_glide() {
+        // 10px outside the rect: gravity well captured, but no outline yet.
         let mut c = Cursor::new();
         let items = [link(1, 100.0, 100.0)];
-        c.x = 150.0;
+        c.x = 210.0;
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, None, "outline pops on arrival, not on entry");
+        assert_eq!(c.click_point(&items), (150.0, 115.0));
+        // Neutral ticks: the point glides in and docks on arrival.
+        for _ in 0..120 {
+            c.advance(0.0, 0.0, 0.016, &items);
+            if c.attached.is_some() {
+                break;
+            }
+        }
         assert_eq!(c.attached, Some(1));
-        let before = (150.0 - c.x).abs();
-        c.advance(0.0, 0.0, 0.05, &items);
-        // Center is (150, 115): already centered, stays put.
-        assert!((c.x - 150.0).abs() <= before);
-        // From the edge: glides inward.
-        c.x = 210.0;
-        c.attached = None;
-        c.advance(0.0, 0.0, 0.05, &items);
-        assert_eq!(c.attached, Some(1));
-        assert!(c.x < 210.0);
+        assert!(c.x <= 208.0, "docked inside acquire pad, x={}", c.x);
     }
 
     #[test]
     fn magnet_pull_is_gradual_not_a_teleport() {
         // 60px from center, 10px outside the rect edge: one 16ms tick must
-        // drift slightly inward, not jump to the center.
+        // drift slightly inward, never jump to the center — and the outline
+        // stays off until arrival.
         let mut c = Cursor::new();
         let items = [link(1, 100.0, 100.0)];
         c.x = 210.0;
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
-        assert_eq!(c.attached, Some(1));
+        assert_eq!(c.attached, None);
         assert!(c.x < 210.0 && c.x > 200.0, "glides, not snaps: x={}", c.x);
     }
 
@@ -504,15 +510,12 @@ mod tests {
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1));
-        // Full deflection away: eventually leaves the snap radius.
+        // Full deflection away: breaks the hold, then outruns the well.
         for _ in 0..120 {
             c.advance(1.0, 0.0, 0.016, &items);
-            if c.attached.is_none() {
-                break;
-            }
         }
         assert_eq!(c.attached, None, "full stick must escape the magnet");
-        assert!(c.x > 250.0, "escaped outward, x={}", c.x);
+        assert!(c.x > 250.0, "escaped past the gravity radius, x={}", c.x);
     }
 
     #[test]
@@ -541,8 +544,24 @@ mod tests {
         c.y = 210.0;
         c.snap(&items);
         assert_eq!(c.click_point(&items), (150.0, 215.0));
-        c.attached = None;
-        assert_eq!(c.click_point(&items), (110.0, 210.0));
+    }
+
+    #[test]
+    fn click_point_uses_well_before_dock_then_free_point() {
+        // Falling into the well but outside the acquire pad: click aims at
+        // the well center so X stays useful during the approach.
+        let mut c = Cursor::new();
+        let items = [link(7, 100.0, 200.0)];
+        c.x = 240.0;
+        c.y = 215.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, None);
+        assert_eq!(c.click_point(&items), (150.0, 215.0));
+        // Nothing in range: the free point.
+        c.x = 500.0;
+        c.y = 500.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.click_point(&items), (500.0, 500.0));
     }
 
     #[test]

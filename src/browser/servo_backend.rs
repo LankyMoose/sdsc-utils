@@ -145,17 +145,29 @@ impl WebViewDelegate for Delegate {
         }
         let mut shared = self.shared.borrow_mut();
         for (id, node) in &update.nodes {
-            match focusable_kind(node.role()).and_then(|kind| {
+            // Role-typed actionables, plus anything Servo marks clickable
+            // (Click action): div-buttons, image links, custom controls.
+            let kind = focusable_kind(node.role()).or_else(|| {
+                node.supports_action(servo::accesskit::Action::Click)
+                    .then_some(FocusKind::Other)
+            });
+            match kind.and_then(|kind| {
                 node.bounds().and_then(|rect| {
                     let (w, h) = (rect.width() as f32, rect.height() as f32);
-                    (w > 0.0 && h > 0.0).then_some(Focusable {
-                        id: id.0,
-                        x: rect.x0 as f32,
-                        y: rect.y0 as f32,
-                        w,
-                        h,
-                        kind,
-                    })
+                    // Non-zero area and smaller than the viewport: a
+                    // full-page click listener is not a snap target.
+                    (w > 0.0
+                        && h > 0.0
+                        && w <= VIEWPORT_WIDTH as f32
+                        && h <= VIEWPORT_HEIGHT as f32)
+                        .then_some(Focusable {
+                            id: id.0,
+                            x: rect.x0 as f32,
+                            y: rect.y0 as f32,
+                            w,
+                            h,
+                            kind,
+                        })
                 })
             }) {
                 Some(item) => {
@@ -188,20 +200,47 @@ impl WebViewDelegate for Delegate {
     }
 }
 
-/// Actionable accesskit roles, mapped to cursor kinds. Everything else is
-/// not worth a magnet (static text, containers, images without actions).
+/// Actionable accesskit roles, mapped to cursor kinds. Covers every HTML
+/// input type (each is its own role: password, email, textarea, ...) plus
+/// buttons of all flavors. Clickable-but-untyped nodes (div-buttons, image
+/// links) fall through to the Click-action check at the call site.
+/// Everything else is not worth a magnet (static text, plain containers,
+// images without actions).
 fn focusable_kind(role: servo::accesskit::Role) -> Option<FocusKind> {
     use servo::accesskit::Role;
     match role {
-        Role::Link => Some(FocusKind::Link),
+        Role::Link | Role::DocBackLink => Some(FocusKind::Link),
         Role::Button
+        | Role::DefaultButton
         | Role::CheckBox
         | Role::RadioButton
         | Role::Switch
         | Role::MenuItem
+        | Role::MenuItemCheckBox
+        | Role::MenuItemRadio
+        | Role::MenuListOption
         | Role::Tab
-        | Role::ListBoxOption => Some(FocusKind::Button),
-        Role::TextInput | Role::SearchInput | Role::ComboBox => Some(FocusKind::Field),
+        | Role::ListBoxOption
+        | Role::TreeItem
+        | Role::DisclosureTriangle
+        | Role::ColorWell
+        | Role::Slider
+        | Role::SpinButton => Some(FocusKind::Button),
+        Role::TextInput
+        | Role::MultilineTextInput
+        | Role::SearchInput
+        | Role::PasswordInput
+        | Role::EmailInput
+        | Role::NumberInput
+        | Role::UrlInput
+        | Role::PhoneNumberInput
+        | Role::DateInput
+        | Role::DateTimeInput
+        | Role::TimeInput
+        | Role::MonthInput
+        | Role::WeekInput
+        | Role::ComboBox
+        | Role::EditableComboBox => Some(FocusKind::Field),
         _ => None,
     }
 }
@@ -329,11 +368,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                     state.load_started_at = Some(Instant::now());
                     // Fresh page, fresh tree: drop the old page's nodes so
                     // no stale outline survives the navigation.
-                    if !state.focusables.is_empty() {
-                        state.focusables.clear();
-                        state.last_emitted = Vec::new();
-                        state.handle.emit(EngineEvent::A11yTree(Vec::new()));
-                    }
+                    clear_tree(&mut state);
                     state
                         .handle
                         .emit(EngineEvent::UrlChanged { url: url.clone() });
@@ -349,7 +384,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             }
         }
         EngineCommand::ScrollBy { dx, dy } => {
-            let state = shared.borrow();
+            let mut state = shared.borrow_mut();
             if state.suspended {
                 return;
             }
@@ -358,6 +393,14 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                 Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(dx, dy))),
                 WebViewPoint::Device(DevicePoint::new(w as f32 / 2.0, h as f32 / 2.0)),
             );
+            // Destructure the reborrow so the two maps borrow disjointly
+            // (`RefMut` field borrows don't split on their own).
+            let Shared {
+                focusables,
+                last_emitted,
+                ..
+            } = &mut *state;
+            shift_tree(focusables, last_emitted, dx, dy);
         }
         EngineCommand::Key(event) => {
             if shared.borrow().suspended {
@@ -369,14 +412,21 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             webview.notify_theme_change(if dark { Theme::Dark } else { Theme::Light });
         }
         EngineCommand::GoBack => {
-            if !shared.borrow().suspended {
-                webview.go_back(1);
+            let mut state = shared.borrow_mut();
+            if state.suspended {
+                return;
             }
+            // History travel swaps the document: same staleness as navigate.
+            clear_tree(&mut state);
+            webview.go_back(1);
         }
         EngineCommand::GoForward => {
-            if !shared.borrow().suspended {
-                webview.go_forward(1);
+            let mut state = shared.borrow_mut();
+            if state.suspended {
+                return;
             }
+            clear_tree(&mut state);
+            webview.go_forward(1);
         }
         EngineCommand::ClickAt { x, y } => {
             if shared.borrow().suspended {
@@ -420,6 +470,41 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
     }
 }
 
+/// Drop the accumulated tree (fresh page, history travel): stale outlines
+/// must never survive a document change.
+fn clear_tree(state: &mut Shared) {
+    if state.focusables.is_empty() {
+        return;
+    }
+    state.focusables.clear();
+    state.last_emitted = Vec::new();
+    state.handle.emit(EngineEvent::A11yTree(Vec::new()));
+}
+
+/// Shift cached rects by a commanded scroll: Servo reports bounds in
+/// viewport coordinates but only re-emits changed nodes, so without this
+/// the whole tree lags one scroll behind. Map and diff-baseline shift
+/// together. Clamp drift (hitting top/bottom) and page-driven scrolls
+/// self-heal on the next tree update.
+fn shift_tree(
+    focusables: &mut std::collections::HashMap<u64, Focusable>,
+    last_emitted: &mut [Focusable],
+    dx: f32,
+    dy: f32,
+) {
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    for item in focusables.values_mut() {
+        item.x -= dx;
+        item.y -= dy;
+    }
+    for item in last_emitted.iter_mut() {
+        item.x -= dx;
+        item.y -= dy;
+    }
+}
+
 /// Fail loads that never complete so the UI never spins forever.
 fn check_load_timeout(shared: &Rc<RefCell<Shared>>) {
     let mut state = shared.borrow_mut();
@@ -435,4 +520,33 @@ fn check_load_timeout(shared: &Rc<RefCell<Shared>>) {
         generation,
         result: Err("load timed out".to_string()),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn item(id: u64, x: f32, y: f32) -> Focusable {
+        Focusable {
+            id,
+            x,
+            y,
+            w: 100.0,
+            h: 30.0,
+            kind: FocusKind::Link,
+        }
+    }
+
+    #[test]
+    fn scroll_shifts_cache_and_baseline_together() {
+        let mut map: HashMap<u64, Focusable> = [(1, item(1, 100.0, 200.0))].into_iter().collect();
+        let mut last = vec![item(1, 100.0, 200.0)];
+        shift_tree(&mut map, &mut last, 0.0, 240.0);
+        assert_eq!((map[&1].x, map[&1].y), (100.0, -40.0));
+        assert_eq!((last[0].x, last[0].y), (100.0, -40.0));
+        // No-op scroll leaves everything untouched.
+        shift_tree(&mut map, &mut last, 0.0, 0.0);
+        assert_eq!((map[&1].x, map[&1].y), (100.0, -40.0));
+    }
 }
