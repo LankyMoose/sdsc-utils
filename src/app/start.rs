@@ -757,6 +757,54 @@ impl App {
         Task::none()
     }
 
+    /// Debug-only frame shot: every 5s while the browser overlay is on, dump
+    /// the engine pixels to `shots/` under the data dir and log a correlator
+    /// (cursor, dock, target count, backend scroll offset). Encode + write
+    /// happen on a throwaway thread so the UI never hitches on disk I/O.
+    #[cfg(debug_assertions)]
+    fn maybe_shot_browser_frame(&mut self, frame: &crate::browser::engine::PageFrame) {
+        if !self.debug_browser {
+            return;
+        }
+        let now = Instant::now();
+        let panel = &mut self.start_state.browser;
+        if panel
+            .last_shot
+            .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(5))
+        {
+            return;
+        }
+        panel.last_shot = Some(now);
+        let (w, h) = (frame.width, frame.height);
+        let rgba = frame.rgba.clone();
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let cursor = (panel.cursor.x, panel.cursor.y);
+        let magnet = panel.cursor.magnet;
+        let dock = panel.cursor.attached;
+        let wells = panel.focusables.len();
+        let scroll = panel.scroll_offset;
+        std::thread::spawn(move || {
+            let dir = crate::persist::paths::data_dir().join("shots");
+            if std::fs::create_dir_all(&dir).is_err() {
+                return;
+            }
+            let path = dir.join(format!("shot-{ms}.png"));
+            if image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8).is_ok() {
+                app_log::info(format!(
+                    "shot saved path={} cursor=({:.0},{:.0}) magnet={magnet} dock={dock:?} wells={wells} scroll=({:.0},{:.0})",
+                    path.display(),
+                    cursor.0,
+                    cursor.1,
+                    scroll.0,
+                    scroll.1,
+                ));
+            }
+        });
+    }
+
     /// Pad/keyboard body scroll for the reader browser (engine mode scrolls
     /// via [`Self::tick_browser_cursor`] instead). With engine
     /// pixels on screen the scroll goes to the engine (which repaints);
@@ -786,6 +834,8 @@ impl App {
                 if !self.start_state.browser.session.is_open() {
                     return Task::none();
                 }
+                #[cfg(debug_assertions)]
+                self.maybe_shot_browser_frame(&frame);
                 self.start_state.browser.session.set_frame(
                     crate::browser::BrowserFrame::from_rgba(frame.width, frame.height, frame.rgba),
                 );
@@ -803,6 +853,9 @@ impl App {
                     .browser
                     .cursor
                     .retarget(&self.start_state.browser.focusables);
+            }
+            EngineEvent::ScrollOffset { x, y } => {
+                self.start_state.browser.scroll_offset = (x, y);
             }
             EngineEvent::LoadFinished { generation, result } => match result {
                 Ok(()) => {

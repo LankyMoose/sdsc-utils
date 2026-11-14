@@ -68,6 +68,13 @@ pub enum EngineEvent {
     /// Fresh focusable set from the accessibility tree. The UI re-snaps the
     /// cursor and drops stale attachments.
     A11yTree(Vec<crate::browser::cursor::Focusable>),
+    /// Viewport scroll offset the backend translated the current tree with
+    /// (document-space bounds minus this). Emitted when it changes so the
+    /// debug overlay can correlate cursor against targets.
+    ScrollOffset {
+        x: f32,
+        y: f32,
+    },
     LoadFinished {
         generation: u64,
         result: Result<(), String>,

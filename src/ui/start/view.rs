@@ -792,6 +792,14 @@ pub struct BrowserPanel {
     pub focusables: Vec<crate::browser::cursor::Focusable>,
     /// Last analog integrate step (None until the first pad sample).
     pub analog_at: Option<Instant>,
+    /// Viewport scroll offset the backend translated the tree with
+    /// (`EngineEvent::ScrollOffset`). Debug overlay + shot correlation.
+    pub scroll_offset: (f32, f32),
+    /// Last debug frame-shot time (5s cadence while the overlay is on).
+    pub last_shot: Option<Instant>,
+    /// Browser debug overlay + shots (Diagnostics toggle / F10, mirrored
+    /// from App). Never persisted.
+    pub debug_overlay: bool,
 }
 
 impl BrowserPanel {
@@ -967,6 +975,34 @@ pub fn browser_page_view(state: &State, img_w: f32) -> Element<'_, StartMessage>
     .into()
 }
 
+/// Debug-only correlator line under the page (Diagnostics toggle / F10):
+/// cursor point, magnet, dock target, well count, backend scroll offset.
+/// Empty when the overlay is off so the card layout never shifts.
+fn browser_debug_line(panel: &BrowserPanel) -> Element<'_, StartMessage> {
+    if !panel.debug_overlay {
+        return space().height(Length::Fixed(0.0)).into();
+    }
+    let dock = match panel.cursor.attached {
+        Some(id) => match panel.focusables.iter().find(|o| o.id == id) {
+            Some(o) => format!("#{id}/{:?}", o.kind),
+            None => format!("#{id}/stale"),
+        },
+        None => "free".to_string(),
+    };
+    text(format!(
+        "cursor ({:.0},{:.0}) magnet {} dock {dock} wells {} scroll ({:.0},{:.0})",
+        panel.cursor.x,
+        panel.cursor.y,
+        if panel.cursor.magnet { "on" } else { "off" },
+        panel.focusables.len(),
+        panel.scroll_offset.0,
+        panel.scroll_offset.1,
+    ))
+    .size(11.0)
+    .color(theme::MUTED)
+    .into()
+}
+
 /// In-Start browser card: URL row, page, reload / external / close
 /// actions. Sized by the caller (near-full-bleed; see `immersive::view`),
 /// so the root column fills its card.
@@ -1010,6 +1046,7 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         .align_y(Alignment::Center),
         space().height(8),
         browser_page_view(state, img_w),
+        browser_debug_line(panel),
         space().height(8),
         row![
             button(text("Reload").size(14.0))

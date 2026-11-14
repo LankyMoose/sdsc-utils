@@ -228,6 +228,10 @@ pub enum Message {
     /// Debug-only: flip the layout-bounding-box overlay (Diagnostics toggle or F9).
     #[cfg(debug_assertions)]
     ToggleDebugLayoutBounds,
+    /// Debug-only: browser target overlay + frame shots (Diagnostics toggle
+    /// or F10). Mirrored into the Start browser panel for the card readout.
+    #[cfg(debug_assertions)]
+    ToggleDebugBrowser,
 
     PlaceToast {
         id: window::Id,
@@ -322,6 +326,8 @@ impl Message {
             Message::DebugOpen(_) => true,
             #[cfg(debug_assertions)]
             Message::ToggleDebugLayoutBounds => true,
+            #[cfg(debug_assertions)]
+            Message::ToggleDebugBrowser => true,
             Message::PlaceToast { .. }
             | Message::ToastShown { .. }
             | Message::ToastFrame
@@ -420,6 +426,10 @@ pub struct App {
     /// state: never persisted.
     #[cfg(debug_assertions)]
     pub debug_layout_bounds: bool,
+    /// Debug-only browser overlay + frame shots (Diagnostics toggle / F10).
+    /// Local UI state: never persisted. Mirrored into the browser panel.
+    #[cfg(debug_assertions)]
+    pub debug_browser: bool,
     /// Debug-only ambient pulse + ken-burns tuning (Diagnostics sliders).
     /// Local UI state: never persisted; defaults
     /// reproduce release visuals. Mirrored into the process-wide tuning
@@ -763,6 +773,8 @@ impl App {
             #[cfg(debug_assertions)]
             debug_layout_bounds: false,
             #[cfg(debug_assertions)]
+            debug_browser: false,
+            #[cfg(debug_assertions)]
             debug_ambient_freq: debug_tune.pulse_freq,
             #[cfg(debug_assertions)]
             debug_ambient_veil_freq: debug_tune.veil_freq,
@@ -1062,6 +1074,10 @@ impl App {
                     if key == keyboard::Key::Named(keyboard::key::Named::F9) {
                         return Some(Message::ToggleDebugLayoutBounds);
                     }
+                    #[cfg(debug_assertions)]
+                    if key == keyboard::Key::Named(keyboard::key::Named::F10) {
+                        return Some(Message::ToggleDebugBrowser);
+                    }
                     Some(Message::BrowserRawKey {
                         id,
                         key: RawKey {
@@ -1259,6 +1275,8 @@ impl App {
                 #[cfg(debug_assertions)]
                 self.debug_layout_bounds,
                 #[cfg(debug_assertions)]
+                self.debug_browser,
+                #[cfg(debug_assertions)]
                 &debug_tune,
             )
             .map(Message::Configure);
@@ -1382,6 +1400,12 @@ impl App {
             #[cfg(debug_assertions)]
             Message::ToggleDebugLayoutBounds => {
                 self.debug_layout_bounds = !self.debug_layout_bounds;
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            Message::ToggleDebugBrowser => {
+                self.debug_browser = !self.debug_browser;
+                self.start_state.browser.debug_overlay = self.debug_browser;
                 Task::none()
             }
             #[cfg(debug_assertions)]

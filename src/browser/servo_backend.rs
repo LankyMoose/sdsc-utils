@@ -75,11 +75,14 @@ struct Shared {
     suspended: bool,
     /// Commanded scroll offset, page pixels. Servo reports document-relative
     /// bounds and never re-emits them on scroll, so the backend translates
-    /// to viewport space at emit time. Reset on fresh navigate (new document
-    /// starts at top); kept across history travel, which usually restores
-    /// the previous position. Page-driven scrolls (anchors, JS) are
-    /// invisible to us and self-heal only via fresh bounds — a known gap.
+    /// to viewport space at emit time. Reset on fresh navigate and on
+    /// history travel — session history does not reliably restore the
+    /// offset, and a stale value misplaces every outline (observed). Page-
+    /// driven scrolls (anchors, JS) are invisible to us and self-heal only
+    /// via fresh bounds — a known gap.
     scroll: (f32, f32),
+    /// Last scroll offset sent to the UI (diffed like the tree).
+    last_sent_scroll: (f32, f32),
     /// Verbose per-node AX diagnostics (`SDSC_AX_DEBUG=1`): role, bounds,
     /// and keep/drop verdict for every node in each tree update.
     ax_debug: bool,
@@ -343,6 +346,7 @@ fn run(
         visible: false,
         suspended: true,
         scroll: (0.0, 0.0),
+        last_sent_scroll: (0.0, 0.0),
         ax_debug: std::env::var("SDSC_AX_DEBUG").is_ok(),
     }));
     let webview = WebViewBuilder::new(&servo, ctx.clone())
@@ -393,7 +397,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                     state.load_started_at = Some(Instant::now());
                     // Fresh page, fresh tree, zero scroll: drops the old
                     // page's nodes so no stale outline survives.
-                    state.scroll = (0.0, 0.0);
+                    set_scroll(&mut state, (0.0, 0.0));
                     clear_tree(&mut state);
                     state
                         .handle
@@ -424,8 +428,8 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             // rects so outlines track the page. `try_send` + subscription
             // conflation absorb held-stick bursts; the emit itself stays
             // silent unless nodes join/leave (see `emit_tree`).
-            state.scroll.0 += dx;
-            state.scroll.1 += dy;
+            let (sx, sy) = state.scroll;
+            set_scroll(&mut state, (sx + dx, sy + dy));
             emit_tree(&mut state);
         }
         EngineCommand::Key(event) => {
@@ -442,7 +446,10 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             if state.suspended {
                 return;
             }
-            // History travel swaps the document: same staleness as navigate.
+            // History travel swaps the document: same staleness as navigate,
+            // and the offset does not reliably restore — reset it, or every
+            // translated outline lands wrong.
+            set_scroll(&mut state, (0.0, 0.0));
             clear_tree(&mut state);
             webview.go_back(1);
         }
@@ -451,6 +458,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             if state.suspended {
                 return;
             }
+            set_scroll(&mut state, (0.0, 0.0));
             clear_tree(&mut state);
             webview.go_forward(1);
         }
@@ -527,6 +535,20 @@ fn translate_tree(
         .collect();
     out.sort_by_key(|o| o.id);
     out
+}
+
+/// Update the tracked scroll offset and report it when it moves, so the UI
+/// overlay can correlate cursor against targets.
+fn set_scroll(state: &mut Shared, scroll: (f32, f32)) {
+    if state.scroll == scroll {
+        return;
+    }
+    state.scroll = scroll;
+    state.last_sent_scroll = scroll;
+    state.handle.emit(EngineEvent::ScrollOffset {
+        x: scroll.0,
+        y: scroll.1,
+    });
 }
 
 /// Diff + publish the translated tree. Logs only when the set size changes
