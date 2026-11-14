@@ -744,16 +744,8 @@ impl App {
         // Dock-triggered shot: capture the exact pixels the fresh wrap sits
         // on (throttled; the 5s cadence rarely coincides with a dock).
         #[cfg(debug_assertions)]
-        if self.debug_browser
-            && !was_docked
-            && self.start_state.browser.cursor.attached.is_some()
-            && self
-                .start_state
-                .browser
-                .last_shot
-                .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(2))
-        {
-            self.start_state.browser.shot_on_dock = true;
+        if self.debug_browser && !was_docked && self.start_state.browser.cursor.attached.is_some() {
+            self.start_state.browser.last_dock_change = Some(now);
         }
         if (dx != 0.0 || dy != 0.0)
             && let Some(engine) = &self.engine
@@ -787,8 +779,14 @@ impl App {
         }
         let now = Instant::now();
         let panel = &mut self.start_state.browser;
-        let on_dock = std::mem::replace(&mut panel.shot_on_dock, false);
-        if !on_dock
+        // A fresh dock shoots once it settles (~300ms for the morph to
+        // complete); the 5s cadence covers everything else.
+        let settled_dock = panel.cursor.attached.is_some()
+            && panel.last_dock_change.is_some_and(|t| {
+                now.saturating_duration_since(t) >= Duration::from_millis(300)
+                    && panel.last_shot.is_none_or(|s| s < t)
+            });
+        if !settled_dock
             && panel
                 .last_shot
                 .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(5))
@@ -811,6 +809,7 @@ impl App {
         let cursor = (panel.cursor.x, panel.cursor.y);
         let magnet = panel.cursor.magnet;
         let dock = panel.cursor.attached;
+        let blend = panel.cursor.dock_blend;
         let rect = panel
             .cursor
             .attached_rect(&panel.focusables)
@@ -834,7 +833,7 @@ impl App {
             let path = dir.join(format!("shot-{ms}.png"));
             match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
                 Ok(()) => app_log::info(format!(
-                    "shot saved path={} size={w}x{h} scale={scale} cursor=({:.0},{:.0}) magnet={magnet} dock={dock:?} rect={rect} wells={wells} scroll=({:.0},{:.0})",
+                    "shot saved path={} size={w}x{h} scale={scale} cursor=({:.0},{:.0}) magnet={magnet} dock={dock:?} blend={blend:.2} rect={rect} wells={wells} scroll=({:.0},{:.0})",
                     path.display(),
                     cursor.0,
                     cursor.1,

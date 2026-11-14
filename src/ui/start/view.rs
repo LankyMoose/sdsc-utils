@@ -800,9 +800,11 @@ pub struct BrowserPanel {
     pub scroll_offset: (f32, f32),
     /// Last debug frame-shot time (5s cadence while the overlay is on).
     pub last_shot: Option<Instant>,
-    /// Save the next frame immediately (fresh dock while the overlay is on).
-    /// Cleared when the shot fires, so bursts of re-docks stay throttled.
-    pub shot_on_dock: bool,
+    /// Last dock transition (None→Some) wall-clock, for settled dock shots.
+    /// Dock-triggered shots wait ~300ms so the morph completes first —
+    /// shooting on the dock tick only ever captures a half-morphed wrap
+    /// and reads as a misplaced outline.
+    pub last_dock_change: Option<Instant>,
     /// Browser debug overlay + shots (Diagnostics toggle / F10, mirrored
     /// from App). Never persisted.
     pub debug_overlay: bool,
@@ -924,10 +926,14 @@ fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, 
     .spacing(0)
     .into();
     // F10 coverage view: one thin ring per snap target, colored by kind.
-    // Viewport-clamped (offscreen boxes are skipped; partial ones shrink
-    // to the visible part) so every drawn ring sits exactly on pixels.
+    // The stack is explicitly full-card: it sizes to its first child
+    // (the cursor-sized morph layer) by default, which would clip every
+    // layer beyond the cursor. Viewport-clamped boxes are skipped when
+    // fully offscreen, shrunk when partial.
     let body: Element<'_, StartMessage> = if panel.debug_overlay {
-        let mut overlay = stack![morph];
+        let mut overlay = stack![morph]
+            .width(Length::Fixed(img_w))
+            .height(Length::Fixed(img_h));
         for f in &panel.focusables {
             let (mut bx, mut by) = (f.x * scale, f.y * scale);
             let (mut bw, mut bh) = ((f.w * scale).max(3.0), (f.h * scale).max(3.0));
@@ -1027,10 +1033,11 @@ fn browser_debug_line(panel: &BrowserPanel) -> Element<'_, StartMessage> {
         None => "free".to_string(),
     };
     text(format!(
-        "cursor ({:.0},{:.0}) magnet {} dock {dock} wells {} scroll ({:.0},{:.0})",
+        "cursor ({:.0},{:.0}) magnet {} dock {dock} blend {:.2} wells {} scroll ({:.0},{:.0})",
         panel.cursor.x,
         panel.cursor.y,
         if panel.cursor.magnet { "on" } else { "off" },
+        panel.cursor.dock_blend,
         panel.focusables.len(),
         panel.scroll_offset.0,
         panel.scroll_offset.1,
