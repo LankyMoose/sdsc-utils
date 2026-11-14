@@ -73,6 +73,13 @@ struct Shared {
     last_emitted: Vec<Focusable>,
     visible: bool,
     suspended: bool,
+    /// Commanded scroll offset, page pixels. Servo reports document-relative
+    /// bounds and never re-emits them on scroll, so the backend translates
+    /// to viewport space at emit time. Reset on fresh navigate (new document
+    /// starts at top); kept across history travel, which usually restores
+    /// the previous position. Page-driven scrolls (anchors, JS) are
+    /// invisible to us and self-heal only via fresh bounds — a known gap.
+    scroll: (f32, f32),
     /// Verbose per-node AX diagnostics (`SDSC_AX_DEBUG=1`): role, bounds,
     /// and keep/drop verdict for every node in each tree update.
     ax_debug: bool,
@@ -211,25 +218,8 @@ impl WebViewDelegate for Delegate {
                 }
             }
         }
-        let mut focusables: Vec<Focusable> = shared.focusables.values().cloned().collect();
-        focusables.sort_by_key(|o| o.id);
-        if focusables != shared.last_emitted {
-            let sample = focusables
-                .first()
-                .map(|o| {
-                    format!(
-                        " first=({},{} {}x{})",
-                        o.x as i32, o.y as i32, o.w as i32, o.h as i32
-                    )
-                })
-                .unwrap_or_default();
-            crate::platform::app_log::info(format!(
-                "servo-engine: a11y focusables={}{sample}",
-                focusables.len()
-            ));
-            shared.last_emitted = focusables.clone();
-            shared.handle.emit(EngineEvent::A11yTree(focusables));
-        }
+        // Publish the translated tree (diffed + logged inside).
+        emit_tree(&mut shared);
     }
 }
 
@@ -352,6 +342,7 @@ fn run(
         last_emitted: Vec::new(),
         visible: false,
         suspended: true,
+        scroll: (0.0, 0.0),
         ax_debug: std::env::var("SDSC_AX_DEBUG").is_ok(),
     }));
     let webview = WebViewBuilder::new(&servo, ctx.clone())
@@ -400,8 +391,9 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                     crate::platform::app_log::info(format!("servo-engine: navigate {url}"));
                     state.generation = generation;
                     state.load_started_at = Some(Instant::now());
-                    // Fresh page, fresh tree: drop the old page's nodes so
-                    // no stale outline survives the navigation.
+                    // Fresh page, fresh tree, zero scroll: drops the old
+                    // page's nodes so no stale outline survives.
+                    state.scroll = (0.0, 0.0);
                     clear_tree(&mut state);
                     state
                         .handle
@@ -427,31 +419,14 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                 Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(dx, dy))),
                 WebViewPoint::Device(DevicePoint::new(w as f32 / 2.0, h as f32 / 2.0)),
             );
-            // Stick-noise-scale deltas would random-walk the cached rects
-            // if integrated; genuine scrolls are orders of magnitude bigger.
-            if dx.abs() < 0.25 && dy.abs() < 0.25 {
-                return;
-            }
-            // The UI only refreshes on A11yTree events, and pure scrolling
-            // never produces a Servo update — re-emit the shifted list so
-            // outlines track the page. Silent (count never changes here) to
-            // avoid log spam at scroll-tick rates; `try_send` + subscription
-            // conflation absorb bursts while the stick is held.
-            let fresh: Vec<Focusable> = {
-                // Destructure the reborrow so the two maps borrow disjointly
-                // (`RefCell` field borrows don't split on their own).
-                let Shared {
-                    focusables,
-                    last_emitted,
-                    ..
-                } = &mut *state;
-                shift_tree(focusables, last_emitted, dx, dy);
-                let mut fresh: Vec<Focusable> = focusables.values().cloned().collect();
-                fresh.sort_by_key(|o| o.id);
-                *last_emitted = fresh.clone();
-                fresh
-            };
-            state.handle.emit(EngineEvent::A11yTree(fresh));
+            // Servo reports document-relative bounds and never re-emits on
+            // scroll: accumulate the commanded offset and re-emit translated
+            // rects so outlines track the page. `try_send` + subscription
+            // conflation absorb held-stick bursts; the emit itself stays
+            // silent unless nodes join/leave (see `emit_tree`).
+            state.scroll.0 += dx;
+            state.scroll.1 += dy;
+            emit_tree(&mut state);
         }
         EngineCommand::Key(event) => {
             if shared.borrow().suspended {
@@ -532,28 +507,52 @@ fn clear_tree(state: &mut Shared) {
     state.handle.emit(EngineEvent::A11yTree(Vec::new()));
 }
 
-/// Shift cached rects by a commanded scroll: Servo reports bounds in
-/// viewport coordinates but only re-emits changed nodes, so without this
-/// the whole tree lags one scroll behind. Map and diff-baseline shift
-/// together. Clamp drift (hitting top/bottom) and page-driven scrolls
-/// self-heal on the next tree update.
-fn shift_tree(
-    focusables: &mut std::collections::HashMap<u64, Focusable>,
-    last_emitted: &mut [Focusable],
-    dx: f32,
-    dy: f32,
-) {
-    if dx == 0.0 && dy == 0.0 {
+/// Viewport-space snapshot of the cached document tree: rects translated by
+/// the tracked scroll offset (Servo reports document-relative bounds and
+/// never re-emits them on scroll). Sorted by id so diffing is stable.
+fn translate_tree(
+    focusables: &std::collections::HashMap<u64, Focusable>,
+    scroll: (f32, f32),
+) -> Vec<Focusable> {
+    let mut out: Vec<Focusable> = focusables
+        .values()
+        .map(|o| Focusable {
+            id: o.id,
+            x: o.x - scroll.0,
+            y: o.y - scroll.1,
+            w: o.w,
+            h: o.h,
+            kind: o.kind,
+        })
+        .collect();
+    out.sort_by_key(|o| o.id);
+    out
+}
+
+/// Diff + publish the translated tree. Logs only when the set size changes
+/// so scroll ticks (which move rects without adding nodes) stay silent.
+fn emit_tree(shared: &mut Shared) {
+    let fresh = translate_tree(&shared.focusables, shared.scroll);
+    if fresh == shared.last_emitted {
         return;
     }
-    for item in focusables.values_mut() {
-        item.x -= dx;
-        item.y -= dy;
+    if fresh.len() != shared.last_emitted.len() {
+        let sample = fresh
+            .first()
+            .map(|o| {
+                format!(
+                    " first=({},{}) {}x{}",
+                    o.x as i32, o.y as i32, o.w as i32, o.h as i32
+                )
+            })
+            .unwrap_or_default();
+        crate::platform::app_log::info(format!(
+            "servo-engine: a11y focusables={}{sample}",
+            fresh.len()
+        ));
     }
-    for item in last_emitted.iter_mut() {
-        item.x -= dx;
-        item.y -= dy;
-    }
+    shared.last_emitted = fresh.clone();
+    shared.handle.emit(EngineEvent::A11yTree(fresh));
 }
 
 /// Fail loads that never complete so the UI never spins forever.
@@ -590,14 +589,15 @@ mod tests {
     }
 
     #[test]
-    fn scroll_shifts_cache_and_baseline_together() {
-        let mut map: HashMap<u64, Focusable> = [(1, item(1, 100.0, 200.0))].into_iter().collect();
-        let mut last = vec![item(1, 100.0, 200.0)];
-        shift_tree(&mut map, &mut last, 0.0, 240.0);
-        assert_eq!((map[&1].x, map[&1].y), (100.0, -40.0));
-        assert_eq!((last[0].x, last[0].y), (100.0, -40.0));
-        // No-op scroll leaves everything untouched.
-        shift_tree(&mut map, &mut last, 0.0, 0.0);
-        assert_eq!((map[&1].x, map[&1].y), (100.0, -40.0));
+    fn translate_shifts_by_scroll_and_sorts() {
+        let map: HashMap<u64, Focusable> = [(2, item(2, 100.0, 800.0)), (1, item(1, 0.0, 0.0))]
+            .into_iter()
+            .collect();
+        let out = translate_tree(&map, (0.0, 240.0));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, 1);
+        assert_eq!((out[0].x, out[0].y), (0.0, -240.0));
+        assert_eq!(out[1].id, 2);
+        assert_eq!((out[1].x, out[1].y), (100.0, 560.0));
     }
 }
