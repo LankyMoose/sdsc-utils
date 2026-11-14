@@ -17,6 +17,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
+use embedder_traits::{InputEvent, KeyboardEvent, Theme};
 use euclid::{Box2D, Point2D};
 
 use servo::{
@@ -253,6 +254,25 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                 Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(dx, dy))),
                 WebViewPoint::Device(DevicePoint::new(w as f32 / 2.0, h as f32 / 2.0)),
             );
+        }
+        EngineCommand::Key(event) => {
+            if shared.borrow().suspended {
+                return;
+            }
+            webview.notify_input_event(InputEvent::Keyboard(KeyboardEvent::new(event)));
+        }
+        EngineCommand::SetDarkMode { dark } => {
+            webview.notify_theme_change(if dark { Theme::Dark } else { Theme::Light });
+        }
+        EngineCommand::GoBack => {
+            if !shared.borrow().suspended {
+                webview.go_back(1);
+            }
+        }
+        EngineCommand::GoForward => {
+            if !shared.borrow().suspended {
+                webview.go_forward(1);
+            }
         }
         EngineCommand::Resize { width, height } => {
             let mut state = shared.borrow_mut();

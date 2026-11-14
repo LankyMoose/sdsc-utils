@@ -18,6 +18,7 @@ use crate::domain::pad::InputHub;
 use crate::{AppError, AppResult};
 
 use crate::browser::engine::{EngineEvent, EngineHandle};
+use crate::browser::keys::RawKey;
 #[cfg(debug_assertions)]
 use crate::controller::emulate;
 use crate::controller::hid::poll::{
@@ -165,6 +166,13 @@ pub enum Message {
 
     ConfigureOpened(window::Id),
     Configure(ConfigureMessage),
+    /// Raw keyboard event for the Start browser (controller-first: no mouse).
+    /// Routed in `update` — page mode forwards to the engine, URL-edit mode
+    /// and reader mode fall back to the legacy Start-key mapping.
+    BrowserRawKey {
+        id: window::Id,
+        key: RawKey,
+    },
     /// Debug-only standalone ambient preview window opened.
     #[cfg(debug_assertions)]
     AmbientPreviewOpened(window::Id),
@@ -299,6 +307,7 @@ impl Message {
             Message::Popup(_)
             | Message::Configure(_)
             | Message::Start(_)
+            | Message::BrowserRawKey { .. }
             | Message::StartCursorActivity(_)
             | Message::PadInput(_) => true,
             Message::StartKey { .. } => true,
@@ -1041,54 +1050,47 @@ impl App {
             window::close_events().map(Message::WindowClosed),
             iced::event::listen_with(|event, _status, id| match event {
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
-                iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key,
+                    physical_key,
+                    location,
+                    modifiers,
+                    repeat,
+                    ..
+                }) => {
                     #[cfg(debug_assertions)]
                     if key == keyboard::Key::Named(keyboard::key::Named::F9) {
                         return Some(Message::ToggleDebugLayoutBounds);
                     }
-                    let action = match key {
-                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                            Some(StartKeyAction::Cancel)
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::Enter) => {
-                            Some(StartKeyAction::Confirm)
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
-                            Some(StartKeyAction::Up)
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
-                            Some(StartKeyAction::Down)
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                            Some(StartKeyAction::Left)
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                            Some(StartKeyAction::Right)
-                        }
-                        _ => None,
-                    }?;
-                    Some(Message::StartKey {
+                    Some(Message::BrowserRawKey {
                         id,
-                        action,
-                        pressed: true,
+                        key: RawKey {
+                            key,
+                            physical: physical_key,
+                            location,
+                            modifiers,
+                            pressed: true,
+                            repeat,
+                        },
                     })
                 }
-                iced::Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
-                    let action = match key {
-                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                            Some(StartKeyAction::Cancel)
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::Enter) => {
-                            Some(StartKeyAction::Confirm)
-                        }
-                        _ => None,
-                    }?;
-                    Some(Message::StartKey {
-                        id,
-                        action,
+                iced::Event::Keyboard(keyboard::Event::KeyReleased {
+                    key,
+                    physical_key,
+                    location,
+                    modifiers,
+                    ..
+                }) => Some(Message::BrowserRawKey {
+                    id,
+                    key: RawKey {
+                        key,
+                        physical: physical_key,
+                        location,
+                        modifiers,
                         pressed: false,
-                    })
-                }
+                        repeat: false,
+                    },
+                }),
                 iced::Event::Mouse(
                     mouse::Event::CursorMoved { .. }
                     | mouse::Event::ButtonPressed(_)
@@ -1498,6 +1500,7 @@ impl App {
                 action,
                 pressed,
             } => self.on_start_key(id, action, pressed),
+            Message::BrowserRawKey { id, key } => self.on_browser_raw_key(id, key),
             Message::PadInput(edge) => {
                 if crate::platform::debug_quiet::enabled() {
                     Task::none()

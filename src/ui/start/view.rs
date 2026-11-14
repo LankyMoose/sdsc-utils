@@ -70,8 +70,12 @@ pub enum StartMessage {
     /// Browser: toggle the in-Start reader surface (Servo offscreen target;
     /// phase-1 fetch backend with system-browser fallback).
     ToggleBrowser,
+    /// Browser: toggle URL-edit mode (keyboard to the address field).
+    ToggleUrlEntry,
     BrowserUrlChanged(String),
     BrowserNavigate,
+    BrowserBack,
+    BrowserForward,
     BrowserFetched {
         generation: u64,
         result: Result<crate::browser::FetchedPage, String>,
@@ -779,6 +783,10 @@ pub struct BrowserPanel {
     pub session: crate::browser::BrowserSession,
     pub draft: String,
     pub scroll_y: f32,
+    /// URL-edit mode: keyboard goes to the address field (pad Triangle /
+    /// Ctrl+L enters, Enter commits, Esc/Circle backs out). Cleared on
+    /// navigate and close.
+    pub url_editing: bool,
 }
 
 impl BrowserPanel {
@@ -788,10 +796,12 @@ impl BrowserPanel {
         } else {
             self.session.open_surface();
         }
+        self.url_editing = false;
     }
 
     pub fn close_surface(&mut self) {
         self.session.close_surface();
+        self.url_editing = false;
     }
 
     pub fn note_scrolled(&mut self, y: f32) {
@@ -810,8 +820,12 @@ pub fn browser_scroll_id() -> iced::widget::Id {
     iced::widget::Id::new("start-browser-body")
 }
 
-/// Fixed card width for the browser overlay (dialog family sizing).
-pub const BROWSER_CARD_W: f32 = 600.0;
+/// Address field id (URL-edit mode focuses it so typing lands in the box,
+/// not the page).
+pub fn browser_url_id() -> iced::widget::Id {
+    iced::widget::Id::new("start-browser-url")
+}
+
 /// Pad Up/Down body scroll step.
 pub const BROWSER_SCROLL_STEP: f32 = 240.0;
 
@@ -854,9 +868,9 @@ pub fn browser_page_view(state: &State) -> Element<'_, StartMessage> {
     .into()
 }
 
-/// In-Start reader browser card: URL row, readable body, reload / external /
-/// close actions. Mounted as a centered dialog over the live stage (same
-/// wash + card builder as manual/replace), below the settings drawer.
+/// In-Start browser card: URL row, page, reload / external / close
+/// actions. Sized by the caller (near-full-bleed; see `immersive::view`),
+/// so the root column fills its card.
 pub fn browser_view(state: &State) -> Element<'_, StartMessage> {
     let panel = &state.browser;
     let session = &panel.session;
@@ -882,6 +896,7 @@ pub fn browser_view(state: &State) -> Element<'_, StartMessage> {
         space().height(4),
         row![
             text_input("https://…", &panel.draft)
+                .id(browser_url_id())
                 .size(14.0)
                 .padding(8)
                 .on_input(StartMessage::BrowserUrlChanged)
@@ -914,14 +929,21 @@ pub fn browser_view(state: &State) -> Element<'_, StartMessage> {
         .spacing(10),
         action_cluster(
             &[
-                face_hint(FaceButton::Cross, "Go", press.held, press.press_anim),
+                face_hint(
+                    FaceButton::Cross,
+                    if panel.url_editing { "Go" } else { "Use" },
+                    press.held,
+                    press.press_anim
+                ),
                 face_hint(FaceButton::Circle, "Close", press.held, press.press_anim),
+                face_hint(FaceButton::Triangle, "URL", press.held, press.press_anim),
+                face_hint(FaceButton::Square, "Tab", press.held, press.press_anim),
             ],
             false,
         ),
     ]
     .spacing(4)
-    .width(Length::Fixed(BROWSER_CARD_W))
+    .width(Fill)
     .align_x(Alignment::Start)
     .into()
 }

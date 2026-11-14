@@ -317,18 +317,22 @@ pub fn view<'a>(
             ep,
         )));
     }
-    // In-Start browser surface: wash + wide card over the live stage (same
-    // dialog family as manual/replace). Wash click toggles it closed, exactly
-    // like Circle/Cancel; the card absorbs clicks. Above modals (a fresh
-    // browser open never underlaps them), below the settings drawer.
+    // In-Start browser surface: near-full-bleed card over the live stage
+    // (same dialog family as manual/replace). The card takes the full
+    // window minus a 100px breather (50px per side) so pages get maximum
+    // room while the immersive chrome stays visible around the edges. Wash
+    // click toggles it closed, exactly like Circle/Cancel; the card absorbs
+    // clicks. Above modals, below the settings drawer.
     if state.browser.session.is_open() {
+        let card_w = (stage_w - 100.0).max(320.0);
+        let card_h = (stage_h - 100.0).max(240.0);
         layers.push(overlay::wash(
             overlay::reveal(1.0),
             StartMessage::ToggleBrowser,
         ));
         layers.push(overlay::centered(Scale::new(
             overlay::click_shield(
-                overlay::dialog_card(browser_view(state), Length::Shrink, Some(MODAL_CARD_MAX_H)),
+                overlay::dialog_card(browser_view(state), Length::Fixed(card_w), Some(card_h)),
                 StartMessage::Noop,
             ),
             1.0,

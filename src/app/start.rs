@@ -9,11 +9,12 @@ use super::stamp_hitch_report;
 use super::{
     App, Message, PAD_POLL_SLOW_MS, PAD_POLL_STALL_MS, RELOAD_FEEDBACK_DELAY,
     RUNNING_CHECK_INTERVAL, SCROLL_RESTORE_AUTHORITY, SNAPSHOT_STALE_MS, START_CURSOR_IDLE_HIDE,
-    START_NAV_NOT_READY_MS, chord_held_on_any_pad, delay, is_manual_target_missing, spawn_blocking,
-    steam_appid_from_target,
+    START_NAV_NOT_READY_MS, StartKeyAction, chord_held_on_any_pad, delay, is_manual_target_missing,
+    spawn_blocking, steam_appid_from_target,
 };
 use crate::AppResult;
 use crate::browser::engine::{EngineCommand, EngineEvent};
+use crate::browser::keys::{self as browser_keys, RawKey};
 use crate::controller::dualsense::rumble::MotorPulse;
 use crate::games::process_match::RunningSession;
 use crate::games::steam::SteamGame;
@@ -85,6 +86,9 @@ impl App {
             }
             StartMessage::ToggleControllers => self.on_toggle_controllers(),
             StartMessage::ToggleBrowser => self.on_toggle_browser(),
+            StartMessage::ToggleUrlEntry => self.on_toggle_url_entry(),
+            StartMessage::BrowserBack => self.on_browser_go_back(),
+            StartMessage::BrowserForward => self.on_browser_go_forward(),
             StartMessage::BrowserUrlChanged(draft) => {
                 self.start_state.browser.draft = draft;
                 Task::none()
@@ -330,9 +334,17 @@ impl App {
             }
             Task::none()
         } else if self.start_state.browser.session.is_open() {
-            // Browser surface open: Cancel closes it first (overlay priority:
-            // settings → browser → manual → replace → edit → dock → close).
+            // Browser surface open: Cancel backs out of URL-edit mode first,
+            // then closes the surface (overlay priority: settings → browser
+            // → manual → replace → edit → dock → close).
             self.play_start_cue(UiSoundKind::Action);
+            if self.start_state.browser.url_editing {
+                self.start_state.browser.url_editing = false;
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: start browser url entry close (cancel)",
+                );
+                return Task::none();
+            }
             self.close_browser_surface()
         } else if self.start_state.manual_add.is_some() {
             self.play_start_cue(UiSoundKind::Action);
@@ -419,6 +431,7 @@ impl App {
             engine.send(EngineCommand::Resume);
             engine.send(EngineCommand::SetVisible { visible: true });
         }
+        self.sync_browser_theme();
         crate::controller::hid::diag::diag_info("ui-diag: start browser open");
         Task::none()
     }
@@ -438,6 +451,17 @@ impl App {
     /// suspending before the worker lands drops the result. With the
     /// `servo-engine` feature the load goes to the engine worker instead
     /// (frames arrive via [`Message::BrowserEngine`]).
+    /// Push the OS light/dark mode to the engine (`prefers-color-scheme`).
+    /// No-op without an engine or when the OS gives no answer.
+    pub(crate) fn sync_browser_theme(&mut self) {
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        if let Some(dark) = crate::platform::appearance::system_dark_mode() {
+            engine.send(EngineCommand::SetDarkMode { dark });
+        }
+    }
+
     pub(crate) fn on_browser_navigate(&mut self) -> Task<Message> {
         let draft = self.start_state.browser.draft.clone();
         let current = self.start_state.browser.session.url().to_string();
@@ -452,12 +476,16 @@ impl App {
         }
         self.start_state.browser.draft = url.clone();
         self.start_state.browser.scroll_y = 0.0;
+        self.start_state.browser.url_editing = false;
         let generation = self.start_state.browser.session.begin_load(url.clone());
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Nav);
         crate::controller::hid::diag::diag_info("ui-diag: start browser navigate");
-        if let Some(engine) = &self.engine {
-            engine.send(EngineCommand::Navigate { url, generation });
+        if self.engine.is_some() {
+            if let Some(engine) = &self.engine {
+                engine.send(EngineCommand::Navigate { url, generation });
+            }
+            self.sync_browser_theme();
             return Task::none();
         }
         Task::perform(
@@ -477,6 +505,144 @@ impl App {
                 }),
             },
         )
+    }
+
+    /// Raw keyboard routing for Start. Controller-first: with the engine
+    /// page focused, keys go to the page (typing, shortcuts, focus nav);
+    /// URL-edit mode and the reader fall back to the legacy Start-key map
+    /// (arrows navigate, Enter confirms, Esc cancels).
+    pub(crate) fn on_browser_raw_key(&mut self, id: window::Id, raw: RawKey) -> Task<Message> {
+        self.haptic_pad_serial = None;
+        if Some(id) != self.start_window || !self.start_visible {
+            return Task::none();
+        }
+        self.note_start_activity();
+        let browser_open = self.start_state.browser.session.is_open();
+        let url_editing = self.start_state.browser.url_editing;
+        let engine_live = self.engine.is_some();
+        if browser_open && !url_editing && engine_live && !self.start_state.cold_load_active {
+            return self.on_browser_page_key(raw);
+        }
+        // Legacy Start-key mapping (reader, URL-edit, closed): arrows/Enter
+        // act on press; Escape/Enter track both edges for holds.
+        if raw.pressed {
+            let action = match &raw.key {
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
+                    Some(StartKeyAction::Cancel)
+                }
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) => {
+                    Some(StartKeyAction::Confirm)
+                }
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp) => {
+                    Some(StartKeyAction::Up)
+                }
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown) => {
+                    Some(StartKeyAction::Down)
+                }
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft) => {
+                    Some(StartKeyAction::Left)
+                }
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight) => {
+                    Some(StartKeyAction::Right)
+                }
+                _ => None,
+            };
+            if let Some(action) = action {
+                return self.on_start_key(id, action, true);
+            }
+        } else {
+            let action = match &raw.key {
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
+                    Some(StartKeyAction::Cancel)
+                }
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) => {
+                    Some(StartKeyAction::Confirm)
+                }
+                _ => None,
+            };
+            if let Some(action) = action {
+                return self.on_start_key(id, action, false);
+            }
+        }
+        Task::none()
+    }
+
+    /// Keyboard while the engine page owns focus. Shell bindings stay local
+    /// (Esc closes, Ctrl+L/R and Alt+arrows act); everything else becomes a
+    /// page key event.
+    fn on_browser_page_key(&mut self, raw: RawKey) -> Task<Message> {
+        use iced::keyboard::Key;
+        use iced::keyboard::key::Named;
+        if matches!(raw.key, Key::Named(Named::Escape)) {
+            self.cancel_key_held = raw.pressed;
+            self.sync_start_held();
+            if !raw.pressed {
+                self.cancel_start_holds();
+                return self.on_start_message(StartMessage::Close);
+            }
+            return Task::none();
+        }
+        if raw.pressed {
+            if raw.modifiers.control()
+                && let Key::Character(text) = &raw.key
+            {
+                match text.to_lowercase().as_str() {
+                    "l" => return self.on_start_message(StartMessage::ToggleUrlEntry),
+                    "r" => return self.on_start_message(StartMessage::BrowserReload),
+                    _ => {}
+                }
+            }
+            if raw.modifiers.alt() {
+                match &raw.key {
+                    Key::Named(Named::ArrowLeft) => {
+                        return self.on_start_message(StartMessage::BrowserBack);
+                    }
+                    Key::Named(Named::ArrowRight) => {
+                        return self.on_start_message(StartMessage::BrowserForward);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::Key(browser_keys::map_event(&raw)));
+        }
+        Task::none()
+    }
+
+    /// URL-edit mode: keyboard goes to the address field (the widget owns
+    /// printable keys natively); the field is focused so typing lands there.
+    /// Exits on navigate, Esc/Circle, or surface close.
+    pub(crate) fn on_toggle_url_entry(&mut self) -> Task<Message> {
+        if !self.start_state.browser.session.is_open() {
+            return Task::none();
+        }
+        let next = !self.start_state.browser.url_editing;
+        self.start_state.browser.url_editing = next;
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Action);
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start browser url entry {}",
+            if next { "open" } else { "close" }
+        ));
+        if next {
+            return operation::focus(start_view::browser_url_id());
+        }
+        Task::none()
+    }
+
+    pub(crate) fn on_browser_go_back(&mut self) -> Task<Message> {
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::GoBack);
+        }
+        Task::none()
+    }
+
+    pub(crate) fn on_browser_go_forward(&mut self) -> Task<Message> {
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::GoForward);
+        }
+        Task::none()
     }
 
     pub(crate) fn on_browser_fetched(
@@ -531,6 +697,17 @@ impl App {
         }
         if let Err(err) = launch::launch_target(&url, "") {
             app_log::warn(format!("start-browser: external open failed: {err}"));
+        }
+        Task::none()
+    }
+
+    /// Pad-driven logical key: press + release pair straight to the engine
+    /// (pad has no physical code or modifiers to carry).
+    pub(crate) fn send_pad_keys(&mut self, key: keyboard_types::NamedKey) -> Task<Message> {
+        if let Some(engine) = &self.engine {
+            for event in browser_keys::pad_key(key) {
+                engine.send(EngineCommand::Key(event));
+            }
         }
         Task::none()
     }
@@ -1685,8 +1862,10 @@ impl App {
             self.on_start_settings_nav(tick.action)
         } else if browser_open {
             // Browser surface owns pad input while open: Up/Down scroll the
-            // body, Cross re-goes the URL, Circle closes. Game nav, holds,
-            // and surface toggles stay parked (same discipline as modals).
+            // body, Cross uses (Enter) or goes (URL mode), Circle backs out
+            // of URL mode or closes, Triangle toggles URL entry, Square tabs
+            // focus, Left/Right travel history. Game nav, holds, and surface
+            // toggles stay parked (same discipline as modals).
             self.start_state.cross_progress = 0.0;
             self.start_state.triangle_progress = 0.0;
             self.keyboard_cross_hold.reset();
@@ -1698,8 +1877,24 @@ impl App {
                 Some(NavAction::Down) => {
                     self.scroll_browser(crate::ui::start::view::BROWSER_SCROLL_STEP)
                 }
-                Some(NavAction::Confirm) => self.on_start_message(StartMessage::BrowserNavigate),
-                Some(NavAction::Cancel) => self.on_start_message(StartMessage::Close),
+                Some(NavAction::Left) => self.on_start_message(StartMessage::BrowserBack),
+                Some(NavAction::Right) => self.on_start_message(StartMessage::BrowserForward),
+                Some(NavAction::Confirm) => {
+                    if self.start_state.browser.url_editing {
+                        self.on_start_message(StartMessage::BrowserNavigate)
+                    } else {
+                        self.send_pad_keys(keyboard_types::NamedKey::Enter)
+                    }
+                }
+                Some(NavAction::Cancel) => {
+                    if self.start_state.browser.url_editing {
+                        self.on_start_message(StartMessage::ToggleUrlEntry)
+                    } else {
+                        self.on_start_message(StartMessage::Close)
+                    }
+                }
+                Some(NavAction::ToggleEdit) => self.on_start_message(StartMessage::ToggleUrlEntry),
+                Some(NavAction::CycleSort) => self.send_pad_keys(keyboard_types::NamedKey::Tab),
                 _ => Task::none(),
             }
         } else if animating {

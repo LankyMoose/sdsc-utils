@@ -1,5 +1,6 @@
 pub mod app_log;
 pub mod app_meta;
+pub mod appearance;
 pub mod autostart;
 pub mod crash_restart;
 pub mod debug_quiet;

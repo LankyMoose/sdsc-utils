@@ -17,6 +17,7 @@ use std::collections::HashMap;
 
 pub mod engine;
 pub mod fetch;
+pub mod keys;
 #[cfg(feature = "servo-engine")]
 pub mod servo_backend;
 

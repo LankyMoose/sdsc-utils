@@ -28,6 +28,12 @@ pub enum EngineCommand {
         dx: f32,
         dy: f32,
     },
+    Key(keyboard_types::KeyboardEvent),
+    SetDarkMode {
+        dark: bool,
+    },
+    GoBack,
+    GoForward,
     Resize {
         width: u32,
         height: u32,
