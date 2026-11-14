@@ -873,9 +873,11 @@ pub fn browser_url_id() -> iced::widget::Id {
 /// Pad Up/Down body scroll step.
 pub const BROWSER_SCROLL_STEP: f32 = 240.0;
 
-/// Virtual cursor overlay, same size as the engine image: a ring at the
-/// free point, or an outline wrapping the attached element. Coordinates are
-/// card pixels (`page * img_w / 800`).
+/// Virtual cursor overlay, same size as the engine image: a ring that
+/// morphs between the free dot and the docked wrap. Position, size, and
+/// corner radius interpolate every tick (smoothstepped blend), so docking
+/// animates circle → square instead of popping. Coordinates are card pixels
+/// (`page * img_w / 800`).
 fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, StartMessage> {
     use crate::browser::cursor::VIEWPORT_W;
     // URL-edit mode owns the keyboard; hide the pad cursor so it never
@@ -885,39 +887,36 @@ fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, 
     }
     let scale = img_w / VIEWPORT_W;
     let panel = &state.browser;
-    let dot_r = 10.0;
-    let body: Element<'_, StartMessage> =
-        if let Some((x, y, w, h)) = panel.cursor.attached_rect(&panel.focusables) {
-            let (x, y) = (x * scale - 2.0, y * scale - 2.0);
-            let (w, h) = ((w * scale + 4.0).max(8.0), (h * scale + 4.0).max(8.0));
-            column![
-                space().height(Length::Fixed(y.max(0.0))),
-                row![
-                    space().width(Length::Fixed(x.max(0.0))),
-                    container(space().width(Length::Fixed(w)).height(Length::Fixed(h)))
-                        .style(theme::cursor_wrap),
-                ],
-            ]
-            .spacing(0)
-            .into()
-        } else {
-            let cx = (panel.cursor.x * scale).clamp(dot_r, img_w - dot_r);
-            let cy = (panel.cursor.y * scale).clamp(dot_r, img_h - dot_r);
-            column![
-                space().height(Length::Fixed((cy - dot_r).max(0.0))),
-                row![
-                    space().width(Length::Fixed((cx - dot_r).max(0.0))),
-                    container(
-                        space()
-                            .width(Length::Fixed(dot_r * 2.0))
-                            .height(Length::Fixed(dot_r * 2.0))
-                    )
-                    .style(theme::cursor_dot),
-                ],
-            ]
-            .spacing(0)
-            .into()
-        };
+    let cursor = &panel.cursor;
+    // 0 = free dot, 1 = docked wrap; smoothstepped so both ends ease.
+    let t = cursor.dock_blend.clamp(0.0, 1.0);
+    let t = t * t * (3.0 - 2.0 * t);
+    // Dot geometry in page px.
+    let (dx, dy) = (cursor.x - 10.0, cursor.y - 10.0);
+    // Wrap geometry in page px: live attachment, else the last dock while
+    // blending back out.
+    let wrap = cursor.attached_rect(&panel.focusables).or(cursor.last_dock);
+    let (wx, wy, ww, wh) = match wrap {
+        Some((x, y, w, h)) => (x - 2.0, y - 2.0, (w + 4.0).max(8.0), (h + 4.0).max(8.0)),
+        None => (dx, dy, 20.0, 20.0),
+    };
+    let (x, y) = ((dx + (wx - dx) * t) * scale, (dy + (wy - dy) * t) * scale);
+    let (w, h) = (
+        (20.0 + (ww - 20.0) * t) * scale,
+        (20.0 + (wh - 20.0) * t) * scale,
+    );
+    // Corner radius in card px: circle (10) ↔ wrap (SM).
+    let radius = 10.0 + (crate::ui::theme::radius::SM - 10.0) * t;
+    let body: Element<'_, StartMessage> = column![
+        space().height(Length::Fixed(y.max(0.0))),
+        row![
+            space().width(Length::Fixed(x.max(0.0))),
+            container(space().width(Length::Fixed(w)).height(Length::Fixed(h)))
+                .style(move |theme| crate::ui::theme::cursor_morph(theme, radius)),
+        ],
+    ]
+    .spacing(0)
+    .into();
     container(body)
         .width(Length::Fixed(img_w))
         .height(Length::Fixed(img_h))

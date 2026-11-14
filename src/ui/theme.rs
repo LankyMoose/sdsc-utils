@@ -205,6 +205,20 @@ pub fn cursor_wrap(_theme: &Theme) -> container::Style {
     }
 }
 
+/// Morphing virtual-cursor ring: transparent fill, accent outline with an
+/// interpolated corner radius. The overlay lerps dot ↔ wrap every tick, so
+/// docking never pops a frame.
+pub fn cursor_morph(_theme: &Theme, radius: f32) -> container::Style {
+    container::Style {
+        border: Border {
+            color: ACCENT,
+            width: 2.0,
+            radius: radius.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Opaque chrome fill (transition veils, fallback view).
 pub fn root(_theme: &Theme) -> container::Style {
     container::Style {

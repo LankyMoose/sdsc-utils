@@ -1,10 +1,10 @@
 //! Virtual cursor for controller-first browsing.
 //!
 //! The pad owns a cursor over the rendered page: the left stick (and D-pad
-//! nudges) move a free point, and it magnetically attaches to the nearest
-//! focusable element. Rendering draws a circle while free and wraps the
-//! attached element's shape once docked. Cross clicks the attached element
-//! (or the free point).
+//! flights) move a free point, and it magnetically attaches to the nearest
+//! focusable element. Rendering morphs a ring between dot (free) and wrap
+//! (docked) every tick — position, size, and shape always interpolate, so
+//! no frame pops. Cross clicks the attached element (or the free point).
 //!
 //! Focusables arrive later via the accessibility tree
 //! (`EngineEvent::A11yTree`); until then the list is empty and the cursor
@@ -56,6 +56,12 @@ pub const PULL_MAX_ACCEL: f32 = CURSOR_ACCEL * 0.25;
 /// wrap only pops once it actually arrives.
 pub const ACQUIRE_PAD: f32 = 8.0;
 pub const HOLD_PAD: f32 = 24.0;
+/// Dock-blend rate: the outline morphs free↔docked in ~140ms, eased every
+/// analog tick so no frame pops.
+pub const DOCK_BLEND_PER_SEC: f32 = 7.0;
+/// D-pad flight speed, px/s: jumps and nudges glide to the target instead
+/// of teleporting; stick input cancels back to manual control.
+pub const FLY_SPEED: f32 = 2400.0;
 /// Right-stick scroll speed at full deflection, px/s.
 pub const SCROLL_SPEED: f32 = 1500.0;
 /// Engine viewport the cursor space matches (see `servo_backend`).
@@ -79,6 +85,15 @@ pub struct Cursor {
     pub vy: f32,
     /// Attached focusable id, if docked.
     pub attached: Option<u64>,
+    /// Outline morph state: 0.0 = free dot, 1.0 = docked wrap. Eased every
+    /// analog tick toward the attachment so the shape always interpolates.
+    pub dock_blend: f32,
+    /// Last docked rect (page px), kept across undock so the wrap visibly
+    /// morphs back into the dot instead of vanishing.
+    pub last_dock: Option<(f32, f32, f32, f32)>,
+    /// D-pad flight target (page px): jumps/nudges glide here at
+    /// [`FLY_SPEED`] instead of teleporting; stick input cancels.
+    pub fly_to: Option<(f32, f32)>,
     /// Magnetic mode (L3 toggles): snap + glide to nearby elements.
     /// Off = pure free-form virtual mouse; D-pad jumping still applies.
     pub magnet: bool,
@@ -93,6 +108,9 @@ impl Cursor {
             vx: 0.0,
             vy: 0.0,
             attached: None,
+            dock_blend: 0.0,
+            last_dock: None,
+            fly_to: None,
             magnet: true,
             visible: true,
         }
@@ -109,30 +127,53 @@ impl Cursor {
         self.y = (self.y + dy).clamp(0.0, VIEWPORT_H);
     }
 
-    /// Analog velocity step with magnetic gravity: the stick accelerates a
-    /// velocity vector, friction decays it, and the nearest focusable
-    /// within range pulls proportionally to closeness. Full-360° control;
-    /// holding past ~25% deflection always overpowers the magnet, lighter
-    /// touches get captured. Attachment follows the pull (docks on capture,
-    /// releases past the radius) — no teleporting.
+    /// Analog velocity step with magnetic gravity, D-pad flights, and dock
+    /// morph state. The stick accelerates a velocity vector, friction decays
+    /// it, and the nearest focusable within range pulls proportionally to
+    /// closeness; flights glide to jump/nudge targets (stick cancels).
+    /// Attachment + `dock_blend` ease every tick, so the overlay never pops.
     pub fn advance(&mut self, lx: f32, ly: f32, dt_secs: f32, options: &[Focusable]) {
-        self.vx =
-            (self.vx + lx * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
-        self.vy =
-            (self.vy + ly * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
-        if self.magnet
-            && let Some((_, tx, ty, edge, clen)) = Self::nearest_within(self.x, self.y, options)
-        {
-            // Gravity, not teleport: pull toward the element center with
-            // a magnitude that falls off quadratically to zero at the
-            // snap radius edge — soft capture from afar, firm center.
-            // Direction normalizes by *center* distance; the edge
-            // distance drives the falloff only.
-            if clen > 0.5 {
-                let fall = (1.0 - edge / SNAP_RADIUS).max(0.0);
-                let strength = PULL_MAX_ACCEL * fall * fall;
-                self.vx += ((tx - self.x) / clen) * strength * dt_secs;
-                self.vy += ((ty - self.y) / clen) * strength * dt_secs;
+        // D-pad flights glide to the target; stick input cancels back to
+        // manual control.
+        if self.fly_to.is_some() && (lx != 0.0 || ly != 0.0) {
+            self.fly_to = None;
+        }
+        if let Some((tx, ty)) = self.fly_to {
+            let dx = tx - self.x;
+            let dy = ty - self.y;
+            let dist = dx.hypot(dy);
+            let step = FLY_SPEED * dt_secs;
+            if dist <= step.max(1.0) {
+                self.x = tx.clamp(0.0, VIEWPORT_W);
+                self.y = ty.clamp(0.0, VIEWPORT_H);
+                self.fly_to = None;
+                self.vx = 0.0;
+                self.vy = 0.0;
+            } else if dist > 0.0 {
+                self.x = (self.x + dx / dist * step).clamp(0.0, VIEWPORT_W);
+                self.y = (self.y + dy / dist * step).clamp(0.0, VIEWPORT_H);
+                self.vx = 0.0;
+                self.vy = 0.0;
+            }
+        } else {
+            self.vx =
+                (self.vx + lx * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
+            self.vy =
+                (self.vy + ly * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
+            if self.magnet
+                && let Some((_, tx, ty, edge, clen)) = Self::nearest_within(self.x, self.y, options)
+            {
+                // Gravity, not teleport: pull toward the element center with
+                // a magnitude that falls off quadratically to zero at the
+                // snap radius edge — soft capture from afar, firm center.
+                // Direction normalizes by *center* distance; the edge
+                // distance drives the falloff only.
+                if clen > 0.5 {
+                    let fall = (1.0 - edge / SNAP_RADIUS).max(0.0);
+                    let strength = PULL_MAX_ACCEL * fall * fall;
+                    self.vx += ((tx - self.x) / clen) * strength * dt_secs;
+                    self.vy += ((ty - self.y) / clen) * strength * dt_secs;
+                }
             }
         }
         let damp = (-CURSOR_FRICTION * dt_secs).exp();
@@ -149,9 +190,18 @@ impl Cursor {
             self.y = (self.y + self.vy * dt_secs).clamp(0.0, VIEWPORT_H);
         }
         // Docking is arrival-based (see `snap`): the outline only engages
-        // once the gliding point actually reaches an element.
+        // once the gliding point actually reaches an element. The morph
+        // state eases toward the attachment every tick — including neutral
+        // ones — so shape, size, and position always interpolate.
         if self.magnet {
             self.snap(options);
+        }
+        let target = if self.attached.is_some() { 1.0 } else { 0.0 };
+        let step = DOCK_BLEND_PER_SEC * dt_secs;
+        if self.dock_blend < target {
+            self.dock_blend = (self.dock_blend + step).min(1.0);
+        } else if self.dock_blend > target {
+            self.dock_blend = (self.dock_blend - step).max(0.0);
         }
     }
 
@@ -189,24 +239,31 @@ impl Cursor {
         best
     }
 
-    /// Nudge for D-pad taps, then snap. Discrete step: kills velocity so a
-    /// tap never inherits drift.
-    pub fn nudge(&mut self, dir: JumpDir, options: &[Focusable]) {
+    /// Nudge for D-pad taps: a short flight, not a step. Kills velocity so a
+    /// tap never inherits drift; arrival docks via the next `advance`.
+    pub fn nudge(&mut self, dir: JumpDir, _options: &[Focusable]) {
         let (dx, dy) = match dir {
             JumpDir::Up => (0.0, -NUDGE_STEP),
             JumpDir::Down => (0.0, NUDGE_STEP),
             JumpDir::Left => (-NUDGE_STEP, 0.0),
             JumpDir::Right => (NUDGE_STEP, 0.0),
         };
-        self.move_by(dx, dy);
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        self.attached = None;
         self.vx = 0.0;
         self.vy = 0.0;
-        self.snap(options);
+        self.fly_to = Some((
+            (self.x + dx).clamp(0.0, VIEWPORT_W),
+            (self.y + dy).clamp(0.0, VIEWPORT_H),
+        ));
     }
 
     /// Directional jump to the nearest *other* element roughly in `dir`;
     /// falls back to a nudge when nothing lies that way. Returns true on a
-    /// jump. D-pad always snaps — this ignores the magnet toggle.
+    /// jump. The point flies to the target and docks on arrival — no
+    /// teleport frames. D-pad always snaps — this ignores the magnet toggle.
     pub fn jump(&mut self, dir: JumpDir, options: &[Focusable]) -> bool {
         let (dx, dy) = match dir {
             JumpDir::Up => (0.0, -1.0),
@@ -236,7 +293,16 @@ impl Cursor {
             }
         }
         if let Some((id, _)) = best {
-            self.attach_to(id, options);
+            if let Some(item) = options.iter().find(|o| o.id == id) {
+                // Fly, don't teleport: the outline morphs on arrival.
+                self.attached = None;
+                self.vx = 0.0;
+                self.vy = 0.0;
+                self.fly_to = Some((
+                    (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W),
+                    (item.y + item.h / 2.0).clamp(0.0, VIEWPORT_H),
+                ));
+            }
             true
         } else {
             self.nudge(dir, options);
@@ -250,6 +316,12 @@ impl Cursor {
     /// flickers the outline. Gravity reaches further than the outline — the
     /// dot visibly glides in before the wrap pops.
     pub fn snap(&mut self, options: &[Focusable]) {
+        // Mid-flight the point belongs to the flight path, not to whatever
+        // it passes over — docking happens on arrival, once per trip.
+        if self.fly_to.is_some() {
+            self.attached = None;
+            return;
+        }
         if let Some(id) = self.attached
             && let Some(item) = options.iter().find(|o| o.id == id)
             && self.inside_expanded(item, HOLD_PAD)
@@ -268,6 +340,13 @@ impl Cursor {
             }
         }
         self.attached = best.map(|(id, _)| id);
+        // Remember the docked rect: if the point leaves, the wrap morphs
+        // back into the dot from here instead of vanishing a frame early.
+        if let Some(id) = self.attached
+            && let Some(item) = options.iter().find(|o| o.id == id)
+        {
+            self.last_dock = Some((item.x, item.y, item.w, item.h));
+        }
     }
 
     /// Re-resolve the attachment after a fresh tree (ids may have shifted;
@@ -280,9 +359,14 @@ impl Cursor {
         }
     }
 
-    /// Point to click: attached element center; else the gravity well's
-    /// center while falling in; else the free cursor.
+    /// Point to click: the flight target mid-flight, attached element
+    /// center when docked, the gravity well's center while falling in, else
+    /// the free cursor.
     pub fn click_point(&self, options: &[Focusable]) -> (f32, f32) {
+        // Mid-flight: aim at the flight target (user intent).
+        if let Some((tx, ty)) = self.fly_to {
+            return (tx, ty);
+        }
         if let Some(id) = self.attached
             && let Some(item) = options.iter().find(|o| o.id == id)
         {
@@ -302,17 +386,6 @@ impl Cursor {
                 .find(|o| o.id == id)
                 .map(|o| (o.x, o.y, o.w, o.h))
         })
-    }
-
-    fn attach_to(&mut self, id: u64, options: &[Focusable]) {
-        if let Some(item) = options.iter().find(|o| o.id == id) {
-            self.x = (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W);
-            self.y = (item.y + item.h / 2.0).clamp(0.0, VIEWPORT_H);
-            self.attached = Some(id);
-            // Teleport, not flick: a jump carries no momentum.
-            self.vx = 0.0;
-            self.vy = 0.0;
-        }
     }
 
     fn inside_expanded(&self, item: &Focusable, pad: f32) -> bool {
@@ -377,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn jump_goes_directionally_and_falls_back_to_nudge() {
+    fn jump_flies_to_target_and_docks_on_arrival() {
         let mut c = Cursor::new();
         let items = [link(1, 100.0, 100.0), link(2, 400.0, 100.0)];
         c.x = 110.0;
@@ -385,11 +458,74 @@ mod tests {
         c.snap(&items);
         assert_eq!(c.attached, Some(1));
         assert!(c.jump(JumpDir::Right, &items));
-        assert_eq!(c.attached, Some(2));
-        // Nothing above: nudge instead, no attach.
-        let before = (c.x, c.y);
+        // Flight, not teleport: leaves the dock, aims at the target.
+        assert_eq!(c.attached, None);
+        assert_eq!(c.click_point(&items), (450.0, 115.0));
+        let mut last_x = c.x;
+        for _ in 0..60 {
+            c.advance(0.0, 0.0, 0.016, &items);
+            assert!(c.x >= last_x, "flight never reverses, x={}", c.x);
+            last_x = c.x;
+            if c.attached.is_some() {
+                break;
+            }
+        }
+        assert_eq!(c.attached, Some(2), "docked on arrival");
+        assert!((c.x - 450.0).abs() < 1.0 && (c.y - 115.0).abs() < 1.0);
+        // Nothing above: nudge flies upward instead, no dock.
         assert!(!c.jump(JumpDir::Up, &[]));
-        assert!(c.y < before.1);
+        c.advance(0.0, 0.0, 0.016, &[]);
+        assert!(c.y < 115.0);
+        assert_eq!(c.attached, None);
+    }
+
+    #[test]
+    fn stick_input_cancels_flight() {
+        let mut c = Cursor::new();
+        let items = [link(2, 400.0, 100.0)];
+        c.x = 110.0;
+        c.y = 115.0;
+        assert!(c.jump(JumpDir::Right, &items));
+        assert!(c.fly_to.is_some());
+        c.advance(1.0, 0.0, 0.016, &items);
+        assert_eq!(c.fly_to, None, "stick takes back control");
+        assert!(c.x > 110.0);
+    }
+
+    #[test]
+    fn dock_blend_morphs_both_directions() {
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        // Dock: blend eases 0 → 1 over ticks, never jumps.
+        c.x = 210.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert!(c.dock_blend < 1.0);
+        let mut prev = c.dock_blend;
+        for _ in 0..60 {
+            c.advance(0.0, 0.0, 0.016, &items);
+            assert!(c.dock_blend >= prev, "morph never reverses");
+            prev = c.dock_blend;
+            if c.dock_blend >= 1.0 {
+                break;
+            }
+        }
+        assert_eq!(c.attached, Some(1));
+        assert_eq!(c.dock_blend, 1.0);
+        assert_eq!(c.last_dock, Some((100.0, 100.0, 100.0, 30.0)));
+        // Undock: blend eases back out from the remembered rect.
+        c.x = 500.0;
+        c.y = 500.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, None);
+        assert!(c.dock_blend < 1.0, "blend={}", c.dock_blend);
+        for _ in 0..60 {
+            c.advance(0.0, 0.0, 0.016, &items);
+            if c.dock_blend <= 0.0 {
+                break;
+            }
+        }
+        assert_eq!(c.dock_blend, 0.0);
     }
 
     #[test]
