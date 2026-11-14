@@ -731,6 +731,8 @@ impl App {
             return;
         };
         let sample = &reading.sample;
+        #[cfg(debug_assertions)]
+        let was_docked = self.start_state.browser.cursor.attached.is_some();
         let (dx, dy) = self.start_state.browser.advance_stick(
             sample.lstick_x,
             sample.lstick_y,
@@ -738,6 +740,20 @@ impl App {
             sample.rstick_y,
             now,
         );
+        // Dock-triggered shot: capture the exact pixels the fresh wrap sits
+        // on (throttled; the 5s cadence rarely coincides with a dock).
+        #[cfg(debug_assertions)]
+        if self.debug_browser
+            && !was_docked
+            && self.start_state.browser.cursor.attached.is_some()
+            && self
+                .start_state
+                .browser
+                .last_shot
+                .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(2))
+        {
+            self.start_state.browser.shot_on_dock = true;
+        }
         if (dx != 0.0 || dy != 0.0)
             && let Some(engine) = &self.engine
         {
@@ -757,10 +773,11 @@ impl App {
         Task::none()
     }
 
-    /// Debug-only frame shot: every 5s while the browser overlay is on, dump
-    /// the engine pixels to `shots/` under the data dir and log a correlator
-    /// (cursor, dock, target count, backend scroll offset). Encode + write
-    /// happen on a throwaway thread so the UI never hitches on disk I/O.
+    /// Debug-only frame shot: every 5s while the browser overlay is on (or
+    /// immediately on a fresh dock), dump the engine pixels to `shots/`
+    /// under the data dir and log a correlator (cursor, dock, drawn rect,
+    /// target count, backend scroll offset). Encode + write happen on a
+    /// throwaway thread so the UI never hitches on disk I/O.
     #[cfg(debug_assertions)]
     fn maybe_shot_browser_frame(&mut self, frame: &crate::browser::engine::PageFrame) {
         if !self.debug_browser {
@@ -768,9 +785,11 @@ impl App {
         }
         let now = Instant::now();
         let panel = &mut self.start_state.browser;
-        if panel
-            .last_shot
-            .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(5))
+        let on_dock = std::mem::replace(&mut panel.shot_on_dock, false);
+        if !on_dock
+            && panel
+                .last_shot
+                .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(5))
         {
             return;
         }

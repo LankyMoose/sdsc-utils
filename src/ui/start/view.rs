@@ -797,6 +797,9 @@ pub struct BrowserPanel {
     pub scroll_offset: (f32, f32),
     /// Last debug frame-shot time (5s cadence while the overlay is on).
     pub last_shot: Option<Instant>,
+    /// Save the next frame immediately (fresh dock while the overlay is on).
+    /// Cleared when the shot fires, so bursts of re-docks stay throttled.
+    pub shot_on_dock: bool,
     /// Browser debug overlay + shots (Diagnostics toggle / F10, mirrored
     /// from App). Never persisted.
     pub debug_overlay: bool,
