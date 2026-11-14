@@ -23,11 +23,12 @@ use embedder_traits::{
 use euclid::{Box2D, Point2D};
 
 use servo::{
-    DevicePixel, DevicePoint, DeviceVector2D, EventLoopWaker, LoadStatus, RenderingContext, Scroll,
-    ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
-    WebViewVector,
+    DevicePixel, DevicePoint, DeviceVector2D, EventLoopWaker, LoadStatus, Preferences,
+    RenderingContext, Scroll, ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder,
+    WebViewDelegate, WebViewPoint, WebViewVector,
 };
 
+use crate::browser::cursor::{FocusKind, Focusable};
 use crate::browser::engine::{EngineCommand, EngineEvent, EngineHandle, PageFrame};
 
 /// Fixed offscreen viewport (phase 1; the iced image scales to the card).
@@ -63,6 +64,7 @@ struct Shared {
     generation: u64,
     load_started_at: Option<Instant>,
     logged_first_frame: bool,
+    last_focusables: Vec<Focusable>,
     visible: bool,
     suspended: bool,
 }
@@ -121,6 +123,62 @@ impl WebViewDelegate for Delegate {
             });
         }
     }
+
+    fn notify_accessibility_tree_update(
+        &self,
+        _webview: WebView,
+        update: servo::accesskit::TreeUpdate,
+    ) {
+        let mut focusables = Vec::new();
+        for (id, node) in &update.nodes {
+            let Some(kind) = focusable_kind(node.role()) else {
+                continue;
+            };
+            let Some(rect) = node.bounds() else {
+                continue;
+            };
+            // Skip zero-area and absurdly large nodes (full-page containers).
+            let (w, h) = (rect.width() as f32, rect.height() as f32);
+            if w <= 0.0 || h <= 0.0 {
+                continue;
+            }
+            focusables.push(Focusable {
+                id: id.0,
+                x: rect.x0 as f32,
+                y: rect.y0 as f32,
+                w,
+                h,
+                kind,
+            });
+        }
+        let mut shared = self.shared.borrow_mut();
+        if shared.last_focusables != focusables {
+            shared.last_focusables = focusables.clone();
+            crate::platform::app_log::info(format!(
+                "servo-engine: a11y focusables={}",
+                focusables.len()
+            ));
+            shared.handle.emit(EngineEvent::A11yTree(focusables));
+        }
+    }
+}
+
+/// Actionable accesskit roles, mapped to cursor kinds. Everything else is
+/// not worth a magnet (static text, containers, images without actions).
+fn focusable_kind(role: servo::accesskit::Role) -> Option<FocusKind> {
+    use servo::accesskit::Role;
+    match role {
+        Role::Link => Some(FocusKind::Link),
+        Role::Button
+        | Role::CheckBox
+        | Role::RadioButton
+        | Role::Switch
+        | Role::MenuItem
+        | Role::Tab
+        | Role::ListBoxOption => Some(FocusKind::Button),
+        Role::TextInput | Role::SearchInput | Role::ComboBox => Some(FocusKind::Field),
+        _ => None,
+    }
 }
 
 /// Spawn the engine thread. Returns `None` when the GL context cannot be
@@ -178,7 +236,12 @@ fn run(
             }
         };
     let _ = ready.send(Ok(()));
+    let servo_prefs = Preferences {
+        accessibility_enabled: true,
+        ..Default::default()
+    };
     let servo = ServoBuilder::default()
+        .preferences(servo_prefs)
         .event_loop_waker(Box::new(ThreadWaker { tx: wake_tx }))
         .build();
     let shared = Rc::new(RefCell::new(Shared {
@@ -188,6 +251,7 @@ fn run(
         generation: 0,
         load_started_at: None,
         logged_first_frame: false,
+        last_focusables: Vec::new(),
         visible: false,
         suspended: true,
     }));
@@ -196,6 +260,11 @@ fn run(
             shared: shared.clone(),
         }))
         .build();
+    // Accessibility tree feed for the magnetic cursor: focusables + bounds.
+    // Needs the pref above; without it this returns None and no updates flow.
+    if webview.set_accessibility_active(true).is_none() {
+        crate::platform::app_log::warn("servo-engine: accessibility tree unavailable");
+    }
     crate::platform::app_log::info(format!(
         "servo-engine: ready ({VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT} software surface)"
     ));
