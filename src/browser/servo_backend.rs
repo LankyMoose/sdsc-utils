@@ -59,6 +59,7 @@ struct Shared {
     handle: EngineHandle,
     generation: u64,
     load_started_at: Option<Instant>,
+    logged_first_frame: bool,
     visible: bool,
     suspended: bool,
 }
@@ -70,7 +71,7 @@ struct Delegate {
 impl WebViewDelegate for Delegate {
     fn notify_new_frame_ready(&self, webview: WebView) {
         webview.paint();
-        let shared = self.shared.borrow();
+        let mut shared = self.shared.borrow_mut();
         if shared.suspended {
             return;
         }
@@ -79,6 +80,12 @@ impl WebViewDelegate for Delegate {
             Box2D::new(Point2D::new(0, 0), Point2D::new(w as i32, h as i32));
         if let Some(img) = shared.ctx.read_to_image(rect) {
             let (w, h) = (img.width(), img.height());
+            if !shared.logged_first_frame {
+                shared.logged_first_frame = true;
+                crate::platform::app_log::info(format!(
+                    "servo-engine: first frame {w}x{h}, worker live"
+                ));
+            }
             shared.handle.emit(EngineEvent::Frame(PageFrame {
                 width: w,
                 height: h,
@@ -177,6 +184,7 @@ fn run(
         handle,
         generation: 0,
         load_started_at: None,
+        logged_first_frame: false,
         visible: false,
         suspended: true,
     }));
@@ -185,6 +193,9 @@ fn run(
             shared: shared.clone(),
         }))
         .build();
+    crate::platform::app_log::info(format!(
+        "servo-engine: ready ({VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT} software surface)"
+    ));
 
     loop {
         let mut shutdown = false;
@@ -215,6 +226,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             let mut state = shared.borrow_mut();
             match url.parse::<url::Url>() {
                 Ok(parsed) => {
+                    crate::platform::app_log::info(format!("servo-engine: navigate {url}"));
                     state.generation = generation;
                     state.load_started_at = Some(Instant::now());
                     state

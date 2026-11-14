@@ -16,6 +16,12 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
+// Servo's surfman GPU-selection exports (NVIDIA Optimus / AMD high-performance
+// request): without these, hybrid-GPU laptops may run WebGL on the integrated
+// chip. No-op elsewhere; required at the final-binary root to take effect.
+#[cfg(feature = "servo-engine")]
+surfman::declare_surfman!();
+
 /// Boot-owned tray-arm flag (no leak). The panic hook needs a `&'static`
 /// borrow (`set_hook` contract); this `OnceLock` provides it via `get_or_init`.
 static CRASH_ARMED: OnceLock<CrashArmed> = OnceLock::new();

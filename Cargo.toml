@@ -32,7 +32,7 @@ default = []
 # Opt-in while the backend matures: Servo's SpiderMonkey build needs Clang +
 # Python at build time and dominates clean-build/CI time, so the default
 # cargo build/test/clippy stays on the reader backend.
-servo-engine = ["dep:servo", "dep:dpi", "dep:euclid", "dep:url"]
+servo-engine = ["dep:servo", "dep:dpi", "dep:euclid", "dep:url", "dep:surfman"]
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.24.2", default-features = false }
@@ -83,6 +83,7 @@ rodio = { version = "0.20", default-features = false, features = ["mp3"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 serde = { version = "1", features = ["derive"] }
 servo = { version = "0.8.0", optional = true }
+surfman = { version = "0.14", optional = true }
 url = { version = "2", optional = true }
 dpi = { version = "0.1", optional = true }
 euclid = { version = "0.22", optional = true }

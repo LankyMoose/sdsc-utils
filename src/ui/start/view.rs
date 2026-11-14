@@ -831,8 +831,13 @@ pub fn browser_page_view(state: &State) -> Element<'_, StartMessage> {
     let body_text = if session.error().is_none() && session.has_content() {
         session.body()
     } else if !session.loading() && !session.has_content() {
-        "Fetches the page and strips it to text — a fast path for guides and docs. \
-         Pages that need JavaScript will not render here; use “Open in system browser”."
+        if state.browser_engine {
+            "Engine rendering — type a URL and press Go. Pages paint as \
+             pixels here; reader text only appears when the engine is off."
+        } else {
+            "Reader view — type a URL and press Go. (No engine in this \
+             build: use --features servo-engine for rendered pages.)"
+        }
     } else {
         ""
     };
@@ -861,8 +866,10 @@ pub fn browser_view(state: &State) -> Element<'_, StartMessage> {
         format!("Error: {err}")
     } else if session.has_content() {
         session.title().unwrap_or_else(|| session.url()).to_string()
+    } else if state.browser_engine {
+        "Engine — type a URL and press Go.".to_string()
     } else {
-        "Reader view — type a URL and press Go.".to_string()
+        "Reader — type a URL and press Go.".to_string()
     };
     let press = HintPress::for_owner(state, HintPressOwner::Browser);
     column![
@@ -1110,6 +1117,10 @@ pub struct State {
     /// In-Start reader browser surface (Servo offscreen target; phase-1
     /// fetch backend). Open = dialog overlay above the stage.
     pub browser: BrowserPanel,
+    /// True when the Servo engine worker is live (`servo-engine` feature and
+    /// successful spawn). Drives the card's backend label; synced once at
+    /// boot (process-static, like renderer prefs).
+    pub browser_engine: bool,
     pub triangle_progress: f32,
     pub cross_progress: f32,
     /// Face buttons currently held (pad OR keyboard) for action-hint press styling.
@@ -1353,6 +1364,7 @@ impl Default for State {
             manual_add: None,
             edit_confirm: None,
             browser: BrowserPanel::default(),
+            browser_engine: false,
             settings: crate::ui::start::settings::SettingsPanel::default(),
             triangle_progress: 0.0,
             cross_progress: 0.0,

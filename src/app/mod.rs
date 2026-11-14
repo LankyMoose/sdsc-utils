@@ -885,6 +885,14 @@ impl App {
         app.sync_low_battery();
         app.refresh_analytics_panel();
         app.seed_steam_library_from_cache();
+        // Engine presence is process-static: sync once so the browser card
+        // can label its backend (engine pixels vs reader text).
+        app.start_state.browser_engine = app.engine.is_some();
+        if app.engine.is_some() {
+            crate::platform::app_log::info("browser: engine backend active");
+        } else {
+            crate::platform::app_log::info("browser: reader backend active");
+        }
 
         // Renderer-pref restart: reopen to the pre-restart UI state.
         // Consumed once; stale (>120s) records are ignored by `take()`.
