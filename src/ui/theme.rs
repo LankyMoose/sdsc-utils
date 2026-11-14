@@ -219,6 +219,25 @@ pub fn cursor_morph(_theme: &Theme, radius: f32) -> container::Style {
     }
 }
 
+/// Debug-only snap-target outline (F10 browser overlay): thin 1px ring per
+/// focusable, colored by kind so coverage gaps are visible at a glance.
+pub fn debug_target(_theme: &Theme, kind: crate::browser::cursor::FocusKind) -> container::Style {
+    use crate::browser::cursor::FocusKind;
+    container::Style {
+        border: Border {
+            color: match kind {
+                FocusKind::Link => SUCCESS,
+                FocusKind::Button => WARNING,
+                FocusKind::Field => DANGER,
+                FocusKind::Other => MUTED,
+            },
+            width: 1.0,
+            radius: 2.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Opaque chrome fill (transition veils, fallback view).
 pub fn root(_theme: &Theme) -> container::Style {
     container::Style {

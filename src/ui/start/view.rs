@@ -910,7 +910,7 @@ fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, 
     );
     // Corner radius in card px: circle (10) ↔ wrap (SM).
     let radius = 10.0 + (crate::ui::theme::radius::SM - 10.0) * t;
-    let body: Element<'_, StartMessage> = column![
+    let morph: Element<'_, StartMessage> = column![
         space().height(Length::Fixed(y.max(0.0))),
         row![
             space().width(Length::Fixed(x.max(0.0))),
@@ -920,6 +920,34 @@ fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, 
     ]
     .spacing(0)
     .into();
+    // F10 coverage view: one thin ring per snap target, colored by kind.
+    // Viewport-culled (offscreen boxes are invisible anyway); the count in
+    // the debug line below still reports the full set.
+    let body: Element<'_, StartMessage> = if panel.debug_overlay {
+        let mut overlay = stack![morph];
+        for f in &panel.focusables {
+            let (bx, by) = (f.x * scale, f.y * scale);
+            let (bw, bh) = ((f.w * scale).max(3.0), (f.h * scale).max(3.0));
+            if bx + bw < -50.0 || bx > img_w + 50.0 || by + bh < -50.0 || by > img_h + 50.0 {
+                continue;
+            }
+            let kind = f.kind;
+            overlay = overlay.push(
+                column![
+                    space().height(Length::Fixed(by.max(0.0))),
+                    row![
+                        space().width(Length::Fixed(bx.max(0.0))),
+                        container(space().width(Length::Fixed(bw)).height(Length::Fixed(bh)))
+                            .style(move |theme| crate::ui::theme::debug_target(theme, kind)),
+                    ],
+                ]
+                .spacing(0),
+            );
+        }
+        overlay.into()
+    } else {
+        morph
+    };
     container(body)
         .width(Length::Fixed(img_w))
         .height(Length::Fixed(img_h))
