@@ -12,6 +12,9 @@ jobs:
   windows:
     name: Windows
     runs-on: windows-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v4
 
@@ -24,12 +27,28 @@ jobs:
           toolchain: 1.99.1
           components: rustfmt, clippy
 
+      - name: Install Servo build prerequisites (Clang; Python is preinstalled)
+        shell: bash
+        run: |
+          choco install llvm --no-progress -y
+          echo "LIBCLANG_PATH=C:/Program Files/LLVM/bin" >> "$GITHUB_ENV"
+          # Stylo codegen wants `python.exe` on PATH or PYTHON3; pin it so a
+          # PATH surprise fails here instead of inside the Servo build.
+          echo "PYTHON3=$(cygpath -w "$(which python)")" >> "$GITHUB_ENV"
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
       - name: Format, Clippy, Test
         shell: bash
         run: bash scripts/ci.sh
+
+      - name: sccache stats
+        shell: bash
+        run: $SCCACHE_PATH --show-stats
 
   msrv:
     name: MSRV floor
@@ -42,9 +61,10 @@ jobs:
         with:
           # Must track `rust-version` in Cargo.toml. Only a compile check:
           # it enforces the floor claim against the exact committed
-          # dependency set, nothing more.
+          # dependency set, nothing more. Scoped to `--no-default-features`:
+          # the default-on Servo engine needs the pinned toolchain.
           toolchain: 1.88
 
-      - name: Check MSRV floor
+      - name: Check MSRV floor (app code only; the default-on engine needs a newer rustc)
         shell: bash
-        run: cargo +1.88 check --locked --all-targets
+        run: cargo +1.88 check --locked --all-targets --no-default-features

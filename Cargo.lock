@@ -7330,8 +7330,6 @@ dependencies = [
  "servo-constellation",
  "servo-constellation-traits",
  "servo-default-resources",
- "servo-devtools",
- "servo-devtools-traits",
  "servo-embedder-traits",
  "servo-fonts",
  "servo-geometry",
@@ -7531,7 +7529,6 @@ dependencies = [
  "servo-canvas-traits",
  "servo-config",
  "servo-constellation-traits",
- "servo-devtools-traits",
  "servo-embedder-traits",
  "servo-fonts",
  "servo-layout-api",
@@ -7568,7 +7565,6 @@ dependencies = [
  "servo-base",
  "servo-canvas-traits",
  "servo-config",
- "servo-devtools-traits",
  "servo-embedder-traits",
  "servo-fonts-traits",
  "servo-hyper-serde",
@@ -7603,56 +7599,6 @@ dependencies = [
  "proc-macro2",
  "syn 2.0.119",
  "synstructure 0.13.2",
-]
-
-[[package]]
-name = "servo-devtools"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba7f336b4c90414dd61faa71e259a829b11e3135efcdd172f6bc72ab521d6cf"
-dependencies = [
- "atomic_refcell",
- "base64 0.23.1",
- "chrono",
- "crossbeam-channel",
- "headers",
- "http",
- "log",
- "malloc_size_of_derive",
- "parking_lot",
- "rand 0.10.3",
- "rustc-hash 2.1.3",
- "serde",
- "serde_json",
- "servo-base",
- "servo-config",
- "servo-devtools-traits",
- "servo-embedder-traits",
- "servo-malloc-size-of",
- "servo-net",
- "servo-net-traits",
- "servo-profile-traits",
- "servo-url",
- "uuid",
-]
-
-[[package]]
-name = "servo-devtools-traits"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4556008469ffd1f74e32db188ea79ca5e77e9be9c2929b7cf1ab61ce8327758c"
-dependencies = [
- "bytes",
- "http",
- "malloc_size_of_derive",
- "serde",
- "servo-base",
- "servo-embedder-traits",
- "servo-malloc-size-of",
- "servo-net-traits",
- "servo-profile-traits",
- "servo-url",
- "uuid",
 ]
 
 [[package]]
@@ -8206,7 +8152,6 @@ dependencies = [
  "serde",
  "servo-base",
  "servo-config",
- "servo-devtools-traits",
  "servo-embedder-traits",
  "servo-fonts",
  "servo-hyper-serde",
@@ -8465,7 +8410,6 @@ dependencies = [
  "servo-config",
  "servo-constellation-traits",
  "servo-deny-public-fields",
- "servo-devtools-traits",
  "servo-dom-struct",
  "servo-embedder-traits",
  "servo-fonts",
@@ -8580,7 +8524,6 @@ dependencies = [
  "servo-canvas-traits",
  "servo-config",
  "servo-constellation-traits",
- "servo-devtools-traits",
  "servo-embedder-traits",
  "servo-fonts-traits",
  "servo-malloc-size-of",

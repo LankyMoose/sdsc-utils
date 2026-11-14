@@ -1,10 +1,10 @@
 //! Engine seam: commands down to the page backend, frames/events up.
 //!
-//! The `servo-engine` cargo feature swaps the reader backend for a Servo
-//! offscreen worker thread (see `servo_backend`); without it the App never
-//! constructs a handle and this module is pure types + tests. Either way the
-//! UI only depends on [`EngineCommand`] / [`EngineEvent`], so the backend is
-//! replaceable without touching Start.
+//! The `servo-engine` cargo feature (on by default) backs this with a Servo
+//! offscreen worker thread (see `servo_backend`); `--no-default-features`
+//! keeps the reader backend and the App never constructs a handle. Either
+//! way the UI only depends on [`EngineCommand`] / [`EngineEvent`], so the
+//! backend is replaceable without touching Start.
 
 use std::sync::{Arc, Mutex, mpsc};
 

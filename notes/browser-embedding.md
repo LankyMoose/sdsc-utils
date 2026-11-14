@@ -24,9 +24,9 @@ touching `src/browser/`, the Start browser surface, or the `servo-engine` featur
 - `src/browser/servo_backend.rs` (`servo-engine` feature only) — worker
   thread owning all Servo types (`!Send` by design). Suspend = skip spin +
   long sleep; generation-guarded loads; 30s load timeout.
-- `src/browser/fetch.rs` + `BrowserSession` — reader backend (default
-  build). `BrowserSession` also carries the engine `BrowserFrame` and all
-  suspend/resume generation guards.
+- `src/browser/fetch.rs` + `BrowserSession` — reader backend (the
+  `--no-default-features` fallback). `BrowserSession` also carries the engine
+  `BrowserFrame` and all suspend/resume generation guards.
 - `src/browser/mod.rs` — `AppManager` (one foreground app, rest
   hidden/unfocused/suspended) + `open_browser` helper.
 - Start surface (`src/ui/start/view.rs::browser_view`): wash + wide card over
@@ -54,7 +54,9 @@ Servo's SpiderMonkey/ICU needs Clang + Python at build time, the MSVC C++
 runtime import lib at link time, and a bumped Stylo thread stack:
 
 - LLVM 23 (winget `LLVM.LLVM`) for `clang`/`libclang` (`LIBCLANG_PATH`).
-- Python 3.13 (winget `Python.Python.3.13`).
+- Python 3.13 (winget `Python.Python.3.13`). Stylo's codegen runs at build
+  time and looks for `python.exe` on `PATH` (or the `PYTHON3` env var) —
+  a missing interpreter fails the build with "Can't find python".
 - BuildTools ≥ 17.14 (MSVC 14.44): older STLs lack the `__std_*` vectorized
   helpers mozjs/ICU reference → LNK2019. `build.rs` links `msvcprt` on
   Windows MSVC for the same reason (proven by the spike link).
@@ -70,10 +72,14 @@ runtime import lib at link time, and a bumped Stylo thread stack:
 ## Feature flag
 
 `servo-engine = ["dep:servo", "dep:dpi", "dep:euclid", "dep:url"]`,
-default off while the backend matures: Servo dominates clean-build/CI time.
-Default `cargo test`/CI stays on the reader backend; test the engine with
-`cargo run --features servo-engine`. Flip default when the backend is the
-product path.
+**on by default** (single exe): plain `cargo run` / `cargo test` / CI builds
+the engine. `servo` itself is `default-features = false` plus `bundled`,
+`clipboard`, `js_jit`, `multiprocess` — i.e. upstream defaults minus
+`devtools` (remote-debugging server, pure build cost; JIT and multiprocess
+stay for page performance). UI-only iteration skips Servo entirely with
+`cargo run --no-default-features` (reader backend) or `SDSC_NO_ENGINE=1`
+at runtime; the MSRV job uses `--no-default-features` since the engine
+needs the pinned toolchain.
 
 ## Open gaps (phase 2+)
 
