@@ -128,11 +128,10 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_url_changed(&self, _webview: WebView, url: url::Url) {
-        let mut shared = self.shared.borrow_mut();
-        // Redirects land here: track the real document identity so the
-        // history comparison below stays consistent.
-        shared.last_url = Some(doc_key(url.as_str()).to_string());
-        shared.handle.emit(EngineEvent::UrlChanged {
+        // NOTE: deliberately does not touch `last_url` — history comparison
+        // owns document identity, and url-changed fires first on
+        // client-side navigations. Updating here would pre-empt the clear.
+        self.shared.borrow().handle.emit(EngineEvent::UrlChanged {
             url: url.to_string(),
         });
     }
@@ -146,10 +145,12 @@ impl WebViewDelegate for Delegate {
         };
         let mut shared = self.shared.borrow_mut();
         let key = doc_key(url.as_str());
-        if shared.last_url.as_deref() != Some(key) {
-            shared.last_url = Some(key.to_string());
-            clear_tree(&mut shared);
+        if shared.last_url.as_deref() == Some(key) {
+            return;
         }
+        crate::platform::app_log::info(format!("servo-engine: history cleared for {key}"));
+        shared.last_url = Some(key.to_string());
+        clear_tree(&mut shared);
     }
 
     fn notify_page_title_changed(&self, _webview: WebView, title: Option<String>) {

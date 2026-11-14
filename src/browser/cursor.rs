@@ -62,6 +62,11 @@ pub const DOCK_BLEND_PER_SEC: f32 = 7.0;
 /// D-pad flight speed, px/s: jumps and nudges glide to the target instead
 /// of teleporting; stick input cancels back to manual control.
 pub const FLY_SPEED: f32 = 2400.0;
+/// Break-free stick deflection while docked: past this the dock releases at
+/// once (detach + outward kick) instead of fighting gravity off gradually.
+pub const BREAK_FREE_DEFLECT: f32 = 0.3;
+/// Outward kick on break-free, px/s: immediate motion in the push direction.
+pub const BREAK_KICK: f32 = 800.0;
 /// Right-stick scroll speed at full deflection, px/s.
 pub const SCROLL_SPEED: f32 = 1500.0;
 /// Engine viewport the cursor space matches (see `servo_backend`).
@@ -94,6 +99,9 @@ pub struct Cursor {
     /// D-pad flight target (page px): jumps/nudges glide here at
     /// [`FLY_SPEED`] instead of teleporting; stick input cancels.
     pub fly_to: Option<(f32, f32)>,
+    /// Break-free suppression: id that must not re-dock until the point
+    /// leaves its hold pad (prevents instant re-capture after a push-off).
+    pub no_dock: Option<u64>,
     /// Magnetic mode (L3 toggles): snap + glide to nearby elements.
     /// Off = pure free-form virtual mouse; D-pad jumping still applies.
     pub magnet: bool,
@@ -111,6 +119,7 @@ impl Cursor {
             dock_blend: 0.0,
             last_dock: None,
             fly_to: None,
+            no_dock: None,
             magnet: true,
             visible: true,
         }
@@ -137,6 +146,30 @@ impl Cursor {
         // manual control.
         if self.fly_to.is_some() && (lx != 0.0 || ly != 0.0) {
             self.fly_to = None;
+        }
+        // Docked: pinned — no velocity, no gravity. A firm push breaks free
+        // at once (detach + kick outward); page motion carrying the element
+        // away releases without a kick.
+        if self.attached.is_some() {
+            self.vx = 0.0;
+            self.vy = 0.0;
+            let pushed = lx.hypot(ly) > BREAK_FREE_DEFLECT;
+            let held = self
+                .attached
+                .and_then(|id| options.iter().find(|o| o.id == id))
+                .is_some_and(|item| self.inside_expanded(item, HOLD_PAD));
+            if pushed || !held {
+                let was = self.attached;
+                self.attached = None;
+                self.no_dock = was;
+                if pushed {
+                    self.vx = lx * BREAK_KICK;
+                    self.vy = ly * BREAK_KICK;
+                }
+            } else {
+                self.ease_blend(dt_secs);
+                return;
+            }
         }
         if let Some((tx, ty)) = self.fly_to {
             let dx = tx - self.x;
@@ -196,6 +229,11 @@ impl Cursor {
         if self.magnet {
             self.snap(options);
         }
+        self.ease_blend(dt_secs);
+    }
+
+    /// Ease the outline morph toward the attachment (1 = docked, 0 = free).
+    fn ease_blend(&mut self, dt_secs: f32) {
         let target = if self.attached.is_some() { 1.0 } else { 0.0 };
         let step = DOCK_BLEND_PER_SEC * dt_secs;
         if self.dock_blend < target {
@@ -322,6 +360,15 @@ impl Cursor {
             self.attached = None;
             return;
         }
+        // Break-free suppression lifts once the point leaves the hold pad.
+        if let Some(sup) = self.no_dock
+            && !options
+                .iter()
+                .find(|o| o.id == sup)
+                .is_some_and(|item| self.inside_expanded(item, HOLD_PAD))
+        {
+            self.no_dock = None;
+        }
         if let Some(id) = self.attached
             && let Some(item) = options.iter().find(|o| o.id == id)
             && self.inside_expanded(item, HOLD_PAD)
@@ -332,6 +379,10 @@ impl Cursor {
         let mut best: Option<(u64, f32)> = None;
         for item in options {
             if !self.inside_expanded(item, ACQUIRE_PAD) {
+                continue;
+            }
+            // Suppressed (just pushed off): no instant re-capture.
+            if Some(item.id) == self.no_dock {
                 continue;
             }
             let d = (item.x + item.w / 2.0 - self.x).hypot(item.y + item.h / 2.0 - self.y);
@@ -635,6 +686,87 @@ mod tests {
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, None);
         assert!(c.x < 210.0 && c.x > 200.0, "glides, not snaps: x={}", c.x);
+    }
+
+    #[test]
+    fn docked_cursor_is_pinned_until_pushed() {
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        // Neutral ticks: frozen, no drift, no velocity.
+        for _ in 0..10 {
+            c.advance(0.0, 0.0, 0.016, &items);
+        }
+        assert_eq!((c.x, c.y), (150.0, 115.0));
+        assert_eq!((c.vx, c.vy), (0.0, 0.0));
+        assert_eq!(c.attached, Some(1));
+        // Weak push below threshold: stays pinned and put.
+        c.advance(0.1, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        assert_eq!((c.x, c.y), (150.0, 115.0));
+    }
+
+    #[test]
+    fn firm_push_breaks_free_at_once_with_kick() {
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        // One firm tick: detached immediately, moving outward, suppressed
+        // from instant re-capture while still inside the hold pad.
+        c.advance(1.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, None);
+        assert_eq!(c.no_dock, Some(1));
+        assert!(c.x > 150.0, "kick moves out at once, x={}", c.x);
+        // Keeps escaping while held; no re-dock inside the pad.
+        for _ in 0..5 {
+            c.advance(1.0, 0.0, 0.016, &items);
+        }
+        assert_eq!(c.attached, None);
+        assert!(c.x > 200.0, "outward progress, x={}", c.x);
+    }
+
+    #[test]
+    fn suppression_lifts_after_leaving_and_redocks() {
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        c.advance(1.0, 0.0, 0.016, &items);
+        assert_eq!(c.no_dock, Some(1));
+        // Flown clear of the hold pad: suppression lifts.
+        c.x = 500.0;
+        c.y = 500.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.no_dock, None);
+        assert_eq!(c.attached, None);
+        // Back inside: docks again.
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+    }
+
+    #[test]
+    fn element_carried_away_releases_without_kick() {
+        // Page motion (scroll) moves the rect off the frozen point: the
+        // dock releases, and with no stick there is no kick.
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        let moved = [link(1, 100.0, 500.0)];
+        c.advance(0.0, 0.0, 0.016, &moved);
+        assert_eq!(c.attached, None);
+        assert_eq!((c.x, c.y), (150.0, 115.0));
     }
 
     #[test]
