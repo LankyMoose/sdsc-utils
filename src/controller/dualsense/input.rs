@@ -23,6 +23,11 @@ pub fn parse_report(buf: &[u8], base: usize) -> PadSample {
     let buttons2 = buf.get(base + 10).copied().unwrap_or(0);
 
     let (dx, dy) = combined_stick(lx, ly, rx, ry);
+    // Per-stick vectors for surfaces that own a stick each (browser: left
+    // moves the cursor, right scrolls). Games keep reading the combined
+    // pair above, unchanged.
+    let (lstick_x, lstick_y) = combined_stick(lx, ly, 0.0, 0.0);
+    let (rstick_x, rstick_y) = combined_stick(rx, ry, 0.0, 0.0);
 
     let dpad = buttons0 & 0x0F;
     let (dpad_up, dpad_down, dpad_left, dpad_right) = match dpad {
@@ -122,6 +127,10 @@ pub fn parse_report(buf: &[u8], base: usize) -> PadSample {
         held,
         stick_x: dx,
         stick_y: dy,
+        lstick_x,
+        lstick_y,
+        rstick_x,
+        rstick_y,
         dpad_up,
         dpad_down,
         dpad_left,
@@ -132,6 +141,9 @@ pub fn parse_report(buf: &[u8], base: usize) -> PadSample {
         triangle,
         options,
         create,
+        l1,
+        r1,
+        l3,
         l2,
         r2,
     }

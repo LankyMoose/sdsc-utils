@@ -324,7 +324,10 @@ pub fn view<'a>(
     // click toggles it closed, exactly like Circle/Cancel; the card absorbs
     // clicks. Above modals, below the settings drawer.
     if state.browser.session.is_open() {
-        let card_w = (stage_w - 100.0).max(320.0);
+        // Image width drives the card: fixed engine aspect keeps the
+        // page→card mapping a single uniform scale for the cursor.
+        let img_w = (stage_w - 100.0 - 48.0).clamp(320.0, 800.0);
+        let card_w = img_w + 48.0;
         let card_h = (stage_h - 100.0).max(240.0);
         layers.push(overlay::wash(
             overlay::reveal(1.0),
@@ -332,7 +335,11 @@ pub fn view<'a>(
         ));
         layers.push(overlay::centered(Scale::new(
             overlay::click_shield(
-                overlay::dialog_card(browser_view(state), Length::Fixed(card_w), Some(card_h)),
+                overlay::dialog_card(
+                    browser_view(state, img_w),
+                    Length::Fixed(card_w),
+                    Some(card_h),
+                ),
                 StartMessage::Noop,
             ),
             1.0,

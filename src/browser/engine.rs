@@ -32,6 +32,12 @@ pub enum EngineCommand {
     SetDarkMode {
         dark: bool,
     },
+    /// Click at a page point (device px == page px at 1x). Sent as
+    /// down+up by the backend; the pad cursor owns this, never the OS mouse.
+    ClickAt {
+        x: f32,
+        y: f32,
+    },
     GoBack,
     GoForward,
     Resize {
@@ -59,6 +65,9 @@ pub enum EngineEvent {
     UrlChanged {
         url: String,
     },
+    /// Fresh focusable set from the accessibility tree. The UI re-snaps the
+    /// cursor and drops stale attachments.
+    A11yTree(Vec<crate::browser::cursor::Focusable>),
     LoadFinished {
         generation: u64,
         result: Result<(), String>,

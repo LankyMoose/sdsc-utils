@@ -13,6 +13,7 @@ use super::{
     spawn_blocking, steam_appid_from_target,
 };
 use crate::AppResult;
+use crate::browser::cursor::JumpDir;
 use crate::browser::engine::{EngineCommand, EngineEvent};
 use crate::browser::keys::{self as browser_keys, RawKey};
 use crate::controller::dualsense::rumble::MotorPulse;
@@ -477,6 +478,10 @@ impl App {
         self.start_state.browser.draft = url.clone();
         self.start_state.browser.scroll_y = 0.0;
         self.start_state.browser.url_editing = false;
+        // Fresh page: cursor back to center; focusables arrive with the
+        // accessibility tree.
+        self.start_state.browser.cursor = crate::browser::cursor::Cursor::new();
+        self.start_state.browser.focusables.clear();
         let generation = self.start_state.browser.session.begin_load(url.clone());
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Nav);
@@ -712,7 +717,55 @@ impl App {
         Task::none()
     }
 
-    /// Pad/keyboard body scroll for the open browser surface. With engine
+    /// Per-poll analog layer for the engine browser: left stick moves the
+    /// virtual cursor (magnetic snap), right stick scrolls. No-op without an
+    /// engine (reader mode has edge-only input).
+    pub(crate) fn tick_browser_cursor(
+        &mut self,
+        readings: &[start_input::NavReading],
+        now: Instant,
+    ) {
+        let Some(reading) = start_input::preferred_reading(readings) else {
+            return;
+        };
+        let sample = &reading.sample;
+        if sample.lstick_x == 0.0
+            && sample.lstick_y == 0.0
+            && sample.rstick_x == 0.0
+            && sample.rstick_y == 0.0
+        {
+            // Still stamp the clock so a later deflection starts clean.
+            self.start_state.browser.analog_at = Some(now);
+            return;
+        }
+        let (dx, dy) = self.start_state.browser.advance_stick(
+            sample.lstick_x,
+            sample.lstick_y,
+            sample.rstick_x,
+            sample.rstick_y,
+            now,
+        );
+        if (dx != 0.0 || dy != 0.0)
+            && let Some(engine) = &self.engine
+        {
+            engine.send(EngineCommand::ScrollBy { dx, dy });
+        }
+    }
+
+    /// Click at the cursor: attached element center, else the free point.
+    pub(crate) fn click_browser_cursor(&mut self) -> Task<Message> {
+        let (x, y) = {
+            let panel = &self.start_state.browser;
+            panel.cursor.click_point(&panel.focusables)
+        };
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::ClickAt { x, y });
+        }
+        Task::none()
+    }
+
+    /// Pad/keyboard body scroll for the reader browser (engine mode scrolls
+    /// via [`Self::tick_browser_cursor`] instead). With engine
     /// pixels on screen the scroll goes to the engine (which repaints);
     /// the reader path scrolls the text widget instead.
     pub(crate) fn scroll_browser(&mut self, delta: f32) -> Task<Message> {
@@ -750,6 +803,13 @@ impl App {
             EngineEvent::UrlChanged { url } => {
                 self.start_state.browser.session.note_url(url.clone());
                 self.start_state.browser.draft = url;
+            }
+            EngineEvent::A11yTree(items) => {
+                self.start_state.browser.focusables = items;
+                self.start_state
+                    .browser
+                    .cursor
+                    .retarget(&self.start_state.browser.focusables);
             }
             EngineEvent::LoadFinished { generation, result } => match result {
                 Ok(()) => {
@@ -1861,41 +1921,90 @@ impl App {
             self.start_state.tick_hint_anims(now);
             self.on_start_settings_nav(tick.action)
         } else if browser_open {
-            // Browser surface owns pad input while open: Up/Down scroll the
-            // body, Cross uses (Enter) or goes (URL mode), Circle backs out
-            // of URL mode or closes, Triangle toggles URL entry, Square tabs
-            // focus, Left/Right travel history. Game nav, holds, and surface
-            // toggles stay parked (same discipline as modals).
+            // Controller-first input. Engine mode (frames on screen): the
+            // left stick moves the virtual cursor (magnetic snap), the
+            // D-pad jumps/nudges it, the right stick scrolls, L1/R1 travel
+            // history, Cross clicks, Square tabs DOM focus, Triangle edits
+            // the URL, Circle backs out or closes. Reader mode keeps the
+            // legacy mapping (D-pad scrolls, Cross goes). Game nav, holds,
+            // and surface toggles stay parked (same discipline as modals).
             self.start_state.cross_progress = 0.0;
             self.start_state.triangle_progress = 0.0;
             self.keyboard_cross_hold.reset();
             self.start_state.tick_hint_anims(now);
-            match tick.action {
-                Some(NavAction::Up) => {
-                    self.scroll_browser(-crate::ui::start::view::BROWSER_SCROLL_STEP)
-                }
-                Some(NavAction::Down) => {
-                    self.scroll_browser(crate::ui::start::view::BROWSER_SCROLL_STEP)
-                }
-                Some(NavAction::Left) => self.on_start_message(StartMessage::BrowserBack),
-                Some(NavAction::Right) => self.on_start_message(StartMessage::BrowserForward),
-                Some(NavAction::Confirm) => {
-                    if self.start_state.browser.url_editing {
-                        self.on_start_message(StartMessage::BrowserNavigate)
-                    } else {
-                        self.send_pad_keys(keyboard_types::NamedKey::Enter)
+            if self.start_state.browser.session.has_frame() {
+                self.tick_browser_cursor(readings, now);
+                match tick.action {
+                    Some(NavAction::Up) => {
+                        self.start_state.browser.jump_cursor(JumpDir::Up);
+                        Task::none()
                     }
-                }
-                Some(NavAction::Cancel) => {
-                    if self.start_state.browser.url_editing {
+                    Some(NavAction::Down) => {
+                        self.start_state.browser.jump_cursor(JumpDir::Down);
+                        Task::none()
+                    }
+                    Some(NavAction::Left) => {
+                        self.start_state.browser.jump_cursor(JumpDir::Left);
+                        Task::none()
+                    }
+                    Some(NavAction::Right) => {
+                        self.start_state.browser.jump_cursor(JumpDir::Right);
+                        Task::none()
+                    }
+                    Some(NavAction::Confirm) => {
+                        if self.start_state.browser.url_editing {
+                            self.on_start_message(StartMessage::BrowserNavigate)
+                        } else {
+                            self.click_browser_cursor()
+                        }
+                    }
+                    Some(NavAction::Cancel) => {
+                        if self.start_state.browser.url_editing {
+                            self.on_start_message(StartMessage::ToggleUrlEntry)
+                        } else {
+                            self.on_start_message(StartMessage::Close)
+                        }
+                    }
+                    Some(NavAction::ToggleEdit) => {
                         self.on_start_message(StartMessage::ToggleUrlEntry)
-                    } else {
-                        self.on_start_message(StartMessage::Close)
                     }
+                    Some(NavAction::CycleSort) => self.send_pad_keys(keyboard_types::NamedKey::Tab),
+                    Some(NavAction::BumperLeft) => self.on_start_message(StartMessage::BrowserBack),
+                    Some(NavAction::BumperRight) => {
+                        self.on_start_message(StartMessage::BrowserForward)
+                    }
+                    Some(NavAction::ToggleMagnetism) => {
+                        self.start_state.browser.cursor.magnet =
+                            !self.start_state.browser.cursor.magnet;
+                        crate::controller::hid::diag::diag_info(format!(
+                            "ui-diag: start browser magnet {}",
+                            if self.start_state.browser.cursor.magnet {
+                                "on"
+                            } else {
+                                "off"
+                            }
+                        ));
+                        Task::none()
+                    }
+                    _ => Task::none(),
                 }
-                Some(NavAction::ToggleEdit) => self.on_start_message(StartMessage::ToggleUrlEntry),
-                Some(NavAction::CycleSort) => self.send_pad_keys(keyboard_types::NamedKey::Tab),
-                _ => Task::none(),
+            } else {
+                match tick.action {
+                    Some(NavAction::Up) => {
+                        self.scroll_browser(-crate::ui::start::view::BROWSER_SCROLL_STEP)
+                    }
+                    Some(NavAction::Down) => {
+                        self.scroll_browser(crate::ui::start::view::BROWSER_SCROLL_STEP)
+                    }
+                    Some(NavAction::Confirm) => {
+                        self.on_start_message(StartMessage::BrowserNavigate)
+                    }
+                    Some(NavAction::Cancel) => self.on_start_message(StartMessage::Close),
+                    Some(NavAction::ToggleEdit) => {
+                        self.on_start_message(StartMessage::ToggleUrlEntry)
+                    }
+                    _ => Task::none(),
+                }
             }
         } else if animating {
             self.start_state.tick_hint_anims(now);
@@ -2002,6 +2111,10 @@ impl App {
                         self.on_start_message(StartMessage::MoveDown)
                     }
                     NavAction::Left | NavAction::Right => Task::none(),
+                    // Bumpers are browser-only (history); L3 toggles the
+                    // browser cursor magnet — both ignored on games.
+                    NavAction::BumperLeft | NavAction::BumperRight => Task::none(),
+                    NavAction::ToggleMagnetism => Task::none(),
                     NavAction::ToggleControllers => {
                         self.on_start_message(StartMessage::ToggleControllers)
                     }
@@ -3903,15 +4016,18 @@ pub(crate) fn start_cold_allows(message: &StartMessage) -> bool {
 }
 
 /// Whether pad directionals flow into the nav stepper, read off live Start
-/// state. Settings and the browser own directionals (settings focus moves /
-/// browser body scroll); otherwise they park while chrome animates or a
-/// modal owns input. The stepper suppresses directionals entirely when
-/// false, so a surface that consumes Up/Down (browser scroll) must keep
-/// this true.
+/// state. Settings and the reader browser own directionals (settings focus
+/// moves / reader body scroll); otherwise they park while chrome animates
+/// or a modal owns input. The stepper suppresses directionals entirely when
+/// false. The engine browser drives its cursor manually per poll, so its
+/// directionals must NOT flow here (or every pad move would double-fire).
 pub(crate) fn start_nav_move_allowed(state: &start_view::State) -> bool {
+    let browser_open = state.browser.session.is_open();
+    let engine_mode = browser_open && state.browser.session.has_frame();
     state.settings.open
-        || state.browser.session.is_open()
-        || (!state.animating()
+        || (browser_open && !engine_mode)
+        || (!browser_open
+            && !state.animating()
             && state.replace_confirm.is_none()
             && state.manual_add.is_none()
             && state.edit_confirm.is_none())
@@ -3947,12 +4063,15 @@ mod tests {
     }
 
     #[test]
-    fn browser_open_keeps_nav_movement_flowing() {
+    fn browser_open_keeps_nav_movement_flowing_for_reader() {
         use super::start_nav_move_allowed;
+        use crate::browser::BrowserFrame;
         use crate::ui::start::view::{EditConfirm, ManualAddDraft, ReplaceConfirm, State};
-        // Regression: the browser consumes pad Up/Down for body scroll via
-        // the stepper, which suppresses directionals when movement is
-        // parked. Settings behaves the same (focus moves).
+        // Regression: the reader browser consumes pad Up/Down for body scroll
+        // via the stepper, which suppresses directionals when movement is
+        // parked. Settings behaves the same (focus moves). The engine
+        // browser drives its cursor manually per poll, so its directionals
+        // must NOT flow (or every pad move would double-fire).
         let mut state = State::default();
         assert!(start_nav_move_allowed(&state));
         state.settings.open = true;
@@ -3960,7 +4079,15 @@ mod tests {
         state.settings.open = false;
         state.browser.session.open_surface();
         assert!(start_nav_move_allowed(&state));
+        state.browser.session.set_frame(BrowserFrame {
+            width: 800,
+            height: 600,
+            handle: iced::widget::image::Handle::from_rgba(800, 600, vec![0; 800 * 600 * 4]),
+        });
+        assert!(!start_nav_move_allowed(&state));
         state.browser.session.close_surface();
+        assert!(start_nav_move_allowed(&state));
+        state.browser.session.open_surface();
         state.manual_add = Some(ManualAddDraft {
             edit_id: None,
             target: String::new(),

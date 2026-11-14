@@ -241,8 +241,14 @@ pub enum NavAction {
     Cancel,
     Left,
     Right,
+    /// L1 bumper edge — history back in the browser; ignored elsewhere.
+    BumperLeft,
+    /// R1 bumper edge — history forward in the browser; ignored elsewhere.
+    BumperRight,
     ToggleEdit,
     CycleSort,
+    /// L3 click — toggle virtual-cursor magnetism (browser only).
+    ToggleMagnetism,
     /// Triangle edge — edit selected manual while in edit mode.
     Triangle,
     /// Options — open/close Start settings.
@@ -255,9 +261,22 @@ pub enum NavAction {
 pub struct PadSample {
     pub held: BTreeSet<GestureControl>,
     /// Combined stick X after deadzone; negative = left. Non-zero means past deadzone.
+    ///
+    /// Legacy sum of both sticks (games nav reads this; unchanged).
     pub stick_x: f32,
     /// Combined stick Y after deadzone; negative = up. Non-zero means past deadzone.
     pub stick_y: f32,
+    /// Left stick alone (browser cursor). Same deadzone feel as the combined
+    /// path, without the right stick folded in.
+    #[serde(default)]
+    pub lstick_x: f32,
+    #[serde(default)]
+    pub lstick_y: f32,
+    /// Right stick alone (browser scroll).
+    #[serde(default)]
+    pub rstick_x: f32,
+    #[serde(default)]
+    pub rstick_y: f32,
     pub dpad_up: bool,
     pub dpad_down: bool,
     pub dpad_left: bool,
@@ -270,6 +289,14 @@ pub struct PadSample {
     pub create: bool,
     pub l2: bool,
     pub r2: bool,
+    /// L1/R1 bumpers (browser history). Parsed but previously dropped.
+    #[serde(default)]
+    pub l1: bool,
+    #[serde(default)]
+    pub r1: bool,
+    /// L3 click (browser magnetism toggle). Parsed but previously dropped.
+    #[serde(default)]
+    pub l3: bool,
 }
 
 /// Which backend produced a start-screen nav sample.
@@ -625,7 +652,8 @@ impl EdgeButton {
     }
 }
 
-/// Face/Options/Create fire on release. `hold_owned` never fires here.
+/// Face/Options/Create fire on release; bumpers fire on press (no hold
+/// behavior). `hold_owned` never fires here.
 #[derive(Debug, Clone, Default)]
 pub struct ButtonEdges {
     cross: bool,
@@ -634,6 +662,9 @@ pub struct ButtonEdges {
     triangle: bool,
     options: bool,
     create: bool,
+    l1: bool,
+    r1: bool,
+    l3: bool,
     /// Face/Options/Create that went down but were cancelled by a foreign face press.
     cancel_cross: bool,
     cancel_circle: bool,
@@ -728,6 +759,28 @@ impl ButtonEdges {
         self.triangle = sample.triangle;
         self.options = sample.options;
         self.create = sample.create;
+        self.l1 = sample.l1;
+        self.r1 = sample.r1;
+        self.l3 = sample.l3;
+    }
+
+    /// Rising edge on L1/R1 (browser history). Checked before `update` syncs,
+    /// like the release path below; deliberately outside the release/cancel
+    /// machinery — bumpers have no hold semantics and must not disturb it.
+    pub fn bumper_press(&self, sample: &PadSample) -> Option<NavAction> {
+        if sample.l1 && !self.l1 {
+            Some(NavAction::BumperLeft)
+        } else if sample.r1 && !self.r1 {
+            Some(NavAction::BumperRight)
+        } else {
+            None
+        }
+    }
+
+    /// Rising edge on L3 (browser magnetism toggle). Same one-shot discipline
+    /// as the bumpers.
+    pub fn l3_press(&self, sample: &PadSample) -> bool {
+        sample.l3 && !self.l3
     }
 
     pub fn clear(&mut self) {
@@ -857,6 +910,9 @@ pub fn sample_nav_resting(sample: &PadSample) -> bool {
         && !sample.triangle
         && !sample.options
         && !sample.create
+        && !sample.l1
+        && !sample.r1
+        && !sample.l3
         && !sample.l2
         && !sample.r2
         && !sample.dpad_up
@@ -865,6 +921,10 @@ pub fn sample_nav_resting(sample: &PadSample) -> bool {
         && !sample.dpad_right
         && sample.stick_x == 0.0
         && sample.stick_y == 0.0
+        && sample.lstick_x == 0.0
+        && sample.lstick_y == 0.0
+        && sample.rstick_x == 0.0
+        && sample.rstick_y == 0.0
 }
 
 /// Pick a single reading for debug UI: prefer a non-resting pad, else the first.
@@ -1295,6 +1355,10 @@ impl PadNavBank {
                 result.triangle_completed_pad = None;
             }
 
+            // Bumpers + L3 fire on press (no hold semantics); read BEFORE
+            // `update` syncs the new state, same discipline as the release path.
+            let bumper = slot.button_edges.bumper_press(&reading.sample);
+            let l3 = slot.button_edges.l3_press(&reading.sample);
             let edge = slot.button_edges.update(&reading.sample, hold_owned);
 
             if let Some(action) = nav
@@ -1310,6 +1374,14 @@ impl PadNavBank {
                     continue;
                 }
                 button_action = Some((reading.id.clone(), action));
+            }
+            if let Some(action) = bumper
+                && button_action.is_none()
+            {
+                button_action = Some((reading.id.clone(), action));
+            }
+            if l3 && button_action.is_none() {
+                button_action = Some((reading.id.clone(), NavAction::ToggleMagnetism));
             }
         }
 
@@ -2999,6 +3071,133 @@ mod tests {
             }
             assert_eq!(fires, 9, "{name} solid hold must stay gated");
         }
+    }
+
+    /// Sticks split at parse: left-only drives the legacy combined vector,
+    /// each stick is readable alone, and bumpers arrive as bools.
+    #[test]
+    fn parse_report_splits_sticks_and_bumpers() {
+        fn usb_report(lx: u8, ly: u8, rx: u8, ry: u8, buttons1: u8) -> PadSample {
+            let mut buf = [0u8; 64];
+            buf[0] = 0x01;
+            buf[1] = lx;
+            buf[2] = ly;
+            buf[3] = rx;
+            buf[4] = ry;
+            buf[8] = 0x08; // dpad neutral
+            buf[9] = buttons1;
+            parse_report(&buf, 0)
+        }
+        // Left full-left: legacy vector follows, right stays neutral.
+        let left = usb_report(4, 128, 128, 128, 0x00);
+        assert!(left.stick_x < 0.0);
+        assert!(left.lstick_x < 0.0);
+        assert_eq!(left.rstick_x, 0.0);
+        assert_eq!(left.rstick_y, 0.0);
+        // Right full-down: legacy vector follows, left stays neutral.
+        let right = usb_report(128, 128, 128, 252, 0x00);
+        assert!(right.stick_y > 0.0);
+        assert_eq!(right.lstick_x, 0.0);
+        assert_eq!(right.lstick_y, 0.0);
+        assert!(right.rstick_y > 0.0);
+        // Bumpers land on their own fields (L1 = bit0, R1 = bit1).
+        let bumpers = usb_report(128, 128, 128, 128, 0x03);
+        assert!(bumpers.l1 && bumpers.r1);
+        let none = usb_report(128, 128, 128, 128, 0x00);
+        assert!(!none.l1 && !none.r1);
+        assert!(sample_nav_resting(&none));
+        // A bumper alone breaks rest (arming waits for full release).
+        let mut l1_only = none.clone();
+        l1_only.l1 = true;
+        assert!(!sample_nav_resting(&l1_only));
+    }
+
+    /// L1/R1 fire on press, never repeat while held, and fire again after a
+    /// release — no hold semantics, no disturb of the face-button path.
+    #[test]
+    fn bumper_edges_fire_once_per_press() {
+        let mut bank = PadNavBank::default();
+        bank.prepare_on_open(true);
+        let now = Instant::now();
+        // First sight only syncs (never fires, even armed) — rest, then press.
+        let rest_tick = bank.tick(
+            &[reading("a", PadSample::default())],
+            now,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(rest_tick.action.is_none());
+        let l1 = PadSample {
+            l1: true,
+            held: [GestureControl::L1].into_iter().collect(),
+            ..Default::default()
+        };
+        let press = bank.tick(
+            &[reading("a", l1)],
+            now,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(press.action, Some(NavAction::BumperLeft));
+        // Held: silent.
+        let hold = bank.tick(
+            &[reading(
+                "a",
+                PadSample {
+                    l1: true,
+                    held: [GestureControl::L1].into_iter().collect(),
+                    ..Default::default()
+                },
+            )],
+            now,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(hold.action.is_none());
+        // Release then re-press: fires again. R1 maps right.
+        let _ = bank.tick(
+            &[reading("a", PadSample::default())],
+            now,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        let r1 = PadSample {
+            r1: true,
+            held: [GestureControl::R1].into_iter().collect(),
+            ..Default::default()
+        };
+        let press2 = bank.tick(
+            &[reading("a", r1)],
+            now,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(press2.action, Some(NavAction::BumperRight));
     }
 
     /// Deliberate release (neutral past the dropout grace) then re-press must

@@ -180,6 +180,31 @@ pub fn toast_theme() -> Theme {
 // Containers
 // ---------------------------------------------------------------------------
 
+/// Free virtual-cursor dot: transparent fill, accent ring.
+pub fn cursor_dot(_theme: &Theme) -> container::Style {
+    container::Style {
+        border: Border {
+            color: ACCENT,
+            width: 2.0,
+            radius: 999.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Docked virtual-cursor wrap: transparent fill, accent outline hugging the
+/// attached element's box.
+pub fn cursor_wrap(_theme: &Theme) -> container::Style {
+    container::Style {
+        border: Border {
+            color: ACCENT,
+            width: 2.0,
+            radius: radius::SM.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Opaque chrome fill (transition veils, fallback view).
 pub fn root(_theme: &Theme) -> container::Style {
     container::Style {

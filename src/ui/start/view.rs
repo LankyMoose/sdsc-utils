@@ -23,9 +23,7 @@ use iced::widget::text::Wrapping;
 use iced::widget::{
     Float, button, column, container, image, row, scrollable, space, stack, svg, text, text_input,
 };
-use iced::{
-    Alignment, Color, ContentFit, Element, Fill, Length, Point, Rectangle, Renderer, Theme,
-};
+use iced::{Alignment, Color, Element, Fill, Length, Point, Rectangle, Renderer, Theme};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -777,7 +775,8 @@ impl ManualAddDraft {
 
 /// In-Start reader browser panel. The URL draft and body scroll offset live
 /// here; load lifecycle (generation-guarded suspend/resume) lives in
-/// [`crate::browser::BrowserSession`].
+/// [`crate::browser::BrowserSession`]. The pad cursor roams in engine page
+/// pixels (see [`crate::browser::cursor`]).
 #[derive(Debug, Clone, Default)]
 pub struct BrowserPanel {
     pub session: crate::browser::BrowserSession,
@@ -787,6 +786,12 @@ pub struct BrowserPanel {
     /// Ctrl+L enters, Enter commits, Esc/Circle backs out). Cleared on
     /// navigate and close.
     pub url_editing: bool,
+    /// Virtual cursor (engine mode only; pad-owned).
+    pub cursor: crate::browser::cursor::Cursor,
+    /// Focusable elements from the latest accessibility tree.
+    pub focusables: Vec<crate::browser::cursor::Focusable>,
+    /// Last analog integrate step (None until the first pad sample).
+    pub analog_at: Option<Instant>,
 }
 
 impl BrowserPanel {
@@ -802,16 +807,47 @@ impl BrowserPanel {
     pub fn close_surface(&mut self) {
         self.session.close_surface();
         self.url_editing = false;
+        // Drop the analog clock so reopening never applies a huge first dt.
+        self.analog_at = None;
     }
 
     pub fn note_scrolled(&mut self, y: f32) {
         self.scroll_y = y.max(0.0);
     }
 
-    /// Step the body scroll (pad Up/Down); returns the new absolute offset.
+    /// Step the body scroll (reader text); returns the new absolute offset.
     pub fn scroll_by(&mut self, delta: f32) -> f32 {
         self.scroll_y = (self.scroll_y + delta).max(0.0);
         self.scroll_y
+    }
+
+    /// Integrate one analog pad sample: left stick moves the cursor
+    /// (magnetic snap + glide when enabled), right stick scrolls. Returns
+    /// the scroll delta in page pixels for this step; `dt` is clamped so
+    /// background gaps cannot teleport either axis.
+    pub fn advance_stick(
+        &mut self,
+        lx: f32,
+        ly: f32,
+        rx: f32,
+        ry: f32,
+        now: Instant,
+    ) -> (f32, f32) {
+        use crate::browser::cursor::SCROLL_SPEED;
+        let dt = self
+            .analog_at
+            .map(|t| now.saturating_duration_since(t).as_secs_f32().min(0.1))
+            .unwrap_or(0.0);
+        self.analog_at = Some(now);
+        if lx != 0.0 || ly != 0.0 {
+            self.cursor.advance(lx, ly, dt, &self.focusables);
+        }
+        (rx * SCROLL_SPEED * dt, ry * SCROLL_SPEED * dt)
+    }
+
+    /// D-pad focus step: directional jump, falling back to a nudge.
+    pub fn jump_cursor(&mut self, dir: crate::browser::cursor::JumpDir) {
+        self.cursor.jump(dir, &self.focusables);
     }
 }
 
@@ -829,18 +865,81 @@ pub fn browser_url_id() -> iced::widget::Id {
 /// Pad Up/Down body scroll step.
 pub const BROWSER_SCROLL_STEP: f32 = 240.0;
 
+/// Virtual cursor overlay, same size as the engine image: a ring at the
+/// free point, or an outline wrapping the attached element. Coordinates are
+/// card pixels (`page * img_w / 800`).
+fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, StartMessage> {
+    use crate::browser::cursor::VIEWPORT_W;
+    // URL-edit mode owns the keyboard; hide the pad cursor so it never
+    // floats over the page while typing in the address field.
+    if state.browser.url_editing {
+        return space().width(Length::Fixed(0.0)).into();
+    }
+    let scale = img_w / VIEWPORT_W;
+    let panel = &state.browser;
+    let dot_r = 10.0;
+    let body: Element<'_, StartMessage> =
+        if let Some((x, y, w, h)) = panel.cursor.attached_rect(&panel.focusables) {
+            let (x, y) = (x * scale - 2.0, y * scale - 2.0);
+            let (w, h) = ((w * scale + 4.0).max(8.0), (h * scale + 4.0).max(8.0));
+            column![
+                space().height(Length::Fixed(y.max(0.0))),
+                row![
+                    space().width(Length::Fixed(x.max(0.0))),
+                    container(space().width(Length::Fixed(w)).height(Length::Fixed(h)))
+                        .style(theme::cursor_wrap),
+                ],
+            ]
+            .spacing(0)
+            .into()
+        } else {
+            let cx = (panel.cursor.x * scale).clamp(dot_r, img_w - dot_r);
+            let cy = (panel.cursor.y * scale).clamp(dot_r, img_h - dot_r);
+            column![
+                space().height(Length::Fixed((cy - dot_r).max(0.0))),
+                row![
+                    space().width(Length::Fixed((cx - dot_r).max(0.0))),
+                    container(
+                        space()
+                            .width(Length::Fixed(dot_r * 2.0))
+                            .height(Length::Fixed(dot_r * 2.0))
+                    )
+                    .style(theme::cursor_dot),
+                ],
+            ]
+            .spacing(0)
+            .into()
+        };
+    container(body)
+        .width(Length::Fixed(img_w))
+        .height(Length::Fixed(img_h))
+        .into()
+}
+
+/// Fixed engine image aspect (800x600): height derives from width so the
+/// page→card mapping stays a single uniform scale (no letterbox math).
+pub fn browser_image_height(img_w: f32) -> f32 {
+    img_w * 0.75
+}
+
 /// Page surface: live engine pixels when a frame is present, reader text
-/// otherwise. The image scales to fit the card; pad/keyboard scroll routes
-/// to the engine in that mode, so no scrollable wraps the image.
-pub fn browser_page_view(state: &State) -> Element<'_, StartMessage> {
+/// otherwise. The engine image is a fixed size (`img_w` wide) so the
+/// virtual cursor maps 1:1 with a uniform scale; pad scroll routes to the
+/// engine in that mode, so no scrollable wraps the image.
+pub fn browser_page_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
     let panel = &state.browser;
     let session = &panel.session;
     if let Some(frame) = session.frame() {
-        return image(frame.handle.clone())
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .content_fit(ContentFit::Contain)
-            .into();
+        let img_h = browser_image_height(img_w);
+        return stack![
+            image(frame.handle.clone())
+                .width(Length::Fixed(img_w))
+                .height(Length::Fixed(img_h)),
+            browser_cursor_overlay(state, img_w, img_h),
+        ]
+        .width(Length::Fixed(img_w))
+        .height(Length::Fixed(img_h))
+        .into();
     }
     let body_text = if session.error().is_none() && session.has_content() {
         session.body()
@@ -871,7 +970,7 @@ pub fn browser_page_view(state: &State) -> Element<'_, StartMessage> {
 /// In-Start browser card: URL row, page, reload / external / close
 /// actions. Sized by the caller (near-full-bleed; see `immersive::view`),
 /// so the root column fills its card.
-pub fn browser_view(state: &State) -> Element<'_, StartMessage> {
+pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
     let panel = &state.browser;
     let session = &panel.session;
     let status = if session.loading() {
@@ -910,7 +1009,7 @@ pub fn browser_view(state: &State) -> Element<'_, StartMessage> {
         .spacing(8)
         .align_y(Alignment::Center),
         space().height(8),
-        browser_page_view(state),
+        browser_page_view(state, img_w),
         space().height(8),
         row![
             button(text("Reload").size(14.0))

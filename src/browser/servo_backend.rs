@@ -17,7 +17,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
-use embedder_traits::{InputEvent, KeyboardEvent, Theme};
+use embedder_traits::{
+    InputEvent, KeyboardEvent, MouseButton, MouseButtonAction, MouseButtonEvent, Theme,
+};
 use euclid::{Box2D, Point2D};
 
 use servo::{
@@ -273,6 +275,22 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             if !shared.borrow().suspended {
                 webview.go_forward(1);
             }
+        }
+        EngineCommand::ClickAt { x, y } => {
+            if shared.borrow().suspended {
+                return;
+            }
+            let point = WebViewPoint::Device(DevicePoint::new(x, y));
+            webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                MouseButtonAction::Down,
+                MouseButton::Primary,
+                point,
+            )));
+            webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                MouseButtonAction::Up,
+                MouseButton::Primary,
+                point,
+            )));
         }
         EngineCommand::Resize { width, height } => {
             let mut state = shared.borrow_mut();
