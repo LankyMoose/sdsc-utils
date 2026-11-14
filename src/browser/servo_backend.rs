@@ -12,7 +12,7 @@
 //! loses), so Start chrome, toasts, and veils composite above the page.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -65,16 +65,12 @@ struct Shared {
     generation: u64,
     load_started_at: Option<Instant>,
     logged_first_frame: bool,
-    /// Mirrored accessibility tree. Servo sends incremental updates, so the
-    /// backend keeps a real consumer mirror (parent/child structure
-    /// included): removals drop with their subtree instead of lingering as
-    /// ghosts. Empty (focus-only) heartbeats are ignored; the mirror resets
-    /// on document change (see `clear_tree`).
-    tree: Option<accesskit_consumer::Tree>,
-    /// Pre-root updates waiting for replay: Servo streams subtree updates
-    /// before the root snapshot, and the mirror can only start from ROOT.
-    /// Bounded; oldest drops on overflow. Cleared on document change.
-    pending: Vec<servo::accesskit::TreeUpdate>,
+    /// Mirrored node snapshots, keyed by accesskit node id. Servo sends
+    /// incremental updates without removal records, so the backend tracks
+    /// parent→child links itself: a node that disappears from its parent's
+    /// children drops with its whole subtree instead of lingering as a
+    /// ghost. Reset on document change (see `clear_tree`).
+    nodes: HashMap<servo::accesskit::NodeId, StoredNode>,
     /// Last list sent to the UI (diffed to avoid spamming identical trees).
     last_emitted: Vec<Focusable>,
     visible: bool,
@@ -88,9 +84,9 @@ struct Shared {
     /// via fresh bounds — a known gap.
     scroll: (f32, f32),
     /// Stable numeric ids for live accesskit nodes (the UI keys attachments
-    /// by u64; accesskit ids are UUIDs). Pruned with each walk, cleared on
-    /// document change, never reused.
-    ids: HashMap<accesskit_consumer::NodeId, u64>,
+    /// by u64). Pruned with each walk, cleared on document change, never
+    /// reused.
+    ids: HashMap<servo::accesskit::NodeId, u64>,
     next_id: u64,
     /// Last scroll offset sent to the UI (diffed like the tree).
     last_sent_scroll: (f32, f32),
@@ -188,146 +184,136 @@ impl WebViewDelegate for Delegate {
         _webview: WebView,
         update: servo::accesskit::TreeUpdate,
     ) {
-        // Servo sends incremental updates, so the backend mirrors the tree in
-        // a real consumer (structure included): removals drop with their
-        // subtree instead of lingering as ghosts. Empty (focus-only)
-        // heartbeats are ignored; the mirror resets on document change.
-        if update.nodes.is_empty() && update.tree.is_none() {
-            // Focus-only heartbeat: nothing to mirror.
+        // Servo sends incremental updates (node id, node) without removal
+        // records, so the backend mirrors parent→child links itself: a node
+        // that disappears from its parent's children drops with its whole
+        // subtree instead of lingering as a ghost. Empty heartbeats are
+        // ignored; the mirror resets on document change.
+        //
+        // (An accesskit_consumer mirror was tried first: Servo never sends
+        // TreeId::ROOT — every update carries a per-document id — and the
+        // consumer refuses to start from anything else. It also panics on
+        // unknown grafts, which killed the worker 3x. Hand-rolled: no
+        // panics possible, no tree_id semantics needed.)
+        if update.nodes.is_empty() {
             return;
         }
         let mut shared = self.shared.borrow_mut();
-        crate::platform::app_log::info(format!(
-            "servo-ax update tree_id={:?} nodes={} tree={} mirror={}",
-            update.tree_id,
-            update.nodes.len(),
-            update.tree.is_some(),
-            if shared.tree.is_some() {
-                "live"
-            } else {
-                "pending"
-            },
-        ));
-        if shared.tree.is_none() {
-            if update.tree_id != servo::accesskit::TreeId::ROOT || update.tree.is_none() {
-                // Subtree (or rootless) update before the root snapshot:
-                // the mirror can only start from ROOT, so queue for replay
-                // after init (bounded).
-                if shared.pending.len() >= MAX_PENDING_UPDATES {
-                    shared.pending.remove(0);
-                }
-                shared.pending.push(update);
-                return;
+        if shared.ax_debug {
+            crate::platform::app_log::info(format!(
+                "servo-ax update tree_id={:?} nodes={}",
+                update.tree_id,
+                update.nodes.len(),
+            ));
+            for (id, node) in &update.nodes {
+                let kind = focusable_kind(node.role());
+                let bounds = node.bounds();
+                let kept = kind.and_then(|kind| {
+                    bounds.and_then(|rect| {
+                        let (w, h) = (rect.width() as f32, rect.height() as f32);
+                        (w > 0.0
+                            && h > 0.0
+                            && w <= VIEWPORT_WIDTH as f32
+                            && h <= VIEWPORT_HEIGHT as f32)
+                            .then_some(kind)
+                    })
+                });
+                let verdict = match (&kept, bounds) {
+                    (Some(_), _) => "kept",
+                    (None, None) => "drop:nobounds",
+                    (None, Some(rect))
+                        if rect.width() as f32 > VIEWPORT_WIDTH as f32
+                            || rect.height() as f32 > VIEWPORT_HEIGHT as f32 =>
+                    {
+                        "drop:oversize"
+                    }
+                    (None, Some(_)) => "drop:role",
+                };
+                let b = bounds
+                    .map(|r| {
+                        format!(
+                            "({},{}) {}x{}",
+                            r.x0 as i32,
+                            r.y0 as i32,
+                            r.width() as i32,
+                            r.height() as i32
+                        )
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                crate::platform::app_log::info(format!(
+                    "servo-ax node id={:?} role={:?} bounds={b} verdict={verdict}",
+                    id,
+                    node.role(),
+                ));
             }
-            shared.tree = Some(accesskit_consumer::Tree::new(update, false));
-            let pending = std::mem::take(&mut shared.pending);
-            for queued in pending {
-                apply_update(&mut shared, queued);
-            }
-        } else {
-            apply_update(&mut shared, update);
         }
+        apply_node_updates(&mut shared, &update.nodes);
         // Publish the translated tree (diffed + logged inside).
         emit_tree(&mut shared);
     }
 }
 
-/// Walk the mirrored tree and collect snap targets, plus the document extent
+/// Stored node snapshot: just enough to filter targets and resolve
+/// removals (children links) without re-querying Servo.
+#[derive(Debug, Clone)]
+struct StoredNode {
+    role: servo::accesskit::Role,
+    bounds: Option<(f32, f32, f32, f32)>,
+    children: Vec<servo::accesskit::NodeId>,
+}
+
+/// Collect snap targets from the mirrored map, plus the document extent
 /// (max far corner over every bounded node) for scroll clamping. Sorted by
-/// id so diffing is stable.
+/// numeric id so diffing is stable.
 fn collect_focusables(shared: &mut Shared) -> (Vec<Focusable>, (f32, f32)) {
     let mut out = Vec::new();
     let mut extent = (0.0f32, 0.0f32);
     let Shared {
-        tree,
+        nodes,
         ids,
         next_id,
-        ax_debug,
         ..
     } = &mut *shared;
-    let Some(tree) = tree.as_ref() else {
-        return (out, extent);
-    };
-    let mut live = HashSet::new();
-    let mut stack = vec![tree.state().root()];
-    while let Some(node) = stack.pop() {
-        live.insert(node.id());
-        let role = node.role();
-        if let Some(rect) = node.bounding_box() {
-            extent.0 = extent.0.max(rect.x1 as f32);
-            extent.1 = extent.1.max(rect.y1 as f32);
+    for (nid, stored) in nodes.iter() {
+        if let Some((_, _, x1, y1)) = stored.bounds {
+            extent.0 = extent.0.max(x1);
+            extent.1 = extent.1.max(y1);
         }
-        // Role-typed actionables. Clickability is logged for diagnosis but
-        // not filtered on: untyped clickable containers are usually page
-        // chrome, not targets.
-        let clickable = node.is_clickable(&|_| accesskit_consumer::FilterResult::Include);
-        let kept = focusable_kind(role).and_then(|kind| {
-            node.bounding_box().and_then(|rect| {
-                let (w, h) = (rect.width() as f32, rect.height() as f32);
+        let kept = focusable_kind(stored.role).and_then(|kind| {
+            stored.bounds.and_then(|(x0, y0, x1, y1)| {
+                let (w, h) = (x1 - x0, y1 - y0);
                 // Non-zero area and smaller than the viewport: a
                 // full-page container is not a snap target.
                 (w > 0.0 && h > 0.0 && w <= VIEWPORT_WIDTH as f32 && h <= VIEWPORT_HEIGHT as f32)
                     .then_some(Focusable {
                         id: 0,
-                        x: rect.x0 as f32,
-                        y: rect.y0 as f32,
+                        x: x0,
+                        y: y0,
                         w,
                         h,
                         kind,
                     })
             })
         });
-        if *ax_debug {
-            let bounds = node.bounding_box();
-            let verdict = match (&kept, bounds) {
-                (Some(_), _) => "kept",
-                (None, None) => "drop:nobounds",
-                (None, Some(rect))
-                    if rect.width() as f32 > VIEWPORT_WIDTH as f32
-                        || rect.height() as f32 > VIEWPORT_HEIGHT as f32 =>
-                {
-                    "drop:oversize"
-                }
-                (None, Some(_)) => "drop:role",
-            };
-            let b = bounds
-                .map(|r| {
-                    format!(
-                        "({},{}) {}x{}",
-                        r.x0 as i32,
-                        r.y0 as i32,
-                        r.width() as i32,
-                        r.height() as i32
-                    )
-                })
-                .unwrap_or_else(|| "-".to_string());
-            crate::platform::app_log::info(format!(
-                "servo-ax node id={:?} role={role:?} clickable={clickable} bounds={b} verdict={verdict}",
-                node.id(),
-            ));
-        }
         if let Some(mut item) = kept {
-            // Stable numeric id for the UI (accesskit ids are UUIDs).
-            item.id = *ids.entry(node.id()).or_insert_with(|| {
+            // Stable numeric id for the UI.
+            item.id = *ids.entry(*nid).or_insert_with(|| {
                 let id = *next_id;
                 *next_id += 1;
                 id
             });
             out.push(item);
         }
-        stack.extend(node.children());
     }
-    ids.retain(|k, _| live.contains(k));
+    ids.retain(|k, _| nodes.contains_key(k));
     out.sort_by_key(|o| o.id);
     (out, extent)
 }
 
 /// Actionable accesskit roles, mapped to cursor kinds. Covers every HTML
 /// input type (each is its own role: password, email, textarea, ...) plus
-/// buttons of all flavors. Clickable-but-untyped nodes (div-buttons, image
-/// links) fall through to the Click-action check at the call site.
-/// Everything else is not worth a magnet (static text, plain containers,
-// images without actions).
+/// buttons of all flavors. Everything else is not worth a magnet (static
+/// text, plain containers, images without actions).
 fn focusable_kind(role: servo::accesskit::Role) -> Option<FocusKind> {
     use servo::accesskit::Role;
     match role {
@@ -437,8 +423,7 @@ fn run(
         generation: 0,
         load_started_at: None,
         logged_first_frame: false,
-        tree: None,
-        pending: Vec::new(),
+        nodes: HashMap::new(),
         last_emitted: Vec::new(),
         visible: false,
         suspended: true,
@@ -608,9 +593,9 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
 /// content extent. Session history does not reliably restore scroll, and
 /// stale anything misplaces every outline (observed in testing).
 fn clear_tree(state: &mut Shared) {
-    if state.tree.is_some() {
-        state.tree = None;
-        state.pending.clear();
+    if !state.nodes.is_empty() {
+        state.nodes.clear();
+        state.ids.clear();
         state.last_emitted = Vec::new();
         state.handle.emit(EngineEvent::A11yTree(Vec::new()));
     }
@@ -636,46 +621,6 @@ fn translate_tree(mut items: Vec<Focusable>, scroll: (f32, f32)) -> Vec<Focusabl
     items
 }
 
-/// Cap on queued pre-root updates (replay after init, oldest drops first).
-const MAX_PENDING_UPDATES: usize = 128;
-
-/// Apply one update, resetting the mirror instead of dying if the consumer
-/// rejects it (unknown-graft races on lively pages must not take down the
-/// worker: the next root snapshot rebuilds it).
-fn apply_update(shared: &mut Shared, update: servo::accesskit::TreeUpdate) {
-    let Some(mut tree) = shared.tree.take() else {
-        return;
-    };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        tree.update_and_process_changes(update, &mut NoChanges);
-        tree
-    }));
-    match result {
-        Ok(tree) => shared.tree = Some(tree),
-        Err(_) => {
-            crate::platform::app_log::warn(
-                "servo-engine: AX mirror rejected an update; rebuilding on next root snapshot",
-            );
-            shared.pending.clear();
-        }
-    }
-}
-
-/// No-op change handler: the backend re-walks the whole mirror per update
-/// instead of reacting to deltas (0.37 has no plain `update`).
-struct NoChanges;
-
-impl accesskit_consumer::TreeChangeHandler for NoChanges {
-    fn node_added(&mut self, _node: &accesskit_consumer::Node) {}
-    fn node_updated(&mut self, _old: &accesskit_consumer::Node, _new: &accesskit_consumer::Node) {}
-    fn node_removed(&mut self, _node: &accesskit_consumer::Node) {}
-    fn focus_moved(
-        &mut self,
-        _old: Option<&accesskit_consumer::Node>,
-        _new: Option<&accesskit_consumer::Node>,
-    ) {
-    }
-}
 /// Document identity for history comparison: URL minus fragment.
 /// Same-document traffic (fragment jumps, some pushState) must not clear
 /// the tree; anything else is a new document.
@@ -710,6 +655,70 @@ fn set_scroll(state: &mut Shared, scroll: (f32, f32)) {
         x: clamped.0,
         y: clamped.1,
     });
+}
+
+/// Upsert changed nodes; drop subtrees a parent no longer lists (unless
+/// re-sent in the same update — reparent, not removal). Recomputes the
+/// document extent from the live set.
+fn apply_node_updates(
+    shared: &mut Shared,
+    updates: &[(servo::accesskit::NodeId, servo::accesskit::Node)],
+) {
+    use std::collections::HashSet;
+    let live: HashSet<servo::accesskit::NodeId> = updates.iter().map(|(id, _)| *id).collect();
+    // Removals first: children the parent dropped and nobody re-sent.
+    let mut dropped = Vec::new();
+    for (id, node) in updates {
+        if let Some(old) = shared.nodes.get(id) {
+            let updated: HashSet<servo::accesskit::NodeId> =
+                node.children().iter().copied().collect();
+            for child in &old.children {
+                if !updated.contains(child) && !live.contains(child) {
+                    dropped.push(*child);
+                }
+            }
+        }
+    }
+    for (id, node) in updates {
+        shared.nodes.insert(
+            *id,
+            StoredNode {
+                role: node.role(),
+                bounds: node
+                    .bounds()
+                    .map(|r| (r.x0 as f32, r.y0 as f32, r.x1 as f32, r.y1 as f32)),
+                children: node.children().to_vec(),
+            },
+        );
+    }
+    for id in dropped {
+        remove_subtree(&mut shared.nodes, id, &live);
+    }
+    // Recompute the extent from the live set (removals shrink it too).
+    let mut extent = (0.0f32, 0.0f32);
+    for n in shared.nodes.values() {
+        if let Some((_, _, x1, y1)) = n.bounds {
+            extent.0 = extent.0.max(x1);
+            extent.1 = extent.1.max(y1);
+        }
+    }
+    shared.content = Some(extent);
+}
+
+/// Drop a subtree, never touching nodes re-sent in the same update.
+fn remove_subtree(
+    map: &mut HashMap<servo::accesskit::NodeId, StoredNode>,
+    id: servo::accesskit::NodeId,
+    live: &std::collections::HashSet<servo::accesskit::NodeId>,
+) {
+    if live.contains(&id) {
+        return;
+    }
+    if let Some(node) = map.remove(&id) {
+        for child in node.children {
+            remove_subtree(map, child, live);
+        }
+    }
 }
 
 /// Diff + publish the translated tree. Logs only when the set size changes
