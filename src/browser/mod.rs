@@ -15,7 +15,10 @@
 
 use std::collections::HashMap;
 
+pub mod engine;
 pub mod fetch;
+#[cfg(feature = "servo-engine")]
+pub mod servo_backend;
 
 /// Stable app identity. Keys mirror the Start convention of stable play keys
 /// (never row indices): games resolve via catalog `play_key`, the browser via
@@ -84,6 +87,26 @@ pub struct FetchedPage {
     pub body: String,
 }
 
+/// Engine-rendered page frame, as a stable iced image handle (rebuilt per
+/// frame; the atlas re-upload cost is the price of live pixels and only
+/// flows while the surface is visible — the worker suspends otherwise).
+#[derive(Debug, Clone)]
+pub struct BrowserFrame {
+    pub width: u32,
+    pub height: u32,
+    pub handle: iced::widget::image::Handle,
+}
+
+impl BrowserFrame {
+    pub fn from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            handle: iced::widget::image::Handle::from_rgba(width, height, rgba),
+        }
+    }
+}
+
 /// In-Start browser surface state. Pure data: the iced view owns the URL
 /// draft and scroll offset, this owns load lifecycle with a generation
 /// counter so late worker results are ignored after suspend/close —
@@ -97,6 +120,7 @@ pub struct BrowserSession {
     loading: bool,
     generation: u64,
     error: Option<String>,
+    frame: Option<BrowserFrame>,
 }
 
 impl BrowserSession {
@@ -126,12 +150,14 @@ impl BrowserSession {
     }
 
     /// Begin loading `url`. Returns the generation the worker result must
-    /// carry to be applied.
+    /// carry to be applied. Drops any engine frame (stale pixels never stand
+    /// in for the new page).
     pub fn begin_load(&mut self, url: String) -> u64 {
         self.url = url;
         self.title = None;
         self.body.clear();
         self.error = None;
+        self.frame = None;
         self.loading = true;
         self.generation = self.generation.wrapping_add(1);
         self.generation
@@ -184,9 +210,48 @@ impl BrowserSession {
         self.generation
     }
 
-    /// True once a page (or a load error) is on screen.
+    /// True once a page (or a load error) is on screen — reader text, an
+    /// engine frame, or an error alike.
     pub fn has_content(&self) -> bool {
-        !self.body.is_empty() || self.error.is_some()
+        !self.body.is_empty() || self.error.is_some() || self.frame.is_some()
+    }
+
+    /// Engine path: install a fresh frame (no generation — frames are
+    /// continuous paint output, staleness is handled by load gating).
+    pub fn set_frame(&mut self, frame: BrowserFrame) {
+        self.frame = Some(frame);
+    }
+
+    pub fn clear_frame(&mut self) {
+        self.frame = None;
+    }
+
+    pub fn has_frame(&self) -> bool {
+        self.frame.is_some()
+    }
+
+    pub fn frame(&self) -> Option<&BrowserFrame> {
+        self.frame.as_ref()
+    }
+
+    /// Engine path: title arrived out of band.
+    pub fn note_title(&mut self, title: Option<String>) {
+        self.title = title;
+    }
+
+    /// Engine path: URL changed (redirects) without a new load.
+    pub fn note_url(&mut self, url: String) {
+        self.url = url;
+    }
+
+    /// Engine path: load completed. Returns false (ignored) when a newer
+    /// load has since begun.
+    pub fn mark_loaded(&mut self, generation: u64) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.loading = false;
+        true
     }
 }
 
@@ -528,5 +593,25 @@ mod tests {
         assert!(!s.loading());
         assert_eq!(s.error(), Some("fetch failed: dns"));
         assert!(s.has_content());
+    }
+
+    #[test]
+    fn engine_frame_counts_as_content_and_clears_on_navigate() {
+        let mut s = BrowserSession::default();
+        s.open_surface();
+        assert!(!s.has_content());
+        s.set_frame(BrowserFrame {
+            width: 800,
+            height: 600,
+            handle: iced::widget::image::Handle::from_rgba(800, 600, vec![0; 800 * 600 * 4]),
+        });
+        assert!(s.has_frame());
+        assert!(s.has_content());
+        let generation = s.begin_load("https://next.test".to_string());
+        assert!(!s.has_frame());
+        assert!(s.mark_loaded(generation));
+        assert!(!s.loading());
+        // Stale completion ignored.
+        assert!(!s.mark_loaded(generation.wrapping_add(1)));
     }
 }

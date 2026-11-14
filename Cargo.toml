@@ -28,6 +28,11 @@ path = "src/bin/gen_msix_logos.rs"
 
 [features]
 default = []
+# In-Start engine-rendered browser (Servo offscreen → iced texture).
+# Opt-in while the backend matures: Servo's SpiderMonkey build needs Clang +
+# Python at build time and dominates clean-build/CI time, so the default
+# cargo build/test/clippy stays on the reader backend.
+servo-engine = ["dep:servo", "dep:dpi", "dep:euclid", "dep:url"]
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.24.2", default-features = false }
@@ -75,7 +80,12 @@ png = "0.17"
 resvg = { version = "0.45", default-features = false }
 rfd = "0.15"
 rodio = { version = "0.20", default-features = false, features = ["mp3"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 serde = { version = "1", features = ["derive"] }
+servo = { version = "0.8.0", optional = true }
+url = { version = "2", optional = true }
+dpi = { version = "0.1", optional = true }
+euclid = { version = "0.22", optional = true }
 serde_json = "1"
 single-instance = "0.3.3"
 notify-rust = "4"

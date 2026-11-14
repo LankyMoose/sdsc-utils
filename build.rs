@@ -60,6 +60,16 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/icons/minimize.svg");
     println!("cargo:rerun-if-changed=assets/icons/check.svg");
     println!("cargo:rerun-if-changed=build.rs");
+
+    // Servo's SpiderMonkey/ICU objects reference MSVC STL vectorized helpers
+    // (`__std_search_1`, …) that live in the C++ runtime import lib. Rust
+    // links only the C runtime by default, so pull in msvcprt on MSVC —
+    // without it the final link fails with LNK2019 (proven by the spike).
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("Windows")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        println!("cargo:rustc-link-lib=msvcprt");
+    }
 }
 
 fn write_embedded_bytes(out_dir: &Path, connected: &[u8], dim: &[u8]) {

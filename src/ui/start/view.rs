@@ -21,9 +21,11 @@ use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Float, button, column, container, row, scrollable, space, stack, svg, text, text_input,
+    Float, button, column, container, image, row, scrollable, space, stack, svg, text, text_input,
 };
-use iced::{Alignment, Color, Element, Fill, Length, Point, Rectangle, Renderer, Theme};
+use iced::{
+    Alignment, Color, ContentFit, Element, Fill, Length, Point, Rectangle, Renderer, Theme,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -813,6 +815,40 @@ pub const BROWSER_CARD_W: f32 = 600.0;
 /// Pad Up/Down body scroll step.
 pub const BROWSER_SCROLL_STEP: f32 = 240.0;
 
+/// Page surface: live engine pixels when a frame is present, reader text
+/// otherwise. The image scales to fit the card; pad/keyboard scroll routes
+/// to the engine in that mode, so no scrollable wraps the image.
+pub fn browser_page_view(state: &State) -> Element<'_, StartMessage> {
+    let panel = &state.browser;
+    let session = &panel.session;
+    if let Some(frame) = session.frame() {
+        return image(frame.handle.clone())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .content_fit(ContentFit::Contain)
+            .into();
+    }
+    let body_text = if session.error().is_none() && session.has_content() {
+        session.body()
+    } else if !session.loading() && !session.has_content() {
+        "Fetches the page and strips it to text — a fast path for guides and docs. \
+         Pages that need JavaScript will not render here; use “Open in system browser”."
+    } else {
+        ""
+    };
+    scrollable(
+        text(body_text)
+            .size(13.0)
+            .color(theme::INK)
+            .wrapping(Wrapping::Word)
+            .width(Fill),
+    )
+    .id(browser_scroll_id())
+    .on_scroll(|viewport| StartMessage::BrowserScrolled(viewport.absolute_offset().y))
+    .height(Length::Fill)
+    .into()
+}
+
 /// In-Start reader browser card: URL row, readable body, reload / external /
 /// close actions. Mounted as a centered dialog over the live stage (same
 /// wash + card builder as manual/replace), below the settings drawer.
@@ -827,14 +863,6 @@ pub fn browser_view(state: &State) -> Element<'_, StartMessage> {
         session.title().unwrap_or_else(|| session.url()).to_string()
     } else {
         "Reader view — type a URL and press Go.".to_string()
-    };
-    let body_text = if session.error().is_none() && session.has_content() {
-        session.body()
-    } else if !session.loading() && !session.has_content() {
-        "Fetches the page and strips it to text — a fast path for guides and docs. \
-         Pages that need JavaScript will not render here; use “Open in system browser”."
-    } else {
-        ""
     };
     let press = HintPress::for_owner(state, HintPressOwner::Browser);
     column![
@@ -860,16 +888,7 @@ pub fn browser_view(state: &State) -> Element<'_, StartMessage> {
         .spacing(8)
         .align_y(Alignment::Center),
         space().height(8),
-        scrollable(
-            text(body_text)
-                .size(13.0)
-                .color(theme::INK)
-                .wrapping(Wrapping::Word)
-                .width(Fill)
-        )
-        .id(browser_scroll_id())
-        .on_scroll(|viewport| StartMessage::BrowserScrolled(viewport.absolute_offset().y))
-        .height(Length::Fill),
+        browser_page_view(state),
         space().height(8),
         row![
             button(text("Reload").size(14.0))

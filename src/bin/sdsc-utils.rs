@@ -32,6 +32,13 @@ fn main() -> ExitCode {
     let crash_armed: &'static CrashArmed = crash_armed();
     app_log::init(crash_armed);
 
+    // Servo's net stack pulls a second rustls crypto provider into the
+    // process (ureq already enables one), which disables rustls
+    // auto-detection and panics on first TLS use. Pin aws-lc-rs explicitly
+    // before anything — engine thread, updater — touches TLS. No-op if a
+    // default is already installed.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let args: Vec<String> = env::args().skip(1).collect();
 
     if args.iter().any(|a| a == crash_restart::RELAUNCH_FLAG) {

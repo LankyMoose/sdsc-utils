@@ -17,6 +17,7 @@ use crate::domain::color::SpectrumService;
 use crate::domain::pad::InputHub;
 use crate::{AppError, AppResult};
 
+use crate::browser::engine::{EngineEvent, EngineHandle};
 #[cfg(debug_assertions)]
 use crate::controller::emulate;
 use crate::controller::hid::poll::{
@@ -188,6 +189,10 @@ pub enum Message {
     /// Single-flight art worker milestone (selected / near / job done).
     StartArtEvent(crate::ui::start::art_worker::ArtEvent),
     Start(StartMessage),
+    /// Servo engine worker event (frame / title / URL / load). System-class:
+    /// frames flow continuously while visible and must not count as user
+    /// activity (or idle-dim and cursor-hide would never fire).
+    BrowserEngine(EngineEvent),
     /// Keyboard while some iced window has focus; filtered to the start screen in update.
     StartKey {
         id: window::Id,
@@ -301,6 +306,7 @@ impl Message {
             | Message::ManualIconPicked(_)
             | Message::SteamPathPicked(_) => true,
             Message::SteamScanDone(_) | Message::SteamScanIdleFallback => false,
+            Message::BrowserEngine(_) => false,
             #[cfg(debug_assertions)]
             Message::StressWindows(_) => true,
             #[cfg(debug_assertions)]
@@ -465,6 +471,9 @@ pub struct App {
     /// Multi-app foreground/background manager (in-Start browser today;
     /// games launch out of Start so they join only with an engine backend).
     apps: crate::browser::AppManager,
+    /// Servo offscreen worker handle (`servo-engine` feature only; `None`
+    /// otherwise — the reader backend owns loads then).
+    engine: Option<EngineHandle>,
     /// Monitor covered by the Start window (stage size for the view).
     start_monitor_cover: Option<MonitorCover>,
     /// Last user activity on Start (mouse / keyboard / pad) for idle/sleep.
@@ -631,7 +640,11 @@ const EMULATOR_COMMIT_POLL: Duration = Duration::from_millis(100);
 /// in for every non-release build, so a plain `cargo run` already has it — no
 /// flag needed. Release builds drop it at compile time.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    crate::platform::wgpu_diag::log_adapters_at_boot();
+    // NOTE: no wgpu/Vulkan init may happen before `App::boot` returns: the
+    // engine worker must create its WGL context first (NVIDIA driver
+    // segfaults worker-thread GL creation once its Vulkan ICD is up — see
+    // `servo_backend::spawn_engine`). `log_adapters_at_boot` creates a wgpu
+    // Instance, so it runs at the end of `boot`, after the engine barrier.
 
     // Boot-only renderer prefs: iced `Settings` cannot flip at runtime, so the
     // app reads them before the daemon builds. `App::boot` re-loads the same
@@ -781,6 +794,14 @@ impl App {
             start_nav_ready: false,
             start_state: start_view::State::default(),
             apps: crate::browser::AppManager::new(),
+            #[cfg(feature = "servo-engine")]
+            engine: if std::env::var("SDSC_NO_ENGINE").is_ok() {
+                None
+            } else {
+                crate::browser::servo_backend::spawn_engine()
+            },
+            #[cfg(not(feature = "servo-engine"))]
+            engine: None,
             start_monitor_cover: None,
             start_last_activity: Instant::now(),
             start_cursor_last_active: Instant::now(),
@@ -905,6 +926,12 @@ impl App {
                 }),
             ]);
         }
+        // wgpu/Vulkan must stay down until the engine worker created its GL
+        // context (see `run` + `servo_backend::spawn_engine`): adapter
+        // logging creates a wgpu Instance, so it runs here, after the engine
+        // barrier in the struct literal above, but still before iced boots
+        // any window.
+        crate::platform::wgpu_diag::log_adapters_at_boot();
         (app, task)
     }
 
@@ -1132,6 +1159,12 @@ impl App {
                 self.input_hub.clone(),
                 pad_input_edge_stream,
             ));
+        }
+
+        // Servo engine worker → UI event bridge (only with the feature; the
+        // worker idles suspended until the browser surface resumes it).
+        if let Some(engine) = self.engine.clone() {
+            subscriptions.push(Subscription::run_with(engine, engine_event_stream));
         }
 
         if self.start_visible && (self.start_state.needs_frames() || self.steam_scan_in_flight()) {
@@ -1451,6 +1484,7 @@ impl App {
                 self.note_start_activity();
                 self.on_start_message(message)
             }
+            Message::BrowserEngine(event) => self.on_engine_event(event),
             Message::StartKey {
                 id,
                 action,
@@ -2523,6 +2557,54 @@ impl Drop for InputEdgeBindGuard {
         // Idempotent with the `Message::Exit` clear below (clearing an
         // unbound hub is a no-op).
         self.hub.clear();
+    }
+}
+
+/// Servo engine worker → iced event bridge.
+///
+/// Frames conflate to the latest buffered one (paint output is absolute
+/// state, like pad snapshots); control events (title/URL/load) pass through
+/// in order. Bind/clear mirrors the pad edge hub.
+fn engine_event_stream(engine: &EngineHandle) -> impl Stream<Item = Message> + Send + use<> {
+    let engine = engine.clone();
+    stream::channel(64, async move |mut output| {
+        let (tx, mut rx) = iced::futures::channel::mpsc::channel(64);
+        engine.bind(tx);
+        let _guard = EngineBindGuard { engine };
+        'outer: while let Some(first) = rx.next().await {
+            let mut batch = vec![first];
+            while let Ok(next) = rx.try_recv() {
+                batch.push(next);
+            }
+            let mut last_frame = None;
+            for event in batch {
+                match event {
+                    EngineEvent::Frame(frame) => last_frame = Some(frame),
+                    other => {
+                        if output.send(Message::BrowserEngine(other)).await.is_err() {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            if let Some(frame) = last_frame
+                && output
+                    .send(Message::BrowserEngine(EngineEvent::Frame(frame)))
+                    .await
+                    .is_err()
+            {
+                break 'outer;
+            }
+        }
+    })
+}
+
+struct EngineBindGuard {
+    engine: EngineHandle,
+}
+impl Drop for EngineBindGuard {
+    fn drop(&mut self) {
+        self.engine.clear();
     }
 }
 

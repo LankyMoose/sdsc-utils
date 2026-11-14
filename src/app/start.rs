@@ -13,6 +13,7 @@ use super::{
     steam_appid_from_target,
 };
 use crate::AppResult;
+use crate::browser::engine::{EngineCommand, EngineEvent};
 use crate::controller::dualsense::rumble::MotorPulse;
 use crate::games::process_match::RunningSession;
 use crate::games::steam::SteamGame;
@@ -414,6 +415,10 @@ impl App {
             crate::browser::AppKind::Browser { url: None },
         );
         self.start_state.browser.session.open_surface();
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::Resume);
+            engine.send(EngineCommand::SetVisible { visible: true });
+        }
         crate::controller::hid::diag::diag_info("ui-diag: start browser open");
         Task::none()
     }
@@ -421,12 +426,18 @@ impl App {
     pub(crate) fn close_browser_surface(&mut self) -> Task<Message> {
         let _ = self.apps.close_app(crate::browser::BROWSER_APP_ID);
         self.start_state.browser.close_surface();
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::SetVisible { visible: false });
+            engine.send(EngineCommand::Suspend);
+        }
         crate::controller::hid::diag::diag_info("ui-diag: start browser close (suspend)");
         Task::none()
     }
 
     /// Kick a reader fetch off the UI thread. Generation-guarded: closing or
-    /// suspending before the worker lands drops the result.
+    /// suspending before the worker lands drops the result. With the
+    /// `servo-engine` feature the load goes to the engine worker instead
+    /// (frames arrive via [`Message::BrowserEngine`]).
     pub(crate) fn on_browser_navigate(&mut self) -> Task<Message> {
         let draft = self.start_state.browser.draft.clone();
         let current = self.start_state.browser.session.url().to_string();
@@ -445,6 +456,10 @@ impl App {
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Nav);
         crate::controller::hid::diag::diag_info("ui-diag: start browser navigate");
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::Navigate { url, generation });
+            return Task::none();
+        }
         Task::perform(
             async move { spawn_blocking(move || crate::browser::fetch::fetch_readable(&url)).await },
             move |result| match result {
@@ -520,8 +535,16 @@ impl App {
         Task::none()
     }
 
-    /// Pad/keyboard body scroll for the open browser surface.
+    /// Pad/keyboard body scroll for the open browser surface. With engine
+    /// pixels on screen the scroll goes to the engine (which repaints);
+    /// the reader path scrolls the text widget instead.
     pub(crate) fn scroll_browser(&mut self, delta: f32) -> Task<Message> {
+        if self.start_state.browser.session.has_frame() {
+            if let Some(engine) = &self.engine {
+                engine.send(EngineCommand::ScrollBy { dx: 0.0, dy: delta });
+            }
+            return Task::none();
+        }
         let y = self.start_state.browser.scroll_by(delta);
         operation::scroll_to(
             start_view::browser_scroll_id(),
@@ -530,6 +553,40 @@ impl App {
                 y: Some(y),
             },
         )
+    }
+
+    /// Engine worker event. Deliberately no activity stamp: frames flow
+    /// continuously while visible and must not defeat idle-dim.
+    pub(crate) fn on_engine_event(&mut self, event: EngineEvent) -> Task<Message> {
+        match event {
+            EngineEvent::Frame(frame) => {
+                if !self.start_state.browser.session.is_open() {
+                    return Task::none();
+                }
+                self.start_state.browser.session.set_frame(
+                    crate::browser::BrowserFrame::from_rgba(frame.width, frame.height, frame.rgba),
+                );
+            }
+            EngineEvent::TitleChanged { title } => {
+                self.start_state.browser.session.note_title(title);
+            }
+            EngineEvent::UrlChanged { url } => {
+                self.start_state.browser.session.note_url(url.clone());
+                self.start_state.browser.draft = url;
+            }
+            EngineEvent::LoadFinished { generation, result } => match result {
+                Ok(()) => {
+                    self.start_state.browser.session.mark_loaded(generation);
+                }
+                Err(err) => {
+                    self.start_state
+                        .browser
+                        .session
+                        .apply_failed(generation, err);
+                }
+            },
+        }
+        Task::none()
     }
 }
 
@@ -3354,6 +3411,9 @@ impl App {
         // Background suspend: an in-flight browser fetch is cancelled (the
         // cached page survives for an instant resume via the surface toggle).
         self.start_state.browser.session.cancel_load();
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::Suspend);
+        }
         // Invalidate in-flight art events; keep caches for fast reopen.
         // Process Exit is what wipes to a blank slate (`ArtOwner::shutdown`).
         let generation = crate::ui::start::icon_cache::bump_art_warm_generation();
