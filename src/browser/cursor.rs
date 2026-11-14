@@ -46,8 +46,9 @@ pub const CURSOR_MAX_SPEED: f32 = 1400.0;
 pub const CURSOR_FRICTION: f32 = 14.0;
 /// Magnetic pull cap, as acceleration: exactly one quarter of stick
 /// thrust, so holding the stick past ~25% deflection always overpowers the
-/// magnet at any range, while lighter touches get captured. Falls off
-/// linearly to zero at the snap radius edge.
+/// magnet at any range, while lighter touches get captured. Falls off with
+/// the square root of closeness to zero at the snap radius edge (soft
+/// capture that never dips under the friction cutoff).
 pub const PULL_MAX_ACCEL: f32 = CURSOR_ACCEL * 0.25;
 /// Dock entry/exit pads in page pixels: the outline engages when the point
 /// enters an element's rect + ACQUIRE_PAD and holds until it leaves +
@@ -147,6 +148,11 @@ impl Cursor {
         if self.fly_to.is_some() && (lx != 0.0 || ly != 0.0) {
             self.fly_to = None;
         }
+        // Letting go inside the hold pad lifts break-free suppression: the
+        // point never left, so hovering means re-dock, not escape.
+        if self.no_dock.is_some() && lx.hypot(ly) < 0.01 && self.fly_to.is_none() {
+            self.no_dock = None;
+        }
         // Docked: pinned — no velocity, no gravity. A firm push breaks free
         // at once (detach + kick outward); page motion carrying the element
         // away releases without a kick.
@@ -197,13 +203,14 @@ impl Cursor {
                 && let Some((_, tx, ty, edge, clen)) = Self::nearest_within(self.x, self.y, options)
             {
                 // Gravity, not teleport: pull toward the element center with
-                // a magnitude that falls off quadratically to zero at the
-                // snap radius edge — soft capture from afar, firm center.
-                // Direction normalizes by *center* distance; the edge
-                // distance drives the falloff only.
+                // a magnitude that falls off to zero at the snap radius
+                // edge — soft capture from afar, firm center. Square-root
+                // falloff keeps edge pull above the friction cutoff so the
+                // rim never deadlocks. Direction normalizes by *center*
+                // distance; the edge distance drives the falloff only.
                 if clen > 0.5 {
                     let fall = (1.0 - edge / SNAP_RADIUS).max(0.0);
-                    let strength = PULL_MAX_ACCEL * fall * fall;
+                    let strength = PULL_MAX_ACCEL * fall.sqrt();
                     self.vx += ((tx - self.x) / clen) * strength * dt_secs;
                     self.vy += ((ty - self.y) / clen) * strength * dt_secs;
                 }
@@ -732,6 +739,50 @@ mod tests {
     }
 
     #[test]
+    fn release_to_neutral_lifts_suppression_and_redocks() {
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        // Push off but don't leave: suppressed while held.
+        c.advance(1.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, None);
+        assert_eq!(c.no_dock, Some(1));
+        // Let go without leaving: suppression lifts, gravity re-docks.
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.no_dock, None);
+        for _ in 0..60 {
+            c.advance(0.0, 0.0, 0.016, &items);
+            if c.attached.is_some() {
+                break;
+            }
+        }
+        assert_eq!(c.attached, Some(1));
+    }
+
+    #[test]
+    fn well_edge_creep_never_stalls() {
+        // 5px inside the well edge: pull must beat the friction cutoff so
+        // the point visibly glides in instead of hovering forever.
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 245.0;
+        c.y = 115.0;
+        let start_x = c.x;
+        for _ in 0..60 {
+            c.advance(0.0, 0.0, 0.016, &items);
+        }
+        assert!(
+            c.x < start_x - 10.0,
+            "edge must glide inward, x={} started={}",
+            c.x,
+            start_x
+        );
+    }
+
+    #[test]
     fn suppression_lifts_after_leaving_and_redocks() {
         let mut c = Cursor::new();
         let items = [link(1, 100.0, 100.0)];
@@ -828,6 +879,8 @@ mod tests {
         // Nothing in range: the free point.
         c.x = 500.0;
         c.y = 500.0;
+        c.vx = 0.0;
+        c.vy = 0.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.click_point(&items), (500.0, 500.0));
     }
