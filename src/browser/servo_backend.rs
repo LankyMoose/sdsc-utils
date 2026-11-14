@@ -501,6 +501,9 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             if shared.borrow().suspended {
                 return;
             }
+            // Viewport-space point (same space as the cursor and the
+            // translated tree); Servo maps to document internally.
+            crate::platform::app_log::info(format!("servo-engine: click at ({x:.0},{y:.0})"));
             let point = WebViewPoint::Device(DevicePoint::new(x, y));
             webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                 MouseButtonAction::Down,

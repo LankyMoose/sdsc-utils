@@ -784,6 +784,11 @@ impl App {
         let cursor = (panel.cursor.x, panel.cursor.y);
         let magnet = panel.cursor.magnet;
         let dock = panel.cursor.attached;
+        let rect = panel
+            .cursor
+            .attached_rect(&panel.focusables)
+            .map(|(x, y, w, h)| format!("({x:.0},{y:.0}) {w:.0}x{h:.0}"))
+            .unwrap_or_else(|| "-".to_string());
         let wells = panel.focusables.len();
         let scroll = panel.scroll_offset;
         std::thread::spawn(move || {
@@ -794,7 +799,7 @@ impl App {
             let path = dir.join(format!("shot-{ms}.png"));
             if image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8).is_ok() {
                 app_log::info(format!(
-                    "shot saved path={} cursor=({:.0},{:.0}) magnet={magnet} dock={dock:?} wells={wells} scroll=({:.0},{:.0})",
+                    "shot saved path={} cursor=({:.0},{:.0}) magnet={magnet} dock={dock:?} rect={rect} wells={wells} scroll=({:.0},{:.0})",
                     path.display(),
                     cursor.0,
                     cursor.1,
