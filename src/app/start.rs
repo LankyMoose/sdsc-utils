@@ -104,6 +104,7 @@ impl App {
                 self.start_state.browser.note_scrolled(y);
                 Task::none()
             }
+            StartMessage::BrowserShot(shot) => self.save_browser_shot(shot),
             StartMessage::ToggleEdit => match self.toggle_start_edit() {
                 Some(task) => {
                     self.play_start_cue(UiSoundKind::Action);
@@ -773,15 +774,16 @@ impl App {
         Task::none()
     }
 
-    /// Debug-only frame shot: every 5s while the browser overlay is on (or
-    /// immediately on a fresh dock), dump the engine pixels to `shots/`
-    /// under the data dir and log a correlator (cursor, dock, drawn rect,
-    /// target count, backend scroll offset). Encode + write happen on a
-    /// throwaway thread so the UI never hitches on disk I/O.
+    /// Debug-only window shot: every 5s while the browser overlay is on (or
+    /// immediately on a fresh dock), capture the real composed Start window
+    /// via the iced compositor readback and save it with a correlator line
+    /// (cursor, dock, drawn rect, target count, backend scroll offset).
+    /// Encode + write happen on a throwaway thread so the UI never hitches
+    /// on disk I/O.
     #[cfg(debug_assertions)]
-    fn maybe_shot_browser_frame(&mut self, frame: &crate::browser::engine::PageFrame) {
+    fn shoot_browser_window(&mut self) -> Task<Message> {
         if !self.debug_browser {
-            return;
+            return Task::none();
         }
         let now = Instant::now();
         let panel = &mut self.start_state.browser;
@@ -791,15 +793,21 @@ impl App {
                 .last_shot
                 .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(5))
         {
-            return;
+            return Task::none();
         }
         panel.last_shot = Some(now);
-        let (w, h) = (frame.width, frame.height);
-        let rgba = frame.rgba.clone();
-        let ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+        let Some(win) = self.start_window else {
+            return Task::none();
+        };
+        iced::window::screenshot(win)
+            .map(StartMessage::BrowserShot)
+            .map(Message::Start)
+    }
+
+    /// Debug-only: persist a captured window shot with the live cursor /
+    /// dock / target state for post-hoc outline placement analysis.
+    fn save_browser_shot(&mut self, shot: iced::window::Screenshot) -> Task<Message> {
+        let panel = &self.start_state.browser;
         let cursor = (panel.cursor.x, panel.cursor.y);
         let magnet = panel.cursor.magnet;
         let dock = panel.cursor.attached;
@@ -810,6 +818,13 @@ impl App {
             .unwrap_or_else(|| "-".to_string());
         let wells = panel.focusables.len();
         let scroll = panel.scroll_offset;
+        let (w, h) = (shot.size.width, shot.size.height);
+        let scale = shot.scale_factor;
+        let rgba = shot.rgba.to_vec();
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
         std::thread::spawn(move || {
             let dir = crate::persist::paths::data_dir().join("shots");
             if let Err(err) = std::fs::create_dir_all(&dir) {
@@ -819,7 +834,7 @@ impl App {
             let path = dir.join(format!("shot-{ms}.png"));
             match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
                 Ok(()) => app_log::info(format!(
-                    "shot saved path={} cursor=({:.0},{:.0}) magnet={magnet} dock={dock:?} rect={rect} wells={wells} scroll=({:.0},{:.0})",
+                    "shot saved path={} size={w}x{h} scale={scale} cursor=({:.0},{:.0}) magnet={magnet} dock={dock:?} rect={rect} wells={wells} scroll=({:.0},{:.0})",
                     path.display(),
                     cursor.0,
                     cursor.1,
@@ -829,6 +844,7 @@ impl App {
                 Err(err) => app_log::warn(format!("shot failed path={}: {err}", path.display())),
             }
         });
+        Task::none()
     }
 
     /// Pad/keyboard body scroll for the reader browser (engine mode scrolls
@@ -861,10 +877,12 @@ impl App {
                     return Task::none();
                 }
                 #[cfg(debug_assertions)]
-                self.maybe_shot_browser_frame(&frame);
+                let shot = self.shoot_browser_window();
                 self.start_state.browser.session.set_frame(
                     crate::browser::BrowserFrame::from_rgba(frame.width, frame.height, frame.rgba),
                 );
+                #[cfg(debug_assertions)]
+                return shot;
             }
             EngineEvent::TitleChanged { title } => {
                 self.start_state.browser.session.note_title(title);

@@ -81,6 +81,9 @@ pub enum StartMessage {
     BrowserOpenExternal,
     BrowserReload,
     BrowserScrolled(f32),
+    /// Debug-only: a requested window screenshot arrived; save it with a
+    /// correlator line (F10 overlay + dock-triggered shots).
+    BrowserShot(iced::window::Screenshot),
     ToggleEdit,
     CycleSort,
     AddShortcut,
