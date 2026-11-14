@@ -81,6 +81,27 @@ stay for page performance). UI-only iteration skips Servo entirely with
 at runtime; the MSRV job uses `--no-default-features` since the engine
 needs the pinned toolchain.
 
+## Upstream gaps (Servo 0.8 AX tree, 2026-11)
+
+Verified against 14k+ nodes across main + iframe documents on
+google.com: these controls never appear in any `TreeUpdate`, so no
+client-side rule can target them (no role, no Click action, no tag —
+`html_tag` is never populated either):
+
+- Search box (`<textarea>`/`<input>`): zero text-input roles of any kind.
+- People-also-ask accordions (`div[role=button]`): zero `Button` roles
+  anywhere, including pages full of native `<button>`s — Servo's
+  role mapping drops them (arrive as `GenericContainer` at best, usually
+  absent entirely).
+- Some header links arrive as `Link` without bounds and are correctly
+  skipped (can't aim at geometry that isn't there).
+
+Missing nodes do NOT corrupt other nodes' positions (each rect is
+absolute); offsets come from layout-shift lag and scroll tracking, which
+are handled separately. Workaround today: free-point click + typing works
+(input bypasses AX); only magnetism needs the nodes. Next step: file
+upstream with a minimal repro page + `SDSC_AX_DEBUG=1` dump.
+
 ## Open gaps (phase 2+)
 
 - No mouse-wheel→engine scroll yet (image has no scrollable; needs

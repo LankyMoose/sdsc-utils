@@ -240,9 +240,16 @@ impl WebViewDelegate for Delegate {
                         )
                     })
                     .unwrap_or_else(|| "-".to_string());
+                // Accessible name fragments identify WHICH element a
+                // boundless drop is (truncated; usually empty).
+                let name: String = node
+                    .label()
+                    .into_iter()
+                    .chain(node.value())
+                    .flat_map(|s| s.chars().take(40))
+                    .collect();
                 crate::platform::app_log::info(format!(
-                    "servo-ax node id={:?} role={:?} bounds={b} verdict={verdict}",
-                    id,
+                    "servo-ax node id={id:?} role={:?} bounds={b} verdict={verdict} name={name:?}",
                     node.role(),
                 ));
             }
