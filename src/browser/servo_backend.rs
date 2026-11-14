@@ -73,6 +73,9 @@ struct Shared {
     last_emitted: Vec<Focusable>,
     visible: bool,
     suspended: bool,
+    /// Verbose per-node AX diagnostics (`SDSC_AX_DEBUG=1`): role, bounds,
+    /// and keep/drop verdict for every node in each tree update.
+    ax_debug: bool,
 }
 
 struct Delegate {
@@ -147,11 +150,10 @@ impl WebViewDelegate for Delegate {
         for (id, node) in &update.nodes {
             // Role-typed actionables, plus anything Servo marks clickable
             // (Click action): div-buttons, image links, custom controls.
-            let kind = focusable_kind(node.role()).or_else(|| {
-                node.supports_action(servo::accesskit::Action::Click)
-                    .then_some(FocusKind::Other)
-            });
-            match kind.and_then(|kind| {
+            let clickable = node.supports_action(servo::accesskit::Action::Click);
+            let kind =
+                focusable_kind(node.role()).or_else(|| clickable.then_some(FocusKind::Other));
+            let kept = kind.and_then(|kind| {
                 node.bounds().and_then(|rect| {
                     let (w, h) = (rect.width() as f32, rect.height() as f32);
                     // Non-zero area and smaller than the viewport: a
@@ -169,7 +171,38 @@ impl WebViewDelegate for Delegate {
                             kind,
                         })
                 })
-            }) {
+            });
+            if shared.ax_debug {
+                let bounds = node.bounds();
+                let verdict = match (&kept, bounds) {
+                    (Some(_), _) => "kept",
+                    (None, None) => "drop:nobounds",
+                    (None, Some(rect))
+                        if rect.width() as f32 > VIEWPORT_WIDTH as f32
+                            || rect.height() as f32 > VIEWPORT_HEIGHT as f32 =>
+                    {
+                        "drop:oversize"
+                    }
+                    (None, Some(_)) => "drop:role",
+                };
+                let b = bounds
+                    .map(|r| {
+                        format!(
+                            "({},{}) {}x{}",
+                            r.x0 as i32,
+                            r.y0 as i32,
+                            r.width() as i32,
+                            r.height() as i32
+                        )
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                crate::platform::app_log::info(format!(
+                    "servo-ax node id={} role={:?} clickable={clickable} bounds={b} verdict={verdict}",
+                    id.0,
+                    node.role()
+                ));
+            }
+            match kept {
                 Some(item) => {
                     shared.focusables.insert(item.id, item);
                 }
@@ -319,6 +352,7 @@ fn run(
         last_emitted: Vec::new(),
         visible: false,
         suspended: true,
+        ax_debug: std::env::var("SDSC_AX_DEBUG").is_ok(),
     }));
     let webview = WebViewBuilder::new(&servo, ctx.clone())
         .delegate(Rc::new(Delegate {
