@@ -71,6 +71,10 @@ struct Shared {
     /// ghosts. Empty (focus-only) heartbeats are ignored; the mirror resets
     /// on document change (see `clear_tree`).
     tree: Option<accesskit_consumer::Tree>,
+    /// Pre-root updates waiting for replay: Servo streams subtree updates
+    /// before the root snapshot, and the mirror can only start from ROOT.
+    /// Bounded; oldest drops on overflow. Cleared on document change.
+    pending: Vec<servo::accesskit::TreeUpdate>,
     /// Last list sent to the UI (diffed to avoid spamming identical trees).
     last_emitted: Vec<Focusable>,
     visible: bool,
@@ -188,21 +192,29 @@ impl WebViewDelegate for Delegate {
         // a real consumer (structure included): removals drop with their
         // subtree instead of lingering as ghosts. Empty (focus-only)
         // heartbeats are ignored; the mirror resets on document change.
-        if update.nodes.is_empty() {
+        if update.nodes.is_empty() && update.tree.is_none() {
+            // Focus-only heartbeat: nothing to mirror.
             return;
         }
         let mut shared = self.shared.borrow_mut();
-        match shared.tree.as_mut() {
-            Some(tree) => tree.update_and_process_changes(update, &mut NoChanges),
-            None => {
-                if update.tree.is_none() {
-                    // No root yet (the first update is normally a full
-                    // snapshot); wait for it rather than panicking the
-                    // worker inside Tree::new.
-                    return;
+        if shared.tree.is_none() {
+            if update.tree_id != servo::accesskit::TreeId::ROOT || update.tree.is_none() {
+                // Subtree (or rootless) update before the root snapshot:
+                // the mirror can only start from ROOT, so queue for replay
+                // after init (bounded).
+                if shared.pending.len() >= MAX_PENDING_UPDATES {
+                    shared.pending.remove(0);
                 }
-                shared.tree = Some(accesskit_consumer::Tree::new(update, false));
+                shared.pending.push(update);
+                return;
             }
+            shared.tree = Some(accesskit_consumer::Tree::new(update, false));
+            let pending = std::mem::take(&mut shared.pending);
+            for queued in pending {
+                apply_update(&mut shared, queued);
+            }
+        } else {
+            apply_update(&mut shared, update);
         }
         // Publish the translated tree (diffed + logged inside).
         emit_tree(&mut shared);
@@ -415,6 +427,7 @@ fn run(
         load_started_at: None,
         logged_first_frame: false,
         tree: None,
+        pending: Vec::new(),
         last_emitted: Vec::new(),
         visible: false,
         suspended: true,
@@ -586,6 +599,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
 fn clear_tree(state: &mut Shared) {
     if state.tree.is_some() {
         state.tree = None;
+        state.pending.clear();
         state.last_emitted = Vec::new();
         state.handle.emit(EngineEvent::A11yTree(Vec::new()));
     }
@@ -609,6 +623,31 @@ fn translate_tree(mut items: Vec<Focusable>, scroll: (f32, f32)) -> Vec<Focusabl
         o.y -= scroll.1;
     }
     items
+}
+
+/// Cap on queued pre-root updates (replay after init, oldest drops first).
+const MAX_PENDING_UPDATES: usize = 128;
+
+/// Apply one update, resetting the mirror instead of dying if the consumer
+/// rejects it (unknown-graft races on lively pages must not take down the
+/// worker: the next root snapshot rebuilds it).
+fn apply_update(shared: &mut Shared, update: servo::accesskit::TreeUpdate) {
+    let Some(mut tree) = shared.tree.take() else {
+        return;
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tree.update_and_process_changes(update, &mut NoChanges);
+        tree
+    }));
+    match result {
+        Ok(tree) => shared.tree = Some(tree),
+        Err(_) => {
+            crate::platform::app_log::warn(
+                "servo-engine: AX mirror rejected an update; rebuilding on next root snapshot",
+            );
+            shared.pending.clear();
+        }
+    }
 }
 
 /// No-op change handler: the backend re-walks the whole mirror per update
