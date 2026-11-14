@@ -42,9 +42,11 @@ pub const CURSOR_MAX_SPEED: f32 = 1400.0;
 /// Velocity decay rate (exponential friction, per second). The cursor glides
 /// a little after release instead of stopping dead.
 pub const CURSOR_FRICTION: f32 = 7.0;
-/// Magnetic pull rate (exponential approach per second) once docked: the
-/// cursor glides to the element's center instead of teleporting.
-pub const MAGNET_PULL_PER_SEC: f32 = 14.0;
+/// Magnetic pull cap, as acceleration: exactly one quarter of stick
+/// thrust, so holding the stick past ~25% deflection always overpowers the
+/// magnet at any range, while lighter touches get captured. Falls off
+/// linearly to zero at the snap radius edge.
+pub const PULL_MAX_ACCEL: f32 = CURSOR_ACCEL * 0.25;
 /// Right-stick scroll speed at full deflection, px/s.
 pub const SCROLL_SPEED: f32 = 1500.0;
 /// Engine viewport the cursor space matches (see `servo_backend`).
@@ -98,17 +100,34 @@ impl Cursor {
         self.y = (self.y + dy).clamp(0.0, VIEWPORT_H);
     }
 
-    /// Analog velocity step: the stick accelerates a velocity vector and
-    /// friction decays it, so the cursor glides full-360° with momentum and
-    /// settles instead of stopping dead. Detaches on manual input; re-snaps
-    /// (magnetic mode) and glides to the dock afterwards.
+    /// Analog velocity step with magnetic gravity: the stick accelerates a
+    /// velocity vector, friction decays it, and the nearest focusable
+    /// within range pulls proportionally to closeness. Full-360° control;
+    /// holding past ~25% deflection always overpowers the magnet, lighter
+    /// touches get captured. Attachment follows the pull (docks on capture,
+    /// releases past the radius) — no teleporting.
     pub fn advance(&mut self, lx: f32, ly: f32, dt_secs: f32, options: &[Focusable]) {
-        if lx != 0.0 || ly != 0.0 {
-            self.attached = None;
-            self.vx =
-                (self.vx + lx * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
-            self.vy =
-                (self.vy + ly * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
+        self.vx =
+            (self.vx + lx * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
+        self.vy =
+            (self.vy + ly * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
+        if self.magnet {
+            if let Some((id, tx, ty, edge, clen)) = Self::nearest_within(self.x, self.y, options) {
+                self.attached = Some(id);
+                // Gravity, not teleport: pull toward the element center with
+                // a magnitude that falls off to zero at the snap radius
+                // edge. Direction normalizes by *center* distance — the edge
+                // distance drives the falloff only. (Normalizing by the edge
+                // distance inflated the pull up to 6x when the cursor sat
+                // just outside a rect, which read as an instant snap.)
+                if clen > 0.5 {
+                    let strength = PULL_MAX_ACCEL * (1.0 - edge / SNAP_RADIUS);
+                    self.vx += ((tx - self.x) / clen) * strength * dt_secs;
+                    self.vy += ((ty - self.y) / clen) * strength * dt_secs;
+                }
+            } else {
+                self.attached = None;
+            }
         }
         let damp = (-CURSOR_FRICTION * dt_secs).exp();
         self.vx *= damp;
@@ -123,26 +142,40 @@ impl Cursor {
             self.x = (self.x + self.vx * dt_secs).clamp(0.0, VIEWPORT_W);
             self.y = (self.y + self.vy * dt_secs).clamp(0.0, VIEWPORT_H);
         }
-        if self.magnet {
-            self.snap(options);
-            self.glide(dt_secs, options);
-        }
     }
 
-    /// Glide the docked point toward its element center (magnetic pull).
-    /// No-op when free: the stick already placed the point this tick.
-    pub fn glide(&mut self, dt_secs: f32, options: &[Focusable]) {
-        let Some(id) = self.attached else {
-            return;
-        };
-        let Some(item) = options.iter().find(|o| o.id == id) else {
-            return;
-        };
-        let tx = item.x + item.w / 2.0;
-        let ty = item.y + item.h / 2.0;
-        let t = 1.0 - (-MAGNET_PULL_PER_SEC * dt_secs).exp();
-        self.x += (tx - self.x) * t;
-        self.y += (ty - self.y) * t;
+    /// Nearest focusable within snap radius of a point: its center, the edge
+    /// distance (drives pull falloff + attach range), and the center distance
+    /// (drives pull direction). Shared by the per-tick gravity and the snap
+    /// pass.
+    fn nearest_within(x: f32, y: f32, options: &[Focusable]) -> Option<(u64, f32, f32, f32, f32)> {
+        let mut best: Option<(u64, f32, f32, f32, f32)> = None;
+        for item in options {
+            let dx = if x < item.x {
+                item.x - x
+            } else if x > item.x + item.w {
+                x - (item.x + item.w)
+            } else {
+                0.0
+            };
+            let dy = if y < item.y {
+                item.y - y
+            } else if y > item.y + item.h {
+                y - (item.y + item.h)
+            } else {
+                0.0
+            };
+            let edge = dx.hypot(dy);
+            if edge <= SNAP_RADIUS {
+                let cx = item.x + item.w / 2.0;
+                let cy = item.y + item.h / 2.0;
+                let clen = (cx - x).hypot(cy - y);
+                if best.is_none_or(|(_, _, _, be, _)| edge < be) {
+                    best = Some((item.id, cx, cy, edge, clen));
+                }
+            }
+        }
+        best
     }
 
     /// Nudge for D-pad taps, then snap. Discrete step: kills velocity so a
@@ -447,6 +480,57 @@ mod tests {
         c.advance(0.0, 0.0, 0.05, &items);
         assert_eq!(c.attached, Some(1));
         assert!(c.x < 210.0);
+    }
+
+    #[test]
+    fn magnet_pull_is_gradual_not_a_teleport() {
+        // 60px from center, 10px outside the rect edge: one 16ms tick must
+        // drift slightly inward, not jump to the center.
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 210.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        assert!(c.x < 210.0 && c.x > 200.0, "glides, not snaps: x={}", c.x);
+    }
+
+    #[test]
+    fn full_stick_overpowers_magnet_and_escapes() {
+        // Docked at the center of link(1) (center 150,115).
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        // Full deflection away: eventually leaves the snap radius.
+        for _ in 0..120 {
+            c.advance(1.0, 0.0, 0.016, &items);
+            if c.attached.is_none() {
+                break;
+            }
+        }
+        assert_eq!(c.attached, None, "full stick must escape the magnet");
+        assert!(c.x > 250.0, "escaped outward, x={}", c.x);
+    }
+
+    #[test]
+    fn weak_stick_stays_captured() {
+        // A gentle 10% push cannot beat the pull near the center.
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        for _ in 0..60 {
+            c.advance(0.1, 0.0, 0.016, &items);
+            if c.attached.is_none() {
+                break;
+            }
+        }
+        assert_eq!(c.attached, Some(1), "10% deflection must not escape");
     }
 
     #[test]
