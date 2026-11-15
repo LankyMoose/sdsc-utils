@@ -166,9 +166,10 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
   var culled = 0;
   // Skip census: WHY matched candidates never become targets. `total` says
   // how many matched; these say where the rest went. Read the ingest log.
-  // skBox = no boxes even via the children-union fallback (display:none
-  // subtrees, empty anchors — correctly invisible, nothing to recover).
+  // skBox = no boxes; skBoxA = of those, anchors; skBoxKid = of those, with
+  // element children (the wrapper signature: boxless parent, boxed kids).
   var skBox = 0, skZero = 0, skBig = 0, skDis = 0, skErr = 0;
+  var skBoxA = 0, skBoxKid = 0;
   S.byId = {};
   var els;
   try { els = document.querySelectorAll(SEL); } catch (e) { return {nodes: [], total: 0, truncated: false}; }
@@ -184,27 +185,9 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
   function boxOf(el) {
     var rs;
     try { rs = el.getClientRects(); } catch (e) { return null; }
-    var boxes = [];
-    var j;
-    for (j = 0; j < rs.length; j++) boxes.push(rs[j]);
-    if (boxes.length === 0) {
-      // Box-free wrappers (display:contents and kin): the element itself
-      // has no boxes but its children do. Union up to 4 element children
-      // instead — bounded, and only runs when the primary path found
-      // nothing. Layout is already forced by the first call above, so the
-      // extras are cache hits, not reflows.
-      try {
-        var kids = el.children;
-        for (var k = 0; k < kids.length && k < 4; k++) {
-          var kr;
-          try { kr = kids[k].getClientRects(); } catch (e2) { continue; }
-          for (var m = 0; m < kr.length; m++) boxes.push(kr[m]);
-        }
-      } catch (e3) {}
-    }
     var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    for (j = 0; j < boxes.length; j++) {
-      var q = boxes[j];
+    for (var j = 0; j < rs.length; j++) {
+      var q = rs[j];
       var qx0 = Math.min(q.x, q.x + q.width), qx1 = Math.max(q.x, q.x + q.width);
       var qy0 = Math.min(q.y, q.y + q.height), qy1 = Math.max(q.y, q.y + q.height);
       if (qx0 < x0) x0 = qx0;
@@ -225,7 +208,14 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
         if (ty === "hidden") return;
       }
       var r = boxOf(el);
-      if (!r) { skBox++; return; }
+      if (!r) {
+        skBox++;
+        try {
+          if (t === "a") skBoxA++;
+          if (el.children && el.children.length > 0) skBoxKid++;
+        } catch (e2) {}
+        return;
+      }
       if (!(r.width > 0 && r.height > 0)) { skZero++; return; }
       var vw = window.innerWidth || 800, vh = window.innerHeight || 600;
       // Full-viewport-or-larger boxes are never snap targets: page roots and
@@ -254,7 +244,7 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
     var de = document.documentElement;
     if (de) { dw = de.scrollWidth || 0; dh = de.scrollHeight || 0; }
   } catch (e) {}
-  return {nodes: out, total: total, truncated: els.length > n, culled: culled, skip: [skBox, skZero, skBig, skDis, skErr], sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
+  return {nodes: out, total: total, truncated: els.length > n, culled: culled, skip: [skBox, skZero, skBig, skDis, skErr], boxA: skBoxA, boxKid: skBoxKid, sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
 })()"###;
 
 /// Parsed snapshot: viewport-space candidates plus the true page scroll at
@@ -264,7 +254,9 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
 /// the full document dims so scroll clamping survives viewport culling (the
 /// live set only ever spans viewport+margin); `total`/`culled`/`skipped`
 /// are diagnostics for cap pressure and skip reasons, in
-/// [boxless, zero-area, oversize, disabled, threw] order.
+/// [boxless, zero-area, oversize, disabled, threw] order. `box_anchors`
+/// counts boxless <a> elements, `boxless_with_kids` counts boxless elements
+/// that have element children (the wrapper signature).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DomSnapshot {
     pub nodes: Vec<DomRaw>,
@@ -273,6 +265,8 @@ pub struct DomSnapshot {
     pub total: usize,
     pub culled: usize,
     pub skipped: [usize; 5],
+    pub box_anchors: usize,
+    pub boxless_with_kids: usize,
 }
 
 /// Parse a `DOM_QUERY_JS` result into raw candidates. Lenient by design:
@@ -290,6 +284,8 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             total: 0,
             culled: 0,
             skipped: [0; 5],
+            box_anchors: 0,
+            boxless_with_kids: 0,
         };
     };
     let num_field = |key: &str| {
@@ -304,6 +300,8 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
     let doc = (num_field("dw"), num_field("dh"));
     let total = num_field("total") as usize;
     let culled = num_field("culled") as usize;
+    let box_anchors = num_field("boxA") as usize;
+    let boxless_with_kids = num_field("boxKid") as usize;
     let mut skipped = [0usize; 5];
     if let Some(JSValue::Array(cols)) = root.get("skip") {
         for (i, col) in cols.iter().take(5).enumerate() {
@@ -320,6 +318,8 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             total,
             culled,
             skipped,
+            box_anchors,
+            boxless_with_kids,
         };
     };
     let mut nodes = Vec::new();
@@ -365,6 +365,8 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
         total,
         culled,
         skipped,
+        box_anchors,
+        boxless_with_kids,
     }
 }
 
@@ -482,6 +484,8 @@ mod tests {
             "skip".to_string(),
             JSValue::Array(vec![num(3.0), num(0.0), num(1.0), num(0.0), num(2.0)]),
         );
+        root.insert("boxA".to_string(), num(7.0));
+        root.insert("boxKid".to_string(), num(5.0));
         let out = parse_dom_snapshot(&JSValue::Object(root));
         assert!(out.nodes.is_empty());
         assert_eq!(out.scroll, (0.0, 1240.0));
@@ -489,6 +493,8 @@ mod tests {
         assert_eq!(out.total, 1500);
         assert_eq!(out.culled, 900);
         assert_eq!(out.skipped, [3, 0, 1, 0, 2]);
+        assert_eq!(out.box_anchors, 7);
+        assert_eq!(out.boxless_with_kids, 5);
     }
 
     #[test]
