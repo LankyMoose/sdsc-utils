@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
 use embedder_traits::{
-    InputEvent, JSValue, KeyboardEvent, MouseButton, MouseButtonAction, MouseButtonEvent, Theme,
-    WebResourceResponse,
+    InputEvent, JSValue, KeyboardEvent, MouseButton, MouseButtonAction, MouseButtonEvent,
+    MouseMoveEvent, Theme, WebResourceResponse,
 };
 use euclid::{Box2D, Point2D};
 
@@ -184,18 +184,52 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
-        if matches!(status, LoadStatus::Complete) {
-            let mut shared = self.shared.borrow_mut();
-            shared.load_started_at = None;
-            // Fresh document settling in: boot (idempotent install +
-            // snapshot) once rendering lands.
-            shared.dom_boot = true;
-            let generation = shared.generation;
-            shared.handle.emit(EngineEvent::LoadFinished {
-                generation,
-                result: Ok(()),
-            });
+        let mut shared = self.shared.borrow_mut();
+        match status {
+            LoadStatus::Started | LoadStatus::HeadParsed => {
+                crate::platform::app_log::info(format!("servo-engine: load {status:?}"));
+            }
+            LoadStatus::Complete => {
+                shared.load_started_at = None;
+                // Fresh document settling in: boot (idempotent install +
+                // snapshot) once rendering lands.
+                shared.dom_boot = true;
+                let generation = shared.generation;
+                shared.handle.emit(EngineEvent::LoadFinished {
+                    generation,
+                    result: Ok(()),
+                });
+            }
+            LoadStatus::Stopped => {
+                // Failed/stopped loads previously sat silent until the 30s
+                // timeout misreported them. Surface immediately.
+                crate::platform::app_log::warn("servo-engine: load stopped before complete");
+                shared.load_started_at = None;
+                let generation = shared.generation;
+                shared.handle.emit(EngineEvent::LoadFinished {
+                    generation,
+                    result: Err("load stopped before complete".to_string()),
+                });
+            }
         }
+    }
+
+    fn notify_crashed(&self, _webview: WebView, reason: String, backtrace: Option<String>) {
+        crate::platform::app_log::warn(format!(
+            "servo-engine: crashed reason={reason} backtrace={}",
+            backtrace
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect::<String>()
+        ));
+        let mut shared = self.shared.borrow_mut();
+        shared.load_started_at = None;
+        let generation = shared.generation;
+        shared.handle.emit(EngineEvent::LoadFinished {
+            generation,
+            result: Err(format!("page crashed: {reason}")),
+        });
     }
 
     fn load_web_resource(&self, _webview: WebView, load: servo::WebResourceLoad) {
@@ -250,9 +284,9 @@ struct DomEntry {
     missed: u8,
 }
 
-/// Completed DOM query from the page: poll sequence (stale results are
-/// dropped) plus the raw JS value or the evaluation error.
-type DomIngest = (u64, Result<JSValue, String>);
+/// Completed DOM query from the page: poll sequence, dispatch time (for
+/// pull round-trip logging), plus the raw JS value or the evaluation error.
+type DomIngest = (u64, Instant, Result<JSValue, String>);
 
 /// Consecutive missed polls before a DOM target is dropped.
 const DOM_MISSED_LIMIT: u8 = 2;
@@ -439,15 +473,17 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                 }
             }
         }
-        EngineCommand::ScrollBy { dx, dy } => {
+        EngineCommand::ScrollBy { dx, dy, x, y } => {
             let mut state = shared.borrow_mut();
             if state.suspended {
                 return;
             }
-            let (w, h) = state.size;
+            // Scroll under the pad cursor, not viewport center: Servo routes
+            // to the innermost scroller under the point, so center-targeting
+            // stranded page scrolls inside carousels.
             webview.notify_scroll_event(
                 Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(dx, dy))),
-                WebViewPoint::Device(DevicePoint::new(w as f32 / 2.0, h as f32 / 2.0)),
+                WebViewPoint::Device(DevicePoint::new(x, y)),
             );
             // Servo reports document-relative bounds and never re-emits on
             // scroll: accumulate the commanded offset and re-emit translated
@@ -493,8 +529,16 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             clear_tree(&mut state);
             webview.go_forward(1);
         }
+        EngineCommand::MouseMove { x, y } => {
+            if shared.borrow().suspended {
+                return;
+            }
+            let point = WebViewPoint::Device(DevicePoint::new(x, y));
+            webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
+        }
         EngineCommand::ClickAt { x, y } => {
             if shared.borrow().suspended {
+                crate::platform::app_log::info("servo-engine: click dropped (suspended)");
                 return;
             }
             // Viewport-space point (same space as the cursor and the
@@ -607,8 +651,9 @@ fn clamp_scroll(scroll: (f32, f32), content: Option<(f32, f32)>) -> (f32, f32) {
 }
 
 /// Quiet period after a dirty ping before the pull fires (lets the page
-/// reflow after the mutation burst that triggered the ping).
-const DOM_SETTLE: Duration = Duration::from_millis(600);
+/// reflow after the mutation burst that triggered the ping). Tuned low:
+/// mid-reflow pulls self-correct via the next ping.
+const DOM_SETTLE: Duration = Duration::from_millis(250);
 
 /// Pull the page for its actionable elements (see `browser::dom`). Purely
 /// event-driven — no timers: fires for a pending boot (fresh document or
@@ -653,9 +698,9 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
         } else {
             DOM_QUERY_JS.to_string()
         };
-        Some((seq, state.dom_tx.clone(), script, boot, pinged))
+        Some((seq, state.dom_tx.clone(), script, boot, pinged, now))
     };
-    let Some((seq, tx, script, boot, pinged)) = fire else {
+    let Some((seq, tx, script, boot, pinged, dispatched)) = fire else {
         return;
     };
     let src = if boot {
@@ -667,7 +712,7 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
     };
     crate::platform::app_log::info(format!("servo-dom: pull seq={seq} src={src}"));
     webview.evaluate_javascript(script, move |result| {
-        let _ = tx.send((seq, result.map_err(|e| format!("{e:?}"))));
+        let _ = tx.send((seq, dispatched, result.map_err(|e| format!("{e:?}"))));
     });
 }
 
@@ -680,7 +725,7 @@ fn drain_dom_results(shared: &Rc<RefCell<Shared>>) {
             .dom_rx
             .as_mut()
             .and_then(|rx| rx.try_recv().ok());
-        let Some((seq, result)) = msg else {
+        let Some((seq, dispatched, result)) = msg else {
             return;
         };
         let mut state = shared.borrow_mut();
@@ -689,13 +734,16 @@ fn drain_dom_results(shared: &Rc<RefCell<Shared>>) {
         }
         state.dom_in_flight = false;
         state.dom_in_flight_at = None;
+        let rtt = dispatched.elapsed().as_millis();
         match result {
             Ok(value) => {
-                ingest_dom(&mut state, &value);
+                ingest_dom(&mut state, &value, rtt);
                 emit_tree(&mut state);
             }
             Err(err) => {
-                crate::platform::app_log::info(format!("servo-dom: query failed: {err}"));
+                crate::platform::app_log::info(format!(
+                    "servo-dom: query failed: {err} rtt={rtt}ms"
+                ));
             }
         }
     }
@@ -708,7 +756,7 @@ fn drain_dom_results(shared: &Rc<RefCell<Shared>>) {
 /// offsets self-heal on every pull. Absent nodes accumulate misses and drop
 /// at [`DOM_MISSED_LIMIT`] (re-render flicker reads as one miss, real
 /// removals as two in a row).
-fn ingest_dom(state: &mut Shared, value: &JSValue) {
+fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128) {
     use std::collections::HashSet;
     let snap = parse_dom_snapshot(value);
     rebase_scroll(state, snap.scroll);
@@ -776,7 +824,7 @@ fn ingest_dom(state: &mut Shared, value: &JSValue) {
         state.dom_uid.clear();
     }
     crate::platform::app_log::info(format!(
-        "servo-dom: ingested fresh={fresh} dropped={dropped} live={}",
+        "servo-dom: ingested fresh={fresh} dropped={dropped} live={} rtt={rtt_ms}ms",
         state.dom.len(),
     ));
 }

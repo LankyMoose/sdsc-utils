@@ -432,6 +432,15 @@ impl App {
         if let Some(engine) = &self.engine {
             engine.send(EngineCommand::Resume);
             engine.send(EngineCommand::SetVisible { visible: true });
+            // Re-sync the mouse after suspension: hover state is stale.
+            engine.send(EngineCommand::MouseMove {
+                x: self.start_state.browser.cursor.x,
+                y: self.start_state.browser.cursor.y,
+            });
+            self.start_state.browser.last_sent_mouse = Some((
+                self.start_state.browser.cursor.x as i32,
+                self.start_state.browser.cursor.y as i32,
+            ));
         }
         self.sync_browser_theme();
         crate::controller::hid::diag::diag_info("ui-diag: start browser open");
@@ -750,7 +759,35 @@ impl App {
         if (dx != 0.0 || dy != 0.0)
             && let Some(engine) = &self.engine
         {
-            engine.send(EngineCommand::ScrollBy { dx, dy });
+            // Scroll under the pad cursor: Servo routes to the innermost
+            // scroller under the point, so center-targeting stranded page
+            // scrolls inside carousels after use.
+            let (cx, cy) = (
+                self.start_state.browser.cursor.x,
+                self.start_state.browser.cursor.y,
+            );
+            engine.send(EngineCommand::ScrollBy {
+                dx,
+                dy,
+                x: cx,
+                y: cy,
+            });
+        }
+        // Stream the pad cursor as the one true mouse: quantized to whole
+        // px so a resting cursor sends nothing, while any travel keeps
+        // Servo hover/hit-test glued to the real position.
+        let (qx, qy) = (
+            self.start_state.browser.cursor.x as i32,
+            self.start_state.browser.cursor.y as i32,
+        );
+        if self.start_state.browser.last_sent_mouse != Some((qx, qy)) {
+            self.start_state.browser.last_sent_mouse = Some((qx, qy));
+            if let Some(engine) = &self.engine {
+                engine.send(EngineCommand::MouseMove {
+                    x: qx as f32,
+                    y: qy as f32,
+                });
+            }
         }
     }
 
@@ -853,7 +890,16 @@ impl App {
     pub(crate) fn scroll_browser(&mut self, delta: f32) -> Task<Message> {
         if self.start_state.browser.session.has_frame() {
             if let Some(engine) = &self.engine {
-                engine.send(EngineCommand::ScrollBy { dx: 0.0, dy: delta });
+                let (cx, cy) = (
+                    self.start_state.browser.cursor.x,
+                    self.start_state.browser.cursor.y,
+                );
+                engine.send(EngineCommand::ScrollBy {
+                    dx: 0.0,
+                    dy: delta,
+                    x: cx,
+                    y: cy,
+                });
             }
             return Task::none();
         }

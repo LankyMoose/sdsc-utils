@@ -53,7 +53,7 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
   S.mo = true;
   var PING = 'http://sdsc.invalid/__SDSC_DOM_DIRTY';
   var lastPing = 0, trailing = null;
-  var SUPPRESS = 1000, TRAIL = 500;
+  var SUPPRESS = 500, TRAIL = 250;
   function fire(){
     lastPing = Date.now();
     try { fetch(PING, {method:'POST', mode:'no-cors', keepalive:true, body:'1'}).catch(function(){}); } catch (e) {}

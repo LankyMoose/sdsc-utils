@@ -805,6 +805,9 @@ pub struct BrowserPanel {
     /// shooting on the dock tick only ever captures a half-morphed wrap
     /// and reads as a misplaced outline.
     pub last_dock_change: Option<Instant>,
+    /// Last sent mouse position (quantized px), so the pad cursor streams
+    /// moves to the engine only when it actually travels. Never persisted.
+    pub last_sent_mouse: Option<(i32, i32)>,
     /// Browser debug overlay + shots (Diagnostics toggle / F10, mirrored
     /// from App). Never persisted.
     pub debug_overlay: bool,

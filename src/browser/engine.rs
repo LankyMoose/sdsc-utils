@@ -27,10 +27,24 @@ pub enum EngineCommand {
     ScrollBy {
         dx: f32,
         dy: f32,
+        /// Page point to scroll under (device px == page px at 1x): the pad
+        /// cursor. Servo scrolls the innermost scroller under the point, so
+        /// this is both intent ("scroll what I point at") and the carousel
+        /// trap escape.
+        x: f32,
+        y: f32,
     },
     Key(keyboard_types::KeyboardEvent),
     SetDarkMode {
         dark: bool,
+    },
+    /// Mouse position sync: the pad cursor is the only mouse Servo ever
+    /// sees. The UI streams this on quantized movement so hover, hit-test
+    /// and `:hover` state track the real cursor; clicks then need no
+    /// pre-move.
+    MouseMove {
+        x: f32,
+        y: f32,
     },
     /// Click at a page point (device px == page px at 1x). Sent as
     /// down+up by the backend; the pad cursor owns this, never the OS mouse.
@@ -186,10 +200,17 @@ mod tests {
     #[test]
     fn scroll_commands_pass_through_in_order() {
         let (handle, rx) = EngineHandle::channel();
-        handle.send(EngineCommand::ScrollBy { dx: 0.0, dy: 240.0 });
+        handle.send(EngineCommand::ScrollBy {
+            dx: 0.0,
+            dy: 240.0,
+            x: 400.0,
+            y: 300.0,
+        });
         handle.send(EngineCommand::ScrollBy {
             dx: 0.0,
             dy: -240.0,
+            x: 400.0,
+            y: 300.0,
         });
         assert!(matches!(
             rx.recv(),
