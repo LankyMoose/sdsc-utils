@@ -28,6 +28,71 @@ pub struct DomRaw {
     pub text: String,
 }
 
+/// Marker shared by all three dirty-ping channels (A=console, B=fetch,
+/// C=sendBeacon). Rust matches it by substring, so every channel embeds it
+/// verbatim — including the ping URL below.
+pub const DOM_DIRTY_MARKER: &str = "__SDSC_DOM_DIRTY";
+
+/// Ping endpoint for the network channels (B=fetch, C=sendBeacon), with the
+/// channel encoded as `?ch=`. Plain `http` (not a custom scheme) so the load
+/// reaches `load_web_resource`, where the backend intercepts it with an
+/// empty 200 before any traffic leaves the machine. `.invalid` can never
+/// resolve if one ever leaks past the intercept.
+pub const DOM_PING_URL: &str = "http://sdsc.invalid/__SDSC_DOM_DIRTY";
+
+/// Observer install script (idempotent per document). Attaches a
+/// MutationObserver (subtree: childList, attributes, characterData) plus a
+/// ResizeObserver on `body` (image/font loads shift layout with no DOM
+/// mutation), with in-page leading+trailing debounce so animation-heavy
+/// pages collapse 60fps mutation storms to ~2 pings/s. Every ping fires all
+/// three channels; the backend ORs them into one dirty flag and logs which
+/// arrived (the A/B/C experiment).
+pub const DOM_INSTALL_JS: &str = r###"(function(){
+  var S = window.__sdsc_ax;
+  if (!S) { S = window.__sdsc_ax = { next: 1, ids: new WeakMap() }; }
+  if (S.mo) return;
+  S.mo = true;
+  var MARK = '__SDSC_DOM_DIRTY';
+  var PING = 'http://sdsc.invalid/__SDSC_DOM_DIRTY';
+  var clog = null;
+  try { clog = console.log.bind(console); } catch (e) {}
+  var beacon = null;
+  try { beacon = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null; } catch (e) {}
+  var lastPing = 0, trailing = null;
+  var SUPPRESS = 1000, TRAIL = 500;
+  function fire(){
+    lastPing = Date.now();
+    try { if (clog) clog(MARK); } catch (e) {}
+    try { fetch(PING + '?ch=fetch', {method:'POST', mode:'no-cors', keepalive:true, body:'1'}).catch(function(){}); } catch (e) {}
+    try { if (beacon) beacon(PING + '?ch=beacon', '1'); } catch (e) {}
+  }
+  function onMut(){
+    var now = Date.now();
+    if (now - lastPing >= SUPPRESS && !trailing) { fire(); }
+    else if (!trailing) {
+      trailing = setTimeout(function(){ trailing = null; fire(); }, TRAIL);
+    }
+  }
+  function arm(){
+    var root = document.documentElement;
+    if (!root) { setTimeout(arm, 500); return; }
+    try {
+      new MutationObserver(onMut).observe(root, {subtree:true, childList:true, attributes:true, characterData:true});
+    } catch (e) {}
+    try {
+      new ResizeObserver(onMut).observe(document.body || root);
+    } catch (e) {}
+  }
+  arm();
+  try { window.addEventListener('load', onMut); } catch (e) {}
+})()"###;
+
+/// Boot script: idempotent install + immediate snapshot, so one round-trip
+/// both arms the observers and returns the current targets.
+pub fn dom_boot_js() -> String {
+    format!("{DOM_INSTALL_JS}\n{DOM_QUERY_JS}")
+}
+
 /// Read-only DOM query. Stable per-document ids via an in-page WeakMap
 /// (recreated on every navigation, so ids are only meaningful within one
 /// document). Bounded to 1000 matches; reports truncation.
@@ -247,6 +312,25 @@ mod tests {
         let out = parse_dom_snapshot(&value);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, 3);
+    }
+
+    #[test]
+    fn install_pings_all_three_channels() {
+        // The ping URL must embed the marker: the backend matches resource
+        // loads by substring.
+        assert!(DOM_PING_URL.contains(DOM_DIRTY_MARKER));
+        assert!(DOM_INSTALL_JS.contains(DOM_PING_URL));
+        assert!(DOM_INSTALL_JS.contains(DOM_DIRTY_MARKER));
+        assert!(DOM_INSTALL_JS.contains("MutationObserver"));
+        assert!(DOM_INSTALL_JS.contains("ResizeObserver"));
+        assert!(DOM_INSTALL_JS.contains("sendBeacon"));
+        assert!(DOM_INSTALL_JS.contains("fetch("));
+        // Idempotent per document: re-running never double-arms.
+        assert!(DOM_INSTALL_JS.contains("S.mo"));
+        // Boot = install + snapshot in one round-trip.
+        let boot = dom_boot_js();
+        assert!(boot.contains(DOM_DIRTY_MARKER));
+        assert!(boot.contains("querySelectorAll"));
     }
 
     #[test]

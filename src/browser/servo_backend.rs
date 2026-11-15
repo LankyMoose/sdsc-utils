@@ -19,18 +19,22 @@ use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
 use embedder_traits::{
-    InputEvent, JSValue, KeyboardEvent, MouseButton, MouseButtonAction, MouseButtonEvent, Theme,
+    ConsoleLogLevel, InputEvent, JSValue, KeyboardEvent, MouseButton, MouseButtonAction,
+    MouseButtonEvent, Theme, WebResourceResponse,
 };
 use euclid::{Box2D, Point2D};
 
 use servo::{
     DevicePixel, DevicePoint, DeviceVector2D, EventLoopWaker, LoadStatus, RenderingContext, Scroll,
-    ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
-    WebViewVector,
+    ServoBuilder, SoftwareRenderingContext, UserContentManager, UserScript, WebView,
+    WebViewBuilder, WebViewDelegate, WebViewPoint, WebViewVector,
 };
 
 use crate::browser::cursor::{FocusKind, Focusable};
-use crate::browser::dom::{DOM_QUERY_JS, dom_kind, parse_dom_snapshot};
+use crate::browser::dom::{
+    DOM_DIRTY_MARKER, DOM_INSTALL_JS, DOM_PING_URL, DOM_QUERY_JS, dom_boot_js, dom_kind,
+    parse_dom_snapshot,
+};
 use crate::browser::engine::{EngineCommand, EngineEvent, EngineHandle, PageFrame};
 
 /// Fixed offscreen viewport (phase 1; the iced image scales to the card).
@@ -88,12 +92,17 @@ struct Shared {
     dom: HashMap<u64, DomEntry>,
     dom_uid: HashMap<u64, u64>,
     dom_seq: u64,
+    /// Fresh document (or fresh load) needs the install+snapshot boot
+    /// round-trip. Set by every document event, cleared on dispatch.
+    dom_boot: bool,
+    /// A/B/C arrival flags since the last pull (A=console, B=fetch,
+    /// C=sendBeacon). Logged per pull so live testing can compare channel
+    /// reliability; the dirty flag itself is the OR of all three.
+    dom_chan: [bool; 3],
     dom_dirty: bool,
     dom_dirty_at: Option<Instant>,
     dom_in_flight: bool,
     dom_in_flight_at: Option<Instant>,
-    last_dom_poll: Option<Instant>,
-    scroll_at_dom_poll: (f32, f32),
     dom_tx: mpsc::Sender<DomIngest>,
     dom_rx: Option<mpsc::Receiver<DomIngest>>,
     /// Last scroll offset sent to the UI (diffed like the tree).
@@ -179,15 +188,41 @@ impl WebViewDelegate for Delegate {
         if matches!(status, LoadStatus::Complete) {
             let mut shared = self.shared.borrow_mut();
             shared.load_started_at = None;
-            // Fresh document settling in: query the DOM once rendering lands.
-            shared.dom_dirty = true;
-            shared.dom_dirty_at = Some(Instant::now());
+            // Fresh document settling in: boot (idempotent install +
+            // snapshot) once rendering lands.
+            shared.dom_boot = true;
             let generation = shared.generation;
             shared.handle.emit(EngineEvent::LoadFinished {
                 generation,
                 result: Ok(()),
             });
         }
+    }
+
+    fn show_console_message(&self, _webview: WebView, _level: ConsoleLogLevel, message: String) {
+        // Channel A of the dirty-ping experiment: the in-page observers
+        // log the marker on every debounced mutation burst.
+        if !message.contains(DOM_DIRTY_MARKER) {
+            return;
+        }
+        mark_dom_dirty(&self.shared, 0);
+    }
+
+    fn load_web_resource(&self, _webview: WebView, load: servo::WebResourceLoad) {
+        // Channels B/C of the dirty-ping experiment: the in-page ping
+        // POSTs to the marker URL (B=fetch, C=sendBeacon). Intercept with
+        // an empty 200 before anything leaves the machine.
+        let url = load.request().url.to_string();
+        if !url.contains(DOM_DIRTY_MARKER) {
+            return;
+        }
+        let chan = if url.contains("ch=beacon") { 2 } else { 1 };
+        mark_dom_dirty(&self.shared, chan);
+        let response = url
+            .parse()
+            .map(WebResourceResponse::new)
+            .unwrap_or_else(|_| WebResourceResponse::new(DOM_PING_URL.parse().unwrap()));
+        load.intercept(response);
     }
 
     fn notify_accessibility_tree_update(
@@ -198,6 +233,26 @@ impl WebViewDelegate for Delegate {
         // AX tree intentionally ignored: the DOM query (see `browser::dom`)
         // is the sole snap-target source. Servo's AX feed withholds real
         // controls and freezes rects; keeping the mirror only grew ghosts.
+    }
+}
+
+/// Mark the DOM set dirty from ping channel `chan` (0=A console, 1=B
+/// fetch, 2=C sendBeacon). The flag is the OR of all three; the per-channel
+/// arrival bits are drained and logged at pull time for the A/B/C
+/// comparison. Logs only on the clean→dirty transition so animation bursts
+/// don't spam.
+fn mark_dom_dirty(shared: &Rc<RefCell<Shared>>, chan: usize) {
+    let mut state = shared.borrow_mut();
+    if !state.dom_dirty {
+        crate::platform::app_log::info(format!(
+            "servo-dom: dirty via {}",
+            ['A', 'B', 'C'].get(chan).unwrap_or(&'?')
+        ));
+    }
+    state.dom_dirty = true;
+    state.dom_dirty_at = Some(Instant::now());
+    if let Some(bit) = state.dom_chan.get_mut(chan) {
+        *bit = true;
     }
 }
 
@@ -221,13 +276,6 @@ type DomIngest = (u64, Result<JSValue, String>);
 
 /// Consecutive missed polls before a DOM target is dropped.
 const DOM_MISSED_LIMIT: u8 = 2;
-/// Minimum gap between DOM polls (lets one round-trip finish; pages need a
-/// beat to reflow after the input that triggered the poll).
-const DOM_MIN_INTERVAL: Duration = Duration::from_millis(800);
-/// Idle backstop between DOM polls while the browser is live.
-const DOM_BACKSTOP: Duration = Duration::from_secs(3);
-/// Scroll distance since the last poll that forces a re-query mid-hold.
-const DOM_SCROLL_DELTA: f32 = 200.0;
 /// Give up waiting on a DOM round-trip and allow the next poll.
 const DOM_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cap on DOM targets kept (the query already caps at 1000; this is the
@@ -333,19 +381,25 @@ fn run(
         dom: HashMap::new(),
         dom_uid: HashMap::new(),
         dom_seq: 0,
+        dom_boot: true,
+        dom_chan: [false; 3],
         dom_dirty: false,
         dom_dirty_at: None,
         dom_in_flight: false,
         dom_in_flight_at: None,
-        last_dom_poll: None,
-        scroll_at_dom_poll: (0.0, 0.0),
         dom_tx,
         dom_rx: Some(dom_rx),
         content: None,
         last_url: None,
         ax_debug: std::env::var("SDSC_AX_DEBUG").is_ok(),
     }));
+    // Auto-install the DOM observers into every document (fresh loads,
+    // history travel, reloads): no per-document injection timing on our
+    // side. The evaluate-boot path below stays as backup.
+    let user_content = Rc::new(UserContentManager::new(&servo));
+    user_content.add_script(Rc::new(UserScript::new(DOM_INSTALL_JS.to_string(), None)));
     let webview = WebViewBuilder::new(&servo, ctx.clone())
+        .user_content_manager(user_content)
         .delegate(Rc::new(Delegate {
             shared: shared.clone(),
         }))
@@ -373,7 +427,7 @@ fn run(
             }
             check_load_timeout(&shared);
             drain_dom_results(&shared);
-            maybe_poll_dom(&webview, &shared);
+            maybe_pull_dom(&webview, &shared);
             std::thread::sleep(if suspended { SUSPENDED_IDLE } else { SPIN_IDLE });
         }
     }
@@ -422,11 +476,9 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             // silent unless nodes join/leave (see `emit_tree`).
             let (sx, sy) = state.scroll;
             set_scroll(&mut state, (sx + dx, sy + dy));
-            // Scrolling usually reflows: re-query the DOM once settled.
-            if dx != 0.0 || dy != 0.0 {
-                state.dom_dirty = true;
-                state.dom_dirty_at = Some(Instant::now());
-            }
+            // No DOM re-query on scroll: stored rects are document-space, so
+            // scrolling only re-translates. Virtualized insertions during a
+            // scroll ping through the observers on their own.
             emit_tree(&mut state);
         }
         EngineCommand::Key(event) => {
@@ -522,14 +574,16 @@ fn clear_tree(state: &mut Shared) {
         state.handle.emit(EngineEvent::A11yTree(Vec::new()));
     }
     state.content = None;
-    // A new document gets fresh DOM ids (the in-page WeakMap resets) and a
-    // fresh poll epoch: in-flight answers from the old page are dropped.
+    // A new document gets fresh DOM ids (the in-page WeakMap resets), a
+    // fresh poll epoch (in-flight answers from the old page are dropped),
+    // and a boot round-trip (idempotent install + snapshot).
     state.dom_seq = state.dom_seq.wrapping_add(1);
     state.dom_in_flight = false;
     state.dom_in_flight_at = None;
-    state.dom_dirty = true;
-    state.dom_dirty_at = Some(Instant::now());
-    state.last_dom_poll = None;
+    state.dom_boot = true;
+    state.dom_dirty = false;
+    state.dom_dirty_at = None;
+    state.dom_chan = [false; 3];
     if state.scroll != (0.0, 0.0) {
         state.scroll = (0.0, 0.0);
         state.last_sent_scroll = (0.0, 0.0);
@@ -572,20 +626,20 @@ fn clamp_scroll(scroll: (f32, f32), content: Option<(f32, f32)>) -> (f32, f32) {
     (scroll.0.clamp(0.0, max_x), scroll.1.clamp(0.0, max_y))
 }
 
-/// Quiet period after dirty input before a re-query fires (lets the page
-/// reflow after the input that triggered the poll).
+/// Quiet period after a dirty ping before the pull fires (lets the page
+/// reflow after the mutation burst that triggered the ping).
 const DOM_SETTLE: Duration = Duration::from_millis(600);
 
-/// Ask the page for its actionable elements (see `browser::dom`). The DOM
-/// is the sole target source: polled, never pushed. Fires on dirty input
-/// (load/scroll/click/key) once settled, on big mid-hold scrolls, and on
-/// a slow backstop. Skipped while suspended/loading or with a poll
-/// in flight (5s timeout unsticks it).
-fn maybe_poll_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
+/// Pull the page for its actionable elements (see `browser::dom`). Purely
+/// event-driven — no timers: fires for a pending boot (fresh document or
+/// load settle) or a settled dirty ping from the in-page observers
+/// (console/fetch/sendBeacon, ORed into one flag). Skipped while suspended
+/// or with a pull in flight (5s timeout unsticks it).
+fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
     let now = Instant::now();
     let fire = {
         let mut state = shared.borrow_mut();
-        if state.suspended || state.load_started_at.is_some() {
+        if state.suspended {
             return;
         }
         if let Some(t) = state.dom_in_flight_at
@@ -597,22 +651,12 @@ fn maybe_poll_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
         if state.dom_in_flight {
             return;
         }
-        if let Some(last) = state.last_dom_poll
-            && now.saturating_duration_since(last) < DOM_MIN_INTERVAL
-        {
-            return;
-        }
-        let dirty_settled = state.dom_dirty
+        let boot = state.dom_boot;
+        let settled = state.dom_dirty
             && state
                 .dom_dirty_at
                 .is_some_and(|t| now.saturating_duration_since(t) >= DOM_SETTLE);
-        let scrolled_far = (state.scroll.0 - state.scroll_at_dom_poll.0)
-            .hypot(state.scroll.1 - state.scroll_at_dom_poll.1)
-            >= DOM_SCROLL_DELTA;
-        let backstop = state
-            .last_dom_poll
-            .is_none_or(|t| now.saturating_duration_since(t) >= DOM_BACKSTOP);
-        if !dirty_settled && !scrolled_far && !backstop {
+        if !boot && !settled {
             return;
         }
         // Reserve the sequence first so a racing callback can't interleave.
@@ -620,17 +664,37 @@ fn maybe_poll_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
         let seq = state.dom_seq;
         state.dom_in_flight = true;
         state.dom_in_flight_at = Some(now);
-        state.last_dom_poll = Some(now);
+        state.dom_boot = false;
         state.dom_dirty = false;
         state.dom_dirty_at = None;
-        state.scroll_at_dom_poll = state.scroll;
-        Some((seq, state.dom_tx.clone()))
+        let chans = std::mem::take(&mut state.dom_chan);
+        let script = if boot {
+            dom_boot_js()
+        } else {
+            DOM_QUERY_JS.to_string()
+        };
+        Some((seq, state.dom_tx.clone(), script, boot, chans))
     };
-    let Some((seq, tx)) = fire else {
+    let Some((seq, tx, script, boot, chans)) = fire else {
         return;
     };
-    crate::platform::app_log::info(format!("servo-dom: poll seq={seq}"));
-    webview.evaluate_javascript(DOM_QUERY_JS.to_string(), move |result| {
+    let src = if boot {
+        "boot".to_string()
+    } else {
+        let mut s = String::new();
+        for (i, c) in chans.iter().enumerate() {
+            if *c {
+                s.push((b'A' + i as u8) as char);
+            }
+        }
+        if s.is_empty() {
+            "gesture".to_string()
+        } else {
+            s
+        }
+    };
+    crate::platform::app_log::info(format!("servo-dom: pull seq={seq} src={src}"));
+    webview.evaluate_javascript(script, move |result| {
         let _ = tx.send((seq, result.map_err(|e| format!("{e:?}"))));
     });
 }
