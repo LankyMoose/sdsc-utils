@@ -182,7 +182,7 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   // skBox = no boxes; skBoxA = of those, anchors; skBoxKid = of those, with
   // element children (the wrapper signature: boxless parent, boxed kids).
   var skBox = 0, skZero = 0, skBig = 0, skDis = 0, skErr = 0;
-  var skBoxA = 0, skBoxKid = 0, skBoxAWrap = 0, skBoxAEmpty = 0;
+  var skBoxA = 0, skBoxKid = 0, skBoxAWrap = 0, skBoxAEmpty = 0, skForce = 0;
   S.byId = {};
   var els;
   try { els = document.querySelectorAll(SEL); } catch (e) { return {nodes: [], total: 0, truncated: false}; }
@@ -198,6 +198,32 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   function boxOf(el) {
     var rs;
     try { rs = el.getClientRects(); } catch (e) { return null; }
+    var forcedBox = false;
+    if (rs.length === 0) {
+      // Temporary display forcing: save the inline display value, force
+      // inline-block, re-measure, restore exactly — all synchronously, so no
+      // paint and no mutation-observer delivery can observe the intermediate
+      // state. Answers whether Servo withholds boxes for lack of an
+      // associated fragment that an atomic box would provide.
+      try {
+        var st = el.style;
+        if (st) {
+          var prevVal = st.getPropertyValue('display');
+          var prevPri = st.getPropertyPriority('display');
+          try {
+            st.setProperty('display', 'inline-block', 'important');
+            var rs2 = null;
+            try { rs2 = el.getClientRects(); } catch (e4) {}
+            if (rs2 && rs2.length > 0) { rs = rs2; forcedBox = true; }
+          } finally {
+            try {
+              if (prevVal === '' && prevPri === '') { st.removeProperty('display'); }
+              else { st.setProperty('display', prevVal, prevPri); }
+            } catch (e5) {}
+          }
+        }
+      } catch (e3) {}
+    }
     var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (var j = 0; j < rs.length; j++) {
       var q = rs[j];
@@ -209,7 +235,9 @@ const DOM_QUERY_BODY: &str = r###"(function(){
       if (qy1 > y1) y1 = qy1;
     }
     if (!(x1 > x0 && y1 > y0)) return null;
-    return {x: x0, y: y0, width: x1 - x0, height: y1 - y0};
+    var r = {x: x0, y: y0, width: x1 - x0, height: y1 - y0};
+    if (forcedBox) skForce++;
+    return r;
   }
   // Pass 1: measure everything (id assignment is stable per document, so
   // culled elements keep their ids for the pull that re-admits them).
@@ -318,7 +346,7 @@ const DOM_QUERY_BODY: &str = r###"(function(){
     var de = document.documentElement;
     if (de) { dw = de.scrollWidth || 0; dh = de.scrollHeight || 0; }
   } catch (e) {}
-  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
+  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, forced: skForce, sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
 })()"###;
 
 /// Parsed snapshot: viewport-space candidates plus the true page scroll at
@@ -333,6 +361,7 @@ const DOM_QUERY_BODY: &str = r###"(function(){
 /// with element children, `box_anchor_wraps` their intersection, and
 /// `box_anchor_empty` the boxless anchors with no children at all
 /// (text-only anchors are the remainder: boxA - wraps - empty).
+/// `forced_boxes` counts targets recovered by temporary display forcing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DomSnapshot {
     pub nodes: Vec<DomRaw>,
@@ -346,6 +375,7 @@ pub struct DomSnapshot {
     pub boxless_with_kids: usize,
     pub box_anchor_wraps: usize,
     pub box_anchor_empty: usize,
+    pub forced_boxes: usize,
 }
 
 /// Parse a `dom_query_js` result into raw candidates. Lenient by design:
@@ -368,6 +398,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             boxless_with_kids: 0,
             box_anchor_wraps: 0,
             box_anchor_empty: 0,
+            forced_boxes: 0,
         };
     };
     let num_field = |key: &str| {
@@ -397,6 +428,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
     let boxless_with_kids = num_field("boxKid") as usize;
     let box_anchor_wraps = num_field("boxAWrap") as usize;
     let box_anchor_empty = num_field("boxAEmpty") as usize;
+    let forced_boxes = num_field("forced") as usize;
     let mut skipped = [0usize; 5];
     if let Some(JSValue::Array(cols)) = root.get("skip") {
         for (i, col) in cols.iter().take(5).enumerate() {
@@ -418,6 +450,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             boxless_with_kids,
             box_anchor_wraps,
             box_anchor_empty,
+            forced_boxes,
         };
     };
     let mut nodes = Vec::new();
@@ -468,6 +501,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
         boxless_with_kids,
         box_anchor_wraps,
         box_anchor_empty,
+        forced_boxes,
     }
 }
 
@@ -589,6 +623,7 @@ mod tests {
         root.insert("boxKid".to_string(), num(5.0));
         root.insert("boxAWrap".to_string(), num(4.0));
         root.insert("boxAEmpty".to_string(), num(2.0));
+        root.insert("forced".to_string(), num(6.0));
         root.insert(
             "ccull".to_string(),
             JSValue::Array(vec![num(11.0), num(13.0)]),
@@ -604,6 +639,7 @@ mod tests {
         assert_eq!(out.boxless_with_kids, 5);
         assert_eq!(out.box_anchor_wraps, 4);
         assert_eq!(out.box_anchor_empty, 2);
+        assert_eq!(out.forced_boxes, 6);
         assert_eq!(out.culled_ids, vec![11, 13]);
     }
 
@@ -670,10 +706,11 @@ mod tests {
         let query = dom_query_js(None);
         assert!(query.contains("getClientRects"));
         assert!(!query.contains("getBoundingClientRect"));
-        // No Range fallback: per-element createRange round-trips cost seconds
-        // per pull in debug Servo (rtt 17ms -> 4000ms); boxless elements stay
-        // skipped and counted.
+        // Boxless fallback is temporary display forcing (set, measure,
+        // restore inside one task — no Range round-trips).
         assert!(!query.contains("selectNodeContents"));
+        assert!(query.contains("setProperty('display', 'inline-block'"));
+        assert!(query.contains("removeProperty('display')"));
         // Cursor culling: radial keep + directional-next keep, uncensored
         // without a cursor.
         assert!(query.contains("__sdsc_cc=false"));
