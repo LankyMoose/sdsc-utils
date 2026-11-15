@@ -161,7 +161,7 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
     S.byId[id] = el;
     return id;
   }
-  var SEL = 'a[href],a[jsaction],button,input,textarea,select,[onclick],[role="button"],[role="link"],[role="checkbox"],[role="textbox"],[role="searchbox"],[role="switch"],[role="combobox"],[role="menuitem"],[role="tab"],[role="option"]';
+  var SEL = 'a,button,input,textarea,select,[onclick],[role="button"],[role="link"],[role="checkbox"],[role="textbox"],[role="searchbox"],[role="switch"],[role="combobox"],[role="menuitem"],[role="tab"],[role="option"]';
   var out = [];
   var culled = 0;
   S.byId = {};
@@ -546,9 +546,9 @@ mod tests {
 
     #[test]
     fn query_covers_handler_attributes() {
-        // href-less anchors (Google stamps href on mousedown) and inline
-        // handlers: both are clickable without matching the base selector.
-        assert!(DOM_QUERY_JS.contains("a[jsaction]"));
+        // Any anchor qualifies (href-less jsaction anchors, name anchors —
+        // the size filter keeps phantoms out) plus inline handlers.
+        assert!(DOM_QUERY_JS.contains("'a,button,"));
         assert!(DOM_QUERY_JS.contains("[onclick]"));
         // Full-viewport boxes never qualify (page roots with global
         // handlers would become screen-hogging phantoms).
