@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
 use embedder_traits::{
-    ConsoleLogLevel, InputEvent, JSValue, KeyboardEvent, MouseButton, MouseButtonAction,
-    MouseButtonEvent, Theme, WebResourceResponse,
+    InputEvent, JSValue, KeyboardEvent, MouseButton, MouseButtonAction, MouseButtonEvent, Theme,
+    WebResourceResponse,
 };
 use euclid::{Box2D, Point2D};
 
@@ -95,10 +95,10 @@ struct Shared {
     /// Fresh document (or fresh load) needs the install+snapshot boot
     /// round-trip. Set by every document event, cleared on dispatch.
     dom_boot: bool,
-    /// A/B/C arrival flags since the last pull (A=console, B=fetch,
-    /// C=sendBeacon). Logged per pull so live testing can compare channel
-    /// reliability; the dirty flag itself is the OR of all three.
-    dom_chan: [bool; 3],
+    /// B/C arrival flags since the last pull (0=fetch, 1=sendBeacon).
+    /// Logged per pull so live testing can compare channel reliability;
+    /// the dirty flag itself is the OR of both.
+    dom_chan: [bool; 2],
     dom_dirty: bool,
     dom_dirty_at: Option<Instant>,
     dom_in_flight: bool,
@@ -199,24 +199,15 @@ impl WebViewDelegate for Delegate {
         }
     }
 
-    fn show_console_message(&self, _webview: WebView, _level: ConsoleLogLevel, message: String) {
-        // Channel A of the dirty-ping experiment: the in-page observers
-        // log the marker on every debounced mutation burst.
-        if !message.contains(DOM_DIRTY_MARKER) {
-            return;
-        }
-        mark_dom_dirty(&self.shared, 0);
-    }
-
     fn load_web_resource(&self, _webview: WebView, load: servo::WebResourceLoad) {
-        // Channels B/C of the dirty-ping experiment: the in-page ping
-        // POSTs to the marker URL (B=fetch, C=sendBeacon). Intercept with
-        // an empty 200 before anything leaves the machine.
+        // Dirty-ping channels: the in-page ping POSTs to the marker URL
+        // (B=fetch, C=sendBeacon). Intercept with an empty 200 before
+        // anything leaves the machine.
         let url = load.request().url.to_string();
         if !url.contains(DOM_DIRTY_MARKER) {
             return;
         }
-        let chan = if url.contains("ch=beacon") { 2 } else { 1 };
+        let chan = if url.contains("ch=beacon") { 1 } else { 0 };
         mark_dom_dirty(&self.shared, chan);
         let response = url
             .parse()
@@ -236,17 +227,16 @@ impl WebViewDelegate for Delegate {
     }
 }
 
-/// Mark the DOM set dirty from ping channel `chan` (0=A console, 1=B
-/// fetch, 2=C sendBeacon). The flag is the OR of all three; the per-channel
-/// arrival bits are drained and logged at pull time for the A/B/C
-/// comparison. Logs only on the clean→dirty transition so animation bursts
-/// don't spam.
+/// Mark the DOM set dirty from ping channel `chan` (0=B fetch, 1=C
+/// sendBeacon). The flag is the OR of both; the per-channel arrival bits
+/// are drained and logged at pull time for the B/C comparison. Logs only on
+/// the clean→dirty transition so animation bursts don't spam.
 fn mark_dom_dirty(shared: &Rc<RefCell<Shared>>, chan: usize) {
     let mut state = shared.borrow_mut();
     if !state.dom_dirty {
         crate::platform::app_log::info(format!(
             "servo-dom: dirty via {}",
-            ['A', 'B', 'C'].get(chan).unwrap_or(&'?')
+            ['B', 'C'].get(chan).unwrap_or(&'?')
         ));
     }
     state.dom_dirty = true;
@@ -382,7 +372,7 @@ fn run(
         dom_uid: HashMap::new(),
         dom_seq: 0,
         dom_boot: true,
-        dom_chan: [false; 3],
+        dom_chan: [false; 2],
         dom_dirty: false,
         dom_dirty_at: None,
         dom_in_flight: false,
@@ -583,7 +573,7 @@ fn clear_tree(state: &mut Shared) {
     state.dom_boot = true;
     state.dom_dirty = false;
     state.dom_dirty_at = None;
-    state.dom_chan = [false; 3];
+    state.dom_chan = [false; 2];
     if state.scroll != (0.0, 0.0) {
         state.scroll = (0.0, 0.0);
         state.last_sent_scroll = (0.0, 0.0);
@@ -684,7 +674,7 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
         let mut s = String::new();
         for (i, c) in chans.iter().enumerate() {
             if *c {
-                s.push((b'A' + i as u8) as char);
+                s.push((b'B' + i as u8) as char);
             }
         }
         if s.is_empty() {

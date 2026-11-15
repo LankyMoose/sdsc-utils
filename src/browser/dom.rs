@@ -28,9 +28,9 @@ pub struct DomRaw {
     pub text: String,
 }
 
-/// Marker shared by all three dirty-ping channels (A=console, B=fetch,
-/// C=sendBeacon). Rust matches it by substring, so every channel embeds it
-/// verbatim — including the ping URL below.
+/// Marker shared by the dirty-ping channels (B=fetch, C=sendBeacon).
+/// Rust matches resource-load URLs by substring, so the ping URL below
+/// embeds it verbatim.
 pub const DOM_DIRTY_MARKER: &str = "__SDSC_DOM_DIRTY";
 
 /// Ping endpoint for the network channels (B=fetch, C=sendBeacon), with the
@@ -44,25 +44,21 @@ pub const DOM_PING_URL: &str = "http://sdsc.invalid/__SDSC_DOM_DIRTY";
 /// MutationObserver (subtree: childList, attributes, characterData) plus a
 /// ResizeObserver on `body` (image/font loads shift layout with no DOM
 /// mutation), with in-page leading+trailing debounce so animation-heavy
-/// pages collapse 60fps mutation storms to ~2 pings/s. Every ping fires all
-/// three channels; the backend ORs them into one dirty flag and logs which
-/// arrived (the A/B/C experiment).
+/// pages collapse 60fps mutation storms to ~2 pings/s. Every ping fires both
+/// network channels; the backend ORs them into one dirty flag and logs which
+/// arrived (the B/C comparison).
 pub const DOM_INSTALL_JS: &str = r###"(function(){
   var S = window.__sdsc_ax;
   if (!S) { S = window.__sdsc_ax = { next: 1, ids: new WeakMap() }; }
   if (S.mo) return;
   S.mo = true;
-  var MARK = '__SDSC_DOM_DIRTY';
   var PING = 'http://sdsc.invalid/__SDSC_DOM_DIRTY';
-  var clog = null;
-  try { clog = console.log.bind(console); } catch (e) {}
   var beacon = null;
   try { beacon = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null; } catch (e) {}
   var lastPing = 0, trailing = null;
   var SUPPRESS = 1000, TRAIL = 500;
   function fire(){
     lastPing = Date.now();
-    try { if (clog) clog(MARK); } catch (e) {}
     try { fetch(PING + '?ch=fetch', {method:'POST', mode:'no-cors', keepalive:true, body:'1'}).catch(function(){}); } catch (e) {}
     try { if (beacon) beacon(PING + '?ch=beacon', '1'); } catch (e) {}
   }
@@ -315,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn install_pings_all_three_channels() {
+    fn install_pings_both_network_channels() {
         // The ping URL must embed the marker: the backend matches resource
         // loads by substring.
         assert!(DOM_PING_URL.contains(DOM_DIRTY_MARKER));
@@ -325,6 +321,8 @@ mod tests {
         assert!(DOM_INSTALL_JS.contains("ResizeObserver"));
         assert!(DOM_INSTALL_JS.contains("sendBeacon"));
         assert!(DOM_INSTALL_JS.contains("fetch("));
+        // Console channel removed: no page-log pollution.
+        assert!(!DOM_INSTALL_JS.contains("console"));
         // Idempotent per document: re-running never double-arms.
         assert!(DOM_INSTALL_JS.contains("S.mo"));
         // Boot = install + snapshot in one round-trip.
