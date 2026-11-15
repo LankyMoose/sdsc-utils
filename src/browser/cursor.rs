@@ -419,7 +419,10 @@ impl Cursor {
 
     /// Point to click: the flight target mid-flight, attached element
     /// center when docked, the gravity well's center while falling in, else
-    /// the free cursor.
+    /// the free cursor. The well fallback only applies with the magnet on:
+    /// magnet-off means "exactly where I point", never a yank to a distant
+    /// well (R3 flag #6: free cursor at (299,115) clicked the search field
+    /// center 47px away instead of the empty point under the cursor).
     pub fn click_point(&self, options: &[Focusable]) -> (f32, f32) {
         // Mid-flight: aim at the flight target (user intent).
         if let Some((tx, ty)) = self.fly_to {
@@ -430,7 +433,9 @@ impl Cursor {
         {
             return (item.x + item.w / 2.0, item.y + item.h / 2.0);
         }
-        if let Some((_, tx, ty, _, _)) = Self::nearest_within(self.x, self.y, options) {
+        if self.magnet
+            && let Some((_, tx, ty, _, _)) = Self::nearest_within(self.x, self.y, options)
+        {
             return (tx, ty);
         }
         (self.x, self.y)
@@ -883,6 +888,19 @@ mod tests {
         c.vy = 0.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.click_point(&items), (500.0, 500.0));
+    }
+
+    #[test]
+    fn click_point_magnet_off_means_free_point() {
+        // R3 flag #6: magnet-off cursor at (299,115) must not yank to the
+        // search field's center 47px away.
+        let mut c = Cursor::new();
+        c.magnet = false;
+        let items = [link(7, 100.0, 200.0)];
+        c.x = 240.0;
+        c.y = 215.0;
+        assert_eq!(c.attached, None);
+        assert_eq!(c.click_point(&items), (240.0, 215.0));
     }
 
     #[test]

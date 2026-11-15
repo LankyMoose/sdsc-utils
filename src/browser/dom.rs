@@ -102,7 +102,7 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
     if (id === undefined) { id = S.next++; S.ids.set(el, id); }
     return id;
   }
-  var SEL = 'a[href],button,input,textarea,select,[role="button"],[role="link"],[role="checkbox"],[role="textbox"],[role="searchbox"],[role="switch"],[role="combobox"],[role="menuitem"],[role="tab"]';
+  var SEL = 'a[href],button,input,textarea,select,[role="button"],[role="link"],[role="checkbox"],[role="textbox"],[role="searchbox"],[role="switch"],[role="combobox"],[role="menuitem"],[role="tab"],[role="option"]';
   var out = [];
   var culled = 0;
   var els;
@@ -283,7 +283,8 @@ pub fn dom_kind(tag: &str, role: &str, typ: &str) -> FocusKind {
         | "radio"
         | "menuitemcheckbox"
         | "menuitemradio"
-        | "menu-listbox-option" => return FocusKind::Button,
+        | "menu-listbox-option"
+        | "option" => return FocusKind::Button,
         "textbox" | "searchbox" | "combobox" => return FocusKind::Field,
         _ => {}
     }
@@ -446,6 +447,13 @@ mod tests {
         let boot = dom_boot_js();
         assert!(boot.contains(DOM_DIRTY_MARKER));
         assert!(boot.contains("querySelectorAll"));
+    }
+
+    #[test]
+    fn query_covers_option_role() {
+        // Autocomplete rows (role=option) are real click targets.
+        assert!(DOM_QUERY_JS.contains("[role=\"option\"]"));
+        assert_eq!(dom_kind("div", "option", ""), FocusKind::Button);
     }
 
     #[test]
