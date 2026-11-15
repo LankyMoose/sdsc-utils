@@ -175,6 +175,81 @@ const DOM_QUERY_BODY: &str = r###"(function(){
     return id;
   }
   var SEL = 'a,button,input,textarea,select,[onclick],[role="button"],[role="link"],[role="checkbox"],[role="textbox"],[role="searchbox"],[role="switch"],[role="combobox"],[role="menuitem"],[role="tab"],[role="option"]';
+  // Computed-style cache for the ancestor walks below: one entry per
+  // distinct ancestor, rebuilt every pull (styles mutate between pulls).
+  var styleCache = (typeof Map !== "undefined") ? new Map() : null;
+  function cstyle(n) {
+    if (styleCache) {
+      var hit = styleCache.get(n);
+      if (hit) return hit;
+    }
+    var s = {d: '', v: '', o: '', ox: '', oy: ''};
+    try {
+      var cs = window.getComputedStyle(n);
+      s = {d: cs.display, v: cs.visibility, o: cs.opacity, ox: cs.overflowX, oy: cs.overflowY};
+    } catch (e) {}
+    if (styleCache) styleCache.set(n, s);
+    return s;
+  }
+  // True visibility: computed visibility is already inheritance-resolved,
+  // so one call covers the whole ancestor chain for it; display:none and
+  // opacity:0 need the ancestor walk (not inherited, still hiding).
+  function isHidden(el) {
+    try {
+      var cs = window.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') return true;
+      if (parseFloat(cs.opacity) === 0) return true;
+    } catch (e) { return false; }
+    var n = el.parentElement, depth = 0;
+    while (n && depth < 32) {
+      var s = cstyle(n);
+      if (s.d === 'none' || parseFloat(s.o) === 0) return true;
+      n = n.parentElement;
+      depth++;
+    }
+    return false;
+  }
+  // Intersect a box with every clipping ancestor (overflow != visible).
+  // Returns the visible part, or null when clipped away entirely.
+  // display:contents ancestors have no box and cannot clip: skipped.
+  function clipRect(el, r) {
+    var x0 = r.x, y0 = r.y, x1 = r.x + r.width, y1 = r.y + r.height;
+    var n = el.parentElement, depth = 0;
+    while (n && depth < 32) {
+      var s = cstyle(n);
+      if (parseFloat(s.o) === 0) return null;
+      var clipX = (s.ox === 'hidden' || s.ox === 'scroll' || s.ox === 'auto' || s.ox === 'clip');
+      var clipY = (s.oy === 'hidden' || s.oy === 'scroll' || s.oy === 'auto' || s.oy === 'clip');
+      if ((clipX || clipY) && s.d !== 'contents') {
+        var br = null;
+        try {
+          var rs = n.getClientRects();
+          if (rs.length) {
+            var bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+            for (var j = 0; j < rs.length; j++) {
+              var q = rs[j];
+              var qx0 = Math.min(q.x, q.x + q.width), qx1 = Math.max(q.x, q.x + q.width);
+              var qy0 = Math.min(q.y, q.y + q.height), qy1 = Math.max(q.y, q.y + q.height);
+              if (qx0 < bx0) bx0 = qx0;
+              if (qy0 < by0) by0 = qy0;
+              if (qx1 > bx1) bx1 = qx1;
+              if (qy1 > by1) by1 = qy1;
+            }
+            if (bx1 > bx0 && by1 > by0) br = {x: bx0, y: by0, width: bx1 - bx0, height: by1 - by0};
+          }
+        } catch (e) {}
+        if (br) {
+          if (clipX) { if (br.x > x0) x0 = br.x; if (br.x + br.width < x1) x1 = br.x + br.width; }
+          if (clipY) { if (br.y > y0) y0 = br.y; if (br.y + br.height < y1) y1 = br.y + br.height; }
+          if (x1 <= x0 || y1 <= y0) return null;
+        }
+      }
+      n = n.parentElement;
+      depth++;
+    }
+    if (!(x1 > x0 && y1 > y0)) return null;
+    return {x: x0, y: y0, width: x1 - x0, height: y1 - y0};
+  }
   var out = [];
   var culled = 0;
   // Skip census: WHY matched candidates never become targets. `total` says
@@ -183,6 +258,7 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   // element children (the wrapper signature: boxless parent, boxed kids).
   var skBox = 0, skZero = 0, skBig = 0, skDis = 0, skErr = 0;
   var skBoxA = 0, skBoxKid = 0, skBoxAWrap = 0, skBoxAEmpty = 0, skForce = 0;
+  var skHid = 0, skClip = 0;
   S.byId = {};
   var els;
   try { els = document.querySelectorAll(SEL); } catch (e) { return {nodes: [], total: 0, truncated: false}; }
@@ -225,6 +301,10 @@ const DOM_QUERY_BODY: &str = r###"(function(){
       }
       var r = boxOf(el);
       if (!r) {
+        // No boxes: hidden subtrees (display/visibility/opacity) are
+        // correctly invisible — count and move on, never force those.
+        // The rest are boxless-but-rendered candidates for forcing.
+        if (isHidden(el)) { skHid++; return; }
         skBox++;
         var hasKids = false;
         var hasAnyKid = false;
@@ -273,6 +353,13 @@ const DOM_QUERY_BODY: &str = r###"(function(){
         culled++;
         return;
       }
+      // Overflow clipping: an element inside a height:0 scroller (Wikipedia
+      // menus) or any overflow:hidden ancestor has boxes but zero visible
+      // area. Intersect up the ancestor chain; fully clipped rows never
+      // become targets.
+      var cr = clipRect(el, r);
+      if (!cr) { skClip++; return; }
+      r = cr;
       cands.push([el, t, ty, r]);
     } catch (e) { skErr++; }
   })(els[i]); }
@@ -333,7 +420,7 @@ const DOM_QUERY_BODY: &str = r###"(function(){
     var de = document.documentElement;
     if (de) { dw = de.scrollWidth || 0; dh = de.scrollHeight || 0; }
   } catch (e) {}
-  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, forced: skForce, sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
+  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], hid: skHid, clip: skClip, boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, forced: skForce, sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
 })()"###;
 
 /// Parsed snapshot: viewport-space candidates plus the true page scroll at
@@ -345,10 +432,12 @@ const DOM_QUERY_BODY: &str = r###"(function(){
 /// are diagnostics for cap pressure and skip reasons, in
 /// [boxless, zero-area, oversize, disabled, threw] order. `box_anchors`
 /// counts boxless <a> elements, `boxless_with_kids` counts boxless elements
-/// with element children, `box_anchor_wraps` their intersection, and
-/// `box_anchor_empty` the boxless anchors with no children at all
-/// (text-only anchors are the remainder: boxA - wraps - empty).
-/// `forced_boxes` counts targets recovered by temporary display forcing.
+/// with element children, `box_anchor_wraps` and `box_anchor_empty` split
+/// the anchors into wrappers vs childless (text-only anchors are the
+/// remainder: boxA - wraps - empty). `forced_boxes` counts targets
+/// recovered by display forcing; `hidden_subtree` (display/visibility/
+/// opacity) and `clipped_away` (overflow clip to zero) the correctly
+/// invisible.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DomSnapshot {
     pub nodes: Vec<DomRaw>,
@@ -363,6 +452,8 @@ pub struct DomSnapshot {
     pub box_anchor_wraps: usize,
     pub box_anchor_empty: usize,
     pub forced_boxes: usize,
+    pub hidden_subtree: usize,
+    pub clipped_away: usize,
 }
 
 /// Parse a `dom_query_js` result into raw candidates. Lenient by design:
@@ -386,6 +477,8 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             box_anchor_wraps: 0,
             box_anchor_empty: 0,
             forced_boxes: 0,
+            hidden_subtree: 0,
+            clipped_away: 0,
         };
     };
     let num_field = |key: &str| {
@@ -416,6 +509,8 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
     let box_anchor_wraps = num_field("boxAWrap") as usize;
     let box_anchor_empty = num_field("boxAEmpty") as usize;
     let forced_boxes = num_field("forced") as usize;
+    let hidden_subtree = num_field("hid") as usize;
+    let clipped_away = num_field("clip") as usize;
     let mut skipped = [0usize; 5];
     if let Some(JSValue::Array(cols)) = root.get("skip") {
         for (i, col) in cols.iter().take(5).enumerate() {
@@ -438,6 +533,8 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             box_anchor_wraps,
             box_anchor_empty,
             forced_boxes,
+            hidden_subtree,
+            clipped_away,
         };
     };
     let mut nodes = Vec::new();
@@ -489,6 +586,8 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
         box_anchor_wraps,
         box_anchor_empty,
         forced_boxes,
+        hidden_subtree,
+        clipped_away,
     }
 }
 
@@ -611,6 +710,8 @@ mod tests {
         root.insert("boxAWrap".to_string(), num(4.0));
         root.insert("boxAEmpty".to_string(), num(2.0));
         root.insert("forced".to_string(), num(6.0));
+        root.insert("hid".to_string(), num(4.0));
+        root.insert("clip".to_string(), num(3.0));
         root.insert(
             "ccull".to_string(),
             JSValue::Array(vec![num(11.0), num(13.0)]),
@@ -627,6 +728,8 @@ mod tests {
         assert_eq!(out.box_anchor_wraps, 4);
         assert_eq!(out.box_anchor_empty, 2);
         assert_eq!(out.forced_boxes, 6);
+        assert_eq!(out.hidden_subtree, 4);
+        assert_eq!(out.clipped_away, 3);
         assert_eq!(out.culled_ids, vec![11, 13]);
     }
 
