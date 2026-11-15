@@ -838,9 +838,8 @@ impl App {
             panel.session.url(),
         ));
         #[cfg(debug_assertions)]
-        {
-            panel.force_shot = true;
-        }
+        return self.shoot_browser_window();
+        #[cfg(not(debug_assertions))]
         Task::none()
     }
 
@@ -857,8 +856,6 @@ impl App {
         }
         let now = Instant::now();
         let panel = &mut self.start_state.browser;
-        // R3 issue flag forces a shot for visual correlation.
-        let forced = std::mem::replace(&mut panel.force_shot, false);
         // A fresh dock shoots once it settles (~300ms for the morph to
         // complete); the 5s cadence covers everything else.
         let settled_dock = panel.cursor.attached.is_some()
@@ -866,8 +863,7 @@ impl App {
                 now.saturating_duration_since(t) >= Duration::from_millis(300)
                     && panel.last_shot.is_none_or(|s| s < t)
             });
-        if !forced
-            && !settled_dock
+        if !settled_dock
             && panel
                 .last_shot
                 .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(5))

@@ -809,9 +809,6 @@ pub struct BrowserPanel {
     pub last_click: Option<((f32, f32), Instant)>,
     /// R3 rising-edge latch for the issue flag (R3 carries no NavAction).
     pub r3_latched: bool,
-    /// Force the next debug shot (R3 issue flag). Debug-only.
-    #[cfg(debug_assertions)]
-    pub force_shot: bool,
     /// Last sent mouse position (quantized px), so the pad cursor streams
     /// moves to the engine only when it actually travels. Never persisted.
     pub last_sent_mouse: Option<(i32, i32)>,
@@ -938,10 +935,11 @@ fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, 
     // F10 coverage view: one thin ring per snap target, colored by kind.
     // The stack is explicitly full-card: it sizes to its first child
     // (the cursor-sized morph layer) by default, which would clip every
-    // layer beyond the cursor. Boxes draw at their TRUE rects (no shrinking:
-    // a shrunk box would hide the very overflow/drift the overlay exists to
-    // diagnose); the card clips overflow, and fully-offscreen targets are
-    // skipped (nothing visible to draw, and negative spacers are invalid).
+    // layer beyond the cursor. Boxes draw exactly their on-screen
+    // intersection (true rect cut at the card edge — what the pixels show,
+    // and all the overlay can truthfully render). The full rects stay in
+    // the log (`servo-dom map`, `ISSUE-FLAG near=`). Fully-offscreen
+    // targets skip (nothing visible, and negative spacers are invalid).
     let body: Element<'_, StartMessage> = if panel.debug_overlay {
         let mut overlay = stack![morph]
             .width(Length::Fixed(img_w))
@@ -949,12 +947,12 @@ fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, 
         for f in &panel.focusables {
             let (bx, by) = (f.x * scale, f.y * scale);
             let (bw, bh) = ((f.w * scale).max(3.0), (f.h * scale).max(3.0));
-            if bx + bw <= 0.0 || bx >= img_w || by + bh <= 0.0 || by >= img_h {
+            let (ox, oy) = (bx.max(0.0), by.max(0.0));
+            let (ex, ey) = ((bx + bw).min(img_w), (by + bh).min(img_h));
+            if ex <= ox || ey <= oy {
                 continue;
             }
-            // Spacers can't go negative in iced: pin the origin, keep the
-            // true size and let the card clip the rest.
-            let (ox, oy) = (bx.max(0.0), by.max(0.0));
+            let (bw, bh) = (ex - ox, ey - oy);
             let kind = f.kind;
             overlay = overlay.push(
                 column![
