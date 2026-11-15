@@ -44,23 +44,19 @@ pub const DOM_PING_URL: &str = "http://sdsc.invalid/__SDSC_DOM_DIRTY";
 /// MutationObserver (subtree: childList, attributes, characterData) plus a
 /// ResizeObserver on `body` (image/font loads shift layout with no DOM
 /// mutation), with in-page leading+trailing debounce so animation-heavy
-/// pages collapse 60fps mutation storms to ~2 pings/s. Every ping fires both
-/// network channels; the backend ORs them into one dirty flag and logs which
-/// arrived (the B/C comparison).
+/// pages collapse 60fps mutation storms to ~2 pings/s. Every ping POSTs to
+/// the marker URL; the backend intercepts it into one dirty flag.
 pub const DOM_INSTALL_JS: &str = r###"(function(){
   var S = window.__sdsc_ax;
   if (!S) { S = window.__sdsc_ax = { next: 1, ids: new WeakMap() }; }
   if (S.mo) return;
   S.mo = true;
   var PING = 'http://sdsc.invalid/__SDSC_DOM_DIRTY';
-  var beacon = null;
-  try { beacon = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null; } catch (e) {}
   var lastPing = 0, trailing = null;
   var SUPPRESS = 1000, TRAIL = 500;
   function fire(){
     lastPing = Date.now();
-    try { fetch(PING + '?ch=fetch', {method:'POST', mode:'no-cors', keepalive:true, body:'1'}).catch(function(){}); } catch (e) {}
-    try { if (beacon) beacon(PING + '?ch=beacon', '1'); } catch (e) {}
+    try { fetch(PING, {method:'POST', mode:'no-cors', keepalive:true, body:'1'}).catch(function(){}); } catch (e) {}
   }
   function onMut(){
     var now = Date.now();
@@ -84,9 +80,11 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
 })()"###;
 
 /// Boot script: idempotent install + immediate snapshot, so one round-trip
-/// both arms the observers and returns the current targets.
+/// both arms the observers and returns the current targets. The install is
+/// explicitly semicolon-terminated: without it the two adjacent IIFEs parse
+/// as a call on the install's (undefined) return value (ASI hazard).
 pub fn dom_boot_js() -> String {
-    format!("{DOM_INSTALL_JS}\n{DOM_QUERY_JS}")
+    format!("{DOM_INSTALL_JS};\n{DOM_QUERY_JS}")
 }
 
 /// Read-only DOM query. Stable per-document ids via an in-page WeakMap
@@ -311,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn install_pings_both_network_channels() {
+    fn install_pings_fetch_only() {
         // The ping URL must embed the marker: the backend matches resource
         // loads by substring.
         assert!(DOM_PING_URL.contains(DOM_DIRTY_MARKER));
@@ -319,10 +317,11 @@ mod tests {
         assert!(DOM_INSTALL_JS.contains(DOM_DIRTY_MARKER));
         assert!(DOM_INSTALL_JS.contains("MutationObserver"));
         assert!(DOM_INSTALL_JS.contains("ResizeObserver"));
-        assert!(DOM_INSTALL_JS.contains("sendBeacon"));
         assert!(DOM_INSTALL_JS.contains("fetch("));
-        // Console channel removed: no page-log pollution.
+        // Console and beacon channels removed: no page-log pollution, one
+        // network channel to reason about.
         assert!(!DOM_INSTALL_JS.contains("console"));
+        assert!(!DOM_INSTALL_JS.contains("sendBeacon"));
         // Idempotent per document: re-running never double-arms.
         assert!(DOM_INSTALL_JS.contains("S.mo"));
         // Boot = install + snapshot in one round-trip.

@@ -95,10 +95,9 @@ struct Shared {
     /// Fresh document (or fresh load) needs the install+snapshot boot
     /// round-trip. Set by every document event, cleared on dispatch.
     dom_boot: bool,
-    /// B/C arrival flags since the last pull (0=fetch, 1=sendBeacon).
-    /// Logged per pull so live testing can compare channel reliability;
-    /// the dirty flag itself is the OR of both.
-    dom_chan: [bool; 2],
+    /// Set when a fetch ping dirtied the set; drained at pull time so the
+    /// log can tell ping-driven pulls (`src=B`) from gesture ones.
+    dom_ping: bool,
     dom_dirty: bool,
     dom_dirty_at: Option<Instant>,
     dom_in_flight: bool,
@@ -200,15 +199,13 @@ impl WebViewDelegate for Delegate {
     }
 
     fn load_web_resource(&self, _webview: WebView, load: servo::WebResourceLoad) {
-        // Dirty-ping channels: the in-page ping POSTs to the marker URL
-        // (B=fetch, C=sendBeacon). Intercept with an empty 200 before
-        // anything leaves the machine.
+        // Dirty-ping channel: the in-page ping POSTs to the marker URL.
+        // Intercept with an empty 200 before anything leaves the machine.
         let url = load.request().url.to_string();
         if !url.contains(DOM_DIRTY_MARKER) {
             return;
         }
-        let chan = if url.contains("ch=beacon") { 1 } else { 0 };
-        mark_dom_dirty(&self.shared, chan);
+        mark_dom_dirty(&self.shared);
         let response = url
             .parse()
             .map(WebResourceResponse::new)
@@ -227,23 +224,16 @@ impl WebViewDelegate for Delegate {
     }
 }
 
-/// Mark the DOM set dirty from ping channel `chan` (0=B fetch, 1=C
-/// sendBeacon). The flag is the OR of both; the per-channel arrival bits
-/// are drained and logged at pull time for the B/C comparison. Logs only on
-/// the clean→dirty transition so animation bursts don't spam.
-fn mark_dom_dirty(shared: &Rc<RefCell<Shared>>, chan: usize) {
+/// Mark the DOM set dirty from a fetch ping. Logs only on the
+/// clean→dirty transition so animation bursts don't spam.
+fn mark_dom_dirty(shared: &Rc<RefCell<Shared>>) {
     let mut state = shared.borrow_mut();
     if !state.dom_dirty {
-        crate::platform::app_log::info(format!(
-            "servo-dom: dirty via {}",
-            ['B', 'C'].get(chan).unwrap_or(&'?')
-        ));
+        crate::platform::app_log::info("servo-dom: dirty via B");
     }
     state.dom_dirty = true;
     state.dom_dirty_at = Some(Instant::now());
-    if let Some(bit) = state.dom_chan.get_mut(chan) {
-        *bit = true;
-    }
+    state.dom_ping = true;
 }
 
 /// DOM target: actionable element found by the in-page query. Rects are
@@ -372,7 +362,7 @@ fn run(
         dom_uid: HashMap::new(),
         dom_seq: 0,
         dom_boot: true,
-        dom_chan: [false; 2],
+        dom_ping: false,
         dom_dirty: false,
         dom_dirty_at: None,
         dom_in_flight: false,
@@ -573,7 +563,7 @@ fn clear_tree(state: &mut Shared) {
     state.dom_boot = true;
     state.dom_dirty = false;
     state.dom_dirty_at = None;
-    state.dom_chan = [false; 2];
+    state.dom_ping = false;
     if state.scroll != (0.0, 0.0) {
         state.scroll = (0.0, 0.0);
         state.last_sent_scroll = (0.0, 0.0);
@@ -657,31 +647,23 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
         state.dom_boot = false;
         state.dom_dirty = false;
         state.dom_dirty_at = None;
-        let chans = std::mem::take(&mut state.dom_chan);
+        let pinged = std::mem::take(&mut state.dom_ping);
         let script = if boot {
             dom_boot_js()
         } else {
             DOM_QUERY_JS.to_string()
         };
-        Some((seq, state.dom_tx.clone(), script, boot, chans))
+        Some((seq, state.dom_tx.clone(), script, boot, pinged))
     };
-    let Some((seq, tx, script, boot, chans)) = fire else {
+    let Some((seq, tx, script, boot, pinged)) = fire else {
         return;
     };
     let src = if boot {
-        "boot".to_string()
+        "boot"
+    } else if pinged {
+        "B"
     } else {
-        let mut s = String::new();
-        for (i, c) in chans.iter().enumerate() {
-            if *c {
-                s.push((b'B' + i as u8) as char);
-            }
-        }
-        if s.is_empty() {
-            "gesture".to_string()
-        } else {
-            s
-        }
+        "gesture"
     };
     crate::platform::app_log::info(format!("servo-dom: pull seq={seq} src={src}"));
     webview.evaluate_javascript(script, move |result| {
