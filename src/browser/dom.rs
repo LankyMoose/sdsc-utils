@@ -108,6 +108,29 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
   try { els = document.querySelectorAll(SEL); } catch (e) { return {nodes: [], total: 0, truncated: false}; }
   var total = els.length;
   var n = Math.min(els.length, 1000);
+  // NOTE: deliberately the plural fragment call, never the singular
+  // bounding-box one. Servo's singular version carries a
+  // `debug_assert!(w >= 0 && h >= 0)` (servo-script dom/element/element.rs)
+  // that aborts the script thread on real pages (negative border boxes from
+  // transformed content), taking the whole app down in debug builds.
+  // GetClientRects shares the data source but has no assert; the union below
+  // normalizes fragments and can never go negative.
+  function boxOf(el) {
+    var rs;
+    try { rs = el.getClientRects(); } catch (e) { return null; }
+    var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (var j = 0; j < rs.length; j++) {
+      var q = rs[j];
+      var qx0 = Math.min(q.x, q.x + q.width), qx1 = Math.max(q.x, q.x + q.width);
+      var qy0 = Math.min(q.y, q.y + q.height), qy1 = Math.max(q.y, q.y + q.height);
+      if (qx0 < x0) x0 = qx0;
+      if (qy0 < y0) y0 = qy0;
+      if (qx1 > x1) x1 = qx1;
+      if (qy1 > y1) y1 = qy1;
+    }
+    if (!(x1 > x0 && y1 > y0)) return null;
+    return {x: x0, y: y0, width: x1 - x0, height: y1 - y0};
+  }
   for (var i = 0; i < n; i++) { (function(el){
     try {
       if (el.disabled) return;
@@ -117,7 +140,8 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
         ty = (el.getAttribute("type") || "text").toLowerCase();
         if (ty === "hidden") return;
       }
-      var r = el.getBoundingClientRect();
+      var r = boxOf(el);
+      if (!r) return;
       if (!(r.width > 0 && r.height > 0)) return;
       var vw = window.innerWidth || 800, vh = window.innerHeight || 600;
       if (r.width > vw || r.height > vh) return;
@@ -373,6 +397,9 @@ mod tests {
         assert!(!DOM_INSTALL_JS.contains("sendBeacon"));
         // Idempotent per document: re-running never double-arms.
         assert!(DOM_INSTALL_JS.contains("S.mo"));
+        // Union-of-fragments measurement: never the crashing call.
+        assert!(DOM_QUERY_JS.contains("getClientRects"));
+        assert!(!DOM_QUERY_JS.contains("getBoundingClientRect"));
         // Boot = install + snapshot in one round-trip.
         let boot = dom_boot_js();
         assert!(boot.contains(DOM_DIRTY_MARKER));
