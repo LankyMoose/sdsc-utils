@@ -792,14 +792,18 @@ impl App {
     }
 
     /// Click at the cursor: attached element center, else the free point.
+    /// Passes the docked target id so Button-kind targets can activate on
+    /// the exact element (`__sdsc_click`); everything else (and free
+    /// points) go through the trusted synthetic pair.
     pub(crate) fn click_browser_cursor(&mut self) -> Task<Message> {
-        let (x, y) = {
+        let (x, y, target) = {
             let panel = &self.start_state.browser;
-            panel.cursor.click_point(&panel.focusables)
+            let (x, y) = panel.cursor.click_point(&panel.focusables);
+            (x, y, panel.cursor.attached)
         };
         self.start_state.browser.last_click = Some(((x, y), Instant::now()));
         if let Some(engine) = &self.engine {
-            engine.send(EngineCommand::ClickAt { x, y });
+            engine.send(EngineCommand::ClickAt { x, y, target });
         }
         Task::none()
     }
@@ -842,7 +846,7 @@ impl App {
             if let Some(engine) = &self.engine {
                 engine.send(EngineCommand::ProbeEventLoop);
             }
-            self.shoot_browser_window()
+            self.shoot_browser_window(true)
         }
         #[cfg(not(debug_assertions))]
         {
@@ -851,13 +855,11 @@ impl App {
     }
 
     /// Debug-only window shot: every 5s while the browser overlay is on (or
-    /// immediately on a fresh dock), capture the real composed Start window
-    /// via the iced compositor readback and save it with a correlator line
-    /// (cursor, dock, drawn rect, target count, backend scroll offset).
-    /// Encode + write happen on a throwaway thread so the UI never hitches
-    /// on disk I/O.
+    /// immediately on a fresh dock), plus forced on R3 issue flags.
+    /// `force` bypasses the cadence gate. Encode + write happen on a
+    /// throwaway thread so the UI never hitches on disk I/O.
     #[cfg(debug_assertions)]
-    fn shoot_browser_window(&mut self) -> Task<Message> {
+    fn shoot_browser_window(&mut self, force: bool) -> Task<Message> {
         if !self.debug_browser {
             return Task::none();
         }
@@ -870,7 +872,8 @@ impl App {
                 now.saturating_duration_since(t) >= Duration::from_millis(300)
                     && panel.last_shot.is_none_or(|s| s < t)
             });
-        if !settled_dock
+        if !force
+            && !settled_dock
             && panel
                 .last_shot
                 .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(5))
@@ -969,7 +972,7 @@ impl App {
                     return Task::none();
                 }
                 #[cfg(debug_assertions)]
-                let shot = self.shoot_browser_window();
+                let shot = self.shoot_browser_window(false);
                 self.start_state.browser.session.set_frame(
                     crate::browser::BrowserFrame::from_rgba(frame.width, frame.height, frame.rgba),
                 );

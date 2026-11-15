@@ -51,6 +51,18 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
   if (!S) { S = window.__sdsc_ax = { next: 1, ids: new WeakMap() }; }
   if (S.mo) return;
   S.mo = true;
+  // Numeric id → element map, rebuilt by every snapshot query (so detached
+  // nodes release instead of leaking). Powers `__sdsc_click`: exact-element
+  // activation without hit-test staleness.
+  if (!S.byId) { S.byId = {}; }
+  window.__sdsc_click = window.__sdsc_click || function(id) {
+    try {
+      var el = S.byId[id];
+      if (!el) return 'missing';
+      el.click();
+      return 'ok';
+    } catch (e) { return 'threw:' + (e && e.message ? e.message : e); }
+  };
   var PING = 'http://sdsc.invalid/__SDSC_DOM_DIRTY';
   var lastPing = 0, trailing = null;
   var SUPPRESS = 500, TRAIL = 250;
@@ -140,11 +152,13 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
   function idFor(el) {
     var id = S.ids.get(el);
     if (id === undefined) { id = S.next++; S.ids.set(el, id); }
+    S.byId[id] = el;
     return id;
   }
   var SEL = 'a[href],button,input,textarea,select,[role="button"],[role="link"],[role="checkbox"],[role="textbox"],[role="searchbox"],[role="switch"],[role="combobox"],[role="menuitem"],[role="tab"],[role="option"]';
   var out = [];
   var culled = 0;
+  S.byId = {};
   var els;
   try { els = document.querySelectorAll(SEL); } catch (e) { return {nodes: [], total: 0, truncated: false}; }
   var total = els.length;
@@ -480,6 +494,9 @@ mod tests {
         assert!(!DOM_INSTALL_JS.contains("sendBeacon"));
         // Idempotent per document: re-running never double-arms.
         assert!(DOM_INSTALL_JS.contains("S.mo"));
+        // Exact-element activation helper + id map (no hit-test staleness).
+        assert!(DOM_INSTALL_JS.contains("__sdsc_click"));
+        assert!(DOM_INSTALL_JS.contains("byId"));
         // Union-of-fragments measurement: never the crashing call.
         assert!(DOM_QUERY_JS.contains("getClientRects"));
         assert!(!DOM_QUERY_JS.contains("getBoundingClientRect"));

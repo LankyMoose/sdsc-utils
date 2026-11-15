@@ -46,11 +46,15 @@ pub enum EngineCommand {
         x: f32,
         y: f32,
     },
-    /// Click at a page point (device px == page px at 1x). Sent as
-    /// down+up by the backend; the pad cursor owns this, never the OS mouse.
+    /// Click at a page point (device px == page px at 1x), optionally on a
+    /// known snap target (UI numeric id). Button-kind targets activate via
+    /// element `.click()` (exact element, no hit-test staleness); everything
+    /// else goes as trusted down+up at the point, which the pad cursor owns
+    /// (never the OS mouse).
     ClickAt {
         x: f32,
         y: f32,
+        target: Option<u64>,
     },
     /// R3 diagnostic: arm a one-shot event-loop probe (timers, rAF,
     /// IntersectionObserver) and read it back ~700ms later. Tells whether

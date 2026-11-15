@@ -598,7 +598,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             let id = webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
             track_input(shared, id, "move");
         }
-        EngineCommand::ClickAt { x, y } => {
+        EngineCommand::ClickAt { x, y, target } => {
             if shared.borrow().suspended {
                 crate::platform::app_log::info("servo-engine: click dropped (suspended)");
                 return;
@@ -606,12 +606,52 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             // Viewport-space point (same space as the cursor and the
             // translated tree); Servo maps to document internally.
             crate::platform::app_log::info(format!("servo-engine: click at ({x:.0},{y:.0})"));
-            let point = WebViewPoint::Device(DevicePoint::new(x, y));
-            for action in [MouseButtonAction::Down, MouseButtonAction::Up] {
-                let id = webview.notify_input_event(InputEvent::MouseButton(
-                    MouseButtonEvent::new(action, MouseButton::Primary, point),
-                ));
-                track_input(shared, id, "click");
+            // Button-kind dock targets activate on the exact element via
+            // `__sdsc_click` (no hit-test staleness, exercises whatever
+            // handler the page registered — getEventListeners is DevTools-only
+            // and no DOM API exposes listeners, so reaching the element IS
+            // the discovery). Anything else (links, fields, free points,
+            // canvas) keeps the trusted synthetic path.
+            let jsid = target.and_then(|uid| {
+                shared
+                    .borrow()
+                    .dom_uid
+                    .iter()
+                    .find(|(_, u)| **u == uid)
+                    .map(|(j, _)| *j)
+            });
+            let button = jsid.is_some_and(|j| {
+                shared
+                    .borrow()
+                    .dom
+                    .get(&j)
+                    .is_some_and(|n| n.kind == FocusKind::Button)
+            });
+            if button {
+                let jsid = jsid.unwrap_or(0);
+                let handle = shared.borrow().handle.clone();
+                webview.evaluate_javascript(
+                    format!("window.__sdsc_click ? window.__sdsc_click({jsid}) : 'missing'"),
+                    move |result| {
+                        let status = match result {
+                            Ok(v) => match v {
+                                JSValue::String(s) => s,
+                                _ => "bad-shape".to_string(),
+                            },
+                            Err(e) => format!("eval-failed:{e:?}"),
+                        };
+                        crate::platform::app_log::info(format!(
+                            "servo-engine: element click js#{jsid} -> {status}"
+                        ));
+                        if status != "ok" {
+                            // Element gone (or helper missing): fall back to
+                            // the trusted synthetic pair at the point.
+                            handle.send(EngineCommand::ClickAt { x, y, target: None });
+                        }
+                    },
+                );
+            } else {
+                send_synthetic_click(webview, shared, x, y);
             }
             // Clicks mutate the DOM (toggles, expands, navigation): re-query
             // once settled.
@@ -895,6 +935,21 @@ fn poll_probe(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
         crate::platform::app_log::warn(
             "servo-loop: probe unread after 700ms — script thread unresponsive",
         );
+    }
+}
+
+/// Trusted synthetic Down+Up pair at a viewport point. Used for links,
+/// fields, free points (canvas/games have no DOM handlers), and as the
+/// fallback when element activation reports anything but `ok`.
+fn send_synthetic_click(webview: &WebView, shared: &Rc<RefCell<Shared>>, x: f32, y: f32) {
+    let point = WebViewPoint::Device(DevicePoint::new(x, y));
+    for action in [MouseButtonAction::Down, MouseButtonAction::Up] {
+        let id = webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+            action,
+            MouseButton::Primary,
+            point,
+        )));
+        track_input(shared, id, "click");
     }
 }
 
