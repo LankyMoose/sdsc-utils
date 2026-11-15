@@ -250,7 +250,7 @@ const DOM_QUERY_BODY: &str = r###"(function(){
           if (!S.forced) S.forced = {};
           if (!S.forced[fid]) {
             S.forced[fid] = 1;
-            el.style.setProperty('display', 'inline-block', 'important');
+            el.style.setProperty('display', 'block', 'important');
             skForce++;
           }
         } catch (e6) {}
@@ -696,7 +696,7 @@ mod tests {
         // Boxless fallback is persistent display forcing (one shot per
         // element; our own observer re-pulls on the mutation).
         assert!(!query.contains("selectNodeContents"));
-        assert!(query.contains("setProperty('display', 'inline-block'"));
+        assert!(query.contains("setProperty('display', 'block'"));
         assert!(!query.contains("removeProperty"));
         // Cursor culling: radial keep + directional-next keep, uncensored
         // without a cursor.
