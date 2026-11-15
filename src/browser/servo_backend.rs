@@ -702,16 +702,20 @@ fn drain_dom_results(shared: &Rc<RefCell<Shared>>) {
 }
 
 /// Merge one DOM snapshot into the live set. Rects arrive viewport-relative;
-/// document space is viewport plus tracked scroll. Absent nodes accumulate
-/// misses and drop at [`DOM_MISSED_LIMIT`] (re-render flicker reads as one
-/// miss, real removals as two in a row).
+/// document space is viewport plus the snapshot's own scroll (the page is
+/// the ground truth — never the tracked offset). The tracked offset then
+/// rebases to that truth, so commanded-delta drift and history-restored
+/// offsets self-heal on every pull. Absent nodes accumulate misses and drop
+/// at [`DOM_MISSED_LIMIT`] (re-render flicker reads as one miss, real
+/// removals as two in a row).
 fn ingest_dom(state: &mut Shared, value: &JSValue) {
     use std::collections::HashSet;
-    let raws = parse_dom_snapshot(value);
-    let mut seen = HashSet::with_capacity(raws.len());
+    let snap = parse_dom_snapshot(value);
+    rebase_scroll(state, snap.scroll);
+    let mut seen = HashSet::with_capacity(snap.nodes.len());
     let mut fresh = 0usize;
     let (sx, sy) = state.scroll;
-    for r in raws {
+    for r in snap.nodes {
         seen.insert(r.id);
         let kind = dom_kind(&r.tag, &r.role, &r.typ);
         if let Some(n) = state.dom.get_mut(&r.id) {
@@ -775,6 +779,27 @@ fn ingest_dom(state: &mut Shared, value: &JSValue) {
         "servo-dom: ingested fresh={fresh} dropped={dropped} live={}",
         state.dom.len(),
     ));
+}
+
+/// Rebase the tracked offset to the page's reported scroll. Unlike
+/// [`set_scroll`] this deliberately skips the upper clamp: our extent can
+/// lag the page (unseen far corners), and truth from the page must win —
+/// clamping it would reintroduce the very drift this heals. Origin-pinned
+/// (negative scroll is never real) and reported when it moves the UI value.
+fn rebase_scroll(state: &mut Shared, scroll: (f32, f32)) {
+    let rebased = (scroll.0.max(0.0), scroll.1.max(0.0));
+    if state.scroll == rebased {
+        return;
+    }
+    state.scroll = rebased;
+    if state.last_sent_scroll == rebased {
+        return;
+    }
+    state.last_sent_scroll = rebased;
+    state.handle.emit(EngineEvent::ScrollOffset {
+        x: rebased.0,
+        y: rebased.1,
+    });
 }
 
 /// Update the tracked scroll offset and report it when it moves, so the UI

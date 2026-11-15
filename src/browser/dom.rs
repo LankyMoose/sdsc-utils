@@ -77,6 +77,10 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
   }
   arm();
   try { window.addEventListener('load', onMut); } catch (e) {}
+  // Scrolls (page or nested containers) change viewport rects with no DOM
+  // mutation, so the observers alone never hear them. Capture phase: scroll
+  // events don't bubble, this catches every scroller in the document.
+  try { document.addEventListener('scroll', onMut, {capture:true, passive:true}); } catch (e) {}
 })()"###;
 
 /// Boot script: idempotent install + immediate snapshot, so one round-trip
@@ -123,19 +127,50 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
       out.push([idFor(el), t, role, ty, Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height), txt]);
     } catch (e) { /* skip hostile nodes */ }
   })(els[i]); }
-  return {nodes: out, total: total, truncated: els.length > n};
+  var sx = 0, sy = 0;
+  try { sx = window.scrollX || window.pageXOffset || 0; sy = window.scrollY || window.pageYOffset || 0; } catch (e) {}
+  return {nodes: out, total: total, truncated: els.length > n, sx: Math.round(sx), sy: Math.round(sy)};
 })()"###;
 
+/// Parsed snapshot: viewport-space candidates plus the true page scroll at
+/// query time. The backend stores document-space rects (viewport + scroll)
+/// and rebases its tracked offset to this ground truth, so commanded-delta
+/// drift and history-restored offsets self-heal on every pull.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DomSnapshot {
+    pub nodes: Vec<DomRaw>,
+    pub scroll: (f32, f32),
+}
+
 /// Parse a `DOM_QUERY_JS` result into raw candidates. Lenient by design:
-/// malformed rows are skipped, never fatal.
-pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> Vec<DomRaw> {
+/// malformed rows are skipped, never fatal; a missing scroll defaults to
+/// origin (old cached pages can't produce one, and origin is the safe
+/// assumption, never a drift source — the next pull rebases).
+pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
     use embedder_traits::JSValue;
-    let mut out = Vec::new();
+    let mut nodes = Vec::new();
     let JSValue::Object(root) = value else {
-        return out;
+        return DomSnapshot {
+            nodes,
+            scroll: (0.0, 0.0),
+        };
     };
+    let scroll = (
+        root.get("sx")
+            .and_then(|v| match v {
+                JSValue::Number(n) => Some(*n as f32),
+                _ => None,
+            })
+            .unwrap_or(0.0),
+        root.get("sy")
+            .and_then(|v| match v {
+                JSValue::Number(n) => Some(*n as f32),
+                _ => None,
+            })
+            .unwrap_or(0.0),
+    );
     let Some(JSValue::Array(rows)) = root.get("nodes") else {
-        return out;
+        return DomSnapshot { nodes, scroll };
     };
     for row in rows {
         let JSValue::Array(cols) = row else {
@@ -160,7 +195,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> Vec<DomRaw> {
         if !(x.is_finite() && y.is_finite()) {
             continue;
         }
-        out.push(DomRaw {
+        nodes.push(DomRaw {
             id: id as u64,
             tag: str_(1),
             role: str_(2),
@@ -172,7 +207,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> Vec<DomRaw> {
             text: str_(8),
         });
     }
-    out
+    DomSnapshot { nodes, scroll }
 }
 
 /// Map a DOM node to a cursor kind. Explicit `role=` wins (ARIA authors know
@@ -265,11 +300,24 @@ mod tests {
             root
         });
         let out = parse_dom_snapshot(&value);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].id, 7);
-        assert_eq!(out[0].tag, "textarea");
-        assert_eq!(out[0].x, 10.0);
-        assert_eq!(out[1].typ, "password");
+        assert_eq!(out.nodes.len(), 2);
+        assert_eq!(out.nodes[0].id, 7);
+        assert_eq!(out.nodes[0].tag, "textarea");
+        assert_eq!(out.nodes[0].x, 10.0);
+        assert_eq!(out.nodes[1].typ, "password");
+        // No scroll fields in this fixture: origin, the safe assumption.
+        assert_eq!(out.scroll, (0.0, 0.0));
+    }
+
+    #[test]
+    fn parse_reads_page_scroll() {
+        let mut root = HashMap::new();
+        root.insert("nodes".to_string(), JSValue::Array(vec![]));
+        root.insert("sx".to_string(), num(0.0));
+        root.insert("sy".to_string(), num(1240.0));
+        let out = parse_dom_snapshot(&JSValue::Object(root));
+        assert!(out.nodes.is_empty());
+        assert_eq!(out.scroll, (0.0, 1240.0));
     }
 
     #[test]
@@ -304,8 +352,8 @@ mod tests {
             ]),
         ]);
         let out = parse_dom_snapshot(&value);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].id, 3);
+        assert_eq!(out.nodes.len(), 1);
+        assert_eq!(out.nodes[0].id, 3);
     }
 
     #[test]
@@ -317,6 +365,7 @@ mod tests {
         assert!(DOM_INSTALL_JS.contains(DOM_DIRTY_MARKER));
         assert!(DOM_INSTALL_JS.contains("MutationObserver"));
         assert!(DOM_INSTALL_JS.contains("ResizeObserver"));
+        assert!(DOM_INSTALL_JS.contains("addEventListener('scroll'"));
         assert!(DOM_INSTALL_JS.contains("fetch("));
         // Console and beacon channels removed: no page-log pollution, one
         // network channel to reason about.
