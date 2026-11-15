@@ -104,6 +104,7 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
   }
   var SEL = 'a[href],button,input,textarea,select,[role="button"],[role="link"],[role="checkbox"],[role="textbox"],[role="searchbox"],[role="switch"],[role="combobox"],[role="menuitem"],[role="tab"]';
   var out = [];
+  var culled = 0;
   var els;
   try { els = document.querySelectorAll(SEL); } catch (e) { return {nodes: [], total: 0, truncated: false}; }
   var total = els.length;
@@ -145,6 +146,15 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
       if (!(r.width > 0 && r.height > 0)) return;
       var vw = window.innerWidth || 800, vh = window.innerHeight || 600;
       if (r.width > vw || r.height > vh) return;
+      // Viewport cull (1-viewport margin): offscreen targets are dead weight
+      // in transfer, merge, and magnet cost — and worse, document-order
+      // truncation would keep them while dropping visible ones. Culled nodes
+      // re-enter on the next scroll-settle pull; scroll clamping uses the
+      // document dims below, never the live-set corners.
+      if (r.x + r.width < -vw || r.x > vw + vw || r.y + r.height < -vh || r.y > vh + vh) {
+        culled++;
+        return;
+      }
       var role = el.getAttribute ? (el.getAttribute("role") || "").toLowerCase() : "";
       var txt = "";
       try { txt = (el.innerText || el.textContent || "").replace(/\s+/g, " ").slice(0, 40); } catch (e2) {}
@@ -153,49 +163,68 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
   })(els[i]); }
   var sx = 0, sy = 0;
   try { sx = window.scrollX || window.pageXOffset || 0; sy = window.scrollY || window.pageYOffset || 0; } catch (e) {}
-  return {nodes: out, total: total, truncated: els.length > n, sx: Math.round(sx), sy: Math.round(sy)};
+  var dw = 0, dh = 0;
+  try {
+    var de = document.documentElement;
+    if (de) { dw = de.scrollWidth || 0; dh = de.scrollHeight || 0; }
+  } catch (e) {}
+  return {nodes: out, total: total, truncated: els.length > n, culled: culled, sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
 })()"###;
 
 /// Parsed snapshot: viewport-space candidates plus the true page scroll at
 /// query time. The backend stores document-space rects (viewport + scroll)
 /// and rebases its tracked offset to this ground truth, so commanded-delta
-/// drift and history-restored offsets self-heal on every pull.
+/// drift and history-restored offsets self-heal on every pull. `doc` carries
+/// the full document dims so scroll clamping survives viewport culling (the
+/// live set only ever spans viewport+margin); `total`/`culled` are
+/// diagnostics for cap pressure.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DomSnapshot {
     pub nodes: Vec<DomRaw>,
     pub scroll: (f32, f32),
+    pub doc: (f32, f32),
+    pub total: usize,
+    pub culled: usize,
 }
 
 /// Parse a `DOM_QUERY_JS` result into raw candidates. Lenient by design:
-/// malformed rows are skipped, never fatal; a missing scroll defaults to
-/// origin (old cached pages can't produce one, and origin is the safe
-/// assumption, never a drift source — the next pull rebases).
+/// malformed rows are skipped, never fatal; missing scroll/doc dims default
+/// to origin/zero (old cached pages can't produce them; origin is the safe
+/// assumption, never a drift source — the next pull rebases; zero doc dims
+/// just leave the extent to the live set).
 pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
     use embedder_traits::JSValue;
-    let mut nodes = Vec::new();
     let JSValue::Object(root) = value else {
         return DomSnapshot {
-            nodes,
+            nodes: Vec::new(),
             scroll: (0.0, 0.0),
+            doc: (0.0, 0.0),
+            total: 0,
+            culled: 0,
         };
     };
-    let scroll = (
-        root.get("sx")
+    let num_field = |key: &str| {
+        root.get(key)
             .and_then(|v| match v {
                 JSValue::Number(n) => Some(*n as f32),
                 _ => None,
             })
-            .unwrap_or(0.0),
-        root.get("sy")
-            .and_then(|v| match v {
-                JSValue::Number(n) => Some(*n as f32),
-                _ => None,
-            })
-            .unwrap_or(0.0),
-    );
-    let Some(JSValue::Array(rows)) = root.get("nodes") else {
-        return DomSnapshot { nodes, scroll };
+            .unwrap_or(0.0)
     };
+    let scroll = (num_field("sx"), num_field("sy"));
+    let doc = (num_field("dw"), num_field("dh"));
+    let total = num_field("total") as usize;
+    let culled = num_field("culled") as usize;
+    let Some(JSValue::Array(rows)) = root.get("nodes") else {
+        return DomSnapshot {
+            nodes: Vec::new(),
+            scroll,
+            doc,
+            total,
+            culled,
+        };
+    };
+    let mut nodes = Vec::new();
     for row in rows {
         let JSValue::Array(cols) = row else {
             continue;
@@ -231,7 +260,13 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             text: str_(8),
         });
     }
-    DomSnapshot { nodes, scroll }
+    DomSnapshot {
+        nodes,
+        scroll,
+        doc,
+        total,
+        culled,
+    }
 }
 
 /// Map a DOM node to a cursor kind. Explicit `role=` wins (ARIA authors know
@@ -334,14 +369,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_reads_page_scroll() {
+    fn parse_reads_page_scroll_and_doc_dims() {
         let mut root = HashMap::new();
         root.insert("nodes".to_string(), JSValue::Array(vec![]));
         root.insert("sx".to_string(), num(0.0));
         root.insert("sy".to_string(), num(1240.0));
+        root.insert("dw".to_string(), num(800.0));
+        root.insert("dh".to_string(), num(4000.0));
+        root.insert("total".to_string(), num(1500.0));
+        root.insert("culled".to_string(), num(900.0));
         let out = parse_dom_snapshot(&JSValue::Object(root));
         assert!(out.nodes.is_empty());
         assert_eq!(out.scroll, (0.0, 1240.0));
+        assert_eq!(out.doc, (800.0, 4000.0));
+        assert_eq!(out.total, 1500);
+        assert_eq!(out.culled, 900);
     }
 
     #[test]
