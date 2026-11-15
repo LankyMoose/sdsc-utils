@@ -322,16 +322,20 @@ const DOM_QUERY_BODY: &str = r###"(function(){
         // Persistent display forcing: the synchronous set-measure-restore
         // cycle recovered nothing, so keep the mutation. One shot per
         // element (repeat sets are no-ops, the guard keeps the census
-        // honest). The attribute mutation pings our own observer, which
-        // re-pulls: elements that gain boxes appear as fresh targets, the
-        // rest stay counted here.
+        // honest). HTML only: forcing display on SVG-namespace elements
+        // breaks their native layout (observed: dead SVG rendering).
+        // The attribute mutation pings our own observer, which re-pulls:
+        // elements that gain boxes appear as fresh targets, the rest stay
+        // counted here.
         try {
           var fid = idFor(el);
           if (!S.forced) S.forced = {};
           if (!S.forced[fid]) {
             S.forced[fid] = 1;
-            el.style.setProperty('display', 'block', 'important');
-            skForce++;
+            if (!el.namespaceURI || el.namespaceURI === 'http://www.w3.org/1999/xhtml') {
+              el.style.setProperty('display', 'block', 'important');
+              skForce++;
+            }
           }
         } catch (e6) {}
         return;
@@ -408,8 +412,12 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   function emitCand(cc) {
     var el = cc[0];
     var role = el.getAttribute ? (el.getAttribute("role") || "").toLowerCase() : "";
+    // textContent, not innerText: innerText forces a style-sensitive layout
+    // pass per element (death by a thousand reflows in debug builds);
+    // textContent is a straight tree walk and hidden subtrees never reach
+    // here (isHidden filtered them first).
     var txt = "";
-    try { txt = (el.innerText || el.textContent || "").replace(/\s+/g, " ").slice(0, 40); } catch (e2) {}
+    try { txt = (el.textContent || "").replace(/\s+/g, " ").slice(0, 40); } catch (e2) {}
     var r = cc[3];
     out.push([idFor(el), cc[1], role, cc[2], Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height), txt]);
   }
