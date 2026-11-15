@@ -938,28 +938,29 @@ fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, 
     // F10 coverage view: one thin ring per snap target, colored by kind.
     // The stack is explicitly full-card: it sizes to its first child
     // (the cursor-sized morph layer) by default, which would clip every
-    // layer beyond the cursor. Viewport-clamped boxes are skipped when
-    // fully offscreen, shrunk when partial.
+    // layer beyond the cursor. Boxes draw at their TRUE rects (no shrinking:
+    // a shrunk box would hide the very overflow/drift the overlay exists to
+    // diagnose); the card clips overflow, and fully-offscreen targets are
+    // skipped (nothing visible to draw, and negative spacers are invalid).
     let body: Element<'_, StartMessage> = if panel.debug_overlay {
         let mut overlay = stack![morph]
             .width(Length::Fixed(img_w))
             .height(Length::Fixed(img_h));
         for f in &panel.focusables {
-            let (mut bx, mut by) = (f.x * scale, f.y * scale);
-            let (mut bw, mut bh) = ((f.w * scale).max(3.0), (f.h * scale).max(3.0));
+            let (bx, by) = (f.x * scale, f.y * scale);
+            let (bw, bh) = ((f.w * scale).max(3.0), (f.h * scale).max(3.0));
             if bx + bw <= 0.0 || bx >= img_w || by + bh <= 0.0 || by >= img_h {
                 continue;
             }
-            bx = bx.max(0.0);
-            by = by.max(0.0);
-            bw = bw.min(img_w - bx);
-            bh = bh.min(img_h - by);
+            // Spacers can't go negative in iced: pin the origin, keep the
+            // true size and let the card clip the rest.
+            let (ox, oy) = (bx.max(0.0), by.max(0.0));
             let kind = f.kind;
             overlay = overlay.push(
                 column![
-                    space().height(Length::Fixed(by)),
+                    space().height(Length::Fixed(oy)),
                     row![
-                        space().width(Length::Fixed(bx)),
+                        space().width(Length::Fixed(ox)),
                         container(space().width(Length::Fixed(bw)).height(Length::Fixed(bh)))
                             .style(move |theme| crate::ui::theme::debug_target(theme, kind)),
                     ],
@@ -974,6 +975,7 @@ fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, 
     container(body)
         .width(Length::Fixed(img_w))
         .height(Length::Fixed(img_h))
+        .clip(true)
         .into()
 }
 
