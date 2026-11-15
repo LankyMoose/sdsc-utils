@@ -161,7 +161,7 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
     S.byId[id] = el;
     return id;
   }
-  var SEL = 'a[href],button,input,textarea,select,[role="button"],[role="link"],[role="checkbox"],[role="textbox"],[role="searchbox"],[role="switch"],[role="combobox"],[role="menuitem"],[role="tab"],[role="option"]';
+  var SEL = 'a[href],a[jsaction],button,input,textarea,select,[onclick],[role="button"],[role="link"],[role="checkbox"],[role="textbox"],[role="searchbox"],[role="switch"],[role="combobox"],[role="menuitem"],[role="tab"],[role="option"]';
   var out = [];
   var culled = 0;
   S.byId = {};
@@ -205,7 +205,10 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
       if (!r) return;
       if (!(r.width > 0 && r.height > 0)) return;
       var vw = window.innerWidth || 800, vh = window.innerHeight || 600;
-      if (r.width > vw || r.height > vh) return;
+      // Full-viewport-or-larger boxes are never snap targets: page roots and
+      // app shells (often carrying global [onclick]) would otherwise become
+      // screen-hogging phantoms. Strictly smaller in both axes to qualify.
+      if (r.width >= vw || r.height >= vh) return;
       // Viewport cull (1-viewport margin): offscreen targets are dead weight
       // in transfer, merge, and magnet cost — and worse, document-order
       // truncation would keep them while dropping visible ones. Culled nodes
@@ -539,6 +542,17 @@ mod tests {
         // Autocomplete rows (role=option) are real click targets.
         assert!(DOM_QUERY_JS.contains("[role=\"option\"]"));
         assert_eq!(dom_kind("div", "option", ""), FocusKind::Button);
+    }
+
+    #[test]
+    fn query_covers_handler_attributes() {
+        // href-less anchors (Google stamps href on mousedown) and inline
+        // handlers: both are clickable without matching the base selector.
+        assert!(DOM_QUERY_JS.contains("a[jsaction]"));
+        assert!(DOM_QUERY_JS.contains("[onclick]"));
+        // Full-viewport boxes never qualify (page roots with global
+        // handlers would become screen-hogging phantoms).
+        assert!(DOM_QUERY_JS.contains("r.width >= vw || r.height >= vh"));
     }
 
     #[test]
