@@ -838,9 +838,16 @@ impl App {
             panel.session.url(),
         ));
         #[cfg(debug_assertions)]
-        return self.shoot_browser_window();
+        {
+            if let Some(engine) = &self.engine {
+                engine.send(EngineCommand::ProbeEventLoop);
+            }
+            self.shoot_browser_window()
+        }
         #[cfg(not(debug_assertions))]
-        Task::none()
+        {
+            Task::none()
+        }
     }
 
     /// Debug-only window shot: every 5s while the browser overlay is on (or

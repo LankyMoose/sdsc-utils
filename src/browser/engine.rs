@@ -52,6 +52,10 @@ pub enum EngineCommand {
         x: f32,
         y: f32,
     },
+    /// R3 diagnostic: arm a one-shot event-loop probe (timers, rAF,
+    /// IntersectionObserver) and read it back ~700ms later. Tells whether
+    /// page JS task sources are actually running.
+    ProbeEventLoop,
     GoBack,
     GoForward,
     Resize {

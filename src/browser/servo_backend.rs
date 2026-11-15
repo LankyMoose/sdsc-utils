@@ -12,15 +12,15 @@
 //! loses), so Start chrome, toasts, and veils composite above the page.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
 use embedder_traits::{
-    InputEvent, JSValue, KeyboardEvent, MouseButton, MouseButtonAction, MouseButtonEvent,
-    MouseMoveEvent, Theme, WebResourceResponse,
+    InputEvent, InputEventId, InputEventResult, JSValue, KeyboardEvent, MouseButton,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Theme, WebResourceResponse,
 };
 use euclid::{Box2D, Point2D};
 
@@ -32,8 +32,8 @@ use servo::{
 
 use crate::browser::cursor::{FocusKind, Focusable};
 use crate::browser::dom::{
-    DOM_DIRTY_MARKER, DOM_INSTALL_JS, DOM_PING_URL, DOM_QUERY_JS, dom_boot_js, dom_kind,
-    parse_dom_snapshot,
+    DOM_DIRTY_MARKER, DOM_INSTALL_JS, DOM_PING_URL, DOM_QUERY_JS, PROBE_ARM_JS, PROBE_READ_JS,
+    dom_boot_js, dom_kind, parse_dom_snapshot, parse_loop_probe,
 };
 use crate::browser::engine::{EngineCommand, EngineEvent, EngineHandle, PageFrame};
 
@@ -104,6 +104,18 @@ struct Shared {
     dom_in_flight_at: Option<Instant>,
     dom_tx: mpsc::Sender<DomIngest>,
     dom_rx: Option<mpsc::Receiver<DomIngest>>,
+    /// In-flight input events awaiting their handled callback: (id, kind,
+    /// sent-at). Bounded; entries older than 5s mean the input pipeline
+    /// swallowed an event — the stall signature. Drained on completion.
+    pending_inputs: VecDeque<(InputEventId, &'static str, Instant)>,
+    /// One-shot event-loop probe (R3 diagnostic): result channel + read
+    /// deadline. Armed by `ProbeEventLoop`, read once, then cleared.
+    /// `probe_armed_at` marks the arm dispatch; the READ goes out 600ms
+    /// later so the 100ms timer and one rAF have a chance to fire.
+    /// `probe_rx` carries the READ result; `probe_deadline` bounds it.
+    probe_armed_at: Option<Instant>,
+    probe_rx: Option<mpsc::Receiver<Result<JSValue, String>>>,
+    probe_deadline: Option<Instant>,
     /// Last scroll offset sent to the UI (diffed like the tree).
     last_sent_scroll: (f32, f32),
     /// Document extent (max far corner seen, page pixels). Bounds the
@@ -245,6 +257,46 @@ impl WebViewDelegate for Delegate {
             .map(WebResourceResponse::new)
             .unwrap_or_else(|_| WebResourceResponse::new(DOM_PING_URL.parse().unwrap()));
         load.intercept(response);
+    }
+
+    fn notify_input_event_handled(
+        &self,
+        _webview: WebView,
+        event_id: InputEventId,
+        result: InputEventResult,
+    ) {
+        // Correlate outcomes with sent inputs: DispatchFailed means the
+        // engine dropped it; unconsumed clicks mean no page handler ran.
+        // Moves log only on failure (pad-tick rate would spam).
+        let mut shared = self.shared.borrow_mut();
+        let pos = shared
+            .pending_inputs
+            .iter()
+            .position(|(id, _, _)| *id == event_id);
+        let Some(idx) = pos else {
+            return;
+        };
+        let (_, kind, _) = shared.pending_inputs.remove(idx).unwrap();
+        let failed = result.contains(InputEventResult::DispatchFailed);
+        let consumed = result.contains(InputEventResult::Consumed);
+        if failed {
+            crate::platform::app_log::warn(format!("servo-input: {kind} dispatch failed"));
+        } else if kind != "move" {
+            crate::platform::app_log::info(format!(
+                "servo-input: {kind} handled consumed={consumed}"
+            ));
+        }
+        // Entries older than 5s with no outcome: the input pipeline
+        // swallowed an event — the stall signature.
+        while let Some((_, kind, at)) = shared.pending_inputs.front() {
+            if at.elapsed() < Duration::from_secs(5) {
+                break;
+            }
+            crate::platform::app_log::warn(format!(
+                "servo-input: {kind} swallowed (no outcome in 5s)"
+            ));
+            shared.pending_inputs.pop_front();
+        }
     }
 
     fn notify_accessibility_tree_update(
@@ -403,6 +455,10 @@ fn run(
         dom_in_flight_at: None,
         dom_tx,
         dom_rx: Some(dom_rx),
+        pending_inputs: VecDeque::with_capacity(64),
+        probe_armed_at: None,
+        probe_rx: None,
+        probe_deadline: None,
         content: None,
         last_url: None,
         ax_debug: std::env::var("SDSC_AX_DEBUG").is_ok(),
@@ -442,6 +498,7 @@ fn run(
             check_load_timeout(&shared);
             drain_dom_results(&shared);
             maybe_pull_dom(&webview, &shared);
+            poll_probe(&webview, &shared);
             std::thread::sleep(if suspended { SUSPENDED_IDLE } else { SPIN_IDLE });
         }
     }
@@ -501,7 +558,8 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             if shared.borrow().suspended {
                 return;
             }
-            webview.notify_input_event(InputEvent::Keyboard(KeyboardEvent::new(event)));
+            let id = webview.notify_input_event(InputEvent::Keyboard(KeyboardEvent::new(event)));
+            track_input(shared, id, "key");
             // Keys can mutate the DOM (typing, shortcuts, focus Cruft):
             // re-query once settled.
             let mut state = shared.borrow_mut();
@@ -534,7 +592,8 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                 return;
             }
             let point = WebViewPoint::Device(DevicePoint::new(x, y));
-            webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
+            let id = webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
+            track_input(shared, id, "move");
         }
         EngineCommand::ClickAt { x, y } => {
             if shared.borrow().suspended {
@@ -545,21 +604,27 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             // translated tree); Servo maps to document internally.
             crate::platform::app_log::info(format!("servo-engine: click at ({x:.0},{y:.0})"));
             let point = WebViewPoint::Device(DevicePoint::new(x, y));
-            webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                MouseButtonAction::Down,
-                MouseButton::Primary,
-                point,
-            )));
-            webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                MouseButtonAction::Up,
-                MouseButton::Primary,
-                point,
-            )));
+            for action in [MouseButtonAction::Down, MouseButtonAction::Up] {
+                let id = webview.notify_input_event(InputEvent::MouseButton(
+                    MouseButtonEvent::new(action, MouseButton::Primary, point),
+                ));
+                track_input(shared, id, "click");
+            }
             // Clicks mutate the DOM (toggles, expands, navigation): re-query
             // once settled.
             let mut state = shared.borrow_mut();
             state.dom_dirty = true;
             state.dom_dirty_at = Some(Instant::now());
+        }
+        EngineCommand::ProbeEventLoop => {
+            if shared.borrow().suspended {
+                return;
+            }
+            // Fire-and-forget arm; the loop dispatches the READ 600ms later
+            // and bounds it with a deadline (see `poll_probe`).
+            shared.borrow_mut().probe_armed_at = Some(Instant::now());
+            crate::platform::app_log::info("servo-loop: probe armed");
+            webview.evaluate_javascript(PROBE_ARM_JS.to_string(), |_| {});
         }
         EngineCommand::Resize { width, height } => {
             let mut state = shared.borrow_mut();
@@ -746,6 +811,87 @@ fn drain_dom_results(shared: &Rc<RefCell<Shared>>) {
                 ));
             }
         }
+    }
+}
+
+/// Record a sent input event for outcome correlation. Bounded: moves stream
+/// at pad-tick rate, so the oldest entry drops when full (its outcome just
+/// goes unmatched — fine at that cadence).
+fn track_input(shared: &Rc<RefCell<Shared>>, id: InputEventId, kind: &'static str) {
+    let mut state = shared.borrow_mut();
+    if state.pending_inputs.len() >= 64 {
+        state.pending_inputs.pop_front();
+    }
+    state.pending_inputs.push_back((id, kind, Instant::now()));
+}
+
+/// Drain one-shot event-loop probe results and drive its two phases:
+/// READ dispatch 600ms after the arm (lets the 100ms timer and one rAF
+/// fire), then a 2s bound on the READ round-trip.
+fn poll_probe(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
+    // Phase 1: time to dispatch the READ.
+    let dispatch_read = {
+        let mut state = shared.borrow_mut();
+        match (state.probe_armed_at, state.probe_rx.is_some()) {
+            (Some(armed), false) if armed.elapsed() >= Duration::from_millis(600) => {
+                let (tx, rx) = mpsc::channel();
+                state.probe_rx = Some(rx);
+                state.probe_armed_at = None;
+                state.probe_deadline = Some(Instant::now() + Duration::from_secs(2));
+                Some(tx)
+            }
+            _ => None,
+        }
+    };
+    if let Some(tx) = dispatch_read {
+        webview.evaluate_javascript(PROBE_READ_JS.to_string(), move |result| {
+            let _ = tx.send(result.map_err(|e| format!("{e:?}")));
+        });
+        return;
+    }
+    // Phase 2: READ result or deadline expiry.
+    let msg = shared
+        .borrow_mut()
+        .probe_rx
+        .as_mut()
+        .and_then(|rx| rx.try_recv().ok());
+    if let Some(result) = msg {
+        let mut state = shared.borrow_mut();
+        state.probe_rx = None;
+        state.probe_deadline = None;
+        match result {
+            Ok(value) => match parse_loop_probe(&value) {
+                Some([timer, raf, io]) => {
+                    crate::platform::app_log::info(format!(
+                        "servo-loop: probe timer={timer} raf={raf} io={io}"
+                    ));
+                    if !raf {
+                        crate::platform::app_log::warn(
+                            "servo-loop: rAF starved — frame-gated page JS is stalled",
+                        );
+                    }
+                }
+                None => {
+                    crate::platform::app_log::info("servo-loop: probe unread (arm never ran)");
+                }
+            },
+            Err(err) => {
+                crate::platform::app_log::info(format!("servo-loop: probe failed: {err}"));
+            }
+        }
+        return;
+    }
+    let expired = shared
+        .borrow()
+        .probe_deadline
+        .is_some_and(|t| Instant::now() >= t);
+    if expired {
+        let mut state = shared.borrow_mut();
+        state.probe_rx = None;
+        state.probe_deadline = None;
+        crate::platform::app_log::warn(
+            "servo-loop: probe unread after 700ms — script thread unresponsive",
+        );
     }
 }
 

@@ -91,6 +91,46 @@ pub fn dom_boot_js() -> String {
     format!("{DOM_INSTALL_JS};\n{DOM_QUERY_JS}")
 }
 
+/// One-shot event-loop probe: arm markers for the three async task
+/// sources, read them back after a beat. If timers fire but rAF never
+/// does, the page's frame-gated JS (hydration, lazy handlers) is starved —
+/// exactly the "clicks do nothing" signature.
+pub const PROBE_ARM_JS: &str = r###"(function(){
+  try {
+    window.__sdsc_loop = {timer: 0, raf: 0, io: 0};
+    setTimeout(function(){ window.__sdsc_loop.timer = 1; }, 100);
+    requestAnimationFrame(function(){ window.__sdsc_loop.raf = 1; });
+    var t = document.body || document.documentElement;
+    if (t) { new IntersectionObserver(function(){ window.__sdsc_loop.io = 1; }).observe(t); }
+  } catch (e) {}
+  return 'armed';
+})()"###;
+
+/// Read back [`PROBE_ARM_JS`] markers: `[timer, raf, io]` as 1/0, or
+/// `[-1,-1,-1]` when the arm never ran.
+pub const PROBE_READ_JS: &str = r###"(function(){var l=window.__sdsc_loop;if(!l)return[-1,-1,-1];return[l.timer?1:0,l.raf?1:0,l.io?1:0]})()"###;
+
+/// Parse a [`PROBE_READ_JS`] result. `None` on malformed shapes or when the
+/// arm never ran (page navigated away mid-probe).
+pub fn parse_loop_probe(value: &embedder_traits::JSValue) -> Option<[bool; 3]> {
+    use embedder_traits::JSValue;
+    let JSValue::Array(cols) = value else {
+        return None;
+    };
+    if cols.len() != 3 {
+        return None;
+    }
+    let mut out = [false; 3];
+    for (i, col) in cols.iter().enumerate() {
+        match col {
+            JSValue::Number(n) if *n == 1.0 => out[i] = true,
+            JSValue::Number(n) if *n == 0.0 => {}
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 /// Read-only DOM query. Stable per-document ids via an in-page WeakMap
 /// (recreated on every navigation, so ids are only meaningful within one
 /// document). Bounded to 1000 matches; reports truncation.
@@ -447,6 +487,25 @@ mod tests {
         let boot = dom_boot_js();
         assert!(boot.contains(DOM_DIRTY_MARKER));
         assert!(boot.contains("querySelectorAll"));
+    }
+
+    #[test]
+    fn probe_parses_marker_triplet() {
+        use embedder_traits::JSValue;
+        let good = JSValue::Array(vec![
+            JSValue::Number(1.0),
+            JSValue::Number(0.0),
+            JSValue::Number(1.0),
+        ]);
+        assert_eq!(parse_loop_probe(&good), Some([true, false, true]));
+        let unarmed = JSValue::Array(vec![
+            JSValue::Number(-1.0),
+            JSValue::Number(-1.0),
+            JSValue::Number(-1.0),
+        ]);
+        assert_eq!(parse_loop_probe(&unarmed), None);
+        let short = JSValue::Array(vec![JSValue::Number(1.0)]);
+        assert_eq!(parse_loop_probe(&short), None);
     }
 
     #[test]
