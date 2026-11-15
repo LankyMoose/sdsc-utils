@@ -68,7 +68,13 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
   var SUPPRESS = 500, TRAIL = 250;
   function fire(){
     lastPing = Date.now();
-    try { fetch(PING, {method:'POST', mode:'no-cors', keepalive:true, body:'1'}).catch(function(){}); } catch (e) {}
+    // Window truth rides along: a nested-container scroll moves only that
+    // container's children, so the global offset must not absorb it — the
+    // backend corrects to these coordinates on arrival instead of
+    // mis-translating every outline until the next settle pull.
+    var wx = 0, wy = 0;
+    try { wx = Math.round(window.scrollX || window.pageXOffset || 0); wy = Math.round(window.scrollY || window.pageYOffset || 0); } catch (e) {}
+    try { fetch(PING + '?wx=' + wx + '&wy=' + wy, {method:'POST', mode:'no-cors', keepalive:true, body:'1'}).catch(function(){}); } catch (e) {}
   }
   function onMut(){
     var now = Date.now();
@@ -488,6 +494,9 @@ mod tests {
         assert!(DOM_INSTALL_JS.contains("ResizeObserver"));
         assert!(DOM_INSTALL_JS.contains("addEventListener('scroll'"));
         assert!(DOM_INSTALL_JS.contains("fetch("));
+        // Pings carry window truth so nested scrolls can't poison the
+        // global offset.
+        assert!(DOM_INSTALL_JS.contains("wx="));
         // Console and beacon channels removed: no page-log pollution, one
         // network channel to reason about.
         assert!(!DOM_INSTALL_JS.contains("console"));

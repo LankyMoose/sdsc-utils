@@ -252,6 +252,13 @@ impl WebViewDelegate for Delegate {
             return;
         }
         mark_dom_dirty(&self.shared);
+        // Window truth rides on the ping query: a nested-container scroll
+        // leaves window.scroll unchanged, so correcting to it here instantly
+        // reverts any commanded accumulation the inner scroller absorbed —
+        // outlines stop tracking a scroll the page never made.
+        if let Some(truth) = parse_ping_scroll(&url) {
+            rebase_scroll(&mut self.shared.borrow_mut(), truth);
+        }
         let response = url
             .parse()
             .map(WebResourceResponse::new)
@@ -538,6 +545,15 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             if state.suspended {
                 return;
             }
+            // Dominant axis only: a diagonal stick deflection must not leak
+            // the minor axis into the wrong scroller (the carousel trap:
+            // horizontal intent with slight vertical drift scrolls the
+            // carousel instead of the page, or vice versa).
+            let (dx, dy) = if dx.abs() >= dy.abs() {
+                (dx, 0.0)
+            } else {
+                (0.0, dy)
+            };
             // Scroll under the pad cursor, not viewport center: Servo routes
             // to the innermost scroller under the point, so center-targeting
             // stranded page scrolls inside carousels.
@@ -1065,6 +1081,23 @@ fn rebase_scroll(state: &mut Shared, scroll: (f32, f32)) {
     });
 }
 
+/// Parse the window-truth coordinates off a dirty-ping URL (`?wx=&wy=`).
+/// `None` when absent or malformed — the ping still dirties, it just
+/// carries no correction.
+fn parse_ping_scroll(url: &str) -> Option<(f32, f32)> {
+    let parsed = url.parse::<url::Url>().ok()?;
+    let mut wx = None;
+    let mut wy = None;
+    for (k, v) in parsed.query_pairs() {
+        match k.as_ref() {
+            "wx" => wx = v.parse::<f32>().ok(),
+            "wy" => wy = v.parse::<f32>().ok(),
+            _ => {}
+        }
+    }
+    Some((wx?, wy?))
+}
+
 /// Update the tracked scroll offset and report it when it moves, so the UI
 /// overlay can correlate cursor against targets.
 fn set_scroll(state: &mut Shared, scroll: (f32, f32)) {
@@ -1172,5 +1205,22 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!((out[0].x, out[0].y), (100.0, 560.0));
         assert_eq!((out[1].x, out[1].y), (0.0, -240.0));
+    }
+
+    #[test]
+    fn ping_scroll_parses_window_truth() {
+        assert_eq!(
+            parse_ping_scroll("http://sdsc.invalid/__SDSC_DOM_DIRTY?wx=0&wy=1240"),
+            Some((0.0, 1240.0))
+        );
+        // Missing coords: no correction, ping still dirties elsewhere.
+        assert_eq!(
+            parse_ping_scroll("http://sdsc.invalid/__SDSC_DOM_DIRTY"),
+            None
+        );
+        assert_eq!(
+            parse_ping_scroll("http://sdsc.invalid/__SDSC_DOM_DIRTY?wx=abc&wy=1"),
+            None
+        );
     }
 }
