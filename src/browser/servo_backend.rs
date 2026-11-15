@@ -276,14 +276,17 @@ impl WebViewDelegate for Delegate {
         let Some(idx) = pos else {
             return;
         };
-        let (_, kind, _) = shared.pending_inputs.remove(idx).unwrap();
+        let (_, kind, sent_at) = shared.pending_inputs.remove(idx).unwrap();
         let failed = result.contains(InputEventResult::DispatchFailed);
         let consumed = result.contains(InputEventResult::Consumed);
+        let dt_ms = sent_at.elapsed().as_millis();
         if failed {
-            crate::platform::app_log::warn(format!("servo-input: {kind} dispatch failed"));
+            crate::platform::app_log::warn(format!(
+                "servo-input: {kind} dispatch failed dt={dt_ms}ms"
+            ));
         } else if kind != "move" {
             crate::platform::app_log::info(format!(
-                "servo-input: {kind} handled consumed={consumed}"
+                "servo-input: {kind} handled consumed={consumed} dt={dt_ms}ms"
             ));
         }
         // Entries older than 5s with no outcome: the input pipeline
