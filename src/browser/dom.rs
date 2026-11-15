@@ -164,6 +164,9 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
   var SEL = 'a,button,input,textarea,select,[onclick],[role="button"],[role="link"],[role="checkbox"],[role="textbox"],[role="searchbox"],[role="switch"],[role="combobox"],[role="menuitem"],[role="tab"],[role="option"]';
   var out = [];
   var culled = 0;
+  // Skip census: WHY matched candidates never become targets. `total` says
+  // how many matched; these say where the rest went. Read the ingest log.
+  var skBox = 0, skZero = 0, skBig = 0, skDis = 0, skErr = 0;
   S.byId = {};
   var els;
   try { els = document.querySelectorAll(SEL); } catch (e) { return {nodes: [], total: 0, truncated: false}; }
@@ -194,7 +197,7 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
   }
   for (var i = 0; i < n; i++) { (function(el){
     try {
-      if (el.disabled) return;
+      if (el.disabled) { skDis++; return; }
       var t = el.tagName ? el.tagName.toLowerCase() : "";
       var ty = "";
       if (t === "input") {
@@ -202,13 +205,13 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
         if (ty === "hidden") return;
       }
       var r = boxOf(el);
-      if (!r) return;
-      if (!(r.width > 0 && r.height > 0)) return;
+      if (!r) { skBox++; return; }
+      if (!(r.width > 0 && r.height > 0)) { skZero++; return; }
       var vw = window.innerWidth || 800, vh = window.innerHeight || 600;
       // Full-viewport-or-larger boxes are never snap targets: page roots and
       // app shells (often carrying global [onclick]) would otherwise become
       // screen-hogging phantoms. Strictly smaller in both axes to qualify.
-      if (r.width >= vw || r.height >= vh) return;
+      if (r.width >= vw || r.height >= vh) { skBig++; return; }
       // Viewport cull (1-viewport margin): offscreen targets are dead weight
       // in transfer, merge, and magnet cost — and worse, document-order
       // truncation would keep them while dropping visible ones. Culled nodes
@@ -222,7 +225,7 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
       var txt = "";
       try { txt = (el.innerText || el.textContent || "").replace(/\s+/g, " ").slice(0, 40); } catch (e2) {}
       out.push([idFor(el), t, role, ty, Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height), txt]);
-    } catch (e) { /* skip hostile nodes */ }
+    } catch (e) { skErr++; }
   })(els[i]); }
   var sx = 0, sy = 0;
   try { sx = window.scrollX || window.pageXOffset || 0; sy = window.scrollY || window.pageYOffset || 0; } catch (e) {}
@@ -231,7 +234,7 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
     var de = document.documentElement;
     if (de) { dw = de.scrollWidth || 0; dh = de.scrollHeight || 0; }
   } catch (e) {}
-  return {nodes: out, total: total, truncated: els.length > n, culled: culled, sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
+  return {nodes: out, total: total, truncated: els.length > n, culled: culled, skip: [skBox, skZero, skBig, skDis, skErr], sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
 })()"###;
 
 /// Parsed snapshot: viewport-space candidates plus the true page scroll at
@@ -239,8 +242,9 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
 /// and rebases its tracked offset to this ground truth, so commanded-delta
 /// drift and history-restored offsets self-heal on every pull. `doc` carries
 /// the full document dims so scroll clamping survives viewport culling (the
-/// live set only ever spans viewport+margin); `total`/`culled` are
-/// diagnostics for cap pressure.
+/// live set only ever spans viewport+margin); `total`/`culled`/`skipped`
+/// are diagnostics for cap pressure and skip reasons, in
+/// [boxless, zero-area, oversize, disabled, threw] order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DomSnapshot {
     pub nodes: Vec<DomRaw>,
@@ -248,6 +252,7 @@ pub struct DomSnapshot {
     pub doc: (f32, f32),
     pub total: usize,
     pub culled: usize,
+    pub skipped: [usize; 5],
 }
 
 /// Parse a `DOM_QUERY_JS` result into raw candidates. Lenient by design:
@@ -264,6 +269,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             doc: (0.0, 0.0),
             total: 0,
             culled: 0,
+            skipped: [0; 5],
         };
     };
     let num_field = |key: &str| {
@@ -278,6 +284,14 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
     let doc = (num_field("dw"), num_field("dh"));
     let total = num_field("total") as usize;
     let culled = num_field("culled") as usize;
+    let mut skipped = [0usize; 5];
+    if let Some(JSValue::Array(cols)) = root.get("skip") {
+        for (i, col) in cols.iter().take(5).enumerate() {
+            if let JSValue::Number(n) = col {
+                skipped[i] = (*n).max(0.0) as usize;
+            }
+        }
+    }
     let Some(JSValue::Array(rows)) = root.get("nodes") else {
         return DomSnapshot {
             nodes: Vec::new(),
@@ -285,6 +299,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             doc,
             total,
             culled,
+            skipped,
         };
     };
     let mut nodes = Vec::new();
@@ -329,6 +344,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
         doc,
         total,
         culled,
+        skipped,
     }
 }
 
@@ -442,12 +458,17 @@ mod tests {
         root.insert("dh".to_string(), num(4000.0));
         root.insert("total".to_string(), num(1500.0));
         root.insert("culled".to_string(), num(900.0));
+        root.insert(
+            "skip".to_string(),
+            JSValue::Array(vec![num(3.0), num(0.0), num(1.0), num(0.0), num(2.0)]),
+        );
         let out = parse_dom_snapshot(&JSValue::Object(root));
         assert!(out.nodes.is_empty());
         assert_eq!(out.scroll, (0.0, 1240.0));
         assert_eq!(out.doc, (800.0, 4000.0));
         assert_eq!(out.total, 1500);
         assert_eq!(out.culled, 900);
+        assert_eq!(out.skipped, [3, 0, 1, 0, 2]);
     }
 
     #[test]
