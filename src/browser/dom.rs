@@ -166,6 +166,8 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
   var culled = 0;
   // Skip census: WHY matched candidates never become targets. `total` says
   // how many matched; these say where the rest went. Read the ingest log.
+  // skBox = no boxes even via the children-union fallback (display:none
+  // subtrees, empty anchors — correctly invisible, nothing to recover).
   var skBox = 0, skZero = 0, skBig = 0, skDis = 0, skErr = 0;
   S.byId = {};
   var els;
@@ -182,9 +184,27 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
   function boxOf(el) {
     var rs;
     try { rs = el.getClientRects(); } catch (e) { return null; }
+    var boxes = [];
+    var j;
+    for (j = 0; j < rs.length; j++) boxes.push(rs[j]);
+    if (boxes.length === 0) {
+      // Box-free wrappers (display:contents and kin): the element itself
+      // has no boxes but its children do. Union up to 4 element children
+      // instead — bounded, and only runs when the primary path found
+      // nothing. Layout is already forced by the first call above, so the
+      // extras are cache hits, not reflows.
+      try {
+        var kids = el.children;
+        for (var k = 0; k < kids.length && k < 4; k++) {
+          var kr;
+          try { kr = kids[k].getClientRects(); } catch (e2) { continue; }
+          for (var m = 0; m < kr.length; m++) boxes.push(kr[m]);
+        }
+      } catch (e3) {}
+    }
     var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    for (var j = 0; j < rs.length; j++) {
-      var q = rs[j];
+    for (j = 0; j < boxes.length; j++) {
+      var q = boxes[j];
       var qx0 = Math.min(q.x, q.x + q.width), qx1 = Math.max(q.x, q.x + q.width);
       var qy0 = Math.min(q.y, q.y + q.height), qy1 = Math.max(q.y, q.y + q.height);
       if (qx0 < x0) x0 = qx0;
@@ -533,6 +553,8 @@ mod tests {
         // Union-of-fragments measurement: never the crashing call.
         assert!(DOM_QUERY_JS.contains("getClientRects"));
         assert!(!DOM_QUERY_JS.contains("getBoundingClientRect"));
+        // Box-free wrappers fall back to a bounded children union.
+        assert!(DOM_QUERY_JS.contains("el.children"));
         // Boot = install + snapshot in one round-trip.
         let boot = dom_boot_js();
         assert!(boot.contains(DOM_DIRTY_MARKER));
