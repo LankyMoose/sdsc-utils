@@ -265,9 +265,12 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   // what the cursor can actually reach; the nearest target strictly in each
   // direction always survives so arrow-key jumps never strand. No cursor yet
   // (__sdsc_cc false) keeps everything. Text extraction stays here so culled
-  // rows never pay innerText.
+  // rows never pay innerText. Cursor-culled ids ride along in `ccull` so the
+  // backend retains them with translated rects instead of churning
+  // fresh/drop every pull (the set would never stabilize while scrolling).
   var R2 = 500 * 500;
   var best = {up: null, down: null, left: null, right: null};
+  var ccull = [];
   var ci, cr, cdx, cdy, dirs, di, dd, score;
   if (__sdsc_cc) {
     for (ci = 0; ci < cands.length; ci++) {
@@ -290,7 +293,11 @@ const DOM_QUERY_BODY: &str = r###"(function(){
     var keepIdx = {};
     for (var bk in best) { if (best[bk]) keepIdx[best[bk][0]] = true; }
     for (ci = 0; ci < cands.length; ci++) {
-      if (!cands[ci][4] && !keepIdx[ci]) { culled++; continue; }
+      if (!cands[ci][4] && !keepIdx[ci]) {
+        culled++;
+        ccull.push(idFor(cands[ci][0]));
+        continue;
+      }
       emitCand(cands[ci]);
     }
   } else {
@@ -311,7 +318,7 @@ const DOM_QUERY_BODY: &str = r###"(function(){
     var de = document.documentElement;
     if (de) { dw = de.scrollWidth || 0; dh = de.scrollHeight || 0; }
   } catch (e) {}
-  return {nodes: out, total: total, truncated: els.length > n, culled: culled, skip: [skBox, skZero, skBig, skDis, skErr], boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
+  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
 })()"###;
 
 /// Parsed snapshot: viewport-space candidates plus the true page scroll at
@@ -333,6 +340,7 @@ pub struct DomSnapshot {
     pub doc: (f32, f32),
     pub total: usize,
     pub culled: usize,
+    pub culled_ids: Vec<u64>,
     pub skipped: [usize; 5],
     pub box_anchors: usize,
     pub boxless_with_kids: usize,
@@ -354,6 +362,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             doc: (0.0, 0.0),
             total: 0,
             culled: 0,
+            culled_ids: Vec::new(),
             skipped: [0; 5],
             box_anchors: 0,
             boxless_with_kids: 0,
@@ -373,6 +382,17 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
     let doc = (num_field("dw"), num_field("dh"));
     let total = num_field("total") as usize;
     let culled = num_field("culled") as usize;
+    let mut culled_ids = Vec::new();
+    if let Some(JSValue::Array(cols)) = root.get("ccull") {
+        for col in cols.iter().take(3000) {
+            if let JSValue::Number(n) = col {
+                let id = *n as u64;
+                if (*n).is_finite() && id as f64 == *n {
+                    culled_ids.push(id);
+                }
+            }
+        }
+    }
     let box_anchors = num_field("boxA") as usize;
     let boxless_with_kids = num_field("boxKid") as usize;
     let box_anchor_wraps = num_field("boxAWrap") as usize;
@@ -392,6 +412,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             doc,
             total,
             culled,
+            culled_ids,
             skipped,
             box_anchors,
             boxless_with_kids,
@@ -441,6 +462,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
         doc,
         total,
         culled,
+        culled_ids,
         skipped,
         box_anchors,
         boxless_with_kids,
@@ -567,6 +589,10 @@ mod tests {
         root.insert("boxKid".to_string(), num(5.0));
         root.insert("boxAWrap".to_string(), num(4.0));
         root.insert("boxAEmpty".to_string(), num(2.0));
+        root.insert(
+            "ccull".to_string(),
+            JSValue::Array(vec![num(11.0), num(13.0)]),
+        );
         let out = parse_dom_snapshot(&JSValue::Object(root));
         assert!(out.nodes.is_empty());
         assert_eq!(out.scroll, (0.0, 1240.0));
@@ -578,6 +604,7 @@ mod tests {
         assert_eq!(out.boxless_with_kids, 5);
         assert_eq!(out.box_anchor_wraps, 4);
         assert_eq!(out.box_anchor_empty, 2);
+        assert_eq!(out.culled_ids, vec![11, 13]);
     }
 
     #[test]
@@ -649,7 +676,8 @@ mod tests {
         assert!(!query.contains("selectNodeContents"));
         // Cursor culling: radial keep + directional-next keep, uncensored
         // without a cursor.
-        assert!(query.contains("__sdsc_cc"));
+        assert!(query.contains("__sdsc_cc=false"));
+        assert!(dom_query_js(Some((100.0, 200.0))).contains("__sdsc_cc=true"));
         assert!(query.contains("__sdsc_cx"));
         assert!(dom_query_js(Some((100.0, 200.0))).contains("__sdsc_cx=100"));
         // Boot = install + snapshot in one round-trip.

@@ -1026,8 +1026,9 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128) {
         snap.box_anchor_wraps,
         snap.box_anchor_empty,
     );
-    let mut seen = HashSet::with_capacity(snap.nodes.len());
+    let mut seen = HashSet::with_capacity(snap.nodes.len() + snap.culled_ids.len());
     let mut fresh = 0usize;
+    let mut retained = 0usize;
     let (sx, sy) = state.scroll;
     for r in snap.nodes {
         seen.insert(r.id);
@@ -1065,6 +1066,18 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128) {
             }
         }
     }
+    // Cursor-culled but seen: hold position (translated by the tracked
+    // scroll, exact for window scrolls) and reset the miss counter. Without
+    // this the set churns fresh/drop every pull while scrolling and the
+    // cursor re-docks constantly; with it, ids survive range exits and only
+    // truly-removed DOM drops.
+    for jsid in &snap.culled_ids {
+        seen.insert(*jsid);
+        if let Some(n) = state.dom.get_mut(jsid) {
+            n.missed = 0;
+            retained += 1;
+        }
+    }
     // Missed++ for the absent; drop the long-gone; prune dead uid mappings.
     // Bound the map so a pathological page can't grow it without limit.
     let mut dropped = 0usize;
@@ -1090,7 +1103,7 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128) {
         state.dom_uid.clear();
     }
     crate::platform::app_log::info(format!(
-        "servo-dom: ingested fresh={fresh} dropped={dropped} live={} total={total} culled={culled} skip={skipped:?} boxA={box_anchors} boxKid={box_kids} boxAWrap={box_wraps} boxAEmpty={box_empty} rtt={rtt_ms}ms",
+        "servo-dom: ingested fresh={fresh} dropped={dropped} retained={retained} live={} total={total} culled={culled} skip={skipped:?} boxA={box_anchors} boxKid={box_kids} boxAWrap={box_wraps} boxAEmpty={box_empty} rtt={rtt_ms}ms",
         state.dom.len(),
     ));
 }
