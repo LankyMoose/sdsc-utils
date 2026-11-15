@@ -1,0 +1,263 @@
+//! DOM target source for snap targets (`servo-engine` only).
+//!
+//! Servo's accessibility tree withholds real controls (form elements,
+//! `div[role=button]`, virtualized items) and freezes rects, so the live
+//! DOM is the sole target source instead. This module queries the page
+//! directly for actionable elements and their boxes:
+//! - the page is the ground truth for *existence* (re-renders funnel into
+//!   the DOM, no removal-record bookkeeping needed),
+//! - [`getBoundingClientRect`] forces real boxes every poll.
+//!
+//! The backend polls this on load settle, scroll settle, input, and a slow
+//! backstop. Polling, not pushing: the DOM cannot notify us, so we re-query
+//! on every event that typically mutates it.
+
+use crate::browser::cursor::FocusKind;
+
+/// Viewport-space snap candidate straight from the DOM.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DomRaw {
+    pub id: u64,
+    pub tag: String,
+    pub role: String,
+    pub typ: String,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub text: String,
+}
+
+/// Read-only DOM query. Stable per-document ids via an in-page WeakMap
+/// (recreated on every navigation, so ids are only meaningful within one
+/// document). Bounded to 1000 matches; reports truncation.
+pub const DOM_QUERY_JS: &str = r###"(function(){
+  var S = window.__sdsc_ax;
+  if (!S) { S = window.__sdsc_ax = { next: 1, ids: new WeakMap() }; }
+  function idFor(el) {
+    var id = S.ids.get(el);
+    if (id === undefined) { id = S.next++; S.ids.set(el, id); }
+    return id;
+  }
+  var SEL = 'a[href],button,input,textarea,select,[role="button"],[role="link"],[role="checkbox"],[role="textbox"],[role="searchbox"],[role="switch"],[role="combobox"],[role="menuitem"],[role="tab"]';
+  var out = [];
+  var els;
+  try { els = document.querySelectorAll(SEL); } catch (e) { return {nodes: [], total: 0, truncated: false}; }
+  var total = els.length;
+  var n = Math.min(els.length, 1000);
+  for (var i = 0; i < n; i++) { (function(el){
+    try {
+      if (el.disabled) return;
+      var t = el.tagName ? el.tagName.toLowerCase() : "";
+      var ty = "";
+      if (t === "input") {
+        ty = (el.getAttribute("type") || "text").toLowerCase();
+        if (ty === "hidden") return;
+      }
+      var r = el.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return;
+      var vw = window.innerWidth || 800, vh = window.innerHeight || 600;
+      if (r.width > vw || r.height > vh) return;
+      var role = el.getAttribute ? (el.getAttribute("role") || "").toLowerCase() : "";
+      var txt = "";
+      try { txt = (el.innerText || el.textContent || "").replace(/\s+/g, " ").slice(0, 40); } catch (e2) {}
+      out.push([idFor(el), t, role, ty, Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height), txt]);
+    } catch (e) { /* skip hostile nodes */ }
+  })(els[i]); }
+  return {nodes: out, total: total, truncated: els.length > n};
+})()"###;
+
+/// Parse a `DOM_QUERY_JS` result into raw candidates. Lenient by design:
+/// malformed rows are skipped, never fatal.
+pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> Vec<DomRaw> {
+    use embedder_traits::JSValue;
+    let mut out = Vec::new();
+    let JSValue::Object(root) = value else {
+        return out;
+    };
+    let Some(JSValue::Array(rows)) = root.get("nodes") else {
+        return out;
+    };
+    for row in rows {
+        let JSValue::Array(cols) = row else {
+            continue;
+        };
+        let num = |i: usize| match cols.get(i) {
+            Some(JSValue::Number(n)) => *n as f32,
+            _ => f32::NAN,
+        };
+        let str_ = |i: usize| match cols.get(i) {
+            Some(JSValue::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        let id = num(0);
+        let (x, y, w, h) = (num(4), num(5), num(6), num(7));
+        if !id.is_finite() || id < 0.0 {
+            continue;
+        }
+        if !(w > 0.0 && h > 0.0) {
+            continue;
+        }
+        if !(x.is_finite() && y.is_finite()) {
+            continue;
+        }
+        out.push(DomRaw {
+            id: id as u64,
+            tag: str_(1),
+            role: str_(2),
+            typ: str_(3),
+            x,
+            y,
+            w,
+            h,
+            text: str_(8),
+        });
+    }
+    out
+}
+
+/// Map a DOM node to a cursor kind. Explicit `role=` wins (ARIA authors know
+/// best); otherwise the tag (and input type) decides. Unknown but queried
+/// elements (they matched the actionable selector) fall back to `Other`.
+pub fn dom_kind(tag: &str, role: &str, typ: &str) -> FocusKind {
+    match role {
+        "link" | "doc-backlink" => return FocusKind::Link,
+        "button"
+        | "menuitem"
+        | "tab"
+        | "switch"
+        | "checkbox"
+        | "radio"
+        | "menuitemcheckbox"
+        | "menuitemradio"
+        | "menu-listbox-option" => return FocusKind::Button,
+        "textbox" | "searchbox" | "combobox" => return FocusKind::Field,
+        _ => {}
+    }
+    match tag {
+        "a" => FocusKind::Link,
+        "button" => FocusKind::Button,
+        "textarea" | "select" => FocusKind::Field,
+        "input" => match typ {
+            "checkbox" | "radio" | "submit" | "button" | "reset" | "image" | "color" | "range" => {
+                FocusKind::Button
+            }
+            _ => FocusKind::Field,
+        },
+        _ => FocusKind::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use embedder_traits::JSValue;
+    use std::collections::HashMap;
+
+    fn row(cols: Vec<JSValue>) -> JSValue {
+        JSValue::Array(cols)
+    }
+
+    fn num(n: f64) -> JSValue {
+        JSValue::Number(n)
+    }
+
+    fn str_(s: &str) -> JSValue {
+        JSValue::String(s.to_string())
+    }
+
+    fn snapshot(rows: Vec<JSValue>) -> JSValue {
+        let mut root = HashMap::new();
+        root.insert("nodes".to_string(), JSValue::Array(rows));
+        JSValue::Object(root)
+    }
+
+    #[test]
+    fn parse_accepts_well_formed_rows() {
+        let value = JSValue::Object({
+            let mut root = HashMap::new();
+            root.insert(
+                "nodes".to_string(),
+                JSValue::Array(vec![
+                    row(vec![
+                        num(7.0),
+                        str_("textarea"),
+                        str_(""),
+                        str_(""),
+                        num(10.0),
+                        num(20.0),
+                        num(300.0),
+                        num(40.0),
+                        str_("Search"),
+                    ]),
+                    row(vec![
+                        num(9.0),
+                        str_("input"),
+                        str_(""),
+                        str_("password"),
+                        num(10.0),
+                        num(70.0),
+                        num(300.0),
+                        num(40.0),
+                        str_(""),
+                    ]),
+                ]),
+            );
+            root
+        });
+        let out = parse_dom_snapshot(&value);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, 7);
+        assert_eq!(out[0].tag, "textarea");
+        assert_eq!(out[0].x, 10.0);
+        assert_eq!(out[1].typ, "password");
+    }
+
+    #[test]
+    fn parse_skips_garbage_without_failing() {
+        let value = snapshot(vec![
+            num(1.0),
+            str_("nope"),
+            row(vec![num(2.0)]),
+            row(vec![
+                num(f64::NAN),
+                str_("a"),
+                str_(""),
+                str_(""),
+                num(0.0),
+                num(0.0),
+                num(-5.0),
+                num(10.0),
+                str_(""),
+            ]),
+            // Flat numbers and short rows are skipped; the NaN/negative
+            // row is skipped; the valid row still parses.
+            row(vec![
+                num(3.0),
+                str_("button"),
+                str_(""),
+                str_(""),
+                num(5.0),
+                num(5.0),
+                num(50.0),
+                num(20.0),
+                str_("Go"),
+            ]),
+        ]);
+        let out = parse_dom_snapshot(&value);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, 3);
+    }
+
+    #[test]
+    fn kind_prefers_role_then_tag() {
+        assert_eq!(dom_kind("div", "button", ""), FocusKind::Button);
+        assert_eq!(dom_kind("div", "link", ""), FocusKind::Link);
+        assert_eq!(dom_kind("textarea", "", ""), FocusKind::Field);
+        assert_eq!(dom_kind("input", "", "password"), FocusKind::Field);
+        assert_eq!(dom_kind("input", "", "checkbox"), FocusKind::Button);
+        assert_eq!(dom_kind("input", "", "submit"), FocusKind::Button);
+        assert_eq!(dom_kind("a", "", ""), FocusKind::Link);
+        assert_eq!(dom_kind("button", "", ""), FocusKind::Button);
+    }
+}

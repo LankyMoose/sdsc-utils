@@ -19,17 +19,18 @@ use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
 use embedder_traits::{
-    InputEvent, KeyboardEvent, MouseButton, MouseButtonAction, MouseButtonEvent, Theme,
+    InputEvent, JSValue, KeyboardEvent, MouseButton, MouseButtonAction, MouseButtonEvent, Theme,
 };
 use euclid::{Box2D, Point2D};
 
 use servo::{
-    DevicePixel, DevicePoint, DeviceVector2D, EventLoopWaker, LoadStatus, Preferences,
-    RenderingContext, Scroll, ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder,
-    WebViewDelegate, WebViewPoint, WebViewVector,
+    DevicePixel, DevicePoint, DeviceVector2D, EventLoopWaker, LoadStatus, RenderingContext, Scroll,
+    ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
+    WebViewVector,
 };
 
 use crate::browser::cursor::{FocusKind, Focusable};
+use crate::browser::dom::{DOM_QUERY_JS, dom_kind, parse_dom_snapshot};
 use crate::browser::engine::{EngineCommand, EngineEvent, EngineHandle, PageFrame};
 
 /// Fixed offscreen viewport (phase 1; the iced image scales to the card).
@@ -65,12 +66,6 @@ struct Shared {
     generation: u64,
     load_started_at: Option<Instant>,
     logged_first_frame: bool,
-    /// Mirrored node snapshots, keyed by accesskit node id. Servo sends
-    /// incremental updates without removal records, so the backend tracks
-    /// parent→child links itself: a node that disappears from its parent's
-    /// children drops with its whole subtree instead of lingering as a
-    /// ghost. Reset on document change (see `clear_tree`).
-    nodes: HashMap<servo::accesskit::NodeId, StoredNode>,
     /// Last list sent to the UI (diffed to avoid spamming identical trees).
     last_emitted: Vec<Focusable>,
     visible: bool,
@@ -83,17 +78,24 @@ struct Shared {
     /// driven scrolls (anchors, JS) are invisible to us and self-heal only
     /// via fresh bounds — a known gap.
     scroll: (f32, f32),
-    /// Stable numeric ids for live accesskit nodes (the UI keys attachments
-    /// by u64). Pruned with each walk, cleared on document change, never
-    /// reused.
-    ids: HashMap<servo::accesskit::NodeId, u64>,
+    /// Stable numeric ids for live DOM targets (the UI keys attachments
+    /// by u64). Never reused within a document; cleared on document change.
     next_id: u64,
-    /// Last commanded scroll, for the AX refresh heuristic: a settled scroll
-    /// after big movement usually means the layout underneath shifted too.
-    last_scroll_at: Option<Instant>,
-    /// Last AX refresh (full re-request), and the scroll offset it saw.
-    last_refresh_at: Instant,
-    scroll_at_refresh: (f32, f32),
+    /// DOM-supplement targets (see `browser::dom`): keyed by the in-page
+    /// WeakMap id, stable per document. `missed` counts consecutive polls
+    /// without a sighting; pruned at 2 (re-renders flicker once, ghosts
+    /// don't survive twice).
+    dom: HashMap<u64, DomEntry>,
+    dom_uid: HashMap<u64, u64>,
+    dom_seq: u64,
+    dom_dirty: bool,
+    dom_dirty_at: Option<Instant>,
+    dom_in_flight: bool,
+    dom_in_flight_at: Option<Instant>,
+    last_dom_poll: Option<Instant>,
+    scroll_at_dom_poll: (f32, f32),
+    dom_tx: mpsc::Sender<DomIngest>,
+    dom_rx: Option<mpsc::Receiver<DomIngest>>,
     /// Last scroll offset sent to the UI (diffed like the tree).
     last_sent_scroll: (f32, f32),
     /// Document extent (max far corner seen, page pixels). Bounds the
@@ -105,8 +107,8 @@ struct Shared {
     /// compared against it: a new document clears the tree, same-document
     /// fragment/pushState traffic keeps it (no flash, no stale nodes).
     last_url: Option<String>,
-    /// Verbose per-node AX diagnostics (`SDSC_AX_DEBUG=1`): role, bounds,
-    /// and keep/drop verdict for every node in each tree update.
+    /// Verbose per-target DOM diagnostics (`SDSC_AX_DEBUG=1`): js id, kind,
+    /// and rect for every freshly mapped target.
     ax_debug: bool,
 }
 
@@ -177,6 +179,9 @@ impl WebViewDelegate for Delegate {
         if matches!(status, LoadStatus::Complete) {
             let mut shared = self.shared.borrow_mut();
             shared.load_started_at = None;
+            // Fresh document settling in: query the DOM once rendering lands.
+            shared.dom_dirty = true;
+            shared.dom_dirty_at = Some(Instant::now());
             let generation = shared.generation;
             shared.handle.emit(EngineEvent::LoadFinished {
                 generation,
@@ -188,190 +193,69 @@ impl WebViewDelegate for Delegate {
     fn notify_accessibility_tree_update(
         &self,
         _webview: WebView,
-        update: servo::accesskit::TreeUpdate,
+        _update: servo::accesskit::TreeUpdate,
     ) {
-        // Servo sends incremental updates (node id, node) without removal
-        // records, so the backend mirrors parent→child links itself: a node
-        // that disappears from its parent's children drops with its whole
-        // subtree instead of lingering as a ghost. Empty heartbeats are
-        // ignored; the mirror resets on document change.
-        //
-        // (An accesskit_consumer mirror was tried first: Servo never sends
-        // TreeId::ROOT — every update carries a per-document id — and the
-        // consumer refuses to start from anything else. It also panics on
-        // unknown grafts, which killed the worker 3x. Hand-rolled: no
-        // panics possible, no tree_id semantics needed.)
-        if update.nodes.is_empty() {
-            return;
-        }
-        let mut shared = self.shared.borrow_mut();
-        if shared.ax_debug {
-            crate::platform::app_log::info(format!(
-                "servo-ax update tree_id={:?} nodes={}",
-                update.tree_id,
-                update.nodes.len(),
-            ));
-            for (id, node) in &update.nodes {
-                let kind = focusable_kind(node.role());
-                let bounds = node.bounds();
-                let kept = kind.and_then(|kind| {
-                    bounds.and_then(|rect| {
-                        let (w, h) = (rect.width() as f32, rect.height() as f32);
-                        (w > 0.0
-                            && h > 0.0
-                            && w <= VIEWPORT_WIDTH as f32
-                            && h <= VIEWPORT_HEIGHT as f32)
-                            .then_some(kind)
-                    })
-                });
-                let verdict = match (&kept, bounds) {
-                    (Some(_), _) => "kept",
-                    (None, None) => "drop:nobounds",
-                    (None, Some(rect))
-                        if rect.width() as f32 > VIEWPORT_WIDTH as f32
-                            || rect.height() as f32 > VIEWPORT_HEIGHT as f32 =>
-                    {
-                        "drop:oversize"
-                    }
-                    (None, Some(_)) => "drop:role",
-                };
-                let b = bounds
-                    .map(|r| {
-                        format!(
-                            "({},{}) {}x{}",
-                            r.x0 as i32,
-                            r.y0 as i32,
-                            r.width() as i32,
-                            r.height() as i32
-                        )
-                    })
-                    .unwrap_or_else(|| "-".to_string());
-                // Accessible name fragments identify WHICH element a
-                // boundless drop is (truncated; usually empty).
-                let name: String = node
-                    .label()
-                    .into_iter()
-                    .chain(node.value())
-                    .flat_map(|s| s.chars().take(40))
-                    .collect();
-                crate::platform::app_log::info(format!(
-                    "servo-ax node id={id:?} role={role:?} bounds={b} kids={kids} verdict={verdict} name={name:?}",
-                    role = node.role(),
-                    kids = node.children().len(),
-                ));
-            }
-        }
-        apply_node_updates(&mut shared, &update.nodes);
-        // Publish the translated tree (diffed + logged inside).
-        emit_tree(&mut shared);
+        // AX tree intentionally ignored: the DOM query (see `browser::dom`)
+        // is the sole snap-target source. Servo's AX feed withholds real
+        // controls and freezes rects; keeping the mirror only grew ghosts.
     }
 }
 
-/// Stored node snapshot: just enough to filter targets and resolve
-/// removals (children links) without re-querying Servo.
+/// DOM target: actionable element found by the in-page query. Rects are
+/// document-space (viewport rect + scroll at ingest). `missed` counts consecutive polls
+/// without a sighting; pruned at [`DOM_MISSED_LIMIT`] so re-render flicker
+/// doesn't flap targets, but removed nodes still go away.
 #[derive(Debug, Clone)]
-struct StoredNode {
-    role: servo::accesskit::Role,
-    bounds: Option<(f32, f32, f32, f32)>,
-    children: Vec<servo::accesskit::NodeId>,
+struct DomEntry {
+    kind: FocusKind,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    missed: u8,
 }
 
-/// Collect snap targets from the mirrored map, plus the document extent
-/// (max far corner over every bounded node) for scroll clamping. Sorted by
+/// Completed DOM query from the page: poll sequence (stale results are
+/// dropped) plus the raw JS value or the evaluation error.
+type DomIngest = (u64, Result<JSValue, String>);
+
+/// Consecutive missed polls before a DOM target is dropped.
+const DOM_MISSED_LIMIT: u8 = 2;
+/// Minimum gap between DOM polls (lets one round-trip finish; pages need a
+/// beat to reflow after the input that triggered the poll).
+const DOM_MIN_INTERVAL: Duration = Duration::from_millis(800);
+/// Idle backstop between DOM polls while the browser is live.
+const DOM_BACKSTOP: Duration = Duration::from_secs(3);
+/// Scroll distance since the last poll that forces a re-query mid-hold.
+const DOM_SCROLL_DELTA: f32 = 200.0;
+/// Give up waiting on a DOM round-trip and allow the next poll.
+const DOM_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cap on DOM targets kept (the query already caps at 1000; this is the
+/// pathological-reparent backstop).
+const DOM_MAX_TARGETS: usize = 3000;
+
+/// Collect snap targets from the live DOM set, plus the document extent
+/// (max far corner over every target) for scroll clamping. Sorted by
 /// numeric id so diffing is stable.
 fn collect_focusables(shared: &mut Shared) -> (Vec<Focusable>, (f32, f32)) {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(shared.dom.len());
     let mut extent = (0.0f32, 0.0f32);
-    let Shared {
-        nodes,
-        ids,
-        next_id,
-        ax_debug,
-        ..
-    } = &mut *shared;
-    for (nid, stored) in nodes.iter() {
-        if let Some((_, _, x1, y1)) = stored.bounds {
-            extent.0 = extent.0.max(x1);
-            extent.1 = extent.1.max(y1);
-        }
-        let kept = focusable_kind(stored.role).and_then(|kind| {
-            stored.bounds.and_then(|(x0, y0, x1, y1)| {
-                let (w, h) = (x1 - x0, y1 - y0);
-                // Non-zero area and smaller than the viewport: a
-                // full-page container is not a snap target.
-                (w > 0.0 && h > 0.0 && w <= VIEWPORT_WIDTH as f32 && h <= VIEWPORT_HEIGHT as f32)
-                    .then_some(Focusable {
-                        id: 0,
-                        x: x0,
-                        y: y0,
-                        w,
-                        h,
-                        kind,
-                    })
-            })
-        });
-        if let Some(mut item) = kept {
-            // Stable numeric id for the UI.
-            item.id = *ids.entry(*nid).or_insert_with(|| {
-                let id = *next_id;
-                *next_id += 1;
-                if *ax_debug {
-                    crate::platform::app_log::info(format!(
-                        "servo-ax map #{id} <= {nid:?} role={:?}",
-                        stored.role
-                    ));
-                }
-                id
+    for (jsid, entry) in shared.dom.iter() {
+        extent.0 = extent.0.max(entry.x + entry.w);
+        extent.1 = extent.1.max(entry.y + entry.h);
+        if let Some(id) = shared.dom_uid.get(jsid) {
+            out.push(Focusable {
+                id: *id,
+                x: entry.x,
+                y: entry.y,
+                w: entry.w,
+                h: entry.h,
+                kind: entry.kind,
             });
-            out.push(item);
         }
     }
-    ids.retain(|k, _| nodes.contains_key(k));
     out.sort_by_key(|o| o.id);
     (out, extent)
-}
-
-/// Actionable accesskit roles, mapped to cursor kinds. Covers every HTML
-/// input type (each is its own role: password, email, textarea, ...) plus
-/// buttons of all flavors. Everything else is not worth a magnet (static
-/// text, plain containers, images without actions).
-fn focusable_kind(role: servo::accesskit::Role) -> Option<FocusKind> {
-    use servo::accesskit::Role;
-    match role {
-        Role::Link | Role::DocBackLink => Some(FocusKind::Link),
-        Role::Button
-        | Role::DefaultButton
-        | Role::CheckBox
-        | Role::RadioButton
-        | Role::Switch
-        | Role::MenuItem
-        | Role::MenuItemCheckBox
-        | Role::MenuItemRadio
-        | Role::MenuListOption
-        | Role::Tab
-        | Role::ListBoxOption
-        | Role::TreeItem
-        | Role::DisclosureTriangle
-        | Role::ColorWell
-        | Role::Slider
-        | Role::SpinButton => Some(FocusKind::Button),
-        Role::TextInput
-        | Role::MultilineTextInput
-        | Role::SearchInput
-        | Role::PasswordInput
-        | Role::EmailInput
-        | Role::NumberInput
-        | Role::UrlInput
-        | Role::PhoneNumberInput
-        | Role::DateInput
-        | Role::DateTimeInput
-        | Role::TimeInput
-        | Role::MonthInput
-        | Role::WeekInput
-        | Role::ComboBox
-        | Role::EditableComboBox => Some(FocusKind::Field),
-        _ => None,
-    }
 }
 
 /// Spawn the engine thread. Returns `None` when the GL context cannot be
@@ -429,14 +313,10 @@ fn run(
             }
         };
     let _ = ready.send(Ok(()));
-    let servo_prefs = Preferences {
-        accessibility_enabled: true,
-        ..Default::default()
-    };
     let servo = ServoBuilder::default()
-        .preferences(servo_prefs)
         .event_loop_waker(Box::new(ThreadWaker { tx: wake_tx }))
         .build();
+    let (dom_tx, dom_rx) = mpsc::channel();
     let shared = Rc::new(RefCell::new(Shared {
         ctx: ctx.clone(),
         size: (VIEWPORT_WIDTH, VIEWPORT_HEIGHT),
@@ -444,17 +324,23 @@ fn run(
         generation: 0,
         load_started_at: None,
         logged_first_frame: false,
-        nodes: HashMap::new(),
         last_emitted: Vec::new(),
         visible: false,
         suspended: true,
         scroll: (0.0, 0.0),
         last_sent_scroll: (0.0, 0.0),
-        ids: HashMap::new(),
         next_id: 0,
-        last_scroll_at: None,
-        last_refresh_at: Instant::now(),
-        scroll_at_refresh: (0.0, 0.0),
+        dom: HashMap::new(),
+        dom_uid: HashMap::new(),
+        dom_seq: 0,
+        dom_dirty: false,
+        dom_dirty_at: None,
+        dom_in_flight: false,
+        dom_in_flight_at: None,
+        last_dom_poll: None,
+        scroll_at_dom_poll: (0.0, 0.0),
+        dom_tx,
+        dom_rx: Some(dom_rx),
         content: None,
         last_url: None,
         ax_debug: std::env::var("SDSC_AX_DEBUG").is_ok(),
@@ -464,11 +350,6 @@ fn run(
             shared: shared.clone(),
         }))
         .build();
-    // Accessibility tree feed for the magnetic cursor: focusables + bounds.
-    // Needs the pref above; without it this returns None and no updates flow.
-    if webview.set_accessibility_active(true).is_none() {
-        crate::platform::app_log::warn("servo-engine: accessibility tree unavailable");
-    }
     crate::platform::app_log::info(format!(
         "servo-engine: ready ({VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT} software surface)"
     ));
@@ -491,7 +372,8 @@ fn run(
                 servo.spin_event_loop();
             }
             check_load_timeout(&shared);
-            maybe_refresh_ax(&webview, &shared);
+            drain_dom_results(&shared);
+            maybe_poll_dom(&webview, &shared);
             std::thread::sleep(if suspended { SUSPENDED_IDLE } else { SPIN_IDLE });
         }
     }
@@ -506,7 +388,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                     crate::platform::app_log::info(format!("servo-engine: navigate {url}"));
                     state.generation = generation;
                     state.load_started_at = Some(Instant::now());
-                    // Fresh page: clear_tree drops nodes, scroll and extent.
+                    // Fresh page: clear_tree drops DOM targets, scroll and extent.
                     state.last_url = Some(doc_key(&url).to_string());
                     clear_tree(&mut state);
                     state
@@ -540,8 +422,10 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             // silent unless nodes join/leave (see `emit_tree`).
             let (sx, sy) = state.scroll;
             set_scroll(&mut state, (sx + dx, sy + dy));
+            // Scrolling usually reflows: re-query the DOM once settled.
             if dx != 0.0 || dy != 0.0 {
-                state.last_scroll_at = Some(Instant::now());
+                state.dom_dirty = true;
+                state.dom_dirty_at = Some(Instant::now());
             }
             emit_tree(&mut state);
         }
@@ -550,6 +434,11 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                 return;
             }
             webview.notify_input_event(InputEvent::Keyboard(KeyboardEvent::new(event)));
+            // Keys can mutate the DOM (typing, shortcuts, focus Cruft):
+            // re-query once settled.
+            let mut state = shared.borrow_mut();
+            state.dom_dirty = true;
+            state.dom_dirty_at = Some(Instant::now());
         }
         EngineCommand::SetDarkMode { dark } => {
             webview.notify_theme_change(if dark { Theme::Dark } else { Theme::Light });
@@ -559,7 +448,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             if state.suspended {
                 return;
             }
-            // History travel swaps the document: clear_tree drops nodes,
+            // History travel swaps the document: clear_tree drops DOM targets,
             // scroll and extent (no reliable scroll restore to keep).
             clear_tree(&mut state);
             webview.go_back(1);
@@ -590,6 +479,11 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                 MouseButton::Primary,
                 point,
             )));
+            // Clicks mutate the DOM (toggles, expands, navigation): re-query
+            // once settled.
+            let mut state = shared.borrow_mut();
+            state.dom_dirty = true;
+            state.dom_dirty_at = Some(Instant::now());
         }
         EngineCommand::Resize { width, height } => {
             let mut state = shared.borrow_mut();
@@ -617,20 +511,25 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
     }
 }
 
-/// Document changed (fresh load or history travel): drop nodes, scroll and
-/// content extent. Session history does not reliably restore scroll, and
-/// stale anything misplaces every outline (observed in testing).
+/// Document changed (fresh load or history travel): drop DOM targets, scroll
+/// and content extent. Session history does not reliably restore scroll,
+/// and stale anything misplaces every outline (observed in testing).
 fn clear_tree(state: &mut Shared) {
-    if !state.nodes.is_empty() {
-        state.nodes.clear();
-        state.ids.clear();
+    if !state.dom.is_empty() {
+        state.dom.clear();
+        state.dom_uid.clear();
         state.last_emitted = Vec::new();
         state.handle.emit(EngineEvent::A11yTree(Vec::new()));
     }
     state.content = None;
-    state.last_scroll_at = None;
-    state.last_refresh_at = Instant::now();
-    state.scroll_at_refresh = (0.0, 0.0);
+    // A new document gets fresh DOM ids (the in-page WeakMap resets) and a
+    // fresh poll epoch: in-flight answers from the old page are dropped.
+    state.dom_seq = state.dom_seq.wrapping_add(1);
+    state.dom_in_flight = false;
+    state.dom_in_flight_at = None;
+    state.dom_dirty = true;
+    state.dom_dirty_at = Some(Instant::now());
+    state.last_dom_poll = None;
     if state.scroll != (0.0, 0.0) {
         state.scroll = (0.0, 0.0);
         state.last_sent_scroll = (0.0, 0.0);
@@ -659,38 +558,6 @@ fn doc_key(url: &str) -> &str {
     url.split('#').next().unwrap_or(url)
 }
 
-/// Re-request the accessibility tree when the mirror is likely stale:
-/// single-sighting rects freeze while the page keeps reflowing underneath
-/// them, and Servo does not reliably re-send. Capped cadence; toggling the
-/// feed forces a full re-send whose upserts refresh every rect in place.
-const AX_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
-/// Scroll distance since the last refresh that demands a re-request once
-/// movement settles (reflows usually follow big scrolls).
-const AX_REFRESH_SCROLL_DIST: f32 = 400.0;
-/// Quiet period after the last scroll input before a scroll-driven refresh.
-const AX_REFRESH_SETTLE: Duration = Duration::from_millis(1200);
-
-/// Drop the mirrored tree and re-request it, re-baselining every rect.
-/// Scroll is kept (same document, same position); nodes/ids/extent rebuild
-/// from the full re-send. Brief outline flicker while the tree streams back
-/// in — bounded by the cadence above.
-fn refresh_ax_tree(webview: &WebView, shared: &Rc<RefCell<Shared>>, reason: &str) {
-    {
-        let mut state = shared.borrow_mut();
-        state.nodes.clear();
-        state.ids.clear();
-        state.last_emitted = Vec::new();
-        state.content = None;
-        state.handle.emit(EngineEvent::A11yTree(Vec::new()));
-        state.last_scroll_at = None;
-        state.last_refresh_at = Instant::now();
-        state.scroll_at_refresh = state.scroll;
-    }
-    webview.set_accessibility_active(false);
-    webview.set_accessibility_active(true);
-    crate::platform::app_log::info(format!("servo-engine: AX refresh ({reason})"));
-}
-
 /// Clamp a tracked offset to the physically possible range: pages never sit
 /// above/left of origin, nor past extent-viewport. `None` extent (no
 /// bounded node seen yet) means no upper bound.
@@ -705,37 +572,173 @@ fn clamp_scroll(scroll: (f32, f32), content: Option<(f32, f32)>) -> (f32, f32) {
     (scroll.0.clamp(0.0, max_x), scroll.1.clamp(0.0, max_y))
 }
 
-/// Re-request the tree when the mirror is likely stale: single-sighting
-/// rects freeze while the page keeps reflowing underneath them, and Servo
-/// does not reliably re-send. Either a settled scroll that moved far since
-/// the last refresh (reflows usually follow big scrolls), or a plain
-/// interval backstop for image loads while reading. Skipped while
-/// suspended, empty, or mid-load (fresh loads stream their own tree).
-fn maybe_refresh_ax(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
+/// Quiet period after dirty input before a re-query fires (lets the page
+/// reflow after the input that triggered the poll).
+const DOM_SETTLE: Duration = Duration::from_millis(600);
+
+/// Ask the page for its actionable elements (see `browser::dom`). The DOM
+/// is the sole target source: polled, never pushed. Fires on dirty input
+/// (load/scroll/click/key) once settled, on big mid-hold scrolls, and on
+/// a slow backstop. Skipped while suspended/loading or with a poll
+/// in flight (5s timeout unsticks it).
+fn maybe_poll_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
     let now = Instant::now();
-    let reason = {
-        let state = shared.borrow();
-        if state.suspended || state.nodes.is_empty() || state.load_started_at.is_some() {
+    let fire = {
+        let mut state = shared.borrow_mut();
+        if state.suspended || state.load_started_at.is_some() {
             return;
         }
-        let scrolled_far = state.last_scroll_at.is_some_and(|t| {
-            now.saturating_duration_since(t) >= AX_REFRESH_SETTLE
-                && (state.scroll.0 - state.scroll_at_refresh.0)
-                    .hypot(state.scroll.1 - state.scroll_at_refresh.1)
-                    >= AX_REFRESH_SCROLL_DIST
-        });
-        let interval = now.saturating_duration_since(state.last_refresh_at) >= AX_REFRESH_INTERVAL;
-        if scrolled_far {
-            Some("scroll-settled")
-        } else if interval {
-            Some("interval")
-        } else {
-            None
+        if let Some(t) = state.dom_in_flight_at
+            && now.saturating_duration_since(t) >= DOM_TIMEOUT
+        {
+            state.dom_in_flight = false;
+            state.dom_in_flight_at = None;
         }
+        if state.dom_in_flight {
+            return;
+        }
+        if let Some(last) = state.last_dom_poll
+            && now.saturating_duration_since(last) < DOM_MIN_INTERVAL
+        {
+            return;
+        }
+        let dirty_settled = state.dom_dirty
+            && state
+                .dom_dirty_at
+                .is_some_and(|t| now.saturating_duration_since(t) >= DOM_SETTLE);
+        let scrolled_far = (state.scroll.0 - state.scroll_at_dom_poll.0)
+            .hypot(state.scroll.1 - state.scroll_at_dom_poll.1)
+            >= DOM_SCROLL_DELTA;
+        let backstop = state
+            .last_dom_poll
+            .is_none_or(|t| now.saturating_duration_since(t) >= DOM_BACKSTOP);
+        if !dirty_settled && !scrolled_far && !backstop {
+            return;
+        }
+        // Reserve the sequence first so a racing callback can't interleave.
+        state.dom_seq = state.dom_seq.wrapping_add(1);
+        let seq = state.dom_seq;
+        state.dom_in_flight = true;
+        state.dom_in_flight_at = Some(now);
+        state.last_dom_poll = Some(now);
+        state.dom_dirty = false;
+        state.dom_dirty_at = None;
+        state.scroll_at_dom_poll = state.scroll;
+        Some((seq, state.dom_tx.clone()))
     };
-    if let Some(reason) = reason {
-        refresh_ax_tree(webview, shared, reason);
+    let Some((seq, tx)) = fire else {
+        return;
+    };
+    crate::platform::app_log::info(format!("servo-dom: poll seq={seq}"));
+    webview.evaluate_javascript(DOM_QUERY_JS.to_string(), move |result| {
+        let _ = tx.send((seq, result.map_err(|e| format!("{e:?}"))));
+    });
+}
+
+/// Drain completed DOM queries: parse, merge, re-emit through the normal
+/// diff path (so the UI, cursor, and debug overlay see every update).
+fn drain_dom_results(shared: &Rc<RefCell<Shared>>) {
+    loop {
+        let msg = shared
+            .borrow_mut()
+            .dom_rx
+            .as_mut()
+            .and_then(|rx| rx.try_recv().ok());
+        let Some((seq, result)) = msg else {
+            return;
+        };
+        let mut state = shared.borrow_mut();
+        if seq != state.dom_seq {
+            continue;
+        }
+        state.dom_in_flight = false;
+        state.dom_in_flight_at = None;
+        match result {
+            Ok(value) => {
+                ingest_dom(&mut state, &value);
+                emit_tree(&mut state);
+            }
+            Err(err) => {
+                crate::platform::app_log::info(format!("servo-dom: query failed: {err}"));
+            }
+        }
     }
+}
+
+/// Merge one DOM snapshot into the live set. Rects arrive viewport-relative;
+/// document space is viewport plus tracked scroll. Absent nodes accumulate
+/// misses and drop at [`DOM_MISSED_LIMIT`] (re-render flicker reads as one
+/// miss, real removals as two in a row).
+fn ingest_dom(state: &mut Shared, value: &JSValue) {
+    use std::collections::HashSet;
+    let raws = parse_dom_snapshot(value);
+    let mut seen = HashSet::with_capacity(raws.len());
+    let mut fresh = 0usize;
+    let (sx, sy) = state.scroll;
+    for r in raws {
+        seen.insert(r.id);
+        let kind = dom_kind(&r.tag, &r.role, &r.typ);
+        if let Some(n) = state.dom.get_mut(&r.id) {
+            n.kind = kind;
+            n.x = r.x + sx;
+            n.y = r.y + sy;
+            n.w = r.w;
+            n.h = r.h;
+            n.missed = 0;
+        } else {
+            // Fresh node: assign a UI id from the document counter.
+            let id = state.next_id;
+            state.next_id += 1;
+            state.dom_uid.insert(r.id, id);
+            state.dom.insert(
+                r.id,
+                DomEntry {
+                    kind,
+                    x: r.x + sx,
+                    y: r.y + sy,
+                    w: r.w,
+                    h: r.h,
+                    missed: 0,
+                },
+            );
+            fresh += 1;
+            if state.ax_debug {
+                crate::platform::app_log::info(format!(
+                    "servo-dom map #{id} <= js#{} {kind:?} {}",
+                    r.id,
+                    r.text.chars().take(40).collect::<String>()
+                ));
+            }
+        }
+    }
+    // Missed++ for the absent; drop the long-gone; prune dead uid mappings.
+    // Bound the map so a pathological page can't grow it without limit.
+    let mut dropped = 0usize;
+    state.dom.retain(|jsid, n| {
+        if seen.contains(jsid) {
+            true
+        } else {
+            n.missed += 1;
+            let keep = n.missed < DOM_MISSED_LIMIT;
+            if !keep {
+                dropped += 1;
+            }
+            keep
+        }
+    });
+    state.dom_uid.retain(|jsid, _| state.dom.contains_key(jsid));
+    if state.dom.len() > DOM_MAX_TARGETS {
+        crate::platform::app_log::info(format!(
+            "servo-dom: over cap ({}), clearing and re-learning",
+            state.dom.len()
+        ));
+        state.dom.clear();
+        state.dom_uid.clear();
+    }
+    crate::platform::app_log::info(format!(
+        "servo-dom: ingested fresh={fresh} dropped={dropped} live={}",
+        state.dom.len(),
+    ));
 }
 
 /// Update the tracked scroll offset and report it when it moves, so the UI
@@ -751,70 +754,6 @@ fn set_scroll(state: &mut Shared, scroll: (f32, f32)) {
         x: clamped.0,
         y: clamped.1,
     });
-}
-
-/// Upsert changed nodes; drop subtrees a parent no longer lists (unless
-/// re-sent in the same update — reparent, not removal). Recomputes the
-/// document extent from the live set.
-fn apply_node_updates(
-    shared: &mut Shared,
-    updates: &[(servo::accesskit::NodeId, servo::accesskit::Node)],
-) {
-    use std::collections::HashSet;
-    let live: HashSet<servo::accesskit::NodeId> = updates.iter().map(|(id, _)| *id).collect();
-    // Removals first: children the parent dropped and nobody re-sent.
-    let mut dropped = Vec::new();
-    for (id, node) in updates {
-        if let Some(old) = shared.nodes.get(id) {
-            let updated: HashSet<servo::accesskit::NodeId> =
-                node.children().iter().copied().collect();
-            for child in &old.children {
-                if !updated.contains(child) && !live.contains(child) {
-                    dropped.push(*child);
-                }
-            }
-        }
-    }
-    for (id, node) in updates {
-        shared.nodes.insert(
-            *id,
-            StoredNode {
-                role: node.role(),
-                bounds: node
-                    .bounds()
-                    .map(|r| (r.x0 as f32, r.y0 as f32, r.x1 as f32, r.y1 as f32)),
-                children: node.children().to_vec(),
-            },
-        );
-    }
-    for id in dropped {
-        remove_subtree(&mut shared.nodes, id, &live);
-    }
-    // Recompute the extent from the live set (removals shrink it too).
-    let mut extent = (0.0f32, 0.0f32);
-    for n in shared.nodes.values() {
-        if let Some((_, _, x1, y1)) = n.bounds {
-            extent.0 = extent.0.max(x1);
-            extent.1 = extent.1.max(y1);
-        }
-    }
-    shared.content = Some(extent);
-}
-
-/// Drop a subtree, never touching nodes re-sent in the same update.
-fn remove_subtree(
-    map: &mut HashMap<servo::accesskit::NodeId, StoredNode>,
-    id: servo::accesskit::NodeId,
-    live: &std::collections::HashSet<servo::accesskit::NodeId>,
-) {
-    if live.contains(&id) {
-        return;
-    }
-    if let Some(node) = map.remove(&id) {
-        for child in node.children {
-            remove_subtree(map, child, live);
-        }
-    }
 }
 
 /// Diff + publish the translated tree. Logs only when the set size changes
@@ -841,7 +780,7 @@ fn emit_tree(shared: &mut Shared) {
             })
             .unwrap_or_default();
         crate::platform::app_log::info(format!(
-            "servo-engine: a11y focusables={}{sample}",
+            "servo-engine: dom focusables={}{sample}",
             fresh.len()
         ));
     }
