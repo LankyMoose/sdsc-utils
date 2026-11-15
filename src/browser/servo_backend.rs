@@ -279,7 +279,10 @@ impl WebViewDelegate for Delegate {
         result: InputEventResult,
     ) {
         // Correlate outcomes with sent inputs: DispatchFailed means the
-        // engine dropped it; unconsumed clicks mean no page handler ran.
+        // engine dropped it; handled-but-unconsumed means dispatch reached
+        // the page with no handler acting. DefaultPrevented-but-unconsumed
+        // is the tell for jsaction-style links: the page ate the event
+        // (killing native activation) and its JS never followed through.
         // Moves log only on failure (pad-tick rate would spam).
         let mut shared = self.shared.borrow_mut();
         let pos = shared
@@ -292,6 +295,7 @@ impl WebViewDelegate for Delegate {
         let (_, kind, sent_at) = shared.pending_inputs.remove(idx).unwrap();
         let failed = result.contains(InputEventResult::DispatchFailed);
         let consumed = result.contains(InputEventResult::Consumed);
+        let prevented = result.contains(InputEventResult::DefaultPrevented);
         let dt_ms = sent_at.elapsed().as_millis();
         if failed {
             crate::platform::app_log::warn(format!(
@@ -299,7 +303,7 @@ impl WebViewDelegate for Delegate {
             ));
         } else if kind != "move" {
             crate::platform::app_log::info(format!(
-                "servo-input: {kind} handled consumed={consumed} dt={dt_ms}ms"
+                "servo-input: {kind} handled consumed={consumed} prevented={prevented} dt={dt_ms}ms"
             ));
         }
         // Entries older than 5s with no outcome: the input pipeline
@@ -353,7 +357,8 @@ struct DomEntry {
 }
 
 /// Completed DOM query from the page: poll sequence, dispatch time (for
-/// pull round-trip logging), plus the raw JS value or the evaluation error.
+/// pull round-trip logging), tracked scroll at dispatch (for race-free
+/// rebasing), plus the raw JS value or the evaluation error.
 type DomIngest = (u64, Instant, Result<JSValue, String>);
 
 /// Cursor travel that re-seeds the cursor-culled set: past this distance
@@ -577,9 +582,14 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             // scroll: accumulate the commanded offset and re-emit translated
             // rects so outlines track the page. `try_send` + subscription
             // conflation absorb held-stick bursts; the emit itself stays
-            // silent unless nodes join/leave (see `emit_tree`).
-            let (sx, sy) = state.scroll;
-            set_scroll(&mut state, (sx + dx, sy + dy));
+            // silent unless nodes join/leave (see `emit_tree`). No known
+            // bounds yet (pre-first-ingest): notify Servo but don't
+            // integrate — unbounded accumulation with an infinite clamp is
+            // exactly the overscroll-into-the-void; the first pull rebases.
+            if state.content.is_some() {
+                let (sx, sy) = state.scroll;
+                set_scroll(&mut state, (sx + dx, sy + dy));
+            }
             // No DOM re-query on scroll: stored rects are document-space, so
             // scrolling only re-translates. Virtualized insertions during a
             // scroll ping through the observers on their own.
@@ -998,16 +1008,27 @@ fn send_synthetic_click(webview: &WebView, shared: &Rc<RefCell<Shared>>, x: f32,
 }
 
 /// Merge one DOM snapshot into the live set. Rects arrive viewport-relative;
-/// document space is viewport plus the snapshot's own scroll (the page is
-/// the ground truth — never the tracked offset). The tracked offset then
-/// rebases to that truth, so commanded-delta drift and history-restored
-/// offsets self-heal on every pull. Absent nodes accumulate misses and drop
-/// at [`DOM_MISSED_LIMIT`] (re-render flicker reads as one miss, real
-/// removals as two in a row).
+/// document space is viewport plus the tracked offset (pulls fire on
+/// settle, so measure and offset agree). The tracked offset then rebases by
+/// the snapshot truth's *delta from current* — never to an absolute value:
+/// an absolute rebase would clobber commanded scrolls that landed while the
+/// round-trip was in flight, yanking every outline backward (the overscroll
+/// jitter). A stale truth can still win one round when commands interleave
+/// the flight window, but those same commands already marked dirty, so the
+/// next pull corrects it. Absent nodes accumulate misses and drop at
+/// [`DOM_MISSED_LIMIT`] (re-render flicker reads as one miss, real removals
+/// as two in a row).
 fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128) {
     use std::collections::HashSet;
     let snap = parse_dom_snapshot(value);
-    rebase_scroll(state, snap.scroll);
+    // Truth delta vs current: heals unapplied commands (edge clamping the
+    // page ignored) and history-restored offsets alike. Origin-pinned;
+    // never upper-clamped (extent can lag truth).
+    let dx = (snap.scroll.0 - state.scroll.0).max(-state.scroll.0);
+    let dy = (snap.scroll.1 - state.scroll.1).max(-state.scroll.1);
+    if dx != 0.0 || dy != 0.0 {
+        rebase_scroll(state, (state.scroll.0 + dx, state.scroll.1 + dy));
+    }
     // Document dims bound scroll clamping (the live set only spans
     // viewport+margin after culling, so entry corners can't). Grow-only per
     // document, reset by `clear_tree`.
