@@ -105,8 +105,10 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
 /// both arms the observers and returns the current targets. The install is
 /// explicitly semicolon-terminated: without it the two adjacent IIFEs parse
 /// as a call on the install's (undefined) return value (ASI hazard).
-pub fn dom_boot_js() -> String {
-    format!("{DOM_INSTALL_JS};\n{DOM_QUERY_JS}")
+/// `center` is the cursor point the snapshot culls around (see
+/// [`dom_query_js`]); `None` keeps everything (no cursor yet).
+pub fn dom_boot_js(center: Option<(f32, f32)>) -> String {
+    format!("{DOM_INSTALL_JS};\n{}", dom_query_js(center))
 }
 
 /// One-shot event-loop probe: arm markers for the three async task
@@ -152,7 +154,18 @@ pub fn parse_loop_probe(value: &embedder_traits::JSValue) -> Option<[bool; 3]> {
 /// Read-only DOM query. Stable per-document ids via an in-page WeakMap
 /// (recreated on every navigation, so ids are only meaningful within one
 /// document). Bounded to 1000 matches; reports truncation.
-pub const DOM_QUERY_JS: &str = r###"(function(){
+/// `center` is the pad cursor in viewport px (or `None`): candidates beyond
+/// 500px of it are culled — except the nearest target in each direction, so
+/// arrow-key jumps always have somewhere to go. `None` keeps everything.
+pub fn dom_query_js(center: Option<(f32, f32)>) -> String {
+    let (cx, cy, on) = match center {
+        Some((x, y)) => (format!("{x:.0}"), format!("{y:.0}"), "true"),
+        None => ("0".to_string(), "0".to_string(), "false"),
+    };
+    format!("var __sdsc_cx={cx},__sdsc_cy={cy},__sdsc_cc={on};\n{DOM_QUERY_BODY}")
+}
+
+const DOM_QUERY_BODY: &str = r###"(function(){
   var S = window.__sdsc_ax;
   if (!S) { S = window.__sdsc_ax = { next: 1, ids: new WeakMap() }; }
   function idFor(el) {
@@ -198,6 +211,9 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
     if (!(x1 > x0 && y1 > y0)) return null;
     return {x: x0, y: y0, width: x1 - x0, height: y1 - y0};
   }
+  // Pass 1: measure everything (id assignment is stable per document, so
+  // culled elements keep their ids for the pull that re-admits them).
+  var cands = [];
   for (var i = 0; i < n; i++) { (function(el){
     try {
       if (el.disabled) { skDis++; return; }
@@ -242,12 +258,52 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
         culled++;
         return;
       }
-      var role = el.getAttribute ? (el.getAttribute("role") || "").toLowerCase() : "";
-      var txt = "";
-      try { txt = (el.innerText || el.textContent || "").replace(/\s+/g, " ").slice(0, 40); } catch (e2) {}
-      out.push([idFor(el), t, role, ty, Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height), txt]);
+      cands.push([el, t, ty, r]);
     } catch (e) { skErr++; }
   })(els[i]); }
+  // Pass 2: cursor cull (500px radius) + directional keep. The live set is
+  // what the cursor can actually reach; the nearest target strictly in each
+  // direction always survives so arrow-key jumps never strand. No cursor yet
+  // (__sdsc_cc false) keeps everything. Text extraction stays here so culled
+  // rows never pay innerText.
+  var R2 = 500 * 500;
+  var best = {up: null, down: null, left: null, right: null};
+  var ci, cr, cdx, cdy, dirs, di, dd, score;
+  if (__sdsc_cc) {
+    for (ci = 0; ci < cands.length; ci++) {
+      cr = cands[ci][3];
+      cdx = (cr.x + cr.width / 2) - __sdsc_cx;
+      cdy = (cr.y + cr.height / 2) - __sdsc_cy;
+      if (cdx * cdx + cdy * cdy <= R2) { cands[ci].push(true); continue; }
+      dirs = [];
+      if (cdy < 0) dirs.push(['up', -cdy, Math.abs(cdx)]);
+      if (cdy > 0) dirs.push(['down', cdy, Math.abs(cdx)]);
+      if (cdx < 0) dirs.push(['left', -cdx, Math.abs(cdy)]);
+      if (cdx > 0) dirs.push(['right', cdx, Math.abs(cdy)]);
+      for (di = 0; di < dirs.length; di++) {
+        dd = dirs[di];
+        score = dd[1] + 2 * dd[2];
+        if (!best[dd[0]] || score < best[dd[0]][1]) best[dd[0]] = [ci, score];
+      }
+      cands[ci].push(false);
+    }
+    var keepIdx = {};
+    for (var bk in best) { if (best[bk]) keepIdx[best[bk][0]] = true; }
+    for (ci = 0; ci < cands.length; ci++) {
+      if (!cands[ci][4] && !keepIdx[ci]) { culled++; continue; }
+      emitCand(cands[ci]);
+    }
+  } else {
+    for (ci = 0; ci < cands.length; ci++) emitCand(cands[ci]);
+  }
+  function emitCand(cc) {
+    var el = cc[0];
+    var role = el.getAttribute ? (el.getAttribute("role") || "").toLowerCase() : "";
+    var txt = "";
+    try { txt = (el.innerText || el.textContent || "").replace(/\s+/g, " ").slice(0, 40); } catch (e2) {}
+    var r = cc[3];
+    out.push([idFor(el), cc[1], role, cc[2], Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height), txt]);
+  }
   var sx = 0, sy = 0;
   try { sx = window.scrollX || window.pageXOffset || 0; sy = window.scrollY || window.pageYOffset || 0; } catch (e) {}
   var dw = 0, dh = 0;
@@ -284,7 +340,7 @@ pub struct DomSnapshot {
     pub box_anchor_empty: usize,
 }
 
-/// Parse a `DOM_QUERY_JS` result into raw candidates. Lenient by design:
+/// Parse a `dom_query_js` result into raw candidates. Lenient by design:
 /// malformed rows are skipped, never fatal; missing scroll/doc dims default
 /// to origin/zero (old cached pages can't produce them; origin is the safe
 /// assumption, never a drift source — the next pull rebases; zero doc dims
@@ -584,15 +640,20 @@ mod tests {
         assert!(DOM_INSTALL_JS.contains("__sdsc_click"));
         assert!(DOM_INSTALL_JS.contains("byId"));
         // Union-of-fragments measurement: never the crashing call.
-        assert!(DOM_QUERY_JS.contains("getClientRects"));
-        assert!(!DOM_QUERY_JS.contains("getBoundingClientRect"));
+        let query = dom_query_js(None);
+        assert!(query.contains("getClientRects"));
+        assert!(!query.contains("getBoundingClientRect"));
         // No Range fallback: per-element createRange round-trips cost seconds
         // per pull in debug Servo (rtt 17ms -> 4000ms); boxless elements stay
         // skipped and counted.
-        // Box-free wrappers fall back to a bounded children union.
-        assert!(DOM_QUERY_JS.contains("el.children"));
+        assert!(!query.contains("selectNodeContents"));
+        // Cursor culling: radial keep + directional-next keep, uncensored
+        // without a cursor.
+        assert!(query.contains("__sdsc_cc"));
+        assert!(query.contains("__sdsc_cx"));
+        assert!(dom_query_js(Some((100.0, 200.0))).contains("__sdsc_cx=100"));
         // Boot = install + snapshot in one round-trip.
-        let boot = dom_boot_js();
+        let boot = dom_boot_js(None);
         assert!(boot.contains(DOM_DIRTY_MARKER));
         assert!(boot.contains("querySelectorAll"));
     }
@@ -619,7 +680,7 @@ mod tests {
     #[test]
     fn query_covers_option_role() {
         // Autocomplete rows (role=option) are real click targets.
-        assert!(DOM_QUERY_JS.contains("[role=\"option\"]"));
+        assert!(dom_query_js(None).contains("[role=\"option\"]"));
         assert_eq!(dom_kind("div", "option", ""), FocusKind::Button);
     }
 
@@ -627,12 +688,13 @@ mod tests {
     fn query_covers_handler_attributes() {
         // Any anchor qualifies (href-less jsaction anchors, name anchors —
         // the size filter keeps phantoms out) plus inline handlers.
-        assert!(DOM_QUERY_JS.contains("'a,button,"));
-        assert!(DOM_QUERY_JS.contains("[onclick]"));
+        let query = dom_query_js(None);
+        assert!(query.contains("'a,button,"));
+        assert!(query.contains("[onclick]"));
         // Full-viewport boxes never qualify (a screen-sized box with a
         // global handler would become a screen-hogging phantom); full-width
         // rows survive because both axes are required.
-        assert!(DOM_QUERY_JS.contains("r.width >= vw && r.height >= vh"));
+        assert!(query.contains("r.width >= vw && r.height >= vh"));
     }
 
     #[test]

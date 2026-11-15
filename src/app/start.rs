@@ -773,9 +773,13 @@ impl App {
                 y: cy,
             });
         }
-        // Stream the pad cursor as the one true mouse: quantized to whole
-        // px so a resting cursor sends nothing, while any travel keeps
-        // Servo hover/hit-test glued to the real position.
+    }
+
+    /// Stream the pad cursor as the one true mouse (see `EngineCommand::MouseMove`):
+    /// quantized to whole px so a resting cursor sends nothing. Called once
+    /// per browser tick AFTER input handling, so stick glides, D-pad jumps
+    /// and nudges — every cursor mover — converge on one sync point.
+    pub(crate) fn sync_browser_mouse(&mut self) -> Task<Message> {
         let (qx, qy) = (
             self.start_state.browser.cursor.x as i32,
             self.start_state.browser.cursor.y as i32,
@@ -789,6 +793,7 @@ impl App {
                 });
             }
         }
+        Task::none()
     }
 
     /// Click at the cursor: attached element center, else the free point.
@@ -2184,7 +2189,8 @@ impl App {
                     }
                     _ => Task::none(),
                 };
-                Task::batch(vec![flag, action])
+                let sync = self.sync_browser_mouse();
+                Task::batch(vec![flag, action, sync])
             } else {
                 match tick.action {
                     Some(NavAction::Up) => {

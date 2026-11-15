@@ -32,8 +32,8 @@ use servo::{
 
 use crate::browser::cursor::{FocusKind, Focusable};
 use crate::browser::dom::{
-    DOM_DIRTY_MARKER, DOM_INSTALL_JS, DOM_PING_URL, DOM_QUERY_JS, PROBE_ARM_JS, PROBE_READ_JS,
-    dom_boot_js, dom_kind, parse_dom_snapshot, parse_loop_probe,
+    DOM_DIRTY_MARKER, DOM_INSTALL_JS, DOM_PING_URL, PROBE_ARM_JS, PROBE_READ_JS, dom_boot_js,
+    dom_kind, dom_query_js, parse_dom_snapshot, parse_loop_probe,
 };
 use crate::browser::engine::{EngineCommand, EngineEvent, EngineHandle, PageFrame};
 
@@ -104,6 +104,12 @@ struct Shared {
     dom_in_flight_at: Option<Instant>,
     dom_tx: mpsc::Sender<DomIngest>,
     dom_rx: Option<mpsc::Receiver<DomIngest>>,
+    /// Last cursor position seen via MouseMove (viewport px). Drives the
+    /// per-pull cursor cull and re-seeds it when the cursor travels.
+    last_mouse: Option<(f32, f32)>,
+    /// Cursor position the last pull culled around. A roam past 300px marks
+    /// dirty so the live set follows the cursor.
+    last_cull_center: Option<(f32, f32)>,
     /// In-flight input events awaiting their handled callback: (id, kind,
     /// sent-at). Bounded; entries older than 5s mean the input pipeline
     /// swallowed an event — the stall signature. Drained on completion.
@@ -350,6 +356,10 @@ struct DomEntry {
 /// pull round-trip logging), plus the raw JS value or the evaluation error.
 type DomIngest = (u64, Instant, Result<JSValue, String>);
 
+/// Cursor travel that re-seeds the cursor-culled set: past this distance
+/// from the last pull center, the live set no longer covers the cursor.
+const DOM_CULL_RESEED_DIST: f32 = 300.0;
+
 /// Consecutive missed polls before a DOM target is dropped.
 const DOM_MISSED_LIMIT: u8 = 2;
 /// Give up waiting on a DOM round-trip and allow the next poll.
@@ -465,6 +475,8 @@ fn run(
         dom_in_flight_at: None,
         dom_tx,
         dom_rx: Some(dom_rx),
+        last_mouse: None,
+        last_cull_center: None,
         pending_inputs: VecDeque::with_capacity(64),
         probe_armed_at: None,
         probe_rx: None,
@@ -613,6 +625,20 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             let point = WebViewPoint::Device(DevicePoint::new(x, y));
             let id = webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
             track_input(shared, id, "move");
+            // Roaming cursor re-seeds the cursor-culled set: once a cursor
+            // position exists and the pull center is stale (or never set),
+            // the live set no longer covers the cursor.
+            let mut state = shared.borrow_mut();
+            let roamed = match (state.last_mouse, state.last_cull_center) {
+                (None, _) => false,
+                (Some(_), None) => true,
+                (Some(_), Some((cx, cy))) => (cx - x).hypot(cy - y) >= DOM_CULL_RESEED_DIST,
+            };
+            state.last_mouse = Some((x, y));
+            if roamed {
+                state.dom_dirty = true;
+                state.dom_dirty_at = Some(Instant::now());
+            }
         }
         EngineCommand::ClickAt { x, y, target } => {
             if shared.borrow().suspended {
@@ -817,10 +843,12 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
         state.dom_dirty = false;
         state.dom_dirty_at = None;
         let pinged = std::mem::take(&mut state.dom_ping);
+        let center = state.last_mouse;
+        state.last_cull_center = center;
         let script = if boot {
-            dom_boot_js()
+            dom_boot_js(center)
         } else {
-            DOM_QUERY_JS.to_string()
+            dom_query_js(center)
         };
         Some((seq, state.dom_tx.clone(), script, boot, pinged, now))
     };
