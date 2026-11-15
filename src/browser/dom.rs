@@ -169,7 +169,7 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
   // skBox = no boxes; skBoxA = of those, anchors; skBoxKid = of those, with
   // element children (the wrapper signature: boxless parent, boxed kids).
   var skBox = 0, skZero = 0, skBig = 0, skDis = 0, skErr = 0;
-  var skBoxA = 0, skBoxKid = 0;
+  var skBoxA = 0, skBoxKid = 0, skBoxAWrap = 0;
   S.byId = {};
   var els;
   try { els = document.querySelectorAll(SEL); } catch (e) { return {nodes: [], total: 0, truncated: false}; }
@@ -227,9 +227,14 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
       var r = boxOf(el);
       if (!r) {
         skBox++;
+        var hasKids = false;
+        try { hasKids = !!(el.children && el.children.length > 0); } catch (e3) {}
         try {
-          if (t === "a") skBoxA++;
-          if (el.children && el.children.length > 0) skBoxKid++;
+          if (t === "a") {
+            skBoxA++;
+            if (hasKids) skBoxAWrap++;
+          }
+          if (hasKids) skBoxKid++;
         } catch (e2) {}
         return;
       }
@@ -261,7 +266,7 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
     var de = document.documentElement;
     if (de) { dw = de.scrollWidth || 0; dh = de.scrollHeight || 0; }
   } catch (e) {}
-  return {nodes: out, total: total, truncated: els.length > n, culled: culled, skip: [skBox, skZero, skBig, skDis, skErr], boxA: skBoxA, boxKid: skBoxKid, sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
+  return {nodes: out, total: total, truncated: els.length > n, culled: culled, skip: [skBox, skZero, skBig, skDis, skErr], boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
 })()"###;
 
 /// Parsed snapshot: viewport-space candidates plus the true page scroll at
@@ -273,7 +278,8 @@ pub const DOM_QUERY_JS: &str = r###"(function(){
 /// are diagnostics for cap pressure and skip reasons, in
 /// [boxless, zero-area, oversize, disabled, threw] order. `box_anchors`
 /// counts boxless <a> elements, `boxless_with_kids` counts boxless elements
-/// that have element children (the wrapper signature).
+/// with element children, `box_anchor_wraps` their intersection (wrapper
+/// anchors: no own box, boxed descendants).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DomSnapshot {
     pub nodes: Vec<DomRaw>,
@@ -284,6 +290,7 @@ pub struct DomSnapshot {
     pub skipped: [usize; 5],
     pub box_anchors: usize,
     pub boxless_with_kids: usize,
+    pub box_anchor_wraps: usize,
 }
 
 /// Parse a `DOM_QUERY_JS` result into raw candidates. Lenient by design:
@@ -303,6 +310,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             skipped: [0; 5],
             box_anchors: 0,
             boxless_with_kids: 0,
+            box_anchor_wraps: 0,
         };
     };
     let num_field = |key: &str| {
@@ -319,6 +327,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
     let culled = num_field("culled") as usize;
     let box_anchors = num_field("boxA") as usize;
     let boxless_with_kids = num_field("boxKid") as usize;
+    let box_anchor_wraps = num_field("boxAWrap") as usize;
     let mut skipped = [0usize; 5];
     if let Some(JSValue::Array(cols)) = root.get("skip") {
         for (i, col) in cols.iter().take(5).enumerate() {
@@ -337,6 +346,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             skipped,
             box_anchors,
             boxless_with_kids,
+            box_anchor_wraps,
         };
     };
     let mut nodes = Vec::new();
@@ -384,6 +394,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
         skipped,
         box_anchors,
         boxless_with_kids,
+        box_anchor_wraps,
     }
 }
 
@@ -503,6 +514,7 @@ mod tests {
         );
         root.insert("boxA".to_string(), num(7.0));
         root.insert("boxKid".to_string(), num(5.0));
+        root.insert("boxAWrap".to_string(), num(4.0));
         let out = parse_dom_snapshot(&JSValue::Object(root));
         assert!(out.nodes.is_empty());
         assert_eq!(out.scroll, (0.0, 1240.0));
@@ -512,6 +524,7 @@ mod tests {
         assert_eq!(out.skipped, [3, 0, 1, 0, 2]);
         assert_eq!(out.box_anchors, 7);
         assert_eq!(out.boxless_with_kids, 5);
+        assert_eq!(out.box_anchor_wraps, 4);
     }
 
     #[test]

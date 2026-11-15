@@ -992,7 +992,11 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128) {
     }
     let (total, culled) = (snap.total, snap.culled);
     let skipped = snap.skipped;
-    let (box_anchors, box_kids) = (snap.box_anchors, snap.boxless_with_kids);
+    let (box_anchors, box_kids, box_wraps) = (
+        snap.box_anchors,
+        snap.boxless_with_kids,
+        snap.box_anchor_wraps,
+    );
     let mut seen = HashSet::with_capacity(snap.nodes.len());
     let mut fresh = 0usize;
     let (sx, sy) = state.scroll;
@@ -1057,7 +1061,7 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128) {
         state.dom_uid.clear();
     }
     crate::platform::app_log::info(format!(
-        "servo-dom: ingested fresh={fresh} dropped={dropped} live={} total={total} culled={culled} skip={skipped:?} boxA={box_anchors} boxKid={box_kids} rtt={rtt_ms}ms",
+        "servo-dom: ingested fresh={fresh} dropped={dropped} live={} total={total} culled={culled} skip={skipped:?} boxA={box_anchors} boxKid={box_kids} boxAWrap={box_wraps} rtt={rtt_ms}ms",
         state.dom.len(),
     ));
 }
