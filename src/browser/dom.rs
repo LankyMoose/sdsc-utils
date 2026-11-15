@@ -198,32 +198,6 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   function boxOf(el) {
     var rs;
     try { rs = el.getClientRects(); } catch (e) { return null; }
-    var forcedBox = false;
-    if (rs.length === 0) {
-      // Temporary display forcing: save the inline display value, force
-      // inline-block, re-measure, restore exactly — all synchronously, so no
-      // paint and no mutation-observer delivery can observe the intermediate
-      // state. Answers whether Servo withholds boxes for lack of an
-      // associated fragment that an atomic box would provide.
-      try {
-        var st = el.style;
-        if (st) {
-          var prevVal = st.getPropertyValue('display');
-          var prevPri = st.getPropertyPriority('display');
-          try {
-            st.setProperty('display', 'inline-block', 'important');
-            var rs2 = null;
-            try { rs2 = el.getClientRects(); } catch (e4) {}
-            if (rs2 && rs2.length > 0) { rs = rs2; forcedBox = true; }
-          } finally {
-            try {
-              if (prevVal === '' && prevPri === '') { st.removeProperty('display'); }
-              else { st.setProperty('display', prevVal, prevPri); }
-            } catch (e5) {}
-          }
-        }
-      } catch (e3) {}
-    }
     var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (var j = 0; j < rs.length; j++) {
       var q = rs[j];
@@ -235,9 +209,7 @@ const DOM_QUERY_BODY: &str = r###"(function(){
       if (qy1 > y1) y1 = qy1;
     }
     if (!(x1 > x0 && y1 > y0)) return null;
-    var r = {x: x0, y: y0, width: x1 - x0, height: y1 - y0};
-    if (forcedBox) skForce++;
-    return r;
+    return {x: x0, y: y0, width: x1 - x0, height: y1 - y0};
   }
   // Pass 1: measure everything (id assignment is stable per document, so
   // culled elements keep their ids for the pull that re-admits them).
@@ -267,6 +239,21 @@ const DOM_QUERY_BODY: &str = r###"(function(){
           }
           if (hasKids) skBoxKid++;
         } catch (e2) {}
+        // Persistent display forcing: the synchronous set-measure-restore
+        // cycle recovered nothing, so keep the mutation. One shot per
+        // element (repeat sets are no-ops, the guard keeps the census
+        // honest). The attribute mutation pings our own observer, which
+        // re-pulls: elements that gain boxes appear as fresh targets, the
+        // rest stay counted here.
+        try {
+          var fid = idFor(el);
+          if (!S.forced) S.forced = {};
+          if (!S.forced[fid]) {
+            S.forced[fid] = 1;
+            el.style.setProperty('display', 'inline-block', 'important');
+            skForce++;
+          }
+        } catch (e6) {}
         return;
       }
       if (!(r.width > 0 && r.height > 0)) { skZero++; return; }
@@ -706,11 +693,11 @@ mod tests {
         let query = dom_query_js(None);
         assert!(query.contains("getClientRects"));
         assert!(!query.contains("getBoundingClientRect"));
-        // Boxless fallback is temporary display forcing (set, measure,
-        // restore inside one task — no Range round-trips).
+        // Boxless fallback is persistent display forcing (one shot per
+        // element; our own observer re-pulls on the mutation).
         assert!(!query.contains("selectNodeContents"));
         assert!(query.contains("setProperty('display', 'inline-block'"));
-        assert!(query.contains("removeProperty('display')"));
+        assert!(!query.contains("removeProperty"));
         // Cursor culling: radial keep + directional-next keep, uncensored
         // without a cursor.
         assert!(query.contains("__sdsc_cc=false"));
