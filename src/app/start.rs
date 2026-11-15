@@ -797,8 +797,49 @@ impl App {
             let panel = &self.start_state.browser;
             panel.cursor.click_point(&panel.focusables)
         };
+        self.start_state.browser.last_click = Some(((x, y), Instant::now()));
         if let Some(engine) = &self.engine {
             engine.send(EngineCommand::ClickAt { x, y });
+        }
+        Task::none()
+    }
+
+    /// R3 issue flag: user reports "clicked and nothing happened". Dumps one
+    /// correlatable bundle (cursor, dock, nearest targets, last click age,
+    /// scroll, url, wells) and forces a debug shot, so the backend pull log
+    /// around this timestamp tells the rest of the story.
+    pub(crate) fn flag_browser_issue(&mut self, now: Instant) -> Task<Message> {
+        let panel = &mut self.start_state.browser;
+        let (cx, cy) = (panel.cursor.x, panel.cursor.y);
+        let dock = panel.cursor.attached;
+        let dock_rect = panel.cursor.attached_rect(&panel.focusables);
+        let would_click = panel.cursor.click_point(&panel.focusables);
+        let last_click_ago = panel
+            .last_click
+            .map(|(_, t)| now.saturating_duration_since(t).as_millis());
+        let last_click_at = panel.last_click.map(|(p, _)| p);
+        // Nearest 8 targets by center distance: the actionable context.
+        let mut ranked: Vec<(u64, f32, f32, f32, f32, f32)> = panel
+            .focusables
+            .iter()
+            .map(|o| {
+                let d = ((o.x + o.w / 2.0) - cx).abs() + ((o.y + o.h / 2.0) - cy).abs();
+                (o.id, o.x, o.y, o.w, o.h, d)
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.5.partial_cmp(&b.5).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(8);
+        crate::platform::app_log::warn(format!(
+            "ISSUE-FLAG cursor=({cx:.0},{cy:.0}) dock={dock:?} dock_rect={dock_rect:?} would_click=({:.0},{:.0}) last_click_at={last_click_at:?} last_click_ago_ms={last_click_ago:?} scroll={:?} wells={} url={} near={ranked:?}",
+            would_click.0,
+            would_click.1,
+            panel.scroll_offset,
+            panel.focusables.len(),
+            panel.session.url(),
+        ));
+        #[cfg(debug_assertions)]
+        {
+            panel.force_shot = true;
         }
         Task::none()
     }
@@ -816,6 +857,8 @@ impl App {
         }
         let now = Instant::now();
         let panel = &mut self.start_state.browser;
+        // R3 issue flag forces a shot for visual correlation.
+        let forced = std::mem::replace(&mut panel.force_shot, false);
         // A fresh dock shoots once it settles (~300ms for the morph to
         // complete); the 5s cadence covers everything else.
         let settled_dock = panel.cursor.attached.is_some()
@@ -823,7 +866,8 @@ impl App {
                 now.saturating_duration_since(t) >= Duration::from_millis(300)
                     && panel.last_shot.is_none_or(|s| s < t)
             });
-        if !settled_dock
+        if !forced
+            && !settled_dock
             && panel
                 .last_shot
                 .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(5))
@@ -2069,7 +2113,18 @@ impl App {
             self.start_state.tick_hint_anims(now);
             if self.start_state.browser.session.has_frame() {
                 self.tick_browser_cursor(readings, now);
-                match tick.action {
+                // R3 issue flag (R3 carries no NavAction): rising edge while
+                // browsing dumps the trace bundle + forces a debug shot.
+                let r3_down = readings
+                    .iter()
+                    .any(|r| r.sample.held.contains(&gesture::GestureControl::R3));
+                let latched = std::mem::replace(&mut self.start_state.browser.r3_latched, r3_down);
+                let flag = if r3_down && !latched {
+                    self.flag_browser_issue(now)
+                } else {
+                    Task::none()
+                };
+                let action = match tick.action {
                     Some(NavAction::Up) => {
                         self.start_state.browser.jump_cursor(JumpDir::Up);
                         Task::none()
@@ -2122,7 +2177,8 @@ impl App {
                         Task::none()
                     }
                     _ => Task::none(),
-                }
+                };
+                Task::batch(vec![flag, action])
             } else {
                 match tick.action {
                     Some(NavAction::Up) => {

@@ -805,6 +805,13 @@ pub struct BrowserPanel {
     /// shooting on the dock tick only ever captures a half-morphed wrap
     /// and reads as a misplaced outline.
     pub last_dock_change: Option<Instant>,
+    /// Last click point + time, for the R3 issue-flag correlation.
+    pub last_click: Option<((f32, f32), Instant)>,
+    /// R3 rising-edge latch for the issue flag (R3 carries no NavAction).
+    pub r3_latched: bool,
+    /// Force the next debug shot (R3 issue flag). Debug-only.
+    #[cfg(debug_assertions)]
+    pub force_shot: bool,
     /// Last sent mouse position (quantized px), so the pad cursor streams
     /// moves to the engine only when it actually travels. Never persisted.
     pub last_sent_mouse: Option<(i32, i32)>,
