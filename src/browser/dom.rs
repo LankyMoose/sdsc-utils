@@ -344,7 +344,15 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   }
   // Pass 1: measure everything (id assignment is stable per document, so
   // culled elements keep their ids for the pull that re-admits them).
+  // Deliberately NO visibility verdicts here: one getComputedStyle call
+  // costs ~15ms in debug Servo while getClientRects unions are
+  // microseconds, so verdicts run only on elements that survive geometric
+  // culling (pass 2/3) plus boxless forcing candidates — never on all N
+  // candidates up front.
   var cands = [];
+  var boxless = [];
+  var vw = 800, vh = 600;
+  try { vw = window.innerWidth || 800; vh = window.innerHeight || 600; } catch (e0) {}
   for (var i = 0; i < n; i++) { (function(el){
     try {
       if (el.disabled) { skDis++; return; }
@@ -354,55 +362,14 @@ const DOM_QUERY_BODY: &str = r###"(function(){
         ty = (el.getAttribute("type") || "text").toLowerCase();
         if (ty === "hidden") return;
       }
-      // Hidden check BEFORE measuring: getComputedStyle is far cheaper than
-      // getClientRects, and hidden subtrees are numerous (menus, dialogs).
       var __a = Date.now();
-      var __h = isHidden(el);
-      tmV += Date.now() - __a;
-      if (__h) { skHid++; return; }
-      __a = Date.now();
       var r = boxOf(el);
       tmM += Date.now() - __a;
-      if (!r) {
-        // Boxless-but-rendered: hidden subtrees were already filtered above,
-        // so these are candidates for forcing.
-        skBox++;
-        var hasKids = false;
-        var hasAnyKid = false;
-        try { hasKids = !!(el.children && el.children.length > 0); } catch (e3) {}
-        try { hasAnyKid = !!el.firstChild; } catch (e4) {}
-        try {
-          if (t === "a") {
-            skBoxA++;
-            if (hasKids) skBoxAWrap++;
-            else if (!hasAnyKid) skBoxAEmpty++;
-            // Remainder (hasAnyKid && !hasKids) = text-only anchors.
-          }
-          if (hasKids) skBoxKid++;
-        } catch (e2) {}
-        // Persistent display forcing: the synchronous set-measure-restore
-        // cycle recovered nothing, so keep the mutation. One shot per
-        // element (repeat sets are no-ops, the guard keeps the census
-        // honest). HTML only: forcing display on SVG-namespace elements
-        // breaks their native layout (observed: dead SVG rendering).
-        // The attribute mutation pings our own observer, which re-pulls:
-        // elements that gain boxes appear as fresh targets, the rest stay
-        // counted here.
-        try {
-          var fid = idFor(el);
-          if (!S.forced) S.forced = {};
-          if (!S.forced[fid]) {
-            S.forced[fid] = 1;
-            if (!el.namespaceURI || el.namespaceURI === 'http://www.w3.org/1999/xhtml') {
-              el.style.setProperty('display', 'block', 'important');
-              skForce++;
-            }
-          }
-        } catch (e6) {}
-        return;
-      }
+      // Boxless goes aside: hidden subtrees (display:none) are the common
+      // case and get their own cheap triage + verdict below, never the
+      // forcing path blind.
+      if (!r) { boxless.push([el, t]); return; }
       if (!(r.width > 0 && r.height > 0)) { skZero++; return; }
-      var vw = window.innerWidth || 800, vh = window.innerHeight || 600;
       // Full-viewport-or-larger boxes are never snap targets: page roots and
       // app shells (often carrying global [onclick]) would otherwise become
       // screen-hogging phantoms. Only a box covering the whole viewport in
@@ -418,23 +385,66 @@ const DOM_QUERY_BODY: &str = r###"(function(){
         culled++;
         return;
       }
-      // Overflow clipping: an element inside a height:0 scroller (Wikipedia
-      // menus) or any overflow:hidden ancestor has boxes but zero visible
-      // area. Intersect up the ancestor chain; fully clipped rows never
-      // become targets.
-      __a = Date.now();
-      var cr = clipRect(el, r);
-      tmC += Date.now() - __a;
-      if (!cr) { skClip++; return; }
-      r = cr;
       cands.push([el, t, ty, r]);
     } catch (e) { skErr++; }
   })(els[i]); }
+  // Pass 1b: boxless triage. display:none subtrees (menus, dialogs) match
+  // the selector but must never reach forcing — and there can be hundreds.
+  // Cheap gates first ([hidden] subtree membership, inline display:none:
+  // property reads, no style resolution); the full verdict walk only for
+  // the remainder. Survivors are forcing candidates (boxless-but-rendered,
+  // e.g. wrapper anchors).
+  var bi;
+  for (bi = 0; bi < boxless.length; bi++) { (function(el, t){
+    try {
+      var gateHidden = false;
+      try { gateHidden = !!(el.hidden || (el.style && el.style.display === 'none') || (el.closest && el.closest('[hidden]'))); } catch (e0) {}
+      var __b = Date.now();
+      var __h = gateHidden || isHidden(el);
+      tmV += Date.now() - __b;
+      if (__h) { skHid++; return; }
+      // Boxless-but-rendered: candidates for forcing.
+      skBox++;
+      var hasKids = false;
+      var hasAnyKid = false;
+      try { hasKids = !!(el.children && el.children.length > 0); } catch (e3) {}
+      try { hasAnyKid = !!el.firstChild; } catch (e4) {}
+      try {
+        if (t === "a") {
+          skBoxA++;
+          if (hasKids) skBoxAWrap++;
+          else if (!hasAnyKid) skBoxAEmpty++;
+          // Remainder (hasAnyKid && !hasKids) = text-only anchors.
+        }
+        if (hasKids) skBoxKid++;
+      } catch (e2) {}
+      // Persistent display forcing: the synchronous set-measure-restore
+      // cycle recovered nothing, so keep the mutation. One shot per
+      // element (repeat sets are no-ops, the guard keeps the census
+      // honest). HTML only: forcing display on SVG-namespace elements
+      // breaks their native layout (observed: dead SVG rendering).
+      // The attribute mutation pings our own observer, which re-pulls:
+      // elements that gain boxes appear as fresh targets, the rest stay
+      // counted here.
+      try {
+        var fid = idFor(el);
+        if (!S.forced) S.forced = {};
+        if (!S.forced[fid]) {
+          S.forced[fid] = 1;
+          if (!el.namespaceURI || el.namespaceURI === 'http://www.w3.org/1999/xhtml') {
+            el.style.setProperty('display', 'block', 'important');
+            skForce++;
+          }
+        }
+      } catch (e6) {}
+    } catch (e) { skErr++; }
+  })(boxless[bi][0], boxless[bi][1]); }
   // Pass 2: cursor cull (500px radius) + directional keep. The live set is
   // what the cursor can actually reach; the nearest target strictly in each
   // direction always survives so arrow-key jumps never strand. No cursor yet
-  // (__sdsc_cc false) keeps everything. Text extraction stays here so culled
-  // rows never pay innerText. Cursor-culled ids ride along in `ccull` so the
+  // (__sdsc_cc false) keeps everything. Verdicts, clip walks, and text
+  // extraction all stay in the emit below so geometrically-culled rows pay
+  // for none of them. Cursor-culled ids ride along in `ccull` so the
   // backend retains them with translated rects instead of churning
   // fresh/drop every pull (the set would never stabilize while scrolling).
   var R2 = 500 * 500;
@@ -474,16 +484,32 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   }
   function emitCand(cc) {
     var el = cc[0];
+    // Verdict LAST: only elements that survived every geometric cull pay
+    // for getComputedStyle. Out-of-range rows keep no verdict either way —
+    // they re-verify on the pull that re-admits them (or hit the warm
+    // cache when the epoch held).
+    var __c = Date.now();
+    var __h = isHidden(el);
+    tmV += Date.now() - __c;
+    if (__h) { skHid++; return; }
+    // Overflow clipping: an element inside a height:0 scroller (Wikipedia
+    // menus) or any overflow:hidden ancestor has boxes but zero visible
+    // area. Intersect up the ancestor chain; fully clipped rows never
+    // become targets.
+    __c = Date.now();
+    var cr = clipRect(el, cc[3]);
+    tmC += Date.now() - __c;
+    if (!cr) { skClip++; return; }
     var role = el.getAttribute ? (el.getAttribute("role") || "").toLowerCase() : "";
     // textContent, not innerText: innerText forces a style-sensitive layout
     // pass per element (death by a thousand reflows in debug builds);
     // textContent is a straight tree walk and hidden subtrees never reach
-    // here (isHidden filtered them first).
+    // here (the verdict above filtered them).
     var txt = "";
     var __a = Date.now();
     try { txt = (el.textContent || "").replace(/\s+/g, " ").slice(0, 40); } catch (e2) {}
     tmT += Date.now() - __a;
-    var r = cc[3];
+    var r = cr;
     out.push([idFor(el), cc[1], role, cc[2], Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height), txt]);
   }
   var sx = 0, sy = 0;
@@ -894,10 +920,12 @@ mod tests {
         assert!(!query.contains("selectNodeContents"));
         assert!(query.contains("setProperty('display', 'block'"));
         assert!(!query.contains("removeProperty"));
-        // Hidden check runs before measuring: subtrees that never render
-        // must never reach forcing, and getComputedStyle is far cheaper
-        // than getClientRects per element.
+        // Measure-first ordering: verdicts (getComputedStyle, ~15ms/call
+        // in debug Servo) run only on geometric-cull survivors and boxless
+        // triage remainders — never on all N candidates up front.
         assert!(query.contains("isHidden(el)"));
+        assert!(query.contains("boxless"));
+        assert!(query.contains("closest('[hidden]')"));
         // Cursor culling: radial keep + directional-next keep, uncensored
         // without a cursor.
         assert!(query.contains("__sdsc_cc=false"));
