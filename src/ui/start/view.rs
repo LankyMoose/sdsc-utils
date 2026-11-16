@@ -1711,9 +1711,9 @@ impl State {
         // so the new order is oriented. Any play-key sequence change counts
         // (reorder or membership); disabled-only refreshes keep keys and stay
         // quiet. Immersive only — the open-path refresh runs while immersive
-        // is still false, so this never fires before `reset_to_games`. Pinned
-        // (`AlwaysOn`) is a no-op show; reduced motion snaps the slide
-        // downstream (the trigger only starts the chase).
+        // is still false, so this never fires before selections resolve.
+        // Re-show is a no-op when pinned (`AlwaysOn`); reduced motion snaps
+        // the slide downstream (the trigger only starts the chase).
         let order_changed = self.rows.len() != rows.len()
             || self
                 .rows
@@ -2982,10 +2982,10 @@ impl State {
 
     /// Begin the process-first Start load ceremony (ambient + dock).
     ///
-    /// Re-shows the position rail: runs after the `reset_to_games` /
-    /// transition-phase clears on the open path, so the rail is up on enter.
-    /// Pinned (`AlwaysOn`) is a no-op show; reduced motion snaps the slide
-    /// downstream (the trigger only starts the chase).
+    /// Re-shows the position rail: runs after the transition-phase clears on
+    /// the open path, so the rail is up on enter. Pinned (`AlwaysOn`) is a
+    /// no-op show; reduced motion snaps the slide downstream (the trigger
+    /// only starts the chase).
     pub fn begin_cold_load(&mut self, now: Instant) {
         self.cold_load_active = true;
         self.cold_ambient_started = None;

@@ -307,9 +307,9 @@ impl App {
             }
         } else if self.launch_selected() {
             self.play_start_cue(UiSoundKind::Action);
-            // A freshly-armed replace confirm stays open on its modal —
-            // closing here would run `reset_to_games()` and wipe it before
-            // its first paint.
+            // A freshly-armed replace confirm stays open on its modal: the
+            // close preserves it now, so this guard only skips the close
+            // while the modal owns the screen — the game already launched.
             if self.start_state.replace_confirm.is_none() {
                 self.close_start_screen()
             } else {
@@ -456,6 +456,20 @@ impl App {
             crate::browser::AppKind::Browser { url: None },
         );
         self.start_state.browser.session.open_surface();
+        self.resume_browser_engine();
+        crate::controller::hid::diag::diag_info("ui-diag: start browser open");
+        Task::none()
+    }
+
+    /// Resume a suspended engine under an open browser surface. Close
+    /// suspends but keeps the cached page, so reopening Start (or the
+    /// surface) resumes where it left off: un-suspend, re-show, and re-sync
+    /// the mouse, since hover state went stale while suspended. No-op
+    /// unless the surface is open.
+    pub(crate) fn resume_browser_engine(&mut self) {
+        if !self.start_state.browser.session.is_open() {
+            return;
+        }
         if let Some(engine) = &self.engine {
             engine.send(EngineCommand::Resume);
             engine.send(EngineCommand::SetVisible { visible: true });
@@ -470,8 +484,6 @@ impl App {
             ));
         }
         self.sync_browser_theme();
-        crate::controller::hid::diag::diag_info("ui-diag: start browser open");
-        Task::none()
     }
 
     pub(crate) fn close_browser_surface(&mut self) -> Task<Message> {
@@ -2019,8 +2031,11 @@ impl App {
             self.note_start_activity();
         }
 
-        // Reopen chord while open is swallowed (PS opens when closed).
-        self.swallow_reopen_chord_while_open(readings);
+        // PS while open toggles Start closed (PS opens when closed); a close
+        // task preempts pad nav for this tick.
+        if let Some(task) = self.toggle_start_on_reopen_chord(readings) {
+            return task;
+        }
 
         // Debug R3: hide/show all chrome while tuning (pad-only; R3 carries
         // no NavAction). Tuning-scoped, so it never fires in normal chrome.
@@ -2463,15 +2478,29 @@ impl App {
         }
     }
 
-    /// Rising-edge reopen chord while Start is open is swallowed (PS opens when
-    /// closed). Still consumes the sticky hold through the release gate so the
-    /// opening press cannot immediately re-fire.
-    pub(crate) fn swallow_reopen_chord_while_open(&mut self, readings: &[start_input::NavReading]) {
+    /// Rising-edge reopen chord while Start is open closes it (PS toggles:
+    /// opens when closed). True modals (replace/edit/manual dialogs, open or
+    /// animating settings, ambient tuning) keep the old swallow so PS can't
+    /// strand them mid-dialog. A lone open browser surface does NOT block:
+    /// close suspends the engine with the page cached and reopening resumes
+    /// it, so the toggle works mid-browse with nothing lost. Still consumes
+    /// the sticky hold through the release gate so the opening press cannot
+    /// immediately re-fire.
+    pub(crate) fn toggle_start_on_reopen_chord(
+        &mut self,
+        readings: &[start_input::NavReading],
+    ) -> Option<Task<Message>> {
         if !self.start_visible || readings.is_empty() {
-            return;
+            return None;
         }
-        if self.start_state.overlay_blocking() {
-            return;
+        let modal_blocking = self.start_state.replace_confirm.is_some()
+            || self.start_state.manual_add.is_some()
+            || self.start_state.edit_confirm.is_some()
+            || self.start_state.settings.open
+            || self.start_state.settings.anim.is_some()
+            || self.start_state.ambient_tuning_active();
+        if modal_blocking {
+            return None;
         }
         let required = gesture::default_gesture();
         let chord_held = chord_held_on_any_pad(&required, readings);
@@ -2485,9 +2514,16 @@ impl App {
                 if chord_held {
                     self.gesture_detectors.consume_pending_match(readings);
                 }
+                None
             }
-            ChordReleaseTick::Cleared | ChordReleaseTick::Open => {
+            ChordReleaseTick::Cleared => {
+                // Absent sample disarms detectors; next held rising edge may fire.
                 let _ = self.gesture_detectors.update(&required, readings);
+                None
+            }
+            ChordReleaseTick::Open => {
+                crate::controller::hid::diag::diag_info("ui-diag: reopen gesture toggle close");
+                Some(self.close_start_screen())
             }
         }
     }
@@ -3573,10 +3609,8 @@ impl App {
 
     /// Reopen to a consumed restart record (renderer-pref restart only).
     /// Settings state restores FIRST, before any window opens or list
-    /// rebuilds: the Start open path resets nav state (`reset_to_games`),
-    /// which would wipe restored drawer/scroll/selection state. The restore
-    /// open bypasses that reset (see `restore_preserve_nav`) and resolves
-    /// selections from the shadow keys instead. Scroll offsets land on
+    /// rebuilds; the restore open resolves selections from the shadow keys
+    /// instead (see `restore_preserve_nav`). Scroll offsets land on
     /// `StartOpened`/`ConfigureOpened`, when the scrollables exist.
     pub(crate) fn apply_restart_ui(
         &mut self,
@@ -3660,17 +3694,14 @@ impl App {
         }
         // An explicit open wins over a pending deferred destroy.
         self.start_close_armed = false;
-        self.start_state.editing = false;
-        self.start_state.edit_anchor_play_key = None;
-        self.start_state.clear_edit_confirm();
-        self.edit_draft = None;
+        // Edit state (editing mode, drafts, confirms) survives closes like
+        // everything else: PS toggles never wipe in-progress work.
         self.refresh_start_rows();
         self.refresh_start_controllers();
 
-        // Restore opens bypass the nav reset: reload restore already set
-        // drawer/scroll/selection state above, and `reset_to_games` would
-        // wipe it (drawer close, scroll zero, selections zeroed). Pad nav
-        // arming still runs either way.
+        // Restore opens resolve from the shadow keys: reload restore already
+        // set drawer/scroll/selection state above. Pad nav arming still runs
+        // either way; no visual state is ever reset on open anymore.
         if std::mem::take(&mut self.restore_preserve_nav) {
             self.pad_nav.prepare_on_open(false);
         } else {
@@ -3827,9 +3858,10 @@ impl App {
         }
     }
 
-    /// Reset to Games and (optionally) require a full control release before nav fires.
+    /// Re-arm pad nav for an open: selection, drawer, scrolls and drafts all
+    /// survive closes now (PS toggles; every close preserves state), so this
+    /// only re-arms input, it never resets visual state.
     pub(crate) fn prepare_start_nav_on_open(&mut self, arm_immediately: bool) {
-        self.start_state.reset_to_games();
         self.pad_nav.prepare_on_open(arm_immediately);
         self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
@@ -4007,17 +4039,11 @@ impl App {
         self.confirm_key_held = false;
         self.cancel_key_held = false;
         self.pad_held = FaceHeld::default();
-        // Visual state (selection, dock, drawer, scrolls, edit draft) resets
-        // in `on_window_closed`, once the HWND is actually gone. Resetting
-        // here would repaint one frame with `game_selected = 0` before the
-        // hide+close lands — a visible selection jump on every close.
-        // No window (never opened / already destroyed): no WindowClosed will
-        // follow, so reset synchronously.
-        if self.start_window.is_none() {
-            self.start_state.clear_immersive_session();
-            self.start_state.reset_to_games();
-            self.discard_edit_draft();
-        }
+        // Visual state (selection, dock, drawer, scrolls, edit draft) is
+        // never reset on close anymore: every close preserves state and the
+        // next open resumes where it left off (see `toggle_start_on_reopen_chord`).
+        // No window (never opened / already destroyed): nothing to do —
+        // there is no teardown pending and no reset to run.
         self.clear_start_nav_diag();
         // Focus-close often leaves the reopen chord held (e.g. PS); latch until
         // a debounced full release so the next PadPoll cannot immediately reopen.

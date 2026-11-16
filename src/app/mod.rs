@@ -580,9 +580,10 @@ pub struct App {
     /// Reload button pressed, restart due after a short feedback delay.
     /// Disables the button and spins both reload buttons until exit.
     renderer_reload_queued: bool,
-    /// One-shot nav-reset bypass for the next `open_start_screen`. Reload
-    /// restore sets all UI state (drawer, scrolls, selections) BEFORE
-    /// opening; the open path must not `reset_to_games()` it away.
+    /// One-shot pad-nav arming variant for the next `open_start_screen`.
+    /// Reload restore sets all UI state (drawer, scrolls, selections) BEFORE
+    /// opening; the restore open takes this path instead of the standard
+    /// prepare (see `apply_restart_ui`).
     restore_preserve_nav: bool,
     /// Saved settings-drawer offset to re-apply on `StartOpened`, when the
     /// scrollable exists. One-shot per window open and never re-asserted.
@@ -1600,13 +1601,11 @@ impl App {
             self.start_visible = false;
             self.start_close_armed = false;
             self.start_nav_ready = false;
-            // Deferred close teardown: visual state reset here, once the HWND
-            // is actually gone, so no reset frame paints before destroy (see
-            // `close_start_screen`). Also covers the OS-close path, which
+            // Close preserves all visual state (selection, dock, drawer,
+            // scrolls, drafts, browser panel): the next open resumes where
+            // it left off. Only the cursor-restore backstop and input
+            // re-arming run here. Also covers the OS-close path, which
             // bypasses `close_start_screen` entirely.
-            self.start_state.clear_immersive_session();
-            self.start_state.reset_to_games();
-            self.discard_edit_draft();
             // Defensive: an OS-close path bypasses close_start_screen's
             // clear_start_activity, so never leak a Hidden interaction into
             // a later window (the force_cursor gate above is the backstop).
@@ -1686,7 +1685,16 @@ impl App {
             // before art kicks and scan below.
             if let Some(settings_y) = self.pending_settings_scroll.take() {
                 task = task.chain(self.restore_settings_scroll(settings_y));
+            } else if self.start_state.settings.open {
+                // Warm reopen under an open settings drawer: the fresh
+                // scrollable mounts at 0, so re-apply the tracked offset
+                // (closes preserve it now; restarts use the pending path).
+                let settings_y = self.start_state.settings.scroll_y;
+                task = task.chain(self.restore_settings_scroll(settings_y));
             }
+            // Reopened Start under an open browser surface: close suspends
+            // the engine but keeps the cached page, so resume here.
+            self.resume_browser_engine();
             // Re-show the position rail on every open.
             // Warm opens skip begin_cold_load; cold opens refresh
             // the hide clock to visible time. Pinned is a no-op.
