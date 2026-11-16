@@ -82,6 +82,13 @@ struct Shared {
     /// driven scrolls (anchors, JS) are invisible to us and self-heal only
     /// via fresh bounds — a known gap.
     scroll: (f32, f32),
+    /// Highest scroll truth this document ever reported (snapshot `sx/sy`,
+    /// ping `wx/wy`), per axis, monotonically growing. Bounds commanded
+    /// accumulation: at the page end the truth pins, so translations stop
+    /// instead of sailing past into the void. Truth always proves
+    /// reachability, so legitimate scrolling can never block — the bound
+    /// only ever grows. Reset on document change, like `scroll`.
+    scroll_max: (f32, f32),
     /// Stable numeric ids for live DOM targets (the UI keys attachments
     /// by u64). Never reused within a document; cleared on document change.
     next_id: u64,
@@ -310,7 +317,9 @@ impl WebViewDelegate for Delegate {
         // reverts any commanded accumulation the inner scroller absorbed —
         // outlines stop tracking a scroll the page never made.
         if let Some(truth) = parse_ping_scroll(&url) {
-            rebase_scroll(&mut self.shared.borrow_mut(), truth);
+            let mut state = self.shared.borrow_mut();
+            note_scroll_truth(&mut state.scroll_max, truth);
+            rebase_scroll(&mut state, truth);
         }
         let response = url
             .parse()
@@ -521,6 +530,7 @@ fn run(
         visible: false,
         suspended: true,
         scroll: (0.0, 0.0),
+        scroll_max: (0.0, 0.0),
         last_sent_scroll: (0.0, 0.0),
         next_id: 0,
         dom: HashMap::new(),
@@ -861,6 +871,8 @@ fn clear_tree(state: &mut Shared) {
     state.dom_ping = false;
     state.last_pull_at = None;
     state.last_pull_rtt_ms = 0;
+    // Truth bound resets with the document (see `scroll_max`).
+    state.scroll_max = (0.0, 0.0);
     if state.scroll != (0.0, 0.0) {
         state.scroll = (0.0, 0.0);
         state.last_sent_scroll = (0.0, 0.0);
@@ -1147,6 +1159,10 @@ fn flush_pending_up(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
 fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128, skip_rebase: bool) {
     use std::collections::HashSet;
     let snap = parse_dom_snapshot(value);
+    // The snapshot's own truth counts as observed even when the rebase is
+    // skipped (a newer ping already applied): it is still a position the
+    // page proved reachable, so it feeds the commanded-lead bound.
+    note_scroll_truth(&mut state.scroll_max, snap.scroll);
     // Tracked offset before the snapshot truth is applied: logged alongside
     // the snapshot's own truth so stale-box reports can separate "snapshot
     // measured old truth" from "rebase yanked backwards".
@@ -1329,10 +1345,32 @@ fn parse_ping_scroll(url: &str) -> Option<(f32, f32)> {
     Some((wx?, wy?))
 }
 
+/// Record observed scroll truth toward the per-document maximum (see
+/// `Shared::scroll_max`). Every observation — ping `wx/wy`, snapshot `sx/sy`
+/// — is a position the page proved reachable, so the running maximum is
+/// always a safe upper bound for commanded accumulation.
+fn note_scroll_truth(scroll_max: &mut (f32, f32), truth: (f32, f32)) {
+    scroll_max.0 = scroll_max.0.max(truth.0);
+    scroll_max.1 = scroll_max.1.max(truth.1);
+}
+
+/// Bound a commanded scroll offset by the highest truth this document ever
+/// reported, plus one viewport of exploration slop. At the page end the
+/// truth pins and translations stop instead of sailing past into the void.
+/// (Extent alone can't do this — virtualized filler overstates it.)
+fn bound_commanded(scroll: (f32, f32), scroll_max: (f32, f32)) -> (f32, f32) {
+    (
+        scroll.0.min(scroll_max.0 + VIEWPORT_WIDTH as f32),
+        scroll.1.min(scroll_max.1 + VIEWPORT_HEIGHT as f32),
+    )
+}
+
 /// Update the tracked scroll offset and report it when it moves, so the UI
 /// overlay can correlate cursor against targets.
 fn set_scroll(state: &mut Shared, scroll: (f32, f32)) {
-    let clamped = clamp_scroll(scroll, state.content);
+    // Commanded lead is bounded by observed truth (see `bound_commanded`).
+    let bounded = bound_commanded(scroll, state.scroll_max);
+    let clamped = clamp_scroll(bounded, state.content);
     if state.scroll == clamped {
         return;
     }
@@ -1431,6 +1469,31 @@ mod tests {
         assert_eq!(clamp_scroll((0.0, 2573.0), content), (0.0, 1881.0));
         assert_eq!(clamp_scroll((-225.0, 100.0), content), (0.0, 100.0));
         assert_eq!(clamp_scroll((0.0, 1881.0), content), (0.0, 1881.0));
+    }
+
+    #[test]
+    fn scroll_truth_max_grows_monotonically() {
+        let mut max = (0.0, 0.0);
+        note_scroll_truth(&mut max, (0.0, 500.0));
+        assert_eq!(max, (0.0, 500.0));
+        // scrolling back up never lowers the proven-reachable bound.
+        note_scroll_truth(&mut max, (0.0, 200.0));
+        assert_eq!(max, (0.0, 500.0));
+        // infinite scroll grows it again.
+        note_scroll_truth(&mut max, (30.0, 900.0));
+        assert_eq!(max, (30.0, 900.0));
+    }
+
+    #[test]
+    fn commanded_lead_bounded_by_truth_plus_viewport() {
+        // Within one viewport of proven truth: untouched.
+        assert_eq!(bound_commanded((0.0, 1500.0), (0.0, 1000.0)), (0.0, 1500.0));
+        // Past the end the page proved: pinned to truth + viewport.
+        assert_eq!(bound_commanded((0.0, 5000.0), (0.0, 1000.0)), (0.0, 1600.0));
+        assert_eq!(bound_commanded((5000.0, 0.0), (0.0, 0.0)), (800.0, 0.0));
+        // Fresh document (no truth yet): one viewport of exploration.
+        assert_eq!(bound_commanded((0.0, 599.0), (0.0, 0.0)), (0.0, 599.0));
+        assert_eq!(bound_commanded((0.0, 601.0), (0.0, 0.0)), (0.0, 600.0));
     }
 
     #[test]
