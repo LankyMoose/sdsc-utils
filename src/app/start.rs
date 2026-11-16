@@ -100,6 +100,10 @@ impl App {
             }
             StartMessage::BrowserOpenExternal => self.on_browser_open_external(),
             StartMessage::BrowserReload => self.on_browser_reload(),
+            // Overlay is a debug-only tool (F10 path is gated the same way):
+            // release builds keep the message variant (the card button is
+            // compiled out there too) but never set the flag.
+            #[cfg(debug_assertions)]
             StartMessage::BrowserToggleOverlay => {
                 self.debug_browser = !self.debug_browser;
                 self.start_state.browser.debug_overlay = self.debug_browser;
@@ -109,6 +113,8 @@ impl App {
                 ));
                 Task::none()
             }
+            #[cfg(not(debug_assertions))]
+            StartMessage::BrowserToggleOverlay => Task::none(),
             StartMessage::BrowserToggleJsClick => {
                 self.start_state.browser.js_click = !self.start_state.browser.js_click;
                 crate::platform::app_log::info(format!(

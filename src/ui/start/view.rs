@@ -1124,43 +1124,55 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         browser_page_view(state, img_w),
         browser_debug_line(panel),
         space().height(8),
-        row![
-            button(text("Reload").size(14.0))
+        // Card action row: the overlay toggle is debug-only (mirrors the
+        // gated F10 path) and compiled out of release builds; JS-click is
+        // real functionality and ships everywhere.
+        {
+            let mut actions = row![
+                button(text("Reload").size(14.0))
+                    .padding([6, 14])
+                    .on_press(StartMessage::BrowserReload)
+                    .style(theme::ghost),
+                button(text("Open in system browser").size(14.0))
+                    .padding([6, 14])
+                    .on_press(StartMessage::BrowserOpenExternal)
+                    .style(theme::ghost),
+                button(text("Close").size(14.0))
+                    .padding([6, 14])
+                    .on_press(StartMessage::ToggleBrowser)
+                    .style(theme::ghost),
+            ];
+            #[cfg(debug_assertions)]
+            {
+                actions = actions.push(
+                    button(
+                        text(if panel.debug_overlay {
+                            "Overlay: on"
+                        } else {
+                            "Overlay: off"
+                        })
+                        .size(14.0),
+                    )
+                    .padding([6, 14])
+                    .on_press(StartMessage::BrowserToggleOverlay)
+                    .style(theme::ghost),
+                );
+            }
+            actions = actions.push(
+                button(
+                    text(if panel.js_click {
+                        "JS click: on"
+                    } else {
+                        "JS click: off"
+                    })
+                    .size(14.0),
+                )
                 .padding([6, 14])
-                .on_press(StartMessage::BrowserReload)
+                .on_press(StartMessage::BrowserToggleJsClick)
                 .style(theme::ghost),
-            button(text("Open in system browser").size(14.0))
-                .padding([6, 14])
-                .on_press(StartMessage::BrowserOpenExternal)
-                .style(theme::ghost),
-            button(text("Close").size(14.0))
-                .padding([6, 14])
-                .on_press(StartMessage::ToggleBrowser)
-                .style(theme::ghost),
-            button(
-                text(if panel.debug_overlay {
-                    "Overlay: on"
-                } else {
-                    "Overlay: off"
-                })
-                .size(14.0),
-            )
-            .padding([6, 14])
-            .on_press(StartMessage::BrowserToggleOverlay)
-            .style(theme::ghost),
-            button(
-                text(if panel.js_click {
-                    "JS click: on"
-                } else {
-                    "JS click: off"
-                })
-                .size(14.0),
-            )
-            .padding([6, 14])
-            .on_press(StartMessage::BrowserToggleJsClick)
-            .style(theme::ghost),
-        ]
-        .spacing(10),
+            );
+            actions.spacing(10)
+        },
         action_cluster(
             &[
                 face_hint(
