@@ -95,14 +95,22 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
     var root = document.documentElement;
     if (!root) { setTimeout(arm, 500); return; }
     try {
-      // Classify records: attribute mutations (class/style/hidden) can
-      // hide/show an element and all its descendants, invalidating cached
-      // visibility verdicts (backend tag 'ma'). Insert/remove/text changes
-      // ('mc') can't affect surviving nodes' verdicts — new nodes miss the
-      // cache and compute fresh — so they re-query without invalidating.
+      // Classify records: only attribute mutations that can flip a
+      // visibility verdict invalidate the cache (backend tag 'ma'):
+      // `class`/`style`/`hidden` drive the selectors and inline styles the
+      // verdict walk reads. Any other attribute (data-*, aria-*, jsaction
+      // churn Google fires constantly) can't change display/visibility/
+      // opacity in practice, so it re-queries for fresh boxes ('mc') without
+      // invalidating survivors' verdicts. Insert/remove/text ('mc') can't
+      // affect surviving nodes either — new nodes miss the cache and
+      // compute fresh.
       new MutationObserver(function(recs){
         var attr = false;
-        try { for (var i = 0; i < recs.length; i++) { if (recs[i].type === 'attributes') { attr = true; break; } } } catch (e) {}
+        try { for (var i = 0; i < recs.length; i++) {
+          if (recs[i].type !== 'attributes') continue;
+          var an = recs[i].attributeName;
+          if (!an || an === 'class' || an === 'style' || an === 'hidden') { attr = true; break; }
+        } } catch (e) {}
         onMut(attr ? 'ma' : 'mc');
       }).observe(root, {subtree:true, childList:true, attributes:true, characterData:true});
     } catch (e) {}
@@ -906,6 +914,9 @@ mod tests {
         assert!(DOM_INSTALL_JS.contains("'mc'"));
         assert!(DOM_INSTALL_JS.contains("'sc'"));
         assert!(DOM_INSTALL_JS.contains("pendingEv"));
+        // Invalidation is name-filtered: only class/style/hidden (or
+        // unknown) attributes escalate to 'ma'.
+        assert!(DOM_INSTALL_JS.contains("attributeName"));
         assert!(dom_query_js(Some((100.0, 200.0)), 7).contains("__sdsc_cx=100"));
         assert!(dom_query_js(Some((100.0, 200.0)), 7).contains("__sdsc_v=7"));
         // Boot = install + snapshot in one round-trip.
