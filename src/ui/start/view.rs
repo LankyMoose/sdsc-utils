@@ -807,6 +807,11 @@ pub struct BrowserPanel {
     pub last_dock_change: Option<Instant>,
     /// Last click point + time, for the R3 issue-flag correlation.
     pub last_click: Option<((f32, f32), Instant)>,
+    /// Transient action hint shown in the card header ("Opening link…"):
+    /// instant feedback that a click landed, so a slow-or-dead page reads
+    /// as such instead of a dropped input. Superseded by Loading…/Error,
+    /// expires after a few seconds.
+    pub action_hint: Option<(String, Instant)>,
     /// R3 rising-edge latch for the issue flag (R3 carries no NavAction).
     pub r3_latched: bool,
     /// Last sent mouse position (quantized px), so the pad cursor streams
@@ -1067,6 +1072,14 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         "Loading…".to_string()
     } else if let Some(err) = session.error() {
         format!("Error: {err}")
+    } else if let Some((hint, at)) = &panel.action_hint {
+        if at.elapsed() < Duration::from_secs(4) {
+            hint.clone()
+        } else if session.has_content() {
+            session.title().unwrap_or_else(|| session.url()).to_string()
+        } else {
+            String::new()
+        }
     } else if session.has_content() {
         session.title().unwrap_or_else(|| session.url()).to_string()
     } else if state.browser_engine {

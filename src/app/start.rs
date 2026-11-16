@@ -806,7 +806,24 @@ impl App {
             let (x, y) = panel.cursor.click_point(&panel.focusables);
             (x, y, panel.cursor.attached)
         };
+        // Instant header feedback ("Opening link…"): the click is
+        // acknowledged now; the page changing (or not) tells the rest.
+        let label = match target.and_then(|id| {
+            self.start_state
+                .browser
+                .focusables
+                .iter()
+                .find(|o| o.id == id)
+        }) {
+            Some(o) => match o.kind {
+                crate::browser::cursor::FocusKind::Link => "Opening link…",
+                crate::browser::cursor::FocusKind::Field => "Focusing field…",
+                _ => "Activating…",
+            },
+            None => "Clicking…",
+        };
         self.start_state.browser.last_click = Some(((x, y), Instant::now()));
+        self.start_state.browser.action_hint = Some((label.to_string(), Instant::now()));
         if let Some(engine) = &self.engine {
             engine.send(EngineCommand::ClickAt { x, y, target });
         }

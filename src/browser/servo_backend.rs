@@ -104,6 +104,12 @@ struct Shared {
     dom_in_flight_at: Option<Instant>,
     dom_tx: mpsc::Sender<DomIngest>,
     dom_rx: Option<mpsc::Receiver<DomIngest>>,
+    /// Last completed pull (time + round-trip ms). The next pull waits at
+    /// least the last round-trip (floor 300ms): slow pulls back off instead
+    /// of saturating the script thread, which would stall input dispatch
+    /// and page JS behind our own queries.
+    last_pull_at: Option<Instant>,
+    last_pull_rtt_ms: u64,
     /// Last cursor position seen via MouseMove (viewport px). Drives the
     /// per-pull cursor cull and re-seeds it when the cursor travels.
     last_mouse: Option<(f32, f32)>,
@@ -365,6 +371,11 @@ type DomIngest = (u64, Instant, Result<JSValue, String>);
 /// from the last pull center, the live set no longer covers the cursor.
 const DOM_CULL_RESEED_DIST: f32 = 300.0;
 
+/// Minimum gap between pulls (healthy pages): the settle window already
+/// paces those. Above it, the gap tracks the last round-trip so sick
+/// pages back off instead of saturating the script thread.
+const DOM_MIN_PULL_GAP: Duration = Duration::from_millis(300);
+
 /// Consecutive missed polls before a DOM target is dropped.
 const DOM_MISSED_LIMIT: u8 = 2;
 /// Give up waiting on a DOM round-trip and allow the next poll.
@@ -480,6 +491,8 @@ fn run(
         dom_in_flight_at: None,
         dom_tx,
         dom_rx: Some(dom_rx),
+        last_pull_at: None,
+        last_pull_rtt_ms: 0,
         last_mouse: None,
         last_cull_center: None,
         pending_inputs: VecDeque::with_capacity(64),
@@ -768,6 +781,8 @@ fn clear_tree(state: &mut Shared) {
     state.dom_dirty = false;
     state.dom_dirty_at = None;
     state.dom_ping = false;
+    state.last_pull_at = None;
+    state.last_pull_rtt_ms = 0;
     if state.scroll != (0.0, 0.0) {
         state.scroll = (0.0, 0.0);
         state.last_sent_scroll = (0.0, 0.0);
@@ -844,6 +859,15 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
         if !boot && !settled {
             return;
         }
+        // Adaptive cooldown: never pull sooner than the last round-trip
+        // took (300ms floor). Boot bypasses it — a fresh document needs
+        // its first snapshot promptly.
+        if !boot && let Some(last) = state.last_pull_at {
+            let gap = DOM_MIN_PULL_GAP.max(Duration::from_millis(state.last_pull_rtt_ms));
+            if now.saturating_duration_since(last) < gap {
+                return;
+            }
+        }
         // Reserve the sequence first so a racing callback can't interleave.
         state.dom_seq = state.dom_seq.wrapping_add(1);
         let seq = state.dom_seq;
@@ -852,6 +876,7 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
         state.dom_boot = false;
         state.dom_dirty = false;
         state.dom_dirty_at = None;
+        state.last_pull_at = Some(now);
         let pinged = std::mem::take(&mut state.dom_ping);
         let center = state.last_mouse;
         state.last_cull_center = center;
@@ -897,6 +922,7 @@ fn drain_dom_results(shared: &Rc<RefCell<Shared>>) {
         state.dom_in_flight = false;
         state.dom_in_flight_at = None;
         let rtt = dispatched.elapsed().as_millis();
+        state.last_pull_rtt_ms = rtt.min(u64::MAX as u128) as u64;
         match result {
             Ok(value) => {
                 ingest_dom(&mut state, &value, rtt);
