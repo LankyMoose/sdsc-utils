@@ -166,6 +166,12 @@ struct Shared {
     /// Verbose per-target DOM diagnostics (`SDSC_AX_DEBUG=1`): js id, kind,
     /// and rect for every freshly mapped target.
     ax_debug: bool,
+    /// Debug-only storage spike probe: set on load-complete, consumed when
+    /// the one-shot census eval dispatches; the reply channel below.
+    #[cfg(debug_assertions)]
+    storage_probe_pending: bool,
+    #[cfg(debug_assertions)]
+    storage_probe_rx: Option<mpsc::Receiver<Result<JSValue, String>>>,
 }
 
 struct Delegate {
@@ -252,6 +258,12 @@ impl WebViewDelegate for Delegate {
                 // snapshot) once rendering lands. New load, new verdicts.
                 shared.dom_boot = true;
                 shared.dom_epoch = shared.dom_epoch.wrapping_add(1);
+                // Debug-only storage spike diagnostic: one in-page
+                // localStorage/sessionStorage/cookie census per document.
+                #[cfg(debug_assertions)]
+                {
+                    shared.storage_probe_pending = true;
+                }
                 let generation = shared.generation;
                 shared.handle.emit(EngineEvent::LoadFinished {
                     generation,
@@ -571,6 +583,10 @@ fn run(
         dom_rx: Some(dom_rx),
         dom_epoch: 0,
         ping_at: None,
+        #[cfg(debug_assertions)]
+        storage_probe_pending: false,
+        #[cfg(debug_assertions)]
+        storage_probe_rx: None,
         spin_seq: 0,
         pending_click_up: None,
         last_pull_at: None,
@@ -642,6 +658,8 @@ fn run(
             drain_dom_results(&shared);
             maybe_pull_dom(&webview, &shared);
             poll_probe(&webview, &shared);
+            #[cfg(debug_assertions)]
+            maybe_probe_storage(&webview, &shared);
             std::thread::sleep(if suspended { SUSPENDED_IDLE } else { SPIN_IDLE });
         }
     }
@@ -898,6 +916,12 @@ fn clear_tree(state: &mut Shared) {
     state.last_pull_rtt_ms = 0;
     // Truth bound resets with the document (see `scroll_max`).
     state.scroll_max = (0.0, 0.0);
+    // Stale probe reply can never match this document; re-armed per load.
+    #[cfg(debug_assertions)]
+    {
+        state.storage_probe_pending = false;
+        state.storage_probe_rx = None;
+    }
     if state.scroll != (0.0, 0.0) {
         state.scroll = (0.0, 0.0);
         state.last_sent_scroll = (0.0, 0.0);
@@ -1066,6 +1090,51 @@ fn track_input(shared: &Rc<RefCell<Shared>>, id: InputEventId, kind: &'static st
         state.pending_inputs.pop_front();
     }
     state.pending_inputs.push_back((id, kind, Instant::now()));
+}
+
+/// Debug-only storage spike diagnostic: one-shot in-page census per
+/// document (localStorage/sessionStorage sizes, probe-key round-trip,
+/// cookie count — key names truncated, values never read). Dispatched when
+/// the load-complete arm fires, drained below; logged once then forgotten.
+#[cfg(debug_assertions)]
+fn maybe_probe_storage(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
+    let msg = shared
+        .borrow_mut()
+        .storage_probe_rx
+        .as_mut()
+        .and_then(|rx| rx.try_recv().ok());
+    if let Some(result) = msg {
+        shared.borrow_mut().storage_probe_rx = None;
+        let rendered: String = match result {
+            Ok(JSValue::String(s)) => s.chars().take(300).collect(),
+            Ok(other) => format!("non-string:{other:?}").chars().take(300).collect(),
+            Err(err) => format!("eval-failed:{err}").chars().take(300).collect(),
+        };
+        let url = shared
+            .borrow()
+            .last_url
+            .clone()
+            .unwrap_or_else(|| "?".to_string());
+        crate::platform::app_log::info(format!("servo-dom: storage probe url={url} {rendered}"));
+        return;
+    }
+    if shared.borrow().storage_probe_rx.is_some() {
+        return;
+    }
+    let mut state = shared.borrow_mut();
+    if !state.storage_probe_pending {
+        return;
+    }
+    state.storage_probe_pending = false;
+    let (tx, rx) = mpsc::channel();
+    state.storage_probe_rx = Some(rx);
+    drop(state);
+    webview.evaluate_javascript(
+        crate::browser::dom::STORAGE_PROBE_JS.to_string(),
+        move |result| {
+            let _ = tx.send(result.map_err(|e| format!("{e:?}")));
+        },
+    );
 }
 
 /// Drain one-shot event-loop probe results and drive its two phases:

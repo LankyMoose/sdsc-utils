@@ -160,6 +160,33 @@ pub const PROBE_ARM_JS: &str = r###"(function(){
 /// `[-1,-1,-1]` when the arm never ran.
 pub const PROBE_READ_JS: &str = r###"(function(){var l=window.__sdsc_loop;if(!l)return[-1,-1,-1];return[l.timer?1:0,l.raf?1:0,l.io?1:0]})()"###;
 
+/// Debug-only storage spike census (see `maybe_probe_storage`): reports
+/// localStorage/sessionStorage sizes, a probe-key write/read/delete
+/// round-trip, and the cookie count. Key names truncated to 40 chars for
+/// the log; VALUES NEVER LEAVE THE PAGE (only lengths and the probe key's
+/// own marker round-trip).
+pub const STORAGE_PROBE_JS: &str = r###"(function(){
+  var r = {lsLen: -1, lsKeys: [], roundTrip: 'skip', ssLen: -1, cookies: -1};
+  try { r.lsLen = window.localStorage.length; } catch (e) { r.lsLen = -2; }
+  try {
+    var ks = [];
+    for (var i = 0; i < window.localStorage.length && i < 10; i++) {
+      var k = window.localStorage.key(i);
+      ks.push(k === null ? 'null' : String(k).slice(0, 40));
+    }
+    r.lsKeys = ks;
+  } catch (e) {}
+  try {
+    window.localStorage.setItem('__sdsc_probe', '1');
+    var v = window.localStorage.getItem('__sdsc_probe');
+    window.localStorage.removeItem('__sdsc_probe');
+    r.roundTrip = (v === '1') ? 'ok' : ('mismatch:' + v);
+  } catch (e) { r.roundTrip = 'threw:' + (e && e.name ? e.name : e); }
+  try { r.ssLen = window.sessionStorage.length; } catch (e2) { r.ssLen = -2; }
+  try { var c = document.cookie || ''; r.cookies = c ? c.split(';').length : 0; } catch (e3) {}
+  return JSON.stringify(r);
+})()"###;
+
 /// Parse a [`PROBE_READ_JS`] result. `None` on malformed shapes or when the
 /// arm never ran (page navigated away mid-probe).
 pub fn parse_loop_probe(value: &embedder_traits::JSValue) -> Option<[bool; 3]> {
@@ -970,6 +997,19 @@ mod tests {
         assert_eq!(parse_loop_probe(&unarmed), None);
         let short = JSValue::Array(vec![JSValue::Number(1.0)]);
         assert_eq!(parse_loop_probe(&short), None);
+    }
+
+    #[test]
+    fn storage_probe_reports_counts_not_values() {
+        // Census only: sizes, truncated key names, probe-key round-trip,
+        // cookie count. Values must never be serialized out of the page.
+        assert!(STORAGE_PROBE_JS.contains("localStorage"));
+        assert!(STORAGE_PROBE_JS.contains("sessionStorage"));
+        assert!(STORAGE_PROBE_JS.contains("document.cookie"));
+        assert!(STORAGE_PROBE_JS.contains("__sdsc_probe"));
+        assert!(STORAGE_PROBE_JS.contains("JSON.stringify"));
+        // No wholesale value dump: the only getItem reads the probe's own key.
+        assert_eq!(STORAGE_PROBE_JS.matches("getItem").count(), 1);
     }
 
     #[test]
