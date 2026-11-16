@@ -64,7 +64,7 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
     } catch (e) { return 'threw:' + (e && e.message ? e.message : e); }
   };
   var PING = 'http://sdsc.invalid/__SDSC_DOM_DIRTY';
-  var lastPing = 0, trailing = null;
+  var lastPing = 0, trailing = null, pendingEv = null;
   var SUPPRESS = 500, TRAIL = 250;
   function fire(src){
     lastPing = Date.now();
@@ -79,25 +79,43 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
     try { fetch(PING + '?wx=' + wx + '&wy=' + wy + '&ev=' + src, {method:'POST', mode:'no-cors', keepalive:true, body:'1'}).catch(function(){}); } catch (e) {}
   }
   function onMut(ev) {
-    ev = ev || 'mo';
+    ev = ev || 'mc';
+    // Escalate: a trailing 'mc' must not swallow a later 'ma' — an
+    // attribute change hiding elements would otherwise keep stale
+    // visible verdicts until the next invalidating ping.
+    if (ev === 'ma') pendingEv = 'ma';
+    else if (!pendingEv) pendingEv = ev;
     var now = Date.now();
-    if (now - lastPing >= SUPPRESS && !trailing) { fire(ev); }
+    if (now - lastPing >= SUPPRESS && !trailing) { var e = pendingEv; pendingEv = null; fire(e); }
     else if (!trailing) {
-      trailing = setTimeout(function(){ trailing = null; fire(ev); }, TRAIL);
+      trailing = setTimeout(function(){ trailing = null; var e2 = pendingEv; pendingEv = null; fire(e2); }, TRAIL);
     }
   }
   function arm(){
     var root = document.documentElement;
     if (!root) { setTimeout(arm, 500); return; }
     try {
-      new MutationObserver(function(){ onMut('mo'); }).observe(root, {subtree:true, childList:true, attributes:true, characterData:true});
+      // Classify records: attribute mutations (class/style/hidden) can
+      // hide/show an element and all its descendants, invalidating cached
+      // visibility verdicts (backend tag 'ma'). Insert/remove/text changes
+      // ('mc') can't affect surviving nodes' verdicts — new nodes miss the
+      // cache and compute fresh — so they re-query without invalidating.
+      new MutationObserver(function(recs){
+        var attr = false;
+        try { for (var i = 0; i < recs.length; i++) { if (recs[i].type === 'attributes') { attr = true; break; } } } catch (e) {}
+        onMut(attr ? 'ma' : 'mc');
+      }).observe(root, {subtree:true, childList:true, attributes:true, characterData:true});
     } catch (e) {}
     try {
-      new ResizeObserver(function(){ onMut('mo'); }).observe(document.body || root);
+      // Resize shifts layout but never flips display/visibility/opacity:
+      // structural tag, verdicts kept.
+      new ResizeObserver(function(){ onMut('mc'); }).observe(document.body || root);
     } catch (e) {}
   }
   arm();
-  try { window.addEventListener('load', function(){ onMut('mo'); }); } catch (e) {}
+  // Stylesheets applying at load can flip whole-subtree verdicts: treat
+  // as attribute-class invalidation.
+  try { window.addEventListener('load', function(){ onMut('ma'); }); } catch (e) {}
   // Scrolls (page or nested containers) change viewport rects with no DOM
   // mutation, so the observers alone never hear them. Capture phase: scroll
   // events don't bubble, this catches every scroller in the document.
@@ -881,6 +899,13 @@ mod tests {
         assert!(query.contains("S.visEpoch"));
         assert!(query.contains("visEpoch"));
         assert!(DOM_INSTALL_JS.contains("ev="));
+        // Ping taxonomy: attribute mutations invalidate verdicts ('ma'),
+        // structural changes ('mc') and scrolls ('sc') don't; trailing
+        // debounce escalates mc->ma so a hide is never swallowed.
+        assert!(DOM_INSTALL_JS.contains("'ma'"));
+        assert!(DOM_INSTALL_JS.contains("'mc'"));
+        assert!(DOM_INSTALL_JS.contains("'sc'"));
+        assert!(DOM_INSTALL_JS.contains("pendingEv"));
         assert!(dom_query_js(Some((100.0, 200.0)), 7).contains("__sdsc_cx=100"));
         assert!(dom_query_js(Some((100.0, 200.0)), 7).contains("__sdsc_v=7"));
         // Boot = install + snapshot in one round-trip.

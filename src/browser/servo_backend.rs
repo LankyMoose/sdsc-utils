@@ -291,12 +291,16 @@ impl WebViewDelegate for Delegate {
             return;
         }
         // Mutation pings invalidate the cached per-element visibility
-        // verdicts (something in the DOM changed); scroll-only pings don't
-        // (scrolling moves boxes but never hides anything that was visible).
+        // verdicts only when attributes changed (`ma`: class/style/hidden
+        // flips can hide whole subtrees). Structural pings (`mc`:
+        // insert/remove/text/resize) and scroll pings (`sc`) leave
+        // surviving nodes' verdicts valid — new nodes miss the cache and
+        // compute fresh. Unknown tags (incl. pre-taxonomy `mo`) bump:
+        // safe default.
         {
             let mut state = self.shared.borrow_mut();
             state.ping_at = Some(Instant::now());
-            if !url.contains("ev=sc") {
+            if !(url.contains("ev=sc") || url.contains("ev=mc")) {
                 state.dom_epoch = state.dom_epoch.wrapping_add(1);
             }
         }
@@ -1143,6 +1147,10 @@ fn flush_pending_up(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
 fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128, skip_rebase: bool) {
     use std::collections::HashSet;
     let snap = parse_dom_snapshot(value);
+    // Tracked offset before the snapshot truth is applied: logged alongside
+    // the snapshot's own truth so stale-box reports can separate "snapshot
+    // measured old truth" from "rebase yanked backwards".
+    let pre_scroll = state.scroll;
     // Truth delta vs current: heals unapplied commands (edge clamping the
     // page ignored) and history-restored offsets alike. Origin-pinned;
     // never upper-clamped (extent can lag truth). Skipped when a ping landed
@@ -1265,8 +1273,13 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128, skip_rebase: bo
         state.dom_uid.clear();
     }
     crate::platform::app_log::info(format!(
-        "servo-dom: ingested fresh={fresh} dropped={dropped} retained={retained} live={} total={total} culled={culled} skip={skipped:?} boxA={box_anchors} boxKid={box_kids} boxAWrap={box_wraps} boxAEmpty={box_empty} forced={forced} hid={hid} clip={clip} t={timings:?} rtt={rtt_ms}ms",
+        "servo-dom: ingested fresh={fresh} dropped={dropped} retained={retained} live={} total={total} culled={culled} skip={skipped:?} boxA={box_anchors} boxKid={box_kids} boxAWrap={box_wraps} boxAEmpty={box_empty} forced={forced} hid={hid} clip={clip} t={timings:?} rtt={rtt_ms}ms rb={} snap=({:.0},{:.0}) trk=({:.0},{:.0})",
         state.dom.len(),
+        if skip_rebase { "skip" } else { "apply" },
+        snap.scroll.0,
+        snap.scroll.1,
+        pre_scroll.0,
+        pre_scroll.1,
     ));
 }
 
@@ -1435,6 +1448,11 @@ mod tests {
         assert_eq!(
             parse_ping_scroll("http://sdsc.invalid/__SDSC_DOM_DIRTY?wx=abc&wy=1"),
             None
+        );
+        // Source tags ride alongside without disturbing truth parsing.
+        assert_eq!(
+            parse_ping_scroll("http://sdsc.invalid/__SDSC_DOM_DIRTY?wx=3&wy=44&ev=mc"),
+            Some((3.0, 44.0))
         );
     }
 }
