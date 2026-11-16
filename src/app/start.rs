@@ -2522,8 +2522,17 @@ impl App {
                 None
             }
             ChordReleaseTick::Open => {
-                crate::controller::hid::diag::diag_info("ui-diag: reopen gesture toggle close");
-                Some(self.close_start_screen())
+                // Rising-edge guard, mirroring `on_reopen_gesture`: the gate
+                // reports Open on EVERY tick once unlatched, even with the
+                // chord absent — closing here unconditionally turns the
+                // release after any open into an instant re-close. Only a
+                // genuine new press (detector rising edge) toggles closed.
+                if self.gesture_detectors.update(&required, readings) {
+                    crate::controller::hid::diag::diag_info("ui-diag: reopen gesture toggle close");
+                    Some(self.close_start_screen())
+                } else {
+                    None
+                }
             }
         }
     }
