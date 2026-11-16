@@ -110,6 +110,20 @@ impl BrowserFrame {
     }
 }
 
+/// One remembered navigation for omnibox autocomplete: URL plus the title
+/// at visit time. In-memory only (session scope, never persisted).
+#[derive(Debug, Clone, Default)]
+pub struct HistoryEntry {
+    pub url: String,
+    pub title: Option<String>,
+}
+
+/// Cap on remembered navigations: oldest drops past this.
+pub const MAX_HISTORY_ENTRIES: usize = 100;
+
+/// Autocomplete rows per dropdown.
+pub const MAX_SUGGESTIONS: usize = 6;
+
 /// In-Start browser surface state. Pure data: the iced view owns the URL
 /// draft and scroll offset, this owns load lifecycle with a generation
 /// counter so late worker results are ignored after suspend/close —
@@ -124,6 +138,9 @@ pub struct BrowserSession {
     generation: u64,
     error: Option<String>,
     frame: Option<BrowserFrame>,
+    /// Most-recent-first navigation history for autocomplete. Recorded on
+    /// every load and client-side URL change; titles attach out of band.
+    history: Vec<HistoryEntry>,
 }
 
 impl BrowserSession {
@@ -156,13 +173,14 @@ impl BrowserSession {
     /// carry to be applied. Drops any engine frame (stale pixels never stand
     /// in for the new page).
     pub fn begin_load(&mut self, url: String) -> u64 {
-        self.url = url;
+        self.url = url.clone();
         self.title = None;
         self.body.clear();
         self.error = None;
         self.frame = None;
         self.loading = true;
         self.generation = self.generation.wrapping_add(1);
+        self.record_visit(url);
         self.generation
     }
 
@@ -237,14 +255,61 @@ impl BrowserSession {
         self.frame.as_ref()
     }
 
-    /// Engine path: title arrived out of band.
+    /// Engine path: title arrived out of band. Attaches to the most recent
+    /// history entry (titles trail their document; a stale late title may
+    /// misattach until the next one lands — harmless for suggestions).
     pub fn note_title(&mut self, title: Option<String>) {
-        self.title = title;
+        self.title = title.clone();
+        if let Some(entry) = self.history.first_mut() {
+            entry.title = title;
+        }
     }
 
     /// Engine path: URL changed (redirects) without a new load.
     pub fn note_url(&mut self, url: String) {
-        self.url = url;
+        self.url = url.clone();
+        self.record_visit(url);
+    }
+
+    /// Remember a navigation (most-recent-first, deduped, capped).
+    /// Revisits move to the front; empty URLs never record.
+    pub fn record_visit(&mut self, url: String) {
+        if url.is_empty() {
+            return;
+        }
+        self.history.retain(|e| e.url != url);
+        self.history.insert(0, HistoryEntry { url, title: None });
+        self.history.truncate(MAX_HISTORY_ENTRIES);
+    }
+
+    /// Autocomplete candidates for `draft`: case-insensitive substring over
+    /// URL + title, prefix hits first, recency order within ranks, capped.
+    /// Empty drafts match nothing (Chrome shows recents on focus; v1 shows
+    /// the dropdown only once the user typed).
+    pub fn suggestions(&self, draft: &str) -> Vec<HistoryEntry> {
+        let needle = draft.trim().to_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        // Two ranks over the whole history (prefix hits anywhere beat
+        // substring hits everywhere); recency order within ranks.
+        let mut prefix = Vec::new();
+        let mut rest = Vec::new();
+        for entry in &self.history {
+            let url_lc = entry.url.to_lowercase();
+            let title_lc = entry.title.as_deref().unwrap_or("").to_lowercase();
+            if !(url_lc.contains(&needle) || title_lc.contains(&needle)) {
+                continue;
+            }
+            if url_lc.starts_with(&needle) || title_lc.starts_with(&needle) {
+                prefix.push(entry.clone());
+            } else {
+                rest.push(entry.clone());
+            }
+        }
+        prefix.extend(rest);
+        prefix.truncate(MAX_SUGGESTIONS);
+        prefix
     }
 
     /// Engine path: load completed. Returns false (ignored) when a newer
@@ -492,6 +557,53 @@ mod tests {
         let (a, ka) = game("a");
         let _ = m.open_app(a.clone(), ka.clone());
         assert!(m.open_app(a, ka).is_empty());
+    }
+
+    #[test]
+    fn history_dedupes_revisits_to_front() {
+        let mut s = BrowserSession::default();
+        s.record_visit("https://a.test/".to_string());
+        s.record_visit("https://b.test/".to_string());
+        s.record_visit("https://a.test/".to_string());
+        let urls: Vec<&str> = s.history.iter().map(|e| e.url.as_str()).collect();
+        assert_eq!(urls, vec!["https://a.test/", "https://b.test/"]);
+        // Empty URLs never record.
+        s.record_visit(String::new());
+        assert_eq!(s.history.len(), 2);
+    }
+
+    #[test]
+    fn history_attaches_out_of_band_titles() {
+        let mut s = BrowserSession::default();
+        s.record_visit("https://a.test/".to_string());
+        s.note_title(Some("A page".to_string()));
+        assert_eq!(s.history[0].title.as_deref(), Some("A page"));
+    }
+
+    #[test]
+    fn suggestions_rank_prefix_first_then_recency() {
+        let mut s = BrowserSession::default();
+        // Recency order (oldest first here): sub hit, then prefix hit.
+        s.record_visit("https://x.test/deep-meerkat-page".to_string());
+        s.record_visit("https://meerkat.test/".to_string());
+        let got: Vec<String> = s
+            .suggestions("meerkat")
+            .iter()
+            .map(|e| e.url.clone())
+            .collect();
+        // Prefix hit wins despite being newer-or-not; recency within ranks.
+        assert_eq!(
+            got,
+            vec![
+                "https://meerkat.test/".to_string(),
+                "https://x.test/deep-meerkat-page".to_string()
+            ]
+        );
+        // Title hits count too; empty draft matches nothing.
+        s.note_title(Some("Meerkats are great".to_string()));
+        assert_eq!(s.suggestions("great").len(), 1);
+        assert!(s.suggestions("").is_empty());
+        assert!(s.suggestions("zzz").is_empty());
     }
 
     #[test]

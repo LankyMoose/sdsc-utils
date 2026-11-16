@@ -72,6 +72,9 @@ pub enum StartMessage {
     ToggleUrlEntry,
     BrowserUrlChanged(String),
     BrowserNavigate,
+    /// Browser: autocomplete pick — draft becomes the picked URL and
+    /// navigates through the normal path.
+    BrowserAutocompletePick(String),
     BrowserBack,
     BrowserForward,
     BrowserFetched {
@@ -1074,6 +1077,44 @@ fn browser_debug_line(panel: &BrowserPanel) -> Element<'_, StartMessage> {
     .into()
 }
 
+/// Omnibox autocomplete dropdown: in-memory history matches for the draft.
+/// Shows only once the user typed something diverging from the current URL
+/// (post-navigate the draft mirrors the URL — no dropdown then). Rows are
+/// plain buttons so the pad cursor reaches them like every other target;
+/// dpad-through-the-list is a later refinement.
+fn browser_suggestions(panel: &BrowserPanel) -> Element<'_, StartMessage> {
+    let draft = panel.draft.trim();
+    if draft.is_empty() || draft == panel.session.url() {
+        return space().height(Length::Fixed(0.0)).into();
+    }
+    let matches = panel.session.suggestions(draft);
+    if matches.is_empty() {
+        return space().height(Length::Fixed(0.0)).into();
+    }
+    let mut list = column![].spacing(2);
+    for m in matches {
+        let title = m.title.clone().unwrap_or_else(|| m.url.clone());
+        list = list.push(
+            button(
+                column![
+                    text(title).size(13.0).color(theme::INK),
+                    text(m.url.clone()).size(11.0).color(theme::MUTED),
+                ]
+                .spacing(0),
+            )
+            .padding([6, 10])
+            .width(Fill)
+            .on_press(StartMessage::BrowserAutocompletePick(m.url.clone()))
+            .style(theme::ghost),
+        );
+    }
+    container(list)
+        .padding([4, 0])
+        .width(Fill)
+        .style(theme::menu_panel)
+        .into()
+}
+
 /// In-Start browser card: URL row, page, reload / external / close
 /// actions. Sized by the caller (near-full-bleed; see `immersive::view`),
 /// so the root column fills its card.
@@ -1144,6 +1185,7 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         .spacing(8)
         .align_y(Alignment::Center),
         space().height(8),
+        browser_suggestions(panel),
         browser_page_view(state, img_w),
         browser_debug_line(panel),
         space().height(8),

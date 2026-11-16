@@ -95,6 +95,10 @@ impl App {
                 Task::none()
             }
             StartMessage::BrowserNavigate => self.on_browser_navigate(),
+            StartMessage::BrowserAutocompletePick(url) => {
+                self.start_state.browser.draft = url;
+                self.on_browser_navigate()
+            }
             StartMessage::BrowserFetched { generation, result } => {
                 self.on_browser_fetched(generation, result)
             }
@@ -537,7 +541,7 @@ impl App {
         } else {
             draft
         };
-        let url = crate::browser::fetch::normalize_url(&raw);
+        let url = crate::browser::fetch::resolve_navigate_target(&raw);
         if url.is_empty() {
             return Task::none();
         }
@@ -770,7 +774,7 @@ impl App {
         } else {
             session.url().to_string()
         };
-        let url = crate::browser::fetch::normalize_url(&raw);
+        let url = crate::browser::fetch::resolve_navigate_target(&raw);
         if url.is_empty() {
             return Task::none();
         }

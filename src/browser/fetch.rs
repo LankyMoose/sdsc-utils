@@ -32,6 +32,28 @@ pub fn normalize_url(input: &str) -> String {
     }
 }
 
+/// Omnibox resolution: full URLs (and bare hosts, ports, localhost) navigate
+/// directly; anything else becomes a Google search. This is the single
+/// funnel for address-bar commits (navigate + open-external).
+pub fn resolve_navigate_target(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.contains("://") {
+        return trimmed.to_string();
+    }
+    let host_like = !trimmed.contains(char::is_whitespace)
+        && (trimmed.contains('.')
+            || trimmed.contains(':')
+            || trimmed.eq_ignore_ascii_case("localhost"));
+    if host_like {
+        return format!("https://{trimmed}");
+    }
+    let query: String = url::form_urlencoded::byte_serialize(trimmed.as_bytes()).collect();
+    format!("https://www.google.com/search?q={query}")
+}
+
 /// Blocking: download `url` and extract title + readable text.
 /// Runs on a worker thread through `spawn_blocking`, never on the UI thread.
 pub fn fetch_readable(url: &str) -> Result<crate::browser::FetchedPage, String> {
@@ -249,6 +271,31 @@ mod tests {
         );
         assert_eq!(normalize_url("http://x.test/"), "http://x.test/");
         assert_eq!(normalize_url(""), "");
+    }
+
+    #[test]
+    fn resolve_routes_hosts_and_searches() {
+        // Full URLs and bare hosts navigate directly.
+        assert_eq!(resolve_navigate_target("http://x.test/"), "http://x.test/");
+        assert_eq!(
+            resolve_navigate_target("example.com"),
+            "https://example.com"
+        );
+        assert_eq!(
+            resolve_navigate_target("localhost:8080/a"),
+            "https://localhost:8080/a"
+        );
+        assert_eq!(resolve_navigate_target("localhost"), "https://localhost");
+        // Plain words and phrases search.
+        assert_eq!(
+            resolve_navigate_target("meerkats"),
+            "https://www.google.com/search?q=meerkats"
+        );
+        assert_eq!(
+            resolve_navigate_target("meerkat facts"),
+            "https://www.google.com/search?q=meerkat+facts"
+        );
+        assert_eq!(resolve_navigate_target(""), "");
     }
 
     #[test]
