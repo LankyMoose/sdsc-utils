@@ -218,9 +218,18 @@ impl WebViewDelegate for Delegate {
         let mut shared = self.shared.borrow_mut();
         match status {
             LoadStatus::Started | LoadStatus::HeadParsed => {
-                crate::platform::app_log::info(format!("servo-engine: load {status:?}"));
+                crate::platform::app_log::info(format!(
+                    "servo-engine: load {status:?} url={}",
+                    shared.last_url.as_deref().unwrap_or("?"),
+                ));
             }
             LoadStatus::Complete => {
+                if let Some(started) = shared.load_started_at {
+                    crate::platform::app_log::info(format!(
+                        "servo-engine: load Complete in {}ms",
+                        started.elapsed().as_millis()
+                    ));
+                }
                 shared.load_started_at = None;
                 // Fresh document settling in: boot (idempotent install +
                 // snapshot) once rendering lands.
@@ -1314,6 +1323,10 @@ fn check_load_timeout(shared: &Rc<RefCell<Shared>>) {
     }
     state.load_started_at = None;
     let generation = state.generation;
+    crate::platform::app_log::warn(format!(
+        "servo-engine: load timed out after {}s",
+        LOAD_TIMEOUT.as_secs()
+    ));
     state.handle.emit(EngineEvent::LoadFinished {
         generation,
         result: Err("load timed out".to_string()),
