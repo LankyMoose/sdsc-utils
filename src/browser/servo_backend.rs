@@ -1189,7 +1189,15 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128, skip_rebase: bo
     let mut seen = HashSet::with_capacity(snap.nodes.len() + snap.culled_ids.len());
     let mut fresh = 0usize;
     let mut retained = 0usize;
-    let (sx, sy) = state.scroll;
+    // Translate by the snapshot's own scroll truth (read in-page in the
+    // same pass as the rects), NOT the tracked offset: when the rebase is
+    // skipped (a ping landed mid-flight with newer truth), the tracked
+    // offset is ahead of what these rects were measured against, and
+    // translating by it misplaces every merged box by the difference —
+    // the stale-boxes-that-never-heal from the first-scroll flag (that
+    // pull merged scroll-0 rects at offset 814). In the apply case both
+    // agree (rebase just set tracked := snapshot), so this is identical.
+    let (sx, sy) = snap.scroll;
     for r in snap.nodes {
         seen.insert(r.id);
         let kind = dom_kind(&r.tag, &r.role, &r.typ);
