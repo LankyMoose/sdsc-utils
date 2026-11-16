@@ -299,12 +299,13 @@ const DOM_QUERY_BODY: &str = r###"(function(){
         ty = (el.getAttribute("type") || "text").toLowerCase();
         if (ty === "hidden") return;
       }
+      // Hidden check BEFORE measuring: getComputedStyle is far cheaper than
+      // getClientRects, and hidden subtrees are numerous (menus, dialogs).
+      if (isHidden(el)) { skHid++; return; }
       var r = boxOf(el);
       if (!r) {
-        // No boxes: hidden subtrees (display/visibility/opacity) are
-        // correctly invisible — count and move on, never force those.
-        // The rest are boxless-but-rendered candidates for forcing.
-        if (isHidden(el)) { skHid++; return; }
+        // Boxless-but-rendered: hidden subtrees were already filtered above,
+        // so these are candidates for forcing.
         skBox++;
         var hasKids = false;
         var hasAnyKid = false;
@@ -809,6 +810,10 @@ mod tests {
         assert!(!query.contains("selectNodeContents"));
         assert!(query.contains("setProperty('display', 'block'"));
         assert!(!query.contains("removeProperty"));
+        // Hidden check runs before measuring: subtrees that never render
+        // must never reach forcing, and getComputedStyle is far cheaper
+        // than getClientRects per element.
+        assert!(query.contains("isHidden(el)"));
         // Cursor culling: radial keep + directional-next keep, uncensored
         // without a cursor.
         assert!(query.contains("__sdsc_cc=false"));
