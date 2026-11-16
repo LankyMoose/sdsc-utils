@@ -1079,9 +1079,10 @@ fn browser_debug_line(panel: &BrowserPanel) -> Element<'_, StartMessage> {
 
 /// Omnibox autocomplete dropdown: in-memory history matches for the draft.
 /// Shows only once the user typed something diverging from the current URL
-/// (post-navigate the draft mirrors the URL — no dropdown then). Rows are
-/// plain buttons so the pad cursor reaches them like every other target;
-/// dpad-through-the-list is a later refinement.
+/// (post-navigate the draft mirrors the URL — no dropdown then). Rendered
+/// as a `stack!` overlay layer over the page, so appearing never shifts
+/// layout. Rows are plain buttons so the pad cursor reaches them like every
+/// other target; dpad-through-the-list is a later refinement.
 fn browser_suggestions(panel: &BrowserPanel) -> Element<'_, StartMessage> {
     let draft = panel.draft.trim();
     if draft.is_empty() || draft == panel.session.url() {
@@ -1185,9 +1186,13 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         .spacing(8)
         .align_y(Alignment::Center),
         space().height(8),
-        browser_suggestions(panel),
-        browser_page_view(state, img_w),
-        browser_debug_line(panel),
+        // Fixed-position dropdown: the suggestions overlay floats over the
+        // page — `stack!` sizes to its base layer, so the dropdown appearing
+        // never shoves content down.
+        stack![
+            column![browser_page_view(state, img_w), browser_debug_line(panel),],
+            browser_suggestions(panel),
+        ],
         space().height(8),
         // Card action row: the overlay toggle is debug-only (mirrors the
         // gated F10 path) and compiled out of release builds; JS-click is
