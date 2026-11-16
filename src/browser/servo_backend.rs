@@ -104,6 +104,13 @@ struct Shared {
     dom_in_flight_at: Option<Instant>,
     dom_tx: mpsc::Sender<DomIngest>,
     dom_rx: Option<mpsc::Receiver<DomIngest>>,
+    /// Monotonic loop counter: proves at least one full tick elapsed.
+    spin_seq: u64,
+    /// Armed mouse-up completing the previous synthetic click. Down goes
+    /// out immediately; Up waits for the next loop tick so every press has
+    /// real duration instead of a zero-width Down+Up pair. Flushed early if
+    /// another click arrives first (no stranded presses).
+    pending_click_up: Option<(WebViewPoint, u64)>,
     /// Last completed pull (time + round-trip ms). The next pull waits at
     /// least the last round-trip (floor 300ms): slow pulls back off instead
     /// of saturating the script thread, which would stall input dispatch
@@ -351,10 +358,13 @@ fn mark_dom_dirty(shared: &Rc<RefCell<Shared>>) {
 /// DOM target: actionable element found by the in-page query. Rects are
 /// document-space (viewport rect + scroll at ingest). `missed` counts consecutive polls
 /// without a sighting; pruned at [`DOM_MISSED_LIMIT`] so re-render flicker
-/// doesn't flap targets, but removed nodes still go away.
+/// doesn't flap targets, but removed nodes still go away. `tag`/`role` are
+/// the raw element identity for diagnostics (which selector arm matched).
 #[derive(Debug, Clone)]
 struct DomEntry {
     kind: FocusKind,
+    tag: String,
+    role: String,
     x: f32,
     y: f32,
     w: f32,
@@ -363,8 +373,7 @@ struct DomEntry {
 }
 
 /// Completed DOM query from the page: poll sequence, dispatch time (for
-/// pull round-trip logging), tracked scroll at dispatch (for race-free
-/// rebasing), plus the raw JS value or the evaluation error.
+/// pull round-trip logging), plus the raw JS value or the evaluation error.
 type DomIngest = (u64, Instant, Result<JSValue, String>);
 
 /// Cursor travel that re-seeds the cursor-culled set: past this distance
@@ -491,6 +500,8 @@ fn run(
         dom_in_flight_at: None,
         dom_tx,
         dom_rx: Some(dom_rx),
+        spin_seq: 0,
+        pending_click_up: None,
         last_pull_at: None,
         last_pull_rtt_ms: 0,
         last_mouse: None,
@@ -529,6 +540,27 @@ fn run(
         }
         if shutdown {
             break;
+        }
+        // Complete the previous synthetic click: Down went out with its
+        // command; Up waits for at least one full tick so presses have real
+        // duration. Runs even while suspended so a press can never strand.
+        {
+            let mut state = shared.borrow_mut();
+            state.spin_seq = state.spin_seq.wrapping_add(1);
+            match state.pending_click_up.take() {
+                // At least one full tick elapsed since Down: complete it.
+                Some((point, at)) if state.spin_seq > at => {
+                    drop(state);
+                    let id = webview.notify_input_event(InputEvent::MouseButton(
+                        MouseButtonEvent::new(MouseButtonAction::Up, MouseButton::Primary, point),
+                    ));
+                    track_input(&shared, id, "click");
+                }
+                // Not yet due (or nothing armed): put it back.
+                pending => {
+                    state.pending_click_up = pending;
+                }
+            }
         }
         {
             let suspended = shared.borrow().suspended;
@@ -671,6 +703,9 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             // Viewport-space point (same space as the cursor and the
             // translated tree); Servo maps to document internally.
             crate::platform::app_log::info(format!("servo-engine: click at ({x:.0},{y:.0})"));
+            // Complete any in-flight press first: rapid clicks stay paired
+            // (Down/Up, Down/Up) instead of stranding a Down.
+            flush_pending_up(webview, shared);
             // Button-kind dock targets activate on the exact element via
             // `__sdsc_click` (no hit-test staleness, exercises whatever
             // handler the page registered — getEventListeners is DevTools-only
@@ -716,7 +751,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                     },
                 );
             } else {
-                send_synthetic_click(webview, shared, x, y);
+                send_synthetic_down(webview, shared, x, y);
             }
             // Clicks mutate the DOM (toggles, expands, navigation): re-query
             // once settled.
@@ -1018,14 +1053,28 @@ fn poll_probe(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
     }
 }
 
-/// Trusted synthetic Down+Up pair at a viewport point. Used for links,
-/// fields, free points (canvas/games have no DOM handlers), and as the
-/// fallback when element activation reports anything but `ok`.
-fn send_synthetic_click(webview: &WebView, shared: &Rc<RefCell<Shared>>, x: f32, y: f32) {
+/// Trusted synthetic mouse-down; the matching Up is armed on
+/// [`Shared::pending_click_up`] for the next loop tick (see `run`), so
+/// every press has real duration instead of a zero-width Down+Up pair.
+fn send_synthetic_down(webview: &WebView, shared: &Rc<RefCell<Shared>>, x: f32, y: f32) {
     let point = WebViewPoint::Device(DevicePoint::new(x, y));
-    for action in [MouseButtonAction::Down, MouseButtonAction::Up] {
+    let id = webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+        MouseButtonAction::Down,
+        MouseButton::Primary,
+        point,
+    )));
+    track_input(shared, id, "click");
+    let mut state = shared.borrow_mut();
+    state.pending_click_up = Some((point, state.spin_seq));
+}
+
+/// Complete any in-flight synthetic press immediately (used when a new
+/// click arrives before the tick flush, and to keep rapid clicks paired).
+fn flush_pending_up(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
+    let pending = shared.borrow_mut().pending_click_up.take();
+    if let Some((point, _)) = pending {
         let id = webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-            action,
+            MouseButtonAction::Up,
             MouseButton::Primary,
             point,
         )));
@@ -1085,6 +1134,8 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128) {
         let kind = dom_kind(&r.tag, &r.role, &r.typ);
         if let Some(n) = state.dom.get_mut(&r.id) {
             n.kind = kind;
+            n.tag = r.tag.clone();
+            n.role = r.role.clone();
             n.x = r.x + sx;
             n.y = r.y + sy;
             n.w = r.w;
@@ -1099,6 +1150,8 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128) {
                 r.id,
                 DomEntry {
                     kind,
+                    tag: r.tag.clone(),
+                    role: r.role.clone(),
                     x: r.x + sx,
                     y: r.y + sy,
                     w: r.w,
@@ -1109,8 +1162,14 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128) {
             fresh += 1;
             if state.ax_debug {
                 crate::platform::app_log::info(format!(
-                    "servo-dom map #{id} <= js#{} {kind:?} {}",
+                    "servo-dom map #{id} <= js#{} {kind:?} [{}]{} {}",
                     r.id,
+                    r.tag,
+                    if r.role.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" role={}", r.role)
+                    },
                     r.text.chars().take(40).collect::<String>()
                 ));
             }

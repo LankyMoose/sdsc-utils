@@ -804,7 +804,22 @@ impl App {
         let (x, y, target) = {
             let panel = &self.start_state.browser;
             let (x, y) = panel.cursor.click_point(&panel.focusables);
-            (x, y, panel.cursor.attached)
+            // JS element-click is opt-in per the Diagnostics toggle and only
+            // ever addresses Button-kind dock targets; everything else (and
+            // the default) goes through the trusted synthetic path, which the
+            // backend also falls back to when the element is gone.
+            let target = match panel.cursor.attached {
+                Some(id)
+                    if panel.js_click
+                        && panel.focusables.iter().any(|o| {
+                            o.id == id && o.kind == crate::browser::cursor::FocusKind::Button
+                        }) =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            };
+            (x, y, target)
         };
         // Instant header feedback ("Opening link…"): the click is
         // acknowledged now; the page changing (or not) tells the rest.
@@ -845,15 +860,24 @@ impl App {
             .map(|(_, t)| now.saturating_duration_since(t).as_millis());
         let last_click_at = panel.last_click.map(|(p, _)| p);
         // Nearest 8 targets by center distance: the actionable context.
-        let mut ranked: Vec<(u64, f32, f32, f32, f32, f32)> = panel
+        // Kind included: distinguishes Button/Link/Field/Other at a glance.
+        let mut ranked: Vec<(
+            u64,
+            crate::browser::cursor::FocusKind,
+            f32,
+            f32,
+            f32,
+            f32,
+            f32,
+        )> = panel
             .focusables
             .iter()
             .map(|o| {
                 let d = ((o.x + o.w / 2.0) - cx).abs() + ((o.y + o.h / 2.0) - cy).abs();
-                (o.id, o.x, o.y, o.w, o.h, d)
+                (o.id, o.kind, o.x, o.y, o.w, o.h, d)
             })
             .collect();
-        ranked.sort_by(|a, b| a.5.partial_cmp(&b.5).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.sort_by(|a, b| a.6.partial_cmp(&b.6).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(8);
         crate::platform::app_log::warn(format!(
             "ISSUE-FLAG cursor=({cx:.0},{cy:.0}) dock={dock:?} dock_rect={dock_rect:?} would_click=({:.0},{:.0}) last_click_at={last_click_at:?} last_click_ago_ms={last_click_ago:?} scroll={:?} wells={} url={} near={ranked:?}",

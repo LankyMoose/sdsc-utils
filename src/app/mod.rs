@@ -1277,6 +1277,8 @@ impl App {
                 #[cfg(debug_assertions)]
                 self.debug_browser,
                 #[cfg(debug_assertions)]
+                self.start_state.browser.js_click,
+                #[cfg(debug_assertions)]
                 &debug_tune,
             )
             .map(Message::Configure);

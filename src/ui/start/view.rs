@@ -807,6 +807,11 @@ pub struct BrowserPanel {
     pub last_dock_change: Option<Instant>,
     /// Last click point + time, for the R3 issue-flag correlation.
     pub last_click: Option<((f32, f32), Instant)>,
+    /// JS element-click mode for Button-kind dock targets (Diagnostics
+    /// toggle, off by default): `__sdsc_click` on the exact element instead
+    /// of the trusted synthetic pair. Lets A/B testing untrusted-activation
+    /// against trusted input per page.
+    pub js_click: bool,
     /// Transient action hint shown in the card header ("Opening link…"):
     /// instant feedback that a click landed, so a slow-or-dead page reads
     /// as such instead of a dropped input. Superseded by Loading…/Error,
