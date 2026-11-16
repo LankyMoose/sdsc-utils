@@ -66,39 +66,43 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
   var PING = 'http://sdsc.invalid/__SDSC_DOM_DIRTY';
   var lastPing = 0, trailing = null;
   var SUPPRESS = 500, TRAIL = 250;
-  function fire(){
+  function fire(src){
     lastPing = Date.now();
     // Window truth rides along: a nested-container scroll moves only that
     // container's children, so the global offset must not absorb it — the
     // backend corrects to these coordinates on arrival instead of
     // mis-translating every outline until the next settle pull.
+    // `src` tells the backend what mutated: scroll-only pings carry no DOM
+    // changes, so cached per-element verdicts stay valid across them.
     var wx = 0, wy = 0;
     try { wx = Math.round(window.scrollX || window.pageXOffset || 0); wy = Math.round(window.scrollY || window.pageYOffset || 0); } catch (e) {}
-    try { fetch(PING + '?wx=' + wx + '&wy=' + wy, {method:'POST', mode:'no-cors', keepalive:true, body:'1'}).catch(function(){}); } catch (e) {}
+    try { fetch(PING + '?wx=' + wx + '&wy=' + wy + '&ev=' + src, {method:'POST', mode:'no-cors', keepalive:true, body:'1'}).catch(function(){}); } catch (e) {}
   }
-  function onMut(){
+  function onMut(ev) {
+    ev = ev || 'mo';
     var now = Date.now();
-    if (now - lastPing >= SUPPRESS && !trailing) { fire(); }
+    if (now - lastPing >= SUPPRESS && !trailing) { fire(ev); }
     else if (!trailing) {
-      trailing = setTimeout(function(){ trailing = null; fire(); }, TRAIL);
+      trailing = setTimeout(function(){ trailing = null; fire(ev); }, TRAIL);
     }
   }
   function arm(){
     var root = document.documentElement;
     if (!root) { setTimeout(arm, 500); return; }
     try {
-      new MutationObserver(onMut).observe(root, {subtree:true, childList:true, attributes:true, characterData:true});
+      new MutationObserver(function(){ onMut('mo'); }).observe(root, {subtree:true, childList:true, attributes:true, characterData:true});
     } catch (e) {}
     try {
-      new ResizeObserver(onMut).observe(document.body || root);
+      new ResizeObserver(function(){ onMut('mo'); }).observe(document.body || root);
     } catch (e) {}
   }
   arm();
-  try { window.addEventListener('load', onMut); } catch (e) {}
+  try { window.addEventListener('load', function(){ onMut('mo'); }); } catch (e) {}
   // Scrolls (page or nested containers) change viewport rects with no DOM
   // mutation, so the observers alone never hear them. Capture phase: scroll
   // events don't bubble, this catches every scroller in the document.
-  try { document.addEventListener('scroll', onMut, {capture:true, passive:true}); } catch (e) {}
+  // Tagged 'sc' so the backend knows nothing mutated.
+  try { document.addEventListener('scroll', function(){ onMut('sc'); }, {capture:true, passive:true}); } catch (e) {}
 })()"###;
 
 /// Boot script: idempotent install + immediate snapshot, so one round-trip
@@ -107,8 +111,8 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
 /// as a call on the install's (undefined) return value (ASI hazard).
 /// `center` is the cursor point the snapshot culls around (see
 /// [`dom_query_js`]); `None` keeps everything (no cursor yet).
-pub fn dom_boot_js(center: Option<(f32, f32)>) -> String {
-    format!("{DOM_INSTALL_JS};\n{}", dom_query_js(center))
+pub fn dom_boot_js(center: Option<(f32, f32)>, epoch: u64) -> String {
+    format!("{DOM_INSTALL_JS};\n{}", dom_query_js(center, epoch))
 }
 
 /// One-shot event-loop probe: arm markers for the three async task
@@ -157,12 +161,15 @@ pub fn parse_loop_probe(value: &embedder_traits::JSValue) -> Option<[bool; 3]> {
 /// `center` is the pad cursor in viewport px (or `None`): candidates beyond
 /// 500px of it are culled — except the nearest target in each direction, so
 /// arrow-key jumps always have somewhere to go. `None` keeps everything.
-pub fn dom_query_js(center: Option<(f32, f32)>) -> String {
+/// `epoch` bumps whenever the DOM (or anything affecting visibility) may
+/// have changed; the in-page visibility verdict cache resets on mismatch,
+/// so pure-scroll pulls reuse verdicts while mutations re-verify.
+pub fn dom_query_js(center: Option<(f32, f32)>, epoch: u64) -> String {
     let (cx, cy, on) = match center {
         Some((x, y)) => (format!("{x:.0}"), format!("{y:.0}"), "true"),
         None => ("0".to_string(), "0".to_string(), "false"),
     };
-    format!("var __sdsc_cx={cx},__sdsc_cy={cy},__sdsc_cc={on};\n{DOM_QUERY_BODY}")
+    format!("var __sdsc_cx={cx},__sdsc_cy={cy},__sdsc_cc={on},__sdsc_v={epoch};\n{DOM_QUERY_BODY}")
 }
 
 const DOM_QUERY_BODY: &str = r###"(function(){
@@ -178,6 +185,12 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   // Computed-style cache for the ancestor walks below: one entry per
   // distinct ancestor, rebuilt every pull (styles mutate between pulls).
   var styleCache = (typeof Map !== "undefined") ? new Map() : null;
+  // Verdict cache: an element's hidden/visible verdict only changes when
+  // the DOM (or its ancestors' styles) mutates, which always fires a
+  // mutation ping. The backend bumps __sdsc_v on those and leaves it alone
+  // for pure scrolls — so scroll-settle pulls reuse verdicts instead of
+  // re-walking, and mutation pulls re-verify.
+  if (S.visEpoch !== __sdsc_v) { S.vis = (typeof WeakMap !== "undefined") ? new WeakMap() : null; S.visEpoch = __sdsc_v; }
   function cstyle(n) {
     if (styleCache) {
       var hit = styleCache.get(n);
@@ -194,7 +207,17 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   // True visibility: computed visibility is already inheritance-resolved,
   // so one call covers the whole ancestor chain for it; display:none and
   // opacity:0 need the ancestor walk (not inherited, still hiding).
+  // Verdicts are cached per element for the epoch (see above): recompute
+  // only on the first sighting per DOM epoch.
   function isHidden(el) {
+    var cached;
+    try { cached = S.vis ? S.vis.get(el) : undefined; } catch (e) {}
+    if (cached !== undefined) return cached;
+    var hidden = isHiddenUncached(el);
+    try { if (S.vis) S.vis.set(el, hidden); } catch (e2) {}
+    return hidden;
+  }
+  function isHiddenUncached(el) {
     try {
       var cs = window.getComputedStyle(el);
       if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') return true;
@@ -837,7 +860,7 @@ mod tests {
         assert!(DOM_INSTALL_JS.contains("__sdsc_click"));
         assert!(DOM_INSTALL_JS.contains("byId"));
         // Union-of-fragments measurement: never the crashing call.
-        let query = dom_query_js(None);
+        let query = dom_query_js(None, 7);
         assert!(query.contains("getClientRects"));
         assert!(!query.contains("getBoundingClientRect"));
         // Boxless fallback is persistent display forcing (one shot per
@@ -852,11 +875,16 @@ mod tests {
         // Cursor culling: radial keep + directional-next keep, uncensored
         // without a cursor.
         assert!(query.contains("__sdsc_cc=false"));
-        assert!(dom_query_js(Some((100.0, 200.0))).contains("__sdsc_cc=true"));
+        assert!(dom_query_js(Some((100.0, 200.0)), 7).contains("__sdsc_cc=true"));
         assert!(query.contains("__sdsc_cx"));
-        assert!(dom_query_js(Some((100.0, 200.0))).contains("__sdsc_cx=100"));
+        // Epoch-gated visibility verdicts + tagged ping sources.
+        assert!(query.contains("S.visEpoch"));
+        assert!(query.contains("visEpoch"));
+        assert!(DOM_INSTALL_JS.contains("ev="));
+        assert!(dom_query_js(Some((100.0, 200.0)), 7).contains("__sdsc_cx=100"));
+        assert!(dom_query_js(Some((100.0, 200.0)), 7).contains("__sdsc_v=7"));
         // Boot = install + snapshot in one round-trip.
-        let boot = dom_boot_js(None);
+        let boot = dom_boot_js(None, 7);
         assert!(boot.contains(DOM_DIRTY_MARKER));
         assert!(boot.contains("querySelectorAll"));
     }
@@ -883,7 +911,7 @@ mod tests {
     #[test]
     fn query_covers_option_role() {
         // Autocomplete rows (role=option) are real click targets.
-        assert!(dom_query_js(None).contains("[role=\"option\"]"));
+        assert!(dom_query_js(None, 7).contains("[role=\"option\"]"));
         assert_eq!(dom_kind("div", "option", ""), FocusKind::Button);
     }
 
@@ -891,7 +919,7 @@ mod tests {
     fn query_covers_handler_attributes() {
         // Any anchor qualifies (href-less jsaction anchors, name anchors —
         // the size filter keeps phantoms out) plus inline handlers.
-        let query = dom_query_js(None);
+        let query = dom_query_js(None, 7);
         assert!(query.contains("'a,button,"));
         assert!(query.contains("[onclick]"));
         // Full-viewport boxes never qualify (a screen-sized box with a

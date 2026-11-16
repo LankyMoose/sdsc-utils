@@ -104,6 +104,16 @@ struct Shared {
     dom_in_flight_at: Option<Instant>,
     dom_tx: mpsc::Sender<DomIngest>,
     dom_rx: Option<mpsc::Receiver<DomIngest>>,
+    /// DOM epoch: bumped whenever the DOM (or anything affecting per-element
+    /// visibility verdicts) may have changed — navigate/history/load, input,
+    /// reseed, MutationObserver pings. Scroll-only pings don't bump, so
+    /// settle pulls after pure scrolling reuse the cached verdicts instead
+    /// of re-walking every ancestor. Passed into each query as `__sdsc_v`.
+    dom_epoch: u64,
+    /// Wall time of the latest scroll ping, for the ingest rebase guard:
+    /// if a ping landed after the in-flight pull was dispatched, its truth
+    /// is newer — the snapshot must not rebase backwards over it.
+    ping_at: Option<Instant>,
     /// Monotonic loop counter: proves at least one full tick elapsed.
     spin_seq: u64,
     /// Armed mouse-up completing the previous synthetic click. Down goes
@@ -232,8 +242,9 @@ impl WebViewDelegate for Delegate {
                 }
                 shared.load_started_at = None;
                 // Fresh document settling in: boot (idempotent install +
-                // snapshot) once rendering lands.
+                // snapshot) once rendering lands. New load, new verdicts.
                 shared.dom_boot = true;
+                shared.dom_epoch = shared.dom_epoch.wrapping_add(1);
                 let generation = shared.generation;
                 shared.handle.emit(EngineEvent::LoadFinished {
                     generation,
@@ -278,6 +289,16 @@ impl WebViewDelegate for Delegate {
         let url = load.request().url.to_string();
         if !url.contains(DOM_DIRTY_MARKER) {
             return;
+        }
+        // Mutation pings invalidate the cached per-element visibility
+        // verdicts (something in the DOM changed); scroll-only pings don't
+        // (scrolling moves boxes but never hides anything that was visible).
+        {
+            let mut state = self.shared.borrow_mut();
+            state.ping_at = Some(Instant::now());
+            if !url.contains("ev=sc") {
+                state.dom_epoch = state.dom_epoch.wrapping_add(1);
+            }
         }
         mark_dom_dirty(&self.shared);
         // Window truth rides on the ping query: a nested-container scroll
@@ -509,6 +530,8 @@ fn run(
         dom_in_flight_at: None,
         dom_tx,
         dom_rx: Some(dom_rx),
+        dom_epoch: 0,
+        ping_at: None,
         spin_seq: 0,
         pending_click_up: None,
         last_pull_at: None,
@@ -656,10 +679,11 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             let id = webview.notify_input_event(InputEvent::Keyboard(KeyboardEvent::new(event)));
             track_input(shared, id, "key");
             // Keys can mutate the DOM (typing, shortcuts, focus Cruft):
-            // re-query once settled.
+            // re-query once settled, and invalidate cached verdicts.
             let mut state = shared.borrow_mut();
             state.dom_dirty = true;
             state.dom_dirty_at = Some(Instant::now());
+            state.dom_epoch = state.dom_epoch.wrapping_add(1);
         }
         EngineCommand::SetDarkMode { dark } => {
             webview.notify_theme_change(if dark { Theme::Dark } else { Theme::Light });
@@ -702,6 +726,9 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             if roamed {
                 state.dom_dirty = true;
                 state.dom_dirty_at = Some(Instant::now());
+                // Fresh cursor region: hover states may differ here, so
+                // cached visibility verdicts are suspect.
+                state.dom_epoch = state.dom_epoch.wrapping_add(1);
             }
         }
         EngineCommand::ClickAt { x, y, target } => {
@@ -763,10 +790,11 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                 send_synthetic_down(webview, shared, x, y);
             }
             // Clicks mutate the DOM (toggles, expands, navigation): re-query
-            // once settled.
+            // once settled, and invalidate cached verdicts.
             let mut state = shared.borrow_mut();
             state.dom_dirty = true;
             state.dom_dirty_at = Some(Instant::now());
+            state.dom_epoch = state.dom_epoch.wrapping_add(1);
         }
         EngineCommand::ProbeEventLoop => {
             if shared.borrow().suspended {
@@ -817,8 +845,10 @@ fn clear_tree(state: &mut Shared) {
     state.content = None;
     // A new document gets fresh DOM ids (the in-page WeakMap resets), a
     // fresh poll epoch (in-flight answers from the old page are dropped),
-    // and a boot round-trip (idempotent install + snapshot).
+    // a fresh visibility epoch (no verdicts carry across documents), and
+    // a boot round-trip (idempotent install + snapshot).
     state.dom_seq = state.dom_seq.wrapping_add(1);
+    state.dom_epoch = state.dom_epoch.wrapping_add(1);
     state.dom_in_flight = false;
     state.dom_in_flight_at = None;
     state.dom_boot = true;
@@ -924,14 +954,15 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
         let pinged = std::mem::take(&mut state.dom_ping);
         let center = state.last_mouse;
         state.last_cull_center = center;
+        let epoch = state.dom_epoch;
         let script = if boot {
-            dom_boot_js(center)
+            dom_boot_js(center, epoch)
         } else {
-            dom_query_js(center)
+            dom_query_js(center, epoch)
         };
-        Some((seq, state.dom_tx.clone(), script, boot, pinged, now))
+        Some((seq, state.dom_tx.clone(), script, boot, pinged, now, epoch))
     };
-    let Some((seq, tx, script, boot, pinged, dispatched)) = fire else {
+    let Some((seq, tx, script, boot, pinged, dispatched, epoch)) = fire else {
         return;
     };
     let src = if boot {
@@ -941,7 +972,7 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
     } else {
         "gesture"
     };
-    crate::platform::app_log::info(format!("servo-dom: pull seq={seq} src={src}"));
+    crate::platform::app_log::info(format!("servo-dom: pull seq={seq} src={src} ep={epoch}"));
     webview.evaluate_javascript(script, move |result| {
         let _ = tx.send((seq, dispatched, result.map_err(|e| format!("{e:?}"))));
     });
@@ -967,9 +998,13 @@ fn drain_dom_results(shared: &Rc<RefCell<Shared>>) {
         state.dom_in_flight_at = None;
         let rtt = dispatched.elapsed().as_millis();
         state.last_pull_rtt_ms = rtt.min(u64::MAX as u128) as u64;
+        // A ping that landed after this pull was dispatched carries newer
+        // scroll truth (already applied by its handler): re-running the
+        // snapshot's older truth backwards over it is the overscroll jitter.
+        let skip_rebase = state.ping_at.is_some_and(|t| t > dispatched);
         match result {
             Ok(value) => {
-                ingest_dom(&mut state, &value, rtt);
+                ingest_dom(&mut state, &value, rtt, skip_rebase);
                 emit_tree(&mut state);
             }
             Err(err) => {
@@ -1101,17 +1136,25 @@ fn flush_pending_up(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
 /// the flight window, but those same commands already marked dirty, so the
 /// next pull corrects it. Absent nodes accumulate misses and drop at
 /// [`DOM_MISSED_LIMIT`] (re-render flicker reads as one miss, real removals
-/// as two in a row).
-fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128) {
+/// as two in a row). `skip_rebase` arrives from the drain path when a ping
+/// landed after this pull was dispatched: that ping's truth is newer and
+/// already applied, so the snapshot's older truth must not yank outlines
+/// backwards.
+fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128, skip_rebase: bool) {
     use std::collections::HashSet;
     let snap = parse_dom_snapshot(value);
     // Truth delta vs current: heals unapplied commands (edge clamping the
     // page ignored) and history-restored offsets alike. Origin-pinned;
-    // never upper-clamped (extent can lag truth).
-    let dx = (snap.scroll.0 - state.scroll.0).max(-state.scroll.0);
-    let dy = (snap.scroll.1 - state.scroll.1).max(-state.scroll.1);
-    if dx != 0.0 || dy != 0.0 {
-        rebase_scroll(state, (state.scroll.0 + dx, state.scroll.1 + dy));
+    // never upper-clamped (extent can lag truth). Skipped when a ping landed
+    // after this pull was dispatched — that truth is newer and already
+    // applied; re-applying the snapshot's older truth would yank every
+    // outline backwards (the overscroll jitter).
+    if !skip_rebase {
+        let dx = (snap.scroll.0 - state.scroll.0).max(-state.scroll.0);
+        let dy = (snap.scroll.1 - state.scroll.1).max(-state.scroll.1);
+        if dx != 0.0 || dy != 0.0 {
+            rebase_scroll(state, (state.scroll.0 + dx, state.scroll.1 + dy));
+        }
     }
     // Document dims bound scroll clamping (the live set only spans
     // viewport+margin after culling, so entry corners can't). Grow-only per
