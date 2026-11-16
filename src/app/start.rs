@@ -461,6 +461,18 @@ impl App {
             crate::browser::AppKind::Browser { url: None },
         );
         self.start_state.browser.session.open_surface();
+        // Fresh session (never navigated, no pending draft): start at home
+        // instead of the empty state. A typed-but-unsent draft is the
+        // user's intent — leave it for Go.
+        if self.start_state.browser.session.url().is_empty()
+            && self.start_state.browser.draft.trim().is_empty()
+        {
+            self.start_state.browser.draft = Self::BROWSER_HOME_URL.to_string();
+            let task = self.on_browser_navigate();
+            self.resume_browser_engine();
+            crate::controller::hid::diag::diag_info("ui-diag: start browser open (home)");
+            return task;
+        }
         self.resume_browser_engine();
         crate::controller::hid::diag::diag_info("ui-diag: start browser open");
         Task::none()
