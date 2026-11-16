@@ -259,11 +259,17 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   var skBox = 0, skZero = 0, skBig = 0, skDis = 0, skErr = 0;
   var skBoxA = 0, skBoxKid = 0, skBoxAWrap = 0, skBoxAEmpty = 0, skForce = 0;
   var skHid = 0, skClip = 0;
+  // Phase timings (ms, Date.now resolution): find the actual per-pull cost
+  // center instead of guessing. tq = selector, tm = boxes, tv = visibility
+  // walks, tc = clip walks, tt = text extraction.
+  var tQ = 0, tmM = 0, tmV = 0, tmC = 0, tmT = 0;
+  var __t0 = Date.now();
   S.byId = {};
   var els;
   try { els = document.querySelectorAll(SEL); } catch (e) { return {nodes: [], total: 0, truncated: false}; }
   var total = els.length;
   var n = Math.min(els.length, 1000);
+  tQ = Date.now() - __t0;
   // NOTE: deliberately the plural fragment call, never the singular
   // bounding-box one. Servo's singular version carries a
   // `debug_assert!(w >= 0 && h >= 0)` (servo-script dom/element/element.rs)
@@ -301,8 +307,13 @@ const DOM_QUERY_BODY: &str = r###"(function(){
       }
       // Hidden check BEFORE measuring: getComputedStyle is far cheaper than
       // getClientRects, and hidden subtrees are numerous (menus, dialogs).
-      if (isHidden(el)) { skHid++; return; }
+      var __a = Date.now();
+      var __h = isHidden(el);
+      tmV += Date.now() - __a;
+      if (__h) { skHid++; return; }
+      __a = Date.now();
       var r = boxOf(el);
+      tmM += Date.now() - __a;
       if (!r) {
         // Boxless-but-rendered: hidden subtrees were already filtered above,
         // so these are candidates for forcing.
@@ -362,7 +373,9 @@ const DOM_QUERY_BODY: &str = r###"(function(){
       // menus) or any overflow:hidden ancestor has boxes but zero visible
       // area. Intersect up the ancestor chain; fully clipped rows never
       // become targets.
+      __a = Date.now();
       var cr = clipRect(el, r);
+      tmC += Date.now() - __a;
       if (!cr) { skClip++; return; }
       r = cr;
       cands.push([el, t, ty, r]);
@@ -418,7 +431,9 @@ const DOM_QUERY_BODY: &str = r###"(function(){
     // textContent is a straight tree walk and hidden subtrees never reach
     // here (isHidden filtered them first).
     var txt = "";
+    var __a = Date.now();
     try { txt = (el.textContent || "").replace(/\s+/g, " ").slice(0, 40); } catch (e2) {}
+    tmT += Date.now() - __a;
     var r = cc[3];
     out.push([idFor(el), cc[1], role, cc[2], Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height), txt]);
   }
@@ -429,7 +444,7 @@ const DOM_QUERY_BODY: &str = r###"(function(){
     var de = document.documentElement;
     if (de) { dw = de.scrollWidth || 0; dh = de.scrollHeight || 0; }
   } catch (e) {}
-  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], hid: skHid, clip: skClip, boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, forced: skForce, sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
+  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], hid: skHid, clip: skClip, boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, forced: skForce, t: [Math.round(tQ), Math.round(tmM), Math.round(tmV), Math.round(tmC), Math.round(tmT)], sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
 })()"###;
 
 /// Parsed snapshot: viewport-space candidates plus the true page scroll at
@@ -463,6 +478,10 @@ pub struct DomSnapshot {
     pub forced_boxes: usize,
     pub hidden_subtree: usize,
     pub clipped_away: usize,
+    /// In-page phase timings (ms): querySelectorAll, box measurement,
+    /// visibility walks, clip walks, text extraction. Finds the real
+    /// per-pull cost center instead of guessing.
+    pub timings: [u64; 5],
 }
 
 /// Parse a `dom_query_js` result into raw candidates. Lenient by design:
@@ -488,6 +507,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             forced_boxes: 0,
             hidden_subtree: 0,
             clipped_away: 0,
+            timings: [0; 5],
         };
     };
     let num_field = |key: &str| {
@@ -520,6 +540,14 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
     let forced_boxes = num_field("forced") as usize;
     let hidden_subtree = num_field("hid") as usize;
     let clipped_away = num_field("clip") as usize;
+    let mut timings = [0u64; 5];
+    if let Some(JSValue::Array(cols)) = root.get("t") {
+        for (i, col) in cols.iter().take(5).enumerate() {
+            if let JSValue::Number(n) = col {
+                timings[i] = (*n).max(0.0) as u64;
+            }
+        }
+    }
     let mut skipped = [0usize; 5];
     if let Some(JSValue::Array(cols)) = root.get("skip") {
         for (i, col) in cols.iter().take(5).enumerate() {
@@ -544,6 +572,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             forced_boxes,
             hidden_subtree,
             clipped_away,
+            timings,
         };
     };
     let mut nodes = Vec::new();
@@ -597,6 +626,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
         forced_boxes,
         hidden_subtree,
         clipped_away,
+        timings,
     }
 }
 
@@ -722,6 +752,10 @@ mod tests {
         root.insert("hid".to_string(), num(4.0));
         root.insert("clip".to_string(), num(3.0));
         root.insert(
+            "t".to_string(),
+            JSValue::Array(vec![num(5.0), num(40.0), num(12.0), num(3.0), num(1.0)]),
+        );
+        root.insert(
             "ccull".to_string(),
             JSValue::Array(vec![num(11.0), num(13.0)]),
         );
@@ -739,6 +773,7 @@ mod tests {
         assert_eq!(out.forced_boxes, 6);
         assert_eq!(out.hidden_subtree, 4);
         assert_eq!(out.clipped_away, 3);
+        assert_eq!(out.timings, [5, 40, 12, 3, 1]);
         assert_eq!(out.culled_ids, vec![11, 13]);
     }
 

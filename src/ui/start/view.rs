@@ -81,6 +81,10 @@ pub enum StartMessage {
     BrowserOpenExternal,
     BrowserReload,
     BrowserScrolled(f32),
+    /// Browser: toggle the F10 debug overlay from the card.
+    BrowserToggleOverlay,
+    /// Browser: toggle JS element-click for Button-kind dock targets.
+    BrowserToggleJsClick,
     /// Debug-only: a requested window screenshot arrived; save it with a
     /// correlator line (F10 overlay + dock-triggered shots).
     BrowserShot(iced::window::Screenshot),
@@ -807,10 +811,10 @@ pub struct BrowserPanel {
     pub last_dock_change: Option<Instant>,
     /// Last click point + time, for the R3 issue-flag correlation.
     pub last_click: Option<((f32, f32), Instant)>,
-    /// JS element-click mode for Button-kind dock targets (Diagnostics
-    /// toggle, off by default): `__sdsc_click` on the exact element instead
-    /// of the trusted synthetic pair. Lets A/B testing untrusted-activation
-    /// against trusted input per page.
+    /// JS element-click mode for Button-kind dock targets (toggled from the
+    /// browser card itself; off by default): `__sdsc_click` on the exact
+    /// element instead of the trusted synthetic pair. Lets A/B testing
+    /// untrusted-activation against trusted input per page.
     pub js_click: bool,
     /// Transient action hint shown in the card header ("Opening link…"):
     /// instant feedback that a click landed, so a slow-or-dead page reads
@@ -1133,6 +1137,28 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
                 .padding([6, 14])
                 .on_press(StartMessage::ToggleBrowser)
                 .style(theme::ghost),
+            button(
+                text(if panel.debug_overlay {
+                    "Overlay: on"
+                } else {
+                    "Overlay: off"
+                })
+                .size(14.0),
+            )
+            .padding([6, 14])
+            .on_press(StartMessage::BrowserToggleOverlay)
+            .style(theme::ghost),
+            button(
+                text(if panel.js_click {
+                    "JS click: on"
+                } else {
+                    "JS click: off"
+                })
+                .size(14.0),
+            )
+            .padding([6, 14])
+            .on_press(StartMessage::BrowserToggleJsClick)
+            .style(theme::ghost),
         ]
         .spacing(10),
         action_cluster(

@@ -447,14 +447,6 @@ pub enum ConfigureMessage {
     /// Shell-local only (never persisted); see Diagnostics.
     #[cfg(debug_assertions)]
     SetDebugLayoutBounds(bool),
-    /// Debug-only: browser target overlay + periodic frame shots.
-    /// Shell-local only (never persisted); mirrored into the browser panel.
-    #[cfg(debug_assertions)]
-    SetDebugBrowser(bool),
-    /// Debug-only: route Button-kind dock clicks through JS element
-    /// activation instead of the trusted synthetic pair. Shell-local only.
-    #[cfg(debug_assertions)]
-    SetJsClick(bool),
     /// Debug-only ambient tuning sliders (Diagnostics; shell-local, never
     /// persisted). Ranges match the clamps in `ui::shader::ambient` /
     /// `ui::start::mode`.
@@ -720,8 +712,6 @@ pub fn view<'a>(
     #[cfg(debug_assertions)] emulators: &'a [EmulatedPad],
     #[cfg(debug_assertions)] pending: &[PendingEmulatorChange],
     #[cfg(debug_assertions)] debug_layout_bounds: bool,
-    #[cfg(debug_assertions)] debug_browser: bool,
-    #[cfg(debug_assertions)] js_click: bool,
     #[cfg(debug_assertions)] debug_tune: &DebugAmbientTune,
 ) -> Element<'a, ConfigureMessage> {
     // Section heading doubles as the drag handle for the undecorated window.
@@ -809,10 +799,6 @@ pub fn view<'a>(
                     emulators,
                     pending,
                     debug_layout_bounds,
-                    #[cfg(debug_assertions)]
-                    debug_browser,
-                    #[cfg(debug_assertions)]
-                    js_click,
                     debug_tune,
                 ))
                 .into()
@@ -1202,8 +1188,6 @@ fn section_content<'a>(
     #[cfg(debug_assertions)] emulators: &'a [EmulatedPad],
     #[cfg(debug_assertions)] pending: &[PendingEmulatorChange],
     #[cfg(debug_assertions)] debug_layout_bounds: bool,
-    #[cfg(debug_assertions)] debug_browser: bool,
-    #[cfg(debug_assertions)] js_click: bool,
     #[cfg(debug_assertions)] debug_tune: &DebugAmbientTune,
 ) -> Element<'a, ConfigureMessage> {
     match state.section {
@@ -1216,17 +1200,13 @@ fn section_content<'a>(
         #[cfg(debug_assertions)]
         Section::Emulators => emulators_view(state, emulators, pending),
         #[cfg(debug_assertions)]
-        Section::Diagnostics => {
-            diagnostics_view(debug_layout_bounds, debug_browser, js_click, debug_tune)
-        }
+        Section::Diagnostics => diagnostics_view(debug_layout_bounds, debug_tune),
     }
 }
 
 #[cfg(debug_assertions)]
 fn diagnostics_view<'a>(
     debug_layout_bounds: bool,
-    debug_browser: bool,
-    js_click: bool,
     tune: &DebugAmbientTune,
 ) -> Element<'a, ConfigureMessage> {
     let stress = group(
@@ -1439,29 +1419,10 @@ fn diagnostics_view<'a>(
             ),
         ],
     );
-    let browser = group(
-        Some("Browser targets".to_string()),
-        vec![
-            toggle_row(
-                "Browser debug overlay + shots",
-                Some("Cursor/target/scroll readout on the card + frame PNGs in the data dir (F10)"),
-                debug_browser,
-                ConfigureMessage::SetDebugBrowser,
-            ),
-            toggle_row(
-                "JS element click for buttons",
-                Some(
-                    "Button-kind dock targets activate via in-page .click() instead of the trusted synthetic pair (manual A/B)",
-                ),
-                js_click,
-                ConfigureMessage::SetJsClick,
-            ),
-            note(
-                "Debug-only, off at boot and never saved. Shots land in shots/ under the data dir with a correlating app.log line.",
-            ),
-        ],
-    );
-    column![stress, tuning, bounds, browser]
+    // NOTE: browser-target toggles (F10 overlay, JS click) live on the
+    // browser card itself, not here — mid-test Settings round-trips were
+    // too slow. F10 key handling is untouched.
+    column![stress, tuning, bounds]
         .spacing(18)
         .width(Fill)
         .into()
@@ -3026,13 +2987,13 @@ mod tests {
         // panicking; the flag itself stays shell-local (never persisted).
         // Default tuning must also compose (and reproduce release visuals).
         let tune = super::DebugAmbientTune::default();
-        drop(super::diagnostics_view(false, false, false, &tune));
-        drop(super::diagnostics_view(true, true, true, &tune));
+        drop(super::diagnostics_view(false, &tune));
+        drop(super::diagnostics_view(true, &tune));
         let mut tuned = tune;
         tuned.pulse_freq = 0.0;
         tuned.time_scale = 0.0;
         tuned.kenburns_amp = 5.0;
-        drop(super::diagnostics_view(false, false, false, &tuned));
+        drop(super::diagnostics_view(false, &tuned));
     }
 
     #[test]

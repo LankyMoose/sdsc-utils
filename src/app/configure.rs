@@ -404,24 +404,6 @@ impl App {
                 Task::none()
             }
             #[cfg(debug_assertions)]
-            ConfigureMessage::SetDebugBrowser(enabled) => {
-                // Local overlay + shots only: deliberately no save_prefs.
-                // (Shots land in the data dir, prefs stay untouched.)
-                self.debug_browser = enabled;
-                self.start_state.browser.debug_overlay = enabled;
-                Task::none()
-            }
-            #[cfg(debug_assertions)]
-            ConfigureMessage::SetJsClick(enabled) => {
-                // Shell-local only: deliberately no save_prefs.
-                self.start_state.browser.js_click = enabled;
-                crate::platform::app_log::info(format!(
-                    "browser: js-click {}",
-                    if enabled { "on" } else { "off" }
-                ));
-                Task::none()
-            }
-            #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugAmbientFreq(v) => {
                 self.debug_ambient_freq = v.clamp(0.0, 5.0);
                 crate::ui::shader::ambient::set_pulse_freq(self.debug_ambient_freq);

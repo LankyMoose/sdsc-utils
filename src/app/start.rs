@@ -100,6 +100,27 @@ impl App {
             }
             StartMessage::BrowserOpenExternal => self.on_browser_open_external(),
             StartMessage::BrowserReload => self.on_browser_reload(),
+            StartMessage::BrowserToggleOverlay => {
+                self.debug_browser = !self.debug_browser;
+                self.start_state.browser.debug_overlay = self.debug_browser;
+                crate::platform::app_log::info(format!(
+                    "browser: overlay {}",
+                    if self.debug_browser { "on" } else { "off" }
+                ));
+                Task::none()
+            }
+            StartMessage::BrowserToggleJsClick => {
+                self.start_state.browser.js_click = !self.start_state.browser.js_click;
+                crate::platform::app_log::info(format!(
+                    "browser: js-click {}",
+                    if self.start_state.browser.js_click {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ));
+                Task::none()
+            }
             StartMessage::BrowserScrolled(y) => {
                 self.start_state.browser.note_scrolled(y);
                 Task::none()
