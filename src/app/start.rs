@@ -100,6 +100,7 @@ impl App {
             }
             StartMessage::BrowserOpenExternal => self.on_browser_open_external(),
             StartMessage::BrowserReload => self.on_browser_reload(),
+            StartMessage::BrowserHome => self.on_browser_go_home(),
             // Overlay is a debug-only tool (F10 path is gated the same way):
             // release builds keep the message variant (the card button is
             // compiled out there too) but never set the flag.
@@ -442,6 +443,10 @@ impl App {
         Task::none()
     }
 
+    /// Browser home page: hardcoded default until the settings screen lands
+    /// a configurable home pref.
+    pub(crate) const BROWSER_HOME_URL: &'static str = "https://www.google.com";
+
     /// Browser toggle: foreground the browser app through the multi-app
     /// manager and open the surface; toggling again suspends (close cancels
     /// in-flight work but keeps the cached page for an instant resume).
@@ -697,6 +702,14 @@ impl App {
             engine.send(EngineCommand::GoForward);
         }
         Task::none()
+    }
+
+    /// Browser home page. Hardcoded until the settings screen lands, then a
+    /// pref. Reuses the navigate path (fresh-page cursor/focusable reset,
+    /// theme sync) with the draft pinned to home.
+    pub(crate) fn on_browser_go_home(&mut self) -> Task<Message> {
+        self.start_state.browser.draft = Self::BROWSER_HOME_URL.to_string();
+        self.on_browser_navigate()
     }
 
     pub(crate) fn on_browser_fetched(

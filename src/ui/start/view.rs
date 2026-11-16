@@ -80,6 +80,9 @@ pub enum StartMessage {
     },
     BrowserOpenExternal,
     BrowserReload,
+    /// Browser: navigate to the home page (hardcoded for now; a settings
+    /// screen later makes it configurable).
+    BrowserHome,
     BrowserScrolled(f32),
     /// Browser: toggle the F10 debug overlay from the card.
     BrowserToggleOverlay,
@@ -1105,8 +1108,28 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         ]
         .align_y(Alignment::Center),
         space().height(4),
+        // Chrome-order toolbar: traverse, reload, home, address, go. The
+        // star lands after the address with bookmarks (B2.3). Back/forward
+        // stay always-enabled until the history stack (B2.4) drives greyed
+        // state; the engine no-ops without entries.
         row![
-            text_input("https://…", &panel.draft)
+            button(text("←").size(14.0))
+                .padding([8, 12])
+                .on_press(StartMessage::BrowserBack)
+                .style(theme::ghost),
+            button(text("→").size(14.0))
+                .padding([8, 12])
+                .on_press(StartMessage::BrowserForward)
+                .style(theme::ghost),
+            button(text("⟳").size(14.0))
+                .padding([8, 12])
+                .on_press(StartMessage::BrowserReload)
+                .style(theme::ghost),
+            button(text("⌂").size(14.0))
+                .padding([8, 12])
+                .on_press(StartMessage::BrowserHome)
+                .style(theme::ghost),
+            text_input("Search or enter URL", &panel.draft)
                 .id(browser_url_id())
                 .size(14.0)
                 .padding(8)
@@ -1129,10 +1152,6 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         // real functionality and ships everywhere.
         {
             let mut actions = row![
-                button(text("Reload").size(14.0))
-                    .padding([6, 14])
-                    .on_press(StartMessage::BrowserReload)
-                    .style(theme::ghost),
                 button(text("Open in system browser").size(14.0))
                     .padding([6, 14])
                     .on_press(StartMessage::BrowserOpenExternal)
