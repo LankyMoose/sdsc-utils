@@ -25,8 +25,8 @@ use embedder_traits::{
 use euclid::{Box2D, Point2D};
 
 use servo::{
-    DevicePixel, DevicePoint, DeviceVector2D, EventLoopWaker, LoadStatus, RenderingContext, Scroll,
-    ServoBuilder, SoftwareRenderingContext, UserContentManager, UserScript, WebView,
+    DevicePixel, DevicePoint, DeviceVector2D, EventLoopWaker, LoadStatus, Opts, RenderingContext,
+    Scroll, ServoBuilder, SoftwareRenderingContext, UserContentManager, UserScript, WebView,
     WebViewBuilder, WebViewDelegate, WebViewPoint, WebViewVector,
 };
 
@@ -515,7 +515,32 @@ fn run(
             }
         };
     let _ = ready.send(Ok(()));
+    // Persistent web storage: Servo reads/writes `localstorage.json` (and
+    // friends) under `config_dir` — without it everything is memory-only and
+    // search history, logins-in-localStorage etc. evaporate on restart. Power
+    // our own data dir (namespaced subdir, created up front: Servo's writer
+    // panics on a missing directory). Cookies stay memory-only: Servo 0.8
+    // has no persistent cookie jar, so cookie-backed personalization still
+    // resets per launch — an upstream gap, not a config one.
+    let storage_dir = crate::persist::paths::data_dir().join("servo");
+    if let Err(err) = std::fs::create_dir_all(&storage_dir) {
+        crate::platform::app_log::info(format!(
+            "servo-engine: storage dir unavailable ({}), web storage stays memory-only",
+            err
+        ));
+    }
+    let servo_opts = Opts {
+        config_dir: Some(storage_dir.clone()),
+        temporary_storage: false,
+        ..Default::default()
+    };
+    crate::platform::app_log::info(format!(
+        "servo-engine: storage dir={} temporary={}",
+        storage_dir.display(),
+        servo_opts.temporary_storage
+    ));
     let servo = ServoBuilder::default()
+        .opts(servo_opts)
         .event_loop_waker(Box::new(ThreadWaker { tx: wake_tx }))
         .build();
     let (dom_tx, dom_rx) = mpsc::channel();
