@@ -87,6 +87,15 @@ pub enum EngineEvent {
     UrlChanged {
         url: String,
     },
+    /// Page favicon arrived (Servo parses `<link rel=icon>` out of band).
+    /// Keyed by document URL; the UI caches handles per URL for the
+    /// bookmark bar and history rows.
+    FaviconChanged {
+        url: String,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
     /// Fresh focusable set from the accessibility tree. The UI re-snaps the
     /// cursor and drops stale attachments.
     A11yTree(Vec<crate::browser::cursor::Focusable>),

@@ -86,6 +86,15 @@ pub enum StartMessage {
     /// Browser: navigate to the home page (hardcoded for now; a settings
     /// screen later makes it configurable).
     BrowserHome,
+    /// Browser: star toggle — bookmark the current page (opening the rename
+    /// bubble), or open the bubble for an already-bookmarked page.
+    BrowserBookmarkStar,
+    /// Browser: rename draft inside the star bubble.
+    BrowserBookmarkNameChanged(String),
+    /// Browser: apply the bubble rename and close it.
+    BrowserBookmarkSave,
+    /// Browser: delete the current page's bookmark and close the bubble.
+    BrowserBookmarkRemove,
     BrowserScrolled(f32),
     /// Browser: toggle the F10 debug overlay from the card.
     BrowserToggleOverlay,
@@ -835,6 +844,17 @@ pub struct BrowserPanel {
     /// Browser debug overlay + shots (Diagnostics toggle / F10, mirrored
     /// from App). Never persisted.
     pub debug_overlay: bool,
+    /// Chrome-style bookmarks (disk-persisted). The star toggles the current
+    /// page; the bar offers one-click open.
+    pub bookmarks: Vec<crate::browser::bookmarks::Bookmark>,
+    /// Star bubble open: rename the current page's bookmark or remove it.
+    pub bookmark_bubble: bool,
+    /// Bubble rename draft (applied on Done, discarded on dismiss).
+    pub bookmark_name_draft: String,
+    /// Favicon handles by full page URL (engine `FaviconChanged`), shared by
+    /// the bookmark bar and history rows. Capped; oldest evicted first.
+    pub favicons: HashMap<String, iced::widget::image::Handle>,
+    pub favicon_order: Vec<String>,
 }
 
 impl BrowserPanel {
@@ -856,6 +876,29 @@ impl BrowserPanel {
 
     pub fn note_scrolled(&mut self, y: f32) {
         self.scroll_y = y.max(0.0);
+    }
+
+    /// Cap on cached favicon handles: oldest evicted first.
+    pub const MAX_FAVICONS: usize = 64;
+
+    /// True when `url` is bookmarked (drives the star state).
+    pub fn is_bookmarked(&self, url: &str) -> bool {
+        !url.is_empty() && self.bookmarks.iter().any(|b| b.url == url)
+    }
+
+    /// Cache a favicon handle, evicting the oldest past the cap.
+    pub fn note_favicon(&mut self, url: String, handle: iced::widget::image::Handle) {
+        if url.is_empty() {
+            return;
+        }
+        if !self.favicons.contains_key(&url) {
+            self.favicon_order.push(url.clone());
+            while self.favicon_order.len() > Self::MAX_FAVICONS {
+                let oldest = self.favicon_order.remove(0);
+                self.favicons.remove(&oldest);
+            }
+        }
+        self.favicons.insert(url, handle);
     }
 
     /// Step the body scroll (reader text); returns the new absolute offset.
@@ -1085,7 +1128,7 @@ fn browser_debug_line(panel: &BrowserPanel) -> Element<'_, StartMessage> {
 /// other target; dpad-through-the-list is a later refinement.
 fn browser_suggestions(panel: &BrowserPanel) -> Element<'_, StartMessage> {
     let draft = panel.draft.trim();
-    if draft.is_empty() || draft == panel.session.url() {
+    if draft.is_empty() || draft == panel.session.url() || panel.bookmark_bubble {
         return space().height(Length::Fixed(0.0)).into();
     }
     let matches = panel.session.suggestions(draft);
@@ -1114,6 +1157,84 @@ fn browser_suggestions(panel: &BrowserPanel) -> Element<'_, StartMessage> {
         .width(Fill)
         .style(theme::menu_panel)
         .into()
+}
+
+/// Address field id for the star-bubble rename box.
+pub fn bookmark_name_id() -> iced::widget::Id {
+    iced::widget::Id::new("start-bookmark-name")
+}
+
+/// Chrome-style bookmarks bar: one-click rows under the toolbar, favicon +
+/// name each, chunked into short rows (no chevron overflow yet). In-flow by
+/// design (persistent bars legitimately own layout); only dropdowns float.
+/// Hidden entirely when empty.
+fn browser_bookmark_bar(panel: &BrowserPanel) -> Element<'_, StartMessage> {
+    if panel.bookmarks.is_empty() {
+        return space().height(Length::Fixed(0.0)).into();
+    }
+    let mut rows = column![].spacing(4);
+    for chunk in panel.bookmarks.chunks(6) {
+        let mut row_elems = row![].spacing(6);
+        for b in chunk {
+            let mut inner = row![].spacing(6).align_y(Alignment::Center);
+            if let Some(icon) = panel.favicons.get(&b.url) {
+                inner = inner.push(
+                    image(icon.clone())
+                        .width(Length::Fixed(16.0))
+                        .height(Length::Fixed(16.0)),
+                );
+            }
+            inner = inner.push(text(b.name()).size(13.0).color(theme::INK));
+            row_elems = row_elems.push(
+                button(inner)
+                    .padding([4, 10])
+                    .on_press(StartMessage::BrowserAutocompletePick(b.url.clone()))
+                    .style(theme::ghost),
+            );
+        }
+        rows = rows.push(row_elems);
+    }
+    rows.into()
+}
+
+/// Star bubble overlay (stack layer, top-right under the toolbar): rename
+/// the current page's bookmark or remove it. Done applies the draft.
+fn browser_bookmark_bubble(panel: &BrowserPanel) -> Element<'_, StartMessage> {
+    if !panel.bookmark_bubble {
+        return space().height(Length::Fixed(0.0)).into();
+    }
+    row![
+        space().width(Fill),
+        container(
+            column![
+                text("Bookmark").size(13.0).color(theme::INK),
+                text_input("Name", &panel.bookmark_name_draft)
+                    .id(bookmark_name_id())
+                    .size(13.0)
+                    .padding(6)
+                    .on_input(StartMessage::BrowserBookmarkNameChanged)
+                    .on_submit(StartMessage::BrowserBookmarkSave)
+                    .style(theme::input),
+                row![
+                    button(text("Remove").size(13.0))
+                        .padding([6, 12])
+                        .on_press(StartMessage::BrowserBookmarkRemove)
+                        .style(theme::ghost),
+                    button(text("Done").size(13.0))
+                        .padding([6, 12])
+                        .on_press(StartMessage::BrowserBookmarkSave)
+                        .style(theme::primary),
+                ]
+                .spacing(8),
+            ]
+            .spacing(6),
+        )
+        .padding(10)
+        .width(Length::Fixed(300.0))
+        .style(theme::menu_panel),
+    ]
+    .width(Fill)
+    .into()
 }
 
 /// In-Start browser card: URL row, page, reload / external / close
@@ -1150,10 +1271,9 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         ]
         .align_y(Alignment::Center),
         space().height(4),
-        // Chrome-order toolbar: traverse, reload, home, address, go. The
-        // star lands after the address with bookmarks (B2.3). Back/forward
-        // stay always-enabled until the history stack (B2.4) drives greyed
-        // state; the engine no-ops without entries.
+        // Chrome-order toolbar: traverse, reload, home, address, star, go.
+        // Back/forward stay always-enabled until the history stack (B2.4)
+        // drives greyed state; the engine no-ops without entries.
         row![
             button(text("←").size(14.0))
                 .padding([8, 12])
@@ -1178,6 +1298,17 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
                 .on_input(StartMessage::BrowserUrlChanged)
                 .on_submit(StartMessage::BrowserNavigate)
                 .style(theme::input),
+            button(
+                text(if panel.is_bookmarked(session.url()) {
+                    "★"
+                } else {
+                    "☆"
+                })
+                .size(16.0),
+            )
+            .padding([8, 10])
+            .on_press(StartMessage::BrowserBookmarkStar)
+            .style(theme::ghost),
             button(text("Go").size(14.0))
                 .padding([8, 14])
                 .on_press(StartMessage::BrowserNavigate)
@@ -1186,12 +1317,14 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         .spacing(8)
         .align_y(Alignment::Center),
         space().height(8),
-        // Fixed-position dropdown: the suggestions overlay floats over the
-        // page — `stack!` sizes to its base layer, so the dropdown appearing
-        // never shoves content down.
+        browser_bookmark_bar(panel),
+        // Fixed-position dropdowns: the stack sizes to its base layer, so
+        // suggestions and the star bubble appearing never shove content
+        // down. The bubble wins over suggestions (it owns the keyboard).
         stack![
             column![browser_page_view(state, img_w), browser_debug_line(panel),],
             browser_suggestions(panel),
+            browser_bookmark_bubble(panel),
         ],
         space().height(8),
         // Card action row: the overlay toggle is debug-only (mirrors the

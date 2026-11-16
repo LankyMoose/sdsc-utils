@@ -889,6 +889,10 @@ impl App {
             pending_emulator_commits: std::collections::HashMap::new(),
         };
 
+        // Disk-persisted bookmarks into the browser panel (the one state
+        // that survives restarts by design).
+        app.start_state.browser.bookmarks = crate::browser::bookmarks::load();
+
         // Show the tray immediately; the daemon owns it for its whole lifetime.
         app.create_tray();
         // Forensics line: which binary, which install flavor, and whether the

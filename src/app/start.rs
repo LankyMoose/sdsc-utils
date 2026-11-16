@@ -105,6 +105,13 @@ impl App {
             StartMessage::BrowserOpenExternal => self.on_browser_open_external(),
             StartMessage::BrowserReload => self.on_browser_reload(),
             StartMessage::BrowserHome => self.on_browser_go_home(),
+            StartMessage::BrowserBookmarkStar => self.on_browser_bookmark_star(),
+            StartMessage::BrowserBookmarkNameChanged(draft) => {
+                self.start_state.browser.bookmark_name_draft = draft;
+                Task::none()
+            }
+            StartMessage::BrowserBookmarkSave => self.on_browser_bookmark_save(),
+            StartMessage::BrowserBookmarkRemove => self.on_browser_bookmark_remove(),
             // Overlay is a debug-only tool (F10 path is gated the same way):
             // release builds keep the message variant (the card button is
             // compiled out there too) but never set the flag.
@@ -368,10 +375,15 @@ impl App {
             }
             Task::none()
         } else if self.start_state.browser.session.is_open() {
-            // Browser surface open: Cancel backs out of URL-edit mode first,
-            // then closes the surface (overlay priority: settings → browser
-            // → manual → replace → edit → dock → close).
+            // Browser surface open: Cancel dismisses the star bubble first,
+            // then backs out of URL-edit mode, then closes the surface
+            // (overlay priority: settings → browser → manual → replace →
+            // edit → dock → close).
             self.play_start_cue(UiSoundKind::Action);
+            if self.start_state.browser.bookmark_bubble {
+                self.start_state.browser.bookmark_bubble = false;
+                return Task::none();
+            }
             if self.start_state.browser.url_editing {
                 self.start_state.browser.url_editing = false;
                 crate::controller::hid::diag::diag_info(
@@ -548,6 +560,7 @@ impl App {
         self.start_state.browser.draft = url.clone();
         self.start_state.browser.scroll_y = 0.0;
         self.start_state.browser.url_editing = false;
+        self.start_state.browser.bookmark_bubble = false;
         // Fresh page: cursor back to center; focusables arrive with the
         // accessibility tree.
         self.start_state.browser.cursor = crate::browser::cursor::Cursor::new();
@@ -726,6 +739,68 @@ impl App {
     pub(crate) fn on_browser_go_home(&mut self) -> Task<Message> {
         self.start_state.browser.draft = Self::BROWSER_HOME_URL.to_string();
         self.on_browser_navigate()
+    }
+
+    /// Star toggle: bookmark the current page (opening the rename bubble),
+    /// or open the bubble for an already-bookmarked page. No page, no-op
+    /// (fresh surface navigates home first — nothing to star yet).
+    pub(crate) fn on_browser_bookmark_star(&mut self) -> Task<Message> {
+        let url = self.start_state.browser.session.url().to_string();
+        if url.is_empty() {
+            return Task::none();
+        }
+        let panel = &mut self.start_state.browser;
+        if !panel.is_bookmarked(&url) {
+            let title = panel.session.title().unwrap_or(&url).to_string();
+            panel.bookmarks.push(crate::browser::bookmarks::Bookmark {
+                url: url.clone(),
+                title,
+            });
+            crate::browser::bookmarks::save(&panel.bookmarks);
+        }
+        let draft = panel
+            .bookmarks
+            .iter()
+            .find(|b| b.url == url)
+            .map(|b| b.title.clone())
+            .unwrap_or_default();
+        panel.bookmark_name_draft = draft;
+        panel.bookmark_bubble = true;
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Action);
+        operation::focus(start_view::bookmark_name_id())
+    }
+
+    /// Star bubble Done: apply a non-empty rename, persist, close.
+    /// An empty draft keeps the existing name (Chrome requires one; v1
+    /// keeps the old instead of deleting).
+    pub(crate) fn on_browser_bookmark_save(&mut self) -> Task<Message> {
+        let url = self.start_state.browser.session.url().to_string();
+        let panel = &mut self.start_state.browser;
+        if let Some(entry) = panel.bookmarks.iter_mut().find(|b| b.url == url) {
+            let renamed = panel.bookmark_name_draft.trim().to_string();
+            if !renamed.is_empty() {
+                entry.title = renamed;
+            }
+            crate::browser::bookmarks::save(&panel.bookmarks);
+        }
+        self.start_state.browser.bookmark_bubble = false;
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Action);
+        Task::none()
+    }
+
+    /// Star bubble Remove: delete the current page's bookmark, persist,
+    /// close.
+    pub(crate) fn on_browser_bookmark_remove(&mut self) -> Task<Message> {
+        let url = self.start_state.browser.session.url().to_string();
+        let panel = &mut self.start_state.browser;
+        panel.bookmarks.retain(|b| b.url != url);
+        crate::browser::bookmarks::save(&panel.bookmarks);
+        panel.bookmark_bubble = false;
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Action);
+        Task::none()
     }
 
     pub(crate) fn on_browser_fetched(
@@ -1099,6 +1174,15 @@ impl App {
             EngineEvent::UrlChanged { url } => {
                 self.start_state.browser.session.note_url(url.clone());
                 self.start_state.browser.draft = url;
+            }
+            EngineEvent::FaviconChanged {
+                url,
+                width,
+                height,
+                rgba,
+            } => {
+                let handle = iced::widget::image::Handle::from_rgba(width, height, rgba);
+                self.start_state.browser.note_favicon(url, handle);
             }
             EngineEvent::A11yTree(items) => {
                 self.start_state.browser.focusables = items;

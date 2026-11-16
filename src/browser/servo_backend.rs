@@ -163,6 +163,9 @@ struct Shared {
     /// compared against it: a new document clears the tree, same-document
     /// fragment/pushState traffic keeps it (no flash, no stale nodes).
     last_url: Option<String>,
+    /// Full current URL (fragments kept): identity key for per-URL caches
+    /// like favicons, where the stripped doc key would miss.
+    last_full_url: String,
     /// Verbose per-target DOM diagnostics (`SDSC_AX_DEBUG=1`): js id, kind,
     /// and rect for every freshly mapped target.
     ax_debug: bool,
@@ -208,6 +211,8 @@ impl WebViewDelegate for Delegate {
         // NOTE: deliberately does not touch `last_url` — history comparison
         // owns document identity, and url-changed fires first on
         // client-side navigations. Updating here would pre-empt the clear.
+        // The full URL is safe to track (favicon identity only).
+        self.shared.borrow_mut().last_full_url = url.to_string();
         self.shared.borrow().handle.emit(EngineEvent::UrlChanged {
             url: url.to_string(),
         });
@@ -227,7 +232,30 @@ impl WebViewDelegate for Delegate {
         }
         crate::platform::app_log::info(format!("servo-engine: history cleared for {key}"));
         shared.last_url = Some(key.to_string());
+        shared.last_full_url = url.as_str().to_string();
         clear_tree(&mut shared);
+    }
+
+    fn notify_favicon_changed(&self, webview: WebView) {
+        // Servo parses `<link rel=icon>` out of band; the frame rides along
+        // on the webview. Keyed by full URL for the bookmark/history caches.
+        let shared = self.shared.borrow();
+        let url = shared.last_full_url.clone();
+        let Some(icon) = webview.favicon() else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let Some((width, height, rgba)) = favicon_rgba(&icon) else {
+            return;
+        };
+        shared.handle.emit(EngineEvent::FaviconChanged {
+            url,
+            width,
+            height,
+            rgba,
+        });
     }
 
     fn notify_page_title_changed(&self, _webview: WebView, title: Option<String>) {
@@ -599,6 +627,7 @@ fn run(
         probe_deadline: None,
         content: None,
         last_url: None,
+        last_full_url: String::new(),
         ax_debug: std::env::var("SDSC_AX_DEBUG").is_ok(),
     }));
     // Auto-install the DOM observers into every document (fresh loads,
@@ -676,6 +705,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                     state.load_started_at = Some(Instant::now());
                     // Fresh page: clear_tree drops DOM targets, scroll and extent.
                     state.last_url = Some(doc_key(&url).to_string());
+                    state.last_full_url = url.clone();
                     clear_tree(&mut state);
                     state
                         .handle
@@ -1420,6 +1450,68 @@ fn rebase_scroll(state: &mut Shared, scroll: (f32, f32)) {
         x: rebased.0,
         y: rebased.1,
     });
+}
+
+/// Convert a Servo favicon frame to RGBA8 bytes for an iced image handle.
+/// `None` for empty, oversized (>256px — favicons are tiny; anything larger
+/// is a mislabeled hero image), short, or unsupported formats.
+fn favicon_rgba(image: &embedder_traits::Image) -> Option<(u32, u32, Vec<u8>)> {
+    use embedder_traits::PixelFormat;
+    let (w, h) = (image.width, image.height);
+    if w == 0 || h == 0 || w > 256 || h > 256 {
+        return None;
+    }
+    let px = (w as usize) * (h as usize);
+    let data = image.data();
+    let rgba = match image.format {
+        PixelFormat::RGBA8 => {
+            if data.len() != px * 4 {
+                return None;
+            }
+            data.to_vec()
+        }
+        PixelFormat::BGRA8 => {
+            if data.len() != px * 4 {
+                return None;
+            }
+            let mut out = Vec::with_capacity(data.len());
+            for chunk in data.as_chunks::<4>().0 {
+                out.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
+            }
+            out
+        }
+        PixelFormat::RGB8 => {
+            if data.len() != px * 3 {
+                return None;
+            }
+            let mut out = Vec::with_capacity(px * 4);
+            for chunk in data.as_chunks::<3>().0 {
+                out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            }
+            out
+        }
+        PixelFormat::K8 => {
+            if data.len() != px {
+                return None;
+            }
+            let mut out = Vec::with_capacity(px * 4);
+            for g in data {
+                out.extend_from_slice(&[*g, *g, *g, 255]);
+            }
+            out
+        }
+        PixelFormat::KA8 => {
+            if data.len() != px * 2 {
+                return None;
+            }
+            let mut out = Vec::with_capacity(px * 4);
+            for chunk in data.as_chunks::<2>().0 {
+                out.extend_from_slice(&[chunk[0], chunk[0], chunk[0], chunk[1]]);
+            }
+            out
+        }
+    };
+    Some((w, h, rgba))
 }
 
 /// Parse the window-truth coordinates off a dirty-ping URL (`?wx=&wy=`).

@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 
+pub mod bookmarks;
 pub mod cursor;
 pub mod dom;
 pub mod engine;
