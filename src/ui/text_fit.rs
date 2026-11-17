@@ -1,13 +1,13 @@
 //! Pixel-aware single-line truncation (End ellipsis) for browser chrome.
 //!
-//! Renders nothing itself: it measures with cosmic-text 0.18 (system sans,
+//! Renders nothing itself: it measures with cosmic-text 0.19 (system sans,
 //! matching the stock iced text stack) and returns a pre-truncated string
 //! the normal iced `text` widget draws. All rendering stays on iced's own
 //! pipeline — no second font/raster/DPI path to maintain.
 //!
 //! The helper mirrors iced's defaults (sans family, Normal weight, Auto
 //! shaping: Basic for pure-ASCII, Advanced otherwise) with a small safety
-//! margin absorbing shaper-version drift between the measuring 0.18 stack
+//! margin absorbing shaper-version drift between the measuring 0.19 stack
 //! and iced 0.14's rendering 0.15 stack. Truncation splits at char
 //! boundaries by construction, so multi-byte glyphs (emoji, CJK) never tear.
 
@@ -44,8 +44,8 @@ pub fn text_width_px(s: &str, font_px: f32) -> f32 {
         cosmic_text::Shaping::Advanced
     };
     let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::SansSerif);
-    buffer.set_wrap(&mut fs, cosmic_text::Wrap::None);
-    buffer.set_text(&mut fs, s, &attrs, shaping, None);
+    buffer.set_wrap(cosmic_text::Wrap::None);
+    buffer.set_text(s, &attrs, shaping, None);
     buffer.shape_until_scroll(&mut fs, false);
     buffer
         .layout_runs()
