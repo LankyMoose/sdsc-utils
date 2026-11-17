@@ -1483,6 +1483,9 @@ impl App {
             EngineEvent::ScrollOffset { x, y } => {
                 self.start_state.browser.scroll_offset = (x, y);
             }
+            EngineEvent::ActivityChanged { phase } => {
+                self.start_state.browser.engine_activity = phase;
+            }
             EngineEvent::HistoryChanged { entries, current } => {
                 self.start_state
                     .browser

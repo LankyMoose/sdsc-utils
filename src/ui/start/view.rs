@@ -919,6 +919,8 @@ pub struct BrowserPanel {
     /// requires the stick at rest (an active steer means the user is driving
     /// and wins over the page).
     pub last_pad_stick: (f32, f32),
+    /// Engine phase for the status strip (navigate → load → DOM boot).
+    pub engine_activity: crate::browser::engine::EngineActivity,
 }
 
 impl BrowserPanel {
@@ -1396,6 +1398,45 @@ fn browser_history_selector(panel: &BrowserPanel) -> Element<'_, StartMessage> {
         .into()
 }
 
+/// Hovered link target, if the cursor sits on a link with a URL: the
+/// Chrome-style status-bar URL. Viewport-space point against the translated
+/// tree; first id-order match wins (stable across pulls).
+fn browser_hover_link(panel: &BrowserPanel) -> Option<String> {
+    let (x, y) = (panel.cursor.x, panel.cursor.y);
+    panel
+        .focusables
+        .iter()
+        .find(|o| {
+            o.kind == crate::browser::cursor::FocusKind::Link
+                && x >= o.x
+                && x <= o.x + o.w
+                && y >= o.y
+                && y <= o.y + o.h
+        })
+        .and_then(|o| o.url.clone())
+}
+
+/// Status strip under the toolbar: hovered-link URL wins (Chrome-style),
+/// else the live engine phase, else the session URL so the strip never
+/// collapses (stable layout). Long URLs ellipsize to pixels like the other
+/// browser rows.
+fn browser_status_strip(panel: &BrowserPanel) -> Element<'_, StartMessage> {
+    let line = if let Some(url) = browser_hover_link(panel) {
+        url
+    } else {
+        let activity = panel.engine_activity.label();
+        if activity.is_empty() {
+            panel.session.url().to_string()
+        } else {
+            activity.to_string()
+        }
+    };
+    text(text_fit::ellipsize_to_width(&line, 11.0, 640.0))
+        .size(11.0)
+        .color(theme::MUTED)
+        .into()
+}
+
 /// In-Start browser card: URL row, page, reload / external / close
 /// actions. Sized by the caller (near-full-bleed; see `immersive::view`),
 /// so the root column fills its card.
@@ -1483,7 +1524,9 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         ]
         .spacing(8)
         .align_y(Alignment::Center),
-        space().height(8),
+        space().height(4),
+        browser_status_strip(panel),
+        space().height(4),
         browser_bookmark_bar(panel),
         // Fixed-position dropdowns: the stack sizes to its base layer, so
         // suggestions, the star bubble, and the history selector appearing

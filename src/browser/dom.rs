@@ -26,6 +26,10 @@ pub struct DomRaw {
     pub w: f32,
     pub h: f32,
     pub text: String,
+    /// Resolved link target (`href`, absolute, capped; empty when none).
+    pub url: String,
+    /// Carries the `autofocus` attribute (ground truth for traces).
+    pub autofocus: bool,
 }
 
 /// Marker shared by the dirty-ping channels (B=fetch, C=sendBeacon).
@@ -537,7 +541,14 @@ const DOM_QUERY_BODY: &str = r###"(function(){
     try { txt = (el.textContent || "").replace(/\s+/g, " ").slice(0, 40); } catch (e2) {}
     tmT += Date.now() - __a;
     var r = cr;
-    out.push([idFor(el), cc[1], role, cc[2], Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height), txt]);
+    // Hovered-link status needs the target: resolved href (absolute), capped
+    // so pathological query strings never bloat the snapshot.
+    var href = "";
+    try { if (typeof el.href === "string") href = el.href.slice(0, 512); } catch (e3) {}
+    // Autofocus ground truth for traces: which elements carry the attribute.
+    var af = 0;
+    try { if (el.hasAttribute && el.hasAttribute("autofocus")) af = 1; } catch (e4) {}
+    out.push([idFor(el), cc[1], role, cc[2], Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height), txt, href, af]);
   }
   var sx = 0, sy = 0;
   try { sx = window.scrollX || window.pageXOffset || 0; sy = window.scrollY || window.pageYOffset || 0; } catch (e) {}
@@ -721,6 +732,8 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             w,
             h,
             text: str_(8),
+            url: str_(9),
+            autofocus: matches!(cols.get(10), Some(JSValue::Number(n)) if *n != 0.0),
         });
     }
     DomSnapshot {
@@ -839,8 +852,39 @@ mod tests {
         assert_eq!(out.nodes[0].tag, "textarea");
         assert_eq!(out.nodes[0].x, 10.0);
         assert_eq!(out.nodes[1].typ, "password");
+        // No link/flag columns in this fixture: empty + unset.
+        assert_eq!(out.nodes[0].url, "");
+        assert!(!out.nodes[0].autofocus);
         // No scroll fields in this fixture: origin, the safe assumption.
         assert_eq!(out.scroll, (0.0, 0.0));
+    }
+
+    #[test]
+    fn parse_reads_href_and_autofocus() {
+        let value = JSValue::Object({
+            let mut root = HashMap::new();
+            root.insert(
+                "nodes".to_string(),
+                JSValue::Array(vec![row(vec![
+                    num(3.0),
+                    str_("a"),
+                    str_(""),
+                    str_(""),
+                    num(10.0),
+                    num(20.0),
+                    num(100.0),
+                    num(30.0),
+                    str_("Example"),
+                    str_("https://example.com/page?q=1"),
+                    num(1.0),
+                ])]),
+            );
+            root
+        });
+        let out = parse_dom_snapshot(&value);
+        assert_eq!(out.nodes.len(), 1);
+        assert_eq!(out.nodes[0].url, "https://example.com/page?q=1");
+        assert!(out.nodes[0].autofocus);
     }
 
     #[test]

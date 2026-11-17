@@ -8,6 +8,35 @@
 
 use std::sync::{Arc, Mutex, mpsc};
 
+/// Coarse engine phase for the browser status strip. The backend owns the
+/// transitions (navigate → load → DOM boot); the UI just renders the
+/// latest value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EngineActivity {
+    /// Nothing in flight.
+    #[default]
+    Idle,
+    /// Explicit navigate accepted, load not started yet.
+    Navigating,
+    /// Document bytes arriving (`Started` / `HeadParsed`).
+    Loading,
+    /// Document complete; DOM observers installing and the first snapshot
+    /// round-tripping ("initializing JS").
+    Initializing,
+}
+
+impl EngineActivity {
+    /// Status-strip label; empty when idle (Chrome shows nothing then).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "",
+            Self::Navigating => "Navigating…",
+            Self::Loading => "Loading…",
+            Self::Initializing => "Initializing…",
+        }
+    }
+}
+
 /// One rendered page frame: RGBA pixels for an iced image handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageFrame {
@@ -101,6 +130,11 @@ pub enum EngineEvent {
         width: u32,
         height: u32,
         rgba: Vec<u8>,
+    },
+    /// Engine phase changed (navigate → load → DOM boot). Drives the
+    /// browser status strip ("real" status, not just clicks).
+    ActivityChanged {
+        phase: EngineActivity,
     },
     /// Fresh focusable set from the accessibility tree. The UI re-snaps the
     /// cursor and drops stale attachments.

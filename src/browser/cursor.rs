@@ -22,6 +22,8 @@ pub struct Focusable {
     pub w: f32,
     pub h: f32,
     pub kind: FocusKind,
+    /// Resolved link target (hovered-link status); `None` when none.
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,6 +475,7 @@ mod tests {
             w: 100.0,
             h: 30.0,
             kind: FocusKind::Link,
+            url: None,
         }
     }
 
@@ -970,6 +973,7 @@ mod tests {
             w: 100.0,
             h: 100.0,
             kind: FocusKind::Link,
+            url: None,
         };
         let (cx, cy) = Cursor::exit_point(&square, 1.0, 1.0);
         assert!(

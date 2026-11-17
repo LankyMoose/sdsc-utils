@@ -35,7 +35,7 @@ use crate::browser::dom::{
     DOM_DIRTY_MARKER, DOM_INSTALL_JS, DOM_PING_URL, PROBE_ARM_JS, PROBE_READ_JS, dom_boot_js,
     dom_kind, dom_query_js, parse_dom_snapshot, parse_loop_probe,
 };
-use crate::browser::engine::{EngineCommand, EngineEvent, EngineHandle, PageFrame};
+use crate::browser::engine::{EngineActivity, EngineCommand, EngineEvent, EngineHandle, PageFrame};
 
 /// Fixed offscreen viewport (phase 1; the iced image scales to the card).
 const VIEWPORT_WIDTH: u32 = 800;
@@ -103,6 +103,8 @@ struct Shared {
     /// unknown). Compared per ingest so autofocus / JS `.focus()` dock the
     /// cursor exactly once per change. Reset per document with the maps.
     last_focus: Option<u64>,
+    /// Coarse engine phase for the status strip; emitted on change only.
+    activity: EngineActivity,
     /// Fresh document (or fresh load) needs the install+snapshot boot
     /// round-trip. Set by every document event, cleared on dispatch.
     dom_boot: bool,
@@ -282,6 +284,7 @@ impl WebViewDelegate for Delegate {
                     "servo-engine: load {status:?} url={}",
                     shared.last_url.as_deref().unwrap_or("?"),
                 ));
+                set_activity(&mut shared, EngineActivity::Loading);
             }
             LoadStatus::Complete => {
                 if let Some(started) = shared.load_started_at {
@@ -293,8 +296,10 @@ impl WebViewDelegate for Delegate {
                 shared.load_started_at = None;
                 // Fresh document settling in: boot (idempotent install +
                 // snapshot) once rendering lands. New load, new verdicts.
+                // Content arrived; now the DOM observers install.
                 shared.dom_boot = true;
                 shared.dom_epoch = shared.dom_epoch.wrapping_add(1);
+                set_activity(&mut shared, EngineActivity::Initializing);
                 // Debug-only storage spike diagnostic: one in-page
                 // localStorage/sessionStorage/cookie census per document.
                 #[cfg(debug_assertions)]
@@ -312,6 +317,7 @@ impl WebViewDelegate for Delegate {
                 // timeout misreported them. Surface immediately.
                 crate::platform::app_log::warn("servo-engine: load stopped before complete");
                 shared.load_started_at = None;
+                set_activity(&mut shared, EngineActivity::Idle);
                 let generation = shared.generation;
                 shared.handle.emit(EngineEvent::LoadFinished {
                     generation,
@@ -457,6 +463,8 @@ struct DomEntry {
     kind: FocusKind,
     tag: String,
     role: String,
+    /// Resolved link target (empty when none): hovered-link status.
+    url: String,
     x: f32,
     y: f32,
     w: f32,
@@ -502,6 +510,11 @@ fn collect_focusables(shared: &mut Shared) -> (Vec<Focusable>, (f32, f32)) {
                 w: entry.w,
                 h: entry.h,
                 kind: entry.kind,
+                url: if entry.url.is_empty() {
+                    None
+                } else {
+                    Some(entry.url.clone())
+                },
             });
         }
     }
@@ -650,6 +663,7 @@ fn run(
         last_url: None,
         last_full_url: String::new(),
         last_focus: None,
+        activity: EngineActivity::Idle,
         ax_debug: std::env::var("SDSC_AX_DEBUG").is_ok(),
     }));
     // Auto-install the DOM observers into every document (fresh loads,
@@ -747,6 +761,8 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                     state.last_url = Some(doc_key(&url).to_string());
                     state.last_full_url = url.clone();
                     clear_tree(&mut state);
+                    // Explicit user navigation (overrides clear_tree's Loading).
+                    set_activity(&mut state, EngineActivity::Navigating);
                     state
                         .handle
                         .emit(EngineEvent::UrlChanged { url: url.clone() });
@@ -754,6 +770,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                     webview.set_focused(state.visible && !state.suspended);
                 }
                 Err(err) => {
+                    set_activity(&mut state, EngineActivity::Idle);
                     state.handle.emit(EngineEvent::LoadFinished {
                         generation,
                         result: Err(format!("bad URL: {err}")),
@@ -959,10 +976,25 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
     }
 }
 
+/// Set the status-strip phase, emitting (and logging) only on change.
+fn set_activity(state: &mut Shared, phase: EngineActivity) {
+    if state.activity == phase {
+        return;
+    }
+    crate::platform::app_log::info(format!(
+        "servo-engine: activity {:?} -> {phase:?}",
+        state.activity
+    ));
+    state.activity = phase;
+    state.handle.emit(EngineEvent::ActivityChanged { phase });
+}
+
 /// Document changed (fresh load or history travel): drop DOM targets, scroll
 /// and content extent. Session history does not reliably restore scroll,
 /// and stale anything misplaces every outline (observed in testing).
 fn clear_tree(state: &mut Shared) {
+    // A new document is loading content from here.
+    set_activity(state, EngineActivity::Loading);
     if !state.dom.is_empty() {
         state.dom.clear();
         state.dom_uid.clear();
@@ -1386,6 +1418,7 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128, skip_rebase: bo
             n.kind = kind;
             n.tag = r.tag.clone();
             n.role = r.role.clone();
+            n.url = r.url.clone();
             n.x = r.x + sx;
             n.y = r.y + sy;
             n.w = r.w;
@@ -1402,6 +1435,7 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128, skip_rebase: bo
                     kind,
                     tag: r.tag.clone(),
                     role: r.role.clone(),
+                    url: r.url.clone(),
                     x: r.x + sx,
                     y: r.y + sy,
                     w: r.w,
@@ -1412,7 +1446,7 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128, skip_rebase: bo
             fresh += 1;
             if state.ax_debug {
                 crate::platform::app_log::info(format!(
-                    "servo-dom map #{id} <= js#{} {kind:?} [{}]{} {}",
+                    "servo-dom map #{id} <= js#{} {kind:?} [{}]{}{} {}",
                     r.id,
                     r.tag,
                     if r.role.is_empty() {
@@ -1420,6 +1454,7 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128, skip_rebase: bo
                     } else {
                         format!(" role={}", r.role)
                     },
+                    if r.autofocus { " autofocus" } else { "" },
                     r.text.chars().take(40).collect::<String>()
                 ));
             }
@@ -1473,6 +1508,12 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128, skip_rebase: bo
         if let Some(id) = focus {
             state.handle.emit(EngineEvent::FocusChanged { id });
         }
+    }
+    // First snapshot after a completed document ends the initializing phase
+    // (DOM observers are in, targets flowing). Gated on Initializing so
+    // scroll-settle pulls can never Idle-out an in-flight load.
+    if state.activity == EngineActivity::Initializing {
+        set_activity(state, EngineActivity::Idle);
     }
     crate::platform::app_log::info(format!(
         "servo-dom: ingested fresh={fresh} dropped={dropped} retained={retained} live={} total={total} culled={culled} skip={skipped:?} boxA={box_anchors} boxKid={box_kids} boxAWrap={box_wraps} boxAEmpty={box_empty} forced={forced} hid={hid} clip={clip} t={timings:?} rtt={rtt_ms}ms rb={} snap=({:.0},{:.0}) trk=({:.0},{:.0})",
@@ -1669,6 +1710,7 @@ fn check_load_timeout(shared: &Rc<RefCell<Shared>>) {
         "servo-engine: load timed out after {}s",
         LOAD_TIMEOUT.as_secs()
     ));
+    set_activity(&mut state, EngineActivity::Idle);
     state.handle.emit(EngineEvent::LoadFinished {
         generation,
         result: Err("load timed out".to_string()),
@@ -1687,6 +1729,7 @@ mod tests {
             w: 100.0,
             h: 30.0,
             kind: FocusKind::Link,
+            url: None,
         }
     }
 
