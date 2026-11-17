@@ -505,9 +505,6 @@ impl WebViewDelegate for Delegate {
                 {
                     state.storage_probe_pending = true;
                 }
-                // Fresh settle re-broadcasts the tree + focus: anything the
-                // load burst dropped heals here instead of sticking.
-                arm_resync(&mut state);
                 let generation = state.generation;
                 let tab = state.tab;
                 state.handle.emit(EngineEvent::LoadFinished {
@@ -522,7 +519,6 @@ impl WebViewDelegate for Delegate {
                 crate::platform::app_log::warn("servo-engine: load stopped before complete");
                 state.load_started_at = None;
                 set_activity(&mut state, EngineActivity::Idle);
-                arm_resync(&mut state);
                 let generation = state.generation;
                 let tab = state.tab;
                 state.handle.emit(EngineEvent::LoadFinished {
@@ -548,7 +544,6 @@ impl WebViewDelegate for Delegate {
         };
         let mut state = entry.state.borrow_mut();
         state.load_started_at = None;
-        arm_resync(&mut state);
         let generation = state.generation;
         let tab = state.tab;
         state.handle.emit(EngineEvent::LoadFinished {
@@ -1415,10 +1410,6 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
             if let Some(next) = global_ref.tabs.get(&tab).cloned() {
                 next.webview.show();
                 next.webview.set_focused(visible && !suspended);
-                // Foregrounding re-broadcasts the tree + focus on the next
-                // pull: backgrounding (or a saturated burst) may have left
-                // the UI behind, and diffed emits never repeat alone.
-                arm_resync(&mut next.state.borrow_mut());
                 // Kick a frame so the newly foregrounded tab paints at once
                 // instead of waiting for page-driven invalidation.
                 next.webview.paint();
@@ -1481,16 +1472,6 @@ fn set_activity(state: &mut TabState, phase: EngineActivity) {
     state
         .handle
         .emit(EngineEvent::ActivityChanged { tab, phase });
-}
-
-/// Re-broadcast the tab's tree + focus on the next pull. Delivery is
-/// fire-and-forget (`try_send`): a burst-saturation drop desyncs the UI
-/// permanently, because diffed emits never repeat on their own. Called
-/// where the UI needs the final state — load completion and foregrounding
-/// — so a dropped burst heals instead of sticking.
-fn arm_resync(state: &mut TabState) {
-    state.last_emitted.clear();
-    state.last_focus = None;
 }
 
 /// Document changed (fresh load or history travel): drop DOM targets, scroll
@@ -2241,7 +2222,6 @@ fn check_load_timeout(global: &Rc<RefCell<Global>>) {
             LOAD_TIMEOUT.as_secs()
         ));
         set_activity(&mut state, EngineActivity::Idle);
-        arm_resync(&mut state);
         state.handle.emit(EngineEvent::LoadFinished {
             tab,
             generation,

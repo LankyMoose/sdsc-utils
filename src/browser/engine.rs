@@ -276,35 +276,45 @@ pub struct TabFrame {
 /// Channel pair between the UI shell and the backend worker thread.
 ///
 /// Mirrors [`crate::domain::pad::InputHub`]: the worker owns the engine and
-/// publishes here; the iced subscription binds an event sink while listening.
-/// Everything is `try_send` — a saturated UI drops frames (the next one lands
-/// in ~16ms), exactly like pad edges.
+/// publishes here; the iced subscription binds event sinks while listening.
+///
+/// Transport is split by data semantics, not by urgency. Frames are
+/// idempotent state snapshots — latest wins, so a saturated UI drops stale
+/// ones (the next one lands in ~16ms), exactly like pad edges. Everything
+/// else is an edge-triggered fact (URL, history, focus, tree, tab
+/// lifecycle) that must never drop: those ride an unbounded channel and
+/// are forwarded in order. Cross-channel frame/control interleaving is
+/// benign — frames are continuous paint, controls discrete facts, and the
+/// UI already handles them arriving in any mix.
 #[derive(Debug)]
 pub struct EngineHandle {
     commands: mpsc::Sender<EngineCommand>,
-    events: Arc<Mutex<Option<iced::futures::channel::mpsc::Sender<EngineEvent>>>>,
+    frames: Arc<Mutex<Option<iced::futures::channel::mpsc::Sender<TabFrame>>>>,
+    controls: Arc<Mutex<Option<iced::futures::channel::mpsc::UnboundedSender<EngineEvent>>>>,
 }
 
 impl Clone for EngineHandle {
     fn clone(&self) -> Self {
         Self {
             commands: self.commands.clone(),
-            events: Arc::clone(&self.events),
+            frames: Arc::clone(&self.frames),
+            controls: Arc::clone(&self.controls),
         }
     }
 }
 
-/// Identity hash: clones share the event sink, so the subscription recipe
+/// Identity hash: clones share the event sinks, so the subscription recipe
 /// stays stable across reconciles (same pattern as the pad `InputHub` id).
 impl std::hash::Hash for EngineHandle {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.events).hash(state);
+        Arc::as_ptr(&self.frames).hash(state);
+        Arc::as_ptr(&self.controls).hash(state);
     }
 }
 
 impl PartialEq for EngineHandle {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.events, &other.events)
+        Arc::ptr_eq(&self.frames, &other.frames) && Arc::ptr_eq(&self.controls, &other.controls)
     }
 }
 
@@ -317,7 +327,8 @@ impl EngineHandle {
         (
             Self {
                 commands: tx,
-                events: Arc::new(Mutex::new(None)),
+                frames: Arc::new(Mutex::new(None)),
+                controls: Arc::new(Mutex::new(None)),
             },
             rx,
         )
@@ -333,31 +344,57 @@ impl EngineHandle {
         let _ = self.commands.send(command);
     }
 
-    /// Install the iced-side event sink (subscription start).
-    pub fn bind(&self, tx: iced::futures::channel::mpsc::Sender<EngineEvent>) {
-        if let Ok(mut guard) = self.events.lock() {
-            *guard = Some(tx);
+    /// Install the iced-side event sinks (subscription start): bounded for
+    /// frames, unbounded for control events.
+    pub fn bind(
+        &self,
+        frames: iced::futures::channel::mpsc::Sender<TabFrame>,
+        controls: iced::futures::channel::mpsc::UnboundedSender<EngineEvent>,
+    ) {
+        if let Ok(mut guard) = self.frames.lock() {
+            *guard = Some(frames);
+        }
+        if let Ok(mut guard) = self.controls.lock() {
+            *guard = Some(controls);
         }
     }
 
-    /// Clear the iced-side sink (subscription end).
+    /// Clear the iced-side sinks (subscription end).
     pub fn clear(&self) {
-        if let Ok(mut guard) = self.events.lock() {
+        if let Ok(mut guard) = self.frames.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.controls.lock() {
             *guard = None;
         }
     }
 
     /// Publish one event. Called on the worker thread; never blocks.
-    /// Frames that arrive while the UI is saturated are dropped (conflation
-    /// in the subscription keeps the latest anyway).
+    /// Frames that arrive while the UI is saturated are dropped (the
+    /// subscription keeps the latest anyway); control events are queued
+    /// without bound and never drop — the subscription drains them in
+    /// order.
     pub fn emit(&self, event: EngineEvent) {
-        let Ok(mut guard) = self.events.lock() else {
-            return;
-        };
-        let Some(tx) = guard.as_mut() else {
-            return;
-        };
-        let _ = tx.try_send(event);
+        match event {
+            EngineEvent::Frame(frame) => {
+                let Ok(mut guard) = self.frames.lock() else {
+                    return;
+                };
+                let Some(tx) = guard.as_mut() else {
+                    return;
+                };
+                let _ = tx.try_send(frame);
+            }
+            control => {
+                let Ok(mut guard) = self.controls.lock() else {
+                    return;
+                };
+                let Some(tx) = guard.as_mut() else {
+                    return;
+                };
+                let _ = tx.unbounded_send(control);
+            }
+        }
     }
 }
 
@@ -400,6 +437,28 @@ mod tests {
         });
         handle.send(EngineCommand::Suspend);
         assert!(matches!(rx.recv(), Ok(EngineCommand::Suspend)));
+    }
+
+    #[test]
+    fn control_events_arrive_lossless_and_in_order() {
+        use iced::futures::channel::mpsc;
+        let (handle, _) = EngineHandle::channel();
+        let (frame_tx, _frame_rx) = mpsc::channel::<TabFrame>(64);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded::<EngineEvent>();
+        handle.bind(frame_tx, ctrl_tx);
+        for i in 0..200u64 {
+            handle.emit(EngineEvent::FocusChanged {
+                tab: TabId::BOOT,
+                id: i,
+            });
+        }
+        // All 200 arrive, in order — no saturation drop, however bursty.
+        for i in 0..200u64 {
+            match ctrl_rx.try_recv() {
+                Ok(EngineEvent::FocusChanged { id, .. }) => assert_eq!(id, i),
+                other => panic!("lost control event at {i}: {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -2659,38 +2659,42 @@ impl Drop for InputEdgeBindGuard {
 
 /// Servo engine worker → iced event bridge.
 ///
-/// Frames conflate to the latest buffered one (paint output is absolute
-/// state, like pad snapshots); control events (title/URL/load) pass through
-/// in order. Bind/clear mirrors the pad edge hub.
+/// Two transports merge here (see [`EngineHandle`]): frames conflate to the
+/// latest buffered one (paint output is absolute state, like pad
+/// snapshots); control events (title/URL/load/focus/tree/tabs) arrive
+/// lossless and in order. Bind/clear mirrors the pad edge hub.
 fn engine_event_stream(engine: &EngineHandle) -> impl Stream<Item = Message> + Send + use<> {
+    use iced::futures::StreamExt;
     let engine = engine.clone();
     stream::channel(64, async move |mut output| {
-        let (tx, mut rx) = iced::futures::channel::mpsc::channel(64);
-        engine.bind(tx);
+        let (frame_tx, mut frame_rx) =
+            iced::futures::channel::mpsc::channel::<crate::browser::engine::TabFrame>(64);
+        let (ctrl_tx, mut ctrl_rx) = iced::futures::channel::mpsc::unbounded::<EngineEvent>();
+        engine.bind(frame_tx, ctrl_tx);
         let _guard = EngineBindGuard { engine };
-        'outer: while let Some(first) = rx.next().await {
-            let mut batch = vec![first];
-            while let Ok(next) = rx.try_recv() {
-                batch.push(next);
-            }
-            let mut last_frame = None;
-            for event in batch {
-                match event {
-                    EngineEvent::Frame(frame) => last_frame = Some(frame),
-                    other => {
-                        if output.send(Message::BrowserEngine(other)).await.is_err() {
-                            break 'outer;
-                        }
+        loop {
+            iced::futures::select! {
+                control = ctrl_rx.next() => {
+                    let Some(event) = control else { break };
+                    if output.send(Message::BrowserEngine(event)).await.is_err() {
+                        break;
                     }
                 }
-            }
-            if let Some(frame) = last_frame
-                && output
-                    .send(Message::BrowserEngine(EngineEvent::Frame(frame)))
-                    .await
-                    .is_err()
-            {
-                break 'outer;
+                frame = frame_rx.next() => {
+                    let Some(first) = frame else { break };
+                    // Drain any newer frames; only the latest paints.
+                    let mut latest = first;
+                    while let Ok(newer) = frame_rx.try_recv() {
+                        latest = newer;
+                    }
+                    if output
+                        .send(Message::BrowserEngine(EngineEvent::Frame(latest)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
     })
