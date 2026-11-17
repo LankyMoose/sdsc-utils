@@ -767,7 +767,11 @@ fn collect_focusables(shared: &mut TabState) -> (Vec<Focusable>, (f32, f32)) {
 /// The stack is oversized on purpose: SpiderMonkey + layout recurse deep
 /// during init, and a default 2MiB spawned-thread stack segfaults where the
 /// 8MiB main thread survives (proven by the spike, which ran on main).
-pub fn spawn_engine() -> Option<EngineHandle> {
+/// Spawn the engine worker with its first view on `boot_url` (the restored
+/// active tab, or home). Booting straight onto it leaves no stale home load
+/// to race the first restore-navigate and clobber the live session.
+pub fn spawn_engine(boot_url: &str) -> Option<EngineHandle> {
+    let boot_url = boot_url.to_string();
     let (handle, rx) = EngineHandle::channel();
     let worker = handle.clone();
     let wake_tx = handle.sender();
@@ -775,7 +779,7 @@ pub fn spawn_engine() -> Option<EngineHandle> {
     std::thread::Builder::new()
         .name("servo-engine".to_string())
         .stack_size(32 * 1024 * 1024)
-        .spawn(move || run(rx, wake_tx, worker, ready_tx))
+        .spawn(move || run(rx, wake_tx, worker, boot_url, ready_tx))
         .expect("spawn servo engine thread");
     // Deterministic GL-before-Vulkan barrier: iced (and its wgpu/Vulkan
     // init) only starts after `App::new` returns. Context creation itself
@@ -804,6 +808,7 @@ fn run(
     rx: mpsc::Receiver<EngineCommand>,
     wake_tx: mpsc::Sender<EngineCommand>,
     handle: EngineHandle,
+    boot_url: String,
     ready: mpsc::Sender<Result<(), String>>,
 ) {
     // GL context FIRST: see `spawn_engine` ordering contract.
@@ -873,10 +878,11 @@ fn run(
         .borrow()
         .user_content
         .add_script(Rc::new(UserScript::new(DOM_INSTALL_JS.to_string(), None)));
-    // Boot straight onto the home page: without an initial URL Servo opens
-    // about:blank, which would pollute history (and cost a throwaway load)
-    // before the first real navigate. Falls back to blank if unparseable
-    // (hardcoded constant — cannot happen, but never panic the worker).
+    // Boot straight onto the given URL (restored active tab, else home):
+    // without an initial URL Servo opens about:blank, which would pollute
+    // history (and cost a throwaway load) before the first real navigate.
+    // Falls back to blank if unparseable (cannot happen for our inputs,
+    // but never panic the worker).
     let user_content = delegate_global.borrow().user_content.clone();
     let delegate = Rc::new(Delegate {
         global: delegate_global.clone(),
@@ -885,8 +891,8 @@ fn run(
     let mut builder = WebViewBuilder::new(&servo, ctx.clone())
         .user_content_manager(user_content)
         .delegate(delegate);
-    if let Ok(home) = url::Url::parse(crate::browser::BROWSER_HOME_URL) {
-        builder = builder.url(home);
+    if let Ok(initial) = url::Url::parse(&boot_url) {
+        builder = builder.url(initial);
     }
     let boot_view = builder.build();
     // NOTE: no hide() here — a hidden view produces no frames, and the

@@ -31,6 +31,22 @@ pub struct SavedTabs {
     pub active: usize,
 }
 
+/// Boot URL for the worker's first view: the restored active tab's URL
+/// when a strip was persisted, else home. Booting straight onto it (instead
+/// of home-then-navigate) leaves no stale home load to race the restore.
+pub fn boot_url() -> String {
+    boot_url_from(&load())
+}
+
+fn boot_url_from(saved: &SavedTabs) -> String {
+    saved
+        .tabs
+        .get(saved.active.min(saved.tabs.len().saturating_sub(1)))
+        .map(|t| t.url.clone())
+        .filter(|u| !u.is_empty() && u != crate::browser::BLANK_PAGE_URL)
+        .unwrap_or_else(|| crate::browser::BROWSER_HOME_URL.to_string())
+}
+
 /// Storage location next to `prefs.json`.
 pub fn default_path() -> PathBuf {
     crate::persist::paths::data_dir().join("tabs.json")
@@ -83,6 +99,43 @@ mod tests {
         save_to(&path, &strip);
         assert_eq!(load_from(&path), strip);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn boot_url_prefers_saved_active_tab() {
+        assert_eq!(
+            boot_url_from(&SavedTabs::default()),
+            crate::browser::BROWSER_HOME_URL
+        );
+        let strip = SavedTabs {
+            tabs: vec![
+                SavedTab {
+                    url: "https://a.test/".to_string(),
+                    title: String::new(),
+                },
+                SavedTab {
+                    url: "https://b.test/".to_string(),
+                    title: String::new(),
+                },
+            ],
+            active: 1,
+        };
+        assert_eq!(boot_url_from(&strip), "https://b.test/");
+        // Out-of-range active clamps into the strip.
+        let clamped = SavedTabs {
+            active: 9,
+            ..strip.clone()
+        };
+        assert_eq!(boot_url_from(&clamped), "https://b.test/");
+        // Blank active entry falls back to home.
+        let blank = SavedTabs {
+            tabs: vec![SavedTab {
+                url: crate::browser::BLANK_PAGE_URL.to_string(),
+                title: String::new(),
+            }],
+            active: 0,
+        };
+        assert_eq!(boot_url_from(&blank), crate::browser::BROWSER_HOME_URL);
     }
 
     #[test]

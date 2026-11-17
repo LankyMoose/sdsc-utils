@@ -825,7 +825,7 @@ impl App {
             engine: if std::env::var("SDSC_NO_ENGINE").is_ok() {
                 None
             } else {
-                crate::browser::servo_backend::spawn_engine()
+                crate::browser::servo_backend::spawn_engine(&crate::browser::tabs::boot_url())
             },
             #[cfg(not(feature = "servo-engine"))]
             engine: None,
