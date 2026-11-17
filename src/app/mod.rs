@@ -2086,9 +2086,17 @@ impl App {
         // timeout the process exits as before, cookies lost).
         if let Some(engine) = &self.engine {
             let (tx, rx) = std::sync::mpsc::channel();
+            // TEMP-DIAG(cookies): trace the shutdown handshake until the
+            // missing cookie_jar.json is explained.
+            crate::controller::hid::diag::diag_info("ui-diag: sending engine shutdown");
             engine.send(EngineCommand::Shutdown { done: tx });
-            if rx.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
-                crate::controller::hid::diag::diag_info("ui-diag: engine shutdown timeout");
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(()) => {
+                    crate::controller::hid::diag::diag_info("ui-diag: engine shutdown ack received")
+                }
+                Err(_) => {
+                    crate::controller::hid::diag::diag_info("ui-diag: engine shutdown timeout")
+                }
             }
         }
         self.tray_icon.take();
