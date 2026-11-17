@@ -56,15 +56,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.88
+      - name: Install Rust 1.89
         uses: dtolnay/rust-toolchain@stable
         with:
           # Must track `rust-version` in Cargo.toml. Only a compile check:
           # it enforces the floor claim against the exact committed
           # dependency set, nothing more. Scoped to `--no-default-features`:
           # the default-on Servo engine needs the pinned toolchain.
-          toolchain: 1.88
+          toolchain: 1.89
 
       - name: Check MSRV floor (app code only; the default-on engine needs a newer rustc)
         shell: bash
-        run: cargo +1.88 check --locked --all-targets --no-default-features
+        run: cargo +1.89 check --locked --all-targets --no-default-features

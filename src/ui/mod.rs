@@ -16,6 +16,7 @@ pub mod scale;
 pub mod shader;
 pub mod start;
 pub mod svg_icon;
+pub mod text_fit;
 pub mod theme;
 pub mod toast;
 pub mod tray;

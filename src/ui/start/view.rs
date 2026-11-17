@@ -16,6 +16,7 @@ use crate::ui::start::icon_cache;
 use crate::ui::start::input::FaceHeld;
 use crate::ui::start::overlay;
 use crate::ui::svg_icon;
+use crate::ui::text_fit;
 use crate::ui::theme;
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
@@ -1204,10 +1205,10 @@ fn browser_suggestions(panel: &BrowserPanel) -> Element<'_, StartMessage> {
         list = list.push(
             button(
                 column![
-                    text(theme::ellipsize(&title, 48))
+                    text(text_fit::ellipsize_to_width(&title, 13.0, 420.0))
                         .size(13.0)
                         .color(theme::INK),
-                    text(theme::ellipsize(&m.url, 72))
+                    text(text_fit::ellipsize_to_width(&m.url, 11.0, 480.0))
                         .size(11.0)
                         .color(theme::MUTED),
                 ]
@@ -1253,7 +1254,7 @@ fn browser_bookmark_bar(panel: &BrowserPanel) -> Element<'_, StartMessage> {
                 );
             }
             inner = inner.push(
-                text(theme::ellipsize(b.name(), 24))
+                text(text_fit::ellipsize_to_width(b.name(), 13.0, 170.0))
                     .size(13.0)
                     .color(theme::INK),
             );
@@ -1333,7 +1334,7 @@ fn browser_history_selector(panel: &BrowserPanel) -> Element<'_, StartMessage> {
     let mut list = column![
         text(format!(
             "{header} — {}",
-            theme::ellipsize(&current_title, 48)
+            text_fit::ellipsize_to_width(&current_title, 12.0, 460.0)
         ))
         .size(12.0)
         .color(theme::MUTED),
@@ -1352,10 +1353,10 @@ fn browser_history_selector(panel: &BrowserPanel) -> Element<'_, StartMessage> {
         }
         inner = inner.push(
             column![
-                text(theme::ellipsize(&title, 48))
+                text(text_fit::ellipsize_to_width(&title, 13.0, 420.0))
                     .size(13.0)
                     .color(theme::INK),
-                text(theme::ellipsize(&entry.url, 72))
+                text(text_fit::ellipsize_to_width(&entry.url, 11.0, 480.0))
                     .size(11.0)
                     .color(theme::MUTED),
             ]

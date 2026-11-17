@@ -2,7 +2,7 @@
 name = "sdsc-utils"
 version = "1.7.3"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "SDSC Utils â€” system tray battery, lightbar, and identify utilities for DualSense controllers"
 authors = ["LankyMoose"]
 license = "MIT"
@@ -60,6 +60,7 @@ winreg = "0.55"
 
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
+cosmic-text = "0.18"
 crc32fast = "1.5.0"
 hidapi = "2.6.6"
 iced = { version = "0.14.0", features = [
