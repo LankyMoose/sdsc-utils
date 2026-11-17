@@ -1651,6 +1651,15 @@ impl App {
         if Some(id) == self.popup_window && !self.popup_state.is_editing_any() {
             self.close_popup()
         } else if Some(id) == self.start_window && self.start_visible {
+            // TEST HOOK (shutdown-flush A/B): the dismiss-on-unfocus below
+            // force-closes Start before a tray quit lands, collapsing both
+            // test runs to surface-closed. Disabled so "quit with surface
+            // open" is actually reachable. Re-enable — or promote to a
+            // settings pref — once the test concludes.
+            const CLOSE_ON_UNFOCUS: bool = false;
+            if !CLOSE_ON_UNFOCUS {
+                return Task::none();
+            }
             // File dialogs (add/edit shortcut, choose image) steal focus — keep the
             // start screen open so the modal / draft is not discarded.
             if self.start_state.manual_add.is_some() || self.start_file_dialog_open {
