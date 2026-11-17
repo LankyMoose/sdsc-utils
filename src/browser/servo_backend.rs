@@ -886,12 +886,15 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             // Complete any in-flight press first: rapid clicks stay paired
             // (Down/Up, Down/Up) instead of stranding a Down.
             flush_pending_up(webview, shared);
-            // Button-kind dock targets activate on the exact element via
-            // `__sdsc_click` (no hit-test staleness, exercises whatever
-            // handler the page registered — getEventListeners is DevTools-only
-            // and no DOM API exposes listeners, so reaching the element IS
-            // the discovery). Anything else (links, fields, free points,
-            // canvas) keeps the trusted synthetic path.
+            // Button- and link-kind dock targets activate on the exact
+            // element via `__sdsc_click`: no hit-test staleness, and it
+            // exercises whatever handler the page registered
+            // (getEventListeners is DevTools-only and no DOM API exposes
+            // listeners, so reaching the element IS the discovery).
+            // Synthetic clicks provably never navigated (hit test never
+            // visibly landed), so links take this path too; fields and free
+            // points keep the trusted synthetic pair. A miss falls back to
+            // synthetic at the point below.
             let jsid = target.and_then(|uid| {
                 shared
                     .borrow()
@@ -900,15 +903,12 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                     .find(|(_, u)| **u == uid)
                     .map(|(j, _)| *j)
             });
-            let button = jsid.is_some_and(|j| {
-                shared
-                    .borrow()
-                    .dom
-                    .get(&j)
-                    .is_some_and(|n| n.kind == FocusKind::Button)
+            let direct_kind = jsid.and_then(|j| {
+                shared.borrow().dom.get(&j).and_then(|n| {
+                    (n.kind == FocusKind::Button || n.kind == FocusKind::Link).then_some(n.kind)
+                })
             });
-            if button {
-                let jsid = jsid.unwrap_or(0);
+            if let Some((jsid, kind)) = jsid.zip(direct_kind) {
                 let handle = shared.borrow().handle.clone();
                 webview.evaluate_javascript(
                     format!("window.__sdsc_click ? window.__sdsc_click({jsid}) : 'missing'"),
@@ -921,7 +921,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                             Err(e) => format!("eval-failed:{e:?}"),
                         };
                         crate::platform::app_log::info(format!(
-                            "servo-engine: element click js#{jsid} -> {status}"
+                            "servo-engine: element click js#{jsid} ({kind:?}) -> {status}"
                         ));
                         if status != "ok" {
                             // Element gone (or helper missing): fall back to
