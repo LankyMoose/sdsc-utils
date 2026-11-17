@@ -541,6 +541,8 @@ impl App {
     pub(crate) fn close_browser_surface(&mut self) -> Task<Message> {
         let _ = self.apps.close_app(crate::browser::BROWSER_APP_ID);
         self.start_state.browser.close_surface();
+        // A held D-pad must not jump the cursor of the next opened page.
+        self.browser_dpad_stepper.reset();
         if let Some(engine) = &self.engine {
             engine.send(EngineCommand::SetVisible { visible: false });
             engine.send(EngineCommand::Suspend);
@@ -1072,6 +1074,32 @@ impl App {
                 x: cx,
                 y: cy,
             });
+        }
+    }
+
+    /// D-pad cursor jumps for engine mode. The banked nav stepper stays
+    /// parked there (stick moves must never double-fire into both cursor
+    /// and nav), which would otherwise starve the `jump_cursor` arms of
+    /// `tick.action`. Runs a dedicated stepper on a stickless mask instead:
+    /// press jumps at once, holds repeat, D-pad release resets at once.
+    /// Returns the jump (if any); the caller applies it alongside whatever
+    /// `tick.action` carried (face buttons are orthogonal).
+    pub(crate) fn poll_browser_dpad_jump(
+        &mut self,
+        readings: &[start_input::NavReading],
+        now: Instant,
+    ) -> Option<JumpDir> {
+        let reading = start_input::preferred_reading(readings)?;
+        let masked = start_input::dpad_only(&reading.sample);
+        // No D-pad held: feed neutral so a release resets repeat gating at
+        // once (D-pad contacts never flicker — same discipline as the bank).
+        let action = self.browser_dpad_stepper.update(&masked, now, true, true);
+        match action {
+            Some(NavAction::Up) => Some(JumpDir::Up),
+            Some(NavAction::Down) => Some(JumpDir::Down),
+            Some(NavAction::Left) => Some(JumpDir::Left),
+            Some(NavAction::Right) => Some(JumpDir::Right),
+            _ => None,
         }
     }
 
@@ -2519,6 +2547,14 @@ impl App {
             }
             if self.start_state.browser.session.has_frame() {
                 self.tick_browser_cursor(readings, now);
+                // D-pad cursor jumps: dead since the magnetic-cursor commit
+                // parked the banked stepper in engine mode (its `tick.action`
+                // arms can never fire there). Stepped here on a stickless
+                // mask instead, so stick moves never double-fire into both
+                // cursor and nav.
+                if let Some(jump) = self.poll_browser_dpad_jump(readings, now) {
+                    self.start_state.browser.jump_cursor(jump);
+                }
                 // R3 issue flag (R3 carries no NavAction): rising edge while
                 // browsing dumps the trace bundle + forces a debug shot.
                 let r3_down = readings
@@ -4375,6 +4411,7 @@ impl App {
         self.haptic_pad_serial = None;
         self.hid_worker.rumble_stop_all();
         self.pad_nav.reset();
+        self.browser_dpad_stepper.reset();
         self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
         self.cancel_key_held = false;

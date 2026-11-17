@@ -55,7 +55,7 @@ use crate::ui::start::cursor_hide;
 use crate::ui::start::gesture::{self, ChordReleaseGate};
 use crate::ui::start::input::{
     self as start_input, CrossHold, FaceHeld, GestureDetectorBank, NavAction, NavLogSnapshot,
-    PadNavBank,
+    NavStepper, PadNavBank,
 };
 use crate::ui::start::view::{self as start_view, StartMessage};
 use crate::ui::theme;
@@ -509,6 +509,11 @@ pub struct App {
     start_revealed_at: Option<Instant>,
     gesture_detectors: GestureDetectorBank,
     pad_nav: PadNavBank,
+    /// Engine-mode D-pad cursor jumps run on this standalone stepper (fed a
+    /// stickless [`start_input::dpad_only`] mask): the banked stepper stays
+    /// parked in engine mode so stick moves never double-fire into both
+    /// cursor and nav. Reset with the browser surface.
+    browser_dpad_stepper: NavStepper,
     /// When set, the next start cue may rumble this DualSense serial (pad-originated).
     haptic_pad_serial: Option<Serial>,
     /// Keyboard Enter hold for replace-confirm (not folded into pad slots).
@@ -833,6 +838,7 @@ impl App {
             start_revealed_at: None,
             gesture_detectors: GestureDetectorBank::default(),
             pad_nav: PadNavBank::default(),
+            browser_dpad_stepper: NavStepper::default(),
             haptic_pad_serial: None,
             keyboard_cross_hold: CrossHold::default(),
             confirm_key_held: false,
@@ -1615,6 +1621,7 @@ impl App {
             // a later window (the force_cursor gate above is the backstop).
             self.set_start_cursor_hidden(false);
             self.pad_nav.reset();
+            self.browser_dpad_stepper.reset();
             self.clear_start_nav_diag();
             self.consume_reopen_gesture_chord();
             let sync = self.sync_toast_zorder();

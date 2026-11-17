@@ -1020,6 +1020,21 @@ impl BumperHold {
     }
 }
 
+/// Stickless copy of a pad sample: D-pad bits preserved, sticks zeroed,
+/// face/system buttons and the gesture set dropped. Feeds a standalone
+/// [`NavStepper`] where directionals must flow without stick input — the
+/// engine browser's D-pad cursor jumps run on this while the banked stepper
+/// stays parked (so stick moves never double-fire into both cursor and nav).
+pub fn dpad_only(sample: &PadSample) -> PadSample {
+    PadSample {
+        dpad_up: sample.dpad_up,
+        dpad_down: sample.dpad_down,
+        dpad_left: sample.dpad_left,
+        dpad_right: sample.dpad_right,
+        ..PadSample::default()
+    }
+}
+
 /// True when face/system buttons, triggers, D-pad, and stick are at rest (safe to arm start nav).
 pub fn sample_nav_resting(sample: &PadSample) -> bool {
     sample.held.is_empty()
@@ -2212,6 +2227,38 @@ mod tests {
             false,
         );
         assert_eq!(tick.action, Some(NavAction::Down));
+    }
+
+    #[test]
+    fn dpad_only_masks_sticks_buttons_and_gestures() {
+        let full = PadSample {
+            held: [GestureControl::L1, GestureControl::R3]
+                .into_iter()
+                .collect(),
+            stick_x: 0.7,
+            stick_y: -0.4,
+            lstick_x: 0.5,
+            lstick_y: 0.2,
+            rstick_x: -0.3,
+            rstick_y: 0.9,
+            dpad_up: true,
+            dpad_left: true,
+            cross: true,
+            l1: true,
+            r2: true,
+            ..Default::default()
+        };
+        let masked = dpad_only(&full);
+        assert!(masked.dpad_up);
+        assert!(masked.dpad_left);
+        assert!(!masked.dpad_down);
+        assert!(!masked.dpad_right);
+        assert_eq!(masked.stick_x, 0.0);
+        assert_eq!(masked.stick_y, 0.0);
+        assert_eq!(masked.lstick_x, 0.0);
+        assert_eq!(masked.rstick_x, 0.0);
+        assert!(masked.held.is_empty());
+        assert!(!masked.cross && !masked.l1 && !masked.r2);
     }
 
     #[test]
