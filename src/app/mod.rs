@@ -2096,8 +2096,12 @@ impl App {
                     .map(|m| (m.len(), m.modified().ok()))
                     .map_err(|e| e.to_string())
             };
+            // Surface state rides along: tests whether quit-time suspension
+            // correlates with missed flushes (the in-app shutdown with the
+            // surface open flushed fine).
+            let surface_open = self.start_state.browser.session.is_open();
             crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: cookie jar before shutdown: {:?} {:?}",
+                "ui-diag: cookie jar before shutdown: {:?} {:?} surface_open={surface_open}",
                 jar_path,
                 jar_stat()
             ));
@@ -2107,7 +2111,7 @@ impl App {
                 crate::controller::hid::diag::diag_info("ui-diag: engine shutdown timeout");
             } else {
                 crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: cookie jar after shutdown: {:?}",
+                    "ui-diag: cookie jar after shutdown: {:?} surface_open={surface_open}",
                     jar_stat()
                 ));
             }
