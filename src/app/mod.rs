@@ -2085,10 +2085,31 @@ impl App {
         // bounded — a hung constellation must not hang quit forever (on
         // timeout the process exits as before, cookies lost).
         if let Some(engine) = &self.engine {
+            // Flush proof: stat the jar before and after. A completed
+            // shutdown that doesn't move the file means the resource thread
+            // skipped its write (config) rather than us racing the exit.
+            let jar_path = crate::persist::paths::data_dir()
+                .join("servo")
+                .join("cookie_jar.json");
+            let jar_stat = || {
+                std::fs::metadata(&jar_path)
+                    .map(|m| (m.len(), m.modified().ok()))
+                    .map_err(|e| e.to_string())
+            };
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: cookie jar before shutdown: {:?} {:?}",
+                jar_path,
+                jar_stat()
+            ));
             let (tx, rx) = std::sync::mpsc::channel();
             engine.send(EngineCommand::Shutdown { done: tx });
             if rx.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
                 crate::controller::hid::diag::diag_info("ui-diag: engine shutdown timeout");
+            } else {
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: cookie jar after shutdown: {:?}",
+                    jar_stat()
+                ));
             }
         }
         self.tray_icon.take();
