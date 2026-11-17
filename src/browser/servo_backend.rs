@@ -529,11 +529,18 @@ pub fn spawn_engine() -> Option<EngineHandle> {
     match ready_rx.recv_timeout(Duration::from_secs(15)) {
         Ok(Ok(())) => Some(handle),
         Ok(Err(err)) => {
-            eprintln!("servo-engine: software context failed: {err}");
+            // Log file, not stderr: background/tray launches have nowhere
+            // visible for eprintln, and a silent reader-fallback looks like
+            // a broken browser.
+            crate::platform::app_log::warn(format!(
+                "servo-engine: software context failed ({err}), engine disabled"
+            ));
             None
         }
         Err(_) => {
-            eprintln!("servo-engine: context readiness timeout");
+            crate::platform::app_log::warn(
+                "servo-engine: context readiness timeout, engine disabled",
+            );
             None
         }
     }
