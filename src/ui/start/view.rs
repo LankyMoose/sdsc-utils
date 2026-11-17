@@ -886,19 +886,22 @@ impl BrowserPanel {
         !url.is_empty() && self.bookmarks.iter().any(|b| b.url == url)
     }
 
-    /// Cache a favicon handle, evicting the oldest past the cap.
+    /// Cache a favicon handle, keyed by site origin (see `origin_key`):
+    /// icons are per-site, and arrivals race navigations, so full-URL keys
+    /// miss their rows. Evicts the oldest past the cap.
     pub fn note_favicon(&mut self, url: String, handle: iced::widget::image::Handle) {
         if url.is_empty() {
             return;
         }
-        if !self.favicons.contains_key(&url) {
-            self.favicon_order.push(url.clone());
+        let key = crate::browser::bookmarks::origin_key(&url);
+        if !self.favicons.contains_key(&key) {
+            self.favicon_order.push(key.clone());
             while self.favicon_order.len() > Self::MAX_FAVICONS {
                 let oldest = self.favicon_order.remove(0);
                 self.favicons.remove(&oldest);
             }
         }
-        self.favicons.insert(url, handle);
+        self.favicons.insert(key, handle);
     }
 
     /// Step the body scroll (reader text); returns the new absolute offset.
@@ -1177,7 +1180,8 @@ fn browser_bookmark_bar(panel: &BrowserPanel) -> Element<'_, StartMessage> {
         let mut row_elems = row![].spacing(6);
         for b in chunk {
             let mut inner = row![].spacing(6).align_y(Alignment::Center);
-            if let Some(icon) = panel.favicons.get(&b.url) {
+            let icon_key = crate::browser::bookmarks::origin_key(&b.url);
+            if let Some(icon) = panel.favicons.get(&icon_key) {
                 inner = inner.push(
                     image(icon.clone())
                         .width(Length::Fixed(16.0))

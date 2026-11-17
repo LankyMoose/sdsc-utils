@@ -26,6 +26,21 @@ impl Bookmark {
     }
 }
 
+/// Favicon cache identity: favicons are per-site, not per-page, so the key
+/// is scheme + host. This absorbs the homepage-vs-search-URL,
+/// redirect-chain, and fragment variance that made icons miss their rows
+/// (same site, different URL strings). Unparseable URLs key by themselves
+/// so both sides still agree.
+pub fn origin_key(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    match parsed.host_str() {
+        Some(host) => format!("{}://{host}", parsed.scheme()),
+        None => url.to_string(),
+    }
+}
+
 /// Storage location next to `prefs.json`.
 pub fn default_path() -> PathBuf {
     crate::persist::paths::data_dir().join("bookmarks.json")
@@ -77,5 +92,29 @@ mod tests {
         // Name falls back to the URL when untitled.
         assert_eq!(list[1].name(), "https://x.test/");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn origin_key_collapses_site_variants() {
+        // Homepage vs search URL vs fragment: same site, same key — this is
+        // the miss that left bookmark rows iconless.
+        assert_eq!(
+            origin_key("https://www.google.com/"),
+            "https://www.google.com"
+        );
+        assert_eq!(
+            origin_key("https://www.google.com/search?q=meerkats"),
+            "https://www.google.com"
+        );
+        assert_eq!(
+            origin_key("https://www.google.com/#frag"),
+            "https://www.google.com"
+        );
+        // Different hosts stay distinct; unparseable keys by themselves.
+        assert_ne!(
+            origin_key("https://m.example.com/"),
+            origin_key("https://www.example.com/")
+        );
+        assert_eq!(origin_key("not a url"), "not a url");
     }
 }

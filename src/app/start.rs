@@ -1182,6 +1182,10 @@ impl App {
                 rgba,
             } => {
                 let handle = iced::widget::image::Handle::from_rgba(width, height, rgba);
+                crate::platform::app_log::info(format!(
+                    "servo-dom: favicon {} {width}x{height}",
+                    crate::browser::bookmarks::origin_key(&url)
+                ));
                 self.start_state.browser.note_favicon(url, handle);
             }
             EngineEvent::A11yTree(items) => {
