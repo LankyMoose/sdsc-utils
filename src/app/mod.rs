@@ -1651,11 +1651,10 @@ impl App {
         if Some(id) == self.popup_window && !self.popup_state.is_editing_any() {
             self.close_popup()
         } else if Some(id) == self.start_window && self.start_visible {
-            // TEST HOOK (shutdown-flush A/B): the dismiss-on-unfocus below
-            // force-closes Start before a tray quit lands, collapsing both
-            // test runs to surface-closed. Disabled so "quit with surface
-            // open" is actually reachable. Re-enable — or promote to a
-            // settings pref — once the test concludes.
+            // Dismiss-on-unfocus stays off until the settings screen ships
+            // a proper toggle for it (close-on-focus-loss vs stay-open).
+            // Until then Start only closes on explicit dismiss, so tray
+            // quit can happen with the browser surface still open.
             const CLOSE_ON_UNFOCUS: bool = false;
             if !CLOSE_ON_UNFOCUS {
                 return Task::none();
