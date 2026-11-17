@@ -487,12 +487,21 @@ impl App {
             crate::browser::AppKind::Browser { url: None },
         );
         self.start_state.browser.session.open_surface();
-        // Fresh session (never navigated, no pending draft): start at home
-        // instead of the empty state. A typed-but-unsent draft is the
-        // user's intent — leave it for Go.
+        // Fresh session (never navigated, no pending draft): restore the
+        // persisted strip when one exists, else start at home instead of
+        // the empty state. A typed-but-unsent draft is the user's intent —
+        // leave it for Go.
         if self.start_state.browser.session.url().is_empty()
             && self.start_state.browser.draft.trim().is_empty()
+            && self.start_state.browser.stored.is_empty()
         {
+            let saved = crate::browser::tabs::load();
+            if !saved.tabs.is_empty() {
+                let task = self.restore_browser_tabs(saved);
+                self.resume_browser_engine();
+                crate::controller::hid::diag::diag_info("ui-diag: start browser open (restore)");
+                return task;
+            }
             self.start_state.browser.draft = crate::browser::BROWSER_HOME_URL.to_string();
             let task = self.on_browser_navigate();
             self.resume_browser_engine();
@@ -1406,6 +1415,7 @@ impl App {
                 panel.order.push(tab);
             }
             panel.draft.clear();
+            panel.save_tabs();
         }
         self.sync_live_mouse();
         Task::none()
@@ -1422,6 +1432,7 @@ impl App {
         let active = self.start_state.browser.active_tab;
         if tab != active {
             self.start_state.browser.drop_stored(tab);
+            self.start_state.browser.save_tabs();
             return Task::none();
         }
         // Active tab closed by its page: forget it, adopt a survivor.
@@ -1433,6 +1444,7 @@ impl App {
                 debug_assert!(ok);
                 let url = self.start_state.browser.session.url().to_string();
                 self.start_state.browser.draft = url;
+                self.start_state.browser.save_tabs();
                 if let Some(engine) = &self.engine {
                     engine.send(EngineCommand::SetActiveTab { tab: next });
                 }
@@ -1458,6 +1470,7 @@ impl App {
             panel.draft = url.clone();
             panel.page.session.begin_load(url.clone())
         };
+        self.start_state.browser.save_tabs();
         if let Some(engine) = &self.engine {
             engine.send(EngineCommand::OpenTab {
                 tab,
@@ -1465,6 +1478,92 @@ impl App {
                 generation,
             });
             engine.send(EngineCommand::SetActiveTab { tab });
+        }
+        self.sync_browser_theme();
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Nav);
+        crate::controller::hid::diag::diag_info("ui-diag: start browser navigate");
+        Task::none()
+    }
+
+    /// First-open restore from `tabs.json`: rebuild the strip (live +
+    /// stored), pre-seed titles, and drive every tab. Backend views are
+    /// fresh, so each tab re-navigates — engine history starts over by
+    /// construction. Falls back to the home flow when nothing restorable
+    /// survives validation.
+    pub(crate) fn restore_browser_tabs(
+        &mut self,
+        saved: crate::browser::tabs::SavedTabs,
+    ) -> Task<Message> {
+        use crate::browser::engine::TabId;
+        let mut tabs: Vec<crate::browser::tabs::SavedTab> = saved
+            .tabs
+            .into_iter()
+            .filter(|t| !t.url.is_empty() && t.url != crate::browser::BLANK_PAGE_URL)
+            .take(crate::browser::tabs::MAX_SAVED_TABS)
+            .collect();
+        if tabs.is_empty() {
+            self.start_state.browser.draft = crate::browser::BROWSER_HOME_URL.to_string();
+            return self.on_browser_navigate();
+        }
+        let active_pos = saved.active.min(tabs.len() - 1);
+        // (tab id, url, generation) per restored tab, in strip order.
+        let mut loads: Vec<(TabId, String, u64)> = Vec::with_capacity(tabs.len());
+        {
+            let panel = &mut self.start_state.browser;
+            panel.stored.clear();
+            panel.order.clear();
+            let mut next_id = panel.next_tab_id.max(2);
+            for (pos, saved_tab) in tabs.drain(..).enumerate() {
+                let title = saved_tab.title.clone();
+                let seed_title = |session: &mut crate::browser::BrowserSession| {
+                    if !title.is_empty() {
+                        session.note_title(Some(title.clone()));
+                    }
+                };
+                if pos == active_pos {
+                    panel.active_tab = TabId::BOOT;
+                    panel.page = start_view::BrowserTabPage::default();
+                    panel.page.session.open_surface();
+                    let generation = panel.page.session.begin_load(saved_tab.url.clone());
+                    seed_title(&mut panel.page.session);
+                    panel.order.push(TabId::BOOT);
+                    panel.draft = saved_tab.url.clone();
+                    loads.push((TabId::BOOT, saved_tab.url, generation));
+                } else {
+                    let id = TabId(next_id);
+                    next_id += 1;
+                    let mut page = start_view::BrowserTabPage::default();
+                    page.session.open_surface();
+                    let generation = page.session.begin_load(saved_tab.url.clone());
+                    seed_title(&mut page.session);
+                    panel.stored.push(start_view::StoredTab { id, page });
+                    panel.order.push(id);
+                    loads.push((id, saved_tab.url, generation));
+                }
+            }
+            panel.next_tab_id = next_id;
+        }
+        if let Some(engine) = &self.engine {
+            for (tab, url, generation) in loads {
+                if tab == TabId::BOOT {
+                    engine.send(EngineCommand::Navigate {
+                        tab,
+                        url,
+                        generation,
+                    });
+                } else {
+                    engine.send(EngineCommand::OpenTab {
+                        tab,
+                        url,
+                        generation,
+                    });
+                }
+            }
+        } else {
+            // Reader fallback: fetch the live tab only; stored tabs fetch
+            // when switched to.
+            return self.on_browser_navigate();
         }
         self.sync_browser_theme();
         self.note_start_activity();
@@ -1492,6 +1591,7 @@ impl App {
             panel.order.push(tab);
             panel.draft = url.clone();
             let generation = panel.page.session.begin_load(url.clone());
+            panel.save_tabs();
             (tab, generation)
         };
         if let Some(engine) = &self.engine {
@@ -1524,6 +1624,12 @@ impl App {
         }
         let url = self.start_state.browser.session.url().to_string();
         self.start_state.browser.draft = url;
+        self.start_state.browser.save_tabs();
+        if self.engine.is_none() {
+            // Reader fallback: no views to foreground — fetch the newly
+            // live tab's URL through the normal path instead.
+            return self.on_browser_navigate();
+        }
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Action);
         if let Some(engine) = &self.engine {
@@ -1543,6 +1649,7 @@ impl App {
     ) -> Task<Message> {
         if tab != self.start_state.browser.active_tab {
             self.start_state.browser.drop_stored(tab);
+            self.start_state.browser.save_tabs();
             if let Some(engine) = &self.engine {
                 engine.send(EngineCommand::CloseTab { tab });
             }
@@ -1570,6 +1677,7 @@ impl App {
         self.start_state.browser.order.retain(|o| *o != tab);
         let url = self.start_state.browser.session.url().to_string();
         self.start_state.browser.draft = url;
+        self.start_state.browser.save_tabs();
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Action);
         if let Some(engine) = &self.engine {
@@ -1645,10 +1753,12 @@ impl App {
             }
             EngineEvent::TitleChanged { tab: _, title } => {
                 self.start_state.browser.session.note_title(title);
+                self.start_state.browser.save_tabs();
             }
             EngineEvent::UrlChanged { tab: _, url } => {
                 self.start_state.browser.session.note_url(url.clone());
                 self.start_state.browser.draft = url;
+                self.start_state.browser.save_tabs();
                 // A new document underneath invalidates the selector's
                 // snapshot (link click, redirect, history travel).
                 self.start_state.browser.history_selector = None;
@@ -1768,59 +1878,74 @@ impl App {
     /// but never touches chrome (draft, selector UI, docking). Favicons are
     /// the exception — the cache is shared by origin across tabs.
     fn route_background_event(&mut self, tab: crate::browser::engine::TabId, event: EngineEvent) {
-        let Some(stored) = self.start_state.browser.stored_mut(tab) else {
+        // Favicons need no stored state (shared origin cache) — handle
+        // before the stored borrow so the borrow below stays clean.
+        if let EngineEvent::FaviconChanged {
+            url,
+            width,
+            height,
+            rgba,
+            ..
+        } = event
+        {
+            let handle = iced::widget::image::Handle::from_rgba(width, height, rgba);
+            self.start_state.browser.note_favicon(url, handle);
             return;
-        };
-        match event {
-            EngineEvent::TitleChanged { title, .. } => {
-                stored.page.session.note_title(title);
-            }
-            EngineEvent::UrlChanged { url, .. } => {
-                stored.page.session.note_url(url);
-            }
-            EngineEvent::FaviconChanged {
-                url,
-                width,
-                height,
-                rgba,
-                ..
-            } => {
-                let handle = iced::widget::image::Handle::from_rgba(width, height, rgba);
-                self.start_state.browser.note_favicon(url, handle);
-            }
-            EngineEvent::A11yTree { items, .. } => {
-                stored.page.focusables = items;
-                let (cursor, focusables) = (&mut stored.page.cursor, &stored.page.focusables);
-                cursor.retarget(focusables);
-            }
-            EngineEvent::ScrollOffset { x, y, .. } => {
-                stored.page.scroll_offset = (x, y);
-            }
-            EngineEvent::ActivityChanged { phase, .. } => {
-                stored.page.engine_activity = phase;
-            }
-            EngineEvent::HistoryChanged {
-                entries, current, ..
-            } => {
-                stored.page.session.note_session_history(entries, current);
-            }
-            EngineEvent::FocusChanged { id, .. } => {
-                // Docked when foregrounded (if still live then).
-                stored.page.pending_focus = Some(id);
-            }
-            EngineEvent::LoadFinished {
-                generation, result, ..
-            } => match result {
-                Ok(()) => {
-                    stored.page.session.mark_loaded(generation);
+        }
+        // URL/title changes persist the strip; the borrow ends before the
+        // save (which reborrows the panel).
+        let mut strip_changed = false;
+        {
+            let Some(stored) = self.start_state.browser.stored_mut(tab) else {
+                return;
+            };
+            match event {
+                EngineEvent::TitleChanged { title, .. } => {
+                    stored.page.session.note_title(title);
+                    strip_changed = true;
                 }
-                Err(err) => {
-                    stored.page.session.apply_failed(generation, err);
+                EngineEvent::UrlChanged { url, .. } => {
+                    stored.page.session.note_url(url);
+                    strip_changed = true;
                 }
-            },
-            EngineEvent::Frame(_)
-            | EngineEvent::TabOpened { .. }
-            | EngineEvent::TabClosed { .. } => {}
+                EngineEvent::FaviconChanged { .. } => {}
+                EngineEvent::A11yTree { items, .. } => {
+                    stored.page.focusables = items;
+                    let (cursor, focusables) = (&mut stored.page.cursor, &stored.page.focusables);
+                    cursor.retarget(focusables);
+                }
+                EngineEvent::ScrollOffset { x, y, .. } => {
+                    stored.page.scroll_offset = (x, y);
+                }
+                EngineEvent::ActivityChanged { phase, .. } => {
+                    stored.page.engine_activity = phase;
+                }
+                EngineEvent::HistoryChanged {
+                    entries, current, ..
+                } => {
+                    stored.page.session.note_session_history(entries, current);
+                }
+                EngineEvent::FocusChanged { id, .. } => {
+                    // Docked when foregrounded (if still live then).
+                    stored.page.pending_focus = Some(id);
+                }
+                EngineEvent::LoadFinished {
+                    generation, result, ..
+                } => match result {
+                    Ok(()) => {
+                        stored.page.session.mark_loaded(generation);
+                    }
+                    Err(err) => {
+                        stored.page.session.apply_failed(generation, err);
+                    }
+                },
+                EngineEvent::Frame(_)
+                | EngineEvent::TabOpened { .. }
+                | EngineEvent::TabClosed { .. } => {}
+            }
+        }
+        if strip_changed {
+            self.start_state.browser.save_tabs();
         }
     }
 }

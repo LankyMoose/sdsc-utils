@@ -2090,6 +2090,9 @@ impl App {
         }
         let _ = crate::ui::start::icon_cache::bump_art_warm_generation();
         self.art.shutdown();
+        // Persist the tab strip (backstop — mutations already save on the
+        // way; this covers a crash-free quit with no prior change).
+        self.start_state.browser.save_tabs();
         // Idempotent with `InputEdgeBindGuard::drop` (subscription
         // teardown also clears).
         self.input_hub.clear();

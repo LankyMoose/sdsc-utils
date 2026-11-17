@@ -23,6 +23,7 @@ pub mod fetch;
 pub mod keys;
 #[cfg(feature = "servo-engine")]
 pub mod servo_backend;
+pub mod tabs;
 
 /// Stable app identity. Keys mirror the Start convention of stable play keys
 /// (never row indices): games resolve via catalog `play_key`, the browser via

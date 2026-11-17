@@ -1056,6 +1056,43 @@ impl BrowserPanel {
         true
     }
 
+    /// Snapshot the strip for `tabs.json`: creation-order (URL, title),
+    /// active position. Blank/empty URLs never persist (placeholders, not
+    /// visits — same rule as the history stacks).
+    pub fn snapshot_tabs(&self) -> crate::browser::tabs::SavedTabs {
+        let mut tabs = Vec::with_capacity(self.order.len());
+        let mut active = 0;
+        for id in &self.order {
+            if *id == self.active_tab {
+                active = tabs.len();
+            }
+            let page = if *id == self.active_tab {
+                Some(&self.page)
+            } else {
+                self.stored.iter().find(|t| t.id == *id).map(|t| &t.page)
+            };
+            let Some(page) = page else {
+                continue;
+            };
+            let url = page.session.url();
+            if url.is_empty() || url == crate::browser::BLANK_PAGE_URL {
+                continue;
+            }
+            tabs.push(crate::browser::tabs::SavedTab {
+                url: url.to_string(),
+                title: page.session.title().unwrap_or_default().to_string(),
+            });
+        }
+        tabs.truncate(crate::browser::tabs::MAX_SAVED_TABS);
+        active = active.min(tabs.len().saturating_sub(1));
+        crate::browser::tabs::SavedTabs { tabs, active }
+    }
+
+    /// Overwrite `tabs.json` with the current strip.
+    pub fn save_tabs(&self) {
+        crate::browser::tabs::save(&self.snapshot_tabs());
+    }
+
     /// Title for a tab id (live or stored): page title, else URL, else home.
     pub fn tab_title(&self, id: crate::browser::engine::TabId) -> String {
         let page = if id == self.active_tab {
@@ -5178,6 +5215,49 @@ mod tests {
         assert!(panel.stored.is_empty());
         assert_eq!(panel.active_tab, TabId::BOOT);
         assert!(!panel.drop_stored(TabId::BOOT));
+    }
+
+    #[test]
+    fn tab_strip_snapshot_round_trips_order_and_active() {
+        use crate::browser::engine::TabId;
+        let mut panel = BrowserPanel {
+            order: vec![TabId::BOOT, TabId(2), TabId(3)],
+            active_tab: TabId(2),
+            ..BrowserPanel::default()
+        };
+        panel.page.session.begin_load("https://b.test/".to_string());
+        panel.page.session.note_title(Some("B".to_string()));
+        panel.stored.push(StoredTab {
+            id: TabId::BOOT,
+            page: {
+                let mut p = BrowserTabPage::default();
+                p.session.begin_load("https://a.test/".to_string());
+                p
+            },
+        });
+        panel.stored.push(StoredTab {
+            id: TabId(3),
+            page: {
+                let mut p = BrowserTabPage::default();
+                p.session.begin_load("https://c.test/".to_string());
+                p.session.note_title(Some("C".to_string()));
+                p
+            },
+        });
+        let snap = panel.snapshot_tabs();
+        assert_eq!(
+            snap.tabs.iter().map(|t| t.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://a.test/", "https://b.test/", "https://c.test/"]
+        );
+        assert_eq!(snap.tabs[1].title, "B");
+        assert_eq!(snap.active, 1);
+        // Blank/empty pages never persist.
+        panel
+            .page
+            .session
+            .note_url(crate::browser::BLANK_PAGE_URL.to_string());
+        let snap = panel.snapshot_tabs();
+        assert_eq!(snap.tabs.len(), 2);
     }
 
     #[test]
