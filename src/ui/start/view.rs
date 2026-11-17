@@ -1006,7 +1006,7 @@ impl Default for BrowserPanel {
             js_click: false,
             r3_latched: false,
             chrome: Vec::new(),
-            chrome_seq: CHROME_ID_BASE,
+            chrome_seq: crate::browser::cursor::CHROME_ID_BASE,
             debug_overlay: false,
             bookmarks: Vec::new(),
             bookmark_bubble: false,
@@ -1129,8 +1129,10 @@ impl BrowserPanel {
             if items.is_empty() {
                 continue;
             }
-            let w = VIEWPORT_W / items.len() as f32;
-            for (i, target) in items.iter().enumerate() {
+            let total: f32 = items.iter().map(|(_, w)| w).sum();
+            let mut x = 0.0;
+            for (target, weight) in items {
+                let w = VIEWPORT_W * weight / total.max(1.0);
                 let id = match self.chrome.iter().find(|(t, _)| t == target) {
                     Some((_, f)) => f.id,
                     None => {
@@ -1145,7 +1147,7 @@ impl BrowserPanel {
                     *target,
                     Focusable {
                         id,
-                        x: i as f32 * w,
+                        x,
                         y: ys[r.min(2)],
                         w,
                         h: hs[r.min(2)],
@@ -1153,6 +1155,7 @@ impl BrowserPanel {
                         url: None,
                     },
                 ));
+                x += w;
             }
         }
         self.chrome = fresh;
@@ -1184,6 +1187,9 @@ impl BrowserPanel {
             ChromeTarget::Forward => Some(StartMessage::BrowserForward),
             ChromeTarget::Reload => Some(StartMessage::BrowserReload),
             ChromeTarget::Home => Some(StartMessage::BrowserHome),
+            // The address field owns the keyboard; pad users get there via
+            // Triangle today, cursor dock now too.
+            ChromeTarget::Omnibox => Some(StartMessage::ToggleUrlEntry),
             ChromeTarget::Star => Some(StartMessage::BrowserBookmarkStar),
             ChromeTarget::Go => Some(StartMessage::BrowserNavigate),
             ChromeTarget::Bookmark(i) => self
@@ -1330,10 +1336,10 @@ pub const BROWSER_SCROLL_STEP: f32 = 240.0;
 fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, StartMessage> {
     use crate::browser::cursor::VIEWPORT_W;
     // URL-edit mode owns the keyboard; hide the pad cursor so it never
-    // floats over the page while typing in the address field. A chrome
-    // dock hides it too — the header chip carries the focus instead (the
-    // overlay clips to the page image and couldn't show it anyway).
-    if state.browser.url_editing || state.browser.chrome_attached().is_some() {
+    // floats over the page while typing in the address field. A header
+    // roam hides it too — above the page the chip carries the focus, and
+    // the free dot sliding along the clipped edge reads as a glitch.
+    if state.browser.url_editing || state.browser.cursor.y < 0.0 {
         return space().width(Length::Fixed(0.0)).into();
     }
     let scale = img_w / VIEWPORT_W;
@@ -1776,50 +1782,41 @@ pub enum ChromeTarget {
     Forward,
     Reload,
     Home,
+    Omnibox,
     Star,
     Go,
     Bookmark(usize),
 }
 
-/// Header rows for pad navigation: tab strip, toolbar, then one row per
-/// bookmark-bar chunk (the bar wraps at 6). Empty rows are skipped by
-/// vertical moves.
-pub fn chrome_rows(panel: &BrowserPanel) -> Vec<Vec<ChromeTarget>> {
+/// Header rows for pad navigation: tab strip, toolbar (omnibox wide),
+/// one bookmark row. Each entry carries its magnet weight — slots are
+/// roughly proportional to the real control widths so the dock lands
+/// where the control is.
+pub fn chrome_rows(panel: &BrowserPanel) -> Vec<Vec<(ChromeTarget, f32)>> {
     let mut rows = Vec::new();
     let mut strip = Vec::with_capacity(panel.order.len() * 2 + 1);
     for id in &panel.order {
-        strip.push(ChromeTarget::Tab(*id));
-        strip.push(ChromeTarget::TabClose(*id));
+        strip.push((ChromeTarget::Tab(*id), 3.0));
+        strip.push((ChromeTarget::TabClose(*id), 1.0));
     }
-    strip.push(ChromeTarget::NewTab);
+    strip.push((ChromeTarget::NewTab, 1.0));
     rows.push(strip);
     rows.push(vec![
-        ChromeTarget::Back,
-        ChromeTarget::Forward,
-        ChromeTarget::Reload,
-        ChromeTarget::Home,
-        ChromeTarget::Star,
-        ChromeTarget::Go,
+        (ChromeTarget::Back, 1.0),
+        (ChromeTarget::Forward, 1.0),
+        (ChromeTarget::Reload, 1.0),
+        (ChromeTarget::Home, 1.0),
+        (ChromeTarget::Omnibox, 8.0),
+        (ChromeTarget::Star, 1.0),
+        (ChromeTarget::Go, 1.0),
     ]);
-    // Bookmarks flatten to one row (capped): the unified space keeps a
-    // single bookmarks band; overflow stays mouse-reachable.
     rows.push(
         (0..panel.bookmarks.len().min(CHROME_MAX_BOOKMARKS))
-            .map(ChromeTarget::Bookmark)
+            .map(|i| (ChromeTarget::Bookmark(i), 2.0))
             .collect(),
     );
     rows
 }
-
-/// True for synthetic chrome ids (pad action, never an engine click).
-pub fn is_chrome_id(id: u64) -> bool {
-    id >= CHROME_ID_BASE
-}
-
-/// Synthetic chrome ids live far above any engine-assigned page id, so a
-/// cursor attachment unambiguously addresses chrome (pad action, never an
-/// engine click) or page (engine click path).
-pub const CHROME_ID_BASE: u64 = 1 << 62;
 
 /// Unified-space geometry (page px): header rows above the viewport.
 pub const CHROME_STRIP_Y: f32 = -112.0;
@@ -1995,7 +1992,11 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
                 .padding(8)
                 .on_input(StartMessage::BrowserUrlChanged)
                 .on_submit(StartMessage::BrowserNavigate)
-                .style(theme::input),
+                .style(if panel.chrome_attached() == Some(ChromeTarget::Omnibox) {
+                    theme::input_docked
+                } else {
+                    theme::input
+                },),
             if panel.chrome_attached() == Some(ChromeTarget::Star) {
                 button(
                     text(if panel.is_bookmarked(session.url()) {
@@ -5513,6 +5514,26 @@ mod tests {
         assert!(panel.chrome_target(tab_id.unwrap()) == Some(ChromeTarget::Tab(TabId(9))));
         // Unknown id resolves to nothing (engine page ids are small).
         assert_eq!(panel.chrome_target(42), None);
+    }
+
+    #[test]
+    fn chrome_message_maps_targets_to_start_messages() {
+        use crate::browser::engine::TabId;
+        let panel = BrowserPanel::default();
+        assert!(matches!(
+            panel.chrome_message(ChromeTarget::NewTab),
+            Some(StartMessage::BrowserTabNew)
+        ));
+        assert!(matches!(
+            panel.chrome_message(ChromeTarget::Tab(TabId::BOOT)),
+            Some(StartMessage::BrowserTabSwitch(id)) if id == TabId::BOOT
+        ));
+        assert!(matches!(
+            panel.chrome_message(ChromeTarget::Omnibox),
+            Some(StartMessage::ToggleUrlEntry)
+        ));
+        // Unknown bookmark index: no message (caller exits to viewport).
+        assert!(panel.chrome_message(ChromeTarget::Bookmark(0)).is_none());
     }
 
     #[test]

@@ -85,6 +85,10 @@ pub const VIEWPORT_H: f32 = 600.0;
 /// The overlay clips to the page image, so the dot hides while docked up
 /// there and the header chip carries the focus instead.
 pub const CURSOR_MIN_Y: f32 = -140.0;
+/// Synthetic chrome ids live far above any engine-assigned page id, so a
+/// cursor attachment unambiguously addresses chrome (pad action, never an
+/// engine click) or page (engine click path).
+pub const CHROME_ID_BASE: u64 = 1 << 62;
 
 /// Directional jump axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,7 +400,15 @@ impl Cursor {
         self.attached = None;
         let mut best: Option<&Focusable> = None;
         let mut best_d = f32::INFINITY;
+        // Zone rule: above the viewport only header chrome competes, below
+        // it only page targets do. Without this a glide across the sparse
+        // header keeps getting yanked down by dense page links (and back
+        // up) — the bounce. Jumps don't need it: they score directionally.
+        let in_header = self.y < 0.0;
         for item in options {
+            if (item.id >= CHROME_ID_BASE) != in_header {
+                continue;
+            }
             if !self.inside_expanded(item, ACQUIRE_PAD) {
                 continue;
             }
@@ -743,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn jump_flies_up_into_header_space() {
+    fn jump_flies_into_header_space_and_docks() {
         // Unified cursor space: a D-pad Up from the top page target lands
         // on the synthetic header slot above the viewport (negative y).
         let mut c = Cursor::new();
@@ -773,6 +785,38 @@ mod tests {
         }
         assert_eq!(c.attached, Some(1 << 62));
         assert!(c.y < 0.0);
+    }
+
+    #[test]
+    fn magnet_is_zone_gated() {
+        // While roaming the header (y < 0) only chrome competes for the
+        // magnet: a dense page link directly below never yanks the cursor
+        // back down mid-travel (and vice versa at y >= 0).
+        let mut c = Cursor::new();
+        let chrome = Focusable {
+            id: 1 << 62,
+            x: 300.0,
+            y: -72.0,
+            w: 100.0,
+            h: 36.0,
+            kind: FocusKind::Button,
+            url: None,
+        };
+        // Page link directly below the chrome slot.
+        let page = link(1, 300.0, 10.0);
+        let items = [page, chrome];
+        // Roaming free in the header band docks chrome, not the page link
+        // a few dozen px below.
+        c.x = 350.0;
+        c.y = -54.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1 << 62));
+        // Roaming free just inside the viewport ignores the chrome above.
+        let mut c2 = Cursor::new();
+        c2.x = 350.0;
+        c2.y = 20.0;
+        c2.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c2.attached, Some(1));
     }
 
     #[test]

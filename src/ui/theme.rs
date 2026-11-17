@@ -1012,6 +1012,15 @@ pub fn scrollbar(
 // Text inputs
 // ---------------------------------------------------------------------------
 
+/// Omnibox with pad-cursor dock: same as [`input`], pinned to the focused
+/// border so the header dock reads on the widget too (pad focus is not
+/// iced keyboard focus, which is what [`input`] keys off).
+pub fn input_docked(_theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let mut style = input(_theme, status);
+    style.border.color = ACCENT;
+    style
+}
+
 pub fn input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
     let border_color = match status {
         text_input::Status::Focused { .. } => ACCENT,
