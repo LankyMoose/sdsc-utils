@@ -514,6 +514,11 @@ pub struct App {
     /// parked in engine mode so stick moves never double-fire into both
     /// cursor and nav. Reset with the browser surface.
     browser_dpad_stepper: NavStepper,
+    /// TEMP cursor-trace for session analysis (remove after): first tick,
+    /// last emitted tick, and last dock for change detection.
+    cursor_trace_t0: Option<Instant>,
+    cursor_trace_last: Option<Instant>,
+    cursor_trace_dock: Option<u64>,
     /// When set, the next start cue may rumble this DualSense serial (pad-originated).
     haptic_pad_serial: Option<Serial>,
     /// Keyboard Enter hold for replace-confirm (not folded into pad slots).
@@ -839,6 +844,9 @@ impl App {
             gesture_detectors: GestureDetectorBank::default(),
             pad_nav: PadNavBank::default(),
             browser_dpad_stepper: NavStepper::default(),
+            cursor_trace_t0: None,
+            cursor_trace_last: None,
+            cursor_trace_dock: None,
             haptic_pad_serial: None,
             keyboard_cross_hold: CrossHold::default(),
             confirm_key_held: false,
