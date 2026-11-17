@@ -911,6 +911,14 @@ pub struct BrowserPanel {
     pub favicon_order: Vec<String>,
     /// Hold-bumper history selector overlay (B2.4). `None` = closed.
     pub history_selector: Option<HistorySelector>,
+    /// Page-driven focus target (autofocus / JS `.focus()`): UI id to dock
+    /// when it next resolves in the live set. One shot per tree — a culled
+    /// target never docks ("if possible").
+    pub pending_focus: Option<u64>,
+    /// Last left-stick vector seen by the cursor tick. Autofocus docking
+    /// requires the stick at rest (an active steer means the user is driving
+    /// and wins over the page).
+    pub last_pad_stick: (f32, f32),
 }
 
 impl BrowserPanel {
@@ -927,6 +935,7 @@ impl BrowserPanel {
         self.session.close_surface();
         self.url_editing = false;
         self.history_selector = None;
+        self.pending_focus = None;
         // Drop the analog clock so reopening never applies a huge first dt.
         self.analog_at = None;
     }

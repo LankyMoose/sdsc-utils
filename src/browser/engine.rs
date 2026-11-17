@@ -112,6 +112,13 @@ pub enum EngineEvent {
         x: f32,
         y: f32,
     },
+    /// Page focus moved to a live focusable (autofocus attribute, JS
+    /// `.focus()`, tabbing into the page). The UI docks the pad cursor
+    /// onto it when possible. Fires only on change to a known target
+    /// (never on blur-to-nothing).
+    FocusChanged {
+        id: u64,
+    },
     /// Canonical session history (Servo `notify_history_changed` entries +
     /// current index). Overwrites the UI's locally-maintained session
     /// stack so the hold-bumper selector shows exact back/forward targets.

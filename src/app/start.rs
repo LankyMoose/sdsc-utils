@@ -13,7 +13,7 @@ use super::{
     spawn_blocking, steam_appid_from_target,
 };
 use crate::AppResult;
-use crate::browser::cursor::JumpDir;
+use crate::browser::cursor::{JumpDir, VIEWPORT_H, VIEWPORT_W};
 use crate::browser::engine::{EngineCommand, EngineEvent};
 use crate::browser::keys::{self as browser_keys, RawKey};
 use crate::controller::dualsense::rumble::MotorPulse;
@@ -470,10 +470,6 @@ impl App {
         Task::none()
     }
 
-    /// Browser home page: hardcoded default until the settings screen lands
-    /// a configurable home pref.
-    pub(crate) const BROWSER_HOME_URL: &'static str = "https://www.google.com";
-
     /// Browser toggle: foreground the browser app through the multi-app
     /// manager and open the surface; toggling again suspends (close cancels
     /// in-flight work but keeps the cached page for an instant resume).
@@ -494,7 +490,7 @@ impl App {
         if self.start_state.browser.session.url().is_empty()
             && self.start_state.browser.draft.trim().is_empty()
         {
-            self.start_state.browser.draft = Self::BROWSER_HOME_URL.to_string();
+            self.start_state.browser.draft = crate::browser::BROWSER_HOME_URL.to_string();
             let task = self.on_browser_navigate();
             self.resume_browser_engine();
             crate::controller::hid::diag::diag_info("ui-diag: start browser open (home)");
@@ -509,7 +505,7 @@ impl App {
     /// pref. Reuses the navigate path (fresh-page cursor/focusable reset,
     /// theme sync) with the draft pinned to home.
     pub(crate) fn on_browser_go_home(&mut self) -> Task<Message> {
-        self.start_state.browser.draft = Self::BROWSER_HOME_URL.to_string();
+        self.start_state.browser.draft = crate::browser::BROWSER_HOME_URL.to_string();
         self.on_browser_navigate()
     }
 
@@ -818,6 +814,39 @@ impl App {
         Task::none()
     }
 
+    /// Dock the cursor onto a page-focused element (autofocus attribute, JS
+    /// `.focus()`). Returns true when docked. Requires the magnet on, the
+    /// stick at rest (an active steer means the user is driving and wins
+    /// over the page), no mid-flight jump, and a live target — page intent
+    /// never yanks a driven cursor.
+    pub(crate) fn try_dock_focused(&mut self, id: u64) -> bool {
+        let panel = &mut self.start_state.browser;
+        if !panel.cursor.magnet || panel.cursor.fly_to.is_some() {
+            return false;
+        }
+        if panel.last_pad_stick.0.hypot(panel.last_pad_stick.1) != 0.0 {
+            return false;
+        }
+        let Some(item) = panel.focusables.iter().find(|o| o.id == id).cloned() else {
+            return false;
+        };
+        let cursor = &mut panel.cursor;
+        cursor.attached = Some(id);
+        cursor.vx = 0.0;
+        cursor.vy = 0.0;
+        cursor.break_armed = false;
+        if cursor.no_dock == Some(id) {
+            cursor.no_dock = None;
+        }
+        cursor.x = (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W);
+        cursor.y = (item.y + item.h / 2.0).clamp(0.0, VIEWPORT_H);
+        cursor.last_dock = Some((item.x, item.y, item.w, item.h));
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start browser autofocus dock {id}"
+        ));
+        true
+    }
+
     /// Pad tick while the history selector is open (B2.4). The selector owns
     /// the pad: Up/Down/Left/Right moves the highlight (highlight 0 =
     /// closest = quick-press default), Cross confirms, Circle cancels.
@@ -1052,6 +1081,9 @@ impl App {
             sample.rstick_y,
             now,
         );
+        // Stick vector for autofocus docking: a deflected stick means the
+        // user is driving and wins over page focus.
+        self.start_state.browser.last_pad_stick = (sample.lstick_x, sample.lstick_y);
         // Dock-triggered shot: capture the exact pixels the fresh wrap sits
         // on (throttled; the 5s cadence rarely coincides with a dock).
         #[cfg(debug_assertions)]
@@ -1433,6 +1465,20 @@ impl App {
                     .browser
                     .cursor
                     .retarget(&self.start_state.browser.focusables);
+                // Parked page-focus target: dock when it resolves live; drop
+                // after one tree if it never does (culled targets never
+                // dock). A mid-flight jump keeps the target parked.
+                if self.start_state.browser.pending_focus.is_some()
+                    && self.start_state.browser.cursor.fly_to.is_none()
+                {
+                    let id = self
+                        .start_state
+                        .browser
+                        .pending_focus
+                        .take()
+                        .expect("pending focus checked");
+                    self.try_dock_focused(id);
+                }
             }
             EngineEvent::ScrollOffset { x, y } => {
                 self.start_state.browser.scroll_offset = (x, y);
@@ -1455,6 +1501,18 @@ impl App {
                     } else {
                         sel.clamp(len);
                     }
+                }
+            }
+            EngineEvent::FocusChanged { id } => {
+                // Magnet off means never dock — drop any parked target too.
+                if !self.start_state.browser.cursor.magnet {
+                    self.start_state.browser.pending_focus = None;
+                } else if !self.try_dock_focused(id) {
+                    // Not live / mid-flight / stick busy: park for the next
+                    // tree (one shot).
+                    self.start_state.browser.pending_focus = Some(id);
+                } else {
+                    self.start_state.browser.pending_focus = None;
                 }
             }
             EngineEvent::LoadFinished { generation, result } => match result {

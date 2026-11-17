@@ -128,6 +128,21 @@ pub const MAX_SUGGESTIONS: usize = 6;
 /// History-selector rows per dropdown (closest first, controller-scannable).
 pub const MAX_SELECTOR_ENTRIES: usize = 8;
 
+/// Home page: hardcoded default until the settings screen lands a
+/// configurable home pref. The engine also boots directly onto this (no
+/// about:blank document), so back/forward and the selector start clean.
+pub const BROWSER_HOME_URL: &str = "https://www.google.com";
+
+/// The empty document: never a history entry (autocomplete or session).
+/// The engine used to boot on it before the initial URL was configured;
+/// JS can still navigate to it — it is a placeholder, not a visit.
+pub const BLANK_PAGE_URL: &str = "about:blank";
+
+/// True for URLs that must never be remembered as visits.
+fn is_ignored_url(url: &str) -> bool {
+    url.is_empty() || url == BLANK_PAGE_URL
+}
+
 /// In-Start browser surface state. Pure data: the iced view owns the URL
 /// draft and scroll offset, this owns load lifecycle with a generation
 /// counter so late worker results are ignored after suspend/close —
@@ -296,7 +311,7 @@ impl BrowserSession {
     /// Remember a navigation (most-recent-first, deduped, capped).
     /// Revisits move to the front; empty URLs never record.
     pub fn record_visit(&mut self, url: String) {
-        if url.is_empty() {
+        if is_ignored_url(&url) {
             return;
         }
         self.history.retain(|e| e.url != url);
@@ -317,11 +332,11 @@ impl BrowserSession {
     /// from the middle truncate the forward tail (browser semantics);
     /// same-document fragment traffic only retargets the live entry.
     /// Engine history travel lands via `UrlChanged` before the canonical
-    /// `HistoryChanged` overwrite: an exact adjacent match moves the index
-    /// instead of forking the stack (otherwise every Back would truncate
-    /// the forward tail and append a duplicate). Empty URLs never record.
+    /// `HistoryChanged`: an exact adjacent match moves the index instead of
+    /// forking the stack (otherwise every Back would truncate the forward
+    /// tail and append a duplicate). Blank/empty URLs never record.
     pub fn push_nav(&mut self, url: String) {
-        if url.is_empty() {
+        if is_ignored_url(&url) {
             return;
         }
         if let Some(i) = self.nav_index
@@ -729,6 +744,21 @@ mod tests {
         // Empty URLs never record.
         s.record_visit(String::new());
         assert_eq!(s.history.len(), 2);
+    }
+
+    #[test]
+    fn blank_page_never_records() {
+        // The engine boots straight onto home now, but JS can still land
+        // on about:blank — a placeholder, never a visit, in either stack.
+        let mut s = BrowserSession::default();
+        s.begin_load("https://a.test/".to_string());
+        s.record_visit(BLANK_PAGE_URL.to_string());
+        s.note_url(BLANK_PAGE_URL.to_string());
+        assert_eq!(s.nav_len(), 1);
+        assert_eq!(s.nav_current(), Some(0));
+        assert_eq!(s.url(), BLANK_PAGE_URL);
+        assert!(s.history.iter().all(|e| e.url != BLANK_PAGE_URL));
+        assert!(!s.can_go_back());
     }
 
     #[test]

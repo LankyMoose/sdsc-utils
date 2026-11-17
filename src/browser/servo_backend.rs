@@ -99,6 +99,10 @@ struct Shared {
     dom: HashMap<u64, DomEntry>,
     dom_uid: HashMap<u64, u64>,
     dom_seq: u64,
+    /// Last focused UI id emitted via `FocusChanged` (None = nothing or
+    /// unknown). Compared per ingest so autofocus / JS `.focus()` dock the
+    /// cursor exactly once per change. Reset per document with the maps.
+    last_focus: Option<u64>,
     /// Fresh document (or fresh load) needs the install+snapshot boot
     /// round-trip. Set by every document event, cleared on dispatch.
     dom_boot: bool,
@@ -645,6 +649,7 @@ fn run(
         content: None,
         last_url: None,
         last_full_url: String::new(),
+        last_focus: None,
         ax_debug: std::env::var("SDSC_AX_DEBUG").is_ok(),
     }));
     // Auto-install the DOM observers into every document (fresh loads,
@@ -652,12 +657,19 @@ fn run(
     // side. The evaluate-boot path below stays as backup.
     let user_content = Rc::new(UserContentManager::new(&servo));
     user_content.add_script(Rc::new(UserScript::new(DOM_INSTALL_JS.to_string(), None)));
-    let webview = WebViewBuilder::new(&servo, ctx.clone())
+    // Boot straight onto the home page: without an initial URL Servo opens
+    // about:blank, which would pollute history (and cost a throwaway load)
+    // before the first real navigate. Falls back to blank if unparseable
+    // (hardcoded constant — cannot happen, but never panic the worker).
+    let mut builder = WebViewBuilder::new(&servo, ctx.clone())
         .user_content_manager(user_content)
         .delegate(Rc::new(Delegate {
             shared: shared.clone(),
-        }))
-        .build();
+        }));
+    if let Ok(home) = url::Url::parse(crate::browser::BROWSER_HOME_URL) {
+        builder = builder.url(home);
+    }
+    let webview = builder.build();
     crate::platform::app_log::info(format!(
         "servo-engine: ready ({VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT} software surface)"
     ));
@@ -964,6 +976,7 @@ fn clear_tree(state: &mut Shared) {
     // a boot round-trip (idempotent install + snapshot).
     state.dom_seq = state.dom_seq.wrapping_add(1);
     state.dom_epoch = state.dom_epoch.wrapping_add(1);
+    state.last_focus = None;
     state.dom_in_flight = false;
     state.dom_in_flight_at = None;
     state.dom_boot = true;
@@ -1447,6 +1460,19 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128, skip_rebase: bo
         ));
         state.dom.clear();
         state.dom_uid.clear();
+    }
+    // Page focus (autofocus attribute, JS .focus()): resolve the snapshot's
+    // active id to a live UI id and emit on change only, so the cursor
+    // docks exactly once per focus move. Unknown/culled/body targets (0 or
+    // unmapped) resolve to None and stay silent — blur never undocks.
+    let focus = (snap.active != 0)
+        .then(|| state.dom_uid.get(&snap.active).copied())
+        .flatten();
+    if focus != state.last_focus {
+        state.last_focus = focus;
+        if let Some(id) = focus {
+            state.handle.emit(EngineEvent::FocusChanged { id });
+        }
     }
     crate::platform::app_log::info(format!(
         "servo-dom: ingested fresh={fresh} dropped={dropped} retained={retained} live={} total={total} culled={culled} skip={skipped:?} boxA={box_anchors} boxKid={box_kids} boxAWrap={box_wraps} boxAEmpty={box_empty} forced={forced} hid={hid} clip={clip} t={timings:?} rtt={rtt_ms}ms rb={} snap=({:.0},{:.0}) trk=({:.0},{:.0})",

@@ -546,7 +546,11 @@ const DOM_QUERY_BODY: &str = r###"(function(){
     var de = document.documentElement;
     if (de) { dw = de.scrollWidth || 0; dh = de.scrollHeight || 0; }
   } catch (e) {}
-  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], hid: skHid, clip: skClip, boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, forced: skForce, t: [Math.round(tQ), Math.round(tmM), Math.round(tmV), Math.round(tmC), Math.round(tmT)], sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh)};
+  // Focused element in the snapshot's own id space (0 = none/body):
+  // drives cursor docking on autofocus / JS .focus().
+  var ax = 0;
+  try { var ae = document.activeElement; if (ae && ae !== document.body && ae !== document.documentElement) { ax = idFor(ae); } } catch (e) {}
+  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], hid: skHid, clip: skClip, boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, forced: skForce, t: [Math.round(tQ), Math.round(tmM), Math.round(tmV), Math.round(tmC), Math.round(tmT)], sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh), ax: ax};
 })()"###;
 
 /// Parsed snapshot: viewport-space candidates plus the true page scroll at
@@ -584,6 +588,9 @@ pub struct DomSnapshot {
     /// visibility walks, clip walks, text extraction. Finds the real
     /// per-pull cost center instead of guessing.
     pub timings: [u64; 5],
+    /// Focused element's snapshot id (`ax`, 0 = none): drives cursor
+    /// docking on autofocus / JS `.focus()`.
+    pub active: u64,
 }
 
 /// Parse a `dom_query_js` result into raw candidates. Lenient by design:
@@ -610,6 +617,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             hidden_subtree: 0,
             clipped_away: 0,
             timings: [0; 5],
+            active: 0,
         };
     };
     let num_field = |key: &str| {
@@ -622,6 +630,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
     };
     let scroll = (num_field("sx"), num_field("sy"));
     let doc = (num_field("dw"), num_field("dh"));
+    let active = num_field("ax").max(0.0) as u64;
     let total = num_field("total") as usize;
     let culled = num_field("culled") as usize;
     let mut culled_ids = Vec::new();
@@ -675,6 +684,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             hidden_subtree,
             clipped_away,
             timings,
+            active,
         };
     };
     let mut nodes = Vec::new();
@@ -729,6 +739,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
         hidden_subtree,
         clipped_away,
         timings,
+        active,
     }
 }
 
@@ -861,6 +872,7 @@ mod tests {
             "ccull".to_string(),
             JSValue::Array(vec![num(11.0), num(13.0)]),
         );
+        root.insert("ax".to_string(), num(9.0));
         let out = parse_dom_snapshot(&JSValue::Object(root));
         assert!(out.nodes.is_empty());
         assert_eq!(out.scroll, (0.0, 1240.0));
@@ -877,6 +889,17 @@ mod tests {
         assert_eq!(out.clipped_away, 3);
         assert_eq!(out.timings, [5, 40, 12, 3, 1]);
         assert_eq!(out.culled_ids, vec![11, 13]);
+        assert_eq!(out.active, 9);
+    }
+
+    #[test]
+    fn parse_defaults_active_to_none() {
+        // Old cached pages predate the focus field: missing `ax` means
+        // no focused element, never a dock.
+        let mut root = HashMap::new();
+        root.insert("nodes".to_string(), JSValue::Array(vec![]));
+        let out = parse_dom_snapshot(&JSValue::Object(root));
+        assert_eq!(out.active, 0);
     }
 
     #[test]
