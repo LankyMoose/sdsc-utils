@@ -59,11 +59,18 @@ pub const FLY_SPEED: f32 = 2400.0;
 /// along. Fresh means the stick dropped below [`BREAK_REARM_DEFLECT`]
 /// since docking — landing with the stick still held never instantly
 /// kicks back off (human release time is ~200ms; the old level trigger
-/// broke every arrival on the very next tick).
+/// broke every arrival on the very next tick). A hold sustained past
+/// [`BREAK_LATCH_GRACE_SECS`] breaks anyway, so push-through traversal
+/// never strands on a landing.
 pub const BREAK_FREE_DEFLECT: f32 = 0.25;
 /// Re-arm deflection: the stick must fall below this after docking before
 /// a new push can break free again.
 pub const BREAK_REARM_DEFLECT: f32 = 0.1;
+/// Latch grace, seconds: a landing held past this long breaks free anyway.
+/// Covers release latency with margin, then yields to a deliberate hold.
+pub const BREAK_LATCH_GRACE_SECS: f32 = 0.3;
+/// Latch grace, seconds: a landing held past this long breaks free anyway.
+/// Covers release latency with margin, then yields to a deliberate hold.
 /// Outward kick on break-free, px/s: immediate motion in the push direction.
 pub const BREAK_KICK: f32 = 800.0;
 /// Right-stick scroll speed at full deflection, px/s.
@@ -104,8 +111,11 @@ pub struct Cursor {
     /// Break-free arming: set on every dock, cleared only once the stick
     /// drops below [`BREAK_REARM_DEFLECT`]. A fresh push past
     /// [`BREAK_FREE_DEFLECT`] then breaks; arriving (or lingering) with the
-    /// stick held never does.
+    /// stick held never does — unless the hold outlasts
+    /// [`BREAK_LATCH_GRACE_SECS`], which breaks through anyway.
     pub break_armed: bool,
+    /// Seconds docked (accumulates while attached): bounds the latch above.
+    pub docked_for: f32,
     /// Docking mode (L3 toggles): the point docks onto elements it arrives
     /// at. Off = pure free-form virtual mouse; D-pad jumping still applies.
     pub magnet: bool,
@@ -125,6 +135,7 @@ impl Cursor {
             fly_to: None,
             no_dock: None,
             break_armed: true,
+            docked_for: 0.0,
             magnet: true,
             visible: true,
         }
@@ -163,10 +174,13 @@ impl Cursor {
         // carried-away element actually releases instead of re-centering
         // onto its new rect forever. Breaks are edge-triggered: docking
         // latches until the stick drops below BREAK_REARM_DEFLECT, so
-        // arriving with the stick still held never kicks straight back off.
+        // arriving with the stick still held never kicks straight back
+        // off — but a hold sustained past BREAK_LATCH_GRACE_SECS breaks
+        // through anyway, so traversal never strands.
         if self.attached.is_some() {
             self.vx = 0.0;
             self.vy = 0.0;
+            self.docked_for += dt_secs;
             let item = self
                 .attached
                 .and_then(|id| options.iter().find(|o| o.id == id));
@@ -174,7 +188,10 @@ impl Cursor {
             if deflect < BREAK_REARM_DEFLECT {
                 self.break_armed = true;
             }
-            let pushed = deflect > BREAK_FREE_DEFLECT && self.break_armed;
+            // Landed-held latches until release — but a hold sustained past
+            // the grace still breaks through, so traversal never strands.
+            let latched = !self.break_armed && self.docked_for < BREAK_LATCH_GRACE_SECS;
+            let pushed = deflect > BREAK_FREE_DEFLECT && !latched;
             let held = item.is_some_and(|it| self.inside_expanded(it, HOLD_PAD));
             if pushed || !held {
                 let was = self.attached;
@@ -383,6 +400,7 @@ impl Cursor {
             self.vx = 0.0;
             self.vy = 0.0;
             self.break_armed = false;
+            self.docked_for = 0.0;
             self.x = (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W);
             self.y = (item.y + item.h / 2.0).clamp(0.0, VIEWPORT_H);
             self.last_dock = Some((item.x, item.y, item.w, item.h));
@@ -897,6 +915,30 @@ mod tests {
         c.advance(0.0, 0.0, 0.016, &items);
         c.advance(0.26, 0.0, 0.016, &items);
         assert_eq!(c.attached, None);
+    }
+
+    #[test]
+    fn sustained_hold_breaks_through_after_grace() {
+        // The latch is not a lock: holding past the grace still breaks
+        // free, so push-through traversal never strands on a landing.
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        for _ in 0..10 {
+            c.advance(0.6, 0.0, 0.016, &items);
+            assert_eq!(c.attached, Some(1), "grace holds the landing");
+        }
+        for _ in 0..30 {
+            c.advance(0.6, 0.0, 0.016, &items);
+            if c.attached.is_none() {
+                break;
+            }
+        }
+        assert_eq!(c.attached, None, "sustained hold breaks through");
+        assert_eq!(c.no_dock, Some(1));
     }
 
     #[test]

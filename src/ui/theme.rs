@@ -313,6 +313,21 @@ pub fn panel(_theme: &Theme) -> container::Style {
     }
 }
 
+/// Browser status overlay (Chrome-style link hover): near-black translucent
+/// chip pinned bottom-left over the page. No border, small radius.
+pub fn status_overlay(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(alpha(Color::BLACK, 0.78))),
+        text_color: Some(rgb(241, 243, 245)),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: radius::SM.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Raised surface without a border (list rows, headers).
 pub fn surface(_theme: &Theme) -> container::Style {
     container::Style {

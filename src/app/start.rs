@@ -835,6 +835,7 @@ impl App {
         cursor.vx = 0.0;
         cursor.vy = 0.0;
         cursor.break_armed = false;
+        cursor.docked_for = 0.0;
         if cursor.no_dock == Some(id) {
             cursor.no_dock = None;
         }

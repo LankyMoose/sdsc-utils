@@ -1416,25 +1416,47 @@ fn browser_hover_link(panel: &BrowserPanel) -> Option<String> {
         .and_then(|o| o.url.clone())
 }
 
-/// Status strip under the toolbar: hovered-link URL wins (Chrome-style),
-/// else the live engine phase, else the session URL so the strip never
-/// collapses (stable layout). Long URLs ellipsize to pixels like the other
-/// browser rows.
-fn browser_status_strip(panel: &BrowserPanel) -> Element<'_, StartMessage> {
-    let line = if let Some(url) = browser_hover_link(panel) {
-        url
+/// Status text: hovered-link URL wins (Chrome-style), else the live engine
+/// phase, else nothing (the overlay hides — it never takes layout space).
+fn browser_status_text(panel: &BrowserPanel) -> Option<String> {
+    if let Some(url) = browser_hover_link(panel) {
+        return Some(url);
+    }
+    let activity = panel.engine_activity.label();
+    if activity.is_empty() {
+        None
     } else {
-        let activity = panel.engine_activity.label();
-        if activity.is_empty() {
-            panel.session.url().to_string()
-        } else {
-            activity.to_string()
-        }
+        Some(activity.to_string())
+    }
+}
+
+/// Status overlay: small black (translucent) bar pinned bottom-left over
+/// the viewport, Chrome-style. Hidden entirely when there is no status —
+/// as a `stack!` layer it never shifts layout appearing or vanishing.
+fn browser_status_overlay(panel: &BrowserPanel) -> Element<'_, StartMessage> {
+    let Some(status) = browser_status_text(panel) else {
+        return space().height(Length::Fixed(0.0)).into();
     };
-    text(text_fit::ellipsize_to_width(&line, 11.0, 640.0))
-        .size(11.0)
-        .color(theme::MUTED)
-        .into()
+    column![
+        space().height(Fill),
+        row![
+            container(
+                text(text_fit::ellipsize_to_width(&status, 11.0, 480.0))
+                    .size(11.0)
+                    .color(theme::INK)
+            )
+            .padding([4, 10])
+            .style(theme::status_overlay),
+            space().width(Fill),
+        ],
+    ]
+    .padding(iced::Padding {
+        top: 0.0,
+        right: 8.0,
+        bottom: 8.0,
+        left: 0.0,
+    })
+    .into()
 }
 
 /// In-Start browser card: URL row, page, reload / external / close
@@ -1524,20 +1546,20 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         ]
         .spacing(8)
         .align_y(Alignment::Center),
-        space().height(4),
-        browser_status_strip(panel),
-        space().height(4),
+        space().height(8),
         browser_bookmark_bar(panel),
         // Fixed-position dropdowns: the stack sizes to its base layer, so
-        // suggestions, the star bubble, and the history selector appearing
-        // never shove content down. The bubble wins over suggestions (it
-        // owns the keyboard); the selector wins over both (hold claims
-        // the pad until release/Cross/Circle resolves it).
+        // suggestions, the star bubble, the history selector, and the status
+        // overlay appearing never shove content down. The bubble wins over
+        // suggestions (it owns the keyboard); the selector wins over both
+        // (hold claims the pad until release/Cross/Circle resolves it). The
+        // status bar floats bottom-left over the page, Chrome-style.
         stack![
             column![browser_page_view(state, img_w), browser_debug_line(panel),],
             browser_suggestions(panel),
             browser_bookmark_bubble(panel),
             browser_history_selector(panel),
+            browser_status_overlay(panel),
         ],
         space().height(8),
         // Card action row: the overlay toggle is debug-only (mirrors the
