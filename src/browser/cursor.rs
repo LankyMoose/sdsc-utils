@@ -147,11 +147,6 @@ fn cone_hit(item: &Focusable, x: f32, y: f32, dx: f32, dy: f32) -> bool {
     across <= along
 }
 
-/// Same-row band for header-zone horizontal jumps: a wide slot's center
-/// can otherwise prefer a nearer row above/below over the adjacent
-/// same-row button (observed: omnibox-Left landing two rows up).
-pub const HEADER_ROW_BAND: f32 = 24.0;
-
 impl Cursor {
     pub fn new() -> Self {
         Self {
@@ -362,23 +357,13 @@ impl Cursor {
             JumpDir::Right => (1.0, 0.0),
         };
         let mut best: Option<(u64, f32)> = None;
-        // Header zone, horizontal moves: same-band targets only, so a wide
-        // slot's center can't prefer a nearer row above/below over the
-        // adjacent same-row button. Page and vertical moves keep the plain
-        // cone (long-standing feel, untouched).
-        let banded = self.y < 0.0 && (dir == JumpDir::Left || dir == JumpDir::Right);
         for item in options {
             if Some(item.id) == self.attached {
                 continue;
             }
-            // Row gate uses centers (which row is this target in?); alignment
-            // scoring uses the nearest point (a slot directly below wins over
-            // a diagonally-nearer center, and tiny off-axis targets stop
-            // intercepting wide same-row neighbors).
-            let center_cy = item.y + item.h / 2.0 - self.y;
-            if banded && center_cy.abs() > HEADER_ROW_BAND {
-                continue;
-            }
+            // Nearest-point alignment scoring: a slot directly below wins
+            // over a diagonally-nearer center, and tiny off-axis targets
+            // stop intercepting wide same-row neighbors.
             let nx = self.x.clamp(item.x, item.x + item.w);
             let ny = self.y.clamp(item.y, item.y + item.h);
             let cx = nx - self.x;
@@ -400,19 +385,26 @@ impl Cursor {
         if let Some((id, _)) = best {
             if let Some(item) = options.iter().find(|o| o.id == id) {
                 // Fly, don't teleport: the outline morphs on arrival.
-                self.attached = None;
-                self.vx = 0.0;
-                self.vy = 0.0;
-                self.fly_to = Some((
-                    (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W),
-                    (item.y + item.h / 2.0).clamp(CURSOR_MIN_Y, VIEWPORT_H),
-                ));
+                self.jump_to(item);
             }
             true
         } else {
             self.nudge(dir, options);
             false
         }
+    }
+
+    /// Fly straight to a known target, bypassing directional scoring. Row-
+    /// stepped header navigation picks the slot itself (column-preserved),
+    /// and a pick can sit outside the 60-degree cone the spatial jump uses.
+    pub fn jump_to(&mut self, item: &Focusable) {
+        self.attached = None;
+        self.vx = 0.0;
+        self.vy = 0.0;
+        self.fly_to = Some((
+            (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W),
+            (item.y + item.h / 2.0).clamp(CURSOR_MIN_Y, VIEWPORT_H),
+        ));
     }
 
     /// Dock when the point actually arrives: attach to the element whose
@@ -468,6 +460,13 @@ impl Cursor {
             }
         }
         self.attached = best.map(|item| item.id);
+        // New dock, instant wrap: the morph eases dot→wrap, which swooshes
+        // through wrong sizes on big targets (bookmark bar to page link).
+        // The flight already animated the motion; the outline cuts in.
+        // Undocking keeps the morph (wrap collapses back into the dot).
+        if best.is_some() {
+            self.dock_blend = 1.0;
+        }
         // Center on dock: the point moves to the middle of the target, and
         // any arrival velocity dies here — a dock starts from rest, and the
         // break latch engages so the arriving (still-held) stick cannot
@@ -866,10 +865,11 @@ mod tests {
     }
 
     #[test]
-    fn header_jump_left_stays_in_row() {
-        // The observed miss: docked on the wide omnibox, Left jumped two
-        // rows up to a strip tab whose center was nearer in x than the
-        // adjacent toolbar buttons. Same-band wins in the header.
+    fn jump_scores_nearest_point_not_center() {
+        // Rect-nearest scoring (not centers): direct-below wins over
+        // diagonal, and tiny off-axis targets stop intercepting wide
+        // same-row neighbors. Row membership itself is enforced by the
+        // caller (view-level row stepping), not by scoring.
         let mut c = Cursor::new();
         let omni = Focusable {
             id: CHROME_ID_BASE,
@@ -903,15 +903,17 @@ mod tests {
         c.y = -54.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(CHROME_ID_BASE));
+        // Pure spatial scoring: the nearer strip slot wins here. Same-row
+        // restriction lives one level up (view row-stepping), where row
+        // membership is known.
         assert!(c.jump(JumpDir::Left, &items));
-        // Flies to the toolbar neighbor, not the nearer-in-x strip slot.
         for _ in 0..60 {
             c.advance(0.0, 0.0, 0.016, &items);
-            if c.attached == Some(CHROME_ID_BASE + 1) {
+            if c.attached == Some(CHROME_ID_BASE + 2) {
                 break;
             }
         }
-        assert_eq!(c.attached, Some(CHROME_ID_BASE + 1));
+        assert_eq!(c.attached, Some(CHROME_ID_BASE + 2));
     }
 
     fn chrome_btn(id: u64, x: f32, y: f32, w: f32, h: f32) -> Focusable {

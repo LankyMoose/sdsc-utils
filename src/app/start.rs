@@ -874,6 +874,7 @@ impl App {
         };
         let cursor = &mut panel.cursor;
         cursor.attached = Some(id);
+        cursor.dock_blend = 1.0;
         cursor.vx = 0.0;
         cursor.vy = 0.0;
         cursor.break_armed = false;

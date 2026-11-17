@@ -1340,16 +1340,140 @@ impl BrowserPanel {
         (rx * SCROLL_SPEED * dt, ry * SCROLL_SPEED * dt)
     }
 
-    /// D-pad focus step: directional jump, falling back to a nudge. Same
-    /// unified surface — jumps fly into header slots and back out.
+    /// D-pad focus step. Chrome travel is row-stepped: Left/Right stay in
+    /// the row (stop at the ends), Up/Down move exactly one row with the
+    /// column preserved — never skipping rows, never flying into the void.
+    /// Page travel keeps the spatial cone jump.
     pub fn jump_cursor(&mut self, dir: crate::browser::cursor::JumpDir) {
+        use crate::browser::cursor::JumpDir;
         #[cfg(debug_assertions)]
         crate::platform::app_log::info(format!(
             "cursor jump {dir:?} from={:?} at=({:.0},{:.0})",
             self.page.cursor.attached, self.page.cursor.x, self.page.cursor.y,
         ));
-        let targets = cursor_targets(&self.page.focusables, &self.chrome);
-        self.page.cursor.jump(dir, &targets);
+        self.rebuild_chrome();
+        // Row layout with live rects (stable indices: 0 strip, 1 toolbar,
+        // 2 bookmarks; empties kept so indices never shift).
+        let layout: Vec<Vec<(ChromeTarget, crate::browser::cursor::Focusable)>> = chrome_rows(self)
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .filter_map(|(t, _)| {
+                        self.chrome
+                            .iter()
+                            .find(|(tt, _)| *tt == t)
+                            .map(|(t, f)| (*t, f.clone()))
+                    })
+                    .collect()
+            })
+            .collect();
+        let attached = self.page.cursor.attached;
+        let in_chrome = match attached {
+            Some(id) => layout
+                .iter()
+                .flat_map(|r| r.iter())
+                .any(|(_, f)| f.id == id),
+            None => self.page.cursor.y < 0.0,
+        };
+        // Current row: the attached slot's row, else the y-band row.
+        let cur_row: Option<usize> = if in_chrome {
+            attached
+                .and_then(|id| {
+                    layout
+                        .iter()
+                        .position(|r| r.iter().any(|(_, f)| f.id == id))
+                })
+                .or_else(|| {
+                    // Row boundaries: strip ends where toolbar begins,
+                    // toolbar ends where the bookmark row begins.
+                    let y = self.page.cursor.y;
+                    let strip_bottom = CHROME_STRIP_Y + CHROME_ROW_H;
+                    let toolbar_bottom = CHROME_TOOLBAR_Y + CHROME_ROW_H;
+                    if y < strip_bottom {
+                        Some(0)
+                    } else if y < toolbar_bottom {
+                        Some(1)
+                    } else {
+                        Some(2)
+                    }
+                })
+        } else {
+            None
+        };
+        let row_items = |r: usize| -> Vec<crate::browser::cursor::Focusable> {
+            layout
+                .get(r)
+                .map(|row| row.iter().map(|(_, f)| f.clone()).collect())
+                .unwrap_or_default()
+        };
+        // Column-preserving pick: the slot containing the cursor's x, else
+        // the one whose edge is nearest. Deliberately not cone-filtered —
+        // row stepping always moves exactly one row, however far sideways
+        // the nearest slot sits.
+        let col_pick = |items: &[crate::browser::cursor::Focusable],
+                        x: f32|
+         -> Option<crate::browser::cursor::Focusable> {
+            let mut best: Option<(&crate::browser::cursor::Focusable, f32)> = None;
+            for f in items {
+                let d = if x < f.x {
+                    f.x - x
+                } else if x > f.x + f.w {
+                    x - (f.x + f.w)
+                } else {
+                    return Some(f.clone());
+                };
+                if best.is_none_or(|(_, bd)| d < bd) {
+                    best = Some((f, d));
+                }
+            }
+            best.map(|(f, _)| f.clone())
+        };
+        let x = self.page.cursor.x;
+        match (cur_row, dir) {
+            // Header horizontals: same row only (bounded nudge stops at the
+            // ends instead of flying off).
+            (Some(r), JumpDir::Left | JumpDir::Right) => {
+                let items = row_items(r);
+                self.page.cursor.jump(dir, &items);
+            }
+            // Header up: nearest non-empty row above, column preserved;
+            // top row stays put.
+            (Some(r), JumpDir::Up) => {
+                for prev in (0..r).rev() {
+                    if let Some(f) = col_pick(&row_items(prev), x) {
+                        self.page.cursor.jump_to(&f);
+                        return;
+                    }
+                }
+            }
+            // Header down: nearest non-empty row below, column preserved;
+            // the bottom row drops spatially into the page.
+            (Some(r), JumpDir::Down) => {
+                for next in r + 1..layout.len() {
+                    if let Some(f) = col_pick(&row_items(next), x) {
+                        self.page.cursor.jump_to(&f);
+                        return;
+                    }
+                }
+                let targets = cursor_targets(&self.page.focusables, &self.chrome);
+                self.page.cursor.jump(dir, &targets);
+            }
+            // Page up: lowest non-empty chrome row (toolbar before strip),
+            // column preserved.
+            (None, JumpDir::Up) => {
+                for r in (0..layout.len()).rev() {
+                    if let Some(f) = col_pick(&row_items(r), x) {
+                        self.page.cursor.jump_to(&f);
+                        return;
+                    }
+                }
+            }
+            // Page verticals/horizontals: spatial cone, unchanged.
+            (None, _) => {
+                let targets = cursor_targets(&self.page.focusables, &self.chrome);
+                self.page.cursor.jump(dir, &targets);
+            }
+        }
     }
 }
 
@@ -1375,10 +1499,12 @@ pub const BROWSER_SCROLL_STEP: f32 = 240.0;
 fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, StartMessage> {
     use crate::browser::cursor::VIEWPORT_W;
     // URL-edit mode owns the keyboard; hide the pad cursor so it never
-    // floats over the page while typing in the address field. A header
-    // roam hides it too — above the page the chip carries the focus, and
-    // the free dot sliding along the clipped edge reads as a glitch.
-    if state.browser.url_editing || state.browser.cursor.y < 0.0 {
+    // floats over the page while typing in the address field. A chrome
+    // dock hides it too — the header chip carries the focus instead (the
+    // overlay clips to the page image and couldn't show it anyway). Free
+    // header roam keeps the dot, clamped at the top edge, so position
+    // feedback never vanishes mid-travel.
+    if state.browser.url_editing || state.browser.chrome_attached().is_some() {
         return space().width(Length::Fixed(0.0)).into();
     }
     let scale = img_w / VIEWPORT_W;
@@ -5478,6 +5604,109 @@ mod tests {
         assert!(!sample_controller(true, false).show_power_off());
         assert!(!sample_controller(false, true).show_power_off());
         assert!(!sample_controller(false, false).show_power_off());
+    }
+
+    fn docked_panel_on(target: ChromeTarget) -> BrowserPanel {
+        let mut panel = BrowserPanel::default();
+        panel.rebuild_chrome();
+        let (_, f) = panel
+            .chrome
+            .iter()
+            .find(|(t, _)| *t == target)
+            .expect("chrome slot exists");
+        panel.page.cursor.x = f.x + f.w / 2.0;
+        panel.page.cursor.y = f.y + f.h / 2.0;
+        panel.page.cursor.attached = Some(f.id);
+        panel
+    }
+
+    /// Tick neutral samples until the current jump flight lands, so the
+    /// post-jump dock state is observable (docking is arrival-based).
+    fn fly_until_dock(panel: &mut BrowserPanel) {
+        let mut now = Instant::now();
+        for _ in 0..240 {
+            now += Duration::from_millis(16);
+            panel.advance_stick(0.0, 0.0, 0.0, 0.0, now);
+            if panel.page.cursor.fly_to.is_none() {
+                break;
+            }
+        }
+        assert!(
+            panel.page.cursor.fly_to.is_none(),
+            "flight never arrived (cursor stuck at ({:.0},{:.0}))",
+            panel.page.cursor.x,
+            panel.page.cursor.y
+        );
+    }
+
+    #[test]
+    fn header_left_stays_in_row() {
+        // Left from the omnibox must land on the adjacent toolbar button,
+        // never a strip slot two rows up.
+        let mut panel = docked_panel_on(ChromeTarget::Omnibox);
+        panel.jump_cursor(crate::browser::cursor::JumpDir::Left);
+        fly_until_dock(&mut panel);
+        assert_eq!(
+            panel.chrome_attached(),
+            Some(ChromeTarget::Home),
+            "left of omnibox is Home, same row"
+        );
+    }
+
+    #[test]
+    fn header_up_down_moves_one_row() {
+        // Toolbar -> strip -> toolbar with the column preserved; never a
+        // two-row skip in either direction.
+        let mut panel = docked_panel_on(ChromeTarget::Omnibox);
+        panel.jump_cursor(crate::browser::cursor::JumpDir::Up);
+        fly_until_dock(&mut panel);
+        let up = panel.chrome_attached().expect("docked in strip row");
+        let (_, f) = panel
+            .chrome
+            .iter()
+            .find(|(t, _)| *t == up)
+            .expect("strip slot");
+        assert_eq!(f.y, CHROME_STRIP_Y, "one row up, not skipped");
+        panel.jump_cursor(crate::browser::cursor::JumpDir::Down);
+        fly_until_dock(&mut panel);
+        let back = panel.chrome_attached().expect("docked in toolbar row");
+        let (_, f) = panel
+            .chrome
+            .iter()
+            .find(|(t, _)| *t == back)
+            .expect("toolbar slot");
+        assert_eq!(f.y, CHROME_TOOLBAR_Y, "one row down, not skipped");
+    }
+
+    #[test]
+    fn page_up_lands_on_toolbar_never_strip() {
+        // Up from the page enters the header at the lowest row (toolbar),
+        // never vaulting straight to the tab strip.
+        let mut panel = BrowserPanel::default();
+        panel.rebuild_chrome();
+        panel.page.cursor.x = 400.0;
+        panel.page.cursor.y = 300.0;
+        panel.jump_cursor(crate::browser::cursor::JumpDir::Up);
+        fly_until_dock(&mut panel);
+        let got = panel.chrome_attached().expect("docked in header");
+        let (_, f) = panel
+            .chrome
+            .iter()
+            .find(|(t, _)| *t == got)
+            .expect("header slot");
+        assert_eq!(f.y, CHROME_TOOLBAR_Y);
+        // Off-column entry still moves a row: a far-right point must land
+        // on the toolbar's right edge, not refuse the cone and stay put.
+        panel.page.cursor.attached = None;
+        panel.page.cursor.x = 1250.0;
+        panel.page.cursor.y = 300.0;
+        panel.jump_cursor(crate::browser::cursor::JumpDir::Up);
+        fly_until_dock(&mut panel);
+        assert_eq!(
+            panel.chrome_attached(),
+            Some(ChromeTarget::Go),
+            "column preserved even when far off the omnibox"
+        );
     }
 
     #[test]

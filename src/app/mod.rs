@@ -896,8 +896,10 @@ impl App {
         };
 
         // Disk-persisted bookmarks into the browser panel (the one state
-        // that survives restarts by design).
+        // that survives restarts by design). Rebuild chrome after: the
+        // panel default built its snap map with an empty bookmark row.
         app.start_state.browser.bookmarks = crate::browser::bookmarks::load();
+        app.start_state.browser.rebuild_chrome();
 
         // Show the tray immediately; the daemon owns it for its whole lifetime.
         app.create_tray();
