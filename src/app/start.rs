@@ -1440,16 +1440,23 @@ impl App {
         let survivor = self.start_state.browser.order.pop();
         match survivor {
             Some(next) => {
+                let needs_open = self
+                    .start_state
+                    .browser
+                    .stored
+                    .iter()
+                    .find(|t| t.id == next)
+                    .is_some_and(|t| !t.loaded);
                 let ok = self.start_state.browser.activate_stored(next);
                 debug_assert!(ok);
                 let url = self.start_state.browser.session.url().to_string();
-                self.start_state.browser.draft = url;
+                self.start_state.browser.draft = url.clone();
                 self.start_state.browser.save_tabs();
-                if let Some(engine) = &self.engine {
-                    engine.send(EngineCommand::SetActiveTab { tab: next });
+                if self.engine.is_none() {
+                    // Reader fallback: fetch the adopted tab.
+                    return self.on_browser_navigate();
                 }
-                self.sync_live_mouse();
-                self.sync_browser_theme();
+                self.foreground_live_tab(next, needs_open, url);
                 Task::none()
             }
             None => self.reopen_home_tab(tab),
@@ -1507,58 +1514,54 @@ impl App {
             return self.on_browser_navigate();
         }
         let active_pos = saved.active.min(tabs.len() - 1);
-        // (tab id, url, generation) per restored tab, in strip order.
-        let mut loads: Vec<(TabId, String, u64)> = Vec::with_capacity(tabs.len());
+        // The live tab's load (restored tabs behind it stay unloaded until
+        // first switch — the worker only ever pays for visible tabs).
+        let mut live_load: Option<(TabId, String, u64)> = None;
         {
             let panel = &mut self.start_state.browser;
             panel.stored.clear();
             panel.order.clear();
             let mut next_id = panel.next_tab_id.max(2);
             for (pos, saved_tab) in tabs.drain(..).enumerate() {
-                let title = saved_tab.title.clone();
-                let seed_title = |session: &mut crate::browser::BrowserSession| {
-                    if !title.is_empty() {
-                        session.note_title(Some(title.clone()));
-                    }
-                };
                 if pos == active_pos {
                     panel.active_tab = TabId::BOOT;
                     panel.page = start_view::BrowserTabPage::default();
                     panel.page.session.open_surface();
                     let generation = panel.page.session.begin_load(saved_tab.url.clone());
-                    seed_title(&mut panel.page.session);
+                    if !saved_tab.title.is_empty() {
+                        panel.page.session.note_title(Some(saved_tab.title.clone()));
+                    }
                     panel.order.push(TabId::BOOT);
                     panel.draft = saved_tab.url.clone();
-                    loads.push((TabId::BOOT, saved_tab.url, generation));
+                    live_load = Some((TabId::BOOT, saved_tab.url, generation));
                 } else {
+                    // Unloaded: URL + title recorded for the strip, no
+                    // generation, no view — first switch opens and loads it.
                     let id = TabId(next_id);
                     next_id += 1;
                     let mut page = start_view::BrowserTabPage::default();
                     page.session.open_surface();
-                    let generation = page.session.begin_load(saved_tab.url.clone());
-                    seed_title(&mut page.session);
-                    panel.stored.push(start_view::StoredTab { id, page });
+                    page.session.note_url(saved_tab.url.clone());
+                    if !saved_tab.title.is_empty() {
+                        page.session.note_title(Some(saved_tab.title));
+                    }
+                    panel.stored.push(start_view::StoredTab {
+                        id,
+                        page,
+                        loaded: false,
+                    });
                     panel.order.push(id);
-                    loads.push((id, saved_tab.url, generation));
                 }
             }
             panel.next_tab_id = next_id;
         }
         if let Some(engine) = &self.engine {
-            for (tab, url, generation) in loads {
-                if tab == TabId::BOOT {
-                    engine.send(EngineCommand::Navigate {
-                        tab,
-                        url,
-                        generation,
-                    });
-                } else {
-                    engine.send(EngineCommand::OpenTab {
-                        tab,
-                        url,
-                        generation,
-                    });
-                }
+            if let Some((tab, url, generation)) = live_load {
+                engine.send(EngineCommand::Navigate {
+                    tab,
+                    url,
+                    generation,
+                });
             }
         } else {
             // Reader fallback: fetch the live tab only; stored tabs fetch
@@ -1609,6 +1612,30 @@ impl App {
         Task::none()
     }
 
+    /// Foreground the live tab's view: open it on first show (restored tabs
+    /// start unloaded), then activate + re-sync the mouse. `needs_open`
+    /// comes from the stored entry's `loaded` flag, read before the swap.
+    pub(crate) fn foreground_live_tab(
+        &mut self,
+        tab: crate::browser::engine::TabId,
+        needs_open: bool,
+        url: String,
+    ) {
+        if let Some(engine) = &self.engine {
+            if needs_open {
+                let generation = self.start_state.browser.session.begin_load(url.clone());
+                engine.send(EngineCommand::OpenTab {
+                    tab,
+                    url,
+                    generation,
+                });
+            }
+            engine.send(EngineCommand::SetActiveTab { tab });
+        }
+        self.sync_live_mouse();
+        self.sync_browser_theme();
+    }
+
     /// User switches tab (strip click): swap the live page with the stored
     /// one (order untouched), foreground the view, mirror the URL to the
     /// draft, re-sync the mouse.
@@ -1619,11 +1646,29 @@ impl App {
         if tab == self.start_state.browser.active_tab {
             return Task::none();
         }
+        let old = self.start_state.browser.active_tab;
+        let needs_open = self
+            .start_state
+            .browser
+            .stored
+            .iter()
+            .find(|t| t.id == tab)
+            .is_some_and(|t| !t.loaded);
         if !self.start_state.browser.activate_stored(tab) {
             return Task::none();
         }
+        // The shelved page keeps its backing view.
+        if let Some(prev) = self
+            .start_state
+            .browser
+            .stored
+            .iter_mut()
+            .find(|t| t.id == old)
+        {
+            prev.loaded = true;
+        }
         let url = self.start_state.browser.session.url().to_string();
-        self.start_state.browser.draft = url;
+        self.start_state.browser.draft = url.clone();
         self.start_state.browser.save_tabs();
         if self.engine.is_none() {
             // Reader fallback: no views to foreground — fetch the newly
@@ -1632,11 +1677,7 @@ impl App {
         }
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Action);
-        if let Some(engine) = &self.engine {
-            engine.send(EngineCommand::SetActiveTab { tab });
-        }
-        self.sync_live_mouse();
-        self.sync_browser_theme();
+        self.foreground_live_tab(tab, needs_open, url);
         Task::none()
     }
 
@@ -1648,9 +1689,18 @@ impl App {
         tab: crate::browser::engine::TabId,
     ) -> Task<Message> {
         if tab != self.start_state.browser.active_tab {
+            let loaded = self
+                .start_state
+                .browser
+                .stored
+                .iter()
+                .find(|t| t.id == tab)
+                .map(|t| t.loaded)
+                .unwrap_or(false);
             self.start_state.browser.drop_stored(tab);
             self.start_state.browser.save_tabs();
-            if let Some(engine) = &self.engine {
+            // Unloaded tabs have no view to close (restored, never shown).
+            if loaded && let Some(engine) = &self.engine {
                 engine.send(EngineCommand::CloseTab { tab });
             }
             return Task::none();
@@ -1670,22 +1720,31 @@ impl App {
         let Some(next) = next else {
             return self.on_browser_go_home();
         };
+        let needs_open = self
+            .start_state
+            .browser
+            .stored
+            .iter()
+            .find(|t| t.id == next)
+            .is_some_and(|t| !t.loaded);
         let ok = self.start_state.browser.activate_stored(next);
         if !ok {
             return self.on_browser_go_home();
         }
         self.start_state.browser.order.retain(|o| *o != tab);
         let url = self.start_state.browser.session.url().to_string();
-        self.start_state.browser.draft = url;
+        self.start_state.browser.draft = url.clone();
         self.start_state.browser.save_tabs();
+        if self.engine.is_none() {
+            // Reader fallback: fetch the adopted tab like a fresh navigate.
+            return self.on_browser_navigate();
+        }
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Action);
+        self.foreground_live_tab(next, needs_open, url);
         if let Some(engine) = &self.engine {
-            engine.send(EngineCommand::SetActiveTab { tab: next });
             engine.send(EngineCommand::CloseTab { tab });
         }
-        self.sync_live_mouse();
-        self.sync_browser_theme();
         Task::none()
     }
 

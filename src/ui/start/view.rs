@@ -899,12 +899,14 @@ pub struct BrowserTabPage {
     pub engine_activity: crate::browser::engine::EngineActivity,
 }
 
-/// One background tab: stable id plus the page state the live slot swaps
-/// with on switch.
+/// One background tab: stable id, page state, and whether a backend view
+/// exists for it. Restored tabs start unloaded (no view, no load) and open
+/// on first switch — the worker only ever pays for visible tabs.
 #[derive(Debug, Clone)]
 pub struct StoredTab {
     pub id: crate::browser::engine::TabId,
     pub page: BrowserTabPage,
+    pub loaded: bool,
 }
 
 /// In-Start reader browser panel. The URL draft and body scroll offset live
@@ -1012,14 +1014,20 @@ impl BrowserPanel {
 
     /// Stash the live page as a background tab under its current id. Called
     /// before the live slot is reset for a new/adopted tab or swapped with
-    /// a stored one.
+    /// a stored one. The stashed page keeps its backing view, so it stays
+    /// loaded.
     pub fn stash_live(&mut self) {
         let page = std::mem::take(&mut self.page);
         let id = self.active_tab;
         if let Some(slot) = self.stored.iter_mut().find(|t| t.id == id) {
             slot.page = page;
+            slot.loaded = true;
         } else {
-            self.stored.push(StoredTab { id, page });
+            self.stored.push(StoredTab {
+                id,
+                page,
+                loaded: true,
+            });
             if !self.order.contains(&id) {
                 self.order.push(id);
             }
@@ -5192,6 +5200,8 @@ mod tests {
         assert_eq!(panel.stored.len(), 1);
         assert_eq!(panel.stored[0].id, TabId::BOOT);
         assert_eq!(panel.stored[0].page.session.url(), "https://a.test/");
+        // Stashed live pages keep their backing view.
+        assert!(panel.stored[0].loaded);
         assert_eq!(panel.order, vec![TabId::BOOT]);
         // New tab id takes the live slot; switching back restores the page.
         let second = TabId(panel.next_tab_id);
@@ -5229,6 +5239,7 @@ mod tests {
         panel.page.session.note_title(Some("B".to_string()));
         panel.stored.push(StoredTab {
             id: TabId::BOOT,
+            loaded: true,
             page: {
                 let mut p = BrowserTabPage::default();
                 p.session.begin_load("https://a.test/".to_string());
@@ -5237,6 +5248,9 @@ mod tests {
         });
         panel.stored.push(StoredTab {
             id: TabId(3),
+            // Unloaded (restored, never foregrounded) tabs snapshot the
+            // same as loaded ones.
+            loaded: false,
             page: {
                 let mut p = BrowserTabPage::default();
                 p.session.begin_load("https://c.test/".to_string());

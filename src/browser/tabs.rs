@@ -6,9 +6,10 @@
 //! (a corrupt file parses to empty and gets overwritten on the next change).
 //!
 //! Only the strip is persisted (URL + title per tab, active position).
-//! Engine state never crosses a restart: tabs restore by re-navigating
-//! fresh views, so back/forward stacks start over — the engine's canonical
-//! history overwrites whatever we remembered on first load.
+//! Restored tabs load lazily: the live tab navigates at restore,
+//! background tabs open their views on first switch — the worker only ever
+//! pays for visible tabs. Engine state never crosses a restart, so
+//! back/forward stacks start over by construction.
 
 use std::path::{Path, PathBuf};
 
