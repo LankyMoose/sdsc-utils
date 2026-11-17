@@ -1445,32 +1445,43 @@ impl App {
     }
 
     /// Fresh home tab reusing `tab` (backend dropped it): recreate the view
-    /// and navigate home. Tab-less engine has no boot path back, so the
-    /// last tab never truly closes.
+    /// with the home URL from birth and navigate the session there. Tab-less
+    /// engine has no boot path back, so the last tab never truly closes.
     fn reopen_home_tab(&mut self, tab: crate::browser::engine::TabId) -> Task<Message> {
-        {
+        let url = crate::browser::BROWSER_HOME_URL.to_string();
+        let generation = {
             let panel = &mut self.start_state.browser;
             panel.page = start_view::BrowserTabPage::default();
             panel.page.session.open_surface();
             panel.active_tab = tab;
             panel.order.push(tab);
-            panel.draft = crate::browser::BROWSER_HOME_URL.to_string();
-        }
+            panel.draft = url.clone();
+            panel.page.session.begin_load(url.clone())
+        };
         if let Some(engine) = &self.engine {
-            engine.send(EngineCommand::OpenTab { tab });
+            engine.send(EngineCommand::OpenTab {
+                tab,
+                url,
+                generation,
+            });
             engine.send(EngineCommand::SetActiveTab { tab });
         }
-        self.on_browser_navigate()
+        self.sync_browser_theme();
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Nav);
+        crate::controller::hid::diag::diag_info("ui-diag: start browser navigate");
+        Task::none()
     }
 
-    /// User-opened tab (`+`): stash live, reset, create + foreground the
-    /// view, navigate home. Reader fallback (no engine) just goes home in
+    /// User-opened tab (`+`): stash live, reset, create the home-loaded view
+    /// and foreground it. Reader fallback (no engine) just goes home in
     /// place — tabs need views.
     pub(crate) fn on_browser_tab_new(&mut self) -> Task<Message> {
         if self.engine.is_none() {
             return self.on_browser_go_home();
         }
-        let tab = {
+        let url = crate::browser::BROWSER_HOME_URL.to_string();
+        let (tab, generation) = {
             let panel = &mut self.start_state.browser;
             panel.stash_live();
             panel.page = start_view::BrowserTabPage::default();
@@ -1479,16 +1490,23 @@ impl App {
             panel.next_tab_id = panel.next_tab_id.wrapping_add(1).max(2);
             panel.active_tab = tab;
             panel.order.push(tab);
-            panel.draft = crate::browser::BROWSER_HOME_URL.to_string();
-            tab
+            panel.draft = url.clone();
+            let generation = panel.page.session.begin_load(url.clone());
+            (tab, generation)
         };
         if let Some(engine) = &self.engine {
-            engine.send(EngineCommand::OpenTab { tab });
+            engine.send(EngineCommand::OpenTab {
+                tab,
+                url,
+                generation,
+            });
             engine.send(EngineCommand::SetActiveTab { tab });
         }
+        self.sync_browser_theme();
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Nav);
-        self.on_browser_navigate()
+        crate::controller::hid::diag::diag_info("ui-diag: start browser navigate");
+        Task::none()
     }
 
     /// User switches tab (strip click): swap the live page with the stored

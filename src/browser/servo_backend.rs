@@ -889,7 +889,10 @@ fn run(
         builder = builder.url(home);
     }
     let boot_view = builder.build();
-    boot_view.hide();
+    // NOTE: no hide() here — a hidden view produces no frames, and the
+    // resume path (Resume/SetVisible) only re-focuses. Visibility gating
+    // lives in `notify_new_frame_ready` (suspended/hidden/active checks);
+    // background tabs are the ones that hide, on switch.
     boot_view.set_focused(false);
     {
         let mut global = delegate_global.borrow_mut();
@@ -1277,7 +1280,11 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
                 .webview
                 .evaluate_javascript(PROBE_ARM_JS.to_string(), |_| {});
         }
-        EngineCommand::OpenTab { tab } => {
+        EngineCommand::OpenTab {
+            tab,
+            url,
+            generation,
+        } => {
             let mut global_ref = global.borrow_mut();
             if global_ref.tabs.contains_key(&tab) {
                 crate::platform::app_log::warn(format!(
@@ -1292,29 +1299,75 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
                 crate::platform::app_log::warn("servo-engine: OpenTab before delegate ready");
                 return;
             };
-            // serve the new view un-shown: the UI foregrounds it with
-            // `SetActiveTab` next (command order is FIFO).
-            let webview = WebViewBuilder::new(servo, ctx)
+            // URL from birth (see the variant docs): a blank-built view
+            // races any post-build Navigate and wins it.
+            let parsed = match url.parse::<url::Url>() {
+                Ok(parsed) => Some(parsed),
+                Err(err) => {
+                    crate::platform::app_log::warn(format!(
+                        "servo-engine: OpenTab bad url {url}: {err}"
+                    ));
+                    None
+                }
+            };
+            let mut builder = WebViewBuilder::new(servo, ctx)
                 .user_content_manager(user_content)
-                .delegate(delegate)
-                .build();
+                .delegate(delegate);
+            if let Some(ref initial) = parsed {
+                builder = builder.url(initial.clone());
+            }
+            // Serve the new view un-shown: the UI foregrounds it with
+            // `SetActiveTab` next (command order is FIFO).
+            let webview = builder.build();
             webview.hide();
             webview.set_focused(false);
             let view_id = webview.id();
             crate::platform::app_log::info(format!(
-                "servo-engine: OpenTab tab{} view{view_id:?}",
+                "servo-engine: OpenTab tab{} view{view_id:?} url={url}",
                 tab.0
             ));
             let handle = global_ref.handle.clone();
             let ax_debug = global_ref.ax_debug;
+            let mut tab_state = TabState::fresh(tab, handle, ax_debug);
+            match parsed {
+                Some(_) => {
+                    // Mirror the Navigate arm's bookkeeping (fresh state has
+                    // nothing to clear): session generation, timeout clock,
+                    // identity, phase. Delegate Started/History/Complete
+                    // drive the rest.
+                    tab_state.generation = generation;
+                    tab_state.load_started_at = Some(Instant::now());
+                    tab_state.last_url = Some(doc_key(&url).to_string());
+                    tab_state.last_full_url = url.clone();
+                    set_activity(&mut tab_state, EngineActivity::Navigating);
+                }
+                None => {
+                    tab_state.generation = generation;
+                    set_activity(&mut tab_state, EngineActivity::Idle);
+                }
+            }
+            let failed = parsed.is_none();
             global_ref.by_view.insert(view_id, tab);
             global_ref.tabs.insert(
                 tab,
                 TabEntry {
                     webview,
-                    state: Rc::new(RefCell::new(TabState::fresh(tab, handle, ax_debug))),
+                    state: Rc::new(RefCell::new(tab_state)),
                 },
             );
+            let handle = global_ref.handle.clone();
+            drop(global_ref);
+            handle.emit(EngineEvent::UrlChanged {
+                tab,
+                url: url.clone(),
+            });
+            if failed {
+                handle.emit(EngineEvent::LoadFinished {
+                    tab,
+                    generation,
+                    result: Err(format!("bad URL: {url}")),
+                });
+            }
         }
         EngineCommand::CloseTab { tab } => {
             let mut global_ref = global.borrow_mut();

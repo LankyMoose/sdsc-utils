@@ -114,9 +114,14 @@ pub enum EngineCommand {
     GoForward {
         tab: TabId,
     },
-    /// Create an empty tab (no load — a `Navigate` follows). UI-assigned id.
+    /// Create a tab loading `url` from birth (builder URL, like the boot
+    /// tab). A separate post-build `Navigate` loses to the blank's initial
+    /// load (observed: blank history clears after the navigate and the real
+    /// load never starts), so the URL rides the build. UI-assigned id.
     OpenTab {
         tab: TabId,
+        url: String,
+        generation: u64,
     },
     /// Drop a tab (its `WebView` handle closes the view). The UI activates a
     /// neighbor first when closing the active tab.
