@@ -1430,33 +1430,47 @@ fn browser_status_text(panel: &BrowserPanel) -> Option<String> {
     }
 }
 
-/// Status overlay: small black (translucent) bar pinned bottom-left over
-/// the viewport, Chrome-style. Hidden entirely when there is no status —
-/// as a `stack!` layer it never shifts layout appearing or vanishing.
+/// Status overlay: small black (translucent) bar pinned to the bottom of
+/// the viewport, Chrome-style. Bottom-left unless the cursor or the live
+/// dock overlaps that corner — then it mirrors to bottom-right so it never
+/// covers what you are pointing at. Hidden entirely when there is no
+/// status; as a `stack!` layer it never shifts layout.
 fn browser_status_overlay(panel: &BrowserPanel) -> Element<'_, StartMessage> {
     let Some(status) = browser_status_text(panel) else {
         return space().height(Length::Fixed(0.0)).into();
     };
-    column![
-        space().height(Fill),
-        row![
-            container(
-                text(text_fit::ellipsize_to_width(&status, 11.0, 480.0))
-                    .size(11.0)
-                    .color(theme::INK)
-            )
-            .padding([4, 10])
-            .style(theme::status_overlay),
-            space().width(Fill),
-        ],
-    ]
-    .padding(iced::Padding {
-        top: 0.0,
-        right: 8.0,
-        bottom: 8.0,
-        left: 0.0,
-    })
-    .into()
+    let chip = container(
+        text(text_fit::ellipsize_to_width(&status, 11.0, 480.0))
+            .size(11.0)
+            .color(theme::INK),
+    )
+    .padding([4, 10])
+    .style(theme::status_overlay);
+    let bar = if status_obscured(panel) {
+        row![space().width(Fill), chip]
+    } else {
+        row![chip, space().width(Fill)]
+    };
+    column![space().height(Fill), bar].into()
+}
+
+/// True when the cursor point or the live docked rect overlaps the
+/// bottom-left status corner: the overlay mirrors to bottom-right.
+fn status_obscured(panel: &BrowserPanel) -> bool {
+    /// Overlay footprint guess (480px cap + padding, one text line).
+    const ZONE_W: f32 = 520.0;
+    const ZONE_H: f32 = 64.0;
+    let bottom = crate::browser::cursor::VIEWPORT_H - ZONE_H;
+    if panel.cursor.x < ZONE_W && panel.cursor.y > bottom {
+        return true;
+    }
+    if let Some((x, y, w, h)) = panel.cursor.attached_rect(&panel.focusables) {
+        return x < ZONE_W
+            && x + w > 0.0
+            && y < crate::browser::cursor::VIEWPORT_H
+            && y + h > bottom;
+    }
+    false
 }
 
 /// In-Start browser card: URL row, page, reload / external / close
