@@ -1684,7 +1684,11 @@ impl App {
                         .pending_focus
                         .take()
                         .expect("pending focus checked");
-                    self.try_dock_focused(id);
+                    if !self.try_dock_focused(id) {
+                        crate::controller::hid::diag::diag_info(format!(
+                            "ui-diag: start browser focus dropped {id}"
+                        ));
+                    }
                 }
             }
             EngineEvent::ScrollOffset { tab: _, x, y } => {
@@ -1731,7 +1735,11 @@ impl App {
                     self.start_state.browser.pending_focus = None;
                 } else if !self.try_dock_focused(id) {
                     // Not live / mid-flight / stick busy: park for the next
-                    // tree (one shot).
+                    // tree (one shot). Logged: a park with no later dock is
+                    // the missed-autofocus signature.
+                    crate::controller::hid::diag::diag_info(format!(
+                        "ui-diag: start browser focus parked {id}"
+                    ));
                     self.start_state.browser.pending_focus = Some(id);
                 } else {
                     self.start_state.browser.pending_focus = None;

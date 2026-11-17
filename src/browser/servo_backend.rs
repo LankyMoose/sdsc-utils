@@ -1998,6 +1998,10 @@ fn ingest_dom(state: &mut TabState, value: &JSValue, rtt_ms: u128, skip_rebase: 
         .then(|| state.dom_uid.get(&snap.active).copied())
         .flatten();
     if focus != state.last_focus {
+        crate::platform::app_log::info(format!(
+            "servo-dom: focus {:?} -> {focus:?} (snap.active js#{})",
+            state.last_focus, snap.active
+        ));
         state.last_focus = focus;
         if let Some(id) = focus {
             let tab = state.tab;
