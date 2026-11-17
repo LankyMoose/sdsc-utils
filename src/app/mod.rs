@@ -2085,6 +2085,13 @@ impl App {
         // bounded — a hung constellation must not hang quit forever (on
         // timeout the process exits as before, cookies lost).
         if let Some(engine) = &self.engine {
+            // TEMP-DIAG(cookies): prove what global config Servo actually
+            // sees at shutdown (vs what we passed the builder).
+            let opts = servo::opts::get();
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: servo global opts config_dir={:?} temporary={}",
+                opts.config_dir, opts.temporary_storage
+            ));
             let (tx, rx) = std::sync::mpsc::channel();
             // TEMP-DIAG(cookies): trace the shutdown handshake until the
             // missing cookie_jar.json is explained.
