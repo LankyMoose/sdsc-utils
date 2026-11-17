@@ -64,10 +64,17 @@ impl App {
             return Task::none();
         }
         // Keyboard / UI actions other than pure scroll cancel an in-progress hold.
+        // History-selector messages are excluded: the Open message fires
+        // mid-press (resetting the bumper hold would split one physical
+        // press into two and forge a tap on release), and Pick/Cancel
+        // resolve the open selector (the hold's release carries no event).
         match &message {
             StartMessage::SettingsScrolled(..)
             | StartMessage::ManualAddTitle(_)
-            | StartMessage::ManualAddArgs(_) => {}
+            | StartMessage::ManualAddArgs(_)
+            | StartMessage::BrowserHistoryOpen { .. }
+            | StartMessage::BrowserHistoryPick(_)
+            | StartMessage::BrowserHistoryCancel => {}
             #[cfg(debug_assertions)]
             StartMessage::ReportLightbarFailure | StartMessage::ReportInputFailure => {}
             _ => self.cancel_start_holds(),
@@ -90,6 +97,9 @@ impl App {
             StartMessage::ToggleUrlEntry => self.on_toggle_url_entry(),
             StartMessage::BrowserBack => self.on_browser_go_back(),
             StartMessage::BrowserForward => self.on_browser_go_forward(),
+            StartMessage::BrowserHistoryOpen { back } => self.on_browser_history_open(back),
+            StartMessage::BrowserHistoryPick(index) => self.on_browser_history_pick(index),
+            StartMessage::BrowserHistoryCancel => self.on_browser_history_cancel(),
             StartMessage::BrowserUrlChanged(draft) => {
                 self.start_state.browser.draft = draft;
                 Task::none()
@@ -570,6 +580,7 @@ impl App {
         self.start_state.browser.scroll_y = 0.0;
         self.start_state.browser.url_editing = false;
         self.start_state.browser.bookmark_bubble = false;
+        self.start_state.browser.history_selector = None;
         // Fresh page: cursor back to center; focusables arrive with the
         // accessibility tree.
         self.start_state.browser.cursor = crate::browser::cursor::Cursor::new();
@@ -716,6 +727,9 @@ impl App {
         }
         let next = !self.start_state.browser.url_editing;
         self.start_state.browser.url_editing = next;
+        if next {
+            self.start_state.browser.history_selector = None;
+        }
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Action);
         crate::controller::hid::diag::diag_info(format!(
@@ -740,6 +754,135 @@ impl App {
             engine.send(EngineCommand::GoForward);
         }
         Task::none()
+    }
+
+    /// Browser: open the hold-bumper history selector (B2.4). `back` picks
+    /// the L1/back direction, else R1/forward. No-op when that direction
+    /// has no entries (never an empty dropdown) or the selector is already
+    /// open (a second hold never restacks). Default highlight is the
+    /// closest entry — the quick-press target.
+    pub(crate) fn on_browser_history_open(&mut self, back: bool) -> Task<Message> {
+        if !self.start_state.browser.session.is_open() {
+            return Task::none();
+        }
+        if self.start_state.browser.history_selector.is_some() {
+            return Task::none();
+        }
+        let has = if back {
+            self.start_state.browser.session.can_go_back()
+        } else {
+            self.start_state.browser.session.can_go_forward()
+        };
+        if !has {
+            return Task::none();
+        }
+        self.start_state.browser.history_selector =
+            Some(crate::ui::start::view::HistorySelector { back, highlight: 0 });
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Action);
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start browser history selector open {}",
+            if back { "back" } else { "forward" }
+        ));
+        Task::none()
+    }
+
+    /// Browser: selector pick — navigate to the absolute session index
+    /// through the normal path (new load; forward tail truncates). Closes
+    /// the selector first so the loadbehind never renders under it, and
+    /// swallows an in-flight Cross press so the confirming release cannot
+    /// also click the fresh page.
+    pub(crate) fn on_browser_history_pick(&mut self, index: usize) -> Task<Message> {
+        let url = match self.start_state.browser.session.nav_entry(index) {
+            Some(entry) => entry.url.clone(),
+            None => return Task::none(),
+        };
+        self.start_state.browser.history_selector = None;
+        self.pad_nav.cancel_held_face_releases();
+        self.start_state.browser.draft = url;
+        self.on_browser_navigate()
+    }
+
+    /// Browser: dismiss the history selector without navigating.
+    pub(crate) fn on_browser_history_cancel(&mut self) -> Task<Message> {
+        if self.start_state.browser.history_selector.is_none() {
+            return Task::none();
+        }
+        self.start_state.browser.history_selector = None;
+        self.pad_nav.cancel_held_face_releases();
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Action);
+        crate::controller::hid::diag::diag_info("ui-diag: start browser history selector cancel");
+        Task::none()
+    }
+
+    /// Pad tick while the history selector is open (B2.4). The selector owns
+    /// the pad: Up/Down moves the highlight (highlight 0 = closest =
+    /// quick-press default), Cross confirms, Circle cancels, and releasing
+    /// both bumpers confirms (spec: release selects). Everything else —
+    /// cursor, scroll, taps, magnetism — stays parked. Called before the
+    /// engine/reader split so both modes share it.
+    pub(crate) fn tick_browser_history_selector(
+        &mut self,
+        readings: &[start_input::NavReading],
+        action: Option<NavAction>,
+    ) -> Task<Message> {
+        // Bumper release confirms the highlight (both bumpers up). The hold
+        // tracker already consumed the press (no tap follows: release after
+        // open carries no event), so this is the only release path.
+        let bumpers_held = readings.iter().any(|r| r.sample.l1 || r.sample.r1);
+        if !bumpers_held {
+            if let Some(sel) = &self.start_state.browser.history_selector
+                && let Some(index) = sel.picked(&self.start_state.browser.session)
+            {
+                return self.on_start_message(StartMessage::BrowserHistoryPick(index));
+            }
+            self.start_state.browser.history_selector = None;
+            return Task::none();
+        }
+        match action {
+            Some(NavAction::Up) => {
+                if let Some(sel) = self.start_state.browser.history_selector.as_mut()
+                    && sel.highlight > 0
+                {
+                    sel.highlight -= 1;
+                    self.note_start_activity();
+                }
+                Task::none()
+            }
+            Some(NavAction::Down) => {
+                let len = {
+                    let panel = &self.start_state.browser;
+                    match &panel.history_selector {
+                        Some(sel) if sel.back => panel.session.back_entries().len(),
+                        Some(_) => panel.session.forward_entries().len(),
+                        None => 0,
+                    }
+                };
+                if let Some(sel) = self.start_state.browser.history_selector.as_mut()
+                    && len > 0
+                    && sel.highlight + 1 < len
+                {
+                    sel.highlight += 1;
+                    self.note_start_activity();
+                }
+                Task::none()
+            }
+            Some(NavAction::Confirm) => {
+                if let Some(sel) = &self.start_state.browser.history_selector
+                    && let Some(index) = sel.picked(&self.start_state.browser.session)
+                {
+                    return self.on_start_message(StartMessage::BrowserHistoryPick(index));
+                }
+                self.start_state.browser.history_selector = None;
+                Task::none()
+            }
+            Some(NavAction::Cancel) => self.on_start_message(StartMessage::BrowserHistoryCancel),
+            Some(NavAction::ToggleEdit) => self.on_start_message(StartMessage::ToggleUrlEntry),
+            // Taps, holds, magnetism, and cursor moves stay parked: the
+            // hold claimed the press and the selector owns the outcome.
+            _ => Task::none(),
+        }
     }
 
     /// Browser: shut down the engine worker in-app (diagnostic + resource
@@ -1198,6 +1341,9 @@ impl App {
             EngineEvent::UrlChanged { url } => {
                 self.start_state.browser.session.note_url(url.clone());
                 self.start_state.browser.draft = url;
+                // A new document underneath invalidates the selector's
+                // snapshot (link click, redirect, history travel).
+                self.start_state.browser.history_selector = None;
             }
             EngineEvent::FaviconChanged {
                 url,
@@ -1221,6 +1367,12 @@ impl App {
             }
             EngineEvent::ScrollOffset { x, y } => {
                 self.start_state.browser.scroll_offset = (x, y);
+            }
+            EngineEvent::HistoryChanged { entries, current } => {
+                self.start_state
+                    .browser
+                    .session
+                    .note_session_history(entries, current);
             }
             EngineEvent::LoadFinished { generation, result } => match result {
                 Ok(()) => {
@@ -2338,7 +2490,8 @@ impl App {
             // Controller-first input. Engine mode (frames on screen): the
             // left stick moves the virtual cursor (magnetic snap), the
             // D-pad jumps/nudges it, the right stick scrolls, L1/R1 travel
-            // history, Cross clicks, Square tabs DOM focus, Triangle edits
+            // history (tap) or open the history selector (hold, B2.4),
+            // Cross clicks, Square tabs DOM focus, Triangle edits
             // the URL, Circle backs out or closes. Reader mode keeps the
             // legacy mapping (D-pad scrolls, Cross goes). Game nav, holds,
             // and surface toggles stay parked (same discipline as modals).
@@ -2346,6 +2499,13 @@ impl App {
             self.start_state.triangle_progress = 0.0;
             self.keyboard_cross_hold.reset();
             self.start_state.tick_hint_anims(now);
+            // History selector owns the pad while open: D-pad moves the
+            // highlight, Cross/bumper-release confirms, Circle cancels.
+            // Cursor, scroll, taps, and magnetism stay parked so the page
+            // behind never moves under the dropdown.
+            if self.start_state.browser.history_selector.is_some() {
+                return self.tick_browser_history_selector(readings, tick.action);
+            }
             if self.start_state.browser.session.has_frame() {
                 self.tick_browser_cursor(readings, now);
                 // R3 issue flag (R3 carries no NavAction): rising edge while
@@ -2398,6 +2558,12 @@ impl App {
                     Some(NavAction::BumperRight) => {
                         self.on_start_message(StartMessage::BrowserForward)
                     }
+                    Some(NavAction::BumperHoldLeft) => {
+                        self.on_start_message(StartMessage::BrowserHistoryOpen { back: true })
+                    }
+                    Some(NavAction::BumperHoldRight) => {
+                        self.on_start_message(StartMessage::BrowserHistoryOpen { back: false })
+                    }
                     Some(NavAction::ToggleMagnetism) => {
                         self.start_state.browser.cursor.magnet =
                             !self.start_state.browser.cursor.magnet;
@@ -2429,6 +2595,16 @@ impl App {
                     Some(NavAction::Cancel) => self.on_start_message(StartMessage::Close),
                     Some(NavAction::ToggleEdit) => {
                         self.on_start_message(StartMessage::ToggleUrlEntry)
+                    }
+                    Some(NavAction::BumperLeft) => self.on_start_message(StartMessage::BrowserBack),
+                    Some(NavAction::BumperRight) => {
+                        self.on_start_message(StartMessage::BrowserForward)
+                    }
+                    Some(NavAction::BumperHoldLeft) => {
+                        self.on_start_message(StartMessage::BrowserHistoryOpen { back: true })
+                    }
+                    Some(NavAction::BumperHoldRight) => {
+                        self.on_start_message(StartMessage::BrowserHistoryOpen { back: false })
                     }
                     _ => Task::none(),
                 }
@@ -2539,8 +2715,11 @@ impl App {
                     }
                     NavAction::Left | NavAction::Right => Task::none(),
                     // Bumpers are browser-only (history); L3 toggles the
-                    // browser cursor magnet — both ignored on games.
-                    NavAction::BumperLeft | NavAction::BumperRight => Task::none(),
+                    // browser cursor magnet — all ignored on games.
+                    NavAction::BumperLeft
+                    | NavAction::BumperRight
+                    | NavAction::BumperHoldLeft
+                    | NavAction::BumperHoldRight => Task::none(),
                     NavAction::ToggleMagnetism => Task::none(),
                     NavAction::ToggleControllers => {
                         self.on_start_message(StartMessage::ToggleControllers)

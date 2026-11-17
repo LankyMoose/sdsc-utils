@@ -112,6 +112,13 @@ pub enum EngineEvent {
         x: f32,
         y: f32,
     },
+    /// Canonical session history (Servo `notify_history_changed` entries +
+    /// current index). Overwrites the UI's locally-maintained session
+    /// stack so the hold-bumper selector shows exact back/forward targets.
+    HistoryChanged {
+        entries: Vec<String>,
+        current: usize,
+    },
     LoadFinished {
         generation: u64,
         result: Result<(), String>,

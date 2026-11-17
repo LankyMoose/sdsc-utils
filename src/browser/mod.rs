@@ -125,6 +125,9 @@ pub const MAX_HISTORY_ENTRIES: usize = 100;
 /// Autocomplete rows per dropdown.
 pub const MAX_SUGGESTIONS: usize = 6;
 
+/// History-selector rows per dropdown (closest first, controller-scannable).
+pub const MAX_SELECTOR_ENTRIES: usize = 8;
+
 /// In-Start browser surface state. Pure data: the iced view owns the URL
 /// draft and scroll offset, this owns load lifecycle with a generation
 /// counter so late worker results are ignored after suspend/close —
@@ -142,6 +145,15 @@ pub struct BrowserSession {
     /// Most-recent-first navigation history for autocomplete. Recorded on
     /// every load and client-side URL change; titles attach out of band.
     history: Vec<HistoryEntry>,
+    /// Chronological session stack (oldest first) + live index for the
+    /// hold-bumper history selector (B2.4). Separate from `history` (which
+    /// is MRU-deduped for autocomplete): the session keeps revisit
+    /// duplicates and order so back/forward targets are exact. Fed two
+    /// ways — locally on every load/URL change (reader fallback) and
+    /// overwritten by the engine's canonical `HistoryChanged` (Servo
+    /// `notify_history_changed` entries + current) when present.
+    nav_stack: Vec<HistoryEntry>,
+    nav_index: Option<usize>,
 }
 
 impl BrowserSession {
@@ -181,7 +193,8 @@ impl BrowserSession {
         self.frame = None;
         self.loading = true;
         self.generation = self.generation.wrapping_add(1);
-        self.record_visit(url);
+        self.record_visit(url.clone());
+        self.push_nav(url);
         self.generation
     }
 
@@ -258,10 +271,17 @@ impl BrowserSession {
 
     /// Engine path: title arrived out of band. Attaches to the most recent
     /// history entry (titles trail their document; a stale late title may
-    /// misattach until the next one lands — harmless for suggestions).
+    /// misattach until the next one lands — harmless for suggestions) and
+    /// to the live session entry when the URLs match.
     pub fn note_title(&mut self, title: Option<String>) {
         self.title = title.clone();
         if let Some(entry) = self.history.first_mut() {
+            entry.title = title.clone();
+        }
+        if let Some(i) = self.nav_index
+            && let Some(entry) = self.nav_stack.get_mut(i)
+            && Self::same_doc(&entry.url, &self.url)
+        {
             entry.title = title;
         }
     }
@@ -269,7 +289,8 @@ impl BrowserSession {
     /// Engine path: URL changed (redirects) without a new load.
     pub fn note_url(&mut self, url: String) {
         self.url = url.clone();
-        self.record_visit(url);
+        self.record_visit(url.clone());
+        self.push_nav(url);
     }
 
     /// Remember a navigation (most-recent-first, deduped, capped).
@@ -281,6 +302,130 @@ impl BrowserSession {
         self.history.retain(|e| e.url != url);
         self.history.insert(0, HistoryEntry { url, title: None });
         self.history.truncate(MAX_HISTORY_ENTRIES);
+    }
+
+    /// Fragment-stripped document identity: same-document traffic
+    /// (fragments) must not fork the session stack.
+    fn same_doc(a: &str, b: &str) -> bool {
+        fn strip(s: &str) -> &str {
+            s.split('#').next().unwrap_or(s)
+        }
+        !a.is_empty() && !b.is_empty() && strip(a) == strip(b)
+    }
+
+    /// Push a document onto the chronological session stack. New navigations
+    /// from the middle truncate the forward tail (browser semantics);
+    /// same-document fragment traffic only retargets the live entry.
+    /// Empty URLs never record.
+    pub fn push_nav(&mut self, url: String) {
+        if url.is_empty() {
+            return;
+        }
+        if let Some(i) = self.nav_index
+            && let Some(live) = self.nav_stack.get_mut(i)
+            && Self::same_doc(&live.url, &url)
+        {
+            live.url = url;
+            return;
+        }
+        if let Some(i) = self.nav_index {
+            let keep = (i + 1).min(self.nav_stack.len());
+            self.nav_stack.truncate(keep);
+        } else {
+            self.nav_stack.clear();
+        }
+        self.nav_stack.push(HistoryEntry { url, title: None });
+        if self.nav_stack.len() > MAX_HISTORY_ENTRIES {
+            self.nav_stack.remove(0);
+        }
+        self.nav_index = Some(self.nav_stack.len() - 1);
+    }
+
+    /// Overwrite the session stack with the engine's canonical history
+    /// (Servo `notify_history_changed` entries + current). Titles are
+    /// preserved where the URL matches the previous stack; anything new
+    /// starts untitled until its `TitleChanged` lands.
+    pub fn note_session_history(&mut self, entries: Vec<String>, current: usize) {
+        if entries.is_empty() {
+            self.nav_stack.clear();
+            self.nav_index = None;
+            return;
+        }
+        let current = current.min(entries.len() - 1);
+        let mut titles: std::collections::HashMap<&str, Option<String>> =
+            std::collections::HashMap::new();
+        for e in &self.nav_stack {
+            titles
+                .entry(e.url.as_str())
+                .or_insert_with(|| e.title.clone());
+        }
+        self.nav_stack = entries
+            .into_iter()
+            .map(|url| {
+                let title = titles.remove(url.as_str()).flatten();
+                HistoryEntry { url, title }
+            })
+            .collect();
+        if self.nav_stack.len() > MAX_HISTORY_ENTRIES {
+            let drop = self.nav_stack.len() - MAX_HISTORY_ENTRIES;
+            self.nav_stack.drain(..drop);
+            self.nav_index = Some(current.saturating_sub(drop));
+        } else {
+            self.nav_index = Some(current);
+        }
+    }
+
+    /// Live session index (None when the stack is empty).
+    pub fn nav_current(&self) -> Option<usize> {
+        self.nav_index
+    }
+
+    pub fn nav_len(&self) -> usize {
+        self.nav_stack.len()
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        self.nav_index
+            .is_some_and(|i| i > 0 && !self.nav_stack.is_empty())
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.nav_index.is_some_and(|i| i + 1 < self.nav_stack.len())
+    }
+
+    /// Back targets, closest first: `(absolute_index, entry)`. Capped so the
+    /// selector dropdown stays controller-scannable.
+    pub fn back_entries(&self) -> Vec<(usize, HistoryEntry)> {
+        let Some(cur) = self.nav_index else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for i in (0..cur.min(self.nav_stack.len())).rev() {
+            out.push((i, self.nav_stack[i].clone()));
+            if out.len() >= MAX_SELECTOR_ENTRIES {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Forward targets, closest first: `(absolute_index, entry)`.
+    pub fn forward_entries(&self) -> Vec<(usize, HistoryEntry)> {
+        let Some(cur) = self.nav_index else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for i in (cur + 1)..self.nav_stack.len() {
+            out.push((i, self.nav_stack[i].clone()));
+            if out.len() >= MAX_SELECTOR_ENTRIES {
+                break;
+            }
+        }
+        out
+    }
+
+    pub fn nav_entry(&self, index: usize) -> Option<&HistoryEntry> {
+        self.nav_stack.get(index)
     }
 
     /// Autocomplete candidates for `draft`: case-insensitive substring over
@@ -729,5 +874,81 @@ mod tests {
         assert!(!s.loading());
         // Stale completion ignored.
         assert!(!s.mark_loaded(generation.wrapping_add(1)));
+    }
+
+    #[test]
+    fn nav_stack_pushes_chronologically_and_reports_travel() {
+        let mut s = BrowserSession::default();
+        assert!(s.nav_current().is_none());
+        assert!(!s.can_go_back());
+        assert!(!s.can_go_forward());
+        s.begin_load("https://a.test/".to_string());
+        s.begin_load("https://b.test/".to_string());
+        s.begin_load("https://c.test/".to_string());
+        assert_eq!(s.nav_current(), Some(2));
+        assert!(s.can_go_back());
+        assert!(!s.can_go_forward());
+        let back: Vec<usize> = s.back_entries().iter().map(|(i, _)| *i).collect();
+        assert_eq!(back, vec![1, 0]);
+        assert!(s.forward_entries().is_empty());
+    }
+
+    #[test]
+    fn nav_stack_fragment_retargets_instead_of_forking() {
+        let mut s = BrowserSession::default();
+        s.begin_load("https://a.test/page".to_string());
+        s.note_url("https://a.test/page#section".to_string());
+        assert_eq!(s.nav_len(), 1);
+        assert_eq!(s.nav_current(), Some(0));
+        assert!(!s.can_go_back());
+    }
+
+    #[test]
+    fn nav_stack_new_load_truncates_forward_tail() {
+        let mut s = BrowserSession::default();
+        s.begin_load("https://a.test/".to_string());
+        s.begin_load("https://b.test/".to_string());
+        // Simulate travel-to-a then a fresh navigation: engine-canonical
+        // overwrite puts us back at a, then a new load forks from there.
+        s.note_session_history(
+            vec!["https://a.test/".to_string(), "https://b.test/".to_string()],
+            0,
+        );
+        s.begin_load("https://c.test/".to_string());
+        assert_eq!(s.nav_current(), Some(1));
+        assert_eq!(
+            s.nav_entry(0).map(|e| e.url.as_str()),
+            Some("https://a.test/")
+        );
+        assert_eq!(
+            s.nav_entry(1).map(|e| e.url.as_str()),
+            Some("https://c.test/")
+        );
+        assert!(!s.can_go_forward());
+    }
+
+    #[test]
+    fn nav_stack_engine_history_overwrites_and_preserves_titles() {
+        let mut s = BrowserSession::default();
+        s.begin_load("https://a.test/".to_string());
+        s.note_title(Some("A page".to_string()));
+        s.begin_load("https://b.test/".to_string());
+        s.note_session_history(
+            vec!["https://a.test/".to_string(), "https://b.test/".to_string()],
+            1,
+        );
+        assert_eq!(s.nav_current(), Some(1));
+        assert_eq!(
+            s.nav_entry(0).and_then(|e| e.title.as_deref()),
+            Some("A page")
+        );
+        let fwd = s.forward_entries();
+        assert!(fwd.is_empty());
+        let back: Vec<usize> = s.back_entries().iter().map(|(i, _)| *i).collect();
+        assert_eq!(back, vec![0]);
+        // Empty engine history clears the stack (no entries → no selector).
+        s.note_session_history(Vec::new(), 0);
+        assert!(s.nav_current().is_none());
+        assert!(s.back_entries().is_empty());
     }
 }

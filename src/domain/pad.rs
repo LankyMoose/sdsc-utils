@@ -242,9 +242,16 @@ pub enum NavAction {
     Left,
     Right,
     /// L1 bumper edge — history back in the browser; ignored elsewhere.
+    /// Fires on release (hold-vs-tap disambiguation for the B2.4 history
+    /// selector: a hold past [`BUMPER_HOLD`] opens the selector instead).
     BumperLeft,
     /// R1 bumper edge — history forward in the browser; ignored elsewhere.
+    /// Fires on release, like [`NavAction::BumperLeft`].
     BumperRight,
+    /// L1 held past the threshold — open the back-history selector.
+    BumperHoldLeft,
+    /// R1 held past the threshold — open the forward-history selector.
+    BumperHoldRight,
     ToggleEdit,
     CycleSort,
     /// L3 click — toggle virtual-cursor magnetism (browser only).
@@ -652,8 +659,9 @@ impl EdgeButton {
     }
 }
 
-/// Face/Options/Create fire on release; bumpers fire on press (no hold
-/// behavior). `hold_owned` never fires here.
+/// Face/Options/Create fire on release; bumper taps fire on release via
+/// [`BumperHold`] (hold-vs-tap disambiguation for the history selector).
+/// `hold_owned` never fires here.
 #[derive(Debug, Clone, Default)]
 pub struct ButtonEdges {
     cross: bool,
@@ -765,8 +773,10 @@ impl ButtonEdges {
     }
 
     /// Rising edge on L1/R1 (browser history). Checked before `update` syncs,
-    /// like the release path below; deliberately outside the release/cancel
-    /// machinery — bumpers have no hold semantics and must not disturb it.
+    /// like the release path below. LEGACY press-edge path: `PadNavBank::tick`
+    /// no longer calls this — bumper taps now flow through [`BumperHold`]
+    /// (release-timed) so a hold can claim the press first. Kept for
+    /// unit tests of the old discipline.
     pub fn bumper_press(&self, sample: &PadSample) -> Option<NavAction> {
         if sample.l1 && !self.l1 {
             Some(NavAction::BumperLeft)
@@ -900,6 +910,114 @@ impl HoldTracker {
 /// Triangle / Cross hold trackers share the same timing.
 pub type TriangleHold = HoldTracker;
 pub type CrossHold = HoldTracker;
+
+/// Hold threshold for the browser history selector (B2.4): holding L1/R1
+/// this long opens the directional dropdown instead of single-stepping
+/// history on release.
+pub const BUMPER_HOLD: Duration = Duration::from_millis(400);
+
+/// Which bumper the hold tracker is following.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BumperSide {
+    Left,
+    Right,
+}
+
+/// One bumper lifecycle event. `Tap` fires on release when the hold never
+/// opened the selector (the old press-edge path, now release-timed so a
+/// hold can claim the press first). `Open` fires once when the hold
+/// threshold is crossed while still held; the later release carries no
+/// event (the App confirms the open selector on release instead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BumperHoldEvent {
+    Tap(BumperSide),
+    Open(BumperSide),
+}
+
+/// Per-pad L1/R1 hold-vs-tap disambiguation. Tracks at most one side: a
+/// fresh press starts the clock, crossing [`BUMPER_HOLD`] while held
+/// emits `Open` once, releasing first emits `Tap`. Both-held is
+/// ambiguous — the existing side keeps its clock, a fresh both-press is
+/// ignored. Side switches without a release cancel the old press silently
+/// (no tap) and start the new side.
+#[derive(Debug, Clone, Default)]
+pub struct BumperHold {
+    side: Option<BumperSide>,
+    since: Option<Instant>,
+    opened: bool,
+}
+
+impl BumperHold {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn tracking(&self) -> Option<BumperSide> {
+        self.side
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.opened
+    }
+
+    pub fn update(&mut self, l1: bool, r1: bool, now: Instant) -> Option<BumperHoldEvent> {
+        let held = match (l1, r1) {
+            (true, false) => Some(BumperSide::Left),
+            (false, true) => Some(BumperSide::Right),
+            // Both held: keep the existing clock so a grazing second
+            // finger cannot restart the hold; fresh both-press ignored.
+            (true, true) => {
+                if self.side.is_some() {
+                    return self.tick_hold(now);
+                }
+                return None;
+            }
+            (false, false) => None,
+        };
+        match (self.side, held) {
+            // Release.
+            (Some(prev), None) => {
+                let opened = self.opened;
+                self.reset();
+                if opened {
+                    None
+                } else {
+                    Some(BumperHoldEvent::Tap(prev))
+                }
+            }
+            // Fresh press.
+            (None, Some(next)) => {
+                self.side = Some(next);
+                self.since = Some(now);
+                self.opened = false;
+                None
+            }
+            // Side switch without a release: old press cancelled silently.
+            (Some(prev), Some(next)) if prev != next => {
+                self.side = Some(next);
+                self.since = Some(now);
+                self.opened = false;
+                None
+            }
+            // Steady hold: maybe cross the threshold.
+            (Some(_), Some(_)) => self.tick_hold(now),
+            // Idle.
+            (None, None) => None,
+        }
+    }
+
+    fn tick_hold(&mut self, now: Instant) -> Option<BumperHoldEvent> {
+        let (Some(side), Some(since)) = (self.side, self.since) else {
+            return None;
+        };
+        if !self.opened && now.saturating_duration_since(since) >= BUMPER_HOLD {
+            self.opened = true;
+            Some(BumperHoldEvent::Open(side))
+        } else {
+            None
+        }
+    }
+}
 
 /// True when face/system buttons, triggers, D-pad, and stick are at rest (safe to arm start nav).
 pub fn sample_nav_resting(sample: &PadSample) -> bool {
@@ -1092,6 +1210,7 @@ struct PadSlot {
     button_edges: ButtonEdges,
     triangle_hold: TriangleHold,
     cross_hold: CrossHold,
+    bumper_hold: BumperHold,
     armed: bool,
 }
 
@@ -1174,11 +1293,14 @@ impl PadNavBank {
         self.arm_new_pads = arm_immediately;
     }
 
-    /// Abort Triangle / Cross charge and decay immediately.
+    /// Abort Triangle / Cross charge and decay immediately, and drop any
+    /// in-progress bumper hold (so a hold started before a modal cannot
+    /// pop the history selector over it).
     pub fn cancel_holds(&mut self) {
         for slot in self.slots.values_mut() {
             slot.triangle_hold.cancel();
             slot.cross_hold.cancel();
+            slot.bumper_hold.reset();
         }
     }
 
@@ -1236,6 +1358,7 @@ impl PadNavBank {
                 slot.nav_stepper.reset();
                 slot.triangle_hold.reset();
                 slot.cross_hold.reset();
+                slot.bumper_hold.reset();
                 if sample_nav_resting(&reading.sample) {
                     slot.armed = true;
                     newly_armed.push(reading.id.clone());
@@ -1366,9 +1489,19 @@ impl PadNavBank {
                 result.triangle_completed_pad = None;
             }
 
-            // Bumpers + L3 fire on press (no hold semantics); read BEFORE
-            // `update` syncs the new state, same discipline as the release path.
-            let bumper = slot.button_edges.bumper_press(&reading.sample);
+            // Bumper taps fire on release via BumperHold (hold-vs-tap
+            // disambiguation for the history selector); L3 still fires on
+            // press. Button-edges sync below; the hold tracker reads the
+            // raw sample so ordering is irrelevant.
+            let bumper = slot
+                .bumper_hold
+                .update(reading.sample.l1, reading.sample.r1, now);
+            let bumper = bumper.map(|event| match event {
+                BumperHoldEvent::Tap(BumperSide::Left) => NavAction::BumperLeft,
+                BumperHoldEvent::Tap(BumperSide::Right) => NavAction::BumperRight,
+                BumperHoldEvent::Open(BumperSide::Left) => NavAction::BumperHoldLeft,
+                BumperHoldEvent::Open(BumperSide::Right) => NavAction::BumperHoldRight,
+            });
             let l3 = slot.button_edges.l3_press(&reading.sample);
             let edge = slot.button_edges.update(&reading.sample, hold_owned);
 
@@ -3123,8 +3256,9 @@ mod tests {
         assert!(!sample_nav_resting(&l1_only));
     }
 
-    /// L1/R1 fire on press, never repeat while held, and fire again after a
-    /// release — no hold semantics, no disturb of the face-button path.
+    /// L1/R1 taps fire on release (hold-vs-tap disambiguation for the
+    /// history selector), never repeat while held, and fire again after a
+    /// release — without disturbing the face-button path.
     #[test]
     fn bumper_edges_fire_once_per_press() {
         let mut bank = PadNavBank::default();
@@ -3148,6 +3282,7 @@ mod tests {
             held: [GestureControl::L1].into_iter().collect(),
             ..Default::default()
         };
+        // Press: silent (the hold may still claim it).
         let press = bank.tick(
             &[reading("a", l1)],
             now,
@@ -3159,7 +3294,7 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(press.action, Some(NavAction::BumperLeft));
+        assert!(press.action.is_none());
         // Held: silent.
         let hold = bank.tick(
             &[reading(
@@ -3180,8 +3315,8 @@ mod tests {
             false,
         );
         assert!(hold.action.is_none());
-        // Release then re-press: fires again. R1 maps right.
-        let _ = bank.tick(
+        // Release before the threshold: tap fires. R1 maps right.
+        let release = bank.tick(
             &[reading("a", PadSample::default())],
             now,
             true,
@@ -3192,12 +3327,13 @@ mod tests {
             false,
             false,
         );
+        assert_eq!(release.action, Some(NavAction::BumperLeft));
         let r1 = PadSample {
             r1: true,
             held: [GestureControl::R1].into_iter().collect(),
             ..Default::default()
         };
-        let press2 = bank.tick(
+        let _ = bank.tick(
             &[reading("a", r1)],
             now,
             true,
@@ -3208,7 +3344,85 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(press2.action, Some(NavAction::BumperRight));
+        let release2 = bank.tick(
+            &[reading("a", PadSample::default())],
+            now,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(release2.action, Some(NavAction::BumperRight));
+    }
+
+    #[test]
+    fn bumper_hold_opens_selector_instead_of_tapping() {
+        let mut hold = BumperHold::default();
+        let t0 = Instant::now();
+        // Fresh press: silent.
+        assert!(hold.update(true, false, t0).is_none());
+        // Still held just under the threshold: silent.
+        assert!(
+            hold.update(true, false, t0 + BUMPER_HOLD - Duration::from_millis(50))
+                .is_none()
+        );
+        // Crossing the threshold: opens once.
+        assert_eq!(
+            hold.update(true, false, t0 + BUMPER_HOLD),
+            Some(BumperHoldEvent::Open(BumperSide::Left))
+        );
+        // Still held: silent (fires once).
+        assert!(
+            hold.update(true, false, t0 + BUMPER_HOLD + Duration::from_millis(500))
+                .is_none()
+        );
+        // Release after open: no tap.
+        assert!(
+            hold.update(false, false, t0 + BUMPER_HOLD + Duration::from_millis(600))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bumper_hold_side_switch_cancels_silently() {
+        let mut hold = BumperHold::default();
+        let t0 = Instant::now();
+        assert!(hold.update(true, false, t0).is_none());
+        // L1 → R1 without a release: old press cancelled, no tap, new clock.
+        assert!(
+            hold.update(false, true, t0 + Duration::from_millis(100))
+                .is_none()
+        );
+        assert_eq!(hold.tracking(), Some(BumperSide::Right));
+        assert!(!hold.is_open());
+        // Quick release: taps the NEW side only.
+        assert_eq!(
+            hold.update(false, false, t0 + Duration::from_millis(200)),
+            Some(BumperHoldEvent::Tap(BumperSide::Right))
+        );
+    }
+
+    #[test]
+    fn bumper_hold_both_held_keeps_clock() {
+        let mut hold = BumperHold::default();
+        let t0 = Instant::now();
+        assert!(hold.update(true, false, t0).is_none());
+        // Grazing second finger: clock preserved, still opens on time.
+        assert!(
+            hold.update(true, true, t0 + BUMPER_HOLD - Duration::from_millis(10))
+                .is_none()
+        );
+        assert_eq!(
+            hold.update(true, true, t0 + BUMPER_HOLD),
+            Some(BumperHoldEvent::Open(BumperSide::Left))
+        );
+        // Fresh both-press with no side tracked: ignored.
+        let mut fresh = BumperHold::default();
+        assert!(fresh.update(true, true, t0).is_none());
+        assert_eq!(fresh.tracking(), None);
     }
 
     /// Deliberate release (neutral past the dropout grace) then re-press must

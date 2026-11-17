@@ -225,6 +225,7 @@ impl WebViewDelegate for Delegate {
         let Some(url) = entries.get(current) else {
             return;
         };
+        let urls: Vec<String> = entries.iter().map(|u| u.as_str().to_string()).collect();
         let mut shared = self.shared.borrow_mut();
         let key = doc_key(url.as_str());
         if shared.last_url.as_deref() == Some(key) {
@@ -234,6 +235,10 @@ impl WebViewDelegate for Delegate {
         shared.last_url = Some(key.to_string());
         shared.last_full_url = url.as_str().to_string();
         clear_tree(&mut shared);
+        shared.handle.emit(EngineEvent::HistoryChanged {
+            entries: urls,
+            current,
+        });
     }
 
     fn notify_favicon_changed(&self, webview: WebView) {

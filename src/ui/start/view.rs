@@ -77,6 +77,18 @@ pub enum StartMessage {
     BrowserAutocompletePick(String),
     BrowserBack,
     BrowserForward,
+    /// Browser: open the hold-bumper history selector (`back` = L1/back
+    /// targets, else R1/forward targets). No-op when that direction has
+    /// no entries.
+    BrowserHistoryOpen {
+        back: bool,
+    },
+    /// Browser: jump to an absolute session-stack index (selector row).
+    /// Navigates through the normal path (new load, forward truncated —
+    /// keeps the local and engine stacks consistent with no engine changes).
+    BrowserHistoryPick(usize),
+    /// Browser: close the history selector without navigating.
+    BrowserHistoryCancel,
     BrowserFetched {
         generation: u64,
         result: Result<crate::browser::FetchedPage, String>,
@@ -801,6 +813,41 @@ impl ManualAddDraft {
     }
 }
 
+/// Hold-bumper history selector (B2.4): directional dropdown over the
+/// session stack. `back` selects L1/back targets, else R1/forward targets;
+/// `highlight` indexes the displayed directional list (0 = closest =
+/// quick-press target = default). Rows map to absolute session indices via
+/// [`crate::browser::BrowserSession::back_entries`] /
+/// [`crate::browser::BrowserSession::forward_entries`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistorySelector {
+    pub back: bool,
+    pub highlight: usize,
+}
+
+impl HistorySelector {
+    /// Absolute session index under the highlight, if the list is non-empty.
+    pub fn picked(&self, session: &crate::browser::BrowserSession) -> Option<usize> {
+        let list = if self.back {
+            session.back_entries()
+        } else {
+            session.forward_entries()
+        };
+        list.get(self.highlight.min(list.len().saturating_sub(1)))
+            .or_else(|| list.first())
+            .map(|(i, _)| *i)
+    }
+
+    /// Clamp the highlight after the stack moved underneath the selector.
+    pub fn clamp(&mut self, len: usize) {
+        if len == 0 {
+            self.highlight = 0;
+        } else {
+            self.highlight = self.highlight.min(len - 1);
+        }
+    }
+}
+
 /// In-Start reader browser panel. The URL draft and body scroll offset live
 /// here; load lifecycle (generation-guarded suspend/resume) lives in
 /// [`crate::browser::BrowserSession`]. The pad cursor roams in engine page
@@ -861,6 +908,8 @@ pub struct BrowserPanel {
     /// the bookmark bar and history rows. Capped; oldest evicted first.
     pub favicons: HashMap<String, iced::widget::image::Handle>,
     pub favicon_order: Vec<String>,
+    /// Hold-bumper history selector overlay (B2.4). `None` = closed.
+    pub history_selector: Option<HistorySelector>,
 }
 
 impl BrowserPanel {
@@ -876,6 +925,7 @@ impl BrowserPanel {
     pub fn close_surface(&mut self) {
         self.session.close_surface();
         self.url_editing = false;
+        self.history_selector = None;
         // Drop the analog clock so reopening never applies a huge first dt.
         self.analog_at = None;
     }
@@ -1137,7 +1187,11 @@ fn browser_debug_line(panel: &BrowserPanel) -> Element<'_, StartMessage> {
 /// other target; dpad-through-the-list is a later refinement.
 fn browser_suggestions(panel: &BrowserPanel) -> Element<'_, StartMessage> {
     let draft = panel.draft.trim();
-    if draft.is_empty() || draft == panel.session.url() || panel.bookmark_bubble {
+    if draft.is_empty()
+        || draft == panel.session.url()
+        || panel.bookmark_bubble
+        || panel.history_selector.is_some()
+    {
         return space().height(Length::Fixed(0.0)).into();
     }
     let matches = panel.session.suggestions(draft);
@@ -1247,6 +1301,79 @@ fn browser_bookmark_bubble(panel: &BrowserPanel) -> Element<'_, StartMessage> {
     .into()
 }
 
+/// Hold-bumper history selector (B2.4): directional dropdown over the
+/// session stack (closest first, `highlight` = quick-press default until
+/// the pad moves it). Current page heads the list (marked, not a target);
+/// rows carry favicons + titles like the bookmark bar. Rendered as a
+/// `stack!` overlay layer so appearing never shifts layout; hidden unless
+/// the selector is open with entries in that direction.
+fn browser_history_selector(panel: &BrowserPanel) -> Element<'_, StartMessage> {
+    let Some(sel) = &panel.history_selector else {
+        return space().height(Length::Fixed(0.0)).into();
+    };
+    let session = &panel.session;
+    let entries = if sel.back {
+        session.back_entries()
+    } else {
+        session.forward_entries()
+    };
+    if entries.is_empty() {
+        return space().height(Length::Fixed(0.0)).into();
+    }
+    let current_title = session.title().unwrap_or_else(|| session.url()).to_string();
+    let mut list = column![
+        text(if sel.back {
+            format!("Back — {current_title}")
+        } else {
+            format!("Forward — {current_title}")
+        })
+        .size(12.0)
+        .color(theme::MUTED),
+    ]
+    .spacing(2);
+    for (row, (abs, entry)) in entries.iter().enumerate() {
+        let title = entry.title.clone().unwrap_or_else(|| entry.url.clone());
+        let mut inner = row![].spacing(6).align_y(Alignment::Center);
+        let icon_key = crate::browser::bookmarks::origin_key(&entry.url);
+        if let Some(icon) = panel.favicons.get(&icon_key) {
+            inner = inner.push(
+                image(icon.clone())
+                    .width(Length::Fixed(16.0))
+                    .height(Length::Fixed(16.0)),
+            );
+        }
+        inner = inner.push(
+            column![
+                text(title).size(13.0).color(theme::INK),
+                text(entry.url.clone()).size(11.0).color(theme::MUTED),
+            ]
+            .spacing(0),
+        );
+        if row == sel.highlight.min(entries.len() - 1) {
+            inner = inner.push(text("◀").size(13.0).color(theme::INK));
+        }
+        let abs = *abs;
+        list = list.push(
+            button(inner)
+                .padding([6, 10])
+                .width(Fill)
+                .on_press(StartMessage::BrowserHistoryPick(abs))
+                .style(theme::ghost),
+        );
+    }
+    list = list.push(
+        button(text("Cancel").size(13.0))
+            .padding([6, 12])
+            .on_press(StartMessage::BrowserHistoryCancel)
+            .style(theme::ghost),
+    );
+    container(list.spacing(2))
+        .padding([4, 0])
+        .width(Fill)
+        .style(theme::menu_panel)
+        .into()
+}
+
 /// In-Start browser card: URL row, page, reload / external / close
 /// actions. Sized by the caller (near-full-bleed; see `immersive::view`),
 /// so the root column fills its card.
@@ -1282,17 +1409,25 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         .align_y(Alignment::Center),
         space().height(4),
         // Chrome-order toolbar: traverse, reload, home, address, star, go.
-        // Back/forward stay always-enabled until the history stack (B2.4)
-        // drives greyed state; the engine no-ops without entries.
+        // Back/forward grey out with no session entries in that direction
+        // (selector included); the engine no-ops without entries.
         row![
-            button(text("←").size(14.0))
-                .padding([8, 12])
-                .on_press(StartMessage::BrowserBack)
-                .style(theme::ghost),
-            button(text("→").size(14.0))
-                .padding([8, 12])
-                .on_press(StartMessage::BrowserForward)
-                .style(theme::ghost),
+            {
+                let b = button(text("←").size(14.0)).padding([8, 12]);
+                if session.can_go_back() {
+                    b.on_press(StartMessage::BrowserBack).style(theme::ghost)
+                } else {
+                    b.style(theme::ghost)
+                }
+            },
+            {
+                let b = button(text("→").size(14.0)).padding([8, 12]);
+                if session.can_go_forward() {
+                    b.on_press(StartMessage::BrowserForward).style(theme::ghost)
+                } else {
+                    b.style(theme::ghost)
+                }
+            },
             button(text("⟳").size(14.0))
                 .padding([8, 12])
                 .on_press(StartMessage::BrowserReload)
@@ -1329,12 +1464,15 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         space().height(8),
         browser_bookmark_bar(panel),
         // Fixed-position dropdowns: the stack sizes to its base layer, so
-        // suggestions and the star bubble appearing never shove content
-        // down. The bubble wins over suggestions (it owns the keyboard).
+        // suggestions, the star bubble, and the history selector appearing
+        // never shove content down. The bubble wins over suggestions (it
+        // owns the keyboard); the selector wins over both (hold claims
+        // the pad until release/Cross/Circle resolves it).
         stack![
             column![browser_page_view(state, img_w), browser_debug_line(panel),],
             browser_suggestions(panel),
             browser_bookmark_bubble(panel),
+            browser_history_selector(panel),
         ],
         space().height(8),
         // Card action row: the overlay toggle is debug-only (mirrors the
