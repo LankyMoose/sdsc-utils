@@ -652,10 +652,14 @@ fn run(
         "servo-engine: ready ({VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT} software surface)"
     ));
 
+    // Shutdown ack: carried out of the drain loop so the post-loop Drop
+    // below can signal only after Servo (and its cookie flush) completes.
+    let mut shutdown_done: Option<std::sync::mpsc::Sender<()>> = None;
     loop {
         let mut shutdown = false;
         while let Ok(command) = rx.try_recv() {
-            if matches!(command, EngineCommand::Shutdown) {
+            if let EngineCommand::Shutdown { done } = command {
+                shutdown_done = Some(done);
                 shutdown = true;
                 break;
             }
@@ -698,6 +702,13 @@ fn run(
             maybe_probe_storage(&webview, &shared);
             std::thread::sleep(if suspended { SUSPENDED_IDLE } else { SPIN_IDLE });
         }
+    }
+    // Synchronous constellation shutdown happens in Servo's Drop below — the
+    // resource thread flushes cookie_jar.json before it returns. Signal the
+    // waiter only after that completes, so process exit can't win the race.
+    drop(servo);
+    if let Some(done) = shutdown_done {
+        let _ = done.send(());
     }
 }
 
@@ -922,7 +933,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             state.suspended = false;
             webview.set_focused(state.visible);
         }
-        EngineCommand::Shutdown | EngineCommand::Wake => {}
+        EngineCommand::Shutdown { .. } | EngineCommand::Wake => {}
     }
 }
 

@@ -17,7 +17,7 @@ use crate::domain::color::SpectrumService;
 use crate::domain::pad::InputHub;
 use crate::{AppError, AppResult};
 
-use crate::browser::engine::{EngineEvent, EngineHandle};
+use crate::browser::engine::{EngineCommand, EngineEvent, EngineHandle};
 use crate::browser::keys::RawKey;
 #[cfg(debug_assertions)]
 use crate::controller::emulate;
@@ -2079,6 +2079,18 @@ impl App {
         // teardown also clears).
         self.input_hub.clear();
         self.hid_worker.shutdown();
+        // Clean engine shutdown FIRST: the worker breaks its loop, drops
+        // Servo (which spins synchronously to ShutdownComplete, flushing
+        // cookie_jar.json + auth/hsts to disk), then acks. The wait is
+        // bounded — a hung constellation must not hang quit forever (on
+        // timeout the process exits as before, cookies lost).
+        if let Some(engine) = &self.engine {
+            let (tx, rx) = std::sync::mpsc::channel();
+            engine.send(EngineCommand::Shutdown { done: tx });
+            if rx.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
+                crate::controller::hid::diag::diag_info("ui-diag: engine shutdown timeout");
+            }
+        }
         self.tray_icon.take();
         crate::controller::hid::diag::diag_info("ui-diag: process exit complete");
         iced::exit()

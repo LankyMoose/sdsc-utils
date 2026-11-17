@@ -71,7 +71,13 @@ pub enum EngineCommand {
     },
     Suspend,
     Resume,
-    Shutdown,
+    /// Clean shutdown: the worker breaks its loop, drops Servo (whose Drop
+    /// spins synchronously to ShutdownComplete, flushing cookie_jar.json),
+    /// then signals `done`. The sender waits on it (bounded) before
+    /// process exit so the flush actually lands.
+    Shutdown {
+        done: std::sync::mpsc::Sender<()>,
+    },
     /// Poke the loop awake (Servo's [`EventLoopWaker`] hook). No-op by the
     /// time it drains: the loop spins every few ms anyway.
     Wake,
