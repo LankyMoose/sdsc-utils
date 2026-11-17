@@ -2369,7 +2369,14 @@ impl App {
         let save_modal = self.start_state.edit_confirm.is_some();
         let settings_open = self.start_state.settings.open;
         let browser_open = self.start_state.browser.session.is_open();
-        let allow_nav_move = start_nav_move_allowed(&self.start_state);
+        // The history selector owns the pad while open — including D-pad
+        // moves. Engine mode normally gates the nav stepper off (D-pad
+        // belongs to the cursor jump code), which would starve the selector
+        // of Up/Down/Left/Right; force it on so the selector tick sees
+        // moves. The selector branch returns before the cursor tick, so
+        // the cursor still never moves under the dropdown.
+        let selector_open = browser_open && self.start_state.browser.history_selector.is_some();
+        let allow_nav_move = selector_open || start_nav_move_allowed(&self.start_state);
         let editing = self.start_state.editing;
         // Only when the selected row shows Close game (running target match).
         let hold_cross_close = !editing

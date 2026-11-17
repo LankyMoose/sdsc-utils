@@ -2174,6 +2174,46 @@ mod tests {
         }
     }
 
+    /// Selector contract (B2.4): D-pad moves fire even with a bumper held.
+    /// Engine mode gates the stepper off for the cursor; the App forces it
+    /// back on while the history selector is open, which only works because
+    /// bumper holds never disturb stepper state.
+    #[test]
+    fn dpad_moves_fire_with_bumper_held() {
+        let mut bank = PadNavBank::default();
+        bank.prepare_on_open(true);
+        let now = Instant::now();
+        let _ = bank.tick(
+            &[reading("a", PadSample::default())],
+            now,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        let both = PadSample {
+            l1: true,
+            dpad_down: true,
+            held: [GestureControl::L1].into_iter().collect(),
+            ..Default::default()
+        };
+        let tick = bank.tick(
+            &[reading("a", both)],
+            now,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(tick.action, Some(NavAction::Down));
+    }
+
     #[test]
     fn input_hub_read_missing_before_publish() {
         let hub = InputHub::new();
