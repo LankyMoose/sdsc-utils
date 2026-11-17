@@ -371,11 +371,18 @@ impl Cursor {
             if Some(item.id) == self.attached {
                 continue;
             }
-            let cx = item.x + item.w / 2.0 - self.x;
-            let cy = item.y + item.h / 2.0 - self.y;
-            if banded && cy.abs() > HEADER_ROW_BAND {
+            // Row gate uses centers (which row is this target in?); alignment
+            // scoring uses the nearest point (a slot directly below wins over
+            // a diagonally-nearer center, and tiny off-axis targets stop
+            // intercepting wide same-row neighbors).
+            let center_cy = item.y + item.h / 2.0 - self.y;
+            if banded && center_cy.abs() > HEADER_ROW_BAND {
                 continue;
             }
+            let nx = self.x.clamp(item.x, item.x + item.w);
+            let ny = self.y.clamp(item.y, item.y + item.h);
+            let cx = nx - self.x;
+            let cy = ny - self.y;
             let along = cx * dx + cy * dy;
             if along <= 0.0 {
                 continue;
@@ -905,6 +912,69 @@ mod tests {
             }
         }
         assert_eq!(c.attached, Some(CHROME_ID_BASE + 1));
+    }
+
+    fn chrome_btn(id: u64, x: f32, y: f32, w: f32, h: f32) -> Focusable {
+        Focusable {
+            id,
+            x,
+            y,
+            w,
+            h,
+            kind: FocusKind::Button,
+            url: None,
+        }
+    }
+
+    #[test]
+    fn header_down_picks_slot_below_over_aligned_page_link() {
+        // Trace case: Down from a strip tab landed on a page link two rows
+        // down, skipping the toolbar. Nearest-point scoring prefers the
+        // slot directly below.
+        let mut c = Cursor::new();
+        let omni = chrome_btn(CHROME_ID_BASE, 228.0, -72.0, 457.0, 36.0);
+        let page = link(1, 283.0, 50.0);
+        let items = [page, omni];
+        c.x = 338.0;
+        c.y = -94.0;
+        assert!(c.jump(JumpDir::Down, &items));
+        for _ in 0..60 {
+            c.advance(0.0, 0.0, 0.016, &items);
+            if c.attached == Some(CHROME_ID_BASE) {
+                break;
+            }
+        }
+        assert_eq!(c.attached, Some(CHROME_ID_BASE));
+    }
+
+    #[test]
+    fn tiny_off_axis_button_does_not_intercept() {
+        // Trace case: Right from a page link hopped through a tiny 13x15
+        // button instead of the wide same-row neighbor. Rect-nearest
+        // scoring fixes the interception.
+        let mut c = Cursor::new();
+        let tiny = Focusable {
+            id: 2,
+            x: 674.0,
+            y: 23.0,
+            w: 13.0,
+            h: 15.0,
+            kind: FocusKind::Link,
+            url: None,
+        };
+        let wide = link(3, 707.0, 50.0);
+        let items = [tiny, wide];
+        c.x = 636.0;
+        c.y = 68.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert!(c.jump(JumpDir::Right, &items));
+        for _ in 0..60 {
+            c.advance(0.0, 0.0, 0.016, &items);
+            if c.attached == Some(3) {
+                break;
+            }
+        }
+        assert_eq!(c.attached, Some(3));
     }
 
     #[test]
