@@ -1458,17 +1458,10 @@ impl BrowserPanel {
                 let targets = cursor_targets(&self.page.focusables, &self.chrome);
                 self.page.cursor.jump(dir, &targets);
             }
-            // Page up: lowest non-empty chrome row (toolbar before strip),
-            // column preserved.
-            (None, JumpDir::Up) => {
-                for r in (0..layout.len()).rev() {
-                    if let Some(f) = col_pick(&row_items(r), x) {
-                        self.page.cursor.jump_to(&f);
-                        return;
-                    }
-                }
-            }
-            // Page verticals/horizontals: spatial cone, unchanged.
+            // Page verticals/horizontals: spatial cone, unchanged. A page
+            // target above wins on distance; only the topmost page row
+            // reaches chrome, and the nearest chrome row wins (toolbar
+            // before strip, bookmarks before toolbar when present).
             (None, _) => {
                 let targets = cursor_targets(&self.page.focusables, &self.chrome);
                 self.page.cursor.jump(dir, &targets);
@@ -5698,7 +5691,7 @@ mod tests {
         // Off-column entry still moves a row: a far-right point must land
         // on the toolbar's right edge, not refuse the cone and stay put.
         panel.page.cursor.attached = None;
-        panel.page.cursor.x = 1250.0;
+        panel.page.cursor.x = 770.0;
         panel.page.cursor.y = 300.0;
         panel.jump_cursor(crate::browser::cursor::JumpDir::Up);
         fly_until_dock(&mut panel);
@@ -5707,6 +5700,40 @@ mod tests {
             Some(ChromeTarget::Go),
             "column preserved even when far off the omnibox"
         );
+    }
+
+    #[test]
+    fn page_up_steps_to_page_target_before_header() {
+        // Up on a populated page walks page elements first; chrome is only
+        // reachable once the topmost page row has nothing above it.
+        use crate::browser::cursor::{FocusKind, Focusable};
+        let mut panel = BrowserPanel::default();
+        panel.rebuild_chrome();
+        panel.page.focusables = vec![Focusable {
+            id: 2,
+            x: 300.0,
+            y: 80.0,
+            w: 200.0,
+            h: 40.0,
+            kind: FocusKind::Link,
+            url: None,
+        }];
+        panel.page.cursor.x = 400.0;
+        panel.page.cursor.y = 300.0;
+        panel.jump_cursor(crate::browser::cursor::JumpDir::Up);
+        fly_until_dock(&mut panel);
+        assert_eq!(panel.page.cursor.attached, Some(2), "page link above wins");
+        assert_eq!(panel.chrome_attached(), None, "did not vault into chrome");
+        // One more Up from the top page row reaches the toolbar.
+        panel.jump_cursor(crate::browser::cursor::JumpDir::Up);
+        fly_until_dock(&mut panel);
+        let got = panel.chrome_attached().expect("docked in header");
+        let (_, f) = panel
+            .chrome
+            .iter()
+            .find(|(t, _)| *t == got)
+            .expect("header slot");
+        assert_eq!(f.y, CHROME_TOOLBAR_Y);
     }
 
     #[test]
