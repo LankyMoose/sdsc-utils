@@ -1108,57 +1108,6 @@ impl App {
                 y: cy,
             });
         }
-        // TEMP cursor-trace for session analysis (remove after): analog
-        // input + dock + velocity per tick, change-driven with a 500ms
-        // heartbeat so idle-docked still shows up. Grep `cursor-trace`.
-        let cursor = &self.start_state.browser.cursor;
-        let (cx, cy, vx, vy, dock, fly, blend, mag) = (
-            cursor.x,
-            cursor.y,
-            cursor.vx,
-            cursor.vy,
-            cursor.attached,
-            cursor.fly_to,
-            cursor.dock_blend,
-            cursor.magnet,
-        );
-        let dock_rect = cursor.attached_rect(&self.start_state.browser.focusables);
-        let pad_active = readings
-            .iter()
-            .any(|r| !start_input::sample_nav_resting(&r.sample));
-        let moving =
-            vx != 0.0 || vy != 0.0 || fly.is_some() || pad_active || dock != self.cursor_trace_dock;
-        let due = self
-            .cursor_trace_last
-            .is_none_or(|t| now.saturating_duration_since(t).as_millis() >= 500);
-        if moving || due {
-            let t0 = *self.cursor_trace_t0.get_or_insert(now);
-            let dpad = [
-                (sample.dpad_up, 'U'),
-                (sample.dpad_down, 'D'),
-                (sample.dpad_left, 'L'),
-                (sample.dpad_right, 'R'),
-            ]
-            .iter()
-            .map(|(held, c)| if *held { *c } else { '-' })
-            .collect::<String>();
-            crate::platform::app_log::info(format!(
-                "cursor-trace t={} ls=({:.2},{:.2}) rs=({:.2},{:.2}) dpad={dpad} pos=({cx:.0},{cy:.0}) vel=({vx:.0},{vy:.0}) dock={} rect={} fly={} blend={blend:.2} mag={}",
-                now.saturating_duration_since(t0).as_millis(),
-                sample.lstick_x,
-                sample.lstick_y,
-                sample.rstick_x,
-                sample.rstick_y,
-                dock.map_or("-".to_string(), |id| id.to_string()),
-                dock_rect.map_or("-".to_string(), |(x, y, w, h)| format!(
-                    "({x:.0},{y:.0},{w:.0}x{h:.0})"
-                )),
-                fly.map_or("-".to_string(), |(x, y)| format!("({x:.0},{y:.0})")),
-                u8::from(mag),
-            ));
-            self.cursor_trace_last = Some(now);
-            self.cursor_trace_dock = dock;
-        }
     }
 
     /// D-pad cursor jumps for engine mode. The banked nav stepper stays
