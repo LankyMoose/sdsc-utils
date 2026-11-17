@@ -52,9 +52,16 @@ pub const DOCK_BLEND_PER_SEC: f32 = 7.0;
 /// D-pad flight speed, px/s: jumps and nudges glide to the target instead
 /// of teleporting; stick input cancels back to manual control.
 pub const FLY_SPEED: f32 = 2400.0;
-/// Break-free stick deflection while docked: past 25% the dock releases at
-/// once (detach + outward kick) instead of dragging the dock along.
+/// Break-free stick deflection while docked: past 25% a *fresh* push
+/// releases at once (detach + outward kick) instead of dragging the dock
+/// along. Fresh means the stick dropped below [`BREAK_REARM_DEFLECT`]
+/// since docking — landing with the stick still held never instantly
+/// kicks back off (human release time is ~200ms; the old level trigger
+/// broke every arrival on the very next tick).
 pub const BREAK_FREE_DEFLECT: f32 = 0.25;
+/// Re-arm deflection: the stick must fall below this after docking before
+/// a new push can break free again.
+pub const BREAK_REARM_DEFLECT: f32 = 0.1;
 /// Outward kick on break-free, px/s: immediate motion in the push direction.
 pub const BREAK_KICK: f32 = 800.0;
 /// Right-stick scroll speed at full deflection, px/s.
@@ -92,6 +99,11 @@ pub struct Cursor {
     /// Break-free suppression: id that must not re-dock until the point
     /// leaves its hold pad (prevents instant re-capture after a push-off).
     pub no_dock: Option<u64>,
+    /// Break-free arming: set on every dock, cleared only once the stick
+    /// drops below [`BREAK_REARM_DEFLECT`]. A fresh push past
+    /// [`BREAK_FREE_DEFLECT`] then breaks; arriving (or lingering) with the
+    /// stick held never does.
+    pub break_armed: bool,
     /// Docking mode (L3 toggles): the point docks onto elements it arrives
     /// at. Off = pure free-form virtual mouse; D-pad jumping still applies.
     pub magnet: bool,
@@ -110,6 +122,7 @@ impl Cursor {
             last_dock: None,
             fly_to: None,
             no_dock: None,
+            break_armed: true,
             magnet: true,
             visible: true,
         }
@@ -146,14 +159,20 @@ impl Cursor {
         // outward); page motion carrying the element away releases without
         // a kick. The hold check runs against the previous point so a
         // carried-away element actually releases instead of re-centering
-        // onto its new rect forever.
+        // onto its new rect forever. Breaks are edge-triggered: docking
+        // latches until the stick drops below BREAK_REARM_DEFLECT, so
+        // arriving with the stick still held never kicks straight back off.
         if self.attached.is_some() {
             self.vx = 0.0;
             self.vy = 0.0;
             let item = self
                 .attached
                 .and_then(|id| options.iter().find(|o| o.id == id));
-            let pushed = lx.hypot(ly) > BREAK_FREE_DEFLECT;
+            let deflect = lx.hypot(ly);
+            if deflect < BREAK_REARM_DEFLECT {
+                self.break_armed = true;
+            }
+            let pushed = deflect > BREAK_FREE_DEFLECT && self.break_armed;
             let held = item.is_some_and(|it| self.inside_expanded(it, HOLD_PAD));
             if pushed || !held {
                 let was = self.attached;
@@ -354,11 +373,14 @@ impl Cursor {
         }
         self.attached = best.map(|item| item.id);
         // Center on dock: the point moves to the middle of the target, and
-        // any arrival velocity dies here — a docked point never carries
-        // momentum (break-free re-arms from zero with its own kick).
+        // any arrival velocity dies here — a dock starts from rest, and the
+        // break latch engages so the arriving (still-held) stick cannot
+        // instantly kick back off. Release below BREAK_REARM_DEFLECT to
+        // re-arm, then push to leave.
         if let Some(item) = best {
             self.vx = 0.0;
             self.vy = 0.0;
+            self.break_armed = false;
             self.x = (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W);
             self.y = (item.y + item.h / 2.0).clamp(0.0, VIEWPORT_H);
             self.last_dock = Some((item.x, item.y, item.w, item.h));
@@ -688,6 +710,34 @@ mod tests {
     }
 
     #[test]
+    fn landing_with_stick_held_never_breaks() {
+        // The t=4311 trace: pushing onto a target with the stick still
+        // deflected must NOT kick straight back off on the next tick.
+        // Only a release-then-repush leaves.
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        // Still holding hard: latched, stays docked.
+        for _ in 0..10 {
+            c.advance(0.6, 0.0, 0.016, &items);
+            assert_eq!(c.attached, Some(1));
+        }
+        // Relax but not below the re-arm line: still latched.
+        c.advance(0.2, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        c.advance(0.26, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1), "no release since dock: no break");
+        // Release, then the same push breaks at once.
+        c.advance(0.0, 0.0, 0.016, &items);
+        c.advance(0.26, 0.0, 0.016, &items);
+        assert_eq!(c.attached, None);
+        assert_eq!(c.no_dock, Some(1));
+    }
+
+    #[test]
     fn firm_push_breaks_free_at_once_with_kick() {
         let mut c = Cursor::new();
         let items = [link(1, 100.0, 100.0)];
@@ -695,8 +745,10 @@ mod tests {
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1));
-        // One firm tick: detached immediately, moving outward, suppressed
-        // from instant re-capture while still inside the hold pad.
+        // Release to re-arm, then one firm tick: detached immediately,
+        // moving outward, suppressed from instant re-capture while still
+        // inside the hold pad.
+        c.advance(0.0, 0.0, 0.016, &items);
         c.advance(1.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, None);
         assert_eq!(c.no_dock, Some(1));
@@ -720,7 +772,9 @@ mod tests {
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1));
-        // Push off: detaches immediately, suppressed while held.
+        // Release to re-arm, then push off: detaches immediately,
+        // suppressed while held.
+        c.advance(0.0, 0.0, 0.016, &items);
         c.advance(1.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, None);
         assert_eq!(c.no_dock, Some(1));
@@ -739,6 +793,8 @@ mod tests {
         let items = [link(1, 100.0, 100.0)];
         c.x = 150.0;
         c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        // Release to re-arm, then push off: suppressed while held.
         c.advance(0.0, 0.0, 0.016, &items);
         c.advance(1.0, 0.0, 0.016, &items);
         assert_eq!(c.no_dock, Some(1));
@@ -780,17 +836,20 @@ mod tests {
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1));
-        // Full deflection away: breaks the hold, then outruns the well.
+        // Release to re-arm, then full deflection away: breaks the hold
+        // and outruns the old well range.
+        c.advance(0.0, 0.0, 0.016, &items);
         for _ in 0..120 {
             c.advance(1.0, 0.0, 0.016, &items);
         }
-        assert_eq!(c.attached, None, "full stick must escape the magnet");
-        assert!(c.x > 250.0, "escaped past the gravity radius, x={}", c.x);
+        assert_eq!(c.attached, None, "full stick must escape the dock");
+        assert!(c.x > 250.0, "escaped outward, x={}", c.x);
     }
 
     #[test]
     fn weak_stick_stays_captured() {
-        // A gentle 10% push cannot beat the pull near the center.
+        // A gentle 10% push holds the dock (and never reaches the
+        // quarter-stick break line either).
         let mut c = Cursor::new();
         let items = [link(1, 100.0, 100.0)];
         c.x = 150.0;
@@ -818,7 +877,8 @@ mod tests {
 
     #[test]
     fn break_free_needs_quarter_stick() {
-        // Below 25% deflection a dock holds; past it, one tick detaches.
+        // Below 25% deflection a dock holds; a fresh push past it detaches
+        // in one tick — but only after a release re-arms the latch.
         let mut c = Cursor::new();
         let items = [link(1, 100.0, 100.0)];
         c.x = 150.0;
@@ -827,6 +887,11 @@ mod tests {
         assert_eq!(c.attached, Some(1));
         c.advance(0.2, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1));
+        // Past 25% but never released since docking: latched, stays.
+        c.advance(0.26, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        // Release, then the same push breaks at once.
+        c.advance(0.0, 0.0, 0.016, &items);
         c.advance(0.26, 0.0, 0.016, &items);
         assert_eq!(c.attached, None);
     }
@@ -856,6 +921,8 @@ mod tests {
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1));
+        // Release to re-arm, then down exits mid-bottom with a kick.
+        c.advance(0.0, 0.0, 0.016, &items);
         c.advance(0.0, 1.0, 0.016, &items);
         assert_eq!(c.attached, None);
         assert_eq!(c.x, 150.0);
@@ -874,6 +941,8 @@ mod tests {
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1));
+        // Release to re-arm, then the diagonal heads to the corner.
+        c.advance(0.0, 0.0, 0.016, &items);
         c.advance(1.0, 1.0, 0.016, &items);
         assert_eq!(c.attached, None);
         assert!(c.x > 150.0 && c.y > 115.0);
