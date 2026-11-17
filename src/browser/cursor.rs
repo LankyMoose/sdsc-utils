@@ -1,10 +1,12 @@
 //! Virtual cursor for controller-first browsing.
 //!
-//! The pad owns a cursor over the rendered page: the left stick (and D-pad
-//! flights) move a free point, and it magnetically attaches to the nearest
-//! focusable element. Rendering morphs a ring between dot (free) and wrap
-//! (docked) every tick — position, size, and shape always interpolate, so
-//! no frame pops. Cross clicks the attached element (or the free point).
+//! The pad owns a cursor over the rendered page: the left stick moves a
+//! free point with velocity + friction, D-pad jumps fly between focusables,
+//! and the point docks onto whatever element it actually arrives at.
+//! Docking centers the point on the element; pushing off leaves from the
+//! rect edge along the push. Rendering morphs a ring between dot (free) and
+//! wrap (docked) every tick — size and shape always interpolate, so no
+//! frame pops. Cross clicks the attached element (or the free point).
 //!
 //! Focusables arrive later via the accessibility tree
 //! (`EngineEvent::A11yTree`); until then the list is empty and the cursor
@@ -30,10 +32,6 @@ pub enum FocusKind {
     Other,
 }
 
-/// Gravity radius in page pixels: magnetism only pulls this close to a
-/// focusable. Outside it the stick drives free-form. Halved from 100: the
-/// old range grabbed across unrelated links.
-pub const SNAP_RADIUS: f32 = 50.0;
 /// D-pad nudge step in page pixels.
 pub const NUDGE_STEP: f32 = 32.0;
 /// Left-stick cursor acceleration at full deflection, px/s^2.
@@ -41,20 +39,11 @@ pub const CURSOR_ACCEL: f32 = 7000.0;
 /// Left-stick cursor top speed, px/s.
 pub const CURSOR_MAX_SPEED: f32 = 1400.0;
 /// Velocity decay rate (exponential friction, per second). The cursor glides
-/// a little after release instead of stopping dead. Doubled from 7: the old
-/// value felt slippery and let the magnet yank at high speed.
+/// a little after release instead of stopping dead.
 pub const CURSOR_FRICTION: f32 = 14.0;
-/// Magnetic pull cap, as acceleration: exactly one quarter of stick
-/// thrust, so holding the stick past ~25% deflection always overpowers the
-/// magnet at any range, while lighter touches get captured. Falls off with
-/// the square root of closeness to zero at the snap radius edge (soft
-/// capture that never dips under the friction cutoff).
-pub const PULL_MAX_ACCEL: f32 = CURSOR_ACCEL * 0.25;
 /// Dock entry/exit pads in page pixels: the outline engages when the point
 /// enters an element's rect + ACQUIRE_PAD and holds until it leaves +
-/// HOLD_PAD, so edge dither never flickers the wrap. Gravity (SNAP_RADIUS)
-/// reaches further than the outline — the dot visibly glides in and the
-/// wrap only pops once it actually arrives.
+/// HOLD_PAD, so edge dither never flickers the wrap.
 pub const ACQUIRE_PAD: f32 = 8.0;
 pub const HOLD_PAD: f32 = 24.0;
 /// Dock-blend rate: the outline morphs free↔docked in ~140ms, eased every
@@ -64,7 +53,7 @@ pub const DOCK_BLEND_PER_SEC: f32 = 7.0;
 /// of teleporting; stick input cancels back to manual control.
 pub const FLY_SPEED: f32 = 2400.0;
 /// Break-free stick deflection while docked: past this the dock releases at
-/// once (detach + outward kick) instead of fighting gravity off gradually.
+/// once (detach + outward kick) instead of dragging the dock along.
 pub const BREAK_FREE_DEFLECT: f32 = 0.3;
 /// Outward kick on break-free, px/s: immediate motion in the push direction.
 pub const BREAK_KICK: f32 = 800.0;
@@ -103,8 +92,8 @@ pub struct Cursor {
     /// Break-free suppression: id that must not re-dock until the point
     /// leaves its hold pad (prevents instant re-capture after a push-off).
     pub no_dock: Option<u64>,
-    /// Magnetic mode (L3 toggles): snap + glide to nearby elements.
-    /// Off = pure free-form virtual mouse; D-pad jumping still applies.
+    /// Docking mode (L3 toggles): the point docks onto elements it arrives
+    /// at. Off = pure free-form virtual mouse; D-pad jumping still applies.
     pub magnet: bool,
     pub visible: bool,
 }
@@ -127,7 +116,7 @@ impl Cursor {
     }
 
     /// Free movement with viewport clamping. Any manual move drops the
-    /// attachment first; the caller re-snaps afterwards.
+    /// attachment first; docking re-engages on arrival.
     pub fn move_by(&mut self, dx: f32, dy: f32) {
         if dx == 0.0 && dy == 0.0 {
             return;
@@ -137,11 +126,10 @@ impl Cursor {
         self.y = (self.y + dy).clamp(0.0, VIEWPORT_H);
     }
 
-    /// Analog velocity step with magnetic gravity, D-pad flights, and dock
-    /// morph state. The stick accelerates a velocity vector, friction decays
-    /// it, and the nearest focusable within range pulls proportionally to
-    /// closeness; flights glide to jump/nudge targets (stick cancels).
-    /// Attachment + `dock_blend` ease every tick, so the overlay never pops.
+    /// Analog velocity step, D-pad flights, and dock morph state. The stick
+    /// accelerates a velocity vector and friction decays it; flights glide
+    /// to jump/nudge targets (stick cancels). Attachment + `dock_blend`
+    /// ease every tick, so the overlay never pops.
     pub fn advance(&mut self, lx: f32, ly: f32, dt_secs: f32, options: &[Focusable]) {
         // D-pad flights glide to the target; stick input cancels back to
         // manual control.
@@ -153,26 +141,41 @@ impl Cursor {
         if self.no_dock.is_some() && lx.hypot(ly) < 0.01 && self.fly_to.is_none() {
             self.no_dock = None;
         }
-        // Docked: pinned — no velocity, no gravity. A firm push breaks free
-        // at once (detach + kick outward); page motion carrying the element
-        // away releases without a kick.
+        // Docked: pinned to the element center — no velocity. A firm push
+        // breaks free at once (detach + place on the exit edge + kick
+        // outward); page motion carrying the element away releases without
+        // a kick. The hold check runs against the previous point so a
+        // carried-away element actually releases instead of re-centering
+        // onto its new rect forever.
         if self.attached.is_some() {
             self.vx = 0.0;
             self.vy = 0.0;
-            let pushed = lx.hypot(ly) > BREAK_FREE_DEFLECT;
-            let held = self
+            let item = self
                 .attached
-                .and_then(|id| options.iter().find(|o| o.id == id))
-                .is_some_and(|item| self.inside_expanded(item, HOLD_PAD));
+                .and_then(|id| options.iter().find(|o| o.id == id));
+            let pushed = lx.hypot(ly) > BREAK_FREE_DEFLECT;
+            let held = item.is_some_and(|it| self.inside_expanded(it, HOLD_PAD));
             if pushed || !held {
                 let was = self.attached;
                 self.attached = None;
                 self.no_dock = was;
-                if pushed {
+                if pushed && let Some(it) = item {
+                    // Leave from the rect edge along the push: down exits
+                    // mid-bottom, diagonals exit corners — the point starts
+                    // where the velocity says it is going.
+                    let (ex, ey) = Self::exit_point(it, lx, ly);
+                    self.x = ex.clamp(0.0, VIEWPORT_W);
+                    self.y = ey.clamp(0.0, VIEWPORT_H);
                     self.vx = lx * BREAK_KICK;
                     self.vy = ly * BREAK_KICK;
                 }
             } else {
+                // Still held and unpushed: re-pin to the center so page
+                // motion drags the point along instead of stranding it.
+                if let Some(it) = item {
+                    self.x = (it.x + it.w / 2.0).clamp(0.0, VIEWPORT_W);
+                    self.y = (it.y + it.h / 2.0).clamp(0.0, VIEWPORT_H);
+                }
                 self.ease_blend(dt_secs);
                 return;
             }
@@ -199,22 +202,6 @@ impl Cursor {
                 (self.vx + lx * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
             self.vy =
                 (self.vy + ly * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
-            if self.magnet
-                && let Some((_, tx, ty, edge, clen)) = Self::nearest_within(self.x, self.y, options)
-            {
-                // Gravity, not teleport: pull toward the element center with
-                // a magnitude that falls off to zero at the snap radius
-                // edge — soft capture from afar, firm center. Square-root
-                // falloff keeps edge pull above the friction cutoff so the
-                // rim never deadlocks. Direction normalizes by *center*
-                // distance; the edge distance drives the falloff only.
-                if clen > 0.5 {
-                    let fall = (1.0 - edge / SNAP_RADIUS).max(0.0);
-                    let strength = PULL_MAX_ACCEL * fall.sqrt();
-                    self.vx += ((tx - self.x) / clen) * strength * dt_secs;
-                    self.vy += ((ty - self.y) / clen) * strength * dt_secs;
-                }
-            }
         }
         let damp = (-CURSOR_FRICTION * dt_secs).exp();
         self.vx *= damp;
@@ -248,40 +235,6 @@ impl Cursor {
         } else if self.dock_blend > target {
             self.dock_blend = (self.dock_blend - step).max(0.0);
         }
-    }
-
-    /// Nearest focusable within snap radius of a point: its center, the edge
-    /// distance (drives pull falloff + attach range), and the center distance
-    /// (drives pull direction). Shared by the per-tick gravity and the snap
-    /// pass.
-    fn nearest_within(x: f32, y: f32, options: &[Focusable]) -> Option<(u64, f32, f32, f32, f32)> {
-        let mut best: Option<(u64, f32, f32, f32, f32)> = None;
-        for item in options {
-            let dx = if x < item.x {
-                item.x - x
-            } else if x > item.x + item.w {
-                x - (item.x + item.w)
-            } else {
-                0.0
-            };
-            let dy = if y < item.y {
-                item.y - y
-            } else if y > item.y + item.h {
-                y - (item.y + item.h)
-            } else {
-                0.0
-            };
-            let edge = dx.hypot(dy);
-            if edge <= SNAP_RADIUS {
-                let cx = item.x + item.w / 2.0;
-                let cy = item.y + item.h / 2.0;
-                let clen = (cx - x).hypot(cy - y);
-                if best.is_none_or(|(_, _, _, be, _)| edge < be) {
-                    best = Some((item.id, cx, cy, edge, clen));
-                }
-            }
-        }
-        best
     }
 
     /// Nudge for D-pad taps: a short flight, not a step. Kills velocity so a
@@ -355,11 +308,11 @@ impl Cursor {
         }
     }
 
-    /// Dock when the point actually arrives: attach to the nearest element
-    /// whose rect (expanded by [`ACQUIRE_PAD`]) contains the point. Holding
-    /// is stickier than acquiring ([`HOLD_PAD`]) so edge dither never
-    /// flickers the outline. Gravity reaches further than the outline — the
-    /// dot visibly glides in before the wrap pops.
+    /// Dock when the point actually arrives: attach to the element whose
+    /// rect (expanded by [`ACQUIRE_PAD`]) contains the point, and center
+    /// the point on it — clicks and push-offs start from the middle, not
+    /// the arrival edge. Holding is stickier than acquiring ([`HOLD_PAD`])
+    /// so edge dither never flickers the outline.
     pub fn snap(&mut self, options: &[Focusable]) {
         // Mid-flight the point belongs to the flight path, not to whatever
         // it passes over — docking happens on arrival, once per trip.
@@ -383,7 +336,8 @@ impl Cursor {
             return;
         }
         self.attached = None;
-        let mut best: Option<(u64, f32)> = None;
+        let mut best: Option<&Focusable> = None;
+        let mut best_d = f32::INFINITY;
         for item in options {
             if !self.inside_expanded(item, ACQUIRE_PAD) {
                 continue;
@@ -393,16 +347,16 @@ impl Cursor {
                 continue;
             }
             let d = (item.x + item.w / 2.0 - self.x).hypot(item.y + item.h / 2.0 - self.y);
-            if best.is_none_or(|(_, bd)| d < bd) {
-                best = Some((item.id, d));
+            if d < best_d {
+                best_d = d;
+                best = Some(item);
             }
         }
-        self.attached = best.map(|(id, _)| id);
-        // Remember the docked rect: if the point leaves, the wrap morphs
-        // back into the dot from here instead of vanishing a frame early.
-        if let Some(id) = self.attached
-            && let Some(item) = options.iter().find(|o| o.id == id)
-        {
+        self.attached = best.map(|item| item.id);
+        // Center on dock: the point moves to the middle of the target.
+        if let Some(item) = best {
+            self.x = (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W);
+            self.y = (item.y + item.h / 2.0).clamp(0.0, VIEWPORT_H);
             self.last_dock = Some((item.x, item.y, item.w, item.h));
         }
     }
@@ -418,11 +372,10 @@ impl Cursor {
     }
 
     /// Point to click: the flight target mid-flight, attached element
-    /// center when docked, the gravity well's center while falling in, else
-    /// the free cursor. The well fallback only applies with the magnet on:
-    /// magnet-off means "exactly where I point", never a yank to a distant
-    /// well (R3 flag #6: free cursor at (299,115) clicked the search field
-    /// center 47px away instead of the empty point under the cursor).
+    /// center when docked, else the free cursor. No gravity fallback: with
+    /// no pull, a free point far from any element means exactly that (the
+    /// old well fallback once clicked a field center 47px from the free
+    /// cursor — R3 flag #6).
     pub fn click_point(&self, options: &[Focusable]) -> (f32, f32) {
         // Mid-flight: aim at the flight target (user intent).
         if let Some((tx, ty)) = self.fly_to {
@@ -432,11 +385,6 @@ impl Cursor {
             && let Some(item) = options.iter().find(|o| o.id == id)
         {
             return (item.x + item.w / 2.0, item.y + item.h / 2.0);
-        }
-        if self.magnet
-            && let Some((_, tx, ty, _, _)) = Self::nearest_within(self.x, self.y, options)
-        {
-            return (tx, ty);
         }
         (self.x, self.y)
     }
@@ -456,6 +404,34 @@ impl Cursor {
             && self.x <= item.x + item.w + pad
             && self.y >= item.y - pad
             && self.y <= item.y + item.h + pad
+    }
+
+    /// Rect-boundary point where a push from the center along `(lx, ly)`
+    /// leaves the element: axis pushes exit mid-edge, diagonals exit
+    /// corners. Ray from the center; the first rect edge it hits wins.
+    fn exit_point(item: &Focusable, lx: f32, ly: f32) -> (f32, f32) {
+        let cx = item.x + item.w / 2.0;
+        let cy = item.y + item.h / 2.0;
+        let len = lx.hypot(ly);
+        if len <= 0.0 {
+            return (cx, cy);
+        }
+        let (dx, dy) = (lx / len, ly / len);
+        let mut t = f32::INFINITY;
+        if dx > 0.0 {
+            t = t.min((item.x + item.w - cx) / dx);
+        } else if dx < 0.0 {
+            t = t.min((item.x - cx) / dx);
+        }
+        if dy > 0.0 {
+            t = t.min((item.y + item.h - cy) / dy);
+        } else if dy < 0.0 {
+            t = t.min((item.y - cy) / dy);
+        }
+        if !t.is_finite() {
+            return (cx, cy);
+        }
+        (cx + dx * t, cy + dy * t)
     }
 }
 
@@ -559,11 +535,13 @@ mod tests {
     fn dock_blend_morphs_both_directions() {
         let mut c = Cursor::new();
         let items = [link(1, 100.0, 100.0)];
-        // Dock: blend eases 0 → 1 over ticks, never jumps.
-        c.x = 210.0;
+        // Dock inside the pad: blend eases 0 → 1 over ticks, never jumps.
+        c.x = 205.0;
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
-        assert!(c.dock_blend < 1.0);
+        assert_eq!(c.attached, Some(1));
+        // Docking centers the point.
+        assert_eq!((c.x, c.y), (150.0, 115.0));
         let mut prev = c.dock_blend;
         for _ in 0..60 {
             c.advance(0.0, 0.0, 0.016, &items);
@@ -666,38 +644,22 @@ mod tests {
     }
 
     #[test]
-    fn dock_requires_arrival_outline_follows_glide() {
-        // 10px outside the rect: gravity well captured, but no outline yet.
+    fn dock_engages_on_arrival_and_click_stays_free_until_then() {
+        // 10px outside the rect (+8px pad): no outline, and the click is
+        // the free point — there is no gravity well to fall into or yank
+        // toward.
         let mut c = Cursor::new();
         let items = [link(1, 100.0, 100.0)];
         c.x = 210.0;
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, None, "outline pops on arrival, not on entry");
-        assert_eq!(c.click_point(&items), (150.0, 115.0));
-        // Neutral ticks: the point glides in and docks on arrival.
-        for _ in 0..120 {
-            c.advance(0.0, 0.0, 0.016, &items);
-            if c.attached.is_some() {
-                break;
-            }
-        }
-        assert_eq!(c.attached, Some(1));
-        assert!(c.x <= 208.0, "docked inside acquire pad, x={}", c.x);
-    }
-
-    #[test]
-    fn magnet_pull_is_gradual_not_a_teleport() {
-        // 60px from center, 10px outside the rect edge: one 16ms tick must
-        // drift slightly inward, never jump to the center — and the outline
-        // stays off until arrival.
-        let mut c = Cursor::new();
-        let items = [link(1, 100.0, 100.0)];
-        c.x = 210.0;
-        c.y = 115.0;
+        assert_eq!(c.click_point(&items), (210.0, 115.0));
+        // Drive into the pad: docks and centers at once.
+        c.x = 205.0;
         c.advance(0.0, 0.0, 0.016, &items);
-        assert_eq!(c.attached, None);
-        assert!(c.x < 210.0 && c.x > 200.0, "glides, not snaps: x={}", c.x);
+        assert_eq!(c.attached, Some(1));
+        assert_eq!((c.x, c.y), (150.0, 115.0));
     }
 
     #[test]
@@ -744,47 +706,27 @@ mod tests {
     }
 
     #[test]
-    fn release_to_neutral_lifts_suppression_and_redocks() {
+    fn release_after_break_free_coasts_out_without_redock() {
+        // A firm push detaches with a kick from the rect edge; letting go
+        // then coasts out of the hold pad on momentum (no gravity to drag
+        // it back), so suppression lifts outside and nothing re-docks.
         let mut c = Cursor::new();
         let items = [link(1, 100.0, 100.0)];
         c.x = 150.0;
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1));
-        // Push off but don't leave: suppressed while held.
+        // Push off: detaches immediately, suppressed while held.
         c.advance(1.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, None);
         assert_eq!(c.no_dock, Some(1));
-        // Let go without leaving: suppression lifts, gravity re-docks.
-        c.advance(0.0, 0.0, 0.016, &items);
+        // Let go: the kick coasts the point clear of the hold pad.
+        for _ in 0..60 {
+            c.advance(0.0, 0.0, 0.016, &items);
+        }
+        assert!(c.x > 224.0, "kick coasts clear of the hold pad, x={}", c.x);
         assert_eq!(c.no_dock, None);
-        for _ in 0..60 {
-            c.advance(0.0, 0.0, 0.016, &items);
-            if c.attached.is_some() {
-                break;
-            }
-        }
-        assert_eq!(c.attached, Some(1));
-    }
-
-    #[test]
-    fn well_edge_creep_never_stalls() {
-        // 5px inside the well edge: pull must beat the friction cutoff so
-        // the point visibly glides in instead of hovering forever.
-        let mut c = Cursor::new();
-        let items = [link(1, 100.0, 100.0)];
-        c.x = 245.0;
-        c.y = 115.0;
-        let start_x = c.x;
-        for _ in 0..60 {
-            c.advance(0.0, 0.0, 0.016, &items);
-        }
-        assert!(
-            c.x < start_x - 10.0,
-            "edge must glide inward, x={} started={}",
-            c.x,
-            start_x
-        );
+        assert_eq!(c.attached, None);
     }
 
     #[test]
@@ -871,16 +813,96 @@ mod tests {
     }
 
     #[test]
-    fn click_point_uses_well_before_dock_then_free_point() {
-        // Falling into the well but outside the acquire pad: click aims at
-        // the well center so X stays useful during the approach.
+    fn break_free_down_exits_mid_bottom() {
+        // LS down from a dock: the point starts at the bottom side, 50%
+        // width, with an outward kick (exit placement is exact; the kick
+        // integrates onward in the same tick).
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        c.advance(0.0, 1.0, 0.016, &items);
+        assert_eq!(c.attached, None);
+        assert_eq!(c.x, 150.0);
+        assert!(c.y > 130.0, "kick carries past the exit edge, y={}", c.y);
+        assert!(c.vy > 0.0);
+        assert_eq!(c.vx, 0.0);
+    }
+
+    #[test]
+    fn break_free_diagonal_heads_to_corner() {
+        // LS diagonal bottom-right: leaves toward the corner with an
+        // outward kick on both axes.
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        c.advance(1.0, 1.0, 0.016, &items);
+        assert_eq!(c.attached, None);
+        assert!(c.x > 150.0 && c.y > 115.0);
+        assert!(c.vx > 0.0 && c.vy > 0.0);
+    }
+
+    #[test]
+    fn exit_point_leaves_along_push_direction() {
+        let item = link(1, 100.0, 100.0); // 100x30, center (150,115)
+        assert_eq!(Cursor::exit_point(&item, 0.0, 1.0), (150.0, 130.0));
+        assert_eq!(Cursor::exit_point(&item, 0.0, -1.0), (150.0, 100.0));
+        assert_eq!(Cursor::exit_point(&item, -1.0, 0.0), (100.0, 115.0));
+        assert_eq!(Cursor::exit_point(&item, 0.0, 0.0), (150.0, 115.0));
+        // Diagonal on a wide element hits the nearer edge, not the corner.
+        let (ex, ey) = Cursor::exit_point(&item, 1.0, 1.0);
+        assert!(
+            (ex - 165.0).abs() < 0.01 && (ey - 130.0).abs() < 0.01,
+            "wide exit=({ex},{ey})"
+        );
+        // Diagonal on a square element exits the corner.
+        let square = Focusable {
+            id: 2,
+            x: 100.0,
+            y: 100.0,
+            w: 100.0,
+            h: 100.0,
+            kind: FocusKind::Link,
+        };
+        let (cx, cy) = Cursor::exit_point(&square, 1.0, 1.0);
+        assert!(
+            (cx - 200.0).abs() < 0.01 && (cy - 200.0).abs() < 0.01,
+            "square exit=({cx},{cy})"
+        );
+    }
+
+    #[test]
+    fn docked_pin_follows_page_motion() {
+        // The element scrolls under a docked cursor: still held, so the
+        // point re-pins to the new center instead of stranding.
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        let moved = [link(1, 100.0, 110.0)];
+        c.advance(0.0, 0.0, 0.016, &moved);
+        assert_eq!(c.attached, Some(1));
+        assert_eq!((c.x, c.y), (150.0, 125.0));
+    }
+
+    #[test]
+    fn click_point_free_until_docked() {
+        // No well fallback: the free point clicks where it is until the
+        // outline actually engages.
         let mut c = Cursor::new();
         let items = [link(7, 100.0, 200.0)];
         c.x = 240.0;
         c.y = 215.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, None);
-        assert_eq!(c.click_point(&items), (150.0, 215.0));
+        assert_eq!(c.click_point(&items), (240.0, 215.0));
         // Nothing in range: the free point.
         c.x = 500.0;
         c.y = 500.0;
