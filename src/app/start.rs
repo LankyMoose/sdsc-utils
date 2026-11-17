@@ -817,31 +817,21 @@ impl App {
     }
 
     /// Pad tick while the history selector is open (B2.4). The selector owns
-    /// the pad: Up/Down moves the highlight (highlight 0 = closest =
-    /// quick-press default), Cross confirms, Circle cancels, and releasing
-    /// both bumpers confirms (spec: release selects). Everything else —
-    /// cursor, scroll, taps, magnetism — stays parked. Called before the
-    /// engine/reader split so both modes share it.
+    /// the pad: Up/Down/Left/Right moves the highlight (highlight 0 =
+    /// closest = quick-press default), Cross confirms, Circle cancels.
+    /// Releasing the bumpers does nothing (the hold is over; the selector
+    /// stays open for D-pad browsing — release-to-confirm fired the moment
+    /// the user let go to reach the D-pad, making navigation impossible).
+    /// Everything else — cursor, scroll, taps, magnetism — stays parked.
+    /// Called before the engine/reader split so both modes share it.
     pub(crate) fn tick_browser_history_selector(
         &mut self,
         readings: &[start_input::NavReading],
         action: Option<NavAction>,
     ) -> Task<Message> {
-        // Bumper release confirms the highlight (both bumpers up). The hold
-        // tracker already consumed the press (no tap follows: release after
-        // open carries no event), so this is the only release path.
-        let bumpers_held = readings.iter().any(|r| r.sample.l1 || r.sample.r1);
-        if !bumpers_held {
-            if let Some(sel) = &self.start_state.browser.history_selector
-                && let Some(index) = sel.picked(&self.start_state.browser.session)
-            {
-                return self.on_start_message(StartMessage::BrowserHistoryPick(index));
-            }
-            self.start_state.browser.history_selector = None;
-            return Task::none();
-        }
+        let _ = readings;
         match action {
-            Some(NavAction::Up) => {
+            Some(NavAction::Up) | Some(NavAction::Left) => {
                 if let Some(sel) = self.start_state.browser.history_selector.as_mut()
                     && sel.highlight > 0
                 {
@@ -850,7 +840,7 @@ impl App {
                 }
                 Task::none()
             }
-            Some(NavAction::Down) => {
+            Some(NavAction::Down) | Some(NavAction::Right) => {
                 let len = {
                     let panel = &self.start_state.browser;
                     match &panel.history_selector {
@@ -861,9 +851,9 @@ impl App {
                 };
                 if let Some(sel) = self.start_state.browser.history_selector.as_mut()
                     && len > 0
-                    && sel.highlight + 1 < len
                 {
                     sel.highlight += 1;
+                    sel.clamp(len);
                     self.note_start_activity();
                 }
                 Task::none()
@@ -1373,6 +1363,20 @@ impl App {
                     .browser
                     .session
                     .note_session_history(entries, current);
+                // The stack moved under an open selector: clamp the highlight,
+                // close if the direction ran dry.
+                if let Some(sel) = self.start_state.browser.history_selector.as_mut() {
+                    let len = if sel.back {
+                        self.start_state.browser.session.back_entries().len()
+                    } else {
+                        self.start_state.browser.session.forward_entries().len()
+                    };
+                    if len == 0 {
+                        self.start_state.browser.history_selector = None;
+                    } else {
+                        sel.clamp(len);
+                    }
+                }
             }
             EngineEvent::LoadFinished { generation, result } => match result {
                 Ok(()) => {

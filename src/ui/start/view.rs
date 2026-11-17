@@ -1204,8 +1204,12 @@ fn browser_suggestions(panel: &BrowserPanel) -> Element<'_, StartMessage> {
         list = list.push(
             button(
                 column![
-                    text(title).size(13.0).color(theme::INK),
-                    text(m.url.clone()).size(11.0).color(theme::MUTED),
+                    text(theme::ellipsize(&title, 48))
+                        .size(13.0)
+                        .color(theme::INK),
+                    text(theme::ellipsize(&m.url, 72))
+                        .size(11.0)
+                        .color(theme::MUTED),
                 ]
                 .spacing(0),
             )
@@ -1248,7 +1252,11 @@ fn browser_bookmark_bar(panel: &BrowserPanel) -> Element<'_, StartMessage> {
                         .height(Length::Fixed(16.0)),
                 );
             }
-            inner = inner.push(text(b.name()).size(13.0).color(theme::INK));
+            inner = inner.push(
+                text(theme::ellipsize(b.name(), 24))
+                    .size(13.0)
+                    .color(theme::INK),
+            );
             row_elems = row_elems.push(
                 button(inner)
                     .padding([4, 10])
@@ -1321,12 +1329,12 @@ fn browser_history_selector(panel: &BrowserPanel) -> Element<'_, StartMessage> {
         return space().height(Length::Fixed(0.0)).into();
     }
     let current_title = session.title().unwrap_or_else(|| session.url()).to_string();
+    let header = if sel.back { "Back" } else { "Forward" };
     let mut list = column![
-        text(if sel.back {
-            format!("Back — {current_title}")
-        } else {
-            format!("Forward — {current_title}")
-        })
+        text(format!(
+            "{header} — {}",
+            theme::ellipsize(&current_title, 48)
+        ))
         .size(12.0)
         .color(theme::MUTED),
     ]
@@ -1344,8 +1352,12 @@ fn browser_history_selector(panel: &BrowserPanel) -> Element<'_, StartMessage> {
         }
         inner = inner.push(
             column![
-                text(title).size(13.0).color(theme::INK),
-                text(entry.url.clone()).size(11.0).color(theme::MUTED),
+                text(theme::ellipsize(&title, 48))
+                    .size(13.0)
+                    .color(theme::INK),
+                text(theme::ellipsize(&entry.url, 72))
+                    .size(11.0)
+                    .color(theme::MUTED),
             ]
             .spacing(0),
         );

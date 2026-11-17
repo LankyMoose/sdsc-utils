@@ -927,7 +927,8 @@ pub enum BumperSide {
 /// opened the selector (the old press-edge path, now release-timed so a
 /// hold can claim the press first). `Open` fires once when the hold
 /// threshold is crossed while still held; the later release carries no
-/// event (the App confirms the open selector on release instead).
+/// event (the open selector stays up for D-pad browsing; Cross confirms,
+/// Circle cancels).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BumperHoldEvent {
     Tap(BumperSide),

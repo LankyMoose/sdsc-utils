@@ -1020,3 +1020,52 @@ pub fn input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
         selection: alpha(ACCENT, 0.45),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Text truncation
+// ---------------------------------------------------------------------------
+
+/// Truncate `s` to at most `max_chars` characters (char-boundary safe),
+/// appending "…" when truncated. Strings that already fit pass through
+/// untouched; `max_chars == 0` yields "". Long page titles (and URLs)
+/// would otherwise stretch dropdown rows and the bookmark bar.
+pub fn ellipsize(s: impl AsRef<str>, max_chars: usize) -> String {
+    let s = s.as_ref();
+    if max_chars == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    // Reserve one cell for the ellipsis.
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ellipsize_passes_through_fitting_text() {
+        assert_eq!(ellipsize("", 10), "");
+        assert_eq!(ellipsize("short", 10), "short");
+        assert_eq!(ellipsize("exact", 5), "exact");
+    }
+
+    #[test]
+    fn ellipsize_truncates_with_ellipsis() {
+        assert_eq!(ellipsize("hello world", 6), "hello…");
+        assert_eq!(ellipsize("abcdef", 1), "…");
+        assert_eq!(ellipsize("anything", 0), "");
+    }
+
+    #[test]
+    fn ellipsize_respects_char_boundaries() {
+        // Emoji are multi-byte but single chars: never split one.
+        assert_eq!(ellipsize("a🎮bcd", 4), "a🎮b…");
+        assert_eq!(ellipsize("🎮🎮🎮", 3), "🎮🎮🎮");
+        assert_eq!(ellipsize("🎮🎮🎮", 2), "🎮…");
+    }
+}

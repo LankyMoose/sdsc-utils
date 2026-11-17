@@ -316,7 +316,10 @@ impl BrowserSession {
     /// Push a document onto the chronological session stack. New navigations
     /// from the middle truncate the forward tail (browser semantics);
     /// same-document fragment traffic only retargets the live entry.
-    /// Empty URLs never record.
+    /// Engine history travel lands via `UrlChanged` before the canonical
+    /// `HistoryChanged` overwrite: an exact adjacent match moves the index
+    /// instead of forking the stack (otherwise every Back would truncate
+    /// the forward tail and append a duplicate). Empty URLs never record.
     pub fn push_nav(&mut self, url: String) {
         if url.is_empty() {
             return;
@@ -329,6 +332,16 @@ impl BrowserSession {
             return;
         }
         if let Some(i) = self.nav_index {
+            if i > 0 && self.nav_stack.get(i - 1).is_some_and(|e| e.url == url) {
+                // Back travel (engine `go_back`): step onto the predecessor.
+                self.nav_index = Some(i - 1);
+                return;
+            }
+            if self.nav_stack.get(i + 1).is_some_and(|e| e.url == url) {
+                // Forward travel (engine `go_forward`): step onto the successor.
+                self.nav_index = Some(i + 1);
+                return;
+            }
             let keep = (i + 1).min(self.nav_stack.len());
             self.nav_stack.truncate(keep);
         } else {
@@ -901,6 +914,35 @@ mod tests {
         assert_eq!(s.nav_len(), 1);
         assert_eq!(s.nav_current(), Some(0));
         assert!(!s.can_go_back());
+    }
+
+    #[test]
+    fn nav_stack_engine_travel_moves_index_without_forking() {
+        let mut s = BrowserSession::default();
+        s.begin_load("https://a.test/".to_string());
+        s.begin_load("https://b.test/".to_string());
+        s.begin_load("https://c.test/".to_string());
+        // Engine Back lands via UrlChanged before HistoryChanged: the
+        // adjacent match steps the index (no truncate, no duplicate).
+        s.note_url("https://b.test/".to_string());
+        assert_eq!(s.nav_current(), Some(1));
+        assert_eq!(s.nav_len(), 3);
+        assert!(s.can_go_back());
+        assert!(s.can_go_forward());
+        // And forward again.
+        s.note_url("https://c.test/".to_string());
+        assert_eq!(s.nav_current(), Some(2));
+        assert_eq!(s.nav_len(), 3);
+        assert!(!s.can_go_forward());
+        // A genuinely new URL from the middle still truncates forward.
+        s.note_url("https://b.test/".to_string());
+        s.note_url("https://d.test/".to_string());
+        assert_eq!(s.nav_len(), 3);
+        assert_eq!(
+            s.nav_entry(2).map(|e| e.url.as_str()),
+            Some("https://d.test/")
+        );
+        assert!(!s.can_go_forward());
     }
 
     #[test]
