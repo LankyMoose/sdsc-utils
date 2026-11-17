@@ -115,6 +115,9 @@ impl App {
             StartMessage::BrowserOpenExternal => self.on_browser_open_external(),
             StartMessage::BrowserReload => self.on_browser_reload(),
             StartMessage::BrowserHome => self.on_browser_go_home(),
+            StartMessage::BrowserTabNew => self.on_browser_tab_new(),
+            StartMessage::BrowserTabSwitch(id) => self.on_browser_tab_switch(id),
+            StartMessage::BrowserTabClose(id) => self.on_browser_tab_close(id),
             StartMessage::BrowserShutdownEngine => self.on_browser_shutdown_engine(),
             StartMessage::BrowserBookmarkStar => self.on_browser_bookmark_star(),
             StartMessage::BrowserBookmarkNameChanged(draft) => {
@@ -509,6 +512,30 @@ impl App {
         self.on_browser_navigate()
     }
 
+    /// Active tab id for engine commands. The backend gates input to the
+    /// active tab; navigation/history apply per tab.
+    pub(crate) fn browser_tab(&self) -> crate::browser::engine::TabId {
+        self.start_state.browser.active_tab
+    }
+
+    /// Re-sync the pad cursor as the engine mouse for the live tab (after
+    /// resume, tab switch, or popup adopt — hover state went stale).
+    pub(crate) fn sync_live_mouse(&mut self) {
+        let tab = self.start_state.browser.active_tab;
+        let (qx, qy) = (
+            self.start_state.browser.cursor.x as i32,
+            self.start_state.browser.cursor.y as i32,
+        );
+        self.start_state.browser.last_sent_mouse = Some((qx, qy));
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::MouseMove {
+                tab,
+                x: qx as f32,
+                y: qy as f32,
+            });
+        }
+    }
+
     /// Resume a suspended engine under an open browser surface. Close
     /// suspends but keeps the cached page, so reopening Start (or the
     /// surface) resumes where it left off: un-suspend, re-show, and re-sync
@@ -521,16 +548,9 @@ impl App {
         if let Some(engine) = &self.engine {
             engine.send(EngineCommand::Resume);
             engine.send(EngineCommand::SetVisible { visible: true });
-            // Re-sync the mouse after suspension: hover state is stale.
-            engine.send(EngineCommand::MouseMove {
-                x: self.start_state.browser.cursor.x,
-                y: self.start_state.browser.cursor.y,
-            });
-            self.start_state.browser.last_sent_mouse = Some((
-                self.start_state.browser.cursor.x as i32,
-                self.start_state.browser.cursor.y as i32,
-            ));
         }
+        // Re-sync the mouse after suspension: hover state is stale.
+        self.sync_live_mouse();
         self.sync_browser_theme();
     }
 
@@ -589,7 +609,12 @@ impl App {
         crate::controller::hid::diag::diag_info("ui-diag: start browser navigate");
         if self.engine.is_some() {
             if let Some(engine) = &self.engine {
-                engine.send(EngineCommand::Navigate { url, generation });
+                let tab = self.browser_tab();
+                engine.send(EngineCommand::Navigate {
+                    tab,
+                    url,
+                    generation,
+                });
             }
             self.sync_browser_theme();
             return Task::none();
@@ -711,7 +736,11 @@ impl App {
             }
         }
         if let Some(engine) = &self.engine {
-            engine.send(EngineCommand::Key(browser_keys::map_event(&raw)));
+            let tab = self.browser_tab();
+            engine.send(EngineCommand::Key(crate::browser::engine::TabKey {
+                tab,
+                event: browser_keys::map_event(&raw),
+            }));
         }
         Task::none()
     }
@@ -742,14 +771,16 @@ impl App {
 
     pub(crate) fn on_browser_go_back(&mut self) -> Task<Message> {
         if let Some(engine) = &self.engine {
-            engine.send(EngineCommand::GoBack);
+            let tab = self.browser_tab();
+            engine.send(EngineCommand::GoBack { tab });
         }
         Task::none()
     }
 
     pub(crate) fn on_browser_go_forward(&mut self) -> Task<Message> {
         if let Some(engine) = &self.engine {
-            engine.send(EngineCommand::GoForward);
+            let tab = self.browser_tab();
+            engine.send(EngineCommand::GoForward { tab });
         }
         Task::none()
     }
@@ -1052,8 +1083,12 @@ impl App {
     /// (pad has no physical code or modifiers to carry).
     pub(crate) fn send_pad_keys(&mut self, key: keyboard_types::NamedKey) -> Task<Message> {
         if let Some(engine) = &self.engine {
+            let tab = self.browser_tab();
             for event in browser_keys::pad_key(key) {
-                engine.send(EngineCommand::Key(event));
+                engine.send(EngineCommand::Key(crate::browser::engine::TabKey {
+                    tab,
+                    event,
+                }));
             }
         }
         Task::none()
@@ -1102,6 +1137,7 @@ impl App {
                 self.start_state.browser.cursor.y,
             );
             engine.send(EngineCommand::ScrollBy {
+                tab: self.browser_tab(),
                 dx,
                 dy,
                 x: cx,
@@ -1149,6 +1185,7 @@ impl App {
             self.start_state.browser.last_sent_mouse = Some((qx, qy));
             if let Some(engine) = &self.engine {
                 engine.send(EngineCommand::MouseMove {
+                    tab: self.browser_tab(),
                     x: qx as f32,
                     y: qy as f32,
                 });
@@ -1204,7 +1241,12 @@ impl App {
         self.start_state.browser.last_click = Some(((x, y), Instant::now()));
         self.start_state.browser.action_hint = Some((label.to_string(), Instant::now()));
         if let Some(engine) = &self.engine {
-            engine.send(EngineCommand::ClickAt { x, y, target });
+            engine.send(EngineCommand::ClickAt {
+                tab: self.browser_tab(),
+                x,
+                y,
+                target,
+            });
         }
         Task::none()
     }
@@ -1254,7 +1296,9 @@ impl App {
         #[cfg(debug_assertions)]
         {
             if let Some(engine) = &self.engine {
-                engine.send(EngineCommand::ProbeEventLoop);
+                engine.send(EngineCommand::ProbeEventLoop {
+                    tab: self.browser_tab(),
+                });
             }
             self.shoot_browser_window(true)
         }
@@ -1343,6 +1387,182 @@ impl App {
         Task::none()
     }
 
+    /// Engine-created tab (popup `request_create_new`): the backend already
+    /// foregrounded the view — adopt it. Stash the live page, reset the
+    /// live slot, point the draft at the incoming navigation.
+    pub(crate) fn on_tab_opened(&mut self, tab: crate::browser::engine::TabId) -> Task<Message> {
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start browser tab opened tab{}",
+            tab.0
+        ));
+        {
+            let panel = &mut self.start_state.browser;
+            panel.stash_live();
+            panel.page = start_view::BrowserTabPage::default();
+            panel.page.session.open_surface();
+            panel.page.action_hint = Some(("New tab…".to_string(), std::time::Instant::now()));
+            panel.active_tab = tab;
+            if !panel.order.contains(&tab) {
+                panel.order.push(tab);
+            }
+            panel.draft.clear();
+        }
+        self.sync_live_mouse();
+        Task::none()
+    }
+
+    /// Engine reports a tab's page called `window.close()`: the view is
+    /// already gone backend-side — adopt the most recent survivor (or a
+    /// fresh home tab when none).
+    pub(crate) fn on_tab_closed(&mut self, tab: crate::browser::engine::TabId) -> Task<Message> {
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: start browser tab closed tab{}",
+            tab.0
+        ));
+        let active = self.start_state.browser.active_tab;
+        if tab != active {
+            self.start_state.browser.drop_stored(tab);
+            return Task::none();
+        }
+        // Active tab closed by its page: forget it, adopt a survivor.
+        self.start_state.browser.order.retain(|o| *o != tab);
+        let survivor = self.start_state.browser.order.pop();
+        match survivor {
+            Some(next) => {
+                let ok = self.start_state.browser.activate_stored(next);
+                debug_assert!(ok);
+                let url = self.start_state.browser.session.url().to_string();
+                self.start_state.browser.draft = url;
+                if let Some(engine) = &self.engine {
+                    engine.send(EngineCommand::SetActiveTab { tab: next });
+                }
+                self.sync_live_mouse();
+                self.sync_browser_theme();
+                Task::none()
+            }
+            None => self.reopen_home_tab(tab),
+        }
+    }
+
+    /// Fresh home tab reusing `tab` (backend dropped it): recreate the view
+    /// and navigate home. Tab-less engine has no boot path back, so the
+    /// last tab never truly closes.
+    fn reopen_home_tab(&mut self, tab: crate::browser::engine::TabId) -> Task<Message> {
+        {
+            let panel = &mut self.start_state.browser;
+            panel.page = start_view::BrowserTabPage::default();
+            panel.page.session.open_surface();
+            panel.active_tab = tab;
+            panel.order.push(tab);
+            panel.draft = crate::browser::BROWSER_HOME_URL.to_string();
+        }
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::OpenTab { tab });
+            engine.send(EngineCommand::SetActiveTab { tab });
+        }
+        self.on_browser_navigate()
+    }
+
+    /// User-opened tab (`+`): stash live, reset, create + foreground the
+    /// view, navigate home. Reader fallback (no engine) just goes home in
+    /// place — tabs need views.
+    pub(crate) fn on_browser_tab_new(&mut self) -> Task<Message> {
+        if self.engine.is_none() {
+            return self.on_browser_go_home();
+        }
+        let tab = {
+            let panel = &mut self.start_state.browser;
+            panel.stash_live();
+            panel.page = start_view::BrowserTabPage::default();
+            panel.page.session.open_surface();
+            let tab = crate::browser::engine::TabId(panel.next_tab_id);
+            panel.next_tab_id = panel.next_tab_id.wrapping_add(1).max(2);
+            panel.active_tab = tab;
+            panel.order.push(tab);
+            panel.draft = crate::browser::BROWSER_HOME_URL.to_string();
+            tab
+        };
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::OpenTab { tab });
+            engine.send(EngineCommand::SetActiveTab { tab });
+        }
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Nav);
+        self.on_browser_navigate()
+    }
+
+    /// User switches tab (strip click): swap the live page with the stored
+    /// one (order untouched), foreground the view, mirror the URL to the
+    /// draft, re-sync the mouse.
+    pub(crate) fn on_browser_tab_switch(
+        &mut self,
+        tab: crate::browser::engine::TabId,
+    ) -> Task<Message> {
+        if tab == self.start_state.browser.active_tab {
+            return Task::none();
+        }
+        if !self.start_state.browser.activate_stored(tab) {
+            return Task::none();
+        }
+        let url = self.start_state.browser.session.url().to_string();
+        self.start_state.browser.draft = url;
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Action);
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::SetActiveTab { tab });
+        }
+        self.sync_live_mouse();
+        self.sync_browser_theme();
+        Task::none()
+    }
+
+    /// User closes a tab (`×`): background tabs drop outright; closing the
+    /// active tab adopts the most recent survivor first. The last tab
+    /// resets to home instead of closing.
+    pub(crate) fn on_browser_tab_close(
+        &mut self,
+        tab: crate::browser::engine::TabId,
+    ) -> Task<Message> {
+        if tab != self.start_state.browser.active_tab {
+            self.start_state.browser.drop_stored(tab);
+            if let Some(engine) = &self.engine {
+                engine.send(EngineCommand::CloseTab { tab });
+            }
+            return Task::none();
+        }
+        // Active tab: survivors live in `stored`.
+        if self.start_state.browser.stored.is_empty() {
+            return self.on_browser_go_home();
+        }
+        let next = self
+            .start_state
+            .browser
+            .order
+            .iter()
+            .rev()
+            .find(|o| **o != tab)
+            .copied();
+        let Some(next) = next else {
+            return self.on_browser_go_home();
+        };
+        let ok = self.start_state.browser.activate_stored(next);
+        if !ok {
+            return self.on_browser_go_home();
+        }
+        self.start_state.browser.order.retain(|o| *o != tab);
+        let url = self.start_state.browser.session.url().to_string();
+        self.start_state.browser.draft = url;
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Action);
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::SetActiveTab { tab: next });
+            engine.send(EngineCommand::CloseTab { tab });
+        }
+        self.sync_live_mouse();
+        self.sync_browser_theme();
+        Task::none()
+    }
+
     /// Pad/keyboard body scroll for the reader browser (engine mode scrolls
     /// via [`Self::tick_browser_cursor`] instead). With engine
     /// pixels on screen the scroll goes to the engine (which repaints);
@@ -1355,6 +1575,7 @@ impl App {
                     self.start_state.browser.cursor.y,
                 );
                 engine.send(EngineCommand::ScrollBy {
+                    tab: self.browser_tab(),
                     dx: 0.0,
                     dy: delta,
                     x: cx,
@@ -1375,8 +1596,23 @@ impl App {
 
     /// Engine worker event. Deliberately no activity stamp: frames flow
     /// continuously while visible and must not defeat idle-dim.
+    ///
+    /// Tab routing: events for the active tab apply to the live page state;
+    /// background-tab events apply to the matching stored tab (the draft
+    /// mirrors the active tab only). Unknown (closed-race) ids are ignored.
     pub(crate) fn on_engine_event(&mut self, event: EngineEvent) -> Task<Message> {
         match event {
+            EngineEvent::TabOpened { tab } => return self.on_tab_opened(tab),
+            EngineEvent::TabClosed { tab } => return self.on_tab_closed(tab),
+            _ => {}
+        }
+        let tab = event.tab().expect("tab-carrying event checked above");
+        if tab != self.start_state.browser.active_tab {
+            self.route_background_event(tab, event);
+            return Task::none();
+        }
+        match event {
+            EngineEvent::TabOpened { .. } | EngineEvent::TabClosed { .. } => {}
             EngineEvent::Frame(frame) => {
                 if !self.start_state.browser.session.is_open() {
                     return Task::none();
@@ -1389,10 +1625,10 @@ impl App {
                 #[cfg(debug_assertions)]
                 return shot;
             }
-            EngineEvent::TitleChanged { title } => {
+            EngineEvent::TitleChanged { tab: _, title } => {
                 self.start_state.browser.session.note_title(title);
             }
-            EngineEvent::UrlChanged { url } => {
+            EngineEvent::UrlChanged { tab: _, url } => {
                 self.start_state.browser.session.note_url(url.clone());
                 self.start_state.browser.draft = url;
                 // A new document underneath invalidates the selector's
@@ -1400,6 +1636,7 @@ impl App {
                 self.start_state.browser.history_selector = None;
             }
             EngineEvent::FaviconChanged {
+                tab: _,
                 url,
                 width,
                 height,
@@ -1412,12 +1649,11 @@ impl App {
                 ));
                 self.start_state.browser.note_favicon(url, handle);
             }
-            EngineEvent::A11yTree(items) => {
-                self.start_state.browser.focusables = items;
-                self.start_state
-                    .browser
-                    .cursor
-                    .retarget(&self.start_state.browser.focusables);
+            EngineEvent::A11yTree { tab: _, items } => {
+                let panel = &mut self.start_state.browser;
+                panel.page.focusables = items;
+                let (cursor, focusables) = (&mut panel.page.cursor, &panel.page.focusables);
+                cursor.retarget(focusables);
                 // Parked page-focus target: dock when it resolves live; drop
                 // after one tree if it never does (culled targets never
                 // dock). A mid-flight jump keeps the target parked.
@@ -1433,33 +1669,45 @@ impl App {
                     self.try_dock_focused(id);
                 }
             }
-            EngineEvent::ScrollOffset { x, y } => {
+            EngineEvent::ScrollOffset { tab: _, x, y } => {
                 self.start_state.browser.scroll_offset = (x, y);
             }
-            EngineEvent::ActivityChanged { phase } => {
+            EngineEvent::ActivityChanged { tab: _, phase } => {
                 self.start_state.browser.engine_activity = phase;
             }
-            EngineEvent::HistoryChanged { entries, current } => {
+            EngineEvent::HistoryChanged {
+                tab: _,
+                entries,
+                current,
+            } => {
                 self.start_state
                     .browser
                     .session
                     .note_session_history(entries, current);
                 // The stack moved under an open selector: clamp the highlight,
                 // close if the direction ran dry.
-                if let Some(sel) = self.start_state.browser.history_selector.as_mut() {
-                    let len = if sel.back {
-                        self.start_state.browser.session.back_entries().len()
+                let dir_is_back = self
+                    .start_state
+                    .browser
+                    .page
+                    .history_selector
+                    .as_ref()
+                    .map(|sel| sel.back);
+                if let Some(back) = dir_is_back {
+                    let panel = &mut self.start_state.browser;
+                    let len = if back {
+                        panel.session.back_entries().len()
                     } else {
-                        self.start_state.browser.session.forward_entries().len()
+                        panel.session.forward_entries().len()
                     };
                     if len == 0 {
-                        self.start_state.browser.history_selector = None;
-                    } else {
+                        panel.history_selector = None;
+                    } else if let Some(sel) = panel.history_selector.as_mut() {
                         sel.clamp(len);
                     }
                 }
             }
-            EngineEvent::FocusChanged { id } => {
+            EngineEvent::FocusChanged { tab: _, id } => {
                 // Magnet off means never dock — drop any parked target too.
                 if !self.start_state.browser.cursor.magnet {
                     self.start_state.browser.pending_focus = None;
@@ -1471,7 +1719,11 @@ impl App {
                     self.start_state.browser.pending_focus = None;
                 }
             }
-            EngineEvent::LoadFinished { generation, result } => match result {
+            EngineEvent::LoadFinished {
+                tab: _,
+                generation,
+                result,
+            } => match result {
                 Ok(()) => {
                     self.start_state.browser.session.mark_loaded(generation);
                 }
@@ -1484,6 +1736,66 @@ impl App {
             },
         }
         Task::none()
+    }
+
+    /// Background-tab event: same per-tab state updates as the live path,
+    /// but never touches chrome (draft, selector UI, docking). Favicons are
+    /// the exception — the cache is shared by origin across tabs.
+    fn route_background_event(&mut self, tab: crate::browser::engine::TabId, event: EngineEvent) {
+        let Some(stored) = self.start_state.browser.stored_mut(tab) else {
+            return;
+        };
+        match event {
+            EngineEvent::TitleChanged { title, .. } => {
+                stored.page.session.note_title(title);
+            }
+            EngineEvent::UrlChanged { url, .. } => {
+                stored.page.session.note_url(url);
+            }
+            EngineEvent::FaviconChanged {
+                url,
+                width,
+                height,
+                rgba,
+                ..
+            } => {
+                let handle = iced::widget::image::Handle::from_rgba(width, height, rgba);
+                self.start_state.browser.note_favicon(url, handle);
+            }
+            EngineEvent::A11yTree { items, .. } => {
+                stored.page.focusables = items;
+                let (cursor, focusables) = (&mut stored.page.cursor, &stored.page.focusables);
+                cursor.retarget(focusables);
+            }
+            EngineEvent::ScrollOffset { x, y, .. } => {
+                stored.page.scroll_offset = (x, y);
+            }
+            EngineEvent::ActivityChanged { phase, .. } => {
+                stored.page.engine_activity = phase;
+            }
+            EngineEvent::HistoryChanged {
+                entries, current, ..
+            } => {
+                stored.page.session.note_session_history(entries, current);
+            }
+            EngineEvent::FocusChanged { id, .. } => {
+                // Docked when foregrounded (if still live then).
+                stored.page.pending_focus = Some(id);
+            }
+            EngineEvent::LoadFinished {
+                generation, result, ..
+            } => match result {
+                Ok(()) => {
+                    stored.page.session.mark_loaded(generation);
+                }
+                Err(err) => {
+                    stored.page.session.apply_failed(generation, err);
+                }
+            },
+            EngineEvent::Frame(_)
+            | EngineEvent::TabOpened { .. }
+            | EngineEvent::TabClosed { .. } => {}
+        }
     }
 }
 

@@ -25,9 +25,10 @@ use embedder_traits::{
 use euclid::{Box2D, Point2D};
 
 use servo::{
-    DevicePixel, DevicePoint, DeviceVector2D, EventLoopWaker, LoadStatus, Opts, RenderingContext,
-    Scroll, ServoBuilder, SoftwareRenderingContext, UserContentManager, UserScript, WebView,
-    WebViewBuilder, WebViewDelegate, WebViewPoint, WebViewVector,
+    CreateNewWebViewRequest, DevicePixel, DevicePoint, DeviceVector2D, EventLoopWaker, LoadStatus,
+    Opts, RenderingContext, Scroll, Servo, ServoBuilder, SoftwareRenderingContext,
+    UserContentManager, UserScript, WebView, WebViewBuilder, WebViewDelegate, WebViewId,
+    WebViewPoint, WebViewVector,
 };
 
 use crate::browser::cursor::{FocusKind, Focusable};
@@ -35,7 +36,9 @@ use crate::browser::dom::{
     DOM_DIRTY_MARKER, DOM_INSTALL_JS, DOM_PING_URL, PROBE_ARM_JS, PROBE_READ_JS, dom_boot_js,
     dom_kind, dom_query_js, parse_dom_snapshot, parse_loop_probe,
 };
-use crate::browser::engine::{EngineActivity, EngineCommand, EngineEvent, EngineHandle, PageFrame};
+use crate::browser::engine::{
+    EngineActivity, EngineCommand, EngineEvent, EngineHandle, TabFrame, TabId, TabKey,
+};
 
 /// Fixed offscreen viewport (phase 1; the iced image scales to the card).
 const VIEWPORT_WIDTH: u32 = 800;
@@ -63,17 +66,21 @@ impl EventLoopWaker for ThreadWaker {
     }
 }
 
-struct Shared {
-    ctx: Rc<SoftwareRenderingContext>,
-    size: (u32, u32),
+/// Per-tab worker state. Every Servo type here is `!Send` by design, so all
+/// of Servo lives on this one thread for the process lifetime — the same
+/// ownership shape as the HID worker (blocking I/O off the UI executor) and
+/// the art worker. One [`TabState`] per tab; the truly global pieces (GL
+/// context, size, visibility, suspension, the active tab) live in
+/// [`Global`]. The iced shell talks in [`EngineCommand`]s and receives
+/// [`EngineEvent`]s; nothing Servo ever touches the UI thread.
+struct TabState {
+    /// Which tab this state belongs to (stamped on every emitted event).
+    tab: TabId,
     handle: EngineHandle,
     generation: u64,
     load_started_at: Option<Instant>,
-    logged_first_frame: bool,
     /// Last list sent to the UI (diffed to avoid spamming identical trees).
     last_emitted: Vec<Focusable>,
-    visible: bool,
-    suspended: bool,
     /// Commanded scroll offset, page pixels. Servo reports document-relative
     /// bounds and never re-emits them on scroll, so the backend translates
     /// to viewport space at emit time. Reset on fresh navigate and on
@@ -183,29 +190,146 @@ struct Shared {
     storage_probe_rx: Option<mpsc::Receiver<Result<JSValue, String>>>,
 }
 
+impl TabState {
+    /// Fresh per-tab state: a new document boot is pending (the install +
+    /// snapshot round-trip fires on the first pull), matching what a fresh
+    /// `Navigate` used to set up via `clear_tree`.
+    fn fresh(tab: TabId, handle: EngineHandle, ax_debug: bool) -> Self {
+        let (dom_tx, dom_rx) = mpsc::channel();
+        Self {
+            tab,
+            handle,
+            generation: 0,
+            load_started_at: None,
+            last_emitted: Vec::new(),
+            scroll: (0.0, 0.0),
+            scroll_max: (0.0, 0.0),
+            next_id: 0,
+            dom: HashMap::new(),
+            dom_uid: HashMap::new(),
+            dom_seq: 0,
+            last_focus: None,
+            activity: EngineActivity::Idle,
+            dom_boot: true,
+            dom_ping: false,
+            dom_dirty: false,
+            dom_dirty_at: None,
+            dom_in_flight: false,
+            dom_in_flight_at: None,
+            dom_tx,
+            dom_rx: Some(dom_rx),
+            dom_epoch: 0,
+            ping_at: None,
+            spin_seq: 0,
+            pending_click_up: None,
+            last_pull_at: None,
+            last_pull_rtt_ms: 0,
+            last_mouse: None,
+            last_cull_center: None,
+            pending_inputs: VecDeque::with_capacity(64),
+            probe_armed_at: None,
+            probe_rx: None,
+            probe_deadline: None,
+            last_sent_scroll: (0.0, 0.0),
+            content: None,
+            last_url: None,
+            last_full_url: String::new(),
+            ax_debug,
+            #[cfg(debug_assertions)]
+            storage_probe_pending: false,
+            #[cfg(debug_assertions)]
+            storage_probe_rx: None,
+        }
+    }
+}
+
+/// Worker-global state: everything shared across tabs. One GL context, one
+/// size, one suspension/visibility pair for the whole engine; per-tab
+/// everything else. Follows the servoshell shape (one shared delegate +
+/// context, one `WebView` per tab), minus its windowing.
+struct Global {
+    ctx: Rc<SoftwareRenderingContext>,
+    size: (u32, u32),
+    handle: EngineHandle,
+    user_content: Rc<UserContentManager>,
+    visible: bool,
+    suspended: bool,
+    /// Tab whose frames/DOM/input are live. All delegate paint/emit/input
+    /// gating keys off this.
+    active: TabId,
+    /// Engine-owned tab ids count down from [`TabId::ENGINE_TOP`] (popups);
+    /// UI-owned ids count up from [`TabId::BOOT`]. Disjoint, no handshake.
+    engine_next: u64,
+    tabs: HashMap<TabId, TabEntry>,
+    by_view: HashMap<WebViewId, TabId>,
+    logged_first_frame: bool,
+    ax_debug: bool,
+    /// Shared delegate handle for engine-side tab builds (`OpenTab` can't
+    /// reach a parent view; popups use their parent's instead). Set once at
+    /// boot — the `Delegate` needs the `Global` to exist first.
+    delegate_source: Option<Rc<dyn WebViewDelegate>>,
+}
+
+/// One tab's view handle plus its state. Dropping the `WebView` closes the
+/// view (`CloseWebView`), so `CloseTab`/`notify_closed` just remove the
+/// entry and drop.
+#[derive(Clone)]
+struct TabEntry {
+    webview: WebView,
+    state: Rc<RefCell<TabState>>,
+}
+
 struct Delegate {
-    shared: Rc<RefCell<Shared>>,
+    global: Rc<RefCell<Global>>,
+}
+
+impl Delegate {
+    /// Resolve a delegate callback's originating view to its tab. `None`
+    /// for closed-race views (their handle is gone from the maps).
+    fn entry_for(&self, webview: &WebView) -> Option<TabEntry> {
+        let global = self.global.borrow();
+        let tab = global.by_view.get(&webview.id()).copied()?;
+        global.tabs.get(&tab).cloned()
+    }
 }
 
 impl WebViewDelegate for Delegate {
     fn notify_new_frame_ready(&self, webview: WebView) {
-        webview.paint();
-        let mut shared = self.shared.borrow_mut();
-        if shared.suspended {
+        // Active tab only: background tabs never paint (their frames would
+        // read over the active tab's back buffer on the shared context).
+        // Suspended/hidden: no frames at all, same as the old single-view
+        // gate.
+        let entry = {
+            let global = self.global.borrow();
+            if global.suspended || !global.visible {
+                return;
+            }
+            let tab = match global.by_view.get(&webview.id()).copied() {
+                Some(tab) if tab == global.active => tab,
+                _ => return,
+            };
+            global.tabs.get(&tab).cloned()
+        };
+        let Some(entry) = entry else {
             return;
-        }
-        let (w, h) = shared.size;
+        };
+        webview.paint();
+        let (w, h) = self.global.borrow().size;
         let rect: Box2D<i32, DevicePixel> =
             Box2D::new(Point2D::new(0, 0), Point2D::new(w as i32, h as i32));
-        if let Some(img) = shared.ctx.read_to_image(rect) {
+        let ctx = self.global.borrow().ctx.clone();
+        if let Some(img) = ctx.read_to_image(rect) {
             let (w, h) = (img.width(), img.height());
-            if !shared.logged_first_frame {
-                shared.logged_first_frame = true;
+            let mut global = self.global.borrow_mut();
+            if !global.logged_first_frame {
+                global.logged_first_frame = true;
                 crate::platform::app_log::info(format!(
                     "servo-engine: first frame {w}x{h}, worker live"
                 ));
             }
-            shared.handle.emit(EngineEvent::Frame(PageFrame {
+            let tab = entry.state.borrow().tab;
+            global.handle.emit(EngineEvent::Frame(TabFrame {
+                tab,
                 width: w,
                 height: h,
                 rgba: img.into_raw(),
@@ -213,18 +337,72 @@ impl WebViewDelegate for Delegate {
         }
     }
 
-    fn notify_url_changed(&self, _webview: WebView, url: url::Url) {
+    /// Popup `request_create_new` (`window.open()`, `target=_blank`): build
+    /// the auxiliary view on the shared context (servoshell shape) and
+    /// foreground it at once — a single-view product has no background-tab
+    /// concept, and dropping the request is exactly the dead-click bug.
+    fn request_create_new(&self, parent_webview: WebView, request: CreateNewWebViewRequest) {
+        let mut global = self.global.borrow_mut();
+        let tab = TabId(global.engine_next);
+        global.engine_next = global.engine_next.wrapping_sub(1);
+        let ctx = global.ctx.clone();
+        let user_content = global.user_content.clone();
+        let delegate: Rc<dyn WebViewDelegate> = parent_webview.delegate();
+        let webview = request
+            .builder(ctx)
+            .user_content_manager(user_content)
+            .delegate(delegate)
+            .build();
+        // New tab takes the stage: hide + unfocus the old active view, show
+        // the new one. UI adopts on `TabOpened` (stash live, reset, set
+        // active) — no `SetActiveTab` round-trip needed.
+        let old_active = global.active;
+        if let Some(old) = global.tabs.get(&old_active).cloned() {
+            old.webview.hide();
+            old.webview.set_focused(false);
+        }
+        webview.show();
+        webview.set_focused(global.visible && !global.suspended);
+        let view_id = webview.id();
+        crate::platform::app_log::info(format!(
+            "servo-engine: request_create_new -> tab{} view{view_id:?}",
+            tab.0
+        ));
+        global.by_view.insert(view_id, tab);
+        let tab_handle = global.handle.clone();
+        let tab_ax = global.ax_debug;
+        global.tabs.insert(
+            tab,
+            TabEntry {
+                webview,
+                state: Rc::new(RefCell::new(TabState::fresh(tab, tab_handle, tab_ax))),
+            },
+        );
+        global.active = tab;
+        global.handle.emit(EngineEvent::TabOpened { tab });
+    }
+
+    fn notify_url_changed(&self, webview: WebView, url: url::Url) {
+        let Some(entry) = self.entry_for(&webview) else {
+            return;
+        };
         // NOTE: deliberately does not touch `last_url` — history comparison
         // owns document identity, and url-changed fires first on
         // client-side navigations. Updating here would pre-empt the clear.
         // The full URL is safe to track (favicon identity only).
-        self.shared.borrow_mut().last_full_url = url.to_string();
-        self.shared.borrow().handle.emit(EngineEvent::UrlChanged {
+        let mut state = entry.state.borrow_mut();
+        state.last_full_url = url.to_string();
+        let tab = state.tab;
+        state.handle.emit(EngineEvent::UrlChanged {
+            tab,
             url: url.to_string(),
         });
     }
 
-    fn notify_history_changed(&self, _webview: WebView, entries: Vec<url::Url>, current: usize) {
+    fn notify_history_changed(&self, webview: WebView, entries: Vec<url::Url>, current: usize) {
+        let Some(entry) = self.entry_for(&webview) else {
+            return;
+        };
         // Client-side navigation (link click, redirect, form submit, JS):
         // a new document arrives through no EngineCommand. Same-document
         // traffic (fragments) keeps the tree; anything else clears it.
@@ -232,26 +410,36 @@ impl WebViewDelegate for Delegate {
             return;
         };
         let urls: Vec<String> = entries.iter().map(|u| u.as_str().to_string()).collect();
-        let mut shared = self.shared.borrow_mut();
+        let mut state = entry.state.borrow_mut();
         let key = doc_key(url.as_str());
-        if shared.last_url.as_deref() == Some(key) {
+        if state.last_url.as_deref() == Some(key) {
             return;
         }
         crate::platform::app_log::info(format!("servo-engine: history cleared for {key}"));
-        shared.last_url = Some(key.to_string());
-        shared.last_full_url = url.as_str().to_string();
-        clear_tree(&mut shared);
-        shared.handle.emit(EngineEvent::HistoryChanged {
+        state.last_url = Some(key.to_string());
+        state.last_full_url = url.as_str().to_string();
+        clear_tree(&mut state);
+        let tab = state.tab;
+        let handle = state.handle.clone();
+        drop(state);
+        handle.emit(EngineEvent::HistoryChanged {
+            tab,
             entries: urls,
             current,
         });
     }
 
     fn notify_favicon_changed(&self, webview: WebView) {
+        let Some(entry) = self.entry_for(&webview) else {
+            return;
+        };
         // Servo parses `<link rel=icon>` out of band; the frame rides along
         // on the webview. Keyed by full URL for the bookmark/history caches.
-        let shared = self.shared.borrow();
-        let url = shared.last_full_url.clone();
+        let state = entry.state.borrow();
+        let url = state.last_full_url.clone();
+        let tab = state.tab;
+        let handle = state.handle.clone();
+        drop(state);
         let Some(icon) = webview.favicon() else {
             return;
         };
@@ -261,7 +449,8 @@ impl WebViewDelegate for Delegate {
         let Some((width, height, rgba)) = favicon_rgba(&icon) else {
             return;
         };
-        shared.handle.emit(EngineEvent::FaviconChanged {
+        handle.emit(EngineEvent::FaviconChanged {
+            tab,
             url,
             width,
             height,
@@ -269,45 +458,57 @@ impl WebViewDelegate for Delegate {
         });
     }
 
-    fn notify_page_title_changed(&self, _webview: WebView, title: Option<String>) {
-        self.shared
-            .borrow()
-            .handle
-            .emit(EngineEvent::TitleChanged { title });
+    fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
+        let Some(entry) = self.entry_for(&webview) else {
+            return;
+        };
+        let state = entry.state.borrow();
+        let tab = state.tab;
+        state.handle.emit(EngineEvent::TitleChanged { tab, title });
     }
 
-    fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
-        let mut shared = self.shared.borrow_mut();
+    fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
+        let Some(entry) = self.entry_for(&webview) else {
+            return;
+        };
+        let mut state = entry.state.borrow_mut();
         match status {
             LoadStatus::Started | LoadStatus::HeadParsed => {
                 crate::platform::app_log::info(format!(
                     "servo-engine: load {status:?} url={}",
-                    shared.last_url.as_deref().unwrap_or("?"),
+                    state.last_url.as_deref().unwrap_or("?"),
                 ));
-                set_activity(&mut shared, EngineActivity::Loading);
+                // Engine-created tabs never go through `Navigate`, so arm the
+                // load-timeout clock here when nothing set it yet.
+                if state.load_started_at.is_none() {
+                    state.load_started_at = Some(Instant::now());
+                }
+                set_activity(&mut state, EngineActivity::Loading);
             }
             LoadStatus::Complete => {
-                if let Some(started) = shared.load_started_at {
+                if let Some(started) = state.load_started_at {
                     crate::platform::app_log::info(format!(
                         "servo-engine: load Complete in {}ms",
                         started.elapsed().as_millis()
                     ));
                 }
-                shared.load_started_at = None;
+                state.load_started_at = None;
                 // Fresh document settling in: boot (idempotent install +
                 // snapshot) once rendering lands. New load, new verdicts.
                 // Content arrived; now the DOM observers install.
-                shared.dom_boot = true;
-                shared.dom_epoch = shared.dom_epoch.wrapping_add(1);
-                set_activity(&mut shared, EngineActivity::Initializing);
+                state.dom_boot = true;
+                state.dom_epoch = state.dom_epoch.wrapping_add(1);
+                set_activity(&mut state, EngineActivity::Initializing);
                 // Debug-only storage spike diagnostic: one in-page
                 // localStorage/sessionStorage/cookie census per document.
                 #[cfg(debug_assertions)]
                 {
-                    shared.storage_probe_pending = true;
+                    state.storage_probe_pending = true;
                 }
-                let generation = shared.generation;
-                shared.handle.emit(EngineEvent::LoadFinished {
+                let generation = state.generation;
+                let tab = state.tab;
+                state.handle.emit(EngineEvent::LoadFinished {
+                    tab,
                     generation,
                     result: Ok(()),
                 });
@@ -316,10 +517,12 @@ impl WebViewDelegate for Delegate {
                 // Failed/stopped loads previously sat silent until the 30s
                 // timeout misreported them. Surface immediately.
                 crate::platform::app_log::warn("servo-engine: load stopped before complete");
-                shared.load_started_at = None;
-                set_activity(&mut shared, EngineActivity::Idle);
-                let generation = shared.generation;
-                shared.handle.emit(EngineEvent::LoadFinished {
+                state.load_started_at = None;
+                set_activity(&mut state, EngineActivity::Idle);
+                let generation = state.generation;
+                let tab = state.tab;
+                state.handle.emit(EngineEvent::LoadFinished {
+                    tab,
                     generation,
                     result: Err("load stopped before complete".to_string()),
                 });
@@ -327,7 +530,7 @@ impl WebViewDelegate for Delegate {
         }
     }
 
-    fn notify_crashed(&self, _webview: WebView, reason: String, backtrace: Option<String>) {
+    fn notify_crashed(&self, webview: WebView, reason: String, backtrace: Option<String>) {
         crate::platform::app_log::warn(format!(
             "servo-engine: crashed reason={reason} backtrace={}",
             backtrace
@@ -336,22 +539,48 @@ impl WebViewDelegate for Delegate {
                 .take(500)
                 .collect::<String>()
         ));
-        let mut shared = self.shared.borrow_mut();
-        shared.load_started_at = None;
-        let generation = shared.generation;
-        shared.handle.emit(EngineEvent::LoadFinished {
+        let Some(entry) = self.entry_for(&webview) else {
+            return;
+        };
+        let mut state = entry.state.borrow_mut();
+        state.load_started_at = None;
+        let generation = state.generation;
+        let tab = state.tab;
+        state.handle.emit(EngineEvent::LoadFinished {
+            tab,
             generation,
             result: Err(format!("page crashed: {reason}")),
         });
     }
 
-    fn load_web_resource(&self, _webview: WebView, load: servo::WebResourceLoad) {
+    /// A tab's page called `window.close()`: drop the view (its `Drop`
+    /// closes it constellation-side) and tell the UI to adopt a neighbor.
+    fn notify_closed(&self, webview: WebView) {
+        let tab = {
+            let mut global = self.global.borrow_mut();
+            let Some(tab) = global.by_view.remove(&webview.id()) else {
+                return;
+            };
+            global.tabs.remove(&tab);
+            crate::platform::app_log::info(format!("servo-engine: tab{} closed by page", tab.0));
+            tab
+        };
+        self.global
+            .borrow()
+            .handle
+            .emit(EngineEvent::TabClosed { tab });
+    }
+
+    fn load_web_resource(&self, webview: WebView, load: servo::WebResourceLoad) {
         // Dirty-ping channel: the in-page ping POSTs to the marker URL.
         // Intercept with an empty 200 before anything leaves the machine.
         let url = load.request().url.to_string();
         if !url.contains(DOM_DIRTY_MARKER) {
             return;
         }
+        let Some(entry) = self.entry_for(&webview) else {
+            return;
+        };
         // Mutation pings invalidate the cached per-element visibility
         // verdicts only when attributes changed (`ma`: class/style/hidden
         // flips can hide whole subtrees). Structural pings (`mc`:
@@ -360,19 +589,19 @@ impl WebViewDelegate for Delegate {
         // compute fresh. Unknown tags (incl. pre-taxonomy `mo`) bump:
         // safe default.
         {
-            let mut state = self.shared.borrow_mut();
+            let mut state = entry.state.borrow_mut();
             state.ping_at = Some(Instant::now());
             if !(url.contains("ev=sc") || url.contains("ev=mc")) {
                 state.dom_epoch = state.dom_epoch.wrapping_add(1);
             }
         }
-        mark_dom_dirty(&self.shared);
+        mark_dom_dirty(&entry.state);
         // Window truth rides on the ping query: a nested-container scroll
         // leaves window.scroll unchanged, so correcting to it here instantly
         // reverts any commanded accumulation the inner scroller absorbed —
         // outlines stop tracking a scroll the page never made.
         if let Some(truth) = parse_ping_scroll(&url) {
-            let mut state = self.shared.borrow_mut();
+            let mut state = entry.state.borrow_mut();
             note_scroll_truth(&mut state.scroll_max, truth);
             rebase_scroll(&mut state, truth);
         }
@@ -385,7 +614,7 @@ impl WebViewDelegate for Delegate {
 
     fn notify_input_event_handled(
         &self,
-        _webview: WebView,
+        webview: WebView,
         event_id: InputEventId,
         result: InputEventResult,
     ) {
@@ -395,15 +624,18 @@ impl WebViewDelegate for Delegate {
         // is the tell for jsaction-style links: the page ate the event
         // (killing native activation) and its JS never followed through.
         // Moves log only on failure (pad-tick rate would spam).
-        let mut shared = self.shared.borrow_mut();
-        let pos = shared
+        let Some(entry) = self.entry_for(&webview) else {
+            return;
+        };
+        let mut state = entry.state.borrow_mut();
+        let pos = state
             .pending_inputs
             .iter()
             .position(|(id, _, _)| *id == event_id);
         let Some(idx) = pos else {
             return;
         };
-        let (_, kind, sent_at) = shared.pending_inputs.remove(idx).unwrap();
+        let (_, kind, sent_at) = state.pending_inputs.remove(idx).unwrap();
         let failed = result.contains(InputEventResult::DispatchFailed);
         let consumed = result.contains(InputEventResult::Consumed);
         let prevented = result.contains(InputEventResult::DefaultPrevented);
@@ -419,14 +651,14 @@ impl WebViewDelegate for Delegate {
         }
         // Entries older than 5s with no outcome: the input pipeline
         // swallowed an event — the stall signature.
-        while let Some((_, kind, at)) = shared.pending_inputs.front() {
+        while let Some((_, kind, at)) = state.pending_inputs.front() {
             if at.elapsed() < Duration::from_secs(5) {
                 break;
             }
             crate::platform::app_log::warn(format!(
                 "servo-input: {kind} swallowed (no outcome in 5s)"
             ));
-            shared.pending_inputs.pop_front();
+            state.pending_inputs.pop_front();
         }
     }
 
@@ -443,7 +675,7 @@ impl WebViewDelegate for Delegate {
 
 /// Mark the DOM set dirty from a fetch ping. Logs only on the
 /// clean→dirty transition so animation bursts don't spam.
-fn mark_dom_dirty(shared: &Rc<RefCell<Shared>>) {
+fn mark_dom_dirty(shared: &Rc<RefCell<TabState>>) {
     let mut state = shared.borrow_mut();
     if !state.dom_dirty {
         crate::platform::app_log::info("servo-dom: dirty via B");
@@ -496,7 +728,7 @@ const DOM_MAX_TARGETS: usize = 3000;
 /// Collect snap targets from the live DOM set, plus the document extent
 /// (max far corner over every target) for scroll clamping. Sorted by
 /// numeric id so diffing is stable.
-fn collect_focusables(shared: &mut Shared) -> (Vec<Focusable>, (f32, f32)) {
+fn collect_focusables(shared: &mut TabState) -> (Vec<Focusable>, (f32, f32)) {
     let mut out = Vec::with_capacity(shared.dom.len());
     let mut extent = (0.0f32, 0.0f32);
     for (jsid, entry) in shared.dom.iter() {
@@ -617,73 +849,67 @@ fn run(
     // shutdown/storage logs go nowhere, which once hid a cookie-flush
     // failure behind a successful-looking ack. Harmless when unset.
     servo.setup_logging();
-    let (dom_tx, dom_rx) = mpsc::channel();
-    let shared = Rc::new(RefCell::new(Shared {
+    let ax_debug = std::env::var("SDSC_AX_DEBUG").is_ok();
+    let delegate_global: Rc<RefCell<Global>> = Rc::new(RefCell::new(Global {
         ctx: ctx.clone(),
         size: (VIEWPORT_WIDTH, VIEWPORT_HEIGHT),
         handle,
-        generation: 0,
-        load_started_at: None,
-        logged_first_frame: false,
-        last_emitted: Vec::new(),
+        user_content: Rc::new(UserContentManager::new(&servo)),
         visible: false,
         suspended: true,
-        scroll: (0.0, 0.0),
-        scroll_max: (0.0, 0.0),
-        last_sent_scroll: (0.0, 0.0),
-        next_id: 0,
-        dom: HashMap::new(),
-        dom_uid: HashMap::new(),
-        dom_seq: 0,
-        dom_boot: true,
-        dom_ping: false,
-        dom_dirty: false,
-        dom_dirty_at: None,
-        dom_in_flight: false,
-        dom_in_flight_at: None,
-        dom_tx,
-        dom_rx: Some(dom_rx),
-        dom_epoch: 0,
-        ping_at: None,
-        #[cfg(debug_assertions)]
-        storage_probe_pending: false,
-        #[cfg(debug_assertions)]
-        storage_probe_rx: None,
-        spin_seq: 0,
-        pending_click_up: None,
-        last_pull_at: None,
-        last_pull_rtt_ms: 0,
-        last_mouse: None,
-        last_cull_center: None,
-        pending_inputs: VecDeque::with_capacity(64),
-        probe_armed_at: None,
-        probe_rx: None,
-        probe_deadline: None,
-        content: None,
-        last_url: None,
-        last_full_url: String::new(),
-        last_focus: None,
-        activity: EngineActivity::Idle,
-        ax_debug: std::env::var("SDSC_AX_DEBUG").is_ok(),
+        active: TabId::BOOT,
+        engine_next: TabId::ENGINE_TOP,
+        tabs: HashMap::new(),
+        by_view: HashMap::new(),
+        logged_first_frame: false,
+        ax_debug,
+        delegate_source: None,
     }));
     // Auto-install the DOM observers into every document (fresh loads,
     // history travel, reloads): no per-document injection timing on our
-    // side. The evaluate-boot path below stays as backup.
-    let user_content = Rc::new(UserContentManager::new(&servo));
-    user_content.add_script(Rc::new(UserScript::new(DOM_INSTALL_JS.to_string(), None)));
+    // side. The evaluate-boot path below stays as backup. One manager for
+    // all tabs (Servo shares it across views by design).
+    delegate_global
+        .borrow()
+        .user_content
+        .add_script(Rc::new(UserScript::new(DOM_INSTALL_JS.to_string(), None)));
     // Boot straight onto the home page: without an initial URL Servo opens
     // about:blank, which would pollute history (and cost a throwaway load)
     // before the first real navigate. Falls back to blank if unparseable
     // (hardcoded constant — cannot happen, but never panic the worker).
+    let user_content = delegate_global.borrow().user_content.clone();
+    let delegate = Rc::new(Delegate {
+        global: delegate_global.clone(),
+    });
+    delegate_global.borrow_mut().delegate_source = Some(delegate.clone());
     let mut builder = WebViewBuilder::new(&servo, ctx.clone())
         .user_content_manager(user_content)
-        .delegate(Rc::new(Delegate {
-            shared: shared.clone(),
-        }));
+        .delegate(delegate);
     if let Ok(home) = url::Url::parse(crate::browser::BROWSER_HOME_URL) {
         builder = builder.url(home);
     }
-    let webview = builder.build();
+    let boot_view = builder.build();
+    boot_view.hide();
+    boot_view.set_focused(false);
+    {
+        let mut global = delegate_global.borrow_mut();
+        let view_id = boot_view.id();
+        let tab_handle = global.handle.clone();
+        let tab_ax = global.ax_debug;
+        global.by_view.insert(view_id, TabId::BOOT);
+        global.tabs.insert(
+            TabId::BOOT,
+            TabEntry {
+                webview: boot_view,
+                state: Rc::new(RefCell::new(TabState::fresh(
+                    TabId::BOOT,
+                    tab_handle,
+                    tab_ax,
+                ))),
+            },
+        );
+    }
+    let global = delegate_global;
     crate::platform::app_log::info(format!(
         "servo-engine: ready ({VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT} software surface)"
     ));
@@ -699,43 +925,64 @@ fn run(
                 shutdown = true;
                 break;
             }
-            apply_command(&webview, &shared, command);
+            apply_command(&servo, &global, command);
         }
         if shutdown {
             break;
         }
-        // Complete the previous synthetic click: Down went out with its
+        // Complete previous synthetic clicks: Down went out with its
         // command; Up waits for at least one full tick so presses have real
-        // duration. Runs even while suspended so a press can never strand.
+        // duration. Every tab flushes its own press (clicks only arm on the
+        // active tab, but a tab switch mid-press must never strand one).
+        // Runs even while suspended so a press can never strand.
         {
-            let mut state = shared.borrow_mut();
-            state.spin_seq = state.spin_seq.wrapping_add(1);
-            match state.pending_click_up.take() {
-                // At least one full tick elapsed since Down: complete it.
-                Some((point, at)) if state.spin_seq > at => {
-                    drop(state);
-                    let id = webview.notify_input_event(InputEvent::MouseButton(
-                        MouseButtonEvent::new(MouseButtonAction::Up, MouseButton::Primary, point),
-                    ));
-                    track_input(&shared, id, "click");
-                }
-                // Not yet due (or nothing armed): put it back.
-                pending => {
-                    state.pending_click_up = pending;
+            let global_ref = global.borrow();
+            let entries: Vec<TabEntry> = global_ref.tabs.values().cloned().collect();
+            drop(global_ref);
+            for entry in entries {
+                let mut state = entry.state.borrow_mut();
+                state.spin_seq = state.spin_seq.wrapping_add(1);
+                match state.pending_click_up.take() {
+                    // At least one full tick elapsed since Down: complete it.
+                    Some((point, at)) if state.spin_seq > at => {
+                        drop(state);
+                        let id = entry.webview.notify_input_event(InputEvent::MouseButton(
+                            MouseButtonEvent::new(
+                                MouseButtonAction::Up,
+                                MouseButton::Primary,
+                                point,
+                            ),
+                        ));
+                        track_input(&entry.state, id, "click");
+                    }
+                    // Not yet due (or nothing armed): put it back.
+                    pending => {
+                        state.pending_click_up = pending;
+                    }
                 }
             }
         }
+        // Active-tab-only tick work: DOM pulls, probes, and their result
+        // drains never run for background tabs (suspend contract), but loads
+        // anywhere still time out.
+        let active_entry = {
+            let global_ref = global.borrow();
+            let tab = global_ref.active;
+            global_ref.tabs.get(&tab).cloned()
+        };
         {
-            let suspended = shared.borrow().suspended;
+            let suspended = global.borrow().suspended;
             if !suspended {
                 servo.spin_event_loop();
             }
-            check_load_timeout(&shared);
-            drain_dom_results(&shared);
-            maybe_pull_dom(&webview, &shared);
-            poll_probe(&webview, &shared);
-            #[cfg(debug_assertions)]
-            maybe_probe_storage(&webview, &shared);
+            check_load_timeout(&global);
+            if let Some(entry) = &active_entry {
+                drain_dom_results(&entry.state);
+                maybe_pull_dom(&entry.webview, &entry.state, &global);
+                poll_probe(&entry.webview, &entry.state);
+                #[cfg(debug_assertions)]
+                maybe_probe_storage(&entry.webview, &entry.state);
+            }
             std::thread::sleep(if suspended { SUSPENDED_IDLE } else { SPIN_IDLE });
         }
     }
@@ -748,10 +995,23 @@ fn run(
     }
 }
 
-fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: EngineCommand) {
+/// Resolve a per-tab command's target. `None` for closed-race tabs (the
+/// view is gone from the maps).
+fn tab_entry(global: &Rc<RefCell<Global>>, tab: TabId) -> Option<TabEntry> {
+    global.borrow().tabs.get(&tab).cloned()
+}
+
+fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCommand) {
     match command {
-        EngineCommand::Navigate { url, generation } => {
-            let mut state = shared.borrow_mut();
+        EngineCommand::Navigate {
+            tab,
+            url,
+            generation,
+        } => {
+            let Some(entry) = tab_entry(global, tab) else {
+                return;
+            };
+            let mut state = entry.state.borrow_mut();
             match url.parse::<url::Url>() {
                 Ok(parsed) => {
                     crate::platform::app_log::info(format!("servo-engine: navigate {url}"));
@@ -763,26 +1023,44 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                     clear_tree(&mut state);
                     // Explicit user navigation (overrides clear_tree's Loading).
                     set_activity(&mut state, EngineActivity::Navigating);
-                    state
-                        .handle
-                        .emit(EngineEvent::UrlChanged { url: url.clone() });
-                    webview.load(parsed);
-                    webview.set_focused(state.visible && !state.suspended);
+                    let tab = state.tab;
+                    let handle = state.handle.clone();
+                    drop(state);
+                    handle.emit(EngineEvent::UrlChanged {
+                        tab,
+                        url: url.clone(),
+                    });
+                    let global_ref = global.borrow();
+                    entry
+                        .webview
+                        .set_focused(global_ref.visible && !global_ref.suspended);
+                    drop(global_ref);
+                    entry.webview.load(parsed);
                 }
                 Err(err) => {
                     set_activity(&mut state, EngineActivity::Idle);
                     state.handle.emit(EngineEvent::LoadFinished {
+                        tab,
                         generation,
                         result: Err(format!("bad URL: {err}")),
                     });
                 }
             }
         }
-        EngineCommand::ScrollBy { dx, dy, x, y } => {
-            let mut state = shared.borrow_mut();
-            if state.suspended {
+        EngineCommand::ScrollBy { tab, dx, dy, x, y } => {
+            let Some(entry) = tab_entry(global, tab) else {
+                return;
+            };
+            // Input lands on the active tab only; anything else is a stale
+            // (switched-away) command.
+            let live = {
+                let global_ref = global.borrow();
+                !global_ref.suspended && global_ref.active == tab
+            };
+            if !live {
                 return;
             }
+            let mut state = entry.state.borrow_mut();
             // Dominant axis only: a diagonal stick deflection must not leak
             // the minor axis into the wrong scroller (the carousel trap:
             // horizontal intent with slight vertical drift scrolls the
@@ -795,7 +1073,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             // Scroll under the pad cursor, not viewport center: Servo routes
             // to the innermost scroller under the point, so center-targeting
             // stranded page scrolls inside carousels.
-            webview.notify_scroll_event(
+            entry.webview.notify_scroll_event(
                 Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(dx, dy))),
                 WebViewPoint::Device(DevicePoint::new(x, y)),
             );
@@ -816,51 +1094,78 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             // scroll ping through the observers on their own.
             emit_tree(&mut state);
         }
-        EngineCommand::Key(event) => {
-            if shared.borrow().suspended {
+        EngineCommand::Key(TabKey { tab, event }) => {
+            let Some(entry) = tab_entry(global, tab) else {
+                return;
+            };
+            let live = {
+                let global_ref = global.borrow();
+                !global_ref.suspended && global_ref.active == tab
+            };
+            if !live {
                 return;
             }
-            let id = webview.notify_input_event(InputEvent::Keyboard(KeyboardEvent::new(event)));
-            track_input(shared, id, "key");
+            let id = entry
+                .webview
+                .notify_input_event(InputEvent::Keyboard(KeyboardEvent::new(event)));
+            track_input(&entry.state, id, "key");
             // Keys can mutate the DOM (typing, shortcuts, focus Cruft):
             // re-query once settled, and invalidate cached verdicts.
-            let mut state = shared.borrow_mut();
+            let mut state = entry.state.borrow_mut();
             state.dom_dirty = true;
             state.dom_dirty_at = Some(Instant::now());
             state.dom_epoch = state.dom_epoch.wrapping_add(1);
         }
         EngineCommand::SetDarkMode { dark } => {
-            webview.notify_theme_change(if dark { Theme::Dark } else { Theme::Light });
+            // OS-level theme: every tab's view, not just the active one.
+            let global_ref = global.borrow();
+            let theme = if dark { Theme::Dark } else { Theme::Light };
+            for entry in global_ref.tabs.values() {
+                entry.webview.notify_theme_change(theme);
+            }
         }
-        EngineCommand::GoBack => {
-            let mut state = shared.borrow_mut();
-            if state.suspended {
+        EngineCommand::GoBack { tab } => {
+            let Some(entry) = tab_entry(global, tab) else {
+                return;
+            };
+            if global.borrow().suspended {
                 return;
             }
             // History travel swaps the document: clear_tree drops DOM targets,
             // scroll and extent (no reliable scroll restore to keep).
-            clear_tree(&mut state);
-            webview.go_back(1);
+            clear_tree(&mut entry.state.borrow_mut());
+            entry.webview.go_back(1);
         }
-        EngineCommand::GoForward => {
-            let mut state = shared.borrow_mut();
-            if state.suspended {
+        EngineCommand::GoForward { tab } => {
+            let Some(entry) = tab_entry(global, tab) else {
+                return;
+            };
+            if global.borrow().suspended {
                 return;
             }
-            clear_tree(&mut state);
-            webview.go_forward(1);
+            clear_tree(&mut entry.state.borrow_mut());
+            entry.webview.go_forward(1);
         }
-        EngineCommand::MouseMove { x, y } => {
-            if shared.borrow().suspended {
+        EngineCommand::MouseMove { tab, x, y } => {
+            let Some(entry) = tab_entry(global, tab) else {
+                return;
+            };
+            let live = {
+                let global_ref = global.borrow();
+                !global_ref.suspended && global_ref.active == tab
+            };
+            if !live {
                 return;
             }
             let point = WebViewPoint::Device(DevicePoint::new(x, y));
-            let id = webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
-            track_input(shared, id, "move");
+            let id = entry
+                .webview
+                .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
+            track_input(&entry.state, id, "move");
             // Roaming cursor re-seeds the cursor-culled set: once a cursor
             // position exists and the pull center is stale (or never set),
             // the live set no longer covers the cursor.
-            let mut state = shared.borrow_mut();
+            let mut state = entry.state.borrow_mut();
             let roamed = match (state.last_mouse, state.last_cull_center) {
                 (None, _) => false,
                 (Some(_), None) => true,
@@ -875,9 +1180,16 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                 state.dom_epoch = state.dom_epoch.wrapping_add(1);
             }
         }
-        EngineCommand::ClickAt { x, y, target } => {
-            if shared.borrow().suspended {
-                crate::platform::app_log::info("servo-engine: click dropped (suspended)");
+        EngineCommand::ClickAt { tab, x, y, target } => {
+            let Some(entry) = tab_entry(global, tab) else {
+                return;
+            };
+            let live = {
+                let global_ref = global.borrow();
+                !global_ref.suspended && global_ref.active == tab
+            };
+            if !live {
+                crate::platform::app_log::info("servo-engine: click dropped (not live)");
                 return;
             }
             // Viewport-space point (same space as the cursor and the
@@ -885,7 +1197,7 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             crate::platform::app_log::info(format!("servo-engine: click at ({x:.0},{y:.0})"));
             // Complete any in-flight press first: rapid clicks stay paired
             // (Down/Up, Down/Up) instead of stranding a Down.
-            flush_pending_up(webview, shared);
+            flush_pending_up(&entry.webview, &entry.state);
             // Button- and link-kind dock targets activate on the exact
             // element via `__sdsc_click`: no hit-test staleness, and it
             // exercises whatever handler the page registered
@@ -896,7 +1208,8 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
             // points keep the trusted synthetic pair. A miss falls back to
             // synthetic at the point below.
             let jsid = target.and_then(|uid| {
-                shared
+                entry
+                    .state
                     .borrow()
                     .dom_uid
                     .iter()
@@ -904,13 +1217,13 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                     .map(|(j, _)| *j)
             });
             let direct_kind = jsid.and_then(|j| {
-                shared.borrow().dom.get(&j).and_then(|n| {
+                entry.state.borrow().dom.get(&j).and_then(|n| {
                     (n.kind == FocusKind::Button || n.kind == FocusKind::Link).then_some(n.kind)
                 })
             });
             if let Some((jsid, kind)) = jsid.zip(direct_kind) {
-                let handle = shared.borrow().handle.clone();
-                webview.evaluate_javascript(
+                let tab_state = entry.state.clone();
+                entry.webview.evaluate_javascript(
                     format!("window.__sdsc_click ? window.__sdsc_click({jsid}) : 'missing'"),
                     move |result| {
                         let status = match result {
@@ -926,58 +1239,174 @@ fn apply_command(webview: &WebView, shared: &Rc<RefCell<Shared>>, command: Engin
                         if status != "ok" {
                             // Element gone (or helper missing): fall back to
                             // the trusted synthetic pair at the point.
-                            handle.send(EngineCommand::ClickAt { x, y, target: None });
+                            tab_state.borrow().handle.send(EngineCommand::ClickAt {
+                                tab,
+                                x,
+                                y,
+                                target: None,
+                            });
                         }
                     },
                 );
             } else {
-                send_synthetic_down(webview, shared, x, y);
+                send_synthetic_down(&entry.webview, &entry.state, x, y);
             }
             // Clicks mutate the DOM (toggles, expands, navigation): re-query
             // once settled, and invalidate cached verdicts.
-            let mut state = shared.borrow_mut();
+            let mut state = entry.state.borrow_mut();
             state.dom_dirty = true;
             state.dom_dirty_at = Some(Instant::now());
             state.dom_epoch = state.dom_epoch.wrapping_add(1);
         }
-        EngineCommand::ProbeEventLoop => {
-            if shared.borrow().suspended {
+        EngineCommand::ProbeEventLoop { tab } => {
+            let Some(entry) = tab_entry(global, tab) else {
+                return;
+            };
+            let live = {
+                let global_ref = global.borrow();
+                !global_ref.suspended && global_ref.active == tab
+            };
+            if !live {
                 return;
             }
             // Fire-and-forget arm; the loop dispatches the READ 600ms later
             // and bounds it with a deadline (see `poll_probe`).
-            shared.borrow_mut().probe_armed_at = Some(Instant::now());
+            entry.state.borrow_mut().probe_armed_at = Some(Instant::now());
             crate::platform::app_log::info("servo-loop: probe armed");
-            webview.evaluate_javascript(PROBE_ARM_JS.to_string(), |_| {});
+            entry
+                .webview
+                .evaluate_javascript(PROBE_ARM_JS.to_string(), |_| {});
+        }
+        EngineCommand::OpenTab { tab } => {
+            let mut global_ref = global.borrow_mut();
+            if global_ref.tabs.contains_key(&tab) {
+                crate::platform::app_log::warn(format!(
+                    "servo-engine: OpenTab tab{} already exists",
+                    tab.0
+                ));
+                return;
+            }
+            let ctx = global_ref.ctx.clone();
+            let user_content = global_ref.user_content.clone();
+            let Some(delegate) = global_ref.delegate_source.clone() else {
+                crate::platform::app_log::warn("servo-engine: OpenTab before delegate ready");
+                return;
+            };
+            // serve the new view un-shown: the UI foregrounds it with
+            // `SetActiveTab` next (command order is FIFO).
+            let webview = WebViewBuilder::new(servo, ctx)
+                .user_content_manager(user_content)
+                .delegate(delegate)
+                .build();
+            webview.hide();
+            webview.set_focused(false);
+            let view_id = webview.id();
+            crate::platform::app_log::info(format!(
+                "servo-engine: OpenTab tab{} view{view_id:?}",
+                tab.0
+            ));
+            let handle = global_ref.handle.clone();
+            let ax_debug = global_ref.ax_debug;
+            global_ref.by_view.insert(view_id, tab);
+            global_ref.tabs.insert(
+                tab,
+                TabEntry {
+                    webview,
+                    state: Rc::new(RefCell::new(TabState::fresh(tab, handle, ax_debug))),
+                },
+            );
+        }
+        EngineCommand::CloseTab { tab } => {
+            let mut global_ref = global.borrow_mut();
+            let Some(entry) = global_ref.tabs.remove(&tab) else {
+                return;
+            };
+            global_ref.by_view.remove(&entry.webview.id());
+            if global_ref.active == tab {
+                crate::platform::app_log::warn(format!(
+                    "servo-engine: CloseTab closed the active tab{} (UI should switch first)",
+                    tab.0
+                ));
+            }
+            crate::platform::app_log::info(format!("servo-engine: CloseTab tab{}", tab.0));
+            drop(global_ref);
+            // Dropping the last `WebView` handle closes the view
+            // constellation-side (`CloseWebView`).
+            drop(entry);
+        }
+        EngineCommand::SetActiveTab { tab } => {
+            let mut global_ref = global.borrow_mut();
+            if !global_ref.tabs.contains_key(&tab) {
+                crate::platform::app_log::warn(format!(
+                    "servo-engine: SetActiveTab unknown tab{}",
+                    tab.0
+                ));
+                return;
+            }
+            if global_ref.active == tab {
+                return;
+            }
+            let old = global_ref.active;
+            if let Some(prev) = global_ref.tabs.get(&old).cloned() {
+                prev.webview.hide();
+                prev.webview.set_focused(false);
+            }
+            global_ref.active = tab;
+            let visible = global_ref.visible;
+            let suspended = global_ref.suspended;
+            if let Some(next) = global_ref.tabs.get(&tab).cloned() {
+                next.webview.show();
+                next.webview.set_focused(visible && !suspended);
+                // Kick a frame so the newly foregrounded tab paints at once
+                // instead of waiting for page-driven invalidation.
+                next.webview.paint();
+            }
+            crate::platform::app_log::info(format!(
+                "servo-engine: active tab{} -> tab{}",
+                old.0, tab.0
+            ));
         }
         EngineCommand::Resize { width, height } => {
-            let mut state = shared.borrow_mut();
+            let mut global_ref = global.borrow_mut();
             let width = width.max(1);
             let height = height.max(1);
-            state.ctx.resize(PhysicalSize::new(width, height));
-            state.size = (width, height);
+            // One shared context: a resize resizes every tab's view (Servo
+            // documents this). All tabs are the same fixed viewport anyway.
+            global_ref.ctx.resize(PhysicalSize::new(width, height));
+            global_ref.size = (width, height);
         }
         EngineCommand::SetVisible { visible } => {
-            let mut state = shared.borrow_mut();
-            state.visible = visible;
-            webview.set_focused(visible && !state.suspended);
+            let mut global_ref = global.borrow_mut();
+            global_ref.visible = visible;
+            let suspended = global_ref.suspended;
+            let active = global_ref.active;
+            if let Some(entry) = global_ref.tabs.get(&active).cloned() {
+                entry.webview.set_focused(visible && !suspended);
+            }
         }
         EngineCommand::Suspend => {
-            let mut state = shared.borrow_mut();
-            state.suspended = true;
-            webview.set_focused(false);
+            let mut global_ref = global.borrow_mut();
+            global_ref.suspended = true;
+            let active = global_ref.active;
+            if let Some(entry) = global_ref.tabs.get(&active).cloned() {
+                entry.webview.set_focused(false);
+            }
         }
         EngineCommand::Resume => {
-            let mut state = shared.borrow_mut();
-            state.suspended = false;
-            webview.set_focused(state.visible);
+            let mut global_ref = global.borrow_mut();
+            global_ref.suspended = false;
+            let visible = global_ref.visible;
+            let active = global_ref.active;
+            if let Some(entry) = global_ref.tabs.get(&active).cloned() {
+                entry.webview.set_focused(visible);
+            }
         }
         EngineCommand::Shutdown { .. } | EngineCommand::Wake => {}
     }
 }
 
 /// Set the status-strip phase, emitting (and logging) only on change.
-fn set_activity(state: &mut Shared, phase: EngineActivity) {
+fn set_activity(state: &mut TabState, phase: EngineActivity) {
     if state.activity == phase {
         return;
     }
@@ -986,20 +1415,27 @@ fn set_activity(state: &mut Shared, phase: EngineActivity) {
         state.activity
     ));
     state.activity = phase;
-    state.handle.emit(EngineEvent::ActivityChanged { phase });
+    let tab = state.tab;
+    state
+        .handle
+        .emit(EngineEvent::ActivityChanged { tab, phase });
 }
 
 /// Document changed (fresh load or history travel): drop DOM targets, scroll
 /// and content extent. Session history does not reliably restore scroll,
 /// and stale anything misplaces every outline (observed in testing).
-fn clear_tree(state: &mut Shared) {
+fn clear_tree(state: &mut TabState) {
     // A new document is loading content from here.
     set_activity(state, EngineActivity::Loading);
     if !state.dom.is_empty() {
         state.dom.clear();
         state.dom_uid.clear();
         state.last_emitted = Vec::new();
-        state.handle.emit(EngineEvent::A11yTree(Vec::new()));
+        let tab = state.tab;
+        state.handle.emit(EngineEvent::A11yTree {
+            tab,
+            items: Vec::new(),
+        });
     }
     state.content = None;
     // A new document gets fresh DOM ids (the in-page WeakMap resets), a
@@ -1028,9 +1464,12 @@ fn clear_tree(state: &mut Shared) {
     if state.scroll != (0.0, 0.0) {
         state.scroll = (0.0, 0.0);
         state.last_sent_scroll = (0.0, 0.0);
-        state
-            .handle
-            .emit(EngineEvent::ScrollOffset { x: 0.0, y: 0.0 });
+        let tab = state.tab;
+        state.handle.emit(EngineEvent::ScrollOffset {
+            tab,
+            x: 0.0,
+            y: 0.0,
+        });
     }
 }
 
@@ -1077,11 +1516,13 @@ const DOM_SETTLE: Duration = Duration::from_millis(250);
 /// load settle) or a settled dirty ping from the in-page observers
 /// (console/fetch/sendBeacon, ORed into one flag). Skipped while suspended
 /// or with a pull in flight (5s timeout unsticks it).
-fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
+fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<TabState>>, global: &Rc<RefCell<Global>>) {
     let now = Instant::now();
     let fire = {
         let mut state = shared.borrow_mut();
-        if state.suspended {
+        // Suspended engine: no pulls anywhere (the loop only calls this for
+        // the active tab anyway — belt and suspenders).
+        if global.borrow().suspended {
             return;
         }
         if let Some(t) = state.dom_in_flight_at
@@ -1148,7 +1589,7 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
 
 /// Drain completed DOM queries: parse, merge, re-emit through the normal
 /// diff path (so the UI, cursor, and debug overlay see every update).
-fn drain_dom_results(shared: &Rc<RefCell<Shared>>) {
+fn drain_dom_results(shared: &Rc<RefCell<TabState>>) {
     loop {
         let msg = shared
             .borrow_mut()
@@ -1187,7 +1628,7 @@ fn drain_dom_results(shared: &Rc<RefCell<Shared>>) {
 /// Record a sent input event for outcome correlation. Bounded: moves stream
 /// at pad-tick rate, so the oldest entry drops when full (its outcome just
 /// goes unmatched — fine at that cadence).
-fn track_input(shared: &Rc<RefCell<Shared>>, id: InputEventId, kind: &'static str) {
+fn track_input(shared: &Rc<RefCell<TabState>>, id: InputEventId, kind: &'static str) {
     let mut state = shared.borrow_mut();
     if state.pending_inputs.len() >= 64 {
         state.pending_inputs.pop_front();
@@ -1200,7 +1641,7 @@ fn track_input(shared: &Rc<RefCell<Shared>>, id: InputEventId, kind: &'static st
 /// cookie count — key names truncated, values never read). Dispatched when
 /// the load-complete arm fires, drained below; logged once then forgotten.
 #[cfg(debug_assertions)]
-fn maybe_probe_storage(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
+fn maybe_probe_storage(webview: &WebView, shared: &Rc<RefCell<TabState>>) {
     let msg = shared
         .borrow_mut()
         .storage_probe_rx
@@ -1243,7 +1684,7 @@ fn maybe_probe_storage(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
 /// Drain one-shot event-loop probe results and drive its two phases:
 /// READ dispatch 600ms after the arm (lets the 100ms timer and one rAF
 /// fire), then a 2s bound on the READ round-trip.
-fn poll_probe(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
+fn poll_probe(webview: &WebView, shared: &Rc<RefCell<TabState>>) {
     // Phase 1: time to dispatch the READ.
     let dispatch_read = {
         let mut state = shared.borrow_mut();
@@ -1311,9 +1752,9 @@ fn poll_probe(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
 }
 
 /// Trusted synthetic mouse-down; the matching Up is armed on
-/// [`Shared::pending_click_up`] for the next loop tick (see `run`), so
+/// [`TabState::pending_click_up`] for the next loop tick (see `run`), so
 /// every press has real duration instead of a zero-width Down+Up pair.
-fn send_synthetic_down(webview: &WebView, shared: &Rc<RefCell<Shared>>, x: f32, y: f32) {
+fn send_synthetic_down(webview: &WebView, shared: &Rc<RefCell<TabState>>, x: f32, y: f32) {
     let point = WebViewPoint::Device(DevicePoint::new(x, y));
     let id = webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
         MouseButtonAction::Down,
@@ -1327,7 +1768,7 @@ fn send_synthetic_down(webview: &WebView, shared: &Rc<RefCell<Shared>>, x: f32, 
 
 /// Complete any in-flight synthetic press immediately (used when a new
 /// click arrives before the tick flush, and to keep rapid clicks paired).
-fn flush_pending_up(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
+fn flush_pending_up(webview: &WebView, shared: &Rc<RefCell<TabState>>) {
     let pending = shared.borrow_mut().pending_click_up.take();
     if let Some((point, _)) = pending {
         let id = webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
@@ -1353,7 +1794,7 @@ fn flush_pending_up(webview: &WebView, shared: &Rc<RefCell<Shared>>) {
 /// landed after this pull was dispatched: that ping's truth is newer and
 /// already applied, so the snapshot's older truth must not yank outlines
 /// backwards.
-fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128, skip_rebase: bool) {
+fn ingest_dom(state: &mut TabState, value: &JSValue, rtt_ms: u128, skip_rebase: bool) {
     use std::collections::HashSet;
     let snap = parse_dom_snapshot(value);
     // The snapshot's own truth counts as observed even when the rebase is
@@ -1506,7 +1947,8 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128, skip_rebase: bo
     if focus != state.last_focus {
         state.last_focus = focus;
         if let Some(id) = focus {
-            state.handle.emit(EngineEvent::FocusChanged { id });
+            let tab = state.tab;
+            state.handle.emit(EngineEvent::FocusChanged { tab, id });
         }
     }
     // First snapshot after a completed document ends the initializing phase
@@ -1531,7 +1973,7 @@ fn ingest_dom(state: &mut Shared, value: &JSValue, rtt_ms: u128, skip_rebase: bo
 /// lag the page (unseen far corners), and truth from the page must win —
 /// clamping it would reintroduce the very drift this heals. Origin-pinned
 /// (negative scroll is never real) and reported when it moves the UI value.
-fn rebase_scroll(state: &mut Shared, scroll: (f32, f32)) {
+fn rebase_scroll(state: &mut TabState, scroll: (f32, f32)) {
     let rebased = (scroll.0.max(0.0), scroll.1.max(0.0));
     if state.scroll == rebased {
         return;
@@ -1541,7 +1983,9 @@ fn rebase_scroll(state: &mut Shared, scroll: (f32, f32)) {
         return;
     }
     state.last_sent_scroll = rebased;
+    let tab = state.tab;
     state.handle.emit(EngineEvent::ScrollOffset {
+        tab,
         x: rebased.0,
         y: rebased.1,
     });
@@ -1627,7 +2071,7 @@ fn parse_ping_scroll(url: &str) -> Option<(f32, f32)> {
 }
 
 /// Record observed scroll truth toward the per-document maximum (see
-/// `Shared::scroll_max`). Every observation — ping `wx/wy`, snapshot `sx/sy`
+/// `TabState::scroll_max`). Every observation — ping `wx/wy`, snapshot `sx/sy`
 /// — is a position the page proved reachable, so the running maximum is
 /// always a safe upper bound for commanded accumulation.
 fn note_scroll_truth(scroll_max: &mut (f32, f32), truth: (f32, f32)) {
@@ -1648,7 +2092,7 @@ fn bound_commanded(scroll: (f32, f32), scroll_max: (f32, f32)) -> (f32, f32) {
 
 /// Update the tracked scroll offset and report it when it moves, so the UI
 /// overlay can correlate cursor against targets.
-fn set_scroll(state: &mut Shared, scroll: (f32, f32)) {
+fn set_scroll(state: &mut TabState, scroll: (f32, f32)) {
     // Commanded lead is bounded by observed truth (see `bound_commanded`).
     let bounded = bound_commanded(scroll, state.scroll_max);
     let clamped = clamp_scroll(bounded, state.content);
@@ -1657,7 +2101,9 @@ fn set_scroll(state: &mut Shared, scroll: (f32, f32)) {
     }
     state.scroll = clamped;
     state.last_sent_scroll = clamped;
+    let tab = state.tab;
     state.handle.emit(EngineEvent::ScrollOffset {
+        tab,
         x: clamped.0,
         y: clamped.1,
     });
@@ -1665,18 +2111,18 @@ fn set_scroll(state: &mut Shared, scroll: (f32, f32)) {
 
 /// Diff + publish the translated tree. Logs only when the set size changes
 /// so scroll ticks (which move rects without adding nodes) stay silent.
-fn emit_tree(shared: &mut Shared) {
-    let (focusables, extent) = collect_focusables(shared);
+fn emit_tree(state: &mut TabState) {
+    let (focusables, extent) = collect_focusables(state);
     // Extent only grows per document (reset by `clear_tree`).
-    shared.content = Some(match shared.content {
+    state.content = Some(match state.content {
         Some(prev) => (prev.0.max(extent.0), prev.1.max(extent.1)),
         None => extent,
     });
-    let fresh = translate_tree(focusables, shared.scroll);
-    if fresh == shared.last_emitted {
+    let fresh = translate_tree(focusables, state.scroll);
+    if fresh == state.last_emitted {
         return;
     }
-    if fresh.len() != shared.last_emitted.len() {
+    if fresh.len() != state.last_emitted.len() {
         let sample = fresh
             .first()
             .map(|o| {
@@ -1691,30 +2137,40 @@ fn emit_tree(shared: &mut Shared) {
             fresh.len()
         ));
     }
-    shared.last_emitted = fresh.clone();
-    shared.handle.emit(EngineEvent::A11yTree(fresh));
+    state.last_emitted = fresh.clone();
+    let tab = state.tab;
+    state
+        .handle
+        .emit(EngineEvent::A11yTree { tab, items: fresh });
 }
 
-/// Fail loads that never complete so the UI never spins forever.
-fn check_load_timeout(shared: &Rc<RefCell<Shared>>) {
-    let mut state = shared.borrow_mut();
-    let Some(started) = state.load_started_at else {
-        return;
-    };
-    if started.elapsed() < LOAD_TIMEOUT {
-        return;
+/// Fail loads that never complete so the UI never spins forever. Every tab
+/// times out on its own clock (background loads keep running in the
+/// constellation even while suspended from our side).
+fn check_load_timeout(global: &Rc<RefCell<Global>>) {
+    let entries: Vec<TabEntry> = global.borrow().tabs.values().cloned().collect();
+    for entry in entries {
+        let mut state = entry.state.borrow_mut();
+        let Some(started) = state.load_started_at else {
+            continue;
+        };
+        if started.elapsed() < LOAD_TIMEOUT {
+            continue;
+        }
+        state.load_started_at = None;
+        let generation = state.generation;
+        let tab = state.tab;
+        crate::platform::app_log::warn(format!(
+            "servo-engine: load timed out after {}s",
+            LOAD_TIMEOUT.as_secs()
+        ));
+        set_activity(&mut state, EngineActivity::Idle);
+        state.handle.emit(EngineEvent::LoadFinished {
+            tab,
+            generation,
+            result: Err("load timed out".to_string()),
+        });
     }
-    state.load_started_at = None;
-    let generation = state.generation;
-    crate::platform::app_log::warn(format!(
-        "servo-engine: load timed out after {}s",
-        LOAD_TIMEOUT.as_secs()
-    ));
-    set_activity(&mut state, EngineActivity::Idle);
-    state.handle.emit(EngineEvent::LoadFinished {
-        generation,
-        result: Err("load timed out".to_string()),
-    });
 }
 
 #[cfg(test)]

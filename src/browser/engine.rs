@@ -37,23 +37,38 @@ impl EngineActivity {
     }
 }
 
-/// One rendered page frame: RGBA pixels for an iced image handle.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PageFrame {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
+/// Stable tab identity for the multi-view engine.
+///
+/// The boot webview the worker creates at spawn is always [`TabId::BOOT`],
+/// so the UI default-matches it with no handshake. UI-owned ids count up
+/// from there (explicit new tabs); engine-owned ids count down from
+/// [`TabId::ENGINE_TOP`] (popup `request_create_new` tabs). Disjoint by
+/// construction over the fire-and-forget command channel — no coordination
+/// needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TabId(pub u64);
+
+impl TabId {
+    /// First tab: the boot webview (home URL).
+    pub const BOOT: TabId = TabId(1);
+    /// Engine-owned ids count down from here.
+    pub const ENGINE_TOP: u64 = u64::MAX;
 }
 
 /// Commands the UI sends to the backend. Fire-and-forget: a disconnected
 /// backend drops them, and scroll floods coalesce naturally.
+///
+/// Every per-tab command carries its [`TabId`]; commands for unknown
+/// (closed-race) tabs are ignored. Only the active tab receives input.
 #[derive(Debug, Clone)]
 pub enum EngineCommand {
     Navigate {
+        tab: TabId,
         url: String,
         generation: u64,
     },
     ScrollBy {
+        tab: TabId,
         dx: f32,
         dy: f32,
         /// Page point to scroll under (device px == page px at 1x): the pad
@@ -63,7 +78,7 @@ pub enum EngineCommand {
         x: f32,
         y: f32,
     },
-    Key(keyboard_types::KeyboardEvent),
+    Key(TabKey),
     SetDarkMode {
         dark: bool,
     },
@@ -72,6 +87,7 @@ pub enum EngineCommand {
     /// and `:hover` state track the real cursor; clicks then need no
     /// pre-move.
     MouseMove {
+        tab: TabId,
         x: f32,
         y: f32,
     },
@@ -81,6 +97,7 @@ pub enum EngineCommand {
     /// else goes as trusted down+up at the point, which the pad cursor owns
     /// (never the OS mouse).
     ClickAt {
+        tab: TabId,
         x: f32,
         y: f32,
         target: Option<u64>,
@@ -88,9 +105,29 @@ pub enum EngineCommand {
     /// R3 diagnostic: arm a one-shot event-loop probe (timers, rAF,
     /// IntersectionObserver) and read it back ~700ms later. Tells whether
     /// page JS task sources are actually running.
-    ProbeEventLoop,
-    GoBack,
-    GoForward,
+    ProbeEventLoop {
+        tab: TabId,
+    },
+    GoBack {
+        tab: TabId,
+    },
+    GoForward {
+        tab: TabId,
+    },
+    /// Create an empty tab (no load — a `Navigate` follows). UI-assigned id.
+    OpenTab {
+        tab: TabId,
+    },
+    /// Drop a tab (its `WebView` handle closes the view). The UI activates a
+    /// neighbor first when closing the active tab.
+    CloseTab {
+        tab: TabId,
+    },
+    /// Foreground a tab: show + focus it, hide + unfocus the previous one,
+    /// and gate all frame/DOM/input work to it.
+    SetActiveTab {
+        tab: TabId,
+    },
     Resize {
         width: u32,
         height: u32,
@@ -112,20 +149,34 @@ pub enum EngineCommand {
     Wake,
 }
 
+/// Per-tab key event: the tab rides alongside so the worker routes the page
+/// key to the right view.
+#[derive(Debug, Clone)]
+pub struct TabKey {
+    pub tab: TabId,
+    pub event: keyboard_types::KeyboardEvent,
+}
+
 /// Events the backend publishes to the UI subscription.
+///
+/// Every event carries its [`TabId`]; the UI routes active-tab events to the
+/// live page state and background-tab events to the matching stored tab.
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
-    Frame(PageFrame),
+    Frame(TabFrame),
     TitleChanged {
+        tab: TabId,
         title: Option<String>,
     },
     UrlChanged {
+        tab: TabId,
         url: String,
     },
     /// Page favicon arrived (Servo parses `<link rel=icon>` out of band).
     /// Keyed by document URL; the UI caches handles per URL for the
     /// bookmark bar and history rows.
     FaviconChanged {
+        tab: TabId,
         url: String,
         width: u32,
         height: u32,
@@ -134,15 +185,21 @@ pub enum EngineEvent {
     /// Engine phase changed (navigate → load → DOM boot). Drives the
     /// browser status strip ("real" status, not just clicks).
     ActivityChanged {
+        tab: TabId,
         phase: EngineActivity,
     },
     /// Fresh focusable set from the accessibility tree. The UI re-snaps the
+    /// Fresh focusable set from the accessibility tree. The UI re-snaps the
     /// cursor and drops stale attachments.
-    A11yTree(Vec<crate::browser::cursor::Focusable>),
+    A11yTree {
+        tab: TabId,
+        items: Vec<crate::browser::cursor::Focusable>,
+    },
     /// Viewport scroll offset the backend translated the current tree with
     /// (document-space bounds minus this). Emitted when it changes so the
     /// debug overlay can correlate cursor against targets.
     ScrollOffset {
+        tab: TabId,
         x: f32,
         y: f32,
     },
@@ -151,19 +208,64 @@ pub enum EngineEvent {
     /// onto it when possible. Fires only on change to a known target
     /// (never on blur-to-nothing).
     FocusChanged {
+        tab: TabId,
         id: u64,
     },
     /// Canonical session history (Servo `notify_history_changed` entries +
     /// current index). Overwrites the UI's locally-maintained session
     /// stack so the hold-bumper selector shows exact back/forward targets.
     HistoryChanged {
+        tab: TabId,
         entries: Vec<String>,
         current: usize,
     },
     LoadFinished {
+        tab: TabId,
         generation: u64,
         result: Result<(), String>,
     },
+    /// Engine-created tab (popup `request_create_new`: `window.open()`,
+    /// `target=_blank`). Already foregrounded backend-side; the UI adopts
+    /// it (stash live, reset, set active).
+    TabOpened {
+        tab: TabId,
+    },
+    /// A tab's page called `window.close()`: the backend already dropped the
+    /// view. The UI activates a neighbor (or a fresh home tab if none).
+    TabClosed {
+        tab: TabId,
+    },
+}
+
+impl EngineEvent {
+    /// Owning tab for page-state routing. `None` for tab-lifecycle events
+    /// (`TabOpened` / `TabClosed`), which the UI handles before routing.
+    pub fn tab(&self) -> Option<TabId> {
+        match self {
+            Self::Frame(f) => Some(f.tab),
+            Self::TitleChanged { tab, .. }
+            | Self::UrlChanged { tab, .. }
+            | Self::FaviconChanged { tab, .. }
+            | Self::ActivityChanged { tab, .. }
+            | Self::ScrollOffset { tab, .. }
+            | Self::FocusChanged { tab, .. }
+            | Self::HistoryChanged { tab, .. }
+            | Self::LoadFinished { tab, .. } => Some(*tab),
+            Self::A11yTree { tab, .. } => Some(*tab),
+            Self::TabOpened { .. } | Self::TabClosed { .. } => None,
+        }
+    }
+}
+
+/// One rendered page frame: owning tab plus RGBA pixels for an iced image
+/// handle. Frames only ever flow for the active tab (background tabs never
+/// paint), so the subscription's latest-frame conflation is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabFrame {
+    pub tab: TabId,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
 }
 
 /// Channel pair between the UI shell and the backend worker thread.
@@ -259,9 +361,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn events_report_their_tab() {
+        let boot = TabId::BOOT;
+        assert_eq!(
+            EngineEvent::TitleChanged {
+                tab: boot,
+                title: None
+            }
+            .tab(),
+            Some(boot)
+        );
+        assert_eq!(
+            EngineEvent::Frame(TabFrame {
+                tab: boot,
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 0, 255],
+            })
+            .tab(),
+            Some(boot)
+        );
+        // Lifecycle events route before page state: no tab.
+        assert_eq!(EngineEvent::TabOpened { tab: boot }.tab(), None);
+        assert_eq!(EngineEvent::TabClosed { tab: boot }.tab(), None);
+    }
+
+    #[test]
     fn unbound_emit_drops_silently() {
         let (handle, rx) = EngineHandle::channel();
         handle.emit(EngineEvent::UrlChanged {
+            tab: TabId::BOOT,
             url: "https://example.com".to_string(),
         });
         handle.send(EngineCommand::Suspend);
@@ -272,12 +401,14 @@ mod tests {
     fn scroll_commands_pass_through_in_order() {
         let (handle, rx) = EngineHandle::channel();
         handle.send(EngineCommand::ScrollBy {
+            tab: TabId::BOOT,
             dx: 0.0,
             dy: 240.0,
             x: 400.0,
             y: 300.0,
         });
         handle.send(EngineCommand::ScrollBy {
+            tab: TabId::BOOT,
             dx: 0.0,
             dy: -240.0,
             x: 400.0,

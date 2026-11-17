@@ -99,6 +99,14 @@ pub enum StartMessage {
     /// Browser: navigate to the home page (hardcoded for now; a settings
     /// screen later makes it configurable).
     BrowserHome,
+    /// Browser: open a new foreground tab on the home page.
+    BrowserTabNew,
+    /// Browser: foreground a tab (stashes the live page, loads the stored
+    /// one into the live slot).
+    BrowserTabSwitch(crate::browser::engine::TabId),
+    /// Browser: close a tab. Closing the last tab resets it to home
+    /// instead (a tab-less engine has no boot path back).
+    BrowserTabClose(crate::browser::engine::TabId),
     /// Browser: shut down the engine worker in-app (diagnostic + resource
     /// release). Runs the exact clean-shutdown path as quit (drain, Servo
     /// drop, storage flush) while the app keeps running. NOTE: Servo
@@ -849,28 +857,81 @@ impl HistorySelector {
     }
 }
 
-/// In-Start reader browser panel. The URL draft and body scroll offset live
-/// here; load lifecycle (generation-guarded suspend/resume) lives in
-/// [`crate::browser::BrowserSession`]. The pad cursor roams in engine page
-/// pixels (see [`crate::browser::cursor`]).
+/// Per-tab page state: everything that belongs to one tab's document.
+/// `BrowserPanel::page` is always the ACTIVE tab's; background tabs stash
+/// theirs in `BrowserPanel::stored`. The panel derefs to this, so all
+/// existing live-tab call sites (`panel.session`, `panel.cursor`, …) keep
+/// working.
 #[derive(Debug, Clone, Default)]
-pub struct BrowserPanel {
+pub struct BrowserTabPage {
     pub session: crate::browser::BrowserSession,
-    pub draft: String,
-    pub scroll_y: f32,
-    /// URL-edit mode: keyboard goes to the address field (pad Triangle /
-    /// Ctrl+L enters, Enter commits, Esc/Circle backs out). Cleared on
-    /// navigate and close.
-    pub url_editing: bool,
     /// Virtual cursor (engine mode only; pad-owned).
     pub cursor: crate::browser::cursor::Cursor,
     /// Focusable elements from the latest accessibility tree.
     pub focusables: Vec<crate::browser::cursor::Focusable>,
-    /// Last analog integrate step (None until the first pad sample).
-    pub analog_at: Option<Instant>,
+    pub scroll_y: f32,
     /// Viewport scroll offset the backend translated the tree with
     /// (`EngineEvent::ScrollOffset`). Debug overlay + shot correlation.
     pub scroll_offset: (f32, f32),
+    /// Last analog integrate step (None until the first pad sample).
+    pub analog_at: Option<Instant>,
+    /// Page-driven focus target (autofocus / JS `.focus()`): UI id to dock
+    /// when it next resolves in the live set. One shot per tree — a culled
+    /// target never docks ("if possible").
+    pub pending_focus: Option<u64>,
+    /// Last left-stick vector seen by the cursor tick. Autofocus docking
+    /// requires the stick at rest (an active steer means the user is driving
+    /// and wins over the page).
+    pub last_pad_stick: (f32, f32),
+    /// Last sent mouse position (quantized px), so the pad cursor streams
+    /// moves to the engine only when it actually travels. Never persisted.
+    pub last_sent_mouse: Option<(i32, i32)>,
+    /// Last click point + time, for the R3 issue-flag correlation.
+    pub last_click: Option<((f32, f32), Instant)>,
+    /// Transient action hint shown in the card header ("Opening link…"):
+    /// instant feedback that a click landed, so a slow-or-dead page reads
+    /// as such instead of a dropped input. Superseded by Loading…/Error,
+    /// expires after a few seconds.
+    pub action_hint: Option<(String, Instant)>,
+    /// Hold-bumper history selector overlay (B2.4). `None` = closed.
+    pub history_selector: Option<HistorySelector>,
+    /// Engine phase for the status strip (navigate → load → DOM boot).
+    pub engine_activity: crate::browser::engine::EngineActivity,
+}
+
+/// One background tab: stable id plus the page state the live slot swaps
+/// with on switch.
+#[derive(Debug, Clone)]
+pub struct StoredTab {
+    pub id: crate::browser::engine::TabId,
+    pub page: BrowserTabPage,
+}
+
+/// In-Start reader browser panel. The URL draft and body scroll offset live
+/// here; load lifecycle (generation-guarded suspend/resume) lives in
+/// [`crate::browser::BrowserSession`]. The pad cursor roams in engine page
+/// pixels (see [`crate::browser::cursor`]).
+#[derive(Debug, Clone)]
+pub struct BrowserPanel {
+    /// Live page state: ALWAYS the active tab's. Swapped with `stored`
+    /// entries on switch (see `activate_stored`).
+    pub page: BrowserTabPage,
+    /// Background tabs (page state only; chrome stays shared).
+    pub stored: Vec<StoredTab>,
+    /// Creation-order tab ids (active included): the strip renders in this
+    /// order so switching never shuffles positions.
+    pub order: Vec<crate::browser::engine::TabId>,
+    /// Active tab id. Defaults to the boot webview — matches the worker's
+    /// `TabId::BOOT` with no handshake.
+    pub active_tab: crate::browser::engine::TabId,
+    /// Next UI-owned tab id (counts up from boot; engine popups count down
+    /// from `u64::MAX` — disjoint by construction).
+    pub next_tab_id: u64,
+    pub draft: String,
+    /// URL-edit mode: keyboard goes to the address field (pad Triangle /
+    /// Ctrl+L enters, Enter commits, Esc/Circle backs out). Cleared on
+    /// navigate and close.
+    pub url_editing: bool,
     /// Last debug frame-shot time (5s cadence while the overlay is on).
     pub last_shot: Option<Instant>,
     /// Last dock transition (None→Some) wall-clock, for settled dock shots.
@@ -878,23 +939,13 @@ pub struct BrowserPanel {
     /// shooting on the dock tick only ever captures a half-morphed wrap
     /// and reads as a misplaced outline.
     pub last_dock_change: Option<Instant>,
-    /// Last click point + time, for the R3 issue-flag correlation.
-    pub last_click: Option<((f32, f32), Instant)>,
     /// JS element-click mode for Button-kind dock targets (toggled from the
     /// browser card itself; off by default): `__sdsc_click` on the exact
     /// element instead of the trusted synthetic pair. Lets A/B testing
     /// untrusted-activation against trusted input per page.
     pub js_click: bool,
-    /// Transient action hint shown in the card header ("Opening link…"):
-    /// instant feedback that a click landed, so a slow-or-dead page reads
-    /// as such instead of a dropped input. Superseded by Loading…/Error,
-    /// expires after a few seconds.
-    pub action_hint: Option<(String, Instant)>,
     /// R3 rising-edge latch for the issue flag (R3 carries no NavAction).
     pub r3_latched: bool,
-    /// Last sent mouse position (quantized px), so the pad cursor streams
-    /// moves to the engine only when it actually travels. Never persisted.
-    pub last_sent_mouse: Option<(i32, i32)>,
     /// Browser debug overlay + shots (Diagnostics toggle / F10, mirrored
     /// from App). Never persisted.
     pub debug_overlay: bool,
@@ -909,21 +960,128 @@ pub struct BrowserPanel {
     /// the bookmark bar and history rows. Capped; oldest evicted first.
     pub favicons: HashMap<String, iced::widget::image::Handle>,
     pub favicon_order: Vec<String>,
-    /// Hold-bumper history selector overlay (B2.4). `None` = closed.
-    pub history_selector: Option<HistorySelector>,
-    /// Page-driven focus target (autofocus / JS `.focus()`): UI id to dock
-    /// when it next resolves in the live set. One shot per tree — a culled
-    /// target never docks ("if possible").
-    pub pending_focus: Option<u64>,
-    /// Last left-stick vector seen by the cursor tick. Autofocus docking
-    /// requires the stick at rest (an active steer means the user is driving
-    /// and wins over the page).
-    pub last_pad_stick: (f32, f32),
-    /// Engine phase for the status strip (navigate → load → DOM boot).
-    pub engine_activity: crate::browser::engine::EngineActivity,
+}
+
+impl std::ops::Deref for BrowserPanel {
+    type Target = BrowserTabPage;
+
+    /// Live page state is always the active tab's — `panel.session`,
+    /// `panel.cursor` and friends address it directly.
+    fn deref(&self) -> &Self::Target {
+        &self.page
+    }
+}
+
+impl std::ops::DerefMut for BrowserPanel {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.page
+    }
+}
+
+impl Default for BrowserPanel {
+    /// Fresh panel: one implicit boot tab (matches the worker's
+    /// `TabId::BOOT`); the next explicit tab takes id 2.
+    fn default() -> Self {
+        Self {
+            page: BrowserTabPage::default(),
+            stored: Vec::new(),
+            order: vec![crate::browser::engine::TabId::BOOT],
+            active_tab: crate::browser::engine::TabId::BOOT,
+            next_tab_id: 2,
+            draft: String::new(),
+            url_editing: false,
+            last_shot: None,
+            last_dock_change: None,
+            js_click: false,
+            r3_latched: false,
+            debug_overlay: false,
+            bookmarks: Vec::new(),
+            bookmark_bubble: false,
+            bookmark_name_draft: String::new(),
+            favicons: HashMap::new(),
+            favicon_order: Vec::new(),
+        }
+    }
 }
 
 impl BrowserPanel {
+    /// Find a background tab's stored state.
+    pub fn stored_mut(&mut self, id: crate::browser::engine::TabId) -> Option<&mut StoredTab> {
+        self.stored.iter_mut().find(|t| t.id == id)
+    }
+
+    /// Stash the live page as a background tab under its current id. Called
+    /// before the live slot is reset for a new/adopted tab or swapped with
+    /// a stored one.
+    pub fn stash_live(&mut self) {
+        let page = std::mem::take(&mut self.page);
+        let id = self.active_tab;
+        if let Some(slot) = self.stored.iter_mut().find(|t| t.id == id) {
+            slot.page = page;
+        } else {
+            self.stored.push(StoredTab { id, page });
+            if !self.order.contains(&id) {
+                self.order.push(id);
+            }
+        }
+    }
+
+    /// Load a background tab into the live slot: the live page swaps into
+    /// the stored slot (order untouched), the stored page becomes live.
+    /// Returns false for unknown ids.
+    pub fn activate_stored(&mut self, id: crate::browser::engine::TabId) -> bool {
+        if id == self.active_tab {
+            return true;
+        }
+        let Some(pos) = self.stored.iter().position(|t| t.id == id) else {
+            return false;
+        };
+        std::mem::swap(&mut self.page, &mut self.stored[pos].page);
+        self.stored[pos].id = self.active_tab;
+        self.active_tab = id;
+        true
+    }
+
+    /// Drop a background tab's stored state (the engine side closes via
+    /// `CloseTab`). Returns false when the id is live or unknown.
+    pub fn drop_stored(&mut self, id: crate::browser::engine::TabId) -> bool {
+        if id == self.active_tab {
+            return false;
+        }
+        let Some(pos) = self.stored.iter().position(|t| t.id == id) else {
+            return false;
+        };
+        self.stored.remove(pos);
+        self.order.retain(|o| *o != id);
+        true
+    }
+
+    /// Title for a tab id (live or stored): page title, else URL, else home.
+    pub fn tab_title(&self, id: crate::browser::engine::TabId) -> String {
+        let page = if id == self.active_tab {
+            Some(&self.page)
+        } else {
+            self.stored.iter().find(|t| t.id == id).map(|t| &t.page)
+        };
+        match page {
+            Some(p) => {
+                let url = p.session.url();
+                p.session
+                    .title()
+                    .map(str::to_string)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| {
+                        if url.is_empty() {
+                            crate::browser::BROWSER_HOME_URL.to_string()
+                        } else {
+                            url.to_string()
+                        }
+                    })
+            }
+            None => String::new(),
+        }
+    }
+
     pub fn toggle(&mut self) {
         if self.session.is_open() {
             self.session.close_surface();
@@ -998,13 +1156,15 @@ impl BrowserPanel {
             .map(|t| now.saturating_duration_since(t).as_secs_f32().min(0.1))
             .unwrap_or(0.0);
         self.analog_at = Some(now);
-        self.cursor.advance(lx, ly, dt, &self.focusables);
+        let (cursor, focusables) = (&mut self.page.cursor, &self.page.focusables);
+        cursor.advance(lx, ly, dt, focusables);
         (rx * SCROLL_SPEED * dt, ry * SCROLL_SPEED * dt)
     }
 
     /// D-pad focus step: directional jump, falling back to a nudge.
     pub fn jump_cursor(&mut self, dir: crate::browser::cursor::JumpDir) {
-        self.cursor.jump(dir, &self.focusables);
+        let (cursor, focusables) = (&mut self.page.cursor, &self.page.focusables);
+        cursor.jump(dir, focusables);
     }
 }
 
@@ -1398,6 +1558,39 @@ fn browser_history_selector(panel: &BrowserPanel) -> Element<'_, StartMessage> {
         .into()
 }
 
+/// Chrome-style tab strip: one slot per tab in creation order (active
+/// highlighted), `×` closes, `+` opens. Mouse-clickable today; pad focus
+/// across the header (same dock language as the viewport) is the follow-up.
+fn browser_tab_strip(panel: &BrowserPanel) -> Element<'_, StartMessage> {
+    let mut strip = row![].spacing(4).align_y(Alignment::Center);
+    for id in &panel.order {
+        let id = *id;
+        let title = text_fit::ellipsize_to_width(panel.tab_title(id), 11.0, 140.0);
+        let tab_btn = if id == panel.active_tab {
+            button(text(title).size(11.0).color(theme::INK))
+                .padding([4, 8])
+                .style(theme::primary)
+        } else {
+            button(text(title).size(11.0).color(theme::INK))
+                .padding([4, 8])
+                .on_press(StartMessage::BrowserTabSwitch(id))
+                .style(theme::ghost)
+        };
+        let close = button(text("×").size(11.0).color(theme::MUTED))
+            .padding([4, 6])
+            .on_press(StartMessage::BrowserTabClose(id))
+            .style(theme::ghost);
+        strip = strip.push(row![tab_btn, close].spacing(0).align_y(Alignment::Center));
+    }
+    strip = strip.push(
+        button(text("+").size(14.0))
+            .padding([4, 10])
+            .on_press(StartMessage::BrowserTabNew)
+            .style(theme::ghost),
+    );
+    strip.into()
+}
+
 /// Hovered link target, if the cursor sits on a link with a URL: the
 /// Chrome-style status-bar URL. Viewport-space point against the translated
 /// tree; first id-order match wins (stable across pulls).
@@ -1488,6 +1681,9 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
             text(status).size(12.0).color(theme::MUTED),
         ]
         .align_y(Alignment::Center),
+        space().height(4),
+        // Tab strip first (Chrome order): tabs, then the toolbar.
+        browser_tab_strip(panel),
         space().height(4),
         // Chrome-order toolbar: traverse, reload, home, address, star, go.
         // Back/forward grey out with no session entries in that direction
@@ -4945,6 +5141,60 @@ mod tests {
         assert!(!sample_controller(true, false).show_power_off());
         assert!(!sample_controller(false, true).show_power_off());
         assert!(!sample_controller(false, false).show_power_off());
+    }
+
+    #[test]
+    fn tab_stash_activate_round_trips_live_page() {
+        use crate::browser::engine::TabId;
+        let mut panel = BrowserPanel::default();
+        assert_eq!(panel.active_tab, TabId::BOOT);
+        assert_eq!(panel.order, vec![TabId::BOOT]);
+        // Live page belongs to boot: visiting a URL then stashing keeps it.
+        panel.session.begin_load("https://a.test/".to_string());
+        panel.stash_live();
+        assert_eq!(panel.stored.len(), 1);
+        assert_eq!(panel.stored[0].id, TabId::BOOT);
+        assert_eq!(panel.stored[0].page.session.url(), "https://a.test/");
+        assert_eq!(panel.order, vec![TabId::BOOT]);
+        // New tab id takes the live slot; switching back restores the page.
+        let second = TabId(panel.next_tab_id);
+        panel.next_tab_id += 1;
+        panel.active_tab = second;
+        panel.order.push(second);
+        panel.session.begin_load("https://b.test/".to_string());
+        assert!(panel.activate_stored(TabId::BOOT));
+        assert_eq!(panel.active_tab, TabId::BOOT);
+        assert_eq!(panel.session.url(), "https://a.test/");
+        assert_eq!(panel.stored.len(), 1);
+        assert_eq!(panel.stored[0].id, second);
+        assert_eq!(panel.stored[0].page.session.url(), "https://b.test/");
+        // Order never shuffles on switch.
+        assert_eq!(panel.order, vec![TabId::BOOT, second]);
+        // Unknown ids refuse.
+        assert!(!panel.activate_stored(TabId(999)));
+        assert!(!panel.drop_stored(TabId(999)));
+        // Dropping the background tab leaves live untouched.
+        assert!(panel.drop_stored(second));
+        assert!(panel.stored.is_empty());
+        assert_eq!(panel.active_tab, TabId::BOOT);
+        assert!(!panel.drop_stored(TabId::BOOT));
+    }
+
+    #[test]
+    fn tab_title_falls_back_to_url_then_home() {
+        use crate::browser::engine::TabId;
+        let mut panel = BrowserPanel::default();
+        // Fresh boot tab: home.
+        assert_eq!(
+            panel.tab_title(TabId::BOOT),
+            crate::browser::BROWSER_HOME_URL
+        );
+        panel.session.begin_load("https://a.test/page".to_string());
+        assert_eq!(panel.tab_title(TabId::BOOT), "https://a.test/page");
+        panel.session.note_title(Some("A page".to_string()));
+        assert_eq!(panel.tab_title(TabId::BOOT), "A page");
+        // Unknown id: empty (no strip slot renders it).
+        assert!(panel.tab_title(TabId(999)).is_empty());
     }
 
     #[test]
