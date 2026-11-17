@@ -659,9 +659,6 @@ fn run(
         let mut shutdown = false;
         while let Ok(command) = rx.try_recv() {
             if let EngineCommand::Shutdown { done } = command {
-                // TEMP-DIAG(cookies): trace the shutdown handshake until the
-                // missing cookie_jar.json is explained.
-                crate::platform::app_log::info("servo-engine: worker shutdown received");
                 shutdown_done = Some(done);
                 shutdown = true;
                 break;
@@ -709,9 +706,7 @@ fn run(
     // Synchronous constellation shutdown happens in Servo's Drop below — the
     // resource thread flushes cookie_jar.json before it returns. Signal the
     // waiter only after that completes, so process exit can't win the race.
-    // TEMP-DIAG(cookies): trace until the missing cookie_jar.json is explained.
     drop(servo);
-    crate::platform::app_log::info("servo-engine: servo dropped, shutdown complete");
     if let Some(done) = shutdown_done {
         let _ = done.send(());
     }
