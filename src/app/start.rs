@@ -1216,16 +1216,19 @@ impl App {
         let (x, y, target) = {
             let panel = &self.start_state.browser;
             let (x, y) = panel.cursor.click_point(&panel.focusables);
-            // JS element-click is opt-in per the Diagnostics toggle and only
-            // ever addresses Button-kind dock targets; everything else (and
-            // the default) goes through the trusted synthetic path, which the
-            // backend also falls back to when the element is gone.
+            // Exact-element targets: docked buttons honor the Diagnostics
+            // JS-click toggle (untrusted-activation A/B); docked links
+            // always go exact — synthetic Down/Up pairs demonstrably never
+            // navigated, so there is nothing to A/B there. The backend
+            // falls back to synthetic at the point when the element is gone.
             let target = match panel.cursor.attached {
                 Some(id)
-                    if panel.js_click
-                        && panel.focusables.iter().any(|o| {
-                            o.id == id && o.kind == crate::browser::cursor::FocusKind::Button
-                        }) =>
+                    if panel.focusables.iter().any(|o| {
+                        o.id == id
+                            && (o.kind == crate::browser::cursor::FocusKind::Link
+                                || (o.kind == crate::browser::cursor::FocusKind::Button
+                                    && panel.js_click))
+                    }) =>
                 {
                     Some(id)
                 }
