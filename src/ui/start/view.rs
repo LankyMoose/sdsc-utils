@@ -1301,14 +1301,53 @@ impl BrowserPanel {
         self.analog_at = Some(now);
         // One continuous surface: page targets plus synthetic chrome.
         let targets = cursor_targets(&self.page.focusables, &self.chrome);
+        #[cfg(debug_assertions)]
+        let before = self.page.cursor.attached;
+        #[cfg(debug_assertions)]
+        let (bx, by) = (self.page.cursor.x, self.page.cursor.y);
         let cursor = &mut self.page.cursor;
         cursor.advance(lx, ly, dt, &targets);
+        #[cfg(debug_assertions)]
+        {
+            let after = self.page.cursor.attached;
+            if before != after {
+                let describe = |id: Option<u64>| match id {
+                    None => "free".to_string(),
+                    Some(i) => match targets.iter().find(|o| o.id == i) {
+                        Some(o) => format!(
+                            "#{i} {:?} ({:.0},{:.0},{:.0}x{:.0}){}",
+                            o.kind,
+                            o.x,
+                            o.y,
+                            o.w,
+                            o.h,
+                            if i >= crate::browser::cursor::CHROME_ID_BASE {
+                                " chrome"
+                            } else {
+                                ""
+                            }
+                        ),
+                        None => format!("#{i} gone"),
+                    },
+                };
+                crate::platform::app_log::info(format!(
+                    "cursor dock {} -> {} stick=({lx:.2},{ly:.2}) pos=({bx:.0},{by:.0})",
+                    describe(before),
+                    describe(after),
+                ));
+            }
+        }
         (rx * SCROLL_SPEED * dt, ry * SCROLL_SPEED * dt)
     }
 
     /// D-pad focus step: directional jump, falling back to a nudge. Same
     /// unified surface — jumps fly into header slots and back out.
     pub fn jump_cursor(&mut self, dir: crate::browser::cursor::JumpDir) {
+        #[cfg(debug_assertions)]
+        crate::platform::app_log::info(format!(
+            "cursor jump {dir:?} from={:?} at=({:.0},{:.0})",
+            self.page.cursor.attached, self.page.cursor.x, self.page.cursor.y,
+        ));
         let targets = cursor_targets(&self.page.focusables, &self.chrome);
         self.page.cursor.jump(dir, &targets);
     }
