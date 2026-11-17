@@ -1188,8 +1188,8 @@ impl App {
 
     /// Stream the pad cursor as the one true mouse (see `EngineCommand::MouseMove`):
     /// quantized to whole px so a resting cursor sends nothing. Called once
-    /// per browser tick AFTER input handling, so stick glides, D-pad jumps
-    /// and nudges — every cursor mover — converge on one sync point.
+    /// per browser tick AFTER input handling, so stick glides and D-pad
+    /// jumps — every cursor mover — converge on one sync point.
     pub(crate) fn sync_browser_mouse(&mut self) -> Task<Message> {
         // Clamped out of the header zone (see `sync_live_mouse`).
         let (qx, qy) = (
@@ -3162,7 +3162,7 @@ impl App {
         } else if browser_open {
             // Controller-first input. Engine mode (frames on screen): the
             // left stick moves the virtual cursor (magnetic snap), the
-            // D-pad jumps/nudges it, the right stick scrolls, L1/R1 travel
+            // D-pad jumps between targets, the right stick scrolls, L1/R1 travel
             // history (tap) or open the history selector (hold, B2.4),
             // Cross clicks, Square tabs DOM focus, Triangle edits
             // the URL, Circle backs out or closes. Reader mode keeps the

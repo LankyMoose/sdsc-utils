@@ -34,8 +34,6 @@ pub enum FocusKind {
     Other,
 }
 
-/// D-pad nudge step in page pixels.
-pub const NUDGE_STEP: f32 = 32.0;
 /// Left-stick cursor acceleration at full deflection, px/s^2.
 pub const CURSOR_ACCEL: f32 = 7000.0;
 /// Left-stick cursor top speed, px/s.
@@ -51,8 +49,8 @@ pub const HOLD_PAD: f32 = 24.0;
 /// Dock-blend rate: the outline morphs free↔docked in ~140ms, eased every
 /// analog tick so no frame pops.
 pub const DOCK_BLEND_PER_SEC: f32 = 7.0;
-/// D-pad flight speed, px/s: jumps and nudges glide to the target instead
-/// of teleporting; stick input cancels back to manual control.
+/// D-pad flight speed, px/s: jumps glide to the target instead of
+/// teleporting; stick input cancels back to manual control.
 pub const FLY_SPEED: f32 = 2400.0;
 /// Break-free stick deflection while docked: past 25% a *fresh* push
 /// releases at once (detach + outward kick) instead of dragging the dock
@@ -113,7 +111,7 @@ pub struct Cursor {
     /// Last docked rect (page px), kept across undock so the wrap visibly
     /// morphs back into the dot instead of vanishing.
     pub last_dock: Option<(f32, f32, f32, f32)>,
-    /// D-pad flight target (page px): jumps/nudges glide here at
+    /// D-pad flight target (page px): jumps glide here at
     /// [`FLY_SPEED`] instead of teleporting; stick input cancels.
     pub fly_to: Option<(f32, f32)>,
     /// Break-free suppression: id that must not re-dock until the point
@@ -131,20 +129,6 @@ pub struct Cursor {
     /// at. Off = pure free-form virtual mouse; D-pad jumping still applies.
     pub magnet: bool,
     pub visible: bool,
-}
-
-/// 60-degree cone test shared by jumping (scoring) and nudging
-/// (boundedness): lateral offset must stay within the forward run,
-/// strictly forward.
-fn cone_hit(item: &Focusable, x: f32, y: f32, dx: f32, dy: f32) -> bool {
-    let cx = item.x + item.w / 2.0 - x;
-    let cy = item.y + item.h / 2.0 - y;
-    let along = cx * dx + cy * dy;
-    if along <= 0.0 {
-        return false;
-    }
-    let across = (cx * dy - cy * dx).abs();
-    across <= along
 }
 
 impl Cursor {
@@ -192,7 +176,7 @@ impl Cursor {
 
     /// Analog velocity step, D-pad flights, and dock morph state. The stick
     /// accelerates a velocity vector and friction decays it; flights glide
-    /// to jump/nudge targets (stick cancels). Attachment + `dock_blend`
+    /// to jump targets (stick cancels). Attachment + `dock_blend`
     /// ease every tick, so the overlay never pops.
     pub fn advance(&mut self, lx: f32, ly: f32, dt_secs: f32, options: &[Focusable]) {
         // D-pad flights glide to the target; stick input cancels back to
@@ -313,42 +297,11 @@ impl Cursor {
         }
     }
 
-    /// Nudge for D-pad taps: a short flight, not a step. Kills velocity so a
-    /// tap never inherits drift; arrival docks via the next `advance`.
-    /// Bounded: with nothing dockable that way the point stays put instead
-    /// of flying off into empty space (observed: Up off the tab strip
-    /// stranding the cursor, invisible, above the header).
-    pub fn nudge(&mut self, dir: JumpDir, options: &[Focusable]) {
-        let (dx, dy) = match dir {
-            JumpDir::Up => (0.0, -NUDGE_STEP),
-            JumpDir::Down => (0.0, NUDGE_STEP),
-            JumpDir::Left => (-NUDGE_STEP, 0.0),
-            JumpDir::Right => (NUDGE_STEP, 0.0),
-        };
-        if dx == 0.0 && dy == 0.0 {
-            return;
-        }
-        // No-dock flight to nowhere reads as a lost cursor: only leave when
-        // something lies in that direction (the cone test matches `jump`).
-        // Sparse-page travel still works — a far target in-cone counts, and
-        // repeated nudges walk up to it.
-        let anywhere = options.iter().any(|o| cone_hit(o, self.x, self.y, dx, dy));
-        if !anywhere {
-            return;
-        }
-        self.attached = None;
-        self.vx = 0.0;
-        self.vy = 0.0;
-        self.fly_to = Some((
-            (self.x + dx).clamp(0.0, VIEWPORT_W),
-            (self.y + dy).clamp(CURSOR_MIN_Y, VIEWPORT_H),
-        ));
-    }
-
-    /// Directional jump to the nearest *other* element roughly in `dir`;
-    /// falls back to a nudge when nothing lies that way. Returns true on a
-    /// jump. The point flies to the target and docks on arrival — no
-    /// teleport frames. D-pad always snaps — this ignores the magnet toggle.
+    /// Directional jump to the nearest *other* element roughly in `dir`.
+    /// Returns true on a jump; with nothing that way it returns false and
+    /// the point stays put. The point flies to the target and docks on
+    /// arrival — no teleport frames. D-pad always snaps — this ignores the
+    /// magnet toggle.
     pub fn jump(&mut self, dir: JumpDir, options: &[Focusable]) -> bool {
         let (dx, dy) = match dir {
             JumpDir::Up => (0.0, -1.0),
@@ -389,7 +342,6 @@ impl Cursor {
             }
             true
         } else {
-            self.nudge(dir, options);
             false
         }
     }
@@ -647,9 +599,9 @@ mod tests {
         }
         assert_eq!(c.attached, Some(2), "docked on arrival");
         assert!((c.x - 450.0).abs() < 1.0 && (c.y - 115.0).abs() < 1.0);
-        // Nothing above: bounded nudge stays docked instead of flying off
-        // into empty space — D-pad at the edge is a no-op, not a void trip.
-        // (Advancing against an empty tree still detaches — page gone.)
+        // Nothing above: the jump is a no-op that stays docked instead of
+        // flying off into empty space. (Advancing against an empty tree
+        // still detaches — page gone.)
         assert!(!c.jump(JumpDir::Up, &[]));
         assert_eq!(c.attached, Some(2));
         assert!((c.x - 450.0).abs() < 1.0 && (c.y - 115.0).abs() < 1.0);
@@ -980,10 +932,10 @@ mod tests {
     }
 
     #[test]
-    fn nudge_into_void_stays_put() {
-        // D-pad Up off the top strip row used to fly the cursor into empty
-        // space above the header (invisible, nothing to dock to). Bounded
-        // nudges stay docked when nothing lies that way.
+    fn jump_into_void_stays_put() {
+        // D-pad past the last element is a no-op: it used to nudge the
+        // cursor into empty space above the header (invisible, nothing to
+        // dock to). Jump-only movement stays exactly put.
         let mut c = Cursor::new();
         let tab = Focusable {
             id: CHROME_ID_BASE,
@@ -1001,8 +953,27 @@ mod tests {
         assert_eq!(c.attached, Some(CHROME_ID_BASE));
         assert!(!c.jump(JumpDir::Up, &items));
         assert_eq!(c.attached, Some(CHROME_ID_BASE));
-        // Dock re-pins to the slot center; the blocked nudge moves nothing.
+        // Dock re-pins to the slot center; the blocked press moves nothing.
         assert_eq!((c.x, c.y), (92.5, -94.0));
+        assert!(c.fly_to.is_none());
+    }
+
+    #[test]
+    fn docked_last_link_does_not_nudge_off_bottom() {
+        // Observed: docked on the last visible link, Down nudged the dot
+        // 32px into the viewport's bottom edge and off the element. The
+        // attached link's center sits a fraction below the point, which is
+        // what used to authorize the nudge.
+        let mut c = Cursor::new();
+        let last = link(61, 115.0, 554.0);
+        let items = [last];
+        c.x = 165.0;
+        c.y = 568.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(61));
+        assert!(!c.jump(JumpDir::Down, &items));
+        assert_eq!(c.attached, Some(61), "still docked");
+        assert_eq!(c.y, 569.0, "pinned to the element center, not the edge");
         assert!(c.fly_to.is_none());
     }
 

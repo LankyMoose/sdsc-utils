@@ -1430,8 +1430,8 @@ impl BrowserPanel {
         };
         let x = self.page.cursor.x;
         match (cur_row, dir) {
-            // Header horizontals: same row only (bounded nudge stops at the
-            // ends instead of flying off).
+            // Header horizontals: same row only; nothing in that direction
+            // means a no-op (stop at the row's ends).
             (Some(r), JumpDir::Left | JumpDir::Right) => {
                 let items = row_items(r);
                 self.page.cursor.jump(dir, &items);
