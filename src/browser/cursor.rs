@@ -88,7 +88,7 @@ pub enum JumpDir {
     Right,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Cursor {
     pub x: f32,
     pub y: f32,
@@ -140,7 +140,20 @@ impl Cursor {
             visible: true,
         }
     }
+}
 
+impl Default for Cursor {
+    /// A fresh cursor is a live one: centered, magnetized, visible — the
+    /// same as [`Cursor::new`]. (A derived `Default` would park it at
+    /// (0,0) with the magnet off, which silently disables autofocus
+    /// docking on any page state built by derivation — observed on new
+    /// tabs.)
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Cursor {
     /// Free movement with viewport clamping. Any manual move drops the
     /// attachment first; docking re-engages on arrival.
     pub fn move_by(&mut self, dx: f32, dy: f32) {
@@ -495,6 +508,19 @@ mod tests {
             kind: FocusKind::Link,
             url: None,
         }
+    }
+
+    #[test]
+    fn default_cursor_is_live() {
+        // Fresh page states derive their cursor: it must be centered,
+        // magnetized and visible — a derived (0,0)/magnet-off default
+        // silently disabled autofocus docking on new tabs.
+        let c = Cursor::default();
+        assert_eq!((c.x, c.y), (VIEWPORT_W / 2.0, VIEWPORT_H / 2.0));
+        assert!(c.magnet);
+        assert!(c.visible);
+        assert!(c.attached.is_none());
+        assert!(c.fly_to.is_none());
     }
 
     #[test]
