@@ -133,6 +133,25 @@ pub struct Cursor {
     pub visible: bool,
 }
 
+/// 60-degree cone test shared by jumping (scoring) and nudging
+/// (boundedness): lateral offset must stay within the forward run,
+/// strictly forward.
+fn cone_hit(item: &Focusable, x: f32, y: f32, dx: f32, dy: f32) -> bool {
+    let cx = item.x + item.w / 2.0 - x;
+    let cy = item.y + item.h / 2.0 - y;
+    let along = cx * dx + cy * dy;
+    if along <= 0.0 {
+        return false;
+    }
+    let across = (cx * dy - cy * dx).abs();
+    across <= along
+}
+
+/// Same-row band for header-zone horizontal jumps: a wide slot's center
+/// can otherwise prefer a nearer row above/below over the adjacent
+/// same-row button (observed: omnibox-Left landing two rows up).
+pub const HEADER_ROW_BAND: f32 = 24.0;
+
 impl Cursor {
     pub fn new() -> Self {
         Self {
@@ -301,7 +320,10 @@ impl Cursor {
 
     /// Nudge for D-pad taps: a short flight, not a step. Kills velocity so a
     /// tap never inherits drift; arrival docks via the next `advance`.
-    pub fn nudge(&mut self, dir: JumpDir, _options: &[Focusable]) {
+    /// Bounded: with nothing dockable that way the point stays put instead
+    /// of flying off into empty space (observed: Up off the tab strip
+    /// stranding the cursor, invisible, above the header).
+    pub fn nudge(&mut self, dir: JumpDir, options: &[Focusable]) {
         let (dx, dy) = match dir {
             JumpDir::Up => (0.0, -NUDGE_STEP),
             JumpDir::Down => (0.0, NUDGE_STEP),
@@ -309,6 +331,14 @@ impl Cursor {
             JumpDir::Right => (NUDGE_STEP, 0.0),
         };
         if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        // No-dock flight to nowhere reads as a lost cursor: only leave when
+        // something lies in that direction (the cone test matches `jump`).
+        // Sparse-page travel still works — a far target in-cone counts, and
+        // repeated nudges walk up to it.
+        let anywhere = options.iter().any(|o| cone_hit(o, self.x, self.y, dx, dy));
+        if !anywhere {
             return;
         }
         self.attached = None;
@@ -332,12 +362,20 @@ impl Cursor {
             JumpDir::Right => (1.0, 0.0),
         };
         let mut best: Option<(u64, f32)> = None;
+        // Header zone, horizontal moves: same-band targets only, so a wide
+        // slot's center can't prefer a nearer row above/below over the
+        // adjacent same-row button. Page and vertical moves keep the plain
+        // cone (long-standing feel, untouched).
+        let banded = self.y < 0.0 && (dir == JumpDir::Left || dir == JumpDir::Right);
         for item in options {
             if Some(item.id) == self.attached {
                 continue;
             }
             let cx = item.x + item.w / 2.0 - self.x;
             let cy = item.y + item.h / 2.0 - self.y;
+            if banded && cy.abs() > HEADER_ROW_BAND {
+                continue;
+            }
             let along = cx * dx + cy * dy;
             if along <= 0.0 {
                 continue;
@@ -603,11 +641,12 @@ mod tests {
         }
         assert_eq!(c.attached, Some(2), "docked on arrival");
         assert!((c.x - 450.0).abs() < 1.0 && (c.y - 115.0).abs() < 1.0);
-        // Nothing above: nudge flies upward instead, no dock.
+        // Nothing above: bounded nudge stays docked instead of flying off
+        // into empty space — D-pad at the edge is a no-op, not a void trip.
+        // (Advancing against an empty tree still detaches — page gone.)
         assert!(!c.jump(JumpDir::Up, &[]));
-        c.advance(0.0, 0.0, 0.016, &[]);
-        assert!(c.y < 115.0);
-        assert_eq!(c.attached, None);
+        assert_eq!(c.attached, Some(2));
+        assert!((c.x - 450.0).abs() < 1.0 && (c.y - 115.0).abs() < 1.0);
     }
 
     #[test]
@@ -817,6 +856,82 @@ mod tests {
         c2.y = 20.0;
         c2.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c2.attached, Some(1));
+    }
+
+    #[test]
+    fn header_jump_left_stays_in_row() {
+        // The observed miss: docked on the wide omnibox, Left jumped two
+        // rows up to a strip tab whose center was nearer in x than the
+        // adjacent toolbar buttons. Same-band wins in the header.
+        let mut c = Cursor::new();
+        let omni = Focusable {
+            id: CHROME_ID_BASE,
+            x: 228.0,
+            y: -72.0,
+            w: 456.0,
+            h: 36.0,
+            kind: FocusKind::Button,
+            url: None,
+        };
+        let reload = Focusable {
+            id: CHROME_ID_BASE + 1,
+            x: 114.0,
+            y: -72.0,
+            w: 57.0,
+            h: 36.0,
+            kind: FocusKind::Button,
+            url: None,
+        };
+        let strip = Focusable {
+            id: CHROME_ID_BASE + 2,
+            x: 246.0,
+            y: -112.0,
+            w: 185.0,
+            h: 36.0,
+            kind: FocusKind::Button,
+            url: None,
+        };
+        let items = [omni, reload, strip];
+        c.x = 456.0;
+        c.y = -54.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(CHROME_ID_BASE));
+        assert!(c.jump(JumpDir::Left, &items));
+        // Flies to the toolbar neighbor, not the nearer-in-x strip slot.
+        for _ in 0..60 {
+            c.advance(0.0, 0.0, 0.016, &items);
+            if c.attached == Some(CHROME_ID_BASE + 1) {
+                break;
+            }
+        }
+        assert_eq!(c.attached, Some(CHROME_ID_BASE + 1));
+    }
+
+    #[test]
+    fn nudge_into_void_stays_put() {
+        // D-pad Up off the top strip row used to fly the cursor into empty
+        // space above the header (invisible, nothing to dock to). Bounded
+        // nudges stay docked when nothing lies that way.
+        let mut c = Cursor::new();
+        let tab = Focusable {
+            id: CHROME_ID_BASE,
+            x: 0.0,
+            y: -112.0,
+            w: 185.0,
+            h: 36.0,
+            kind: FocusKind::Button,
+            url: None,
+        };
+        let items = [tab];
+        c.x = 92.0;
+        c.y = -94.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(CHROME_ID_BASE));
+        assert!(!c.jump(JumpDir::Up, &items));
+        assert_eq!(c.attached, Some(CHROME_ID_BASE));
+        // Dock re-pins to the slot center; the blocked nudge moves nothing.
+        assert_eq!((c.x, c.y), (92.5, -94.0));
+        assert!(c.fly_to.is_none());
     }
 
     #[test]
