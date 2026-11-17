@@ -590,10 +590,6 @@ fn run(
         .opts(servo_opts)
         .event_loop_waker(Box::new(ThreadWaker { tx: wake_tx }))
         .build();
-    // TEMP-DIAG(cookies): install Servo's logger so the shutdown flow is
-    // observable on stderr (constellation/resource-thread debug lines).
-    // Remove once the missing cookie_jar.json is explained.
-    servo.setup_logging();
     let (dom_tx, dom_rx) = mpsc::channel();
     let shared = Rc::new(RefCell::new(Shared {
         ctx: ctx.clone(),
