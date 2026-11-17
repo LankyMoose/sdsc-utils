@@ -52,9 +52,9 @@ pub const DOCK_BLEND_PER_SEC: f32 = 7.0;
 /// D-pad flight speed, px/s: jumps and nudges glide to the target instead
 /// of teleporting; stick input cancels back to manual control.
 pub const FLY_SPEED: f32 = 2400.0;
-/// Break-free stick deflection while docked: past this the dock releases at
+/// Break-free stick deflection while docked: past 25% the dock releases at
 /// once (detach + outward kick) instead of dragging the dock along.
-pub const BREAK_FREE_DEFLECT: f32 = 0.3;
+pub const BREAK_FREE_DEFLECT: f32 = 0.25;
 /// Outward kick on break-free, px/s: immediate motion in the push direction.
 pub const BREAK_KICK: f32 = 800.0;
 /// Right-stick scroll speed at full deflection, px/s.
@@ -353,8 +353,12 @@ impl Cursor {
             }
         }
         self.attached = best.map(|item| item.id);
-        // Center on dock: the point moves to the middle of the target.
+        // Center on dock: the point moves to the middle of the target, and
+        // any arrival velocity dies here — a docked point never carries
+        // momentum (break-free re-arms from zero with its own kick).
         if let Some(item) = best {
+            self.vx = 0.0;
+            self.vy = 0.0;
             self.x = (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W);
             self.y = (item.y + item.h / 2.0).clamp(0.0, VIEWPORT_H);
             self.last_dock = Some((item.x, item.y, item.w, item.h));
@@ -810,6 +814,35 @@ mod tests {
         c.y = 210.0;
         c.snap(&items);
         assert_eq!(c.click_point(&items), (150.0, 215.0));
+    }
+
+    #[test]
+    fn break_free_needs_quarter_stick() {
+        // Below 25% deflection a dock holds; past it, one tick detaches.
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        c.advance(0.2, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        c.advance(0.26, 0.0, 0.016, &items);
+        assert_eq!(c.attached, None);
+    }
+
+    #[test]
+    fn dock_kills_arrival_velocity() {
+        // Collision zeroes momentum at once: the dock starts from rest, and
+        // any later push-off kick is the only velocity it ever carries.
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 195.0;
+        c.y = 115.0;
+        c.vx = 500.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        assert_eq!((c.vx, c.vy), (0.0, 0.0));
     }
 
     #[test]
