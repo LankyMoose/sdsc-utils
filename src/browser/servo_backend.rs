@@ -590,6 +590,11 @@ fn run(
         .opts(servo_opts)
         .event_loop_waker(Box::new(ThreadWaker { tx: wake_tx }))
         .build();
+    // Servo-side diagnostics (opt-in via RUST_LOG, e.g.
+    // `RUST_LOG=net::resource_thread=debug`): without this, Servo's own
+    // shutdown/storage logs go nowhere, which once hid a cookie-flush
+    // failure behind a successful-looking ack. Harmless when unset.
+    servo.setup_logging();
     let (dom_tx, dom_rx) = mpsc::channel();
     let shared = Rc::new(RefCell::new(Shared {
         ctx: ctx.clone(),
