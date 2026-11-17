@@ -948,6 +948,15 @@ pub struct BrowserPanel {
     pub js_click: bool,
     /// R3 rising-edge latch for the issue flag (R3 carries no NavAction).
     pub r3_latched: bool,
+    /// Synthetic header snap targets: the tab strip, toolbar and bookmarks
+    /// as cursor-space rects above the viewport (negative y), so the pad
+    /// cursor treats chrome and page as one continuous surface. Rebuilt
+    /// whenever the strip or bookmark count changes; ids are stable while
+    /// the set is unchanged so dock attachments survive pulls.
+    pub chrome: Vec<(ChromeTarget, crate::browser::cursor::Focusable)>,
+    /// Next synthetic id (counts up from [`CHROME_ID_BASE`], far above any
+    /// engine-assigned page id).
+    pub chrome_seq: u64,
     /// Browser debug overlay + shots (Diagnostics toggle / F10, mirrored
     /// from App). Never persisted.
     pub debug_overlay: bool,
@@ -984,7 +993,7 @@ impl Default for BrowserPanel {
     /// Fresh panel: one implicit boot tab (matches the worker's
     /// `TabId::BOOT`); the next explicit tab takes id 2.
     fn default() -> Self {
-        Self {
+        let mut panel = Self {
             page: BrowserTabPage::default(),
             stored: Vec::new(),
             order: vec![crate::browser::engine::TabId::BOOT],
@@ -996,13 +1005,17 @@ impl Default for BrowserPanel {
             last_dock_change: None,
             js_click: false,
             r3_latched: false,
+            chrome: Vec::new(),
+            chrome_seq: CHROME_ID_BASE,
             debug_overlay: false,
             bookmarks: Vec::new(),
             bookmark_bubble: false,
             bookmark_name_draft: String::new(),
             favicons: HashMap::new(),
             favicon_order: Vec::new(),
-        }
+        };
+        panel.rebuild_chrome();
+        panel
     }
 }
 
@@ -1099,6 +1112,85 @@ impl BrowserPanel {
     /// Overwrite `tabs.json` with the current strip.
     pub fn save_tabs(&self) {
         crate::browser::tabs::save(&self.snapshot_tabs());
+    }
+
+    /// Rebuild the synthetic chrome map: stable ids while the target set
+    /// is unchanged (dock attachments survive pulls), fresh ids for new
+    /// targets, dropped ids for gone ones (the cursor detaches via the
+    /// normal retarget path). Call after strip/bookmark changes.
+    pub fn rebuild_chrome(&mut self) {
+        use crate::browser::cursor::{FocusKind, Focusable, VIEWPORT_W};
+        let rows = chrome_rows(self);
+        // Row geometry (unified space, top-down): strip, toolbar, bookmarks.
+        let ys = [CHROME_STRIP_Y, CHROME_TOOLBAR_Y, CHROME_BOOKMARKS_Y];
+        let hs = [CHROME_ROW_H, CHROME_ROW_H, CHROME_BOOKMARK_H];
+        let mut fresh = Vec::new();
+        for (r, items) in rows.iter().enumerate() {
+            if items.is_empty() {
+                continue;
+            }
+            let w = VIEWPORT_W / items.len() as f32;
+            for (i, target) in items.iter().enumerate() {
+                let id = match self.chrome.iter().find(|(t, _)| t == target) {
+                    Some((_, f)) => f.id,
+                    None => {
+                        let id = self.chrome_seq;
+                        self.chrome_seq = self.chrome_seq.wrapping_add(1);
+                        id
+                    }
+                };
+                // Chrome slots carry no link target: hover status stays on
+                // the engine phase, and activation never touches the page.
+                fresh.push((
+                    *target,
+                    Focusable {
+                        id,
+                        x: i as f32 * w,
+                        y: ys[r.min(2)],
+                        w,
+                        h: hs[r.min(2)],
+                        kind: FocusKind::Button,
+                        url: None,
+                    },
+                ));
+            }
+        }
+        self.chrome = fresh;
+    }
+
+    /// Chrome target for a cursor attachment id, if synthetic.
+    pub fn chrome_target(&self, id: u64) -> Option<ChromeTarget> {
+        self.chrome
+            .iter()
+            .find(|(_, f)| f.id == id)
+            .map(|(t, _)| *t)
+    }
+
+    /// Currently docked chrome target, if the cursor sits on synthetic
+    /// chrome rather than a page element.
+    pub fn chrome_attached(&self) -> Option<ChromeTarget> {
+        self.cursor.attached.and_then(|id| self.chrome_target(id))
+    }
+
+    /// Pad action for a docked chrome target. `None` when the target needs
+    /// data that vanished (removed bookmark) — the caller exits to the
+    /// viewport instead.
+    pub fn chrome_message(&self, target: ChromeTarget) -> Option<StartMessage> {
+        match target {
+            ChromeTarget::Tab(id) => Some(StartMessage::BrowserTabSwitch(id)),
+            ChromeTarget::TabClose(id) => Some(StartMessage::BrowserTabClose(id)),
+            ChromeTarget::NewTab => Some(StartMessage::BrowserTabNew),
+            ChromeTarget::Back => Some(StartMessage::BrowserBack),
+            ChromeTarget::Forward => Some(StartMessage::BrowserForward),
+            ChromeTarget::Reload => Some(StartMessage::BrowserReload),
+            ChromeTarget::Home => Some(StartMessage::BrowserHome),
+            ChromeTarget::Star => Some(StartMessage::BrowserBookmarkStar),
+            ChromeTarget::Go => Some(StartMessage::BrowserNavigate),
+            ChromeTarget::Bookmark(i) => self
+                .bookmarks
+                .get(i)
+                .map(|b| StartMessage::BrowserAutocompletePick(b.url.clone())),
+        }
     }
 
     /// Title for a tab id (live or stored): page title, else URL, else home.
@@ -1201,15 +1293,18 @@ impl BrowserPanel {
             .map(|t| now.saturating_duration_since(t).as_secs_f32().min(0.1))
             .unwrap_or(0.0);
         self.analog_at = Some(now);
-        let (cursor, focusables) = (&mut self.page.cursor, &self.page.focusables);
-        cursor.advance(lx, ly, dt, focusables);
+        // One continuous surface: page targets plus synthetic chrome.
+        let targets = cursor_targets(&self.page.focusables, &self.chrome);
+        let cursor = &mut self.page.cursor;
+        cursor.advance(lx, ly, dt, &targets);
         (rx * SCROLL_SPEED * dt, ry * SCROLL_SPEED * dt)
     }
 
-    /// D-pad focus step: directional jump, falling back to a nudge.
+    /// D-pad focus step: directional jump, falling back to a nudge. Same
+    /// unified surface — jumps fly into header slots and back out.
     pub fn jump_cursor(&mut self, dir: crate::browser::cursor::JumpDir) {
-        let (cursor, focusables) = (&mut self.page.cursor, &self.page.focusables);
-        cursor.jump(dir, focusables);
+        let targets = cursor_targets(&self.page.focusables, &self.chrome);
+        self.page.cursor.jump(dir, &targets);
     }
 }
 
@@ -1235,8 +1330,10 @@ pub const BROWSER_SCROLL_STEP: f32 = 240.0;
 fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, StartMessage> {
     use crate::browser::cursor::VIEWPORT_W;
     // URL-edit mode owns the keyboard; hide the pad cursor so it never
-    // floats over the page while typing in the address field.
-    if state.browser.url_editing {
+    // floats over the page while typing in the address field. A chrome
+    // dock hides it too — the header chip carries the focus instead (the
+    // overlay clips to the page image and couldn't show it anyway).
+    if state.browser.url_editing || state.browser.chrome_attached().is_some() {
         return space().width(Length::Fixed(0.0)).into();
     }
     let scale = img_w / VIEWPORT_W;
@@ -1248,8 +1345,9 @@ fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, 
     // Dot geometry in page px.
     let (dx, dy) = (cursor.x - 10.0, cursor.y - 10.0);
     // Wrap geometry in page px: live attachment, else the last dock while
-    // blending back out.
-    let wrap = cursor.attached_rect(&panel.focusables).or(cursor.last_dock);
+    // blending back out. Unified targets so a page dock resolves too.
+    let targets = cursor_targets(&panel.focusables, &panel.chrome);
+    let wrap = cursor.attached_rect(&targets).or(cursor.last_dock);
     let (wx, wy, ww, wh) = match wrap {
         Some((x, y, w, h)) => (x - 2.0, y - 2.0, (w + 4.0).max(8.0), (h + 4.0).max(8.0)),
         None => (dx, dy, 20.0, 20.0),
@@ -1457,9 +1555,12 @@ fn browser_bookmark_bar(panel: &BrowserPanel) -> Element<'_, StartMessage> {
         return space().height(Length::Fixed(0.0)).into();
     }
     let mut rows = column![].spacing(4);
+    let mut index = 0;
     for chunk in panel.bookmarks.chunks(6) {
         let mut row_elems = row![].spacing(6);
         for b in chunk {
+            let slot = index;
+            index += 1;
             let mut inner = row![].spacing(6).align_y(Alignment::Center);
             let icon_key = crate::browser::bookmarks::origin_key(&b.url);
             if let Some(icon) = panel.favicons.get(&icon_key) {
@@ -1475,10 +1576,17 @@ fn browser_bookmark_bar(panel: &BrowserPanel) -> Element<'_, StartMessage> {
                     .color(theme::INK),
             );
             row_elems = row_elems.push(
-                button(inner)
-                    .padding([4, 10])
-                    .on_press(StartMessage::BrowserAutocompletePick(b.url.clone()))
-                    .style(theme::ghost),
+                if panel.chrome_attached() == Some(ChromeTarget::Bookmark(slot)) {
+                    button(inner)
+                        .padding([4, 10])
+                        .on_press(StartMessage::BrowserAutocompletePick(b.url.clone()))
+                        .style(theme::chip(true))
+                } else {
+                    button(inner)
+                        .padding([4, 10])
+                        .on_press(StartMessage::BrowserAutocompletePick(b.url.clone()))
+                        .style(theme::ghost)
+                },
             );
         }
         rows = rows.push(row_elems);
@@ -1611,7 +1719,14 @@ fn browser_tab_strip(panel: &BrowserPanel) -> Element<'_, StartMessage> {
     for id in &panel.order {
         let id = *id;
         let title = text_fit::ellipsize_to_width(panel.tab_title(id), 11.0, 140.0);
-        let tab_btn = if id == panel.active_tab {
+        // Ring focus wins over the active-tab highlight (same blue-wrap
+        // language as the viewport dock, discrete variant).
+        let tab_btn = if panel.chrome_attached() == Some(ChromeTarget::Tab(id)) {
+            button(text(title).size(11.0).color(theme::INK))
+                .padding([4, 8])
+                .on_press(StartMessage::BrowserTabSwitch(id))
+                .style(theme::chip(true))
+        } else if id == panel.active_tab {
             button(text(title).size(11.0).color(theme::INK))
                 .padding([4, 8])
                 .style(theme::primary)
@@ -1621,25 +1736,121 @@ fn browser_tab_strip(panel: &BrowserPanel) -> Element<'_, StartMessage> {
                 .on_press(StartMessage::BrowserTabSwitch(id))
                 .style(theme::ghost)
         };
-        let close = button(text("×").size(11.0).color(theme::MUTED))
-            .padding([4, 6])
-            .on_press(StartMessage::BrowserTabClose(id))
-            .style(theme::ghost);
+        let close = if panel.chrome_attached() == Some(ChromeTarget::TabClose(id)) {
+            button(text("×").size(11.0).color(theme::MUTED))
+                .padding([4, 6])
+                .on_press(StartMessage::BrowserTabClose(id))
+                .style(theme::chip(true))
+        } else {
+            button(text("×").size(11.0).color(theme::MUTED))
+                .padding([4, 6])
+                .on_press(StartMessage::BrowserTabClose(id))
+                .style(theme::ghost)
+        };
         strip = strip.push(row![tab_btn, close].spacing(0).align_y(Alignment::Center));
     }
-    strip = strip.push(
+    strip = strip.push(if panel.chrome_attached() == Some(ChromeTarget::NewTab) {
         button(text("+").size(14.0))
             .padding([4, 10])
             .on_press(StartMessage::BrowserTabNew)
-            .style(theme::ghost),
-    );
+            .style(theme::chip(true))
+    } else {
+        button(text("+").size(14.0))
+            .padding([4, 10])
+            .on_press(StartMessage::BrowserTabNew)
+            .style(theme::ghost)
+    });
     strip.into()
+}
+
+/// Pad-navigable chrome target: every header control the pad cursor docks
+/// onto as if it were in-viewport page chrome (same magnet, same
+/// break-free physics — the header rows live just above y=0 in unified
+/// cursor space).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromeTarget {
+    Tab(crate::browser::engine::TabId),
+    TabClose(crate::browser::engine::TabId),
+    NewTab,
+    Back,
+    Forward,
+    Reload,
+    Home,
+    Star,
+    Go,
+    Bookmark(usize),
+}
+
+/// Header rows for pad navigation: tab strip, toolbar, then one row per
+/// bookmark-bar chunk (the bar wraps at 6). Empty rows are skipped by
+/// vertical moves.
+pub fn chrome_rows(panel: &BrowserPanel) -> Vec<Vec<ChromeTarget>> {
+    let mut rows = Vec::new();
+    let mut strip = Vec::with_capacity(panel.order.len() * 2 + 1);
+    for id in &panel.order {
+        strip.push(ChromeTarget::Tab(*id));
+        strip.push(ChromeTarget::TabClose(*id));
+    }
+    strip.push(ChromeTarget::NewTab);
+    rows.push(strip);
+    rows.push(vec![
+        ChromeTarget::Back,
+        ChromeTarget::Forward,
+        ChromeTarget::Reload,
+        ChromeTarget::Home,
+        ChromeTarget::Star,
+        ChromeTarget::Go,
+    ]);
+    // Bookmarks flatten to one row (capped): the unified space keeps a
+    // single bookmarks band; overflow stays mouse-reachable.
+    rows.push(
+        (0..panel.bookmarks.len().min(CHROME_MAX_BOOKMARKS))
+            .map(ChromeTarget::Bookmark)
+            .collect(),
+    );
+    rows
+}
+
+/// True for synthetic chrome ids (pad action, never an engine click).
+pub fn is_chrome_id(id: u64) -> bool {
+    id >= CHROME_ID_BASE
+}
+
+/// Synthetic chrome ids live far above any engine-assigned page id, so a
+/// cursor attachment unambiguously addresses chrome (pad action, never an
+/// engine click) or page (engine click path).
+pub const CHROME_ID_BASE: u64 = 1 << 62;
+
+/// Unified-space geometry (page px): header rows above the viewport.
+pub const CHROME_STRIP_Y: f32 = -112.0;
+pub const CHROME_TOOLBAR_Y: f32 = -72.0;
+pub const CHROME_BOOKMARKS_Y: f32 = -32.0;
+pub const CHROME_ROW_H: f32 = 36.0;
+pub const CHROME_BOOKMARK_H: f32 = 28.0;
+/// Cap on bookmark chrome slots (overflow stays mouse-reachable; magnet
+/// slots must stay wide enough to arrive at).
+pub const CHROME_MAX_BOOKMARKS: usize = 12;
+
+/// Cursor physics space: the page's focusables plus the synthetic header
+/// targets — one continuous magnet/jump/click surface.
+pub fn cursor_targets(
+    page: &[crate::browser::cursor::Focusable],
+    chrome: &[(ChromeTarget, crate::browser::cursor::Focusable)],
+) -> Vec<crate::browser::cursor::Focusable> {
+    let mut out = Vec::with_capacity(page.len() + chrome.len());
+    out.extend_from_slice(page);
+    out.extend(chrome.iter().map(|(_, f)| f.clone()));
+    out
 }
 
 /// Hovered link target, if the cursor sits on a link with a URL: the
 /// Chrome-style status-bar URL. Viewport-space point against the translated
 /// tree; first id-order match wins (stable across pulls).
 fn browser_hover_link(panel: &BrowserPanel) -> Option<String> {
+    // Chrome-docked: the cursor is parked in the header; page hover is stale.
+    if panel.chrome_attached().is_some() {
+        return None;
+    }
     let (x, y) = (panel.cursor.x, panel.cursor.y);
     panel
         .focusables
@@ -1736,7 +1947,10 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         row![
             {
                 let b = button(text("←").size(14.0)).padding([8, 12]);
-                if session.can_go_back() {
+                if panel.chrome_attached() == Some(ChromeTarget::Back) {
+                    b.on_press(StartMessage::BrowserBack)
+                        .style(theme::chip(true))
+                } else if session.can_go_back() {
                     b.on_press(StartMessage::BrowserBack).style(theme::ghost)
                 } else {
                     b.style(theme::ghost)
@@ -1744,20 +1958,37 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
             },
             {
                 let b = button(text("→").size(14.0)).padding([8, 12]);
-                if session.can_go_forward() {
+                if panel.chrome_attached() == Some(ChromeTarget::Forward) {
+                    b.on_press(StartMessage::BrowserForward)
+                        .style(theme::chip(true))
+                } else if session.can_go_forward() {
                     b.on_press(StartMessage::BrowserForward).style(theme::ghost)
                 } else {
                     b.style(theme::ghost)
                 }
             },
-            button(text("⟳").size(14.0))
-                .padding([8, 12])
-                .on_press(StartMessage::BrowserReload)
-                .style(theme::ghost),
-            button(text("⌂").size(14.0))
-                .padding([8, 12])
-                .on_press(StartMessage::BrowserHome)
-                .style(theme::ghost),
+            if panel.chrome_attached() == Some(ChromeTarget::Reload) {
+                button(text("⟳").size(14.0))
+                    .padding([8, 12])
+                    .on_press(StartMessage::BrowserReload)
+                    .style(theme::chip(true))
+            } else {
+                button(text("⟳").size(14.0))
+                    .padding([8, 12])
+                    .on_press(StartMessage::BrowserReload)
+                    .style(theme::ghost)
+            },
+            if panel.chrome_attached() == Some(ChromeTarget::Home) {
+                button(text("⌂").size(14.0))
+                    .padding([8, 12])
+                    .on_press(StartMessage::BrowserHome)
+                    .style(theme::chip(true))
+            } else {
+                button(text("⌂").size(14.0))
+                    .padding([8, 12])
+                    .on_press(StartMessage::BrowserHome)
+                    .style(theme::ghost)
+            },
             text_input("Search or enter URL", &panel.draft)
                 .id(browser_url_id())
                 .size(14.0)
@@ -1765,21 +1996,42 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
                 .on_input(StartMessage::BrowserUrlChanged)
                 .on_submit(StartMessage::BrowserNavigate)
                 .style(theme::input),
-            button(
-                text(if panel.is_bookmarked(session.url()) {
-                    "★"
-                } else {
-                    "☆"
-                })
-                .size(16.0),
-            )
-            .padding([8, 10])
-            .on_press(StartMessage::BrowserBookmarkStar)
-            .style(theme::ghost),
-            button(text("Go").size(14.0))
-                .padding([8, 14])
-                .on_press(StartMessage::BrowserNavigate)
-                .style(theme::primary),
+            if panel.chrome_attached() == Some(ChromeTarget::Star) {
+                button(
+                    text(if panel.is_bookmarked(session.url()) {
+                        "★"
+                    } else {
+                        "☆"
+                    })
+                    .size(16.0),
+                )
+                .padding([8, 10])
+                .on_press(StartMessage::BrowserBookmarkStar)
+                .style(theme::chip(true))
+            } else {
+                button(
+                    text(if panel.is_bookmarked(session.url()) {
+                        "★"
+                    } else {
+                        "☆"
+                    })
+                    .size(16.0),
+                )
+                .padding([8, 10])
+                .on_press(StartMessage::BrowserBookmarkStar)
+                .style(theme::ghost)
+            },
+            if panel.chrome_attached() == Some(ChromeTarget::Go) {
+                button(text("Go").size(14.0))
+                    .padding([8, 14])
+                    .on_press(StartMessage::BrowserNavigate)
+                    .style(theme::chip(true))
+            } else {
+                button(text("Go").size(14.0))
+                    .padding([8, 14])
+                    .on_press(StartMessage::BrowserNavigate)
+                    .style(theme::primary)
+            },
         ]
         .spacing(8)
         .align_y(Alignment::Center),
@@ -5225,6 +5477,42 @@ mod tests {
         assert!(panel.stored.is_empty());
         assert_eq!(panel.active_tab, TabId::BOOT);
         assert!(!panel.drop_stored(TabId::BOOT));
+    }
+
+    #[test]
+    fn chrome_ids_stable_while_set_unchanged() {
+        use crate::browser::engine::TabId;
+        let mut panel = BrowserPanel::default();
+        panel.rebuild_chrome();
+        let first: Vec<(ChromeTarget, u64)> =
+            panel.chrome.iter().map(|(t, f)| (*t, f.id)).collect();
+        assert!(!first.is_empty());
+        // Same set, new bookmark-less rebuild: ids persist.
+        panel.rebuild_chrome();
+        let second: Vec<(ChromeTarget, u64)> =
+            panel.chrome.iter().map(|(t, f)| (*t, f.id)).collect();
+        assert_eq!(first, second);
+        // Rects live above the viewport, within the roam band.
+        for (_, f) in &panel.chrome {
+            assert!(f.y < 0.0);
+            assert!(f.y >= crate::browser::cursor::CURSOR_MIN_Y);
+        }
+        // New tab shifts slots: same targets keep their ids (dock
+        // attachments survive), the new tab gets a fresh one.
+        panel.order.push(TabId(9));
+        panel.rebuild_chrome();
+        for (t, id) in &first {
+            assert_eq!(panel.chrome_target(*id), Some(*t));
+        }
+        let tab_id = panel
+            .chrome
+            .iter()
+            .find(|(t, _)| *t == ChromeTarget::Tab(TabId(9)))
+            .map(|(_, f)| f.id);
+        assert!(tab_id.is_some());
+        assert!(panel.chrome_target(tab_id.unwrap()) == Some(ChromeTarget::Tab(TabId(9))));
+        // Unknown id resolves to nothing (engine page ids are small).
+        assert_eq!(panel.chrome_target(42), None);
     }
 
     #[test]

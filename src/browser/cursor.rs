@@ -78,6 +78,13 @@ pub const SCROLL_SPEED: f32 = 1500.0;
 /// Engine viewport the cursor space matches (see `servo_backend`).
 pub const VIEWPORT_W: f32 = 800.0;
 pub const VIEWPORT_H: f32 = 600.0;
+/// Top of the unified cursor space: the header lives above the viewport as
+/// synthetic snap targets (tab strip, toolbar, bookmarks), so the pad
+/// cursor treats chrome and page as one continuous surface — pushing past
+/// the viewport top walks into the header, pushing back down returns.
+/// The overlay clips to the page image, so the dot hides while docked up
+/// there and the header chip carries the focus instead.
+pub const CURSOR_MIN_Y: f32 = -140.0;
 
 /// Directional jump axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,7 +223,7 @@ impl Cursor {
                     // where the velocity says it is going.
                     let (ex, ey) = Self::exit_point(it, lx, ly);
                     self.x = ex.clamp(0.0, VIEWPORT_W);
-                    self.y = ey.clamp(0.0, VIEWPORT_H);
+                    self.y = ey.clamp(CURSOR_MIN_Y, VIEWPORT_H);
                     self.vx = lx * BREAK_KICK;
                     self.vy = ly * BREAK_KICK;
                 }
@@ -225,7 +232,7 @@ impl Cursor {
                 // motion drags the point along instead of stranding it.
                 if let Some(it) = item {
                     self.x = (it.x + it.w / 2.0).clamp(0.0, VIEWPORT_W);
-                    self.y = (it.y + it.h / 2.0).clamp(0.0, VIEWPORT_H);
+                    self.y = (it.y + it.h / 2.0).clamp(CURSOR_MIN_Y, VIEWPORT_H);
                 }
                 self.ease_blend(dt_secs);
                 return;
@@ -238,13 +245,13 @@ impl Cursor {
             let step = FLY_SPEED * dt_secs;
             if dist <= step.max(1.0) {
                 self.x = tx.clamp(0.0, VIEWPORT_W);
-                self.y = ty.clamp(0.0, VIEWPORT_H);
+                self.y = ty.clamp(CURSOR_MIN_Y, VIEWPORT_H);
                 self.fly_to = None;
                 self.vx = 0.0;
                 self.vy = 0.0;
             } else if dist > 0.0 {
                 self.x = (self.x + dx / dist * step).clamp(0.0, VIEWPORT_W);
-                self.y = (self.y + dy / dist * step).clamp(0.0, VIEWPORT_H);
+                self.y = (self.y + dy / dist * step).clamp(CURSOR_MIN_Y, VIEWPORT_H);
                 self.vx = 0.0;
                 self.vy = 0.0;
             }
@@ -265,7 +272,7 @@ impl Cursor {
         }
         if self.vx != 0.0 || self.vy != 0.0 {
             self.x = (self.x + self.vx * dt_secs).clamp(0.0, VIEWPORT_W);
-            self.y = (self.y + self.vy * dt_secs).clamp(0.0, VIEWPORT_H);
+            self.y = (self.y + self.vy * dt_secs).clamp(CURSOR_MIN_Y, VIEWPORT_H);
         }
         // Docking is arrival-based (see `snap`): the outline only engages
         // once the gliding point actually reaches an element. The morph
@@ -305,7 +312,7 @@ impl Cursor {
         self.vy = 0.0;
         self.fly_to = Some((
             (self.x + dx).clamp(0.0, VIEWPORT_W),
-            (self.y + dy).clamp(0.0, VIEWPORT_H),
+            (self.y + dy).clamp(CURSOR_MIN_Y, VIEWPORT_H),
         ));
     }
 
@@ -349,7 +356,7 @@ impl Cursor {
                 self.vy = 0.0;
                 self.fly_to = Some((
                     (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W),
-                    (item.y + item.h / 2.0).clamp(0.0, VIEWPORT_H),
+                    (item.y + item.h / 2.0).clamp(CURSOR_MIN_Y, VIEWPORT_H),
                 ));
             }
             true
@@ -415,7 +422,7 @@ impl Cursor {
             self.break_armed = false;
             self.docked_for = 0.0;
             self.x = (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W);
-            self.y = (item.y + item.h / 2.0).clamp(0.0, VIEWPORT_H);
+            self.y = (item.y + item.h / 2.0).clamp(CURSOR_MIN_Y, VIEWPORT_H);
             self.last_dock = Some((item.x, item.y, item.w, item.h));
         }
     }
@@ -733,6 +740,39 @@ mod tests {
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1));
         assert_eq!((c.x, c.y), (150.0, 115.0));
+    }
+
+    #[test]
+    fn jump_flies_up_into_header_space() {
+        // Unified cursor space: a D-pad Up from the top page target lands
+        // on the synthetic header slot above the viewport (negative y).
+        let mut c = Cursor::new();
+        let chrome = Focusable {
+            id: 1 << 62,
+            x: 300.0,
+            y: -72.0,
+            w: 100.0,
+            h: 36.0,
+            kind: FocusKind::Button,
+            url: None,
+        };
+        let page = link(1, 300.0, 100.0);
+        let items = [page, chrome];
+        c.x = 350.0;
+        c.y = 115.0;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1));
+        // Push up past the page target: jump targets the header slot.
+        assert!(c.jump(JumpDir::Up, &items));
+        // Fly until arrival (jump glides, docks on arrival).
+        for _ in 0..60 {
+            c.advance(0.0, 0.0, 0.016, &items);
+            if c.attached == Some(1 << 62) {
+                break;
+            }
+        }
+        assert_eq!(c.attached, Some(1 << 62));
+        assert!(c.y < 0.0);
     }
 
     #[test]

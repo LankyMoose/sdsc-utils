@@ -531,9 +531,11 @@ impl App {
     /// resume, tab switch, or popup adopt — hover state went stale).
     pub(crate) fn sync_live_mouse(&mut self) {
         let tab = self.start_state.browser.active_tab;
+        // Clamp out of the header zone: the engine's viewport starts at
+        // y=0 and has no use for negative points.
         let (qx, qy) = (
             self.start_state.browser.cursor.x as i32,
-            self.start_state.browser.cursor.y as i32,
+            self.start_state.browser.cursor.y.max(0.0) as i32,
         );
         self.start_state.browser.last_sent_mouse = Some((qx, qy));
         if let Some(engine) = &self.engine {
@@ -986,6 +988,7 @@ impl App {
                 title,
             });
             crate::browser::bookmarks::save(&panel.bookmarks);
+            panel.rebuild_chrome();
         }
         let draft = panel
             .bookmarks
@@ -1026,6 +1029,7 @@ impl App {
         let panel = &mut self.start_state.browser;
         panel.bookmarks.retain(|b| b.url != url);
         crate::browser::bookmarks::save(&panel.bookmarks);
+        panel.rebuild_chrome();
         panel.bookmark_bubble = false;
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Action);
@@ -1186,9 +1190,10 @@ impl App {
     /// per browser tick AFTER input handling, so stick glides, D-pad jumps
     /// and nudges — every cursor mover — converge on one sync point.
     pub(crate) fn sync_browser_mouse(&mut self) -> Task<Message> {
+        // Clamped out of the header zone (see `sync_live_mouse`).
         let (qx, qy) = (
             self.start_state.browser.cursor.x as i32,
-            self.start_state.browser.cursor.y as i32,
+            self.start_state.browser.cursor.y.max(0.0) as i32,
         );
         if self.start_state.browser.last_sent_mouse != Some((qx, qy)) {
             self.start_state.browser.last_sent_mouse = Some((qx, qy));
@@ -1206,11 +1211,30 @@ impl App {
     /// Click at the cursor: attached element center, else the free point.
     /// Passes the docked target id so Button-kind targets can activate on
     /// the exact element (`__sdsc_click`); everything else (and free
-    /// points) go through the trusted synthetic pair.
+    /// points) go through the trusted synthetic pair. A chrome dock isn't
+    /// a page click at all — it runs the header action instead.
     pub(crate) fn click_browser_cursor(&mut self) -> Task<Message> {
+        // Chrome dock first: pad action, never an engine click.
+        if let Some(target) = self.start_state.browser.chrome_attached() {
+            self.start_state.browser.last_click = Some((
+                (
+                    self.start_state.browser.cursor.x,
+                    self.start_state.browser.cursor.y,
+                ),
+                Instant::now(),
+            ));
+            if let Some(message) = self.start_state.browser.chrome_message(target) {
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: start browser chrome activate {target:?}"
+                ));
+                return self.on_start_message(message);
+            }
+            return Task::none();
+        }
         let (x, y, target) = {
             let panel = &self.start_state.browser;
-            let (x, y) = panel.cursor.click_point(&panel.focusables);
+            let targets = start_view::cursor_targets(&panel.focusables, &panel.chrome);
+            let (x, y) = panel.cursor.click_point(&targets);
             // Exact-element targets: docked buttons honor the Diagnostics
             // JS-click toggle (untrusted-activation A/B); docked links
             // always go exact — synthetic Down/Up pairs demonstrably never
@@ -1265,11 +1289,15 @@ impl App {
     /// scroll, url, wells) and forces a debug shot, so the backend pull log
     /// around this timestamp tells the rest of the story.
     pub(crate) fn flag_browser_issue(&mut self, now: Instant) -> Task<Message> {
+        let targets = start_view::cursor_targets(
+            &self.start_state.browser.page.focusables,
+            &self.start_state.browser.chrome,
+        );
         let panel = &mut self.start_state.browser;
         let (cx, cy) = (panel.cursor.x, panel.cursor.y);
         let dock = panel.cursor.attached;
-        let dock_rect = panel.cursor.attached_rect(&panel.focusables);
-        let would_click = panel.cursor.click_point(&panel.focusables);
+        let dock_rect = panel.cursor.attached_rect(&targets);
+        let would_click = panel.cursor.click_point(&targets);
         let last_click_ago = panel
             .last_click
             .map(|(_, t)| now.saturating_duration_since(t).as_millis());
@@ -1356,13 +1384,14 @@ impl App {
     /// dock / target state for post-hoc outline placement analysis.
     fn save_browser_shot(&mut self, shot: iced::window::Screenshot) -> Task<Message> {
         let panel = &self.start_state.browser;
+        let targets = start_view::cursor_targets(&panel.focusables, &panel.chrome);
         let cursor = (panel.cursor.x, panel.cursor.y);
         let magnet = panel.cursor.magnet;
         let dock = panel.cursor.attached;
         let blend = panel.cursor.dock_blend;
         let rect = panel
             .cursor
-            .attached_rect(&panel.focusables)
+            .attached_rect(&targets)
             .map(|(x, y, w, h)| format!("({x:.0},{y:.0}) {w:.0}x{h:.0}"))
             .unwrap_or_else(|| "-".to_string());
         let wells = panel.focusables.len();
@@ -1415,6 +1444,7 @@ impl App {
                 panel.order.push(tab);
             }
             panel.draft.clear();
+            panel.rebuild_chrome();
             panel.save_tabs();
         }
         self.sync_live_mouse();
@@ -1432,7 +1462,7 @@ impl App {
         let active = self.start_state.browser.active_tab;
         if tab != active {
             self.start_state.browser.drop_stored(tab);
-            self.start_state.browser.save_tabs();
+            self.save_strip();
             return Task::none();
         }
         // Active tab closed by its page: forget it, adopt a survivor.
@@ -1451,7 +1481,7 @@ impl App {
                 debug_assert!(ok);
                 let url = self.start_state.browser.session.url().to_string();
                 self.start_state.browser.draft = url.clone();
-                self.start_state.browser.save_tabs();
+                self.save_strip();
                 if self.engine.is_none() {
                     // Reader fallback: fetch the adopted tab.
                     return self.on_browser_navigate();
@@ -1477,7 +1507,7 @@ impl App {
             panel.draft = url.clone();
             panel.page.session.begin_load(url.clone())
         };
-        self.start_state.browser.save_tabs();
+        self.save_strip();
         if let Some(engine) = &self.engine {
             engine.send(EngineCommand::OpenTab {
                 tab,
@@ -1554,6 +1584,7 @@ impl App {
                 }
             }
             panel.next_tab_id = next_id;
+            panel.rebuild_chrome();
         }
         if let Some(engine) = &self.engine {
             if let Some((tab, url, generation)) = live_load {
@@ -1594,6 +1625,7 @@ impl App {
             panel.order.push(tab);
             panel.draft = url.clone();
             let generation = panel.page.session.begin_load(url.clone());
+            panel.rebuild_chrome();
             panel.save_tabs();
             (tab, generation)
         };
@@ -1634,6 +1666,15 @@ impl App {
         }
         self.sync_live_mouse();
         self.sync_browser_theme();
+    }
+
+    /// Strip changed shape or membership: persist it (`tabs.json`) and
+    /// rebuild the chrome snap map (rects derive from order/bookmarks).
+    /// URL/title-only traffic uses `save_tabs` directly (no geometry
+    /// change, mapping stays valid).
+    pub(crate) fn save_strip(&mut self) {
+        self.start_state.browser.rebuild_chrome();
+        self.start_state.browser.save_tabs();
     }
 
     /// User switches tab (strip click): swap the live page with the stored
@@ -1698,7 +1739,7 @@ impl App {
                 .map(|t| t.loaded)
                 .unwrap_or(false);
             self.start_state.browser.drop_stored(tab);
-            self.start_state.browser.save_tabs();
+            self.save_strip();
             // Unloaded tabs have no view to close (restored, never shown).
             if loaded && let Some(engine) = &self.engine {
                 engine.send(EngineCommand::CloseTab { tab });
@@ -1734,7 +1775,7 @@ impl App {
         self.start_state.browser.order.retain(|o| *o != tab);
         let url = self.start_state.browser.session.url().to_string();
         self.start_state.browser.draft = url.clone();
-        self.start_state.browser.save_tabs();
+        self.save_strip();
         if self.engine.is_none() {
             // Reader fallback: fetch the adopted tab like a fresh navigate.
             return self.on_browser_navigate();
@@ -1837,10 +1878,12 @@ impl App {
                 self.start_state.browser.note_favicon(url, handle);
             }
             EngineEvent::A11yTree { tab: _, items } => {
-                let panel = &mut self.start_state.browser;
-                panel.page.focusables = items;
-                let (cursor, focusables) = (&mut panel.page.cursor, &panel.page.focusables);
-                cursor.retarget(focusables);
+                self.start_state.browser.page.focusables = items;
+                let targets = {
+                    let panel = &self.start_state.browser;
+                    start_view::cursor_targets(&panel.page.focusables, &panel.chrome)
+                };
+                self.start_state.browser.page.cursor.retarget(&targets);
                 // Parked page-focus target: dock when it resolves live; drop
                 // after one tree if it never does (culled targets never
                 // dock). A mid-flight jump keeps the target parked.
@@ -1952,8 +1995,10 @@ impl App {
             return;
         }
         // URL/title changes persist the strip; the borrow ends before the
-        // save (which reborrows the panel).
+        // save (which reborrows the panel). Chrome entries are cloned up
+        // front so the stored borrow below stays uncontended.
         let mut strip_changed = false;
+        let chrome = self.start_state.browser.chrome.clone();
         {
             let Some(stored) = self.start_state.browser.stored_mut(tab) else {
                 return;
@@ -1970,8 +2015,9 @@ impl App {
                 EngineEvent::FaviconChanged { .. } => {}
                 EngineEvent::A11yTree { items, .. } => {
                     stored.page.focusables = items;
-                    let (cursor, focusables) = (&mut stored.page.cursor, &stored.page.focusables);
-                    cursor.retarget(focusables);
+                    let mut all = stored.page.focusables.clone();
+                    all.extend(chrome.iter().map(|(_, f)| f.clone()));
+                    stored.page.cursor.retarget(&all);
                 }
                 EngineEvent::ScrollOffset { x, y, .. } => {
                     stored.page.scroll_offset = (x, y);
