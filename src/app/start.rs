@@ -105,6 +105,7 @@ impl App {
             StartMessage::BrowserOpenExternal => self.on_browser_open_external(),
             StartMessage::BrowserReload => self.on_browser_reload(),
             StartMessage::BrowserHome => self.on_browser_go_home(),
+            StartMessage::BrowserShutdownEngine => self.on_browser_shutdown_engine(),
             StartMessage::BrowserBookmarkStar => self.on_browser_bookmark_star(),
             StartMessage::BrowserBookmarkNameChanged(draft) => {
                 self.start_state.browser.bookmark_name_draft = draft;
@@ -494,6 +495,14 @@ impl App {
         Task::none()
     }
 
+    /// Browser home page. Hardcoded until the settings screen lands, then a
+    /// pref. Reuses the navigate path (fresh-page cursor/focusable reset,
+    /// theme sync) with the draft pinned to home.
+    pub(crate) fn on_browser_go_home(&mut self) -> Task<Message> {
+        self.start_state.browser.draft = Self::BROWSER_HOME_URL.to_string();
+        self.on_browser_navigate()
+    }
+
     /// Resume a suspended engine under an open browser surface. Close
     /// suspends but keeps the cached page, so reopening Start (or the
     /// surface) resumes where it left off: un-suspend, re-show, and re-sync
@@ -733,12 +742,27 @@ impl App {
         Task::none()
     }
 
-    /// Browser home page. Hardcoded until the settings screen lands, then a
-    /// pref. Reuses the navigate path (fresh-page cursor/focusable reset,
-    /// theme sync) with the draft pinned to home.
-    pub(crate) fn on_browser_go_home(&mut self) -> Task<Message> {
-        self.start_state.browser.draft = Self::BROWSER_HOME_URL.to_string();
-        self.on_browser_navigate()
+    /// Browser: shut down the engine worker in-app (diagnostic + resource
+    /// release). Runs the exact clean-shutdown path as quit (worker drain,
+    /// Servo drop with synchronous constellation shutdown, storage flush)
+    /// while the app keeps running — no suspend, no process exit. Fire and
+    /// forget: with no exit following, no ack wait is needed; the cookie jar
+    /// lands in the servo dir within a second or two. NOTE: Servo
+    /// initializes once per process (`OnceLock` panics on re-init), so the
+    /// engine stays down until app restart: the handle is dropped (later
+    /// navigates take the reader fetch path) and the card label flips to
+    /// reader so it never claims a live engine.
+    pub(crate) fn on_browser_shutdown_engine(&mut self) -> Task<Message> {
+        let Some(engine) = self.engine.take() else {
+            return Task::none();
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        engine.send(EngineCommand::Shutdown { done: tx });
+        self.start_state.browser_engine = false;
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Action);
+        crate::platform::app_log::info("ui-diag: engine shutdown requested (in-app, no app exit)");
+        Task::none()
     }
 
     /// Star toggle: bookmark the current page (opening the rename bubble),

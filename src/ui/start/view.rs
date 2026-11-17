@@ -86,6 +86,12 @@ pub enum StartMessage {
     /// Browser: navigate to the home page (hardcoded for now; a settings
     /// screen later makes it configurable).
     BrowserHome,
+    /// Browser: shut down the engine worker in-app (diagnostic + resource
+    /// release). Runs the exact clean-shutdown path as quit (drain, Servo
+    /// drop, storage flush) while the app keeps running. NOTE: Servo
+    /// initializes once per process, so the engine stays down until app
+    /// restart — the card falls back to the reader backend.
+    BrowserShutdownEngine,
     /// Browser: star toggle — bookmark the current page (opening the rename
     /// bubble), or open the bubble for an already-bookmarked page.
     BrowserBookmarkStar,
@@ -1343,6 +1349,13 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
                 button(text("Close").size(14.0))
                     .padding([6, 14])
                     .on_press(StartMessage::ToggleBrowser)
+                    .style(theme::ghost),
+                // In-app engine shutdown: same clean-shutdown path as quit
+                // (storage flush included), app keeps running. One-shot per
+                // process — the browser stays down until app restart.
+                button(text("Exit engine").size(14.0))
+                    .padding([6, 14])
+                    .on_press(StartMessage::BrowserShutdownEngine)
                     .style(theme::ghost),
             ];
             #[cfg(debug_assertions)]
