@@ -138,6 +138,16 @@ struct TabState {
     /// jump — and its older scroll reading then yanks the tracked offset
     /// back (the 0 <-> N blip).
     last_scroll_at: Option<Instant>,
+    /// A user action (click, key, cursor roam) wants fresh targets. Those
+    /// pulls skip the idle breather so interaction stays responsive; the
+    /// page's own mutation pings do not.
+    user_dirty: bool,
+    /// Per-window document token from the install script. A mismatch means
+    /// the document was replaced without a Navigate/history event (same-URL
+    /// reload); that ingest resets the tree. A spurious `Complete` (Servo
+    /// re-reporting a load when the page injects a head resource) keeps the
+    /// token and must not invalidate anything.
+    doc_token: Option<String>,
     /// Monotonic loop counter: proves at least one full tick elapsed.
     spin_seq: u64,
     /// Armed mouse-up completing the previous synthetic click. Down goes
@@ -225,6 +235,8 @@ impl TabState {
             dom_epoch: 0,
             ping_at: None,
             last_scroll_at: None,
+            user_dirty: false,
+            doc_token: None,
             spin_seq: 0,
             pending_click_up: None,
             last_pull_at: None,
@@ -502,10 +514,13 @@ impl WebViewDelegate for Delegate {
                 }
                 state.load_started_at = None;
                 // Fresh document settling in: boot (idempotent install +
-                // snapshot) once rendering lands. New load, new verdicts.
-                // Content arrived; now the DOM observers install.
+                // snapshot) once rendering lands. Do NOT invalidate here:
+                // Servo re-reports `Complete` when the page injects a head
+                // resource without replacing the document (same URL, same
+                // WeakMap). Real document swaps own invalidation —
+                // `clear_tree` for navigations, the document token in
+                // `ingest_dom` for same-URL reloads.
                 state.dom_boot = true;
-                state.dom_epoch = state.dom_epoch.wrapping_add(1);
                 set_activity(&mut state, EngineActivity::Initializing);
                 // Debug-only storage spike diagnostic: one in-page
                 // localStorage/sessionStorage/cookie census per document.
@@ -879,6 +894,24 @@ pub fn spawn_engine(boot_url: &str, initial_size: (u32, u32)) -> Option<EngineHa
     }
 }
 
+/// Apply every queued engine command. Returns `true` when a Shutdown was
+/// received (the worker loop must break so the post-loop Drop can flush).
+fn drain_commands(
+    servo: &Servo,
+    global: &Rc<RefCell<Global>>,
+    rx: &mpsc::Receiver<EngineCommand>,
+    shutdown_done: &mut Option<std::sync::mpsc::Sender<()>>,
+) -> bool {
+    while let Ok(command) = rx.try_recv() {
+        if let EngineCommand::Shutdown { done } = command {
+            *shutdown_done = Some(done);
+            return true;
+        }
+        apply_command(servo, global, command);
+    }
+    false
+}
+
 fn run(
     rx: mpsc::Receiver<EngineCommand>,
     wake_tx: mpsc::Sender<EngineCommand>,
@@ -1007,16 +1040,7 @@ fn run(
     // below can signal only after Servo (and its cookie flush) completes.
     let mut shutdown_done: Option<std::sync::mpsc::Sender<()>> = None;
     loop {
-        let mut shutdown = false;
-        while let Ok(command) = rx.try_recv() {
-            if let EngineCommand::Shutdown { done } = command {
-                shutdown_done = Some(done);
-                shutdown = true;
-                break;
-            }
-            apply_command(&servo, &global, command);
-        }
-        if shutdown {
+        if drain_commands(&servo, &global, &rx, &mut shutdown_done) {
             break;
         }
         // Complete previous synthetic clicks: Down went out with its
@@ -1051,29 +1075,37 @@ fn run(
                 }
             }
         }
+        // Spin first: Servo renders and copies frames here, which can take
+        // hundreds of milliseconds at wide viewports. Drain again afterwards
+        // so a scroll command that arrived during the spin updates
+        // `last_scroll_at` before the pull gate reads it; otherwise a fresh
+        // gesture looks older than the quiet window and a query launches
+        // mid-scroll (the page then stalls and the offset blips).
+        let suspended = global.borrow().suspended;
+        if !suspended {
+            servo.spin_event_loop();
+        }
+        if drain_commands(&servo, &global, &rx, &mut shutdown_done) {
+            break;
+        }
         // Active-tab-only tick work: DOM pulls, probes, and their result
         // drains never run for background tabs (suspend contract), but loads
         // anywhere still time out.
+        let suspended = global.borrow().suspended;
         let active_entry = {
             let global_ref = global.borrow();
             let tab = global_ref.active;
             global_ref.tabs.get(&tab).cloned()
         };
-        {
-            let suspended = global.borrow().suspended;
-            if !suspended {
-                servo.spin_event_loop();
-            }
-            check_load_timeout(&global);
-            if let Some(entry) = &active_entry {
-                drain_dom_results(&entry.state);
-                maybe_pull_dom(&entry.webview, &entry.state, &global);
-                poll_probe(&entry.webview, &entry.state);
-                #[cfg(debug_assertions)]
-                maybe_probe_storage(&entry.webview, &entry.state);
-            }
-            std::thread::sleep(if suspended { SUSPENDED_IDLE } else { SPIN_IDLE });
+        check_load_timeout(&global);
+        if let Some(entry) = &active_entry {
+            drain_dom_results(&entry.state);
+            maybe_pull_dom(&entry.webview, &entry.state, &global);
+            poll_probe(&entry.webview, &entry.state);
+            #[cfg(debug_assertions)]
+            maybe_probe_storage(&entry.webview, &entry.state);
         }
+        std::thread::sleep(if suspended { SUSPENDED_IDLE } else { SPIN_IDLE });
     }
     // Synchronous constellation shutdown happens in Servo's Drop below — the
     // resource thread flushes cookie_jar.json before it returns. Signal the
@@ -1209,6 +1241,7 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
             state.dom_dirty = true;
             state.dom_dirty_at = Some(Instant::now());
             state.dom_epoch = state.dom_epoch.wrapping_add(1);
+            state.user_dirty = true;
         }
         EngineCommand::SetDarkMode { dark } => {
             // OS-level theme: every tab's view, not just the active one.
@@ -1272,6 +1305,7 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
                 // Fresh cursor region: hover states may differ here, so
                 // cached visibility verdicts are suspect.
                 state.dom_epoch = state.dom_epoch.wrapping_add(1);
+                state.user_dirty = true;
             }
         }
         EngineCommand::ClickAt { tab, x, y, target } => {
@@ -1351,6 +1385,7 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
             state.dom_dirty = true;
             state.dom_dirty_at = Some(Instant::now());
             state.dom_epoch = state.dom_epoch.wrapping_add(1);
+            state.user_dirty = true;
         }
         EngineCommand::ProbeEventLoop { tab } => {
             let Some(entry) = tab_entry(global, tab) else {
@@ -1623,6 +1658,8 @@ fn clear_tree(state: &mut TabState) {
     state.last_pull_at = None;
     state.last_pull_rtt_ms = 0;
     state.last_scroll_at = None;
+    state.user_dirty = false;
+    state.doc_token = None;
     // Truth bound resets with the document (see `scroll_max`).
     state.scroll_max = (0.0, 0.0);
     // Stale probe reply can never match this document; re-armed per load.
@@ -1692,6 +1729,25 @@ const DOM_SCROLL_QUIET: Duration = Duration::from_millis(400);
 /// scroller must still refresh its targets eventually.
 const DOM_SCROLL_QUIET_MAX: Duration = Duration::from_secs(3);
 
+/// Breathing room after a completed pull for page-driven mutations. On
+/// mutation-heavy pages (Google toggles classes constantly) back-to-back
+/// 1s visibility walks keep the script thread saturated, which shows up as
+/// pixel jitter. User-triggered pulls bypass this.
+const DOM_IDLE_BREATHER: Duration = Duration::from_millis(2000);
+
+/// Minimum spacing from the previous pull. User actions keep the short
+/// floor (hover/click feedback); page-driven mutations get a breather
+/// scaled by the last pass so the script thread stays available for the
+/// page itself.
+fn pull_gap(user_dirty: bool, rtt_ms: u64) -> Duration {
+    let rtt = Duration::from_millis(rtt_ms);
+    if user_dirty {
+        DOM_MIN_PULL_GAP.max(rtt / 2)
+    } else {
+        rtt + DOM_IDLE_BREATHER
+    }
+}
+
 /// Pull the page for its actionable elements (see `browser::dom`). Purely
 /// event-driven — no timers: fires for a pending boot (fresh document or
 /// load settle) or a settled dirty ping from the in-page observers
@@ -1727,27 +1783,39 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<TabState>>, global: &Rc
         // Never measure geometry mid-scroll: the pass blocks the page's
         // script thread and the queued scroll lands as one jump. The dirty
         // flag and timestamp survive, so the refresh fires once the gesture
-        // goes quiet. Boot pulls are exempt (a fresh document needs its
-        // first snapshot promptly).
-        if !boot
-            && state
-                .last_scroll_at
-                .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET)
+        // goes quiet. Boot pulls are not exempt: a false `Complete` (a head
+        // script/resource re-report) or a real load landing mid-gesture is
+        // exactly what produced the 0 <-> N blip. The 3s cap only applies
+        // once a pull has happened; a first boot pull waits for quiet.
+        if state
+            .last_scroll_at
+            .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET)
             && state
                 .last_pull_at
                 .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET_MAX)
         {
             return;
         }
-        // Adaptive cooldown: never pull sooner than the last round-trip
-        // took (300ms floor). Boot bypasses it — a fresh document needs
-        // its first snapshot promptly.
+        // Adaptive cooldown: a slow pull bought breathing room before the
+        // next one. Page-driven mutation pings (Google's class churn) would
+        // otherwise run 1.1s visibility walks back-to-back and keep the
+        // script thread saturated, which reads as pixel jitter. User
+        // actions skip the breather so clicks/typing stay responsive.
         if !boot && let Some(last) = state.last_pull_at {
-            let gap = DOM_MIN_PULL_GAP.max(Duration::from_millis(state.last_pull_rtt_ms));
+            let gap = pull_gap(state.user_dirty, state.last_pull_rtt_ms);
             if now.saturating_duration_since(last) < gap {
                 return;
             }
         }
+        // Diagnostic ages for the pull trace: a fresh scroll timestamp makes
+        // the quiet gate hold; a stale one is a loop-latency bug.
+        let scroll_age_ms = state
+            .last_scroll_at
+            .map_or(-1, |t| now.saturating_duration_since(t).as_millis() as i64);
+        let pull_age_ms = state
+            .last_pull_at
+            .map_or(-1, |t| now.saturating_duration_since(t).as_millis() as i64);
+        let user_dirty = state.user_dirty;
         // Reserve the sequence first so a racing callback can't interleave.
         state.dom_seq = state.dom_seq.wrapping_add(1);
         let seq = state.dom_seq;
@@ -1756,6 +1824,7 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<TabState>>, global: &Rc
         state.dom_boot = false;
         state.dom_dirty = false;
         state.dom_dirty_at = None;
+        state.user_dirty = false;
         state.last_pull_at = Some(now);
         let pinged = std::mem::take(&mut state.dom_ping);
         let center = state.last_mouse;
@@ -1778,9 +1847,26 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<TabState>>, global: &Rc
             epoch,
             tab,
             scroll,
+            scroll_age_ms,
+            pull_age_ms,
+            user_dirty,
         ))
     };
-    let Some((seq, tx, script, boot, pinged, dispatched, epoch, tab, scroll)) = fire else {
+    let Some((
+        seq,
+        tx,
+        script,
+        boot,
+        pinged,
+        dispatched,
+        epoch,
+        tab,
+        scroll,
+        scroll_age_ms,
+        pull_age_ms,
+        user_dirty,
+    )) = fire
+    else {
         return;
     };
     let src = if boot {
@@ -1791,8 +1877,11 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<TabState>>, global: &Rc
         "gesture"
     };
     crate::platform::app_log::info(format!(
-        "servo-dom: pull tab{} seq={seq} src={src} ep={epoch} scroll=({:.0},{:.0})",
-        tab.0, scroll.0, scroll.1
+        "servo-dom: pull tab{} seq={seq} src={src} ep={epoch} scroll=({:.0},{:.0}) scroll_age={scroll_age_ms}ms pull_age={pull_age_ms}ms user={}",
+        tab.0,
+        scroll.0,
+        scroll.1,
+        u8::from(user_dirty)
     ));
     webview.evaluate_javascript(script, move |result| {
         let _ = tx.send((
@@ -2008,9 +2097,35 @@ fn flush_pending_up(webview: &WebView, shared: &Rc<RefCell<TabState>>) {
 /// (the 0 <-> N blip). Absent nodes accumulate misses and drop at
 /// [`DOM_MISSED_LIMIT`] (re-render flicker reads as one miss, real removals
 /// as two in a row).
+/// True when a snapshot proves the page was replaced without a Navigate or
+/// history event (same-URL reload). Empty tokens (the page never ran our
+/// install) never force a reset.
+fn doc_token_changed(old: Option<&str>, new: &str) -> bool {
+    !new.is_empty() && old.is_some_and(|t| t != new)
+}
+
 fn ingest_dom(state: &mut TabState, value: &JSValue, rtt_ms: u128, rebase: Rebase) {
     use std::collections::HashSet;
     let snap = parse_dom_snapshot(value);
+    let token_changed = doc_token_changed(state.doc_token.as_deref(), &snap.doc_token);
+    if token_changed {
+        // Same-URL reload: no Navigate/history event ran clear_tree, so the
+        // old document's tree is still here. Reset before merging this
+        // snapshot, which is the new document's boot.
+        crate::platform::app_log::info(format!(
+            "servo-dom: document swapped under the same URL tab{} — resetting targets",
+            state.tab.0
+        ));
+        clear_tree(state);
+        set_activity(state, EngineActivity::Initializing);
+        state.dom_boot = false;
+        state.dom_dirty = false;
+        state.dom_dirty_at = None;
+        state.dom_ping = false;
+    }
+    if !snap.doc_token.is_empty() {
+        state.doc_token = Some(snap.doc_token.clone());
+    }
     // The snapshot's own truth counts as observed even when the rebase is
     // skipped (a newer ping already applied): it is still a position the
     // page proved reachable, so it feeds the commanded-lead bound.
@@ -2021,9 +2136,10 @@ fn ingest_dom(state: &mut TabState, value: &JSValue, rtt_ms: u128, rebase: Rebas
     let pre_scroll = state.scroll;
     // Truth wins only when it is still current. Heals unapplied commands
     // (edge clamping the page ignored) and history-restored offsets alike.
-    // `rebase_scroll` is origin-pinned and never upper-clamped (extent can
-    // lag truth).
-    if rebase == Rebase::Apply {
+    // A document swap has no prior truth to protect: its boot snapshot is
+    // authoritative. `rebase_scroll` is origin-pinned and never
+    // upper-clamped (extent can lag truth).
+    if token_changed || rebase == Rebase::Apply {
         rebase_scroll(state, snap.scroll);
     }
     // Document dims bound scroll clamping (the live set only spans
@@ -2537,6 +2653,30 @@ mod tests {
         // Missing or malformed tags fall back to the invalidating path.
         assert_eq!(ping_event(base), "");
         assert_eq!(ping_event("http://sdsc.invalid/ping"), "");
+    }
+
+    #[test]
+    fn doc_token_mismatch_means_a_real_document_swap() {
+        // First snapshot: no prior token, never a reset.
+        assert!(!doc_token_changed(None, "abc"));
+        // Same document (spurious Complete / head-resource re-report).
+        assert!(!doc_token_changed(Some("abc"), "abc"));
+        // Real same-URL reload: new window, new token.
+        assert!(doc_token_changed(Some("abc"), "def"));
+        // Malformed/missing token never forces a reset.
+        assert!(!doc_token_changed(Some("abc"), ""));
+        assert!(!doc_token_changed(None, ""));
+    }
+
+    #[test]
+    fn idle_pulls_get_a_breather_but_user_pulls_do_not() {
+        assert_eq!(pull_gap(true, 0), DOM_MIN_PULL_GAP);
+        assert_eq!(pull_gap(true, 1200), Duration::from_millis(600));
+        assert_eq!(pull_gap(false, 0), DOM_IDLE_BREATHER);
+        assert_eq!(
+            pull_gap(false, 1200),
+            Duration::from_millis(1200) + DOM_IDLE_BREATHER
+        );
     }
 
     #[test]

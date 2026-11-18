@@ -60,6 +60,11 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
   if (!S) { S = window.__sdsc_ax = { next: 1, ids: new WeakMap() }; }
   if (S.mo) return;
   S.mo = true;
+  // Document identity: a real reload gets a fresh window and therefore a
+  // new token; a same-document head re-parse (Servo can re-report load
+  // status when the page injects head resources) keeps it. The backend
+  // uses this to tell a spurious `Complete` from an actual document swap.
+  if (!S.doc) { S.doc = Date.now().toString(36) + '.' + Math.random().toString(36).slice(2); }
   // Numeric id → element map, rebuilt by every snapshot query (so detached
   // nodes release instead of leaking). Powers `__sdsc_click`: exact-element
   // activation without hit-test staleness.
@@ -569,7 +574,7 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   // drives cursor docking on autofocus / JS .focus().
   var ax = 0;
   try { var ae = document.activeElement; if (ae && ae !== document.body && ae !== document.documentElement) { ax = idFor(ae); } } catch (e) {}
-  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], hid: skHid, clip: skClip, boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, forced: skForce, t: [Math.round(tQ), Math.round(tmM), Math.round(tmV), Math.round(tmC), Math.round(tmT)], sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh), ax: ax};
+  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], hid: skHid, clip: skClip, boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, forced: skForce, t: [Math.round(tQ), Math.round(tmM), Math.round(tmV), Math.round(tmC), Math.round(tmT)], sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh), ax: ax, dt: S.doc};
 })()"###;
 
 /// Parsed snapshot: viewport-space candidates plus the true page scroll at
@@ -610,6 +615,10 @@ pub struct DomSnapshot {
     /// Focused element's snapshot id (`ax`, 0 = none): drives cursor
     /// docking on autofocus / JS `.focus()`.
     pub active: u64,
+    /// Per-window document token from the install script. A real reload
+    /// creates a fresh window (new token); a same-document head re-parse
+    /// keeps it. `""` when the page never ran our install.
+    pub doc_token: String,
 }
 
 /// Parse a `dom_query_js` result into raw candidates. Lenient by design:
@@ -637,6 +646,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             clipped_away: 0,
             timings: [0; 5],
             active: 0,
+            doc_token: String::new(),
         };
     };
     let num_field = |key: &str| {
@@ -650,6 +660,10 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
     let scroll = (num_field("sx"), num_field("sy"));
     let doc = (num_field("dw"), num_field("dh"));
     let active = num_field("ax").max(0.0) as u64;
+    let doc_token = match root.get("dt") {
+        Some(JSValue::String(s)) => s.clone(),
+        _ => String::new(),
+    };
     let total = num_field("total") as usize;
     let culled = num_field("culled") as usize;
     let mut culled_ids = Vec::new();
@@ -704,6 +718,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
             clipped_away,
             timings,
             active,
+            doc_token,
         };
     };
     let mut nodes = Vec::new();
@@ -761,6 +776,7 @@ pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
         clipped_away,
         timings,
         active,
+        doc_token,
     }
 }
 
@@ -1058,6 +1074,10 @@ mod tests {
         // Servo's script/layout stability asserts fire.
         assert!(DOM_INSTALL_JS.contains("window.top !== window.self"));
         assert!(DOM_QUERY_BODY.contains("window.top !== window.self"));
+        // Document identity token: a same-document head re-parse keeps it,
+        // a real reload gets a fresh one.
+        assert!(DOM_INSTALL_JS.contains("S.doc"));
+        assert!(dom_query_js(None, 7).contains("dt: S.doc"));
     }
 
     #[test]
