@@ -219,6 +219,30 @@ pub fn cursor_morph(_theme: &Theme, radius: f32) -> container::Style {
     }
 }
 
+/// Page scrollbar track: a barely-there rail over arbitrary page pixels.
+pub fn page_scrollbar_track(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.07))),
+        border: Border {
+            radius: 3.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Page scrollbar thumb: readable over both dark and light pages.
+pub fn page_scrollbar_thumb(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.42))),
+        border: Border {
+            radius: 3.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Debug-only snap-target outline (F10 browser overlay): thin 1px ring per
 /// focusable, colored by kind so coverage gaps are visible at a glance.
 pub fn debug_target(_theme: &Theme, kind: crate::browser::cursor::FocusKind) -> container::Style {

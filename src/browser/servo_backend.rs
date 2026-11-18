@@ -1682,7 +1682,15 @@ fn clear_tree(state: &mut TabState) {
             items: Vec::new(),
         });
     }
+    let had_content = state.content.is_some();
     state.content = None;
+    if had_content {
+        let tab = state.tab;
+        state.handle.emit(EngineEvent::ScrollExtent {
+            tab,
+            extent: (0.0, 0.0),
+        });
+    }
     // A new document gets fresh DOM ids (the in-page WeakMap resets), a
     // fresh poll epoch (in-flight answers from the old page are dropped),
     // a fresh visibility epoch (no verdicts carry across documents), and
@@ -2219,10 +2227,20 @@ fn ingest_dom(state: &mut TabState, value: &JSValue, rtt_ms: u128, rebase: Rebas
     // viewport+margin after culling, so entry corners can't). Grow-only per
     // document, reset by `clear_tree`.
     let (dw, dh) = (snap.doc.0.max(0.0), snap.doc.1.max(0.0));
+    let old_content = state.content;
     if dw > 0.0 || dh > 0.0 {
         state.content = Some(match state.content {
             Some(prev) => (prev.0.max(dw), prev.1.max(dh)),
             None => (dw, dh),
+        });
+    }
+    if state.content != old_content
+        && let Some((w, h)) = state.content
+    {
+        let tab = state.tab;
+        state.handle.emit(EngineEvent::ScrollExtent {
+            tab,
+            extent: (w, h),
         });
     }
     let (total, culled) = (snap.total, snap.culled);

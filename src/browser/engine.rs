@@ -215,6 +215,12 @@ pub enum EngineEvent {
         x: f32,
         y: f32,
     },
+    /// Document extent in page pixels (grow-only per document). Drives the
+    /// page scrollbar; reset to `(0,0)` on a new document.
+    ScrollExtent {
+        tab: TabId,
+        extent: (f32, f32),
+    },
     /// Page focus moved to a live focusable (autofocus attribute, JS
     /// `.focus()`, tabbing into the page). The UI docks the pad cursor
     /// onto it when possible. Fires only on change to a known target
@@ -270,6 +276,7 @@ impl EngineEvent {
             | Self::FaviconChanged { tab, .. }
             | Self::ActivityChanged { tab, .. }
             | Self::ScrollOffset { tab, .. }
+            | Self::ScrollExtent { tab, .. }
             | Self::FocusChanged { tab, .. }
             | Self::HistoryChanged { tab, .. }
             | Self::LoadFinished { tab, .. } => Some(*tab),

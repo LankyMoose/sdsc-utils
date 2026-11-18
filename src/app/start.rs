@@ -2090,6 +2090,9 @@ impl App {
                 }
                 self.start_state.browser.scroll_offset = (x, y);
             }
+            EngineEvent::ScrollExtent { extent, .. } => {
+                self.start_state.browser.page_extent = extent;
+            }
             EngineEvent::ActivityChanged { tab: _, phase } => {
                 self.start_state.browser.engine_activity = phase;
             }
@@ -2212,6 +2215,9 @@ impl App {
                         ));
                     }
                     stored.page.scroll_offset = (x, y);
+                }
+                EngineEvent::ScrollExtent { extent, .. } => {
+                    stored.page.page_extent = extent;
                 }
                 EngineEvent::ActivityChanged { phase, .. } => {
                     stored.page.engine_activity = phase;
