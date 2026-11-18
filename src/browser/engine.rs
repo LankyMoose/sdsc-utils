@@ -92,6 +92,12 @@ pub enum EngineCommand {
         x: f32,
         y: f32,
     },
+    /// The UI cursor jumped: force a fresh DOM target cull around the
+    /// current mouse position (the live set is culled around its pull
+    /// center, so a jump can land where no snap target was collected yet).
+    ReseedDom {
+        tab: TabId,
+    },
     /// Click at a page point (device px == page px at 1x), optionally on a
     /// known snap target (UI numeric id). Button-kind targets activate via
     /// element `.click()` (exact element, no hit-test staleness); everything

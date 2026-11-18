@@ -226,6 +226,16 @@ impl Default for Cursor {
 }
 
 impl Cursor {
+    /// Clamp a y value to the cursor's current zone (page >= 0, header < 0).
+    /// Only an explicit D-pad jump (`jump_to`) may cross the boundary.
+    fn zone_y(&self, y: f32) -> f32 {
+        if self.y < 0.0 {
+            y.clamp(CURSOR_MIN_Y, -0.5)
+        } else {
+            y.clamp(0.0, self.view_h)
+        }
+    }
+
     /// Free movement with viewport clamping. Any manual move drops the
     /// attachment first; docking re-engages on arrival.
     pub fn move_by(&mut self, dx: f32, dy: f32) {
@@ -310,7 +320,7 @@ impl Cursor {
                     // where the velocity says it is going.
                     let (ex, ey) = Self::exit_point(it, lx, ly);
                     self.x = ex.clamp(0.0, self.view_w);
-                    self.y = ey.clamp(CURSOR_MIN_Y, self.view_h);
+                    self.y = self.zone_y(ey);
                     self.vx = lx * BREAK_KICK;
                     self.vy = ly * BREAK_KICK;
                 }
@@ -355,7 +365,10 @@ impl Cursor {
         }
         if self.vx != 0.0 || self.vy != 0.0 {
             self.x = (self.x + self.vx * dt_secs).clamp(0.0, self.view_w);
-            self.y = (self.y + self.vy * dt_secs).clamp(CURSOR_MIN_Y, self.view_h);
+            // Zone lock: the stick never crosses the header/page boundary.
+            // Entering the header requires an explicit D-pad Up; leaving it
+            // requires an explicit Down. Only `fly_to` (jumps) may cross.
+            self.y = self.zone_y(self.y + self.vy * dt_secs);
         }
         // Docking is arrival-based (see `snap`): the outline only engages
         // once the gliding point actually reaches an element. The morph
@@ -493,10 +506,16 @@ impl Cursor {
         self.attached = None;
         self.vx = 0.0;
         self.vy = 0.0;
-        self.fly_to = Some((
-            (item.x + item.w / 2.0).clamp(0.0, self.view_w),
-            (item.y + item.h / 2.0).clamp(CURSOR_MIN_Y, self.view_h),
-        ));
+        // Explicit jump: allowed to cross the header/page boundary, but
+        // land in the target's own zone (a partially visible page link
+        // must not park the point inside the header).
+        let cy = item.y + item.h / 2.0;
+        let y = if item.id >= CHROME_ID_BASE {
+            cy.clamp(CURSOR_MIN_Y, -0.5)
+        } else {
+            cy.clamp(0.0, self.view_h)
+        };
+        self.fly_to = Some(((item.x + item.w / 2.0).clamp(0.0, self.view_w), y));
     }
 
     /// Snap and centre: the fresh-acquisition entry point used by jumps,
@@ -586,7 +605,10 @@ impl Cursor {
             self.docked_for = 0.0;
             if centre {
                 self.x = (item.x + item.w / 2.0).clamp(0.0, self.view_w);
-                self.y = (item.y + item.h / 2.0).clamp(CURSOR_MIN_Y, self.view_h);
+                // Centre snap is a stick acquire: keep it in the same zone,
+                // even if the target's centre reaches across the boundary.
+                let cy = item.y + item.h / 2.0;
+                self.y = self.zone_y(cy);
             }
             self.last_dock = Some((item.x, item.y, item.w, item.h));
         }

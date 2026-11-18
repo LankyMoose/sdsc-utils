@@ -1271,6 +1271,20 @@ impl App {
                 });
             }
         }
+        // A D-pad jump asks for a fresh target cull once the flight lands
+        // (the live set was culled around the previous pull center). Send
+        // the reseed after the MouseMove so the engine centers on the
+        // arrival position, not the flight origin.
+        if self.start_state.browser.dom_reseed_pending
+            && self.start_state.browser.cursor.fly_to.is_none()
+        {
+            self.start_state.browser.dom_reseed_pending = false;
+            if let Some(engine) = &self.engine {
+                engine.send(EngineCommand::ReseedDom {
+                    tab: self.browser_tab(),
+                });
+            }
+        }
         Task::none()
     }
 

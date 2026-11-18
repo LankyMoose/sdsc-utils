@@ -962,6 +962,9 @@ pub struct BrowserPanel {
     /// Live page-area size in card pixels (the engine viewport resizes to
     /// this; the cursor space matches it 1:1).
     pub viewport: (f32, f32),
+    /// A D-pad jump asked for a fresh DOM target cull around the cursor.
+    /// Cleared once the jump flight lands and the engine is told to pull.
+    pub dom_reseed_pending: bool,
     /// Next synthetic id (counts up from [`CHROME_ID_BASE`], far above any
     /// engine-assigned page id).
     pub chrome_seq: u64,
@@ -1018,6 +1021,7 @@ impl Default for BrowserPanel {
                 crate::browser::cursor::VIEWPORT_W,
                 crate::browser::cursor::VIEWPORT_H,
             ),
+            dom_reseed_pending: false,
             chrome_seq: crate::browser::cursor::CHROME_ID_BASE,
             debug_overlay: false,
             bookmarks: Vec::new(),
@@ -1398,11 +1402,13 @@ impl BrowserPanel {
     /// Page travel keeps the spatial cone jump.
     pub fn jump_cursor(&mut self, dir: crate::browser::cursor::JumpDir) {
         use crate::browser::cursor::JumpDir;
-        #[cfg(debug_assertions)]
-        crate::platform::app_log::info(format!(
-            "cursor jump {dir:?} from={:?} at=({:.0},{:.0})",
-            self.page.cursor.attached, self.page.cursor.x, self.page.cursor.y,
-        ));
+        // A D-pad press always asks the engine for a fresh target set around
+        // the new cursor: the live DOM set is culled around the previous
+        // pull center, and a jump can land where no target was collected
+        // yet (the "skipped target" that works on the second pass).
+        self.dom_reseed_pending = true;
+        let from = (self.page.cursor.x, self.page.cursor.y);
+        let was = self.page.cursor.attached;
         self.rebuild_chrome();
         // Row layout with live rects (stable indices: 0 strip, 1 toolbar,
         // 2 bookmarks; empties kept so indices never shift).
@@ -1481,44 +1487,55 @@ impl BrowserPanel {
             best.map(|(f, _)| f.clone())
         };
         let x = self.page.cursor.x;
-        match (cur_row, dir) {
-            // Header horizontals: same row only; nothing in that direction
-            // means a no-op (stop at the row's ends).
-            (Some(r), JumpDir::Left | JumpDir::Right) => {
-                let items = row_items(r);
-                self.page.cursor.jump(dir, &items);
-            }
-            // Header up: nearest non-empty row above, column preserved;
-            // top row stays put.
-            (Some(r), JumpDir::Up) => {
-                for prev in (0..r).rev() {
-                    if let Some(f) = col_pick(&row_items(prev), x) {
-                        self.page.cursor.jump_to(&f);
-                        return;
+        'jump: {
+            match (cur_row, dir) {
+                // Header horizontals: same row only; nothing in that direction
+                // means a no-op (stop at the row's ends).
+                (Some(r), JumpDir::Left | JumpDir::Right) => {
+                    let items = row_items(r);
+                    self.page.cursor.jump(dir, &items);
+                }
+                // Header up: nearest non-empty row above, column preserved;
+                // top row stays put.
+                (Some(r), JumpDir::Up) => {
+                    for prev in (0..r).rev() {
+                        if let Some(f) = col_pick(&row_items(prev), x) {
+                            self.page.cursor.jump_to(&f);
+                            break 'jump;
+                        }
                     }
                 }
-            }
-            // Header down: nearest non-empty row below, column preserved;
-            // the bottom row drops spatially into the page.
-            (Some(r), JumpDir::Down) => {
-                for next in r + 1..layout.len() {
-                    if let Some(f) = col_pick(&row_items(next), x) {
-                        self.page.cursor.jump_to(&f);
-                        return;
+                // Header down: nearest non-empty row below, column preserved;
+                // the bottom row drops spatially into the page.
+                (Some(r), JumpDir::Down) => {
+                    for next in r + 1..layout.len() {
+                        if let Some(f) = col_pick(&row_items(next), x) {
+                            self.page.cursor.jump_to(&f);
+                            break 'jump;
+                        }
                     }
+                    let targets = cursor_targets(&self.page.focusables, &self.chrome);
+                    self.page.cursor.jump(dir, &targets);
                 }
-                let targets = cursor_targets(&self.page.focusables, &self.chrome);
-                self.page.cursor.jump(dir, &targets);
-            }
-            // Page verticals/horizontals: spatial cone, unchanged. A page
-            // target above wins on distance; only the topmost page row
-            // reaches chrome, and the nearest chrome row wins (toolbar
-            // before strip, bookmarks before toolbar when present).
-            (None, _) => {
-                let targets = cursor_targets(&self.page.focusables, &self.chrome);
-                self.page.cursor.jump(dir, &targets);
+                // Page verticals/horizontals: spatial cone, unchanged. A page
+                // target above wins on distance; only the topmost page row
+                // reaches chrome, and the nearest chrome row wins (toolbar
+                // before strip, bookmarks before toolbar when present).
+                (None, _) => {
+                    let targets = cursor_targets(&self.page.focusables, &self.chrome);
+                    self.page.cursor.jump(dir, &targets);
+                }
             }
         }
+        crate::platform::app_log::info(format!(
+            "cursor jump {dir:?} zone={} from=({:.0},{:.0}) dock={was:?} fly={:?} attached={:?} targets={}",
+            if from.1 < 0.0 { "header" } else { "page" },
+            from.0,
+            from.1,
+            self.page.cursor.fly_to,
+            self.page.cursor.attached,
+            self.page.focusables.len() + self.chrome.len(),
+        ));
     }
 }
 

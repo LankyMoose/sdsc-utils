@@ -1481,6 +1481,28 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
                 state.user_dirty = true;
             }
         }
+        EngineCommand::ReseedDom { tab } => {
+            let Some(entry) = tab_entry(global, tab) else {
+                return;
+            };
+            let live = {
+                let global_ref = global.borrow();
+                !global_ref.suspended && global_ref.active == tab
+            };
+            if !live {
+                return;
+            }
+            let mut state = entry.state.borrow_mut();
+            state.dom_dirty = true;
+            state.dom_dirty_at = Some(Instant::now());
+            // User cursor action: take the short pull gap.
+            state.user_dirty = true;
+            // New cursor region: hover states differ, so cached verdicts
+            // are suspect.
+            state.dom_epoch = state.dom_epoch.wrapping_add(1);
+            // Force a full cull around last_mouse at the next pull.
+            state.last_cull_center = None;
+        }
         EngineCommand::ClickAt { tab, x, y, target } => {
             let Some(entry) = tab_entry(global, tab) else {
                 return;
