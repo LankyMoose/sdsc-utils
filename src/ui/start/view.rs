@@ -1343,10 +1343,18 @@ impl BrowserPanel {
         // release too so user-marked nudges are diagnosable.
         let before = self.page.cursor.attached;
         let (bx, by) = (self.page.cursor.x, self.page.cursor.y);
+        // The scroll stick only means anything over the page surface. In
+        // the header (negative y) it must not scroll the page, and it must
+        // not release the dock: each deflection/neutral pair used to
+        // undock/re-dock the chrome target under the point (the nudge
+        // flicker) while also moving the page scrollbar.
+        let in_page = self.page.cursor.x >= 0.0
+            && self.page.cursor.x < self.viewport.0
+            && self.page.cursor.y >= 0.0
+            && self.page.cursor.y < self.viewport.1;
+        let scrolling = in_page && (rx != 0.0 || ry != 0.0);
         let cursor = &mut self.page.cursor;
-        // Right stick drives page scroll; while it is active, skip docking
-        // entirely (the point holds still and content passes under it).
-        cursor.advance_with(lx, ly, dt, &targets, rx != 0.0 || ry != 0.0);
+        cursor.advance_with(lx, ly, dt, &targets, scrolling);
         {
             let after = self.page.cursor.attached;
             if before != after {
@@ -1370,13 +1378,18 @@ impl BrowserPanel {
                     },
                 };
                 crate::platform::app_log::info(format!(
-                    "cursor dock {} -> {} stick=({lx:.2},{ly:.2}) pos=({bx:.0},{by:.0})",
+                    "cursor dock {} -> {} stick=({lx:.2},{ly:.2}) rstick=({rx:.2},{ry:.2}) scrolling={} pos=({bx:.0},{by:.0})",
                     describe(before),
                     describe(after),
+                    u8::from(scrolling),
                 ));
             }
         }
-        (rx * SCROLL_SPEED * dt, ry * SCROLL_SPEED * dt)
+        if in_page {
+            (rx * SCROLL_SPEED * dt, ry * SCROLL_SPEED * dt)
+        } else {
+            (0.0, 0.0)
+        }
     }
 
     /// D-pad focus step. Chrome travel is row-stepped: Left/Right stay in
