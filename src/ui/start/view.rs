@@ -1489,15 +1489,28 @@ pub const BROWSER_SCROLL_STEP: f32 = 240.0;
 /// corner radius interpolate every tick (smoothstepped blend), so docking
 /// animates circle → square instead of popping. Coordinates are card pixels
 /// (`page * img_w / 800`).
+/// Whether the pad cursor can be drawn truthfully in the page overlay.
+/// Header space is above the overlay's clip rect, so header-bound travel
+/// hides the dot (the focused header control carries the focus instead).
+fn cursor_draws_in_page(panel: &BrowserPanel) -> bool {
+    if panel.url_editing || panel.cursor.y < 0.0 || panel.chrome_attached().is_some() {
+        return false;
+    }
+    !panel.cursor.fly_to.is_some_and(|(_, ty)| ty < 0.0)
+}
+
 fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, StartMessage> {
     use crate::browser::cursor::VIEWPORT_W;
     // URL-edit mode owns the keyboard; hide the pad cursor so it never
-    // floats over the page while typing in the address field. A chrome
-    // dock hides it too — the header chip carries the focus instead (the
-    // overlay clips to the page image and couldn't show it anyway). Free
-    // header roam keeps the dot, clamped at the top edge, so position
-    // feedback never vanishes mid-travel.
-    if state.browser.url_editing || state.browser.chrome_attached().is_some() {
+    // floats over the page while typing in the address field.
+    // The overlay lives inside the page stack and clips to the page image,
+    // so header coordinates cannot be drawn truthfully: a flight between
+    // header slots would show the dot clamped to the page's top edge (the
+    // observed "drops into the page, then jumps back up" artifact). Hide
+    // the dot whenever the cursor is in, or flying to, the header; the
+    // focused control chip carries the header focus instead. A header→page
+    // flight reappears as soon as the point crosses into the page.
+    if !cursor_draws_in_page(&state.browser) {
         return space().width(Length::Fixed(0.0)).into();
     }
     let scale = img_w / VIEWPORT_W;
@@ -5734,6 +5747,32 @@ mod tests {
             .find(|(t, _)| *t == got)
             .expect("header slot");
         assert_eq!(f.y, CHROME_TOOLBAR_Y);
+    }
+
+    #[test]
+    fn header_travel_hides_the_page_cursor() {
+        let mut panel = BrowserPanel::default();
+        panel.page.cursor.x = 400.0;
+        panel.page.cursor.y = 300.0;
+        panel.page.cursor.fly_to = Some((100.0, 200.0));
+        assert!(cursor_draws_in_page(&panel), "page→page flight is drawn");
+        // Free header roam: clipped overlay can't place the dot truthfully.
+        panel.page.cursor.y = -54.0;
+        panel.page.cursor.fly_to = None;
+        assert!(!cursor_draws_in_page(&panel));
+        // Page cursor flying up to a header slot.
+        panel.page.cursor.y = 300.0;
+        panel.page.cursor.fly_to = Some((400.0, -54.0));
+        assert!(!cursor_draws_in_page(&panel));
+        // Header cursor flying down: hidden until it crosses into the page.
+        panel.page.cursor.y = -30.0;
+        panel.page.cursor.fly_to = Some((400.0, 200.0));
+        assert!(!cursor_draws_in_page(&panel));
+        // URL entry owns the cursor regardless of position.
+        panel.page.cursor.y = 300.0;
+        panel.page.cursor.fly_to = None;
+        panel.url_editing = true;
+        assert!(!cursor_draws_in_page(&panel));
     }
 
     #[test]
