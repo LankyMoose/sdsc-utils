@@ -98,6 +98,9 @@ pub enum JumpDir {
     Right,
 }
 
+/// Page-pixel rectangle: origin + size.
+type CursorRect = (f32, f32, f32, f32);
+
 #[derive(Debug, Clone)]
 pub struct Cursor {
     pub x: f32,
@@ -138,8 +141,14 @@ pub struct Cursor {
     /// centring the first target after the scroll reads as a nudge.
     scroll_released: bool,
     /// R2 turbo: doubles cursor acceleration/cap and scroll speed for the
-    /// duration of the hold.
+    /// duration of the hold. Docking is disabled while set (magnet on).
     pub turbo: bool,
+    /// Previous tick's turbo, to detect the release edge and re-snap.
+    was_turbo: bool,
+    /// Direct nudge morph: while jumping from one docked target to another,
+    /// the wrap rect interpolates old -> new and never collapses through
+    /// the free dot.
+    nudge_morph: Option<(CursorRect, CursorRect)>,
     pub visible: bool,
     /// Live page-area size in card pixels (dynamic engine viewport).
     pub view_w: f32,
@@ -198,6 +207,8 @@ impl Cursor {
             magnet: true,
             scroll_released: false,
             turbo: false,
+            was_turbo: false,
+            nudge_morph: None,
             visible: true,
             view_w: VIEWPORT_W,
             view_h: VIEWPORT_H,
@@ -284,6 +295,14 @@ impl Cursor {
         options: &[Focusable],
         scrolling: bool,
     ) {
+        let turbo_end = self.was_turbo && !self.turbo;
+        self.was_turbo = self.turbo;
+        // Turbo disables every docking behavior: release the hold and drop
+        // any direct-morph state so the point is a free 2x cursor.
+        if self.turbo {
+            self.attached = None;
+            self.nudge_morph = None;
+        }
         if scrolling {
             self.attached = None;
             self.scroll_released = true;
@@ -292,6 +311,7 @@ impl Cursor {
         // manual control.
         if self.fly_to.is_some() && (lx != 0.0 || ly != 0.0) {
             self.fly_to = None;
+            self.nudge_morph = None;
         }
         // Letting go inside the hold pad lifts break-free suppression: the
         // point never left, so hovering means re-dock, not escape.
@@ -360,8 +380,21 @@ impl Cursor {
                 (self.fly_from.1 + (ty - self.fly_from.1) * e).clamp(CURSOR_MIN_Y, self.view_h);
             self.vx = 0.0;
             self.vy = 0.0;
+            if let Some((from, to)) = self.nudge_morph {
+                // Direct shape change: old target rect -> new target rect,
+                // no dot phase. Same smoothstep as the travel.
+                let lerp = |a: f32, b: f32| a + (b - a) * e;
+                self.last_dock = Some((
+                    lerp(from.0, to.0),
+                    lerp(from.1, to.1),
+                    lerp(from.2, to.2),
+                    lerp(from.3, to.3),
+                ));
+                self.dock_blend = 1.0;
+            }
             if t >= 1.0 {
                 self.fly_to = None;
+                self.nudge_morph = None;
             }
         } else {
             // R2 turbo doubles the effective speed. The friction model
@@ -395,7 +428,7 @@ impl Cursor {
         // once the gliding point actually reaches an element. The morph
         // state eases toward the attachment every tick — including neutral
         // ones — so shape, size, and position always interpolate.
-        if self.magnet && !scrolling {
+        if self.magnet && !scrolling && !self.turbo {
             let stick = lx != 0.0 || ly != 0.0;
             // Neutral ticks keep the point fixed (content scrolling under
             // it). A deflected stick gets the magnetic centre snap, except
@@ -405,7 +438,9 @@ impl Cursor {
             // place, no centre snap).
             let suppression = self.no_dock.is_some() && stick;
             if !suppression {
-                self.snap_with(options, stick && !self.scroll_released);
+                // Release edge: snap in place to whatever is under the
+                // cursor, never centre-nudge the point after turbo.
+                self.snap_with(options, stick && !self.scroll_released && !turbo_end);
             }
         }
         self.ease_blend(dt_secs);
@@ -413,6 +448,10 @@ impl Cursor {
 
     /// Ease the outline morph toward the attachment (1 = docked, 0 = free).
     fn ease_blend(&mut self, dt_secs: f32) {
+        if self.nudge_morph.is_some() {
+            self.dock_blend = 1.0;
+            return;
+        }
         let target = if self.attached.is_some() { 1.0 } else { 0.0 };
         let step = DOCK_BLEND_PER_SEC * dt_secs;
         if self.dock_blend < target {
@@ -532,6 +571,13 @@ impl Cursor {
     /// stepped header navigation picks the slot itself (column-preserved),
     /// and a pick can sit outside the 60-degree cone the spatial jump uses.
     pub fn jump_to(&mut self, item: &Focusable) {
+        // Capture the departure dock before clearing it: a jump from a
+        // docked target morphs wrap->wrap directly.
+        let departure = if self.attached.is_some() {
+            self.last_dock
+        } else {
+            None
+        };
         self.attached = None;
         self.vx = 0.0;
         self.vy = 0.0;
@@ -547,6 +593,15 @@ impl Cursor {
         };
         self.fly_from = (self.x, self.y);
         self.fly_elapsed = 0.0;
+        let target_rect = (item.x, item.y, item.w, item.h);
+        self.nudge_morph = if self.turbo {
+            None
+        } else {
+            departure.map(|from| (from, target_rect))
+        };
+        if self.nudge_morph.is_some() {
+            self.dock_blend = 1.0;
+        }
         self.fly_to = Some(((item.x + item.w / 2.0).clamp(0.0, self.view_w), y));
     }
 
@@ -861,6 +916,51 @@ mod tests {
         let ratio = fast.vx.abs() / slow.vx.abs();
         assert!((ratio - 2.0).abs() < 0.05, "turbo ratio={ratio}");
         assert!(fast.x > slow.x * 1.5);
+    }
+
+    #[test]
+    fn nudge_morphs_directly_between_target_shapes() {
+        let items = [link(1, 100.0, 100.0), link(2, 500.0, 100.0)];
+        let mut c = Cursor::new();
+        c.x = 150.0;
+        c.y = 115.0;
+        c.snap(&items);
+        assert_eq!(c.attached, Some(1));
+        assert!(c.jump(JumpDir::Right, &items));
+        // Mid-flight the outline stays a wrap and its rect moves from the
+        // old target toward the new one: no collapse through the dot.
+        for _ in 0..4 {
+            c.advance(0.0, 0.0, 0.016, &items);
+        }
+        assert_eq!(c.dock_blend, 1.0);
+        let mid = c.last_dock.expect("interpolated rect");
+        assert!(mid.0 > 100.0 && mid.0 < 500.0, "mid rect={mid:?}");
+        for _ in 0..10 {
+            c.advance(0.0, 0.0, 0.016, &items);
+            if c.attached == Some(2) {
+                break;
+            }
+        }
+        assert_eq!(c.attached, Some(2));
+        assert_eq!(c.dock_blend, 1.0);
+        assert_eq!(c.last_dock, Some((500.0, 100.0, 100.0, 30.0)));
+    }
+
+    #[test]
+    fn turbo_disables_docking_and_resnaps_in_place_on_release() {
+        let items = [link(1, 100.0, 100.0)];
+        let mut c = Cursor::new();
+        c.x = 150.0;
+        c.y = 115.0;
+        c.snap(&items);
+        assert_eq!(c.attached, Some(1));
+        c.turbo = true;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, None, "turbo releases the dock");
+        c.turbo = false;
+        c.advance(0.0, 0.0, 0.016, &items);
+        assert_eq!(c.attached, Some(1), "release re-snaps under the cursor");
+        assert_eq!((c.x, c.y), (150.0, 115.0), "in place, no centre nudge");
     }
 
     #[test]
