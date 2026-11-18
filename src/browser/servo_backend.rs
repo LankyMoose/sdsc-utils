@@ -138,6 +138,16 @@ struct TabState {
     /// jump — and its older scroll reading then yanks the tracked offset
     /// back (the 0 <-> N blip).
     last_scroll_at: Option<Instant>,
+    /// Wall time of the latest user-commanded scroll (`ScrollBy`). Unlike
+    /// `last_scroll_at` (which scroll pings also refresh), this proves a
+    /// gesture is still under our control, so the starvation cap must not
+    /// force a pull through it.
+    last_scroll_cmd_at: Option<Instant>,
+    /// Latest page truth seen while a gesture was hot. Held instead of
+    /// rebased: the script-thread scroll lags the visual scroll during
+    /// input, so applying it mid-gesture rubber-bands the overlay. Applied
+    /// once by `flush_scroll_truth` after the gesture goes quiet.
+    pending_scroll_truth: Option<(f32, f32)>,
     /// A user action (click, key, cursor roam) wants fresh targets. Those
     /// pulls skip the idle breather so interaction stays responsive; the
     /// page's own mutation pings do not.
@@ -235,6 +245,8 @@ impl TabState {
             dom_epoch: 0,
             ping_at: None,
             last_scroll_at: None,
+            last_scroll_cmd_at: None,
+            pending_scroll_truth: None,
             user_dirty: false,
             doc_token: None,
             spin_seq: 0,
@@ -643,13 +655,34 @@ impl WebViewDelegate for Delegate {
             let mut state = entry.state.borrow_mut();
             note_scroll_truth(&mut state.scroll_max, truth);
             let before = state.scroll;
-            rebase_scroll(&mut state, truth);
+            // `window.scrollY` is read on the script thread and lags the
+            // visual scroll while input is being applied. Rebasing to it
+            // mid-gesture rubber-bands the overlay (364 -> 255 -> 364 in
+            // the 17:31 trace). Hold the latest truth; the worker loop
+            // applies it once the gesture is quiet.
+            let hot = state
+                .last_scroll_at
+                .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET)
+                || state
+                    .last_scroll_cmd_at
+                    .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET);
+            if hot {
+                state.pending_scroll_truth = Some(truth);
+            } else {
+                state.pending_scroll_truth = None;
+                rebase_scroll(&mut state, truth);
+            }
             // Every scroll ping logs its truth (page-scroll trace); other
-            // pings only when they actually move the tracked offset.
-            if scroll_only || state.scroll != before {
+            // pings only when they move the tracked offset or are held.
+            if scroll_only || state.scroll != before || hot {
                 crate::platform::app_log::info(format!(
-                    "servo-dom: ping tab{} ev={ev} truth=({:.0},{:.0}) tracked=({:.0},{:.0})",
-                    state.tab.0, truth.0, truth.1, before.0, before.1
+                    "servo-dom: ping tab{} ev={ev} truth=({:.0},{:.0}) tracked=({:.0},{:.0}) held={}",
+                    state.tab.0,
+                    truth.0,
+                    truth.1,
+                    before.0,
+                    before.1,
+                    u8::from(hot)
                 ));
             }
         }
@@ -1099,6 +1132,10 @@ fn run(
         };
         check_load_timeout(&global);
         if let Some(entry) = &active_entry {
+            // Settle held scroll truth before the pull decision: a snapshot
+            // rebase computed against the pre-settle offset must not clobber
+            // a truth that is now current.
+            flush_scroll_truth(&entry.state);
             drain_dom_results(&entry.state);
             maybe_pull_dom(&entry.webview, &entry.state, &global);
             poll_probe(&entry.webview, &entry.state);
@@ -1194,7 +1231,9 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
             // Scroll under the pad cursor, not viewport center: Servo routes
             // to the innermost scroller under the point, so center-targeting
             // stranded page scrolls inside carousels.
-            state.last_scroll_at = Some(Instant::now());
+            let cmd_at = Instant::now();
+            state.last_scroll_at = Some(cmd_at);
+            state.last_scroll_cmd_at = Some(cmd_at);
             entry.webview.notify_scroll_event(
                 Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(dx, dy))),
                 WebViewPoint::Device(DevicePoint::new(x, y)),
@@ -1658,6 +1697,8 @@ fn clear_tree(state: &mut TabState) {
     state.last_pull_at = None;
     state.last_pull_rtt_ms = 0;
     state.last_scroll_at = None;
+    state.last_scroll_cmd_at = None;
+    state.pending_scroll_truth = None;
     state.user_dirty = false;
     state.doc_token = None;
     // Truth bound resets with the document (see `scroll_max`).
@@ -1785,14 +1826,22 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<TabState>>, global: &Rc
         // flag and timestamp survive, so the refresh fires once the gesture
         // goes quiet. Boot pulls are not exempt: a false `Complete` (a head
         // script/resource re-report) or a real load landing mid-gesture is
-        // exactly what produced the 0 <-> N blip. The 3s cap only applies
-        // once a pull has happened; a first boot pull waits for quiet.
-        if state
+        // exactly what produced the 0 <-> N blip.
+        let command_hot = state
+            .last_scroll_cmd_at
+            .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET);
+        let scroll_hot = state
             .last_scroll_at
-            .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET)
-            && state
-                .last_pull_at
-                .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET_MAX)
+            .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET);
+        // A gesture we are commanding has no cap: a long flick used to hit
+        // the 3s starvation guard and pull at scroll_age=0ms, which is what
+        // stalled the page in the 17:31 trace. The cap only breaks
+        // ping-only (animated scroller) starvation.
+        if scroll_hot
+            && (command_hot
+                || state
+                    .last_pull_at
+                    .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET_MAX))
         {
             return;
         }
@@ -2294,6 +2343,36 @@ fn ingest_dom(state: &mut TabState, value: &JSValue, rtt_ms: u128, rebase: Rebas
         pre_scroll.0,
         pre_scroll.1,
     ));
+}
+
+/// Apply held page scroll truth once the gesture has gone quiet.
+///
+/// Ping truth is read on the page's script thread; while scroll input is
+/// being applied that value lags the visual scroll (the first flick in the
+/// 17:31 trace: commands at 364, script still at 255). Rebasing to it
+/// mid-gesture is the 364 -> 255 -> 364 rubber-band. The ping handler holds
+/// the latest truth instead; this applies it once, after quiet.
+fn flush_scroll_truth(shared: &Rc<RefCell<TabState>>) {
+    let now = Instant::now();
+    let mut state = shared.borrow_mut();
+    let Some(truth) = state.pending_scroll_truth else {
+        return;
+    };
+    let hot = state
+        .last_scroll_at
+        .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET)
+        || state
+            .last_scroll_cmd_at
+            .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET);
+    if hot {
+        return;
+    }
+    state.pending_scroll_truth = None;
+    crate::platform::app_log::info(format!(
+        "servo-dom: scroll settle tab{} truth=({:.0},{:.0}) tracked=({:.0},{:.0})",
+        state.tab.0, truth.0, truth.1, state.scroll.0, state.scroll.1
+    ));
+    rebase_scroll(&mut state, truth);
 }
 
 /// Rebase the tracked offset to the page's reported scroll. Unlike
