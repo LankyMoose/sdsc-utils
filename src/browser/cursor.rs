@@ -258,7 +258,9 @@ impl Default for Cursor {
 
 impl Cursor {
     /// Clamp a y value to the cursor's current zone (page >= 0, header < 0).
-    /// Only an explicit D-pad jump (`jump_to`) may cross the boundary.
+    /// Jump and centre-snap landings stay in the target's zone; analog
+    /// movement is free to cross the boundary (the stick supersedes the
+    /// explicit D-pad entry/exit).
     fn zone_y(&self, y: f32) -> f32 {
         if self.y < 0.0 {
             y.clamp(CURSOR_MIN_Y, -0.5)
@@ -267,7 +269,7 @@ impl Cursor {
         }
     }
 
-    /// Free movement with viewport clamping. Any manual move drops the
+    /// Free movement across the unified surface. Any manual move drops the
     /// attachment first; docking re-engages on arrival.
     pub fn move_by(&mut self, dx: f32, dy: f32) {
         if dx == 0.0 && dy == 0.0 {
@@ -275,7 +277,7 @@ impl Cursor {
         }
         self.attached = None;
         self.x = (self.x + dx).clamp(0.0, self.view_w);
-        self.y = (self.y + dy).clamp(0.0, self.view_h);
+        self.y = (self.y + dy).clamp(CURSOR_MIN_Y, self.view_h);
     }
 
     /// Analog velocity step, D-pad flights, and dock morph state. The stick
@@ -423,10 +425,10 @@ impl Cursor {
         }
         if self.vx != 0.0 || self.vy != 0.0 {
             self.x = (self.x + self.vx * dt_secs).clamp(0.0, self.view_w);
-            // Zone lock: the stick never crosses the header/page boundary.
-            // Entering the header requires an explicit D-pad Up; leaving it
-            // requires an explicit Down. Only `fly_to` (jumps) may cross.
-            self.y = self.zone_y(self.y + self.vy * dt_secs);
+            // Analog is the free pointer across the unified surface: it may
+            // cross the header/page boundary in either direction. The
+            // explicit D-pad Up/Down rule gates jumps only, not the stick.
+            self.y = (self.y + self.vy * dt_secs).clamp(CURSOR_MIN_Y, self.view_h);
         }
         // Docking is arrival-based (see `snap`): the outline only engages
         // once the gliding point actually reaches an element. The morph
@@ -480,6 +482,34 @@ impl Cursor {
     /// back to the 60-degree cone and nearest-point scoring. Page targets
     /// must intersect the viewport; chrome lives above it.
     pub fn jump(&mut self, dir: JumpDir, options: &[Focusable]) -> bool {
+        self.jump_with(dir, options, false)
+    }
+
+    /// Horizontal jump constrained to the current row. The eligible set is
+    /// only targets sharing the attached rect's vertical band (or, with a
+    /// free point, targets containing its y). There is deliberately no
+    /// cone fallback: a row end is a no-op, never a diagonal hop into
+    /// another row or into chrome. The dot keeps its row y on arrival
+    /// (clamped into the destination rect), so a tall masonry tile morphs
+    /// into shape without yanking the point to its centre.
+    pub fn jump_row(&mut self, dir: JumpDir, options: &[Focusable]) -> bool {
+        debug_assert!(matches!(dir, JumpDir::Left | JumpDir::Right));
+        let from = self.attached_rect(options);
+        let row: Vec<Focusable> = options
+            .iter()
+            .filter(|o| match from {
+                Some((_, y, _, h)) => o.y < y + h && y < o.y + o.h,
+                None => o.y <= self.y && self.y <= o.y + o.h,
+            })
+            .cloned()
+            .collect();
+        if row.is_empty() {
+            return false;
+        }
+        self.jump_with(dir, &row, true)
+    }
+
+    fn jump_with(&mut self, dir: JumpDir, options: &[Focusable], keep_row_y: bool) -> bool {
         let (dx, dy) = match dir {
             JumpDir::Up => (0.0, -1.0),
             JumpDir::Down => (0.0, 1.0),
@@ -564,7 +594,7 @@ impl Cursor {
             })
         };
         if let Some(c) = winner {
-            self.jump_to(c.item);
+            self.jump_to_with(c.item, keep_row_y);
             true
         } else {
             false
@@ -575,6 +605,10 @@ impl Cursor {
     /// stepped header navigation picks the slot itself (column-preserved),
     /// and a pick can sit outside the 60-degree cone the spatial jump uses.
     pub fn jump_to(&mut self, item: &Focusable) {
+        self.jump_to_with(item, false);
+    }
+
+    fn jump_to_with(&mut self, item: &Focusable, keep_row_y: bool) {
         // Capture the departure dock before clearing it: a jump from a
         // docked target morphs wrap->wrap directly.
         let departure = if self.attached.is_some() {
@@ -590,7 +624,17 @@ impl Cursor {
         // land in the target's own zone (a partially visible page link
         // must not park the point inside the header).
         let cy = item.y + item.h / 2.0;
-        let y = if item.id >= CHROME_ID_BASE {
+        let y = if keep_row_y {
+            // Horizontal nudge: keep the dot on its row, clamped into the
+            // destination rect so an edge-overlap still docks. A tall tile
+            // must not pull the point to its centre.
+            let y = self.y.clamp(item.y, item.y + item.h);
+            if item.id >= CHROME_ID_BASE {
+                y.clamp(CURSOR_MIN_Y, -0.5)
+            } else {
+                y.clamp(0.0, self.view_h)
+            }
+        } else if item.id >= CHROME_ID_BASE {
             cy.clamp(CURSOR_MIN_Y, -0.5)
         } else {
             cy.clamp(0.0, self.view_h)
@@ -965,6 +1009,120 @@ mod tests {
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1), "release re-snaps under the cursor");
         assert_eq!((c.x, c.y), (150.0, 115.0), "in place, no centre nudge");
+    }
+
+    #[test]
+    fn analog_stick_can_cross_the_header_boundary() {
+        // The stick is the free pointer across the unified surface: no
+        // D-pad needed to walk into the header or back out. The unified
+        // top stays the clamp.
+        let mut c = Cursor::new();
+        c.x = 400.0;
+        c.y = 20.0;
+        for _ in 0..60 {
+            c.advance(0.0, -1.0, 0.016, &[]);
+        }
+        assert!(c.y < 0.0, "stick entered the header, y={}", c.y);
+        assert!(c.y >= CURSOR_MIN_Y);
+        for _ in 0..120 {
+            c.advance(0.0, 1.0, 0.016, &[]);
+        }
+        assert!(c.y > 0.0, "stick returned to the page, y={}", c.y);
+        for _ in 0..300 {
+            c.advance(0.0, 1.0, 0.016, &[]);
+        }
+        assert_eq!(c.y, c.view_h, "bottom clamp");
+    }
+
+    #[test]
+    fn analog_can_cross_and_dock_header_chrome() {
+        // Crossing the boundary by stick must be enough to acquire chrome;
+        // the zone gate applies to the acquisition, not to movement.
+        let mut c = Cursor::new();
+        c.x = 350.0;
+        c.y = 20.0;
+        let chrome = chrome_btn(CHROME_ID_BASE, 300.0, -72.0, 100.0, 36.0);
+        let items = [chrome];
+        for _ in 0..90 {
+            c.advance(0.0, -1.0, 0.016, &items);
+            if c.attached.is_some() {
+                break;
+            }
+        }
+        assert_eq!(c.attached, Some(CHROME_ID_BASE));
+        assert!(c.y < 0.0);
+    }
+
+    #[test]
+    fn horizontal_row_jump_stops_at_the_row_end() {
+        // A row edge is a no-op: no cone fallback into the next row.
+        let row = link(1, 100.0, 300.0);
+        let off_row = link(2, 500.0, 500.0);
+        let mut c = Cursor::new();
+        c.x = 150.0;
+        c.y = 315.0;
+        c.attached = Some(1);
+        assert!(!c.jump_row(JumpDir::Right, &[row, off_row]));
+        assert!(c.fly_to.is_none());
+        assert_eq!(c.attached, Some(1), "row end keeps the dock");
+    }
+
+    #[test]
+    fn horizontal_row_jump_ignores_off_row_targets() {
+        let row = link(1, 100.0, 300.0);
+        let same = link(2, 300.0, 300.0);
+        let off = link(3, 500.0, 100.0);
+        let mut c = Cursor::new();
+        c.x = 150.0;
+        c.y = 315.0;
+        c.attached = Some(1);
+        assert!(c.jump_row(JumpDir::Right, &[row, same, off]));
+        assert_eq!(c.fly_to, Some((350.0, 315.0)));
+    }
+
+    #[test]
+    fn horizontal_row_jump_keeps_the_row_y_on_a_tall_tile() {
+        // Masonry case: a portrait tile overlaps the row by only a few px.
+        // The dot must stay on the row, not fly to the tile's centre.
+        let row = link(1, 100.0, 300.0);
+        let tall = Focusable {
+            id: 2,
+            x: 300.0,
+            y: -30.0,
+            w: 100.0,
+            h: 360.0,
+            kind: FocusKind::Link,
+            url: None,
+        };
+        let items = [row, tall];
+        let mut c = Cursor::new();
+        c.x = 150.0;
+        c.y = 315.0;
+        c.attached = Some(1);
+        assert!(c.jump_row(JumpDir::Right, &items));
+        assert_eq!(c.fly_to, Some((350.0, 315.0)), "row y preserved");
+        for _ in 0..60 {
+            c.advance(0.0, 0.0, 0.016, &items);
+        }
+        assert_eq!(c.attached, Some(2));
+        assert_eq!(c.y, 315.0, "no centre pull");
+    }
+
+    #[test]
+    fn free_horizontal_row_jump_uses_the_point_row() {
+        let same = link(1, 300.0, 300.0);
+        let off = link(2, 500.0, 100.0);
+        let mut c = Cursor::new();
+        c.x = 150.0;
+        c.y = 315.0;
+        assert!(c.jump_row(JumpDir::Right, &[same, off.clone()]));
+        assert_eq!(c.fly_to, Some((350.0, 315.0)));
+        // No target containing the point's row: no-op, not a diagonal hop.
+        let mut c2 = Cursor::new();
+        c2.x = 150.0;
+        c2.y = 315.0;
+        assert!(!c2.jump_row(JumpDir::Right, &[off]));
+        assert!(c2.fly_to.is_none());
     }
 
     #[test]

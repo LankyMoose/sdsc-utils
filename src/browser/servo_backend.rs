@@ -678,7 +678,14 @@ impl WebViewDelegate for Delegate {
                 state.pending_scroll_truth = Some(truth);
             } else {
                 state.pending_scroll_truth = None;
-                rebase_scroll(&mut state, truth);
+                if rebase_scroll(&mut state, truth) {
+                    // Rects are document-space: rebasing only needs a cheap
+                    // re-translate, never a DOM query. Without this the live
+                    // set stays at the pre-settle offset until the next pull,
+                    // so a D-pad jump just after a scroll scores against
+                    // geometry that no longer matches the page.
+                    emit_tree(&mut state);
+                }
             }
             // Every scroll ping logs its truth (page-scroll trace); other
             // pings only when they move the tracked offset or are held.
@@ -2571,7 +2578,11 @@ fn flush_scroll_truth(shared: &Rc<RefCell<TabState>>) {
         "servo-dom: scroll settle tab{} truth=({:.0},{:.0}) tracked=({:.0},{:.0})",
         state.tab.0, truth.0, truth.1, state.scroll.0, state.scroll.1
     ));
-    rebase_scroll(&mut state, truth);
+    if rebase_scroll(&mut state, truth) {
+        // Re-translate the stored tree at the settled offset; otherwise the
+        // first D-pad press after a scroll sees the pre-scroll rects.
+        emit_tree(&mut state);
+    }
 }
 
 /// Rebase the tracked offset to the page's reported scroll. Unlike
@@ -2579,10 +2590,12 @@ fn flush_scroll_truth(shared: &Rc<RefCell<TabState>>) {
 /// lag the page (unseen far corners), and truth from the page must win —
 /// clamping it would reintroduce the very drift this heals. Origin-pinned
 /// (negative scroll is never real) and reported when it moves the UI value.
-fn rebase_scroll(state: &mut TabState, scroll: (f32, f32)) {
+/// Returns whether the tracked offset moved; callers that run outside a
+/// DOM ingest must re-emit the translated tree (see `emit_tree`).
+fn rebase_scroll(state: &mut TabState, scroll: (f32, f32)) -> bool {
     let rebased = (scroll.0.max(0.0), scroll.1.max(0.0));
     if state.scroll == rebased {
-        return;
+        return false;
     }
     crate::platform::app_log::info(format!(
         "servo-dom: rebase tab{} scroll=({:.0},{:.0}) -> ({:.0},{:.0})",
@@ -2590,7 +2603,7 @@ fn rebase_scroll(state: &mut TabState, scroll: (f32, f32)) {
     ));
     state.scroll = rebased;
     if state.last_sent_scroll == rebased {
-        return;
+        return true;
     }
     state.last_sent_scroll = rebased;
     let tab = state.tab;
@@ -2599,6 +2612,7 @@ fn rebase_scroll(state: &mut TabState, scroll: (f32, f32)) {
         x: rebased.0,
         y: rebased.1,
     });
+    true
 }
 
 /// Convert a Servo favicon frame to RGBA8 bytes for an iced image handle.

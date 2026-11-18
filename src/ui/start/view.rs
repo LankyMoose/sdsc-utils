@@ -1499,7 +1499,7 @@ impl BrowserPanel {
                 // means a no-op (stop at the row's ends).
                 (Some(r), JumpDir::Left | JumpDir::Right) => {
                     let items = row_items(r);
-                    self.page.cursor.jump(dir, &items);
+                    self.page.cursor.jump_row(dir, &items);
                 }
                 // Header up: nearest non-empty row above, column preserved;
                 // top row stays put.
@@ -1523,10 +1523,17 @@ impl BrowserPanel {
                     let targets = cursor_targets(&self.page.focusables, &self.chrome);
                     self.page.cursor.jump(dir, &targets);
                 }
-                // Page verticals/horizontals: spatial cone, unchanged. A page
-                // target above wins on distance; only the topmost page row
-                // reaches chrome, and the nearest chrome row wins (toolbar
-                // before strip, bookmarks before toolbar when present).
+                // Page horizontals never see chrome (header entry/exit is
+                // Up/Down or analog) and never cone into another row: the
+                // row lock stops at the row's ends.
+                (None, JumpDir::Left | JumpDir::Right) => {
+                    let targets = self.page.focusables.clone();
+                    self.page.cursor.jump_row(dir, &targets);
+                }
+                // Page verticals: spatial cone. A page target above wins on
+                // distance; only the topmost page row reaches chrome, and
+                // the nearest chrome row wins (toolbar before strip,
+                // bookmarks before toolbar when present).
                 (None, _) => {
                     let targets = cursor_targets(&self.page.focusables, &self.chrome);
                     self.page.cursor.jump(dir, &targets);
@@ -5872,6 +5879,82 @@ mod tests {
             panel.page.cursor.x,
             panel.page.cursor.y
         );
+    }
+
+    #[test]
+    fn page_left_never_enters_the_header() {
+        // R3 trace: Left from a wide page link at y=339 flew to the Back
+        // button at y=-54 because the 60-degree cone accepted it by 3px.
+        // Page horizontals must never see chrome; header entry is Up/Down
+        // (or the analog stick).
+        use crate::browser::cursor::{FocusKind, Focusable};
+        let mut panel = BrowserPanel::default();
+        panel.page.focusables = vec![Focusable {
+            id: 2,
+            x: 32.0,
+            y: 309.0,
+            w: 851.0,
+            h: 60.0,
+            kind: FocusKind::Link,
+            url: None,
+        }];
+        panel.rebuild_chrome();
+        panel.page.cursor.x = 458.0;
+        panel.page.cursor.y = 339.0;
+        panel.page.cursor.attached = Some(2);
+        panel.jump_cursor(crate::browser::cursor::JumpDir::Left);
+        assert!(panel.chrome_attached().is_none());
+        assert!(panel.page.cursor.fly_to.is_none());
+        assert_eq!(
+            panel.page.cursor.attached,
+            Some(2),
+            "row end keeps the dock"
+        );
+    }
+
+    #[test]
+    fn page_right_prefers_the_same_row() {
+        // A same-row link must win over a farther tile that merely shares
+        // the row band, and neither may pull the point off its row.
+        use crate::browser::cursor::{FocusKind, Focusable};
+        let mut panel = BrowserPanel::default();
+        panel.page.focusables = vec![
+            Focusable {
+                id: 2,
+                x: 100.0,
+                y: 300.0,
+                w: 100.0,
+                h: 40.0,
+                kind: FocusKind::Link,
+                url: None,
+            },
+            Focusable {
+                id: 3,
+                x: 300.0,
+                y: 300.0,
+                w: 100.0,
+                h: 40.0,
+                kind: FocusKind::Link,
+                url: None,
+            },
+            Focusable {
+                id: 4,
+                x: 500.0,
+                y: 50.0,
+                w: 100.0,
+                h: 360.0,
+                kind: FocusKind::Link,
+                url: None,
+            },
+        ];
+        panel.rebuild_chrome();
+        panel.page.cursor.x = 150.0;
+        panel.page.cursor.y = 320.0;
+        panel.page.cursor.attached = Some(2);
+        panel.jump_cursor(crate::browser::cursor::JumpDir::Right);
+        fly_until_dock(&mut panel);
+        assert_eq!(panel.page.cursor.attached, Some(3));
+        assert_eq!(panel.page.cursor.y, 320.0, "row y preserved");
     }
 
     #[test]
