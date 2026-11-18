@@ -1366,7 +1366,7 @@ impl App {
     /// `force` bypasses the cadence gate. Encode + write happen on a
     /// throwaway thread so the UI never hitches on disk I/O.
     #[cfg(debug_assertions)]
-    fn shoot_browser_window(&mut self, force: bool) -> Task<Message> {
+    pub(crate) fn shoot_browser_window(&mut self, force: bool) -> Task<Message> {
         if !self.debug_browser {
             return Task::none();
         }
@@ -1444,7 +1444,11 @@ impl App {
     /// Engine-created tab (popup `request_create_new`): the backend already
     /// foregrounded the view — adopt it. Stash the live page, reset the
     /// live slot, point the draft at the incoming navigation.
-    pub(crate) fn on_tab_opened(&mut self, tab: crate::browser::engine::TabId) -> Task<Message> {
+    pub(crate) fn on_tab_opened(
+        &mut self,
+        tab: crate::browser::engine::TabId,
+        slot: std::sync::Arc<crate::browser::frame_slot::FrameSlot>,
+    ) -> Task<Message> {
         crate::controller::hid::diag::diag_info(format!(
             "ui-diag: start browser tab opened tab{}",
             tab.0
@@ -1454,6 +1458,7 @@ impl App {
             panel.stash_live();
             panel.page = start_view::BrowserTabPage::default();
             panel.page.session.open_surface();
+            panel.page.session.set_frame_slot(slot);
             panel.page.action_hint = Some(("New tab…".to_string(), std::time::Instant::now()));
             panel.active_tab = tab;
             if !panel.order.contains(&tab) {
@@ -1464,6 +1469,22 @@ impl App {
             panel.save_tabs();
         }
         self.sync_live_mouse();
+        Task::none()
+    }
+
+    /// Worker-owned frame slot handoff for a tab the UI already knows
+    /// (the boot tab, delivered on the first visible tick).
+    pub(crate) fn on_frame_slot(
+        &mut self,
+        tab: crate::browser::engine::TabId,
+        slot: std::sync::Arc<crate::browser::frame_slot::FrameSlot>,
+    ) -> Task<Message> {
+        let panel = &mut self.start_state.browser;
+        if tab == panel.active_tab {
+            panel.session.set_frame_slot(slot);
+        } else if let Some(stored) = panel.stored.iter_mut().find(|t| t.id == tab) {
+            stored.page.session.set_frame_slot(slot);
+        }
         Task::none()
     }
 
@@ -1514,14 +1535,16 @@ impl App {
     /// engine has no boot path back, so the last tab never truly closes.
     fn reopen_home_tab(&mut self, tab: crate::browser::engine::TabId) -> Task<Message> {
         let url = crate::browser::BROWSER_HOME_URL.to_string();
-        let generation = {
+        let (generation, frame) = {
             let panel = &mut self.start_state.browser;
             panel.page = start_view::BrowserTabPage::default();
             panel.page.session.open_surface();
             panel.active_tab = tab;
             panel.order.push(tab);
             panel.draft = url.clone();
-            panel.page.session.begin_load(url.clone())
+            let generation = panel.page.session.begin_load(url.clone());
+            let frame = std::sync::Arc::clone(panel.page.session.frame_slot());
+            (generation, frame)
         };
         self.save_strip();
         if let Some(engine) = &self.engine {
@@ -1529,6 +1552,7 @@ impl App {
                 tab,
                 url,
                 generation,
+                frame,
             });
             engine.send(EngineCommand::SetActiveTab { tab });
         }
@@ -1630,7 +1654,7 @@ impl App {
             return self.on_browser_go_home();
         }
         let url = crate::browser::BROWSER_HOME_URL.to_string();
-        let (tab, generation) = {
+        let (tab, generation, frame) = {
             let panel = &mut self.start_state.browser;
             panel.stash_live();
             panel.page = start_view::BrowserTabPage::default();
@@ -1643,13 +1667,15 @@ impl App {
             let generation = panel.page.session.begin_load(url.clone());
             panel.rebuild_chrome();
             panel.save_tabs();
-            (tab, generation)
+            let frame = std::sync::Arc::clone(panel.page.session.frame_slot());
+            (tab, generation, frame)
         };
         if let Some(engine) = &self.engine {
             engine.send(EngineCommand::OpenTab {
                 tab,
                 url,
                 generation,
+                frame,
             });
             engine.send(EngineCommand::SetActiveTab { tab });
         }
@@ -1676,6 +1702,7 @@ impl App {
                     tab,
                     url,
                     generation,
+                    frame: std::sync::Arc::clone(self.start_state.browser.session.frame_slot()),
                 });
             }
             engine.send(EngineCommand::SetActiveTab { tab });
@@ -1860,7 +1887,8 @@ impl App {
     /// mirrors the active tab only). Unknown (closed-race) ids are ignored.
     pub(crate) fn on_engine_event(&mut self, event: EngineEvent) -> Task<Message> {
         match event {
-            EngineEvent::TabOpened { tab } => return self.on_tab_opened(tab),
+            EngineEvent::TabOpened { tab, slot } => return self.on_tab_opened(tab, slot),
+            EngineEvent::FrameSlot { tab, slot } => return self.on_frame_slot(tab, slot),
             EngineEvent::TabClosed { tab } => return self.on_tab_closed(tab),
             _ => {}
         }
@@ -1870,16 +1898,21 @@ impl App {
             return Task::none();
         }
         match event {
-            EngineEvent::TabOpened { .. } | EngineEvent::TabClosed { .. } => {}
+            EngineEvent::FrameSlot { .. }
+            | EngineEvent::TabOpened { .. }
+            | EngineEvent::TabClosed { .. } => {}
             EngineEvent::Frame(frame) => {
                 if !self.start_state.browser.session.is_open() {
                     return Task::none();
                 }
                 #[cfg(debug_assertions)]
                 let shot = self.shoot_browser_window(false);
-                self.start_state.browser.session.set_frame(
-                    crate::browser::BrowserFrame::from_rgba(frame.width, frame.height, frame.rgba),
-                );
+                // Move the RGBA buffer into the slot; the stable-texture
+                // primitive uploads unseen generations into one texture.
+                self.start_state
+                    .browser
+                    .session
+                    .write_frame(frame.width, frame.height, frame.rgba);
                 #[cfg(debug_assertions)]
                 return shot;
             }
@@ -2077,6 +2110,7 @@ impl App {
                     }
                 },
                 EngineEvent::Frame(_)
+                | EngineEvent::FrameSlot { .. }
                 | EngineEvent::TabOpened { .. }
                 | EngineEvent::TabClosed { .. } => {}
             }
@@ -5401,7 +5435,6 @@ mod tests {
     #[test]
     fn browser_open_keeps_nav_movement_flowing_for_reader() {
         use super::start_nav_move_allowed;
-        use crate::browser::BrowserFrame;
         use crate::ui::start::view::{EditConfirm, ManualAddDraft, ReplaceConfirm, State};
         // Regression: the reader browser consumes pad Up/Down for body scroll
         // via the stepper, which suppresses directionals when movement is
@@ -5415,11 +5448,10 @@ mod tests {
         state.settings.open = false;
         state.browser.session.open_surface();
         assert!(start_nav_move_allowed(&state));
-        state.browser.session.set_frame(BrowserFrame {
-            width: 800,
-            height: 600,
-            handle: iced::widget::image::Handle::from_rgba(800, 600, vec![0; 800 * 600 * 4]),
-        });
+        state
+            .browser
+            .session
+            .write_frame(800, 600, vec![0; 800 * 600 * 4]);
         assert!(!start_nav_move_allowed(&state));
         state.browser.session.close_surface();
         assert!(start_nav_move_allowed(&state));

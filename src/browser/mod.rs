@@ -20,6 +20,7 @@ pub mod cursor;
 pub mod dom;
 pub mod engine;
 pub mod fetch;
+pub mod frame_slot;
 pub mod keys;
 #[cfg(feature = "servo-engine")]
 pub mod servo_backend;
@@ -92,26 +93,6 @@ pub struct FetchedPage {
     pub body: String,
 }
 
-/// Engine-rendered page frame, as a stable iced image handle (rebuilt per
-/// frame; the atlas re-upload cost is the price of live pixels and only
-/// flows while the surface is visible — the worker suspends otherwise).
-#[derive(Debug, Clone)]
-pub struct BrowserFrame {
-    pub width: u32,
-    pub height: u32,
-    pub handle: iced::widget::image::Handle,
-}
-
-impl BrowserFrame {
-    pub fn from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Self {
-        Self {
-            width,
-            height,
-            handle: iced::widget::image::Handle::from_rgba(width, height, rgba),
-        }
-    }
-}
-
 /// One remembered navigation for omnibox autocomplete: URL plus the title
 /// at visit time. In-memory only (session scope, never persisted).
 #[derive(Debug, Clone, Default)]
@@ -157,7 +138,9 @@ pub struct BrowserSession {
     loading: bool,
     generation: u64,
     error: Option<String>,
-    frame: Option<BrowserFrame>,
+    /// Latest engine frame for this tab. The GPU primitive uploads unseen
+    /// generations into one stable texture (no per-frame image handles).
+    frame: std::sync::Arc<frame_slot::FrameSlot>,
     /// Most-recent-first navigation history for autocomplete. Recorded on
     /// every load and client-side URL change; titles attach out of band.
     history: Vec<HistoryEntry>,
@@ -206,7 +189,7 @@ impl BrowserSession {
         self.title = None;
         self.body.clear();
         self.error = None;
-        self.frame = None;
+        self.frame.clear();
         self.loading = true;
         self.generation = self.generation.wrapping_add(1);
         self.record_visit(url.clone());
@@ -264,25 +247,34 @@ impl BrowserSession {
     /// True once a page (or a load error) is on screen — reader text, an
     /// engine frame, or an error alike.
     pub fn has_content(&self) -> bool {
-        !self.body.is_empty() || self.error.is_some() || self.frame.is_some()
+        !self.body.is_empty() || self.error.is_some() || self.frame.has_frame()
     }
 
-    /// Engine path: install a fresh frame (no generation — frames are
-    /// continuous paint output, staleness is handled by load gating).
-    pub fn set_frame(&mut self, frame: BrowserFrame) {
-        self.frame = Some(frame);
+    /// Engine path: install the latest RGBA frame. `FrameSlot::write`
+    /// rejects mismatched buffers and bumps the generation the GPU
+    /// primitive watches.
+    pub fn write_frame(&mut self, width: u32, height: u32, rgba: Vec<u8>) {
+        self.frame.write(width, height, rgba);
     }
 
     pub fn clear_frame(&mut self) {
-        self.frame = None;
+        self.frame.clear();
     }
 
     pub fn has_frame(&self) -> bool {
-        self.frame.is_some()
+        self.frame.has_frame()
     }
 
-    pub fn frame(&self) -> Option<&BrowserFrame> {
-        self.frame.as_ref()
+    /// Slot for the stable-texture shader widget.
+    pub fn frame_slot(&self) -> &std::sync::Arc<frame_slot::FrameSlot> {
+        &self.frame
+    }
+
+    /// Replace the placeholder slot with the worker-owned one (boot tab or
+    /// an engine-created popup). The old slot drops; its texture entry is
+    /// trimmed by the render pipeline.
+    pub fn set_frame_slot(&mut self, slot: std::sync::Arc<frame_slot::FrameSlot>) {
+        self.frame = slot;
     }
 
     /// Engine path: title arrived out of band. Attaches to the most recent
@@ -905,11 +897,7 @@ mod tests {
         let mut s = BrowserSession::default();
         s.open_surface();
         assert!(!s.has_content());
-        s.set_frame(BrowserFrame {
-            width: 800,
-            height: 600,
-            handle: iced::widget::image::Handle::from_rgba(800, 600, vec![0; 800 * 600 * 4]),
-        });
+        s.write_frame(800, 600, vec![0; 800 * 600 * 4]);
         assert!(s.has_frame());
         assert!(s.has_content());
         let generation = s.begin_load("https://next.test".to_string());

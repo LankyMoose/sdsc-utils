@@ -37,7 +37,7 @@ use crate::browser::dom::{
     dom_kind, dom_query_js, parse_dom_snapshot, parse_loop_probe,
 };
 use crate::browser::engine::{
-    EngineActivity, EngineCommand, EngineEvent, EngineHandle, TabFrame, TabId, TabKey,
+    EngineActivity, EngineCommand, EngineEvent, EngineHandle, TabId, TabKey,
 };
 
 /// Spin cadence while foreground (matches the ~60Hz UI tick budget).
@@ -274,6 +274,9 @@ struct Global {
 struct TabEntry {
     webview: WebView,
     state: Rc<RefCell<TabState>>,
+    /// Shared with the UI: the worker writes each painted frame here; the
+    /// stable-texture shader primitive uploads unseen generations.
+    frame: std::sync::Arc<crate::browser::frame_slot::FrameSlot>,
 }
 
 struct Delegate {
@@ -324,13 +327,9 @@ impl WebViewDelegate for Delegate {
                     "servo-engine: first frame {w}x{h}, worker live"
                 ));
             }
-            let tab = entry.state.borrow().tab;
-            global.handle.emit(EngineEvent::Frame(TabFrame {
-                tab,
-                width: w,
-                height: h,
-                rgba: img.into_raw(),
-            }));
+            // Direct handoff: the stable-texture primitive reads the slot;
+            // no per-frame event or view rebuild.
+            entry.frame.write(w, h, img.into_raw());
         }
     }
 
@@ -368,15 +367,19 @@ impl WebViewDelegate for Delegate {
         global.by_view.insert(view_id, tab);
         let tab_handle = global.handle.clone();
         let tab_ax = global.ax_debug;
+        let frame = std::sync::Arc::new(crate::browser::frame_slot::FrameSlot::default());
         global.tabs.insert(
             tab,
             TabEntry {
                 webview,
                 state: Rc::new(RefCell::new(TabState::fresh(tab, tab_handle, tab_ax))),
+                frame: std::sync::Arc::clone(&frame),
             },
         );
         global.active = tab;
-        global.handle.emit(EngineEvent::TabOpened { tab });
+        global
+            .handle
+            .emit(EngineEvent::TabOpened { tab, slot: frame });
     }
 
     fn notify_url_changed(&self, webview: WebView, url: url::Url) {
@@ -916,6 +919,7 @@ fn run(
                     tab_handle,
                     tab_ax,
                 ))),
+                frame: std::sync::Arc::new(crate::browser::frame_slot::FrameSlot::default()),
             },
         );
     }
@@ -1296,6 +1300,7 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
             tab,
             url,
             generation,
+            frame,
         } => {
             let mut global_ref = global.borrow_mut();
             if global_ref.tabs.contains_key(&tab) {
@@ -1365,6 +1370,7 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
                 TabEntry {
                     webview,
                     state: Rc::new(RefCell::new(tab_state)),
+                    frame,
                 },
             );
             let handle = global_ref.handle.clone();
@@ -1462,6 +1468,14 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
             let active = global_ref.active;
             if let Some(entry) = global_ref.tabs.get(&active).cloned() {
                 entry.webview.set_focused(visible && !suspended);
+                if visible {
+                    // The UI may have started with a placeholder slot;
+                    // hand over the worker-owned one for the boot tab.
+                    global_ref.handle.emit(EngineEvent::FrameSlot {
+                        tab: active,
+                        slot: entry.frame.clone(),
+                    });
+                }
             }
         }
         EngineCommand::Suspend => {

@@ -1,6 +1,7 @@
 #[cfg(debug_assertions)]
 pub mod ambient_tune;
 pub mod art_worker;
+pub mod browser_frame;
 pub mod chrome;
 pub mod clock;
 pub mod cursor_hide;

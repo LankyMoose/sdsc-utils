@@ -70,6 +70,9 @@ iced = { version = "0.14.0", features = [
     "svg",
     "image",
 ] }
+# Custom GPU primitives for the stable browser-frame texture (same pattern
+# as the video preview in valorant-companion).
+iced_wgpu = "0.14"
 wgpu = "27"
 image = { version = "0.25", default-features = false, features = [
     "jpeg",
@@ -131,3 +134,8 @@ debug = false
 
 [profile.dev.package."sdsc-utils"]
 debug = "line-tables-only"
+
+[dev-dependencies]
+# Headless WGSL validation: the browser-frame pipeline builds on the first
+# painted frame, so a shader typo would panic the app instead of failing a test.
+naga = { version = "27.0.3", default-features = false, features = ["wgsl-in"] }

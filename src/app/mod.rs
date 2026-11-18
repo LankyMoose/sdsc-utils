@@ -1543,7 +1543,20 @@ impl App {
             Message::StartOpened(id) => self.on_start_opened(id),
             Message::FinishStartClose => self.finish_start_close(),
             Message::StartArtEvent(ev) => self.on_start_art_event(ev),
-            Message::StartFrame => self.on_start_frame(),
+            Message::StartFrame => {
+                // Debug frame shots used to ride the per-frame engine event;
+                // the shader now pulls frames from the slot, so the 5s shot
+                // cadence lives on the Start frame tick.
+                #[cfg(debug_assertions)]
+                {
+                    let shot = self.shoot_browser_window(false);
+                    self.on_start_frame().chain(shot)
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    self.on_start_frame()
+                }
+            }
             Message::StartCursorActivity(id) => {
                 if Some(id) == self.start_window && self.start_visible {
                     self.note_start_cursor_activity();

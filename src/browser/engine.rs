@@ -6,6 +6,7 @@
 //! way the UI only depends on [`EngineCommand`] / [`EngineEvent`], so the
 //! backend is replaceable without touching Start.
 
+use crate::browser::frame_slot::FrameSlot;
 use std::sync::{Arc, Mutex, mpsc};
 
 /// Coarse engine phase for the browser status strip. The backend owns the
@@ -122,6 +123,9 @@ pub enum EngineCommand {
         tab: TabId,
         url: String,
         generation: u64,
+        /// Shared frame slot the worker writes into; the UI's stable
+        /// texture primitive reads it. Owned by the UI tab page.
+        frame: Arc<FrameSlot>,
     },
     /// Drop a tab (its `WebView` handle closes the view). The UI activates a
     /// neighbor first when closing the active tab.
@@ -232,8 +236,17 @@ pub enum EngineEvent {
     /// Engine-created tab (popup `request_create_new`: `window.open()`,
     /// `target=_blank`). Already foregrounded backend-side; the UI adopts
     /// it (stash live, reset, set active).
+    /// Engine-side slot handoff for the boot tab (UI-opened tabs already
+    /// passed their slot in `OpenTab`). Replaces the UI page's placeholder.
+    FrameSlot {
+        tab: TabId,
+        slot: Arc<FrameSlot>,
+    },
+    /// Engine-opened tab (`window.open`): carries the slot the worker
+    /// writes into, so the UI adopts both in one event.
     TabOpened {
         tab: TabId,
+        slot: Arc<FrameSlot>,
     },
     /// A tab's page called `window.close()`: the backend already dropped the
     /// view. The UI activates a neighbor (or a fresh home tab if none).
@@ -248,6 +261,7 @@ impl EngineEvent {
     pub fn tab(&self) -> Option<TabId> {
         match self {
             Self::Frame(f) => Some(f.tab),
+            Self::FrameSlot { tab, .. } => Some(*tab),
             Self::TitleChanged { tab, .. }
             | Self::UrlChanged { tab, .. }
             | Self::FaviconChanged { tab, .. }
@@ -424,7 +438,14 @@ mod tests {
             Some(boot)
         );
         // Lifecycle events route before page state: no tab.
-        assert_eq!(EngineEvent::TabOpened { tab: boot }.tab(), None);
+        assert_eq!(
+            EngineEvent::TabOpened {
+                tab: boot,
+                slot: Arc::new(FrameSlot::default())
+            }
+            .tab(),
+            None
+        );
         assert_eq!(EngineEvent::TabClosed { tab: boot }.tab(), None);
     }
 

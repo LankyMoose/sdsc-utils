@@ -1617,11 +1617,17 @@ fn browser_cursor_overlay(state: &State, page_w: f32, page_h: f32) -> Element<'_
 pub fn browser_page_view(state: &State, page_w: f32, page_h: f32) -> Element<'_, StartMessage> {
     let panel = &state.browser;
     let session = &panel.session;
-    if let Some(frame) = session.frame() {
-        return image(frame.handle.clone())
-            .width(Length::Fixed(page_w))
-            .height(Length::Fixed(page_h))
-            .into();
+    if session.has_frame() {
+        // One stable GPU texture per tab, uploaded on unseen generations
+        // only. Never mint a per-frame image handle: the atlas cache misses
+        // by construction and the page blinks at large viewports.
+        return iced::widget::shader(crate::ui::start::browser_frame::BrowserFrameProgram::new(
+            std::sync::Arc::clone(session.frame_slot()),
+            state.browser.active_tab.0,
+        ))
+        .width(Length::Fixed(page_w))
+        .height(Length::Fixed(page_h))
+        .into();
     }
     let body_text = if session.error().is_none() && session.has_content() {
         session.body()
