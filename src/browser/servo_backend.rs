@@ -143,6 +143,10 @@ struct TabState {
     /// gesture is still under our control, so the starvation cap must not
     /// force a pull through it.
     last_scroll_cmd_at: Option<Instant>,
+    /// When the current continuous scroll period began. The starvation cap
+    /// measures this, not `last_pull_at`: a pull from before the gesture
+    /// must not make a 1s-old scroll look like 3s of continuous motion.
+    scroll_hot_since: Option<Instant>,
     /// Latest page truth seen while a gesture was hot. Held instead of
     /// rebased: the script-thread scroll lags the visual scroll during
     /// input, so applying it mid-gesture rubber-bands the overlay. Applied
@@ -246,6 +250,7 @@ impl TabState {
             ping_at: None,
             last_scroll_at: None,
             last_scroll_cmd_at: None,
+            scroll_hot_since: None,
             pending_scroll_truth: None,
             user_dirty: false,
             doc_token: None,
@@ -638,7 +643,7 @@ impl WebViewDelegate for Delegate {
             let mut state = entry.state.borrow_mut();
             state.ping_at = Some(now);
             if scroll_only {
-                state.last_scroll_at = Some(now);
+                note_scroll_activity(&mut state, now);
             }
         }
         if !scroll_only {
@@ -1229,7 +1234,7 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
             // to the innermost scroller under the point, so center-targeting
             // stranded page scrolls inside carousels.
             let cmd_at = Instant::now();
-            state.last_scroll_at = Some(cmd_at);
+            note_scroll_activity(&mut state, cmd_at);
             state.last_scroll_cmd_at = Some(cmd_at);
             entry.webview.notify_scroll_event(
                 Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(dx, dy))),
@@ -1695,6 +1700,7 @@ fn clear_tree(state: &mut TabState) {
     state.last_pull_rtt_ms = 0;
     state.last_scroll_at = None;
     state.last_scroll_cmd_at = None;
+    state.scroll_hot_since = None;
     state.pending_scroll_truth = None;
     state.user_dirty = false;
     state.doc_token = None;
@@ -1767,11 +1773,36 @@ const DOM_SCROLL_QUIET: Duration = Duration::from_millis(400);
 /// scroller must still refresh its targets eventually.
 const DOM_SCROLL_QUIET_MAX: Duration = Duration::from_secs(3);
 
+/// A continuous scroll period survives this long without activity. Longer
+/// than the in-page ping throttle (500ms) so a ping-only scroller keeps one
+/// period, shorter than a deliberate pause.
+const DOM_SCROLL_PERIOD_GAP: Duration = Duration::from_millis(800);
+
 /// Breathing room after a completed pull for page-driven mutations. On
 /// mutation-heavy pages (Google toggles classes constantly) back-to-back
 /// 1s visibility walks keep the script thread saturated, which shows up as
 /// pixel jitter. User-triggered pulls bypass this.
 const DOM_IDLE_BREATHER: Duration = Duration::from_millis(2000);
+
+/// Record scroll activity and mark the start of a continuous hot period.
+/// A fresh period starts only after the quiet window lapsed, so the
+/// starvation cap measures the current gesture, not the nightly pull
+/// cadence before it.
+/// True while the current continuous scroll period is still under the
+/// starvation cap. A missing marker defers (no starvation evidence).
+fn scroll_cap_ok(hot_since: Option<Instant>, now: Instant) -> bool {
+    hot_since.is_none_or(|s| now.saturating_duration_since(s) < DOM_SCROLL_QUIET_MAX)
+}
+
+fn note_scroll_activity(state: &mut TabState, now: Instant) {
+    let fresh = state
+        .last_scroll_at
+        .is_none_or(|t| now.saturating_duration_since(t) >= DOM_SCROLL_PERIOD_GAP);
+    if fresh || state.scroll_hot_since.is_none() {
+        state.scroll_hot_since = Some(now);
+    }
+    state.last_scroll_at = Some(now);
+}
 
 /// Minimum spacing from the previous pull. User actions keep the short
 /// floor (hover/click feedback); page-driven mutations get a breather
@@ -1830,16 +1861,12 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<TabState>>, global: &Rc
         let scroll_hot = state
             .last_scroll_at
             .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET);
-        // A gesture we are commanding has no cap: a long flick used to hit
-        // the 3s starvation guard and pull at scroll_age=0ms, which is what
-        // stalled the page in the 17:31 trace. The cap only breaks
-        // ping-only (animated scroller) starvation.
-        if scroll_hot
-            && (command_hot
-                || state
-                    .last_pull_at
-                    .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET_MAX))
-        {
+        // A gesture we are commanding has no cap at all. Ping-only motion
+        // (animated scroller) is capped by how long *this* scroll has been
+        // continuous — not by the last pull age: a pull from before the
+        // gesture made a 1s-old scroll look like 3s, which is what fired
+        // mid-settle at scroll_age=281ms in the 17:46 trace.
+        if command_hot || (scroll_hot && scroll_cap_ok(state.scroll_hot_since, now)) {
             return;
         }
         // Adaptive cooldown: a slow pull bought breathing room before the
@@ -2742,6 +2769,18 @@ mod tests {
         // Malformed/missing token never forces a reset.
         assert!(!doc_token_changed(Some("abc"), ""));
         assert!(!doc_token_changed(None, ""));
+    }
+
+    #[test]
+    fn starvation_cap_measures_the_current_scroll_period() {
+        let now = Instant::now();
+        // No marker: defer (a fresh period is never capped).
+        assert!(scroll_cap_ok(None, now));
+        // The 17:46 case: the scroll is only 1.2s old; the last pull being
+        // 3.1s ago must not force a query through it.
+        assert!(scroll_cap_ok(Some(now - Duration::from_millis(1200)), now));
+        // A genuinely continuous ping-only scroller eventually refreshes.
+        assert!(!scroll_cap_ok(Some(now - Duration::from_millis(3100)), now));
     }
 
     #[test]
