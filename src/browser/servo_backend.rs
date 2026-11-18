@@ -168,6 +168,10 @@ struct TabState {
     /// non-zero scroll that matches it is a stale top-of-page frame; dropping
     /// it keeps the previous texture on screen instead of jumping.
     top_frame_hash: Option<u64>,
+    /// Hash + tracked scroll of the last frame actually written. A new frame
+    /// whose hash matches it after the scroll moved is a stale read from the
+    /// previous scroll position; retry the paint/read once before dropping.
+    last_frame: Option<(u64, (f32, f32))>,
     /// Per-window document token from the install script. A mismatch means
     /// the document was replaced without a Navigate/history event (same-URL
     /// reload); that ingest resets the tree. A spurious `Complete` (Servo
@@ -268,6 +272,7 @@ impl TabState {
             last_frame_at: None,
             needs_paint: false,
             top_frame_hash: None,
+            last_frame: None,
             doc_token: None,
             spin_seq: 0,
             pending_click_up: None,
@@ -986,42 +991,73 @@ fn paint_active_tab(global: &Rc<RefCell<Global>>) {
         Box2D::new(Point2D::new(0, 0), Point2D::new(w as i32, h as i32));
     let ctx = global.borrow().ctx.clone();
     let read_start = Instant::now();
-    let Some(img) = ctx.read_to_image(rect) else {
+    let Some(mut img) = ctx.read_to_image(rect) else {
         return;
     };
-    let read_ms = read_start.elapsed().as_millis();
+    let mut read_ms = read_start.elapsed().as_millis();
     let (w, h) = (img.width(), img.height());
-    let hash = frame_hash(img.as_raw());
+    let mut hash = frame_hash(img.as_raw());
     let ax_debug = entry.state.borrow().ax_debug;
-    let (tab, scroll, gap_ms, stale) = {
+    let (tab, scroll, gap_ms, top_hash, last) = {
         let mut state = entry.state.borrow_mut();
         let now = Instant::now();
         let gap = state
             .last_frame_at
             .replace(now)
             .map_or(-1, |t| now.saturating_duration_since(t).as_millis() as i64);
-        let scroll = state.scroll;
-        if scroll.1 <= 1.0 {
-            state.top_frame_hash = Some(hash);
-        }
-        let stale = scroll.1 > 8.0 && state.top_frame_hash == Some(hash);
-        (state.tab, scroll, gap, stale)
+        (
+            state.tab,
+            state.scroll,
+            gap,
+            state.top_frame_hash,
+            state.last_frame,
+        )
     };
+    // A frame is suspect when its content is the scroll-0 page at a real
+    // scroll, or the last written frame's content after the scroll moved.
+    // Both mean the read raced the render / returned the previous buffer.
+    let suspect = |hash: u64| {
+        (scroll.1 > 8.0 && top_hash == Some(hash))
+            || last.is_some_and(|(h, s)| h == hash && (scroll.1 - s.1).abs() > 4.0)
+    };
+    let mut retried = false;
+    if suspect(hash) {
+        // One immediate repaint/read usually returns the current scene.
+        retried = true;
+        let retry_start = Instant::now();
+        entry.webview.paint();
+        if let Some(img2) = ctx.read_to_image(rect) {
+            let h2 = frame_hash(img2.as_raw());
+            if h2 != hash {
+                img = img2;
+                hash = h2;
+            }
+        }
+        read_ms += retry_start.elapsed().as_millis();
+    }
+    let stale = suspect(hash);
     if ax_debug {
         crate::platform::app_log::info(format!(
-            "servo-frame tab{} gen={} scroll=({:.0},{:.0}) hash={hash:016x} paint={paint_ms}ms read={read_ms}ms gap={gap_ms}ms stale={} {w}x{h}",
+            "servo-frame tab{} gen={} scroll=({:.0},{:.0}) hash={hash:016x} paint={paint_ms}ms read={read_ms}ms gap={gap_ms}ms retry={} stale={} {w}x{h}",
             tab.0,
             entry.frame.generation().wrapping_add(1),
             scroll.0,
             scroll.1,
+            u8::from(retried),
             u8::from(stale)
         ));
     }
     if stale {
-        // Servo painted its scroll-0 content at a non-zero tracked scroll.
-        // Drop it: the previous texture stays until the next (correct)
-        // frame, so the user sees a pause instead of a jump to the top.
+        // Still the wrong scene after a retry: keep the previous texture so
+        // the page pauses instead of jumping to a different scroll offset.
         return;
+    }
+    {
+        let mut state = entry.state.borrow_mut();
+        if scroll.1 <= 1.0 {
+            state.top_frame_hash = Some(hash);
+        }
+        state.last_frame = Some((hash, scroll));
     }
     let mut g = global.borrow_mut();
     if !g.logged_first_frame {
@@ -1800,6 +1836,7 @@ fn clear_tree(state: &mut TabState) {
     state.scroll_hot_since = None;
     state.needs_paint = false;
     state.top_frame_hash = None;
+    state.last_frame = None;
     state.pending_scroll_truth = None;
     state.user_dirty = false;
     state.doc_token = None;
