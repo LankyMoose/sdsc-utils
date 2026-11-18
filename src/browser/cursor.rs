@@ -35,9 +35,13 @@ pub enum FocusKind {
 }
 
 /// Left-stick cursor acceleration at full deflection, px/s^2.
-pub const CURSOR_ACCEL: f32 = 7000.0;
+///
+/// Friction settles the glide at `accel / CURSOR_FRICTION`, so this is the
+/// real base-speed knob; the cap below is only a safety ceiling (R2 turbo
+/// doubles both).
+pub const CURSOR_ACCEL: f32 = 10500.0;
 /// Left-stick cursor top speed, px/s.
-pub const CURSOR_MAX_SPEED: f32 = 1400.0;
+pub const CURSOR_MAX_SPEED: f32 = 2100.0;
 /// Velocity decay rate (exponential friction, per second). The cursor glides
 /// a little after release instead of stopping dead.
 pub const CURSOR_FRICTION: f32 = 14.0;
