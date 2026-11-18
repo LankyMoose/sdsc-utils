@@ -170,6 +170,18 @@ fn band_metrics(from: (f32, f32, f32, f32), to: &Focusable, dir: JumpDir) -> (f3
     }
 }
 
+/// Page targets are only reachable while any part of them intersects the
+/// viewport; synthetic chrome lives above it and is always eligible. The
+/// cursor clamps to the viewport, so off-screen page targets can only pin
+/// it to an edge with nothing visible beneath it.
+fn within_viewport(item: &Focusable) -> bool {
+    item.id >= CHROME_ID_BASE
+        || (item.x < VIEWPORT_W
+            && item.x + item.w > 0.0
+            && item.y < VIEWPORT_H
+            && item.y + item.h > 0.0)
+}
+
 impl Cursor {
     pub fn new() -> Self {
         Self {
@@ -346,10 +358,11 @@ impl Cursor {
     /// by the docked item's perpendicular centre line (same row/column)
     /// outrank every partial overlap, and partial overlaps outrank purely
     /// diagonal targets — so a below-right target can never win a Right
-    /// press over a right target. Within a tier the widest shared
-    /// perpendicular extent wins, then the nearest forward row, then the
+    /// press over a right target. Within a tier the nearest forward row
+    /// wins, then the widest shared perpendicular extent, then the
     /// smallest column offset. With no dock (or nothing sharing the band)
     /// it falls back to the 60-degree cone and nearest-point scoring.
+    /// Page targets must intersect the viewport; chrome lives above it.
     pub fn jump(&mut self, dir: JumpDir, options: &[Focusable]) -> bool {
         let (dx, dy) = match dir {
             JumpDir::Up => (0.0, -1.0),
@@ -375,6 +388,9 @@ impl Cursor {
         let mut cands: Vec<Candidate<'_>> = Vec::new();
         for item in options {
             if Some(item.id) == self.attached {
+                continue;
+            }
+            if !within_viewport(item) {
                 continue;
             }
             // Nearest-point direction test: the candidate must lie forward
@@ -423,14 +439,16 @@ impl Cursor {
                 let sb = b.along + b.across * 2.0;
                 sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
             } else {
-                // Same row/column first: widest shared extent, then the
-                // nearest forward row, then the closest column.
-                b.shared
-                    .partial_cmp(&a.shared)
+                // Same row/column first: nearest forward row, then the
+                // widest shared extent, then the closest column. Proximity
+                // must lead inside the tier — a wide bar two rows away
+                // must not beat the very next row (bookmark -> page trace).
+                a.gap
+                    .partial_cmp(&b.gap)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| {
-                        a.gap
-                            .partial_cmp(&b.gap)
+                        b.shared
+                            .partial_cmp(&a.shared)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
                     .then_with(|| {
@@ -484,6 +502,7 @@ impl Cursor {
         }
         if let Some(id) = self.attached
             && let Some(item) = options.iter().find(|o| o.id == id)
+            && within_viewport(item)
             && self.inside_expanded(item, HOLD_PAD)
         {
             return;
@@ -498,6 +517,9 @@ impl Cursor {
         let in_header = self.y < 0.0;
         for item in options {
             if (item.id >= CHROME_ID_BASE) != in_header {
+                continue;
+            }
+            if !within_viewport(item) {
                 continue;
             }
             if !self.inside_expanded(item, ACQUIRE_PAD) {
@@ -560,7 +582,15 @@ impl Cursor {
         if let Some(id) = self.attached
             && let Some(item) = options.iter().find(|o| o.id == id)
         {
-            return (item.x + item.w / 2.0, item.y + item.h / 2.0);
+            let (cx, cy) = (item.x + item.w / 2.0, item.y + item.h / 2.0);
+            if item.id >= CHROME_ID_BASE {
+                return (cx, cy);
+            }
+            // Page clicks must land inside the viewport: a partially
+            // visible target's centre can sit below it (observed click at
+            // y=718 for a 600px viewport). The clamped centre stays within
+            // the item's visible intersection.
+            return (cx.clamp(0.0, VIEWPORT_W), cy.clamp(0.0, VIEWPORT_H));
         }
         (self.x, self.y)
     }
@@ -1014,6 +1044,71 @@ mod tests {
             Some((300.0, 125.0)),
             "must land on the right target, never below-right"
         );
+    }
+
+    #[test]
+    fn nearest_forward_row_beats_a_wide_far_target() {
+        // R3 trace: Down from the bookmark bar docked a 302px banner at
+        // y=188 instead of the 100px link at y=50. Both crossed the
+        // bookmark centre line; the nearer row must win before width.
+        let bookmark = chrome_btn(CHROME_ID_BASE, 0.0, -32.0, 400.0, 28.0);
+        let near = link(1, 141.0, 50.0);
+        let far = link(2, 14.0, 188.0);
+        let items = [bookmark, near, far];
+        let mut c = Cursor::new();
+        c.attached = Some(CHROME_ID_BASE);
+        c.x = 200.0;
+        c.y = -18.0;
+        assert!(c.jump(JumpDir::Down, &items));
+        assert_eq!(
+            c.fly_to,
+            Some((191.0, 65.0)),
+            "nearest row (y=50) wins, not the wide banner at y=188"
+        );
+    }
+
+    #[test]
+    fn offscreen_page_target_is_not_a_jump_target() {
+        // R3 trace: Down from the last visible link flew to a link at
+        // y=607 (entirely below the 600px viewport), pinning the dot to
+        // the bottom edge with nothing under it.
+        let last = link(1, 16.0, 552.0);
+        let below = link(2, 16.0, 607.0);
+        let items = [last, below];
+        let mut c = Cursor::new();
+        c.attached = Some(1);
+        c.x = 66.0;
+        c.y = 567.0;
+        assert!(!c.jump(JumpDir::Down, &items));
+        assert!(c.fly_to.is_none());
+    }
+
+    #[test]
+    fn snap_ignores_offscreen_page_targets() {
+        let below = link(2, 16.0, 607.0);
+        let items = [below];
+        let mut c = Cursor::new();
+        c.x = 66.0;
+        c.y = 600.0;
+        c.snap(&items);
+        assert_eq!(c.attached, None);
+    }
+
+    #[test]
+    fn click_point_stays_inside_viewport_for_partial_target() {
+        // R3 trace: docked on a 480x270 link whose centre is y=718 in a
+        // 600px viewport; the click must clamp to the visible edge area.
+        let tall = chrome_btn(2, 420.0, 583.0, 480.0, 270.0);
+        let items = [tall];
+        let mut c = Cursor::new();
+        c.attached = Some(2);
+        c.x = 660.0;
+        c.y = 600.0;
+        assert_eq!(c.click_point(&items), (660.0, 600.0));
+        // Chrome keeps its true centre: header coordinates stay meaningful.
+        let bm = chrome_btn(CHROME_ID_BASE, 400.0, -32.0, 400.0, 28.0);
+        c.attached = Some(CHROME_ID_BASE);
+        assert_eq!(c.click_point(&[bm]), (600.0, -18.0));
     }
 
     fn chrome_btn(id: u64, x: f32, y: f32, w: f32, h: f32) -> Focusable {
