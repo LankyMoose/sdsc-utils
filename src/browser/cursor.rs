@@ -234,16 +234,17 @@ impl Cursor {
         if self.no_dock.is_some() && lx.hypot(ly) < 0.01 && self.fly_to.is_none() {
             self.no_dock = None;
         }
-        // Docked: pinned to the element center — no velocity. A firm push
-        // breaks free at once (detach + place on the exit edge + kick
-        // outward); page motion carrying the element away releases without
-        // a kick. The hold check runs against the previous point so a
-        // carried-away element actually releases instead of re-centering
-        // onto its new rect forever. Breaks are edge-triggered: docking
-        // latches until the stick drops below BREAK_REARM_DEFLECT, so
-        // arriving with the stick still held never kicks straight back
-        // off — but a hold sustained past BREAK_LATCH_GRACE_SECS breaks
-        // through anyway, so traversal never strands.
+        // Docked: the point stays at its viewport position — content
+        // scrolling beneath it must not drag it (that was the old
+        // re-pin-to-center behavior). A firm push breaks free at once
+        // (detach + place on the exit edge + kick outward); an element
+        // scrolling out of the hold pad releases without a kick and lets
+        // the neutral acquire pass re-dock whatever is now under the
+        // point. Breaks are edge-triggered: docking latches until the
+        // stick drops below BREAK_REARM_DEFLECT, so arriving with the
+        // stick still held never kicks straight back off — but a hold
+        // sustained past BREAK_LATCH_GRACE_SECS breaks through anyway, so
+        // traversal never strands.
         if self.attached.is_some() {
             self.vx = 0.0;
             self.vy = 0.0;
@@ -263,7 +264,9 @@ impl Cursor {
             if pushed || !held {
                 let was = self.attached;
                 self.attached = None;
-                self.no_dock = was;
+                if pushed {
+                    self.no_dock = was;
+                }
                 if pushed && let Some(it) = item {
                     // Leave from the rect edge along the push: down exits
                     // mid-bottom, diagonals exit corners — the point starts
@@ -274,13 +277,9 @@ impl Cursor {
                     self.vx = lx * BREAK_KICK;
                     self.vy = ly * BREAK_KICK;
                 }
+                // Scrolled out from under the point: fall through to the
+                // acquire pass, which docks in place on neutral ticks.
             } else {
-                // Still held and unpushed: re-pin to the center so page
-                // motion drags the point along instead of stranding it.
-                if let Some(it) = item {
-                    self.x = (it.x + it.w / 2.0).clamp(0.0, VIEWPORT_W);
-                    self.y = (it.y + it.h / 2.0).clamp(CURSOR_MIN_Y, VIEWPORT_H);
-                }
                 self.ease_blend(dt_secs);
                 return;
             }
@@ -326,7 +325,9 @@ impl Cursor {
         // state eases toward the attachment every tick — including neutral
         // ones — so shape, size, and position always interpolate.
         if self.magnet {
-            self.snap(options);
+            // Neutral ticks keep the point fixed (content scrolling under
+            // it); a deflected stick still gets the magnetic centre snap.
+            self.snap_with(options, lx != 0.0 || ly != 0.0);
         }
         self.ease_blend(dt_secs);
     }
@@ -461,12 +462,23 @@ impl Cursor {
         ));
     }
 
+    /// Snap and centre: the fresh-acquisition entry point used by jumps,
+    /// explicit magnet calls, and tests.
+    pub fn snap(&mut self, options: &[Focusable]) {
+        self.snap_with(options, true);
+    }
+
     /// Dock when the point actually arrives: attach to the element whose
     /// rect (expanded by [`ACQUIRE_PAD`]) contains the point, and center
     /// the point on it — clicks and push-offs start from the middle, not
     /// the arrival edge. Holding is stickier than acquiring ([`HOLD_PAD`])
     /// so edge dither never flickers the outline.
-    pub fn snap(&mut self, options: &[Focusable]) {
+    ///
+    /// `centre` moves the point to the target's middle (fresh stick or
+    /// jump acquisition). `false` keeps the point exactly where it is —
+    /// used on neutral ticks so page scrolling under a docked cursor never
+    /// drags its viewport position.
+    pub fn snap_with(&mut self, options: &[Focusable], centre: bool) {
         // Mid-flight the point belongs to the flight path, not to whatever
         // it passes over — docking happens on arrival, once per trip.
         if self.fly_to.is_some() {
@@ -535,8 +547,10 @@ impl Cursor {
             self.vy = 0.0;
             self.break_armed = false;
             self.docked_for = 0.0;
-            self.x = (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W);
-            self.y = (item.y + item.h / 2.0).clamp(CURSOR_MIN_Y, VIEWPORT_H);
+            if centre {
+                self.x = (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W);
+                self.y = (item.y + item.h / 2.0).clamp(CURSOR_MIN_Y, VIEWPORT_H);
+            }
             self.last_dock = Some((item.x, item.y, item.w, item.h));
         }
     }
@@ -743,8 +757,8 @@ mod tests {
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1));
-        // Docking centers the point.
-        assert_eq!((c.x, c.y), (150.0, 115.0));
+        // Neutral docking keeps the point where it already is.
+        assert_eq!((c.x, c.y), (205.0, 115.0));
         let mut prev = c.dock_blend;
         for _ in 0..60 {
             c.advance(0.0, 0.0, 0.016, &items);
@@ -858,11 +872,11 @@ mod tests {
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, None, "outline pops on arrival, not on entry");
         assert_eq!(c.click_point(&items), (210.0, 115.0));
-        // Drive into the pad: docks and centers at once.
+        // Drive into the pad: docks in place (no viewport jump).
         c.x = 205.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1));
-        assert_eq!((c.x, c.y), (150.0, 115.0));
+        assert_eq!((c.x, c.y), (205.0, 115.0));
     }
 
     #[test]
@@ -1200,8 +1214,8 @@ mod tests {
         assert_eq!(c.attached, Some(CHROME_ID_BASE));
         assert!(!c.jump(JumpDir::Up, &items));
         assert_eq!(c.attached, Some(CHROME_ID_BASE));
-        // Dock re-pins to the slot center; the blocked press moves nothing.
-        assert_eq!((c.x, c.y), (92.5, -94.0));
+        // The blocked press moves nothing; the point keeps its position.
+        assert_eq!((c.x, c.y), (92.0, -94.0));
         assert!(c.fly_to.is_none());
     }
 
@@ -1220,7 +1234,7 @@ mod tests {
         assert_eq!(c.attached, Some(61));
         assert!(!c.jump(JumpDir::Down, &items));
         assert_eq!(c.attached, Some(61), "still docked");
-        assert_eq!(c.y, 569.0, "pinned to the element center, not the edge");
+        assert_eq!(c.y, 568.0, "viewport point preserved");
         assert!(c.fly_to.is_none());
     }
 
@@ -1540,19 +1554,26 @@ mod tests {
     }
 
     #[test]
-    fn docked_pin_follows_page_motion() {
-        // The element scrolls under a docked cursor: still held, so the
-        // point re-pins to the new center instead of stranding.
+    fn docked_point_holds_still_while_page_scrolls() {
         let mut c = Cursor::new();
         let items = [link(1, 100.0, 100.0)];
         c.x = 150.0;
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1));
+        // The element shifts under the point but still holds it: the point
+        // stays exactly at its viewport position.
         let moved = [link(1, 100.0, 110.0)];
         c.advance(0.0, 0.0, 0.016, &moved);
         assert_eq!(c.attached, Some(1));
-        assert_eq!((c.x, c.y), (150.0, 125.0));
+        assert_eq!((c.x, c.y), (150.0, 115.0));
+        // It scrolls away; a different element takes its place under the
+        // point. Re-dock in place — the viewport point never moves.
+        let replaced = [link(1, 100.0, 300.0), link(2, 100.0, 90.0)];
+        c.advance(0.0, 0.0, 0.016, &replaced);
+        assert_eq!(c.attached, Some(2));
+        assert_eq!((c.x, c.y), (150.0, 115.0), "viewport point persisted");
+        assert_eq!(c.last_dock, Some((100.0, 90.0, 100.0, 30.0)));
     }
 
     #[test]
