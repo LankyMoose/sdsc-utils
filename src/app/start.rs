@@ -1194,6 +1194,7 @@ impl App {
             sample.lstick_y,
             sample.rstick_x,
             sample.rstick_y,
+            sample.r2,
             now,
         );
         // Stick vector for autofocus docking: a deflected stick means the

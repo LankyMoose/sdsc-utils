@@ -1332,6 +1332,7 @@ impl BrowserPanel {
         ly: f32,
         rx: f32,
         ry: f32,
+        r2: bool,
         now: Instant,
     ) -> (f32, f32) {
         use crate::browser::cursor::SCROLL_SPEED;
@@ -1340,6 +1341,7 @@ impl BrowserPanel {
             .map(|t| now.saturating_duration_since(t).as_secs_f32().min(0.1))
             .unwrap_or(0.0);
         self.analog_at = Some(now);
+        self.page.cursor.turbo = r2;
         // One continuous surface: page targets plus synthetic chrome.
         let targets = cursor_targets(&self.page.focusables, &self.chrome);
         // Docking transitions are rare and are the cursor's most surprising
@@ -1390,7 +1392,11 @@ impl BrowserPanel {
             }
         }
         if in_page {
-            (rx * SCROLL_SPEED * dt, ry * SCROLL_SPEED * dt)
+            let scale = if r2 { 2.0 } else { 1.0 };
+            (
+                rx * SCROLL_SPEED * dt * scale,
+                ry * SCROLL_SPEED * dt * scale,
+            )
         } else {
             (0.0, 0.0)
         }
@@ -5855,7 +5861,7 @@ mod tests {
         let mut now = Instant::now();
         for _ in 0..240 {
             now += Duration::from_millis(16);
-            panel.advance_stick(0.0, 0.0, 0.0, 0.0, now);
+            panel.advance_stick(0.0, 0.0, 0.0, 0.0, false, now);
             if panel.page.cursor.fly_to.is_none() {
                 break;
             }

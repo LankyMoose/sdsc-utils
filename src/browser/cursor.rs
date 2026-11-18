@@ -137,6 +137,9 @@ pub struct Cursor {
     /// place (no centre snap): content moved under a fixed point, and
     /// centring the first target after the scroll reads as a nudge.
     scroll_released: bool,
+    /// R2 turbo: doubles cursor acceleration/cap and scroll speed for the
+    /// duration of the hold.
+    pub turbo: bool,
     pub visible: bool,
     /// Live page-area size in card pixels (dynamic engine viewport).
     pub view_w: f32,
@@ -194,6 +197,7 @@ impl Cursor {
             docked_for: 0.0,
             magnet: true,
             scroll_released: false,
+            turbo: false,
             visible: true,
             view_w: VIEWPORT_W,
             view_h: VIEWPORT_H,
@@ -360,10 +364,16 @@ impl Cursor {
                 self.fly_to = None;
             }
         } else {
-            self.vx =
-                (self.vx + lx * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
-            self.vy =
-                (self.vy + ly * CURSOR_ACCEL * dt_secs).clamp(-CURSOR_MAX_SPEED, CURSOR_MAX_SPEED);
+            // R2 turbo doubles the effective speed. The friction model
+            // settles at accel/friction, so scale acceleration too — the
+            // cap alone would never be reached.
+            let (accel, max_speed) = if self.turbo {
+                (CURSOR_ACCEL * 2.0, CURSOR_MAX_SPEED * 2.0)
+            } else {
+                (CURSOR_ACCEL, CURSOR_MAX_SPEED)
+            };
+            self.vx = (self.vx + lx * accel * dt_secs).clamp(-max_speed, max_speed);
+            self.vy = (self.vy + ly * accel * dt_secs).clamp(-max_speed, max_speed);
         }
         let damp = (-CURSOR_FRICTION * dt_secs).exp();
         self.vx *= damp;
@@ -833,6 +843,24 @@ mod tests {
         c.advance(0.0, 0.0, 0.006, &items);
         assert!(c.fly_to.is_none(), "nudge lands at 150ms");
         assert!((c.x - 550.0).abs() < 1.0 && (c.y - 115.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn turbo_doubles_the_cursor_speed() {
+        let mut slow = Cursor::new();
+        let mut fast = Cursor::new();
+        slow.view_w = 10_000.0;
+        fast.view_w = 10_000.0;
+        slow.x = 100.0;
+        fast.x = 100.0;
+        fast.turbo = true;
+        for _ in 0..60 {
+            slow.advance(1.0, 0.0, 0.016, &[]);
+            fast.advance(1.0, 0.0, 0.016, &[]);
+        }
+        let ratio = fast.vx.abs() / slow.vx.abs();
+        assert!((ratio - 2.0).abs() < 0.05, "turbo ratio={ratio}");
+        assert!(fast.x > slow.x * 1.5);
     }
 
     #[test]
