@@ -133,12 +133,10 @@ pub struct Cursor {
 
 /// Perpendicular band metrics between a docked rect and a candidate for a
 /// move along `dir`: `(forward gap, shared perpendicular extent,
-/// perpendicular centre offset, centre line crossed)`. Gap is clamped at
-/// zero when the rects overlap on the movement axis; shared extent is zero
-/// when they do not overlap on the perpendicular axis. Centre line crossed
-/// means the docked rect's perpendicular centre falls inside the
-/// candidate's span — the target sits in the same visual row/column.
-fn band_metrics(from: (f32, f32, f32, f32), to: &Focusable, dir: JumpDir) -> (f32, f32, f32, bool) {
+/// perpendicular centre offset)`. Gap is clamped at zero when the rects
+/// overlap on the movement axis; shared extent is zero when they do not
+/// overlap on the perpendicular axis.
+fn band_metrics(from: (f32, f32, f32, f32), to: &Focusable, dir: JumpDir) -> (f32, f32, f32) {
     let (fx0, fy0, fw, fh) = from;
     let (fx1, fy1) = (fx0 + fw, fy0 + fh);
     let (tx1, ty1) = (to.x + to.w, to.y + to.h);
@@ -151,9 +149,7 @@ fn band_metrics(from: (f32, f32, f32, f32), to: &Focusable, dir: JumpDir) -> (f3
                 to.y - fy1
             };
             let column = ((fx0 + fw / 2.0) - (to.x + to.w / 2.0)).abs();
-            let centre = fx0 + fw / 2.0;
-            let on_axis = to.x <= centre && centre <= tx1;
-            (gap.max(0.0), shared.max(0.0), column, on_axis)
+            (gap.max(0.0), shared.max(0.0), column)
         }
         JumpDir::Left | JumpDir::Right => {
             let shared = fy1.min(ty1) - fy0.max(to.y);
@@ -163,9 +159,7 @@ fn band_metrics(from: (f32, f32, f32, f32), to: &Focusable, dir: JumpDir) -> (f3
                 to.x - fx1
             };
             let column = ((fy0 + fh / 2.0) - (to.y + to.h / 2.0)).abs();
-            let centre = fy0 + fh / 2.0;
-            let on_axis = to.y <= centre && centre <= ty1;
-            (gap.max(0.0), shared.max(0.0), column, on_axis)
+            (gap.max(0.0), shared.max(0.0), column)
         }
     }
 }
@@ -354,15 +348,14 @@ impl Cursor {
     /// arrival — no teleport frames. D-pad always snaps — this ignores the
     /// magnet toggle.
     ///
-    /// Docked ranking is band-first, not centre-distance. Targets crossed
-    /// by the docked item's perpendicular centre line (same row/column)
-    /// outrank every partial overlap, and partial overlaps outrank purely
-    /// diagonal targets — so a below-right target can never win a Right
-    /// press over a right target. Within a tier the nearest forward row
-    /// wins, then the widest shared perpendicular extent, then the
-    /// smallest column offset. With no dock (or nothing sharing the band)
-    /// it falls back to the 60-degree cone and nearest-point scoring.
-    /// Page targets must intersect the viewport; chrome lives above it.
+    /// Docked ranking is band-first, not centre-distance. Targets sharing
+    /// the docked item's perpendicular extent form the eligible band when
+    /// any exist, so a below-right target can never win a Right press over
+    /// a right target. Inside the band the nearest forward row wins first,
+    /// then the widest shared perpendicular extent, then the smallest
+    /// column offset. With no dock (or nothing sharing the band) it falls
+    /// back to the 60-degree cone and nearest-point scoring. Page targets
+    /// must intersect the viewport; chrome lives above it.
     pub fn jump(&mut self, dir: JumpDir, options: &[Focusable]) -> bool {
         let (dx, dy) = match dir {
             JumpDir::Up => (0.0, -1.0),
@@ -380,9 +373,6 @@ impl Cursor {
             shared: f32,
             /// Perpendicular centre offset (last-resort tie-break).
             column: f32,
-            /// 2 = docked centre line crosses this target (same row or
-            /// column), 1 = partial band overlap, 0 = diagonal fallback.
-            tier: u8,
         }
         let from = self.attached_rect(options);
         let mut cands: Vec<Candidate<'_>> = Vec::new();
@@ -405,22 +395,15 @@ impl Cursor {
                 continue;
             }
             let across = (cx * dy - cy * dx).abs();
-            let (gap, shared, column, on_axis) = match from {
+            let (gap, shared, column) = match from {
                 Some(f) => band_metrics(f, item, dir),
-                None => (along, 0.0, across, false),
+                None => (along, 0.0, across),
             };
             // A candidate sharing the docked band is a legitimate row move
             // even off-axis; only diagonal (out-of-band) targets are coned.
             if shared <= 0.0 && across > along {
                 continue;
             }
-            let tier = if on_axis {
-                2
-            } else if shared > 0.0 {
-                1
-            } else {
-                0
-            };
             cands.push(Candidate {
                 item,
                 along,
@@ -428,21 +411,14 @@ impl Cursor {
                 gap,
                 shared,
                 column,
-                tier,
             });
         }
-        let top_tier = cands.iter().map(|c| c.tier).max().unwrap_or(0);
-        let winner = cands.iter().filter(|c| c.tier == top_tier).min_by(|a, b| {
-            if top_tier == 0 {
-                // Free cursor or fully diagonal: nearest point in the cone.
-                let sa = a.along + a.across * 2.0;
-                let sb = b.along + b.across * 2.0;
-                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
-            } else {
-                // Same row/column first: nearest forward row, then the
-                // widest shared extent, then the closest column. Proximity
-                // must lead inside the tier — a wide bar two rows away
-                // must not beat the very next row (bookmark -> page trace).
+        let any_shared = cands.iter().any(|c| c.shared > 0.0);
+        let winner = if any_shared {
+            cands.iter().filter(|c| c.shared > 0.0).min_by(|a, b| {
+                // Nearest forward row first (a wide bar two rows away
+                // must not beat the very next row); shared extent then
+                // decides inside that row.
                 a.gap
                     .partial_cmp(&b.gap)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -456,8 +432,14 @@ impl Cursor {
                             .partial_cmp(&b.column)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
-            }
-        });
+            })
+        } else {
+            cands.iter().min_by(|a, b| {
+                let sa = a.along + a.across * 2.0;
+                let sb = b.along + b.across * 2.0;
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+            })
+        };
         if let Some(c) = winner {
             self.jump_to(c.item);
             true
@@ -1043,6 +1025,28 @@ mod tests {
             c.fly_to,
             Some((300.0, 125.0)),
             "must land on the right target, never below-right"
+        );
+    }
+
+    #[test]
+    fn near_page_logo_beats_the_wide_bookmark_bar() {
+        // R3 trace: Up from link #6 (141-282) skipped the brand logo #1
+        // (8-188) and jumped to the 400px bookmark bar. The logo shares
+        // 47px and sits 12px above; the bookmark shares 141px but is 54px
+        // above. Nearest row wins inside the band.
+        let logo = chrome_btn(1, 8.0, 12.0, 180.0, 26.0);
+        let tile = chrome_btn(6, 141.0, 50.0, 141.0, 36.0);
+        let bookmark = chrome_btn(CHROME_ID_BASE, 0.0, -32.0, 400.0, 28.0);
+        let items = [logo, tile, bookmark];
+        let mut c = Cursor::new();
+        c.attached = Some(6);
+        c.x = 211.5;
+        c.y = 68.0;
+        assert!(c.jump(JumpDir::Up, &items));
+        assert_eq!(
+            c.fly_to,
+            Some((98.0, 25.0)),
+            "the brand logo directly above wins, not the wide bookmark bar"
         );
     }
 
