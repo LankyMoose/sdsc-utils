@@ -70,6 +70,40 @@ fn budget_path() -> std::path::PathBuf {
     paths::data_dir().join("crash-restart.json")
 }
 
+/// Marker written by the panic hook. Unlike the crash-restart budget (which
+/// only the relauncher records), this survives a manual relaunch: the next
+/// boot consumes it and starts in safe mode.
+fn panic_flag_path() -> std::path::PathBuf {
+    paths::data_dir().join("crashed.flag")
+}
+
+/// Panic hook: stamp that this process died abnormally. Best effort; the
+/// hook must never panic itself.
+pub fn mark_panic() {
+    let path = panic_flag_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(
+        path,
+        format!(
+            "{}
+",
+            epoch_secs()
+        ),
+    );
+}
+
+/// Consume the abnormal-exit marker (once per boot).
+pub fn take_panic_flag() -> bool {
+    let path = panic_flag_path();
+    if !path.exists() {
+        return false;
+    }
+    let _ = fs::remove_file(path);
+    true
+}
+
 fn read_budget() -> RestartBudget {
     fs::read(budget_path())
         .ok()

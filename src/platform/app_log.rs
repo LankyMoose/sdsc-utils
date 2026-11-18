@@ -230,6 +230,9 @@ fn install_panic_hook(crash_armed: &'static CrashArmed) {
         append_panic_line(&line);
         append_panic_line(&crate::platform::wgpu_diag::context_line());
         append_panic_line(&format!("PANIC_BACKTRACE {}", panic_backtrace_capped()));
+        // Persist abnormal exit independently of the relauncher budget:
+        // a manual relaunch after a crash must still boot safe.
+        crate::platform::crash_restart::mark_panic();
         crate::platform::crash_restart::schedule_from_panic(crash_armed);
         let _ = writeln!(std::io::stderr(), "{line}");
         previous(info);

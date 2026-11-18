@@ -770,7 +770,8 @@ impl App {
         // Servo (the restored active tab is the one that was loading).
         // Boot home; saved tabs stay stored for a manual switch.
         let crash_restart_boot = crate::platform::crash_restart::has_pending_notice()
-            || crate::platform::crash_restart::recent_crash();
+            || crate::platform::crash_restart::recent_crash()
+            || crate::platform::crash_restart::take_panic_flag();
         let boot_url = if crash_restart_boot {
             crate::browser::BROWSER_HOME_URL.to_string()
         } else {
