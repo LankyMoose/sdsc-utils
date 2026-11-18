@@ -1437,6 +1437,9 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
             // documents this). All tabs are the same fixed viewport anyway.
             global_ref.ctx.resize(PhysicalSize::new(width, height));
             global_ref.size = (width, height);
+            crate::controller::hid::diag::diag_info(format!(
+                "servo-engine: resize -> {width}x{height}"
+            ));
         }
         EngineCommand::SetVisible { visible } => {
             let mut global_ref = global.borrow_mut();

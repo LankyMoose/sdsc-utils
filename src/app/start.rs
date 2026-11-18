@@ -493,6 +493,10 @@ impl App {
             return;
         }
         if let Some(engine) = &self.engine {
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: browser viewport {:.0}x{:.0}",
+                layout.page_w, layout.page_h
+            ));
             engine.send(EngineCommand::Resize {
                 width: layout.page_w.round().max(1.0) as u32,
                 height: layout.page_h.round().max(1.0) as u32,
