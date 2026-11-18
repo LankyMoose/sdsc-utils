@@ -46,12 +46,13 @@ pub const CURSOR_FRICTION: f32 = 14.0;
 /// HOLD_PAD, so edge dither never flickers the wrap.
 pub const ACQUIRE_PAD: f32 = 8.0;
 pub const HOLD_PAD: f32 = 24.0;
-/// Dock-blend rate: the outline morphs free↔docked in ~140ms, eased every
-/// analog tick so no frame pops.
-pub const DOCK_BLEND_PER_SEC: f32 = 7.0;
-/// D-pad flight speed, px/s: jumps glide to the target instead of
-/// teleporting; stick input cancels back to manual control.
-pub const FLY_SPEED: f32 = 2400.0;
+/// Full undock → travel → dock beat for a D-pad nudge, seconds. Distance
+/// independent: every jump takes the same 150ms, and the outline morph
+/// uses the same rate so the whole transition is one consistent beat.
+pub const NUDGE_SECS: f32 = 0.150;
+/// Dock-blend rate: the outline morphs free↔docked in [`NUDGE_SECS`],
+/// eased every analog tick so no frame pops.
+pub const DOCK_BLEND_PER_SEC: f32 = 1.0 / NUDGE_SECS;
 /// Break-free stick deflection while docked: past 25% a *fresh* push
 /// releases at once (detach + outward kick) instead of dragging the dock
 /// along. Fresh means the stick dropped below [`BREAK_REARM_DEFLECT`]
@@ -111,9 +112,13 @@ pub struct Cursor {
     /// Last docked rect (page px), kept across undock so the wrap visibly
     /// morphs back into the dot instead of vanishing.
     pub last_dock: Option<(f32, f32, f32, f32)>,
-    /// D-pad flight target (page px): jumps glide here at
-    /// [`FLY_SPEED`] instead of teleporting; stick input cancels.
+    /// D-pad flight target (page px): jumps glide here over [`NUDGE_SECS`]
+    /// instead of teleporting; stick input cancels.
     pub fly_to: Option<(f32, f32)>,
+    /// Flight origin and elapsed seconds: the tween is fixed-duration, so
+    /// long and short nudges read the same.
+    fly_from: (f32, f32),
+    fly_elapsed: f32,
     /// Break-free suppression: id that must not re-dock until the point
     /// leaves its hold pad (prevents instant re-capture after a push-off).
     pub no_dock: Option<u64>,
@@ -128,6 +133,10 @@ pub struct Cursor {
     /// Docking mode (L3 toggles): the point docks onto elements it arrives
     /// at. Off = pure free-form virtual mouse; D-pad jumping still applies.
     pub magnet: bool,
+    /// A scroll released the dock and the next acquire must happen in
+    /// place (no centre snap): content moved under a fixed point, and
+    /// centring the first target after the scroll reads as a nudge.
+    scroll_released: bool,
     pub visible: bool,
     /// Live page-area size in card pixels (dynamic engine viewport).
     pub view_w: f32,
@@ -179,9 +188,12 @@ impl Cursor {
             last_dock: None,
             fly_to: None,
             no_dock: None,
+            fly_from: (0.0, 0.0),
+            fly_elapsed: 0.0,
             break_armed: true,
             docked_for: 0.0,
             magnet: true,
+            scroll_released: false,
             visible: true,
             view_w: VIEWPORT_W,
             view_h: VIEWPORT_H,
@@ -270,6 +282,7 @@ impl Cursor {
     ) {
         if scrolling {
             self.attached = None;
+            self.scroll_released = true;
         }
         // D-pad flights glide to the target; stick input cancels back to
         // manual control.
@@ -332,21 +345,19 @@ impl Cursor {
             }
         }
         if let Some((tx, ty)) = self.fly_to {
-            let dx = tx - self.x;
-            let dy = ty - self.y;
-            let dist = dx.hypot(dy);
-            let step = FLY_SPEED * dt_secs;
-            if dist <= step.max(1.0) {
-                self.x = tx.clamp(0.0, self.view_w);
-                self.y = ty.clamp(CURSOR_MIN_Y, self.view_h);
+            // Fixed-duration nudge tween: every jump takes NUDGE_SECS,
+            // regardless of distance, on a smoothstep so it starts and
+            // lands without a velocity snap.
+            self.fly_elapsed += dt_secs;
+            let t = (self.fly_elapsed / NUDGE_SECS).clamp(0.0, 1.0);
+            let e = t * t * (3.0 - 2.0 * t);
+            self.x = (self.fly_from.0 + (tx - self.fly_from.0) * e).clamp(0.0, self.view_w);
+            self.y =
+                (self.fly_from.1 + (ty - self.fly_from.1) * e).clamp(CURSOR_MIN_Y, self.view_h);
+            self.vx = 0.0;
+            self.vy = 0.0;
+            if t >= 1.0 {
                 self.fly_to = None;
-                self.vx = 0.0;
-                self.vy = 0.0;
-            } else if dist > 0.0 {
-                self.x = (self.x + dx / dist * step).clamp(0.0, self.view_w);
-                self.y = (self.y + dy / dist * step).clamp(CURSOR_MIN_Y, self.view_h);
-                self.vx = 0.0;
-                self.vy = 0.0;
             }
         } else {
             self.vx =
@@ -375,9 +386,17 @@ impl Cursor {
         // state eases toward the attachment every tick — including neutral
         // ones — so shape, size, and position always interpolate.
         if self.magnet && !scrolling {
+            let stick = lx != 0.0 || ly != 0.0;
             // Neutral ticks keep the point fixed (content scrolling under
-            // it); a deflected stick still gets the magnetic centre snap.
-            self.snap_with(options, lx != 0.0 || ly != 0.0);
+            // it). A deflected stick gets the magnetic centre snap, except
+            // right after a break-free push (the no_dock suppression is
+            // meant to prevent instant re-capture, and overlapping targets
+            // must not alternate) or right after a scroll (first re-dock in
+            // place, no centre snap).
+            let suppression = self.no_dock.is_some() && stick;
+            if !suppression {
+                self.snap_with(options, stick && !self.scroll_released);
+            }
         }
         self.ease_blend(dt_secs);
     }
@@ -506,6 +525,7 @@ impl Cursor {
         self.attached = None;
         self.vx = 0.0;
         self.vy = 0.0;
+        self.scroll_released = false;
         // Explicit jump: allowed to cross the header/page boundary, but
         // land in the target's own zone (a partially visible page link
         // must not park the point inside the header).
@@ -515,6 +535,8 @@ impl Cursor {
         } else {
             cy.clamp(0.0, self.view_h)
         };
+        self.fly_from = (self.x, self.y);
+        self.fly_elapsed = 0.0;
         self.fly_to = Some(((item.x + item.w / 2.0).clamp(0.0, self.view_w), y));
     }
 
@@ -603,6 +625,7 @@ impl Cursor {
             self.vy = 0.0;
             self.break_armed = false;
             self.docked_for = 0.0;
+            self.scroll_released = false;
             if centre {
                 self.x = (item.x + item.w / 2.0).clamp(0.0, self.view_w);
                 // Centre snap is a stick acquire: keep it in the same zone,
@@ -792,6 +815,24 @@ mod tests {
         assert!(!c.jump(JumpDir::Up, &[]));
         assert_eq!(c.attached, Some(2));
         assert!((c.x - 450.0).abs() < 1.0 && (c.y - 115.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn jump_travel_is_a_fixed_150ms_regardless_of_distance() {
+        let items = [link(2, 500.0, 100.0)];
+        let mut c = Cursor::new();
+        c.x = 110.0;
+        c.y = 115.0;
+        assert!(c.jump(JumpDir::Right, &items));
+        // 9 × 16ms = 144ms: still in flight, nearly arrived.
+        for _ in 0..9 {
+            c.advance(0.0, 0.0, 0.016, &items);
+        }
+        assert!(c.fly_to.is_some(), "nudge must not finish early");
+        // One 6ms tick closes the fixed 150ms beat.
+        c.advance(0.0, 0.0, 0.006, &items);
+        assert!(c.fly_to.is_none(), "nudge lands at 150ms");
+        assert!((c.x - 550.0).abs() < 1.0 && (c.y - 115.0).abs() < 1.0);
     }
 
     #[test]

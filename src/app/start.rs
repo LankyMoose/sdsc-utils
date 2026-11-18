@@ -3453,15 +3453,19 @@ impl App {
                         self.on_start_message(StartMessage::BrowserHistoryOpen { back: false })
                     }
                     Some(NavAction::ToggleMagnetism) => {
-                        self.start_state.browser.cursor.magnet =
-                            !self.start_state.browser.cursor.magnet;
-                        crate::controller::hid::diag::diag_info(format!(
+                        let cursor = &mut self.start_state.browser.cursor;
+                        cursor.magnet = !cursor.magnet;
+                        // Free-form starts now: drop any current dock and
+                        // break suppression so the point is actually free.
+                        if !cursor.magnet {
+                            cursor.attached = None;
+                            cursor.no_dock = None;
+                        }
+                        // Release-visible: the old diag_info is compiled out
+                        // in release, which made the toggle look dead.
+                        crate::platform::app_log::info(format!(
                             "ui-diag: start browser magnet {}",
-                            if self.start_state.browser.cursor.magnet {
-                                "on"
-                            } else {
-                                "off"
-                            }
+                            if cursor.magnet { "on" } else { "off" }
                         ));
                         Task::none()
                     }
