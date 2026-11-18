@@ -1583,6 +1583,58 @@ impl App {
             self.start_state.browser.draft = crate::browser::BROWSER_HOME_URL.to_string();
             return self.on_browser_navigate();
         }
+        if self.crash_restart_boot {
+            // Safe mode: the restored active tab is the page that killed
+            // Servo. Start on home and keep every saved tab stored (the
+            // user can switch deliberately); never auto-load the crash page
+            // again on relaunch.
+            crate::platform::app_log::info(
+                "crash-restart: safe tab restore (home live, saved tabs stored)",
+            );
+            let generation = {
+                let panel = &mut self.start_state.browser;
+                panel.stored.clear();
+                panel.order.clear();
+                panel.active_tab = TabId::BOOT;
+                panel.page = start_view::BrowserTabPage::default();
+                panel.page.session.open_surface();
+                let generation = panel
+                    .page
+                    .session
+                    .begin_load(crate::browser::BROWSER_HOME_URL.to_string());
+                panel.draft = crate::browser::BROWSER_HOME_URL.to_string();
+                panel.order.push(TabId::BOOT);
+                let mut next_id = panel.next_tab_id.max(2);
+                for saved_tab in tabs {
+                    let id = TabId(next_id);
+                    next_id += 1;
+                    let mut page = start_view::BrowserTabPage::default();
+                    page.session.open_surface();
+                    page.session.note_url(saved_tab.url.clone());
+                    if !saved_tab.title.is_empty() {
+                        page.session.note_title(Some(saved_tab.title));
+                    }
+                    panel.stored.push(start_view::StoredTab {
+                        id,
+                        page,
+                        loaded: false,
+                    });
+                    panel.order.push(id);
+                }
+                panel.next_tab_id = next_id;
+                panel.rebuild_chrome();
+                generation
+            };
+            self.save_strip();
+            if let Some(engine) = &self.engine {
+                engine.send(EngineCommand::Navigate {
+                    tab: TabId::BOOT,
+                    url: crate::browser::BROWSER_HOME_URL.to_string(),
+                    generation,
+                });
+            }
+            return Task::none();
+        }
         let active_pos = saved.active.min(tabs.len() - 1);
         // The live tab's load (restored tabs behind it stay unloaded until
         // first switch — the worker only ever pays for visible tabs).

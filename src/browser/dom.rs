@@ -51,6 +51,11 @@ pub const DOM_PING_URL: &str = "http://sdsc.invalid/__SDSC_DOM_DIRTY";
 /// pages collapse 60fps mutation storms to ~2 pings/s. Every ping POSTs to
 /// the marker URL; the backend intercepts it into one dirty flag.
 pub const DOM_INSTALL_JS: &str = r###"(function(){
+  // Top document only. UserContentManager auto-installs this in every
+  // frame; subframe documents can be transient and Servo's script/layout
+  // state is unstable during iframe load/teardown. Never attach our
+  // observers or geometry reads there.
+  try { if (window.top !== window.self) return; } catch (e) { return; }
   var S = window.__sdsc_ax;
   if (!S) { S = window.__sdsc_ax = { next: 1, ids: new WeakMap() }; }
   if (S.mo) return;
@@ -230,6 +235,9 @@ pub fn dom_query_js(center: Option<(f32, f32)>, epoch: u64) -> String {
 }
 
 const DOM_QUERY_BODY: &str = r###"(function(){
+  // Top document only (see DOM_INSTALL_JS): no snap targets are collected
+  // from transient iframe documents.
+  try { if (window.top !== window.self) return {}; } catch (e) { return {}; }
   var S = window.__sdsc_ax;
   if (!S) { S = window.__sdsc_ax = { next: 1, ids: new WeakMap() }; }
   function idFor(el) {
@@ -1045,6 +1053,11 @@ mod tests {
         let boot = dom_boot_js(None, 7);
         assert!(boot.contains(DOM_DIRTY_MARKER));
         assert!(boot.contains("querySelectorAll"));
+        // Both scripts refuse to run in subframes: UserContentManager
+        // installs per document, and iframe documents are exactly where
+        // Servo's script/layout stability asserts fire.
+        assert!(DOM_INSTALL_JS.contains("window.top !== window.self"));
+        assert!(DOM_QUERY_BODY.contains("window.top !== window.self"));
     }
 
     #[test]

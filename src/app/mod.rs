@@ -495,6 +495,9 @@ pub struct App {
     engine: Option<EngineHandle>,
     /// Monitor covered by the Start window (stage size for the view).
     start_monitor_cover: Option<MonitorCover>,
+    /// This process was relaunched by the crash handler: restore tabs in
+    /// safe mode (home live tab, saved tabs stored).
+    crash_restart_boot: bool,
     /// Last user activity on Start (mouse / keyboard / pad) for idle/sleep.
     start_last_activity: Instant,
     /// Last mouse activity on Start (cursor hide only — pad must not unhide).
@@ -763,6 +766,16 @@ impl App {
             initial_browser.page_w.round().max(1.0) as u32,
             initial_browser.page_h.round().max(1.0) as u32,
         );
+        // A crash-restart successor must not re-open the page that killed
+        // Servo (the restored active tab is the one that was loading).
+        // Boot home; saved tabs stay stored for a manual switch.
+        let crash_restart_boot = crate::platform::crash_restart::has_pending_notice()
+            || crate::platform::crash_restart::recent_crash();
+        let boot_url = if crash_restart_boot {
+            crate::browser::BROWSER_HOME_URL.to_string()
+        } else {
+            crate::browser::tabs::boot_url()
+        };
         let mut app = Self {
             session,
             games,
@@ -842,14 +855,12 @@ impl App {
             engine: if std::env::var("SDSC_NO_ENGINE").is_ok() {
                 None
             } else {
-                crate::browser::servo_backend::spawn_engine(
-                    &crate::browser::tabs::boot_url(),
-                    initial_page,
-                )
+                crate::browser::servo_backend::spawn_engine(&boot_url, initial_page)
             },
             #[cfg(not(feature = "servo-engine"))]
             engine: None,
             start_monitor_cover: None,
+            crash_restart_boot,
             start_last_activity: Instant::now(),
             start_cursor_last_active: Instant::now(),
             start_cursor_hidden: false,
