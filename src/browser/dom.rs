@@ -65,6 +65,13 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
   // status when the page injects head resources) keeps it. The backend
   // uses this to tell a spurious `Complete` from an actual document swap.
   if (!S.doc) { S.doc = Date.now().toString(36) + '.' + Math.random().toString(36).slice(2); }
+  // Visibility-verdict cache bookkeeping (populated by the query): every
+  // element with a cached verdict, plus every ancestor of one. A style/
+  // class mutation only invalidates the mutated element and its cached
+  // descendants, so unrelated class churn (Google's sticky header) no
+  // longer resets the whole cache and forces a 1s ancestor re-walk.
+  if (!S.visSet) { S.visSet = (typeof Set !== "undefined") ? new Set() : null; }
+  if (!S.visAnc) { S.visAnc = (typeof Set !== "undefined") ? new Set() : null; }
   // Numeric id → element map, rebuilt by every snapshot query (so detached
   // nodes release instead of leaking). Powers `__sdsc_click`: exact-element
   // activation without hit-test staleness.
@@ -91,6 +98,23 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
     var wx = 0, wy = 0;
     try { wx = Math.round(window.scrollX || window.pageXOffset || 0); wy = Math.round(window.scrollY || window.pageYOffset || 0); } catch (e) {}
     try { fetch(PING + '?wx=' + wx + '&wy=' + wy + '&ev=' + src, {method:'POST', mode:'no-cors', keepalive:true, body:'1'}).catch(function(){}); } catch (e) {}
+  }
+  function resetVerdicts() {
+    S.vis = (typeof WeakMap !== "undefined") ? new WeakMap() : null;
+    if (S.visSet) S.visSet.clear();
+    if (S.visAnc) S.visAnc.clear();
+  }
+  // Drop only cached verdicts whose element is the mutation target or a
+  // descendant of it. A mutation on an unrelated sibling cannot change a
+  // cached verdict, so the warm cache survives.
+  function dropVerdicts(t) {
+    try {
+      if (!S.vis || !S.visSet) { resetVerdicts(); return; }
+      if (!S.visSet.has(t) && !(S.visAnc && S.visAnc.has(t))) return;
+      var dead = [];
+      S.visSet.forEach(function(el){ try { if (t === el || t.contains(el)) dead.push(el); } catch (e) {} });
+      for (var i = 0; i < dead.length; i++) { S.vis.delete(dead[i]); S.visSet.delete(dead[i]); }
+    } catch (e) {}
   }
   function onMut(ev) {
     ev = ev || 'mc';
@@ -121,9 +145,13 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
       new MutationObserver(function(recs){
         var attr = false;
         try { for (var i = 0; i < recs.length; i++) {
-          if (recs[i].type !== 'attributes') continue;
-          var an = recs[i].attributeName;
-          if (!an || an === 'class' || an === 'style' || an === 'hidden') { attr = true; break; }
+          var r = recs[i];
+          if (r.type !== 'attributes') continue;
+          var an = r.attributeName;
+          if (!an || an === 'class' || an === 'style' || an === 'hidden') {
+            attr = true;
+            if (r.target) dropVerdicts(r.target);
+          }
         } } catch (e) {}
         onMut(attr ? 'ma' : 'mc');
       }).observe(root, {subtree:true, childList:true, attributes:true, characterData:true});
@@ -131,7 +159,16 @@ pub const DOM_INSTALL_JS: &str = r###"(function(){
     try {
       // Resize shifts layout but never flips display/visibility/opacity:
       // structural tag, verdicts kept.
-      new ResizeObserver(function(){ onMut('mc'); }).observe(document.body || root);
+      new ResizeObserver(function(){
+        // A viewport change can re-evaluate media queries across the whole
+        // document: reset. Body content growth leaves innerWidth/Height
+        // alone and keeps the warm cache.
+        try {
+          var vw = window.innerWidth, vh = window.innerHeight;
+          if (S.vw !== vw || S.vh !== vh) { S.vw = vw; S.vh = vh; resetVerdicts(); }
+        } catch (e) {}
+        onMut('mc');
+      }).observe(document.body || root);
     } catch (e) {}
   }
   arm();
@@ -260,7 +297,12 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   // mutation ping. The backend bumps __sdsc_v on those and leaves it alone
   // for pure scrolls — so scroll-settle pulls reuse verdicts instead of
   // re-walking, and mutation pulls re-verify.
-  if (S.visEpoch !== __sdsc_v) { S.vis = (typeof WeakMap !== "undefined") ? new WeakMap() : null; S.visEpoch = __sdsc_v; }
+  if (S.visEpoch !== __sdsc_v) {
+    S.vis = (typeof WeakMap !== "undefined") ? new WeakMap() : null;
+    S.visSet = (typeof Set !== "undefined") ? new Set() : null;
+    S.visAnc = (typeof Set !== "undefined") ? new Set() : null;
+    S.visEpoch = __sdsc_v;
+  }
   function cstyle(n) {
     if (styleCache) {
       var hit = styleCache.get(n);
@@ -284,7 +326,15 @@ const DOM_QUERY_BODY: &str = r###"(function(){
     try { cached = S.vis ? S.vis.get(el) : undefined; } catch (e) {}
     if (cached !== undefined) return cached;
     var hidden = isHiddenUncached(el);
-    try { if (S.vis) S.vis.set(el, hidden); } catch (e2) {}
+    try {
+      if (S.vis) S.vis.set(el, hidden);
+      if (S.visSet) S.visSet.add(el);
+      // Ancestors of cached elements: a mutation here can hide them.
+      if (S.visAnc) {
+        var a = el.parentElement, d = 0;
+        while (a && d < 32) { S.visAnc.add(a); a = a.parentElement; d++; }
+      }
+    } catch (e2) {}
     return hidden;
   }
   function isHiddenUncached(el) {
@@ -1053,9 +1103,16 @@ mod tests {
         assert!(query.contains("S.visEpoch"));
         assert!(query.contains("visEpoch"));
         assert!(DOM_INSTALL_JS.contains("ev="));
-        // Ping taxonomy: attribute mutations invalidate verdicts ('ma'),
-        // structural changes ('mc') and scrolls ('sc') don't; trailing
-        // debounce escalates mc->ma so a hide is never swallowed.
+        // Verdict invalidation is localized: the observer drops only the
+        // mutated element plus its cached descendants, so unrelated class
+        // churn keeps the warm cache (the 1s ancestor re-walk killer).
+        assert!(query.contains("S.visSet"));
+        assert!(query.contains("S.visAnc"));
+        assert!(DOM_INSTALL_JS.contains("dropVerdicts"));
+        assert!(DOM_INSTALL_JS.contains("resetVerdicts"));
+        // Ping taxonomy: class/style/hidden flips ('ma'), structural
+        // changes ('mc') and scrolls ('sc'); trailing debounce escalates
+        // mc->ma so a hide is never swallowed.
         assert!(DOM_INSTALL_JS.contains("'ma'"));
         assert!(DOM_INSTALL_JS.contains("'mc'"));
         assert!(DOM_INSTALL_JS.contains("'sc'"));

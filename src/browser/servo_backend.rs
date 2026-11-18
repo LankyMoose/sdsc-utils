@@ -616,13 +616,13 @@ impl WebViewDelegate for Delegate {
         let Some(entry) = self.entry_for(&webview) else {
             return;
         };
-        // Mutation pings invalidate the cached per-element visibility
-        // verdicts only when attributes changed (`ma`: class/style/hidden
-        // flips can hide whole subtrees). Structural pings (`mc`:
-        // insert/remove/text/resize) and scroll pings (`sc`) leave
-        // surviving nodes' verdicts valid — new nodes miss the cache and
-        // compute fresh. Unknown tags (incl. pre-taxonomy `mo`) bump:
-        // safe default.
+        // Ping taxonomy: `sc` is scroll-only, `mc` is a structural change,
+        // `ma` is a class/style/hidden flip. Verdict invalidation is
+        // localized in-page: the mutation observer drops only the mutated
+        // element and its cached descendants, so unrelated class churn
+        // (Google's sticky header) no longer forces a full ancestor
+        // re-walk. Epoch bumps stay for input (hover can restyle without
+        // a mutation) and document events.
         let ev = ping_event(&url);
         let truth = parse_ping_scroll(&url);
         let now = Instant::now();
@@ -639,9 +639,6 @@ impl WebViewDelegate for Delegate {
             state.ping_at = Some(now);
             if scroll_only {
                 state.last_scroll_at = Some(now);
-            }
-            if !(scroll_only || ev == "mc") {
-                state.dom_epoch = state.dom_epoch.wrapping_add(1);
             }
         }
         if !scroll_only {
