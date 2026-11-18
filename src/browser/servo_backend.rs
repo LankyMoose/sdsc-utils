@@ -159,6 +159,15 @@ struct TabState {
     /// Wall time of the last frame written to the slot, for the SDSC_AX_DEBUG
     /// frame trace (cadence + content hash vs tracked scroll).
     last_frame_at: Option<Instant>,
+    /// `notify_new_frame_ready` asked for a paint. The worker loop paints on
+    /// its next turn instead of inside the callback: painting there can race
+    /// the WebRender scene build and return the pre-scroll frame (the page
+    /// visibly jumps to the top).
+    needs_paint: bool,
+    /// Content hash of the last frame painted at scroll 0. A frame at a
+    /// non-zero scroll that matches it is a stale top-of-page frame; dropping
+    /// it keeps the previous texture on screen instead of jumping.
+    top_frame_hash: Option<u64>,
     /// Per-window document token from the install script. A mismatch means
     /// the document was replaced without a Navigate/history event (same-URL
     /// reload); that ingest resets the tree. A spurious `Complete` (Servo
@@ -257,6 +266,8 @@ impl TabState {
             pending_scroll_truth: None,
             user_dirty: false,
             last_frame_at: None,
+            needs_paint: false,
+            top_frame_hash: None,
             doc_token: None,
             spin_seq: 0,
             pending_click_up: None,
@@ -354,57 +365,10 @@ impl WebViewDelegate for Delegate {
         let Some(entry) = entry else {
             return;
         };
-        let paint_start = Instant::now();
-        webview.paint();
-        let paint_ms = paint_start.elapsed().as_millis();
-        let (w, h) = self.global.borrow().size;
-        let rect: Box2D<i32, DevicePixel> =
-            Box2D::new(Point2D::new(0, 0), Point2D::new(w as i32, h as i32));
-        let ctx = self.global.borrow().ctx.clone();
-        let read_start = Instant::now();
-        if let Some(img) = ctx.read_to_image(rect) {
-            let read_ms = read_start.elapsed().as_millis();
-            let (w, h) = (img.width(), img.height());
-            // Frame trace (SDSC_AX_DEBUG): content hash + tracked scroll per
-            // written frame. A hash that regresses while `scroll` advances is
-            // a stale frame, not a scroll-state change.
-            if entry.state.borrow().ax_debug {
-                let now = Instant::now();
-                let (tab, scroll, gap_ms) = {
-                    let mut state = entry.state.borrow_mut();
-                    let gap = state
-                        .last_frame_at
-                        .replace(now)
-                        .map_or(-1, |t| now.saturating_duration_since(t).as_millis() as i64);
-                    (state.tab, state.scroll, gap)
-                };
-                let hash =
-                    img.as_raw()
-                        .iter()
-                        .step_by(997)
-                        .fold(0xcbf2_9ce4_8422_2325u64, |acc, &b| {
-                            acc.wrapping_mul(0x0000_0100_0000_01b3)
-                                .wrapping_add(b as u64)
-                        });
-                crate::platform::app_log::info(format!(
-                    "servo-frame tab{} gen={} scroll=({:.0},{:.0}) hash={hash:016x} paint={paint_ms}ms read={read_ms}ms gap={gap_ms}ms {w}x{h}",
-                    tab.0,
-                    entry.frame.generation().wrapping_add(1),
-                    scroll.0,
-                    scroll.1
-                ));
-            }
-            let mut global = self.global.borrow_mut();
-            if !global.logged_first_frame {
-                global.logged_first_frame = true;
-                crate::platform::app_log::info(format!(
-                    "servo-engine: first frame {w}x{h}, worker live"
-                ));
-            }
-            // Direct handoff: the stable-texture primitive reads the slot;
-            // no per-frame event or view rebuild.
-            entry.frame.write(w, h, img.into_raw());
-        }
+        // Defer the actual paint to the worker loop's next turn. Painting
+        // inside the callback can race WebRender's scene build and hand back
+        // the pre-scroll frame (the page jumps to the top for one frame).
+        entry.state.borrow_mut().needs_paint = true;
     }
 
     /// Popup `request_create_new` (`window.open()`, `target=_blank`): build
@@ -984,6 +948,91 @@ fn drain_commands(
     false
 }
 
+/// Content hash for the frame trace / stale-top guard. Sampling every 997th
+/// byte catches page changes without hashing 6.4 MiB per frame.
+fn frame_hash(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .step_by(997)
+        .fold(0xcbf2_9ce4_8422_2325u64, |acc, &b| {
+            acc.wrapping_mul(0x0000_0100_0000_01b3)
+                .wrapping_add(b as u64)
+        })
+}
+
+/// Paint the active tab after `notify_new_frame_ready` asked for it. Runs
+/// from the worker loop one turn later so the scene is built; painting in
+/// the callback can hand back the pre-scroll frame.
+fn paint_active_tab(global: &Rc<RefCell<Global>>) {
+    let (entry, size) = {
+        let g = global.borrow();
+        if g.suspended || !g.visible {
+            return;
+        }
+        let Some(entry) = g.tabs.get(&g.active).cloned() else {
+            return;
+        };
+        (entry, g.size)
+    };
+    if !entry.state.borrow_mut().needs_paint {
+        return;
+    }
+    entry.state.borrow_mut().needs_paint = false;
+    let paint_start = Instant::now();
+    entry.webview.paint();
+    let paint_ms = paint_start.elapsed().as_millis();
+    let (w, h) = size;
+    let rect: Box2D<i32, DevicePixel> =
+        Box2D::new(Point2D::new(0, 0), Point2D::new(w as i32, h as i32));
+    let ctx = global.borrow().ctx.clone();
+    let read_start = Instant::now();
+    let Some(img) = ctx.read_to_image(rect) else {
+        return;
+    };
+    let read_ms = read_start.elapsed().as_millis();
+    let (w, h) = (img.width(), img.height());
+    let hash = frame_hash(img.as_raw());
+    let ax_debug = entry.state.borrow().ax_debug;
+    let (tab, scroll, gap_ms, stale) = {
+        let mut state = entry.state.borrow_mut();
+        let now = Instant::now();
+        let gap = state
+            .last_frame_at
+            .replace(now)
+            .map_or(-1, |t| now.saturating_duration_since(t).as_millis() as i64);
+        let scroll = state.scroll;
+        if scroll.1 <= 1.0 {
+            state.top_frame_hash = Some(hash);
+        }
+        let stale = scroll.1 > 8.0 && state.top_frame_hash == Some(hash);
+        (state.tab, scroll, gap, stale)
+    };
+    if ax_debug {
+        crate::platform::app_log::info(format!(
+            "servo-frame tab{} gen={} scroll=({:.0},{:.0}) hash={hash:016x} paint={paint_ms}ms read={read_ms}ms gap={gap_ms}ms stale={} {w}x{h}",
+            tab.0,
+            entry.frame.generation().wrapping_add(1),
+            scroll.0,
+            scroll.1,
+            u8::from(stale)
+        ));
+    }
+    if stale {
+        // Servo painted its scroll-0 content at a non-zero tracked scroll.
+        // Drop it: the previous texture stays until the next (correct)
+        // frame, so the user sees a pause instead of a jump to the top.
+        return;
+    }
+    let mut g = global.borrow_mut();
+    if !g.logged_first_frame {
+        g.logged_first_frame = true;
+        crate::platform::app_log::info(format!("servo-engine: first frame {w}x{h}, worker live"));
+    }
+    // Direct handoff: the stable-texture primitive reads the slot; no
+    // per-frame event or view rebuild.
+    entry.frame.write(w, h, img.into_raw());
+}
+
 fn run(
     rx: mpsc::Receiver<EngineCommand>,
     wake_tx: mpsc::Sender<EngineCommand>,
@@ -1112,6 +1161,9 @@ fn run(
     // below can signal only after Servo (and its cookie flush) completes.
     let mut shutdown_done: Option<std::sync::mpsc::Sender<()>> = None;
     loop {
+        // Paint requests set by the previous spin's callback. Painting here
+        // (not inside the callback) lets the scene build finish first.
+        paint_active_tab(&global);
         if drain_commands(&servo, &global, &rx, &mut shutdown_done) {
             break;
         }
@@ -1746,6 +1798,8 @@ fn clear_tree(state: &mut TabState) {
     state.last_scroll_at = None;
     state.last_scroll_cmd_at = None;
     state.scroll_hot_since = None;
+    state.needs_paint = false;
+    state.top_frame_hash = None;
     state.pending_scroll_truth = None;
     state.user_dirty = false;
     state.doc_token = None;
