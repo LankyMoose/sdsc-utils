@@ -1790,9 +1790,19 @@ impl App {
             .iter()
             .find(|t| t.id == tab)
             .is_some_and(|t| !t.loaded);
+        let old_scroll = self.start_state.browser.scroll_offset;
         if !self.start_state.browser.activate_stored(tab) {
             return Task::none();
         }
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: browser tab switch tab{} -> tab{} scroll ({:.0},{:.0}) -> ({:.0},{:.0})",
+            old.0,
+            tab.0,
+            old_scroll.0,
+            old_scroll.1,
+            self.start_state.browser.scroll_offset.0,
+            self.start_state.browser.scroll_offset.1
+        ));
         // The shelved page keeps its backing view.
         if let Some(prev) = self
             .start_state
@@ -2020,7 +2030,14 @@ impl App {
                     }
                 }
             }
-            EngineEvent::ScrollOffset { tab: _, x, y } => {
+            EngineEvent::ScrollOffset { tab, x, y } => {
+                let before = self.start_state.browser.scroll_offset;
+                if before != (x, y) {
+                    crate::controller::hid::diag::diag_info(format!(
+                        "ui-diag: scroll tab{} ({:.0},{:.0}) -> ({:.0},{:.0}) active={}",
+                        tab.0, before.0, before.1, x, y, self.start_state.browser.active_tab.0
+                    ));
+                }
                 self.start_state.browser.scroll_offset = (x, y);
             }
             EngineEvent::ActivityChanged { tab: _, phase } => {
@@ -2136,7 +2153,14 @@ impl App {
                     all.extend(chrome.iter().map(|(_, f)| f.clone()));
                     stored.page.cursor.retarget(&all);
                 }
-                EngineEvent::ScrollOffset { x, y, .. } => {
+                EngineEvent::ScrollOffset { tab, x, y } => {
+                    let before = stored.page.scroll_offset;
+                    if before != (x, y) {
+                        crate::controller::hid::diag::diag_info(format!(
+                            "ui-diag: bg scroll tab{} ({:.0},{:.0}) -> ({:.0},{:.0})",
+                            tab.0, before.0, before.1, x, y
+                        ));
+                    }
                     stored.page.scroll_offset = (x, y);
                 }
                 EngineEvent::ActivityChanged { phase, .. } => {

@@ -1659,14 +1659,26 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<TabState>>, global: &Rc
         let center = state.last_mouse;
         state.last_cull_center = center;
         let epoch = state.dom_epoch;
+        let tab = state.tab;
+        let scroll = state.scroll;
         let script = if boot {
             dom_boot_js(center, epoch)
         } else {
             dom_query_js(center, epoch)
         };
-        Some((seq, state.dom_tx.clone(), script, boot, pinged, now, epoch))
+        Some((
+            seq,
+            state.dom_tx.clone(),
+            script,
+            boot,
+            pinged,
+            now,
+            epoch,
+            tab,
+            scroll,
+        ))
     };
-    let Some((seq, tx, script, boot, pinged, dispatched, epoch)) = fire else {
+    let Some((seq, tx, script, boot, pinged, dispatched, epoch, tab, scroll)) = fire else {
         return;
     };
     let src = if boot {
@@ -1676,7 +1688,10 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<TabState>>, global: &Rc
     } else {
         "gesture"
     };
-    crate::platform::app_log::info(format!("servo-dom: pull seq={seq} src={src} ep={epoch}"));
+    crate::platform::app_log::info(format!(
+        "servo-dom: pull tab{} seq={seq} src={src} ep={epoch} scroll=({:.0},{:.0})",
+        tab.0, scroll.0, scroll.1
+    ));
     webview.evaluate_javascript(script, move |result| {
         let _ = tx.send((seq, dispatched, result.map_err(|e| format!("{e:?}"))));
     });
@@ -2041,8 +2056,8 @@ fn ingest_dom(state: &mut TabState, value: &JSValue, rtt_ms: u128, skip_rebase: 
         .flatten();
     if focus != state.last_focus {
         crate::platform::app_log::info(format!(
-            "servo-dom: focus {:?} -> {focus:?} (snap.active js#{})",
-            state.last_focus, snap.active
+            "servo-dom: focus tab{} {:?} -> {focus:?} (snap.active js#{})",
+            state.tab.0, state.last_focus, snap.active
         ));
         state.last_focus = focus;
         if let Some(id) = focus {
@@ -2077,6 +2092,10 @@ fn rebase_scroll(state: &mut TabState, scroll: (f32, f32)) {
     if state.scroll == rebased {
         return;
     }
+    crate::platform::app_log::info(format!(
+        "servo-dom: rebase tab{} scroll=({:.0},{:.0}) -> ({:.0},{:.0})",
+        state.tab.0, state.scroll.0, state.scroll.1, rebased.0, rebased.1
+    ));
     state.scroll = rebased;
     if state.last_sent_scroll == rebased {
         return;
@@ -2232,8 +2251,11 @@ fn emit_tree(state: &mut TabState) {
             })
             .unwrap_or_default();
         crate::platform::app_log::info(format!(
-            "servo-engine: dom focusables={}{sample}",
-            fresh.len()
+            "servo-engine: dom focusables={} tab{} scroll=({:.0},{:.0}){sample}",
+            fresh.len(),
+            state.tab.0,
+            state.scroll.0,
+            state.scroll.1
         ));
     }
     state.last_emitted = fresh.clone();
