@@ -17,8 +17,8 @@ use crate::ui::start::row::{game_subtitle_block, update_required_badge};
 use crate::ui::start::settings::{edit_confirm_view, manual_add_view, replace_confirm_view};
 use crate::ui::start::translate::backdrop_art;
 use crate::ui::start::view::{
-    HintPress, HintPressOwner, LaunchStatus, StartControllerRow, StartMessage, StartRow, State,
-    browser_view, scan_status_chip, scan_status_stack,
+    BROWSER_CARD_PAD, HintPress, HintPressOwner, LaunchStatus, StartControllerRow, StartMessage,
+    StartRow, State, browser_layout, browser_view, scan_status_chip, scan_status_stack,
 };
 use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics, StripOrientation};
 use crate::ui::theme;
@@ -324,21 +324,20 @@ pub fn view<'a>(
     // click toggles it closed, exactly like Circle/Cancel; the card absorbs
     // clicks. Above modals, below the settings drawer.
     if state.browser.session.is_open() {
-        // Image width drives the card: fixed engine aspect keeps the
-        // page→card mapping a single uniform scale for the cursor.
-        let img_w = (stage_w - 100.0 - 48.0).clamp(320.0, 800.0);
-        let card_w = img_w + 48.0;
-        let card_h = (stage_h - 100.0).max(240.0);
+        // 16:9 page area sized from the available viewport height, header
+        // fixed on top, tight card padding and a ~2rem screen breather.
+        let layout = browser_layout(stage_w, stage_h);
         layers.push(overlay::wash(
             overlay::reveal(1.0),
             StartMessage::ToggleBrowser,
         ));
         layers.push(overlay::centered(Scale::new(
             overlay::click_shield(
-                overlay::dialog_card(
-                    browser_view(state, img_w),
-                    Length::Fixed(card_w),
-                    Some(card_h),
+                overlay::dialog_card_padded(
+                    browser_view(state, layout.page_w, layout.page_h),
+                    Length::Fixed(layout.card_w),
+                    Some(layout.card_h),
+                    BROWSER_CARD_PAD,
                 ),
                 StartMessage::Noop,
             ),

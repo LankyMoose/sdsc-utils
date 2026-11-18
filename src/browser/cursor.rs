@@ -73,16 +73,16 @@ pub const BREAK_LATCH_GRACE_SECS: f32 = 0.3;
 pub const BREAK_KICK: f32 = 800.0;
 /// Right-stick scroll speed at full deflection, px/s.
 pub const SCROLL_SPEED: f32 = 1500.0;
-/// Engine viewport the cursor space matches (see `servo_backend`).
+/// Engine viewport the cursor space matches. The engine resizes its
+/// offscreen surface to the browser card's page area (16:9), so this is the
+/// startup/default size; live cursors carry their own `view_w/view_h`.
 pub const VIEWPORT_W: f32 = 800.0;
 pub const VIEWPORT_H: f32 = 600.0;
 /// Top of the unified cursor space: the header lives above the viewport as
 /// synthetic snap targets (tab strip, toolbar, bookmarks), so the pad
 /// cursor treats chrome and page as one continuous surface — pushing past
 /// the viewport top walks into the header, pushing back down returns.
-/// The overlay clips to the page image, so the dot hides while docked up
-/// there and the header chip carries the focus instead.
-pub const CURSOR_MIN_Y: f32 = -140.0;
+pub const CURSOR_MIN_Y: f32 = -112.0;
 /// Synthetic chrome ids live far above any engine-assigned page id, so a
 /// cursor attachment unambiguously addresses chrome (pad action, never an
 /// engine click) or page (engine click path).
@@ -129,6 +129,9 @@ pub struct Cursor {
     /// at. Off = pure free-form virtual mouse; D-pad jumping still applies.
     pub magnet: bool,
     pub visible: bool,
+    /// Live page-area size in card pixels (dynamic engine viewport).
+    pub view_w: f32,
+    pub view_h: f32,
 }
 
 /// Perpendicular band metrics between a docked rect and a candidate for a
@@ -164,18 +167,6 @@ fn band_metrics(from: (f32, f32, f32, f32), to: &Focusable, dir: JumpDir) -> (f3
     }
 }
 
-/// Page targets are only reachable while any part of them intersects the
-/// viewport; synthetic chrome lives above it and is always eligible. The
-/// cursor clamps to the viewport, so off-screen page targets can only pin
-/// it to an edge with nothing visible beneath it.
-fn within_viewport(item: &Focusable) -> bool {
-    item.id >= CHROME_ID_BASE
-        || (item.x < VIEWPORT_W
-            && item.x + item.w > 0.0
-            && item.y < VIEWPORT_H
-            && item.y + item.h > 0.0)
-}
-
 impl Cursor {
     pub fn new() -> Self {
         Self {
@@ -192,7 +183,34 @@ impl Cursor {
             docked_for: 0.0,
             magnet: true,
             visible: true,
+            view_w: VIEWPORT_W,
+            view_h: VIEWPORT_H,
         }
+    }
+
+    /// Match the cursor space to the live page area (dynamic engine
+    /// viewport). Clamps the point into the new bounds.
+    pub fn set_viewport(&mut self, w: f32, h: f32) {
+        let (w, h) = (w.max(1.0), h.max(1.0));
+        if self.view_w == w && self.view_h == h {
+            return;
+        }
+        self.view_w = w;
+        self.view_h = h;
+        self.x = self.x.clamp(0.0, w);
+        self.y = self.y.clamp(CURSOR_MIN_Y, h);
+    }
+
+    /// Page targets are only reachable while any part of them intersects
+    /// the viewport; synthetic chrome lives above it and is always
+    /// eligible. The cursor clamps to the viewport, so off-screen page
+    /// targets can only pin it to an edge with nothing visible beneath it.
+    fn within_viewport(&self, item: &Focusable) -> bool {
+        item.id >= CHROME_ID_BASE
+            || (item.x < self.view_w
+                && item.x + item.w > 0.0
+                && item.y < self.view_h
+                && item.y + item.h > 0.0)
     }
 }
 
@@ -215,8 +233,8 @@ impl Cursor {
             return;
         }
         self.attached = None;
-        self.x = (self.x + dx).clamp(0.0, VIEWPORT_W);
-        self.y = (self.y + dy).clamp(0.0, VIEWPORT_H);
+        self.x = (self.x + dx).clamp(0.0, self.view_w);
+        self.y = (self.y + dy).clamp(0.0, self.view_h);
     }
 
     /// Analog velocity step, D-pad flights, and dock morph state. The stick
@@ -291,8 +309,8 @@ impl Cursor {
                     // mid-bottom, diagonals exit corners — the point starts
                     // where the velocity says it is going.
                     let (ex, ey) = Self::exit_point(it, lx, ly);
-                    self.x = ex.clamp(0.0, VIEWPORT_W);
-                    self.y = ey.clamp(CURSOR_MIN_Y, VIEWPORT_H);
+                    self.x = ex.clamp(0.0, self.view_w);
+                    self.y = ey.clamp(CURSOR_MIN_Y, self.view_h);
                     self.vx = lx * BREAK_KICK;
                     self.vy = ly * BREAK_KICK;
                 }
@@ -309,14 +327,14 @@ impl Cursor {
             let dist = dx.hypot(dy);
             let step = FLY_SPEED * dt_secs;
             if dist <= step.max(1.0) {
-                self.x = tx.clamp(0.0, VIEWPORT_W);
-                self.y = ty.clamp(CURSOR_MIN_Y, VIEWPORT_H);
+                self.x = tx.clamp(0.0, self.view_w);
+                self.y = ty.clamp(CURSOR_MIN_Y, self.view_h);
                 self.fly_to = None;
                 self.vx = 0.0;
                 self.vy = 0.0;
             } else if dist > 0.0 {
-                self.x = (self.x + dx / dist * step).clamp(0.0, VIEWPORT_W);
-                self.y = (self.y + dy / dist * step).clamp(CURSOR_MIN_Y, VIEWPORT_H);
+                self.x = (self.x + dx / dist * step).clamp(0.0, self.view_w);
+                self.y = (self.y + dy / dist * step).clamp(CURSOR_MIN_Y, self.view_h);
                 self.vx = 0.0;
                 self.vy = 0.0;
             }
@@ -336,8 +354,8 @@ impl Cursor {
             self.vy = 0.0;
         }
         if self.vx != 0.0 || self.vy != 0.0 {
-            self.x = (self.x + self.vx * dt_secs).clamp(0.0, VIEWPORT_W);
-            self.y = (self.y + self.vy * dt_secs).clamp(CURSOR_MIN_Y, VIEWPORT_H);
+            self.x = (self.x + self.vx * dt_secs).clamp(0.0, self.view_w);
+            self.y = (self.y + self.vy * dt_secs).clamp(CURSOR_MIN_Y, self.view_h);
         }
         // Docking is arrival-based (see `snap`): the outline only engages
         // once the gliding point actually reaches an element. The morph
@@ -400,7 +418,7 @@ impl Cursor {
             if Some(item.id) == self.attached {
                 continue;
             }
-            if !within_viewport(item) {
+            if !self.within_viewport(item) {
                 continue;
             }
             // Nearest-point direction test: the candidate must lie forward
@@ -476,8 +494,8 @@ impl Cursor {
         self.vx = 0.0;
         self.vy = 0.0;
         self.fly_to = Some((
-            (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W),
-            (item.y + item.h / 2.0).clamp(CURSOR_MIN_Y, VIEWPORT_H),
+            (item.x + item.w / 2.0).clamp(0.0, self.view_w),
+            (item.y + item.h / 2.0).clamp(CURSOR_MIN_Y, self.view_h),
         ));
     }
 
@@ -515,7 +533,7 @@ impl Cursor {
         }
         if let Some(id) = self.attached
             && let Some(item) = options.iter().find(|o| o.id == id)
-            && within_viewport(item)
+            && self.within_viewport(item)
             && self.inside_expanded(item, HOLD_PAD)
         {
             return;
@@ -532,7 +550,7 @@ impl Cursor {
             if (item.id >= CHROME_ID_BASE) != in_header {
                 continue;
             }
-            if !within_viewport(item) {
+            if !self.within_viewport(item) {
                 continue;
             }
             if !self.inside_expanded(item, ACQUIRE_PAD) {
@@ -567,8 +585,8 @@ impl Cursor {
             self.break_armed = false;
             self.docked_for = 0.0;
             if centre {
-                self.x = (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W);
-                self.y = (item.y + item.h / 2.0).clamp(CURSOR_MIN_Y, VIEWPORT_H);
+                self.x = (item.x + item.w / 2.0).clamp(0.0, self.view_w);
+                self.y = (item.y + item.h / 2.0).clamp(CURSOR_MIN_Y, self.view_h);
             }
             self.last_dock = Some((item.x, item.y, item.w, item.h));
         }
@@ -605,7 +623,7 @@ impl Cursor {
             // visible target's centre can sit below it (observed click at
             // y=718 for a 600px viewport). The clamped centre stays within
             // the item's visible intersection.
-            return (cx.clamp(0.0, VIEWPORT_W), cy.clamp(0.0, VIEWPORT_H));
+            return (cx.clamp(0.0, self.view_w), cy.clamp(0.0, self.view_h));
         }
         (self.x, self.y)
     }

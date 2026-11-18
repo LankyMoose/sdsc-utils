@@ -477,6 +477,29 @@ impl App {
     /// Browser toggle: foreground the browser app through the multi-app
     /// manager and open the surface; toggling again suspends (close cancels
     /// in-flight work but keeps the cached page for an instant resume).
+    /// Match the browser surface and engine viewport to the current 16:9
+    /// card layout. No-op when the computed page size is unchanged.
+    pub(crate) fn sync_browser_viewport(&mut self) {
+        let (sw, sh) = self
+            .start_monitor_cover
+            .map(|c| (c.width, c.height))
+            .unwrap_or((1920.0, 1080.0));
+        let layout = crate::ui::start::view::browser_layout(sw, sh);
+        if !self
+            .start_state
+            .browser
+            .set_viewport(layout.page_w, layout.page_h)
+        {
+            return;
+        }
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::Resize {
+                width: layout.page_w.round().max(1.0) as u32,
+                height: layout.page_h.round().max(1.0) as u32,
+            });
+        }
+    }
+
     pub(crate) fn on_toggle_browser(&mut self) -> Task<Message> {
         if self.start_state.browser.session.is_open() {
             return self.close_browser_surface();
@@ -488,6 +511,9 @@ impl App {
             crate::browser::AppKind::Browser { url: None },
         );
         self.start_state.browser.session.open_surface();
+        // The card's 16:9 page area drives the engine viewport; sync before
+        // the first frame so the cursor space and image are the same size.
+        self.sync_browser_viewport();
         // Fresh session (never navigated, no pending draft): restore the
         // persisted strip when one exists, else start at home instead of
         // the empty state. A typed-but-unsent draft is the user's intent —
@@ -944,7 +970,6 @@ impl App {
                 Task::none()
             }
             Some(NavAction::Cancel) => self.on_start_message(StartMessage::BrowserHistoryCancel),
-            Some(NavAction::ToggleEdit) => self.on_start_message(StartMessage::ToggleUrlEntry),
             // Taps, holds, magnetism, and cursor moves stay parked: the
             // hold claimed the press and the selector owns the outcome.
             _ => Task::none(),
@@ -1090,21 +1115,6 @@ impl App {
         }
         if let Err(err) = launch::launch_target(&url, "") {
             app_log::warn(format!("start-browser: external open failed: {err}"));
-        }
-        Task::none()
-    }
-
-    /// Pad-driven logical key: press + release pair straight to the engine
-    /// (pad has no physical code or modifiers to carry).
-    pub(crate) fn send_pad_keys(&mut self, key: keyboard_types::NamedKey) -> Task<Message> {
-        if let Some(engine) = &self.engine {
-            let tab = self.browser_tab();
-            for event in browser_keys::pad_key(key) {
-                engine.send(EngineCommand::Key(crate::browser::engine::TabKey {
-                    tab,
-                    event,
-                }));
-            }
         }
         Task::none()
     }
@@ -3248,10 +3258,6 @@ impl App {
                             self.on_start_message(StartMessage::Close)
                         }
                     }
-                    Some(NavAction::ToggleEdit) => {
-                        self.on_start_message(StartMessage::ToggleUrlEntry)
-                    }
-                    Some(NavAction::CycleSort) => self.send_pad_keys(keyboard_types::NamedKey::Tab),
                     Some(NavAction::BumperLeft) => self.on_start_message(StartMessage::BrowserBack),
                     Some(NavAction::BumperRight) => {
                         self.on_start_message(StartMessage::BrowserForward)
@@ -3291,9 +3297,6 @@ impl App {
                         self.on_start_message(StartMessage::BrowserNavigate)
                     }
                     Some(NavAction::Cancel) => self.on_start_message(StartMessage::Close),
-                    Some(NavAction::ToggleEdit) => {
-                        self.on_start_message(StartMessage::ToggleUrlEntry)
-                    }
                     Some(NavAction::BumperLeft) => self.on_start_message(StartMessage::BrowserBack),
                     Some(NavAction::BumperRight) => {
                         self.on_start_message(StartMessage::BrowserForward)
@@ -4801,6 +4804,10 @@ impl App {
             height: 1080.0,
         });
         self.start_monitor_cover = Some(cover);
+        // The browser card is height-driven (16:9); align the surface and
+        // engine viewport here too, since a preserved browser session can
+        // reopen with the Start screen after a monitor change.
+        self.sync_browser_viewport();
         self.clear_start_activity();
         // Enter veil stays solid until StartOpened arms the capped clock.
         self.start_state

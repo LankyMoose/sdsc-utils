@@ -11,7 +11,6 @@ use crate::persist::prefs::{
 use crate::ui::color::BatterySpectrum;
 use crate::ui::layout as window_layout;
 use crate::ui::start::face::FacePressAnim;
-use crate::ui::start::face::{FaceButton, action_cluster, face_hint};
 use crate::ui::start::icon_cache;
 use crate::ui::start::input::FaceHeld;
 use crate::ui::start::overlay;
@@ -957,6 +956,9 @@ pub struct BrowserPanel {
     /// whenever the strip or bookmark count changes; ids are stable while
     /// the set is unchanged so dock attachments survive pulls.
     pub chrome: Vec<(ChromeTarget, crate::browser::cursor::Focusable)>,
+    /// Live page-area size in card pixels (the engine viewport resizes to
+    /// this; the cursor space matches it 1:1).
+    pub viewport: (f32, f32),
     /// Next synthetic id (counts up from [`CHROME_ID_BASE`], far above any
     /// engine-assigned page id).
     pub chrome_seq: u64,
@@ -1009,6 +1011,10 @@ impl Default for BrowserPanel {
             js_click: false,
             r3_latched: false,
             chrome: Vec::new(),
+            viewport: (
+                crate::browser::cursor::VIEWPORT_W,
+                crate::browser::cursor::VIEWPORT_H,
+            ),
             chrome_seq: crate::browser::cursor::CHROME_ID_BASE,
             debug_overlay: false,
             bookmarks: Vec::new(),
@@ -1023,6 +1029,19 @@ impl Default for BrowserPanel {
 }
 
 impl BrowserPanel {
+    /// Match the surface to the live card page size. Returns true when the
+    /// size changed (the engine must be resized to the same numbers).
+    pub fn set_viewport(&mut self, w: f32, h: f32) -> bool {
+        let size = (w.max(1.0), h.max(1.0));
+        if self.viewport == size {
+            return false;
+        }
+        self.viewport = size;
+        self.page.cursor.set_viewport(size.0, size.1);
+        self.rebuild_chrome();
+        true
+    }
+
     /// Find a background tab's stored state.
     pub fn stored_mut(&mut self, id: crate::browser::engine::TabId) -> Option<&mut StoredTab> {
         self.stored.iter_mut().find(|t| t.id == id)
@@ -1123,6 +1142,11 @@ impl BrowserPanel {
     /// normal retarget path). Call after strip/bookmark changes.
     pub fn rebuild_chrome(&mut self) {
         use crate::browser::cursor::{FocusKind, Focusable};
+        // The header and cursor share the live page size; keep the cursor
+        // bounds in step even if only the chrome map is being refreshed.
+        self.page
+            .cursor
+            .set_viewport(self.viewport.0, self.viewport.1);
         // Natural-width layout is the single source of truth: the rendered
         // header and the pad cursor both use these rects, so the dot can be
         // drawn truthfully in header space.
@@ -1504,17 +1528,9 @@ fn cursor_draws(panel: &BrowserPanel) -> bool {
 }
 
 /// Map a unified cursor point (page px; header negative) to card pixels.
-/// Header rows are fixed-height and match the negative bands exactly, so
-/// header coordinates stay 1:1; page coordinates scale with the image.
-fn cursor_card_point(x: f32, y: f32, scale: f32) -> (f32, f32) {
-    (
-        x * scale,
-        if y < 0.0 {
-            CHROME_HEADER_H + y
-        } else {
-            CHROME_HEADER_H + y * scale
-        },
-    )
+/// The surface is 1:1: the engine viewport is resized to the page area.
+fn cursor_card_point(x: f32, y: f32) -> (f32, f32) {
+    (x, CHROME_HEADER_H + y)
 }
 
 /// Virtual cursor overlay across the whole browser surface (header plus
@@ -1522,18 +1538,16 @@ fn cursor_card_point(x: f32, y: f32, scale: f32) -> (f32, f32) {
 /// Position, size, and corner radius interpolate every tick
 /// (smoothstepped blend), so docking animates circle to square instead of
 /// popping.
-fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, StartMessage> {
-    use crate::browser::cursor::VIEWPORT_W;
+fn browser_cursor_overlay(state: &State, page_w: f32, page_h: f32) -> Element<'_, StartMessage> {
     if !cursor_draws(&state.browser) {
         return space().width(Length::Fixed(0.0)).into();
     }
-    let scale = img_w / VIEWPORT_W;
     let panel = &state.browser;
     let cursor = &panel.cursor;
     // 0 = free dot, 1 = docked wrap; smoothstepped so both ends ease.
     let t = cursor.dock_blend.clamp(0.0, 1.0);
     let t = t * t * (3.0 - 2.0 * t);
-    // Dot geometry in unified page px.
+    // Dot geometry in page px.
     let (dx, dy) = (cursor.x - 10.0, cursor.y - 10.0);
     let targets = cursor_targets(&panel.focusables, &panel.chrome);
     let wrap = cursor.attached_rect(&targets).or(cursor.last_dock);
@@ -1543,35 +1557,31 @@ fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, 
     };
     let (ix, iy) = (dx + (wx - dx) * t, dy + (wy - dy) * t);
     let (iw, ih) = (20.0 + (ww - 20.0) * t, 20.0 + (wh - 20.0) * t);
-    let (x, y) = cursor_card_point(ix, iy, scale);
-    let w = iw * scale;
-    // Header rows are fixed-height, so a header rect keeps its height
-    // regardless of the page scale; page rects scale with the image.
-    let h = if iy < 0.0 { ih } else { ih * scale };
+    let (x, y) = cursor_card_point(ix, iy);
     let radius = 10.0 + (crate::ui::theme::radius::SM - 10.0) * t;
     let morph: Element<'_, StartMessage> = column![
         space().height(Length::Fixed(y.max(0.0))),
         row![
             space().width(Length::Fixed(x.max(0.0))),
-            container(space().width(Length::Fixed(w)).height(Length::Fixed(h)))
+            container(space().width(Length::Fixed(iw)).height(Length::Fixed(ih)))
                 .style(move |theme| crate::ui::theme::cursor_morph(theme, radius)),
         ],
     ]
     .spacing(0)
     .into();
-    let surface_h = CHROME_HEADER_H + img_h;
+    let surface_h = CHROME_HEADER_H + page_h;
     // F10 coverage view: one thin ring per page snap target, colored by
     // kind. Draws exactly the rectangle's intersection with the card (the
     // truthful pixels); off-screen targets skip.
     let body: Element<'_, StartMessage> = if panel.debug_overlay {
         let mut overlay = stack![morph]
-            .width(Length::Fixed(img_w))
+            .width(Length::Fixed(page_w))
             .height(Length::Fixed(surface_h));
         for f in &panel.focusables {
-            let (bx, by) = (f.x * scale, CHROME_HEADER_H + f.y * scale);
-            let (bw, bh) = ((f.w * scale).max(3.0), (f.h * scale).max(3.0));
+            let (bx, by) = (f.x, CHROME_HEADER_H + f.y);
+            let (bw, bh) = (f.w.max(3.0), f.h.max(3.0));
             let (ox, oy) = (bx.max(0.0), by.max(0.0));
-            let (ex, ey) = ((bx + bw).min(img_w), (by + bh).min(surface_h));
+            let (ex, ey) = ((bx + bw).min(page_w), (by + bh).min(surface_h));
             if ex <= ox || ey <= oy {
                 continue;
             }
@@ -1594,30 +1604,23 @@ fn browser_cursor_overlay(state: &State, img_w: f32, img_h: f32) -> Element<'_, 
         morph
     };
     container(body)
-        .width(Length::Fixed(img_w))
+        .width(Length::Fixed(page_w))
         .height(Length::Fixed(surface_h))
         .clip(true)
         .into()
-}
-
-/// Fixed engine image aspect (800x600): height derives from width so the
-/// page→card mapping stays a single uniform scale (no letterbox math).
-pub fn browser_image_height(img_w: f32) -> f32 {
-    img_w * 0.75
 }
 
 /// Page surface: live engine pixels when a frame is present, reader text
 /// otherwise. The engine image is a fixed size (`img_w` wide) so the
 /// virtual cursor maps 1:1 with a uniform scale; pad scroll routes to the
 /// engine in that mode, so no scrollable wraps the image.
-pub fn browser_page_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
+pub fn browser_page_view(state: &State, page_w: f32, page_h: f32) -> Element<'_, StartMessage> {
     let panel = &state.browser;
     let session = &panel.session;
     if let Some(frame) = session.frame() {
-        let img_h = browser_image_height(img_w);
         return image(frame.handle.clone())
-            .width(Length::Fixed(img_w))
-            .height(Length::Fixed(img_h))
+            .width(Length::Fixed(page_w))
+            .height(Length::Fixed(page_h))
             .into();
     }
     let body_text = if session.error().is_none() && session.has_content() {
@@ -1643,35 +1646,6 @@ pub fn browser_page_view(state: &State, img_w: f32) -> Element<'_, StartMessage>
     .id(browser_scroll_id())
     .on_scroll(|viewport| StartMessage::BrowserScrolled(viewport.absolute_offset().y))
     .height(Length::Fill)
-    .into()
-}
-
-/// Debug-only correlator line under the page (Diagnostics toggle / F10):
-/// cursor point, magnet, dock target, well count, backend scroll offset.
-/// Empty when the overlay is off so the card layout never shifts.
-fn browser_debug_line(panel: &BrowserPanel) -> Element<'_, StartMessage> {
-    if !panel.debug_overlay {
-        return space().height(Length::Fixed(0.0)).into();
-    }
-    let dock = match panel.cursor.attached {
-        Some(id) => match panel.focusables.iter().find(|o| o.id == id) {
-            Some(o) => format!("#{id}/{:?}", o.kind),
-            None => format!("#{id}/stale"),
-        },
-        None => "free".to_string(),
-    };
-    text(format!(
-        "cursor ({:.0},{:.0}) magnet {} dock {dock} blend {:.2} wells {} scroll ({:.0},{:.0})",
-        panel.cursor.x,
-        panel.cursor.y,
-        if panel.cursor.magnet { "on" } else { "off" },
-        panel.cursor.dock_blend,
-        panel.focusables.len(),
-        panel.scroll_offset.0,
-        panel.scroll_offset.1,
-    ))
-    .size(11.0)
-    .color(theme::MUTED)
     .into()
 }
 
@@ -1753,7 +1727,6 @@ fn chrome_row_view<'a>(
     row_y: f32,
     h: f32,
     width: f32,
-    scale: f32,
 ) -> Element<'a, StartMessage> {
     let session = &panel.session;
     let mut layer = stack![]
@@ -1945,7 +1918,7 @@ fn chrome_row_view<'a>(
                 .into()
             }
         };
-        layer = layer.push(chrome_at(f.x * scale, f.w * scale, h, content));
+        layer = layer.push(chrome_at(f.x, f.w, h, content));
     }
     layer.into()
 }
@@ -2104,7 +2077,7 @@ fn label_width(label: &str, size: f32, pad_x: f32) -> f32 {
 }
 
 pub fn chrome_layout(panel: &BrowserPanel) -> Vec<ChromeRowLayout> {
-    use crate::browser::cursor::VIEWPORT_W;
+    let viewport_w = panel.viewport.0;
     let mut rows = Vec::with_capacity(3);
 
     // Tab strip: favicon + ellipsized title + close per tab, fitted to the
@@ -2143,10 +2116,10 @@ pub fn chrome_layout(panel: &BrowserPanel) -> Vec<ChromeRowLayout> {
     let titles_all: f32 = plans.iter().map(|(_, title, _)| title).sum();
     let (start, end, title_budget, hidden) = if count == 0 {
         (0, 0, 0.0, 0)
-    } else if fixed_all + titles_all + gaps_all + new_w <= VIEWPORT_W {
+    } else if fixed_all + titles_all + gaps_all + new_w <= viewport_w {
         (0, count, f32::INFINITY, 0)
     } else {
-        let per = (VIEWPORT_W - fixed_all - gaps_all - new_w) / count as f32;
+        let per = (viewport_w - fixed_all - gaps_all - new_w) / count as f32;
         if per >= TITLE_MIN {
             (0, count, per, 0)
         } else {
@@ -2154,7 +2127,7 @@ pub fn chrome_layout(panel: &BrowserPanel) -> Vec<ChromeRowLayout> {
             // many minimum-title tabs as possible.
             let chip_max = label_width("+99", 11.0, 10.0);
             let group_min = TAB_PAD + ICON_W + close_w + TITLE_MIN;
-            let room = VIEWPORT_W - new_w - chip_max - TAB_GAP;
+            let room = viewport_w - new_w - chip_max - TAB_GAP;
             let fit = (room / (group_min + TAB_GAP)).floor().max(1.0) as usize;
             let fit = fit.min(count.saturating_sub(1)).max(1);
             let active = panel
@@ -2185,7 +2158,7 @@ pub fn chrome_layout(panel: &BrowserPanel) -> Vec<ChromeRowLayout> {
         strip.push((ChromeTarget::TabOverflow(hidden), x, chip_w));
         x += chip_w + TAB_GAP;
     }
-    if x + new_w <= VIEWPORT_W {
+    if x + new_w <= viewport_w {
         strip.push((ChromeTarget::NewTab, x, new_w));
     }
     rows.push(ChromeRowLayout {
@@ -2202,7 +2175,7 @@ pub fn chrome_layout(panel: &BrowserPanel) -> Vec<ChromeRowLayout> {
     let home = label_width("⌂", 14.0, 12.0);
     let star = label_width("★", 16.0, 10.0).max(label_width("☆", 16.0, 10.0));
     let go = label_width("Go", 14.0, 14.0);
-    let omni = (VIEWPORT_W - (back + forward + reload + home + star + go + gaps)).max(120.0);
+    let omni = (viewport_w - (back + forward + reload + home + star + go + gaps)).max(120.0);
     let mut bar = Vec::with_capacity(7);
     let mut x = 0.0;
     for (target, w) in [
@@ -2237,7 +2210,7 @@ pub fn chrome_layout(panel: &BrowserPanel) -> Vec<ChromeRowLayout> {
             .contains_key(&crate::browser::bookmarks::origin_key(&b.url));
         let name = text_fit::ellipsize_to_width(b.name(), 13.0, 170.0);
         let w = 20.0 + text_fit::text_width_px(&name, 13.0) + if icon { 22.0 } else { 0.0 };
-        if x + w > VIEWPORT_W {
+        if x + w > viewport_w {
             break;
         }
         marks.push((ChromeTarget::Bookmark(i), x, w));
@@ -2262,8 +2235,6 @@ pub fn chrome_rows(panel: &BrowserPanel) -> Vec<Vec<ChromeTarget>> {
 }
 
 /// Unified-space geometry (page px): header rows above the viewport.
-/// Title band above the strip: the cursor's roam space up to `CURSOR_MIN_Y`.
-pub const CHROME_TITLE_H: f32 = 28.0;
 pub const CHROME_STRIP_Y: f32 = -112.0;
 pub const CHROME_TOOLBAR_Y: f32 = -72.0;
 pub const CHROME_BOOKMARKS_Y: f32 = -32.0;
@@ -2271,14 +2242,48 @@ pub const CHROME_ROW_H: f32 = 36.0;
 pub const CHROME_BOOKMARK_H: f32 = 28.0;
 /// Gap between header rows.
 pub const CHROME_ROW_GAP: f32 = 4.0;
-/// Total header height above the page: title + three rows + three gaps.
-pub const CHROME_HEADER_H: f32 = CHROME_TITLE_H
-    + CHROME_ROW_H
+/// Total header height above the page: three rows plus three gaps. Matches
+/// `CURSOR_MIN_Y` exactly.
+pub const CHROME_HEADER_H: f32 = CHROME_ROW_H
     + CHROME_ROW_GAP
     + CHROME_ROW_H
     + CHROME_ROW_GAP
     + CHROME_BOOKMARK_H
     + CHROME_ROW_GAP;
+/// Outer breather against the screen edge (~2rem).
+pub const BROWSER_OUTER_MARGIN: f32 = 32.0;
+/// Card padding around the browser surface.
+pub const BROWSER_CARD_PAD: f32 = 4.0;
+
+/// Browser popup geometry: the card itself is 16:9, sized from the
+/// available viewport height (clamped by width). The fixed header takes
+/// the top of the card; the page area is the rest.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BrowserLayout {
+    pub page_w: f32,
+    pub page_h: f32,
+    pub card_w: f32,
+    pub card_h: f32,
+}
+
+pub fn browser_layout(stage_w: f32, stage_h: f32) -> BrowserLayout {
+    let avail_w = (stage_w - 2.0 * BROWSER_OUTER_MARGIN).max(320.0);
+    let avail_h = (stage_h - 2.0 * BROWSER_OUTER_MARGIN).max(240.0);
+    let mut card_h = avail_h;
+    let mut card_w = card_h * 16.0 / 9.0;
+    if card_w > avail_w {
+        card_w = avail_w;
+        card_h = card_w * 9.0 / 16.0;
+    }
+    let page_w = (card_w - 2.0 * BROWSER_CARD_PAD).max(1.0);
+    let page_h = (card_h - 2.0 * BROWSER_CARD_PAD - CHROME_HEADER_H).max(1.0);
+    BrowserLayout {
+        page_w: page_w.round(),
+        page_h: page_h.round(),
+        card_w: card_w.round(),
+        card_h: card_h.round(),
+    }
+}
 /// Cap on bookmark chrome slots (overflow stays mouse-reachable; magnet
 /// slots must stay wide enough to arrive at).
 pub const CHROME_MAX_BOOKMARKS: usize = 12;
@@ -2356,53 +2361,17 @@ fn browser_status_overlay(panel: &BrowserPanel) -> Element<'_, StartMessage> {
     column![space().height(Fill), bar].into()
 }
 
-/// In-Start browser card: URL row, page, reload / external / close
-/// actions. Sized by the caller (near-full-bleed; see `immersive::view`),
-/// so the root column fills its card.
-pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
+/// In-Start browser surface: one 1:1 card containing the fixed header and
+/// the page area. The caller sizes the page to 16:9; the engine viewport is
+/// resized to the same numbers, so cursor coordinates are card pixels.
+pub fn browser_view(state: &State, page_w: f32, page_h: f32) -> Element<'_, StartMessage> {
     let panel = &state.browser;
-    let session = &panel.session;
-    let status = if session.loading() {
-        "Loading…".to_string()
-    } else if let Some(err) = session.error() {
-        format!("Error: {err}")
-    } else if let Some((hint, at)) = &panel.action_hint {
-        if at.elapsed() < Duration::from_secs(4) {
-            hint.clone()
-        } else if session.has_content() {
-            session.title().unwrap_or_else(|| session.url()).to_string()
-        } else {
-            String::new()
-        }
-    } else if session.has_content() {
-        session.title().unwrap_or_else(|| session.url()).to_string()
-    } else if state.browser_engine {
-        "Engine — type a URL and press Go.".to_string()
-    } else {
-        "Reader — type a URL and press Go.".to_string()
-    };
-    let press = HintPress::for_owner(state, HintPressOwner::Browser);
-    let scale = img_w / crate::browser::cursor::VIEWPORT_W;
-    let img_h = browser_image_height(img_w);
-    // One surface for header + page. Header rows are fixed to the cursor's
-    // negative bands (title 28 + strip 36 + gap 4 + toolbar 36 + gap 4 +
-    // bookmarks 28 + gap 4 = 140), so header-space cursor coordinates map
-    // 1:1 to card pixels and page coordinates scale with the page image.
     let base = column![
-        container(
-            row![
-                text("Browser").size(18.0).color(theme::INK),
-                space().width(Fill),
-                text(status).size(12.0).color(theme::MUTED),
-            ]
-            .align_y(Alignment::Center),
-        )
-        .center_y(Length::Fixed(CHROME_TITLE_H)),
-        chrome_row_view(panel, CHROME_STRIP_Y, CHROME_ROW_H, img_w, scale),
+        chrome_row_view(panel, CHROME_STRIP_Y, CHROME_ROW_H, page_w),
         space().height(CHROME_ROW_GAP),
-        chrome_row_view(panel, CHROME_TOOLBAR_Y, CHROME_ROW_H, img_w, scale),
+        chrome_row_view(panel, CHROME_TOOLBAR_Y, CHROME_ROW_H, page_w),
         space().height(CHROME_ROW_GAP),
-        chrome_row_view(panel, CHROME_BOOKMARKS_Y, CHROME_BOOKMARK_H, img_w, scale),
+        chrome_row_view(panel, CHROME_BOOKMARKS_Y, CHROME_BOOKMARK_H, page_w),
         space().height(CHROME_ROW_GAP),
         // Fixed-position dropdowns: the stack sizes to its base layer, so
         // suggestions, the star bubble, the history selector, and the status
@@ -2411,92 +2380,18 @@ pub fn browser_view(state: &State, img_w: f32) -> Element<'_, StartMessage> {
         // (hold claims the pad until release/Cross/Circle resolves it). The
         // status bar floats bottom-left over the page, Chrome-style.
         stack![
-            browser_page_view(state, img_w),
+            browser_page_view(state, page_w, page_h),
             browser_suggestions(panel),
             browser_bookmark_bubble(panel),
             browser_history_selector(panel),
             browser_status_overlay(panel),
         ],
     ];
-    let surface = stack![base, browser_cursor_overlay(state, img_w, img_h)]
-        .width(Length::Fixed(img_w))
-        .height(Length::Fixed(CHROME_HEADER_H + img_h))
-        .clip(true);
-    column![
-        surface,
-        browser_debug_line(panel),
-        space().height(8),
-        // Card action row: the overlay toggle is debug-only (mirrors the
-        // gated F10 path) and compiled out of release builds; JS-click is
-        // real functionality and ships everywhere.
-        {
-            let mut actions = row![
-                button(text("Open in system browser").size(14.0))
-                    .padding([6, 14])
-                    .on_press(StartMessage::BrowserOpenExternal)
-                    .style(theme::ghost),
-                button(text("Close").size(14.0))
-                    .padding([6, 14])
-                    .on_press(StartMessage::ToggleBrowser)
-                    .style(theme::ghost),
-                // In-app engine shutdown: same clean-shutdown path as quit
-                // (storage flush included), app keeps running. One-shot per
-                // process — the browser stays down until app restart.
-                button(text("Exit engine").size(14.0))
-                    .padding([6, 14])
-                    .on_press(StartMessage::BrowserShutdownEngine)
-                    .style(theme::ghost),
-            ];
-            #[cfg(debug_assertions)]
-            {
-                actions = actions.push(
-                    button(
-                        text(if panel.debug_overlay {
-                            "Overlay: on"
-                        } else {
-                            "Overlay: off"
-                        })
-                        .size(14.0),
-                    )
-                    .padding([6, 14])
-                    .on_press(StartMessage::BrowserToggleOverlay)
-                    .style(theme::ghost),
-                );
-            }
-            actions = actions.push(
-                button(
-                    text(if panel.js_click {
-                        "JS click: on"
-                    } else {
-                        "JS click: off"
-                    })
-                    .size(14.0),
-                )
-                .padding([6, 14])
-                .on_press(StartMessage::BrowserToggleJsClick)
-                .style(theme::ghost),
-            );
-            actions.spacing(10)
-        },
-        action_cluster(
-            &[
-                face_hint(
-                    FaceButton::Cross,
-                    if panel.url_editing { "Go" } else { "Use" },
-                    press.held,
-                    press.press_anim
-                ),
-                face_hint(FaceButton::Circle, "Close", press.held, press.press_anim),
-                face_hint(FaceButton::Triangle, "URL", press.held, press.press_anim),
-                face_hint(FaceButton::Square, "Tab", press.held, press.press_anim),
-            ],
-            false,
-        ),
-    ]
-    .spacing(4)
-    .width(Fill)
-    .align_x(Alignment::Start)
-    .into()
+    stack![base, browser_cursor_overlay(state, page_w, page_h)]
+        .width(Length::Fixed(page_w))
+        .height(Length::Fixed(CHROME_HEADER_H + page_h))
+        .clip(true)
+        .into()
 }
 
 #[derive(Debug, Clone)]
@@ -5994,7 +5889,29 @@ mod tests {
         assert_eq!(layout[0].y, CHROME_STRIP_Y);
         assert_eq!(layout[1].y, CHROME_TOOLBAR_Y);
         assert_eq!(layout[2].y, CHROME_BOOKMARKS_Y);
-        assert_eq!(CHROME_HEADER_H, 140.0);
+        assert_eq!(CHROME_HEADER_H, 112.0);
+    }
+
+    #[test]
+    fn browser_layout_is_16_9_and_height_driven() {
+        let l = browser_layout(1920.0, 1080.0);
+        assert!(
+            (l.card_w / l.card_h - 16.0 / 9.0).abs() < 0.01,
+            "card must be 16:9 ({:.1}x{:.1})",
+            l.card_w,
+            l.card_h
+        );
+        assert_eq!(l.card_h, 1016.0, "2rem top/bottom breather");
+        assert_eq!(l.card_w, l.page_w + 2.0 * BROWSER_CARD_PAD);
+        assert_eq!(
+            l.card_h,
+            l.page_h + CHROME_HEADER_H + 2.0 * BROWSER_CARD_PAD
+        );
+        assert!(l.page_w > 1700.0, "height-driven width");
+        // Narrow stage: width clamps and the card keeps 16:9.
+        let n = browser_layout(800.0, 1200.0);
+        assert!(n.card_w <= 800.0 - 2.0 * BROWSER_OUTER_MARGIN + 0.01);
+        assert!((n.card_w / n.card_h - 16.0 / 9.0).abs() < 0.01);
     }
 
     #[test]
@@ -6094,16 +6011,12 @@ mod tests {
         panel.page.cursor.attached = Some(crate::browser::cursor::CHROME_ID_BASE);
         assert!(!cursor_draws(&panel));
 
-        // Unified -> card mapping: header bands stay 1:1, the page scales.
-        assert_eq!(cursor_card_point(400.0, -140.0, 1.0), (400.0, 0.0));
-        assert_eq!(cursor_card_point(400.0, -94.0, 1.0), (400.0, 46.0));
-        assert_eq!(cursor_card_point(400.0, -18.0, 1.0), (400.0, 122.0));
-        assert_eq!(cursor_card_point(400.0, 0.0, 1.0), (400.0, 140.0));
-        assert_eq!(cursor_card_point(400.0, 600.0, 1.0), (400.0, 740.0));
-        // At half page scale the header stays fixed while the page halves.
-        assert_eq!(cursor_card_point(400.0, -94.0, 0.5), (200.0, 46.0));
-        assert_eq!(cursor_card_point(400.0, 0.0, 0.5), (200.0, 140.0));
-        assert_eq!(cursor_card_point(400.0, 600.0, 0.5), (200.0, 440.0));
+        // Unified -> card mapping: the surface is 1:1 (dynamic viewport).
+        assert_eq!(cursor_card_point(400.0, -112.0), (400.0, 0.0));
+        assert_eq!(cursor_card_point(400.0, -94.0), (400.0, 18.0));
+        assert_eq!(cursor_card_point(400.0, -18.0), (400.0, 94.0));
+        assert_eq!(cursor_card_point(400.0, 0.0), (400.0, 112.0));
+        assert_eq!(cursor_card_point(400.0, 600.0), (400.0, 712.0));
     }
 
     #[test]

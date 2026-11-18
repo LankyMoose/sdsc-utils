@@ -1095,8 +1095,12 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
             // integrate — unbounded accumulation with an infinite clamp is
             // exactly the overscroll-into-the-void; the first pull rebases.
             if state.content.is_some() {
+                let viewport = {
+                    let g = global.borrow();
+                    (g.size.0 as f32, g.size.1 as f32)
+                };
                 let (sx, sy) = state.scroll;
-                set_scroll(&mut state, (sx + dx, sy + dy));
+                set_scroll(&mut state, (sx + dx, sy + dy), viewport);
             }
             // No DOM re-query on scroll: stored rects are document-space, so
             // scrolling only re-translates. Virtualized insertions during a
@@ -1554,12 +1558,13 @@ fn doc_key(url: &str) -> &str {
 /// Clamp a tracked offset to the physically possible range: pages never sit
 /// above/left of origin, nor past extent-viewport. `None` extent (no
 /// bounded node seen yet) means no upper bound.
-fn clamp_scroll(scroll: (f32, f32), content: Option<(f32, f32)>) -> (f32, f32) {
+fn clamp_scroll(
+    scroll: (f32, f32),
+    content: Option<(f32, f32)>,
+    viewport: (f32, f32),
+) -> (f32, f32) {
     let (max_x, max_y) = match content {
-        Some((w, h)) => (
-            (w - VIEWPORT_WIDTH as f32).max(0.0),
-            (h - VIEWPORT_HEIGHT as f32).max(0.0),
-        ),
+        Some((w, h)) => ((w - viewport.0).max(0.0), (h - viewport.1).max(0.0)),
         None => (f32::INFINITY, f32::INFINITY),
     };
     (scroll.0.clamp(0.0, max_x), scroll.1.clamp(0.0, max_y))
@@ -2146,19 +2151,19 @@ fn note_scroll_truth(scroll_max: &mut (f32, f32), truth: (f32, f32)) {
 /// reported, plus one viewport of exploration slop. At the page end the
 /// truth pins and translations stop instead of sailing past into the void.
 /// (Extent alone can't do this — virtualized filler overstates it.)
-fn bound_commanded(scroll: (f32, f32), scroll_max: (f32, f32)) -> (f32, f32) {
+fn bound_commanded(scroll: (f32, f32), scroll_max: (f32, f32), viewport: (f32, f32)) -> (f32, f32) {
     (
-        scroll.0.min(scroll_max.0 + VIEWPORT_WIDTH as f32),
-        scroll.1.min(scroll_max.1 + VIEWPORT_HEIGHT as f32),
+        scroll.0.min(scroll_max.0 + viewport.0),
+        scroll.1.min(scroll_max.1 + viewport.1),
     )
 }
 
 /// Update the tracked scroll offset and report it when it moves, so the UI
 /// overlay can correlate cursor against targets.
-fn set_scroll(state: &mut TabState, scroll: (f32, f32)) {
+fn set_scroll(state: &mut TabState, scroll: (f32, f32), viewport: (f32, f32)) {
     // Commanded lead is bounded by observed truth (see `bound_commanded`).
-    let bounded = bound_commanded(scroll, state.scroll_max);
-    let clamped = clamp_scroll(bounded, state.content);
+    let bounded = bound_commanded(scroll, state.scroll_max, viewport);
+    let clamped = clamp_scroll(bounded, state.content, viewport);
     if state.scroll == clamped {
         return;
     }
@@ -2263,14 +2268,29 @@ mod tests {
     #[test]
     fn clamp_scroll_pins_to_possible_range() {
         // No extent known yet: anything non-negative passes.
-        assert_eq!(clamp_scroll((100.0, 200.0), None), (100.0, 200.0));
+        assert_eq!(
+            clamp_scroll((100.0, 200.0), None, (800.0, 600.0)),
+            (100.0, 200.0)
+        );
         // Negative is never real (pages sit at/after origin).
-        assert_eq!(clamp_scroll((-57.0, -74.0), None), (0.0, 0.0));
+        assert_eq!(
+            clamp_scroll((-57.0, -74.0), None, (800.0, 600.0)),
+            (0.0, 0.0)
+        );
         // Known 800x2481 document on an 800x600 viewport.
         let content = Some((800.0, 2481.0));
-        assert_eq!(clamp_scroll((0.0, 2573.0), content), (0.0, 1881.0));
-        assert_eq!(clamp_scroll((-225.0, 100.0), content), (0.0, 100.0));
-        assert_eq!(clamp_scroll((0.0, 1881.0), content), (0.0, 1881.0));
+        assert_eq!(
+            clamp_scroll((0.0, 2573.0), content, (800.0, 600.0)),
+            (0.0, 1881.0)
+        );
+        assert_eq!(
+            clamp_scroll((-225.0, 100.0), content, (800.0, 600.0)),
+            (0.0, 100.0)
+        );
+        assert_eq!(
+            clamp_scroll((0.0, 1881.0), content, (800.0, 600.0)),
+            (0.0, 1881.0)
+        );
     }
 
     #[test]
@@ -2289,13 +2309,28 @@ mod tests {
     #[test]
     fn commanded_lead_bounded_by_truth_plus_viewport() {
         // Within one viewport of proven truth: untouched.
-        assert_eq!(bound_commanded((0.0, 1500.0), (0.0, 1000.0)), (0.0, 1500.0));
+        assert_eq!(
+            bound_commanded((0.0, 1500.0), (0.0, 1000.0), (800.0, 600.0)),
+            (0.0, 1500.0)
+        );
         // Past the end the page proved: pinned to truth + viewport.
-        assert_eq!(bound_commanded((0.0, 5000.0), (0.0, 1000.0)), (0.0, 1600.0));
-        assert_eq!(bound_commanded((5000.0, 0.0), (0.0, 0.0)), (800.0, 0.0));
+        assert_eq!(
+            bound_commanded((0.0, 5000.0), (0.0, 1000.0), (800.0, 600.0)),
+            (0.0, 1600.0)
+        );
+        assert_eq!(
+            bound_commanded((5000.0, 0.0), (0.0, 0.0), (800.0, 600.0)),
+            (800.0, 0.0)
+        );
         // Fresh document (no truth yet): one viewport of exploration.
-        assert_eq!(bound_commanded((0.0, 599.0), (0.0, 0.0)), (0.0, 599.0));
-        assert_eq!(bound_commanded((0.0, 601.0), (0.0, 0.0)), (0.0, 600.0));
+        assert_eq!(
+            bound_commanded((0.0, 599.0), (0.0, 0.0), (800.0, 600.0)),
+            (0.0, 599.0)
+        );
+        assert_eq!(
+            bound_commanded((0.0, 601.0), (0.0, 0.0), (800.0, 600.0)),
+            (0.0, 600.0)
+        );
     }
 
     #[test]

@@ -122,10 +122,21 @@ pub fn dialog_card<'a>(
     width: Length,
     max_height: Option<f32>,
 ) -> Element<'a, StartMessage> {
+    dialog_card_padded(content, width, max_height, 24.0)
+}
+
+/// [`dialog_card`] with explicit padding (the browser card sits tight at
+/// ~4px around its surface).
+pub fn dialog_card_padded<'a>(
+    content: impl Into<Element<'a, StartMessage>>,
+    width: Length,
+    max_height: Option<f32>,
+    padding: f32,
+) -> Element<'a, StartMessage> {
     use iced::widget::container;
     let card = container(content)
         .width(width)
-        .padding(24)
+        .padding(padding)
         .style(theme::modal_card);
     match max_height {
         Some(max) => card.max_height(max).into(),
