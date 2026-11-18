@@ -746,6 +746,23 @@ impl App {
             (session.prefs.perf_antialiasing, session.prefs.perf_vsync);
 
         let last_discovered = hid_worker.presence_paths();
+        // The browser card is height-driven (16:9): resolve the primary
+        // monitor before spawning the engine so the software surface is
+        // created at its final page size. Starting at a placeholder size
+        // would reflow the first document (and leave it laid out at the old
+        // width if only the pixel buffer grew).
+        let initial_cover =
+            crate::ui::layout::primary_monitor_cover().unwrap_or(crate::ui::layout::MonitorCover {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            });
+        let initial_browser = start_view::browser_layout(initial_cover.width, initial_cover.height);
+        let initial_page = (
+            initial_browser.page_w.round().max(1.0) as u32,
+            initial_browser.page_h.round().max(1.0) as u32,
+        );
         let mut app = Self {
             session,
             games,
@@ -825,7 +842,10 @@ impl App {
             engine: if std::env::var("SDSC_NO_ENGINE").is_ok() {
                 None
             } else {
-                crate::browser::servo_backend::spawn_engine(&crate::browser::tabs::boot_url())
+                crate::browser::servo_backend::spawn_engine(
+                    &crate::browser::tabs::boot_url(),
+                    initial_page,
+                )
             },
             #[cfg(not(feature = "servo-engine"))]
             engine: None,
@@ -894,6 +914,13 @@ impl App {
             #[cfg(debug_assertions)]
             pending_emulator_commits: std::collections::HashMap::new(),
         };
+
+        // Apply the boot-time browser geometry to the panel/cursor now; the
+        // Start screen may not open for a while and the browser must be
+        // ready at the right size when it does.
+        app.start_state
+            .browser
+            .set_viewport(initial_browser.page_w, initial_browser.page_h);
 
         // Disk-persisted bookmarks into the browser panel (the one state
         // that survives restarts by design). Rebuild chrome after: the

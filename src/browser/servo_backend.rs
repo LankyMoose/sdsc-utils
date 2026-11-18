@@ -40,9 +40,6 @@ use crate::browser::engine::{
     EngineActivity, EngineCommand, EngineEvent, EngineHandle, TabFrame, TabId, TabKey,
 };
 
-/// Fixed offscreen viewport (phase 1; the iced image scales to the card).
-const VIEWPORT_WIDTH: u32 = 800;
-const VIEWPORT_HEIGHT: u32 = 600;
 /// Spin cadence while foreground (matches the ~60Hz UI tick budget).
 const SPIN_IDLE: Duration = Duration::from_millis(8);
 /// Spin cadence while suspended: timers parked, just drain commands.
@@ -770,8 +767,9 @@ fn collect_focusables(shared: &mut TabState) -> (Vec<Focusable>, (f32, f32)) {
 /// Spawn the engine worker with its first view on `boot_url` (the restored
 /// active tab, or home). Booting straight onto it leaves no stale home load
 /// to race the first restore-navigate and clobber the live session.
-pub fn spawn_engine(boot_url: &str) -> Option<EngineHandle> {
+pub fn spawn_engine(boot_url: &str, initial_size: (u32, u32)) -> Option<EngineHandle> {
     let boot_url = boot_url.to_string();
+    let initial_size = (initial_size.0.max(1), initial_size.1.max(1));
     let (handle, rx) = EngineHandle::channel();
     let worker = handle.clone();
     let wake_tx = handle.sender();
@@ -779,7 +777,7 @@ pub fn spawn_engine(boot_url: &str) -> Option<EngineHandle> {
     std::thread::Builder::new()
         .name("servo-engine".to_string())
         .stack_size(32 * 1024 * 1024)
-        .spawn(move || run(rx, wake_tx, worker, boot_url, ready_tx))
+        .spawn(move || run(rx, wake_tx, worker, boot_url, initial_size, ready_tx))
         .expect("spawn servo engine thread");
     // Deterministic GL-before-Vulkan barrier: iced (and its wgpu/Vulkan
     // init) only starts after `App::new` returns. Context creation itself
@@ -809,17 +807,20 @@ fn run(
     wake_tx: mpsc::Sender<EngineCommand>,
     handle: EngineHandle,
     boot_url: String,
+    initial_size: (u32, u32),
     ready: mpsc::Sender<Result<(), String>>,
 ) {
-    // GL context FIRST: see `spawn_engine` ordering contract.
-    let ctx =
-        match SoftwareRenderingContext::new(PhysicalSize::new(VIEWPORT_WIDTH, VIEWPORT_HEIGHT)) {
-            Ok(ctx) => Rc::new(ctx),
-            Err(err) => {
-                let _ = ready.send(Err(format!("{err:?}")));
-                return;
-            }
-        };
+    // GL context FIRST: see `spawn_engine` ordering contract. Created at
+    // the final card size so the first document lays out correctly; a
+    // later resize only runs when the monitor geometry actually changes.
+    let ctx = match SoftwareRenderingContext::new(PhysicalSize::new(initial_size.0, initial_size.1))
+    {
+        Ok(ctx) => Rc::new(ctx),
+        Err(err) => {
+            let _ = ready.send(Err(format!("{err:?}")));
+            return;
+        }
+    };
     let _ = ready.send(Ok(()));
     // Persistent web storage: Servo reads/writes `localstorage.json` (and
     // friends) under `config_dir` — without it everything is memory-only and
@@ -857,7 +858,7 @@ fn run(
     let ax_debug = std::env::var("SDSC_AX_DEBUG").is_ok();
     let delegate_global: Rc<RefCell<Global>> = Rc::new(RefCell::new(Global {
         ctx: ctx.clone(),
-        size: (VIEWPORT_WIDTH, VIEWPORT_HEIGHT),
+        size: initial_size,
         handle,
         user_content: Rc::new(UserContentManager::new(&servo)),
         visible: false,
@@ -920,7 +921,8 @@ fn run(
     }
     let global = delegate_global;
     crate::platform::app_log::info(format!(
-        "servo-engine: ready ({VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT} software surface)"
+        "servo-engine: ready ({}x{} software surface)",
+        initial_size.0, initial_size.1
     ));
 
     // Shutdown ack: carried out of the drain loop so the post-loop Drop
@@ -1433,9 +1435,21 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
             let mut global_ref = global.borrow_mut();
             let width = width.max(1);
             let height = height.max(1);
-            // One shared context: a resize resizes every tab's view (Servo
-            // documents this). All tabs are the same fixed viewport anyway.
-            global_ref.ctx.resize(PhysicalSize::new(width, height));
+            let size = PhysicalSize::new(width, height);
+            // WebView::resize resizes the shared RenderingContext *and*
+            // notifies Servo, so the document viewport reflows to the new
+            // size. Calling ctx.resize directly only grows the buffer: the
+            // page stays at its old width in the top-left of a white surface.
+            let view = global_ref
+                .tabs
+                .get(&global_ref.active)
+                .or_else(|| global_ref.tabs.values().next())
+                .map(|entry| entry.webview.clone());
+            if let Some(view) = view {
+                view.resize(size);
+            } else {
+                global_ref.ctx.resize(size);
+            }
             global_ref.size = (width, height);
             crate::controller::hid::diag::diag_info(format!(
                 "servo-engine: resize -> {width}x{height}"
