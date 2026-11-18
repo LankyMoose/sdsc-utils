@@ -131,6 +131,45 @@ pub struct Cursor {
     pub visible: bool,
 }
 
+/// Perpendicular band metrics between a docked rect and a candidate for a
+/// move along `dir`: `(forward gap, shared perpendicular extent,
+/// perpendicular centre offset, centre line crossed)`. Gap is clamped at
+/// zero when the rects overlap on the movement axis; shared extent is zero
+/// when they do not overlap on the perpendicular axis. Centre line crossed
+/// means the docked rect's perpendicular centre falls inside the
+/// candidate's span — the target sits in the same visual row/column.
+fn band_metrics(from: (f32, f32, f32, f32), to: &Focusable, dir: JumpDir) -> (f32, f32, f32, bool) {
+    let (fx0, fy0, fw, fh) = from;
+    let (fx1, fy1) = (fx0 + fw, fy0 + fh);
+    let (tx1, ty1) = (to.x + to.w, to.y + to.h);
+    match dir {
+        JumpDir::Up | JumpDir::Down => {
+            let shared = fx1.min(tx1) - fx0.max(to.x);
+            let gap = if dir == JumpDir::Up {
+                fy0 - ty1
+            } else {
+                to.y - fy1
+            };
+            let column = ((fx0 + fw / 2.0) - (to.x + to.w / 2.0)).abs();
+            let centre = fx0 + fw / 2.0;
+            let on_axis = to.x <= centre && centre <= tx1;
+            (gap.max(0.0), shared.max(0.0), column, on_axis)
+        }
+        JumpDir::Left | JumpDir::Right => {
+            let shared = fy1.min(ty1) - fy0.max(to.y);
+            let gap = if dir == JumpDir::Left {
+                fx0 - tx1
+            } else {
+                to.x - fx1
+            };
+            let column = ((fy0 + fh / 2.0) - (to.y + to.h / 2.0)).abs();
+            let centre = fy0 + fh / 2.0;
+            let on_axis = to.y <= centre && centre <= ty1;
+            (gap.max(0.0), shared.max(0.0), column, on_axis)
+        }
+    }
+}
+
 impl Cursor {
     pub fn new() -> Self {
         Self {
@@ -302,6 +341,15 @@ impl Cursor {
     /// the point stays put. The point flies to the target and docks on
     /// arrival — no teleport frames. D-pad always snaps — this ignores the
     /// magnet toggle.
+    ///
+    /// Docked ranking is band-first, not centre-distance. Targets crossed
+    /// by the docked item's perpendicular centre line (same row/column)
+    /// outrank every partial overlap, and partial overlaps outrank purely
+    /// diagonal targets — so a below-right target can never win a Right
+    /// press over a right target. Within a tier the widest shared
+    /// perpendicular extent wins, then the nearest forward row, then the
+    /// smallest column offset. With no dock (or nothing sharing the band)
+    /// it falls back to the 60-degree cone and nearest-point scoring.
     pub fn jump(&mut self, dir: JumpDir, options: &[Focusable]) -> bool {
         let (dx, dy) = match dir {
             JumpDir::Up => (0.0, -1.0),
@@ -309,14 +357,29 @@ impl Cursor {
             JumpDir::Left => (-1.0, 0.0),
             JumpDir::Right => (1.0, 0.0),
         };
-        let mut best: Option<(u64, f32)> = None;
+        struct Candidate<'a> {
+            item: &'a Focusable,
+            along: f32,
+            across: f32,
+            /// Forward gap between the docked rect and the candidate.
+            gap: f32,
+            /// Shared perpendicular extent with the docked rect.
+            shared: f32,
+            /// Perpendicular centre offset (last-resort tie-break).
+            column: f32,
+            /// 2 = docked centre line crosses this target (same row or
+            /// column), 1 = partial band overlap, 0 = diagonal fallback.
+            tier: u8,
+        }
+        let from = self.attached_rect(options);
+        let mut cands: Vec<Candidate<'_>> = Vec::new();
         for item in options {
             if Some(item.id) == self.attached {
                 continue;
             }
-            // Nearest-point alignment scoring: a slot directly below wins
-            // over a diagonally-nearer center, and tiny off-axis targets
-            // stop intercepting wide same-row neighbors.
+            // Nearest-point direction test: the candidate must lie forward
+            // of the point, and out-of-band targets must sit inside the
+            // 60-degree cone.
             let nx = self.x.clamp(item.x, item.x + item.w);
             let ny = self.y.clamp(item.y, item.y + item.h);
             let cx = nx - self.x;
@@ -326,20 +389,59 @@ impl Cursor {
                 continue;
             }
             let across = (cx * dy - cy * dx).abs();
-            // 60-degree cone: lateral offset must stay within the forward run.
-            if across > along {
+            let (gap, shared, column, on_axis) = match from {
+                Some(f) => band_metrics(f, item, dir),
+                None => (along, 0.0, across, false),
+            };
+            // A candidate sharing the docked band is a legitimate row move
+            // even off-axis; only diagonal (out-of-band) targets are coned.
+            if shared <= 0.0 && across > along {
                 continue;
             }
-            let score = along + across * 2.0;
-            if best.is_none_or(|(_, s)| score < s) {
-                best = Some((item.id, score));
-            }
+            let tier = if on_axis {
+                2
+            } else if shared > 0.0 {
+                1
+            } else {
+                0
+            };
+            cands.push(Candidate {
+                item,
+                along,
+                across,
+                gap,
+                shared,
+                column,
+                tier,
+            });
         }
-        if let Some((id, _)) = best {
-            if let Some(item) = options.iter().find(|o| o.id == id) {
-                // Fly, don't teleport: the outline morphs on arrival.
-                self.jump_to(item);
+        let top_tier = cands.iter().map(|c| c.tier).max().unwrap_or(0);
+        let winner = cands.iter().filter(|c| c.tier == top_tier).min_by(|a, b| {
+            if top_tier == 0 {
+                // Free cursor or fully diagonal: nearest point in the cone.
+                let sa = a.along + a.across * 2.0;
+                let sb = b.along + b.across * 2.0;
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                // Same row/column first: widest shared extent, then the
+                // nearest forward row, then the closest column.
+                b.shared
+                    .partial_cmp(&a.shared)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        a.gap
+                            .partial_cmp(&b.gap)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| {
+                        a.column
+                            .partial_cmp(&b.column)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
             }
+        });
+        if let Some(c) = winner {
+            self.jump_to(c.item);
             true
         } else {
             false
@@ -817,11 +919,11 @@ mod tests {
     }
 
     #[test]
-    fn jump_scores_nearest_point_not_center() {
-        // Rect-nearest scoring (not centers): direct-below wins over
-        // diagonal, and tiny off-axis targets stop intercepting wide
-        // same-row neighbors. Row membership itself is enforced by the
-        // caller (view-level row stepping), not by scoring.
+    fn docked_jump_stays_in_the_docked_band() {
+        // Trace case: Left from the wide omnibox must land on the adjacent
+        // toolbar button, not a strip slot two rows up whose nearest edge
+        // is closer in x. Direction is the gate; shared row extent decides
+        // eligibility before any distance scoring.
         let mut c = Cursor::new();
         let omni = Focusable {
             id: CHROME_ID_BASE,
@@ -855,17 +957,63 @@ mod tests {
         c.y = -54.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(CHROME_ID_BASE));
-        // Pure spatial scoring: the nearer strip slot wins here. Same-row
-        // restriction lives one level up (view row-stepping), where row
-        // membership is known.
         assert!(c.jump(JumpDir::Left, &items));
         for _ in 0..60 {
             c.advance(0.0, 0.0, 0.016, &items);
-            if c.attached == Some(CHROME_ID_BASE + 2) {
+            if c.attached == Some(CHROME_ID_BASE + 1) {
                 break;
             }
         }
-        assert_eq!(c.attached, Some(CHROME_ID_BASE + 2));
+        assert_eq!(c.attached, Some(CHROME_ID_BASE + 1));
+    }
+
+    #[test]
+    fn vertical_jump_ranks_shared_width_within_the_row() {
+        // Two content rows: a(200) b(100) over c(150) d(80). Up from
+        // either row-2 slot must pick a: it shares 150px with c and 50px
+        // with d, while b shares 0 and 30. Center distance would pick b
+        // from d; shared extent picks a.
+        let a = chrome_btn(1, 0.0, 100.0, 200.0, 40.0);
+        let b = chrome_btn(2, 200.0, 100.0, 100.0, 40.0);
+        let c = chrome_btn(3, 0.0, 200.0, 150.0, 40.0);
+        let d = chrome_btn(4, 150.0, 200.0, 80.0, 40.0);
+        let items = [a, b, c, d];
+        for (from, x) in [(3u64, 75.0f32), (4, 190.0)] {
+            let mut cur = Cursor::new();
+            cur.attached = Some(from);
+            cur.x = x;
+            cur.y = 220.0;
+            assert!(
+                cur.jump(JumpDir::Up, &items),
+                "Up from item {from} must find a target"
+            );
+            assert_eq!(
+                cur.fly_to,
+                Some((100.0, 120.0)),
+                "Up from {from} lands on a (shared width), not b"
+            );
+        }
+    }
+
+    #[test]
+    fn right_never_picks_below_right_over_right() {
+        // The below-right target is nearer in x and would win any
+        // distance/centre score, but shares none of the docked row's
+        // vertical extent. Direction gates it out entirely.
+        let current = chrome_btn(1, 100.0, 100.0, 100.0, 100.0);
+        let right = chrome_btn(2, 250.0, 100.0, 100.0, 50.0);
+        let below_right = chrome_btn(3, 220.0, 220.0, 100.0, 50.0);
+        let items = [current, right, below_right];
+        let mut c = Cursor::new();
+        c.attached = Some(1);
+        c.x = 150.0;
+        c.y = 150.0;
+        assert!(c.jump(JumpDir::Right, &items));
+        assert_eq!(
+            c.fly_to,
+            Some((300.0, 125.0)),
+            "must land on the right target, never below-right"
+        );
     }
 
     fn chrome_btn(id: u64, x: f32, y: f32, w: f32, h: f32) -> Focusable {
