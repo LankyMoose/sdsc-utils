@@ -101,6 +101,9 @@ pub enum StartMessage {
     BrowserHome,
     /// Browser: open a new foreground tab on the home page.
     BrowserTabNew,
+    /// Browser: foreground the next tab in strip order (overflow chip;
+    /// wraps around).
+    BrowserTabNext,
     /// Browser: foreground a tab (stashes the live page, loads the stored
     /// one into the live slot).
     BrowserTabSwitch(crate::browser::engine::TabId),
@@ -1176,6 +1179,7 @@ impl BrowserPanel {
             ChromeTarget::Tab(id) => Some(StartMessage::BrowserTabSwitch(id)),
             ChromeTarget::TabClose(id) => Some(StartMessage::BrowserTabClose(id)),
             ChromeTarget::NewTab => Some(StartMessage::BrowserTabNew),
+            ChromeTarget::TabOverflow(_) => Some(StartMessage::BrowserTabNext),
             ChromeTarget::Back => Some(StartMessage::BrowserBack),
             ChromeTarget::Forward => Some(StartMessage::BrowserForward),
             ChromeTarget::Reload => Some(StartMessage::BrowserReload),
@@ -1216,6 +1220,17 @@ impl BrowserPanel {
             }
             None => String::new(),
         }
+    }
+
+    /// URL for a tab id (live or stored), empty when the tab vanished.
+    pub fn tab_url(&self, id: crate::browser::engine::TabId) -> String {
+        let page = if id == self.active_tab {
+            Some(&self.page)
+        } else {
+            self.stored.iter().find(|t| t.id == id).map(|t| &t.page)
+        };
+        page.map(|p| p.session.url().to_string())
+            .unwrap_or_default()
     }
 
     pub fn toggle(&mut self) {
@@ -1264,6 +1279,8 @@ impl BrowserPanel {
             }
         }
         self.favicons.insert(key, handle);
+        // Tab strips size themselves from the icon's presence/absence.
+        self.rebuild_chrome();
     }
 
     /// Step the body scroll (reader text); returns the new absolute offset.
@@ -1745,8 +1762,34 @@ fn chrome_row_view<'a>(
     for (target, f) in panel.chrome.iter().filter(|(_, f)| f.y == row_y) {
         let content: Element<'a, StartMessage> = match *target {
             ChromeTarget::Tab(id) => {
-                let title = text_fit::ellipsize_to_width(panel.tab_title(id), 11.0, 140.0);
-                let b = button(text(title).size(11.0).color(theme::INK)).padding([4, 8]);
+                let url = panel.tab_url(id);
+                let icon = if url.is_empty() {
+                    None
+                } else {
+                    panel
+                        .favicons
+                        .get(&crate::browser::bookmarks::origin_key(&url))
+                        .cloned()
+                };
+                let icon_w = if icon.is_some() { 22.0 } else { 0.0 };
+                let budget = (f.w - 16.0 - icon_w).max(0.0);
+                let title = if budget >= 8.0 {
+                    text_fit::ellipsize_to_width(panel.tab_title(id), 11.0, budget)
+                } else {
+                    String::new()
+                };
+                let mut inner = row![].spacing(6).align_y(Alignment::Center);
+                if let Some(icon) = icon {
+                    inner = inner.push(
+                        image(icon)
+                            .width(Length::Fixed(16.0))
+                            .height(Length::Fixed(16.0)),
+                    );
+                }
+                if !title.is_empty() {
+                    inner = inner.push(text(title).size(11.0).color(theme::INK));
+                }
+                let b = button(inner).padding([4, 8]);
                 if panel.chrome_attached() == Some(ChromeTarget::Tab(id)) {
                     b.on_press(StartMessage::BrowserTabSwitch(id))
                         .style(theme::chip(true))
@@ -1776,6 +1819,17 @@ fn chrome_row_view<'a>(
                         .style(theme::chip(true))
                 } else {
                     b.on_press(StartMessage::BrowserTabNew).style(theme::ghost)
+                }
+                .into()
+            }
+            ChromeTarget::TabOverflow(hidden) => {
+                let b = button(text(format!("+{hidden}")).size(11.0).color(theme::MUTED))
+                    .padding([4, 10]);
+                if panel.chrome_attached() == Some(ChromeTarget::TabOverflow(hidden)) {
+                    b.on_press(StartMessage::BrowserTabNext)
+                        .style(theme::chip(true))
+                } else {
+                    b.on_press(StartMessage::BrowserTabNext).style(theme::ghost)
                 }
                 .into()
             }
@@ -2022,6 +2076,8 @@ pub enum ChromeTarget {
     Tab(crate::browser::engine::TabId),
     TabClose(crate::browser::engine::TabId),
     NewTab,
+    /// Hidden-tab count; activation cycles to the next tab.
+    TabOverflow(usize),
     Back,
     Forward,
     Reload,
@@ -2051,21 +2107,84 @@ pub fn chrome_layout(panel: &BrowserPanel) -> Vec<ChromeRowLayout> {
     use crate::browser::cursor::VIEWPORT_W;
     let mut rows = Vec::with_capacity(3);
 
-    // Tab strip: natural tab + close widths, 4px between tab groups.
-    let mut strip = Vec::with_capacity(panel.order.len() * 2 + 1);
-    let mut x = 0.0;
+    // Tab strip: favicon + ellipsized title + close per tab, fitted to the
+    // width. Titles shrink evenly first; when even minimum titles cannot
+    // fit, a window around the active tab is shown plus an overflow chip
+    // that cycles to the next tab (so no tab is unreachable).
+    const TAB_PAD: f32 = 16.0; // button padding [4, 8]
+    const CLOSE_PAD: f32 = 12.0; // close padding [4, 6]
+    const ICON_W: f32 = 22.0; // 16px favicon + 6px spacing
+    const TAB_GAP: f32 = 4.0;
+    const TITLE_MIN: f32 = 16.0;
+    const TITLE_MAX: f32 = 140.0;
+    let close_w = text_fit::text_width_px("×", 11.0) + CLOSE_PAD;
+    let new_w = text_fit::text_width_px("+", 14.0) + 20.0;
+    let mut plans = Vec::with_capacity(panel.order.len());
     for id in &panel.order {
-        let title = text_fit::ellipsize_to_width(panel.tab_title(*id), 11.0, 140.0);
-        let tab_w = text_fit::text_width_px(&title, 11.0) + 16.0;
-        let close_w = text_fit::text_width_px("×", 11.0) + 12.0;
-        if x + tab_w + close_w > VIEWPORT_W {
-            break;
+        let url = panel.tab_url(*id);
+        let icon_w = if !url.is_empty()
+            && panel
+                .favicons
+                .contains_key(&crate::browser::bookmarks::origin_key(&url))
+        {
+            ICON_W
+        } else {
+            0.0
+        };
+        let title = text_fit::ellipsize_to_width(panel.tab_title(*id), 11.0, TITLE_MAX);
+        plans.push((*id, text_fit::text_width_px(&title, 11.0), icon_w));
+    }
+    let count = plans.len();
+    let gaps_all = TAB_GAP * count as f32;
+    let fixed_all: f32 = plans
+        .iter()
+        .map(|(_, _, icon)| TAB_PAD + icon + close_w)
+        .sum();
+    let titles_all: f32 = plans.iter().map(|(_, title, _)| title).sum();
+    let (start, end, title_budget, hidden) = if count == 0 {
+        (0, 0, 0.0, 0)
+    } else if fixed_all + titles_all + gaps_all + new_w <= VIEWPORT_W {
+        (0, count, f32::INFINITY, 0)
+    } else {
+        let per = (VIEWPORT_W - fixed_all - gaps_all - new_w) / count as f32;
+        if per >= TITLE_MIN {
+            (0, count, per, 0)
+        } else {
+            // Reserve the widest chip and the new-tab button, then fit as
+            // many minimum-title tabs as possible.
+            let chip_max = label_width("+99", 11.0, 10.0);
+            let group_min = TAB_PAD + ICON_W + close_w + TITLE_MIN;
+            let room = VIEWPORT_W - new_w - chip_max - TAB_GAP;
+            let fit = (room / (group_min + TAB_GAP)).floor().max(1.0) as usize;
+            let fit = fit.min(count.saturating_sub(1)).max(1);
+            let active = panel
+                .order
+                .iter()
+                .position(|id| *id == panel.active_tab)
+                .unwrap_or(0);
+            let start = if active < fit {
+                0
+            } else {
+                (active + 1 - fit).min(count - fit)
+            };
+            (start, start + fit, TITLE_MIN, count - fit)
         }
+    };
+    let mut strip = Vec::with_capacity((end - start) * 2 + 2);
+    let mut x = 0.0;
+    for (id, title_w, icon_w) in plans.iter().take(end).skip(start) {
+        let title_w = title_w.min(title_budget);
+        let tab_w = TAB_PAD + icon_w + title_w;
         strip.push((ChromeTarget::Tab(*id), x, tab_w));
         strip.push((ChromeTarget::TabClose(*id), x + tab_w, close_w));
-        x += tab_w + close_w + 4.0;
+        x += tab_w + close_w + TAB_GAP;
     }
-    let new_w = text_fit::text_width_px("+", 14.0) + 20.0;
+    if hidden > 0 {
+        let label = format!("+{hidden}");
+        let chip_w = label_width(&label, 11.0, 10.0);
+        strip.push((ChromeTarget::TabOverflow(hidden), x, chip_w));
+        x += chip_w + TAB_GAP;
+    }
     if x + new_w <= VIEWPORT_W {
         strip.push((ChromeTarget::NewTab, x, new_w));
     }
@@ -5879,6 +5998,84 @@ mod tests {
     }
 
     #[test]
+    fn tab_favicon_widens_the_slot() {
+        use crate::browser::engine::TabId;
+        let mut panel = BrowserPanel::default();
+        panel.page.session.begin_load("https://a.test/".to_string());
+        panel.rebuild_chrome();
+        let tab_width = |panel: &BrowserPanel| {
+            panel
+                .chrome
+                .iter()
+                .find_map(|(t, f)| matches!(t, ChromeTarget::Tab(TabId::BOOT)).then_some(f.w))
+                .expect("tab slot")
+        };
+        let before = tab_width(&panel);
+        panel.note_favicon(
+            "https://a.test/".to_string(),
+            iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+        );
+        let after = tab_width(&panel);
+        assert!(
+            (after - before - 22.0).abs() < 0.5,
+            "favicon must add 16px + 6px spacing ({before} -> {after})"
+        );
+    }
+
+    #[test]
+    fn tab_strip_windows_and_counts_overflow() {
+        use crate::browser::engine::TabId;
+        let mut panel = BrowserPanel::default();
+        // Twenty tabs with long titles cannot fit; the strip must window
+        // around the active tab and expose the rest through the chip.
+        panel.order.clear();
+        panel.stored.clear();
+        for i in 0..20u64 {
+            let id = TabId(100 + i);
+            let mut page = BrowserTabPage::default();
+            page.session
+                .begin_load(format!("https://site-{i}.test/a-long-page-title"));
+            panel.order.push(id);
+            panel.stored.push(StoredTab {
+                id,
+                page,
+                loaded: false,
+            });
+        }
+        panel.active_tab = TabId(115);
+        panel.rebuild_chrome();
+        let layout = chrome_layout(&panel);
+        let strip = &layout[0].items;
+        for (target, x, w) in strip {
+            assert!(
+                *x >= 0.0 && x + w <= crate::browser::cursor::VIEWPORT_W + 0.01,
+                "{target:?} spills past the strip"
+            );
+        }
+        let overflow = strip
+            .iter()
+            .find_map(|(t, _, _)| match t {
+                ChromeTarget::TabOverflow(hidden) => Some(*hidden),
+                _ => None,
+            })
+            .expect("overflow chip");
+        assert!(
+            strip
+                .iter()
+                .any(|(t, _, _)| *t == ChromeTarget::Tab(TabId(115))),
+            "the active tab must stay in the visible window"
+        );
+        assert!(strip.iter().any(|(t, _, _)| *t == ChromeTarget::NewTab));
+        let shown = strip
+            .iter()
+            .filter(|(t, _, _)| matches!(t, ChromeTarget::Tab(_)))
+            .count();
+        assert_eq!(shown + overflow, 20, "all tabs are accounted for");
+        let laid_out: usize = layout.iter().map(|row| row.items.len()).sum();
+        assert_eq!(panel.chrome.len(), laid_out);
+    }
+
+    #[test]
     fn header_cursor_is_drawn_in_unified_space() {
         // Header roam and header-bound flights are visible now: the overlay
         // spans the fixed header plus the page, so the dot is never drawn
@@ -5995,6 +6192,10 @@ mod tests {
         assert!(matches!(
             panel.chrome_message(ChromeTarget::Tab(TabId::BOOT)),
             Some(StartMessage::BrowserTabSwitch(id)) if id == TabId::BOOT
+        ));
+        assert!(matches!(
+            panel.chrome_message(ChromeTarget::TabOverflow(3)),
+            Some(StartMessage::BrowserTabNext)
         ));
         assert!(matches!(
             panel.chrome_message(ChromeTarget::Omnibox),

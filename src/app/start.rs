@@ -116,6 +116,7 @@ impl App {
             StartMessage::BrowserReload => self.on_browser_reload(),
             StartMessage::BrowserHome => self.on_browser_go_home(),
             StartMessage::BrowserTabNew => self.on_browser_tab_new(),
+            StartMessage::BrowserTabNext => self.on_browser_tab_next(),
             StartMessage::BrowserTabSwitch(id) => self.on_browser_tab_switch(id),
             StartMessage::BrowserTabClose(id) => self.on_browser_tab_close(id),
             StartMessage::BrowserShutdownEngine => self.on_browser_shutdown_engine(),
@@ -1711,7 +1712,9 @@ impl App {
         }
         let url = self.start_state.browser.session.url().to_string();
         self.start_state.browser.draft = url.clone();
-        self.start_state.browser.save_tabs();
+        // The visible tab window follows the active tab, so the strip
+        // geometry changes on every switch (not just membership).
+        self.save_strip();
         if self.engine.is_none() {
             // Reader fallback: no views to foreground — fetch the newly
             // live tab's URL through the normal path instead.
@@ -1721,6 +1724,20 @@ impl App {
         self.play_start_cue(UiSoundKind::Action);
         self.foreground_live_tab(tab, needs_open, url);
         Task::none()
+    }
+
+    /// Cycle to the next tab in strip order (wraps). Used by the tab
+    /// strip's overflow chip, which stands in for tabs hidden by the
+    /// fit pass; switching windows the strip around the new active tab.
+    pub(crate) fn on_browser_tab_next(&mut self) -> Task<Message> {
+        let order = self.start_state.browser.order.clone();
+        if order.len() < 2 {
+            return Task::none();
+        }
+        let active = self.start_state.browser.active_tab;
+        let index = order.iter().position(|id| *id == active).unwrap_or(0);
+        let next = order[(index + 1) % order.len()];
+        self.on_browser_tab_switch(next)
     }
 
     /// User closes a tab (`×`): background tabs drop outright; closing the
