@@ -111,9 +111,12 @@ pub enum EngineCommand {
     },
     GoBack {
         tab: TabId,
+        /// Entries to traverse at once (history selector jumps).
+        steps: usize,
     },
     GoForward {
         tab: TabId,
+        steps: usize,
     },
     /// Create a tab loading `url` from birth (builder URL, like the boot
     /// tab). A separate post-build `Navigate` loses to the blank's initial

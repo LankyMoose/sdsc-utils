@@ -84,8 +84,8 @@ pub enum StartMessage {
         back: bool,
     },
     /// Browser: jump to an absolute session-stack index (selector row).
-    /// Navigates through the normal path (new load, forward truncated —
-    /// keeps the local and engine stacks consistent with no engine changes).
+    /// History traversal (`go_back`/`go_forward` with steps): moves within
+    /// the existing stack, so the forward tail is preserved.
     BrowserHistoryPick(usize),
     /// Browser: close the history selector without navigating.
     BrowserHistoryCancel,

@@ -1143,27 +1143,27 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
                 entry.webview.notify_theme_change(theme);
             }
         }
-        EngineCommand::GoBack { tab } => {
+        EngineCommand::GoBack { tab, steps } => {
             let Some(entry) = tab_entry(global, tab) else {
                 return;
             };
-            if global.borrow().suspended {
+            if global.borrow().suspended || steps == 0 {
                 return;
             }
             // History travel swaps the document: clear_tree drops DOM targets,
             // scroll and extent (no reliable scroll restore to keep).
             clear_tree(&mut entry.state.borrow_mut());
-            entry.webview.go_back(1);
+            entry.webview.go_back(steps);
         }
-        EngineCommand::GoForward { tab } => {
+        EngineCommand::GoForward { tab, steps } => {
             let Some(entry) = tab_entry(global, tab) else {
                 return;
             };
-            if global.borrow().suspended {
+            if global.borrow().suspended || steps == 0 {
                 return;
             }
             clear_tree(&mut entry.state.borrow_mut());
-            entry.webview.go_forward(1);
+            entry.webview.go_forward(steps);
         }
         EngineCommand::MouseMove { tab, x, y } => {
             let Some(entry) = tab_entry(global, tab) else {

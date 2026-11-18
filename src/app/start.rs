@@ -812,17 +812,41 @@ impl App {
     }
 
     pub(crate) fn on_browser_go_back(&mut self) -> Task<Message> {
+        let session = &self.start_state.browser.session;
+        let (Some(current), true) = (session.nav_current(), session.can_go_back()) else {
+            return Task::none();
+        };
+        if self.engine.is_none() {
+            return Task::none();
+        }
+        let target = current - 1;
+        self.start_state
+            .browser
+            .session
+            .begin_history_travel(target);
         if let Some(engine) = &self.engine {
             let tab = self.browser_tab();
-            engine.send(EngineCommand::GoBack { tab });
+            engine.send(EngineCommand::GoBack { tab, steps: 1 });
         }
         Task::none()
     }
 
     pub(crate) fn on_browser_go_forward(&mut self) -> Task<Message> {
+        let session = &self.start_state.browser.session;
+        let (Some(current), true) = (session.nav_current(), session.can_go_forward()) else {
+            return Task::none();
+        };
+        if self.engine.is_none() {
+            return Task::none();
+        }
+        let target = current + 1;
+        self.start_state
+            .browser
+            .session
+            .begin_history_travel(target);
         if let Some(engine) = &self.engine {
             let tab = self.browser_tab();
-            engine.send(EngineCommand::GoForward { tab });
+            engine.send(EngineCommand::GoForward { tab, steps: 1 });
         }
         Task::none()
     }
@@ -858,20 +882,46 @@ impl App {
         Task::none()
     }
 
-    /// Browser: selector pick — navigate to the absolute session index
-    /// through the normal path (new load; forward tail truncates). Closes
-    /// the selector first so the loadbehind never renders under it, and
-    /// swallows an in-flight Cross press so the confirming release cannot
-    /// also click the fresh page.
+    /// Browser: selector pick — traverse to the absolute session index.
+    /// History travel moves within the existing stack (go_back/go_forward),
+    /// so the forward tail survives; only a normal navigation truncates it.
+    /// Closes the selector first so the loadbehind never renders under it,
+    /// and swallows an in-flight Cross press so the confirming release
+    /// cannot also click the fresh page.
     pub(crate) fn on_browser_history_pick(&mut self, index: usize) -> Task<Message> {
-        let url = match self.start_state.browser.session.nav_entry(index) {
+        let session = &self.start_state.browser.session;
+        let Some(current) = session.nav_current() else {
+            return Task::none();
+        };
+        let url = match session.nav_entry(index) {
             Some(entry) => entry.url.clone(),
             None => return Task::none(),
         };
         self.start_state.browser.history_selector = None;
         self.pad_nav.cancel_held_face_releases();
         self.start_state.browser.draft = url;
-        self.on_browser_navigate()
+        if index == current {
+            return Task::none();
+        }
+        if self.engine.is_none() {
+            // Reader fallback has no session-history traversal; keep the
+            // old fetch path (forward tail may prune there).
+            return self.on_browser_navigate();
+        }
+        let back = index < current;
+        let steps = index.abs_diff(current);
+        self.start_state.browser.session.begin_history_travel(index);
+        self.note_start_activity();
+        self.play_start_cue(UiSoundKind::Nav);
+        if let Some(engine) = &self.engine {
+            let tab = self.browser_tab();
+            engine.send(if back {
+                EngineCommand::GoBack { tab, steps }
+            } else {
+                EngineCommand::GoForward { tab, steps }
+            });
+        }
+        Task::none()
     }
 
     /// Browser: dismiss the history selector without navigating.

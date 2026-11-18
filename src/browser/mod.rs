@@ -153,6 +153,10 @@ pub struct BrowserSession {
     /// `notify_history_changed` entries + current) when present.
     nav_stack: Vec<HistoryEntry>,
     nav_index: Option<usize>,
+    /// Pending history traversal target (absolute session index). While set,
+    /// URL updates move the index instead of pushing and truncating the
+    /// forward tail; only a normal navigation may prune.
+    history_travel_to: Option<usize>,
 }
 
 impl BrowserSession {
@@ -179,6 +183,9 @@ impl BrowserSession {
             self.loading = false;
             self.generation = self.generation.wrapping_add(1);
         }
+        // A traversal in flight when the surface suspends never lands; do
+        // not let a stale intent retarget the next unrelated URL change.
+        self.history_travel_to = None;
     }
 
     /// Begin loading `url`. Returns the generation the worker result must
@@ -192,6 +199,7 @@ impl BrowserSession {
         self.frame.clear();
         self.loading = true;
         self.generation = self.generation.wrapping_add(1);
+        self.history_travel_to = None;
         self.record_visit(url.clone());
         self.push_nav(url);
         self.generation
@@ -324,12 +332,23 @@ impl BrowserSession {
     /// Push a document onto the chronological session stack. New navigations
     /// from the middle truncate the forward tail (browser semantics);
     /// same-document fragment traffic only retargets the live entry.
-    /// Engine history travel lands via `UrlChanged` before the canonical
-    /// `HistoryChanged`: an exact adjacent match moves the index instead of
-    /// forking the stack (otherwise every Back would truncate the forward
-    /// tail and append a duplicate). Blank/empty URLs never record.
+    /// A pending `begin_history_travel` target moves the index without
+    /// pruning. Engine history travel lands via `UrlChanged` before the
+    /// canonical `HistoryChanged`: an exact adjacent match moves the index
+    /// instead of forking the stack (otherwise every Back would truncate the
+    /// forward tail and append a duplicate). Blank/empty URLs never record.
     pub fn push_nav(&mut self, url: String) {
         if is_ignored_url(&url) {
+            return;
+        }
+        // History traversal (bumper taps or a selector jump): move the index
+        // to the target entry. The forward tail stays intact until a normal
+        // navigation truncates it.
+        if let Some(target) = self.history_travel_to.take()
+            && let Some(entry) = self.nav_stack.get_mut(target)
+        {
+            entry.url = url;
+            self.nav_index = Some(target);
             return;
         }
         if let Some(i) = self.nav_index
@@ -373,6 +392,7 @@ impl BrowserSession {
             return;
         }
         let current = current.min(entries.len() - 1);
+        self.history_travel_to = None;
         let mut titles: std::collections::HashMap<&str, Option<String>> =
             std::collections::HashMap::new();
         for e in &self.nav_stack {
@@ -393,6 +413,14 @@ impl BrowserSession {
             self.nav_index = Some(current.saturating_sub(drop));
         } else {
             self.nav_index = Some(current);
+        }
+    }
+
+    /// Mark the next URL change as history travel to `index`. Cleared by the
+    /// matching URL (or the engine's canonical history event).
+    pub fn begin_history_travel(&mut self, index: usize) {
+        if self.nav_stack.get(index).is_some() {
+            self.history_travel_to = Some(index);
         }
     }
 
@@ -923,6 +951,39 @@ mod tests {
         let back: Vec<usize> = s.back_entries().iter().map(|(i, _)| *i).collect();
         assert_eq!(back, vec![1, 0]);
         assert!(s.forward_entries().is_empty());
+    }
+
+    #[test]
+    fn history_travel_jump_preserves_forward_tail() {
+        let mut s = BrowserSession::default();
+        for host in ["a", "b", "c", "d"] {
+            s.begin_load(format!("https://{host}.test/"));
+        }
+        assert_eq!(s.nav_current(), Some(3));
+        // Selector jump back to a (index 0): multi-step traversal keeps the
+        // forward tail instead of pushing a new entry.
+        s.begin_history_travel(0);
+        s.note_url("https://a.test/".to_string());
+        assert_eq!(s.nav_current(), Some(0));
+        assert_eq!(s.nav_len(), 4);
+        assert_eq!(s.forward_entries().len(), 3);
+        // Jump forward to d (index 3): still no pruning.
+        s.begin_history_travel(3);
+        s.note_url("https://d.test/".to_string());
+        assert_eq!(s.nav_current(), Some(3));
+        assert_eq!(s.nav_len(), 4);
+        assert!(s.forward_entries().is_empty());
+        // A genuinely normal navigation from the middle still truncates.
+        s.begin_history_travel(2);
+        s.note_url("https://c.test/".to_string());
+        s.begin_load("https://e.test/".to_string());
+        assert_eq!(s.nav_current(), Some(3));
+        assert_eq!(s.nav_len(), 4);
+        assert_eq!(
+            s.nav_entry(3).map(|e| e.url.as_str()),
+            Some("https://e.test/")
+        );
+        assert!(!s.can_go_forward());
     }
 
     #[test]
