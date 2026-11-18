@@ -25,10 +25,10 @@ use embedder_traits::{
 use euclid::{Box2D, Point2D};
 
 use servo::{
-    CreateNewWebViewRequest, DevicePixel, DevicePoint, EventLoopWaker, LoadStatus, Opts,
-    RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext, UserContentManager,
-    UserScript, WebView, WebViewBuilder, WebViewDelegate, WebViewId, WebViewPoint, WheelDelta,
-    WheelEvent, WheelMode,
+    CreateNewWebViewRequest, DevicePixel, DevicePoint, DeviceVector2D, EventLoopWaker, LoadStatus,
+    Opts, RenderingContext, Scroll, Servo, ServoBuilder, SoftwareRenderingContext,
+    UserContentManager, UserScript, WebView, WebViewBuilder, WebViewDelegate, WebViewId,
+    WebViewPoint, WebViewVector,
 };
 
 use crate::browser::cursor::{FocusKind, Focusable};
@@ -1354,29 +1354,24 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
             } else {
                 (0.0, dy)
             };
-            // Wheel input, not the raw scroll command: this dispatches a
-            // real DOM `wheel` event and lets Servo's input pipeline apply
-            // the default scroll only when script does not prevent it. The
-            // direct `notify_scroll_event` path skips the page's own wheel
-            // handlers, which is the wrong layer for a browser.
-            // Send before borrowing the tab state: dispatch can synchronously
-            // run the handled callback, which needs the same RefCell.
-            let id = entry
-                .webview
-                .notify_input_event(InputEvent::Wheel(WheelEvent::new(
-                    WheelDelta {
-                        x: -dx as f64,
-                        y: -dy as f64,
-                        z: 0.0,
-                        mode: WheelMode::DeltaPixel,
-                    },
-                    WebViewPoint::Device(DevicePoint::new(x, y)),
-                )));
-            track_input(&entry.state, id, "wheel");
+            // Direct scroll command, not a wheel input event. The wheel
+            // path is DOM-correct but each event waits 40-80ms for script
+            // (`servo-input: wheel handled dt=…`) — far too slow for 60Hz
+            // pad scrolling, and it lets the tracked offset run a whole
+            // gesture ahead of the page. This API applies on the paint
+            // thread before the frame read.
+            //
+            // Scroll under the pad cursor, not viewport center: Servo routes
+            // to the innermost scroller under the point, so center-targeting
+            // stranded page scrolls inside carousels.
             let cmd_at = Instant::now();
             let mut state = entry.state.borrow_mut();
             note_scroll_activity(&mut state, cmd_at);
             state.last_scroll_cmd_at = Some(cmd_at);
+            entry.webview.notify_scroll_event(
+                Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(dx, dy))),
+                WebViewPoint::Device(DevicePoint::new(x, y)),
+            );
             // Servo reports document-relative bounds and never re-emits on
             // scroll: accumulate the commanded offset and re-emit translated
             // rects so outlines track the page. `try_send` + subscription
