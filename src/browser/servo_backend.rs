@@ -131,6 +131,13 @@ struct TabState {
     /// if a ping landed after the in-flight pull was dispatched, its truth
     /// is newer — the snapshot must not rebase backwards over it.
     ping_at: Option<Instant>,
+    /// Wall time of the latest scroll-affecting activity (commanded scroll
+    /// or a scroll ping). Pulls wait for this to go quiet: a snapshot's
+    /// synchronous geometry pass blocks the page's script thread for up to
+    /// a second, so scroll input queued behind it lands as one visible
+    /// jump — and its older scroll reading then yanks the tracked offset
+    /// back (the 0 <-> N blip).
+    last_scroll_at: Option<Instant>,
     /// Monotonic loop counter: proves at least one full tick elapsed.
     spin_seq: u64,
     /// Armed mouse-up completing the previous synthetic click. Down goes
@@ -217,6 +224,7 @@ impl TabState {
             dom_rx: Some(dom_rx),
             dom_epoch: 0,
             ping_at: None,
+            last_scroll_at: None,
             spin_seq: 0,
             pending_click_up: None,
             last_pull_at: None,
@@ -588,22 +596,47 @@ impl WebViewDelegate for Delegate {
         // surviving nodes' verdicts valid — new nodes miss the cache and
         // compute fresh. Unknown tags (incl. pre-taxonomy `mo`) bump:
         // safe default.
+        let ev = ping_event(&url);
+        let truth = parse_ping_scroll(&url);
+        let now = Instant::now();
+        // Scroll-only pings carry no structural change: rects are
+        // document-space, so a scroll never needs a geometry pass. Marking
+        // them dirty used to start a full pull 250ms into every gesture; on
+        // heavy pages that synchronous pass blocks the script thread for
+        // ~1s, so the scrolls queued behind it land as one visible jump.
+        // Real mutations (`mc`/`ma`) and unknown tags still re-query, but
+        // only once the gesture has gone quiet (see `maybe_pull_dom`).
+        let scroll_only = ev == "sc";
         {
             let mut state = entry.state.borrow_mut();
-            state.ping_at = Some(Instant::now());
-            if !(url.contains("ev=sc") || url.contains("ev=mc")) {
+            state.ping_at = Some(now);
+            if scroll_only {
+                state.last_scroll_at = Some(now);
+            }
+            if !(scroll_only || ev == "mc") {
                 state.dom_epoch = state.dom_epoch.wrapping_add(1);
             }
         }
-        mark_dom_dirty(&entry.state);
+        if !scroll_only {
+            mark_dom_dirty(&entry.state);
+        }
         // Window truth rides on the ping query: a nested-container scroll
         // leaves window.scroll unchanged, so correcting to it here instantly
         // reverts any commanded accumulation the inner scroller absorbed —
         // outlines stop tracking a scroll the page never made.
-        if let Some(truth) = parse_ping_scroll(&url) {
+        if let Some(truth) = truth {
             let mut state = entry.state.borrow_mut();
             note_scroll_truth(&mut state.scroll_max, truth);
+            let before = state.scroll;
             rebase_scroll(&mut state, truth);
+            // Every scroll ping logs its truth (page-scroll trace); other
+            // pings only when they actually move the tracked offset.
+            if scroll_only || state.scroll != before {
+                crate::platform::app_log::info(format!(
+                    "servo-dom: ping tab{} ev={ev} truth=({:.0},{:.0}) tracked=({:.0},{:.0})",
+                    state.tab.0, truth.0, truth.1, before.0, before.1
+                ));
+            }
         }
         let response = url
             .parse()
@@ -705,8 +738,49 @@ struct DomEntry {
 }
 
 /// Completed DOM query from the page: poll sequence, dispatch time (for
-/// pull round-trip logging), plus the raw JS value or the evaluation error.
-type DomIngest = (u64, Instant, Result<JSValue, String>);
+/// pull round-trip logging), the tracked scroll at dispatch (stale-truth
+/// guard), plus the raw JS value or the evaluation error.
+type DomIngest = (u64, Instant, (f32, f32), Result<JSValue, String>);
+
+/// What to do with a completed snapshot's in-page scroll reading. The read
+/// happens inside the query; commands or pings that land while it is in
+/// flight make the tracked offset newer than that reading, and applying the
+/// older value yanks the page overlay (the 0 <-> N blip).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Rebase {
+    /// Nothing moved since dispatch: the snapshot's reading is current.
+    Apply,
+    /// A scroll ping landed after dispatch and already rebased to newer truth.
+    SkipPing,
+    /// The tracked offset moved after dispatch (commanded scroll, cursor
+    /// reseed, another correction). The reading is stale by definition.
+    SkipScroll,
+}
+
+impl Rebase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Apply => "apply",
+            Self::SkipPing => "skip:ping",
+            Self::SkipScroll => "skip:scroll",
+        }
+    }
+}
+
+fn rebase_decision(
+    ping_at: Option<Instant>,
+    dispatched: Instant,
+    live: (f32, f32),
+    at_dispatch: (f32, f32),
+) -> Rebase {
+    if ping_at.is_some_and(|t| t > dispatched) {
+        Rebase::SkipPing
+    } else if live != at_dispatch {
+        Rebase::SkipScroll
+    } else {
+        Rebase::Apply
+    }
+}
 
 /// Cursor travel that re-seeds the cursor-culled set: past this distance
 /// from the last pull center, the live set no longer covers the cursor.
@@ -1088,6 +1162,7 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
             // Scroll under the pad cursor, not viewport center: Servo routes
             // to the innermost scroller under the point, so center-targeting
             // stranded page scrolls inside carousels.
+            state.last_scroll_at = Some(Instant::now());
             entry.webview.notify_scroll_event(
                 Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(dx, dy))),
                 WebViewPoint::Device(DevicePoint::new(x, y)),
@@ -1547,6 +1622,7 @@ fn clear_tree(state: &mut TabState) {
     state.dom_ping = false;
     state.last_pull_at = None;
     state.last_pull_rtt_ms = 0;
+    state.last_scroll_at = None;
     // Truth bound resets with the document (see `scroll_max`).
     state.scroll_max = (0.0, 0.0);
     // Stale probe reply can never match this document; re-armed per load.
@@ -1606,11 +1682,22 @@ fn clamp_scroll(
 /// mid-reflow pulls self-correct via the next ping.
 const DOM_SETTLE: Duration = Duration::from_millis(250);
 
+/// After scroll activity, hold pulls until the gesture has been quiet this
+/// long. A snapshot's synchronous geometry pass blocks the page's script
+/// thread for up to a second; running it mid-gesture queues the user's
+/// scroll behind the pass, and the page then lands as one visible jump.
+const DOM_SCROLL_QUIET: Duration = Duration::from_millis(400);
+
+/// Hard cap on the scroll-quiet hold: a page with a continuously animating
+/// scroller must still refresh its targets eventually.
+const DOM_SCROLL_QUIET_MAX: Duration = Duration::from_secs(3);
+
 /// Pull the page for its actionable elements (see `browser::dom`). Purely
 /// event-driven — no timers: fires for a pending boot (fresh document or
 /// load settle) or a settled dirty ping from the in-page observers
-/// (console/fetch/sendBeacon, ORed into one flag). Skipped while suspended
-/// or with a pull in flight (5s timeout unsticks it).
+/// (console/fetch/sendBeacon, ORed into one flag). Skipped while suspended,
+/// with a pull in flight (5s timeout unsticks it), or while a scroll
+/// gesture is still active.
 fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<TabState>>, global: &Rc<RefCell<Global>>) {
     let now = Instant::now();
     let fire = {
@@ -1635,6 +1722,21 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<TabState>>, global: &Rc
                 .dom_dirty_at
                 .is_some_and(|t| now.saturating_duration_since(t) >= DOM_SETTLE);
         if !boot && !settled {
+            return;
+        }
+        // Never measure geometry mid-scroll: the pass blocks the page's
+        // script thread and the queued scroll lands as one jump. The dirty
+        // flag and timestamp survive, so the refresh fires once the gesture
+        // goes quiet. Boot pulls are exempt (a fresh document needs its
+        // first snapshot promptly).
+        if !boot
+            && state
+                .last_scroll_at
+                .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET)
+            && state
+                .last_pull_at
+                .is_some_and(|t| now.saturating_duration_since(t) < DOM_SCROLL_QUIET_MAX)
+        {
             return;
         }
         // Adaptive cooldown: never pull sooner than the last round-trip
@@ -1693,7 +1795,12 @@ fn maybe_pull_dom(webview: &WebView, shared: &Rc<RefCell<TabState>>, global: &Rc
         tab.0, scroll.0, scroll.1
     ));
     webview.evaluate_javascript(script, move |result| {
-        let _ = tx.send((seq, dispatched, result.map_err(|e| format!("{e:?}"))));
+        let _ = tx.send((
+            seq,
+            dispatched,
+            scroll,
+            result.map_err(|e| format!("{e:?}")),
+        ));
     });
 }
 
@@ -1706,7 +1813,7 @@ fn drain_dom_results(shared: &Rc<RefCell<TabState>>) {
             .dom_rx
             .as_mut()
             .and_then(|rx| rx.try_recv().ok());
-        let Some((seq, dispatched, result)) = msg else {
+        let Some((seq, dispatched, scroll_at_dispatch, result)) = msg else {
             return;
         };
         let mut state = shared.borrow_mut();
@@ -1717,13 +1824,15 @@ fn drain_dom_results(shared: &Rc<RefCell<TabState>>) {
         state.dom_in_flight_at = None;
         let rtt = dispatched.elapsed().as_millis();
         state.last_pull_rtt_ms = rtt.min(u64::MAX as u128) as u64;
-        // A ping that landed after this pull was dispatched carries newer
-        // scroll truth (already applied by its handler): re-running the
-        // snapshot's older truth backwards over it is the overscroll jitter.
-        let skip_rebase = state.ping_at.is_some_and(|t| t > dispatched);
+        // The query's scroll read and box pass ran in the page while the
+        // tracked offset was free to move (commanded scroll, cursor reseed,
+        // ping correction). Applying that older reading yanks the overlay
+        // backwards — the 0 <-> N blip. Pings also carry newer truth and
+        // already applied it.
+        let rebase = rebase_decision(state.ping_at, dispatched, state.scroll, scroll_at_dispatch);
         match result {
             Ok(value) => {
-                ingest_dom(&mut state, &value, rtt, skip_rebase);
+                ingest_dom(&mut state, &value, rtt, rebase);
                 emit_tree(&mut state);
             }
             Err(err) => {
@@ -1890,21 +1999,16 @@ fn flush_pending_up(webview: &WebView, shared: &Rc<RefCell<TabState>>) {
     }
 }
 
-/// Merge one DOM snapshot into the live set. Rects arrive viewport-relative;
-/// document space is viewport plus the tracked offset (pulls fire on
-/// settle, so measure and offset agree). The tracked offset then rebases by
-/// the snapshot truth's *delta from current* — never to an absolute value:
-/// an absolute rebase would clobber commanded scrolls that landed while the
-/// round-trip was in flight, yanking every outline backward (the overscroll
-/// jitter). A stale truth can still win one round when commands interleave
-/// the flight window, but those same commands already marked dirty, so the
-/// next pull corrects it. Absent nodes accumulate misses and drop at
+/// Merge one DOM snapshot into the live set. Rects arrive viewport-relative
+/// and are translated to document space with the snapshot's own scroll
+/// reading, so a skipped rebase still merges the right document positions.
+/// The tracked offset rebases to the snapshot truth only when nothing moved
+/// it after dispatch ([`Rebase::Apply`]): an in-flight command or ping
+/// makes that reading stale, and applying it yanks every outline backwards
+/// (the 0 <-> N blip). Absent nodes accumulate misses and drop at
 /// [`DOM_MISSED_LIMIT`] (re-render flicker reads as one miss, real removals
-/// as two in a row). `skip_rebase` arrives from the drain path when a ping
-/// landed after this pull was dispatched: that ping's truth is newer and
-/// already applied, so the snapshot's older truth must not yank outlines
-/// backwards.
-fn ingest_dom(state: &mut TabState, value: &JSValue, rtt_ms: u128, skip_rebase: bool) {
+/// as two in a row).
+fn ingest_dom(state: &mut TabState, value: &JSValue, rtt_ms: u128, rebase: Rebase) {
     use std::collections::HashSet;
     let snap = parse_dom_snapshot(value);
     // The snapshot's own truth counts as observed even when the rebase is
@@ -1915,18 +2019,12 @@ fn ingest_dom(state: &mut TabState, value: &JSValue, rtt_ms: u128, skip_rebase: 
     // the snapshot's own truth so stale-box reports can separate "snapshot
     // measured old truth" from "rebase yanked backwards".
     let pre_scroll = state.scroll;
-    // Truth delta vs current: heals unapplied commands (edge clamping the
-    // page ignored) and history-restored offsets alike. Origin-pinned;
-    // never upper-clamped (extent can lag truth). Skipped when a ping landed
-    // after this pull was dispatched — that truth is newer and already
-    // applied; re-applying the snapshot's older truth would yank every
-    // outline backwards (the overscroll jitter).
-    if !skip_rebase {
-        let dx = (snap.scroll.0 - state.scroll.0).max(-state.scroll.0);
-        let dy = (snap.scroll.1 - state.scroll.1).max(-state.scroll.1);
-        if dx != 0.0 || dy != 0.0 {
-            rebase_scroll(state, (state.scroll.0 + dx, state.scroll.1 + dy));
-        }
+    // Truth wins only when it is still current. Heals unapplied commands
+    // (edge clamping the page ignored) and history-restored offsets alike.
+    // `rebase_scroll` is origin-pinned and never upper-clamped (extent can
+    // lag truth).
+    if rebase == Rebase::Apply {
+        rebase_scroll(state, snap.scroll);
     }
     // Document dims bound scroll clamping (the live set only spans
     // viewport+margin after culling, so entry corners can't). Grow-only per
@@ -2074,7 +2172,7 @@ fn ingest_dom(state: &mut TabState, value: &JSValue, rtt_ms: u128, skip_rebase: 
     crate::platform::app_log::info(format!(
         "servo-dom: ingested fresh={fresh} dropped={dropped} retained={retained} live={} total={total} culled={culled} skip={skipped:?} boxA={box_anchors} boxKid={box_kids} boxAWrap={box_wraps} boxAEmpty={box_empty} forced={forced} hid={hid} clip={clip} t={timings:?} rtt={rtt_ms}ms rb={} snap=({:.0},{:.0}) trk=({:.0},{:.0})",
         state.dom.len(),
-        if skip_rebase { "skip" } else { "apply" },
+        rebase.label(),
         snap.scroll.0,
         snap.scroll.1,
         pre_scroll.0,
@@ -2174,6 +2272,19 @@ fn favicon_rgba(image: &embedder_traits::Image) -> Option<(u32, u32, Vec<u8>)> {
 /// Parse the window-truth coordinates off a dirty-ping URL (`?wx=&wy=`).
 /// `None` when absent or malformed — the ping still dirties, it just
 /// carries no correction.
+/// Event tag from a DOM ping URL: `sc` (scroll only), `mc` (structural
+/// mutation), `ma` (attribute/visibility change). Missing or unknown tags
+/// default to `""`, which the caller treats as invalidating.
+fn ping_event(url: &str) -> &str {
+    let Some((_, query)) = url.split_once('?') else {
+        return "";
+    };
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("ev="))
+        .unwrap_or("")
+}
+
 fn parse_ping_scroll(url: &str) -> Option<(f32, f32)> {
     let parsed = url.parse::<url::Url>().ok()?;
     let mut wx = None;
@@ -2414,6 +2525,48 @@ mod tests {
         assert_eq!(
             parse_ping_scroll("http://sdsc.invalid/__SDSC_DOM_DIRTY?wx=3&wy=44&ev=mc"),
             Some((3.0, 44.0))
+        );
+    }
+
+    #[test]
+    fn ping_event_splits_scroll_from_mutations() {
+        let base = "http://sdsc.invalid/__SDSC_DOM_DIRTY?wx=0&wy=256";
+        assert_eq!(ping_event(&format!("{base}&ev=sc")), "sc");
+        assert_eq!(ping_event(&format!("{base}&ev=mc")), "mc");
+        assert_eq!(ping_event(&format!("{base}&ev=ma")), "ma");
+        // Missing or malformed tags fall back to the invalidating path.
+        assert_eq!(ping_event(base), "");
+        assert_eq!(ping_event("http://sdsc.invalid/ping"), "");
+    }
+
+    #[test]
+    fn stale_snapshot_never_rebases_over_newer_scroll() {
+        let now = Instant::now();
+        // Dispatch and drain with nothing moving: truth is current.
+        assert_eq!(
+            rebase_decision(None, now, (0.0, 256.0), (0.0, 256.0)),
+            Rebase::Apply
+        );
+        // The 0 <-> 256 blip: the query read 0, commands moved the tracked
+        // offset to 256 while it was in flight. Applying 0 would yank it.
+        assert_eq!(
+            rebase_decision(None, now, (0.0, 256.0), (0.0, 1.0)),
+            Rebase::SkipScroll
+        );
+        // A ping after dispatch already applied newer truth.
+        assert_eq!(
+            rebase_decision(
+                Some(now + Duration::from_millis(1)),
+                now,
+                (0.0, 256.0),
+                (0.0, 1.0)
+            ),
+            Rebase::SkipPing
+        );
+        // A ping at/before dispatch did not supersede the snapshot.
+        assert_eq!(
+            rebase_decision(Some(now), now, (0.0, 256.0), (0.0, 256.0)),
+            Rebase::Apply
         );
     }
 }
