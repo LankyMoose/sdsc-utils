@@ -224,6 +224,25 @@ impl Cursor {
     /// to jump targets (stick cancels). Attachment + `dock_blend`
     /// ease every tick, so the overlay never pops.
     pub fn advance(&mut self, lx: f32, ly: f32, dt_secs: f32, options: &[Focusable]) {
+        self.advance_with(lx, ly, dt_secs, options, false);
+    }
+
+    /// [`advance`](Self::advance) with the page-scroll flag. While the
+    /// scroll stick is active the dock is released and no new dock is
+    /// acquired: the cursor simply holds its viewport point while content
+    /// moves under it, and the normal neutral acquire pass re-docks in
+    /// place once the scroll stops.
+    pub fn advance_with(
+        &mut self,
+        lx: f32,
+        ly: f32,
+        dt_secs: f32,
+        options: &[Focusable],
+        scrolling: bool,
+    ) {
+        if scrolling {
+            self.attached = None;
+        }
         // D-pad flights glide to the target; stick input cancels back to
         // manual control.
         if self.fly_to.is_some() && (lx != 0.0 || ly != 0.0) {
@@ -324,7 +343,7 @@ impl Cursor {
         // once the gliding point actually reaches an element. The morph
         // state eases toward the attachment every tick — including neutral
         // ones — so shape, size, and position always interpolate.
-        if self.magnet {
+        if self.magnet && !scrolling {
             // Neutral ticks keep the point fixed (content scrolling under
             // it); a deflected stick still gets the magnetic centre snap.
             self.snap_with(options, lx != 0.0 || ly != 0.0);
@@ -1554,26 +1573,45 @@ mod tests {
     }
 
     #[test]
-    fn docked_point_holds_still_while_page_scrolls() {
+    fn scrolling_releases_dock_and_holds_the_viewport_point() {
         let mut c = Cursor::new();
         let items = [link(1, 100.0, 100.0)];
         c.x = 150.0;
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1));
-        // The element shifts under the point but still holds it: the point
-        // stays exactly at its viewport position.
-        let moved = [link(1, 100.0, 110.0)];
-        c.advance(0.0, 0.0, 0.016, &moved);
+        // Scrolling starts: the dock releases immediately and no new dock
+        // is acquired while the scroll stick is active. The point holds.
+        let replacement = [link(2, 100.0, 90.0)];
+        for _ in 0..10 {
+            c.advance_with(0.0, 0.0, 0.016, &replacement, true);
+            assert_eq!(c.attached, None, "no docking while scrolling");
+            assert_eq!((c.x, c.y), (150.0, 115.0), "viewport point held");
+        }
+        // Scroll stops: the neutral acquire pass docks in place.
+        c.advance(0.0, 0.0, 0.016, &replacement);
+        assert_eq!(c.attached, Some(2));
+        assert_eq!(
+            (c.x, c.y),
+            (150.0, 115.0),
+            "re-dock must not move the point"
+        );
+        assert_eq!(c.last_dock, Some((100.0, 90.0, 100.0, 30.0)));
+    }
+
+    #[test]
+    fn scrolling_never_acquires_a_fresh_dock() {
+        let mut c = Cursor::new();
+        let items = [link(1, 100.0, 100.0)];
+        c.x = 150.0;
+        c.y = 115.0;
+        c.advance_with(0.0, 0.0, 0.016, &items, true);
+        assert_eq!(c.attached, None);
+        assert_eq!((c.x, c.y), (150.0, 115.0));
+        // Once the stick is released the element under the point docks.
+        c.advance(0.0, 0.0, 0.016, &items);
         assert_eq!(c.attached, Some(1));
         assert_eq!((c.x, c.y), (150.0, 115.0));
-        // It scrolls away; a different element takes its place under the
-        // point. Re-dock in place — the viewport point never moves.
-        let replaced = [link(1, 100.0, 300.0), link(2, 100.0, 90.0)];
-        c.advance(0.0, 0.0, 0.016, &replaced);
-        assert_eq!(c.attached, Some(2));
-        assert_eq!((c.x, c.y), (150.0, 115.0), "viewport point persisted");
-        assert_eq!(c.last_dock, Some((100.0, 90.0, 100.0, 30.0)));
     }
 
     #[test]

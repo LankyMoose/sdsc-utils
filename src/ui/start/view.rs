@@ -1299,7 +1299,9 @@ impl BrowserPanel {
         #[cfg(debug_assertions)]
         let (bx, by) = (self.page.cursor.x, self.page.cursor.y);
         let cursor = &mut self.page.cursor;
-        cursor.advance(lx, ly, dt, &targets);
+        // Right stick drives page scroll; while it is active, skip docking
+        // entirely (the point holds still and content passes under it).
+        cursor.advance_with(lx, ly, dt, &targets, rx != 0.0 || ry != 0.0);
         #[cfg(debug_assertions)]
         {
             let after = self.page.cursor.attached;
