@@ -60,6 +60,26 @@ Predicted adapter was Vulkan on RTX 4070 SUPER (`alpha_composite=true`).
 
 Upstream: Cosmic / iced apps hit the same atlas `create_view` invalid pattern after GPU device faults (e.g. NVIDIA Xid) — device already dead, then atlas create panics.
 
+**Crash D (session `1794977648`, 2026-11-18, debug, user AFK):**
+same empty-atlas `create_view` signature, but the device was already lost
+*before* the window open:
+
+1. 18:01:57 — display sleep/lock. `iced_winit` logs hundreds of
+   `Error Other when presenting surface.` (surface lost; no panic yet).
+2. 18:24:09 — user returns and presses the **PS button**; the next window
+   renderer construction panics (`Renderer::new` → `create_renderer`,
+   `WindowManager::insert`) with
+   `Texture with 'iced_wgpu::image texture atlas' label is invalid`.
+3. `crash-restart: scheduled`, successor logs only
+   `starting session=…` and exits; no surviving process (separate
+   recovery gap — the successor may have hit the same dead device or lost
+   the single-instance race).
+
+The PS button is the trigger for the new window (Start open), not the
+cause: any new `create_renderer` after device loss constructs an atlas on
+the dead device. Unlike A/B/C, no toast was live and no cold-open race
+was involved; the surface-error burst before the panic is the tell.
+
 ## Repro matrix (manual)
 
 | Case | Expect |
@@ -68,8 +88,9 @@ Upstream: Cosmic / iced apps hit the same atlas `create_view` invalid pattern af
 | Connect → Start open → toast expires to Idle | Crash A path; watch `toast hide` / deferred hide |
 | Spam edit mode on/off | Should **not** panic (no new `create_renderer`) |
 | Open Settings while toast Resting | Another cold `create_renderer`; compare |
+| Display sleep/lock → wake → PS button (open Start) | Crash D: surface-error burst first (`Error Other when presenting surface`), then atlas `create_view` panic on the dead device |
 
-Debug grep: `wgpu-diag:`, `ui-diag: start cold open`, `start opened`, `toast hide`, `PANIC at`, `PANIC_BACKTRACE`, `create_renderer` (in backtrace).
+Debug grep: `wgpu-diag:`, `ui-diag: start cold open`, `start opened`, `toast hide`, `PANIC at`, `PANIC_BACKTRACE`, `create_renderer` (in backtrace), `presenting surface` (device-loss tell before D).
 
 ## Mitigations landed
 
