@@ -156,6 +156,9 @@ struct TabState {
     /// pulls skip the idle breather so interaction stays responsive; the
     /// page's own mutation pings do not.
     user_dirty: bool,
+    /// Wall time of the last frame written to the slot, for the SDSC_AX_DEBUG
+    /// frame trace (cadence + content hash vs tracked scroll).
+    last_frame_at: Option<Instant>,
     /// Per-window document token from the install script. A mismatch means
     /// the document was replaced without a Navigate/history event (same-URL
     /// reload); that ingest resets the tree. A spurious `Complete` (Servo
@@ -253,6 +256,7 @@ impl TabState {
             scroll_hot_since: None,
             pending_scroll_truth: None,
             user_dirty: false,
+            last_frame_at: None,
             doc_token: None,
             spin_seq: 0,
             pending_click_up: None,
@@ -350,13 +354,46 @@ impl WebViewDelegate for Delegate {
         let Some(entry) = entry else {
             return;
         };
+        let paint_start = Instant::now();
         webview.paint();
+        let paint_ms = paint_start.elapsed().as_millis();
         let (w, h) = self.global.borrow().size;
         let rect: Box2D<i32, DevicePixel> =
             Box2D::new(Point2D::new(0, 0), Point2D::new(w as i32, h as i32));
         let ctx = self.global.borrow().ctx.clone();
+        let read_start = Instant::now();
         if let Some(img) = ctx.read_to_image(rect) {
+            let read_ms = read_start.elapsed().as_millis();
             let (w, h) = (img.width(), img.height());
+            // Frame trace (SDSC_AX_DEBUG): content hash + tracked scroll per
+            // written frame. A hash that regresses while `scroll` advances is
+            // a stale frame, not a scroll-state change.
+            if entry.state.borrow().ax_debug {
+                let now = Instant::now();
+                let (tab, scroll, gap_ms) = {
+                    let mut state = entry.state.borrow_mut();
+                    let gap = state
+                        .last_frame_at
+                        .replace(now)
+                        .map_or(-1, |t| now.saturating_duration_since(t).as_millis() as i64);
+                    (state.tab, state.scroll, gap)
+                };
+                let hash =
+                    img.as_raw()
+                        .iter()
+                        .step_by(997)
+                        .fold(0xcbf2_9ce4_8422_2325u64, |acc, &b| {
+                            acc.wrapping_mul(0x0000_0100_0000_01b3)
+                                .wrapping_add(b as u64)
+                        });
+                crate::platform::app_log::info(format!(
+                    "servo-frame tab{} gen={} scroll=({:.0},{:.0}) hash={hash:016x} paint={paint_ms}ms read={read_ms}ms gap={gap_ms}ms {w}x{h}",
+                    tab.0,
+                    entry.frame.generation().wrapping_add(1),
+                    scroll.0,
+                    scroll.1
+                ));
+            }
             let mut global = self.global.borrow_mut();
             if !global.logged_first_frame {
                 global.logged_first_frame = true;
