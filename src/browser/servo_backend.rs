@@ -1345,7 +1345,6 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
             if !live {
                 return;
             }
-            let mut state = entry.state.borrow_mut();
             // Dominant axis only: a diagonal stick deflection must not leak
             // the minor axis into the wrong scroller (the carousel trap:
             // horizontal intent with slight vertical drift scrolls the
@@ -1360,11 +1359,8 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
             // the default scroll only when script does not prevent it. The
             // direct `notify_scroll_event` path skips the page's own wheel
             // handlers, which is the wrong layer for a browser.
-            let cmd_at = Instant::now();
-            note_scroll_activity(&mut state, cmd_at);
-            state.last_scroll_cmd_at = Some(cmd_at);
-            // Wheel deltas are the inverse of the scroll delta; positive
-            // wheel y scrolls the view up. Pad dy is the scroll offset delta.
+            // Send before borrowing the tab state: dispatch can synchronously
+            // run the handled callback, which needs the same RefCell.
             let id = entry
                 .webview
                 .notify_input_event(InputEvent::Wheel(WheelEvent::new(
@@ -1377,6 +1373,10 @@ fn apply_command(servo: &Servo, global: &Rc<RefCell<Global>>, command: EngineCom
                     WebViewPoint::Device(DevicePoint::new(x, y)),
                 )));
             track_input(&entry.state, id, "wheel");
+            let cmd_at = Instant::now();
+            let mut state = entry.state.borrow_mut();
+            note_scroll_activity(&mut state, cmd_at);
+            state.last_scroll_cmd_at = Some(cmd_at);
             // Servo reports document-relative bounds and never re-emits on
             // scroll: accumulate the commanded offset and re-emit translated
             // rects so outlines track the page. `try_send` + subscription
