@@ -1338,15 +1338,15 @@ impl BrowserPanel {
         self.analog_at = Some(now);
         // One continuous surface: page targets plus synthetic chrome.
         let targets = cursor_targets(&self.page.focusables, &self.chrome);
-        #[cfg(debug_assertions)]
+        // Docking transitions are rare and are the cursor's most surprising
+        // behavior (magnet centre snap, break-free kick); keep the trace in
+        // release too so user-marked nudges are diagnosable.
         let before = self.page.cursor.attached;
-        #[cfg(debug_assertions)]
         let (bx, by) = (self.page.cursor.x, self.page.cursor.y);
         let cursor = &mut self.page.cursor;
         // Right stick drives page scroll; while it is active, skip docking
         // entirely (the point holds still and content passes under it).
         cursor.advance_with(lx, ly, dt, &targets, rx != 0.0 || ry != 0.0);
-        #[cfg(debug_assertions)]
         {
             let after = self.page.cursor.attached;
             if before != after {
