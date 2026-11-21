@@ -53,6 +53,16 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   // Exact-element click map (`window.__sdsc_click`); rebuilt per pull so
   // detached nodes release.
   if (!S.byId) { S.byId = {}; }
+  if (!window.__sdsc_click) {
+    window.__sdsc_click = function(id) {
+      try {
+        var el = S.byId[id];
+        if (!el) return 'missing';
+        el.click();
+        return 'ok';
+      } catch (e) { return 'threw'; }
+    };
+  }
   function idFor(el) {
     var id = S.ids.get(el);
     if (id === undefined) { id = S.next++; S.ids.set(el, id); }

@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 const DOM_QUERY_MSG: &str = "sdsc.dom.query";
 const DOM_RESULT_MSG: &str = "sdsc.dom.result";
 const DOM_POLL: Duration = Duration::from_millis(350);
-const BROWSER_BG: u32 = 0xFF14_161C;
+const BROWSER_BG: u32 = 0xFFFF_FFFF;
 
 /// CEF is process-global; subprocess bootstrap and host init both need it.
 /// `None` = not attempted, `Some(true)` = live, `Some(false)` = retryable
@@ -397,6 +397,21 @@ cef::wrap_app! {
         }
         fn render_process_handler(&self) -> Option<RenderProcessHandler> {
             Some(self.render_process_handler.clone())
+        }
+        fn on_before_command_line_processing(
+            &self,
+            _process_type: Option<&CefString>,
+            command_line: Option<&mut CommandLine>,
+        ) {
+            let Some(cmd) = command_line else { return };
+            // Tight, controller-paced scrolling: Chromium's smooth-scroll
+            // easing makes every pad wheel tick feel laggy. sRGB keeps the
+            // OSR buffer in the same color space as the shader's sRGB texture.
+            cmd.append_switch(Some(&"disable-smooth-scrolling".into()));
+            cmd.append_switch_with_value(
+                Some(&"force-color-profile".into()),
+                Some(&"srgb".into()),
+            );
         }
     }
 }

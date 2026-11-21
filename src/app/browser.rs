@@ -6,7 +6,7 @@
 //! Behavior is unchanged — Start still renders the panel until the standalone
 //! Browser window lands. See `notes/browser-hub-pivot.md`.
 
-use crate::browser::engine::EngineHandle;
+use crate::browser::engine::{EngineCommand, EngineHandle};
 use crate::domain::pad::NavStepper;
 use crate::ui::browser::BrowserPanel;
 use std::path::PathBuf;
@@ -45,6 +45,10 @@ pub struct BrowserAppState {
     pub engine_available: bool,
     /// Runtime/install status for the optional engine package.
     pub engine_status: EngineStatus,
+    /// Accumulated analog scroll for the next BrowserFrame tick.
+    pub pending_scroll: (f32, f32),
+    /// Page point the pending scroll belongs to (cursor at accumulation).
+    pub pending_scroll_at: (f32, f32),
     /// Engine-mode D-pad cursor jumps run on this standalone stepper (fed a
     /// stickless `dpad_only` mask): the Start bank stays parked in engine
     /// mode so stick moves never double-fire into both cursor and nav.
@@ -193,7 +197,26 @@ impl super::App {
         self.browser_visible = true;
         crate::controller::hid::diag::diag_info(format!("ui-diag: browser opened id={id:?}"));
         self.sync_browser_viewport();
-        crate::ui::layout::focus_window(id)
+        // The monitor cover is logical pixels, but confirm the actual window
+        // size after creation: a DPI/fullscreen mismatch here is exactly what
+        // makes the cursor feel trapped in one quarter of the screen.
+        iced::window::size(id)
+            .map(Message::BrowserWindowSized)
+            .chain(crate::ui::layout::focus_window(id))
+    }
+
+    pub(crate) fn on_browser_window_sized(&mut self, size: iced::Size) -> Task<Message> {
+        let size = (size.width.max(1.0), size.height.max(1.0));
+        if self.browser_window_size == Some(size) {
+            return Task::none();
+        }
+        self.browser_window_size = Some(size);
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: browser window size {:.0}x{:.0}",
+            size.0, size.1
+        ));
+        self.sync_browser_viewport();
+        Task::none()
     }
 
     pub(crate) fn on_browser_frame(&mut self) -> Task<Message> {
@@ -202,6 +225,19 @@ impl super::App {
         }
         // Cursor glides and script-driven scroll still need one mouse sync
         // per paint even when no new pad edge arrived.
+        if let Some(engine) = &self.browser.engine {
+            let (dx, dy) = std::mem::take(&mut self.browser.pending_scroll);
+            if dx != 0.0 || dy != 0.0 {
+                let (x, y) = self.browser.pending_scroll_at;
+                engine.send(EngineCommand::ScrollBy {
+                    tab: self.browser_tab(),
+                    dx,
+                    dy,
+                    x,
+                    y,
+                });
+            }
+        }
         let sync = self.sync_browser_mouse();
         #[cfg(debug_assertions)]
         {
@@ -226,6 +262,12 @@ impl super::App {
         use crate::domain::pad::NavAction;
         if readings.is_empty() {
             return Task::none();
+        }
+        // PS is global: while Browser owns the pad it must still open the hub
+        // (the hub-open path routes PS to close once visible).
+        if self.hub_chord_fires(readings) {
+            crate::controller::hid::diag::diag_info("ui-diag: PS opens hub over Browser");
+            return self.toggle_hub();
         }
         let now = std::time::Instant::now();
         let history_open = self.browser.panel.history_selector.is_some();
@@ -534,6 +576,48 @@ impl super::App {
 
     #[cfg(not(feature = "cef-engine"))]
     pub(crate) fn start_engine_install(&mut self) -> Task<Message> {
+        self.hub_state.install_done(
+            false,
+            Some("This build has no browser engine support".to_string()),
+        );
+        Task::none()
+    }
+
+    #[cfg(feature = "cef-engine")]
+    pub(crate) fn start_engine_uninstall(&mut self) -> Task<Message> {
+        let EngineStatus::Ready(path) = &self.browser.engine_status else {
+            return Task::none();
+        };
+        let path = path.clone();
+        if crate::platform::packaged::is_packaged() {
+            let _ = crate::games::launch::launch_target("ms-settings:appsfeatures", "");
+            self.hub_state.install_done(
+                false,
+                Some("Remove Browser Engine in Windows Settings, then reopen the hub".to_string()),
+            );
+            return Task::none();
+        }
+        if let Some(engine) = self.browser.engine.take() {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            engine.send(EngineCommand::Shutdown { done: tx });
+        }
+        self.browser.engine_available = false;
+        self.browser.engine_status = EngineStatus::Missing;
+        match crate::browser::engine_install::uninstall_local(&path) {
+            Ok(()) => {
+                self.hub_state.install_done(false, None);
+                crate::platform::app_log::info("cef: BrowserEngine uninstalled");
+            }
+            Err(err) => {
+                crate::platform::app_log::warn(format!("cef: uninstall failed: {err}"));
+                self.hub_state.install_done(false, Some(err));
+            }
+        }
+        Task::none()
+    }
+
+    #[cfg(not(feature = "cef-engine"))]
+    pub(crate) fn start_engine_uninstall(&mut self) -> Task<Message> {
         self.hub_state.install_done(
             false,
             Some("This build has no browser engine support".to_string()),

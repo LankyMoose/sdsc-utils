@@ -51,6 +51,8 @@ pub enum HubMessage {
     CatalogClose,
     /// Install/retry the optional BrowserEngine package.
     InstallEngine,
+    /// Remove the locally installed BrowserEngine runtime.
+    UninstallEngine,
     /// Highlight a tile (hover/pad focus) without activating it.
     Select(usize),
     /// Mouse click: select and activate in one step.
@@ -81,6 +83,8 @@ pub struct State {
     pub installing: bool,
     /// Last install failure (user-facing).
     pub install_error: Option<String>,
+    /// Catalog focus: 0 = primary action, 1 = Back.
+    pub catalog_focus: usize,
 }
 
 impl Default for State {
@@ -95,6 +99,7 @@ impl Default for State {
             catalog_open: false,
             installing: false,
             install_error: None,
+            catalog_focus: 0,
         }
     }
 }
@@ -147,6 +152,18 @@ impl State {
     pub fn open_catalog(&mut self) {
         self.catalog_open = true;
         self.install_error = None;
+        self.catalog_focus = 0;
+    }
+
+    pub fn catalog_move(&mut self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+        self.catalog_focus = if delta > 0 { 1 } else { 0 };
+    }
+
+    pub fn catalog_primary_is_back(&self) -> bool {
+        self.catalog_focus == 1
     }
 
     pub fn close_catalog(&mut self) {
@@ -260,28 +277,41 @@ fn catalog_view(state: &State) -> Element<'_, HubMessage> {
     } else {
         theme::MUTED
     };
-    let mut action = button(
-        text(if state.engine_ready {
-            "Installed"
-        } else if state.installing {
-            "Installing…"
+    let primary_label = if state.installing {
+        "Installing…"
+    } else if state.engine_ready {
+        "Uninstall"
+    } else {
+        "Install"
+    };
+    let primary_focused = state.catalog_focus == 0;
+    let mut action = button(text(primary_label).size(13.0).color(theme::INK))
+        .padding([8, 18])
+        .style(move |theme_, status| {
+            if primary_focused {
+                theme::primary(theme_, status)
+            } else {
+                theme::chip(false)(theme_, status)
+            }
+        });
+    if !state.installing {
+        action = action.on_press(if state.engine_ready {
+            HubMessage::UninstallEngine
         } else {
-            "Install"
-        })
-        .size(13.0)
-        .color(theme::INK),
-    )
-    .padding([8, 18])
-    .style(|theme_, status| {
-        if state.engine_ready {
-            theme::chip(false)(theme_, status)
-        } else {
-            theme::primary(theme_, status)
-        }
-    });
-    if !state.engine_ready && !state.installing {
-        action = action.on_press(HubMessage::InstallEngine);
+            HubMessage::InstallEngine
+        });
     }
+    let back_focused = state.catalog_focus == 1;
+    let back = button(text("Back").size(13.0).color(theme::INK))
+        .padding([8, 14])
+        .on_press(HubMessage::CatalogClose)
+        .style(move |theme_, status| {
+            if back_focused {
+                theme::primary(theme_, status)
+            } else {
+                theme::chip(false)(theme_, status)
+            }
+        });
     let row = row![
         svg(svg::Handle::from_memory(svg_icon::GLOBE_SVG.as_bytes()))
             .width(Length::Fixed(24.0))
@@ -295,7 +325,7 @@ fn catalog_view(state: &State) -> Element<'_, HubMessage> {
         ]
         .spacing(2)
         .width(Fill),
-        action,
+        row![action, back].spacing(8),
     ]
     .spacing(12)
     .align_y(Alignment::Center);
@@ -319,7 +349,8 @@ fn catalog_view(state: &State) -> Element<'_, HubMessage> {
                 .color(theme::DIM),
             space().height(6),
             row![
-                hint("Cross", if state.engine_ready { "Close" } else { "Install" }),
+                hint("Cross", "Select"),
+                hint("D-pad", "Focus"),
                 hint("Circle", "Back"),
             ]
             .spacing(18),

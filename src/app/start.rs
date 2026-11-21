@@ -398,8 +398,8 @@ impl App {
     /// card layout. No-op when the computed page size is unchanged.
     pub(crate) fn sync_browser_viewport(&mut self) {
         let (sw, sh) = self
-            .browser_monitor_cover
-            .map(|c| (c.width, c.height))
+            .browser_window_size
+            .or_else(|| self.browser_monitor_cover.map(|c| (c.width, c.height)))
             .unwrap_or((1920.0, 1080.0));
         let (page_w, page_h) = crate::ui::browser::view::fullscreen_layout(sw, sh);
         if !self.browser.panel.set_viewport(page_w, page_h) {

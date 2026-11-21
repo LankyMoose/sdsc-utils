@@ -77,7 +77,7 @@ pub const BREAK_LATCH_GRACE_SECS: f32 = 0.3;
 /// Outward kick on break-free, px/s: immediate motion in the push direction.
 pub const BREAK_KICK: f32 = 800.0;
 /// Right-stick scroll speed at full deflection, px/s.
-pub const SCROLL_SPEED: f32 = 1500.0;
+pub const SCROLL_SPEED: f32 = 3200.0;
 /// Engine viewport the cursor space matches. The engine resizes its
 /// offscreen surface to the browser card's page area (16:9), so this is the
 /// startup/default size; live cursors carry their own `view_w/view_h`.

@@ -182,74 +182,6 @@ fn browser_cursor_overlay<'a>(
         .into()
 }
 
-/// Thin page scrollbar over the engine surface. The thumb follows the
-/// tracked scroll offset; a state blip moves it, a paint-only blip leaves it
-/// fixed — the requested paint-vs-state discriminator.
-fn browser_scrollbar(
-    panel: &BrowserPanel,
-    page_w: f32,
-    page_h: f32,
-) -> Element<'_, BrowserMessage> {
-    if !panel.session.has_frame() {
-        return space().into();
-    }
-    let track = (page_w - 10.0, 6.0, 6.0, (page_h - 12.0).max(1.0));
-    let Some((tx, ty, tw, th)) = scrollbar_thumb(
-        track,
-        panel.page_extent.1,
-        panel.viewport.1.max(1.0),
-        panel.scroll_offset.1,
-    ) else {
-        return space().into();
-    };
-    let track_layer = column![
-        space().height(Length::Fixed(track.1)),
-        row![
-            space().width(Length::Fixed(track.0)),
-            container(
-                space()
-                    .width(Length::Fixed(track.2))
-                    .height(Length::Fixed(track.3))
-            )
-            .style(crate::ui::theme::page_scrollbar_track),
-        ],
-    ]
-    .spacing(0);
-    let thumb_layer = column![
-        space().height(Length::Fixed(ty)),
-        row![
-            space().width(Length::Fixed(tx)),
-            container(space().width(Length::Fixed(tw)).height(Length::Fixed(th)))
-                .style(crate::ui::theme::page_scrollbar_thumb),
-        ],
-    ]
-    .spacing(0);
-    container(stack![track_layer, thumb_layer])
-        .width(Length::Fixed(page_w))
-        .height(Length::Fixed(page_h))
-        .clip(true)
-        .into()
-}
-
-/// Thumb rect for a vertical scrollbar: proportional length, top-aligned at
-/// origin, bottom-aligned at max scroll. A minimum length keeps the thumb
-/// visible on very long documents. `None` when the page fits.
-fn scrollbar_thumb(
-    track: (f32, f32, f32, f32),
-    content_h: f32,
-    viewport_h: f32,
-    scroll_y: f32,
-) -> Option<(f32, f32, f32, f32)> {
-    let (tx, ty, tw, th) = track;
-    if content_h <= viewport_h + 1.0 || th <= 0.0 || viewport_h <= 0.0 {
-        return None;
-    }
-    let thumb_h = (th * (viewport_h / content_h)).clamp(24.0, th);
-    let max_scroll = (content_h - viewport_h).max(1.0);
-    let t = (scroll_y / max_scroll).clamp(0.0, 1.0);
-    Some((tx, ty + (th - thumb_h) * t, tw, thumb_h))
-}
-
 /// Page surface: live engine pixels when a frame is present, reader text
 /// otherwise. The engine image is a fixed size (`img_w` wide) so the
 /// virtual cursor maps 1:1 with a uniform scale; pad scroll routes to the
@@ -764,7 +696,6 @@ pub fn browser_view<'a>(
         // status bar floats bottom-left over the page, Chrome-style.
         stack![
             browser_page_view(panel, engine_available, page_w, page_h),
-            browser_scrollbar(panel, page_w, page_h),
             browser_suggestions(panel),
             browser_bookmark_bubble(panel),
             browser_history_selector(panel),
@@ -817,26 +748,6 @@ mod tests {
         chrome_layout,
     };
     use std::time::{Duration, Instant};
-
-    #[test]
-    fn scrollbar_thumb_is_proportional_and_clamped() {
-        let track = (0.0, 0.0, 6.0, 100.0);
-        // Page fits: no thumb.
-        assert_eq!(scrollbar_thumb(track, 100.0, 100.0, 0.0), None);
-        // 4x content height: thumb is a quarter of the track at origin.
-        let (_, y, w, h) = scrollbar_thumb(track, 400.0, 100.0, 0.0).unwrap();
-        assert_eq!((y, w, h), (0.0, 6.0, 25.0));
-        // At max scroll the thumb sits at the bottom of the track.
-        let (_, y, _, _) = scrollbar_thumb(track, 400.0, 100.0, 300.0).unwrap();
-        assert!((y - 75.0).abs() < 0.01);
-        // Overscroll input clamps.
-        let (_, y, _, _) = scrollbar_thumb(track, 400.0, 100.0, 999.0).unwrap();
-        assert!((y - 75.0).abs() < 0.01);
-        // Very long document keeps a grabbable minimum thumb.
-        let (_, y, _, h) = scrollbar_thumb(track, 100_000.0, 100.0, 99_900.0).unwrap();
-        assert_eq!(h, 24.0);
-        assert!((y - 76.0).abs() < 0.01);
-    }
 
     fn docked_panel_on(target: ChromeTarget) -> BrowserPanel {
         let mut panel = BrowserPanel::default();

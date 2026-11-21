@@ -173,6 +173,48 @@ fn find_runtime_root(root: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Remove a locally installed engine. Files locked by the running CEF
+/// processes cannot be deleted until exit, so a marker schedules the removal
+/// for the next boot (before CEF initializes).
+pub fn uninstall_local(path: &Path) -> Result<(), String> {
+    let data = crate::persist::paths::data_dir();
+    if !path.starts_with(&data) {
+        return Err(
+            "This engine lives outside the app data folder; remove its cef folder manually"
+                .to_string(),
+        );
+    }
+    let marker = data.join("cef-engine.uninstall");
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(marker);
+            Ok(())
+        }
+        Err(_) => {
+            std::fs::write(&marker, path.to_string_lossy().as_bytes())
+                .map_err(|e| format!("schedule removal: {e}"))?;
+            Ok(())
+        }
+    }
+}
+
+/// Run before CEF initializes. Deletes a scheduled engine directory after the
+/// previous process released its DLLs.
+pub fn cleanup_pending_uninstall() {
+    let data = crate::persist::paths::data_dir();
+    let marker = data.join("cef-engine.uninstall");
+    if !marker.is_file() {
+        return;
+    }
+    if let Ok(raw) = std::fs::read_to_string(&marker) {
+        let path = PathBuf::from(raw.trim());
+        if path.starts_with(&data) {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+    let _ = std::fs::remove_file(marker);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

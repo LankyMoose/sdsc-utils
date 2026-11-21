@@ -266,7 +266,11 @@ impl App {
     pub(crate) fn on_hub_message(&mut self, message: hub_view::HubMessage) -> Task<Message> {
         match message {
             hub_view::HubMessage::Move(delta) => {
-                self.hub_state.move_selection(delta);
+                if self.hub_state.catalog_open {
+                    self.hub_state.catalog_move(delta);
+                } else {
+                    self.hub_state.move_selection(delta);
+                }
                 Task::none()
             }
             hub_view::HubMessage::Select(index) => {
@@ -286,9 +290,17 @@ impl App {
                 Task::none()
             }
             hub_view::HubMessage::InstallEngine => self.start_engine_install(),
+            hub_view::HubMessage::UninstallEngine => self.start_engine_uninstall(),
             hub_view::HubMessage::Confirm => {
                 if self.hub_state.catalog_open {
-                    self.start_engine_install()
+                    if self.hub_state.catalog_primary_is_back() {
+                        self.hub_state.close_catalog();
+                        Task::none()
+                    } else if self.browser.engine.is_some() {
+                        self.start_engine_uninstall()
+                    } else {
+                        self.start_engine_install()
+                    }
                 } else {
                     self.hub_activate()
                 }
@@ -397,7 +409,7 @@ impl App {
     /// Shared PS chord detector for the hub. Mirrors the Start-era toggle:
     /// a rising chord fires once, and the release gate swallows the sticky
     /// hold that opened the hub.
-    fn hub_chord_fires(&mut self, readings: &[start_input::NavReading]) -> bool {
+    pub(crate) fn hub_chord_fires(&mut self, readings: &[start_input::NavReading]) -> bool {
         let required = crate::ui::start::gesture::default_gesture();
         let chord_held = super::chord_held_on_any_pad(&required, readings);
         let now = Instant::now();

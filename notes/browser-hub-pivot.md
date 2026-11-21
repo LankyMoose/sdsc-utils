@@ -137,8 +137,9 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    optional package (runtime files under `cef\`). The engine resolver searches
    portable sidecars, the optional package, `LocalAppData`, then the debug
    build dir, and validates the required runtime files. Hub ＋ opens a catalog
-   card with Browser engine status/install; Browser on a missing engine opens
-   the catalog instead of a dead page. Dev install uses
+   card with Browser engine status/install/uninstall and controller focus
+   (D-pad primary/Back, Cross select); Browser on a missing engine opens the
+   catalog instead of a dead page. Dev install uses
    `SDSC_CEF_DLC_URL`/`SDSC_CEF_DLC_SHA256`, SHA-256 verification, and
    extraction to `LocalAppData`. Remaining: Store
    `RequestDownloadAndInstallStorePackagesAsync` wiring/product IDs,

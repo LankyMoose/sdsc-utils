@@ -174,6 +174,8 @@ pub enum Message {
     BrowserFrame,
     /// Optional BrowserEngine install/download finished.
     EngineInstallDone(Result<std::path::PathBuf, String>),
+    /// Browser window's actual logical size (post-create/resize).
+    BrowserWindowSized(iced::Size),
     /// PS hub window opened (focus it once the renderer exists).
     HubOpened(window::Id),
     /// Hub selection / activation from pad, keyboard, or mouse.
@@ -319,6 +321,7 @@ impl Message {
             | Message::StartFrame
             | Message::BrowserFrame
             | Message::EngineInstallDone(_)
+            | Message::BrowserWindowSized(_)
             | Message::StartArtEvent(_) => false,
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
@@ -495,6 +498,8 @@ pub struct App {
     browser_visible: bool,
     /// Monitor covered by the Browser window (stage size for its view).
     browser_monitor_cover: Option<MonitorCover>,
+    /// Actual logical window size reported by iced after creation/resize.
+    browser_window_size: Option<(f32, f32)>,
     /// Topmost PS app-switcher overlay (small, bottom-weighted).
     hub_window: Option<window::Id>,
     /// True while the hub is revealed; modal owner of pad input.
@@ -798,7 +803,10 @@ impl App {
             crate::browser::tabs::boot_url()
         };
         #[cfg(feature = "cef-engine")]
-        let browser_engine = crate::browser::cef_backend::spawn_engine(&boot_url, initial_page);
+        let browser_engine = {
+            crate::browser::engine_install::cleanup_pending_uninstall();
+            crate::browser::cef_backend::spawn_engine(&boot_url, initial_page)
+        };
         #[cfg(not(feature = "cef-engine"))]
         let browser_engine: Option<EngineHandle> = {
             // UI-only iteration build: no engine, no reader fallback.
@@ -877,6 +885,7 @@ impl App {
             browser_window: None,
             browser_visible: false,
             browser_monitor_cover: None,
+            browser_window_size: None,
             hub_window: None,
             hub_visible: false,
             hub_state: crate::ui::hub::State::default(),
@@ -1598,6 +1607,7 @@ impl App {
             Message::Browser(message) => self.on_browser_message(message),
             Message::BrowserFrame => self.on_browser_frame(),
             Message::EngineInstallDone(result) => self.on_engine_install_done(result),
+            Message::BrowserWindowSized(size) => self.on_browser_window_sized(size),
             Message::HubOpened(id) => self.on_hub_opened(id),
             Message::Hub(message) => self.on_hub_message(message),
 

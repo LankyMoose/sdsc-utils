@@ -60,6 +60,16 @@ window, the engine worker, DOM targets, or the CEF packaging path.
 
 ## Current input/UX contract (pad)
 
+- The analog scroll is accumulated and flushed once per `BrowserFrame`
+  instead of one wheel event per pad poll; Chromium's smooth-scroll easing is
+  disabled via `--disable-smooth-scrolling`. The custom iced scrollbar was
+  removed — Chromium owns the page scrollbar.
+- Docked clicks use `window.__sdsc_click`, defined by the DOM query itself
+  (the observer install script is gone). Precise/free clicks use trusted
+  synthetic events at the point.
+- `--force-color-profile=srgb` and a white `BrowserSettings.background_color`
+  keep the OSR buffer aligned with the sRGB texture and the browser canvas.
+
 PS opens the topmost hub over Start, Browser, or a game; while the hub is
 open it owns pad input and the app underneath is gated. Selecting Browser
 closes the hub and opens the standalone fullscreen Browser window. Browser
@@ -68,7 +78,8 @@ Start when it is visible.
 
 Input priority is **hub → Browser → Start**. The Browser window has its own
 pad bank (`BrowserAppState::nav`) and D-pad stepper; Start's bank no longer
-sees browser presses.
+sees browser presses. PS is checked in the Browser pad path too, so it opens
+the hub over Browser exactly like over Start.
 
 - Left stick moves the cursor with velocity + friction; magnet docks on
   arrival, centre-snaps on fresh acquisition, holds in place while scrolling.
