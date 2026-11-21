@@ -158,6 +158,7 @@ impl App {
             .chain(move_window(id, position))
             .chain(show_window(id))
             .chain(focus_window(id))
+            .chain(self.raise_toast_above_all())
     }
 
     pub(crate) fn close_popup(&mut self) -> Task<Message> {

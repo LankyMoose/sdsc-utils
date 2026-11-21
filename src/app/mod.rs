@@ -155,6 +155,7 @@ pub enum Message {
 
     WindowClosed(window::Id),
     WindowUnfocused(window::Id),
+    WindowFocused(window::Id),
 
     PopupOpened(window::Id),
     PlacePopup {
@@ -314,6 +315,7 @@ impl Message {
             Message::TrayLeftClick(_) => true,
             Message::WindowClosed(_)
             | Message::WindowUnfocused(_)
+            | Message::WindowFocused(_)
             | Message::PopupOpened(_)
             | Message::PlacePopup { .. }
             | Message::ConfigureOpened(_)
@@ -1176,6 +1178,7 @@ impl App {
             window::close_events().map(Message::WindowClosed),
             iced::event::listen_with(|event, _status, id| match event {
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
+                iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocused(id)),
                 iced::Event::Keyboard(keyboard::Event::KeyPressed {
                     key,
                     physical_key,
@@ -1415,8 +1418,18 @@ impl App {
         }
 
         if Some(window) == self.hub_window {
-            return crate::ui::hub::view(&self.hub_state, self.hub_stage.0, self.hub_stage.1)
+            let hub = crate::ui::hub::view(&self.hub_state, self.hub_stage.0, self.hub_stage.1)
                 .map(Message::Hub);
+            // Start hosts the toast card while its cover is up; the hub
+            // overwrites that window with the scrim, so draw the same card in
+            // the hub's full-screen window too. The HWND toast is hidden in
+            // this mode, so there is no duplicate.
+            if self.hub_stage.0 > crate::ui::hub::HUB_WIDTH + 1.0
+                && let Some(toast) = self.immersive_toast_overlay()
+            {
+                return stack![hub, toast].width(Fill).height(Fill).into();
+            }
+            return hub;
         }
 
         if Some(window) == self.start_window {
@@ -1595,6 +1608,7 @@ impl App {
 
             Message::WindowClosed(id) => self.on_window_closed(id),
             Message::WindowUnfocused(id) => self.on_window_unfocused(id),
+            Message::WindowFocused(id) => self.on_window_focused(id),
 
             Message::PopupOpened(id) => self.handle_popup_opened(id),
             Message::PlacePopup { id, scale, monitor } => {
@@ -1615,7 +1629,7 @@ impl App {
                         },
                     ));
                 }
-                task
+                task.chain(self.raise_toast_above_all())
             }
             Message::Configure(message) => self.on_configure_message(message),
             Message::BrowserOpened(id) => self.on_browser_opened(id),
@@ -1633,7 +1647,9 @@ impl App {
             Message::Hub(message) => self.on_hub_message(message),
 
             #[cfg(debug_assertions)]
-            Message::AmbientPreviewOpened(id) => focus_window(id),
+            Message::AmbientPreviewOpened(id) => {
+                focus_window(id).chain(self.raise_toast_above_all())
+            }
             #[cfg(debug_assertions)]
             Message::AmbientPreviewTick => {
                 crate::ui::ambient_preview::note_preview_tick();

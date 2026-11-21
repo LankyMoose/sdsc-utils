@@ -65,9 +65,10 @@ pub struct ToastPlacement {
 /// foreground. On Windows we apply `WS_EX_NOACTIVATE`, pin `HWND_TOPMOST`, and
 /// show with `SW_SHOWNOACTIVATE` instead.
 ///
-/// Callers that have the hub / Settings / popup open should then
-/// [`raise_window_topmost`] those windows so they sit above the toast in the
-/// topmost band and keep receiving presents (iced#3108 / #3320). Start is a
+/// Callers that have the hub / Settings / popup open should raise those
+/// windows (focus/refresh), then re-raise the toast with
+/// [`raise_toast_topmost`] so it stays visible above the hub's full-screen
+/// scrim without stealing focus.
 /// normal-level window and stays behind the toast by design.
 pub fn show_toast_without_activate<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     #[cfg(windows)]
@@ -177,8 +178,33 @@ pub fn set_toast_topmost<Message: Send + 'static>(id: window::Id) -> Task<Messag
     }
 }
 
-/// Raise an interactive UI window to the top of the topmost band (above toast).
-/// Used for popup/Settings and, last, the hub.
+/// Raise the non-activating toast to the top of the z-order without stealing
+/// focus from the hub or Settings underneath it.
+pub fn raise_toast_topmost<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+    #[cfg(windows)]
+    {
+        window::run(id, move |window| {
+            use window::raw_window_handle::RawWindowHandle;
+
+            let Ok(handle) = window.window_handle() else {
+                return;
+            };
+            let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
+                return;
+            };
+            host::set_no_activate(win32_handle.hwnd.get(), true);
+            host::raise_no_activate(win32_handle.hwnd.get());
+        })
+        .discard()
+    }
+    #[cfg(not(windows))]
+    {
+        window::set_level(id, window::Level::AlwaysOnTop)
+    }
+}
+
+/// Raise an interactive UI window to the top of the topmost band.
+/// The toast is raised after these windows so it stays on top.
 pub fn raise_window_topmost<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     #[cfg(windows)]
     {

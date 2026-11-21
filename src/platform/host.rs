@@ -71,6 +71,34 @@ pub fn focus(hwnd: isize) {
     }
 }
 
+/// Raise a window to the top of the z-order without activating it. Used for
+/// the non-activating toast so it can sit above the hub's full-screen scrim.
+pub fn raise_no_activate(hwnd: isize) {
+    #[cfg(windows)]
+    {
+        // SAFETY: same contract as [`show_window`]: opaque HWND from a
+        // `window::run` closure on the UI thread; `HWND_TOP` only reorders
+        // the window and `SWP_NOACTIVATE` keeps focus where it is.
+        unsafe {
+            crate::platform::win32::SetWindowPos(
+                hwnd,
+                crate::platform::win32::HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                crate::platform::win32::SWP_NOMOVE
+                    | crate::platform::win32::SWP_NOSIZE
+                    | crate::platform::win32::SWP_NOACTIVATE,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+    }
+}
+
 /// Pin (`topmost = true`) or unpin (`false`) a window in the topmost band
 /// without activating it and without moving or resizing it.
 pub fn set_topmost(hwnd: isize, topmost: bool) {

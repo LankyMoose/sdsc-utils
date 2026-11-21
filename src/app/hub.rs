@@ -185,7 +185,7 @@ impl App {
         if self.hub_visible
             && let Some(id) = self.hub_window
         {
-            return focus_window(id);
+            return focus_window(id).chain(self.sync_toast_zorder());
         }
         if self.hub_window.is_some() {
             // Close in flight; the next attempt can open once WindowClosed lands.
@@ -276,7 +276,9 @@ impl App {
         }
         self.hub_visible = true;
         crate::controller::hid::diag::diag_info(format!("ui-diag: hub opened id={id:?}"));
-        focus_window(id)
+        // Focusing the full-screen hub would otherwise cover a resting toast
+        // with its scrim; sync raises the shell, then the toast last.
+        focus_window(id).chain(self.sync_toast_zorder())
     }
 
     pub(crate) fn on_hub_message(&mut self, message: hub_view::HubMessage) -> Task<Message> {

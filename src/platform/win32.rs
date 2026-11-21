@@ -28,6 +28,7 @@ pub const WS_THICKFRAME: isize = 0x0004_0000;
 pub const WS_EX_NOACTIVATE: isize = 0x0800_0000;
 pub const SW_HIDE: i32 = 0;
 pub const SW_SHOWNOACTIVATE: i32 = 4;
+pub const HWND_TOP: isize = 0;
 pub const HWND_TOPMOST: isize = -1;
 pub const HWND_NOTOPMOST: isize = -2;
 pub const SWP_NOSIZE: u32 = 0x0001;

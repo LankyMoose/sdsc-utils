@@ -3,7 +3,7 @@
 **Status:** do-not-regress. **When to read:** toast/Start present starvation, wrong toast content, connect-open races. Index: [README.md](README.md).
 
 > **Hub pivot (phases 1–2):** Start and the standalone Browser window are
-> `Level::Normal`; the PS hub is the only shell surface above the toast.
+> `Level::Normal`. The toast is the topmost shell surface, above the hub.
 > `AfterToast::OpenStart` is now `OpenHub`, and auto-open targets the hub.
 > The history below explains why the toast band must stay intact.
 
@@ -13,13 +13,13 @@ iced multi-window present starvation: [iced#3108](https://github.com/iced-rs/ice
 
 **Do not demote** the toast to `HWND_NOTOPMOST` when the hub/Settings/popup are open — that puts the toast under Cursor.
 
-**Do not** raise the toast above Start every `ToastFrame` — that starves Start presents.
+**Do not** raise the toast every `ToastFrame` — that causes z-order churn/present starvation. Event-driven raises are fine (placement, Resting, shell open/focus).
 
-**Do (current):** keep toast `HWND_TOPMOST` (above Cursor); raise Settings/popup into the topmost band above the toast, and raise the hub **last** so it outranks everything. Start stays `Normal` and is deliberately *under* the toast; `gain_focus` the interactive window. The corner toast remains visible beside a centered Start, and the hub stays above both.
+**Do (current):** keep toast `HWND_TOPMOST` (above Cursor) and raise it **last** above every shell surface — hub, Settings, popup — with `HWND_TOP` + `SWP_NOACTIVATE` so focus stays on the shell. Raise/focus the shell first, then the toast. The hub's full-screen scrim would otherwise hide the toast. Start stays `Normal` and is under the toast. Do **not** raise the toast every frame; only on placement, shell open/focus, and Resting sync (same cadence as `RaiseInteractive`). The small toast card occludes only its own rect, so the full-screen hub keeps presenting.
 
 **Immersive cover:** the primary-monitor Start HWND occludes the toast HWND (and unowned `rfd` file dialogs). Do **not** raise the toast above Start (present starvation). While immersive, composite the same toast card into the Start window (`Float` overlay at cover-local slide pose); keep the toast HWND blank/hidden (no `show_toast_without_activate`, no `move_to`). Parent add/edit shortcut file dialogs to the Start HWND via `rfd::FileDialog::set_parent` so the picker opens above the cover.
 
-Debug grep: `ui-diag: place toast gen=`, `ui-diag: sync toast z-order (toast + raise UI)`, `ui-diag: immersive toast composite gen=`, `ui-diag: file dialog parent hwnd=`.
+Debug grep: `ui-diag: place toast gen=`, `ui-diag: sync toast z-order (toast above UI)`, `ui-diag: immersive toast composite gen=`, `ui-diag: file dialog parent hwnd=`.
 
 ## Queued toast wrong content (Windows)
 

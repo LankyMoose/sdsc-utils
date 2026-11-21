@@ -11,7 +11,7 @@ use crate::platform::crash_restart;
 use crate::session::notify::NotifyEvent;
 use crate::ui::layout::{
     focus_window, hide_toast, invalidate_toast, move_window, overlay_platform_specific,
-    raise_window_topmost, remount_toast_surface, set_toast_topmost, show_toast_without_activate,
+    raise_toast_topmost, raise_window_topmost, remount_toast_surface, show_toast_without_activate,
     slide_y, toast_local_in_cover, toast_placement,
 };
 use crate::ui::motion::MAX_FRAME_DT;
@@ -256,7 +256,9 @@ impl App {
             } => self.effect_toast_move(progress, dismissing),
             ToastEffect::OpenHub => self.effect_open_hub(),
             ToastEffect::Finished => self.effect_toast_finished(),
-            ToastEffect::RaiseInteractive { focus } => self.raise_interactive_ui_above_toast(focus),
+            ToastEffect::RaiseInteractive { focus } => self
+                .raise_shell_ui(focus)
+                .chain(self.raise_toast_above_all()),
         }
     }
 
@@ -366,25 +368,26 @@ impl App {
         Task::none()
     }
 
-    /// Raise interactive UI into the topmost band above the toast (last wins).
-    /// Toast stays TOPMOST vs Cursor; UI above toast keeps presents (iced#3320).
+    /// Raise interactive shell UI into the topmost band. The toast is raised
+    /// afterwards (see [`Self::raise_toast_above_all`]) so it sits above the
+    /// hub's full-screen scrim.
     /// Only called when the machine emits RaiseInteractive (Resting / settle).
     /// Hidden warm Start must not be raised — that resurfaced Start after close.
     /// Immersive cover occludes the toast HWND; see `immersive_toast_overlay`.
-    pub(crate) fn raise_interactive_ui_above_toast(&self, focus: bool) -> Task<Message> {
+    pub(crate) fn raise_shell_ui(&self, focus: bool) -> Task<Message> {
         let mut task = Task::none();
         if let Some(id) = self.popup_window {
             task = task.chain(raise_window_topmost(id));
         }
-        // Start is a normal-level app now: the toast intentionally floats
-        // above it (only the hub outranks the toast).
+        // Start is a normal-level app now: the toast floats above it. The
+        // toast is raised again after the shell surfaces below.
         if let Some(id) = self.configure_window {
             task = task.chain(raise_window_topmost(id));
         }
         if self.hub_visible
             && let Some(id) = self.hub_window
         {
-            // Raised last: the hub is the one surface above the toast band.
+            // Raised last among shell surfaces; the toast goes above it.
             task = task.chain(raise_window_topmost(id));
         }
         if focus {
@@ -394,19 +397,50 @@ impl App {
         }
     }
 
-    /// Re-assert toast topmost, then UI above it, after Settings / Start / popup
-    /// open or close — only while the toast is Resting (safe to share presents).
+    /// Re-assert toast topmost after Settings / Start / popup / hub open or
+    /// close. While the toast is Resting, shell UI is raised first; the toast
+    /// is always raised last so it stays visible above every shell surface.
     pub(crate) fn sync_toast_zorder(&self) -> Task<Message> {
+        if self.toast_window.is_none() || self.toast_message.is_none() {
+            return Task::none();
+        }
+        let mut task = Task::none();
+        if self.toast_machine.is_resting() {
+            crate::controller::hid::diag::diag_info("ui-diag: sync toast z-order (toast above UI)");
+            task = self.raise_shell_ui(true);
+        }
+        task.chain(self.raise_toast_above_all())
+    }
+
+    /// A topmost shell was focused: activation can lift the hub/Settings/
+    /// popup above a non-activating toast, so re-raise the toast without
+    /// stealing focus back. Normal-level Start/Browser cannot cover a
+    /// topmost toast, so they are ignored.
+    pub(crate) fn on_window_focused(&self, id: window::Id) -> Task<Message> {
+        let topmost_shell = Some(id) == self.hub_window
+            || Some(id) == self.configure_window
+            || Some(id) == self.popup_window;
+        #[cfg(debug_assertions)]
+        let topmost_shell = topmost_shell || Some(id) == self.preview_window;
+        if topmost_shell {
+            self.raise_toast_above_all()
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Put the toast at the top of the z-order without activating it, so it
+    /// renders above the hub's full-screen scrim. No-op with no toast.
+    pub(crate) fn raise_toast_above_all(&self) -> Task<Message> {
         let Some(id) = self.toast_window else {
             return Task::none();
         };
-        if self.toast_message.is_none() || !self.toast_machine.is_resting() {
+        // Immersive Start (and a hub over it) composites the card; the HWND
+        // stays blank, so raising it would only put an empty window topmost.
+        if self.toast_message.is_none() || self.immersive_hosts_toast() {
             return Task::none();
         }
-        crate::controller::hid::diag::diag_info("ui-diag: sync toast z-order (toast + raise UI)");
-        window::set_level(id, window::Level::AlwaysOnTop)
-            .chain(set_toast_topmost(id))
-            .chain(self.raise_interactive_ui_above_toast(true))
+        window::set_level(id, window::Level::AlwaysOnTop).chain(raise_toast_topmost(id))
     }
 
     pub(crate) fn handle_place_toast(&mut self, id: window::Id, generation: u64) -> Task<Message> {
@@ -444,14 +478,11 @@ impl App {
                 .chain(show_toast_without_activate(id))
                 .chain(invalidate_toast(id));
         }
-        // The hub outranks the toast even during the slide-in, before the
-        // resting RaiseInteractive tick.
-        if self.hub_visible
-            && let Some(hub) = self.hub_window
-        {
-            place = place.chain(raise_window_topmost(hub));
-        }
-        place.chain(Task::done(Message::ToastShown { generation }))
+        // The toast stays above the shell (including the hub's full-screen
+        // scrim) from the first slide-in frame; no focus theft.
+        place
+            .chain(self.raise_toast_above_all())
+            .chain(Task::done(Message::ToastShown { generation }))
     }
 
     pub(crate) fn handle_toast_frame(&mut self) -> Task<Message> {
