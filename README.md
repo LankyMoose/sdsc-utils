@@ -146,6 +146,10 @@ The emulator is compiled into every non-release build, so there is no flag to pa
 
 Developer controls need no flag: they are compiled into every non-release build.
 
+Install/update QA: `python scripts/install_qa_web.py --open` serves a local
+version-feed mock, portable install/launch controls, and the CEF DLC zip — see
+[`notes/install-qa.md`](notes/install-qa.md).
+
 ## Windows notes
 
 - Release builds use the Windows subsystem (no console window for the tray app).

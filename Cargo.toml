@@ -32,6 +32,9 @@ path = "src/bin/gen_msix_logos.rs"
 # never falls back to a reader/text page.
 default = ["cef-engine"]
 cef-engine = ["dep:cef"]
+# QA builds may point the release-check and engine DLC at a local mock feed.
+# Never enabled in normal release/Store builds.
+qa-feed = []
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.24.2", default-features = false }

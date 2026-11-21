@@ -34,6 +34,8 @@ pub const HWND_NOTOPMOST: isize = -2;
 pub const SWP_NOSIZE: u32 = 0x0001;
 pub const SWP_NOMOVE: u32 = 0x0002;
 pub const SWP_NOACTIVATE: u32 = 0x0010;
+/// Disable DWM open/close/minimize transitions for a window.
+pub const DWMWA_TRANSITIONS_FORCEDISABLED: u32 = 3;
 pub const SWP_FRAMECHANGED: u32 = 0x0020;
 pub const RDW_INVALIDATE: u32 = 0x0001;
 pub const RDW_ERASE: u32 = 0x0004;
@@ -159,6 +161,16 @@ pub unsafe fn invalidate_hwnd(hwnd: isize) {
             RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN,
         );
     }
+}
+
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    pub fn DwmSetWindowAttribute(
+        hwnd: isize,
+        attribute: u32,
+        value: *const core::ffi::c_void,
+        value_size: u32,
+    ) -> i32;
 }
 
 #[link(name = "user32")]

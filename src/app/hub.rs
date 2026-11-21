@@ -161,7 +161,7 @@ use super::{App, Message};
 use crate::browser::keys::RawKey;
 use crate::ui::hub as hub_view;
 use crate::ui::layout::{
-    MonitorCover, focus_window, open_visible, overlay_platform_specific, primary_monitor_cover,
+    MonitorCover, focus_window, overlay_platform_specific, primary_monitor_cover,
 };
 use crate::ui::start::gesture::ChordReleaseTick;
 use crate::ui::start::input as start_input;
@@ -203,6 +203,7 @@ impl App {
         // clear color instead of the desktop.
         self.hub_stage = (cover.width, cover.height);
         self.hub_monitor_cover = Some(cover);
+        self.hub_pending_show = true;
         let window_size = Size::new(cover.width, cover.height);
         let window_position = window::Position::Specific(Point::new(cover.x, cover.y));
         self.refresh_engine_status();
@@ -215,7 +216,10 @@ impl App {
         let (id, open) = window::open(window::Settings {
             size: window_size,
             position: window_position,
-            visible: open_visible(),
+            // Hidden until the final cover size is configured and DWM
+            // transitions are disabled; showing earlier lets Windows animate
+            // the create-time default size into the full-screen rect.
+            visible: false,
             transparent: crate::ui::chrome::transparent_windows(),
             resizable: false,
             decorations: false,
@@ -229,21 +233,18 @@ impl App {
         self.hub_visible = true;
         self.session.auto_open_pending = false;
         crate::controller::hid::diag::diag_info("ui-diag: hub open");
-        // The hub composites the toast card; keep the HWND hidden so it
-        // cannot sit above the scrim as a blank transparent window.
-        let hide_toast = if self.toast_message.is_some() {
-            self.toast_window
-                .map(crate::ui::layout::hide_toast)
-                .unwrap_or_else(Task::none)
-        } else {
-            Task::none()
-        };
-        hide_toast.chain(open.map(Message::HubOpened))
+        open.map(Message::HubOpened)
+            .chain(crate::ui::layout::disable_window_transitions(id))
+            .chain(Task::perform(
+                super::delay(std::time::Duration::from_millis(250)),
+                move |()| Message::WindowShowFallback(id),
+            ))
     }
 
     /// Hide the hub and return focus to Start when it is the app underneath.
     pub(crate) fn close_hub(&mut self) -> Task<Message> {
         self.hub_visible = false;
+        self.hub_pending_show = false;
         let Some(id) = self.hub_window.take() else {
             return self.rehost_toast_after_composite();
         };
@@ -272,60 +273,146 @@ impl App {
         }
         self.hub_visible = true;
         crate::controller::hid::diag::diag_info(format!("ui-diag: hub opened id={id:?}"));
-        // Focusing the full-screen hub would otherwise cover a resting toast
-        // with its scrim; sync raises the shell, then the toast last.
-        focus_window(id).chain(self.sync_toast_zorder())
+        Task::none()
+    }
+
+    pub(crate) fn on_hub_window_sized(&mut self, size: iced::Size) -> Task<Message> {
+        let Some(cover) = self.hub_monitor_cover else {
+            return Task::none();
+        };
+        if (size.width - cover.width).abs() > 1.0 || (size.height - cover.height).abs() > 1.0 {
+            return Task::none();
+        }
+        self.hub_stage = (size.width, size.height);
+        Task::none()
+    }
+
+    pub(crate) fn on_hub_show_fallback(&mut self) -> Task<Message> {
+        self.show_hub_now()
+    }
+
+    fn show_hub_now(&mut self) -> Task<Message> {
+        if !self.hub_pending_show {
+            return Task::none();
+        }
+        let Some(id) = self.hub_window else {
+            return Task::none();
+        };
+        self.hub_pending_show = false;
+        // The hub composites the toast card; keep the HWND hidden so it
+        // cannot sit above the scrim as a blank transparent window.
+        let hide_toast = if self.toast_message.is_some() {
+            self.toast_window
+                .map(crate::ui::layout::hide_toast)
+                .unwrap_or_else(Task::none)
+        } else {
+            Task::none()
+        };
+        hide_toast
+            .chain(crate::ui::layout::show_window(id))
+            .chain(focus_window(id))
+            .chain(self.sync_toast_zorder())
     }
 
     pub(crate) fn on_hub_message(&mut self, message: hub_view::HubMessage) -> Task<Message> {
+        use hub_view::HubMessage;
         match message {
-            hub_view::HubMessage::Move(delta) => {
-                if self.hub_state.catalog_open {
-                    self.hub_state.catalog_move(delta);
+            HubMessage::Move(delta) => {
+                if self.hub_state.apps_info.is_some() {
+                    // Info owns the screen until dismissed.
+                } else if self.hub_state.apps_menu.is_some() {
+                    self.hub_state.apps_menu_move(delta);
+                } else if self.hub_state.apps_open {
+                    self.hub_state.apps_move(delta);
                 } else {
                     self.hub_state.move_selection(delta);
                 }
                 Task::none()
             }
-            hub_view::HubMessage::Select(index) => {
-                self.hub_state.select(index);
+            HubMessage::AppsOpen => {
+                self.hub_state.open_apps();
                 Task::none()
             }
-            hub_view::HubMessage::Activate(index) => {
+            HubMessage::AppsClose => {
+                self.hub_state.close_apps();
+                Task::none()
+            }
+            HubMessage::Activate(index) => {
                 self.hub_state.select(index);
                 self.hub_activate()
             }
-            hub_view::HubMessage::CatalogOpen => {
-                self.hub_state.open_catalog();
+            HubMessage::AppsMenuOpen(index) => {
+                self.hub_state.open_apps_menu(index);
                 Task::none()
             }
-            hub_view::HubMessage::CatalogClose => {
-                self.hub_state.close_catalog();
+            HubMessage::AppsMenuMove(delta) => {
+                self.hub_state.apps_menu_move(delta);
                 Task::none()
             }
-            hub_view::HubMessage::InstallEngine => self.start_engine_install(),
-            hub_view::HubMessage::UninstallEngine => self.start_engine_uninstall(),
-            hub_view::HubMessage::Confirm => {
-                if self.hub_state.catalog_open {
-                    if self.hub_state.catalog_primary_is_back() {
-                        self.hub_state.close_catalog();
-                        Task::none()
-                    } else if self.browser.engine.is_some() {
-                        self.start_engine_uninstall()
-                    } else {
-                        self.start_engine_install()
-                    }
+            HubMessage::AppsMenuConfirm => self.apps_menu_confirm(),
+            HubMessage::AppsMenuAction(action) => self.apps_menu_action(action),
+            HubMessage::AppsMenuClose => {
+                self.hub_state.close_apps_menu();
+                Task::none()
+            }
+            HubMessage::AppInfoClose => {
+                self.hub_state.close_app_info();
+                Task::none()
+            }
+            HubMessage::Confirm => {
+                if self.hub_state.apps_info.is_some() {
+                    self.hub_state.close_app_info();
+                    Task::none()
+                } else if self.hub_state.apps_menu.is_some() {
+                    self.apps_menu_confirm()
+                } else if self.hub_state.apps_open {
+                    let index = self.hub_state.apps_focus;
+                    self.hub_state.open_apps_menu(index);
+                    Task::none()
                 } else {
                     self.hub_activate()
                 }
             }
-            hub_view::HubMessage::Close => {
-                if self.hub_state.catalog_open {
-                    self.hub_state.close_catalog();
+            HubMessage::Close => {
+                if self.hub_state.apps_info.is_some() {
+                    self.hub_state.close_app_info();
+                    Task::none()
+                } else if self.hub_state.apps_menu.is_some() {
+                    self.hub_state.close_apps_menu();
+                    Task::none()
+                } else if self.hub_state.apps_open {
+                    self.hub_state.close_apps();
                     Task::none()
                 } else {
                     self.close_hub()
                 }
+            }
+        }
+    }
+
+    fn apps_menu_confirm(&mut self) -> Task<Message> {
+        let Some(action) = self.hub_state.apps_menu_action() else {
+            return Task::none();
+        };
+        self.apps_menu_action(action)
+    }
+
+    fn apps_menu_action(&mut self, action: hub_view::AppAction) -> Task<Message> {
+        let Some(index) = self.hub_state.apps_menu else {
+            return Task::none();
+        };
+        match action {
+            hub_view::AppAction::Install => {
+                self.hub_state.close_apps_menu();
+                self.start_engine_install()
+            }
+            hub_view::AppAction::Uninstall => {
+                self.hub_state.close_apps_menu();
+                self.start_engine_uninstall()
+            }
+            hub_view::AppAction::Info => {
+                self.hub_state.show_app_info(index);
+                Task::none()
             }
         }
     }
@@ -351,15 +438,15 @@ impl App {
                     crate::controller::hid::diag::diag_info(
                         "ui-diag: hub Browser requested but engine not installed",
                     );
-                    self.hub_state.open_catalog();
+                    self.hub_state.open_apps();
                     return Task::none();
                 }
                 crate::controller::hid::diag::diag_info("ui-diag: hub launch Browser");
                 self.close_hub().chain(self.open_browser_window())
             }
             hub_view::HubTile::AddApps => {
-                crate::controller::hid::diag::diag_info("ui-diag: hub catalog open");
-                self.hub_state.open_catalog();
+                crate::controller::hid::diag::diag_info("ui-diag: hub apps open");
+                self.hub_state.open_apps();
                 Task::none()
             }
         }

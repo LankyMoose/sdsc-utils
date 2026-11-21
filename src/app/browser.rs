@@ -160,11 +160,15 @@ impl super::App {
         self.browser.panel.cursor.reset_for_page();
         self.browser.panel.last_sent_mouse = None;
         self.browser_visible = true;
+        self.browser_pending_show = true;
         let was_open = self.browser.panel.session.is_open();
         let (id, open) = iced::window::open(iced::window::Settings {
             size: cover.size(),
             position: iced::window::Position::Specific(cover.origin()),
-            visible: crate::ui::layout::open_visible(),
+            // Hidden until the final cover size is configured and DWM
+            // transitions are disabled; showing earlier lets Windows animate
+            // the create-time default size into the full-screen rect.
+            visible: false,
             // The 16:9 card sits over a dimmed desktop; the root view draws
             // the scrim on backends that can composite alpha.
             transparent: crate::ui::chrome::transparent_windows(),
@@ -192,7 +196,13 @@ impl super::App {
             // Fresh surface: open the tab strip (restore) or home.
             opened.chain(self.open_browser_session())
         };
-        close_start.chain(opened)
+        close_start
+            .chain(crate::ui::layout::disable_window_transitions(id))
+            .chain(opened)
+            .chain(Task::perform(
+                super::delay(std::time::Duration::from_millis(250)),
+                move |()| Message::WindowShowFallback(id),
+            ))
     }
 
     /// Close the standalone Browser window and suspend its engine (cached
@@ -201,6 +211,7 @@ impl super::App {
         self.browser_visible = false;
         self.browser_monitor_cover = None;
         self.browser_window_size = None;
+        self.browser_pending_show = false;
         let task = self.close_browser_surface();
         let Some(id) = self.browser_window.take() else {
             return task;
@@ -250,7 +261,23 @@ impl super::App {
         // can race creation and report the pre-fullscreen default, which
         // would briefly shrink the cursor space (the quarter-screen bug).
         self.sync_browser_viewport();
-        crate::ui::layout::focus_window(id)
+        Task::none()
+    }
+
+    /// Show the hidden Browser window after the DWM transition task has run
+    /// and the surface has had a moment to settle at the cover size. Showing
+    /// immediately lets Windows animate the create-time default size into the
+    /// fullscreen rect (the visible "scale" on open).
+    pub(crate) fn on_browser_show_fallback(&mut self) -> Task<Message> {
+        if !self.browser_pending_show {
+            return Task::none();
+        }
+        self.browser_pending_show = false;
+        let Some(id) = self.browser_window else {
+            return Task::none();
+        };
+        self.sync_browser_viewport();
+        crate::ui::layout::show_window(id).chain(crate::ui::layout::focus_window(id))
     }
 
     pub(crate) fn on_browser_window_sized(&mut self, size: iced::Size) -> Task<Message> {

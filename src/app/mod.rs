@@ -175,11 +175,11 @@ pub enum Message {
     BrowserFrame,
     /// Optional BrowserEngine install/download finished.
     EngineInstallDone(Result<std::path::PathBuf, String>),
-    /// A window resized (logical size). Only the browser window consumes
-    /// this. The event is authoritative; iced's `size()` query can return the
-    /// pre-fullscreen default (observed 1440x789 on a 1920x1080 window), so
-    /// the browser does not trust a one-shot query at creation.
-    BrowserWindowSized(window::Id, iced::Size),
+    /// A window resized (logical size). The browser and hub consume this;
+    /// the event is authoritative for their final full-cover size.
+    WindowSized(window::Id, iced::Size),
+    /// Safety net for a hidden window whose final resize never arrives.
+    WindowShowFallback(window::Id),
     /// PS hub window opened (focus it once the renderer exists).
     HubOpened(window::Id),
     /// Hub selection / activation from pad, keyboard, or mouse.
@@ -326,7 +326,8 @@ impl Message {
             | Message::StartFrame
             | Message::BrowserFrame
             | Message::EngineInstallDone(_)
-            | Message::BrowserWindowSized(_, _)
+            | Message::WindowSized(_, _)
+            | Message::WindowShowFallback(_)
             | Message::StartArtEvent(_) => false,
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
@@ -505,6 +506,9 @@ pub struct App {
     browser_monitor_cover: Option<MonitorCover>,
     /// Actual logical window size reported by iced after creation/resize.
     browser_window_size: Option<(f32, f32)>,
+    /// Browser HWND is created hidden until its final size + DWM transition
+    /// setup; then it is shown so no create-time scale animation is visible.
+    browser_pending_show: bool,
     /// Topmost PS app-switcher overlay: a full-screen dim scrim with the
     /// card centered in it.
     hub_window: Option<window::Id>,
@@ -512,6 +516,9 @@ pub struct App {
     hub_visible: bool,
     /// Actual logical size of the hub window (always the monitor cover).
     hub_stage: (f32, f32),
+    /// Hub HWND is created hidden until its final size + DWM transition
+    /// setup; then it is shown.
+    hub_pending_show: bool,
     /// Monitor covered by the hub window (toast composite pose).
     hub_monitor_cover: Option<MonitorCover>,
     hub_state: crate::ui::hub::State,
@@ -901,9 +908,11 @@ impl App {
             browser_visible: false,
             browser_monitor_cover: None,
             browser_window_size: None,
+            browser_pending_show: false,
             hub_window: None,
             hub_visible: false,
             hub_stage: (crate::ui::hub::HUB_WIDTH, crate::ui::hub::HUB_HEIGHT),
+            hub_pending_show: false,
             hub_monitor_cover: None,
             hub_state: crate::ui::hub::State::default(),
             start_close_armed: false,
@@ -1254,7 +1263,7 @@ impl App {
         );
         subscriptions.push(Subscription::run(tray_events_mapped));
         subscriptions
-            .push(window::resize_events().map(|(id, size)| Message::BrowserWindowSized(id, size)));
+            .push(window::resize_events().map(|(id, size)| Message::WindowSized(id, size)));
         // OS device arrival/removal wake (event-driven; the Tick timer above
         // is only a backstop). Always subscribed like tray events: the stream
         // owns its watcher registration for the process lifetime.
@@ -1644,9 +1653,20 @@ impl App {
             Message::Browser(message) => self.on_browser_message(message),
             Message::BrowserFrame => self.on_browser_frame(),
             Message::EngineInstallDone(result) => self.on_engine_install_done(result),
-            Message::BrowserWindowSized(id, size) => {
+            Message::WindowSized(id, size) => {
                 if self.browser_window == Some(id) {
                     self.on_browser_window_sized(size)
+                } else if self.hub_window == Some(id) {
+                    self.on_hub_window_sized(size)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::WindowShowFallback(id) => {
+                if self.browser_window == Some(id) {
+                    self.on_browser_show_fallback()
+                } else if self.hub_window == Some(id) {
+                    self.on_hub_show_fallback()
                 } else {
                     Task::none()
                 }

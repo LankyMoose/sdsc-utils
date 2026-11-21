@@ -64,8 +64,11 @@ pub fn resolve_engine_dir() -> Option<std::path::PathBuf> {
     candidates.push(crate::persist::paths::data_dir().join("cef-engine"));
     // Build-time distribution directory. It exists on the build machine
     // (including `cargo run --release`); portable/Store installs resolve via
-    // the sidecar/package paths above instead.
-    if let Some(dir) = cef::sys::get_cef_dir() {
+    // the sidecar/package paths above instead. QA launches set
+    // `SDSC_CEF_NO_BUILD_FALLBACK` to simulate a clean machine.
+    let build_fallback = !(cfg!(any(debug_assertions, feature = "qa-feed"))
+        && std::env::var_os("SDSC_CEF_NO_BUILD_FALLBACK").is_some());
+    if build_fallback && let Some(dir) = cef::sys::get_cef_dir() {
         candidates.push(dir);
     }
     candidates

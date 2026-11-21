@@ -22,9 +22,11 @@ use std::time::Instant;
 pub const HUB_WIDTH: f32 = 620.0;
 pub const HUB_HEIGHT: f32 = 220.0;
 
-const TILE_H: f32 = 124.0;
-const TILE_GAP: f32 = 12.0;
-const ICON: f32 = 48.0;
+const TILE_H: f32 = 112.0;
+const TILE_GAP: f32 = 8.0;
+const ICON: f32 = 44.0;
+const APP_TILE_H: f32 = 128.0;
+const APP_ICON: f32 = 48.0;
 
 /// Stable tile identity. The order in [`TILES`] is the render/selection
 /// order; message handlers match on identity, never on an index captured in
@@ -43,20 +45,72 @@ pub const TILES: [HubTile; 3] = [HubTile::Start, HubTile::Browser, HubTile::AddA
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HubMessage {
     Move(i32),
-    /// Open the app catalog / engine installer.
-    CatalogOpen,
-    /// Back out of the catalog to the app tiles.
-    CatalogClose,
-    /// Install/retry the optional BrowserEngine package.
-    InstallEngine,
-    /// Remove the locally installed BrowserEngine runtime.
-    UninstallEngine,
-    /// Highlight a tile (hover/pad focus) without activating it.
-    Select(usize),
-    /// Mouse click: select and activate in one step.
+    /// Open the apps management screen.
+    AppsOpen,
+    /// Back out of the apps screen.
+    AppsClose,
+    /// Mouse click: select and activate a hub tile in one step.
     Activate(usize),
+    /// Open the per-app action menu (tile X / Cross on an app).
+    AppsMenuOpen(usize),
+    AppsMenuMove(i32),
+    AppsMenuConfirm,
+    AppsMenuAction(AppAction),
+    AppsMenuClose,
+    AppInfoClose,
     Confirm,
     Close,
+}
+
+/// One entry on the apps management screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubApp {
+    Start,
+    Browser,
+}
+
+pub const APPS: [HubApp; 2] = [HubApp::Start, HubApp::Browser];
+
+impl HubApp {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Start => "Start",
+            Self::Browser => "Browser",
+        }
+    }
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Start => svg_icon::GAME_SVG,
+            Self::Browser => svg_icon::GLOBE_SVG,
+        }
+    }
+}
+
+/// A row in the per-app action popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppAction {
+    Install,
+    Uninstall,
+    Info,
+}
+
+impl AppAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Install => "Install",
+            Self::Uninstall => "Uninstall",
+            Self::Info => "Info",
+        }
+    }
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Install => svg_icon::DOWNLOAD_SVG,
+            Self::Uninstall => svg_icon::TRASH_SVG,
+            Self::Info => svg_icon::INFO_SVG,
+        }
+    }
 }
 
 /// Hub render/input state. Selection is an index into [`TILES`]; activation
@@ -67,22 +121,26 @@ pub struct State {
     /// Whether the Start tile is enabled in prefs. Disabled tiles still show
     /// (stable layout) but Confirm is a no-op.
     pub start_enabled: bool,
-    /// Engine worker live. Drives the Browser tile subtitle; the tile stays
-    /// visible either way.
+    /// Engine worker live. Drives the Browser tile state.
     pub engine_ready: bool,
     /// D-pad/stick repeat for hub movement.
     nav: crate::domain::pad::NavStepper,
     /// Face-button rising-edge latches (Cross confirm, Circle close).
     pub prev_cross: bool,
     pub prev_circle: bool,
-    /// Catalog/install card replaces the tile row while open.
-    pub catalog_open: bool,
+    /// Apps management screen replaces the tile row while open.
+    pub apps_open: bool,
+    /// App entry under the focus ring.
+    pub apps_focus: usize,
+    /// Per-app action popup: app index + focused action.
+    pub apps_menu: Option<usize>,
+    pub apps_menu_focus: usize,
+    /// Info popup: app index.
+    pub apps_info: Option<usize>,
     /// Engine install/download in flight.
     pub installing: bool,
     /// Last install failure (user-facing).
     pub install_error: Option<String>,
-    /// Catalog focus: 0 = primary action, 1 = Back.
-    pub catalog_focus: usize,
 }
 
 impl Default for State {
@@ -94,10 +152,13 @@ impl Default for State {
             nav: crate::domain::pad::NavStepper::default(),
             prev_cross: false,
             prev_circle: false,
-            catalog_open: false,
+            apps_open: false,
+            apps_focus: 0,
+            apps_menu: None,
+            apps_menu_focus: 0,
+            apps_info: None,
             installing: false,
             install_error: None,
-            catalog_focus: 0,
         }
     }
 }
@@ -143,30 +204,121 @@ impl State {
         self.nav = crate::domain::pad::NavStepper::default();
         self.prev_cross = false;
         self.prev_circle = false;
-        self.catalog_open = false;
+        self.apps_open = false;
+        self.apps_menu = None;
+        self.apps_info = None;
         self.install_error = None;
     }
 
-    pub fn open_catalog(&mut self) {
-        self.catalog_open = true;
+    pub fn open_apps(&mut self) {
+        self.apps_open = true;
+        self.apps_focus = 0;
+        self.apps_menu = None;
+        self.apps_info = None;
         self.install_error = None;
-        self.catalog_focus = 0;
     }
 
-    pub fn catalog_move(&mut self, delta: i32) {
+    pub fn close_apps(&mut self) {
+        self.apps_open = false;
+        self.apps_menu = None;
+        self.apps_info = None;
+        self.install_error = None;
+    }
+
+    pub fn apps_focus_app(&self) -> HubApp {
+        APPS[self.apps_focus.min(APPS.len() - 1)]
+    }
+
+    pub fn apps_move(&mut self, delta: i32) {
         if delta == 0 {
             return;
         }
-        self.catalog_focus = if delta > 0 { 1 } else { 0 };
+        let len = APPS.len() as i32;
+        self.apps_focus = (self.apps_focus as i32 + delta).rem_euclid(len) as usize;
     }
 
-    pub fn catalog_primary_is_back(&self) -> bool {
-        self.catalog_focus == 1
+    pub fn select_app(&mut self, index: usize) {
+        if index < APPS.len() {
+            self.apps_focus = index;
+        }
     }
 
-    pub fn close_catalog(&mut self) {
-        self.catalog_open = false;
-        self.install_error = None;
+    pub fn open_apps_menu(&mut self, index: usize) {
+        if index >= APPS.len() {
+            return;
+        }
+        self.apps_focus = index;
+        self.apps_menu = Some(index);
+        self.apps_menu_focus = 0;
+        self.apps_info = None;
+    }
+
+    pub fn close_apps_menu(&mut self) {
+        self.apps_menu = None;
+    }
+
+    pub fn app_actions(&self, index: usize) -> Vec<AppAction> {
+        match APPS.get(index).copied() {
+            Some(HubApp::Start) => vec![AppAction::Info],
+            Some(HubApp::Browser) => {
+                if self.installing {
+                    vec![AppAction::Info]
+                } else if self.engine_ready {
+                    vec![AppAction::Uninstall, AppAction::Info]
+                } else {
+                    vec![AppAction::Install, AppAction::Info]
+                }
+            }
+            None => Vec::new(),
+        }
+    }
+
+    pub fn apps_menu_actions(&self) -> Vec<AppAction> {
+        self.apps_menu
+            .map(|i| self.app_actions(i))
+            .unwrap_or_default()
+    }
+
+    pub fn apps_menu_action(&self) -> Option<AppAction> {
+        self.apps_menu_actions().get(self.apps_menu_focus).copied()
+    }
+
+    pub fn apps_menu_move(&mut self, delta: i32) {
+        let len = self.apps_menu_actions().len() as i32;
+        if delta == 0 || len == 0 {
+            return;
+        }
+        self.apps_menu_focus = (self.apps_menu_focus as i32 + delta).rem_euclid(len) as usize;
+    }
+
+    pub fn show_app_info(&mut self, index: usize) {
+        if index >= APPS.len() {
+            return;
+        }
+        self.apps_focus = index;
+        self.apps_info = Some(index);
+        self.apps_menu = None;
+    }
+
+    pub fn close_app_info(&mut self) {
+        self.apps_info = None;
+    }
+
+    pub fn app_dimmed(&self, app: HubApp) -> bool {
+        match app {
+            HubApp::Start => !self.start_enabled,
+            HubApp::Browser => !self.engine_ready,
+        }
+    }
+
+    pub fn app_status(&self, app: HubApp) -> &'static str {
+        match app {
+            HubApp::Start if self.start_enabled => "Built in",
+            HubApp::Start => "Disabled",
+            HubApp::Browser if self.installing => "Installing…",
+            HubApp::Browser if self.engine_ready => "Installed",
+            HubApp::Browser => "Not installed",
+        }
     }
 
     pub fn set_installing(&mut self, installing: bool) {
@@ -215,39 +367,20 @@ impl State {
 /// Render the hub card. The window root is transparent; the card is the only
 /// opaque surface.
 pub fn view(state: &State, stage_w: f32, stage_h: f32) -> Element<'_, HubMessage> {
-    if state.catalog_open {
-        return catalog_view(state, stage_w, stage_h);
+    if state.apps_open {
+        return apps_view(state, stage_w, stage_h);
     }
-    let card_w = (stage_w - 48.0).clamp(360.0, HUB_WIDTH - 24.0);
-    let inner_w = card_w - 32.0;
-    let tile_w = ((inner_w - 2.0 * TILE_GAP) / 3.0).max(112.0);
+    let card_w = (stage_w - 32.0).clamp(340.0, HUB_WIDTH - 24.0);
+    let inner_w = card_w - 24.0;
+    let tile_w = ((inner_w - 2.0 * TILE_GAP) / 3.0).max(104.0);
     let mut tiles = row![].spacing(TILE_GAP).align_y(Alignment::Center);
     for (i, tile) in TILES.into_iter().enumerate() {
         tiles = tiles.push(tile_button(state, tile, i, tile_w));
     }
-    let header = row![
-        text("Apps")
-            .size(theme::type_scale::META)
-            .color(theme::MUTED),
-        space().width(Fill),
-        icon_button(
-            svg_icon::CLOSE_SVG,
-            18.0,
-            40.0,
-            theme::MUTED,
-            false,
-            Some(HubMessage::Close),
-        ),
-    ]
-    .align_y(Alignment::Center);
-    let card = container(
-        column![header, space().height(10), tiles,]
-            .spacing(0)
-            .align_x(Alignment::Center),
-    )
-    .padding(16)
-    .width(Length::Fixed(card_w))
-    .style(card_style);
+    let card = container(tiles)
+        .padding(12)
+        .width(Length::Fixed(card_w))
+        .style(card_style);
     frame(card.into(), stage_w, stage_h)
 }
 
@@ -267,106 +400,44 @@ fn frame<'a>(
         .into()
 }
 
-fn catalog_view(state: &State, stage_w: f32, stage_h: f32) -> Element<'_, HubMessage> {
-    let card_w = (stage_w - 48.0).clamp(360.0, 560.0);
-    let back_focused = state.catalog_focus == 1;
+fn apps_view(state: &State, stage_w: f32, stage_h: f32) -> Element<'_, HubMessage> {
+    let card_w = (stage_w - 48.0).clamp(360.0, 480.0);
+    let inner_w = card_w - 24.0;
+    let app_w = ((inner_w - 8.0) / 2.0).max(150.0);
     let back = icon_button(
         svg_icon::CHEVRON_LEFT_SVG,
         22.0,
-        44.0,
+        40.0,
         theme::INK,
-        back_focused,
-        Some(HubMessage::CatalogClose),
+        false,
+        Some(HubMessage::AppsClose),
     );
-    let primary_focused = state.catalog_focus == 0;
-    let (primary_icon, primary_color, primary_message) = if state.installing {
-        (svg_icon::SPINNER_SVG, theme::MUTED, None)
-    } else if state.engine_ready {
-        (
-            svg_icon::TRASH_SVG,
-            theme::INK,
-            Some(HubMessage::UninstallEngine),
-        )
-    } else {
-        (
-            svg_icon::DOWNLOAD_SVG,
-            if state.install_error.is_some() {
-                theme::WARNING
-            } else {
-                theme::INK
-            },
-            Some(HubMessage::InstallEngine),
-        )
-    };
-    let action = icon_button(
-        primary_icon,
-        28.0,
-        52.0,
-        primary_color,
-        primary_focused,
-        primary_message,
-    );
-    let mut title = row![
-        svg(svg::Handle::from_memory(svg_icon::GLOBE_SVG.as_bytes()))
-            .width(Length::Fixed(34.0))
-            .height(Length::Fixed(34.0))
-            .style(|_theme, _status| svg::Style {
-                color: Some(theme::INK)
-            }),
-        text("Browser engine")
-            .size(theme::type_scale::HEADING)
-            .color(theme::INK),
-    ]
-    .spacing(12)
-    .align_y(Alignment::Center);
-    let status_icon = if state.installing {
-        Some((svg_icon::SPINNER_SVG, theme::MUTED))
-    } else if state.engine_ready {
-        Some((svg_icon::CHECK_SVG, theme::SUCCESS))
-    } else {
-        None
-    };
-    if let Some((icon, color)) = status_icon {
-        title = title.push(
-            svg(svg::Handle::from_memory(icon.as_bytes()))
-                .width(Length::Fixed(18.0))
-                .height(Length::Fixed(18.0))
-                .style(move |_theme, _status| svg::Style { color: Some(color) }),
-        );
+    let mut grid = row![].spacing(8).align_y(Alignment::Center);
+    for (i, app) in APPS.into_iter().enumerate() {
+        grid = grid.push(app_tile(state, app, i, app_w));
     }
     let card = container(
-        row![back, title, space().width(Fill), action]
-            .spacing(16)
-            .align_y(Alignment::Center),
+        column![row![back, space().width(Fill)], space().height(8), grid,]
+            .spacing(0)
+            .align_x(Alignment::Center),
     )
-    .padding(20)
+    .padding(12)
     .width(Length::Fixed(card_w))
     .style(card_style);
-    frame(card.into(), stage_w, stage_h)
-}
-
-/// Compact icon-only button for close/back/install actions.
-fn icon_button<'a>(
-    icon: &'static str,
-    icon_size: f32,
-    box_size: f32,
-    color: Color,
-    focused: bool,
-    on_press: Option<HubMessage>,
-) -> Element<'a, HubMessage> {
-    let glyph = svg(svg::Handle::from_memory(icon.as_bytes()))
-        .width(Length::Fixed(icon_size))
-        .height(Length::Fixed(icon_size))
-        .style(move |_theme, _status| svg::Style { color: Some(color) });
-    let mut b = button(glyph)
-        .width(Length::Fixed(box_size))
-        .height(Length::Fixed(box_size))
-        .padding(0)
-        .style(move |_theme, status| icon_button_style(focused, status));
-    if let Some(message) = on_press {
-        b = b.on_press(message);
+    let base: Element<'_, HubMessage> = frame(card.into(), stage_w, stage_h);
+    if let Some(index) = state.apps_info {
+        return stack![base, app_info(state, index)]
+            .width(Fill)
+            .height(Fill)
+            .into();
     }
-    b.into()
+    if let Some(index) = state.apps_menu {
+        return stack![base, apps_menu(state, index)]
+            .width(Fill)
+            .height(Fill)
+            .into();
+    }
+    base
 }
 
 fn tile_button<'a>(
@@ -376,9 +447,14 @@ fn tile_button<'a>(
     width: f32,
 ) -> Element<'a, HubMessage> {
     let selected = state.selected() == index;
-    let enabled = state.tile_enabled(tile);
+    let interactive = state.tile_enabled(tile);
+    let dim = match tile {
+        HubTile::Start => !state.start_enabled,
+        HubTile::Browser => !state.engine_ready,
+        HubTile::AddApps => false,
+    };
     let (icon, title) = tile_copy(tile);
-    let ink = if enabled { theme::INK } else { theme::DIM };
+    let ink = if dim { theme::DIM } else { theme::INK };
     let title_font = if selected {
         iced::Font {
             weight: iced::font::Weight::Semibold,
@@ -392,15 +468,14 @@ fn tile_button<'a>(
             .width(Length::Fixed(ICON))
             .height(Length::Fixed(ICON))
             .style(move |_theme, _status| svg::Style { color: Some(ink) }),
-        text(text_fit::ellipsize_to_width(title, 18.0, width - 28.0))
+        text(text_fit::ellipsize_to_width(title, 18.0, width - 24.0))
             .size(18.0)
             .font(title_font)
             .color(ink),
     ]
-    .spacing(12)
+    .spacing(10)
     .align_x(Alignment::Center)
     .into();
-    // Missing engine: a small download badge, no explanatory subtitle.
     let content = if matches!(tile, HubTile::Browser) && !state.engine_ready {
         stack![
             content,
@@ -424,12 +499,175 @@ fn tile_button<'a>(
     let mut b = button(container(content).center_x(Fill).center_y(Fill))
         .width(Length::Fixed(width))
         .height(Length::Fixed(TILE_H))
-        .padding(10)
-        .style(move |_theme, status| tile_style(selected, enabled, status));
-    if enabled {
+        .padding(8)
+        .style(move |_theme, status| tile_style(selected, interactive, dim, status));
+    if interactive {
         b = b.on_press(HubMessage::Activate(index));
     }
     b.into()
+}
+
+fn app_tile<'a>(state: &State, app: HubApp, index: usize, width: f32) -> Element<'a, HubMessage> {
+    let selected = state.apps_focus.min(APPS.len() - 1) == index;
+    let dim = state.app_dimmed(app);
+    let ink = if dim { theme::DIM } else { theme::INK };
+    let title_font = if selected {
+        iced::Font {
+            weight: iced::font::Weight::Semibold,
+            ..iced::Font::default()
+        }
+    } else {
+        iced::Font::default()
+    };
+    let body: Element<'a, HubMessage> = column![
+        svg(svg::Handle::from_memory(app.icon().as_bytes()))
+            .width(Length::Fixed(APP_ICON))
+            .height(Length::Fixed(APP_ICON))
+            .style(move |_theme, _status| svg::Style { color: Some(ink) }),
+        text(text_fit::ellipsize_to_width(
+            app.title(),
+            18.0,
+            width - 28.0
+        ))
+        .size(18.0)
+        .font(title_font)
+        .color(ink),
+    ]
+    .spacing(10)
+    .align_x(Alignment::Center)
+    .into();
+    // The X affordance is the action affordance: the whole tile opens the
+    // same per-app actions popup, so there is no nested button.
+    let content: Element<'a, HubMessage> = stack![
+        body,
+        container(
+            svg(svg::Handle::from_memory(svg_icon::CLOSE_SVG.as_bytes()))
+                .width(Length::Fixed(13.0))
+                .height(Length::Fixed(13.0))
+                .style(|_theme, _status| svg::Style {
+                    color: Some(theme::MUTED)
+                }),
+        )
+        .width(Fill)
+        .height(Fill)
+        .align_x(Alignment::End)
+        .align_y(Alignment::Start),
+    ]
+    .into();
+    button(container(content).center_x(Fill).center_y(Fill))
+        .width(Length::Fixed(width))
+        .height(Length::Fixed(APP_TILE_H))
+        .padding(10)
+        .on_press(HubMessage::AppsMenuOpen(index))
+        .style(move |_theme, status| app_tile_style(selected, dim, status))
+        .into()
+}
+
+fn apps_menu<'a>(state: &State, index: usize) -> Element<'a, HubMessage> {
+    let app = APPS[index];
+    let mut rows = column![].spacing(4);
+    for (i, action) in state.app_actions(index).into_iter().enumerate() {
+        let focused = i == state.apps_menu_focus;
+        rows = rows.push(
+            button(
+                row![
+                    svg(svg::Handle::from_memory(action.icon().as_bytes()))
+                        .width(Length::Fixed(18.0))
+                        .height(Length::Fixed(18.0))
+                        .style(|_theme, _status| svg::Style {
+                            color: Some(theme::INK)
+                        }),
+                    text(action.label()).size(14.0).color(theme::INK),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            )
+            .width(Fill)
+            .padding([8, 10])
+            .on_press(HubMessage::AppsMenuAction(action))
+            .style(move |_theme, status| menu_row_style(focused, status)),
+        );
+    }
+    let card = container(
+        column![
+            row![
+                svg(svg::Handle::from_memory(app.icon().as_bytes()))
+                    .width(Length::Fixed(22.0))
+                    .height(Length::Fixed(22.0))
+                    .style(|_theme, _status| svg::Style {
+                        color: Some(theme::INK)
+                    }),
+                text(app.title()).size(16.0).color(theme::INK),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            space().height(6),
+            rows,
+        ]
+        .spacing(0),
+    )
+    .padding(10)
+    .width(Length::Fixed(230.0))
+    .style(card_style);
+    container(card)
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill)
+        .into()
+}
+
+fn app_info<'a>(state: &State, index: usize) -> Element<'a, HubMessage> {
+    let app = APPS[index];
+    let dim = state.app_dimmed(app);
+    let ink = if dim { theme::DIM } else { theme::INK };
+    let card = container(
+        column![
+            row![
+                svg(svg::Handle::from_memory(app.icon().as_bytes()))
+                    .width(Length::Fixed(44.0))
+                    .height(Length::Fixed(44.0))
+                    .style(move |_theme, _status| svg::Style { color: Some(ink) }),
+                column![
+                    text(app.title())
+                        .size(theme::type_scale::HEADING)
+                        .color(theme::INK),
+                    text(state.app_status(app))
+                        .size(theme::type_scale::META)
+                        .color(theme::MUTED),
+                ]
+                .spacing(2),
+                space().width(Fill),
+                icon_button(
+                    svg_icon::CLOSE_SVG,
+                    16.0,
+                    36.0,
+                    theme::MUTED,
+                    false,
+                    Some(HubMessage::AppInfoClose),
+                ),
+            ]
+            .spacing(14)
+            .align_y(Alignment::Center),
+            space().height(10),
+            text(format!(
+                "SDSC Utils {}",
+                crate::platform::app_meta::PKG_VERSION
+            ))
+            .size(theme::type_scale::CAPTION)
+            .color(theme::DIM),
+        ]
+        .spacing(0),
+    )
+    .padding(16)
+    .width(Length::Fixed(340.0))
+    .style(card_style);
+    container(card)
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill)
+        .into()
 }
 
 fn tile_copy(tile: HubTile) -> (&'static str, &'static str) {
@@ -438,6 +676,29 @@ fn tile_copy(tile: HubTile) -> (&'static str, &'static str) {
         HubTile::Browser => (svg_icon::GLOBE_SVG, "Browser"),
         HubTile::AddApps => (svg_icon::PLUS_SVG, "Add apps"),
     }
+}
+
+fn icon_button<'a>(
+    icon: &'static str,
+    icon_size: f32,
+    box_size: f32,
+    color: Color,
+    focused: bool,
+    on_press: Option<HubMessage>,
+) -> Element<'a, HubMessage> {
+    let glyph = svg(svg::Handle::from_memory(icon.as_bytes()))
+        .width(Length::Fixed(icon_size))
+        .height(Length::Fixed(icon_size))
+        .style(move |_theme, _status| svg::Style { color: Some(color) });
+    let mut b = button(glyph)
+        .width(Length::Fixed(box_size))
+        .height(Length::Fixed(box_size))
+        .padding(0)
+        .style(move |_theme, status| icon_button_style(focused, status));
+    if let Some(message) = on_press {
+        b = b.on_press(message);
+    }
+    b.into()
 }
 
 fn icon_button_style(focused: bool, status: button::Status) -> button::Style {
@@ -475,42 +736,48 @@ fn icon_button_style(focused: bool, status: button::Status) -> button::Style {
     }
 }
 
-fn card_style(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(theme::alpha(theme::BASE_BG, 0.94))),
-        text_color: Some(theme::INK),
+fn menu_row_style(focused: bool, status: button::Status) -> button::Style {
+    let fill = if focused {
+        theme::alpha(theme::INK, 0.12)
+    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        theme::alpha(theme::INK, 0.08)
+    } else {
+        theme::alpha(theme::INK, 0.02)
+    };
+    button::Style {
+        background: Some(Background::Color(fill)),
+        text_color: theme::INK,
         border: Border {
-            color: theme::GLASS_HAIRLINE,
+            color: if focused {
+                theme::alpha(theme::INK, 0.28)
+            } else {
+                Color::TRANSPARENT
+            },
             width: 1.0,
-            radius: theme::radius::XL.into(),
+            radius: theme::radius::MD.into(),
         },
-        shadow: Shadow {
-            color: Color::BLACK,
-            offset: Vector::new(0.0, 8.0),
-            blur_radius: 24.0,
-        },
-        ..container::Style::default()
+        ..button::Style::default()
     }
 }
 
-fn tile_style(selected: bool, enabled: bool, status: button::Status) -> button::Style {
-    let (fill, border, ink) = if !enabled {
-        (
-            theme::alpha(theme::INK, 0.02),
-            theme::alpha(theme::LINE, 0.4),
-            theme::DIM,
-        )
-    } else if selected {
+fn app_tile_style(selected: bool, dim: bool, status: button::Status) -> button::Style {
+    let (fill, border, ink) = if selected {
         (
             theme::alpha(theme::INK, 0.10),
             theme::alpha(theme::INK, 0.34),
-            theme::INK,
+            if dim { theme::DIM } else { theme::INK },
         )
     } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
         (
             theme::alpha(theme::INK, 0.08),
             theme::alpha(theme::INK, 0.22),
-            theme::INK,
+            if dim { theme::DIM } else { theme::INK },
+        )
+    } else if dim {
+        (
+            theme::alpha(theme::INK, 0.02),
+            theme::alpha(theme::LINE, 0.35),
+            theme::DIM,
         )
     } else {
         (
@@ -537,6 +804,82 @@ fn tile_style(selected: bool, enabled: bool, status: button::Status) -> button::
             Shadow::default()
         },
         ..button::Style::default()
+    }
+}
+
+fn tile_style(
+    selected: bool,
+    interactive: bool,
+    dim: bool,
+    status: button::Status,
+) -> button::Style {
+    let (fill, border, ink) = if !interactive {
+        (
+            theme::alpha(theme::INK, 0.02),
+            theme::alpha(theme::LINE, 0.4),
+            theme::DIM,
+        )
+    } else if selected {
+        (
+            theme::alpha(theme::INK, 0.10),
+            theme::alpha(theme::INK, 0.34),
+            if dim { theme::DIM } else { theme::INK },
+        )
+    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        (
+            theme::alpha(theme::INK, 0.08),
+            theme::alpha(theme::INK, 0.22),
+            if dim { theme::DIM } else { theme::INK },
+        )
+    } else if dim {
+        (
+            theme::alpha(theme::INK, 0.02),
+            theme::alpha(theme::LINE, 0.35),
+            theme::DIM,
+        )
+    } else {
+        (
+            theme::alpha(theme::INK, 0.04),
+            theme::GLASS_HAIRLINE,
+            theme::INK,
+        )
+    };
+    button::Style {
+        background: Some(Background::Color(fill)),
+        text_color: ink,
+        border: Border {
+            color: border,
+            width: 1.0,
+            radius: theme::radius::LG.into(),
+        },
+        shadow: if selected {
+            Shadow {
+                color: theme::alpha(theme::INK, 0.10),
+                offset: Vector::new(0.0, 0.0),
+                blur_radius: 18.0,
+            }
+        } else {
+            Shadow::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+fn card_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(theme::alpha(theme::BASE_BG, 0.94))),
+        text_color: Some(theme::INK),
+        border: Border {
+            color: theme::GLASS_HAIRLINE,
+            width: 1.0,
+            radius: theme::radius::XL.into(),
+        },
+        shadow: Shadow {
+            color: Color::BLACK,
+            offset: Vector::new(0.0, 8.0),
+            blur_radius: 24.0,
+        },
+        ..container::Style::default()
     }
 }
 
@@ -574,6 +917,56 @@ mod tests {
         assert!(!state.tile_enabled(HubTile::Start));
         assert!(state.tile_enabled(HubTile::Browser));
         assert!(state.tile_enabled(HubTile::AddApps));
+    }
+
+    #[test]
+    fn uninstalled_app_offers_install_and_dims() {
+        let mut state = State {
+            engine_ready: false,
+            ..State::default()
+        };
+        assert_eq!(
+            state.app_actions(1),
+            vec![AppAction::Install, AppAction::Info]
+        );
+        assert!(state.app_dimmed(HubApp::Browser));
+        state.engine_ready = true;
+        assert_eq!(
+            state.app_actions(1),
+            vec![AppAction::Uninstall, AppAction::Info]
+        );
+        assert!(!state.app_dimmed(HubApp::Browser));
+    }
+
+    #[test]
+    fn apps_menu_focus_wraps_over_actions() {
+        let mut state = State {
+            engine_ready: false,
+            ..State::default()
+        };
+        state.open_apps();
+        state.open_apps_menu(1);
+        assert_eq!(state.apps_menu_action(), Some(AppAction::Install));
+        state.apps_menu_move(1);
+        assert_eq!(state.apps_menu_action(), Some(AppAction::Info));
+        state.apps_menu_move(1);
+        assert_eq!(state.apps_menu_action(), Some(AppAction::Install));
+        state.apps_menu_move(-1);
+        assert_eq!(state.apps_menu_action(), Some(AppAction::Info));
+    }
+
+    #[test]
+    fn apps_screen_actions_back_out_one_level() {
+        let mut state = State::default();
+        state.open_apps();
+        assert!(state.apps_open);
+        state.open_apps_menu(0);
+        assert!(state.apps_menu.is_some());
+        state.close_apps_menu();
+        assert!(state.apps_menu.is_none());
+        assert!(state.apps_open);
+        state.close_apps();
+        assert!(!state.apps_open);
     }
 
     #[test]

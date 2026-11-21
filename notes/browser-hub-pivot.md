@@ -98,12 +98,14 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    `start_visible` for the gate. Start moved from `AlwaysOnTop` to
    `Normal`; the hub is raised above Settings/popup, with the toast raised
    last above all shell surfaces. The hub window always covers the monitor
-   and dims the screen behind a centered card. The card is icon-first
-   (large glyph + title, no subtitles): Start / Browser / Add apps tiles, an
-   X close icon, and an icon-only catalog (back chevron, globe, install/
-   uninstall/trash action + status check). Start and Browser are mutually
-   exclusive; opening either dismisses the other. Over exclusive-fullscreen
-   games the topmost hub can still be covered (documented limitation).
+   and dims the screen behind a centered card. The card is compact and
+   icon-first (large glyph + title, no subtitles, no header/close chrome):
+   Start / Browser / Add apps tiles. Add apps opens a tiles grid (Start /
+   Browser); each tile's X affordance opens a per-app popup with
+   Install/Uninstall/Info, and uninstalled entries are dimmed. Start and
+   Browser are mutually exclusive; opening either dismisses the other. Over
+   exclusive-fullscreen games the topmost hub can still be covered
+   (documented limitation).
 2. **Browser standalone window. — landed.** New fullscreen `Level::Normal`
    Browser window (`app::browser::open_browser_window`); Start no longer
    renders or owns the panel. Rendering moved to `src/ui/browser/view.rs`

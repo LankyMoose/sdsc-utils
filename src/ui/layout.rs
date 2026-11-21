@@ -178,6 +178,31 @@ pub fn set_toast_topmost<Message: Send + 'static>(id: window::Id) -> Task<Messag
     }
 }
 
+/// Disable DWM open/close transitions for a window (the Windows 11 scale
+/// effect) while it is still hidden, before its first show.
+pub fn disable_window_transitions<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+    #[cfg(windows)]
+    {
+        window::run(id, |window| {
+            use window::raw_window_handle::RawWindowHandle;
+
+            let Ok(handle) = window.window_handle() else {
+                return;
+            };
+            let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
+                return;
+            };
+            host::disable_transitions(win32_handle.hwnd.get());
+        })
+        .discard()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = id;
+        Task::none()
+    }
+}
+
 /// Raise the non-activating toast to the top of the z-order without stealing
 /// focus from the hub or Settings underneath it.
 pub fn raise_toast_topmost<Message: Send + 'static>(id: window::Id) -> Task<Message> {

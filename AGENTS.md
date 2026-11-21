@@ -13,6 +13,7 @@
 | Run (tray + HID + UI, one process) | `cargo run` |
 | UI-only check (no engine) | `cargo check --no-default-features` |
 | List connected controllers | `sdsc-utils --list-controllers` |
+| Install/update QA console | `python scripts/install_qa_web.py --open` (see `notes/install-qa.md`) |
 
 ## Project structure
 

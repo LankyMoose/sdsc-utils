@@ -135,6 +135,19 @@ fn validate_release_url(url: &str) -> Option<String> {
     Some(url.to_string())
 }
 
+/// Release API URL: production GitHub, or the local mock on a debug/QA build
+/// with `SDSC_UPDATE_API_URL` set.
+fn release_feed_url() -> String {
+    #[cfg(any(debug_assertions, feature = "qa-feed"))]
+    if let Ok(url) = std::env::var("SDSC_UPDATE_API_URL") {
+        let url = url.trim();
+        if !url.is_empty() {
+            return url.to_string();
+        }
+    }
+    RELEASES_API_URL.to_string()
+}
+
 /// Blocking: fetch the latest release from GitHub. Run through
 /// `spawn_blocking`, never on the UI thread.
 pub fn fetch_latest() -> AppResult<ReleaseInfo> {
@@ -144,11 +157,9 @@ pub fn fetch_latest() -> AppResult<ReleaseInfo> {
     #[cfg(debug_assertions)]
     std::thread::sleep(Duration::from_secs(2));
     let started = std::time::Instant::now();
-    diag_update(format!(
-        "update check: requesting {}",
-        url_host(RELEASES_API_URL)
-    ));
-    let request = ureq::get(RELEASES_API_URL)
+    let feed_url = release_feed_url();
+    diag_update(format!("update check: requesting {}", url_host(&feed_url)));
+    let request = ureq::get(&feed_url)
         .header("User-Agent", format!("{PKG_NAME}/{PKG_VERSION}"))
         .header("Accept", "application/vnd.github+json")
         .config()

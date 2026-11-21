@@ -51,9 +51,10 @@ Per-OS probe (`motion::system_animations_enabled`): Windows reads the real toggl
 - [ ] **1 Window chrome** — drop `framed` outline + header rule; corner strategy per `alpha_composite()`; backdrop + spacing. Stress-test.
 - [ ] **2 Tray popup** — dock-style glass rows (bigger ring, 18px title, muted meta), pin toggle replaces Remember checkbox, quieter actions, empty state, staggered row entrance.
 - [ ] **3 Toasts** — rounded glass card, accent glow instead of 3px rail, optional dwell bar; align with immersive composite toast ([windows-toast.md](windows-toast.md)).
-- [x] **Hub overlay** — full-cover dim scrim, centered card, icon-first tiles
-  (large glyph + title, no subtitles), icon-only close/back/install actions,
-  no explanatory copy or hint rows. Start/Browser are mutually exclusive.
+- [x] **Hub overlay** — full-cover dim scrim, centered compact card,
+  icon-first tiles (large glyph + title, no subtitles, no header/X), app
+  management grid with per-app Install/Uninstall/Info popup and dimmed
+  uninstalled entries. Start/Browser are mutually exclusive.
 - [ ] **4 Settings** — ~720×520, floating glass sidebar with icons + pill selection, grouped glass cards, toggles/sliders, lightbar editor polish (rounded bar, round handles, tinted controller preview); share rows with `start/settings.rs`.
 - [x] **5 Start** (compact removed; single fullscreen console stage — superseded).
 - [ ] **6 Polish** — icon stroke consistency, hover/press micro-motion, focus rings, README screenshots, CHANGELOG.

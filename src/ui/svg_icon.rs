@@ -27,6 +27,7 @@ pub const MICROSOFT_STORE_SVG: &str = include_str!("../../assets/icons/microsoft
 pub const DOWNLOAD_SVG: &str = include_str!("../../assets/icons/download.svg");
 pub const TRASH_SVG: &str = include_str!("../../assets/icons/trash.svg");
 pub const CHEVRON_LEFT_SVG: &str = include_str!("../../assets/icons/chevron-left.svg");
+pub const INFO_SVG: &str = include_str!("../../assets/icons/info.svg");
 /// Indeterminate arc; rotated by [`crate::ui::configure`] for pending states.
 pub const SPINNER_SVG: &str = include_str!("../../assets/icons/spinner.svg");
 /// Disclosure chevron; rotated 90° when a row is expanded.

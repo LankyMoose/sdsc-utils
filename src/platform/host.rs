@@ -99,6 +99,30 @@ pub fn raise_no_activate(hwnd: isize) {
     }
 }
 
+/// Disable DWM show/close/minimize transitions for this window (the Windows
+/// 11 open "scale" effect). Per-window, so the rest of the desktop keeps its
+/// animations.
+pub fn disable_transitions(hwnd: isize) {
+    #[cfg(windows)]
+    {
+        // SAFETY: opaque HWND from a `window::run` closure on the UI thread;
+        // DwmSetWindowAttribute only reads the 4-byte BOOL.
+        unsafe {
+            let disabled: i32 = 1;
+            let _ = crate::platform::win32::DwmSetWindowAttribute(
+                hwnd,
+                crate::platform::win32::DWMWA_TRANSITIONS_FORCEDISABLED,
+                &disabled as *const i32 as *const core::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+    }
+}
+
 /// Pin (`topmost = true`) or unpin (`false`) a window in the topmost band
 /// without activating it and without moving or resizing it.
 pub fn set_topmost(hwnd: isize, topmost: bool) {
