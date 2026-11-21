@@ -31,7 +31,6 @@ pub fn install_from_env() -> Result<PathBuf, String> {
     let target = crate::persist::paths::data_dir().join("cef-engine");
     let staging = target.with_extension("staging");
     let _ = std::fs::remove_dir_all(&staging);
-    let _ = std::fs::remove_dir_all(&target);
     std::fs::create_dir_all(&staging).map_err(|e| format!("create staging dir: {e}"))?;
 
     let archive = staging.join("cef-engine.zip");
@@ -50,6 +49,10 @@ pub fn install_from_env() -> Result<PathBuf, String> {
         let _ = std::fs::remove_dir_all(&staging);
         return Err("Downloaded package does not contain a CEF runtime".to_string());
     };
+    // Only replace the previous install after the new runtime is fully
+    // staged and verified; a failed download must never delete a working
+    // engine.
+    let _ = std::fs::remove_dir_all(&target);
     if runtime == staging {
         std::fs::rename(&staging, &target).map_err(|e| format!("install runtime: {e}"))?;
     } else {
