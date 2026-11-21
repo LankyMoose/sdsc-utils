@@ -172,6 +172,8 @@ pub enum Message {
     Browser(crate::ui::browser::BrowserMessage),
     /// 60Hz Browser window tick (cursor/scroll/mouse sync/shots).
     BrowserFrame,
+    /// Optional BrowserEngine install/download finished.
+    EngineInstallDone(Result<std::path::PathBuf, String>),
     /// PS hub window opened (focus it once the renderer exists).
     HubOpened(window::Id),
     /// Hub selection / activation from pad, keyboard, or mouse.
@@ -316,6 +318,7 @@ impl Message {
             | Message::FinishStartClose
             | Message::StartFrame
             | Message::BrowserFrame
+            | Message::EngineInstallDone(_)
             | Message::StartArtEvent(_) => false,
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
@@ -987,6 +990,16 @@ impl App {
         // Engine presence is process-static: sync once so the browser card
         // can label its backend (engine pixels vs reader text).
         app.browser.engine_available = app.browser.engine.is_some();
+        #[cfg(feature = "cef-engine")]
+        {
+            app.browser.engine_status = if app.browser.engine.is_some() {
+                crate::app::browser::EngineStatus::Ready(
+                    crate::browser::cef_backend::resolve_engine_dir().unwrap_or_default(),
+                )
+            } else {
+                crate::app::browser::EngineStatus::Missing
+            };
+        }
         if app.browser.engine.is_some() {
             crate::platform::app_log::info("browser: engine backend active");
         } else {
@@ -1584,6 +1597,7 @@ impl App {
             Message::BrowserOpened(id) => self.on_browser_opened(id),
             Message::Browser(message) => self.on_browser_message(message),
             Message::BrowserFrame => self.on_browser_frame(),
+            Message::EngineInstallDone(result) => self.on_engine_install_done(result),
             Message::HubOpened(id) => self.on_hub_opened(id),
             Message::Hub(message) => self.on_hub_message(message),
 

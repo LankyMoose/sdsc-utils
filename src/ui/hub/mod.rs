@@ -45,6 +45,12 @@ pub const TILES: [HubTile; 3] = [HubTile::Start, HubTile::Browser, HubTile::AddA
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HubMessage {
     Move(i32),
+    /// Open the app catalog / engine installer.
+    CatalogOpen,
+    /// Back out of the catalog to the app tiles.
+    CatalogClose,
+    /// Install/retry the optional BrowserEngine package.
+    InstallEngine,
     /// Highlight a tile (hover/pad focus) without activating it.
     Select(usize),
     /// Mouse click: select and activate in one step.
@@ -69,6 +75,12 @@ pub struct State {
     /// Face-button rising-edge latches (Cross confirm, Circle close).
     pub prev_cross: bool,
     pub prev_circle: bool,
+    /// Catalog/install card replaces the tile row while open.
+    pub catalog_open: bool,
+    /// Engine install/download in flight.
+    pub installing: bool,
+    /// Last install failure (user-facing).
+    pub install_error: Option<String>,
 }
 
 impl Default for State {
@@ -80,6 +92,9 @@ impl Default for State {
             nav: crate::domain::pad::NavStepper::default(),
             prev_cross: false,
             prev_circle: false,
+            catalog_open: false,
+            installing: false,
+            install_error: None,
         }
     }
 }
@@ -125,6 +140,31 @@ impl State {
         self.nav = crate::domain::pad::NavStepper::default();
         self.prev_cross = false;
         self.prev_circle = false;
+        self.catalog_open = false;
+        self.install_error = None;
+    }
+
+    pub fn open_catalog(&mut self) {
+        self.catalog_open = true;
+        self.install_error = None;
+    }
+
+    pub fn close_catalog(&mut self) {
+        self.catalog_open = false;
+        self.install_error = None;
+    }
+
+    pub fn set_installing(&mut self, installing: bool) {
+        self.installing = installing;
+        if installing {
+            self.install_error = None;
+        }
+    }
+
+    pub fn install_done(&mut self, ready: bool, error: Option<String>) {
+        self.installing = false;
+        self.engine_ready = ready;
+        self.install_error = error;
     }
 
     /// Feed one pad tick. Returns a hub message for a movement or face edge.
@@ -160,6 +200,9 @@ impl State {
 /// Render the hub card. The window root is transparent; the card is the only
 /// opaque surface.
 pub fn view(state: &State) -> Element<'_, HubMessage> {
+    if state.catalog_open {
+        return catalog_view(state);
+    }
     let mut tiles = row![].spacing(TILE_GAP).align_y(Alignment::Center);
     for (i, tile) in TILES.into_iter().enumerate() {
         tiles = tiles.push(tile_button(state, tile, i));
@@ -186,6 +229,100 @@ pub fn view(state: &State) -> Element<'_, HubMessage> {
             ]
             .spacing(18)
             .align_y(Alignment::Center),
+        ]
+        .spacing(0),
+    )
+    .padding(16)
+    .width(Length::Fixed(HUB_WIDTH - 24.0))
+    .style(card_style);
+    container(card)
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill)
+        .into()
+}
+
+fn catalog_view(state: &State) -> Element<'_, HubMessage> {
+    let status = if state.installing {
+        "Installing…".to_string()
+    } else if state.engine_ready {
+        "Installed".to_string()
+    } else if let Some(err) = &state.install_error {
+        err.clone()
+    } else {
+        "Not installed".to_string()
+    };
+    let status_color = if state.engine_ready {
+        theme::SUCCESS
+    } else if state.install_error.is_some() {
+        theme::WARNING
+    } else {
+        theme::MUTED
+    };
+    let mut action = button(
+        text(if state.engine_ready {
+            "Installed"
+        } else if state.installing {
+            "Installing…"
+        } else {
+            "Install"
+        })
+        .size(13.0)
+        .color(theme::INK),
+    )
+    .padding([8, 18])
+    .style(|theme_, status| {
+        if state.engine_ready {
+            theme::chip(false)(theme_, status)
+        } else {
+            theme::primary(theme_, status)
+        }
+    });
+    if !state.engine_ready && !state.installing {
+        action = action.on_press(HubMessage::InstallEngine);
+    }
+    let row = row![
+        svg(svg::Handle::from_memory(svg_icon::GLOBE_SVG.as_bytes()))
+            .width(Length::Fixed(24.0))
+            .height(Length::Fixed(24.0))
+            .style(|_theme, _status| svg::Style {
+                color: Some(theme::INK)
+            }),
+        column![
+            text("Browser engine").size(15.0).color(theme::INK),
+            text(status).size(11.0).color(status_color),
+        ]
+        .spacing(2)
+        .width(Fill),
+        action,
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center);
+    let card = container(
+        column![
+            row![
+                text("Add apps")
+                    .size(theme::type_scale::META)
+                    .color(theme::MUTED),
+                space().width(Fill),
+                text("Catalog")
+                    .size(theme::type_scale::CAPTION)
+                    .color(theme::DIM),
+            ]
+            .align_y(Alignment::Center),
+            space().height(12),
+            row,
+            space().height(8),
+            text("Optional · enables the Browser app. Installed from the Microsoft Store or a configured package feed.")
+                .size(10.0)
+                .color(theme::DIM),
+            space().height(6),
+            row![
+                hint("Cross", if state.engine_ready { "Close" } else { "Install" }),
+                hint("Circle", "Back"),
+            ]
+            .spacing(18),
         ]
         .spacing(0),
     )

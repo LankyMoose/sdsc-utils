@@ -116,5 +116,5 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Toasts** → `src/ui/toast/` (state machine in `machine.rs`); z-order / remount → `notes/windows-toast.md`
 - **Persisted state (prefs/controllers/analytics)** → `src/persist/`
 - **Single instance, tray lifecycle, crash-restart** → `src/bin/sdsc-utils.rs`, `src/platform/crash_restart.rs`
-- **MSIX packaging** → `packaging/`, `src/platform/packaged.rs`
+- **MSIX packaging / engine DLC** → `packaging/` (`AppxManifest.xml`, `BrowserEngine.AppxManifest.xml`, `pack-msix.ps1 -CefDir`), `src/platform/packaged.rs`, `src/browser/cef_backend.rs` (path resolver), `src/browser/engine_install.rs` (dev feed)
 - **CI / clippy fmt gates** → `scripts/ci.sh`, `.github/workflows/ci.yml`

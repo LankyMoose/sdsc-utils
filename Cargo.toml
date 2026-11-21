@@ -40,6 +40,8 @@ windows = { version = "0.61", features = [
     "Foundation",
     "Foundation_Collections",
     "Gaming_Input",
+    "Management_Deployment",
+    "Storage_Search",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
@@ -90,6 +92,8 @@ serde = { version = "1", features = ["derive"] }
 url = "2"
 keyboard-types = "0.8"
 serde_json = "1"
+sha2 = "0.11"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 single-instance = "0.3.3"
 notify-rust = "4"
 ureq = { version = "3", features = ["rustls"] }

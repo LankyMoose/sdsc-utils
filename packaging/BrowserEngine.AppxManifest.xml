@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Optional BrowserEngine package for SDSC Utils (phase 5).
+
+  Contains only the CEF runtime (under cef\) so the main MSIX stays lean.
+  Executable code in an optional package forces a related set: main and engine
+  must be submitted/updated together in Partner Center, and sideload installs
+  must pass both packages together.
+
+  Identity Name / Publisher must match the main package's publisher and the
+  Partner Center optional-package identity.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap10 rescap">
+  <Identity
+    Name="LankyMoose.SDSCUtils.BrowserEngine"
+    Publisher="CN=F2379117-7506-444F-AA08-EC697BF7DE9D"
+    Version="0.0.0.0"
+    ProcessorArchitecture="x64" />
+  <Properties>
+    <DisplayName>SDSC Utils Browser Engine</DisplayName>
+    <PublisherDisplayName>LankyMoose</PublisherDisplayName>
+    <Description>Optional Chromium (CEF) engine used by the SDSC Utils Browser app.</Description>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

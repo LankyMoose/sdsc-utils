@@ -112,9 +112,9 @@ CEF toolchain needs the pinned compiler.
   cookies (including Cloudflare clearance) persist there.
 - CEF resources/locales: the distribution directory resolved by
   `cef::sys::get_cef_dir()` (`CEF_PATH` or build `OUT_DIR` for dev).
-- Packaging (phase 5) moves these into an optional `BrowserEngine` package;
-  the engine-presence check must use the optional package path before
-  spawning.
+- Packaging (phase 5): the optional `BrowserEngine` MSIX stores CEF under
+  `cef\`; the resolver checks that package path, portable `cef\`, and the
+  dev `LocalAppData` install before falling back to the build directory.
 
 ## Known gaps
 

@@ -9,6 +9,30 @@
 use crate::browser::engine::EngineHandle;
 use crate::domain::pad::NavStepper;
 use crate::ui::browser::BrowserPanel;
+use std::path::PathBuf;
+
+/// Install/runtime state for the optional CEF engine package.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+// UI-only builds construct only `Missing`; the install states are exercised
+// with `cef-engine` enabled.
+#[allow(dead_code)]
+pub enum EngineStatus {
+    /// No valid runtime found. The hub Browser tile offers install.
+    #[default]
+    Missing,
+    /// Runtime directory verified and the worker is live.
+    Ready(PathBuf),
+    /// An install/download is in flight.
+    Installing,
+    /// The last install attempt failed; message is user-facing.
+    Failed(String),
+}
+
+impl EngineStatus {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+}
 
 #[derive(Default)]
 pub struct BrowserAppState {
@@ -17,8 +41,10 @@ pub struct BrowserAppState {
     /// CEF OSR worker. `None` in UI-only builds or when CEF is missing.
     pub engine: Option<EngineHandle>,
     /// Process-static capability: true when an engine worker is live. Drives
-    /// the page placeholder copy and, later, the hub tile install state.
+    /// the page placeholder copy and the hub tile install state.
     pub engine_available: bool,
+    /// Runtime/install status for the optional engine package.
+    pub engine_status: EngineStatus,
     /// Engine-mode D-pad cursor jumps run on this standalone stepper (fed a
     /// stickless `dpad_only` mask): the Start bank stays parked in engine
     /// mode so stick moves never double-fire into both cursor and nav.
@@ -413,5 +439,142 @@ impl super::App {
             Key::Named(Named::Enter) => self.on_browser_message(BrowserMessage::Navigate),
             _ => Task::none(),
         }
+    }
+}
+
+impl super::App {
+    /// Re-check the optional engine package and spawn CEF if it appeared
+    /// (Store install completed while the app stayed open, dev download, or a
+    /// portable sidecar placed next to the exe).
+    #[cfg(feature = "cef-engine")]
+    pub(crate) fn refresh_engine_status(&mut self) {
+        if self.browser.engine.is_some() {
+            self.browser.engine_available = true;
+            return;
+        }
+        let Some(path) = crate::browser::cef_backend::resolve_engine_dir() else {
+            self.browser.engine_status = EngineStatus::Missing;
+            return;
+        };
+        let (w, h) = self
+            .browser_monitor_cover
+            .map(|c| (c.width, c.height))
+            .unwrap_or((1920.0, 1080.0));
+        let (page_w, page_h) = crate::ui::browser::view::fullscreen_layout(w, h);
+        if let Some(engine) =
+            crate::browser::cef_backend::spawn_engine(&crate::browser::tabs::boot_url(), {
+                (page_w.max(1.0) as u32, page_h.max(1.0) as u32)
+            })
+        {
+            self.browser.engine = Some(engine);
+            self.browser.engine_available = true;
+            self.browser.engine_status = EngineStatus::Ready(path);
+            crate::platform::app_log::info("cef: engine attached after install");
+        } else {
+            self.browser.engine_status =
+                EngineStatus::Failed("Browser engine could not be initialized".to_string());
+        }
+    }
+
+    #[cfg(not(feature = "cef-engine"))]
+    pub(crate) fn refresh_engine_status(&mut self) {
+        self.browser.engine_status = EngineStatus::Missing;
+        self.browser.engine_available = false;
+    }
+
+    /// Start the optional engine install. Packaged builds hand off to the
+    /// Store; unpackaged/dev builds use the configured zip feed.
+    #[cfg(feature = "cef-engine")]
+    pub(crate) fn start_engine_install(&mut self) -> Task<Message> {
+        if matches!(self.browser.engine_status, EngineStatus::Installing) {
+            return Task::none();
+        }
+        if self.browser.engine.is_some() {
+            self.browser.engine_status = EngineStatus::Ready(
+                crate::browser::cef_backend::resolve_engine_dir().unwrap_or_default(),
+            );
+            self.hub_state.install_done(true, None);
+            return Task::none();
+        }
+        if crate::platform::packaged::is_packaged() {
+            let url = std::env::var("SDSC_BROWSER_ENGINE_STORE_URL").unwrap_or_else(|_| {
+                "ms-windows-store://search/?query=SDSC%20Utils%20Browser%20Engine".to_string()
+            });
+            let launched = crate::games::launch::launch_target(&url, "").map_err(|e| e.to_string());
+            if let Err(err) = launched {
+                crate::platform::app_log::warn(format!(
+                    "engine install: could not open Store page: {err}"
+                ));
+            }
+            let msg = "Finish installing Browser Engine in the Store, then reopen the hub";
+            self.browser.engine_status = EngineStatus::Missing;
+            self.hub_state.install_done(false, Some(msg.to_string()));
+            return Task::none();
+        }
+
+        self.browser.engine_status = EngineStatus::Installing;
+        self.hub_state.set_installing(true);
+        Task::perform(
+            async {
+                super::spawn_blocking(|| {
+                    crate::browser::engine_install::install_from_env()
+                        .map_err(crate::AppError::Persist)
+                })
+                .await
+            },
+            |result| {
+                Message::EngineInstallDone(match result {
+                    Ok(Ok(path)) => Ok(path),
+                    Ok(Err(err)) => Err(err.to_string()),
+                    Err(err) => Err(err.to_string()),
+                })
+            },
+        )
+    }
+
+    #[cfg(not(feature = "cef-engine"))]
+    pub(crate) fn start_engine_install(&mut self) -> Task<Message> {
+        self.hub_state.install_done(
+            false,
+            Some("This build has no browser engine support".to_string()),
+        );
+        Task::none()
+    }
+
+    #[cfg(feature = "cef-engine")]
+    pub(crate) fn on_engine_install_done(
+        &mut self,
+        result: Result<std::path::PathBuf, String>,
+    ) -> Task<Message> {
+        match result {
+            Ok(path) => {
+                self.browser.engine_status = EngineStatus::Ready(path);
+                self.browser.engine_available = true;
+                self.refresh_engine_status();
+                if self.browser.engine.is_some() {
+                    self.hub_state.install_done(true, None);
+                    crate::platform::app_log::info("cef: BrowserEngine install complete");
+                } else {
+                    let msg = "Browser engine installed but failed to start".to_string();
+                    self.browser.engine_status = EngineStatus::Failed(msg.clone());
+                    self.hub_state.install_done(false, Some(msg));
+                }
+            }
+            Err(err) => {
+                crate::platform::app_log::warn(format!("cef: BrowserEngine install failed: {err}"));
+                self.browser.engine_available = false;
+                self.browser.engine_status = EngineStatus::Failed(err.clone());
+                self.hub_state.install_done(false, Some(err));
+            }
+        }
+        Task::none()
+    }
+
+    #[cfg(not(feature = "cef-engine"))]
+    pub(crate) fn on_engine_install_done(
+        &mut self,
+        _result: Result<std::path::PathBuf, String>,
+    ) -> Task<Message> {
+        Task::none()
     }
 }

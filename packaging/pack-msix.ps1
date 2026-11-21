@@ -3,7 +3,13 @@
 # Usage:
 #   ./packaging/pack-msix.ps1 -ExePath target/release/sdsc-utils.exe -OutDir target/msix
 #
-# Ships the single `sdsc-utils.exe` (tray + HID + UI in one process).
+#   # phase 5: also build the optional BrowserEngine package
+#   ./packaging/pack-msix.ps1 -ExePath target/release/sdsc-utils.exe `
+#       -CefDir target/release/build/cef-dll-sys-*/out/cef_windows_x86_64
+#
+# Ships `sdsc-utils.exe` (tray + HID + UI in one process). The optional
+# BrowserEngine MSIX carries the CEF sidecars under `cef\` so the main package
+# stays lean; Store/AppInstaller must install both as a related set.
 #
 # Identity Version is stamped from Cargo.toml (e.g. 1.3.1 -> 1.3.1.0).
 # Identity Name / Publisher in AppxManifest.xml must match Partner Center.
@@ -17,7 +23,12 @@ param(
     [string] $OutDir = "target/msix",
 
     [Parameter(Mandatory = $false)]
-    [string] $RepoRoot = ""
+    [string] $RepoRoot = "",
+
+    # Optional: CEF runtime directory (contains libcef.dll/resources/locales).
+    # When set, also packs BrowserEngine.msix next to the main package.
+    [Parameter(Mandatory = $false)]
+    [string] $CefDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -98,3 +109,53 @@ Write-Host "Using $makeappx"
 if ($LASTEXITCODE -ne 0) { throw "makeappx failed" }
 
 Write-Host "Wrote $msixPath"
+
+if ($CefDir) {
+    $cef = (Resolve-Path $CefDir).Path
+    if (-not (Test-Path (Join-Path $cef "libcef.dll"))) {
+        throw "CefDir does not look like a CEF runtime (missing libcef.dll): $cef"
+    }
+
+    Write-Host "Packing optional BrowserEngine MSIX from $cef"
+    $engineLayout = Join-Path $OutDir "engine-layout"
+    if (Test-Path $engineLayout) { Remove-Item $engineLayout -Recurse -Force }
+    New-Item -ItemType Directory -Path $engineLayout | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $engineLayout "Assets") | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $engineLayout "cef") | Out-Null
+
+    # Runtime-only payload: CEF's headers, CMake files, import lib, and
+    # wrapper sources are build artifacts, not install content.
+    $cefFiles = @(
+        "libcef.dll", "chrome_elf.dll", "d3dcompiler_47.dll", "dxcompiler.dll",
+        "vk_swiftshader.dll", "vk_swiftshader_icd.json", "vulkan-1.dll",
+        "icudtl.dat", "resources.pak", "chrome_100_percent.pak",
+        "chrome_200_percent.pak", "v8_context_snapshot.bin", "CREDITS.html"
+    )
+    foreach ($name in $cefFiles) {
+        $src = Join-Path $cef $name
+        if (Test-Path $src) {
+            Copy-Item $src (Join-Path $engineLayout "cef\$name") -Force
+        } else {
+            Write-Warning "CEF runtime file missing: $name"
+        }
+    }
+    foreach ($dirName in @("locales", "swiftshader")) {
+        $src = Join-Path $cef $dirName
+        if (Test-Path $src) {
+            Copy-Item $src (Join-Path $engineLayout "cef\$dirName") -Recurse -Force
+        }
+    }
+    Copy-Item (Join-Path $RepoRoot "packaging\Assets\*") (Join-Path $engineLayout "Assets\") -Force
+
+    $engineManifestSrc = Join-Path $RepoRoot "packaging\BrowserEngine.AppxManifest.xml"
+    $engineManifestDst = Join-Path $engineLayout "AppxManifest.xml"
+    $engineManifest = Get-Content $engineManifestSrc -Raw
+    $engineManifest = $engineManifest -replace 'Version="0\.0\.0\.0"', "Version=`"$msixVersion`""
+    Set-Content -Path $engineManifestDst -Value $engineManifest -Encoding UTF8
+
+    $engineMsix = Join-Path $OutDir "BrowserEngine.msix"
+    if (Test-Path $engineMsix) { Remove-Item $engineMsix -Force }
+    & $makeappx pack /o /d $engineLayout /p $engineMsix
+    if ($LASTEXITCODE -ne 0) { throw "makeappx failed for BrowserEngine" }
+    Write-Host "Wrote $engineMsix"
+}

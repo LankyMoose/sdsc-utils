@@ -202,9 +202,10 @@ impl App {
         let y = cover.y
             + (cover.height * hub_view::HUB_TOP_FRACTION)
                 .min((cover.height - hub_view::HUB_HEIGHT - 24.0).max(0.0));
+        self.refresh_engine_status();
         self.hub_state.on_open(
             self.session.prefs.start_screen_enabled,
-            self.browser.engine_available,
+            self.browser.engine_status.is_ready(),
         );
         // The opening PS press must not toggle the hub straight back closed.
         self.arm_chord_release_latch();
@@ -276,8 +277,30 @@ impl App {
                 self.hub_state.select(index);
                 self.hub_activate()
             }
-            hub_view::HubMessage::Confirm => self.hub_activate(),
-            hub_view::HubMessage::Close => self.close_hub(),
+            hub_view::HubMessage::CatalogOpen => {
+                self.hub_state.open_catalog();
+                Task::none()
+            }
+            hub_view::HubMessage::CatalogClose => {
+                self.hub_state.close_catalog();
+                Task::none()
+            }
+            hub_view::HubMessage::InstallEngine => self.start_engine_install(),
+            hub_view::HubMessage::Confirm => {
+                if self.hub_state.catalog_open {
+                    self.start_engine_install()
+                } else {
+                    self.hub_activate()
+                }
+            }
+            hub_view::HubMessage::Close => {
+                if self.hub_state.catalog_open {
+                    self.hub_state.close_catalog();
+                    Task::none()
+                } else {
+                    self.close_hub()
+                }
+            }
         }
     }
 
@@ -306,22 +329,18 @@ impl App {
             }
             hub_view::HubTile::Browser => {
                 if self.browser.engine.is_none() {
-                    // Phase 5 owns the install flow; keep the hub open so the
-                    // inline install state is not dismissed into a dead end.
                     crate::controller::hid::diag::diag_info(
                         "ui-diag: hub Browser requested but engine not installed",
                     );
+                    self.hub_state.open_catalog();
                     return Task::none();
                 }
                 crate::controller::hid::diag::diag_info("ui-diag: hub launch Browser");
                 self.close_hub().chain(self.open_browser_window())
             }
             hub_view::HubTile::AddApps => {
-                // Catalog/DLC arrives in phase 5. Keep the hub open so it
-                // never feels like a dead dismiss.
-                crate::controller::hid::diag::diag_info(
-                    "ui-diag: hub catalog requested (not implemented)",
-                );
+                crate::controller::hid::diag::diag_info("ui-diag: hub catalog open");
+                self.hub_state.open_catalog();
                 Task::none()
             }
         }

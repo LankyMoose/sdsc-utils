@@ -1,9 +1,10 @@
 # Browser hub pivot — managed apps + CEF engine (planned)
 
 **Status:** in progress (branch `browser/hub-pivot`, based on `browser/main`).
-Phases 0–4 landed: state extraction, PS hub + auto-open, the standalone
-Browser window, the CEF OSR backend, and the Servo/reader deletion with CEF
-as the default engine. Phase 5 (DLC packaging/install + catalog) is next.
+Phases 0–4 are complete; phase 5 (DLC packaging/install + catalog) is
+partially landed. The engine package, resolver, catalog/install UI, and dev
+download path exist; the Store API wiring and optional-package submission
+remain.
 **When to read:** before touching Start/browser window ownership, the PS
 overlay, app selection, the engine backend, or MSIX packaging.
 
@@ -131,19 +132,18 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    Windows; `--no-default-features` is UI-only. The Browser tile/install
    placeholder handles a missing engine (no reader page). CI now installs
    CMake/Ninja instead of LLVM.
-5. **DLC install + catalog.** Main MSIX stays lean; `BrowserEngine` optional
-   package (all CEF files, one package) in a **related set** (mandatory for
-   executable code). `pack-msix.ps1` grows bundle/mapping support. Store:
-   `RequestDownloadAndInstallStorePackagesAsync(storeIds)` for first install;
-   `GetAppAndOptional…` + `RequestDownload…UpdatesAsync` only for updates
-   (UI thread + `InitializeWithWindow`). Sideload: AppInstaller
-   `<OptionalPackages>` + `PackageManager`. Dev: `LocalAppData`
-   download+hash-verify fallback. Missing/uninstalled engine → install UI.
-   Future apps register as `AppManifest { id, title, icon, storeIds?,
-   engineCheck? }` with per-app pad bindings. Needs Partner Center approval
-   for optional packages; every Chromium security patch forces a
-   main+optional resubmission (related-set lockstep) — the core
-   Store-vs-self-managed tradeoff.
+5. **DLC install + catalog. — partially landed.** Main MSIX stays lean;
+   `BrowserEngine.AppxManifest.xml` + `pack-msix.ps1 -CefDir` emit the
+   optional package (runtime files under `cef\`). The engine resolver searches
+   portable sidecars, the optional package, `LocalAppData`, then the debug
+   build dir, and validates the required runtime files. Hub ＋ opens a catalog
+   card with Browser engine status/install; Browser on a missing engine opens
+   the catalog instead of a dead page. Dev install uses
+   `SDSC_CEF_DLC_URL`/`SDSC_CEF_DLC_SHA256`, SHA-256 verification, and
+   extraction to `LocalAppData`. Remaining: Store
+   `RequestDownloadAndInstallStorePackagesAsync` wiring/product IDs,
+   AppInstaller/`PackageManager` sideload packaging, Partner Center optional
+   package submission, and the generic `AppManifest` catalog for future apps.
 
 ## CEF build (default)
 
@@ -168,6 +168,8 @@ cargo check --no-default-features # UI-only; Browser tile shows install state
 - Cloudflare-blocked sites pass; `cf_clearance` persists per profile.
   **Status:** CEF renders the interactive challenge (`nowsecure.nl`) where
   Servo never did; solving it with a pad click is the remaining manual check.
+- Optional-package install: pack both MSIXs and confirm the engine resolver
+  finds `<package>/cef`; Store API install still needs assigned Store IDs.
 - Manual matrix: taskbar/Alt-Tab, toast-over-app, auto-open borderless vs
   exclusive-fullscreen, hub→app focus transfer, game-over-hub input
   coexistence.

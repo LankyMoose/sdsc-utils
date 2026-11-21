@@ -57,3 +57,20 @@ When asked about `runFullTrust`: tray icon + raw DualSense HID (`hidapi`) for ba
 1. Download `sdsc-utils.msix` from the [v1.7.3 GitHub Release](https://github.com/LankyMoose/sdsc-utils/releases/tag/v1.7.3) (or pack locally — see [README.md](README.md)).
 2. Confirm the package identity matches Partner Center (`LankyMoose.SDSCUtils` / publisher CN in [`AppxManifest.xml`](AppxManifest.xml)). Identity Version is stamped from `Cargo.toml` (`1.7.3` → `1.7.3.0`).
 3. Submit for certification.
+
+## Optional BrowserEngine package (phase 5)
+
+The browser engine is a separate optional package in a **related set** with the
+main app (executable code requires it). In Partner Center:
+
+1. Create an optional package named **SDSC Utils Browser Engine**
+   (`LankyMoose.SDSCUtils.BrowserEngine`, same publisher).
+2. Associate it with the main app as a related-set optional package.
+3. Submit both packages together; every Chromium security patch requires a
+   main + engine resubmission (lockstep).
+
+Build both locally with `pack-msix.ps1 -CefDir <cef runtime dir>` (see
+[README.md](README.md)). The app currently opens the Store search/product page
+for install; wiring `Windows.Services.Store` with the assigned Store IDs is
+still pending, so Store installs should be completed from the Store UI and the
+hub re-opened (it re-checks the package path on open).

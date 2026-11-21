@@ -24,7 +24,7 @@ use crate::browser::frame_slot::FrameSlot;
 use cef::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const DOM_QUERY_MSG: &str = "sdsc.dom.query";
@@ -33,13 +33,116 @@ const DOM_POLL: Duration = Duration::from_millis(350);
 const BROWSER_BG: u32 = 0xFF14_161C;
 
 /// CEF is process-global; subprocess bootstrap and host init both need it.
-static INIT: OnceLock<bool> = OnceLock::new();
+/// `None` = not attempted, `Some(true)` = live, `Some(false)` = retryable
+/// (usually a missing runtime that was installed afterwards).
+static INIT: Mutex<Option<bool>> = Mutex::new(None);
+
+/// Resolve the CEF runtime directory. Search order:
+/// 1. `CEF_PATH` (explicit/dev override; may point at the versioned parent).
+/// 2. `cef\` next to the executable (portable bundle).
+/// 3. The `BrowserEngine` optional MSIX package (`...\cef`).
+/// 4. `%LOCALAPPDATA%\sdsc-utils\cef-engine` (dev download).
+/// 5. The build-time `OUT_DIR` fallback (debug builds only).
+///
+/// A directory is only accepted when the runtime files CEF must load exist;
+/// an empty/stale directory must not report the engine as installed.
+pub fn resolve_engine_dir() -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(path) = std::env::var_os("CEF_PATH") {
+        let path = std::path::PathBuf::from(path);
+        candidates.push(path.join("cef_windows_x86_64"));
+        candidates.push(path.join("cef"));
+        candidates.push(path);
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("cef"));
+    }
+    #[cfg(windows)]
+    candidates.extend(optional_package_dirs());
+    candidates.push(crate::persist::paths::data_dir().join("cef-engine"));
+    #[cfg(debug_assertions)]
+    if let Some(dir) = cef::sys::get_cef_dir() {
+        candidates.push(dir);
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| validate_engine_dir(candidate))
+}
+
+pub fn engine_installed() -> bool {
+    resolve_engine_dir().is_some()
+}
+
+pub(crate) fn validate_engine_dir(dir: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        dir.join("libcef.dll").is_file()
+            && dir.join("icudtl.dat").is_file()
+            && dir.join("resources.pak").is_file()
+            && dir.join("locales").join("en-US.pak").is_file()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        dir.join("Chromium Embedded Framework.framework").is_dir()
+            && dir
+                .join("Chromium Embedded Framework.framework")
+                .join("Chromium Embedded Framework")
+                .is_file()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        dir.join("libcef.so").is_file()
+            && dir.join("icudtl.dat").is_file()
+            && dir.join("resources.pak").is_file()
+    }
+}
+
+#[cfg(windows)]
+fn optional_package_dirs() -> Vec<std::path::PathBuf> {
+    use windows::ApplicationModel::Package;
+    use windows::Management::Deployment::PackageManager;
+    use windows::core::HSTRING;
+
+    const ENGINE_PACKAGE: &str = "LankyMoose.SDSCUtils.BrowserEngine";
+    let wanted = HSTRING::from(ENGINE_PACKAGE);
+    let mut out = Vec::new();
+    let mut push = |pkg: Package| {
+        if pkg
+            .Id()
+            .and_then(|id| id.Name())
+            .is_ok_and(|name| name == wanted)
+            && let Ok(location) = pkg.InstalledLocation()
+            && let Ok(path) = location.Path()
+        {
+            let root = std::path::PathBuf::from(path.to_string());
+            out.push(root.join("cef"));
+            out.push(root);
+        }
+    };
+    if let Ok(current) = Package::Current()
+        && let Ok(deps) = current.Dependencies()
+    {
+        for dep in deps {
+            push(dep);
+        }
+    }
+    if let Ok(manager) = PackageManager::new()
+        && let Ok(packages) = manager.FindPackages()
+    {
+        for pkg in packages {
+            push(pkg);
+        }
+    }
+    out
+}
 
 fn cef_dir() -> Option<std::path::PathBuf> {
-    let dir = cef::sys::get_cef_dir();
+    let dir = resolve_engine_dir();
     if dir.is_none() {
         crate::platform::app_log::warn(
-            "cef: binary distribution not found (set CEF_PATH or use the packaged sidecars)",
+            "cef: runtime not found (portable sidecars, BrowserEngine package, or LocalAppData)",
         );
     }
     dir
@@ -78,51 +181,64 @@ pub fn execute_subprocess() -> Option<i32> {
     (code >= 0).then_some(code)
 }
 
+/// Initialize CEF once on the calling (main) thread. Retryable when the
+/// runtime was missing on the first attempt (install-then-open).
+fn initialize_cef(dir: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    set_dll_directory(dir);
+    pin_api();
+    let cache = crate::persist::paths::data_dir().join("cef");
+    let _ = std::fs::create_dir_all(&cache);
+    let log = cache.join("cef.log");
+    let mut settings = Settings {
+        no_sandbox: 1,
+        windowless_rendering_enabled: 1,
+        multi_threaded_message_loop: cfg!(windows) as _,
+        external_message_pump: cfg!(not(windows)) as _,
+        persist_session_cookies: 1,
+        log_severity: LogSeverity::WARNING,
+        ..Settings::default()
+    };
+    settings.root_cache_path = cache.to_string_lossy().as_ref().into();
+    settings.log_file = log.to_string_lossy().as_ref().into();
+    settings.resources_dir_path = dir.to_string_lossy().as_ref().into();
+    settings.locales_dir_path = dir.join("locales").to_string_lossy().as_ref().into();
+    settings.locale = "en-US".into();
+    settings.accept_language_list = "en-US,en".into();
+    // A plain Chromium UA. CEF's default includes `Cef/...`, which bot
+    // checks treat as a non-browser client.
+    settings.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+            AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+        .into();
+    let args = cef::args::Args::new();
+    let mut app = build_app();
+    let ok = initialize(
+        Some(args.as_main_args()),
+        Some(&settings),
+        Some(&mut app),
+        std::ptr::null_mut(),
+    ) != 0;
+    if ok {
+        crate::platform::app_log::info(format!("cef: initialized from {}", dir.display()));
+    } else {
+        crate::platform::app_log::warn("cef: CefInitialize failed");
+    }
+    ok
+}
+
 /// Initialize CEF on the calling (main) thread and start the engine worker.
 pub fn spawn_engine(boot_url: &str, initial_size: (u32, u32)) -> Option<EngineHandle> {
     let dir = cef_dir()?;
-    let initialized = *INIT.get_or_init(|| {
-        #[cfg(windows)]
-        set_dll_directory(&dir);
-        pin_api();
-        let cache = crate::persist::paths::data_dir().join("cef");
-        let _ = std::fs::create_dir_all(&cache);
-        let log = cache.join("cef.log");
-        let mut settings = Settings {
-            no_sandbox: 1,
-            windowless_rendering_enabled: 1,
-            multi_threaded_message_loop: cfg!(windows) as _,
-            external_message_pump: cfg!(not(windows)) as _,
-            persist_session_cookies: 1,
-            log_severity: LogSeverity::WARNING,
-            ..Settings::default()
-        };
-        settings.root_cache_path = cache.to_string_lossy().as_ref().into();
-        settings.log_file = log.to_string_lossy().as_ref().into();
-        settings.resources_dir_path = dir.to_string_lossy().as_ref().into();
-        settings.locales_dir_path = dir.join("locales").to_string_lossy().as_ref().into();
-        settings.locale = "en-US".into();
-        settings.accept_language_list = "en-US,en".into();
-        // A plain Chromium UA. CEF's default includes `Cef/...`, which bot
-        // checks treat as a non-browser client.
-        settings.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-            AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
-            .into();
-        let args = cef::args::Args::new();
-        let mut app = build_app();
-        let ok = initialize(
-            Some(args.as_main_args()),
-            Some(&settings),
-            Some(&mut app),
-            std::ptr::null_mut(),
-        ) != 0;
-        if ok {
-            crate::platform::app_log::info(format!("cef: initialized from {}", dir.display()));
+    let initialized = {
+        let mut guard = INIT.lock().unwrap_or_else(|e| e.into_inner());
+        if *guard == Some(true) {
+            true
         } else {
-            crate::platform::app_log::warn("cef: CefInitialize failed");
+            let ok = initialize_cef(&dir);
+            *guard = Some(ok);
+            ok
         }
-        ok
-    });
+    };
     if !initialized {
         return None;
     }
