@@ -181,13 +181,17 @@ class Console:
         self.requests = deque(maxlen=60)
         self.installed: dict[str, dict] = {}
         self.server: ThreadingHTTPServer | None = None
-        self.versions, self.latest, self.cef_mode = self.load_state()
+        self.last_flavor: str | None = None
+        self.last_debug_open: str = ""
+        self.preparing = False
+        self.versions, self.latest, self.cef_mode, self.manifest = self.load_state()
         OUT.mkdir(parents=True, exist_ok=True)
         DOWNLOADS.mkdir(parents=True, exist_ok=True)
         PORTABLE.mkdir(parents=True, exist_ok=True)
         INSTALLS.mkdir(parents=True, exist_ok=True)
         APPDATA_ROOT.mkdir(parents=True, exist_ok=True)
         self.refresh_installed()
+        self.load_engine_state()
 
     # -- state -----------------------------------------------------------
 
@@ -204,8 +208,18 @@ class Console:
             {"tag": nxt, "enabled": True},
         ], nxt, "full"
 
+    def default_manifest(self, version: str):
+        return {
+            "tag_name": version,
+            "name": version,
+            "html_url": f"https://github.com/LankyMoose/sdsc-utils/releases/tag/{version}",
+            "body": "",
+            "assets": [],
+        }
+
     def load_state(self):
         versions, latest, cef_mode = self.default_versions()
+        manifest = self.default_manifest(latest)
         try:
             raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
             loaded = [
@@ -219,9 +233,22 @@ class Console:
             cef_mode = str(raw.get("cef_mode", cef_mode))
             if cef_mode not in ("full", "loader", "none"):
                 cef_mode = "full" if bool(raw.get("ship_cef", True)) else "none"
+            saved_manifest = raw.get("manifest")
+            if isinstance(saved_manifest, dict):
+                manifest.update(saved_manifest)
         except (OSError, ValueError):
             pass
-        return versions, latest, cef_mode
+        tag = normalize_tag(str(manifest.get("tag_name", "")))
+        if tag:
+            manifest["tag_name"] = tag
+            latest = tag
+        else:
+            manifest["tag_name"] = latest
+        if not str(manifest.get("html_url", "")).strip():
+            manifest["html_url"] = (
+                f"https://github.com/LankyMoose/sdsc-utils/releases/tag/{latest}"
+            )
+        return versions, latest, cef_mode, manifest
 
     def save_state(self):
         with self.lock:
@@ -231,6 +258,7 @@ class Console:
                     {
                         "versions": self.versions,
                         "latest": self.latest,
+                        "manifest": self.manifest,
                         "cef_mode": self.cef_mode,
                     },
                     indent=2,
@@ -289,12 +317,16 @@ class Console:
                 "git": rev,
                 "dirty": dirty,
                 "feed_url": self.feed_url(),
-                "latest": latest,
+                "latest": self.manifest.get("tag_name", latest),
                 "versions": self.versions,
+                "manifest": self.manifest,
                 "cef_mode": self.cef_mode,
                 "running": running,
                 "running_pid": pid,
                 "running_flavor": self.running_flavor,
+                "last_flavor": self.last_flavor,
+                "last_debug_open": self.last_debug_open,
+                "preparing": self.preparing,
                 "building": self.building,
                 "building_since": self.building_since,
                 "build_error": self.build_error,
@@ -309,12 +341,154 @@ class Console:
 
     # -- actions ---------------------------------------------------------
 
+    def load_engine_state(self):
+        archive = DOWNLOADS / "cef-engine.zip"
+        if archive.is_file():
+            self.engine = {
+                "path": str(archive),
+                "url": f"http://127.0.0.1:{self.port}/downloads/cef-engine.zip",
+                "sha256": sha256_file(archive),
+                "bytes": archive.stat().st_size,
+                "built_at": time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(archive.stat().st_mtime)
+                ),
+            }
+
+    def ensure_engine(self):
+        with self.lock:
+            if self.engine and Path(self.engine.get("path", "")).is_file():
+                return
+        self._engine_worker()
+        with self.lock:
+            if not self.engine:
+                raise RuntimeError("engine DLC zip unavailable (CEF runtime not found)")
+
+    def _stage_install_sync(self, flavor: str, cef_mode: str, tag: str):
+        exe = exe_for(flavor)
+        if not exe.is_file():
+            raise RuntimeError(f"{flavor} exe missing: {exe}")
+        root = PORTABLE / f"{tag}-{flavor}-{cef_mode}"
+        if root.exists():
+            shutil.rmtree(root)
+        root.mkdir(parents=True)
+        shutil.copy2(exe, root / exe.name)
+        if cef_mode != "none":
+            cef = find_cef_dir()
+            if not cef:
+                raise RuntimeError("CEF runtime not found; build the project or set CEF_PATH")
+            loader_files = {
+                "libcef.dll",
+                "chrome_elf.dll",
+                "d3dcompiler_47.dll",
+                "dxcompiler.dll",
+                "vulkan-1.dll",
+                "vk_swiftshader.dll",
+            }
+            if cef_mode == "full":
+                dest = root / "cef"
+                dest.mkdir()
+                for name in CEF_FILES:
+                    src = cef / name
+                    if src.is_file():
+                        shutil.copy2(src, dest / name)
+                for name in CEF_DIRS:
+                    src = cef / name
+                    if src.is_dir():
+                        shutil.copytree(src, dest / name)
+            else:
+                for name in loader_files:
+                    src = cef / name
+                    if src.is_file():
+                        shutil.copy2(src, root / name)
+        archive = DOWNLOADS / f"sdsc-utils-{tag}-{flavor}-{cef_mode}-portable.zip"
+        self._zip_dir(root, archive)
+        dest = INSTALLS / tag
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True)
+        with zipfile.ZipFile(archive) as zf:
+            for info in zf.infolist():
+                target = (dest / info.filename).resolve()
+                if not str(target).startswith(str(dest.resolve())):
+                    raise RuntimeError("archive entry escapes install dir")
+                zf.extract(info, dest)
+        (dest / ".qa-mode").write_text(f"{flavor}:{cef_mode}", encoding="utf-8")
+        appdata = appdata_for(f"portable-{tag}")
+        if appdata.is_dir():
+            shutil.rmtree(appdata, ignore_errors=True)
+        appdata.mkdir(parents=True, exist_ok=True)
+        self.refresh_installed()
+        self.log(f"install: {tag} ({flavor}, cef={cef_mode})")
+
+    def prepare_launch(self, payload):
+        self.preparing = True
+        try:
+            if isinstance(payload.get("manifest"), dict):
+                self.set_config({"manifest": payload["manifest"]})
+            if payload.get("version"):
+                self.set_config({"version": str(payload["version"])})
+            if payload.get("html_url"):
+                self.set_config({"html_url": str(payload["html_url"])})
+            target = str(payload.get("target", "direct"))
+            flavor = str(payload.get("flavor", "debug"))
+            cef = str(payload.get("cef", "full"))
+            open_hub = bool(payload.get("open_hub", True))
+            restage = bool(payload.get("restage", False))
+            if flavor not in ("debug", "release"):
+                raise RuntimeError(f"unknown flavor {flavor!r}")
+            if cef not in ("full", "loader", "none"):
+                raise RuntimeError(f"unknown CEF mode {cef!r}")
+            if not (target == "portable" and cef == "full"):
+                self.ensure_engine()
+            if target == "portable":
+                tag = str(self.manifest.get("tag_name", ""))
+                marker = INSTALLS / tag / ".qa-mode"
+                want = f"{flavor}:{cef}"
+                if (
+                    restage
+                    or not marker.is_file()
+                    or marker.read_text(encoding="utf-8").strip() != want
+                ):
+                    self._stage_install_sync(flavor, cef, tag)
+                return self.launch(
+                    f"installed:{tag}",
+                    "hub" if open_hub and flavor == "debug" else "",
+                )
+            return self.launch(
+                flavor, "hub" if open_hub and flavor == "debug" else ""
+            )
+        finally:
+            self.preparing = False
+
+    def relaunch(self):
+        if not self.last_flavor:
+            raise RuntimeError("nothing has been launched yet")
+        return self.launch(self.last_flavor, self.last_debug_open)
+
     def set_config(self, payload):
         with self.lock:
             if "cef_mode" in payload:
                 mode = str(payload["cef_mode"])
                 if mode in ("full", "loader", "none"):
                     self.cef_mode = mode
+            if isinstance(payload.get("manifest"), dict):
+                manifest = dict(payload["manifest"])
+                tag = normalize_tag(str(manifest.get("tag_name", "")))
+                if tag:
+                    manifest["tag_name"] = tag
+                    self.manifest = manifest
+                    self.latest = tag
+                    if all(v["tag"] != tag for v in self.versions):
+                        self.versions.append({"tag": tag, "enabled": True})
+            if "version" in payload:
+                tag = normalize_tag(str(payload["version"]))
+                if tag:
+                    self.manifest["tag_name"] = tag
+                    self.latest = tag
+                    if all(v["tag"] != tag for v in self.versions):
+                        self.versions.append({"tag": tag, "enabled": True})
+            if "html_url" in payload and str(payload["html_url"]).strip():
+                self.manifest["html_url"] = str(payload["html_url"]).strip()
             if "versions" in payload:
                 cleaned = []
                 for item in payload["versions"]:
@@ -538,6 +712,8 @@ class Console:
             )
             self.running_flavor = flavor
             self.running_pid = self.proc.pid
+            self.last_flavor = flavor
+            self.last_debug_open = debug_open
         self.log(f"launch: {flavor} pid={self.proc.pid} data={appdata}")
         return self.api_state()
 
@@ -649,19 +825,11 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/state":
                 self._json(self.console.api_state())
             elif path == "/repos/LankyMoose/sdsc-utils/releases/latest":
-                latest = self.console.latest_enabled()
-                if not latest:
-                    self._json({"error": "no enabled release"}, 404)
-                    return
-                self.console.log(f"feed: latest {latest}")
-                self._json(
-                    {
-                        "tag_name": latest,
-                        "name": latest,
-                        "html_url": f"https://github.com/LankyMoose/sdsc-utils/releases/tag/{latest}",
-                        "assets": [],
-                    }
-                )
+                manifest = dict(self.console.manifest)
+                manifest.setdefault("name", manifest.get("tag_name", ""))
+                manifest.setdefault("assets", [])
+                self.console.log(f"feed: {manifest.get('tag_name', '?')}")
+                self._json(manifest)
             elif path.startswith("/downloads/"):
                 self._download(unquote(path[len("/downloads/"):]))
             else:
@@ -676,13 +844,22 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/config":
                 self._json(self.console.set_config(payload))
+            elif path == "/api/prepare":
+                self._json(self.console.prepare_launch(payload))
+            elif path == "/api/relaunch":
+                self._json(self.console.relaunch())
             elif path == "/api/build":
                 self.console.build()
                 self._json(self.console.api_state())
             elif path == "/api/stage":
-                if "ship_cef" in payload:
-                    self.console.ship_cef = bool(payload["ship_cef"])
-                    self.console.save_state()
+                if "cef_mode" in payload and str(payload["cef_mode"]) in (
+                    "full",
+                    "loader",
+                    "none",
+                ):
+                    self.console.cef_mode = str(payload["cef_mode"])
+                elif "ship_cef" in payload:
+                    self.console.cef_mode = "full" if bool(payload["ship_cef"]) else "none"
                 self.console.stage()
                 self._json(self.console.api_state())
             elif path == "/api/install":
@@ -714,133 +891,196 @@ PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SDSC Utils — install QA</title>
+<title>SDSC Utils — app lab</title>
 <style>
   :root { color-scheme: dark; --bg:#0d0f14; --panel:#161a22; --line:#2a3040;
           --ink:#e8eaf0; --muted:#8b93a7; --accent:#3d7dff; --ok:#38c172; --warn:#e0a030; }
   * { box-sizing: border-box; }
   body { margin:0; font:14px/1.45 system-ui, Segoe UI, sans-serif; background:var(--bg); color:var(--ink); }
-  main { max-width: 1100px; margin: 0 auto; padding: 28px 22px 60px; }
+  main { max-width: 780px; margin: 0 auto; padding: 30px 22px 60px; }
   h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 12px; }
   .sub { color: var(--muted); margin-bottom: 22px; }
-  .grid { display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; }
-  .card { background: var(--panel); border:1px solid var(--line); border-radius: 14px; padding: 16px; }
-  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 12px; }
+  .card { background: var(--panel); border:1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 14px; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  .row + .row { margin-top: 8px; }
+  .row + .row { margin-top: 10px; }
+  label { color: var(--muted); display:flex; gap:6px; align-items:center; }
+  input, select, textarea { background:#0f131b; color:var(--ink); border:1px solid var(--line); border-radius:9px;
+                  padding: 7px 9px; font: inherit; min-width: 0; }
+  input[type=text] { flex:1 1 150px; }
+  textarea { width:100%; min-height: 190px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; resize: vertical; }
   button { background:#222939; color:var(--ink); border:1px solid var(--line); border-radius: 9px;
-           padding: 7px 11px; font: inherit; cursor: pointer; }
+           padding: 8px 12px; font: inherit; cursor: pointer; }
   button:hover { border-color:#3a445c; background:#293247; }
   button.primary { background: var(--accent); border-color: transparent; color:#fff; }
-  button.danger { color:#ffb4b4; border-color:#5a3030; }
-  input, select { background:#0f131b; color:var(--ink); border:1px solid var(--line); border-radius:9px;
-                  padding: 7px 9px; font: inherit; min-width: 0; }
-  input[type=text] { flex:1 1 110px; }
-  table { width:100%; border-collapse: collapse; }
-  th, td { text-align:left; padding: 7px 4px; border-bottom:1px solid #202635; }
-  th { color:var(--muted); font-weight: 500; font-size: 12px; }
-  .tag { font-family: ui-monospace, Consolas, monospace; }
+  button.ghost { background: transparent; color: var(--muted); }
+  button:disabled { opacity: .5; cursor: default; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; word-break:break-all; }
+  .muted { color: var(--muted); }
+  .ok { color: var(--ok); }
+  .warn { color: var(--warn); }
+  details { margin-top: 10px; }
+  summary { cursor:pointer; color: var(--muted); }
+  pre { margin:0; max-height: 220px; overflow:auto; color: var(--muted); font-size:12px; }
   .pill { display:inline-block; padding: 1px 7px; border-radius: 999px; border:1px solid var(--line); color:var(--muted); font-size: 12px; }
   .pill.ok { color: var(--ok); border-color:#234d35; }
-  .pill.warn { color: var(--warn); border-color:#4d3f20; }
-  .muted { color: var(--muted); }
-  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; word-break:break-all; }
-  pre { margin:0; max-height: 220px; overflow:auto; color: var(--muted); font-size:12px; }
-  .full { grid-column: 1 / -1; }
-  a { color:#8fb4ff; }
 </style>
 </head>
 <body><main>
-  <h1>SDSC Utils <span class="muted">install QA</span></h1>
+  <h1>SDSC Utils <span class="muted">app lab</span></h1>
   <div class="sub" id="status">loading…</div>
-  <div class="grid">
-    <section class="card">
-      <h2>Release feed</h2>
-      <div class="row"><span class="muted">Latest</span><span id="latest" class="tag">—</span></div>
-      <div class="row"><span class="muted">API</span><span id="feed" class="mono">—</span></div>
-      <table><thead><tr><th>Version</th><th>Enabled</th><th></th></tr></thead><tbody id="versions"></tbody></table>
-      <div class="row"><input id="new-tag" type="text" placeholder="v1.7.4"><button onclick="addVersion()">Add</button>
-        <button onclick="setLatest()">Set latest</button></div>
-      <div class="row"><button onclick="saveConfig()">Save versions</button>
-        <span class="muted">Current app version <span id="app-version">—</span></span></div>
-    </section>
-    <section class="card">
-      <h2>Build &amp; stage</h2>
-      <div class="row"><button class="primary" onclick="post('/api/build')">Build release (qa-feed)</button>
-        <button onclick="post('/api/stage', {cef_mode: cefMode()})">Stage portable</button></div>
-      <div class="row"><label class="muted">CEF sidecar</label>
-        <select id="cef-mode" onchange="saveConfig()">
-          <option value="full">full (runnable portable)</option>
-          <option value="loader">loader-only (DLC install flow)</option>
-          <option value="none">none (does not start)</option>
-        </select></div>
-      <div class="row"><span id="build" class="muted">—</span></div>
-      <div class="row"><button onclick="post('/api/engine')">Build engine DLC zip</button></div>
-      <div id="engine" class="muted mono"></div>
-    </section>
-    <section class="card">
-      <h2>Installations</h2>
-      <table><thead><tr><th>Version</th><th>CEF</th><th></th></tr></thead><tbody id="installs"></tbody></table>
-      <div class="row"><button onclick="installStaged()">Install staged portable</button>
-        <button class="danger" onclick="post('/api/clear')">Clear QA installs/appdata</button></div>
-    </section>
-    <section class="card">
-      <h2>Launch</h2>
-      <div class="row">
-        <select id="flavor"><option value="debug">debug (target/debug)</option><option value="release">release qa-feed (target/release)</option></select>
-        <input id="debug-open" type="text" placeholder="SDSC_DEBUG_OPEN (e.g. hub)">
-        <button class="primary" onclick="launch()">Launch</button>
-        <button onclick="post('/api/stop')">Stop</button>
-      </div>
-      <div class="row muted" id="running">—</div>
-      <div class="row"><span class="muted">APPDATA is rewritten to a private QA dir; the update API + engine DLC env point here.</span></div>
-    </section>
-    <section class="card full">
-      <h2>Requests / events</h2>
-      <pre id="log">—</pre>
-    </section>
-  </div>
+
+  <section class="card">
+    <h2>Version &amp; manifest</h2>
+    <div class="row">
+      <label>App version <input id="version" type="text" placeholder="v1.7.4"></label>
+      <label>Release URL <input id="html-url" type="text"></label>
+    </div>
+    <div class="row">
+      <label class="muted">The release URL must stay on https://github.com/ for the app's validator.</label>
+    </div>
+    <details>
+      <summary>Manifest JSON (tag, URL, notes, assets)</summary>
+      <div class="row"><textarea id="manifest"></textarea></div>
+    </details>
+    <div class="row"><button onclick="saveManifest()">Save manifest</button>
+      <span class="muted" id="manifest-note"></span></div>
+  </section>
+
+  <section class="card">
+    <h2>Launch</h2>
+    <div class="row">
+      <label>Target <select id="target" onchange="syncTarget()">
+        <option value="direct">Direct app</option>
+        <option value="portable">Installed portable</option>
+      </select></label>
+      <label>Build <select id="flavor">
+        <option value="debug">Debug</option>
+        <option value="release">Release (needs qa-feed)</option>
+      </select></label>
+      <label>CEF <select id="cef">
+        <option value="full">Full bundle</option>
+        <option value="loader">Loader-only (DLC test)</option>
+      </select></label>
+      <label><input id="open-hub" type="checkbox" checked> Open hub</label>
+      <label><input id="restage" type="checkbox"> Rebuild portable</label>
+    </div>
+    <div class="row">
+      <button class="primary" id="go" onclick="prepare()">Launch</button>
+      <button id="relaunch" onclick="relaunch()" disabled>Relaunch</button>
+      <button onclick="stop()">Stop</button>
+      <button class="ghost" onclick="buildRelease()">Build release qa-feed</button>
+    </div>
+    <div class="row muted" id="run">—</div>
+    <div class="row muted">Direct debug is fastest and still tests the hub/app/engine flow. Portable stages a private install; loader-only omits resources/locales so the Browser engine must be installed from the hub. Release only honors the mock update feed when built with qa-feed.</div>
+  </section>
+
+  <section class="card">
+    <h2>Status</h2>
+    <div id="info" class="mono muted">—</div>
+  </section>
+
+  <details><summary>Log</summary><pre id="log">—</pre></details>
 </main>
 <script>
 let S = null;
+let initialized = false;
 const $ = (id) => document.getElementById(id);
-async function getState(){ S = await (await fetch('/api/state')).json(); render(); }
-function cefMode(){ return $('cef-mode').value; }
-function render(){
-  $('status').textContent = `v${S.version} · ${S.git}${S.dirty ? ' dirty' : ''} · ${S.cef ? 'CEF found' : 'CEF missing'}`;
-  $('latest').textContent = S.latest || '—';
-  $('feed').textContent = S.feed_url;
-  $('app-version').textContent = S.version;
-  $('cef-mode').value = S.cef_mode || 'full';
-  $('versions').innerHTML = S.versions.map((v) =>
-    `<tr><td class="tag">${v.tag}</td><td>${v.enabled ? '<span class="pill ok">on</span>' : '<span class="pill">off</span>'}</td>
-     <td><button onclick="toggleVersion('${v.tag}')">Toggle</button>
-         <button onclick="removeVersion('${v.tag}')">Remove</button></td></tr>`).join('');
-  $('installs').innerHTML = S.installed.map((i) =>
-    `<tr><td class="tag">${i.tag}</td><td>${i.sidecar ? '<span class="pill ok">sidecar</span>' : '<span class="pill warn">missing</span>'}</td>
-     <td><button onclick="post('/api/install', {tag:'${i.tag}'})">Reinstall</button>
-         <button onclick="post('/api/uninstall', {tag:'${i.tag}'})">Uninstall</button>
-         <button onclick="launchInstalled('${i.tag}')">Launch</button></td></tr>`).join('');
-  $('build').textContent = S.building ? 'building release…' : (S.build_error ? `build error: ${S.build_error}` : (S.stage_error ? `stage error: ${S.stage_error}` : 'ready'));
-  $('engine').textContent = S.engine ? `${S.engine.url}\\n${S.engine.sha256} (${S.engine.bytes} bytes)` : 'engine zip not built';
-  $('running').textContent = S.running ? `running ${S.running_flavor} pid ${S.running_pid}` : 'not running';
-  $('log').textContent = S.requests.map((r) => `${r.at}  ${r.line}`).join('\\n') || '—';
-  const select = $('flavor');
-  const saved = select.value;
-  select.innerHTML = '<option value="debug">debug (target/debug)</option><option value="release">release qa-feed (target/release)</option>' +
-    S.installed.map((i) => `<option value="installed:${i.tag}">installed ${i.tag}</option>`).join('');
-  if ([...select.options].some((o) => o.value === saved)) select.value = saved;
+async function getState(){
+  try { S = await (await fetch('/api/state')).json(); render(); }
+  catch (e) { $('status').textContent = 'server unavailable: ' + e; }
 }
-function toggleVersion(tag){ const v = S.versions.find((x) => x.tag === tag); post('/api/config', {versions: S.versions.map((x) => x.tag === tag ? {tag, enabled: !x.enabled} : x), latest: S.latest}); }
-function removeVersion(tag){ post('/api/config', {remove: tag}); }
-function addVersion(){ const tag = $('new-tag').value.trim(); if (tag) { post('/api/config', {add: tag}); $('new-tag').value = ''; } }
-function installStaged(){ post('/api/install', {tag: S.latest || ('v' + S.version)}); }
-function saveConfig(){ post('/api/config', {versions: S.versions, latest: S.latest, cef_mode: cefMode()}); }
-function launch(){ post('/api/launch', {flavor: $('flavor').value, debug_open: $('debug-open').value.trim()}); }
-function launchInstalled(tag){ $('flavor').value = 'installed:' + tag; post('/api/launch', {flavor: 'installed:' + tag, debug_open: $('debug-open').value.trim()}); }
-async function post(path, body){ try { const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {})}); const j = await r.json(); if (j.error) alert(j.error); } catch(e){ alert(e); } await getState(); }
-function setLatest(){ const tag = prompt('Latest version tag', S.latest || ''); if (tag) post('/api/config', {latest: tag}); }
-setInterval(getState, 2000); getState();
+function render(){
+  if (!S) return;
+  $('status').textContent =
+    `app ${S.version} · feed ${(S.manifest && S.manifest.tag_name) || S.latest} · ` +
+    (S.running ? `running ${S.running_flavor}` : 'not running') +
+    (S.building ? ' · building release…' : '') +
+    (S.preparing ? ' · preparing…' : '');
+  if (!initialized) {
+    $('version').value = (S.manifest && S.manifest.tag_name) || S.latest || '';
+    $('html-url').value = (S.manifest && S.manifest.html_url) || '';
+    $('manifest').value = JSON.stringify(S.manifest || {}, null, 2);
+    $('cef').value = S.cef_mode || 'full';
+    initialized = true;
+  }
+  $('relaunch').disabled = !S.last_flavor;
+  syncTarget();
+  $('run').textContent = S.running
+    ? `running ${S.running_flavor} pid ${S.running_pid}`
+    : (S.last_flavor ? `last: ${S.last_flavor}` : 'not launched yet');
+  const engine = S.engine ? `DLC ${Math.round(S.engine.bytes / 1048576)} MB` : 'DLC not built';
+  $('info').textContent =
+    `feed ${S.feed_url || ''}\\napp ${S.version} · CEF ${S.cef ? 'found' : 'missing'} · ${engine}\\n` +
+    `installs: ${(S.installed || []).map((i) => i.tag + (i.sidecar ? ' (full)' : ' (loader)')).join(', ') || '—'}`;
+  $('log').textContent = (S.requests || []).map((r) => `${r.at}  ${r.line}`).join('\\n') || '—';
+}
+function syncTarget(){
+  const portable = $('target').value === 'portable';
+  $('cef').disabled = !portable;
+  $('restage').disabled = !portable;
+}
+function manifestValue(){
+  let m = {};
+  try { m = JSON.parse($('manifest').value || '{}'); } catch (e) { m = {}; }
+  m.tag_name = $('version').value.trim();
+  m.html_url = $('html-url').value.trim();
+  if (!m.name) m.name = m.tag_name;
+  if (!m.body) m.body = '';
+  if (!Array.isArray(m.assets)) m.assets = [];
+  return m;
+}
+async function post(path, body){
+  const response = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {})});
+  const data = await response.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+async function saveManifest(){
+  try {
+    await post('/api/config', {manifest: manifestValue(), cef_mode: $('cef').value});
+    $('manifest-note').textContent = 'saved';
+    initialized = false;
+    await getState();
+  } catch (e) { $('manifest-note').textContent = String(e); }
+}
+async function prepare(){
+  const go = $('go');
+  go.disabled = true;
+  const old = go.textContent;
+  go.textContent = 'Preparing…';
+  try {
+    await post('/api/prepare', {
+      manifest: manifestValue(),
+      target: $('target').value,
+      flavor: $('flavor').value,
+      cef: $('cef').value,
+      open_hub: $('open-hub').checked,
+      restage: $('restage').checked
+    });
+    initialized = false;
+    await getState();
+  } catch (e) {
+    alert(String(e));
+  } finally {
+    go.disabled = false;
+    go.textContent = old;
+  }
+}
+async function relaunch(){
+  try { await post('/api/relaunch', {}); await getState(); }
+  catch (e) { alert(String(e)); }
+}
+async function stop(){
+  try { await post('/api/stop', {}); await getState(); }
+  catch (e) { alert(String(e)); }
+}
+async function buildRelease(){
+  try { await post('/api/build', {}); await getState(); }
+  catch (e) { alert(String(e)); }
+}
+setInterval(getState, 2000);
+getState();
 </script>
 </body></html>"""
 
