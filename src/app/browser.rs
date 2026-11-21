@@ -24,6 +24,8 @@ pub enum EngineStatus {
     Ready(PathBuf),
     /// An install/download is in flight.
     Installing,
+    /// A local uninstall is in flight.
+    Uninstalling,
     /// The last install attempt failed; message is user-facing.
     Failed(String),
 }
@@ -616,7 +618,10 @@ impl super::App {
     /// Store; unpackaged/dev builds use the configured zip feed.
     #[cfg(feature = "cef-engine")]
     pub(crate) fn start_engine_install(&mut self) -> Task<Message> {
-        if matches!(self.browser.engine_status, EngineStatus::Installing) {
+        if matches!(
+            self.browser.engine_status,
+            EngineStatus::Installing | EngineStatus::Uninstalling
+        ) {
             return Task::none();
         }
         if self.browser.engine.is_some() {
@@ -699,23 +704,45 @@ impl super::App {
             );
             return Task::none();
         }
+        let close_browser = if self.browser_visible {
+            self.close_browser_window()
+        } else {
+            Task::none()
+        };
+        self.browser.engine_status = EngineStatus::Uninstalling;
+        self.hub_state.set_uninstalling();
+        self.browser.engine_install_generation =
+            self.browser.engine_install_generation.wrapping_add(1);
+        let generation = self.browser.engine_install_generation;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         if let Some(engine) = self.browser.engine.take() {
-            let (tx, _rx) = std::sync::mpsc::channel();
-            engine.send(EngineCommand::Shutdown { done: tx });
+            engine.send(EngineCommand::Shutdown { done: done_tx });
         }
         self.browser.engine_available = false;
-        self.browser.engine_status = EngineStatus::Missing;
-        match crate::browser::engine_install::uninstall_local(&path) {
-            Ok(()) => {
-                self.hub_state.install_done(false, None);
-                crate::platform::app_log::info("cef: BrowserEngine uninstalled");
-            }
-            Err(err) => {
-                crate::platform::app_log::warn(format!("cef: uninstall failed: {err}"));
-                self.hub_state.install_done(false, Some(err));
-            }
-        }
-        Task::none()
+        let uninstall = Task::perform(
+            async move {
+                super::spawn_blocking(move || {
+                    // Let the engine worker close its browsers before the
+                    // pointer is dropped. The DLL stays mapped either way;
+                    // the directory itself is deferred to next boot.
+                    let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+                    // Keep the inline meter visible long enough to read.
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    crate::browser::engine_install::uninstall_local(&path)
+                        .map_err(crate::AppError::Persist)
+                })
+                .await
+            },
+            move |result| Message::EngineUninstallDone {
+                generation,
+                result: match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(err)) => Err(err.to_string()),
+                    Err(err) => Err(err.to_string()),
+                },
+            },
+        );
+        close_browser.chain(uninstall)
     }
 
     #[cfg(not(feature = "cef-engine"))]
@@ -775,6 +802,35 @@ impl super::App {
         Task::none()
     }
 
+    #[cfg(feature = "cef-engine")]
+    pub(crate) fn on_engine_uninstall_done(
+        &mut self,
+        generation: u64,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        if generation != self.browser.engine_install_generation
+            || !matches!(self.browser.engine_status, EngineStatus::Uninstalling)
+        {
+            return Task::none();
+        }
+        self.browser.engine_install_generation =
+            self.browser.engine_install_generation.wrapping_add(1);
+        match result {
+            Ok(()) => {
+                self.browser.engine_status = EngineStatus::Missing;
+                self.browser.engine_available = false;
+                self.hub_state.uninstall_done(None);
+                crate::platform::app_log::info("cef: BrowserEngine uninstalled");
+            }
+            Err(err) => {
+                crate::platform::app_log::warn(format!("cef: uninstall failed: {err}"));
+                self.browser.engine_status = EngineStatus::Failed(err.clone());
+                self.hub_state.uninstall_done(Some(err));
+            }
+        }
+        Task::none()
+    }
+
     #[cfg(not(feature = "cef-engine"))]
     pub(crate) fn on_engine_install_done(
         &mut self,
@@ -787,37 +843,31 @@ impl super::App {
 #[cfg(feature = "cef-engine")]
 fn hub_install_progress(
     progress: crate::browser::engine_install::InstallProgress,
-) -> crate::ui::hub::InstallProgress {
+) -> crate::ui::hub::EngineProgress {
     use crate::browser::engine_install::InstallProgress as Engine;
-    use crate::ui::hub::{InstallPhase, InstallProgress};
+    use crate::ui::hub::{EnginePhase, EngineProgress};
     match progress {
-        Engine::Starting => InstallProgress {
-            phase: InstallPhase::Starting,
-            ..InstallProgress::default()
+        Engine::Starting => EngineProgress {
+            phase: EnginePhase::Preparing,
+            fraction: None,
         },
-        Engine::Downloading { received, total } => InstallProgress {
-            phase: InstallPhase::Downloading,
+        Engine::Downloading { received, total } => EngineProgress {
+            phase: EnginePhase::Downloading,
             fraction: total
                 .filter(|total| *total > 0)
                 .map(|total| received as f32 / total as f32),
-            done: received,
-            total,
         },
-        Engine::Verifying { done, total } => InstallProgress {
-            phase: InstallPhase::Verifying,
+        Engine::Verifying { done, total } => EngineProgress {
+            phase: EnginePhase::Verifying,
             fraction: (total > 0).then(|| done as f32 / total as f32),
-            done,
-            total: Some(total),
         },
-        Engine::Extracting { done, total } => InstallProgress {
-            phase: InstallPhase::Extracting,
+        Engine::Extracting { done, total } => EngineProgress {
+            phase: EnginePhase::Installing,
             fraction: (total > 0).then(|| done as f32 / total as f32),
-            done: done as u64,
-            total: Some(total as u64),
         },
-        Engine::Finishing => InstallProgress {
-            phase: InstallPhase::Finishing,
-            ..InstallProgress::default()
+        Engine::Finishing => EngineProgress {
+            phase: EnginePhase::Finishing,
+            fraction: None,
         },
     }
 }

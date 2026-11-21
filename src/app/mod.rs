@@ -181,6 +181,14 @@ pub enum Message {
         generation: u64,
         progress: crate::browser::engine_install::InstallProgress,
     },
+    /// BrowserEngine uninstall finished.
+    #[cfg(feature = "cef-engine")]
+    EngineUninstallDone {
+        generation: u64,
+        result: Result<(), String>,
+    },
+    /// 60Hz tick while the hub animates the indeterminate uninstall meter.
+    HubProgressTick,
     /// A window resized (logical size). The browser and hub consume this;
     /// the event is authoritative for their final full-cover size.
     WindowSized(window::Id, iced::Size),
@@ -340,7 +348,8 @@ impl Message {
             | Message::ShellFadeTick
             | Message::StartArtEvent(_) => false,
             #[cfg(feature = "cef-engine")]
-            Message::EngineInstallProgress { .. } => false,
+            Message::EngineInstallProgress { .. } | Message::EngineUninstallDone { .. } => false,
+            Message::HubProgressTick => false,
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
             #[cfg(debug_assertions)]
@@ -1312,6 +1321,12 @@ impl App {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::ToastFrame));
         }
 
+        // The local uninstall is almost instant, but the inline meter still
+        // animates while the worker closes and the pointer is dropped.
+        if self.hub_state.uninstalling {
+            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::HubProgressTick));
+        }
+
         // Transient: animate the reload-button spinner until the queued exit.
         if self.renderer_reload_queued {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::RendererReloadTick));
@@ -1700,6 +1715,14 @@ impl App {
                 generation,
                 progress,
             } => self.on_engine_install_progress(generation, progress),
+            #[cfg(feature = "cef-engine")]
+            Message::EngineUninstallDone { generation, result } => {
+                self.on_engine_uninstall_done(generation, result)
+            }
+            Message::HubProgressTick => {
+                self.hub_state.advance_progress_anim();
+                Task::none()
+            }
             Message::WindowSized(id, size) => {
                 if self.browser_window == Some(id) {
                     self.on_browser_window_sized(size)

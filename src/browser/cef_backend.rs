@@ -37,11 +37,23 @@ const BROWSER_BG: u32 = 0xFFFF_FFFF;
 /// (usually a missing runtime that was installed afterwards).
 static INIT: Mutex<Option<bool>> = Mutex::new(None);
 
+/// Runtime directory actually loaded into this process. Uninstall/reinstall
+/// keeps the old files mapped until exit, so the installer must not delete
+/// this directory mid-session.
+static LOADED_DIR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+pub(crate) fn loaded_engine_dir() -> Option<std::path::PathBuf> {
+    LOADED_DIR
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
 /// Resolve the CEF runtime directory. Search order:
 /// 1. `CEF_PATH` (explicit/dev override; may point at the versioned parent).
 /// 2. `cef\` next to the executable (portable bundle).
 /// 3. The `BrowserEngine` optional MSIX package (`...\cef`).
-/// 4. `%LOCALAPPDATA%\sdsc-utils\cef-engine` (dev download).
+/// 4. The local versioned store (`cef-engine.current` → `cef-engine-<stamp>`).
 /// 5. The build-time `OUT_DIR` fallback (debug builds only).
 ///
 /// A directory is only accepted when the runtime files CEF must load exist;
@@ -61,7 +73,11 @@ pub fn resolve_engine_dir() -> Option<std::path::PathBuf> {
     }
     #[cfg(windows)]
     candidates.extend(optional_package_dirs());
-    candidates.push(crate::persist::paths::data_dir().join("cef-engine"));
+    if let Some(local) =
+        crate::browser::engine_install::active_local_dir(&crate::persist::paths::data_dir())
+    {
+        candidates.push(local);
+    }
     // Build-time distribution directory. It exists on the build machine
     // (including `cargo run --release`); portable/Store installs resolve via
     // the sidecar/package paths above instead. QA launches set
@@ -224,6 +240,7 @@ fn initialize_cef(dir: &std::path::Path) -> bool {
         std::ptr::null_mut(),
     ) != 0;
     if ok {
+        *LOADED_DIR.lock().unwrap_or_else(|err| err.into_inner()) = Some(dir.to_path_buf());
         crate::platform::app_log::info(format!("cef: initialized from {}", dir.display()));
     } else {
         crate::platform::app_log::warn("cef: CefInitialize failed");

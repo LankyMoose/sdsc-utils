@@ -2,9 +2,14 @@
 //!
 //! Store/packaged builds use the platform installer path in `app::browser`;
 //! this module is the unpackaged/dev fallback: download a zipped CEF runtime
-//! from `SDSC_CEF_DLC_URL`, verify `SDSC_CEF_DLC_SHA256`, extract it under
-//! `%LOCALAPPDATA%/sdsc-utils/cef-engine`, and report success only when a
-//! complete runtime layout is present.
+//! from `SDSC_CEF_DLC_URL`, verify `SDSC_CEF_DLC_SHA256`, and install it into
+//! a versioned directory under `%LOCALAPPDATA%/sdsc-utils`.
+//!
+//! A running CEF maps `libcef.dll` and cannot have its directory replaced.
+//! Every install therefore lands in a fresh `cef-engine-<stamp>` folder and
+//! publishes it through `cef-engine.current`. The previous directory is
+//! scheduled for deletion after the next boot; reinstall works in the same
+//! process even while the old runtime is still loaded.
 //!
 //! No URL/hash is compiled in: the DLC feed is deployment configuration, not
 //! source. Without both env vars the install UI reports that the package is
@@ -13,10 +18,16 @@
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+const LOCAL_ENGINE_PREFIX: &str = "cef-engine";
+const LOCAL_LEGACY_DIR: &str = "cef-engine";
+const LOCAL_POINTER_FILE: &str = "cef-engine.current";
+const LOCAL_STAGING_DIR: &str = "cef-engine.staging";
+const LOCAL_PENDING_FILE: &str = "cef-engine.uninstall";
 
 /// Install phases reported to the hub while the engine DLC is prepared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,8 +58,8 @@ pub fn install_from_env_with_progress(
         return Err("Browser engine download is not configured".to_string());
     }
 
-    let target = crate::persist::paths::data_dir().join("cef-engine");
-    let staging = target.with_extension("staging");
+    let data = crate::persist::paths::data_dir();
+    let staging = data.join(LOCAL_STAGING_DIR);
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| format!("create staging dir: {e}"))?;
 
@@ -69,10 +80,8 @@ pub fn install_from_env_with_progress(
         let _ = std::fs::remove_dir_all(&staging);
         return Err("Downloaded package does not contain a CEF runtime".to_string());
     };
-    // Only replace the previous install after the new runtime is fully
-    // staged and verified; a failed download must never delete a working
-    // engine.
-    let _ = std::fs::remove_dir_all(&target);
+    let previous = active_local_dir(&data);
+    let target = unique_local_target(&data);
     if runtime == staging {
         std::fs::rename(&staging, &target).map_err(|e| format!("install runtime: {e}"))?;
     } else {
@@ -80,13 +89,117 @@ pub fn install_from_env_with_progress(
         copy_dir(&runtime, &target)?;
         let _ = std::fs::remove_dir_all(&staging);
     }
-    if !crate::browser::cef_backend::resolve_engine_dir().is_some_and(|p| p == target) {
-        // The resolver may find another install; re-check the directory itself.
-        if !crate::browser::cef_backend::validate_engine_dir(&target) {
-            return Err("Installed files do not form a valid CEF runtime".to_string());
+    if !crate::browser::cef_backend::validate_engine_dir(&target) {
+        let _ = std::fs::remove_dir_all(&target);
+        return Err("Installed files do not form a valid CEF runtime".to_string());
+    }
+    if let Err(err) = write_pointer(&data, &target) {
+        let _ = std::fs::remove_dir_all(&target);
+        return Err(err);
+    }
+    schedule_stale_dirs(&data, &target, previous.as_deref());
+    Ok(target)
+}
+
+/// The active local engine: the pointer target when present, otherwise the
+/// legacy single `cef-engine` directory.
+pub(crate) fn active_local_dir(data: &Path) -> Option<PathBuf> {
+    let pointer = data.join(LOCAL_POINTER_FILE);
+    if pointer.is_file()
+        && let Ok(raw) = std::fs::read_to_string(&pointer)
+        && !raw.trim().is_empty()
+    {
+        let path = local_engine_path(data, raw.trim())?;
+        return crate::browser::cef_backend::validate_engine_dir(&path).then_some(path);
+    }
+    let legacy = data.join(LOCAL_LEGACY_DIR);
+    crate::browser::cef_backend::validate_engine_dir(&legacy).then_some(legacy)
+}
+
+fn local_engine_path(data: &Path, raw: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(raw);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        data.join(path)
+    };
+    (path.starts_with(data) && path != data).then_some(path)
+}
+
+fn unique_local_target(data: &Path) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    let mut target = data.join(format!("{LOCAL_ENGINE_PREFIX}-{stamp}"));
+    let mut suffix = 1;
+    while target.exists() {
+        target = data.join(format!("{LOCAL_ENGINE_PREFIX}-{stamp}-{suffix}"));
+        suffix += 1;
+    }
+    target
+}
+
+fn write_pointer(data: &Path, target: &Path) -> Result<(), String> {
+    std::fs::write(
+        data.join(LOCAL_POINTER_FILE),
+        target.to_string_lossy().as_bytes(),
+    )
+    .map_err(|e| format!("write engine pointer: {e}"))
+}
+
+fn is_engine_dir(data: &Path, path: &Path) -> bool {
+    path.starts_with(data)
+        && path != data
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(LOCAL_ENGINE_PREFIX))
+}
+
+/// Remove every old local runtime except `keep`. The runtime currently mapped
+/// into this process is only scheduled (deleting its files could break the
+/// live browser).
+fn schedule_stale_dirs(data: &Path, keep: &Path, previous: Option<&Path>) {
+    let loaded = crate::browser::cef_backend::loaded_engine_dir();
+    let Ok(entries) = std::fs::read_dir(data) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || path == keep || !is_engine_dir(data, &path) {
+            continue;
+        }
+        let name = entry.file_name();
+        if name.to_string_lossy() == LOCAL_STAGING_DIR {
+            continue;
+        }
+        let is_live = previous.is_some_and(|old| old == path.as_path())
+            || loaded.as_deref() == Some(path.as_path());
+        let removed = !is_live && std::fs::remove_dir_all(&path).is_ok();
+        if !removed {
+            schedule_pending(data, &path);
         }
     }
-    Ok(target)
+}
+
+fn schedule_pending(data: &Path, path: &Path) {
+    if !is_engine_dir(data, path) {
+        return;
+    }
+    let marker = data.join(LOCAL_PENDING_FILE);
+    let mut lines: Vec<String> = std::fs::read_to_string(&marker)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    let line = path.to_string_lossy().to_string();
+    if !lines.iter().any(|existing| existing == &line) {
+        lines.push(line);
+    }
+    let _ = std::fs::write(marker, lines.join("\n"));
 }
 
 fn download(
@@ -245,46 +358,52 @@ fn find_runtime_root(root: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Remove a locally installed engine. Files locked by the running CEF
-/// processes cannot be deleted until exit, so a marker schedules the removal
-/// for the next boot (before CEF initializes).
+/// Remove a locally installed engine. The active pointer is dropped
+/// immediately (the hub reports Missing); the directory itself is deferred
+/// until the next boot because the running process has `libcef.dll` mapped.
+/// Reinstall works now because a new versioned directory is used.
 pub fn uninstall_local(path: &Path) -> Result<(), String> {
     let data = crate::persist::paths::data_dir();
-    if !path.starts_with(&data) {
+    if !is_engine_dir(&data, path) {
         return Err(
             "This engine lives outside the app data folder; remove its cef folder manually"
                 .to_string(),
         );
     }
-    let marker = data.join("cef-engine.uninstall");
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(marker);
-            Ok(())
-        }
-        Err(_) => {
-            std::fs::write(&marker, path.to_string_lossy().as_bytes())
-                .map_err(|e| format!("schedule removal: {e}"))?;
-            Ok(())
-        }
+    let pointer = data.join(LOCAL_POINTER_FILE);
+    if let Ok(raw) = std::fs::read_to_string(&pointer)
+        && local_engine_path(&data, raw.trim()).as_deref() == Some(path)
+    {
+        let _ = std::fs::remove_file(&pointer);
     }
+    schedule_pending(&data, path);
+    Ok(())
 }
 
-/// Run before CEF initializes. Deletes a scheduled engine directory after the
+/// Run before CEF initializes. Deletes scheduled engine directories after the
 /// previous process released its DLLs.
 pub fn cleanup_pending_uninstall() {
     let data = crate::persist::paths::data_dir();
-    let marker = data.join("cef-engine.uninstall");
+    let marker = data.join(LOCAL_PENDING_FILE);
     if !marker.is_file() {
         return;
     }
-    if let Ok(raw) = std::fs::read_to_string(&marker) {
-        let path = PathBuf::from(raw.trim());
-        if path.starts_with(&data) {
-            let _ = std::fs::remove_dir_all(&path);
+    let raw = std::fs::read_to_string(&marker).unwrap_or_default();
+    let mut remaining = Vec::new();
+    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let path = PathBuf::from(line);
+        if !is_engine_dir(&data, &path) {
+            continue;
+        }
+        if std::fs::remove_dir_all(&path).is_err() {
+            remaining.push(line.to_string());
         }
     }
-    let _ = std::fs::remove_file(marker);
+    if remaining.is_empty() {
+        let _ = std::fs::remove_file(marker);
+    } else {
+        let _ = std::fs::write(marker, remaining.join("\n"));
+    }
 }
 
 #[cfg(test)]
@@ -298,15 +417,19 @@ mod tests {
         dir
     }
 
+    fn fake_runtime(root: &Path) {
+        std::fs::create_dir_all(root.join("locales")).unwrap();
+        for file in ["libcef.dll", "icudtl.dat", "resources.pak"] {
+            std::fs::write(root.join(file), b"x").unwrap();
+        }
+        std::fs::write(root.join("locales").join("en-US.pak"), b"x").unwrap();
+    }
+
     #[test]
     fn finds_wrapped_runtime_directory() {
         let root = temp_dir("cef-wrap");
         let inner = root.join("cef_windows_x86_64");
-        std::fs::create_dir_all(inner.join("locales")).unwrap();
-        for file in ["libcef.dll", "icudtl.dat", "resources.pak"] {
-            std::fs::write(inner.join(file), b"x").unwrap();
-        }
-        std::fs::write(inner.join("locales").join("en-US.pak"), b"x").unwrap();
+        fake_runtime(&inner);
         assert_eq!(find_runtime_root(&root), Some(inner));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -316,6 +439,23 @@ mod tests {
         let root = temp_dir("cef-partial");
         std::fs::write(root.join("libcef.dll"), b"x").unwrap();
         assert_eq!(find_runtime_root(&root), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pointer_selects_versioned_install_and_legacy_falls_back() {
+        let root = temp_dir("cef-pointer");
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let legacy = data.join(LOCAL_LEGACY_DIR);
+        fake_runtime(&legacy);
+        assert_eq!(active_local_dir(&data), Some(legacy));
+        let versioned = data.join("cef-engine-1");
+        fake_runtime(&versioned);
+        write_pointer(&data, &versioned).unwrap();
+        assert_eq!(active_local_dir(&data), Some(versioned));
+        std::fs::write(data.join(LOCAL_POINTER_FILE), b"not an engine").unwrap();
+        assert_eq!(active_local_dir(&data), None);
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -165,6 +165,24 @@ def appdata_for(name: str) -> Path:
     return APPDATA_ROOT / name
 
 
+def engine_appdata_present(appdata: Path) -> bool:
+    """Mirror the app resolver: pointer target first, legacy `cef-engine`."""
+    root = appdata / "sdsc-utils"
+    pointer = root / "cef-engine.current"
+    if pointer.is_file():
+        try:
+            raw = pointer.read_text(encoding="utf-8").strip()
+        except OSError:
+            return False
+        if not raw:
+            return False
+        path = Path(raw)
+        if not path.is_absolute():
+            path = root / path
+        return (path / "libcef.dll").is_file()
+    return (root / "cef-engine" / "libcef.dll").is_file()
+
+
 class Console:
     def __init__(self, port: int):
         self.port = port
@@ -268,13 +286,12 @@ class Console:
                 marker = entry / ".qa-mode"
                 mode = marker.read_text(encoding="utf-8").strip() if marker.is_file() else ""
                 appdata = appdata_for(f"portable-{entry.name}")
-                engine_data = appdata / "sdsc-utils" / "cef-engine"
                 found[entry.name] = {
                     "tag": entry.name,
                     "path": str(entry),
                     "exe": str(exe),
                     "sidecar": (entry / "cef" / "libcef.dll").is_file(),
-                    "engine_appdata": (engine_data / "libcef.dll").is_file(),
+                    "engine_appdata": engine_appdata_present(appdata),
                     "mode": ":".join(mode.split(":")[:2]),
                     "appdata": str(appdata),
                 }

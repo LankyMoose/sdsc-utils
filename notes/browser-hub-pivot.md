@@ -155,7 +155,10 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    (D-pad primary/Back, Cross select); Browser on a missing engine opens the
    catalog instead of a dead page. Dev install uses
    `SDSC_CEF_DLC_URL`/`SDSC_CEF_DLC_SHA256`, SHA-256 verification, and
-   extraction to `LocalAppData`. Because the app binary delay-loads CEF, a
+   extraction to `LocalAppData`. Installs are versioned
+   (`cef-engine-<stamp>` + `cef-engine.current`), so a locked running runtime
+   never blocks a reinstall; uninstall drops the pointer and defers directory
+   cleanup to the next boot. Because the app binary delay-loads CEF, a
    truly engine-less portable starts; the install path loads `libcef.dll` and
    attaches the engine in the same process. Remaining: Store
    `RequestDownloadAndInstallStorePackagesAsync` wiring/product IDs,

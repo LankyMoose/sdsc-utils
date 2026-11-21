@@ -33,6 +33,9 @@ zips, the CEF DLC zip, installed copies, and private `APPDATA` dirs.
 - **Installed state.** Check **Bundle browser engine** to stage a full `cef\`
   sidecar beside the exe. Use **Relaunch** to run the last install again; a
   previously downloaded engine in the private appdata survives relaunches.
+  Install and uninstall both show the active phase and an in-tile meter
+  (`Downloading`, `Verifying`, `Installing`, `Uninstalling`); there is no
+  separate progress panel.
 - **Reset.** **Rebuild install** recreates the install dir and wipes its
   private appdata, including any engine downloaded during the last
   walk-through, so the clean flow can be repeated.
@@ -58,6 +61,16 @@ directory and calls `SetDllDirectoryW` first (`browser::cef_backend`), so:
 
 This is why the QA console no longer needs a “loader-only” sidecar: a truly
 empty install is the default test state.
+
+## Local engine store
+
+Local DLC installs land in `%APPDATA%\sdsc-utils\cef-engine-<stamp>` and
+`cef-engine.current` points at the active copy. A running CEF keeps
+`libcef.dll` mapped, so uninstall drops the pointer immediately and schedules
+the directory for cleanup on the next boot. Reinstall works in the same
+session because it writes a new versioned directory; the still-loaded old
+runtime is left intact until exit. The next boot deletes the pending old
+copies and loads the pointer target.
 
 ## Environment overrides
 
