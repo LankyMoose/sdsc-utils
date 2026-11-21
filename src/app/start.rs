@@ -424,14 +424,13 @@ impl App {
         // The card's 16:9 page area drives the engine viewport; sync before
         // the first frame so the cursor space and image are the same size.
         self.sync_browser_viewport();
-        // Fresh session (never navigated, no pending draft): restore the
-        // persisted strip when one exists, else start at home instead of
-        // the empty state. A typed-but-unsent draft is the user's intent —
-        // leave it for Go.
-        if self.browser.panel.session.url().is_empty()
-            && self.browser.panel.draft.trim().is_empty()
-            && self.browser.panel.stored.is_empty()
-        {
+        // First fresh surface: restore the persisted strip when one exists,
+        // else start at home instead of the empty state. The engine already
+        // preloaded the saved active URL at boot, so the session URL is never
+        // empty here; a one-shot flag distinguishes the first open from a
+        // reopen of the cached page.
+        if !self.browser.tabs_restored {
+            self.browser.tabs_restored = true;
             let saved = crate::browser::tabs::load();
             if !saved.tabs.is_empty() {
                 let task = self.restore_browser_tabs(saved);
@@ -1551,11 +1550,33 @@ impl App {
             // when switched to.
             return self.on_browser_navigate();
         }
+        self.prefetch_stored_tab_favicons();
         self.sync_browser_theme();
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Nav);
         crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
         Task::none()
+    }
+
+    /// Restored background tabs have URLs but no loaded page (and therefore
+    /// no CEF favicon callback). Fetch their conventional icons so the strip
+    /// does not look half-finished until each tab is visited.
+    fn prefetch_stored_tab_favicons(&mut self) {
+        let Some(engine) = &self.browser.engine else {
+            return;
+        };
+        let mut seen = std::collections::HashSet::new();
+        for stored in &self.browser.panel.stored {
+            let url = stored.page.session.url().to_string();
+            if url.is_empty() {
+                continue;
+            }
+            let key = crate::browser::bookmarks::origin_key(&url);
+            if key == url || self.browser.panel.favicons.contains_key(&key) || !seen.insert(key) {
+                continue;
+            }
+            engine.send(crate::browser::engine::EngineCommand::PrefetchFavicon { url });
+        }
     }
 
     /// User-opened tab (`+`): stash live, reset, create the home-loaded view
@@ -1830,12 +1851,19 @@ impl App {
             }
             EngineEvent::TitleChanged { tab: _, title } => {
                 self.browser.panel.session.note_title(title);
-                self.browser.panel.save_tabs();
+                // The boot tab loads before the Browser window opens; writing
+                // the strip now would replace the saved multi-tab file with
+                // this one boot tab before the first restore reads it.
+                if self.browser.tabs_restored {
+                    self.browser.panel.save_tabs();
+                }
             }
             EngineEvent::UrlChanged { tab: _, url } => {
                 self.browser.panel.session.note_url(url.clone());
                 self.browser.panel.draft = url;
-                self.browser.panel.save_tabs();
+                if self.browser.tabs_restored {
+                    self.browser.panel.save_tabs();
+                }
                 // A new document underneath invalidates the selector's
                 // snapshot (link click, redirect, history travel).
                 self.browser.panel.history_selector = None;
@@ -2044,7 +2072,7 @@ impl App {
                 | EngineEvent::TabClosed { .. } => {}
             }
         }
-        if strip_changed {
+        if strip_changed && self.browser.tabs_restored {
             self.browser.panel.save_tabs();
         }
     }

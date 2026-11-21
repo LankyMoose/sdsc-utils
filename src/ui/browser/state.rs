@@ -788,7 +788,10 @@ pub fn chrome_layout(panel: &BrowserPanel) -> Vec<ChromeRowLayout> {
     const CLOSE_PAD: f32 = 12.0; // close padding [4, 6]
     const ICON_W: f32 = 22.0; // 16px favicon + 6px spacing
     const TAB_GAP: f32 = 4.0;
-    const TITLE_MIN: f32 = 16.0;
+    // Minimum title budget per tab (~120px tab + close). Below this the
+    // strip switches to the overflow chip instead of collapsing titles to a
+    // few characters.
+    const TITLE_MIN: f32 = 72.0;
     // Give a lone/few tabs real room. The old fixed 140px cap clipped normal
     // page titles after a handful of characters on wide screens.
     let title_max = (viewport_w * 0.55).clamp(200.0, 640.0);

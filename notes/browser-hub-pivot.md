@@ -125,9 +125,10 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    before argument parsing. During phase 3 CEF was behind `cef-engine`, mutually
    exclusive with `servo-engine`; it needs the static MSVC CRT because
    `libcef_dll_wrapper` is built `/MT`. Sandbox is disabled in this phase;
-   popups (`window.open`/`target=_blank`) are denied; favicons and
-   `HistoryChanged` are not emitted yet. Engine-presence/DLC install remains
-   phase 5.
+   popups (`window.open`/`target=_blank`) are denied; canonical
+   `HistoryChanged` is not emitted yet. Favicons are fetched from CEF's icon
+   URLs (and `/favicon.ico` for bookmarks). Engine-presence/DLC install
+   remains phase 5.
 4. **Delete Servo + reader, flip to CEF. — landed.** `servo_backend.rs`,
    the `servo-engine` feature/deps, `declare_surfman!`, Stylo stack env,
    Clang/Python build steps, `SDSC_NO_ENGINE`, and `fetch.rs` are gone;

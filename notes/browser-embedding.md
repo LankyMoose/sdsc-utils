@@ -35,8 +35,10 @@ window, the engine worker, DOM targets, or the CEF packaging path.
   `FrameSlot`. Covers navigate/tabs/resize/visibility/suspend/back/forward/
   reload/mouse/key/wheel/click-at/DOM reseed. `--type=` helpers re-exec the
   exe and run `CefExecuteProcess` before argument parsing. Popups are denied
-  until engine-created tab adoption lands; favicons and canonical
-  `HistoryChanged` are not emitted yet.
+  until engine-created tab adoption lands; canonical `HistoryChanged` is not
+  emitted yet. Favicons come from `DisplayHandler::on_favicon_urlchange`
+  (fetched off-thread with `favicon.rs`); bookmarks with no page visit yet
+  prefetch the site's conventional `/favicon.ico`.
 - `src/browser/dom.rs` — DOM target query JS. CEF polls it from the page's
   V8 context through a renderer-process message bridge; the browser process
   parses the JSON. Stable per-document ids, viewport boxes, visibility,
@@ -60,10 +62,13 @@ window, the engine worker, DOM targets, or the CEF packaging path.
 
 ## Current input/UX contract (pad)
 
-- The analog scroll is accumulated and flushed once per `BrowserFrame`
-  instead of one wheel event per pad poll; Chromium's smooth-scroll easing is
-  disabled via `--disable-smooth-scrolling`. The custom iced scrollbar was
-  removed — Chromium owns the page scrollbar.
+- Analog scroll is accumulated once per `BrowserFrame` and applied as an
+  instant `scrollBy` on the innermost scroller under the cursor (falling back
+  to the window). Wheel events feed Chromium's scroll animator, which trails
+  the stick and keeps gliding after release; the instant path stops the frame
+  the stick centers. `--disable-smooth-scrolling` still covers real wheel
+  input. The custom iced scrollbar was removed — Chromium owns the page
+  scrollbar.
 - Docked clicks use `window.__sdsc_click`, defined by the DOM query itself
   (the observer install script is gone). Precise/free clicks use trusted
   synthetic events at the point.
@@ -99,13 +104,23 @@ the hub over Browser exactly like over Start.
 - R2 turbo doubles cursor acceleration/cap and scroll speed while held and
   disables docking; release re-snaps in place.
 - Right stick scrolls only while the cursor is over the page. Scroll
-  commands go straight to the engine (no wheel-event round-trip).
+  commands go straight to the engine as instant JS deltas (no wheel
+  animation).
 - Cross clicks the docked target (chrome target first, then exact-element
   click, else point click); Circle closes/backs out; Triangle edits the URL;
   L1/R1 travel history (tap) or open the history selector (hold); L3 toggles
   magnet; R3 dumps an issue bundle.
-- Tabs: favicon (not emitted by CEF yet) + ellipsized title + close, active
-  highlighted; background tabs suspend, strip persists/restores lazily.
+- Tabs: favicon (CEF icon URLs, 64px cache keyed by origin) + minimum-width
+  title + close, active highlighted; crowded strips switch to an overflow
+  chip instead of collapsing titles. Background tabs suspend, strip
+  persists/restores lazily.
+- The saved strip is not written until the first Browser open has restored
+  it. The engine preloads the saved active URL at boot and its early
+  `TitleChanged`/`UrlChanged` events used to persist a one-tab strip before
+  the restore read the file; `BrowserAppState::tabs_restored` gates that.
+- The Browser root leaves the margin transparent on alpha-capable backends so
+  the 16:9 card floats over the desktop; the cursor is recentered in the live
+  page area every time the window opens.
 
 ## Build prerequisites (Windows)
 
@@ -144,8 +159,9 @@ CEF toolchain needs the pinned compiler.
   place).
 - **Popups denied**: `window.open`/`target=_blank` are canceled until the UI
   adopts engine-created tabs.
-- **No favicons / canonical history events**: tab titles and URLs work;
-  favicon cache and exact back/forward stacks come later.
+- **Canonical history events**: tab titles and URLs work; exact back/forward
+  stacks come later. Favicon fetches use the app's own HTTP client (no CEF
+  cookies) and fall back to `/favicon.ico`.
 - **Accelerated OSR not wired**: L1 CPU `OnPaint` only; `OnAcceleratedPaint`
   shared-texture import is the L2 performance step.
 - **macOS/Linux untested** for the CEF backend.

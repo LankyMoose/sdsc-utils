@@ -56,6 +56,10 @@ pub struct BrowserAppState {
     /// Browser-window pad bank: face/bumper edges + reader nav. The engine
     /// cursor uses `dpad_stepper` and raw stick samples instead.
     pub nav: crate::domain::pad::PadNavBank,
+    /// First fresh Browser surface attempted the persisted-strip restore.
+    /// The engine preloads the saved active URL at boot, so "session URL is
+    /// empty" is not a usable freshness test on later opens.
+    pub tabs_restored: bool,
 }
 
 use iced::Task;
@@ -143,14 +147,20 @@ impl super::App {
         // A new window can land on a different monitor; the cover drives the
         // first layout until its own resize event arrives.
         self.browser_window_size = None;
+        self.sync_browser_viewport();
+        // Center before the first frame, not after the window has painted the
+        // previous open's cursor position.
+        self.browser.panel.cursor.reset_for_page();
+        self.browser.panel.last_sent_mouse = None;
         self.browser_visible = true;
         let was_open = self.browser.panel.session.is_open();
         let (id, open) = iced::window::open(iced::window::Settings {
             size: cover.size(),
             position: iced::window::Position::Specific(cover.origin()),
             visible: crate::ui::layout::open_visible(),
-            // Opaque app window: the root view paints the full backdrop.
-            transparent: false,
+            // The 16:9 card floats over the desktop; the root view leaves the
+            // margin clear on backends that can composite alpha.
+            transparent: crate::ui::chrome::transparent_windows(),
             resizable: false,
             decorations: false,
             level: iced::window::Level::Normal,
@@ -160,6 +170,10 @@ impl super::App {
         });
         self.browser_window = Some(id);
         self.arm_chord_release_latch();
+        // Fetch conventional bookmark icons once the engine and the UI event
+        // subscription are alive; restored bookmarks would otherwise stay
+        // iconless until each site is visited.
+        self.prefetch_bookmark_favicons();
         crate::controller::hid::diag::diag_info("ui-diag: browser window open");
         let opened = open.map(Message::BrowserOpened);
         if was_open {
@@ -192,6 +206,28 @@ impl super::App {
             return task.chain(crate::ui::layout::focus_window(start));
         }
         task
+    }
+
+    /// Ask the engine for `/favicon.ico` for remembered sites that have no
+    /// cached icon yet. Space is bounded and origins are deduped; the worker
+    /// also dedupes across opens.
+    fn prefetch_bookmark_favicons(&mut self) {
+        let Some(engine) = &self.browser.engine else {
+            return;
+        };
+        let mut seen = std::collections::HashSet::new();
+        for bookmark in self.browser.panel.bookmarks.iter().take(32) {
+            let key = crate::browser::bookmarks::origin_key(&bookmark.url);
+            if key == bookmark.url
+                || self.browser.panel.favicons.contains_key(&key)
+                || !seen.insert(key)
+            {
+                continue;
+            }
+            engine.send(crate::browser::engine::EngineCommand::PrefetchFavicon {
+                url: bookmark.url.clone(),
+            });
+        }
     }
 
     pub(crate) fn on_browser_opened(&mut self, id: iced::window::Id) -> Task<Message> {

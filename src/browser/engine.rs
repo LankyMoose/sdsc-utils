@@ -159,6 +159,12 @@ pub enum EngineCommand {
     Shutdown {
         done: std::sync::mpsc::Sender<()>,
     },
+    /// Fetch a site's conventional `/favicon.ico` for a bookmark whose page
+    /// has not been opened this session. The event keys by the page URL's
+    /// origin, matching the tab/bookmark cache.
+    PrefetchFavicon {
+        url: String,
+    },
     /// Poke the loop awake. No-op by the time it drains: the loop wakes
     /// every few ms for DOM polling anyway.
     Wake,
@@ -187,9 +193,8 @@ pub enum EngineEvent {
         tab: TabId,
         url: String,
     },
-    /// Page favicon arrived (not emitted by CEF yet; reserved).
-    /// Keyed by document URL; the UI caches handles per URL for the
-    /// bookmark bar and history rows.
+    /// Page favicon arrived. Keyed by document URL; the UI caches handles
+    /// per origin for tabs, the bookmark bar, and history rows.
     FaviconChanged {
         tab: TabId,
         url: String,

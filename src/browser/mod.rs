@@ -18,6 +18,7 @@ pub mod dom;
 pub mod engine;
 #[cfg(feature = "cef-engine")]
 pub mod engine_install;
+pub mod favicon;
 pub mod frame_slot;
 pub mod keys;
 pub mod nav;

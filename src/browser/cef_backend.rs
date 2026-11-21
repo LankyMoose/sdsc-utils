@@ -276,6 +276,9 @@ struct TabContext {
     last_active: Arc<Mutex<u64>>,
     scroll: Arc<Mutex<(f32, f32)>>,
     extent: Arc<Mutex<(f32, f32)>>,
+    /// Last icon candidate set fetched for this tab (dedupe repeated
+    /// `on_favicon_urlchange` notifications).
+    favicon_key: Arc<Mutex<String>>,
 }
 
 /// `cef::Browser` is a ref-counted raw pointer without Rust `Send`; CEF's
@@ -647,7 +650,71 @@ cef::wrap_display_handler! {
                 title,
             });
         }
+
+        fn on_favicon_urlchange(
+            &self,
+            browser: Option<&mut Browser>,
+            icon_urls: Option<&mut CefStringList>,
+        ) {
+            let Some(list) = icon_urls else { return };
+            // Clone the CEF-owned list handle: the clone is a borrowed view
+            // (freeing is reserved for owned lists), so iterating it is safe.
+            let urls: Vec<String> = list
+                .clone()
+                .into_iter()
+                .filter(|url| !url.is_empty())
+                .collect();
+            let page_url = browser
+                .and_then(|b| b.main_frame())
+                .map(|frame| CefString::from(&frame.url()).to_string())
+                .unwrap_or_default();
+            if page_url.is_empty() {
+                return;
+            }
+            let key = format!(
+                "{}
+{}",
+                crate::browser::bookmarks::origin_key(&page_url),
+                urls.join("
+")
+            );
+            {
+                let mut last = self
+                    .ctx
+                    .favicon_key
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if *last == key {
+                    return;
+                }
+                *last = key;
+            }
+            spawn_favicon_fetch(self.ctx.handle.clone(), self.ctx.tab, page_url, urls);
+        }
     }
+}
+
+/// Fetch off the CEF UI thread (blocking network + image decode), then post
+/// the decoded icon through the normal engine event channel.
+fn spawn_favicon_fetch(handle: EngineHandle, tab: TabId, page_url: String, icon_urls: Vec<String>) {
+    std::thread::spawn(move || {
+        let Some((width, height, rgba)) =
+            crate::browser::favicon::fetch_best(&page_url, &icon_urls)
+        else {
+            return;
+        };
+        crate::platform::app_log::info(format!(
+            "cef: favicon {} {width}x{height}",
+            crate::browser::bookmarks::origin_key(&page_url)
+        ));
+        handle.emit(EngineEvent::FaviconChanged {
+            tab,
+            url: page_url,
+            width,
+            height,
+            rgba,
+        });
+    });
 }
 
 cef::wrap_client! {
@@ -843,6 +910,8 @@ struct Worker {
     suspended: bool,
     active_tab: Arc<AtomicU64>,
     visible_flag: Arc<AtomicBool>,
+    /// Bookmark favicon origins already asked for this session.
+    prefetched: std::collections::HashSet<String>,
 }
 
 fn run(
@@ -863,6 +932,7 @@ fn run(
         suspended: true,
         active_tab,
         visible_flag,
+        prefetched: std::collections::HashSet::new(),
     };
     worker.create_tab(TabId::BOOT, &boot_url, Arc::new(FrameSlot::default()), 1);
     loop {
@@ -906,6 +976,7 @@ impl Worker {
             last_active: Arc::new(Mutex::new(0)),
             scroll: Arc::new(Mutex::new((0.0, 0.0))),
             extent: Arc::new(Mutex::new((0.0, 0.0))),
+            favicon_key: Arc::new(Mutex::new(String::new())),
         };
         let mut client = SdscClient::new(
             ctx.clone(),
@@ -997,18 +1068,37 @@ impl Worker {
                     return false;
                 };
                 if let Some(browser) = entry.ctx.browser.get()
-                    && let Some(host) = browser.host()
+                    && let Some(frame) = browser.main_frame()
                 {
-                    let ev = MouseEvent {
-                        x: x as i32,
-                        y: y as i32,
-                        modifiers: 0,
-                    };
-                    // CEF wheel deltas are ±120-ish units; convert pixel
-                    // intent from the pad scroll path.
-                    let wheel_y = (-(dy / 100.0) * 120.0).round() as i32;
-                    let wheel_x = (-(dx / 100.0) * 120.0).round() as i32;
-                    host.send_mouse_wheel_event(Some(&ev), wheel_x, wheel_y);
+                    // Analog pad scroll is applied as an instant `scrollBy` on
+                    // the innermost scroller under the cursor. Wheel events
+                    // feed Chromium's scroll animator: each 60Hz event starts
+                    // an easing curve, which trails the stick and visibly
+                    // keeps gliding after release. `behavior: 'instant'` makes
+                    // the stop immediate and keeps the wheel path reserved for
+                    // real wheel input.
+                    let code = format!(
+                        r#"(function(){{
+                        var x={x:.0}, y={y:.0}, dx={dx:.2}, dy={dy:.2};
+                        var e = document.elementFromPoint(x, y);
+                        while (e && e !== document.documentElement && e !== document.body) {{
+                          var style = getComputedStyle(e);
+                          var canY = /(auto|scroll|overlay)/.test(style.overflowY)
+                            && e.scrollHeight > e.clientHeight + 1;
+                          var canX = /(auto|scroll|overlay)/.test(style.overflowX)
+                            && e.scrollWidth > e.clientWidth + 1;
+                          if ((dy !== 0 && canY) || (dx !== 0 && canX)) {{
+                            e.scrollBy({{ left: dx, top: dy, behavior: 'instant' }});
+                            return;
+                          }}
+                          e = e.parentElement;
+                        }}
+                        window.scrollBy({{ left: dx, top: dy, behavior: 'instant' }});
+                        }})();"#
+                    );
+                    let code: CefString = code.as_str().into();
+                    let url: CefString = "sdsc://scroll".into();
+                    frame.execute_java_script(Some(&code), Some(&url), 0);
                 }
             }
             EngineCommand::Key(key) => {
@@ -1220,6 +1310,12 @@ impl Worker {
                 }
                 let _ = done.send(());
                 return true;
+            }
+            EngineCommand::PrefetchFavicon { url } => {
+                let key = crate::browser::bookmarks::origin_key(&url);
+                if self.prefetched.insert(key) {
+                    spawn_favicon_fetch(self.handle.clone(), self.active, url, Vec::new());
+                }
             }
             EngineCommand::Wake => {}
         }

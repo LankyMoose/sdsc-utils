@@ -974,6 +974,10 @@ impl App {
         app.browser
             .panel
             .set_viewport(initial_page_w.max(1.0), initial_page_h.max(1.0));
+        // The default cursor is centered in the compile-time 800x600 box;
+        // recenter it in the real boot page area before the first Browser
+        // frame so it never appears near the top-left corner.
+        app.browser.panel.cursor.reset_for_page();
 
         // Disk-persisted bookmarks into the browser panel (the one state
         // that survives restarts by design). Rebuild chrome after: the

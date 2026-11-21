@@ -732,13 +732,20 @@ pub fn root_view(
         .style(theme::menu_panel)
         .width(Length::Fixed(layout.card_w))
         .height(Length::Fixed(layout.card_h));
+    let transparent = crate::ui::chrome::transparent_windows();
     container(card)
         .width(Fill)
         .height(Fill)
         .center_x(Fill)
         .center_y(Fill)
-        .style(|_theme| container::Style {
-            background: Some(iced::Background::Color(theme::BASE_BG)),
+        .style(move |_theme| container::Style {
+            // Alpha-capable backends leave the margin clear so the card reads
+            // as a floating popup; opaque backends keep the dark backdrop.
+            background: if transparent {
+                None
+            } else {
+                Some(iced::Background::Color(theme::BASE_BG))
+            },
             text_color: Some(theme::INK),
             ..container::Style::default()
         })
@@ -1065,6 +1072,53 @@ mod tests {
         assert_eq!(
             (panel.page.cursor.view_w, panel.page.cursor.view_h),
             (1734.0, 860.0)
+        );
+    }
+
+    #[test]
+    fn crowded_tabs_keep_a_minimum_width() {
+        let mut panel = BrowserPanel::default();
+        panel.set_viewport(900.0, 500.0);
+        let title = "A very long page title that needs the overflow chip";
+        panel
+            .page
+            .session
+            .begin_load("https://example.com/".to_string());
+        panel.page.session.note_title(Some(title.to_string()));
+        panel.order.clear();
+        panel.order.push(TabId(10));
+        panel.active_tab = TabId(10);
+        for i in 1..12 {
+            let id = TabId(10 + i);
+            let mut page = BrowserTabPage::default();
+            page.session.note_url(format!("https://example.com/{i}"));
+            page.session.note_title(Some(title.to_string()));
+            panel.stored.push(StoredTab {
+                id,
+                page,
+                loaded: false,
+            });
+            panel.order.push(id);
+        }
+        panel.rebuild_chrome();
+        let visible = panel
+            .chrome
+            .iter()
+            .filter(|(t, _)| matches!(t, ChromeTarget::Tab(_)))
+            .count();
+        assert!(visible > 0 && visible < 12, "strip should overflow");
+        for (target, f) in &panel.chrome {
+            if matches!(target, ChromeTarget::Tab(_)) {
+                // 16px tab padding + 72px title budget + 6px slack.
+                assert!(f.w >= 94.0, "tab {target:?} collapsed to {:.0}px", f.w);
+            }
+        }
+        assert!(
+            panel
+                .chrome
+                .iter()
+                .any(|(t, _)| matches!(t, ChromeTarget::TabOverflow(_))),
+            "crowded strip needs an overflow chip"
         );
     }
 
