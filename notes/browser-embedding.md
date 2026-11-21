@@ -1,6 +1,7 @@
 # Browser embedding: Servo offscreen in the Browser app (current), CEF pivot planned
 
-**Status:** current implementation (Servo era) on `browser/hub-pivot` / `browser/main`.
+**Status:** Servo is the default engine; CEF OSR is implemented behind
+`cef-engine` (phase 3) and becomes the default in phase 4.
 **When to read:** anything touching `src/browser/`, the standalone Browser
 window, or the `servo-engine` feature. **Planned replacement:**
 [browser-hub-pivot.md](browser-hub-pivot.md) (replace Servo with CEF OSR).
@@ -28,6 +29,12 @@ window, or the `servo-engine` feature. **Planned replacement:**
   up, `EngineHandle` channel pair (mirrors `InputHub` bind/clear/emit). The UI
   only depends on this seam, so the backend is replaceable without touching
   the Browser window.
+- `src/browser/cef_backend.rs` (`cef-engine` feature only) — CEF worker:
+  `CefInitialize` on the main thread, multi-threaded message loop (Windows),
+  async OSR browsers per tab, CPU `on_paint` → BGRA→RGBA → `FrameSlot`,
+  mouse/key/wheel translation, and a renderer-process message bridge for
+  `dom_query_js` JSON. `--type=` helpers re-exec the exe and call
+  `CefExecuteProcess` first. Sandbox off in this phase; popups denied.
 - `src/browser/servo_backend.rs` (`servo-engine` feature only) — worker
   thread owning all Servo types (`!Send` by design). Suspend = skip spin +
   long sleep; generation-guarded loads; 30s load timeout. The `A11yTree`
@@ -115,6 +122,13 @@ spawning the worker.
 
 ## Build prerequisites (Windows)
 
+CEF (`--no-default-features --features cef-engine`): CMake + Ninja on PATH;
+CEF's distribution downloads to `OUT_DIR` (or `CEF_PATH`). The wrapper is
+built `/MT`, so the Rust side must use the static CRT
+(`RUSTFLAGS="-C target-feature=+crt-static"`) until phase 4 makes that the
+Windows default. Servo prerequisites below apply to the default feature:
+
+
 Servo's SpiderMonkey/ICU needs Clang + Python at build time, the MSVC C++
 runtime import lib at link time, and a bumped Stylo thread stack:
 
@@ -131,15 +145,19 @@ runtime import lib at link time, and a bumped Stylo thread stack:
   box aborts the process. Changing the value needs `cargo clean -p stylo`
   (at least) since Cargo does not track env changes in fingerprints.
 
-## Feature flag
+## Feature flags
 
-`servo-engine = ["dep:servo", "dep:dpi", "dep:euclid", "dep:url", "dep:surfman", "dep:embedder_traits"]`,
+`servo-engine = ["dep:servo", "dep:dpi", "dep:euclid", "dep:surfman", "dep:embedder_traits"]`,
 **on by default** (single exe): plain `cargo run` / `cargo test` / CI builds
 the engine. `servo` itself is `default-features = false` plus `bundled`,
 `clipboard`, `js_jit`, `multiprocess` — upstream defaults minus `devtools`.
 UI-only iteration skips Servo with `cargo run --no-default-features` (reader
 backend) or `SDSC_NO_ENGINE=1` at runtime; the MSRV job uses
 `--no-default-features` since the engine needs the pinned toolchain.
+
+`cef-engine = ["dep:cef"]` selects the CEF backend instead. It is mutually
+exclusive with `servo-engine` in phase 3 (compile error) because the CEF
+wrapper is `/MT` and Servo's mozjs is `/MD`.
 
 ## Early Servo AX gaps (historical)
 
@@ -151,8 +169,12 @@ longer blocking: targets come from `getClientRects`/DOM state, and
 
 ## Known gaps
 
-- **Cloudflare bot protection**: challenged sites cannot be used. Requires the
-  CEF pivot (see [browser-hub-pivot.md](browser-hub-pivot.md)).
+- **Cloudflare bot protection**: Servo cannot pass managed challenges. The
+  CEF dev backend renders the interactive challenge (real Chromium TLS/JS);
+  pad-click verification remains manual until phase 4.
+- **CEF gaps (phase 3)**: sandbox disabled, popups denied, favicons and
+  canonical history events not emitted, static CRT required, macOS/Linux
+  untested.
 - Debug-build Servo performance dominates scroll/render timing; release is the
   reference for frame/scroll validation.
 - Page-field IME/OSK still unbuilt ([browser-osk.md](browser-osk.md)).

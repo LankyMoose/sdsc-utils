@@ -192,6 +192,20 @@ pub fn dom_boot_js(center: Option<(f32, f32)>, epoch: u64) -> String {
     format!("{DOM_INSTALL_JS};\n{}", dom_query_js(center, epoch))
 }
 
+/// JSON-string variant of [`dom_query_js`] for engines whose JS bridge
+/// returns strings (CEF). Servo evaluates the object directly.
+pub fn dom_query_js_json(center: Option<(f32, f32)>, epoch: u64) -> String {
+    let (cx, cy, on) = match center {
+        Some((x, y)) => (format!("{x:.0}"), format!("{y:.0}"), "true"),
+        None => ("0".to_string(), "0".to_string(), "false"),
+    };
+    format!(
+        "var __sdsc_cx={cx},__sdsc_cy={cy},__sdsc_cc={on},__sdsc_v={epoch};
+         var __sdsc_obj = {DOM_QUERY_BODY};
+JSON.stringify(__sdsc_obj);"
+    )
+}
+
 /// One-shot event-loop probe: arm markers for the three async task
 /// sources, read them back after a beat. If timers fire but rAF never
 /// does, the page's frame-gated JS (hydration, lazy handlers) is starved —
@@ -238,6 +252,7 @@ pub const STORAGE_PROBE_JS: &str = r###"(function(){
   return JSON.stringify(r);
 })()"###;
 
+#[cfg(feature = "servo-engine")]
 /// Parse a [`PROBE_READ_JS`] result. `None` on malformed shapes or when the
 /// arm never ran (page navigated away mid-probe).
 pub fn parse_loop_probe(value: &embedder_traits::JSValue) -> Option<[bool; 3]> {
@@ -282,6 +297,9 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   try { if (window.top !== window.self) return {}; } catch (e) { return {}; }
   var S = window.__sdsc_ax;
   if (!S) { S = window.__sdsc_ax = { next: 1, ids: new WeakMap() }; }
+  // Standalone query: CEF polls instead of installing the observer/ping
+  // machinery, so `byId` may not exist yet. Servo's install sets it too.
+  if (!S.byId) { S.byId = {}; }
   function idFor(el) {
     var id = S.ids.get(el);
     if (id === undefined) { id = S.next++; S.ids.set(el, id); }
@@ -643,6 +661,7 @@ const DOM_QUERY_BODY: &str = r###"(function(){
 /// opacity) and `clipped_away` (overflow clip to zero) the correctly
 /// invisible.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg(feature = "servo-engine")]
 pub struct DomSnapshot {
     pub nodes: Vec<DomRaw>,
     pub scroll: (f32, f32),
@@ -676,6 +695,7 @@ pub struct DomSnapshot {
 /// to origin/zero (old cached pages can't produce them; origin is the safe
 /// assumption, never a drift source — the next pull rebases; zero doc dims
 /// just leave the extent to the live set).
+#[cfg(feature = "servo-engine")]
 pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
     use embedder_traits::JSValue;
     let JSValue::Object(root) = value else {
@@ -863,7 +883,7 @@ pub fn dom_kind(tag: &str, role: &str, typ: &str) -> FocusKind {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "servo-engine"))]
 mod tests {
     use super::*;
     use embedder_traits::JSValue;

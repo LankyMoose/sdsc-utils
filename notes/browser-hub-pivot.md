@@ -1,8 +1,9 @@
 # Browser hub pivot — managed apps + CEF engine (planned)
 
 **Status:** in progress (branch `browser/hub-pivot`, based on `browser/main`).
-Phases 0–2 landed: state extraction, PS hub + auto-open, and the standalone
-Browser window. CEF (phase 3) is next.
+Phases 0–3 landed: state extraction, PS hub + auto-open, the standalone
+Browser window, and the CEF OSR backend. Phase 4 (delete Servo, flip the
+default engine) is next.
 **When to read:** before touching Start/browser window ownership, the PS
 overlay, app selection, the engine backend, or MSIX packaging.
 
@@ -107,14 +108,21 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    window close/suspend/focus return. Hub is routed before Browser; Browser
    before Start. `browser_layout`/16:9 card remains only for the old Start
    card tests — the live window uses fullscreen geometry.
-3. **CEF backend behind the existing `EngineCommand`/`EngineEvent` seam.**
-   New `src/browser/cef_backend.rs`; `FrameSlot` + shader pipeline unchanged
-   (L1 CPU `OnPaint`). DOM contract: fragments from `getClientRects()` +
-   `checkVisibility()` + `elementsFromPoint`/`findNext` + exact `click()`;
-   delete forcing, verdict cache, `clipRect` walks, cursor-cull/`ccull`,
-   rebase/settle/starvation logic. Engine-presence check (optional package
-   path valid + `libcef`/resources present, else Store/`LocalAppData`/dev
-   fallback).
+3. **CEF backend behind the existing `EngineCommand`/`EngineEvent` seam. —
+   landed (dev).** `src/browser/cef_backend.rs` owns CEF init + a worker;
+   `FrameSlot` and the shader pipeline are unchanged. L1 CPU `OnPaint`
+   swizzles BGRA → RGBA into the tab slot. Reuses `dom_query_js` through a
+   renderer-process message bridge (no A11y forcing/clip walks; `dom.rs`
+   keeps the JS, CEF parses JSON in the browser process). Commands covered:
+   navigate, tabs (open/close/activate), resize, visibility/suspend, back/
+   forward, reload, mouse move/click/wheel, keyboard, click-at, DOM reseed.
+   `--type=` subprocesses re-exec the exe and run `CefExecuteProcess` before
+   argument parsing. CEF is behind `cef-engine`, mutually exclusive with
+   `servo-engine` for now; it needs the static MSVC CRT because
+   `libcef_dll_wrapper` is built `/MT`. Sandbox is disabled in this phase;
+   popups (`window.open`/`target=_blank`) are denied; favicons and
+   `HistoryChanged` are not emitted yet. Engine-presence/DLC install remains
+   phase 5.
 4. **Delete Servo + reader**, flip to CEF in the same landing (never ship a
    dead-browser main). Docs, `AGENTS.md`, CI/MSRV/toolchain updates included;
    keep the toolchain pin for one release, then unpin.
@@ -132,6 +140,25 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    main+optional resubmission (related-set lockstep) — the core
    Store-vs-self-managed tradeoff.
 
+## CEF dev build (phase 3)
+
+Prerequisites (Windows): CMake + Ninja on `PATH` (winget
+`Kitware.CMake`, `Ninja-build.Ninja`); LLVM/Clang is only needed by Servo.
+CEF's binary distribution (~427 MB) is downloaded by `cef-dll-sys` into
+`OUT_DIR` on first build; set `CEF_PATH` to share it across build dirs.
+
+```bash
+# CEF backend (Servo off). Static CRT matches libcef_dll_wrapper's /MT.
+RUSTFLAGS="-C target-feature=+crt-static"   cargo run --no-default-features --features cef-engine
+
+# UI-only (no engine; Browser tile shows install state)
+cargo check --no-default-features
+```
+
+`cef-engine` + `servo-engine` are mutually exclusive (clear compile error):
+the two wrappers disagree on the MSVC runtime. Phase 4 removes Servo and
+makes static CRT the Windows default.
+
 ## Open verifications (before committing to Phase 4)
 
 - Dummy native DLL in a related set loads via `LoadPackagedLibrary`
@@ -142,6 +169,8 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
 - Frame latency vs Servo (expect +0–1 frames L1), 60Hz scroll, dock/jump
   traces unchanged, no per-frame handle churn.
 - Cloudflare-blocked sites pass; `cf_clearance` persists per profile.
+  **Status:** CEF renders the interactive challenge (`nowsecure.nl`) where
+  Servo never did; solving it with a pad click is the remaining check.
 - Manual matrix: taskbar/Alt-Tab, toast-over-app, auto-open borderless vs
   exclusive-fullscreen, hub→app focus transfer, game-over-hub input
   coexistence.

@@ -797,14 +797,19 @@ impl App {
         } else {
             crate::browser::tabs::boot_url()
         };
-        #[cfg(feature = "servo-engine")]
+        #[cfg(feature = "cef-engine")]
+        let browser_engine = crate::browser::cef_backend::spawn_engine(&boot_url, initial_page);
+        #[cfg(all(not(feature = "cef-engine"), feature = "servo-engine"))]
         let browser_engine = if std::env::var("SDSC_NO_ENGINE").is_ok() {
             None
         } else {
             crate::browser::servo_backend::spawn_engine(&boot_url, initial_page)
         };
-        #[cfg(not(feature = "servo-engine"))]
-        let browser_engine: Option<EngineHandle> = None;
+        #[cfg(not(any(feature = "cef-engine", feature = "servo-engine")))]
+        let browser_engine: Option<EngineHandle> = {
+            let _ = (&boot_url, initial_page);
+            None
+        };
         let mut app = Self {
             session,
             games,

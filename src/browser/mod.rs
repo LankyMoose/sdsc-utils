@@ -12,6 +12,8 @@
 //! here. This module is engine/runtime plumbing plus pure protocol types.
 
 pub mod bookmarks;
+#[cfg(feature = "cef-engine")]
+pub mod cef_backend;
 pub mod cursor;
 pub mod dom;
 pub mod engine;

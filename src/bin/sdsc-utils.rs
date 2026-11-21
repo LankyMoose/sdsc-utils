@@ -38,6 +38,13 @@ fn main() -> ExitCode {
     let crash_armed: &'static CrashArmed = crash_armed();
     app_log::init(crash_armed);
 
+    // CEF re-executes this binary for renderer/GPU/utility processes. This
+    // must run before argument parsing and the single-instance guard.
+    #[cfg(feature = "cef-engine")]
+    if let Some(code) = sdsc_utils::browser::cef_backend::execute_subprocess() {
+        return ExitCode::from(u8::try_from(code).unwrap_or(1));
+    }
+
     // Servo's net stack pulls a second rustls crypto provider into the
     // process (ureq already enables one), which disables rustls
     // auto-detection and panics on first TLS use. Pin aws-lc-rs explicitly

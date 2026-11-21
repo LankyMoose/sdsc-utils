@@ -65,7 +65,8 @@ fn main() {
     // (`__std_search_1`, …) that live in the C++ runtime import lib. Rust
     // links only the C runtime by default, so pull in msvcprt on MSVC —
     // without it the final link fails with LNK2019 (proven by the spike).
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("Windows")
+    if env::var_os("CARGO_FEATURE_SERVO_ENGINE").is_some()
+        && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("Windows")
         && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
     {
         println!("cargo:rustc-link-lib=msvcprt");
