@@ -45,6 +45,9 @@ pub struct BrowserAppState {
     pub engine_available: bool,
     /// Runtime/install status for the optional engine package.
     pub engine_status: EngineStatus,
+    /// Guards live install progress against stragglers after completion.
+    #[cfg(feature = "cef-engine")]
+    pub engine_install_generation: u64,
     /// Accumulated analog scroll for the next BrowserFrame tick.
     pub pending_scroll: (f32, f32),
     /// Page point the pending scroll belongs to (cursor at accumulation).
@@ -641,11 +644,24 @@ impl super::App {
 
         self.browser.engine_status = EngineStatus::Installing;
         self.hub_state.set_installing(true);
-        Task::perform(
-            async {
-                super::spawn_blocking(|| {
-                    crate::browser::engine_install::install_from_env()
-                        .map_err(crate::AppError::Persist)
+        self.browser.engine_install_generation =
+            self.browser.engine_install_generation.wrapping_add(1);
+        let generation = self.browser.engine_install_generation;
+        let (progress_tx, progress_rx) = iced::futures::channel::mpsc::unbounded::<
+            crate::browser::engine_install::InstallProgress,
+        >();
+        let progress_task =
+            Task::stream(progress_rx).map(move |progress| Message::EngineInstallProgress {
+                generation,
+                progress,
+            });
+        let install = Task::perform(
+            async move {
+                super::spawn_blocking(move || {
+                    crate::browser::engine_install::install_from_env_with_progress(|progress| {
+                        let _ = progress_tx.unbounded_send(progress);
+                    })
+                    .map_err(crate::AppError::Persist)
                 })
                 .await
             },
@@ -656,7 +672,8 @@ impl super::App {
                     Err(err) => Err(err.to_string()),
                 })
             },
-        )
+        );
+        Task::batch([progress_task, install])
     }
 
     #[cfg(not(feature = "cef-engine"))]
@@ -711,10 +728,29 @@ impl super::App {
     }
 
     #[cfg(feature = "cef-engine")]
+    pub(crate) fn on_engine_install_progress(
+        &mut self,
+        generation: u64,
+        progress: crate::browser::engine_install::InstallProgress,
+    ) -> Task<Message> {
+        if generation != self.browser.engine_install_generation
+            || !matches!(self.browser.engine_status, EngineStatus::Installing)
+        {
+            return Task::none();
+        }
+        self.hub_state
+            .set_install_progress(hub_install_progress(progress));
+        Task::none()
+    }
+
+    #[cfg(feature = "cef-engine")]
     pub(crate) fn on_engine_install_done(
         &mut self,
         result: Result<std::path::PathBuf, String>,
     ) -> Task<Message> {
+        // Invalidate any progress messages still buffered behind the result.
+        self.browser.engine_install_generation =
+            self.browser.engine_install_generation.wrapping_add(1);
         match result {
             Ok(path) => {
                 self.browser.engine_status = EngineStatus::Ready(path);
@@ -745,5 +781,43 @@ impl super::App {
         _result: Result<std::path::PathBuf, String>,
     ) -> Task<Message> {
         Task::none()
+    }
+}
+
+#[cfg(feature = "cef-engine")]
+fn hub_install_progress(
+    progress: crate::browser::engine_install::InstallProgress,
+) -> crate::ui::hub::InstallProgress {
+    use crate::browser::engine_install::InstallProgress as Engine;
+    use crate::ui::hub::{InstallPhase, InstallProgress};
+    match progress {
+        Engine::Starting => InstallProgress {
+            phase: InstallPhase::Starting,
+            ..InstallProgress::default()
+        },
+        Engine::Downloading { received, total } => InstallProgress {
+            phase: InstallPhase::Downloading,
+            fraction: total
+                .filter(|total| *total > 0)
+                .map(|total| received as f32 / total as f32),
+            done: received,
+            total,
+        },
+        Engine::Verifying { done, total } => InstallProgress {
+            phase: InstallPhase::Verifying,
+            fraction: (total > 0).then(|| done as f32 / total as f32),
+            done,
+            total: Some(total),
+        },
+        Engine::Extracting { done, total } => InstallProgress {
+            phase: InstallPhase::Extracting,
+            fraction: (total > 0).then(|| done as f32 / total as f32),
+            done: done as u64,
+            total: Some(total as u64),
+        },
+        Engine::Finishing => InstallProgress {
+            phase: InstallPhase::Finishing,
+            ..InstallProgress::default()
+        },
     }
 }

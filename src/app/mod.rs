@@ -175,6 +175,12 @@ pub enum Message {
     BrowserFrame,
     /// Optional BrowserEngine install/download finished.
     EngineInstallDone(Result<std::path::PathBuf, String>),
+    /// Live BrowserEngine install phase (download/verify/extract).
+    #[cfg(feature = "cef-engine")]
+    EngineInstallProgress {
+        generation: u64,
+        progress: crate::browser::engine_install::InstallProgress,
+    },
     /// A window resized (logical size). The browser and hub consume this;
     /// the event is authoritative for their final full-cover size.
     WindowSized(window::Id, iced::Size),
@@ -333,6 +339,8 @@ impl Message {
             | Message::WindowShowNow(_)
             | Message::ShellFadeTick
             | Message::StartArtEvent(_) => false,
+            #[cfg(feature = "cef-engine")]
+            Message::EngineInstallProgress { .. } => false,
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
             #[cfg(debug_assertions)]
@@ -1687,6 +1695,11 @@ impl App {
             Message::Browser(message) => self.on_browser_message(message),
             Message::BrowserFrame => self.on_browser_frame(),
             Message::EngineInstallDone(result) => self.on_engine_install_done(result),
+            #[cfg(feature = "cef-engine")]
+            Message::EngineInstallProgress {
+                generation,
+                progress,
+            } => self.on_engine_install_progress(generation, progress),
             Message::WindowSized(id, size) => {
                 if self.browser_window == Some(id) {
                     self.on_browser_window_sized(size)
@@ -1788,7 +1801,7 @@ impl App {
             } => self.on_start_key(id, action, pressed),
             Message::BrowserRawKey { id, key } => self.on_browser_raw_key(id, key),
             Message::PadInput(edge) => {
-                if crate::platform::debug_quiet::enabled() {
+                if crate::platform::debug_quiet::input_dropped() {
                     Task::none()
                 } else {
                     self.on_pad_input(edge)
@@ -2649,8 +2662,9 @@ impl App {
     /// True when live pad-input edges should drive Start / diagnostics.
     fn wants_pad_input(&self) -> bool {
         // Debug quiet mode: HID input is focus-independent, so a pad press during
-        // a game must never drive Start (navigate / launch).
-        if crate::platform::debug_quiet::enabled() {
+        // a game must never drive Start (navigate / launch). `SDSC_DEBUG_INPUT=1`
+        // is the QA opt-in that keeps quiet placement but accepts pad edges.
+        if crate::platform::debug_quiet::input_dropped() {
             return false;
         }
         let pad_input_live =

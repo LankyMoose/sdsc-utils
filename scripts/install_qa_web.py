@@ -184,6 +184,7 @@ class Console:
         self.server: ThreadingHTTPServer | None = None
         self.last_flavor: str | None = None
         self.last_debug_open: str = ""
+        self.last_controller_input = True
         self.manifest, self.engine_bundled = self.load_state()
         OUT.mkdir(parents=True, exist_ok=True)
         DOWNLOADS.mkdir(parents=True, exist_ok=True)
@@ -310,6 +311,7 @@ class Console:
                 "running_flavor": self.running_flavor,
                 "last_flavor": self.last_flavor,
                 "last_debug_open": self.last_debug_open,
+                "last_controller_input": self.last_controller_input,
                 "preparing": self.preparing,
                 "prepare_step": self.prepare_step,
                 "prepare_error": self.prepare_error,
@@ -488,9 +490,11 @@ class Console:
             bundle = bool(payload.get("engine_bundled", self.engine_bundled))
             open_hub = bool(payload.get("open_hub", True))
             restage = bool(payload.get("restage", False))
+            controller_input = bool(payload.get("controller_input", True))
             self.log(
                 f"prepare: {flavor}, engine={'bundled' if bundle else 'missing'}"
                 + (", reset" if restage else "")
+                + (", controller on" if controller_input else ", controller off")
             )
             self.stop()
 
@@ -530,6 +534,7 @@ class Console:
             self.launch(
                 f"installed:{tag}",
                 "hub" if open_hub and flavor == "debug" else "",
+                controller_input,
             )
         except Exception as err:  # noqa: BLE001 - surfaced in the web UI
             with self.lock:
@@ -547,7 +552,11 @@ class Console:
     def relaunch(self):
         if not self.last_flavor:
             raise RuntimeError("nothing has been launched yet")
-        return self.launch(self.last_flavor, self.last_debug_open)
+        return self.launch(
+            self.last_flavor,
+            self.last_debug_open,
+            self.last_controller_input,
+        )
 
     def set_config(self, payload):
         with self.lock:
@@ -611,7 +620,12 @@ class Console:
             self.log("launch: stopped")
         return self.api_state()
 
-    def launch(self, flavor: str, debug_open: str = ""):
+    def launch(
+        self,
+        flavor: str,
+        debug_open: str = "",
+        controller_input: bool = True,
+    ):
         self.stop()
         if flavor.startswith("installed:"):
             tag = normalize_tag(flavor.split(":", 1)[1]) or flavor.split(":", 1)[1]
@@ -632,10 +646,10 @@ class Console:
         env["APPDATA"] = str(appdata)
         env["SDSC_UPDATE_API_URL"] = self.feed_url()
         env["SDSC_CEF_NO_BUILD_FALLBACK"] = "1"
-        # `SDSC_DEBUG_OPEN` turns on debug quiet mode by default (no focus,
-        # pad edges dropped, secondary monitor). QA needs the real shell:
-        # focusable windows and live controller navigation.
-        env["SDSC_DEBUG_QUIET"] = "0"
+        # Always use debug quiet placement: secondary monitor, no focus steal.
+        # Manual testing may opt pad edges back in; automation must not.
+        env["SDSC_DEBUG_QUIET"] = "1"
+        env["SDSC_DEBUG_INPUT"] = "1" if controller_input else "0"
         if self.engine:
             env["SDSC_CEF_DLC_URL"] = self.engine["url"]
             env["SDSC_CEF_DLC_SHA256"] = self.engine["sha256"]
@@ -653,7 +667,11 @@ class Console:
             self.running_pid = self.proc.pid
             self.last_flavor = flavor
             self.last_debug_open = debug_open
-        self.log(f"launch: {flavor} pid={self.proc.pid} data={appdata}")
+            self.last_controller_input = controller_input
+        self.log(
+            f"launch: {flavor} pid={self.proc.pid} "
+            f"controller={'on' if controller_input else 'off'} data={appdata}"
+        )
         return self.api_state()
 
     def clear(self):
@@ -828,6 +846,7 @@ PAGE = """<!doctype html>
       </select></label>
       <label><input id="engine" type="checkbox"> Bundle browser engine</label>
       <label><input id="open-hub" type="checkbox" checked> Open hub (debug)</label>
+      <label><input id="controller-input" type="checkbox" checked> Allow controller input</label>
       <label><input id="restage" type="checkbox"> Rebuild install</label>
     </div>
     <div class="row">
@@ -837,7 +856,7 @@ PAGE = """<!doctype html>
     </div>
     <div class="row error" id="error" style="display:none"></div>
     <div class="row muted" id="run">—</div>
-    <div class="row hint">Leave <b>Bundle browser engine</b> unchecked to start with no CEF at all: only the exe is staged, and the hub's Apps → Browser → Install walks the DLC flow. Check it to test an already-installed engine. <b>Rebuild install</b> resets the private appdata, including a previously downloaded engine.</div>
+    <div class="row hint">Leave <b>Bundle browser engine</b> unchecked to start with no CEF at all: only the exe is staged, and the hub's Apps → Browser → Install walks the DLC flow. Check it to test an already-installed engine. <b>Rebuild install</b> resets the private appdata, including a previously downloaded engine. The app always opens on the secondary monitor without stealing focus; uncheck <b>Allow controller input</b> for automated runs so the physical controller cannot navigate or close it.</div>
   </section>
 
   <section class="card">
@@ -868,6 +887,7 @@ function render(){
     $('html-url').value = (S.manifest && S.manifest.html_url) || '';
     $('manifest').value = JSON.stringify(S.manifest || {}, null, 2);
     $('engine').checked = !!S.engine_bundled;
+    $('controller-input').checked = S.last_controller_input !== false;
     initialized = true;
   }
   $('go').disabled = !!S.preparing;
@@ -918,6 +938,7 @@ async function prepare(){
       flavor: $('flavor').value,
       engine_bundled: $('engine').checked,
       open_hub: $('open-hub').checked,
+      controller_input: $('controller-input').checked,
       restage: $('restage').checked
     });
     await getState();

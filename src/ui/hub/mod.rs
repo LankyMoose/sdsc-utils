@@ -13,7 +13,8 @@
 use crate::ui::svg_icon;
 use crate::ui::text_fit;
 use crate::ui::theme;
-use iced::widget::{button, column, container, row, space, stack, svg, text};
+use iced::widget::text::Wrapping;
+use iced::widget::{button, column, container, progress_bar, row, space, stack, svg, text};
 use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Shadow, Theme, Vector};
 use std::time::Instant;
 
@@ -62,28 +63,98 @@ pub enum HubMessage {
     Close,
 }
 
-/// One entry on the apps management screen.
+/// One entry on the apps management screen. Start is a built-in app and has
+/// no install/update state, so it deliberately does not appear here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HubApp {
-    Start,
     Browser,
 }
 
-pub const APPS: [HubApp; 2] = [HubApp::Start, HubApp::Browser];
+pub const APPS: [HubApp; 1] = [HubApp::Browser];
 
 impl HubApp {
     pub fn title(self) -> &'static str {
         match self {
-            Self::Start => "Start",
             Self::Browser => "Browser",
         }
     }
 
     pub fn icon(self) -> &'static str {
         match self {
-            Self::Start => svg_icon::GAME_SVG,
             Self::Browser => svg_icon::GLOBE_SVG,
         }
+    }
+}
+
+/// Install phases shown by the hub. Mirrors the installer's progress events
+/// without coupling `ui` to the CEF-only module (UI-only builds compile this).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InstallPhase {
+    #[default]
+    Starting,
+    Downloading,
+    Verifying,
+    Extracting,
+    Finishing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct InstallProgress {
+    pub phase: InstallPhase,
+    pub fraction: Option<f32>,
+    /// Bytes for download/verify phases; archive entries for extraction.
+    pub done: u64,
+    pub total: Option<u64>,
+}
+
+impl InstallProgress {
+    pub fn percent(&self) -> Option<u8> {
+        self.fraction
+            .map(|fraction| (fraction.clamp(0.0, 1.0) * 100.0).round() as u8)
+    }
+
+    pub fn title(&self) -> &'static str {
+        match self.phase {
+            InstallPhase::Starting => "Preparing browser engine…",
+            InstallPhase::Downloading => "Downloading browser engine…",
+            InstallPhase::Verifying => "Verifying download…",
+            InstallPhase::Extracting => "Installing browser engine…",
+            InstallPhase::Finishing => "Finishing install…",
+        }
+    }
+
+    pub fn detail(&self) -> String {
+        let percent = self.percent();
+        match self.phase {
+            InstallPhase::Downloading => match (self.total, percent) {
+                (Some(total), Some(percent)) => format!(
+                    "{percent}% · {} of {}",
+                    format_bytes(self.done),
+                    format_bytes(total)
+                ),
+                (None, Some(percent)) => {
+                    format!("{percent}% · {}", format_bytes(self.done))
+                }
+                (_, None) => format_bytes(self.done),
+            },
+            InstallPhase::Verifying | InstallPhase::Extracting => percent
+                .map(|percent| format!("{percent}%"))
+                .unwrap_or_default(),
+            InstallPhase::Starting | InstallPhase::Finishing => "Please wait".to_string(),
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * MB;
+    let bytes = bytes as f64;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes / GB)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes / MB)
+    } else {
+        format!("{:.0} KB", bytes / 1024.0)
     }
 }
 
@@ -139,6 +210,8 @@ pub struct State {
     pub apps_info: Option<usize>,
     /// Engine install/download in flight.
     pub installing: bool,
+    /// Live phase/percent for the install progress card.
+    pub install_progress: InstallProgress,
     /// Last install failure (user-facing).
     pub install_error: Option<String>,
 }
@@ -158,6 +231,7 @@ impl Default for State {
             apps_menu_focus: 0,
             apps_info: None,
             installing: false,
+            install_progress: InstallProgress::default(),
             install_error: None,
         }
     }
@@ -259,7 +333,6 @@ impl State {
 
     pub fn app_actions(&self, index: usize) -> Vec<AppAction> {
         match APPS.get(index).copied() {
-            Some(HubApp::Start) => vec![AppAction::Info],
             Some(HubApp::Browser) => {
                 if self.installing {
                     vec![AppAction::Info]
@@ -306,30 +379,38 @@ impl State {
 
     pub fn app_dimmed(&self, app: HubApp) -> bool {
         match app {
-            HubApp::Start => !self.start_enabled,
             HubApp::Browser => !self.engine_ready,
         }
     }
 
-    pub fn app_status(&self, app: HubApp) -> &'static str {
+    pub fn app_status(&self, app: HubApp) -> String {
         match app {
-            HubApp::Start if self.start_enabled => "Built in",
-            HubApp::Start => "Disabled",
-            HubApp::Browser if self.installing => "Installing…",
-            HubApp::Browser if self.engine_ready => "Installed",
-            HubApp::Browser => "Not installed",
+            HubApp::Browser if self.installing => match self.install_progress.percent() {
+                Some(percent) => format!("Installing… {percent}%"),
+                None => "Installing…".to_string(),
+            },
+            HubApp::Browser if self.engine_ready => "Installed".to_string(),
+            HubApp::Browser => "Not installed".to_string(),
         }
     }
 
     pub fn set_installing(&mut self, installing: bool) {
         self.installing = installing;
         if installing {
+            self.install_progress = InstallProgress::default();
             self.install_error = None;
         }
     }
 
+    pub fn set_install_progress(&mut self, progress: InstallProgress) {
+        self.installing = true;
+        self.install_progress = progress;
+        self.install_error = None;
+    }
+
     pub fn install_done(&mut self, ready: bool, error: Option<String>) {
         self.installing = false;
+        self.install_progress = InstallProgress::default();
         self.engine_ready = ready;
         self.install_error = error;
     }
@@ -423,14 +504,27 @@ fn apps_view(
     for (i, app) in APPS.into_iter().enumerate() {
         grid = grid.push(app_tile(state, app, i, app_w));
     }
-    let card = container(
-        column![row![back, space().width(Fill)], space().height(8), grid,]
-            .spacing(0)
-            .align_x(Alignment::Center),
-    )
-    .padding(12)
-    .width(Length::Fixed(card_w))
-    .style(card_style);
+    let mut content = column![row![back, space().width(Fill)], space().height(8), grid]
+        .spacing(0)
+        .align_x(Alignment::Center);
+    if state.installing {
+        content = content
+            .push(space().height(10))
+            .push(install_progress_card(state));
+    }
+    if let Some(error) = &state.install_error {
+        content = content.push(space().height(8)).push(
+            text(error.as_str())
+                .size(theme::type_scale::CAPTION)
+                .color(theme::WARNING)
+                .width(Fill)
+                .wrapping(Wrapping::Word),
+        );
+    }
+    let card = container(content)
+        .padding(12)
+        .width(Length::Fixed(card_w))
+        .style(card_style);
     let base: Element<'_, HubMessage> = frame(card.into(), backdrop_alpha);
     if let Some(index) = state.apps_info {
         return stack![base, app_info(state, index)]
@@ -445,6 +539,45 @@ fn apps_view(
             .into();
     }
     base
+}
+
+fn install_progress_card<'a>(state: &State) -> Element<'a, HubMessage> {
+    let progress = state.install_progress;
+    let value = if progress.phase == InstallPhase::Finishing {
+        1.0
+    } else {
+        progress.fraction.unwrap_or(0.0).clamp(0.0, 1.0)
+    };
+    column![
+        row![
+            text(progress.title())
+                .size(theme::type_scale::META)
+                .color(theme::MUTED),
+            space().width(Fill),
+            text(progress.detail())
+                .size(theme::type_scale::CAPTION)
+                .color(theme::DIM),
+        ]
+        .align_y(Alignment::Center),
+        progress_bar(0.0..=1.0, value)
+            .length(Fill)
+            .girth(4.0)
+            .style(progress_style),
+    ]
+    .spacing(6)
+    .width(Fill)
+    .into()
+}
+
+fn progress_style(_theme: &Theme) -> progress_bar::Style {
+    progress_bar::Style {
+        background: Background::Color(theme::alpha(theme::INK, 0.10)),
+        bar: Background::Color(theme::ACCENT),
+        border: Border {
+            radius: theme::radius::PILL.into(),
+            ..Border::default()
+        },
+    }
 }
 
 fn tile_button<'a>(
@@ -483,7 +616,26 @@ fn tile_button<'a>(
     .spacing(10)
     .align_x(Alignment::Center)
     .into();
-    let content = if matches!(tile, HubTile::Browser) && !state.engine_ready {
+    let content = if matches!(tile, HubTile::Browser) && state.installing {
+        let label = state
+            .install_progress
+            .percent()
+            .map(|percent| format!("{percent}%"))
+            .unwrap_or_else(|| "…".to_string());
+        stack![
+            content,
+            container(
+                text(label)
+                    .size(theme::type_scale::CAPTION)
+                    .color(theme::WARNING),
+            )
+            .width(Fill)
+            .height(Fill)
+            .align_x(Alignment::End)
+            .align_y(Alignment::Start),
+        ]
+        .into()
+    } else if matches!(tile, HubTile::Browser) && !state.engine_ready {
         stack![
             content,
             container(
@@ -543,25 +695,9 @@ fn app_tile<'a>(state: &State, app: HubApp, index: usize, width: f32) -> Element
     .spacing(10)
     .align_x(Alignment::Center)
     .into();
-    // The X affordance is the action affordance: the whole tile opens the
-    // same per-app actions popup, so there is no nested button.
-    let content: Element<'a, HubMessage> = stack![
-        body,
-        container(
-            svg(svg::Handle::from_memory(svg_icon::CLOSE_SVG.as_bytes()))
-                .width(Length::Fixed(13.0))
-                .height(Length::Fixed(13.0))
-                .style(|_theme, _status| svg::Style {
-                    color: Some(theme::MUTED)
-                }),
-        )
-        .width(Fill)
-        .height(Fill)
-        .align_x(Alignment::End)
-        .align_y(Alignment::Start),
-    ]
-    .into();
-    button(container(content).center_x(Fill).center_y(Fill))
+    // The whole tile opens the per-app actions popup; there is no nested
+    // button or redundant corner affordance.
+    button(container(body).center_x(Fill).center_y(Fill))
         .width(Length::Fixed(width))
         .height(Length::Fixed(APP_TILE_H))
         .padding(10)
@@ -933,16 +1069,34 @@ mod tests {
             ..State::default()
         };
         assert_eq!(
-            state.app_actions(1),
+            state.app_actions(0),
             vec![AppAction::Install, AppAction::Info]
         );
         assert!(state.app_dimmed(HubApp::Browser));
         state.engine_ready = true;
         assert_eq!(
-            state.app_actions(1),
+            state.app_actions(0),
             vec![AppAction::Uninstall, AppAction::Info]
         );
         assert!(!state.app_dimmed(HubApp::Browser));
+    }
+
+    #[test]
+    fn install_progress_is_visible_in_status() {
+        let mut state = State::default();
+        state.set_installing(true);
+        assert_eq!(state.app_status(HubApp::Browser), "Installing…");
+        state.set_install_progress(InstallProgress {
+            phase: InstallPhase::Downloading,
+            fraction: Some(0.42),
+            done: 82 * 1024 * 1024,
+            total: Some(196 * 1024 * 1024),
+        });
+        assert_eq!(state.app_status(HubApp::Browser), "Installing… 42%");
+        assert_eq!(state.install_progress.detail(), "42% · 82.0 MB of 196.0 MB");
+        state.install_done(true, None);
+        assert!(!state.installing);
+        assert_eq!(state.app_status(HubApp::Browser), "Installed");
     }
 
     #[test]
@@ -952,7 +1106,7 @@ mod tests {
             ..State::default()
         };
         state.open_apps();
-        state.open_apps_menu(1);
+        state.open_apps_menu(0);
         assert_eq!(state.apps_menu_action(), Some(AppAction::Install));
         state.apps_menu_move(1);
         assert_eq!(state.apps_menu_action(), Some(AppAction::Info));

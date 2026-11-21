@@ -18,8 +18,27 @@ use std::time::Duration;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Install phases reported to the hub while the engine DLC is prepared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallProgress {
+    Starting,
+    Downloading { received: u64, total: Option<u64> },
+    Verifying { done: u64, total: u64 },
+    Extracting { done: usize, total: usize },
+    Finishing,
+}
+
 /// Install from the dev DLC feed.
 pub fn install_from_env() -> Result<PathBuf, String> {
+    install_from_env_with_progress(|_| {})
+}
+
+/// Install from the dev DLC feed, reporting download/verify/extract progress
+/// to the caller (the hub renders it live).
+pub fn install_from_env_with_progress(
+    mut progress: impl FnMut(InstallProgress),
+) -> Result<PathBuf, String> {
+    progress(InstallProgress::Starting);
     let url = std::env::var("SDSC_CEF_DLC_URL")
         .map_err(|_| "Browser engine download is not configured (SDSC_CEF_DLC_URL)".to_string())?;
     let expected = std::env::var("SDSC_CEF_DLC_SHA256")
@@ -34,16 +53,17 @@ pub fn install_from_env() -> Result<PathBuf, String> {
     std::fs::create_dir_all(&staging).map_err(|e| format!("create staging dir: {e}"))?;
 
     let archive = staging.join("cef-engine.zip");
-    download(&url, &archive)?;
-    let actual = sha256_file(&archive)?;
+    download(&url, &archive, &mut progress)?;
+    let actual = sha256_file_with_progress(&archive, &mut progress)?;
     if !actual.eq_ignore_ascii_case(expected.trim()) {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(format!(
             "Browser engine hash mismatch (expected {expected}, got {actual})"
         ));
     }
-    extract_zip(&archive, &staging)?;
+    extract_zip(&archive, &staging, &mut progress)?;
     let _ = std::fs::remove_file(&archive);
+    progress(InstallProgress::Finishing);
 
     let Some(runtime) = find_runtime_root(&staging) else {
         let _ = std::fs::remove_dir_all(&staging);
@@ -69,7 +89,11 @@ pub fn install_from_env() -> Result<PathBuf, String> {
     Ok(target)
 }
 
-fn download(url: &str, dest: &Path) -> Result<(), String> {
+fn download(
+    url: &str,
+    dest: &Path,
+    progress: &mut impl FnMut(InstallProgress),
+) -> Result<(), String> {
     let response = ureq::get(url)
         .header("User-Agent", "sdsc-utils")
         .config()
@@ -77,10 +101,19 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
         .build()
         .call()
         .map_err(|e| format!("download failed: {e}"))?;
+    let expected = response.body().content_length();
+    progress(InstallProgress::Downloading {
+        received: 0,
+        total: expected,
+    });
     let mut reader = response.into_body().into_reader();
     let mut file = std::fs::File::create(dest).map_err(|e| format!("create archive: {e}"))?;
     let mut buf = vec![0u8; 1 << 20];
-    let mut total = 0u64;
+    let step = expected
+        .map(|total| (total / 100).max(64 * 1024))
+        .unwrap_or(4 << 20);
+    let mut received = 0u64;
+    let mut last_report = 0u64;
     loop {
         let n = reader
             .read(&mut buf)
@@ -88,27 +121,52 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
         if n == 0 {
             break;
         }
-        total += n as u64;
-        if total > MAX_ARCHIVE_BYTES {
+        received += n as u64;
+        if received > MAX_ARCHIVE_BYTES {
             return Err("Browser engine archive is unexpectedly large".to_string());
         }
         file.write_all(&buf[..n])
             .map_err(|e| format!("download write: {e}"))?;
+        if received.saturating_sub(last_report) >= step {
+            progress(InstallProgress::Downloading {
+                received,
+                total: expected,
+            });
+            last_report = received;
+        }
     }
+    progress(InstallProgress::Downloading {
+        received,
+        total: expected,
+    });
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
+fn sha256_file_with_progress(
+    path: &Path,
+    progress: &mut impl FnMut(InstallProgress),
+) -> Result<String, String> {
+    let total = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    progress(InstallProgress::Verifying { done: 0, total });
     let mut file = std::fs::File::open(path).map_err(|e| format!("open archive: {e}"))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
+    let step = (total / 100).max(1 << 20);
+    let mut done = 0u64;
+    let mut last_report = 0u64;
     loop {
         let n = file.read(&mut buf).map_err(|e| format!("hash read: {e}"))?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
+        done += n as u64;
+        if done.saturating_sub(last_report) >= step {
+            progress(InstallProgress::Verifying { done, total });
+            last_report = done;
+        }
     }
+    progress(InstallProgress::Verifying { done, total });
     Ok(hasher
         .finalize()
         .iter()
@@ -116,10 +174,17 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         .collect())
 }
 
-fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
+fn extract_zip(
+    archive: &Path,
+    dest: &Path,
+    progress: &mut impl FnMut(InstallProgress),
+) -> Result<(), String> {
     let file = std::fs::File::open(archive).map_err(|e| format!("open archive: {e}"))?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("read archive: {e}"))?;
-    for i in 0..zip.len() {
+    let total = zip.len();
+    progress(InstallProgress::Extracting { done: 0, total });
+    let mut last_percent = usize::MAX;
+    for i in 0..total {
         let mut entry = zip
             .by_index(i)
             .map_err(|e| format!("archive entry {i}: {e}"))?;
@@ -129,13 +194,20 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
         let out = dest.join(path);
         if entry.is_dir() {
             std::fs::create_dir_all(&out).map_err(|e| format!("create dir: {e}"))?;
-            continue;
+        } else {
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
+            }
+            let mut out_file =
+                std::fs::File::create(&out).map_err(|e| format!("create file: {e}"))?;
+            std::io::copy(&mut entry, &mut out_file).map_err(|e| format!("extract file: {e}"))?;
         }
-        if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
+        let done = i + 1;
+        let percent = (done * 100).checked_div(total).unwrap_or(100);
+        if percent != last_percent {
+            progress(InstallProgress::Extracting { done, total });
+            last_percent = percent;
         }
-        let mut out_file = std::fs::File::create(&out).map_err(|e| format!("create file: {e}"))?;
-        std::io::copy(&mut entry, &mut out_file).map_err(|e| format!("extract file: {e}"))?;
     }
     Ok(())
 }

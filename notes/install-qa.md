@@ -38,7 +38,11 @@ zips, the CEF DLC zip, installed copies, and private `APPDATA` dirs.
   walk-through, so the clean flow can be repeated.
 - **Launch controls.** `APPDATA` is rewritten to the QA dir and the mock feed
   + engine env appended. A tracked PID is stopped with `taskkill /T` (CEF
-  subprocesses included).
+  subprocesses included). **Allow controller input** is on by default for
+  manual testing; uncheck it for automation.
+- **Secondary monitor only.** Every QA launch sets `SDSC_DEBUG_QUIET=1`, so
+  debug-open windows use the secondary monitor and never take focus from the
+  game/desktop on the primary.
 
 ## Why an engine-less exe starts
 
@@ -64,12 +68,24 @@ empty install is the default test state.
 | `SDSC_CEF_NO_BUILD_FALLBACK` | engine resolver in debug/qa-feed builds |
 | `APPDATA` | app data dir (`%APPDATA%\sdsc-utils`) |
 | `SDSC_DEBUG_OPEN` | debug builds: open `hub`/`browser`/etc. after boot |
-| `SDSC_DEBUG_QUIET` | `0` keeps debug-open windows focusable with live pad input |
+| `SDSC_DEBUG_QUIET` | `0` makes debug-open windows focusable on the primary |
+| `SDSC_DEBUG_INPUT` | `1` keeps pad edges live while quiet placement is active |
 
 `SDSC_DEBUG_OPEN` normally enables **debug quiet mode** (no focus, secondary
 monitor, pad edges dropped) for screenshotting over a running game. The QA
-console sets `SDSC_DEBUG_QUIET=0` so its debug-open hub is a normal focused
-window and controller navigation works in the hub, Start, and Browser.
+console always sets `SDSC_DEBUG_QUIET=1`. Manual launches default to
+`SDSC_DEBUG_INPUT=1` so controller navigation works in the hub, Start, and
+Browser. Automated launches must pass `"controller_input": false` so
+`SDSC_DEBUG_INPUT=0`; the physical controller must never navigate or close the
+QA app while a test is running.
+
+## Automation
+
+Call `/api/prepare` with `"controller_input": false` (and leave **Allow
+controller input** unchecked in the page). The app still opens on the
+secondary monitor with no focus steal, but pad edges are dropped by the debug
+quiet path. Never automate against the primary monitor or with controller
+input enabled.
 
 ## Build prerequisites
 
