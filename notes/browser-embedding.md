@@ -22,7 +22,8 @@ window, the engine worker, DOM targets, or the CEF packaging path.
 - CEF ships as sidecar files next to the exe (`libcef.dll`, `*.pak`,
   `locales/`, ANGLE/SwiftShader). A literal single `.exe` is impossible; the
   packaging phase makes this one installer/bundle with an optional engine
-  package.
+  package. The exe delay-loads `libcef.dll`, so a bundle with no engine is
+  runnable and the catalog can install it (and attach CEF) without a restart.
 
 ## Layout
 

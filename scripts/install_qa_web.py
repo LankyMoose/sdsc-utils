@@ -5,30 +5,29 @@ One loopback process serves:
 
     /                                   control page
     /api/state                          JSON snapshot
-    /api/config                         POST versions/latest/toggles
-    /api/build                          POST cargo build --release --features qa-feed
-    /api/stage                          POST stage a portable folder + zip
-    /api/install                        POST extract a staged portable into an install dir
-    /api/uninstall                      POST remove an install + its QA appdata
-    /api/launch                         POST launch debug/release/installed with QA env
+    /api/config                         POST manifest + engine choice
+    /api/prepare                        POST build, stage, launch (async)
+    /api/relaunch                       POST rerun the last install
     /api/stop                           POST stop the launched app
-    /api/engine                         POST build the CEF DLC zip + sha256
-    /api/clear                          POST clear QA appdata / installs
+    /api/clear                          POST remove QA installs/appdata
     /repos/LankyMoose/sdsc-utils/releases/latest
                                         fake GitHub release API
-    /downloads/<file>                   staged portable / engine zips
+    /downloads/<file>                   engine DLC zip
 
-Run:
+The point of the console is to run a standalone install that has **no CEF
+engine yet**. `Build & launch` builds the app, copies only the exe into the
+QA install, points `APPDATA` at a private directory, and starts it. The hub
+then shows Browser as not installed; its Install action downloads the engine
+zip from this server and attaches CEF without restarting the app.
 
-    python scripts/install_qa_web.py
-    python scripts/install_qa_web.py --port 8765 --open
+Check `Bundle browser engine` to stage `cef\\` beside the exe instead, for the
+already-installed path. `Rebuild install` resets the install and its private
+appdata, including any engine downloaded during a previous walk-through.
 
 The app reads `SDSC_UPDATE_API_URL` in debug builds or release builds
 compiled with `--features qa-feed`; `SDSC_CEF_DLC_URL`/`SHA256` drive the
-BrowserEngine install. QA launches also set `APPDATA` to a private data dir
-and `SDSC_CEF_NO_BUILD_FALLBACK=1`, so a portable install without the `cef\\`
-sidecar behaves like a clean machine and the engine must be installed from
-the catalog.
+engine install. `SDSC_CEF_NO_BUILD_FALLBACK=1` stops the app from finding the
+build machine's CEF runtime, so a clean install really is clean.
 """
 
 import argparse
@@ -74,6 +73,7 @@ CEF_FILES = [
 ]
 CEF_DIRS = ["locales", "swiftshader"]
 TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+$")
+GITHUB_RELEASE_PREFIX = "https://github.com/"
 
 
 def cargo_version() -> str:
@@ -175,16 +175,16 @@ class Console:
         self.building = False
         self.building_since: float | None = None
         self.build_error: str | None = None
-        self.staging = False
-        self.stage_error: str | None = None
+        self.preparing = False
+        self.prepare_step = ""
+        self.prepare_error: str | None = None
         self.engine: dict | None = None
-        self.requests = deque(maxlen=60)
+        self.requests = deque(maxlen=80)
         self.installed: dict[str, dict] = {}
         self.server: ThreadingHTTPServer | None = None
         self.last_flavor: str | None = None
         self.last_debug_open: str = ""
-        self.preparing = False
-        self.versions, self.latest, self.cef_mode, self.manifest = self.load_state()
+        self.manifest, self.engine_bundled = self.load_state()
         OUT.mkdir(parents=True, exist_ok=True)
         DOWNLOADS.mkdir(parents=True, exist_ok=True)
         PORTABLE.mkdir(parents=True, exist_ok=True)
@@ -195,60 +195,50 @@ class Console:
 
     # -- state -----------------------------------------------------------
 
-    def default_versions(self):
+    def default_manifest(self):
         current = cargo_version()
         parts = current.split(".")
         try:
             major, minor, patch = (int(p) for p in parts[:3])
-            nxt = f"v{major}.{minor}.{patch + 1}"
+            tag = f"v{major}.{minor}.{patch + 1}"
         except (ValueError, IndexError):
-            nxt = "v1.7.4"
-        return [
-            {"tag": f"v{current}", "enabled": True},
-            {"tag": nxt, "enabled": True},
-        ], nxt, "full"
-
-    def default_manifest(self, version: str):
+            tag = "v1.7.4"
         return {
-            "tag_name": version,
-            "name": version,
-            "html_url": f"https://github.com/LankyMoose/sdsc-utils/releases/tag/{version}",
+            "tag_name": tag,
+            "name": tag,
+            "html_url": f"https://github.com/LankyMoose/sdsc-utils/releases/tag/{tag}",
             "body": "",
             "assets": [],
         }
 
     def load_state(self):
-        versions, latest, cef_mode = self.default_versions()
-        manifest = self.default_manifest(latest)
+        manifest = self.default_manifest()
+        engine_bundled = False
         try:
             raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-            loaded = [
-                {"tag": normalize_tag(str(v.get("tag", ""))), "enabled": bool(v.get("enabled", True))}
-                for v in raw.get("versions", [])
-            ]
-            loaded = [v for v in loaded if v["tag"]]
-            if loaded:
-                versions = loaded
-            latest = normalize_tag(str(raw.get("latest", ""))) or latest
-            cef_mode = str(raw.get("cef_mode", cef_mode))
-            if cef_mode not in ("full", "loader", "none"):
-                cef_mode = "full" if bool(raw.get("ship_cef", True)) else "none"
-            saved_manifest = raw.get("manifest")
-            if isinstance(saved_manifest, dict):
-                manifest.update(saved_manifest)
+            saved = raw.get("manifest")
+            if isinstance(saved, dict):
+                manifest.update(saved)
+            engine_bundled = bool(raw.get("engine_bundled", False))
         except (OSError, ValueError):
             pass
         tag = normalize_tag(str(manifest.get("tag_name", "")))
-        if tag:
-            manifest["tag_name"] = tag
-            latest = tag
-        else:
-            manifest["tag_name"] = latest
-        if not str(manifest.get("html_url", "")).strip():
-            manifest["html_url"] = (
-                f"https://github.com/LankyMoose/sdsc-utils/releases/tag/{latest}"
-            )
-        return versions, latest, cef_mode, manifest
+        if not tag:
+            tag = normalize_tag(str(manifest.get("name", "")))
+        if not tag:
+            tag = self.default_manifest()["tag_name"]
+        manifest["tag_name"] = tag
+        if not str(manifest.get("name", "")).strip():
+            manifest["name"] = tag
+        if not str(manifest.get("body", "")).strip():
+            manifest["body"] = ""
+        if not isinstance(manifest.get("assets"), list):
+            manifest["assets"] = []
+        url = str(manifest.get("html_url", "")).strip()
+        if not url:
+            url = f"https://github.com/LankyMoose/sdsc-utils/releases/tag/{tag}"
+        manifest["html_url"] = url
+        return manifest, engine_bundled
 
     def save_state(self):
         with self.lock:
@@ -256,10 +246,8 @@ class Console:
             STATE_PATH.write_text(
                 json.dumps(
                     {
-                        "versions": self.versions,
-                        "latest": self.latest,
                         "manifest": self.manifest,
-                        "cef_mode": self.cef_mode,
+                        "engine_bundled": self.engine_bundled,
                     },
                     indent=2,
                 )
@@ -274,24 +262,22 @@ class Console:
                 if not entry.is_dir():
                     continue
                 exe = entry / ("sdsc-utils.exe" if os.name == "nt" else "sdsc-utils")
-                if exe.is_file():
-                    found[entry.name] = {
-                        "tag": entry.name,
-                        "path": str(entry),
-                        "exe": str(exe),
-                        "sidecar": (entry / "cef" / "libcef.dll").is_file(),
-                        "appdata": str(appdata_for(f"portable-{entry.name}")),
-                    }
+                if not exe.is_file():
+                    continue
+                marker = entry / ".qa-mode"
+                mode = marker.read_text(encoding="utf-8").strip() if marker.is_file() else ""
+                appdata = appdata_for(f"portable-{entry.name}")
+                engine_data = appdata / "sdsc-utils" / "cef-engine"
+                found[entry.name] = {
+                    "tag": entry.name,
+                    "path": str(entry),
+                    "exe": str(exe),
+                    "sidecar": (entry / "cef" / "libcef.dll").is_file(),
+                    "engine_appdata": (engine_data / "libcef.dll").is_file(),
+                    "mode": ":".join(mode.split(":")[:2]),
+                    "appdata": str(appdata),
+                }
             self.installed = found
-
-    def latest_enabled(self):
-        with self.lock:
-            enabled = [v["tag"] for v in self.versions if v["enabled"]]
-            if not enabled:
-                return None
-            if self.latest in enabled:
-                return self.latest
-            return max(enabled, key=version_key)
 
     def feed_url(self):
         return f"http://127.0.0.1:{self.port}/repos/LankyMoose/sdsc-utils/releases/latest"
@@ -311,27 +297,25 @@ class Console:
                     self.running_pid = None
             rev, dirty = git_rev()
             cef = find_cef_dir()
-            latest = self.latest_enabled()
             return {
                 "version": cargo_version(),
                 "git": rev,
                 "dirty": dirty,
                 "feed_url": self.feed_url(),
-                "latest": self.manifest.get("tag_name", latest),
-                "versions": self.versions,
+                "latest": self.manifest.get("tag_name", ""),
                 "manifest": self.manifest,
-                "cef_mode": self.cef_mode,
+                "engine_bundled": self.engine_bundled,
                 "running": running,
                 "running_pid": pid,
                 "running_flavor": self.running_flavor,
                 "last_flavor": self.last_flavor,
                 "last_debug_open": self.last_debug_open,
                 "preparing": self.preparing,
+                "prepare_step": self.prepare_step,
+                "prepare_error": self.prepare_error,
                 "building": self.building,
                 "building_since": self.building_since,
                 "build_error": self.build_error,
-                "staging": self.staging,
-                "stage_error": self.stage_error,
                 "cef": str(cef) if cef else None,
                 "engine": self.engine,
                 "installed": sorted(self.installed.values(), key=lambda x: version_key(x["tag"])),
@@ -363,44 +347,89 @@ class Console:
             if not self.engine:
                 raise RuntimeError("engine DLC zip unavailable (CEF runtime not found)")
 
-    def _stage_install_sync(self, flavor: str, cef_mode: str, tag: str):
+    def _engine_worker(self):
+        cef = find_cef_dir()
+        if not cef:
+            raise RuntimeError("CEF runtime not found; build the project or set CEF_PATH")
+        archive = DOWNLOADS / "cef-engine.zip"
+        tmp = DOWNLOADS / "cef-engine.zip.tmp"
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+            for name in CEF_FILES:
+                src = cef / name
+                if src.is_file():
+                    zf.write(src, name)
+            for name in CEF_DIRS:
+                src = cef / name
+                if src.is_dir():
+                    for path in src.rglob("*"):
+                        if path.is_file():
+                            zf.write(path, path.relative_to(cef))
+        os.replace(tmp, archive)
+        with self.lock:
+            self.engine = {
+                "path": str(archive),
+                "url": f"http://127.0.0.1:{self.port}/downloads/cef-engine.zip",
+                "sha256": sha256_file(archive),
+                "bytes": archive.stat().st_size,
+                "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        self.log(f"engine: {archive.name} ({archive.stat().st_size:,} bytes)")
+
+    def build_flavor(self, flavor: str):
+        with self.lock:
+            self.building = True
+            self.building_since = time.time()
+            self.build_error = None
+        try:
+            cmd = ["cargo", "build", "--bin", "sdsc-utils"]
+            if flavor == "release":
+                cmd.extend(["--release", "--features", "qa-feed"])
+            self.log(f"$ {' '.join(cmd)}")
+            result = subprocess.run(cmd, cwd=str(REPO), env=build_env())
+            if result.returncode != 0:
+                raise RuntimeError(f"cargo build failed ({result.returncode})")
+            self.log(f"build: {flavor} ready")
+        except Exception as err:  # noqa: BLE001 - surfaced in the web UI
+            with self.lock:
+                self.build_error = str(err)
+            raise
+        finally:
+            with self.lock:
+                self.building = False
+                self.building_since = None
+
+    def _stage_install_sync(
+        self,
+        flavor: str,
+        engine_bundled: bool,
+        tag: str,
+        marker: str,
+        reset_appdata: bool,
+    ):
         exe = exe_for(flavor)
         if not exe.is_file():
             raise RuntimeError(f"{flavor} exe missing: {exe}")
-        root = PORTABLE / f"{tag}-{flavor}-{cef_mode}"
+        label = "engine" if engine_bundled else "clean"
+        root = PORTABLE / f"{tag}-{flavor}-{label}"
         if root.exists():
             shutil.rmtree(root)
         root.mkdir(parents=True)
         shutil.copy2(exe, root / exe.name)
-        if cef_mode != "none":
+        if engine_bundled:
             cef = find_cef_dir()
             if not cef:
                 raise RuntimeError("CEF runtime not found; build the project or set CEF_PATH")
-            loader_files = {
-                "libcef.dll",
-                "chrome_elf.dll",
-                "d3dcompiler_47.dll",
-                "dxcompiler.dll",
-                "vulkan-1.dll",
-                "vk_swiftshader.dll",
-            }
-            if cef_mode == "full":
-                dest = root / "cef"
-                dest.mkdir()
-                for name in CEF_FILES:
-                    src = cef / name
-                    if src.is_file():
-                        shutil.copy2(src, dest / name)
-                for name in CEF_DIRS:
-                    src = cef / name
-                    if src.is_dir():
-                        shutil.copytree(src, dest / name)
-            else:
-                for name in loader_files:
-                    src = cef / name
-                    if src.is_file():
-                        shutil.copy2(src, root / name)
-        archive = DOWNLOADS / f"sdsc-utils-{tag}-{flavor}-{cef_mode}-portable.zip"
+            dest = root / "cef"
+            dest.mkdir()
+            for name in CEF_FILES:
+                src = cef / name
+                if src.is_file():
+                    shutil.copy2(src, dest / name)
+            for name in CEF_DIRS:
+                src = cef / name
+                if src.is_dir():
+                    shutil.copytree(src, dest / name)
+        archive = DOWNLOADS / f"sdsc-utils-{tag}-{flavor}-{label}-portable.zip"
         self._zip_dir(root, archive)
         dest = INSTALLS / tag
         if dest.exists():
@@ -412,197 +441,13 @@ class Console:
                 if not str(target).startswith(str(dest.resolve())):
                     raise RuntimeError("archive entry escapes install dir")
                 zf.extract(info, dest)
-        (dest / ".qa-mode").write_text(f"{flavor}:{cef_mode}", encoding="utf-8")
+        (dest / ".qa-mode").write_text(marker, encoding="utf-8")
         appdata = appdata_for(f"portable-{tag}")
-        if appdata.is_dir():
+        if reset_appdata and appdata.is_dir():
             shutil.rmtree(appdata, ignore_errors=True)
         appdata.mkdir(parents=True, exist_ok=True)
         self.refresh_installed()
-        self.log(f"install: {tag} ({flavor}, cef={cef_mode})")
-
-    def prepare_launch(self, payload):
-        self.preparing = True
-        try:
-            if isinstance(payload.get("manifest"), dict):
-                self.set_config({"manifest": payload["manifest"]})
-            if payload.get("version"):
-                self.set_config({"version": str(payload["version"])})
-            if payload.get("html_url"):
-                self.set_config({"html_url": str(payload["html_url"])})
-            target = str(payload.get("target", "direct"))
-            flavor = str(payload.get("flavor", "debug"))
-            cef = str(payload.get("cef", "full"))
-            open_hub = bool(payload.get("open_hub", True))
-            restage = bool(payload.get("restage", False))
-            if flavor not in ("debug", "release"):
-                raise RuntimeError(f"unknown flavor {flavor!r}")
-            if cef not in ("full", "loader", "none"):
-                raise RuntimeError(f"unknown CEF mode {cef!r}")
-            if not (target == "portable" and cef == "full"):
-                self.ensure_engine()
-            if target == "portable":
-                tag = str(self.manifest.get("tag_name", ""))
-                marker = INSTALLS / tag / ".qa-mode"
-                want = f"{flavor}:{cef}"
-                if (
-                    restage
-                    or not marker.is_file()
-                    or marker.read_text(encoding="utf-8").strip() != want
-                ):
-                    self._stage_install_sync(flavor, cef, tag)
-                return self.launch(
-                    f"installed:{tag}",
-                    "hub" if open_hub and flavor == "debug" else "",
-                )
-            return self.launch(
-                flavor, "hub" if open_hub and flavor == "debug" else ""
-            )
-        finally:
-            self.preparing = False
-
-    def relaunch(self):
-        if not self.last_flavor:
-            raise RuntimeError("nothing has been launched yet")
-        return self.launch(self.last_flavor, self.last_debug_open)
-
-    def set_config(self, payload):
-        with self.lock:
-            if "cef_mode" in payload:
-                mode = str(payload["cef_mode"])
-                if mode in ("full", "loader", "none"):
-                    self.cef_mode = mode
-            if isinstance(payload.get("manifest"), dict):
-                manifest = dict(payload["manifest"])
-                tag = normalize_tag(str(manifest.get("tag_name", "")))
-                if tag:
-                    manifest["tag_name"] = tag
-                    self.manifest = manifest
-                    self.latest = tag
-                    if all(v["tag"] != tag for v in self.versions):
-                        self.versions.append({"tag": tag, "enabled": True})
-            if "version" in payload:
-                tag = normalize_tag(str(payload["version"]))
-                if tag:
-                    self.manifest["tag_name"] = tag
-                    self.latest = tag
-                    if all(v["tag"] != tag for v in self.versions):
-                        self.versions.append({"tag": tag, "enabled": True})
-            if "html_url" in payload and str(payload["html_url"]).strip():
-                self.manifest["html_url"] = str(payload["html_url"]).strip()
-            if "versions" in payload:
-                cleaned = []
-                for item in payload["versions"]:
-                    tag = normalize_tag(str(item.get("tag", "")))
-                    if tag:
-                        cleaned.append({"tag": tag, "enabled": bool(item.get("enabled", True))})
-                if cleaned:
-                    self.versions = cleaned
-            if "latest" in payload:
-                tag = normalize_tag(str(payload["latest"]))
-                if tag:
-                    self.latest = tag
-            if "add" in payload:
-                tag = normalize_tag(str(payload["add"]))
-                if tag and all(v["tag"] != tag for v in self.versions):
-                    self.versions.append({"tag": tag, "enabled": True})
-            if "remove" in payload:
-                tag = normalize_tag(str(payload["remove"]))
-                self.versions = [v for v in self.versions if v["tag"] != tag]
-                if self.latest == tag:
-                    self.latest = self.latest_enabled() or ""
-            self.save_state()
-        return self.api_state()
-
-    def build(self):
-        with self.lock:
-            if self.building:
-                return
-            self.building = True
-            self.building_since = time.time()
-            self.build_error = None
-        threading.Thread(target=self._build_worker, daemon=True).start()
-
-    def _build_worker(self):
-        try:
-            env = build_env()
-            # Do not set CEF_PATH here: cef-dll-sys expects its binary
-            # distribution/archive layout, not the extracted runtime dir.
-            # An existing build's OUT_DIR is reused automatically.
-            cmd = ["cargo", "build", "--release", "--features", "qa-feed"]
-            self.log(f"$ {' '.join(cmd)}")
-            result = subprocess.run(cmd, cwd=str(REPO), env=env)
-            if result.returncode != 0:
-                raise RuntimeError(f"cargo build failed ({result.returncode})")
-            self.log("build: release qa-feed ready")
-        except Exception as err:  # noqa: BLE001 - surfaced to the web UI
-            with self.lock:
-                self.build_error = str(err)
-            self.log(f"build error: {err}")
-        finally:
-            with self.lock:
-                self.building = False
-
-    def stage(self):
-        with self.lock:
-            if self.staging:
-                return
-            self.staging = True
-            self.stage_error = None
-        threading.Thread(target=self._stage_worker, daemon=True).start()
-
-    def _stage_worker(self):
-        try:
-            exe = exe_for("release")
-            if not exe.is_file():
-                raise RuntimeError("release exe missing; build release (qa-feed) first")
-            version = cargo_version()
-            out = PORTABLE / version
-            if out.exists():
-                shutil.rmtree(out)
-            out.mkdir(parents=True)
-            shutil.copy2(exe, out / exe.name)
-            if self.cef_mode != "none":
-                cef = find_cef_dir()
-                if not cef:
-                    raise RuntimeError("CEF runtime not found; build the project or set CEF_PATH")
-                # Full: a runnable portable bundle in cef\ (resolver-valid).
-                # Loader: the DLLs libcef needs at process load go next to the
-                # exe, but resources/locales are omitted, so the resolver sees
-                # "not installed" and the DLC flow can be exercised.
-                loader_files = {
-                    "libcef.dll",
-                    "chrome_elf.dll",
-                    "d3dcompiler_47.dll",
-                    "dxcompiler.dll",
-                    "vulkan-1.dll",
-                    "vk_swiftshader.dll",
-                }
-                if self.cef_mode == "full":
-                    dest = out / "cef"
-                    dest.mkdir()
-                    for name in CEF_FILES:
-                        src = cef / name
-                        if src.is_file():
-                            shutil.copy2(src, dest / name)
-                    for name in CEF_DIRS:
-                        src = cef / name
-                        if src.is_dir():
-                            shutil.copytree(src, dest / name)
-                else:
-                    for name in loader_files:
-                        src = cef / name
-                        if src.is_file():
-                            shutil.copy2(src, out / name)
-            archive = DOWNLOADS / f"sdsc-utils-{version}-portable.zip"
-            self._zip_dir(out, archive)
-            self.log(f"stage: {archive.name} ({archive.stat().st_size:,} bytes)")
-        except Exception as err:  # noqa: BLE001
-            with self.lock:
-                self.stage_error = str(err)
-            self.log(f"stage error: {err}")
-        finally:
-            with self.lock:
-                self.staging = False
+        self.log(f"install: {tag} ({flavor}, engine={'bundled' if engine_bundled else 'missing'})")
 
     @staticmethod
     def _zip_dir(root: Path, archive: Path):
@@ -613,44 +458,136 @@ class Console:
                 if path.is_file():
                     zf.write(path, path.relative_to(root))
 
-    def install(self, tag: str):
-        tag = normalize_tag(tag) or tag
-        archive = DOWNLOADS / f"sdsc-utils-{tag}-portable.zip"
-        if not archive.is_file():
-            # The staged archive is named by Cargo version; allow installing
-            # the current stage under the feed tag being tested.
-            archives = sorted(DOWNLOADS.glob("sdsc-utils-*-portable.zip"))
-            if not archives:
-                raise RuntimeError("no staged portable zip; Stage first")
-            archive = archives[-1]
-        dest = INSTALLS / tag
-        if dest.exists():
-            shutil.rmtree(dest)
-        dest.mkdir(parents=True)
-        with zipfile.ZipFile(archive) as zf:
-            for info in zf.infolist():
-                target = (dest / info.filename).resolve()
-                if not str(target).startswith(str(dest.resolve())):
-                    raise RuntimeError("archive entry escapes install dir")
-                zf.extract(info, dest)
-        appdata = appdata_for(f"portable-{tag}")
-        if appdata.is_dir():
-            shutil.rmtree(appdata, ignore_errors=True)
-        appdata.mkdir(parents=True, exist_ok=True)
-        self.log(f"install: {tag} -> {dest}")
-        self.refresh_installed()
+    def prepare_launch(self, payload):
+        with self.lock:
+            if self.preparing:
+                return self.api_state()
+        config = {
+            key: payload[key]
+            for key in ("manifest", "version", "html_url", "engine_bundled")
+            if key in payload
+        }
+        if config:
+            self.set_config(config)
+        with self.lock:
+            if self.preparing:
+                return self.api_state()
+            self.preparing = True
+            self.prepare_step = "starting"
+            self.prepare_error = None
+        threading.Thread(
+            target=self._prepare_worker, args=(dict(payload),), daemon=True
+        ).start()
         return self.api_state()
 
-    def uninstall(self, tag: str):
-        tag = normalize_tag(tag) or tag
-        dest = INSTALLS / tag
-        if dest.is_dir():
-            shutil.rmtree(dest, ignore_errors=True)
-        appdata = appdata_for(f"portable-{tag}")
-        if appdata.is_dir():
-            shutil.rmtree(appdata, ignore_errors=True)
-        self.log(f"uninstall: {tag}")
-        self.refresh_installed()
+    def _prepare_worker(self, payload):
+        try:
+            flavor = str(payload.get("flavor", "debug"))
+            if flavor not in ("debug", "release"):
+                raise RuntimeError(f"unknown flavor {flavor!r}")
+            bundle = bool(payload.get("engine_bundled", self.engine_bundled))
+            open_hub = bool(payload.get("open_hub", True))
+            restage = bool(payload.get("restage", False))
+            self.log(
+                f"prepare: {flavor}, engine={'bundled' if bundle else 'missing'}"
+                + (", reset" if restage else "")
+            )
+            self.stop()
+
+            self._set_prepare_step("building")
+            self.build_flavor(flavor)
+            if not bundle:
+                self._set_prepare_step("packaging engine")
+                self.ensure_engine()
+
+            tag = normalize_tag(str(self.manifest.get("tag_name", "")))
+            if not tag:
+                raise RuntimeError("version must look like v1.2.3")
+            source = exe_for(flavor)
+            if not source.is_file():
+                raise RuntimeError(f"{flavor} exe missing: {source}")
+            label = "engine" if bundle else "clean"
+            want = f"{flavor}:{label}"
+            marker_path = INSTALLS / tag / ".qa-mode"
+            old_marker = (
+                marker_path.read_text(encoding="utf-8").strip()
+                if marker_path.is_file()
+                else ""
+            )
+            old_mode = ":".join(old_marker.split(":")[:2])
+            stamp = f"{want}:{source.stat().st_mtime_ns}:{source.stat().st_size}"
+            if restage or old_marker != stamp:
+                self._set_prepare_step("installing")
+                self._stage_install_sync(
+                    flavor,
+                    bundle,
+                    tag,
+                    stamp,
+                    reset_appdata=restage or old_mode != want,
+                )
+
+            self._set_prepare_step("launching")
+            self.launch(
+                f"installed:{tag}",
+                "hub" if open_hub and flavor == "debug" else "",
+            )
+        except Exception as err:  # noqa: BLE001 - surfaced in the web UI
+            with self.lock:
+                self.prepare_error = str(err)
+            self.log(f"prepare error: {err}")
+        finally:
+            with self.lock:
+                self.preparing = False
+                self.prepare_step = ""
+
+    def _set_prepare_step(self, step: str):
+        with self.lock:
+            self.prepare_step = step
+
+    def relaunch(self):
+        if not self.last_flavor:
+            raise RuntimeError("nothing has been launched yet")
+        return self.launch(self.last_flavor, self.last_debug_open)
+
+    def set_config(self, payload):
+        with self.lock:
+            if isinstance(payload.get("manifest"), dict):
+                manifest = dict(payload["manifest"])
+                tag = normalize_tag(str(manifest.get("tag_name", "")))
+                if not tag:
+                    raise RuntimeError("manifest tag_name must look like v1.2.3")
+                manifest["tag_name"] = tag
+                if not str(manifest.get("name", "")).strip():
+                    manifest["name"] = tag
+                if not str(manifest.get("body", "")).strip():
+                    manifest["body"] = ""
+                if not isinstance(manifest.get("assets"), list):
+                    manifest["assets"] = []
+                self.manifest = manifest
+            if "version" in payload:
+                tag = normalize_tag(str(payload["version"]))
+                if not tag:
+                    raise RuntimeError("version must look like v1.2.3")
+                before = str(self.manifest.get("tag_name", ""))
+                if str(self.manifest.get("name", "")) in ("", before):
+                    self.manifest["name"] = tag
+                url = str(self.manifest.get("html_url", ""))
+                if not url or "/releases/tag/" in url:
+                    self.manifest["html_url"] = (
+                        f"https://github.com/LankyMoose/sdsc-utils/releases/tag/{tag}"
+                    )
+                self.manifest["tag_name"] = tag
+            if "html_url" in payload:
+                url = str(payload["html_url"]).strip()
+                if url and not url.startswith(GITHUB_RELEASE_PREFIX):
+                    raise RuntimeError(
+                        f"release URL must start with {GITHUB_RELEASE_PREFIX}"
+                    )
+                if url:
+                    self.manifest["html_url"] = url
+            if "engine_bundled" in payload:
+                self.engine_bundled = bool(payload["engine_bundled"])
+            self.save_state()
         return self.api_state()
 
     def stop(self):
@@ -700,9 +637,7 @@ class Console:
             env["SDSC_CEF_DLC_SHA256"] = self.engine["sha256"]
         if debug_open:
             env["SDSC_DEBUG_OPEN"] = debug_open
-        flags = 0
-        if os.name == "nt":
-            flags = subprocess.CREATE_NEW_PROCESS_GROUP
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         with self.lock:
             self.proc = subprocess.Popen(
                 [str(exe)],
@@ -717,41 +652,6 @@ class Console:
         self.log(f"launch: {flavor} pid={self.proc.pid} data={appdata}")
         return self.api_state()
 
-    def build_engine(self):
-        threading.Thread(target=self._engine_worker, daemon=True).start()
-        return {"building": True}
-
-    def _engine_worker(self):
-        try:
-            cef = find_cef_dir()
-            if not cef:
-                raise RuntimeError("CEF runtime not found; build the project or set CEF_PATH")
-            archive = DOWNLOADS / "cef-engine.zip"
-            tmp = DOWNLOADS / "cef-engine.zip.tmp"
-            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
-                for name in CEF_FILES:
-                    src = cef / name
-                    if src.is_file():
-                        zf.write(src, name)
-                for name in CEF_DIRS:
-                    src = cef / name
-                    if src.is_dir():
-                        for path in src.rglob("*"):
-                            if path.is_file():
-                                zf.write(path, path.relative_to(cef))
-            os.replace(tmp, archive)
-            with self.lock:
-                self.engine = {
-                    "path": str(archive),
-                    "url": f"http://127.0.0.1:{self.port}/downloads/cef-engine.zip",
-                    "sha256": sha256_file(archive),
-                    "bytes": archive.stat().st_size,
-                    "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                }
-            self.log(f"engine: {archive.name} ({archive.stat().st_size:,} bytes)")
-        except Exception as err:  # noqa: BLE001
-            self.log(f"engine error: {err}")
-
     def clear(self):
         self.stop()
         with self.lock:
@@ -765,9 +665,7 @@ class Console:
 
     def log(self, line: str):
         with self.lock:
-            self.requests.append(
-                {"at": time.strftime("%H:%M:%S"), "line": line}
-            )
+            self.requests.append({"at": time.strftime("%H:%M:%S"), "line": line})
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -848,35 +746,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(self.console.prepare_launch(payload))
             elif path == "/api/relaunch":
                 self._json(self.console.relaunch())
-            elif path == "/api/build":
-                self.console.build()
-                self._json(self.console.api_state())
-            elif path == "/api/stage":
-                if "cef_mode" in payload and str(payload["cef_mode"]) in (
-                    "full",
-                    "loader",
-                    "none",
-                ):
-                    self.console.cef_mode = str(payload["cef_mode"])
-                elif "ship_cef" in payload:
-                    self.console.cef_mode = "full" if bool(payload["ship_cef"]) else "none"
-                self.console.stage()
-                self._json(self.console.api_state())
-            elif path == "/api/install":
-                self._json(self.console.install(str(payload.get("tag", ""))))
-            elif path == "/api/uninstall":
-                self._json(self.console.uninstall(str(payload.get("tag", ""))))
-            elif path == "/api/launch":
-                self._json(
-                    self.console.launch(
-                        str(payload.get("flavor", "debug")),
-                        str(payload.get("debug_open", "")),
-                    )
-                )
             elif path == "/api/stop":
                 self._json(self.console.stop())
-            elif path == "/api/engine":
-                self._json(self.console.build_engine())
             elif path == "/api/clear":
                 self._json(self.console.clear())
             else:
@@ -894,7 +765,7 @@ PAGE = """<!doctype html>
 <title>SDSC Utils — app lab</title>
 <style>
   :root { color-scheme: dark; --bg:#0d0f14; --panel:#161a22; --line:#2a3040;
-          --ink:#e8eaf0; --muted:#8b93a7; --accent:#3d7dff; --ok:#38c172; --warn:#e0a030; }
+          --ink:#e8eaf0; --muted:#8b93a7; --accent:#3d7dff; --ok:#38c172; --warn:#e0a030; --bad:#ff6b6b; }
   * { box-sizing: border-box; }
   body { margin:0; font:14px/1.45 system-ui, Segoe UI, sans-serif; background:var(--bg); color:var(--ink); }
   main { max-width: 780px; margin: 0 auto; padding: 30px 22px 60px; }
@@ -917,13 +788,12 @@ PAGE = """<!doctype html>
   button:disabled { opacity: .5; cursor: default; }
   .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; word-break:break-all; }
   .muted { color: var(--muted); }
-  .ok { color: var(--ok); }
-  .warn { color: var(--warn); }
+  .hint { color: var(--muted); font-size: 12px; }
+  .error { color: var(--bad); }
   details { margin-top: 10px; }
   summary { cursor:pointer; color: var(--muted); }
   pre { margin:0; max-height: 220px; overflow:auto; color: var(--muted); font-size:12px; }
-  .pill { display:inline-block; padding: 1px 7px; border-radius: 999px; border:1px solid var(--line); color:var(--muted); font-size: 12px; }
-  .pill.ok { color: var(--ok); border-color:#234d35; }
+  #info { white-space: pre-wrap; }
 </style>
 </head>
 <body><main>
@@ -936,43 +806,34 @@ PAGE = """<!doctype html>
       <label>App version <input id="version" type="text" placeholder="v1.7.4"></label>
       <label>Release URL <input id="html-url" type="text"></label>
     </div>
-    <div class="row">
-      <label class="muted">The release URL must stay on https://github.com/ for the app's validator.</label>
-    </div>
     <details>
       <summary>Manifest JSON (tag, URL, notes, assets)</summary>
       <div class="row"><textarea id="manifest"></textarea></div>
     </details>
     <div class="row"><button onclick="saveManifest()">Save manifest</button>
       <span class="muted" id="manifest-note"></span></div>
+    <div class="row hint">The mock release feed serves this manifest. The release URL must stay on https://github.com/ for the app's validator.</div>
   </section>
 
   <section class="card">
-    <h2>Launch</h2>
+    <h2>Build &amp; install</h2>
     <div class="row">
-      <label>Target <select id="target" onchange="syncTarget()">
-        <option value="direct">Direct app</option>
-        <option value="portable">Installed portable</option>
-      </select></label>
       <label>Build <select id="flavor">
         <option value="debug">Debug</option>
-        <option value="release">Release (needs qa-feed)</option>
+        <option value="release">Release (qa-feed)</option>
       </select></label>
-      <label>CEF <select id="cef">
-        <option value="full">Full bundle</option>
-        <option value="loader">Loader-only (DLC test)</option>
-      </select></label>
-      <label><input id="open-hub" type="checkbox" checked> Open hub</label>
-      <label><input id="restage" type="checkbox"> Rebuild portable</label>
+      <label><input id="engine" type="checkbox"> Bundle browser engine</label>
+      <label><input id="open-hub" type="checkbox" checked> Open hub (debug)</label>
+      <label><input id="restage" type="checkbox"> Rebuild install</label>
     </div>
     <div class="row">
-      <button class="primary" id="go" onclick="prepare()">Launch</button>
+      <button class="primary" id="go" onclick="prepare()">Build &amp; launch</button>
       <button id="relaunch" onclick="relaunch()" disabled>Relaunch</button>
       <button onclick="stop()">Stop</button>
-      <button class="ghost" onclick="buildRelease()">Build release qa-feed</button>
     </div>
+    <div class="row error" id="error" style="display:none"></div>
     <div class="row muted" id="run">—</div>
-    <div class="row muted">Direct debug is fastest and still tests the hub/app/engine flow. Portable stages a private install; loader-only omits resources/locales so the Browser engine must be installed from the hub. Release only honors the mock update feed when built with qa-feed.</div>
+    <div class="row hint">Leave <b>Bundle browser engine</b> unchecked to start with no CEF at all: only the exe is staged, and the hub's Apps → Browser → Install walks the DLC flow. Check it to test an already-installed engine. <b>Rebuild install</b> resets the private appdata, including a previously downloaded engine.</div>
   </section>
 
   <section class="card">
@@ -992,33 +853,36 @@ async function getState(){
 }
 function render(){
   if (!S) return;
-  $('status').textContent =
-    `app ${S.version} · feed ${(S.manifest && S.manifest.tag_name) || S.latest} · ` +
-    (S.running ? `running ${S.running_flavor}` : 'not running') +
-    (S.building ? ' · building release…' : '') +
-    (S.preparing ? ' · preparing…' : '');
+  const feed = (S.manifest && S.manifest.tag_name) || S.latest || '?';
+  let status = `app ${S.version} · feed ${feed} · `;
+  if (S.preparing) status += `working: ${S.prepare_step || 'starting'}`;
+  else if (S.running) status += `running ${S.running_flavor}`;
+  else status += 'not running';
+  $('status').textContent = status;
   if (!initialized) {
-    $('version').value = (S.manifest && S.manifest.tag_name) || S.latest || '';
+    $('version').value = feed;
     $('html-url').value = (S.manifest && S.manifest.html_url) || '';
     $('manifest').value = JSON.stringify(S.manifest || {}, null, 2);
-    $('cef').value = S.cef_mode || 'full';
+    $('engine').checked = !!S.engine_bundled;
     initialized = true;
   }
-  $('relaunch').disabled = !S.last_flavor;
-  syncTarget();
+  $('go').disabled = !!S.preparing;
+  $('go').textContent = S.preparing ? 'Working…' : 'Build & launch';
+  $('relaunch').disabled = !!S.preparing || !S.last_flavor;
   $('run').textContent = S.running
     ? `running ${S.running_flavor} pid ${S.running_pid}`
     : (S.last_flavor ? `last: ${S.last_flavor}` : 'not launched yet');
+  const err = S.prepare_error || S.build_error || '';
+  $('error').textContent = err ? `error: ${err}` : '';
+  $('error').style.display = err ? '' : 'none';
   const engine = S.engine ? `DLC ${Math.round(S.engine.bytes / 1048576)} MB` : 'DLC not built';
   $('info').textContent =
-    `feed ${S.feed_url || ''}\\napp ${S.version} · CEF ${S.cef ? 'found' : 'missing'} · ${engine}\\n` +
-    `installs: ${(S.installed || []).map((i) => i.tag + (i.sidecar ? ' (full)' : ' (loader)')).join(', ') || '—'}`;
+    `feed ${S.feed_url || ''}\\n` +
+    `app ${S.version} · build CEF ${S.cef ? 'found' : 'missing'} · ${engine}\\n` +
+    `installs: ${(S.installed || []).map((i) =>
+      i.tag + (i.sidecar ? ' (engine bundled)' : ' (engine missing)') +
+      (i.engine_appdata ? ' + downloaded' : '')).join(', ') || '—'}`;
   $('log').textContent = (S.requests || []).map((r) => `${r.at}  ${r.line}`).join('\\n') || '—';
-}
-function syncTarget(){
-  const portable = $('target').value === 'portable';
-  $('cef').disabled = !portable;
-  $('restage').disabled = !portable;
 }
 function manifestValue(){
   let m = {};
@@ -1038,33 +902,23 @@ async function post(path, body){
 }
 async function saveManifest(){
   try {
-    await post('/api/config', {manifest: manifestValue(), cef_mode: $('cef').value});
+    await post('/api/config', {manifest: manifestValue(), engine_bundled: $('engine').checked});
     $('manifest-note').textContent = 'saved';
-    initialized = false;
     await getState();
   } catch (e) { $('manifest-note').textContent = String(e); }
 }
 async function prepare(){
-  const go = $('go');
-  go.disabled = true;
-  const old = go.textContent;
-  go.textContent = 'Preparing…';
   try {
     await post('/api/prepare', {
       manifest: manifestValue(),
-      target: $('target').value,
       flavor: $('flavor').value,
-      cef: $('cef').value,
+      engine_bundled: $('engine').checked,
       open_hub: $('open-hub').checked,
       restage: $('restage').checked
     });
-    initialized = false;
     await getState();
   } catch (e) {
     alert(String(e));
-  } finally {
-    go.disabled = false;
-    go.textContent = old;
   }
 }
 async function relaunch(){
@@ -1075,11 +929,7 @@ async function stop(){
   try { await post('/api/stop', {}); await getState(); }
   catch (e) { alert(String(e)); }
 }
-async function buildRelease(){
-  try { await post('/api/build', {}); await getState(); }
-  catch (e) { alert(String(e)); }
-}
-setInterval(getState, 2000);
+setInterval(getState, 1000);
 getState();
 </script>
 </body></html>"""
@@ -1097,7 +947,9 @@ def main():
     console.log(f"console: http://127.0.0.1:{args.port}/")
     print(f"install QA console: http://127.0.0.1:{args.port}/")
     if args.open_browser:
-        threading.Timer(0.4, lambda: webbrowser.open(f"http://127.0.0.1:{args.port}/")).start()
+        threading.Timer(
+            0.4, lambda: webbrowser.open(f"http://127.0.0.1:{args.port}/")
+        ).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

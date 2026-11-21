@@ -37,8 +37,10 @@ half-measures, no `fetch.rs` text fallback).
   Vulkan-preferred `WGPU_BACKEND` on Windows — explicit risk).
 - **No single-`.exe`.** CEF ships as sidecar files next to the exe (`libcef`,
   `*.pak`, `locales/`, ANGLE/SwiftShader); helpers reuse our exe via `--type=`
-  branching. "Self-contained" = one installer/bundle (one `.msix` + related
-  set), offline-capable, no system-browser dependency.
+  branching. The exe delay-loads `libcef.dll` (`build.rs`), so a bundle
+  without the engine still starts and can install it from the catalog.
+  "Self-contained" = one installer/bundle (one `.msix` + related set),
+  offline-capable, no system-browser dependency.
 - **No Servo fallback.** Delete `servo_backend.rs`, the `servo-engine` feature
   and `servo/surfman/dpi/euclid` deps, `declare_surfman!`, the rustls pin
   (keep what `ureq` needs for `platform/updater.rs`), Stylo stack env,
@@ -153,7 +155,9 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    (D-pad primary/Back, Cross select); Browser on a missing engine opens the
    catalog instead of a dead page. Dev install uses
    `SDSC_CEF_DLC_URL`/`SDSC_CEF_DLC_SHA256`, SHA-256 verification, and
-   extraction to `LocalAppData`. Remaining: Store
+   extraction to `LocalAppData`. Because the app binary delay-loads CEF, a
+   truly engine-less portable starts; the install path loads `libcef.dll` and
+   attaches the engine in the same process. Remaining: Store
    `RequestDownloadAndInstallStorePackagesAsync` wiring/product IDs,
    AppInstaller/`PackageManager` sideload packaging, Partner Center optional
    package submission, and the generic `AppManifest` catalog for future apps.

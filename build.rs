@@ -50,6 +50,15 @@ fn main() {
         }
     }
 
+    // The browser engine is an optional download: a portable install may not
+    // have `libcef.dll` yet. Delay-load CEF for the app binary only so the
+    // process can start engine-less and install the runtime from the hub.
+    // Every CEF entry point resolves the runtime directory and calls
+    // `SetDllDirectoryW` before its first call (see `browser::cef_backend`).
+    if cfg!(windows) && env::var_os("CARGO_FEATURE_CEF_ENGINE").is_some() {
+        println!("cargo:rustc-link-arg-bin=sdsc-utils=/DELAYLOAD:libcef.dll");
+    }
+
     println!("cargo:rerun-if-changed=assets/CHANGELOG.md");
     println!("cargo:rerun-if-changed=src/ui/svg_icon.rs");
     println!("cargo:rerun-if-changed=assets/icons/dualsense.svg");

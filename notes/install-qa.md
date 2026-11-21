@@ -17,28 +17,43 @@ zips, the CEF DLC zip, installed copies, and private `APPDATA` dirs.
   mock `/repos/.../releases/latest` payload immediately, so Settings → System →
   Version can show “update available” or “up to date”. (The binary itself is
   compiled at the Cargo version; the field is the manifest/install version.)
-- **Release QA build.** `Build release (qa-feed)` runs
-  `cargo build --release --features qa-feed`. That feature is the only way a
-  release build may honor the feed overrides; normal release/Store builds never
-  do. Debug builds honor them unconditionally.
-- **One launch flow.** Choose `Direct app` (fast; no install) or `Installed
-  portable`; debug/release; full/loader CEF. `Launch` prepares the private
-  install (first time only unless **Rebuild portable** is checked) and starts
-  the app. `Relaunch`/`Stop` reuse the last launch. The portable lives in
-  `target/install-qa/installs/<tag>` with a private `APPDATA`.
-- **Engine DLC flow.** `Build engine DLC zip` packs the CEF runtime and
-  SHA-256. Launch env sets `SDSC_CEF_DLC_URL`/`SDSC_CEF_DLC_SHA256`;
-  `SDSC_CEF_NO_BUILD_FALLBACK=1` disables the build-time `OUT_DIR` fallback in
-  debug/qa-feed builds so the hub catalog must install the engine.
-  - `full` CEF mode stages a runnable portable (engine sidecar present).
-  - `loader-only` puts only the DLLs libcef needs to load next to the exe and
-    omits resources/locales, so the resolver reports “not installed” and the
-    catalog install/uninstall path is testable.
-  - `none` copies no CEF; the app will not start (libcef is a load-time
-    dependency), but it is useful to confirm the failure mode.
-- **Launch controls.** The last launch is tracked; `APPDATA` is rewritten to
-  the QA dir and the mock feed + engine env appended. A tracked PID is stopped
-  with `taskkill /T` (CEF subprocesses included).
+- **Build & launch.** One button runs the selected Cargo build, stages a
+  standalone install under `target/install-qa/installs/<tag>`, and starts it
+  with a private `APPDATA`. **Debug** is fast; **Release (qa-feed)** builds
+  with the feature that lets a release binary honor the mock feed. Preparing
+  runs in a background worker, so the page keeps polling and shows
+  `building` → `packaging engine` → `installing` → `launching`.
+- **No CEF by default.** With **Bundle browser engine** unchecked, the staged
+  install contains only `sdsc-utils.exe` (plus the exe's non-CEF runtime) and
+  the private appdata has no `cef-engine`. The app binary delay-loads
+  `libcef.dll`, so it starts cleanly and the hub shows Browser as not
+  installed. **Apps → Browser → Install** downloads the engine zip from this
+  server, verifies the SHA-256, extracts it under the private appdata, and
+  attaches CEF in the same process — no relaunch required.
+- **Installed state.** Check **Bundle browser engine** to stage a full `cef\`
+  sidecar beside the exe. Use **Relaunch** to run the last install again; a
+  previously downloaded engine in the private appdata survives relaunches.
+- **Reset.** **Rebuild install** recreates the install dir and wipes its
+  private appdata, including any engine downloaded during the last
+  walk-through, so the clean flow can be repeated.
+- **Launch controls.** `APPDATA` is rewritten to the QA dir and the mock feed
+  + engine env appended. A tracked PID is stopped with `taskkill /T` (CEF
+  subprocesses included).
+
+## Why an engine-less exe starts
+
+`libcef.dll` is a normal import of `sdsc-utils.exe`, but `build.rs` adds
+`/DELAYLOAD:libcef.dll` for the app binary. The process only loads CEF when a
+CEF entry point is first called. Every entry point resolves the runtime
+directory and calls `SetDllDirectoryW` first (`browser::cef_backend`), so:
+
+- no runtime → `execute_subprocess()` returns `None`, the app starts, the hub
+  offers Install;
+- runtime installed later → the next `spawn_engine` loads `libcef.dll` from
+  the resolved directory and initializes CEF in-process.
+
+This is why the QA console no longer needs a “loader-only” sidecar: a truly
+empty install is the default test state.
 
 ## Environment overrides
 
@@ -57,23 +72,23 @@ dir on Windows when present. The first CEF build downloads ~427 MB into the
 target `OUT_DIR`; later builds reuse it. The console does **not** set
 `CEF_PATH` for cargo (the crate expects its archive layout, not the extracted
 runtime dir); `CEF_PATH` is only used by the console to find the runtime for
-the engine zip.
+the engine zip. A clean launch builds the DLC zip on first use; later launches
+reuse it.
 
 ## Typical flow
 
 1. Set the version/manifest (default `v1.7.4`); the binary is 1.7.3.
-2. Fastest: Target **Direct app**, Debug, **Launch**. The hub opens with a
-   private appdata, the mock feed, and the engine DLC env (engine installable).
-3. Install layout: Target **Installed portable**, Debug, CEF **loader-only**,
-   **Launch**. The first launch stages/installs; later launches reuse it.
-4. Add apps → Browser → X/Cross → **Install**. The catalog downloads the local
-   CEF zip, verifies the SHA-256, and installs under the private `APPDATA`.
-5. **Relaunch** so the engine initializes at boot. The feed advertises the
-   configured version; Settings → System → Version shows it.
-6. Uninstall the engine from the apps menu, or `Clear` the QA install/appdata.
-
-`Build release qa-feed` remains available for testing a release binary; a
-normal release ignores the mock feed URL by design.
+2. Leave **Bundle browser engine** unchecked; choose **Debug**; press
+   **Build & launch**. The hub opens with no CEF sidecar and clean appdata.
+3. **Apps → Browser → Install** (X/Cross). The catalog downloads the local CEF
+   zip, verifies the SHA-256, installs under the private `APPDATA`, and starts
+   the engine. The Browser tile becomes usable.
+4. **Relaunch** to exercise a process that finds the downloaded engine at boot.
+5. To test the already-installed layout, check **Bundle browser engine** and
+   **Rebuild install**, then **Build & launch**; the Browser tile is ready
+   immediately.
+6. Uninstall the engine from the apps menu, or **Rebuild install** / the
+   `/api/clear` endpoint to reset the QA data.
 
 The updater is check-only by design (README: it never downloads or applies
 app updates). This console tests the app-install layout, launch, engine DLC,
