@@ -1,4 +1,5 @@
-//! PS overlay hub: the small topmost app switcher.
+//! PS overlay hub: the topmost app switcher. On alpha-capable backends its
+//! window covers the monitor and dims the whole screen behind the card.
 //!
 //! Phase 1 of the hub pivot. The hub is the auto-open target and the only
 //! always-on-top shell surface; Start and (later) Browser stay normal-level
@@ -216,9 +217,9 @@ impl State {
 
 /// Render the hub card. The window root is transparent; the card is the only
 /// opaque surface.
-pub fn view(state: &State) -> Element<'_, HubMessage> {
+pub fn view(state: &State, stage_w: f32, stage_h: f32) -> Element<'_, HubMessage> {
     if state.catalog_open {
-        return catalog_view(state);
+        return catalog_view(state, stage_w, stage_h);
     }
     let mut tiles = row![].spacing(TILE_GAP).align_y(Alignment::Center);
     for (i, tile) in TILES.into_iter().enumerate() {
@@ -252,15 +253,34 @@ pub fn view(state: &State) -> Element<'_, HubMessage> {
     .padding(16)
     .width(Length::Fixed(HUB_WIDTH - 24.0))
     .style(card_style);
-    container(card)
+    frame(card.into(), stage_w, stage_h)
+}
+
+/// Wrap the hub card in its window root. A full-screen stage (alpha-capable
+/// backend) gets the translucent-black scrim and keeps the card
+/// bottom-weighted; the small opaque fallback centers the card in its window.
+fn frame<'a>(card: Element<'a, HubMessage>, stage_w: f32, stage_h: f32) -> Element<'a, HubMessage> {
+    if stage_w <= HUB_WIDTH + 1.0 {
+        return container(card)
+            .width(Fill)
+            .height(Fill)
+            .center_x(Fill)
+            .center_y(Fill)
+            .into();
+    }
+    let top = (stage_h * HUB_TOP_FRACTION).min((stage_h - HUB_HEIGHT - 24.0).max(0.0));
+    let body = column![space().height(top), card]
         .width(Fill)
         .height(Fill)
-        .center_x(Fill)
-        .center_y(Fill)
+        .align_x(Alignment::Center);
+    container(body)
+        .width(Fill)
+        .height(Fill)
+        .style(theme::scrim(theme::BACKDROP_ALPHA))
         .into()
 }
 
-fn catalog_view(state: &State) -> Element<'_, HubMessage> {
+fn catalog_view(state: &State, stage_w: f32, stage_h: f32) -> Element<'_, HubMessage> {
     let status = if state.installing {
         "Installing…".to_string()
     } else if state.engine_ready {
@@ -360,12 +380,7 @@ fn catalog_view(state: &State) -> Element<'_, HubMessage> {
     .padding(16)
     .width(Length::Fixed(HUB_WIDTH - 24.0))
     .style(card_style);
-    container(card)
-        .width(Fill)
-        .height(Fill)
-        .center_x(Fill)
-        .center_y(Fill)
-        .into()
+    frame(card.into(), stage_w, stage_h)
 }
 
 fn tile_button<'a>(state: &State, tile: HubTile, index: usize) -> Element<'a, HubMessage> {

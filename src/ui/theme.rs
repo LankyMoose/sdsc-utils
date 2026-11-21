@@ -441,6 +441,14 @@ pub fn immersive_island_radius(radius: f32) -> impl Fn(&Theme) -> container::Sty
     glass(radius)
 }
 
+/// Alpha of the full-screen dim behind the hub and Browser popup shells.
+pub const BACKDROP_ALPHA: f32 = 0.55;
+
+/// Full-bleed dimming scrim behind a modal/popup shell surface.
+pub fn scrim(amount: f32) -> impl Fn(&Theme) -> container::Style {
+    immersive_dim(amount)
+}
+
 /// Full-bleed darken wash when the controllers drawer is open.
 pub fn immersive_dim(amount: f32) -> impl Fn(&Theme) -> container::Style {
     let amount = amount.clamp(0.0, 1.0);

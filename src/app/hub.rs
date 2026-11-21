@@ -198,10 +198,26 @@ impl App {
             width: 1920.0,
             height: 1080.0,
         });
-        let x = cover.x + ((cover.width - hub_view::HUB_WIDTH) * 0.5).max(0.0);
-        let y = cover.y
-            + (cover.height * hub_view::HUB_TOP_FRACTION)
-                .min((cover.height - hub_view::HUB_HEIGHT - 24.0).max(0.0));
+        // Alpha-capable backends put the whole monitor behind a dim scrim;
+        // opaque backends keep the small card window so they do not black out
+        // the app underneath.
+        let full_screen = crate::ui::chrome::transparent_windows();
+        let (window_size, window_position) = if full_screen {
+            (
+                Size::new(cover.width, cover.height),
+                window::Position::Specific(Point::new(cover.x, cover.y)),
+            )
+        } else {
+            let x = cover.x + ((cover.width - hub_view::HUB_WIDTH) * 0.5).max(0.0);
+            let y = cover.y
+                + (cover.height * hub_view::HUB_TOP_FRACTION)
+                    .min((cover.height - hub_view::HUB_HEIGHT - 24.0).max(0.0));
+            (
+                Size::new(hub_view::HUB_WIDTH, hub_view::HUB_HEIGHT),
+                window::Position::Specific(Point::new(x, y)),
+            )
+        };
+        self.hub_stage = (window_size.width, window_size.height);
         self.refresh_engine_status();
         self.hub_state.on_open(
             self.session.prefs.start_screen_enabled,
@@ -210,10 +226,10 @@ impl App {
         // The opening PS press must not toggle the hub straight back closed.
         self.arm_chord_release_latch();
         let (id, open) = window::open(window::Settings {
-            size: Size::new(hub_view::HUB_WIDTH, hub_view::HUB_HEIGHT),
-            position: window::Position::Specific(Point::new(x, y)),
+            size: window_size,
+            position: window_position,
             visible: open_visible(),
-            transparent: crate::ui::chrome::transparent_windows(),
+            transparent: full_screen,
             resizable: false,
             decorations: false,
             // The one shell surface above toast / Settings / popups.

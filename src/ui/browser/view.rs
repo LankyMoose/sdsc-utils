@@ -739,13 +739,13 @@ pub fn root_view(
         .center_x(Fill)
         .center_y(Fill)
         .style(move |_theme| container::Style {
-            // Alpha-capable backends leave the margin clear so the card reads
-            // as a floating popup; opaque backends keep the dark backdrop.
-            background: if transparent {
-                None
+            // Alpha-capable backends dim the whole screen behind the card;
+            // opaque backends keep the flat dark backdrop.
+            background: Some(iced::Background::Color(if transparent {
+                theme::alpha(iced::Color::BLACK, theme::BACKDROP_ALPHA)
             } else {
-                Some(iced::Background::Color(theme::BASE_BG))
-            },
+                theme::BASE_BG
+            })),
             text_color: Some(theme::INK),
             ..container::Style::default()
         })

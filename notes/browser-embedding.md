@@ -118,9 +118,13 @@ the hub over Browser exactly like over Start.
   it. The engine preloads the saved active URL at boot and its early
   `TitleChanged`/`UrlChanged` events used to persist a one-tab strip before
   the restore read the file; `BrowserAppState::tabs_restored` gates that.
-- The Browser root leaves the margin transparent on alpha-capable backends so
-  the 16:9 card floats over the desktop; the cursor is recentered in the live
-  page area every time the window opens.
+- On alpha-capable backends the Browser root dims the whole screen with a
+  55% black scrim behind the 16:9 card (`theme::BACKDROP_ALPHA`); opaque
+  backends keep the flat backdrop. The cursor is recentered in the live page
+  area every time the window opens.
+- The hub uses the same full-screen scrim (its window expands to the monitor
+  cover) and keeps the card bottom-weighted. On an opaque backend it falls
+  back to the small card window so it does not black out the app underneath.
 
 ## Build prerequisites (Windows)
 

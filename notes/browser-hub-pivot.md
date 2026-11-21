@@ -96,7 +96,9 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    and cooldown all target the hub (`SessionEffect::OpenHub`,
    `AfterToast::OpenHub`); `ApplyContext.hub_visible` replaces
    `start_visible` for the gate. Start moved from `AlwaysOnTop` to
-   `Normal`; the hub is raised last above toast/Settings/popup. Over
+   `Normal`; the hub is raised last above toast/Settings/popup. On
+   alpha-capable backends its window covers the monitor and dims the screen
+   behind the card (small card window on opaque backends). Over
    exclusive-fullscreen games the topmost hub can still be covered
    (documented limitation).
 2. **Browser standalone window. — landed.** New fullscreen `Level::Normal`

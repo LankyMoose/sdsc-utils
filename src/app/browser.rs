@@ -158,8 +158,8 @@ impl super::App {
             size: cover.size(),
             position: iced::window::Position::Specific(cover.origin()),
             visible: crate::ui::layout::open_visible(),
-            // The 16:9 card floats over the desktop; the root view leaves the
-            // margin clear on backends that can composite alpha.
+            // The 16:9 card sits over a dimmed desktop; the root view draws
+            // the scrim on backends that can composite alpha.
             transparent: crate::ui::chrome::transparent_windows(),
             resizable: false,
             decorations: false,

@@ -503,10 +503,14 @@ pub struct App {
     browser_monitor_cover: Option<MonitorCover>,
     /// Actual logical window size reported by iced after creation/resize.
     browser_window_size: Option<(f32, f32)>,
-    /// Topmost PS app-switcher overlay (small, bottom-weighted).
+    /// Topmost PS app-switcher overlay: a full-screen dim scrim with the
+    /// card bottom-weighted (small card window on opaque backends).
     hub_window: Option<window::Id>,
     /// True while the hub is revealed; modal owner of pad input.
     hub_visible: bool,
+    /// Actual logical size of the hub window (full-screen cover on an
+    /// alpha-capable backend, the small card window on an opaque one).
+    hub_stage: (f32, f32),
     hub_state: crate::ui::hub::State,
     /// Close is two-phase when the cursor was hidden: the flag clears
     /// immediately, but HWND destruction waits one loop pass
@@ -891,6 +895,7 @@ impl App {
             browser_window_size: None,
             hub_window: None,
             hub_visible: false,
+            hub_stage: (crate::ui::hub::HUB_WIDTH, crate::ui::hub::HUB_HEIGHT),
             hub_state: crate::ui::hub::State::default(),
             start_close_armed: false,
             last_start_paint_at: std::cell::Cell::new(None),
@@ -1410,7 +1415,8 @@ impl App {
         }
 
         if Some(window) == self.hub_window {
-            return crate::ui::hub::view(&self.hub_state).map(Message::Hub);
+            return crate::ui::hub::view(&self.hub_state, self.hub_stage.0, self.hub_stage.1)
+                .map(Message::Hub);
         }
 
         if Some(window) == self.start_window {
