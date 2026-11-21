@@ -2,7 +2,7 @@
 
 **Status:** do-not-regress. **When to read:** toast/Start present starvation, wrong toast content, connect-open races. Index: [README.md](README.md).
 
-> **Hub pivot (phase 1):** Start and the future Browser window are
+> **Hub pivot (phases 1–2):** Start and the standalone Browser window are
 > `Level::Normal`; the PS hub is the only shell surface above the toast.
 > `AfterToast::OpenStart` is now `OpenHub`, and auto-open targets the hub.
 > The history below explains why the toast band must stay intact.

@@ -1,4 +1,4 @@
-//! iced → Servo keyboard mapping for the in-Start browser.
+//! iced → Servo keyboard mapping for the Browser app.
 //!
 //! Pure functions (unit-tested): the subscription captures raw iced key
 //! events, the shell decides page-vs-URL routing, and only mapped events

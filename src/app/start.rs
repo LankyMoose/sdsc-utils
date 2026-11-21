@@ -15,7 +15,7 @@ use super::{
 use crate::AppResult;
 use crate::browser::cursor::{JumpDir, VIEWPORT_H, VIEWPORT_W};
 use crate::browser::engine::{EngineCommand, EngineEvent};
-use crate::browser::keys::{self as browser_keys, RawKey};
+use crate::browser::keys::RawKey;
 use crate::controller::dualsense::rumble::MotorPulse;
 use crate::games::process_match::RunningSession;
 use crate::games::steam::SteamGame;
@@ -75,10 +75,7 @@ impl App {
         match &message {
             StartMessage::SettingsScrolled(..)
             | StartMessage::ManualAddTitle(_)
-            | StartMessage::ManualAddArgs(_)
-            | StartMessage::BrowserHistoryOpen { .. }
-            | StartMessage::BrowserHistoryPick(_)
-            | StartMessage::BrowserHistoryCancel => {}
+            | StartMessage::ManualAddArgs(_) => {}
             #[cfg(debug_assertions)]
             StartMessage::ReportLightbarFailure | StartMessage::ReportInputFailure => {}
             _ => self.cancel_start_holds(),
@@ -97,72 +94,6 @@ impl App {
                 Task::none()
             }
             StartMessage::ToggleControllers => self.on_toggle_controllers(),
-            StartMessage::ToggleBrowser => self.on_toggle_browser(),
-            StartMessage::ToggleUrlEntry => self.on_toggle_url_entry(),
-            StartMessage::BrowserBack => self.on_browser_go_back(),
-            StartMessage::BrowserForward => self.on_browser_go_forward(),
-            StartMessage::BrowserHistoryOpen { back } => self.on_browser_history_open(back),
-            StartMessage::BrowserHistoryPick(index) => self.on_browser_history_pick(index),
-            StartMessage::BrowserHistoryCancel => self.on_browser_history_cancel(),
-            StartMessage::BrowserUrlChanged(draft) => {
-                self.browser.panel.draft = draft;
-                Task::none()
-            }
-            StartMessage::BrowserNavigate => self.on_browser_navigate(),
-            StartMessage::BrowserAutocompletePick(url) => {
-                self.browser.panel.draft = url;
-                self.on_browser_navigate()
-            }
-            StartMessage::BrowserFetched { generation, result } => {
-                self.on_browser_fetched(generation, result)
-            }
-            StartMessage::BrowserOpenExternal => self.on_browser_open_external(),
-            StartMessage::BrowserReload => self.on_browser_reload(),
-            StartMessage::BrowserHome => self.on_browser_go_home(),
-            StartMessage::BrowserTabNew => self.on_browser_tab_new(),
-            StartMessage::BrowserTabNext => self.on_browser_tab_next(),
-            StartMessage::BrowserTabSwitch(id) => self.on_browser_tab_switch(id),
-            StartMessage::BrowserTabClose(id) => self.on_browser_tab_close(id),
-            StartMessage::BrowserShutdownEngine => self.on_browser_shutdown_engine(),
-            StartMessage::BrowserBookmarkStar => self.on_browser_bookmark_star(),
-            StartMessage::BrowserBookmarkNameChanged(draft) => {
-                self.browser.panel.bookmark_name_draft = draft;
-                Task::none()
-            }
-            StartMessage::BrowserBookmarkSave => self.on_browser_bookmark_save(),
-            StartMessage::BrowserBookmarkRemove => self.on_browser_bookmark_remove(),
-            // Overlay is a debug-only tool (F10 path is gated the same way):
-            // release builds keep the message variant (the card button is
-            // compiled out there too) but never set the flag.
-            #[cfg(debug_assertions)]
-            StartMessage::BrowserToggleOverlay => {
-                self.debug_browser = !self.debug_browser;
-                self.browser.panel.debug_overlay = self.debug_browser;
-                crate::platform::app_log::info(format!(
-                    "browser: overlay {}",
-                    if self.debug_browser { "on" } else { "off" }
-                ));
-                Task::none()
-            }
-            #[cfg(not(debug_assertions))]
-            StartMessage::BrowserToggleOverlay => Task::none(),
-            StartMessage::BrowserToggleJsClick => {
-                self.browser.panel.js_click = !self.browser.panel.js_click;
-                crate::platform::app_log::info(format!(
-                    "browser: js-click {}",
-                    if self.browser.panel.js_click {
-                        "on"
-                    } else {
-                        "off"
-                    }
-                ));
-                Task::none()
-            }
-            StartMessage::BrowserScrolled(y) => {
-                self.browser.panel.note_scrolled(y);
-                Task::none()
-            }
-            StartMessage::BrowserShot(shot) => self.save_browser_shot(shot),
             StartMessage::ToggleEdit => match self.toggle_start_edit() {
                 Some(task) => {
                     self.play_start_cue(UiSoundKind::Action);
@@ -393,24 +324,6 @@ impl App {
                 crate::controller::hid::diag::diag_info("ui-diag: start settings close");
             }
             Task::none()
-        } else if self.browser.panel.session.is_open() {
-            // Browser surface open: Cancel dismisses the star bubble first,
-            // then backs out of URL-edit mode, then closes the surface
-            // (overlay priority: settings → browser → manual → replace →
-            // edit → dock → close).
-            self.play_start_cue(UiSoundKind::Action);
-            if self.browser.panel.bookmark_bubble {
-                self.browser.panel.bookmark_bubble = false;
-                return Task::none();
-            }
-            if self.browser.panel.url_editing {
-                self.browser.panel.url_editing = false;
-                crate::controller::hid::diag::diag_info(
-                    "ui-diag: start browser url entry close (cancel)",
-                );
-                return Task::none();
-            }
-            self.close_browser_surface()
         } else if self.start_state.manual_add.is_some() {
             self.play_start_cue(UiSoundKind::Action);
             self.cancel_manual_add()
@@ -485,38 +398,29 @@ impl App {
     /// card layout. No-op when the computed page size is unchanged.
     pub(crate) fn sync_browser_viewport(&mut self) {
         let (sw, sh) = self
-            .start_monitor_cover
+            .browser_monitor_cover
             .map(|c| (c.width, c.height))
             .unwrap_or((1920.0, 1080.0));
-        let layout = crate::ui::start::view::browser_layout(sw, sh);
-        if !self
-            .browser
-            .panel
-            .set_viewport(layout.page_w, layout.page_h)
-        {
+        let (page_w, page_h) = crate::ui::browser::view::fullscreen_layout(sw, sh);
+        if !self.browser.panel.set_viewport(page_w, page_h) {
             return;
         }
         if let Some(engine) = &self.browser.engine {
             crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: browser viewport {:.0}x{:.0}",
-                layout.page_w, layout.page_h
+                "ui-diag: browser viewport {page_w:.0}x{page_h:.0}"
             ));
             engine.send(EngineCommand::Resize {
-                width: layout.page_w.round().max(1.0) as u32,
-                height: layout.page_h.round().max(1.0) as u32,
+                width: page_w.round().max(1.0) as u32,
+                height: page_h.round().max(1.0) as u32,
             });
         }
     }
 
-    pub(crate) fn on_toggle_browser(&mut self) -> Task<Message> {
-        if self.browser.panel.session.is_open() {
-            return self.close_browser_surface();
-        }
+    pub(crate) fn open_browser_session(&mut self) -> Task<Message> {
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Action);
         let _ = self.hub.open(crate::app::hub::AppId::Browser);
         self.browser.panel.session.open_surface();
-        self.start_state.browser_open = true;
         // The card's 16:9 page area drives the engine viewport; sync before
         // the first frame so the cursor space and image are the same size.
         self.sync_browser_viewport();
@@ -532,17 +436,17 @@ impl App {
             if !saved.tabs.is_empty() {
                 let task = self.restore_browser_tabs(saved);
                 self.resume_browser_engine();
-                crate::controller::hid::diag::diag_info("ui-diag: start browser open (restore)");
+                crate::controller::hid::diag::diag_info("ui-diag: browser session open (restore)");
                 return task;
             }
             self.browser.panel.draft = crate::browser::BROWSER_HOME_URL.to_string();
             let task = self.on_browser_navigate();
             self.resume_browser_engine();
-            crate::controller::hid::diag::diag_info("ui-diag: start browser open (home)");
+            crate::controller::hid::diag::diag_info("ui-diag: browser session open (home)");
             return task;
         }
         self.resume_browser_engine();
-        crate::controller::hid::diag::diag_info("ui-diag: start browser open");
+        crate::controller::hid::diag::diag_info("ui-diag: browser session open");
         Task::none()
     }
 
@@ -601,14 +505,13 @@ impl App {
     pub(crate) fn close_browser_surface(&mut self) -> Task<Message> {
         let _ = self.hub.close(crate::app::hub::AppId::Browser);
         self.browser.panel.close_surface();
-        self.start_state.browser_open = false;
         // A held D-pad must not jump the cursor of the next opened page.
         self.browser.dpad_stepper.reset();
         if let Some(engine) = &self.browser.engine {
             engine.send(EngineCommand::SetVisible { visible: false });
             engine.send(EngineCommand::Suspend);
         }
-        crate::controller::hid::diag::diag_info("ui-diag: start browser close (suspend)");
+        crate::controller::hid::diag::diag_info("ui-diag: browser session close (suspend)");
         Task::none()
     }
 
@@ -651,7 +554,7 @@ impl App {
         let generation = self.browser.panel.session.begin_load(url.clone());
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Nav);
-        crate::controller::hid::diag::diag_info("ui-diag: start browser navigate");
+        crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
         if self.browser.engine.is_some() {
             if let Some(engine) = &self.browser.engine {
                 let tab = self.browser_tab();
@@ -667,15 +570,15 @@ impl App {
         Task::perform(
             async move { spawn_blocking(move || crate::browser::fetch::fetch_readable(&url)).await },
             move |result| match result {
-                Ok(Ok(page)) => Message::Start(StartMessage::BrowserFetched {
+                Ok(Ok(page)) => Message::Browser(crate::ui::browser::BrowserMessage::Fetched {
                     generation,
                     result: Ok(page),
                 }),
-                Ok(Err(err)) => Message::Start(StartMessage::BrowserFetched {
+                Ok(Err(err)) => Message::Browser(crate::ui::browser::BrowserMessage::Fetched {
                     generation,
                     result: Err(err),
                 }),
-                Err(err) => Message::Start(StartMessage::BrowserFetched {
+                Err(err) => Message::Browser(crate::ui::browser::BrowserMessage::Fetched {
                     generation,
                     result: Err(err.to_string()),
                 }),
@@ -692,18 +595,15 @@ impl App {
         if Some(id) == self.hub_window && self.hub_visible {
             return self.on_hub_key(raw);
         }
+        if Some(id) == self.browser_window && self.browser_visible {
+            return self.on_browser_key(raw);
+        }
         if Some(id) != self.start_window || !self.start_visible {
             return Task::none();
         }
         self.note_start_activity();
-        let browser_open = self.browser.panel.session.is_open();
-        let url_editing = self.browser.panel.url_editing;
-        let engine_live = self.browser.engine.is_some();
-        if browser_open && !url_editing && engine_live && !self.start_state.cold_load_active {
-            return self.on_browser_page_key(raw);
-        }
-        // Legacy Start-key mapping (reader, URL-edit, closed): arrows/Enter
-        // act on press; Escape/Enter track both edges for holds.
+        // Start key mapping: arrows/Enter act on press; Escape/Enter track
+        // both edges for holds.
         if raw.pressed {
             let action = match &raw.key {
                 iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
@@ -746,53 +646,6 @@ impl App {
         Task::none()
     }
 
-    /// Keyboard while the engine page owns focus. Shell bindings stay local
-    /// (Esc closes, Ctrl+L/R and Alt+arrows act); everything else becomes a
-    /// page key event.
-    fn on_browser_page_key(&mut self, raw: RawKey) -> Task<Message> {
-        use iced::keyboard::Key;
-        use iced::keyboard::key::Named;
-        if matches!(raw.key, Key::Named(Named::Escape)) {
-            self.cancel_key_held = raw.pressed;
-            self.sync_start_held();
-            if !raw.pressed {
-                self.cancel_start_holds();
-                return self.on_start_message(StartMessage::Close);
-            }
-            return Task::none();
-        }
-        if raw.pressed {
-            if raw.modifiers.control()
-                && let Key::Character(text) = &raw.key
-            {
-                match text.to_lowercase().as_str() {
-                    "l" => return self.on_start_message(StartMessage::ToggleUrlEntry),
-                    "r" => return self.on_start_message(StartMessage::BrowserReload),
-                    _ => {}
-                }
-            }
-            if raw.modifiers.alt() {
-                match &raw.key {
-                    Key::Named(Named::ArrowLeft) => {
-                        return self.on_start_message(StartMessage::BrowserBack);
-                    }
-                    Key::Named(Named::ArrowRight) => {
-                        return self.on_start_message(StartMessage::BrowserForward);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if let Some(engine) = &self.browser.engine {
-            let tab = self.browser_tab();
-            engine.send(EngineCommand::Key(crate::browser::engine::TabKey {
-                tab,
-                event: browser_keys::map_event(&raw),
-            }));
-        }
-        Task::none()
-    }
-
     /// URL-edit mode: keyboard goes to the address field (the widget owns
     /// printable keys natively); the field is focused so typing lands there.
     /// Exits on navigate, Esc/Circle, or surface close.
@@ -808,11 +661,11 @@ impl App {
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Action);
         crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start browser url entry {}",
+            "ui-diag: browser url entry {}",
             if next { "open" } else { "close" }
         ));
         if next {
-            return operation::focus(start_view::browser_url_id());
+            return operation::focus(crate::ui::browser::view::browser_url_id());
         }
         Task::none()
     }
@@ -872,11 +725,11 @@ impl App {
             return Task::none();
         }
         self.browser.panel.history_selector =
-            Some(crate::ui::start::view::HistorySelector { back, highlight: 0 });
+            Some(crate::ui::browser::HistorySelector { back, highlight: 0 });
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Action);
         crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start browser history selector open {}",
+            "ui-diag: browser history selector open {}",
             if back { "back" } else { "forward" }
         ));
         Task::none()
@@ -898,7 +751,7 @@ impl App {
             None => return Task::none(),
         };
         self.browser.panel.history_selector = None;
-        self.pad_nav.cancel_held_face_releases();
+        self.browser.nav.cancel_held_face_releases();
         self.browser.panel.draft = url;
         if index == current {
             return Task::none();
@@ -930,10 +783,10 @@ impl App {
             return Task::none();
         }
         self.browser.panel.history_selector = None;
-        self.pad_nav.cancel_held_face_releases();
+        self.browser.nav.cancel_held_face_releases();
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Action);
-        crate::controller::hid::diag::diag_info("ui-diag: start browser history selector cancel");
+        crate::controller::hid::diag::diag_info("ui-diag: browser history selector cancel");
         Task::none()
     }
 
@@ -966,9 +819,7 @@ impl App {
         cursor.x = (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W);
         cursor.y = (item.y + item.h / 2.0).clamp(0.0, VIEWPORT_H);
         cursor.last_dock = Some((item.x, item.y, item.w, item.h));
-        crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start browser autofocus dock {id}"
-        ));
+        crate::controller::hid::diag::diag_info(format!("ui-diag: browser autofocus dock {id}"));
         true
     }
 
@@ -1018,12 +869,16 @@ impl App {
                 if let Some(sel) = &self.browser.panel.history_selector
                     && let Some(index) = sel.picked(&self.browser.panel.session)
                 {
-                    return self.on_start_message(StartMessage::BrowserHistoryPick(index));
+                    return self.on_browser_message(
+                        crate::ui::browser::BrowserMessage::HistoryPick(index),
+                    );
                 }
                 self.browser.panel.history_selector = None;
                 Task::none()
             }
-            Some(NavAction::Cancel) => self.on_start_message(StartMessage::BrowserHistoryCancel),
+            Some(NavAction::Cancel) => {
+                self.on_browser_message(crate::ui::browser::BrowserMessage::HistoryCancel)
+            }
             // Taps, holds, magnetism, and cursor moves stay parked: the
             // hold claimed the press and the selector owns the outcome.
             _ => Task::none(),
@@ -1081,7 +936,7 @@ impl App {
         panel.bookmark_bubble = true;
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Action);
-        operation::focus(start_view::bookmark_name_id())
+        operation::focus(crate::ui::browser::view::bookmark_name_id())
     }
 
     /// Star bubble Done: apply a non-empty rename, persist, close.
@@ -1158,7 +1013,7 @@ impl App {
             return Task::none();
         }
         if let Err(err) = launch::launch_target(&url, "") {
-            app_log::warn(format!("start-browser: external open failed: {err}"));
+            app_log::warn(format!("browser: external open failed: {err}"));
         }
         Task::none()
     }
@@ -1288,15 +1143,15 @@ impl App {
             ));
             if let Some(message) = self.browser.panel.chrome_message(target) {
                 crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: start browser chrome activate {target:?}"
+                    "ui-diag: browser chrome activate {target:?}"
                 ));
-                return self.on_start_message(message);
+                return self.on_browser_message(message);
             }
             return Task::none();
         }
         let (x, y, target) = {
             let panel = &self.browser.panel;
-            let targets = start_view::cursor_targets(&panel.focusables, &panel.chrome);
+            let targets = crate::ui::browser::cursor_targets(&panel.focusables, &panel.chrome);
             let (x, y) = panel.cursor.click_point(&targets);
             // Exact-element targets: docked buttons honor the Diagnostics
             // JS-click toggle (untrusted-activation A/B); docked links
@@ -1347,7 +1202,7 @@ impl App {
     /// scroll, url, wells) and forces a debug shot, so the backend pull log
     /// around this timestamp tells the rest of the story.
     pub(crate) fn flag_browser_issue(&mut self, now: Instant) -> Task<Message> {
-        let targets = start_view::cursor_targets(
+        let targets = crate::ui::browser::cursor_targets(
             &self.browser.panel.page.focusables,
             &self.browser.panel.chrome,
         );
@@ -1430,19 +1285,20 @@ impl App {
             return Task::none();
         }
         panel.last_shot = Some(now);
-        let Some(win) = self.start_window else {
+        let Some(win) = self.browser_window else {
             return Task::none();
         };
         iced::window::screenshot(win)
-            .map(StartMessage::BrowserShot)
-            .map(Message::Start)
+            .map(crate::ui::browser::BrowserMessage::Shot)
+            .map(Message::Browser)
     }
 
     /// Debug-only: persist a captured window shot with the live cursor /
     /// dock / target state for post-hoc outline placement analysis.
-    fn save_browser_shot(&mut self, shot: iced::window::Screenshot) -> Task<Message> {
+    #[cfg(debug_assertions)]
+    pub(crate) fn save_browser_shot(&mut self, shot: iced::window::Screenshot) -> Task<Message> {
         let panel = &self.browser.panel;
-        let targets = start_view::cursor_targets(&panel.focusables, &panel.chrome);
+        let targets = crate::ui::browser::cursor_targets(&panel.focusables, &panel.chrome);
         let cursor = (panel.cursor.x, panel.cursor.y);
         let magnet = panel.cursor.magnet;
         let dock = panel.cursor.attached;
@@ -1492,13 +1348,13 @@ impl App {
         slot: std::sync::Arc<crate::browser::frame_slot::FrameSlot>,
     ) -> Task<Message> {
         crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start browser tab opened tab{}",
+            "ui-diag: browser tab opened tab{}",
             tab.0
         ));
         {
             let panel = &mut self.browser.panel;
             panel.stash_live();
-            panel.page = start_view::BrowserTabPage::default();
+            panel.page = crate::ui::browser::BrowserTabPage::default();
             panel.page.session.open_surface();
             panel.page.session.set_frame_slot(slot);
             panel.page.action_hint = Some(("New tab…".to_string(), std::time::Instant::now()));
@@ -1535,7 +1391,7 @@ impl App {
     /// fresh home tab when none).
     pub(crate) fn on_tab_closed(&mut self, tab: crate::browser::engine::TabId) -> Task<Message> {
         crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start browser tab closed tab{}",
+            "ui-diag: browser tab closed tab{}",
             tab.0
         ));
         let active = self.browser.panel.active_tab;
@@ -1579,7 +1435,7 @@ impl App {
         let url = crate::browser::BROWSER_HOME_URL.to_string();
         let (generation, frame) = {
             let panel = &mut self.browser.panel;
-            panel.page = start_view::BrowserTabPage::default();
+            panel.page = crate::ui::browser::BrowserTabPage::default();
             panel.page.session.open_surface();
             panel.active_tab = tab;
             panel.order.push(tab);
@@ -1601,7 +1457,7 @@ impl App {
         self.sync_browser_theme();
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Nav);
-        crate::controller::hid::diag::diag_info("ui-diag: start browser navigate");
+        crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
         Task::none()
     }
 
@@ -1638,7 +1494,7 @@ impl App {
                 panel.stored.clear();
                 panel.order.clear();
                 panel.active_tab = TabId::BOOT;
-                panel.page = start_view::BrowserTabPage::default();
+                panel.page = crate::ui::browser::BrowserTabPage::default();
                 panel.page.session.open_surface();
                 let generation = panel
                     .page
@@ -1650,13 +1506,13 @@ impl App {
                 for saved_tab in tabs {
                     let id = TabId(next_id);
                     next_id += 1;
-                    let mut page = start_view::BrowserTabPage::default();
+                    let mut page = crate::ui::browser::BrowserTabPage::default();
                     page.session.open_surface();
                     page.session.note_url(saved_tab.url.clone());
                     if !saved_tab.title.is_empty() {
                         page.session.note_title(Some(saved_tab.title));
                     }
-                    panel.stored.push(start_view::StoredTab {
+                    panel.stored.push(crate::ui::browser::StoredTab {
                         id,
                         page,
                         loaded: false,
@@ -1689,7 +1545,7 @@ impl App {
             for (pos, saved_tab) in tabs.drain(..).enumerate() {
                 if pos == active_pos {
                     panel.active_tab = TabId::BOOT;
-                    panel.page = start_view::BrowserTabPage::default();
+                    panel.page = crate::ui::browser::BrowserTabPage::default();
                     panel.page.session.open_surface();
                     let generation = panel.page.session.begin_load(saved_tab.url.clone());
                     if !saved_tab.title.is_empty() {
@@ -1703,13 +1559,13 @@ impl App {
                     // generation, no view — first switch opens and loads it.
                     let id = TabId(next_id);
                     next_id += 1;
-                    let mut page = start_view::BrowserTabPage::default();
+                    let mut page = crate::ui::browser::BrowserTabPage::default();
                     page.session.open_surface();
                     page.session.note_url(saved_tab.url.clone());
                     if !saved_tab.title.is_empty() {
                         page.session.note_title(Some(saved_tab.title));
                     }
-                    panel.stored.push(start_view::StoredTab {
+                    panel.stored.push(crate::ui::browser::StoredTab {
                         id,
                         page,
                         loaded: false,
@@ -1736,7 +1592,7 @@ impl App {
         self.sync_browser_theme();
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Nav);
-        crate::controller::hid::diag::diag_info("ui-diag: start browser navigate");
+        crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
         Task::none()
     }
 
@@ -1751,7 +1607,7 @@ impl App {
         let (tab, generation, frame) = {
             let panel = &mut self.browser.panel;
             panel.stash_live();
-            panel.page = start_view::BrowserTabPage::default();
+            panel.page = crate::ui::browser::BrowserTabPage::default();
             panel.page.session.open_surface();
             let tab = crate::browser::engine::TabId(panel.next_tab_id);
             panel.next_tab_id = panel.next_tab_id.wrapping_add(1).max(2);
@@ -1776,7 +1632,7 @@ impl App {
         self.sync_browser_theme();
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Nav);
-        crate::controller::hid::diag::diag_info("ui-diag: start browser navigate");
+        crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
         Task::none()
     }
 
@@ -1966,7 +1822,7 @@ impl App {
         }
         let y = self.browser.panel.scroll_by(delta);
         operation::scroll_to(
-            start_view::browser_scroll_id(),
+            crate::ui::browser::view::browser_scroll_id(),
             operation::AbsoluteOffset {
                 x: None,
                 y: Some(y),
@@ -2041,7 +1897,7 @@ impl App {
                 self.browser.panel.page.focusables = items;
                 let targets = {
                     let panel = &self.browser.panel;
-                    start_view::cursor_targets(&panel.page.focusables, &panel.chrome)
+                    crate::ui::browser::cursor_targets(&panel.page.focusables, &panel.chrome)
                 };
                 self.browser.panel.page.cursor.retarget(&targets);
                 // Parked page-focus target: dock when it resolves live; drop
@@ -2058,7 +1914,7 @@ impl App {
                         .expect("pending focus checked");
                     if !self.try_dock_focused(id) {
                         crate::controller::hid::diag::diag_info(format!(
-                            "ui-diag: start browser focus dropped {id}"
+                            "ui-diag: browser focus dropped {id}"
                         ));
                     }
                 }
@@ -2120,7 +1976,7 @@ impl App {
                     // tree (one shot). Logged: a park with no later dock is
                     // the missed-autofocus signature.
                     crate::controller::hid::diag::diag_info(format!(
-                        "ui-diag: start browser focus parked {id}"
+                        "ui-diag: browser focus parked {id}"
                     ));
                     self.browser.panel.pending_focus = Some(id);
                 } else {
@@ -3012,6 +2868,9 @@ impl App {
         if self.hub_visible {
             return self.on_hub_pad(&readings);
         }
+        if self.browser_visible {
+            return self.on_browser_pad(&readings);
+        }
 
         if start_open {
             if let Some(prev) = self.last_pad_poll_at {
@@ -3213,23 +3072,13 @@ impl App {
         let manual_add = self.start_state.manual_add.is_some();
         let save_modal = self.start_state.edit_confirm.is_some();
         let settings_open = self.start_state.settings.open;
-        let browser_open = self.browser.panel.session.is_open();
-        // The history selector owns the pad while open — including D-pad
-        // moves. Engine mode normally gates the nav stepper off (D-pad
-        // belongs to the cursor jump code), which would starve the selector
-        // of Up/Down/Left/Right; force it on so the selector tick sees
-        // moves. The selector branch returns before the cursor tick, so
-        // the cursor still never moves under the dropdown.
-        let selector_open = browser_open && self.browser.panel.history_selector.is_some();
-        let allow_nav_move =
-            selector_open || start_nav_move_allowed(&self.start_state, &self.browser.panel);
+        let allow_nav_move = start_nav_move_allowed(&self.start_state);
         let editing = self.start_state.editing;
         // Only when the selected row shows Close game (running target match).
         let hold_cross_close = !editing
             && !replace_confirm
             && !manual_add
             && !save_modal
-            && !browser_open
             && !settings_open
             && !animating
             && !self.start_state.dock_expanded
@@ -3244,7 +3093,6 @@ impl App {
             && !replace_confirm
             && !manual_add
             && !save_modal
-            && !browser_open
             && !settings_open
             && !animating
             && self.start_state.dock_expanded
@@ -3343,134 +3191,6 @@ impl App {
             self.keyboard_cross_hold.reset();
             self.start_state.tick_hint_anims(now);
             self.on_start_settings_nav(tick.action)
-        } else if browser_open {
-            // Controller-first input. Engine mode (frames on screen): the
-            // left stick moves the virtual cursor (magnetic snap), the
-            // D-pad jumps between targets, the right stick scrolls, L1/R1 travel
-            // history (tap) or open the history selector (hold, B2.4),
-            // Cross clicks, Square tabs DOM focus, Triangle edits
-            // the URL, Circle backs out or closes. Reader mode keeps the
-            // legacy mapping (D-pad scrolls, Cross goes). Game nav, holds,
-            // and surface toggles stay parked (same discipline as modals).
-            self.start_state.cross_progress = 0.0;
-            self.start_state.triangle_progress = 0.0;
-            self.keyboard_cross_hold.reset();
-            self.start_state.tick_hint_anims(now);
-            // History selector owns the pad while open: D-pad moves the
-            // highlight, Cross/bumper-release confirms, Circle cancels.
-            // Cursor, scroll, taps, and magnetism stay parked so the page
-            // behind never moves under the dropdown.
-            if self.browser.panel.history_selector.is_some() {
-                return self.tick_browser_history_selector(readings, tick.action);
-            }
-            if self.browser.panel.session.has_frame() {
-                self.tick_browser_cursor(readings, now);
-                // D-pad cursor jumps: dead since the magnetic-cursor commit
-                // parked the banked stepper in engine mode (its `tick.action`
-                // arms can never fire there). Stepped here on a stickless
-                // mask instead, so stick moves never double-fire into both
-                // cursor and nav.
-                if let Some(jump) = self.poll_browser_dpad_jump(readings, now) {
-                    self.browser.panel.jump_cursor(jump);
-                }
-                // R3 issue flag (R3 carries no NavAction): rising edge while
-                // browsing dumps the trace bundle + forces a debug shot.
-                let r3_down = readings
-                    .iter()
-                    .any(|r| r.sample.held.contains(&gesture::GestureControl::R3));
-                let latched = std::mem::replace(&mut self.browser.panel.r3_latched, r3_down);
-                let flag = if r3_down && !latched {
-                    self.flag_browser_issue(now)
-                } else {
-                    Task::none()
-                };
-                let action = match tick.action {
-                    Some(NavAction::Up) => {
-                        self.browser.panel.jump_cursor(JumpDir::Up);
-                        Task::none()
-                    }
-                    Some(NavAction::Down) => {
-                        self.browser.panel.jump_cursor(JumpDir::Down);
-                        Task::none()
-                    }
-                    Some(NavAction::Left) => {
-                        self.browser.panel.jump_cursor(JumpDir::Left);
-                        Task::none()
-                    }
-                    Some(NavAction::Right) => {
-                        self.browser.panel.jump_cursor(JumpDir::Right);
-                        Task::none()
-                    }
-                    Some(NavAction::Confirm) => {
-                        if self.browser.panel.url_editing {
-                            self.on_start_message(StartMessage::BrowserNavigate)
-                        } else {
-                            self.click_browser_cursor()
-                        }
-                    }
-                    Some(NavAction::Cancel) => {
-                        if self.browser.panel.url_editing {
-                            self.on_start_message(StartMessage::ToggleUrlEntry)
-                        } else {
-                            self.on_start_message(StartMessage::Close)
-                        }
-                    }
-                    Some(NavAction::BumperLeft) => self.on_start_message(StartMessage::BrowserBack),
-                    Some(NavAction::BumperRight) => {
-                        self.on_start_message(StartMessage::BrowserForward)
-                    }
-                    Some(NavAction::BumperHoldLeft) => {
-                        self.on_start_message(StartMessage::BrowserHistoryOpen { back: true })
-                    }
-                    Some(NavAction::BumperHoldRight) => {
-                        self.on_start_message(StartMessage::BrowserHistoryOpen { back: false })
-                    }
-                    Some(NavAction::ToggleMagnetism) => {
-                        let cursor = &mut self.browser.panel.cursor;
-                        cursor.magnet = !cursor.magnet;
-                        // Free-form starts now: drop any current dock and
-                        // break suppression so the point is actually free.
-                        if !cursor.magnet {
-                            cursor.attached = None;
-                            cursor.no_dock = None;
-                        }
-                        // Release-visible: the old diag_info is compiled out
-                        // in release, which made the toggle look dead.
-                        crate::platform::app_log::info(format!(
-                            "ui-diag: start browser magnet {}",
-                            if cursor.magnet { "on" } else { "off" }
-                        ));
-                        Task::none()
-                    }
-                    _ => Task::none(),
-                };
-                let sync = self.sync_browser_mouse();
-                Task::batch(vec![flag, action, sync])
-            } else {
-                match tick.action {
-                    Some(NavAction::Up) => {
-                        self.scroll_browser(-crate::ui::start::view::BROWSER_SCROLL_STEP)
-                    }
-                    Some(NavAction::Down) => {
-                        self.scroll_browser(crate::ui::start::view::BROWSER_SCROLL_STEP)
-                    }
-                    Some(NavAction::Confirm) => {
-                        self.on_start_message(StartMessage::BrowserNavigate)
-                    }
-                    Some(NavAction::Cancel) => self.on_start_message(StartMessage::Close),
-                    Some(NavAction::BumperLeft) => self.on_start_message(StartMessage::BrowserBack),
-                    Some(NavAction::BumperRight) => {
-                        self.on_start_message(StartMessage::BrowserForward)
-                    }
-                    Some(NavAction::BumperHoldLeft) => {
-                        self.on_start_message(StartMessage::BrowserHistoryOpen { back: true })
-                    }
-                    Some(NavAction::BumperHoldRight) => {
-                        self.on_start_message(StartMessage::BrowserHistoryOpen { back: false })
-                    }
-                    _ => Task::none(),
-                }
-            }
         } else if animating {
             self.start_state.tick_hint_anims(now);
             if let Some(action) = tick.action {
@@ -4961,10 +4681,6 @@ impl App {
             height: 1080.0,
         });
         self.start_monitor_cover = Some(cover);
-        // The browser card is height-driven (16:9); align the surface and
-        // engine viewport here too, since a preserved browser session can
-        // reopen with the Start screen after a monitor change.
-        self.sync_browser_viewport();
         self.clear_start_activity();
         // Enter veil stays solid until StartOpened arms the capped clock.
         self.start_state
@@ -5212,12 +4928,6 @@ impl App {
         #[cfg(debug_assertions)]
         self.start_state.request_ambient_tuning(false);
         self.start_state.clear_transition_phase();
-        // Background suspend: an in-flight browser fetch is cancelled (the
-        // cached page survives for an instant resume via the surface toggle).
-        self.browser.panel.session.cancel_load();
-        if let Some(engine) = &self.browser.engine {
-            engine.send(EngineCommand::Suspend);
-        }
         // Invalidate in-flight art events; keep caches for fast reopen.
         // Process Exit is what wipes to a blank slate (`ArtOwner::shutdown`).
         let generation = crate::ui::start::icon_cache::bump_art_warm_generation();
@@ -5228,7 +4938,6 @@ impl App {
         self.haptic_pad_serial = None;
         self.hid_worker.rumble_stop_all();
         self.pad_nav.reset();
-        self.browser.dpad_stepper.reset();
         self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
         self.cancel_key_held = false;
@@ -5512,16 +5221,9 @@ pub(crate) fn start_cold_allows(message: &StartMessage) -> bool {
 /// or a modal owns input. The stepper suppresses directionals entirely when
 /// false. The engine browser drives its cursor manually per poll, so its
 /// directionals must NOT flow here (or every pad move would double-fire).
-pub(crate) fn start_nav_move_allowed(
-    state: &start_view::State,
-    browser: &crate::ui::browser::BrowserPanel,
-) -> bool {
-    let browser_open = browser.session.is_open();
-    let engine_mode = browser_open && browser.session.has_frame();
+pub(crate) fn start_nav_move_allowed(state: &start_view::State) -> bool {
     state.settings.open
-        || (browser_open && !engine_mode)
-        || (!browser_open
-            && !state.animating()
+        || (!state.animating()
             && state.replace_confirm.is_none()
             && state.manual_add.is_none()
             && state.edit_confirm.is_none())
@@ -5557,30 +5259,14 @@ mod tests {
     }
 
     #[test]
-    fn browser_open_keeps_nav_movement_flowing_for_reader() {
+    fn start_nav_movement_follows_settings_and_modals() {
         use super::start_nav_move_allowed;
-        use crate::ui::browser::BrowserPanel;
         use crate::ui::start::view::{EditConfirm, ManualAddDraft, ReplaceConfirm, State};
-        // Regression: the reader browser consumes pad Up/Down for body scroll
-        // via the stepper, which suppresses directionals when movement is
-        // parked. Settings behaves the same (focus moves). The engine
-        // browser drives its cursor manually per poll, so its directionals
-        // must NOT flow (or every pad move would double-fire).
         let mut state = State::default();
-        let mut browser = BrowserPanel::default();
-        assert!(start_nav_move_allowed(&state, &browser));
+        assert!(start_nav_move_allowed(&state));
         state.settings.open = true;
-        assert!(start_nav_move_allowed(&state, &browser));
+        assert!(start_nav_move_allowed(&state));
         state.settings.open = false;
-        browser.session.open_surface();
-        assert!(start_nav_move_allowed(&state, &browser));
-        browser
-            .session
-            .write_frame(800, 600, vec![0; 800 * 600 * 4]);
-        assert!(!start_nav_move_allowed(&state, &browser));
-        browser.session.close_surface();
-        assert!(start_nav_move_allowed(&state, &browser));
-        browser.session.open_surface();
         state.manual_add = Some(ManualAddDraft {
             edit_id: None,
             target: String::new(),
@@ -5589,17 +5275,17 @@ mod tests {
             icon_path: None,
             shell_icon: None,
         });
-        assert!(!start_nav_move_allowed(&state, &browser));
+        assert!(!start_nav_move_allowed(&state));
         state.manual_add = None;
         state.replace_confirm = Some(ReplaceConfirm {
             running_title: String::new(),
             next_title: String::new(),
             next_index: 0,
         });
-        assert!(!start_nav_move_allowed(&state, &browser));
+        assert!(!start_nav_move_allowed(&state));
         state.replace_confirm = None;
         state.edit_confirm = Some(EditConfirm);
-        assert!(!start_nav_move_allowed(&state, &browser));
+        assert!(!start_nav_move_allowed(&state));
     }
 
     #[test]

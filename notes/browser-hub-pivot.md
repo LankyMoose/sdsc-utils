@@ -1,8 +1,8 @@
 # Browser hub pivot — managed apps + CEF engine (planned)
 
 **Status:** in progress (branch `browser/hub-pivot`, based on `browser/main`).
-Phases 0–1 landed (state extraction, PS hub window + auto-open); the
-standalone Browser window is next.
+Phases 0–2 landed: state extraction, PS hub + auto-open, and the standalone
+Browser window. CEF (phase 3) is next.
 **When to read:** before touching Start/browser window ownership, the PS
 overlay, app selection, the engine backend, or MSIX packaging.
 
@@ -97,10 +97,16 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    `Normal`; the hub is raised last above toast/Settings/popup. Over
    exclusive-fullscreen games the topmost hub can still be covered
    (documented limitation).
-2. **Browser standalone window.** Move panel rendering, cursor/scroll/D-pad
-   routing (`tick_browser_cursor`, jumps, clicks, `sync_browser_mouse`) and
-   all `StartMessage::Browser*` into `BrowserMessage`. Settings/history/
-   bookmark-bubble/URL-edit move with it.
+2. **Browser standalone window. — landed.** New fullscreen `Level::Normal`
+   Browser window (`app::browser::open_browser_window`); Start no longer
+   renders or owns the panel. Rendering moved to `src/ui/browser/view.rs`
+   (`root_view`, `fullscreen_layout`) and all browser messages are
+   `BrowserMessage` (no `StartMessage::Browser*` left). Browser owns pad
+   routing (`on_browser_pad`: cursor, D-pad jumps, history selector, R3
+   flag), keyboard (`on_browser_key`), its own 60Hz `BrowserFrame` tick, and
+   window close/suspend/focus return. Hub is routed before Browser; Browser
+   before Start. `browser_layout`/16:9 card remains only for the old Start
+   card tests — the live window uses fullscreen geometry.
 3. **CEF backend behind the existing `EngineCommand`/`EngineEvent` seam.**
    New `src/browser/cef_backend.rs`; `FrameSlot` + shader pipeline unchanged
    (L1 CPU `OnPaint`). DOM contract: fragments from `getClientRects()` +

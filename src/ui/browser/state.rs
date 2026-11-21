@@ -98,7 +98,7 @@ pub struct StoredTab {
     pub loaded: bool,
 }
 
-/// In-Start reader browser panel. The URL draft and body scroll offset live
+/// Browser app panel. The URL draft and body scroll offset live
 /// here; load lifecycle (generation-guarded suspend/resume) lives in
 /// [`crate::browser::BrowserSession`]. The pad cursor roams in engine page
 /// pixels (see [`crate::browser::cursor`]).

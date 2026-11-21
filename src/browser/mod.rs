@@ -63,7 +63,7 @@ fn is_ignored_url(url: &str) -> bool {
     url.is_empty() || url == BLANK_PAGE_URL
 }
 
-/// In-Start browser surface state. Pure data: the iced view owns the URL
+/// Browser surface state. Pure data: the iced view owns the URL
 /// draft and scroll offset, this owns load lifecycle with a generation
 /// counter so late worker results are ignored after suspend/close —
 /// the same stale-generation discipline as the Start art worker.

@@ -80,7 +80,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 
 | Directory | Typical changes |
 |---|---|
-| `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Start / toast, message routing; `browser.rs` (top-level `BrowserAppState`), `hub.rs` (`AppHub` installed/active apps + PS hub window lifecycle/input) |
+| `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Start / toast, message routing; `browser.rs` (top-level `BrowserAppState`, standalone Browser window, pad/key/`BrowserMessage` routing), `hub.rs` (`AppHub` installed/active apps + PS hub window lifecycle/input) |
 | `src/browser/` | Browser internals: engine seam + Servo worker, DOM target query, controller cursor, tabs/bookmarks, stable frame texture, reader fallback (Servo-era; pivot to managed app + CEF planned) |
 | `src/session/` | Pure device session (no windows/HWND): presence, notify, analytics, Start-open policy; emits `SessionEffect`s the UI applies |
 | `src/controller/` | HID polling + worker (`hid/`), DualSense protocol (`dualsense/`: battery, lightbar, rumble, input, identity), known controllers, debug-only `emulate` emulation |
@@ -88,7 +88,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 | `src/games/` | Steam library scan, game launch, process matching |
 | `src/persist/` | `prefs.json`, `controllers.json`, `analytics.json`, `steam_library.json`, paths |
 | `src/platform/` | Logging, app metadata, autostart, crash-restart, device-arrival watch, file icons, MSIX (`packaged`), UI sounds, wgpu diagnostics, Win32 helpers |
-| `src/ui/` | All iced views + styling: `theme.rs`, `popup/`, `configure/` (Settings), `start/` (fullscreen Start console), `browser/` (browser panel state, standalone view later), `hub/` (PS overlay tiles/selection), `toast/`, `shader/`, `percent_ring.rs`, `layout.rs` (window placement) |
+| `src/ui/` | All iced views + styling: `theme.rs`, `popup/`, `configure/` (Settings), `start/` (fullscreen Start console), `browser/` (panel state + standalone window view/`BrowserMessage`), `hub/` (PS overlay tiles/selection), `toast/`, `shader/`, `percent_ring.rs`, `layout.rs` (window placement) |
 | Tests | Inline `#[cfg(test)] mod tests` next to the code (no `tests/` dir) |
 
 ## Common gotchas for agents

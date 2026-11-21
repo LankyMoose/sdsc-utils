@@ -108,7 +108,11 @@ impl AppHub {
     /// Close an app. Closing the active app leaves no foreground app; the
     /// caller decides whether to return to Start or the hub.
     pub fn close(&mut self, id: AppId) -> Vec<AppEffect> {
-        if !self.installed.remove(&id) {
+        // Closing tears down runtime state; the app stays installed and can
+        // be reopened (browser suspend/resume uses this path). Unknown or
+        // not-running apps are a no-op.
+        let was_open = self.active == Some(id) || self.suspended.contains(&id);
+        if !self.installed.contains(&id) || !was_open {
             return Vec::new();
         }
         self.suspended.remove(&id);
@@ -232,6 +236,13 @@ impl App {
         };
         crate::controller::hid::diag::diag_info("ui-diag: hub close");
         let task = window::close(id);
+        // Return focus to the app underneath: Browser first (it launches on
+        // top of Start or the desktop), else Start.
+        if self.browser_visible
+            && let Some(browser) = self.browser_window
+        {
+            return task.chain(focus_window(browser));
+        }
         if self.start_visible
             && let Some(start) = self.start_window
         {
@@ -282,24 +293,20 @@ impl App {
                     return Task::none();
                 }
                 crate::controller::hid::diag::diag_info("ui-diag: hub launch Start");
-                self.close_hub().chain(self.open_start_screen())
+                // Start is a sibling app: dismiss the browser before showing
+                // it, or the fullscreen browser would stay on top.
+                let dismiss = self.close_hub();
+                if self.browser_visible {
+                    dismiss
+                        .chain(self.close_browser_window())
+                        .chain(self.open_start_screen())
+                } else {
+                    dismiss.chain(self.open_start_screen())
+                }
             }
             hub_view::HubTile::Browser => {
-                // Phase 1: the Browser still renders inside Start. Phase 2
-                // moves it to its own normal-level window.
-                if !self.session.prefs.start_screen_enabled {
-                    crate::controller::hid::diag::diag_info(
-                        "ui-diag: hub Browser selected but Start host disabled",
-                    );
-                    return Task::none();
-                }
                 crate::controller::hid::diag::diag_info("ui-diag: hub launch Browser");
-                let show = self.close_hub().chain(self.open_start_screen());
-                if self.browser.panel.session.is_open() {
-                    show
-                } else {
-                    show.chain(self.on_toggle_browser())
-                }
+                self.close_hub().chain(self.open_browser_window())
             }
             hub_view::HubTile::AddApps => {
                 // Catalog/DLC arrives in phase 5. Keep the hub open so it
@@ -469,7 +476,7 @@ mod tests {
             ]
         );
         assert_eq!(hub.active(), None);
-        assert!(!hub.is_installed(AppId::Browser));
+        assert!(hub.is_installed(AppId::Browser));
         assert!(hub.close(AppId::Browser).is_empty());
     }
 

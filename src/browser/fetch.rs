@@ -1,4 +1,4 @@
-//! Blocking web fetch + readability extraction for the in-Start browser.
+//! Blocking web fetch + readability extraction for the browser reader path.
 //!
 //! Phase-1 backend behind [`crate::browser::BrowserSession`]: fetch a URL off
 //! the UI thread (callers use `spawn_blocking`) and reduce the HTML to title

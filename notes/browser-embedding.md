@@ -1,14 +1,14 @@
-# Browser embedding: Servo offscreen inside Start (current), CEF pivot planned
+# Browser embedding: Servo offscreen in the Browser app (current), CEF pivot planned
 
 **Status:** current implementation (Servo era) on `browser/hub-pivot` / `browser/main`.
-**When to read:** anything touching `src/browser/`, the Start browser surface, or
-the `servo-engine` feature. **Planned replacement:** [browser-hub-pivot.md](browser-hub-pivot.md)
-(split the browser out of Start into a managed app; replace Servo with CEF OSR).
+**When to read:** anything touching `src/browser/`, the standalone Browser
+window, or the `servo-engine` feature. **Planned replacement:**
+[browser-hub-pivot.md](browser-hub-pivot.md) (replace Servo with CEF OSR).
 
 ## Decision (current)
 
-- Inside-Start + open web + no DRM → Servo offscreen composited as an iced
-  texture. Rejected: `wry`/WebView2 child HWND (native child draws above the
+- Standalone Browser window + open web + no DRM → Servo offscreen
+  composited as an iced texture. Rejected: `wry`/WebView2 child HWND (native child draws above the
   iced/wgpu canvas — toasts, veils, drawer chrome cannot composite over it;
   Linux child is X11-only anyway). `retsurf` is a standalone GPL app, not a
   library — only its controller UX patterns carry over.
@@ -27,7 +27,7 @@ the `servo-engine` feature. **Planned replacement:** [browser-hub-pivot.md](brow
 - `src/browser/engine.rs` — engine seam: `EngineCommand` down, `EngineEvent`
   up, `EngineHandle` channel pair (mirrors `InputHub` bind/clear/emit). The UI
   only depends on this seam, so the backend is replaceable without touching
-  Start.
+  the Browser window.
 - `src/browser/servo_backend.rs` (`servo-engine` feature only) — worker
   thread owning all Servo types (`!Send` by design). Suspend = skip spin +
   long sleep; generation-guarded loads; 30s load timeout. The `A11yTree`
@@ -41,12 +41,15 @@ the `servo-engine` feature. **Planned replacement:** [browser-hub-pivot.md](brow
   `getComputedStyle`).
 - `src/ui/browser/state.rs` — `BrowserPanel`, per-tab `BrowserTabPage`,
   `StoredTab`, `HistorySelector`, chrome targets/layout, cursor integration,
-  bookmarks/favicon cache, tab persistence helpers. Extracted from the Start
-  view in phase 0; the Start view re-exports it until the standalone window
-  lands.
+  bookmarks/favicon cache, tab persistence helpers.
+- `src/ui/browser/view.rs` — standalone Browser rendering (`root_view`,
+  `fullscreen_layout`) and the `BrowserMessage` vocabulary. The window is
+  opaque fullscreen with the tab strip/toolbar/bookmarks header and the page
+  taking the remaining height.
 - `src/app/browser.rs` — `BrowserAppState`: panel, engine handle, capability
-  flag, browser-only D-pad stepper (the browser no longer lives inside
-  `StartState`).
+  flag, browser-only D-pad stepper and pad bank; window lifecycle
+  (`open_browser_window`, `close_browser_window`), `BrowserMessage` router,
+  `on_browser_pad`/`on_browser_key`, and the 60Hz `BrowserFrame` tick.
 - `src/app/hub.rs` — `AppHub`: installed/active apps (`AppId::Start`,
   `AppId::Browser`), show/hide/focus/suspend/resume/close effects, plus the
   PS hub window lifecycle (`open_hub`/`close_hub`, pad/key routing). The hub
@@ -70,9 +73,15 @@ the `servo-engine` feature. **Planned replacement:** [browser-hub-pivot.md](brow
 
 ## Current input/UX contract (pad, engine mode)
 
-PS opens the topmost hub over Start or a game; while the hub is open it owns
-pad input and Start messages are gated. Selecting Browser closes the hub and
-opens the in-Start browser (the standalone window lands in phase 2).
+PS opens the topmost hub over Start, Browser, or a game; while the hub is open
+it owns pad input and the app underneath is gated. Selecting Browser closes
+the hub and opens the standalone fullscreen Browser window. Browser close
+(Circle/Esc with no modal) suspends the engine and returns focus to Start when
+it is visible.
+
+Input priority is **hub → Browser → Start**. The Browser window has its own
+pad bank (`BrowserAppState::nav`) and D-pad stepper; Start's bank no longer
+sees browser presses.
 
 - Left stick moves the cursor with velocity + friction; magnet docks on
   arrival, centre-snaps on fresh acquisition, holds in place while scrolling.

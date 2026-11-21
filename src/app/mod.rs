@@ -166,11 +166,17 @@ pub enum Message {
 
     ConfigureOpened(window::Id),
     Configure(ConfigureMessage),
+    /// Standalone Browser window opened (focus + size the engine viewport).
+    BrowserOpened(window::Id),
+    /// Browser-window chrome / page / cursor message.
+    Browser(crate::ui::browser::BrowserMessage),
+    /// 60Hz Browser window tick (cursor/scroll/mouse sync/shots).
+    BrowserFrame,
     /// PS hub window opened (focus it once the renderer exists).
     HubOpened(window::Id),
     /// Hub selection / activation from pad, keyboard, or mouse.
     Hub(crate::ui::hub::HubMessage),
-    /// Raw keyboard event for the Start browser (controller-first: no mouse).
+    /// Raw keyboard event for the Browser app (controller-first: no mouse).
     /// Routed in `update` — page mode forwards to the engine, URL-edit mode
     /// and reader mode fall back to the legacy Start-key mapping.
     BrowserRawKey {
@@ -233,7 +239,7 @@ pub enum Message {
     #[cfg(debug_assertions)]
     ToggleDebugLayoutBounds,
     /// Debug-only: browser target overlay + frame shots (Diagnostics toggle
-    /// or F10). Mirrored into the Start browser panel for the card readout.
+    /// or F10). Mirrored into the browser panel for the card readout.
     #[cfg(debug_assertions)]
     ToggleDebugBrowser,
 
@@ -304,10 +310,12 @@ impl Message {
             | Message::PopupOpened(_)
             | Message::PlacePopup { .. }
             | Message::ConfigureOpened(_)
+            | Message::BrowserOpened(_)
             | Message::HubOpened(_)
             | Message::StartOpened(_)
             | Message::FinishStartClose
             | Message::StartFrame
+            | Message::BrowserFrame
             | Message::StartArtEvent(_) => false,
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
@@ -316,6 +324,7 @@ impl Message {
             Message::Popup(_)
             | Message::Configure(_)
             | Message::Hub(_)
+            | Message::Browser(_)
             | Message::Start(_)
             | Message::BrowserRawKey { .. }
             | Message::StartCursorActivity(_)
@@ -478,6 +487,11 @@ pub struct App {
     start_window: Option<window::Id>,
     /// True only while Start is revealed (warm HWND may exist while false).
     start_visible: bool,
+    /// Standalone fullscreen Browser app window.
+    browser_window: Option<window::Id>,
+    browser_visible: bool,
+    /// Monitor covered by the Browser window (stage size for its view).
+    browser_monitor_cover: Option<MonitorCover>,
     /// Topmost PS app-switcher overlay (small, bottom-weighted).
     hub_window: Option<window::Id>,
     /// True while the hub is revealed; modal owner of pad input.
@@ -766,10 +780,11 @@ impl App {
                 width: 1920.0,
                 height: 1080.0,
             });
-        let initial_browser = start_view::browser_layout(initial_cover.width, initial_cover.height);
+        let (initial_page_w, initial_page_h) =
+            crate::ui::browser::view::fullscreen_layout(initial_cover.width, initial_cover.height);
         let initial_page = (
-            initial_browser.page_w.round().max(1.0) as u32,
-            initial_browser.page_h.round().max(1.0) as u32,
+            initial_page_w.round().max(1.0) as u32,
+            initial_page_h.round().max(1.0) as u32,
         );
         // A crash-restart successor must not re-open the page that killed
         // Servo (the restored active tab is the one that was loading).
@@ -859,6 +874,9 @@ impl App {
             pad_input_panel: PadInputPanel::default(),
             start_window: None,
             start_visible: false,
+            browser_window: None,
+            browser_visible: false,
+            browser_monitor_cover: None,
             hub_window: None,
             hub_visible: false,
             hub_state: crate::ui::hub::State::default(),
@@ -939,11 +957,11 @@ impl App {
         };
 
         // Apply the boot-time browser geometry to the panel/cursor now; the
-        // Start screen may not open for a while and the browser must be
-        // ready at the right size when it does.
+        // browser window may not open for a while and must be ready at the
+        // right fullscreen size when it does.
         app.browser
             .panel
-            .set_viewport(initial_browser.page_w, initial_browser.page_h);
+            .set_viewport(initial_page_w.max(1.0), initial_page_h.max(1.0));
 
         // Disk-persisted bookmarks into the browser panel (the one state
         // that survives restarts by design). Rebuild chrome after: the
@@ -1062,6 +1080,7 @@ impl App {
                     }
                 }
                 "hub" => tasks.push(self.open_hub()),
+                "browser" => tasks.push(self.open_browser_window()),
                 "start" => tasks.push(self.open_start_screen()),
                 "start-controllers" => {
                     tasks.push(self.open_start_screen());
@@ -1091,7 +1110,10 @@ impl App {
         }
         if Some(window) == self.configure_window {
             "Settings".to_string()
-        } else if Some(window) == self.start_window || Some(window) == self.hub_window {
+        } else if Some(window) == self.start_window
+            || Some(window) == self.hub_window
+            || Some(window) == self.browser_window
+        {
             String::new()
         } else {
             crate::platform::app_meta::DISPLAY_NAME.to_string()
@@ -1242,6 +1264,7 @@ impl App {
         let pad_input_live =
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
         let pad_listening = pad_input_live
+            || self.browser_visible
             || (self.session.prefs.start_screen_enabled && !self.session.controllers.is_empty());
         self.hid_worker.set_input_hot(pad_listening);
         if pad_listening {
@@ -1259,6 +1282,9 @@ impl App {
 
         if self.start_visible && (self.start_state.needs_frames() || self.steam_scan_in_flight()) {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::StartFrame));
+        }
+        if self.browser_visible {
+            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::BrowserFrame));
         }
 
         if self.popup_window.is_some() || self.configure_window.is_some() {
@@ -1344,6 +1370,20 @@ impl App {
             .map(Message::Configure);
         }
 
+        if Some(window) == self.browser_window {
+            let cover = self.browser_monitor_cover;
+            let (w, h) = cover
+                .map(|c| (c.width, c.height))
+                .unwrap_or((1920.0, 1080.0));
+            return crate::ui::browser::view::root_view(
+                &self.browser.panel,
+                self.browser.engine_available,
+                w,
+                h,
+            )
+            .map(Message::Browser);
+        }
+
         if Some(window) == self.hub_window {
             return crate::ui::hub::view(&self.hub_state).map(Message::Hub);
         }
@@ -1380,8 +1420,6 @@ impl App {
             let settings_snapshot = self.start_settings_snapshot();
             let start = start_view::view(
                 &self.start_state,
-                &self.browser.panel,
-                self.browser.engine_available,
                 &self.session.prefs.spectrum,
                 Instant::now(),
                 self.session.prefs.start_screen_clock_enabled,
@@ -1549,6 +1587,9 @@ impl App {
                 task
             }
             Message::Configure(message) => self.on_configure_message(message),
+            Message::BrowserOpened(id) => self.on_browser_opened(id),
+            Message::Browser(message) => self.on_browser_message(message),
+            Message::BrowserFrame => self.on_browser_frame(),
             Message::HubOpened(id) => self.on_hub_opened(id),
             Message::Hub(message) => self.on_hub_message(message),
 
@@ -1680,12 +1721,25 @@ impl App {
         } else if Some(id) == self.configure_window {
             self.configure_window = None;
             self.sync_toast_zorder()
+        } else if Some(id) == self.browser_window {
+            self.browser_window = None;
+            self.browser_visible = false;
+            self.browser_monitor_cover = None;
+            if self.browser.panel.session.is_open() {
+                let _ = self.close_browser_surface();
+            }
+            Task::none()
         } else if Some(id) == self.hub_window {
             self.hub_window = None;
             self.hub_visible = false;
             // Return focus to Start when it is the app underneath. The toast
             // is AlwaysOnTop, so it stays above a normal-level Start without
             // re-raising anything.
+            if self.browser_visible
+                && let Some(browser) = self.browser_window
+            {
+                return focus_window(browser);
+            }
             if self.start_visible
                 && let Some(start) = self.start_window
             {
@@ -1797,9 +1851,6 @@ impl App {
                 let settings_y = self.start_state.settings.scroll_y;
                 task = task.chain(self.restore_settings_scroll(settings_y));
             }
-            // Reopened Start under an open browser surface: close suspends
-            // the engine but keeps the cached page, so resume here.
-            self.resume_browser_engine();
             // Re-show the position rail on every open.
             // Warm opens skip begin_cold_load; cold opens refresh
             // the hide clock to visible time. Pinned is a no-op.
@@ -2001,7 +2052,7 @@ impl App {
                     } else if self.start_state.settings.open {
                         self.on_start_settings_nav(Some(NavAction::Up))
                     } else if self.browser.panel.session.is_open() {
-                        self.scroll_browser(-crate::ui::start::view::BROWSER_SCROLL_STEP)
+                        self.scroll_browser(-crate::ui::browser::view::BROWSER_SCROLL_STEP)
                     } else if self.immersive_horizontal_games_nav() {
                         // Horizontal Games strip scrolls Left/Right only.
                         Task::none()
@@ -2016,7 +2067,7 @@ impl App {
                     } else if self.start_state.settings.open {
                         self.on_start_settings_nav(Some(NavAction::Down))
                     } else if self.browser.panel.session.is_open() {
-                        self.scroll_browser(crate::ui::start::view::BROWSER_SCROLL_STEP)
+                        self.scroll_browser(crate::ui::browser::view::BROWSER_SCROLL_STEP)
                     } else if self.immersive_horizontal_games_nav() {
                         // Horizontal Games strip scrolls Left/Right only.
                         Task::none()
@@ -2064,8 +2115,6 @@ impl App {
                         self.cancel_start_holds();
                         if self.start_state.ambient_tuning_active() {
                             self.on_ambient_tuning_nav(Some(NavAction::Confirm))
-                        } else if self.browser.panel.session.is_open() {
-                            self.on_start_message(StartMessage::BrowserNavigate)
                         } else if self.start_state.settings.open {
                             self.on_start_settings_nav(Some(NavAction::Confirm))
                         } else {
@@ -2496,6 +2545,7 @@ impl App {
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
         pad_input_live
             || self.hub_visible
+            || self.browser_visible
             || (self.start_visible
                 && self.session.prefs.start_screen_enabled
                 && !self.session.controllers.is_empty())
