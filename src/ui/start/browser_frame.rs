@@ -175,10 +175,14 @@ impl BrowserFramePipeline {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                // The engine's software output is sRGB-encoded RGBA; the sRGB
-                // texture view linearizes on sample, matching the image
-                // atlas path this replaces.
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                // The engine's software output is already sRGB-encoded RGBA.
+                // iced renders into a non-sRGB target and its own image atlas
+                // is plain `Rgba8Unorm` too; declaring this texture sRGB made
+                // the hardware linearize the samples, and the shader then
+                // wrote those linear values raw — visibly darkening every
+                // midtone (a #808080 page read back as #373737). Plain Unorm
+                // passes the bytes through unchanged.
+                format: wgpu::TextureFormat::Rgba8Unorm,
                 usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });

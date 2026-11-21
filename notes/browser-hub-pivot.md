@@ -107,18 +107,22 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    routing (`on_browser_pad`: cursor, D-pad jumps, history selector, R3
    flag), keyboard (`on_browser_key`), its own 60Hz `BrowserFrame` tick, and
    window close/suspend/focus return. Hub is routed before Browser; Browser
-   before Start. `browser_layout`/16:9 card remains only for the old Start
-   card tests — the live window uses fullscreen geometry.
+   before Start. The live window renders a **16:9 card**, height-driven at
+   `window height - 100px` (50px breather per side), centered on the monitor
+   with the tab/toolbar/bookmark header inside it; `browser_layout` is the
+   single geometry source for both the card and the engine viewport.
 3. **CEF backend behind the existing `EngineCommand`/`EngineEvent` seam. —
    landed (dev).** `src/browser/cef_backend.rs` owns CEF init + a worker;
-   `FrameSlot` and the shader pipeline are unchanged. L1 CPU `OnPaint`
-   swizzles BGRA → RGBA into the tab slot. Reuses `dom_query_js` through a
+   `FrameSlot` and the custom shader pipeline are reused (the frame texture
+   is plain `Rgba8Unorm` now). L1 CPU `OnPaint` swizzles BGRA → RGBA into the
+   tab slot. Reuses `dom_query_js` through a
    renderer-process message bridge (no A11y forcing/clip walks; `dom.rs`
    keeps the JS, CEF parses JSON in the browser process). Commands covered:
    navigate, tabs (open/close/activate), resize, visibility/suspend, back/
    forward, reload, mouse move/click/wheel, keyboard, click-at, DOM reseed.
-   `--type=` subprocesses re-exec the exe and run `CefExecuteProcess` before
-   argument parsing. During phase 3 CEF was behind `cef-engine`, mutually
+   Navigation recenters the existing cursor so the live viewport bounds
+   survive. `--type=` subprocesses re-exec the exe and run `CefExecuteProcess`
+   before argument parsing. During phase 3 CEF was behind `cef-engine`, mutually
    exclusive with `servo-engine`; it needs the static MSVC CRT because
    `libcef_dll_wrapper` is built `/MT`. Sandbox is disabled in this phase;
    popups (`window.open`/`target=_blank`) are denied; favicons and

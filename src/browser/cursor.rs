@@ -232,6 +232,32 @@ impl Cursor {
         self.y = self.y.clamp(CURSOR_MIN_Y, h);
     }
 
+    /// Reset for a fresh document: recenter in the **live** viewport and
+    /// drop docks/flights/velocity. User preferences (magnet) and the live
+    /// bounds survive — replacing the cursor with `Cursor::new()` would
+    /// silently clamp it back to the compile-time 800x600 defaults, which is
+    /// exactly the "cursor trapped in the top-left quarter" bug.
+    pub fn reset_for_page(&mut self) {
+        self.x = self.view_w / 2.0;
+        self.y = self.view_h / 2.0;
+        self.vx = 0.0;
+        self.vy = 0.0;
+        self.attached = None;
+        self.dock_blend = 0.0;
+        self.last_dock = None;
+        self.fly_to = None;
+        self.fly_from = (0.0, 0.0);
+        self.fly_elapsed = 0.0;
+        self.no_dock = None;
+        self.break_armed = true;
+        self.docked_for = 0.0;
+        self.scroll_released = false;
+        self.turbo = false;
+        self.was_turbo = false;
+        self.nudge_morph = None;
+        self.visible = true;
+    }
+
     /// Page targets are only reachable while any part of them intersects
     /// the viewport; synthetic chrome lives above it and is always
     /// eligible. The cursor clamps to the viewport, so off-screen page
@@ -859,6 +885,21 @@ mod tests {
         assert!(c.visible);
         assert!(c.attached.is_none());
         assert!(c.fly_to.is_none());
+    }
+
+    #[test]
+    fn reset_for_page_keeps_live_viewport_bounds() {
+        let mut c = Cursor::new();
+        c.set_viewport(1734.0, 860.0);
+        c.x = 10.0;
+        c.y = 20.0;
+        c.attached = Some(7);
+        c.reset_for_page();
+        assert_eq!((c.view_w, c.view_h), (1734.0, 860.0));
+        assert_eq!((c.x, c.y), (867.0, 430.0));
+        assert_eq!(c.attached, None);
+        assert!(c.fly_to.is_none());
+        assert!(c.magnet, "navigation must not reset the magnet preference");
     }
 
     #[test]

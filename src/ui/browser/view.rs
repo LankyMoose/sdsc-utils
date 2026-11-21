@@ -709,14 +709,12 @@ pub fn browser_view<'a>(
         .into()
 }
 
-/// Fullscreen page geometry for the standalone window: the tab/toolbar/
-/// bookmark header is fixed, the page takes the remaining height. No Start
-/// card wash or outer breather.
+/// Standalone Browser card geometry: 16:9, height-driven, with a 50px
+/// breather per side (window height - 100). The fixed tab/toolbar/bookmark
+/// header is inside the card; only the page area is returned.
 pub fn fullscreen_layout(stage_w: f32, stage_h: f32) -> (f32, f32) {
-    (
-        stage_w.max(1.0).round(),
-        (stage_h - CHROME_HEADER_H).max(1.0).round(),
-    )
+    let layout = crate::ui::browser::state::browser_layout(stage_w, stage_h);
+    (layout.page_w, layout.page_h)
 }
 
 /// Standalone Browser window root. Fills the window with the browser surface
@@ -728,9 +726,17 @@ pub fn root_view(
     stage_h: f32,
 ) -> Element<'_, BrowserMessage> {
     let (page_w, page_h) = fullscreen_layout(stage_w, stage_h);
-    container(browser_view(panel, engine_available, page_w, page_h))
+    let layout = crate::ui::browser::state::browser_layout(stage_w, stage_h);
+    let card = container(browser_view(panel, engine_available, page_w, page_h))
+        .padding(crate::ui::browser::state::BROWSER_CARD_PAD)
+        .style(theme::menu_panel)
+        .width(Length::Fixed(layout.card_w))
+        .height(Length::Fixed(layout.card_h));
+    container(card)
         .width(Fill)
         .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill)
         .style(|_theme| container::Style {
             background: Some(iced::Background::Color(theme::BASE_BG)),
             text_color: Some(theme::INK),
@@ -1016,17 +1022,109 @@ mod tests {
             l.card_w,
             l.card_h
         );
-        assert_eq!(l.card_h, 1016.0, "2rem top/bottom breather");
+        assert_eq!(l.card_h, 980.0, "50px top/bottom breather (height - 100)");
         assert_eq!(l.card_w, l.page_w + 2.0 * BROWSER_CARD_PAD);
         assert_eq!(
             l.card_h,
             l.page_h + CHROME_HEADER_H + 2.0 * BROWSER_CARD_PAD
         );
-        assert!(l.page_w > 1700.0, "height-driven width");
+        assert!(l.page_w > 1600.0, "height-driven width");
         // Narrow stage: width clamps and the card keeps 16:9.
         let n = browser_layout(800.0, 1200.0);
         assert!(n.card_w <= 800.0 - 2.0 * BROWSER_OUTER_MARGIN + 0.01);
         assert!((n.card_w / n.card_h - 16.0 / 9.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn page_replacement_keeps_live_cursor_bounds() {
+        let mut panel = BrowserPanel::default();
+        panel.set_viewport(1734.0, 860.0);
+        panel.reset_live_page();
+        assert_eq!(
+            (panel.page.cursor.view_w, panel.page.cursor.view_h),
+            (1734.0, 860.0)
+        );
+
+        // A stored tab's cursor may predate the live viewport; activating it
+        // must re-sync rather than clamp to the page's 800x600 default.
+        let id = TabId(2);
+        panel.order.push(id);
+        panel.stored.push(StoredTab {
+            id,
+            page: BrowserTabPage::default(),
+            loaded: false,
+        });
+        assert!(panel.activate_stored(id));
+        assert_eq!(
+            (panel.page.cursor.view_w, panel.page.cursor.view_h),
+            (1734.0, 860.0)
+        );
+
+        // `stash_live` leaves a default placeholder page behind.
+        panel.stash_live();
+        assert_eq!(
+            (panel.page.cursor.view_w, panel.page.cursor.view_h),
+            (1734.0, 860.0)
+        );
+    }
+
+    #[test]
+    fn one_long_tab_gets_a_wide_title() {
+        use crate::browser::engine::TabId;
+        let mut panel = BrowserPanel::default();
+        panel.set_viewport(1920.0, 968.0);
+        panel
+            .page
+            .session
+            .begin_load("https://example.com/".to_string());
+        panel.page.session.note_title(Some(
+            "A very long page title that must not collapse to four characters".to_string(),
+        ));
+        panel.rebuild_chrome();
+        let f = panel
+            .chrome
+            .iter()
+            .find(|(t, _)| matches!(t, ChromeTarget::Tab(TabId::BOOT)))
+            .map(|(_, f)| f)
+            .expect("tab slot");
+        assert!(
+            f.w > 260.0,
+            "long lone tab should get real width, got {:.0}",
+            f.w
+        );
+    }
+
+    #[test]
+    fn precise_header_point_hits_the_rect() {
+        let mut panel = BrowserPanel::default();
+        panel.set_viewport(1920.0, 968.0);
+        panel.rebuild_chrome();
+        // Tab, tab-close, and toolbar controls all live in the negative
+        // header band; a magnet-off precise click must hit each rect.
+        for target in [
+            ChromeTarget::Tab(TabId::BOOT),
+            ChromeTarget::TabClose(TabId::BOOT),
+            ChromeTarget::Back,
+            ChromeTarget::Omnibox,
+        ] {
+            let f = panel
+                .chrome
+                .iter()
+                .find(|(t, _)| *t == target)
+                .map(|(_, f)| f.clone())
+                .unwrap_or_else(|| panic!("missing chrome slot {target:?}"));
+            assert!(
+                f.y + f.h <= 0.0,
+                "{target:?} must sit in the header band, got y={}..{}",
+                f.y,
+                f.y + f.h
+            );
+            assert_eq!(
+                panel.chrome_target_at(f.x + f.w / 2.0, f.y + f.h / 2.0),
+                Some(target)
+            );
+        }
+        assert_eq!(panel.chrome_target_at(-1.0, -80.0), None);
     }
 
     #[test]

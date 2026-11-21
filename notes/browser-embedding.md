@@ -68,7 +68,17 @@ window, the engine worker, DOM targets, or the CEF packaging path.
   (the observer install script is gone). Precise/free clicks use trusted
   synthetic events at the point.
 - `--force-color-profile=srgb` and a white `BrowserSettings.background_color`
-  keep the OSR buffer aligned with the sRGB texture and the browser canvas.
+  keep the OSR buffer aligned with the browser canvas.
+- The OSR frame texture is **`Rgba8Unorm`, not `Rgba8UnormSrgb`**. iced renders
+  into a non-sRGB target (its own image atlas is plain Unorm too), so an sRGB
+  texture view decoded every midtone and the shader wrote the linear values
+  raw: a `#808080` page read back as `#373737`. Verified against Edge with a
+  solid-color probe — all eight patches are now byte-identical.
+- Cursor bounds come from the live page area and never from `Cursor::new()`'s
+  800x600 defaults. Navigation calls `reset_for_page()` (recenter, keep the
+  live viewport) instead of replacing the cursor, and the browser takes its
+  window size from `window::resize_events()` rather than a creation-time
+  `window::size()` query, which can return the pre-fullscreen default.
 
 PS opens the topmost hub over Start, Browser, or a game; while the hub is
 open it owns pad input and the app underneath is gated. Selecting Browser

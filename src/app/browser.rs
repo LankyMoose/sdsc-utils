@@ -140,6 +140,9 @@ impl super::App {
                 height: 1080.0,
             });
         self.browser_monitor_cover = Some(cover);
+        // A new window can land on a different monitor; the cover drives the
+        // first layout until its own resize event arrives.
+        self.browser_window_size = None;
         self.browser_visible = true;
         let was_open = self.browser.panel.session.is_open();
         let (id, open) = iced::window::open(iced::window::Settings {
@@ -175,6 +178,7 @@ impl super::App {
     pub(crate) fn close_browser_window(&mut self) -> Task<Message> {
         self.browser_visible = false;
         self.browser_monitor_cover = None;
+        self.browser_window_size = None;
         let task = self.close_browser_surface();
         let Some(id) = self.browser_window.take() else {
             return task;
@@ -196,17 +200,27 @@ impl super::App {
         }
         self.browser_visible = true;
         crate::controller::hid::diag::diag_info(format!("ui-diag: browser opened id={id:?}"));
+        // The cover is logical pixels and already drives this first layout.
+        // The real size arrives through `window::resize_events()` once the
+        // fullscreen surface is configured; a one-shot `window::size()` here
+        // can race creation and report the pre-fullscreen default, which
+        // would briefly shrink the cursor space (the quarter-screen bug).
         self.sync_browser_viewport();
-        // The monitor cover is logical pixels, but confirm the actual window
-        // size after creation: a DPI/fullscreen mismatch here is exactly what
-        // makes the cursor feel trapped in one quarter of the screen.
-        iced::window::size(id)
-            .map(Message::BrowserWindowSized)
-            .chain(crate::ui::layout::focus_window(id))
+        crate::ui::layout::focus_window(id)
     }
 
     pub(crate) fn on_browser_window_sized(&mut self, size: iced::Size) -> Task<Message> {
         let size = (size.width.max(1.0), size.height.max(1.0));
+        // The Browser window is a borderless fullscreen window sized to the
+        // monitor cover. iced configures the surface once at its pre-fullscreen
+        // default (observed 1440x789) before the final resize; adopting that
+        // would briefly shrink the card, engine viewport, and cursor space.
+        // The cover is the intended size, so ignore any other size.
+        if let Some(cover) = self.browser_monitor_cover
+            && ((size.0 - cover.width).abs() > 1.0 || (size.1 - cover.height).abs() > 1.0)
+        {
+            return Task::none();
+        }
         if self.browser_window_size == Some(size) {
             return Task::none();
         }

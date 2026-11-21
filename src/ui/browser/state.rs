@@ -233,6 +233,23 @@ impl BrowserPanel {
         true
     }
 
+    /// Keep the live page's cursor bounds in step with the panel viewport.
+    /// Page state (including the cursor) is swapped per tab and replaced on
+    /// new/restored tabs, so a default page carries 800x600 bounds until this
+    /// runs — the recurring "cursor trapped in a quarter of the page" bug.
+    pub fn sync_live_cursor(&mut self) {
+        self.page
+            .cursor
+            .set_viewport(self.viewport.0, self.viewport.1);
+    }
+
+    /// Replace the live page with a fresh one that already knows the live
+    /// viewport. Prefer this over assigning `BrowserTabPage::default()`.
+    pub fn reset_live_page(&mut self) {
+        self.page = BrowserTabPage::default();
+        self.sync_live_cursor();
+    }
+
     /// Find a background tab's stored state.
     pub fn stored_mut(&mut self, id: crate::browser::engine::TabId) -> Option<&mut StoredTab> {
         self.stored.iter_mut().find(|t| t.id == id)
@@ -244,6 +261,9 @@ impl BrowserPanel {
     /// loaded.
     pub fn stash_live(&mut self) {
         let page = std::mem::take(&mut self.page);
+        // `take` leaves a default page behind; give its cursor the live
+        // bounds in case the caller has not installed the replacement yet.
+        self.sync_live_cursor();
         let id = self.active_tab;
         if let Some(slot) = self.stored.iter_mut().find(|t| t.id == id) {
             slot.page = page;
@@ -271,6 +291,7 @@ impl BrowserPanel {
             return false;
         };
         std::mem::swap(&mut self.page, &mut self.stored[pos].page);
+        self.sync_live_cursor();
         self.stored[pos].id = self.active_tab;
         self.active_tab = id;
         true
@@ -335,9 +356,7 @@ impl BrowserPanel {
         use crate::browser::cursor::{FocusKind, Focusable};
         // The header and cursor share the live page size; keep the cursor
         // bounds in step even if only the chrome map is being refreshed.
-        self.page
-            .cursor
-            .set_viewport(self.viewport.0, self.viewport.1);
+        self.sync_live_cursor();
         // Natural-width layout is the single source of truth: the rendered
         // header and the pad cursor both use these rects, so the dot can be
         // drawn truthfully in header space.
@@ -384,6 +403,16 @@ impl BrowserPanel {
     /// chrome rather than a page element.
     pub fn chrome_attached(&self) -> Option<ChromeTarget> {
         self.cursor.attached.and_then(|id| self.chrome_target(id))
+    }
+
+    /// Header target under a precise cursor point (page/chrome coordinates).
+    /// Docked clicks use the attachment id; a free precise click in the
+    /// header must still hit the tab/toolbar/bookmark rect it points at.
+    pub fn chrome_target_at(&self, x: f32, y: f32) -> Option<ChromeTarget> {
+        self.chrome
+            .iter()
+            .find(|(_, f)| x >= f.x && x <= f.x + f.w && y >= f.y && y <= f.y + f.h)
+            .map(|(target, _)| *target)
     }
 
     /// Title for a tab id (live or stored): page title, else URL, else home.
@@ -760,7 +789,9 @@ pub fn chrome_layout(panel: &BrowserPanel) -> Vec<ChromeRowLayout> {
     const ICON_W: f32 = 22.0; // 16px favicon + 6px spacing
     const TAB_GAP: f32 = 4.0;
     const TITLE_MIN: f32 = 16.0;
-    const TITLE_MAX: f32 = 140.0;
+    // Give a lone/few tabs real room. The old fixed 140px cap clipped normal
+    // page titles after a handful of characters on wide screens.
+    let title_max = (viewport_w * 0.55).clamp(200.0, 640.0);
     let close_w = text_fit::text_width_px("×", 11.0) + CLOSE_PAD;
     let new_w = text_fit::text_width_px("+", 14.0) + 20.0;
     let mut plans = Vec::with_capacity(panel.order.len());
@@ -775,7 +806,7 @@ pub fn chrome_layout(panel: &BrowserPanel) -> Vec<ChromeRowLayout> {
         } else {
             0.0
         };
-        let title = text_fit::ellipsize_to_width(panel.tab_title(*id), 11.0, TITLE_MAX);
+        let title = text_fit::ellipsize_to_width(panel.tab_title(*id), 11.0, title_max);
         plans.push((*id, text_fit::text_width_px(&title, 11.0), icon_w));
     }
     let count = plans.len();
@@ -818,7 +849,9 @@ pub fn chrome_layout(panel: &BrowserPanel) -> Vec<ChromeRowLayout> {
     let mut x = 0.0;
     for (id, title_w, icon_w) in plans.iter().take(end).skip(start) {
         let title_w = title_w.min(title_budget);
-        let tab_w = TAB_PAD + icon_w + title_w;
+        // A few px of slack so the render-side ellipsis safety margin does not
+        // shave the last character off a title that already fits naturally.
+        let tab_w = TAB_PAD + icon_w + title_w + 6.0;
         strip.push((ChromeTarget::Tab(*id), x, tab_w));
         strip.push((ChromeTarget::TabClose(*id), x + tab_w, close_w));
         x += tab_w + close_w + TAB_GAP;
@@ -921,8 +954,8 @@ pub const CHROME_HEADER_H: f32 = CHROME_ROW_H
     + CHROME_ROW_GAP
     + CHROME_BOOKMARK_H
     + CHROME_ROW_GAP;
-/// Outer breather against the screen edge (~2rem).
-pub const BROWSER_OUTER_MARGIN: f32 = 32.0;
+/// Outer breather against the screen edge: 50px per side (height - 100).
+pub const BROWSER_OUTER_MARGIN: f32 = 50.0;
 /// Card padding around the browser surface.
 pub const BROWSER_CARD_PAD: f32 = 4.0;
 

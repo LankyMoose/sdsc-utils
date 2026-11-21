@@ -547,8 +547,9 @@ impl App {
         self.browser.panel.bookmark_bubble = false;
         self.browser.panel.history_selector = None;
         // Fresh page: cursor back to center; focusables arrive with the
-        // accessibility tree.
-        self.browser.panel.cursor = crate::browser::cursor::Cursor::new();
+        // accessibility tree. Recenter the existing cursor so the live
+        // viewport bounds (not the 800x600 defaults) survive navigation.
+        self.browser.panel.cursor.reset_for_page();
         self.browser.panel.focusables.clear();
         let generation = self.browser.panel.session.begin_load(url.clone());
         self.note_start_activity();
@@ -1093,6 +1094,23 @@ impl App {
             }
             return Task::none();
         }
+        // Precise click inside the header: hit the rect under the point even
+        // without a magnet dock. Empty header space must not fall through to
+        // a page click at negative coordinates.
+        if self.browser.panel.cursor.y < 0.0 {
+            if let Some(target) = self
+                .browser
+                .panel
+                .chrome_target_at(self.browser.panel.cursor.x, self.browser.panel.cursor.y)
+                && let Some(message) = self.browser.panel.chrome_message(target)
+            {
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: browser precise chrome activate {target:?}"
+                ));
+                return self.on_browser_message(message);
+            }
+            return Task::none();
+        }
         let (x, y, target) = {
             let panel = &self.browser.panel;
             let targets = crate::ui::browser::cursor_targets(&panel.focusables, &panel.chrome);
@@ -1298,7 +1316,7 @@ impl App {
         {
             let panel = &mut self.browser.panel;
             panel.stash_live();
-            panel.page = crate::ui::browser::BrowserTabPage::default();
+            panel.reset_live_page();
             panel.page.session.open_surface();
             panel.page.session.set_frame_slot(slot);
             panel.page.action_hint = Some(("New tab…".to_string(), std::time::Instant::now()));
@@ -1379,7 +1397,7 @@ impl App {
         let url = crate::browser::BROWSER_HOME_URL.to_string();
         let (generation, frame) = {
             let panel = &mut self.browser.panel;
-            panel.page = crate::ui::browser::BrowserTabPage::default();
+            panel.reset_live_page();
             panel.page.session.open_surface();
             panel.active_tab = tab;
             panel.order.push(tab);
@@ -1438,7 +1456,7 @@ impl App {
                 panel.stored.clear();
                 panel.order.clear();
                 panel.active_tab = TabId::BOOT;
-                panel.page = crate::ui::browser::BrowserTabPage::default();
+                panel.reset_live_page();
                 panel.page.session.open_surface();
                 let generation = panel
                     .page
@@ -1489,7 +1507,7 @@ impl App {
             for (pos, saved_tab) in tabs.drain(..).enumerate() {
                 if pos == active_pos {
                     panel.active_tab = TabId::BOOT;
-                    panel.page = crate::ui::browser::BrowserTabPage::default();
+                    panel.reset_live_page();
                     panel.page.session.open_surface();
                     let generation = panel.page.session.begin_load(saved_tab.url.clone());
                     if !saved_tab.title.is_empty() {
@@ -1551,7 +1569,7 @@ impl App {
         let (tab, generation, frame) = {
             let panel = &mut self.browser.panel;
             panel.stash_live();
-            panel.page = crate::ui::browser::BrowserTabPage::default();
+            panel.reset_live_page();
             panel.page.session.open_surface();
             let tab = crate::browser::engine::TabId(panel.next_tab_id);
             panel.next_tab_id = panel.next_tab_id.wrapping_add(1).max(2);

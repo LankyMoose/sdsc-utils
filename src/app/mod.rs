@@ -174,8 +174,11 @@ pub enum Message {
     BrowserFrame,
     /// Optional BrowserEngine install/download finished.
     EngineInstallDone(Result<std::path::PathBuf, String>),
-    /// Browser window's actual logical size (post-create/resize).
-    BrowserWindowSized(iced::Size),
+    /// A window resized (logical size). Only the browser window consumes
+    /// this. The event is authoritative; iced's `size()` query can return the
+    /// pre-fullscreen default (observed 1440x789 on a 1920x1080 window), so
+    /// the browser does not trust a one-shot query at creation.
+    BrowserWindowSized(window::Id, iced::Size),
     /// PS hub window opened (focus it once the renderer exists).
     HubOpened(window::Id),
     /// Hub selection / activation from pad, keyboard, or mouse.
@@ -321,7 +324,7 @@ impl Message {
             | Message::StartFrame
             | Message::BrowserFrame
             | Message::EngineInstallDone(_)
-            | Message::BrowserWindowSized(_)
+            | Message::BrowserWindowSized(_, _)
             | Message::StartArtEvent(_) => false,
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
@@ -1230,6 +1233,8 @@ impl App {
             .map(|_| Message::Tick),
         );
         subscriptions.push(Subscription::run(tray_events_mapped));
+        subscriptions
+            .push(window::resize_events().map(|(id, size)| Message::BrowserWindowSized(id, size)));
         // OS device arrival/removal wake (event-driven; the Tick timer above
         // is only a backstop). Always subscribed like tray events: the stream
         // owns its watcher registration for the process lifetime.
@@ -1387,9 +1392,9 @@ impl App {
         }
 
         if Some(window) == self.browser_window {
-            let cover = self.browser_monitor_cover;
-            let (w, h) = cover
-                .map(|c| (c.width, c.height))
+            let (w, h) = self
+                .browser_window_size
+                .or_else(|| self.browser_monitor_cover.map(|c| (c.width, c.height)))
                 .unwrap_or((1920.0, 1080.0));
             return crate::ui::browser::view::root_view(
                 &self.browser.panel,
@@ -1607,7 +1612,13 @@ impl App {
             Message::Browser(message) => self.on_browser_message(message),
             Message::BrowserFrame => self.on_browser_frame(),
             Message::EngineInstallDone(result) => self.on_engine_install_done(result),
-            Message::BrowserWindowSized(size) => self.on_browser_window_sized(size),
+            Message::BrowserWindowSized(id, size) => {
+                if self.browser_window == Some(id) {
+                    self.on_browser_window_sized(size)
+                } else {
+                    Task::none()
+                }
+            }
             Message::HubOpened(id) => self.on_hub_opened(id),
             Message::Hub(message) => self.on_hub_message(message),
 
