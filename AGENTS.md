@@ -11,7 +11,6 @@
 | Debug build (every binary) | `cargo build` |
 | Release build | `cargo build --release` |
 | Run (tray + HID + UI, one process) | `cargo run` |
-| Run with CEF OSR backend (dev) | `RUSTFLAGS="-C target-feature=+crt-static" cargo run --no-default-features --features cef-engine` |
 | UI-only check (no engine) | `cargo check --no-default-features` |
 | List connected controllers | `sdsc-utils --list-controllers` |
 
@@ -26,11 +25,10 @@
 ## Branch layout
 
 - `main` — released line.
-- `browser/main` — consolidation point for all Servo-era browser work
+- `browser/main` — consolidation point for the pre-pivot browser work
   (contains the former `browser/multi-app-suspend-spike` / `browser/tabs`).
-- `browser/hub-pivot` — current work: split browser out of Start into a
-  managed app + PS hub, then replace Servo with CEF OSR. Plan:
-  `notes/browser-hub-pivot.md`.
+- `browser/hub-pivot` — current work: managed-app PS hub + standalone
+  Browser window, now on CEF OSR. Plan: `notes/browser-hub-pivot.md`.
 - `backup/pre-split-full` — pre-split snapshot; keep until the pivot merges.
 
 
@@ -65,11 +63,10 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Windows features**: `tray-icon` builds differ per OS — root `Cargo.toml` has `[target.'cfg(windows)'.dependencies]`, `[target.'cfg(target_os = "macos")']`, `[target.'cfg(target_os = "linux")']` sections.
 - **No telemetry**: All data stays local (`prefs.json`, `controllers.json`, `analytics.json`, `app.log`).
 - **Git hooks** (`git config core.hooksPath .githooks`): pre-commit runs `cargo fmt --all` and re-stages staged `.rs` files; pre-push runs `scripts/ci.sh`. Bypass with `--no-verify`.
-- **CI**: GitHub Actions `ci.yml` runs `bash scripts/ci.sh` on push/PR (fmt → clippy → test → build, debug + release), plus an MSRV-floor job (`cargo +1.89 check --locked --all-targets --no-default-features`) enforcing the `rust-version` claim for app code (the default-on Servo engine needs the pinned toolchain). CI also wires `sccache` + `rust-cache` and installs LLVM (bindgen) on the Windows runner.
+- **CI**: GitHub Actions `ci.yml` runs `bash scripts/ci.sh` on push/PR (fmt → clippy → test → build, debug + release), plus an MSRV-floor job (`cargo +1.89 check --locked --all-targets --no-default-features`) enforcing the `rust-version` claim for UI-only app code (CEF needs the pinned toolchain). CI wires `sccache` + `rust-cache` and installs CMake/Ninja for the CEF wrapper.
 - **Toolchain is pinned**: `rust-toolchain.toml` names the exact compiler for local dev (rustup auto-installs it); `ci.yml` pins the same version explicitly via the dtolnay `toolchain:` input (the action defaults to floating `stable`, it does not follow the file). `rust-version` in `Cargo.toml` (1.89) is only the MSRV floor — never float or "sync" the pins to it. Bump deliberately (both pins → run `scripts/ci.sh` → commit) so new-compiler lints surface in the bump commit, not as surprise CI failures.
-- **Stylo thread stack**: `.cargo/config.toml` sets `SERVO_STYLE_THREAD_STACK_SIZE_KB=1024` (applies to every build automatically). Servo's default 512 KiB style threads overflow on real-world restyle storms (typing into Google autocomplete aborts the process). Changing the value needs `cargo clean -p stylo` (at least) — Cargo does not track env changes in fingerprints. Only matters when Servo compiles (default-on; `--no-default-features` skips it).
-- **Engines**: `servo-engine` is the default feature; `cef-engine` is the phase-3 CEF OSR backend, mutually exclusive with Servo, and requires CMake + Ninja plus the static MSVC CRT (`RUSTFLAGS="-C target-feature=+crt-static"`). CEF's binary distribution downloads to `OUT_DIR` (~427 MB; set `CEF_PATH` to share). `--no-default-features` is UI-only (Browser tile shows install state).
-- **Build speed (single exe, engine default-on)**: `servo-engine` is a default feature — plain `cargo run` builds the browser. Dev profile keeps debuginfo minimal (`line-tables-only` for our code, none for deps) because link time dominates; don't raise it. For UI-only iteration use `cargo check` / `cargo run --no-default-features` (reader fallback, no Servo compile). Recommended locally: `sccache` (`cargo install sccache`, `RUSTC_WRAPPER=sccache`) — first build populates, later ones hit. Batch `Cargo.toml`/profile edits: each set invalidates fingerprints once.
+- **Engines**: `cef-engine` is the default feature (CEF OSR). Windows builds use the static MSVC CRT via `.cargo/config.toml` because `libcef_dll_wrapper` is `/MT`. CEF requires CMake + Ninja on `PATH`; its binary distribution downloads to `OUT_DIR` (~427 MB; set `CEF_PATH` to share). `--no-default-features` is the UI-only iteration build (Browser tile shows the engine install state; no reader fallback).
+- **Build speed (single exe, engine default-on)**: `cef-engine` is a default feature — plain `cargo run` builds Chromium OSR. Dev profile keeps debuginfo minimal (`line-tables-only` for our code, none for deps) because link time dominates; don't raise it. For UI-only iteration use `cargo check --no-default-features` (no CEF compile). Recommended locally: `sccache` (`cargo install sccache`, `RUSTC_WRAPPER=sccache`) — first build populates, later ones hit. Batch `Cargo.toml`/profile edits: each set invalidates fingerprints once.
 
 ## Platform-specific notes
 
@@ -84,7 +81,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 | Directory | Typical changes |
 |---|---|
 | `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Start / toast, message routing; `browser.rs` (top-level `BrowserAppState`, standalone Browser window, pad/key/`BrowserMessage` routing), `hub.rs` (`AppHub` installed/active apps + PS hub window lifecycle/input) |
-| `src/browser/` | Browser internals: engine seam + Servo worker (default) + CEF OSR worker (`cef-engine`), DOM target query, controller cursor, tabs/bookmarks, stable frame texture, reader fallback (Servo-era; CEF becomes default in phase 4) |
+| `src/browser/` | Browser internals: engine seam + CEF OSR worker, DOM target query, controller cursor, tabs/bookmarks, stable frame texture; no reader fallback |
 | `src/session/` | Pure device session (no windows/HWND): presence, notify, analytics, Start-open policy; emits `SessionEffect`s the UI applies |
 | `src/controller/` | HID polling + worker (`hid/`), DualSense protocol (`dualsense/`: battery, lightbar, rumble, input, identity), known controllers, debug-only `emulate` emulation |
 | `src/domain/` | Pure logic: battery colors/spectrum math, pad gestures/chords, protocol helpers |
@@ -115,7 +112,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Lightbar spectrum editor (Settings)** → `src/ui/configure/spectrum.rs`, `src/ui/configure/mod.rs`
 - **Theme / shared widget styles** → `src/ui/theme.rs`; restyle plan → `notes/ui-refresh.md`
 - **Start screen / game launcher** → `src/ui/start/` (UI), `src/games/` (Steam scan, launch); behavior → `notes/start-immersive.md`
-- **Browser (Servo era / CEF dev)** → `src/browser/` (engine/DOM/cursor, `cef_backend.rs`) + `src/ui/browser/state.rs` (panel/tabs/chrome) + `src/ui/start/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state); PS hub → `src/ui/hub/` + `src/app/hub.rs`; contracts → `notes/browser-embedding.md`; planned hub/CEF split → `notes/browser-hub-pivot.md`
+- **Browser (CEF)** → `src/browser/` (engine seam, `cef_backend.rs`, DOM/cursor, nav helpers) + `src/ui/browser/state.rs` (panel/tabs/chrome) + `src/ui/start/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state); PS hub → `src/ui/hub/` + `src/app/hub.rs`; contracts → `notes/browser-embedding.md`; planned hub/CEF split → `notes/browser-hub-pivot.md`
 - **Toasts** → `src/ui/toast/` (state machine in `machine.rs`); z-order / remount → `notes/windows-toast.md`
 - **Persisted state (prefs/controllers/analytics)** → `src/persist/`
 - **Single instance, tray lifecycle, crash-restart** → `src/bin/sdsc-utils.rs`, `src/platform/crash_restart.rs`

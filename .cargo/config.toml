@@ -1,16 +1,12 @@
-# Cargo-local environment (checked in; applies to every local and CI build).
-#
-# Stylo sizes its style-thread stacks from this at *compile time*
-# (`option_env!` in stylo's `parallel.rs`), so bumping it requires a rebuild
-# of the stylo subtree — plain `cargo build` will NOT pick up a change here
-# on its own (force with `cargo clean -p stylo style style-traits` or a full
-# `cargo clean` if a stack overflow persists after editing this).
-#
-# Servo's crates.io default is 512 KiB per style thread, which overflows on
-# real-world restyle storms (e.g. typing into Google's autocomplete box
-# aborts the whole process with "StyleThread has overflowed its stack").
-# 1024 matches the platform default thread stack; committed pages stay small
-# because the extra is address-space reserve, not committed memory (see the
-# STACK_SAFETY_MARGIN discussion in stylo's `parallel.rs`).
-[env]
-SERVO_STYLE_THREAD_STACK_SIZE_KB = "1024"
+# Cargo-local configuration (checked in; applies to every local and CI build).
+
+# CEF's `libcef_dll_wrapper` is compiled with the static MSVC runtime (/MT),
+# and CEF's process sandbox requires /MT as well. Rust's MSVC default is the
+# dynamic CRT (/MD), which produces LNK2038/LNK2005 at the final link. Use the
+# static CRT for every Windows target so the wrapper, our C++/Rust code, and
+# CEF's own binaries agree.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

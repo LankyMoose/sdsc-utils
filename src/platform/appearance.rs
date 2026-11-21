@@ -1,7 +1,7 @@
 //! OS appearance for the in-Start browser (`prefers-color-scheme`).
 //!
 //! Windows reads the personalize key directly. Other platforms return
-//! `None` (leave Servo's default alone) until they grow a native readout.
+//! `None` (leave Chromium's default alone) until they grow a native readout.
 
 /// True when the OS is in dark mode, `None` when unknown.
 pub fn system_dark_mode() -> Option<bool> {

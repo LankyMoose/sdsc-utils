@@ -207,7 +207,7 @@ pub enum Message {
     /// Single-flight art worker milestone (selected / near / job done).
     StartArtEvent(crate::ui::start::art_worker::ArtEvent),
     Start(StartMessage),
-    /// Servo engine worker event (frame / title / URL / load). System-class:
+    /// CEF engine worker event (title / URL / load / DOM). System-class:
     /// frames flow continuously while visible and must not count as user
     /// activity (or idle-dim and cursor-hide would never fire).
     BrowserEngine(EngineEvent),
@@ -687,11 +687,8 @@ const EMULATOR_COMMIT_POLL: Duration = Duration::from_millis(100);
 /// in for every non-release build, so a plain `cargo run` already has it — no
 /// flag needed. Release builds drop it at compile time.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // NOTE: no wgpu/Vulkan init may happen before `App::boot` returns: the
-    // engine worker must create its WGL context first (NVIDIA driver
-    // segfaults worker-thread GL creation once its Vulkan ICD is up — see
-    // `servo_backend::spawn_engine`). `log_adapters_at_boot` creates a wgpu
-    // Instance, so it runs at the end of `boot`, after the engine barrier.
+    // Adapter logging creates a wgpu Instance; it runs at the end of `boot`
+    // so CEF initialization and the persistent profile are in place first.
 
     // Boot-only renderer prefs: iced `Settings` cannot flip at runtime, so the
     // app reads them before the daemon builds. `App::boot` re-loads the same
@@ -787,8 +784,8 @@ impl App {
             initial_page_h.round().max(1.0) as u32,
         );
         // A crash-restart successor must not re-open the page that killed
-        // Servo (the restored active tab is the one that was loading).
-        // Boot home; saved tabs stay stored for a manual switch.
+        // CEF can crash on a hostile page too. Boot home; saved tabs stay
+        // stored for a manual switch.
         let crash_restart_boot = crate::platform::crash_restart::has_pending_notice()
             || crate::platform::crash_restart::recent_crash()
             || crate::platform::crash_restart::take_panic_flag();
@@ -799,14 +796,9 @@ impl App {
         };
         #[cfg(feature = "cef-engine")]
         let browser_engine = crate::browser::cef_backend::spawn_engine(&boot_url, initial_page);
-        #[cfg(all(not(feature = "cef-engine"), feature = "servo-engine"))]
-        let browser_engine = if std::env::var("SDSC_NO_ENGINE").is_ok() {
-            None
-        } else {
-            crate::browser::servo_backend::spawn_engine(&boot_url, initial_page)
-        };
-        #[cfg(not(any(feature = "cef-engine", feature = "servo-engine")))]
+        #[cfg(not(feature = "cef-engine"))]
         let browser_engine: Option<EngineHandle> = {
+            // UI-only iteration build: no engine, no reader fallback.
             let _ = (&boot_url, initial_page);
             None
         };
@@ -1041,11 +1033,8 @@ impl App {
                 }),
             ]);
         }
-        // wgpu/Vulkan must stay down until the engine worker created its GL
-        // context (see `run` + `servo_backend::spawn_engine`): adapter
-        // logging creates a wgpu Instance, so it runs here, after the engine
-        // barrier in the struct literal above, but still before iced boots
-        // any window.
+        // Adapter logging creates a wgpu Instance; run it after the engine
+        // is initialized but before iced boots any window.
         crate::platform::wgpu_diag::log_adapters_at_boot();
         (app, task)
     }
@@ -1279,8 +1268,8 @@ impl App {
             ));
         }
 
-        // Servo engine worker → UI event bridge (only with the feature; the
-        // worker idles suspended until the browser surface resumes it).
+        // CEF engine worker → UI event bridge. The worker stays suspended
+        // until the Browser window is visible.
         if let Some(engine) = self.browser.engine.clone() {
             subscriptions.push(Subscription::run_with(engine, engine_event_stream));
         }
@@ -2240,41 +2229,14 @@ impl App {
         // teardown also clears).
         self.input_hub.clear();
         self.hid_worker.shutdown();
-        // Clean engine shutdown FIRST: the worker breaks its loop, drops
-        // Servo (which spins synchronously to ShutdownComplete, flushing
-        // cookie_jar.json + auth/hsts to disk), then acks. The wait is
-        // bounded — a hung constellation must not hang quit forever (on
-        // timeout the process exits as before, cookies lost).
+        // Close CEF browsers and let the worker ack. Bounded: a wedged
+        // engine must not hang quit. Profile state is flushed continuously
+        // by CEF; process exit follows immediately.
         if let Some(engine) = &self.browser.engine {
-            // Flush proof: stat the jar before and after. A completed
-            // shutdown that doesn't move the file means the resource thread
-            // skipped its write (config) rather than us racing the exit.
-            let jar_path = crate::persist::paths::data_dir()
-                .join("servo")
-                .join("cookie_jar.json");
-            let jar_stat = || {
-                std::fs::metadata(&jar_path)
-                    .map(|m| (m.len(), m.modified().ok()))
-                    .map_err(|e| e.to_string())
-            };
-            // Surface state rides along: tests whether quit-time suspension
-            // correlates with missed flushes (the in-app shutdown with the
-            // surface open flushed fine).
-            let surface_open = self.browser.panel.session.is_open();
-            crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: cookie jar before shutdown: {:?} {:?} surface_open={surface_open}",
-                jar_path,
-                jar_stat()
-            ));
             let (tx, rx) = std::sync::mpsc::channel();
             engine.send(EngineCommand::Shutdown { done: tx });
-            if rx.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
+            if rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
                 crate::controller::hid::diag::diag_info("ui-diag: engine shutdown timeout");
-            } else {
-                crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: cookie jar after shutdown: {:?} surface_open={surface_open}",
-                    jar_stat()
-                ));
             }
         }
         self.tray_icon.take();
@@ -2811,7 +2773,7 @@ impl Drop for InputEdgeBindGuard {
     }
 }
 
-/// Servo engine worker → iced event bridge.
+/// CEF engine worker → iced event bridge.
 ///
 /// Two transports merge here (see [`EngineHandle`]): frames conflate to the
 /// latest buffered one (paint output is absolute state, like pad

@@ -32,10 +32,6 @@ pub enum BrowserMessage {
     },
     HistoryPick(usize),
     HistoryCancel,
-    Fetched {
-        generation: u64,
-        result: Result<crate::browser::FetchedPage, String>,
-    },
     OpenExternal,
     Reload,
     Home,
@@ -43,7 +39,6 @@ pub enum BrowserMessage {
     TabNext,
     TabSwitch(crate::browser::engine::TabId),
     TabClose(crate::browser::engine::TabId),
-    ShutdownEngine,
     BookmarkStar,
     BookmarkNameChanged(String),
     BookmarkSave,
@@ -278,18 +273,16 @@ pub fn browser_page_view(
         .height(Length::Fixed(page_h))
         .into();
     }
-    let body_text = if session.error().is_none() && session.has_content() {
-        session.body()
-    } else if !session.loading() && !session.has_content() {
-        if engine_available {
-            "Engine rendering — type a URL and press Go. Pages paint as \
-             pixels here; reader text only appears when the engine is off."
-        } else {
-            "Reader view — type a URL and press Go. (No engine in this \
-             build: use --features servo-engine for rendered pages.)"
+    let body_text = match session.error() {
+        Some(err) => format!("Page couldn't load: {err}"),
+        None if !session.loading() && !session.has_content() => {
+            if engine_available {
+                "Rendering…".to_string()
+            } else {
+                "Browser engine not installed. Install it from the PS hub.".to_string()
+            }
         }
-    } else {
-        ""
+        None => String::new(),
     };
     scrollable(
         text(body_text)

@@ -54,7 +54,7 @@ Current as of 1.7.0 (`assets/screenshots/1.7.0/`; previous sets are kept under `
 
 **Recommended (Windows):** install from the [Microsoft Store](https://apps.microsoft.com/) once the listing is live (search for **SDSC Utils**). Store installs are signed by Microsoft and update automatically through the Store / `winget`.
 
-**Advanced:** portable builds are attached to [GitHub Releases](https://github.com/LankyMoose/sdsc-utils/releases) as a single `sdsc-utils.exe` (tray + HID + UI in one process, no bundled extras). That executable is **not** Authenticode-signed. Browsers and Windows SmartScreen often warn on uncommon unsigned downloads — that is expected. The app checks the release feed for new versions (Settings → System → Version) and notifies once per version, but it never downloads or installs anything itself; download the next release manually when you want it.
+**Advanced:** portable builds are attached to [GitHub Releases](https://github.com/LankyMoose/sdsc-utils/releases) as `sdsc-utils.exe` plus its CEF browser sidecars (`libcef.dll`, resources, locales) in the same download (tray + HID + UI in one process). The executable is **not** Authenticode-signed. Browsers and Windows SmartScreen often warn on uncommon unsigned downloads — that is expected. The app checks the release feed for new versions (Settings → System → Version) and notifies once per version, but it never downloads or installs anything itself; download the next release manually when you want it.
 
 ## Features
 

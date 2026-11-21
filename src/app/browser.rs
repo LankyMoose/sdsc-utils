@@ -14,8 +14,7 @@ use crate::ui::browser::BrowserPanel;
 pub struct BrowserAppState {
     /// Tabs, chrome targets, cursor, bookmarks, and per-tab page state.
     pub panel: BrowserPanel,
-    /// Offscreen engine worker (`servo-engine` today, CEF later). `None` when
-    /// this build/runtime has no engine backend.
+    /// CEF OSR worker. `None` in UI-only builds or when CEF is missing.
     pub engine: Option<EngineHandle>,
     /// Process-static capability: true when an engine worker is live. Drives
     /// the page placeholder copy and, later, the hub tile install state.
@@ -58,9 +57,6 @@ impl super::App {
             BrowserMessage::HistoryOpen { back } => self.on_browser_history_open(back),
             BrowserMessage::HistoryPick(index) => self.on_browser_history_pick(index),
             BrowserMessage::HistoryCancel => self.on_browser_history_cancel(),
-            BrowserMessage::Fetched { generation, result } => {
-                self.on_browser_fetched(generation, result)
-            }
             BrowserMessage::OpenExternal => self.on_browser_open_external(),
             BrowserMessage::Reload => self.on_browser_reload(),
             BrowserMessage::Home => self.on_browser_go_home(),
@@ -68,7 +64,6 @@ impl super::App {
             BrowserMessage::TabNext => self.on_browser_tab_next(),
             BrowserMessage::TabSwitch(id) => self.on_browser_tab_switch(id),
             BrowserMessage::TabClose(id) => self.on_browser_tab_close(id),
-            BrowserMessage::ShutdownEngine => self.on_browser_shutdown_engine(),
             BrowserMessage::BookmarkStar => self.on_browser_bookmark_star(),
             BrowserMessage::BookmarkNameChanged(draft) => {
                 self.browser.panel.bookmark_name_draft = draft;
@@ -98,6 +93,12 @@ impl super::App {
         if self.browser_window.is_some() {
             crate::controller::hid::diag::diag_info(
                 "ui-diag: browser open skipped (window still closing)",
+            );
+            return Task::none();
+        }
+        if self.browser.engine.is_none() {
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: browser open skipped (engine not installed)",
             );
             return Task::none();
         }

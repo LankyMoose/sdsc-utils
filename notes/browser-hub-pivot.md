@@ -1,9 +1,9 @@
 # Browser hub pivot — managed apps + CEF engine (planned)
 
 **Status:** in progress (branch `browser/hub-pivot`, based on `browser/main`).
-Phases 0–3 landed: state extraction, PS hub + auto-open, the standalone
-Browser window, and the CEF OSR backend. Phase 4 (delete Servo, flip the
-default engine) is next.
+Phases 0–4 landed: state extraction, PS hub + auto-open, the standalone
+Browser window, the CEF OSR backend, and the Servo/reader deletion with CEF
+as the default engine. Phase 5 (DLC packaging/install + catalog) is next.
 **When to read:** before touching Start/browser window ownership, the PS
 overlay, app selection, the engine backend, or MSIX packaging.
 
@@ -123,9 +123,14 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    popups (`window.open`/`target=_blank`) are denied; favicons and
    `HistoryChanged` are not emitted yet. Engine-presence/DLC install remains
    phase 5.
-4. **Delete Servo + reader**, flip to CEF in the same landing (never ship a
-   dead-browser main). Docs, `AGENTS.md`, CI/MSRV/toolchain updates included;
-   keep the toolchain pin for one release, then unpin.
+4. **Delete Servo + reader, flip to CEF. — landed.** `servo_backend.rs`,
+   the `servo-engine` feature/deps, `declare_surfman!`, Stylo stack env,
+   Clang/Python build steps, `SDSC_NO_ENGINE`, and `fetch.rs` are gone;
+   `normalize_url`/`resolve_navigate_target` live in `browser/nav.rs`. CEF is
+   the default feature; `.cargo/config.toml` sets the static MSVC CRT for
+   Windows; `--no-default-features` is UI-only. The Browser tile/install
+   placeholder handles a missing engine (no reader page). CI now installs
+   CMake/Ninja instead of LLVM.
 5. **DLC install + catalog.** Main MSIX stays lean; `BrowserEngine` optional
    package (all CEF files, one package) in a **related set** (mandatory for
    executable code). `pack-msix.ps1` grows bundle/mapping support. Store:
@@ -140,24 +145,16 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    main+optional resubmission (related-set lockstep) — the core
    Store-vs-self-managed tradeoff.
 
-## CEF dev build (phase 3)
+## CEF build (default)
 
 Prerequisites (Windows): CMake + Ninja on `PATH` (winget
-`Kitware.CMake`, `Ninja-build.Ninja`); LLVM/Clang is only needed by Servo.
-CEF's binary distribution (~427 MB) is downloaded by `cef-dll-sys` into
-`OUT_DIR` on first build; set `CEF_PATH` to share it across build dirs.
+`Kitware.CMake`, `Ninja-build.Ninja`). CEF's binary distribution (~427 MB)
+downloads into `OUT_DIR` on first build; set `CEF_PATH` to share it.
 
 ```bash
-# CEF backend (Servo off). Static CRT matches libcef_dll_wrapper's /MT.
-RUSTFLAGS="-C target-feature=+crt-static"   cargo run --no-default-features --features cef-engine
-
-# UI-only (no engine; Browser tile shows install state)
-cargo check --no-default-features
+cargo run                         # CEF OSR, static CRT from .cargo/config.toml
+cargo check --no-default-features # UI-only; Browser tile shows install state
 ```
-
-`cef-engine` + `servo-engine` are mutually exclusive (clear compile error):
-the two wrappers disagree on the MSVC runtime. Phase 4 removes Servo and
-makes static CRT the Windows default.
 
 ## Open verifications (before committing to Phase 4)
 
@@ -170,7 +167,7 @@ makes static CRT the Windows default.
   traces unchanged, no per-frame handle churn.
 - Cloudflare-blocked sites pass; `cf_clearance` persists per profile.
   **Status:** CEF renders the interactive challenge (`nowsecure.nl`) where
-  Servo never did; solving it with a pad click is the remaining check.
+  Servo never did; solving it with a pad click is the remaining manual check.
 - Manual matrix: taskbar/Alt-Tab, toast-over-app, auto-open borderless vs
   exclusive-fullscreen, hub→app focus transfer, game-over-hub input
   coexistence.

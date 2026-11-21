@@ -1,6 +1,6 @@
 //! CEF offscreen-rendering backend (pivot phase 3).
 //!
-//! Mirrors the Servo worker's contract: one worker thread owns the engine,
+//! One worker thread owns the engine,
 //! commands arrive over `EngineHandle`'s channel, and events/frames come back
 //! through the same sinks. CEF's multi-threaded message loop (Windows) proxies
 //! browser-host calls from this thread.
@@ -14,11 +14,6 @@
 //! bridge sends `dom_query_js` to the renderer, evaluates it in the frame's V8
 //! context, and posts the JSON result back. The browser process parses it with
 //! serde_json.
-
-#[cfg(feature = "servo-engine")]
-compile_error!(
-    "cef-engine is mutually exclusive with servo-engine until phase 4 removes Servo;      build with `--no-default-features --features cef-engine`"
-);
 
 use crate::browser::cursor::{FocusKind, Focusable};
 use crate::browser::dom;
@@ -1136,7 +1131,7 @@ impl Worker {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let center = (center.0 > 0.0 || center.1 > 0.0).then_some(center);
-        let js = dom::dom_query_js_json(center, entry.dom_epoch);
+        let js = dom::dom_query_js(center, entry.dom_epoch);
         let Some(mut msg) = process_message_create(Some(&DOM_QUERY_MSG.into())) else {
             return;
         };

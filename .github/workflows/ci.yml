@@ -27,14 +27,12 @@ jobs:
           toolchain: 1.99.1
           components: rustfmt, clippy
 
-      - name: Install Servo build prerequisites (Clang; Python is preinstalled)
+      - name: Install CEF build prerequisites (CMake + Ninja)
         shell: bash
         run: |
-          choco install llvm --no-progress -y
-          echo "LIBCLANG_PATH=C:/Program Files/LLVM/bin" >> "$GITHUB_ENV"
-          # Stylo codegen wants `python.exe` on PATH or PYTHON3; pin it so a
-          # PATH surprise fails here instead of inside the Servo build.
-          echo "PYTHON3=$(cygpath -w "$(which python)")" >> "$GITHUB_ENV"
+          cmake --version
+          ninja --version || choco install ninja --no-progress -y
+          # Static CRT comes from .cargo/config.toml; libcef_dll_wrapper is /MT.
 
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.11
@@ -61,10 +59,10 @@ jobs:
         with:
           # Must track `rust-version` in Cargo.toml. Only a compile check:
           # it enforces the floor claim against the exact committed
-          # dependency set, nothing more. Scoped to `--no-default-features`:
-          # the default-on Servo engine needs the pinned toolchain.
+          # dependency set, nothing more. Scoped to `--no-default-features`
+          # (UI-only; CEF needs the pinned toolchain).
           toolchain: 1.89
 
-      - name: Check MSRV floor (app code only; the default-on engine needs a newer rustc)
+      - name: Check MSRV floor (UI-only app code; CEF needs the pinned toolchain)
         shell: bash
         run: cargo +1.89 check --locked --all-targets --no-default-features

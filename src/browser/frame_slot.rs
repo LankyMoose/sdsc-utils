@@ -1,6 +1,6 @@
 //! CPU-side latest engine frame, shared with the stable-texture renderer.
 //!
-//! The old path minted a fresh `iced::image::Handle` for every Servo frame.
+//! The old path minted a fresh `iced::image::Handle` for every engine frame.
 //! Each handle is a new atlas id by construction, so iced paid a full atlas
 //! allocation + upload + eviction per frame; at wide viewports the raster
 //! worker could not finish before the next handle replaced it and the page

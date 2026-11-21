@@ -1,4 +1,4 @@
-//! iced → Servo keyboard mapping for the Browser app.
+//! iced → engine keyboard mapping for the Browser app.
 //!
 //! Pure functions (unit-tested): the subscription captures raw iced key
 //! events, the shell decides page-vs-URL routing, and only mapped events
@@ -23,7 +23,7 @@ pub struct RawKey {
     pub repeat: bool,
 }
 
-/// Map a raw key into a Servo keyboard event. `pressed` selects
+/// Map a raw key into an engine keyboard event. `pressed` selects
 /// down/up; `repeat` passes through for held keys.
 pub fn map_event(raw: &RawKey) -> keyboard_types::KeyboardEvent {
     keyboard_types::KeyboardEvent {

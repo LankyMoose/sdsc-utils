@@ -1,12 +1,11 @@
-//! Controller-first browser internals: engine seam, DOM target query, cursor
-//! physics, frame slots, tabs/bookmarks, and the reader fallback.
+//! Controller-first browser internals: engine seam, CEF OSR worker, DOM
+//! target query, cursor physics, frame slots, tabs/bookmarks, and URL helpers.
 //!
 //! Decision record (Nov 2026): the browser renders open web with no DRM
-//! requirement, so the current backend is Servo offscreen composited as an
-//! iced texture. A `wry`/WebView2 child HWND was rejected (native child draws
+//! requirement, so the backend is CEF offscreen composited as an iced
+//! texture. A `wry`/WebView2 child HWND was rejected (native child draws
 //! above the iced/wgpu canvas, breaking toasts, idle/sleep veils, and overlay
-//! surfaces). Cloudflare bot protection is the Servo ceiling; CEF OSR replaces
-//! it (see `notes/browser-hub-pivot.md`).
+//! surfaces). Chromium's real TLS/JS is why CEF replaced Servo.
 //!
 //! App lifecycle (which app is foreground) lives in [`crate::app::hub`], not
 //! here. This module is engine/runtime plumbing plus pure protocol types.
@@ -17,21 +16,10 @@ pub mod cef_backend;
 pub mod cursor;
 pub mod dom;
 pub mod engine;
-pub mod fetch;
 pub mod frame_slot;
 pub mod keys;
-#[cfg(feature = "servo-engine")]
-pub mod servo_backend;
+pub mod nav;
 pub mod tabs;
-
-/// A fetched reader page: the URL that was actually loaded plus the
-/// extracted title and body text.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FetchedPage {
-    pub url: String,
-    pub title: Option<String>,
-    pub body: String,
-}
 
 /// One remembered navigation for omnibox autocomplete: URL plus the title
 /// at visit time. In-memory only (session scope, never persisted).
@@ -74,7 +62,6 @@ pub struct BrowserSession {
     open: bool,
     url: String,
     title: Option<String>,
-    body: String,
     loading: bool,
     generation: u64,
     error: Option<String>,
@@ -89,7 +76,7 @@ pub struct BrowserSession {
     /// is MRU-deduped for autocomplete): the session keeps revisit
     /// duplicates and order so back/forward targets are exact. Fed two
     /// ways — locally on every load/URL change (reader fallback) and
-    /// overwritten by the engine's canonical `HistoryChanged` (Servo
+    /// overwritten by the engine's canonical `HistoryChanged` (
     /// `notify_history_changed` entries + current) when present.
     nav_stack: Vec<HistoryEntry>,
     nav_index: Option<usize>,
@@ -134,7 +121,6 @@ impl BrowserSession {
     pub fn begin_load(&mut self, url: String) -> u64 {
         self.url = url.clone();
         self.title = None;
-        self.body.clear();
         self.error = None;
         self.frame.clear();
         self.loading = true;
@@ -143,20 +129,6 @@ impl BrowserSession {
         self.record_visit(url.clone());
         self.push_nav(url);
         self.generation
-    }
-
-    /// Apply a worker result. Returns false (ignored) when the generation
-    /// no longer matches — the load was suspended or superseded.
-    pub fn apply_fetched(&mut self, generation: u64, page: FetchedPage) -> bool {
-        if generation != self.generation {
-            return false;
-        }
-        self.loading = false;
-        self.url = page.url;
-        self.title = page.title;
-        self.body = page.body;
-        self.error = None;
-        true
     }
 
     pub fn apply_failed(&mut self, generation: u64, error: String) -> bool {
@@ -176,10 +148,6 @@ impl BrowserSession {
         self.title.as_deref()
     }
 
-    pub fn body(&self) -> &str {
-        &self.body
-    }
-
     pub fn loading(&self) -> bool {
         self.loading
     }
@@ -192,10 +160,9 @@ impl BrowserSession {
         self.generation
     }
 
-    /// True once a page (or a load error) is on screen — reader text, an
-    /// engine frame, or an error alike.
+    /// True once a page (or a load error) is on screen.
     pub fn has_content(&self) -> bool {
-        !self.body.is_empty() || self.error.is_some() || self.frame.has_frame()
+        self.error.is_some() || self.frame.has_frame()
     }
 
     /// Engine path: install the latest RGBA frame. `FrameSlot::write`
@@ -322,7 +289,7 @@ impl BrowserSession {
     }
 
     /// Overwrite the session stack with the engine's canonical history
-    /// (Servo `notify_history_changed` entries + current). Titles are
+    /// (engine-provided entries + current). Titles are
     /// preserved where the URL matches the previous stack; anything new
     /// starts untitled until its `TitleChanged` lands.
     pub fn note_session_history(&mut self, entries: Vec<String>, current: usize) {
@@ -524,43 +491,17 @@ mod tests {
         assert!(s.suggestions("zzz").is_empty());
     }
 
-    fn page(url: &str) -> FetchedPage {
-        FetchedPage {
-            url: url.to_string(),
-            title: Some("T".to_string()),
-            body: "body".to_string(),
-        }
-    }
-
-    #[test]
-    fn session_applies_matching_generation_only() {
-        let mut s = BrowserSession::default();
-        s.open_surface();
-        let generation = s.begin_load("https://example.com".to_string());
-        assert!(s.loading());
-        // Stale worker result (superseded load) is ignored.
-        assert!(!s.apply_fetched(generation.wrapping_add(1), page("https://stale.test")));
-        assert!(s.loading());
-        assert!(s.apply_fetched(generation, page("https://example.com")));
-        assert!(!s.loading());
-        assert_eq!(s.body(), "body");
-        assert!(s.has_content());
-    }
-
     #[test]
     fn session_close_cancels_in_flight_but_keeps_url() {
         let mut s = BrowserSession::default();
         s.open_surface();
-        let generation = s.begin_load("https://example.com".to_string());
-        assert!(s.apply_fetched(generation, page("https://example.com")));
-        // Suspend mid-load of page 2: late result ignored, target URL kept,
-        // loader parked — reopen resumes from a coherent idle state.
-        let generation2 = s.begin_load("https://example.com/2".to_string());
-        let _ = generation2;
+        let _ = s.begin_load("https://example.com".to_string());
+        // Suspend mid-load of page 2: the target URL is kept so reopening
+        // lands on the user's intent; the engine has no in-flight load.
+        let _ = s.begin_load("https://example.com/2".to_string());
         s.close_surface();
         assert!(!s.is_open());
         assert!(!s.loading());
-        assert!(!s.apply_fetched(generation2, page("https://example.com/2")));
         assert_eq!(s.url(), "https://example.com/2");
     }
 

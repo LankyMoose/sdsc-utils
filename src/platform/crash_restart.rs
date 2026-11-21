@@ -146,7 +146,7 @@ pub fn has_pending_notice() -> bool {
 /// True when this process is starting inside the crash-restart window —
 /// either a pending notice or a recent budget attempt. Used for safe-mode
 /// boot so a manually relaunched app does not re-open the page that just
-/// killed Servo after the toast flag has been consumed.
+/// killed CEF after the toast flag has been consumed.
 pub fn recent_crash() -> bool {
     let now = epoch_secs();
     let cutoff = now.saturating_sub(BUDGET_WINDOW_SECS);

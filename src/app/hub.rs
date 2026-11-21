@@ -305,6 +305,14 @@ impl App {
                 }
             }
             hub_view::HubTile::Browser => {
+                if self.browser.engine.is_none() {
+                    // Phase 5 owns the install flow; keep the hub open so the
+                    // inline install state is not dismissed into a dead end.
+                    crate::controller::hid::diag::diag_info(
+                        "ui-diag: hub Browser requested but engine not installed",
+                    );
+                    return Task::none();
+                }
                 crate::controller::hid::diag::diag_info("ui-diag: hub launch Browser");
                 self.close_hub().chain(self.open_browser_window())
             }

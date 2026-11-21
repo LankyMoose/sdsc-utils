@@ -1,215 +1,18 @@
-//! DOM target source for snap targets (`servo-engine` only).
+//! DOM target query for the CEF OSR backend.
 //!
-//! Servo's accessibility tree withholds real controls (form elements,
-//! `div[role=button]`, virtualized items) and freezes rects, so the live
-//! DOM is the sole target source instead. This module queries the page
-//! directly for actionable elements and their boxes:
-//! - the page is the ground truth for *existence* (re-renders funnel into
-//!   the DOM, no removal-record bookkeeping needed),
-//! - [`getBoundingClientRect`] forces real boxes every poll.
+//! CEF polls the live DOM from the page's V8 context through the renderer
+//! process message bridge (see `cef_backend.rs`). The query returns a stable
+//! per-document id, viewport-space boxes, visibility verdicts, overflow
+//! clipping, scroll truth and document extents; Rust parses it as JSON.
 //!
-//! The backend polls this on load settle, scroll settle, input, and a slow
-//! backstop. Polling, not pushing: the DOM cannot notify us, so we re-query
-//! on every event that typically mutates it.
+//! Polling is deliberate: the DOM cannot notify us without a network ping or
+//! a renderer-side observer bridge, and the 350ms CEF cadence plus reseed on
+//! D-pad jumps keeps targets fresh without per-mutation traffic.
 
 use crate::browser::cursor::FocusKind;
 
-/// Viewport-space snap candidate straight from the DOM.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DomRaw {
-    pub id: u64,
-    pub tag: String,
-    pub role: String,
-    pub typ: String,
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
-    pub text: String,
-    /// Resolved link target (`href`, absolute, capped; empty when none).
-    pub url: String,
-    /// Carries the `autofocus` attribute (ground truth for traces).
-    pub autofocus: bool,
-}
-
-/// Marker shared by the dirty-ping channels (B=fetch, C=sendBeacon).
-/// Rust matches resource-load URLs by substring, so the ping URL below
-/// embeds it verbatim.
-pub const DOM_DIRTY_MARKER: &str = "__SDSC_DOM_DIRTY";
-
-/// Ping endpoint for the network channels (B=fetch, C=sendBeacon), with the
-/// channel encoded as `?ch=`. Plain `http` (not a custom scheme) so the load
-/// reaches `load_web_resource`, where the backend intercepts it with an
-/// empty 200 before any traffic leaves the machine. `.invalid` can never
-/// resolve if one ever leaks past the intercept.
-pub const DOM_PING_URL: &str = "http://sdsc.invalid/__SDSC_DOM_DIRTY";
-
-/// Observer install script (idempotent per document). Attaches a
-/// MutationObserver (subtree: childList, attributes, characterData) plus a
-/// ResizeObserver on `body` (image/font loads shift layout with no DOM
-/// mutation), with in-page leading+trailing debounce so animation-heavy
-/// pages collapse 60fps mutation storms to ~2 pings/s. Every ping POSTs to
-/// the marker URL; the backend intercepts it into one dirty flag.
-pub const DOM_INSTALL_JS: &str = r###"(function(){
-  // Top document only. UserContentManager auto-installs this in every
-  // frame; subframe documents can be transient and Servo's script/layout
-  // state is unstable during iframe load/teardown. Never attach our
-  // observers or geometry reads there.
-  try { if (window.top !== window.self) return; } catch (e) { return; }
-  var S = window.__sdsc_ax;
-  if (!S) { S = window.__sdsc_ax = { next: 1, ids: new WeakMap() }; }
-  if (S.mo) return;
-  S.mo = true;
-  // Document identity: a real reload gets a fresh window and therefore a
-  // new token; a same-document head re-parse (Servo can re-report load
-  // status when the page injects head resources) keeps it. The backend
-  // uses this to tell a spurious `Complete` from an actual document swap.
-  if (!S.doc) { S.doc = Date.now().toString(36) + '.' + Math.random().toString(36).slice(2); }
-  // Visibility-verdict cache bookkeeping (populated by the query): every
-  // element with a cached verdict, plus every ancestor of one. A style/
-  // class mutation only invalidates the mutated element and its cached
-  // descendants, so unrelated class churn (Google's sticky header) no
-  // longer resets the whole cache and forces a 1s ancestor re-walk.
-  if (!S.visSet) { S.visSet = (typeof Set !== "undefined") ? new Set() : null; }
-  if (!S.visAnc) { S.visAnc = (typeof Set !== "undefined") ? new Set() : null; }
-  // Numeric id → element map, rebuilt by every snapshot query (so detached
-  // nodes release instead of leaking). Powers `__sdsc_click`: exact-element
-  // activation without hit-test staleness.
-  if (!S.byId) { S.byId = {}; }
-  window.__sdsc_click = window.__sdsc_click || function(id) {
-    try {
-      var el = S.byId[id];
-      if (!el) return 'missing';
-      el.click();
-      return 'ok';
-    } catch (e) { return 'threw:' + (e && e.message ? e.message : e); }
-  };
-  var PING = 'http://sdsc.invalid/__SDSC_DOM_DIRTY';
-  var lastPing = 0, trailing = null, pendingEv = null;
-  var SUPPRESS = 500, TRAIL = 250;
-  function fire(src){
-    lastPing = Date.now();
-    // Window truth rides along: a nested-container scroll moves only that
-    // container's children, so the global offset must not absorb it — the
-    // backend corrects to these coordinates on arrival instead of
-    // mis-translating every outline until the next settle pull.
-    // `src` tells the backend what mutated: scroll-only pings carry no DOM
-    // changes, so cached per-element verdicts stay valid across them.
-    var wx = 0, wy = 0;
-    try { wx = Math.round(window.scrollX || window.pageXOffset || 0); wy = Math.round(window.scrollY || window.pageYOffset || 0); } catch (e) {}
-    try { fetch(PING + '?wx=' + wx + '&wy=' + wy + '&ev=' + src, {method:'POST', mode:'no-cors', keepalive:true, body:'1'}).catch(function(){}); } catch (e) {}
-  }
-  function resetVerdicts() {
-    S.vis = (typeof WeakMap !== "undefined") ? new WeakMap() : null;
-    if (S.visSet) S.visSet.clear();
-    if (S.visAnc) S.visAnc.clear();
-  }
-  // Drop only cached verdicts whose element is the mutation target or a
-  // descendant of it. A mutation on an unrelated sibling cannot change a
-  // cached verdict, so the warm cache survives.
-  function dropVerdicts(t) {
-    try {
-      if (!S.vis || !S.visSet) { resetVerdicts(); return; }
-      if (!S.visSet.has(t) && !(S.visAnc && S.visAnc.has(t))) return;
-      var dead = [];
-      S.visSet.forEach(function(el){ try { if (t === el || t.contains(el)) dead.push(el); } catch (e) {} });
-      for (var i = 0; i < dead.length; i++) { S.vis.delete(dead[i]); S.visSet.delete(dead[i]); }
-    } catch (e) {}
-  }
-  function onMut(ev) {
-    ev = ev || 'mc';
-    // Escalate: a trailing 'mc' must not swallow a later 'ma' — an
-    // attribute change hiding elements would otherwise keep stale
-    // visible verdicts until the next invalidating ping.
-    if (ev === 'ma') pendingEv = 'ma';
-    else if (!pendingEv) pendingEv = ev;
-    var now = Date.now();
-    if (now - lastPing >= SUPPRESS && !trailing) { var e = pendingEv; pendingEv = null; fire(e); }
-    else if (!trailing) {
-      trailing = setTimeout(function(){ trailing = null; var e2 = pendingEv; pendingEv = null; fire(e2); }, TRAIL);
-    }
-  }
-  function arm(){
-    var root = document.documentElement;
-    if (!root) { setTimeout(arm, 500); return; }
-    try {
-      // Classify records: only attribute mutations that can flip a
-      // visibility verdict invalidate the cache (backend tag 'ma'):
-      // `class`/`style`/`hidden` drive the selectors and inline styles the
-      // verdict walk reads. Any other attribute (data-*, aria-*, jsaction
-      // churn Google fires constantly) can't change display/visibility/
-      // opacity in practice, so it re-queries for fresh boxes ('mc') without
-      // invalidating survivors' verdicts. Insert/remove/text ('mc') can't
-      // affect surviving nodes either — new nodes miss the cache and
-      // compute fresh.
-      new MutationObserver(function(recs){
-        var attr = false;
-        try { for (var i = 0; i < recs.length; i++) {
-          var r = recs[i];
-          if (r.type !== 'attributes') continue;
-          var an = r.attributeName;
-          if (!an || an === 'class' || an === 'style' || an === 'hidden') {
-            attr = true;
-            if (r.target) dropVerdicts(r.target);
-          }
-        } } catch (e) {}
-        onMut(attr ? 'ma' : 'mc');
-      }).observe(root, {subtree:true, childList:true, attributes:true, characterData:true});
-    } catch (e) {}
-    try {
-      // Resize shifts layout but never flips display/visibility/opacity:
-      // structural tag, verdicts kept.
-      new ResizeObserver(function(){
-        // A viewport change can re-evaluate media queries across the whole
-        // document: reset. Body content growth leaves innerWidth/Height
-        // alone and keeps the warm cache.
-        try {
-          var vw = window.innerWidth, vh = window.innerHeight;
-          if (S.vw !== vw || S.vh !== vh) { S.vw = vw; S.vh = vh; resetVerdicts(); }
-        } catch (e) {}
-        onMut('mc');
-      }).observe(document.body || root);
-    } catch (e) {}
-  }
-  arm();
-  // Stylesheets applying at load can flip whole-subtree verdicts: treat
-  // as attribute-class invalidation.
-  try { window.addEventListener('load', function(){ onMut('ma'); }); } catch (e) {}
-  // Scrolls (page or nested containers) change viewport rects with no DOM
-  // mutation, so the observers alone never hear them. Capture phase: scroll
-  // events don't bubble, this catches every scroller in the document.
-  // Tagged 'sc' so the backend knows nothing mutated.
-  try { document.addEventListener('scroll', function(){ onMut('sc'); }, {capture:true, passive:true}); } catch (e) {}
-})()"###;
-
-/// Boot script: idempotent install + immediate snapshot, so one round-trip
-/// both arms the observers and returns the current targets. The install is
-/// explicitly semicolon-terminated: without it the two adjacent IIFEs parse
-/// as a call on the install's (undefined) return value (ASI hazard).
-/// `center` is the cursor point the snapshot culls around (see
-/// [`dom_query_js`]); `None` keeps everything (no cursor yet).
-pub fn dom_boot_js(center: Option<(f32, f32)>, epoch: u64) -> String {
-    format!("{DOM_INSTALL_JS};\n{}", dom_query_js(center, epoch))
-}
-
-/// JSON-string variant of [`dom_query_js`] for engines whose JS bridge
-/// returns strings (CEF). Servo evaluates the object directly.
-pub fn dom_query_js_json(center: Option<(f32, f32)>, epoch: u64) -> String {
-    let (cx, cy, on) = match center {
-        Some((x, y)) => (format!("{x:.0}"), format!("{y:.0}"), "true"),
-        None => ("0".to_string(), "0".to_string(), "false"),
-    };
-    format!(
-        "var __sdsc_cx={cx},__sdsc_cy={cy},__sdsc_cc={on},__sdsc_v={epoch};
-         var __sdsc_obj = {DOM_QUERY_BODY};
-JSON.stringify(__sdsc_obj);"
-    )
-}
-
-/// One-shot event-loop probe: arm markers for the three async task
-/// sources, read them back after a beat. If timers fire but rAF never
-/// does, the page's frame-gated JS (hydration, lazy handlers) is starved —
-/// exactly the "clicks do nothing" signature.
+/// One-shot event-loop probe: arms timers, rAF, and an IntersectionObserver
+/// so a later read can tell whether page JS task sources are running.
 pub const PROBE_ARM_JS: &str = r###"(function(){
   try {
     window.__sdsc_loop = {timer: 0, raf: 0, io: 0};
@@ -221,59 +24,6 @@ pub const PROBE_ARM_JS: &str = r###"(function(){
   return 'armed';
 })()"###;
 
-/// Read back [`PROBE_ARM_JS`] markers: `[timer, raf, io]` as 1/0, or
-/// `[-1,-1,-1]` when the arm never ran.
-pub const PROBE_READ_JS: &str = r###"(function(){var l=window.__sdsc_loop;if(!l)return[-1,-1,-1];return[l.timer?1:0,l.raf?1:0,l.io?1:0]})()"###;
-
-/// Debug-only storage spike census (see `maybe_probe_storage`): reports
-/// localStorage/sessionStorage sizes, a probe-key write/read/delete
-/// round-trip, and the cookie count. Key names truncated to 40 chars for
-/// the log; VALUES NEVER LEAVE THE PAGE (only lengths and the probe key's
-/// own marker round-trip).
-pub const STORAGE_PROBE_JS: &str = r###"(function(){
-  var r = {lsLen: -1, lsKeys: [], roundTrip: 'skip', ssLen: -1, cookies: -1};
-  try { r.lsLen = window.localStorage.length; } catch (e) { r.lsLen = -2; }
-  try {
-    var ks = [];
-    for (var i = 0; i < window.localStorage.length && i < 10; i++) {
-      var k = window.localStorage.key(i);
-      ks.push(k === null ? 'null' : String(k).slice(0, 40));
-    }
-    r.lsKeys = ks;
-  } catch (e) {}
-  try {
-    window.localStorage.setItem('__sdsc_probe', '1');
-    var v = window.localStorage.getItem('__sdsc_probe');
-    window.localStorage.removeItem('__sdsc_probe');
-    r.roundTrip = (v === '1') ? 'ok' : ('mismatch:' + v);
-  } catch (e) { r.roundTrip = 'threw:' + (e && e.name ? e.name : e); }
-  try { r.ssLen = window.sessionStorage.length; } catch (e2) { r.ssLen = -2; }
-  try { var c = document.cookie || ''; r.cookies = c ? c.split(';').length : 0; } catch (e3) {}
-  return JSON.stringify(r);
-})()"###;
-
-#[cfg(feature = "servo-engine")]
-/// Parse a [`PROBE_READ_JS`] result. `None` on malformed shapes or when the
-/// arm never ran (page navigated away mid-probe).
-pub fn parse_loop_probe(value: &embedder_traits::JSValue) -> Option<[bool; 3]> {
-    use embedder_traits::JSValue;
-    let JSValue::Array(cols) = value else {
-        return None;
-    };
-    if cols.len() != 3 {
-        return None;
-    }
-    let mut out = [false; 3];
-    for (i, col) in cols.iter().enumerate() {
-        match col {
-            JSValue::Number(n) if *n == 1.0 => out[i] = true,
-            JSValue::Number(n) if *n == 0.0 => {}
-            _ => return None,
-        }
-    }
-    Some(out)
-}
-
 /// Read-only DOM query. Stable per-document ids via an in-page WeakMap
 /// (recreated on every navigation, so ids are only meaningful within one
 /// document). Bounded to 1000 matches; reports truncation.
@@ -281,24 +31,27 @@ pub fn parse_loop_probe(value: &embedder_traits::JSValue) -> Option<[bool; 3]> {
 /// 500px of it are culled — except the nearest target in each direction, so
 /// arrow-key jumps always have somewhere to go. `None` keeps everything.
 /// `epoch` bumps whenever the DOM (or anything affecting visibility) may
-/// have changed; the in-page visibility verdict cache resets on mismatch,
-/// so pure-scroll pulls reuse verdicts while mutations re-verify.
+/// have changed; the in-page visibility verdict cache resets on mismatch.
 pub fn dom_query_js(center: Option<(f32, f32)>, epoch: u64) -> String {
     let (cx, cy, on) = match center {
         Some((x, y)) => (format!("{x:.0}"), format!("{y:.0}"), "true"),
         None => ("0".to_string(), "0".to_string(), "false"),
     };
-    format!("var __sdsc_cx={cx},__sdsc_cy={cy},__sdsc_cc={on},__sdsc_v={epoch};\n{DOM_QUERY_BODY}")
+    format!(
+        "var __sdsc_cx={cx},__sdsc_cy={cy},__sdsc_cc={on},__sdsc_v={epoch};
+         var __sdsc_obj = {DOM_QUERY_BODY};
+JSON.stringify(__sdsc_obj);"
+    )
 }
 
 const DOM_QUERY_BODY: &str = r###"(function(){
-  // Top document only (see DOM_INSTALL_JS): no snap targets are collected
-  // from transient iframe documents.
+  // Top document only: no snap targets are collected from transient iframe
+  // documents.
   try { if (window.top !== window.self) return {}; } catch (e) { return {}; }
   var S = window.__sdsc_ax;
   if (!S) { S = window.__sdsc_ax = { next: 1, ids: new WeakMap() }; }
-  // Standalone query: CEF polls instead of installing the observer/ping
-  // machinery, so `byId` may not exist yet. Servo's install sets it too.
+  // Exact-element click map (`window.__sdsc_click`); rebuilt per pull so
+  // detached nodes release.
   if (!S.byId) { S.byId = {}; }
   function idFor(el) {
     var id = S.ids.get(el);
@@ -431,13 +184,9 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   var total = els.length;
   var n = Math.min(els.length, 1000);
   tQ = Date.now() - __t0;
-  // NOTE: deliberately the plural fragment call, never the singular
-  // bounding-box one. Servo's singular version carries a
-  // `debug_assert!(w >= 0 && h >= 0)` (servo-script dom/element/element.rs)
-  // that aborts the script thread on real pages (negative border boxes from
-  // transformed content), taking the whole app down in debug builds.
-  // GetClientRects shares the data source but has no assert; the union below
-  // normalizes fragments and can never go negative.
+  // Deliberately the plural fragment call: the union below normalizes
+  // multi-line/inline fragments and can never go negative (real pages have
+  // negative border boxes from transformed content).
   function boxOf(el) {
     var rs;
     try { rs = el.getClientRects(); } catch (e) { return null; }
@@ -456,9 +205,9 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   }
   // Pass 1: measure everything (id assignment is stable per document, so
   // culled elements keep their ids for the pull that re-admits them).
-  // Deliberately NO visibility verdicts here: one getComputedStyle call
-  // costs ~15ms in debug Servo while getClientRects unions are
-  // microseconds, so verdicts run only on elements that survive geometric
+  // Deliberately NO visibility verdicts here: one getComputedStyle call is
+  // expensive while getClientRects unions are microseconds, so verdicts run
+  // only on elements that survive geometric
   // culling (pass 2/3) plus boxless forcing candidates — never on all N
   // candidates up front.
   var cands = [];
@@ -645,214 +394,6 @@ const DOM_QUERY_BODY: &str = r###"(function(){
   return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], hid: skHid, clip: skClip, boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, forced: skForce, t: [Math.round(tQ), Math.round(tmM), Math.round(tmV), Math.round(tmC), Math.round(tmT)], sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh), ax: ax, dt: S.doc};
 })()"###;
 
-/// Parsed snapshot: viewport-space candidates plus the true page scroll at
-/// query time. The backend stores document-space rects (viewport + scroll)
-/// and rebases its tracked offset to this ground truth, so commanded-delta
-/// drift and history-restored offsets self-heal on every pull. `doc` carries
-/// the full document dims so scroll clamping survives viewport culling (the
-/// live set only ever spans viewport+margin); `total`/`culled`/`skipped`
-/// are diagnostics for cap pressure and skip reasons, in
-/// [boxless, zero-area, oversize, disabled, threw] order. `box_anchors`
-/// counts boxless <a> elements, `boxless_with_kids` counts boxless elements
-/// with element children, `box_anchor_wraps` and `box_anchor_empty` split
-/// the anchors into wrappers vs childless (text-only anchors are the
-/// remainder: boxA - wraps - empty). `forced_boxes` counts targets
-/// recovered by display forcing; `hidden_subtree` (display/visibility/
-/// opacity) and `clipped_away` (overflow clip to zero) the correctly
-/// invisible.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg(feature = "servo-engine")]
-pub struct DomSnapshot {
-    pub nodes: Vec<DomRaw>,
-    pub scroll: (f32, f32),
-    pub doc: (f32, f32),
-    pub total: usize,
-    pub culled: usize,
-    pub culled_ids: Vec<u64>,
-    pub skipped: [usize; 5],
-    pub box_anchors: usize,
-    pub boxless_with_kids: usize,
-    pub box_anchor_wraps: usize,
-    pub box_anchor_empty: usize,
-    pub forced_boxes: usize,
-    pub hidden_subtree: usize,
-    pub clipped_away: usize,
-    /// In-page phase timings (ms): querySelectorAll, box measurement,
-    /// visibility walks, clip walks, text extraction. Finds the real
-    /// per-pull cost center instead of guessing.
-    pub timings: [u64; 5],
-    /// Focused element's snapshot id (`ax`, 0 = none): drives cursor
-    /// docking on autofocus / JS `.focus()`.
-    pub active: u64,
-    /// Per-window document token from the install script. A real reload
-    /// creates a fresh window (new token); a same-document head re-parse
-    /// keeps it. `""` when the page never ran our install.
-    pub doc_token: String,
-}
-
-/// Parse a `dom_query_js` result into raw candidates. Lenient by design:
-/// malformed rows are skipped, never fatal; missing scroll/doc dims default
-/// to origin/zero (old cached pages can't produce them; origin is the safe
-/// assumption, never a drift source — the next pull rebases; zero doc dims
-/// just leave the extent to the live set).
-#[cfg(feature = "servo-engine")]
-pub fn parse_dom_snapshot(value: &embedder_traits::JSValue) -> DomSnapshot {
-    use embedder_traits::JSValue;
-    let JSValue::Object(root) = value else {
-        return DomSnapshot {
-            nodes: Vec::new(),
-            scroll: (0.0, 0.0),
-            doc: (0.0, 0.0),
-            total: 0,
-            culled: 0,
-            culled_ids: Vec::new(),
-            skipped: [0; 5],
-            box_anchors: 0,
-            boxless_with_kids: 0,
-            box_anchor_wraps: 0,
-            box_anchor_empty: 0,
-            forced_boxes: 0,
-            hidden_subtree: 0,
-            clipped_away: 0,
-            timings: [0; 5],
-            active: 0,
-            doc_token: String::new(),
-        };
-    };
-    let num_field = |key: &str| {
-        root.get(key)
-            .and_then(|v| match v {
-                JSValue::Number(n) => Some(*n as f32),
-                _ => None,
-            })
-            .unwrap_or(0.0)
-    };
-    let scroll = (num_field("sx"), num_field("sy"));
-    let doc = (num_field("dw"), num_field("dh"));
-    let active = num_field("ax").max(0.0) as u64;
-    let doc_token = match root.get("dt") {
-        Some(JSValue::String(s)) => s.clone(),
-        _ => String::new(),
-    };
-    let total = num_field("total") as usize;
-    let culled = num_field("culled") as usize;
-    let mut culled_ids = Vec::new();
-    if let Some(JSValue::Array(cols)) = root.get("ccull") {
-        for col in cols.iter().take(3000) {
-            if let JSValue::Number(n) = col {
-                let id = *n as u64;
-                if (*n).is_finite() && id as f64 == *n {
-                    culled_ids.push(id);
-                }
-            }
-        }
-    }
-    let box_anchors = num_field("boxA") as usize;
-    let boxless_with_kids = num_field("boxKid") as usize;
-    let box_anchor_wraps = num_field("boxAWrap") as usize;
-    let box_anchor_empty = num_field("boxAEmpty") as usize;
-    let forced_boxes = num_field("forced") as usize;
-    let hidden_subtree = num_field("hid") as usize;
-    let clipped_away = num_field("clip") as usize;
-    let mut timings = [0u64; 5];
-    if let Some(JSValue::Array(cols)) = root.get("t") {
-        for (i, col) in cols.iter().take(5).enumerate() {
-            if let JSValue::Number(n) = col {
-                timings[i] = (*n).max(0.0) as u64;
-            }
-        }
-    }
-    let mut skipped = [0usize; 5];
-    if let Some(JSValue::Array(cols)) = root.get("skip") {
-        for (i, col) in cols.iter().take(5).enumerate() {
-            if let JSValue::Number(n) = col {
-                skipped[i] = (*n).max(0.0) as usize;
-            }
-        }
-    }
-    let Some(JSValue::Array(rows)) = root.get("nodes") else {
-        return DomSnapshot {
-            nodes: Vec::new(),
-            scroll,
-            doc,
-            total,
-            culled,
-            culled_ids,
-            skipped,
-            box_anchors,
-            boxless_with_kids,
-            box_anchor_wraps,
-            box_anchor_empty,
-            forced_boxes,
-            hidden_subtree,
-            clipped_away,
-            timings,
-            active,
-            doc_token,
-        };
-    };
-    let mut nodes = Vec::new();
-    for row in rows {
-        let JSValue::Array(cols) = row else {
-            continue;
-        };
-        let num = |i: usize| match cols.get(i) {
-            Some(JSValue::Number(n)) => *n as f32,
-            _ => f32::NAN,
-        };
-        let str_ = |i: usize| match cols.get(i) {
-            Some(JSValue::String(s)) => s.clone(),
-            _ => String::new(),
-        };
-        let id = num(0);
-        let (x, y, w, h) = (num(4), num(5), num(6), num(7));
-        if !id.is_finite() || id < 0.0 {
-            continue;
-        }
-        if !(w > 0.0 && h > 0.0) {
-            continue;
-        }
-        if !(x.is_finite() && y.is_finite()) {
-            continue;
-        }
-        nodes.push(DomRaw {
-            id: id as u64,
-            tag: str_(1),
-            role: str_(2),
-            typ: str_(3),
-            x,
-            y,
-            w,
-            h,
-            text: str_(8),
-            url: str_(9),
-            autofocus: matches!(cols.get(10), Some(JSValue::Number(n)) if *n != 0.0),
-        });
-    }
-    DomSnapshot {
-        nodes,
-        scroll,
-        doc,
-        total,
-        culled,
-        culled_ids,
-        skipped,
-        box_anchors,
-        boxless_with_kids,
-        box_anchor_wraps,
-        box_anchor_empty,
-        forced_boxes,
-        hidden_subtree,
-        clipped_away,
-        timings,
-        active,
-        doc_token,
-    }
-}
-
-/// Map a DOM node to a cursor kind. Explicit `role=` wins (ARIA authors know
-/// best); otherwise the tag (and input type) decides. Unknown but queried
-/// elements (they matched the actionable selector) fall back to `Other`.
 pub fn dom_kind(tag: &str, role: &str, typ: &str) -> FocusKind {
     match role {
         "link" | "doc-backlink" => return FocusKind::Link,
@@ -883,341 +424,19 @@ pub fn dom_kind(tag: &str, role: &str, typ: &str) -> FocusKind {
     }
 }
 
-#[cfg(all(test, feature = "servo-engine"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use embedder_traits::JSValue;
-    use std::collections::HashMap;
-
-    fn row(cols: Vec<JSValue>) -> JSValue {
-        JSValue::Array(cols)
-    }
-
-    fn num(n: f64) -> JSValue {
-        JSValue::Number(n)
-    }
-
-    fn str_(s: &str) -> JSValue {
-        JSValue::String(s.to_string())
-    }
-
-    fn snapshot(rows: Vec<JSValue>) -> JSValue {
-        let mut root = HashMap::new();
-        root.insert("nodes".to_string(), JSValue::Array(rows));
-        JSValue::Object(root)
-    }
 
     #[test]
-    fn parse_accepts_well_formed_rows() {
-        let value = JSValue::Object({
-            let mut root = HashMap::new();
-            root.insert(
-                "nodes".to_string(),
-                JSValue::Array(vec![
-                    row(vec![
-                        num(7.0),
-                        str_("textarea"),
-                        str_(""),
-                        str_(""),
-                        num(10.0),
-                        num(20.0),
-                        num(300.0),
-                        num(40.0),
-                        str_("Search"),
-                    ]),
-                    row(vec![
-                        num(9.0),
-                        str_("input"),
-                        str_(""),
-                        str_("password"),
-                        num(10.0),
-                        num(70.0),
-                        num(300.0),
-                        num(40.0),
-                        str_(""),
-                    ]),
-                ]),
-            );
-            root
-        });
-        let out = parse_dom_snapshot(&value);
-        assert_eq!(out.nodes.len(), 2);
-        assert_eq!(out.nodes[0].id, 7);
-        assert_eq!(out.nodes[0].tag, "textarea");
-        assert_eq!(out.nodes[0].x, 10.0);
-        assert_eq!(out.nodes[1].typ, "password");
-        // No link/flag columns in this fixture: empty + unset.
-        assert_eq!(out.nodes[0].url, "");
-        assert!(!out.nodes[0].autofocus);
-        // No scroll fields in this fixture: origin, the safe assumption.
-        assert_eq!(out.scroll, (0.0, 0.0));
-    }
-
-    #[test]
-    fn parse_reads_href_and_autofocus() {
-        let value = JSValue::Object({
-            let mut root = HashMap::new();
-            root.insert(
-                "nodes".to_string(),
-                JSValue::Array(vec![row(vec![
-                    num(3.0),
-                    str_("a"),
-                    str_(""),
-                    str_(""),
-                    num(10.0),
-                    num(20.0),
-                    num(100.0),
-                    num(30.0),
-                    str_("Example"),
-                    str_("https://example.com/page?q=1"),
-                    num(1.0),
-                ])]),
-            );
-            root
-        });
-        let out = parse_dom_snapshot(&value);
-        assert_eq!(out.nodes.len(), 1);
-        assert_eq!(out.nodes[0].url, "https://example.com/page?q=1");
-        assert!(out.nodes[0].autofocus);
-    }
-
-    #[test]
-    fn parse_reads_page_scroll_and_doc_dims() {
-        let mut root = HashMap::new();
-        root.insert("nodes".to_string(), JSValue::Array(vec![]));
-        root.insert("sx".to_string(), num(0.0));
-        root.insert("sy".to_string(), num(1240.0));
-        root.insert("dw".to_string(), num(800.0));
-        root.insert("dh".to_string(), num(4000.0));
-        root.insert("total".to_string(), num(1500.0));
-        root.insert("culled".to_string(), num(900.0));
-        root.insert(
-            "skip".to_string(),
-            JSValue::Array(vec![num(3.0), num(0.0), num(1.0), num(0.0), num(2.0)]),
-        );
-        root.insert("boxA".to_string(), num(7.0));
-        root.insert("boxKid".to_string(), num(5.0));
-        root.insert("boxAWrap".to_string(), num(4.0));
-        root.insert("boxAEmpty".to_string(), num(2.0));
-        root.insert("forced".to_string(), num(6.0));
-        root.insert("hid".to_string(), num(4.0));
-        root.insert("clip".to_string(), num(3.0));
-        root.insert(
-            "t".to_string(),
-            JSValue::Array(vec![num(5.0), num(40.0), num(12.0), num(3.0), num(1.0)]),
-        );
-        root.insert(
-            "ccull".to_string(),
-            JSValue::Array(vec![num(11.0), num(13.0)]),
-        );
-        root.insert("ax".to_string(), num(9.0));
-        let out = parse_dom_snapshot(&JSValue::Object(root));
-        assert!(out.nodes.is_empty());
-        assert_eq!(out.scroll, (0.0, 1240.0));
-        assert_eq!(out.doc, (800.0, 4000.0));
-        assert_eq!(out.total, 1500);
-        assert_eq!(out.culled, 900);
-        assert_eq!(out.skipped, [3, 0, 1, 0, 2]);
-        assert_eq!(out.box_anchors, 7);
-        assert_eq!(out.boxless_with_kids, 5);
-        assert_eq!(out.box_anchor_wraps, 4);
-        assert_eq!(out.box_anchor_empty, 2);
-        assert_eq!(out.forced_boxes, 6);
-        assert_eq!(out.hidden_subtree, 4);
-        assert_eq!(out.clipped_away, 3);
-        assert_eq!(out.timings, [5, 40, 12, 3, 1]);
-        assert_eq!(out.culled_ids, vec![11, 13]);
-        assert_eq!(out.active, 9);
-    }
-
-    #[test]
-    fn parse_defaults_active_to_none() {
-        // Old cached pages predate the focus field: missing `ax` means
-        // no focused element, never a dock.
-        let mut root = HashMap::new();
-        root.insert("nodes".to_string(), JSValue::Array(vec![]));
-        let out = parse_dom_snapshot(&JSValue::Object(root));
-        assert_eq!(out.active, 0);
-    }
-
-    #[test]
-    fn parse_skips_garbage_without_failing() {
-        let value = snapshot(vec![
-            num(1.0),
-            str_("nope"),
-            row(vec![num(2.0)]),
-            row(vec![
-                num(f64::NAN),
-                str_("a"),
-                str_(""),
-                str_(""),
-                num(0.0),
-                num(0.0),
-                num(-5.0),
-                num(10.0),
-                str_(""),
-            ]),
-            // Flat numbers and short rows are skipped; the NaN/negative
-            // row is skipped; the valid row still parses.
-            row(vec![
-                num(3.0),
-                str_("button"),
-                str_(""),
-                str_(""),
-                num(5.0),
-                num(5.0),
-                num(50.0),
-                num(20.0),
-                str_("Go"),
-            ]),
-        ]);
-        let out = parse_dom_snapshot(&value);
-        assert_eq!(out.nodes.len(), 1);
-        assert_eq!(out.nodes[0].id, 3);
-    }
-
-    #[test]
-    fn install_pings_fetch_only() {
-        // The ping URL must embed the marker: the backend matches resource
-        // loads by substring.
-        assert!(DOM_PING_URL.contains(DOM_DIRTY_MARKER));
-        assert!(DOM_INSTALL_JS.contains(DOM_PING_URL));
-        assert!(DOM_INSTALL_JS.contains(DOM_DIRTY_MARKER));
-        assert!(DOM_INSTALL_JS.contains("MutationObserver"));
-        assert!(DOM_INSTALL_JS.contains("ResizeObserver"));
-        assert!(DOM_INSTALL_JS.contains("addEventListener('scroll'"));
-        assert!(DOM_INSTALL_JS.contains("fetch("));
-        // Pings carry window truth so nested scrolls can't poison the
-        // global offset.
-        assert!(DOM_INSTALL_JS.contains("wx="));
-        // Console and beacon channels removed: no page-log pollution, one
-        // network channel to reason about.
-        assert!(!DOM_INSTALL_JS.contains("console"));
-        assert!(!DOM_INSTALL_JS.contains("sendBeacon"));
-        // Idempotent per document: re-running never double-arms.
-        assert!(DOM_INSTALL_JS.contains("S.mo"));
-        // Exact-element activation helper + id map (no hit-test staleness).
-        assert!(DOM_INSTALL_JS.contains("__sdsc_click"));
-        assert!(DOM_INSTALL_JS.contains("byId"));
-        // Union-of-fragments measurement: never the crashing call.
-        let query = dom_query_js(None, 7);
-        assert!(query.contains("getClientRects"));
-        assert!(!query.contains("getBoundingClientRect"));
-        // Boxless fallback is persistent display forcing (one shot per
-        // element; our own observer re-pulls on the mutation).
-        assert!(!query.contains("selectNodeContents"));
-        assert!(query.contains("setProperty('display', 'block'"));
-        assert!(!query.contains("removeProperty"));
-        // Measure-first ordering: verdicts (getComputedStyle, ~15ms/call
-        // in debug Servo) run only on geometric-cull survivors and boxless
-        // triage remainders — never on all N candidates up front.
-        assert!(query.contains("isHidden(el)"));
-        assert!(query.contains("boxless"));
-        assert!(query.contains("closest('[hidden]')"));
-        // Cursor culling: radial keep + directional-next keep, uncensored
-        // without a cursor.
-        assert!(query.contains("__sdsc_cc=false"));
-        assert!(dom_query_js(Some((100.0, 200.0)), 7).contains("__sdsc_cc=true"));
-        assert!(query.contains("__sdsc_cx"));
-        // Epoch-gated visibility verdicts + tagged ping sources.
-        assert!(query.contains("S.visEpoch"));
-        assert!(query.contains("visEpoch"));
-        assert!(DOM_INSTALL_JS.contains("ev="));
-        // Verdict invalidation is localized: the observer drops only the
-        // mutated element plus its cached descendants, so unrelated class
-        // churn keeps the warm cache (the 1s ancestor re-walk killer).
-        assert!(query.contains("S.visSet"));
-        assert!(query.contains("S.visAnc"));
-        assert!(DOM_INSTALL_JS.contains("dropVerdicts"));
-        assert!(DOM_INSTALL_JS.contains("resetVerdicts"));
-        // Ping taxonomy: class/style/hidden flips ('ma'), structural
-        // changes ('mc') and scrolls ('sc'); trailing debounce escalates
-        // mc->ma so a hide is never swallowed.
-        assert!(DOM_INSTALL_JS.contains("'ma'"));
-        assert!(DOM_INSTALL_JS.contains("'mc'"));
-        assert!(DOM_INSTALL_JS.contains("'sc'"));
-        assert!(DOM_INSTALL_JS.contains("pendingEv"));
-        // Invalidation is name-filtered: only class/style/hidden (or
-        // unknown) attributes escalate to 'ma'.
-        assert!(DOM_INSTALL_JS.contains("attributeName"));
-        assert!(dom_query_js(Some((100.0, 200.0)), 7).contains("__sdsc_cx=100"));
-        assert!(dom_query_js(Some((100.0, 200.0)), 7).contains("__sdsc_v=7"));
-        // Boot = install + snapshot in one round-trip.
-        let boot = dom_boot_js(None, 7);
-        assert!(boot.contains(DOM_DIRTY_MARKER));
-        assert!(boot.contains("querySelectorAll"));
-        // Both scripts refuse to run in subframes: UserContentManager
-        // installs per document, and iframe documents are exactly where
-        // Servo's script/layout stability asserts fire.
-        assert!(DOM_INSTALL_JS.contains("window.top !== window.self"));
-        assert!(DOM_QUERY_BODY.contains("window.top !== window.self"));
-        // Document identity token: a same-document head re-parse keeps it,
-        // a real reload gets a fresh one.
-        assert!(DOM_INSTALL_JS.contains("S.doc"));
-        assert!(dom_query_js(None, 7).contains("dt: S.doc"));
-    }
-
-    #[test]
-    fn probe_parses_marker_triplet() {
-        use embedder_traits::JSValue;
-        let good = JSValue::Array(vec![
-            JSValue::Number(1.0),
-            JSValue::Number(0.0),
-            JSValue::Number(1.0),
-        ]);
-        assert_eq!(parse_loop_probe(&good), Some([true, false, true]));
-        let unarmed = JSValue::Array(vec![
-            JSValue::Number(-1.0),
-            JSValue::Number(-1.0),
-            JSValue::Number(-1.0),
-        ]);
-        assert_eq!(parse_loop_probe(&unarmed), None);
-        let short = JSValue::Array(vec![JSValue::Number(1.0)]);
-        assert_eq!(parse_loop_probe(&short), None);
-    }
-
-    #[test]
-    fn storage_probe_reports_counts_not_values() {
-        // Census only: sizes, truncated key names, probe-key round-trip,
-        // cookie count. Values must never be serialized out of the page.
-        assert!(STORAGE_PROBE_JS.contains("localStorage"));
-        assert!(STORAGE_PROBE_JS.contains("sessionStorage"));
-        assert!(STORAGE_PROBE_JS.contains("document.cookie"));
-        assert!(STORAGE_PROBE_JS.contains("__sdsc_probe"));
-        assert!(STORAGE_PROBE_JS.contains("JSON.stringify"));
-        // No wholesale value dump: the only getItem reads the probe's own key.
-        assert_eq!(STORAGE_PROBE_JS.matches("getItem").count(), 1);
-    }
-
-    #[test]
-    fn query_covers_option_role() {
-        // Autocomplete rows (role=option) are real click targets.
-        assert!(dom_query_js(None, 7).contains("[role=\"option\"]"));
+    fn query_is_a_json_string_and_covers_controls() {
+        let js = dom_query_js(Some((10.0, 20.0)), 7);
+        assert!(js.contains("JSON.stringify"));
+        assert!(js.contains("__sdsc_cx=10"));
+        assert!(js.contains("role=\"button\""));
+        assert!(js.contains("role=\"option\""));
         assert_eq!(dom_kind("div", "option", ""), FocusKind::Button);
-    }
-
-    #[test]
-    fn query_covers_handler_attributes() {
-        // Any anchor qualifies (href-less jsaction anchors, name anchors —
-        // the size filter keeps phantoms out) plus inline handlers.
-        let query = dom_query_js(None, 7);
-        assert!(query.contains("'a,button,"));
-        assert!(query.contains("[onclick]"));
-        // Full-viewport boxes never qualify (a screen-sized box with a
-        // global handler would become a screen-hogging phantom); full-width
-        // rows survive because both axes are required.
-        assert!(query.contains("r.width >= vw && r.height >= vh"));
-    }
-
-    #[test]
-    fn kind_prefers_role_then_tag() {
-        assert_eq!(dom_kind("div", "button", ""), FocusKind::Button);
-        assert_eq!(dom_kind("div", "link", ""), FocusKind::Link);
-        assert_eq!(dom_kind("textarea", "", ""), FocusKind::Field);
-        assert_eq!(dom_kind("input", "", "password"), FocusKind::Field);
-        assert_eq!(dom_kind("input", "", "checkbox"), FocusKind::Button);
-        assert_eq!(dom_kind("input", "", "submit"), FocusKind::Button);
         assert_eq!(dom_kind("a", "", ""), FocusKind::Link);
-        assert_eq!(dom_kind("button", "", ""), FocusKind::Button);
+        assert_eq!(dom_kind("input", "", "text"), FocusKind::Field);
     }
 }

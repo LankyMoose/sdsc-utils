@@ -1,10 +1,9 @@
 //! Engine seam: commands down to the page backend, frames/events up.
 //!
-//! The `servo-engine` cargo feature (on by default) backs this with a Servo
-//! offscreen worker thread (see `servo_backend`); `--no-default-features`
-//! keeps the reader backend and the App never constructs a handle. Either
-//! way the UI only depends on [`EngineCommand`] / [`EngineEvent`], so the
-//! backend is replaceable without touching Start.
+//! The `cef-engine` cargo feature (on by default) backs this with the CEF
+//! OSR worker (see `cef_backend`); `--no-default-features` is a UI-only build
+//! and the App never constructs a handle. The UI only depends on
+//! [`EngineCommand`] / [`EngineEvent`], so the backend stays replaceable.
 
 use crate::browser::frame_slot::FrameSlot;
 use std::sync::{Arc, Mutex, mpsc};
@@ -73,7 +72,7 @@ pub enum EngineCommand {
         dx: f32,
         dy: f32,
         /// Page point to scroll under (device px == page px at 1x): the pad
-        /// cursor. Servo scrolls the innermost scroller under the point, so
+        /// cursor. Chromium scrolls the innermost scroller under the point, so
         /// this is both intent ("scroll what I point at") and the carousel
         /// trap escape.
         x: f32,
@@ -83,7 +82,7 @@ pub enum EngineCommand {
     SetDarkMode {
         dark: bool,
     },
-    /// Mouse position sync: the pad cursor is the only mouse Servo ever
+    /// Mouse position sync: the pad cursor is the only mouse Chromium ever
     /// sees. The UI streams this on quantized movement so hover, hit-test
     /// and `:hover` state track the real cursor; clicks then need no
     /// pre-move.
@@ -155,15 +154,13 @@ pub enum EngineCommand {
     },
     Suspend,
     Resume,
-    /// Clean shutdown: the worker breaks its loop, drops Servo (whose Drop
-    /// spins synchronously to ShutdownComplete, flushing cookie_jar.json),
-    /// then signals `done`. The sender waits on it (bounded) before
-    /// process exit so the flush actually lands.
+    /// Close all CEF browsers and stop the worker, then signal `done`.
+    /// The sender waits on it (bounded) before process exit.
     Shutdown {
         done: std::sync::mpsc::Sender<()>,
     },
-    /// Poke the loop awake (Servo's [`EventLoopWaker`] hook). No-op by the
-    /// time it drains: the loop spins every few ms anyway.
+    /// Poke the loop awake. No-op by the time it drains: the loop wakes
+    /// every few ms for DOM polling anyway.
     Wake,
 }
 
@@ -190,7 +187,7 @@ pub enum EngineEvent {
         tab: TabId,
         url: String,
     },
-    /// Page favicon arrived (Servo parses `<link rel=icon>` out of band).
+    /// Page favicon arrived (not emitted by CEF yet; reserved).
     /// Keyed by document URL; the UI caches handles per URL for the
     /// bookmark bar and history rows.
     FaviconChanged {
@@ -235,7 +232,7 @@ pub enum EngineEvent {
         tab: TabId,
         id: u64,
     },
-    /// Canonical session history (Servo `notify_history_changed` entries +
+    /// Canonical session history (engine-provided entries +
     /// current index). Overwrites the UI's locally-maintained session
     /// stack so the hold-bumper selector shows exact back/forward targets.
     HistoryChanged {

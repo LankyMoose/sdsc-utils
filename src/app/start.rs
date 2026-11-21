@@ -515,10 +515,9 @@ impl App {
         Task::none()
     }
 
-    /// Kick a reader fetch off the UI thread. Generation-guarded: closing or
-    /// suspending before the worker lands drops the result. With the
-    /// `servo-engine` feature the load goes to the engine worker instead
-    /// (frames arrive via [`Message::BrowserEngine`]).
+    /// Send a load to the CEF worker (frames arrive via
+    /// [`Message::BrowserEngine`]). Generation-guarded so a suspend/close
+    /// before completion is ignored.
     /// Push the OS light/dark mode to the engine (`prefers-color-scheme`).
     /// No-op without an engine or when the OS gives no answer.
     pub(crate) fn sync_browser_theme(&mut self) {
@@ -538,7 +537,7 @@ impl App {
         } else {
             draft
         };
-        let url = crate::browser::fetch::resolve_navigate_target(&raw);
+        let url = crate::browser::nav::resolve_navigate_target(&raw);
         if url.is_empty() {
             return Task::none();
         }
@@ -555,35 +554,23 @@ impl App {
         self.note_start_activity();
         self.play_start_cue(UiSoundKind::Nav);
         crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
-        if self.browser.engine.is_some() {
-            if let Some(engine) = &self.browser.engine {
-                let tab = self.browser_tab();
-                engine.send(EngineCommand::Navigate {
-                    tab,
-                    url,
-                    generation,
-                });
-            }
-            self.sync_browser_theme();
+        let Some(engine) = &self.browser.engine else {
+            // The engine is mandatory in phase 4; the hub tile handles the
+            // missing-engine install flow before a window ever opens.
+            self.browser
+                .panel
+                .session
+                .apply_failed(generation, "Browser engine not installed".to_string());
             return Task::none();
-        }
-        Task::perform(
-            async move { spawn_blocking(move || crate::browser::fetch::fetch_readable(&url)).await },
-            move |result| match result {
-                Ok(Ok(page)) => Message::Browser(crate::ui::browser::BrowserMessage::Fetched {
-                    generation,
-                    result: Ok(page),
-                }),
-                Ok(Err(err)) => Message::Browser(crate::ui::browser::BrowserMessage::Fetched {
-                    generation,
-                    result: Err(err),
-                }),
-                Err(err) => Message::Browser(crate::ui::browser::BrowserMessage::Fetched {
-                    generation,
-                    result: Err(err.to_string()),
-                }),
-            },
-        )
+        };
+        let tab = self.browser_tab();
+        engine.send(EngineCommand::Navigate {
+            tab,
+            url,
+            generation,
+        });
+        self.sync_browser_theme();
+        Task::none()
     }
 
     /// Raw keyboard routing for Start. Controller-first: with the engine
@@ -885,29 +872,6 @@ impl App {
         }
     }
 
-    /// Browser: shut down the engine worker in-app (diagnostic + resource
-    /// release). Runs the exact clean-shutdown path as quit (worker drain,
-    /// Servo drop with synchronous constellation shutdown, storage flush)
-    /// while the app keeps running — no suspend, no process exit. Fire and
-    /// forget: with no exit following, no ack wait is needed; the cookie jar
-    /// lands in the servo dir within a second or two. NOTE: Servo
-    /// initializes once per process (`OnceLock` panics on re-init), so the
-    /// engine stays down until app restart: the handle is dropped (later
-    /// navigates take the reader fetch path) and the card label flips to
-    /// reader so it never claims a live engine.
-    pub(crate) fn on_browser_shutdown_engine(&mut self) -> Task<Message> {
-        let Some(engine) = self.browser.engine.take() else {
-            return Task::none();
-        };
-        let (tx, _rx) = std::sync::mpsc::channel();
-        engine.send(EngineCommand::Shutdown { done: tx });
-        self.browser.engine_available = false;
-        self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Action);
-        crate::platform::app_log::info("ui-diag: engine shutdown requested (in-app, no app exit)");
-        Task::none()
-    }
-
     /// Star toggle: bookmark the current page (opening the rename bubble),
     /// or open the bubble for an already-bookmarked page. No page, no-op
     /// (fresh surface navigates home first — nothing to star yet).
@@ -972,26 +936,6 @@ impl App {
         Task::none()
     }
 
-    pub(crate) fn on_browser_fetched(
-        &mut self,
-        generation: u64,
-        result: Result<crate::browser::FetchedPage, String>,
-    ) -> Task<Message> {
-        match result {
-            Ok(page) => {
-                if self.browser.panel.session.apply_fetched(generation, page) {
-                    self.note_start_activity();
-                }
-            }
-            Err(err) => {
-                if self.browser.panel.session.apply_failed(generation, err) {
-                    self.note_start_activity();
-                }
-            }
-        }
-        Task::none()
-    }
-
     pub(crate) fn on_browser_reload(&mut self) -> Task<Message> {
         if self.browser.panel.session.url().is_empty() {
             return self.on_browser_navigate();
@@ -1008,7 +952,7 @@ impl App {
         } else {
             session.url().to_string()
         };
-        let url = crate::browser::fetch::resolve_navigate_target(&raw);
+        let url = crate::browser::nav::resolve_navigate_target(&raw);
         if url.is_empty() {
             return Task::none();
         }
@@ -1054,7 +998,7 @@ impl App {
         if (dx != 0.0 || dy != 0.0)
             && let Some(engine) = &self.browser.engine
         {
-            // Scroll under the pad cursor: Servo routes to the innermost
+            // Scroll under the pad cursor: Chromium routes to the innermost
             // scroller under the point, so center-targeting stranded page
             // scrolls inside carousels after use.
             let (cx, cy) = (self.browser.panel.cursor.x, self.browser.panel.cursor.y);
@@ -1483,7 +1427,7 @@ impl App {
         }
         if self.crash_restart_boot {
             // Safe mode: the restored active tab is the page that killed
-            // Servo. Start on home and keep every saved tab stored (the
+            // CEF. Start on home and keep every saved tab stored (the
             // user can switch deliberately); never auto-load the crash page
             // again on relaunch.
             crate::platform::app_log::info(
@@ -1888,7 +1832,7 @@ impl App {
             } => {
                 let handle = iced::widget::image::Handle::from_rgba(width, height, rgba);
                 crate::platform::app_log::info(format!(
-                    "servo-dom: favicon {} {width}x{height}",
+                    "browser-dom: favicon {} {width}x{height}",
                     crate::browser::bookmarks::origin_key(&url)
                 ));
                 self.browser.panel.note_favicon(url, handle);

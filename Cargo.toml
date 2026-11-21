@@ -27,13 +27,10 @@ name = "gen_msix_logos"
 path = "src/bin/gen_msix_logos.rs"
 
 [features]
-# Single executable: the engine-rendered browser (Servo offscreen → iced
-# texture) is on by default. Servo's SpiderMonkey build needs Clang + Python
-# at build time and dominates clean-build time, so `--no-default-features`
-# (or `SDSC_NO_ENGINE=1` at runtime) is the fast UI-only fallback.
-default = ["servo-engine"]
-servo-engine = ["dep:servo", "dep:dpi", "dep:euclid", "dep:surfman", "dep:embedder_traits"]
-# CEF OSR engine (pivot phase 3; not default until phase 4).
+# Single executable with CEF OSR in-process. `--no-default-features` is the
+# UI-only iteration build (Browser tile shows the engine install state); it
+# never falls back to a reader/text page.
+default = ["cef-engine"]
 cef-engine = ["dep:cef"]
 
 [target.'cfg(windows)'.dependencies]
@@ -90,20 +87,7 @@ rfd = "0.15"
 rodio = { version = "0.20", default-features = false, features = ["mp3"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 serde = { version = "1", features = ["derive"] }
-# Servo defaults minus devtools: `bundled` (fonts/resources), `clipboard`,
-# `js_jit` and `multiprocess` stay (page performance); `default_tooling`
-# (the remote-debugging server) is pure build cost with no runtime effect.
-servo = { version = "0.8.0", optional = true, default-features = false, features = [
-    "bundled",
-    "clipboard",
-    "js_jit",
-    "multiprocess",
-] }
-surfman = { version = "0.14", optional = true }
 url = "2"
-dpi = { version = "0.1", optional = true }
-embedder_traits = { package = "servo-embedder-traits", version = "0.8.0", optional = true }
-euclid = { version = "0.22", optional = true }
 keyboard-types = "0.8"
 serde_json = "1"
 single-instance = "0.3.3"

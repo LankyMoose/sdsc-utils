@@ -1,4 +1,4 @@
-//! Stable GPU texture for the Servo page frame.
+//! Stable GPU texture for the browser page frame.
 //!
 //! Pattern from `valorant-companion`'s video preview: a custom
 //! `iced_wgpu` primitive owns one RGBA texture per tab and uploads it with
@@ -175,7 +175,7 @@ impl BrowserFramePipeline {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                // Servo's software output is sRGB-encoded RGBA; the sRGB
+                // The engine's software output is sRGB-encoded RGBA; the sRGB
                 // texture view linearizes on sample, matching the image
                 // atlas path this replaces.
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
