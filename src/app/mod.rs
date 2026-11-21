@@ -6,7 +6,9 @@
 //! compositor; popup, Settings, and Start stay ephemeral (create/destroy on each
 //! open — Start uses a normal OS window open).
 
+mod browser;
 mod configure;
+mod hub;
 mod popup;
 mod start;
 mod toast;
@@ -55,7 +57,7 @@ use crate::ui::start::cursor_hide;
 use crate::ui::start::gesture::{self, ChordReleaseGate};
 use crate::ui::start::input::{
     self as start_input, CrossHold, FaceHeld, GestureDetectorBank, NavAction, NavLogSnapshot,
-    NavStepper, PadNavBank,
+    PadNavBank,
 };
 use crate::ui::start::view::{self as start_view, StartMessage};
 use crate::ui::theme;
@@ -487,12 +489,11 @@ pub struct App {
     /// False until Start is revealed and ready — blocks pad nav / sounds early.
     start_nav_ready: bool,
     start_state: start_view::State,
-    /// Multi-app foreground/background manager (in-Start browser today;
-    /// games launch out of Start so they join only with an engine backend).
-    apps: crate::browser::AppManager,
-    /// Servo offscreen worker handle (`servo-engine` feature only; `None`
-    /// otherwise — the reader backend owns loads then).
-    engine: Option<EngineHandle>,
+    /// Top-level browser app: panel, engine worker, capability flag, and
+    /// browser-only D-pad stepper. No longer owned by `StartState`.
+    browser: browser::BrowserAppState,
+    /// Managed-app hub: installed/active apps and transition effects.
+    hub: hub::AppHub,
     /// Monitor covered by the Start window (stage size for the view).
     start_monitor_cover: Option<MonitorCover>,
     /// This process was relaunched by the crash handler: restore tabs in
@@ -512,11 +513,6 @@ pub struct App {
     start_revealed_at: Option<Instant>,
     gesture_detectors: GestureDetectorBank,
     pad_nav: PadNavBank,
-    /// Engine-mode D-pad cursor jumps run on this standalone stepper (fed a
-    /// stickless [`start_input::dpad_only`] mask): the banked stepper stays
-    /// parked in engine mode so stick moves never double-fire into both
-    /// cursor and nav. Reset with the browser surface.
-    browser_dpad_stepper: NavStepper,
     /// When set, the next start cue may rumble this DualSense serial (pad-originated).
     haptic_pad_serial: Option<Serial>,
     /// Keyboard Enter hold for replace-confirm (not folded into pad slots).
@@ -777,6 +773,14 @@ impl App {
         } else {
             crate::browser::tabs::boot_url()
         };
+        #[cfg(feature = "servo-engine")]
+        let browser_engine = if std::env::var("SDSC_NO_ENGINE").is_ok() {
+            None
+        } else {
+            crate::browser::servo_backend::spawn_engine(&boot_url, initial_page)
+        };
+        #[cfg(not(feature = "servo-engine"))]
+        let browser_engine: Option<EngineHandle> = None;
         let mut app = Self {
             session,
             games,
@@ -851,15 +855,11 @@ impl App {
             last_start_paint_active: std::cell::Cell::new(false),
             start_nav_ready: false,
             start_state: start_view::State::default(),
-            apps: crate::browser::AppManager::new(),
-            #[cfg(feature = "servo-engine")]
-            engine: if std::env::var("SDSC_NO_ENGINE").is_ok() {
-                None
-            } else {
-                crate::browser::servo_backend::spawn_engine(&boot_url, initial_page)
+            browser: browser::BrowserAppState {
+                engine: browser_engine,
+                ..Default::default()
             },
-            #[cfg(not(feature = "servo-engine"))]
-            engine: None,
+            hub: hub::AppHub::new(),
             start_monitor_cover: None,
             crash_restart_boot,
             start_last_activity: Instant::now(),
@@ -870,7 +870,6 @@ impl App {
             start_revealed_at: None,
             gesture_detectors: GestureDetectorBank::default(),
             pad_nav: PadNavBank::default(),
-            browser_dpad_stepper: NavStepper::default(),
             haptic_pad_serial: None,
             keyboard_cross_hold: CrossHold::default(),
             confirm_key_held: false,
@@ -930,15 +929,15 @@ impl App {
         // Apply the boot-time browser geometry to the panel/cursor now; the
         // Start screen may not open for a while and the browser must be
         // ready at the right size when it does.
-        app.start_state
-            .browser
+        app.browser
+            .panel
             .set_viewport(initial_browser.page_w, initial_browser.page_h);
 
         // Disk-persisted bookmarks into the browser panel (the one state
         // that survives restarts by design). Rebuild chrome after: the
         // panel default built its snap map with an empty bookmark row.
-        app.start_state.browser.bookmarks = crate::browser::bookmarks::load();
-        app.start_state.browser.rebuild_chrome();
+        app.browser.panel.bookmarks = crate::browser::bookmarks::load();
+        app.browser.panel.rebuild_chrome();
 
         // Show the tray immediately; the daemon owns it for its whole lifetime.
         app.create_tray();
@@ -960,8 +959,8 @@ impl App {
         app.seed_steam_library_from_cache();
         // Engine presence is process-static: sync once so the browser card
         // can label its backend (engine pixels vs reader text).
-        app.start_state.browser_engine = app.engine.is_some();
-        if app.engine.is_some() {
+        app.browser.engine_available = app.browser.engine.is_some();
+        if app.browser.engine.is_some() {
             crate::platform::app_log::info("browser: engine backend active");
         } else {
             crate::platform::app_log::info("browser: reader backend active");
@@ -1241,7 +1240,7 @@ impl App {
 
         // Servo engine worker → UI event bridge (only with the feature; the
         // worker idles suspended until the browser surface resumes it).
-        if let Some(engine) = self.engine.clone() {
+        if let Some(engine) = self.browser.engine.clone() {
             subscriptions.push(Subscription::run_with(engine, engine_event_stream));
         }
 
@@ -1364,6 +1363,8 @@ impl App {
             let settings_snapshot = self.start_settings_snapshot();
             let start = start_view::view(
                 &self.start_state,
+                &self.browser.panel,
+                self.browser.engine_available,
                 &self.session.prefs.spectrum,
                 Instant::now(),
                 self.session.prefs.start_screen_clock_enabled,
@@ -1455,7 +1456,7 @@ impl App {
             #[cfg(debug_assertions)]
             Message::ToggleDebugBrowser => {
                 self.debug_browser = !self.debug_browser;
-                self.start_state.browser.debug_overlay = self.debug_browser;
+                self.browser.panel.debug_overlay = self.debug_browser;
                 Task::none()
             }
             #[cfg(debug_assertions)]
@@ -1675,7 +1676,7 @@ impl App {
             // a later window (the force_cursor gate above is the backstop).
             self.set_start_cursor_hidden(false);
             self.pad_nav.reset();
-            self.browser_dpad_stepper.reset();
+            self.browser.dpad_stepper.reset();
             self.clear_start_nav_diag();
             self.consume_reopen_gesture_chord();
             let sync = self.sync_toast_zorder();
@@ -1965,7 +1966,7 @@ impl App {
                         self.on_ambient_tuning_nav(Some(NavAction::Up))
                     } else if self.start_state.settings.open {
                         self.on_start_settings_nav(Some(NavAction::Up))
-                    } else if self.start_state.browser.session.is_open() {
+                    } else if self.browser.panel.session.is_open() {
                         self.scroll_browser(-crate::ui::start::view::BROWSER_SCROLL_STEP)
                     } else if self.immersive_horizontal_games_nav() {
                         // Horizontal Games strip scrolls Left/Right only.
@@ -1980,7 +1981,7 @@ impl App {
                         self.on_ambient_tuning_nav(Some(NavAction::Down))
                     } else if self.start_state.settings.open {
                         self.on_start_settings_nav(Some(NavAction::Down))
-                    } else if self.start_state.browser.session.is_open() {
+                    } else if self.browser.panel.session.is_open() {
                         self.scroll_browser(crate::ui::start::view::BROWSER_SCROLL_STEP)
                     } else if self.immersive_horizontal_games_nav() {
                         // Horizontal Games strip scrolls Left/Right only.
@@ -2029,7 +2030,7 @@ impl App {
                         self.cancel_start_holds();
                         if self.start_state.ambient_tuning_active() {
                             self.on_ambient_tuning_nav(Some(NavAction::Confirm))
-                        } else if self.start_state.browser.session.is_open() {
+                        } else if self.browser.panel.session.is_open() {
                             self.on_start_message(StartMessage::BrowserNavigate)
                         } else if self.start_state.settings.open {
                             self.on_start_settings_nav(Some(NavAction::Confirm))
@@ -2146,7 +2147,7 @@ impl App {
         self.art.shutdown();
         // Persist the tab strip (backstop — mutations already save on the
         // way; this covers a crash-free quit with no prior change).
-        self.start_state.browser.save_tabs();
+        self.browser.panel.save_tabs();
         // Idempotent with `InputEdgeBindGuard::drop` (subscription
         // teardown also clears).
         self.input_hub.clear();
@@ -2156,7 +2157,7 @@ impl App {
         // cookie_jar.json + auth/hsts to disk), then acks. The wait is
         // bounded — a hung constellation must not hang quit forever (on
         // timeout the process exits as before, cookies lost).
-        if let Some(engine) = &self.engine {
+        if let Some(engine) = &self.browser.engine {
             // Flush proof: stat the jar before and after. A completed
             // shutdown that doesn't move the file means the resource thread
             // skipped its write (config) rather than us racing the exit.
@@ -2171,7 +2172,7 @@ impl App {
             // Surface state rides along: tests whether quit-time suspension
             // correlates with missed flushes (the in-app shutdown with the
             // surface open flushed fine).
-            let surface_open = self.start_state.browser.session.is_open();
+            let surface_open = self.browser.panel.session.is_open();
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: cookie jar before shutdown: {:?} {:?} surface_open={surface_open}",
                 jar_path,

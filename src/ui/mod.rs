@@ -1,6 +1,7 @@
 #[cfg(debug_assertions)]
 pub mod ambient_preview;
 pub mod backdrop;
+pub mod browser;
 pub mod chrome;
 pub mod color;
 pub mod configure;

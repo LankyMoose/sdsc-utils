@@ -17,8 +17,9 @@ use crate::ui::start::row::{game_subtitle_block, update_required_badge};
 use crate::ui::start::settings::{edit_confirm_view, manual_add_view, replace_confirm_view};
 use crate::ui::start::translate::backdrop_art;
 use crate::ui::start::view::{
-    BROWSER_CARD_PAD, HintPress, HintPressOwner, LaunchStatus, StartControllerRow, StartMessage,
-    StartRow, State, browser_layout, browser_view, scan_status_chip, scan_status_stack,
+    BROWSER_CARD_PAD, BrowserPanel, HintPress, HintPressOwner, LaunchStatus, StartControllerRow,
+    StartMessage, StartRow, State, browser_layout, browser_view, scan_status_chip,
+    scan_status_stack,
 };
 use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics, StripOrientation};
 use crate::ui::theme;
@@ -60,6 +61,8 @@ const DOCK_HINT_COL_W: f32 = 210.0;
 #[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     state: &'a State,
+    browser: &'a BrowserPanel,
+    browser_engine: bool,
     spectrum: &BatterySpectrum,
     now: Instant,
     clock_enabled: bool,
@@ -323,7 +326,7 @@ pub fn view<'a>(
     // room while the immersive chrome stays visible around the edges. Wash
     // click toggles it closed, exactly like Circle/Cancel; the card absorbs
     // clicks. Above modals, below the settings drawer.
-    if state.browser.session.is_open() {
+    if browser.session.is_open() {
         // 16:9 page area sized from the available viewport height, header
         // fixed on top, tight card padding and a ~2rem screen breather.
         let layout = browser_layout(stage_w, stage_h);
@@ -334,7 +337,7 @@ pub fn view<'a>(
         layers.push(overlay::centered(Scale::new(
             overlay::click_shield(
                 overlay::dialog_card_padded(
-                    browser_view(state, layout.page_w, layout.page_h),
+                    browser_view(browser, browser_engine, layout.page_w, layout.page_h),
                     Length::Fixed(layout.card_w),
                     Some(layout.card_h),
                     BROWSER_CARD_PAD,

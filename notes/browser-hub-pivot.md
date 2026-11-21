@@ -1,11 +1,11 @@
 # Browser hub pivot — managed apps + CEF engine (planned)
 
-**Status:** planned (branch `browser/hub-pivot`, based on `browser/main`).
+**Status:** in progress (branch `browser/hub-pivot`, based on `browser/main`).
+Phase 0 (state extraction) landed; the hub window is next.
 **When to read:** before touching Start/browser window ownership, the PS
 overlay, app selection, the engine backend, or MSIX packaging.
 
-This note is the agreed direction, not a description of current code. Current
-browser internals: [browser-embedding.md](browser-embedding.md).
+Current browser internals: [browser-embedding.md](browser-embedding.md).
 
 ## Goal
 
@@ -76,12 +76,15 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
 
 ## Phases (each lands green; `bash scripts/ci.sh`)
 
-0. **Extract state, no behavior change (Servo still working).** Move
-   `BrowserPanel`/tabs/store/chrome/cursor/engine out of `StartState` into a
-   top-level `BrowserAppState` (same file paths for `tabs.json`/
-   `bookmarks.json`). Promote `AppManager` to a real top-level hub
-   (`AppId { Start, Browser }`, install/active/focus, open/close/suspend/
-   resume). Repoint the ~100 `start_state.browser.*` sites.
+0. **Extract state, no behavior change (Servo still working). — landed.**
+   `BrowserPanel`/tabs/store/chrome/cursor moved to
+   `src/ui/browser/state.rs`; panel + engine handle + capability flag +
+   browser D-pad stepper now live in `BrowserAppState`
+   (`src/app/browser.rs`). `StartState` keeps only a `browser_open` mirror
+   for pure view helpers. `AppManager` was replaced by `AppHub`
+   (`src/app/hub.rs`, `AppId { Start, Browser }`, install/active/focus,
+   open/close/suspend/resume); Start still renders the panel until phase 2.
+   `tabs.json`/`bookmarks.json` paths unchanged.
 1. **Hub window + PS retarget + auto-open moved.** New `src/ui/hub/` +
    `src/app/hub.rs`, same open/close/focus pattern as popup/configure. Hub is
    the topmost exception. Pref migration + toast-settle latch + over-game

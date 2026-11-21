@@ -39,6 +39,17 @@ the `servo-engine` feature. **Planned replacement:** [browser-hub-pivot.md](brow
   per-document ids, visibility verdicts, overflow clipping, scroll truth and
   document dims. Culling/retention is deliberate (pull cost + Servo's slow
   `getComputedStyle`).
+- `src/ui/browser/state.rs` — `BrowserPanel`, per-tab `BrowserTabPage`,
+  `StoredTab`, `HistorySelector`, chrome targets/layout, cursor integration,
+  bookmarks/favicon cache, tab persistence helpers. Extracted from the Start
+  view in phase 0; the Start view re-exports it until the standalone window
+  lands.
+- `src/app/browser.rs` — `BrowserAppState`: panel, engine handle, capability
+  flag, browser-only D-pad stepper (the browser no longer lives inside
+  `StartState`).
+- `src/app/hub.rs` — `AppHub`: installed/active apps (`AppId::Start`,
+  `AppId::Browser`) and show/hide/focus/suspend/resume/close effects. Pure
+  bookkeeping today; the hub window consumes it in phase 1.
 - `src/browser/cursor.rs` — controller cursor: analog free point, magnet dock
   with acquire/hold hysteresis and break-free, D-pad flights (fixed 150ms
   tween; wrap-to-wrap morph), unified page+header space, row-locked
