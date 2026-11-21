@@ -114,9 +114,9 @@ tray-icon = { version = "0.24.2", default-features = false, features = ["gtk"] }
 [profile.dev]
 # Link time dominates engine builds (one ~250MB binary), so keep debuginfo
 # minimal for iteration: line tables for our own code (usable panics and
-# backtraces), none for dependencies. This also compiles the mozjs C++ objects
-# without `-g` (build scripts see `DEBUG=false`), which shrinks objects and
-# speeds both compile and link. Release profiles are untouched.
+# backtraces), none for dependencies (build scripts see `DEBUG=false`),
+# which shrinks objects and speeds both compile and link. Release profiles are
+# untouched.
 debug = "line-tables-only"
 codegen-units = 256
 incremental = true

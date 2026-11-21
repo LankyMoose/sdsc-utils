@@ -230,8 +230,8 @@ impl super::App {
         let now = std::time::Instant::now();
         let history_open = self.browser.panel.history_selector.is_some();
         let engine_mode = self.browser.panel.session.has_frame();
-        // History selector and the reader path use D-pad nav; engine mode
-        // parks it (cursor jumps run on the dedicated stepper).
+        // History selector uses D-pad nav; engine mode parks it (cursor
+        // jumps run on the dedicated stepper).
         let allow_nav = history_open || !engine_mode;
         let tick = self.browser.nav.tick(
             readings, now, allow_nav, true, false, false, false, false, false,

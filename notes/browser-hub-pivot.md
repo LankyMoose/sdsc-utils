@@ -118,8 +118,8 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    navigate, tabs (open/close/activate), resize, visibility/suspend, back/
    forward, reload, mouse move/click/wheel, keyboard, click-at, DOM reseed.
    `--type=` subprocesses re-exec the exe and run `CefExecuteProcess` before
-   argument parsing. CEF is behind `cef-engine`, mutually exclusive with
-   `servo-engine` for now; it needs the static MSVC CRT because
+   argument parsing. During phase 3 CEF was behind `cef-engine`, mutually
+   exclusive with `servo-engine`; it needs the static MSVC CRT because
    `libcef_dll_wrapper` is built `/MT`. Sandbox is disabled in this phase;
    popups (`window.open`/`target=_blank`) are denied; favicons and
    `HistoryChanged` are not emitted yet. Engine-presence/DLC install remains

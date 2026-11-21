@@ -39,7 +39,7 @@ cargo build --release
 
 This writes `target/msix/sdsc-utils.msix` and
 `target/msix/BrowserEngine.msix`. The engine layout copies only runtime files
-(`libcef.dll`, ELF/D3D/compiler DLLs, paks, `icudtl.dat`, locales) under
+(`libcef.dll`, ANGLE/D3D/compiler DLLs, paks, `icudtl.dat`, locales) under
 `cef\`, not CEF headers/CMake/import libs. [`BrowserEngine.AppxManifest.xml`](BrowserEngine.AppxManifest.xml)
 uses the same publisher identity.
 
@@ -56,7 +56,7 @@ uses the same publisher identity.
   `%LOCALAPPDATA%\sdsc-utils\cef-engine`, and starts CEF without a restart.
 
 Engine resolver order: `CEF_PATH` → `cef\` next to the exe → the
-`BrowserEngine` package's `cef\` directory → `%LOCALAPPDATA%\sdsc-utilscef-engine` → debug build `OUT_DIR`. A directory only counts as installed when
+`BrowserEngine` package's `cef\` directory → `%LOCALAPPDATA%\sdsc-utils\cef-engine` → debug build `OUT_DIR`. A directory only counts as installed when
 `libcef.dll`, `icudtl.dat`, `resources.pak`, and `locales/en-US.pak` exist.
 
 ## Store submission

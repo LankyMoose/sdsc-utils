@@ -54,7 +54,7 @@ impl FrameSlot {
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Drop the pixels (new document, reader fallback) and bump the
+    /// Drop the pixels (new document / install placeholder) and bump the
     /// generation so the renderer sees the change.
     pub fn clear(&self) {
         *self.frame.lock().unwrap_or_else(|e| e.into_inner()) = None;

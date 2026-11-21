@@ -62,7 +62,9 @@ pub fn resolve_engine_dir() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     candidates.extend(optional_package_dirs());
     candidates.push(crate::persist::paths::data_dir().join("cef-engine"));
-    #[cfg(debug_assertions)]
+    // Build-time distribution directory. It exists on the build machine
+    // (including `cargo run --release`); portable/Store installs resolve via
+    // the sidecar/package paths above instead.
     if let Some(dir) = cef::sys::get_cef_dir() {
         candidates.push(dir);
     }

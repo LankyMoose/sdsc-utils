@@ -77,9 +77,8 @@ pub struct BrowserSession {
     /// hold-bumper history selector (B2.4). Separate from `history` (which
     /// is MRU-deduped for autocomplete): the session keeps revisit
     /// duplicates and order so back/forward targets are exact. Fed two
-    /// ways — locally on every load/URL change (reader fallback) and
-    /// overwritten by the engine's canonical `HistoryChanged` (
-    /// `notify_history_changed` entries + current) when present.
+    /// ways — locally on every load/URL change and overwritten by the
+    /// engine's canonical `HistoryChanged` when present.
     nav_stack: Vec<HistoryEntry>,
     nav_index: Option<usize>,
     /// Pending history traversal target (absolute session index). While set,

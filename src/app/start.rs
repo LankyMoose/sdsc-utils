@@ -1746,10 +1746,9 @@ impl App {
         Task::none()
     }
 
-    /// Pad/keyboard body scroll for the reader browser (engine mode scrolls
-    /// via [`Self::tick_browser_cursor`] instead). With engine
-    /// pixels on screen the scroll goes to the engine (which repaints);
-    /// the reader path scrolls the text widget instead.
+    /// Pad/keyboard body scroll. Engine mode scrolls Chromium at the cursor
+    /// point (`tick_browser_cursor` handles analog scroll); this path covers
+    /// explicit D-pad/keys.
     pub(crate) fn scroll_browser(&mut self, delta: f32) -> Task<Message> {
         if self.browser.panel.session.has_frame() {
             if let Some(engine) = &self.browser.engine {
