@@ -14,7 +14,7 @@ pub const POLL_MISS_HOLD: Duration = Duration::from_secs(2);
 /// Whether any pad counts toward start-screen auto-open / auto-close.
 ///
 /// When `include_usb` is false, only Bluetooth pads qualify.
-pub fn has_start_presence(controllers: &[ControllerStatus], include_usb: bool) -> bool {
+pub fn has_hub_presence(controllers: &[ControllerStatus], include_usb: bool) -> bool {
     controllers.iter().any(|c| {
         if include_usb {
             true
@@ -25,7 +25,7 @@ pub fn has_start_presence(controllers: &[ControllerStatus], include_usb: bool) -
 }
 
 /// Gate for automatic start-screen open on a qualifying 0→1 connect.
-pub fn should_auto_open_start(
+pub fn should_auto_open_hub(
     enabled: bool,
     previous_empty: bool,
     next_nonempty: bool,
@@ -37,16 +37,12 @@ pub fn should_auto_open_start(
 }
 
 /// Close Start when qualifying presence drops 1→0 while the window is visible.
-pub fn should_auto_close_start(
-    prev_present: bool,
-    next_present: bool,
-    start_visible: bool,
-) -> bool {
+pub fn should_auto_close_hub(prev_present: bool, next_present: bool, start_visible: bool) -> bool {
     prev_present && !next_present && start_visible
 }
 
 /// Defer 0→1 Start until a connect toast finishes slide-in (both stay on screen).
-pub fn should_defer_auto_open_start(want_open: bool, connect_toast_queued: bool) -> bool {
+pub fn should_defer_auto_open_hub(want_open: bool, connect_toast_queued: bool) -> bool {
     want_open && connect_toast_queued
 }
 
@@ -102,7 +98,7 @@ pub fn connect_cooldown_on_empty(
 }
 
 /// Latched flush: open if still enabled and not already open (ignore fullscreen/cooldown).
-pub fn should_flush_latched_start(pending: bool, start_enabled: bool, already_open: bool) -> bool {
+pub fn should_flush_latched_hub(pending: bool, start_enabled: bool, already_open: bool) -> bool {
     pending && start_enabled && !already_open
 }
 
@@ -174,108 +170,98 @@ mod tests {
 
     #[test]
     fn opens_on_clean_zero_to_one() {
-        assert!(should_auto_open_start(
-            true, true, true, false, false, false
-        ));
+        assert!(should_auto_open_hub(true, true, true, false, false, false));
     }
 
     #[test]
     fn skips_when_disabled_empty_open_cooldown_or_fullscreen() {
-        assert!(!should_auto_open_start(
+        assert!(!should_auto_open_hub(
             false, true, true, false, false, false
         ));
-        assert!(!should_auto_open_start(
+        assert!(!should_auto_open_hub(
             true, false, true, false, false, false
         ));
-        assert!(!should_auto_open_start(
-            true, true, true, true, false, false
-        ));
-        assert!(!should_auto_open_start(
-            true, true, true, false, true, false
-        ));
-        assert!(!should_auto_open_start(
-            true, true, true, false, false, true
-        ));
+        assert!(!should_auto_open_hub(true, true, true, true, false, false));
+        assert!(!should_auto_open_hub(true, true, true, false, true, false));
+        assert!(!should_auto_open_hub(true, true, true, false, false, true));
     }
 
     #[test]
     fn presence_includes_usb_when_allowed() {
         let usb = vec![usb_pad("aa:bb")];
-        assert!(has_start_presence(&usb, true));
-        assert!(!has_start_presence(&usb, false));
-        assert!(has_start_presence(&[pad("aa:bb")], false));
-        assert!(has_start_presence(&[usb_pad("aa:bb"), pad("cc:dd")], false));
-        assert!(!has_start_presence(&[], false));
+        assert!(has_hub_presence(&usb, true));
+        assert!(!has_hub_presence(&usb, false));
+        assert!(has_hub_presence(&[pad("aa:bb")], false));
+        assert!(has_hub_presence(&[usb_pad("aa:bb"), pad("cc:dd")], false));
+        assert!(!has_hub_presence(&[], false));
     }
 
     #[test]
     fn usb_off_usb_only_connect_does_not_open() {
-        let prev = has_start_presence(&[], false);
-        let next = has_start_presence(&[usb_pad("aa:bb")], false);
-        assert!(!should_auto_open_start(
+        let prev = has_hub_presence(&[], false);
+        let next = has_hub_presence(&[usb_pad("aa:bb")], false);
+        assert!(!should_auto_open_hub(
             true, !prev, next, false, false, false
         ));
     }
 
     #[test]
     fn usb_off_bluetooth_connect_while_usb_present_opens() {
-        let prev = has_start_presence(&[usb_pad("aa:bb")], false);
-        let next = has_start_presence(&[usb_pad("aa:bb"), pad("cc:dd")], false);
+        let prev = has_hub_presence(&[usb_pad("aa:bb")], false);
+        let next = has_hub_presence(&[usb_pad("aa:bb"), pad("cc:dd")], false);
         assert!(!prev);
         assert!(next);
-        assert!(should_auto_open_start(
-            true, !prev, next, false, false, false
-        ));
+        assert!(should_auto_open_hub(true, !prev, next, false, false, false));
     }
 
     #[test]
     fn usb_off_last_bluetooth_leave_closes_with_usb_remaining() {
-        let prev = has_start_presence(&[usb_pad("aa:bb"), pad("cc:dd")], false);
-        let next = has_start_presence(&[usb_pad("aa:bb")], false);
-        assert!(should_auto_close_start(prev, next, true));
-        assert!(!should_auto_close_start(prev, next, false));
+        let prev = has_hub_presence(&[usb_pad("aa:bb"), pad("cc:dd")], false);
+        let next = has_hub_presence(&[usb_pad("aa:bb")], false);
+        assert!(should_auto_close_hub(prev, next, true));
+        assert!(!should_auto_close_hub(prev, next, false));
     }
 
     #[test]
     fn usb_off_usb_leave_while_bluetooth_remains_does_not_close() {
-        let prev = has_start_presence(&[usb_pad("aa:bb"), pad("cc:dd")], false);
-        let next = has_start_presence(&[pad("cc:dd")], false);
-        assert!(!should_auto_close_start(prev, next, true));
+        let prev = has_hub_presence(&[usb_pad("aa:bb"), pad("cc:dd")], false);
+        let next = has_hub_presence(&[pad("cc:dd")], false);
+        assert!(!should_auto_close_hub(prev, next, true));
     }
 
     #[test]
     fn usb_on_presence_matches_raw_list() {
         let usb = vec![usb_pad("aa:bb")];
-        assert!(has_start_presence(&usb, true));
-        assert!(should_auto_open_start(
+        assert!(has_hub_presence(&usb, true));
+        assert!(should_auto_open_hub(
             true,
-            !has_start_presence(&[], true),
-            has_start_presence(&usb, true),
+            !has_hub_presence(&[], true),
+            has_hub_presence(&usb, true),
             false,
             false,
             false
         ));
-        assert!(should_auto_close_start(
-            has_start_presence(&usb, true),
-            has_start_presence(&[], true),
+        assert!(should_auto_close_hub(
+            has_hub_presence(&usb, true),
+            has_hub_presence(&[], true),
             true
         ));
     }
 
     #[test]
     fn defers_start_only_when_connect_toast_pending() {
-        assert!(should_defer_auto_open_start(true, true));
-        assert!(!should_defer_auto_open_start(true, false));
-        assert!(!should_defer_auto_open_start(false, true));
-        assert!(!should_defer_auto_open_start(false, false));
+        assert!(should_defer_auto_open_hub(true, true));
+        assert!(!should_defer_auto_open_hub(true, false));
+        assert!(!should_defer_auto_open_hub(false, true));
+        assert!(!should_defer_auto_open_hub(false, false));
     }
 
     #[test]
     fn latched_flush_ignores_fullscreen_and_requires_pending() {
-        assert!(should_flush_latched_start(true, true, false));
-        assert!(!should_flush_latched_start(true, true, true));
-        assert!(!should_flush_latched_start(true, false, false));
-        assert!(!should_flush_latched_start(false, true, false));
+        assert!(should_flush_latched_hub(true, true, false));
+        assert!(!should_flush_latched_hub(true, true, true));
+        assert!(!should_flush_latched_hub(true, false, false));
+        assert!(!should_flush_latched_hub(false, true, false));
     }
 
     #[test]

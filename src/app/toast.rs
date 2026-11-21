@@ -254,7 +254,7 @@ impl App {
                 progress,
                 dismissing,
             } => self.effect_toast_move(progress, dismissing),
-            ToastEffect::OpenStart => self.effect_open_start(),
+            ToastEffect::OpenHub => self.effect_open_hub(),
             ToastEffect::Finished => self.effect_toast_finished(),
             ToastEffect::RaiseInteractive { focus } => self.raise_interactive_ui_above_toast(focus),
         }
@@ -284,18 +284,18 @@ impl App {
         move_window(id, Point::new(placement.x, y))
     }
 
-    pub(crate) fn effect_open_start(&mut self) -> Task<Message> {
-        if crate::session::should_flush_latched_start(
+    pub(crate) fn effect_open_hub(&mut self) -> Task<Message> {
+        if crate::session::should_flush_latched_hub(
             true,
             self.session.prefs.start_screen_enabled
                 && self.session.prefs.start_screen_auto_open.auto_opens(),
-            self.start_visible,
+            self.hub_visible,
         ) {
-            crate::controller::hid::diag::diag_info("ui-diag: start open after toast settle");
-            self.open_start_screen()
+            crate::controller::hid::diag::diag_info("ui-diag: hub open after toast settle");
+            self.open_hub()
         } else {
             crate::controller::hid::diag::diag_info(
-                "ui-diag: latched start skipped (disabled or already open)",
+                "ui-diag: latched hub skipped (disabled or already open)",
             );
             Task::none()
         }
@@ -340,6 +340,13 @@ impl App {
 
     /// Prefer Settings, then Start, then popup as the focused presenting window.
     pub(crate) fn refocus_interactive_ui(&self) -> Task<Message> {
+        // The hub outranks every other shell surface; never steal its focus
+        // back to Start/Settings while it is open.
+        if self.hub_visible
+            && let Some(id) = self.hub_window
+        {
+            return focus_window(id);
+        }
         if let Some(id) = self.configure_window {
             return focus_window(id);
         }
@@ -364,15 +371,15 @@ impl App {
         if let Some(id) = self.popup_window {
             task = task.chain(raise_window_topmost(id));
         }
-        if self.start_visible {
-            if let Some(id) = self.start_window {
-                task = task.chain(raise_window_topmost(id));
-            }
-        } else if focus && self.start_window.is_some() {
-            // Resting frames raise every tick — only log on settle/sync (focus).
-            crate::controller::hid::diag::diag_info("ui-diag: start raise skipped (hidden)");
-        }
+        // Start is a normal-level app now: the toast intentionally floats
+        // above it (only the hub outranks the toast).
         if let Some(id) = self.configure_window {
+            task = task.chain(raise_window_topmost(id));
+        }
+        if self.hub_visible
+            && let Some(id) = self.hub_window
+        {
+            // Raised last: the hub is the one surface above the toast band.
             task = task.chain(raise_window_topmost(id));
         }
         if focus {
@@ -431,6 +438,13 @@ impl App {
             place = place
                 .chain(show_toast_without_activate(id))
                 .chain(invalidate_toast(id));
+        }
+        // The hub outranks the toast even during the slide-in, before the
+        // resting RaiseInteractive tick.
+        if self.hub_visible
+            && let Some(hub) = self.hub_window
+        {
+            place = place.chain(raise_window_topmost(hub));
         }
         place.chain(Task::done(Message::ToastShown { generation }))
     }

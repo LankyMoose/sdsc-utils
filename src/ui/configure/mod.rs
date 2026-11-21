@@ -1698,8 +1698,8 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
     let mut groups = Column::new().spacing(18).width(Fill);
 
     let mut opening = vec![toggle_row(
-        "Enable start screen",
-        Some("A controller-friendly launcher for your games"),
+        "Enable PS hub",
+        Some("Controller-first app switcher and Start screen launcher"),
         settings.start_screen_enabled,
         ConfigureMessage::SetStartScreenEnabled,
     )];
@@ -1707,7 +1707,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         opening.push(
             row![
                 column![
-                    text("Auto open")
+                    text("Auto open hub")
                         .size(theme::type_scale::BODY)
                         .color(theme::INK),
                     text("When a controller connects")

@@ -2,15 +2,20 @@
 
 **Status:** do-not-regress. **When to read:** toast/Start present starvation, wrong toast content, connect-open races. Index: [README.md](README.md).
 
+> **Hub pivot (phase 1):** Start and the future Browser window are
+> `Level::Normal`; the PS hub is the only shell surface above the toast.
+> `AfterToast::OpenStart` is now `OpenHub`, and auto-open targets the hub.
+> The history below explains why the toast band must stay intact.
+
 ## Toast Z-order vs Settings / Start freeze (Windows)
 
 iced multi-window present starvation: [iced#3108](https://github.com/iced-rs/iced/issues/3108) / [#3320](https://github.com/iced-rs/iced/issues/3320).
 
-**Do not demote** the toast to `HWND_NOTOPMOST` when Settings/Start/popup are open — that puts the toast under Cursor.
+**Do not demote** the toast to `HWND_NOTOPMOST` when the hub/Settings/popup are open — that puts the toast under Cursor.
 
-**Do not** raise toast above Start every `ToastFrame` — that starves Start presents.
+**Do not** raise the toast above Start every `ToastFrame` — that starves Start presents.
 
-**Do:** keep toast `HWND_TOPMOST` (above Cursor); raise Start/Settings into the same topmost band *above* the toast (corner toast stays visible beside centered Start); `gain_focus` the interactive window.
+**Do (current):** keep toast `HWND_TOPMOST` (above Cursor); raise Settings/popup into the topmost band above the toast, and raise the hub **last** so it outranks everything. Start stays `Normal` and is deliberately *under* the toast; `gain_focus` the interactive window. The corner toast remains visible beside a centered Start, and the hub stays above both.
 
 **Immersive cover:** the primary-monitor Start HWND occludes the toast HWND (and unowned `rfd` file dialogs). Do **not** raise the toast above Start (present starvation). While immersive, composite the same toast card into the Start window (`Float` overlay at cover-local slide pose); keep the toast HWND blank/hidden (no `show_toast_without_activate`, no `move_to`). Parent add/edit shortcut file dialogs to the Start HWND via `rfd::FileDialog::set_parent` so the picker opens above the cover.
 
@@ -36,9 +41,9 @@ Cause (session `1790509148457`): a 500ms Start deadline fired **before** `place 
 
 Cause (session `1790510886493`): after the state machine landed, a **2s Placing wall-clock failsafe** treated a stale `ToastFrame` `raw_dt` (time since app boot / last toast) as “placement gave up.” Log: `Idle->Placing` → `Placing->Idle` + `start open` in the same second — toast never reached `SlidingIn`. Reconnect after intentional power-off then showed toast with `after=Nothing` because `START_CONNECT_COOLDOWN` armed on the power-off 1→0.
 
-Fix: pure presentation state machine in [`src/ui/toast/machine.rs`](../src/ui/toast/machine.rs). Phases `Placing → SlidingIn → Resting → SlidingOut`. **Placing is event-only** (`Frame` ignored for phase change; leave only on `Shown` or `Dismiss`) — **no placing wall-clock failsafe** (stays removed). Start opens only as an `OpenStart` effect from slide rest or dismiss finish. `RaiseInteractive` only after Resting. Placement uses `primary_toast_area()` immediately (no `monitor_size` hop). Intentional power-off sets `skip_next_connect_cooldown` only when that pad was the sole live controller, so the next reconnect can latch `OpenStart` again (unexpected disconnects still get the 5s ghost-flap cooldown; powering off one of several must not treat a sibling as a fresh 0→1). Do not put the toast on a second thread — iced presents on one UI thread.
+Fix: pure presentation state machine in [`src/ui/toast/machine.rs`](../src/ui/toast/machine.rs). Phases `Placing → SlidingIn → Resting → SlidingOut`. **Placing is event-only** (`Frame` ignored for phase change; leave only on `Shown` or `Dismiss`) — **no placing wall-clock failsafe** (stays removed). The hub opens only as an `OpenHub` effect from slide rest or dismiss finish. `RaiseInteractive` only after Resting. Placement uses `primary_toast_area()` immediately (no `monitor_size` hop). Intentional power-off sets `skip_next_connect_cooldown` only when that pad was the sole live controller, so the next reconnect can latch `OpenHub` again (unexpected disconnects still get the 5s ghost-flap cooldown; powering off one of several must not treat a sibling as a fresh 0→1). Do not put the toast on a second thread — iced presents on one UI thread.
 
-**Reopen gesture during latch:** `suppresses_reopen_gesture()` while `after == OpenStart` and phase is Placing/SlidingIn. During Placing, suppress lifts after ~60 Frame ticks (~1s) so a lost `Shown` cannot block the gesture forever; phase stays Placing and no `OpenStart` is emitted from that budget.
+**Reopen gesture during latch:** `suppresses_reopen_gesture()` while `after == OpenHub` and phase is Placing/SlidingIn. During Placing, suppress lifts after ~60 Frame ticks (~1s) so a lost `Shown` cannot block the gesture forever; phase stays Placing and no `OpenHub` is emitted from that budget.
 
 ### 0→1 Connected vs Start open order
 
@@ -47,7 +52,7 @@ Auto-open suppresses the Connected toast at the session layer
 opens immediately with no toast to race. The shell keeps a second-layer
 filter for service-race leftovers.
 
-Auto-open is immediate: the session strips the Connected card on 0→1 auto-open and opens Start at once, so there is no toast to race. The `AfterToast::OpenStart` latch remains as a second layer for service-race leftovers (a Connected card that slipped through still opens Start on slide rest via the machine effect, exactly once — settle consumes the latch, and early dismiss / slide-out finish also emit it). A mid-toast 1→0 clears the latch via `ClearStartLatch`, so Start never opens after the pads left.
+Auto-open is immediate: the session strips the Connected card on 0→1 auto-open and opens the **hub** at once, so there is no toast to race. The `AfterToast::OpenHub` latch remains as a second layer for service-race leftovers (a Connected card that slipped through still opens the hub on slide rest via the machine effect, exactly once — settle consumes the latch, and early dismiss / slide-out finish also emit it). A mid-toast 1→0 clears the latch via `ClearStartLatch`, so the hub never opens after the pads left.
 
 Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: connect toast suppressed (immersive auto-open`, `ui-diag: start open after toast settle`.
 
@@ -57,6 +62,6 @@ Toast and Start are separate gates. To stop Connected-without-Start on turn-on:
 
 - **One-miss hold:** a failed battery/open poll keeps the last status for one tick; the second consecutive miss accepts the drop. Presence-empty (HID list gone) still clears immediately.
 - **Short arrival:** nonempty stretch under 2s does not arm the 5s ghost cooldown (enumerate blip). Stable disconnects still arm it; intentional Power Off still skips.
-- **Pending retry:** `start_auto_open_pending` is set when 0→1 auto-open gates pass; cleared only once Start is visible. Close-in-flight leaves it set; `WindowClosed` retries. Confirmed empty clears pending and `clear_after()` even when Start is not visible.
+- **Pending retry:** `auto_open_pending` is set when 0→1 auto-open gates pass; cleared once the hub is visible. Close-in-flight leaves it set; `WindowClosed` retries the hub. Confirmed empty clears pending and `clear_after()` even when the hub is not visible.
 
-Debug grep: `ui-diag: defer start until toast slide settles`, `ui-diag: toast Placing->SlidingIn`, `ui-diag: toast SlidingIn->Resting`, `ui-diag: toast show … body=Connected after=OpenStart`, `ui-diag: place toast gen=`, `ui-diag: start open after toast settle`, `ui-diag: skip connect cooldown (intentional power-off)`, `ui-diag: skip connect cooldown (short arrival)`, `ui-diag: hold pad across missed read serial=`, `ui-diag: retry start open after close`, `ui-diag: reopen gesture suppressed (toast OpenStart pending)`, `ui-diag: immersive connect toast`, `ui-diag: connect toast suppressed (immersive auto-open`.
+Debug grep: `ui-diag: defer hub until toast slide settles`, `ui-diag: toast Placing->SlidingIn`, `ui-diag: toast SlidingIn->Resting`, `ui-diag: toast show … body=Connected after=OpenHub`, `ui-diag: place toast gen=`, `ui-diag: hub open after toast settle`, `ui-diag: skip connect cooldown (intentional power-off)`, `ui-diag: skip connect cooldown (short arrival)`, `ui-diag: hold pad across missed read serial=`, `ui-diag: retry hub open after close`, `ui-diag: reopen gesture suppressed (toast OpenHub pending)`, `ui-diag: immersive connect toast`, `ui-diag: connect toast suppressed (immersive auto-open`.

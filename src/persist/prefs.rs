@@ -53,16 +53,17 @@ impl GamesSortMode {
     }
 }
 
-/// When a controller connect auto-opens the start screen.
+/// When a controller connect auto-opens the PS hub.
 /// Single control subsuming the former auto-open bool + USB-scope bool.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartAutoOpen {
     /// Never auto-open (manual / gesture open only).
     Never,
-    /// Only Bluetooth connects open; USB pads are ignored for open and close.
+    /// Only Bluetooth connects open the hub; USB pads are ignored for open
+    /// and close.
     Bluetooth,
-    /// Any controller connect opens (default).
+    /// Any controller connect opens the hub (default).
     #[default]
     Any,
 }

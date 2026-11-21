@@ -307,8 +307,15 @@ impl App {
             ConfigureMessage::SetStartScreenEnabled(enabled) => {
                 self.session.prefs.start_screen_enabled = enabled;
                 self.save_prefs();
-                if !enabled && self.start_visible {
-                    return self.close_start_screen();
+                if !enabled {
+                    let mut task = Task::none();
+                    if self.hub_visible {
+                        task = task.chain(self.close_hub());
+                    }
+                    if self.start_visible {
+                        task = task.chain(self.close_start_screen());
+                    }
+                    return task;
                 }
                 Task::none()
             }

@@ -50,6 +50,10 @@ impl App {
     }
 
     pub(crate) fn on_start_message_inner(&mut self, message: StartMessage) -> Task<Message> {
+        // Hub is modal: the app underneath takes no input while it is open.
+        if self.hub_visible {
+            return Task::none();
+        }
         // Cold ambient: only Close is live (escape hatch); ignore nav/launch/edit.
         if self.start_state.cold_load_active && !start_cold_allows(&message) {
             return Task::none();
@@ -685,6 +689,9 @@ impl App {
     /// (arrows navigate, Enter confirms, Esc cancels).
     pub(crate) fn on_browser_raw_key(&mut self, id: window::Id, raw: RawKey) -> Task<Message> {
         self.haptic_pad_serial = None;
+        if Some(id) == self.hub_window && self.hub_visible {
+            return self.on_hub_key(raw);
+        }
         if Some(id) != self.start_window || !self.start_visible {
             return Task::none();
         }
@@ -3000,6 +3007,12 @@ impl App {
         let meta = Some(edge.meta());
         let readings = edge.readings;
 
+        // Hub is modal: while open it owns the pad; the app underneath keeps
+        // its last frame but gets no nav.
+        if self.hub_visible {
+            return self.on_hub_pad(&readings);
+        }
+
         if start_open {
             if let Some(prev) = self.last_pad_poll_at {
                 let gap_ms = prev.elapsed().as_millis();
@@ -3162,7 +3175,7 @@ impl App {
 
         // PS while open toggles Start closed (PS opens when closed); a close
         // task preempts pad nav for this tick.
-        if let Some(task) = self.toggle_start_on_reopen_chord(readings) {
+        if let Some(task) = self.toggle_hub_on_reopen_chord(readings) {
             return task;
         }
 
@@ -3641,25 +3654,23 @@ impl App {
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: reopen gesture fire held={held}"
             ));
-            self.open_start_screen()
+            self.open_hub()
         } else {
             Task::none()
         }
     }
 
-    /// Rising-edge reopen chord while Start is open closes it (PS toggles:
-    /// opens when closed). True modals (replace/edit/manual dialogs, open or
-    /// animating settings, ambient tuning) keep the old swallow so PS can't
-    /// strand them mid-dialog. A lone open browser surface does NOT block:
-    /// close suspends the engine with the page cached and reopening resumes
-    /// it, so the toggle works mid-browse with nothing lost. Still consumes
-    /// the sticky hold through the release gate so the opening press cannot
+    /// Rising-edge PS chord while Start is open opens the hub. The hub is
+    /// the only PS target now: PS never closes Start directly. True modals
+    /// (replace/edit/manual dialogs, open or animating settings, ambient
+    /// tuning) swallow the chord so PS cannot strand them mid-dialog. The
+    /// release gate consumes the sticky hold so the opening press cannot
     /// immediately re-fire.
-    pub(crate) fn toggle_start_on_reopen_chord(
+    pub(crate) fn toggle_hub_on_reopen_chord(
         &mut self,
         readings: &[start_input::NavReading],
     ) -> Option<Task<Message>> {
-        if !self.start_visible || readings.is_empty() {
+        if !self.start_visible || self.hub_visible || readings.is_empty() {
             return None;
         }
         let modal_blocking = self.start_state.replace_confirm.is_some()
@@ -3691,14 +3702,12 @@ impl App {
                 None
             }
             ChordReleaseTick::Open => {
-                // Rising-edge guard, mirroring `on_reopen_gesture`: the gate
-                // reports Open on EVERY tick once unlatched, even with the
-                // chord absent — closing here unconditionally turns the
-                // release after any open into an instant re-close. Only a
-                // genuine new press (detector rising edge) toggles closed.
+                // Rising-edge guard: the gate reports Open on every tick once
+                // unlatched, even with the chord absent. Only a genuine new
+                // press (detector rising edge) opens the hub.
                 if self.gesture_detectors.update(&required, readings) {
-                    crate::controller::hid::diag::diag_info("ui-diag: reopen gesture toggle close");
-                    Some(self.close_start_screen())
+                    crate::controller::hid::diag::diag_info("ui-diag: PS opens hub");
+                    Some(self.toggle_hub())
                 } else {
                     None
                 }
@@ -3884,7 +3893,7 @@ impl App {
         if !mode.auto_opens() {
             // Disabling auto-open clears any latched auto-open; never opens
             // or closes here.
-            self.session.start_auto_open_pending = false;
+            self.session.auto_open_pending = false;
             return Task::none();
         }
         if mode.includes_usb() == old.includes_usb() {
@@ -3892,7 +3901,7 @@ impl App {
         }
         // Scope flip may CloseStart when USB pads no longer qualify; never opens.
         let ctx = crate::session::ApplyContext {
-            start_visible: self.start_visible,
+            hub_visible: self.hub_visible,
             fullscreen: start_input::foreground_is_exclusive_fullscreen(),
             now: Instant::now(),
             lightbar_enabled: self.claims.is_enabled(),
@@ -4917,7 +4926,7 @@ impl App {
         if self.start_visible
             && let Some(id) = self.start_window
         {
-            self.session.start_auto_open_pending = false;
+            self.session.auto_open_pending = false;
             self.last_running_check = None;
             self.arm_chord_release_latch();
             let badge = self.refresh_running_badge();
@@ -4938,7 +4947,7 @@ impl App {
         // StartOpened raises after the window/renderer exists.
         if self.start_window.is_some() {
             // Stale id without visibility (close in flight) — wait for WindowClosed.
-            // Leave start_auto_open_pending set so WindowClosed can retry.
+            // Leave auto_open_pending set so WindowClosed can retry.
             crate::controller::hid::diag::diag_info(
                 "ui-diag: start open skipped (window still closing)",
             );
@@ -4976,14 +4985,16 @@ impl App {
             transparent: crate::ui::chrome::transparent_windows(),
             resizable: false,
             decorations: false,
-            level: window::Level::AlwaysOnTop,
+            // Start is a normal-level window now: the PS hub is the only
+            // always-on-top shell surface. Bring-to-front happens on open.
+            level: window::Level::Normal,
             exit_on_close_request: true,
             platform_specific: overlay_platform_specific(),
             ..window::Settings::default()
         });
         self.start_window = Some(id);
         self.start_visible = true;
-        self.session.start_auto_open_pending = false;
+        self.session.auto_open_pending = false;
         crate::platform::wgpu_diag::note_start_open();
         Task::batch([badge, restored_art, open.map(Message::StartOpened)])
     }

@@ -80,7 +80,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 
 | Directory | Typical changes |
 |---|---|
-| `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Start / toast, message routing; `browser.rs` (top-level `BrowserAppState`), `hub.rs` (`AppHub` installed/active apps) |
+| `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Start / toast, message routing; `browser.rs` (top-level `BrowserAppState`), `hub.rs` (`AppHub` installed/active apps + PS hub window lifecycle/input) |
 | `src/browser/` | Browser internals: engine seam + Servo worker, DOM target query, controller cursor, tabs/bookmarks, stable frame texture, reader fallback (Servo-era; pivot to managed app + CEF planned) |
 | `src/session/` | Pure device session (no windows/HWND): presence, notify, analytics, Start-open policy; emits `SessionEffect`s the UI applies |
 | `src/controller/` | HID polling + worker (`hid/`), DualSense protocol (`dualsense/`: battery, lightbar, rumble, input, identity), known controllers, debug-only `emulate` emulation |
@@ -88,7 +88,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 | `src/games/` | Steam library scan, game launch, process matching |
 | `src/persist/` | `prefs.json`, `controllers.json`, `analytics.json`, `steam_library.json`, paths |
 | `src/platform/` | Logging, app metadata, autostart, crash-restart, device-arrival watch, file icons, MSIX (`packaged`), UI sounds, wgpu diagnostics, Win32 helpers |
-| `src/ui/` | All iced views + styling: `theme.rs`, `popup/`, `configure/` (Settings), `start/` (fullscreen Start console), `browser/` (browser panel state, standalone view later), `toast/`, `shader/`, `percent_ring.rs`, `layout.rs` (window placement) |
+| `src/ui/` | All iced views + styling: `theme.rs`, `popup/`, `configure/` (Settings), `start/` (fullscreen Start console), `browser/` (browser panel state, standalone view later), `hub/` (PS overlay tiles/selection), `toast/`, `shader/`, `percent_ring.rs`, `layout.rs` (window placement) |
 | Tests | Inline `#[cfg(test)] mod tests` next to the code (no `tests/` dir) |
 
 ## Common gotchas for agents
@@ -112,7 +112,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Lightbar spectrum editor (Settings)** → `src/ui/configure/spectrum.rs`, `src/ui/configure/mod.rs`
 - **Theme / shared widget styles** → `src/ui/theme.rs`; restyle plan → `notes/ui-refresh.md`
 - **Start screen / game launcher** → `src/ui/start/` (UI), `src/games/` (Steam scan, launch); behavior → `notes/start-immersive.md`
-- **Browser (Servo era)** → `src/browser/` (engine/DOM/cursor) + `src/ui/browser/state.rs` (panel/tabs/chrome) + `src/ui/start/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state); hub/app lifecycle → `src/app/hub.rs`; contracts → `notes/browser-embedding.md`; planned hub/CEF split → `notes/browser-hub-pivot.md`
+- **Browser (Servo era)** → `src/browser/` (engine/DOM/cursor) + `src/ui/browser/state.rs` (panel/tabs/chrome) + `src/ui/start/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state); PS hub → `src/ui/hub/` + `src/app/hub.rs`; contracts → `notes/browser-embedding.md`; planned hub/CEF split → `notes/browser-hub-pivot.md`
 - **Toasts** → `src/ui/toast/` (state machine in `machine.rs`); z-order / remount → `notes/windows-toast.md`
 - **Persisted state (prefs/controllers/analytics)** → `src/persist/`
 - **Single instance, tray lifecycle, crash-restart** → `src/bin/sdsc-utils.rs`, `src/platform/crash_restart.rs`

@@ -48,8 +48,12 @@ the `servo-engine` feature. **Planned replacement:** [browser-hub-pivot.md](brow
   flag, browser-only D-pad stepper (the browser no longer lives inside
   `StartState`).
 - `src/app/hub.rs` — `AppHub`: installed/active apps (`AppId::Start`,
-  `AppId::Browser`) and show/hide/focus/suspend/resume/close effects. Pure
-  bookkeeping today; the hub window consumes it in phase 1.
+  `AppId::Browser`), show/hide/focus/suspend/resume/close effects, plus the
+  PS hub window lifecycle (`open_hub`/`close_hub`, pad/key routing). The hub
+  is topmost; Start is `Normal`.
+- `src/ui/hub/` — hub card: Start / Browser / Add-apps tiles, wrapping
+  selection, Cross/Circle edges, install-state subtitle. Modal for pad input
+  while open.
 - `src/browser/cursor.rs` — controller cursor: analog free point, magnet dock
   with acquire/hold hysteresis and break-free, D-pad flights (fixed 150ms
   tween; wrap-to-wrap morph), unified page+header space, row-locked
@@ -65,6 +69,10 @@ the `servo-engine` feature. **Planned replacement:** [browser-hub-pivot.md](brow
 - `src/browser/keys.rs` — iced → Servo keyboard mapping.
 
 ## Current input/UX contract (pad, engine mode)
+
+PS opens the topmost hub over Start or a game; while the hub is open it owns
+pad input and Start messages are gated. Selecting Browser closes the hub and
+opens the in-Start browser (the standalone window lands in phase 2).
 
 - Left stick moves the cursor with velocity + friction; magnet docks on
   arrival, centre-snaps on fresh acquisition, holds in place while scrolling.

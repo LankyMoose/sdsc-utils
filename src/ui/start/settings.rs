@@ -1270,7 +1270,7 @@ pub fn panel_view<'a>(
         let focused = focus_rows.get(focus) == Some(&row);
         let widget: Element<'_, StartMessage> = match row {
             SettingsRow::AutoOpen => selector_row(
-                "Auto open:",
+                "Auto open hub:",
                 SettingsRow::AutoOpen.helper(),
                 snapshot.auto_open.label(),
                 focused,

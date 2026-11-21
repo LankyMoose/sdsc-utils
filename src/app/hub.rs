@@ -149,6 +149,244 @@ impl AppHub {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hub window lifecycle + input (phase 1)
+// ---------------------------------------------------------------------------
+
+use super::{App, Message};
+use crate::browser::keys::RawKey;
+use crate::ui::hub as hub_view;
+use crate::ui::layout::{
+    MonitorCover, focus_window, open_visible, overlay_platform_specific, primary_monitor_cover,
+};
+use crate::ui::start::gesture::ChordReleaseTick;
+use crate::ui::start::input as start_input;
+use iced::{Point, Size, Task, window};
+use std::time::Instant;
+
+impl App {
+    /// Toggle the PS hub from anywhere. PS is the only global shell gesture:
+    /// while the hub is open it closes; otherwise it opens over whatever is
+    /// running (Start, a game, or the desktop).
+    pub(crate) fn toggle_hub(&mut self) -> Task<Message> {
+        if self.hub_visible {
+            self.close_hub()
+        } else {
+            self.open_hub()
+        }
+    }
+
+    /// Show the topmost hub overlay. Idempotent when already visible.
+    pub(crate) fn open_hub(&mut self) -> Task<Message> {
+        if self.hub_visible
+            && let Some(id) = self.hub_window
+        {
+            return focus_window(id);
+        }
+        if self.hub_window.is_some() {
+            // Close in flight; the next attempt can open once WindowClosed lands.
+            crate::controller::hid::diag::diag_info("ui-diag: hub open skipped (window closing)");
+            return Task::none();
+        }
+        let cover = primary_monitor_cover().unwrap_or(MonitorCover {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        });
+        let x = cover.x + ((cover.width - hub_view::HUB_WIDTH) * 0.5).max(0.0);
+        let y = cover.y
+            + (cover.height * hub_view::HUB_TOP_FRACTION)
+                .min((cover.height - hub_view::HUB_HEIGHT - 24.0).max(0.0));
+        self.hub_state.on_open(
+            self.session.prefs.start_screen_enabled,
+            self.browser.engine_available,
+        );
+        // The opening PS press must not toggle the hub straight back closed.
+        self.arm_chord_release_latch();
+        let (id, open) = window::open(window::Settings {
+            size: Size::new(hub_view::HUB_WIDTH, hub_view::HUB_HEIGHT),
+            position: window::Position::Specific(Point::new(x, y)),
+            visible: open_visible(),
+            transparent: crate::ui::chrome::transparent_windows(),
+            resizable: false,
+            decorations: false,
+            // The one shell surface above toast / Settings / popups.
+            level: window::Level::AlwaysOnTop,
+            exit_on_close_request: true,
+            platform_specific: overlay_platform_specific(),
+            ..window::Settings::default()
+        });
+        self.hub_window = Some(id);
+        self.hub_visible = true;
+        self.session.auto_open_pending = false;
+        crate::controller::hid::diag::diag_info("ui-diag: hub open");
+        open.map(Message::HubOpened)
+    }
+
+    /// Hide the hub and return focus to Start when it is the app underneath.
+    pub(crate) fn close_hub(&mut self) -> Task<Message> {
+        self.hub_visible = false;
+        let Some(id) = self.hub_window.take() else {
+            return Task::none();
+        };
+        crate::controller::hid::diag::diag_info("ui-diag: hub close");
+        let task = window::close(id);
+        if self.start_visible
+            && let Some(start) = self.start_window
+        {
+            return task.chain(focus_window(start));
+        }
+        task
+    }
+
+    pub(crate) fn on_hub_opened(&mut self, id: window::Id) -> Task<Message> {
+        // The hub may have been dismissed before the renderer came up; accept
+        // the open only while it is still the tracked window.
+        if self.hub_window != Some(id) {
+            return Task::none();
+        }
+        self.hub_visible = true;
+        crate::controller::hid::diag::diag_info(format!("ui-diag: hub opened id={id:?}"));
+        focus_window(id)
+    }
+
+    pub(crate) fn on_hub_message(&mut self, message: hub_view::HubMessage) -> Task<Message> {
+        match message {
+            hub_view::HubMessage::Move(delta) => {
+                self.hub_state.move_selection(delta);
+                Task::none()
+            }
+            hub_view::HubMessage::Select(index) => {
+                self.hub_state.select(index);
+                Task::none()
+            }
+            hub_view::HubMessage::Activate(index) => {
+                self.hub_state.select(index);
+                self.hub_activate()
+            }
+            hub_view::HubMessage::Confirm => self.hub_activate(),
+            hub_view::HubMessage::Close => self.close_hub(),
+        }
+    }
+
+    /// Activate the highlighted tile. The hub closes first so the target app
+    /// comes forward without a topmost cover left behind.
+    fn hub_activate(&mut self) -> Task<Message> {
+        match self.hub_state.selected_tile() {
+            hub_view::HubTile::Start => {
+                if !self.session.prefs.start_screen_enabled {
+                    crate::controller::hid::diag::diag_info(
+                        "ui-diag: hub Start selected but start screen disabled",
+                    );
+                    return Task::none();
+                }
+                crate::controller::hid::diag::diag_info("ui-diag: hub launch Start");
+                self.close_hub().chain(self.open_start_screen())
+            }
+            hub_view::HubTile::Browser => {
+                // Phase 1: the Browser still renders inside Start. Phase 2
+                // moves it to its own normal-level window.
+                if !self.session.prefs.start_screen_enabled {
+                    crate::controller::hid::diag::diag_info(
+                        "ui-diag: hub Browser selected but Start host disabled",
+                    );
+                    return Task::none();
+                }
+                crate::controller::hid::diag::diag_info("ui-diag: hub launch Browser");
+                let show = self.close_hub().chain(self.open_start_screen());
+                if self.browser.panel.session.is_open() {
+                    show
+                } else {
+                    show.chain(self.on_toggle_browser())
+                }
+            }
+            hub_view::HubTile::AddApps => {
+                // Catalog/DLC arrives in phase 5. Keep the hub open so it
+                // never feels like a dead dismiss.
+                crate::controller::hid::diag::diag_info(
+                    "ui-diag: hub catalog requested (not implemented)",
+                );
+                Task::none()
+            }
+        }
+    }
+
+    /// Pad tick while the hub is the modal owner. Only the chord (close) and
+    /// selection/confirm are live; the app underneath gets nothing.
+    pub(crate) fn on_hub_pad(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
+        if readings.is_empty() {
+            return Task::none();
+        }
+        if self.hub_chord_fires(readings) {
+            crate::controller::hid::diag::diag_info("ui-diag: hub chord close");
+            return self.close_hub();
+        }
+        let Some(reading) = crate::domain::pad::preferred_reading(readings) else {
+            return Task::none();
+        };
+        if let Some(message) = self.hub_state.pad_tick(&reading.sample, Instant::now()) {
+            return self.on_hub_message(message);
+        }
+        Task::none()
+    }
+
+    /// Keyboard while the hub window has focus.
+    pub(crate) fn on_hub_key(&mut self, raw: RawKey) -> Task<Message> {
+        if !raw.pressed {
+            return Task::none();
+        }
+        use iced::keyboard::Key;
+        use iced::keyboard::key::Named;
+        let message = match raw.key {
+            Key::Named(Named::ArrowLeft) | Key::Named(Named::ArrowUp) => {
+                Some(hub_view::HubMessage::Move(-1))
+            }
+            Key::Named(Named::ArrowRight) | Key::Named(Named::ArrowDown) => {
+                Some(hub_view::HubMessage::Move(1))
+            }
+            Key::Named(Named::Enter) | Key::Named(Named::Space) => {
+                Some(hub_view::HubMessage::Confirm)
+            }
+            Key::Named(Named::Escape) => Some(hub_view::HubMessage::Close),
+            _ => None,
+        };
+        match message {
+            Some(message) => {
+                self.note_start_activity();
+                self.on_hub_message(message)
+            }
+            None => Task::none(),
+        }
+    }
+
+    /// Shared PS chord detector for the hub. Mirrors the Start-era toggle:
+    /// a rising chord fires once, and the release gate swallows the sticky
+    /// hold that opened the hub.
+    fn hub_chord_fires(&mut self, readings: &[start_input::NavReading]) -> bool {
+        let required = crate::ui::start::gesture::default_gesture();
+        let chord_held = super::chord_held_on_any_pad(&required, readings);
+        let now = Instant::now();
+        let (tick, glitch) = self.chord_release_gate.tick(chord_held, now);
+        if glitch {
+            crate::controller::hid::diag::diag_info("ui-diag: hub chord glitch ignored");
+        }
+        match tick {
+            ChordReleaseTick::Blocked => {
+                if chord_held {
+                    self.gesture_detectors.consume_pending_match(readings);
+                }
+                false
+            }
+            ChordReleaseTick::Cleared => {
+                let _ = self.gesture_detectors.update(&required, readings);
+                false
+            }
+            ChordReleaseTick::Open => self.gesture_detectors.update(&required, readings),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

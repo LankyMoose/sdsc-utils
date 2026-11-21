@@ -65,9 +65,10 @@ pub struct ToastPlacement {
 /// foreground. On Windows we apply `WS_EX_NOACTIVATE`, pin `HWND_TOPMOST`, and
 /// show with `SW_SHOWNOACTIVATE` instead.
 ///
-/// Callers that have Settings / Start / popup open should then
+/// Callers that have the hub / Settings / popup open should then
 /// [`raise_window_topmost`] those windows so they sit above the toast in the
-/// topmost band and keep receiving presents (iced#3108 / #3320).
+/// topmost band and keep receiving presents (iced#3108 / #3320). Start is a
+/// normal-level window and stays behind the toast by design.
 pub fn show_toast_without_activate<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     #[cfg(windows)]
     {
@@ -152,7 +153,7 @@ pub fn open_visible() -> bool {
     !crate::platform::debug_quiet::enabled()
 }
 
-/// Re-assert toast topmost (e.g. after Settings / Start / popup open or close).
+/// Re-assert toast topmost (e.g. after Settings / hub / popup open or close).
 pub fn set_toast_topmost<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     #[cfg(windows)]
     {
@@ -177,6 +178,7 @@ pub fn set_toast_topmost<Message: Send + 'static>(id: window::Id) -> Task<Messag
 }
 
 /// Raise an interactive UI window to the top of the topmost band (above toast).
+/// Used for popup/Settings and, last, the hub.
 pub fn raise_window_topmost<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     #[cfg(windows)]
     {

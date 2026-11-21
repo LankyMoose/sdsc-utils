@@ -6,9 +6,9 @@ mod gate;
 pub mod notify;
 
 pub use gate::{
-    ConnectCooldownDecision, POLL_MISS_HOLD, connect_cooldown_on_empty, has_start_presence,
-    reconcile_poll_with_hold, should_auto_close_start, should_auto_open_start,
-    should_defer_auto_open_start, should_flush_latched_start,
+    ConnectCooldownDecision, POLL_MISS_HOLD, connect_cooldown_on_empty, has_hub_presence,
+    reconcile_poll_with_hold, should_auto_close_hub, should_auto_open_hub,
+    should_defer_auto_open_hub, should_flush_latched_hub,
     should_skip_connect_cooldown_on_power_off, take_skip_connect_cooldown,
 };
 
@@ -55,11 +55,11 @@ pub enum SessionEffect {
         /// Latch Start open onto the connect toast presentation machine.
         open_start_after_toast: bool,
     },
-    /// Open the start screen now (no connect toast to wait on).
-    OpenStart,
+    /// Open the hub now (no connect toast to wait on).
+    OpenHub,
     /// Close the start screen (all pads gone).
-    CloseStart,
-    /// Clear latched auto-open and toast AfterToast::OpenStart.
+    CloseHub,
+    /// Clear latched auto-open and toast AfterToast::OpenHub.
     ClearStartLatch,
     /// Persist remembered controllers / nicknames.
     SaveKnown,
@@ -76,7 +76,7 @@ pub enum SessionEffect {
 /// Inputs the app provides when applying a poll snapshot (UI facts only).
 #[derive(Debug, Clone, Copy)]
 pub struct ApplyContext {
-    pub start_visible: bool,
+    pub hub_visible: bool,
     pub fullscreen: bool,
     pub now: Instant,
     pub lightbar_enabled: bool,
@@ -95,7 +95,7 @@ pub struct DeviceSession {
     pub(crate) skip_next_connect_cooldown: bool,
     controllers_nonempty_since: Option<Instant>,
     missed_poll_since: HashMap<Serial, Instant>,
-    pub start_auto_open_pending: bool,
+    pub auto_open_pending: bool,
 }
 
 impl DeviceSession {
@@ -111,7 +111,7 @@ impl DeviceSession {
             skip_next_connect_cooldown: false,
             controllers_nonempty_since: None,
             missed_poll_since: HashMap::new(),
-            start_auto_open_pending: false,
+            auto_open_pending: false,
         }
     }
 
@@ -191,8 +191,8 @@ impl DeviceSession {
         let mut presence_edge: Option<(bool, bool)> = None;
         if controllers_changed {
             let previous = std::mem::replace(&mut self.controllers, controllers);
-            let prev_present = has_start_presence(&previous, include_usb);
-            let next_present = has_start_presence(&self.controllers, include_usb);
+            let prev_present = has_hub_presence(&previous, include_usb);
+            let next_present = has_hub_presence(&self.controllers, include_usb);
             presence_edge = Some((prev_present, next_present));
             if prev_present != next_present {
                 crate::controller::hid::diag::diag_info(format!(
@@ -249,11 +249,11 @@ impl DeviceSession {
 
         effects.push(SessionEffect::SaveKnown);
         let want_auto_open = presence_edge.is_some_and(|(prev_present, next_present)| {
-            should_auto_open_start(
+            should_auto_open_hub(
                 self.prefs.start_screen_enabled && self.prefs.start_screen_auto_open.auto_opens(),
                 !prev_present,
                 next_present,
-                ctx.start_visible,
+                ctx.hub_visible,
                 self.cooldown_active(ctx.now),
                 ctx.fullscreen,
             )
@@ -272,10 +272,10 @@ impl DeviceSession {
         }
         let connect_toast_queued = events.iter().any(|event| event.body == "Connected");
         if want_auto_open {
-            self.start_auto_open_pending = true;
+            self.auto_open_pending = true;
         }
         let open_start_after_toast =
-            want_auto_open && should_defer_auto_open_start(true, connect_toast_queued);
+            want_auto_open && should_defer_auto_open_hub(true, connect_toast_queued);
 
         effects.push(SessionEffect::SetTray {
             connected: self.controllers.len(),
@@ -292,13 +292,13 @@ impl DeviceSession {
 
         if let Some((prev_present, next_present)) = presence_edge {
             if !next_present {
-                self.start_auto_open_pending = false;
+                self.auto_open_pending = false;
                 effects.push(SessionEffect::ClearStartLatch);
-                if should_auto_close_start(prev_present, next_present, ctx.start_visible) {
-                    effects.push(SessionEffect::CloseStart);
+                if should_auto_close_hub(prev_present, next_present, ctx.hub_visible) {
+                    effects.push(SessionEffect::CloseHub);
                 }
             } else if want_auto_open && !connect_toast_queued {
-                effects.push(SessionEffect::OpenStart);
+                effects.push(SessionEffect::OpenHub);
             }
         }
 
@@ -311,7 +311,7 @@ impl DeviceSession {
     /// Does not arm the ghost-flap cooldown (settings flip is not a pad leave).
     pub fn reevaluate_start_presence(&mut self, ctx: ApplyContext) -> Vec<SessionEffect> {
         let include_usb = self.prefs.start_screen_auto_open.includes_usb();
-        let present = has_start_presence(&self.controllers, include_usb);
+        let present = has_hub_presence(&self.controllers, include_usb);
         crate::controller::hid::diag::diag_info(format!(
             "ui-diag: start presence include_usb={} present={} (prefs)",
             u8::from(include_usb),
@@ -324,11 +324,11 @@ impl DeviceSession {
                 self.controllers_nonempty_since = Some(ctx.now);
             }
         } else {
-            self.start_auto_open_pending = false;
+            self.auto_open_pending = false;
             self.controllers_nonempty_since = None;
             effects.push(SessionEffect::ClearStartLatch);
-            if ctx.start_visible {
-                effects.push(SessionEffect::CloseStart);
+            if ctx.hub_visible {
+                effects.push(SessionEffect::CloseHub);
             }
         }
         effects
@@ -425,9 +425,9 @@ mod tests {
         )
     }
 
-    fn ctx(start_visible: bool) -> ApplyContext {
+    fn ctx(hub_visible: bool) -> ApplyContext {
         ApplyContext {
-            start_visible,
+            hub_visible,
             fullscreen: false,
             now: Instant::now(),
             lightbar_enabled: false,
@@ -449,10 +449,8 @@ mod tests {
         )
     }
 
-    fn has_open_start(effects: &[SessionEffect]) -> bool {
-        effects
-            .iter()
-            .any(|e| matches!(e, SessionEffect::OpenStart))
+    fn has_open_hub(effects: &[SessionEffect]) -> bool {
+        effects.iter().any(|e| matches!(e, SessionEffect::OpenHub))
     }
 
     fn queued_bodies(effects: &[SessionEffect]) -> Vec<String> {
@@ -471,7 +469,7 @@ mod tests {
     fn auto_open_suppresses_connected_toast() {
         let mut session = session_with(StartAutoOpen::Any);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
-        assert!(has_open_start(&effects));
+        assert!(has_open_hub(&effects));
         assert!(
             !queued_bodies(&effects).contains(&"Connected".to_string()),
             "auto-open must not queue Connected, got {:?}",
@@ -480,10 +478,10 @@ mod tests {
     }
 
     #[test]
-    fn no_suppress_when_already_open() {
+    fn no_auto_open_when_hub_already_open() {
         let mut session = session_with(StartAutoOpen::Any);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(true));
-        assert!(!has_open_start(&effects));
+        assert!(!has_open_hub(&effects));
         assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
     }
 
@@ -491,7 +489,7 @@ mod tests {
     fn auto_open_never_never_opens_but_still_toasts() {
         let mut session = session_with(StartAutoOpen::Never);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
-        assert!(!has_open_start(&effects));
+        assert!(!has_open_hub(&effects));
         assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
     }
 
@@ -504,7 +502,7 @@ mod tests {
         let pad_b = bt_pad("bb");
         let t0 = Instant::now();
         let ctx_at = |now: Instant| ApplyContext {
-            start_visible: false,
+            hub_visible: false,
             fullscreen: false,
             now,
             lightbar_enabled: false,
@@ -541,7 +539,7 @@ mod tests {
         let pad_a = bt_pad("aa");
         let t0 = Instant::now();
         let ctx_at = |now: Instant| ApplyContext {
-            start_visible: false,
+            hub_visible: false,
             fullscreen: false,
             now,
             lightbar_enabled: false,
@@ -569,7 +567,7 @@ mod tests {
         // no open, and the toast stays a plain notification.
         let mut session = session_with(StartAutoOpen::Bluetooth);
         let effects = session.apply_controllers(vec![usb_pad("usb:1")], ctx(false));
-        assert!(!has_open_start(&effects));
+        assert!(!has_open_hub(&effects));
         assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
         assert!(
             !effects.iter().any(|e| matches!(
@@ -587,7 +585,7 @@ mod tests {
     fn bluetooth_mode_opens_on_bluetooth_arrival() {
         let mut session = session_with(StartAutoOpen::Bluetooth);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
-        assert!(has_open_start(&effects));
+        assert!(has_open_hub(&effects));
         assert!(
             !queued_bodies(&effects).contains(&"Connected".to_string()),
             "auto-open suppresses Connected, got {:?}",

@@ -1,7 +1,8 @@
 # Browser hub pivot — managed apps + CEF engine (planned)
 
 **Status:** in progress (branch `browser/hub-pivot`, based on `browser/main`).
-Phase 0 (state extraction) landed; the hub window is next.
+Phases 0–1 landed (state extraction, PS hub window + auto-open); the
+standalone Browser window is next.
 **When to read:** before touching Start/browser window ownership, the PS
 overlay, app selection, the engine backend, or MSIX packaging.
 
@@ -85,10 +86,17 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    (`src/app/hub.rs`, `AppId { Start, Browser }`, install/active/focus,
    open/close/suspend/resume); Start still renders the panel until phase 2.
    `tabs.json`/`bookmarks.json` paths unchanged.
-1. **Hub window + PS retarget + auto-open moved.** New `src/ui/hub/` +
-   `src/app/hub.rs`, same open/close/focus pattern as popup/configure. Hub is
-   the topmost exception. Pref migration + toast-settle latch + over-game
-   focus behavior as explicit acceptance.
+1. **Hub window + PS retarget + auto-open moved. — landed.** New
+   `src/ui/hub/` (tiles, selection, pad/key edges) + `src/app/hub.rs`
+   (window lifecycle, topmost raise, PS toggle). PS opens the hub from
+   Start, desktop, or a running game; while open the hub owns pad input and
+   Start messages are gated. Auto-open/session latch, toast settle, retry,
+   and cooldown all target the hub (`SessionEffect::OpenHub`,
+   `AfterToast::OpenHub`); `ApplyContext.hub_visible` replaces
+   `start_visible` for the gate. Start moved from `AlwaysOnTop` to
+   `Normal`; the hub is raised last above toast/Settings/popup. Over
+   exclusive-fullscreen games the topmost hub can still be covered
+   (documented limitation).
 2. **Browser standalone window.** Move panel rendering, cursor/scroll/D-pad
    routing (`tick_browser_cursor`, jumps, clicks, `sync_browser_mouse`) and
    all `StartMessage::Browser*` into `BrowserMessage`. Settings/history/

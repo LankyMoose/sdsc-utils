@@ -48,9 +48,7 @@ use crate::ui::configure::{
     self as configure_view, AnalyticsPanel, ConfigureMessage, ConfigureState, PadInputPanel,
     Section,
 };
-use crate::ui::layout::{
-    MonitorCover, ToastPlacement, TrayAnchor, focus_window, raise_window_topmost,
-};
+use crate::ui::layout::{MonitorCover, ToastPlacement, TrayAnchor, focus_window};
 use crate::ui::popup::{self as popup_view, ControllerRow, PopupMessage};
 use crate::ui::start::art_worker::ArtOwner;
 use crate::ui::start::cursor_hide;
@@ -168,6 +166,10 @@ pub enum Message {
 
     ConfigureOpened(window::Id),
     Configure(ConfigureMessage),
+    /// PS hub window opened (focus it once the renderer exists).
+    HubOpened(window::Id),
+    /// Hub selection / activation from pad, keyboard, or mouse.
+    Hub(crate::ui::hub::HubMessage),
     /// Raw keyboard event for the Start browser (controller-first: no mouse).
     /// Routed in `update` — page mode forwards to the engine, URL-edit mode
     /// and reader mode fall back to the legacy Start-key mapping.
@@ -302,6 +304,7 @@ impl Message {
             | Message::PopupOpened(_)
             | Message::PlacePopup { .. }
             | Message::ConfigureOpened(_)
+            | Message::HubOpened(_)
             | Message::StartOpened(_)
             | Message::FinishStartClose
             | Message::StartFrame
@@ -312,6 +315,7 @@ impl Message {
             Message::PreviewDrag | Message::PreviewClose => true,
             Message::Popup(_)
             | Message::Configure(_)
+            | Message::Hub(_)
             | Message::Start(_)
             | Message::BrowserRawKey { .. }
             | Message::StartCursorActivity(_)
@@ -474,6 +478,11 @@ pub struct App {
     start_window: Option<window::Id>,
     /// True only while Start is revealed (warm HWND may exist while false).
     start_visible: bool,
+    /// Topmost PS app-switcher overlay (small, bottom-weighted).
+    hub_window: Option<window::Id>,
+    /// True while the hub is revealed; modal owner of pad input.
+    hub_visible: bool,
+    hub_state: crate::ui::hub::State,
     /// Close is two-phase when the cursor was hidden: the flag clears
     /// immediately, but HWND destruction waits one loop pass
     /// (`FinishStartClose`) so a rebuild pushes the restored cursor to the
@@ -850,6 +859,9 @@ impl App {
             pad_input_panel: PadInputPanel::default(),
             start_window: None,
             start_visible: false,
+            hub_window: None,
+            hub_visible: false,
+            hub_state: crate::ui::hub::State::default(),
             start_close_armed: false,
             last_start_paint_at: std::cell::Cell::new(None),
             last_start_paint_active: std::cell::Cell::new(false),
@@ -1049,6 +1061,7 @@ impl App {
                         ));
                     }
                 }
+                "hub" => tasks.push(self.open_hub()),
                 "start" => tasks.push(self.open_start_screen()),
                 "start-controllers" => {
                     tasks.push(self.open_start_screen());
@@ -1078,7 +1091,7 @@ impl App {
         }
         if Some(window) == self.configure_window {
             "Settings".to_string()
-        } else if Some(window) == self.start_window {
+        } else if Some(window) == self.start_window || Some(window) == self.hub_window {
             String::new()
         } else {
             crate::platform::app_meta::DISPLAY_NAME.to_string()
@@ -1331,6 +1344,10 @@ impl App {
             .map(Message::Configure);
         }
 
+        if Some(window) == self.hub_window {
+            return crate::ui::hub::view(&self.hub_state).map(Message::Hub);
+        }
+
         if Some(window) == self.start_window {
             // Paint-gap witness (black-lockup forensics): while the enter
             // ceremony is live the window must repaint ~60Hz. A gap here
@@ -1532,6 +1549,8 @@ impl App {
                 task
             }
             Message::Configure(message) => self.on_configure_message(message),
+            Message::HubOpened(id) => self.on_hub_opened(id),
+            Message::Hub(message) => self.on_hub_message(message),
 
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(id) => focus_window(id),
@@ -1661,6 +1680,18 @@ impl App {
         } else if Some(id) == self.configure_window {
             self.configure_window = None;
             self.sync_toast_zorder()
+        } else if Some(id) == self.hub_window {
+            self.hub_window = None;
+            self.hub_visible = false;
+            // Return focus to Start when it is the app underneath. The toast
+            // is AlwaysOnTop, so it stays above a normal-level Start without
+            // re-raising anything.
+            if self.start_visible
+                && let Some(start) = self.start_window
+            {
+                return focus_window(start);
+            }
+            Task::none()
         } else if Some(id) == self.start_window {
             self.start_window = None;
             self.start_visible = false;
@@ -1682,16 +1713,16 @@ impl App {
             let sync = self.sync_toast_zorder();
             // The auto-open latch survives a close so a pending
             // open can retry once presence still qualifies.
-            if self.session.start_auto_open_pending
+            if self.session.auto_open_pending
                 && self.session.prefs.start_screen_enabled
                 && self.session.prefs.start_screen_auto_open.auto_opens()
-                && crate::session::has_start_presence(
+                && crate::session::has_hub_presence(
                     &self.session.controllers,
                     self.session.prefs.start_screen_auto_open.includes_usb(),
                 )
             {
-                crate::controller::hid::diag::diag_info("ui-diag: retry start open after close");
-                sync.chain(self.open_start_screen())
+                crate::controller::hid::diag::diag_info("ui-diag: retry hub open after close");
+                sync.chain(self.open_hub())
             } else {
                 sync
             }
@@ -1752,9 +1783,9 @@ impl App {
             // Raise/focus after create_renderer has a chance to finish —
             // chaining sync on the same turn as window::open correlated
             // with atlas create_renderer panics.
-            let mut task = focus_window(id)
-                .chain(raise_window_topmost(id))
-                .chain(self.sync_toast_zorder());
+            // Start stays normal-level; focus brings it forward without
+            // joining the topmost band.
+            let mut task = focus_window(id).chain(self.sync_toast_zorder());
             // Settings restore first: the drawer scroll lands
             // before art kicks and scan below.
             if let Some(settings_y) = self.pending_settings_scroll.take() {
@@ -1927,6 +1958,9 @@ impl App {
     ) -> Task<Message> {
         // Keyboard is never pad-originated.
         self.haptic_pad_serial = None;
+        if self.hub_visible {
+            return Task::none();
+        }
         if Some(id) == self.start_window && self.start_visible {
             self.note_start_activity();
             // Cold ambient: only Cancel/Close is live.
@@ -2371,7 +2405,7 @@ impl App {
                     .notify
                     .queue_launch_quiet(self.hid_worker.take_launch_serials());
                 let ctx = crate::session::ApplyContext {
-                    start_visible: self.start_visible,
+                    hub_visible: self.hub_visible,
                     fullscreen: start_input::foreground_is_exclusive_fullscreen(),
                     now: Instant::now(),
                     lightbar_enabled: self.claims.is_enabled(),
@@ -2407,19 +2441,25 @@ impl App {
                 } => {
                     tasks.push(self.queue_notifications(events, open_start_after_toast));
                 }
-                SessionEffect::OpenStart => {
+                SessionEffect::OpenHub => {
                     // The reopen chord may fire during the connect-toast
-                    // latch; the toast's own AfterToast::OpenStart still opens Start.
+                    // latch; the toast's own AfterToast::OpenHub still opens
+                    // the hub.
                     if self.toast_machine.suppresses_reopen_gesture() {
                         crate::controller::hid::diag::diag_info(
-                            "ui-diag: OpenStart ignored (toast OpenStart pending)",
+                            "ui-diag: OpenHub ignored (toast OpenHub pending)",
                         );
                     } else {
-                        tasks.push(self.open_start_screen());
+                        tasks.push(self.open_hub());
                     }
                 }
-                SessionEffect::CloseStart => {
-                    tasks.push(self.close_start_screen());
+                SessionEffect::CloseHub => {
+                    // Auto-close owns the hub, not a manually opened Start.
+                    if self.hub_visible {
+                        tasks.push(self.close_hub());
+                    } else {
+                        tasks.push(self.close_start_screen());
+                    }
                 }
                 SessionEffect::ClearStartLatch => {
                     self.toast_machine.clear_after();
@@ -2455,6 +2495,7 @@ impl App {
         let pad_input_live =
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
         pad_input_live
+            || self.hub_visible
             || (self.start_visible
                 && self.session.prefs.start_screen_enabled
                 && !self.session.controllers.is_empty())
@@ -2463,7 +2504,7 @@ impl App {
     /// Apply a controller snapshot through the session (used by presence clear + emulate).
     fn apply_controllers(&mut self, controllers: Vec<ControllerStatus>) -> Task<Message> {
         let ctx = crate::session::ApplyContext {
-            start_visible: self.start_visible,
+            hub_visible: self.hub_visible,
             fullscreen: start_input::foreground_is_exclusive_fullscreen(),
             now: Instant::now(),
             lightbar_enabled: self.claims.is_enabled(),
@@ -2624,7 +2665,7 @@ impl App {
                     "ui-diag: connect toast suppressed (immersive auto-open)",
                 );
             }
-            let open = self.open_start_screen();
+            let open = self.open_hub();
             // Queue any non-Connected events normally (Low/Charged); Connected is gone.
             for event in events {
                 let eta = self.toast_eta_for(&event);
@@ -2637,8 +2678,8 @@ impl App {
             }
             return open.chain(self.show_next_toast());
         }
-        // Auto-open is toast-first: latch Start onto the toast settle so
-        // the Connected card always presents (the toast machine emits OpenStart
+        // Auto-open is toast-first: latch the hub onto the toast settle so
+        // the Connected card always presents (the toast machine emits OpenHub
         // exactly once — on rest, early dismiss, or slide-out finish).
         for event in events {
             let eta = self.toast_eta_for(&event);
@@ -2646,9 +2687,9 @@ impl App {
                 ToastMessage::from_notification(event, self.session.prefs.spectrum.clone(), eta);
             if open_start_after && message.body == "Connected" {
                 open_start_after = false;
-                message.after = AfterToast::OpenStart;
+                message.after = AfterToast::OpenHub;
                 crate::controller::hid::diag::diag_info(
-                    "ui-diag: defer start until toast slide settles",
+                    "ui-diag: defer hub until toast slide settles",
                 );
             }
             ToastMessage::enqueue(&mut self.toast_queue, message);

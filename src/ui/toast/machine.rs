@@ -8,7 +8,7 @@ use crate::ui::layout::{TOAST_SLIDE_DURATION, advance_toast_slide};
 use std::time::Duration;
 
 /// Frame ticks while Placing before the reopen gesture is allowed again (~1s at 16ms).
-/// Does not leave Placing or emit OpenStart — only lifts gesture suppress.
+/// Does not leave Placing or emit OpenHub — only lifts gesture suppress.
 pub const PLACING_GESTURE_SUPPRESS_FRAMES: u32 = 60;
 
 /// What to do after this toast reaches rest (or finishes early).
@@ -16,8 +16,8 @@ pub const PLACING_GESTURE_SUPPRESS_FRAMES: u32 = 60;
 pub enum AfterToast {
     #[default]
     Nothing,
-    /// Latched on the 0→1 Connected toast: open Start when safe.
-    OpenStart,
+    /// Latched on the 0→1 Connected toast: open the hub when safe.
+    OpenHub,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,8 +79,8 @@ pub enum Effect {
     Move { progress: f32, dismissing: bool },
     /// Toast presentation finished; clear message / hide or hand off.
     Finished,
-    /// Open the start screen now (toast may still be Resting).
-    OpenStart,
+    /// Open the hub now (toast may still be Resting).
+    OpenHub,
     /// Raise Settings / Start / popup above the toast (only after Resting).
     RaiseInteractive { focus: bool },
 }
@@ -119,13 +119,13 @@ impl State {
     pub fn suppresses_reopen_gesture(&self) -> bool {
         match self {
             Self::Active(Active {
-                after: AfterToast::OpenStart,
+                after: AfterToast::OpenHub,
                 phase: Phase::Placing,
                 placing_frames,
                 ..
             }) => *placing_frames < PLACING_GESTURE_SUPPRESS_FRAMES,
             Self::Active(Active {
-                after: AfterToast::OpenStart,
+                after: AfterToast::OpenHub,
                 phase: Phase::SlidingIn { .. },
                 ..
             }) => true,
@@ -342,8 +342,8 @@ pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
             },
         ) if dismiss_gen == generation => {
             let mut effects = Vec::new();
-            if after == AfterToast::OpenStart {
-                effects.push(Effect::OpenStart);
+            if after == AfterToast::OpenHub {
+                effects.push(Effect::OpenHub);
             }
             effects.push(Effect::Finished);
             (State::Idle, effects)
@@ -421,16 +421,16 @@ fn step_slide(
     }
 
     if dismissing {
-        if after == AfterToast::OpenStart {
-            effects.push(Effect::OpenStart);
+        if after == AfterToast::OpenHub {
+            effects.push(Effect::OpenHub);
         }
         effects.push(Effect::Finished);
         (State::Idle, effects)
     } else {
         // Slide-in settled: rest pose. OpenStart fires here (toast stays visible).
         let mut after = after;
-        if after == AfterToast::OpenStart {
-            effects.push(Effect::OpenStart);
+        if after == AfterToast::OpenHub {
+            effects.push(Effect::OpenHub);
             after = AfterToast::Nothing;
         }
         effects.push(Effect::RaiseInteractive { focus: true });
@@ -464,7 +464,7 @@ mod tests {
     fn show_connect(generation: u64) -> Event {
         Event::Show {
             generation,
-            after: AfterToast::OpenStart,
+            after: AfterToast::OpenHub,
             body: "Connected".into(),
         }
     }
@@ -480,7 +480,7 @@ mod tests {
                 },
             );
             state = next;
-            if effects.iter().any(|e| matches!(e, Effect::OpenStart)) {
+            if effects.iter().any(|e| matches!(e, Effect::OpenHub)) {
                 opened = true;
                 break;
             }
@@ -496,7 +496,7 @@ mod tests {
             State::Active(Active {
                 generation: 1,
                 phase: Phase::Placing,
-                after: AfterToast::OpenStart,
+                after: AfterToast::OpenHub,
                 placing_frames: 0,
                 ..
             })
@@ -533,7 +533,7 @@ mod tests {
         assert!(
             !effects
                 .iter()
-                .any(|e| matches!(e, Effect::OpenStart | Effect::Finished))
+                .any(|e| matches!(e, Effect::OpenHub | Effect::Finished))
         );
         // One frame counted; still under the suppress budget.
         assert!(matches!(
@@ -558,13 +558,13 @@ mod tests {
                 },
             );
             assert!(effects.is_empty());
-            assert!(!effects.iter().any(|e| matches!(e, Effect::OpenStart)));
+            assert!(!effects.iter().any(|e| matches!(e, Effect::OpenHub)));
             state = next;
             assert!(matches!(state.phase(), Some(Phase::Placing)));
         }
         assert!(!state.suppresses_reopen_gesture());
         assert!(matches!(state.phase(), Some(Phase::Placing)));
-        assert_eq!(state.after(), AfterToast::OpenStart);
+        assert_eq!(state.after(), AfterToast::OpenHub);
     }
 
     #[test]
@@ -629,8 +629,8 @@ mod tests {
         let (state, effects) = step(state, Event::Dismiss { generation: 1 });
         assert_eq!(state, State::Idle);
         assert!(effects.contains(&Effect::Finished));
-        assert!(effects.contains(&Effect::OpenStart));
-        let open_idx = effects.iter().position(|e| matches!(e, Effect::OpenStart));
+        assert!(effects.contains(&Effect::OpenHub));
+        let open_idx = effects.iter().position(|e| matches!(e, Effect::OpenHub));
         let fin_idx = effects.iter().position(|e| matches!(e, Effect::Finished));
         assert!(open_idx < fin_idx);
     }
@@ -646,7 +646,7 @@ mod tests {
 
         let (state, effects) = step(state, Event::Dismiss { generation: 1 });
         assert!(state.is_dismissing());
-        assert!(!effects.iter().any(|e| matches!(e, Effect::OpenStart)));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::OpenHub)));
 
         let mut state = state;
         for _ in 0..20 {
@@ -660,7 +660,7 @@ mod tests {
             state = next;
             if effects.iter().any(|e| matches!(e, Effect::Finished)) {
                 assert!(effects.contains(&Effect::Finished));
-                assert!(!effects.iter().any(|e| matches!(e, Effect::OpenStart)));
+                assert!(!effects.iter().any(|e| matches!(e, Effect::OpenHub)));
                 assert_eq!(state, State::Idle);
                 return;
             }
@@ -689,7 +689,7 @@ mod tests {
                 },
             );
             state = next;
-            assert!(!effects.iter().any(|e| matches!(e, Effect::OpenStart)));
+            assert!(!effects.iter().any(|e| matches!(e, Effect::OpenHub)));
             if state.is_resting() {
                 return;
             }
