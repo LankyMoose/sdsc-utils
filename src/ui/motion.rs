@@ -33,6 +33,33 @@ pub const BASE_MS: u64 = 280;
 /// Large surface transition: art crossfades, veil-style fades.
 pub const SLOW_MS: u64 = 450;
 
+/// Hub/Browser entrance: let the card appear first; the full-screen backdrop
+/// stays clear briefly, then fades in behind it.
+pub const SHELL_BACKDROP_DELAY: Duration = Duration::from_millis(140);
+pub const SHELL_BACKDROP_FADE: Duration = Duration::from_millis(220);
+
+/// Backdrop alpha for a shell opened at `started`: 0 during the delay, then
+/// an eased fade to `target`. Opacity is never gated by reduced motion.
+pub fn shell_backdrop_alpha(
+    started: std::time::Instant,
+    now: std::time::Instant,
+    target: f32,
+) -> f32 {
+    let elapsed = now.saturating_duration_since(started);
+    if elapsed < SHELL_BACKDROP_DELAY {
+        return 0.0;
+    }
+    let t = progress_linear(
+        (elapsed - SHELL_BACKDROP_DELAY).as_millis() as u64,
+        SHELL_BACKDROP_FADE.as_millis() as u64,
+    );
+    target * ease_in_out_cubic(t)
+}
+
+pub fn shell_backdrop_done(started: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(started) >= SHELL_BACKDROP_DELAY + SHELL_BACKDROP_FADE
+}
+
 /// Linear 0..=1 fraction of `elapsed_ms / duration_ms` (zero duration = done).
 pub fn progress_linear(elapsed_ms: u64, duration_ms: u64) -> f32 {
     if duration_ms == 0 {
@@ -204,5 +231,41 @@ mod tests {
         assert!((movement_offset(72.0, true) - 0.0).abs() < f32::EPSILON);
         assert!((movement_scale(0.88, false) - 0.88).abs() < f32::EPSILON);
         assert!((movement_scale(0.88, true) - 1.0).abs() < f32::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod shell_fade_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn backdrop_waits_then_fades_to_target() {
+        let t0 = Instant::now();
+        assert_eq!(shell_backdrop_alpha(t0, t0, 0.55), 0.0);
+        assert_eq!(
+            shell_backdrop_alpha(
+                t0,
+                t0 + SHELL_BACKDROP_DELAY - Duration::from_millis(1),
+                0.55
+            ),
+            0.0
+        );
+        let mid = shell_backdrop_alpha(
+            t0,
+            t0 + SHELL_BACKDROP_DELAY + SHELL_BACKDROP_FADE / 2,
+            0.55,
+        );
+        assert!(mid > 0.0 && mid < 0.55, "midpoint should be partial: {mid}");
+        assert!(
+            (shell_backdrop_alpha(t0, t0 + SHELL_BACKDROP_DELAY + SHELL_BACKDROP_FADE, 0.55)
+                - 0.55)
+                .abs()
+                < 0.001
+        );
+        assert!(shell_backdrop_done(
+            t0,
+            t0 + SHELL_BACKDROP_DELAY + SHELL_BACKDROP_FADE
+        ));
     }
 }

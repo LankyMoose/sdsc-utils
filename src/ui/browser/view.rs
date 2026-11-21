@@ -724,6 +724,7 @@ pub fn root_view(
     engine_available: bool,
     stage_w: f32,
     stage_h: f32,
+    backdrop_alpha: f32,
 ) -> Element<'_, BrowserMessage> {
     let (page_w, page_h) = fullscreen_layout(stage_w, stage_h);
     let layout = crate::ui::browser::state::browser_layout(stage_w, stage_h);
@@ -742,7 +743,7 @@ pub fn root_view(
             // Alpha-capable backends dim the whole screen behind the card;
             // opaque backends keep the flat dark backdrop.
             background: Some(iced::Background::Color(if transparent {
-                theme::alpha(iced::Color::BLACK, theme::BACKDROP_ALPHA)
+                theme::alpha(iced::Color::BLACK, backdrop_alpha)
             } else {
                 theme::BASE_BG
             })),

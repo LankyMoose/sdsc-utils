@@ -235,16 +235,14 @@ impl App {
         crate::controller::hid::diag::diag_info("ui-diag: hub open");
         open.map(Message::HubOpened)
             .chain(crate::ui::layout::disable_window_transitions(id))
-            .chain(Task::perform(
-                super::delay(std::time::Duration::from_millis(250)),
-                move |()| Message::WindowShowFallback(id),
-            ))
+            .chain(Task::done(Message::WindowShowNow(id)))
     }
 
     /// Hide the hub and return focus to Start when it is the app underneath.
     pub(crate) fn close_hub(&mut self) -> Task<Message> {
         self.hub_visible = false;
         self.hub_pending_show = false;
+        self.hub_backdrop_fade = None;
         let Some(id) = self.hub_window.take() else {
             return self.rehost_toast_after_composite();
         };
@@ -287,7 +285,7 @@ impl App {
         Task::none()
     }
 
-    pub(crate) fn on_hub_show_fallback(&mut self) -> Task<Message> {
+    pub(crate) fn on_hub_show_now(&mut self) -> Task<Message> {
         self.show_hub_now()
     }
 
@@ -299,6 +297,7 @@ impl App {
             return Task::none();
         };
         self.hub_pending_show = false;
+        self.hub_backdrop_fade = Some(Instant::now());
         // The hub composites the toast card; keep the HWND hidden so it
         // cannot sit above the scrim as a blank transparent window.
         let hide_toast = if self.toast_message.is_some() {

@@ -178,8 +178,11 @@ pub enum Message {
     /// A window resized (logical size). The browser and hub consume this;
     /// the event is authoritative for their final full-cover size.
     WindowSized(window::Id, iced::Size),
-    /// Safety net for a hidden window whose final resize never arrives.
-    WindowShowFallback(window::Id),
+    /// Hidden shell setup is done: show the window and begin the backdrop
+    /// fade (the card is visible immediately; the scrim fades in after).
+    WindowShowNow(window::Id),
+    /// 60Hz redraw while a hub/Browser backdrop fade is running.
+    ShellFadeTick,
     /// PS hub window opened (focus it once the renderer exists).
     HubOpened(window::Id),
     /// Hub selection / activation from pad, keyboard, or mouse.
@@ -327,7 +330,8 @@ impl Message {
             | Message::BrowserFrame
             | Message::EngineInstallDone(_)
             | Message::WindowSized(_, _)
-            | Message::WindowShowFallback(_)
+            | Message::WindowShowNow(_)
+            | Message::ShellFadeTick
             | Message::StartArtEvent(_) => false,
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
@@ -509,6 +513,8 @@ pub struct App {
     /// Browser HWND is created hidden until its final size + DWM transition
     /// setup; then it is shown so no create-time scale animation is visible.
     browser_pending_show: bool,
+    /// Start instant for the Browser backdrop fade-in (card first, scrim after).
+    browser_backdrop_fade: Option<Instant>,
     /// Topmost PS app-switcher overlay: a full-screen dim scrim with the
     /// card centered in it.
     hub_window: Option<window::Id>,
@@ -519,6 +525,8 @@ pub struct App {
     /// Hub HWND is created hidden until its final size + DWM transition
     /// setup; then it is shown.
     hub_pending_show: bool,
+    /// Start instant for the hub backdrop fade-in.
+    hub_backdrop_fade: Option<Instant>,
     /// Monitor covered by the hub window (toast composite pose).
     hub_monitor_cover: Option<MonitorCover>,
     hub_state: crate::ui::hub::State,
@@ -909,10 +917,12 @@ impl App {
             browser_monitor_cover: None,
             browser_window_size: None,
             browser_pending_show: false,
+            browser_backdrop_fade: None,
             hub_window: None,
             hub_visible: false,
             hub_stage: (crate::ui::hub::HUB_WIDTH, crate::ui::hub::HUB_HEIGHT),
             hub_pending_show: false,
+            hub_backdrop_fade: None,
             hub_monitor_cover: None,
             hub_state: crate::ui::hub::State::default(),
             start_close_armed: false,
@@ -1284,6 +1294,10 @@ impl App {
                 .push(iced::time::every(EMULATOR_COMMIT_POLL).map(|_| Message::EmulatorCommitTick));
         }
 
+        if self.browser_backdrop_fade.is_some() || self.hub_backdrop_fade.is_some() {
+            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::ShellFadeTick));
+        }
+
         if self.toast_message.is_some() || self.toast_machine.wants_frames() {
             // Tick for the whole toast lifetime so content swaps present, and while
             // Placing so the placement failsafe can fire without a Shown event.
@@ -1425,18 +1439,38 @@ impl App {
                 .browser_window_size
                 .or_else(|| self.browser_monitor_cover.map(|c| (c.width, c.height)))
                 .unwrap_or((1920.0, 1080.0));
+            let now = Instant::now();
+            let backdrop_alpha = self
+                .browser_backdrop_fade
+                .map(|started| {
+                    crate::ui::motion::shell_backdrop_alpha(started, now, theme::BACKDROP_ALPHA)
+                })
+                .unwrap_or(theme::BACKDROP_ALPHA);
             return crate::ui::browser::view::root_view(
                 &self.browser.panel,
                 self.browser.engine_available,
                 w,
                 h,
+                backdrop_alpha,
             )
             .map(Message::Browser);
         }
 
         if Some(window) == self.hub_window {
-            let hub = crate::ui::hub::view(&self.hub_state, self.hub_stage.0, self.hub_stage.1)
-                .map(Message::Hub);
+            let now = Instant::now();
+            let backdrop_alpha = self
+                .hub_backdrop_fade
+                .map(|started| {
+                    crate::ui::motion::shell_backdrop_alpha(started, now, theme::BACKDROP_ALPHA)
+                })
+                .unwrap_or(theme::BACKDROP_ALPHA);
+            let hub = crate::ui::hub::view(
+                &self.hub_state,
+                self.hub_stage.0,
+                self.hub_stage.1,
+                backdrop_alpha,
+            )
+            .map(Message::Hub);
             // Start hosts the toast card while its cover is up; the hub
             // overwrites that window with the scrim, so draw the same card in
             // the hub's full-screen window too. The HWND toast is hidden in
@@ -1662,14 +1696,35 @@ impl App {
                     Task::none()
                 }
             }
-            Message::WindowShowFallback(id) => {
+            Message::WindowShowNow(id) => {
                 if self.browser_window == Some(id) {
-                    self.on_browser_show_fallback()
+                    self.on_browser_show_now()
                 } else if self.hub_window == Some(id) {
-                    self.on_hub_show_fallback()
+                    self.on_hub_show_now()
                 } else {
                     Task::none()
                 }
+            }
+            Message::ShellFadeTick => {
+                let now = Instant::now();
+                let mut redraw = Task::none();
+                if let Some(started) = self.browser_backdrop_fade {
+                    if let Some(id) = self.browser_window {
+                        redraw = redraw.chain(crate::ui::layout::invalidate_window(id));
+                    }
+                    if crate::ui::motion::shell_backdrop_done(started, now) {
+                        self.browser_backdrop_fade = None;
+                    }
+                }
+                if let Some(started) = self.hub_backdrop_fade {
+                    if let Some(id) = self.hub_window {
+                        redraw = redraw.chain(crate::ui::layout::invalidate_window(id));
+                    }
+                    if crate::ui::motion::shell_backdrop_done(started, now) {
+                        self.hub_backdrop_fade = None;
+                    }
+                }
+                redraw
             }
             Message::HubOpened(id) => self.on_hub_opened(id),
             Message::Hub(message) => self.on_hub_message(message),

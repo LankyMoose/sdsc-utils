@@ -63,6 +63,7 @@ pub struct BrowserAppState {
 }
 
 use iced::Task;
+use std::time::Instant;
 
 use super::Message;
 
@@ -199,10 +200,7 @@ impl super::App {
         close_start
             .chain(crate::ui::layout::disable_window_transitions(id))
             .chain(opened)
-            .chain(Task::perform(
-                super::delay(std::time::Duration::from_millis(250)),
-                move |()| Message::WindowShowFallback(id),
-            ))
+            .chain(Task::done(Message::WindowShowNow(id)))
     }
 
     /// Close the standalone Browser window and suspend its engine (cached
@@ -212,6 +210,7 @@ impl super::App {
         self.browser_monitor_cover = None;
         self.browser_window_size = None;
         self.browser_pending_show = false;
+        self.browser_backdrop_fade = None;
         let task = self.close_browser_surface();
         let Some(id) = self.browser_window.take() else {
             return task;
@@ -268,7 +267,7 @@ impl super::App {
     /// and the surface has had a moment to settle at the cover size. Showing
     /// immediately lets Windows animate the create-time default size into the
     /// fullscreen rect (the visible "scale" on open).
-    pub(crate) fn on_browser_show_fallback(&mut self) -> Task<Message> {
+    pub(crate) fn on_browser_show_now(&mut self) -> Task<Message> {
         if !self.browser_pending_show {
             return Task::none();
         }
@@ -276,6 +275,7 @@ impl super::App {
         let Some(id) = self.browser_window else {
             return Task::none();
         };
+        self.browser_backdrop_fade = Some(Instant::now());
         self.sync_browser_viewport();
         crate::ui::layout::show_window(id).chain(crate::ui::layout::focus_window(id))
     }

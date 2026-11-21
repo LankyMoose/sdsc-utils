@@ -276,8 +276,8 @@ pub fn window_hwnd(id: window::Id) -> Task<Option<isize>> {
     }
 }
 
-/// Ask Win32 to invalidate the toast HWND so a new view can present.
-pub fn invalidate_toast<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+/// Ask Win32 to invalidate a window HWND so its next view can present.
+pub fn invalidate_window<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     #[cfg(windows)]
     {
         window::run(id, move |window| {
@@ -299,6 +299,11 @@ pub fn invalidate_toast<Message: Send + 'static>(id: window::Id) -> Task<Message
         let _ = id;
         Task::none()
     }
+}
+
+/// Ask Win32 to invalidate the toast HWND so a new view can present.
+pub fn invalidate_toast<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+    invalidate_window(id)
 }
 
 /// Nudge toast size by ±1px so wgpu rebuilds the surface for a new message.

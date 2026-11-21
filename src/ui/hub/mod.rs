@@ -366,9 +366,14 @@ impl State {
 
 /// Render the hub card. The window root is transparent; the card is the only
 /// opaque surface.
-pub fn view(state: &State, stage_w: f32, stage_h: f32) -> Element<'_, HubMessage> {
+pub fn view(
+    state: &State,
+    stage_w: f32,
+    _stage_h: f32,
+    backdrop_alpha: f32,
+) -> Element<'_, HubMessage> {
     if state.apps_open {
-        return apps_view(state, stage_w, stage_h);
+        return apps_view(state, stage_w, _stage_h, backdrop_alpha);
     }
     let card_w = (stage_w - 32.0).clamp(340.0, HUB_WIDTH - 24.0);
     let inner_w = card_w - 24.0;
@@ -381,26 +386,28 @@ pub fn view(state: &State, stage_w: f32, stage_h: f32) -> Element<'_, HubMessage
         .padding(12)
         .width(Length::Fixed(card_w))
         .style(card_style);
-    frame(card.into(), stage_w, stage_h)
+    frame(card.into(), backdrop_alpha)
 }
 
 /// Full-screen dimmed backdrop with the card centered. The backdrop always
-/// covers the window; only the card itself scales with the stage.
-fn frame<'a>(
-    card: Element<'a, HubMessage>,
-    _stage_w: f32,
-    _stage_h: f32,
-) -> Element<'a, HubMessage> {
+/// covers the window; only the card itself scales with the stage. The caller
+/// fades `backdrop_alpha` in after the card has appeared.
+fn frame<'a>(card: Element<'a, HubMessage>, backdrop_alpha: f32) -> Element<'a, HubMessage> {
     container(card)
         .width(Fill)
         .height(Fill)
         .center_x(Fill)
         .center_y(Fill)
-        .style(theme::scrim(theme::BACKDROP_ALPHA))
+        .style(theme::scrim(backdrop_alpha))
         .into()
 }
 
-fn apps_view(state: &State, stage_w: f32, stage_h: f32) -> Element<'_, HubMessage> {
+fn apps_view(
+    state: &State,
+    stage_w: f32,
+    _stage_h: f32,
+    backdrop_alpha: f32,
+) -> Element<'_, HubMessage> {
     let card_w = (stage_w - 48.0).clamp(360.0, 480.0);
     let inner_w = card_w - 24.0;
     let app_w = ((inner_w - 8.0) / 2.0).max(150.0);
@@ -424,7 +431,7 @@ fn apps_view(state: &State, stage_w: f32, stage_h: f32) -> Element<'_, HubMessag
     .padding(12)
     .width(Length::Fixed(card_w))
     .style(card_style);
-    let base: Element<'_, HubMessage> = frame(card.into(), stage_w, stage_h);
+    let base: Element<'_, HubMessage> = frame(card.into(), backdrop_alpha);
     if let Some(index) = state.apps_info {
         return stack![base, app_info(state, index)]
             .width(Fill)
