@@ -632,6 +632,10 @@ class Console:
         env["APPDATA"] = str(appdata)
         env["SDSC_UPDATE_API_URL"] = self.feed_url()
         env["SDSC_CEF_NO_BUILD_FALLBACK"] = "1"
+        # `SDSC_DEBUG_OPEN` turns on debug quiet mode by default (no focus,
+        # pad edges dropped, secondary monitor). QA needs the real shell:
+        # focusable windows and live controller navigation.
+        env["SDSC_DEBUG_QUIET"] = "0"
         if self.engine:
             env["SDSC_CEF_DLC_URL"] = self.engine["url"]
             env["SDSC_CEF_DLC_SHA256"] = self.engine["sha256"]

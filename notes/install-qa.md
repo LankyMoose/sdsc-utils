@@ -64,6 +64,12 @@ empty install is the default test state.
 | `SDSC_CEF_NO_BUILD_FALLBACK` | engine resolver in debug/qa-feed builds |
 | `APPDATA` | app data dir (`%APPDATA%\sdsc-utils`) |
 | `SDSC_DEBUG_OPEN` | debug builds: open `hub`/`browser`/etc. after boot |
+| `SDSC_DEBUG_QUIET` | `0` keeps debug-open windows focusable with live pad input |
+
+`SDSC_DEBUG_OPEN` normally enables **debug quiet mode** (no focus, secondary
+monitor, pad edges dropped) for screenshotting over a running game. The QA
+console sets `SDSC_DEBUG_QUIET=0` so its debug-open hub is a normal focused
+window and controller navigation works in the hub, Start, and Browser.
 
 ## Build prerequisites
 
