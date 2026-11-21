@@ -442,6 +442,7 @@ mod tests {
     fn query_is_a_json_string_and_covers_controls() {
         let js = dom_query_js(Some((10.0, 20.0)), 7);
         assert!(js.contains("JSON.stringify"));
+        assert!(js.contains("__sdsc_click"));
         assert!(js.contains("__sdsc_cx=10"));
         assert!(js.contains("role=\"button\""));
         assert!(js.contains("role=\"option\""));
