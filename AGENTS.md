@@ -21,6 +21,17 @@
 - **`notes/`** — topic handoffs for agents (index: `notes/README.md`). Read the matching note before touching a do-not-regress area.
 - **`packaging/`** — MSIX packaging; **`scripts/`** — CI checklist; **`assets/`** — icons, sounds, README screenshots.
 
+## Branch layout
+
+- `main` — released line.
+- `browser/main` — consolidation point for all Servo-era browser work
+  (contains the former `browser/multi-app-suspend-spike` / `browser/tabs`).
+- `browser/hub-pivot` — current work: split browser out of Start into a
+  managed app + PS hub, then replace Servo with CEF OSR. Plan:
+  `notes/browser-hub-pivot.md`.
+- `backup/pre-split-full` — pre-split snapshot; keep until the pivot merges.
+
+
 ## Build / test / lint ordering
 
 **Always: fmt → clippy → test → build** (this is the CI order and the pre-push hook order).
@@ -70,6 +81,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 | Directory | Typical changes |
 |---|---|
 | `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Start / toast, message routing |
+| `src/browser/` | In-Start browser: engine seam + Servo worker, DOM target query, controller cursor, tabs/bookmarks, stable frame texture, reader fallback (Servo-era; pivot to managed app + CEF planned) |
 | `src/session/` | Pure device session (no windows/HWND): presence, notify, analytics, Start-open policy; emits `SessionEffect`s the UI applies |
 | `src/controller/` | HID polling + worker (`hid/`), DualSense protocol (`dualsense/`: battery, lightbar, rumble, input, identity), known controllers, debug-only `emulate` emulation |
 | `src/domain/` | Pure logic: battery colors/spectrum math, pad gestures/chords, protocol helpers |
@@ -100,6 +112,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Lightbar spectrum editor (Settings)** → `src/ui/configure/spectrum.rs`, `src/ui/configure/mod.rs`
 - **Theme / shared widget styles** → `src/ui/theme.rs`; restyle plan → `notes/ui-refresh.md`
 - **Start screen / game launcher** → `src/ui/start/` (UI), `src/games/` (Steam scan, launch); behavior → `notes/start-immersive.md`
+- **Browser (Servo era)** → `src/browser/` + `src/ui/start/browser_frame.rs`; engine/DOM/cursor contract → `notes/browser-embedding.md`; planned hub/CEF split → `notes/browser-hub-pivot.md`
 - **Toasts** → `src/ui/toast/` (state machine in `machine.rs`); z-order / remount → `notes/windows-toast.md`
 - **Persisted state (prefs/controllers/analytics)** → `src/persist/`
 - **Single instance, tray lifecycle, crash-restart** → `src/bin/sdsc-utils.rs`, `src/platform/crash_restart.rs`

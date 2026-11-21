@@ -26,7 +26,7 @@ Historical evidence of the ~5s freezes is preserved below (`last_op=hidapi_new`,
 | `%APPDATA%\sdsc-utils\app.log` | Edge summaries, second timestamps, 1 MB rotate → `app.log.1` |
 | `%APPDATA%\sdsc-utils\hid-trace.log` | Every HID open / write / read, **ms** timestamps, 16 MB rotate → `hid-trace.log.1` |
 
-Logger: [`src/app_log.rs`](../src/app_log.rs). Phase + watchdog: [`src/hid_diag.rs`](../src/hid_diag.rs).
+Logger: [`src/app_log.rs`](../src/platform/app_log.rs). Phase + watchdog: [`src/hid_diag.rs`](../src/controller/hid/diag.rs).
 
 ## Known internal causes (historical)
 
@@ -76,9 +76,9 @@ Shell client mode has no local `INPUT_SNAPSHOT` (`shell: client mode (service ow
 - `ui-diag: start cursor hide` / `start cursor show` — immersive idle cursor hide (debug builds)
 - `HITCH_MARK kind=lightbar|input source=hotkey|button` — shell client also `client=1`
 - `shell: client mode (service owns HID + tray)` — local snapshot is unused; do not trust `NeverPublished` on F8 without `client=1`
-- `PANIC at file:line:col: …` — custom hook in [`app_log::init`](../src/app_log.rs); required because `windows_subsystem = "windows"` discards stderr panic text (exit 101 with an empty console)
+- `PANIC at file:line:col: …` — custom hook in [`app_log::init`](../src/platform/app_log.rs); required because `windows_subsystem = "windows"` discards stderr panic text (exit 101 with an empty console)
 - `PANIC_BACKTRACE …` — capped `Backtrace::force_capture()` right after `PANIC at` (all builds); use to tell iced atlas/main-thread from the image worker
-- `crash-restart: scheduled` / `launching` / `giving up after N` — panic hook arms a delayed self-relaunch ([`crash_restart`](../src/crash_restart.rs)); budget file `crash-restart.json` caps 3 restarts / 10 min
+- `crash-restart: scheduled` / `launching` / `giving up after N` — panic hook arms a delayed self-relaunch ([`crash_restart`](../src/platform/crash_restart.rs)); budget file `crash-restart.json` caps 3 restarts / 10 min
 - `crash-restart: notice toast` — post-relaunch (or `--test-crash-toast`) one-shot toast with bug icon; `notice` flag in `crash-restart.json`
 - **Sibling:** wgpu `iced_wgpu::image texture atlas` / `Texture::create_view` panics (seen on **v1.4.1** after the stable-Rgba mitigation) → [`wgpu-image-atlas-crash.md`](wgpu-image-atlas-crash.md). Not fixed by toast/Start slide latch work.
 

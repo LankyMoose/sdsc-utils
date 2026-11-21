@@ -1,49 +1,86 @@
-# Browser embedding: Servo offscreen inside Start
+# Browser embedding: Servo offscreen inside Start (current), CEF pivot planned
 
-**Status:** in progress (branch `browser/multi-app-suspend-spike`). **When to read:** anything
-touching `src/browser/`, the Start browser surface, or the `servo-engine` feature.
+**Status:** current implementation (Servo era) on `browser/hub-pivot` / `browser/main`.
+**When to read:** anything touching `src/browser/`, the Start browser surface, or
+the `servo-engine` feature. **Planned replacement:** [browser-hub-pivot.md](browser-hub-pivot.md)
+(split the browser out of Start into a managed app; replace Servo with CEF OSR).
 
-## Decision
+## Decision (current)
 
-- Inside-Start + open web + no-DRM → Servo offscreen composited as an iced
+- Inside-Start + open web + no DRM → Servo offscreen composited as an iced
   texture. Rejected: `wry`/WebView2 child HWND (native child draws above the
-  iced/wgpu canvas — toasts, veils, and drawer chrome cannot composite over
-  it; Linux child is X11-only anyway). `retsurf` is a standalone GPL app, not
-  a library — only its controller UX patterns carry over (virtual cursor,
-  link hints, grid/wheel OSK, input maps). Incompatible pages fall back to
-  the system browser via `games::launch`.
+  iced/wgpu canvas — toasts, veils, drawer chrome cannot composite over it;
+  Linux child is X11-only anyway). `retsurf` is a standalone GPL app, not a
+  library — only its controller UX patterns carry over.
 - Proven by spike (Nov 2026, temp `servo-spike` crate, Servo 0.8.0):
   `SoftwareRenderingContext` 800×600 → `read_to_image` → `example.com`
   rendered correctly (icon, Latin/Arabic-RTL/Chinese/French/Russian). Software
   path needs no GL sharing and no GStreamer (media feature off by default).
+- **Cloudflare bot protection is the known ceiling** and the reason a CEF
+  replacement is planned: Servo's TLS/HTTP2 fingerprint and JS environment do
+  not pass managed challenges, so challenged sites are dead in the embedded
+  browser. See the pivot note for the target architecture (CEF OSR, Store/DLC
+  engine packaging).
 
 ## Layout
 
 - `src/browser/engine.rs` — engine seam: `EngineCommand` down, `EngineEvent`
-  up, `EngineHandle` channel pair (mirrors `InputHub` bind/clear/emit).
+  up, `EngineHandle` channel pair (mirrors `InputHub` bind/clear/emit). The UI
+  only depends on this seam, so the backend is replaceable without touching
+  Start.
 - `src/browser/servo_backend.rs` (`servo-engine` feature only) — worker
   thread owning all Servo types (`!Send` by design). Suspend = skip spin +
-  long sleep; generation-guarded loads; 30s load timeout.
-- `src/browser/fetch.rs` + `BrowserSession` — reader backend (the
-  `--no-default-features` fallback). `BrowserSession` also carries the engine
-  `BrowserFrame` and all suspend/resume generation guards.
-- `src/browser/mod.rs` — `AppManager` (one foreground app, rest
-  hidden/unfocused/suspended) + `open_browser` helper.
-- Start surface (`src/ui/start/view.rs::browser_view`): wash + wide card over
-  the live stage, above modals, below the settings drawer. Engine image
-  (Contain) when a frame exists, reader text otherwise. Pad Up/Down scrolls
-  (engine `Scroll::Delta` vs text `scroll_to`); Cross re-goes; Circle/Esc
-  closes through the standard unwind chain.
-- `Message::BrowserEngine` is system-class (like ticks, not input): frames
-  must not reset idle-dim/cursor-hide.
+  long sleep; generation-guarded loads; 30s load timeout. The `A11yTree`
+  event name is legacy: it carries the DOM-derived focusable set, not Servo's
+  accessibility tree.
+- `src/browser/dom.rs` — DOM target source: injected `MutationObserver` /
+  `ResizeObserver` / scroll listeners ping a marker URL (intercepted locally,
+  no traffic); `dom_query_js` returns viewport-space candidates with stable
+  per-document ids, visibility verdicts, overflow clipping, scroll truth and
+  document dims. Culling/retention is deliberate (pull cost + Servo's slow
+  `getComputedStyle`).
+- `src/browser/cursor.rs` — controller cursor: analog free point, magnet dock
+  with acquire/hold hysteresis and break-free, D-pad flights (fixed 150ms
+  tween; wrap-to-wrap morph), unified page+header space, row-locked
+  horizontals, R2 turbo.
+- `src/browser/frame_slot.rs` + `src/ui/start/browser_frame.rs` — per-tab
+  latest RGBA; custom `iced_wgpu` primitive uploads unseen generations into
+  one stable texture (`queue.write_texture`). No per-frame image handles.
+- `src/browser/tabs.rs`, `src/browser/bookmarks.rs` — the two persisted
+  browser stores (`tabs.json`, `bookmarks.json`). Restored tabs load lazily;
+  engine state never crosses a restart.
+- `src/browser/fetch.rs` — reader fallback (blocking `ureq` + readability)
+  used when the engine is unavailable. Scheduled for deletion with Servo.
+- `src/browser/keys.rs` — iced → Servo keyboard mapping.
+
+## Current input/UX contract (pad, engine mode)
+
+- Left stick moves the cursor with velocity + friction; magnet docks on
+  arrival, centre-snaps on fresh acquisition, holds in place while scrolling.
+- D-pad: vertical is one row per press with column preserved; horizontal is
+  row-locked and stops at row ends. D-pad Up/Down is the explicit
+  header/page crossing; the analog stick may cross freely.
+- R2 turbo doubles cursor acceleration/cap and scroll speed while held and
+  disables docking; release re-snaps in place.
+- Right stick scrolls only while the cursor is over the page. Scroll
+  commands go straight to the engine (no wheel-event round-trip).
+- Cross clicks the docked target (chrome target first, then exact-element
+  click, else point click); Circle closes/backs out; Triangle edits the URL;
+  L1/R1 travel history (tap) or open the history selector (hold); L3 toggles
+  magnet; R3 dumps an issue bundle.
+- Tabs: favicon + ellipsized title + close, active highlighted,
+  `_blank`/`window.open` foreground, background tabs suspend, strip
+  persists/restores lazily.
+- Browser popup: no Browser/title row, 4px card padding, 16:9 card sized from
+  viewport height, dynamic engine viewport.
 
 ## Startup ordering contract (Windows, NVIDIA)
 
-Worker-thread WGL context creation segfaults inside `nvoglv64.dll` once
-any Vulkan is initialized in the process — but is fine before it (proven by
+Worker-thread WGL context creation segfaults inside `nvoglv64.dll` once any
+Vulkan is initialized in the process — but is fine before it (proven by
 scratch probes). So `App::boot` blocks on the engine's context-ready signal
 (up to 15s, then falls back to reader-only) and `wgpu_diag` adapter logging
-(which creates a wgpu Instance) moved after it. `WGPU_BACKEND` stays
+(which creates a wgpu Instance) runs after it. `WGPU_BACKEND` stays
 Vulkan-first (transparency needs it); DX12-only also dodges the crash but
 loses alpha compositing. `SDSC_NO_ENGINE=1` forces the reader path without
 spawning the worker.
@@ -63,50 +100,34 @@ runtime import lib at link time, and a bumped Stylo thread stack:
 - `.cargo/config.toml` sets `SERVO_STYLE_THREAD_STACK_SIZE_KB=1024`
   (Stylo reads it at *compile time*). Servo's default 512 KiB style threads
   overflow on real-world restyle storms — typing into Google's autocomplete
-  box aborts the process (`StyleThread has overflowed its stack`), while
-  passive loads never push that deep. 1024 matches the platform default
-  thread stack; the extra is address-space reserve. Changing the value
-  needs a `cargo clean -p stylo` (at least) to take effect, since Cargo
-  does not track env changes in fingerprints.
+  box aborts the process. Changing the value needs `cargo clean -p stylo`
+  (at least) since Cargo does not track env changes in fingerprints.
 
 ## Feature flag
 
-`servo-engine = ["dep:servo", "dep:dpi", "dep:euclid", "dep:url"]`,
+`servo-engine = ["dep:servo", "dep:dpi", "dep:euclid", "dep:url", "dep:surfman", "dep:embedder_traits"]`,
 **on by default** (single exe): plain `cargo run` / `cargo test` / CI builds
 the engine. `servo` itself is `default-features = false` plus `bundled`,
-`clipboard`, `js_jit`, `multiprocess` — i.e. upstream defaults minus
-`devtools` (remote-debugging server, pure build cost; JIT and multiprocess
-stay for page performance). UI-only iteration skips Servo entirely with
-`cargo run --no-default-features` (reader backend) or `SDSC_NO_ENGINE=1`
-at runtime; the MSRV job uses `--no-default-features` since the engine
-needs the pinned toolchain.
+`clipboard`, `js_jit`, `multiprocess` — upstream defaults minus `devtools`.
+UI-only iteration skips Servo with `cargo run --no-default-features` (reader
+backend) or `SDSC_NO_ENGINE=1` at runtime; the MSRV job uses
+`--no-default-features` since the engine needs the pinned toolchain.
 
-## Upstream gaps (Servo 0.8 AX tree, 2026-11)
+## Early Servo AX gaps (historical)
 
-Verified against 14k+ nodes across main + iframe documents on
-google.com: these controls never appear in any `TreeUpdate`, so no
-client-side rule can target them (no role, no Click action, no tag —
-`html_tag` is never populated either):
+The first target source was Servo's accesskit tree; it withheld real controls
+(textareas, `div[role=button]`, native buttons arrived as containers or not at
+all). That is why `dom.rs` queries the live DOM instead. These gaps are no
+longer blocking: targets come from `getClientRects`/DOM state, and
+`notify_accessibility_tree_update` is a no-op in the backend.
 
-- Search box (`<textarea>`/`<input>`): zero text-input roles of any kind.
-- People-also-ask accordions (`div[role=button]`): zero `Button` roles
-  anywhere, including pages full of native `<button>`s — Servo's
-  role mapping drops them (arrive as `GenericContainer` at best, usually
-  absent entirely).
-- Some header links arrive as `Link` without bounds and are correctly
-  skipped (can't aim at geometry that isn't there).
+## Known gaps
 
-Missing nodes do NOT corrupt other nodes' positions (each rect is
-absolute); offsets come from layout-shift lag and scroll tracking, which
-are handled separately. Workaround today: free-point click + typing works
-(input bypasses AX); only magnetism needs the nodes. Next step: file
-upstream with a minimal repro page + `SDSC_AX_DEBUG=1` dump.
-
-## Open gaps (phase 2+)
-
-- No mouse-wheel→engine scroll yet (image has no scrollable; needs
-  `mouse_area` scroll events forwarded as `Scroll::Delta`).
-- No link clicking / text input into the page (`notify_input_event`
-  plumbing). Pad currently scrolls + re-goes only.
-- Fixed 800×600 viewport (card scales it); resize on card-size change.
-- No per-engine pref for JS/media toggles; no disk cache tuning.
+- **Cloudflare bot protection**: challenged sites cannot be used. Requires the
+  CEF pivot (see [browser-hub-pivot.md](browser-hub-pivot.md)).
+- Debug-build Servo performance dominates scroll/render timing; release is the
+  reference for frame/scroll validation.
+- Page-field IME/OSK still unbuilt ([browser-osk.md](browser-osk.md)).
+- `notes/wgpu-image-atlas-crash.md` Crash D (display sleep → surface loss →
+  PS button → atlas panic) remains a separate recovery gap.
+- Reader fallback only covers text pages and is being removed with Servo.

@@ -20,6 +20,17 @@ Requires the Windows SDK (`makeappx.exe`). Logos are generated into `packaging/A
 
 The MSIX layout ships the single `sdsc-utils.exe` (tray + HID + UI in one process). The GitHub portable download is the same exe copied to `target/portable/`.
 
+## Planned: browser engine DLC (not implemented)
+
+The hub/CEF pivot splits the browser out of Start and moves the engine into an
+optional `BrowserEngine` package in a **related set** (mandatory for executable
+code), so the main MSIX stays lean. Store users install it through
+`Windows.Services.Store`; sideload uses AppInstaller `<OptionalPackages>`;
+dev/unpackaged uses a `LocalAppData` download+hash-verify fallback. See
+[`notes/browser-hub-pivot.md`](../notes/browser-hub-pivot.md) before changing
+`AppxManifest.xml`/`pack-msix.ps1` for multi-package output. The current
+single-package layout below remains accurate until that work lands.
+
 ## Store submission
 
 See [STORE.md](STORE.md) for the Partner Center checklist (account, listing copy, first upload).

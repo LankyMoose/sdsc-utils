@@ -1,7 +1,9 @@
 # On-screen keyboard (plan, not built)
 
 **Status:** design only. **When to read:** adding controller text entry to
-the browser (or anywhere else in Start).
+the browser (or anywhere else). After the hub pivot
+([browser-hub-pivot.md](browser-hub-pivot.md)) the OSK belongs to the Browser
+app's own window, not Start.
 
 ## Goal
 
@@ -13,8 +15,10 @@ commit path, not a replacement.
 
 Start already composites modal surfaces over the stage with one owner at a
 time (`HintPressOwner`, overlay priority in `notes/start-immersive.md`).
-The OSK becomes one more surface — `OskPanel` next to `BrowserPanel` — so
-pad ownership, Cancel-unwind, and idle-dim keep working unchanged.
+After the pivot the Browser app owns its own window and the same modal-surface
+pattern; the OSK becomes one more Browser surface (`OskPanel` next to the
+browser panel), so pad ownership, Cancel-unwind, and idle-dim keep working
+unchanged.
 
 ## Proposed shape (URL bar, phase 1)
 
@@ -22,7 +26,7 @@ pad ownership, Cancel-unwind, and idle-dim keep working unchanged.
   Wheel layouts (retsurf-style) are nicer on sticks but cost a custom
   canvas; grid reuses buttons and the existing focus-chase patterns.
 - State: `open: bool`, `focus: (row, col)`, `layer: Alpha | Symbol`.
-  Lives in `BrowserPanel` while URL-only; promotes to its own
+  Lives in the Browser app's panel while URL-only; promotes to its own
   `State` field if page-field IME ever needs it.
 - Pad while open (owns input like the browser surface does):
   D-pad moves cell focus (wrap), Cross commits the char into the URL draft
