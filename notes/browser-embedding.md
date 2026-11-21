@@ -122,9 +122,9 @@ the hub over Browser exactly like over Start.
   55% black scrim behind the 16:9 card (`theme::BACKDROP_ALPHA`); opaque
   backends keep the flat backdrop. The cursor is recentered in the live page
   area every time the window opens.
-- The hub uses the same full-screen scrim (its window expands to the monitor
-  cover) and keeps the card bottom-weighted. On an opaque backend it falls
-  back to the small card window so it does not black out the app underneath.
+- The hub window always covers the monitor and draws the same scrim; the
+  card is centered and scales with the stage (icon tiles, no subtitles). On
+  an opaque backend the scrim blends over the opaque clear color.
 
 ## Build prerequisites (Windows)
 

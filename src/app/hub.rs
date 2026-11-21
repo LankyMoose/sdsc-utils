@@ -198,26 +198,13 @@ impl App {
             width: 1920.0,
             height: 1080.0,
         });
-        // Alpha-capable backends put the whole monitor behind a dim scrim;
-        // opaque backends keep the small card window so they do not black out
-        // the app underneath.
-        let full_screen = crate::ui::chrome::transparent_windows();
-        let (window_size, window_position) = if full_screen {
-            (
-                Size::new(cover.width, cover.height),
-                window::Position::Specific(Point::new(cover.x, cover.y)),
-            )
-        } else {
-            let x = cover.x + ((cover.width - hub_view::HUB_WIDTH) * 0.5).max(0.0);
-            let y = cover.y
-                + (cover.height * hub_view::HUB_TOP_FRACTION)
-                    .min((cover.height - hub_view::HUB_HEIGHT - 24.0).max(0.0));
-            (
-                Size::new(hub_view::HUB_WIDTH, hub_view::HUB_HEIGHT),
-                window::Position::Specific(Point::new(x, y)),
-            )
-        };
-        self.hub_stage = (window_size.width, window_size.height);
+        // The backdrop always covers the monitor; the card scales/centers
+        // inside it. On an opaque backend the scrim blends over the opaque
+        // clear color instead of the desktop.
+        self.hub_stage = (cover.width, cover.height);
+        self.hub_monitor_cover = Some(cover);
+        let window_size = Size::new(cover.width, cover.height);
+        let window_position = window::Position::Specific(Point::new(cover.x, cover.y));
         self.refresh_engine_status();
         self.hub_state.on_open(
             self.session.prefs.start_screen_enabled,
@@ -229,10 +216,10 @@ impl App {
             size: window_size,
             position: window_position,
             visible: open_visible(),
-            transparent: full_screen,
+            transparent: crate::ui::chrome::transparent_windows(),
             resizable: false,
             decorations: false,
-            // The one shell surface above toast / Settings / popups.
+            // Above Settings/popup; the toast is raised/composited above.
             level: window::Level::AlwaysOnTop,
             exit_on_close_request: true,
             platform_specific: overlay_platform_specific(),
@@ -242,17 +229,26 @@ impl App {
         self.hub_visible = true;
         self.session.auto_open_pending = false;
         crate::controller::hid::diag::diag_info("ui-diag: hub open");
-        open.map(Message::HubOpened)
+        // The hub composites the toast card; keep the HWND hidden so it
+        // cannot sit above the scrim as a blank transparent window.
+        let hide_toast = if self.toast_message.is_some() {
+            self.toast_window
+                .map(crate::ui::layout::hide_toast)
+                .unwrap_or_else(Task::none)
+        } else {
+            Task::none()
+        };
+        hide_toast.chain(open.map(Message::HubOpened))
     }
 
     /// Hide the hub and return focus to Start when it is the app underneath.
     pub(crate) fn close_hub(&mut self) -> Task<Message> {
         self.hub_visible = false;
         let Some(id) = self.hub_window.take() else {
-            return Task::none();
+            return self.rehost_toast_after_composite();
         };
         crate::controller::hid::diag::diag_info("ui-diag: hub close");
-        let task = window::close(id);
+        let task = window::close(id).chain(self.rehost_toast_after_composite());
         // Return focus to the app underneath: Browser first (it launches on
         // top of Start or the desktop), else Start.
         if self.browser_visible
@@ -346,16 +342,9 @@ impl App {
                     return Task::none();
                 }
                 crate::controller::hid::diag::diag_info("ui-diag: hub launch Start");
-                // Start is a sibling app: dismiss the browser before showing
-                // it, or the fullscreen browser would stay on top.
-                let dismiss = self.close_hub();
-                if self.browser_visible {
-                    dismiss
-                        .chain(self.close_browser_window())
-                        .chain(self.open_start_screen())
-                } else {
-                    dismiss.chain(self.open_start_screen())
-                }
+                // Start and Browser are exclusive; `open_start_screen` closes
+                // the Browser before showing Start.
+                self.close_hub().chain(self.open_start_screen())
             }
             hub_view::HubTile::Browser => {
                 if self.browser.engine.is_none() {
@@ -390,6 +379,18 @@ impl App {
             return Task::none();
         };
         if let Some(message) = self.hub_state.pad_tick(&reading.sample, Instant::now()) {
+            let face_held = reading.sample.cross
+                || reading.sample.circle
+                || reading.sample.square
+                || reading.sample.triangle;
+            if message == hub_view::HubMessage::Close && face_held {
+                // The hub consumed this press; keep the underlying app from
+                // seeing the same hold as a fresh Cancel/Confirm edge. The
+                // latch is time-bounded so a missed release sample cannot
+                // wedge pad input.
+                self.hub_face_latch_until =
+                    Some(Instant::now() + std::time::Duration::from_millis(1000));
+            }
             return self.on_hub_message(message);
         }
         Task::none()

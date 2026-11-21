@@ -136,6 +136,13 @@ impl super::App {
             );
             return Task::none();
         }
+        // Start and Browser are mutually exclusive: opening one dismisses
+        // the other rather than stacking two fullscreen apps.
+        let close_start = if self.start_visible {
+            self.close_start_screen()
+        } else {
+            Task::none()
+        };
         let cover =
             crate::ui::layout::primary_monitor_cover().unwrap_or(crate::ui::layout::MonitorCover {
                 x: 0.0,
@@ -176,7 +183,7 @@ impl super::App {
         self.prefetch_bookmark_favicons();
         crate::controller::hid::diag::diag_info("ui-diag: browser window open");
         let opened = open.map(Message::BrowserOpened);
-        if was_open {
+        let opened = if was_open {
             // Reopen after close: cached page, suspended engine.
             self.browser.panel.session.open_surface();
             self.resume_browser_engine();
@@ -184,7 +191,8 @@ impl super::App {
         } else {
             // Fresh surface: open the tab strip (restore) or home.
             opened.chain(self.open_browser_session())
-        }
+        };
+        close_start.chain(opened)
     }
 
     /// Close the standalone Browser window and suspend its engine (cached

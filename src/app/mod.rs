@@ -506,13 +506,14 @@ pub struct App {
     /// Actual logical window size reported by iced after creation/resize.
     browser_window_size: Option<(f32, f32)>,
     /// Topmost PS app-switcher overlay: a full-screen dim scrim with the
-    /// card bottom-weighted (small card window on opaque backends).
+    /// card centered in it.
     hub_window: Option<window::Id>,
     /// True while the hub is revealed; modal owner of pad input.
     hub_visible: bool,
-    /// Actual logical size of the hub window (full-screen cover on an
-    /// alpha-capable backend, the small card window on an opaque one).
+    /// Actual logical size of the hub window (always the monitor cover).
     hub_stage: (f32, f32),
+    /// Monitor covered by the hub window (toast composite pose).
+    hub_monitor_cover: Option<MonitorCover>,
     hub_state: crate::ui::hub::State,
     /// Close is two-phase when the cursor was hidden: the flag clears
     /// immediately, but HWND destruction waits one loop pass
@@ -549,6 +550,11 @@ pub struct App {
     start_file_dialog_open: bool,
     /// After open / hide: ignore reopen until a debounced full release.
     chord_release_gate: ChordReleaseGate,
+    /// Face-button release latch after the hub closes on Circle/Cross. The
+    /// hub consumed the press; without this the same hold reaches the app
+    /// underneath and dismisses its popup/window. Time-bounded so a missed
+    /// release sample can never wedge pad input.
+    hub_face_latch_until: Option<Instant>,
     /// When Start was last revealed (unfocus grace).
     start_revealed_at: Option<Instant>,
     gesture_detectors: GestureDetectorBank,
@@ -898,6 +904,7 @@ impl App {
             hub_window: None,
             hub_visible: false,
             hub_stage: (crate::ui::hub::HUB_WIDTH, crate::ui::hub::HUB_HEIGHT),
+            hub_monitor_cover: None,
             hub_state: crate::ui::hub::State::default(),
             start_close_armed: false,
             last_start_paint_at: std::cell::Cell::new(None),
@@ -916,6 +923,7 @@ impl App {
             start_cursor_hidden: false,
             start_file_dialog_open: false,
             chord_release_gate: ChordReleaseGate::default(),
+            hub_face_latch_until: None,
             start_revealed_at: None,
             gesture_detectors: GestureDetectorBank::default(),
             pad_nav: PadNavBank::default(),
@@ -1806,6 +1814,7 @@ impl App {
             self.start_visible = false;
             self.start_close_armed = false;
             self.start_nav_ready = false;
+            let rehost_toast = self.rehost_toast_after_composite();
             // Close preserves all visual state (selection, dock, drawer,
             // scrolls, drafts, browser panel): the next open resumes where
             // it left off. Only the cursor-restore backstop and input
@@ -1819,7 +1828,7 @@ impl App {
             self.browser.dpad_stepper.reset();
             self.clear_start_nav_diag();
             self.consume_reopen_gesture_chord();
-            let sync = self.sync_toast_zorder();
+            let sync = rehost_toast.chain(self.sync_toast_zorder());
             // The auto-open latch survives a close so a pending
             // open can retry once presence still qualifies.
             if self.session.auto_open_pending

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 impl App {
     pub(crate) fn immersive_hosts_toast(&self) -> bool {
-        self.start_visible
+        self.start_visible || self.hub_visible
     }
 
     pub(crate) fn toast_eta_for(&self, event: &NotifyEvent) -> Option<String> {
@@ -206,13 +206,16 @@ impl App {
 
     /// Draw the active toast inside Start (cover occludes the toast HWND).
     pub(crate) fn immersive_toast_overlay(&self) -> Option<Element<'_, Message>> {
-        if !self.start_visible {
-            return None;
-        }
         let message = self.toast_message.as_ref()?;
         let (progress, dismissing) = self.toast_machine.slide_pose()?;
         let placement = self.toast_placement?;
-        let cover = self.start_monitor_cover?;
+        let cover = if self.start_visible {
+            self.start_monitor_cover?
+        } else if self.hub_visible {
+            self.hub_monitor_cover?
+        } else {
+            return None;
+        };
         let local = toast_local_in_cover(placement, progress, dismissing, cover);
         let card = toast_view::view(
             message,
@@ -427,6 +430,28 @@ impl App {
         } else {
             Task::none()
         }
+    }
+
+    /// Popup/Start close was hosting the toast inside its window; move the
+    /// HWND toast to the current slide pose and show it. No-op when no toast
+    /// is active or the toast is still hosted by another window.
+    pub(crate) fn rehost_toast_after_composite(&self) -> Task<Message> {
+        let Some(id) = self.toast_window else {
+            return Task::none();
+        };
+        if self.toast_message.is_none() || self.immersive_hosts_toast() {
+            return Task::none();
+        }
+        let Some(placement) = self.toast_placement else {
+            return Task::none();
+        };
+        let (progress, dismissing) = self.toast_machine.slide_pose().unwrap_or((1.0, false));
+        let y = slide_y(placement, progress, dismissing);
+        remount_toast_surface(id, self.toast_generation)
+            .chain(move_window(id, Point::new(placement.x, y)))
+            .chain(show_toast_without_activate(id))
+            .chain(invalidate_toast(id))
+            .chain(self.raise_toast_above_all())
     }
 
     /// Put the toast at the top of the z-order without activating it, so it

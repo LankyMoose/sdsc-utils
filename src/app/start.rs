@@ -2857,6 +2857,18 @@ impl App {
         if self.hub_visible {
             return self.on_hub_pad(&readings);
         }
+        // The hub may have just closed on a face press. Swallow pad input
+        // until that press is fully released so it cannot also dismiss the
+        // Start/Browser popup underneath.
+        if let Some(until) = self.hub_face_latch_until {
+            let face_held = readings
+                .iter()
+                .any(|r| r.sample.cross || r.sample.circle || r.sample.square || r.sample.triangle);
+            if face_held && Instant::now() < until {
+                return Task::none();
+            }
+            self.hub_face_latch_until = None;
+        }
         if self.browser_visible {
             return self.on_browser_pad(&readings);
         }
@@ -4639,7 +4651,12 @@ impl App {
             self.last_running_check = None;
             self.arm_chord_release_latch();
             let badge = self.refresh_running_badge();
-            return Task::batch([badge, focus_window(id)]);
+            let close_browser = if self.browser_visible {
+                self.close_browser_window()
+            } else {
+                Task::none()
+            };
+            return close_browser.chain(Task::batch([badge, focus_window(id)]));
         }
 
         // Mark the current chord consumed (do not reset): a held PS from power-on
@@ -4662,6 +4679,12 @@ impl App {
             );
             return Task::none();
         }
+        // Start and Browser are mutually exclusive.
+        let close_browser = if self.browser_visible {
+            self.close_browser_window()
+        } else {
+            Task::none()
+        };
 
         let cover = primary_monitor_cover().unwrap_or(MonitorCover {
             x: 0.0,
@@ -4701,7 +4724,20 @@ impl App {
         self.start_visible = true;
         self.session.auto_open_pending = false;
         crate::platform::wgpu_diag::note_start_open();
-        Task::batch([badge, restored_art, open.map(Message::StartOpened)])
+        // Start composites the toast card; hide the HWND so it cannot float
+        // above the cover as a duplicate.
+        let hide_toast = if self.toast_message.is_some() {
+            self.toast_window
+                .map(crate::ui::layout::hide_toast)
+                .unwrap_or_else(Task::none)
+        } else {
+            Task::none()
+        };
+        close_browser.chain(hide_toast.chain(Task::batch([
+            badge,
+            restored_art,
+            open.map(Message::StartOpened),
+        ])))
     }
 
     /// Advance the enter ceremony: once the veil clock finishes, clear the
@@ -4911,6 +4947,7 @@ impl App {
         // Clear visibility before any hide task so Resting toast RaiseInteractive
         // cannot resurface Start while the hide is in flight.
         self.start_visible = false;
+        let rehost_toast = self.rehost_toast_after_composite();
         self.start_nav_ready = false;
         self.start_revealed_at = None;
         // Tuning is settled state: never reopen with it on.
@@ -4946,9 +4983,9 @@ impl App {
             // restore to the OS before FinishStartClose tears down the HWND.
             crate::controller::hid::diag::diag_info("ui-diag: start close armed (cursor restore)");
             self.start_close_armed = true;
-            return Task::done(Message::FinishStartClose);
+            return rehost_toast.chain(Task::done(Message::FinishStartClose));
         }
-        self.hide_and_close_start_window()
+        rehost_toast.chain(self.hide_and_close_start_window())
     }
 
     /// Second close phase: destroy the Start HWND after the cursor-restore
