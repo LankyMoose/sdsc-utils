@@ -76,7 +76,7 @@ impl Policy {
         refresh_hint_throttle: Duration::from_secs(1),
         open_backoff_threshold: 3,
         open_backoff_window: Duration::from_secs(5),
-        probe_backoff_first: Duration::from_secs(30),
+        probe_backoff_first: Duration::from_secs(1),
         probe_backoff_max: Duration::from_secs(300),
         active_poll: Duration::from_millis(4),
         identify_sample_poll: Duration::from_millis(4),

@@ -82,7 +82,9 @@ const OPEN_BACKOFF_THRESHOLD: u32 = Policy::DEFAULT.open_backoff_threshold;
 /// How long a backed-off path is skipped (re-probed sooner on list change).
 const OPEN_BACKOFF_WINDOW: Duration = Policy::DEFAULT.open_backoff_window;
 /// First probe-failure hold. Ghost HID nodes (listed but never readable) cost
-/// ~1s per open; re-probing them on every liveness poll stalls live input.
+/// ~1s per open, but a transient boot-time failure (a sleeping pad or a just-
+/// woken BT link) must retry fast or presence/lightbar/auto-open lag by the
+/// whole hold. Start at 1s and double from there.
 const PROBE_BACKOFF_FIRST: Duration = Policy::DEFAULT.probe_backoff_first;
 /// Probe backoff cap (further consecutive failures stay at this window).
 const PROBE_BACKOFF_MAX: Duration = Policy::DEFAULT.probe_backoff_max;
@@ -105,7 +107,9 @@ fn backoff_skip_at(fails: u32, last: Instant, now: Instant) -> bool {
 }
 
 /// Exponential hold after `fails` consecutive full-probe failures:
-/// 30s, 60s, 120s, 240s, then the 5-minute cap.
+/// 1s, 2s, 4s, 8s, 16s, 32s, ... capped at 5 minutes. The short first holds
+/// keep boot-time presence discovery fast; only a persistent ghost reaches
+/// the long windows.
 fn probe_backoff_window(fails: u32) -> Duration {
     if fails == 0 {
         return Duration::ZERO;
@@ -2724,11 +2728,14 @@ mod tests {
     #[test]
     fn probe_backoff_window_doubles_to_cap() {
         assert_eq!(probe_backoff_window(0), Duration::ZERO);
-        assert_eq!(probe_backoff_window(1), Duration::from_secs(30));
-        assert_eq!(probe_backoff_window(2), Duration::from_secs(60));
-        assert_eq!(probe_backoff_window(3), Duration::from_secs(120));
-        assert_eq!(probe_backoff_window(4), Duration::from_secs(240));
-        assert_eq!(probe_backoff_window(5), Duration::from_secs(300));
+        assert_eq!(probe_backoff_window(1), Duration::from_secs(1));
+        assert_eq!(probe_backoff_window(2), Duration::from_secs(2));
+        assert_eq!(probe_backoff_window(3), Duration::from_secs(4));
+        assert_eq!(probe_backoff_window(4), Duration::from_secs(8));
+        assert_eq!(probe_backoff_window(5), Duration::from_secs(16));
+        assert_eq!(probe_backoff_window(6), Duration::from_secs(32));
+        assert_eq!(probe_backoff_window(9), Duration::from_secs(256));
+        assert_eq!(probe_backoff_window(10), Duration::from_secs(300));
         assert_eq!(probe_backoff_window(50), Duration::from_secs(300));
     }
 
@@ -2737,10 +2744,10 @@ mod tests {
         let now = Instant::now();
         assert!(!probe_skip_at(0, now, now));
         assert!(probe_skip_at(1, now, now));
-        assert!(probe_skip_at(1, now, now + Duration::from_secs(29)));
-        assert!(!probe_skip_at(1, now, now + Duration::from_secs(30)));
-        assert!(probe_skip_at(3, now, now + Duration::from_secs(119)));
-        assert!(!probe_skip_at(3, now, now + Duration::from_secs(120)));
+        assert!(probe_skip_at(1, now, now + Duration::from_millis(999)));
+        assert!(!probe_skip_at(1, now, now + Duration::from_secs(1)));
+        assert!(probe_skip_at(3, now, now + Duration::from_secs(3)));
+        assert!(!probe_skip_at(3, now, now + Duration::from_secs(4)));
     }
 
     #[test]

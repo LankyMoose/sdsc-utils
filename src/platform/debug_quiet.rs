@@ -1,11 +1,13 @@
 //! Debug-only "quiet" UI mode for screenshotting while the desktop is in use.
 //!
 //! Enabled when `SDSC_DEBUG_OPEN` is set (debug builds only), unless
-//! `SDSC_DEBUG_QUIET=0` explicitly opts out. While quiet: windows never take
-//! focus and are relocated from the primary monitor to a secondary one
-//! (`ui::layout::{focus_window, show_window, move_window}`), pad edges are
-//! dropped, and UI sounds / Start haptics are muted — so a debug session
-//! cannot interrupt a game running on the primary monitor. Set
+//! `SDSC_DEBUG_QUIET=0` explicitly opts out. `SDSC_DEBUG_QUIET=1` also enables
+//! quiet mode on its own, so an automated launch that auto-opens a window
+//! without `SDSC_DEBUG_OPEN` still goes to the secondary monitor. While quiet:
+//! windows never take focus and are relocated from the primary monitor to a
+//! secondary one (`ui::layout::{focus_window, show_window, move_window}`), pad
+//! edges are dropped, and UI sounds / Start haptics are muted — so a debug
+//! session cannot interrupt a game running on the primary monitor. Set
 //! `SDSC_DEBUG_INPUT=1` to keep pad edges live in quiet mode (the install QA
 //! console uses this to drive the hub on the secondary monitor while a game
 //! keeps focus on the primary). Release builds always return `false`.
@@ -58,13 +60,11 @@ pub fn input_dropped() -> bool {
 
 #[cfg(any(debug_assertions, test))]
 fn quiet_from_env(open: bool, quiet: Option<&str>) -> bool {
-    if !open {
-        return false;
+    match quiet.map(str::to_ascii_lowercase).as_deref() {
+        Some("1" | "true" | "on") => true,
+        Some("0" | "false" | "off") => false,
+        _ => open,
     }
-    !matches!(
-        quiet.map(str::to_ascii_lowercase).as_deref(),
-        Some("0" | "false" | "off")
-    )
 }
 
 #[cfg(any(debug_assertions, test))]
@@ -97,9 +97,11 @@ mod tests {
     }
 
     #[test]
-    fn no_auto_open_is_never_quiet() {
+    fn explicit_quiet_works_without_auto_open() {
         assert!(!quiet_from_env(false, None));
-        assert!(!quiet_from_env(false, Some("1")));
+        assert!(quiet_from_env(false, Some("1")));
+        assert!(quiet_from_env(false, Some("TRUE")));
+        assert!(quiet_from_env(false, Some("on")));
     }
 
     #[test]

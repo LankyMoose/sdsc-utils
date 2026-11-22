@@ -111,10 +111,11 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
   view.
 - Cross (or click) launches the focused app. Triangle on the Browser tile opens
   its install/update/Info actions popup (the old catalog screen is gone).
-- Every controller card keeps its battery wheel. The focused card adds the
-  standard ringed face hints: Cross Identify and Triangle hold Power off on a
-  live Bluetooth pad. These replaced Start's controllers surface, which no
-  longer exists (Create is inert).
+- Only the selected controller card (controllers row focused) shows its
+  battery wheel; unfocused cards stay compact with name/status. The selected
+  card also adds the standard ringed face hints: Cross Identify and Triangle
+  hold Power off on a live Bluetooth pad. These replaced Start's controllers
+  surface, which no longer exists (Create is inert).
 
 ## Environment overrides
 
@@ -127,7 +128,7 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
 | `SDSC_CEF_NO_BUILD_FALLBACK` | engine resolver in debug/qa-feed builds |
 | `APPDATA` | app data dir (`%APPDATA%\sdsc-utils`) |
 | `SDSC_DEBUG_OPEN` | debug builds: open `hub`/`browser`/etc. after boot |
-| `SDSC_DEBUG_QUIET` | `0` makes debug-open windows focusable on the primary |
+| `SDSC_DEBUG_QUIET` | `1` forces quiet secondary placement; `0` opts out of debug-open quiet |
 | `SDSC_DEBUG_INPUT` | `1` keeps pad edges live; `0` drops them (even outside quiet mode) |
 
 `SDSC_DEBUG_OPEN` normally enables **debug quiet mode** (no focus, secondary

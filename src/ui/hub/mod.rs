@@ -25,8 +25,9 @@ use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Shadow, 
 use std::time::Instant;
 
 /// Nominal hub card width/height. The card is centered in the full-monitor
-/// window; `HUB_HEIGHT` is only the pre-open stage default.
-pub const HUB_WIDTH: f32 = 620.0;
+/// window; `HUB_HEIGHT` is only the pre-open stage default. Keep the card
+/// compact: the controller strip scrolls horizontally rather than widening it.
+pub const HUB_WIDTH: f32 = 380.0;
 pub const HUB_HEIGHT: f32 = 280.0;
 
 /// Main hub section inset (the card itself has no padding).
@@ -903,7 +904,7 @@ pub fn view<'a>(
         .style(card_style);
     let base: Element<'a, HubMessage> = frame(card.into(), backdrop_alpha);
     if let Some(index) = state.apps_info {
-        return stack![base, app_info(state, index)]
+        return stack![base, app_info(state, index, (card_w - 24.0).max(300.0))]
             .width(Fill)
             .height(Fill)
             .into();
@@ -1057,21 +1058,30 @@ fn controller_card<'a>(
             == index;
     let powering_off = row.connected && state.powering_off.as_ref() == Some(&row.serial);
     let live = row.connected && !powering_off;
-    let ring_color = if state.ring_flash_white(&row.serial) {
-        theme::from_rgb(lightbar::IDENTIFY_FLASH)
-    } else if live {
-        theme::from_rgb(spectrum.color_at_percent(row.percent))
+    // The wheel is a focus affordance: unfocused rows stay compact and show
+    // only name/state. It returns as soon as the card is selected.
+    let ring = selected.then(|| {
+        let ring_color = if state.ring_flash_white(&row.serial) {
+            theme::from_rgb(lightbar::IDENTIFY_FLASH)
+        } else if live {
+            theme::from_rgb(spectrum.color_at_percent(row.percent))
+        } else {
+            theme::DIM
+        };
+        crate::ui::percent_ring::percent_ring(
+            row.percent,
+            ring_color,
+            CONTROLLER_RING,
+            row.eta.clone(),
+            1.0,
+            if live { 1.0 } else { 0.6 },
+        )
+    });
+    let details_w = if selected {
+        CONTROLLER_CARD_W - 12.0 - CONTROLLER_RING - 8.0
     } else {
-        theme::DIM
+        CONTROLLER_CARD_W - 12.0
     };
-    let ring = crate::ui::percent_ring::percent_ring(
-        row.percent,
-        ring_color,
-        CONTROLLER_RING,
-        row.eta.clone(),
-        1.0,
-        if live { 1.0 } else { 0.6 },
-    );
     let meta = if powering_off {
         "Powering off".to_string()
     } else if !row.connected {
@@ -1097,7 +1107,7 @@ fn controller_card<'a>(
         text(text_fit::ellipsize_to_width(
             row.display_name(),
             13.0,
-            CONTROLLER_CARD_W - 16.0 - CONTROLLER_RING - 8.0
+            details_w
         ))
         .size(13.0)
         .font(iced::Font {
@@ -1113,7 +1123,7 @@ fn controller_card<'a>(
         text(text_fit::ellipsize_to_width(
             &meta,
             theme::type_scale::CAPTION,
-            CONTROLLER_CARD_W - 16.0 - CONTROLLER_RING - 8.0
+            details_w
         ))
         .size(theme::type_scale::CAPTION)
         .color(if powering_off {
@@ -1132,11 +1142,15 @@ fn controller_card<'a>(
             .push(space().height(2))
             .push(action_cluster_spaced::<HubMessage>(&hints, 10.0, true));
     }
-    let body: Element<'a, HubMessage> = row![ring, details]
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .width(Fill)
-        .into();
+    let body: Element<'a, HubMessage> = if let Some(ring) = ring {
+        row![ring, details]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .width(Fill)
+            .into()
+    } else {
+        details.into()
+    };
     let mut b = button(
         container(body)
             .width(Fill)
@@ -1230,7 +1244,7 @@ pub fn info_scroll_id() -> iced::widget::Id {
 }
 
 fn settings_view<'a>(state: &State, stage_w: f32, backdrop_alpha: f32) -> Element<'a, HubMessage> {
-    let card_w = (stage_w - 48.0).clamp(340.0, 460.0);
+    let card_w = hub_card_width(stage_w);
     let mut rows = column![].spacing(4);
     for (i, label) in SETTINGS_ROWS.iter().enumerate() {
         if !state.settings_visible(i) {
@@ -1514,7 +1528,7 @@ fn apps_menu<'a>(state: &State, index: usize) -> Element<'a, HubMessage> {
         .into()
 }
 
-fn app_info<'a>(state: &'a State, index: usize) -> Element<'a, HubMessage> {
+fn app_info<'a>(state: &'a State, index: usize, width: f32) -> Element<'a, HubMessage> {
     let app = APPS[index];
     let dim = state.app_dimmed(app);
     let ink = if dim { theme::DIM } else { theme::INK };
@@ -1663,7 +1677,7 @@ fn app_info<'a>(state: &'a State, index: usize) -> Element<'a, HubMessage> {
         .spacing(0),
     )
     .padding(16)
-    .width(Length::Fixed(420.0))
+    .width(Length::Fixed(width))
     .style(card_style);
     container(card)
         .width(Fill)

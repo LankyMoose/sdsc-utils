@@ -10,7 +10,7 @@ Start, Browser, hub, and Configure nav/action cues may pulse DualSense motors vi
 
 While a UI surface is hot (Start, Browser, hub, pad-input), **do not** run exclusive battery `Poll` (`drop_all` + `read_timeout`). Battery is parsed from the same USB `0x01` / BT `0x31` reports the sample loop already drains (`parse_battery_from_report`). The app synthesizes `Controllers` from `HidWorkerHandle::live_controllers()` and applies lightbar only on membership / color-bucket change (`reassert_lightbar_for_pads`).
 
-**Never probe an actively used pad.** `LivePadStatus.last_input_at` updates on every non-resting sample (buttons / sticks / D-pad / triggers / bumpers). For ~3s after the last such sample, `poll_incremental` skips both the cached-handle battery read and any full probe: battery comes from the live stream instead. Idle, new, and ghost paths remain probeable (failed paths still use the exponential backoff).
+**Never probe an actively used pad.** `LivePadStatus.last_input_at` updates on every non-resting sample (buttons / sticks / D-pad / triggers / bumpers). For ~3s after the last such sample, `poll_incremental` skips both the cached-handle battery read and any full probe: battery comes from the live stream instead. Idle, new, and ghost paths remain probeable (failed paths use exponential backoff starting at 1s, doubling to 5 minutes, so boot-time presence/lightbar/auto-open do not wait out a ghost hold).
 
 Cold (tray idle): classic timed `Poll` unchanged.
 
