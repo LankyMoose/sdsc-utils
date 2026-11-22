@@ -41,6 +41,11 @@ pub struct Policy {
     pub open_backoff_threshold: u32,
     /// How long a backed-off path is skipped.
     pub open_backoff_window: Duration,
+    /// First full-probe failure holds the path off for this long; doubles per
+    /// consecutive failure (ghost HID nodes open slowly but never read).
+    pub probe_backoff_first: Duration,
+    /// Cap for the per-path full-probe failure backoff.
+    pub probe_backoff_max: Duration,
     /// Active input wake (wired report interval).
     pub active_poll: Duration,
     /// Identify-flash input sample interval.
@@ -71,6 +76,8 @@ impl Policy {
         refresh_hint_throttle: Duration::from_secs(1),
         open_backoff_threshold: 3,
         open_backoff_window: Duration::from_secs(5),
+        probe_backoff_first: Duration::from_secs(30),
+        probe_backoff_max: Duration::from_secs(300),
         active_poll: Duration::from_millis(4),
         identify_sample_poll: Duration::from_millis(4),
         sample_stall_ms: 100,

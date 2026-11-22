@@ -78,6 +78,11 @@ const REFRESH_HINT_THROTTLE: Duration = Policy::DEFAULT.refresh_hint_throttle;
 const OPEN_BACKOFF_THRESHOLD: u32 = Policy::DEFAULT.open_backoff_threshold;
 /// How long a backed-off path is skipped (re-probed sooner on list change).
 const OPEN_BACKOFF_WINDOW: Duration = Policy::DEFAULT.open_backoff_window;
+/// First probe-failure hold. Ghost HID nodes (listed but never readable) cost
+/// ~1s per open; re-probing them on every liveness poll stalls live input.
+const PROBE_BACKOFF_FIRST: Duration = Policy::DEFAULT.probe_backoff_first;
+/// Probe backoff cap (further consecutive failures stay at this window).
+const PROBE_BACKOFF_MAX: Duration = Policy::DEFAULT.probe_backoff_max;
 
 /// Pure decision: is the last enumeration older than `max_age` (or never ran)?
 fn refresh_overdue_at(last_refresh: Option<Instant>, now: Instant, max_age: Duration) -> bool {
@@ -88,6 +93,27 @@ fn refresh_overdue_at(last_refresh: Option<Instant>, now: Instant, max_age: Dura
 /// `last`, evaluated at `now`.
 fn backoff_skip_at(fails: u32, last: Instant, now: Instant) -> bool {
     fails >= OPEN_BACKOFF_THRESHOLD && now.saturating_duration_since(last) < OPEN_BACKOFF_WINDOW
+}
+
+/// Exponential hold after `fails` consecutive full-probe failures:
+/// 30s, 60s, 120s, 240s, then the 5-minute cap.
+fn probe_backoff_window(fails: u32) -> Duration {
+    if fails == 0 {
+        return Duration::ZERO;
+    }
+    let mut window = PROBE_BACKOFF_FIRST;
+    for _ in 1..fails {
+        window = window.saturating_mul(2).min(PROBE_BACKOFF_MAX);
+        if window >= PROBE_BACKOFF_MAX {
+            return PROBE_BACKOFF_MAX;
+        }
+    }
+    window
+}
+
+/// Pure decision: is a path with `fails` failed probes still inside its hold?
+fn probe_skip_at(fails: u32, last: Instant, now: Instant) -> bool {
+    fails > 0 && now.saturating_duration_since(last) < probe_backoff_window(fails)
 }
 
 /// Cold-idle heartbeat: refresh soon when no handles are open (first connect
@@ -122,6 +148,14 @@ fn idle_timeout_for(pulse_wake: Option<Instant>, devices_empty: bool, now: Insta
 /// Consecutive open failures per HID path (ghost devices linger in Windows
 /// enumeration while un-openable: `open_device: file not found`).
 struct OpenBackoff {
+    fails: u32,
+    last: Instant,
+}
+
+/// Consecutive **full-probe** (open + battery read) failures per HID path.
+/// Separate from [`OpenBackoff`]: a ghost can open fine and still never stream
+/// a battery report, and each probe costs ~1s of worker time.
+struct ProbeBackoff {
     fails: u32,
     last: Instant,
 }
@@ -209,6 +243,11 @@ struct DeviceCache {
     /// the sampling open loop (pruned to the listed set on every refresh).
     /// Keyed by HID path (not serial) — filesystem-style identities stay `String`.
     open_backoff: HashMap<String, OpenBackoff>,
+    /// Consecutive full-probe failures per HID path; poll skips these until the
+    /// exponential window expires (pruned to the listed set on refresh).
+    probe_backoff: HashMap<String, ProbeBackoff>,
+    /// Throttles the per-poll `probe skip` diag line to once per 30s.
+    last_probe_skip_log: Option<Instant>,
     presence: Arc<Mutex<Vec<String>>>,
     launch_paths: LaunchPaths,
     launch_serials: Arc<Mutex<Vec<Serial>>>,
@@ -241,6 +280,8 @@ impl DeviceCache {
             last_enum_at: None,
             last_refresh_at: None,
             open_backoff: HashMap::new(),
+            probe_backoff: HashMap::new(),
+            last_probe_skip_log: None,
             presence,
             launch_paths: LaunchPaths::new(),
             launch_serials,
@@ -277,6 +318,8 @@ impl DeviceCache {
         // and a reappearing path retries immediately (no stale skip).
         let listed: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
         self.open_backoff
+            .retain(|path, _| listed.contains(path.as_str()));
+        self.probe_backoff
             .retain(|path, _| listed.contains(path.as_str()));
         if let Ok(mut guard) = self.presence.lock() {
             *guard = paths;
@@ -329,6 +372,80 @@ impl DeviceCache {
 
     fn drop_serial(&mut self, serial: &str) {
         self.devices.remove(&Serial::normalize(serial));
+    }
+
+    /// Paths currently held off by the full-probe failure backoff.
+    fn probe_skipped_paths(&self) -> Vec<String> {
+        let now = Instant::now();
+        self.probe_backoff
+            .iter()
+            .filter(|(_, backoff)| probe_skip_at(backoff.fails, backoff.last, now))
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// Every path that has failed at least one full probe (regardless of the
+    /// backoff clock). Used to defer re-probes while live input is hot.
+    fn failed_probe_paths(&self) -> Vec<String> {
+        self.probe_backoff.keys().cloned().collect()
+    }
+
+    fn probe_fails(&self, path: &str) -> u32 {
+        self.probe_backoff.get(path).map_or(0, |b| b.fails)
+    }
+
+    /// Record a full-probe outcome (call after any `device_list` borrow ends).
+    fn note_probe_result(&mut self, path: &str, ok: bool) {
+        if ok {
+            self.probe_backoff.remove(path);
+            return;
+        }
+        let now = Instant::now();
+        let fails = match self.probe_backoff.get_mut(path) {
+            Some(backoff) => {
+                backoff.fails = backoff.fails.saturating_add(1);
+                backoff.last = now;
+                backoff.fails
+            }
+            None => {
+                self.probe_backoff.insert(
+                    path.to_string(),
+                    ProbeBackoff {
+                        fails: 1,
+                        last: now,
+                    },
+                );
+                1
+            }
+        };
+        crate::controller::hid::diag::diag_info(format!(
+            "hid-diag: probe backoff path={path} fails={fails} hold_ms={}",
+            probe_backoff_window(fails).as_millis()
+        ));
+    }
+
+    /// Arrival hint: a real (re)connect invalidates prior failure holds.
+    fn clear_probe_backoff(&mut self) {
+        if !self.probe_backoff.is_empty() {
+            crate::controller::hid::diag::diag_info(format!(
+                "hid-diag: probe backoff cleared paths={}",
+                self.probe_backoff.len()
+            ));
+            self.probe_backoff.clear();
+        }
+    }
+
+    /// Rate-limit the `probe skip` line (one per 30s across paths).
+    fn probe_skip_log_due(&mut self, now: Instant) -> bool {
+        if self
+            .last_probe_skip_log
+            .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(30))
+        {
+            self.last_probe_skip_log = Some(now);
+            true
+        } else {
+            false
+        }
     }
 
     /// Try to open `serial` from the current device list (no refresh).
@@ -467,8 +584,14 @@ impl DeviceCache {
         let mut best: HashMap<Serial, (OpenDevice, bool)> = HashMap::new();
         // Ghost paths linger in Windows enumeration while un-openable; skip
         // backed-off paths here (re-probed on list change) instead of burning
-        // an open per sample. Outcomes recorded after the borrow ends.
+        // an open per sample. Full-probe failures add a second hold: while
+        // input is hot, never reopen a path that already failed a probe.
+        // Outcomes recorded after the borrow ends.
         let skipped = self.backoff_skipped_paths();
+        let mut probe_skipped = self.probe_skipped_paths();
+        if input_hot {
+            probe_skipped.extend(self.failed_probe_paths());
+        }
         let mut open_failed: Vec<String> = Vec::new();
         let mut open_ok: Vec<String> = Vec::new();
         for info in self.api.device_list().filter(|d| driver::is_gamepad(d)) {
@@ -488,7 +611,7 @@ impl DeviceCache {
                 continue;
             }
             let path = info.path().to_string_lossy().into_owned();
-            if skipped.contains(&path) {
+            if skipped.contains(&path) || probe_skipped.contains(&path) {
                 continue;
             }
             let open_started = Instant::now();
@@ -1968,6 +2091,8 @@ fn handle_cmd(
         HidCmd::RefreshPresence => {
             // Arrival/removal hint: list-only refresh, throttled so bursts
             // collapse. Newcomers are opened by sampling; no reads here.
+            // A real arrival also clears probe failure holds (replugged ghost).
+            cache.clear_probe_backoff();
             let stale =
                 refresh_overdue_at(cache.last_refresh_at, Instant::now(), REFRESH_HINT_THROTTLE);
             if stale {
@@ -1987,7 +2112,15 @@ fn handle_cmd(
             let (result, timing) = {
                 let _op = crate::controller::hid::diag::enter_op("cmd_Poll");
                 let _ = cache.refresh_device_list();
-                poll_incremental(cache, spectrum, claims, live_pads, &previously, &mut quiet)
+                poll_incremental(
+                    cache,
+                    spectrum,
+                    claims,
+                    live_pads,
+                    &previously,
+                    &mut quiet,
+                    input_hot,
+                )
             };
             for serial in quiet {
                 cache.queue_launch_serial(serial);
@@ -2011,6 +2144,9 @@ fn handle_cmd(
 ///
 /// Blocking reads are reserved for new serials (full attempts) and stale pads
 /// (fail-fast on the cached handle, full re-probe only after a drop).
+/// Full probes that fail are held off per path (30s doubling to 5min) so a
+/// ghost node cannot cost ~1s of worker time on every liveness tick; while
+/// input is hot, previously failed paths are deferred outright.
 /// Successful reads refresh the live map via [`remember_live_pad`]; pads the
 /// poll misses are left alone so sampling (not a map wipe) owns liveness.
 fn poll_incremental(
@@ -2020,6 +2156,7 @@ fn poll_incremental(
     live_pads: &Mutex<HashMap<Serial, LivePadStatus>>,
     previously: &[Serial],
     launch_quiet: &mut Vec<Serial>,
+    input_hot: bool,
 ) -> (AppResult<Vec<ControllerStatus>>, HidPhaseTiming) {
     let mut timing = HidPhaseTiming::default();
     let now = Instant::now();
@@ -2054,6 +2191,21 @@ fn poll_incremental(
         return (Ok(Vec::new()), timing);
     }
 
+    // Probe-failure holds: skip paths inside their exponential window, and
+    // while live input is hot, defer *any* path that already failed a probe so
+    // a ghost node cannot stall the ~4ms sample loop between liveness polls.
+    // A fresh live reading proves the remaining pads are fine; the deferred
+    // path retries when input goes cold (or after an arrival hint clears it).
+    let mut skip_probe: std::collections::HashSet<String> =
+        cache.probe_skipped_paths().into_iter().collect();
+    let live_fresh = live_snapshot
+        .values()
+        .any(|(_, _, at)| now.saturating_duration_since(*at) < POLL_LIVE_BATTERY_STALE);
+    if input_hot && live_fresh {
+        skip_probe.extend(cache.failed_probe_paths());
+    }
+    let log_probe_skip = cache.probe_skip_log_due(now);
+
     let mut statuses: Vec<ControllerStatus> = Vec::with_capacity(devices.len());
     for (path, hint) in devices {
         let key = Serial::normalize(&hint);
@@ -2086,6 +2238,7 @@ fn poll_incremental(
             timing.io_ms += io_started.elapsed().as_millis();
             match stale {
                 Some((product, kind, Ok(reading))) => {
+                    cache.note_probe_result(&path, true);
                     if let Some(serial) =
                         cache.launch_paths.take_serial_for_path(&path, key.as_ref())
                     {
@@ -2113,6 +2266,16 @@ fn poll_incremental(
         }
         // Full probe: new serial, unknown hint, or re-probe after a drop.
         // Re-resolve the device by path (list may have shifted since enumerate).
+        if skip_probe.contains(&path) {
+            if log_probe_skip {
+                crate::controller::hid::diag::diag_info(format!(
+                    "hid-diag: probe skip path={path} fails={} input_hot={}",
+                    cache.probe_fails(&path),
+                    input_hot as u8
+                ));
+            }
+            continue;
+        }
         let open_started = Instant::now();
         let probed: Option<(
             String,
@@ -2156,7 +2319,19 @@ fn poll_incremental(
             };
             let serial = resolve_device_identity(info, &device);
             let io_started = Instant::now();
-            match driver.read_battery(&device) {
+            // Known pads re-probe fail-fast; first-seen serials get the full
+            // attempt budget for a cold BT report.
+            let fast = cache.probe_fails(&path) > 0
+                || previously
+                    .iter()
+                    .any(|s| Serial::normalize(s.as_ref()) == key)
+                || live_snapshot.contains_key(&key);
+            let read = if fast {
+                driver.read_battery_fast(&device)
+            } else {
+                driver.read_battery(&device)
+            };
+            match read {
                 Ok(reading) => {
                     let io_ms = io_started.elapsed().as_millis();
                     drop(device);
@@ -2181,6 +2356,7 @@ fn poll_incremental(
             }
         })();
         timing.open_ms += open_started.elapsed().as_millis();
+        cache.note_probe_result(&path, probed.is_some());
         let Some((serial, product, reading, io_ms, kind)) = probed else {
             continue;
         };
@@ -2480,6 +2656,28 @@ fn log_cmd(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_backoff_window_doubles_to_cap() {
+        assert_eq!(probe_backoff_window(0), Duration::ZERO);
+        assert_eq!(probe_backoff_window(1), Duration::from_secs(30));
+        assert_eq!(probe_backoff_window(2), Duration::from_secs(60));
+        assert_eq!(probe_backoff_window(3), Duration::from_secs(120));
+        assert_eq!(probe_backoff_window(4), Duration::from_secs(240));
+        assert_eq!(probe_backoff_window(5), Duration::from_secs(300));
+        assert_eq!(probe_backoff_window(50), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn probe_skip_only_inside_window() {
+        let now = Instant::now();
+        assert!(!probe_skip_at(0, now, now));
+        assert!(probe_skip_at(1, now, now));
+        assert!(probe_skip_at(1, now, now + Duration::from_secs(29)));
+        assert!(!probe_skip_at(1, now, now + Duration::from_secs(30)));
+        assert!(probe_skip_at(3, now, now + Duration::from_secs(119)));
+        assert!(!probe_skip_at(3, now, now + Duration::from_secs(120)));
+    }
 
     #[test]
     fn rumble_defer_until_none_when_empty() {
