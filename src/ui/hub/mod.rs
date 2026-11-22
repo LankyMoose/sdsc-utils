@@ -31,7 +31,9 @@ pub const HUB_HEIGHT: f32 = 280.0;
 
 /// Main hub section inset (the card itself has no padding).
 const SECTION_PAD_X: f32 = 12.0;
-const SECTION_PAD_Y: f32 = 8.0;
+/// Vertical row inset, kept equal for header/apps/controllers so the
+/// separators read as the same gap throughout the card.
+const ROW_PAD_Y: f32 = 4.0;
 const TILE_H: f32 = 88.0;
 const TILE_GAP: f32 = 6.0;
 const ICON: f32 = 42.0;
@@ -957,11 +959,11 @@ pub fn view<'a>(
     let inner_w = (card_w - 2.0 * SECTION_PAD_X).max(1.0);
     let mut content = column![
         container(hub_header(inner_w))
-            .padding([8.0, SECTION_PAD_X])
+            .padding([ROW_PAD_Y, SECTION_PAD_X])
             .width(Length::Fixed(card_w)),
         section_separator(card_w),
         container(apps_row(state, inner_w))
-            .padding([SECTION_PAD_Y, SECTION_PAD_X])
+            .padding([ROW_PAD_Y, SECTION_PAD_X])
             .width(Length::Fixed(card_w)),
     ]
     .spacing(0);
@@ -980,7 +982,7 @@ pub fn view<'a>(
     }
     content = content.push(section_separator(card_w)).push(
         container(controllers_row(state, spectrum, inner_w))
-            .padding([6.0, SECTION_PAD_X])
+            .padding([ROW_PAD_Y, SECTION_PAD_X])
             .width(Length::Fixed(card_w)),
     );
     let card = container(content)
