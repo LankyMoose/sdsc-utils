@@ -52,6 +52,9 @@ use std::time::{Duration, Instant};
 
 const PULSE_SAMPLE_LOG_INTERVAL: Duration = Policy::DEFAULT.pulse_sample_log_interval;
 const SLOW_CMD_LOG_MS: u128 = Policy::DEFAULT.slow_cmd_log_ms;
+/// A pad with a pressed/held control inside this window is actively in use:
+/// battery must come from that stream, never a blocking HID probe.
+const ACTIVE_INPUT_WINDOW: Duration = Duration::from_secs(3);
 /// Cold-idle presence heartbeat: how long the worker blocks when input is not
 /// live and no output is pending. Refreshes the device list on timeout so
 /// arrival still works on platforms without an OS watcher (macOS); watcher
@@ -87,6 +90,12 @@ const PROBE_BACKOFF_MAX: Duration = Policy::DEFAULT.probe_backoff_max;
 /// Pure decision: is the last enumeration older than `max_age` (or never ran)?
 fn refresh_overdue_at(last_refresh: Option<Instant>, now: Instant, max_age: Duration) -> bool {
     last_refresh.is_none_or(|at| now.saturating_duration_since(at) >= max_age)
+}
+
+/// Pure decision: a pad is actively used when a non-resting sample arrived
+/// inside [`ACTIVE_INPUT_WINDOW`]. Active pads are never battery-probed.
+fn pad_input_active_at(last_input_at: Option<Instant>, now: Instant) -> bool {
+    last_input_at.is_some_and(|at| now.saturating_duration_since(at) < ACTIVE_INPUT_WINDOW)
 }
 
 /// Pure decision: skip opening a path with `fails` consecutive failures as of
@@ -264,6 +273,9 @@ struct LivePadStatus {
     /// When the reading was last confirmed (sample or poll read). Drives the
     /// incremental poll: fresh entries skip the blocking battery read.
     updated_at: Instant,
+    /// Last non-resting sample (button/stick/dpad/trigger held). Active pads
+    /// are never HID-probed; their battery comes from the input stream.
+    last_input_at: Option<Instant>,
 }
 
 impl DeviceCache {
@@ -1269,7 +1281,8 @@ fn sample_one(
                 open.silence_timeouts = 0;
             }
             if let Some(reading) = battery {
-                remember_live_pad(live_pads, serial, product, reading, kind);
+                let input_active = !start_input::sample_nav_resting(&sample);
+                remember_live_pad(live_pads, serial, product, reading, kind, input_active);
             }
             SampleOneResult::Ok(start_input::hid_nav_reading(serial, sample))
         }
@@ -1309,16 +1322,24 @@ fn remember_live_pad(
     product: String,
     reading: battery::BatteryReading,
     kind: ControllerKind,
+    input_active: bool,
 ) {
     let key = Serial::normalize(serial);
+    let now = Instant::now();
     if let Ok(mut guard) = live_pads.lock() {
+        let last_input_at = if input_active {
+            Some(now)
+        } else {
+            guard.get(&key).and_then(|pad| pad.last_input_at)
+        };
         guard.insert(
             key,
             LivePadStatus {
                 product,
                 reading,
                 kind,
-                updated_at: Instant::now(),
+                updated_at: now,
+                last_input_at,
             },
         );
     }
@@ -2162,7 +2183,10 @@ fn poll_incremental(
     let now = Instant::now();
 
     // Fresh live batteries (single lock; released before any HID I/O).
-    let live_snapshot: HashMap<Serial, (String, battery::BatteryReading, Instant)> = live_pads
+    let live_snapshot: HashMap<
+        Serial,
+        (String, battery::BatteryReading, Instant, Option<Instant>),
+    > = live_pads
         .lock()
         .map(|guard| {
             guard
@@ -2170,7 +2194,12 @@ fn poll_incremental(
                 .map(|(serial, pad)| {
                     (
                         serial.clone(),
-                        (pad.product.clone(), pad.reading.clone(), pad.updated_at),
+                        (
+                            pad.product.clone(),
+                            pad.reading.clone(),
+                            pad.updated_at,
+                            pad.last_input_at,
+                        ),
                     )
                 })
                 .collect()
@@ -2200,7 +2229,7 @@ fn poll_incremental(
         cache.probe_skipped_paths().into_iter().collect();
     let live_fresh = live_snapshot
         .values()
-        .any(|(_, _, at)| now.saturating_duration_since(*at) < POLL_LIVE_BATTERY_STALE);
+        .any(|(_, _, at, _)| now.saturating_duration_since(*at) < POLL_LIVE_BATTERY_STALE);
     if input_hot && live_fresh {
         skip_probe.extend(cache.failed_probe_paths());
     }
@@ -2209,10 +2238,17 @@ fn poll_incremental(
     let mut statuses: Vec<ControllerStatus> = Vec::with_capacity(devices.len());
     for (path, hint) in devices {
         let key = Serial::normalize(&hint);
+        // An actively used pad (input within ~3s) is never probed: its battery
+        // comes from the live input stream. Applies even when the cached
+        // handle was dropped.
+        let actively_used = live_snapshot
+            .get(&key)
+            .is_some_and(|(_, _, _, input_at)| pad_input_active_at(*input_at, now));
         // Known pad on a live handle: fresh samples cost zero HID reads.
         if is_storable_serial(&hint) && cache.devices.contains_key(&key) {
-            if let Some((product, reading, at)) = live_snapshot.get(&key)
-                && now.saturating_duration_since(*at) < POLL_LIVE_BATTERY_STALE
+            if let Some((product, reading, at, input_at)) = live_snapshot.get(&key)
+                && (pad_input_active_at(*input_at, now)
+                    || now.saturating_duration_since(*at) < POLL_LIVE_BATTERY_STALE)
                 && let Some(driver) = cache
                     .devices
                     .get(&key)
@@ -2250,6 +2286,7 @@ fn poll_incremental(
                         product.clone(),
                         reading.clone(),
                         kind,
+                        false,
                     );
                     if let Some(driver) = driver::find_for_kind(kind) {
                         statuses.push(poll::status_from_reading(driver, &product, &reading, key));
@@ -2266,10 +2303,11 @@ fn poll_incremental(
         }
         // Full probe: new serial, unknown hint, or re-probe after a drop.
         // Re-resolve the device by path (list may have shifted since enumerate).
-        if skip_probe.contains(&path) {
+        if skip_probe.contains(&path) || actively_used {
             if log_probe_skip {
+                let reason = if actively_used { "active" } else { "backoff" };
                 crate::controller::hid::diag::diag_info(format!(
-                    "hid-diag: probe skip path={path} fails={} input_hot={}",
+                    "hid-diag: probe skip path={path} reason={reason} fails={} input_hot={}",
                     cache.probe_fails(&path),
                     input_hot as u8
                 ));
@@ -2364,7 +2402,14 @@ fn poll_incremental(
         if let Some(serial) = cache.launch_paths.take_serial_for_path(&path, &serial) {
             launch_quiet.push(serial);
         }
-        remember_live_pad(live_pads, &serial, product.clone(), reading.clone(), kind);
+        remember_live_pad(
+            live_pads,
+            &serial,
+            product.clone(),
+            reading.clone(),
+            kind,
+            false,
+        );
         let Some(driver) = driver::find_for_kind(kind) else {
             continue;
         };
@@ -2656,6 +2701,25 @@ fn log_cmd(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_pad_window_is_bounded() {
+        let now = Instant::now();
+        assert!(!pad_input_active_at(None, now));
+        assert!(pad_input_active_at(Some(now), now));
+        assert!(pad_input_active_at(
+            Some(now),
+            now + Duration::from_millis(2999)
+        ));
+        assert!(!pad_input_active_at(
+            Some(now),
+            now + Duration::from_secs(3)
+        ));
+        assert!(!pad_input_active_at(
+            Some(now),
+            now + Duration::from_secs(30)
+        ));
+    }
 
     #[test]
     fn probe_backoff_window_doubles_to_cap() {
