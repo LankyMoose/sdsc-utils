@@ -1,8 +1,8 @@
-//! SVG face-button rings for Start hint glyphs (Idle / Pressed / Hold-progress).
+//! SVG face-button rings for shared UI hint glyphs (Idle / Pressed / Hold-progress).
 //!
 //! One `canvas` widget per hint glyph meant one tiny-skia layer rebuilt on
-//! every frame while Start is visible (footer hints, dock hints, hero cue
-//! boxes — a dozen-plus instances at 60fps). These rings are plain stroked
+//! every frame while a surface was visible (footer, settings, and hero cues —
+//! a dozen-plus instances at 60fps). These rings are plain stroked
 //! circles, so they render identically as SVG: iced hashes `Handle`
 //! content for its cache id, parses + rasterizes each distinct handle once,
 //! then reuses the atlas entry on every later frame, and `.opacity()` rides
@@ -351,7 +351,7 @@ mod tests {
         /// off-center on every hint — whole pixels keep them concentric.
         #[test]
         fn pictogram_stays_concentric_with_ring() {
-            let glyph = crate::ui::start::hint_ring::pictogram_size(SIZE, 1.1, 18.0);
+            let glyph = crate::ui::face::ring::pictogram_size(SIZE, 1.1, 18.0);
             // Whole pixels, exact centered offset: the regression pin itself.
             assert_eq!(glyph.fract(), 0.0, "glyph={glyph}");
             assert_eq!(((SIZE - glyph) / 2.0).fract(), 0.0);

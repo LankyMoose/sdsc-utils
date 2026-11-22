@@ -8,6 +8,7 @@
 
 use crate::browser::engine::{EngineCommand, EngineHandle};
 use crate::domain::pad::NavStepper;
+use crate::platform::ui_sound::UiSoundKind;
 use crate::ui::browser::BrowserPanel;
 use std::path::PathBuf;
 
@@ -424,6 +425,7 @@ impl super::App {
         if engine_mode {
             self.tick_browser_cursor(readings, now);
             if let Some(jump) = self.poll_browser_dpad_jump(readings, now) {
+                self.play_ui_cue(UiSoundKind::Nav);
                 self.browser.panel.jump_cursor(jump);
             }
             // R3 issue flag (R3 carries no NavAction).
@@ -440,18 +442,22 @@ impl super::App {
             };
             let action = match tick.action {
                 Some(NavAction::Up) => {
+                    self.play_ui_cue(UiSoundKind::Nav);
                     self.browser.panel.jump_cursor(JumpDir::Up);
                     Task::none()
                 }
                 Some(NavAction::Down) => {
+                    self.play_ui_cue(UiSoundKind::Nav);
                     self.browser.panel.jump_cursor(JumpDir::Down);
                     Task::none()
                 }
                 Some(NavAction::Left) => {
+                    self.play_ui_cue(UiSoundKind::Nav);
                     self.browser.panel.jump_cursor(JumpDir::Left);
                     Task::none()
                 }
                 Some(NavAction::Right) => {
+                    self.play_ui_cue(UiSoundKind::Nav);
                     self.browser.panel.jump_cursor(JumpDir::Right);
                     Task::none()
                 }
@@ -483,6 +489,7 @@ impl super::App {
                     self.on_browser_message(crate::ui::browser::BrowserMessage::ToggleUrlEntry)
                 }
                 Some(NavAction::ToggleMagnetism) => {
+                    self.play_ui_cue(UiSoundKind::Action);
                     let cursor = &mut self.browser.panel.cursor;
                     cursor.magnet = !cursor.magnet;
                     if !cursor.magnet {
@@ -503,9 +510,11 @@ impl super::App {
             // Reader fallback: D-pad scrolls text, Cross navigates.
             match tick.action {
                 Some(NavAction::Up) | Some(NavAction::Left) => {
+                    self.play_ui_cue(UiSoundKind::Nav);
                     self.scroll_browser(-crate::ui::browser::view::BROWSER_SCROLL_STEP)
                 }
                 Some(NavAction::Down) | Some(NavAction::Right) => {
+                    self.play_ui_cue(UiSoundKind::Nav);
                     self.scroll_browser(crate::ui::browser::view::BROWSER_SCROLL_STEP)
                 }
                 Some(NavAction::Confirm) => {

@@ -347,17 +347,13 @@ impl App {
             ConfigureMessage::SetStartScreenInactiveDimPercent(percent) => {
                 self.apply_start_screen_inactive_dim_percent(percent)
             }
-            ConfigureMessage::SetStartScreenSounds(enabled) => {
-                self.apply_start_screen_sounds(enabled)
-            }
+            ConfigureMessage::SetStartScreenSounds(enabled) => self.apply_ui_sounds(enabled),
             ConfigureMessage::SetStartScreenSoundVolume(volume) => {
-                self.apply_start_screen_sound_volume(volume)
+                self.apply_ui_sound_volume(volume)
             }
-            ConfigureMessage::SetStartScreenHaptics(enabled) => {
-                self.apply_start_screen_haptics(enabled)
-            }
+            ConfigureMessage::SetStartScreenHaptics(enabled) => self.apply_ui_haptics(enabled),
             ConfigureMessage::SetStartScreenHapticsStrength(strength) => {
-                self.apply_start_screen_haptics_strength(strength)
+                self.apply_ui_haptics_strength(strength)
             }
             ConfigureMessage::OpenDataFolder => {
                 if let Err(err) = paths::open_data_folder() {
@@ -795,7 +791,7 @@ impl App {
                 "ui-diag: start ambient chrome hidden={}",
                 self.start_state.ambient_tune_hide_chrome as u8
             ));
-            self.play_start_cue(UiSoundKind::Nav);
+            self.play_ui_cue(UiSoundKind::Nav);
             return Some(Task::none());
         }
         if !held {
@@ -842,14 +838,14 @@ impl App {
             match action {
                 NavAction::Up => {
                     if self.start_state.move_ambient_tune_focus(-1) {
-                        self.play_start_cue(UiSoundKind::Nav);
+                        self.play_ui_cue(UiSoundKind::Nav);
                         return self.scroll_ambient_tune_into_view();
                     }
                     Task::none()
                 }
                 NavAction::Down => {
                     if self.start_state.move_ambient_tune_focus(1) {
-                        self.play_start_cue(UiSoundKind::Nav);
+                        self.play_ui_cue(UiSoundKind::Nav);
                         return self.scroll_ambient_tune_into_view();
                     }
                     Task::none()
@@ -865,12 +861,12 @@ impl App {
                         .min(TuneRow::count().saturating_sub(1));
                     match TuneRow::ALL[focus] {
                         TuneRow::Reset => {
-                            self.play_start_cue(UiSoundKind::Action);
+                            self.play_ui_cue(UiSoundKind::Action);
                             self.reset_debug_tuning();
                             Task::none()
                         }
                         TuneRow::Done => {
-                            self.play_start_cue(UiSoundKind::Action);
+                            self.play_ui_cue(UiSoundKind::Action);
                             self.close_ambient_tuning(true)
                         }
                         TuneRow::Param(_) => Task::none(),

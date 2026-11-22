@@ -8,6 +8,7 @@
 
 mod browser;
 mod configure;
+mod feedback;
 mod hub;
 mod popup;
 mod start;
@@ -2194,7 +2195,7 @@ impl App {
             self.start_state.cross_progress = self.start_state.cross_progress.max(progress);
             if completed {
                 self.haptic_pad_serial = None;
-                self.play_start_cue(UiSoundKind::Hold);
+                self.play_ui_cue(UiSoundKind::Hold);
                 return task.chain(self.complete_replace_confirm());
             }
         }

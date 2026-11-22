@@ -1,12 +1,11 @@
-//! Start-screen footer + controllers-surface assembly.
+//! Start-screen footer + hint assembly.
 //!
-//! Split from [`crate::ui::start::view`]: footer hints, the shared
-//! controllers-surface footer, and immersive hint clusters live here.
-//! Face glyph primitives come from [`crate::ui::start::face`], modal bodies
+//! Split from [`crate::ui::start::view`]: footer hints and immersive hint
+//! clusters live here. Face glyph primitives come from [`crate::ui::face`], modal bodies
 //! from [`crate::ui::start::settings`], press ownership and state from `view`.
 
 use crate::persist::prefs::GamesSortMode;
-use crate::ui::start::face::{
+use crate::ui::face::{
     ActionHint, FaceButton, FacePressAnim, RingStyle, action_cluster, face_glyph, face_glyph_stack,
     face_hint, face_hold_hint, hint_text_capsule,
 };

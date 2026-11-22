@@ -8,6 +8,8 @@
 
 use std::collections::HashSet;
 
+use crate::platform::ui_sound::UiSoundKind;
+
 /// Stable app identity. Never index rows by order; these ids survive UI
 /// reflows and persist into future catalog entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -325,6 +327,9 @@ impl App {
         use hub_view::HubMessage;
         match message {
             HubMessage::MoveX(delta) => {
+                if delta != 0 {
+                    self.play_ui_cue(UiSoundKind::Nav);
+                }
                 if self.hub_state.apps_info.is_some() {
                     // Info owns the screen; movement scrolls the changelog.
                     return iced::widget::operation::scroll_by(
@@ -338,8 +343,6 @@ impl App {
                     self.hub_state.settings_move(delta);
                 } else if self.hub_state.apps_menu.is_some() {
                     self.hub_state.apps_menu_move(delta);
-                } else if self.hub_state.apps_open {
-                    self.hub_state.apps_move(delta);
                 } else {
                     self.hub_state.move_across(delta);
                     return self.scroll_to_hub_controller();
@@ -347,6 +350,9 @@ impl App {
                 Task::none()
             }
             HubMessage::MoveY(delta) => {
+                if delta != 0 {
+                    self.play_ui_cue(UiSoundKind::Nav);
+                }
                 if self.hub_state.apps_info.is_some() {
                     return iced::widget::operation::scroll_by(
                         hub_view::info_scroll_id(),
@@ -359,23 +365,14 @@ impl App {
                     self.hub_state.settings_move(delta);
                 } else if self.hub_state.apps_menu.is_some() {
                     self.hub_state.apps_menu_move(delta);
-                } else if self.hub_state.apps_open {
-                    self.hub_state.apps_move(delta);
                 } else {
                     self.hub_state.move_row(delta);
                     return self.scroll_to_hub_controller();
                 }
                 Task::none()
             }
-            HubMessage::AppsOpen => {
-                self.hub_state.open_apps();
-                Task::none()
-            }
-            HubMessage::AppsClose => {
-                self.hub_state.close_apps();
-                Task::none()
-            }
             HubMessage::SettingsToggle => {
+                self.play_ui_cue(UiSoundKind::Action);
                 if self.hub_state.settings_open {
                     self.hub_state.close_settings();
                 } else {
@@ -385,6 +382,7 @@ impl App {
                 Task::none()
             }
             HubMessage::SettingsOpen => {
+                self.play_ui_cue(UiSoundKind::Action);
                 self.hub_state.open_settings();
                 self.sync_hub_settings();
                 Task::none()
@@ -406,6 +404,7 @@ impl App {
                 self.hub_settings_confirm()
             }
             HubMessage::Activate(index) => {
+                self.play_ui_cue(UiSoundKind::Action);
                 self.hub_state.select(index);
                 self.hub_activate()
             }
@@ -416,6 +415,7 @@ impl App {
             HubMessage::IdentifySelected => self.hub_identify_selected(),
             HubMessage::PowerOff => self.hub_power_off_selected(),
             HubMessage::AppsMenuOpen(index) => {
+                self.play_ui_cue(UiSoundKind::Action);
                 self.hub_state.open_apps_menu(index);
                 Task::none()
             }
@@ -441,10 +441,6 @@ impl App {
                     self.hub_settings_confirm()
                 } else if self.hub_state.apps_menu.is_some() {
                     self.apps_menu_confirm()
-                } else if self.hub_state.apps_open {
-                    let index = self.hub_state.apps_focus;
-                    self.hub_state.open_apps_menu(index);
-                    Task::none()
                 } else if self.hub_state.focus == hub_view::HubFocus::Controllers {
                     self.hub_identify_selected()
                 } else {
@@ -463,9 +459,6 @@ impl App {
                     Task::none()
                 } else if self.hub_state.installing && !self.hub_state.cancelling {
                     self.cancel_engine_install()
-                } else if self.hub_state.apps_open {
-                    self.hub_state.close_apps();
-                    Task::none()
                 } else {
                     self.close_hub()
                 }
@@ -484,6 +477,7 @@ impl App {
         let Some(index) = self.hub_state.apps_menu else {
             return Task::none();
         };
+        self.play_ui_cue(UiSoundKind::Action);
         match action {
             hub_view::AppAction::Install | hub_view::AppAction::Update => {
                 self.hub_state.close_apps_menu();
@@ -544,26 +538,26 @@ impl App {
         match self.hub_state.settings_focus {
             0 => {
                 let enabled = !self.session.prefs.start_screen_sounds_enabled;
-                let task = self.apply_start_screen_sounds(enabled);
+                let task = self.apply_ui_sounds(enabled);
                 self.sync_hub_settings();
                 task
             }
             1 => {
                 let volume = Self::next_ten_percent(self.session.prefs.start_screen_sound_volume);
-                let task = self.apply_start_screen_sound_volume(volume);
+                let task = self.apply_ui_sound_volume(volume);
                 self.sync_hub_settings();
                 task
             }
             2 => {
                 let enabled = !self.session.prefs.start_screen_haptics_enabled;
-                let task = self.apply_start_screen_haptics(enabled);
+                let task = self.apply_ui_haptics(enabled);
                 self.sync_hub_settings();
                 task
             }
             3 => {
                 let strength =
                     Self::next_ten_percent(self.session.prefs.start_screen_haptics_strength);
-                let task = self.apply_start_screen_haptics_strength(strength);
+                let task = self.apply_ui_haptics_strength(strength);
                 self.sync_hub_settings();
                 task
             }
@@ -617,16 +611,11 @@ impl App {
                     crate::controller::hid::diag::diag_info(
                         "ui-diag: hub Browser requested but engine not installed",
                     );
-                    self.hub_state.open_apps();
+                    self.hub_state.open_apps_menu(0);
                     return Task::none();
                 }
                 crate::controller::hid::diag::diag_info("ui-diag: hub launch Browser");
                 self.close_hub().chain(self.open_browser_window())
-            }
-            hub_view::HubTile::AddApps => {
-                crate::controller::hid::diag::diag_info("ui-diag: hub apps open");
-                self.hub_state.open_apps();
-                Task::none()
             }
         }
     }
@@ -648,7 +637,7 @@ impl App {
         let serial = row.serial.clone();
         if self.identify(&serial) {
             self.hub_state.begin_identify_flash(&serial);
-            self.play_start_cue(crate::platform::ui_sound::UiSoundKind::Action);
+            self.play_ui_cue(crate::platform::ui_sound::UiSoundKind::Action);
         }
         Task::none()
     }
@@ -662,7 +651,7 @@ impl App {
             return Task::none();
         }
         let serial = row.serial.clone();
-        self.play_start_cue(crate::platform::ui_sound::UiSoundKind::Hold);
+        self.play_ui_cue(crate::platform::ui_sound::UiSoundKind::Hold);
         self.hub_state.powering_off = Some(serial.clone());
         self.power_off(&serial);
         Task::none()
@@ -697,6 +686,12 @@ impl App {
         let Some(reading) = crate::domain::pad::preferred_reading(readings) else {
             return Task::none();
         };
+        // Cues fired by this pad tick rumble the pad that produced them. The
+        // target is restored afterwards so mouse/keyboard actions stay silent
+        // on the haptic side.
+        let previous_haptic = self.haptic_pad_serial.take();
+        self.set_haptic_pad_from_id(Some(&reading.id));
+        let mut task = Task::none();
         if let Some(message) = self.hub_state.pad_tick(&reading.sample, Instant::now()) {
             let face_held = reading.sample.cross
                 || reading.sample.circle
@@ -710,9 +705,10 @@ impl App {
                 self.hub_face_latch_until =
                     Some(Instant::now() + std::time::Duration::from_millis(1000));
             }
-            return self.on_hub_message(message);
+            task = self.on_hub_message(message);
         }
-        Task::none()
+        self.haptic_pad_serial = previous_haptic;
+        task
     }
 
     /// Keyboard while the hub window has focus.

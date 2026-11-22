@@ -6,8 +6,8 @@ use crate::persist::prefs::{
     START_SCREEN_SLEEP_SECS_STEPS, StartAutoOpen, StartSelectionMode, format_timeout_duration,
     min_sleep_secs_for_idle, secs_step_index,
 };
+use crate::ui::face::{FaceButton, action_cluster, face_hint, face_hold_hint};
 use crate::ui::layout as window_layout;
-use crate::ui::start::face::{FaceButton, action_cluster, face_hint, face_hold_hint};
 use crate::ui::start::icon_cache;
 use crate::ui::start::view::{
     HintPress, HintPressOwner, ICON_H, ICON_W, ScrollReveal, StartIcon, StartMessage, State,

@@ -70,8 +70,7 @@ half-measures, no `fetch.rs` text fallback).
 sdsc-utils (tray + HID + manager)
 ├── Hub overlay (small, topmost) — PS toggle, auto-open target
 │   ├── Start Screen Launcher (always)
-│   ├── Browser (or install tile)
-│   └── ＋ Add apps → catalog (Store DLCs + future apps)
+│   └── Browser (or install tile) — Triangle opens actions/Info
 ├── Start app (Normal window — games, scan, art; browser fields removed)
 └── Browser app (Normal fullscreen window — own engine + chrome)
 ```
@@ -104,7 +103,9 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    icon-first (large glyph + title, no subtitles, no header/close chrome):
    Start / Browser / Add apps tiles. Add apps opens a tiles grid (Start /
    Browser); each tile's X affordance opens a per-app popup with
-   Install/Uninstall/Info, and uninstalled entries are dimmed. Start and
+   Install/Uninstall/Info, and uninstalled entries are dimmed. **Later
+   superseded:** the Add apps tile/screen was removed; Triangle on the
+   Browser tile now opens the same actions/Info popup directly. Start and
    Browser are mutually exclusive; opening either dismisses the other. Over
    exclusive-fullscreen games the topmost hub can still be covered
    (documented limitation).

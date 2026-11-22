@@ -7,8 +7,8 @@ use crate::persist::prefs::{
     GamesSortMode, ImmersiveLayout, NavbarVisibility, ReducedMotion, StartAutoOpen,
     StartSelectionMode,
 };
+use crate::ui::face::FacePressAnim;
 use crate::ui::layout as window_layout;
-use crate::ui::start::face::FacePressAnim;
 use crate::ui::start::icon_cache;
 use crate::ui::start::input::FaceHeld;
 use crate::ui::start::overlay;

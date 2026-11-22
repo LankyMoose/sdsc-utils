@@ -8,10 +8,11 @@
 //!
 //! Tiles are stable identities, never row indices. Icon-first tiles carry
 //! a large glyph plus a title (no subtitles); the Browser tile stays visible
-//! when its engine is missing and opens the icon-only install catalog.
+//! when its engine is missing and Triangle opens its actions/Info popup.
 
 use crate::controller::dualsense::lightbar;
 use crate::controller::model::Serial;
+use crate::ui::face::{FaceButton, action_cluster_spaced, hold_hint, plain_hint};
 use crate::ui::popup::ControllerRow;
 use crate::ui::svg_icon;
 use crate::ui::text_fit;
@@ -31,14 +32,13 @@ pub const HUB_HEIGHT: f32 = 280.0;
 /// Main hub section inset (the card itself has no padding).
 const SECTION_PAD_X: f32 = 12.0;
 const SECTION_PAD_Y: f32 = 8.0;
-const TILE_H: f32 = 96.0;
+const TILE_H: f32 = 88.0;
 const TILE_GAP: f32 = 6.0;
-const ICON: f32 = 30.0;
+const ICON: f32 = 42.0;
 const TILE_TITLE: f32 = 14.0;
-const APP_TILE_H: f32 = 128.0;
-const APP_ICON: f32 = 48.0;
-/// Controller strip card metrics (fixed width; horizontal scroll).
-pub const CONTROLLER_CARD_W: f32 = 182.0;
+/// Controller strip card metrics (fixed width; horizontal scroll). The width
+/// leaves room for the selected card's Identify / Power off hint cluster.
+pub const CONTROLLER_CARD_W: f32 = 280.0;
 pub const CONTROLLER_CARD_H: f32 = 84.0;
 const CONTROLLER_GAP: f32 = 6.0;
 const CONTROLLER_RING: f32 = 46.0;
@@ -50,11 +50,10 @@ const CONTROLLER_RING: f32 = 46.0;
 pub enum HubTile {
     Start,
     Browser,
-    AddApps,
 }
 
 /// Visible tiles, left to right.
-pub const TILES: [HubTile; 3] = [HubTile::Start, HubTile::Browser, HubTile::AddApps];
+pub const TILES: [HubTile; 2] = [HubTile::Start, HubTile::Browser];
 
 /// Which row owns the pad highlight on the main hub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -71,10 +70,6 @@ pub enum HubMessage {
     MoveX(i32),
     /// Switch focus between the apps and controllers rows.
     MoveY(i32),
-    /// Open the apps management screen.
-    AppsOpen,
-    /// Back out of the apps screen.
-    AppsClose,
     /// Open/close the hub shell settings screen (Options).
     SettingsToggle,
     /// Open the hub shell settings screen.
@@ -94,7 +89,7 @@ pub enum HubMessage {
     IdentifySelected,
     /// Triangle hold completed on the focused Bluetooth pad.
     PowerOff,
-    /// Open the per-app action menu (tile X / Cross on an app).
+    /// Open the per-app action menu (Triangle on a focused app tile).
     AppsMenuOpen(usize),
     AppsMenuMove(i32),
     AppsMenuConfirm,
@@ -105,8 +100,8 @@ pub enum HubMessage {
     Close,
 }
 
-/// One entry on the apps management screen. Start is a built-in app and has
-/// no install/update state, so it deliberately does not appear here.
+/// One managed app entry. Start is a built-in app and has no install/update
+/// state, so it deliberately does not appear here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HubApp {
     Browser,
@@ -260,10 +255,15 @@ pub struct State {
     pub engine_ready: bool,
     /// D-pad/stick repeat for hub movement.
     nav: crate::domain::pad::NavStepper,
-    /// Face-button rising-edge latches (Cross confirm, Circle close, Options).
+    /// Face-button rising-edge latches (Cross confirm, Circle close, Options,
+    /// Triangle actions on the apps row).
     pub prev_cross: bool,
     pub prev_circle: bool,
     pub prev_options: bool,
+    pub prev_triangle: bool,
+    /// Current face holds for the controller-card hint rings.
+    pub cross_held: bool,
+    pub triangle_held: bool,
     /// Triangle hold tracker (power off on the focused Bluetooth controller).
     triangle_hold: crate::domain::pad::HoldTracker,
     pub triangle_progress: f32,
@@ -275,10 +275,6 @@ pub struct State {
     pub powering_off: Option<Serial>,
     /// Ring flash started with the last successful Identify.
     identify_flash: Option<IdentifyFlash>,
-    /// Apps management screen replaces the tile row while open.
-    pub apps_open: bool,
-    /// App entry under the focus ring.
-    pub apps_focus: usize,
     /// Per-app action popup: app index + focused action.
     pub apps_menu: Option<usize>,
     pub apps_menu_focus: usize,
@@ -333,14 +329,15 @@ impl Default for State {
             prev_cross: false,
             prev_circle: false,
             prev_options: false,
+            prev_triangle: false,
+            cross_held: false,
+            triangle_held: false,
             triangle_hold: crate::domain::pad::HoldTracker::default(),
             triangle_progress: 0.0,
             controllers: Vec::new(),
             controller_focus: 0,
             powering_off: None,
             identify_flash: None,
-            apps_open: false,
-            apps_focus: 0,
             apps_menu: None,
             apps_menu_focus: 0,
             apps_info: None,
@@ -510,7 +507,7 @@ impl State {
     pub fn tile_enabled(&self, tile: HubTile) -> bool {
         match tile {
             HubTile::Start => self.start_enabled,
-            HubTile::Browser | HubTile::AddApps => true,
+            HubTile::Browser => true,
         }
     }
 
@@ -523,39 +520,24 @@ impl State {
         self.prev_cross = false;
         self.prev_circle = false;
         self.prev_options = false;
+        self.prev_triangle = false;
+        self.cross_held = false;
+        self.triangle_held = false;
         self.focus = HubFocus::Apps;
         self.controller_focus = 0;
         self.powering_off = None;
         self.identify_flash = None;
         self.reset_triangle_hold();
-        self.apps_open = false;
         self.apps_menu = None;
         self.apps_info = None;
         self.settings_open = false;
         self.settings_focus = 0;
-        self.install_error = None;
-    }
-
-    pub fn open_apps(&mut self) {
-        self.apps_open = true;
-        self.apps_focus = 0;
-        self.apps_menu = None;
-        self.apps_info = None;
-        self.settings_open = false;
-        self.install_error = None;
-    }
-
-    pub fn close_apps(&mut self) {
-        self.apps_open = false;
-        self.apps_menu = None;
-        self.apps_info = None;
         self.install_error = None;
     }
 
     pub fn open_settings(&mut self) {
         self.settings_open = true;
         self.settings_focus = 0;
-        self.apps_open = false;
         self.apps_menu = None;
         self.apps_info = None;
         self.install_error = None;
@@ -623,29 +605,10 @@ impl State {
         self.show_all_controllers = show_all_controllers;
     }
 
-    pub fn apps_focus_app(&self) -> HubApp {
-        APPS[self.apps_focus.min(APPS.len() - 1)]
-    }
-
-    pub fn apps_move(&mut self, delta: i32) {
-        if delta == 0 {
-            return;
-        }
-        let len = APPS.len() as i32;
-        self.apps_focus = (self.apps_focus as i32 + delta).rem_euclid(len) as usize;
-    }
-
-    pub fn select_app(&mut self, index: usize) {
-        if index < APPS.len() {
-            self.apps_focus = index;
-        }
-    }
-
     pub fn open_apps_menu(&mut self, index: usize) {
         if index >= APPS.len() {
             return;
         }
-        self.apps_focus = index;
         self.apps_menu = Some(index);
         self.apps_menu_focus = 0;
         self.apps_info = None;
@@ -702,7 +665,6 @@ impl State {
         if index >= APPS.len() {
             return;
         }
-        self.apps_focus = index;
         self.apps_info = Some(index);
         self.apps_menu = None;
     }
@@ -839,6 +801,9 @@ impl State {
     ) -> Option<HubMessage> {
         use crate::domain::pad::NavAction;
         let mut message = None;
+        self.cross_held = sample.cross;
+        self.triangle_held = sample.triangle;
+        let triangle_rising = sample.triangle && !self.prev_triangle;
         let nav = self.nav.update(sample, now, true, true);
         if let Some(action) = nav {
             message = match action {
@@ -872,10 +837,20 @@ impl State {
             message = Some(HubMessage::Close);
         } else if sample.options && !self.prev_options {
             message = Some(HubMessage::SettingsToggle);
+        } else if triangle_rising
+            && !self.settings_open
+            && self.apps_info.is_none()
+            && self.apps_menu.is_none()
+            && self.focus == HubFocus::Apps
+            && matches!(self.selected_tile(), HubTile::Browser)
+        {
+            // Apps-row actions live behind Triangle; Cross still activates.
+            message = Some(HubMessage::AppsMenuOpen(0));
         }
         self.prev_cross = sample.cross;
         self.prev_circle = sample.circle;
         self.prev_options = sample.options;
+        self.prev_triangle = sample.triangle;
         message
     }
 }
@@ -892,12 +867,9 @@ pub fn view<'a>(
     if state.settings_open {
         return settings_view(state, stage_w, backdrop_alpha);
     }
-    if state.apps_open {
-        return apps_view(state, stage_w, _stage_h, backdrop_alpha);
-    }
     let card_w = hub_card_width(stage_w);
     let inner_w = (card_w - 2.0 * SECTION_PAD_X).max(1.0);
-    let content = column![
+    let mut content = column![
         container(hub_header(inner_w))
             .padding([8.0, SECTION_PAD_X])
             .width(Length::Fixed(card_w)),
@@ -905,17 +877,44 @@ pub fn view<'a>(
         container(apps_row(state, inner_w))
             .padding([SECTION_PAD_Y, SECTION_PAD_X])
             .width(Length::Fixed(card_w)),
-        section_separator(card_w),
-        container(controllers_row(state, spectrum, inner_w))
-            .padding([SECTION_PAD_Y, SECTION_PAD_X])
-            .width(Length::Fixed(card_w)),
     ]
     .spacing(0);
+    if let Some(error) = &state.install_error {
+        content = content.push(
+            container(
+                text(error.as_str())
+                    .size(theme::type_scale::CAPTION)
+                    .color(theme::WARNING)
+                    .width(Fill)
+                    .wrapping(Wrapping::Word),
+            )
+            .padding([4.0, SECTION_PAD_X + 4.0])
+            .width(Length::Fixed(card_w)),
+        );
+    }
+    content = content.push(section_separator(card_w)).push(
+        container(controllers_row(state, spectrum, inner_w))
+            .padding([6.0, SECTION_PAD_X])
+            .width(Length::Fixed(card_w)),
+    );
     let card = container(content)
         .padding(0)
         .width(Length::Fixed(card_w))
         .style(card_style);
-    frame(card.into(), backdrop_alpha)
+    let base: Element<'a, HubMessage> = frame(card.into(), backdrop_alpha);
+    if let Some(index) = state.apps_info {
+        return stack![base, app_info(state, index)]
+            .width(Fill)
+            .height(Fill)
+            .into();
+    }
+    if let Some(index) = state.apps_menu {
+        return stack![base, apps_menu(state, index)]
+            .width(Fill)
+            .height(Fill)
+            .into();
+    }
+    base
 }
 
 /// Hub card width for a monitor stage (also used for controller scroll math).
@@ -990,7 +989,7 @@ fn hub_header<'a>(width: f32) -> Element<'a, HubMessage> {
         .into()
 }
 
-/// Start / Browser / Add apps tiles.
+/// Start / Browser tiles.
 fn apps_row<'a>(state: &State, inner_w: f32) -> Element<'a, HubMessage> {
     let gaps = (TILES.len().saturating_sub(1)) as f32 * TILE_GAP;
     let tile_w = ((inner_w - gaps) / TILES.len() as f32).max(80.0);
@@ -1007,17 +1006,6 @@ fn controllers_row<'a>(
     spectrum: &crate::domain::color::BatterySpectrum,
     inner_w: f32,
 ) -> Element<'a, HubMessage> {
-    let focused = state.focus == HubFocus::Controllers;
-    let label = row![
-        text("Controllers")
-            .size(theme::type_scale::CAPTION)
-            .color(if focused { theme::INK } else { theme::MUTED }),
-        space().width(Fill),
-        text(format!("{}", state.controllers.len()))
-            .size(theme::type_scale::CAPTION)
-            .color(theme::DIM),
-    ]
-    .width(Length::Fixed(inner_w));
     let strip: Element<'a, HubMessage> = if state.controllers.is_empty() {
         container(
             text("No controllers connected")
@@ -1053,9 +1041,7 @@ fn controllers_row<'a>(
             .style(theme::scrollbar)
             .into()
     };
-    column![label, space().height(4), strip]
-        .width(Length::Fixed(inner_w))
-        .into()
+    strip
 }
 
 fn controller_card<'a>(
@@ -1093,13 +1079,20 @@ fn controller_card<'a>(
     } else {
         format!("{} · {}", row.connection, row.state)
     };
-    let hint = if selected && row.show_power_off() && !powering_off {
-        Some("Hold △ power off")
-    } else if selected && row.show_identify() {
-        Some("Cross identify")
-    } else {
-        None
-    };
+    let mut hints = Vec::new();
+    if selected && !powering_off {
+        if row.show_identify() {
+            hints.push(plain_hint(FaceButton::Cross, "Identify", state.cross_held));
+        }
+        if row.show_power_off() {
+            hints.push(hold_hint(
+                FaceButton::Triangle,
+                "Power off",
+                state.triangle_progress,
+                state.triangle_held,
+            ));
+        }
+    }
     let mut details = column![
         text(text_fit::ellipsize_to_width(
             row.display_name(),
@@ -1134,39 +1127,16 @@ fn controller_card<'a>(
     ]
     .spacing(2)
     .width(Fill);
-    if let Some(hint) = hint {
-        details = details.push(
-            text(hint)
-                .size(10.0)
-                .color(if state.triangle_progress > 0.0 {
-                    theme::ACCENT
-                } else {
-                    theme::DIM
-                }),
-        );
+    if !hints.is_empty() {
+        details = details
+            .push(space().height(2))
+            .push(action_cluster_spaced::<HubMessage>(&hints, 10.0, true));
     }
     let body: Element<'a, HubMessage> = row![ring, details]
         .spacing(8)
         .align_y(Alignment::Center)
         .width(Fill)
         .into();
-    let body: Element<'a, HubMessage> = if selected && state.triangle_progress > 0.0 {
-        stack![
-            body,
-            container(
-                progress_bar(0.0..=1.0, state.triangle_progress)
-                    .girth(2.0)
-                    .style(progress_style)
-            )
-            .width(Fill)
-            .height(Fill)
-            .align_y(Alignment::End)
-            .padding([0, 4]),
-        ]
-        .into()
-    } else {
-        body
-    };
     let mut b = button(
         container(body)
             .width(Fill)
@@ -1176,7 +1146,7 @@ fn controller_card<'a>(
     )
     .width(Length::Fixed(CONTROLLER_CARD_W))
     .height(Length::Fixed(CONTROLLER_CARD_H))
-    .padding(8)
+    .padding(6)
     .style(move |_theme, status| controller_card_style(selected, live, status));
     if row.connected {
         b = b.on_press(HubMessage::IdentifyController(index));
@@ -1323,59 +1293,6 @@ fn settings_view<'a>(state: &State, stage_w: f32, backdrop_alpha: f32) -> Elemen
     frame(card.into(), backdrop_alpha)
 }
 
-fn apps_view(
-    state: &State,
-    stage_w: f32,
-    _stage_h: f32,
-    backdrop_alpha: f32,
-) -> Element<'_, HubMessage> {
-    let card_w = (stage_w - 48.0).clamp(360.0, 480.0);
-    let inner_w = card_w - 24.0;
-    let app_w = ((inner_w - 8.0) / 2.0).max(150.0);
-    let back = icon_button(
-        svg_icon::CHEVRON_LEFT_SVG,
-        22.0,
-        40.0,
-        theme::INK,
-        false,
-        Some(HubMessage::AppsClose),
-    );
-    let mut grid = row![].spacing(8).align_y(Alignment::Center);
-    for (i, app) in APPS.into_iter().enumerate() {
-        grid = grid.push(app_tile(state, app, i, app_w));
-    }
-    let mut content = column![row![back, space().width(Fill)], space().height(8), grid]
-        .spacing(0)
-        .align_x(Alignment::Center);
-    if let Some(error) = &state.install_error {
-        content = content.push(space().height(8)).push(
-            text(error.as_str())
-                .size(theme::type_scale::CAPTION)
-                .color(theme::WARNING)
-                .width(Fill)
-                .wrapping(Wrapping::Word),
-        );
-    }
-    let card = container(content)
-        .padding(12)
-        .width(Length::Fixed(card_w))
-        .style(card_style);
-    let base: Element<'_, HubMessage> = frame(card.into(), backdrop_alpha);
-    if let Some(index) = state.apps_info {
-        return stack![base, app_info(state, index)]
-            .width(Fill)
-            .height(Fill)
-            .into();
-    }
-    if let Some(index) = state.apps_menu {
-        return stack![base, apps_menu(state, index)]
-            .width(Fill)
-            .height(Fill)
-            .into();
-    }
-    base
-}
-
 fn progress_style(_theme: &Theme) -> progress_bar::Style {
     progress_bar::Style {
         background: Background::Color(theme::alpha(theme::INK, 0.10)),
@@ -1468,7 +1385,6 @@ fn tile_button<'a>(
     let dim = match tile {
         HubTile::Start => !state.start_enabled,
         HubTile::Browser => !state.engine_ready,
-        HubTile::AddApps => false,
     };
     let (icon, title) = tile_copy(tile);
     let ink = if dim { theme::DIM } else { theme::INK };
@@ -1498,7 +1414,7 @@ fn tile_button<'a>(
     .align_x(Alignment::Center)
     .into();
     let content = if matches!(tile, HubTile::Browser) && state.busy() {
-        progress_tile_body(state, icon, title, width, 24.0, TILE_TITLE, selected)
+        progress_tile_body(state, icon, title, width, 22.0, TILE_TITLE, selected)
     } else if matches!(tile, HubTile::Browser) && !state.engine_ready {
         stack![
             normal,
@@ -1536,76 +1452,12 @@ fn tile_button<'a>(
     let mut b = button(container(content).center_x(Fill).center_y(Fill))
         .width(Length::Fixed(width))
         .height(Length::Fixed(TILE_H))
-        .padding(6)
+        .padding(4)
         .style(move |_theme, status| tile_style(selected, interactive, dim, status));
     if interactive {
         b = b.on_press(HubMessage::Activate(index));
     }
     b.into()
-}
-
-fn app_tile<'a>(state: &State, app: HubApp, index: usize, width: f32) -> Element<'a, HubMessage> {
-    let selected = state.apps_focus.min(APPS.len() - 1) == index;
-    let dim = state.app_dimmed(app);
-    let ink = if dim { theme::DIM } else { theme::INK };
-    let title_font = if selected {
-        iced::Font {
-            weight: iced::font::Weight::Semibold,
-            ..iced::Font::default()
-        }
-    } else {
-        iced::Font::default()
-    };
-    let normal: Element<'a, HubMessage> = column![
-        svg(svg::Handle::from_memory(app.icon().as_bytes()))
-            .width(Length::Fixed(APP_ICON))
-            .height(Length::Fixed(APP_ICON))
-            .style(move |_theme, _status| svg::Style { color: Some(ink) }),
-        text(text_fit::ellipsize_to_width(
-            app.title(),
-            18.0,
-            width - 28.0
-        ))
-        .size(18.0)
-        .font(title_font)
-        .color(ink),
-    ]
-    .spacing(10)
-    .align_x(Alignment::Center)
-    .into();
-    let body: Element<'a, HubMessage> = if state.busy() {
-        progress_tile_body(state, app.icon(), app.title(), width, 38.0, 17.0, selected)
-    } else if state.engine_ready && (state.engine_update_ready || state.engine_restart_required) {
-        let label = if state.engine_restart_required {
-            "Restart"
-        } else {
-            "Update"
-        };
-        stack![
-            normal,
-            container(
-                text(label)
-                    .size(theme::type_scale::CAPTION)
-                    .color(theme::WARNING),
-            )
-            .width(Fill)
-            .height(Fill)
-            .align_x(Alignment::End)
-            .align_y(Alignment::End),
-        ]
-        .into()
-    } else {
-        normal
-    };
-    // The whole tile opens the per-app actions popup; there is no nested
-    // button or redundant corner affordance.
-    button(container(body).center_x(Fill).center_y(Fill))
-        .width(Length::Fixed(width))
-        .height(Length::Fixed(APP_TILE_H))
-        .padding(10)
-        .on_press(HubMessage::AppsMenuOpen(index))
-        .style(move |_theme, status| app_tile_style(selected, dim, status))
-        .into()
 }
 
 fn apps_menu<'a>(state: &State, index: usize) -> Element<'a, HubMessage> {
@@ -1839,7 +1691,6 @@ fn tile_copy(tile: HubTile) -> (&'static str, &'static str) {
     match tile {
         HubTile::Start => (svg_icon::GAME_SVG, "Start"),
         HubTile::Browser => (svg_icon::GLOBE_SVG, "Browser"),
-        HubTile::AddApps => (svg_icon::PLUS_SVG, "Add apps"),
     }
 }
 
@@ -1920,53 +1771,6 @@ fn menu_row_style(focused: bool, status: button::Status) -> button::Style {
             },
             width: 1.0,
             radius: theme::radius::MD.into(),
-        },
-        ..button::Style::default()
-    }
-}
-
-fn app_tile_style(selected: bool, dim: bool, status: button::Status) -> button::Style {
-    let (fill, border, ink) = if selected {
-        (
-            theme::alpha(theme::INK, 0.10),
-            theme::alpha(theme::INK, 0.34),
-            if dim { theme::DIM } else { theme::INK },
-        )
-    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-        (
-            theme::alpha(theme::INK, 0.08),
-            theme::alpha(theme::INK, 0.22),
-            if dim { theme::DIM } else { theme::INK },
-        )
-    } else if dim {
-        (
-            theme::alpha(theme::INK, 0.02),
-            theme::alpha(theme::LINE, 0.35),
-            theme::DIM,
-        )
-    } else {
-        (
-            theme::alpha(theme::INK, 0.04),
-            theme::GLASS_HAIRLINE,
-            theme::INK,
-        )
-    };
-    button::Style {
-        background: Some(Background::Color(fill)),
-        text_color: ink,
-        border: Border {
-            color: border,
-            width: 1.0,
-            radius: theme::radius::LG.into(),
-        },
-        shadow: if selected {
-            Shadow {
-                color: theme::alpha(theme::INK, 0.10),
-                offset: Vector::new(0.0, 0.0),
-                blur_radius: 18.0,
-            }
-        } else {
-            Shadow::default()
         },
         ..button::Style::default()
     }
@@ -2059,11 +1863,9 @@ mod tests {
         state.move_across(1);
         assert_eq!(state.selected_tile(), HubTile::Browser);
         state.move_across(1);
-        assert_eq!(state.selected_tile(), HubTile::AddApps);
-        state.move_across(1);
         assert_eq!(state.selected_tile(), HubTile::Start);
         state.move_across(-1);
-        assert_eq!(state.selected_tile(), HubTile::AddApps);
+        assert_eq!(state.selected_tile(), HubTile::Browser);
     }
 
     #[test]
@@ -2161,7 +1963,6 @@ mod tests {
         state.on_open(false, true);
         assert!(!state.tile_enabled(HubTile::Start));
         assert!(state.tile_enabled(HubTile::Browser));
-        assert!(state.tile_enabled(HubTile::AddApps));
     }
 
     #[test]
@@ -2313,7 +2114,6 @@ mod tests {
             engine_ready: false,
             ..State::default()
         };
-        state.open_apps();
         state.open_apps_menu(0);
         assert_eq!(state.apps_menu_action(), Some(AppAction::Install));
         state.apps_menu_move(1);
@@ -2325,17 +2125,51 @@ mod tests {
     }
 
     #[test]
-    fn apps_screen_actions_back_out_one_level() {
+    fn triangle_opens_browser_actions_on_the_apps_row() {
+        use crate::domain::pad::PadSample;
         let mut state = State::default();
-        state.open_apps();
-        assert!(state.apps_open);
-        state.open_apps_menu(0);
-        assert!(state.apps_menu.is_some());
-        state.close_apps_menu();
-        assert!(state.apps_menu.is_none());
-        assert!(state.apps_open);
-        state.close_apps();
-        assert!(!state.apps_open);
+        let now = Instant::now();
+        let press = PadSample {
+            triangle: true,
+            ..PadSample::default()
+        };
+        let release = PadSample::default();
+
+        // Start has no managed actions: Triangle is inert there.
+        assert_eq!(state.pad_tick(&press, now), None);
+
+        // Browser opens the same per-app popup the old catalog used.
+        state.pad_tick(&release, now + std::time::Duration::from_millis(16));
+        state.select(1);
+        assert_eq!(
+            state.pad_tick(&press, now + std::time::Duration::from_millis(32)),
+            Some(HubMessage::AppsMenuOpen(0))
+        );
+        assert_eq!(
+            state.pad_tick(&press, now + std::time::Duration::from_millis(48)),
+            None
+        );
+    }
+
+    #[test]
+    fn controller_cards_track_face_holds() {
+        use crate::domain::pad::PadSample;
+        let mut state = State::default();
+        let now = Instant::now();
+        let sample = PadSample {
+            cross: true,
+            triangle: true,
+            ..PadSample::default()
+        };
+        state.pad_tick(&sample, now);
+        assert!(state.cross_held);
+        assert!(state.triangle_held);
+        state.pad_tick(
+            &PadSample::default(),
+            now + std::time::Duration::from_millis(16),
+        );
+        assert!(!state.cross_held);
+        assert!(!state.triangle_held);
     }
 
     #[test]

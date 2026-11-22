@@ -1,0 +1,123 @@
+//! Shared UI feedback: sounds, haptics, and the settings that control them.
+//!
+//! Start, Browser, Configure, and the PS hub all route cues through these
+//! methods so the hub-shell preferences apply globally. On-disk keys keep
+//! their historical `start_screen_*` names for compatibility.
+
+use super::{App, Message};
+use crate::controller::dualsense::rumble::MotorPulse;
+use crate::domain::pad::PadId;
+use crate::persist::prefs::{clamp_start_screen_haptics_strength, clamp_start_screen_sound_volume};
+use crate::platform::ui_sound::UiSoundKind;
+use iced::Task;
+
+impl App {
+    pub(crate) fn play_ui_sound(&self, kind: UiSoundKind) {
+        if !self.session.prefs.start_screen_sounds_enabled {
+            return;
+        }
+        let volume = f32::from(self.session.prefs.start_screen_sound_volume) / 100.0;
+        self.sound.play(kind, volume);
+    }
+
+    /// Sound + optional pad haptic for a UI cue.
+    pub(crate) fn play_ui_cue(&self, kind: UiSoundKind) {
+        self.play_ui_sound(kind);
+        self.play_ui_haptic(kind);
+    }
+
+    pub(crate) fn play_ui_haptic(&self, kind: UiSoundKind) {
+        if !self.session.prefs.start_screen_haptics_enabled
+            || crate::platform::debug_quiet::enabled()
+        {
+            return;
+        }
+        let Some(serial) = self.haptic_pad_serial.as_ref() else {
+            return;
+        };
+        let pulse = match kind {
+            UiSoundKind::Nav => MotorPulse::NAV,
+            UiSoundKind::Action => MotorPulse::ACTION,
+            UiSoundKind::Hold => MotorPulse::HOLD,
+            UiSoundKind::Slide => MotorPulse::SLIDE,
+        };
+        let (right, left, duration) =
+            pulse.scaled(self.session.prefs.start_screen_haptics_strength);
+        if right == 0 && left == 0 {
+            return;
+        }
+        self.hid_worker
+            .rumble(serial.clone(), right, left, duration.as_millis() as u64);
+    }
+
+    /// Preview haptic on every connected DualSense (settings toggle / strength slider).
+    pub(crate) fn preview_haptic_all(&self, pulse: MotorPulse) {
+        if !self.session.prefs.start_screen_haptics_enabled
+            || crate::platform::debug_quiet::enabled()
+        {
+            return;
+        }
+        let (right, left, duration) =
+            pulse.scaled(self.session.prefs.start_screen_haptics_strength);
+        if right == 0 && left == 0 {
+            return;
+        }
+        let ms = duration.as_millis() as u64;
+        for controller in &self.session.controllers {
+            self.hid_worker
+                .rumble(controller.serial.clone(), right, left, ms);
+        }
+    }
+
+    pub(crate) fn set_haptic_pad_from_id(&mut self, pad: Option<&PadId>) {
+        self.haptic_pad_serial = pad.and_then(|id| {
+            id.as_str()
+                .strip_prefix("hid:")
+                .map(crate::controller::model::Serial::normalize)
+        });
+    }
+
+    pub(crate) fn apply_ui_sounds(&mut self, enabled: bool) -> Task<Message> {
+        self.session.prefs.start_screen_sounds_enabled = enabled;
+        self.save_prefs();
+        if enabled {
+            self.play_ui_sound(UiSoundKind::Nav);
+        }
+        Task::none()
+    }
+
+    pub(crate) fn apply_ui_sound_volume(&mut self, volume: u8) -> Task<Message> {
+        let volume = clamp_start_screen_sound_volume(volume);
+        if self.session.prefs.start_screen_sound_volume != volume {
+            self.session.prefs.start_screen_sound_volume = volume;
+            self.save_prefs();
+            if self.session.prefs.start_screen_sounds_enabled {
+                self.play_ui_sound(UiSoundKind::Nav);
+            }
+        }
+        Task::none()
+    }
+
+    pub(crate) fn apply_ui_haptics(&mut self, enabled: bool) -> Task<Message> {
+        self.session.prefs.start_screen_haptics_enabled = enabled;
+        self.save_prefs();
+        if enabled {
+            self.preview_haptic_all(MotorPulse::NAV);
+        } else {
+            self.hid_worker.rumble_stop_all();
+        }
+        Task::none()
+    }
+
+    pub(crate) fn apply_ui_haptics_strength(&mut self, strength: u8) -> Task<Message> {
+        let strength = clamp_start_screen_haptics_strength(strength);
+        if self.session.prefs.start_screen_haptics_strength != strength {
+            self.session.prefs.start_screen_haptics_strength = strength;
+            self.save_prefs();
+            if self.session.prefs.start_screen_haptics_enabled {
+                self.preview_haptic_all(MotorPulse::NAV);
+            }
+        }
+        Task::none()
+    }
+}

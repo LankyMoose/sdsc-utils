@@ -1,4 +1,4 @@
-//! Short embedded UI cues for the start screen.
+//! Short embedded UI cues shared by Start, Browser, Configure, and the PS hub.
 //!
 //! Playback runs on a dedicated worker thread so WASAPI/COM init from `cpal`
 //! never touches the iced / winit UI thread (which causes RPC_E_CHANGED_MODE
@@ -42,7 +42,7 @@ enum Cmd {
 /// Owned UI-sound worker handle.
 ///
 /// Owned by the app root (`App::sound`); callers go through
-/// `App::play_start_sound` / `play_start_cue`, never a process-global.
+/// `App::play_ui_sound` / `play_ui_cue`, never a process-global.
 /// The worker thread spawns lazily on the first `play` (see
 /// [`SoundHub::sender`]); a construction without playback spawns nothing.
 pub struct SoundHub {

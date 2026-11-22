@@ -7,6 +7,7 @@ pub mod color;
 pub mod configure;
 #[cfg(debug_assertions)]
 pub mod debug_bounds;
+pub mod face;
 pub mod hub;
 pub mod icon;
 pub mod layout;

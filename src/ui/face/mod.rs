@@ -1,14 +1,17 @@
-//! Shared face-button hint primitives (footer, rows, dock, hero cues).
+//! Shared face-button hint primitives (footer, rows, cards, hero cues).
 //!
-//! Behavior-preserving split from [`crate::ui::start::view`]: glyph and
-//! cluster constructors live here; chrome assembly lives in
-//! [`crate::ui::start::chrome`], press ownership in `view`.
+//! Glyph and cluster constructors live here; callers assemble them into
+//! Start chrome, settings, and the PS hub. The widgets are message-generic,
+//! so a surface never needs its own copy of the ring/label style.
+//! [`ring`] holds the SVG ring renderer.
 
-use crate::ui::start::input::FaceHeld;
-use crate::ui::start::view::StartMessage;
+mod ring;
+
+use crate::domain::pad::FaceHeld;
 use crate::ui::{svg_icon, theme};
 use iced::widget::{Float, container, row, svg, text};
 use iced::{Alignment, Border, Color, Element, Fill, Length, Padding};
+use ring::{RingKind, ring_svg};
 
 const HOLD_RING_SIZE: f32 = 32.0;
 const FACE_GLYPH_SIZE: f32 = 18.0;
@@ -98,6 +101,40 @@ pub(crate) fn face_hold_hint(
     }
 }
 
+/// Message-agnostic action hint for surfaces that track their own held state
+/// (the PS hub controller cards) instead of Start's [`FaceHeld`] snapshot.
+pub(crate) fn plain_hint(face: FaceButton, label: &'static str, pressed: bool) -> ActionHint {
+    ActionHint {
+        face: Some(face),
+        text_glyph: None,
+        label,
+        hold: None,
+        armed_t: 0.0,
+        pressed,
+        press_t: 0.0,
+        alpha: 1.0,
+    }
+}
+
+/// Message-agnostic hold hint for surfaces with their own progress clock.
+pub(crate) fn hold_hint(
+    face: FaceButton,
+    label: &'static str,
+    progress: f32,
+    pressed: bool,
+) -> ActionHint {
+    ActionHint {
+        face: Some(face),
+        text_glyph: None,
+        label,
+        hold: Some(progress),
+        armed_t: 0.0,
+        pressed,
+        press_t: 0.0,
+        alpha: 1.0,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct FacePressAnim {
     pub(crate) cross: f32,
@@ -119,24 +156,30 @@ impl FacePressAnim {
     }
 }
 
-pub(crate) fn action_cluster(hints: &[ActionHint], flat: bool) -> Element<'static, StartMessage> {
+pub(crate) fn action_cluster<Message: 'static>(
+    hints: &[ActionHint],
+    flat: bool,
+) -> Element<'static, Message> {
     action_cluster_spaced(hints, 28.0, flat)
 }
 
-pub(crate) fn action_cluster_spaced(
+pub(crate) fn action_cluster_spaced<Message: 'static>(
     hints: &[ActionHint],
     spacing: f32,
     flat: bool,
-) -> Element<'static, StartMessage> {
+) -> Element<'static, Message> {
     let mut row = row![].spacing(spacing).align_y(Alignment::Center);
     for hint in hints {
-        row = row.push(action_hint(hint, flat));
+        row = row.push(render_action_hint(hint, flat));
     }
     row.into()
 }
 
-fn action_hint(hint: &ActionHint, flat: bool) -> Element<'static, StartMessage> {
-    let glyph: Element<'static, StartMessage> = if let Some(face) = hint.face {
+fn render_action_hint<Message: 'static>(
+    hint: &ActionHint,
+    flat: bool,
+) -> Element<'static, Message> {
+    let glyph: Element<'static, Message> = if let Some(face) = hint.face {
         let style = if let Some(progress) = hint.hold {
             RingStyle::Hold {
                 progress,
@@ -163,12 +206,12 @@ fn action_hint(hint: &ActionHint, flat: bool) -> Element<'static, StartMessage> 
         .into()
 }
 
-pub(crate) fn text_glyph_circle(
+pub(crate) fn text_glyph_circle<Message: 'static>(
     glyph: &'static str,
     pressed: bool,
     press_t: f32,
     flat: bool,
-) -> Element<'static, StartMessage> {
+) -> Element<'static, Message> {
     let half = HOLD_RING_SIZE / 2.0;
     let max_radius = half - 2.5;
     let idle_radius = max_radius / PRESSED_SCALE;
@@ -198,14 +241,14 @@ pub(crate) fn text_glyph_circle(
 /// Pill glyph centered in a [`HOLD_RING_SIZE`] slot so height matches face rings.
 ///
 /// `optical_top` adds extra top padding inside the pill (monospace caps often sit high).
-pub(crate) fn hint_text_capsule(
+pub(crate) fn hint_text_capsule<Message: 'static>(
     label: text::Text<'static>,
     pad_x: f32,
     optical_top: f32,
     pressed: bool,
     press_t: f32,
     flat: bool,
-) -> Element<'static, StartMessage> {
+) -> Element<'static, Message> {
     hint_element_capsule(label, pad_x, optical_top, pressed, press_t, flat)
 }
 
@@ -213,14 +256,14 @@ pub(crate) fn hint_text_capsule(
 ///
 /// Important: use [`Alignment::Center`], never `center_y(Fill)` — Fill expands the
 /// capsule to the parent height (settings footer became a tall vertical pill).
-fn hint_element_capsule(
-    content: impl Into<Element<'static, StartMessage>>,
+fn hint_element_capsule<Message: 'static>(
+    content: impl Into<Element<'static, Message>>,
     pad_x: f32,
     optical_top: f32,
     pressed: bool,
     press_t: f32,
     flat: bool,
-) -> Element<'static, StartMessage> {
+) -> Element<'static, Message> {
     let border_color = if pressed {
         theme::ACCENT
     } else {
@@ -267,7 +310,11 @@ fn hint_ring_idle_diameter() -> f32 {
     (max_radius / PRESSED_SCALE) * 2.0
 }
 
-fn face_svg(face: FaceButton, size: f32, alpha: f32) -> Element<'static, StartMessage> {
+fn face_svg<Message: 'static>(
+    face: FaceButton,
+    size: f32,
+    alpha: f32,
+) -> Element<'static, Message> {
     svg(svg::Handle::from_memory(face.svg().as_bytes()))
         .width(Length::Fixed(size))
         .height(Length::Fixed(size))
@@ -282,12 +329,12 @@ pub(crate) enum RingStyle {
     Hold { progress: f32, armed_t: f32 },
 }
 
-pub(crate) fn face_glyph(
+pub(crate) fn face_glyph<Message: 'static>(
     face: FaceButton,
     style: RingStyle,
     press_t: f32,
     flat: bool,
-) -> Element<'static, StartMessage> {
+) -> Element<'static, Message> {
     let stack = face_glyph_stack(face, style, 1.0);
     if flat {
         return stack;
@@ -299,16 +346,15 @@ pub(crate) fn face_glyph(
     Float::new(stack).scale(scale).into()
 }
 
-pub(crate) fn face_glyph_stack(
+pub(crate) fn face_glyph_stack<Message: 'static>(
     face: FaceButton,
     style: RingStyle,
     alpha: f32,
-) -> Element<'static, StartMessage> {
+) -> Element<'static, Message> {
     // Leave room for ~2.5px stroke: idle radius is inset so full press stays
     // in-slot. Pictogram box comes snapped to whole pixels (see helper).
     let idle_radius = (HOLD_RING_SIZE / 2.0 - 2.5) / PRESSED_SCALE;
-    let glyph_size =
-        crate::ui::start::hint_ring::pictogram_size(HOLD_RING_SIZE, PRESSED_SCALE, FACE_GLYPH_SIZE);
+    let glyph_size = ring::pictogram_size(HOLD_RING_SIZE, PRESSED_SCALE, FACE_GLYPH_SIZE);
     iced::widget::stack![
         ring_element(style, idle_radius, alpha),
         container(face_svg(face, glyph_size, alpha))
@@ -325,8 +371,11 @@ pub(crate) fn face_glyph_stack(
 /// Face-button ring as SVG instead of `canvas` (see `hint_ring`): identical
 /// stroked circle + hold arc, but static states rasterize once and every
 /// later frame is an atlas hit instead of a rebuilt tiny-skia layer.
-fn ring_element(style: RingStyle, radius: f32, alpha: f32) -> Element<'static, StartMessage> {
-    use crate::ui::start::hint_ring::{RingKind, ring_svg};
+fn ring_element<Message: 'static>(
+    style: RingStyle,
+    radius: f32,
+    alpha: f32,
+) -> Element<'static, Message> {
     let kind = match style {
         RingStyle::Pressed => RingKind::Pressed,
         RingStyle::Idle => RingKind::Idle,

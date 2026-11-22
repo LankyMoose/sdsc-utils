@@ -16,14 +16,12 @@ use crate::AppResult;
 use crate::browser::cursor::{JumpDir, VIEWPORT_H, VIEWPORT_W};
 use crate::browser::engine::{EngineCommand, EngineEvent};
 use crate::browser::keys::RawKey;
-use crate::controller::dualsense::rumble::MotorPulse;
 use crate::games::process_match::RunningSession;
 use crate::games::steam::SteamGame;
 use crate::games::{self, GamesCatalog, launch, process_match, steam};
 use crate::persist::prefs::{
     NavbarVisibility, ReducedMotion, StartAutoOpen, StartSelectionMode,
-    clamp_start_screen_haptics_strength, clamp_start_screen_idle_timeouts,
-    clamp_start_screen_inactive_dim_percent, clamp_start_screen_sound_volume,
+    clamp_start_screen_idle_timeouts, clamp_start_screen_inactive_dim_percent,
     renderer_restart_needed,
 };
 use crate::platform::app_log;
@@ -88,27 +86,27 @@ impl App {
             StartMessage::Close => self.on_start_close(),
             StartMessage::Noop => Task::none(),
             StartMessage::DismissEditConfirm => {
-                self.play_start_cue(UiSoundKind::Action);
+                self.play_ui_cue(UiSoundKind::Action);
                 self.start_state.dismiss_edit_confirm(Instant::now());
                 Task::none()
             }
             StartMessage::ToggleEdit => match self.toggle_start_edit() {
                 Some(task) => {
-                    self.play_start_cue(UiSoundKind::Action);
+                    self.play_ui_cue(UiSoundKind::Action);
                     task
                 }
                 None => Task::none(),
             },
             StartMessage::CycleSort => match self.on_start_cycle_sort() {
                 Some(task) => {
-                    self.play_start_cue(UiSoundKind::Action);
+                    self.play_ui_cue(UiSoundKind::Action);
                     task
                 }
                 None => Task::none(),
             },
             StartMessage::AddShortcut => {
                 if self.start_state.editing && !self.start_state.overlay_blocking() {
-                    self.play_start_cue(UiSoundKind::Action);
+                    self.play_ui_cue(UiSoundKind::Action);
                     self.pick_manual_shortcut()
                 } else {
                     Task::none()
@@ -118,7 +116,7 @@ impl App {
                 let before = self.start_state.manual_add.is_some();
                 let task = self.begin_manual_edit();
                 if !before && self.start_state.manual_add.is_some() {
-                    self.play_start_cue(UiSoundKind::Action);
+                    self.play_ui_cue(UiSoundKind::Action);
                 }
                 task
             }
@@ -143,13 +141,13 @@ impl App {
                 Task::none()
             }
             StartMessage::ManualPickIcon => {
-                self.play_start_cue(UiSoundKind::Action);
+                self.play_ui_cue(UiSoundKind::Action);
                 self.pick_manual_icon()
             }
             StartMessage::ManualClearIcon => {
                 if let Some(draft) = self.start_state.manual_add.as_mut() {
                     draft.icon_path = None;
-                    self.play_start_cue(UiSoundKind::Action);
+                    self.play_ui_cue(UiSoundKind::Action);
                 }
                 Task::none()
             }
@@ -157,7 +155,7 @@ impl App {
                 let now = Instant::now();
                 let open = !self.start_state.settings.open;
                 if self.start_state.request_settings(open, now) {
-                    self.play_start_cue(UiSoundKind::Action);
+                    self.play_ui_cue(UiSoundKind::Action);
                     crate::controller::hid::diag::diag_info(format!(
                         "ui-diag: start settings {}",
                         if open { "open" } else { "close" }
@@ -198,12 +196,10 @@ impl App {
             StartMessage::SetInactiveDimPercent(percent) => {
                 self.apply_start_screen_inactive_dim_percent(percent)
             }
-            StartMessage::SetSounds(enabled) => self.apply_start_screen_sounds(enabled),
-            StartMessage::SetSoundVolume(volume) => self.apply_start_screen_sound_volume(volume),
-            StartMessage::SetHaptics(enabled) => self.apply_start_screen_haptics(enabled),
-            StartMessage::SetHapticsStrength(strength) => {
-                self.apply_start_screen_haptics_strength(strength)
-            }
+            StartMessage::SetSounds(enabled) => self.apply_ui_sounds(enabled),
+            StartMessage::SetSoundVolume(volume) => self.apply_ui_sound_volume(volume),
+            StartMessage::SetHaptics(enabled) => self.apply_ui_haptics(enabled),
+            StartMessage::SetHapticsStrength(strength) => self.apply_ui_haptics_strength(strength),
             StartMessage::SetPerfThrottle(enabled) => self.apply_perf_throttle_immersive(enabled),
             StartMessage::SetShowUninstalledGames(enabled) => {
                 self.apply_show_uninstalled_games(enabled)
@@ -254,13 +250,13 @@ impl App {
         if self.start_state.editing {
             match self.edit_toggle_selected() {
                 Some(task) => {
-                    self.play_start_cue(UiSoundKind::Action);
+                    self.play_ui_cue(UiSoundKind::Action);
                     task
                 }
                 None => Task::none(),
             }
         } else if self.launch_selected() {
-            self.play_start_cue(UiSoundKind::Action);
+            self.play_ui_cue(UiSoundKind::Action);
             // A freshly-armed replace confirm stays open on its modal: the
             // close preserves it now, so this guard only skips the close
             // while the modal owns the screen — the game already launched.
@@ -284,7 +280,7 @@ impl App {
             .begin_strip_anim(prev_game as f32, Instant::now());
         self.start_state.reset_backdrop_fade();
         let task = self.warm_start_art_task();
-        self.play_start_cue(UiSoundKind::Nav);
+        self.play_ui_cue(UiSoundKind::Nav);
         task
     }
 
@@ -294,7 +290,7 @@ impl App {
         let direction = self.start_state.move_selection(delta);
         let mut task = Task::none();
         if direction.is_some() {
-            self.play_start_cue(UiSoundKind::Nav);
+            self.play_ui_cue(UiSoundKind::Nav);
             if self.start_state.game_selected != prev_game {
                 self.start_state
                     .begin_strip_anim(prev_game as f32, Instant::now());
@@ -309,29 +305,29 @@ impl App {
     /// draft → replace confirm → save guard → edit mode → Start itself).
     pub(crate) fn on_start_close(&mut self) -> Task<Message> {
         if self.start_state.settings.open {
-            self.play_start_cue(UiSoundKind::Action);
+            self.play_ui_cue(UiSoundKind::Action);
             let now = Instant::now();
             if self.start_state.request_settings(false, now) {
                 crate::controller::hid::diag::diag_info("ui-diag: start settings close");
             }
             Task::none()
         } else if self.start_state.manual_add.is_some() {
-            self.play_start_cue(UiSoundKind::Action);
+            self.play_ui_cue(UiSoundKind::Action);
             self.cancel_manual_add()
         } else if self.start_state.replace_confirm.is_some() {
             // Cancel unwinds through the exit tween (content clears when it
             // settles); reduced motion clears instantly.
-            self.play_start_cue(UiSoundKind::Action);
+            self.play_ui_cue(UiSoundKind::Action);
             self.start_state.dismiss_replace(Instant::now());
             Task::none()
         } else if self.start_state.edit_confirm.is_some() {
             // Second Cancel backs out of the question: draft kept, stay in
             // edit mode (unwinds through the exit tween like any dismiss).
-            self.play_start_cue(UiSoundKind::Action);
+            self.play_ui_cue(UiSoundKind::Action);
             self.start_state.dismiss_edit_confirm(Instant::now());
             Task::none()
         } else if self.start_state.editing {
-            self.play_start_cue(UiSoundKind::Action);
+            self.play_ui_cue(UiSoundKind::Action);
             if self.edit_draft_dirty() {
                 // Dirty exit asks first; clean exits cancel silently as before.
                 self.start_state.arm_edit_confirm(Instant::now());
@@ -340,7 +336,7 @@ impl App {
                 self.cancel_start_edit()
             }
         } else if self.start_visible {
-            self.play_start_cue(UiSoundKind::Action);
+            self.play_ui_cue(UiSoundKind::Action);
             self.close_start_screen()
         } else {
             Task::none()
@@ -374,7 +370,7 @@ impl App {
 
     pub(crate) fn open_browser_session(&mut self) -> Task<Message> {
         self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Action);
+        self.play_ui_cue(UiSoundKind::Action);
         let _ = self.hub.open(crate::app::hub::AppId::Browser);
         self.browser.panel.session.open_surface();
         // The card's 16:9 page area drives the engine viewport; sync before
@@ -508,7 +504,7 @@ impl App {
         self.browser.panel.focusables.clear();
         let generation = self.browser.panel.session.begin_load(url.clone());
         self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Nav);
+        self.play_ui_cue(UiSoundKind::Nav);
         crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
         let Some(engine) = &self.browser.engine else {
             // The engine is mandatory in phase 4; the hub tile handles the
@@ -602,7 +598,7 @@ impl App {
             self.browser.panel.history_selector = None;
         }
         self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Action);
+        self.play_ui_cue(UiSoundKind::Action);
         crate::controller::hid::diag::diag_info(format!(
             "ui-diag: browser url entry {}",
             if next { "open" } else { "close" }
@@ -670,7 +666,7 @@ impl App {
         self.browser.panel.history_selector =
             Some(crate::ui::browser::HistorySelector { back, highlight: 0 });
         self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Action);
+        self.play_ui_cue(UiSoundKind::Action);
         crate::controller::hid::diag::diag_info(format!(
             "ui-diag: browser history selector open {}",
             if back { "back" } else { "forward" }
@@ -708,7 +704,7 @@ impl App {
         let steps = index.abs_diff(current);
         self.browser.panel.session.begin_history_travel(index);
         self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Nav);
+        self.play_ui_cue(UiSoundKind::Nav);
         if let Some(engine) = &self.browser.engine {
             let tab = self.browser_tab();
             engine.send(if back {
@@ -728,7 +724,7 @@ impl App {
         self.browser.panel.history_selector = None;
         self.browser.nav.cancel_held_face_releases();
         self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Action);
+        self.play_ui_cue(UiSoundKind::Action);
         crate::controller::hid::diag::diag_info("ui-diag: browser history selector cancel");
         Task::none()
     }
@@ -787,6 +783,7 @@ impl App {
                 {
                     sel.highlight -= 1;
                     self.note_start_activity();
+                    self.play_ui_cue(UiSoundKind::Nav);
                 }
                 Task::none()
             }
@@ -805,6 +802,7 @@ impl App {
                     sel.highlight += 1;
                     sel.clamp(len);
                     self.note_start_activity();
+                    self.play_ui_cue(UiSoundKind::Nav);
                 }
                 Task::none()
             }
@@ -855,7 +853,7 @@ impl App {
         panel.bookmark_name_draft = draft;
         panel.bookmark_bubble = true;
         self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Action);
+        self.play_ui_cue(UiSoundKind::Action);
         operation::focus(crate::ui::browser::view::bookmark_name_id())
     }
 
@@ -874,7 +872,7 @@ impl App {
         }
         self.browser.panel.bookmark_bubble = false;
         self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Action);
+        self.play_ui_cue(UiSoundKind::Action);
         Task::none()
     }
 
@@ -888,7 +886,7 @@ impl App {
         panel.rebuild_chrome();
         panel.bookmark_bubble = false;
         self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Action);
+        self.play_ui_cue(UiSoundKind::Action);
         Task::none()
     }
 
@@ -1373,7 +1371,7 @@ impl App {
         }
         self.sync_browser_theme();
         self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Nav);
+        self.play_ui_cue(UiSoundKind::Nav);
         crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
         Task::none()
     }
@@ -1509,7 +1507,7 @@ impl App {
         self.prefetch_stored_tab_favicons();
         self.sync_browser_theme();
         self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Nav);
+        self.play_ui_cue(UiSoundKind::Nav);
         crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
         Task::none()
     }
@@ -1570,7 +1568,7 @@ impl App {
         }
         self.sync_browser_theme();
         self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Nav);
+        self.play_ui_cue(UiSoundKind::Nav);
         crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
         Task::none()
     }
@@ -1655,7 +1653,7 @@ impl App {
             return self.on_browser_navigate();
         }
         self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Action);
+        self.play_ui_cue(UiSoundKind::Action);
         self.foreground_live_tab(tab, needs_open, url);
         Task::none()
     }
@@ -1733,7 +1731,7 @@ impl App {
             return self.on_browser_navigate();
         }
         self.note_start_activity();
-        self.play_start_cue(UiSoundKind::Action);
+        self.play_ui_cue(UiSoundKind::Action);
         self.foreground_live_tab(next, needs_open, url);
         if let Some(engine) = &self.browser.engine {
             engine.send(EngineCommand::CloseTab { tab });
@@ -2249,11 +2247,11 @@ impl App {
             if self.start_state.edit_confirm_closing() {
                 return Task::none();
             }
-            self.play_start_cue(UiSoundKind::Action);
+            self.play_ui_cue(UiSoundKind::Action);
             return self.complete_edit_discard();
         }
         if self.start_state.manual_add.is_some() {
-            self.play_start_cue(UiSoundKind::Action);
+            self.play_ui_cue(UiSoundKind::Action);
             return self.confirm_manual_add();
         }
         // Replace confirm requires hold-Cross / hold-Enter (see pad poll / key hold).
@@ -2263,14 +2261,14 @@ impl App {
         if self.start_state.editing {
             return match self.edit_toggle_selected() {
                 Some(task) => {
-                    self.play_start_cue(UiSoundKind::Action);
+                    self.play_ui_cue(UiSoundKind::Action);
                     task
                 }
                 None => Task::none(),
             };
         }
         if self.launch_selected() {
-            self.play_start_cue(UiSoundKind::Action);
+            self.play_ui_cue(UiSoundKind::Action);
             // Same as `on_start_launch`: keep a fresh replace-confirm modal
             // alive instead of closing (and wiping) it on the arming update.
             if self.start_state.replace_confirm.is_some() {
@@ -2664,20 +2662,6 @@ impl App {
 }
 
 impl App {
-    pub(crate) fn play_start_sound(&self, kind: UiSoundKind) {
-        if !self.session.prefs.start_screen_sounds_enabled {
-            return;
-        }
-        let volume = f32::from(self.session.prefs.start_screen_sound_volume) / 100.0;
-        self.sound.play(kind, volume);
-    }
-
-    /// Sound + optional pad haptic for a start-screen cue.
-    pub(crate) fn play_start_cue(&self, kind: UiSoundKind) {
-        self.play_start_sound(kind);
-        self.play_start_haptic(kind);
-    }
-
     /// Row-aware settings nav cue: splits sound/haptic so the pre-flip nav
     /// cue never double-plays the modality the apply side previews after
     /// saving (volume rows → sound preview, strength rows → haptic preview).
@@ -2688,61 +2672,10 @@ impl App {
         kind: UiSoundKind,
     ) {
         match crate::ui::start::settings::settings_nav_cue(row) {
-            crate::ui::start::settings::SettingsCue::Full => self.play_start_cue(kind),
-            crate::ui::start::settings::SettingsCue::HapticOnly => self.play_start_haptic(kind),
-            crate::ui::start::settings::SettingsCue::SoundOnly => self.play_start_sound(kind),
+            crate::ui::start::settings::SettingsCue::Full => self.play_ui_cue(kind),
+            crate::ui::start::settings::SettingsCue::HapticOnly => self.play_ui_haptic(kind),
+            crate::ui::start::settings::SettingsCue::SoundOnly => self.play_ui_sound(kind),
         }
-    }
-
-    pub(crate) fn play_start_haptic(&self, kind: UiSoundKind) {
-        if !self.session.prefs.start_screen_haptics_enabled
-            || crate::platform::debug_quiet::enabled()
-        {
-            return;
-        }
-        let Some(serial) = self.haptic_pad_serial.as_ref() else {
-            return;
-        };
-        let pulse = match kind {
-            UiSoundKind::Nav => MotorPulse::NAV,
-            UiSoundKind::Action => MotorPulse::ACTION,
-            UiSoundKind::Hold => MotorPulse::HOLD,
-            UiSoundKind::Slide => MotorPulse::SLIDE,
-        };
-        let (right, left, duration) =
-            pulse.scaled(self.session.prefs.start_screen_haptics_strength);
-        if right == 0 && left == 0 {
-            return;
-        }
-        self.hid_worker
-            .rumble(serial.clone(), right, left, duration.as_millis() as u64);
-    }
-
-    /// Preview haptic on every connected DualSense (settings toggle / strength slider).
-    pub(crate) fn preview_haptic_all(&self, pulse: MotorPulse) {
-        if !self.session.prefs.start_screen_haptics_enabled
-            || crate::platform::debug_quiet::enabled()
-        {
-            return;
-        }
-        let (right, left, duration) =
-            pulse.scaled(self.session.prefs.start_screen_haptics_strength);
-        if right == 0 && left == 0 {
-            return;
-        }
-        let ms = duration.as_millis() as u64;
-        for controller in &self.session.controllers {
-            self.hid_worker
-                .rumble(controller.serial.clone(), right, left, ms);
-        }
-    }
-
-    pub(crate) fn set_haptic_pad_from_id(&mut self, pad: Option<&start_input::PadId>) {
-        self.haptic_pad_serial = pad.and_then(|id| {
-            id.as_str()
-                .strip_prefix("hid:")
-                .map(crate::controller::model::Serial::normalize)
-        });
     }
 
     pub(crate) fn cancel_start_holds(&mut self) {
@@ -3142,7 +3075,7 @@ impl App {
                 if k_completed && tick.cross_completed_pad.is_none() {
                     self.haptic_pad_serial = None;
                 }
-                self.play_start_cue(UiSoundKind::Hold);
+                self.play_ui_cue(UiSoundKind::Hold);
                 self.complete_replace_confirm()
             } else if tick.action == Some(NavAction::Cancel) {
                 self.keyboard_cross_hold.cancel();
@@ -3174,7 +3107,7 @@ impl App {
             if hold_cross_close {
                 self.start_state.cross_progress = tick.cross_progress;
                 if tick.cross_completed {
-                    self.play_start_cue(UiSoundKind::Hold);
+                    self.play_ui_cue(UiSoundKind::Hold);
                     close_task = self.close_running_game_if_selected();
                 }
             } else {
@@ -3557,50 +3490,6 @@ impl App {
         Task::none()
     }
 
-    pub(crate) fn apply_start_screen_sounds(&mut self, enabled: bool) -> Task<Message> {
-        self.session.prefs.start_screen_sounds_enabled = enabled;
-        self.save_prefs();
-        if enabled {
-            self.play_start_sound(UiSoundKind::Nav);
-        }
-        Task::none()
-    }
-
-    pub(crate) fn apply_start_screen_sound_volume(&mut self, volume: u8) -> Task<Message> {
-        let volume = clamp_start_screen_sound_volume(volume);
-        if self.session.prefs.start_screen_sound_volume != volume {
-            self.session.prefs.start_screen_sound_volume = volume;
-            self.save_prefs();
-            if self.session.prefs.start_screen_sounds_enabled {
-                self.play_start_sound(UiSoundKind::Nav);
-            }
-        }
-        Task::none()
-    }
-
-    pub(crate) fn apply_start_screen_haptics(&mut self, enabled: bool) -> Task<Message> {
-        self.session.prefs.start_screen_haptics_enabled = enabled;
-        self.save_prefs();
-        if enabled {
-            self.preview_haptic_all(MotorPulse::NAV);
-        } else {
-            self.hid_worker.rumble_stop_all();
-        }
-        Task::none()
-    }
-
-    pub(crate) fn apply_start_screen_haptics_strength(&mut self, strength: u8) -> Task<Message> {
-        let strength = clamp_start_screen_haptics_strength(strength);
-        if self.session.prefs.start_screen_haptics_strength != strength {
-            self.session.prefs.start_screen_haptics_strength = strength;
-            self.save_prefs();
-            if self.session.prefs.start_screen_haptics_enabled {
-                self.preview_haptic_all(MotorPulse::NAV);
-            }
-        }
-        Task::none()
-    }
-
     /// Generic dropdown toggle for selector rows: collapsing the open row
     /// just closes it; opening inits the highlight to the current value,
     /// closes any other menu (single menu), and scrolls it into view.
@@ -3610,7 +3499,7 @@ impl App {
     ) -> Task<Message> {
         let snapshot = self.start_settings_snapshot();
         let opened = self.start_state.settings.toggle_menu(row, &snapshot);
-        self.play_start_cue(UiSoundKind::Nav);
+        self.play_ui_cue(UiSoundKind::Nav);
         if opened {
             self.scroll_settings_focus_into_view(start_view::ScrollReveal::Either)
         } else {
@@ -3701,7 +3590,7 @@ impl App {
             NavAction::Up => {
                 let before = self.start_state.settings.focus;
                 if self.start_state.settings.move_focus(-1, &snapshot) {
-                    self.play_start_cue(UiSoundKind::Nav);
+                    self.play_ui_cue(UiSoundKind::Nav);
                     let after = self.start_state.settings.focus;
                     crate::controller::hid::diag::diag_info(format!(
                         "ui-diag: start settings focus={after}"
@@ -3714,7 +3603,7 @@ impl App {
             NavAction::Down => {
                 let before = self.start_state.settings.focus;
                 if self.start_state.settings.move_focus(1, &snapshot) {
-                    self.play_start_cue(UiSoundKind::Nav);
+                    self.play_ui_cue(UiSoundKind::Nav);
                     let after = self.start_state.settings.focus;
                     crate::controller::hid::diag::diag_info(format!(
                         "ui-diag: start settings focus={after}"
@@ -3765,23 +3654,23 @@ impl App {
             NavAction::Up => {
                 let next = (highlight as isize - 1).rem_euclid(count) as usize;
                 self.start_state.settings.set_menu_highlight(next);
-                self.play_start_cue(UiSoundKind::Nav);
+                self.play_ui_cue(UiSoundKind::Nav);
                 self.scroll_settings_focus_into_view(start_view::ScrollReveal::Either)
             }
             NavAction::Down => {
                 let next = (highlight as isize + 1).rem_euclid(count) as usize;
                 self.start_state.settings.set_menu_highlight(next);
-                self.play_start_cue(UiSoundKind::Nav);
+                self.play_ui_cue(UiSoundKind::Nav);
                 self.scroll_settings_focus_into_view(start_view::ScrollReveal::Either)
             }
             NavAction::Confirm => {
                 let select = row.selector_select(highlight);
-                self.play_start_cue(UiSoundKind::Action);
+                self.play_ui_cue(UiSoundKind::Action);
                 self.on_start_message(select)
             }
             NavAction::Cancel | NavAction::ToggleSettings => {
                 self.start_state.settings.close_menus();
-                self.play_start_cue(UiSoundKind::Nav);
+                self.play_ui_cue(UiSoundKind::Nav);
                 Task::none()
             }
             _ => Task::none(),

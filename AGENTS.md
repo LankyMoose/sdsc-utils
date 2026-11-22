@@ -114,6 +114,8 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Error type** → `src/app_error.rs` (`AppError` + `AppResult`)
 - **Lightbar spectrum editor (Settings)** → `src/ui/configure/spectrum.rs`, `src/ui/configure/mod.rs`
 - **Theme / shared widget styles** → `src/ui/theme.rs`; restyle plan → `notes/ui-refresh.md`
+- **Shared face-button hints / rings** → `src/ui/face/` (`mod.rs` widgets, `ring.rs` SVG rings); used by Start, Start Settings, and hub controller cards
+- **Shared UI sounds / haptics** → `src/app/feedback.rs` (global cue + pref application), `src/platform/ui_sound.rs` (audio worker); hub Settings owns the controls
 - **Start screen / game launcher** → `src/ui/start/` (UI), `src/games/` (Steam scan, launch); behavior → `notes/start-immersive.md`
 - **Browser (CEF)** → `src/browser/` (engine seam, `cef_backend.rs`, DOM/cursor, nav helpers) + `src/ui/browser/state.rs` (panel/tabs/chrome) + `src/ui/start/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state); PS hub → `src/ui/hub/` + `src/app/hub.rs`; contracts → `notes/browser-embedding.md`; planned hub/CEF split → `notes/browser-hub-pivot.md`
 - **Toasts** → `src/ui/toast/` (state machine in `machine.rs`); z-order / remount → `notes/windows-toast.md`
