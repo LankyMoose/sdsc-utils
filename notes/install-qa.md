@@ -103,8 +103,8 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
   wordmark, **Options** hint + gear on the right), apps row (Start / Browser /
   Add apps), then a horizontal controllers strip.
 - **Options** toggles hub Settings from the main card (Circle closes). The
-  settings screen absorbs UI sounds, volume, haptics, strength, and the
-  standalone download cap.
+  settings screen absorbs UI sounds, volume, haptics, strength, the standalone
+  download cap, and the disconnected-controller filter for the strip.
 - Up/Down switch focus between the apps and controllers rows; Left/Right move
   within the focused row. The controllers strip scrolls the selected card into
   view.

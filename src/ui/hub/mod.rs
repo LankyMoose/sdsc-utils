@@ -229,12 +229,13 @@ impl AppAction {
 }
 
 /// Rows in the hub shell settings screen.
-pub const SETTINGS_ROWS: [&str; 6] = [
+pub const SETTINGS_ROWS: [&str; 7] = [
     "UI sounds",
     "Volume",
     "Controller haptics",
     "Strength",
     "Download speed",
+    "Disconnected controllers",
     "Back",
 ];
 
@@ -314,6 +315,8 @@ pub struct State {
     pub haptics_enabled: bool,
     pub haptics_strength: u8,
     pub download_limit_kbps: u32,
+    /// Include remembered-disconnected controllers in the strip.
+    pub show_all_controllers: bool,
     /// False in packaged builds: the Store owns engine downloads/updates, so
     /// the local download cap has no effect and its row is hidden.
     pub download_cap_available: bool,
@@ -363,6 +366,7 @@ impl Default for State {
             haptics_enabled: true,
             haptics_strength: 60,
             download_limit_kbps: 0,
+            show_all_controllers: false,
             download_cap_available: true,
         }
     }
@@ -591,6 +595,12 @@ impl State {
             2 => (if self.haptics_enabled { "On" } else { "Off" }).to_string(),
             3 => format!("{}%", self.haptics_strength),
             4 => crate::persist::prefs::engine_download_limit_label(self.download_limit_kbps),
+            5 => (if self.show_all_controllers {
+                "Show"
+            } else {
+                "Hide"
+            })
+            .to_string(),
             _ => String::new(),
         }
     }
@@ -602,6 +612,7 @@ impl State {
         haptics: bool,
         haptics_strength: u8,
         download_limit_kbps: u32,
+        show_all_controllers: bool,
     ) {
         self.sound_enabled = sounds;
         self.sound_volume = sound_volume;
@@ -609,6 +620,7 @@ impl State {
         self.haptics_strength = haptics_strength;
         self.download_limit_kbps =
             crate::persist::prefs::clamp_engine_download_limit(download_limit_kbps);
+        self.show_all_controllers = show_all_controllers;
     }
 
     pub fn apps_focus_app(&self) -> HubApp {
@@ -2240,12 +2252,13 @@ mod tests {
     #[test]
     fn settings_rows_cycle_and_report_values() {
         let mut state = State::default();
-        state.set_settings(true, 70, false, 40, 5 * 1024);
+        state.set_settings(true, 70, false, 40, 5 * 1024, true);
         assert_eq!(state.settings_value(0), "On");
         assert_eq!(state.settings_value(1), "70%");
         assert_eq!(state.settings_value(2), "Off");
         assert_eq!(state.settings_value(3), "40%");
         assert_eq!(state.settings_value(4), "5 MB/s");
+        assert_eq!(state.settings_value(5), "Show");
         state.settings_move(1);
         state.settings_move(-1);
         assert_eq!(state.settings_focus, 0);
@@ -2265,6 +2278,8 @@ mod tests {
         state.settings_focus = 3;
         state.settings_move(1);
         assert_eq!(state.settings_focus, 5, "movement skips the hidden cap row");
+        state.settings_move(1);
+        assert_eq!(state.settings_focus, 6);
         state.settings_move(1);
         assert_eq!(state.settings_focus, 0);
     }

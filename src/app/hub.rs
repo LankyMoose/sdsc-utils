@@ -519,6 +519,7 @@ impl App {
             self.session.prefs.start_screen_haptics_enabled,
             self.session.prefs.start_screen_haptics_strength,
             self.session.prefs.engine_download_limit_kbps,
+            self.session.prefs.show_all_controllers,
         );
         // Store-managed builds download through the Store; the local cap is a
         // standalone-only control.
@@ -579,6 +580,13 @@ impl App {
                     .engine_download_limit
                     .store(limit, std::sync::atomic::Ordering::Relaxed);
                 self.sync_hub_settings();
+                Task::none()
+            }
+            5 => {
+                self.session.prefs.show_all_controllers = !self.session.prefs.show_all_controllers;
+                self.save_prefs();
+                self.sync_hub_settings();
+                self.sync_hub_controllers();
                 Task::none()
             }
             _ => {
