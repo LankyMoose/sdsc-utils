@@ -20,7 +20,6 @@ use crate::controller::dualsense::rumble::MotorPulse;
 use crate::games::process_match::RunningSession;
 use crate::games::steam::SteamGame;
 use crate::games::{self, GamesCatalog, launch, process_match, steam};
-use crate::persist::analytics;
 use crate::persist::prefs::{
     NavbarVisibility, ReducedMotion, StartAutoOpen, StartSelectionMode,
     clamp_start_screen_haptics_strength, clamp_start_screen_idle_timeouts,
@@ -93,7 +92,6 @@ impl App {
                 self.start_state.dismiss_edit_confirm(Instant::now());
                 Task::none()
             }
-            StartMessage::ToggleControllers => self.on_toggle_controllers(),
             StartMessage::ToggleEdit => match self.toggle_start_edit() {
                 Some(task) => {
                     self.play_start_cue(UiSoundKind::Action);
@@ -158,12 +156,6 @@ impl App {
             StartMessage::ToggleSettings => {
                 let now = Instant::now();
                 let open = !self.start_state.settings.open;
-                // The dock owns the right edge while open: never stack the
-                // drawer over it (Create is likewise blocked while settings
-                // owns input — see `on_toggle_controllers`).
-                if open && self.start_state.dock_open_or_animating() {
-                    return Task::none();
-                }
                 if self.start_state.request_settings(open, now) {
                     self.play_start_cue(UiSoundKind::Action);
                     crate::controller::hid::diag::diag_info(format!(
@@ -303,7 +295,7 @@ impl App {
         let mut task = Task::none();
         if direction.is_some() {
             self.play_start_cue(UiSoundKind::Nav);
-            if !self.start_state.dock_expanded && self.start_state.game_selected != prev_game {
+            if self.start_state.game_selected != prev_game {
                 self.start_state
                     .begin_strip_anim(prev_game as f32, Instant::now());
                 self.start_state.reset_backdrop_fade();
@@ -314,8 +306,7 @@ impl App {
     }
 
     /// Close/Cancel arm: unwinds topmost surface first (settings → manual-add
-    /// draft → replace confirm → save guard → controllers surface → edit
-    /// mode → Start itself).
+    /// draft → replace confirm → save guard → edit mode → Start itself).
     pub(crate) fn on_start_close(&mut self) -> Task<Message> {
         if self.start_state.settings.open {
             self.play_start_cue(UiSoundKind::Action);
@@ -339,14 +330,6 @@ impl App {
             self.play_start_cue(UiSoundKind::Action);
             self.start_state.dismiss_edit_confirm(Instant::now());
             Task::none()
-        } else if start_mode::dock_collapse_target(self.start_state.dock_expanded).is_some()
-            && self.start_state.request_dock(false, Instant::now())
-        {
-            // Controllers surface open: Circle/Cancel collapses it first,
-            // preserving any edit draft underneath.
-            self.play_start_cue(UiSoundKind::Slide);
-            crate::controller::hid::diag::diag_info("ui-diag: start controllers collapse (cancel)");
-            Task::none()
         } else if self.start_state.editing {
             self.play_start_cue(UiSoundKind::Action);
             if self.edit_draft_dirty() {
@@ -362,33 +345,6 @@ impl App {
         } else {
             Task::none()
         }
-    }
-
-    /// Create-toggle arm: flips the controllers surface both ways.
-    /// An in-progress edit draft is preserved underneath (like the settings
-    /// drawer): closing the dock returns to the checklist with the draft
-    /// intact, so either panel opens freely from dirty edit mode.
-    /// A stowed settle scroll is dropped (the user took over post-settle
-    /// browsing).
-    pub(crate) fn on_toggle_controllers(&mut self) -> Task<Message> {
-        if self.start_state.overlay_blocking() {
-            return Task::none();
-        }
-        let now = Instant::now();
-        let next = !self.start_state.dock_expanded;
-        let target = if next {
-            start_mode::dock_expand_target(self.start_state.dock_expanded)
-        } else {
-            start_mode::dock_collapse_target(self.start_state.dock_expanded)
-        };
-        if target.is_some() && self.start_state.request_dock(next, now) {
-            self.play_start_cue(UiSoundKind::Slide);
-            crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: start controllers {} (create)",
-                if next { "open" } else { "close" },
-            ));
-        }
-        Task::none()
     }
 
     /// Browser toggle: foreground the browser app through the multi-app
@@ -2222,10 +2178,7 @@ impl App {
     }
 
     pub(crate) fn toggle_start_edit(&mut self) -> Option<Task<Message>> {
-        if self.start_state.dock_expanded
-            || self.start_state.overlay_blocking()
-            || self.start_state.animating()
-        {
+        if self.start_state.overlay_blocking() || self.start_state.animating() {
             return None;
         }
         Some(if self.start_state.editing {
@@ -2305,19 +2258,6 @@ impl App {
         }
         // Replace confirm requires hold-Cross / hold-Enter (see pad poll / key hold).
         if self.start_state.replace_confirm.is_some() {
-            return Task::none();
-        }
-        if self.start_state.dock_expanded {
-            if let Some(row) = self.start_state.selected_controller()
-                && row.connected
-            {
-                let serial = row.serial.clone();
-                if self.identify(&serial) {
-                    self.popup_state.begin_identify_flash(&serial);
-                    self.start_state.begin_identify_flash(&serial);
-                    self.play_start_cue(UiSoundKind::Action);
-                }
-            }
             return Task::none();
         }
         if self.start_state.editing {
@@ -2983,16 +2923,15 @@ impl App {
     }
 
     /// True when left/right should scroll the Games strip: horizontal layout
-    /// with the controllers surface closed and no overlays
-    /// (settings / replace-confirm / manual-add) open. Edit mode is a mode,
-    /// not an overlay, so it stays included: left/right move selection (all
-    /// rows are enabled in the checklist) while Up/Down are suppressed.
+    /// with no overlays (settings / replace-confirm / manual-add) open. Edit
+    /// mode is a mode, not an overlay, so it stays included: left/right move
+    /// selection (all rows are enabled in the checklist) while Up/Down are
+    /// suppressed.
     pub(crate) fn immersive_horizontal_games_nav(&self) -> bool {
         matches!(
             self.session.prefs.start_screen_immersive_layout,
             crate::persist::prefs::ImmersiveLayout::Horizontal
-        ) && !self.start_state.dock_expanded
-            && !self.start_state.settings.open
+        ) && !self.start_state.settings.open
             && !self.browser.panel.session.is_open()
             && self.start_state.replace_confirm.is_none()
             && self.start_state.manual_add.is_none()
@@ -3047,19 +2986,14 @@ impl App {
         }
 
         let animating = self.start_state.animating();
-        // Mid-anim: skip controller-row rebuilds (those hitch the UI thread).
+        // Mid-anim: skip the running-badge rebuild (it hitches the UI thread).
         let badge_task = if !animating {
-            let controllers_started = Instant::now();
-            self.refresh_start_controllers();
-            let controllers_ms = controllers_started.elapsed().as_millis();
-
             let badge_started = Instant::now();
             let badge = self.refresh_running_badge();
             let badge_ms = badge_started.elapsed().as_millis();
-
-            if controllers_ms >= PAD_POLL_SLOW_MS || badge_ms >= PAD_POLL_SLOW_MS {
+            if badge_ms >= PAD_POLL_SLOW_MS {
                 crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: pad-poll slow controllers_ms={controllers_ms} badge_ms={badge_ms}"
+                    "ui-diag: pad-poll slow badge_ms={badge_ms}"
                 ));
             }
             badge
@@ -3082,25 +3016,14 @@ impl App {
             && !save_modal
             && !settings_open
             && !animating
-            && !self.start_state.dock_expanded
             && self.start_state.running_target.as_ref().is_some_and(|t| {
                 self.start_state
                     .rows
                     .get(self.start_state.game_selected)
                     .is_some_and(|row| &row.target == t)
             });
-        // Match the row hint: Triangle hold only when Power off is shown.
-        let hold_triangle_power = !editing
-            && !replace_confirm
-            && !manual_add
-            && !save_modal
-            && !settings_open
-            && !animating
-            && self.start_state.dock_expanded
-            && self
-                .start_state
-                .selected_controller()
-                .is_some_and(|row| row.show_power_off());
+        // Triangle hold power-off lives in the PS hub controllers row.
+        let hold_triangle_power = false;
         // Left/right move. Settings ignores Left/Right (form controls are
         // mouse-driven); Up/Down moves focus.
         let horizontal_nav = true;
@@ -3183,9 +3106,6 @@ impl App {
         } else if tick.action == Some(NavAction::ToggleSettings) {
             self.start_state.tick_hint_anims(now);
             self.on_start_message(StartMessage::ToggleSettings)
-        } else if tick.action == Some(NavAction::ToggleControllers) {
-            self.start_state.tick_hint_anims(now);
-            self.on_start_message(StartMessage::ToggleControllers)
         } else if settings_open {
             self.start_state.cross_progress = 0.0;
             self.start_state.triangle_progress = 0.0;
@@ -3201,9 +3121,6 @@ impl App {
                     // Left/Right while chrome animates: move the selection.
                     NavAction::Left => self.on_start_message(StartMessage::MoveUp),
                     NavAction::Right => self.on_start_message(StartMessage::MoveDown),
-                    NavAction::ToggleControllers => {
-                        self.on_start_message(StartMessage::ToggleControllers)
-                    }
                     NavAction::Cancel => self.on_start_message(StartMessage::Close),
                     _ => Task::none(),
                 }
@@ -3266,14 +3183,6 @@ impl App {
 
             if hold_triangle_power {
                 self.start_state.triangle_progress = tick.triangle_progress;
-                if tick.triangle_completed
-                    && let Some(row) = self.start_state.selected_controller()
-                    && row.show_power_off()
-                {
-                    let serial = row.serial.clone();
-                    self.play_start_cue(UiSoundKind::Hold);
-                    self.power_off(&serial);
-                }
             } else {
                 self.start_state.triangle_progress = 0.0;
             }
@@ -3289,13 +3198,7 @@ impl App {
                     NavAction::Down => self.on_start_message(StartMessage::MoveDown),
                     NavAction::Confirm => self.on_start_message(StartMessage::Confirm),
                     NavAction::Cancel => self.on_start_message(StartMessage::Close),
-                    // Left/Right: controllers selection when open, else ignore.
-                    NavAction::Left if self.start_state.dock_expanded => {
-                        self.on_start_message(StartMessage::MoveUp)
-                    }
-                    NavAction::Right if self.start_state.dock_expanded => {
-                        self.on_start_message(StartMessage::MoveDown)
-                    }
+                    // Left/Right: ignored on games.
                     NavAction::Left | NavAction::Right => Task::none(),
                     // Bumpers are browser-only (history); L3 toggles the
                     // browser cursor magnet — all ignored on games.
@@ -3304,9 +3207,7 @@ impl App {
                     | NavAction::BumperHoldLeft
                     | NavAction::BumperHoldRight => Task::none(),
                     NavAction::ToggleMagnetism => Task::none(),
-                    NavAction::ToggleControllers => {
-                        self.on_start_message(StartMessage::ToggleControllers)
-                    }
+                    NavAction::ToggleControllers => Task::none(),
                     NavAction::ToggleEdit => self.on_start_message(StartMessage::ToggleEdit),
                     NavAction::CycleSort => self.on_start_message(StartMessage::CycleSort),
                     NavAction::Triangle if self.start_state.editing => {
@@ -4018,82 +3919,6 @@ impl App {
         rows
     }
 
-    pub(crate) fn refresh_start_controllers(&mut self) {
-        self.start_state.show_all_controllers = self.session.prefs.show_all_controllers;
-        let mut rows: Vec<_> = self
-            .session
-            .controllers
-            .iter()
-            .map(|c| {
-                let nickname = self.session.known.nickname(c.serial.as_ref());
-                let eta = if self.session.prefs.analytics_enabled {
-                    self.session
-                        .analytics
-                        .eta_for(c)
-                        .map(analytics::format_eta_ring)
-                } else {
-                    None
-                };
-                start_view::StartControllerRow {
-                    serial: c.serial.clone(),
-                    title: start_view::controller_title(&c.product, nickname),
-                    connection: c.connection.to_string(),
-                    state: if c.is_low_battery(self.session.prefs.low_battery_percent) {
-                        "low battery".into()
-                    } else {
-                        start_view::power_state_label(c.state).into()
-                    },
-                    percent: c.percent,
-                    low: c.is_low_battery(self.session.prefs.low_battery_percent),
-                    bluetooth: c.connection.is_bluetooth() && c.capabilities.power_off,
-                    connected: true,
-                    eta,
-                }
-            })
-            .collect();
-        if self.session.prefs.show_all_controllers {
-            for controller in self
-                .session
-                .known
-                .remembered_disconnected(&self.session.controllers)
-            {
-                let nickname = self.session.known.nickname(controller.serial.as_ref());
-                let eta = if self.session.prefs.analytics_enabled {
-                    self.session
-                        .analytics
-                        .eta_play_at(controller.serial.as_ref(), controller.percent)
-                        .map(analytics::format_eta_ring)
-                } else {
-                    None
-                };
-                rows.push(start_view::StartControllerRow {
-                    serial: controller.serial.clone(),
-                    title: start_view::controller_title(&controller.product, nickname),
-                    connection: controller.connection.clone(),
-                    state: "disconnected".into(),
-                    percent: controller.percent,
-                    low: false,
-                    bluetooth: false,
-                    connected: false,
-                    eta,
-                });
-            }
-        }
-        self.start_state.set_controllers(rows);
-        // Keep a restored selection pinned to its pad across membership changes.
-        // Controller axis only (never gated by the game-axis persist pref):
-        // the game axis resolves as disabled so it stays untouched.
-        if let Some(selection) = self.start_selection_shadow.clone() {
-            self.start_state.resolve_start_selection(
-                None,
-                selection.controller_key.as_deref(),
-                false,
-                StartSelectionMode::ByGame,
-                None,
-            );
-        }
-    }
-
     pub(crate) fn refresh_running_badge(&mut self) -> Task<Message> {
         self.refresh_running_badge_inner(false)
     }
@@ -4490,18 +4315,14 @@ impl App {
         RestartUiState {
             saved_at_ms: RestartUiState::now_ms(),
             start_visible: self.start_visible,
-            start_on_controllers: self.start_state.dock_expanded,
+            start_on_controllers: false,
             game_key: self
                 .start_state
                 .rows
                 .get(self.start_state.game_selected)
                 .map(|r| r.play_key.clone()),
             game_index: Some(self.start_state.game_selected),
-            controller_key: self
-                .start_state
-                .controllers
-                .get(self.start_state.controller_selected)
-                .map(|r| r.serial.to_string()),
+            controller_key: None,
             settings_scroll_y: self
                 .start_state
                 .list_offset(start_view::StartListId::Settings),
@@ -4539,7 +4360,7 @@ impl App {
             self.pending_configure_scroll = Some(rs.configure_scroll_y);
         }
         if rs.start_visible && self.session.prefs.start_screen_enabled {
-            if rs.game_key.is_some() || rs.controller_key.is_some() {
+            if rs.game_key.is_some() {
                 // Fresh boot: seed the shadow from the restore record so row
                 // rebuilds re-pin the pre-restart selection by key.
                 self.start_selection_shadow = Some(crate::session::StartSelection {
@@ -4551,9 +4372,9 @@ impl App {
             // Bypass the open-time nav reset below; everything it would
             // clear is restored here instead.
             self.restore_preserve_nav = true;
-            if rs.start_on_controllers {
-                self.start_state.dock_expanded = true;
-            }
+            // Controllers live in the PS hub now; legacy Start surface state
+            // in the record is ignored.
+            let _ = rs.start_on_controllers;
             if rs.settings_open {
                 self.start_state.request_settings(true, Instant::now());
                 // Instant restore: no drawer travel on boot.
@@ -4605,7 +4426,6 @@ impl App {
         // Edit state (editing mode, drafts, confirms) survives closes like
         // everything else: PS toggles never wipe in-progress work.
         self.refresh_start_rows();
-        self.refresh_start_controllers();
 
         // Restore opens resolve from the shadow keys: reload restore already
         // set drawer/scroll/selection state above. Pad nav arming still runs
@@ -5064,7 +4884,7 @@ impl App {
     pub(crate) fn cycle_games_sort(&mut self) -> Option<Task<Message>> {
         // Sort stays live in edit mode: the checklist re-sorts under the same
         // mode and the prefs write persists across save/cancel.
-        if self.start_state.dock_expanded || self.start_state.overlay_blocking() {
+        if self.start_state.overlay_blocking() {
             return None;
         }
         self.session.prefs.games_sort_mode = self.session.prefs.games_sort_mode.cycle();
@@ -5076,29 +4896,7 @@ impl App {
     }
 
     pub(crate) fn on_start_cycle_sort(&mut self) -> Option<Task<Message>> {
-        if self.start_state.dock_expanded {
-            let next = !self.session.prefs.show_all_controllers;
-            self.set_show_all_controllers(next)
-        } else {
-            self.cycle_games_sort()
-        }
-    }
-
-    pub(crate) fn set_show_all_controllers(&mut self, show_all: bool) -> Option<Task<Message>> {
-        if !self.start_state.dock_expanded
-            || self.start_state.overlay_blocking()
-            || self.session.prefs.show_all_controllers == show_all
-        {
-            return None;
-        }
-        self.session.prefs.show_all_controllers = show_all;
-        self.save_prefs();
-        app_log::hid_trace(format!(
-            "start-controllers: show_all={}",
-            u8::from(show_all)
-        ));
-        self.refresh_start_controllers();
-        Some(Task::none())
+        self.cycle_games_sort()
     }
 
     /// Native file picker; on Windows parents to Start so it clears immersive cover.
@@ -5275,7 +5073,6 @@ mod tests {
             StartMessage::Confirm,
             StartMessage::ToggleEdit,
             StartMessage::ToggleSettings,
-            StartMessage::ToggleControllers,
         ] {
             assert!(
                 !start_cold_allows(&msg),
@@ -5323,7 +5120,6 @@ mod tests {
             StartMessage::Confirm,
             StartMessage::Close,
             StartMessage::ToggleSettings,
-            StartMessage::ToggleControllers,
         ] {
             assert!(
                 !start_focus_move_frozen(&msg),

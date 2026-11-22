@@ -260,7 +260,8 @@ pub enum NavAction {
     Triangle,
     /// Options — open/close Start settings.
     ToggleSettings,
-    /// Create (Select) — open/close the controllers surface.
+    /// Create (Select) — legacy controllers-surface toggle (inert: the PS hub
+    /// owns the controllers strip now).
     ToggleControllers,
 }
 
@@ -642,7 +643,7 @@ impl EdgeButton {
             // Browse: enter edit. Edit: save (ToggleEdit commits).
             Self::Triangle => Some(NavAction::ToggleEdit),
             Self::Options => Some(NavAction::ToggleSettings),
-            // Create (Select): toggle the controllers surface.
+            // Create (Select): legacy controllers-surface toggle (inert).
             Self::Create => Some(NavAction::ToggleControllers),
         }
     }

@@ -1176,10 +1176,6 @@ impl App {
                 "hub" => tasks.push(self.open_hub()),
                 "browser" => tasks.push(self.open_browser_window()),
                 "start" => tasks.push(self.open_start_screen()),
-                "start-controllers" => {
-                    tasks.push(self.open_start_screen());
-                    self.start_state.request_dock(true, Instant::now());
-                }
                 "start-edit" => {
                     tasks.push(self.open_start_screen());
                     let _ = self.toggle_start_edit();
@@ -1362,7 +1358,7 @@ impl App {
         }
 
         if self.popup_state.identify_flash_active()
-            || self.start_state.identify_flash_active()
+            || self.hub_state.identify_flash_active()
             || (self.popup_window.is_some() && self.popup_state.entrance_active(Instant::now()))
         {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::IdentifyFrame));
@@ -1371,6 +1367,7 @@ impl App {
         let pad_input_live =
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
         let pad_listening = pad_input_live
+            || self.hub_visible
             || self.browser_visible
             || (self.session.prefs.start_screen_enabled && !self.session.controllers.is_empty());
         self.hid_worker.set_input_hot(pad_listening);
@@ -1509,6 +1506,7 @@ impl App {
                 .unwrap_or(theme::BACKDROP_ALPHA);
             let hub = crate::ui::hub::view(
                 &self.hub_state,
+                &self.session.prefs.spectrum,
                 self.hub_stage.0,
                 self.hub_stage.1,
                 backdrop_alpha,
@@ -1558,7 +1556,6 @@ impl App {
             let settings_snapshot = self.start_settings_snapshot();
             let start = start_view::view(
                 &self.start_state,
-                &self.session.prefs.spectrum,
                 Instant::now(),
                 self.session.prefs.start_screen_clock_enabled,
                 stage_h,
@@ -1896,7 +1893,7 @@ impl App {
             Message::ToastFrame => self.handle_toast_frame(),
             Message::IdentifyFrame => {
                 self.popup_state.tick_identify_flash();
-                self.start_state.tick_identify_flash();
+                self.hub_state.tick_identify_flash();
                 Task::none()
             }
             // Redraw only: the wall-clock spinner phase advances in `view`.
@@ -2293,9 +2290,7 @@ impl App {
                         self.on_ambient_tuning_nav(Some(NavAction::Left))
                     } else if self.start_state.settings.open {
                         self.on_start_settings_nav(Some(NavAction::Left))
-                    } else if self.immersive_horizontal_games_nav()
-                        || self.start_state.dock_expanded
-                    {
+                    } else if self.immersive_horizontal_games_nav() {
                         self.on_start_message(StartMessage::MoveUp)
                     } else {
                         Task::none()
@@ -2307,9 +2302,7 @@ impl App {
                         self.on_ambient_tuning_nav(Some(NavAction::Right))
                     } else if self.start_state.settings.open {
                         self.on_start_settings_nav(Some(NavAction::Right))
-                    } else if self.immersive_horizontal_games_nav()
-                        || self.start_state.dock_expanded
-                    {
+                    } else if self.immersive_horizontal_games_nav() {
                         self.on_start_message(StartMessage::MoveDown)
                     } else {
                         Task::none()
@@ -2549,6 +2542,10 @@ impl App {
 
         if self.identifying.load(Ordering::SeqCst) || self.refreshing.load(Ordering::SeqCst) {
             return Task::none();
+        }
+
+        if self.hub_visible {
+            self.sync_hub_controllers();
         }
 
         let discovered = self.hid_worker.presence_paths();

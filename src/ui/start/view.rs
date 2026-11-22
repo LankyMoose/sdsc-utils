@@ -1,14 +1,12 @@
 //! Start screen: fullscreen console game launcher, DualSense / keyboard navigable.
 
-use crate::controller::dualsense::lightbar;
-use crate::controller::model::{PowerState, Serial};
+use crate::controller::model::Serial;
 use crate::games::GameEntry;
 use crate::games::steam::SteamGame;
 use crate::persist::prefs::{
     GamesSortMode, ImmersiveLayout, NavbarVisibility, ReducedMotion, StartAutoOpen,
     StartSelectionMode,
 };
-use crate::ui::color::BatterySpectrum;
 use crate::ui::layout as window_layout;
 use crate::ui::start::face::FacePressAnim;
 use crate::ui::start::icon_cache;
@@ -27,8 +25,6 @@ use std::time::{Duration, Instant};
 
 /// Logical width of the start-screen window.
 pub const WIDTH: f32 = 768.0;
-
-pub const DOCK_ANIM_MS: u64 = 220;
 
 /// Layout-transition duration when swapping immersive strip orientation
 /// (ease in-out, orientation swaps at the midpoint).
@@ -60,8 +56,6 @@ pub enum StartMessage {
     /// Backdrop click on the save-guard modal: close the modal, stay in
     /// edit mode (never discards — Discard stays an explicit choice).
     DismissEditConfirm,
-    /// Create (Select): toggle the controllers surface.
-    ToggleControllers,
     ToggleEdit,
     CycleSort,
     AddShortcut,
@@ -534,32 +528,8 @@ pub fn probe_shell_icon(target: &str) -> Option<StartIcon> {
     icon_cache::handle_for_shell_pinned(&path).map(StartIcon)
 }
 
-/// Controller row for the Controllers slide (live or remembered disconnected).
-#[derive(Debug, Clone, PartialEq)]
-pub struct StartControllerRow {
-    pub serial: Serial,
-    pub title: String,
-    pub connection: String,
-    pub state: String,
-    pub percent: u8,
-    pub low: bool,
-    pub bluetooth: bool,
-    /// Live HID pad vs remembered-but-disconnected.
-    pub connected: bool,
-    pub eta: Option<String>,
-}
-
-impl StartControllerRow {
-    /// Triangle hold is shown and accepted only for a live Bluetooth pad.
-    pub fn show_power_off(&self) -> bool {
-        self.connected && self.bluetooth
-    }
-}
-
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RowHintState {
-    pub(crate) triangle_progress: f32,
-    pub(crate) triangle_armed_t: f32,
     pub(crate) cross_progress: f32,
     pub(crate) cross_armed_t: f32,
     pub(crate) held: FaceHeld,
@@ -574,12 +544,11 @@ pub(crate) struct RowHintState {
 #[derive(Debug, Clone, Copy, Default)]
 struct OwnerPress {
     anim: FacePressAnim,
-    triangle_armed: f32,
     cross_armed: f32,
 }
 
 impl OwnerPress {
-    fn needs_frames(&self, held: FaceHeld, triangle_armed: bool, cross_armed: bool) -> bool {
+    fn needs_frames(&self, held: FaceHeld, cross_armed: bool) -> bool {
         const EPS: f32 = 0.001;
         let press = [
             (held.cross, self.anim.cross),
@@ -595,20 +564,16 @@ impl OwnerPress {
         {
             return true;
         }
-        (triangle_armed && self.triangle_armed < 1.0 - EPS)
-            || (!triangle_armed && self.triangle_armed > EPS)
-            || (cross_armed && self.cross_armed < 1.0 - EPS)
-            || (!cross_armed && self.cross_armed > EPS)
+        (cross_armed && self.cross_armed < 1.0 - EPS) || (!cross_armed && self.cross_armed > EPS)
     }
 
-    fn tick(&mut self, held: FaceHeld, triangle_armed: bool, cross_armed: bool, dt: f32) {
+    fn tick(&mut self, held: FaceHeld, cross_armed: bool, dt: f32) {
         approach_anim(&mut self.anim.cross, held.cross, dt);
         approach_anim(&mut self.anim.circle, held.circle, dt);
         approach_anim(&mut self.anim.square, held.square, dt);
         approach_anim(&mut self.anim.triangle, held.triangle, dt);
         approach_anim(&mut self.anim.options, held.options, dt);
         approach_anim(&mut self.anim.create, held.create, dt);
-        approach_anim(&mut self.triangle_armed, triangle_armed, dt);
         approach_anim(&mut self.cross_armed, cross_armed, dt);
     }
 }
@@ -621,18 +586,16 @@ pub(crate) enum HintPressOwner {
     ManualAdd,
     ReplaceConfirm,
     SaveDiscard,
-    Dock,
 }
 
 impl HintPressOwner {
-    const COUNT: usize = 6;
+    const COUNT: usize = 5;
     const ALL: [Self; Self::COUNT] = [
         Self::Browse,
         Self::Settings,
         Self::ManualAdd,
         Self::ReplaceConfirm,
         Self::SaveDiscard,
-        Self::Dock,
     ];
 
     fn index(self) -> usize {
@@ -642,7 +605,6 @@ impl HintPressOwner {
             Self::ManualAdd => 2,
             Self::ReplaceConfirm => 3,
             Self::SaveDiscard => 4,
-            Self::Dock => 5,
         }
     }
 
@@ -655,8 +617,6 @@ impl HintPressOwner {
             Self::ReplaceConfirm
         } else if state.edit_confirm.is_some() {
             Self::SaveDiscard
-        } else if state.dock_expanded {
-            Self::Dock
         } else {
             Self::Browse
         }
@@ -667,8 +627,6 @@ impl HintPressOwner {
 pub(crate) struct HintPress {
     pub(crate) held: FaceHeld,
     pub(crate) press_anim: FacePressAnim,
-    pub(crate) triangle_progress: f32,
-    pub(crate) triangle_armed_t: f32,
     pub(crate) cross_progress: f32,
     pub(crate) cross_armed_t: f32,
 }
@@ -682,8 +640,6 @@ impl HintPress {
         Self {
             held: state.held,
             press_anim: slot.anim,
-            triangle_progress: state.triangle_progress,
-            triangle_armed_t: slot.triangle_armed,
             cross_progress: state.cross_progress,
             cross_armed_t: slot.cross_armed,
         }
@@ -696,8 +652,6 @@ impl RowHintState {
         if selected {
             let press = HintPress::for_owner(state, owner);
             Self {
-                triangle_progress: press.triangle_progress,
-                triangle_armed_t: press.triangle_armed_t,
                 cross_progress: press.cross_progress,
                 cross_armed_t: press.cross_armed_t,
                 held: press.held,
@@ -747,14 +701,6 @@ impl ManualAddDraft {
     pub fn is_edit(&self) -> bool {
         self.edit_id.is_some()
     }
-}
-
-#[derive(Debug, Clone)]
-struct DockAnim {
-    from: f32,
-    to: f32,
-    duration_ms: u64,
-    started: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -906,12 +852,8 @@ pub struct State {
     enter_splash_fade: bool,
     /// Incoming splash paints fully opaque (cached reopen / after-veil snap).
     splash_opaque: bool,
-    /// Controllers surface target (open = controllers focus).
-    pub dock_expanded: bool,
     pub game_selected: usize,
     pub rows: Vec<StartRow>,
-    pub controller_selected: usize,
-    pub controllers: Vec<StartControllerRow>,
     pub running_target: Option<String>,
     /// Target with a live launch session not yet confirmed running (no
     /// process match, no Steam `Running` verdict). Shows "Launching" instead
@@ -921,7 +863,7 @@ pub struct State {
     /// Shows "Closing" immediately instead of clearing to nothing.
     pub closing_target: Option<String>,
     /// Controller serial currently being powered off (feature report sent,
-    /// waiting for the pad to disappear). Shows "Powering off" the same way.
+    /// waiting for the pad to disappear). Shows "Powering off" in the popup.
     pub powering_off: Option<Serial>,
     pub replace_confirm: Option<ReplaceConfirm>,
     /// In-flight dialog tweens (`None` = settled on content presence; see
@@ -948,8 +890,6 @@ pub struct State {
     hint_anim_tick: Option<Instant>,
     pub editing: bool,
     pub sort_mode: GamesSortMode,
-    /// Controllers surface: include remembered disconnected pads.
-    pub show_all_controllers: bool,
     /// `play_key` of the row selected when edit mode was entered (restored on Save/Cancel).
     pub edit_anchor_play_key: Option<String>,
     /// Unified scroll-offset tracking for every Start list (games / controllers /
@@ -959,7 +899,6 @@ pub struct State {
     /// a frame). Future lists add a [`StartListId`] variant + geometry below.
     pub(crate) scrolls: ListScrollTracker,
 
-    dock_anim: Option<DockAnim>,
     strip_anim: Option<StripAnim>,
     /// In-flight strip orientation transition (`None` = settled on prefs layout).
     layout_transition: Option<LayoutTransitionAnim>,
@@ -1015,9 +954,6 @@ pub struct State {
     backdrop_current: Option<(String, Option<Instant>)>,
     /// Outgoing backdrop during cover-crossfade: `(play_key, scale, ox_norm, oy_norm)`.
     backdrop_outgoing: Option<(String, f32, f32, f32)>,
-    /// Ring flash started with the last successful Identify (Controllers slide).
-    identify_flash: Option<IdentifyFlash>,
-    /// Keep painting while the art worker may still fill peeks.
     pub art_awaiting_paint: bool,
     /// Immersive inactive / sleep logical phase.
     pub idle_phase: crate::ui::start::idle::IdlePhase,
@@ -1027,13 +963,6 @@ pub struct State {
     idle_dim_settled: f32,
     /// True from Sleep wake until dim returns to Active (pad fully gated).
     pub idle_sleep_wake_pending: bool,
-}
-
-/// Active Identify ring flash for one controller row on the start screen.
-#[derive(Debug, Clone)]
-struct IdentifyFlash {
-    serial: Serial,
-    started: Instant,
 }
 
 /// Which Start list a scroll offset belongs to.
@@ -1164,11 +1093,8 @@ impl Default for State {
             splash_reveal_cached: false,
             enter_splash_fade: false,
             splash_opaque: false,
-            dock_expanded: false,
             game_selected: 0,
             rows: Vec::new(),
-            controller_selected: 0,
-            controllers: Vec::new(),
             running_target: None,
             launching_target: None,
             closing_target: None,
@@ -1187,11 +1113,9 @@ impl Default for State {
             hint_anim_tick: None,
             editing: false,
             sort_mode: GamesSortMode::default(),
-            show_all_controllers: false,
             edit_anchor_play_key: None,
             scrolls: ListScrollTracker::default(),
 
-            dock_anim: None,
             strip_anim: None,
             layout_transition: None,
             position_section: None,
@@ -1217,7 +1141,6 @@ impl Default for State {
             ambient_tuning_keepalive: false,
             backdrop_current: None,
             backdrop_outgoing: None,
-            identify_flash: None,
             art_awaiting_paint: false,
             idle_phase: crate::ui::start::idle::IdlePhase::Active,
             idle_dim_anim: None,
@@ -1294,35 +1217,6 @@ impl State {
         self.snap_position_section();
         if order_changed {
             self.note_position_bar_scroll(Instant::now());
-        }
-    }
-
-    pub fn set_controllers(&mut self, controllers: Vec<StartControllerRow>) {
-        let prev_serial = self
-            .controllers
-            .get(self.controller_selected)
-            .map(|r| &r.serial);
-        let next_selected = if controllers.is_empty() {
-            0
-        } else if let Some(serial) = prev_serial {
-            controllers
-                .iter()
-                .position(|r| r.serial == *serial)
-                .unwrap_or_else(|| self.controller_selected.min(controllers.len() - 1))
-        } else {
-            self.controller_selected.min(controllers.len() - 1)
-        };
-        self.controllers = controllers;
-        self.controller_selected = next_selected;
-        // A powered-off pad is done once no *connected* row carries it
-        // (remembered-disconnected rows reuse the serial).
-        if self.powering_off.as_ref().is_some_and(|s| {
-            !self
-                .controllers
-                .iter()
-                .any(|r| r.connected && r.serial == *s)
-        }) {
-            self.powering_off = None;
         }
     }
 
@@ -1503,13 +1397,6 @@ impl State {
             .map(|r| r.play_key.clone())
     }
 
-    /// Current controllers selection as a stable key for service-side memory.
-    pub fn selected_controller_key(&self) -> Option<Serial> {
-        self.controllers
-            .get(self.controller_selected)
-            .map(|r| r.serial.clone())
-    }
-
     /// Resolve service-stored keys to indices after a shell restart.
     ///
     /// Game axis honors the persistence prefs; the controller axis is never
@@ -1524,7 +1411,7 @@ impl State {
     pub fn resolve_start_selection(
         &mut self,
         game_key: Option<&str>,
-        controller_key: Option<&str>,
+        _controller_key: Option<&str>,
         persist_enabled: bool,
         selection_mode: StartSelectionMode,
         game_index: Option<usize>,
@@ -1563,35 +1450,19 @@ impl State {
                 changed = true;
             }
         }
-        if let Some(serial) = controller_key {
-            let index = if self.controllers.is_empty() {
-                0
-            } else {
-                self.controllers
-                    .iter()
-                    .position(|r| r.serial.as_ref() == serial)
-                    .unwrap_or(0)
-            };
-            if index != self.controller_selected {
-                self.controller_selected = index;
-                changed = true;
-            }
-        }
         if changed {
             self.snap_position_section();
         }
         changed
     }
 
-    /// Land on Games with the controllers surface closed (used whenever the start screen opens).
+    /// Landing on Games resets the transient Start surfaces.
     pub fn reset_to_games(&mut self) {
-        self.dock_anim = None;
         self.strip_anim = None;
         self.layout_transition = None;
         self.position_bar_last_scroll = None;
         self.position_bar_slide = None;
         self.snap_position_section();
-        self.dock_expanded = false;
         self.clear_replace();
         self.clear_manual();
         self.clear_edit_confirm();
@@ -1604,7 +1475,6 @@ impl State {
         self.editing = false;
         self.edit_anchor_play_key = None;
         self.game_selected = 0;
-        self.controller_selected = 0;
         // Fresh window mounts scrollables at 0 with no on_scroll yet; the
         // open-time reveal (see `open_reveal_scroll`, issued on StartOpened)
         // recomputes from here with the estimate-viewport fallback.
@@ -1793,9 +1663,7 @@ impl State {
     pub fn animating(&self) -> bool {
         // Strip scroll + title crossfade are retargetable — do not gate pad Up/Down on them.
         // The layout transition is not retargetable: block pad nav mid-transition.
-        self.dock_anim.is_some()
-            || self.transition_phase.is_some()
-            || self.layout_transition.is_some()
+        self.transition_phase.is_some() || self.layout_transition.is_some()
     }
 
     /// True while the immersive layout transition is in flight.
@@ -1815,8 +1683,7 @@ impl State {
     }
 
     pub fn needs_frames(&self) -> bool {
-        self.dock_anim.is_some()
-            || self.strip_anim.is_some()
+        self.strip_anim.is_some()
             || self.layout_transition.is_some()
             || self.transition_phase.is_some()
             || self.backdrop_current.is_some()
@@ -1833,7 +1700,6 @@ impl State {
             || self.settings.open
             || self.settings.anim.is_some()
             || self.hint_anims_need_frames()
-            || self.identify_flash_active()
             || self.art_awaiting_paint
             || !self.chrome_status.is_empty()
             || self.games_list_reveal_at.is_some()
@@ -1852,8 +1718,7 @@ impl State {
     /// subscription itself consults `needs_frames()` (which gates only the
     /// bare arm behind `perf_throttle_immersive`).
     pub fn immersive_anim_active(&self) -> bool {
-        self.dock_anim.is_some()
-            || self.strip_anim.is_some()
+        self.strip_anim.is_some()
             || self.layout_transition.is_some()
             || self.transition_phase.is_some()
             || self.backdrop_current.is_some()
@@ -1869,7 +1734,6 @@ impl State {
             || self.settings.open
             || self.settings.anim.is_some()
             || self.hint_anims_need_frames()
-            || self.identify_flash_active()
             || self.art_awaiting_paint
             || !self.chrome_status.is_empty()
             || self.games_list_reveal_at.is_some()
@@ -1944,71 +1808,6 @@ impl State {
         {
             false
         }
-    }
-
-    /// Immersive dock width progress 0..=1 (eased while animating).
-    pub fn dock_progress(&self, now: Instant) -> f32 {
-        if let Some(anim) = &self.dock_anim {
-            let t = (now.saturating_duration_since(anim.started).as_secs_f32()
-                / (anim.duration_ms.max(1) as f32 / 1000.0))
-                .clamp(0.0, 1.0);
-            let e = window_layout::ease_out_cubic(t);
-            return anim.from + (anim.to - anim.from) * e;
-        }
-        if self.dock_expanded { 1.0 } else { 0.0 }
-    }
-
-    /// True while the controllers surface is open or still traveling
-    /// (used to keep the settings drawer from opening over it).
-    pub fn dock_open_or_animating(&self) -> bool {
-        self.dock_expanded || self.dock_anim.is_some()
-    }
-
-    /// Request the controllers surface open/close. An edit draft survives
-    /// underneath (like the settings drawer): closing the dock returns to
-    /// the checklist untouched.
-    pub fn request_dock(&mut self, expanded: bool, now: Instant) -> bool {
-        let target = if expanded { 1.0 } else { 0.0 };
-        if self
-            .dock_anim
-            .as_ref()
-            .is_some_and(|a| (a.to - target).abs() < 0.01)
-        {
-            return false;
-        }
-        if self.dock_anim.is_none() && self.dock_expanded == expanded {
-            return false;
-        }
-        // Reduced motion: snap the surface (no travel); the stage scale gate
-        // below keeps the games stage at 1x while open.
-        if self.reduced_motion {
-            let snapped = self.dock_anim.is_some();
-            let changed = self.dock_expanded != expanded;
-            self.dock_expanded = expanded;
-            self.clear_replace();
-            self.clear_manual();
-            self.clear_edit_confirm();
-            self.cross_progress = 0.0;
-            self.dock_anim = None;
-            return changed || snapped;
-        }
-        let from = self.dock_progress(now);
-        self.dock_expanded = expanded;
-        self.clear_replace();
-        self.clear_manual();
-        self.clear_edit_confirm();
-        self.cross_progress = 0.0;
-        if (from - target).abs() < 0.01 {
-            self.dock_anim = None;
-            return false;
-        }
-        self.dock_anim = Some(DockAnim {
-            from,
-            to: target,
-            duration_ms: DOCK_ANIM_MS,
-            started: now,
-        });
-        true
     }
 
     /// Fractional game index for the immersive vertical strip.
@@ -2307,8 +2106,7 @@ impl State {
         if !reduced {
             return;
         }
-        // Dock/strip state is set target-side at request time; drop the chase.
-        self.dock_anim = None;
+        // Strip state is set target-side at request time; drop the chase.
         self.strip_anim = None;
         self.layout_transition = None;
         if let Some(anim) = self.position_section.take() {
@@ -2352,10 +2150,8 @@ impl State {
         self.position_section_at = self.position_section_target();
     }
 
-    /// Clear dock/strip/enter-phase and ambient (close fully).
+    /// Clear strip/enter-phase and ambient (close fully).
     pub fn clear_immersive_session(&mut self) {
-        self.dock_expanded = false;
-        self.dock_anim = None;
         self.strip_anim = None;
         self.layout_transition = None;
         self.position_bar_last_scroll = None;
@@ -2465,7 +2261,6 @@ impl State {
         now: Instant,
     ) {
         use crate::ui::start::mode::TransitionPhase;
-        self.dock_anim = None;
         self.strip_anim = None;
         self.position_bar_last_scroll = None;
         self.position_bar_slide = None;
@@ -3486,49 +3281,16 @@ impl State {
         self.note_backdrop_ready(now);
     }
 
-    /// Start the UI ring flash that mirrors the lightbar Identify pattern.
-    pub fn begin_identify_flash(&mut self, serial: &Serial) {
-        self.identify_flash = Some(IdentifyFlash {
-            serial: serial.clone(),
-            started: Instant::now(),
-        });
-    }
-
-    /// True while a ring Identify flash still has frames to draw.
-    pub fn identify_flash_active(&self) -> bool {
-        self.identify_flash.as_ref().is_some_and(|flash| {
-            lightbar::identify_flash_is_white(flash.started, Instant::now()).is_some()
-        })
-    }
-
-    /// Drop finished flash state; call from the frame subscription.
-    pub fn tick_identify_flash(&mut self) {
-        let finished = self.identify_flash.as_ref().is_some_and(|flash| {
-            lightbar::identify_flash_is_white(flash.started, Instant::now()).is_none()
-        });
-        if finished {
-            self.identify_flash = None;
-        }
-    }
-
-    pub(crate) fn ring_flash_white(&self, serial: &Serial) -> bool {
-        self.identify_flash.as_ref().is_some_and(|flash| {
-            flash.serial == *serial
-                && lightbar::identify_flash_is_white(flash.started, Instant::now()) == Some(true)
-        })
-    }
-
     fn hint_anims_need_frames(&self) -> bool {
         let current = HintPressOwner::current(self);
-        let triangle_armed = self.triangle_progress >= 1.0;
         let cross_armed = self.cross_progress >= 1.0;
         HintPressOwner::ALL.iter().any(|&owner| {
             let slot = &self.press_slots[owner.index()];
             if owner == current {
-                slot.needs_frames(self.held, triangle_armed, cross_armed)
+                slot.needs_frames(self.held, cross_armed)
             } else {
                 // Hidden slots relax to idle; they need frames until settled.
-                slot.needs_frames(FaceHeld::default(), false, false)
+                slot.needs_frames(FaceHeld::default(), false)
             }
         })
     }
@@ -3553,14 +3315,13 @@ impl State {
         }
         let current = HintPressOwner::current(self);
         let held = self.held;
-        let triangle_armed = self.triangle_progress >= 1.0;
         let cross_armed = self.cross_progress >= 1.0;
         for owner in HintPressOwner::ALL {
             let slot = &mut self.press_slots[owner.index()];
             if owner == current {
-                slot.tick(held, triangle_armed, cross_armed, dt);
+                slot.tick(held, cross_armed, dt);
             } else {
-                slot.tick(FaceHeld::default(), false, false, dt);
+                slot.tick(FaceHeld::default(), false, dt);
             }
         }
     }
@@ -3570,13 +3331,6 @@ impl State {
         let _ = self.try_arm_enter_reveal_when_art_ready(now);
         self.try_start_pending_splash_reveal(now);
         self.tick_chrome_status(now);
-        if let Some(anim) = self.dock_anim.as_ref() {
-            let elapsed = now.saturating_duration_since(anim.started);
-            if elapsed >= Duration::from_millis(anim.duration_ms) {
-                self.dock_expanded = anim.to >= 0.5;
-                self.dock_anim = None;
-            }
-        }
         // Dialog exit tweens: content stays mounted through the fade so
         // dismissals settle back onto the stage instead of blinking out.
         if overlay::tween_settle(&mut self.replace_anim, now) {
@@ -3667,19 +3421,6 @@ impl State {
         if self.overlay_blocking() || self.layout_transition_active() {
             return None;
         }
-        if self.dock_expanded {
-            if self.controllers.is_empty() {
-                return None;
-            }
-            let len = self.controllers.len() as i32;
-            let before = self.controller_selected as i32;
-            let after = (before + delta).rem_euclid(len);
-            if after == before {
-                return None;
-            }
-            self.controller_selected = after as usize;
-            return Some(reveal_for_step(before, after, delta));
-        }
         if self.rows.is_empty() {
             return None;
         }
@@ -3711,10 +3452,6 @@ impl State {
         self.game_selected = after as usize;
         self.sync_position_section(Instant::now(), crate::ui::start::vstrip::STRIP_ANIM_MS);
         Some(reveal_for_step(before, after, delta))
-    }
-
-    pub fn selected_controller(&self) -> Option<&StartControllerRow> {
-        self.controllers.get(self.controller_selected)
     }
 }
 
@@ -3990,7 +3727,6 @@ pub(crate) fn scan_status_stack<'a>(
 #[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     state: &'a State,
-    spectrum: &BatterySpectrum,
     now: Instant,
     clock_enabled: bool,
     stage_h: f32,
@@ -4000,7 +3736,6 @@ pub fn view<'a>(
 ) -> Element<'a, StartMessage> {
     crate::ui::start::immersive::view(
         state,
-        spectrum,
         now,
         clock_enabled,
         stage_h,
@@ -4012,47 +3747,9 @@ pub fn view<'a>(
     )
 }
 
-pub fn controller_title(product: &str, nickname: Option<&str>) -> String {
-    nickname
-        .filter(|n| !n.is_empty())
-        .unwrap_or(product)
-        .to_string()
-}
-
-pub fn power_state_label(state: PowerState) -> &'static str {
-    state.as_str()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sample_controller(connected: bool, bluetooth: bool) -> StartControllerRow {
-        StartControllerRow {
-            serial: "pad".into(),
-            title: "DualSense".into(),
-            connection: if bluetooth { "Bluetooth" } else { "USB" }.into(),
-            state: if connected {
-                "charging"
-            } else {
-                "disconnected"
-            }
-            .into(),
-            percent: 50,
-            low: false,
-            bluetooth,
-            connected,
-            eta: None,
-        }
-    }
-
-    #[test]
-    fn power_off_hint_only_for_live_bluetooth() {
-        assert!(sample_controller(true, true).show_power_off());
-        assert!(!sample_controller(true, false).show_power_off());
-        assert!(!sample_controller(false, true).show_power_off());
-        assert!(!sample_controller(false, false).show_power_off());
-    }
 
     #[test]
     fn navbar_pin_holds_rail_visible_and_skips_hide_timer() {
@@ -4224,16 +3921,6 @@ mod tests {
         assert!(gated.immersive_anim_active());
 
         let mut ungated = State { ..State::default() };
-        ungated.request_dock(true, now);
-        assert!(ungated.needs_frames());
-        assert!(ungated.immersive_anim_active());
-        let mut gated = State { ..State::default() };
-        gated.sync_perf_throttle(true);
-        gated.request_dock(true, now);
-        assert!(gated.needs_frames());
-        assert!(gated.immersive_anim_active());
-
-        let mut ungated = State { ..State::default() };
         ungated.replace_confirm = Some(crate::ui::start::view::ReplaceConfirm {
             running_title: "a".into(),
             next_title: "b".into(),
@@ -4302,18 +3989,15 @@ mod tests {
         // panel's own scroll reset (fresh open) is intended.
         let mut state = State {
             game_selected: 3,
-            controller_selected: 2,
             ..State::default()
         };
         let now = Instant::now();
         assert!(state.request_settings(true, now));
         assert_eq!(state.game_selected, 3);
-        assert_eq!(state.controller_selected, 2);
         assert!((state.settings.scroll_y - 0.0).abs() < f32::EPSILON);
         assert!((state.list_offset(StartListId::Settings) - 0.0).abs() < f32::EPSILON);
         assert!(state.request_settings(false, now));
         assert_eq!(state.game_selected, 3);
-        assert_eq!(state.controller_selected, 2);
     }
 
     #[test]
@@ -4338,20 +4022,6 @@ mod tests {
         assert!(StartListId::from_scroll_id(&unknown).is_none());
         assert!(!state.note_scroll_y(&unknown, 999.0));
         assert!((state.list_offset(StartListId::Settings) - 42.0).abs() < f32::EPSILON);
-    }
-
-    fn controller_row_with(serial: &str, connected: bool) -> StartControllerRow {
-        StartControllerRow {
-            serial: serial.into(),
-            title: "DualSense".into(),
-            connection: "Bluetooth".into(),
-            state: "discharging".into(),
-            percent: 50,
-            low: false,
-            bluetooth: true,
-            connected,
-            eta: None,
-        }
     }
 
     fn game_row_with(play_key: &str) -> StartRow {
@@ -4396,236 +4066,6 @@ mod tests {
         );
         // Other targets unaffected.
         assert_eq!(state.launch_status("steam://rungameid/2"), None);
-    }
-
-    #[test]
-    fn selection_keys_snapshot_current_indices() {
-        let mut state = State::default();
-        assert_eq!(state.selected_game_key(), None);
-        assert_eq!(state.selected_controller_key(), None);
-        state.rows = vec![
-            game_row_with("steam:1"),
-            game_row_with("steam:2"),
-            game_row_with("steam:3"),
-        ];
-        state.controllers = vec![
-            controller_row_with("aa", true),
-            controller_row_with("bb", true),
-        ];
-        state.game_selected = 2;
-        state.controller_selected = 1;
-        assert_eq!(state.selected_game_key().as_deref(), Some("steam:3"));
-        assert_eq!(state.selected_controller_key(), Some(Serial::from("bb")));
-    }
-
-    #[test]
-    fn resolve_start_selection_matches_stable_keys() {
-        let mut state = State {
-            rows: vec![
-                game_row_with("steam:1"),
-                game_row_with("steam:2"),
-                game_row_with("steam:3"),
-            ],
-            controllers: vec![
-                controller_row_with("aa", true),
-                controller_row_with("bb", true),
-            ],
-            ..Default::default()
-        };
-        assert!(state.resolve_start_selection(
-            Some("steam:3"),
-            Some("bb"),
-            true,
-            StartSelectionMode::ByGame,
-            None,
-        ));
-        assert_eq!(state.game_selected, 2);
-        assert_eq!(state.controller_selected, 1);
-        // Resolving the same keys again is a no-op.
-        assert!(!state.resolve_start_selection(
-            Some("steam:3"),
-            Some("bb"),
-            true,
-            StartSelectionMode::ByGame,
-            None,
-        ));
-    }
-
-    #[test]
-    fn resolve_start_selection_miss_falls_back_to_zero() {
-        let mut state = State {
-            rows: vec![game_row_with("steam:1"), game_row_with("steam:2")],
-            controllers: vec![controller_row_with("aa", true)],
-            game_selected: 1,
-            ..Default::default()
-        };
-        // Unknown game key (uninstalled since the service stored it).
-        assert!(state.resolve_start_selection(
-            Some("steam:gone"),
-            None,
-            true,
-            StartSelectionMode::ByGame,
-            None,
-        ));
-        assert_eq!(state.game_selected, 0);
-        assert_eq!(state.controller_selected, 0);
-        // Unknown controller serial.
-        state.controller_selected = 0;
-        state.controllers = vec![
-            controller_row_with("aa", true),
-            controller_row_with("bb", true),
-        ];
-        state.controller_selected = 1;
-        assert!(state.resolve_start_selection(
-            None,
-            Some("zz"),
-            true,
-            StartSelectionMode::ByGame,
-            None,
-        ));
-        assert_eq!(state.controller_selected, 0);
-    }
-
-    #[test]
-    fn resolve_start_selection_none_keys_leave_axes_untouched() {
-        let mut state = State {
-            rows: vec![game_row_with("steam:1"), game_row_with("steam:2")],
-            controllers: vec![
-                controller_row_with("aa", true),
-                controller_row_with("bb", true),
-            ],
-            game_selected: 1,
-            controller_selected: 1,
-            ..Default::default()
-        };
-        assert!(
-            !state.resolve_start_selection(None, None, true, StartSelectionMode::ByGame, None,)
-        );
-        assert_eq!(state.game_selected, 1);
-        assert_eq!(state.controller_selected, 1);
-        // One axis only.
-        assert!(state.resolve_start_selection(
-            Some("steam:1"),
-            None,
-            true,
-            StartSelectionMode::ByGame,
-            None,
-        ));
-        assert_eq!(state.game_selected, 0);
-        assert_eq!(state.controller_selected, 1);
-    }
-
-    #[test]
-    fn resolve_start_selection_empty_lists_stay_zero() {
-        let mut state = State::default();
-        assert!(!state.resolve_start_selection(
-            Some("steam:1"),
-            Some("aa"),
-            true,
-            StartSelectionMode::ByGame,
-            None,
-        ));
-        assert_eq!(state.game_selected, 0);
-        assert_eq!(state.controller_selected, 0);
-    }
-
-    #[test]
-    fn resolve_start_selection_disabled_leaves_game_axis_untouched() {
-        let mut state = State {
-            rows: vec![game_row_with("steam:1"), game_row_with("steam:2")],
-            controllers: vec![
-                controller_row_with("aa", true),
-                controller_row_with("bb", true),
-            ],
-            game_selected: 1,
-            ..Default::default()
-        };
-        // Disabled: game key + index are ignored (clamped index kept)…
-        assert!(!state.resolve_start_selection(
-            Some("steam:1"),
-            None,
-            false,
-            StartSelectionMode::ByGame,
-            Some(0),
-        ));
-        assert_eq!(state.game_selected, 1);
-        // …while the controller axis still resolves (never gated).
-        assert!(state.resolve_start_selection(
-            Some("steam:1"),
-            Some("bb"),
-            false,
-            StartSelectionMode::ByGame,
-            Some(0),
-        ));
-        assert_eq!(state.game_selected, 1);
-        assert_eq!(state.controller_selected, 1);
-    }
-
-    #[test]
-    fn resolve_start_selection_by_position_clamps() {
-        let mut state = State {
-            rows: vec![
-                game_row_with("steam:1"),
-                game_row_with("steam:2"),
-                game_row_with("steam:3"),
-            ],
-            controllers: vec![controller_row_with("aa", true)],
-            ..Default::default()
-        };
-        // Stored index restores directly, ignoring the key.
-        assert!(state.resolve_start_selection(
-            Some("steam:1"),
-            None,
-            true,
-            StartSelectionMode::ByPosition,
-            Some(2),
-        ));
-        assert_eq!(state.game_selected, 2);
-        // Out-of-range index clamps to the last row.
-        state.game_selected = 0;
-        assert!(state.resolve_start_selection(
-            None,
-            None,
-            true,
-            StartSelectionMode::ByPosition,
-            Some(99),
-        ));
-        assert_eq!(state.game_selected, 2);
-        // …while a missing index keeps the clamped position, never 0.
-        state.game_selected = 1;
-        assert!(!state.resolve_start_selection(
-            Some("steam:gone"),
-            None,
-            true,
-            StartSelectionMode::ByPosition,
-            None,
-        ));
-        assert_eq!(state.game_selected, 1);
-    }
-
-    #[test]
-    fn powering_off_clears_only_when_no_connected_row_remains() {
-        let mut state = State {
-            powering_off: Some("aa".into()),
-            ..Default::default()
-        };
-        // Still connected: flag survives rebuilds.
-        state.set_controllers(vec![
-            controller_row_with("aa", true),
-            controller_row_with("bb", true),
-        ]);
-        assert_eq!(state.powering_off.as_ref().map(AsRef::as_ref), Some("aa"));
-        // Gone entirely: cleared.
-        state.set_controllers(vec![controller_row_with("bb", true)]);
-        assert_eq!(state.powering_off, None);
-
-        // Remembered-disconnected rows reuse the serial: still cleared.
-        state.powering_off = Some("aa".into());
-        state.set_controllers(vec![
-            controller_row_with("bb", true),
-            controller_row_with("aa", false),
-        ]);
-        assert_eq!(state.powering_off, None);
     }
 
     #[test]
@@ -5139,10 +4579,6 @@ mod tests {
             reduced_motion: true,
             ..State::default()
         };
-        // Controllers surface: snaps open, no travel anim (stage scale gates to 1 at render).
-        assert!(state.request_dock(true, now));
-        assert!(state.dock_expanded);
-        assert!(state.dock_anim.is_none());
         // Layout transition never starts; a pre-existing one renders settled.
         state.begin_layout_transition(ImmersiveLayout::Vertical, ImmersiveLayout::Horizontal, now);
         assert!(state.layout_transition.is_none());
@@ -5176,15 +4612,17 @@ mod tests {
         assert_eq!(mid.len(), 1);
         assert!(mid[0].exit_x.abs() < 1e-6);
         assert!(mid[0].opacity > 0.0 && mid[0].opacity < 1.0);
-        // Enabling mid-flight settles dock/strip chases to target.
+        // Enabling mid-flight settles strip chases to target.
         let mut moving = State { ..State::default() };
-        assert!(moving.request_dock(true, now));
-        assert!(moving.dock_anim.is_some());
+        moving.strip_anim = Some(StripAnim {
+            from: 0.0,
+            to: 2.0,
+            duration_ms: 220,
+            started: now,
+        });
+        assert!(moving.strip_anim.is_some());
         moving.sync_reduced_motion(true);
         assert!(moving.reduced_motion);
-        assert!(moving.dock_expanded);
-        assert!(moving.dock_anim.is_none());
-        assert!(moving.dock_anim.is_none());
         assert!(moving.strip_anim.is_none());
         assert!(moving.layout_transition.is_none());
         // Disabling never creates or clears chases by itself.
@@ -5272,12 +4710,11 @@ mod tests {
     }
 
     #[test]
-    fn save_guard_owns_hints_over_dock_and_browse() {
+    fn save_guard_owns_hints_over_browse() {
         let mut state = State {
-            dock_expanded: true,
-            ..Default::default()
+            edit_confirm: Some(EditConfirm),
+            ..State::default()
         };
-        state.edit_confirm = Some(EditConfirm);
         assert_eq!(HintPressOwner::current(&state), HintPressOwner::SaveDiscard);
         // Settings and the other dialogs still outrank it.
         state.settings.open = true;
@@ -5363,42 +4800,6 @@ mod tests {
         assert!(!state.layout_transition_active());
         assert!(state.move_selection(1).is_some());
         assert_eq!(state.game_selected, 2);
-    }
-
-    #[test]
-    fn dock_toggle_opens_and_closes() {
-        let now = Instant::now();
-        let mut state = State::default();
-        assert!(state.request_dock(true, now));
-        assert!(state.dock_expanded);
-        assert!(!state.request_dock(true, now));
-        let later = now + Duration::from_millis(DOCK_ANIM_MS + 10);
-        assert!(state.request_dock(false, later));
-        assert!(!state.dock_expanded);
-        assert!(!state.request_dock(false, later));
-    }
-
-    #[test]
-    fn move_selection_follows_controllers_surface() {
-        let mut state = State {
-            rows: vec![test_row("a", false, None), test_row("b", false, None)],
-            controllers: vec![
-                controller_row_with("aa", true),
-                controller_row_with("bb", true),
-            ],
-            ..Default::default()
-        };
-        // Closed: moves games.
-        assert!(state.move_selection(1).is_some());
-        assert_eq!(state.game_selected, 1);
-        assert_eq!(state.controller_selected, 0);
-        // Open: moves controllers (wraps) and leaves games alone.
-        state.dock_expanded = true;
-        assert!(state.move_selection(1).is_some());
-        assert_eq!(state.controller_selected, 1);
-        assert_eq!(state.game_selected, 1);
-        assert!(state.move_selection(1).is_some());
-        assert_eq!(state.controller_selected, 0);
     }
 
     #[test]

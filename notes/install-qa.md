@@ -97,6 +97,21 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
   Browser reports **Managed by Store**, Uninstall is hidden, and Info shows the
   version/size without a local uninstall path.
 
+## Hub layout and pad input
+
+- The hub card has no outer padding: header (DualSense mark + `SDSC Utils`
+  wordmark, **Options** hint + gear on the right), apps row (Start / Browser /
+  Add apps), then a horizontal controllers strip.
+- **Options** toggles hub Settings from the main card (Circle closes). The
+  settings screen absorbs UI sounds, volume, haptics, strength, and the
+  standalone download cap.
+- Up/Down switch focus between the apps and controllers rows; Left/Right move
+  within the focused row. The controllers strip scrolls the selected card into
+  view.
+- Cross (or click) identifies the focused controller; Triangle hold powers off
+  a live Bluetooth pad. These replaced Start's controllers surface, which no
+  longer exists (Create is inert).
+
 ## Environment overrides
 
 | Variable | Read by |

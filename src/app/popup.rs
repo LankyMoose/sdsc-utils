@@ -43,6 +43,12 @@ impl App {
         {
             self.start_state.powering_off = None;
         }
+        self.popup_rows = self.controller_rows(true);
+    }
+
+    /// Build controller cards for the popup and the hub strip. `include_remembered`
+    /// appends remembered-disconnected pads after the live ones.
+    pub(crate) fn controller_rows(&self, include_remembered: bool) -> Vec<ControllerRow> {
         let threshold = self.session.prefs.low_battery_percent;
         let mut rows = Vec::new();
         for controller in &self.session.controllers {
@@ -67,27 +73,29 @@ impl App {
                 eta,
             ));
         }
-        for controller in self
-            .session
-            .known
-            .remembered_disconnected(&self.session.controllers)
-        {
-            let nickname = self
+        if include_remembered {
+            for controller in self
                 .session
                 .known
-                .nickname(controller.serial.as_ref())
-                .map(str::to_string);
-            let eta = if self.session.prefs.analytics_enabled {
-                self.session
-                    .analytics
-                    .eta_play_at(controller.serial.as_ref(), controller.percent)
-                    .map(analytics::format_eta_ring)
-            } else {
-                None
-            };
-            rows.push(ControllerRow::disconnected(controller, nickname, eta));
+                .remembered_disconnected(&self.session.controllers)
+            {
+                let nickname = self
+                    .session
+                    .known
+                    .nickname(controller.serial.as_ref())
+                    .map(str::to_string);
+                let eta = if self.session.prefs.analytics_enabled {
+                    self.session
+                        .analytics
+                        .eta_play_at(controller.serial.as_ref(), controller.percent)
+                        .map(analytics::format_eta_ring)
+                } else {
+                    None
+                };
+                rows.push(ControllerRow::disconnected(controller, nickname, eta));
+            }
         }
-        self.popup_rows = rows;
+        rows
     }
 
     /// Rebuild popup rows and, when the flyout is open, resize/re-anchor if height changed.
@@ -181,7 +189,6 @@ impl App {
             PopupMessage::Identify(serial) => {
                 if self.identify(&serial) {
                     self.popup_state.begin_identify_flash(&serial);
-                    self.start_state.begin_identify_flash(&serial);
                 }
                 Task::none()
             }

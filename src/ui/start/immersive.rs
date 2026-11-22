@@ -1,29 +1,23 @@
 //! Fullscreen console-style presentation of the start screen.
 
-use crate::controller::dualsense::lightbar;
 use crate::persist::prefs::ImmersiveLayout;
-use crate::ui::color::BatterySpectrum;
-use crate::ui::percent_ring;
 use crate::ui::scale::Scale;
 use crate::ui::shader::{AmbientProgram, VignetteProgram};
 use crate::ui::start::chrome::{
-    empty_games_browse_prompt, face_cycle_toggle, footer_hint, immersive_dock_row_hints,
-    immersive_game_hints, immersive_game_membership_label,
+    empty_games_browse_prompt, footer_hint, immersive_game_hints, immersive_game_membership_label,
 };
-use crate::ui::start::face::FaceButton;
-use crate::ui::start::mode::{TransitionPhase, dock_panel_width, dock_stage_dim, dock_stage_scale};
+use crate::ui::start::mode::TransitionPhase;
 use crate::ui::start::overlay;
 use crate::ui::start::row::{game_subtitle_block, update_required_badge};
 use crate::ui::start::settings::{edit_confirm_view, manual_add_view, replace_confirm_view};
 use crate::ui::start::translate::backdrop_art;
 use crate::ui::start::view::{
-    HintPress, HintPressOwner, LaunchStatus, StartControllerRow, StartMessage, StartRow, State,
-    scan_status_chip, scan_status_stack,
+    LaunchStatus, StartMessage, StartRow, State, scan_status_chip, scan_status_stack,
 };
 use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics, StripOrientation};
 use crate::ui::theme;
 use iced::font::Weight;
-use iced::widget::{Float, column, container, keyed_column, row, shader, space, stack, text};
+use iced::widget::{Float, column, container, row, shader, space, stack, text};
 use iced::{Alignment, Element, Fill, Font, Length, Padding, Vector};
 use std::time::Instant;
 
@@ -45,22 +39,9 @@ const REPLACE_CONFIRM_W: f32 = 440.0;
 /// Save-guard dialog width (same compact card as the replace confirm).
 const EDIT_CONFIRM_W: f32 = 440.0;
 
-/// Peek ring size bounds: rings grow as the dock expands.
-const DOCK_RING_INSET: f32 = 6.0;
-const DOCK_RING_MIN: f32 = 52.0;
-const DOCK_RING_MAX: f32 = 68.0;
-/// Peek width is exactly the ring column; expanded fits rows + hints.
-const DOCK_PEEK_W: f32 = DOCK_RING_MAX + DOCK_RING_INSET * 2.0;
-const DOCK_MAX_W: f32 = 560.0;
-const DOCK_ROW_H: f32 = 80.0;
-const DOCK_ROW_GAP: f32 = 8.0;
-/// Trailing hints column reserve (no title shift on select).
-const DOCK_HINT_COL_W: f32 = 210.0;
-
 #[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     state: &'a State,
-    spectrum: &BatterySpectrum,
     now: Instant,
     clock_enabled: bool,
     stage_h: f32,
@@ -69,14 +50,13 @@ pub fn view<'a>(
     immersive_layout: ImmersiveLayout,
     #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
-    let dock_p = state.dock_progress(now);
     let veil = transition_top_veil(state, now);
     let idle_veil = state.idle_dim_amount(now);
     let settings_p = state.settings.progress(now);
     // Any Float under a veil paints above it — flatten stage scale + hint presses.
     let flat = veil > 0.001 || idle_veil > 0.001 || settings_p > 0.001;
     // Chrome stays fully lit; one top veil handles the enter (no per-panel dims).
-    let program = AmbientProgram::new(state.ambient_time, dock_p, 0.0, 1.0);
+    let program = AmbientProgram::new(state.ambient_time, 0.0, 0.0, 1.0);
     let atmosphere = shader(program).width(Fill).height(Fill);
 
     // Debug R3 hide: pure ambient background, no chrome at all (tuning panel
@@ -95,10 +75,9 @@ pub fn view<'a>(
     // The stage always stays mounted: both dialogs (manual form, replace
     // confirm) are wash + card overlays layered further below, sharing the
     // overlay builder, so the games strip stays visible behind them.
-    let body: Element<'_, StartMessage> = stage_with_dock(
+    let body: Element<'_, StartMessage> = stage_view(
         state,
         now,
-        dock_p,
         flat,
         stage_h,
         stage_w,
@@ -118,7 +97,7 @@ pub fn view<'a>(
         })
         .style(theme::immersive_footer_pill);
 
-    // Full-bleed stage + dock; footer hints overlay the bottom. Under the
+    // Full-bleed stage; footer hints overlay the bottom. Under the
     // replace-confirm modal the island keeps its (inert) browse hints —
     // `footer_hint` has no modal arm, and ownership forces idle press
     // visuals — while the card owns the only live Proceed/Cancel row.
@@ -220,51 +199,13 @@ pub fn view<'a>(
     let base = stack![atmosphere, chrome].width(Fill).height(Fill);
 
     let mut layers: Vec<Element<'_, StartMessage>> = vec![base.into()];
-    // Surface-open dim + dock below the drawer: the drawer and its scrim
-    // stay on top of the island. Always pushed so the drawer never shifts
-    // tree position and loses scroll.
-    // While the drawer travels in over an open dock, the island slides off
-    // the right edge on the drawer's eased travel clock (`Float` offsets
-    // paint without touching layout, so nothing reflows; user input keeps
-    // the two exclusive, so this only runs on the restore path).
-    // Dialogs keep the stage + dock mounted behind their dims so they read
-    // as overlays, not screen swaps.
-    {
-        let dock_dim = dock_stage_dim(dock_p);
-        if dock_dim > 0.01 {
-            layers.push(
-                container(space())
-                    .width(Fill)
-                    .height(Fill)
-                    .style(theme::immersive_dim(dock_dim))
-                    .into(),
-            );
-        } else {
-            layers.push(
-                space()
-                    .width(Length::Fixed(0.0))
-                    .height(Length::Fixed(0.0))
-                    .into(),
-            );
-        }
-        layers.push(
-            Float::new(dock_overlay(
-                state,
-                spectrum,
-                dock_p,
-                flat,
-                #[cfg(debug_assertions)]
-                debug_bounds,
-            ))
-            .translate(move |_, _| Vector::new(settings_p * (DOCK_MAX_W + EDGE_PAD), 0.0))
-            .into(),
-        );
-    }
+    // Dialogs keep the stage mounted behind their dims so they read as
+    // overlays, not screen swaps.
     // Dialog overlays (manual form, replace confirm, save guard on top):
     // shared wash + card over the live stage, with a wash-fade + centered
     // 0→1 scale enter/exit tween. Layout always reserves the full-size card
     // (see `ui::scale`), so nothing reflows; the wrapper never changes
-    // shape mid-tween (no remount flash). Above dock/chrome, below
+    // shape mid-tween (no remount flash). Above chrome, below
     // drawer/tuning/idle/ceremony. Clicks never reach the dimmed stage:
     // replace/manual washes dismiss (same as Cancel), the save-guard wash
     // and a second Cancel back out to edit — only Cross confirms the
@@ -317,11 +258,10 @@ pub fn view<'a>(
             ep,
         )));
     }
-    // Dock slide-out: while the drawer travels in over an open dock, slide
-    // the island off the right edge on the drawer's eased travel clock.
-    // (User input keeps the two exclusive — this only runs on the restore
-    // path.) `Float` offsets paint without touching layout, so nothing
-    // reflows; the slide clears the full dock width plus its edge inset.
+    // Settings drawer slide-out: while the drawer travels in, the island
+    // slides off the right edge on the drawer's eased travel clock.
+    // `Float` offsets paint without touching layout, so nothing reflows; the
+    // slide clears the full drawer width plus its edge inset.
     if state.settings.visible(now) {
         layers.push(crate::ui::start::settings::immersive_drawer(
             state,
@@ -401,7 +341,7 @@ fn stage_backdrop_layers<'a>(state: &'a State, now: Instant) -> Vec<Element<'a, 
     }
 
     // Soft rectangular edge vignette over atmosphere/splash only — games strip,
-    // dock, footer, settings, and status chips paint above this stack.
+    // footer, settings, and status chips paint above this stack.
     layers.push(
         shader(VignetteProgram::new(0.55))
             .width(Fill)
@@ -425,19 +365,18 @@ fn backdrop_layer(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stage_with_dock<'a>(
+fn stage_view<'a>(
     state: &'a State,
     now: Instant,
-    dock_p: f32,
     flat: bool,
     stage_h: f32,
     stage_w: f32,
     immersive_layout: ImmersiveLayout,
     #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, StartMessage> {
-    let scale = crate::ui::motion::movement_scale(dock_stage_scale(dock_p), state.reduced_motion);
+    let scale = crate::ui::motion::movement_scale(1.0, state.reduced_motion);
 
-    // Backdrop lives in the games stage (scales with dock), not the full window.
+    // Backdrop lives in the games stage, not the full window.
     // A layout change slides the old orientation out along its scroll axis
     // while fading it; the orientation swaps at the midpoint, then the new one
     // slides in from the opposite side while fading back in.
@@ -464,8 +403,8 @@ fn stage_with_dock<'a>(
             games_stage(state, now, stage_h, stage_w, list_op, transition_layout);
         #[cfg(debug_assertions)]
         let strip = crate::ui::debug_bounds::wrap(strip, debug_bounds);
-        // Float paints above veils — skip the slide while flattening (same as
-        // the dock scale); sub-pixel offsets skip the extra layer. No scale
+        // Float paints above veils — skip the slide while flattening;
+        // sub-pixel offsets skip the extra layer. No scale
         // punch: the directional travel carries the motion.
         let strip: Element<'_, StartMessage> = if !flat
             && (transition_dx.abs() >= 0.5 || transition_dy.abs() >= 0.5)
@@ -507,41 +446,6 @@ fn stage_with_dock<'a>(
     let layers: Vec<Element<'_, StartMessage>> = vec![scaled_stage];
 
     stack(layers).width(Fill).height(Fill).into()
-}
-
-/// Top-right controllers dock overlay (above the surface-open dim, which is
-/// layered in `view`). Carries its own filter-toggle footer while open.
-fn dock_overlay<'a>(
-    state: &'a State,
-    spectrum: &BatterySpectrum,
-    dock_p: f32,
-    flat: bool,
-    #[cfg(debug_assertions)] debug_bounds: bool,
-) -> Element<'a, StartMessage> {
-    let dock = controllers_dock_host(state, spectrum, dock_p, flat);
-    #[cfg(debug_assertions)]
-    let dock: Element<'_, StartMessage> = crate::ui::debug_bounds::wrap_fixed(dock, debug_bounds);
-    // Filter footer lives inside the dock glass now (see host).
-    // Top-right floating island — same inset as footer (EDGE_PAD / 10).
-    // (The filter footer lives inside the dock glass, not here.)
-    let dock_overlay: Element<'_, StartMessage> = row![
-        space().width(Fill),
-        column![dock, space().height(Fill),]
-            .height(Fill)
-            .padding(Padding {
-                top: 10.0,
-                right: EDGE_PAD,
-                bottom: 0.0,
-                left: 0.0,
-            }),
-    ]
-    .width(Fill)
-    .height(Fill)
-    .into();
-    #[cfg(debug_assertions)]
-    let dock_overlay: Element<'_, StartMessage> =
-        crate::ui::debug_bounds::wrap(dock_overlay, debug_bounds);
-    dock_overlay
 }
 
 fn games_stage(
@@ -1176,303 +1080,4 @@ fn strip_capsule<'a>(
     } else {
         container(art).width(Fill).height(Fill).style(frame).into()
     }
-}
-
-/// Controllers dock: peek ring column collapsed, full rows expanded.
-/// [`width_reveal`](crate::ui::reveal::width_reveal) scissors peek→expanded
-/// so the ring column never desyncs. Selection highlights while the surface
-/// is open (Create toggles; no slide system on this shell).
-fn controllers_dock_host<'a>(
-    state: &'a State,
-    spectrum: &BatterySpectrum,
-    dock_progress: f32,
-    flat: bool,
-) -> Element<'a, StartMessage> {
-    let t = dock_progress.clamp(0.0, 1.0);
-    let row_h = dock_row_h(dock_progress);
-    // Reveal only the list — peek width is exactly the ring column.
-    let visible_w = dock_panel_width(dock_progress, DOCK_PEEK_W, DOCK_MAX_W);
-    let details_w = DOCK_MAX_W - DOCK_PEEK_W;
-
-    // Island pad stays at the peek inset (concentric with rings) through expand.
-    let pad = dock_peek_inset();
-    let pad_y = pad;
-    // Side pad only while expanded (peek stays flush so reveal width == ring column).
-    let pad_x = pad * t;
-    // Peek gap matches island pad; expanded uses the list gap.
-    let row_gap = pad + (DOCK_ROW_GAP - pad) * t;
-    // Peek: concentric with rings (radius = peek_w/2). Expand: pad + row radius so corners nest.
-    let peek_radius = DOCK_PEEK_W * 0.5;
-    let expanded_island = pad + theme::IMMERSIVE_DOCK_ROW_RADIUS;
-    let island_radius = peek_radius + (expanded_island - peek_radius) * t;
-    // Nested rounded-rect: inner = outer − pad (never the same as the island).
-    let row_radius = (island_radius - pad).max(0.0);
-
-    let list: Element<'_, StartMessage> = if state.controllers.is_empty() {
-        column![dock_empty_row(details_w, row_h)]
-            .spacing(row_gap)
-            .width(Length::Fixed(DOCK_MAX_W))
-            .into()
-    } else {
-        keyed_column(state.controllers.iter().enumerate().map(|(i, row)| {
-            let selected = i == state.controller_selected && state.dock_expanded;
-            (
-                dock_row_key(row.serial.as_ref()),
-                dock_controller_row(
-                    row,
-                    spectrum,
-                    selected,
-                    state.ring_flash_white(&row.serial),
-                    details_w,
-                    dock_progress,
-                    row_h,
-                    row_radius,
-                    state,
-                ),
-            )
-        }))
-        .spacing(row_gap)
-        .width(Length::Fixed(DOCK_MAX_W))
-        .into()
-    };
-
-    // Filter footer lives inside the glass and rides the same width reveal
-    // as the rows, so open/shrink travel never desyncs (a separate footer
-    // below the host keeps its hug width while the host narrows — jitter).
-    // Appears over the latter part of expand, like the ETA labels.
-    let reveal_t = dock_eta_reveal(dock_progress);
-    let footer: Element<'_, StartMessage> = if reveal_t > 0.001 {
-        let press = HintPress::for_owner(state, HintPressOwner::Dock);
-        let bar = face_cycle_toggle(
-            FaceButton::Square,
-            press.held,
-            press.press_anim,
-            &[
-                ("Connected", !state.show_all_controllers),
-                ("All", state.show_all_controllers),
-            ],
-            flat,
-        );
-        crate::ui::reveal::height_reveal(bar, 32.0, 32.0 * reveal_t)
-            .width(Fill)
-            .into()
-    } else {
-        space()
-            .width(Length::Fixed(0.0))
-            .height(Length::Fixed(0.0))
-            .into()
-    };
-
-    let full = container(
-        column![list, footer]
-            .spacing(if reveal_t > 0.001 { 8.0 } else { 0.0 })
-            .width(Length::Fixed(DOCK_MAX_W)),
-    )
-    .padding(Padding {
-        top: pad_y,
-        right: 0.0,
-        bottom: pad_y,
-        left: 0.0,
-    })
-    .width(Length::Fixed(DOCK_MAX_W));
-
-    // Shrink so the floating island sizes to its rows (Fill collapses to 0 off a Fill parent).
-    let revealed =
-        crate::ui::reveal::width_reveal(full, DOCK_MAX_W, visible_w).height(Length::Shrink);
-
-    container(revealed)
-        .padding(Padding {
-            top: 0.0,
-            right: pad_x,
-            bottom: 0.0,
-            left: pad_x,
-        })
-        .style(theme::immersive_island_radius(island_radius))
-        .clip(true)
-        .into()
-}
-
-/// Stable per-build key for a dock row (keyed column identity).
-fn dock_row_key(serial: &str) -> u64 {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    serial.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn dock_empty_row<'a>(details_w: f32, row_h: f32) -> Element<'a, StartMessage> {
-    container(
-        row![
-            container(text("—").size(13.0).color(theme::DIM))
-                .width(Length::Fixed(DOCK_PEEK_W))
-                .height(Length::Fixed(row_h))
-                .center_x(Fill)
-                .center_y(Fill),
-            container(text("No controllers").size(13.0).color(theme::DIM))
-                .width(Length::Fixed(details_w))
-                .height(Length::Fixed(row_h))
-                .center_y(Fill)
-                .padding(Padding {
-                    top: 0.0,
-                    right: 16.0,
-                    bottom: 0.0,
-                    left: 4.0,
-                }),
-        ]
-        .width(Length::Fixed(DOCK_MAX_W))
-        .height(Length::Fixed(row_h))
-        .align_y(Alignment::Center),
-    )
-    .width(Length::Fixed(DOCK_MAX_W))
-    .height(Length::Fixed(row_h))
-    .clip(true)
-    .into()
-}
-
-fn dock_ring_size(dock_progress: f32) -> f32 {
-    let t = dock_progress.clamp(0.0, 1.0);
-    DOCK_RING_MIN + (DOCK_RING_MAX - DOCK_RING_MIN) * t
-}
-
-/// Horizontal inset from peek column edge to the peek-sized ring (== island pad / row gap).
-fn dock_peek_inset() -> f32 {
-    (DOCK_PEEK_W - DOCK_RING_MIN).max(0.0) * 0.5
-}
-
-/// Peek rows hug the ring; expanded rows grow for title + meta.
-fn dock_row_h(dock_progress: f32) -> f32 {
-    let t = dock_progress.clamp(0.0, 1.0);
-    let ring = dock_ring_size(dock_progress);
-    ring + (DOCK_ROW_H - ring) * t
-}
-
-/// ETA stays hidden in peek; fades in through the latter part of expand.
-fn dock_eta_reveal(dock_progress: f32) -> f32 {
-    ((dock_progress.clamp(0.0, 1.0) - 0.2) / 0.8).clamp(0.0, 1.0)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn dock_controller_row<'a>(
-    row: &'a StartControllerRow,
-    spectrum: &BatterySpectrum,
-    selected: bool,
-    flash_white: bool,
-    details_w: f32,
-    dock_progress: f32,
-    row_h: f32,
-    row_radius: f32,
-    state: &State,
-) -> Element<'a, StartMessage> {
-    let powering_off = row.connected
-        && state
-            .powering_off
-            .as_ref()
-            .is_some_and(|s| s == &row.serial);
-    let ring_color = if flash_white {
-        theme::from_rgb(lightbar::IDENTIFY_FLASH)
-    } else if row.connected && !powering_off {
-        theme::from_rgb(spectrum.color_at_percent(row.percent))
-    } else {
-        theme::DIM
-    };
-    let ring = percent_ring::percent_ring(
-        row.percent,
-        ring_color,
-        dock_ring_size(dock_progress),
-        row.eta.clone(),
-        dock_eta_reveal(dock_progress),
-        1.0,
-    );
-    let ring_cell = container(ring)
-        .width(Length::Fixed(DOCK_PEEK_W))
-        .height(Length::Fixed(row_h))
-        .center_x(Fill)
-        .center_y(Fill);
-
-    let title_color = if row.connected && !powering_off {
-        theme::INK
-    } else {
-        theme::MUTED
-    };
-    let meta = if powering_off {
-        theme::MUTED
-    } else if row.low {
-        theme::WARNING
-    } else {
-        theme::MUTED
-    };
-    let meta_text = if powering_off {
-        "Powering off".to_string()
-    } else {
-        format!("{} · {}", row.connection, row.state)
-    };
-    let titles = column![
-        text(&row.title).size(18.0).color(title_color).font(Font {
-            weight: if selected {
-                Weight::Bold
-            } else {
-                Weight::Normal
-            },
-            ..Font::DEFAULT
-        }),
-        text(meta_text).size(13.0).color(meta),
-    ]
-    .spacing(3)
-    .width(Fill);
-
-    // Inline hints; always reserve trailing width so select does not shift titles.
-    let hints: Element<'_, StartMessage> =
-        if let Some(hints) = immersive_dock_row_hints(row, state, selected) {
-            container(hints)
-                .width(Length::Fixed(DOCK_HINT_COL_W))
-                .height(Length::Fixed(row_h))
-                .center_y(Fill)
-                .align_x(Alignment::End)
-                .clip(true)
-                .into()
-        } else {
-            space()
-                .width(Length::Fixed(DOCK_HINT_COL_W))
-                .height(Length::Fixed(row_h))
-                .into()
-        };
-
-    let pad_l = 4.0;
-    let pad_r = 16.0;
-    let gap = 8.0;
-    let inner_w = (details_w - pad_l - pad_r).max(DOCK_HINT_COL_W + 80.0);
-    let titles_w = (inner_w - DOCK_HINT_COL_W - gap).max(80.0);
-    let details_cell = container(
-        row![
-            container(titles)
-                .width(Length::Fixed(titles_w))
-                .height(Length::Fixed(row_h))
-                .center_y(Fill),
-            hints,
-        ]
-        .spacing(gap)
-        .width(Length::Fixed(inner_w))
-        .height(Length::Fixed(row_h))
-        .align_y(Alignment::Center),
-    )
-    .width(Length::Fixed(details_w))
-    .height(Length::Fixed(row_h))
-    .padding(Padding {
-        top: 0.0,
-        right: pad_r,
-        bottom: 0.0,
-        left: pad_l,
-    });
-
-    container(
-        row![ring_cell, details_cell]
-            .width(Length::Fixed(DOCK_MAX_W))
-            .height(Length::Fixed(row_h))
-            .align_y(Alignment::Center),
-    )
-    .width(Length::Fixed(DOCK_MAX_W))
-    .height(Length::Fixed(row_h))
-    .clip(true)
-    .style(theme::immersive_dock_row_surface(selected, row_radius))
-    .into()
 }

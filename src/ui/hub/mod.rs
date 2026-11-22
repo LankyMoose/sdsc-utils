@@ -10,6 +10,9 @@
 //! a large glyph plus a title (no subtitles); the Browser tile stays visible
 //! when its engine is missing and opens the icon-only install catalog.
 
+use crate::controller::dualsense::lightbar;
+use crate::controller::model::Serial;
+use crate::ui::popup::ControllerRow;
 use crate::ui::svg_icon;
 use crate::ui::text_fit;
 use crate::ui::theme;
@@ -23,13 +26,22 @@ use std::time::Instant;
 /// Nominal hub card width/height. The card is centered in the full-monitor
 /// window; `HUB_HEIGHT` is only the pre-open stage default.
 pub const HUB_WIDTH: f32 = 620.0;
-pub const HUB_HEIGHT: f32 = 220.0;
+pub const HUB_HEIGHT: f32 = 280.0;
 
-const TILE_H: f32 = 112.0;
-const TILE_GAP: f32 = 8.0;
-const ICON: f32 = 44.0;
+/// Main hub section inset (the card itself has no padding).
+const SECTION_PAD_X: f32 = 12.0;
+const SECTION_PAD_Y: f32 = 8.0;
+const TILE_H: f32 = 96.0;
+const TILE_GAP: f32 = 6.0;
+const ICON: f32 = 30.0;
+const TILE_TITLE: f32 = 14.0;
 const APP_TILE_H: f32 = 128.0;
 const APP_ICON: f32 = 48.0;
+/// Controller strip card metrics (fixed width; horizontal scroll).
+pub const CONTROLLER_CARD_W: f32 = 182.0;
+pub const CONTROLLER_CARD_H: f32 = 84.0;
+const CONTROLLER_GAP: f32 = 6.0;
+const CONTROLLER_RING: f32 = 46.0;
 
 /// Stable tile identity. The order in [`TILES`] is the render/selection
 /// order; message handlers match on identity, never on an index captured in
@@ -39,25 +51,32 @@ pub enum HubTile {
     Start,
     Browser,
     AddApps,
-    Settings,
 }
 
 /// Visible tiles, left to right.
-pub const TILES: [HubTile; 4] = [
-    HubTile::Start,
-    HubTile::Browser,
-    HubTile::AddApps,
-    HubTile::Settings,
-];
+pub const TILES: [HubTile; 3] = [HubTile::Start, HubTile::Browser, HubTile::AddApps];
+
+/// Which row owns the pad highlight on the main hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HubFocus {
+    #[default]
+    Apps,
+    Controllers,
+}
 
 /// What the hub asks the shell to do. Pure data; the App owns windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HubMessage {
-    Move(i32),
+    /// Move within the focused row.
+    MoveX(i32),
+    /// Switch focus between the apps and controllers rows.
+    MoveY(i32),
     /// Open the apps management screen.
     AppsOpen,
     /// Back out of the apps screen.
     AppsClose,
+    /// Open/close the hub shell settings screen (Options).
+    SettingsToggle,
     /// Open the hub shell settings screen.
     SettingsOpen,
     SettingsClose,
@@ -69,6 +88,12 @@ pub enum HubMessage {
     SettingsRow(usize),
     /// Mouse click: select and activate a hub tile in one step.
     Activate(usize),
+    /// Mouse click on a controller card: focus it and identify the pad.
+    IdentifyController(usize),
+    /// Identify the focused controller (Cross).
+    IdentifySelected,
+    /// Triangle hold completed on the focused Bluetooth pad.
+    PowerOff,
     /// Open the per-app action menu (tile X / Cross on an app).
     AppsMenuOpen(usize),
     AppsMenuMove(i32),
@@ -213,11 +238,20 @@ pub const SETTINGS_ROWS: [&str; 6] = [
     "Back",
 ];
 
+/// Active Identify ring flash for one controller card.
+#[derive(Debug, Clone)]
+struct IdentifyFlash {
+    serial: Serial,
+    started: Instant,
+}
+
 /// Hub render/input state. Selection is an index into [`TILES`]; activation
 /// resolves it through [`State::selected_tile`].
 #[derive(Debug)]
 pub struct State {
     selected: usize,
+    /// Which main row (apps / controllers) owns the pad highlight.
+    pub focus: HubFocus,
     /// Whether the Start tile is enabled in prefs. Disabled tiles still show
     /// (stable layout) but Confirm is a no-op.
     pub start_enabled: bool,
@@ -225,9 +259,21 @@ pub struct State {
     pub engine_ready: bool,
     /// D-pad/stick repeat for hub movement.
     nav: crate::domain::pad::NavStepper,
-    /// Face-button rising-edge latches (Cross confirm, Circle close).
+    /// Face-button rising-edge latches (Cross confirm, Circle close, Options).
     pub prev_cross: bool,
     pub prev_circle: bool,
+    pub prev_options: bool,
+    /// Triangle hold tracker (power off on the focused Bluetooth controller).
+    triangle_hold: crate::domain::pad::HoldTracker,
+    pub triangle_progress: f32,
+    /// Connected/remembered controller cards for the horizontal strip.
+    pub controllers: Vec<ControllerRow>,
+    /// Controller card under the focus ring.
+    pub controller_focus: usize,
+    /// Controller serial currently being powered off (feature report sent).
+    pub powering_off: Option<Serial>,
+    /// Ring flash started with the last successful Identify.
+    identify_flash: Option<IdentifyFlash>,
     /// Apps management screen replaces the tile row while open.
     pub apps_open: bool,
     /// App entry under the focus ring.
@@ -277,11 +323,19 @@ impl Default for State {
     fn default() -> Self {
         Self {
             selected: 0,
+            focus: HubFocus::Apps,
             start_enabled: true,
             engine_ready: false,
             nav: crate::domain::pad::NavStepper::default(),
             prev_cross: false,
             prev_circle: false,
+            prev_options: false,
+            triangle_hold: crate::domain::pad::HoldTracker::default(),
+            triangle_progress: 0.0,
+            controllers: Vec::new(),
+            controller_focus: 0,
+            powering_off: None,
+            identify_flash: None,
             apps_open: false,
             apps_focus: 0,
             apps_menu: None,
@@ -323,8 +377,7 @@ impl State {
         TILES[self.selected()]
     }
 
-    /// Move the highlight, wrapping. Vertical input is treated like the
-    /// matching horizontal direction — the hub is one row.
+    /// Move the app highlight, wrapping.
     pub fn move_selection(&mut self, delta: i32) {
         if delta == 0 {
             return;
@@ -334,16 +387,126 @@ impl State {
         self.selected = next as usize;
     }
 
+    /// Move within the focused row.
+    pub fn move_across(&mut self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+        match self.focus {
+            HubFocus::Apps => self.move_selection(delta),
+            HubFocus::Controllers => {
+                if self.controllers.is_empty() {
+                    return;
+                }
+                let len = self.controllers.len() as i32;
+                self.controller_focus =
+                    (self.controller_focus as i32 + delta).rem_euclid(len) as usize;
+                self.reset_triangle_hold();
+            }
+        }
+    }
+
+    /// Switch focus between the apps row and the controllers row. Directional:
+    /// Down enters the controllers strip, Up leaves it; the controllers row is
+    /// skipped while empty (no dead focus).
+    pub fn move_row(&mut self, delta: i32) {
+        match (self.focus, delta.signum()) {
+            (HubFocus::Apps, 1) if !self.controllers.is_empty() => {
+                self.focus = HubFocus::Controllers;
+                self.reset_triangle_hold();
+            }
+            (HubFocus::Controllers, -1) => {
+                self.focus = HubFocus::Apps;
+                self.reset_triangle_hold();
+            }
+            _ => {}
+        }
+    }
+
     pub fn select(&mut self, index: usize) {
         if index < TILES.len() {
             self.selected = index;
+            self.focus = HubFocus::Apps;
         }
+    }
+
+    pub fn select_controller(&mut self, index: usize) {
+        if index < self.controllers.len() {
+            self.controller_focus = index;
+            self.focus = HubFocus::Controllers;
+            self.reset_triangle_hold();
+        }
+    }
+
+    /// Focused controller card (clamped).
+    pub fn controller_selected(&self) -> Option<&ControllerRow> {
+        if self.controllers.is_empty() {
+            return None;
+        }
+        self.controllers
+            .get(self.controller_focus.min(self.controllers.len() - 1))
+    }
+
+    /// Install/refresh the controller strip rows. Keeps focus valid and clears
+    /// a power-off marker once the pad has left the list.
+    pub fn set_controllers(&mut self, controllers: Vec<ControllerRow>) {
+        self.controllers = controllers;
+        if self.controllers.is_empty() {
+            self.controller_focus = 0;
+            self.focus = HubFocus::Apps;
+        } else if self.controller_focus >= self.controllers.len() {
+            self.controller_focus = self.controllers.len() - 1;
+        }
+        if self
+            .powering_off
+            .as_ref()
+            .is_some_and(|s| !self.controllers.iter().any(|row| row.serial == *s))
+        {
+            self.powering_off = None;
+        }
+    }
+
+    fn reset_triangle_hold(&mut self) {
+        self.triangle_hold.reset();
+        self.triangle_progress = 0.0;
+    }
+
+    /// Start the UI ring flash that mirrors the lightbar Identify pattern.
+    pub fn begin_identify_flash(&mut self, serial: &Serial) {
+        self.identify_flash = Some(IdentifyFlash {
+            serial: serial.clone(),
+            started: Instant::now(),
+        });
+    }
+
+    /// True while a ring Identify flash still has frames to draw.
+    pub fn identify_flash_active(&self) -> bool {
+        self.identify_flash.as_ref().is_some_and(|flash| {
+            lightbar::identify_flash_is_white(flash.started, Instant::now()).is_some()
+        })
+    }
+
+    /// Drop finished flash state; call from the frame subscription.
+    pub fn tick_identify_flash(&mut self) {
+        let finished = self.identify_flash.as_ref().is_some_and(|flash| {
+            lightbar::identify_flash_is_white(flash.started, Instant::now()).is_none()
+        });
+        if finished {
+            self.identify_flash = None;
+        }
+    }
+
+    fn ring_flash_white(&self, serial: &Serial) -> bool {
+        self.identify_flash.as_ref().is_some_and(|flash| {
+            flash.serial == *serial
+                && lightbar::identify_flash_is_white(flash.started, Instant::now()) == Some(true)
+        })
     }
 
     pub fn tile_enabled(&self, tile: HubTile) -> bool {
         match tile {
             HubTile::Start => self.start_enabled,
-            HubTile::Browser | HubTile::AddApps | HubTile::Settings => true,
+            HubTile::Browser | HubTile::AddApps => true,
         }
     }
 
@@ -355,6 +518,12 @@ impl State {
         self.nav = crate::domain::pad::NavStepper::default();
         self.prev_cross = false;
         self.prev_circle = false;
+        self.prev_options = false;
+        self.focus = HubFocus::Apps;
+        self.controller_focus = 0;
+        self.powering_off = None;
+        self.identify_flash = None;
+        self.reset_triangle_hold();
         self.apps_open = false;
         self.apps_menu = None;
         self.apps_info = None;
@@ -656,56 +825,408 @@ impl State {
         sample: &crate::domain::pad::PadSample,
         now: Instant,
     ) -> Option<HubMessage> {
+        use crate::domain::pad::NavAction;
         let mut message = None;
-        if let Some(action) = self.nav.update(sample, now, true, true) {
+        let nav = self.nav.update(sample, now, true, true);
+        if let Some(action) = nav {
             message = match action {
-                crate::domain::pad::NavAction::Left | crate::domain::pad::NavAction::Up => {
-                    Some(HubMessage::Move(-1))
-                }
-                crate::domain::pad::NavAction::Right | crate::domain::pad::NavAction::Down => {
-                    Some(HubMessage::Move(1))
-                }
+                NavAction::Left => Some(HubMessage::MoveX(-1)),
+                NavAction::Right => Some(HubMessage::MoveX(1)),
+                NavAction::Up => Some(HubMessage::MoveY(-1)),
+                NavAction::Down => Some(HubMessage::MoveY(1)),
                 _ => None,
             };
         }
+        // Triangle hold powers off the focused Bluetooth pad; movement or a
+        // foreign press cancels it (same discipline as Start's dock row).
+        let can_power = self.focus == HubFocus::Controllers
+            && self.controller_selected().is_some_and(|row| {
+                row.show_power_off() && self.powering_off.as_ref() != Some(&row.serial)
+            });
+        let foreign =
+            sample.cross || sample.circle || sample.square || sample.options || sample.create;
+        if self.triangle_hold.is_active() && (nav.is_some() || foreign) {
+            self.reset_triangle_hold();
+        }
+        let (progress, completed) = self.triangle_hold.update(sample.triangle && can_power, now);
+        self.triangle_progress = progress;
+        if completed && can_power {
+            message = Some(HubMessage::PowerOff);
+        }
+
         if sample.cross && !self.prev_cross {
             message = Some(HubMessage::Confirm);
         } else if sample.circle && !self.prev_circle {
             message = Some(HubMessage::Close);
+        } else if sample.options && !self.prev_options {
+            message = Some(HubMessage::SettingsToggle);
         }
         self.prev_cross = sample.cross;
         self.prev_circle = sample.circle;
+        self.prev_options = sample.options;
         message
     }
 }
 
 /// Render the hub card. The window root is transparent; the card is the only
-/// opaque surface.
-pub fn view(
-    state: &State,
+/// opaque surface. `spectrum` colors the controller battery rings.
+pub fn view<'a>(
+    state: &'a State,
+    spectrum: &crate::domain::color::BatterySpectrum,
     stage_w: f32,
     _stage_h: f32,
     backdrop_alpha: f32,
-) -> Element<'_, HubMessage> {
+) -> Element<'a, HubMessage> {
     if state.settings_open {
         return settings_view(state, stage_w, backdrop_alpha);
     }
     if state.apps_open {
         return apps_view(state, stage_w, _stage_h, backdrop_alpha);
     }
-    let card_w = (stage_w - 32.0).clamp(340.0, HUB_WIDTH - 24.0);
-    let inner_w = card_w - 24.0;
+    let card_w = hub_card_width(stage_w);
+    let inner_w = (card_w - 2.0 * SECTION_PAD_X).max(1.0);
+    let content = column![
+        container(hub_header(inner_w))
+            .padding([8.0, SECTION_PAD_X])
+            .width(Length::Fixed(card_w)),
+        section_separator(card_w),
+        container(apps_row(state, inner_w))
+            .padding([SECTION_PAD_Y, SECTION_PAD_X])
+            .width(Length::Fixed(card_w)),
+        section_separator(card_w),
+        container(controllers_row(state, spectrum, inner_w))
+            .padding([SECTION_PAD_Y, SECTION_PAD_X])
+            .width(Length::Fixed(card_w)),
+    ]
+    .spacing(0);
+    let card = container(content)
+        .padding(0)
+        .width(Length::Fixed(card_w))
+        .style(card_style);
+    frame(card.into(), backdrop_alpha)
+}
+
+/// Hub card width for a monitor stage (also used for controller scroll math).
+pub fn hub_card_width(stage_w: f32) -> f32 {
+    (stage_w - 32.0).clamp(340.0, HUB_WIDTH - 24.0)
+}
+
+/// Widget id for the horizontal controller strip.
+pub fn controllers_scroll_id() -> iced::widget::Id {
+    iced::widget::Id::new("hub-controllers")
+}
+
+/// Horizontal scroll target that centers controller card `index`.
+pub fn controller_scroll_x(index: usize, stage_w: f32) -> f32 {
+    let card_w = hub_card_width(stage_w);
+    let viewport = (card_w - 2.0 * SECTION_PAD_X).max(1.0);
+    let x = index as f32 * (CONTROLLER_CARD_W + CONTROLLER_GAP);
+    (x - (viewport - CONTROLLER_CARD_W).max(0.0) * 0.5).max(0.0)
+}
+
+fn section_separator<'a>(width: f32) -> Element<'a, HubMessage> {
+    container(space())
+        .width(Length::Fixed(width))
+        .height(Length::Fixed(1.0))
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(theme::alpha(theme::INK, 0.06))),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// Branding + Options hint header row.
+fn hub_header<'a>(width: f32) -> Element<'a, HubMessage> {
+    let brand = row![
+        svg(svg::Handle::from_memory(svg_icon::DUALSENSE_SVG.as_bytes()))
+            .width(Length::Fixed(24.0))
+            .height(Length::Fixed(24.0))
+            .style(|_theme, _status| svg::Style {
+                color: Some(theme::ACCENT)
+            }),
+        text("SDSC Utils")
+            .size(15.0)
+            .font(iced::Font {
+                weight: iced::font::Weight::Semibold,
+                ..iced::Font::default()
+            })
+            .color(theme::INK),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let settings_hint = button(
+        row![
+            text("Options")
+                .size(theme::type_scale::CAPTION)
+                .color(theme::MUTED),
+            svg(svg::Handle::from_memory(svg_icon::SETTINGS_SVG.as_bytes()))
+                .width(Length::Fixed(14.0))
+                .height(Length::Fixed(14.0))
+                .style(|_theme, _status| svg::Style {
+                    color: Some(theme::MUTED)
+                }),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .padding([4, 8])
+    .style(options_pill_style)
+    .on_press(HubMessage::SettingsOpen);
+    row![brand, space().width(Fill), settings_hint]
+        .width(Length::Fixed(width))
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// Start / Browser / Add apps tiles.
+fn apps_row<'a>(state: &State, inner_w: f32) -> Element<'a, HubMessage> {
     let gaps = (TILES.len().saturating_sub(1)) as f32 * TILE_GAP;
-    let tile_w = ((inner_w - gaps) / TILES.len() as f32).max(96.0);
+    let tile_w = ((inner_w - gaps) / TILES.len() as f32).max(80.0);
     let mut tiles = row![].spacing(TILE_GAP).align_y(Alignment::Center);
     for (i, tile) in TILES.into_iter().enumerate() {
         tiles = tiles.push(tile_button(state, tile, i, tile_w));
     }
-    let card = container(tiles)
-        .padding(12)
-        .width(Length::Fixed(card_w))
-        .style(card_style);
-    frame(card.into(), backdrop_alpha)
+    tiles.width(Length::Fixed(inner_w)).into()
+}
+
+/// Horizontal, scrollable controller cards.
+fn controllers_row<'a>(
+    state: &'a State,
+    spectrum: &crate::domain::color::BatterySpectrum,
+    inner_w: f32,
+) -> Element<'a, HubMessage> {
+    let focused = state.focus == HubFocus::Controllers;
+    let label = row![
+        text("Controllers")
+            .size(theme::type_scale::CAPTION)
+            .color(if focused { theme::INK } else { theme::MUTED }),
+        space().width(Fill),
+        text(format!("{}", state.controllers.len()))
+            .size(theme::type_scale::CAPTION)
+            .color(theme::DIM),
+    ]
+    .width(Length::Fixed(inner_w));
+    let strip: Element<'a, HubMessage> = if state.controllers.is_empty() {
+        container(
+            text("No controllers connected")
+                .size(theme::type_scale::CAPTION)
+                .color(theme::DIM),
+        )
+        .width(Length::Fixed(inner_w))
+        .height(Length::Fixed(CONTROLLER_CARD_H))
+        .padding([0, 8])
+        .align_y(Alignment::Center)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(theme::alpha(theme::INK, 0.02))),
+            border: Border {
+                color: theme::alpha(theme::LINE, 0.35),
+                width: 1.0,
+                radius: theme::radius::LG.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+    } else {
+        let mut cards = row![].spacing(CONTROLLER_GAP).align_y(Alignment::Center);
+        for (i, controller) in state.controllers.iter().enumerate() {
+            cards = cards.push(controller_card(state, spectrum, controller, i));
+        }
+        scrollable(cards)
+            .id(controllers_scroll_id())
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new(),
+            ))
+            .width(Length::Fixed(inner_w))
+            .height(Length::Fixed(CONTROLLER_CARD_H + 10.0))
+            .style(theme::scrollbar)
+            .into()
+    };
+    column![label, space().height(4), strip]
+        .width(Length::Fixed(inner_w))
+        .into()
+}
+
+fn controller_card<'a>(
+    state: &'a State,
+    spectrum: &crate::domain::color::BatterySpectrum,
+    row: &'a ControllerRow,
+    index: usize,
+) -> Element<'a, HubMessage> {
+    let selected = state.focus == HubFocus::Controllers
+        && state
+            .controller_focus
+            .min(state.controllers.len().saturating_sub(1))
+            == index;
+    let powering_off = row.connected && state.powering_off.as_ref() == Some(&row.serial);
+    let live = row.connected && !powering_off;
+    let ring_color = if state.ring_flash_white(&row.serial) {
+        theme::from_rgb(lightbar::IDENTIFY_FLASH)
+    } else if live {
+        theme::from_rgb(spectrum.color_at_percent(row.percent))
+    } else {
+        theme::DIM
+    };
+    let ring = crate::ui::percent_ring::percent_ring(
+        row.percent,
+        ring_color,
+        CONTROLLER_RING,
+        row.eta.clone(),
+        1.0,
+        if live { 1.0 } else { 0.6 },
+    );
+    let meta = if powering_off {
+        "Powering off".to_string()
+    } else if !row.connected {
+        "Disconnected".to_string()
+    } else {
+        format!("{} · {}", row.connection, row.state)
+    };
+    let hint = if selected && row.show_power_off() && !powering_off {
+        Some("Hold △ power off")
+    } else if selected && row.show_identify() {
+        Some("Cross identify")
+    } else {
+        None
+    };
+    let mut details = column![
+        text(text_fit::ellipsize_to_width(
+            row.display_name(),
+            13.0,
+            CONTROLLER_CARD_W - 16.0 - CONTROLLER_RING - 8.0
+        ))
+        .size(13.0)
+        .font(iced::Font {
+            weight: if selected {
+                iced::font::Weight::Semibold
+            } else {
+                iced::font::Weight::Normal
+            },
+            ..iced::Font::default()
+        })
+        .color(if live { theme::INK } else { theme::MUTED })
+        .width(Fill),
+        text(text_fit::ellipsize_to_width(
+            &meta,
+            theme::type_scale::CAPTION,
+            CONTROLLER_CARD_W - 16.0 - CONTROLLER_RING - 8.0
+        ))
+        .size(theme::type_scale::CAPTION)
+        .color(if powering_off {
+            theme::MUTED
+        } else if row.low {
+            theme::WARNING
+        } else {
+            theme::DIM
+        })
+        .width(Fill),
+    ]
+    .spacing(2)
+    .width(Fill);
+    if let Some(hint) = hint {
+        details = details.push(
+            text(hint)
+                .size(10.0)
+                .color(if state.triangle_progress > 0.0 {
+                    theme::ACCENT
+                } else {
+                    theme::DIM
+                }),
+        );
+    }
+    let body: Element<'a, HubMessage> = row![ring, details]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .width(Fill)
+        .into();
+    let body: Element<'a, HubMessage> = if selected && state.triangle_progress > 0.0 {
+        stack![
+            body,
+            container(
+                progress_bar(0.0..=1.0, state.triangle_progress)
+                    .girth(2.0)
+                    .style(progress_style)
+            )
+            .width(Fill)
+            .height(Fill)
+            .align_y(Alignment::End)
+            .padding([0, 4]),
+        ]
+        .into()
+    } else {
+        body
+    };
+    let mut b = button(
+        container(body)
+            .width(Fill)
+            .height(Fill)
+            .center_y(Fill)
+            .padding(0),
+    )
+    .width(Length::Fixed(CONTROLLER_CARD_W))
+    .height(Length::Fixed(CONTROLLER_CARD_H))
+    .padding(8)
+    .style(move |_theme, status| controller_card_style(selected, live, status));
+    if row.connected {
+        b = b.on_press(HubMessage::IdentifyController(index));
+    }
+    b.into()
+}
+
+fn options_pill_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let fill = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        theme::alpha(theme::INK, 0.10)
+    } else {
+        theme::alpha(theme::INK, 0.04)
+    };
+    button::Style {
+        background: Some(Background::Color(fill)),
+        text_color: theme::MUTED,
+        border: Border {
+            color: theme::alpha(theme::INK, 0.12),
+            width: 1.0,
+            radius: theme::radius::PILL.into(),
+        },
+        ..button::Style::default()
+    }
+}
+
+fn controller_card_style(selected: bool, live: bool, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    let (fill, border) = if selected {
+        (
+            theme::alpha(theme::INK, 0.10),
+            theme::alpha(theme::INK, 0.34),
+        )
+    } else if hovered {
+        (
+            theme::alpha(theme::INK, 0.07),
+            theme::alpha(theme::INK, 0.20),
+        )
+    } else {
+        (
+            theme::alpha(theme::INK, if live { 0.03 } else { 0.015 }),
+            theme::GLASS_HAIRLINE,
+        )
+    };
+    button::Style {
+        background: Some(Background::Color(fill)),
+        text_color: theme::INK,
+        border: Border {
+            color: border,
+            width: 1.0,
+            radius: theme::radius::LG.into(),
+        },
+        shadow: if selected {
+            Shadow {
+                color: theme::alpha(theme::INK, 0.10),
+                offset: Vector::new(0.0, 0.0),
+                blur_radius: 14.0,
+            }
+        } else {
+            Shadow::default()
+        },
+        ..button::Style::default()
+    }
 }
 
 /// Full-screen dimmed backdrop with the card centered. The backdrop always
@@ -778,7 +1299,7 @@ fn settings_view<'a>(state: &State, stage_w: f32, backdrop_alpha: f32) -> Elemen
             space().height(10),
             rows,
             space().height(8),
-            text("Cross adjust · Circle back")
+            text("Cross adjust · Options/Circle back")
                 .size(theme::type_scale::CAPTION)
                 .color(theme::DIM),
         ]
@@ -899,7 +1420,7 @@ fn progress_tile_body<'a>(
         text(text_fit::ellipsize_to_width(
             title,
             title_size,
-            width - 24.0
+            width - 12.0
         ))
         .size(title_size)
         .font(font)
@@ -919,7 +1440,7 @@ fn progress_tile_body<'a>(
             .girth(3.0)
             .style(progress_style),
     )
-    .spacing(3)
+    .spacing(2)
     .align_x(Alignment::Center)
     .into()
 }
@@ -930,12 +1451,12 @@ fn tile_button<'a>(
     index: usize,
     width: f32,
 ) -> Element<'a, HubMessage> {
-    let selected = state.selected() == index;
+    let selected = state.focus == HubFocus::Apps && state.selected() == index;
     let interactive = state.tile_enabled(tile);
     let dim = match tile {
         HubTile::Start => !state.start_enabled,
         HubTile::Browser => !state.engine_ready,
-        HubTile::AddApps | HubTile::Settings => false,
+        HubTile::AddApps => false,
     };
     let (icon, title) = tile_copy(tile);
     let ink = if dim { theme::DIM } else { theme::INK };
@@ -952,23 +1473,27 @@ fn tile_button<'a>(
             .width(Length::Fixed(ICON))
             .height(Length::Fixed(ICON))
             .style(move |_theme, _status| svg::Style { color: Some(ink) }),
-        text(text_fit::ellipsize_to_width(title, 18.0, width - 24.0))
-            .size(18.0)
-            .font(title_font)
-            .color(ink),
+        text(text_fit::ellipsize_to_width(
+            title,
+            TILE_TITLE,
+            width - 16.0
+        ))
+        .size(TILE_TITLE)
+        .font(title_font)
+        .color(ink),
     ]
-    .spacing(10)
+    .spacing(4)
     .align_x(Alignment::Center)
     .into();
     let content = if matches!(tile, HubTile::Browser) && state.busy() {
-        progress_tile_body(state, icon, title, width, 36.0, 17.0, selected)
+        progress_tile_body(state, icon, title, width, 24.0, TILE_TITLE, selected)
     } else if matches!(tile, HubTile::Browser) && !state.engine_ready {
         stack![
             normal,
             container(
                 svg(svg::Handle::from_memory(svg_icon::DOWNLOAD_SVG.as_bytes()))
-                    .width(Length::Fixed(15.0))
-                    .height(Length::Fixed(15.0))
+                    .width(Length::Fixed(14.0))
+                    .height(Length::Fixed(14.0))
                     .style(|_theme, _status| svg::Style {
                         color: Some(theme::WARNING)
                     }),
@@ -999,7 +1524,7 @@ fn tile_button<'a>(
     let mut b = button(container(content).center_x(Fill).center_y(Fill))
         .width(Length::Fixed(width))
         .height(Length::Fixed(TILE_H))
-        .padding(8)
+        .padding(6)
         .style(move |_theme, status| tile_style(selected, interactive, dim, status));
     if interactive {
         b = b.on_press(HubMessage::Activate(index));
@@ -1303,7 +1828,6 @@ fn tile_copy(tile: HubTile) -> (&'static str, &'static str) {
         HubTile::Start => (svg_icon::GAME_SVG, "Start"),
         HubTile::Browser => (svg_icon::GLOBE_SVG, "Browser"),
         HubTile::AddApps => (svg_icon::PLUS_SVG, "Add apps"),
-        HubTile::Settings => (svg_icon::SETTINGS_SVG, "Settings"),
     }
 }
 
@@ -1520,16 +2044,14 @@ mod tests {
     fn selection_wraps_both_ways() {
         let mut state = State::default();
         assert_eq!(state.selected_tile(), HubTile::Start);
-        state.move_selection(1);
+        state.move_across(1);
         assert_eq!(state.selected_tile(), HubTile::Browser);
-        state.move_selection(1);
+        state.move_across(1);
         assert_eq!(state.selected_tile(), HubTile::AddApps);
-        state.move_selection(1);
-        assert_eq!(state.selected_tile(), HubTile::Settings);
-        state.move_selection(1);
+        state.move_across(1);
         assert_eq!(state.selected_tile(), HubTile::Start);
-        state.move_selection(-1);
-        assert_eq!(state.selected_tile(), HubTile::Settings);
+        state.move_across(-1);
+        assert_eq!(state.selected_tile(), HubTile::AddApps);
     }
 
     #[test]
@@ -1539,6 +2061,86 @@ mod tests {
         assert_eq!(state.selected_tile(), HubTile::Browser);
         state.select(99);
         assert_eq!(state.selected_tile(), HubTile::Browser);
+    }
+
+    #[test]
+    fn controller_row_focus_switches_rows_and_wraps() {
+        use crate::controller::model::{
+            Capabilities, Connection, ControllerKind, ControllerStatus, PowerState, Serial,
+        };
+        let row = ControllerRow::connected(
+            &ControllerStatus {
+                index: 1,
+                kind: ControllerKind::DualSense,
+                serial: Serial::from("abc"),
+                product: "DualSense".into(),
+                connection: Connection::Bluetooth,
+                percent: 80,
+                state: PowerState::Discharging,
+                capabilities: Capabilities::FULL,
+            },
+            false,
+            true,
+            None,
+            20,
+            None,
+        );
+        let mut state = State::default();
+        state.set_controllers(vec![row.clone(), {
+            let mut second = row.clone();
+            second.serial = Serial::from("def");
+            second
+        }]);
+        assert_eq!(state.focus, HubFocus::Apps);
+        state.move_row(1);
+        assert_eq!(state.focus, HubFocus::Controllers);
+        state.move_row(1);
+        assert_eq!(state.focus, HubFocus::Controllers);
+        state.move_across(1);
+        assert_eq!(
+            state.controller_selected().map(|r| r.serial.as_ref()),
+            Some("def")
+        );
+        state.move_across(1);
+        assert_eq!(
+            state.controller_selected().map(|r| r.serial.as_ref()),
+            Some("abc")
+        );
+        state.move_row(-1);
+        assert_eq!(state.focus, HubFocus::Apps);
+    }
+
+    #[test]
+    fn empty_controller_row_is_not_focused() {
+        let mut state = State::default();
+        state.move_row(1);
+        assert_eq!(state.focus, HubFocus::Apps);
+    }
+
+    #[test]
+    fn options_edge_toggles_settings_request() {
+        use crate::domain::pad::PadSample;
+        let mut state = State::default();
+        let now = Instant::now();
+        let mut sample = PadSample {
+            options: true,
+            ..PadSample::default()
+        };
+        assert_eq!(
+            state.pad_tick(&sample, now),
+            Some(HubMessage::SettingsToggle)
+        );
+        assert!(!matches!(
+            state.pad_tick(&sample, now),
+            Some(HubMessage::SettingsToggle)
+        ));
+        sample.options = false;
+        state.pad_tick(&sample, now);
+        sample.options = true;
+        assert_eq!(
+            state.pad_tick(&sample, now),
+            Some(HubMessage::SettingsToggle)
+        );
     }
 
     #[test]

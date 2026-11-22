@@ -735,18 +735,6 @@ pub fn menu_row_surface(selected: bool) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
-/// Target inner radius for selected controller rows when the dock is fully expanded.
-/// Island radius is `pad +` this so corners stay concentric.
-pub const IMMERSIVE_DOCK_ROW_RADIUS: f32 = radius::MD;
-
-/// Controllers island row: near-neutral select wash; radius from island − pad.
-pub fn immersive_dock_row_surface(
-    selected: bool,
-    radius: f32,
-) -> impl Fn(&Theme) -> container::Style {
-    glass_row(selected, radius)
-}
-
 /// Row on a [`glass`] island: [`SELECT_WASH`] when selected, transparent otherwise.
 pub fn glass_row(selected: bool, radius: f32) -> impl Fn(&Theme) -> container::Style {
     let radius = radius.max(0.0);

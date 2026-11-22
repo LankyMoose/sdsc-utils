@@ -173,33 +173,6 @@ pub fn cancel_circle_label(editing: bool) -> &'static str {
     if editing { "Cancel" } else { "Close" }
 }
 
-/// Right while immersive: expand dock when collapsed.
-pub fn dock_expand_target(expanded: bool) -> Option<bool> {
-    if expanded { None } else { Some(true) }
-}
-
-/// Left while immersive: collapse dock when expanded.
-pub fn dock_collapse_target(expanded: bool) -> Option<bool> {
-    if !expanded { None } else { Some(false) }
-}
-
-/// Stage scale while the controllers surface opens (1 → ~12% smaller).
-pub fn dock_stage_scale(progress: f32) -> f32 {
-    let t = progress.clamp(0.0, 1.0);
-    1.0 - 0.12 * t
-}
-
-/// Dim overlay alpha over the games stage while the controllers surface opens.
-pub fn dock_stage_dim(progress: f32) -> f32 {
-    progress.clamp(0.0, 1.0) * 0.45
-}
-
-/// Dock panel width from peek ring column to full rows panel.
-pub fn dock_panel_width(progress: f32, peek: f32, expanded: f32) -> f32 {
-    let t = progress.clamp(0.0, 1.0);
-    peek + (expanded - peek) * t
-}
-
 /// Ease-out cubic progress 0..=1 for elapsed/duration.
 pub fn phase_progress(elapsed_ms: u64, duration_ms: u64) -> f32 {
     crate::ui::motion::ease_out_cubic(phase_progress_linear(elapsed_ms, duration_ms))
@@ -288,22 +261,6 @@ mod tests {
     fn cancel_label_is_close_unless_editing() {
         assert_eq!(cancel_circle_label(false), "Close");
         assert_eq!(cancel_circle_label(true), "Cancel");
-    }
-
-    #[test]
-    fn dock_expand_collapse_targets() {
-        assert_eq!(dock_expand_target(false), Some(true));
-        assert_eq!(dock_expand_target(true), None);
-        assert_eq!(dock_collapse_target(true), Some(false));
-        assert_eq!(dock_collapse_target(false), None);
-    }
-
-    #[test]
-    fn dock_overlay_scale_dim_width() {
-        assert!((dock_stage_scale(0.0) - 1.0).abs() < 0.001);
-        assert!((dock_stage_scale(1.0) - 0.88).abs() < 0.001);
-        assert!((dock_stage_dim(0.0) - 0.0).abs() < 0.001);
-        assert!((dock_stage_dim(1.0) - 0.45).abs() < 0.001);
     }
 
     #[test]

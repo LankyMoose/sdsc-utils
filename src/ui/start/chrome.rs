@@ -13,7 +13,7 @@ use crate::ui::start::face::{
 use crate::ui::start::input::FaceHeld;
 use crate::ui::start::view::{
     EditRow, HintPress, HintPressOwner, LaunchStatus, ROW_ACTION_SPACING, RowHintState,
-    StartControllerRow, StartMessage, StartRow, State,
+    StartMessage, StartRow, State,
 };
 use crate::ui::theme;
 use iced::widget::{button, container, row, text};
@@ -24,48 +24,6 @@ const IMMERSIVE_FOOTER_HEIGHT: f32 = 44.0;
 const FOOTER_SECONDARY_GAP: f32 = 14.0;
 /// Immersive split footer min width so left/right packing reads clearly.
 const FOOTER_SPLIT_MIN_W: f32 = 680.0;
-
-/// Identify / Power-off hints for the selected controllers row.
-/// Uses layout-stable glyphs (no Float scale) so dock row height cannot escape.
-pub(crate) fn immersive_dock_row_hints(
-    row: &StartControllerRow,
-    state: &State,
-    selected: bool,
-) -> Option<Element<'static, StartMessage>> {
-    if !selected || !row.connected {
-        return None;
-    }
-    let hint = RowHintState::for_selected(state, true, HintPressOwner::Dock);
-    let powering_off = state
-        .powering_off
-        .as_ref()
-        .is_some_and(|s| s == &row.serial);
-    if powering_off {
-        return Some(action_cluster_dock(&[face_hint(
-            FaceButton::Triangle,
-            "Powering off…",
-            hint.held,
-            hint.press_anim,
-        )]));
-    }
-    let mut actions = vec![face_hint(
-        FaceButton::Cross,
-        "Identify",
-        hint.held,
-        hint.press_anim,
-    )];
-    if row.show_power_off() {
-        actions.push(face_hold_hint(
-            FaceButton::Triangle,
-            "Power off",
-            hint.triangle_progress,
-            hint.triangle_armed_t,
-            hint.held,
-            hint.press_anim,
-        ));
-    }
-    Some(action_cluster_dock(&actions))
-}
 
 /// Edit-mode membership mark for the immersive hero meta column.
 pub(crate) fn immersive_game_membership_label(
@@ -335,7 +293,6 @@ pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a,
                 .align_y(Alignment::Center)
                 .into(),
                 row![
-                    select_toggle_hint("Controllers", press.held, press.press_anim, flat_hints,),
                     options_hint_el("Settings", press.held, press.press_anim, flat_hints,),
                     action_cluster(
                         &[face_hint(
@@ -405,36 +362,6 @@ fn options_hint_el(
         .spacing(8)
         .align_y(Alignment::Center)
         .into()
-}
-
-/// Create (Select) toggle cue with label (footer use). The island uses
-/// the icon-only [`select_capsule`].
-fn select_toggle_hint(
-    label: &'static str,
-    held: FaceHeld,
-    press_anim: FacePressAnim,
-    flat: bool,
-) -> Element<'static, StartMessage> {
-    let glyph = select_capsule(held.create, press_anim.create, flat);
-    row![glyph, text(label).size(14.0).color(theme::MUTED)]
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .into()
-}
-
-/// DualSense Create → SELECT capsule (icon-only use in the island/header;
-/// same metrics as the START capsule so the pair reads as opposites).
-pub(crate) fn select_capsule(
-    pressed: bool,
-    press_t: f32,
-    flat: bool,
-) -> Element<'static, StartMessage> {
-    let label = text("SELECT")
-        .size(12.0)
-        .font(Font::MONOSPACE)
-        .color(theme::ACCENT);
-    // Monospace caps sit high in the em box — nudge down for optical center.
-    hint_text_capsule(label, 10.0, 1.0, pressed, press_t, flat)
 }
 
 /// DualSense Options → START capsule (visual height matches face-ring idle diameter).

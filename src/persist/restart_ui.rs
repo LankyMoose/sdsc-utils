@@ -33,7 +33,7 @@ pub struct RestartUiState {
     /// Start window was visible.
     #[serde(default = "default_false")]
     pub start_visible: bool,
-    /// Controllers surface was open.
+    /// Legacy: Start's controllers surface was open (ignored; hub owns controllers).
     #[serde(default = "default_false")]
     pub start_on_controllers: bool,
     /// Selected game / controller keys (re-resolved after rows rebuild).

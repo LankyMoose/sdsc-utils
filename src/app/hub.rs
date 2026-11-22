@@ -217,6 +217,7 @@ impl App {
         // persistent shell state, so re-apply them after the reset.
         self.sync_hub_engine_info();
         self.sync_hub_settings();
+        self.sync_hub_controllers();
         // The opening PS press must not toggle the hub straight back closed.
         self.arm_chord_release_latch();
         let (id, open) = window::open(window::Settings {
@@ -323,7 +324,7 @@ impl App {
     pub(crate) fn on_hub_message(&mut self, message: hub_view::HubMessage) -> Task<Message> {
         use hub_view::HubMessage;
         match message {
-            HubMessage::Move(delta) => {
+            HubMessage::MoveX(delta) => {
                 if self.hub_state.apps_info.is_some() {
                     // Info owns the screen; movement scrolls the changelog.
                     return iced::widget::operation::scroll_by(
@@ -340,7 +341,29 @@ impl App {
                 } else if self.hub_state.apps_open {
                     self.hub_state.apps_move(delta);
                 } else {
-                    self.hub_state.move_selection(delta);
+                    self.hub_state.move_across(delta);
+                    return self.scroll_to_hub_controller();
+                }
+                Task::none()
+            }
+            HubMessage::MoveY(delta) => {
+                if self.hub_state.apps_info.is_some() {
+                    return iced::widget::operation::scroll_by(
+                        hub_view::info_scroll_id(),
+                        iced::widget::operation::AbsoluteOffset {
+                            x: 0.0,
+                            y: 56.0 * delta as f32,
+                        },
+                    );
+                } else if self.hub_state.settings_open {
+                    self.hub_state.settings_move(delta);
+                } else if self.hub_state.apps_menu.is_some() {
+                    self.hub_state.apps_menu_move(delta);
+                } else if self.hub_state.apps_open {
+                    self.hub_state.apps_move(delta);
+                } else {
+                    self.hub_state.move_row(delta);
+                    return self.scroll_to_hub_controller();
                 }
                 Task::none()
             }
@@ -350,6 +373,15 @@ impl App {
             }
             HubMessage::AppsClose => {
                 self.hub_state.close_apps();
+                Task::none()
+            }
+            HubMessage::SettingsToggle => {
+                if self.hub_state.settings_open {
+                    self.hub_state.close_settings();
+                } else {
+                    self.hub_state.open_settings();
+                    self.sync_hub_settings();
+                }
                 Task::none()
             }
             HubMessage::SettingsOpen => {
@@ -377,6 +409,12 @@ impl App {
                 self.hub_state.select(index);
                 self.hub_activate()
             }
+            HubMessage::IdentifyController(index) => {
+                self.hub_state.select_controller(index);
+                self.hub_identify_selected()
+            }
+            HubMessage::IdentifySelected => self.hub_identify_selected(),
+            HubMessage::PowerOff => self.hub_power_off_selected(),
             HubMessage::AppsMenuOpen(index) => {
                 self.hub_state.open_apps_menu(index);
                 Task::none()
@@ -407,6 +445,8 @@ impl App {
                     let index = self.hub_state.apps_focus;
                     self.hub_state.open_apps_menu(index);
                     Task::none()
+                } else if self.hub_state.focus == hub_view::HubFocus::Controllers {
+                    self.hub_identify_selected()
                 } else {
                     self.hub_activate()
                 }
@@ -580,13 +620,58 @@ impl App {
                 self.hub_state.open_apps();
                 Task::none()
             }
-            hub_view::HubTile::Settings => {
-                crate::controller::hid::diag::diag_info("ui-diag: hub settings open");
-                self.hub_state.open_settings();
-                self.sync_hub_settings();
-                Task::none()
-            }
         }
+    }
+
+    /// Rebuild the hub controller strip from the live session.
+    pub(crate) fn sync_hub_controllers(&mut self) {
+        let rows = self.controller_rows(self.session.prefs.show_all_controllers);
+        self.hub_state.set_controllers(rows);
+    }
+
+    /// Identify the focused controller card (Cross / click).
+    fn hub_identify_selected(&mut self) -> Task<Message> {
+        let Some(row) = self.hub_state.controller_selected() else {
+            return Task::none();
+        };
+        if !row.connected || !row.supports_identify {
+            return Task::none();
+        }
+        let serial = row.serial.clone();
+        if self.identify(&serial) {
+            self.hub_state.begin_identify_flash(&serial);
+            self.play_start_cue(crate::platform::ui_sound::UiSoundKind::Action);
+        }
+        Task::none()
+    }
+
+    /// Triangle hold completed on the focused Bluetooth pad.
+    fn hub_power_off_selected(&mut self) -> Task<Message> {
+        let Some(row) = self.hub_state.controller_selected() else {
+            return Task::none();
+        };
+        if !row.show_power_off() {
+            return Task::none();
+        }
+        let serial = row.serial.clone();
+        self.play_start_cue(crate::platform::ui_sound::UiSoundKind::Hold);
+        self.hub_state.powering_off = Some(serial.clone());
+        self.power_off(&serial);
+        Task::none()
+    }
+
+    /// Keep the focused controller card inside the horizontal strip.
+    fn scroll_to_hub_controller(&self) -> Task<Message> {
+        if self.hub_state.focus != hub_view::HubFocus::Controllers {
+            return Task::none();
+        }
+        iced::widget::operation::scroll_to(
+            hub_view::controllers_scroll_id(),
+            iced::widget::operation::AbsoluteOffset {
+                x: hub_view::controller_scroll_x(self.hub_state.controller_focus, self.hub_stage.0),
+                y: 0.0,
+            },
+        )
     }
 
     /// Pad tick while the hub is the modal owner. Only the chord (close) and
@@ -595,6 +680,8 @@ impl App {
         if readings.is_empty() {
             return Task::none();
         }
+        self.sync_hub_controllers();
+        self.hub_state.tick_identify_flash();
         if self.hub_chord_fires(readings) {
             crate::controller::hid::diag::diag_info("ui-diag: hub chord close");
             return self.close_hub();
@@ -628,15 +715,14 @@ impl App {
         use iced::keyboard::Key;
         use iced::keyboard::key::Named;
         let message = match raw.key {
-            Key::Named(Named::ArrowLeft) | Key::Named(Named::ArrowUp) => {
-                Some(hub_view::HubMessage::Move(-1))
-            }
-            Key::Named(Named::ArrowRight) | Key::Named(Named::ArrowDown) => {
-                Some(hub_view::HubMessage::Move(1))
-            }
+            Key::Named(Named::ArrowLeft) => Some(hub_view::HubMessage::MoveX(-1)),
+            Key::Named(Named::ArrowRight) => Some(hub_view::HubMessage::MoveX(1)),
+            Key::Named(Named::ArrowUp) => Some(hub_view::HubMessage::MoveY(-1)),
+            Key::Named(Named::ArrowDown) => Some(hub_view::HubMessage::MoveY(1)),
             Key::Named(Named::Enter) | Key::Named(Named::Space) => {
                 Some(hub_view::HubMessage::Confirm)
             }
+            Key::Named(Named::Tab) => Some(hub_view::HubMessage::SettingsToggle),
             Key::Named(Named::Escape) => Some(hub_view::HubMessage::Close),
             _ => None,
         };
