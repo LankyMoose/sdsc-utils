@@ -43,9 +43,11 @@ zips, the CEF DLC zip, installed copies, and private `APPDATA` dirs.
   + engine env appended. A tracked PID is stopped with `taskkill /T` (CEF
   subprocesses included). **Allow controller input** is on by default for
   manual testing; uncheck it for automation.
-- **Secondary monitor only.** Every QA launch sets `SDSC_DEBUG_QUIET=1`, so
-  debug-open windows use the secondary monitor and never take focus from the
-  game/desktop on the primary.
+- **Display target.** Manual launches (`Automated` unchecked) use the primary
+  monitor with normal focus and `SDSC_DEBUG_QUIET=0`. Automated launches
+  (checkbox on, or `controller_input: false` via the API) set
+  `SDSC_DEBUG_QUIET=1` for quiet secondary-monitor placement with no focus
+  steal. `SDSC_DEBUG_INPUT=0` drops pad edges in either mode.
 
 ## Why an engine-less exe starts
 
@@ -107,23 +109,25 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
 | `APPDATA` | app data dir (`%APPDATA%\sdsc-utils`) |
 | `SDSC_DEBUG_OPEN` | debug builds: open `hub`/`browser`/etc. after boot |
 | `SDSC_DEBUG_QUIET` | `0` makes debug-open windows focusable on the primary |
-| `SDSC_DEBUG_INPUT` | `1` keeps pad edges live while quiet placement is active |
+| `SDSC_DEBUG_INPUT` | `1` keeps pad edges live; `0` drops them (even outside quiet mode) |
 
 `SDSC_DEBUG_OPEN` normally enables **debug quiet mode** (no focus, secondary
 monitor, pad edges dropped) for screenshotting over a running game. The QA
-console always sets `SDSC_DEBUG_QUIET=1`. Manual launches default to
-`SDSC_DEBUG_INPUT=1` so controller navigation works in the hub, Start, and
-Browser. Automated launches must pass `"controller_input": false` so
+console sets `SDSC_DEBUG_QUIET=0` for manual launches (primary monitor, normal
+focus) and `=1` for automated launches (secondary monitor, no focus steal).
+Manual launches default to `SDSC_DEBUG_INPUT=1` so controller navigation works.
+Automated launches must pass `"controller_input": false` so
 `SDSC_DEBUG_INPUT=0`; the physical controller must never navigate or close the
 QA app while a test is running.
 
 ## Automation
 
 Call `/api/prepare` with `"controller_input": false` (and leave **Allow
-controller input** unchecked in the page). The app still opens on the
-secondary monitor with no focus steal, but pad edges are dropped by the debug
-quiet path. Never automate against the primary monitor or with controller
-input enabled.
+controller input** unchecked in the page). This also defaults
+`"automated": true`, so the app opens on the secondary monitor with no focus
+steal and pad edges are dropped. Never automate against the primary monitor or
+with controller input enabled. Manual runs leave **Automated** unchecked and
+open focused on the primary.
 
 ## Build prerequisites
 

@@ -69,11 +69,15 @@ fn quiet_from_env(open: bool, quiet: Option<&str>) -> bool {
 
 #[cfg(any(debug_assertions, test))]
 fn input_dropped_from_env(quiet: bool, input: Option<&str>) -> bool {
-    quiet
-        && !matches!(
-            input.map(str::to_ascii_lowercase).as_deref(),
-            Some("1" | "true" | "on")
-        )
+    match input.map(str::to_ascii_lowercase).as_deref() {
+        // Explicit opt-in/opt-out, even outside quiet mode. This lets the QA
+        // console run a focused primary-monitor session with pad edges off.
+        Some("1" | "true" | "on") => false,
+        Some("0" | "false" | "off") => true,
+        // Unset follows the mode: quiet sessions drop edges, normal sessions
+        // keep them live.
+        _ => quiet,
+    }
 }
 
 #[cfg(test)]
@@ -110,5 +114,12 @@ mod tests {
         assert!(!input_dropped_from_env(true, Some("TRUE")));
         assert!(!input_dropped_from_env(true, Some("on")));
         assert!(!input_dropped_from_env(false, None));
+    }
+
+    #[test]
+    fn explicit_input_off_drops_edges_without_quiet() {
+        assert!(input_dropped_from_env(false, Some("0")));
+        assert!(input_dropped_from_env(false, Some("off")));
+        assert!(!input_dropped_from_env(false, Some("1")));
     }
 }

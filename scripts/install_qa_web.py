@@ -204,6 +204,7 @@ class Console:
         self.last_flavor: str | None = None
         self.last_debug_open: str = ""
         self.last_controller_input = True
+        self.last_automated = False
         (
             self.manifest,
             self.engine_bundled,
@@ -361,6 +362,7 @@ class Console:
                 "last_flavor": self.last_flavor,
                 "last_debug_open": self.last_debug_open,
                 "last_controller_input": self.last_controller_input,
+                "last_automated": self.last_automated,
                 "preparing": self.preparing,
                 "prepare_step": self.prepare_step,
                 "prepare_error": self.prepare_error,
@@ -553,6 +555,7 @@ class Console:
             open_hub = bool(payload.get("open_hub", True))
             restage = bool(payload.get("restage", False))
             controller_input = bool(payload.get("controller_input", True))
+            automated = bool(payload.get("automated", not controller_input))
             self.log(
                 f"prepare: {flavor}, engine={'bundled' if bundle else ('msix-mock' if msix_mock else 'missing')}"
                 + (", reset" if restage else "")
@@ -598,6 +601,7 @@ class Console:
                 f"installed:{tag}",
                 "hub" if open_hub and flavor == "debug" else "",
                 controller_input,
+                automated,
             )
         except Exception as err:  # noqa: BLE001 - surfaced in the web UI
             with self.lock:
@@ -619,6 +623,7 @@ class Console:
             self.last_flavor,
             self.last_debug_open,
             self.last_controller_input,
+            self.last_automated,
         )
 
     def set_config(self, payload):
@@ -697,6 +702,7 @@ class Console:
         flavor: str,
         debug_open: str = "",
         controller_input: bool = True,
+        automated: bool = False,
     ):
         self.stop()
         if flavor.startswith("installed:"):
@@ -718,9 +724,10 @@ class Console:
         env["APPDATA"] = str(appdata)
         env["SDSC_UPDATE_API_URL"] = self.feed_url()
         env["SDSC_CEF_NO_BUILD_FALLBACK"] = "1"
-        # Always use debug quiet placement: secondary monitor, no focus steal.
-        # Manual testing may opt pad edges back in; automation must not.
-        env["SDSC_DEBUG_QUIET"] = "1"
+        # Manual launches open on the primary monitor with focus; automated
+        # launches use the secondary monitor and never steal focus. Pad edges
+        # stay live for manual testing and are dropped for automation.
+        env["SDSC_DEBUG_QUIET"] = "1" if automated else "0"
         env["SDSC_DEBUG_INPUT"] = "1" if controller_input else "0"
         if self.engine:
             env["SDSC_CEF_DLC_URL"] = self.engine["url"]
@@ -745,9 +752,11 @@ class Console:
             self.last_flavor = flavor
             self.last_debug_open = debug_open
             self.last_controller_input = controller_input
+            self.last_automated = automated
         self.log(
             f"launch: {flavor} pid={self.proc.pid} "
-            f"controller={'on' if controller_input else 'off'} data={appdata}"
+            f"controller={'on' if controller_input else 'off'} "
+            f"display={'secondary' if automated else 'primary'} data={appdata}"
         )
         return self.api_state()
 
@@ -939,6 +948,7 @@ PAGE = """<!doctype html>
       <label><input id="engine" type="checkbox"> Bundle browser engine</label>
       <label><input id="open-hub" type="checkbox" checked> Open hub (debug)</label>
       <label><input id="controller-input" type="checkbox" checked> Allow controller input</label>
+      <label><input id="automated" type="checkbox"> Automated (secondary monitor)</label>
       <label><input id="restage" type="checkbox"> Rebuild install</label>
     </div>
     <div class="row">
@@ -948,7 +958,7 @@ PAGE = """<!doctype html>
     </div>
     <div class="row error" id="error" style="display:none"></div>
     <div class="row muted" id="run">—</div>
-    <div class="row hint">Leave <b>Bundle browser engine</b> unchecked to start with no CEF at all: only the exe is staged, and the hub's Apps → Browser → Install walks the DLC flow. Check it to test an already-installed engine. <b>Rebuild install</b> resets the private appdata, including a previously downloaded engine. The app always opens on the secondary monitor without stealing focus; uncheck <b>Allow controller input</b> for automated runs so the physical controller cannot navigate or close it.</div>
+    <div class="row hint">Leave <b>Bundle browser engine</b> unchecked to start with no CEF at all: only the exe is staged, and the hub's Apps → Browser → Install walks the DLC flow. Check it to test an already-installed engine. <b>Rebuild install</b> resets the private appdata, including a previously downloaded engine. Manual runs open on the primary monitor with focus. Check <b>Automated (secondary monitor)</b> for quiet placement on the secondary display with no focus steal; uncheck <b>Allow controller input</b> too so the physical controller cannot navigate or close it.</div>
   </section>
 
   <section class="card">
@@ -983,6 +993,7 @@ function render(){
     $('engine-changelog').value = S.engine_changelog || '';
     $('msix-mock').checked = !!S.msix_mock;
     $('controller-input').checked = S.last_controller_input !== false;
+    $('automated').checked = !!S.last_automated;
     initialized = true;
   }
   $('go').disabled = !!S.preparing;
@@ -1059,6 +1070,7 @@ async function prepare(){
       msix_mock: $('msix-mock').checked,
       open_hub: $('open-hub').checked,
       controller_input: $('controller-input').checked,
+      automated: $('automated').checked,
       restage: $('restage').checked
     });
     await getState();
