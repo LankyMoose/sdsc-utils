@@ -71,6 +71,14 @@ pub fn resolve_engine_dir() -> Option<std::path::PathBuf> {
     {
         candidates.push(dir.join("cef"));
     }
+    // QA/dev mock of the optional MSIX package: same resolver slot as the
+    // real package, so priority and managed-package behavior are testable
+    // without sideloading. `SDSC_MSIX_ENGINE_DIR` may point at the engine
+    // directory itself or at a package root containing `cef\`.
+    if let Some(root) = msix_mock_dir() {
+        candidates.push(root.join("cef"));
+        candidates.push(root);
+    }
     #[cfg(windows)]
     candidates.extend(optional_package_dirs());
     if let Some(local) =
@@ -94,6 +102,33 @@ pub fn resolve_engine_dir() -> Option<std::path::PathBuf> {
 
 pub fn engine_installed() -> bool {
     resolve_engine_dir().is_some()
+}
+
+/// Mock root for the optional `BrowserEngine` MSIX package. Set by the QA
+/// console (and available to developers) to exercise resolver priority and
+/// managed-package behavior without a sideload.
+pub fn msix_mock_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("SDSC_MSIX_ENGINE_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+/// True when the runtime is package-owned (real MSIX or the resolver mock)
+/// rather than a local/portable install the app may uninstall itself.
+pub fn engine_is_managed(path: &std::path::Path) -> bool {
+    if let Some(root) = msix_mock_dir()
+        && path.starts_with(&root)
+    {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy().to_ascii_lowercase();
+        if text.contains("\\windowsapps\\") {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn validate_engine_dir(dir: &std::path::Path) -> bool {

@@ -1878,43 +1878,9 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         ));
         groups = groups.push(group(Some("Display".to_string()), display));
 
-        let mut feedback = vec![toggle_row(
-            "UI sounds",
-            None,
-            settings.start_screen_sounds_enabled,
-            ConfigureMessage::SetStartScreenSounds,
-        )];
-        if settings.start_screen_sounds_enabled {
-            let volume = settings.start_screen_sound_volume;
-            feedback.push(slider_row(
-                "Volume",
-                format!("{volume}%"),
-                slider(0.0..=100.0, f32::from(volume), |value| {
-                    ConfigureMessage::SetStartScreenSoundVolume(value.round() as u8)
-                })
-                .step(5.0_f32)
-                .style(theme::slider),
-            ));
-        }
-        feedback.push(toggle_row(
-            "Controller haptics",
-            None,
-            settings.start_screen_haptics_enabled,
-            ConfigureMessage::SetStartScreenHaptics,
-        ));
-        if settings.start_screen_haptics_enabled {
-            let strength = settings.start_screen_haptics_strength;
-            feedback.push(slider_row(
-                "Strength",
-                format!("{strength}%"),
-                slider(0.0..=100.0, f32::from(strength), |value| {
-                    ConfigureMessage::SetStartScreenHapticsStrength(value.round() as u8)
-                })
-                .step(5.0_f32)
-                .style(theme::slider),
-            ));
-        }
-        groups = groups.push(group(Some("Feedback".to_string()), feedback));
+        // UI sounds and controller haptics moved to the hub shell Settings
+        // screen (PS hub → Settings) so they apply beyond the Start screen.
+        // The prefs keys remain `start_screen_*` for on-disk compatibility.
 
         let mut performance = vec![
             toggle_row(

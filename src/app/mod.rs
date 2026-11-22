@@ -173,13 +173,29 @@ pub enum Message {
     Browser(crate::ui::browser::BrowserMessage),
     /// 60Hz Browser window tick (cursor/scroll/mouse sync/shots).
     BrowserFrame,
-    /// Optional BrowserEngine install/download finished.
-    EngineInstallDone(Result<std::path::PathBuf, String>),
+    /// Optional BrowserEngine install/update finished or was cancelled.
+    EngineInstallDone {
+        generation: u64,
+        outcome: crate::app::browser::EngineInstallOutcome,
+    },
+    /// Circle/Esc or the Cancel row while an install/update is in flight.
+    EngineInstallCancel,
     /// Live BrowserEngine install phase (download/verify/extract).
     #[cfg(feature = "cef-engine")]
     EngineInstallProgress {
         generation: u64,
         progress: crate::browser::engine_install::InstallProgress,
+    },
+    /// Background DLC manifest check finished (hub open).
+    #[cfg(feature = "cef-engine")]
+    EngineManifestReady {
+        generation: u64,
+        result: Result<Option<crate::browser::engine_install::EngineManifest>, String>,
+    },
+    /// Background Info-panel size walk finished.
+    EngineInfoSize {
+        generation: u64,
+        result: Result<(u64, u64), String>,
     },
     /// BrowserEngine uninstall finished.
     #[cfg(feature = "cef-engine")]
@@ -342,13 +358,16 @@ impl Message {
             | Message::FinishStartClose
             | Message::StartFrame
             | Message::BrowserFrame
-            | Message::EngineInstallDone(_)
+            | Message::EngineInstallDone { .. }
+            | Message::EngineInfoSize { .. }
             | Message::WindowSized(_, _)
             | Message::WindowShowNow(_)
             | Message::ShellFadeTick
             | Message::StartArtEvent(_) => false,
             #[cfg(feature = "cef-engine")]
-            Message::EngineInstallProgress { .. } | Message::EngineUninstallDone { .. } => false,
+            Message::EngineInstallProgress { .. }
+            | Message::EngineManifestReady { .. }
+            | Message::EngineUninstallDone { .. } => false,
             Message::HubProgressTick => false,
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
@@ -357,6 +376,7 @@ impl Message {
             Message::Popup(_)
             | Message::Configure(_)
             | Message::Hub(_)
+            | Message::EngineInstallCancel
             | Message::Browser(_)
             | Message::Start(_)
             | Message::BrowserRawKey { .. }
@@ -1709,12 +1729,29 @@ impl App {
             Message::BrowserOpened(id) => self.on_browser_opened(id),
             Message::Browser(message) => self.on_browser_message(message),
             Message::BrowserFrame => self.on_browser_frame(),
-            Message::EngineInstallDone(result) => self.on_engine_install_done(result),
+            Message::EngineInstallDone {
+                generation,
+                outcome,
+            } => self.on_engine_install_done(generation, outcome),
+            Message::EngineInstallCancel => self.cancel_engine_install(),
             #[cfg(feature = "cef-engine")]
             Message::EngineInstallProgress {
                 generation,
                 progress,
             } => self.on_engine_install_progress(generation, progress),
+            #[cfg(feature = "cef-engine")]
+            Message::EngineManifestReady { generation, result } => {
+                self.on_engine_manifest_ready(generation, result)
+            }
+            Message::EngineInfoSize { generation, result } => {
+                if generation == self.browser.engine_info_generation
+                    && let Ok((size, pending)) = result
+                {
+                    self.hub_state.engine_size = (size > 0).then_some(size);
+                    self.hub_state.engine_pending_size = pending;
+                }
+                Task::none()
+            }
             #[cfg(feature = "cef-engine")]
             Message::EngineUninstallDone { generation, result } => {
                 self.on_engine_uninstall_done(generation, result)

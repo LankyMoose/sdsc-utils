@@ -72,12 +72,36 @@ session because it writes a new versioned directory; the still-loaded old
 runtime is left intact until exit. The next boot deletes the pending old
 copies and loads the pointer target.
 
+Each install writes `engine.json` (version, CEF/Chromium source versions,
+changelog, measured size). The app checks `/engine-manifest` on hub open and
+compares that version with the installed copy; a newer feed shows an Update
+badge and the Update action. Updates use the same versioned store, so the
+running CEF stays loaded until restart (`Restart to finish` in Info).
+
+## Update, cancel, and settings
+
+- **Publish update** in the DLC card bumps the engine version and saves the
+  changelog. The app sees it on the next hub open (relaunch, or close/reopen
+  the hub) and offers **Update**.
+- **Cancel** during Downloading/Verifying/Installing: Circle/Esc or the Cancel
+  action row. The worker deletes staging, restores the previous install, and
+  leaves the pointer untouched.
+- **Download speed** lives in PS hub → Settings (`Unlimited / 2 / 5 / 10 MB/s`)
+  and is shared with a live download. The tile always shows the current MB/s;
+  there is no “capped” label.
+- **Mock MSIX engine package** stages `cef\` beside the exe and sets
+  `SDSC_MSIX_ENGINE_DIR`, so the resolver treats it as the optional package:
+  Browser reports **Managed by Store**, Uninstall is hidden, and Info shows the
+  version/size without a local uninstall path.
+
 ## Environment overrides
 
 | Variable | Read by |
 |---|---|
 | `SDSC_UPDATE_API_URL` | updater in debug or `qa-feed` builds |
-| `SDSC_CEF_DLC_URL` / `SDSC_CEF_DLC_SHA256` | engine install (all builds) |
+| `SDSC_CEF_DLC_URL` / `SDSC_CEF_DLC_SHA256` | env-only engine feed (legacy fallback) |
+| `SDSC_CEF_DLC_MANIFEST_URL` | version/changelog/download engine manifest |
+| `SDSC_MSIX_ENGINE_DIR` | resolver mock for the optional BrowserEngine package |
 | `SDSC_CEF_NO_BUILD_FALLBACK` | engine resolver in debug/qa-feed builds |
 | `APPDATA` | app data dir (`%APPDATA%\sdsc-utils`) |
 | `SDSC_DEBUG_OPEN` | debug builds: open `hub`/`browser`/etc. after boot |
@@ -118,11 +142,15 @@ reuse it.
 3. **Apps → Browser → Install** (X/Cross). The catalog downloads the local CEF
    zip, verifies the SHA-256, installs under the private `APPDATA`, and starts
    the engine. The Browser tile becomes usable.
-4. **Relaunch** to exercise a process that finds the downloaded engine at boot.
-5. To test the already-installed layout, check **Bundle browser engine** and
+4. **Apps → Browser → Info** shows the engine version, `Size on disk`, pending
+   cleanup, and the changelog (no app version line).
+5. Set a new engine version, press **Publish update**, and reopen the hub to
+   test Update; cancel mid-download with Circle/Esc.
+6. **Relaunch** to exercise a process that finds the downloaded engine at boot.
+7. To test the already-installed layout, check **Bundle browser engine** and
    **Rebuild install**, then **Build & launch**; the Browser tile is ready
-   immediately.
-6. Uninstall the engine from the apps menu, or **Rebuild install** / the
+   immediately. Check **Mock MSIX engine package** for the managed-package path.
+8. Uninstall the engine from the apps menu, or **Rebuild install** / the
    `/api/clear` endpoint to reset the QA data.
 
 The updater is check-only by design (README: it never downloads or applies

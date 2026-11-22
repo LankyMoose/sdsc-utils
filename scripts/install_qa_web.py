@@ -12,6 +12,7 @@ One loopback process serves:
     /api/clear                          POST remove QA installs/appdata
     /repos/LankyMoose/sdsc-utils/releases/latest
                                         fake GitHub release API
+    /engine-manifest                    BrowserEngine DLC manifest
     /downloads/<file>                   engine DLC zip
 
 The point of the console is to run a standalone install that has **no CEF
@@ -203,7 +204,13 @@ class Console:
         self.last_flavor: str | None = None
         self.last_debug_open: str = ""
         self.last_controller_input = True
-        self.manifest, self.engine_bundled = self.load_state()
+        (
+            self.manifest,
+            self.engine_bundled,
+            self.engine_version,
+            self.engine_changelog,
+            self.msix_mock,
+        ) = self.load_state()
         OUT.mkdir(parents=True, exist_ok=True)
         DOWNLOADS.mkdir(parents=True, exist_ok=True)
         PORTABLE.mkdir(parents=True, exist_ok=True)
@@ -233,12 +240,18 @@ class Console:
     def load_state(self):
         manifest = self.default_manifest()
         engine_bundled = False
+        engine_version = "1.0.0"
+        engine_changelog = "- Initial Browser engine package."
+        msix_mock = False
         try:
             raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
             saved = raw.get("manifest")
             if isinstance(saved, dict):
                 manifest.update(saved)
             engine_bundled = bool(raw.get("engine_bundled", False))
+            engine_version = str(raw.get("engine_version", engine_version))
+            engine_changelog = str(raw.get("engine_changelog", engine_changelog))
+            msix_mock = bool(raw.get("msix_mock", False))
         except (OSError, ValueError):
             pass
         tag = normalize_tag(str(manifest.get("tag_name", "")))
@@ -257,7 +270,7 @@ class Console:
         if not url:
             url = f"https://github.com/LankyMoose/sdsc-utils/releases/tag/{tag}"
         manifest["html_url"] = url
-        return manifest, engine_bundled
+        return manifest, engine_bundled, engine_version, engine_changelog, msix_mock
 
     def save_state(self):
         with self.lock:
@@ -267,6 +280,9 @@ class Console:
                     {
                         "manifest": self.manifest,
                         "engine_bundled": self.engine_bundled,
+                        "engine_version": self.engine_version,
+                        "engine_changelog": self.engine_changelog,
+                        "msix_mock": self.msix_mock,
                     },
                     indent=2,
                 )
@@ -300,6 +316,21 @@ class Console:
     def feed_url(self):
         return f"http://127.0.0.1:{self.port}/repos/LankyMoose/sdsc-utils/releases/latest"
 
+    def engine_manifest_url(self):
+        return f"http://127.0.0.1:{self.port}/engine-manifest"
+
+    def engine_manifest(self):
+        engine = self.engine or {}
+        return {
+            "version": self.engine_version,
+            "cef_version": "",
+            "chromium_version": "",
+            "url": engine.get("url", ""),
+            "sha256": engine.get("sha256", ""),
+            "size": int(engine.get("bytes", 0)),
+            "changelog": self.engine_changelog,
+        }
+
     def api_state(self):
         with self.lock:
             self.refresh_installed()
@@ -323,6 +354,7 @@ class Console:
                 "latest": self.manifest.get("tag_name", ""),
                 "manifest": self.manifest,
                 "engine_bundled": self.engine_bundled,
+                "engine": self.engine,
                 "running": running,
                 "running_pid": pid,
                 "running_flavor": self.running_flavor,
@@ -337,6 +369,9 @@ class Console:
                 "build_error": self.build_error,
                 "cef": str(cef) if cef else None,
                 "engine": self.engine,
+                "engine_version": self.engine_version,
+                "engine_changelog": self.engine_changelog,
+                "msix_mock": self.msix_mock,
                 "installed": sorted(self.installed.values(), key=lambda x: version_key(x["tag"])),
                 "requests": list(self.requests),
                 "downloads": f"http://127.0.0.1:{self.port}/downloads/",
@@ -424,17 +459,18 @@ class Console:
         tag: str,
         marker: str,
         reset_appdata: bool,
+        msix_mock: bool = False,
     ):
         exe = exe_for(flavor)
         if not exe.is_file():
             raise RuntimeError(f"{flavor} exe missing: {exe}")
-        label = "engine" if engine_bundled else "clean"
+        label = "engine" if engine_bundled else ("mock" if msix_mock else "clean")
         root = PORTABLE / f"{tag}-{flavor}-{label}"
         if root.exists():
             shutil.rmtree(root)
         root.mkdir(parents=True)
         shutil.copy2(exe, root / exe.name)
-        if engine_bundled:
+        if engine_bundled or msix_mock:
             cef = find_cef_dir()
             if not cef:
                 raise RuntimeError("CEF runtime not found; build the project or set CEF_PATH")
@@ -483,7 +519,15 @@ class Console:
                 return self.api_state()
         config = {
             key: payload[key]
-            for key in ("manifest", "version", "html_url", "engine_bundled")
+            for key in (
+                "manifest",
+                "version",
+                "html_url",
+                "engine_bundled",
+                "engine_version",
+                "engine_changelog",
+                "msix_mock",
+            )
             if key in payload
         }
         if config:
@@ -505,11 +549,12 @@ class Console:
             if flavor not in ("debug", "release"):
                 raise RuntimeError(f"unknown flavor {flavor!r}")
             bundle = bool(payload.get("engine_bundled", self.engine_bundled))
+            msix_mock = bool(payload.get("msix_mock", self.msix_mock))
             open_hub = bool(payload.get("open_hub", True))
             restage = bool(payload.get("restage", False))
             controller_input = bool(payload.get("controller_input", True))
             self.log(
-                f"prepare: {flavor}, engine={'bundled' if bundle else 'missing'}"
+                f"prepare: {flavor}, engine={'bundled' if bundle else ('msix-mock' if msix_mock else 'missing')}"
                 + (", reset" if restage else "")
                 + (", controller on" if controller_input else ", controller off")
             )
@@ -527,7 +572,7 @@ class Console:
             source = exe_for(flavor)
             if not source.is_file():
                 raise RuntimeError(f"{flavor} exe missing: {source}")
-            label = "engine" if bundle else "clean"
+            label = "engine" if bundle else ("mock" if msix_mock else "clean")
             want = f"{flavor}:{label}"
             marker_path = INSTALLS / tag / ".qa-mode"
             old_marker = (
@@ -545,6 +590,7 @@ class Console:
                     tag,
                     stamp,
                     reset_appdata=restage or old_mode != want,
+                    msix_mock=msix_mock,
                 )
 
             self._set_prepare_step("launching")
@@ -613,6 +659,15 @@ class Console:
                     self.manifest["html_url"] = url
             if "engine_bundled" in payload:
                 self.engine_bundled = bool(payload["engine_bundled"])
+            if "engine_version" in payload:
+                version = str(payload["engine_version"]).strip().lstrip("vV")
+                if not re.fullmatch(r"\d+(?:\.\d+)*", version):
+                    raise RuntimeError("engine version must look like 1.0.0")
+                self.engine_version = version
+            if "engine_changelog" in payload:
+                self.engine_changelog = str(payload["engine_changelog"])
+            if "msix_mock" in payload:
+                self.msix_mock = bool(payload["msix_mock"])
             self.save_state()
         return self.api_state()
 
@@ -670,6 +725,11 @@ class Console:
         if self.engine:
             env["SDSC_CEF_DLC_URL"] = self.engine["url"]
             env["SDSC_CEF_DLC_SHA256"] = self.engine["sha256"]
+            env["SDSC_CEF_DLC_MANIFEST_URL"] = self.engine_manifest_url()
+        if self.msix_mock:
+            mock = cwd / "cef"
+            if mock.is_dir():
+                env["SDSC_MSIX_ENGINE_DIR"] = str(mock)
         if debug_open:
             env["SDSC_DEBUG_OPEN"] = debug_open
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
@@ -761,6 +821,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._html(PAGE)
             elif path == "/api/state":
                 self._json(self.console.api_state())
+            elif path == "/engine-manifest":
+                self._json(self.console.engine_manifest())
             elif path == "/repos/LankyMoose/sdsc-utils/releases/latest":
                 manifest = dict(self.console.manifest)
                 manifest.setdefault("name", manifest.get("tag_name", ""))
@@ -855,6 +917,19 @@ PAGE = """<!doctype html>
   </section>
 
   <section class="card">
+    <h2>Browser engine DLC</h2>
+    <div class="row">
+      <label>Engine version <input id="engine-version" type="text" placeholder="1.0.0"></label>
+      <button onclick="publishEngine()">Publish update</button>
+      <button onclick="saveEngine()">Save</button>
+      <span class="muted" id="engine-note"></span>
+    </div>
+    <div class="row"><textarea id="engine-changelog" placeholder="What's new in this engine build…"></textarea></div>
+    <div class="row"><label><input id="msix-mock" type="checkbox"> Mock MSIX engine package</label></div>
+    <div class="row hint">The app checks <b>/engine-manifest</b> when the hub opens. <b>Publish update</b> bumps the patch version so the next hub open shows <b>Update ready</b>. The MSIX mock puts the staged <b>cef\\</b> folder in the optional-package resolver slot and marks it store-managed (Uninstall hidden).</div>
+  </section>
+
+  <section class="card">
     <h2>Build &amp; install</h2>
     <div class="row">
       <label>Build <select id="flavor">
@@ -904,6 +979,9 @@ function render(){
     $('html-url').value = (S.manifest && S.manifest.html_url) || '';
     $('manifest').value = JSON.stringify(S.manifest || {}, null, 2);
     $('engine').checked = !!S.engine_bundled;
+    $('engine-version').value = S.engine_version || '1.0.0';
+    $('engine-changelog').value = S.engine_changelog || '';
+    $('msix-mock').checked = !!S.msix_mock;
     $('controller-input').checked = S.last_controller_input !== false;
     initialized = true;
   }
@@ -919,7 +997,7 @@ function render(){
   const engine = S.engine ? `DLC ${Math.round(S.engine.bytes / 1048576)} MB` : 'DLC not built';
   $('info').textContent =
     `feed ${S.feed_url || ''}\\n` +
-    `app ${S.version} · build CEF ${S.cef ? 'found' : 'missing'} · ${engine}\\n` +
+    `app ${S.version} · engine ${S.engine_version || '?'} · build CEF ${S.cef ? 'found' : 'missing'} · ${engine}${S.msix_mock ? ' · MSIX mock' : ''}\\n` +
     `installs: ${(S.installed || []).map((i) =>
       i.tag + (i.sidecar ? ' (engine bundled)' : ' (engine missing)') +
       (i.engine_appdata ? ' + downloaded' : '')).join(', ') || '—'}`;
@@ -948,12 +1026,37 @@ async function saveManifest(){
     await getState();
   } catch (e) { $('manifest-note').textContent = String(e); }
 }
+function bumpVersion(value){
+  const parts = String(value || '1.0.0').trim().split('.').map((p) => parseInt(p, 10) || 0);
+  if (!parts.length) parts.push(0);
+  parts[parts.length - 1] += 1;
+  return parts.join('.');
+}
+async function saveEngine(){
+  try {
+    await post('/api/config', {
+      engine_version: $('engine-version').value,
+      engine_changelog: $('engine-changelog').value,
+      msix_mock: $('msix-mock').checked
+    });
+    $('engine-note').textContent = 'saved';
+    await getState();
+  } catch (e) { $('engine-note').textContent = String(e); }
+}
+async function publishEngine(){
+  $('engine-version').value = bumpVersion($('engine-version').value);
+  $('engine-note').textContent = 'published';
+  await saveEngine();
+}
 async function prepare(){
   try {
     await post('/api/prepare', {
       manifest: manifestValue(),
       flavor: $('flavor').value,
       engine_bundled: $('engine').checked,
+      engine_version: $('engine-version').value,
+      engine_changelog: $('engine-changelog').value,
+      msix_mock: $('msix-mock').checked,
       open_hub: $('open-hub').checked,
       controller_input: $('controller-input').checked,
       restage: $('restage').checked

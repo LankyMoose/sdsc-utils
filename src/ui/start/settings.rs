@@ -171,13 +171,15 @@ impl SettingsRow {
             | Self::IdleSecs
             | Self::SleepSecs
             | Self::IdleDim
-            | Self::Sounds
-            | Self::Haptics
             | Self::PerfThrottle
             | Self::PerfAntialiasing
             | Self::PerfVsync
             | Self::ShowUninstalled
             | Self::SyncSteam => true,
+            // Sound/haptics moved to the PS hub shell Settings screen, which
+            // applies them beyond Start. Keep the rows' message plumbing for
+            // on-disk pref compatibility, but never render them here.
+            Self::Sounds | Self::SoundVolume | Self::Haptics | Self::HapticsStrength => false,
             // Hidden feature: selection persistence is always off (no UI).
             // The row, its logic, and the mode gate stay wired underneath.
             Self::SelectionPersist => false,
@@ -187,8 +189,6 @@ impl SettingsRow {
                 snapshot.perf_aa_boot,
                 snapshot.perf_vsync_boot,
             ),
-            Self::SoundVolume => snapshot.sounds_enabled,
-            Self::HapticsStrength => snapshot.haptics_enabled,
             Self::SelectionMode => snapshot.selection_persist,
             #[cfg(debug_assertions)]
             Self::TuneAmbience => true,
@@ -2109,10 +2109,12 @@ mod tests {
     }
 
     #[test]
-    fn focusable_omits_volume_when_sounds_off() {
-        let rows = SettingsRow::focusable(&snap(false, true));
+    fn focusable_omits_feedback_rows_moved_to_hub_settings() {
+        let rows = SettingsRow::focusable(&snap(true, true));
+        assert!(!rows.contains(&SettingsRow::Sounds));
         assert!(!rows.contains(&SettingsRow::SoundVolume));
-        assert!(rows.contains(&SettingsRow::HapticsStrength));
+        assert!(!rows.contains(&SettingsRow::Haptics));
+        assert!(!rows.contains(&SettingsRow::HapticsStrength));
     }
 
     #[test]
@@ -2157,10 +2159,6 @@ mod tests {
                 SettingsRow::IdleSecs,
                 SettingsRow::SleepSecs,
                 SettingsRow::IdleDim,
-                SettingsRow::Sounds,
-                SettingsRow::SoundVolume,
-                SettingsRow::Haptics,
-                SettingsRow::HapticsStrength,
                 SettingsRow::PerfThrottle,
                 SettingsRow::PerfAntialiasing,
                 SettingsRow::PerfVsync,
@@ -2506,17 +2504,18 @@ mod tests {
         for sounds in [false, true] {
             for haptics in [false, true] {
                 let s = snap(sounds, haptics);
-                // Unified visibility predicate: exactly the conditional rows gate.
-                assert_eq!(
-                    SettingsRow::SoundVolume.visible(&s),
-                    sounds,
-                    "sounds={sounds} haptics={haptics}"
-                );
-                assert_eq!(
-                    SettingsRow::HapticsStrength.visible(&s),
-                    haptics,
-                    "sounds={sounds} haptics={haptics}"
-                );
+                // Feedback rows moved to hub Settings and never render here.
+                for row in [
+                    SettingsRow::Sounds,
+                    SettingsRow::SoundVolume,
+                    SettingsRow::Haptics,
+                    SettingsRow::HapticsStrength,
+                ] {
+                    assert!(
+                        !row.visible(&s),
+                        "{row:?} must be hidden (sounds={sounds} haptics={haptics})"
+                    );
+                }
                 let focusable = SettingsRow::focusable(&s);
                 assert_eq!(
                     focusable,

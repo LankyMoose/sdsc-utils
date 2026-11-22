@@ -207,10 +207,16 @@ impl App {
         let window_size = Size::new(cover.width, cover.height);
         let window_position = window::Position::Specific(Point::new(cover.x, cover.y));
         self.refresh_engine_status();
+        self.sync_hub_engine_info();
+        self.sync_hub_settings();
         self.hub_state.on_open(
             self.session.prefs.start_screen_enabled,
             self.browser.engine_status.is_ready(),
         );
+        // `on_open` resets transient screens; engine info and settings are
+        // persistent shell state, so re-apply them after the reset.
+        self.sync_hub_engine_info();
+        self.sync_hub_settings();
         // The opening PS press must not toggle the hub straight back closed.
         self.arm_chord_release_latch();
         let (id, open) = window::open(window::Settings {
@@ -236,6 +242,7 @@ impl App {
         open.map(Message::HubOpened)
             .chain(crate::ui::layout::disable_window_transitions(id))
             .chain(Task::done(Message::WindowShowNow(id)))
+            .chain(self.check_engine_manifest())
     }
 
     /// Hide the hub and return focus to Start when it is the app underneath.
@@ -318,7 +325,16 @@ impl App {
         match message {
             HubMessage::Move(delta) => {
                 if self.hub_state.apps_info.is_some() {
-                    // Info owns the screen until dismissed.
+                    // Info owns the screen; movement scrolls the changelog.
+                    return iced::widget::operation::scroll_by(
+                        hub_view::info_scroll_id(),
+                        iced::widget::operation::AbsoluteOffset {
+                            x: 0.0,
+                            y: 56.0 * delta as f32,
+                        },
+                    );
+                } else if self.hub_state.settings_open {
+                    self.hub_state.settings_move(delta);
                 } else if self.hub_state.apps_menu.is_some() {
                     self.hub_state.apps_menu_move(delta);
                 } else if self.hub_state.apps_open {
@@ -335,6 +351,24 @@ impl App {
             HubMessage::AppsClose => {
                 self.hub_state.close_apps();
                 Task::none()
+            }
+            HubMessage::SettingsOpen => {
+                self.hub_state.open_settings();
+                self.sync_hub_settings();
+                Task::none()
+            }
+            HubMessage::SettingsClose => {
+                self.hub_state.close_settings();
+                Task::none()
+            }
+            HubMessage::SettingsMove(delta) => {
+                self.hub_state.settings_move(delta);
+                Task::none()
+            }
+            HubMessage::SettingsConfirm => self.hub_settings_confirm(),
+            HubMessage::SettingsRow(row) => {
+                self.hub_state.settings_focus = row.min(hub_view::SETTINGS_ROWS.len() - 1);
+                self.hub_settings_confirm()
             }
             HubMessage::Activate(index) => {
                 self.hub_state.select(index);
@@ -362,6 +396,8 @@ impl App {
                 if self.hub_state.apps_info.is_some() {
                     self.hub_state.close_app_info();
                     Task::none()
+                } else if self.hub_state.settings_open {
+                    self.hub_settings_confirm()
                 } else if self.hub_state.apps_menu.is_some() {
                     self.apps_menu_confirm()
                 } else if self.hub_state.apps_open {
@@ -376,9 +412,14 @@ impl App {
                 if self.hub_state.apps_info.is_some() {
                     self.hub_state.close_app_info();
                     Task::none()
+                } else if self.hub_state.settings_open {
+                    self.hub_state.close_settings();
+                    Task::none()
                 } else if self.hub_state.apps_menu.is_some() {
                     self.hub_state.close_apps_menu();
                     Task::none()
+                } else if self.hub_state.installing && !self.hub_state.cancelling {
+                    self.cancel_engine_install()
                 } else if self.hub_state.apps_open {
                     self.hub_state.close_apps();
                     Task::none()
@@ -401,9 +442,13 @@ impl App {
             return Task::none();
         };
         match action {
-            hub_view::AppAction::Install => {
+            hub_view::AppAction::Install | hub_view::AppAction::Update => {
                 self.hub_state.close_apps_menu();
                 self.start_engine_install()
+            }
+            hub_view::AppAction::Cancel => {
+                self.hub_state.close_apps_menu();
+                self.cancel_engine_install()
             }
             hub_view::AppAction::Uninstall => {
                 self.hub_state.close_apps_menu();
@@ -411,6 +456,87 @@ impl App {
             }
             hub_view::AppAction::Info => {
                 self.hub_state.show_app_info(index);
+                #[cfg(feature = "cef-engine")]
+                {
+                    self.load_engine_info_sizes()
+                }
+                #[cfg(not(feature = "cef-engine"))]
+                {
+                    Task::none()
+                }
+            }
+        }
+    }
+
+    /// Copy the live prefs into the hub settings screen.
+    fn sync_hub_settings(&mut self) {
+        self.hub_state.set_settings(
+            self.session.prefs.start_screen_sounds_enabled,
+            self.session.prefs.start_screen_sound_volume,
+            self.session.prefs.start_screen_haptics_enabled,
+            self.session.prefs.start_screen_haptics_strength,
+            self.session.prefs.engine_download_limit_kbps,
+        );
+        #[cfg(feature = "cef-engine")]
+        self.browser.engine_download_limit.store(
+            self.session.prefs.engine_download_limit_kbps,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn next_ten_percent(value: u8) -> u8 {
+        if value >= 100 {
+            0
+        } else {
+            (value / 10 + 1) * 10
+        }
+    }
+
+    /// Adjust the focused hub settings row. Confirm/click both land here.
+    fn hub_settings_confirm(&mut self) -> Task<Message> {
+        match self.hub_state.settings_focus {
+            0 => {
+                let enabled = !self.session.prefs.start_screen_sounds_enabled;
+                let task = self.apply_start_screen_sounds(enabled);
+                self.sync_hub_settings();
+                task
+            }
+            1 => {
+                let volume = Self::next_ten_percent(self.session.prefs.start_screen_sound_volume);
+                let task = self.apply_start_screen_sound_volume(volume);
+                self.sync_hub_settings();
+                task
+            }
+            2 => {
+                let enabled = !self.session.prefs.start_screen_haptics_enabled;
+                let task = self.apply_start_screen_haptics(enabled);
+                self.sync_hub_settings();
+                task
+            }
+            3 => {
+                let strength =
+                    Self::next_ten_percent(self.session.prefs.start_screen_haptics_strength);
+                let task = self.apply_start_screen_haptics_strength(strength);
+                self.sync_hub_settings();
+                task
+            }
+            4 => {
+                let limit = crate::persist::prefs::cycle_engine_download_limit(
+                    self.session.prefs.engine_download_limit_kbps,
+                );
+                self.session.prefs.engine_download_limit_kbps = limit;
+                self.save_prefs();
+                // A live install shares this atomic; the change applies at
+                // the next chunk boundary.
+                #[cfg(feature = "cef-engine")]
+                self.browser
+                    .engine_download_limit
+                    .store(limit, std::sync::atomic::Ordering::Relaxed);
+                self.sync_hub_settings();
+                Task::none()
+            }
+            _ => {
+                self.hub_state.close_settings();
                 Task::none()
             }
         }
@@ -446,6 +572,12 @@ impl App {
             hub_view::HubTile::AddApps => {
                 crate::controller::hid::diag::diag_info("ui-diag: hub apps open");
                 self.hub_state.open_apps();
+                Task::none()
+            }
+            hub_view::HubTile::Settings => {
+                crate::controller::hid::diag::diag_info("ui-diag: hub settings open");
+                self.hub_state.open_settings();
+                self.sync_hub_settings();
                 Task::none()
             }
         }

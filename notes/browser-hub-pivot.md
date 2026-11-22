@@ -153,12 +153,21 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    build dir, and validates the required runtime files. Hub ＋ opens a catalog
    card with Browser engine status/install/uninstall and controller focus
    (D-pad primary/Back, Cross select); Browser on a missing engine opens the
-   catalog instead of a dead page. Dev install uses
-   `SDSC_CEF_DLC_URL`/`SDSC_CEF_DLC_SHA256`, SHA-256 verification, and
+   catalog instead of a dead page. Dev install uses a DLC manifest
+   (`SDSC_CEF_DLC_MANIFEST_URL`, or env-only
+   `SDSC_CEF_DLC_URL`/`SDSC_CEF_DLC_SHA256`), SHA-256 verification, and
    extraction to `LocalAppData`. Installs are versioned
-   (`cef-engine-<stamp>` + `cef-engine.current`), so a locked running runtime
-   never blocks a reinstall; uninstall drops the pointer and defers directory
-   cleanup to the next boot. Because the app binary delay-loads CEF, a
+   (`cef-engine-<stamp>` + `cef-engine.current`) and carry `engine.json`
+   (version/changelog/size). The hub checks the manifest on open, shows
+   **Update ready** when the feed is newer, and Info shows the engine version,
+   size on disk, pending cleanup, and changelog. Install/update is cancellable
+   (cooperative token; staging removed; previous state restored), and a running
+   CEF keeps the old runtime until restart (`Restart to finish`). Uninstall
+   drops the pointer and defers directory cleanup to the next boot. Hub
+   Settings owns UI sound/haptic prefs and the engine download cap
+   (`Unlimited / 2 / 5 / 10 MB/s`, live during a download); the tile always
+   shows current MB/s. `SDSC_MSIX_ENGINE_DIR` mocks the optional package for
+   resolver/managed-state testing. Because the app binary delay-loads CEF, a
    truly engine-less portable starts; the install path loads `libcef.dll` and
    attaches the engine in the same process. Remaining: Store
    `RequestDownloadAndInstallStorePackagesAsync` wiring/product IDs,
