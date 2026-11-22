@@ -150,8 +150,14 @@ impl EngineProgress {
     /// Whole-number throughput label (`8 MB/s`). Hidden when no bytes have
     /// moved yet or the phase does not move bytes.
     pub fn rate_label(&self) -> Option<String> {
-        let rate = self.rate_bps.filter(|rate| *rate >= 1024.0)?;
-        Some(format!("{:.0} MB/s", rate / (1024.0 * 1024.0)))
+        const KB: f64 = 1024.0;
+        const MB: f64 = 1024.0 * KB;
+        let rate = self.rate_bps.filter(|rate| *rate >= KB)?;
+        if rate >= MB {
+            Some(format!("{:.0} MB/s", rate / MB))
+        } else {
+            Some(format!("{:.0} KB/s", rate / KB))
+        }
     }
 }
 
@@ -1583,6 +1589,20 @@ mod tests {
         assert_eq!(format_size(196 * 1024 * 1024), "196 MB");
         assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2.0 GB");
         assert_eq!(format_size(512 * 1024), "512 KB");
+    }
+
+    #[test]
+    fn throughput_label_switches_units() {
+        let mut progress = EngineProgress {
+            phase: EnginePhase::Downloading,
+            fraction: Some(0.5),
+            rate_bps: Some(512.0 * 1024.0),
+        };
+        assert_eq!(progress.rate_label().as_deref(), Some("512 KB/s"));
+        progress.rate_bps = Some(8.2 * 1024.0 * 1024.0);
+        assert_eq!(progress.rate_label().as_deref(), Some("8 MB/s"));
+        progress.rate_bps = Some(0.0);
+        assert_eq!(progress.rate_label(), None);
     }
 
     #[test]
