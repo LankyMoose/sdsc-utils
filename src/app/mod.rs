@@ -206,6 +206,8 @@ pub enum Message {
     },
     /// 60Hz tick while the hub animates the indeterminate uninstall meter.
     HubProgressTick,
+    /// 60Hz tick while a hub controller card expands/collapses on focus.
+    HubControllerTick,
     /// A window resized (logical size). The browser and hub consume this;
     /// the event is authoritative for their final full-cover size.
     WindowSized(window::Id, iced::Size),
@@ -369,7 +371,7 @@ impl Message {
             Message::EngineInstallProgress { .. }
             | Message::EngineManifestReady { .. }
             | Message::EngineUninstallDone { .. } => false,
-            Message::HubProgressTick => false,
+            Message::HubProgressTick | Message::HubControllerTick => false,
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
             #[cfg(debug_assertions)]
@@ -1343,6 +1345,9 @@ impl App {
         if self.hub_state.uninstalling {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::HubProgressTick));
         }
+        if self.hub_visible && self.hub_state.controller_anim_needs_frames() {
+            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::HubControllerTick));
+        }
 
         // Transient: animate the reload-button spinner until the queued exit.
         if self.renderer_reload_queued {
@@ -1385,7 +1390,13 @@ impl App {
             subscriptions.push(Subscription::run_with(engine, engine_event_stream));
         }
 
-        if self.start_visible && (self.start_state.needs_frames() || self.steam_scan_in_flight()) {
+        // The hub's full-screen overlay owns the screen; freezing Start's
+        // 60Hz clock avoids advance-then-catch-up judder in the dimmed
+        // game art underneath. Frames resume when the hub closes.
+        if self.start_visible
+            && !self.hub_visible
+            && (self.start_state.needs_frames() || self.steam_scan_in_flight())
+        {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::StartFrame));
         }
         if self.browser_visible {
@@ -1756,6 +1767,10 @@ impl App {
             }
             Message::HubProgressTick => {
                 self.hub_state.advance_progress_anim();
+                Task::none()
+            }
+            Message::HubControllerTick => {
+                self.hub_state.tick_controller_anim(Instant::now());
                 Task::none()
             }
             Message::WindowSized(id, size) => {
@@ -2160,6 +2175,11 @@ impl App {
     }
 
     fn on_start_frame(&mut self) -> Task<Message> {
+        // A frame queued before the hub opened must not advance/redraw the
+        // frozen Start animation.
+        if self.hub_visible {
+            return Task::none();
+        }
         let now = Instant::now();
         self.start_state.steam_scan_pending = self.steam_scan_pending;
         // Prefs-owned pin for the immersive position rail (heals across

@@ -26,7 +26,7 @@ use std::time::Instant;
 
 /// Nominal hub card width/height. The card is centered in the full-monitor
 /// window; `HUB_HEIGHT` is only the pre-open stage default.
-pub const HUB_WIDTH: f32 = 620.0;
+pub const HUB_WIDTH: f32 = 500.0;
 pub const HUB_HEIGHT: f32 = 280.0;
 
 /// Main hub section inset (the card itself has no padding).
@@ -275,6 +275,9 @@ pub struct State {
     pub controllers: Vec<ControllerRow>,
     /// Controller card under the focus ring.
     pub controller_focus: usize,
+    /// Per-controller expansion 0..=1 (wheel-only → selected detail card).
+    controller_anim: Vec<f32>,
+    controller_anim_at: Option<Instant>,
     /// Controller serial currently being powered off (feature report sent).
     pub powering_off: Option<Serial>,
     /// Ring flash started with the last successful Identify.
@@ -342,6 +345,8 @@ impl Default for State {
             hint_anim_at: None,
             controllers: Vec::new(),
             controller_focus: 0,
+            controller_anim: Vec::new(),
+            controller_anim_at: None,
             powering_off: None,
             identify_flash: None,
             apps_menu: None,
@@ -454,13 +459,77 @@ impl State {
             .get(self.controller_focus.min(self.controllers.len() - 1))
     }
 
+    /// Expansion amount for one controller card (0 = wheel-only, 1 = full).
+    pub fn controller_focus_t(&self, index: usize) -> f32 {
+        self.controller_anim
+            .get(index)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0)
+    }
+
+    /// Whether the controller focus animation needs UI ticks.
+    pub fn controller_anim_needs_frames(&self) -> bool {
+        let selected = self
+            .controller_focus
+            .min(self.controllers.len().saturating_sub(1));
+        self.controller_anim.iter().enumerate().any(|(i, t)| {
+            let target = if self.focus == HubFocus::Controllers && i == selected {
+                1.0
+            } else {
+                0.0
+            };
+            (t - target).abs() > 0.002
+        })
+    }
+
+    /// Advance controller card expansion/collapse (~280ms).
+    pub fn tick_controller_anim(&mut self, now: Instant) {
+        let dt = self
+            .controller_anim_at
+            .map(|at| now.saturating_duration_since(at).as_secs_f32())
+            .unwrap_or(0.0)
+            .min(0.05);
+        self.controller_anim_at = Some(now);
+        if dt <= 0.0 {
+            return;
+        }
+        let selected = self
+            .controller_focus
+            .min(self.controllers.len().saturating_sub(1));
+        let anim_secs = crate::ui::motion::BASE_MS as f32 / 1000.0;
+        for (i, t) in self.controller_anim.iter_mut().enumerate() {
+            let target = if self.focus == HubFocus::Controllers && i == selected {
+                1.0
+            } else {
+                0.0
+            };
+            approach_anim_to(t, target, dt, anim_secs);
+        }
+    }
+
     /// Install/refresh the controller strip rows. Keeps focus valid and clears
     /// a power-off marker once the pad has left the list.
     pub fn set_controllers(&mut self, controllers: Vec<ControllerRow>) {
+        // Preserve in-flight expansion across the per-tick session resync by
+        // matching serials, not row indices.
+        let old_rows = std::mem::take(&mut self.controllers);
+        let old_anim = std::mem::take(&mut self.controller_anim);
+        self.controller_anim = controllers
+            .iter()
+            .map(|row| {
+                old_rows
+                    .iter()
+                    .position(|old| old.serial == row.serial)
+                    .and_then(|i| old_anim.get(i).copied())
+                    .unwrap_or(0.0)
+            })
+            .collect();
         self.controllers = controllers;
         if self.controllers.is_empty() {
             self.controller_focus = 0;
             self.focus = HubFocus::Apps;
+            self.controller_anim_at = None;
         } else if self.controller_focus >= self.controllers.len() {
             self.controller_focus = self.controllers.len() - 1;
         }
@@ -533,6 +602,8 @@ impl State {
         self.triangle_held = false;
         self.focus = HubFocus::Apps;
         self.controller_focus = 0;
+        self.controller_anim.clear();
+        self.controller_anim_at = None;
         self.powering_off = None;
         self.identify_flash = None;
         self.reset_triangle_hold();
@@ -1067,11 +1138,9 @@ fn controller_card<'a>(
     row: &'a ControllerRow,
     index: usize,
 ) -> Element<'a, HubMessage> {
-    let selected = state.focus == HubFocus::Controllers
-        && state
-            .controller_focus
-            .min(state.controllers.len().saturating_sub(1))
-            == index;
+    let t = state.controller_focus_t(index);
+    let expanded = t > 0.005;
+    let card_w = CONTROLLER_CARD_W + (CONTROLLER_CARD_W_SELECTED - CONTROLLER_CARD_W) * t;
     let powering_off = row.connected && state.powering_off.as_ref() == Some(&row.serial);
     let live = row.connected && !powering_off;
     let ring_color = if state.ring_flash_white(&row.serial) {
@@ -1090,9 +1159,10 @@ fn controller_card<'a>(
         if live { 1.0 } else { 0.6 },
     );
     // Default strip state is wheel-only. Selecting a card expands it to the
-    // name/status and the action hints.
-    let body: Element<'a, HubMessage> = if selected {
-        let details_w = CONTROLLER_CARD_W_SELECTED - 12.0 - CONTROLLER_RING - 8.0;
+    // name/status and the action hints; the expansion is driven by `t` so
+    // focus changes glide instead of swapping in one frame.
+    let body: Element<'a, HubMessage> = if expanded {
+        let details_w = (card_w - 12.0 - CONTROLLER_RING - 8.0).max(1.0);
         let meta = if powering_off {
             "Powering off".to_string()
         } else if !row.connected {
@@ -1100,19 +1170,30 @@ fn controller_card<'a>(
         } else {
             format!("{} · {}", row.connection, row.state)
         };
+        let meta_color = if powering_off {
+            theme::MUTED
+        } else if row.low {
+            theme::WARNING
+        } else {
+            theme::DIM
+        };
         let mut hints = Vec::new();
-        if !powering_off {
+        if !powering_off && details_w >= 200.0 {
             if row.show_identify() {
-                hints.push(plain_hint(FaceButton::Cross, "Identify", state.cross_held));
+                let mut hint = plain_hint(FaceButton::Cross, "Identify", state.cross_held);
+                hint.alpha = t;
+                hints.push(hint);
             }
             if row.show_power_off() {
-                hints.push(hold_hint(
+                let mut hint = hold_hint(
                     FaceButton::Triangle,
                     "Power off",
                     state.triangle_progress,
                     state.triangle_armed_t,
                     state.triangle_held,
-                ));
+                );
+                hint.alpha = t;
+                hints.push(hint);
             }
         }
         let mut details = column![
@@ -1126,7 +1207,10 @@ fn controller_card<'a>(
                 weight: iced::font::Weight::Semibold,
                 ..iced::Font::default()
             })
-            .color(if live { theme::INK } else { theme::MUTED })
+            .color(theme::scale_alpha(
+                if live { theme::INK } else { theme::MUTED },
+                t
+            ))
             .width(Fill),
             text(text_fit::ellipsize_to_width(
                 &meta,
@@ -1134,13 +1218,7 @@ fn controller_card<'a>(
                 details_w
             ))
             .size(theme::type_scale::CAPTION)
-            .color(if powering_off {
-                theme::MUTED
-            } else if row.low {
-                theme::WARNING
-            } else {
-                theme::DIM
-            })
+            .color(theme::scale_alpha(meta_color, t))
             .width(Fill),
         ]
         .spacing(2)
@@ -1158,11 +1236,6 @@ fn controller_card<'a>(
     } else {
         ring
     };
-    let card_w = if selected {
-        CONTROLLER_CARD_W_SELECTED
-    } else {
-        CONTROLLER_CARD_W
-    };
     let mut b = button(
         container(body)
             .width(Fill)
@@ -1174,7 +1247,7 @@ fn controller_card<'a>(
     .width(Length::Fixed(card_w))
     .height(Length::Fixed(CONTROLLER_CARD_H))
     .padding(6)
-    .style(move |_theme, status| controller_card_style(selected, live, status));
+    .style(move |_theme, status| controller_card_style(t, live, status));
     // Wheel-only cards still need a way to reveal their name/status; connected
     // cards additionally Identify. Disconnected selection is a no-op beyond
     // expanding the card.
@@ -1182,16 +1255,21 @@ fn controller_card<'a>(
     b.into()
 }
 
-/// ~100ms accent → ink chase mirroring Start's armed hold-hint animation.
-fn approach_hint_anim(current: &mut f32, target: bool, dt: f32) {
-    const HINT_ANIM_SECS: f32 = crate::ui::motion::FAST_MS as f32 / 1000.0;
-    let target = if target { 1.0 } else { 0.0 };
-    let step = dt / HINT_ANIM_SECS;
+/// Move a 0..=1 animation value toward its target at a fixed duration.
+fn approach_anim_to(current: &mut f32, target: f32, dt: f32, duration_secs: f32) {
+    let target = target.clamp(0.0, 1.0);
+    let step = dt / duration_secs.max(f32::EPSILON);
     if *current < target {
         *current = (*current + step).min(target);
     } else if *current > target {
         *current = (*current - step).max(target);
     }
+}
+
+/// ~100ms accent → ink chase mirroring Start's armed hold-hint animation.
+fn approach_hint_anim(current: &mut f32, target: bool, dt: f32) {
+    const HINT_ANIM_SECS: f32 = crate::ui::motion::FAST_MS as f32 / 1000.0;
+    approach_anim_to(current, if target { 1.0 } else { 0.0 }, dt, HINT_ANIM_SECS);
 }
 
 fn options_pill_style(_theme: &Theme, status: button::Status) -> button::Style {
@@ -1212,14 +1290,10 @@ fn options_pill_style(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-fn controller_card_style(selected: bool, live: bool, status: button::Status) -> button::Style {
+fn controller_card_style(focus_t: f32, live: bool, status: button::Status) -> button::Style {
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-    let (fill, border) = if selected {
-        (
-            theme::alpha(theme::INK, 0.10),
-            theme::alpha(theme::INK, 0.34),
-        )
-    } else if hovered {
+    let focus_t = focus_t.clamp(0.0, 1.0);
+    let (base_fill, base_border) = if hovered {
         (
             theme::alpha(theme::INK, 0.07),
             theme::alpha(theme::INK, 0.20),
@@ -1230,6 +1304,8 @@ fn controller_card_style(selected: bool, live: bool, status: button::Status) -> 
             theme::GLASS_HAIRLINE,
         )
     };
+    let fill = theme::mix(base_fill, theme::alpha(theme::INK, 0.10), focus_t);
+    let border = theme::mix(base_border, theme::alpha(theme::INK, 0.34), focus_t);
     button::Style {
         background: Some(Background::Color(fill)),
         text_color: theme::INK,
@@ -1238,9 +1314,9 @@ fn controller_card_style(selected: bool, live: bool, status: button::Status) -> 
             width: 1.0,
             radius: theme::radius::LG.into(),
         },
-        shadow: if selected {
+        shadow: if focus_t > 0.01 {
             Shadow {
-                color: theme::alpha(theme::INK, 0.10),
+                color: theme::alpha(theme::INK, 0.10 * focus_t),
                 offset: Vector::new(0.0, 0.0),
                 blur_radius: 14.0,
             }
@@ -2189,6 +2265,44 @@ mod tests {
             state.pad_tick(&press, now + std::time::Duration::from_millis(48)),
             None
         );
+    }
+
+    #[test]
+    fn controller_focus_animation_expands_then_collapses() {
+        use crate::controller::model::{
+            Capabilities, Connection, ControllerKind, ControllerStatus, PowerState,
+        };
+        let row = ControllerRow::connected(
+            &ControllerStatus {
+                index: 1,
+                kind: ControllerKind::DualSense,
+                serial: Serial::from("abc"),
+                product: "DualSense".into(),
+                connection: Connection::Bluetooth,
+                percent: 80,
+                state: PowerState::Discharging,
+                capabilities: Capabilities::FULL,
+            },
+            false,
+            true,
+            None,
+            20,
+            None,
+        );
+        let mut state = State::default();
+        state.set_controllers(vec![row]);
+        state.focus = HubFocus::Controllers;
+        let start = Instant::now();
+        for i in 1..=8 {
+            state.tick_controller_anim(start + std::time::Duration::from_millis(50 * i));
+        }
+        assert!((state.controller_focus_t(0) - 1.0).abs() < 1e-4);
+        assert!(!state.controller_anim_needs_frames());
+        state.focus = HubFocus::Apps;
+        for i in 1..=8 {
+            state.tick_controller_anim(start + std::time::Duration::from_millis(400 + 50 * i));
+        }
+        assert!(state.controller_focus_t(0).abs() < 1e-4);
     }
 
     #[test]
