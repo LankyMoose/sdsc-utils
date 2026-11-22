@@ -1155,6 +1155,8 @@ fn hub_install_progress(
         Engine::Starting => EngineProgress {
             phase: EnginePhase::Preparing,
             fraction: None,
+            bytes_done: 0,
+            bytes_total: None,
             rate_bps: None,
         },
         Engine::Downloading { received, total } => EngineProgress {
@@ -1162,21 +1164,29 @@ fn hub_install_progress(
             fraction: total
                 .filter(|total| *total > 0)
                 .map(|total| received as f32 / total as f32),
+            bytes_done: received,
+            bytes_total: total,
             rate_bps: None,
         },
         Engine::Verifying { done, total } => EngineProgress {
             phase: EnginePhase::Verifying,
             fraction: (total > 0).then(|| done as f32 / total as f32),
+            bytes_done: done,
+            bytes_total: Some(total),
             rate_bps: None,
         },
         Engine::Extracting { done, total } => EngineProgress {
             phase: EnginePhase::Installing,
             fraction: (total > 0).then(|| done as f32 / total as f32),
+            bytes_done: done,
+            bytes_total: Some(total),
             rate_bps: None,
         },
         Engine::Finishing => EngineProgress {
             phase: EnginePhase::Finishing,
             fraction: None,
+            bytes_done: 0,
+            bytes_total: None,
             rate_bps: None,
         },
     }

@@ -87,8 +87,9 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
   action row. The worker deletes staging, restores the previous install, and
   leaves the pointer untouched.
 - **Download speed** lives in PS hub → Settings (`Unlimited / 2 / 5 / 10 MB/s`)
-  and is shared with a live download. The tile always shows the current MB/s;
-  there is no “capped” label.
+  and is shared with a live download. It is hidden in packaged builds because
+  the Store owns downloads. The tile shows the live `current / target` size
+  and MB/s; there is no “capped” label.
 - **Mock MSIX engine package** stages `cef\` beside the exe and sets
   `SDSC_MSIX_ENGINE_DIR`, so the resolver treats it as the optional package:
   Browser reports **Managed by Store**, Uninstall is hidden, and Info shows the

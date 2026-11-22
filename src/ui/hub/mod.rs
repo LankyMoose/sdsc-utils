@@ -122,6 +122,9 @@ pub enum EnginePhase {
 pub struct EngineProgress {
     pub phase: EnginePhase,
     pub fraction: Option<f32>,
+    /// Bytes completed / total for byte-moving phases.
+    pub bytes_done: u64,
+    pub bytes_total: Option<u64>,
     /// Live throughput while a byte-moving phase is active.
     pub rate_bps: Option<f64>,
 }
@@ -145,6 +148,14 @@ impl EngineProgress {
         } else {
             self.fraction.unwrap_or(0.0).clamp(0.0, 1.0)
         }
+    }
+
+    /// `82 MB / 196 MB` for byte-moving phases, hidden when the feed did not
+    /// advertise a total size.
+    pub fn size_label(&self) -> Option<String> {
+        let total = self.bytes_total.filter(|total| *total > 0)?;
+        let done = self.bytes_done.min(total);
+        Some(format!("{} / {}", format_size(done), format_size(total)))
     }
 
     /// Whole-number throughput label (`8 MB/s`). Hidden when no bytes have
@@ -257,6 +268,9 @@ pub struct State {
     pub haptics_enabled: bool,
     pub haptics_strength: u8,
     pub download_limit_kbps: u32,
+    /// False in packaged builds: the Store owns engine downloads/updates, so
+    /// the local download cap has no effect and its row is hidden.
+    pub download_cap_available: bool,
 }
 
 impl Default for State {
@@ -295,6 +309,7 @@ impl Default for State {
             haptics_enabled: true,
             haptics_strength: 60,
             download_limit_kbps: 0,
+            download_cap_available: true,
         }
     }
 }
@@ -378,12 +393,26 @@ impl State {
         self.settings_focus = 0;
     }
 
+    pub fn settings_visible(&self, row: usize) -> bool {
+        row != 4 || self.download_cap_available
+    }
+
     pub fn settings_move(&mut self, delta: i32) {
         if delta == 0 {
             return;
         }
-        let len = SETTINGS_ROWS.len() as i32;
-        self.settings_focus = (self.settings_focus as i32 + delta).rem_euclid(len) as usize;
+        let rows: Vec<usize> = (0..SETTINGS_ROWS.len())
+            .filter(|row| self.settings_visible(*row))
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let current = rows
+            .iter()
+            .position(|row| *row == self.settings_focus)
+            .unwrap_or(0) as i32;
+        let next = (current + delta).rem_euclid(rows.len() as i32) as usize;
+        self.settings_focus = rows[next];
     }
 
     pub fn settings_value(&self, row: usize) -> String {
@@ -542,6 +571,8 @@ impl State {
         self.progress = EngineProgress {
             phase: EnginePhase::Cancelling,
             fraction: None,
+            bytes_done: 0,
+            bytes_total: None,
             rate_bps: None,
         };
     }
@@ -581,6 +612,8 @@ impl State {
         self.progress = EngineProgress {
             phase: EnginePhase::Uninstalling,
             fraction: None,
+            bytes_done: 0,
+            bytes_total: None,
             rate_bps: None,
         };
         self.progress_anim = 0.0;
@@ -697,6 +730,9 @@ fn settings_view<'a>(state: &State, stage_w: f32, backdrop_alpha: f32) -> Elemen
     let card_w = (stage_w - 48.0).clamp(340.0, 460.0);
     let mut rows = column![].spacing(4);
     for (i, label) in SETTINGS_ROWS.iter().enumerate() {
+        if !state.settings_visible(i) {
+            continue;
+        }
         let focused = i == state.settings_focus;
         let value = state.settings_value(i);
         let mut content = row![
@@ -855,7 +891,7 @@ fn progress_tile_body<'a>(
                 .color(theme::DIM),
         );
     }
-    column![
+    let mut body = column![
         svg(svg::Handle::from_memory(icon.as_bytes()))
             .width(Length::Fixed(icon_size))
             .height(Length::Fixed(icon_size))
@@ -869,12 +905,21 @@ fn progress_tile_body<'a>(
         .font(font)
         .color(ink),
         phase,
+    ];
+    if let Some(size) = state.progress.size_label() {
+        body = body.push(
+            text(size)
+                .size(theme::type_scale::CAPTION)
+                .color(theme::MUTED),
+        );
+    }
+    body.push(
         progress_bar(0.0..=1.0, state.progress_bar_value())
             .length(Length::Fixed((width - 40.0).max(80.0)))
             .girth(3.0)
             .style(progress_style),
-    ]
-    .spacing(4)
+    )
+    .spacing(3)
     .align_x(Alignment::Center)
     .into()
 }
@@ -1091,6 +1136,22 @@ fn app_info<'a>(state: &'a State, index: usize) -> Element<'a, HubMessage> {
             text(format!("Browser engine {version}"))
                 .size(theme::type_scale::CAPTION)
                 .color(theme::MUTED),
+        );
+    }
+    if state.installing {
+        let mut live = state.progress.label().to_string();
+        if let Some(size) = state.progress.size_label() {
+            live.push_str(" · ");
+            live.push_str(&size);
+        }
+        if let Some(rate) = state.progress.rate_label() {
+            live.push_str(" · ");
+            live.push_str(&rate);
+        }
+        details = details.push(
+            text(live)
+                .size(theme::type_scale::CAPTION)
+                .color(theme::WARNING),
         );
     }
     if state.engine_managed {
@@ -1516,10 +1577,16 @@ mod tests {
         state.set_install_progress(EngineProgress {
             phase: EnginePhase::Downloading,
             fraction: Some(0.42),
+            bytes_done: 82 * 1024 * 1024,
+            bytes_total: Some(196 * 1024 * 1024),
             rate_bps: Some(8.2 * 1024.0 * 1024.0),
         });
         assert_eq!(state.app_status(HubApp::Browser), "Downloading");
         assert_eq!(state.progress.label(), "Downloading");
+        assert_eq!(
+            state.progress.size_label().as_deref(),
+            Some("82 MB / 196 MB")
+        );
         state.install_done(true, None);
         assert!(!state.installing);
         assert_eq!(state.app_status(HubApp::Browser), "Installed");
@@ -1585,6 +1652,22 @@ mod tests {
     }
 
     #[test]
+    fn download_cap_row_is_hidden_for_packaged_builds() {
+        let mut state = State {
+            download_cap_available: false,
+            ..State::default()
+        };
+        assert!(!state.settings_visible(4));
+        assert!(state.settings_visible(3));
+        assert!(state.settings_visible(5));
+        state.settings_focus = 3;
+        state.settings_move(1);
+        assert_eq!(state.settings_focus, 5, "movement skips the hidden cap row");
+        state.settings_move(1);
+        assert_eq!(state.settings_focus, 0);
+    }
+
+    #[test]
     fn info_size_uses_whole_megabytes() {
         assert_eq!(format_size(196 * 1024 * 1024), "196 MB");
         assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2.0 GB");
@@ -1596,6 +1679,8 @@ mod tests {
         let mut progress = EngineProgress {
             phase: EnginePhase::Downloading,
             fraction: Some(0.5),
+            bytes_done: 0,
+            bytes_total: None,
             rate_bps: Some(512.0 * 1024.0),
         };
         assert_eq!(progress.rate_label().as_deref(), Some("512 KB/s"));

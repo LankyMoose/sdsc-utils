@@ -367,7 +367,10 @@ impl App {
             }
             HubMessage::SettingsConfirm => self.hub_settings_confirm(),
             HubMessage::SettingsRow(row) => {
-                self.hub_state.settings_focus = row.min(hub_view::SETTINGS_ROWS.len() - 1);
+                if row >= hub_view::SETTINGS_ROWS.len() || !self.hub_state.settings_visible(row) {
+                    return Task::none();
+                }
+                self.hub_state.settings_focus = row;
                 self.hub_settings_confirm()
             }
             HubMessage::Activate(index) => {
@@ -477,6 +480,9 @@ impl App {
             self.session.prefs.start_screen_haptics_strength,
             self.session.prefs.engine_download_limit_kbps,
         );
+        // Store-managed builds download through the Store; the local cap is a
+        // standalone-only control.
+        self.hub_state.download_cap_available = !crate::platform::packaged::is_packaged();
         #[cfg(feature = "cef-engine")]
         self.browser.engine_download_limit.store(
             self.session.prefs.engine_download_limit_kbps,

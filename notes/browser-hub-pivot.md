@@ -164,10 +164,10 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    (cooperative token; staging removed; previous state restored), and a running
    CEF keeps the old runtime until restart (`Restart to finish`). Uninstall
    drops the pointer and defers directory cleanup to the next boot. Hub
-   Settings owns UI sound/haptic prefs and the engine download cap
-   (`Unlimited / 2 / 5 / 10 MB/s`, live during a download); the tile always
-   shows current MB/s. `SDSC_MSIX_ENGINE_DIR` mocks the optional package for
-   resolver/managed-state testing. Because the app binary delay-loads CEF, a
+   Settings owns UI sound/haptic prefs and the standalone-only engine download
+   cap (`Unlimited / 2 / 5 / 10 MB/s`, live during a download); the tile shows
+   the live `current / target` size and MB/s. `SDSC_MSIX_ENGINE_DIR` mocks the
+   optional package for resolver/managed-state testing. Because the app binary delay-loads CEF, a
    truly engine-less portable starts; the install path loads `libcef.dll` and
    attaches the engine in the same process. Remaining: Store
    `RequestDownloadAndInstallStorePackagesAsync` wiring/product IDs,
