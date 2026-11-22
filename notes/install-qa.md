@@ -111,11 +111,11 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
   view.
 - Cross (or click) launches the focused app. Triangle on the Browser tile opens
   its install/update/Info actions popup (the old catalog screen is gone).
-- Only the selected controller card (controllers row focused) shows its
-  battery wheel; unfocused cards stay compact with name/status. The selected
-  card also adds the standard ringed face hints: Cross Identify and Triangle
-  hold Power off on a live Bluetooth pad. These replaced Start's controllers
-  surface, which no longer exists (Create is inert).
+- The controller strip defaults to wheel-only cards. Selecting a card while
+  the controllers row is focused expands it to name/status plus the standard
+  ringed face hints: Cross Identify and Triangle hold Power off on a live
+  Bluetooth pad. These replaced Start's controllers surface, which no longer
+  exists (Create is inert).
 
 ## Environment overrides
 

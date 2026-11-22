@@ -121,6 +121,7 @@ pub(crate) fn hold_hint(
     face: FaceButton,
     label: &'static str,
     progress: f32,
+    armed_t: f32,
     pressed: bool,
 ) -> ActionHint {
     ActionHint {
@@ -128,7 +129,7 @@ pub(crate) fn hold_hint(
         text_glyph: None,
         label,
         hold: Some(progress),
-        armed_t: 0.0,
+        armed_t,
         pressed,
         press_t: 0.0,
         alpha: 1.0,

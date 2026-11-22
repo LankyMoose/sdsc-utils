@@ -25,9 +25,8 @@ use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Shadow, 
 use std::time::Instant;
 
 /// Nominal hub card width/height. The card is centered in the full-monitor
-/// window; `HUB_HEIGHT` is only the pre-open stage default. Keep the card
-/// compact: the controller strip scrolls horizontally rather than widening it.
-pub const HUB_WIDTH: f32 = 380.0;
+/// window; `HUB_HEIGHT` is only the pre-open stage default.
+pub const HUB_WIDTH: f32 = 620.0;
 pub const HUB_HEIGHT: f32 = 280.0;
 
 /// Main hub section inset (the card itself has no padding).
@@ -37,9 +36,10 @@ const TILE_H: f32 = 88.0;
 const TILE_GAP: f32 = 6.0;
 const ICON: f32 = 42.0;
 const TILE_TITLE: f32 = 14.0;
-/// Controller strip card metrics (fixed width; horizontal scroll). The width
-/// leaves room for the selected card's Identify / Power off hint cluster.
-pub const CONTROLLER_CARD_W: f32 = 280.0;
+/// Controller strip card metrics. Unfocused cards are wheel-only; the
+/// selected card expands to leave room for name/status and action hints.
+pub const CONTROLLER_CARD_W: f32 = 88.0;
+pub const CONTROLLER_CARD_W_SELECTED: f32 = 280.0;
 pub const CONTROLLER_CARD_H: f32 = 84.0;
 const CONTROLLER_GAP: f32 = 6.0;
 const CONTROLLER_RING: f32 = 46.0;
@@ -268,6 +268,9 @@ pub struct State {
     /// Triangle hold tracker (power off on the focused Bluetooth controller).
     triangle_hold: crate::domain::pad::HoldTracker,
     pub triangle_progress: f32,
+    /// Armed-color chase for a completed hold hint (accent → ink over 100ms).
+    pub triangle_armed_t: f32,
+    hint_anim_at: Option<Instant>,
     /// Connected/remembered controller cards for the horizontal strip.
     pub controllers: Vec<ControllerRow>,
     /// Controller card under the focus ring.
@@ -335,6 +338,8 @@ impl Default for State {
             triangle_held: false,
             triangle_hold: crate::domain::pad::HoldTracker::default(),
             triangle_progress: 0.0,
+            triangle_armed_t: 0.0,
+            hint_anim_at: None,
             controllers: Vec::new(),
             controller_focus: 0,
             powering_off: None,
@@ -471,6 +476,8 @@ impl State {
     fn reset_triangle_hold(&mut self) {
         self.triangle_hold.reset();
         self.triangle_progress = 0.0;
+        self.triangle_armed_t = 0.0;
+        self.hint_anim_at = None;
     }
 
     /// Start the UI ring flash that mirrors the lightbar Identify pattern.
@@ -828,6 +835,13 @@ impl State {
         }
         let (progress, completed) = self.triangle_hold.update(sample.triangle && can_power, now);
         self.triangle_progress = progress;
+        let dt = self
+            .hint_anim_at
+            .map(|at| now.saturating_duration_since(at).as_secs_f32())
+            .unwrap_or(0.0)
+            .min(0.05);
+        self.hint_anim_at = Some(now);
+        approach_hint_anim(&mut self.triangle_armed_t, progress >= 1.0, dt);
         if completed && can_power {
             message = Some(HubMessage::PowerOff);
         }
@@ -904,7 +918,7 @@ pub fn view<'a>(
         .style(card_style);
     let base: Element<'a, HubMessage> = frame(card.into(), backdrop_alpha);
     if let Some(index) = state.apps_info {
-        return stack![base, app_info(state, index, (card_w - 24.0).max(300.0))]
+        return stack![base, app_info(state, index)]
             .width(Fill)
             .height(Fill)
             .into();
@@ -932,8 +946,10 @@ pub fn controllers_scroll_id() -> iced::widget::Id {
 pub fn controller_scroll_x(index: usize, stage_w: f32) -> f32 {
     let card_w = hub_card_width(stage_w);
     let viewport = (card_w - 2.0 * SECTION_PAD_X).max(1.0);
+    // Every card before the target collapses to the wheel-only width; the
+    // previous selection shrinks before the scroll lands.
     let x = index as f32 * (CONTROLLER_CARD_W + CONTROLLER_GAP);
-    (x - (viewport - CONTROLLER_CARD_W).max(0.0) * 0.5).max(0.0)
+    (x - (viewport - CONTROLLER_CARD_W_SELECTED).max(0.0) * 0.5).max(0.0)
 }
 
 fn section_separator<'a>(width: f32) -> Element<'a, HubMessage> {
@@ -1058,114 +1074,124 @@ fn controller_card<'a>(
             == index;
     let powering_off = row.connected && state.powering_off.as_ref() == Some(&row.serial);
     let live = row.connected && !powering_off;
-    // The wheel is a focus affordance: unfocused rows stay compact and show
-    // only name/state. It returns as soon as the card is selected.
-    let ring = selected.then(|| {
-        let ring_color = if state.ring_flash_white(&row.serial) {
-            theme::from_rgb(lightbar::IDENTIFY_FLASH)
-        } else if live {
-            theme::from_rgb(spectrum.color_at_percent(row.percent))
+    let ring_color = if state.ring_flash_white(&row.serial) {
+        theme::from_rgb(lightbar::IDENTIFY_FLASH)
+    } else if live {
+        theme::from_rgb(spectrum.color_at_percent(row.percent))
+    } else {
+        theme::DIM
+    };
+    let ring = crate::ui::percent_ring::percent_ring(
+        row.percent,
+        ring_color,
+        CONTROLLER_RING,
+        row.eta.clone(),
+        1.0,
+        if live { 1.0 } else { 0.6 },
+    );
+    // Default strip state is wheel-only. Selecting a card expands it to the
+    // name/status and the action hints.
+    let body: Element<'a, HubMessage> = if selected {
+        let details_w = CONTROLLER_CARD_W_SELECTED - 12.0 - CONTROLLER_RING - 8.0;
+        let meta = if powering_off {
+            "Powering off".to_string()
+        } else if !row.connected {
+            "Disconnected".to_string()
         } else {
-            theme::DIM
+            format!("{} · {}", row.connection, row.state)
         };
-        crate::ui::percent_ring::percent_ring(
-            row.percent,
-            ring_color,
-            CONTROLLER_RING,
-            row.eta.clone(),
-            1.0,
-            if live { 1.0 } else { 0.6 },
-        )
-    });
-    let details_w = if selected {
-        CONTROLLER_CARD_W - 12.0 - CONTROLLER_RING - 8.0
-    } else {
-        CONTROLLER_CARD_W - 12.0
-    };
-    let meta = if powering_off {
-        "Powering off".to_string()
-    } else if !row.connected {
-        "Disconnected".to_string()
-    } else {
-        format!("{} · {}", row.connection, row.state)
-    };
-    let mut hints = Vec::new();
-    if selected && !powering_off {
-        if row.show_identify() {
-            hints.push(plain_hint(FaceButton::Cross, "Identify", state.cross_held));
+        let mut hints = Vec::new();
+        if !powering_off {
+            if row.show_identify() {
+                hints.push(plain_hint(FaceButton::Cross, "Identify", state.cross_held));
+            }
+            if row.show_power_off() {
+                hints.push(hold_hint(
+                    FaceButton::Triangle,
+                    "Power off",
+                    state.triangle_progress,
+                    state.triangle_armed_t,
+                    state.triangle_held,
+                ));
+            }
         }
-        if row.show_power_off() {
-            hints.push(hold_hint(
-                FaceButton::Triangle,
-                "Power off",
-                state.triangle_progress,
-                state.triangle_held,
-            ));
-        }
-    }
-    let mut details = column![
-        text(text_fit::ellipsize_to_width(
-            row.display_name(),
-            13.0,
-            details_w
-        ))
-        .size(13.0)
-        .font(iced::Font {
-            weight: if selected {
-                iced::font::Weight::Semibold
+        let mut details = column![
+            text(text_fit::ellipsize_to_width(
+                row.display_name(),
+                13.0,
+                details_w
+            ))
+            .size(13.0)
+            .font(iced::Font {
+                weight: iced::font::Weight::Semibold,
+                ..iced::Font::default()
+            })
+            .color(if live { theme::INK } else { theme::MUTED })
+            .width(Fill),
+            text(text_fit::ellipsize_to_width(
+                &meta,
+                theme::type_scale::CAPTION,
+                details_w
+            ))
+            .size(theme::type_scale::CAPTION)
+            .color(if powering_off {
+                theme::MUTED
+            } else if row.low {
+                theme::WARNING
             } else {
-                iced::font::Weight::Normal
-            },
-            ..iced::Font::default()
-        })
-        .color(if live { theme::INK } else { theme::MUTED })
-        .width(Fill),
-        text(text_fit::ellipsize_to_width(
-            &meta,
-            theme::type_scale::CAPTION,
-            details_w
-        ))
-        .size(theme::type_scale::CAPTION)
-        .color(if powering_off {
-            theme::MUTED
-        } else if row.low {
-            theme::WARNING
-        } else {
-            theme::DIM
-        })
-        .width(Fill),
-    ]
-    .spacing(2)
-    .width(Fill);
-    if !hints.is_empty() {
-        details = details
-            .push(space().height(2))
-            .push(action_cluster_spaced::<HubMessage>(&hints, 10.0, true));
-    }
-    let body: Element<'a, HubMessage> = if let Some(ring) = ring {
+                theme::DIM
+            })
+            .width(Fill),
+        ]
+        .spacing(2)
+        .width(Fill);
+        if !hints.is_empty() {
+            details = details
+                .push(space().height(2))
+                .push(action_cluster_spaced::<HubMessage>(&hints, 10.0, true));
+        }
         row![ring, details]
             .spacing(8)
             .align_y(Alignment::Center)
             .width(Fill)
             .into()
     } else {
-        details.into()
+        ring
+    };
+    let card_w = if selected {
+        CONTROLLER_CARD_W_SELECTED
+    } else {
+        CONTROLLER_CARD_W
     };
     let mut b = button(
         container(body)
             .width(Fill)
             .height(Fill)
+            .center_x(Fill)
             .center_y(Fill)
             .padding(0),
     )
-    .width(Length::Fixed(CONTROLLER_CARD_W))
+    .width(Length::Fixed(card_w))
     .height(Length::Fixed(CONTROLLER_CARD_H))
     .padding(6)
     .style(move |_theme, status| controller_card_style(selected, live, status));
-    if row.connected {
-        b = b.on_press(HubMessage::IdentifyController(index));
-    }
+    // Wheel-only cards still need a way to reveal their name/status; connected
+    // cards additionally Identify. Disconnected selection is a no-op beyond
+    // expanding the card.
+    b = b.on_press(HubMessage::IdentifyController(index));
     b.into()
+}
+
+/// ~100ms accent → ink chase mirroring Start's armed hold-hint animation.
+fn approach_hint_anim(current: &mut f32, target: bool, dt: f32) {
+    const HINT_ANIM_SECS: f32 = crate::ui::motion::FAST_MS as f32 / 1000.0;
+    let target = if target { 1.0 } else { 0.0 };
+    let step = dt / HINT_ANIM_SECS;
+    if *current < target {
+        *current = (*current + step).min(target);
+    } else if *current > target {
+        *current = (*current - step).max(target);
+    }
 }
 
 fn options_pill_style(_theme: &Theme, status: button::Status) -> button::Style {
@@ -1244,7 +1270,7 @@ pub fn info_scroll_id() -> iced::widget::Id {
 }
 
 fn settings_view<'a>(state: &State, stage_w: f32, backdrop_alpha: f32) -> Element<'a, HubMessage> {
-    let card_w = hub_card_width(stage_w);
+    let card_w = (stage_w - 48.0).clamp(340.0, 460.0);
     let mut rows = column![].spacing(4);
     for (i, label) in SETTINGS_ROWS.iter().enumerate() {
         if !state.settings_visible(i) {
@@ -1528,7 +1554,7 @@ fn apps_menu<'a>(state: &State, index: usize) -> Element<'a, HubMessage> {
         .into()
 }
 
-fn app_info<'a>(state: &'a State, index: usize, width: f32) -> Element<'a, HubMessage> {
+fn app_info<'a>(state: &'a State, index: usize) -> Element<'a, HubMessage> {
     let app = APPS[index];
     let dim = state.app_dimmed(app);
     let ink = if dim { theme::DIM } else { theme::INK };
@@ -1677,7 +1703,7 @@ fn app_info<'a>(state: &'a State, index: usize, width: f32) -> Element<'a, HubMe
         .spacing(0),
     )
     .padding(16)
-    .width(Length::Fixed(width))
+    .width(Length::Fixed(420.0))
     .style(card_style);
     container(card)
         .width(Fill)
@@ -2163,6 +2189,27 @@ mod tests {
             state.pad_tick(&press, now + std::time::Duration::from_millis(48)),
             None
         );
+    }
+
+    #[test]
+    fn controller_scroll_accounts_for_compact_and_selected_widths() {
+        assert_eq!(controller_scroll_x(0, 1920.0), 0.0);
+        let expected = 2.0 * (CONTROLLER_CARD_W + CONTROLLER_GAP)
+            - ((hub_card_width(1920.0) - 2.0 * SECTION_PAD_X - CONTROLLER_CARD_W_SELECTED) * 0.5);
+        assert!((controller_scroll_x(2, 1920.0) - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn hold_hint_armed_chase_hits_full_and_returns() {
+        let mut armed = 0.0;
+        for _ in 0..10 {
+            approach_hint_anim(&mut armed, true, 0.01);
+        }
+        assert!((armed - 1.0).abs() < 1e-4);
+        for _ in 0..10 {
+            approach_hint_anim(&mut armed, false, 0.01);
+        }
+        assert!(armed.abs() < 1e-4);
     }
 
     #[test]
