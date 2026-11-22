@@ -48,6 +48,24 @@ impl HistorySelector {
 /// theirs in `BrowserPanel::stored`. The panel derefs to this, so all
 /// existing live-tab call sites (`panel.session`, `panel.cursor`, …) keep
 /// working.
+/// Dominant right-stick axis for one scroll gesture. Chosen when the stick
+/// leaves neutral and held until it returns, so a diagonal hold cannot drift
+/// sideways while the user scrolls vertically (or vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollAxis {
+    Vertical,
+    Horizontal,
+}
+
+impl ScrollAxis {
+    fn other(self) -> Self {
+        match self {
+            Self::Vertical => Self::Horizontal,
+            Self::Horizontal => Self::Vertical,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BrowserTabPage {
     pub session: crate::browser::BrowserSession,
@@ -64,6 +82,8 @@ pub struct BrowserTabPage {
     pub page_extent: (f32, f32),
     /// Last analog integrate step (None until the first pad sample).
     pub analog_at: Option<Instant>,
+    /// Active right-stick scroll axis lock (None = stick at rest, unlocked).
+    pub scroll_axis: Option<ScrollAxis>,
     /// Page-driven focus target (autofocus / JS `.focus()`): UI id to dock
     /// when it next resolves in the live set. One shot per tree — a culled
     /// target never docks ("if possible").
@@ -468,6 +488,7 @@ impl BrowserPanel {
         self.pending_focus = None;
         // Drop the analog clock so reopening never applies a huge first dt.
         self.analog_at = None;
+        self.scroll_axis = None;
     }
 
     pub fn note_scrolled(&mut self, y: f32) {
@@ -580,12 +601,51 @@ impl BrowserPanel {
             }
         }
         if in_page {
+            // One axis per gesture: a slightly diagonal hold must not drift
+            // sideways (the scroll-trap). The lock is chosen on the first
+            // deflected sample and cleared only at neutral; if the locked
+            // axis is released while the other stays deflected, adopt the
+            // other so crossing over without a neutral pass never dead-sticks.
+            let axis = match self.scroll_axis {
+                Some(_) if rx == 0.0 && ry == 0.0 => {
+                    self.scroll_axis = None;
+                    None
+                }
+                Some(axis) => {
+                    let (locked, other) = match axis {
+                        ScrollAxis::Vertical => (ry, rx),
+                        ScrollAxis::Horizontal => (rx, ry),
+                    };
+                    if locked == 0.0 && other != 0.0 {
+                        let next = axis.other();
+                        self.scroll_axis = Some(next);
+                        Some(next)
+                    } else {
+                        Some(axis)
+                    }
+                }
+                None if rx == 0.0 && ry == 0.0 => None,
+                None => {
+                    // Tie goes vertical: down-page is the dominant gesture.
+                    let axis = if ry.abs() >= rx.abs() {
+                        ScrollAxis::Vertical
+                    } else {
+                        ScrollAxis::Horizontal
+                    };
+                    self.scroll_axis = Some(axis);
+                    Some(axis)
+                }
+            };
             let scale = if r2 { 2.0 } else { 1.0 };
-            (
-                rx * SCROLL_SPEED * dt * scale,
-                ry * SCROLL_SPEED * dt * scale,
-            )
+            match axis {
+                Some(ScrollAxis::Vertical) => (0.0, ry * SCROLL_SPEED * dt * scale),
+                Some(ScrollAxis::Horizontal) => (rx * SCROLL_SPEED * dt * scale, 0.0),
+                None => (0.0, 0.0),
+            }
         } else {
+            // The scroll stick only applies over the page surface; visiting
+            // the header resets the gesture so re-entry starts clean.
+            self.scroll_axis = None;
             (0.0, 0.0)
         }
     }
@@ -1005,4 +1065,111 @@ pub fn cursor_targets(
     out.extend_from_slice(page);
     out.extend(chrome.iter().map(|(_, f)| f.clone()));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn panel() -> BrowserPanel {
+        let mut panel = BrowserPanel {
+            viewport: (900.0, 700.0),
+            ..BrowserPanel::default()
+        };
+        panel.page.cursor.x = 450.0;
+        panel.page.cursor.y = 350.0;
+        panel
+    }
+
+    fn step(panel: &mut BrowserPanel, rx: f32, ry: f32, r2: bool, at: Instant) -> (f32, f32) {
+        panel.advance_stick(0.0, 0.0, rx, ry, r2, at)
+    }
+
+    #[test]
+    fn scroll_locks_to_dominant_vertical_axis() {
+        let mut panel = panel();
+        let t0 = Instant::now();
+        step(&mut panel, 0.0, 0.0, false, t0);
+        let at = t0 + Duration::from_millis(100);
+        let (dx, dy) = step(&mut panel, 0.4, -0.8, false, at);
+        assert_eq!(dx, 0.0);
+        assert!(dy < 0.0);
+        // Same gesture, now deflected mostly sideways: still vertical.
+        let at = at + Duration::from_millis(100);
+        let (dx, dy) = step(&mut panel, 0.9, -0.2, false, at);
+        assert_eq!(dx, 0.0);
+        assert!(dy < 0.0);
+    }
+
+    #[test]
+    fn scroll_locks_to_dominant_horizontal_axis() {
+        let mut panel = panel();
+        let t0 = Instant::now();
+        step(&mut panel, 0.0, 0.0, false, t0);
+        let at = t0 + Duration::from_millis(100);
+        let (dx, dy) = step(&mut panel, 0.9, -0.2, false, at);
+        assert!(dx > 0.0);
+        assert_eq!(dy, 0.0);
+    }
+
+    #[test]
+    fn neutral_release_unlocks_axis() {
+        let mut panel = panel();
+        let t0 = Instant::now();
+        step(&mut panel, 0.0, 0.0, false, t0);
+        let at = t0 + Duration::from_millis(100);
+        let (dx, dy) = step(&mut panel, 0.2, -0.9, false, at);
+        assert_eq!(dx, 0.0);
+        assert!(dy < 0.0);
+        let at = at + Duration::from_millis(100);
+        step(&mut panel, 0.0, 0.0, false, at);
+        assert_eq!(panel.scroll_axis, None);
+        let at = at + Duration::from_millis(100);
+        let (dx, dy) = step(&mut panel, 0.9, -0.2, false, at);
+        assert!(dx > 0.0);
+        assert_eq!(dy, 0.0);
+    }
+
+    #[test]
+    fn releasing_locked_axis_adopts_the_other() {
+        let mut panel = panel();
+        let t0 = Instant::now();
+        step(&mut panel, 0.0, 0.0, false, t0);
+        let at = t0 + Duration::from_millis(100);
+        step(&mut panel, 0.2, -0.9, false, at);
+        let at = at + Duration::from_millis(100);
+        let (dx, dy) = step(&mut panel, 0.9, 0.0, false, at);
+        assert!(dx > 0.0);
+        assert_eq!(dy, 0.0);
+    }
+
+    #[test]
+    fn turbo_doubles_scroll_speed() {
+        let mut panel = panel();
+        let t0 = Instant::now();
+        step(&mut panel, 0.0, 0.0, false, t0);
+        let at = t0 + Duration::from_millis(100);
+        let (_, normal) = step(&mut panel, 0.0, -0.5, false, at);
+        let at = at + Duration::from_millis(100);
+        step(&mut panel, 0.0, 0.0, false, at);
+        let at = at + Duration::from_millis(100);
+        let (_, turbo) = step(&mut panel, 0.0, -0.5, true, at);
+        assert!((turbo - normal * 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn header_resets_axis_lock() {
+        let mut panel = panel();
+        let t0 = Instant::now();
+        step(&mut panel, 0.0, 0.0, false, t0);
+        let at = t0 + Duration::from_millis(100);
+        step(&mut panel, 0.2, -0.9, false, at);
+        assert_eq!(panel.scroll_axis, Some(ScrollAxis::Vertical));
+        panel.page.cursor.y = -5.0;
+        let at = at + Duration::from_millis(100);
+        let (dx, dy) = step(&mut panel, 0.2, -0.9, false, at);
+        assert_eq!((dx, dy), (0.0, 0.0));
+        assert_eq!(panel.scroll_axis, None);
+    }
 }
