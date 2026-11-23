@@ -33,8 +33,8 @@ pub struct SavedTabs {
 }
 
 /// Boot URL for the worker's first view: the restored active tab's URL
-/// when a strip was persisted, else home. Booting straight onto it (instead
-/// of home-then-navigate) leaves no stale home load to race the restore.
+/// when a strip was persisted, else the default page. Booting straight onto it (instead
+/// of default-then-navigate) leaves no stale default load to race the restore.
 pub fn boot_url() -> String {
     boot_url_from(&load())
 }
@@ -45,7 +45,7 @@ fn boot_url_from(saved: &SavedTabs) -> String {
         .get(saved.active.min(saved.tabs.len().saturating_sub(1)))
         .map(|t| t.url.clone())
         .filter(|u| !u.is_empty() && u != crate::browser::BLANK_PAGE_URL)
-        .unwrap_or_else(|| crate::browser::BROWSER_HOME_URL.to_string())
+        .unwrap_or_else(|| crate::browser::BROWSER_DEFAULT_URL.to_string())
 }
 
 /// Storage location next to `prefs.json`.
@@ -106,7 +106,7 @@ mod tests {
     fn boot_url_prefers_saved_active_tab() {
         assert_eq!(
             boot_url_from(&SavedTabs::default()),
-            crate::browser::BROWSER_HOME_URL
+            crate::browser::BROWSER_DEFAULT_URL
         );
         let strip = SavedTabs {
             tabs: vec![
@@ -128,7 +128,7 @@ mod tests {
             ..strip.clone()
         };
         assert_eq!(boot_url_from(&clamped), "https://b.test/");
-        // Blank active entry falls back to home.
+        // Blank active entry falls back to the default page.
         let blank = SavedTabs {
             tabs: vec![SavedTab {
                 url: crate::browser::BLANK_PAGE_URL.to_string(),
@@ -136,7 +136,7 @@ mod tests {
             }],
             active: 0,
         };
-        assert_eq!(boot_url_from(&blank), crate::browser::BROWSER_HOME_URL);
+        assert_eq!(boot_url_from(&blank), crate::browser::BROWSER_DEFAULT_URL);
     }
 
     #[test]

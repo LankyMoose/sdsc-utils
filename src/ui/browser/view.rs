@@ -34,7 +34,7 @@ pub enum BrowserMessage {
     HistoryCancel,
     OpenExternal,
     Reload,
-    Home,
+    DefaultPage,
     TabNew,
     TabNext,
     TabSwitch(crate::browser::engine::TabId),
@@ -61,7 +61,7 @@ impl BrowserPanel {
             ChromeTarget::Back => Some(BrowserMessage::Back),
             ChromeTarget::Forward => Some(BrowserMessage::Forward),
             ChromeTarget::Reload => Some(BrowserMessage::Reload),
-            ChromeTarget::Home => Some(BrowserMessage::Home),
+            ChromeTarget::DefaultPage => Some(BrowserMessage::DefaultPage),
             // The address field owns the keyboard; pad users get there via
             // Triangle today, cursor dock now too.
             ChromeTarget::Omnibox => Some(BrowserMessage::ToggleUrlEntry),
@@ -416,12 +416,13 @@ fn chrome_row_view<'a>(
                 }
                 .into()
             }
-            ChromeTarget::Home => {
+            ChromeTarget::DefaultPage => {
                 let b = button(text("⌂").size(14.0)).padding([8, 12]);
-                if panel.chrome_attached() == Some(ChromeTarget::Home) {
-                    b.on_press(BrowserMessage::Home).style(theme::chip(true))
+                if panel.chrome_attached() == Some(ChromeTarget::DefaultPage) {
+                    b.on_press(BrowserMessage::DefaultPage)
+                        .style(theme::chip(true))
                 } else {
-                    b.on_press(BrowserMessage::Home).style(theme::ghost)
+                    b.on_press(BrowserMessage::DefaultPage).style(theme::ghost)
                 }
                 .into()
             }
@@ -883,8 +884,8 @@ mod tests {
         fly_until_dock(&mut panel);
         assert_eq!(
             panel.chrome_attached(),
-            Some(ChromeTarget::Home),
-            "left of omnibox is Home, same row"
+            Some(ChromeTarget::DefaultPage),
+            "left of omnibox is the default-page button, same row"
         );
     }
 
@@ -1432,10 +1433,10 @@ mod tests {
     #[test]
     fn tab_title_falls_back_to_url_then_home() {
         let mut panel = BrowserPanel::default();
-        // Fresh boot tab: home.
+        // Fresh boot tab: the default page.
         assert_eq!(
             panel.tab_title(TabId::BOOT),
-            crate::browser::BROWSER_HOME_URL
+            crate::browser::BROWSER_DEFAULT_URL
         );
         panel.session.begin_load("https://a.test/page".to_string());
         assert_eq!(panel.tab_title(TabId::BOOT), "https://a.test/page");

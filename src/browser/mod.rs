@@ -41,10 +41,10 @@ pub const MAX_SUGGESTIONS: usize = 6;
 /// History-selector rows per dropdown (closest first, controller-scannable).
 pub const MAX_SELECTOR_ENTRIES: usize = 8;
 
-/// Home page: hardcoded default until the settings screen lands a
-/// configurable home pref. The engine also boots directly onto this (no
+/// Default page: hardcoded default until the settings screen lands a
+/// configurable default-page pref. The engine also boots directly onto this (no
 /// about:blank document), so back/forward and the selector start clean.
-pub const BROWSER_HOME_URL: &str = "https://www.google.com";
+pub const BROWSER_DEFAULT_URL: &str = "https://www.google.com";
 
 /// The empty document: never a history entry (autocomplete or session).
 /// The engine used to boot on it before the initial URL was configured;
@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn blank_page_never_records() {
-        // The engine boots straight onto home now, but JS can still land
+        // The engine boots straight onto the default page now, but JS can still land
         // on about:blank — a placeholder, never a visit, in either stack.
         let mut s = BrowserSession::default();
         s.begin_load("https://a.test/".to_string());

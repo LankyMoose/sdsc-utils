@@ -597,7 +597,7 @@ pub struct App {
     /// Monitor covered by the Launcher window (stage size for the view).
     launcher_monitor_cover: Option<MonitorCover>,
     /// This process was relaunched by the crash handler: restore tabs in
-    /// safe mode (home live tab, saved tabs stored).
+    /// safe mode (default live tab, saved tabs stored).
     crash_restart_boot: bool,
     /// Last user activity on Launcher (mouse / keyboard / pad) for idle/sleep.
     launcher_last_activity: Instant,
@@ -870,13 +870,13 @@ impl App {
             initial_page_h.round().max(1.0) as u32,
         );
         // A crash-restart successor must not re-open the page that killed
-        // CEF can crash on a hostile page too. Boot home; saved tabs stay
+        // CEF can crash on a hostile page too. Boot the default page; saved tabs stay
         // stored for a manual switch.
         let crash_restart_boot = crate::platform::crash_restart::has_pending_notice()
             || crate::platform::crash_restart::recent_crash()
             || crate::platform::crash_restart::take_panic_flag();
         let boot_url = if crash_restart_boot {
-            crate::browser::BROWSER_HOME_URL.to_string()
+            crate::browser::BROWSER_DEFAULT_URL.to_string()
         } else {
             crate::browser::tabs::boot_url()
         };

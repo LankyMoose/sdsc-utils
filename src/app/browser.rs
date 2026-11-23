@@ -141,7 +141,7 @@ impl super::App {
             BrowserMessage::HistoryCancel => self.on_browser_history_cancel(),
             BrowserMessage::OpenExternal => self.on_browser_open_external(),
             BrowserMessage::Reload => self.on_browser_reload(),
-            BrowserMessage::Home => self.on_browser_go_home(),
+            BrowserMessage::DefaultPage => self.on_browser_go_default(),
             BrowserMessage::TabNew => self.on_browser_tab_new(),
             BrowserMessage::TabNext => self.on_browser_tab_next(),
             BrowserMessage::TabSwitch(id) => self.on_browser_tab_switch(id),
@@ -241,7 +241,7 @@ impl super::App {
             self.resume_browser_engine();
             opened
         } else {
-            // Fresh surface: open the tab strip (restore) or home.
+            // Fresh surface: open the tab strip (restore) or the default page.
             opened.chain(self.open_browser_session())
         };
         close_start

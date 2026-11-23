@@ -435,7 +435,7 @@ impl BrowserPanel {
             .map(|(target, _)| *target)
     }
 
-    /// Title for a tab id (live or stored): page title, else URL, else home.
+    /// Title for a tab id (live or stored): page title, else URL, else the default page.
     pub fn tab_title(&self, id: crate::browser::engine::TabId) -> String {
         let page = if id == self.active_tab {
             Some(&self.page)
@@ -451,7 +451,7 @@ impl BrowserPanel {
                     .filter(|t| !t.is_empty())
                     .unwrap_or_else(|| {
                         if url.is_empty() {
-                            crate::browser::BROWSER_HOME_URL.to_string()
+                            crate::browser::BROWSER_DEFAULT_URL.to_string()
                         } else {
                             url.to_string()
                         }
@@ -814,7 +814,7 @@ pub enum ChromeTarget {
     Back,
     Forward,
     Reload,
-    Home,
+    DefaultPage,
     Omnibox,
     Star,
     Go,
@@ -939,17 +939,18 @@ pub fn chrome_layout(panel: &BrowserPanel) -> Vec<ChromeRowLayout> {
     let back = label_width("←", 14.0, 12.0);
     let forward = label_width("→", 14.0, 12.0);
     let reload = label_width("⟳", 14.0, 12.0);
-    let home = label_width("⌂", 14.0, 12.0);
+    let default_page = label_width("⌂", 14.0, 12.0);
     let star = label_width("★", 16.0, 10.0).max(label_width("☆", 16.0, 10.0));
     let go = label_width("Go", 14.0, 14.0);
-    let omni = (viewport_w - (back + forward + reload + home + star + go + gaps)).max(120.0);
+    let omni =
+        (viewport_w - (back + forward + reload + default_page + star + go + gaps)).max(120.0);
     let mut bar = Vec::with_capacity(7);
     let mut x = 0.0;
     for (target, w) in [
         (ChromeTarget::Back, back),
         (ChromeTarget::Forward, forward),
         (ChromeTarget::Reload, reload),
-        (ChromeTarget::Home, home),
+        (ChromeTarget::DefaultPage, default_page),
         (ChromeTarget::Omnibox, omni),
         (ChromeTarget::Star, star),
         (ChromeTarget::Go, go),

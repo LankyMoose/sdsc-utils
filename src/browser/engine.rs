@@ -49,7 +49,7 @@ impl EngineActivity {
 pub struct TabId(pub u64);
 
 impl TabId {
-    /// First tab: the boot webview (home URL).
+    /// First tab: the boot webview (default URL).
     pub const BOOT: TabId = TabId(1);
     /// Engine-owned ids count down from here.
     pub const ENGINE_TOP: u64 = u64::MAX;
@@ -266,7 +266,7 @@ pub enum EngineEvent {
         slot: Arc<FrameSlot>,
     },
     /// A tab's page called `window.close()`: the backend already dropped the
-    /// view. The UI activates a neighbor (or a fresh home tab if none).
+    /// view. The UI activates a neighbor (or a fresh default tab if none).
     TabClosed {
         tab: TabId,
     },

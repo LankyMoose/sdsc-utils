@@ -382,7 +382,7 @@ impl App {
         // the first frame so the cursor space and image are the same size.
         self.sync_browser_viewport();
         // First fresh surface: restore the persisted strip when one exists,
-        // else start at home instead of the empty state. The engine already
+        // else start at the default page instead of the empty state. The engine already
         // preloaded the saved active URL at boot, so the session URL is never
         // empty here; a one-shot flag distinguishes the first open from a
         // reopen of the cached page.
@@ -395,10 +395,10 @@ impl App {
                 crate::controller::hid::diag::diag_info("ui-diag: browser session open (restore)");
                 return task;
             }
-            self.browser.panel.draft = crate::browser::BROWSER_HOME_URL.to_string();
+            self.browser.panel.draft = crate::browser::BROWSER_DEFAULT_URL.to_string();
             let task = self.on_browser_navigate();
             self.resume_browser_engine();
-            crate::controller::hid::diag::diag_info("ui-diag: browser session open (home)");
+            crate::controller::hid::diag::diag_info("ui-diag: browser session open (default page)");
             return task;
         }
         self.resume_browser_engine();
@@ -406,11 +406,11 @@ impl App {
         Task::none()
     }
 
-    /// Browser home page. Hardcoded until the settings screen lands, then a
+    /// Browser default page. Hardcoded until the settings screen lands, then a
     /// pref. Reuses the navigate path (fresh-page cursor/focusable reset,
-    /// theme sync) with the draft pinned to home.
-    pub(crate) fn on_browser_go_home(&mut self) -> Task<Message> {
-        self.browser.panel.draft = crate::browser::BROWSER_HOME_URL.to_string();
+    /// theme sync) with the draft pinned to the default page.
+    pub(crate) fn on_browser_go_default(&mut self) -> Task<Message> {
+        self.browser.panel.draft = crate::browser::BROWSER_DEFAULT_URL.to_string();
         self.on_browser_navigate()
     }
 
@@ -833,7 +833,7 @@ impl App {
 
     /// Star toggle: bookmark the current page (opening the rename bubble),
     /// or open the bubble for an already-bookmarked page. No page, no-op
-    /// (fresh surface navigates home first — nothing to star yet).
+    /// (fresh surface navigates to the default page first — nothing to star yet).
     pub(crate) fn on_browser_bookmark_star(&mut self) -> Task<Message> {
         let url = self.browser.panel.session.url().to_string();
         if url.is_empty() {
@@ -1308,7 +1308,7 @@ impl App {
 
     /// Engine reports a tab's page called `window.close()`: the view is
     /// already gone backend-side — adopt the most recent survivor (or a
-    /// fresh home tab when none).
+    /// fresh default tab when none).
     pub(crate) fn on_tab_closed(&mut self, tab: crate::browser::engine::TabId) -> Task<Message> {
         crate::controller::hid::diag::diag_info(format!(
             "ui-diag: browser tab closed tab{}",
@@ -1348,11 +1348,11 @@ impl App {
         }
     }
 
-    /// Fresh home tab reusing `tab` (backend dropped it): recreate the view
-    /// with the home URL from birth and navigate the session there. Tab-less
+    /// Fresh default tab reusing `tab` (backend dropped it): recreate the view
+    /// with the default URL from birth and navigate the session there. Tab-less
     /// engine has no boot path back, so the last tab never truly closes.
     fn reopen_home_tab(&mut self, tab: crate::browser::engine::TabId) -> Task<Message> {
-        let url = crate::browser::BROWSER_HOME_URL.to_string();
+        let url = crate::browser::BROWSER_DEFAULT_URL.to_string();
         let (generation, frame) = {
             let panel = &mut self.browser.panel;
             panel.reset_live_page();
@@ -1384,7 +1384,7 @@ impl App {
     /// First-open restore from `tabs.json`: rebuild the strip (live +
     /// stored), pre-seed titles, and drive every tab. Backend views are
     /// fresh, so each tab re-navigates — engine history starts over by
-    /// construction. Falls back to the home flow when nothing restorable
+    /// construction. Falls back to the default flow when nothing restorable
     /// survives validation.
     pub(crate) fn restore_browser_tabs(
         &mut self,
@@ -1398,16 +1398,16 @@ impl App {
             .take(crate::browser::tabs::MAX_SAVED_TABS)
             .collect();
         if tabs.is_empty() {
-            self.browser.panel.draft = crate::browser::BROWSER_HOME_URL.to_string();
+            self.browser.panel.draft = crate::browser::BROWSER_DEFAULT_URL.to_string();
             return self.on_browser_navigate();
         }
         if self.crash_restart_boot {
             // Safe mode: the restored active tab is the page that killed
-            // CEF. Start on home and keep every saved tab stored (the
+            // CEF. Start on the default page and keep every saved tab stored (the
             // user can switch deliberately); never auto-load the crash page
             // again on relaunch.
             crate::platform::app_log::info(
-                "crash-restart: safe tab restore (home live, saved tabs stored)",
+                "crash-restart: safe tab restore (default live, saved tabs stored)",
             );
             let generation = {
                 let panel = &mut self.browser.panel;
@@ -1419,8 +1419,8 @@ impl App {
                 let generation = panel
                     .page
                     .session
-                    .begin_load(crate::browser::BROWSER_HOME_URL.to_string());
-                panel.draft = crate::browser::BROWSER_HOME_URL.to_string();
+                    .begin_load(crate::browser::BROWSER_DEFAULT_URL.to_string());
+                panel.draft = crate::browser::BROWSER_DEFAULT_URL.to_string();
                 panel.order.push(TabId::BOOT);
                 let mut next_id = panel.next_tab_id.max(2);
                 for saved_tab in tabs {
@@ -1447,7 +1447,7 @@ impl App {
             if let Some(engine) = &self.browser.engine {
                 engine.send(EngineCommand::Navigate {
                     tab: TabId::BOOT,
-                    url: crate::browser::BROWSER_HOME_URL.to_string(),
+                    url: crate::browser::BROWSER_DEFAULT_URL.to_string(),
                     generation,
                 });
             }
@@ -1538,14 +1538,14 @@ impl App {
         }
     }
 
-    /// User-opened tab (`+`): stash live, reset, create the home-loaded view
-    /// and foreground it. Reader fallback (no engine) just goes home in
+    /// User-opened tab (`+`): stash live, reset, create the default-loaded view
+    /// and foreground it. Reader fallback (no engine) just goes to the default page in
     /// place — tabs need views.
     pub(crate) fn on_browser_tab_new(&mut self) -> Task<Message> {
         if self.browser.engine.is_none() {
-            return self.on_browser_go_home();
+            return self.on_browser_go_default();
         }
-        let url = crate::browser::BROWSER_HOME_URL.to_string();
+        let url = crate::browser::BROWSER_DEFAULT_URL.to_string();
         let (tab, generation, frame) = {
             let panel = &mut self.browser.panel;
             panel.stash_live();
@@ -1679,7 +1679,7 @@ impl App {
 
     /// User closes a tab (`×`): background tabs drop outright; closing the
     /// active tab adopts the most recent survivor first. The last tab
-    /// resets to home instead of closing.
+    /// resets to the default page instead of closing.
     pub(crate) fn on_browser_tab_close(
         &mut self,
         tab: crate::browser::engine::TabId,
@@ -1703,7 +1703,7 @@ impl App {
         }
         // Active tab: survivors live in `stored`.
         if self.browser.panel.stored.is_empty() {
-            return self.on_browser_go_home();
+            return self.on_browser_go_default();
         }
         let next = self
             .browser
@@ -1714,7 +1714,7 @@ impl App {
             .find(|o| **o != tab)
             .copied();
         let Some(next) = next else {
-            return self.on_browser_go_home();
+            return self.on_browser_go_default();
         };
         let needs_open = self
             .browser
@@ -1725,7 +1725,7 @@ impl App {
             .is_some_and(|t| !t.loaded);
         let ok = self.browser.panel.activate_stored(next);
         if !ok {
-            return self.on_browser_go_home();
+            return self.on_browser_go_default();
         }
         self.browser.panel.order.retain(|o| *o != tab);
         let url = self.browser.panel.session.url().to_string();
