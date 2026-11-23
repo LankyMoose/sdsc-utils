@@ -426,7 +426,7 @@ impl App {
                         },
                     );
                 } else if self.hub_state.settings_open {
-                    self.hub_state.settings_move(delta);
+                    return self.hub_settings_adjust(delta);
                 } else if self.hub_state.apps_menu.is_some() {
                     self.hub_state.apps_menu_move(delta);
                 } else {
@@ -450,9 +450,11 @@ impl App {
                     self.hub_state.settings_move(delta);
                 } else if self.hub_state.apps_menu.is_some() {
                     self.hub_state.apps_menu_move(delta);
+                } else if self.hub_state.focus == hub_view::HubFocus::Controllers {
+                    // The restored dock is a vertical list: Up/Down (and the
+                    // keyboard arrows) move the controller selection.
+                    self.hub_state.move_across(delta);
                 }
-                // Main hub: one apps row (Left/Right). Up/Down has no target
-                // now that Select/Share owns the controllers dock.
                 Task::none()
             }
             HubMessage::SettingsToggle => {
@@ -465,38 +467,6 @@ impl App {
                 }
                 Task::none()
             }
-            HubMessage::SettingsOpen => {
-                self.play_ui_cue(UiSoundKind::Action);
-                self.hub_state.open_settings();
-                self.sync_hub_settings();
-                Task::none()
-            }
-            HubMessage::SettingsClose => {
-                self.hub_state.close_settings();
-                Task::none()
-            }
-            HubMessage::SettingsMove(delta) => {
-                self.hub_state.settings_move(delta);
-                Task::none()
-            }
-            HubMessage::SettingsConfirm => self.hub_settings_confirm(),
-            HubMessage::SettingsRow(row) => {
-                if row >= hub_view::SETTINGS_ROWS.len() || !self.hub_state.settings_visible(row) {
-                    return Task::none();
-                }
-                self.hub_state.settings_focus = row;
-                self.hub_settings_confirm()
-            }
-            HubMessage::Activate(index) => {
-                self.play_ui_cue(UiSoundKind::Action);
-                self.hub_state.select(index, Instant::now());
-                self.hub_activate()
-            }
-            HubMessage::IdentifyController(index) => {
-                self.hub_state.select_controller(index, Instant::now());
-                self.hub_identify_selected()
-            }
-            HubMessage::IdentifySelected => self.hub_identify_selected(),
             HubMessage::PowerOff => self.hub_power_off_selected(),
             HubMessage::AppsMenuOpen(index) => {
                 self.play_ui_cue(UiSoundKind::Action);
@@ -508,13 +478,8 @@ impl App {
                 Task::none()
             }
             HubMessage::AppsMenuConfirm => self.apps_menu_confirm(),
-            HubMessage::AppsMenuAction(action) => self.apps_menu_action(action),
             HubMessage::AppsMenuClose => {
                 self.hub_state.close_apps_menu();
-                Task::none()
-            }
-            HubMessage::AppInfoClose => {
-                self.hub_state.close_app_info();
                 Task::none()
             }
             HubMessage::Confirm => {
@@ -594,22 +559,20 @@ impl App {
 
     /// Copy the live prefs into the hub settings screen.
     fn sync_hub_settings(&mut self) {
+        // Store-managed builds download through the Store; the local cap is a
+        // standalone-hub policy shared by every managed-app installer.
+        self.install_policy
+            .set(self.session.prefs.app_download_limit_kbps);
         self.hub_state.set_settings(
             self.session.prefs.start_screen_sounds_enabled,
             self.session.prefs.start_screen_sound_volume,
             self.session.prefs.start_screen_haptics_enabled,
             self.session.prefs.start_screen_haptics_strength,
-            self.session.prefs.engine_download_limit_kbps,
-            self.session.prefs.show_all_controllers,
+            self.install_policy.limit(),
         );
-        // Store-managed builds download through the Store; the local cap is a
-        // standalone-only control.
+        self.hub_state.show_all_controllers = self.session.prefs.show_all_controllers;
         self.hub_state.download_cap_available = !crate::platform::packaged::is_packaged();
-        #[cfg(feature = "cef-engine")]
-        self.browser.engine_download_limit.store(
-            self.session.prefs.engine_download_limit_kbps,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.hub_state.clamp_settings_focus();
     }
 
     fn next_ten_percent(value: u8) -> u8 {
@@ -620,61 +583,113 @@ impl App {
         }
     }
 
-    /// Adjust the focused hub settings row. Confirm/click both land here.
+    fn step_percent(value: u8, delta: i32) -> u8 {
+        (i16::from(value) + delta.signum() as i16 * 5).clamp(0, 100) as u8
+    }
+
+    /// Confirm the focused hub settings row. Toggles flip, the download
+    /// choice advances, and sliders take a coarse step; Left/Right does the
+    /// fine adjustment without a mouse.
     fn hub_settings_confirm(&mut self) -> Task<Message> {
         match self.hub_state.settings_focus {
-            0 => {
+            hub_view::SETTINGS_SOUNDS => {
                 let enabled = !self.session.prefs.start_screen_sounds_enabled;
                 let task = self.apply_ui_sounds(enabled);
                 self.sync_hub_settings();
                 task
             }
-            1 => {
+            hub_view::SETTINGS_VOLUME => {
                 let volume = Self::next_ten_percent(self.session.prefs.start_screen_sound_volume);
                 let task = self.apply_ui_sound_volume(volume);
                 self.sync_hub_settings();
                 task
             }
-            2 => {
+            hub_view::SETTINGS_HAPTICS => {
                 let enabled = !self.session.prefs.start_screen_haptics_enabled;
                 let task = self.apply_ui_haptics(enabled);
                 self.sync_hub_settings();
                 task
             }
-            3 => {
+            hub_view::SETTINGS_STRENGTH => {
                 let strength =
                     Self::next_ten_percent(self.session.prefs.start_screen_haptics_strength);
                 let task = self.apply_ui_haptics_strength(strength);
                 self.sync_hub_settings();
                 task
             }
-            4 => {
-                let limit = crate::persist::prefs::cycle_engine_download_limit(
-                    self.session.prefs.engine_download_limit_kbps,
+            hub_view::SETTINGS_DOWNLOAD => {
+                let limit = crate::app::installs::step_download_limit(
+                    self.session.prefs.app_download_limit_kbps,
+                    1,
                 );
-                self.session.prefs.engine_download_limit_kbps = limit;
-                self.save_prefs();
-                // A live install shares this atomic; the change applies at
-                // the next chunk boundary.
-                #[cfg(feature = "cef-engine")]
-                self.browser
-                    .engine_download_limit
-                    .store(limit, std::sync::atomic::Ordering::Relaxed);
-                self.sync_hub_settings();
+                self.apply_install_download_limit(limit);
                 Task::none()
             }
-            5 => {
-                self.session.prefs.show_all_controllers = !self.session.prefs.show_all_controllers;
-                self.save_prefs();
-                self.sync_hub_settings();
-                self.sync_hub_controllers();
-                Task::none()
-            }
-            _ => {
-                self.hub_state.close_settings();
-                Task::none()
-            }
+            _ => Task::none(),
         }
+    }
+
+    /// Left/Right adjustment for the focused hub settings row.
+    fn hub_settings_adjust(&mut self, delta: i32) -> Task<Message> {
+        if delta == 0 {
+            return Task::none();
+        }
+        let task = match self.hub_state.settings_focus {
+            hub_view::SETTINGS_SOUNDS => {
+                let want_on = delta > 0;
+                if self.session.prefs.start_screen_sounds_enabled != want_on {
+                    self.apply_ui_sounds(want_on)
+                } else {
+                    Task::none()
+                }
+            }
+            hub_view::SETTINGS_VOLUME => {
+                let current = self.session.prefs.start_screen_sound_volume;
+                let next = Self::step_percent(current, delta);
+                if next != current {
+                    self.apply_ui_sound_volume(next)
+                } else {
+                    Task::none()
+                }
+            }
+            hub_view::SETTINGS_HAPTICS => {
+                let want_on = delta > 0;
+                if self.session.prefs.start_screen_haptics_enabled != want_on {
+                    self.apply_ui_haptics(want_on)
+                } else {
+                    Task::none()
+                }
+            }
+            hub_view::SETTINGS_STRENGTH => {
+                let current = self.session.prefs.start_screen_haptics_strength;
+                let next = Self::step_percent(current, delta);
+                if next != current {
+                    self.apply_ui_haptics_strength(next)
+                } else {
+                    Task::none()
+                }
+            }
+            hub_view::SETTINGS_DOWNLOAD => {
+                let limit = crate::app::installs::step_download_limit(
+                    self.session.prefs.app_download_limit_kbps,
+                    delta,
+                );
+                self.apply_install_download_limit(limit);
+                Task::none()
+            }
+            _ => Task::none(),
+        };
+        self.sync_hub_settings();
+        task
+    }
+
+    /// Update the hub-owned install cap, persist it, and publish the live
+    /// value to any in-flight installer (including a running engine download).
+    fn apply_install_download_limit(&mut self, limit_kbps: u32) {
+        self.session.prefs.app_download_limit_kbps = limit_kbps;
+        self.save_prefs();
+        self.install_policy.set(limit_kbps);
+        self.sync_hub_settings();
     }
 
     /// Activate the highlighted tile. The hub closes first so the target app
@@ -713,7 +728,7 @@ impl App {
         self.hub_state.set_controllers(rows);
     }
 
-    /// Identify the focused controller card (Cross / click).
+    /// Identify the focused controller card (Cross).
     fn hub_identify_selected(&mut self) -> Task<Message> {
         let Some(row) = self.hub_state.controller_selected() else {
             return Task::none();
@@ -760,8 +775,8 @@ impl App {
             return Task::none();
         };
         // Cues fired by this pad tick rumble the pad that produced them. The
-        // target is restored afterwards so mouse/keyboard actions stay silent
-        // on the haptic side.
+        // target is restored afterwards so non-pad actions stay silent on the
+        // haptic side.
         let previous_haptic = self.haptic_pad_serial.take();
         self.set_haptic_pad_from_id(Some(&reading.id));
         let mut task = Task::none();

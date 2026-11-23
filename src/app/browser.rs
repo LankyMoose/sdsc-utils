@@ -73,9 +73,6 @@ pub struct BrowserAppState {
     /// Cancel flag for the live install/update worker.
     #[cfg(feature = "cef-engine")]
     pub engine_install_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Shared download cap; hub Settings updates it live during a download.
-    #[cfg(feature = "cef-engine")]
-    pub engine_download_limit: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// State to restore when an install/update is cancelled.
     #[cfg(feature = "cef-engine")]
     pub engine_install_previous: Option<EngineStatus>,
@@ -710,11 +707,7 @@ impl super::App {
         let generation = self.browser.engine_install_generation;
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.browser.engine_install_cancel = std::sync::Arc::clone(&cancel);
-        let limit_kbps = self.session.prefs.engine_download_limit_kbps;
-        self.browser
-            .engine_download_limit
-            .store(limit_kbps, std::sync::atomic::Ordering::Relaxed);
-        let limit = std::sync::Arc::clone(&self.browser.engine_download_limit);
+        let limit = self.install_policy.handle();
         let (progress_tx, progress_rx) = iced::futures::channel::mpsc::unbounded::<
             crate::browser::engine_install::InstallProgress,
         >();

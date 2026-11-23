@@ -12,6 +12,7 @@ pub mod hub;
 pub mod icon;
 pub mod layout;
 pub mod motion;
+pub mod mouse_shield;
 pub mod percent_ring;
 pub mod popup;
 pub mod reveal;

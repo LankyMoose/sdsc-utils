@@ -42,8 +42,7 @@ const LOCAL_PENDING_FILE: &str = "cef-engine.uninstall";
 const LOCAL_META_FILE: &str = "engine.json";
 
 /// Download caps offered in hub Settings. `0` means unlimited.
-pub const DOWNLOAD_LIMIT_OPTIONS_KBPS: [u32; 4] =
-    crate::persist::prefs::ENGINE_DOWNLOAD_LIMIT_OPTIONS_KBPS;
+pub const DOWNLOAD_LIMIT_OPTIONS_KBPS: [u32; 4] = crate::app::installs::DOWNLOAD_LIMIT_OPTIONS_KBPS;
 
 /// Latest DLC feed metadata. Served by the QA console in development and by
 /// the release feed in production.

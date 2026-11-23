@@ -10,6 +10,7 @@ mod browser;
 mod configure;
 mod feedback;
 mod hub;
+pub(crate) mod installs;
 mod popup;
 mod start;
 mod toast;
@@ -588,6 +589,9 @@ pub struct App {
     /// Top-level browser app: panel, engine worker, capability flag, and
     /// browser-only D-pad stepper. No longer owned by `StartState`.
     browser: browser::BrowserAppState,
+    /// Hub-owned standalone install policy (download cap shared by every
+    /// managed-app installer).
+    install_policy: installs::AppInstallPolicy,
     /// Managed-app hub: installed/active apps and transition effects.
     hub: hub::AppHub,
     /// Monitor covered by the Start window (stage size for the view).
@@ -887,6 +891,7 @@ impl App {
             let _ = (&boot_url, initial_page);
             None
         };
+        let install_limit = session.prefs.app_download_limit_kbps;
         let mut app = Self {
             session,
             games,
@@ -978,6 +983,7 @@ impl App {
                 engine: browser_engine,
                 ..Default::default()
             },
+            install_policy: installs::AppInstallPolicy::new(install_limit),
             hub: hub::AppHub::new(),
             start_monitor_cover: None,
             crash_restart_boot,

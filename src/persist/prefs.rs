@@ -23,39 +23,6 @@ pub const TOAST_OPACITY_MAX: u8 = 100;
 /// content fully opaque); 100 is a fully opaque card.
 pub const TOAST_OPACITY_DEFAULT: u8 = 60;
 
-/// Browser engine download caps offered in hub Settings (`0` = unlimited).
-pub const ENGINE_DOWNLOAD_LIMIT_OPTIONS_KBPS: [u32; 4] = [0, 2 * 1024, 5 * 1024, 10 * 1024];
-
-/// Label for a download-cap value used by hub Settings.
-pub fn engine_download_limit_label(kbps: u32) -> String {
-    if kbps == 0 {
-        "Unlimited".to_string()
-    } else if kbps.is_multiple_of(1024) {
-        format!("{} MB/s", kbps / 1024)
-    } else {
-        format!("{kbps} KB/s")
-    }
-}
-
-/// Snap an arbitrary cap to the supported option list.
-pub fn clamp_engine_download_limit(kbps: u32) -> u32 {
-    ENGINE_DOWNLOAD_LIMIT_OPTIONS_KBPS
-        .iter()
-        .copied()
-        .min_by_key(|option| option.abs_diff(kbps))
-        .unwrap_or(0)
-}
-
-/// Next download-cap option, wrapping.
-pub fn cycle_engine_download_limit(kbps: u32) -> u32 {
-    let current = clamp_engine_download_limit(kbps);
-    let index = ENGINE_DOWNLOAD_LIMIT_OPTIONS_KBPS
-        .iter()
-        .position(|option| *option == current)
-        .unwrap_or(0);
-    ENGINE_DOWNLOAD_LIMIT_OPTIONS_KBPS[(index + 1) % ENGINE_DOWNLOAD_LIMIT_OPTIONS_KBPS.len()]
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToastPosition {
@@ -348,11 +315,12 @@ pub struct Prefs {
     /// Always forced to PS on load/save; custom chords are no longer honored.
     #[serde(default = "default_gesture")]
     pub start_screen_gesture: Vec<GestureControl>,
-    /// Browser engine download cap in KB/s (`0` = unlimited). The serialized
-    /// key is engine-specific because it is a DLC/network pref, not a
-    /// start-screen pref; hub Settings owns the control.
-    #[serde(default)]
-    pub engine_download_limit_kbps: u32,
+    /// Standalone hub app-install download cap in KB/s (`0` = unlimited).
+    /// Hub Settings owns the control; every managed-app installer shares the
+    /// live policy. The old `engine_download_limit_kbps` key is read as an
+    /// alias so existing files keep their value.
+    #[serde(default, alias = "engine_download_limit_kbps")]
+    pub app_download_limit_kbps: u32,
     /// Play UI cues while navigating the start screen (default on).
     #[serde(default = "default_true")]
     pub start_screen_sounds_enabled: bool,
@@ -619,7 +587,7 @@ impl Default for Prefs {
             start_screen_sleep_secs: default_start_screen_sleep_secs(),
             start_screen_inactive_dim_percent: default_start_screen_inactive_dim_percent(),
             start_screen_gesture: default_gesture(),
-            engine_download_limit_kbps: 0,
+            app_download_limit_kbps: 0,
             start_screen_sounds_enabled: true,
             start_screen_sound_volume: default_start_screen_sound_volume(),
             start_screen_haptics_enabled: true,
@@ -745,8 +713,6 @@ impl Prefs {
         self.start_screen_inactive_secs = inactive;
         self.start_screen_sleep_secs = sleep;
         self.start_screen_gesture = default_gesture();
-        self.engine_download_limit_kbps =
-            clamp_engine_download_limit(self.engine_download_limit_kbps);
         self.start_selection_persist = false;
     }
 }
@@ -930,18 +896,16 @@ mod tests {
     }
 
     #[test]
-    fn engine_download_limit_defaults_unlimited_and_snaps() {
+    fn app_download_limit_defaults_and_reads_legacy_key() {
         let prefs = prefs_from_json("{}");
-        assert_eq!(prefs.engine_download_limit_kbps, 0);
-        assert_eq!(engine_download_limit_label(0), "Unlimited");
-        assert_eq!(engine_download_limit_label(2 * 1024), "2 MB/s");
-        assert_eq!(engine_download_limit_label(10 * 1024), "10 MB/s");
-        assert_eq!(clamp_engine_download_limit(3 * 1024), 2 * 1024);
-        assert_eq!(clamp_engine_download_limit(8 * 1024), 10 * 1024);
-        assert_eq!(cycle_engine_download_limit(0), 2 * 1024);
-        assert_eq!(cycle_engine_download_limit(10 * 1024), 0);
-        let pref = prefs_from_json(r#"{"engine_download_limit_kbps":4096}"#);
-        assert_eq!(pref.engine_download_limit_kbps, 5 * 1024);
+        assert_eq!(prefs.app_download_limit_kbps, 0);
+        let legacy = prefs_from_json(r#"{"engine_download_limit_kbps":4096}"#);
+        assert_eq!(legacy.app_download_limit_kbps, 4096);
+        let current = prefs_from_json(r#"{"app_download_limit_kbps":5120}"#);
+        assert_eq!(current.app_download_limit_kbps, 5120);
+        let json = serde_json::to_string(&current).unwrap();
+        assert!(json.contains("\"app_download_limit_kbps\""));
+        assert!(!json.contains("engine_download_limit_kbps"));
     }
 
     #[test]

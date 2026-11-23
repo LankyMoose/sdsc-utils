@@ -22,7 +22,8 @@ use crate::ui::text_fit;
 use crate::ui::theme;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, column, container, keyed_column, progress_bar, row, scrollable, space, stack, svg, text,
+    column, container, keyed_column, mouse_area, progress_bar, row, scrollable, space, stack, svg,
+    text, toggler,
 };
 use iced::{
     Alignment, Background, Border, Color, Element, Fill, Length, Padding, Shadow, Theme, Vector,
@@ -239,30 +240,13 @@ pub enum HubMessage {
     ToggleShowAll,
     /// Open/close the hub shell settings screen (Options).
     SettingsToggle,
-    /// Open the hub shell settings screen.
-    SettingsOpen,
-    SettingsClose,
-    /// Move the settings highlight.
-    SettingsMove(i32),
-    /// Toggle/cycle the focused settings row.
-    SettingsConfirm,
-    /// Mouse: focus and adjust a settings row.
-    SettingsRow(usize),
-    /// Mouse click: select and activate a hub tile in one step.
-    Activate(usize),
-    /// Mouse click on a controller card: focus it and identify the pad.
-    IdentifyController(usize),
-    /// Identify the focused controller (Cross).
-    IdentifySelected,
     /// Triangle hold completed on the focused Bluetooth pad.
     PowerOff,
     /// Open the per-app action menu (Triangle on a focused app tile).
     AppsMenuOpen(usize),
     AppsMenuMove(i32),
     AppsMenuConfirm,
-    AppsMenuAction(AppAction),
     AppsMenuClose,
-    AppInfoClose,
     Confirm,
     Close,
 }
@@ -390,16 +374,22 @@ impl AppAction {
     }
 }
 
-/// Rows in the hub shell settings screen.
-pub const SETTINGS_ROWS: [&str; 7] = [
+/// Rows in the hub shell settings screen. The download cap is hub policy for
+/// every standalone install, not a Browser-specific option.
+pub const SETTINGS_ROWS: [&str; 5] = [
     "UI sounds",
     "Volume",
     "Controller haptics",
     "Strength",
     "Download speed",
-    "Disconnected controllers",
-    "Back",
 ];
+
+/// Settings row indices used by the view and the App's apply path.
+pub const SETTINGS_SOUNDS: usize = 0;
+pub const SETTINGS_VOLUME: usize = 1;
+pub const SETTINGS_HAPTICS: usize = 2;
+pub const SETTINGS_STRENGTH: usize = 3;
+pub const SETTINGS_DOWNLOAD: usize = 4;
 
 /// Active Identify ring flash for one controller card.
 #[derive(Debug, Clone)]
@@ -613,6 +603,13 @@ impl State {
     /// True while the top-right controllers dock owns input.
     pub fn dock_expanded(&self) -> bool {
         self.focus == HubFocus::Controllers
+    }
+
+    /// Dock visibility: stays on screen while hub Settings is open (it is
+    /// display-only there), hidden only while an Info/action modal owns the
+    /// screen.
+    pub fn dock_visible(&self) -> bool {
+        !self.controllers.is_empty() && self.apps_info.is_none() && self.apps_menu.is_none()
     }
 
     /// Select/Share toggles the dock: collapsed ring column ↔ expanded list.
@@ -893,6 +890,9 @@ impl State {
         self.apps_menu = None;
         self.apps_info = None;
         self.install_error = None;
+        // Settings owns the screen; a Triangle hold started on the dock must
+        // not complete behind it.
+        self.reset_triangle_hold();
     }
 
     pub fn close_settings(&mut self) {
@@ -901,7 +901,14 @@ impl State {
     }
 
     pub fn settings_visible(&self, row: usize) -> bool {
-        row != 4 || self.download_cap_available
+        row != SETTINGS_DOWNLOAD || self.download_cap_available
+    }
+
+    pub fn clamp_settings_focus(&mut self) {
+        if self.settings_focus >= SETTINGS_ROWS.len() || !self.settings_visible(self.settings_focus)
+        {
+            self.settings_focus = 0;
+        }
     }
 
     pub fn settings_move(&mut self, delta: i32) {
@@ -924,17 +931,13 @@ impl State {
 
     pub fn settings_value(&self, row: usize) -> String {
         match row {
-            0 => (if self.sound_enabled { "On" } else { "Off" }).to_string(),
-            1 => format!("{}%", self.sound_volume),
-            2 => (if self.haptics_enabled { "On" } else { "Off" }).to_string(),
-            3 => format!("{}%", self.haptics_strength),
-            4 => crate::persist::prefs::engine_download_limit_label(self.download_limit_kbps),
-            5 => (if self.show_all_controllers {
-                "Show"
-            } else {
-                "Hide"
-            })
-            .to_string(),
+            SETTINGS_SOUNDS => (if self.sound_enabled { "On" } else { "Off" }).to_string(),
+            SETTINGS_VOLUME => format!("{}%", self.sound_volume),
+            SETTINGS_HAPTICS => (if self.haptics_enabled { "On" } else { "Off" }).to_string(),
+            SETTINGS_STRENGTH => format!("{}%", self.haptics_strength),
+            SETTINGS_DOWNLOAD => {
+                crate::app::installs::download_limit_label(self.download_limit_kbps)
+            }
             _ => String::new(),
         }
     }
@@ -946,15 +949,12 @@ impl State {
         haptics: bool,
         haptics_strength: u8,
         download_limit_kbps: u32,
-        show_all_controllers: bool,
     ) {
         self.sound_enabled = sounds;
         self.sound_volume = sound_volume;
         self.haptics_enabled = haptics;
         self.haptics_strength = haptics_strength;
-        self.download_limit_kbps =
-            crate::persist::prefs::clamp_engine_download_limit(download_limit_kbps);
-        self.show_all_controllers = show_all_controllers;
+        self.download_limit_kbps = crate::app::installs::clamp_download_limit(download_limit_kbps);
     }
 
     pub fn open_apps_menu(&mut self, index: usize) {
@@ -1171,7 +1171,10 @@ impl State {
         }
         // Triangle hold powers off the focused Bluetooth pad; movement or a
         // foreign press cancels it (same discipline as Start's dock row).
-        let can_power = self.focus == HubFocus::Controllers
+        let can_power = !self.settings_open
+            && self.apps_info.is_none()
+            && self.apps_menu.is_none()
+            && self.focus == HubFocus::Controllers
             && self.controller_selected().is_some_and(|row| {
                 row.show_power_off() && self.powering_off.as_ref() != Some(&row.serial)
             });
@@ -1250,12 +1253,19 @@ pub fn view<'a>(
     now: Instant,
 ) -> Element<'a, HubMessage> {
     let fade = panel.alpha.clamp(0.0, 1.0);
+    // Controller-first: the only mouse binding is a backdrop click, which
+    // mirrors Circle. Card layers are shielded so only clicks outside the
+    // active panel reach this backdrop.
     let mut layers: Vec<Element<'a, HubMessage>> = vec![
-        container(space())
-            .width(Fill)
-            .height(Fill)
-            .style(theme::scrim(backdrop_alpha))
-            .into(),
+        mouse_area(
+            container(space())
+                .width(Fill)
+                .height(Fill)
+                .style(theme::scrim(backdrop_alpha)),
+        )
+        .on_press(HubMessage::Close)
+        .interaction(iced::mouse::Interaction::Pointer)
+        .into(),
     ];
 
     let card: Element<'a, HubMessage> = if state.settings_open {
@@ -1298,6 +1308,15 @@ pub fn view<'a>(
             .into()
     };
 
+    let modal_open = state.apps_info.is_some() || state.apps_menu.is_some();
+    // While a modal card owns the screen, leave the hub card unshielded so a
+    // click anywhere outside the modal falls through to the backdrop (Circle
+    // closes the modal, not the hub).
+    let card: Element<'a, HubMessage> = if modal_open {
+        card
+    } else {
+        crate::ui::mouse_shield::mouse_shield(card)
+    };
     let card =
         crate::ui::scale::Scale::new(card, panel.scale).offset(Vector::new(0.0, panel.offset_y));
     layers.push(
@@ -1309,8 +1328,7 @@ pub fn view<'a>(
             .into(),
     );
 
-    let modal_open = state.settings_open || state.apps_info.is_some() || state.apps_menu.is_some();
-    if !modal_open && !state.controllers.is_empty() {
+    if state.dock_visible() {
         layers.push(controllers_dock_layer(
             state, spectrum, stage_w, stage_h, now, fade,
         ));
@@ -1348,12 +1366,7 @@ fn section_separator<'a>(width: f32, fade: f32) -> Element<'a, HubMessage> {
 /// Branding-only header row (Options moved to the action-hint row).
 fn hub_header<'a>(width: f32, fade: f32) -> Element<'a, HubMessage> {
     let brand = row![
-        svg(svg::Handle::from_memory(svg_icon::DUALSENSE_SVG.as_bytes()))
-            .width(Length::Fixed(24.0))
-            .height(Length::Fixed(24.0))
-            .style(move |_theme, _status| svg::Style {
-                color: Some(theme::scale_alpha(theme::ACCENT, fade))
-            }),
+        faded_svg(svg_icon::DUALSENSE_SVG, 24.0, theme::ACCENT, fade),
         text("SDSC Utils")
             .size(15.0)
             .font(iced::Font {
@@ -1375,31 +1388,43 @@ fn apps_row<'a>(state: &State, inner_w: f32, fade: f32) -> Element<'a, HubMessag
     let gaps = (TILES.len().saturating_sub(1)) as f32 * TILE_GAP;
     let tile_w = ((inner_w - gaps) / TILES.len() as f32).max(80.0);
     let mut tiles = row![].spacing(TILE_GAP).align_y(Alignment::Center);
-    for (i, tile) in TILES.into_iter().enumerate() {
-        tiles = tiles.push(tile_button(state, tile, i, tile_w, fade));
+    for (index, tile) in TILES.into_iter().enumerate() {
+        tiles = tiles.push(tile_button(state, tile, index, tile_w, fade));
     }
     tiles.width(Length::Fixed(inner_w)).into()
 }
 
-/// Third row: Select/Share controllers + Options settings, matching the old
-/// Start capsule hints. Both are clickable for mouse users.
+/// Third row: Select/Share controllers + Options settings. Display-only hints;
+/// the pad owns the actions.
 fn action_hints_row<'a>(state: &State, inner_w: f32, fade: f32) -> Element<'a, HubMessage> {
-    let controllers = button(capsule_hint(
+    let controllers = container(capsule_hint(
         "SELECT",
         "Controllers",
         state.create_held,
         fade,
     ))
-    .padding([2, 4])
-    .style(theme::ghost)
-    .on_press(HubMessage::ToggleControllers);
-    let settings = button(capsule_hint("START", "Settings", state.options_held, fade))
-        .padding([2, 4])
-        .style(theme::ghost)
-        .on_press(HubMessage::SettingsOpen);
+    .padding([2, 4]);
+    let settings =
+        container(capsule_hint("START", "Settings", state.options_held, fade)).padding([2, 4]);
     row![controllers, space().width(Fill), settings]
         .width(Length::Fixed(inner_w))
         .align_y(Alignment::Center)
+        .into()
+}
+
+fn faded_svg<'a>(
+    icon: &'static str,
+    size: f32,
+    color: Color,
+    fade: f32,
+) -> Element<'a, HubMessage> {
+    // iced's SVG colour filter rewrites RGB only; alpha must be applied as
+    // draw opacity so icons fade with the rest of the hub shell.
+    svg(svg::Handle::from_memory(icon.as_bytes()))
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .opacity(fade.clamp(0.0, 1.0))
+        .style(move |_theme, _status| svg::Style { color: Some(color) })
         .into()
 }
 
@@ -1434,7 +1459,9 @@ fn controllers_dock_layer<'a>(
     now: Instant,
     fade: f32,
 ) -> Element<'a, HubMessage> {
-    let dock = controllers_dock(state, spectrum, stage_h, now, fade);
+    let dock = crate::ui::mouse_shield::mouse_shield(controllers_dock(
+        state, spectrum, stage_h, now, fade,
+    ));
     row![
         space().width(Fill),
         column![dock, space().height(Fill)]
@@ -1722,18 +1749,12 @@ fn dock_controller_row<'a>(
         .align_y(Alignment::Center);
 
     let selection_t = state.controller_focus_t(index);
-    let mut b = button(
-        container(body)
-            .width(Length::Fixed(DOCK_MAX_W))
-            .height(Length::Fixed(row_h))
-            .clip(true),
-    )
-    .width(Length::Fixed(DOCK_MAX_W))
-    .height(Length::Fixed(row_h))
-    .padding(0)
-    .style(move |_theme, status| dock_row_style(selected, selection_t, row_radius, fade, status));
-    b = b.on_press(HubMessage::IdentifyController(index));
-    b.into()
+    container(body)
+        .width(Length::Fixed(DOCK_MAX_W))
+        .height(Length::Fixed(row_h))
+        .clip(true)
+        .style(move |theme| dock_row_style(selected, selection_t, row_radius, fade, theme))
+        .into()
 }
 
 /// Move a 0..=1 animation value toward its target at a fixed duration.
@@ -1753,97 +1774,104 @@ fn approach_hint_anim(current: &mut f32, target: bool, dt: f32) {
     approach_anim_to(current, if target { 1.0 } else { 0.0 }, dt, HINT_ANIM_SECS);
 }
 
-/// Controller dock row: transparent at rest, wash for hover/selection. The
-/// wash crossfades with `selection_t`, never swaps in one frame.
+/// Controller dock row: transparent at rest, selection wash crossfades with
+/// `selection_t`; there is no hover state (mouse is ignored).
 fn dock_row_style(
     selected: bool,
     selection_t: f32,
     radius: f32,
     fade: f32,
-    status: button::Status,
-) -> button::Style {
-    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-    let wash = if selected {
-        Some(theme::scale_alpha(
+    _theme: &Theme,
+) -> container::Style {
+    let wash = selected.then(|| {
+        theme::scale_alpha(
             theme::alpha(theme::INK, 0.05 * selection_t.clamp(0.0, 1.0)),
             fade,
-        ))
-    } else if hovered {
-        Some(theme::scale_alpha(theme::alpha(theme::INK, 0.04), fade))
-    } else {
-        None
-    };
-    button::Style {
+        )
+    });
+    container::Style {
         background: wash.map(Background::Color),
-        text_color: theme::scale_alpha(theme::INK, fade),
+        text_color: Some(theme::scale_alpha(theme::INK, fade)),
         border: Border {
             radius: radius.into(),
             ..Border::default()
         },
-        ..button::Style::default()
+        ..container::Style::default()
     }
 }
 
-/// Stable id for the controller/mouse-scrollable changelog in Info.
+/// Stable id for the pad-scrollable changelog in Info.
 pub fn info_scroll_id() -> iced::widget::Id {
     iced::widget::Id::new("hub-info-changelog")
 }
 
 fn settings_view<'a>(state: &'a State, stage_w: f32, fade: f32) -> Element<'a, HubMessage> {
-    let card_w = (stage_w - 48.0).clamp(340.0, 460.0);
-    let mut rows = column![].spacing(4);
+    let card_w = (stage_w - 32.0).clamp(340.0, HUB_WIDTH);
+    let mut rows = column![].spacing(6).width(Fill);
     for (i, label) in SETTINGS_ROWS.iter().enumerate() {
         if !state.settings_visible(i) {
             continue;
         }
-        let focused = i == state.settings_focus;
-        let value = state.settings_value(i);
-        let mut content = row![
-            text(*label)
-                .size(14.0)
-                .color(theme::scale_alpha(theme::INK, fade)),
-            space().width(Fill),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center);
-        if !value.is_empty() {
-            content = content.push(
-                text(value)
-                    .size(theme::type_scale::CAPTION)
-                    .color(theme::scale_alpha(theme::MUTED, fade)),
-            );
+        if i == SETTINGS_SOUNDS {
+            rows = rows.push(settings_section("Feedback", fade));
+        } else if i == SETTINGS_DOWNLOAD {
+            rows = rows.push(space().height(Length::Fixed(16.0)));
+            rows = rows.push(settings_section("App installs", fade));
         }
-        rows = rows.push(
-            button(content)
-                .width(Fill)
-                .padding([10, 12])
-                .on_press(HubMessage::SettingsRow(i))
-                .style(move |_theme, status| menu_row_style(focused, fade, status)),
-        );
+        let focused = i == state.settings_focus;
+        let row = match i {
+            SETTINGS_SOUNDS => {
+                settings_toggle_row("UI sounds", None, state.sound_enabled, focused, fade)
+            }
+            SETTINGS_VOLUME => settings_slider_row(
+                &format!("Volume {}%", state.sound_volume),
+                None,
+                state.sound_volume,
+                focused,
+                fade,
+            ),
+            SETTINGS_HAPTICS => settings_toggle_row(
+                "Controller haptics",
+                None,
+                state.haptics_enabled,
+                focused,
+                fade,
+            ),
+            SETTINGS_STRENGTH => settings_slider_row(
+                &format!("Strength {}%", state.haptics_strength),
+                None,
+                state.haptics_strength,
+                focused,
+                fade,
+            ),
+            SETTINGS_DOWNLOAD => settings_choice_row(
+                label,
+                Some("Applies to apps installed through the standalone hub"),
+                &state.settings_value(i),
+                focused,
+                fade,
+            ),
+            _ => continue,
+        };
+        rows = rows.push(row);
     }
     container(
         column![
-            row![
-                svg(svg::Handle::from_memory(svg_icon::SETTINGS_SVG.as_bytes()))
-                    .width(Length::Fixed(22.0))
-                    .height(Length::Fixed(22.0))
-                    .style(move |_theme, _status| svg::Style {
-                        color: Some(theme::scale_alpha(theme::INK, fade))
-                    }),
-                text("Settings")
-                    .size(theme::type_scale::HEADING)
-                    .color(theme::scale_alpha(theme::INK, fade)),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
+            text("Settings")
+                .size(26.0)
+                .font(iced::Font {
+                    weight: iced::font::Weight::Bold,
+                    ..iced::Font::default()
+                })
+                .color(theme::scale_alpha(theme::INK, fade)),
             space().height(4),
             text("Applies across the hub, Start, and Browser")
                 .size(theme::type_scale::CAPTION)
                 .color(theme::scale_alpha(theme::DIM, fade)),
-            space().height(10),
+            space().height(12),
             rows,
-            space().height(8),
-            text("Cross adjust · Options/Circle back")
+            space().height(10),
+            text("Up/Down select · Left/Right adjust · Circle back")
                 .size(theme::type_scale::CAPTION)
                 .color(theme::scale_alpha(theme::DIM, fade)),
         ]
@@ -1852,6 +1880,214 @@ fn settings_view<'a>(state: &'a State, stage_w: f32, fade: f32) -> Element<'a, H
     .padding(16)
     .width(Length::Fixed(card_w))
     .style(move |theme| card_style(fade, theme))
+    .into()
+}
+
+fn settings_section<'a>(label: &'static str, fade: f32) -> Element<'a, HubMessage> {
+    column![
+        text(label)
+            .size(15.0)
+            .font(iced::Font {
+                weight: iced::font::Weight::Semibold,
+                ..iced::Font::default()
+            })
+            .color(theme::scale_alpha(theme::DIM, fade)),
+        container(space().height(Length::Fixed(1.0)))
+            .width(Fill)
+            .style(move |_theme| container::Style {
+                background: Some(Background::Color(theme::scale_alpha(theme::LINE, fade))),
+                ..container::Style::default()
+            }),
+    ]
+    .spacing(6)
+    .width(Fill)
+    .into()
+}
+
+fn settings_focus_style(focused: bool, fade: f32) -> impl Fn(&Theme) -> container::Style + 'static {
+    move |_theme| {
+        if focused {
+            container::Style {
+                background: Some(Background::Color(theme::scale_alpha(
+                    theme::alpha(theme::ACCENT, 0.12),
+                    fade,
+                ))),
+                border: Border {
+                    color: theme::scale_alpha(theme::alpha(theme::ACCENT, 0.55), fade),
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..container::Style::default()
+            }
+        } else {
+            container::Style::default()
+        }
+    }
+}
+
+fn settings_row_labels<'a>(
+    label: impl Into<String>,
+    helper: Option<&'static str>,
+    size: f32,
+    fade: f32,
+) -> Element<'a, HubMessage> {
+    let mut col = column![
+        text(label.into())
+            .size(size)
+            .color(theme::scale_alpha(theme::INK, fade))
+    ]
+    .spacing(2)
+    .width(Fill);
+    if let Some(helper) = helper {
+        col = col.push(
+            text(helper)
+                .size(14.0)
+                .color(theme::scale_alpha(theme::DIM, fade))
+                .wrapping(Wrapping::None),
+        );
+    }
+    col.into()
+}
+
+fn settings_toggle<'a>(on: bool, fade: f32) -> Element<'a, HubMessage> {
+    toggler(on)
+        .size(22.0)
+        .style(move |_theme, _status| {
+            let (track, knob) = if on {
+                (theme::ACCENT, theme::INK)
+            } else {
+                (theme::alpha(theme::INK, 0.14), theme::MUTED)
+            };
+            iced::widget::toggler::Style {
+                background: Background::Color(theme::scale_alpha(track, fade)),
+                background_border_width: 0.0,
+                background_border_color: Color::TRANSPARENT,
+                foreground: Background::Color(theme::scale_alpha(knob, fade)),
+                foreground_border_width: 0.0,
+                foreground_border_color: Color::TRANSPARENT,
+                text_color: Some(theme::scale_alpha(theme::INK, fade)),
+                border_radius: None,
+                padding_ratio: 0.1,
+            }
+        })
+        .into()
+}
+
+fn settings_slider<'a>(percent: u8, fade: f32) -> Element<'a, HubMessage> {
+    let percent = percent.min(100);
+    let p = u16::from(percent);
+    let track = progress_bar(0.0..=1.0, f32::from(percent) / 100.0)
+        .girth(4.0)
+        .style(move |_theme| progress_bar::Style {
+            background: Background::Color(theme::scale_alpha(theme::alpha(theme::INK, 0.14), fade)),
+            bar: Background::Color(theme::scale_alpha(theme::ACCENT, fade)),
+            border: Border {
+                radius: theme::radius::PILL.into(),
+                ..Border::default()
+            },
+        });
+    let knob = container(space())
+        .width(Length::Fixed(16.0))
+        .height(Length::Fixed(16.0))
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(theme::scale_alpha(theme::INK, fade))),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 8.0.into(),
+            },
+            ..container::Style::default()
+        });
+    stack![
+        container(track)
+            .width(Fill)
+            .height(Length::Fixed(16.0))
+            .align_y(Alignment::Center),
+        row![
+            space().width(Length::FillPortion(p)),
+            knob,
+            space().width(Length::FillPortion(100u16.saturating_sub(p))),
+        ]
+        .width(Fill)
+        .height(Length::Fixed(16.0))
+        .align_y(Alignment::Center),
+    ]
+    .width(Fill)
+    .height(Length::Fixed(16.0))
+    .into()
+}
+
+fn settings_toggle_row<'a>(
+    label: &'static str,
+    helper: Option<&'static str>,
+    on: bool,
+    focused: bool,
+    fade: f32,
+) -> Element<'a, HubMessage> {
+    container(
+        row![
+            settings_row_labels(label, helper, 16.0, fade),
+            settings_toggle(on, fade),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    )
+    .padding(10)
+    .width(Fill)
+    .style(settings_focus_style(focused, fade))
+    .into()
+}
+
+fn settings_slider_row<'a>(
+    label: &str,
+    helper: Option<&'static str>,
+    percent: u8,
+    focused: bool,
+    fade: f32,
+) -> Element<'a, HubMessage> {
+    let mut content = column![
+        text(label.to_string())
+            .size(14.0)
+            .color(theme::scale_alpha(theme::MUTED, fade)),
+        settings_slider(percent, fade),
+    ]
+    .spacing(4)
+    .width(Fill);
+    if let Some(helper) = helper {
+        content = content.push(
+            text(helper)
+                .size(14.0)
+                .color(theme::scale_alpha(theme::DIM, fade))
+                .wrapping(Wrapping::None),
+        );
+    }
+    container(content)
+        .padding(10)
+        .width(Fill)
+        .style(settings_focus_style(focused, fade))
+        .into()
+}
+
+fn settings_choice_row<'a>(
+    label: &'static str,
+    helper: Option<&'static str>,
+    value: &str,
+    focused: bool,
+    fade: f32,
+) -> Element<'a, HubMessage> {
+    container(
+        row![
+            settings_row_labels(label, helper, 16.0, fade),
+            text(value.to_string())
+                .size(14.0)
+                .color(theme::scale_alpha(theme::INK, fade)),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    )
+    .padding(10)
+    .width(Fill)
+    .style(settings_focus_style(focused, fade))
     .into()
 }
 
@@ -1883,7 +2119,6 @@ fn progress_tile_body<'a>(
     } else {
         theme::DIM
     };
-    let ink = theme::scale_alpha(ink, fade);
     let font = if focused {
         iced::Font {
             weight: iced::font::Weight::Semibold,
@@ -1907,10 +2142,7 @@ fn progress_tile_body<'a>(
         );
     }
     let mut body = column![
-        svg(svg::Handle::from_memory(icon.as_bytes()))
-            .width(Length::Fixed(icon_size))
-            .height(Length::Fixed(icon_size))
-            .style(move |_theme, _status| svg::Style { color: Some(ink) }),
+        faded_svg(icon, icon_size, ink, fade),
         text(text_fit::ellipsize_to_width(
             title,
             title_size,
@@ -1918,7 +2150,7 @@ fn progress_tile_body<'a>(
         ))
         .size(title_size)
         .font(font)
-        .color(ink),
+        .color(theme::scale_alpha(ink, fade)),
         phase,
     ];
     if let Some(size) = state.progress.size_label() {
@@ -1954,7 +2186,6 @@ fn tile_button<'a>(
     };
     let (icon, title) = tile_copy(tile);
     let ink = if dim { theme::DIM } else { theme::INK };
-    let ink = theme::scale_alpha(ink, fade);
     let title_font = if selected {
         iced::Font {
             weight: iced::font::Weight::Semibold,
@@ -1964,10 +2195,7 @@ fn tile_button<'a>(
         iced::Font::default()
     };
     let normal: Element<'a, HubMessage> = column![
-        svg(svg::Handle::from_memory(icon.as_bytes()))
-            .width(Length::Fixed(ICON))
-            .height(Length::Fixed(ICON))
-            .style(move |_theme, _status| svg::Style { color: Some(ink) }),
+        faded_svg(icon, ICON, ink, fade),
         text(text_fit::ellipsize_to_width(
             title,
             TILE_TITLE,
@@ -1975,7 +2203,7 @@ fn tile_button<'a>(
         ))
         .size(TILE_TITLE)
         .font(title_font)
-        .color(ink),
+        .color(theme::scale_alpha(ink, fade)),
     ]
     .spacing(4)
     .align_x(Alignment::Center)
@@ -1985,14 +2213,12 @@ fn tile_button<'a>(
     } else if matches!(tile, HubTile::Browser) && !state.engine_ready {
         stack![
             normal,
-            container(
-                svg(svg::Handle::from_memory(svg_icon::DOWNLOAD_SVG.as_bytes()))
-                    .width(Length::Fixed(14.0))
-                    .height(Length::Fixed(14.0))
-                    .style(move |_theme, _status| svg::Style {
-                        color: Some(theme::scale_alpha(theme::WARNING, fade))
-                    }),
-            )
+            container(faded_svg(
+                svg_icon::DOWNLOAD_SVG,
+                14.0,
+                theme::WARNING,
+                fade,
+            ))
             .width(Fill)
             .height(Fill)
             .align_x(Alignment::End)
@@ -2016,15 +2242,14 @@ fn tile_button<'a>(
     } else {
         normal
     };
-    let mut b = button(container(content).center_x(Fill).center_y(Fill))
+    container(content)
         .width(Length::Fixed(width))
         .height(Length::Fixed(TILE_H))
         .padding(4)
-        .style(move |_theme, status| tile_style(selected, interactive, dim, fade, status));
-    if interactive {
-        b = b.on_press(HubMessage::Activate(index));
-    }
-    b.into()
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .style(move |theme| tile_style(selected, interactive, dim, fade, theme))
+        .into()
 }
 
 fn apps_menu<'a>(state: &State, index: usize, fade: f32) -> Element<'a, HubMessage> {
@@ -2033,14 +2258,9 @@ fn apps_menu<'a>(state: &State, index: usize, fade: f32) -> Element<'a, HubMessa
     for (i, action) in state.app_actions(index).into_iter().enumerate() {
         let focused = i == state.apps_menu_focus;
         rows = rows.push(
-            button(
+            container(
                 row![
-                    svg(svg::Handle::from_memory(action.icon().as_bytes()))
-                        .width(Length::Fixed(18.0))
-                        .height(Length::Fixed(18.0))
-                        .style(move |_theme, _status| svg::Style {
-                            color: Some(theme::scale_alpha(theme::INK, fade))
-                        }),
+                    faded_svg(action.icon(), 18.0, theme::INK, fade),
                     text(action.label())
                         .size(14.0)
                         .color(theme::scale_alpha(theme::INK, fade)),
@@ -2050,19 +2270,13 @@ fn apps_menu<'a>(state: &State, index: usize, fade: f32) -> Element<'a, HubMessa
             )
             .width(Fill)
             .padding([8, 10])
-            .on_press(HubMessage::AppsMenuAction(action))
-            .style(move |_theme, status| menu_row_style(focused, fade, status)),
+            .style(move |theme| menu_row_style(focused, fade, theme)),
         );
     }
     let card = container(
         column![
             row![
-                svg(svg::Handle::from_memory(app.icon().as_bytes()))
-                    .width(Length::Fixed(22.0))
-                    .height(Length::Fixed(22.0))
-                    .style(move |_theme, _status| svg::Style {
-                        color: Some(theme::scale_alpha(theme::INK, fade))
-                    }),
+                faded_svg(app.icon(), 22.0, theme::INK, fade),
                 text(app.title())
                     .size(16.0)
                     .color(theme::scale_alpha(theme::INK, fade)),
@@ -2077,6 +2291,7 @@ fn apps_menu<'a>(state: &State, index: usize, fade: f32) -> Element<'a, HubMessa
     .padding(10)
     .width(Length::Fixed(230.0))
     .style(move |theme| card_style(fade, theme));
+    let card = crate::ui::mouse_shield::mouse_shield(card);
     container(card)
         .width(Fill)
         .height(Fill)
@@ -2203,10 +2418,7 @@ fn app_info<'a>(state: &'a State, index: usize, fade: f32) -> Element<'a, HubMes
     let card = container(
         column![
             row![
-                svg(svg::Handle::from_memory(app.icon().as_bytes()))
-                    .width(Length::Fixed(44.0))
-                    .height(Length::Fixed(44.0))
-                    .style(move |_theme, _status| svg::Style { color: Some(ink) }),
+                faded_svg(app.icon(), 44.0, ink, fade),
                 column![
                     text(app.title())
                         .size(theme::type_scale::HEADING)
@@ -2217,15 +2429,6 @@ fn app_info<'a>(state: &'a State, index: usize, fade: f32) -> Element<'a, HubMes
                 ]
                 .spacing(2),
                 space().width(Fill),
-                icon_button(
-                    svg_icon::CLOSE_SVG,
-                    16.0,
-                    36.0,
-                    theme::MUTED,
-                    false,
-                    fade,
-                    Some(HubMessage::AppInfoClose),
-                ),
             ]
             .spacing(14)
             .align_y(Alignment::Center),
@@ -2237,6 +2440,7 @@ fn app_info<'a>(state: &'a State, index: usize, fade: f32) -> Element<'a, HubMes
     .padding(16)
     .width(Length::Fixed(420.0))
     .style(move |theme| card_style(fade, theme));
+    let card = crate::ui::mouse_shield::mouse_shield(card);
     container(card)
         .width(Fill)
         .height(Fill)
@@ -2266,78 +2470,15 @@ fn tile_copy(tile: HubTile) -> (&'static str, &'static str) {
     }
 }
 
-fn icon_button<'a>(
-    icon: &'static str,
-    icon_size: f32,
-    box_size: f32,
-    color: Color,
-    focused: bool,
-    fade: f32,
-    on_press: Option<HubMessage>,
-) -> Element<'a, HubMessage> {
-    let glyph = svg(svg::Handle::from_memory(icon.as_bytes()))
-        .width(Length::Fixed(icon_size))
-        .height(Length::Fixed(icon_size))
-        .style(move |_theme, _status| svg::Style {
-            color: Some(theme::scale_alpha(color, fade)),
-        });
-    let mut b = button(glyph)
-        .width(Length::Fixed(box_size))
-        .height(Length::Fixed(box_size))
-        .padding(0)
-        .style(move |_theme, status| icon_button_style(focused, fade, status));
-    if let Some(message) = on_press {
-        b = b.on_press(message);
-    }
-    b.into()
-}
-
-fn icon_button_style(focused: bool, fade: f32, status: button::Status) -> button::Style {
-    let (fill, border) = if focused {
-        (
-            theme::alpha(theme::INK, 0.12),
-            theme::alpha(theme::INK, 0.38),
-        )
-    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-        (
-            theme::alpha(theme::INK, 0.09),
-            theme::alpha(theme::INK, 0.22),
-        )
-    } else {
-        (theme::alpha(theme::INK, 0.04), theme::GLASS_HAIRLINE)
-    };
-    button::Style {
-        background: Some(Background::Color(theme::scale_alpha(fill, fade))),
-        text_color: theme::scale_alpha(theme::INK, fade),
-        border: Border {
-            color: theme::scale_alpha(border, fade),
-            width: 1.0,
-            radius: theme::radius::PILL.into(),
-        },
-        shadow: if focused {
-            Shadow {
-                color: theme::scale_alpha(theme::alpha(theme::INK, 0.12), fade),
-                offset: Vector::new(0.0, 0.0),
-                blur_radius: 16.0,
-            }
-        } else {
-            Shadow::default()
-        },
-        ..button::Style::default()
-    }
-}
-
-fn menu_row_style(focused: bool, fade: f32, status: button::Status) -> button::Style {
+fn menu_row_style(focused: bool, fade: f32, _theme: &Theme) -> container::Style {
     let fill = if focused {
         theme::alpha(theme::INK, 0.12)
-    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-        theme::alpha(theme::INK, 0.08)
     } else {
         theme::alpha(theme::INK, 0.02)
     };
-    button::Style {
+    container::Style {
         background: Some(Background::Color(theme::scale_alpha(fill, fade))),
-        text_color: theme::scale_alpha(theme::INK, fade),
+        text_color: Some(theme::scale_alpha(theme::INK, fade)),
         border: Border {
             color: if focused {
                 theme::scale_alpha(theme::alpha(theme::INK, 0.28), fade)
@@ -2347,7 +2488,7 @@ fn menu_row_style(focused: bool, fade: f32, status: button::Status) -> button::S
             width: 1.0,
             radius: theme::radius::MD.into(),
         },
-        ..button::Style::default()
+        ..container::Style::default()
     }
 }
 
@@ -2356,42 +2497,28 @@ fn tile_style(
     interactive: bool,
     dim: bool,
     fade: f32,
-    status: button::Status,
-) -> button::Style {
-    let (fill, border, ink) = if !interactive {
+    _theme: &Theme,
+) -> container::Style {
+    let (fill, border) = if !interactive {
         (
             theme::alpha(theme::INK, 0.02),
             theme::alpha(theme::LINE, 0.4),
-            theme::DIM,
         )
     } else if selected {
         (
             theme::alpha(theme::INK, 0.10),
             theme::alpha(theme::INK, 0.34),
-            if dim { theme::DIM } else { theme::INK },
-        )
-    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-        (
-            theme::alpha(theme::INK, 0.08),
-            theme::alpha(theme::INK, 0.22),
-            if dim { theme::DIM } else { theme::INK },
         )
     } else if dim {
         (
             theme::alpha(theme::INK, 0.02),
             theme::alpha(theme::LINE, 0.35),
-            theme::DIM,
         )
     } else {
-        (
-            theme::alpha(theme::INK, 0.04),
-            theme::GLASS_HAIRLINE,
-            theme::INK,
-        )
+        (theme::alpha(theme::INK, 0.04), theme::GLASS_HAIRLINE)
     };
-    button::Style {
+    container::Style {
         background: Some(Background::Color(theme::scale_alpha(fill, fade))),
-        text_color: theme::scale_alpha(ink, fade),
         border: Border {
             color: theme::scale_alpha(border, fade),
             width: 1.0,
@@ -2406,7 +2533,7 @@ fn tile_style(
         } else {
             Shadow::default()
         },
-        ..button::Style::default()
+        ..container::Style::default()
     }
 }
 
@@ -2638,13 +2765,12 @@ mod tests {
     #[test]
     fn settings_rows_cycle_and_report_values() {
         let mut state = State::default();
-        state.set_settings(true, 70, false, 40, 5 * 1024, true);
+        state.set_settings(true, 70, false, 40, 5 * 1024);
         assert_eq!(state.settings_value(0), "On");
         assert_eq!(state.settings_value(1), "70%");
         assert_eq!(state.settings_value(2), "Off");
         assert_eq!(state.settings_value(3), "40%");
         assert_eq!(state.settings_value(4), "5 MB/s");
-        assert_eq!(state.settings_value(5), "Show");
         state.settings_move(1);
         state.settings_move(-1);
         assert_eq!(state.settings_focus, 0);
@@ -2658,16 +2784,18 @@ mod tests {
             download_cap_available: false,
             ..State::default()
         };
-        assert!(!state.settings_visible(4));
-        assert!(state.settings_visible(3));
-        assert!(state.settings_visible(5));
-        state.settings_focus = 3;
+        assert!(!state.settings_visible(SETTINGS_DOWNLOAD));
+        assert!(state.settings_visible(SETTINGS_STRENGTH));
+        state.settings_focus = SETTINGS_STRENGTH;
         state.settings_move(1);
-        assert_eq!(state.settings_focus, 5, "movement skips the hidden cap row");
+        assert_eq!(
+            state.settings_focus, SETTINGS_SOUNDS,
+            "movement skips the hidden cap row and wraps"
+        );
         state.settings_move(1);
-        assert_eq!(state.settings_focus, 6);
-        state.settings_move(1);
-        assert_eq!(state.settings_focus, 0);
+        assert_eq!(state.settings_focus, SETTINGS_VOLUME);
+        state.settings_move(-1);
+        assert_eq!(state.settings_focus, SETTINGS_SOUNDS);
     }
 
     #[test]
@@ -2899,6 +3027,65 @@ mod tests {
         assert_eq!(
             state.pad_tick(&square, now + std::time::Duration::from_millis(80)),
             Some(HubMessage::ToggleShowAll)
+        );
+    }
+
+    #[test]
+    fn dock_stays_visible_under_settings_but_not_modals() {
+        use crate::controller::model::{
+            Capabilities, Connection, ControllerKind, ControllerStatus, PowerState,
+        };
+        let row = ControllerRow::connected(
+            &ControllerStatus {
+                index: 1,
+                kind: ControllerKind::DualSense,
+                serial: Serial::from("abc"),
+                product: "DualSense".into(),
+                connection: Connection::Bluetooth,
+                percent: 80,
+                state: PowerState::Discharging,
+                capabilities: Capabilities::FULL,
+            },
+            false,
+            true,
+            None,
+            20,
+            None,
+        );
+        let mut state = State::default();
+        assert!(!state.dock_visible());
+        state.set_controllers(vec![row]);
+        assert!(state.dock_visible());
+        state.settings_open = true;
+        assert!(state.dock_visible(), "settings leaves the dock on screen");
+        state.apps_menu = Some(0);
+        assert!(!state.dock_visible(), "action modal hides the dock");
+        state.apps_menu = None;
+        state.apps_info = Some(0);
+        assert!(!state.dock_visible(), "info modal hides the dock");
+    }
+
+    #[test]
+    fn dpad_vertical_emits_move_y_for_the_dock() {
+        use crate::domain::pad::PadSample;
+        let mut state = State::default();
+        let now = Instant::now();
+        let down = PadSample {
+            dpad_down: true,
+            ..PadSample::default()
+        };
+        assert_eq!(state.pad_tick(&down, now), Some(HubMessage::MoveY(1)));
+        state.pad_tick(
+            &PadSample::default(),
+            now + std::time::Duration::from_millis(16),
+        );
+        let up = PadSample {
+            dpad_up: true,
+            ..PadSample::default()
+        };
+        assert_eq!(
+            state.pad_tick(&up, now + std::time::Duration::from_millis(32)),
+            Some(HubMessage::MoveY(-1))
         );
     }
 

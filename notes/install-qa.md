@@ -88,10 +88,12 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
 - **Cancel** during Downloading/Verifying/Installing: Circle/Esc or the Cancel
   action row. The worker deletes staging, restores the previous install, and
   leaves the pointer untouched.
-- **Download speed** lives in PS hub → Settings (`Unlimited / 2 / 5 / 10 MB/s`)
-  and is shared with a live download. It is hidden in packaged builds because
-  the Store owns downloads. The tile shows the live `current / target` size
-  and MB/s; there is no “capped” label.
+- **Download speed** lives in PS hub → Settings → App installs
+  (`Unlimited / 2 / 5 / 10 MB/s`). It is hub-owned policy, shared live with
+  every standalone managed-app install (Browser engine today, future catalog
+  apps later), and hidden in packaged builds because the Store owns downloads.
+  The tile shows the live `current / target` size and MB/s; there is no
+  “capped” label.
 - **Mock MSIX engine package** stages `cef\` beside the exe and sets
   `SDSC_MSIX_ENGINE_DIR`, so the resolver treats it as the optional package:
   Browser reports **Managed by Store**, Uninstall is hidden, and Info shows the
@@ -101,21 +103,28 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
 
 - The hub card keeps three rows and no outer padding: branding header
   (DualSense mark + `SDSC Utils`), apps (Start / Browser), then action hints
-  left-to-right: **SELECT Controllers** and **START Settings**. Both hints are
-  clickable.
+  left-to-right: **SELECT Controllers** and **START Settings**. Hints are
+  display-only; the pad owns every action.
 - The controllers list is the restored Start-style dock in the monitor's
   top-right corner: collapsed battery-ring column by default; Select/Share
   (Create) expands it in place and moves focus to controllers. It has no
-  section title or count.
-- While the dock is expanded, Left/Right move the controller selection, Cross
-  identifies, Triangle hold powers off a live Bluetooth pad, Square toggles
-  Connected/All in the dock footer, and Circle collapses the dock (a second
-  Circle closes the hub). Up/Down have no row-focus role on the main hub.
-- **Options** (or the START Settings hint) opens hub Settings. The settings
-  screen absorbs UI sounds, volume, haptics, strength, the standalone download
-  cap, and the disconnected-controller filter for the dock. Those feedback
-  prefs are global (Start, Browser, and hub).
-- Cross (or click) launches the focused app. Triangle on the Browser tile opens
+  section title or count. The dock stays visible while hub Settings is open
+  (display-only there) and hides only for Info/action modals.
+- While the dock is expanded, Up/Down or Left/Right move the controller
+  selection, Cross identifies, Triangle hold powers off a live Bluetooth pad,
+  Square toggles Connected/All in the dock footer, and Circle collapses the
+  dock (a second Circle closes the hub). Up/Down have no row-focus role on the
+  main hub outside the dock.
+- **Options** (or the START Settings hint) opens hub Settings. The screen uses
+  Start-settings sections and controls: **Feedback** (UI sounds, volume,
+  controller haptics, strength) and **App installs** (Download speed, hidden
+  in packaged builds). The cap is hub-owned and applies to every standalone
+  managed-app install/update. The disconnected-controller filter is no longer
+  a settings row; Square in the dock owns it. Feedback prefs are global
+  (Start, Browser, and hub).
+- Hub Settings and the dock are controller/keyboard only. The sole mouse
+  binding is clicking the backdrop of the active panel, which acts like
+  Circle. Cross launches the focused app; Triangle on the Browser tile opens
   its install/update/Info actions popup (the old catalog screen is gone).
 
 ## Environment overrides
