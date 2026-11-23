@@ -1,10 +1,9 @@
 //! In-window launcher settings (Options): right drawer.
 
 use crate::persist::prefs::{
-    AUTO_OPEN_MODES, HomeAutoOpen, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout,
-    LAUNCHER_IDLE_SECS_STEPS, LAUNCHER_SLEEP_SECS_STEPS, LauncherSelectionMode, NAVBAR_MODES,
-    NavbarVisibility, REDUCED_MOTION_MODES, ReducedMotion, SELECTION_MODES,
-    format_timeout_duration, min_sleep_secs_for_idle, secs_step_index,
+    IMMERSIVE_LAYOUT_MODES, ImmersiveLayout, LAUNCHER_IDLE_SECS_STEPS, LAUNCHER_SLEEP_SECS_STEPS,
+    LauncherSelectionMode, NAVBAR_MODES, NavbarVisibility, REDUCED_MOTION_MODES, ReducedMotion,
+    SELECTION_MODES, format_timeout_duration, min_sleep_secs_for_idle, secs_step_index,
 };
 use crate::ui::face::{FaceButton, action_cluster, face_hint, face_hold_hint};
 use crate::ui::launcher::icon_cache;
@@ -30,7 +29,7 @@ pub const DRAWER_W: f32 = 600.0;
 const DRAWER_ANIM_MS: u64 = 220;
 const ROW_PAD: f32 = 10.0;
 const COL_GAP: f32 = 6.0;
-/// Inner padding of the expanded auto-open dropdown panel.
+/// Inner padding of the expanded selector dropdown panel.
 const MENU_PANEL_PAD: f32 = 4.0;
 /// Gap between scrollable content and the embedded scrollbar (matches Configure/Popup).
 const SCROLL_GAP: f32 = 8.0;
@@ -67,7 +66,6 @@ const TOP_PIN_MAX_ROW_TOP: f32 = CONTENT_PAD_Y + 48.0;
 /// Prefs snapshot for the Launcher settings panel (Enabled stays Configure-only).
 #[derive(Debug, Clone)]
 pub struct LauncherSettingsSnapshot {
-    pub auto_open: HomeAutoOpen,
     pub selection_persist: bool,
     pub selection_mode: LauncherSelectionMode,
     pub clock_enabled: bool,
@@ -97,7 +95,6 @@ pub struct LauncherSettingsSnapshot {
 /// Focusable rows in the Launcher settings list (dynamic when sounds/haptics off).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
-    AutoOpen,
     SelectionPersist,
     SelectionMode,
     Clock,
@@ -130,11 +127,10 @@ impl SettingsRow {
     /// To add a row: append/reorder here, extend `visible()` + `section_before()`
     /// / `gap_before()` + the `panel_view` build match + `kind()`/dispatch arms.
     #[cfg(debug_assertions)]
-    pub const ROW_COUNT: usize = 21;
-    #[cfg(not(debug_assertions))]
     pub const ROW_COUNT: usize = 20;
+    #[cfg(not(debug_assertions))]
+    pub const ROW_COUNT: usize = 19;
     pub const ALL: [Self; Self::ROW_COUNT] = [
-        Self::AutoOpen,
         Self::SelectionPersist,
         Self::SelectionMode,
         Self::Clock,
@@ -163,8 +159,7 @@ impl SettingsRow {
     /// compile until its visibility is declared.
     pub fn visible(self, snapshot: &LauncherSettingsSnapshot) -> bool {
         match self {
-            Self::AutoOpen
-            | Self::Clock
+            Self::Clock
             | Self::ImmersiveLayout
             | Self::Navbar
             | Self::ReducedMotion
@@ -222,11 +217,9 @@ impl SettingsRow {
     /// the row so inserting/reordering rows carries its section along.
     ///
     /// Selection restores on open, so it gets its own section immediately
-    /// after Opening (Opening-adjacent, before Display) rather than joining
-    /// either neighbor.
+    /// before Display rather than joining either neighbor.
     fn section_before(self) -> Option<&'static str> {
         match self {
-            Self::AutoOpen => Some("Opening"),
             Self::SelectionPersist => Some("Selection"),
             Self::Clock => Some("Display"),
             Self::Sounds => Some("Feedback"),
@@ -259,8 +252,7 @@ impl SettingsRow {
             Self::ShowUninstalled => true,
             #[cfg(debug_assertions)]
             Self::TuneAmbience => true,
-            Self::AutoOpen
-            | Self::SelectionMode
+            Self::SelectionMode
             | Self::ImmersiveLayout
             | Self::Navbar
             | Self::ReducedMotion
@@ -298,11 +290,9 @@ impl SettingsRow {
     /// Widget kind for a row, declared once; confirm/nudge dispatch over it.
     pub fn kind(self) -> RowKind {
         match self {
-            Self::AutoOpen
-            | Self::SelectionMode
-            | Self::ImmersiveLayout
-            | Self::Navbar
-            | Self::ReducedMotion => RowKind::Selector,
+            Self::SelectionMode | Self::ImmersiveLayout | Self::Navbar | Self::ReducedMotion => {
+                RowKind::Selector
+            }
             Self::SelectionPersist
             | Self::Clock
             | Self::Sounds
@@ -355,7 +345,6 @@ impl SettingsRow {
     /// Dropdown-open message for selector rows (confirm path).
     fn open_menu(self) -> LauncherMessage {
         match self {
-            Self::AutoOpen => LauncherMessage::ToggleAutoOpenMenu,
             Self::SelectionMode => LauncherMessage::ToggleSelectionModeMenu,
             Self::ImmersiveLayout => LauncherMessage::ToggleLayoutMenu,
             Self::Navbar => LauncherMessage::ToggleNavbarMenu,
@@ -367,7 +356,6 @@ impl SettingsRow {
     /// Dropdown length for selector rows (option count driving highlight wrap).
     pub fn selector_count(self) -> usize {
         match self {
-            Self::AutoOpen => AUTO_OPEN_MODES.len(),
             Self::SelectionMode => SELECTION_MODES.len(),
             Self::ImmersiveLayout => IMMERSIVE_LAYOUT_MODES.len(),
             Self::Navbar => NAVBAR_MODES.len(),
@@ -379,10 +367,6 @@ impl SettingsRow {
     /// Highlight init: index of the current value in the dropdown order.
     pub fn initial_highlight(self, snapshot: &LauncherSettingsSnapshot) -> usize {
         match self {
-            Self::AutoOpen => AUTO_OPEN_MODES
-                .iter()
-                .position(|&m| m == snapshot.auto_open)
-                .unwrap_or(0),
             Self::SelectionMode => SELECTION_MODES
                 .iter()
                 .position(|&m| m == snapshot.selection_mode)
@@ -406,7 +390,6 @@ impl SettingsRow {
     /// Display label of the dropdown option at `index`.
     pub fn selector_label(self, index: usize) -> &'static str {
         match self {
-            Self::AutoOpen => AUTO_OPEN_MODES[index].label(),
             Self::SelectionMode => SELECTION_MODES[index].label(),
             Self::ImmersiveLayout => IMMERSIVE_LAYOUT_MODES[index].label(),
             Self::Navbar => NAVBAR_MODES[index].label(),
@@ -418,9 +401,6 @@ impl SettingsRow {
     /// Whether the dropdown option at `index` is the committed value.
     pub fn selector_selected(self, index: usize, snapshot: &LauncherSettingsSnapshot) -> bool {
         match self {
-            Self::AutoOpen => AUTO_OPEN_MODES
-                .get(index)
-                .is_some_and(|&m| m == snapshot.auto_open),
             Self::SelectionMode => SELECTION_MODES
                 .get(index)
                 .is_some_and(|&m| m == snapshot.selection_mode),
@@ -441,9 +421,6 @@ impl SettingsRow {
     /// the old per-menu confirm paths).
     pub fn selector_select(self, index: usize) -> LauncherMessage {
         match self {
-            Self::AutoOpen => {
-                LauncherMessage::SetAutoOpen(AUTO_OPEN_MODES[index.min(AUTO_OPEN_MODES.len() - 1)])
-            }
             Self::SelectionMode => LauncherMessage::SetSelectionMode(
                 SELECTION_MODES[index.min(SELECTION_MODES.len() - 1)],
             ),
@@ -461,14 +438,9 @@ impl SettingsRow {
     }
 
     /// Quick-cycle for selector rows without opening the menu.
-    /// AutoOpen respects direction (next/prev); Layout flips either way (delta ignored).
+    /// Layout flips either way (delta ignored); other selectors respect it.
     fn cycle_selector(self, snapshot: &LauncherSettingsSnapshot, delta: i8) -> LauncherMessage {
         match self {
-            Self::AutoOpen => LauncherMessage::SetAutoOpen(if delta > 0 {
-                snapshot.auto_open.next()
-            } else {
-                snapshot.auto_open.prev()
-            }),
             Self::SelectionMode => LauncherMessage::SetSelectionMode(if delta > 0 {
                 snapshot.selection_mode.next()
             } else {
@@ -567,8 +539,7 @@ pub fn settings_nav_cue(row: SettingsRow) -> SettingsCue {
         SettingsRow::Sounds | SettingsRow::SoundVolume => SettingsCue::HapticOnly,
         // Apply rumbles at the new strength; nav covers sound only.
         SettingsRow::Haptics | SettingsRow::HapticsStrength => SettingsCue::SoundOnly,
-        SettingsRow::AutoOpen
-        | SettingsRow::SelectionPersist
+        SettingsRow::SelectionPersist
         | SettingsRow::SelectionMode
         | SettingsRow::Clock
         | SettingsRow::ImmersiveLayout
@@ -879,8 +850,8 @@ pub fn confirm_message(
 ///
 /// No longer wired to Left/Right nav (form controls are mouse-driven);
 /// retained for tests. Sliders step; toggles set off on left and on on
-/// right (no-op if already there). Auto open and Layout quick-cycle without
-/// opening the menu (Confirm opens the menu for direct picking instead).
+/// right (no-op if already there). Selectors quick-cycle without opening the
+/// menu (Confirm opens the menu for direct picking instead).
 /// With a menu open, Up/Down move the highlight and Confirm picks /
 /// Cancel closes.
 pub fn nudge_message(
@@ -948,7 +919,6 @@ fn step_in_table(value: u32, table: &[u32], step: isize) -> Option<u32> {
 /// literals). `None` where Configure itself shows no helper.
 fn row_helper(row: SettingsRow) -> Option<&'static str> {
     match row {
-        SettingsRow::AutoOpen => Some("When a controller connects"),
         SettingsRow::SelectionPersist => Some("Keep the game highlight across restarts"),
         SettingsRow::SelectionMode => Some("Match the game, or its position"),
         SettingsRow::Clock => None,
@@ -1289,14 +1259,6 @@ pub fn panel_view<'a>(
         }
         let focused = focus_rows.get(focus) == Some(&row);
         let widget: Element<'_, LauncherMessage> = match row {
-            SettingsRow::AutoOpen => selector_row(
-                "Auto open Home:",
-                SettingsRow::AutoOpen.helper(),
-                snapshot.auto_open.label(),
-                focused,
-                ty,
-                SettingsRow::AutoOpen.open_menu(),
-            ),
             SettingsRow::SelectionPersist => toggle_row(
                 "Remember selection",
                 SettingsRow::SelectionPersist.helper(),
@@ -2103,7 +2065,6 @@ mod tests {
 
     fn snap(sounds: bool, haptics: bool) -> LauncherSettingsSnapshot {
         LauncherSettingsSnapshot {
-            auto_open: HomeAutoOpen::Any,
             selection_persist: true,
             selection_mode: LauncherSelectionMode::ByGame,
             clock_enabled: true,
@@ -2147,7 +2108,7 @@ mod tests {
         drop(panel_view(&state, &snapshot, false));
         drop(panel_view(&state, &snapshot, true));
         let mut menu_open = State::default();
-        menu_open.settings.menu = Some((SettingsRow::AutoOpen, 0));
+        menu_open.settings.menu = Some((SettingsRow::ImmersiveLayout, 0));
         drop(panel_view(&menu_open, &snapshot, true));
         drop(immersive_drawer(&state, &snapshot, 1.0, true));
         // Dirty + queued renderer prefs: the reload action row (both states)
@@ -2169,7 +2130,6 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                SettingsRow::AutoOpen,
                 // SelectionPersist is a hidden row (never focusable).
                 SettingsRow::SelectionMode,
                 SettingsRow::Clock,
@@ -2262,26 +2222,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_open_confirm_opens_menu_nudge_quick_cycles() {
-        let s = snap(true, true);
-        // Confirm (Cross) expands the dropdown instead of changing the value.
-        let msg = confirm_message(SettingsRow::AutoOpen, &s).unwrap();
-        assert!(matches!(msg, LauncherMessage::ToggleAutoOpenMenu));
-        // Left/Right still quick-cycle without opening the menu.
-        // Snapshot starts at Any: right wraps to Never, left steps to Bluetooth.
-        let msg = nudge_message(SettingsRow::AutoOpen, &s, 1).unwrap();
-        assert!(matches!(
-            msg,
-            LauncherMessage::SetAutoOpen(HomeAutoOpen::Never)
-        ));
-        let msg = nudge_message(SettingsRow::AutoOpen, &s, -1).unwrap();
-        assert!(matches!(
-            msg,
-            LauncherMessage::SetAutoOpen(HomeAutoOpen::Bluetooth)
-        ));
-    }
-
-    #[test]
     fn layout_confirm_opens_menu_nudge_quick_cycles() {
         let s = snap(true, true);
         // Confirm (Cross) expands the dropdown instead of changing the value.
@@ -2313,22 +2253,22 @@ mod tests {
         let mut panel = SettingsPanel::default();
         assert!(!panel.any_menu_open());
         // Opening inits the highlight to the current value.
-        assert!(panel.toggle_menu(SettingsRow::AutoOpen, &s));
-        assert!(panel.any_menu_open());
-        assert_eq!(panel.menu_row(), Some(SettingsRow::AutoOpen));
-        assert_eq!(
-            panel.menu,
-            Some((
-                SettingsRow::AutoOpen,
-                SettingsRow::AutoOpen.initial_highlight(&s)
-            ))
-        );
-        // Opening the second menu closes the first: both can never be open.
         assert!(panel.toggle_menu(SettingsRow::ImmersiveLayout, &s));
         assert!(panel.any_menu_open());
         assert_eq!(panel.menu_row(), Some(SettingsRow::ImmersiveLayout));
+        assert_eq!(
+            panel.menu,
+            Some((
+                SettingsRow::ImmersiveLayout,
+                SettingsRow::ImmersiveLayout.initial_highlight(&s)
+            ))
+        );
+        // Opening the second menu closes the first: both can never be open.
+        assert!(panel.toggle_menu(SettingsRow::Navbar, &s));
+        assert!(panel.any_menu_open());
+        assert_eq!(panel.menu_row(), Some(SettingsRow::Navbar));
         // Toggling the open row closes it.
-        assert!(!panel.toggle_menu(SettingsRow::ImmersiveLayout, &s));
+        assert!(!panel.toggle_menu(SettingsRow::Navbar, &s));
         assert!(!panel.any_menu_open());
         panel.close_menus();
         assert!(!panel.any_menu_open());
@@ -2338,7 +2278,6 @@ mod tests {
     fn selector_highlight_wraps_generically() {
         let s = snap(true, true);
         for row in [
-            SettingsRow::AutoOpen,
             SettingsRow::ImmersiveLayout,
             SettingsRow::Navbar,
             SettingsRow::ReducedMotion,
@@ -2352,14 +2291,6 @@ mod tests {
             assert!(row.selector_selected(row.initial_highlight(&s), &s));
         }
         // Every committed value round-trips through init + selected + select.
-        for mode in AUTO_OPEN_MODES {
-            let mut v = snap(true, true);
-            v.auto_open = mode;
-            let row = SettingsRow::AutoOpen;
-            let h = row.initial_highlight(&v);
-            assert!(row.selector_selected(h, &v));
-            assert!(matches!(row.selector_select(h), LauncherMessage::SetAutoOpen(m) if m == mode));
-        }
         for layout in IMMERSIVE_LAYOUT_MODES {
             let mut v = snap(true, true);
             v.immersive_layout = layout;
@@ -2502,7 +2433,7 @@ mod tests {
         // Closed: no overlay.
         assert!(menu_overlay(&state, &s, false).is_none());
         // Open on a visible row: overlay present.
-        state.settings.menu = Some((SettingsRow::AutoOpen, 0));
+        state.settings.menu = Some((SettingsRow::ImmersiveLayout, 0));
         assert!(menu_overlay(&state, &s, false).is_some());
         // Open on a row that left the focusable list: no overlay.
         let mut hidden = s.clone();
@@ -2556,7 +2487,6 @@ mod tests {
                 // panels float over the list instead of living in the flow.
                 for menu in [
                     None,
-                    Some(SettingsRow::AutoOpen),
                     Some(SettingsRow::SelectionMode),
                     Some(SettingsRow::ImmersiveLayout),
                     Some(SettingsRow::Navbar),
@@ -2711,10 +2641,6 @@ mod tests {
     fn pin_confirm_matrix_all_rows() {
         let base = snap(true, true);
         // Selectors open their dropdown menu instead of changing the value.
-        assert!(matches!(
-            confirm_message(SettingsRow::AutoOpen, &base),
-            Some(LauncherMessage::ToggleAutoOpenMenu)
-        ));
         assert!(matches!(
             confirm_message(SettingsRow::SelectionMode, &base),
             Some(LauncherMessage::ToggleSelectionModeMenu)
@@ -2897,45 +2823,11 @@ mod tests {
         }
     }
 
-    /// Pinned nudge matrix for the two selector rows, every value × both deltas.
-    /// Layout ignores delta (cycle); AutoOpen respects it (next/prev).
+    /// Pinned nudge matrix for the selector rows, every value × both deltas.
+    /// Layout ignores delta (cycle); other selectors respect it.
     #[test]
     fn pin_nudge_selectors_all_values() {
         let base = snap(true, true);
-        for (mode, right, left) in [
-            (
-                HomeAutoOpen::Never,
-                HomeAutoOpen::Bluetooth,
-                HomeAutoOpen::Any,
-            ),
-            (
-                HomeAutoOpen::Bluetooth,
-                HomeAutoOpen::Any,
-                HomeAutoOpen::Never,
-            ),
-            (
-                HomeAutoOpen::Any,
-                HomeAutoOpen::Never,
-                HomeAutoOpen::Bluetooth,
-            ),
-        ] {
-            let mut s = base.clone();
-            s.auto_open = mode;
-            assert!(
-                matches!(
-                    nudge_message(SettingsRow::AutoOpen, &s, 1),
-                    Some(LauncherMessage::SetAutoOpen(v)) if v == right
-                ),
-                "AutoOpen {mode:?} right"
-            );
-            assert!(
-                matches!(
-                    nudge_message(SettingsRow::AutoOpen, &s, -1),
-                    Some(LauncherMessage::SetAutoOpen(v)) if v == left
-                ),
-                "AutoOpen {mode:?} left"
-            );
-        }
         for (layout, cycled) in [
             (ImmersiveLayout::Vertical, ImmersiveLayout::Horizontal),
             (ImmersiveLayout::Horizontal, ImmersiveLayout::Vertical),
@@ -3122,7 +3014,6 @@ mod tests {
     fn mouse_builders_use_confirm_constructors() {
         let s = snap(true, true);
         for row in [
-            SettingsRow::AutoOpen,
             SettingsRow::ImmersiveLayout,
             SettingsRow::Navbar,
             SettingsRow::ReducedMotion,

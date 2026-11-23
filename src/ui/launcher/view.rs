@@ -4,8 +4,7 @@ use crate::controller::model::Serial;
 use crate::games::GameEntry;
 use crate::games::steam::SteamGame;
 use crate::persist::prefs::{
-    GamesSortMode, HomeAutoOpen, ImmersiveLayout, LauncherSelectionMode, NavbarVisibility,
-    ReducedMotion,
+    GamesSortMode, ImmersiveLayout, LauncherSelectionMode, NavbarVisibility, ReducedMotion,
 };
 use crate::ui::face::FacePressAnim;
 use crate::ui::launcher::icon_cache;
@@ -69,8 +68,6 @@ pub enum LauncherMessage {
     ManualClearIcon,
     /// Options — open/close in-window Launcher settings.
     ToggleSettings,
-    SetAutoOpen(HomeAutoOpen),
-    ToggleAutoOpenMenu,
     ToggleLayoutMenu,
     ToggleNavbarMenu,
     ToggleReducedMotionMenu,

@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 
+use crate::domain::pad::{PadAction, PadButton, PadButtonAction};
 use crate::platform::ui_sound::UiSoundKind;
 
 /// Stable app identity. Never index rows by order; these ids survive UI
@@ -166,6 +167,45 @@ use crate::ui::layout::{
 };
 use iced::{Point, Size, Task, window};
 use std::time::Instant;
+
+/// Map source-side tap actions to the Home shell's gated messages.
+fn home_tap_message(
+    state: &home_view::State,
+    action: &PadAction,
+) -> Option<home_view::HomeMessage> {
+    if action.action != PadButtonAction::Tap {
+        return None;
+    }
+    let modal = state.apps_info.is_some() || state.apps_menu.is_some();
+    match action.button {
+        PadButton::Cross => Some(home_view::HomeMessage::Confirm),
+        PadButton::Circle => Some(home_view::HomeMessage::Close),
+        PadButton::Options => Some(home_view::HomeMessage::SettingsToggle),
+        PadButton::Create if !state.settings_open && !modal && !state.controllers.is_empty() => {
+            Some(home_view::HomeMessage::ToggleControllers)
+        }
+        PadButton::Square
+            if state.focus == home_view::HomeFocus::Controllers
+                && !state.settings_open
+                && !modal =>
+        {
+            Some(home_view::HomeMessage::ToggleShowAll)
+        }
+        PadButton::Triangle
+            if !state.settings_open
+                && !modal
+                && state.focus == home_view::HomeFocus::Apps
+                && matches!(state.selected_tile(), home_view::HomeTile::Browser) =>
+        {
+            Some(home_view::HomeMessage::AppsMenuOpen(0))
+        }
+        PadButton::Create
+        | PadButton::Square
+        | PadButton::Triangle
+        | PadButton::L3
+        | PadButton::R3 => None,
+    }
+}
 
 impl App {
     /// Toggle the PS Home from anywhere. PS is the only global shell gesture:
@@ -410,11 +450,12 @@ impl App {
                 Task::none()
             }
             HomeMessage::MoveX(delta) => {
-                if delta != 0 {
-                    self.play_ui_cue(UiSoundKind::Nav);
+                if delta == 0 {
+                    return Task::none();
                 }
                 if self.home_state.apps_info.is_some() {
                     // Info owns the screen; movement scrolls the changelog.
+                    self.play_ui_cue(UiSoundKind::Nav);
                     return iced::widget::operation::scroll_by(
                         home_view::info_scroll_id(),
                         iced::widget::operation::AbsoluteOffset {
@@ -422,20 +463,32 @@ impl App {
                             y: 56.0 * delta as f32,
                         },
                     );
-                } else if self.home_state.settings_open {
+                }
+                if self.home_state.settings_open {
+                    // Selector dropdowns are menu-driven; Left/Right is inert.
                     return self.home_settings_adjust(delta);
-                } else if self.home_state.apps_menu.is_some() {
+                }
+                if self.home_state.apps_menu.is_some() {
                     self.home_state.apps_menu_move(delta);
-                } else {
-                    self.home_state.move_across(delta);
+                    self.play_ui_cue(UiSoundKind::Nav);
+                    return Task::none();
+                }
+                // The controllers dock is a vertical surface: horizontal
+                // input must not move its selection or play feedback.
+                if self.home_state.focus == home_view::HomeFocus::Controllers {
+                    return Task::none();
+                }
+                if self.home_state.move_x(delta) {
+                    self.play_ui_cue(UiSoundKind::Nav);
                 }
                 Task::none()
             }
             HomeMessage::MoveY(delta) => {
-                if delta != 0 {
-                    self.play_ui_cue(UiSoundKind::Nav);
+                if delta == 0 {
+                    return Task::none();
                 }
                 if self.home_state.apps_info.is_some() {
+                    self.play_ui_cue(UiSoundKind::Nav);
                     return iced::widget::operation::scroll_by(
                         home_view::info_scroll_id(),
                         iced::widget::operation::AbsoluteOffset {
@@ -443,14 +496,30 @@ impl App {
                             y: 56.0 * delta as f32,
                         },
                     );
-                } else if self.home_state.settings_open {
-                    self.home_state.settings_move(delta);
-                } else if self.home_state.apps_menu.is_some() {
+                }
+                if self.home_state.settings_open {
+                    let moved = if self.home_state.settings_menu_open() {
+                        self.home_state.settings_menu_move(delta)
+                    } else {
+                        self.home_state.settings_move(delta)
+                    };
+                    if moved {
+                        self.play_ui_cue(UiSoundKind::Nav);
+                    }
+                    return Task::none();
+                }
+                if self.home_state.apps_menu.is_some() {
                     self.home_state.apps_menu_move(delta);
-                } else if self.home_state.focus == home_view::HomeFocus::Controllers {
+                    self.play_ui_cue(UiSoundKind::Nav);
+                    return Task::none();
+                }
+                // The apps row is horizontal: Up/Down must not play feedback.
+                if self.home_state.focus == home_view::HomeFocus::Controllers {
                     // The restored dock is a vertical list: Up/Down (and the
                     // keyboard arrows) move the controller selection.
-                    self.home_state.move_across(delta);
+                    if self.home_state.move_y(delta) {
+                        self.play_ui_cue(UiSoundKind::Nav);
+                    }
                 }
                 Task::none()
             }
@@ -484,7 +553,11 @@ impl App {
                     self.home_state.close_app_info();
                     Task::none()
                 } else if self.home_state.settings_open {
-                    self.home_settings_confirm()
+                    if self.home_state.settings_menu_open() {
+                        self.home_settings_menu_confirm()
+                    } else {
+                        self.home_settings_confirm()
+                    }
                 } else if self.home_state.apps_menu.is_some() {
                     self.apps_menu_confirm()
                 } else if self.home_state.focus == home_view::HomeFocus::Controllers {
@@ -498,7 +571,12 @@ impl App {
                     self.home_state.close_app_info();
                     Task::none()
                 } else if self.home_state.settings_open {
-                    self.home_state.close_settings();
+                    if self.home_state.settings_menu_open() {
+                        self.home_state.close_settings_menu();
+                        self.play_ui_cue(UiSoundKind::Nav);
+                    } else {
+                        self.home_state.close_settings();
+                    }
                     Task::none()
                 } else if self.home_state.apps_menu.is_some() {
                     self.home_state.close_apps_menu();
@@ -566,6 +644,7 @@ impl App {
             self.session.prefs.ui_haptics_enabled,
             self.session.prefs.ui_haptics_strength,
             self.install_policy.limit(),
+            self.session.prefs.home_auto_open,
         );
         self.home_state.show_all_controllers = self.session.prefs.show_all_controllers;
         self.home_state.download_cap_available = !crate::platform::packaged::is_packaged();
@@ -584,96 +663,125 @@ impl App {
         (i16::from(value) + delta.signum() as i16 * 5).clamp(0, 100) as u8
     }
 
-    /// Confirm the focused Home settings row. Toggles flip, the download
-    /// choice advances, and sliders take a coarse step; Left/Right does the
-    /// fine adjustment without a mouse.
+    /// Row-aware cue for Home settings: the apply side previews the changed
+    /// modality, so the pre-cue covers only the other half. Without this a
+    /// volume change plays the nav sound plus its preview (and a strength
+    /// change rumbles twice).
+    fn play_home_settings_cue(&self, row: usize, kind: UiSoundKind) {
+        match row {
+            home_view::SETTINGS_SOUNDS | home_view::SETTINGS_VOLUME => self.play_ui_haptic(kind),
+            home_view::SETTINGS_HAPTICS | home_view::SETTINGS_STRENGTH => self.play_ui_sound(kind),
+            _ => self.play_ui_cue(kind),
+        }
+    }
+
+    /// Confirm the focused Home settings row. Selectors open their dropdown;
+    /// toggles flip; sliders take a coarse step.
     fn home_settings_confirm(&mut self) -> Task<Message> {
-        match self.home_state.settings_focus {
+        let row = self.home_state.settings_focus;
+        match row {
+            home_view::SETTINGS_AUTO_OPEN | home_view::SETTINGS_DOWNLOAD => {
+                self.play_home_settings_cue(row, UiSoundKind::Action);
+                self.home_state.open_settings_menu(row);
+                Task::none()
+            }
             home_view::SETTINGS_SOUNDS => {
+                self.play_home_settings_cue(row, UiSoundKind::Action);
                 let enabled = !self.session.prefs.ui_sounds_enabled;
                 let task = self.apply_ui_sounds(enabled);
                 self.sync_home_settings();
                 task
             }
             home_view::SETTINGS_VOLUME => {
+                self.play_home_settings_cue(row, UiSoundKind::Action);
                 let volume = Self::next_ten_percent(self.session.prefs.ui_sound_volume);
                 let task = self.apply_ui_sound_volume(volume);
                 self.sync_home_settings();
                 task
             }
             home_view::SETTINGS_HAPTICS => {
+                self.play_home_settings_cue(row, UiSoundKind::Action);
                 let enabled = !self.session.prefs.ui_haptics_enabled;
                 let task = self.apply_ui_haptics(enabled);
                 self.sync_home_settings();
                 task
             }
             home_view::SETTINGS_STRENGTH => {
+                self.play_home_settings_cue(row, UiSoundKind::Action);
                 let strength = Self::next_ten_percent(self.session.prefs.ui_haptics_strength);
                 let task = self.apply_ui_haptics_strength(strength);
                 self.sync_home_settings();
                 task
             }
-            home_view::SETTINGS_DOWNLOAD => {
-                let limit = crate::app::installs::step_download_limit(
-                    self.session.prefs.apps_download_limit_kbps,
-                    1,
-                );
-                self.apply_install_download_limit(limit);
-                Task::none()
-            }
             _ => Task::none(),
         }
     }
 
-    /// Left/Right adjustment for the focused Home settings row.
+    /// Commit the highlighted option in the open Home settings dropdown.
+    fn home_settings_menu_confirm(&mut self) -> Task<Message> {
+        let Some(choice) = self.home_state.settings_menu_choice() else {
+            self.home_state.close_settings_menu();
+            return Task::none();
+        };
+        self.play_ui_cue(UiSoundKind::Action);
+        self.home_state.close_settings_menu();
+        match choice {
+            home_view::HomeSettingChoice::AutoOpen(mode) => {
+                let task = self.apply_home_auto_open(mode);
+                self.sync_home_settings();
+                task
+            }
+            home_view::HomeSettingChoice::DownloadLimit(limit) => {
+                self.apply_install_download_limit(limit);
+                Task::none()
+            }
+        }
+    }
+
+    /// Left/Right adjustment for the focused Home settings row. Selector
+    /// rows are dropdown-driven and ignore horizontal input.
     fn home_settings_adjust(&mut self, delta: i32) -> Task<Message> {
         if delta == 0 {
             return Task::none();
         }
-        let task = match self.home_state.settings_focus {
+        let row = self.home_state.settings_focus;
+        let task = match row {
             home_view::SETTINGS_SOUNDS => {
                 let want_on = delta > 0;
-                if self.session.prefs.ui_sounds_enabled != want_on {
-                    self.apply_ui_sounds(want_on)
-                } else {
-                    Task::none()
+                if self.session.prefs.ui_sounds_enabled == want_on {
+                    return Task::none();
                 }
+                self.play_home_settings_cue(row, UiSoundKind::Nav);
+                self.apply_ui_sounds(want_on)
             }
             home_view::SETTINGS_VOLUME => {
                 let current = self.session.prefs.ui_sound_volume;
                 let next = Self::step_percent(current, delta);
-                if next != current {
-                    self.apply_ui_sound_volume(next)
-                } else {
-                    Task::none()
+                if next == current {
+                    return Task::none();
                 }
+                self.play_home_settings_cue(row, UiSoundKind::Nav);
+                self.apply_ui_sound_volume(next)
             }
             home_view::SETTINGS_HAPTICS => {
                 let want_on = delta > 0;
-                if self.session.prefs.ui_haptics_enabled != want_on {
-                    self.apply_ui_haptics(want_on)
-                } else {
-                    Task::none()
+                if self.session.prefs.ui_haptics_enabled == want_on {
+                    return Task::none();
                 }
+                self.play_home_settings_cue(row, UiSoundKind::Nav);
+                self.apply_ui_haptics(want_on)
             }
             home_view::SETTINGS_STRENGTH => {
                 let current = self.session.prefs.ui_haptics_strength;
                 let next = Self::step_percent(current, delta);
-                if next != current {
-                    self.apply_ui_haptics_strength(next)
-                } else {
-                    Task::none()
+                if next == current {
+                    return Task::none();
                 }
+                self.play_home_settings_cue(row, UiSoundKind::Nav);
+                self.apply_ui_haptics_strength(next)
             }
-            home_view::SETTINGS_DOWNLOAD => {
-                let limit = crate::app::installs::step_download_limit(
-                    self.session.prefs.apps_download_limit_kbps,
-                    delta,
-                );
-                self.apply_install_download_limit(limit);
-                Task::none()
-            }
-            _ => Task::none(),
+            home_view::SETTINGS_AUTO_OPEN | home_view::SETTINGS_DOWNLOAD => return Task::none(),
+            _ => return Task::none(),
         };
         self.sync_home_settings();
         task
@@ -757,7 +865,11 @@ impl App {
 
     /// Pad tick while Home is the modal owner. Only the chord (close) and
     /// selection/confirm are live; the app underneath gets nothing.
-    pub(crate) fn on_home_pad(&mut self, readings: &[launcher_input::NavReading]) -> Task<Message> {
+    pub(crate) fn on_home_pad(
+        &mut self,
+        readings: &[launcher_input::NavReading],
+        tap_actions: &[PadAction],
+    ) -> Task<Message> {
         if self.home_closing() || readings.is_empty() {
             return Task::none();
         }
@@ -776,7 +888,13 @@ impl App {
         let previous_haptic = self.haptic_pad_serial.take();
         self.set_haptic_pad_from_id(Some(&reading.id));
         let mut task = Task::none();
-        if let Some(message) = self.home_state.pad_tick(&reading.sample, Instant::now()) {
+        let tap = tap_actions
+            .iter()
+            .find_map(|action| home_tap_message(&self.home_state, action));
+        if let Some(message) = self
+            .home_state
+            .pad_tick(&reading.sample, Instant::now(), tap)
+        {
             let face_held = reading.sample.cross
                 || reading.sample.circle
                 || reading.sample.square
@@ -853,6 +971,41 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::pad::PadId;
+
+    fn tap(button: PadButton) -> PadAction {
+        PadAction {
+            pad: PadId("hid:a".into()),
+            button,
+            action: PadButtonAction::Tap,
+        }
+    }
+
+    #[test]
+    fn home_taps_map_to_gated_messages() {
+        let mut state = home_view::State::default();
+        assert_eq!(
+            home_tap_message(&state, &tap(PadButton::Cross)),
+            Some(home_view::HomeMessage::Confirm)
+        );
+        assert_eq!(
+            home_tap_message(&state, &tap(PadButton::Circle)),
+            Some(home_view::HomeMessage::Close)
+        );
+        assert_eq!(
+            home_tap_message(&state, &tap(PadButton::Options)),
+            Some(home_view::HomeMessage::SettingsToggle)
+        );
+        assert_eq!(home_tap_message(&state, &tap(PadButton::L3)), None);
+        assert_eq!(home_tap_message(&state, &tap(PadButton::Triangle)), None);
+        state.select(1, Instant::now());
+        assert_eq!(
+            home_tap_message(&state, &tap(PadButton::Triangle)),
+            Some(home_view::HomeMessage::AppsMenuOpen(0))
+        );
+        state.settings_open = true;
+        assert_eq!(home_tap_message(&state, &tap(PadButton::Triangle)), None);
+    }
 
     #[test]
     fn both_phase0_apps_are_installed() {

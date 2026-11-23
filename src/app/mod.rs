@@ -18,7 +18,7 @@ mod update;
 
 use crate::controller::dualsense::lightbar::ClaimStore;
 use crate::domain::color::SpectrumService;
-use crate::domain::pad::InputHub;
+use crate::domain::pad::{InputHub, PadAction, PadActionGate};
 use crate::{AppError, AppResult};
 
 use crate::browser::engine::{EngineCommand, EngineEvent, EngineHandle};
@@ -429,6 +429,16 @@ pub enum LauncherKeyAction {
     Cancel,
 }
 
+/// Surface currently entitled to source-side button actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PadInputOwner {
+    #[default]
+    None,
+    Home,
+    Browser,
+    Launcher,
+}
+
 pub struct App {
     session: crate::session::DeviceSession,
     games: GamesCatalog,
@@ -622,6 +632,14 @@ pub struct App {
     launcher_revealed_at: Option<Instant>,
     gesture_detectors: GestureDetectorBank,
     pad_nav: PadNavBank,
+    /// Source-action delivery gate (sequence dedupe + owner arming).
+    pad_actions: PadActionGate,
+    /// Source taps waiting for a pad frame to run through the surface handler.
+    /// Edges can conflate during a UI stall; draining one per input frame keeps
+    /// every tap without changing the one-action surface contracts.
+    pending_pad_actions: VecDeque<PadAction>,
+    /// Surface receiving source-side tap actions.
+    pad_input_owner: PadInputOwner,
     /// When set, the next start cue may rumble this DualSense serial (pad-originated).
     haptic_pad_serial: Option<Serial>,
     /// Keyboard Enter hold for replace-confirm (not folded into pad slots).
@@ -997,6 +1015,9 @@ impl App {
             launcher_revealed_at: None,
             gesture_detectors: GestureDetectorBank::default(),
             pad_nav: PadNavBank::default(),
+            pad_actions: PadActionGate::default(),
+            pending_pad_actions: VecDeque::new(),
+            pad_input_owner: PadInputOwner::None,
             haptic_pad_serial: None,
             keyboard_cross_hold: CrossHold::default(),
             confirm_key_held: false,
@@ -3013,9 +3034,12 @@ fn pad_input_edge_stream(hub: &Arc<InputHub>) -> impl Stream<Item = Message> + S
             // healthy; when saturated they are already being dropped at
             // try_send).
             let mut edge = first;
+            let mut actions = std::mem::take(&mut edge.actions);
             while let Ok(next) = rx.try_recv() {
                 edge = next;
+                actions.append(&mut edge.actions);
             }
+            edge.actions = actions;
             if output.send(Message::PadInput(edge)).await.is_err() {
                 break;
             }

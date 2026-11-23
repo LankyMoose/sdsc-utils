@@ -68,20 +68,6 @@ pub fn clamp_download_limit(kbps: u32) -> u32 {
         .unwrap_or(0)
 }
 
-/// Step through the supported caps, wrapping. `delta > 0` moves forward.
-pub fn step_download_limit(kbps: u32, delta: i32) -> u32 {
-    if delta == 0 {
-        return clamp_download_limit(kbps);
-    }
-    let current = clamp_download_limit(kbps);
-    let index = DOWNLOAD_LIMIT_OPTIONS_KBPS
-        .iter()
-        .position(|option| *option == current)
-        .unwrap_or(0) as i32;
-    let next = (index + delta.signum()).rem_euclid(DOWNLOAD_LIMIT_OPTIONS_KBPS.len() as i32);
-    DOWNLOAD_LIMIT_OPTIONS_KBPS[next as usize]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,15 +85,6 @@ mod tests {
         assert_eq!(clamp_download_limit(3 * 1024), 2 * 1024);
         assert_eq!(clamp_download_limit(8 * 1024), 10 * 1024);
         assert_eq!(clamp_download_limit(u32::MAX), 10 * 1024);
-    }
-
-    #[test]
-    fn step_wraps_both_ways() {
-        assert_eq!(step_download_limit(0, 1), 2 * 1024);
-        assert_eq!(step_download_limit(2 * 1024, -1), 0);
-        assert_eq!(step_download_limit(10 * 1024, 1), 0);
-        assert_eq!(step_download_limit(0, -1), 10 * 1024);
-        assert_eq!(step_download_limit(0, 0), 0);
     }
 
     #[test]

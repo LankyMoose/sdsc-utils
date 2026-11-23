@@ -7,7 +7,7 @@
 //! Browser window lands. See `notes/browser-Home-pivot.md`.
 
 use crate::browser::engine::{EngineCommand, EngineHandle};
-use crate::domain::pad::NavStepper;
+use crate::domain::pad::{NavAction, NavStepper, PadAction, PadButton, PadId};
 use crate::platform::ui_sound::UiSoundKind;
 use crate::ui::browser::BrowserPanel;
 use std::path::PathBuf;
@@ -113,6 +113,23 @@ use iced::Task;
 use std::time::Instant;
 
 use super::Message;
+
+/// Map source-side tap actions to the Browser's semantic nav actions.
+fn browser_tap_action(actions: &[PadAction]) -> Option<(PadId, NavAction)> {
+    actions.iter().find_map(|action| {
+        let nav = match action.button {
+            PadButton::Cross => NavAction::Confirm,
+            PadButton::Circle => NavAction::Cancel,
+            PadButton::Square => NavAction::CycleSort,
+            PadButton::Triangle => NavAction::Triangle,
+            PadButton::Options => NavAction::ToggleSettings,
+            PadButton::Create => NavAction::ToggleControllers,
+            PadButton::L3 => NavAction::ToggleMagnetism,
+            PadButton::R3 => return None,
+        };
+        Some((action.pad.clone(), nav))
+    })
+}
 
 impl super::App {
     /// Browser-window message router. Phase 2 is moving the reducer here; the
@@ -389,9 +406,9 @@ impl super::App {
     pub(crate) fn on_browser_pad(
         &mut self,
         readings: &[crate::ui::launcher::input::NavReading],
+        tap_actions: &[PadAction],
     ) -> Task<Message> {
         use crate::browser::cursor::JumpDir;
-        use crate::domain::pad::NavAction;
         if readings.is_empty() {
             return Task::none();
         }
@@ -407,9 +424,14 @@ impl super::App {
         // History selector uses D-pad nav; engine mode parks it (cursor
         // jumps run on the dedicated stepper).
         let allow_nav = history_open || !engine_mode;
-        let tick = self.browser.nav.tick(
+        let mut tick = self.browser.nav.tick(
             readings, now, allow_nav, true, false, false, false, false, false,
         );
+        // Source-side taps replace the old per-surface face-edge reconstruction.
+        if let Some((pad, action)) = browser_tap_action(tap_actions) {
+            tick.action = Some(action);
+            tick.action_pad = Some(pad);
+        }
         self.set_haptic_pad_from_id(
             tick.action_pad
                 .as_ref()
@@ -1192,5 +1214,35 @@ fn home_install_progress(
             bytes_total: None,
             rate_bps: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::pad::PadButtonAction;
+
+    fn tap(button: PadButton) -> PadAction {
+        PadAction {
+            pad: PadId("hid:a".into()),
+            button,
+            action: PadButtonAction::Tap,
+        }
+    }
+
+    #[test]
+    fn browser_taps_map_to_semantic_actions() {
+        for (button, expected) in [
+            (PadButton::Cross, NavAction::Confirm),
+            (PadButton::Circle, NavAction::Cancel),
+            (PadButton::Triangle, NavAction::Triangle),
+            (PadButton::L3, NavAction::ToggleMagnetism),
+        ] {
+            assert_eq!(
+                browser_tap_action(&[tap(button)]).map(|(_, action)| action),
+                Some(expected)
+            );
+        }
+        assert!(browser_tap_action(&[tap(PadButton::R3)]).is_none());
     }
 }

@@ -88,7 +88,7 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
 - **Cancel** during Downloading/Verifying/Installing: Circle/Esc or the Cancel
   action row. The worker deletes staging, restores the previous install, and
   leaves the pointer untouched.
-- **Download speed** lives in Home → Settings → App installs
+- **Download speed** lives in Home → Settings → App installs as a dropdown
   (`Unlimited / 2 / 5 / 10 MB/s`). It is Home-owned policy, shared live with
   every standalone managed-app install (Browser engine today, future catalog
   apps later), and hidden in packaged builds because the Store owns downloads.
@@ -110,18 +110,21 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
   (Create) expands it in place and moves focus to controllers. It has no
   section title or count. The dock stays visible while Home Settings is open
   (display-only there) and hides only for Info/action modals.
-- While the dock is expanded, Up/Down or Left/Right move the controller
-  selection, Cross identifies, Triangle hold powers off a live Bluetooth pad,
-  Square toggles Connected/All in the dock footer, and Circle collapses the
-  dock (a second Circle closes Home). Up/Down have no row-focus role on the
-  main Home outside the dock.
+- While the dock is expanded, Up/Down move the controller selection, Cross
+  identifies, Triangle hold powers off a live Bluetooth pad, Square toggles
+  Connected/All in the dock footer, and Circle collapses the dock (a second
+  Circle closes Home). Left/Right are inert in the vertical dock, and Up/Down
+  have no row-focus role on the main Home outside the dock.
 - **Options** (or the START Settings hint) opens Home Settings. The screen uses
-  Launcher-settings sections and controls: **Feedback** (UI sounds, volume,
-  controller haptics, strength) and **App installs** (Download speed, hidden
-  in packaged builds). The cap is Home-owned and applies to every standalone
-  managed-app install/update. The disconnected-controller filter is no longer
-  a settings row; Square in the dock owns it. Feedback prefs are global
-  (Launcher, Browser, and Home).
+  Launcher-settings sections and controls: **Home** (Auto open, moved here from
+  the Launcher drawer), **Feedback** (UI sounds, volume, controller haptics,
+  strength), and **App installs** (Download speed, hidden in packaged builds).
+  Volume hides while UI sounds are off and Strength hides while haptics are
+  off. Auto open and Download speed use the Launcher-style dropdown (✓/○
+  options). The cap is Home-owned and applies to every standalone managed-app
+  install/update. The disconnected-controller filter is no longer a settings
+  row; Square in the dock owns it. Feedback prefs are global (Launcher,
+  Browser, and Home).
 - Home Settings and the dock are controller/keyboard only. The sole mouse
   binding is clicking the backdrop of the active panel, which acts like
   Circle. Cross launches the focused app; Triangle on the Browser tile opens

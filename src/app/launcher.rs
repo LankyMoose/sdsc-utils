@@ -8,14 +8,15 @@ use super::Win32DialogParent;
 use super::stamp_hitch_report;
 use super::{
     App, LAUNCHER_CURSOR_IDLE_HIDE, LAUNCHER_NAV_NOT_READY_MS, LauncherKeyAction, Message,
-    PAD_POLL_SLOW_MS, PAD_POLL_STALL_MS, RELOAD_FEEDBACK_DELAY, RUNNING_CHECK_INTERVAL,
-    SCROLL_RESTORE_AUTHORITY, SNAPSHOT_STALE_MS, chord_held_on_any_pad, delay,
-    is_manual_target_missing, spawn_blocking, steam_appid_from_target,
+    PAD_POLL_SLOW_MS, PAD_POLL_STALL_MS, PadInputOwner, RELOAD_FEEDBACK_DELAY,
+    RUNNING_CHECK_INTERVAL, SCROLL_RESTORE_AUTHORITY, SNAPSHOT_STALE_MS, chord_held_on_any_pad,
+    delay, is_manual_target_missing, spawn_blocking, steam_appid_from_target,
 };
 use crate::AppResult;
 use crate::browser::cursor::{JumpDir, VIEWPORT_H, VIEWPORT_W};
 use crate::browser::engine::{EngineCommand, EngineEvent};
 use crate::browser::keys::RawKey;
+use crate::domain::pad::{PadAction, PadButton, PadId};
 use crate::games::process_match::RunningSession;
 use crate::games::steam::SteamGame;
 use crate::games::{self, GamesCatalog, launch, process_match, steam};
@@ -38,6 +39,22 @@ use iced::widget::operation;
 use iced::{Task, window};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// Map source-side tap actions to the Launcher's semantic nav actions.
+fn launcher_tap_action(actions: &[PadAction]) -> Option<(PadId, NavAction)> {
+    actions.iter().find_map(|action| {
+        let nav = match action.button {
+            PadButton::Cross => NavAction::Confirm,
+            PadButton::Circle => NavAction::Cancel,
+            PadButton::Square => NavAction::CycleSort,
+            PadButton::Triangle => NavAction::ToggleEdit,
+            PadButton::Options => NavAction::ToggleSettings,
+            PadButton::Create => NavAction::ToggleControllers,
+            PadButton::L3 | PadButton::R3 => return None,
+        };
+        Some((action.pad.clone(), nav))
+    })
+}
 
 impl App {
     /// All Launcher selection changes funnel through here (mouse, keyboard, pad).
@@ -166,16 +183,12 @@ impl App {
                 }
                 Task::none()
             }
-            LauncherMessage::SetAutoOpen(mode) => self.apply_home_auto_open(mode),
             LauncherMessage::SetSelectionPersist(enabled) => {
                 self.apply_launcher_selection_persist(enabled)
             }
             LauncherMessage::SetSelectionMode(mode) => self.apply_launcher_selection_mode(mode),
             LauncherMessage::ToggleSelectionModeMenu => self.toggle_launcher_selector_menu(
                 crate::ui::launcher::settings::SettingsRow::SelectionMode,
-            ),
-            LauncherMessage::ToggleAutoOpenMenu => self.toggle_launcher_selector_menu(
-                crate::ui::launcher::settings::SettingsRow::AutoOpen,
             ),
             LauncherMessage::ToggleLayoutMenu => self.toggle_launcher_selector_menu(
                 crate::ui::launcher::settings::SettingsRow::ImmersiveLayout,
@@ -2703,6 +2716,30 @@ impl App {
 }
 
 impl App {
+    /// Sequence-dedupe one input edge and filter source-side taps through the
+    /// current owner's arming gate. A pad must reach rest after an owner
+    /// change before its taps are accepted.
+    fn begin_pad_edge(
+        &mut self,
+        owner: PadInputOwner,
+        edge: &crate::domain::pad::InputEdge,
+    ) -> Option<()> {
+        let reset_arming = owner != self.pad_input_owner;
+        self.pad_input_owner = owner;
+        if reset_arming {
+            self.pending_pad_actions.clear();
+        }
+        let actions =
+            self.pad_actions
+                .begin(edge.seq, reset_arming, &edge.readings, &edge.actions)?;
+        if owner == PadInputOwner::None {
+            self.pending_pad_actions.clear();
+        } else {
+            self.pending_pad_actions.extend(actions);
+        }
+        Some(())
+    }
+
     pub(crate) fn on_pad_input(&mut self, edge: crate::domain::pad::InputEdge) -> Task<Message> {
         let poll_started = Instant::now();
         let launcher_open = self.launcher_visible;
@@ -2726,13 +2763,28 @@ impl App {
         } else {
             self.last_edge_seq = None;
         }
+        let owner = if self.home_visible {
+            PadInputOwner::Home
+        } else if self.browser_visible {
+            PadInputOwner::Browser
+        } else if launcher_open {
+            PadInputOwner::Launcher
+        } else {
+            PadInputOwner::None
+        };
+        if self.begin_pad_edge(owner, &edge).is_none() {
+            return Task::none();
+        }
+        // One action per pad frame; conflated edges drain FIFO across frames.
+        let tap_action = self.pending_pad_actions.pop_front();
+        let tap_actions: &[PadAction] = tap_action.as_slice();
         let meta = Some(edge.meta());
         let readings = edge.readings;
 
         // Home is modal: while open it owns the pad; the app underneath keeps
         // its last frame but gets no nav.
         if self.home_visible {
-            return self.on_home_pad(&readings);
+            return self.on_home_pad(&readings, tap_actions);
         }
         // Home may have just closed on a face press. Swallow pad input
         // until that press is fully released so it cannot also dismiss the
@@ -2747,7 +2799,7 @@ impl App {
             self.home_face_latch_until = None;
         }
         if self.browser_visible {
-            return self.on_browser_pad(&readings);
+            return self.on_browser_pad(&readings, tap_actions);
         }
 
         if launcher_open {
@@ -2796,7 +2848,7 @@ impl App {
         }
 
         // Continue with the same body as the old on_pad_poll from launcher_open onward.
-        self.on_pad_readings(readings, meta, launcher_open)
+        self.on_pad_readings(readings, meta, launcher_open, tap_actions)
     }
 
     pub(crate) fn on_pad_readings(
@@ -2804,6 +2856,7 @@ impl App {
         readings: Vec<launcher_input::NavReading>,
         meta: Option<launcher_input::SnapshotMeta>,
         launcher_open: bool,
+        tap_actions: &[PadAction],
     ) -> Task<Message> {
         if launcher_open {
             if !self.launcher_nav_ready {
@@ -2853,7 +2906,7 @@ impl App {
                 }
             }
 
-            return self.handle_launcher_nav_readings(&readings);
+            return self.handle_launcher_nav_readings(&readings, tap_actions);
         }
 
         self.on_reopen_gesture(&readings)
@@ -2877,6 +2930,7 @@ impl App {
     pub(crate) fn handle_launcher_nav_readings(
         &mut self,
         readings: &[launcher_input::NavReading],
+        tap_actions: &[PadAction],
     ) -> Task<Message> {
         self.nav_missing_warned = false;
 
@@ -2970,7 +3024,7 @@ impl App {
         let horizontal_nav = true;
         // Horizontal Games strip: left/right scroll games.
         let horizontal_games_nav = self.immersive_horizontal_games_nav();
-        let tick = self.pad_nav.tick(
+        let mut tick = self.pad_nav.tick(
             readings,
             now,
             allow_nav_move,
@@ -2981,6 +3035,11 @@ impl App {
             hold_cross_close,
             hold_triangle_power,
         );
+        // Source-side taps replace the old per-surface face-edge reconstruction.
+        if let Some((pad, action)) = launcher_tap_action(tap_actions) {
+            tick.action = Some(action);
+            tick.action_pad = Some(pad);
+        }
         if let Some(diag) = &tick.diag {
             self.log_start_nav_diag(diag, readings.len());
         }
@@ -3305,7 +3364,6 @@ impl App {
         &self,
     ) -> crate::ui::launcher::settings::LauncherSettingsSnapshot {
         crate::ui::launcher::settings::LauncherSettingsSnapshot {
-            auto_open: self.session.prefs.home_auto_open,
             selection_persist: self.session.prefs.launcher_selection_persist,
             selection_mode: self.session.prefs.launcher_selection_mode,
             clock_enabled: self.session.prefs.launcher_clock_enabled,
@@ -3445,9 +3503,6 @@ impl App {
     }
 
     pub(crate) fn apply_home_auto_open(&mut self, mode: HomeAutoOpen) -> Task<Message> {
-        // Picking from the menu collapses it, even when re-picking the
-        // current value.
-        self.launcher_state.settings.close_menus();
         let old = self.session.prefs.home_auto_open;
         if old == mode {
             return Task::none();
@@ -4974,8 +5029,32 @@ pub(crate) fn launcher_focus_move_frozen(message: &LauncherMessage) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{launcher_cold_allows, launcher_focus_move_frozen};
+    use super::{launcher_cold_allows, launcher_focus_move_frozen, launcher_tap_action};
+    use crate::domain::pad::{PadAction, PadButton, PadButtonAction, PadId};
+    use crate::ui::launcher::input::NavAction;
     use crate::ui::launcher::view::LauncherMessage;
+
+    #[test]
+    fn launcher_taps_map_to_semantic_actions() {
+        for (button, expected) in [
+            (PadButton::Cross, NavAction::Confirm),
+            (PadButton::Circle, NavAction::Cancel),
+            (PadButton::Square, NavAction::CycleSort),
+            (PadButton::Triangle, NavAction::ToggleEdit),
+            (PadButton::Options, NavAction::ToggleSettings),
+            (PadButton::Create, NavAction::ToggleControllers),
+        ] {
+            let action = PadAction {
+                pad: PadId("hid:a".into()),
+                button,
+                action: PadButtonAction::Tap,
+            };
+            assert_eq!(
+                launcher_tap_action(&[action]).map(|(_, nav)| nav),
+                Some(expected)
+            );
+        }
+    }
 
     #[test]
     fn cold_ambient_allows_only_close() {

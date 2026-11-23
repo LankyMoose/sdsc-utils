@@ -237,17 +237,21 @@ pub(crate) fn drain_sample<T: HidTransport>(
     );
     ShortSampleOutcome::Ok {
         sample: merged,
+        reports: batch,
         battery,
     }
 }
 
 fn sample_summary(sample: &PadSample) -> String {
     format!(
-        "ok stick_x={:.2} stick_y={:.2} l2={} r2={} cross={} circle={} square={} triangle={} options={} create={} dpad_u={} dpad_d={} dpad_l={} dpad_r={}",
+        "ok stick_x={:.2} stick_y={:.2} l1={} r1={} l2={} r2={} l3={} cross={} circle={} square={} triangle={} options={} create={} dpad_u={} dpad_d={} dpad_l={} dpad_r={}",
         sample.stick_x,
         sample.stick_y,
+        u8::from(sample.l1),
+        u8::from(sample.r1),
         u8::from(sample.l2),
         u8::from(sample.r2),
+        u8::from(sample.l3),
         u8::from(sample.cross),
         u8::from(sample.circle),
         u8::from(sample.square),
@@ -311,7 +315,12 @@ mod tests {
         let mut opts = SampleOpts::new(false, "test-serial");
         let policy = Policy::default();
         match drain_sample(&transport, &mut opts, &policy) {
-            ShortSampleOutcome::Ok { sample, battery } => {
+            ShortSampleOutcome::Ok {
+                sample,
+                reports,
+                battery,
+            } => {
+                assert_eq!(reports.len(), 1);
                 assert!(sample.cross);
                 assert!(!sample.circle);
                 let reading = battery.expect("battery parsed from same report");

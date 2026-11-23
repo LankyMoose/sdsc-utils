@@ -36,14 +36,15 @@ use crate::controller::hid::poll::{
 use crate::controller::model::{ControllerKind, ControllerStatus, Serial};
 use crate::domain::color::{Rgb, SpectrumService};
 use crate::domain::pad::{
-    self as launcher_input, InputHub, NavReading, ShortSampleOutcome, SnapshotMeta, SnapshotReason,
+    self as launcher_input, InputHub, NavReading, PadAction, PadId, PadInterpreterBank,
+    ShortSampleOutcome, SnapshotMeta, SnapshotReason,
 };
 use crate::platform::app_log;
 use crate::platform::host::Host;
 use crate::{AppError, AppResult};
 use hidapi::{BusType, HidApi, HidDevice};
 use iced::futures::channel::oneshot;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -1280,7 +1281,11 @@ fn sample_one(
         )
     };
     match outcome {
-        ShortSampleOutcome::Ok { sample, battery } => {
+        ShortSampleOutcome::Ok {
+            sample,
+            reports,
+            battery,
+        } => {
             if let Some(open) = cache.devices.get_mut(&key) {
                 open.silence_timeouts = 0;
             }
@@ -1288,7 +1293,10 @@ fn sample_one(
                 let input_active = !launcher_input::sample_nav_resting(&sample);
                 remember_live_pad(live_pads, serial, product, reading, kind, input_active);
             }
-            SampleOneResult::Ok(launcher_input::hid_nav_reading(serial, sample))
+            SampleOneResult::Ok {
+                reading: launcher_input::hid_nav_reading(serial, sample),
+                reports,
+            }
         }
         ShortSampleOutcome::Timeout => {
             let prev = cache
@@ -1364,7 +1372,11 @@ fn prune_live_pads(live_pads: &Mutex<HashMap<Serial, LivePadStatus>>, live_seria
 }
 
 enum SampleOneResult {
-    Ok(NavReading),
+    Ok {
+        reading: NavReading,
+        /// Ordered raw reports consumed by the source button interpreter.
+        reports: Vec<launcher_input::PadSample>,
+    },
     /// Keep handle; caller should reuse the previous snapshot reading.
     Timeout,
     /// Pad went silent long enough: drop from live battery / stop republishing nav.
@@ -1383,6 +1395,7 @@ fn snapshot_age_ms(hub: &InputHub) -> u128 {
 fn publish_snapshot(
     hub: &InputHub,
     readings: Vec<NavReading>,
+    actions: Vec<PadAction>,
     reason: SnapshotReason,
     after_cmd: Option<&str>,
     last_noisy_log: &Mutex<Instant>,
@@ -1403,7 +1416,9 @@ fn publish_snapshot(
     let meta = hub.publish(readings.clone(), reason);
 
     if emit_edge {
-        hub.push_edge(launcher_input::InputEdge::from_snapshot(readings, &meta));
+        hub.push_edge(launcher_input::InputEdge::from_snapshot(
+            readings, actions, &meta,
+        ));
     }
 
     let clearing = matches!(
@@ -1443,6 +1458,7 @@ fn sample_all_inputs(
     cache: &mut DeviceCache,
     live_pads: &Mutex<HashMap<Serial, LivePadStatus>>,
     hub: &InputHub,
+    interpreters: &mut PadInterpreterBank,
     input_hot: bool,
     last_noisy_log: &Mutex<Instant>,
     after_cmd: Option<&str>,
@@ -1464,9 +1480,13 @@ fn sample_all_inputs(
         })
         .unwrap_or_default();
     let mut out = Vec::with_capacity(serials.len());
+    let mut actions = Vec::new();
     for serial in serials {
         match sample_one(cache, live_pads, serial.as_ref(), input_hot) {
-            SampleOneResult::Ok(reading) => out.push(reading),
+            SampleOneResult::Ok { reading, reports } => {
+                actions.extend(interpreters.ingest(&reading.id, &reports));
+                out.push(reading);
+            }
             SampleOneResult::Timeout => {
                 let key = format!("hid:{serial}");
                 if let Some(prev) = prev_by_id.get(&key) {
@@ -1476,6 +1496,8 @@ fn sample_all_inputs(
             SampleOneResult::Silent | SampleOneResult::HardFail => {}
         }
     }
+    let live_ids: HashSet<PadId> = out.iter().map(|r| r.id.clone()).collect();
+    interpreters.retain_live(&live_ids);
     let reason = if out.len() < cached && cached > 0 {
         SnapshotReason::SamplePartial
     } else {
@@ -1497,7 +1519,15 @@ fn sample_all_inputs(
             ));
         }
     }
-    publish_snapshot(hub, out, reason, after_cmd, last_noisy_log, input_hot);
+    publish_snapshot(
+        hub,
+        out,
+        actions,
+        reason,
+        after_cmd,
+        last_noisy_log,
+        input_hot,
+    );
     let sample_ms = sample_started.elapsed().as_millis();
     if after_ensure_ms >= 50 || sample_ms >= 50 {
         crate::controller::hid::diag::diag_info(format!(
@@ -1512,11 +1542,13 @@ fn sample_serial_into_snapshot(
     cache: &mut DeviceCache,
     live_pads: &Mutex<HashMap<Serial, LivePadStatus>>,
     hub: &InputHub,
+    interpreters: &mut PadInterpreterBank,
     serial: &str,
     input_hot: bool,
 ) {
     match sample_one(cache, live_pads, serial, input_hot) {
-        SampleOneResult::Ok(reading) => {
+        SampleOneResult::Ok { reading, reports } => {
+            let actions = interpreters.ingest(&reading.id, &reports);
             let edge = if let Ok(mut guard) = hub.snapshot_mutex().lock() {
                 guard.seq = guard.seq.saturating_add(1);
                 guard.published_at = Instant::now();
@@ -1528,6 +1560,7 @@ fn sample_serial_into_snapshot(
                 }
                 Some(launcher_input::InputEdge::from_snapshot(
                     guard.readings.clone(),
+                    actions,
                     &SnapshotMeta {
                         published_at: guard.published_at,
                         seq: guard.seq,
@@ -1594,6 +1627,7 @@ fn begin_identify(
     claims: &ClaimStore,
     live_pads: &Mutex<HashMap<Serial, LivePadStatus>>,
     hub: &InputHub,
+    interpreters: &mut PadInterpreterBank,
     serial: Serial,
     percent: u8,
     identifying: &AtomicBool,
@@ -1625,7 +1659,14 @@ fn begin_identify(
         identifying.store(false, Ordering::SeqCst);
         return None;
     }
-    sample_serial_into_snapshot(cache, live_pads, hub, serial.as_ref(), input_hot);
+    sample_serial_into_snapshot(
+        cache,
+        live_pads,
+        hub,
+        interpreters,
+        serial.as_ref(),
+        input_hot,
+    );
     Some(IdentifySession {
         serial,
         normal,
@@ -1644,6 +1685,7 @@ fn advance_identify(
     claims: &ClaimStore,
     live_pads: &Mutex<HashMap<Serial, LivePadStatus>>,
     hub: &InputHub,
+    interpreters: &mut PadInterpreterBank,
     identifying: &AtomicBool,
     last_noisy_log: &Mutex<Instant>,
     input_hot: bool,
@@ -1671,6 +1713,7 @@ fn advance_identify(
             cache,
             live_pads,
             hub,
+            interpreters,
             input_hot,
             last_noisy_log,
             Some("Identify"),
@@ -1702,7 +1745,14 @@ fn advance_identify(
         identifying.store(false, Ordering::SeqCst);
         return;
     }
-    sample_serial_into_snapshot(cache, live_pads, hub, serial.as_ref(), input_hot);
+    sample_serial_into_snapshot(
+        cache,
+        live_pads,
+        hub,
+        interpreters,
+        serial.as_ref(),
+        input_hot,
+    );
     s.next_write += 1;
     s.wake_at = Instant::now() + Duration::from_millis(IDENTIFY_FLASH_MS);
 }
@@ -1925,6 +1975,7 @@ fn execute_power_off(
     publish_snapshot(
         hub,
         remaining,
+        Vec::new(),
         reason,
         Some("PowerOff"),
         last_noisy_log,
@@ -1976,6 +2027,7 @@ fn handle_cmd(
     pending_power_off: &mut Option<PendingPowerOff>,
     pulse: &mut LowBatteryPulse,
     hub: &InputHub,
+    interpreters: &mut PadInterpreterBank,
     identifying: &AtomicBool,
     last_noisy_log: &Mutex<Instant>,
     input_hot: bool,
@@ -1994,6 +2046,7 @@ fn handle_cmd(
             publish_snapshot(
                 hub,
                 Vec::new(),
+                Vec::new(),
                 SnapshotReason::ClearedShutdown,
                 Some("Shutdown"),
                 last_noisy_log,
@@ -2010,6 +2063,7 @@ fn handle_cmd(
                 claims,
                 live_pads,
                 hub,
+                interpreters,
                 serial,
                 percent,
                 identifying,
@@ -2252,7 +2306,11 @@ fn poll_incremental(
         if is_storable_serial(&hint) && cache.devices.contains_key(&key) {
             if let Some((product, reading, at, input_at)) = live_snapshot.get(&key)
                 && (pad_input_active_at(*input_at, now)
-                    || now.saturating_duration_since(*at) < POLL_LIVE_BATTERY_STALE)
+                    || now.saturating_duration_since(*at) < POLL_LIVE_BATTERY_STALE
+                    // While input is hot, the sample loop is the sole reader:
+                    // a battery probe here would consume a report the source
+                    // interpreter needs (and can eat a press/release edge).
+                    || input_hot)
                 && let Some(driver) = cache
                     .devices
                     .get(&key)
@@ -2474,6 +2532,7 @@ fn worker_loop(
     let mut pending_power_off: Option<PendingPowerOff> = None;
     let mut pulse = LowBatteryPulse::new();
     let mut session: Option<IdentifySession> = None;
+    let mut interpreters = PadInterpreterBank::default();
     let mut stall_logged = false;
     let mut in_cmd = "none";
 
@@ -2514,6 +2573,7 @@ fn worker_loop(
                 claims,
                 &live_pads,
                 &input_hub,
+                &mut interpreters,
                 &identifying,
                 &last_noisy_log,
                 hot,
@@ -2551,6 +2611,7 @@ fn worker_loop(
                     &mut pending_power_off,
                     &mut pulse,
                     &input_hub,
+                    &mut interpreters,
                     &identifying,
                     &last_noisy_log,
                     hot,
@@ -2586,6 +2647,7 @@ fn worker_loop(
                     &mut cache,
                     &live_pads,
                     &input_hub,
+                    &mut interpreters,
                     serial.as_ref(),
                     hot,
                 );
@@ -2597,6 +2659,7 @@ fn worker_loop(
                     &mut cache,
                     &live_pads,
                     &input_hub,
+                    &mut interpreters,
                     hot,
                     &last_noisy_log,
                     None,
@@ -2648,6 +2711,7 @@ fn worker_loop(
                     &mut pending_power_off,
                     &mut pulse,
                     &input_hub,
+                    &mut interpreters,
                     &identifying,
                     &last_noisy_log,
                     hot,

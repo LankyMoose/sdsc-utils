@@ -17,6 +17,10 @@ const STICK_AXIS_DEADZONE: f32 = 0.9;
 const STICK_COMBINED_DEADZONE: f32 = 0.15;
 const NAV_INITIAL_DELAY: Duration = Duration::from_millis(280);
 const NAV_REPEAT: Duration = Duration::from_millis(90);
+/// Consecutive raw reports a digital button must hold a new state before the
+/// source-level interpreter accepts it. Report-rate (~4ms), so this is a
+/// sub-frame signal filter, not a user-visible delay.
+const BUTTON_STABLE_REPORTS: u8 = 3;
 /// Neutral-dropout grace: a neutral sample held this long is a deliberate
 /// release (reset gating); shorter gaps are threshold flicker and keep the
 /// active direction + repeat schedule. Longer than several input-report
@@ -148,15 +152,22 @@ impl std::hash::Hash for InputHub {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InputEdge {
     pub readings: Vec<NavReading>,
+    /// Ordered source-side button taps generated since the previous edge.
+    pub actions: Vec<PadAction>,
     pub seq: u64,
     pub reason: SnapshotReason,
     pub pad_count: usize,
 }
 
 impl InputEdge {
-    pub fn from_snapshot(readings: Vec<NavReading>, meta: &SnapshotMeta) -> Self {
+    pub fn from_snapshot(
+        readings: Vec<NavReading>,
+        actions: Vec<PadAction>,
+        meta: &SnapshotMeta,
+    ) -> Self {
         Self {
             readings,
+            actions,
             seq: meta.seq,
             reason: meta.reason,
             pad_count: meta.pad_count,
@@ -325,6 +336,215 @@ pub struct PadId(pub String);
 impl PadId {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Digital buttons interpreted at the HID source. L1/R1 stay on the legacy
+/// bumper tracker until that moves to event actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PadButton {
+    Cross,
+    Circle,
+    Square,
+    Triangle,
+    Options,
+    Create,
+    L3,
+    R3,
+}
+
+impl PadButton {
+    pub const COUNT: usize = 8;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Cross,
+        Self::Circle,
+        Self::Square,
+        Self::Triangle,
+        Self::Options,
+        Self::Create,
+        Self::L3,
+        Self::R3,
+    ];
+
+    fn raw(self, sample: &PadSample) -> bool {
+        match self {
+            Self::Cross => sample.cross,
+            Self::Circle => sample.circle,
+            Self::Square => sample.square,
+            Self::Triangle => sample.triangle,
+            Self::Options => sample.options,
+            Self::Create => sample.create,
+            Self::L3 => sample.l3,
+            Self::R3 => sample.held.contains(&GestureControl::R3),
+        }
+    }
+
+    /// R3's issue flag is a press action; every other tap resolves on release
+    /// so a completed press -> release is required.
+    fn tap_on_press(self) -> bool {
+        matches!(self, Self::R3)
+    }
+
+    /// Face/Options/Create presses cancel each other's pending tap, matching
+    /// the old release-cancellation discipline. L3/R3 are independent.
+    fn cancels_others(self) -> bool {
+        !matches!(self, Self::L3 | Self::R3)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PadButtonAction {
+    Tap,
+}
+
+/// One semantic button action from the source interpreter. Ordered and
+/// debounced before it ever reaches a window-specific handler.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PadAction {
+    pub pad: PadId,
+    pub button: PadButton,
+    pub action: PadButtonAction,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ButtonDebounce {
+    raw: bool,
+    stable: bool,
+    count: u8,
+}
+
+impl ButtonDebounce {
+    /// Accept `raw` only after it survives [`BUTTON_STABLE_REPORTS`]
+    /// consecutive reports. Returns the accepted state transition.
+    fn update(&mut self, raw: bool) -> Option<bool> {
+        if raw == self.raw {
+            self.count = self.count.saturating_add(1);
+        } else {
+            self.raw = raw;
+            self.count = 1;
+        }
+        if self.count >= BUTTON_STABLE_REPORTS && self.stable != raw {
+            self.stable = raw;
+            return Some(raw);
+        }
+        None
+    }
+}
+
+/// Per-pad source-side tap interpreter. Feeds on the ordered reports of one
+/// drain (not on a pre-merged snapshot) so batch boundaries cannot create or
+/// erase a press/release edge.
+#[derive(Debug, Clone, Default)]
+pub struct PadInterpreter {
+    buttons: [ButtonDebounce; PadButton::COUNT],
+    cancelled: [bool; PadButton::COUNT],
+}
+
+impl PadInterpreter {
+    pub fn ingest(&mut self, pad: &PadId, reports: &[PadSample]) -> Vec<PadAction> {
+        let mut actions = Vec::new();
+        for sample in reports {
+            let was_stable: [bool; PadButton::COUNT] =
+                std::array::from_fn(|index| self.buttons[index].stable);
+            let mut transitions = Vec::with_capacity(PadButton::COUNT);
+            for (index, button) in PadButton::ALL.into_iter().enumerate() {
+                if let Some(pressed) = self.buttons[index].update(button.raw(sample)) {
+                    transitions.push((index, pressed));
+                }
+            }
+            // A foreign face/Options/Create press cancels another held
+            // button's pending release, before any taps for this report fire.
+            for &(index, pressed) in &transitions {
+                if pressed && PadButton::ALL[index].cancels_others() {
+                    for (other, stable) in was_stable.iter().enumerate() {
+                        if other != index && PadButton::ALL[other].cancels_others() && *stable {
+                            self.cancelled[other] = true;
+                        }
+                    }
+                }
+            }
+            for (index, pressed) in transitions {
+                let button = PadButton::ALL[index];
+                let tap = if pressed {
+                    button.tap_on_press()
+                } else {
+                    let tap = !self.cancelled[index];
+                    self.cancelled[index] = false;
+                    tap
+                };
+                if tap {
+                    actions.push(PadAction {
+                        pad: pad.clone(),
+                        button,
+                        action: PadButtonAction::Tap,
+                    });
+                }
+            }
+        }
+        actions
+    }
+}
+
+/// Per-serial interpreters owned by the HID worker for the current live pads.
+#[derive(Debug, Default)]
+pub struct PadInterpreterBank {
+    pads: HashMap<PadId, PadInterpreter>,
+}
+
+impl PadInterpreterBank {
+    pub fn ingest(&mut self, pad: &PadId, reports: &[PadSample]) -> Vec<PadAction> {
+        self.pads
+            .entry(pad.clone())
+            .or_default()
+            .ingest(pad, reports)
+    }
+
+    pub fn retain_live(&mut self, live: &HashSet<PadId>) {
+        self.pads.retain(|id, _| live.contains(id));
+    }
+}
+
+/// UI-side delivery gate for source-side actions: monotonic sequence dedupe
+/// plus owner-change arming. A pad must reach full rest after a surface takes
+/// over before its taps are accepted.
+#[derive(Debug, Default)]
+pub struct PadActionGate {
+    last_seq: u64,
+    armed: HashSet<PadId>,
+}
+
+impl PadActionGate {
+    /// Returns `None` for a duplicate/stale edge; otherwise the actions that
+    /// are allowed through, in order.
+    pub fn begin(
+        &mut self,
+        seq: u64,
+        reset_arming: bool,
+        readings: &[NavReading],
+        actions: &[PadAction],
+    ) -> Option<Vec<PadAction>> {
+        if seq <= self.last_seq {
+            return None;
+        }
+        self.last_seq = seq;
+        if reset_arming {
+            self.armed.clear();
+        }
+        let live: HashSet<PadId> = readings.iter().map(|r| r.id.clone()).collect();
+        self.armed.retain(|id| live.contains(id));
+        let accepted = actions
+            .iter()
+            .filter(|action| self.armed.contains(&action.pad))
+            .cloned()
+            .collect();
+        for reading in readings {
+            if sample_nav_resting(&reading.sample) {
+                self.armed.insert(reading.id.clone());
+            }
+        }
+        Some(accepted)
     }
 }
 
@@ -673,7 +893,6 @@ pub struct ButtonEdges {
     create: bool,
     l1: bool,
     r1: bool,
-    l3: bool,
     /// Face/Options/Create that went down but were cancelled by a foreign face press.
     cancel_cross: bool,
     cancel_circle: bool,
@@ -770,7 +989,6 @@ impl ButtonEdges {
         self.create = sample.create;
         self.l1 = sample.l1;
         self.r1 = sample.r1;
-        self.l3 = sample.l3;
     }
 
     /// Rising edge on L1/R1 (browser history). Checked before `update` syncs,
@@ -786,12 +1004,6 @@ impl ButtonEdges {
         } else {
             None
         }
-    }
-
-    /// Rising edge on L3 (browser magnetism toggle). Same one-shot discipline
-    /// as the bumpers.
-    pub fn l3_press(&self, sample: &PadSample) -> bool {
-        sample.l3 && !self.l3
     }
 
     pub fn clear(&mut self) {
@@ -1118,6 +1330,10 @@ impl SampleFail {
 pub enum ShortSampleOutcome {
     Ok {
         sample: PadSample,
+        /// Ordered reports from this drain, before button OR-latching. The
+        /// source interpreter consumes these so batch boundaries cannot
+        /// create or erase a tap.
+        reports: Vec<PadSample>,
         /// Newest battery fields parsed from the same report(s), if present.
         battery: Option<crate::controller::dualsense::battery::BatteryReading>,
     },
@@ -1141,6 +1357,9 @@ pub fn merge_nav_samples(batch: &[PadSample]) -> Option<PadSample> {
         out.triangle |= s.triangle;
         out.options |= s.options;
         out.create |= s.create;
+        out.l1 |= s.l1;
+        out.r1 |= s.r1;
+        out.l3 |= s.l3;
         out.l2 |= s.l2;
         out.r2 |= s.r2;
         out.dpad_up |= s.dpad_up;
@@ -1506,10 +1725,10 @@ impl PadNavBank {
                 result.triangle_completed_pad = None;
             }
 
-            // Bumper taps fire on release via BumperHold (hold-vs-tap
-            // disambiguation for the history selector); L3 still fires on
-            // press. Button-edges sync below; the hold tracker reads the
-            // raw sample so ordering is irrelevant.
+            // Bumper taps still use the hold tracker for tap-vs-hold. Face,
+            // Options/Create and L3 taps are source-side PadActions now; this
+            // update only maintains the cancellation/held state used by
+            // holds, so its edge result is deliberately ignored.
             let bumper = slot
                 .bumper_hold
                 .update(reading.sample.l1, reading.sample.r1, now);
@@ -1519,30 +1738,17 @@ impl PadNavBank {
                 BumperHoldEvent::Open(BumperSide::Left) => NavAction::BumperHoldLeft,
                 BumperHoldEvent::Open(BumperSide::Right) => NavAction::BumperHoldRight,
             });
-            let l3 = slot.button_edges.l3_press(&reading.sample);
-            let edge = slot.button_edges.update(&reading.sample, hold_owned);
+            let _ = slot.button_edges.update(&reading.sample, hold_owned);
 
             if let Some(action) = nav
                 && nav_action.is_none()
             {
                 nav_action = Some((reading.id.clone(), action));
             }
-            if let Some(action) = edge
-                && button_action.is_none()
-            {
-                // A completed Cross-hold close must not also Confirm/Launch.
-                if result.cross_completed && action == NavAction::Confirm {
-                    continue;
-                }
-                button_action = Some((reading.id.clone(), action));
-            }
             if let Some(action) = bumper
                 && button_action.is_none()
             {
                 button_action = Some((reading.id.clone(), action));
-            }
-            if l3 && button_action.is_none() {
-                button_action = Some((reading.id.clone(), NavAction::ToggleMagnetism));
             }
         }
 
@@ -1690,6 +1896,25 @@ mod tests {
             "tap that released mid-drain must stay latched"
         );
         assert_eq!(merged.stick_y, 0.0);
+    }
+
+    #[test]
+    fn merge_nav_samples_latches_browser_buttons_released_in_batch() {
+        // L1/R1/L3 were added after the merge helper; a tail release report
+        // must not erase a press seen earlier in the same drain batch.
+        let pressed = PadSample {
+            l1: true,
+            r1: true,
+            l3: true,
+            held: [GestureControl::L1, GestureControl::R1, GestureControl::L3]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let merged = merge_nav_samples(&[pressed, PadSample::default()]).expect("batch");
+        assert!(merged.l1, "L1 press must stay latched");
+        assert!(merged.r1, "R1 press must stay latched");
+        assert!(merged.l3, "L3 press must stay latched");
     }
 
     #[test]
@@ -2230,6 +2455,196 @@ mod tests {
         assert_eq!(tick.action, Some(NavAction::Down));
     }
 
+    fn l3_sample(pressed: bool) -> PadSample {
+        PadSample {
+            l3: pressed,
+            held: if pressed {
+                [GestureControl::L3].into_iter().collect()
+            } else {
+                Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn interpreter_emits_l3_tap_only_after_debounced_press_release() {
+        let mut interpreter = PadInterpreter::default();
+        let pad = PadId("hid:a".into());
+        let pressed = vec![l3_sample(true); usize::from(BUTTON_STABLE_REPORTS)];
+        let released = vec![l3_sample(false); usize::from(BUTTON_STABLE_REPORTS)];
+        assert!(
+            interpreter.ingest(&pad, &pressed).is_empty(),
+            "press alone must not tap"
+        );
+        let actions = interpreter.ingest(&pad, &released);
+        assert_eq!(
+            actions,
+            vec![PadAction {
+                pad: pad.clone(),
+                button: PadButton::L3,
+                action: PadButtonAction::Tap,
+            }]
+        );
+        assert!(
+            interpreter.ingest(&pad, &released).is_empty(),
+            "a held release state must fire once"
+        );
+    }
+
+    #[test]
+    fn interpreter_foreign_press_cancels_pending_tap() {
+        let mut interpreter = PadInterpreter::default();
+        let pad = PadId("hid:a".into());
+        let cross = PadSample {
+            cross: true,
+            ..Default::default()
+        };
+        let both = PadSample {
+            cross: true,
+            circle: true,
+            ..Default::default()
+        };
+        let circle = PadSample {
+            circle: true,
+            ..Default::default()
+        };
+        let n = usize::from(BUTTON_STABLE_REPORTS);
+        assert!(interpreter.ingest(&pad, &vec![cross.clone(); n]).is_empty());
+        // Circle's press cancels Cross's pending release tap.
+        assert!(interpreter.ingest(&pad, &vec![both.clone(); n]).is_empty());
+        assert!(
+            interpreter
+                .ingest(&pad, &vec![circle.clone(); n])
+                .is_empty(),
+            "cancelled Cross release must not tap"
+        );
+        let released = interpreter.ingest(&pad, &vec![PadSample::default(); n]);
+        assert_eq!(
+            released,
+            vec![PadAction {
+                pad,
+                button: PadButton::Circle,
+                action: PadButtonAction::Tap,
+            }]
+        );
+    }
+
+    #[test]
+    fn interpreter_rejects_l3_chatter() {
+        let mut interpreter = PadInterpreter::default();
+        let pad = PadId("hid:a".into());
+        // Alternating reports never survive the stable-report window.
+        let mut chatter = Vec::new();
+        for _ in 0..8 {
+            chatter.push(l3_sample(true));
+            chatter.push(l3_sample(false));
+        }
+        assert!(interpreter.ingest(&pad, &chatter).is_empty());
+
+        // A single short false blip while held is not a release.
+        let n = usize::from(BUTTON_STABLE_REPORTS);
+        assert!(
+            interpreter
+                .ingest(&pad, &vec![l3_sample(true); n])
+                .is_empty()
+        );
+        assert!(interpreter.ingest(&pad, &[l3_sample(false)]).is_empty());
+        assert!(
+            interpreter
+                .ingest(&pad, &vec![l3_sample(true); n])
+                .is_empty()
+        );
+        assert_eq!(
+            interpreter.ingest(&pad, &vec![l3_sample(false); n]).len(),
+            1,
+            "only a stable release completes the tap"
+        );
+
+        // A real held click after the chatter still produces exactly one tap.
+        let press = vec![l3_sample(true); n];
+        let release = vec![l3_sample(false); n];
+        assert!(interpreter.ingest(&pad, &press).is_empty());
+        assert_eq!(interpreter.ingest(&pad, &release).len(), 1);
+    }
+
+    #[test]
+    fn action_gate_dedupes_and_rearms_only_after_rest() {
+        let pad = PadId("hid:a".into());
+        let action = PadAction {
+            pad: pad.clone(),
+            button: PadButton::Cross,
+            action: PadButtonAction::Tap,
+        };
+        let resting = [reading("hid:a", PadSample::default())];
+        let mut gate = PadActionGate::default();
+
+        // Owner change: the action is filtered, then the resting frame arms.
+        assert!(
+            gate.begin(1, true, &resting, std::slice::from_ref(&action))
+                .expect("first edge")
+                .is_empty()
+        );
+        // Same sequence is a duplicate.
+        assert!(
+            gate.begin(1, false, &resting, std::slice::from_ref(&action))
+                .is_none()
+        );
+        // Subsequent action on the armed pad passes.
+        assert_eq!(
+            gate.begin(2, false, &resting, std::slice::from_ref(&action))
+                .expect("second edge"),
+            vec![action.clone()]
+        );
+
+        // New owner + held pad: action is suppressed until a rest frame.
+        let held = [reading(
+            "hid:a",
+            PadSample {
+                l3: true,
+                held: [GestureControl::L3].into_iter().collect(),
+                ..Default::default()
+            },
+        )];
+        assert!(
+            gate.begin(3, true, &held, std::slice::from_ref(&action))
+                .expect("held edge")
+                .is_empty()
+        );
+        assert!(
+            gate.begin(4, false, &resting, std::slice::from_ref(&action))
+                .expect("rest edge")
+                .is_empty()
+        );
+        assert_eq!(
+            gate.begin(5, false, &resting, std::slice::from_ref(&action))
+                .expect("post-rest edge")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn interpreter_emits_r3_tap_on_press() {
+        let mut interpreter = PadInterpreter::default();
+        let pad = PadId("hid:a".into());
+        let reports = vec![
+            PadSample {
+                held: [GestureControl::R3].into_iter().collect(),
+                ..Default::default()
+            };
+            usize::from(BUTTON_STABLE_REPORTS)
+        ];
+        assert_eq!(
+            interpreter.ingest(&pad, &reports),
+            vec![PadAction {
+                pad,
+                button: PadButton::R3,
+                action: PadButtonAction::Tap,
+            }]
+        );
+    }
+
     #[test]
     fn dpad_only_masks_sticks_buttons_and_gestures() {
         let full = PadSample {
@@ -2309,6 +2724,7 @@ mod tests {
         let hub = InputHub::new();
         let edge = InputEdge::from_snapshot(
             Vec::new(),
+            Vec::new(),
             &SnapshotMeta {
                 published_at: Instant::now(),
                 seq: 7,
@@ -2326,6 +2742,7 @@ mod tests {
         hub.bind(tx);
         let edge = InputEdge::from_snapshot(
             vec![reading("hid:pad1", PadSample::default())],
+            Vec::new(),
             &SnapshotMeta {
                 published_at: Instant::now(),
                 seq: 3,
@@ -2339,6 +2756,7 @@ mod tests {
         assert_eq!(got.pad_count, 1);
         hub.clear();
         hub.push_edge(InputEdge::from_snapshot(
+            Vec::new(),
             Vec::new(),
             &SnapshotMeta {
                 published_at: Instant::now(),
@@ -2370,129 +2788,37 @@ mod tests {
     }
 
     #[test]
-    fn pad_b_can_confirm_while_pad_a_holds_open_chord() {
-        let mut bank = PadNavBank::default();
-        bank.prepare_on_open(false);
-        let now = Instant::now();
-
-        // Pad A still holding open chord (unarmed); pad B at rest then Cross.
-        let open = chord_sample(&[
-            GestureControl::L2,
-            GestureControl::R2,
-            GestureControl::L3,
-            GestureControl::R3,
-        ]);
-        let tick1 = bank.tick(
-            &[
-                reading("a", open.clone()),
-                reading("b", PadSample::default()),
-            ],
-            now,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        );
-        assert!(tick1.action.is_none());
-
-        let cross = PadSample {
-            cross: true,
-            held: [GestureControl::Cross].into_iter().collect(),
-            ..Default::default()
-        };
-        let tick2 = bank.tick(
-            &[reading("a", open.clone()), reading("b", cross.clone())],
-            now,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        );
+    fn interpreter_keeps_taps_per_pad() {
+        let mut interpreters = PadInterpreterBank::default();
+        let pad_a = PadId("hid:a".into());
+        let pad_b = PadId("hid:b".into());
+        let open = chord_sample(&[GestureControl::L2, GestureControl::R2]);
         assert!(
-            tick2.action.is_none(),
-            "Cross arms on press, fires on release"
-        );
-        let tick3 = bank.tick(
-            &[reading("a", open), reading("b", PadSample::default())],
-            now,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        );
-        assert_eq!(tick3.action, Some(NavAction::Confirm));
-        assert_eq!(tick3.action_pad.as_ref().map(|p| p.as_str()), Some("b"));
-    }
-
-    #[test]
-    fn same_tick_two_pads_emit_only_first_action() {
-        let mut bank = PadNavBank::default();
-        bank.prepare_on_open(true);
-        let now = Instant::now();
-
-        // Arm both at rest first.
-        let _ = bank.tick(
-            &[
-                reading("a", PadSample::default()),
-                reading("b", PadSample::default()),
-            ],
-            now,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
+            interpreters
+                .ingest(&pad_a, &[open.clone(), open.clone(), open])
+                .is_empty()
         );
 
-        let circle = PadSample {
-            circle: true,
-            held: [GestureControl::Circle].into_iter().collect(),
-            ..Default::default()
-        };
         let cross = PadSample {
             cross: true,
             held: [GestureControl::Cross].into_iter().collect(),
             ..Default::default()
         };
-        let tick = bank.tick(
-            &[reading("a", circle.clone()), reading("b", cross)],
-            now,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
+        let press = [cross.clone(), cross.clone(), cross];
+        let release = [
+            PadSample::default(),
+            PadSample::default(),
+            PadSample::default(),
+        ];
+        assert!(interpreters.ingest(&pad_b, &press).is_empty());
+        assert_eq!(
+            interpreters.ingest(&pad_b, &release),
+            vec![PadAction {
+                pad: pad_b,
+                button: PadButton::Cross,
+                action: PadButtonAction::Tap,
+            }]
         );
-        assert!(tick.action.is_none(), "face actions arm on press");
-        let tick2 = bank.tick(
-            &[
-                reading("a", PadSample::default()),
-                reading("b", PadSample::default()),
-            ],
-            now,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        );
-        assert_eq!(tick2.action, Some(NavAction::Cancel));
-        assert_eq!(tick2.action_pad.as_ref().map(|p| p.as_str()), Some("a"));
     }
 
     #[test]
@@ -2953,8 +3279,8 @@ mod tests {
     #[test]
     fn tick_horizontal_games_nav_editing_left_right_move_selection() {
         // Edit mode on the horizontal Games strip: Left/Right must scroll
-        // games (Up/Down moves). Up/Down stay suppressed, Square still
-        // cycles sort and Triangle still saves (ToggleEdit) in edit mode.
+        // games (Up/Down moves). Up/Down stay suppressed; face taps are
+        // source-side actions and no longer flow through this bank.
         let mut bank = PadNavBank::default();
         bank.prepare_on_open(true);
         let now = Instant::now();
@@ -3032,37 +3358,6 @@ mod tests {
             ..Default::default()
         };
         assert!(tick_games_editing(&mut bank, r2, now).action.is_none());
-
-        // Square still cycles sort in edit mode (manual Edit is mouse-only).
-        assert!(
-            tick_games_editing(&mut bank, PadSample::default(), now)
-                .action
-                .is_none()
-        );
-        let square = PadSample {
-            square: true,
-            ..Default::default()
-        };
-        assert!(tick_games_editing(&mut bank, square, now).action.is_none());
-        assert_eq!(
-            tick_games_editing(&mut bank, PadSample::default(), now).action,
-            Some(NavAction::CycleSort)
-        );
-
-        // Triangle still saves (ToggleEdit) in edit mode on the horizontal strip.
-        let triangle = PadSample {
-            triangle: true,
-            ..Default::default()
-        };
-        assert!(
-            tick_games_editing(&mut bank, triangle, now)
-                .action
-                .is_none()
-        );
-        assert_eq!(
-            tick_games_editing(&mut bank, PadSample::default(), now).action,
-            Some(NavAction::ToggleEdit)
-        );
     }
 
     #[test]

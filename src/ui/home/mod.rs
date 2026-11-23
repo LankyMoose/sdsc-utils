@@ -10,8 +10,10 @@
 //! a large glyph plus a title (no subtitles); the Browser tile stays visible
 //! when its engine is missing and Triangle opens its actions/Info popup.
 
+use crate::app::installs::{DOWNLOAD_LIMIT_OPTIONS_KBPS, download_limit_label};
 use crate::controller::dualsense::lightbar;
 use crate::controller::model::Serial;
+use crate::persist::prefs::{AUTO_OPEN_MODES, HomeAutoOpen};
 use crate::ui::face::{
     FaceButton, RingStyle, action_cluster_spaced, face_glyph, hint_text_capsule, hold_hint,
     plain_hint,
@@ -375,8 +377,10 @@ impl AppAction {
 }
 
 /// Rows in Home shell settings screen. The download cap is Home policy for
-/// every standalone install, not a Browser-specific option.
-pub const SETTINGS_ROWS: [&str; 5] = [
+/// every standalone install, not a Browser-specific option. Auto open is Home
+/// policy too, so it lives here rather than in the Launcher drawer.
+pub const SETTINGS_ROWS: [&str; 6] = [
+    "Auto open",
     "UI sounds",
     "Volume",
     "Controller haptics",
@@ -385,11 +389,19 @@ pub const SETTINGS_ROWS: [&str; 5] = [
 ];
 
 /// Settings row indices used by the view and the App's apply path.
-pub const SETTINGS_SOUNDS: usize = 0;
-pub const SETTINGS_VOLUME: usize = 1;
-pub const SETTINGS_HAPTICS: usize = 2;
-pub const SETTINGS_STRENGTH: usize = 3;
-pub const SETTINGS_DOWNLOAD: usize = 4;
+pub const SETTINGS_AUTO_OPEN: usize = 0;
+pub const SETTINGS_SOUNDS: usize = 1;
+pub const SETTINGS_VOLUME: usize = 2;
+pub const SETTINGS_HAPTICS: usize = 3;
+pub const SETTINGS_STRENGTH: usize = 4;
+pub const SETTINGS_DOWNLOAD: usize = 5;
+
+/// A committed dropdown choice. Kept pure so the App owns applying prefs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeSettingChoice {
+    AutoOpen(HomeAutoOpen),
+    DownloadLimit(u32),
+}
 
 /// Active Identify ring flash for one controller card.
 #[derive(Debug, Clone)]
@@ -421,14 +433,6 @@ pub struct State {
     pub engine_ready: bool,
     /// D-pad/stick repeat for Home movement.
     nav: crate::domain::pad::NavStepper,
-    /// Face-button rising-edge latches (Cross confirm, Circle close, Options
-    /// settings, Create controllers dock, Triangle actions).
-    pub prev_cross: bool,
-    pub prev_circle: bool,
-    pub prev_options: bool,
-    pub prev_create: bool,
-    pub prev_square: bool,
-    pub prev_triangle: bool,
     /// Current face holds for hint rings and the SELECT/START capsules.
     pub cross_held: bool,
     pub square_held: bool,
@@ -488,6 +492,10 @@ pub struct State {
     /// Home shell settings screen.
     pub settings_open: bool,
     pub settings_focus: usize,
+    /// Expanded selector dropdown: (row, highlighted option index).
+    /// `None` = closed; only Auto open / Download speed are selectors.
+    pub settings_menu: Option<(usize, usize)>,
+    pub home_auto_open: HomeAutoOpen,
     pub sound_enabled: bool,
     pub sound_volume: u8,
     pub haptics_enabled: bool,
@@ -508,12 +516,6 @@ impl Default for State {
             launcher_enabled: true,
             engine_ready: false,
             nav: crate::domain::pad::NavStepper::default(),
-            prev_cross: false,
-            prev_circle: false,
-            prev_options: false,
-            prev_create: false,
-            prev_square: false,
-            prev_triangle: false,
             cross_held: false,
             square_held: false,
             triangle_held: false,
@@ -551,6 +553,8 @@ impl Default for State {
             engine_restart_required: false,
             settings_open: false,
             settings_focus: 0,
+            settings_menu: None,
+            home_auto_open: HomeAutoOpen::Any,
             sound_enabled: true,
             sound_volume: 60,
             haptics_enabled: true,
@@ -571,33 +575,48 @@ impl State {
         TILES[self.selected()]
     }
 
-    /// Move the app highlight, wrapping.
-    pub fn move_selection(&mut self, delta: i32) {
+    /// Move the app highlight, wrapping. Returns true when it moved.
+    pub fn move_selection(&mut self, delta: i32) -> bool {
         if delta == 0 {
-            return;
+            return false;
         }
         let len = TILES.len() as i32;
         let next = (self.selected() as i32 + delta).rem_euclid(len);
+        if next as usize == self.selected() {
+            return false;
+        }
         self.selected = next as usize;
+        true
     }
 
-    /// Move within the focused row.
-    pub fn move_across(&mut self, delta: i32) {
-        if delta == 0 {
-            return;
-        }
+    /// Move within the focused row. The apps row is horizontal and the
+    /// controllers dock is vertical; an axis only drives its own row.
+    pub fn move_x(&mut self, delta: i32) -> bool {
         match self.focus {
             HomeFocus::Apps => self.move_selection(delta),
-            HomeFocus::Controllers => {
-                if self.controllers.is_empty() {
-                    return;
-                }
-                let len = self.controllers.len() as i32;
-                self.controller_focus =
-                    (self.controller_focus as i32 + delta).rem_euclid(len) as usize;
-                self.reset_triangle_hold();
-            }
+            HomeFocus::Controllers => false,
         }
+    }
+
+    pub fn move_y(&mut self, delta: i32) -> bool {
+        match self.focus {
+            HomeFocus::Apps => false,
+            HomeFocus::Controllers => self.move_controller_selection(delta),
+        }
+    }
+
+    fn move_controller_selection(&mut self, delta: i32) -> bool {
+        if delta == 0 || self.controllers.is_empty() {
+            return false;
+        }
+        let len = self.controllers.len() as i32;
+        let next = (self.controller_focus as i32 + delta).rem_euclid(len);
+        if next as usize == self.controller_focus {
+            return false;
+        }
+        self.controller_focus = next as usize;
+        self.reset_triangle_hold();
+        true
     }
 
     /// True while the top-right controllers dock owns input.
@@ -858,12 +877,6 @@ impl State {
         self.launcher_enabled = launcher_enabled;
         self.engine_ready = engine_ready;
         self.nav = crate::domain::pad::NavStepper::default();
-        self.prev_cross = false;
-        self.prev_circle = false;
-        self.prev_options = false;
-        self.prev_create = false;
-        self.prev_square = false;
-        self.prev_triangle = false;
         self.cross_held = false;
         self.square_held = false;
         self.triangle_held = false;
@@ -881,12 +894,14 @@ impl State {
         self.apps_info = None;
         self.settings_open = false;
         self.settings_focus = 0;
+        self.settings_menu = None;
         self.install_error = None;
     }
 
     pub fn open_settings(&mut self) {
         self.settings_open = true;
         self.settings_focus = 0;
+        self.settings_menu = None;
         self.apps_menu = None;
         self.apps_info = None;
         self.install_error = None;
@@ -898,46 +913,71 @@ impl State {
     pub fn close_settings(&mut self) {
         self.settings_open = false;
         self.settings_focus = 0;
+        self.settings_menu = None;
     }
 
+    /// Dynamic visibility: sliders disappear with their master toggle; the
+    /// download cap is absent in Store-managed builds.
     pub fn settings_visible(&self, row: usize) -> bool {
-        row != SETTINGS_DOWNLOAD || self.download_cap_available
-    }
-
-    pub fn clamp_settings_focus(&mut self) {
-        if self.settings_focus >= SETTINGS_ROWS.len() || !self.settings_visible(self.settings_focus)
-        {
-            self.settings_focus = 0;
+        match row {
+            SETTINGS_VOLUME => self.sound_enabled,
+            SETTINGS_STRENGTH => self.haptics_enabled,
+            SETTINGS_DOWNLOAD => self.download_cap_available,
+            SETTINGS_AUTO_OPEN | SETTINGS_SOUNDS | SETTINGS_HAPTICS => true,
+            _ => false,
         }
     }
 
-    pub fn settings_move(&mut self, delta: i32) {
+    pub fn settings_is_selector(row: usize) -> bool {
+        matches!(row, SETTINGS_AUTO_OPEN | SETTINGS_DOWNLOAD)
+    }
+
+    pub fn clamp_settings_focus(&mut self) {
+        if self
+            .settings_menu
+            .is_some_and(|(row, _)| !self.settings_visible(row) || !Self::settings_is_selector(row))
+        {
+            self.settings_menu = None;
+        }
+        if self.settings_focus >= SETTINGS_ROWS.len() || !self.settings_visible(self.settings_focus)
+        {
+            self.settings_focus = (0..SETTINGS_ROWS.len())
+                .find(|row| self.settings_visible(*row))
+                .unwrap_or(0);
+        }
+    }
+
+    /// Move the settings focus over visible rows. Returns true when it moved.
+    pub fn settings_move(&mut self, delta: i32) -> bool {
         if delta == 0 {
-            return;
+            return false;
         }
         let rows: Vec<usize> = (0..SETTINGS_ROWS.len())
             .filter(|row| self.settings_visible(*row))
             .collect();
         if rows.is_empty() {
-            return;
+            return false;
         }
         let current = rows
             .iter()
             .position(|row| *row == self.settings_focus)
             .unwrap_or(0) as i32;
         let next = (current + delta).rem_euclid(rows.len() as i32) as usize;
+        if rows[next] == self.settings_focus {
+            return false;
+        }
         self.settings_focus = rows[next];
+        true
     }
 
     pub fn settings_value(&self, row: usize) -> String {
         match row {
+            SETTINGS_AUTO_OPEN => self.home_auto_open.label().to_string(),
             SETTINGS_SOUNDS => (if self.sound_enabled { "On" } else { "Off" }).to_string(),
             SETTINGS_VOLUME => format!("{}%", self.sound_volume),
             SETTINGS_HAPTICS => (if self.haptics_enabled { "On" } else { "Off" }).to_string(),
             SETTINGS_STRENGTH => format!("{}%", self.haptics_strength),
-            SETTINGS_DOWNLOAD => {
-                crate::app::installs::download_limit_label(self.download_limit_kbps)
-            }
+            SETTINGS_DOWNLOAD => download_limit_label(self.download_limit_kbps),
             _ => String::new(),
         }
     }
@@ -949,12 +989,117 @@ impl State {
         haptics: bool,
         haptics_strength: u8,
         download_limit_kbps: u32,
+        home_auto_open: HomeAutoOpen,
     ) {
         self.sound_enabled = sounds;
         self.sound_volume = sound_volume;
         self.haptics_enabled = haptics;
         self.haptics_strength = haptics_strength;
         self.download_limit_kbps = crate::app::installs::clamp_download_limit(download_limit_kbps);
+        self.home_auto_open = home_auto_open;
+    }
+
+    pub fn settings_menu_open(&self) -> bool {
+        self.settings_menu.is_some()
+    }
+
+    pub fn settings_menu_highlight(&self) -> Option<usize> {
+        self.settings_menu.map(|(_, highlight)| highlight)
+    }
+
+    pub fn open_settings_menu(&mut self, row: usize) -> bool {
+        if !self.settings_visible(row) || !Self::settings_is_selector(row) {
+            return false;
+        }
+        self.settings_menu = Some((row, self.settings_initial_highlight(row)));
+        true
+    }
+
+    pub fn close_settings_menu(&mut self) {
+        self.settings_menu = None;
+    }
+
+    /// Move the expanded dropdown highlight, wrapping. Returns true when it moved.
+    pub fn settings_menu_move(&mut self, delta: i32) -> bool {
+        if delta == 0 {
+            return false;
+        }
+        let Some((row, highlight)) = self.settings_menu else {
+            return false;
+        };
+        let count = Self::settings_option_count(row);
+        if count == 0 {
+            return false;
+        }
+        let next = (highlight as i32 + delta).rem_euclid(count as i32) as usize;
+        if next == highlight {
+            return false;
+        }
+        self.settings_menu = Some((row, next));
+        true
+    }
+
+    pub fn settings_option_count(row: usize) -> usize {
+        match row {
+            SETTINGS_AUTO_OPEN => AUTO_OPEN_MODES.len(),
+            SETTINGS_DOWNLOAD => DOWNLOAD_LIMIT_OPTIONS_KBPS.len(),
+            _ => 0,
+        }
+    }
+
+    pub fn settings_option_label(&self, row: usize, index: usize) -> String {
+        match row {
+            SETTINGS_AUTO_OPEN => AUTO_OPEN_MODES
+                .get(index)
+                .map(|mode| mode.label().to_string())
+                .unwrap_or_default(),
+            SETTINGS_DOWNLOAD => DOWNLOAD_LIMIT_OPTIONS_KBPS
+                .get(index)
+                .map(|kbps| download_limit_label(*kbps))
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    pub fn settings_option_selected(&self, row: usize, index: usize) -> bool {
+        match row {
+            SETTINGS_AUTO_OPEN => AUTO_OPEN_MODES
+                .get(index)
+                .is_some_and(|mode| *mode == self.home_auto_open),
+            SETTINGS_DOWNLOAD => DOWNLOAD_LIMIT_OPTIONS_KBPS
+                .get(index)
+                .is_some_and(|kbps| *kbps == self.download_limit_kbps),
+            _ => false,
+        }
+    }
+
+    fn settings_initial_highlight(&self, row: usize) -> usize {
+        match row {
+            SETTINGS_AUTO_OPEN => AUTO_OPEN_MODES
+                .iter()
+                .position(|mode| *mode == self.home_auto_open)
+                .unwrap_or(0),
+            SETTINGS_DOWNLOAD => DOWNLOAD_LIMIT_OPTIONS_KBPS
+                .iter()
+                .position(|kbps| *kbps == self.download_limit_kbps)
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    pub fn settings_menu_choice(&self) -> Option<HomeSettingChoice> {
+        let (row, highlight) = self.settings_menu?;
+        match row {
+            SETTINGS_AUTO_OPEN => AUTO_OPEN_MODES
+                .get(highlight)
+                .copied()
+                .map(HomeSettingChoice::AutoOpen),
+            SETTINGS_DOWNLOAD => DOWNLOAD_LIMIT_OPTIONS_KBPS
+                .get(highlight)
+                .copied()
+                .map(HomeSettingChoice::DownloadLimit),
+            _ => None,
+        }
     }
 
     pub fn open_apps_menu(&mut self, index: usize) {
@@ -1144,12 +1289,13 @@ impl State {
         }
     }
 
-    /// Feed one pad tick. Returns a Home message for a movement or face edge.
-    /// Callers may also read [`Self::prev_cross`] etc. after the call.
+    /// Feed one pad frame. Taps arrive as source-side actions (`tap`); this
+    /// only handles nav repeat, held visuals, and the Triangle power-off hold.
     pub fn pad_tick(
         &mut self,
         sample: &crate::domain::pad::PadSample,
         now: Instant,
+        tap: Option<HomeMessage>,
     ) -> Option<HomeMessage> {
         use crate::domain::pad::NavAction;
         let mut message = None;
@@ -1158,7 +1304,6 @@ impl State {
         self.triangle_held = sample.triangle;
         self.options_held = sample.options;
         self.create_held = sample.create;
-        let triangle_rising = sample.triangle && !self.prev_triangle;
         let nav = self.nav.update(sample, now, true, true);
         if let Some(action) = nav {
             message = match action {
@@ -1169,8 +1314,10 @@ impl State {
                 _ => None,
             };
         }
-        // Triangle hold powers off the focused Bluetooth pad; movement or a
-        // foreign press cancels it (same discipline as the Launcher dock row).
+        // Triangle hold powers off the focused Bluetooth pad; vertical
+        // movement or a foreign press cancels it (same discipline as the
+        // Launcher dock row). Horizontal input is inert in the vertical dock,
+        // so it must not cancel the hold either.
         let can_power = !self.settings_open
             && self.apps_info.is_none()
             && self.apps_menu.is_none()
@@ -1180,7 +1327,11 @@ impl State {
             });
         let foreign =
             sample.cross || sample.circle || sample.square || sample.options || sample.create;
-        if self.triangle_hold.is_active() && (nav.is_some() || foreign) {
+        let nav_cancels_hold = nav.is_some_and(|action| {
+            !(matches!(action, NavAction::Left | NavAction::Right)
+                && self.focus == HomeFocus::Controllers)
+        });
+        if self.triangle_hold.is_active() && (nav_cancels_hold || foreign) {
             self.reset_triangle_hold();
         }
         let (progress, completed) = self.triangle_hold.update(sample.triangle && can_power, now);
@@ -1196,47 +1347,7 @@ impl State {
             message = Some(HomeMessage::PowerOff);
         }
 
-        if sample.cross && !self.prev_cross {
-            message = Some(HomeMessage::Confirm);
-        } else if sample.circle && !self.prev_circle {
-            message = Some(HomeMessage::Close);
-        } else if sample.create
-            && !self.prev_create
-            && !self.settings_open
-            && self.apps_info.is_none()
-            && self.apps_menu.is_none()
-            && !self.controllers.is_empty()
-        {
-            // Select/Share: old Launcher controllers-surface toggle.
-            message = Some(HomeMessage::ToggleControllers);
-        } else if sample.options && !self.prev_options {
-            message = Some(HomeMessage::SettingsToggle);
-        } else if sample.square
-            && !self.prev_square
-            && self.focus == HomeFocus::Controllers
-            && self.apps_info.is_none()
-            && self.apps_menu.is_none()
-            && !self.settings_open
-        {
-            // Old Launcher dock footer: Square cycles Connected / All.
-            message = Some(HomeMessage::ToggleShowAll);
-        } else if triangle_rising
-            && !self.settings_open
-            && self.apps_info.is_none()
-            && self.apps_menu.is_none()
-            && self.focus == HomeFocus::Apps
-            && matches!(self.selected_tile(), HomeTile::Browser)
-        {
-            // Apps-row actions live behind Triangle; Cross still activates.
-            message = Some(HomeMessage::AppsMenuOpen(0));
-        }
-        self.prev_cross = sample.cross;
-        self.prev_circle = sample.circle;
-        self.prev_options = sample.options;
-        self.prev_create = sample.create;
-        self.prev_square = sample.square;
-        self.prev_triangle = sample.triangle;
-        message
+        tap.or(message)
     }
 }
 
@@ -1812,14 +1923,24 @@ fn settings_view<'a>(state: &'a State, stage_w: f32, fade: f32) -> Element<'a, H
         if !state.settings_visible(i) {
             continue;
         }
-        if i == SETTINGS_SOUNDS {
-            rows = rows.push(settings_section("Feedback", fade));
-        } else if i == SETTINGS_DOWNLOAD {
-            rows = rows.push(space().height(Length::Fixed(16.0)));
-            rows = rows.push(settings_section("App installs", fade));
+        match i {
+            SETTINGS_AUTO_OPEN => {
+                rows = rows.push(settings_section("Home", fade));
+            }
+            SETTINGS_SOUNDS => {
+                rows = rows.push(settings_section("Feedback", fade));
+            }
+            SETTINGS_DOWNLOAD => {
+                rows = rows.push(space().height(Length::Fixed(16.0)));
+                rows = rows.push(settings_section("App installs", fade));
+            }
+            _ => {}
         }
         let focused = i == state.settings_focus;
         let row = match i {
+            SETTINGS_AUTO_OPEN => {
+                settings_selector_row(label, None, &state.settings_value(i), focused, fade)
+            }
             SETTINGS_SOUNDS => {
                 settings_toggle_row("UI sounds", None, state.sound_enabled, focused, fade)
             }
@@ -1844,7 +1965,7 @@ fn settings_view<'a>(state: &'a State, stage_w: f32, fade: f32) -> Element<'a, H
                 focused,
                 fade,
             ),
-            SETTINGS_DOWNLOAD => settings_choice_row(
+            SETTINGS_DOWNLOAD => settings_selector_row(
                 label,
                 Some("Applies to apps installed outside the Store"),
                 &state.settings_value(i),
@@ -1854,32 +1975,68 @@ fn settings_view<'a>(state: &'a State, stage_w: f32, fade: f32) -> Element<'a, H
             _ => continue,
         };
         rows = rows.push(row);
+        if state
+            .settings_menu
+            .is_some_and(|(open_row, _)| open_row == i)
+        {
+            rows = rows.push(settings_menu_panel(state, i, fade));
+        }
     }
+    container(rows)
+        .padding(16)
+        .width(Length::Fixed(card_w))
+        .style(move |theme| card_style(fade, theme))
+        .into()
+}
+
+/// Expanded dropdown panel for a selector row: same ✓/○ option language as
+/// the Launcher settings drawer, rendered beneath its row.
+fn settings_menu_panel<'a>(state: &State, row: usize, fade: f32) -> Element<'a, HomeMessage> {
+    let highlight = state.settings_menu_highlight().unwrap_or(0);
+    let mut options = column![].spacing(4).width(Fill);
+    for i in 0..State::settings_option_count(row) {
+        options = options.push(settings_option_row(
+            &state.settings_option_label(row, i),
+            state.settings_option_selected(row, i),
+            i == highlight,
+            fade,
+        ));
+    }
+    container(options)
+        .padding(6)
+        .width(Fill)
+        .style(theme::menu_panel)
+        .into()
+}
+
+fn settings_option_row<'a>(
+    label: &str,
+    selected: bool,
+    highlighted: bool,
+    fade: f32,
+) -> Element<'a, HomeMessage> {
+    let (mark, mark_color) = if selected {
+        ("✓", theme::ACCENT)
+    } else {
+        ("○", theme::alpha(theme::MUTED, 0.55))
+    };
     container(
-        column![
-            text("Settings")
-                .size(26.0)
-                .font(iced::Font {
-                    weight: iced::font::Weight::Bold,
-                    ..iced::Font::default()
-                })
-                .color(theme::scale_alpha(theme::INK, fade)),
-            space().height(4),
-            text("Applies across Home, the Launcher, and Browser")
-                .size(theme::type_scale::CAPTION)
-                .color(theme::scale_alpha(theme::DIM, fade)),
-            space().height(12),
-            rows,
-            space().height(10),
-            text("Up/Down select · Left/Right adjust · Circle back")
-                .size(theme::type_scale::CAPTION)
-                .color(theme::scale_alpha(theme::DIM, fade)),
+        row![
+            text(mark)
+                .size(14.0)
+                .color(theme::scale_alpha(mark_color, fade))
+                .width(Length::Fixed(20.0)),
+            text(label.to_string())
+                .size(14.0)
+                .color(theme::scale_alpha(theme::INK, fade))
+                .width(Fill),
         ]
-        .spacing(0),
+        .spacing(8)
+        .align_y(Alignment::Center),
     )
-    .padding(16)
-    .width(Length::Fixed(card_w))
-    .style(move |theme| card_style(fade, theme))
+    .padding(8)
+    .width(Fill)
+    .style(settings_focus_style(highlighted, fade))
     .into()
 }
 
@@ -2068,7 +2225,7 @@ fn settings_slider_row<'a>(
         .into()
 }
 
-fn settings_choice_row<'a>(
+fn settings_selector_row<'a>(
     label: &'static str,
     helper: Option<&'static str>,
     value: &str,
@@ -2572,11 +2729,14 @@ mod tests {
     fn selection_wraps_both_ways() {
         let mut state = State::default();
         assert_eq!(state.selected_tile(), HomeTile::Launcher);
-        state.move_across(1);
+        assert!(state.move_x(1));
         assert_eq!(state.selected_tile(), HomeTile::Browser);
-        state.move_across(1);
+        assert!(state.move_x(1));
         assert_eq!(state.selected_tile(), HomeTile::Launcher);
-        state.move_across(-1);
+        assert!(state.move_x(-1));
+        assert_eq!(state.selected_tile(), HomeTile::Browser);
+        // The apps row is horizontal: vertical input is inert.
+        assert!(!state.move_y(1));
         assert_eq!(state.selected_tile(), HomeTile::Browser);
     }
 
@@ -2622,12 +2782,18 @@ mod tests {
         assert_eq!(state.focus, HomeFocus::Apps);
         assert!(state.toggle_dock(now));
         assert_eq!(state.focus, HomeFocus::Controllers);
-        state.move_across(1);
+        // The dock is vertical: horizontal input must not move it.
+        assert!(!state.move_x(1));
+        assert_eq!(
+            state.controller_selected().map(|r| r.serial.as_ref()),
+            Some("abc")
+        );
+        assert!(state.move_y(1));
         assert_eq!(
             state.controller_selected().map(|r| r.serial.as_ref()),
             Some("def")
         );
-        state.move_across(1);
+        assert!(state.move_y(1));
         assert_eq!(
             state.controller_selected().map(|r| r.serial.as_ref()),
             Some("abc")
@@ -2641,32 +2807,6 @@ mod tests {
         let mut state = State::default();
         assert!(!state.toggle_dock(Instant::now()));
         assert_eq!(state.focus, HomeFocus::Apps);
-    }
-
-    #[test]
-    fn options_edge_toggles_settings_request() {
-        use crate::domain::pad::PadSample;
-        let mut state = State::default();
-        let now = Instant::now();
-        let mut sample = PadSample {
-            options: true,
-            ..PadSample::default()
-        };
-        assert_eq!(
-            state.pad_tick(&sample, now),
-            Some(HomeMessage::SettingsToggle)
-        );
-        assert!(!matches!(
-            state.pad_tick(&sample, now),
-            Some(HomeMessage::SettingsToggle)
-        ));
-        sample.options = false;
-        state.pad_tick(&sample, now);
-        sample.options = true;
-        assert_eq!(
-            state.pad_tick(&sample, now),
-            Some(HomeMessage::SettingsToggle)
-        );
     }
 
     #[test]
@@ -2765,17 +2905,36 @@ mod tests {
     #[test]
     fn settings_rows_cycle_and_report_values() {
         let mut state = State::default();
-        state.set_settings(true, 70, false, 40, 5 * 1024);
-        assert_eq!(state.settings_value(0), "On");
-        assert_eq!(state.settings_value(1), "70%");
-        assert_eq!(state.settings_value(2), "Off");
-        assert_eq!(state.settings_value(3), "40%");
-        assert_eq!(state.settings_value(4), "5 MB/s");
-        state.settings_move(1);
-        state.settings_move(-1);
-        assert_eq!(state.settings_focus, 0);
-        state.settings_move(-1);
-        assert_eq!(state.settings_focus, SETTINGS_ROWS.len() - 1);
+        state.set_settings(true, 70, false, 40, 5 * 1024, HomeAutoOpen::Bluetooth);
+        assert_eq!(
+            state.settings_value(SETTINGS_AUTO_OPEN),
+            "When a Bluetooth controller connects"
+        );
+        assert_eq!(state.settings_value(SETTINGS_SOUNDS), "On");
+        assert_eq!(state.settings_value(SETTINGS_VOLUME), "70%");
+        assert_eq!(state.settings_value(SETTINGS_HAPTICS), "Off");
+        assert_eq!(state.settings_value(SETTINGS_STRENGTH), "40%");
+        assert_eq!(state.settings_value(SETTINGS_DOWNLOAD), "5 MB/s");
+        assert!(state.settings_move(1));
+        assert_eq!(state.settings_focus, SETTINGS_SOUNDS);
+        assert!(state.settings_move(-1));
+        assert_eq!(state.settings_focus, SETTINGS_AUTO_OPEN);
+        assert!(state.settings_move(-1));
+        assert_eq!(state.settings_focus, SETTINGS_DOWNLOAD);
+    }
+
+    #[test]
+    fn sliders_hide_with_their_master_toggle() {
+        let mut state = State::default();
+        assert!(state.settings_visible(SETTINGS_VOLUME));
+        assert!(state.settings_visible(SETTINGS_STRENGTH));
+        state.sound_enabled = false;
+        state.haptics_enabled = false;
+        assert!(!state.settings_visible(SETTINGS_VOLUME));
+        assert!(!state.settings_visible(SETTINGS_STRENGTH));
+        assert!(state.settings_visible(SETTINGS_AUTO_OPEN));
+        assert!(state.settings_visible(SETTINGS_SOUNDS));
+        assert!(state.settings_visible(SETTINGS_HAPTICS));
     }
 
     #[test]
@@ -2787,15 +2946,43 @@ mod tests {
         assert!(!state.settings_visible(SETTINGS_DOWNLOAD));
         assert!(state.settings_visible(SETTINGS_STRENGTH));
         state.settings_focus = SETTINGS_STRENGTH;
-        state.settings_move(1);
+        assert!(state.settings_move(1));
         assert_eq!(
-            state.settings_focus, SETTINGS_SOUNDS,
+            state.settings_focus, SETTINGS_AUTO_OPEN,
             "movement skips the hidden cap row and wraps"
         );
-        state.settings_move(1);
-        assert_eq!(state.settings_focus, SETTINGS_VOLUME);
-        state.settings_move(-1);
+        assert!(state.settings_move(1));
         assert_eq!(state.settings_focus, SETTINGS_SOUNDS);
+        assert!(state.settings_move(-1));
+        assert_eq!(state.settings_focus, SETTINGS_AUTO_OPEN);
+    }
+
+    #[test]
+    fn settings_dropdowns_track_options_and_commit_choices() {
+        let mut state = State::default();
+        state.set_settings(true, 70, true, 40, 2 * 1024, HomeAutoOpen::Bluetooth);
+        assert_eq!(State::settings_option_count(SETTINGS_AUTO_OPEN), 3);
+        assert_eq!(State::settings_option_count(SETTINGS_DOWNLOAD), 4);
+
+        assert!(state.open_settings_menu(SETTINGS_AUTO_OPEN));
+        assert_eq!(state.settings_menu_highlight(), Some(1));
+        assert!(state.settings_menu_move(1));
+        assert_eq!(state.settings_menu_highlight(), Some(2));
+        assert_eq!(
+            state.settings_menu_choice(),
+            Some(HomeSettingChoice::AutoOpen(HomeAutoOpen::Any))
+        );
+        state.close_settings_menu();
+        assert!(!state.settings_menu_open());
+
+        assert!(state.open_settings_menu(SETTINGS_DOWNLOAD));
+        assert_eq!(state.settings_menu_highlight(), Some(1));
+        assert!(state.settings_menu_move(-1));
+        assert_eq!(state.settings_menu_highlight(), Some(0));
+        assert_eq!(
+            state.settings_menu_choice(),
+            Some(HomeSettingChoice::DownloadLimit(0))
+        );
     }
 
     #[test]
@@ -2835,33 +3022,6 @@ mod tests {
         assert_eq!(state.apps_menu_action(), Some(AppAction::Install));
         state.apps_menu_move(-1);
         assert_eq!(state.apps_menu_action(), Some(AppAction::Info));
-    }
-
-    #[test]
-    fn triangle_opens_browser_actions_on_the_apps_row() {
-        use crate::domain::pad::PadSample;
-        let mut state = State::default();
-        let now = Instant::now();
-        let press = PadSample {
-            triangle: true,
-            ..PadSample::default()
-        };
-        let release = PadSample::default();
-
-        // Launcher has no managed actions: Triangle is inert there.
-        assert_eq!(state.pad_tick(&press, now), None);
-
-        // Browser opens the same per-app popup the old catalog used.
-        state.pad_tick(&release, now + std::time::Duration::from_millis(16));
-        state.select(1, now + std::time::Duration::from_millis(16));
-        assert_eq!(
-            state.pad_tick(&press, now + std::time::Duration::from_millis(32)),
-            Some(HomeMessage::AppsMenuOpen(0))
-        );
-        assert_eq!(
-            state.pad_tick(&press, now + std::time::Duration::from_millis(48)),
-            None
-        );
     }
 
     #[test]
@@ -2962,72 +3122,16 @@ mod tests {
             triangle: true,
             ..PadSample::default()
         };
-        state.pad_tick(&sample, now);
+        state.pad_tick(&sample, now, None);
         assert!(state.cross_held);
         assert!(state.triangle_held);
         state.pad_tick(
             &PadSample::default(),
             now + std::time::Duration::from_millis(16),
+            None,
         );
         assert!(!state.cross_held);
         assert!(!state.triangle_held);
-    }
-
-    #[test]
-    fn create_and_square_edges_drive_the_dock() {
-        use crate::controller::model::{
-            Capabilities, Connection, ControllerKind, ControllerStatus, PowerState,
-        };
-        use crate::domain::pad::PadSample;
-        let row = ControllerRow::connected(
-            &ControllerStatus {
-                index: 1,
-                kind: ControllerKind::DualSense,
-                serial: Serial::from("abc"),
-                product: "DualSense".into(),
-                connection: Connection::Bluetooth,
-                percent: 80,
-                state: PowerState::Discharging,
-                capabilities: Capabilities::FULL,
-            },
-            false,
-            true,
-            None,
-            20,
-            None,
-        );
-        let mut state = State::default();
-        state.set_controllers(vec![row]);
-        let now = Instant::now();
-        let create = PadSample {
-            create: true,
-            ..PadSample::default()
-        };
-        assert_eq!(
-            state.pad_tick(&create, now),
-            Some(HomeMessage::ToggleControllers)
-        );
-        assert_eq!(
-            state.pad_tick(&create, now + std::time::Duration::from_millis(16)),
-            None
-        );
-        state.pad_tick(
-            &PadSample::default(),
-            now + std::time::Duration::from_millis(32),
-        );
-        assert_eq!(
-            state.pad_tick(&create, now + std::time::Duration::from_millis(48)),
-            Some(HomeMessage::ToggleControllers)
-        );
-        state.toggle_dock(now + std::time::Duration::from_millis(64));
-        let square = PadSample {
-            square: true,
-            ..PadSample::default()
-        };
-        assert_eq!(
-            state.pad_tick(&square, now + std::time::Duration::from_millis(80)),
-            Some(HomeMessage::ToggleShowAll)
-        );
     }
 
     #[test]
@@ -3074,38 +3178,22 @@ mod tests {
             dpad_down: true,
             ..PadSample::default()
         };
-        assert_eq!(state.pad_tick(&down, now), Some(HomeMessage::MoveY(1)));
+        assert_eq!(
+            state.pad_tick(&down, now, None),
+            Some(HomeMessage::MoveY(1))
+        );
         state.pad_tick(
             &PadSample::default(),
             now + std::time::Duration::from_millis(16),
+            None,
         );
         let up = PadSample {
             dpad_up: true,
             ..PadSample::default()
         };
         assert_eq!(
-            state.pad_tick(&up, now + std::time::Duration::from_millis(32)),
+            state.pad_tick(&up, now + std::time::Duration::from_millis(32), None),
             Some(HomeMessage::MoveY(-1))
-        );
-    }
-
-    #[test]
-    fn face_edges_fire_once_per_press() {
-        let mut state = State::default();
-        let mut sample = crate::domain::pad::PadSample::default();
-        let t0 = Instant::now();
-        sample.cross = true;
-        assert_eq!(state.pad_tick(&sample, t0), Some(HomeMessage::Confirm));
-        assert_eq!(
-            state.pad_tick(&sample, t0 + std::time::Duration::from_millis(16)),
-            None
-        );
-        sample.cross = false;
-        let _ = state.pad_tick(&sample, t0 + std::time::Duration::from_millis(32));
-        sample.circle = true;
-        assert_eq!(
-            state.pad_tick(&sample, t0 + std::time::Duration::from_millis(48)),
-            Some(HomeMessage::Close)
         );
     }
 }
