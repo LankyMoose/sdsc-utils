@@ -34,6 +34,12 @@
   branch were removed once the pivot merged.
 
 
+## Terminology
+
+- **Launcher** — the fullscreen game console (`src/ui/launcher/`, `src/app/launcher.rs`). Prefs and helpers use the `launcher_*` prefix; `Start` is not a screen name.
+- **Home** — the topmost PS-button overlay app switcher (`src/ui/home/`, `src/app/home.rs`). Registry type is `HomeApps`; managed-app UI identity is `ManagedApp`.
+- **Default page** — the Browser's start URL (`BROWSER_DEFAULT_URL`). "Home" never refers to a browser page.
+
 ## Build / test / lint ordering
 
 **Always: fmt → clippy → test → build** (this is the CI order and the pre-push hook order).
