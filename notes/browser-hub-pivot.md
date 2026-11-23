@@ -1,6 +1,7 @@
 # Browser hub pivot — managed apps + CEF engine (planned)
 
-**Status:** in progress (branch `browser/hub-pivot`, based on `browser/main`).
+**Status:** in progress on `browser/main` (the `browser/hub-pivot` line merged
+in at `d245777`).
 Phases 0–4 are complete; phase 5 (DLC packaging/install + catalog) is
 partially landed. The engine package, resolver, catalog/install UI, and dev
 download path exist; the Store API wiring and optional-package submission

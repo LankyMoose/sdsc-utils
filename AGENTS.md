@@ -26,11 +26,15 @@
 ## Branch layout
 
 - `main` — released line.
-- `browser/main` — consolidation point for the pre-pivot browser work
-  (contains the former `browser/multi-app-suspend-spike` / `browser/tabs`).
-- `browser/hub-pivot` — current work: managed-app PS hub + standalone
-  Browser window, now on CEF OSR. Plan: `notes/browser-hub-pivot.md`.
-- `backup/pre-split-full` — pre-split snapshot; keep until the pivot merges.
+- `browser/main` — integration line for the browser + PS hub work: managed-app
+  hub, standalone Browser window, CEF OSR engine. Absorbed the pivot at
+  `d245777` (also contains the former `browser/multi-app-suspend-spike` /
+  `browser/tabs` work). Plan/handoff: `notes/browser-hub-pivot.md`.
+- `browser/hub-pivot` — the hub-pivot work line; fully merged into
+  `browser/main` at `d245777`, so it is safe to delete or reuse for follow-up
+  hub work. Land changes on `browser/main` unless a separate line is wanted.
+- `backup/pre-split-full` — pre-split snapshot. Its keep-until-the-pivot-merges
+  condition is met, so it can be dropped once nothing needs the history.
 
 
 ## Build / test / lint ordering
@@ -117,7 +121,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Shared face-button hints / rings** → `src/ui/face/` (`mod.rs` widgets, `ring.rs` SVG rings); used by Start, Start Settings, and hub controller dock rows
 - **Shared UI sounds / haptics** → `src/app/feedback.rs` (global cue + pref application), `src/platform/ui_sound.rs` (audio worker); hub Settings owns the controls
 - **Start screen / game launcher** → `src/ui/start/` (UI), `src/games/` (Steam scan, launch); behavior → `notes/start-immersive.md`
-- **Browser (CEF)** → `src/browser/` (engine seam, `cef_backend.rs`, DOM/cursor, nav helpers) + `src/ui/browser/state.rs` (panel/tabs/chrome) + `src/ui/start/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state); PS hub → `src/ui/hub/` + `src/app/hub.rs`; contracts → `notes/browser-embedding.md`; planned hub/CEF split → `notes/browser-hub-pivot.md`
+- **Browser (CEF)** → `src/browser/` (engine seam, `cef_backend.rs`, DOM/cursor, nav helpers) + `src/ui/browser/state.rs` (panel/tabs/chrome) + `src/ui/start/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state); PS hub → `src/ui/hub/` + `src/app/hub.rs`; contracts → `notes/browser-embedding.md`; hub/CEF pivot plan → `notes/browser-hub-pivot.md`
 - **Toasts** → `src/ui/toast/` (state machine in `machine.rs`); z-order / remount → `notes/windows-toast.md`
 - **Persisted state (prefs/controllers/analytics)** → `src/persist/`
 - **Single instance, tray lifecycle, crash-restart** → `src/bin/sdsc-utils.rs`, `src/platform/crash_restart.rs`
