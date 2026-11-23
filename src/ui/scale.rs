@@ -37,6 +37,7 @@ const IDENTITY_THRESHOLD: f32 = 0.999;
 pub struct Scale<'a, Message, Theme, Renderer> {
     content: Element<'a, Message, Theme, Renderer>,
     scale: f32,
+    offset: Vector,
 }
 
 impl<'a, Message, Theme, Renderer> Scale<'a, Message, Theme, Renderer> {
@@ -46,7 +47,15 @@ impl<'a, Message, Theme, Renderer> Scale<'a, Message, Theme, Renderer> {
         Self {
             content: content.into(),
             scale,
+            offset: Vector::new(0.0, 0.0),
         }
+    }
+
+    /// Paint/hit-test translation applied after the center-anchored scale.
+    /// Layout footprint is unchanged, same as scale.
+    pub fn offset(mut self, offset: Vector) -> Self {
+        self.offset = offset;
+        self
     }
 
     fn effective_scale(&self) -> f32 {
@@ -55,8 +64,8 @@ impl<'a, Message, Theme, Renderer> Scale<'a, Message, Theme, Renderer> {
 
     fn transformation(&self, bounds: Rectangle) -> Transformation {
         Transformation::translate(
-            bounds.x + bounds.width / 2.0,
-            bounds.y + bounds.height / 2.0,
+            bounds.x + bounds.width / 2.0 + self.offset.x,
+            bounds.y + bounds.height / 2.0 + self.offset.y,
         ) * Transformation::scale(self.effective_scale())
             * Transformation::translate(
                 -bounds.x - bounds.width / 2.0,
@@ -65,7 +74,7 @@ impl<'a, Message, Theme, Renderer> Scale<'a, Message, Theme, Renderer> {
     }
 
     fn is_identity(&self) -> bool {
-        self.scale >= IDENTITY_THRESHOLD
+        self.scale >= IDENTITY_THRESHOLD && self.offset.x.abs() < 0.01 && self.offset.y.abs() < 0.01
     }
 }
 
@@ -357,6 +366,7 @@ impl<'a, Message: 'a, Theme: 'a, Renderer: renderer::Renderer + 'a>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced::advanced::Widget;
     use iced::widget::{container, text};
 
     fn plain() -> Element<'static, (), iced::Theme, iced::Renderer> {
@@ -380,5 +390,24 @@ mod tests {
                 plain().as_widget().size_hint()
             );
         }
+    }
+
+    #[test]
+    fn scale_offset_translates_without_changing_footprint() {
+        let bounds = Rectangle::new(iced::Point::new(10.0, 20.0), Size::new(400.0, 100.0));
+        let base: Scale<'static, (), iced::Theme, iced::Renderer> =
+            Scale::new(container(text("hello")).width(Length::Fixed(420.0)), 0.96);
+        let base_t = base.transformation(bounds).translation();
+        let widget = base.offset(Vector::new(0.0, 28.0));
+        let moved_t = widget.transformation(bounds).translation();
+        assert!(
+            (moved_t.x - base_t.x).abs() < 0.01,
+            "base={base_t:?} moved={moved_t:?}"
+        );
+        assert!(
+            (moved_t.y - base_t.y - 28.0).abs() < 0.01,
+            "base={base_t:?} moved={moved_t:?}"
+        );
+        assert_eq!(widget.size(), plain().as_widget().size());
     }
 }

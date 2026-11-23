@@ -3326,6 +3326,77 @@ impl State {
         }
     }
 
+    /// Defer every wall-clock animation stamp that was already running when
+    /// the PS hub opened. Start keeps painting its last frame underneath the
+    /// hub, so without this shift the first frame after close sees the whole
+    /// hub session as elapsed time: the ken-burns splash snaps ahead, enter
+    /// veils jump, and chrome races to settle. Stamps created *during* the
+    /// pause (e.g. art decoding while the hub is open) are left alone.
+    pub fn shift_animation_clock(&mut self, paused_at: Instant, pause: Duration) {
+        if pause.is_zero() {
+            return;
+        }
+        fn shift(stamp: &mut Instant, paused_at: Instant, pause: Duration) {
+            if *stamp <= paused_at {
+                *stamp += pause;
+            }
+        }
+        fn shift_opt(stamp: &mut Option<Instant>, paused_at: Instant, pause: Duration) {
+            if let Some(stamp) = stamp {
+                shift(stamp, paused_at, pause);
+            }
+        }
+
+        if let Some(anim) = self.strip_anim.as_mut() {
+            shift(&mut anim.started, paused_at, pause);
+        }
+        if let Some(anim) = self.layout_transition.as_mut() {
+            shift(&mut anim.started, paused_at, pause);
+        }
+        if let Some(anim) = self.position_section.as_mut() {
+            shift(&mut anim.started, paused_at, pause);
+        }
+        if let Some(anim) = self.position_bar_slide.as_mut() {
+            shift(&mut anim.started, paused_at, pause);
+        }
+        shift_opt(&mut self.position_bar_last_scroll, paused_at, pause);
+        if let Some((_, started)) = self.transition_phase.as_mut() {
+            shift(started, paused_at, pause);
+        }
+        if let Some(clock) = self.enter_reveal.as_mut() {
+            shift_opt(&mut clock.armed_at, paused_at, pause);
+        }
+        shift_opt(&mut self.cold_ambient_started, paused_at, pause);
+        shift_opt(&mut self.chrome_status_all_success_at, paused_at, pause);
+        shift_opt(&mut self.chrome_status_batch_exit_at, paused_at, pause);
+        shift_opt(&mut self.games_list_reveal_at, paused_at, pause);
+        shift_opt(&mut self.enter_list_hold_started, paused_at, pause);
+        shift_opt(&mut self.hint_anim_tick, paused_at, pause);
+        shift_opt(&mut self.ambient_last_tick, paused_at, pause);
+        if let Some(anim) = self.idle_dim_anim.as_mut() {
+            shift(&mut anim.started, paused_at, pause);
+        }
+        if let Some(tween) = self.replace_anim.as_mut() {
+            shift(&mut tween.started, paused_at, pause);
+        }
+        if let Some(tween) = self.manual_anim.as_mut() {
+            shift(&mut tween.started, paused_at, pause);
+        }
+        if let Some(tween) = self.edit_confirm_anim.as_mut() {
+            shift(&mut tween.started, paused_at, pause);
+        }
+        if let Some((_, Some(started))) = self.backdrop_current.as_mut() {
+            shift(started, paused_at, pause);
+        }
+        for item in &mut self.chrome_status {
+            shift(&mut item.started, paused_at, pause);
+            if let Some(started) = item.stack_anim_started.as_mut() {
+                shift(started, paused_at, pause);
+            }
+        }
+        self.settings.shift_animation_clock(paused_at, pause);
+    }
+
     pub fn tick_anim(&mut self, now: Instant) {
         self.maybe_force_enter_reveal_after_art_hold(now);
         let _ = self.try_arm_enter_reveal_when_art_ready(now);
@@ -6254,6 +6325,41 @@ mod tests {
                 .iter()
                 .all(|i| i.phase != ChromeStatusPhase::ExitRight),
             "batch exit must wait until every chip is Success"
+        );
+    }
+
+    #[test]
+    fn hub_pause_defers_running_start_animations() {
+        let t0 = Instant::now();
+        let paused_at = t0 + Duration::from_secs(1);
+        let pause = Duration::from_secs(10);
+        let mut state = State {
+            backdrop_current: Some(("game".to_string(), Some(t0))),
+            ambient_last_tick: Some(paused_at),
+            games_list_reveal_at: Some(t0),
+            ..State::default()
+        };
+        state.shift_animation_clock(paused_at, pause);
+        assert_eq!(
+            state.backdrop_current,
+            Some(("game".to_string(), Some(t0 + pause)))
+        );
+        assert_eq!(state.ambient_last_tick, Some(paused_at + pause));
+        assert_eq!(state.games_list_reveal_at, Some(t0 + pause));
+    }
+
+    #[test]
+    fn hub_pause_leaves_art_started_during_the_pause_alone() {
+        let paused_at = Instant::now();
+        let started_during = paused_at + Duration::from_secs(2);
+        let mut state = State {
+            backdrop_current: Some(("game".to_string(), Some(started_during))),
+            ..State::default()
+        };
+        state.shift_animation_clock(paused_at, Duration::from_secs(10));
+        assert_eq!(
+            state.backdrop_current,
+            Some(("game".to_string(), Some(started_during)))
         );
     }
 }

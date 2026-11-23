@@ -565,8 +565,8 @@ pub struct App {
     /// Hub HWND is created hidden until its final size + DWM transition
     /// setup; then it is shown.
     hub_pending_show: bool,
-    /// Start instant for the hub backdrop fade-in.
-    hub_backdrop_fade: Option<Instant>,
+    /// Hub window entrance/exit (card scale/opacity/y + scrim fade).
+    hub_shell_anim: Option<crate::ui::hub::ShellAnim>,
     /// Monitor covered by the hub window (toast composite pose).
     hub_monitor_cover: Option<MonitorCover>,
     hub_state: crate::ui::hub::State,
@@ -599,6 +599,10 @@ pub struct App {
     start_last_activity: Instant,
     /// Last mouse activity on Start (cursor hide only — pad must not unhide).
     start_cursor_last_active: Instant,
+    /// When the PS hub opened over a visible Start. On hub close, Start's
+    /// animation stamps and idle clock are shifted forward by this pause so
+    /// the frozen splash art resumes instead of snapping ahead.
+    start_hub_pause: Option<Instant>,
     /// When true, Start view forces [`mouse::Interaction::Hidden`].
     start_cursor_hidden: bool,
     /// True while an rfd picker is open from the start screen (suppress unfocus-close).
@@ -962,7 +966,7 @@ impl App {
             hub_visible: false,
             hub_stage: (crate::ui::hub::HUB_WIDTH, crate::ui::hub::HUB_HEIGHT),
             hub_pending_show: false,
-            hub_backdrop_fade: None,
+            hub_shell_anim: None,
             hub_monitor_cover: None,
             hub_state: crate::ui::hub::State::default(),
             start_close_armed: false,
@@ -979,6 +983,7 @@ impl App {
             crash_restart_boot,
             start_last_activity: Instant::now(),
             start_cursor_last_active: Instant::now(),
+            start_hub_pause: None,
             start_cursor_hidden: false,
             start_file_dialog_open: false,
             chord_release_gate: ChordReleaseGate::default(),
@@ -1330,7 +1335,7 @@ impl App {
                 .push(iced::time::every(EMULATOR_COMMIT_POLL).map(|_| Message::EmulatorCommitTick));
         }
 
-        if self.browser_backdrop_fade.is_some() || self.hub_backdrop_fade.is_some() {
+        if self.browser_backdrop_fade.is_some() || self.hub_shell_anim.is_some() {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::ShellFadeTick));
         }
 
@@ -1510,18 +1515,20 @@ impl App {
 
         if Some(window) == self.hub_window {
             let now = Instant::now();
-            let backdrop_alpha = self
-                .hub_backdrop_fade
-                .map(|started| {
-                    crate::ui::motion::shell_backdrop_alpha(started, now, theme::BACKDROP_ALPHA)
-                })
-                .unwrap_or(theme::BACKDROP_ALPHA);
+            let reduced =
+                crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
+            let shell = self
+                .hub_shell_anim
+                .map(|anim| anim.frame(now, reduced))
+                .unwrap_or_else(crate::ui::hub::ShellFrame::full);
             let hub = crate::ui::hub::view(
                 &self.hub_state,
                 &self.session.prefs.spectrum,
                 self.hub_stage.0,
                 self.hub_stage.1,
-                backdrop_alpha,
+                shell.backdrop_alpha,
+                shell.panel,
+                now,
             )
             .map(Message::Hub);
             // Start hosts the toast card while its cover is up; the hub
@@ -1627,10 +1634,10 @@ impl App {
         // prefs freshly arrived via snapshot. Re-syncing while set is a
         // no-op (chases are already settled); StartFrame re-syncs too so an
         // OS-toggle flip lands mid-session.
-        self.start_state
-            .sync_reduced_motion(crate::ui::motion::reduced_motion_effective(
-                self.session.prefs.reduced_motion,
-            ));
+        let reduced =
+            crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
+        self.start_state.sync_reduced_motion(reduced);
+        self.hub_state.reduced_motion = reduced;
         self.start_state
             .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
         // Debug tuning keep-alive follows the local fields (the tuning
@@ -1802,12 +1809,17 @@ impl App {
                         self.browser_backdrop_fade = None;
                     }
                 }
-                if let Some(started) = self.hub_backdrop_fade {
+                if let Some(anim) = self.hub_shell_anim {
                     if let Some(id) = self.hub_window {
                         redraw = redraw.chain(crate::ui::layout::invalidate_window(id));
                     }
-                    if crate::ui::motion::shell_backdrop_done(started, now) {
-                        self.hub_backdrop_fade = None;
+                    if anim.done(now) {
+                        match anim.dir {
+                            crate::ui::hub::ShellDir::Enter => self.hub_shell_anim = None,
+                            crate::ui::hub::ShellDir::Exit => {
+                                return redraw.chain(self.finish_hub_close(now));
+                            }
+                        }
                     }
                 }
                 redraw
@@ -1956,6 +1968,8 @@ impl App {
         } else if Some(id) == self.hub_window {
             self.hub_window = None;
             self.hub_visible = false;
+            self.hub_shell_anim = None;
+            self.resume_start_after_hub(Instant::now());
             // Return focus to Start when it is the app underneath. The toast
             // is AlwaysOnTop, so it stays above a normal-level Start without
             // re-raising anything.

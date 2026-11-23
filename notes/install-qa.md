@@ -99,23 +99,24 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
 
 ## Hub layout and pad input
 
-- The hub card has no outer padding: header (DualSense mark + `SDSC Utils`
-  wordmark, **Options** hint + gear on the right), apps row (Start / Browser),
-  then a horizontal controllers strip with no section title or count.
-- **Options** toggles hub Settings from the main card (Circle closes). The
-  settings screen absorbs UI sounds, volume, haptics, strength, the standalone
-  download cap, and the disconnected-controller filter for the strip. Those
-  feedback prefs are global (Start, Browser, and hub).
-- Up/Down switch focus between the apps and controllers rows; Left/Right move
-  within the focused row. The controllers strip scrolls the selected card into
-  view.
+- The hub card keeps three rows and no outer padding: branding header
+  (DualSense mark + `SDSC Utils`), apps (Start / Browser), then action hints
+  left-to-right: **SELECT Controllers** and **START Settings**. Both hints are
+  clickable.
+- The controllers list is the restored Start-style dock in the monitor's
+  top-right corner: collapsed battery-ring column by default; Select/Share
+  (Create) expands it in place and moves focus to controllers. It has no
+  section title or count.
+- While the dock is expanded, Left/Right move the controller selection, Cross
+  identifies, Triangle hold powers off a live Bluetooth pad, Square toggles
+  Connected/All in the dock footer, and Circle collapses the dock (a second
+  Circle closes the hub). Up/Down have no row-focus role on the main hub.
+- **Options** (or the START Settings hint) opens hub Settings. The settings
+  screen absorbs UI sounds, volume, haptics, strength, the standalone download
+  cap, and the disconnected-controller filter for the dock. Those feedback
+  prefs are global (Start, Browser, and hub).
 - Cross (or click) launches the focused app. Triangle on the Browser tile opens
   its install/update/Info actions popup (the old catalog screen is gone).
-- The controller strip defaults to wheel-only cards. Selecting a card while
-  the controllers row is focused animates it open to name/status plus the
-  standard ringed face hints: Cross Identify and Triangle hold Power off on a
-  live Bluetooth pad. The previous card animates back closed. These replaced
-  Start's controllers surface, which no longer exists (Create is inert).
 
 ## Environment overrides
 

@@ -187,7 +187,7 @@ pub(crate) fn empty_games_browse_prompt(
         RingStyle::Idle
     };
     // Flat: body prompt must not Float-scale (same stacking constraint as dock glyphs).
-    let glyph = face_glyph(face, style, press.press_anim.for_face(face), true);
+    let glyph = face_glyph(face, style, press.press_anim.for_face(face), true, 1.0);
     row![
         text("No games yet - press")
             .size(text_size)
@@ -374,7 +374,7 @@ fn start_options_capsule(
         .font(Font::MONOSPACE)
         .color(theme::ACCENT);
     // Monospace caps sit high in the em box — nudge down for optical center.
-    hint_text_capsule(label, 10.0, 1.0, pressed, press_t, flat)
+    hint_text_capsule(label, 10.0, 1.0, pressed, press_t, flat, 1.0)
 }
 
 fn footer_band(content: Element<'_, StartMessage>, expand: bool) -> Element<'_, StartMessage> {
@@ -408,6 +408,7 @@ pub(crate) fn face_cycle_toggle(
         },
         press_anim.for_face(face),
         flat,
+        1.0,
     );
     let mut labels = row![].spacing(8).align_y(Alignment::Center);
     labels = labels.push(glyph);

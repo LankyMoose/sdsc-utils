@@ -612,6 +612,19 @@ impl SettingsPanel {
         self.menu.is_some()
     }
 
+    /// Defer an in-flight open/close tween across a paused overlay (PS hub).
+    pub(crate) fn shift_animation_clock(
+        &mut self,
+        paused_at: std::time::Instant,
+        pause: std::time::Duration,
+    ) {
+        if let Some(anim) = self.anim.as_mut()
+            && anim.started <= paused_at
+        {
+            anim.started += pause;
+        }
+    }
+
     /// Which selector row owns the open dropdown, if any.
     pub fn menu_row(&self) -> Option<SettingsRow> {
         self.menu.map(|(row, _)| row)

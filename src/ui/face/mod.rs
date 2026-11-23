@@ -191,20 +191,26 @@ fn render_action_hint<Message: 'static>(
         } else {
             RingStyle::Idle
         };
-        face_glyph(face, style, hint.press_t, flat)
+        face_glyph(face, style, hint.press_t, flat, hint.alpha)
     } else {
         text_glyph_circle(
             hint.text_glyph.unwrap_or("?"),
             hint.pressed,
             hint.press_t,
             flat,
+            hint.alpha,
         )
     };
 
-    row![glyph, text(hint.label).size(14.0).color(theme::MUTED)]
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .into()
+    row![
+        glyph,
+        text(hint.label)
+            .size(14.0)
+            .color(theme::scale_alpha(theme::MUTED, hint.alpha))
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 pub(crate) fn text_glyph_circle<Message: 'static>(
@@ -212,6 +218,7 @@ pub(crate) fn text_glyph_circle<Message: 'static>(
     pressed: bool,
     press_t: f32,
     flat: bool,
+    alpha: f32,
 ) -> Element<'static, Message> {
     let half = HOLD_RING_SIZE / 2.0;
     let max_radius = half - 2.5;
@@ -222,12 +229,16 @@ pub(crate) fn text_glyph_circle<Message: 'static>(
         RingStyle::Idle
     };
     let stack = iced::widget::stack![
-        ring_element(style, idle_radius, 1.0),
-        container(text(glyph).size(12.0).color(theme::ACCENT))
-            .width(Length::Fixed(HOLD_RING_SIZE))
-            .height(Length::Fixed(HOLD_RING_SIZE))
-            .center_x(Fill)
-            .center_y(Fill),
+        ring_element(style, idle_radius, alpha),
+        container(
+            text(glyph)
+                .size(12.0)
+                .color(theme::scale_alpha(theme::ACCENT, alpha))
+        )
+        .width(Length::Fixed(HOLD_RING_SIZE))
+        .height(Length::Fixed(HOLD_RING_SIZE))
+        .center_x(Fill)
+        .center_y(Fill),
     ]
     .width(Length::Fixed(HOLD_RING_SIZE))
     .height(Length::Fixed(HOLD_RING_SIZE));
@@ -242,6 +253,7 @@ pub(crate) fn text_glyph_circle<Message: 'static>(
 /// Pill glyph centered in a [`HOLD_RING_SIZE`] slot so height matches face rings.
 ///
 /// `optical_top` adds extra top padding inside the pill (monospace caps often sit high).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn hint_text_capsule<Message: 'static>(
     label: text::Text<'static>,
     pad_x: f32,
@@ -249,8 +261,9 @@ pub(crate) fn hint_text_capsule<Message: 'static>(
     pressed: bool,
     press_t: f32,
     flat: bool,
+    alpha: f32,
 ) -> Element<'static, Message> {
-    hint_element_capsule(label, pad_x, optical_top, pressed, press_t, flat)
+    hint_element_capsule(label, pad_x, optical_top, pressed, press_t, flat, alpha)
 }
 
 /// Shared capsule chrome for text and multi-glyph pills.
@@ -264,15 +277,19 @@ fn hint_element_capsule<Message: 'static>(
     pressed: bool,
     press_t: f32,
     flat: bool,
+    alpha: f32,
 ) -> Element<'static, Message> {
-    let border_color = if pressed {
-        theme::ACCENT
-    } else {
-        Color {
-            a: 0.25,
-            ..theme::MUTED
-        }
-    };
+    let border_color = theme::scale_alpha(
+        if pressed {
+            theme::ACCENT
+        } else {
+            Color {
+                a: 0.25,
+                ..theme::MUTED
+            }
+        },
+        alpha,
+    );
     let border_w = if pressed { 2.5 } else { 2.0 };
     let pill_h = hint_ring_idle_diameter();
     let pill = container(content)
@@ -335,8 +352,9 @@ pub(crate) fn face_glyph<Message: 'static>(
     style: RingStyle,
     press_t: f32,
     flat: bool,
+    alpha: f32,
 ) -> Element<'static, Message> {
-    let stack = face_glyph_stack(face, style, 1.0);
+    let stack = face_glyph_stack(face, style, alpha);
     if flat {
         return stack;
     }

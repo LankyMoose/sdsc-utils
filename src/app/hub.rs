@@ -184,6 +184,9 @@ impl App {
 
     /// Show the topmost hub overlay. Idempotent when already visible.
     pub(crate) fn open_hub(&mut self) -> Task<Message> {
+        if self.hub_closing() {
+            return Task::none();
+        }
         if self.hub_visible
             && let Some(id) = self.hub_window
         {
@@ -206,6 +209,9 @@ impl App {
         self.hub_stage = (cover.width, cover.height);
         self.hub_monitor_cover = Some(cover);
         self.hub_pending_show = true;
+        if self.start_visible {
+            self.start_hub_pause.get_or_insert_with(Instant::now);
+        }
         let window_size = Size::new(cover.width, cover.height);
         let window_position = window::Position::Specific(Point::new(cover.x, cover.y));
         self.refresh_engine_status();
@@ -248,18 +254,50 @@ impl App {
             .chain(self.check_engine_manifest())
     }
 
-    /// Hide the hub and return focus to Start when it is the app underneath.
+    /// Begin hiding the hub. The window stays alive (and modal) through the
+    /// exit fade; [`Self::finish_hub_close`] tears it down when the shell
+    /// animation settles. Returns focus to Start when it is the app underneath.
     pub(crate) fn close_hub(&mut self) -> Task<Message> {
-        self.hub_visible = false;
+        if self
+            .hub_shell_anim
+            .is_some_and(|anim| anim.dir == crate::ui::hub::ShellDir::Exit)
+        {
+            return Task::none();
+        }
+        let now = Instant::now();
+        let Some(id) = self.hub_window else {
+            self.hub_visible = false;
+            self.hub_pending_show = false;
+            self.hub_shell_anim = None;
+            self.resume_start_after_hub(now);
+            return self.rehost_toast_after_composite();
+        };
+        if self.hub_pending_show {
+            // Dismissed before the window was shown: nothing to animate.
+            return self.finish_hub_close(now);
+        }
+        crate::controller::hid::diag::diag_info("ui-diag: hub close");
+        let reduced =
+            crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
+        let from = self
+            .hub_shell_anim
+            .map(|anim| anim.frame(now, reduced))
+            .unwrap_or_else(crate::ui::hub::ShellFrame::full);
+        self.hub_shell_anim = Some(crate::ui::hub::ShellAnim::exit(now, from));
+        crate::ui::layout::invalidate_window(id)
+    }
+
+    /// Complete a hub close after the exit fade. Owns window teardown, focus
+    /// return, toast rehost, and thawing the Start animation clock.
+    pub(crate) fn finish_hub_close(&mut self, now: Instant) -> Task<Message> {
+        self.hub_shell_anim = None;
         self.hub_pending_show = false;
-        self.hub_backdrop_fade = None;
+        self.hub_visible = false;
+        self.resume_start_after_hub(now);
         let Some(id) = self.hub_window.take() else {
             return self.rehost_toast_after_composite();
         };
-        crate::controller::hid::diag::diag_info("ui-diag: hub close");
         let task = window::close(id).chain(self.rehost_toast_after_composite());
-        // Return focus to the app underneath: Browser first (it launches on
-        // top of Start or the desktop), else Start.
         if self.browser_visible
             && let Some(browser) = self.browser_window
         {
@@ -271,6 +309,30 @@ impl App {
             return task.chain(focus_window(start));
         }
         task
+    }
+
+    pub(crate) fn hub_closing(&self) -> bool {
+        self.hub_shell_anim
+            .is_some_and(|anim| anim.dir == crate::ui::hub::ShellDir::Exit)
+    }
+
+    /// Shift frozen Start animation/idle stamps across the hub session so the
+    /// splash art resumes where it left off instead of snapping ahead.
+    pub(crate) fn resume_start_after_hub(&mut self, now: Instant) {
+        let Some(paused_at) = self.start_hub_pause.take() else {
+            return;
+        };
+        let pause = now.saturating_duration_since(paused_at);
+        if pause.is_zero() {
+            return;
+        }
+        self.start_state.shift_animation_clock(paused_at, pause);
+        if self.start_last_activity <= paused_at {
+            self.start_last_activity += pause;
+        }
+        if self.start_cursor_last_active <= paused_at {
+            self.start_cursor_last_active += pause;
+        }
     }
 
     pub(crate) fn on_hub_opened(&mut self, id: window::Id) -> Task<Message> {
@@ -307,7 +369,7 @@ impl App {
             return Task::none();
         };
         self.hub_pending_show = false;
-        self.hub_backdrop_fade = Some(Instant::now());
+        self.hub_shell_anim = Some(crate::ui::hub::ShellAnim::enter(Instant::now()));
         // The hub composites the toast card; keep the HWND hidden so it
         // cannot sit above the scrim as a blank transparent window.
         let hide_toast = if self.toast_message.is_some() {
@@ -325,7 +387,31 @@ impl App {
 
     pub(crate) fn on_hub_message(&mut self, message: hub_view::HubMessage) -> Task<Message> {
         use hub_view::HubMessage;
+        if self.hub_closing() {
+            return Task::none();
+        }
         match message {
+            HubMessage::ToggleControllers => {
+                let now = Instant::now();
+                if self.hub_state.settings_open
+                    || self.hub_state.apps_info.is_some()
+                    || self.hub_state.apps_menu.is_some()
+                {
+                    return Task::none();
+                }
+                if self.hub_state.toggle_dock(now) {
+                    self.play_ui_cue(UiSoundKind::Slide);
+                }
+                Task::none()
+            }
+            HubMessage::ToggleShowAll => {
+                self.session.prefs.show_all_controllers = !self.session.prefs.show_all_controllers;
+                self.save_prefs();
+                self.sync_hub_settings();
+                self.sync_hub_controllers();
+                self.play_ui_cue(UiSoundKind::Action);
+                Task::none()
+            }
             HubMessage::MoveX(delta) => {
                 if delta != 0 {
                     self.play_ui_cue(UiSoundKind::Nav);
@@ -345,7 +431,6 @@ impl App {
                     self.hub_state.apps_menu_move(delta);
                 } else {
                     self.hub_state.move_across(delta);
-                    return self.scroll_to_hub_controller();
                 }
                 Task::none()
             }
@@ -365,10 +450,9 @@ impl App {
                     self.hub_state.settings_move(delta);
                 } else if self.hub_state.apps_menu.is_some() {
                     self.hub_state.apps_menu_move(delta);
-                } else {
-                    self.hub_state.move_row(delta);
-                    return self.scroll_to_hub_controller();
                 }
+                // Main hub: one apps row (Left/Right). Up/Down has no target
+                // now that Select/Share owns the controllers dock.
                 Task::none()
             }
             HubMessage::SettingsToggle => {
@@ -405,11 +489,11 @@ impl App {
             }
             HubMessage::Activate(index) => {
                 self.play_ui_cue(UiSoundKind::Action);
-                self.hub_state.select(index);
+                self.hub_state.select(index, Instant::now());
                 self.hub_activate()
             }
             HubMessage::IdentifyController(index) => {
-                self.hub_state.select_controller(index);
+                self.hub_state.select_controller(index, Instant::now());
                 self.hub_identify_selected()
             }
             HubMessage::IdentifySelected => self.hub_identify_selected(),
@@ -456,6 +540,9 @@ impl App {
                     Task::none()
                 } else if self.hub_state.apps_menu.is_some() {
                     self.hub_state.close_apps_menu();
+                    Task::none()
+                } else if self.hub_state.collapse_dock(Instant::now()) {
+                    self.play_ui_cue(UiSoundKind::Slide);
                     Task::none()
                 } else if self.hub_state.installing && !self.hub_state.cancelling {
                     self.cancel_engine_install()
@@ -657,24 +744,10 @@ impl App {
         Task::none()
     }
 
-    /// Keep the focused controller card inside the horizontal strip.
-    fn scroll_to_hub_controller(&self) -> Task<Message> {
-        if self.hub_state.focus != hub_view::HubFocus::Controllers {
-            return Task::none();
-        }
-        iced::widget::operation::scroll_to(
-            hub_view::controllers_scroll_id(),
-            iced::widget::operation::AbsoluteOffset {
-                x: hub_view::controller_scroll_x(self.hub_state.controller_focus, self.hub_stage.0),
-                y: 0.0,
-            },
-        )
-    }
-
     /// Pad tick while the hub is the modal owner. Only the chord (close) and
     /// selection/confirm are live; the app underneath gets nothing.
     pub(crate) fn on_hub_pad(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
-        if readings.is_empty() {
+        if self.hub_closing() || readings.is_empty() {
             return Task::none();
         }
         self.sync_hub_controllers();
@@ -713,7 +786,7 @@ impl App {
 
     /// Keyboard while the hub window has focus.
     pub(crate) fn on_hub_key(&mut self, raw: RawKey) -> Task<Message> {
-        if !raw.pressed {
+        if !raw.pressed || self.hub_closing() {
             return Task::none();
         }
         use iced::keyboard::Key;
