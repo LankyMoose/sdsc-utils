@@ -162,11 +162,11 @@ impl AppHub {
 use super::{App, Message};
 use crate::browser::keys::RawKey;
 use crate::ui::hub as hub_view;
+use crate::ui::launcher::gesture::ChordReleaseTick;
+use crate::ui::launcher::input as launcher_input;
 use crate::ui::layout::{
     MonitorCover, focus_window, overlay_platform_specific, primary_monitor_cover,
 };
-use crate::ui::start::gesture::ChordReleaseTick;
-use crate::ui::start::input as start_input;
 use iced::{Point, Size, Task, window};
 use std::time::Instant;
 
@@ -209,8 +209,8 @@ impl App {
         self.hub_stage = (cover.width, cover.height);
         self.hub_monitor_cover = Some(cover);
         self.hub_pending_show = true;
-        if self.start_visible {
-            self.start_hub_pause.get_or_insert_with(Instant::now);
+        if self.launcher_visible {
+            self.launcher_home_pause.get_or_insert_with(Instant::now);
         }
         let window_size = Size::new(cover.width, cover.height);
         let window_position = window::Position::Specific(Point::new(cover.x, cover.y));
@@ -269,7 +269,7 @@ impl App {
             self.hub_visible = false;
             self.hub_pending_show = false;
             self.hub_shell_anim = None;
-            self.resume_start_after_hub(now);
+            self.resume_launcher_after_home(now);
             return self.rehost_toast_after_composite();
         };
         if self.hub_pending_show {
@@ -293,7 +293,7 @@ impl App {
         self.hub_shell_anim = None;
         self.hub_pending_show = false;
         self.hub_visible = false;
-        self.resume_start_after_hub(now);
+        self.resume_launcher_after_home(now);
         let Some(id) = self.hub_window.take() else {
             return self.rehost_toast_after_composite();
         };
@@ -303,8 +303,8 @@ impl App {
         {
             return task.chain(focus_window(browser));
         }
-        if self.start_visible
-            && let Some(start) = self.start_window
+        if self.launcher_visible
+            && let Some(start) = self.launcher_window
         {
             return task.chain(focus_window(start));
         }
@@ -318,20 +318,20 @@ impl App {
 
     /// Shift frozen Start animation/idle stamps across the hub session so the
     /// splash art resumes where it left off instead of snapping ahead.
-    pub(crate) fn resume_start_after_hub(&mut self, now: Instant) {
-        let Some(paused_at) = self.start_hub_pause.take() else {
+    pub(crate) fn resume_launcher_after_home(&mut self, now: Instant) {
+        let Some(paused_at) = self.launcher_home_pause.take() else {
             return;
         };
         let pause = now.saturating_duration_since(paused_at);
         if pause.is_zero() {
             return;
         }
-        self.start_state.shift_animation_clock(paused_at, pause);
-        if self.start_last_activity <= paused_at {
-            self.start_last_activity += pause;
+        self.launcher_state.shift_animation_clock(paused_at, pause);
+        if self.launcher_last_activity <= paused_at {
+            self.launcher_last_activity += pause;
         }
-        if self.start_cursor_last_active <= paused_at {
-            self.start_cursor_last_active += pause;
+        if self.launcher_cursor_last_active <= paused_at {
+            self.launcher_cursor_last_active += pause;
         }
     }
 
@@ -704,9 +704,9 @@ impl App {
                     return Task::none();
                 }
                 crate::controller::hid::diag::diag_info("ui-diag: hub launch Start");
-                // Start and Browser are exclusive; `open_start_screen` closes
+                // Start and Browser are exclusive; `open_launcher` closes
                 // the Browser before showing Start.
-                self.close_hub().chain(self.open_start_screen())
+                self.close_hub().chain(self.open_launcher())
             }
             hub_view::HubTile::Browser => {
                 if self.browser.engine.is_none() {
@@ -761,7 +761,7 @@ impl App {
 
     /// Pad tick while the hub is the modal owner. Only the chord (close) and
     /// selection/confirm are live; the app underneath gets nothing.
-    pub(crate) fn on_hub_pad(&mut self, readings: &[start_input::NavReading]) -> Task<Message> {
+    pub(crate) fn on_hub_pad(&mut self, readings: &[launcher_input::NavReading]) -> Task<Message> {
         if self.hub_closing() || readings.is_empty() {
             return Task::none();
         }
@@ -820,7 +820,7 @@ impl App {
         };
         match message {
             Some(message) => {
-                self.note_start_activity();
+                self.note_launcher_activity();
                 self.on_hub_message(message)
             }
             None => Task::none(),
@@ -830,8 +830,8 @@ impl App {
     /// Shared PS chord detector for the hub. Mirrors the Start-era toggle:
     /// a rising chord fires once, and the release gate swallows the sticky
     /// hold that opened the hub.
-    pub(crate) fn hub_chord_fires(&mut self, readings: &[start_input::NavReading]) -> bool {
-        let required = crate::ui::start::gesture::default_gesture();
+    pub(crate) fn hub_chord_fires(&mut self, readings: &[launcher_input::NavReading]) -> bool {
+        let required = crate::ui::launcher::gesture::default_gesture();
         let chord_held = super::chord_held_on_any_pad(&required, readings);
         let now = Instant::now();
         let (tick, glitch) = self.chord_release_gate.tick(chord_held, now);

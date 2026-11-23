@@ -2,7 +2,7 @@
 //!
 //! AA/vsync are boot-only iced settings, so flipping them restarts the shell.
 //! To avoid losing the user's place, the restarting shell snapshots which
-//! windows were open (Start / Configure / popup), the Start selection keys,
+//! windows were open (Launcher / Configure / popup), the Launcher selection keys,
 //! list scroll offsets, drawer state, and the Configure section into
 //! `restart-ui.json`, then exits. The next boot consumes the file (only when
 //! fresh — see [`RESTART_UI_MAX_AGE_SECS`]) and reopens to the same state.
@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Maximum age of a restore record before it is ignored (seconds).
 pub const RESTART_UI_MAX_AGE_SECS: u64 = 120;
 
-/// Which Start slide was showing (`true` = Controllers).
+/// Which Launcher slide was showing (`true` = Controllers).
 fn default_false() -> bool {
     false
 }
@@ -30,12 +30,12 @@ fn default_false() -> bool {
 pub struct RestartUiState {
     /// Unix millis when captured (freshness gate).
     pub saved_at_ms: u64,
-    /// Start window was visible.
+    /// Launcher window was visible.
     #[serde(default = "default_false")]
-    pub start_visible: bool,
-    /// Legacy: Start's controllers surface was open (ignored; hub owns controllers).
+    pub launcher_visible: bool,
+    /// Legacy: Launcher's controllers surface was open (ignored; hub owns controllers).
     #[serde(default = "default_false")]
-    pub start_on_controllers: bool,
+    pub launcher_on_controllers: bool,
     /// Selected game / controller keys (re-resolved after rows rebuild).
     #[serde(default)]
     pub game_key: Option<String>,
@@ -48,7 +48,7 @@ pub struct RestartUiState {
     /// Tracked settings-drawer offset.
     #[serde(default)]
     pub settings_scroll_y: f32,
-    /// Start settings drawer was open + focused row.
+    /// Launcher settings drawer was open + focused row.
     #[serde(default = "default_false")]
     pub settings_open: bool,
     #[serde(default)]
@@ -118,8 +118,8 @@ mod tests {
     fn state() -> RestartUiState {
         RestartUiState {
             saved_at_ms: 1_000_000,
-            start_visible: true,
-            start_on_controllers: true,
+            launcher_visible: true,
+            launcher_on_controllers: true,
             game_key: Some("steam:440".into()),
             controller_key: None,
             game_index: Some(2),
@@ -138,8 +138,8 @@ mod tests {
     fn restart_ui_round_trips() {
         let encoded = serde_json::to_string(&state()).unwrap();
         let decoded: RestartUiState = serde_json::from_str(&encoded).unwrap();
-        assert!(decoded.start_visible);
-        assert!(decoded.start_on_controllers);
+        assert!(decoded.launcher_visible);
+        assert!(decoded.launcher_on_controllers);
         assert_eq!(decoded.game_key.as_deref(), Some("steam:440"));
         assert_eq!(decoded.game_index, Some(2));
         assert_eq!(decoded.settings_focus, 3);
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn older_records_default_new_fields() {
         let decoded: RestartUiState = serde_json::from_str(r#"{"saved_at_ms":1000}"#).unwrap();
-        assert!(!decoded.start_visible);
+        assert!(!decoded.launcher_visible);
         assert!(decoded.game_key.is_none());
         assert!(decoded.game_index.is_none());
         assert!(!decoded.settings_open);

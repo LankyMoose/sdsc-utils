@@ -13,7 +13,7 @@ use std::sync::LazyLock;
 // Surface seeds — change these to retheme chrome / panels / borders
 // ---------------------------------------------------------------------------
 
-/// Window chrome fill (Settings, Start, popup roots; toast card).
+/// Window chrome fill (Settings, Launcher, popup roots; toast card).
 pub const BASE_BG: Color = rgb(20, 22, 28);
 /// Mix toward black for inset content panels (start list, configure body, popup rows).
 const CONTENT_DARKEN: f32 = 0.20;
@@ -272,7 +272,7 @@ pub fn root(_theme: &Theme) -> container::Style {
 }
 
 /// Solid modal card shown over other content inside a window (manual add,
-/// replace confirm, compact Start settings). Opaque so text never fights the
+/// replace confirm, compact Launcher settings). Opaque so text never fights the
 /// content behind it; same radius language as glass islands, soft drop shadow.
 pub fn modal_card(_theme: &Theme) -> container::Style {
     container::Style {
@@ -292,7 +292,7 @@ pub fn modal_card(_theme: &Theme) -> container::Style {
     }
 }
 
-/// Floating dropdown panel over the Start settings list. Lifted just above
+/// Floating dropdown panel over the Launcher settings list. Lifted just above
 /// the base surface; same radius language and hairline, softer shadow than
 /// [`modal_card`].
 pub fn menu_panel(_theme: &Theme) -> container::Style {
@@ -533,7 +533,7 @@ pub fn position_rail(selected: bool) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
-/// Hairline under a window title bar (Settings, Start, Controllers popup).
+/// Hairline under a window title bar (Settings, Launcher, Controllers popup).
 pub fn configure_header_rule(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(LINE)),

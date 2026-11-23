@@ -1,9 +1,9 @@
 //! Top-level Browser app state.
 //!
-//! Phase 0 of the hub pivot lifts the browser out of `StartState`: the panel,
+//! Phase 0 of the hub pivot lifts the browser out of `LauncherState`: the panel,
 //! engine handle, capability flag, and browser-only D-pad stepper live here so
-//! the browser no longer disappears when the Start screen is not the owner.
-//! Behavior is unchanged — Start still renders the panel until the standalone
+//! the browser no longer disappears when the Launcher is not the owner.
+//! Behavior is unchanged — Launcher still renders the panel until the standalone
 //! Browser window lands. See `notes/browser-hub-pivot.md`.
 
 use crate::browser::engine::{EngineCommand, EngineHandle};
@@ -97,7 +97,7 @@ pub struct BrowserAppState {
     /// Page point the pending scroll belongs to (cursor at accumulation).
     pub pending_scroll_at: (f32, f32),
     /// Engine-mode D-pad cursor jumps run on this standalone stepper (fed a
-    /// stickless `dpad_only` mask): the Start bank stays parked in engine
+    /// stickless `dpad_only` mask): the Launcher bank stays parked in engine
     /// mode so stick moves never double-fire into both cursor and nav.
     pub dpad_stepper: NavStepper,
     /// Browser-window pad bank: face/bumper edges + reader nav. The engine
@@ -116,7 +116,7 @@ use super::Message;
 
 impl super::App {
     /// Browser-window message router. Phase 2 is moving the reducer here; the
-    /// methods still live beside the Start reducer until the move completes.
+    /// methods still live beside the Launcher reducer until the move completes.
     pub(crate) fn on_browser_message(
         &mut self,
         message: crate::ui::browser::BrowserMessage,
@@ -184,9 +184,9 @@ impl super::App {
             );
             return Task::none();
         }
-        // Start and Browser are mutually exclusive: opening one dismisses
+        // Launcher and Browser are mutually exclusive: opening one dismisses
         // the other rather than stacking two fullscreen apps.
-        let close_start = if self.start_visible {
+        let close_start = if self.launcher_visible {
             self.close_start_screen()
         } else {
             Task::none()
@@ -265,8 +265,8 @@ impl super::App {
         crate::controller::hid::diag::diag_info("ui-diag: browser window close");
         let close = iced::window::close(id);
         let task = task.chain(close);
-        if self.start_visible
-            && let Some(start) = self.start_window
+        if self.launcher_visible
+            && let Some(start) = self.launcher_window
         {
             return task.chain(crate::ui::layout::focus_window(start));
         }
@@ -388,7 +388,7 @@ impl super::App {
     /// routed before this, so the browser never sees hub presses.
     pub(crate) fn on_browser_pad(
         &mut self,
-        readings: &[crate::ui::start::input::NavReading],
+        readings: &[crate::ui::launcher::input::NavReading],
     ) -> Task<Message> {
         use crate::browser::cursor::JumpDir;
         use crate::domain::pad::NavAction;
@@ -429,7 +429,7 @@ impl super::App {
             let r3_down = readings.iter().any(|r| {
                 r.sample
                     .held
-                    .contains(&crate::ui::start::gesture::GestureControl::R3)
+                    .contains(&crate::ui::launcher::gesture::GestureControl::R3)
             });
             let latched = std::mem::replace(&mut self.browser.panel.r3_latched, r3_down);
             let flag = if r3_down && !latched {

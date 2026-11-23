@@ -416,7 +416,7 @@ pub struct State {
     pub focus: HubFocus,
     /// Whether the Start tile is enabled in prefs. Disabled tiles still show
     /// (stable layout) but Confirm is a no-op.
-    pub start_enabled: bool,
+    pub launcher_enabled: bool,
     /// Engine worker live. Drives the Browser tile state.
     pub engine_ready: bool,
     /// D-pad/stick repeat for hub movement.
@@ -505,7 +505,7 @@ impl Default for State {
         Self {
             selected: 0,
             focus: HubFocus::Apps,
-            start_enabled: true,
+            launcher_enabled: true,
             engine_ready: false,
             nav: crate::domain::pad::NavStepper::default(),
             prev_cross: false,
@@ -847,15 +847,15 @@ impl State {
 
     pub fn tile_enabled(&self, tile: HubTile) -> bool {
         match tile {
-            HubTile::Start => self.start_enabled,
+            HubTile::Start => self.launcher_enabled,
             HubTile::Browser => true,
         }
     }
 
     /// Reset edge latches and movement repeat when the hub is opened, so a
     /// held button from the opening gesture cannot fire immediately.
-    pub fn on_open(&mut self, start_enabled: bool, engine_ready: bool) {
-        self.start_enabled = start_enabled;
+    pub fn on_open(&mut self, launcher_enabled: bool, engine_ready: bool) {
+        self.launcher_enabled = launcher_enabled;
         self.engine_ready = engine_ready;
         self.nav = crate::domain::pad::NavStepper::default();
         self.prev_cross = false;
@@ -2181,7 +2181,7 @@ fn tile_button<'a>(
     let selected = state.focus == HubFocus::Apps && state.selected() == index;
     let interactive = state.tile_enabled(tile);
     let dim = match tile {
-        HubTile::Start => !state.start_enabled,
+        HubTile::Start => !state.launcher_enabled,
         HubTile::Browser => !state.engine_ready,
     };
     let (icon, title) = tile_copy(tile);

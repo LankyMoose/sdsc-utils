@@ -103,7 +103,7 @@ impl Drop for ThreadQuitGuard {
 
 /// Mark `hwnd` as non-activating and optionally pin it above other apps.
 ///
-/// Toast stays topmost so it clears Cursor / games. When Settings / Start /
+/// Toast stays topmost so it clears Cursor / games. When Settings / Launcher /
 /// popup are open, raise those HWNDs into the same topmost band *after* the
 /// toast (see [`raise_topmost`]) so they keep presents (iced#3108 / #3320).
 ///

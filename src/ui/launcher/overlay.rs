@@ -21,8 +21,8 @@
 //! Neither ever translates. The wash fade always plays, including under
 //! reduced motion (which snaps progress, so both settle instantly).
 
+use crate::ui::launcher::view::LauncherMessage;
 use crate::ui::motion::ease_out_cubic;
-use crate::ui::start::view::StartMessage;
 use crate::ui::theme;
 use iced::{Alignment, Element, Fill, Length};
 use std::time::Instant;
@@ -101,7 +101,7 @@ pub fn tween_settle(anim: &mut Option<Tween>, now: Instant) -> bool {
 
 /// Full-bleed darken wash. `dismiss` fires on press (backdrop click
 /// cancels, matching the pad Cancel path).
-pub fn wash(amount: f32, dismiss: StartMessage) -> Element<'static, StartMessage> {
+pub fn wash(amount: f32, dismiss: LauncherMessage) -> Element<'static, LauncherMessage> {
     use iced::widget::{container, mouse_area, space};
     mouse_area(
         container(space())
@@ -118,21 +118,21 @@ pub fn wash(amount: f32, dismiss: StartMessage) -> Element<'static, StartMessage
 /// whose inner column already fixes content width (the card hugs it plus
 /// padding); `max_height` caps tall forms.
 pub fn dialog_card<'a>(
-    content: impl Into<Element<'a, StartMessage>>,
+    content: impl Into<Element<'a, LauncherMessage>>,
     width: Length,
     max_height: Option<f32>,
-) -> Element<'a, StartMessage> {
+) -> Element<'a, LauncherMessage> {
     dialog_card_padded(content, width, max_height, 24.0)
 }
 
 /// [`dialog_card`] with explicit padding (the browser card sits tight at
 /// ~4px around its surface).
 pub fn dialog_card_padded<'a>(
-    content: impl Into<Element<'a, StartMessage>>,
+    content: impl Into<Element<'a, LauncherMessage>>,
     width: Length,
     max_height: Option<f32>,
     padding: f32,
-) -> Element<'a, StartMessage> {
+) -> Element<'a, LauncherMessage> {
     use iced::widget::container;
     let card = container(content)
         .width(width)
@@ -147,15 +147,17 @@ pub fn dialog_card_padded<'a>(
 /// Click shield: absorbs presses over the card so they never reach the
 /// live stage behind the dialog. `absorb` is an inert message.
 pub fn click_shield<'a>(
-    content: impl Into<Element<'a, StartMessage>>,
-    absorb: StartMessage,
-) -> Element<'a, StartMessage> {
+    content: impl Into<Element<'a, LauncherMessage>>,
+    absorb: LauncherMessage,
+) -> Element<'a, LauncherMessage> {
     use iced::widget::mouse_area;
     mouse_area(content.into()).on_press(absorb).into()
 }
 
 /// Center `content` in the window (both axes).
-pub fn centered<'a>(content: impl Into<Element<'a, StartMessage>>) -> Element<'a, StartMessage> {
+pub fn centered<'a>(
+    content: impl Into<Element<'a, LauncherMessage>>,
+) -> Element<'a, LauncherMessage> {
     use iced::widget::container;
     container(content)
         .width(Fill)
@@ -181,7 +183,7 @@ pub fn dialog_text<'a>(
     subtitle: String,
     title_size: f32,
     subtitle_size: f32,
-) -> Element<'a, StartMessage> {
+) -> Element<'a, LauncherMessage> {
     use iced::widget::{column, text};
     column![
         text(title).size(title_size).color(theme::INK),

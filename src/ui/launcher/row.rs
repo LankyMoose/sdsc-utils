@@ -1,6 +1,6 @@
 //! Shared strip widgets: update badge and subtitle block.
 
-use crate::ui::start::view::{StartMessage, StartSubtitle};
+use crate::ui::launcher::view::{LauncherMessage, LauncherSubtitle};
 use crate::ui::theme;
 use iced::font::Weight;
 use iced::widget::text::Wrapping;
@@ -12,7 +12,7 @@ pub(crate) fn update_required_badge(
     selected: bool,
     muted: bool,
     fade: f32,
-) -> Element<'static, StartMessage> {
+) -> Element<'static, LauncherMessage> {
     let fade = fade.clamp(0.0, 1.0);
     let a = if muted { 0.55 * fade } else { fade };
     let label_size = if selected { 13.0 } else { 11.0 };
@@ -52,21 +52,21 @@ pub(crate) fn update_required_badge(
 /// `align` places the block inside its column: centered for horizontal
 /// in-slot text, start-aligned for the vertical side column.
 pub(crate) fn game_subtitle_block<'a>(
-    subtitle: &'a StartSubtitle,
+    subtitle: &'a LauncherSubtitle,
     value_color: Color,
     label_color: Color,
     value_size: f32,
     align: Alignment,
-) -> Element<'a, StartMessage> {
+) -> Element<'a, LauncherMessage> {
     match subtitle {
-        StartSubtitle::Plain(plain) => text(plain.as_str())
+        LauncherSubtitle::Plain(plain) => text(plain.as_str())
             .size(value_size)
             .color(value_color)
             .wrapping(Wrapping::Word)
             .width(Fill)
             .align_x(align)
             .into(),
-        StartSubtitle::Labeled(lines) => {
+        LauncherSubtitle::Labeled(lines) => {
             let mut col = column![].spacing(2).width(Fill).align_x(align);
             for line in lines {
                 col = col.push(

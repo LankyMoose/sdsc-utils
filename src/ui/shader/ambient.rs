@@ -239,7 +239,7 @@ pub fn ambient_tick_dt() -> f32 {
 
 /// Ambient seconds for `elapsed` wall-clock (per-frame capped, debug
 /// `time_scale` applied). Tick drivers must advance by this — never by fixed
-/// steps per call: StartFrame (60Hz) and report-rate pad edges share
+/// steps per call: LauncherFrame (60Hz) and report-rate pad edges share
 /// `tick_anim`, so per-call steps fast-forward time whenever edges outnumber
 /// frames (~4ms sample path while hot).
 pub fn ambient_dt_for_elapsed(elapsed: Duration) -> f32 {

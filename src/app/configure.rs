@@ -32,10 +32,10 @@ use crate::ui::configure::{
     self as configure_view, AnalyticsPadRow, AnalyticsPanel, ConfigureMessage, ConfigureSettings,
     NotificationSetting, Section,
 };
-use crate::ui::layout::{focus_window, open_visible, window_platform_specific};
 #[cfg(debug_assertions)]
-use crate::ui::start::gesture;
-use crate::ui::start::input::{self as start_input, NavAction};
+use crate::ui::launcher::gesture;
+use crate::ui::launcher::input::{self as launcher_input, NavAction};
+use crate::ui::layout::{focus_window, open_visible, window_platform_specific};
 use iced::widget::operation;
 use iced::{Size, Task, window};
 #[cfg(debug_assertions)]
@@ -66,9 +66,9 @@ impl App {
             lightbar_enabled: self.session.prefs.lightbar_enabled,
             start_screen_enabled: self.session.prefs.start_screen_enabled,
             start_screen_auto_open: self.session.prefs.start_screen_auto_open,
-            start_screen_immersive_layout: self.session.prefs.start_screen_immersive_layout,
-            start_screen_clock_enabled: self.session.prefs.start_screen_clock_enabled,
-            start_screen_navbar: self.session.prefs.start_screen_navbar,
+            launcher_immersive_layout: self.session.prefs.launcher_immersive_layout,
+            launcher_clock_enabled: self.session.prefs.launcher_clock_enabled,
+            launcher_navbar: self.session.prefs.launcher_navbar,
             reduced_motion: self.session.prefs.reduced_motion,
             perf_throttle_immersive: self.session.prefs.perf_throttle_immersive,
             perf_antialiasing: self.session.prefs.perf_antialiasing,
@@ -80,9 +80,9 @@ impl App {
                 self.renderer_boot_vsync,
             ),
             perf_reload_queued: self.renderer_reload_queued,
-            start_screen_inactive_secs: self.session.prefs.start_screen_inactive_secs,
-            start_screen_sleep_secs: self.session.prefs.start_screen_sleep_secs,
-            start_screen_inactive_dim_percent: self.session.prefs.start_screen_inactive_dim_percent,
+            launcher_inactive_secs: self.session.prefs.launcher_inactive_secs,
+            launcher_sleep_secs: self.session.prefs.launcher_sleep_secs,
+            launcher_inactive_dim_percent: self.session.prefs.launcher_inactive_dim_percent,
             start_screen_sounds_enabled: self.session.prefs.start_screen_sounds_enabled,
             start_screen_sound_volume: self.session.prefs.start_screen_sound_volume,
             start_screen_haptics_enabled: self.session.prefs.start_screen_haptics_enabled,
@@ -183,7 +183,7 @@ impl App {
     }
 
     /// Debug-only standalone ambient preview (Diagnostics "View immersive"):
-    /// immersive-rate background in its own window, no Start required.
+    /// immersive-rate background in its own window, no Launcher required.
     #[cfg(debug_assertions)]
     pub(crate) fn open_ambient_preview(&mut self) -> Task<Message> {
         if let Some(id) = self.preview_window {
@@ -225,10 +225,10 @@ impl App {
                 );
                 if section == Section::PadInput {
                     match self.input_hub.read() {
-                        start_input::NavReadingsOutcome::Readings { readings, .. } => {
+                        launcher_input::NavReadingsOutcome::Readings { readings, .. } => {
                             self.apply_pad_input_panel_from_readings(&readings);
                         }
-                        start_input::NavReadingsOutcome::Missing { .. } => {
+                        launcher_input::NavReadingsOutcome::Missing { .. } => {
                             self.apply_pad_input_panel_from_readings(&[]);
                         }
                     }
@@ -312,7 +312,7 @@ impl App {
                     if self.hub_visible {
                         task = task.chain(self.close_hub());
                     }
-                    if self.start_visible {
+                    if self.launcher_visible {
                         task = task.chain(self.close_start_screen());
                     }
                     return task;
@@ -322,16 +322,12 @@ impl App {
             ConfigureMessage::SetStartScreenAutoOpen(enabled) => {
                 self.apply_start_screen_auto_open(enabled)
             }
-            ConfigureMessage::SetStartScreenClock(enabled) => {
-                self.apply_start_screen_clock(enabled)
-            }
+            ConfigureMessage::SetStartScreenClock(enabled) => self.apply_launcher_clock(enabled),
             ConfigureMessage::SetImmersiveLayout(layout) => {
-                self.apply_start_screen_immersive_layout(layout)
+                self.apply_launcher_immersive_layout(layout)
             }
-            ConfigureMessage::SetNavbarVisibility(navbar) => self.apply_start_screen_navbar(navbar),
-            ConfigureMessage::SetReducedMotion(mode) => {
-                self.apply_start_screen_reduced_motion(mode)
-            }
+            ConfigureMessage::SetNavbarVisibility(navbar) => self.apply_launcher_navbar(navbar),
+            ConfigureMessage::SetReducedMotion(mode) => self.apply_launcher_reduced_motion(mode),
             ConfigureMessage::SetPerfThrottleImmersive(enabled) => {
                 self.apply_perf_throttle_immersive(enabled)
             }
@@ -339,13 +335,11 @@ impl App {
             ConfigureMessage::SetPerfVsync(enabled) => self.apply_perf_vsync(enabled),
             ConfigureMessage::ReloadUi => self.reload_ui_for_renderer(),
             ConfigureMessage::SetStartScreenInactiveSecs(secs) => {
-                self.apply_start_screen_inactive_secs(secs)
+                self.apply_launcher_inactive_secs(secs)
             }
-            ConfigureMessage::SetStartScreenSleepSecs(secs) => {
-                self.apply_start_screen_sleep_secs(secs)
-            }
+            ConfigureMessage::SetStartScreenSleepSecs(secs) => self.apply_launcher_sleep_secs(secs),
             ConfigureMessage::SetStartScreenInactiveDimPercent(percent) => {
-                self.apply_start_screen_inactive_dim_percent(percent)
+                self.apply_launcher_inactive_dim_percent(percent)
             }
             ConfigureMessage::SetStartScreenSounds(enabled) => self.apply_ui_sounds(enabled),
             ConfigureMessage::SetStartScreenSoundVolume(volume) => {
@@ -410,105 +404,105 @@ impl App {
             ConfigureMessage::SetDebugAmbientFreq(v) => {
                 self.debug_ambient_freq = v.clamp(0.0, 5.0);
                 crate::ui::shader::ambient::set_pulse_freq(self.debug_ambient_freq);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugAmbientVeilFreq(v) => {
                 self.debug_ambient_veil_freq = v.clamp(0.0, 8.0);
                 crate::ui::shader::ambient::set_veil_freq(self.debug_ambient_veil_freq);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugAmbientPulseMin(v) => {
                 self.debug_ambient_pulse_min = v.clamp(0.0, 0.6);
                 crate::ui::shader::ambient::set_pulse_min(self.debug_ambient_pulse_min);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugAmbientPulseMax(v) => {
                 self.debug_ambient_pulse_max = v.clamp(0.0, 0.6);
                 crate::ui::shader::ambient::set_pulse_max(self.debug_ambient_pulse_max);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugAmbientOrbSpeed(v) => {
                 self.debug_ambient_orb_speed = v.clamp(0.0, 3.0);
                 crate::ui::shader::ambient::set_orb_speed(self.debug_ambient_orb_speed);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugAmbientGlowHue(v) => {
                 self.debug_ambient_glow_hue = v.clamp(0.0, 360.0);
                 crate::ui::shader::ambient::set_glow_hue(self.debug_ambient_glow_hue);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugAmbientOrbMinX(v) => {
                 self.debug_ambient_orb_min_x = v.clamp(-1.0, 1.0);
                 crate::ui::shader::ambient::set_orb_min_x(self.debug_ambient_orb_min_x);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugAmbientOrbMaxX(v) => {
                 self.debug_ambient_orb_max_x = v.clamp(-1.0, 1.0);
                 crate::ui::shader::ambient::set_orb_max_x(self.debug_ambient_orb_max_x);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugAmbientOrbMinY(v) => {
                 self.debug_ambient_orb_min_y = v.clamp(-1.0, 1.0);
                 crate::ui::shader::ambient::set_orb_min_y(self.debug_ambient_orb_min_y);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugAmbientOrbMaxY(v) => {
                 self.debug_ambient_orb_max_y = v.clamp(-1.0, 1.0);
                 crate::ui::shader::ambient::set_orb_max_y(self.debug_ambient_orb_max_y);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugAmbientGrain(v) => {
                 self.debug_ambient_grain = v.clamp(0.0, 5.0);
                 crate::ui::shader::ambient::set_grain_gain(self.debug_ambient_grain);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugAmbientTimeScale(v) => {
                 self.debug_ambient_time_scale = v.clamp(0.0, 4.0);
                 crate::ui::shader::ambient::set_time_scale(self.debug_ambient_time_scale);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugKenburnsAmp(v) => {
                 self.debug_kenburns_amp = v.clamp(0.0, 5.0);
-                crate::ui::start::mode::set_kenburns_amp_scale(self.debug_kenburns_amp);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                crate::ui::launcher::mode::set_kenburns_amp_scale(self.debug_kenburns_amp);
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugKenburnsPan(v) => {
                 self.debug_kenburns_pan = v.clamp(0.0, 5.0);
-                crate::ui::start::mode::set_kenburns_pan_scale(self.debug_kenburns_pan);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                crate::ui::launcher::mode::set_kenburns_pan_scale(self.debug_kenburns_pan);
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
             ConfigureMessage::SetDebugKenburnsSpeed(v) => {
                 self.debug_kenburns_speed = v.clamp(0.0, 8.0);
-                crate::ui::start::mode::set_kenburns_speed(self.debug_kenburns_speed);
-                self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+                crate::ui::launcher::mode::set_kenburns_speed(self.debug_kenburns_speed);
+                self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
                 Task::none()
             }
             #[cfg(debug_assertions)]
@@ -612,7 +606,7 @@ impl App {
     }
 
     /// True while any debug ambient/ken-burns tuning differs from shipped
-    /// behavior (drives the Start keep-alive so tuning repaints under idle
+    /// behavior (drives the Launcher keep-alive so tuning repaints under idle
     /// throttle). Local only.
     #[cfg(debug_assertions)]
     pub(crate) fn debug_tuning_active(&self) -> bool {
@@ -678,8 +672,8 @@ impl App {
         self.debug_kenburns_pan = defaults.kenburns_pan;
         self.debug_kenburns_speed = defaults.kenburns_speed;
         crate::ui::shader::ambient::reset_ambient_tuning();
-        crate::ui::start::mode::reset_kenburns_tuning();
-        self.start_state.ambient_tuning_keepalive = false;
+        crate::ui::launcher::mode::reset_kenburns_tuning();
+        self.launcher_state.ambient_tuning_keepalive = false;
     }
 
     /// Apply one absolute tuning commit from the in-immersive tuning panel
@@ -690,10 +684,10 @@ impl App {
     #[cfg(debug_assertions)]
     pub(crate) fn apply_ambient_tune(
         &mut self,
-        param: crate::ui::start::ambient_tune::AmbientTuneParam,
+        param: crate::ui::launcher::ambient_tune::AmbientTuneParam,
         value: f32,
     ) -> Task<Message> {
-        use crate::ui::start::ambient_tune::AmbientTuneParam as P;
+        use crate::ui::launcher::ambient_tune::AmbientTuneParam as P;
         match param {
             P::PulseFreq => {
                 self.debug_ambient_freq = value.clamp(0.0, 5.0);
@@ -744,7 +738,7 @@ impl App {
                 crate::ui::shader::ambient::set_time_scale(self.debug_ambient_time_scale);
             }
         }
-        self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+        self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
         Task::none()
     }
 
@@ -752,9 +746,9 @@ impl App {
     #[cfg(debug_assertions)]
     pub(crate) fn open_ambient_tuning(&mut self) -> Task<Message> {
         self.ambient_r3_latched = false;
-        self.start_state.request_ambient_tuning(true);
-        self.start_state.request_settings(false, Instant::now());
-        crate::controller::hid::diag::diag_info("ui-diag: start ambient tuning open");
+        self.launcher_state.request_ambient_tuning(true);
+        self.launcher_state.request_settings(false, Instant::now());
+        crate::controller::hid::diag::diag_info("ui-diag: launcher ambient tuning open");
         Task::none()
     }
 
@@ -762,11 +756,11 @@ impl App {
     #[cfg(debug_assertions)]
     pub(crate) fn close_ambient_tuning(&mut self, reopen_drawer: bool) -> Task<Message> {
         self.ambient_r3_latched = false;
-        self.start_state.request_ambient_tuning(false);
+        self.launcher_state.request_ambient_tuning(false);
         if reopen_drawer {
-            self.start_state.request_settings(true, Instant::now());
+            self.launcher_state.request_settings(true, Instant::now());
         }
-        crate::controller::hid::diag::diag_info("ui-diag: start ambient tuning close");
+        crate::controller::hid::diag::diag_info("ui-diag: launcher ambient tuning close");
         Task::none()
     }
 
@@ -776,9 +770,9 @@ impl App {
     #[cfg(debug_assertions)]
     pub(crate) fn toggle_ambient_chrome_from_r3(
         &mut self,
-        readings: &[start_input::NavReading],
+        readings: &[launcher_input::NavReading],
     ) -> Option<Task<Message>> {
-        if !self.start_visible || !self.start_state.ambient_tuning_active() {
+        if !self.launcher_visible || !self.launcher_state.ambient_tuning_active() {
             return None;
         }
         let held = readings
@@ -786,10 +780,11 @@ impl App {
             .any(|r| r.sample.held.contains(&gesture::GestureControl::R3));
         if held && !self.ambient_r3_latched {
             self.ambient_r3_latched = true;
-            self.start_state.ambient_tune_hide_chrome = !self.start_state.ambient_tune_hide_chrome;
+            self.launcher_state.ambient_tune_hide_chrome =
+                !self.launcher_state.ambient_tune_hide_chrome;
             crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: start ambient chrome hidden={}",
-                self.start_state.ambient_tune_hide_chrome as u8
+                "ui-diag: launcher ambient chrome hidden={}",
+                self.launcher_state.ambient_tune_hide_chrome as u8
             ));
             self.play_ui_cue(UiSoundKind::Nav);
             return Some(Task::none());
@@ -803,20 +798,20 @@ impl App {
     /// Scroll the tuning list to keep the focused row in view.
     #[cfg(debug_assertions)]
     pub(crate) fn scroll_ambient_tune_into_view(&self) -> Task<Message> {
-        use crate::ui::start::ambient_tune::{TuneRow, tune_reveal_y};
+        use crate::ui::launcher::ambient_tune::{TuneRow, tune_reveal_y};
         let focus = self
-            .start_state
+            .launcher_state
             .ambient_tune_focus
             .min(TuneRow::count().saturating_sub(1));
         let Some(y) = tune_reveal_y(
             focus,
-            self.start_state.ambient_tune_scroll_y,
-            self.start_state.ambient_tune_viewport_h,
+            self.launcher_state.ambient_tune_scroll_y,
+            self.launcher_state.ambient_tune_viewport_h,
         ) else {
             return Task::none();
         };
         operation::scroll_to(
-            crate::ui::start::ambient_tune::tune_scroll_id(),
+            crate::ui::launcher::ambient_tune::tune_scroll_id(),
             operation::AbsoluteOffset {
                 x: None,
                 y: Some(y),
@@ -831,20 +826,20 @@ impl App {
     pub(crate) fn on_ambient_tuning_nav(&mut self, action: Option<NavAction>) -> Task<Message> {
         #[cfg(debug_assertions)]
         {
-            use crate::ui::start::ambient_tune::TuneRow;
+            use crate::ui::launcher::ambient_tune::TuneRow;
             let Some(action) = action else {
                 return Task::none();
             };
             match action {
                 NavAction::Up => {
-                    if self.start_state.move_ambient_tune_focus(-1) {
+                    if self.launcher_state.move_ambient_tune_focus(-1) {
                         self.play_ui_cue(UiSoundKind::Nav);
                         return self.scroll_ambient_tune_into_view();
                     }
                     Task::none()
                 }
                 NavAction::Down => {
-                    if self.start_state.move_ambient_tune_focus(1) {
+                    if self.launcher_state.move_ambient_tune_focus(1) {
                         self.play_ui_cue(UiSoundKind::Nav);
                         return self.scroll_ambient_tune_into_view();
                     }
@@ -856,7 +851,7 @@ impl App {
                 }
                 NavAction::Confirm => {
                     let focus = self
-                        .start_state
+                        .launcher_state
                         .ambient_tune_focus
                         .min(TuneRow::count().saturating_sub(1));
                     match TuneRow::ALL[focus] {
@@ -1016,14 +1011,14 @@ impl App {
         let fleet = self.emulated_pads.clone();
         let find = |serial: &Serial| fleet.iter().find(|p| p.serial() == serial).cloned();
 
-        // `publish` runs the normal connect/disconnect path (toasts, Start-open
+        // `publish` runs the normal connect/disconnect path (toasts, Launcher-open
         // policy, analytics edges); `analytics` covers the charge/drain walk.
         let (next_fleet, publish, analytics) = match &command {
             EmulatorCommand::AddPad => {
                 let pad = emulate::new_pad(&fleet, emulate::DEFAULT_PERCENT, Connection::Bluetooth);
                 let mut next = fleet.clone();
                 next.push(pad);
-                // Remembered but disconnected: no toast, no Start window.
+                // Remembered but disconnected: no toast, no Launcher window.
                 (next, false, false)
             }
             EmulatorCommand::RemovePad(serial) => {
@@ -1037,7 +1032,7 @@ impl App {
                 (next, true, false)
             }
             // Preview repaints the tab only. Publishing is debounced so a drag
-            // cannot spam toasts or Start opens — but only for a *connected*
+            // cannot spam toasts or Launcher opens — but only for a *connected*
             // pad, since a disconnected one is not published at all.
             EmulatorCommand::PreviewPercent(serial, percent) => {
                 let next = emulate::set_percent(&fleet, serial, *percent);

@@ -2,7 +2,7 @@
 //!
 //! iced owns the real Device; we cannot install its uncaptured-error handler without a
 //! fork. We enumerate adapters at boot and stamp UI lifecycle timestamps so a
-//! `create_renderer` / atlas panic log can be correlated with toast/Start phase.
+//! `create_renderer` / atlas panic log can be correlated with toast/Launcher phase.
 
 use crate::platform::app_log;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

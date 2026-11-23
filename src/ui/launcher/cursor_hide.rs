@@ -1,4 +1,4 @@
-//! Force `mouse::Interaction::Hidden` over the Start tree (idle immersive hide).
+//! Force `mouse::Interaction::Hidden` over the Launcher tree (idle immersive hide).
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer;

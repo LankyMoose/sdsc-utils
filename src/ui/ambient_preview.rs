@@ -1,9 +1,9 @@
 //! Standalone ambient preview window (debug-only Diagnostics "View immersive").
 //!
 //! Renders the same [`AmbientProgram`](crate::ui::shader::AmbientProgram)
-//! uniforms as immersive Start (`dock_progress` 0, `veil` 0, `aperture` 1)
+//! uniforms as immersive Launcher (`dock_progress` 0, `veil` 0, `aperture` 1)
 //! on its own 60Hz clock, so Diagnostics tuning previews at the exact
-//! immersive speed without opening the Start window. Utility windows stay on
+//! immersive speed without opening the Launcher window. Utility windows stay on
 //! their slow drift; this window is the tuning-speed reference.
 //!
 //! The clock only advances while the preview window is open (the shell
@@ -22,11 +22,11 @@ pub const WIDTH: f32 = 960.0;
 /// Preview window logical size.
 pub const HEIGHT: f32 = 600.0;
 
-/// Preview tick cadence: 60Hz, matching immersive `StartFrame`, so motion
+/// Preview tick cadence: 60Hz, matching immersive `LauncherFrame`, so motion
 /// runs at the exact immersive speed.
 pub const PREVIEW_TICK: Duration = Duration::from_millis(16);
 
-/// Starting phase: matches immersive Start's first frame (`ambient_time`
+/// Starting phase: matches immersive Launcher's first frame (`ambient_time`
 /// starts at 0).
 const START_PHASE: f32 = 0.0;
 
@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn preview_tick_runs_at_immersive_cadence() {
-        // Same 60Hz cadence as immersive `StartFrame`.
+        // Same 60Hz cadence as immersive `LauncherFrame`.
         assert_eq!(PREVIEW_TICK, Duration::from_millis(16));
     }
 

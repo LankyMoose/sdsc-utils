@@ -59,7 +59,7 @@ fn is_ignored_url(url: &str) -> bool {
 /// Browser surface state. Pure data: the iced view owns the URL
 /// draft and scroll offset, this owns load lifecycle with a generation
 /// counter so late worker results are ignored after suspend/close —
-/// the same stale-generation discipline as the Start art worker.
+/// the same stale-generation discipline as the Launcher art worker.
 #[derive(Debug, Clone, Default)]
 pub struct BrowserSession {
     open: bool,

@@ -25,7 +25,7 @@ pub struct ToastMessage {
     pub serial: Serial,
     pub accent: Rgb,
     pub trailing: ToastTrailing,
-    /// Latched at queue time (0→1 Connected → open Start after rest).
+    /// Latched at queue time (0→1 Connected → open Launcher after rest).
     pub after: AfterToast,
 }
 
@@ -256,7 +256,7 @@ mod tests {
         let mut latched = queued("aa", "Connected", 15);
         latched.after = AfterToast::OpenHub;
         ToastMessage::enqueue(&mut queue, latched);
-        // Unlatched duplicate usurps but must not drop the Start latch.
+        // Unlatched duplicate usurps but must not drop the Launcher latch.
         ToastMessage::enqueue(&mut queue, queued("aa", "Connected", 25));
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].after, AfterToast::OpenHub);

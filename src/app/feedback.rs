@@ -1,6 +1,6 @@
 //! Shared UI feedback: sounds, haptics, and the settings that control them.
 //!
-//! Start, Browser, Configure, and the PS hub all route cues through these
+//! Launcher, Browser, Configure, and the PS hub all route cues through these
 //! methods so the hub-shell preferences apply globally. On-disk keys keep
 //! their historical `start_screen_*` names for compatibility.
 

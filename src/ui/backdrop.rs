@@ -1,6 +1,6 @@
 //! Slow-drift atmosphere for utility windows (popup, Settings).
 //!
-//! Same shader as immersive Start ([`AmbientProgram`]) but with **slow time**:
+//! Same shader as immersive Launcher ([`AmbientProgram`]) but with **slow time**:
 //! the shell nudges a process-wide utility clock at [`UTILITY_TICK`] (≤2fps)
 //! running at [`UTILITY_TIME_RATE`] of real time, so the accent-bloom breath
 //! and grain crawl instead of pulsing — a barely-there drift, not immersive
@@ -10,7 +10,7 @@
 //!
 //! The clock only advances while a utility window is actually visible: the
 //! shell subscribes to the slow tick solely when the popup, Settings, or a
-//! non-immersive Start window exists, so hidden/idle windows never tick and
+//! non-immersive Launcher window exists, so hidden/idle windows never tick and
 //! never redraw. Toasts are excluded — the toast window uses its own
 //! transparent theme and never renders this backdrop.
 //!
@@ -26,7 +26,7 @@ use std::time::Duration;
 
 /// Starting ambient phase. In `ambient.wgsl`, time only drives the accent-bloom
 /// breath and grain; `t = 0` holds the breath exactly mid-swing and matches
-/// immersive Start's first frame (`ambient_time` starts at 0), so a freshly
+/// immersive Launcher's first frame (`ambient_time` starts at 0), so a freshly
 /// opened utility window looks like a still of the same atmosphere before
 /// the slow drift carries it.
 pub const FROZEN_TIME: f32 = 0.0;

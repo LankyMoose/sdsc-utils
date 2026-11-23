@@ -1,4 +1,4 @@
-//! Center-top clock widget for immersive Start.
+//! Center-top clock widget for immersive Launcher.
 //!
 //! On Windows the widget uses the user's system locale time format
 //! (`GetTimeFormatW` with the user locale, no seconds), so 12h vs 24h,
@@ -7,7 +7,7 @@
 //! Updates whenever immersive redraws (which ticks continuously).
 
 use crate::platform::host::Host;
-use crate::ui::start::position::{local_utc_offset_secs, now_ms};
+use crate::ui::launcher::position::{local_utc_offset_secs, now_ms};
 
 /// Format 24h hour/minute as 12h `h:mm am/pm` (no leading zero on the hour,
 /// matching system clocks). Midnight and noon render as 12.

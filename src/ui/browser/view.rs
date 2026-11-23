@@ -1,6 +1,6 @@
 //! Standalone Browser window rendering.
 //!
-//! Moved out of the Start view in pivot phase 2. The panel state lives in
+//! Moved out of the Launcher view in pivot phase 2. The panel state lives in
 //! `ui::browser::state`; this module owns the chrome/page/cursor composition
 //! and the browser-facing message vocabulary.
 
@@ -197,10 +197,12 @@ pub fn browser_page_view(
         // One stable GPU texture per tab, uploaded on unseen generations
         // only. Never mint a per-frame image handle: the atlas cache misses
         // by construction and the page blinks at large viewports.
-        return iced::widget::shader(crate::ui::start::browser_frame::BrowserFrameProgram::new(
-            std::sync::Arc::clone(session.frame_slot()),
-            panel.active_tab.0,
-        ))
+        return iced::widget::shader(
+            crate::ui::launcher::browser_frame::BrowserFrameProgram::new(
+                std::sync::Arc::clone(session.frame_slot()),
+                panel.active_tab.0,
+            ),
+        )
         .width(Length::Fixed(page_w))
         .height(Length::Fixed(page_h))
         .into();
@@ -718,7 +720,7 @@ pub fn fullscreen_layout(stage_w: f32, stage_h: f32) -> (f32, f32) {
 }
 
 /// Standalone Browser window root. Fills the window with the browser surface
-/// (opaque background; no Start stage behind it).
+/// (opaque background; no Launcher stage behind it).
 pub fn root_view(
     panel: &BrowserPanel,
     engine_available: bool,

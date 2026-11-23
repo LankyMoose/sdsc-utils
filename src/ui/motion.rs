@@ -1,6 +1,6 @@
 //! Shared motion vocabulary: easing curves, frame-dt cap, and standard durations.
 //!
-//! Immersive Start established the feel (ease-in-out veils, ease-out reveals,
+//! Immersive Launcher established the feel (ease-in-out veils, ease-out reveals,
 //! a 32 ms per-frame cap so a UI stall cannot skip the start of a curve). Every
 //! animated surface should build on these instead of re-deriving them.
 //!

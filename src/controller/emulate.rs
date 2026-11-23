@@ -3,7 +3,7 @@
 //! The emulator owns a **fleet**: every pad it knows about, whether or not it
 //! is currently plugged in. Only connected pads are published as the live
 //! controller snapshot, so toggling a pad runs the ordinary connect/disconnect
-//! path — toasts, Start-open policy, analytics edges — while disconnected pads
+//! path — toasts, Launcher-open policy, analytics edges — while disconnected pads
 //! stay remembered like any other pad the app has seen.
 //!
 //! Serials are prefixed [`SERIAL_PREFIX`] so HID frames, analytics, and the
@@ -91,7 +91,7 @@ pub fn state_for(connection: Connection, percent: u8) -> PowerState {
 /// from the link.
 ///
 /// Starts **disconnected**: a fresh pad is remembered but not live, so it does
-/// not fire a connect toast or open Start until you switch it on.
+/// not fire a connect toast or open Launcher until you switch it on.
 pub fn new_pad(fleet: &[EmulatedPad], percent: u8, connection: Connection) -> EmulatedPad {
     let taken: Vec<usize> = fleet.iter().map(|p| slot_of(p.serial().as_ref())).collect();
     let index = (1..=taken.len() + 1)
@@ -124,7 +124,7 @@ pub fn prune(fleet: Vec<EmulatedPad>) -> Vec<EmulatedPad> {
 /// Callers pass only the emulated records; real hardware is not this fleet's
 /// business, and the remembered store keeps no charge state to restore. Every
 /// pad comes back **disconnected**: a remembered pad is not a plugged-in one,
-/// and reconnecting here would fire connect toasts and open Start unbidden at
+/// and reconnecting here would fire connect toasts and open Launcher unbidden at
 /// boot. Each keeps its remembered level and link, so it resumes where it was
 /// left rather than at the `AddPad` default.
 pub fn rehydrate(remembered: &[(Serial, u8, Connection)]) -> Vec<EmulatedPad> {

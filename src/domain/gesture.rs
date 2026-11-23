@@ -311,7 +311,7 @@ mod tests {
         detector.mark_armed();
         assert_eq!(gate.tick(true, t0).0, ChordReleaseTick::Blocked);
 
-        // Start absence.
+        // Launcher absent.
         assert_eq!(
             gate.tick(false, t0 + Duration::from_millis(1)).0,
             ChordReleaseTick::Blocked

@@ -16,8 +16,8 @@ use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::{Element, Font, Length, Pixels, Point, Rectangle, Renderer, Theme, Vector};
 
 use crate::platform::host::Host;
+use crate::ui::launcher::vstrip::StripOrientation;
 use crate::ui::layout::ease_out_cubic;
-use crate::ui::start::vstrip::StripOrientation;
 use crate::ui::theme;
 
 /// Column width for the centered label stack (room for mono uppercase labels).
@@ -305,7 +305,7 @@ impl<Message> canvas::Program<Message> for PositionBar {
         _bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
-        // The 16ms StartFrame tick is not vsync. While the slide is running,
+        // The 16ms LauncherFrame tick is not vsync. While the slide is running,
         // ask for the next frame so draw() can sample time at display rate.
         if self.spec.show_hide_busy(std::time::Instant::now()) {
             Some(canvas::Action::request_redraw())

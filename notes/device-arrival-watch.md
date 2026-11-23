@@ -76,10 +76,10 @@ ticks pick up membership — no other logic changed.
 ## Validation
 
 - Logs: `hidapi_refresh end` must appear within ~1s of a physical connect
-  while hot (Start open); previously the marker was `deferred` runs with no
+  while hot (Launcher open); previously the marker was `deferred` runs with no
   `end`. Watch `open caller=sample` latency after arrival.
 - Matrix addition (extends [hot-enumeration-freeze](hot-enumeration-freeze.md)):
-  Start open + stable pad 1 + connect pad 2, per OS, with Steam running and
+  Launcher open + stable pad 1 + connect pad 2, per OS, with Steam running and
   without. Time from PS-button press to `Connected` toast.
 - Unit tests: debounce pure fn, `RefreshPresence` throttle, command plumbing.
   Arrival itself stays manual-test-only (no fake-HID harness in the tree).

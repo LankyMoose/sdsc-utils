@@ -102,10 +102,10 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
 ## Hub layout and pad input
 
 - The hub card keeps three rows and no outer padding: branding header
-  (DualSense mark + `SDSC Utils`), apps (Start / Browser), then action hints
+  (DualSense mark + `SDSC Utils`), apps (Launcher / Browser), then action hints
   left-to-right: **SELECT Controllers** and **START Settings**. Hints are
   display-only; the pad owns every action.
-- The controllers list is the restored Start-style dock in the monitor's
+- The controllers list is the restored Launcher-style dock in the monitor's
   top-right corner: collapsed battery-ring column by default; Select/Share
   (Create) expands it in place and moves focus to controllers. It has no
   section title or count. The dock stays visible while hub Settings is open
@@ -116,12 +116,12 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
   dock (a second Circle closes the hub). Up/Down have no row-focus role on the
   main hub outside the dock.
 - **Options** (or the START Settings hint) opens hub Settings. The screen uses
-  Start-settings sections and controls: **Feedback** (UI sounds, volume,
+  Launcher-settings sections and controls: **Feedback** (UI sounds, volume,
   controller haptics, strength) and **App installs** (Download speed, hidden
   in packaged builds). The cap is hub-owned and applies to every standalone
   managed-app install/update. The disconnected-controller filter is no longer
   a settings row; Square in the dock owns it. Feedback prefs are global
-  (Start, Browser, and hub).
+  (Launcher, Browser, and hub).
 - Hub Settings and the dock are controller/keyboard only. The sole mouse
   binding is clicking the backdrop of the active panel, which acts like
   Circle. Cross launches the focused app; Triangle on the Browser tile opens

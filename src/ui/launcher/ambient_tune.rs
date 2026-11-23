@@ -4,11 +4,11 @@
 //! drivable by pad (Up/Down focus, Left/Right nudge, Cross confirm, Circle
 //! done) and mouse (drag sliders, click buttons). Values read the live
 //! process-wide tuning atomics directly; commits route through
-//! [`StartMessage`](crate::ui::start::view::StartMessage) so pad and mouse
+//! [`LauncherMessage`](crate::ui::launcher::view::LauncherMessage) so pad and mouse
 //! share one apply path in the shell.
 
+use crate::ui::launcher::view::{LauncherMessage, State, scroll_y_to_reveal_bounds};
 use crate::ui::shader::ambient;
-use crate::ui::start::view::{StartMessage, State, scroll_y_to_reveal_bounds};
 use crate::ui::theme;
 use iced::font::Weight;
 use iced::widget::{column, container, mouse_area, row, scrollable, slider, stack, text};
@@ -192,7 +192,7 @@ pub fn tune_reveal_y(focus: usize, scroll_y: f32, viewport_h: f32) -> Option<f32
         TUNE_ROW_H,
         scroll_y,
         viewport_h,
-        crate::ui::start::view::ScrollReveal::Either,
+        crate::ui::launcher::view::ScrollReveal::Either,
     )
 }
 
@@ -214,7 +214,7 @@ fn focus_ring(focused: bool) -> impl Fn(&iced::Theme) -> iced::widget::container
     }
 }
 
-fn tune_slider_row(param: AmbientTuneParam, focused: bool) -> Element<'static, StartMessage> {
+fn tune_slider_row(param: AmbientTuneParam, focused: bool) -> Element<'static, LauncherMessage> {
     let value = param.read();
     let range = param.range();
     container(
@@ -225,7 +225,7 @@ fn tune_slider_row(param: AmbientTuneParam, focused: bool) -> Element<'static, S
             ]
             .align_y(Alignment::Center),
             slider(range, value, move |v| {
-                StartMessage::SetAmbientTune(param, v)
+                LauncherMessage::SetAmbientTune(param, v)
             })
             .step(param.step())
             .style(theme::slider),
@@ -243,8 +243,8 @@ fn tune_slider_row(param: AmbientTuneParam, focused: bool) -> Element<'static, S
 fn tune_button_row(
     label: &'static str,
     focused: bool,
-    message: StartMessage,
-) -> Element<'static, StartMessage> {
+    message: LauncherMessage,
+) -> Element<'static, LauncherMessage> {
     container(
         mouse_area(
             container(text(label).size(14.0).color(theme::INK))
@@ -265,7 +265,7 @@ fn tune_button_row(
 
 /// Centered tuning modal over the live ambient background. No dim wash: the
 /// panel tunes the atmosphere itself, so it must stay WYSIWYG.
-pub fn tuning_overlay(state: &State) -> Element<'_, StartMessage> {
+pub fn tuning_overlay(state: &State) -> Element<'_, LauncherMessage> {
     let focus = state
         .ambient_tune_focus
         .min(TuneRow::count().saturating_sub(1));
@@ -274,16 +274,18 @@ pub fn tuning_overlay(state: &State) -> Element<'_, StartMessage> {
         let focused = i == focus;
         items = items.push(match row {
             TuneRow::Param(param) => tune_slider_row(param, focused),
-            TuneRow::Reset => {
-                tune_button_row("Reset ambience", focused, StartMessage::ResetAmbientTuning)
-            }
-            TuneRow::Done => tune_button_row("Done", focused, StartMessage::CloseAmbientTuning),
+            TuneRow::Reset => tune_button_row(
+                "Reset ambience",
+                focused,
+                LauncherMessage::ResetAmbientTuning,
+            ),
+            TuneRow::Done => tune_button_row("Done", focused, LauncherMessage::CloseAmbientTuning),
         });
     }
     let list = scrollable(items)
         .id(tune_scroll_id())
         .on_scroll(|viewport| {
-            StartMessage::AmbientTuneScrolled(
+            LauncherMessage::AmbientTuneScrolled(
                 viewport.absolute_offset().y,
                 viewport.bounds().height,
             )
@@ -325,9 +327,9 @@ pub fn tuning_overlay(state: &State) -> Element<'_, StartMessage> {
 /// Stack the tuning modal over immersive chrome (same layer shape as the
 /// settings drawer so the stage never remounts while it opens/closes).
 pub fn tuning_layer<'a>(
-    chrome: Element<'a, StartMessage>,
+    chrome: Element<'a, LauncherMessage>,
     state: &'a State,
-) -> Element<'a, StartMessage> {
+) -> Element<'a, LauncherMessage> {
     if state.ambient_tune_open {
         stack![chrome, tuning_overlay(state)]
             .width(Fill)

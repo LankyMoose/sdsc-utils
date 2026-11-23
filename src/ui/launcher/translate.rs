@@ -1,6 +1,6 @@
 //! Full-bleed splash art with ken-burns scale + pan in one draw (outer clip only).
 
-use crate::ui::start::mode::backdrop_pose_pixels;
+use crate::ui::launcher::mode::backdrop_pose_pixels;
 use iced::advanced::image::{self as adv_image, FilterMethod};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer;

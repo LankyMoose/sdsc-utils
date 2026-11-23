@@ -19,7 +19,7 @@ pub mod translate;
 pub mod view;
 pub mod vstrip;
 
-/// Wipe every Start-related image cache to a blank slate (process Exit).
+/// Wipe every Launcher-related image cache to a blank slate (process Exit).
 ///
 /// Called from [`art_worker::ArtOwner::shutdown`] (before and after join). Also resets
 /// immersive shader one-shot diag state so the next process logs cleanly.

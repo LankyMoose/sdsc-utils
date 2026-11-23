@@ -3,7 +3,7 @@
 **Status:** design only. **When to read:** adding controller text entry to
 the browser (or anywhere else). After the hub pivot
 ([browser-hub-pivot.md](browser-hub-pivot.md)) the OSK belongs to the Browser
-app's own window, not Start.
+app's own window, not Launcher.
 
 ## Goal
 
@@ -13,8 +13,8 @@ commit path, not a replacement.
 
 ## Why a surface, not a widget trick
 
-Start already composites modal surfaces over the stage with one owner at a
-time (`HintPressOwner`, overlay priority in `notes/start-immersive.md`).
+Launcher already composites modal surfaces over the stage with one owner at a
+time (`HintPressOwner`, overlay priority in `notes/launcher-immersive.md`).
 After the pivot the Browser app owns its own window and the same modal-surface
 pattern; the OSK becomes one more Browser surface (`OskPanel` next to the
 browser panel), so pad ownership, Cancel-unwind, and idle-dim keep working

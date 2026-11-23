@@ -15,7 +15,7 @@ struct CacheKey {
 
 /// Owned shell-icon extract cache.
 ///
-/// Owned by the Start image layer ([`crate::ui::start::icon_cache::IconCache`]:
+/// Owned by the Launcher image layer ([`crate::ui::launcher::icon_cache::IconCache`]:
 /// constructed in `IconCache::new`, passed as `&FileIconCache` to
 /// [`crate::platform::host::Host`] shell-icon reads) — no process-global
 /// instance.

@@ -233,7 +233,7 @@ impl GamesCatalog {
         self.last_played_ms.get(&entry.play_key()).copied()
     }
 
-    /// Entries for the start screen.
+    /// Entries for the launcher.
     ///
     /// `installed_steam`: `None` = library scan not finished/failed — keep all Steam
     /// appids. `Some(ids)` = successful scan — drop Steam appids that are not installed.

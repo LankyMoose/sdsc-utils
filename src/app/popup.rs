@@ -36,12 +36,12 @@ impl App {
 
     pub(crate) fn sync_popup_rows(&mut self) {
         if self
-            .start_state
+            .launcher_state
             .powering_off
             .as_ref()
             .is_some_and(|s| !self.session.controllers.iter().any(|c| c.serial == *s))
         {
-            self.start_state.powering_off = None;
+            self.launcher_state.powering_off = None;
         }
         self.popup_rows = self.controller_rows(true);
     }

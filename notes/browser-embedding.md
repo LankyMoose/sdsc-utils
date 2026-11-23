@@ -47,7 +47,7 @@ window, the engine worker, DOM targets, or the CEF packaging path.
 - `src/browser/cursor.rs` — controller cursor: analog free point, magnet
   dock with hysteresis/break-free, D-pad flights, unified page+header space,
   row-locked horizontals, R2 turbo.
-- `src/browser/frame_slot.rs` + `src/ui/start/browser_frame.rs` — per-tab
+- `src/browser/frame_slot.rs` + `src/ui/launcher/browser_frame.rs` — per-tab
   latest RGBA; a custom `iced_wgpu` primitive uploads unseen generations into
   one stable texture (`queue.write_texture`). No per-frame image handles.
 - `src/browser/tabs.rs`, `src/browser/bookmarks.rs` — the two persisted
@@ -86,16 +86,16 @@ window, the engine worker, DOM targets, or the CEF packaging path.
   window size from `window::resize_events()` rather than a creation-time
   `window::size()` query, which can return the pre-fullscreen default.
 
-PS opens the topmost hub over Start, Browser, or a game; while the hub is
+PS opens the topmost hub over Launcher, Browser, or a game; while the hub is
 open it owns pad input and the app underneath is gated. Selecting Browser
 closes the hub and opens the standalone fullscreen Browser window. Browser
 close (Circle/Esc with no modal) suspends the engine and returns focus to
-Start when it is visible.
+Launcher when it is visible.
 
-Input priority is **hub → Browser → Start**. The Browser window has its own
-pad bank (`BrowserAppState::nav`) and D-pad stepper; Start's bank no longer
+Input priority is **hub → Browser → Launcher**. The Browser window has its own
+pad bank (`BrowserAppState::nav`) and D-pad stepper; Launcher's bank no longer
 sees browser presses. PS is checked in the Browser pad path too, so it opens
-the hub over Browser exactly like over Start.
+the hub over Browser exactly like over Launcher.
 
 - Left stick moves the cursor with velocity + friction; magnet docks on
   arrival, centre-snaps on fresh acquisition, holds in place while scrolling.

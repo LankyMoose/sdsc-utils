@@ -36,12 +36,16 @@ pub fn should_auto_open_hub(
     enabled && previous_empty && next_nonempty && !already_open && !cooldown_active && !fullscreen
 }
 
-/// Close Start when qualifying presence drops 1→0 while the window is visible.
-pub fn should_auto_close_hub(prev_present: bool, next_present: bool, start_visible: bool) -> bool {
-    prev_present && !next_present && start_visible
+/// Close Launcher when qualifying presence drops 1→0 while the window is visible.
+pub fn should_auto_close_hub(
+    prev_present: bool,
+    next_present: bool,
+    launcher_visible: bool,
+) -> bool {
+    prev_present && !next_present && launcher_visible
 }
 
-/// Defer 0→1 Start until a connect toast finishes slide-in (both stay on screen).
+/// Defer 0→1 Launcher until a connect toast finishes slide-in (both stay on screen).
 pub fn should_defer_auto_open_hub(want_open: bool, connect_toast_queued: bool) -> bool {
     want_open && connect_toast_queued
 }
@@ -98,8 +102,8 @@ pub fn connect_cooldown_on_empty(
 }
 
 /// Latched flush: open if still enabled and not already open (ignore fullscreen/cooldown).
-pub fn should_flush_latched_hub(pending: bool, start_enabled: bool, already_open: bool) -> bool {
-    pending && start_enabled && !already_open
+pub fn should_flush_latched_hub(pending: bool, launcher_enabled: bool, already_open: bool) -> bool {
+    pending && launcher_enabled && !already_open
 }
 
 /// Hold pads missing from polls for [`POLL_MISS_HOLD`] wall time, then drop.

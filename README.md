@@ -1,6 +1,6 @@
 # SDSC Utils
 
-System tray app for DualSense wireless controllers (and DualSense Edge): battery levels, lightbar colors from charge, identify flash, overlay toasts, an optional DualSense **start screen** game launcher, and local battery analytics.
+System tray app for DualSense wireless controllers (and DualSense Edge): battery levels, lightbar colors from charge, identify flash, overlay toasts, an optional DualSense **Launcher** (fullscreen game console), and local battery analytics.
 
 **Unofficial.** DualSense, DualSense Edge, PlayStation, and related marks are trademarks of Sony Interactive Entertainment Inc. This project is not affiliated with, endorsed by, or sponsored by Sony.
 
@@ -9,16 +9,16 @@ System tray app for DualSense wireless controllers (and DualSense Edge): battery
 Current as of 1.7.0 (`assets/screenshots/1.7.0/`; previous sets are kept under `assets/screenshots/<version>/`).
 
 <p align="center">
-  <img src="assets/screenshots/1.7.0/start-idle.png" alt="Start screen game launcher" width="640" />
+  <img src="assets/screenshots/1.7.0/start-idle.png" alt="Launcher: fullscreen game console" width="640" />
 </p>
 
-<p align="center">Start screen — fullscreen game launcher with Playing status, footer hints, clock, and controller battery rings</p>
+<p align="center">Launcher — fullscreen game console with Playing status, footer hints, clock, and controller battery rings</p>
 
 <p align="center">
-  <img src="assets/screenshots/1.7.0/start-settings.png" alt="Start screen settings drawer" width="640" />
+  <img src="assets/screenshots/1.7.0/start-settings.png" alt="Launcher settings drawer" width="640" />
 </p>
 
-<p align="center">Start settings drawer — Opening, Immersive (layout, position rail, reduced motion), Feedback, and Performance sections</p>
+<p align="center">Launcher settings drawer — Opening, Immersive (layout, position rail, reduced motion), Feedback, and Performance sections</p>
 
 <p align="center">
   <img src="assets/screenshots/1.7.0/controllers-popup.png" alt="Controller popup with battery rings and ETA" width="420" />
@@ -66,15 +66,15 @@ Current as of 1.7.0 (`assets/screenshots/1.7.0/`; previous sets are kept under `
 - Bluetooth **Turn off** sends the DualSense soft power-off command (same idea as holding the PS button)
 - Steam-style overlay toasts when a pad **connects**, **disconnects**, hits **low battery** (at or below a configurable % while discharging; default ≤5%), or **finishes charging** (tray → **Settings**; on by default)
 - Toasts appear in any configurable screen corner as always-on-top cards and dismiss on click or automatically after five seconds
-- Dark **iced** Configure window with a floating sidebar: System (autostart, data folder, changelog viewer), Start screen, Notifications (including low-battery % and toast position), Lightbar colors, Analytics (opt-in), and Pad input
+- Dark **iced** Configure window with a floating sidebar: System (autostart, data folder, changelog viewer), Launcher, Notifications (including low-battery % and toast position), Lightbar colors, Analytics (opt-in), and Pad input
 - **Battery analytics** (off by default): learns each DualSense battery step for charge and play, shows remaining-time estimates after one qualifying step (interpolating within the current percent bucket; refining as more steps are observed; mid-cycle unplug/charge does not wipe history), and draws per-controller coverage charts in Settings → Analytics (local `analytics.json` only; open the data folder from Settings → System to inspect or delete files)
 - Detects controllers connecting/disconnecting within a few seconds
-- **Start screen** (Settings → Start screen): fullscreen console quick-launch when the first DualSense connects — curated Steam games and manual shortcuts, DualSense and keyboard nav, vertical or horizontal games layout with position rail. Cross/Enter launches (a successful launch closes Start); Circle/Escape closes; Triangle edits the catalog; Square toggles Last played ↔ A–Z; Options opens Start settings. Opens with an empty catalog. UI sounds with volume and controller haptics with strength are configured in PS hub Settings and apply across Start, Browser, and the hub. Any connected pad can drive the UI (inputs are not merged across pads). Reopen with the **PS** (Guide) button. Catalog lives in `games.json` under the data folder
-- **PS hub** (PS button): topmost app switcher with Start/Browser and a top-right vertical controllers dock. Select/Share expands the dock and focuses controllers; Cross identifies, Triangle hold powers off a Bluetooth pad, Square filters Connected/All, and Circle collapses the dock. Triangle on an app tile opens its install/update/Info actions; Cross launches it. The hub card keeps three rows (branding, apps, action hints); Options/START opens hub settings (sounds, haptics, and the standalone app-install download cap). Hub and dock input are controller/keyboard only; clicking the backdrop of the active panel acts like Circle. The Browser tile owns engine install/update progress inline.
+- **Launcher** (Settings → Launcher): fullscreen console quick-launch when the first DualSense connects — curated Steam games and manual shortcuts, DualSense and keyboard nav, vertical or horizontal games layout with position rail. Cross/Enter launches (a successful launch closes Launcher); Circle/Escape closes; Triangle edits the catalog; Square toggles Last played ↔ A–Z; Options opens Launcher settings. Opens with an empty catalog. UI sounds with volume and controller haptics with strength are configured in PS hub Settings and apply across Launcher, Browser, and the hub. Any connected pad can drive the UI (inputs are not merged across pads). Reopen with the **PS** (Guide) button. Catalog lives in `games.json` under the data folder
+- **PS hub** (PS button): topmost app switcher with Launcher/Browser and a top-right vertical controllers dock. Select/Share expands the dock and focuses controllers; Cross identifies, Triangle hold powers off a Bluetooth pad, Square filters Connected/All, and Circle collapses the dock. Triangle on an app tile opens its install/update/Info actions; Cross launches it. The hub card keeps three rows (branding, apps, action hints); Options/START opens hub settings (sounds, haptics, and the standalone app-install download cap). Hub and dock input are controller/keyboard only; clicking the backdrop of the active panel acts like Circle. The Browser tile owns engine install/update progress inline.
 - Lightbar color blends across a customizable **2–5 stop spectrum** (default **blue → purple → red**) as battery drops (reapplied on change, plus a slow ~30s backstop); edit via tray **Settings** with a left-hand tab list. An **Enable lightbar** toggle (on by default) pauses battery-driven colors and the low-battery pulse while leaving Identify available. The Lightbar panel stays fully expanded when active: drag stops along the bar, click empty areas to add stops (up to 5), and drag a stop away to remove it (down to 2). Changes apply immediately.
 - At **low battery while discharging** (same configurable threshold as the toast; default ≤5%), the lightbar periodically pulses **orange**
 - Icons live in `assets/icons/` (SVG) and are rasterized at build/runtime
-- UI is an **iced** daemon (tray via `tray-icon`); Configure, controller popup, Start screen, and toasts are iced windows
+- UI is an **iced** daemon (tray via `tray-icon`); Configure, controller popup, Launcher, and toasts are iced windows
 - Single-instance with takeover (a fresh launch terminates the running predecessor and takes over; only the internal `--replace` child waits)
 - Logs to a file (see Troubleshooting)
 
@@ -128,9 +128,9 @@ cargo run
 
 That unlocks a **Developer mode** group in the **Configure** window — separated from the shipped settings by a caption — containing:
 
-- **Controllers** — the emulated fleet, one row per pad. New pads are created remembered but **disconnected**, so adding one is quiet; the per-pad switch plugs them in and out through the normal connect/disconnect path, so toasts and the Start-open preference fire exactly as they would for real hardware. Pads are remembered across restarts and come back switched off at their last level. The chevron expands a row's controls inline — battery level (snapped to the levels a DualSense actually reports; a connected pad applies changes after a one-second pause marked by a spinner, and unplugging cancels a pending one), link (USB charges, Bluetooth runs down — the charge state follows from it, as on real hardware), battery analytics (seed estimates, or walk the charge/drain cycle), the remember pin, and remove. Forgetting a pad drops it from the remembered list; once it is also unplugged the row goes away.
+- **Controllers** — the emulated fleet, one row per pad. New pads are created remembered but **disconnected**, so adding one is quiet; the per-pad switch plugs them in and out through the normal connect/disconnect path, so toasts and the Launcher-open preference fire exactly as they would for real hardware. Pads are remembered across restarts and come back switched off at their last level. The chevron expands a row's controls inline — battery level (snapped to the levels a DualSense actually reports; a connected pad applies changes after a one-second pause marked by a spinner, and unplugging cancels a pending one), link (USB charges, Bluetooth runs down — the charge state follows from it, as on real hardware), battery analytics (seed estimates, or walk the charge/drain cycle), the remember pin, and remove. Forgetting a pad drops it from the remembered list; once it is also unplugged the row goes away.
 - **Pad input** — live DualSense/gamepad readings.
-- **Diagnostics** — renderer stress test, plus a layout-bounding-boxes overlay (toggle or F9) that outlines Start and Settings-drawer containers (magenta) and fixed-width elements (cyan). Debug-only, off by default, never saved.
+- **Diagnostics** — renderer stress test, plus a layout-bounding-boxes overlay (toggle or F9) that outlines Launcher and Settings-drawer containers (magenta) and fixed-width elements (cyan). Debug-only, off by default, never saved.
 
 The emulator is compiled into every non-release build, so there is no flag to pass; release binaries (`cargo build --release`) never include it.
 
@@ -155,7 +155,7 @@ version-feed mock, portable install/launch controls, and the CEF DLC zip — see
 
 - Release builds use the Windows subsystem (no console window for the tray app).
 - The `.exe` and tray share the same DualSense SVG icon (rasterized at build time via `resvg`, embedded with `winres`).
-- Log file: `%APPDATA%\sdsc-utils\app.log` (grep `hid-worker:` for DualSense HID timing: `enumerate_ms` / `open_ms` / `io_ms` / `total_ms` per poll, Identify, lightbar). Start-screen pad input is sampled on the hid-worker thread and read as a snapshot on PadPoll (UI never opens DualSense HID).
+- Log file: `%APPDATA%\sdsc-utils\app.log` (grep `hid-worker:` for DualSense HID timing: `enumerate_ms` / `open_ms` / `io_ms` / `total_ms` per poll, Identify, lightbar). Launcher pad input is sampled on the hid-worker thread and read as a snapshot on PadPoll (UI never opens DualSense HID).
 - Prefs file: `%APPDATA%\sdsc-utils\prefs.json` (notification toggles/threshold/position + lightbar spectrum/enabled + analytics opt-in)
 - Remembered controllers: `%APPDATA%\sdsc-utils\controllers.json` (remembered pads + nicknames)
 - Battery analytics (when enabled): `%APPDATA%\sdsc-utils\analytics.json` (per-pad step samples + in-progress timer)

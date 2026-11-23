@@ -258,7 +258,7 @@ pub enum NavAction {
     ToggleMagnetism,
     /// Triangle edge — edit selected manual while in edit mode.
     Triangle,
-    /// Options — open/close Start settings.
+    /// Options — open/close Launcher settings.
     ToggleSettings,
     /// Create (Select) — legacy controllers-surface toggle (inert: the PS hub
     /// owns the controllers strip now).
@@ -1235,7 +1235,7 @@ struct PadSlot {
 #[derive(Debug, Clone, Default)]
 pub struct PadNavBank {
     slots: HashMap<PadId, PadSlot>,
-    /// When true, newly seen pads start armed (e.g. after start screen opens cleanly).
+    /// When true, newly seen pads start armed (e.g. after launcher opens cleanly).
     arm_new_pads: bool,
 }
 
@@ -1599,7 +1599,7 @@ impl GestureDetectorBank {
     }
 
     /// Mark every live pad as already armed so the current/sticky hold cannot
-    /// reopen the start screen (e.g. after open / close).
+    /// reopen the launcher (e.g. after open / close).
     pub fn consume_pending_match(&mut self, readings: &[NavReading]) {
         let live: HashSet<PadId> = readings.iter().map(|r| r.id.clone()).collect();
         self.detectors.retain(|id, _| live.contains(id));
@@ -2498,7 +2498,7 @@ mod tests {
     #[test]
     fn reopen_gesture_requires_full_chord_on_one_pad() {
         let mut bank = GestureDetectorBank::default();
-        let required = crate::ui::start::gesture::default_gesture();
+        let required = crate::ui::launcher::gesture::default_gesture();
 
         let a = chord_sample(&[GestureControl::L2]);
         let b = chord_sample(&[GestureControl::R2]);
@@ -2514,7 +2514,7 @@ mod tests {
     #[test]
     fn consume_pending_match_suppresses_sticky_reopen() {
         let mut bank = GestureDetectorBank::default();
-        let required = crate::ui::start::gesture::default_gesture();
+        let required = crate::ui::launcher::gesture::default_gesture();
         let empty = [reading("a", PadSample::default())];
         bank.consume_pending_match(&empty);
 

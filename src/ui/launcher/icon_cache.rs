@@ -1,4 +1,4 @@
-//! Bounded process cache of downscaled iced image handles for Start icons.
+//! Bounded process cache of downscaled iced image handles for Launcher icons.
 //!
 //! Full-size Steam capsules (e.g. 600×900) uploaded into iced's 2048² image atlas
 //! force `Atlas::grow` → `Texture::create_view`. A failed grow (memory / device
@@ -22,10 +22,10 @@ use crate::platform::file_icon::FileIconCache;
 use crate::platform::host::Host;
 use crate::ui::svg_icon::SvgRasterCache;
 
-/// Owned warm-generation counter for Start art prefetches.
+/// Owned warm-generation counter for Launcher art prefetches.
 ///
 /// Bumped on each selection warm so UI can ignore stale ArtEvents.
-/// Future owner is the Start image layer: construct one `ArtWarmGen` there and
+/// Future owner is the Launcher image layer: construct one `ArtWarmGen` there and
 /// pass `&ArtWarmGen` down instead of using the process-global
 /// [`ART_WARM_GEN`] shim below.
 pub struct ArtWarmGen {
@@ -250,9 +250,9 @@ impl CacheState {
     }
 }
 
-/// Owned Start image cache (list / hero / backdrop tiers + pins + epoch).
+/// Owned Launcher image cache (list / hero / backdrop tiers + pins + epoch).
 ///
-/// Owns the Start image layer's decode-source caches alongside the iced
+/// Owns the Launcher image layer's decode-source caches alongside the iced
 /// handles: shell-extracted icons ([`FileIconCache`], read through the
 /// [`Host`] safe wrapper) and SVG rasters ([`SvgRasterCache`]). Constructed
 /// in `IconCache::new`; no process-global leaf instances.
@@ -565,11 +565,11 @@ impl Default for IconCache {
     }
 }
 
-/// Single owner for all Start image caches (list / hero / backdrop + warm gen).
+/// Single owner for all Launcher image caches (list / hero / backdrop + warm gen).
 ///
 /// Bundles the decoded-handle cache (which itself owns the shell-extract and
 /// SVG raster leaf caches) with the selection-warm generation. Future owner
-/// is the Start image layer: construct one `ArtCaches` there and pass
+/// is the Launcher image layer: construct one `ArtCaches` there and pass
 /// `&ArtCaches` (or its `&IconCache` / `&ArtWarmGen` handles) down instead
 /// of using the process-global [`CACHE`] / [`ART_WARM_GEN`] shims below.
 pub struct ArtCaches {
@@ -606,7 +606,7 @@ static CACHE: LazyLock<IconCache> = LazyLock::new(IconCache::new);
 /// Catalog indices within `radius` of `selected`.
 ///
 /// Games strip is linear (`circular: false`). Circular remains available for
-/// callers that still want wrap, but Start Games warm paths pass linear.
+/// callers that still want wrap, but Launcher Games warm paths pass linear.
 pub fn art_window_indices(
     selected: usize,
     len: usize,

@@ -1018,7 +1018,7 @@ pub fn warn_scan_error(err: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Cached Steam library metadata for fast Start cold open.
+// Cached Steam library metadata for fast Launcher cold open.
 //
 // Moved verbatim from `persist::steam_library`: on-disk path
 // (`steam_library.json`) and format are unchanged, only the module moved so

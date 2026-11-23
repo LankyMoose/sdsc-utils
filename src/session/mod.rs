@@ -22,11 +22,11 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Ignore 0→1 auto-open briefly after the last pad vanished (BT ghost flaps).
-pub const START_CONNECT_COOLDOWN: Duration = Duration::from_secs(5);
+pub const LAUNCHER_CONNECT_COOLDOWN: Duration = Duration::from_secs(5);
 /// Nonempty stretch shorter than this is an arrival blip — do not arm ghost cooldown.
 pub const MIN_CONNECT_STRETCH: Duration = Duration::from_secs(2);
 
-/// Start-screen selection held in memory (never written to disk).
+/// Launcher selection held in memory (never written to disk).
 ///
 /// Stable keys (never indices): game rows resolve via `play_key`, controller
 /// rows via pad serial. `game_index` is the game-axis row position at report
@@ -35,7 +35,7 @@ pub const MIN_CONNECT_STRETCH: Duration = Duration::from_secs(2);
 /// deliberately no `controller_index`: controller persistence is out of
 /// scope. Dies with the process, and is never written to disk.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StartSelection {
+pub struct LauncherSelection {
     pub game_key: Option<String>,
     pub controller_key: Option<String>,
     #[serde(default)]
@@ -52,12 +52,12 @@ pub enum SessionEffect {
     /// Enqueue overlay notification events.
     QueueNotifications {
         events: Vec<NotifyEvent>,
-        /// Latch Start open onto the connect toast presentation machine.
+        /// Latch Launcher open onto the connect toast presentation machine.
         open_start_after_toast: bool,
     },
     /// Open the hub now (no connect toast to wait on).
     OpenHub,
-    /// Close the start screen (all pads gone).
+    /// Close Home, or the Launcher when Home is not visible (all pads gone).
     CloseHub,
     /// Clear latched auto-open and toast AfterToast::OpenHub.
     ClearStartLatch,
@@ -91,7 +91,7 @@ pub struct DeviceSession {
     pub controllers: Vec<ControllerStatus>,
     /// Controllers currently in the critical low-battery bucket (serial, percent).
     pub low_battery: Vec<(Serial, u8)>,
-    start_connect_cooldown_until: Option<Instant>,
+    launcher_connect_cooldown_until: Option<Instant>,
     pub(crate) skip_next_connect_cooldown: bool,
     controllers_nonempty_since: Option<Instant>,
     missed_poll_since: HashMap<Serial, Instant>,
@@ -107,7 +107,7 @@ impl DeviceSession {
             analytics,
             controllers: Vec::new(),
             low_battery: Vec::new(),
-            start_connect_cooldown_until: None,
+            launcher_connect_cooldown_until: None,
             skip_next_connect_cooldown: false,
             controllers_nonempty_since: None,
             missed_poll_since: HashMap::new(),
@@ -130,7 +130,7 @@ impl DeviceSession {
     }
 
     pub fn cooldown_active(&self, now: Instant) -> bool {
-        self.start_connect_cooldown_until
+        self.launcher_connect_cooldown_until
             .is_some_and(|until| now < until)
     }
 
@@ -196,7 +196,7 @@ impl DeviceSession {
             presence_edge = Some((prev_present, next_present));
             if prev_present != next_present {
                 crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: start presence include_usb={} prev={} next={}",
+                    "ui-diag: launcher presence include_usb={} prev={} next={}",
                     u8::from(include_usb),
                     u8::from(prev_present),
                     u8::from(next_present)
@@ -208,7 +208,7 @@ impl DeviceSession {
             {
                 // Raw 0→1 was USB-only while USB does not count.
                 crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: start presence include_usb={} prev={} next={}",
+                    "ui-diag: launcher presence include_usb={} prev={} next={}",
                     u8::from(include_usb),
                     u8::from(prev_present),
                     u8::from(next_present)
@@ -235,7 +235,8 @@ impl DeviceSession {
                         );
                     }
                     ConnectCooldownDecision::Arm => {
-                        self.start_connect_cooldown_until = Some(ctx.now + START_CONNECT_COOLDOWN);
+                        self.launcher_connect_cooldown_until =
+                            Some(ctx.now + LAUNCHER_CONNECT_COOLDOWN);
                     }
                 }
             }
@@ -258,7 +259,7 @@ impl DeviceSession {
                 ctx.fullscreen,
             )
         });
-        // When presence newly opens Start, suppress the Connected toast
+        // When presence newly opens Launcher, suppress the Connected toast
         // entirely. Cold-launch already suppresses via launch_quiet; hot connects
         // must match so behaviour is identical.
         if want_auto_open {
@@ -307,13 +308,13 @@ impl DeviceSession {
 
     /// Re-evaluate close after the auto-open USB scope changes.
     ///
-    /// A settings flip is not a connect edge — never auto-open Start here.
+    /// A settings flip is not a connect edge — never auto-open Launcher here.
     /// Does not arm the ghost-flap cooldown (settings flip is not a pad leave).
     pub fn reevaluate_start_presence(&mut self, ctx: ApplyContext) -> Vec<SessionEffect> {
         let include_usb = self.prefs.start_screen_auto_open.includes_usb();
         let present = has_hub_presence(&self.controllers, include_usb);
         crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start presence include_usb={} present={} (prefs)",
+            "ui-diag: launcher presence include_usb={} present={} (prefs)",
             u8::from(include_usb),
             u8::from(present),
         ));

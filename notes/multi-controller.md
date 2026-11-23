@@ -98,4 +98,4 @@ pub static DRIVERS: &[&dyn ControllerDriver] = &[&DUALSENSE]; // registry
 2. Implement `ControllerDriver` (VID/PID in `matches`, report parsing in
    `parse_input`/`read_battery`, `capabilities` honest — `None` backends allowed).
 3. Add to `DRIVERS`, add `ControllerKind` variant, add `product_name` string.
-4. Done — Start/toast/popup/known/emulate work via `ControllerStatus`.
+4. Done — Launcher/toast/popup/known/emulate work via `ControllerStatus`.

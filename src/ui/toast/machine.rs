@@ -1,6 +1,6 @@
-//! Pure presentation state machine for overlay toasts and deferred Start open.
+//! Pure presentation state machine for overlay toasts and deferred Launcher open.
 //!
-//! Start may open only as an effect of a legal transition (slide rest or dismiss
+//! Launcher may open only as an effect of a legal transition (slide rest or dismiss
 //! finish). [`Phase::Placing`] is event-only: `Frame` is ignored; leave only on
 //! [`Event::Shown`] or [`Event::Dismiss`].
 
@@ -81,7 +81,7 @@ pub enum Effect {
     Finished,
     /// Open the hub now (toast may still be Resting).
     OpenHub,
-    /// Raise Settings / Start / popup above the toast (only after Resting).
+    /// Raise Settings / Launcher / popup above the toast (only after Resting).
     RaiseInteractive { focus: bool },
 }
 
@@ -112,7 +112,7 @@ impl State {
         }
     }
 
-    /// True while 0→1 Start is latched and the toast has not reached rest yet.
+    /// True while 0→1 Launcher is latched and the toast has not reached rest yet.
     ///
     /// During Placing, suppress lifts after [`PLACING_GESTURE_SUPPRESS_FRAMES`] so a
     /// lost `Shown` cannot block the reopen gesture forever. Phase stays Placing.
@@ -587,7 +587,7 @@ mod tests {
         assert!(state.suppresses_reopen_gesture());
 
         let (state, opened) = settle_slide_in(state);
-        assert!(opened, "slide-in never settled / opened Start");
+        assert!(opened, "slide-in never settled / opened Launcher");
         assert!(state.is_resting());
     }
 
@@ -607,7 +607,7 @@ mod tests {
         assert!(matches!(state.phase(), Some(Phase::SlidingIn { .. })));
 
         let (state, opened) = settle_slide_in(state);
-        assert!(opened, "slide-in never settled / opened Start");
+        assert!(opened, "slide-in never settled / opened Launcher");
         assert!(state.is_resting());
     }
 
@@ -618,7 +618,7 @@ mod tests {
         assert!(state.suppresses_reopen_gesture());
 
         let (state, opened) = settle_slide_in(state);
-        assert!(opened, "slide-in never settled / opened Start");
+        assert!(opened, "slide-in never settled / opened Launcher");
         assert!(state.is_resting());
         assert!(!state.suppresses_reopen_gesture());
     }

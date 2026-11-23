@@ -1,18 +1,18 @@
-//! In-window Start Screen settings (Options): right drawer.
+//! In-window launcher settings (Options): right drawer.
 
 use crate::persist::prefs::{
-    AUTO_OPEN_MODES, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout, NAVBAR_MODES, NavbarVisibility,
-    REDUCED_MOTION_MODES, ReducedMotion, SELECTION_MODES, START_SCREEN_IDLE_SECS_STEPS,
-    START_SCREEN_SLEEP_SECS_STEPS, StartAutoOpen, StartSelectionMode, format_timeout_duration,
+    AUTO_OPEN_MODES, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout, LAUNCHER_IDLE_SECS_STEPS,
+    LAUNCHER_SLEEP_SECS_STEPS, LauncherSelectionMode, NAVBAR_MODES, NavbarVisibility,
+    REDUCED_MOTION_MODES, ReducedMotion, SELECTION_MODES, StartAutoOpen, format_timeout_duration,
     min_sleep_secs_for_idle, secs_step_index,
 };
 use crate::ui::face::{FaceButton, action_cluster, face_hint, face_hold_hint};
-use crate::ui::layout as window_layout;
-use crate::ui::start::icon_cache;
-use crate::ui::start::view::{
-    HintPress, HintPressOwner, ICON_H, ICON_W, ScrollReveal, StartIcon, StartMessage, State,
+use crate::ui::launcher::icon_cache;
+use crate::ui::launcher::view::{
+    HintPress, HintPressOwner, ICON_H, ICON_W, LauncherIcon, LauncherMessage, ScrollReveal, State,
     scroll_y_to_reveal_bounds,
 };
+use crate::ui::layout as window_layout;
 use crate::ui::theme;
 use iced::font::Weight;
 use iced::widget::text::Wrapping;
@@ -64,12 +64,12 @@ const REVEAL_INSET: f32 = 8.0;
 /// If an Up-reveal target sits above this, pin scroll to 0 so section labels stay visible.
 const TOP_PIN_MAX_ROW_TOP: f32 = CONTENT_PAD_Y + 48.0;
 
-/// Prefs snapshot for the Start settings panel (Enabled stays Configure-only).
+/// Prefs snapshot for the Launcher settings panel (Enabled stays Configure-only).
 #[derive(Debug, Clone)]
-pub struct StartSettingsSnapshot {
+pub struct LauncherSettingsSnapshot {
     pub auto_open: StartAutoOpen,
     pub selection_persist: bool,
-    pub selection_mode: StartSelectionMode,
+    pub selection_mode: LauncherSelectionMode,
     pub clock_enabled: bool,
     pub immersive_layout: ImmersiveLayout,
     pub navbar: NavbarVisibility,
@@ -94,7 +94,7 @@ pub struct StartSettingsSnapshot {
     pub steam_syncing: bool,
 }
 
-/// Focusable rows in the Start settings list (dynamic when sounds/haptics off).
+/// Focusable rows in the Launcher settings list (dynamic when sounds/haptics off).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
     AutoOpen,
@@ -161,7 +161,7 @@ impl SettingsRow {
     /// Conditional visibility shared by ALL THREE paths (focus order, panel
     /// build, bounds geometry). Listed exhaustively so a new row fails to
     /// compile until its visibility is declared.
-    pub fn visible(self, snapshot: &StartSettingsSnapshot) -> bool {
+    pub fn visible(self, snapshot: &LauncherSettingsSnapshot) -> bool {
         match self {
             Self::AutoOpen
             | Self::Clock
@@ -177,7 +177,7 @@ impl SettingsRow {
             | Self::ShowUninstalled
             | Self::SyncSteam => true,
             // Sound/haptics moved to the PS hub shell Settings screen, which
-            // applies them beyond Start. Keep the rows' message plumbing for
+            // applies them beyond Launcher. Keep the rows' message plumbing for
             // on-disk pref compatibility, but never render them here.
             Self::Sounds | Self::SoundVolume | Self::Haptics | Self::HapticsStrength => false,
             // Hidden feature: selection persistence is always off (no UI).
@@ -195,7 +195,7 @@ impl SettingsRow {
         }
     }
 
-    pub fn focusable(snapshot: &StartSettingsSnapshot) -> Vec<Self> {
+    pub fn focusable(snapshot: &LauncherSettingsSnapshot) -> Vec<Self> {
         debug_assert!(
             {
                 let mut seen = [false; Self::ROW_COUNT];
@@ -277,7 +277,7 @@ impl SettingsRow {
         }
     }
 
-    /// Helper line under the row label, mirroring Configure → Start screen
+    /// Helper line under the row label, mirroring Configure → Launcher
     /// copy so the drawer explains itself the same way Settings does.
     fn helper(self) -> Option<&'static str> {
         row_helper(self)
@@ -323,7 +323,7 @@ impl SettingsRow {
     }
 
     /// Current on/off for toggle rows.
-    fn toggle_value(self, snapshot: &StartSettingsSnapshot) -> bool {
+    fn toggle_value(self, snapshot: &LauncherSettingsSnapshot) -> bool {
         match self {
             Self::SelectionPersist => snapshot.selection_persist,
             Self::Clock => snapshot.clock_enabled,
@@ -338,28 +338,28 @@ impl SettingsRow {
     }
 
     /// Toggle message constructor for toggle rows.
-    fn set_toggle(self, on: bool) -> StartMessage {
+    fn set_toggle(self, on: bool) -> LauncherMessage {
         match self {
-            Self::SelectionPersist => StartMessage::SetSelectionPersist(on),
-            Self::Clock => StartMessage::SetClock(on),
-            Self::Sounds => StartMessage::SetSounds(on),
-            Self::Haptics => StartMessage::SetHaptics(on),
-            Self::ShowUninstalled => StartMessage::SetShowUninstalledGames(on),
-            Self::PerfThrottle => StartMessage::SetPerfThrottle(on),
-            Self::PerfAntialiasing => StartMessage::SetPerfAntialiasing(on),
-            Self::PerfVsync => StartMessage::SetPerfVsync(on),
+            Self::SelectionPersist => LauncherMessage::SetSelectionPersist(on),
+            Self::Clock => LauncherMessage::SetClock(on),
+            Self::Sounds => LauncherMessage::SetSounds(on),
+            Self::Haptics => LauncherMessage::SetHaptics(on),
+            Self::ShowUninstalled => LauncherMessage::SetShowUninstalledGames(on),
+            Self::PerfThrottle => LauncherMessage::SetPerfThrottle(on),
+            Self::PerfAntialiasing => LauncherMessage::SetPerfAntialiasing(on),
+            Self::PerfVsync => LauncherMessage::SetPerfVsync(on),
             row => unreachable!("{row:?} is not a toggle row"),
         }
     }
 
     /// Dropdown-open message for selector rows (confirm path).
-    fn open_menu(self) -> StartMessage {
+    fn open_menu(self) -> LauncherMessage {
         match self {
-            Self::AutoOpen => StartMessage::ToggleAutoOpenMenu,
-            Self::SelectionMode => StartMessage::ToggleSelectionModeMenu,
-            Self::ImmersiveLayout => StartMessage::ToggleLayoutMenu,
-            Self::Navbar => StartMessage::ToggleNavbarMenu,
-            Self::ReducedMotion => StartMessage::ToggleReducedMotionMenu,
+            Self::AutoOpen => LauncherMessage::ToggleAutoOpenMenu,
+            Self::SelectionMode => LauncherMessage::ToggleSelectionModeMenu,
+            Self::ImmersiveLayout => LauncherMessage::ToggleLayoutMenu,
+            Self::Navbar => LauncherMessage::ToggleNavbarMenu,
+            Self::ReducedMotion => LauncherMessage::ToggleReducedMotionMenu,
             row => unreachable!("{row:?} is not a selector row"),
         }
     }
@@ -377,7 +377,7 @@ impl SettingsRow {
     }
 
     /// Highlight init: index of the current value in the dropdown order.
-    pub fn initial_highlight(self, snapshot: &StartSettingsSnapshot) -> usize {
+    pub fn initial_highlight(self, snapshot: &LauncherSettingsSnapshot) -> usize {
         match self {
             Self::AutoOpen => AUTO_OPEN_MODES
                 .iter()
@@ -416,7 +416,7 @@ impl SettingsRow {
     }
 
     /// Whether the dropdown option at `index` is the committed value.
-    pub fn selector_selected(self, index: usize, snapshot: &StartSettingsSnapshot) -> bool {
+    pub fn selector_selected(self, index: usize, snapshot: &LauncherSettingsSnapshot) -> bool {
         match self {
             Self::AutoOpen => AUTO_OPEN_MODES
                 .get(index)
@@ -439,21 +439,21 @@ impl SettingsRow {
 
     /// Commit message for the dropdown option at `index` (clamped, matching
     /// the old per-menu confirm paths).
-    pub fn selector_select(self, index: usize) -> StartMessage {
+    pub fn selector_select(self, index: usize) -> LauncherMessage {
         match self {
             Self::AutoOpen => {
-                StartMessage::SetAutoOpen(AUTO_OPEN_MODES[index.min(AUTO_OPEN_MODES.len() - 1)])
+                LauncherMessage::SetAutoOpen(AUTO_OPEN_MODES[index.min(AUTO_OPEN_MODES.len() - 1)])
             }
-            Self::SelectionMode => StartMessage::SetSelectionMode(
+            Self::SelectionMode => LauncherMessage::SetSelectionMode(
                 SELECTION_MODES[index.min(SELECTION_MODES.len() - 1)],
             ),
-            Self::ImmersiveLayout => StartMessage::SetImmersiveLayout(
+            Self::ImmersiveLayout => LauncherMessage::SetImmersiveLayout(
                 IMMERSIVE_LAYOUT_MODES[index.min(IMMERSIVE_LAYOUT_MODES.len() - 1)],
             ),
-            Self::Navbar => {
-                StartMessage::SetNavbarVisibility(NAVBAR_MODES[index.min(NAVBAR_MODES.len() - 1)])
-            }
-            Self::ReducedMotion => StartMessage::SetReducedMotion(
+            Self::Navbar => LauncherMessage::SetNavbarVisibility(
+                NAVBAR_MODES[index.min(NAVBAR_MODES.len() - 1)],
+            ),
+            Self::ReducedMotion => LauncherMessage::SetReducedMotion(
                 REDUCED_MOTION_MODES[index.min(REDUCED_MOTION_MODES.len() - 1)],
             ),
             row => unreachable!("{row:?} is not a selector row"),
@@ -462,46 +462,50 @@ impl SettingsRow {
 
     /// Quick-cycle for selector rows without opening the menu.
     /// AutoOpen respects direction (next/prev); Layout flips either way (delta ignored).
-    fn cycle_selector(self, snapshot: &StartSettingsSnapshot, delta: i8) -> StartMessage {
+    fn cycle_selector(self, snapshot: &LauncherSettingsSnapshot, delta: i8) -> LauncherMessage {
         match self {
-            Self::AutoOpen => StartMessage::SetAutoOpen(if delta > 0 {
+            Self::AutoOpen => LauncherMessage::SetAutoOpen(if delta > 0 {
                 snapshot.auto_open.next()
             } else {
                 snapshot.auto_open.prev()
             }),
-            Self::SelectionMode => StartMessage::SetSelectionMode(if delta > 0 {
+            Self::SelectionMode => LauncherMessage::SetSelectionMode(if delta > 0 {
                 snapshot.selection_mode.next()
             } else {
                 snapshot.selection_mode.prev()
             }),
             Self::ImmersiveLayout => {
-                StartMessage::SetImmersiveLayout(snapshot.immersive_layout.cycle())
+                LauncherMessage::SetImmersiveLayout(snapshot.immersive_layout.cycle())
             }
-            Self::Navbar => StartMessage::SetNavbarVisibility(snapshot.navbar.cycle()),
-            Self::ReducedMotion => StartMessage::SetReducedMotion(snapshot.reduced_motion.cycle()),
+            Self::Navbar => LauncherMessage::SetNavbarVisibility(snapshot.navbar.cycle()),
+            Self::ReducedMotion => {
+                LauncherMessage::SetReducedMotion(snapshot.reduced_motion.cycle())
+            }
             row => unreachable!("{row:?} is not a selector row"),
         }
     }
 
     /// Step for slider rows; `None` at limits.
-    fn nudge_slider(self, snapshot: &StartSettingsSnapshot, step: isize) -> Option<StartMessage> {
+    fn nudge_slider(
+        self,
+        snapshot: &LauncherSettingsSnapshot,
+        step: isize,
+    ) -> Option<LauncherMessage> {
         match self {
-            Self::IdleSecs => {
-                step_in_table(snapshot.inactive_secs, START_SCREEN_IDLE_SECS_STEPS, step)
-                    .map(StartMessage::SetInactiveSecs)
-            }
+            Self::IdleSecs => step_in_table(snapshot.inactive_secs, LAUNCHER_IDLE_SECS_STEPS, step)
+                .map(LauncherMessage::SetInactiveSecs),
             Self::SleepSecs => {
                 let choices = sleep_choices_for(snapshot.inactive_secs);
-                step_in_table(snapshot.sleep_secs, &choices, step).map(StartMessage::SetSleepSecs)
+                step_in_table(snapshot.sleep_secs, &choices, step)
+                    .map(LauncherMessage::SetSleepSecs)
             }
             Self::IdleDim => step_percent(snapshot.inactive_dim_percent, step)
-                .map(StartMessage::SetInactiveDimPercent),
+                .map(LauncherMessage::SetInactiveDimPercent),
             Self::SoundVolume => {
-                step_percent(snapshot.sound_volume, step).map(StartMessage::SetSoundVolume)
+                step_percent(snapshot.sound_volume, step).map(LauncherMessage::SetSoundVolume)
             }
-            Self::HapticsStrength => {
-                step_percent(snapshot.haptics_strength, step).map(StartMessage::SetHapticsStrength)
-            }
+            Self::HapticsStrength => step_percent(snapshot.haptics_strength, step)
+                .map(LauncherMessage::SetHapticsStrength),
             row => unreachable!("{row:?} is not a slider row"),
         }
     }
@@ -510,21 +514,21 @@ impl SettingsRow {
     /// f32 position back onto the committed value with the same tables and
     /// rounding the panel positions use. The apply side re-clamps (idle/sleep
     /// pair, percent ranges), so mouse commits land on the same values.
-    fn slider_select(self, snapshot: &StartSettingsSnapshot, value: f32) -> StartMessage {
+    fn slider_select(self, snapshot: &LauncherSettingsSnapshot, value: f32) -> LauncherMessage {
         match self {
             Self::IdleSecs => {
-                let idx = (value.round() as usize)
-                    .min(START_SCREEN_IDLE_SECS_STEPS.len().saturating_sub(1));
-                StartMessage::SetInactiveSecs(START_SCREEN_IDLE_SECS_STEPS[idx])
+                let idx =
+                    (value.round() as usize).min(LAUNCHER_IDLE_SECS_STEPS.len().saturating_sub(1));
+                LauncherMessage::SetInactiveSecs(LAUNCHER_IDLE_SECS_STEPS[idx])
             }
             Self::SleepSecs => {
                 let choices = sleep_choices_for(snapshot.inactive_secs);
                 let idx = (value.round() as usize).min(choices.len().saturating_sub(1));
-                StartMessage::SetSleepSecs(choices[idx])
+                LauncherMessage::SetSleepSecs(choices[idx])
             }
-            Self::IdleDim => StartMessage::SetInactiveDimPercent(value.round() as u8),
-            Self::SoundVolume => StartMessage::SetSoundVolume(value.round() as u8),
-            Self::HapticsStrength => StartMessage::SetHapticsStrength(value.round() as u8),
+            Self::IdleDim => LauncherMessage::SetInactiveDimPercent(value.round() as u8),
+            Self::SoundVolume => LauncherMessage::SetSoundVolume(value.round() as u8),
+            Self::HapticsStrength => LauncherMessage::SetHapticsStrength(value.round() as u8),
             row => unreachable!("{row:?} is not a slider row"),
         }
     }
@@ -638,7 +642,7 @@ impl SettingsPanel {
     /// Toggle the dropdown for a selector row. Opening inits the highlight
     /// to the current value and closes any other menu (single menu);
     /// toggling the open row closes it. Returns true when open afterwards.
-    pub fn toggle_menu(&mut self, row: SettingsRow, snapshot: &StartSettingsSnapshot) -> bool {
+    pub fn toggle_menu(&mut self, row: SettingsRow, snapshot: &LauncherSettingsSnapshot) -> bool {
         debug_assert_eq!(row.kind(), RowKind::Selector);
         if self.menu.is_some_and(|(open, _)| open == row) {
             self.menu = None;
@@ -741,18 +745,18 @@ impl SettingsPanel {
         self.viewport_h = viewport_h;
     }
 
-    pub fn clamp_focus(&mut self, snapshot: &StartSettingsSnapshot) {
+    pub fn clamp_focus(&mut self, snapshot: &LauncherSettingsSnapshot) {
         let n = SettingsRow::focusable(snapshot).len().max(1);
         if self.focus >= n {
             self.focus = n - 1;
         }
     }
 
-    pub fn focused_row(&self, snapshot: &StartSettingsSnapshot) -> Option<SettingsRow> {
+    pub fn focused_row(&self, snapshot: &LauncherSettingsSnapshot) -> Option<SettingsRow> {
         SettingsRow::focusable(snapshot).get(self.focus).copied()
     }
 
-    pub fn move_focus(&mut self, delta: isize, snapshot: &StartSettingsSnapshot) -> bool {
+    pub fn move_focus(&mut self, delta: isize, snapshot: &LauncherSettingsSnapshot) -> bool {
         let rows = SettingsRow::focusable(snapshot);
         if rows.is_empty() {
             return false;
@@ -769,7 +773,7 @@ impl SettingsPanel {
     /// Absolute scroll Y to keep the focused row in view, if needed.
     pub fn focus_scroll_y(
         &self,
-        snapshot: &StartSettingsSnapshot,
+        snapshot: &LauncherSettingsSnapshot,
         direction: ScrollReveal,
     ) -> Option<f32> {
         let (row_top, row_h) = focus_row_bounds(self.focus, snapshot)?;
@@ -799,7 +803,7 @@ impl SettingsPanel {
     /// (prefs clean) or already fully visible.
     pub fn reload_scroll_y(
         &self,
-        snapshot: &StartSettingsSnapshot,
+        snapshot: &LauncherSettingsSnapshot,
         direction: ScrollReveal,
     ) -> Option<f32> {
         let rows = SettingsRow::focusable(snapshot);
@@ -848,10 +852,13 @@ pub fn scrim_dim(progress: f32) -> f32 {
 }
 
 /// Confirm on the focused row (toggle / activate button).
-pub fn confirm_message(row: SettingsRow, snapshot: &StartSettingsSnapshot) -> Option<StartMessage> {
+pub fn confirm_message(
+    row: SettingsRow,
+    snapshot: &LauncherSettingsSnapshot,
+) -> Option<LauncherMessage> {
     #[cfg(debug_assertions)]
     if row == SettingsRow::TuneAmbience {
-        return Some(StartMessage::OpenAmbientTuning);
+        return Some(LauncherMessage::OpenAmbientTuning);
     }
     match row.kind() {
         // Selectors open the dropdown; picking happens from the menu highlight.
@@ -859,8 +866,8 @@ pub fn confirm_message(row: SettingsRow, snapshot: &StartSettingsSnapshot) -> Op
         RowKind::Toggle => Some(row.set_toggle(!row.toggle_value(snapshot))),
         // Actions run their own message on Confirm.
         RowKind::Action => Some(match row {
-            SettingsRow::PerfReload => StartMessage::ReloadUi,
-            SettingsRow::SyncSteam => StartMessage::SyncSteamLibrary,
+            SettingsRow::PerfReload => LauncherMessage::ReloadUi,
+            SettingsRow::SyncSteam => LauncherMessage::SyncSteamLibrary,
             row => unreachable!("{row:?} is not an action row"),
         }),
         // Sliders are mouse-driven; Cross does nothing.
@@ -878,9 +885,9 @@ pub fn confirm_message(row: SettingsRow, snapshot: &StartSettingsSnapshot) -> Op
 /// Cancel closes.
 pub fn nudge_message(
     row: SettingsRow,
-    snapshot: &StartSettingsSnapshot,
+    snapshot: &LauncherSettingsSnapshot,
     delta: i8,
-) -> Option<StartMessage> {
+) -> Option<LauncherMessage> {
     match row.kind() {
         // Quick-cycle without opening the menu (Confirm opens it instead).
         RowKind::Selector => Some(row.cycle_selector(snapshot, delta)),
@@ -913,13 +920,13 @@ fn step_percent(cur: u8, step: isize) -> Option<u8> {
 /// mouse drag) so position and committed value can't drift apart.
 fn sleep_choices_for(inactive_secs: u32) -> Vec<u32> {
     let min_sleep = min_sleep_secs_for_idle(inactive_secs);
-    let choices: Vec<u32> = START_SCREEN_SLEEP_SECS_STEPS
+    let choices: Vec<u32> = LAUNCHER_SLEEP_SECS_STEPS
         .iter()
         .copied()
         .filter(|&s| s >= min_sleep)
         .collect();
     if choices.is_empty() {
-        vec![*START_SCREEN_SLEEP_SECS_STEPS.last().unwrap_or(&min_sleep)]
+        vec![*LAUNCHER_SLEEP_SECS_STEPS.last().unwrap_or(&min_sleep)]
     } else {
         choices
     }
@@ -936,7 +943,7 @@ fn step_in_table(value: u32, table: &[u32], step: isize) -> Option<u32> {
     (next != value).then_some(next)
 }
 
-/// Helper line under a settings row label, mirroring Configure → Start
+/// Helper line under a settings row label, mirroring Configure → Launcher
 /// screen copy (single source for the drawer; Configure keeps its own
 /// literals). `None` where Configure itself shows no helper.
 fn row_helper(row: SettingsRow) -> Option<&'static str> {
@@ -956,7 +963,7 @@ fn row_helper(row: SettingsRow) -> Option<&'static str> {
         SettingsRow::Haptics => None,
         SettingsRow::HapticsStrength => None,
         SettingsRow::PerfThrottle => {
-            Some("Let the fullscreen Start screen rest when nothing is moving")
+            Some("Let the fullscreen Launcher rest when nothing is moving")
         }
         SettingsRow::ShowUninstalled => {
             Some("Keep owned-but-uninstalled games listed with a View in Steam action")
@@ -997,7 +1004,7 @@ impl TypeScale {
 /// in the flow, so row bounds never move when a menu opens or closes.
 /// Stacking mirrors `panel_view`: one COL_GAP between every child, heights
 /// from the shared `*_row_h` fns / section + gap constants.
-pub fn focus_row_bounds(focus: usize, snapshot: &StartSettingsSnapshot) -> Option<(f32, f32)> {
+pub fn focus_row_bounds(focus: usize, snapshot: &LauncherSettingsSnapshot) -> Option<(f32, f32)> {
     let rows = SettingsRow::focusable(snapshot);
     let target = *rows.get(focus)?;
     debug_assert!(target.visible(snapshot));
@@ -1108,7 +1115,7 @@ enum LayoutItem {
 /// table: visible rows in [`SettingsRow::ALL`] order, each with its anchored
 /// section/gap prefix. `panel_view` and `focus_row_bounds` both consume this
 /// shape (widgets vs. heights) so the three orderings agree by construction.
-fn layout_items(snapshot: &StartSettingsSnapshot) -> Vec<LayoutItem> {
+fn layout_items(snapshot: &LauncherSettingsSnapshot) -> Vec<LayoutItem> {
     let mut items = Vec::new();
     for row in SettingsRow::ALL
         .iter()
@@ -1151,7 +1158,7 @@ fn menu_overlay_right_pad(content_h: f32, viewport_h: f32) -> f32 {
 
 /// Total scrollable content height: top/bottom content padding plus one gap
 /// between stacked items. Decides scrollbar visibility for the overlay inset.
-fn settings_content_h(snapshot: &StartSettingsSnapshot) -> f32 {
+fn settings_content_h(snapshot: &LauncherSettingsSnapshot) -> f32 {
     let ty = TypeScale::drawer();
     let items = layout_items(snapshot);
     let mut h = CONTENT_PAD_Y * 2.0;
@@ -1195,9 +1202,9 @@ fn menu_overlay_y(row_top: f32, row_h: f32, panel_h: f32, scroll_y: f32, viewpor
 /// the menu row left the focusable list.
 fn menu_overlay(
     state: &State,
-    snapshot: &StartSettingsSnapshot,
+    snapshot: &LauncherSettingsSnapshot,
     #[cfg(debug_assertions)] debug_bounds: bool,
-) -> Option<Element<'static, StartMessage>> {
+) -> Option<Element<'static, LauncherMessage>> {
     let (menu_row, _) = state.settings.menu?;
     let ty = TypeScale::drawer();
     let idx = SettingsRow::focusable(snapshot)
@@ -1233,9 +1240,9 @@ fn menu_overlay(
 
 pub fn panel_view<'a>(
     state: &'a State,
-    snapshot: &StartSettingsSnapshot,
+    snapshot: &LauncherSettingsSnapshot,
     #[cfg(debug_assertions)] debug_bounds: bool,
-) -> Element<'a, StartMessage> {
+) -> Element<'a, LauncherMessage> {
     let focus_rows = SettingsRow::focusable(snapshot);
     let focus = state.settings.focus.min(focus_rows.len().saturating_sub(1));
     let ty = TypeScale::drawer();
@@ -1261,8 +1268,8 @@ pub fn panel_view<'a>(
     // is the confirm flip, `selector_select` is the menu-nav commit, and
     // `slider_select` is the mouse-drag commit.
     let idle_secs = snapshot.inactive_secs;
-    let idle_idx = secs_step_index(idle_secs, START_SCREEN_IDLE_SECS_STEPS);
-    let idle_max = START_SCREEN_IDLE_SECS_STEPS.len().saturating_sub(1) as f32;
+    let idle_idx = secs_step_index(idle_secs, LAUNCHER_IDLE_SECS_STEPS);
+    let idle_max = LAUNCHER_IDLE_SECS_STEPS.len().saturating_sub(1) as f32;
     let sleep_secs = snapshot.sleep_secs;
     let sleep_choices = sleep_choices_for(idle_secs);
     let sleep_idx = secs_step_index(sleep_secs, &sleep_choices);
@@ -1281,7 +1288,7 @@ pub fn panel_view<'a>(
             items = items.push(section_label(section, ty.section));
         }
         let focused = focus_rows.get(focus) == Some(&row);
-        let widget: Element<'_, StartMessage> = match row {
+        let widget: Element<'_, LauncherMessage> = match row {
             SettingsRow::AutoOpen => selector_row(
                 "Auto open hub:",
                 SettingsRow::AutoOpen.helper(),
@@ -1447,7 +1454,7 @@ pub fn panel_view<'a>(
                 focused,
                 ty,
                 snapshot.perf_reload_queued,
-                StartMessage::ReloadUi,
+                LauncherMessage::ReloadUi,
             ),
             SettingsRow::ShowUninstalled => toggle_row(
                 "Show uninstalled games",
@@ -1463,7 +1470,7 @@ pub fn panel_view<'a>(
                 focused,
                 ty,
                 snapshot.steam_syncing,
-                StartMessage::SyncSteamLibrary,
+                LauncherMessage::SyncSteamLibrary,
             ),
             #[cfg(debug_assertions)]
             SettingsRow::TuneAmbience => container(
@@ -1476,7 +1483,7 @@ pub fn panel_view<'a>(
                 .width(Fill)
                 .height(Length::Fixed(ACTION_BUTTON_H))
                 .padding([4, 12])
-                .on_press(StartMessage::OpenAmbientTuning)
+                .on_press(LauncherMessage::OpenAmbientTuning)
                 .style(theme::primary),
             )
             .padding(ROW_PAD)
@@ -1509,13 +1516,13 @@ pub fn panel_view<'a>(
     .spacing(SCROLL_GAP)
     .on_scroll(|viewport| {
         let y = viewport.absolute_offset().y;
-        StartMessage::SettingsScrolled(y, viewport.bounds().height)
+        LauncherMessage::SettingsScrolled(y, viewport.bounds().height)
     })
     .width(Fill)
     .height(Fill);
 
     #[cfg(debug_assertions)]
-    let header: Element<'_, StartMessage> =
+    let header: Element<'_, LauncherMessage> =
         crate::ui::debug_bounds::wrap(header.into(), debug_bounds);
     #[cfg(debug_assertions)]
     let list = crate::ui::debug_bounds::wrap(list.into(), debug_bounds);
@@ -1548,10 +1555,10 @@ pub fn panel_view<'a>(
 /// Full-height right drawer over chrome (square corners).
 pub fn immersive_drawer<'a>(
     state: &'a State,
-    snapshot: &StartSettingsSnapshot,
+    snapshot: &LauncherSettingsSnapshot,
     progress: f32,
     #[cfg(debug_assertions)] debug_bounds: bool,
-) -> Element<'a, StartMessage> {
+) -> Element<'a, LauncherMessage> {
     let dim = scrim_dim(progress);
     let w = drawer_width(progress);
     let panel = container(panel_view(
@@ -1564,7 +1571,7 @@ pub fn immersive_drawer<'a>(
     .height(Fill)
     .style(theme::immersive_island_radius(0.0));
     #[cfg(debug_assertions)]
-    let panel: Element<'_, StartMessage> =
+    let panel: Element<'_, LauncherMessage> =
         crate::ui::debug_bounds::wrap_fixed(panel.into(), debug_bounds);
 
     let revealed = crate::ui::reveal::width_reveal(panel, DRAWER_W, w).height(Fill);
@@ -1575,10 +1582,10 @@ pub fn immersive_drawer<'a>(
 
 fn stack_scrim<'a>(
     dim: f32,
-    content: impl Into<Element<'a, StartMessage>>,
-) -> Element<'a, StartMessage> {
+    content: impl Into<Element<'a, LauncherMessage>>,
+) -> Element<'a, LauncherMessage> {
     use iced::widget::stack;
-    let mut layers: Vec<Element<'_, StartMessage>> = Vec::new();
+    let mut layers: Vec<Element<'_, LauncherMessage>> = Vec::new();
     if dim > 0.001 {
         layers.push(
             container(space())
@@ -1592,7 +1599,7 @@ fn stack_scrim<'a>(
     stack(layers).width(Fill).height(Fill).into()
 }
 
-fn space_gap() -> Element<'static, StartMessage> {
+fn space_gap() -> Element<'static, LauncherMessage> {
     space()
         .height(Length::Fixed(SECTION_GAP_H))
         .width(Fill)
@@ -1607,7 +1614,7 @@ fn section_block_h(section: f32) -> f32 {
 
 /// Section header: DIM semibold caption (Configure group-caption language)
 /// over a LINE hairline, so sections read as groups instead of loose rows.
-fn section_block(label: &'static str, size: f32) -> Element<'static, StartMessage> {
+fn section_block(label: &'static str, size: f32) -> Element<'static, LauncherMessage> {
     column![
         text(label)
             .size(size)
@@ -1625,7 +1632,7 @@ fn section_block(label: &'static str, size: f32) -> Element<'static, StartMessag
     .into()
 }
 
-fn section_label(label: &'static str, size: f32) -> Element<'static, StartMessage> {
+fn section_label(label: &'static str, size: f32) -> Element<'static, LauncherMessage> {
     section_block(label, size)
 }
 
@@ -1653,8 +1660,8 @@ fn toggle_row(
     checked: bool,
     focused: bool,
     ty: TypeScale,
-    message: fn(bool) -> StartMessage,
-) -> Element<'static, StartMessage> {
+    message: fn(bool) -> LauncherMessage,
+) -> Element<'static, LauncherMessage> {
     let mut label_col = column![text(label).size(ty.body).color(theme::INK).width(Fill),]
         .spacing(HELPER_GAP)
         .width(Fill);
@@ -1695,13 +1702,13 @@ fn action_row(
     focused: bool,
     ty: TypeScale,
     queued: bool,
-    message: StartMessage,
-) -> Element<'static, StartMessage> {
-    let content: Element<'_, StartMessage> = if queued {
+    message: LauncherMessage,
+) -> Element<'static, LauncherMessage> {
+    let content: Element<'_, LauncherMessage> = if queued {
         container(
             row![
                 text(busy_label).size(ty.body),
-                crate::ui::start::view::scan_spinner(14.0, Instant::now(), 1.0),
+                crate::ui::launcher::view::scan_spinner(14.0, Instant::now(), 1.0),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
@@ -1741,8 +1748,8 @@ fn selector_row(
     value_label: &'static str,
     focused: bool,
     ty: TypeScale,
-    toggle: StartMessage,
-) -> Element<'static, StartMessage> {
+    toggle: LauncherMessage,
+) -> Element<'static, LauncherMessage> {
     // Fixed-height clipped viewport: only the selected option displays.
     let viewport_h = cycle_viewport_h(ty.helper);
     let mut label_col = column![text(label).size(ty.body).color(theme::INK).width(Fill),]
@@ -1793,9 +1800,9 @@ fn selector_row(
 fn selector_menu_panel(
     menu: Option<(SettingsRow, usize)>,
     row: SettingsRow,
-    snapshot: &StartSettingsSnapshot,
+    snapshot: &LauncherSettingsSnapshot,
     ty: TypeScale,
-) -> Option<Element<'static, StartMessage>> {
+) -> Option<Element<'static, LauncherMessage>> {
     let highlight = match menu {
         Some((open, h)) if open == row => h,
         _ => return None,
@@ -1826,8 +1833,8 @@ fn option_row(
     selected: bool,
     highlighted: bool,
     ty: TypeScale,
-    select: StartMessage,
-) -> Element<'static, StartMessage> {
+    select: LauncherMessage,
+) -> Element<'static, LauncherMessage> {
     let (mark, mark_color) = if selected {
         ("✓", theme::ACCENT)
     } else {
@@ -1861,8 +1868,8 @@ fn slider_row(
     ty: TypeScale,
     range: std::ops::RangeInclusive<f32>,
     value: f32,
-    on_change: impl Fn(f32) -> StartMessage + 'static,
-) -> Element<'static, StartMessage> {
+    on_change: impl Fn(f32) -> LauncherMessage + 'static,
+) -> Element<'static, LauncherMessage> {
     let step = if (*range.end() - *range.start()) <= 20.0 {
         1.0_f32
     } else {
@@ -1895,18 +1902,18 @@ fn slider_row(
 /// the overlay card hugs it plus padding (no dead space).
 pub(crate) const MANUAL_FORM_W: f32 = 420.0;
 
-pub(crate) fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
+pub(crate) fn manual_add_view(state: &State) -> Element<'_, LauncherMessage> {
     let Some(draft) = state.manual_add.as_ref() else {
         return space().into();
     };
 
-    let icon_el: Element<'_, StartMessage> = draft
+    let icon_el: Element<'_, LauncherMessage> = draft
         .icon_path
         .as_ref()
         .filter(|p| p.is_file())
         .and_then(|p| icon_cache::handle_for_path_warn(p))
-        .map(|handle| start_icon_image(&StartIcon(handle)))
-        .or_else(|| draft.shell_icon.as_ref().map(start_icon_image))
+        .map(|handle| launcher_icon_image(&LauncherIcon(handle)))
+        .or_else(|| draft.shell_icon.as_ref().map(launcher_icon_image))
         .unwrap_or_else(manual_icon_placeholder);
 
     let icon_hint = if draft.shell_icon.is_none() && draft.icon_path.is_none() {
@@ -1921,14 +1928,14 @@ pub(crate) fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
     icon_actions = icon_actions.push(
         button(text("Choose image…").size(13.0))
             .padding([5, 10])
-            .on_press(StartMessage::ManualPickIcon)
+            .on_press(LauncherMessage::ManualPickIcon)
             .style(theme::ghost),
     );
     if draft.icon_path.is_some() {
         icon_actions = icon_actions.push(
             button(text("Clear").size(13.0))
                 .padding([5, 10])
-                .on_press(StartMessage::ManualClearIcon)
+                .on_press(LauncherMessage::ManualClearIcon)
                 .style(theme::ghost),
         );
     }
@@ -1948,13 +1955,13 @@ pub(crate) fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
         text_input("Title", &draft.title)
             .size(14.0)
             .padding(8)
-            .on_input(StartMessage::ManualAddTitle)
+            .on_input(LauncherMessage::ManualAddTitle)
             .style(theme::input),
         text(&draft.target).size(12.0).color(theme::MUTED),
         text_input("Arguments (optional)", &draft.args)
             .size(14.0)
             .padding(8)
-            .on_input(StartMessage::ManualAddArgs)
+            .on_input(LauncherMessage::ManualAddArgs)
             .style(theme::input),
         row![icon_el, column![icon_actions, icon_hint].spacing(6)]
             .spacing(14)
@@ -1963,11 +1970,11 @@ pub(crate) fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
         row![
             button(text(if draft.is_edit() { "Save" } else { "Add" }).size(14.0))
                 .padding([6, 14])
-                .on_press(StartMessage::Confirm)
+                .on_press(LauncherMessage::Confirm)
                 .style(theme::primary),
             button(text("Cancel").size(14.0))
                 .padding([6, 14])
-                .on_press(StartMessage::Close)
+                .on_press(LauncherMessage::Close)
                 .style(theme::ghost),
         ]
         .spacing(10),
@@ -1993,7 +2000,7 @@ pub(crate) fn manual_add_view(state: &State) -> Element<'_, StartMessage> {
     .into()
 }
 
-fn start_icon_image(icon: &StartIcon) -> Element<'static, StartMessage> {
+fn launcher_icon_image(icon: &LauncherIcon) -> Element<'static, LauncherMessage> {
     iced::widget::image(icon.0.clone())
         .width(Length::Fixed(ICON_W))
         .height(Length::Fixed(ICON_H))
@@ -2001,7 +2008,7 @@ fn start_icon_image(icon: &StartIcon) -> Element<'static, StartMessage> {
         .into()
 }
 
-fn manual_icon_placeholder() -> Element<'static, StartMessage> {
+fn manual_icon_placeholder() -> Element<'static, LauncherMessage> {
     container(space())
         .width(Length::Fixed(ICON_W))
         .height(Length::Fixed(ICON_H))
@@ -2016,14 +2023,14 @@ fn manual_icon_placeholder() -> Element<'static, StartMessage> {
         .into()
 }
 
-pub(crate) fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
+pub(crate) fn replace_confirm_view(state: &State) -> Element<'_, LauncherMessage> {
     let Some(confirm) = state.replace_confirm.as_ref() else {
         return space().into();
     };
     // Compact dialog content: the caller wraps this in a shared overlay
     // card over a dimmed stage (no fullscreen takeover).
     column![
-        crate::ui::start::overlay::dialog_text(
+        crate::ui::launcher::overlay::dialog_text(
             "Game already running",
             format!(
                 "Close {} and launch {}?",
@@ -2061,12 +2068,12 @@ pub(crate) fn replace_confirm_view(state: &State) -> Element<'_, StartMessage> {
 /// the choice stays an explicit pad action). The caller wraps this in a
 /// shared overlay card; Cross confirms (discard + leave edit mode),
 /// Circle cancels (keep the draft, keep editing).
-pub(crate) fn edit_confirm_view(state: &State) -> Element<'_, StartMessage> {
+pub(crate) fn edit_confirm_view(state: &State) -> Element<'_, LauncherMessage> {
     if state.edit_confirm.is_none() {
         return space().into();
     }
     column![
-        crate::ui::start::overlay::dialog_text(
+        crate::ui::launcher::overlay::dialog_text(
             "Discard changes?",
             "Your games list has unsaved changes.".to_string(),
             20.0,
@@ -2094,11 +2101,11 @@ pub(crate) fn edit_confirm_view(state: &State) -> Element<'_, StartMessage> {
 mod tests {
     use super::*;
 
-    fn snap(sounds: bool, haptics: bool) -> StartSettingsSnapshot {
-        StartSettingsSnapshot {
+    fn snap(sounds: bool, haptics: bool) -> LauncherSettingsSnapshot {
+        LauncherSettingsSnapshot {
             auto_open: StartAutoOpen::Any,
             selection_persist: true,
-            selection_mode: StartSelectionMode::ByGame,
+            selection_mode: LauncherSelectionMode::ByGame,
             clock_enabled: true,
             immersive_layout: ImmersiveLayout::Vertical,
             navbar: NavbarVisibility::WhenNavigating,
@@ -2196,13 +2203,19 @@ mod tests {
         assert!(!SettingsRow::SyncSteam.gap_before());
         // Confirm flips the toggle; nudges set it directionally.
         let msg = confirm_message(SettingsRow::ShowUninstalled, &s).unwrap();
-        assert!(matches!(msg, StartMessage::SetShowUninstalledGames(false)));
+        assert!(matches!(
+            msg,
+            LauncherMessage::SetShowUninstalledGames(false)
+        ));
         let msg = nudge_message(SettingsRow::ShowUninstalled, &s, -1).unwrap();
-        assert!(matches!(msg, StartMessage::SetShowUninstalledGames(false)));
+        assert!(matches!(
+            msg,
+            LauncherMessage::SetShowUninstalledGames(false)
+        ));
         assert!(nudge_message(SettingsRow::ShowUninstalled, &s, 1).is_none());
         // Confirm syncs; directionals leave the action alone.
         let msg = confirm_message(SettingsRow::SyncSteam, &s).unwrap();
-        assert!(matches!(msg, StartMessage::SyncSteamLibrary));
+        assert!(matches!(msg, LauncherMessage::SyncSteamLibrary));
         assert!(nudge_message(SettingsRow::SyncSteam, &s, 1).is_none());
         assert!(nudge_message(SettingsRow::SyncSteam, &s, -1).is_none());
     }
@@ -2229,23 +2242,23 @@ mod tests {
         let rows = SettingsRow::focusable(&snapshot);
         assert_eq!(rows.last(), Some(&SettingsRow::TuneAmbience));
         let msg = confirm_message(SettingsRow::TuneAmbience, &snapshot).unwrap();
-        assert!(matches!(msg, StartMessage::OpenAmbientTuning));
+        assert!(matches!(msg, LauncherMessage::OpenAmbientTuning));
     }
 
     #[test]
     fn selection_mode_confirm_opens_menu_nudge_cycles() {
         let s = snap(true, true);
         let msg = confirm_message(SettingsRow::SelectionMode, &s).unwrap();
-        assert!(matches!(msg, StartMessage::ToggleSelectionModeMenu));
+        assert!(matches!(msg, LauncherMessage::ToggleSelectionModeMenu));
         for delta in [1, -1] {
             let msg = nudge_message(SettingsRow::SelectionMode, &s, delta).unwrap();
             assert!(matches!(
                 msg,
-                StartMessage::SetSelectionMode(StartSelectionMode::ByPosition)
+                LauncherMessage::SetSelectionMode(LauncherSelectionMode::ByPosition)
             ));
         }
         let msg = confirm_message(SettingsRow::SelectionPersist, &s).unwrap();
-        assert!(matches!(msg, StartMessage::SetSelectionPersist(false)));
+        assert!(matches!(msg, LauncherMessage::SetSelectionPersist(false)));
     }
 
     #[test]
@@ -2253,18 +2266,18 @@ mod tests {
         let s = snap(true, true);
         // Confirm (Cross) expands the dropdown instead of changing the value.
         let msg = confirm_message(SettingsRow::AutoOpen, &s).unwrap();
-        assert!(matches!(msg, StartMessage::ToggleAutoOpenMenu));
+        assert!(matches!(msg, LauncherMessage::ToggleAutoOpenMenu));
         // Left/Right still quick-cycle without opening the menu.
         // Snapshot starts at Any: right wraps to Never, left steps to Bluetooth.
         let msg = nudge_message(SettingsRow::AutoOpen, &s, 1).unwrap();
         assert!(matches!(
             msg,
-            StartMessage::SetAutoOpen(StartAutoOpen::Never)
+            LauncherMessage::SetAutoOpen(StartAutoOpen::Never)
         ));
         let msg = nudge_message(SettingsRow::AutoOpen, &s, -1).unwrap();
         assert!(matches!(
             msg,
-            StartMessage::SetAutoOpen(StartAutoOpen::Bluetooth)
+            LauncherMessage::SetAutoOpen(StartAutoOpen::Bluetooth)
         ));
     }
 
@@ -2273,14 +2286,14 @@ mod tests {
         let s = snap(true, true);
         // Confirm (Cross) expands the dropdown instead of changing the value.
         let msg = confirm_message(SettingsRow::ImmersiveLayout, &s).unwrap();
-        assert!(matches!(msg, StartMessage::ToggleLayoutMenu));
+        assert!(matches!(msg, LauncherMessage::ToggleLayoutMenu));
         // Left/Right quick-cycle without opening the menu (only two modes,
         // so either direction flips Vertical -> Horizontal).
         for delta in [1, -1] {
             let msg = nudge_message(SettingsRow::ImmersiveLayout, &s, delta).unwrap();
             assert!(matches!(
                 msg,
-                StartMessage::SetImmersiveLayout(ImmersiveLayout::Horizontal)
+                LauncherMessage::SetImmersiveLayout(ImmersiveLayout::Horizontal)
             ));
         }
         let mut h = s.clone();
@@ -2289,7 +2302,7 @@ mod tests {
             let msg = nudge_message(SettingsRow::ImmersiveLayout, &h, delta).unwrap();
             assert!(matches!(
                 msg,
-                StartMessage::SetImmersiveLayout(ImmersiveLayout::Vertical)
+                LauncherMessage::SetImmersiveLayout(ImmersiveLayout::Vertical)
             ));
         }
     }
@@ -2345,7 +2358,7 @@ mod tests {
             let row = SettingsRow::AutoOpen;
             let h = row.initial_highlight(&v);
             assert!(row.selector_selected(h, &v));
-            assert!(matches!(row.selector_select(h), StartMessage::SetAutoOpen(m) if m == mode));
+            assert!(matches!(row.selector_select(h), LauncherMessage::SetAutoOpen(m) if m == mode));
         }
         for layout in IMMERSIVE_LAYOUT_MODES {
             let mut v = snap(true, true);
@@ -2354,7 +2367,7 @@ mod tests {
             let h = row.initial_highlight(&v);
             assert!(row.selector_selected(h, &v));
             assert!(
-                matches!(row.selector_select(h), StartMessage::SetImmersiveLayout(l) if l == layout)
+                matches!(row.selector_select(h), LauncherMessage::SetImmersiveLayout(l) if l == layout)
             );
         }
         for navbar in NAVBAR_MODES {
@@ -2364,7 +2377,7 @@ mod tests {
             let h = row.initial_highlight(&v);
             assert!(row.selector_selected(h, &v));
             assert!(
-                matches!(row.selector_select(h), StartMessage::SetNavbarVisibility(n) if n == navbar)
+                matches!(row.selector_select(h), LauncherMessage::SetNavbarVisibility(n) if n == navbar)
             );
         }
         for motion in REDUCED_MOTION_MODES {
@@ -2374,7 +2387,7 @@ mod tests {
             let h = row.initial_highlight(&v);
             assert!(row.selector_selected(h, &v));
             assert!(
-                matches!(row.selector_select(h), StartMessage::SetReducedMotion(m) if m == motion)
+                matches!(row.selector_select(h), LauncherMessage::SetReducedMotion(m) if m == motion)
             );
         }
     }
@@ -2383,9 +2396,9 @@ mod tests {
     fn nudge_idle_steps() {
         let s = snap(true, true);
         let msg = nudge_message(SettingsRow::IdleSecs, &s, 1).unwrap();
-        assert!(matches!(msg, StartMessage::SetInactiveSecs(60)));
+        assert!(matches!(msg, LauncherMessage::SetInactiveSecs(60)));
         let msg = nudge_message(SettingsRow::IdleDim, &s, -1).unwrap();
-        assert!(matches!(msg, StartMessage::SetInactiveDimPercent(45)));
+        assert!(matches!(msg, LauncherMessage::SetInactiveDimPercent(45)));
     }
 
     #[test]
@@ -2395,11 +2408,11 @@ mod tests {
         let mut off = s.clone();
         off.sounds_enabled = false;
         let msg = nudge_message(SettingsRow::Sounds, &off, 1).unwrap();
-        assert!(matches!(msg, StartMessage::SetSounds(true)));
+        assert!(matches!(msg, LauncherMessage::SetSounds(true)));
         let msg = nudge_message(SettingsRow::Clock, &s, -1).unwrap();
-        assert!(matches!(msg, StartMessage::SetClock(false)));
+        assert!(matches!(msg, LauncherMessage::SetClock(false)));
         let msg = confirm_message(SettingsRow::Clock, &s).unwrap();
-        assert!(matches!(msg, StartMessage::SetClock(false)));
+        assert!(matches!(msg, LauncherMessage::SetClock(false)));
     }
 
     #[test]
@@ -2700,23 +2713,23 @@ mod tests {
         // Selectors open their dropdown menu instead of changing the value.
         assert!(matches!(
             confirm_message(SettingsRow::AutoOpen, &base),
-            Some(StartMessage::ToggleAutoOpenMenu)
+            Some(LauncherMessage::ToggleAutoOpenMenu)
         ));
         assert!(matches!(
             confirm_message(SettingsRow::SelectionMode, &base),
-            Some(StartMessage::ToggleSelectionModeMenu)
+            Some(LauncherMessage::ToggleSelectionModeMenu)
         ));
         assert!(matches!(
             confirm_message(SettingsRow::ImmersiveLayout, &base),
-            Some(StartMessage::ToggleLayoutMenu)
+            Some(LauncherMessage::ToggleLayoutMenu)
         ));
         assert!(matches!(
             confirm_message(SettingsRow::Navbar, &base),
-            Some(StartMessage::ToggleNavbarMenu)
+            Some(LauncherMessage::ToggleNavbarMenu)
         ));
         assert!(matches!(
             confirm_message(SettingsRow::ReducedMotion, &base),
-            Some(StartMessage::ToggleReducedMotionMenu)
+            Some(LauncherMessage::ToggleReducedMotionMenu)
         ));
         // Toggles always flip, from either state.
         for on in [false, true] {
@@ -2725,7 +2738,7 @@ mod tests {
             assert!(
                 matches!(
                     confirm_message(SettingsRow::SelectionPersist, &s),
-                    Some(StartMessage::SetSelectionPersist(v)) if v == !on
+                    Some(LauncherMessage::SetSelectionPersist(v)) if v == !on
                 ),
                 "SelectionPersist confirm from {on}"
             );
@@ -2734,7 +2747,7 @@ mod tests {
             assert!(
                 matches!(
                     confirm_message(SettingsRow::Clock, &s),
-                    Some(StartMessage::SetClock(v)) if v == !on
+                    Some(LauncherMessage::SetClock(v)) if v == !on
                 ),
                 "Clock confirm from {on}"
             );
@@ -2743,7 +2756,7 @@ mod tests {
             assert!(
                 matches!(
                     confirm_message(SettingsRow::Sounds, &s),
-                    Some(StartMessage::SetSounds(v)) if v == !on
+                    Some(LauncherMessage::SetSounds(v)) if v == !on
                 ),
                 "Sounds confirm from {on}"
             );
@@ -2752,7 +2765,7 @@ mod tests {
             assert!(
                 matches!(
                     confirm_message(SettingsRow::Haptics, &s),
-                    Some(StartMessage::SetHaptics(v)) if v == !on
+                    Some(LauncherMessage::SetHaptics(v)) if v == !on
                 ),
                 "Haptics confirm from {on}"
             );
@@ -2761,7 +2774,7 @@ mod tests {
             assert!(
                 matches!(
                     confirm_message(SettingsRow::PerfThrottle, &s),
-                    Some(StartMessage::SetPerfThrottle(v)) if v == !on
+                    Some(LauncherMessage::SetPerfThrottle(v)) if v == !on
                 ),
                 "PerfThrottle confirm from {on}"
             );
@@ -2770,7 +2783,7 @@ mod tests {
             assert!(
                 matches!(
                     confirm_message(SettingsRow::PerfAntialiasing, &s),
-                    Some(StartMessage::SetPerfAntialiasing(v)) if v == !on
+                    Some(LauncherMessage::SetPerfAntialiasing(v)) if v == !on
                 ),
                 "PerfAntialiasing confirm from {on}"
             );
@@ -2779,7 +2792,7 @@ mod tests {
             assert!(
                 matches!(
                     confirm_message(SettingsRow::PerfVsync, &s),
-                    Some(StartMessage::SetPerfVsync(v)) if v == !on
+                    Some(LauncherMessage::SetPerfVsync(v)) if v == !on
                 ),
                 "PerfVsync confirm from {on}"
             );
@@ -2820,7 +2833,7 @@ mod tests {
         assert_eq!(rows.last(), Some(&SettingsRow::PerfReload));
         assert!(matches!(
             confirm_message(SettingsRow::PerfReload, &dirty),
-            Some(StartMessage::ReloadUi)
+            Some(LauncherMessage::ReloadUi)
         ));
         assert!(nudge_message(SettingsRow::PerfReload, &dirty, 1).is_none());
         assert!(nudge_message(SettingsRow::PerfReload, &dirty, -1).is_none());
@@ -2842,12 +2855,12 @@ mod tests {
                 assert!(nudge_message(SettingsRow::Clock, &s, 1).is_none());
                 assert!(matches!(
                     nudge_message(SettingsRow::Clock, &s, -1),
-                    Some(StartMessage::SetClock(false))
+                    Some(LauncherMessage::SetClock(false))
                 ));
             } else {
                 assert!(matches!(
                     nudge_message(SettingsRow::Clock, &s, 1),
-                    Some(StartMessage::SetClock(true))
+                    Some(LauncherMessage::SetClock(true))
                 ));
                 assert!(nudge_message(SettingsRow::Clock, &s, -1).is_none());
             }
@@ -2857,12 +2870,12 @@ mod tests {
                 assert!(nudge_message(SettingsRow::Sounds, &s, 1).is_none());
                 assert!(matches!(
                     nudge_message(SettingsRow::Sounds, &s, -1),
-                    Some(StartMessage::SetSounds(false))
+                    Some(LauncherMessage::SetSounds(false))
                 ));
             } else {
                 assert!(matches!(
                     nudge_message(SettingsRow::Sounds, &s, 1),
-                    Some(StartMessage::SetSounds(true))
+                    Some(LauncherMessage::SetSounds(true))
                 ));
                 assert!(nudge_message(SettingsRow::Sounds, &s, -1).is_none());
             }
@@ -2872,12 +2885,12 @@ mod tests {
                 assert!(nudge_message(SettingsRow::Haptics, &s, 1).is_none());
                 assert!(matches!(
                     nudge_message(SettingsRow::Haptics, &s, -1),
-                    Some(StartMessage::SetHaptics(false))
+                    Some(LauncherMessage::SetHaptics(false))
                 ));
             } else {
                 assert!(matches!(
                     nudge_message(SettingsRow::Haptics, &s, 1),
-                    Some(StartMessage::SetHaptics(true))
+                    Some(LauncherMessage::SetHaptics(true))
                 ));
                 assert!(nudge_message(SettingsRow::Haptics, &s, -1).is_none());
             }
@@ -2911,14 +2924,14 @@ mod tests {
             assert!(
                 matches!(
                     nudge_message(SettingsRow::AutoOpen, &s, 1),
-                    Some(StartMessage::SetAutoOpen(v)) if v == right
+                    Some(LauncherMessage::SetAutoOpen(v)) if v == right
                 ),
                 "AutoOpen {mode:?} right"
             );
             assert!(
                 matches!(
                     nudge_message(SettingsRow::AutoOpen, &s, -1),
-                    Some(StartMessage::SetAutoOpen(v)) if v == left
+                    Some(LauncherMessage::SetAutoOpen(v)) if v == left
                 ),
                 "AutoOpen {mode:?} left"
             );
@@ -2933,7 +2946,7 @@ mod tests {
                 assert!(
                     matches!(
                         nudge_message(SettingsRow::ImmersiveLayout, &s, delta),
-                        Some(StartMessage::SetImmersiveLayout(v)) if v == cycled
+                        Some(LauncherMessage::SetImmersiveLayout(v)) if v == cycled
                     ),
                     "Layout {layout:?} delta {delta}"
                 );
@@ -2949,7 +2962,7 @@ mod tests {
                 assert!(
                     matches!(
                         nudge_message(SettingsRow::Navbar, &s, delta),
-                        Some(StartMessage::SetNavbarVisibility(v)) if v == cycled
+                        Some(LauncherMessage::SetNavbarVisibility(v)) if v == cycled
                     ),
                     "Navbar {navbar:?} delta {delta}"
                 );
@@ -2966,7 +2979,7 @@ mod tests {
                 assert!(
                     matches!(
                         nudge_message(SettingsRow::ReducedMotion, &s, delta),
-                        Some(StartMessage::SetReducedMotion(v)) if v == cycled
+                        Some(LauncherMessage::SetReducedMotion(v)) if v == cycled
                     ),
                     "ReducedMotion {motion:?} delta {delta}"
                 );
@@ -2982,47 +2995,47 @@ mod tests {
         // IdleSecs steps: [5, 15, 30, 60, 120, 180, 300, 600]; base inactive = 30.
         assert!(matches!(
             nudge_message(SettingsRow::IdleSecs, &base, 1),
-            Some(StartMessage::SetInactiveSecs(60))
+            Some(LauncherMessage::SetInactiveSecs(60))
         ));
         assert!(matches!(
             nudge_message(SettingsRow::IdleSecs, &base, -1),
-            Some(StartMessage::SetInactiveSecs(15))
+            Some(LauncherMessage::SetInactiveSecs(15))
         ));
         let mut s = base.clone();
         s.inactive_secs = 5;
         assert!(nudge_message(SettingsRow::IdleSecs, &s, -1).is_none());
         assert!(matches!(
             nudge_message(SettingsRow::IdleSecs, &s, 1),
-            Some(StartMessage::SetInactiveSecs(15))
+            Some(LauncherMessage::SetInactiveSecs(15))
         ));
         s.inactive_secs = 600;
         assert!(nudge_message(SettingsRow::IdleSecs, &s, 1).is_none());
         assert!(matches!(
             nudge_message(SettingsRow::IdleSecs, &s, -1),
-            Some(StartMessage::SetInactiveSecs(300))
+            Some(LauncherMessage::SetInactiveSecs(300))
         ));
         // SleepSecs with inactive = 30: min sleep 60, full choice table.
         // Base sleep = 120.
         assert!(matches!(
             nudge_message(SettingsRow::SleepSecs, &base, 1),
-            Some(StartMessage::SetSleepSecs(180))
+            Some(LauncherMessage::SetSleepSecs(180))
         ));
         assert!(matches!(
             nudge_message(SettingsRow::SleepSecs, &base, -1),
-            Some(StartMessage::SetSleepSecs(60))
+            Some(LauncherMessage::SetSleepSecs(60))
         ));
         s = base.clone();
         s.sleep_secs = 60;
         assert!(nudge_message(SettingsRow::SleepSecs, &s, -1).is_none());
         assert!(matches!(
             nudge_message(SettingsRow::SleepSecs, &s, 1),
-            Some(StartMessage::SetSleepSecs(120))
+            Some(LauncherMessage::SetSleepSecs(120))
         ));
         s.sleep_secs = 3600;
         assert!(nudge_message(SettingsRow::SleepSecs, &s, 1).is_none());
         assert!(matches!(
             nudge_message(SettingsRow::SleepSecs, &s, -1),
-            Some(StartMessage::SetSleepSecs(3300))
+            Some(LauncherMessage::SetSleepSecs(3300))
         ));
         // SleepSecs constrained by a large idle (inactive 600 -> min sleep 900).
         s = base.clone();
@@ -3031,7 +3044,7 @@ mod tests {
         assert!(nudge_message(SettingsRow::SleepSecs, &s, -1).is_none());
         assert!(matches!(
             nudge_message(SettingsRow::SleepSecs, &s, 1),
-            Some(StartMessage::SetSleepSecs(1200))
+            Some(LauncherMessage::SetSleepSecs(1200))
         ));
         // Percent sliders step by 5: 0 / 50 / 100 × left/right.
         let mut s = base.clone();
@@ -3039,21 +3052,21 @@ mod tests {
         assert!(nudge_message(SettingsRow::IdleDim, &s, -1).is_none());
         assert!(matches!(
             nudge_message(SettingsRow::IdleDim, &s, 1),
-            Some(StartMessage::SetInactiveDimPercent(5))
+            Some(LauncherMessage::SetInactiveDimPercent(5))
         ));
         s.inactive_dim_percent = 50;
         assert!(matches!(
             nudge_message(SettingsRow::IdleDim, &s, -1),
-            Some(StartMessage::SetInactiveDimPercent(45))
+            Some(LauncherMessage::SetInactiveDimPercent(45))
         ));
         assert!(matches!(
             nudge_message(SettingsRow::IdleDim, &s, 1),
-            Some(StartMessage::SetInactiveDimPercent(55))
+            Some(LauncherMessage::SetInactiveDimPercent(55))
         ));
         s.inactive_dim_percent = 100;
         assert!(matches!(
             nudge_message(SettingsRow::IdleDim, &s, -1),
-            Some(StartMessage::SetInactiveDimPercent(95))
+            Some(LauncherMessage::SetInactiveDimPercent(95))
         ));
         assert!(nudge_message(SettingsRow::IdleDim, &s, 1).is_none());
         s = base.clone();
@@ -3061,21 +3074,21 @@ mod tests {
         assert!(nudge_message(SettingsRow::SoundVolume, &s, -1).is_none());
         assert!(matches!(
             nudge_message(SettingsRow::SoundVolume, &s, 1),
-            Some(StartMessage::SetSoundVolume(5))
+            Some(LauncherMessage::SetSoundVolume(5))
         ));
         s.sound_volume = 50;
         assert!(matches!(
             nudge_message(SettingsRow::SoundVolume, &s, -1),
-            Some(StartMessage::SetSoundVolume(45))
+            Some(LauncherMessage::SetSoundVolume(45))
         ));
         assert!(matches!(
             nudge_message(SettingsRow::SoundVolume, &s, 1),
-            Some(StartMessage::SetSoundVolume(55))
+            Some(LauncherMessage::SetSoundVolume(55))
         ));
         s.sound_volume = 100;
         assert!(matches!(
             nudge_message(SettingsRow::SoundVolume, &s, -1),
-            Some(StartMessage::SetSoundVolume(95))
+            Some(LauncherMessage::SetSoundVolume(95))
         ));
         assert!(nudge_message(SettingsRow::SoundVolume, &s, 1).is_none());
         s = base.clone();
@@ -3083,21 +3096,21 @@ mod tests {
         assert!(nudge_message(SettingsRow::HapticsStrength, &s, -1).is_none());
         assert!(matches!(
             nudge_message(SettingsRow::HapticsStrength, &s, 1),
-            Some(StartMessage::SetHapticsStrength(5))
+            Some(LauncherMessage::SetHapticsStrength(5))
         ));
         s.haptics_strength = 50;
         assert!(matches!(
             nudge_message(SettingsRow::HapticsStrength, &s, -1),
-            Some(StartMessage::SetHapticsStrength(45))
+            Some(LauncherMessage::SetHapticsStrength(45))
         ));
         assert!(matches!(
             nudge_message(SettingsRow::HapticsStrength, &s, 1),
-            Some(StartMessage::SetHapticsStrength(55))
+            Some(LauncherMessage::SetHapticsStrength(55))
         ));
         s.haptics_strength = 100;
         assert!(matches!(
             nudge_message(SettingsRow::HapticsStrength, &s, -1),
-            Some(StartMessage::SetHapticsStrength(95))
+            Some(LauncherMessage::SetHapticsStrength(95))
         ));
         assert!(nudge_message(SettingsRow::HapticsStrength, &s, 1).is_none());
     }
@@ -3148,11 +3161,11 @@ mod tests {
     #[test]
     fn slider_select_matches_panel_positions() {
         let s = snap(true, true);
-        for (i, &secs) in START_SCREEN_IDLE_SECS_STEPS.iter().enumerate() {
+        for (i, &secs) in LAUNCHER_IDLE_SECS_STEPS.iter().enumerate() {
             assert!(
                 matches!(
                     SettingsRow::IdleSecs.slider_select(&s, i as f32),
-                    StartMessage::SetInactiveSecs(v) if v == secs
+                    LauncherMessage::SetInactiveSecs(v) if v == secs
                 ),
                 "idle position {i}"
             );
@@ -3163,34 +3176,34 @@ mod tests {
             assert!(
                 matches!(
                     SettingsRow::SleepSecs.slider_select(&s, i as f32),
-                    StartMessage::SetSleepSecs(v) if v == secs
+                    LauncherMessage::SetSleepSecs(v) if v == secs
                 ),
                 "sleep position {i}"
             );
         }
         assert!(matches!(
             SettingsRow::IdleDim.slider_select(&s, 47.4),
-            StartMessage::SetInactiveDimPercent(47)
+            LauncherMessage::SetInactiveDimPercent(47)
         ));
         assert!(matches!(
             SettingsRow::SoundVolume.slider_select(&s, 55.5),
-            StartMessage::SetSoundVolume(56)
+            LauncherMessage::SetSoundVolume(56)
         ));
         assert!(matches!(
             SettingsRow::HapticsStrength.slider_select(&s, 5.0),
-            StartMessage::SetHapticsStrength(5)
+            LauncherMessage::SetHapticsStrength(5)
         ));
         // Out-of-range drag positions clamp onto the tables (never panic),
         // matching the position math's `.min(len - 1)`.
-        let last_idle = *START_SCREEN_IDLE_SECS_STEPS.last().unwrap();
+        let last_idle = *LAUNCHER_IDLE_SECS_STEPS.last().unwrap();
         assert!(matches!(
             SettingsRow::IdleSecs.slider_select(&s, 999.0),
-            StartMessage::SetInactiveSecs(v) if v == last_idle
+            LauncherMessage::SetInactiveSecs(v) if v == last_idle
         ));
         let last_sleep = *choices.last().unwrap();
         assert!(matches!(
             SettingsRow::SleepSecs.slider_select(&s, 999.0),
-            StartMessage::SetSleepSecs(v) if v == last_sleep
+            LauncherMessage::SetSleepSecs(v) if v == last_sleep
         ));
     }
 

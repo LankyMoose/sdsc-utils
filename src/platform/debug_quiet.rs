@@ -6,7 +6,7 @@
 //! without `SDSC_DEBUG_OPEN` still goes to the secondary monitor. While quiet:
 //! windows never take focus and are relocated from the primary monitor to a
 //! secondary one (`ui::layout::{focus_window, show_window, move_window}`), pad
-//! edges are dropped, and UI sounds / Start haptics are muted — so a debug
+//! edges are dropped, and UI sounds / Launcher haptics are muted — so a debug
 //! session cannot interrupt a game running on the primary monitor. Set
 //! `SDSC_DEBUG_INPUT=1` to keep pad edges live in quiet mode (the install QA
 //! console uses this to drive the hub on the secondary monitor while a game

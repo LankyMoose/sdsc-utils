@@ -8,7 +8,7 @@
 //! transform, so stacking, clipping, and input keep working.
 //!
 //! Used for dialog enter/exit tweens (see
-//! [`crate::ui::start::overlay`]): layout reserves the full-size card for
+//! [`crate::ui::launcher::overlay`]): layout reserves the full-size card for
 //! the whole tween while only the paint scales, so neighbors never reflow.
 //!
 //! Contract:

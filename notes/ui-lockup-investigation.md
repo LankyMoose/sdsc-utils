@@ -2,7 +2,7 @@
 
 **Status:** playbook. **When to read:** chasing UI/pad freezes, extending debug diagnostics, reading hitch marks. Index: [README.md](README.md).
 
-**Related notes:** [windows-bt-lightbar.md](windows-bt-lightbar.md) · [windows-toast.md](windows-toast.md) · [start-immersive.md](start-immersive.md) · [hid-live-session.md](hid-live-session.md) · [wgpu-image-atlas-crash.md](wgpu-image-atlas-crash.md)
+**Related notes:** [windows-bt-lightbar.md](windows-bt-lightbar.md) · [windows-toast.md](windows-toast.md) · [launcher-immersive.md](launcher-immersive.md) · [hid-live-session.md](hid-live-session.md) · [wgpu-image-atlas-crash.md](wgpu-image-atlas-crash.md)
 
 Hand-off notes. **Fix landed (reuse HidApi):** worker keeps one long-lived `HidApi`, refreshes via `refresh_devices()` on a throttle (not every sample), shares that api into Poll/Identify/lightbar/power-off, **does not clear** the input snapshot on Poll, publishes presence paths for the UI tick (no UI-thread `HidApi::new`), runs process enum via `Task::perform`, and Identify is **4 flashes / 1s** (`IDENTIFY_FLASH_COUNT=4`, `IDENTIFY_FLASH_MS=125`).
 
@@ -14,7 +14,7 @@ Historical evidence of the ~5s freezes is preserved below (`last_op=hidapi_new`,
 
 ## Symptoms (pre-fix)
 
-1. Occasional start-screen pad nav lock-up (keyboard/mouse may still work).
+1. Occasional Launcher pad nav lock-up (keyboard/mouse may still work).
 2. Occasional full freeze (pad + UI) lasting multiple seconds.
 3. Occasional lightbar write that appears to do nothing.
 4. Early hypothesis: Steam Input holding the DualSense interface — **not supported by the captured input hitches** (no `err=` / access denied; all opens/reads `ok`, `steam=1`).
@@ -46,7 +46,7 @@ Was ~1.7s (5×150 ms×2). Now 4 flashes × 125 ms × 2 half-steps = **1.0s**
 
 ### D. Hot-path `hidapi_refresh` (~5s pad stall) — **fixed**
 
-Was: `enum_due` used `PRESENCE_INTERVAL_EMPTY` (500 ms) whenever `input_hot`, so Start / pad-input put `HidApi::refresh_devices()` on the hot sample path. On Windows that enum often takes ~5 s (`slow op=hidapi_refresh ms≈5012` + `pad-input stall gap_ms≈5005`).
+Was: `enum_due` used `PRESENCE_INTERVAL_EMPTY` (500 ms) whenever `input_hot`, so Launcher / pad-input put `HidApi::refresh_devices()` on the hot sample path. On Windows that enum often takes ~5 s (`slow op=hidapi_refresh ms≈5012` + `pad-input stall gap_ms≈5005`).
 
 Now: empty device cache still uses EMPTY cadence (first connect); once pads are open, use `PRESENCE_INTERVAL` and **defer** refresh while `input_hot` so sampling keeps reading open handles. Debug: `hidapi_refresh begin` / `end ms=` / `deferred input_hot=1` / `sample_all ensure_ms=`.
 
@@ -73,14 +73,14 @@ Shell client mode has no local `INPUT_SNAPSHOT` (`shell: client mode (service ow
 - `hid-diag: worker stall kind=op|idle last_op=... gap_ms=... tier=250|500|1000|2000|5000`
 - `start-nav: no … snapshot` / `snapshot restored` / `snapshot stale`
 - `ui-diag: pad-input stall` / `pad-poll stall` / `pad-poll slow` / `process-enum`
-- `ui-diag: start cursor hide` / `start cursor show` — immersive idle cursor hide (debug builds)
+- `ui-diag: launcher cursor hide` / `start cursor show` — immersive idle cursor hide (debug builds)
 - `HITCH_MARK kind=lightbar|input source=hotkey|button` — shell client also `client=1`
 - `shell: client mode (service owns HID + tray)` — local snapshot is unused; do not trust `NeverPublished` on F8 without `client=1`
 - `PANIC at file:line:col: …` — custom hook in [`app_log::init`](../src/platform/app_log.rs); required because `windows_subsystem = "windows"` discards stderr panic text (exit 101 with an empty console)
 - `PANIC_BACKTRACE …` — capped `Backtrace::force_capture()` right after `PANIC at` (all builds); use to tell iced atlas/main-thread from the image worker
 - `crash-restart: scheduled` / `launching` / `giving up after N` — panic hook arms a delayed self-relaunch ([`crash_restart`](../src/platform/crash_restart.rs)); budget file `crash-restart.json` caps 3 restarts / 10 min
 - `crash-restart: notice toast` — post-relaunch (or `--test-crash-toast`) one-shot toast with bug icon; `notice` flag in `crash-restart.json`
-- **Sibling:** wgpu `iced_wgpu::image texture atlas` / `Texture::create_view` panics (seen on **v1.4.1** after the stable-Rgba mitigation) → [`wgpu-image-atlas-crash.md`](wgpu-image-atlas-crash.md). Not fixed by toast/Start slide latch work.
+- **Sibling:** wgpu `iced_wgpu::image texture atlas` / `Texture::create_view` panics (seen on **v1.4.1** after the stable-Rgba mitigation) → [`wgpu-image-atlas-crash.md`](wgpu-image-atlas-crash.md). Not fixed by toast/Launcher slide latch work.
 
 ## How to tell causes apart
 
@@ -107,13 +107,13 @@ Shell client mode has no local `INPUT_SNAPSHOT` (`shell: client mode (service ow
 
 - Pad nav >30 s; Identify (~1s, 4 flashes); F7/F8 if anything still freezes.
 - Grep `slow op=hidapi_new` / `last_op=hidapi_new` — should be **absent**.
-- Grep `hidapi_refresh` — should not fire every sample; while Start is open with pads, prefer `deferred input_hot=1` over `begin`/`slow op=hidapi_refresh ms=5xxx`.
+- Grep `hidapi_refresh` — should not fire every sample; while Launcher is open with pads, prefer `deferred input_hot=1` over `begin`/`slow op=hidapi_refresh ms=5xxx`.
 - Shell client: F8 should show `client=1` and non-zero pads when IPC edges are flowing (not `NeverPublished`).
 - Confirm Identify / lightbar / power-off / running badge / connect-disconnect.
 
 ## 5–30s playbook (hidapi_refresh + client F8)
 
-1. Reproduce pad stall on Start / pad-input (debug build). Note wall clock or press **F8**.
+1. Reproduce pad stall on Launcher / pad-input (debug build). Note wall clock or press **F8**.
 2. Grep `app.log` for the session id, then **5–30 s before** the mark:
    - `worker stall … last_op=hidapi_refresh` → `slow op=hidapi_refresh ms≈5xxx`
    - matching `ui-diag: pad-input stall gap_ms≈5xxx`

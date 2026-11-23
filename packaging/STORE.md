@@ -17,18 +17,18 @@ SDSC Utils
 
 ### Short description
 
-System tray DualSense battery, lightbar, toasts, and start-screen game launcher.
+System tray DualSense battery, lightbar, toasts, and the Launcher game console.
 
 ### Description (full)
 
-SDSC Utils is a Windows system-tray utility for DualSense battery status, lightbar colors, Identify flash, overlay toasts, an optional DualSense start-screen game launcher, and optional local remaining-time estimates.
+SDSC Utils is a Windows system-tray utility for DualSense battery status, lightbar colors, Identify flash, overlay toasts, an optional DualSense Launcher (fullscreen game console), and optional local remaining-time estimates.
 
 What you get
 • Tray icon and popup for connected controllers, with optional nicknames and Remember for disconnected pads
-• Start screen quick-launch when the first pad connects: Steam games and manual shortcuts, DualSense navigation and controller haptics, Games and Controllers tabs
+• Launcher quick-launch when the first pad connects: Steam games and manual shortcuts, DualSense navigation and controller haptics, Games and Controllers tabs
 • Overlay toasts for connect, disconnect, low battery, and charge complete
 • Battery-driven lightbar spectrum (customizable; can be turned off) and Identify to find the right pad
-• Soft power-off over Bluetooth from the popup or start screen
+• Soft power-off over Bluetooth from the popup or Launcher
 • Optional launch at Windows sign-in
 • Opt-in battery analytics stored only on your PC (off by default)
 
@@ -45,12 +45,12 @@ Unofficial third-party utility — not affiliated with, endorsed by, or sponsore
 - **Compatibility (body):** Works with DualSense wireless controllers and DualSense Edge wireless controllers.
 - **Disclaimer:** Unofficial. DualSense, DualSense Edge, PlayStation, and related marks are trademarks of Sony Interactive Entertainment Inc. This app is not affiliated with, endorsed by, or sponsored by Sony.
 - **Privacy policy URL:** the Privacy policy section of the GitHub README (`https://github.com/LankyMoose/sdsc-utils#privacy-policy`).
-- **Screenshots:** use `assets/screenshots/1.7.0/` (controllers popup, Start screen / settings drawer, Settings System / Notifications / Lightbar / Analytics tabs). Older sets are archived under `assets/screenshots/<version>/`.
+- **Screenshots:** use `assets/screenshots/1.7.0/` (controllers popup, Launcher / settings drawer, Settings System / Notifications / Lightbar / Analytics tabs). Older sets are archived under `assets/screenshots/<version>/`.
 - **Age rating:** complete the questionnaire (expect Everyone / suitable for all ages for this utility).
 
 ## Capabilities justification
 
-When asked about `runFullTrust`: tray icon + raw DualSense HID (`hidapi`) for battery, lightbar, identify, and start-screen input.
+When asked about `runFullTrust`: tray icon + raw DualSense HID (`hidapi`) for battery, lightbar, identify, and Launcher input.
 
 ## First upload / update
 

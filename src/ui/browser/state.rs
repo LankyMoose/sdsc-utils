@@ -1,8 +1,8 @@
 //! Browser app state: tabs, per-tab page state, chrome targets, cursor.
 //!
-//! Extracted from the Start view so the browser is a top-level managed app
+//! Extracted from the Launcher view so the browser is a top-level managed app
 //! (see `notes/browser-hub-pivot.md`, phase 0). UI-only: the render code
-//! stays in `ui::start` until the standalone Browser window lands.
+//! stays in `ui::launcher` until the standalone Browser window lands.
 
 use crate::ui::text_fit;
 use std::collections::HashMap;

@@ -1,18 +1,18 @@
-//! Start-screen footer + hint assembly.
+//! Launcher footer + hint assembly.
 //!
-//! Split from [`crate::ui::start::view`]: footer hints and immersive hint
+//! Split from [`crate::ui::launcher::view`]: footer hints and immersive hint
 //! clusters live here. Face glyph primitives come from [`crate::ui::face`], modal bodies
-//! from [`crate::ui::start::settings`], press ownership and state from `view`.
+//! from [`crate::ui::launcher::settings`], press ownership and state from `view`.
 
 use crate::persist::prefs::GamesSortMode;
 use crate::ui::face::{
     ActionHint, FaceButton, FacePressAnim, RingStyle, action_cluster, face_glyph, face_glyph_stack,
     face_hint, face_hold_hint, hint_text_capsule,
 };
-use crate::ui::start::input::FaceHeld;
-use crate::ui::start::view::{
-    EditRow, HintPress, HintPressOwner, LaunchStatus, ROW_ACTION_SPACING, RowHintState,
-    StartMessage, StartRow, State,
+use crate::ui::launcher::input::FaceHeld;
+use crate::ui::launcher::view::{
+    EditRow, HintPress, HintPressOwner, LaunchStatus, LauncherMessage, LauncherRow,
+    ROW_ACTION_SPACING, RowHintState, State,
 };
 use crate::ui::theme;
 use iced::widget::{button, container, row, text};
@@ -26,9 +26,9 @@ const FOOTER_SPLIT_MIN_W: f32 = 680.0;
 
 /// Edit-mode membership mark for the immersive hero meta column.
 pub(crate) fn immersive_game_membership_label(
-    row: &StartRow,
+    row: &LauncherRow,
     alpha: f32,
-) -> Element<'static, StartMessage> {
+) -> Element<'static, LauncherMessage> {
     let a = alpha.clamp(0.0, 1.0);
     let in_lib = row.in_catalog();
     let mark = if in_lib { "✓" } else { "○" };
@@ -60,10 +60,10 @@ pub(crate) fn immersive_game_membership_label(
 /// `alpha` fades the whole cluster with the strip scroll (see
 /// [`State::hero_overlay_alpha`]); other callers pass 1.0.
 pub(crate) fn immersive_game_hints(
-    row: &StartRow,
+    row: &LauncherRow,
     state: &State,
     alpha: f32,
-) -> Element<'static, StartMessage> {
+) -> Element<'static, LauncherMessage> {
     let hint = RowHintState::for_selected(state, true, HintPressOwner::Browse);
     let mut actions = Vec::new();
     let status = if state.editing {
@@ -137,7 +137,7 @@ pub(crate) fn immersive_game_hints(
                     .color(theme::alpha(theme::ACCENT, a))
             )
             .padding([4, 10])
-            .on_press(StartMessage::EditManual)
+            .on_press(LauncherMessage::EditManual)
             .style(theme::ghost),
         ]
         .spacing(6)
@@ -151,7 +151,7 @@ pub(crate) fn immersive_game_hints(
 /// Mouse hitch markers (not pad-navigable). Stamps `HITCH_MARK` in the logs.
 /// Debug builds only. Rendered above the footer capsule.
 #[cfg(debug_assertions)]
-pub(crate) fn diag_report_bar() -> Element<'static, StartMessage> {
+pub(crate) fn diag_report_bar() -> Element<'static, LauncherMessage> {
     row![
         button(
             text("Report lightbar write failure (F7)")
@@ -159,7 +159,7 @@ pub(crate) fn diag_report_bar() -> Element<'static, StartMessage> {
                 .color(theme::MUTED),
         )
         .padding([4, 8])
-        .on_press(StartMessage::ReportLightbarFailure)
+        .on_press(LauncherMessage::ReportLightbarFailure)
         .style(theme::ghost),
         button(
             text("Report input failure (F8)")
@@ -167,7 +167,7 @@ pub(crate) fn diag_report_bar() -> Element<'static, StartMessage> {
                 .color(theme::MUTED),
         )
         .padding([4, 8])
-        .on_press(StartMessage::ReportInputFailure)
+        .on_press(LauncherMessage::ReportInputFailure)
         .style(theme::ghost),
     ]
     .spacing(8)
@@ -178,7 +178,7 @@ pub(crate) fn diag_report_bar() -> Element<'static, StartMessage> {
 pub(crate) fn empty_games_browse_prompt(
     state: &State,
     text_size: f32,
-) -> Element<'static, StartMessage> {
+) -> Element<'static, LauncherMessage> {
     let press = HintPress::for_owner(state, HintPressOwner::Browse);
     let face = FaceButton::Triangle;
     let style = if face.held(press.held) {
@@ -200,7 +200,7 @@ pub(crate) fn empty_games_browse_prompt(
     .into()
 }
 
-pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a, StartMessage> {
+pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a, LauncherMessage> {
     // Settings keeps its own footer inside the panel. Dialog cards own
     // their hint rows (manual form and replace confirm both render live
     // hints inside the card), so the island never mirrors modal state:
@@ -208,7 +208,7 @@ pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a,
     // idle press visuals behind either dim.
     let press = HintPress::for_owner(state, HintPressOwner::Browse);
     // Circle closes (Cancel while editing) regardless of the dock state.
-    let circle_label = crate::ui::start::mode::cancel_circle_label(state.editing);
+    let circle_label = crate::ui::launcher::mode::cancel_circle_label(state.editing);
 
     // Split layout: secondary (sort / controllers / Settings) left,
     // primary actions right.
@@ -227,7 +227,7 @@ pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a,
         ),
     ];
     let actions = action_cluster(&hints, flat_hints);
-    let (secondary, actions): (Element<'a, StartMessage>, Element<'a, StartMessage>) =
+    let (secondary, actions): (Element<'a, LauncherMessage>, Element<'a, LauncherMessage>) =
         if state.editing {
             (
                 footer_secondary_row(
@@ -250,7 +250,7 @@ pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a,
                     Some(
                         button(text("Add shortcut…").size(14.0).color(theme::ACCENT))
                             .padding([6, 12])
-                            .on_press(StartMessage::AddShortcut)
+                            .on_press(LauncherMessage::AddShortcut)
                             .style(theme::ghost)
                             .into(),
                     ),
@@ -259,7 +259,7 @@ pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a,
                 actions,
             )
         } else {
-            // Left: Edit + sort + Browser. Right: Select + Start + Close.
+            // Left: Edit + sort + Browser. Right: Select + Launcher + Close.
             (
                 row![
                     action_cluster(
@@ -313,10 +313,10 @@ pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a,
 }
 
 fn footer_secondary_row<'a>(
-    view: Option<Element<'a, StartMessage>>,
-    controllers: Option<Element<'a, StartMessage>>,
-    settings: Option<Element<'a, StartMessage>>,
-) -> Element<'a, StartMessage> {
+    view: Option<Element<'a, LauncherMessage>>,
+    controllers: Option<Element<'a, LauncherMessage>>,
+    settings: Option<Element<'a, LauncherMessage>>,
+) -> Element<'a, LauncherMessage> {
     let mut row = iced::widget::row![]
         .spacing(FOOTER_SECONDARY_GAP)
         .align_y(Alignment::Center);
@@ -333,9 +333,9 @@ fn footer_secondary_row<'a>(
 }
 
 fn compose_footer_split<'a>(
-    secondary: Element<'a, StartMessage>,
-    actions: Element<'a, StartMessage>,
-) -> Element<'a, StartMessage> {
+    secondary: Element<'a, LauncherMessage>,
+    actions: Element<'a, LauncherMessage>,
+) -> Element<'a, LauncherMessage> {
     iced::widget::row![
         container(secondary)
             .width(Fill)
@@ -355,8 +355,8 @@ fn options_hint_el(
     held: FaceHeld,
     press_anim: FacePressAnim,
     flat: bool,
-) -> Element<'static, StartMessage> {
-    let glyph = start_options_capsule(held.options, press_anim.options, flat);
+) -> Element<'static, LauncherMessage> {
+    let glyph = launcher_options_capsule(held.options, press_anim.options, flat);
     row![glyph, text(label).size(14.0).color(theme::MUTED)]
         .spacing(8)
         .align_y(Alignment::Center)
@@ -364,11 +364,11 @@ fn options_hint_el(
 }
 
 /// DualSense Options → START capsule (visual height matches face-ring idle diameter).
-fn start_options_capsule(
+fn launcher_options_capsule(
     pressed: bool,
     press_t: f32,
     flat: bool,
-) -> Element<'static, StartMessage> {
+) -> Element<'static, LauncherMessage> {
     let label = text("START")
         .size(12.0)
         .font(Font::MONOSPACE)
@@ -377,7 +377,10 @@ fn start_options_capsule(
     hint_text_capsule(label, 10.0, 1.0, pressed, press_t, flat, 1.0)
 }
 
-fn footer_band(content: Element<'_, StartMessage>, expand: bool) -> Element<'_, StartMessage> {
+fn footer_band(
+    content: Element<'_, LauncherMessage>,
+    expand: bool,
+) -> Element<'_, LauncherMessage> {
     // Modals: hug the action cluster. Browse split: widen so left/right pack.
     let band = container(content)
         .height(Length::Fixed(IMMERSIVE_FOOTER_HEIGHT))
@@ -397,7 +400,7 @@ pub(crate) fn face_cycle_toggle(
     press_anim: FacePressAnim,
     options: &[(&'static str, bool)],
     flat: bool,
-) -> Element<'static, StartMessage> {
+) -> Element<'static, LauncherMessage> {
     let dim = theme::alpha(theme::MUTED, 0.45);
     let glyph = face_glyph(
         face,
@@ -421,7 +424,7 @@ pub(crate) fn face_cycle_toggle(
     labels.into()
 }
 
-fn toggle_option_label(label: &'static str, active: bool) -> Element<'static, StartMessage> {
+fn toggle_option_label(label: &'static str, active: bool) -> Element<'static, LauncherMessage> {
     let color = if active {
         theme::INK
     } else {
@@ -431,7 +434,7 @@ fn toggle_option_label(label: &'static str, active: bool) -> Element<'static, St
 }
 
 /// Dock row cluster — no Float scale (keeps fixed row height).
-fn action_cluster_dock(hints: &[ActionHint]) -> Element<'static, StartMessage> {
+fn action_cluster_dock(hints: &[ActionHint]) -> Element<'static, LauncherMessage> {
     let mut row = row![]
         .spacing(ROW_ACTION_SPACING)
         .align_y(Alignment::Center);
@@ -441,9 +444,9 @@ fn action_cluster_dock(hints: &[ActionHint]) -> Element<'static, StartMessage> {
     row.into()
 }
 
-fn action_hint_dock(hint: &ActionHint) -> Element<'static, StartMessage> {
+fn action_hint_dock(hint: &ActionHint) -> Element<'static, LauncherMessage> {
     let a = hint.alpha.clamp(0.0, 1.0);
-    let glyph: Element<'static, StartMessage> = if let Some(face) = hint.face {
+    let glyph: Element<'static, LauncherMessage> = if let Some(face) = hint.face {
         let style = if let Some(progress) = hint.hold {
             RingStyle::Hold {
                 progress,
@@ -479,6 +482,6 @@ fn face_glyph_dock(
     face: FaceButton,
     style: RingStyle,
     alpha: f32,
-) -> Element<'static, StartMessage> {
+) -> Element<'static, LauncherMessage> {
     face_glyph_stack(face, style, alpha)
 }

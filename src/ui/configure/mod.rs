@@ -93,7 +93,7 @@ pub fn content_scroll_id() -> iced::widget::Id {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Section {
     System,
-    StartScreen,
+    Launcher,
     Notifications,
     Lightbar,
     Analytics,
@@ -113,7 +113,7 @@ impl Section {
     fn title(self) -> &'static str {
         match self {
             Self::System => "System",
-            Self::StartScreen => "Start screen",
+            Self::Launcher => "Launcher",
             Self::Notifications => "Notifications",
             Self::Lightbar => "Lightbar colors",
             Self::Analytics => "Analytics",
@@ -128,7 +128,7 @@ impl Section {
     fn subtitle(self) -> &'static str {
         match self {
             Self::System => "Startup and app data",
-            Self::StartScreen => "Game launcher you open from your controller",
+            Self::Launcher => "Fullscreen game console you open from your controller",
             Self::Notifications => "Which controller events show a toast",
             Self::Lightbar => "Lightbar color as the battery drains",
             Self::Analytics => "Learned charge and play times",
@@ -160,7 +160,7 @@ impl Section {
         {
             vec![
                 Self::System,
-                Self::StartScreen,
+                Self::Launcher,
                 Self::Notifications,
                 Self::Lightbar,
                 Self::Analytics,
@@ -173,7 +173,7 @@ impl Section {
         {
             vec![
                 Self::System,
-                Self::StartScreen,
+                Self::Launcher,
                 Self::Notifications,
                 Self::Lightbar,
                 Self::Analytics,
@@ -207,9 +207,9 @@ pub struct ConfigureSettings {
     pub lightbar_enabled: bool,
     pub start_screen_enabled: bool,
     pub start_screen_auto_open: StartAutoOpen,
-    pub start_screen_immersive_layout: ImmersiveLayout,
-    pub start_screen_clock_enabled: bool,
-    pub start_screen_navbar: NavbarVisibility,
+    pub launcher_immersive_layout: ImmersiveLayout,
+    pub launcher_clock_enabled: bool,
+    pub launcher_navbar: NavbarVisibility,
     pub reduced_motion: ReducedMotion,
     pub perf_throttle_immersive: bool,
     pub perf_antialiasing: bool,
@@ -218,9 +218,9 @@ pub struct ConfigureSettings {
     pub perf_restart_needed: bool,
     /// Reload queued (button disabled, spinner shown until exit).
     pub perf_reload_queued: bool,
-    pub start_screen_inactive_secs: u32,
-    pub start_screen_sleep_secs: u32,
-    pub start_screen_inactive_dim_percent: u8,
+    pub launcher_inactive_secs: u32,
+    pub launcher_sleep_secs: u32,
+    pub launcher_inactive_dim_percent: u8,
     pub start_screen_sounds_enabled: bool,
     pub start_screen_sound_volume: u8,
     pub start_screen_haptics_enabled: bool,
@@ -320,9 +320,9 @@ impl Default for DebugAmbientTune {
             orb_min_y: crate::ui::shader::ambient::DEFAULT_ORB_MIN_Y,
             orb_max_y: crate::ui::shader::ambient::DEFAULT_ORB_MAX_Y,
             time_scale: crate::ui::shader::ambient::DEFAULT_TIME_SCALE,
-            kenburns_amp: crate::ui::start::mode::DEFAULT_KENBURNS_AMP_SCALE,
-            kenburns_pan: crate::ui::start::mode::DEFAULT_KENBURNS_PAN_SCALE,
-            kenburns_speed: crate::ui::start::mode::DEFAULT_KENBURNS_SPEED,
+            kenburns_amp: crate::ui::launcher::mode::DEFAULT_KENBURNS_AMP_SCALE,
+            kenburns_pan: crate::ui::launcher::mode::DEFAULT_KENBURNS_PAN_SCALE,
+            kenburns_speed: crate::ui::launcher::mode::DEFAULT_KENBURNS_SPEED,
         }
     }
 }
@@ -443,13 +443,13 @@ pub enum ConfigureMessage {
     /// Debug-only: start the renderer window stress test (Diagnostics section).
     #[cfg(debug_assertions)]
     RunWindowStress,
-    /// Debug-only: outline Start/drawer containers + fixed-width elements.
+    /// Debug-only: outline Launcher/drawer containers + fixed-width elements.
     /// Shell-local only (never persisted); see Diagnostics.
     #[cfg(debug_assertions)]
     SetDebugLayoutBounds(bool),
     /// Debug-only ambient tuning sliders (Diagnostics; shell-local, never
     /// persisted). Ranges match the clamps in `ui::shader::ambient` /
-    /// `ui::start::mode`.
+    /// `ui::launcher::mode`.
     #[cfg(debug_assertions)]
     SetDebugAmbientFreq(f32),
     #[cfg(debug_assertions)]
@@ -488,7 +488,7 @@ pub enum ConfigureMessage {
     #[cfg(debug_assertions)]
     ExportDebugAmbientTune,
     /// Debug-only: open the standalone ambient preview window (immersive-rate
-    /// background without opening Start).
+    /// background without opening Launcher).
     #[cfg(debug_assertions)]
     OpenAmbientPreview,
     /// Begin an OS window drag (title-bar press on the undecorated window).
@@ -1192,7 +1192,7 @@ fn section_content<'a>(
 ) -> Element<'a, ConfigureMessage> {
     match state.section {
         Section::System => system_settings_view(settings),
-        Section::StartScreen => start_screen_view(settings),
+        Section::Launcher => launcher_section_view(settings),
         Section::Notifications => notifications_view(settings, theme::ACCENT),
         Section::Lightbar => lightbar_view(state, settings),
         Section::Analytics => analytics_view(settings, analytics),
@@ -1213,7 +1213,7 @@ fn diagnostics_view<'a>(
         Some("Renderer stress test".to_string()),
         vec![
             note(
-                "Runs rapid toast + cold Start + configure + edit churn (the wgpu atlas-crash shape) for about a minute to shake out renderer crashes. Takes over window open/close while running — don't drive the UI at the same time, then check app.log for PANIC lines.",
+                "Runs rapid toast + cold Launcher + configure + edit churn (the wgpu atlas-crash shape) for about a minute to shake out renderer crashes. Takes over window open/close while running — don't drive the UI at the same time, then check app.log for PANIC lines.",
             ),
             button(text("Run window stress test").size(13.0))
                 .padding([7, 14])
@@ -1227,7 +1227,7 @@ fn diagnostics_view<'a>(
         vec![
             toggle_row(
                 "Display layout bounding boxes",
-                Some("Outlines Start + drawer containers and fixed widths (F9)"),
+                Some("Outlines Launcher + drawer containers and fixed widths (F9)"),
                 debug_layout_bounds,
                 ConfigureMessage::SetDebugLayoutBounds,
             ),
@@ -1240,7 +1240,7 @@ fn diagnostics_view<'a>(
         Some("Ambient pulse + movement".to_string()),
         vec![
             note(
-                "Temporary tuning for the immersive background pulse, orb drift, and ken-burns. Debug-only: defaults reproduce release visuals, off at boot, never saved. Open the ambient preview (View immersive below) or immersive Start to see changes live (frames keep flowing while tuned, even with idle throttle on). Drag the preview to move it; right-click it to close.",
+                "Temporary tuning for the immersive background pulse, orb drift, and ken-burns. Debug-only: defaults reproduce release visuals, off at boot, never saved. Open the ambient preview (View immersive below) or immersive Launcher to see changes live (frames keep flowing while tuned, even with idle throttle on). Drag the preview to move it; right-click it to close.",
             ),
             slider_row(
                 "Pulse speed",
@@ -1694,12 +1694,12 @@ impl std::fmt::Display for ReducedMotion {
     }
 }
 
-fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
+fn launcher_section_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureMessage> {
     let mut groups = Column::new().spacing(18).width(Fill);
 
     let mut opening = vec![toggle_row(
         "Enable PS hub",
-        Some("Controller-first app switcher and Start screen launcher"),
+        Some("Controller-first app switcher and fullscreen game launcher"),
         settings.start_screen_enabled,
         ConfigureMessage::SetStartScreenEnabled,
     )];
@@ -1739,7 +1739,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             toggle_row(
                 "Display clock",
                 None,
-                settings.start_screen_clock_enabled,
+                settings.launcher_clock_enabled,
                 ConfigureMessage::SetStartScreenClock,
             ),
             row![
@@ -1755,7 +1755,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
                 .width(Fill),
                 pick_list(
                     IMMERSIVE_LAYOUT_MODES,
-                    Some(settings.start_screen_immersive_layout),
+                    Some(settings.launcher_immersive_layout),
                     ConfigureMessage::SetImmersiveLayout,
                 )
                 .text_size(13.0)
@@ -1780,7 +1780,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
                 .width(Fill),
                 pick_list(
                     NAVBAR_MODES,
-                    Some(settings.start_screen_navbar),
+                    Some(settings.launcher_navbar),
                     ConfigureMessage::SetNavbarVisibility,
                 )
                 .text_size(13.0)
@@ -1819,8 +1819,8 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             .into(),
         ];
 
-        let idle_secs = settings.start_screen_inactive_secs;
-        let idle_steps = crate::persist::prefs::START_SCREEN_IDLE_SECS_STEPS;
+        let idle_secs = settings.launcher_inactive_secs;
+        let idle_steps = crate::persist::prefs::LAUNCHER_IDLE_SECS_STEPS;
         let idle_idx = crate::persist::prefs::secs_step_index(idle_secs, idle_steps);
         display.push(slider_row(
             "Idle after",
@@ -1837,8 +1837,8 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             .style(theme::slider),
         ));
 
-        let sleep_secs = settings.start_screen_sleep_secs;
-        let sleep_steps = crate::persist::prefs::START_SCREEN_SLEEP_SECS_STEPS;
+        let sleep_secs = settings.launcher_sleep_secs;
+        let sleep_steps = crate::persist::prefs::LAUNCHER_SLEEP_SECS_STEPS;
         let min_sleep = crate::persist::prefs::min_sleep_secs_for_idle(idle_secs);
         let sleep_choices: Vec<u32> = sleep_steps
             .iter()
@@ -1866,7 +1866,7 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
             .style(theme::slider),
         ));
 
-        let dim = settings.start_screen_inactive_dim_percent;
+        let dim = settings.launcher_inactive_dim_percent;
         display.push(slider_row(
             "Idle dim",
             format!("{dim}%"),
@@ -1878,14 +1878,13 @@ fn start_screen_view<'a>(settings: &ConfigureSettings) -> Element<'a, ConfigureM
         ));
         groups = groups.push(group(Some("Display".to_string()), display));
 
-        // UI sounds and controller haptics moved to the hub shell Settings
-        // screen (PS hub → Settings) so they apply beyond the Start screen.
-        // The prefs keys remain `start_screen_*` for on-disk compatibility.
+        // UI sounds and controller haptics live in Home Settings
+        // (Home → Settings) so they apply beyond the launcher.
 
         let mut performance = vec![
             toggle_row(
                 "Save power when idle",
-                Some("Let the fullscreen Start screen rest when nothing is moving"),
+                Some("Let the fullscreen launcher rest when nothing is moving"),
                 settings.perf_throttle_immersive,
                 ConfigureMessage::SetPerfThrottleImmersive,
             ),
@@ -2700,7 +2699,7 @@ fn emulator_row<'a>(
 /// Battery slider, snapped to the levels a DualSense reports.
 ///
 /// A connected pad debounces publication by a second (so a drag cannot spam
-/// preference-driven toasts or Start opens) and spins while it waits; a
+/// preference-driven toasts or Launcher opens) and spins while it waits; a
 /// disconnected pad has nothing to publish to, so it applies immediately.
 #[cfg(debug_assertions)]
 fn battery_row<'a>(
@@ -2887,7 +2886,7 @@ mod tests {
             // group is contiguous so the "Developer mode" caption labels once.
             let shipped = [
                 Section::System,
-                Section::StartScreen,
+                Section::Launcher,
                 Section::Notifications,
                 Section::Lightbar,
                 Section::Analytics,
@@ -3042,7 +3041,7 @@ mod tests {
     }
 
     #[test]
-    fn start_screen_view_builds_when_disabled_and_enabled() {
+    fn launcher_section_view_builds_when_disabled_and_enabled() {
         let mut settings = ConfigureSettings {
             notify_low: true,
             notify_charged: true,
@@ -3057,18 +3056,18 @@ mod tests {
             lightbar_enabled: true,
             start_screen_enabled: false,
             start_screen_auto_open: StartAutoOpen::Any,
-            start_screen_immersive_layout: ImmersiveLayout::Vertical,
-            start_screen_clock_enabled: true,
-            start_screen_navbar: NavbarVisibility::WhenNavigating,
+            launcher_immersive_layout: ImmersiveLayout::Vertical,
+            launcher_clock_enabled: true,
+            launcher_navbar: NavbarVisibility::WhenNavigating,
             reduced_motion: ReducedMotion::System,
             perf_throttle_immersive: false,
             perf_antialiasing: true,
             perf_vsync: true,
             perf_restart_needed: false,
             perf_reload_queued: false,
-            start_screen_inactive_secs: 60,
-            start_screen_sleep_secs: 300,
-            start_screen_inactive_dim_percent: 50,
+            launcher_inactive_secs: 60,
+            launcher_sleep_secs: 300,
+            launcher_inactive_dim_percent: 50,
             start_screen_sounds_enabled: true,
             start_screen_sound_volume: 80,
             start_screen_haptics_enabled: true,
@@ -3084,12 +3083,12 @@ mod tests {
             update_boot_check: true,
             is_packaged: false,
         };
-        let _disabled_el = start_screen_view(&settings);
+        let _disabled_el = launcher_section_view(&settings);
         settings.start_screen_enabled = true;
-        let _enabled_el = start_screen_view(&settings);
+        let _enabled_el = launcher_section_view(&settings);
         settings.steam_syncing = true;
         settings.show_uninstalled_games = false;
         settings.steam_path_error = Some("No Steam library found in that folder".to_string());
-        let _syncing_el = start_screen_view(&settings);
+        let _syncing_el = launcher_section_view(&settings);
     }
 }

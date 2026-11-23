@@ -1,4 +1,4 @@
-//! OS appearance for the in-Start browser (`prefers-color-scheme`).
+//! OS appearance for the in-Launcher browser (`prefers-color-scheme`).
 //!
 //! Windows reads the personalize key directly. Other platforms return
 //! `None` (leave Chromium's default alone) until they grow a native readout.

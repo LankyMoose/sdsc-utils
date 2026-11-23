@@ -1,20 +1,20 @@
-//! Fullscreen console-style presentation of the start screen.
+//! Fullscreen console-style presentation of the launcher.
 
 use crate::persist::prefs::ImmersiveLayout;
-use crate::ui::scale::Scale;
-use crate::ui::shader::{AmbientProgram, VignetteProgram};
-use crate::ui::start::chrome::{
+use crate::ui::launcher::chrome::{
     empty_games_browse_prompt, footer_hint, immersive_game_hints, immersive_game_membership_label,
 };
-use crate::ui::start::mode::TransitionPhase;
-use crate::ui::start::overlay;
-use crate::ui::start::row::{game_subtitle_block, update_required_badge};
-use crate::ui::start::settings::{edit_confirm_view, manual_add_view, replace_confirm_view};
-use crate::ui::start::translate::backdrop_art;
-use crate::ui::start::view::{
-    LaunchStatus, StartMessage, StartRow, State, scan_status_chip, scan_status_stack,
+use crate::ui::launcher::mode::TransitionPhase;
+use crate::ui::launcher::overlay;
+use crate::ui::launcher::row::{game_subtitle_block, update_required_badge};
+use crate::ui::launcher::settings::{edit_confirm_view, manual_add_view, replace_confirm_view};
+use crate::ui::launcher::translate::backdrop_art;
+use crate::ui::launcher::view::{
+    LaunchStatus, LauncherMessage, LauncherRow, State, scan_status_chip, scan_status_stack,
 };
-use crate::ui::start::vstrip::{self, NEIGHBORS, StripMetrics, StripOrientation};
+use crate::ui::launcher::vstrip::{self, NEIGHBORS, StripMetrics, StripOrientation};
+use crate::ui::scale::Scale;
+use crate::ui::shader::{AmbientProgram, VignetteProgram};
 use crate::ui::theme;
 use iced::font::Weight;
 use iced::widget::{Float, column, container, row, shader, space, stack, text};
@@ -46,10 +46,10 @@ pub fn view<'a>(
     clock_enabled: bool,
     stage_h: f32,
     stage_w: f32,
-    settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
+    settings_snapshot: &crate::ui::launcher::settings::LauncherSettingsSnapshot,
     immersive_layout: ImmersiveLayout,
     #[cfg(debug_assertions)] debug_bounds: bool,
-) -> Element<'a, StartMessage> {
+) -> Element<'a, LauncherMessage> {
     let veil = transition_top_veil(state, now);
     let idle_veil = state.idle_dim_amount(now);
     let settings_p = state.settings.progress(now);
@@ -75,7 +75,7 @@ pub fn view<'a>(
     // The stage always stays mounted: both dialogs (manual form, replace
     // confirm) are wash + card overlays layered further below, sharing the
     // overlay builder, so the games strip stays visible behind them.
-    let body: Element<'_, StartMessage> = stage_view(
+    let body: Element<'_, LauncherMessage> = stage_view(
         state,
         now,
         flat,
@@ -102,10 +102,10 @@ pub fn view<'a>(
     // `footer_hint` has no modal arm, and ownership forces idle press
     // visuals — while the card owns the only live Proceed/Cancel row.
     #[cfg(debug_assertions)]
-    let diag: Element<'_, StartMessage> = crate::ui::start::chrome::diag_report_bar();
+    let diag: Element<'_, LauncherMessage> = crate::ui::launcher::chrome::diag_report_bar();
     #[cfg(not(debug_assertions))]
-    let diag: Element<'_, StartMessage> = space().height(Length::Fixed(0.0)).into();
-    let footer_overlay: Element<'_, StartMessage> = column![
+    let diag: Element<'_, LauncherMessage> = space().height(Length::Fixed(0.0)).into();
+    let footer_overlay: Element<'_, LauncherMessage> = column![
         space().height(Fill),
         diag,
         container(footer_capsule)
@@ -122,17 +122,17 @@ pub fn view<'a>(
     .height(Fill)
     .into();
     #[cfg(debug_assertions)]
-    let footer_overlay: Element<'_, StartMessage> =
+    let footer_overlay: Element<'_, LauncherMessage> =
         crate::ui::debug_bounds::wrap(footer_overlay, debug_bounds);
 
-    let mut chrome_layers: Vec<Element<'_, StartMessage>> = vec![body, footer_overlay];
+    let mut chrome_layers: Vec<Element<'_, LauncherMessage>> = vec![body, footer_overlay];
     if clock_enabled {
         // Center-top clock widget (system locale time). Digits carry no descenders,
         // so the font line box holds empty descender space below the baseline and
         // the glyphs sit ~1px high: top padding runs 1px deeper to compensate
         // (optical centering; total capsule height is unchanged).
         let clock_capsule = container(
-            text(crate::ui::start::clock::clock_text().to_ascii_uppercase())
+            text(crate::ui::launcher::clock::clock_text().to_ascii_uppercase())
                 .size(18.0)
                 .color(theme::alpha(theme::INK, 0.72)),
         )
@@ -143,7 +143,7 @@ pub fn view<'a>(
             left: 16.0,
         })
         .style(theme::immersive_footer_pill);
-        let clock_overlay: Element<'_, StartMessage> = column![
+        let clock_overlay: Element<'_, LauncherMessage> = column![
             container(clock_capsule)
                 .width(Fill)
                 .center_x(Fill)
@@ -159,7 +159,7 @@ pub fn view<'a>(
         .height(Fill)
         .into();
         #[cfg(debug_assertions)]
-        let clock_overlay: Element<'_, StartMessage> =
+        let clock_overlay: Element<'_, LauncherMessage> =
             crate::ui::debug_bounds::wrap(clock_overlay, debug_bounds);
         chrome_layers.push(clock_overlay);
     }
@@ -176,7 +176,7 @@ pub fn view<'a>(
                 (visual, chip)
             })
             .collect();
-        let scan_overlay: Element<'_, StartMessage> = column![
+        let scan_overlay: Element<'_, LauncherMessage> = column![
             space().height(Fill),
             container(scan_status_stack(chips, chip_h, bottom_inset))
                 .width(Fill)
@@ -198,7 +198,7 @@ pub fn view<'a>(
     let chrome = stack(chrome_layers).width(Fill).height(Fill);
     let base = stack![atmosphere, chrome].width(Fill).height(Fill);
 
-    let mut layers: Vec<Element<'_, StartMessage>> = vec![base.into()];
+    let mut layers: Vec<Element<'_, LauncherMessage>> = vec![base.into()];
     // Dialogs keep the stage mounted behind their dims so they read as
     // overlays, not screen swaps.
     // Dialog overlays (manual form, replace confirm, save guard on top):
@@ -212,7 +212,7 @@ pub fn view<'a>(
     // discard. Each card absorbs.
     if state.manual_add.is_some() {
         let mp = state.manual_progress(now).clamp(0.0, 1.0);
-        layers.push(overlay::wash(overlay::reveal(mp), StartMessage::Close));
+        layers.push(overlay::wash(overlay::reveal(mp), LauncherMessage::Close));
         layers.push(overlay::centered(Scale::new(
             overlay::click_shield(
                 overlay::dialog_card(
@@ -220,14 +220,14 @@ pub fn view<'a>(
                     Length::Shrink,
                     Some(MODAL_CARD_MAX_H),
                 ),
-                StartMessage::Noop,
+                LauncherMessage::Noop,
             ),
             mp,
         )));
     }
     if state.replace_confirm.is_some() {
         let rp = state.replace_progress(now).clamp(0.0, 1.0);
-        layers.push(overlay::wash(overlay::reveal(rp), StartMessage::Close));
+        layers.push(overlay::wash(overlay::reveal(rp), LauncherMessage::Close));
         layers.push(overlay::centered(Scale::new(
             overlay::click_shield(
                 overlay::dialog_card(
@@ -235,7 +235,7 @@ pub fn view<'a>(
                     Length::Fixed(REPLACE_CONFIRM_W),
                     None,
                 ),
-                StartMessage::Noop,
+                LauncherMessage::Noop,
             ),
             rp,
         )));
@@ -244,7 +244,7 @@ pub fn view<'a>(
         let ep = state.edit_confirm_progress(now).clamp(0.0, 1.0);
         layers.push(overlay::wash(
             overlay::reveal(ep),
-            StartMessage::DismissEditConfirm,
+            LauncherMessage::DismissEditConfirm,
         ));
         layers.push(overlay::centered(Scale::new(
             overlay::click_shield(
@@ -253,7 +253,7 @@ pub fn view<'a>(
                     Length::Fixed(EDIT_CONFIRM_W),
                     None,
                 ),
-                StartMessage::Noop,
+                LauncherMessage::Noop,
             ),
             ep,
         )));
@@ -263,7 +263,7 @@ pub fn view<'a>(
     // `Float` offsets paint without touching layout, so nothing reflows; the
     // slide clears the full drawer width plus its edge inset.
     if state.settings.visible(now) {
-        layers.push(crate::ui::start::settings::immersive_drawer(
+        layers.push(crate::ui::launcher::settings::immersive_drawer(
             state,
             settings_snapshot,
             settings_p,
@@ -275,7 +275,7 @@ pub fn view<'a>(
     // Same stacking discipline as the drawer: chrome never remounts.
     #[cfg(debug_assertions)]
     if state.ambient_tune_open && !state.ambient_tune_hide_chrome {
-        layers.push(crate::ui::start::ambient_tune::tuning_overlay(state));
+        layers.push(crate::ui::launcher::ambient_tune::tuning_overlay(state));
     }
     // Idle/sleep wash sits above settings; ceremony veil stays on top.
     if idle_veil > 0.001 {
@@ -307,9 +307,9 @@ fn transition_top_veil(state: &State, now: Instant) -> f32 {
     }
 }
 
-fn stage_backdrop_layers<'a>(state: &'a State, now: Instant) -> Vec<Element<'a, StartMessage>> {
+fn stage_backdrop_layers<'a>(state: &'a State, now: Instant) -> Vec<Element<'a, LauncherMessage>> {
     let selected = state.game_selected.min(state.rows.len().saturating_sub(1));
-    let mut layers: Vec<Element<'_, StartMessage>> = Vec::new();
+    let mut layers: Vec<Element<'_, LauncherMessage>> = Vec::new();
     // Dim tracks splash opacity so ambient→art does not pop a full wash.
     let mut dim_amount = 0.0_f32;
 
@@ -353,12 +353,12 @@ fn stage_backdrop_layers<'a>(state: &'a State, now: Instant) -> Vec<Element<'a, 
 }
 
 fn backdrop_layer(
-    art: crate::ui::start::view::StartIcon,
+    art: crate::ui::launcher::view::LauncherIcon,
     opacity: f32,
     scale: f32,
     ox_norm: f32,
     oy_norm: f32,
-) -> Element<'static, StartMessage> {
+) -> Element<'static, LauncherMessage> {
     // One-shot Cover draw: zoom then pan inside headroom, clipped to the stage.
     // (Translating an iced Image after its own bounds-clip reveals black edges.)
     backdrop_art(art.0, opacity, scale, ox_norm, oy_norm).into()
@@ -373,7 +373,7 @@ fn stage_view<'a>(
     stage_w: f32,
     immersive_layout: ImmersiveLayout,
     #[cfg(debug_assertions)] debug_bounds: bool,
-) -> Element<'a, StartMessage> {
+) -> Element<'a, LauncherMessage> {
     let scale = crate::ui::motion::movement_scale(1.0, state.reduced_motion);
 
     // Backdrop lives in the games stage, not the full window.
@@ -399,14 +399,14 @@ fn stage_view<'a>(
         Vec::new()
     };
     if list_op > 0.01 {
-        let strip: Element<'_, StartMessage> =
+        let strip: Element<'_, LauncherMessage> =
             games_stage(state, now, stage_h, stage_w, list_op, transition_layout);
         #[cfg(debug_assertions)]
         let strip = crate::ui::debug_bounds::wrap(strip, debug_bounds);
         // Float paints above veils — skip the slide while flattening;
         // sub-pixel offsets skip the extra layer. No scale
         // punch: the directional travel carries the motion.
-        let strip: Element<'_, StartMessage> = if !flat
+        let strip: Element<'_, LauncherMessage> = if !flat
             && (transition_dx.abs() >= 0.5 || transition_dy.abs() >= 0.5)
         {
             container(
@@ -427,7 +427,7 @@ fn stage_view<'a>(
     let stage = stack(stage_layers).width(Fill).height(Fill);
 
     // Float paints above the enter/exit veil — skip scale while flattening.
-    let scaled_stage: Element<'_, StartMessage> = if flat || (scale - 1.0).abs() < 0.001 {
+    let scaled_stage: Element<'_, LauncherMessage> = if flat || (scale - 1.0).abs() < 0.001 {
         container(stage)
             .width(Fill)
             .height(Fill)
@@ -443,7 +443,7 @@ fn stage_view<'a>(
             .into()
     };
 
-    let layers: Vec<Element<'_, StartMessage>> = vec![scaled_stage];
+    let layers: Vec<Element<'_, LauncherMessage>> = vec![scaled_stage];
 
     stack(layers).width(Fill).height(Fill).into()
 }
@@ -455,7 +455,7 @@ fn games_stage(
     stage_w: f32,
     list_opacity: f32,
     immersive_layout: ImmersiveLayout,
-) -> Element<'_, StartMessage> {
+) -> Element<'_, LauncherMessage> {
     if state.rows.is_empty() {
         return empty_games(state);
     }
@@ -527,8 +527,8 @@ fn games_stage(
 
     let mode = state.games_section_mode();
 
-    let bar = crate::ui::start::position::view(crate::ui::start::position::BarSpec {
-        labels: crate::ui::start::position::labels(mode),
+    let bar = crate::ui::launcher::position::view(crate::ui::launcher::position::BarSpec {
+        labels: crate::ui::launcher::position::labels(mode),
         visual: state.position_section_visual(now),
         reveal: list_opacity,
         show_opacity: state.position_bar_opacity(now),
@@ -568,7 +568,7 @@ fn games_stage(
             // the rail keeps its minimum gap under the in-slot titles.
             let block_h = metrics.slot_h;
             let region_h =
-                (stage_h - (crate::ui::start::position::WIDTH + BAR_ABOVE_FOOTER)).max(1.0);
+                (stage_h - (crate::ui::launcher::position::WIDTH + BAR_ABOVE_FOOTER)).max(1.0);
             let lead = vstrip::horizontal_block_lead(
                 region_h,
                 block_h,
@@ -615,10 +615,10 @@ fn games_stage(
 /// `alpha` (from [`State::hero_overlay_alpha`]) fades the whole box with the
 /// strip scroll; layout is unchanged by it, so the fade never reflows art.
 fn hero_hint_overlay<'a>(
-    row: &'a StartRow,
+    row: &'a LauncherRow,
     state: &'a State,
     alpha: f32,
-) -> Element<'a, StartMessage> {
+) -> Element<'a, LauncherMessage> {
     let a = alpha.clamp(0.0, 1.0);
     let status = if state.editing {
         None
@@ -651,8 +651,8 @@ fn hero_hint_overlay<'a>(
     col.into()
 }
 
-fn empty_games(state: &State) -> Element<'_, StartMessage> {
-    let empty: Element<'_, StartMessage> = if state.editing {
+fn empty_games(state: &State) -> Element<'_, LauncherMessage> {
+    let empty: Element<'_, LauncherMessage> = if state.editing {
         text("No installed Steam games — add a manual shortcut.")
             .size(22.0)
             .color(theme::MUTED)
@@ -670,17 +670,17 @@ fn empty_games(state: &State) -> Element<'_, StartMessage> {
 
 #[allow(clippy::too_many_arguments)]
 fn strip_slot<'a>(
-    row: &'a StartRow,
+    row: &'a LauncherRow,
     selected: bool,
     editing: bool,
     scale: f32,
     fade: f32,
     metrics: &StripMetrics,
-    overlay: Option<(Element<'a, StartMessage>, f32)>,
+    overlay: Option<(Element<'a, LauncherMessage>, f32)>,
     orientation: StripOrientation,
     sel_offset: isize,
     dist: f32,
-) -> Element<'a, StartMessage> {
+) -> Element<'a, LauncherMessage> {
     let muted = editing && !row.in_catalog();
     let disabled = row.disabled && !editing;
     let dim = if disabled { 0.35 } else { 1.0 };
@@ -759,7 +759,7 @@ fn strip_slot<'a>(
     // Disabled rows show "Not installed" instead of meta.
     titles = titles.push(status_block(row, bold, muted, fade, sub_alpha, None));
 
-    let label: Element<'_, StartMessage> = container(titles)
+    let label: Element<'_, LauncherMessage> = container(titles)
         .width(Fill)
         .height(Fill)
         .align_y(Alignment::Center)
@@ -793,13 +793,13 @@ fn strip_slot<'a>(
 /// width for horizontal slots (so adjacent slots cannot overlap); `None` keeps
 /// the vertical side-column behavior (fill width, left-aligned).
 fn status_block<'a>(
-    row: &'a StartRow,
+    row: &'a LauncherRow,
     selected: bool,
     muted: bool,
     fade: f32,
     sub_alpha: f32,
     fixed_w: Option<f32>,
-) -> Element<'a, StartMessage> {
+) -> Element<'a, LauncherMessage> {
     let width = match fixed_w {
         Some(w) => Length::Fixed(w),
         None => Fill,
@@ -814,7 +814,7 @@ fn status_block<'a>(
             .size(meta_size)
             .color(theme::alpha(theme::MUTED, 0.7 * fade));
         if fixed_w.is_some() {
-            let label: Element<'_, StartMessage> =
+            let label: Element<'_, LauncherMessage> =
                 not_installed.width(width).align_x(Alignment::Center).into();
             return column![label].spacing(6).width(width).align_x(align).into();
         }
@@ -842,7 +842,7 @@ fn status_block<'a>(
         status = status.push(sub_block);
     }
     if row.update_required {
-        let badge: Element<'_, StartMessage> = update_required_badge(selected, muted, fade);
+        let badge: Element<'_, LauncherMessage> = update_required_badge(selected, muted, fade);
         if fixed_w.is_some() {
             status = status.push(container(badge).width(Fill).center_x(Fill));
         } else {
@@ -866,11 +866,11 @@ fn status_block<'a>(
 /// via `strip_capsule`.
 #[allow(clippy::too_many_arguments)]
 fn strip_slot_stacked<'a>(
-    row: &'a StartRow,
+    row: &'a LauncherRow,
     muted: bool,
     fade: f32,
     dim: f32,
-    capsule: Element<'a, StartMessage>,
+    capsule: Element<'a, LauncherMessage>,
     max_art_w: f32,
     art_w: f32,
     art_h: f32,
@@ -878,9 +878,9 @@ fn strip_slot_stacked<'a>(
     center_w: f32,
     dist: f32,
     sel_offset: isize,
-) -> Element<'a, StartMessage> {
+) -> Element<'a, LauncherMessage> {
     let art_w = art_w.max(1.0);
-    let label: Element<'_, StartMessage> = if show_text {
+    let label: Element<'_, LauncherMessage> = if show_text {
         let title_string = if row.skeleton {
             "…".into()
         } else {
@@ -922,7 +922,8 @@ fn strip_slot_stacked<'a>(
             .width(Length::Fixed(wrap_w))
             .align_x(Alignment::Center)
             .wrapping(iced::widget::text::Wrapping::Word);
-        let title: Element<'_, StartMessage> = container(title).width(Length::Fixed(wrap_w)).into();
+        let title: Element<'_, LauncherMessage> =
+            container(title).width(Length::Fixed(wrap_w)).into();
 
         let sub_alpha = if muted { 0.55 * fade } else { fade * dim };
         let text_block = column![
@@ -971,18 +972,18 @@ fn strip_slot_stacked<'a>(
 }
 
 fn strip_capsule<'a>(
-    row: &'a StartRow,
+    row: &'a LauncherRow,
     selected: bool,
     muted: bool,
     hero_ready: bool,
     fade: f32,
-    overlay: Option<(Element<'a, StartMessage>, f32)>,
-) -> Element<'a, StartMessage> {
+    overlay: Option<(Element<'a, LauncherMessage>, f32)>,
+) -> Element<'a, LauncherMessage> {
     // Subtle radius: image uses border_radius; card border matches for the ring.
     const HERO_RADIUS: f32 = 3.0;
     let fade = fade.clamp(0.0, 1.0);
     let art_fade = if muted { 0.55 * fade } else { fade };
-    let art: Element<'_, StartMessage> = if row.skeleton {
+    let art: Element<'_, LauncherMessage> = if row.skeleton {
         container(space()).width(Fill).height(Fill).into()
     } else {
         match row.hero_icon() {

@@ -36,7 +36,7 @@ use crate::controller::hid::poll::{
 use crate::controller::model::{ControllerKind, ControllerStatus, Serial};
 use crate::domain::color::{Rgb, SpectrumService};
 use crate::domain::pad::{
-    self as start_input, InputHub, NavReading, ShortSampleOutcome, SnapshotMeta, SnapshotReason,
+    self as launcher_input, InputHub, NavReading, ShortSampleOutcome, SnapshotMeta, SnapshotReason,
 };
 use crate::platform::app_log;
 use crate::platform::host::Host;
@@ -1285,10 +1285,10 @@ fn sample_one(
                 open.silence_timeouts = 0;
             }
             if let Some(reading) = battery {
-                let input_active = !start_input::sample_nav_resting(&sample);
+                let input_active = !launcher_input::sample_nav_resting(&sample);
                 remember_live_pad(live_pads, serial, product, reading, kind, input_active);
             }
-            SampleOneResult::Ok(start_input::hid_nav_reading(serial, sample))
+            SampleOneResult::Ok(launcher_input::hid_nav_reading(serial, sample))
         }
         ShortSampleOutcome::Timeout => {
             let prev = cache
@@ -1403,7 +1403,7 @@ fn publish_snapshot(
     let meta = hub.publish(readings.clone(), reason);
 
     if emit_edge {
-        hub.push_edge(start_input::InputEdge::from_snapshot(readings, &meta));
+        hub.push_edge(launcher_input::InputEdge::from_snapshot(readings, &meta));
     }
 
     let clearing = matches!(
@@ -1526,7 +1526,7 @@ fn sample_serial_into_snapshot(
                 } else {
                     guard.readings.push(reading);
                 }
-                Some(start_input::InputEdge::from_snapshot(
+                Some(launcher_input::InputEdge::from_snapshot(
                     guard.readings.clone(),
                     &SnapshotMeta {
                         published_at: guard.published_at,
@@ -2846,9 +2846,9 @@ mod tests {
 
     fn stub_reading(id: &str) -> NavReading {
         NavReading {
-            id: start_input::PadId(id.to_string()),
-            sample: start_input::PadSample::default(),
-            source: start_input::NAV_SOURCE_HID,
+            id: launcher_input::PadId(id.to_string()),
+            sample: launcher_input::PadSample::default(),
+            source: launcher_input::NAV_SOURCE_HID,
         }
     }
 

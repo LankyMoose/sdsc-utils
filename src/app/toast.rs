@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 impl App {
     pub(crate) fn immersive_hosts_toast(&self) -> bool {
-        self.start_visible || self.hub_visible
+        self.launcher_visible || self.hub_visible
     }
 
     pub(crate) fn toast_eta_for(&self, event: &NotifyEvent) -> Option<String> {
@@ -190,7 +190,7 @@ impl App {
         // Shown starts the slide clock after the HWND is visible at outside_y.
         if next_name == "SlidingIn" && prev == "Placing" {
             self.toast_anim_started = Instant::now();
-            if self.start_visible {
+            if self.launcher_visible {
                 let generation = next.generation().or(prev_gen).unwrap_or(0);
                 crate::controller::hid::diag::diag_info(format!(
                     "ui-diag: immersive toast composite gen={generation}"
@@ -204,13 +204,13 @@ impl App {
         self.apply_toast_effects(effects)
     }
 
-    /// Draw the active toast inside Start (cover occludes the toast HWND).
+    /// Draw the active toast inside Launcher (cover occludes the toast HWND).
     pub(crate) fn immersive_toast_overlay(&self) -> Option<Element<'_, Message>> {
         let message = self.toast_message.as_ref()?;
         let (progress, dismissing) = self.toast_machine.slide_pose()?;
         let placement = self.toast_placement?;
-        let cover = if self.start_visible {
-            self.start_monitor_cover?
+        let cover = if self.launcher_visible {
+            self.launcher_monitor_cover?
         } else if self.hub_visible {
             self.hub_monitor_cover?
         } else {
@@ -325,9 +325,9 @@ impl App {
 
         // Keep the window alive but hidden: it doubles as the GPU compositor
         // sentinel so popup/Settings can open without a cold wgpu init.
-        // When Start is visible, defer hide — Crash A lined up create_renderer
-        // panics with toast Idle/hide while Start was already open.
-        if self.start_visible {
+        // When Launcher is visible, defer hide — Crash A lined up create_renderer
+        // panics with toast Idle/hide while Launcher was already open.
+        if self.launcher_visible {
             crate::controller::hid::diag::diag_info("ui-diag: toast hide deferred (start visible)");
             return Task::perform(delay(Duration::from_millis(50)), |()| {
                 Message::ToastHideDeferred
@@ -343,10 +343,10 @@ impl App {
         }
     }
 
-    /// Prefer Settings, then Start, then popup as the focused presenting window.
+    /// Prefer Settings, then Launcher, then popup as the focused presenting window.
     pub(crate) fn refocus_interactive_ui(&self) -> Task<Message> {
         // The hub outranks every other shell surface; never steal its focus
-        // back to Start/Settings while it is open.
+        // back to Launcher/Settings while it is open.
         if self.hub_visible
             && let Some(id) = self.hub_window
         {
@@ -360,8 +360,8 @@ impl App {
         {
             return focus_window(id);
         }
-        if self.start_visible
-            && let Some(id) = self.start_window
+        if self.launcher_visible
+            && let Some(id) = self.launcher_window
         {
             return focus_window(id);
         }
@@ -375,14 +375,14 @@ impl App {
     /// afterwards (see [`Self::raise_toast_above_all`]) so it sits above the
     /// hub's full-screen scrim.
     /// Only called when the machine emits RaiseInteractive (Resting / settle).
-    /// Hidden warm Start must not be raised — that resurfaced Start after close.
+    /// Hidden warm Launcher must not be raised — that resurfaced Launcher after close.
     /// Immersive cover occludes the toast HWND; see `immersive_toast_overlay`.
     pub(crate) fn raise_shell_ui(&self, focus: bool) -> Task<Message> {
         let mut task = Task::none();
         if let Some(id) = self.popup_window {
             task = task.chain(raise_window_topmost(id));
         }
-        // Start is a normal-level app now: the toast floats above it. The
+        // Launcher is a normal-level app now: the toast floats above it. The
         // toast is raised again after the shell surfaces below.
         if let Some(id) = self.configure_window {
             task = task.chain(raise_window_topmost(id));
@@ -400,7 +400,7 @@ impl App {
         }
     }
 
-    /// Re-assert toast topmost after Settings / Start / popup / hub open or
+    /// Re-assert toast topmost after Settings / Launcher / popup / hub open or
     /// close. While the toast is Resting, shell UI is raised first; the toast
     /// is always raised last so it stays visible above every shell surface.
     pub(crate) fn sync_toast_zorder(&self) -> Task<Message> {
@@ -417,7 +417,7 @@ impl App {
 
     /// A topmost shell was focused: activation can lift the hub/Settings/
     /// popup above a non-activating toast, so re-raise the toast without
-    /// stealing focus back. Normal-level Start/Browser cannot cover a
+    /// stealing focus back. Normal-level Launcher/Browser cannot cover a
     /// topmost toast, so they are ignored.
     pub(crate) fn on_window_focused(&self, id: window::Id) -> Task<Message> {
         let topmost_shell = Some(id) == self.hub_window
@@ -432,7 +432,7 @@ impl App {
         }
     }
 
-    /// Popup/Start close was hosting the toast inside its window; move the
+    /// Popup/Launcher close was hosting the toast inside its window; move the
     /// HWND toast to the current slide pose and show it. No-op when no toast
     /// is active or the toast is still hosted by another window.
     pub(crate) fn rehost_toast_after_composite(&self) -> Task<Message> {
@@ -460,7 +460,7 @@ impl App {
         let Some(id) = self.toast_window else {
             return Task::none();
         };
-        // Immersive Start (and a hub over it) composites the card; the HWND
+        // Immersive Launcher (and a hub over it) composites the card; the HWND
         // stays blank, so raising it would only put an empty window topmost.
         if self.toast_message.is_none() || self.immersive_hosts_toast() {
             return Task::none();
@@ -493,8 +493,8 @@ impl App {
         ));
         crate::platform::wgpu_diag::note_toast_remount();
         // Do not raise interactive UI here — machine emits RaiseInteractive
-        // only after Resting so Start create cannot starve the slide.
-        // Immersive Start hosts the card; keep the toast HWND hidden.
+        // only after Resting so Launcher create cannot starve the slide.
+        // Immersive Launcher hosts the card; keep the toast HWND hidden.
         let mut place = remount_toast_surface(id, generation)
             .chain(move_window(id, start))
             .chain(window::set_level(id, window::Level::AlwaysOnTop));

@@ -3,16 +3,16 @@
 //! The daemon boots windowless: it owns the tray icon and only opens windows on
 //! demand (controller popup, configure window, overlay toast). The toast window
 //! is pre-created hidden after the tray appears so iced keeps a warm GPU
-//! compositor; popup, Settings, and Start stay ephemeral (create/destroy on each
-//! open — Start uses a normal OS window open).
+//! compositor; popup, Settings, and Launcher stay ephemeral (create/destroy on each
+//! open — Launcher uses a normal OS window open).
 
 mod browser;
 mod configure;
 mod feedback;
 mod hub;
 pub(crate) mod installs;
+mod launcher;
 mod popup;
-mod start;
 mod toast;
 mod update;
 
@@ -50,16 +50,16 @@ use crate::ui::configure::{
     self as configure_view, AnalyticsPanel, ConfigureMessage, ConfigureState, PadInputPanel,
     Section,
 };
-use crate::ui::layout::{MonitorCover, ToastPlacement, TrayAnchor, focus_window};
-use crate::ui::popup::{self as popup_view, ControllerRow, PopupMessage};
-use crate::ui::start::art_worker::ArtOwner;
-use crate::ui::start::cursor_hide;
-use crate::ui::start::gesture::{self, ChordReleaseGate};
-use crate::ui::start::input::{
-    self as start_input, CrossHold, FaceHeld, GestureDetectorBank, NavAction, NavLogSnapshot,
+use crate::ui::launcher::art_worker::ArtOwner;
+use crate::ui::launcher::cursor_hide;
+use crate::ui::launcher::gesture::{self, ChordReleaseGate};
+use crate::ui::launcher::input::{
+    self as launcher_input, CrossHold, FaceHeld, GestureDetectorBank, NavAction, NavLogSnapshot,
     PadNavBank,
 };
-use crate::ui::start::view::{self as start_view, StartMessage};
+use crate::ui::launcher::view::{self as launcher_view, LauncherMessage};
+use crate::ui::layout::{MonitorCover, ToastPlacement, TrayAnchor, focus_window};
+use crate::ui::popup::{self as popup_view, ControllerRow, PopupMessage};
 use crate::ui::theme;
 use crate::ui::toast::ToastMessage;
 use crate::ui::toast::machine::{self as toast_machine, AfterToast};
@@ -105,19 +105,19 @@ const RELOAD_FEEDBACK_DELAY: Duration = Duration::from_millis(700);
 const SCROLL_RESTORE_AUTHORITY: Duration = Duration::from_secs(30);
 /// Process/catalog running checks are expensive; never run them at pad-poll rate.
 const RUNNING_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-/// Closed-Start cadence for the running-badge wall-clock tick (open Start
+/// Closed-Launcher cadence for the running-badge wall-clock tick (open Launcher
 /// refreshes at `RUNNING_CHECK_INTERVAL` through pad polls already). Slower
 /// keeps background process scans cheap during real gameplay.
 const RUNNING_CHECK_CLOSED_INTERVAL: Duration = Duration::from_secs(5);
 const PAD_POLL_STALL_MS: u128 = 80;
 const PAD_POLL_SLOW_MS: u128 = 20;
 const SNAPSHOT_STALE_MS: u128 = 100;
-const START_NAV_NOT_READY_MS: u128 = 200;
-/// Ignore Start WindowUnfocused briefly after reveal (toast z-order focus blips).
-const START_UNFOCUS_GRACE: Duration = Duration::from_millis(150);
-/// Hide the mouse cursor after this idle while immersive Start covers the primary.
-const START_CURSOR_IDLE_HIDE: Duration = Duration::from_secs(2);
-/// Kick Steam scan if Start never opened / settled (tray-only boot).
+const LAUNCHER_NAV_NOT_READY_MS: u128 = 200;
+/// Ignore Launcher WindowUnfocused briefly after reveal (toast z-order focus blips).
+const LAUNCHER_UNFOCUS_GRACE: Duration = Duration::from_millis(150);
+/// Hide the mouse cursor after this idle while immersive Launcher covers the primary.
+const LAUNCHER_CURSOR_IDLE_HIDE: Duration = Duration::from_secs(2);
+/// Kick Steam scan if Launcher never opened / settled (tray-only boot).
 const STEAM_SCAN_IDLE_FALLBACK: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
@@ -144,7 +144,7 @@ pub enum Message {
     /// the session verdict now instead of waiting for the next badge tick.
     SteamAppsChanged,
     /// Wall-clock tick for the running-game badge. Owns live sessions while
-    /// Start is closed / pad-idle so a failed launch cannot freeze `Playing`
+    /// Launcher is closed / pad-idle so a failed launch cannot freeze `Playing`
     /// until the next open.
     RunningBadgeTick,
     /// Background game-close finished (WM_CLOSE + terminate); badge refresh clears "Closing".
@@ -223,7 +223,7 @@ pub enum Message {
     Hub(crate::ui::hub::HubMessage),
     /// Raw keyboard event for the Browser app (controller-first: no mouse).
     /// Routed in `update` — page mode forwards to the engine, URL-edit mode
-    /// and reader mode fall back to the legacy Start-key mapping.
+    /// and reader mode fall back to the legacy Launcher-key mapping.
     BrowserRawKey {
         id: window::Id,
         key: RawKey,
@@ -241,25 +241,25 @@ pub enum Message {
     #[cfg(debug_assertions)]
     PreviewClose,
 
-    StartOpened(window::Id),
-    /// Deferred Start HWND destruction (second close phase; see
-    /// `start_close_armed`). Lets the cursor-restore present land first.
+    LauncherOpened(window::Id),
+    /// Deferred Launcher HWND destruction (second close phase; see
+    /// `launcher_close_armed`). Lets the cursor-restore present land first.
     FinishStartClose,
     /// Drive start-screen animation frames.
-    StartFrame,
+    LauncherFrame,
     /// Mouse move/button/wheel on a window — resets start activity (cursor + idle/sleep).
-    StartCursorActivity(window::Id),
+    LauncherCursorActivity(window::Id),
     /// Single-flight art worker milestone (selected / near / job done).
-    StartArtEvent(crate::ui::start::art_worker::ArtEvent),
-    Start(StartMessage),
+    LauncherArtEvent(crate::ui::launcher::art_worker::ArtEvent),
+    Launcher(LauncherMessage),
     /// CEF engine worker event (title / URL / load / DOM). System-class:
     /// frames flow continuously while visible and must not count as user
     /// activity (or idle-dim and cursor-hide would never fire).
     BrowserEngine(EngineEvent),
-    /// Keyboard while some iced window has focus; filtered to the start screen in update.
-    StartKey {
+    /// Keyboard while some iced window has focus; filtered to the launcher in update.
+    LauncherKey {
         id: window::Id,
-        action: StartKeyAction,
+        action: LauncherKeyAction,
         pressed: bool,
     },
     /// Pad input edge from the hid-worker (report-rate; replaces UI PadPoll timer).
@@ -271,7 +271,7 @@ pub enum Message {
     /// Boot idle fallback: start deferred Steam scan if still not kicked.
     SteamScanIdleFallback,
     /// Debug-only window stress driver (Diagnostics section in Settings):
-    /// rapid toast + cold Start + configure + edit churn to shake out
+    /// rapid toast + cold Launcher + configure + edit churn to shake out
     /// renderer (e.g. wgpu atlas) crashes. Takes over windows while running.
     #[cfg(debug_assertions)]
     StressWindows(u8),
@@ -305,7 +305,7 @@ pub enum Message {
     /// Fire the queued renderer reload (short feedback delay after the click).
     RendererReloadDue,
     /// Slow utility-ambient drift tick (≤2fps, only while a utility window is
-    /// visible — popup, Settings, or non-immersive Start). Toasts excluded.
+    /// visible — popup, Settings, or non-immersive Launcher). Toasts excluded.
     UtilityAmbientTick,
     /// Begin dismiss (slide-out) for the toast of the given generation.
     ToastDismiss(u64),
@@ -358,16 +358,16 @@ impl Message {
             | Message::ConfigureOpened(_)
             | Message::BrowserOpened(_)
             | Message::HubOpened(_)
-            | Message::StartOpened(_)
+            | Message::LauncherOpened(_)
             | Message::FinishStartClose
-            | Message::StartFrame
+            | Message::LauncherFrame
             | Message::BrowserFrame
             | Message::EngineInstallDone { .. }
             | Message::EngineInfoSize { .. }
             | Message::WindowSized(_, _)
             | Message::WindowShowNow(_)
             | Message::ShellFadeTick
-            | Message::StartArtEvent(_) => false,
+            | Message::LauncherArtEvent(_) => false,
             #[cfg(feature = "cef-engine")]
             Message::EngineInstallProgress { .. }
             | Message::EngineManifestReady { .. }
@@ -382,11 +382,11 @@ impl Message {
             | Message::Hub(_)
             | Message::EngineInstallCancel
             | Message::Browser(_)
-            | Message::Start(_)
+            | Message::Launcher(_)
             | Message::BrowserRawKey { .. }
-            | Message::StartCursorActivity(_)
+            | Message::LauncherCursorActivity(_)
             | Message::PadInput(_) => true,
-            Message::StartKey { .. } => true,
+            Message::LauncherKey { .. } => true,
             Message::ManualFilePicked(_)
             | Message::ManualIconPicked(_)
             | Message::SteamPathPicked(_) => true,
@@ -420,7 +420,7 @@ impl Message {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartKeyAction {
+pub enum LauncherKeyAction {
     Up,
     Down,
     Left,
@@ -458,7 +458,7 @@ pub struct App {
     /// Owned lightbar-claim unit shared with the HID worker (presence-empty
     /// fast path syncs through this clone; no process-global).
     claims: Arc<ClaimStore>,
-    /// Owned Start-art decode unit (single-flight mailbox + iced event sink;
+    /// Owned Launcher-art decode unit (single-flight mailbox + iced event sink;
     /// no process-global).
     art: Arc<ArtOwner>,
     /// Owned UI-sound worker handle (lazy worker spawn on first play;
@@ -484,7 +484,7 @@ pub struct App {
 
     configure_window: Option<window::Id>,
     /// Debug-only standalone ambient preview window (Diagnostics "View
-    /// immersive"): immersive-rate background without opening Start.
+    /// immersive"): immersive-rate background without opening Launcher.
     #[cfg(debug_assertions)]
     preview_window: Option<window::Id>,
     /// Debug-only R3 release latch for the tuning chrome toggle (holding R3
@@ -505,7 +505,7 @@ pub struct App {
     /// Debug-only ambient pulse + ken-burns tuning (Diagnostics sliders).
     /// Local UI state: never persisted; defaults
     /// reproduce release visuals. Mirrored into the process-wide tuning
-    /// atomics (`ui::shader::ambient`, `ui::start::mode`) on every edit.
+    /// atomics (`ui::shader::ambient`, `ui::launcher::mode`) on every edit.
     #[cfg(debug_assertions)]
     debug_ambient_freq: f32,
     #[cfg(debug_assertions)]
@@ -541,9 +541,9 @@ pub struct App {
     analytics_panel: AnalyticsPanel,
     pad_input_panel: PadInputPanel,
 
-    start_window: Option<window::Id>,
-    /// True only while Start is revealed (warm HWND may exist while false).
-    start_visible: bool,
+    launcher_window: Option<window::Id>,
+    /// True only while Launcher is revealed (warm HWND may exist while false).
+    launcher_visible: bool,
     /// Standalone fullscreen Browser app window.
     browser_window: Option<window::Id>,
     browser_visible: bool,
@@ -554,7 +554,7 @@ pub struct App {
     /// Browser HWND is created hidden until its final size + DWM transition
     /// setup; then it is shown so no create-time scale animation is visible.
     browser_pending_show: bool,
-    /// Start instant for the Browser backdrop fade-in (card first, scrim after).
+    /// Launcher instant for the Browser backdrop fade-in (card first, scrim after).
     browser_backdrop_fade: Option<Instant>,
     /// Topmost PS app-switcher overlay: a full-screen dim scrim with the
     /// card centered in it.
@@ -576,41 +576,41 @@ pub struct App {
     /// (`FinishStartClose`) so a rebuild pushes the restored cursor to the
     /// OS first. Destroying a hidden-cursor window skips that push and
     /// leaks a global `ShowCursor(FALSE)` (winit only pushes on change).
-    start_close_armed: bool,
-    /// Last Start-window paint (for the transition paint-gap witness;
+    launcher_close_armed: bool,
+    /// Last Launcher-window paint (for the transition paint-gap witness;
     /// `Cell` because `view()` only gets `&self`).
     last_start_paint_at: std::cell::Cell<Option<Instant>>,
     /// Whether that paint happened with a transition ceremony live (gates the
     /// witness so idle gaps never log).
     last_start_paint_active: std::cell::Cell<bool>,
-    /// False until Start is revealed and ready — blocks pad nav / sounds early.
-    start_nav_ready: bool,
-    start_state: start_view::State,
+    /// False until Launcher is revealed and ready — blocks pad nav / sounds early.
+    launcher_nav_ready: bool,
+    launcher_state: launcher_view::State,
     /// Top-level browser app: panel, engine worker, capability flag, and
-    /// browser-only D-pad stepper. No longer owned by `StartState`.
+    /// browser-only D-pad stepper. No longer owned by `LauncherState`.
     browser: browser::BrowserAppState,
     /// Hub-owned standalone install policy (download cap shared by every
     /// managed-app installer).
     install_policy: installs::AppInstallPolicy,
     /// Managed-app hub: installed/active apps and transition effects.
     hub: hub::AppHub,
-    /// Monitor covered by the Start window (stage size for the view).
-    start_monitor_cover: Option<MonitorCover>,
+    /// Monitor covered by the Launcher window (stage size for the view).
+    launcher_monitor_cover: Option<MonitorCover>,
     /// This process was relaunched by the crash handler: restore tabs in
     /// safe mode (home live tab, saved tabs stored).
     crash_restart_boot: bool,
-    /// Last user activity on Start (mouse / keyboard / pad) for idle/sleep.
-    start_last_activity: Instant,
-    /// Last mouse activity on Start (cursor hide only — pad must not unhide).
-    start_cursor_last_active: Instant,
-    /// When the PS hub opened over a visible Start. On hub close, Start's
+    /// Last user activity on Launcher (mouse / keyboard / pad) for idle/sleep.
+    launcher_last_activity: Instant,
+    /// Last mouse activity on Launcher (cursor hide only — pad must not unhide).
+    launcher_cursor_last_active: Instant,
+    /// When the PS hub opened over a visible Launcher. On hub close, Launcher's
     /// animation stamps and idle clock are shifted forward by this pause so
     /// the frozen splash art resumes instead of snapping ahead.
-    start_hub_pause: Option<Instant>,
-    /// When true, Start view forces [`mouse::Interaction::Hidden`].
-    start_cursor_hidden: bool,
-    /// True while an rfd picker is open from the start screen (suppress unfocus-close).
-    start_file_dialog_open: bool,
+    launcher_home_pause: Option<Instant>,
+    /// When true, Launcher view forces [`mouse::Interaction::Hidden`].
+    launcher_cursor_hidden: bool,
+    /// True while an rfd picker is open from the launcher (suppress unfocus-close).
+    launcher_file_dialog_open: bool,
     /// After open / hide: ignore reopen until a debounced full release.
     chord_release_gate: ChordReleaseGate,
     /// Face-button release latch after the hub closes on Circle/Cross. The
@@ -618,8 +618,8 @@ pub struct App {
     /// underneath and dismisses its popup/window. Time-bounded so a missed
     /// release sample can never wedge pad input.
     hub_face_latch_until: Option<Instant>,
-    /// When Start was last revealed (unfocus grace).
-    start_revealed_at: Option<Instant>,
+    /// When Launcher was last revealed (unfocus grace).
+    launcher_revealed_at: Option<Instant>,
     gesture_detectors: GestureDetectorBank,
     pad_nav: PadNavBank,
     /// When set, the next start cue may rumble this DualSense serial (pad-originated).
@@ -630,7 +630,7 @@ pub struct App {
     confirm_key_held: bool,
     /// Keyboard Escape held (Circle press styling).
     cancel_key_held: bool,
-    /// Last armed-pad face held snapshot (merged with keyboard in [`Self::sync_start_held`]).
+    /// Last armed-pad face held snapshot (merged with keyboard in [`Self::sync_launcher_held`]).
     pad_held: FaceHeld,
     running_session: Option<RunningSession>,
     /// Steam appids whose install dir failed pre-flight (missing/empty):
@@ -677,13 +677,13 @@ pub struct App {
     nav_missing_since: Option<Instant>,
     /// One-shot while snapshot is non-empty but stale.
     nav_stale_warned: bool,
-    /// One-shot when start_nav_ready stays false after open.
+    /// One-shot when launcher_nav_ready stays false after open.
     nav_not_ready_warned: bool,
     /// When the start window was opened (for not-ready timing).
-    start_opened_at: Option<Instant>,
+    launcher_opened_at: Option<Instant>,
     /// Last applied start-screen selection (restart restores, row rebuilds
     /// re-pin by key while the restore settle window is fresh).
-    start_selection_shadow: Option<crate::session::StartSelection>,
+    launcher_selection_shadow: Option<crate::session::LauncherSelection>,
     /// Renderer prefs at boot (AA/vsync are boot-only iced settings).
     renderer_boot_aa: bool,
     renderer_boot_vsync: bool,
@@ -693,12 +693,12 @@ pub struct App {
     /// Reload button pressed, restart due after a short feedback delay.
     /// Disables the button and spins both reload buttons until exit.
     renderer_reload_queued: bool,
-    /// One-shot pad-nav arming variant for the next `open_start_screen`.
+    /// One-shot pad-nav arming variant for the next `open_launcher`.
     /// Reload restore sets all UI state (drawer, scrolls, selections) BEFORE
     /// opening; the restore open takes this path instead of the standard
     /// prepare (see `apply_restart_ui`).
     restore_preserve_nav: bool,
-    /// Saved settings-drawer offset to re-apply on `StartOpened`, when the
+    /// Saved settings-drawer offset to re-apply on `LauncherOpened`, when the
     /// scrollable exists. One-shot per window open and never re-asserted.
     pending_settings_scroll: Option<f32>,
     /// Settle window after a restore during which row rebuilds re-pin the
@@ -720,10 +720,10 @@ pub struct App {
     /// modal loop). This deadline lets the first `ToastFrame` after resume
     /// dismiss immediately instead of extending the lifetime by the stall.
     toast_expire_at: Option<Instant>,
-    /// Pure toast / deferred-Start presentation machine.
+    /// Pure toast / deferred-Launcher presentation machine.
     toast_machine: toast_machine::State,
-    /// True until the first Start HWND of this process finishes its cold-load ceremony.
-    start_cold_load_remaining: bool,
+    /// True until the first Launcher HWND of this process finishes its cold-load ceremony.
+    launcher_cold_load_remaining: bool,
 
     /// Bumped on every spectrum edit; stale SpectrumCommit messages are ignored.
     spectrum_generation: u64,
@@ -745,7 +745,7 @@ pub struct App {
 /// A battery level the slider previewed, waiting out its debounce.
 ///
 /// Publishing runs the normal connect/notify path, so it is deliberately
-/// debounced: a drag must not emit a toast (or open Start) per frame.
+/// debounced: a drag must not emit a toast (or open Launcher) per frame.
 /// The previewed level lives here until the debounce commits it.
 #[cfg(debug_assertions)]
 struct PendingEmulatorCommit {
@@ -959,8 +959,8 @@ impl App {
             configure_state,
             analytics_panel: AnalyticsPanel::default(),
             pad_input_panel: PadInputPanel::default(),
-            start_window: None,
-            start_visible: false,
+            launcher_window: None,
+            launcher_visible: false,
             browser_window: None,
             browser_visible: false,
             browser_monitor_cover: None,
@@ -974,27 +974,27 @@ impl App {
             hub_shell_anim: None,
             hub_monitor_cover: None,
             hub_state: crate::ui::hub::State::default(),
-            start_close_armed: false,
+            launcher_close_armed: false,
             last_start_paint_at: std::cell::Cell::new(None),
             last_start_paint_active: std::cell::Cell::new(false),
-            start_nav_ready: false,
-            start_state: start_view::State::default(),
+            launcher_nav_ready: false,
+            launcher_state: launcher_view::State::default(),
             browser: browser::BrowserAppState {
                 engine: browser_engine,
                 ..Default::default()
             },
             install_policy: installs::AppInstallPolicy::new(install_limit),
             hub: hub::AppHub::new(),
-            start_monitor_cover: None,
+            launcher_monitor_cover: None,
             crash_restart_boot,
-            start_last_activity: Instant::now(),
-            start_cursor_last_active: Instant::now(),
-            start_hub_pause: None,
-            start_cursor_hidden: false,
-            start_file_dialog_open: false,
+            launcher_last_activity: Instant::now(),
+            launcher_cursor_last_active: Instant::now(),
+            launcher_home_pause: None,
+            launcher_cursor_hidden: false,
+            launcher_file_dialog_open: false,
             chord_release_gate: ChordReleaseGate::default(),
             hub_face_latch_until: None,
-            start_revealed_at: None,
+            launcher_revealed_at: None,
             gesture_detectors: GestureDetectorBank::default(),
             pad_nav: PadNavBank::default(),
             haptic_pad_serial: None,
@@ -1025,8 +1025,8 @@ impl App {
             nav_missing_since: None,
             nav_stale_warned: false,
             nav_not_ready_warned: false,
-            start_opened_at: None,
-            start_selection_shadow: None,
+            launcher_opened_at: None,
+            launcher_selection_shadow: None,
             renderer_boot_aa,
             renderer_boot_vsync,
             restarting_for_renderer: false,
@@ -1043,7 +1043,7 @@ impl App {
             toast_anim_started: Instant::now(),
             toast_expire_at: None,
             toast_machine: toast_machine::State::Idle,
-            start_cold_load_remaining: true,
+            launcher_cold_load_remaining: true,
             spectrum_generation: 0,
             update_status: UpdateStatus::Idle,
             updater_state: UpdaterState::load(),
@@ -1117,7 +1117,7 @@ impl App {
             .ensure_toast_window()
             .chain(app.maybe_show_crash_restart_toast())
             .chain(app.maybe_show_startup_notice());
-        // Live Steam scan kicks on StartOpened (or idle fallback when Start is disabled).
+        // Live Steam scan kicks on LauncherOpened (or idle fallback when Launcher is disabled).
         let steam_fallback = Task::perform(delay(STEAM_SCAN_IDLE_FALLBACK), |()| {
             Message::SteamScanIdleFallback
         });
@@ -1165,7 +1165,7 @@ impl App {
                 "popup" => tasks.push(self.open_popup()),
                 "settings" => {
                     let section = match arg {
-                        "start" => Some(Section::StartScreen),
+                        "launcher" => Some(Section::Launcher),
                         "notifications" => Some(Section::Notifications),
                         "toast" => Some(Section::Notifications),
                         "lightbar" => Some(Section::Lightbar),
@@ -1189,10 +1189,10 @@ impl App {
                 }
                 "hub" => tasks.push(self.open_hub()),
                 "browser" => tasks.push(self.open_browser_window()),
-                "start" => tasks.push(self.open_start_screen()),
-                "start-edit" => {
-                    tasks.push(self.open_start_screen());
-                    let _ = self.toggle_start_edit();
+                "launcher" => tasks.push(self.open_launcher()),
+                "launcher-edit" => {
+                    tasks.push(self.open_launcher());
+                    let _ = self.toggle_launcher_edit();
                 }
                 "toast" => {
                     ToastMessage::enqueue(
@@ -1214,7 +1214,7 @@ impl App {
         }
         if Some(window) == self.configure_window {
             "Settings".to_string()
-        } else if Some(window) == self.start_window
+        } else if Some(window) == self.launcher_window
             || Some(window) == self.hub_window
             || Some(window) == self.browser_window
         {
@@ -1303,7 +1303,7 @@ impl App {
                     | mouse::Event::ButtonPressed(_)
                     | mouse::Event::ButtonReleased(_)
                     | mouse::Event::WheelScrolled { .. },
-                ) => Some(Message::StartCursorActivity(id)),
+                ) => Some(Message::LauncherCursorActivity(id)),
                 _ => None,
             }),
         ];
@@ -1401,14 +1401,14 @@ impl App {
             subscriptions.push(Subscription::run_with(engine, engine_event_stream));
         }
 
-        // The hub's full-screen overlay owns the screen; freezing Start's
+        // The hub's full-screen overlay owns the screen; freezing Launcher's
         // 60Hz clock avoids advance-then-catch-up judder in the dimmed
         // game art underneath. Frames resume when the hub closes.
-        if self.start_visible
+        if self.launcher_visible
             && !self.hub_visible
-            && (self.start_state.needs_frames() || self.steam_scan_in_flight())
+            && (self.launcher_state.needs_frames() || self.steam_scan_in_flight())
         {
-            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::StartFrame));
+            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::LauncherFrame));
         }
         if self.browser_visible {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::BrowserFrame));
@@ -1438,18 +1438,18 @@ impl App {
             subscriptions.push(
                 Subscription::run_with(
                     self.art.clone(),
-                    crate::ui::start::art_worker::event_stream,
+                    crate::ui::launcher::art_worker::event_stream,
                 )
-                .map(Message::StartArtEvent),
+                .map(Message::LauncherArtEvent),
             );
         }
 
         // Wall-clock owner for the running-game badge: pad edges only flow
-        // while Start is open and pads are live, so without this a failed
-        // immersive launch (Start auto-closed) would freeze `Playing` until
+        // while Launcher is open and pads are live, so without this a failed
+        // immersive launch (Launcher auto-closed) would freeze `Playing` until
         // the next open. Only subscribed while a session is alive.
         if self.running_session.is_some() {
-            let interval = if self.start_visible {
+            let interval = if self.launcher_visible {
                 RUNNING_CHECK_INTERVAL
             } else {
                 RUNNING_CHECK_CLOSED_INTERVAL
@@ -1467,7 +1467,7 @@ impl App {
                 &self.popup_state,
                 &self.popup_rows,
                 &self.session.prefs.spectrum,
-                self.start_state.powering_off.as_ref(),
+                self.launcher_state.powering_off.as_ref(),
             )
             .map(Message::Popup);
         }
@@ -1537,7 +1537,7 @@ impl App {
                 now,
             )
             .map(Message::Hub);
-            // Start hosts the toast card while its cover is up; the hub
+            // Launcher hosts the toast card while its cover is up; the hub
             // overwrites that window with the scrim, so draw the same card in
             // the hub's full-screen window too. The HWND toast is hidden in
             // this mode, so there is no duplicate.
@@ -1549,14 +1549,14 @@ impl App {
             return hub;
         }
 
-        if Some(window) == self.start_window {
+        if Some(window) == self.launcher_window {
             // Paint-gap witness (black-lockup forensics): while the enter
             // ceremony is live the window must repaint ~60Hz. A gap here
             // means paints starved while logic ran ahead — the render/present
             // side, never the state machine. Armed only across live phases,
             // so idle gaps never log.
             let paint_now = Instant::now();
-            let paint_active = self.start_state.transition_phase.is_some();
+            let paint_active = self.launcher_state.transition_phase.is_some();
             if paint_active
                 && self.last_start_paint_active.get()
                 && let Some(last) = self.last_start_paint_at.get()
@@ -1564,36 +1564,36 @@ impl App {
                 let gap_ms = paint_now.saturating_duration_since(last).as_millis() as u64;
                 if gap_ms > 250 {
                     let phase = self
-                        .start_state
+                        .launcher_state
                         .transition_phase
                         .map(|(p, _)| p.label())
                         .unwrap_or("none");
                     crate::controller::hid::diag::diag_info(format!(
-                        "ui-diag: start paint gap gap_ms={gap_ms} phase={phase}"
+                        "ui-diag: launcher paint gap gap_ms={gap_ms} phase={phase}"
                     ));
                 }
             }
             self.last_start_paint_at.set(Some(paint_now));
             self.last_start_paint_active.set(paint_active);
-            let cover = self.start_monitor_cover.map(|c| (c.width, c.height));
+            let cover = self.launcher_monitor_cover.map(|c| (c.width, c.height));
             let stage_w = cover.map(|(w, _)| w).unwrap_or(1920.0);
             let stage_h = cover.map(|(_, h)| h).unwrap_or(1080.0);
-            let settings_snapshot = self.start_settings_snapshot();
-            let start = start_view::view(
-                &self.start_state,
+            let settings_snapshot = self.launcher_settings_snapshot();
+            let start = launcher_view::view(
+                &self.launcher_state,
                 Instant::now(),
-                self.session.prefs.start_screen_clock_enabled,
+                self.session.prefs.launcher_clock_enabled,
                 stage_h,
                 stage_w,
                 &settings_snapshot,
                 #[cfg(debug_assertions)]
                 self.debug_layout_bounds,
             )
-            .map(Message::Start);
+            .map(Message::Launcher);
             // Debug R3 hide shows pure ambience: no toast composite either.
             #[cfg(debug_assertions)]
-            let start = if self.start_state.ambient_tuning_active()
-                && self.start_state.ambient_tune_hide_chrome
+            let start = if self.launcher_state.ambient_tuning_active()
+                && self.launcher_state.ambient_tune_hide_chrome
             {
                 start
             } else {
@@ -1609,13 +1609,13 @@ impl App {
             };
             return cursor_hide::force_cursor(
                 start,
-                self.start_cursor_hidden && self.start_visible,
+                self.launcher_cursor_hidden && self.launcher_visible,
             )
             .into();
         }
 
         if Some(window) == self.toast_window {
-            // Immersive Start composites the card; keep the toast HWND blank.
+            // Immersive Launcher composites the card; keep the toast HWND blank.
             if self.immersive_hosts_toast() {
                 return toast_view::empty();
             }
@@ -1636,21 +1636,21 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         // Effective reduce-motion gate (prefs choice vs OS "Show animations"
         // toggle): synced on every update so pad/keyboard/mouse-initiated
-        // anims gate instantly, even with an idle Start (no StartFrame) or
+        // anims gate instantly, even with an idle Launcher (no LauncherFrame) or
         // prefs freshly arrived via snapshot. Re-syncing while set is a
-        // no-op (chases are already settled); StartFrame re-syncs too so an
+        // no-op (chases are already settled); LauncherFrame re-syncs too so an
         // OS-toggle flip lands mid-session.
         let reduced =
             crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
-        self.start_state.sync_reduced_motion(reduced);
+        self.launcher_state.sync_reduced_motion(reduced);
         self.hub_state.reduced_motion = reduced;
-        self.start_state
+        self.launcher_state
             .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
         // Debug tuning keep-alive follows the local fields (the tuning
         // arms below re-sync too, since this runs before the match).
         #[cfg(debug_assertions)]
         {
-            self.start_state.ambient_tuning_keepalive = self.debug_tuning_active();
+            self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
         }
         // Renderer reload queued: drop all user input (pad / mouse /
         // keyboard / tray / pickers) so nothing can act in the feedback
@@ -1701,10 +1701,10 @@ impl App {
                 crate::controller::hid::diag::diag_info(format!("ui-diag: tray menu {id}"));
                 match id.as_str() {
                     SETTINGS_ID => {
-                        // Tray engaged while Start is up: the press never reaches
-                        // Start (taskbar sits above the cover), so unhide here or
+                        // Tray engaged while Launcher is up: the press never reaches
+                        // Launcher (taskbar sits above the cover), so unhide here or
                         // the native menu opens under a hidden cursor.
-                        if self.start_visible {
+                        if self.launcher_visible {
                             self.note_start_cursor_activity();
                         }
                         self.open_configure()
@@ -1716,7 +1716,7 @@ impl App {
             Message::TrayLeftClick(anchor) => {
                 crate::controller::hid::diag::diag_info("ui-diag: tray left-click");
                 self.tray_anchor = anchor;
-                if self.start_visible {
+                if self.launcher_visible {
                     self.note_start_cursor_activity();
                 }
                 self.toggle_popup()
@@ -1855,13 +1855,13 @@ impl App {
                 None => Task::none(),
             },
 
-            Message::StartOpened(id) => self.on_start_opened(id),
+            Message::LauncherOpened(id) => self.on_start_opened(id),
             Message::FinishStartClose => self.finish_start_close(),
-            Message::StartArtEvent(ev) => self.on_start_art_event(ev),
-            Message::StartFrame => {
+            Message::LauncherArtEvent(ev) => self.on_start_art_event(ev),
+            Message::LauncherFrame => {
                 // Debug frame shots used to ride the per-frame engine event;
                 // the shader now pulls frames from the slot, so the 5s shot
-                // cadence lives on the Start frame tick.
+                // cadence lives on the Launcher frame tick.
                 #[cfg(debug_assertions)]
                 {
                     let shot = self.shoot_browser_window(false);
@@ -1872,20 +1872,20 @@ impl App {
                     self.on_start_frame()
                 }
             }
-            Message::StartCursorActivity(id) => {
-                if Some(id) == self.start_window && self.start_visible {
+            Message::LauncherCursorActivity(id) => {
+                if Some(id) == self.launcher_window && self.launcher_visible {
                     self.note_start_cursor_activity();
                 }
                 Task::none()
             }
-            Message::Start(message) => {
+            Message::Launcher(message) => {
                 // Mouse / iced UI messages are not pad-originated.
                 self.haptic_pad_serial = None;
-                self.note_start_activity();
-                self.on_start_message(message)
+                self.note_launcher_activity();
+                self.on_launcher_message(message)
             }
             Message::BrowserEngine(event) => self.on_engine_event(event),
-            Message::StartKey {
+            Message::LauncherKey {
                 id,
                 action,
                 pressed,
@@ -1903,7 +1903,7 @@ impl App {
             Message::SteamPathPicked(path) => self.on_steam_path_picked(path),
             Message::SteamScanDone(result) => self.on_steam_scan_done(result),
             Message::SteamScanIdleFallback => {
-                // Only when Start screen is off — otherwise StartOpened owns the kick
+                // Only when Launcher is off — otherwise LauncherOpened owns the kick
                 // so Scanning/Preparing stay visible on first open.
                 if self.session.prefs.start_screen_enabled {
                     Task::none()
@@ -1912,7 +1912,7 @@ impl App {
                 }
             }
             // Debug-only renderer stress driver: 5 fast cycles of toast +
-            // cold Start + configure + edit churn (the atlas-crash shape),
+            // cold Launcher + configure + edit churn (the atlas-crash shape),
             // then a final open. Takes over windows; see the variant docs.
             #[cfg(debug_assertions)]
             Message::StressWindows(step) => self.on_stress_windows(step),
@@ -1975,26 +1975,26 @@ impl App {
             self.hub_window = None;
             self.hub_visible = false;
             self.hub_shell_anim = None;
-            self.resume_start_after_hub(Instant::now());
-            // Return focus to Start when it is the app underneath. The toast
-            // is AlwaysOnTop, so it stays above a normal-level Start without
+            self.resume_launcher_after_home(Instant::now());
+            // Return focus to Launcher when it is the app underneath. The toast
+            // is AlwaysOnTop, so it stays above a normal-level Launcher without
             // re-raising anything.
             if self.browser_visible
                 && let Some(browser) = self.browser_window
             {
                 return focus_window(browser);
             }
-            if self.start_visible
-                && let Some(start) = self.start_window
+            if self.launcher_visible
+                && let Some(start) = self.launcher_window
             {
                 return focus_window(start);
             }
             Task::none()
-        } else if Some(id) == self.start_window {
-            self.start_window = None;
-            self.start_visible = false;
-            self.start_close_armed = false;
-            self.start_nav_ready = false;
+        } else if Some(id) == self.launcher_window {
+            self.launcher_window = None;
+            self.launcher_visible = false;
+            self.launcher_close_armed = false;
+            self.launcher_nav_ready = false;
             let rehost_toast = self.rehost_toast_after_composite();
             // Close preserves all visual state (selection, dock, drawer,
             // scrolls, drafts, browser panel): the next open resumes where
@@ -2042,25 +2042,25 @@ impl App {
         // The popup is a transient tray flyout: dismiss it when focus moves away.
         if Some(id) == self.popup_window && !self.popup_state.is_editing_any() {
             self.close_popup()
-        } else if Some(id) == self.start_window && self.start_visible {
+        } else if Some(id) == self.launcher_window && self.launcher_visible {
             // Dismiss-on-unfocus stays off until the settings screen ships
             // a proper toggle for it (close-on-focus-loss vs stay-open).
-            // Until then Start only closes on explicit dismiss, so tray
+            // Until then Launcher only closes on explicit dismiss, so tray
             // quit can happen with the browser surface still open.
             const CLOSE_ON_UNFOCUS: bool = false;
             if !CLOSE_ON_UNFOCUS {
                 return Task::none();
             }
             // File dialogs (add/edit shortcut, choose image) steal focus — keep the
-            // start screen open so the modal / draft is not discarded.
-            if self.start_state.manual_add.is_some() || self.start_file_dialog_open {
+            // launcher open so the modal / draft is not discarded.
+            if self.launcher_state.manual_add.is_some() || self.launcher_file_dialog_open {
                 Task::none()
             } else if self
-                .start_revealed_at
-                .is_some_and(|t| t.elapsed() < START_UNFOCUS_GRACE)
+                .launcher_revealed_at
+                .is_some_and(|t| t.elapsed() < LAUNCHER_UNFOCUS_GRACE)
             {
                 crate::controller::hid::diag::diag_info(
-                    "ui-diag: start unfocus skipped (reveal grace)",
+                    "ui-diag: launcher unfocus skipped (reveal grace)",
                 );
                 Task::none()
             } else {
@@ -2072,35 +2072,35 @@ impl App {
     }
 
     fn on_start_opened(&mut self, id: window::Id) -> Task<Message> {
-        if Some(id) == self.start_window && self.start_visible {
-            self.start_nav_ready = true;
+        if Some(id) == self.launcher_window && self.launcher_visible {
+            self.launcher_nav_ready = true;
             self.nav_not_ready_warned = false;
             let now = Instant::now();
-            self.start_revealed_at = Some(now);
-            self.start_state.steam_scan_pending = self.steam_scan_pending;
-            crate::controller::hid::diag::diag_info(format!("ui-diag: start opened id={id:?}"));
+            self.launcher_revealed_at = Some(now);
+            self.launcher_state.steam_scan_pending = self.steam_scan_pending;
+            crate::controller::hid::diag::diag_info(format!("ui-diag: launcher opened id={id:?}"));
             // Raise/focus after create_renderer has a chance to finish —
             // chaining sync on the same turn as window::open correlated
             // with atlas create_renderer panics.
-            // Start stays normal-level; focus brings it forward without
+            // Launcher stays normal-level; focus brings it forward without
             // joining the topmost band.
             let mut task = focus_window(id).chain(self.sync_toast_zorder());
             // Settings restore first: the drawer scroll lands
             // before art kicks and scan below.
             if let Some(settings_y) = self.pending_settings_scroll.take() {
                 task = task.chain(self.restore_settings_scroll(settings_y));
-            } else if self.start_state.settings.open {
+            } else if self.launcher_state.settings.open {
                 // Warm reopen under an open settings drawer: the fresh
                 // scrollable mounts at 0, so re-apply the tracked offset
                 // (closes preserve it now; restarts use the pending path).
-                let settings_y = self.start_state.settings.scroll_y;
+                let settings_y = self.launcher_state.settings.scroll_y;
                 task = task.chain(self.restore_settings_scroll(settings_y));
             }
             // Re-show the position rail on every open.
             // Warm opens skip begin_cold_load; cold opens refresh
             // the hide clock to visible time. Pinned is a no-op.
-            self.start_state.note_position_bar_scroll(now);
-            self.start_state.arm_cold_ambient(now);
+            self.launcher_state.note_position_bar_scroll(now);
+            self.launcher_state.arm_cold_ambient(now);
             // Cache miss: need metadata before art/list can land — scan now.
             // Cache hit: Preparing chip first; Steam kicks when art-ready handoff runs.
             if self.steam_scan_pending {
@@ -2113,24 +2113,24 @@ impl App {
             }
             // Cold: lift the enter veil onto ambient+dock immediately (games list
             // stays hidden until art). Warm reopen still waits for art before arming.
-            if self.start_state.cold_load_active {
-                self.start_state.arm_enter_reveal(now);
+            if self.launcher_state.cold_load_active {
+                self.launcher_state.arm_enter_reveal(now);
                 // Cache hit: Preparing chip until art sync; cache miss uses Steam.
                 if !self.steam_scan_pending {
-                    self.start_state
-                        .begin_chrome_status(start_view::ChromeStatusKind::PreparingArt, now);
+                    self.launcher_state
+                        .begin_chrome_status(launcher_view::ChromeStatusKind::PreparingArt, now);
                 }
             }
-            self.start_state.prime_backdrop_for_enter(now);
-            if !self.start_state.try_arm_enter_reveal_when_art_ready(now) {
+            self.launcher_state.prime_backdrop_for_enter(now);
+            if !self.launcher_state.try_arm_enter_reveal_when_art_ready(now) {
                 let open_ms = self
-                    .start_opened_at
+                    .launcher_opened_at
                     .map(|t| now.saturating_duration_since(t).as_millis())
                     .unwrap_or(0);
                 crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: start immersive enter art hold open_ms={open_ms} steam_scan={} cold={}",
+                    "ui-diag: launcher immersive enter art hold open_ms={open_ms} steam_scan={} cold={}",
                     u8::from(self.steam_scan_pending),
-                    u8::from(self.start_state.cold_load_active),
+                    u8::from(self.launcher_state.cold_load_active),
                 ));
             } else {
                 task = task.chain(self.note_cold_load_finished());
@@ -2142,9 +2142,12 @@ impl App {
         }
     }
 
-    fn on_start_art_event(&mut self, ev: crate::ui::start::art_worker::ArtEvent) -> Task<Message> {
-        use crate::ui::start::art_worker::ArtEventKind;
-        if !crate::ui::start::icon_cache::art_warm_is_current(ev.generation) {
+    fn on_start_art_event(
+        &mut self,
+        ev: crate::ui::launcher::art_worker::ArtEvent,
+    ) -> Task<Message> {
+        use crate::ui::launcher::art_worker::ArtEventKind;
+        if !crate::ui::launcher::icon_cache::art_warm_is_current(ev.generation) {
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: art event stale gen={} kind={:?}",
                 ev.generation, ev.kind
@@ -2155,14 +2158,14 @@ impl App {
         let armed = match ev.kind {
             ArtEventKind::SelectedReady => {
                 if self
-                    .start_state
+                    .launcher_state
                     .rows
-                    .get(self.start_state.game_selected)
+                    .get(self.launcher_state.game_selected)
                     .is_some_and(|r| r.backdrop_icon().is_some())
                 {
-                    self.start_state.note_backdrop_ready(now);
+                    self.launcher_state.note_backdrop_ready(now);
                 }
-                let armed = self.start_state.try_arm_enter_reveal_when_art_ready(now);
+                let armed = self.launcher_state.try_arm_enter_reveal_when_art_ready(now);
                 crate::controller::hid::diag::diag_info(format!(
                     "ui-diag: immersive art selected ready gen={}",
                     ev.generation
@@ -2170,7 +2173,7 @@ impl App {
                 armed
             }
             ArtEventKind::NearReady => {
-                let armed = self.start_state.try_arm_enter_reveal_when_art_ready(now);
+                let armed = self.launcher_state.try_arm_enter_reveal_when_art_ready(now);
                 crate::controller::hid::diag::diag_info(format!(
                     "ui-diag: immersive art neighbors ready gen={}",
                     ev.generation
@@ -2178,8 +2181,8 @@ impl App {
                 armed
             }
             ArtEventKind::JobDone => {
-                self.start_state.art_awaiting_paint = false;
-                let armed = self.start_state.try_arm_enter_reveal_when_art_ready(now);
+                self.launcher_state.art_awaiting_paint = false;
+                let armed = self.launcher_state.try_arm_enter_reveal_when_art_ready(now);
                 crate::controller::hid::diag::diag_info(format!(
                     "ui-diag: immersive art warm done gen={}",
                     ev.generation
@@ -2190,38 +2193,38 @@ impl App {
         if armed {
             return self.note_cold_load_finished();
         }
-        // List / hero / backdrop peeks are live — StartFrame redraws pick them up.
+        // List / hero / backdrop peeks are live — LauncherFrame redraws pick them up.
         Task::none()
     }
 
     fn on_start_frame(&mut self) -> Task<Message> {
         // A frame queued before the hub opened must not advance/redraw the
-        // frozen Start animation.
+        // frozen Launcher animation.
         if self.hub_visible {
             return Task::none();
         }
         let now = Instant::now();
-        self.start_state.steam_scan_pending = self.steam_scan_pending;
+        self.launcher_state.steam_scan_pending = self.steam_scan_pending;
         // Prefs-owned pin for the immersive position rail (heals across
         // snapshot syncs / restarts; the apply path syncs immediately).
-        self.start_state.sync_navbar_pinned(
+        self.launcher_state.sync_navbar_pinned(
             matches!(
-                self.session.prefs.start_screen_navbar,
+                self.session.prefs.launcher_navbar,
                 NavbarVisibility::AlwaysOn
             ),
             now,
         );
         // Effective reduce-motion gate (also synced per-update): an OS
         // "Show animations" flip lands on the next frame mid-session.
-        self.start_state
+        self.launcher_state
             .sync_reduced_motion(crate::ui::motion::reduced_motion_effective(
                 self.session.prefs.reduced_motion,
             ));
-        self.start_state
+        self.launcher_state
             .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
-        let was_cold = self.start_state.cold_load_active;
-        self.start_state.tick_anim(now);
-        let task = if was_cold && !self.start_state.cold_load_active {
+        let was_cold = self.launcher_state.cold_load_active;
+        self.launcher_state.tick_anim(now);
+        let task = if was_cold && !self.launcher_state.cold_load_active {
             self.note_cold_load_finished()
         } else {
             Task::none()
@@ -2230,22 +2233,22 @@ impl App {
             return task.chain(phase_task);
         }
         // Keyboard-only hold progress when pad poll is not running.
-        if self.start_state.replace_confirm.is_some() {
+        if self.launcher_state.replace_confirm.is_some() {
             let (progress, completed) = self.keyboard_cross_hold.update(self.confirm_key_held, now);
-            self.start_state.cross_progress = self.start_state.cross_progress.max(progress);
+            self.launcher_state.cross_progress = self.launcher_state.cross_progress.max(progress);
             if completed {
                 self.haptic_pad_serial = None;
                 self.play_ui_cue(UiSoundKind::Hold);
                 return task.chain(self.complete_replace_confirm());
             }
         }
-        self.sync_start_held();
-        self.start_state.tick_hint_anims(now);
+        self.sync_launcher_held();
+        self.launcher_state.tick_hint_anims(now);
         self.tick_start_cursor_idle(now);
         if self.tick_start_idle(now) {
             self.pad_nav.prepare_on_open(false);
             crate::controller::hid::diag::diag_info(
-                "ui-diag: start idle pad re-arm after sleep wake",
+                "ui-diag: launcher idle pad re-arm after sleep wake",
             );
         }
         task
@@ -2254,7 +2257,7 @@ impl App {
     fn on_start_key(
         &mut self,
         id: window::Id,
-        action: StartKeyAction,
+        action: LauncherKeyAction,
         pressed: bool,
     ) -> Task<Message> {
         // Keyboard is never pad-originated.
@@ -2262,18 +2265,18 @@ impl App {
         if self.hub_visible {
             return Task::none();
         }
-        if Some(id) == self.start_window && self.start_visible {
-            self.note_start_activity();
+        if Some(id) == self.launcher_window && self.launcher_visible {
+            self.note_launcher_activity();
             // Cold ambient: only Cancel/Close is live.
-            if self.start_state.cold_load_active {
+            if self.launcher_state.cold_load_active {
                 return match action {
-                    StartKeyAction::Cancel if !pressed => {
-                        self.cancel_start_holds();
-                        self.on_start_message(StartMessage::Close)
+                    LauncherKeyAction::Cancel if !pressed => {
+                        self.cancel_launcher_holds();
+                        self.on_launcher_message(LauncherMessage::Close)
                     }
-                    StartKeyAction::Cancel => {
+                    LauncherKeyAction::Cancel => {
                         self.cancel_key_held = pressed;
-                        self.sync_start_held();
+                        self.sync_launcher_held();
                         Task::none()
                     }
                     _ => Task::none(),
@@ -2285,105 +2288,105 @@ impl App {
             if pressed
                 && matches!(
                     action,
-                    StartKeyAction::Up
-                        | StartKeyAction::Down
-                        | StartKeyAction::Left
-                        | StartKeyAction::Right
+                    LauncherKeyAction::Up
+                        | LauncherKeyAction::Down
+                        | LauncherKeyAction::Left
+                        | LauncherKeyAction::Right
                 )
-                && self.start_state.layout_transition_active()
+                && self.launcher_state.layout_transition_active()
             {
                 return Task::none();
             }
             return match action {
-                StartKeyAction::Up if pressed => {
-                    self.cancel_start_holds();
-                    if self.start_state.ambient_tuning_active() {
+                LauncherKeyAction::Up if pressed => {
+                    self.cancel_launcher_holds();
+                    if self.launcher_state.ambient_tuning_active() {
                         self.on_ambient_tuning_nav(Some(NavAction::Up))
-                    } else if self.start_state.settings.open {
-                        self.on_start_settings_nav(Some(NavAction::Up))
+                    } else if self.launcher_state.settings.open {
+                        self.on_launcher_settings_nav(Some(NavAction::Up))
                     } else if self.browser.panel.session.is_open() {
                         self.scroll_browser(-crate::ui::browser::view::BROWSER_SCROLL_STEP)
                     } else if self.immersive_horizontal_games_nav() {
                         // Horizontal Games strip scrolls Left/Right only.
                         Task::none()
                     } else {
-                        self.on_start_message(StartMessage::MoveUp)
+                        self.on_launcher_message(LauncherMessage::MoveUp)
                     }
                 }
-                StartKeyAction::Down if pressed => {
-                    self.cancel_start_holds();
-                    if self.start_state.ambient_tuning_active() {
+                LauncherKeyAction::Down if pressed => {
+                    self.cancel_launcher_holds();
+                    if self.launcher_state.ambient_tuning_active() {
                         self.on_ambient_tuning_nav(Some(NavAction::Down))
-                    } else if self.start_state.settings.open {
-                        self.on_start_settings_nav(Some(NavAction::Down))
+                    } else if self.launcher_state.settings.open {
+                        self.on_launcher_settings_nav(Some(NavAction::Down))
                     } else if self.browser.panel.session.is_open() {
                         self.scroll_browser(crate::ui::browser::view::BROWSER_SCROLL_STEP)
                     } else if self.immersive_horizontal_games_nav() {
                         // Horizontal Games strip scrolls Left/Right only.
                         Task::none()
                     } else {
-                        self.on_start_message(StartMessage::MoveDown)
+                        self.on_launcher_message(LauncherMessage::MoveDown)
                     }
                 }
-                StartKeyAction::Left if pressed => {
-                    self.cancel_start_holds();
-                    if self.start_state.ambient_tuning_active() {
+                LauncherKeyAction::Left if pressed => {
+                    self.cancel_launcher_holds();
+                    if self.launcher_state.ambient_tuning_active() {
                         self.on_ambient_tuning_nav(Some(NavAction::Left))
-                    } else if self.start_state.settings.open {
-                        self.on_start_settings_nav(Some(NavAction::Left))
+                    } else if self.launcher_state.settings.open {
+                        self.on_launcher_settings_nav(Some(NavAction::Left))
                     } else if self.immersive_horizontal_games_nav() {
-                        self.on_start_message(StartMessage::MoveUp)
+                        self.on_launcher_message(LauncherMessage::MoveUp)
                     } else {
                         Task::none()
                     }
                 }
-                StartKeyAction::Right if pressed => {
-                    self.cancel_start_holds();
-                    if self.start_state.ambient_tuning_active() {
+                LauncherKeyAction::Right if pressed => {
+                    self.cancel_launcher_holds();
+                    if self.launcher_state.ambient_tuning_active() {
                         self.on_ambient_tuning_nav(Some(NavAction::Right))
-                    } else if self.start_state.settings.open {
-                        self.on_start_settings_nav(Some(NavAction::Right))
+                    } else if self.launcher_state.settings.open {
+                        self.on_launcher_settings_nav(Some(NavAction::Right))
                     } else if self.immersive_horizontal_games_nav() {
-                        self.on_start_message(StartMessage::MoveDown)
+                        self.on_launcher_message(LauncherMessage::MoveDown)
                     } else {
                         Task::none()
                     }
                 }
-                StartKeyAction::Confirm => {
+                LauncherKeyAction::Confirm => {
                     self.confirm_key_held = pressed;
-                    self.sync_start_held();
-                    if self.start_state.replace_confirm.is_some() {
+                    self.sync_launcher_held();
+                    if self.launcher_state.replace_confirm.is_some() {
                         if pressed {
                             self.pad_nav.cancel_holds();
                         }
                         Task::none()
                     } else if !pressed {
-                        self.cancel_start_holds();
-                        if self.start_state.ambient_tuning_active() {
+                        self.cancel_launcher_holds();
+                        if self.launcher_state.ambient_tuning_active() {
                             self.on_ambient_tuning_nav(Some(NavAction::Confirm))
-                        } else if self.start_state.settings.open {
-                            self.on_start_settings_nav(Some(NavAction::Confirm))
+                        } else if self.launcher_state.settings.open {
+                            self.on_launcher_settings_nav(Some(NavAction::Confirm))
                         } else {
-                            self.on_start_message(StartMessage::Confirm)
+                            self.on_launcher_message(LauncherMessage::Confirm)
                         }
                     } else {
                         Task::none()
                     }
                 }
-                StartKeyAction::Cancel => {
+                LauncherKeyAction::Cancel => {
                     self.cancel_key_held = pressed;
-                    self.sync_start_held();
+                    self.sync_launcher_held();
                     if !pressed {
-                        self.cancel_start_holds();
-                        if self.start_state.ambient_tuning_active() {
+                        self.cancel_launcher_holds();
+                        if self.launcher_state.ambient_tuning_active() {
                             self.on_ambient_tuning_nav(Some(NavAction::Cancel))
-                        } else if self.start_state.settings.any_menu_open() {
+                        } else if self.launcher_state.settings.any_menu_open() {
                             // Expanded dropdown owns Cancel: Esc closes the
                             // menu only, exactly like pad Circle — not the
                             // whole settings surface.
-                            self.on_start_settings_nav(Some(NavAction::Cancel))
+                            self.on_launcher_settings_nav(Some(NavAction::Cancel))
                         } else {
-                            self.on_start_message(StartMessage::Close)
+                            self.on_launcher_message(LauncherMessage::Close)
                         }
                     } else {
                         Task::none()
@@ -2410,7 +2413,7 @@ impl App {
                 &mut self.toast_queue,
                 crate::ui::toast::ToastMessage::preview(&self.session.prefs.spectrum),
             );
-            return self.show_next_toast().chain(self.open_start_screen());
+            return self.show_next_toast().chain(self.open_launcher());
         }
         let next = Message::StressWindows(step + 1);
         match step % PER_CYCLE {
@@ -2421,16 +2424,16 @@ impl App {
                     crate::ui::toast::ToastMessage::preview(&self.session.prefs.spectrum),
                 );
                 self.show_next_toast()
-                    .chain(self.open_start_screen())
+                    .chain(self.open_launcher())
                     .chain(Task::perform(delay(Duration::from_secs(2)), move |()| next))
             }
-            // Second cold renderer while toast + Start are live.
+            // Second cold renderer while toast + Launcher are live.
             1 => self.open_configure().chain(Task::perform(
                 delay(Duration::from_millis(1500)),
                 move |()| next,
             )),
             2..=4 => self
-                .toggle_start_edit()
+                .toggle_launcher_edit()
                 .unwrap_or_else(Task::none)
                 .chain(Task::perform(delay(Duration::from_secs(1)), move |()| next)),
             // Tear it all down; toast expiry overlaps the next cold open.
@@ -2439,7 +2442,7 @@ impl App {
                     .configure_window
                     .map(window::close)
                     .unwrap_or_else(Task::none);
-                let _ = self.toggle_start_edit();
+                let _ = self.toggle_launcher_edit();
                 close_cfg
                     .chain(self.close_start_screen())
                     .chain(Task::perform(delay(Duration::from_secs(2)), move |()| next))
@@ -2454,7 +2457,8 @@ impl App {
         // change, and there is no later present). Restore only when the
         // OS reports hidden so a balanced counter is never disturbed.
         #[cfg(windows)]
-        if self.start_cursor_hidden && !crate::platform::win32::cursor_visible().unwrap_or(true) {
+        if self.launcher_cursor_hidden && !crate::platform::win32::cursor_visible().unwrap_or(true)
+        {
             crate::controller::hid::diag::diag_info("ui-diag: exit cursor restore");
             unsafe { crate::platform::win32::show_cursor(true) };
         }
@@ -2464,15 +2468,15 @@ impl App {
             crate::persist::restart_ui::clear();
         }
         self.session.known.save();
-        // Drop every Start image Handle before iced tears down the GPU atlas.
-        self.start_visible = false;
-        self.start_nav_ready = false;
-        self.start_state.art_awaiting_paint = false;
-        self.start_state.clear_immersive_session();
-        for row in &mut self.start_state.rows {
+        // Drop every Launcher image Handle before iced tears down the GPU atlas.
+        self.launcher_visible = false;
+        self.launcher_nav_ready = false;
+        self.launcher_state.art_awaiting_paint = false;
+        self.launcher_state.clear_immersive_session();
+        for row in &mut self.launcher_state.rows {
             row.icon = None;
         }
-        let _ = crate::ui::start::icon_cache::bump_art_warm_generation();
+        let _ = crate::ui::launcher::icon_cache::bump_art_warm_generation();
         self.art.shutdown();
         // Persist the tab strip (backstop — mutations already save on the
         // way; this covers a crash-free quit with no prior change).
@@ -2678,7 +2682,7 @@ impl App {
                     .queue_launch_quiet(self.hid_worker.take_launch_serials());
                 let ctx = crate::session::ApplyContext {
                     hub_visible: self.hub_visible,
-                    fullscreen: start_input::foreground_is_exclusive_fullscreen(),
+                    fullscreen: launcher_input::foreground_is_exclusive_fullscreen(),
                     now: Instant::now(),
                     lightbar_enabled: self.claims.is_enabled(),
                 };
@@ -2726,7 +2730,7 @@ impl App {
                     }
                 }
                 SessionEffect::CloseHub => {
-                    // Auto-close owns the hub, not a manually opened Start.
+                    // Auto-close owns the hub, not a manually opened Launcher.
                     if self.hub_visible {
                         tasks.push(self.close_hub());
                     } else {
@@ -2757,10 +2761,10 @@ impl App {
         self.session.prefs.save();
     }
 
-    /// True when live pad-input edges should drive Start / diagnostics.
+    /// True when live pad-input edges should drive Launcher / diagnostics.
     fn wants_pad_input(&self) -> bool {
         // Debug quiet mode: HID input is focus-independent, so a pad press during
-        // a game must never drive Start (navigate / launch). `SDSC_DEBUG_INPUT=1`
+        // a game must never drive Launcher (navigate / launch). `SDSC_DEBUG_INPUT=1`
         // is the QA opt-in that keeps quiet placement but accepts pad edges.
         if crate::platform::debug_quiet::input_dropped() {
             return false;
@@ -2770,7 +2774,7 @@ impl App {
         pad_input_live
             || self.hub_visible
             || self.browser_visible
-            || (self.start_visible
+            || (self.launcher_visible
                 && self.session.prefs.start_screen_enabled
                 && !self.session.controllers.is_empty())
     }
@@ -2779,7 +2783,7 @@ impl App {
     fn apply_controllers(&mut self, controllers: Vec<ControllerStatus>) -> Task<Message> {
         let ctx = crate::session::ApplyContext {
             hub_visible: self.hub_visible,
-            fullscreen: start_input::foreground_is_exclusive_fullscreen(),
+            fullscreen: launcher_input::foreground_is_exclusive_fullscreen(),
             now: Instant::now(),
             lightbar_enabled: self.claims.is_enabled(),
         };
@@ -2803,7 +2807,7 @@ impl App {
             return false;
         }
         // A pad on its way out takes no more commands.
-        if self.start_state.powering_off.as_ref() == Some(serial) {
+        if self.launcher_state.powering_off.as_ref() == Some(serial) {
             return false;
         }
 
@@ -2830,7 +2834,7 @@ impl App {
             return;
         }
         // Already going away: don't re-send the feature report on repeat holds.
-        if self.start_state.powering_off.as_ref() == Some(serial) {
+        if self.launcher_state.powering_off.as_ref() == Some(serial) {
             return;
         }
 
@@ -2851,8 +2855,8 @@ impl App {
         }
 
         // Show "Powering off" immediately (cleared when the pad leaves the list).
-        self.start_state.powering_off = Some(serial.clone());
-        // Reconnect after user power-off should open Start again (not ghost-flap cooldown),
+        self.launcher_state.powering_off = Some(serial.clone());
+        // Reconnect after user power-off should open Launcher again (not ghost-flap cooldown),
         // but only when this was the last pad — a sibling must not look like a fresh 0→1.
         if crate::session::should_skip_connect_cooldown_on_power_off(
             &self.session.controllers,
@@ -2918,7 +2922,7 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // Start screen
+    // Launcher
     // -----------------------------------------------------------------------
 
     fn queue_notifications(
@@ -2992,7 +2996,7 @@ fn tray_events_mapped() -> impl Stream<Item = Message> {
 
 /// Bind the hid-worker → iced pad-input edge channel while listening.
 fn pad_input_edge_stream(hub: &Arc<InputHub>) -> impl Stream<Item = Message> + Send + use<> {
-    // Deep enough to ride out Start-frame hitches without dropping taps:
+    // Deep enough to ride out Launcher-frame hitches without dropping taps:
     // the worker publishes at report rate while hot.
     let hub = Arc::clone(hub);
     stream::channel(128, async move |mut output| {
@@ -3138,13 +3142,13 @@ fn presence_hint_stream() -> impl Stream<Item = Message> {
 #[cfg(debug_assertions)]
 fn stamp_hitch_report(hub: &InputHub, kind: &str, source: &str, extra: Option<String>) {
     let (pads, reason, age_ms, seq) = match hub.read() {
-        start_input::NavReadingsOutcome::Readings { readings, meta } => (
+        launcher_input::NavReadingsOutcome::Readings { readings, meta } => (
             readings.len(),
             meta.reason.as_str(),
             meta.published_at.elapsed().as_millis(),
             meta.seq,
         ),
-        start_input::NavReadingsOutcome::Missing { meta } => (
+        launcher_input::NavReadingsOutcome::Missing { meta } => (
             0,
             meta.reason.as_str(),
             meta.published_at.elapsed().as_millis(),
@@ -3365,7 +3369,7 @@ fn is_emulated_serial(serial: &str) -> bool {
 
 fn chord_held_on_any_pad(
     required: &[gesture::GestureControl],
-    readings: &[start_input::NavReading],
+    readings: &[launcher_input::NavReading],
 ) -> bool {
     if required.is_empty() {
         return false;

@@ -146,11 +146,11 @@ impl ImmersiveLayout {
 pub const IMMERSIVE_LAYOUT_MODES: [ImmersiveLayout; 2] =
     [ImmersiveLayout::Vertical, ImmersiveLayout::Horizontal];
 
-/// How the start screen restores the game highlight (game axis only;
+/// How the launcher restores the game highlight (game axis only;
 /// controller selection persistence is out of scope and never gated).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum StartSelectionMode {
+pub enum LauncherSelectionMode {
     /// Match the stored `play_key` (default; survives reorders).
     #[default]
     ByGame,
@@ -158,7 +158,7 @@ pub enum StartSelectionMode {
     ByPosition,
 }
 
-impl StartSelectionMode {
+impl LauncherSelectionMode {
     pub fn cycle(self) -> Self {
         match self {
             Self::ByGame => Self::ByPosition,
@@ -179,14 +179,16 @@ impl StartSelectionMode {
     }
 }
 
-impl std::fmt::Display for StartSelectionMode {
+impl std::fmt::Display for LauncherSelectionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.label())
     }
 }
 
-pub const SELECTION_MODES: [StartSelectionMode; 2] =
-    [StartSelectionMode::ByGame, StartSelectionMode::ByPosition];
+pub const SELECTION_MODES: [LauncherSelectionMode; 2] = [
+    LauncherSelectionMode::ByGame,
+    LauncherSelectionMode::ByPosition,
+];
 
 /// Immersive position-rail visibility.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,7 +219,7 @@ impl NavbarVisibility {
 pub const NAVBAR_MODES: [NavbarVisibility; 2] =
     [NavbarVisibility::WhenNavigating, NavbarVisibility::AlwaysOn];
 
-/// Start-screen reduce-motion preference.
+/// Launcher reduce-motion preference.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReducedMotion {
@@ -290,53 +292,53 @@ pub struct Prefs {
     #[serde(default = "default_true")]
     pub lightbar_enabled: bool,
     /// Open the start-screen launcher on 0→1 connect / reopen gesture (default on).
-    /// Master switch: when off, the start screen never opens.
+    /// Master switch: when off, Home never opens.
     #[serde(default = "default_true")]
     pub start_screen_enabled: bool,
-    /// Automatically open the start screen when a controller connects.
+    /// Automatically open Home when a controller connects.
     /// `never` disables it (gesture / manual open still work);
     /// `bluetooth` ignores USB pads for open and close; `any` counts every
     /// controller (default).
     #[serde(default)]
     pub start_screen_auto_open: StartAutoOpen,
-    /// Show the clock widget at the top while the start screen is visible (default on).
+    /// Show the clock widget at the top while the launcher is visible (default on).
     #[serde(default = "default_true")]
-    pub start_screen_clock_enabled: bool,
+    pub launcher_clock_enabled: bool,
     /// Immersive idle dim after this many seconds (default 30). Snapped to idle steps.
     #[serde(default = "default_start_screen_inactive_secs")]
-    pub start_screen_inactive_secs: u32,
+    pub launcher_inactive_secs: u32,
     /// Immersive sleep (full black) after this many seconds (default 120). Snapped to sleep steps.
     #[serde(default = "default_start_screen_sleep_secs")]
-    pub start_screen_sleep_secs: u32,
+    pub launcher_sleep_secs: u32,
     /// Idle-mode black overlay percent 0–100 (default 50). Sleep is always 100%.
     #[serde(default = "default_start_screen_inactive_dim_percent")]
-    pub start_screen_inactive_dim_percent: u8,
+    pub launcher_inactive_dim_percent: u8,
     /// Reopen chord while a pad is connected.
     /// Always forced to PS on load/save; custom chords are no longer honored.
     #[serde(default = "default_gesture")]
-    pub start_screen_gesture: Vec<GestureControl>,
+    pub launcher_gesture: Vec<GestureControl>,
     /// Standalone hub app-install download cap in KB/s (`0` = unlimited).
     /// Hub Settings owns the control; every managed-app installer shares the
     /// live policy. The old `engine_download_limit_kbps` key is read as an
     /// alias so existing files keep their value.
     #[serde(default, alias = "engine_download_limit_kbps")]
     pub app_download_limit_kbps: u32,
-    /// Play UI cues while navigating the start screen (default on).
+    /// Play UI cues while navigating the UI (default on).
     #[serde(default = "default_true")]
     pub start_screen_sounds_enabled: bool,
     /// Master volume for start-screen UI sounds (0–100, default 60).
     #[serde(default = "default_start_screen_sound_volume")]
     pub start_screen_sound_volume: u8,
-    /// Play DualSense rumble cues while navigating the start screen (default on).
+    /// Play DualSense rumble cues while navigating the UI (default on).
     #[serde(default = "default_true")]
     pub start_screen_haptics_enabled: bool,
     /// Master strength for start-screen haptic cues (0–100, default 60).
     #[serde(default = "default_start_screen_haptics_strength")]
     pub start_screen_haptics_strength: u8,
-    /// Start-screen games list sort (default last played).
+    /// Launcher games list sort (default last played).
     #[serde(default)]
     pub games_sort_mode: GamesSortMode,
-    /// Show owned-but-uninstalled Steam games in the start screen and the
+    /// Show owned-but-uninstalled Steam games in the launcher and the
     /// edit checklist (default off). `None` means the user never set it —
     /// new installs and pre-1.7.1 files alike — so unset always follows the
     /// current default; `Some` is an explicit choice and wins. Skipped on
@@ -354,23 +356,23 @@ pub struct Prefs {
     /// it off on load. Off keeps the clamped index and never re-pins by key.
     /// Game axis only; the controller axis is never gated.
     #[serde(default)]
-    pub start_selection_persist: bool,
+    pub launcher_selection_persist: bool,
     /// How the game highlight restores when persistence is on (default by game).
     #[serde(default)]
-    pub start_selection_mode: StartSelectionMode,
+    pub launcher_selection_mode: LauncherSelectionMode,
     /// Controllers slide: include remembered disconnected pads (default off).
     #[serde(default)]
     pub show_all_controllers: bool,
     #[serde(default)]
-    pub start_screen_immersive_layout: ImmersiveLayout,
+    pub launcher_immersive_layout: ImmersiveLayout,
     /// Immersive position-rail visibility (default hides after 2s idle).
     #[serde(default)]
-    pub start_screen_navbar: NavbarVisibility,
-    /// Start-screen movement animations (default follows the OS toggle).
+    pub launcher_navbar: NavbarVisibility,
+    /// Launcher movement animations (default follows the OS toggle).
     #[serde(default)]
     pub reduced_motion: ReducedMotion,
-    /// Throttle immersive Start to anim-driven frames only (default off = always 60Hz).
-    /// When on, an idle immersive Start subscribes to no `StartFrame` tick;
+    /// Throttle immersive Launcher to anim-driven frames only (default off = always 60Hz).
+    /// When on, an idle immersive Launcher subscribes to no `LauncherFrame` tick;
     /// backdrop ken-burns freeze until input/nav/art wakes frames.
     #[serde(default)]
     pub perf_throttle_immersive: bool,
@@ -458,9 +460,9 @@ fn default_start_screen_inactive_dim_percent() -> u8 {
 }
 
 /// Allowed immersive idle timeouts (seconds): 5s, 15s, 30s, 1m, 2m, 3m, 5m, 10m.
-pub const START_SCREEN_IDLE_SECS_STEPS: &[u32] = &[5, 15, 30, 60, 120, 180, 300, 600];
+pub const LAUNCHER_IDLE_SECS_STEPS: &[u32] = &[5, 15, 30, 60, 120, 180, 300, 600];
 /// Allowed immersive sleep timeouts (seconds): 1m–5m like idle, then 5m gaps to 60m.
-pub const START_SCREEN_SLEEP_SECS_STEPS: &[u32] = &[
+pub const LAUNCHER_SLEEP_SECS_STEPS: &[u32] = &[
     60, 120, 180, 300, 600, 900, 1_200, 1_500, 1_800, 2_100, 2_400, 2_700, 3_000, 3_300, 3_600,
 ];
 
@@ -537,19 +539,19 @@ pub fn format_timeout_duration(secs: u32) -> String {
 
 /// Earliest allowed sleep step that is strictly after `idle_secs` (one breakpoint ahead).
 pub fn min_sleep_secs_for_idle(idle_secs: u32) -> u32 {
-    let idle = snap_to_secs_steps(idle_secs, START_SCREEN_IDLE_SECS_STEPS);
-    START_SCREEN_SLEEP_SECS_STEPS
+    let idle = snap_to_secs_steps(idle_secs, LAUNCHER_IDLE_SECS_STEPS);
+    LAUNCHER_SLEEP_SECS_STEPS
         .iter()
         .copied()
         .find(|&s| s > idle)
-        .unwrap_or(*START_SCREEN_SLEEP_SECS_STEPS.last().unwrap_or(&idle))
+        .unwrap_or(*LAUNCHER_SLEEP_SECS_STEPS.last().unwrap_or(&idle))
 }
 
 /// Clamp idle/sleep to allowed steps; sleep is always at least one breakpoint ahead of idle.
 pub fn clamp_start_screen_idle_timeouts(idle_secs: u32, sleep_secs: u32) -> (u32, u32) {
-    let idle = snap_to_secs_steps(idle_secs, START_SCREEN_IDLE_SECS_STEPS);
+    let idle = snap_to_secs_steps(idle_secs, LAUNCHER_IDLE_SECS_STEPS);
     let min_sleep = min_sleep_secs_for_idle(idle);
-    let sleep = snap_to_secs_steps(sleep_secs, START_SCREEN_SLEEP_SECS_STEPS).max(min_sleep);
+    let sleep = snap_to_secs_steps(sleep_secs, LAUNCHER_SLEEP_SECS_STEPS).max(min_sleep);
     (idle, sleep)
 }
 
@@ -582,11 +584,11 @@ impl Default for Prefs {
             lightbar_enabled: true,
             start_screen_enabled: true,
             start_screen_auto_open: StartAutoOpen::Any,
-            start_screen_clock_enabled: true,
-            start_screen_inactive_secs: default_start_screen_inactive_secs(),
-            start_screen_sleep_secs: default_start_screen_sleep_secs(),
-            start_screen_inactive_dim_percent: default_start_screen_inactive_dim_percent(),
-            start_screen_gesture: default_gesture(),
+            launcher_clock_enabled: true,
+            launcher_inactive_secs: default_start_screen_inactive_secs(),
+            launcher_sleep_secs: default_start_screen_sleep_secs(),
+            launcher_inactive_dim_percent: default_start_screen_inactive_dim_percent(),
+            launcher_gesture: default_gesture(),
             app_download_limit_kbps: 0,
             start_screen_sounds_enabled: true,
             start_screen_sound_volume: default_start_screen_sound_volume(),
@@ -596,11 +598,11 @@ impl Default for Prefs {
             show_uninstalled_games: None,
             // Hidden feature: selection persistence is always off (no UI).
             // `normalize` forces it off so older prefs files converge too.
-            start_selection_persist: false,
-            start_selection_mode: StartSelectionMode::default(),
+            launcher_selection_persist: false,
+            launcher_selection_mode: LauncherSelectionMode::default(),
             show_all_controllers: false,
-            start_screen_immersive_layout: ImmersiveLayout::default(),
-            start_screen_navbar: NavbarVisibility::default(),
+            launcher_immersive_layout: ImmersiveLayout::default(),
+            launcher_navbar: NavbarVisibility::default(),
             reduced_motion: ReducedMotion::default(),
             perf_throttle_immersive: false,
             perf_antialiasing: true,
@@ -678,7 +680,7 @@ impl Prefs {
         let path = prefs_path();
         // Rewrite stale custom / empty chords as PS on disk.
         let mut prefs = self.clone();
-        prefs.start_screen_gesture = default_gesture();
+        prefs.launcher_gesture = default_gesture();
         crate::persist::store::save_pretty("prefs", &path, &prefs);
     }
 
@@ -704,16 +706,14 @@ impl Prefs {
             clamp_start_screen_sound_volume(self.start_screen_sound_volume);
         self.start_screen_haptics_strength =
             clamp_start_screen_haptics_strength(self.start_screen_haptics_strength);
-        self.start_screen_inactive_dim_percent =
-            clamp_start_screen_inactive_dim_percent(self.start_screen_inactive_dim_percent);
-        let (inactive, sleep) = clamp_start_screen_idle_timeouts(
-            self.start_screen_inactive_secs,
-            self.start_screen_sleep_secs,
-        );
-        self.start_screen_inactive_secs = inactive;
-        self.start_screen_sleep_secs = sleep;
-        self.start_screen_gesture = default_gesture();
-        self.start_selection_persist = false;
+        self.launcher_inactive_dim_percent =
+            clamp_start_screen_inactive_dim_percent(self.launcher_inactive_dim_percent);
+        let (inactive, sleep) =
+            clamp_start_screen_idle_timeouts(self.launcher_inactive_secs, self.launcher_sleep_secs);
+        self.launcher_inactive_secs = inactive;
+        self.launcher_sleep_secs = sleep;
+        self.launcher_gesture = default_gesture();
+        self.launcher_selection_persist = false;
     }
 }
 
@@ -737,7 +737,7 @@ mod tests {
         assert!(!prefs.analytics_enabled);
         assert!(prefs.lightbar_enabled);
         assert!(prefs.start_screen_enabled);
-        assert_eq!(prefs.start_screen_gesture, default_gesture());
+        assert_eq!(prefs.launcher_gesture, default_gesture());
     }
 
     #[test]
@@ -757,34 +757,32 @@ mod tests {
         )
         .unwrap();
         assert!(prefs.start_screen_enabled);
-        assert_eq!(prefs.start_screen_gesture, default_gesture());
+        assert_eq!(prefs.launcher_gesture, default_gesture());
     }
 
     #[test]
     fn empty_gesture_list_normalizes_to_ps() {
         let mut prefs: Prefs =
-            serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":[]}"#)
-                .unwrap();
-        assert!(prefs.start_screen_gesture.is_empty());
+            serde_json::from_str(r#"{"start_screen_enabled":true,"launcher_gesture":[]}"#).unwrap();
+        assert!(prefs.launcher_gesture.is_empty());
         prefs.normalize();
-        assert_eq!(prefs.start_screen_gesture, default_gesture());
+        assert_eq!(prefs.launcher_gesture, default_gesture());
     }
 
     #[test]
     fn custom_gesture_normalizes_to_ps() {
-        let mut prefs: Prefs = serde_json::from_str(
-            r#"{"start_screen_enabled":true,"start_screen_gesture":["l2","r2"]}"#,
-        )
-        .unwrap();
-        assert_ne!(prefs.start_screen_gesture, default_gesture());
+        let mut prefs: Prefs =
+            serde_json::from_str(r#"{"start_screen_enabled":true,"launcher_gesture":["l2","r2"]}"#)
+                .unwrap();
+        assert_ne!(prefs.launcher_gesture, default_gesture());
         prefs.normalize();
-        assert_eq!(prefs.start_screen_gesture, default_gesture());
+        assert_eq!(prefs.launcher_gesture, default_gesture());
     }
 
     #[test]
     fn older_prefs_default_start_screen_sounds_on() {
         let prefs: Prefs =
-            serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":["ps"]}"#)
+            serde_json::from_str(r#"{"start_screen_enabled":true,"launcher_gesture":["ps"]}"#)
                 .unwrap();
         assert!(prefs.start_screen_sounds_enabled);
         assert_eq!(prefs.start_screen_sound_volume, 60);
@@ -793,7 +791,7 @@ mod tests {
     #[test]
     fn older_prefs_default_start_screen_haptics_on() {
         let prefs: Prefs =
-            serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":["ps"]}"#)
+            serde_json::from_str(r#"{"start_screen_enabled":true,"launcher_gesture":["ps"]}"#)
                 .unwrap();
         assert!(prefs.start_screen_haptics_enabled);
         assert_eq!(prefs.start_screen_haptics_strength, 60);
@@ -911,45 +909,45 @@ mod tests {
     #[test]
     fn older_prefs_default_selection_persist_off_by_game() {
         let prefs: Prefs = serde_json::from_str("{}").unwrap();
-        assert!(!prefs.start_selection_persist);
-        assert_eq!(prefs.start_selection_mode, StartSelectionMode::ByGame);
+        assert!(!prefs.launcher_selection_persist);
+        assert_eq!(prefs.launcher_selection_mode, LauncherSelectionMode::ByGame);
         assert_eq!(
-            Prefs::default().start_selection_mode,
-            StartSelectionMode::ByGame
+            Prefs::default().launcher_selection_mode,
+            LauncherSelectionMode::ByGame
         );
     }
 
     #[test]
     fn selection_mode_cycles_and_labels() {
         assert_eq!(
-            StartSelectionMode::ByGame.cycle(),
-            StartSelectionMode::ByPosition
+            LauncherSelectionMode::ByGame.cycle(),
+            LauncherSelectionMode::ByPosition
         );
         assert_eq!(
-            StartSelectionMode::ByPosition.cycle(),
-            StartSelectionMode::ByGame
+            LauncherSelectionMode::ByPosition.cycle(),
+            LauncherSelectionMode::ByGame
         );
         assert_eq!(
-            StartSelectionMode::ByGame.next(),
-            StartSelectionMode::ByPosition
+            LauncherSelectionMode::ByGame.next(),
+            LauncherSelectionMode::ByPosition
         );
         assert_eq!(
-            StartSelectionMode::ByPosition.prev(),
-            StartSelectionMode::ByGame
+            LauncherSelectionMode::ByPosition.prev(),
+            LauncherSelectionMode::ByGame
         );
-        assert_eq!(StartSelectionMode::ByGame.label(), "By game");
-        assert_eq!(StartSelectionMode::ByPosition.label(), "By position");
+        assert_eq!(LauncherSelectionMode::ByGame.label(), "By game");
+        assert_eq!(LauncherSelectionMode::ByPosition.label(), "By position");
         assert_eq!(
-            serde_json::to_string(&StartSelectionMode::ByGame).unwrap(),
+            serde_json::to_string(&LauncherSelectionMode::ByGame).unwrap(),
             r#""by_game""#
         );
         assert_eq!(
-            serde_json::to_string(&StartSelectionMode::ByPosition).unwrap(),
+            serde_json::to_string(&LauncherSelectionMode::ByPosition).unwrap(),
             r#""by_position""#
         );
         for mode in SELECTION_MODES {
             let encoded = serde_json::to_string(&mode).unwrap();
-            let decoded: StartSelectionMode = serde_json::from_str(&encoded).unwrap();
+            let decoded: LauncherSelectionMode = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, mode);
         }
     }
@@ -957,16 +955,19 @@ mod tests {
     #[test]
     fn selection_persist_is_always_off() {
         // Raw files may still carry `true`; `normalize` (load path) forces it off.
-        let prefs: Prefs = serde_json::from_str(r#"{"start_selection_persist":false}"#).unwrap();
-        assert!(!prefs.start_selection_persist);
-        let prefs: Prefs = serde_json::from_str::<Prefs>(r#"{"start_selection_persist":true}"#)
+        let prefs: Prefs = serde_json::from_str(r#"{"launcher_selection_persist":false}"#).unwrap();
+        assert!(!prefs.launcher_selection_persist);
+        let prefs: Prefs = serde_json::from_str::<Prefs>(r#"{"launcher_selection_persist":true}"#)
             .unwrap()
             .normalized();
-        assert!(!prefs.start_selection_persist);
+        assert!(!prefs.launcher_selection_persist);
         let prefs: Prefs =
-            serde_json::from_str(r#"{"start_selection_mode":"by_position"}"#).unwrap();
-        assert!(!prefs.start_selection_persist);
-        assert_eq!(prefs.start_selection_mode, StartSelectionMode::ByPosition);
+            serde_json::from_str(r#"{"launcher_selection_mode":"by_position"}"#).unwrap();
+        assert!(!prefs.launcher_selection_persist);
+        assert_eq!(
+            prefs.launcher_selection_mode,
+            LauncherSelectionMode::ByPosition
+        );
     }
 
     #[test]
@@ -982,11 +983,11 @@ mod tests {
     #[test]
     fn older_prefs_default_immersive_idle_timeouts() {
         let prefs: Prefs =
-            serde_json::from_str(r#"{"start_screen_enabled":true,"start_screen_gesture":["ps"]}"#)
+            serde_json::from_str(r#"{"start_screen_enabled":true,"launcher_gesture":["ps"]}"#)
                 .unwrap();
-        assert_eq!(prefs.start_screen_inactive_secs, 30);
-        assert_eq!(prefs.start_screen_sleep_secs, 120);
-        assert_eq!(prefs.start_screen_inactive_dim_percent, 50);
+        assert_eq!(prefs.launcher_inactive_secs, 30);
+        assert_eq!(prefs.launcher_sleep_secs, 120);
+        assert_eq!(prefs.launcher_inactive_dim_percent, 50);
     }
 
     #[test]
@@ -998,9 +999,9 @@ mod tests {
         assert_eq!(clamp_start_screen_idle_timeouts(0, 10), (5, 60));
         assert_eq!(min_sleep_secs_for_idle(600), 900);
         assert_eq!(clamp_start_screen_idle_timeouts(9_999, 9_999), (600, 3_600));
-        assert_eq!(snap_to_secs_steps(20, START_SCREEN_IDLE_SECS_STEPS), 15);
-        assert_eq!(snap_to_secs_steps(45, START_SCREEN_IDLE_SECS_STEPS), 30);
-        assert_eq!(snap_to_secs_steps(90, START_SCREEN_SLEEP_SECS_STEPS), 60);
+        assert_eq!(snap_to_secs_steps(20, LAUNCHER_IDLE_SECS_STEPS), 15);
+        assert_eq!(snap_to_secs_steps(45, LAUNCHER_IDLE_SECS_STEPS), 30);
+        assert_eq!(snap_to_secs_steps(90, LAUNCHER_SLEEP_SECS_STEPS), 60);
         assert_eq!(clamp_start_screen_inactive_dim_percent(30), 30);
         assert_eq!(clamp_start_screen_inactive_dim_percent(255), 100);
     }
@@ -1101,25 +1102,25 @@ mod tests {
     }
 
     #[test]
-    fn start_screen_clock_defaults_on() {
+    fn launcher_clock_defaults_on() {
         let prefs: Prefs = serde_json::from_str("{}").unwrap();
-        assert!(prefs.start_screen_clock_enabled);
-        assert!(Prefs::default().start_screen_clock_enabled);
-        let prefs: Prefs = serde_json::from_str(r#"{"start_screen_clock_enabled":false}"#).unwrap();
-        assert!(!prefs.start_screen_clock_enabled);
+        assert!(prefs.launcher_clock_enabled);
+        assert!(Prefs::default().launcher_clock_enabled);
+        let prefs: Prefs = serde_json::from_str(r#"{"launcher_clock_enabled":false}"#).unwrap();
+        assert!(!prefs.launcher_clock_enabled);
     }
 
     #[test]
     fn immersive_layout_round_trips_with_extra_steam_paths() {
         let prefs = Prefs {
-            start_screen_immersive_layout: ImmersiveLayout::Horizontal,
+            launcher_immersive_layout: ImmersiveLayout::Horizontal,
             extra_steam_paths: vec![PathBuf::from("/steam/extra")],
             ..Prefs::default()
         };
         let encoded = serde_json::to_string(&prefs).unwrap();
         let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
         assert_eq!(
-            decoded.start_screen_immersive_layout,
+            decoded.launcher_immersive_layout,
             ImmersiveLayout::Horizontal
         );
         assert_eq!(
@@ -1131,13 +1132,10 @@ mod tests {
     #[test]
     fn older_prefs_default_to_vertical_layout_and_no_extra_paths() {
         let prefs: Prefs = serde_json::from_str("{}").unwrap();
-        assert_eq!(
-            prefs.start_screen_immersive_layout,
-            ImmersiveLayout::Vertical
-        );
+        assert_eq!(prefs.launcher_immersive_layout, ImmersiveLayout::Vertical);
         assert!(prefs.extra_steam_paths.is_empty());
         assert_eq!(
-            Prefs::default().start_screen_immersive_layout,
+            Prefs::default().launcher_immersive_layout,
             ImmersiveLayout::Vertical
         );
         assert!(Prefs::default().extra_steam_paths.is_empty());
@@ -1175,20 +1173,20 @@ mod tests {
     #[test]
     fn navbar_visibility_round_trips() {
         let prefs = Prefs {
-            start_screen_navbar: NavbarVisibility::AlwaysOn,
+            launcher_navbar: NavbarVisibility::AlwaysOn,
             ..Prefs::default()
         };
         let encoded = serde_json::to_string(&prefs).unwrap();
         let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded.start_screen_navbar, NavbarVisibility::AlwaysOn);
+        assert_eq!(decoded.launcher_navbar, NavbarVisibility::AlwaysOn);
     }
 
     #[test]
     fn older_prefs_default_to_when_navigating_navbar() {
         let prefs: Prefs = serde_json::from_str("{}").unwrap();
-        assert_eq!(prefs.start_screen_navbar, NavbarVisibility::WhenNavigating);
+        assert_eq!(prefs.launcher_navbar, NavbarVisibility::WhenNavigating);
         assert_eq!(
-            Prefs::default().start_screen_navbar,
+            Prefs::default().launcher_navbar,
             NavbarVisibility::WhenNavigating
         );
         assert_eq!(

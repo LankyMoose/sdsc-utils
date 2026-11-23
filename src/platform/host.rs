@@ -2,7 +2,7 @@
 //!
 //! Safe wrappers that delegate verbatim to the existing platform
 //! implementations. App ([`crate::app`]) and UI ([`crate::ui::layout`] /
-//! [`crate::ui::start`]) call sites go through this seam instead of touching
+//! [`crate::ui::launcher`]) call sites go through this seam instead of touching
 //! Win32 directly.
 //!
 //! Window functions take a raw `isize` HWND, matching [`crate::platform::win32`].
@@ -222,9 +222,9 @@ pub struct Host;
 /// Single implementation; plain associated functions on [`Host`] (no trait:
 /// there is only one backend and no mock callers).
 ///
-/// Reads through the Start image layer's owned
+/// Reads through the Launcher image layer's owned
 /// [`crate::platform::file_icon::FileIconCache`]
-/// (see [`crate::ui::start::icon_cache::IconCache`]); no process-global.
+/// (see [`crate::ui::launcher::icon_cache::IconCache`]); no process-global.
 impl Host {
     /// Square RGBA icon for `path`, or `None` when extraction fails.
     pub fn icon_get(
@@ -425,8 +425,8 @@ impl Host {
     /// Whether the cursor is inside the primary monitor's work area
     /// (excludes the taskbar strip and other reserved chrome).
     ///
-    /// The Start cover spans the full monitor including the taskbar, but
-    /// taskbar input never reaches Start — hiding there strands the cursor
+    /// The Launcher cover spans the full monitor including the taskbar, but
+    /// taskbar input never reaches Launcher — hiding there strands the cursor
     /// with no self-unhide path (notably across a blocking tray-menu modal
     /// loop). `false` off Windows or when the query fails (fail visible).
     pub fn cursor_in_work_area() -> bool {

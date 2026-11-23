@@ -6,18 +6,18 @@ Phases 0–4 are complete; phase 5 (DLC packaging/install + catalog) is
 partially landed. The engine package, resolver, catalog/install UI, and dev
 download path exist; the Store API wiring and optional-package submission
 remain.
-**When to read:** before touching Start/browser window ownership, the PS
+**When to read:** before touching Launcher/browser window ownership, the PS
 overlay, app selection, the engine backend, or MSIX packaging.
 
 Current browser internals: [browser-embedding.md](browser-embedding.md).
 
 ## Goal
 
-Split the controller browser out of the Start screen and make it a standalone
-managed app. PS opens a small overlay **hub** listing installed apps (Start
-Screen Launcher first, Browser second when its engine is installed, ＋ tile for
-adding optional packages). Future controller-first apps register the same way.
-Browser runs its own fullscreen window with its own chrome. Hub, Start, and
+Split the controller browser out of the Launcher and make it a standalone
+managed app. PS opens a small overlay **hub** listing installed apps (Launcher
+first, Browser second when its engine is installed, ＋ tile for adding optional
+packages). Future controller-first apps register the same way.
+Browser runs its own fullscreen window with its own chrome. Hub, Launcher, and
 Browser are all managed by sdsc-utils (tray + HID + iced daemon, one process).
 
 Engine target: **CEF OSR** as a Store/standalone DLC. Servo is deleted with no
@@ -51,7 +51,7 @@ half-measures, no `fetch.rs` text fallback).
   "UI-only iteration build" (browser tile shows install UI).
 - **Hub tile policy:** Browser tile always visible; engine missing → inline
   Install affordance. ＋ tile opens the catalog.
-- **Window levels:** Start + Browser = `Level::Normal` + bring-to-front
+- **Window levels:** Launcher + Browser = `Level::Normal` + bring-to-front
   (`focus_window`), no `raise_window_topmost`, out of the raise-above-toast
   set. Toast/popup/Settings keep current levels. **Hub is the exception:**
   `AlwaysOnTop`, raised last (above toast/Settings/popup). Topmost still loses
@@ -59,10 +59,10 @@ half-measures, no `fetch.rs` text fallback).
 - **PS:** toggles hub from anywhere, including over running games. Pad works
   unfocused (HID is direct); mouse/keyboard in hub over a focused game are
   best-effort. Auto-open behavior (toast-first latch, USB scope, `AfterToast`
-  settle, PS-chord suppression, `WindowClosed` retry) moves from Start to hub;
+  settle, PS-chord suppression, `WindowClosed` retry) moves from Launcher to hub;
   pref key migrates (`Never`/`Bluetooth`/`Any`, default `Any`).
 - **Browser window:** fullscreen immersive, own tab strip + toolbar +
-  bookmarks + page + status strip (current geometry, minus the Start
+  bookmarks + page + status strip (current geometry, minus the Launcher
   wash/card surround).
 
 ## Target shape
@@ -70,9 +70,9 @@ half-measures, no `fetch.rs` text fallback).
 ```
 sdsc-utils (tray + HID + manager)
 ├── Hub overlay (small, topmost) — PS toggle, auto-open target
-│   ├── Start Screen Launcher (always)
+│   ├── Launcher (always)
 │   └── Browser (or install tile) — Triangle opens actions/Info
-├── Start app (Normal window — games, scan, art; browser fields removed)
+├── Launcher app (Normal window — games, scan, art; browser fields removed)
 └── Browser app (Normal fullscreen window — own engine + chrome)
 ```
 
@@ -85,40 +85,40 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    `BrowserPanel`/tabs/store/chrome/cursor moved to
    `src/ui/browser/state.rs`; panel + engine handle + capability flag +
    browser D-pad stepper now live in `BrowserAppState`
-   (`src/app/browser.rs`). `StartState` keeps only a `browser_open` mirror
+   (`src/app/browser.rs`). `LauncherState` keeps only a `browser_open` mirror
    for pure view helpers. `AppManager` was replaced by `AppHub`
-   (`src/app/hub.rs`, `AppId { Start, Browser }`, install/active/focus,
-   open/close/suspend/resume); Start still renders the panel until phase 2.
+   (`src/app/hub.rs`, `AppId { Launcher, Browser }`, install/active/focus,
+   open/close/suspend/resume); Launcher still renders the panel until phase 2.
    `tabs.json`/`bookmarks.json` paths unchanged.
 1. **Hub window + PS retarget + auto-open moved. — landed.** New
    `src/ui/hub/` (tiles, selection, pad/key edges) + `src/app/hub.rs`
    (window lifecycle, topmost raise, PS toggle). PS opens the hub from
-   Start, desktop, or a running game; while open the hub owns pad input and
-   Start messages are gated. Auto-open/session latch, toast settle, retry,
+   Launcher, desktop, or a running game; while open the hub owns pad input and
+   Launcher messages are gated. Auto-open/session latch, toast settle, retry,
    and cooldown all target the hub (`SessionEffect::OpenHub`,
    `AfterToast::OpenHub`); `ApplyContext.hub_visible` replaces
-   `start_visible` for the gate. Start moved from `AlwaysOnTop` to
+   `launcher_visible` for the gate. Launcher moved from `AlwaysOnTop` to
    `Normal`; the hub is raised above Settings/popup, with the toast raised
    last above all shell surfaces. The hub window always covers the monitor
    and dims the screen behind a centered card. The card is compact and
    icon-first (large glyph + title, no subtitles, no header/close chrome):
-   Start / Browser / Add apps tiles. Add apps opens a tiles grid (Start /
+   Launcher / Browser / Add apps tiles. Add apps opens a tiles grid (Launcher /
    Browser); each tile's X affordance opens a per-app popup with
    Install/Uninstall/Info, and uninstalled entries are dimmed. **Later
    superseded:** the Add apps tile/screen was removed; Triangle on the
-   Browser tile now opens the same actions/Info popup directly. Start and
+   Browser tile now opens the same actions/Info popup directly. Launcher and
    Browser are mutually exclusive; opening either dismisses the other. Over
    exclusive-fullscreen games the topmost hub can still be covered
    (documented limitation).
 2. **Browser standalone window. — landed.** New fullscreen `Level::Normal`
-   Browser window (`app::browser::open_browser_window`); Start no longer
+   Browser window (`app::browser::open_browser_window`); Launcher no longer
    renders or owns the panel. Rendering moved to `src/ui/browser/view.rs`
    (`root_view`, `fullscreen_layout`) and all browser messages are
-   `BrowserMessage` (no `StartMessage::Browser*` left). Browser owns pad
+   `BrowserMessage` (no `LauncherMessage::Browser*` left). Browser owns pad
    routing (`on_browser_pad`: cursor, D-pad jumps, history selector, R3
    flag), keyboard (`on_browser_key`), its own 60Hz `BrowserFrame` tick, and
    window close/suspend/focus return. Hub is routed before Browser; Browser
-   before Start. The live window renders a **16:9 card**, height-driven at
+   before Launcher. The live window renders a **16:9 card**, height-driven at
    `window height - 100px` (50px breather per side), centered on the monitor
    with the tab/toolbar/bookmark header inside it; `browser_layout` is the
    single geometry source for both the card and the engine viewport.

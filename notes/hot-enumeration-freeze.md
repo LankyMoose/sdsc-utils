@@ -1,13 +1,13 @@
 # Hot enumeration freeze hides second-pad connects (open)
 
 **Status:** open (latent, pre-existing — NOT introduced by the incremental-poll work). Update in 1.7.0-architecture: the blind window is now bounded — `HOT_ENUM_MAX_DEFER` (20s heartbeat cap, `hid/worker.rs`) forces a refresh while hot, and the OS device-arrival watcher (`device_watch.rs`) fires list-only refresh hints (~1s). The test-matrix lessons below still apply.
-**When to read:** a pad connected while Start is open / input is hot never appears
+**When to read:** a pad connected while Launcher is open / input is hot never appears
 (no toast, no tray, no sample opens) until input goes cold. Index: [README.md](README.md).
 
 ## Repro (2026-10-07 session, `app.log`/`hid-trace.log` 13:2x, epoch base 17913327xx)
 
 - Pad 1 (low, `444648164f65`, 15%) connects → 0→1 presence + `Connected` at
-  `:2715`, Start opens and stays visible until `:2786`.
+  `:2715`, Launcher opens and stays visible until `:2786`.
 - Pad 2 (`444648156926`, charged) is connected afterwards but never appears:
   no `Connected` toast, no tray change, no `open caller=sample|poll` for its
   path (`8&15b6e16c`) until `:2784`.
@@ -27,11 +27,11 @@
    `refresh_devices()` is skipped and the cadence clock is bumped, so the
    refresh never goes due while sampling runs hot.
 2. `service/mod.rs` cold path: `else if !nav_priority` — battery/liveness
-   polls (the only other refresh callers) stop while Start owns input.
+   polls (the only other refresh callers) stop while Launcher owns input.
    The hot path only applies on live-list *changes*, so a stable pad
    produces no polls either.
 
-Net: with Start open and one stable pad, the device list is frozen indefinitely.
+Net: with Launcher open and one stable pad, the device list is frozen indefinitely.
 New arrivals are undiscoverable until input goes cold. Chicken-and-egg: without
 enumerating, nothing can notice the arrival.
 
@@ -67,14 +67,14 @@ repeated hold lines, rare `caller=lightbar` writes.
 
 - `hidapi_refresh deferred input_hot=1` — freeze active (runs of these with no
   `hidapi_refresh end` between = blind window; correlate with missing 0→1)
-- `cmd=Poll` gaps — with Start open, gaps ≫5s are expected (hot path owns
+- `cmd=Poll` gaps — with Launcher open, gaps ≫5s are expected (hot path owns
   updates); do NOT read them as idleness
 - `open caller=sample` for a path with no prior `hidapi_refresh end` within
   ~3s = list was stale when the pad arrived
 
 ## Lessons (test matrix)
 
-- Manual matrix must include: Start OPEN + stable pad 1 + connect pad 2.
+- Manual matrix must include: Launcher OPEN + stable pad 1 + connect pad 2.
   Before this incident every two-pad test started from tray-idle (cold), where
   enumeration runs at 500ms and discovery works.
 - Any poll/sampling change must be validated against a frozen-enumeration

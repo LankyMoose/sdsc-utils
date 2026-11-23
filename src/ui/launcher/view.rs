@@ -1,17 +1,17 @@
-//! Start screen: fullscreen console game launcher, DualSense / keyboard navigable.
+//! Launcher: fullscreen console game launcher, DualSense / keyboard navigable.
 
 use crate::controller::model::Serial;
 use crate::games::GameEntry;
 use crate::games::steam::SteamGame;
 use crate::persist::prefs::{
-    GamesSortMode, ImmersiveLayout, NavbarVisibility, ReducedMotion, StartAutoOpen,
-    StartSelectionMode,
+    GamesSortMode, ImmersiveLayout, LauncherSelectionMode, NavbarVisibility, ReducedMotion,
+    StartAutoOpen,
 };
 use crate::ui::face::FacePressAnim;
+use crate::ui::launcher::icon_cache;
+use crate::ui::launcher::input::FaceHeld;
+use crate::ui::launcher::overlay;
 use crate::ui::layout as window_layout;
-use crate::ui::start::icon_cache;
-use crate::ui::start::input::FaceHeld;
-use crate::ui::start::overlay;
 use crate::ui::svg_icon;
 use crate::ui::theme;
 use iced::mouse;
@@ -41,7 +41,7 @@ const HINT_ANIM: Duration = Duration::from_millis(crate::ui::motion::FAST_MS);
 pub(crate) const ROW_ACTION_SPACING: f32 = 14.0;
 
 #[derive(Debug, Clone)]
-pub enum StartMessage {
+pub enum LauncherMessage {
     Launch(usize),
     /// Immersive strip: select a game without launching.
     SelectGame(usize),
@@ -67,7 +67,7 @@ pub enum StartMessage {
     ManualAddArgs(String),
     ManualPickIcon,
     ManualClearIcon,
-    /// Options — open/close in-window Start settings.
+    /// Options — open/close in-window Launcher settings.
     ToggleSettings,
     SetAutoOpen(StartAutoOpen),
     ToggleAutoOpenMenu,
@@ -76,7 +76,7 @@ pub enum StartMessage {
     ToggleReducedMotionMenu,
     ToggleSelectionModeMenu,
     SetSelectionPersist(bool),
-    SetSelectionMode(StartSelectionMode),
+    SetSelectionMode(LauncherSelectionMode),
 
     SetClock(bool),
     SetImmersiveLayout(ImmersiveLayout),
@@ -105,7 +105,7 @@ pub enum StartMessage {
     CloseAmbientTuning,
     /// Debug-only: absolute tuning commit from the tuning panel (pad + mouse).
     #[cfg(debug_assertions)]
-    SetAmbientTune(crate::ui::start::ambient_tune::AmbientTuneParam, f32),
+    SetAmbientTune(crate::ui::launcher::ambient_tune::AmbientTuneParam, f32),
     /// Debug-only: restore shipped tuning from the tuning panel.
     #[cfg(debug_assertions)]
     ResetAmbientTuning,
@@ -126,7 +126,7 @@ pub enum StartMessage {
 /// `Handle::from_rgba` every refresh assigns a new cache id and forces iced's
 /// image atlas to re-upload (and often grow) each redraw.
 #[derive(Debug, Clone)]
-pub struct StartIcon(pub iced::widget::image::Handle);
+pub struct LauncherIcon(pub iced::widget::image::Handle);
 
 /// Where to load list / hero art for a start-screen game row.
 #[derive(Debug, Clone)]
@@ -137,12 +137,12 @@ pub enum IconSource {
 
 /// Subtext under a game title (plain path/URI, or stacked Steam labels).
 #[derive(Debug, Clone)]
-pub enum StartSubtitle {
+pub enum LauncherSubtitle {
     Plain(String),
     Labeled(Vec<crate::games::steam::MetaLine>),
 }
 
-impl StartSubtitle {
+impl LauncherSubtitle {
     /// Empty-catalog Steam fallback — hide when showing an update badge alone.
     pub fn is_steam_fallback(&self) -> bool {
         match self {
@@ -153,13 +153,13 @@ impl StartSubtitle {
 }
 
 #[derive(Debug, Clone)]
-pub struct StartRow {
+pub struct LauncherRow {
     pub title: String,
-    pub subtitle: Option<StartSubtitle>,
+    pub subtitle: Option<LauncherSubtitle>,
     pub target: String,
     pub args: String,
     pub play_key: String,
-    pub icon: Option<StartIcon>,
+    pub icon: Option<LauncherIcon>,
     /// Path used for immersive hero art (selected + neighbors only).
     pub icon_source: Option<IconSource>,
     /// Landscape Steam art for immersive full-bleed backdrop.
@@ -190,7 +190,7 @@ pub enum EditRow {
     Manual { id: String },
 }
 
-impl StartRow {
+impl LauncherRow {
     pub(crate) fn launch_hint_label(&self) -> &'static str {
         if self.view_in_steam.is_some() {
             "View in Steam"
@@ -214,7 +214,7 @@ impl StartRow {
                     let icon_source = steam_icon_source(game);
                     Self {
                         title: game.name.clone(),
-                        subtitle: Some(StartSubtitle::Labeled(
+                        subtitle: Some(LauncherSubtitle::Labeled(
                             crate::games::steam::browse_meta_lines(game),
                         )),
                         target: crate::games::steam::launch_uri(*appid),
@@ -256,9 +256,9 @@ impl StartRow {
                         .map(str::to_string)
                         .unwrap_or_else(|| format!("Steam {appid}"));
                     let subtitle = if known_missing {
-                        StartSubtitle::Plain("Not installed".into())
+                        LauncherSubtitle::Plain("Not installed".into())
                     } else {
-                        StartSubtitle::Plain("Steam".into())
+                        LauncherSubtitle::Plain("Steam".into())
                     };
                     Self {
                         title,
@@ -292,7 +292,7 @@ impl StartRow {
                 let icon_source = manual_icon_source(target, icon.as_deref());
                 Self {
                     title: title.clone(),
-                    subtitle: Some(StartSubtitle::Plain(target.clone())),
+                    subtitle: Some(LauncherSubtitle::Plain(target.clone())),
                     target: target.clone(),
                     args: args.clone(),
                     play_key: entry.play_key(),
@@ -314,7 +314,7 @@ impl StartRow {
         let icon_source = steam_icon_source(game);
         Self {
             title: game.name.clone(),
-            subtitle: Some(StartSubtitle::Labeled(
+            subtitle: Some(LauncherSubtitle::Labeled(
                 crate::games::steam::browse_meta_lines(game),
             )),
             target: crate::games::steam::launch_uri(game.appid),
@@ -341,7 +341,7 @@ impl StartRow {
     pub fn steam_uninstalled(appid: u32, title: String, played_at_ms: Option<u64>) -> Self {
         Self {
             title,
-            subtitle: Some(StartSubtitle::Plain("Not installed".into())),
+            subtitle: Some(LauncherSubtitle::Plain("Not installed".into())),
             target: crate::games::steam::launch_uri(appid),
             args: String::new(),
             play_key: format!("steam:{appid}"),
@@ -373,7 +373,7 @@ impl StartRow {
         let icon_source = manual_icon_source(target, icon.as_deref());
         Some(Self {
             title: title.clone(),
-            subtitle: Some(StartSubtitle::Plain(target.clone())),
+            subtitle: Some(LauncherSubtitle::Plain(target.clone())),
             target: target.clone(),
             args: args.clone(),
             play_key: entry.play_key(),
@@ -391,10 +391,10 @@ impl StartRow {
 
     /// Immersive hero art — peek only (never decodes on the UI thread).
     /// Falls back to the live list-tier peek when the hero tier is still cold.
-    pub fn hero_icon(&self) -> Option<StartIcon> {
+    pub fn hero_icon(&self) -> Option<LauncherIcon> {
         match &self.icon_source {
-            Some(IconSource::File(path)) => icon_cache::hero_cached(path).map(StartIcon),
-            Some(IconSource::Shell(path)) => icon_cache::hero_shell_cached(path).map(StartIcon),
+            Some(IconSource::File(path)) => icon_cache::hero_cached(path).map(LauncherIcon),
+            Some(IconSource::Shell(path)) => icon_cache::hero_shell_cached(path).map(LauncherIcon),
             None => None,
         }
         .or_else(|| self.list_icon_live())
@@ -410,17 +410,17 @@ impl StartRow {
     }
 
     /// Immersive landscape backdrop — peek only (never decodes on the UI thread).
-    pub fn backdrop_icon(&self) -> Option<StartIcon> {
+    pub fn backdrop_icon(&self) -> Option<LauncherIcon> {
         self.backdrop_path
             .as_ref()
-            .and_then(|p| icon_cache::backdrop_cached(p).map(StartIcon))
+            .and_then(|p| icon_cache::backdrop_cached(p).map(LauncherIcon))
     }
 
     /// List-tier icon — live peek (never decodes on the UI thread).
-    pub fn list_icon_live(&self) -> Option<StartIcon> {
+    pub fn list_icon_live(&self) -> Option<LauncherIcon> {
         match &self.icon_source {
-            Some(IconSource::File(path)) => icon_cache::icon_cached(path).map(StartIcon),
-            Some(IconSource::Shell(path)) => icon_cache::icon_shell_cached(path).map(StartIcon),
+            Some(IconSource::File(path)) => icon_cache::icon_cached(path).map(LauncherIcon),
+            Some(IconSource::Shell(path)) => icon_cache::icon_shell_cached(path).map(LauncherIcon),
             None => None,
         }
         .or_else(|| self.icon.clone())
@@ -450,7 +450,7 @@ impl StartRow {
 /// order is random per process; a bare title sort would reshuffle
 /// duplicate-title rows on every rebuild (toggle / scan / enter), which reads
 /// as the list re-sorting itself. The tiebreak keeps rebuilds byte-stable.
-pub fn sort_edit_rows(rows: &mut [StartRow]) {
+pub fn sort_edit_rows(rows: &mut [LauncherRow]) {
     rows.sort_by(|a, b| {
         a.title
             .to_lowercase()
@@ -464,7 +464,7 @@ pub fn sort_edit_rows(rows: &mut [StartRow]) {
 /// ([`crate::games::GamesCatalog::merge_sorted`]). `played_at_ms` must be
 /// populated before calling (see `App::edit_checklist_rows`); `None` sorts
 /// as never-played, matching browse.
-pub fn sort_edit_rows_by_mode(rows: &mut [StartRow], mode: GamesSortMode) {
+pub fn sort_edit_rows_by_mode(rows: &mut [LauncherRow], mode: GamesSortMode) {
     match mode {
         GamesSortMode::Alphabetical => sort_edit_rows(rows),
         GamesSortMode::LastPlayed => rows.sort_by(|a, b| {
@@ -481,11 +481,11 @@ fn steam_icon_source(game: &SteamGame) -> Option<IconSource> {
     game.icon_path.as_ref().map(|p| IconSource::File(p.clone()))
 }
 
-fn steam_icon(game: &SteamGame) -> Option<StartIcon> {
+fn steam_icon(game: &SteamGame) -> Option<LauncherIcon> {
     game.icon_path
         .as_ref()
         .and_then(|p| icon_cache::icon_cached(p))
-        .map(StartIcon)
+        .map(LauncherIcon)
 }
 
 fn manual_icon_source(target: &str, custom: Option<&str>) -> Option<IconSource> {
@@ -502,13 +502,13 @@ fn manual_icon_source(target: &str, custom: Option<&str>) -> Option<IconSource> 
 }
 
 /// Peek-only list icon — never decodes on the UI thread.
-fn manual_icon(target: &str, custom: Option<&str>) -> Option<StartIcon> {
+fn manual_icon(target: &str, custom: Option<&str>) -> Option<LauncherIcon> {
     if let Some(path) = custom.filter(|p| !p.is_empty()) {
         let path = PathBuf::from(path);
         if path.is_file()
             && let Some(handle) = icon_cache::icon_cached(&path)
         {
-            return Some(StartIcon(handle));
+            return Some(LauncherIcon(handle));
         }
         // Fall through to shell icon when the custom image is cold / missing.
     }
@@ -516,16 +516,16 @@ fn manual_icon(target: &str, custom: Option<&str>) -> Option<StartIcon> {
         return None;
     }
     let path = PathBuf::from(target);
-    icon_cache::icon_shell_cached(&path).map(StartIcon)
+    icon_cache::icon_shell_cached(&path).map(LauncherIcon)
 }
 
 /// Probe whether a target path yields a shell icon (for the add-manual modal).
-pub fn probe_shell_icon(target: &str) -> Option<StartIcon> {
+pub fn probe_shell_icon(target: &str) -> Option<LauncherIcon> {
     if target.starts_with("steam://") {
         return None;
     }
     let path = PathBuf::from(target);
-    icon_cache::handle_for_shell_pinned(&path).map(StartIcon)
+    icon_cache::handle_for_shell_pinned(&path).map(LauncherIcon)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -694,7 +694,7 @@ pub struct ManualAddDraft {
     pub title: String,
     pub args: String,
     pub icon_path: Option<PathBuf>,
-    pub shell_icon: Option<StartIcon>,
+    pub shell_icon: Option<LauncherIcon>,
 }
 
 impl ManualAddDraft {
@@ -746,7 +746,7 @@ struct PositionSlideAnim {
 /// Wall-clock EnterImmersive veil clock (armed once the window can paint).
 ///
 /// Progress derives from the arm [`Instant`], so the lift lasts exactly
-/// [`ENTER_REVEAL_MS`](crate::ui::start::mode::ENTER_REVEAL_MS) no matter the
+/// [`ENTER_REVEAL_MS`](crate::ui::launcher::mode::ENTER_REVEAL_MS) no matter the
 /// frame rate — a stall jumps time-correctly along the curve instead of
 /// stretching the phase past its specified duration.
 #[derive(Debug, Clone)]
@@ -825,12 +825,12 @@ pub struct ChromeStatusVisual {
 #[derive(Debug, Clone)]
 pub struct State {
     /// Enter ceremony phase after open (veil + splash-art hold).
-    pub transition_phase: Option<(crate::ui::start::mode::TransitionPhase, Instant)>,
+    pub transition_phase: Option<(crate::ui::launcher::mode::TransitionPhase, Instant)>,
     /// Capped enter-reveal progress while [`TransitionPhase::EnterImmersive`] is active.
     enter_reveal: Option<EnterRevealClock>,
-    /// First Start HWND of the process: ambient + status ceremony (not warm reopen).
+    /// First Launcher HWND of the process: ambient + status ceremony (not warm reopen).
     pub cold_load_active: bool,
-    /// When the cold black→ambient ease began (`StartOpened`).
+    /// When the cold black→ambient ease began (`LauncherOpened`).
     cold_ambient_started: Option<Instant>,
     /// Mirrored from App: true until first SteamScanDone.
     pub steam_scan_pending: bool,
@@ -853,7 +853,7 @@ pub struct State {
     /// Incoming splash paints fully opaque (cached reopen / after-veil snap).
     splash_opaque: bool,
     pub game_selected: usize,
-    pub rows: Vec<StartRow>,
+    pub rows: Vec<LauncherRow>,
     pub running_target: Option<String>,
     /// Target with a live launch session not yet confirmed running (no
     /// process match, no Steam `Running` verdict). Shows "Launching" instead
@@ -878,7 +878,7 @@ pub struct State {
     /// backs out to edit mode.
     pub edit_confirm: Option<EditConfirm>,
     /// Options settings panel (right drawer).
-    pub settings: crate::ui::start::settings::SettingsPanel,
+    pub settings: crate::ui::launcher::settings::SettingsPanel,
     pub triangle_progress: f32,
     pub cross_progress: f32,
     /// Face buttons currently held (pad OR keyboard) for action-hint press styling.
@@ -892,11 +892,11 @@ pub struct State {
     pub sort_mode: GamesSortMode,
     /// `play_key` of the row selected when edit mode was entered (restored on Save/Cancel).
     pub edit_anchor_play_key: Option<String>,
-    /// Unified scroll-offset tracking for every Start list (games / controllers /
+    /// Unified scroll-offset tracking for every Launcher list (games / controllers /
     /// settings). Owns offset + viewport per list; `on_scroll` records live
     /// values via [`State::record_list_scroll`], programmatic `scroll_to`
     /// targets sync optimistically via [`State::note_scroll_y`] (on_scroll lags
-    /// a frame). Future lists add a [`StartListId`] variant + geometry below.
+    /// a frame). Future lists add a [`LauncherListId`] variant + geometry below.
     pub(crate) scrolls: ListScrollTracker,
 
     strip_anim: Option<StripAnim>,
@@ -918,7 +918,7 @@ pub struct State {
     /// by the shell (see `sync_reduced_motion`). While set, movement snaps
     /// (durations to 0, offsets to 0, scales to 1) and only opacity animates.
     pub reduced_motion: bool,
-    /// Perf toggle: throttle idle immersive Start to anim-driven frames only
+    /// Perf toggle: throttle idle immersive Launcher to anim-driven frames only
     /// (default off = legacy always-60Hz). Synced from prefs by the shell.
     pub perf_throttle_immersive: bool,
     /// Seconds for ambient shader time uniform.
@@ -956,7 +956,7 @@ pub struct State {
     backdrop_outgoing: Option<(String, f32, f32, f32)>,
     pub art_awaiting_paint: bool,
     /// Immersive inactive / sleep logical phase.
-    pub idle_phase: crate::ui::start::idle::IdlePhase,
+    pub idle_phase: crate::ui::launcher::idle::IdlePhase,
     /// In-flight idle dim alpha crossfade.
     idle_dim_anim: Option<IdleDimAnim>,
     /// Settled idle dim alpha when not animating.
@@ -965,21 +965,21 @@ pub struct State {
     pub idle_sleep_wake_pending: bool,
 }
 
-/// Which Start list a scroll offset belongs to.
+/// Which Launcher list a scroll offset belongs to.
 ///
 /// Maps 1:1 to the scrollable widget [`Id`](iced::widget::Id) used in the
 /// view, so `on_scroll` / programmatic `scroll_to` targets resolve through one
 /// place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum StartListId {
+pub enum LauncherListId {
     Settings,
 }
 
-impl StartListId {
+impl LauncherListId {
     /// Scrollable widget id for this list.
     pub fn scroll_id(self) -> iced::widget::Id {
         match self {
-            Self::Settings => crate::ui::start::settings::settings_scroll_id(),
+            Self::Settings => crate::ui::launcher::settings::settings_scroll_id(),
         }
     }
 
@@ -1011,20 +1011,20 @@ pub struct ListScrollTracker {
 }
 
 impl ListScrollTracker {
-    fn slot_mut(&mut self, list: StartListId) -> &mut ListScrollState {
+    fn slot_mut(&mut self, list: LauncherListId) -> &mut ListScrollState {
         match list {
-            StartListId::Settings => &mut self.settings,
+            LauncherListId::Settings => &mut self.settings,
         }
     }
 
-    fn slot(&self, list: StartListId) -> &ListScrollState {
+    fn slot(&self, list: LauncherListId) -> &ListScrollState {
         match list {
-            StartListId::Settings => &self.settings,
+            LauncherListId::Settings => &self.settings,
         }
     }
 
     /// Record a live `on_scroll` viewport report.
-    pub fn record(&mut self, list: StartListId, offset_y: f32, viewport_h: f32) {
+    pub fn record(&mut self, list: LauncherListId, offset_y: f32, viewport_h: f32) {
         let slot = self.slot_mut(list);
         slot.offset_y = offset_y;
         slot.viewport_h = viewport_h;
@@ -1032,14 +1032,14 @@ impl ListScrollTracker {
 
     /// Sync the tracked offset after issuing a programmatic `scroll_to`
     /// (`on_scroll` may lag a frame behind).
-    pub fn note_programmatic(&mut self, list: StartListId, y: f32) {
+    pub fn note_programmatic(&mut self, list: LauncherListId, y: f32) {
         self.slot_mut(list).offset_y = y;
     }
 
     /// [`Self::note_programmatic`] by widget id. Returns false for unknown /
     /// future ids (no-op, never panics).
     pub fn note_programmatic_id(&mut self, id: &iced::widget::Id, y: f32) -> bool {
-        match StartListId::from_scroll_id(id) {
+        match LauncherListId::from_scroll_id(id) {
             Some(list) => {
                 self.note_programmatic(list, y);
                 true
@@ -1048,15 +1048,15 @@ impl ListScrollTracker {
         }
     }
 
-    pub fn offset(&self, list: StartListId) -> f32 {
+    pub fn offset(&self, list: LauncherListId) -> f32 {
         self.slot(list).offset_y
     }
 
-    pub fn viewport(&self, list: StartListId) -> f32 {
+    pub fn viewport(&self, list: LauncherListId) -> f32 {
         self.slot(list).viewport_h
     }
 
-    pub fn reset(&mut self, list: StartListId) {
+    pub fn reset(&mut self, list: LauncherListId) {
         *self.slot_mut(list) = ListScrollState::default();
     }
 
@@ -1105,7 +1105,7 @@ impl Default for State {
             edit_confirm_anim: None,
             manual_add: None,
             edit_confirm: None,
-            settings: crate::ui::start::settings::SettingsPanel::default(),
+            settings: crate::ui::launcher::settings::SettingsPanel::default(),
             triangle_progress: 0.0,
             cross_progress: 0.0,
             held: FaceHeld::default(),
@@ -1142,7 +1142,7 @@ impl Default for State {
             backdrop_current: None,
             backdrop_outgoing: None,
             art_awaiting_paint: false,
-            idle_phase: crate::ui::start::idle::IdlePhase::Active,
+            idle_phase: crate::ui::launcher::idle::IdlePhase::Active,
             idle_dim_anim: None,
             idle_dim_settled: 0.0,
             idle_sleep_wake_pending: false,
@@ -1174,7 +1174,7 @@ impl State {
         }
     }
 
-    pub fn set_rows(&mut self, rows: Vec<StartRow>) {
+    pub fn set_rows(&mut self, rows: Vec<LauncherRow>) {
         // Background rebuilds (Steam-scan reorder, sort change) can permute
         // the catalog without moving the selection: re-show the position rail
         // so the new order is oriented. Any play-key sequence change counts
@@ -1221,28 +1221,28 @@ impl State {
     }
 
     /// Record a live `on_scroll` viewport report for the settings list.
-    pub fn record_list_scroll(&mut self, list: StartListId, y: f32, viewport_h: f32) {
+    pub fn record_list_scroll(&mut self, list: LauncherListId, y: f32, viewport_h: f32) {
         self.scrolls.record(list, y, viewport_h);
-        if list == StartListId::Settings {
+        if list == LauncherListId::Settings {
             self.settings.scroll_y = y;
             self.settings.viewport_h = viewport_h;
         }
     }
 
     /// Tracked offset for one list (for tests / reveal math).
-    pub fn list_offset(&self, list: StartListId) -> f32 {
+    pub fn list_offset(&self, list: LauncherListId) -> f32 {
         self.scrolls.offset(list)
     }
 
     /// Tracked viewport height for one list (for tests / reveal math).
-    pub fn list_viewport(&self, list: StartListId) -> f32 {
+    pub fn list_viewport(&self, list: LauncherListId) -> f32 {
         self.scrolls.viewport(list)
     }
 
     /// Sync the tracked offset for a settings `scroll_to` that bypasses
     /// [`Self::note_scroll_y`] (keeps the tracker mirror + panel consistent).
     pub fn sync_settings_scroll(&mut self, y: f32) {
-        self.scrolls.note_programmatic(StartListId::Settings, y);
+        self.scrolls.note_programmatic(LauncherListId::Settings, y);
         self.settings.scroll_y = y;
     }
 
@@ -1252,7 +1252,7 @@ impl State {
     /// list id can never break existing reveal paths.
     pub fn note_scroll_y(&mut self, id: &iced::widget::Id, y: f32) -> bool {
         let noted = self.scrolls.note_programmatic_id(id, y);
-        if noted && StartListId::from_scroll_id(id) == Some(StartListId::Settings) {
+        if noted && LauncherListId::from_scroll_id(id) == Some(LauncherListId::Settings) {
             self.settings.scroll_y = y;
         }
         noted
@@ -1354,7 +1354,7 @@ impl State {
     /// mode, on the rebuilt browse rows).
     ///
     /// Keeps `preferred_key` when it is still present AND enabled
-    /// ([`StartRow::browse_enabled`]); otherwise the nearest enabled game
+    /// ([`LauncherRow::browse_enabled`]); otherwise the nearest enabled game
     /// ABOVE that position, else the nearest enabled game AFTER it. This is
     /// deliberately above-first, unlike [`Self::set_rows`] (which prefers
     /// forward) — exiting edit should hold the cursor where it was, not slide
@@ -1403,8 +1403,8 @@ impl State {
     /// gated (controller persistence is out of scope):
     /// - `persist_enabled == false` → game axis is a no-op (keeps the clamped
     ///   index; callers additionally skip report + scan re-pin).
-    /// - [`StartSelectionMode::ByGame`] → current key lookup (unknown → 0).
-    /// - [`StartSelectionMode::ByPosition`] → `index.min(len - 1)` clamp;
+    /// - [`LauncherSelectionMode::ByGame`] → current key lookup (unknown → 0).
+    /// - [`LauncherSelectionMode::ByPosition`] → `index.min(len - 1)` clamp;
     ///   missing index keeps the clamped index, never 0.
     ///
     /// `None` keys leave that axis untouched. Returns true when an index moved.
@@ -1413,13 +1413,13 @@ impl State {
         game_key: Option<&str>,
         _controller_key: Option<&str>,
         persist_enabled: bool,
-        selection_mode: StartSelectionMode,
+        selection_mode: LauncherSelectionMode,
         game_index: Option<usize>,
     ) -> bool {
         let mut changed = false;
         if persist_enabled {
             let index = match selection_mode {
-                StartSelectionMode::ByGame => {
+                LauncherSelectionMode::ByGame => {
                     if let Some(key) = game_key {
                         if self.rows.is_empty() {
                             0
@@ -1434,7 +1434,7 @@ impl State {
                         self.game_selected
                     }
                 }
-                StartSelectionMode::ByPosition => {
+                LauncherSelectionMode::ByPosition => {
                     if self.rows.is_empty() {
                         0
                     } else if let Some(i) = game_index {
@@ -1456,7 +1456,7 @@ impl State {
         changed
     }
 
-    /// Landing on Games resets the transient Start surfaces.
+    /// Landing on Games resets the transient Launcher surfaces.
     pub fn reset_to_games(&mut self) {
         self.strip_anim = None;
         self.layout_transition = None;
@@ -1476,7 +1476,7 @@ impl State {
         self.edit_anchor_play_key = None;
         self.game_selected = 0;
         // Fresh window mounts scrollables at 0 with no on_scroll yet; the
-        // open-time reveal (see `open_reveal_scroll`, issued on StartOpened)
+        // open-time reveal (see `open_reveal_scroll`, issued on LauncherOpened)
         // recomputes from here with the estimate-viewport fallback.
         self.scrolls.reset_all();
     }
@@ -1643,7 +1643,7 @@ impl State {
                 self.cross_progress = 0.0;
                 // Fresh settings open resets the panel offset to 0 internally;
                 // keep the tracker mirror consistent.
-                self.scrolls.reset(StartListId::Settings);
+                self.scrolls.reset(LauncherListId::Settings);
             }
             true
         } else {
@@ -1712,7 +1712,7 @@ impl State {
             || self.enter_splash_fade
     }
 
-    /// True while Start has anim/visual work that must keep frames
+    /// True while Launcher has anim/visual work that must keep frames
     /// flowing under the idle throttle (excludes the bare idle arm).
     /// Used to document the gated-vs-ungated `needs_frames()` contract; the
     /// subscription itself consults `needs_frames()` (which gates only the
@@ -1747,7 +1747,7 @@ impl State {
     }
 
     /// Sync the immersive idle-throttle gate from prefs (no anim snapping;
-    /// the next subscription evaluation simply stops/starts `StartFrame`).
+    /// the next subscription evaluation simply stops/starts `LauncherFrame`).
     pub fn sync_perf_throttle(&mut self, throttle: bool) {
         self.perf_throttle_immersive = throttle;
     }
@@ -1781,7 +1781,7 @@ impl State {
     /// Move tuning focus with wrap (debug-only pad/keyboard nav).
     #[cfg(debug_assertions)]
     pub fn move_ambient_tune_focus(&mut self, delta: isize) -> bool {
-        let n = crate::ui::start::ambient_tune::TuneRow::count().max(1) as isize;
+        let n = crate::ui::launcher::ambient_tune::TuneRow::count().max(1) as isize;
         let next = (self.ambient_tune_focus as isize + delta).rem_euclid(n) as usize;
         if next == self.ambient_tune_focus {
             return false;
@@ -1813,7 +1813,7 @@ impl State {
     /// Fractional game index for the immersive vertical strip.
     pub fn strip_scroll(&self, now: Instant) -> f32 {
         if let Some(anim) = &self.strip_anim {
-            return crate::ui::start::vstrip::strip_scroll(
+            return crate::ui::launcher::vstrip::strip_scroll(
                 anim.from,
                 anim.to,
                 anim.started,
@@ -1835,7 +1835,7 @@ impl State {
         let len = self.rows.len();
         if len < 1 {
             self.strip_anim = None;
-            self.sync_position_section(now, crate::ui::start::vstrip::STRIP_ANIM_MS);
+            self.sync_position_section(now, crate::ui::launcher::vstrip::STRIP_ANIM_MS);
             return;
         }
         // Reduced motion: snap the strip (and the position rail) to the selection.
@@ -1855,13 +1855,13 @@ impl State {
         let delta = to - from;
         if delta.abs() < 0.01 {
             self.strip_anim = None;
-            self.sync_position_section(now, crate::ui::start::vstrip::STRIP_ANIM_MS);
+            self.sync_position_section(now, crate::ui::launcher::vstrip::STRIP_ANIM_MS);
             return;
         }
         let duration_ms = if catching_up {
-            crate::ui::start::vstrip::STRIP_ANIM_CATCHUP_MS
+            crate::ui::launcher::vstrip::STRIP_ANIM_CATCHUP_MS
         } else {
-            crate::ui::start::vstrip::STRIP_ANIM_MS
+            crate::ui::launcher::vstrip::STRIP_ANIM_MS
         };
         self.strip_anim = Some(StripAnim {
             from,
@@ -1924,11 +1924,11 @@ impl State {
         (layout, layout_transition_opacity(eased), dx, dy)
     }
 
-    pub(crate) fn games_section_mode(&self) -> crate::ui::start::position::SectionMode {
+    pub(crate) fn games_section_mode(&self) -> crate::ui::launcher::position::SectionMode {
         if matches!(self.sort_mode, GamesSortMode::Alphabetical) {
-            crate::ui::start::position::SectionMode::Alphabetical
+            crate::ui::launcher::position::SectionMode::Alphabetical
         } else {
-            crate::ui::start::position::SectionMode::LastPlayed
+            crate::ui::launcher::position::SectionMode::LastPlayed
         }
     }
 
@@ -1998,13 +1998,13 @@ impl State {
     /// `None` while pinned: the rail draws settled at (1, 1), never mid-hide.
     /// `None` under reduced motion too: the bar snaps to its settled slide
     /// while opacity still eases (see `position_bar_show`).
-    pub(crate) fn position_bar_motion(&self) -> Option<crate::ui::start::position::ShowHide> {
+    pub(crate) fn position_bar_motion(&self) -> Option<crate::ui::launcher::position::ShowHide> {
         if self.navbar_pinned || self.reduced_motion {
             return None;
         }
         self.position_bar_slide
             .as_ref()
-            .map(|anim| crate::ui::start::position::ShowHide {
+            .map(|anim| crate::ui::launcher::position::ShowHide {
                 from_slide: anim.from,
                 from_opacity: anim.opacity_from,
                 to: anim.to,
@@ -2013,8 +2013,8 @@ impl State {
     }
 
     fn position_bar_show(&self, now: Instant) -> (f32, f32) {
+        use crate::ui::launcher::position::{FADE_MS, OPACITY_MS, show_hide_amount};
         use crate::ui::motion::movement_duration_ms;
-        use crate::ui::start::position::{FADE_MS, OPACITY_MS, show_hide_amount};
         // AlwaysOn: the rail stays (1, 1); the hide timer is skipped in `tick_anim`.
         if self.navbar_pinned {
             return (1.0, 1.0);
@@ -2046,12 +2046,12 @@ impl State {
         }
         let idx = self.game_selected.min(self.rows.len() - 1);
         let row = &self.rows[idx];
-        crate::ui::start::position::section_index(
+        crate::ui::launcher::position::section_index(
             mode,
             &row.title,
             row.played_at_ms,
-            crate::ui::start::position::now_ms(),
-            crate::ui::start::position::local_utc_offset_secs(),
+            crate::ui::launcher::position::now_ms(),
+            crate::ui::launcher::position::local_utc_offset_secs(),
         ) as f32
     }
 
@@ -2172,7 +2172,7 @@ impl State {
 
     /// Reset immersive idle/sleep overlay to Active (no anim).
     pub fn reset_idle_dim(&mut self) {
-        self.idle_phase = crate::ui::start::idle::IdlePhase::Active;
+        self.idle_phase = crate::ui::launcher::idle::IdlePhase::Active;
         self.idle_dim_anim = None;
         self.idle_dim_settled = 0.0;
         self.idle_sleep_wake_pending = false;
@@ -2182,14 +2182,14 @@ impl State {
     pub fn idle_dim_amount(&self, now: Instant) -> f32 {
         if let Some(anim) = &self.idle_dim_anim {
             let elapsed = now.saturating_duration_since(anim.started).as_millis() as u64;
-            return crate::ui::start::idle::dim_alpha(anim.from, anim.to, elapsed);
+            return crate::ui::launcher::idle::dim_alpha(anim.from, anim.to, elapsed);
         }
         self.idle_dim_settled
     }
 
     /// True while Sleep, or while waking from Sleep until dim settles on Active.
     pub fn idle_pad_gated(&self) -> bool {
-        matches!(self.idle_phase, crate::ui::start::idle::IdlePhase::Sleep)
+        matches!(self.idle_phase, crate::ui::launcher::idle::IdlePhase::Sleep)
             || self.idle_sleep_wake_pending
     }
 
@@ -2197,19 +2197,19 @@ impl State {
     pub fn idle_dim_animating(&self, now: Instant) -> bool {
         self.idle_dim_anim.as_ref().is_some_and(|anim| {
             let elapsed = now.saturating_duration_since(anim.started).as_millis() as u64;
-            !crate::ui::start::idle::dim_anim_done(elapsed)
+            !crate::ui::launcher::idle::dim_anim_done(elapsed)
         })
     }
 
     /// Begin eased crossfade toward `phase` target alpha. Returns true if phase changed.
     pub fn set_idle_phase(
         &mut self,
-        phase: crate::ui::start::idle::IdlePhase,
+        phase: crate::ui::launcher::idle::IdlePhase,
         inactive_dim: f32,
         now: Instant,
         from_sleep_wake: bool,
     ) -> bool {
-        use crate::ui::start::idle::IdlePhase;
+        use crate::ui::launcher::idle::IdlePhase;
         if self.idle_phase == phase && self.idle_dim_anim.is_none() && !from_sleep_wake {
             return false;
         }
@@ -2239,14 +2239,17 @@ impl State {
     pub fn tick_idle_dim(&mut self, now: Instant) -> bool {
         if let Some(anim) = &self.idle_dim_anim {
             let elapsed = now.saturating_duration_since(anim.started).as_millis() as u64;
-            if !crate::ui::start::idle::dim_anim_done(elapsed) {
+            if !crate::ui::launcher::idle::dim_anim_done(elapsed) {
                 return false;
             }
             self.idle_dim_settled = anim.to;
             self.idle_dim_anim = None;
         }
         if self.idle_sleep_wake_pending
-            && matches!(self.idle_phase, crate::ui::start::idle::IdlePhase::Active)
+            && matches!(
+                self.idle_phase,
+                crate::ui::launcher::idle::IdlePhase::Active
+            )
             && self.idle_dim_anim.is_none()
         {
             self.idle_sleep_wake_pending = false;
@@ -2257,10 +2260,10 @@ impl State {
 
     pub fn begin_transition_phase(
         &mut self,
-        phase: crate::ui::start::mode::TransitionPhase,
+        phase: crate::ui::launcher::mode::TransitionPhase,
         now: Instant,
     ) {
-        use crate::ui::start::mode::TransitionPhase;
+        use crate::ui::launcher::mode::TransitionPhase;
         self.strip_anim = None;
         self.position_bar_last_scroll = None;
         self.position_bar_slide = None;
@@ -2282,7 +2285,7 @@ impl State {
             self.enter_reveal = None;
         }
         crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start immersive transition phase={}",
+            "ui-diag: launcher immersive transition phase={}",
             phase.label()
         ));
     }
@@ -2297,11 +2300,11 @@ impl State {
     fn enter_veil_blocks_splash(&self) -> bool {
         matches!(
             self.transition_phase.map(|(p, _)| p),
-            Some(crate::ui::start::mode::TransitionPhase::EnterImmersive)
+            Some(crate::ui::launcher::mode::TransitionPhase::EnterImmersive)
         )
     }
 
-    /// Begin advancing the EnterImmersive veil (cold open after StartOpened).
+    /// Begin advancing the EnterImmersive veil (cold open after LauncherOpened).
     pub fn arm_enter_reveal(&mut self, now: Instant) {
         let Some(clock) = self.enter_reveal.as_mut() else {
             return;
@@ -2311,7 +2314,7 @@ impl State {
         }
         clock.armed = true;
         clock.armed_at = Some(now);
-        crate::controller::hid::diag::diag_info("ui-diag: start immersive enter reveal armed");
+        crate::controller::hid::diag::diag_info("ui-diag: launcher immersive enter reveal armed");
     }
 
     /// True once the enter-reveal clock is advancing (veil lifting).
@@ -2319,7 +2322,7 @@ impl State {
         self.enter_reveal.as_ref().is_some_and(|c| c.armed)
     }
 
-    /// Begin the process-first Start load ceremony (ambient + dock).
+    /// Begin the process-first Launcher load ceremony (ambient + dock).
     ///
     /// Re-shows the position rail: runs after the transition-phase clears on
     /// the open path, so the rail is up on enter. Pinned (`AlwaysOn`) is a
@@ -2331,7 +2334,7 @@ impl State {
         self.games_list_reveal_at = None;
         self.enter_list_hold_started = None;
         self.note_position_bar_scroll(now);
-        crate::controller::hid::diag::diag_info("ui-diag: start cold load begin");
+        crate::controller::hid::diag::diag_info("ui-diag: launcher cold load begin");
     }
 
     /// Arm the black→ambient ease once the HWND can paint.
@@ -2340,12 +2343,12 @@ impl State {
             return;
         }
         self.cold_ambient_started = Some(now);
-        crate::controller::hid::diag::diag_info("ui-diag: start cold load ambient armed");
+        crate::controller::hid::diag::diag_info("ui-diag: launcher cold load ambient armed");
     }
 
     /// Solid black remaining over ambient during cold load (1 = black, 0 = ambient clear).
     pub fn cold_black_amount(&self, now: Instant) -> f32 {
-        use crate::ui::start::mode::{COLD_AMBIENT_MS, phase_progress};
+        use crate::ui::launcher::mode::{COLD_AMBIENT_MS, phase_progress};
         if !self.cold_load_active {
             return 0.0;
         }
@@ -2363,10 +2366,10 @@ impl State {
         }
         self.cold_load_active = false;
         self.cold_ambient_started = None;
-        crate::controller::hid::diag::diag_info("ui-diag: start cold load done");
+        crate::controller::hid::diag::diag_info("ui-diag: launcher cold load done");
     }
 
-    /// Start chrome status for a background task (Steam wrapper).
+    /// Launcher chrome status for a background task (Steam wrapper).
     pub fn begin_steam_scan_banner(&mut self, now: Instant) {
         self.begin_chrome_status(ChromeStatusKind::SteamLibrary, now);
     }
@@ -2398,7 +2401,7 @@ impl State {
     }
 
     fn chrome_status_display_slot(item: &ChromeStatusItem, now: Instant) -> f32 {
-        use crate::ui::start::mode::{CHROME_STATUS_IN_MS, phase_progress};
+        use crate::ui::launcher::mode::{CHROME_STATUS_IN_MS, phase_progress};
         if let Some(started) = item.stack_anim_started {
             let t = phase_progress(
                 now.saturating_duration_since(started).as_millis() as u64,
@@ -2500,7 +2503,7 @@ impl State {
     }
 
     fn tick_chrome_status(&mut self, now: Instant) {
-        use crate::ui::start::mode::{
+        use crate::ui::launcher::mode::{
             CHROME_STATUS_EXIT_MS, CHROME_STATUS_IN_MS, CHROME_STATUS_STAGGER_MS,
             CHROME_STATUS_STEP_HOLD_MS, CHROME_STATUS_SUCCESS_HOLD_MS,
         };
@@ -2527,7 +2530,7 @@ impl State {
             }
         }
 
-        // Start staggered ExitRight once the batch has held Success long enough.
+        // Launcher staggered ExitRight once the batch has held Success long enough.
         if self.chrome_status_batch_exit_at.is_none()
             && let Some(all_at) = self.chrome_status_all_success_at
         {
@@ -2588,8 +2591,8 @@ impl State {
         item: &ChromeStatusItem,
         now: Instant,
     ) -> ChromeStatusVisual {
+        use crate::ui::launcher::mode::{CHROME_STATUS_EXIT_MS, phase_progress};
         use crate::ui::motion::movement_offset;
-        use crate::ui::start::mode::{CHROME_STATUS_EXIT_MS, phase_progress};
         // Reduced motion snaps stack reflow; ExitRight keeps its fade but
         // loses its travel.
         let stack_slot = if self.reduced_motion {
@@ -2628,7 +2631,7 @@ impl State {
 
     /// Opacity of the games strip (0 = hidden until list reveal, 1 = fully shown).
     pub fn games_list_opacity(&self, now: Instant) -> f32 {
-        use crate::ui::start::mode::{GAMES_LIST_FADE_MS, phase_progress};
+        use crate::ui::launcher::mode::{GAMES_LIST_FADE_MS, phase_progress};
         let Some(started) = self.games_list_reveal_at else {
             // Cold EnterImmersive: strip stays hidden until art sync / timeout.
             return 0.0;
@@ -2642,7 +2645,7 @@ impl State {
         if self.games_list_reveal_at.is_none() {
             self.games_list_reveal_at = Some(now);
             self.enter_list_hold_started = None;
-            crate::controller::hid::diag::diag_info("ui-diag: start games list reveal begin");
+            crate::controller::hid::diag::diag_info("ui-diag: launcher games list reveal begin");
             if self.chrome_status_has_kind(ChromeStatusKind::PreparingArt) {
                 self.note_chrome_status_success(ChromeStatusKind::PreparingArt, now);
             }
@@ -2672,7 +2675,7 @@ impl State {
 
     /// Selected splash + visible strip heroes are decoded (matches idle Steam-scan pre-warm).
     pub fn enter_art_sync_ready(&self) -> bool {
-        use crate::ui::start::vstrip::NEIGHBORS;
+        use crate::ui::launcher::vstrip::NEIGHBORS;
         let len = self.rows.len();
         if len == 0 {
             return true;
@@ -2719,16 +2722,16 @@ impl State {
                     && row.backdrop_icon().is_some()
                     && !self.enter_backdrop_live(&row.play_key)
                 {
-                    self.start_enter_splash_fade(row.play_key.clone(), now);
+                    self.launcher_enter_splash_fade(row.play_key.clone(), now);
                 }
                 if self.cold_load_active {
                     self.finish_cold_load();
                     crate::controller::hid::diag::diag_info(
-                        "ui-diag: start immersive enter art sync ready cold=1 list_reveal=1",
+                        "ui-diag: launcher immersive enter art sync ready cold=1 list_reveal=1",
                     );
                 } else {
                     crate::controller::hid::diag::diag_info(
-                        "ui-diag: start immersive enter art sync ready list_reveal=1",
+                        "ui-diag: launcher immersive enter art sync ready list_reveal=1",
                     );
                 }
                 return true;
@@ -2752,12 +2755,12 @@ impl State {
                 && row.backdrop_icon().is_some()
                 && !self.enter_backdrop_live(&row.play_key)
             {
-                self.start_enter_splash_fade(row.play_key.clone(), now);
+                self.launcher_enter_splash_fade(row.play_key.clone(), now);
             }
             self.finish_cold_load();
             self.arm_enter_reveal(now);
             crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: start immersive enter art sync ready ms={hold_ms} cold=1"
+                "ui-diag: launcher immersive enter art sync ready ms={hold_ms} cold=1"
             ));
             return true;
         }
@@ -2770,14 +2773,14 @@ impl State {
         }
         self.arm_enter_reveal(now);
         crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start immersive enter art sync ready ms={hold_ms} list_reveal=1"
+            "ui-diag: launcher immersive enter art sync ready ms={hold_ms} list_reveal=1"
         ));
         true
     }
 
     /// If art stays cold too long, lift the veil / reveal games anyway.
     pub fn maybe_force_enter_reveal_after_art_hold(&mut self, now: Instant) {
-        use crate::ui::start::mode::ENTER_ART_HOLD_MAX_MS;
+        use crate::ui::launcher::mode::ENTER_ART_HOLD_MAX_MS;
         // Immersive cold: reveal the list even if art never synced.
         if self.cold_load_active {
             let timed_out = self.cold_ambient_started.is_some_and(|t| {
@@ -2789,7 +2792,7 @@ impl State {
                     .map(|t| now.saturating_duration_since(t).as_millis())
                     .unwrap_or(0);
                 crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: start immersive enter art hold timeout ms={hold_ms} cold=1"
+                    "ui-diag: launcher immersive enter art hold timeout ms={hold_ms} cold=1"
                 ));
                 self.begin_games_list_reveal(now);
                 self.note_enter_art_synced(now);
@@ -2797,7 +2800,7 @@ impl State {
                     && row.backdrop_icon().is_some()
                     && !self.enter_backdrop_live(&row.play_key)
                 {
-                    self.start_enter_splash_fade(row.play_key.clone(), now);
+                    self.launcher_enter_splash_fade(row.play_key.clone(), now);
                 }
                 self.finish_cold_load();
                 if self.enter_reveal.is_some() && !self.enter_reveal_armed() {
@@ -2814,14 +2817,14 @@ impl State {
         {
             let hold_ms = now.saturating_duration_since(started).as_millis();
             crate::controller::hid::diag::diag_info(format!(
-                "ui-diag: start immersive enter art hold timeout ms={hold_ms} list_reveal=1"
+                "ui-diag: launcher immersive enter art hold timeout ms={hold_ms} list_reveal=1"
             ));
             self.begin_games_list_reveal(now);
             if let Some(row) = self.rows.get(self.game_selected)
                 && row.backdrop_icon().is_some()
                 && !self.enter_backdrop_live(&row.play_key)
             {
-                self.start_enter_splash_fade(row.play_key.clone(), now);
+                self.launcher_enter_splash_fade(row.play_key.clone(), now);
             }
             if self.enter_reveal.is_some() && !self.enter_reveal_armed() {
                 self.arm_enter_reveal(now);
@@ -2839,7 +2842,7 @@ impl State {
         }
         let hold_ms = now.saturating_duration_since(started).as_millis();
         crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: start immersive enter art hold timeout ms={hold_ms}"
+            "ui-diag: launcher immersive enter art hold timeout ms={hold_ms}"
         ));
         self.begin_games_list_reveal(now);
         if let Some(row) = self.rows.get(self.game_selected)
@@ -2853,7 +2856,7 @@ impl State {
 
     /// EnterImmersive veil alpha from the wall-clock reveal time (1 = solid, 0 = clear).
     pub fn enter_veil_amount(&self, now: Instant) -> f32 {
-        use crate::ui::start::mode::enter_veil_amount;
+        use crate::ui::launcher::mode::enter_veil_amount;
         match &self.enter_reveal {
             Some(clock) if clock.armed => enter_veil_amount(clock.elapsed_ms(now)),
             Some(_) => 1.0,
@@ -2867,9 +2870,9 @@ impl State {
         };
         if matches!(
             phase,
-            crate::ui::start::mode::TransitionPhase::EnterImmersive
+            crate::ui::launcher::mode::TransitionPhase::EnterImmersive
         ) {
-            use crate::ui::start::mode::{ENTER_REVEAL_MS, phase_progress_linear};
+            use crate::ui::launcher::mode::{ENTER_REVEAL_MS, phase_progress_linear};
             let elapsed = self
                 .enter_reveal
                 .as_ref()
@@ -2879,7 +2882,7 @@ impl State {
             return phase_progress_linear(elapsed, ENTER_REVEAL_MS);
         }
         let elapsed = now.saturating_duration_since(started).as_millis() as u64;
-        crate::ui::start::mode::phase_progress(elapsed, phase.duration_ms())
+        crate::ui::launcher::mode::phase_progress(elapsed, phase.duration_ms())
     }
 
     /// Linear phase fraction — use for EnterImmersive grow/chrome so ease-out cannot crush timing.
@@ -2889,9 +2892,9 @@ impl State {
         };
         if matches!(
             phase,
-            crate::ui::start::mode::TransitionPhase::EnterImmersive
+            crate::ui::launcher::mode::TransitionPhase::EnterImmersive
         ) {
-            use crate::ui::start::mode::{ENTER_REVEAL_MS, phase_progress_linear};
+            use crate::ui::launcher::mode::{ENTER_REVEAL_MS, phase_progress_linear};
             let elapsed = self
                 .enter_reveal
                 .as_ref()
@@ -2901,7 +2904,7 @@ impl State {
             return phase_progress_linear(elapsed, ENTER_REVEAL_MS);
         }
         let elapsed = now.saturating_duration_since(started).as_millis() as u64;
-        crate::ui::start::mode::phase_progress_linear(elapsed, phase.duration_ms())
+        crate::ui::launcher::mode::phase_progress_linear(elapsed, phase.duration_ms())
     }
 
     /// True when a timed phase (not Resizing) has reached its duration.
@@ -2915,7 +2918,7 @@ impl State {
         }
         if matches!(
             phase,
-            crate::ui::start::mode::TransitionPhase::EnterImmersive
+            crate::ui::launcher::mode::TransitionPhase::EnterImmersive
         ) {
             return self
                 .enter_reveal
@@ -2978,7 +2981,7 @@ impl State {
     }
 
     /// Uncached enter: ease-in-out ambient → splash.
-    fn start_enter_splash_fade(&mut self, key: String, now: Instant) {
+    fn launcher_enter_splash_fade(&mut self, key: String, now: Instant) {
         self.enter_splash_fade = true;
         self.splash_opaque = false;
         self.splash_reveal_pending = false;
@@ -2990,7 +2993,7 @@ impl State {
     }
 
     /// Title change: incoming fades in over a solid outgoing underlay.
-    fn start_cover_crossfade(&mut self, key: String, now: Instant) {
+    fn launcher_cover_crossfade(&mut self, key: String, now: Instant) {
         self.enter_splash_fade = false;
         self.splash_opaque = false;
         self.splash_reveal_pending = false;
@@ -3024,11 +3027,11 @@ impl State {
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: backdrop reveal after_veil ambient key={key}"
             ));
-            self.start_enter_splash_fade(key, now);
+            self.launcher_enter_splash_fade(key, now);
         }
     }
 
-    /// Start backdrop land/crossfade once peek art exists for a waiting selection.
+    /// Launcher backdrop land/crossfade once peek art exists for a waiting selection.
     pub fn note_backdrop_ready(&mut self, now: Instant) {
         let Some(row) = self.rows.get(self.game_selected) else {
             return;
@@ -3051,11 +3054,11 @@ impl State {
                 ));
             } else if !armed {
                 if self.backdrop_outgoing.is_some() {
-                    self.start_cover_crossfade(key, now);
+                    self.launcher_cover_crossfade(key, now);
                 } else if self.splash_reveal_cached {
                     self.reveal_cached_opaque(key, now);
                 } else {
-                    self.start_enter_splash_fade(key, now);
+                    self.launcher_enter_splash_fade(key, now);
                 }
             }
         } else if !armed {
@@ -3070,9 +3073,9 @@ impl State {
                 "ui-diag: backdrop ready re-arm key={key} was={was}"
             ));
             if self.backdrop_outgoing.is_some() {
-                self.start_cover_crossfade(key, now);
+                self.launcher_cover_crossfade(key, now);
             } else {
-                self.start_enter_splash_fade(key, now);
+                self.launcher_enter_splash_fade(key, now);
             }
         }
     }
@@ -3081,10 +3084,10 @@ impl State {
     /// Reduced motion freezes the ken-burns pose at rest (Cover, centered);
     /// the selection crossfade opacity is unchanged.
     pub fn backdrop_incoming_visual(&self, now: Instant) -> Option<(f32, f32, f32, f32)> {
-        use crate::ui::motion::{movement_offset, movement_scale};
-        use crate::ui::start::mode::{
+        use crate::ui::launcher::mode::{
             art_fade_progress, backdrop_pose_offset, backdrop_pose_scale, enter_art_fade_progress,
         };
+        use crate::ui::motion::{movement_offset, movement_scale};
         let row = self.rows.get(self.game_selected)?;
         row.backdrop_icon()?;
         let still = |elapsed_ms: u64| {
@@ -3125,7 +3128,7 @@ impl State {
     }
 
     /// Resolve a peek backdrop handle by play_key (for outgoing layer).
-    pub fn backdrop_icon_for_key(&self, play_key: &str) -> Option<StartIcon> {
+    pub fn backdrop_icon_for_key(&self, play_key: &str) -> Option<LauncherIcon> {
         self.rows
             .iter()
             .find(|r| r.play_key == play_key)
@@ -3220,13 +3223,13 @@ impl State {
 
     /// Visible strip / near-list paths (±[`vstrip::NEIGHBORS`]) — warm immediately.
     pub fn art_near_set(&self) -> icon_cache::ArtRetainSet {
-        use crate::ui::start::vstrip::NEIGHBORS;
+        use crate::ui::launcher::vstrip::NEIGHBORS;
         self.art_paths_for_radius(NEIGHBORS)
     }
 
     /// Near set with an explicit circular/linear window.
     pub fn art_near_set_circular(&self, circular: bool) -> icon_cache::ArtRetainSet {
-        use crate::ui::start::vstrip::NEIGHBORS;
+        use crate::ui::launcher::vstrip::NEIGHBORS;
         self.art_paths_for_radius_circular(NEIGHBORS, circular)
     }
 
@@ -3239,8 +3242,8 @@ impl State {
 
     /// Selection changed: park prior art as solid underlay and land the new one.
     pub fn reset_backdrop_fade(&mut self) {
+        use crate::ui::launcher::mode::{backdrop_pose_offset, backdrop_pose_scale};
         use crate::ui::motion::{movement_offset, movement_scale};
-        use crate::ui::start::mode::{backdrop_pose_offset, backdrop_pose_scale};
         let now = Instant::now();
         self.splash_reveal_pending = false;
         self.splash_reveal_cached = false;
@@ -3327,7 +3330,7 @@ impl State {
     }
 
     /// Defer every wall-clock animation stamp that was already running when
-    /// the PS hub opened. Start keeps painting its last frame underneath the
+    /// the PS hub opened. Launcher keeps painting its last frame underneath the
     /// hub, so without this shift the first frame after close sees the whole
     /// hub session as elapsed time: the ken-burns splash snaps ahead, enter
     /// veils jump, and chrome races to settle. Stamps created *during* the
@@ -3436,7 +3439,7 @@ impl State {
         }
         if let Some(anim) = self.position_bar_slide.take() {
             let elapsed = now.saturating_duration_since(anim.started);
-            if elapsed >= Duration::from_millis(crate::ui::start::position::FADE_MS) {
+            if elapsed >= Duration::from_millis(crate::ui::launcher::position::FADE_MS) {
                 if anim.to < 0.01 {
                     self.position_bar_last_scroll = None;
                 }
@@ -3447,7 +3450,7 @@ impl State {
             // NavbarVisibility::AlwaysOn pins the rail at (1, 1): skip the
             // hide timer entirely while pinned.
             if !self.navbar_pinned {
-                use crate::ui::start::position::HIDE_AFTER_MS;
+                use crate::ui::launcher::position::HIDE_AFTER_MS;
                 let elapsed = now.saturating_duration_since(last).as_millis() as u64;
                 if elapsed >= HIDE_AFTER_MS {
                     self.position_bar_slide = Some(PositionSlideAnim {
@@ -3470,7 +3473,7 @@ impl State {
             }
         }
         // Ambient clock runs on wall-clock deltas (capped per frame), never on
-        // call count: StartFrame (60Hz) and report-rate pad edges share this
+        // call count: LauncherFrame (60Hz) and report-rate pad edges share this
         // `tick_anim`, and fixed steps per call would fast-forward time
         // whenever edges outnumber frames. All callers share one stamp, so
         // their advances telescope to exactly the wall clock.
@@ -3521,7 +3524,7 @@ impl State {
             return None;
         }
         self.game_selected = after as usize;
-        self.sync_position_section(Instant::now(), crate::ui::start::vstrip::STRIP_ANIM_MS);
+        self.sync_position_section(Instant::now(), crate::ui::launcher::vstrip::STRIP_ANIM_MS);
         Some(reveal_for_step(before, after, delta))
     }
 }
@@ -3635,7 +3638,11 @@ pub(crate) fn scan_spinner_phase(now: Instant) -> f32 {
 }
 
 /// Small indeterminate arc spinner for the status rail.
-pub(crate) fn scan_spinner<'a>(size: f32, now: Instant, opacity: f32) -> Element<'a, StartMessage> {
+pub(crate) fn scan_spinner<'a>(
+    size: f32,
+    now: Instant,
+    opacity: f32,
+) -> Element<'a, LauncherMessage> {
     let phase = scan_spinner_phase(now);
     iced::widget::canvas(ScanSpinner {
         phase,
@@ -3653,7 +3660,7 @@ struct ScanSpinner {
     opacity: f32,
 }
 
-impl canvas::Program<StartMessage> for ScanSpinner {
+impl canvas::Program<LauncherMessage> for ScanSpinner {
     type State = ();
 
     fn draw(
@@ -3709,9 +3716,9 @@ pub(crate) fn scan_status_chip<'a>(
     label_size: f32,
     now: Instant,
     visual: ChromeStatusVisual,
-) -> Element<'a, StartMessage> {
+) -> Element<'a, LauncherMessage> {
     let op = visual.opacity.clamp(0.0, 1.0);
-    let icon: Element<'_, StartMessage> = if visual.success {
+    let icon: Element<'_, LauncherMessage> = if visual.success {
         svg(svg::Handle::from_memory(svg_icon::CHECK_SVG.as_bytes()))
             .width(Length::Fixed(spinner_size))
             .height(Length::Fixed(spinner_size))
@@ -3747,11 +3754,11 @@ pub(crate) fn scan_status_chip<'a>(
 /// upward without shifting slot 0. New chips enter from below (slot &lt; 0, clipped).
 /// ExitRight translates via [`Float`] so layout width stays chip-tight on the right edge.
 pub(crate) fn scan_status_stack<'a>(
-    chips: Vec<(ChromeStatusVisual, Element<'a, StartMessage>)>,
+    chips: Vec<(ChromeStatusVisual, Element<'a, LauncherMessage>)>,
     chip_h: f32,
     bottom_inset: f32,
-) -> Element<'a, StartMessage> {
-    use crate::ui::start::mode::CHROME_STATUS_EXIT_TRAVEL_PX;
+) -> Element<'a, LauncherMessage> {
+    use crate::ui::launcher::mode::CHROME_STATUS_EXIT_TRAVEL_PX;
     use iced::Vector;
 
     let chip_h = chip_h.max(1.0);
@@ -3761,7 +3768,7 @@ pub(crate) fn scan_status_stack<'a>(
     let n = chips.len().max(1) as f32;
     let clip_h = bottom_inset + n * chip_h;
 
-    let mut layers: Vec<Element<'_, StartMessage>> = Vec::new();
+    let mut layers: Vec<Element<'_, LauncherMessage>> = Vec::new();
     for (visual, chip) in chips {
         let slot = visual.stack_slot;
         let y_from_bottom = bottom_inset + slot * chip_h;
@@ -3770,7 +3777,7 @@ pub(crate) fn scan_status_stack<'a>(
         let dx = exit * travel;
         // Always Float while exiting so the first frames also translate (threshold
         // previously skipped early motion).
-        let chip: Element<'_, StartMessage> = if exit > 0.001 {
+        let chip: Element<'_, LauncherMessage> = if exit > 0.001 {
             Float::new(chip)
                 .translate(move |_bounds, _viewport| Vector::new(dx, 0.0))
                 .into()
@@ -3802,10 +3809,10 @@ pub fn view<'a>(
     clock_enabled: bool,
     stage_h: f32,
     stage_w: f32,
-    settings_snapshot: &crate::ui::start::settings::StartSettingsSnapshot,
+    settings_snapshot: &crate::ui::launcher::settings::LauncherSettingsSnapshot,
     #[cfg(debug_assertions)] debug_bounds: bool,
-) -> Element<'a, StartMessage> {
-    crate::ui::start::immersive::view(
+) -> Element<'a, LauncherMessage> {
+    crate::ui::launcher::immersive::view(
         state,
         now,
         clock_enabled,
@@ -3824,7 +3831,7 @@ mod tests {
 
     #[test]
     fn navbar_pin_holds_rail_visible_and_skips_hide_timer() {
-        use crate::ui::start::position::HIDE_AFTER_MS;
+        use crate::ui::launcher::position::HIDE_AFTER_MS;
         let mut state = State::default();
         let now = Instant::now();
         // Unpinned and never scrolled: rail hidden.
@@ -3896,7 +3903,7 @@ mod tests {
 
     #[test]
     fn cold_load_begin_shows_rail_after_reset() {
-        use crate::ui::start::position::FADE_MS;
+        use crate::ui::launcher::position::FADE_MS;
         // Open-path order: reset_to_games clears, begin_cold_load re-shows.
         let mut state = State { ..State::default() };
         let now = Instant::now();
@@ -3926,7 +3933,7 @@ mod tests {
 
     #[test]
     fn set_rows_reorder_shows_rail() {
-        use crate::ui::start::position::FADE_MS;
+        use crate::ui::launcher::position::FADE_MS;
         let mut state = State {
             rows: vec![
                 game_row_with("steam:1"),
@@ -3992,7 +3999,7 @@ mod tests {
         assert!(gated.immersive_anim_active());
 
         let mut ungated = State { ..State::default() };
-        ungated.replace_confirm = Some(crate::ui::start::view::ReplaceConfirm {
+        ungated.replace_confirm = Some(crate::ui::launcher::view::ReplaceConfirm {
             running_title: "a".into(),
             next_title: "b".into(),
             next_index: 0,
@@ -4001,7 +4008,7 @@ mod tests {
         assert!(ungated.immersive_anim_active());
         let mut gated = State { ..State::default() };
         gated.sync_perf_throttle(true);
-        gated.replace_confirm = Some(crate::ui::start::view::ReplaceConfirm {
+        gated.replace_confirm = Some(crate::ui::launcher::view::ReplaceConfirm {
             running_title: "a".into(),
             next_title: "b".into(),
             next_index: 0,
@@ -4066,7 +4073,7 @@ mod tests {
         assert!(state.request_settings(true, now));
         assert_eq!(state.game_selected, 3);
         assert!((state.settings.scroll_y - 0.0).abs() < f32::EPSILON);
-        assert!((state.list_offset(StartListId::Settings) - 0.0).abs() < f32::EPSILON);
+        assert!((state.list_offset(LauncherListId::Settings) - 0.0).abs() < f32::EPSILON);
         assert!(state.request_settings(false, now));
         assert_eq!(state.game_selected, 3);
     }
@@ -4074,13 +4081,13 @@ mod tests {
     #[test]
     fn tracker_records_and_notes_settings_list() {
         let mut state = State::default();
-        state.record_list_scroll(StartListId::Settings, 42.0, 480.0);
-        assert!((state.list_offset(StartListId::Settings) - 42.0).abs() < f32::EPSILON);
-        assert!((state.list_viewport(StartListId::Settings) - 480.0).abs() < f32::EPSILON);
+        state.record_list_scroll(LauncherListId::Settings, 42.0, 480.0);
+        assert!((state.list_offset(LauncherListId::Settings) - 42.0).abs() < f32::EPSILON);
+        assert!((state.list_viewport(LauncherListId::Settings) - 480.0).abs() < f32::EPSILON);
         assert!((state.settings.scroll_y - 42.0).abs() < f32::EPSILON);
         // Programmatic scroll_to syncs optimistically (on_scroll lags).
-        assert!(state.note_scroll_y(&StartListId::Settings.scroll_id(), 60.0));
-        assert!((state.list_offset(StartListId::Settings) - 60.0).abs() < f32::EPSILON);
+        assert!(state.note_scroll_y(&LauncherListId::Settings.scroll_id(), 60.0));
+        assert!((state.list_offset(LauncherListId::Settings) - 60.0).abs() < f32::EPSILON);
         assert!((state.settings.scroll_y - 60.0).abs() < f32::EPSILON);
     }
 
@@ -4088,15 +4095,15 @@ mod tests {
     fn tracker_unknown_list_id_is_noop() {
         // Unknown / future list ids must never disturb tracked lists.
         let mut state = State::default();
-        state.record_list_scroll(StartListId::Settings, 42.0, 480.0);
+        state.record_list_scroll(LauncherListId::Settings, 42.0, 480.0);
         let unknown = iced::widget::Id::new("start-future-list-xyz");
-        assert!(StartListId::from_scroll_id(&unknown).is_none());
+        assert!(LauncherListId::from_scroll_id(&unknown).is_none());
         assert!(!state.note_scroll_y(&unknown, 999.0));
-        assert!((state.list_offset(StartListId::Settings) - 42.0).abs() < f32::EPSILON);
+        assert!((state.list_offset(LauncherListId::Settings) - 42.0).abs() < f32::EPSILON);
     }
 
-    fn game_row_with(play_key: &str) -> StartRow {
-        StartRow {
+    fn game_row_with(play_key: &str) -> LauncherRow {
+        LauncherRow {
             title: play_key.into(),
             subtitle: None,
             target: play_key.into(),
@@ -4143,7 +4150,7 @@ mod tests {
     fn from_entry_skeleton_while_scan_pending() {
         let entry = GameEntry::Steam { appid: 1371980 };
         let empty = HashMap::new();
-        let row = StartRow::from_entry(&entry, &empty, true, None, false);
+        let row = LauncherRow::from_entry(&entry, &empty, true, None, false);
         assert!(row.skeleton);
         assert!(row.title.is_empty());
         assert!(row.icon.is_none());
@@ -4155,14 +4162,14 @@ mod tests {
     fn from_entry_appid_fallback_after_scan() {
         let entry = GameEntry::Steam { appid: 1371980 };
         let empty = HashMap::new();
-        let row = StartRow::from_entry(&entry, &empty, false, None, false);
+        let row = LauncherRow::from_entry(&entry, &empty, false, None, false);
         assert!(!row.skeleton);
         assert_eq!(row.title, "Steam 1371980");
         assert!(row.icon.is_none());
         assert_eq!(row.play_key, "steam:1371980");
         assert!(matches!(
             row.subtitle.as_ref(),
-            Some(StartSubtitle::Plain(label)) if label == "Steam"
+            Some(LauncherSubtitle::Plain(label)) if label == "Steam"
         ));
         assert!(!row.target.is_empty());
         // Unknown scan: no proven absence, so the row stays launchable.
@@ -4176,7 +4183,7 @@ mod tests {
         let empty = HashMap::new();
         // Proven uninstalled: last-known title, "Not installed" subtitle,
         // Cross routes to View in Steam instead of launching.
-        let row = StartRow::from_entry(
+        let row = LauncherRow::from_entry(
             &entry,
             &empty,
             false,
@@ -4187,17 +4194,17 @@ mod tests {
         assert_eq!(row.title, "Achilles: Legends Untold");
         assert!(matches!(
             row.subtitle.as_ref(),
-            Some(StartSubtitle::Plain(label)) if label == "Not installed"
+            Some(LauncherSubtitle::Plain(label)) if label == "Not installed"
         ));
         assert_eq!(row.target, "steam://rungameid/1314000");
         assert_eq!(row.view_in_steam, Some(1314000));
         assert_eq!(row.launch_hint_label(), "View in Steam");
         // Blank remembered names never blank the title.
-        let blank = StartRow::from_entry(&entry, &empty, false, Some("   "), true);
+        let blank = LauncherRow::from_entry(&entry, &empty, false, Some("   "), true);
         assert_eq!(blank.title, "Steam 1314000");
         assert_eq!(blank.view_in_steam, Some(1314000));
         // Remembered name without proven absence: title only, still launches.
-        let unsure = StartRow::from_entry(&entry, &empty, false, Some("Achilles"), false);
+        let unsure = LauncherRow::from_entry(&entry, &empty, false, Some("Achilles"), false);
         assert_eq!(unsure.title, "Achilles");
         assert_eq!(unsure.view_in_steam, None);
         assert_eq!(unsure.launch_hint_label(), "Launch");
@@ -4220,7 +4227,7 @@ mod tests {
                 update_required: true,
             },
         );
-        let row = StartRow::from_entry(&entry, &map, true, None, false);
+        let row = LauncherRow::from_entry(&entry, &map, true, None, false);
         assert!(!row.skeleton);
         assert_eq!(row.title, "Path of Exile");
         assert!(
@@ -4235,7 +4242,8 @@ mod tests {
 
     #[test]
     fn steam_uninstalled_row_is_toggleable_not_viewable() {
-        let row = StartRow::steam_uninstalled(1314000, "Achilles: Legends Untold".into(), Some(99));
+        let row =
+            LauncherRow::steam_uninstalled(1314000, "Achilles: Legends Untold".into(), Some(99));
         assert_eq!(row.title, "Achilles: Legends Untold");
         assert_eq!(row.play_key, "steam:1314000");
         assert_eq!(row.target, "steam://rungameid/1314000");
@@ -4270,7 +4278,7 @@ mod tests {
         let bd1 = PathBuf::from("bd1.png");
         let mut state = State {
             rows: vec![
-                StartRow {
+                LauncherRow {
                     title: "g0".into(),
                     subtitle: None,
                     target: "t0".into(),
@@ -4286,7 +4294,7 @@ mod tests {
                     view_in_steam: None,
                     played_at_ms: None,
                 },
-                StartRow {
+                LauncherRow {
                     title: "g1".into(),
                     subtitle: None,
                     target: "t1".into(),
@@ -4302,7 +4310,7 @@ mod tests {
                     view_in_steam: None,
                     played_at_ms: None,
                 },
-                StartRow {
+                LauncherRow {
                     title: "g2".into(),
                     subtitle: None,
                     target: "t2".into(),
@@ -4348,7 +4356,7 @@ mod tests {
     fn begin_strip_anim_uses_prior_index_when_settled() {
         let mut state = State {
             rows: (0..5)
-                .map(|i| StartRow {
+                .map(|i| LauncherRow {
                     title: format!("g{i}"),
                     subtitle: None,
                     target: format!("t{i}"),
@@ -4374,10 +4382,10 @@ mod tests {
         let anim = state.strip_anim.as_ref().expect("settled step starts anim");
         assert!((anim.from - 2.0).abs() < 0.01);
         assert!((anim.to - 3.0).abs() < 0.01);
-        assert_eq!(anim.duration_ms, crate::ui::start::vstrip::STRIP_ANIM_MS);
+        assert_eq!(anim.duration_ms, crate::ui::launcher::vstrip::STRIP_ANIM_MS);
 
         // Mid-flight retarget uses live visual, not the stale from_visual hint.
-        let mid = now + Duration::from_millis(crate::ui::start::vstrip::STRIP_ANIM_MS / 2);
+        let mid = now + Duration::from_millis(crate::ui::launcher::vstrip::STRIP_ANIM_MS / 2);
         state.game_selected = 4;
         state.begin_strip_anim(0.0, mid);
         let anim = state.strip_anim.as_ref().expect("retarget keeps anim");
@@ -4385,7 +4393,7 @@ mod tests {
         assert!(anim.from > 2.0 && anim.from < 3.0);
         assert_eq!(
             anim.duration_ms,
-            crate::ui::start::vstrip::STRIP_ANIM_CATCHUP_MS
+            crate::ui::launcher::vstrip::STRIP_ANIM_CATCHUP_MS
         );
     }
 
@@ -4393,7 +4401,7 @@ mod tests {
     fn begin_strip_anim_linear_mid_list_step() {
         let mut state = State {
             rows: (0..2)
-                .map(|i| StartRow {
+                .map(|i| LauncherRow {
                     title: format!("g{i}"),
                     subtitle: None,
                     target: format!("t{i}"),
@@ -4420,9 +4428,9 @@ mod tests {
         assert!((anim.to - 0.0).abs() < 0.01);
     }
 
-    fn title_rows(n: usize) -> Vec<StartRow> {
+    fn title_rows(n: usize) -> Vec<LauncherRow> {
         (0..n)
-            .map(|i| StartRow {
+            .map(|i| LauncherRow {
                 title: format!("g{i}"),
                 subtitle: None,
                 target: format!("t{i}"),
@@ -4455,14 +4463,14 @@ mod tests {
         assert!((state.strip_scroll(now) - 3.0).abs() < 0.01);
         state.begin_strip_anim(2.0, now);
         let anim = state.strip_anim.as_ref().expect("settled step animates");
-        assert_eq!(anim.duration_ms, crate::ui::start::vstrip::STRIP_ANIM_MS);
+        assert_eq!(anim.duration_ms, crate::ui::launcher::vstrip::STRIP_ANIM_MS);
         // Visual chases 2 -> 3 on the strip clock, so each slot's title and
         // meta travel with its art.
         assert!((state.strip_scroll(now) - 2.0).abs() < 0.01);
-        let mid = now + Duration::from_millis(crate::ui::start::vstrip::STRIP_ANIM_MS / 2);
+        let mid = now + Duration::from_millis(crate::ui::launcher::vstrip::STRIP_ANIM_MS / 2);
         let s = state.strip_scroll(mid);
         assert!(s > 2.0 && s < 3.0);
-        let done = now + Duration::from_millis(crate::ui::start::vstrip::STRIP_ANIM_MS + 16);
+        let done = now + Duration::from_millis(crate::ui::launcher::vstrip::STRIP_ANIM_MS + 16);
         state.tick_anim(done);
         assert!(state.strip_anim.is_none());
         assert!((state.strip_scroll(done) - 3.0).abs() < 0.01);
@@ -4487,14 +4495,14 @@ mod tests {
         let now = Instant::now();
         state.begin_strip_anim(2.0, now);
         // Rapid second step mid-flight retargets from the live visual.
-        let mid = now + Duration::from_millis(crate::ui::start::vstrip::STRIP_ANIM_MS / 2);
+        let mid = now + Duration::from_millis(crate::ui::launcher::vstrip::STRIP_ANIM_MS / 2);
         state.game_selected = 4;
         state.begin_strip_anim(0.0, mid);
         let anim = state.strip_anim.as_ref().expect("retarget keeps anim");
         assert!((anim.to - 4.0).abs() < 0.01);
         assert_eq!(
             anim.duration_ms,
-            crate::ui::start::vstrip::STRIP_ANIM_CATCHUP_MS
+            crate::ui::launcher::vstrip::STRIP_ANIM_CATCHUP_MS
         );
         // Same index (no strip motion): nothing animates.
         let mut same = State {
@@ -4598,7 +4606,7 @@ mod tests {
     fn immersive_ambient_tracks_wall_clock_not_call_count() {
         // Pins the "same speed" contract the ambient preview relies on: the
         // clock advances by capped wall-clock deltas, so report-rate pad
-        // edges sharing `tick_anim` with StartFrame cannot fast-forward it.
+        // edges sharing `tick_anim` with LauncherFrame cannot fast-forward it.
         // Reduced motion never gates the ambient clock.
         crate::ui::shader::ambient::with_tune_test_lock(|| {
             let nominal = crate::ui::shader::ambient::ambient_tick_dt();
@@ -4642,7 +4650,7 @@ mod tests {
     #[test]
     fn reduced_motion_snaps_movement_keeps_opacity() {
         use crate::persist::prefs::ImmersiveLayout;
-        use crate::ui::start::mode::{
+        use crate::ui::launcher::mode::{
             CHROME_STATUS_EXIT_MS, CHROME_STATUS_STEP_HOLD_MS, CHROME_STATUS_SUCCESS_HOLD_MS,
         };
         let now = Instant::now();
@@ -4706,7 +4714,7 @@ mod tests {
         let now = Instant::now();
         let mut state = State {
             rows: (0..5)
-                .map(|i| StartRow {
+                .map(|i| LauncherRow {
                     title: format!("g{i}"),
                     subtitle: None,
                     target: format!("t{i}"),
@@ -4819,7 +4827,7 @@ mod tests {
         // Strip scroll stays nav-live: animating() ignores it.
         let mut strip = State {
             rows: (0..3)
-                .map(|i| StartRow {
+                .map(|i| LauncherRow {
                     title: format!("g{i}"),
                     subtitle: None,
                     target: format!("t{i}"),
@@ -4877,7 +4885,7 @@ mod tests {
     fn move_selection_games_clamps_at_ends() {
         let mut state = State {
             rows: (0..3)
-                .map(|i| StartRow {
+                .map(|i| LauncherRow {
                     title: format!("g{i}"),
                     subtitle: None,
                     target: format!("t{i}"),
@@ -4906,8 +4914,8 @@ mod tests {
         assert_eq!(state.game_selected, 2);
     }
 
-    fn test_row(title: &str, disabled: bool, played_at_ms: Option<u64>) -> StartRow {
-        StartRow {
+    fn test_row(title: &str, disabled: bool, played_at_ms: Option<u64>) -> LauncherRow {
+        LauncherRow {
             title: title.into(),
             subtitle: None,
             target: format!("t-{title}"),
@@ -4949,8 +4957,8 @@ mod tests {
         assert_eq!(state.game_selected, 0);
     }
 
-    fn edit_check_row(play_key: &str, title: &str, in_catalog: bool) -> StartRow {
-        StartRow {
+    fn edit_check_row(play_key: &str, title: &str, in_catalog: bool) -> LauncherRow {
+        LauncherRow {
             title: title.into(),
             subtitle: None,
             target: format!("t-{play_key}"),
@@ -5279,7 +5287,7 @@ mod tests {
         // Regression: entering/exiting edit mode (save AND cancel, with
         // toggles in between) must not re-sort the games list by itself. The
         // stored sort always mirrors prefs — `cycle_games_sort` stays live
-        // while editing and `refresh_start_rows` re-syncs on every rebuild —
+        // while editing and `refresh_launcher_rows` re-syncs on every rebuild —
         // and these State transitions (the unit-testable half) preserve it.
         for sort in [GamesSortMode::LastPlayed, GamesSortMode::Alphabetical] {
             let mut state = State {
@@ -5329,7 +5337,7 @@ mod tests {
 
     fn state_with_backdrop(path: PathBuf) -> State {
         State {
-            rows: vec![StartRow {
+            rows: vec![LauncherRow {
                 title: "g0".into(),
                 subtitle: None,
                 target: "t0".into(),
@@ -5439,7 +5447,7 @@ mod tests {
 
     #[test]
     fn enter_reveal_stays_solid_until_armed() {
-        use crate::ui::start::mode::TransitionPhase;
+        use crate::ui::launcher::mode::TransitionPhase;
         let mut state = State::default();
         let now = Instant::now();
         state.begin_transition_phase(TransitionPhase::EnterImmersive, now);
@@ -5453,7 +5461,7 @@ mod tests {
     #[test]
     fn enter_holds_veil_until_splash_and_strip_heroes_ready() {
         icon_cache::with_cache_lock(|| {
-            use crate::ui::start::mode::TransitionPhase;
+            use crate::ui::launcher::mode::TransitionPhase;
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
@@ -5465,7 +5473,7 @@ mod tests {
             write_tiny_png(&bd);
 
             let mut state = State {
-                rows: vec![StartRow {
+                rows: vec![LauncherRow {
                     title: "g".into(),
                     subtitle: None,
                     target: "t".into(),
@@ -5511,9 +5519,9 @@ mod tests {
 
     #[test]
     fn enter_hides_list_until_art_sync() {
-        use crate::ui::start::mode::TransitionPhase;
+        use crate::ui::launcher::mode::TransitionPhase;
         let mut state = State {
-            rows: vec![StartRow {
+            rows: vec![LauncherRow {
                 title: "g".into(),
                 subtitle: None,
                 target: "t".into(),
@@ -5550,7 +5558,7 @@ mod tests {
     #[test]
     fn enter_art_ready_reveals_list_while_veil_armed() {
         icon_cache::with_cache_lock(|| {
-            use crate::ui::start::mode::TransitionPhase;
+            use crate::ui::launcher::mode::TransitionPhase;
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
@@ -5564,7 +5572,7 @@ mod tests {
             assert!(icon_cache::backdrop_for_path(&bd).is_some());
 
             let mut state = State {
-                rows: vec![StartRow {
+                rows: vec![LauncherRow {
                     title: "g".into(),
                     subtitle: None,
                     target: "t".into(),
@@ -5600,9 +5608,9 @@ mod tests {
 
     #[test]
     fn enter_list_hold_timeout_reveals_without_art() {
-        use crate::ui::start::mode::{ENTER_ART_HOLD_MAX_MS, TransitionPhase};
+        use crate::ui::launcher::mode::{ENTER_ART_HOLD_MAX_MS, TransitionPhase};
         let mut state = State {
-            rows: vec![StartRow {
+            rows: vec![LauncherRow {
                 title: "g".into(),
                 subtitle: None,
                 target: "t".into(),
@@ -5638,7 +5646,7 @@ mod tests {
         // (previously stuck on "Preparing artwork…" — the reveal-timestamp
         // guard never re-ran once set).
         icon_cache::with_cache_lock(|| {
-            use crate::ui::start::mode::TransitionPhase;
+            use crate::ui::launcher::mode::TransitionPhase;
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
@@ -5652,7 +5660,7 @@ mod tests {
             assert!(icon_cache::backdrop_for_path(&bd).is_some());
 
             let mut state = State {
-                rows: vec![StartRow {
+                rows: vec![LauncherRow {
                     title: "g".into(),
                     subtitle: None,
                     target: "t".into(),
@@ -5695,7 +5703,7 @@ mod tests {
         // must not reset a running splash fade for the same key — that
         // reset was the visible "re-fade" on slow cold opens.
         icon_cache::with_cache_lock(|| {
-            use crate::ui::start::mode::{ENTER_ART_HOLD_MAX_MS, TransitionPhase};
+            use crate::ui::launcher::mode::{ENTER_ART_HOLD_MAX_MS, TransitionPhase};
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
@@ -5709,7 +5717,7 @@ mod tests {
             assert!(icon_cache::backdrop_for_path(&bd).is_some());
 
             let mut state = State {
-                rows: vec![StartRow {
+                rows: vec![LauncherRow {
                     title: "g".into(),
                     subtitle: None,
                     target: "t".into(),
@@ -5748,7 +5756,7 @@ mod tests {
 
     #[test]
     fn enter_reveal_wall_clock_midpoint_and_exact_duration() {
-        use crate::ui::start::mode::{ENTER_REVEAL_MS, TransitionPhase, enter_veil_amount};
+        use crate::ui::launcher::mode::{ENTER_REVEAL_MS, TransitionPhase, enter_veil_amount};
         let mut state = State::default();
         let t0 = Instant::now();
         state.begin_transition_phase(TransitionPhase::EnterImmersive, t0);
@@ -5775,7 +5783,7 @@ mod tests {
     #[test]
     fn enter_paints_cached_splash_opaque_under_veil() {
         icon_cache::with_cache_lock(|| {
-            use crate::ui::start::mode::{ENTER_REVEAL_MS, TransitionPhase};
+            use crate::ui::launcher::mode::{ENTER_REVEAL_MS, TransitionPhase};
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
@@ -5824,7 +5832,7 @@ mod tests {
     #[test]
     fn cold_start_late_art_fades_ambient_to_splash() {
         icon_cache::with_cache_lock(|| {
-            use crate::ui::start::mode::{
+            use crate::ui::launcher::mode::{
                 ART_FADE_MS, ENTER_REVEAL_MS, TransitionPhase, enter_art_fade_progress,
             };
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -5872,7 +5880,7 @@ mod tests {
     #[test]
     fn title_change_cover_crossfade_keeps_outgoing_solid() {
         icon_cache::with_cache_lock(|| {
-            use crate::ui::start::mode::ART_FADE_MS;
+            use crate::ui::launcher::mode::ART_FADE_MS;
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
@@ -5887,7 +5895,7 @@ mod tests {
 
             let mut state = State {
                 rows: vec![
-                    StartRow {
+                    LauncherRow {
                         title: "g0".into(),
                         subtitle: None,
                         target: "t0".into(),
@@ -5903,7 +5911,7 @@ mod tests {
                         view_in_steam: None,
                         played_at_ms: None,
                     },
-                    StartRow {
+                    LauncherRow {
                         title: "g1".into(),
                         subtitle: None,
                         target: "t1".into(),
@@ -5924,7 +5932,7 @@ mod tests {
 
                 ..Default::default()
             };
-            use crate::ui::start::mode::backdrop_pose_scale;
+            use crate::ui::launcher::mode::backdrop_pose_scale;
             let now = Instant::now();
             state.prime_backdrop_for_enter(now);
             assert!(state.splash_opaque);
@@ -5959,7 +5967,7 @@ mod tests {
     #[test]
     fn reset_backdrop_freezes_outgoing_ken_burns_scale() {
         icon_cache::with_cache_lock(|| {
-            use crate::ui::start::mode::{BACKDROP_ZOOM_PERIOD_MS, backdrop_pose_scale};
+            use crate::ui::launcher::mode::{BACKDROP_ZOOM_PERIOD_MS, backdrop_pose_scale};
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
@@ -5974,7 +5982,7 @@ mod tests {
 
             let mut state = State {
                 rows: vec![
-                    StartRow {
+                    LauncherRow {
                         title: "g0".into(),
                         subtitle: None,
                         target: "t0".into(),
@@ -5990,7 +5998,7 @@ mod tests {
                         view_in_steam: None,
                         played_at_ms: None,
                     },
-                    StartRow {
+                    LauncherRow {
                         title: "g1".into(),
                         subtitle: None,
                         target: "t1".into(),
@@ -6018,7 +6026,7 @@ mod tests {
             if let Some((_, started)) = &mut state.backdrop_current {
                 *started = Some(t0 - Duration::from_millis(mid_pose));
             }
-            use crate::ui::start::mode::backdrop_pose_offset;
+            use crate::ui::launcher::mode::backdrop_pose_offset;
             let expected = backdrop_pose_scale(mid_pose);
             let (exp_ox, exp_oy) = backdrop_pose_offset(mid_pose);
             assert!(expected > 1.01, "test needs mid-pose scale, got {expected}");
@@ -6049,7 +6057,7 @@ mod tests {
             .collect();
         let state = State {
             rows: (0..5)
-                .map(|i| StartRow {
+                .map(|i| LauncherRow {
                     title: format!("g{i}"),
                     subtitle: None,
                     target: format!("t{i}"),
@@ -6083,7 +6091,7 @@ mod tests {
     fn art_retain_set_linear_at_start_even_when_immersive() {
         let state = State {
             rows: (0..30)
-                .map(|i| StartRow {
+                .map(|i| LauncherRow {
                     title: format!("g{i}"),
                     subtitle: None,
                     target: format!("t{i}"),
@@ -6133,7 +6141,7 @@ mod tests {
                     ])
                     .unwrap();
             }
-            let row = StartRow {
+            let row = LauncherRow {
                 title: "g".into(),
                 subtitle: None,
                 target: "t".into(),
@@ -6158,7 +6166,7 @@ mod tests {
 
     #[test]
     fn chrome_status_solo_success_exits_right_after_hold() {
-        use crate::ui::start::mode::{
+        use crate::ui::launcher::mode::{
             CHROME_STATUS_EXIT_MS, CHROME_STATUS_IN_MS, CHROME_STATUS_STEP_HOLD_MS,
             CHROME_STATUS_SUCCESS_HOLD_MS,
         };
@@ -6195,7 +6203,7 @@ mod tests {
 
     #[test]
     fn chrome_status_new_job_stacks_success_upward() {
-        use crate::ui::start::mode::CHROME_STATUS_IN_MS;
+        use crate::ui::launcher::mode::CHROME_STATUS_IN_MS;
         let t0 = Instant::now();
         let mut state = State { ..State::default() };
         state.begin_chrome_status(ChromeStatusKind::PreparingArt, t0);
@@ -6258,7 +6266,7 @@ mod tests {
 
     #[test]
     fn chrome_status_batch_exit_staggers_bottom_first() {
-        use crate::ui::start::mode::{
+        use crate::ui::launcher::mode::{
             CHROME_STATUS_STAGGER_MS, CHROME_STATUS_STEP_HOLD_MS, CHROME_STATUS_SUCCESS_HOLD_MS,
         };
         let t0 = Instant::now();
@@ -6299,7 +6307,9 @@ mod tests {
 
     #[test]
     fn chrome_status_third_kind_blocks_batch_exit() {
-        use crate::ui::start::mode::{CHROME_STATUS_STEP_HOLD_MS, CHROME_STATUS_SUCCESS_HOLD_MS};
+        use crate::ui::launcher::mode::{
+            CHROME_STATUS_STEP_HOLD_MS, CHROME_STATUS_SUCCESS_HOLD_MS,
+        };
         let t0 = Instant::now();
         let mut state = State::default();
         state.begin_chrome_status(ChromeStatusKind::PreparingArt, t0);

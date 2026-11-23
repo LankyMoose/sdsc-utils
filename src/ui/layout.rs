@@ -485,8 +485,8 @@ pub fn primary_monitor_cover() -> Option<MonitorCover> {
 
 /// Whether the system cursor is currently on the primary monitor.
 ///
-/// Used for immersive Start idle cursor hide — secondary monitors keep a visible
-/// cursor even while Start covers the primary.
+/// Used for immersive Launcher idle cursor hide — secondary monitors keep a visible
+/// cursor even while Launcher covers the primary.
 ///
 /// Delegates to the [`Host`](crate::platform::host::Host) monitors seam; the
 /// Windows branch compares the cursor's monitor against the primary verbatim,

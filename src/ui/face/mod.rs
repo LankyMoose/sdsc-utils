@@ -1,7 +1,7 @@
 //! Shared face-button hint primitives (footer, rows, cards, hero cues).
 //!
 //! Glyph and cluster constructors live here; callers assemble them into
-//! Start chrome, settings, and the PS hub. The widgets are message-generic,
+//! Launcher chrome, settings, and the PS hub. The widgets are message-generic,
 //! so a surface never needs its own copy of the ring/label style.
 //! [`ring`] holds the SVG ring renderer.
 
@@ -102,7 +102,7 @@ pub(crate) fn face_hold_hint(
 }
 
 /// Message-agnostic action hint for surfaces that track their own held state
-/// (the PS hub controller cards) instead of Start's [`FaceHeld`] snapshot.
+/// (the PS hub controller cards) instead of Launcher's [`FaceHeld`] snapshot.
 pub(crate) fn plain_hint(face: FaceButton, label: &'static str, pressed: bool) -> ActionHint {
     ActionHint {
         face: Some(face),

@@ -1,9 +1,9 @@
-//! Single-flight Start art decode worker (latest-wins mailbox).
+//! Single-flight Launcher art decode worker (latest-wins mailbox).
 //!
 //! The UI posts [`ArtJob`]s; one OS thread decodes one path at a time and drains
 //! the mailbox between items so fast nav never piles decode threads.
 
-use crate::ui::start::icon_cache::{self, ArtRetainSet};
+use crate::ui::launcher::icon_cache::{self, ArtRetainSet};
 use iced::futures::channel::mpsc as iced_mpsc;
 use iced::futures::{SinkExt, StreamExt};
 use std::hash::Hash;
@@ -58,7 +58,7 @@ struct Inner {
     bind_seq: u64,
 }
 
-/// Owned Start-art unit: single-flight decode mailbox plus the iced event sink.
+/// Owned Launcher-art unit: single-flight decode mailbox plus the iced event sink.
 ///
 /// Owned by the app root (`App::art`) and shared with the iced subscription
 /// via `Arc` (mirrors [`crate::domain::pad::InputHub`]: interior locks, `&self`
@@ -119,7 +119,7 @@ impl ArtOwner {
         }
     }
 
-    /// Stop in-flight warm work without tearing the thread down (Start close).
+    /// Stop in-flight warm work without tearing the thread down (Launcher close).
     ///
     /// Posts an empty job at `generation` so the worker abandons the current order
     /// after the decode already in flight. Does not change pin/LRU state — reopen
@@ -147,7 +147,7 @@ impl ArtOwner {
         })));
     }
 
-    /// Stop the worker thread and wipe every Start image cache (app Exit).
+    /// Stop the worker thread and wipe every Launcher image cache (app Exit).
     ///
     /// Wipes caches **before** joining so a slow final `image::open` cannot leave
     /// handles in the process cache, and so quit stays responsive.

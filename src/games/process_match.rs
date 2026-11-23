@@ -36,7 +36,7 @@ pub struct RunningSession {
     /// via the sticky-miss logic immediately, even inside the window.
     pub matched: bool,
     /// Catalog play key to stamp when this session first confirms running.
-    /// `Some` for sessions born from a Start launch, `None` for restored
+    /// `Some` for sessions born from a Launcher launch, `None` for restored
     /// sessions (externally started games keep today's behavior: no stamp).
     /// Stamping on confirm — not at handoff — keeps failed launches out of
     /// Last Played sort/metadata.

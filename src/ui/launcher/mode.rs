@@ -1,6 +1,6 @@
 //! Pure start-screen timing (enter ceremony) and controllers-surface focus.
 //!
-//! The start screen is always the fullscreen console stage; there is no
+//! The launcher is always the fullscreen console stage; there is no
 //! windowed presentation and no promote/demote morph.
 
 #[cfg(debug_assertions)]

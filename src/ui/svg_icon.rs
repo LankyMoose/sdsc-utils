@@ -138,8 +138,8 @@ struct CacheKey {
 
 /// Owned SVG raster cache.
 ///
-/// Owned by the Start image layer
-/// ([`crate::ui::start::icon_cache::IconCache`]: constructed in
+/// Owned by the Launcher image layer
+/// ([`crate::ui::launcher::icon_cache::IconCache`]: constructed in
 /// `IconCache::new`, wiped on process Exit) — no process-global instance.
 /// Runtime tray / iced views use `svg::Handle::from_memory` directly; the
 /// build-time embed (`build.rs`, `gen_msix_logos`) rasterizes through a

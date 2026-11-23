@@ -1,4 +1,4 @@
-//! Short embedded UI cues shared by Start, Browser, Configure, and the PS hub.
+//! Short embedded UI cues shared by Launcher, Browser, Configure, and the PS hub.
 //!
 //! Playback runs on a dedicated worker thread so WASAPI/COM init from `cpal`
 //! never touches the iced / winit UI thread (which causes RPC_E_CHANGED_MODE
