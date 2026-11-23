@@ -9,7 +9,7 @@
 //! edges are dropped, and UI sounds / Launcher haptics are muted — so a debug
 //! session cannot interrupt a game running on the primary monitor. Set
 //! `SDSC_DEBUG_INPUT=1` to keep pad edges live in quiet mode (the install QA
-//! console uses this to drive the hub on the secondary monitor while a game
+//! console uses this to drive Home on the secondary monitor while a game
 //! keeps focus on the primary). Release builds always return `false`.
 
 /// Env var that opens windows at boot; turns quiet mode on by default.

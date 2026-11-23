@@ -9,7 +9,7 @@
 mod browser;
 mod configure;
 mod feedback;
-mod hub;
+mod home;
 pub(crate) mod installs;
 mod launcher;
 mod popup;
@@ -188,7 +188,7 @@ pub enum Message {
         generation: u64,
         progress: crate::browser::engine_install::InstallProgress,
     },
-    /// Background DLC manifest check finished (hub open).
+    /// Background DLC manifest check finished (Home open).
     #[cfg(feature = "cef-engine")]
     EngineManifestReady {
         generation: u64,
@@ -205,22 +205,22 @@ pub enum Message {
         generation: u64,
         result: Result<(), String>,
     },
-    /// 60Hz tick while the hub animates the indeterminate uninstall meter.
-    HubProgressTick,
-    /// 60Hz tick while a hub controller card expands/collapses on focus.
-    HubControllerTick,
-    /// A window resized (logical size). The browser and hub consume this;
+    /// 60Hz tick while Home animates the indeterminate uninstall meter.
+    HomeProgressTick,
+    /// 60Hz tick while a Home controller card expands/collapses on focus.
+    HomeControllerTick,
+    /// A window resized (logical size). The browser and Home consume this;
     /// the event is authoritative for their final full-cover size.
     WindowSized(window::Id, iced::Size),
     /// Hidden shell setup is done: show the window and begin the backdrop
     /// fade (the card is visible immediately; the scrim fades in after).
     WindowShowNow(window::Id),
-    /// 60Hz redraw while a hub/Browser backdrop fade is running.
+    /// 60Hz redraw while a Home/Browser backdrop fade is running.
     ShellFadeTick,
-    /// PS hub window opened (focus it once the renderer exists).
-    HubOpened(window::Id),
-    /// Hub selection / activation from pad, keyboard, or mouse.
-    Hub(crate::ui::hub::HubMessage),
+    /// PS Home window opened (focus it once the renderer exists).
+    HomeOpened(window::Id),
+    /// Home selection / activation from pad, keyboard, or mouse.
+    Home(crate::ui::home::HomeMessage),
     /// Raw keyboard event for the Browser app (controller-first: no mouse).
     /// Routed in `update` — page mode forwards to the engine, URL-edit mode
     /// and reader mode fall back to the legacy Launcher-key mapping.
@@ -245,7 +245,7 @@ pub enum Message {
     /// Deferred Launcher HWND destruction (second close phase; see
     /// `launcher_close_armed`). Lets the cursor-restore present land first.
     FinishStartClose,
-    /// Drive start-screen animation frames.
+    /// Drive launcher animation frames.
     LauncherFrame,
     /// Mouse move/button/wheel on a window — resets start activity (cursor + idle/sleep).
     LauncherCursorActivity(window::Id),
@@ -357,7 +357,7 @@ impl Message {
             | Message::PlacePopup { .. }
             | Message::ConfigureOpened(_)
             | Message::BrowserOpened(_)
-            | Message::HubOpened(_)
+            | Message::HomeOpened(_)
             | Message::LauncherOpened(_)
             | Message::FinishStartClose
             | Message::LauncherFrame
@@ -372,14 +372,14 @@ impl Message {
             Message::EngineInstallProgress { .. }
             | Message::EngineManifestReady { .. }
             | Message::EngineUninstallDone { .. } => false,
-            Message::HubProgressTick | Message::HubControllerTick => false,
+            Message::HomeProgressTick | Message::HomeControllerTick => false,
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
             #[cfg(debug_assertions)]
             Message::PreviewDrag | Message::PreviewClose => true,
             Message::Popup(_)
             | Message::Configure(_)
-            | Message::Hub(_)
+            | Message::Home(_)
             | Message::EngineInstallCancel
             | Message::Browser(_)
             | Message::Launcher(_)
@@ -432,7 +432,7 @@ pub enum LauncherKeyAction {
 pub struct App {
     session: crate::session::DeviceSession,
     games: GamesCatalog,
-    /// In-progress start-screen edit checklist; committed on Save, discarded on Cancel.
+    /// In-progress launcher edit checklist; committed on Save, discarded on Cancel.
     edit_draft: Option<GamesCatalog>,
 
     /// Last HID presence snapshot (serials), used to detect connect/disconnect.
@@ -452,7 +452,7 @@ pub struct App {
     /// Owned battery spectrum shared with the HID worker (clone-then-release
     /// reads; never held across HID writes).
     spectrum: SpectrumService,
-    /// Owned pad-input hub shared with the HID worker thread and the
+    /// Owned pad-input Home shared with the HID worker thread and the
     /// pad-input subscription (no process-global).
     input_hub: Arc<InputHub>,
     /// Owned lightbar-claim unit shared with the HID worker (presence-empty
@@ -558,19 +558,19 @@ pub struct App {
     browser_backdrop_fade: Option<Instant>,
     /// Topmost PS app-switcher overlay: a full-screen dim scrim with the
     /// card centered in it.
-    hub_window: Option<window::Id>,
-    /// True while the hub is revealed; modal owner of pad input.
-    hub_visible: bool,
-    /// Actual logical size of the hub window (always the monitor cover).
-    hub_stage: (f32, f32),
-    /// Hub HWND is created hidden until its final size + DWM transition
+    home_window: Option<window::Id>,
+    /// True while Home is revealed; modal owner of pad input.
+    home_visible: bool,
+    /// Actual logical size of Home window (always the monitor cover).
+    home_stage: (f32, f32),
+    /// Home HWND is created hidden until its final size + DWM transition
     /// setup; then it is shown.
-    hub_pending_show: bool,
-    /// Hub window entrance/exit (card scale/opacity/y + scrim fade).
-    hub_shell_anim: Option<crate::ui::hub::ShellAnim>,
-    /// Monitor covered by the hub window (toast composite pose).
-    hub_monitor_cover: Option<MonitorCover>,
-    hub_state: crate::ui::hub::State,
+    home_pending_show: bool,
+    /// Home window entrance/exit (card scale/opacity/y + scrim fade).
+    home_shell_anim: Option<crate::ui::home::ShellAnim>,
+    /// Monitor covered by Home window (toast composite pose).
+    home_monitor_cover: Option<MonitorCover>,
+    home_state: crate::ui::home::State,
     /// Close is two-phase when the cursor was hidden: the flag clears
     /// immediately, but HWND destruction waits one loop pass
     /// (`FinishStartClose`) so a rebuild pushes the restored cursor to the
@@ -589,11 +589,11 @@ pub struct App {
     /// Top-level browser app: panel, engine worker, capability flag, and
     /// browser-only D-pad stepper. No longer owned by `LauncherState`.
     browser: browser::BrowserAppState,
-    /// Hub-owned standalone install policy (download cap shared by every
+    /// Home-owned standalone install policy (download cap shared by every
     /// managed-app installer).
     install_policy: installs::AppInstallPolicy,
-    /// Managed-app hub: installed/active apps and transition effects.
-    hub: hub::AppHub,
+    /// Managed-app Home: installed/active apps and transition effects.
+    home_apps: home::HomeApps,
     /// Monitor covered by the Launcher window (stage size for the view).
     launcher_monitor_cover: Option<MonitorCover>,
     /// This process was relaunched by the crash handler: restore tabs in
@@ -603,7 +603,7 @@ pub struct App {
     launcher_last_activity: Instant,
     /// Last mouse activity on Launcher (cursor hide only — pad must not unhide).
     launcher_cursor_last_active: Instant,
-    /// When the PS hub opened over a visible Launcher. On hub close, Launcher's
+    /// When the PS Home opened over a visible Launcher. On Home close, Launcher's
     /// animation stamps and idle clock are shifted forward by this pause so
     /// the frozen splash art resumes instead of snapping ahead.
     launcher_home_pause: Option<Instant>,
@@ -613,11 +613,11 @@ pub struct App {
     launcher_file_dialog_open: bool,
     /// After open / hide: ignore reopen until a debounced full release.
     chord_release_gate: ChordReleaseGate,
-    /// Face-button release latch after the hub closes on Circle/Cross. The
-    /// hub consumed the press; without this the same hold reaches the app
+    /// Face-button release latch after Home closes on Circle/Cross. The
+    /// Home consumed the press; without this the same hold reaches the app
     /// underneath and dismisses its popup/window. Time-bounded so a missed
     /// release sample can never wedge pad input.
-    hub_face_latch_until: Option<Instant>,
+    home_face_latch_until: Option<Instant>,
     /// When Launcher was last revealed (unfocus grace).
     launcher_revealed_at: Option<Instant>,
     gesture_detectors: GestureDetectorBank,
@@ -681,7 +681,7 @@ pub struct App {
     nav_not_ready_warned: bool,
     /// When the start window was opened (for not-ready timing).
     launcher_opened_at: Option<Instant>,
-    /// Last applied start-screen selection (restart restores, row rebuilds
+    /// Last applied launcher selection (restart restores, row rebuilds
     /// re-pin by key while the restore settle window is fresh).
     launcher_selection_shadow: Option<crate::session::LauncherSelection>,
     /// Renderer prefs at boot (AA/vsync are boot-only iced settings).
@@ -891,7 +891,7 @@ impl App {
             let _ = (&boot_url, initial_page);
             None
         };
-        let install_limit = session.prefs.app_download_limit_kbps;
+        let install_limit = session.prefs.apps_download_limit_kbps;
         let mut app = Self {
             session,
             games,
@@ -967,13 +967,13 @@ impl App {
             browser_window_size: None,
             browser_pending_show: false,
             browser_backdrop_fade: None,
-            hub_window: None,
-            hub_visible: false,
-            hub_stage: (crate::ui::hub::HUB_WIDTH, crate::ui::hub::HUB_HEIGHT),
-            hub_pending_show: false,
-            hub_shell_anim: None,
-            hub_monitor_cover: None,
-            hub_state: crate::ui::hub::State::default(),
+            home_window: None,
+            home_visible: false,
+            home_stage: (crate::ui::home::HOME_WIDTH, crate::ui::home::HOME_HEIGHT),
+            home_pending_show: false,
+            home_shell_anim: None,
+            home_monitor_cover: None,
+            home_state: crate::ui::home::State::default(),
             launcher_close_armed: false,
             last_start_paint_at: std::cell::Cell::new(None),
             last_start_paint_active: std::cell::Cell::new(false),
@@ -984,7 +984,7 @@ impl App {
                 ..Default::default()
             },
             install_policy: installs::AppInstallPolicy::new(install_limit),
-            hub: hub::AppHub::new(),
+            home_apps: home::HomeApps::new(),
             launcher_monitor_cover: None,
             crash_restart_boot,
             launcher_last_activity: Instant::now(),
@@ -993,7 +993,7 @@ impl App {
             launcher_cursor_hidden: false,
             launcher_file_dialog_open: false,
             chord_release_gate: ChordReleaseGate::default(),
-            hub_face_latch_until: None,
+            home_face_latch_until: None,
             launcher_revealed_at: None,
             gesture_detectors: GestureDetectorBank::default(),
             pad_nav: PadNavBank::default(),
@@ -1187,7 +1187,7 @@ impl App {
                         ));
                     }
                 }
-                "hub" => tasks.push(self.open_hub()),
+                "home" => tasks.push(self.open_home()),
                 "browser" => tasks.push(self.open_browser_window()),
                 "launcher" => tasks.push(self.open_launcher()),
                 "launcher-edit" => {
@@ -1215,7 +1215,7 @@ impl App {
         if Some(window) == self.configure_window {
             "Settings".to_string()
         } else if Some(window) == self.launcher_window
-            || Some(window) == self.hub_window
+            || Some(window) == self.home_window
             || Some(window) == self.browser_window
         {
             String::new()
@@ -1310,7 +1310,7 @@ impl App {
 
         subscriptions.push(
             iced::time::every(
-                if self.session.prefs.start_screen_enabled && self.session.controllers.is_empty() {
+                if self.session.prefs.home_enabled && self.session.controllers.is_empty() {
                     PRESENCE_INTERVAL_EMPTY
                 } else {
                     PRESENCE_INTERVAL
@@ -1341,7 +1341,7 @@ impl App {
                 .push(iced::time::every(EMULATOR_COMMIT_POLL).map(|_| Message::EmulatorCommitTick));
         }
 
-        if self.browser_backdrop_fade.is_some() || self.hub_shell_anim.is_some() {
+        if self.browser_backdrop_fade.is_some() || self.home_shell_anim.is_some() {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::ShellFadeTick));
         }
 
@@ -1353,11 +1353,11 @@ impl App {
 
         // The local uninstall is almost instant, but the inline meter still
         // animates while the worker closes and the pointer is dropped.
-        if self.hub_state.uninstalling {
-            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::HubProgressTick));
+        if self.home_state.uninstalling {
+            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::HomeProgressTick));
         }
-        if self.hub_visible && self.hub_state.controller_anim_needs_frames() {
-            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::HubControllerTick));
+        if self.home_visible && self.home_state.controller_anim_needs_frames() {
+            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::HomeControllerTick));
         }
 
         // Transient: animate the reload-button spinner until the queued exit.
@@ -1375,7 +1375,7 @@ impl App {
         }
 
         if self.popup_state.identify_flash_active()
-            || self.hub_state.identify_flash_active()
+            || self.home_state.identify_flash_active()
             || (self.popup_window.is_some() && self.popup_state.entrance_active(Instant::now()))
         {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::IdentifyFrame));
@@ -1384,9 +1384,9 @@ impl App {
         let pad_input_live =
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
         let pad_listening = pad_input_live
-            || self.hub_visible
+            || self.home_visible
             || self.browser_visible
-            || (self.session.prefs.start_screen_enabled && !self.session.controllers.is_empty());
+            || (self.session.prefs.home_enabled && !self.session.controllers.is_empty());
         self.hid_worker.set_input_hot(pad_listening);
         if pad_listening {
             subscriptions.push(Subscription::run_with(
@@ -1401,11 +1401,11 @@ impl App {
             subscriptions.push(Subscription::run_with(engine, engine_event_stream));
         }
 
-        // The hub's full-screen overlay owns the screen; freezing Launcher's
+        // Home's full-screen overlay owns the screen; freezing Launcher's
         // 60Hz clock avoids advance-then-catch-up judder in the dimmed
-        // game art underneath. Frames resume when the hub closes.
+        // game art underneath. Frames resume when Home closes.
         if self.launcher_visible
-            && !self.hub_visible
+            && !self.home_visible
             && (self.launcher_state.needs_frames() || self.steam_scan_in_flight())
         {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::LauncherFrame));
@@ -1434,7 +1434,7 @@ impl App {
             );
         }
 
-        if self.session.prefs.start_screen_enabled {
+        if self.session.prefs.home_enabled {
             subscriptions.push(
                 Subscription::run_with(
                     self.art.clone(),
@@ -1519,34 +1519,34 @@ impl App {
             .map(Message::Browser);
         }
 
-        if Some(window) == self.hub_window {
+        if Some(window) == self.home_window {
             let now = Instant::now();
             let reduced =
                 crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
             let shell = self
-                .hub_shell_anim
+                .home_shell_anim
                 .map(|anim| anim.frame(now, reduced))
-                .unwrap_or_else(crate::ui::hub::ShellFrame::full);
-            let hub = crate::ui::hub::view(
-                &self.hub_state,
+                .unwrap_or_else(crate::ui::home::ShellFrame::full);
+            let home_panel = crate::ui::home::view(
+                &self.home_state,
                 &self.session.prefs.spectrum,
-                self.hub_stage.0,
-                self.hub_stage.1,
+                self.home_stage.0,
+                self.home_stage.1,
                 shell.backdrop_alpha,
                 shell.panel,
                 now,
             )
-            .map(Message::Hub);
-            // Launcher hosts the toast card while its cover is up; the hub
+            .map(Message::Home);
+            // Launcher hosts the toast card while its cover is up; Home
             // overwrites that window with the scrim, so draw the same card in
-            // the hub's full-screen window too. The HWND toast is hidden in
+            // Home's full-screen window too. The HWND toast is hidden in
             // this mode, so there is no duplicate.
-            if self.hub_stage.0 > crate::ui::hub::HUB_WIDTH + 1.0
+            if self.home_stage.0 > crate::ui::home::HOME_WIDTH + 1.0
                 && let Some(toast) = self.immersive_toast_overlay()
             {
-                return stack![hub, toast].width(Fill).height(Fill).into();
+                return stack![home_panel, toast].width(Fill).height(Fill).into();
             }
-            return hub;
+            return home_panel;
         }
 
         if Some(window) == self.launcher_window {
@@ -1643,7 +1643,7 @@ impl App {
         let reduced =
             crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
         self.launcher_state.sync_reduced_motion(reduced);
-        self.hub_state.reduced_motion = reduced;
+        self.home_state.reduced_motion = reduced;
         self.launcher_state
             .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
         // Debug tuning keep-alive follows the local fields (the tuning
@@ -1769,8 +1769,8 @@ impl App {
                 if generation == self.browser.engine_info_generation
                     && let Ok((size, pending)) = result
                 {
-                    self.hub_state.engine_size = (size > 0).then_some(size);
-                    self.hub_state.engine_pending_size = pending;
+                    self.home_state.engine_size = (size > 0).then_some(size);
+                    self.home_state.engine_pending_size = pending;
                 }
                 Task::none()
             }
@@ -1778,19 +1778,19 @@ impl App {
             Message::EngineUninstallDone { generation, result } => {
                 self.on_engine_uninstall_done(generation, result)
             }
-            Message::HubProgressTick => {
-                self.hub_state.advance_progress_anim();
+            Message::HomeProgressTick => {
+                self.home_state.advance_progress_anim();
                 Task::none()
             }
-            Message::HubControllerTick => {
-                self.hub_state.tick_controller_anim(Instant::now());
+            Message::HomeControllerTick => {
+                self.home_state.tick_controller_anim(Instant::now());
                 Task::none()
             }
             Message::WindowSized(id, size) => {
                 if self.browser_window == Some(id) {
                     self.on_browser_window_sized(size)
-                } else if self.hub_window == Some(id) {
-                    self.on_hub_window_sized(size)
+                } else if self.home_window == Some(id) {
+                    self.on_home_window_sized(size)
                 } else {
                     Task::none()
                 }
@@ -1798,8 +1798,8 @@ impl App {
             Message::WindowShowNow(id) => {
                 if self.browser_window == Some(id) {
                     self.on_browser_show_now()
-                } else if self.hub_window == Some(id) {
-                    self.on_hub_show_now()
+                } else if self.home_window == Some(id) {
+                    self.on_home_show_now()
                 } else {
                     Task::none()
                 }
@@ -1815,23 +1815,23 @@ impl App {
                         self.browser_backdrop_fade = None;
                     }
                 }
-                if let Some(anim) = self.hub_shell_anim {
-                    if let Some(id) = self.hub_window {
+                if let Some(anim) = self.home_shell_anim {
+                    if let Some(id) = self.home_window {
                         redraw = redraw.chain(crate::ui::layout::invalidate_window(id));
                     }
                     if anim.done(now) {
                         match anim.dir {
-                            crate::ui::hub::ShellDir::Enter => self.hub_shell_anim = None,
-                            crate::ui::hub::ShellDir::Exit => {
-                                return redraw.chain(self.finish_hub_close(now));
+                            crate::ui::home::ShellDir::Enter => self.home_shell_anim = None,
+                            crate::ui::home::ShellDir::Exit => {
+                                return redraw.chain(self.finish_home_close(now));
                             }
                         }
                     }
                 }
                 redraw
             }
-            Message::HubOpened(id) => self.on_hub_opened(id),
-            Message::Hub(message) => self.on_hub_message(message),
+            Message::HomeOpened(id) => self.on_home_opened(id),
+            Message::Home(message) => self.on_home_message(message),
 
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(id) => {
@@ -1905,7 +1905,7 @@ impl App {
             Message::SteamScanIdleFallback => {
                 // Only when Launcher is off — otherwise LauncherOpened owns the kick
                 // so Scanning/Preparing stay visible on first open.
-                if self.session.prefs.start_screen_enabled {
+                if self.session.prefs.home_enabled {
                     Task::none()
                 } else {
                     self.maybe_kick_deferred_steam_scan()
@@ -1927,7 +1927,7 @@ impl App {
             Message::ToastFrame => self.handle_toast_frame(),
             Message::IdentifyFrame => {
                 self.popup_state.tick_identify_flash();
-                self.hub_state.tick_identify_flash();
+                self.home_state.tick_identify_flash();
                 Task::none()
             }
             // Redraw only: the wall-clock spinner phase advances in `view`.
@@ -1971,10 +1971,10 @@ impl App {
                 let _ = self.close_browser_surface();
             }
             Task::none()
-        } else if Some(id) == self.hub_window {
-            self.hub_window = None;
-            self.hub_visible = false;
-            self.hub_shell_anim = None;
+        } else if Some(id) == self.home_window {
+            self.home_window = None;
+            self.home_visible = false;
+            self.home_shell_anim = None;
             self.resume_launcher_after_home(Instant::now());
             // Return focus to Launcher when it is the app underneath. The toast
             // is AlwaysOnTop, so it stays above a normal-level Launcher without
@@ -2000,8 +2000,8 @@ impl App {
             // scrolls, drafts, browser panel): the next open resumes where
             // it left off. Only the cursor-restore backstop and input
             // re-arming run here. Also covers the OS-close path, which
-            // bypasses `close_start_screen` entirely.
-            // Defensive: an OS-close path bypasses close_start_screen's
+            // bypasses `close_launcher` entirely.
+            // Defensive: an OS-close path bypasses close_launcher's
             // clear_start_activity, so never leak a Hidden interaction into
             // a later window (the force_cursor gate above is the backstop).
             self.set_start_cursor_hidden(false);
@@ -2013,15 +2013,15 @@ impl App {
             // The auto-open latch survives a close so a pending
             // open can retry once presence still qualifies.
             if self.session.auto_open_pending
-                && self.session.prefs.start_screen_enabled
-                && self.session.prefs.start_screen_auto_open.auto_opens()
-                && crate::session::has_hub_presence(
+                && self.session.prefs.home_enabled
+                && self.session.prefs.home_auto_open.auto_opens()
+                && crate::session::has_home_presence(
                     &self.session.controllers,
-                    self.session.prefs.start_screen_auto_open.includes_usb(),
+                    self.session.prefs.home_auto_open.includes_usb(),
                 )
             {
-                crate::controller::hid::diag::diag_info("ui-diag: retry hub open after close");
-                sync.chain(self.open_hub())
+                crate::controller::hid::diag::diag_info("ui-diag: retry home open after close");
+                sync.chain(self.open_home())
             } else {
                 sync
             }
@@ -2064,7 +2064,7 @@ impl App {
                 );
                 Task::none()
             } else {
-                self.close_start_screen()
+                self.close_launcher()
             }
         } else {
             Task::none()
@@ -2198,9 +2198,9 @@ impl App {
     }
 
     fn on_start_frame(&mut self) -> Task<Message> {
-        // A frame queued before the hub opened must not advance/redraw the
+        // A frame queued before Home opened must not advance/redraw the
         // frozen Launcher animation.
-        if self.hub_visible {
+        if self.home_visible {
             return Task::none();
         }
         let now = Instant::now();
@@ -2262,7 +2262,7 @@ impl App {
     ) -> Task<Message> {
         // Keyboard is never pad-originated.
         self.haptic_pad_serial = None;
-        if self.hub_visible {
+        if self.home_visible {
             return Task::none();
         }
         if Some(id) == self.launcher_window && self.launcher_visible {
@@ -2444,7 +2444,7 @@ impl App {
                     .unwrap_or_else(Task::none);
                 let _ = self.toggle_launcher_edit();
                 close_cfg
-                    .chain(self.close_start_screen())
+                    .chain(self.close_launcher())
                     .chain(Task::perform(delay(Duration::from_secs(2)), move |()| next))
             }
         }
@@ -2589,8 +2589,8 @@ impl App {
             return Task::none();
         }
 
-        if self.hub_visible {
-            self.sync_hub_controllers();
+        if self.home_visible {
+            self.sync_home_controllers();
         }
 
         let discovered = self.hid_worker.presence_paths();
@@ -2622,7 +2622,7 @@ impl App {
         let unread_retry = !self.last_discovered.is_empty()
             && self.session.controllers.is_empty()
             && self.last_battery_poll.elapsed()
-                >= if self.session.prefs.start_screen_enabled {
+                >= if self.session.prefs.home_enabled {
                     PRESENCE_INTERVAL_EMPTY
                 } else {
                     UNREAD_RETRY_INTERVAL
@@ -2681,7 +2681,7 @@ impl App {
                     .notify
                     .queue_launch_quiet(self.hid_worker.take_launch_serials());
                 let ctx = crate::session::ApplyContext {
-                    hub_visible: self.hub_visible,
+                    home_visible: self.home_visible,
                     fullscreen: launcher_input::foreground_is_exclusive_fullscreen(),
                     now: Instant::now(),
                     lightbar_enabled: self.claims.is_enabled(),
@@ -2713,31 +2713,31 @@ impl App {
                 }
                 SessionEffect::QueueNotifications {
                     events,
-                    open_start_after_toast,
+                    open_home_after_toast,
                 } => {
-                    tasks.push(self.queue_notifications(events, open_start_after_toast));
+                    tasks.push(self.queue_notifications(events, open_home_after_toast));
                 }
-                SessionEffect::OpenHub => {
+                SessionEffect::OpenHome => {
                     // The reopen chord may fire during the connect-toast
-                    // latch; the toast's own AfterToast::OpenHub still opens
-                    // the hub.
+                    // latch; the toast's own AfterToast::OpenHome still opens
+                    // Home.
                     if self.toast_machine.suppresses_reopen_gesture() {
                         crate::controller::hid::diag::diag_info(
-                            "ui-diag: OpenHub ignored (toast OpenHub pending)",
+                            "ui-diag: OpenHome ignored (toast OpenHome pending)",
                         );
                     } else {
-                        tasks.push(self.open_hub());
+                        tasks.push(self.open_home());
                     }
                 }
-                SessionEffect::CloseHub => {
-                    // Auto-close owns the hub, not a manually opened Launcher.
-                    if self.hub_visible {
-                        tasks.push(self.close_hub());
+                SessionEffect::CloseHome => {
+                    // Auto-close owns Home, not a manually opened Launcher.
+                    if self.home_visible {
+                        tasks.push(self.close_home());
                     } else {
-                        tasks.push(self.close_start_screen());
+                        tasks.push(self.close_launcher());
                     }
                 }
-                SessionEffect::ClearStartLatch => {
+                SessionEffect::ClearHomeLatch => {
                     self.toast_machine.clear_after();
                 }
                 SessionEffect::SaveKnown => {
@@ -2772,17 +2772,17 @@ impl App {
         let pad_input_live =
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
         pad_input_live
-            || self.hub_visible
+            || self.home_visible
             || self.browser_visible
             || (self.launcher_visible
-                && self.session.prefs.start_screen_enabled
+                && self.session.prefs.home_enabled
                 && !self.session.controllers.is_empty())
     }
 
     /// Apply a controller snapshot through the session (used by presence clear + emulate).
     fn apply_controllers(&mut self, controllers: Vec<ControllerStatus>) -> Task<Message> {
         let ctx = crate::session::ApplyContext {
-            hub_visible: self.hub_visible,
+            home_visible: self.home_visible,
             fullscreen: launcher_input::foreground_is_exclusive_fullscreen(),
             now: Instant::now(),
             lightbar_enabled: self.claims.is_enabled(),
@@ -2861,7 +2861,7 @@ impl App {
         if crate::session::should_skip_connect_cooldown_on_power_off(
             &self.session.controllers,
             serial.as_ref(),
-            self.session.prefs.start_screen_auto_open.includes_usb(),
+            self.session.prefs.home_auto_open.includes_usb(),
         ) {
             self.session.mark_skip_connect_cooldown();
         }
@@ -2943,7 +2943,7 @@ impl App {
                     "ui-diag: connect toast suppressed (immersive auto-open)",
                 );
             }
-            let open = self.open_hub();
+            let open = self.open_home();
             // Queue any non-Connected events normally (Low/Charged); Connected is gone.
             for event in events {
                 let eta = self.toast_eta_for(&event);
@@ -2956,8 +2956,8 @@ impl App {
             }
             return open.chain(self.show_next_toast());
         }
-        // Auto-open is toast-first: latch the hub onto the toast settle so
-        // the Connected card always presents (the toast machine emits OpenHub
+        // Auto-open is toast-first: latch Home onto the toast settle so
+        // the Connected card always presents (the toast machine emits OpenHome
         // exactly once — on rest, early dismiss, or slide-out finish).
         for event in events {
             let eta = self.toast_eta_for(&event);
@@ -2965,9 +2965,9 @@ impl App {
                 ToastMessage::from_notification(event, self.session.prefs.spectrum.clone(), eta);
             if open_start_after && message.body == "Connected" {
                 open_start_after = false;
-                message.after = AfterToast::OpenHub;
+                message.after = AfterToast::OpenHome;
                 crate::controller::hid::diag::diag_info(
-                    "ui-diag: defer hub until toast slide settles",
+                    "ui-diag: defer home until toast slide settles",
                 );
             }
             ToastMessage::enqueue(&mut self.toast_queue, message);
@@ -3029,7 +3029,7 @@ struct InputEdgeBindGuard {
 impl Drop for InputEdgeBindGuard {
     fn drop(&mut self) {
         // Idempotent with the `Message::Exit` clear below (clearing an
-        // unbound hub is a no-op).
+        // unbound Home is a no-op).
         self.hub.clear();
     }
 }
@@ -3039,7 +3039,7 @@ impl Drop for InputEdgeBindGuard {
 /// Two transports merge here (see [`EngineHandle`]): frames conflate to the
 /// latest buffered one (paint output is absolute state, like pad
 /// snapshots); control events (title/URL/load/focus/tree/tabs) arrive
-/// lossless and in order. Bind/clear mirrors the pad edge hub.
+/// lossless and in order. Bind/clear mirrors the pad edge Home.
 fn engine_event_stream(engine: &EngineHandle) -> impl Stream<Item = Message> + Send + use<> {
     use iced::futures::StreamExt;
     let engine = engine.clone();
@@ -3137,7 +3137,7 @@ fn presence_hint_stream() -> impl Stream<Item = Message> {
     })
 }
 
-/// Hitch context: the owned input hub snapshot (`InputHub`) is the
+/// Hitch context: the owned input Home snapshot (`InputHub`) is the
 /// single source F7/F8 stamps read from (safe off the UI thread).
 #[cfg(debug_assertions)]
 fn stamp_hitch_report(hub: &InputHub, kind: &str, source: &str, extra: Option<String>) {

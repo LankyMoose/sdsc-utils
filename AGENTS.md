@@ -26,10 +26,10 @@
 ## Branch layout
 
 - `main` — released line.
-- `browser/main` — integration line for the browser + PS hub work: managed-app
-  hub, standalone Browser window, CEF OSR engine. Absorbed the pivot at
+- `browser/main` — integration line for the browser + Home work: managed-app
+  Home, standalone Browser window, CEF OSR engine. Absorbed the pivot at
   `d245777` (also contains the former `browser/multi-app-suspend-spike` /
-  `browser/tabs` work). Plan/handoff: `notes/browser-hub-pivot.md`.
+  `browser/tabs` work). Plan/handoff: `notes/browser-home-pivot.md`.
 - Land changes on `browser/main`; the pivot line and the pre-split snapshot
   branch were removed once the pivot merged.
 
@@ -67,7 +67,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Git hooks** (`git config core.hooksPath .githooks`): pre-commit runs `cargo fmt --all` and re-stages staged `.rs` files; pre-push runs `scripts/ci.sh`. Bypass with `--no-verify`.
 - **CI**: GitHub Actions `ci.yml` runs `bash scripts/ci.sh` on push/PR (fmt → clippy → test → build, debug + release), plus an MSRV-floor job (`cargo +1.89 check --locked --all-targets --no-default-features`) enforcing the `rust-version` claim for UI-only app code (CEF needs the pinned toolchain). CI wires `sccache` + `rust-cache` and installs CMake/Ninja for the CEF wrapper.
 - **Toolchain is pinned**: `rust-toolchain.toml` names the exact compiler for local dev (rustup auto-installs it); `ci.yml` pins the same version explicitly via the dtolnay `toolchain:` input (the action defaults to floating `stable`, it does not follow the file). `rust-version` in `Cargo.toml` (1.89) is only the MSRV floor — never float or "sync" the pins to it. Bump deliberately (both pins → run `scripts/ci.sh` → commit) so new-compiler lints surface in the bump commit, not as surprise CI failures.
-- **Engines**: `cef-engine` is the default feature (CEF OSR). Windows builds use the static MSVC CRT via `.cargo/config.toml` because `libcef_dll_wrapper` is `/MT`. CEF requires CMake + Ninja on `PATH`; its binary distribution downloads to `OUT_DIR` (~427 MB; set `CEF_PATH` to share). `--no-default-features` is the UI-only iteration build (Browser tile shows the engine install state; no reader fallback). The app binary delay-loads `libcef.dll` via `build.rs`, so an install with no engine still starts; the hub catalog can then install CEF and attach it in-process (see `notes/install-qa.md`). Local DLC installs are versioned (`cef-engine-<stamp>` + `cef-engine.current`); uninstall drops the pointer and defers cleanup of the still-mapped directory to the next boot, so reinstall never renames onto a locked `cef-engine\`. Each install carries `engine.json`; the hub fetches `SDSC_CEF_DLC_MANIFEST_URL` on open for version/changelog/update state, install/update is cancellable, and an in-place update takes effect after restart. Hub Settings owns the standalone app-install download cap (live during a download and shared by every managed-app installer) plus UI sound/haptic prefs; `SDSC_MSIX_ENGINE_DIR` mocks the optional package for resolver/managed tests.
+- **Engines**: `cef-engine` is the default feature (CEF OSR). Windows builds use the static MSVC CRT via `.cargo/config.toml` because `libcef_dll_wrapper` is `/MT`. CEF requires CMake + Ninja on `PATH`; its binary distribution downloads to `OUT_DIR` (~427 MB; set `CEF_PATH` to share). `--no-default-features` is the UI-only iteration build (Browser tile shows the engine install state; no reader fallback). The app binary delay-loads `libcef.dll` via `build.rs`, so an install with no engine still starts; the Home catalog can then install CEF and attach it in-process (see `notes/install-qa.md`). Local DLC installs are versioned (`cef-engine-<stamp>` + `cef-engine.current`); uninstall drops the pointer and defers cleanup of the still-mapped directory to the next boot, so reinstall never renames onto a locked `cef-engine\`. Each install carries `engine.json`; Home fetches `SDSC_CEF_DLC_MANIFEST_URL` on open for version/changelog/update state, install/update is cancellable, and an in-place update takes effect after restart. Home Settings owns the standalone app-install download cap (live during a download and shared by every managed-app installer) plus UI sound/haptic prefs; `SDSC_MSIX_ENGINE_DIR` mocks the optional package for resolver/managed tests.
 - **Build speed (single exe, engine default-on)**: `cef-engine` is a default feature — plain `cargo run` builds Chromium OSR. Dev profile keeps debuginfo minimal (`line-tables-only` for our code, none for deps) because link time dominates; don't raise it. For UI-only iteration use `cargo check --no-default-features` (no CEF compile). Recommended locally: `sccache` (`cargo install sccache`, `RUSTC_WRAPPER=sccache`) — first build populates, later ones hit. Batch `Cargo.toml`/profile edits: each set invalidates fingerprints once.
 
 ## Platform-specific notes
@@ -82,7 +82,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 
 | Directory | Typical changes |
 |---|---|
-| `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Launcher / toast, message routing; `browser.rs` (top-level `BrowserAppState`, standalone Browser window, pad/key/`BrowserMessage` routing), `hub.rs` (`AppHub` installed/active apps + PS hub window lifecycle/input) |
+| `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Launcher / toast, message routing; `browser.rs` (top-level `BrowserAppState`, standalone Browser window, pad/key/`BrowserMessage` routing), `home.rs` (`HomeApps` installed/active apps + Home window lifecycle/input) |
 | `src/browser/` | Browser internals: engine seam + CEF OSR worker, DOM target query, controller cursor, tabs/bookmarks, stable frame texture; no reader fallback |
 | `src/session/` | Pure device session (no windows/HWND): presence, notify, analytics, Launcher-open policy; emits `SessionEffect`s the UI applies |
 | `src/controller/` | HID polling + worker (`hid/`), DualSense protocol (`dualsense/`: battery, lightbar, rumble, input, identity), known controllers, debug-only `emulate` emulation |
@@ -90,7 +90,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 | `src/games/` | Steam library scan, game launch, process matching |
 | `src/persist/` | `prefs.json`, `controllers.json`, `analytics.json`, `steam_library.json`, paths |
 | `src/platform/` | Logging, app metadata, autostart, crash-restart, device-arrival watch, file icons, MSIX (`packaged`), UI sounds, wgpu diagnostics, Win32 helpers |
-| `src/ui/` | All iced views + styling: `theme.rs`, `popup/`, `configure/` (Settings), `launcher/` (fullscreen game console), `browser/` (panel state + standalone window view/`BrowserMessage`), `hub/` (PS overlay tiles/selection), `toast/`, `shader/`, `percent_ring.rs`, `layout.rs` (window placement) |
+| `src/ui/` | All iced views + styling: `theme.rs`, `popup/`, `configure/` (Settings), `launcher/` (fullscreen game console), `browser/` (panel state + standalone window view/`BrowserMessage`), `home/` (PS overlay tiles/selection), `toast/`, `shader/`, `percent_ring.rs`, `layout.rs` (window placement) |
 | Tests | Inline `#[cfg(test)] mod tests` next to the code (no `tests/` dir) |
 
 ## Common gotchas for agents
@@ -115,10 +115,10 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Error type** → `src/app_error.rs` (`AppError` + `AppResult`)
 - **Lightbar spectrum editor (Settings)** → `src/ui/configure/spectrum.rs`, `src/ui/configure/mod.rs`
 - **Theme / shared widget styles** → `src/ui/theme.rs`; restyle plan → `notes/ui-refresh.md`
-- **Shared face-button hints / rings** → `src/ui/face/` (`mod.rs` widgets, `ring.rs` SVG rings); used by Launcher, Launcher Settings, and hub controller dock rows
-- **Shared UI sounds / haptics** → `src/app/feedback.rs` (global cue + pref application), `src/platform/ui_sound.rs` (audio worker); hub Settings owns the controls
+- **Shared face-button hints / rings** → `src/ui/face/` (`mod.rs` widgets, `ring.rs` SVG rings); used by Launcher, Launcher Settings, and Home controller dock rows
+- **Shared UI sounds / haptics** → `src/app/feedback.rs` (global cue + pref application), `src/platform/ui_sound.rs` (audio worker); Home Settings owns the controls
 - **Launcher / fullscreen game console** → `src/ui/launcher/` (UI), `src/games/` (Steam scan, launch); behavior → `notes/launcher-immersive.md`
-- **Browser (CEF)** → `src/browser/` (engine seam, `cef_backend.rs`, DOM/cursor, nav helpers) + `src/ui/browser/state.rs` (panel/tabs/chrome) + `src/ui/launcher/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state); PS hub → `src/ui/hub/` + `src/app/hub.rs`; contracts → `notes/browser-embedding.md`; hub/CEF pivot plan → `notes/browser-hub-pivot.md`
+- **Browser (CEF)** → `src/browser/` (engine seam, `cef_backend.rs`, DOM/cursor, nav helpers) + `src/ui/browser/state.rs` (panel/tabs/chrome) + `src/ui/launcher/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state); Home → `src/ui/home/` + `src/app/home.rs`; contracts → `notes/browser-embedding.md`; Home/CEF pivot plan → `notes/browser-home-pivot.md`
 - **Toasts** → `src/ui/toast/` (state machine in `machine.rs`); z-order / remount → `notes/windows-toast.md`
 - **Persisted state (prefs/controllers/analytics)** → `src/persist/`
 - **Single instance, tray lifecycle, crash-restart** → `src/bin/sdsc-utils.rs`, `src/platform/crash_restart.rs`

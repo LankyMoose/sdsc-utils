@@ -47,11 +47,11 @@ Per-OS probe (`motion::system_animations_enabled`): Windows reads the real toggl
   - `theme.rs` tokens: `radius::{SM 8, MD 12, LG 16, XL 20, PILL}`, `type_scale::{CAPTION 11, META 13, BODY 14, TITLE 18, HEADING 24, DISPLAY 32}` (BODY kept at the app's existing 14, not 15), `GLASS_FILL`, `GLASS_HAIRLINE`, `SELECT_WASH`. `glass(radius)` / `glass_row(selected, radius)` are the shared island + row styles; `immersive_island*` delegate. Legacy `RADIUS`/`RADIUS_SM` remain for unconverted chrome.
   - Form-control styles (defined, applied from Phase 1+): `theme::toggle` (iced `toggler`), `theme::slider`, `theme::pick_list` + `theme::pick_list_menu`, `theme::scrollbar`. Launcher settings drawer also uses stock `toggler`/`slider`, so both settings surfaces adopt these together.
   - `src/ui/backdrop.rs`: `backdrop()` / `with_backdrop(content)` — ambient at `FROZEN_TIME` 0.0 (immersive's first frame, breath mid-swing) + vignette `VIGNETTE_STRENGTH` 0.35 (immersive stage uses 0.55). No continuous redraw.
-  - **Shared now:** face-glyph hints live in `src/ui/face/` (message-generic) and are reused by Launcher, Launcher Settings, and the PS hub controller dock rows. Glass *tiers* beyond `GLASS_FILL` get defined in Phase 1 once they can be judged on screen.
+  - **Shared now:** face-glyph hints live in `src/ui/face/` (message-generic) and are reused by Launcher, Launcher Settings, and Home controller dock rows. Glass *tiers* beyond `GLASS_FILL` get defined in Phase 1 once they can be judged on screen.
 - [ ] **1 Window chrome** — drop `framed` outline + header rule; corner strategy per `alpha_composite()`; backdrop + spacing. Stress-test.
 - [ ] **2 Tray popup** — dock-style glass rows (bigger ring, 18px title, muted meta), pin toggle replaces Remember checkbox, quieter actions, empty state, staggered row entrance.
 - [ ] **3 Toasts** — rounded glass card, accent glow instead of 3px rail, optional dwell bar; align with immersive composite toast ([windows-toast.md](windows-toast.md)).
-- [x] **Hub overlay** — full-cover dim scrim, centered compact card,
+- [x] **Home overlay** — full-cover dim scrim, centered compact card,
   icon-first tiles (large glyph + title, no subtitles, no header/X), app
   management grid with per-app Install/Uninstall/Info popup and dimmed
   uninstalled entries. Launcher/Browser are mutually exclusive.

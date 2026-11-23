@@ -73,4 +73,4 @@ Build both locally with `pack-msix.ps1 -CefDir <cef runtime dir>` (see
 [README.md](README.md)). The app currently opens the Store search/product page
 for install; wiring `Windows.Services.Store` with the assigned Store IDs is
 still pending, so Store installs should be completed from the Store UI and the
-hub re-opened (it re-checks the package path on open).
+Home re-opened (it re-checks the package path on open).

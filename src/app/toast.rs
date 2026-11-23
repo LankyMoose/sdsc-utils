@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 impl App {
     pub(crate) fn immersive_hosts_toast(&self) -> bool {
-        self.launcher_visible || self.hub_visible
+        self.launcher_visible || self.home_visible
     }
 
     pub(crate) fn toast_eta_for(&self, event: &NotifyEvent) -> Option<String> {
@@ -211,8 +211,8 @@ impl App {
         let placement = self.toast_placement?;
         let cover = if self.launcher_visible {
             self.launcher_monitor_cover?
-        } else if self.hub_visible {
-            self.hub_monitor_cover?
+        } else if self.home_visible {
+            self.home_monitor_cover?
         } else {
             return None;
         };
@@ -257,7 +257,7 @@ impl App {
                 progress,
                 dismissing,
             } => self.effect_toast_move(progress, dismissing),
-            ToastEffect::OpenHub => self.effect_open_hub(),
+            ToastEffect::OpenHome => self.effect_open_home(),
             ToastEffect::Finished => self.effect_toast_finished(),
             ToastEffect::RaiseInteractive { focus } => self
                 .raise_shell_ui(focus)
@@ -289,18 +289,17 @@ impl App {
         move_window(id, Point::new(placement.x, y))
     }
 
-    pub(crate) fn effect_open_hub(&mut self) -> Task<Message> {
-        if crate::session::should_flush_latched_hub(
+    pub(crate) fn effect_open_home(&mut self) -> Task<Message> {
+        if crate::session::should_flush_latched_home(
             true,
-            self.session.prefs.start_screen_enabled
-                && self.session.prefs.start_screen_auto_open.auto_opens(),
-            self.hub_visible,
+            self.session.prefs.home_enabled && self.session.prefs.home_auto_open.auto_opens(),
+            self.home_visible,
         ) {
-            crate::controller::hid::diag::diag_info("ui-diag: hub open after toast settle");
-            self.open_hub()
+            crate::controller::hid::diag::diag_info("ui-diag: home open after toast settle");
+            self.open_home()
         } else {
             crate::controller::hid::diag::diag_info(
-                "ui-diag: latched hub skipped (disabled or already open)",
+                "ui-diag: latched home skipped (disabled or already open)",
             );
             Task::none()
         }
@@ -345,10 +344,10 @@ impl App {
 
     /// Prefer Settings, then Launcher, then popup as the focused presenting window.
     pub(crate) fn refocus_interactive_ui(&self) -> Task<Message> {
-        // The hub outranks every other shell surface; never steal its focus
+        // Home outranks every other shell surface; never steal its focus
         // back to Launcher/Settings while it is open.
-        if self.hub_visible
-            && let Some(id) = self.hub_window
+        if self.home_visible
+            && let Some(id) = self.home_window
         {
             return focus_window(id);
         }
@@ -373,7 +372,7 @@ impl App {
 
     /// Raise interactive shell UI into the topmost band. The toast is raised
     /// afterwards (see [`Self::raise_toast_above_all`]) so it sits above the
-    /// hub's full-screen scrim.
+    /// Home's full-screen scrim.
     /// Only called when the machine emits RaiseInteractive (Resting / settle).
     /// Hidden warm Launcher must not be raised — that resurfaced Launcher after close.
     /// Immersive cover occludes the toast HWND; see `immersive_toast_overlay`.
@@ -387,8 +386,8 @@ impl App {
         if let Some(id) = self.configure_window {
             task = task.chain(raise_window_topmost(id));
         }
-        if self.hub_visible
-            && let Some(id) = self.hub_window
+        if self.home_visible
+            && let Some(id) = self.home_window
         {
             // Raised last among shell surfaces; the toast goes above it.
             task = task.chain(raise_window_topmost(id));
@@ -400,7 +399,7 @@ impl App {
         }
     }
 
-    /// Re-assert toast topmost after Settings / Launcher / popup / hub open or
+    /// Re-assert toast topmost after Settings / Launcher / popup / Home open or
     /// close. While the toast is Resting, shell UI is raised first; the toast
     /// is always raised last so it stays visible above every shell surface.
     pub(crate) fn sync_toast_zorder(&self) -> Task<Message> {
@@ -415,12 +414,12 @@ impl App {
         task.chain(self.raise_toast_above_all())
     }
 
-    /// A topmost shell was focused: activation can lift the hub/Settings/
+    /// A topmost shell was focused: activation can lift Home/Settings/
     /// popup above a non-activating toast, so re-raise the toast without
     /// stealing focus back. Normal-level Launcher/Browser cannot cover a
     /// topmost toast, so they are ignored.
     pub(crate) fn on_window_focused(&self, id: window::Id) -> Task<Message> {
-        let topmost_shell = Some(id) == self.hub_window
+        let topmost_shell = Some(id) == self.home_window
             || Some(id) == self.configure_window
             || Some(id) == self.popup_window;
         #[cfg(debug_assertions)]
@@ -455,12 +454,12 @@ impl App {
     }
 
     /// Put the toast at the top of the z-order without activating it, so it
-    /// renders above the hub's full-screen scrim. No-op with no toast.
+    /// renders above Home's full-screen scrim. No-op with no toast.
     pub(crate) fn raise_toast_above_all(&self) -> Task<Message> {
         let Some(id) = self.toast_window else {
             return Task::none();
         };
-        // Immersive Launcher (and a hub over it) composites the card; the HWND
+        // Immersive Launcher (and a Home over it) composites the card; the HWND
         // stays blank, so raising it would only put an empty window topmost.
         if self.toast_message.is_none() || self.immersive_hosts_toast() {
             return Task::none();
@@ -503,7 +502,7 @@ impl App {
                 .chain(show_toast_without_activate(id))
                 .chain(invalidate_toast(id));
         }
-        // The toast stays above the shell (including the hub's full-screen
+        // The toast stays above the shell (including Home's full-screen
         // scrim) from the first slide-in frame; no focus theft.
         place
             .chain(self.raise_toast_above_all())

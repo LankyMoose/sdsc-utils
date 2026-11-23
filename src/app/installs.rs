@@ -1,15 +1,15 @@
-//! Hub-owned install policy shared by every managed-app installer.
+//! Home-owned install policy shared by every managed-app installer.
 //!
-//! The standalone hub (not an individual app) owns the download bandwidth cap:
+//! The standalone Home (not an individual app) owns the download bandwidth cap:
 //! it applies to the Browser engine today and to any future app installed from
 //! the same standalone catalog. Installers receive the live [`AtomicU32`]
-//! handle, so changing the cap in hub Settings takes effect at the next chunk
+//! handle, so changing the cap in Home Settings takes effect at the next chunk
 //! boundary even while an install is running.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Download caps offered in hub Settings (`0` = unlimited).
+/// Download caps offered in Home Settings (`0` = unlimited).
 pub const DOWNLOAD_LIMIT_OPTIONS_KBPS: [u32; 4] = [0, 2 * 1024, 5 * 1024, 10 * 1024];
 
 /// Live install policy owned by the shell. Cheap to clone through the shared
@@ -48,7 +48,7 @@ impl Default for AppInstallPolicy {
     }
 }
 
-/// Label for a cap value in hub Settings.
+/// Label for a cap value in Home Settings.
 pub fn download_limit_label(kbps: u32) -> String {
     if kbps == 0 {
         "Unlimited".to_string()

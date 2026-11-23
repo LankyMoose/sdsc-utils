@@ -1,10 +1,9 @@
-//! Managed-app hub: which controller-first apps exist, which one is active,
+//! Managed-app Home: which controller-first apps exist, which one is active,
 //! and the shell effects a transition requires.
 //!
-//! Phase 0 keeps this pure bookkeeping. The topmost PS hub window, app catalog,
-//! and Start registration land in phase 1; the standalone Browser window in
-//! phase 2. Start never appears in `active` yet because it is the shell that
-//! hosts the hub, not a managed sibling — phase 1 makes that explicit.
+//! Home owns the window lifecycle and pad/key routing for the topmost overlay;
+//! this module keeps the installed/active app bookkeeping the shell applies.
+//! Launcher and Browser are the managed apps; Home itself is the shell.
 
 use std::collections::HashSet;
 
@@ -14,11 +13,11 @@ use crate::platform::ui_sound::UiSoundKind;
 /// reflows and persist into future catalog entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppId {
-    Start,
+    Launcher,
     Browser,
 }
 
-/// Shell work required after a hub transition. Order matters: unfocus/hide
+/// Shell work required after a Home transition. Order matters: unfocus/hide
 /// and suspend the outgoing app before showing/focusing/resuming the
 /// incoming one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,27 +39,25 @@ pub enum AppEffect {
 
 /// Installed apps plus foreground/suspend bookkeeping.
 #[derive(Debug)]
-pub struct AppHub {
+pub struct HomeApps {
     installed: HashSet<AppId>,
     active: Option<AppId>,
     suspended: HashSet<AppId>,
 }
 
-impl Default for AppHub {
+impl Default for HomeApps {
     fn default() -> Self {
         Self::new()
     }
 }
 
-// Phase 1 wires install/catalog/suspend-background through the hub window;
-// the pure API lands here first so phase 0 stays behavior-preserving.
+// Install/catalog/suspend-background effects flow through the Home window.
 #[allow(dead_code)]
-impl AppHub {
-    /// Start is always present (it hosts the hub). Browser is always present
-    /// in phase 0 because the reader backend still works without an engine;
-    /// the tile-level install affordance arrives with the engine DLC.
+impl HomeApps {
+    /// Launcher and Browser are both listed. The Browser tile owns the
+    /// engine install affordance when its engine is missing.
     pub fn new() -> Self {
-        let installed = HashSet::from([AppId::Start, AppId::Browser]);
+        let installed = HashSet::from([AppId::Launcher, AppId::Browser]);
         Self {
             installed,
             active: None,
@@ -108,7 +105,7 @@ impl AppHub {
     }
 
     /// Close an app. Closing the active app leaves no foreground app; the
-    /// caller decides whether to return to Start or the hub.
+    /// caller decides whether to return to Launcher or Home.
     pub fn close(&mut self, id: AppId) -> Vec<AppEffect> {
         // Closing tears down runtime state; the app stays installed and can
         // be reopened (browser suspend/resume uses this path). Unknown or
@@ -156,12 +153,12 @@ impl AppHub {
 }
 
 // ---------------------------------------------------------------------------
-// Hub window lifecycle + input (phase 1)
+// Home window lifecycle + input (phase 1)
 // ---------------------------------------------------------------------------
 
 use super::{App, Message};
 use crate::browser::keys::RawKey;
-use crate::ui::hub as hub_view;
+use crate::ui::home as home_view;
 use crate::ui::launcher::gesture::ChordReleaseTick;
 use crate::ui::launcher::input as launcher_input;
 use crate::ui::layout::{
@@ -171,30 +168,30 @@ use iced::{Point, Size, Task, window};
 use std::time::Instant;
 
 impl App {
-    /// Toggle the PS hub from anywhere. PS is the only global shell gesture:
-    /// while the hub is open it closes; otherwise it opens over whatever is
-    /// running (Start, a game, or the desktop).
-    pub(crate) fn toggle_hub(&mut self) -> Task<Message> {
-        if self.hub_visible {
-            self.close_hub()
+    /// Toggle the PS Home from anywhere. PS is the only global shell gesture:
+    /// while Home is open it closes; otherwise it opens over whatever is
+    /// running (Launcher, a game, or the desktop).
+    pub(crate) fn toggle_home(&mut self) -> Task<Message> {
+        if self.home_visible {
+            self.close_home()
         } else {
-            self.open_hub()
+            self.open_home()
         }
     }
 
-    /// Show the topmost hub overlay. Idempotent when already visible.
-    pub(crate) fn open_hub(&mut self) -> Task<Message> {
-        if self.hub_closing() {
+    /// Show the topmost Home overlay. Idempotent when already visible.
+    pub(crate) fn open_home(&mut self) -> Task<Message> {
+        if self.home_closing() {
             return Task::none();
         }
-        if self.hub_visible
-            && let Some(id) = self.hub_window
+        if self.home_visible
+            && let Some(id) = self.home_window
         {
             return focus_window(id).chain(self.sync_toast_zorder());
         }
-        if self.hub_window.is_some() {
+        if self.home_window.is_some() {
             // Close in flight; the next attempt can open once WindowClosed lands.
-            crate::controller::hid::diag::diag_info("ui-diag: hub open skipped (window closing)");
+            crate::controller::hid::diag::diag_info("ui-diag: home open skipped (window closing)");
             return Task::none();
         }
         let cover = primary_monitor_cover().unwrap_or(MonitorCover {
@@ -206,27 +203,27 @@ impl App {
         // The backdrop always covers the monitor; the card scales/centers
         // inside it. On an opaque backend the scrim blends over the opaque
         // clear color instead of the desktop.
-        self.hub_stage = (cover.width, cover.height);
-        self.hub_monitor_cover = Some(cover);
-        self.hub_pending_show = true;
+        self.home_stage = (cover.width, cover.height);
+        self.home_monitor_cover = Some(cover);
+        self.home_pending_show = true;
         if self.launcher_visible {
             self.launcher_home_pause.get_or_insert_with(Instant::now);
         }
         let window_size = Size::new(cover.width, cover.height);
         let window_position = window::Position::Specific(Point::new(cover.x, cover.y));
         self.refresh_engine_status();
-        self.sync_hub_engine_info();
-        self.sync_hub_settings();
-        self.hub_state.on_open(
-            self.session.prefs.start_screen_enabled,
+        self.sync_home_engine_info();
+        self.sync_home_settings();
+        self.home_state.on_open(
+            self.session.prefs.home_enabled,
             self.browser.engine_status.is_ready(),
         );
         // `on_open` resets transient screens; engine info and settings are
         // persistent shell state, so re-apply them after the reset.
-        self.sync_hub_engine_info();
-        self.sync_hub_settings();
-        self.sync_hub_controllers();
-        // The opening PS press must not toggle the hub straight back closed.
+        self.sync_home_engine_info();
+        self.sync_home_settings();
+        self.sync_home_controllers();
+        // The opening PS press must not toggle Home straight back closed.
         self.arm_chord_release_latch();
         let (id, open) = window::open(window::Settings {
             size: window_size,
@@ -244,57 +241,57 @@ impl App {
             platform_specific: overlay_platform_specific(),
             ..window::Settings::default()
         });
-        self.hub_window = Some(id);
-        self.hub_visible = true;
+        self.home_window = Some(id);
+        self.home_visible = true;
         self.session.auto_open_pending = false;
-        crate::controller::hid::diag::diag_info("ui-diag: hub open");
-        open.map(Message::HubOpened)
+        crate::controller::hid::diag::diag_info("ui-diag: home open");
+        open.map(Message::HomeOpened)
             .chain(crate::ui::layout::disable_window_transitions(id))
             .chain(Task::done(Message::WindowShowNow(id)))
             .chain(self.check_engine_manifest())
     }
 
-    /// Begin hiding the hub. The window stays alive (and modal) through the
-    /// exit fade; [`Self::finish_hub_close`] tears it down when the shell
-    /// animation settles. Returns focus to Start when it is the app underneath.
-    pub(crate) fn close_hub(&mut self) -> Task<Message> {
+    /// Begin hiding Home. The window stays alive (and modal) through the
+    /// exit fade; [`Self::finish_home_close`] tears it down when the shell
+    /// animation settles. Returns focus to Launcher when it is the app underneath.
+    pub(crate) fn close_home(&mut self) -> Task<Message> {
         if self
-            .hub_shell_anim
-            .is_some_and(|anim| anim.dir == crate::ui::hub::ShellDir::Exit)
+            .home_shell_anim
+            .is_some_and(|anim| anim.dir == crate::ui::home::ShellDir::Exit)
         {
             return Task::none();
         }
         let now = Instant::now();
-        let Some(id) = self.hub_window else {
-            self.hub_visible = false;
-            self.hub_pending_show = false;
-            self.hub_shell_anim = None;
+        let Some(id) = self.home_window else {
+            self.home_visible = false;
+            self.home_pending_show = false;
+            self.home_shell_anim = None;
             self.resume_launcher_after_home(now);
             return self.rehost_toast_after_composite();
         };
-        if self.hub_pending_show {
+        if self.home_pending_show {
             // Dismissed before the window was shown: nothing to animate.
-            return self.finish_hub_close(now);
+            return self.finish_home_close(now);
         }
-        crate::controller::hid::diag::diag_info("ui-diag: hub close");
+        crate::controller::hid::diag::diag_info("ui-diag: home close");
         let reduced =
             crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
         let from = self
-            .hub_shell_anim
+            .home_shell_anim
             .map(|anim| anim.frame(now, reduced))
-            .unwrap_or_else(crate::ui::hub::ShellFrame::full);
-        self.hub_shell_anim = Some(crate::ui::hub::ShellAnim::exit(now, from));
+            .unwrap_or_else(crate::ui::home::ShellFrame::full);
+        self.home_shell_anim = Some(crate::ui::home::ShellAnim::exit(now, from));
         crate::ui::layout::invalidate_window(id)
     }
 
-    /// Complete a hub close after the exit fade. Owns window teardown, focus
-    /// return, toast rehost, and thawing the Start animation clock.
-    pub(crate) fn finish_hub_close(&mut self, now: Instant) -> Task<Message> {
-        self.hub_shell_anim = None;
-        self.hub_pending_show = false;
-        self.hub_visible = false;
+    /// Complete a Home close after the exit fade. Owns window teardown, focus
+    /// return, toast rehost, and thawing the Launcher animation clock.
+    pub(crate) fn finish_home_close(&mut self, now: Instant) -> Task<Message> {
+        self.home_shell_anim = None;
+        self.home_pending_show = false;
+        self.home_visible = false;
         self.resume_launcher_after_home(now);
-        let Some(id) = self.hub_window.take() else {
+        let Some(id) = self.home_window.take() else {
             return self.rehost_toast_after_composite();
         };
         let task = window::close(id).chain(self.rehost_toast_after_composite());
@@ -311,12 +308,12 @@ impl App {
         task
     }
 
-    pub(crate) fn hub_closing(&self) -> bool {
-        self.hub_shell_anim
-            .is_some_and(|anim| anim.dir == crate::ui::hub::ShellDir::Exit)
+    pub(crate) fn home_closing(&self) -> bool {
+        self.home_shell_anim
+            .is_some_and(|anim| anim.dir == crate::ui::home::ShellDir::Exit)
     }
 
-    /// Shift frozen Start animation/idle stamps across the hub session so the
+    /// Shift frozen Launcher animation/idle stamps across Home session so the
     /// splash art resumes where it left off instead of snapping ahead.
     pub(crate) fn resume_launcher_after_home(&mut self, now: Instant) {
         let Some(paused_at) = self.launcher_home_pause.take() else {
@@ -335,42 +332,42 @@ impl App {
         }
     }
 
-    pub(crate) fn on_hub_opened(&mut self, id: window::Id) -> Task<Message> {
-        // The hub may have been dismissed before the renderer came up; accept
+    pub(crate) fn on_home_opened(&mut self, id: window::Id) -> Task<Message> {
+        // Home may have been dismissed before the renderer came up; accept
         // the open only while it is still the tracked window.
-        if self.hub_window != Some(id) {
+        if self.home_window != Some(id) {
             return Task::none();
         }
-        self.hub_visible = true;
-        crate::controller::hid::diag::diag_info(format!("ui-diag: hub opened id={id:?}"));
+        self.home_visible = true;
+        crate::controller::hid::diag::diag_info(format!("ui-diag: home opened id={id:?}"));
         Task::none()
     }
 
-    pub(crate) fn on_hub_window_sized(&mut self, size: iced::Size) -> Task<Message> {
-        let Some(cover) = self.hub_monitor_cover else {
+    pub(crate) fn on_home_window_sized(&mut self, size: iced::Size) -> Task<Message> {
+        let Some(cover) = self.home_monitor_cover else {
             return Task::none();
         };
         if (size.width - cover.width).abs() > 1.0 || (size.height - cover.height).abs() > 1.0 {
             return Task::none();
         }
-        self.hub_stage = (size.width, size.height);
+        self.home_stage = (size.width, size.height);
         Task::none()
     }
 
-    pub(crate) fn on_hub_show_now(&mut self) -> Task<Message> {
-        self.show_hub_now()
+    pub(crate) fn on_home_show_now(&mut self) -> Task<Message> {
+        self.show_home_now()
     }
 
-    fn show_hub_now(&mut self) -> Task<Message> {
-        if !self.hub_pending_show {
+    fn show_home_now(&mut self) -> Task<Message> {
+        if !self.home_pending_show {
             return Task::none();
         }
-        let Some(id) = self.hub_window else {
+        let Some(id) = self.home_window else {
             return Task::none();
         };
-        self.hub_pending_show = false;
-        self.hub_shell_anim = Some(crate::ui::hub::ShellAnim::enter(Instant::now()));
-        // The hub composites the toast card; keep the HWND hidden so it
+        self.home_pending_show = false;
+        self.home_shell_anim = Some(crate::ui::home::ShellAnim::enter(Instant::now()));
+        // Home composites the toast card; keep the HWND hidden so it
         // cannot sit above the scrim as a blank transparent window.
         let hide_toast = if self.toast_message.is_some() {
             self.toast_window
@@ -385,166 +382,166 @@ impl App {
             .chain(self.sync_toast_zorder())
     }
 
-    pub(crate) fn on_hub_message(&mut self, message: hub_view::HubMessage) -> Task<Message> {
-        use hub_view::HubMessage;
-        if self.hub_closing() {
+    pub(crate) fn on_home_message(&mut self, message: home_view::HomeMessage) -> Task<Message> {
+        use home_view::HomeMessage;
+        if self.home_closing() {
             return Task::none();
         }
         match message {
-            HubMessage::ToggleControllers => {
+            HomeMessage::ToggleControllers => {
                 let now = Instant::now();
-                if self.hub_state.settings_open
-                    || self.hub_state.apps_info.is_some()
-                    || self.hub_state.apps_menu.is_some()
+                if self.home_state.settings_open
+                    || self.home_state.apps_info.is_some()
+                    || self.home_state.apps_menu.is_some()
                 {
                     return Task::none();
                 }
-                if self.hub_state.toggle_dock(now) {
+                if self.home_state.toggle_dock(now) {
                     self.play_ui_cue(UiSoundKind::Slide);
                 }
                 Task::none()
             }
-            HubMessage::ToggleShowAll => {
+            HomeMessage::ToggleShowAll => {
                 self.session.prefs.show_all_controllers = !self.session.prefs.show_all_controllers;
                 self.save_prefs();
-                self.sync_hub_settings();
-                self.sync_hub_controllers();
+                self.sync_home_settings();
+                self.sync_home_controllers();
                 self.play_ui_cue(UiSoundKind::Action);
                 Task::none()
             }
-            HubMessage::MoveX(delta) => {
+            HomeMessage::MoveX(delta) => {
                 if delta != 0 {
                     self.play_ui_cue(UiSoundKind::Nav);
                 }
-                if self.hub_state.apps_info.is_some() {
+                if self.home_state.apps_info.is_some() {
                     // Info owns the screen; movement scrolls the changelog.
                     return iced::widget::operation::scroll_by(
-                        hub_view::info_scroll_id(),
+                        home_view::info_scroll_id(),
                         iced::widget::operation::AbsoluteOffset {
                             x: 0.0,
                             y: 56.0 * delta as f32,
                         },
                     );
-                } else if self.hub_state.settings_open {
-                    return self.hub_settings_adjust(delta);
-                } else if self.hub_state.apps_menu.is_some() {
-                    self.hub_state.apps_menu_move(delta);
+                } else if self.home_state.settings_open {
+                    return self.home_settings_adjust(delta);
+                } else if self.home_state.apps_menu.is_some() {
+                    self.home_state.apps_menu_move(delta);
                 } else {
-                    self.hub_state.move_across(delta);
+                    self.home_state.move_across(delta);
                 }
                 Task::none()
             }
-            HubMessage::MoveY(delta) => {
+            HomeMessage::MoveY(delta) => {
                 if delta != 0 {
                     self.play_ui_cue(UiSoundKind::Nav);
                 }
-                if self.hub_state.apps_info.is_some() {
+                if self.home_state.apps_info.is_some() {
                     return iced::widget::operation::scroll_by(
-                        hub_view::info_scroll_id(),
+                        home_view::info_scroll_id(),
                         iced::widget::operation::AbsoluteOffset {
                             x: 0.0,
                             y: 56.0 * delta as f32,
                         },
                     );
-                } else if self.hub_state.settings_open {
-                    self.hub_state.settings_move(delta);
-                } else if self.hub_state.apps_menu.is_some() {
-                    self.hub_state.apps_menu_move(delta);
-                } else if self.hub_state.focus == hub_view::HubFocus::Controllers {
+                } else if self.home_state.settings_open {
+                    self.home_state.settings_move(delta);
+                } else if self.home_state.apps_menu.is_some() {
+                    self.home_state.apps_menu_move(delta);
+                } else if self.home_state.focus == home_view::HomeFocus::Controllers {
                     // The restored dock is a vertical list: Up/Down (and the
                     // keyboard arrows) move the controller selection.
-                    self.hub_state.move_across(delta);
+                    self.home_state.move_across(delta);
                 }
                 Task::none()
             }
-            HubMessage::SettingsToggle => {
+            HomeMessage::SettingsToggle => {
                 self.play_ui_cue(UiSoundKind::Action);
-                if self.hub_state.settings_open {
-                    self.hub_state.close_settings();
+                if self.home_state.settings_open {
+                    self.home_state.close_settings();
                 } else {
-                    self.hub_state.open_settings();
-                    self.sync_hub_settings();
+                    self.home_state.open_settings();
+                    self.sync_home_settings();
                 }
                 Task::none()
             }
-            HubMessage::PowerOff => self.hub_power_off_selected(),
-            HubMessage::AppsMenuOpen(index) => {
+            HomeMessage::PowerOff => self.home_power_off_selected(),
+            HomeMessage::AppsMenuOpen(index) => {
                 self.play_ui_cue(UiSoundKind::Action);
-                self.hub_state.open_apps_menu(index);
+                self.home_state.open_apps_menu(index);
                 Task::none()
             }
-            HubMessage::AppsMenuMove(delta) => {
-                self.hub_state.apps_menu_move(delta);
+            HomeMessage::AppsMenuMove(delta) => {
+                self.home_state.apps_menu_move(delta);
                 Task::none()
             }
-            HubMessage::AppsMenuConfirm => self.apps_menu_confirm(),
-            HubMessage::AppsMenuClose => {
-                self.hub_state.close_apps_menu();
+            HomeMessage::AppsMenuConfirm => self.apps_menu_confirm(),
+            HomeMessage::AppsMenuClose => {
+                self.home_state.close_apps_menu();
                 Task::none()
             }
-            HubMessage::Confirm => {
-                if self.hub_state.apps_info.is_some() {
-                    self.hub_state.close_app_info();
+            HomeMessage::Confirm => {
+                if self.home_state.apps_info.is_some() {
+                    self.home_state.close_app_info();
                     Task::none()
-                } else if self.hub_state.settings_open {
-                    self.hub_settings_confirm()
-                } else if self.hub_state.apps_menu.is_some() {
+                } else if self.home_state.settings_open {
+                    self.home_settings_confirm()
+                } else if self.home_state.apps_menu.is_some() {
                     self.apps_menu_confirm()
-                } else if self.hub_state.focus == hub_view::HubFocus::Controllers {
-                    self.hub_identify_selected()
+                } else if self.home_state.focus == home_view::HomeFocus::Controllers {
+                    self.home_identify_selected()
                 } else {
-                    self.hub_activate()
+                    self.home_activate()
                 }
             }
-            HubMessage::Close => {
-                if self.hub_state.apps_info.is_some() {
-                    self.hub_state.close_app_info();
+            HomeMessage::Close => {
+                if self.home_state.apps_info.is_some() {
+                    self.home_state.close_app_info();
                     Task::none()
-                } else if self.hub_state.settings_open {
-                    self.hub_state.close_settings();
+                } else if self.home_state.settings_open {
+                    self.home_state.close_settings();
                     Task::none()
-                } else if self.hub_state.apps_menu.is_some() {
-                    self.hub_state.close_apps_menu();
+                } else if self.home_state.apps_menu.is_some() {
+                    self.home_state.close_apps_menu();
                     Task::none()
-                } else if self.hub_state.collapse_dock(Instant::now()) {
+                } else if self.home_state.collapse_dock(Instant::now()) {
                     self.play_ui_cue(UiSoundKind::Slide);
                     Task::none()
-                } else if self.hub_state.installing && !self.hub_state.cancelling {
+                } else if self.home_state.installing && !self.home_state.cancelling {
                     self.cancel_engine_install()
                 } else {
-                    self.close_hub()
+                    self.close_home()
                 }
             }
         }
     }
 
     fn apps_menu_confirm(&mut self) -> Task<Message> {
-        let Some(action) = self.hub_state.apps_menu_action() else {
+        let Some(action) = self.home_state.apps_menu_action() else {
             return Task::none();
         };
         self.apps_menu_action(action)
     }
 
-    fn apps_menu_action(&mut self, action: hub_view::AppAction) -> Task<Message> {
-        let Some(index) = self.hub_state.apps_menu else {
+    fn apps_menu_action(&mut self, action: home_view::AppAction) -> Task<Message> {
+        let Some(index) = self.home_state.apps_menu else {
             return Task::none();
         };
         self.play_ui_cue(UiSoundKind::Action);
         match action {
-            hub_view::AppAction::Install | hub_view::AppAction::Update => {
-                self.hub_state.close_apps_menu();
+            home_view::AppAction::Install | home_view::AppAction::Update => {
+                self.home_state.close_apps_menu();
                 self.start_engine_install()
             }
-            hub_view::AppAction::Cancel => {
-                self.hub_state.close_apps_menu();
+            home_view::AppAction::Cancel => {
+                self.home_state.close_apps_menu();
                 self.cancel_engine_install()
             }
-            hub_view::AppAction::Uninstall => {
-                self.hub_state.close_apps_menu();
+            home_view::AppAction::Uninstall => {
+                self.home_state.close_apps_menu();
                 self.start_engine_uninstall()
             }
-            hub_view::AppAction::Info => {
-                self.hub_state.show_app_info(index);
+            home_view::AppAction::Info => {
+                self.home_state.show_app_info(index);
                 #[cfg(feature = "cef-engine")]
                 {
                     self.load_engine_info_sizes()
@@ -557,22 +554,22 @@ impl App {
         }
     }
 
-    /// Copy the live prefs into the hub settings screen.
-    fn sync_hub_settings(&mut self) {
+    /// Copy the live prefs into Home settings screen.
+    fn sync_home_settings(&mut self) {
         // Store-managed builds download through the Store; the local cap is a
-        // standalone-hub policy shared by every managed-app installer.
+        // standalone-Home policy shared by every managed-app installer.
         self.install_policy
-            .set(self.session.prefs.app_download_limit_kbps);
-        self.hub_state.set_settings(
-            self.session.prefs.start_screen_sounds_enabled,
-            self.session.prefs.start_screen_sound_volume,
-            self.session.prefs.start_screen_haptics_enabled,
-            self.session.prefs.start_screen_haptics_strength,
+            .set(self.session.prefs.apps_download_limit_kbps);
+        self.home_state.set_settings(
+            self.session.prefs.ui_sounds_enabled,
+            self.session.prefs.ui_sound_volume,
+            self.session.prefs.ui_haptics_enabled,
+            self.session.prefs.ui_haptics_strength,
             self.install_policy.limit(),
         );
-        self.hub_state.show_all_controllers = self.session.prefs.show_all_controllers;
-        self.hub_state.download_cap_available = !crate::platform::packaged::is_packaged();
-        self.hub_state.clamp_settings_focus();
+        self.home_state.show_all_controllers = self.session.prefs.show_all_controllers;
+        self.home_state.download_cap_available = !crate::platform::packaged::is_packaged();
+        self.home_state.clamp_settings_focus();
     }
 
     fn next_ten_percent(value: u8) -> u8 {
@@ -587,39 +584,38 @@ impl App {
         (i16::from(value) + delta.signum() as i16 * 5).clamp(0, 100) as u8
     }
 
-    /// Confirm the focused hub settings row. Toggles flip, the download
+    /// Confirm the focused Home settings row. Toggles flip, the download
     /// choice advances, and sliders take a coarse step; Left/Right does the
     /// fine adjustment without a mouse.
-    fn hub_settings_confirm(&mut self) -> Task<Message> {
-        match self.hub_state.settings_focus {
-            hub_view::SETTINGS_SOUNDS => {
-                let enabled = !self.session.prefs.start_screen_sounds_enabled;
+    fn home_settings_confirm(&mut self) -> Task<Message> {
+        match self.home_state.settings_focus {
+            home_view::SETTINGS_SOUNDS => {
+                let enabled = !self.session.prefs.ui_sounds_enabled;
                 let task = self.apply_ui_sounds(enabled);
-                self.sync_hub_settings();
+                self.sync_home_settings();
                 task
             }
-            hub_view::SETTINGS_VOLUME => {
-                let volume = Self::next_ten_percent(self.session.prefs.start_screen_sound_volume);
+            home_view::SETTINGS_VOLUME => {
+                let volume = Self::next_ten_percent(self.session.prefs.ui_sound_volume);
                 let task = self.apply_ui_sound_volume(volume);
-                self.sync_hub_settings();
+                self.sync_home_settings();
                 task
             }
-            hub_view::SETTINGS_HAPTICS => {
-                let enabled = !self.session.prefs.start_screen_haptics_enabled;
+            home_view::SETTINGS_HAPTICS => {
+                let enabled = !self.session.prefs.ui_haptics_enabled;
                 let task = self.apply_ui_haptics(enabled);
-                self.sync_hub_settings();
+                self.sync_home_settings();
                 task
             }
-            hub_view::SETTINGS_STRENGTH => {
-                let strength =
-                    Self::next_ten_percent(self.session.prefs.start_screen_haptics_strength);
+            home_view::SETTINGS_STRENGTH => {
+                let strength = Self::next_ten_percent(self.session.prefs.ui_haptics_strength);
                 let task = self.apply_ui_haptics_strength(strength);
-                self.sync_hub_settings();
+                self.sync_home_settings();
                 task
             }
-            hub_view::SETTINGS_DOWNLOAD => {
+            home_view::SETTINGS_DOWNLOAD => {
                 let limit = crate::app::installs::step_download_limit(
-                    self.session.prefs.app_download_limit_kbps,
+                    self.session.prefs.apps_download_limit_kbps,
                     1,
                 );
                 self.apply_install_download_limit(limit);
@@ -629,22 +625,22 @@ impl App {
         }
     }
 
-    /// Left/Right adjustment for the focused hub settings row.
-    fn hub_settings_adjust(&mut self, delta: i32) -> Task<Message> {
+    /// Left/Right adjustment for the focused Home settings row.
+    fn home_settings_adjust(&mut self, delta: i32) -> Task<Message> {
         if delta == 0 {
             return Task::none();
         }
-        let task = match self.hub_state.settings_focus {
-            hub_view::SETTINGS_SOUNDS => {
+        let task = match self.home_state.settings_focus {
+            home_view::SETTINGS_SOUNDS => {
                 let want_on = delta > 0;
-                if self.session.prefs.start_screen_sounds_enabled != want_on {
+                if self.session.prefs.ui_sounds_enabled != want_on {
                     self.apply_ui_sounds(want_on)
                 } else {
                     Task::none()
                 }
             }
-            hub_view::SETTINGS_VOLUME => {
-                let current = self.session.prefs.start_screen_sound_volume;
+            home_view::SETTINGS_VOLUME => {
+                let current = self.session.prefs.ui_sound_volume;
                 let next = Self::step_percent(current, delta);
                 if next != current {
                     self.apply_ui_sound_volume(next)
@@ -652,16 +648,16 @@ impl App {
                     Task::none()
                 }
             }
-            hub_view::SETTINGS_HAPTICS => {
+            home_view::SETTINGS_HAPTICS => {
                 let want_on = delta > 0;
-                if self.session.prefs.start_screen_haptics_enabled != want_on {
+                if self.session.prefs.ui_haptics_enabled != want_on {
                     self.apply_ui_haptics(want_on)
                 } else {
                     Task::none()
                 }
             }
-            hub_view::SETTINGS_STRENGTH => {
-                let current = self.session.prefs.start_screen_haptics_strength;
+            home_view::SETTINGS_STRENGTH => {
+                let current = self.session.prefs.ui_haptics_strength;
                 let next = Self::step_percent(current, delta);
                 if next != current {
                     self.apply_ui_haptics_strength(next)
@@ -669,9 +665,9 @@ impl App {
                     Task::none()
                 }
             }
-            hub_view::SETTINGS_DOWNLOAD => {
+            home_view::SETTINGS_DOWNLOAD => {
                 let limit = crate::app::installs::step_download_limit(
-                    self.session.prefs.app_download_limit_kbps,
+                    self.session.prefs.apps_download_limit_kbps,
                     delta,
                 );
                 self.apply_install_download_limit(limit);
@@ -679,58 +675,58 @@ impl App {
             }
             _ => Task::none(),
         };
-        self.sync_hub_settings();
+        self.sync_home_settings();
         task
     }
 
-    /// Update the hub-owned install cap, persist it, and publish the live
+    /// Update Home-owned install cap, persist it, and publish the live
     /// value to any in-flight installer (including a running engine download).
     fn apply_install_download_limit(&mut self, limit_kbps: u32) {
-        self.session.prefs.app_download_limit_kbps = limit_kbps;
+        self.session.prefs.apps_download_limit_kbps = limit_kbps;
         self.save_prefs();
         self.install_policy.set(limit_kbps);
-        self.sync_hub_settings();
+        self.sync_home_settings();
     }
 
-    /// Activate the highlighted tile. The hub closes first so the target app
+    /// Activate the highlighted tile. Home closes first so the target app
     /// comes forward without a topmost cover left behind.
-    fn hub_activate(&mut self) -> Task<Message> {
-        match self.hub_state.selected_tile() {
-            hub_view::HubTile::Start => {
-                if !self.session.prefs.start_screen_enabled {
+    fn home_activate(&mut self) -> Task<Message> {
+        match self.home_state.selected_tile() {
+            home_view::HomeTile::Launcher => {
+                if !self.session.prefs.home_enabled {
                     crate::controller::hid::diag::diag_info(
-                        "ui-diag: hub Start selected but start screen disabled",
+                        "ui-diag: home Launcher selected but home disabled",
                     );
                     return Task::none();
                 }
-                crate::controller::hid::diag::diag_info("ui-diag: hub launch Start");
-                // Start and Browser are exclusive; `open_launcher` closes
-                // the Browser before showing Start.
-                self.close_hub().chain(self.open_launcher())
+                crate::controller::hid::diag::diag_info("ui-diag: home launch Launcher");
+                // Launcher and Browser are exclusive; `open_launcher` closes
+                // the Browser before showing the Launcher.
+                self.close_home().chain(self.open_launcher())
             }
-            hub_view::HubTile::Browser => {
+            home_view::HomeTile::Browser => {
                 if self.browser.engine.is_none() {
                     crate::controller::hid::diag::diag_info(
-                        "ui-diag: hub Browser requested but engine not installed",
+                        "ui-diag: home Browser requested but engine not installed",
                     );
-                    self.hub_state.open_apps_menu(0);
+                    self.home_state.open_apps_menu(0);
                     return Task::none();
                 }
-                crate::controller::hid::diag::diag_info("ui-diag: hub launch Browser");
-                self.close_hub().chain(self.open_browser_window())
+                crate::controller::hid::diag::diag_info("ui-diag: home launch Browser");
+                self.close_home().chain(self.open_browser_window())
             }
         }
     }
 
-    /// Rebuild the hub controller strip from the live session.
-    pub(crate) fn sync_hub_controllers(&mut self) {
+    /// Rebuild Home controller strip from the live session.
+    pub(crate) fn sync_home_controllers(&mut self) {
         let rows = self.controller_rows(self.session.prefs.show_all_controllers);
-        self.hub_state.set_controllers(rows);
+        self.home_state.set_controllers(rows);
     }
 
     /// Identify the focused controller card (Cross).
-    fn hub_identify_selected(&mut self) -> Task<Message> {
-        let Some(row) = self.hub_state.controller_selected() else {
+    fn home_identify_selected(&mut self) -> Task<Message> {
+        let Some(row) = self.home_state.controller_selected() else {
             return Task::none();
         };
         if !row.connected || !row.supports_identify {
@@ -738,15 +734,15 @@ impl App {
         }
         let serial = row.serial.clone();
         if self.identify(&serial) {
-            self.hub_state.begin_identify_flash(&serial);
+            self.home_state.begin_identify_flash(&serial);
             self.play_ui_cue(crate::platform::ui_sound::UiSoundKind::Action);
         }
         Task::none()
     }
 
     /// Triangle hold completed on the focused Bluetooth pad.
-    fn hub_power_off_selected(&mut self) -> Task<Message> {
-        let Some(row) = self.hub_state.controller_selected() else {
+    fn home_power_off_selected(&mut self) -> Task<Message> {
+        let Some(row) = self.home_state.controller_selected() else {
             return Task::none();
         };
         if !row.show_power_off() {
@@ -754,22 +750,22 @@ impl App {
         }
         let serial = row.serial.clone();
         self.play_ui_cue(crate::platform::ui_sound::UiSoundKind::Hold);
-        self.hub_state.powering_off = Some(serial.clone());
+        self.home_state.powering_off = Some(serial.clone());
         self.power_off(&serial);
         Task::none()
     }
 
-    /// Pad tick while the hub is the modal owner. Only the chord (close) and
+    /// Pad tick while Home is the modal owner. Only the chord (close) and
     /// selection/confirm are live; the app underneath gets nothing.
-    pub(crate) fn on_hub_pad(&mut self, readings: &[launcher_input::NavReading]) -> Task<Message> {
-        if self.hub_closing() || readings.is_empty() {
+    pub(crate) fn on_home_pad(&mut self, readings: &[launcher_input::NavReading]) -> Task<Message> {
+        if self.home_closing() || readings.is_empty() {
             return Task::none();
         }
-        self.sync_hub_controllers();
-        self.hub_state.tick_identify_flash();
-        if self.hub_chord_fires(readings) {
-            crate::controller::hid::diag::diag_info("ui-diag: hub chord close");
-            return self.close_hub();
+        self.sync_home_controllers();
+        self.home_state.tick_identify_flash();
+        if self.home_chord_fires(readings) {
+            crate::controller::hid::diag::diag_info("ui-diag: home chord close");
+            return self.close_home();
         }
         let Some(reading) = crate::domain::pad::preferred_reading(readings) else {
             return Task::none();
@@ -780,63 +776,63 @@ impl App {
         let previous_haptic = self.haptic_pad_serial.take();
         self.set_haptic_pad_from_id(Some(&reading.id));
         let mut task = Task::none();
-        if let Some(message) = self.hub_state.pad_tick(&reading.sample, Instant::now()) {
+        if let Some(message) = self.home_state.pad_tick(&reading.sample, Instant::now()) {
             let face_held = reading.sample.cross
                 || reading.sample.circle
                 || reading.sample.square
                 || reading.sample.triangle;
-            if message == hub_view::HubMessage::Close && face_held {
-                // The hub consumed this press; keep the underlying app from
+            if message == home_view::HomeMessage::Close && face_held {
+                // Home consumed this press; keep the underlying app from
                 // seeing the same hold as a fresh Cancel/Confirm edge. The
                 // latch is time-bounded so a missed release sample cannot
                 // wedge pad input.
-                self.hub_face_latch_until =
+                self.home_face_latch_until =
                     Some(Instant::now() + std::time::Duration::from_millis(1000));
             }
-            task = self.on_hub_message(message);
+            task = self.on_home_message(message);
         }
         self.haptic_pad_serial = previous_haptic;
         task
     }
 
-    /// Keyboard while the hub window has focus.
-    pub(crate) fn on_hub_key(&mut self, raw: RawKey) -> Task<Message> {
-        if !raw.pressed || self.hub_closing() {
+    /// Keyboard while Home window has focus.
+    pub(crate) fn on_home_key(&mut self, raw: RawKey) -> Task<Message> {
+        if !raw.pressed || self.home_closing() {
             return Task::none();
         }
         use iced::keyboard::Key;
         use iced::keyboard::key::Named;
         let message = match raw.key {
-            Key::Named(Named::ArrowLeft) => Some(hub_view::HubMessage::MoveX(-1)),
-            Key::Named(Named::ArrowRight) => Some(hub_view::HubMessage::MoveX(1)),
-            Key::Named(Named::ArrowUp) => Some(hub_view::HubMessage::MoveY(-1)),
-            Key::Named(Named::ArrowDown) => Some(hub_view::HubMessage::MoveY(1)),
+            Key::Named(Named::ArrowLeft) => Some(home_view::HomeMessage::MoveX(-1)),
+            Key::Named(Named::ArrowRight) => Some(home_view::HomeMessage::MoveX(1)),
+            Key::Named(Named::ArrowUp) => Some(home_view::HomeMessage::MoveY(-1)),
+            Key::Named(Named::ArrowDown) => Some(home_view::HomeMessage::MoveY(1)),
             Key::Named(Named::Enter) | Key::Named(Named::Space) => {
-                Some(hub_view::HubMessage::Confirm)
+                Some(home_view::HomeMessage::Confirm)
             }
-            Key::Named(Named::Tab) => Some(hub_view::HubMessage::SettingsToggle),
-            Key::Named(Named::Escape) => Some(hub_view::HubMessage::Close),
+            Key::Named(Named::Tab) => Some(home_view::HomeMessage::SettingsToggle),
+            Key::Named(Named::Escape) => Some(home_view::HomeMessage::Close),
             _ => None,
         };
         match message {
             Some(message) => {
                 self.note_launcher_activity();
-                self.on_hub_message(message)
+                self.on_home_message(message)
             }
             None => Task::none(),
         }
     }
 
-    /// Shared PS chord detector for the hub. Mirrors the Start-era toggle:
+    /// Shared PS chord detector for Home. Mirrors the Launcher-era toggle:
     /// a rising chord fires once, and the release gate swallows the sticky
-    /// hold that opened the hub.
-    pub(crate) fn hub_chord_fires(&mut self, readings: &[launcher_input::NavReading]) -> bool {
+    /// hold that opened Home.
+    pub(crate) fn home_chord_fires(&mut self, readings: &[launcher_input::NavReading]) -> bool {
         let required = crate::ui::launcher::gesture::default_gesture();
         let chord_held = super::chord_held_on_any_pad(&required, readings);
         let now = Instant::now();
         let (tick, glitch) = self.chord_release_gate.tick(chord_held, now);
         if glitch {
-            crate::controller::hid::diag::diag_info("ui-diag: hub chord glitch ignored");
+            crate::controller::hid::diag::diag_info("ui-diag: home chord glitch ignored");
         }
         match tick {
             ChordReleaseTick::Blocked => {
@@ -860,16 +856,16 @@ mod tests {
 
     #[test]
     fn both_phase0_apps_are_installed() {
-        let hub = AppHub::new();
-        assert!(hub.is_installed(AppId::Start));
-        assert!(hub.is_installed(AppId::Browser));
-        assert_eq!(hub.active(), None);
+        let apps = HomeApps::new();
+        assert!(apps.is_installed(AppId::Launcher));
+        assert!(apps.is_installed(AppId::Browser));
+        assert_eq!(apps.active(), None);
     }
 
     #[test]
     fn first_open_shows_and_resumes() {
-        let mut hub = AppHub::new();
-        let fx = hub.open(AppId::Browser);
+        let mut apps = HomeApps::new();
+        let fx = apps.open(AppId::Browser);
         assert_eq!(
             fx,
             vec![
@@ -881,15 +877,15 @@ mod tests {
                 AppEffect::Resume(AppId::Browser),
             ]
         );
-        assert_eq!(hub.active(), Some(AppId::Browser));
-        assert!(!hub.is_suspended(AppId::Browser));
+        assert_eq!(apps.active(), Some(AppId::Browser));
+        assert!(!apps.is_suspended(AppId::Browser));
     }
 
     #[test]
     fn opening_another_suspends_the_first() {
-        let mut hub = AppHub::new();
-        let _ = hub.open(AppId::Browser);
-        let fx = hub.open(AppId::Start);
+        let mut apps = HomeApps::new();
+        let _ = apps.open(AppId::Browser);
+        let fx = apps.open(AppId::Launcher);
         assert_eq!(
             fx,
             vec![
@@ -899,31 +895,31 @@ mod tests {
                 },
                 AppEffect::Hide(AppId::Browser),
                 AppEffect::Suspend(AppId::Browser),
-                AppEffect::Show(AppId::Start),
+                AppEffect::Show(AppId::Launcher),
                 AppEffect::SetFocused {
-                    id: AppId::Start,
+                    id: AppId::Launcher,
                     focused: true
                 },
-                AppEffect::Resume(AppId::Start),
+                AppEffect::Resume(AppId::Launcher),
             ]
         );
-        assert!(hub.is_suspended(AppId::Browser));
-        assert!(!hub.is_suspended(AppId::Start));
-        assert_eq!(hub.active(), Some(AppId::Start));
+        assert!(apps.is_suspended(AppId::Browser));
+        assert!(!apps.is_suspended(AppId::Launcher));
+        assert_eq!(apps.active(), Some(AppId::Launcher));
     }
 
     #[test]
     fn reopen_active_is_noop() {
-        let mut hub = AppHub::new();
-        let _ = hub.open(AppId::Browser);
-        assert!(hub.open(AppId::Browser).is_empty());
+        let mut apps = HomeApps::new();
+        let _ = apps.open(AppId::Browser);
+        assert!(apps.open(AppId::Browser).is_empty());
     }
 
     #[test]
     fn close_active_clears_foreground_and_emits_close() {
-        let mut hub = AppHub::new();
-        let _ = hub.open(AppId::Browser);
-        let fx = hub.close(AppId::Browser);
+        let mut apps = HomeApps::new();
+        let _ = apps.open(AppId::Browser);
+        let fx = apps.close(AppId::Browser);
         assert_eq!(
             fx,
             vec![
@@ -935,27 +931,27 @@ mod tests {
                 AppEffect::Close(AppId::Browser),
             ]
         );
-        assert_eq!(hub.active(), None);
-        assert!(hub.is_installed(AppId::Browser));
-        assert!(hub.close(AppId::Browser).is_empty());
+        assert_eq!(apps.active(), None);
+        assert!(apps.is_installed(AppId::Browser));
+        assert!(apps.close(AppId::Browser).is_empty());
     }
 
     #[test]
     fn suspend_background_is_idempotent() {
-        let mut hub = AppHub::new();
-        let _ = hub.open(AppId::Browser);
-        let fx = hub.suspend_background();
+        let mut apps = HomeApps::new();
+        let _ = apps.open(AppId::Browser);
+        let fx = apps.suspend_background();
         assert_eq!(
             fx,
             vec![
                 AppEffect::SetFocused {
-                    id: AppId::Start,
+                    id: AppId::Launcher,
                     focused: false
                 },
-                AppEffect::Hide(AppId::Start),
-                AppEffect::Suspend(AppId::Start),
+                AppEffect::Hide(AppId::Launcher),
+                AppEffect::Suspend(AppId::Launcher),
             ]
         );
-        assert!(hub.suspend_background().is_empty());
+        assert!(apps.suspend_background().is_empty());
     }
 }

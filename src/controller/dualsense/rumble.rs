@@ -1,4 +1,4 @@
-//! DualSense compatible-vibration (rumble) HID output for start-screen cues.
+//! DualSense compatible-vibration (rumble) HID output for launcher cues.
 //!
 //! Uses a dedicated long-lived output handle (see hid-worker). Does **not** go
 //! through lightbar's exclusive open-write-close path, and never requests the

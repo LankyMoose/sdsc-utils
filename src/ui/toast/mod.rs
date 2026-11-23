@@ -34,7 +34,7 @@ impl ToastMessage {
     ///
     /// A flapping pad otherwise queues `Connected` faster than cards can drain.
     /// Same `(serial, body)` keeps only the newest (fresh percent/eta wins);
-    /// a usurped `AfterToast::OpenHub` transfers to the replacement so the
+    /// a usurped `AfterToast::OpenHome` transfers to the replacement so the
     /// auto-open latch can never be dropped by coalescing. Cards
     /// without a serial (preview / crash) never coalesce.
     pub fn enqueue(queue: &mut VecDeque<ToastMessage>, mut message: ToastMessage) {
@@ -42,13 +42,13 @@ impl ToastMessage {
             let mut latched = false;
             queue.retain(|queued| {
                 let same = queued.serial == message.serial && queued.body == message.body;
-                if same && queued.after == AfterToast::OpenHub {
+                if same && queued.after == AfterToast::OpenHome {
                     latched = true;
                 }
                 !same
             });
             if latched && message.after == AfterToast::Nothing {
-                message.after = AfterToast::OpenHub;
+                message.after = AfterToast::OpenHome;
             }
         }
         queue.push_back(message);
@@ -254,12 +254,12 @@ mod tests {
     fn enqueue_transfers_open_start_latch_to_replacement() {
         let mut queue = std::collections::VecDeque::new();
         let mut latched = queued("aa", "Connected", 15);
-        latched.after = AfterToast::OpenHub;
+        latched.after = AfterToast::OpenHome;
         ToastMessage::enqueue(&mut queue, latched);
         // Unlatched duplicate usurps but must not drop the Launcher latch.
         ToastMessage::enqueue(&mut queue, queued("aa", "Connected", 25));
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].after, AfterToast::OpenHub);
+        assert_eq!(queue[0].after, AfterToast::OpenHome);
         assert_eq!(queue[0].percent(), 25);
     }
 }

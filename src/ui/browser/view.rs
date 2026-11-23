@@ -77,13 +77,13 @@ impl BrowserPanel {
 
 /// Scrollable id for the browser body (pad scroll + `on_scroll` reports).
 pub fn browser_scroll_id() -> iced::widget::Id {
-    iced::widget::Id::new("start-browser-body")
+    iced::widget::Id::new("browser-body")
 }
 
 /// Address field id (URL-edit mode focuses it so typing lands in the box,
 /// not the page).
 pub fn browser_url_id() -> iced::widget::Id {
-    iced::widget::Id::new("start-browser-url")
+    iced::widget::Id::new("browser-url")
 }
 
 /// Pad Up/Down body scroll step.
@@ -213,7 +213,7 @@ pub fn browser_page_view(
             if engine_available {
                 "Rendering…".to_string()
             } else {
-                "Browser engine not installed. Install it from the PS hub.".to_string()
+                "Browser engine not installed. Install it from Home.".to_string()
             }
         }
         None => String::new(),
@@ -280,7 +280,7 @@ fn browser_suggestions(panel: &BrowserPanel) -> Element<'_, BrowserMessage> {
 
 /// Address field id for the star-bubble rename box.
 pub fn bookmark_name_id() -> iced::widget::Id {
-    iced::widget::Id::new("start-bookmark-name")
+    iced::widget::Id::new("bookmark-name")
 }
 
 /// Position one header control inside its fixed-height row layer.

@@ -1,8 +1,8 @@
-//! PS overlay hub: the topmost app switcher. Its window always covers the
+//! PS overlay Home: the topmost app switcher. Its window always covers the
 //! monitor and dims the whole screen behind a centered card; the toast is
 //! composited above that scrim.
 //!
-//! The hub is the auto-open target; Start and Browser are normal-level apps
+//! Home is the auto-open target; Launcher and Browser are normal-level apps
 //! underneath and mutually exclusive. It is modal for pad input while open:
 //! the underlying app keeps its last frame but receives no nav.
 //!
@@ -30,12 +30,12 @@ use iced::{
 };
 use std::time::Instant;
 
-/// Nominal hub card width/height. The card is centered in the full-monitor
-/// window; `HUB_HEIGHT` is only the pre-open stage default.
-pub const HUB_WIDTH: f32 = 500.0;
-pub const HUB_HEIGHT: f32 = 280.0;
+/// Nominal Home card width/height. The card is centered in the full-monitor
+/// window; `HOME_HEIGHT` is only the pre-open stage default.
+pub const HOME_WIDTH: f32 = 500.0;
+pub const HOME_HEIGHT: f32 = 280.0;
 
-/// Main hub section inset (the card itself has no padding).
+/// Main Home section inset (the card itself has no padding).
 const SECTION_PAD_X: f32 = 12.0;
 /// Vertical row inset, kept equal for header/apps/action hints so the
 /// separators read as the same gap throughout the card.
@@ -45,7 +45,7 @@ const TILE_GAP: f32 = 6.0;
 const ICON: f32 = 42.0;
 const TILE_TITLE: f32 = 14.0;
 
-/// Restored Start controllers dock (top-right, vertical). Collapsed shows the
+/// Restored Launcher-style controllers dock (top-right, vertical). Collapsed shows the
 /// battery-ring column; Select/Share (Create) expands it in place.
 const DOCK_RING_INSET: f32 = 6.0;
 const DOCK_RING_MIN: f32 = 52.0;
@@ -58,13 +58,13 @@ const DOCK_HINT_COL_W: f32 = 210.0;
 const DOCK_ANIM_MS: u64 = 220;
 const DOCK_TOP: f32 = 10.0;
 const DOCK_RIGHT: f32 = 16.0;
-/// Hub shell panel entrance/exit. Movement is gated by reduced motion;
+/// Home shell panel entrance/exit. Movement is gated by reduced motion;
 /// opacity always animates.
 pub const PANEL_MS: u64 = 280;
 const PANEL_HIDDEN_SCALE: f32 = 0.96;
 const PANEL_HIDDEN_Y: f32 = 28.0;
 
-/// Resolved visual state for the centered hub card and top-right controllers
+/// Resolved visual state for the centered Home card and top-right controllers
 /// dock during the window shell's entrance/exit.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PanelVisual {
@@ -91,7 +91,7 @@ impl PanelVisual {
     }
 }
 
-/// One sampled frame of the hub shell: panel paint plus the full-screen scrim.
+/// One sampled frame of Home shell: panel paint plus the full-screen scrim.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShellFrame {
     pub panel: PanelVisual,
@@ -120,7 +120,7 @@ pub enum ShellDir {
     Exit,
 }
 
-/// Wall-clock driver for the hub window's entrance/exit. Exit captures the
+/// Wall-clock driver for Home window's entrance/exit. Exit captures the
 /// current frame so closing mid-entrance never pops to full first.
 #[derive(Debug, Clone, Copy)]
 pub struct ShellAnim {
@@ -211,25 +211,25 @@ fn gate_movement(panel: PanelVisual, reduced: bool) -> PanelVisual {
 /// order; message handlers match on identity, never on an index captured in
 /// the UI (the catalog may grow/reorder later).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HubTile {
-    Start,
+pub enum HomeTile {
+    Launcher,
     Browser,
 }
 
 /// Visible tiles, left to right.
-pub const TILES: [HubTile; 2] = [HubTile::Start, HubTile::Browser];
+pub const TILES: [HomeTile; 2] = [HomeTile::Launcher, HomeTile::Browser];
 
-/// Which row owns the pad highlight on the main hub.
+/// Which row owns the pad highlight on the main Home.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HubFocus {
+pub enum HomeFocus {
     #[default]
     Apps,
     Controllers,
 }
 
-/// What the hub asks the shell to do. Pure data; the App owns windows.
+/// What Home asks the shell to do. Pure data; the App owns windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HubMessage {
+pub enum HomeMessage {
     /// Move within the focused row.
     MoveX(i32),
     /// Switch focus between the apps and controllers rows.
@@ -238,7 +238,7 @@ pub enum HubMessage {
     ToggleControllers,
     /// Toggle Connected / All in the controllers dock footer (Square).
     ToggleShowAll,
-    /// Open/close the hub shell settings screen (Options).
+    /// Open/close Home shell settings screen (Options).
     SettingsToggle,
     /// Triangle hold completed on the focused Bluetooth pad.
     PowerOff,
@@ -251,16 +251,16 @@ pub enum HubMessage {
     Close,
 }
 
-/// One managed app entry. Start is a built-in app and has no install/update
+/// One managed app entry. Launcher is built-in and has no install/update
 /// state, so it deliberately does not appear here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HubApp {
+pub enum ManagedApp {
     Browser,
 }
 
-pub const APPS: [HubApp; 1] = [HubApp::Browser];
+pub const APPS: [ManagedApp; 1] = [ManagedApp::Browser];
 
-impl HubApp {
+impl ManagedApp {
     pub fn title(self) -> &'static str {
         match self {
             Self::Browser => "Browser",
@@ -274,7 +274,7 @@ impl HubApp {
     }
 }
 
-/// Install/uninstall phases shown by the hub. Mirrors the installer's
+/// Install/uninstall phases shown by Home. Mirrors the installer's
 /// progress events without coupling `ui` to the CEF-only module (UI-only
 /// builds compile this).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -374,7 +374,7 @@ impl AppAction {
     }
 }
 
-/// Rows in the hub shell settings screen. The download cap is hub policy for
+/// Rows in Home shell settings screen. The download cap is Home policy for
 /// every standalone install, not a Browser-specific option.
 pub const SETTINGS_ROWS: [&str; 5] = [
     "UI sounds",
@@ -398,7 +398,7 @@ struct IdentifyFlash {
     started: Instant,
 }
 
-/// Peek ↔ expanded controllers dock tween (old Start dock: 220ms ease-out).
+/// Peek ↔ expanded controllers dock tween (old Launcher dock: 220ms ease-out).
 #[derive(Debug, Clone, Copy)]
 struct DockAnim {
     from: f32,
@@ -406,20 +406,20 @@ struct DockAnim {
     started: Instant,
 }
 
-/// Hub render/input state. Selection is an index into [`TILES`]; activation
+/// Home render/input state. Selection is an index into [`TILES`]; activation
 /// resolves it through [`State::selected_tile`].
 #[derive(Debug)]
 pub struct State {
     selected: usize,
     /// Which surface owns the pad input: the apps row, or the expanded
     /// top-right controllers dock.
-    pub focus: HubFocus,
-    /// Whether the Start tile is enabled in prefs. Disabled tiles still show
+    pub focus: HomeFocus,
+    /// Whether the Launcher tile is enabled in prefs. Disabled tiles still show
     /// (stable layout) but Confirm is a no-op.
     pub launcher_enabled: bool,
     /// Engine worker live. Drives the Browser tile state.
     pub engine_ready: bool,
-    /// D-pad/stick repeat for hub movement.
+    /// D-pad/stick repeat for Home movement.
     nav: crate::domain::pad::NavStepper,
     /// Face-button rising-edge latches (Cross confirm, Circle close, Options
     /// settings, Create controllers dock, Triangle actions).
@@ -485,7 +485,7 @@ pub struct State {
     pub engine_managed: bool,
     /// An update is on disk but the old CEF remains loaded until restart.
     pub engine_restart_required: bool,
-    /// Hub shell settings screen.
+    /// Home shell settings screen.
     pub settings_open: bool,
     pub settings_focus: usize,
     pub sound_enabled: bool,
@@ -504,7 +504,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             selected: 0,
-            focus: HubFocus::Apps,
+            focus: HomeFocus::Apps,
             launcher_enabled: true,
             engine_ready: false,
             nav: crate::domain::pad::NavStepper::default(),
@@ -567,7 +567,7 @@ impl State {
         self.selected.min(TILES.len() - 1)
     }
 
-    pub fn selected_tile(&self) -> HubTile {
+    pub fn selected_tile(&self) -> HomeTile {
         TILES[self.selected()]
     }
 
@@ -587,8 +587,8 @@ impl State {
             return;
         }
         match self.focus {
-            HubFocus::Apps => self.move_selection(delta),
-            HubFocus::Controllers => {
+            HomeFocus::Apps => self.move_selection(delta),
+            HomeFocus::Controllers => {
                 if self.controllers.is_empty() {
                     return;
                 }
@@ -602,10 +602,10 @@ impl State {
 
     /// True while the top-right controllers dock owns input.
     pub fn dock_expanded(&self) -> bool {
-        self.focus == HubFocus::Controllers
+        self.focus == HomeFocus::Controllers
     }
 
-    /// Dock visibility: stays on screen while hub Settings is open (it is
+    /// Dock visibility: stays on screen while Home Settings is open (it is
     /// display-only there), hidden only while an Info/action modal owns the
     /// screen.
     pub fn dock_visible(&self) -> bool {
@@ -621,7 +621,7 @@ impl State {
         self.request_dock(!self.dock_expanded(), now)
     }
 
-    /// Collapse the controllers dock without closing the hub.
+    /// Collapse the controllers dock without closing Home.
     pub fn collapse_dock(&mut self, now: Instant) -> bool {
         if !self.dock_expanded() {
             return false;
@@ -629,7 +629,7 @@ impl State {
         self.request_dock(false, now)
     }
 
-    /// Request the controllers dock open/closed. Old Start behavior: 220ms
+    /// Request the controllers dock open/closed. Old Launcher behavior: 220ms
     /// ease-out travel; the selection wash keeps its own chase.
     pub fn request_dock(&mut self, expanded: bool, now: Instant) -> bool {
         let target = if expanded { 1.0 } else { 0.0 };
@@ -648,9 +648,9 @@ impl State {
         }
         let from = self.dock_progress(now);
         self.focus = if expanded {
-            HubFocus::Controllers
+            HomeFocus::Controllers
         } else {
-            HubFocus::Apps
+            HomeFocus::Apps
         };
         self.reset_triangle_hold();
         if self.reduced_motion || (from - target).abs() < 0.01 {
@@ -688,7 +688,7 @@ impl State {
         if index < self.controllers.len() {
             self.controller_focus = index;
             self.request_dock(true, now);
-            self.focus = HubFocus::Controllers;
+            self.focus = HomeFocus::Controllers;
             self.reset_triangle_hold();
         }
     }
@@ -720,7 +720,7 @@ impl State {
             .controller_focus
             .min(self.controllers.len().saturating_sub(1));
         self.controller_anim.iter().enumerate().any(|(i, t)| {
-            let target = if self.focus == HubFocus::Controllers && i == selected {
+            let target = if self.focus == HomeFocus::Controllers && i == selected {
                 1.0
             } else {
                 0.0
@@ -750,7 +750,7 @@ impl State {
             .min(self.controllers.len().saturating_sub(1));
         let anim_secs = crate::ui::motion::BASE_MS as f32 / 1000.0;
         for (i, t) in self.controller_anim.iter_mut().enumerate() {
-            let target = if self.focus == HubFocus::Controllers && i == selected {
+            let target = if self.focus == HomeFocus::Controllers && i == selected {
                 1.0
             } else {
                 0.0
@@ -791,7 +791,7 @@ impl State {
         }
         if self.controllers.is_empty() {
             self.controller_focus = 0;
-            self.focus = HubFocus::Apps;
+            self.focus = HomeFocus::Apps;
             self.controller_anim_at = None;
             self.dock_anim = None;
         } else if self.controller_focus >= self.controllers.len() {
@@ -845,14 +845,14 @@ impl State {
         })
     }
 
-    pub fn tile_enabled(&self, tile: HubTile) -> bool {
+    pub fn tile_enabled(&self, tile: HomeTile) -> bool {
         match tile {
-            HubTile::Start => self.launcher_enabled,
-            HubTile::Browser => true,
+            HomeTile::Launcher => self.launcher_enabled,
+            HomeTile::Browser => true,
         }
     }
 
-    /// Reset edge latches and movement repeat when the hub is opened, so a
+    /// Reset edge latches and movement repeat when Home is opened, so a
     /// held button from the opening gesture cannot fire immediately.
     pub fn on_open(&mut self, launcher_enabled: bool, engine_ready: bool) {
         self.launcher_enabled = launcher_enabled;
@@ -869,7 +869,7 @@ impl State {
         self.triangle_held = false;
         self.options_held = false;
         self.create_held = false;
-        self.focus = HubFocus::Apps;
+        self.focus = HomeFocus::Apps;
         self.controller_focus = 0;
         self.controller_anim.clear();
         self.controller_anim_at = None;
@@ -972,7 +972,7 @@ impl State {
 
     pub fn app_actions(&self, index: usize) -> Vec<AppAction> {
         match APPS.get(index).copied() {
-            Some(HubApp::Browser) => {
+            Some(ManagedApp::Browser) => {
                 if self.installing {
                     if self.cancelling {
                         vec![AppAction::Info]
@@ -1025,22 +1025,22 @@ impl State {
         self.apps_info = None;
     }
 
-    pub fn app_dimmed(&self, app: HubApp) -> bool {
+    pub fn app_dimmed(&self, app: ManagedApp) -> bool {
         match app {
-            HubApp::Browser => !self.engine_ready,
+            ManagedApp::Browser => !self.engine_ready,
         }
     }
 
-    pub fn app_status(&self, app: HubApp) -> String {
+    pub fn app_status(&self, app: ManagedApp) -> String {
         match app {
-            HubApp::Browser if self.installing || self.uninstalling => {
+            ManagedApp::Browser if self.installing || self.uninstalling => {
                 self.progress.label().to_string()
             }
-            HubApp::Browser if self.engine_managed => "Managed by Store".to_string(),
-            HubApp::Browser if self.engine_restart_required => "Restart to finish".to_string(),
-            HubApp::Browser if self.engine_update_ready => "Update ready".to_string(),
-            HubApp::Browser if self.engine_ready => "Installed".to_string(),
-            HubApp::Browser => "Not installed".to_string(),
+            ManagedApp::Browser if self.engine_managed => "Managed by Store".to_string(),
+            ManagedApp::Browser if self.engine_restart_required => "Restart to finish".to_string(),
+            ManagedApp::Browser if self.engine_update_ready => "Update ready".to_string(),
+            ManagedApp::Browser if self.engine_ready => "Installed".to_string(),
+            ManagedApp::Browser => "Not installed".to_string(),
         }
     }
 
@@ -1144,13 +1144,13 @@ impl State {
         }
     }
 
-    /// Feed one pad tick. Returns a hub message for a movement or face edge.
+    /// Feed one pad tick. Returns a Home message for a movement or face edge.
     /// Callers may also read [`Self::prev_cross`] etc. after the call.
     pub fn pad_tick(
         &mut self,
         sample: &crate::domain::pad::PadSample,
         now: Instant,
-    ) -> Option<HubMessage> {
+    ) -> Option<HomeMessage> {
         use crate::domain::pad::NavAction;
         let mut message = None;
         self.cross_held = sample.cross;
@@ -1162,19 +1162,19 @@ impl State {
         let nav = self.nav.update(sample, now, true, true);
         if let Some(action) = nav {
             message = match action {
-                NavAction::Left => Some(HubMessage::MoveX(-1)),
-                NavAction::Right => Some(HubMessage::MoveX(1)),
-                NavAction::Up => Some(HubMessage::MoveY(-1)),
-                NavAction::Down => Some(HubMessage::MoveY(1)),
+                NavAction::Left => Some(HomeMessage::MoveX(-1)),
+                NavAction::Right => Some(HomeMessage::MoveX(1)),
+                NavAction::Up => Some(HomeMessage::MoveY(-1)),
+                NavAction::Down => Some(HomeMessage::MoveY(1)),
                 _ => None,
             };
         }
         // Triangle hold powers off the focused Bluetooth pad; movement or a
-        // foreign press cancels it (same discipline as Start's dock row).
+        // foreign press cancels it (same discipline as the Launcher dock row).
         let can_power = !self.settings_open
             && self.apps_info.is_none()
             && self.apps_menu.is_none()
-            && self.focus == HubFocus::Controllers
+            && self.focus == HomeFocus::Controllers
             && self.controller_selected().is_some_and(|row| {
                 row.show_power_off() && self.powering_off.as_ref() != Some(&row.serial)
             });
@@ -1193,13 +1193,13 @@ impl State {
         self.hint_anim_at = Some(now);
         approach_hint_anim(&mut self.triangle_armed_t, progress >= 1.0, dt);
         if completed && can_power {
-            message = Some(HubMessage::PowerOff);
+            message = Some(HomeMessage::PowerOff);
         }
 
         if sample.cross && !self.prev_cross {
-            message = Some(HubMessage::Confirm);
+            message = Some(HomeMessage::Confirm);
         } else if sample.circle && !self.prev_circle {
-            message = Some(HubMessage::Close);
+            message = Some(HomeMessage::Close);
         } else if sample.create
             && !self.prev_create
             && !self.settings_open
@@ -1207,28 +1207,28 @@ impl State {
             && self.apps_menu.is_none()
             && !self.controllers.is_empty()
         {
-            // Select/Share: old Start controllers-surface toggle.
-            message = Some(HubMessage::ToggleControllers);
+            // Select/Share: old Launcher controllers-surface toggle.
+            message = Some(HomeMessage::ToggleControllers);
         } else if sample.options && !self.prev_options {
-            message = Some(HubMessage::SettingsToggle);
+            message = Some(HomeMessage::SettingsToggle);
         } else if sample.square
             && !self.prev_square
-            && self.focus == HubFocus::Controllers
+            && self.focus == HomeFocus::Controllers
             && self.apps_info.is_none()
             && self.apps_menu.is_none()
             && !self.settings_open
         {
-            // Old Start dock footer: Square cycles Connected / All.
-            message = Some(HubMessage::ToggleShowAll);
+            // Old Launcher dock footer: Square cycles Connected / All.
+            message = Some(HomeMessage::ToggleShowAll);
         } else if triangle_rising
             && !self.settings_open
             && self.apps_info.is_none()
             && self.apps_menu.is_none()
-            && self.focus == HubFocus::Apps
-            && matches!(self.selected_tile(), HubTile::Browser)
+            && self.focus == HomeFocus::Apps
+            && matches!(self.selected_tile(), HomeTile::Browser)
         {
             // Apps-row actions live behind Triangle; Cross still activates.
-            message = Some(HubMessage::AppsMenuOpen(0));
+            message = Some(HomeMessage::AppsMenuOpen(0));
         }
         self.prev_cross = sample.cross;
         self.prev_circle = sample.circle;
@@ -1240,7 +1240,7 @@ impl State {
     }
 }
 
-/// Render the hub shell. The window root is transparent; the centered card
+/// Render Home shell. The window root is transparent; the centered card
 /// and top-right controllers dock are the only painted surfaces above the
 /// full-screen scrim. `spectrum` colors the controller battery rings.
 pub fn view<'a>(
@@ -1251,30 +1251,30 @@ pub fn view<'a>(
     backdrop_alpha: f32,
     panel: PanelVisual,
     now: Instant,
-) -> Element<'a, HubMessage> {
+) -> Element<'a, HomeMessage> {
     let fade = panel.alpha.clamp(0.0, 1.0);
     // Controller-first: the only mouse binding is a backdrop click, which
     // mirrors Circle. Card layers are shielded so only clicks outside the
     // active panel reach this backdrop.
-    let mut layers: Vec<Element<'a, HubMessage>> = vec![
+    let mut layers: Vec<Element<'a, HomeMessage>> = vec![
         mouse_area(
             container(space())
                 .width(Fill)
                 .height(Fill)
                 .style(theme::scrim(backdrop_alpha)),
         )
-        .on_press(HubMessage::Close)
+        .on_press(HomeMessage::Close)
         .interaction(iced::mouse::Interaction::Pointer)
         .into(),
     ];
 
-    let card: Element<'a, HubMessage> = if state.settings_open {
+    let card: Element<'a, HomeMessage> = if state.settings_open {
         settings_view(state, stage_w, fade)
     } else {
-        let card_w = hub_card_width(stage_w);
+        let card_w = home_card_width(stage_w);
         let inner_w = (card_w - 2.0 * SECTION_PAD_X).max(1.0);
         let mut content = column![
-            container(hub_header(inner_w, fade))
+            container(home_header(inner_w, fade))
                 .padding([ROW_PAD_Y, SECTION_PAD_X])
                 .width(Length::Fixed(card_w)),
             section_separator(card_w, fade),
@@ -1309,10 +1309,10 @@ pub fn view<'a>(
     };
 
     let modal_open = state.apps_info.is_some() || state.apps_menu.is_some();
-    // While a modal card owns the screen, leave the hub card unshielded so a
+    // While a modal card owns the screen, leave Home card unshielded so a
     // click anywhere outside the modal falls through to the backdrop (Circle
-    // closes the modal, not the hub).
-    let card: Element<'a, HubMessage> = if modal_open {
+    // closes the modal, not Home).
+    let card: Element<'a, HomeMessage> = if modal_open {
         card
     } else {
         crate::ui::mouse_shield::mouse_shield(card)
@@ -1343,13 +1343,13 @@ pub fn view<'a>(
     stack(layers).width(Fill).height(Fill).into()
 }
 
-/// Hub card width for a monitor stage. The card itself is the outer surface;
+/// Home card width for a monitor stage. The card itself is the outer surface;
 /// only very narrow stages inset it.
-pub fn hub_card_width(stage_w: f32) -> f32 {
-    (stage_w - 32.0).clamp(340.0, HUB_WIDTH)
+pub fn home_card_width(stage_w: f32) -> f32 {
+    (stage_w - 32.0).clamp(340.0, HOME_WIDTH)
 }
 
-fn section_separator<'a>(width: f32, fade: f32) -> Element<'a, HubMessage> {
+fn section_separator<'a>(width: f32, fade: f32) -> Element<'a, HomeMessage> {
     container(space())
         .width(Length::Fixed(width))
         .height(Length::Fixed(1.0))
@@ -1364,7 +1364,7 @@ fn section_separator<'a>(width: f32, fade: f32) -> Element<'a, HubMessage> {
 }
 
 /// Branding-only header row (Options moved to the action-hint row).
-fn hub_header<'a>(width: f32, fade: f32) -> Element<'a, HubMessage> {
+fn home_header<'a>(width: f32, fade: f32) -> Element<'a, HomeMessage> {
     let brand = row![
         faded_svg(svg_icon::DUALSENSE_SVG, 24.0, theme::ACCENT, fade),
         text("SDSC Utils")
@@ -1383,8 +1383,8 @@ fn hub_header<'a>(width: f32, fade: f32) -> Element<'a, HubMessage> {
         .into()
 }
 
-/// Start / Browser tiles.
-fn apps_row<'a>(state: &State, inner_w: f32, fade: f32) -> Element<'a, HubMessage> {
+/// Launcher / Browser tiles.
+fn apps_row<'a>(state: &State, inner_w: f32, fade: f32) -> Element<'a, HomeMessage> {
     let gaps = (TILES.len().saturating_sub(1)) as f32 * TILE_GAP;
     let tile_w = ((inner_w - gaps) / TILES.len() as f32).max(80.0);
     let mut tiles = row![].spacing(TILE_GAP).align_y(Alignment::Center);
@@ -1396,7 +1396,7 @@ fn apps_row<'a>(state: &State, inner_w: f32, fade: f32) -> Element<'a, HubMessag
 
 /// Third row: Select/Share controllers + Options settings. Display-only hints;
 /// the pad owns the actions.
-fn action_hints_row<'a>(state: &State, inner_w: f32, fade: f32) -> Element<'a, HubMessage> {
+fn action_hints_row<'a>(state: &State, inner_w: f32, fade: f32) -> Element<'a, HomeMessage> {
     let controllers = container(capsule_hint(
         "SELECT",
         "Controllers",
@@ -1417,9 +1417,9 @@ fn faded_svg<'a>(
     size: f32,
     color: Color,
     fade: f32,
-) -> Element<'a, HubMessage> {
+) -> Element<'a, HomeMessage> {
     // iced's SVG colour filter rewrites RGB only; alpha must be applied as
-    // draw opacity so icons fade with the rest of the hub shell.
+    // draw opacity so icons fade with the rest of Home shell.
     svg(svg::Handle::from_memory(icon.as_bytes()))
         .width(Length::Fixed(size))
         .height(Length::Fixed(size))
@@ -1433,7 +1433,7 @@ fn capsule_hint(
     label: &'static str,
     pressed: bool,
     fade: f32,
-) -> Element<'static, HubMessage> {
+) -> Element<'static, HomeMessage> {
     let capsule = text(capsule)
         .size(12.0)
         .font(iced::Font::MONOSPACE)
@@ -1458,7 +1458,7 @@ fn controllers_dock_layer<'a>(
     stage_h: f32,
     now: Instant,
     fade: f32,
-) -> Element<'a, HubMessage> {
+) -> Element<'a, HomeMessage> {
     let dock = crate::ui::mouse_shield::mouse_shield(controllers_dock(
         state, spectrum, stage_h, now, fade,
     ));
@@ -1478,14 +1478,14 @@ fn controllers_dock_layer<'a>(
     .into()
 }
 
-/// Restored Start dock: collapsed peek ring column → expanded vertical rows.
+/// Restored Launcher dock: collapsed peek ring column → expanded vertical rows.
 fn controllers_dock<'a>(
     state: &'a State,
     spectrum: &'a crate::domain::color::BatterySpectrum,
     _stage_h: f32,
     now: Instant,
     fade: f32,
-) -> Element<'a, HubMessage> {
+) -> Element<'a, HomeMessage> {
     let t = state.dock_progress(now).clamp(0.0, 1.0);
     let ring = DOCK_RING_MIN + (DOCK_RING_MAX - DOCK_RING_MIN) * t;
     let row_h = ring + (DOCK_ROW_H - ring) * t;
@@ -1498,7 +1498,7 @@ fn controllers_dock<'a>(
     let island_radius = peek_radius + (expanded_island - peek_radius) * t;
     let row_radius = (island_radius - pad).max(0.0);
 
-    let list: Element<'a, HubMessage> =
+    let list: Element<'a, HomeMessage> =
         keyed_column(state.controllers.iter().enumerate().map(|(i, row)| {
             (
                 dock_row_key(row.serial.as_ref()),
@@ -1509,9 +1509,9 @@ fn controllers_dock<'a>(
         .width(Length::Fixed(DOCK_MAX_W))
         .into();
 
-    // Old Start footer: Square cycles Connected / All.
+    // Old Launcher footer: Square cycles Connected / All.
     let reveal_t = ((t - 0.2) / 0.8).clamp(0.0, 1.0);
-    let footer: Element<'a, HubMessage> = if reveal_t > 0.001 {
+    let footer: Element<'a, HomeMessage> = if reveal_t > 0.001 {
         let bar = container(dock_filter(state, fade))
             .height(Length::Fixed(32.0))
             .align_y(Alignment::Center);
@@ -1564,9 +1564,9 @@ fn controllers_dock<'a>(
         .into()
 }
 
-/// Old Start dock footer: Square cycles Connected / All with the active value
+/// Old Launcher dock footer: Square cycles Connected / All with the active value
 /// in ink and the inactive value dimmed.
-fn dock_filter<'a>(state: &State, fade: f32) -> Element<'a, HubMessage> {
+fn dock_filter<'a>(state: &State, fade: f32) -> Element<'a, HomeMessage> {
     let glyph = face_glyph(
         FaceButton::Square,
         if state.square_held {
@@ -1619,7 +1619,7 @@ fn dock_controller_row<'a>(
     row_radius: f32,
     fade: f32,
     dock_t: f32,
-) -> Element<'a, HubMessage> {
+) -> Element<'a, HomeMessage> {
     let powering_off = row.connected && state.powering_off.as_ref() == Some(&row.serial);
     let live = row.connected && !powering_off;
     let ring_color = if state.ring_flash_white(&row.serial) {
@@ -1665,7 +1665,7 @@ fn dock_controller_row<'a>(
             .min(state.controllers.len().saturating_sub(1))
         && state.dock_expanded();
 
-    let hints: Element<'a, HubMessage> = if selected && !powering_off {
+    let hints: Element<'a, HomeMessage> = if selected && !powering_off {
         let mut actions = Vec::new();
         if row.show_identify() {
             let mut hint = plain_hint(FaceButton::Cross, "Identify", state.cross_held);
@@ -1683,7 +1683,7 @@ fn dock_controller_row<'a>(
             hint.alpha = fade;
             actions.push(hint);
         }
-        container(action_cluster_spaced::<HubMessage>(&actions, 10.0, true))
+        container(action_cluster_spaced::<HomeMessage>(&actions, 10.0, true))
             .width(Length::Fixed(DOCK_HINT_COL_W))
             .height(Length::Fixed(row_h))
             .center_y(Fill)
@@ -1768,7 +1768,7 @@ fn approach_anim_to(current: &mut f32, target: f32, dt: f32, duration_secs: f32)
     }
 }
 
-/// ~100ms accent → ink chase mirroring Start's armed hold-hint animation.
+/// ~100ms accent → ink chase mirroring the Launcher's armed hold-hint animation.
 fn approach_hint_anim(current: &mut f32, target: bool, dt: f32) {
     const HINT_ANIM_SECS: f32 = crate::ui::motion::FAST_MS as f32 / 1000.0;
     approach_anim_to(current, if target { 1.0 } else { 0.0 }, dt, HINT_ANIM_SECS);
@@ -1802,11 +1802,11 @@ fn dock_row_style(
 
 /// Stable id for the pad-scrollable changelog in Info.
 pub fn info_scroll_id() -> iced::widget::Id {
-    iced::widget::Id::new("hub-info-changelog")
+    iced::widget::Id::new("home-info-changelog")
 }
 
-fn settings_view<'a>(state: &'a State, stage_w: f32, fade: f32) -> Element<'a, HubMessage> {
-    let card_w = (stage_w - 32.0).clamp(340.0, HUB_WIDTH);
+fn settings_view<'a>(state: &'a State, stage_w: f32, fade: f32) -> Element<'a, HomeMessage> {
+    let card_w = (stage_w - 32.0).clamp(340.0, HOME_WIDTH);
     let mut rows = column![].spacing(6).width(Fill);
     for (i, label) in SETTINGS_ROWS.iter().enumerate() {
         if !state.settings_visible(i) {
@@ -1846,7 +1846,7 @@ fn settings_view<'a>(state: &'a State, stage_w: f32, fade: f32) -> Element<'a, H
             ),
             SETTINGS_DOWNLOAD => settings_choice_row(
                 label,
-                Some("Applies to apps installed through the standalone hub"),
+                Some("Applies to apps installed outside the Store"),
                 &state.settings_value(i),
                 focused,
                 fade,
@@ -1865,7 +1865,7 @@ fn settings_view<'a>(state: &'a State, stage_w: f32, fade: f32) -> Element<'a, H
                 })
                 .color(theme::scale_alpha(theme::INK, fade)),
             space().height(4),
-            text("Applies across the hub, Start, and Browser")
+            text("Applies across Home, the Launcher, and Browser")
                 .size(theme::type_scale::CAPTION)
                 .color(theme::scale_alpha(theme::DIM, fade)),
             space().height(12),
@@ -1883,7 +1883,7 @@ fn settings_view<'a>(state: &'a State, stage_w: f32, fade: f32) -> Element<'a, H
     .into()
 }
 
-fn settings_section<'a>(label: &'static str, fade: f32) -> Element<'a, HubMessage> {
+fn settings_section<'a>(label: &'static str, fade: f32) -> Element<'a, HomeMessage> {
     column![
         text(label)
             .size(15.0)
@@ -1930,7 +1930,7 @@ fn settings_row_labels<'a>(
     helper: Option<&'static str>,
     size: f32,
     fade: f32,
-) -> Element<'a, HubMessage> {
+) -> Element<'a, HomeMessage> {
     let mut col = column![
         text(label.into())
             .size(size)
@@ -1949,7 +1949,7 @@ fn settings_row_labels<'a>(
     col.into()
 }
 
-fn settings_toggle<'a>(on: bool, fade: f32) -> Element<'a, HubMessage> {
+fn settings_toggle<'a>(on: bool, fade: f32) -> Element<'a, HomeMessage> {
     toggler(on)
         .size(22.0)
         .style(move |_theme, _status| {
@@ -1973,7 +1973,7 @@ fn settings_toggle<'a>(on: bool, fade: f32) -> Element<'a, HubMessage> {
         .into()
 }
 
-fn settings_slider<'a>(percent: u8, fade: f32) -> Element<'a, HubMessage> {
+fn settings_slider<'a>(percent: u8, fade: f32) -> Element<'a, HomeMessage> {
     let percent = percent.min(100);
     let p = u16::from(percent);
     let track = progress_bar(0.0..=1.0, f32::from(percent) / 100.0)
@@ -2023,7 +2023,7 @@ fn settings_toggle_row<'a>(
     on: bool,
     focused: bool,
     fade: f32,
-) -> Element<'a, HubMessage> {
+) -> Element<'a, HomeMessage> {
     container(
         row![
             settings_row_labels(label, helper, 16.0, fade),
@@ -2044,7 +2044,7 @@ fn settings_slider_row<'a>(
     percent: u8,
     focused: bool,
     fade: f32,
-) -> Element<'a, HubMessage> {
+) -> Element<'a, HomeMessage> {
     let mut content = column![
         text(label.to_string())
             .size(14.0)
@@ -2074,7 +2074,7 @@ fn settings_choice_row<'a>(
     value: &str,
     focused: bool,
     fade: f32,
-) -> Element<'a, HubMessage> {
+) -> Element<'a, HomeMessage> {
     container(
         row![
             settings_row_labels(label, helper, 16.0, fade),
@@ -2113,7 +2113,7 @@ fn progress_tile_body<'a>(
     title_size: f32,
     focused: bool,
     fade: f32,
-) -> Element<'a, HubMessage> {
+) -> Element<'a, HomeMessage> {
     let ink = if state.engine_ready {
         theme::INK
     } else {
@@ -2173,16 +2173,16 @@ fn progress_tile_body<'a>(
 
 fn tile_button<'a>(
     state: &State,
-    tile: HubTile,
+    tile: HomeTile,
     index: usize,
     width: f32,
     fade: f32,
-) -> Element<'a, HubMessage> {
-    let selected = state.focus == HubFocus::Apps && state.selected() == index;
+) -> Element<'a, HomeMessage> {
+    let selected = state.focus == HomeFocus::Apps && state.selected() == index;
     let interactive = state.tile_enabled(tile);
     let dim = match tile {
-        HubTile::Start => !state.launcher_enabled,
-        HubTile::Browser => !state.engine_ready,
+        HomeTile::Launcher => !state.launcher_enabled,
+        HomeTile::Browser => !state.engine_ready,
     };
     let (icon, title) = tile_copy(tile);
     let ink = if dim { theme::DIM } else { theme::INK };
@@ -2194,7 +2194,7 @@ fn tile_button<'a>(
     } else {
         iced::Font::default()
     };
-    let normal: Element<'a, HubMessage> = column![
+    let normal: Element<'a, HomeMessage> = column![
         faded_svg(icon, ICON, ink, fade),
         text(text_fit::ellipsize_to_width(
             title,
@@ -2208,9 +2208,9 @@ fn tile_button<'a>(
     .spacing(4)
     .align_x(Alignment::Center)
     .into();
-    let content = if matches!(tile, HubTile::Browser) && state.busy() {
+    let content = if matches!(tile, HomeTile::Browser) && state.busy() {
         progress_tile_body(state, icon, title, width, 22.0, TILE_TITLE, selected, fade)
-    } else if matches!(tile, HubTile::Browser) && !state.engine_ready {
+    } else if matches!(tile, HomeTile::Browser) && !state.engine_ready {
         stack![
             normal,
             container(faded_svg(
@@ -2225,7 +2225,7 @@ fn tile_button<'a>(
             .align_y(Alignment::Start),
         ]
         .into()
-    } else if matches!(tile, HubTile::Browser) && state.engine_restart_required {
+    } else if matches!(tile, HomeTile::Browser) && state.engine_restart_required {
         stack![
             normal,
             container(
@@ -2252,7 +2252,7 @@ fn tile_button<'a>(
         .into()
 }
 
-fn apps_menu<'a>(state: &State, index: usize, fade: f32) -> Element<'a, HubMessage> {
+fn apps_menu<'a>(state: &State, index: usize, fade: f32) -> Element<'a, HomeMessage> {
     let app = APPS[index];
     let mut rows = column![].spacing(4);
     for (i, action) in state.app_actions(index).into_iter().enumerate() {
@@ -2300,7 +2300,7 @@ fn apps_menu<'a>(state: &State, index: usize, fade: f32) -> Element<'a, HubMessa
         .into()
 }
 
-fn app_info<'a>(state: &'a State, index: usize, fade: f32) -> Element<'a, HubMessage> {
+fn app_info<'a>(state: &'a State, index: usize, fade: f32) -> Element<'a, HomeMessage> {
     let app = APPS[index];
     let dim = state.app_dimmed(app);
     let ink = if dim { theme::DIM } else { theme::INK };
@@ -2463,10 +2463,10 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn tile_copy(tile: HubTile) -> (&'static str, &'static str) {
+fn tile_copy(tile: HomeTile) -> (&'static str, &'static str) {
     match tile {
-        HubTile::Start => (svg_icon::GAME_SVG, "Start"),
-        HubTile::Browser => (svg_icon::GLOBE_SVG, "Browser"),
+        HomeTile::Launcher => (svg_icon::GAME_SVG, "Launcher"),
+        HomeTile::Browser => (svg_icon::GLOBE_SVG, "Browser"),
     }
 }
 
@@ -2564,20 +2564,20 @@ mod tests {
 
     #[test]
     fn card_width_hits_nominal_on_wide_stages() {
-        assert_eq!(hub_card_width(1920.0), HUB_WIDTH);
-        assert_eq!(hub_card_width(400.0), 368.0);
+        assert_eq!(home_card_width(1920.0), HOME_WIDTH);
+        assert_eq!(home_card_width(400.0), 368.0);
     }
 
     #[test]
     fn selection_wraps_both_ways() {
         let mut state = State::default();
-        assert_eq!(state.selected_tile(), HubTile::Start);
+        assert_eq!(state.selected_tile(), HomeTile::Launcher);
         state.move_across(1);
-        assert_eq!(state.selected_tile(), HubTile::Browser);
+        assert_eq!(state.selected_tile(), HomeTile::Browser);
         state.move_across(1);
-        assert_eq!(state.selected_tile(), HubTile::Start);
+        assert_eq!(state.selected_tile(), HomeTile::Launcher);
         state.move_across(-1);
-        assert_eq!(state.selected_tile(), HubTile::Browser);
+        assert_eq!(state.selected_tile(), HomeTile::Browser);
     }
 
     #[test]
@@ -2585,9 +2585,9 @@ mod tests {
         let mut state = State::default();
         let now = Instant::now();
         state.select(1, now);
-        assert_eq!(state.selected_tile(), HubTile::Browser);
+        assert_eq!(state.selected_tile(), HomeTile::Browser);
         state.select(99, now);
-        assert_eq!(state.selected_tile(), HubTile::Browser);
+        assert_eq!(state.selected_tile(), HomeTile::Browser);
     }
 
     #[test]
@@ -2619,9 +2619,9 @@ mod tests {
             second
         }]);
         let now = Instant::now();
-        assert_eq!(state.focus, HubFocus::Apps);
+        assert_eq!(state.focus, HomeFocus::Apps);
         assert!(state.toggle_dock(now));
-        assert_eq!(state.focus, HubFocus::Controllers);
+        assert_eq!(state.focus, HomeFocus::Controllers);
         state.move_across(1);
         assert_eq!(
             state.controller_selected().map(|r| r.serial.as_ref()),
@@ -2633,14 +2633,14 @@ mod tests {
             Some("abc")
         );
         assert!(state.collapse_dock(now));
-        assert_eq!(state.focus, HubFocus::Apps);
+        assert_eq!(state.focus, HomeFocus::Apps);
     }
 
     #[test]
     fn empty_dock_cannot_expand() {
         let mut state = State::default();
         assert!(!state.toggle_dock(Instant::now()));
-        assert_eq!(state.focus, HubFocus::Apps);
+        assert_eq!(state.focus, HomeFocus::Apps);
     }
 
     #[test]
@@ -2654,18 +2654,18 @@ mod tests {
         };
         assert_eq!(
             state.pad_tick(&sample, now),
-            Some(HubMessage::SettingsToggle)
+            Some(HomeMessage::SettingsToggle)
         );
         assert!(!matches!(
             state.pad_tick(&sample, now),
-            Some(HubMessage::SettingsToggle)
+            Some(HomeMessage::SettingsToggle)
         ));
         sample.options = false;
         state.pad_tick(&sample, now);
         sample.options = true;
         assert_eq!(
             state.pad_tick(&sample, now),
-            Some(HubMessage::SettingsToggle)
+            Some(HomeMessage::SettingsToggle)
         );
     }
 
@@ -2673,8 +2673,8 @@ mod tests {
     fn disabled_start_tile_cannot_be_activated() {
         let mut state = State::default();
         state.on_open(false, true);
-        assert!(!state.tile_enabled(HubTile::Start));
-        assert!(state.tile_enabled(HubTile::Browser));
+        assert!(!state.tile_enabled(HomeTile::Launcher));
+        assert!(state.tile_enabled(HomeTile::Browser));
     }
 
     #[test]
@@ -2687,20 +2687,20 @@ mod tests {
             state.app_actions(0),
             vec![AppAction::Install, AppAction::Info]
         );
-        assert!(state.app_dimmed(HubApp::Browser));
+        assert!(state.app_dimmed(ManagedApp::Browser));
         state.engine_ready = true;
         assert_eq!(
             state.app_actions(0),
             vec![AppAction::Uninstall, AppAction::Info]
         );
-        assert!(!state.app_dimmed(HubApp::Browser));
+        assert!(!state.app_dimmed(ManagedApp::Browser));
     }
 
     #[test]
     fn install_and_uninstall_progress_is_visible_in_status() {
         let mut state = State::default();
         state.set_installing(true);
-        assert_eq!(state.app_status(HubApp::Browser), "Preparing");
+        assert_eq!(state.app_status(ManagedApp::Browser), "Preparing");
         state.set_install_progress(EngineProgress {
             phase: EnginePhase::Downloading,
             fraction: Some(0.42),
@@ -2708,7 +2708,7 @@ mod tests {
             bytes_total: Some(196 * 1024 * 1024),
             rate_bps: Some(8.2 * 1024.0 * 1024.0),
         });
-        assert_eq!(state.app_status(HubApp::Browser), "Downloading");
+        assert_eq!(state.app_status(ManagedApp::Browser), "Downloading");
         assert_eq!(state.progress.label(), "Downloading");
         assert_eq!(
             state.progress.size_label().as_deref(),
@@ -2716,14 +2716,14 @@ mod tests {
         );
         state.install_done(true, None);
         assert!(!state.installing);
-        assert_eq!(state.app_status(HubApp::Browser), "Installed");
+        assert_eq!(state.app_status(ManagedApp::Browser), "Installed");
         state.set_uninstalling();
-        assert_eq!(state.app_status(HubApp::Browser), "Uninstalling");
+        assert_eq!(state.app_status(ManagedApp::Browser), "Uninstalling");
         assert!(state.busy());
         state.advance_progress_anim();
         assert!(state.progress_bar_value() > 0.0);
         state.uninstall_done(None);
-        assert_eq!(state.app_status(HubApp::Browser), "Not installed");
+        assert_eq!(state.app_status(ManagedApp::Browser), "Not installed");
         assert!(!state.busy());
     }
 
@@ -2740,10 +2740,10 @@ mod tests {
             state.app_actions(0),
             vec![AppAction::Update, AppAction::Uninstall, AppAction::Info]
         );
-        assert_eq!(state.app_status(HubApp::Browser), "Update ready");
+        assert_eq!(state.app_status(ManagedApp::Browser), "Update ready");
         state.engine_managed = true;
         assert_eq!(state.app_actions(0), vec![AppAction::Info]);
-        assert_eq!(state.app_status(HubApp::Browser), "Managed by Store");
+        assert_eq!(state.app_status(ManagedApp::Browser), "Managed by Store");
     }
 
     #[test]
@@ -2755,11 +2755,11 @@ mod tests {
             vec![AppAction::Cancel, AppAction::Info]
         );
         state.set_cancelling();
-        assert_eq!(state.app_status(HubApp::Browser), "Cancelling");
+        assert_eq!(state.app_status(ManagedApp::Browser), "Cancelling");
         assert_eq!(state.app_actions(0), vec![AppAction::Info]);
         state.install_cancelled(false);
         assert!(!state.busy());
-        assert_eq!(state.app_status(HubApp::Browser), "Not installed");
+        assert_eq!(state.app_status(ManagedApp::Browser), "Not installed");
     }
 
     #[test]
@@ -2848,7 +2848,7 @@ mod tests {
         };
         let release = PadSample::default();
 
-        // Start has no managed actions: Triangle is inert there.
+        // Launcher has no managed actions: Triangle is inert there.
         assert_eq!(state.pad_tick(&press, now), None);
 
         // Browser opens the same per-app popup the old catalog used.
@@ -2856,7 +2856,7 @@ mod tests {
         state.select(1, now + std::time::Duration::from_millis(16));
         assert_eq!(
             state.pad_tick(&press, now + std::time::Duration::from_millis(32)),
-            Some(HubMessage::AppsMenuOpen(0))
+            Some(HomeMessage::AppsMenuOpen(0))
         );
         assert_eq!(
             state.pad_tick(&press, now + std::time::Duration::from_millis(48)),
@@ -3005,7 +3005,7 @@ mod tests {
         };
         assert_eq!(
             state.pad_tick(&create, now),
-            Some(HubMessage::ToggleControllers)
+            Some(HomeMessage::ToggleControllers)
         );
         assert_eq!(
             state.pad_tick(&create, now + std::time::Duration::from_millis(16)),
@@ -3017,7 +3017,7 @@ mod tests {
         );
         assert_eq!(
             state.pad_tick(&create, now + std::time::Duration::from_millis(48)),
-            Some(HubMessage::ToggleControllers)
+            Some(HomeMessage::ToggleControllers)
         );
         state.toggle_dock(now + std::time::Duration::from_millis(64));
         let square = PadSample {
@@ -3026,7 +3026,7 @@ mod tests {
         };
         assert_eq!(
             state.pad_tick(&square, now + std::time::Duration::from_millis(80)),
-            Some(HubMessage::ToggleShowAll)
+            Some(HomeMessage::ToggleShowAll)
         );
     }
 
@@ -3074,7 +3074,7 @@ mod tests {
             dpad_down: true,
             ..PadSample::default()
         };
-        assert_eq!(state.pad_tick(&down, now), Some(HubMessage::MoveY(1)));
+        assert_eq!(state.pad_tick(&down, now), Some(HomeMessage::MoveY(1)));
         state.pad_tick(
             &PadSample::default(),
             now + std::time::Duration::from_millis(16),
@@ -3085,7 +3085,7 @@ mod tests {
         };
         assert_eq!(
             state.pad_tick(&up, now + std::time::Duration::from_millis(32)),
-            Some(HubMessage::MoveY(-1))
+            Some(HomeMessage::MoveY(-1))
         );
     }
 
@@ -3095,7 +3095,7 @@ mod tests {
         let mut sample = crate::domain::pad::PadSample::default();
         let t0 = Instant::now();
         sample.cross = true;
-        assert_eq!(state.pad_tick(&sample, t0), Some(HubMessage::Confirm));
+        assert_eq!(state.pad_tick(&sample, t0), Some(HomeMessage::Confirm));
         assert_eq!(
             state.pad_tick(&sample, t0 + std::time::Duration::from_millis(16)),
             None
@@ -3105,7 +3105,7 @@ mod tests {
         sample.circle = true;
         assert_eq!(
             state.pad_tick(&sample, t0 + std::time::Duration::from_millis(48)),
-            Some(HubMessage::Close)
+            Some(HomeMessage::Close)
         );
     }
 }

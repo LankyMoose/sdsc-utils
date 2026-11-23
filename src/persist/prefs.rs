@@ -5,7 +5,7 @@ use crate::domain::color::BatterySpectrum;
 use crate::domain::gesture::{GestureControl, default_gesture};
 use crate::platform::app_log;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 
@@ -35,7 +35,7 @@ pub enum ToastPosition {
     BottomRight,
 }
 
-/// Browse-mode ordering for the start-screen games list.
+/// Browse-mode ordering for the launcher games list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GamesSortMode {
@@ -53,22 +53,22 @@ impl GamesSortMode {
     }
 }
 
-/// When a controller connect auto-opens the PS hub.
+/// When a controller connect auto-opens the PS Home.
 /// Single control subsuming the former auto-open bool + USB-scope bool.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum StartAutoOpen {
+pub enum HomeAutoOpen {
     /// Never auto-open (manual / gesture open only).
     Never,
-    /// Only Bluetooth connects open the hub; USB pads are ignored for open
+    /// Only Bluetooth connects open Home; USB pads are ignored for open
     /// and close.
     Bluetooth,
-    /// Any controller connect opens the hub (default).
+    /// Any controller connect opens Home (default).
     #[default]
     Any,
 }
 
-impl StartAutoOpen {
+impl HomeAutoOpen {
     /// Whether connects can auto-open at all.
     pub fn auto_opens(self) -> bool {
         !matches!(self, Self::Never)
@@ -107,17 +107,17 @@ impl StartAutoOpen {
     }
 }
 
-impl std::fmt::Display for StartAutoOpen {
+impl std::fmt::Display for HomeAutoOpen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.label())
     }
 }
 
 /// All modes in cycle/menu order.
-pub const AUTO_OPEN_MODES: [StartAutoOpen; 3] = [
-    StartAutoOpen::Never,
-    StartAutoOpen::Bluetooth,
-    StartAutoOpen::Any,
+pub const AUTO_OPEN_MODES: [HomeAutoOpen; 3] = [
+    HomeAutoOpen::Never,
+    HomeAutoOpen::Bluetooth,
+    HomeAutoOpen::Any,
 ];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,50 +291,49 @@ pub struct Prefs {
     /// Drive DualSense lightbar from battery spectrum (default on).
     #[serde(default = "default_true")]
     pub lightbar_enabled: bool,
-    /// Open the start-screen launcher on 0→1 connect / reopen gesture (default on).
+    /// Open the launcher launcher on 0→1 connect / reopen gesture (default on).
     /// Master switch: when off, Home never opens.
     #[serde(default = "default_true")]
-    pub start_screen_enabled: bool,
+    pub home_enabled: bool,
     /// Automatically open Home when a controller connects.
     /// `never` disables it (gesture / manual open still work);
     /// `bluetooth` ignores USB pads for open and close; `any` counts every
     /// controller (default).
     #[serde(default)]
-    pub start_screen_auto_open: StartAutoOpen,
+    pub home_auto_open: HomeAutoOpen,
     /// Show the clock widget at the top while the launcher is visible (default on).
     #[serde(default = "default_true")]
     pub launcher_clock_enabled: bool,
     /// Immersive idle dim after this many seconds (default 30). Snapped to idle steps.
-    #[serde(default = "default_start_screen_inactive_secs")]
+    #[serde(default = "default_launcher_inactive_secs")]
     pub launcher_inactive_secs: u32,
     /// Immersive sleep (full black) after this many seconds (default 120). Snapped to sleep steps.
-    #[serde(default = "default_start_screen_sleep_secs")]
+    #[serde(default = "default_launcher_sleep_secs")]
     pub launcher_sleep_secs: u32,
     /// Idle-mode black overlay percent 0–100 (default 50). Sleep is always 100%.
-    #[serde(default = "default_start_screen_inactive_dim_percent")]
+    #[serde(default = "default_launcher_inactive_dim_percent")]
     pub launcher_inactive_dim_percent: u8,
     /// Reopen chord while a pad is connected.
     /// Always forced to PS on load/save; custom chords are no longer honored.
     #[serde(default = "default_gesture")]
     pub launcher_gesture: Vec<GestureControl>,
-    /// Standalone hub app-install download cap in KB/s (`0` = unlimited).
-    /// Hub Settings owns the control; every managed-app installer shares the
-    /// live policy. The old `engine_download_limit_kbps` key is read as an
-    /// alias so existing files keep their value.
-    #[serde(default, alias = "engine_download_limit_kbps")]
-    pub app_download_limit_kbps: u32,
+    /// Standalone app-install download cap in KB/s (`0` = unlimited).
+    /// Home Settings owns the control; every managed-app installer shares the
+    /// live policy.
+    #[serde(default)]
+    pub apps_download_limit_kbps: u32,
     /// Play UI cues while navigating the UI (default on).
     #[serde(default = "default_true")]
-    pub start_screen_sounds_enabled: bool,
-    /// Master volume for start-screen UI sounds (0–100, default 60).
-    #[serde(default = "default_start_screen_sound_volume")]
-    pub start_screen_sound_volume: u8,
+    pub ui_sounds_enabled: bool,
+    /// Master volume for UI sounds (0–100, default 60).
+    #[serde(default = "default_ui_sound_volume")]
+    pub ui_sound_volume: u8,
     /// Play DualSense rumble cues while navigating the UI (default on).
     #[serde(default = "default_true")]
-    pub start_screen_haptics_enabled: bool,
-    /// Master strength for start-screen haptic cues (0–100, default 60).
-    #[serde(default = "default_start_screen_haptics_strength")]
-    pub start_screen_haptics_strength: u8,
+    pub ui_haptics_enabled: bool,
+    /// Master strength for UI haptic cues (0–100, default 60).
+    #[serde(default = "default_ui_haptics_strength")]
+    pub ui_haptics_strength: u8,
     /// Launcher games list sort (default last played).
     #[serde(default)]
     pub games_sort_mode: GamesSortMode,
@@ -351,7 +350,7 @@ pub struct Prefs {
         deserialize_with = "de_opt_bool"
     )]
     pub show_uninstalled_games: Option<bool>,
-    /// Remember the start-screen game highlight across shell restarts.
+    /// Remember the launcher game highlight across shell restarts.
     /// Hidden feature, always off: no UI exposes it and `normalize` forces
     /// it off on load. Off keeps the clamped index and never re-pins by key.
     /// Game axis only; the controller axis is never gated.
@@ -439,23 +438,23 @@ fn default_toast_opacity() -> u8 {
     TOAST_OPACITY_DEFAULT
 }
 
-fn default_start_screen_sound_volume() -> u8 {
+fn default_ui_sound_volume() -> u8 {
     60
 }
 
-fn default_start_screen_haptics_strength() -> u8 {
+fn default_ui_haptics_strength() -> u8 {
     60
 }
 
-fn default_start_screen_inactive_secs() -> u32 {
+fn default_launcher_inactive_secs() -> u32 {
     30
 }
 
-fn default_start_screen_sleep_secs() -> u32 {
+fn default_launcher_sleep_secs() -> u32 {
     120
 }
 
-fn default_start_screen_inactive_dim_percent() -> u8 {
+fn default_launcher_inactive_dim_percent() -> u8 {
     50
 }
 
@@ -478,7 +477,7 @@ pub fn clamp_low_battery_percent(value: u8) -> u8 {
         .unwrap_or(LOW_BATTERY_PERCENT_MIN)
 }
 
-pub fn clamp_start_screen_sound_volume(value: u8) -> u8 {
+pub fn clamp_ui_sound_volume(value: u8) -> u8 {
     value.min(100)
 }
 
@@ -487,11 +486,11 @@ pub fn clamp_toast_opacity(value: u8) -> u8 {
     value.clamp(TOAST_OPACITY_MIN, TOAST_OPACITY_MAX)
 }
 
-pub fn clamp_start_screen_haptics_strength(value: u8) -> u8 {
+pub fn clamp_ui_haptics_strength(value: u8) -> u8 {
     value.min(100)
 }
 
-pub fn clamp_start_screen_inactive_dim_percent(value: u8) -> u8 {
+pub fn clamp_launcher_inactive_dim_percent(value: u8) -> u8 {
     value.min(100)
 }
 
@@ -548,7 +547,7 @@ pub fn min_sleep_secs_for_idle(idle_secs: u32) -> u32 {
 }
 
 /// Clamp idle/sleep to allowed steps; sleep is always at least one breakpoint ahead of idle.
-pub fn clamp_start_screen_idle_timeouts(idle_secs: u32, sleep_secs: u32) -> (u32, u32) {
+pub fn clamp_launcher_idle_timeouts(idle_secs: u32, sleep_secs: u32) -> (u32, u32) {
     let idle = snap_to_secs_steps(idle_secs, LAUNCHER_IDLE_SECS_STEPS);
     let min_sleep = min_sleep_secs_for_idle(idle);
     let sleep = snap_to_secs_steps(sleep_secs, LAUNCHER_SLEEP_SECS_STEPS).max(min_sleep);
@@ -582,18 +581,18 @@ impl Default for Prefs {
             spectrum: BatterySpectrum::default_spectrum(),
             analytics_enabled: false,
             lightbar_enabled: true,
-            start_screen_enabled: true,
-            start_screen_auto_open: StartAutoOpen::Any,
+            home_enabled: true,
+            home_auto_open: HomeAutoOpen::Any,
             launcher_clock_enabled: true,
-            launcher_inactive_secs: default_start_screen_inactive_secs(),
-            launcher_sleep_secs: default_start_screen_sleep_secs(),
-            launcher_inactive_dim_percent: default_start_screen_inactive_dim_percent(),
+            launcher_inactive_secs: default_launcher_inactive_secs(),
+            launcher_sleep_secs: default_launcher_sleep_secs(),
+            launcher_inactive_dim_percent: default_launcher_inactive_dim_percent(),
             launcher_gesture: default_gesture(),
-            app_download_limit_kbps: 0,
-            start_screen_sounds_enabled: true,
-            start_screen_sound_volume: default_start_screen_sound_volume(),
-            start_screen_haptics_enabled: true,
-            start_screen_haptics_strength: default_start_screen_haptics_strength(),
+            apps_download_limit_kbps: 0,
+            ui_sounds_enabled: true,
+            ui_sound_volume: default_ui_sound_volume(),
+            ui_haptics_enabled: true,
+            ui_haptics_strength: default_ui_haptics_strength(),
             games_sort_mode: GamesSortMode::default(),
             show_uninstalled_games: None,
             // Hidden feature: selection persistence is always off (no UI).
@@ -612,55 +611,19 @@ impl Default for Prefs {
     }
 }
 
-/// Legacy keys consumed into [`StartAutoOpen`] (no surviving struct fields).
-const LEGACY_AUTO_OPEN_KEY: &str = "start_screen_auto_open";
-const LEGACY_USB_KEY: &str = "start_screen_usb_controllers";
-
-/// One-time migration from pre-1.6.1 bool prefs into the [`StartAutoOpen`]
-/// enum. Runs on the JSON object before struct deserialization; new string
-/// values pass through untouched:
-/// - unreleased bool `start_screen_auto_open: false` → `never`;
-/// - `true` (or a 1.6.0 file without the key) + legacy USB bool →
-///   `any` / `bluetooth` (USB defaulted on, matching the old defaults).
-fn migrate_legacy_auto_open(root: &mut Map<String, Value>) {
-    if matches!(root.get(LEGACY_AUTO_OPEN_KEY), Some(Value::String(_))) {
-        return;
-    }
-    let legacy_bool = root.get(LEGACY_AUTO_OPEN_KEY).and_then(Value::as_bool);
-    let usb = root
-        .get(LEGACY_USB_KEY)
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let mode = match legacy_bool {
-        Some(false) => "never",
-        _ => {
-            if usb {
-                "any"
-            } else {
-                "bluetooth"
-            }
-        }
-    };
-    root.insert(
-        LEGACY_AUTO_OPEN_KEY.to_string(),
-        Value::String(mode.to_string()),
-    );
-}
-
 impl Prefs {
     pub fn load() -> Self {
         let path = prefs_path();
         let Ok(bytes) = fs::read(&path) else {
             return Self::default();
         };
-        let Ok(Value::Object(mut root)) = serde_json::from_slice::<Value>(&bytes) else {
+        let Ok(Value::Object(root)) = serde_json::from_slice::<Value>(&bytes) else {
             app_log::warn(format!(
                 "failed to parse prefs at {}: not a JSON object; using defaults",
                 path.display()
             ));
             return Self::default();
         };
-        migrate_legacy_auto_open(&mut root);
         match serde_json::from_value::<Prefs>(Value::Object(root)) {
             Ok(mut prefs) => {
                 prefs.normalize();
@@ -702,14 +665,12 @@ impl Prefs {
     fn normalize(&mut self) {
         self.low_battery_percent = clamp_low_battery_percent(self.low_battery_percent);
         self.toast_opacity = clamp_toast_opacity(self.toast_opacity);
-        self.start_screen_sound_volume =
-            clamp_start_screen_sound_volume(self.start_screen_sound_volume);
-        self.start_screen_haptics_strength =
-            clamp_start_screen_haptics_strength(self.start_screen_haptics_strength);
+        self.ui_sound_volume = clamp_ui_sound_volume(self.ui_sound_volume);
+        self.ui_haptics_strength = clamp_ui_haptics_strength(self.ui_haptics_strength);
         self.launcher_inactive_dim_percent =
-            clamp_start_screen_inactive_dim_percent(self.launcher_inactive_dim_percent);
+            clamp_launcher_inactive_dim_percent(self.launcher_inactive_dim_percent);
         let (inactive, sleep) =
-            clamp_start_screen_idle_timeouts(self.launcher_inactive_secs, self.launcher_sleep_secs);
+            clamp_launcher_idle_timeouts(self.launcher_inactive_secs, self.launcher_sleep_secs);
         self.launcher_inactive_secs = inactive;
         self.launcher_sleep_secs = sleep;
         self.launcher_gesture = default_gesture();
@@ -736,7 +697,7 @@ mod tests {
         assert_eq!(prefs.low_battery_percent, LOW_BATTERY_PERCENT);
         assert!(!prefs.analytics_enabled);
         assert!(prefs.lightbar_enabled);
-        assert!(prefs.start_screen_enabled);
+        assert!(prefs.home_enabled);
         assert_eq!(prefs.launcher_gesture, default_gesture());
     }
 
@@ -751,19 +712,19 @@ mod tests {
     }
 
     #[test]
-    fn older_prefs_default_start_screen_on_with_default_gesture() {
+    fn older_prefs_default_launcher_on_with_default_gesture() {
         let prefs: Prefs = serde_json::from_str(
             r#"{"notify_low":true,"notify_charged":true,"notify_connect":true,"notify_disconnect":true}"#,
         )
         .unwrap();
-        assert!(prefs.start_screen_enabled);
+        assert!(prefs.home_enabled);
         assert_eq!(prefs.launcher_gesture, default_gesture());
     }
 
     #[test]
     fn empty_gesture_list_normalizes_to_ps() {
         let mut prefs: Prefs =
-            serde_json::from_str(r#"{"start_screen_enabled":true,"launcher_gesture":[]}"#).unwrap();
+            serde_json::from_str(r#"{"home_enabled":true,"launcher_gesture":[]}"#).unwrap();
         assert!(prefs.launcher_gesture.is_empty());
         prefs.normalize();
         assert_eq!(prefs.launcher_gesture, default_gesture());
@@ -772,7 +733,7 @@ mod tests {
     #[test]
     fn custom_gesture_normalizes_to_ps() {
         let mut prefs: Prefs =
-            serde_json::from_str(r#"{"start_screen_enabled":true,"launcher_gesture":["l2","r2"]}"#)
+            serde_json::from_str(r#"{"home_enabled":true,"launcher_gesture":["l2","r2"]}"#)
                 .unwrap();
         assert_ne!(prefs.launcher_gesture, default_gesture());
         prefs.normalize();
@@ -780,37 +741,35 @@ mod tests {
     }
 
     #[test]
-    fn older_prefs_default_start_screen_sounds_on() {
+    fn older_prefs_default_ui_sounds_on() {
         let prefs: Prefs =
-            serde_json::from_str(r#"{"start_screen_enabled":true,"launcher_gesture":["ps"]}"#)
-                .unwrap();
-        assert!(prefs.start_screen_sounds_enabled);
-        assert_eq!(prefs.start_screen_sound_volume, 60);
+            serde_json::from_str(r#"{"home_enabled":true,"launcher_gesture":["ps"]}"#).unwrap();
+        assert!(prefs.ui_sounds_enabled);
+        assert_eq!(prefs.ui_sound_volume, 60);
     }
 
     #[test]
-    fn older_prefs_default_start_screen_haptics_on() {
+    fn older_prefs_default_ui_haptics_on() {
         let prefs: Prefs =
-            serde_json::from_str(r#"{"start_screen_enabled":true,"launcher_gesture":["ps"]}"#)
-                .unwrap();
-        assert!(prefs.start_screen_haptics_enabled);
-        assert_eq!(prefs.start_screen_haptics_strength, 60);
+            serde_json::from_str(r#"{"home_enabled":true,"launcher_gesture":["ps"]}"#).unwrap();
+        assert!(prefs.ui_haptics_enabled);
+        assert_eq!(prefs.ui_haptics_strength, 60);
     }
 
     #[test]
-    fn clamp_start_screen_sound_volume_bounds() {
-        assert_eq!(clamp_start_screen_sound_volume(0), 0);
-        assert_eq!(clamp_start_screen_sound_volume(60), 60);
-        assert_eq!(clamp_start_screen_sound_volume(100), 100);
-        assert_eq!(clamp_start_screen_sound_volume(255), 100);
+    fn clamp_ui_sound_volume_bounds() {
+        assert_eq!(clamp_ui_sound_volume(0), 0);
+        assert_eq!(clamp_ui_sound_volume(60), 60);
+        assert_eq!(clamp_ui_sound_volume(100), 100);
+        assert_eq!(clamp_ui_sound_volume(255), 100);
     }
 
     #[test]
-    fn clamp_start_screen_haptics_strength_bounds() {
-        assert_eq!(clamp_start_screen_haptics_strength(0), 0);
-        assert_eq!(clamp_start_screen_haptics_strength(60), 60);
-        assert_eq!(clamp_start_screen_haptics_strength(100), 100);
-        assert_eq!(clamp_start_screen_haptics_strength(255), 100);
+    fn clamp_ui_haptics_strength_bounds() {
+        assert_eq!(clamp_ui_haptics_strength(0), 0);
+        assert_eq!(clamp_ui_haptics_strength(60), 60);
+        assert_eq!(clamp_ui_haptics_strength(100), 100);
+        assert_eq!(clamp_ui_haptics_strength(255), 100);
     }
 
     #[test]
@@ -894,16 +853,13 @@ mod tests {
     }
 
     #[test]
-    fn app_download_limit_defaults_and_reads_legacy_key() {
+    fn apps_download_limit_defaults_and_round_trips() {
         let prefs = prefs_from_json("{}");
-        assert_eq!(prefs.app_download_limit_kbps, 0);
-        let legacy = prefs_from_json(r#"{"engine_download_limit_kbps":4096}"#);
-        assert_eq!(legacy.app_download_limit_kbps, 4096);
-        let current = prefs_from_json(r#"{"app_download_limit_kbps":5120}"#);
-        assert_eq!(current.app_download_limit_kbps, 5120);
+        assert_eq!(prefs.apps_download_limit_kbps, 0);
+        let current = prefs_from_json(r#"{"apps_download_limit_kbps":5120}"#);
+        assert_eq!(current.apps_download_limit_kbps, 5120);
         let json = serde_json::to_string(&current).unwrap();
-        assert!(json.contains("\"app_download_limit_kbps\""));
-        assert!(!json.contains("engine_download_limit_kbps"));
+        assert!(json.contains("\"apps_download_limit_kbps\""));
     }
 
     #[test]
@@ -971,39 +927,28 @@ mod tests {
     }
 
     #[test]
-    fn removed_start_screen_always_immersive_key_is_ignored() {
-        // Old files still carry the key; unknown fields must not fail the load.
-        let prefs: Prefs = serde_json::from_str(
-            r#"{"start_screen_enabled":true,"start_screen_always_immersive":false}"#,
-        )
-        .unwrap();
-        assert!(prefs.start_screen_enabled);
-    }
-
-    #[test]
     fn older_prefs_default_immersive_idle_timeouts() {
         let prefs: Prefs =
-            serde_json::from_str(r#"{"start_screen_enabled":true,"launcher_gesture":["ps"]}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"home_enabled":true,"launcher_gesture":["ps"]}"#).unwrap();
         assert_eq!(prefs.launcher_inactive_secs, 30);
         assert_eq!(prefs.launcher_sleep_secs, 120);
         assert_eq!(prefs.launcher_inactive_dim_percent, 50);
     }
 
     #[test]
-    fn clamp_start_screen_idle_timeouts_orders_and_bounds() {
-        assert_eq!(clamp_start_screen_idle_timeouts(30, 180), (30, 180));
+    fn clamp_launcher_idle_timeouts_orders_and_bounds() {
+        assert_eq!(clamp_launcher_idle_timeouts(30, 180), (30, 180));
         // Sleep must be ≥ one sleep breakpoint ahead of idle (2m → 3m).
-        assert_eq!(clamp_start_screen_idle_timeouts(120, 60), (120, 180));
-        assert_eq!(clamp_start_screen_idle_timeouts(120, 120), (120, 180));
-        assert_eq!(clamp_start_screen_idle_timeouts(0, 10), (5, 60));
+        assert_eq!(clamp_launcher_idle_timeouts(120, 60), (120, 180));
+        assert_eq!(clamp_launcher_idle_timeouts(120, 120), (120, 180));
+        assert_eq!(clamp_launcher_idle_timeouts(0, 10), (5, 60));
         assert_eq!(min_sleep_secs_for_idle(600), 900);
-        assert_eq!(clamp_start_screen_idle_timeouts(9_999, 9_999), (600, 3_600));
+        assert_eq!(clamp_launcher_idle_timeouts(9_999, 9_999), (600, 3_600));
         assert_eq!(snap_to_secs_steps(20, LAUNCHER_IDLE_SECS_STEPS), 15);
         assert_eq!(snap_to_secs_steps(45, LAUNCHER_IDLE_SECS_STEPS), 30);
         assert_eq!(snap_to_secs_steps(90, LAUNCHER_SLEEP_SECS_STEPS), 60);
-        assert_eq!(clamp_start_screen_inactive_dim_percent(30), 30);
-        assert_eq!(clamp_start_screen_inactive_dim_percent(255), 100);
+        assert_eq!(clamp_launcher_inactive_dim_percent(30), 30);
+        assert_eq!(clamp_launcher_inactive_dim_percent(255), 100);
     }
 
     #[test]
@@ -1016,10 +961,9 @@ mod tests {
 
     /// Parse helper mirroring [`Prefs::load`] (minus the filesystem read).
     fn prefs_from_json(json: &str) -> Prefs {
-        let Value::Object(mut root) = serde_json::from_str(json).unwrap() else {
+        let Value::Object(root) = serde_json::from_str(json).unwrap() else {
             panic!("expected object");
         };
-        migrate_legacy_auto_open(&mut root);
         let mut prefs: Prefs = serde_json::from_value(Value::Object(root)).unwrap();
         prefs.normalize();
         prefs
@@ -1028,77 +972,49 @@ mod tests {
     #[test]
     fn start_auto_open_defaults_to_any() {
         let prefs = prefs_from_json("{}");
-        assert!(prefs.start_screen_enabled);
-        assert_eq!(prefs.start_screen_auto_open, StartAutoOpen::Any);
-        assert_eq!(Prefs::default().start_screen_auto_open, StartAutoOpen::Any);
+        assert!(prefs.home_enabled);
+        assert_eq!(prefs.home_auto_open, HomeAutoOpen::Any);
+        assert_eq!(Prefs::default().home_auto_open, HomeAutoOpen::Any);
         // Serializes as a plain string (single key, no legacy bool cruft).
         let value = serde_json::to_value(Prefs::default()).unwrap();
-        assert_eq!(value["start_screen_auto_open"], "any");
-        assert!(value.get("start_screen_usb_controllers").is_none());
+        assert_eq!(value["home_auto_open"], "any");
     }
 
     #[test]
     fn start_auto_open_modes_parse_and_persist() {
         for (raw, mode) in [
-            ("never", StartAutoOpen::Never),
-            ("bluetooth", StartAutoOpen::Bluetooth),
-            ("any", StartAutoOpen::Any),
+            ("never", HomeAutoOpen::Never),
+            ("bluetooth", HomeAutoOpen::Bluetooth),
+            ("any", HomeAutoOpen::Any),
         ] {
-            let prefs = prefs_from_json(&format!(r#"{{"start_screen_auto_open":{raw:?}}}"#));
-            assert_eq!(prefs.start_screen_auto_open, mode);
+            let prefs = prefs_from_json(&format!(r#"{{"home_auto_open":{raw:?}}}"#));
+            assert_eq!(prefs.home_auto_open, mode);
         }
     }
 
     #[test]
-    fn legacy_1_6_0_usb_bool_migrates_to_scoped_mode() {
-        // 1.6.0 files have no auto-open key: USB choice maps onto the enum.
-        let prefs = prefs_from_json(
-            r#"{"start_screen_enabled":true,"start_screen_usb_controllers":false}"#,
-        );
-        assert_eq!(prefs.start_screen_auto_open, StartAutoOpen::Bluetooth);
-        let prefs =
-            prefs_from_json(r#"{"start_screen_enabled":true,"start_screen_usb_controllers":true}"#);
-        assert_eq!(prefs.start_screen_auto_open, StartAutoOpen::Any);
-    }
-
-    #[test]
-    fn legacy_unreleased_auto_open_bool_migrates() {
-        // `false` always meant never; `true` defers to the USB scope.
-        let prefs = prefs_from_json(
-            r#"{"start_screen_auto_open":false,"start_screen_usb_controllers":true}"#,
-        );
-        assert_eq!(prefs.start_screen_auto_open, StartAutoOpen::Never);
-        let prefs = prefs_from_json(
-            r#"{"start_screen_auto_open":true,"start_screen_usb_controllers":false}"#,
-        );
-        assert_eq!(prefs.start_screen_auto_open, StartAutoOpen::Bluetooth);
-        let prefs = prefs_from_json(r#"{"start_screen_auto_open":true}"#);
-        assert_eq!(prefs.start_screen_auto_open, StartAutoOpen::Any);
-    }
-
-    #[test]
     fn start_auto_open_cycles_with_wrap_and_labels() {
-        assert_eq!(StartAutoOpen::Never.next(), StartAutoOpen::Bluetooth);
-        assert_eq!(StartAutoOpen::Bluetooth.next(), StartAutoOpen::Any);
-        assert_eq!(StartAutoOpen::Any.next(), StartAutoOpen::Never);
-        assert_eq!(StartAutoOpen::Never.prev(), StartAutoOpen::Any);
-        assert_eq!(StartAutoOpen::Any.prev(), StartAutoOpen::Bluetooth);
-        assert_eq!(StartAutoOpen::Never.label(), "Never");
+        assert_eq!(HomeAutoOpen::Never.next(), HomeAutoOpen::Bluetooth);
+        assert_eq!(HomeAutoOpen::Bluetooth.next(), HomeAutoOpen::Any);
+        assert_eq!(HomeAutoOpen::Any.next(), HomeAutoOpen::Never);
+        assert_eq!(HomeAutoOpen::Never.prev(), HomeAutoOpen::Any);
+        assert_eq!(HomeAutoOpen::Any.prev(), HomeAutoOpen::Bluetooth);
+        assert_eq!(HomeAutoOpen::Never.label(), "Never");
         assert_eq!(
-            StartAutoOpen::Bluetooth.label(),
+            HomeAutoOpen::Bluetooth.label(),
             "When a Bluetooth controller connects"
         );
-        assert_eq!(StartAutoOpen::Any.label(), "When any controller connects");
+        assert_eq!(HomeAutoOpen::Any.label(), "When any controller connects");
         assert_eq!(
-            StartAutoOpen::Bluetooth.to_string(),
+            HomeAutoOpen::Bluetooth.to_string(),
             "When a Bluetooth controller connects"
         );
-        assert!(StartAutoOpen::Any.auto_opens());
-        assert!(StartAutoOpen::Bluetooth.auto_opens());
-        assert!(!StartAutoOpen::Never.auto_opens());
-        assert!(StartAutoOpen::Any.includes_usb());
-        assert!(!StartAutoOpen::Bluetooth.includes_usb());
-        assert!(!StartAutoOpen::Never.includes_usb());
+        assert!(HomeAutoOpen::Any.auto_opens());
+        assert!(HomeAutoOpen::Bluetooth.auto_opens());
+        assert!(!HomeAutoOpen::Never.auto_opens());
+        assert!(HomeAutoOpen::Any.includes_usb());
+        assert!(!HomeAutoOpen::Bluetooth.includes_usb());
+        assert!(!HomeAutoOpen::Never.includes_usb());
     }
 
     #[test]

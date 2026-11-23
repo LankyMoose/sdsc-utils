@@ -46,7 +46,7 @@ impl App {
         self.popup_rows = self.controller_rows(true);
     }
 
-    /// Build controller cards for the popup and the hub strip. `include_remembered`
+    /// Build controller cards for the popup and Home strip. `include_remembered`
     /// appends remembered-disconnected pads after the live ones.
     pub(crate) fn controller_rows(&self, include_remembered: bool) -> Vec<ControllerRow> {
         let threshold = self.session.prefs.low_battery_percent;

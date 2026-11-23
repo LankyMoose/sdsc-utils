@@ -1,6 +1,6 @@
 //! Configure window UI: sidebar tabs, notification toggles, toast
 //! position picker, lightbar spectrum editor, battery analytics, and
-//! system / start-screen launcher settings.
+//! system / launcher launcher settings.
 
 pub mod changelog;
 mod coverage;
@@ -19,9 +19,9 @@ use crate::persist::analytics::{
     BucketDirection, ControllerAnalytics, InProgressBucket, StepCoverage, format_duration_short,
 };
 use crate::persist::prefs::{
-    AUTO_OPEN_MODES, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout, LOW_BATTERY_PERCENT_MAX,
-    LOW_BATTERY_PERCENT_MIN, NAVBAR_MODES, NavbarVisibility, REDUCED_MOTION_MODES, ReducedMotion,
-    StartAutoOpen, TOAST_OPACITY_MAX, TOAST_OPACITY_MIN, ToastPosition,
+    AUTO_OPEN_MODES, HomeAutoOpen, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout,
+    LOW_BATTERY_PERCENT_MAX, LOW_BATTERY_PERCENT_MIN, NAVBAR_MODES, NavbarVisibility,
+    REDUCED_MOTION_MODES, ReducedMotion, TOAST_OPACITY_MAX, TOAST_OPACITY_MIN, ToastPosition,
 };
 use crate::platform::app_meta::{DISPLAY_NAME, PKG_VERSION};
 use crate::platform::updater::UpdateStatus;
@@ -205,8 +205,8 @@ pub struct ConfigureSettings {
     pub configure_always_on_top: bool,
     pub analytics_enabled: bool,
     pub lightbar_enabled: bool,
-    pub start_screen_enabled: bool,
-    pub start_screen_auto_open: StartAutoOpen,
+    pub home_enabled: bool,
+    pub home_auto_open: HomeAutoOpen,
     pub launcher_immersive_layout: ImmersiveLayout,
     pub launcher_clock_enabled: bool,
     pub launcher_navbar: NavbarVisibility,
@@ -221,10 +221,10 @@ pub struct ConfigureSettings {
     pub launcher_inactive_secs: u32,
     pub launcher_sleep_secs: u32,
     pub launcher_inactive_dim_percent: u8,
-    pub start_screen_sounds_enabled: bool,
-    pub start_screen_sound_volume: u8,
-    pub start_screen_haptics_enabled: bool,
-    pub start_screen_haptics_strength: u8,
+    pub ui_sounds_enabled: bool,
+    pub ui_sound_volume: u8,
+    pub ui_haptics_enabled: bool,
+    pub ui_haptics_strength: u8,
     #[cfg(windows)]
     pub autostart: bool,
     pub extra_steam_paths: Vec<PathBuf>,
@@ -387,8 +387,8 @@ pub enum ConfigureMessage {
     SetConfigureAlwaysOnTop(bool),
     SetAnalyticsEnabled(bool),
     SetLightbarEnabled(bool),
-    SetStartScreenEnabled(bool),
-    SetStartScreenAutoOpen(StartAutoOpen),
+    SetHomeEnabled(bool),
+    SetHomeAutoOpen(HomeAutoOpen),
     SetImmersiveLayout(ImmersiveLayout),
     SetStartScreenClock(bool),
     SetNavbarVisibility(NavbarVisibility),
@@ -1698,16 +1698,16 @@ fn launcher_section_view<'a>(settings: &ConfigureSettings) -> Element<'a, Config
     let mut groups = Column::new().spacing(18).width(Fill);
 
     let mut opening = vec![toggle_row(
-        "Enable PS hub",
+        "Enable Home",
         Some("Controller-first app switcher and fullscreen game launcher"),
-        settings.start_screen_enabled,
-        ConfigureMessage::SetStartScreenEnabled,
+        settings.home_enabled,
+        ConfigureMessage::SetHomeEnabled,
     )];
-    if settings.start_screen_enabled {
+    if settings.home_enabled {
         opening.push(
             row![
                 column![
-                    text("Auto open hub")
+                    text("Auto open Home")
                         .size(theme::type_scale::BODY)
                         .color(theme::INK),
                     text("When a controller connects")
@@ -1718,8 +1718,8 @@ fn launcher_section_view<'a>(settings: &ConfigureSettings) -> Element<'a, Config
                 .width(Fill),
                 pick_list(
                     AUTO_OPEN_MODES,
-                    Some(settings.start_screen_auto_open),
-                    ConfigureMessage::SetStartScreenAutoOpen,
+                    Some(settings.home_auto_open),
+                    ConfigureMessage::SetHomeAutoOpen,
                 )
                 .text_size(13.0)
                 .padding([7, 10])
@@ -1734,7 +1734,7 @@ fn launcher_section_view<'a>(settings: &ConfigureSettings) -> Element<'a, Config
     }
     groups = groups.push(group(Some("Opening".to_string()), opening));
 
-    if settings.start_screen_enabled {
+    if settings.home_enabled {
         let mut display = vec![
             toggle_row(
                 "Display clock",
@@ -3054,8 +3054,8 @@ mod tests {
             configure_always_on_top: true,
             analytics_enabled: false,
             lightbar_enabled: true,
-            start_screen_enabled: false,
-            start_screen_auto_open: StartAutoOpen::Any,
+            home_enabled: false,
+            home_auto_open: HomeAutoOpen::Any,
             launcher_immersive_layout: ImmersiveLayout::Vertical,
             launcher_clock_enabled: true,
             launcher_navbar: NavbarVisibility::WhenNavigating,
@@ -3068,10 +3068,10 @@ mod tests {
             launcher_inactive_secs: 60,
             launcher_sleep_secs: 300,
             launcher_inactive_dim_percent: 50,
-            start_screen_sounds_enabled: true,
-            start_screen_sound_volume: 80,
-            start_screen_haptics_enabled: true,
-            start_screen_haptics_strength: 80,
+            ui_sounds_enabled: true,
+            ui_sound_volume: 80,
+            ui_haptics_enabled: true,
+            ui_haptics_strength: 80,
             #[cfg(windows)]
             autostart: false,
             extra_steam_paths: Vec::new(),
@@ -3084,7 +3084,7 @@ mod tests {
             is_packaged: false,
         };
         let _disabled_el = launcher_section_view(&settings);
-        settings.start_screen_enabled = true;
+        settings.home_enabled = true;
         let _enabled_el = launcher_section_view(&settings);
         settings.steam_syncing = true;
         settings.show_uninstalled_games = false;

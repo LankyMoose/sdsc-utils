@@ -2,7 +2,7 @@
 
 **Status:** current (phase 4). CEF OSR is the default engine; Servo and the
 reader fallback are deleted. The pivot plan and remaining phases live in
-[browser-hub-pivot.md](browser-hub-pivot.md).
+[browser-home-pivot.md](browser-home-pivot.md).
 
 **When to read:** anything touching `src/browser/`, the standalone Browser
 window, the engine worker, DOM targets, or the CEF packaging path.
@@ -86,16 +86,16 @@ window, the engine worker, DOM targets, or the CEF packaging path.
   window size from `window::resize_events()` rather than a creation-time
   `window::size()` query, which can return the pre-fullscreen default.
 
-PS opens the topmost hub over Launcher, Browser, or a game; while the hub is
+PS opens the topmost Home over Launcher, Browser, or a game; while Home is
 open it owns pad input and the app underneath is gated. Selecting Browser
-closes the hub and opens the standalone fullscreen Browser window. Browser
+closes Home and opens the standalone fullscreen Browser window. Browser
 close (Circle/Esc with no modal) suspends the engine and returns focus to
 Launcher when it is visible.
 
-Input priority is **hub → Browser → Launcher**. The Browser window has its own
+Input priority is **Home → Browser → Launcher**. The Browser window has its own
 pad bank (`BrowserAppState::nav`) and D-pad stepper; Launcher's bank no longer
 sees browser presses. PS is checked in the Browser pad path too, so it opens
-the hub over Browser exactly like over Launcher.
+Home over Browser exactly like over Launcher.
 
 - Left stick moves the cursor with velocity + friction; magnet docks on
   arrival, centre-snaps on fresh acquisition, holds in place while scrolling.
@@ -123,7 +123,7 @@ the hub over Browser exactly like over Launcher.
   55% black scrim behind the 16:9 card (`theme::BACKDROP_ALPHA`); opaque
   backends keep the flat backdrop. The cursor is recentered in the live page
   area every time the window opens.
-- The hub window always covers the monitor and draws the same scrim; the
+- The Home window always covers the monitor and draws the same scrim; the
   card is centered and scales with the stage (icon tiles, no subtitles). On
   an opaque backend the scrim blends over the opaque clear color.
 

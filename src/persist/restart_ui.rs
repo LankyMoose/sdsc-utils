@@ -33,7 +33,7 @@ pub struct RestartUiState {
     /// Launcher window was visible.
     #[serde(default = "default_false")]
     pub launcher_visible: bool,
-    /// Legacy: Launcher's controllers surface was open (ignored; hub owns controllers).
+    /// Legacy: Launcher's controllers surface was open (ignored; Home owns controllers).
     #[serde(default = "default_false")]
     pub launcher_on_controllers: bool,
     /// Selected game / controller keys (re-resolved after rows rebuild).

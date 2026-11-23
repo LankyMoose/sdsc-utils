@@ -1,10 +1,10 @@
 //! In-window launcher settings (Options): right drawer.
 
 use crate::persist::prefs::{
-    AUTO_OPEN_MODES, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout, LAUNCHER_IDLE_SECS_STEPS,
-    LAUNCHER_SLEEP_SECS_STEPS, LauncherSelectionMode, NAVBAR_MODES, NavbarVisibility,
-    REDUCED_MOTION_MODES, ReducedMotion, SELECTION_MODES, StartAutoOpen, format_timeout_duration,
-    min_sleep_secs_for_idle, secs_step_index,
+    AUTO_OPEN_MODES, HomeAutoOpen, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout,
+    LAUNCHER_IDLE_SECS_STEPS, LAUNCHER_SLEEP_SECS_STEPS, LauncherSelectionMode, NAVBAR_MODES,
+    NavbarVisibility, REDUCED_MOTION_MODES, ReducedMotion, SELECTION_MODES,
+    format_timeout_duration, min_sleep_secs_for_idle, secs_step_index,
 };
 use crate::ui::face::{FaceButton, action_cluster, face_hint, face_hold_hint};
 use crate::ui::launcher::icon_cache;
@@ -67,7 +67,7 @@ const TOP_PIN_MAX_ROW_TOP: f32 = CONTENT_PAD_Y + 48.0;
 /// Prefs snapshot for the Launcher settings panel (Enabled stays Configure-only).
 #[derive(Debug, Clone)]
 pub struct LauncherSettingsSnapshot {
-    pub auto_open: StartAutoOpen,
+    pub auto_open: HomeAutoOpen,
     pub selection_persist: bool,
     pub selection_mode: LauncherSelectionMode,
     pub clock_enabled: bool,
@@ -176,7 +176,7 @@ impl SettingsRow {
             | Self::PerfVsync
             | Self::ShowUninstalled
             | Self::SyncSteam => true,
-            // Sound/haptics moved to the PS hub shell Settings screen, which
+            // Sound/haptics moved to the PS Home shell Settings screen, which
             // applies them beyond Launcher. Keep the rows' message plumbing for
             // on-disk pref compatibility, but never render them here.
             Self::Sounds | Self::SoundVolume | Self::Haptics | Self::HapticsStrength => false,
@@ -616,7 +616,7 @@ impl SettingsPanel {
         self.menu.is_some()
     }
 
-    /// Defer an in-flight open/close tween across a paused overlay (PS hub).
+    /// Defer an in-flight open/close tween across a paused overlay (PS Home).
     pub(crate) fn shift_animation_clock(
         &mut self,
         paused_at: std::time::Instant,
@@ -825,7 +825,7 @@ impl SettingsPanel {
 }
 
 pub fn settings_scroll_id() -> iced::widget::Id {
-    iced::widget::Id::new("start-settings-scroll")
+    iced::widget::Id::new("launcher-settings-scroll")
 }
 
 /// Scroll direction after a focus step (including wrap).
@@ -1290,7 +1290,7 @@ pub fn panel_view<'a>(
         let focused = focus_rows.get(focus) == Some(&row);
         let widget: Element<'_, LauncherMessage> = match row {
             SettingsRow::AutoOpen => selector_row(
-                "Auto open hub:",
+                "Auto open Home:",
                 SettingsRow::AutoOpen.helper(),
                 snapshot.auto_open.label(),
                 focused,
@@ -2103,7 +2103,7 @@ mod tests {
 
     fn snap(sounds: bool, haptics: bool) -> LauncherSettingsSnapshot {
         LauncherSettingsSnapshot {
-            auto_open: StartAutoOpen::Any,
+            auto_open: HomeAutoOpen::Any,
             selection_persist: true,
             selection_mode: LauncherSelectionMode::ByGame,
             clock_enabled: true,
@@ -2129,7 +2129,7 @@ mod tests {
     }
 
     #[test]
-    fn focusable_omits_feedback_rows_moved_to_hub_settings() {
+    fn focusable_omits_feedback_rows_moved_to_home_settings() {
         let rows = SettingsRow::focusable(&snap(true, true));
         assert!(!rows.contains(&SettingsRow::Sounds));
         assert!(!rows.contains(&SettingsRow::SoundVolume));
@@ -2272,12 +2272,12 @@ mod tests {
         let msg = nudge_message(SettingsRow::AutoOpen, &s, 1).unwrap();
         assert!(matches!(
             msg,
-            LauncherMessage::SetAutoOpen(StartAutoOpen::Never)
+            LauncherMessage::SetAutoOpen(HomeAutoOpen::Never)
         ));
         let msg = nudge_message(SettingsRow::AutoOpen, &s, -1).unwrap();
         assert!(matches!(
             msg,
-            LauncherMessage::SetAutoOpen(StartAutoOpen::Bluetooth)
+            LauncherMessage::SetAutoOpen(HomeAutoOpen::Bluetooth)
         ));
     }
 
@@ -2424,9 +2424,9 @@ mod tests {
 
     #[test]
     fn idle_sleep_clamp_via_nudge_helpers() {
-        let (inactive, sleep) = crate::persist::prefs::clamp_start_screen_idle_timeouts(120, 60);
+        let (inactive, sleep) = crate::persist::prefs::clamp_launcher_idle_timeouts(120, 60);
         assert_eq!((inactive, sleep), (120, 180));
-        let _ = crate::persist::prefs::clamp_start_screen_inactive_dim_percent(255);
+        let _ = crate::persist::prefs::clamp_launcher_inactive_dim_percent(255);
     }
 
     #[test]
@@ -2530,7 +2530,7 @@ mod tests {
         for sounds in [false, true] {
             for haptics in [false, true] {
                 let s = snap(sounds, haptics);
-                // Feedback rows moved to hub Settings and never render here.
+                // Feedback rows moved to Home Settings and never render here.
                 for row in [
                     SettingsRow::Sounds,
                     SettingsRow::SoundVolume,
@@ -2904,19 +2904,19 @@ mod tests {
         let base = snap(true, true);
         for (mode, right, left) in [
             (
-                StartAutoOpen::Never,
-                StartAutoOpen::Bluetooth,
-                StartAutoOpen::Any,
+                HomeAutoOpen::Never,
+                HomeAutoOpen::Bluetooth,
+                HomeAutoOpen::Any,
             ),
             (
-                StartAutoOpen::Bluetooth,
-                StartAutoOpen::Any,
-                StartAutoOpen::Never,
+                HomeAutoOpen::Bluetooth,
+                HomeAutoOpen::Any,
+                HomeAutoOpen::Never,
             ),
             (
-                StartAutoOpen::Any,
-                StartAutoOpen::Never,
-                StartAutoOpen::Bluetooth,
+                HomeAutoOpen::Any,
+                HomeAutoOpen::Never,
+                HomeAutoOpen::Bluetooth,
             ),
         ] {
             let mut s = base.clone();

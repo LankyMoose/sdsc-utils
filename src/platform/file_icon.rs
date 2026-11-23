@@ -32,7 +32,7 @@ impl FileIconCache {
 
     /// Return a square RGBA icon for `path`, or `None` if extraction fails.
     ///
-    /// Results are cached (including failures) so start-screen refreshes stay cheap.
+    /// Results are cached (including failures) so launcher refreshes stay cheap.
     /// Cache keys include `size` so list and hero tiers do not collide.
     pub fn rgba_for_path(&self, path: &Path, size: u32) -> Option<(u32, u32, Vec<u8>)> {
         let key = CacheKey {

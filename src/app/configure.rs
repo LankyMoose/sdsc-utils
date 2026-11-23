@@ -64,8 +64,8 @@ impl App {
             configure_always_on_top: self.session.prefs.configure_always_on_top,
             analytics_enabled: self.session.prefs.analytics_enabled,
             lightbar_enabled: self.session.prefs.lightbar_enabled,
-            start_screen_enabled: self.session.prefs.start_screen_enabled,
-            start_screen_auto_open: self.session.prefs.start_screen_auto_open,
+            home_enabled: self.session.prefs.home_enabled,
+            home_auto_open: self.session.prefs.home_auto_open,
             launcher_immersive_layout: self.session.prefs.launcher_immersive_layout,
             launcher_clock_enabled: self.session.prefs.launcher_clock_enabled,
             launcher_navbar: self.session.prefs.launcher_navbar,
@@ -83,10 +83,10 @@ impl App {
             launcher_inactive_secs: self.session.prefs.launcher_inactive_secs,
             launcher_sleep_secs: self.session.prefs.launcher_sleep_secs,
             launcher_inactive_dim_percent: self.session.prefs.launcher_inactive_dim_percent,
-            start_screen_sounds_enabled: self.session.prefs.start_screen_sounds_enabled,
-            start_screen_sound_volume: self.session.prefs.start_screen_sound_volume,
-            start_screen_haptics_enabled: self.session.prefs.start_screen_haptics_enabled,
-            start_screen_haptics_strength: self.session.prefs.start_screen_haptics_strength,
+            ui_sounds_enabled: self.session.prefs.ui_sounds_enabled,
+            ui_sound_volume: self.session.prefs.ui_sound_volume,
+            ui_haptics_enabled: self.session.prefs.ui_haptics_enabled,
+            ui_haptics_strength: self.session.prefs.ui_haptics_strength,
             extra_steam_paths: self.session.prefs.extra_steam_paths.clone(),
             steam_path_error: self.configure_state.steam_path_error.clone(),
             show_uninstalled_games: self.session.prefs.show_uninstalled_games_enabled(),
@@ -304,24 +304,22 @@ impl App {
                     Task::none()
                 }
             }
-            ConfigureMessage::SetStartScreenEnabled(enabled) => {
-                self.session.prefs.start_screen_enabled = enabled;
+            ConfigureMessage::SetHomeEnabled(enabled) => {
+                self.session.prefs.home_enabled = enabled;
                 self.save_prefs();
                 if !enabled {
                     let mut task = Task::none();
-                    if self.hub_visible {
-                        task = task.chain(self.close_hub());
+                    if self.home_visible {
+                        task = task.chain(self.close_home());
                     }
                     if self.launcher_visible {
-                        task = task.chain(self.close_start_screen());
+                        task = task.chain(self.close_launcher());
                     }
                     return task;
                 }
                 Task::none()
             }
-            ConfigureMessage::SetStartScreenAutoOpen(enabled) => {
-                self.apply_start_screen_auto_open(enabled)
-            }
+            ConfigureMessage::SetHomeAutoOpen(enabled) => self.apply_home_auto_open(enabled),
             ConfigureMessage::SetStartScreenClock(enabled) => self.apply_launcher_clock(enabled),
             ConfigureMessage::SetImmersiveLayout(layout) => {
                 self.apply_launcher_immersive_layout(layout)

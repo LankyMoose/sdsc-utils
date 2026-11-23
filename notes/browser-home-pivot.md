@@ -1,7 +1,7 @@
-# Browser hub pivot — managed apps + CEF engine (planned)
+# Browser Home pivot — managed apps + CEF engine (planned)
 
-**Status:** in progress on `browser/main` (the `browser/hub-pivot` line merged
-in at `d245777`).
+**Status:** in progress on `browser/main` (the pivot line merged in at
+`d245777`).
 Phases 0–4 are complete; phase 5 (DLC packaging/install + catalog) is
 partially landed. The engine package, resolver, catalog/install UI, and dev
 download path exist; the Store API wiring and optional-package submission
@@ -14,10 +14,10 @@ Current browser internals: [browser-embedding.md](browser-embedding.md).
 ## Goal
 
 Split the controller browser out of the Launcher and make it a standalone
-managed app. PS opens a small overlay **hub** listing installed apps (Launcher
+managed app. PS opens a small overlay **Home** listing installed apps (Launcher
 first, Browser second when its engine is installed, ＋ tile for adding optional
 packages). Future controller-first apps register the same way.
-Browser runs its own fullscreen window with its own chrome. Hub, Launcher, and
+Browser runs its own fullscreen window with its own chrome. Home, Launcher, and
 Browser are all managed by sdsc-utils (tray + HID + iced daemon, one process).
 
 Engine target: **CEF OSR** as a Store/standalone DLC. Servo is deleted with no
@@ -49,17 +49,17 @@ half-measures, no `fetch.rs` text fallback).
   except `normalize_url` + `resolve_navigate_target`, which move to the
   Browser app as the address-bar funnel. `--no-default-features` becomes
   "UI-only iteration build" (browser tile shows install UI).
-- **Hub tile policy:** Browser tile always visible; engine missing → inline
+- **Home tile policy:** Browser tile always visible; engine missing → inline
   Install affordance. ＋ tile opens the catalog.
 - **Window levels:** Launcher + Browser = `Level::Normal` + bring-to-front
   (`focus_window`), no `raise_window_topmost`, out of the raise-above-toast
-  set. Toast/popup/Settings keep current levels. **Hub is the exception:**
+  set. Toast/popup/Settings keep current levels. **Home is the exception:**
   `AlwaysOnTop`, raised last (above toast/Settings/popup). Topmost still loses
   to exclusive-fullscreen scanout — documented limitation, best-effort only.
-- **PS:** toggles hub from anywhere, including over running games. Pad works
-  unfocused (HID is direct); mouse/keyboard in hub over a focused game are
+- **PS:** toggles Home from anywhere, including over running games. Pad works
+  unfocused (HID is direct); mouse/keyboard in Home over a focused game are
   best-effort. Auto-open behavior (toast-first latch, USB scope, `AfterToast`
-  settle, PS-chord suppression, `WindowClosed` retry) moves from Launcher to hub;
+  settle, PS-chord suppression, `WindowClosed` retry) moves from Launcher to Home;
   pref key migrates (`Never`/`Bluetooth`/`Any`, default `Any`).
 - **Browser window:** fullscreen immersive, own tab strip + toolbar +
   bookmarks + page + status strip (current geometry, minus the Launcher
@@ -69,14 +69,14 @@ half-measures, no `fetch.rs` text fallback).
 
 ```
 sdsc-utils (tray + HID + manager)
-├── Hub overlay (small, topmost) — PS toggle, auto-open target
+├── Home overlay (small, topmost) — PS toggle, auto-open target
 │   ├── Launcher (always)
 │   └── Browser (or install tile) — Triangle opens actions/Info
 ├── Launcher app (Normal window — games, scan, art; browser fields removed)
 └── Browser app (Normal fullscreen window — own engine + chrome)
 ```
 
-Hub is modal: owns the pad while open; the underlying app keeps its last frame
+Home is modal: owns the pad while open; the underlying app keeps its last frame
 but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
 
 ## Phases (each lands green; `bash scripts/ci.sh`)
@@ -86,20 +86,20 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    `src/ui/browser/state.rs`; panel + engine handle + capability flag +
    browser D-pad stepper now live in `BrowserAppState`
    (`src/app/browser.rs`). `LauncherState` keeps only a `browser_open` mirror
-   for pure view helpers. `AppManager` was replaced by `AppHub`
-   (`src/app/hub.rs`, `AppId { Launcher, Browser }`, install/active/focus,
+   for pure view helpers. `AppManager` was replaced by `HomeApps`
+   (`src/app/home.rs`, `AppId { Launcher, Browser }`, install/active/focus,
    open/close/suspend/resume); Launcher still renders the panel until phase 2.
    `tabs.json`/`bookmarks.json` paths unchanged.
-1. **Hub window + PS retarget + auto-open moved. — landed.** New
-   `src/ui/hub/` (tiles, selection, pad/key edges) + `src/app/hub.rs`
-   (window lifecycle, topmost raise, PS toggle). PS opens the hub from
-   Launcher, desktop, or a running game; while open the hub owns pad input and
+1. **Home window + PS retarget + auto-open moved. — landed.** New
+   `src/ui/home/` (tiles, selection, pad/key edges) + `src/app/home.rs`
+   (window lifecycle, topmost raise, PS toggle). PS opens Home from
+   Launcher, desktop, or a running game; while open Home owns pad input and
    Launcher messages are gated. Auto-open/session latch, toast settle, retry,
-   and cooldown all target the hub (`SessionEffect::OpenHub`,
-   `AfterToast::OpenHub`); `ApplyContext.hub_visible` replaces
+   and cooldown all target Home (`SessionEffect::OpenHome`,
+   `AfterToast::OpenHome`); `ApplyContext.home_visible` replaces
    `launcher_visible` for the gate. Launcher moved from `AlwaysOnTop` to
-   `Normal`; the hub is raised above Settings/popup, with the toast raised
-   last above all shell surfaces. The hub window always covers the monitor
+   `Normal`; Home is raised above Settings/popup, with the toast raised
+   last above all shell surfaces. Home window always covers the monitor
    and dims the screen behind a centered card. The card is compact and
    icon-first (large glyph + title, no subtitles, no header/close chrome):
    Launcher / Browser / Add apps tiles. Add apps opens a tiles grid (Launcher /
@@ -108,7 +108,7 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    superseded:** the Add apps tile/screen was removed; Triangle on the
    Browser tile now opens the same actions/Info popup directly. Launcher and
    Browser are mutually exclusive; opening either dismisses the other. Over
-   exclusive-fullscreen games the topmost hub can still be covered
+   exclusive-fullscreen games the topmost Home can still be covered
    (documented limitation).
 2. **Browser standalone window. — landed.** New fullscreen `Level::Normal`
    Browser window (`app::browser::open_browser_window`); Launcher no longer
@@ -117,7 +117,7 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    `BrowserMessage` (no `LauncherMessage::Browser*` left). Browser owns pad
    routing (`on_browser_pad`: cursor, D-pad jumps, history selector, R3
    flag), keyboard (`on_browser_key`), its own 60Hz `BrowserFrame` tick, and
-   window close/suspend/focus return. Hub is routed before Browser; Browser
+   window close/suspend/focus return. Home is routed before Browser; Browser
    before Launcher. The live window renders a **16:9 card**, height-driven at
    `window height - 100px` (50px breather per side), centered on the monitor
    with the tab/toolbar/bookmark header inside it; `browser_layout` is the
@@ -152,7 +152,7 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    `BrowserEngine.AppxManifest.xml` + `pack-msix.ps1 -CefDir` emit the
    optional package (runtime files under `cef\`). The engine resolver searches
    portable sidecars, the optional package, `LocalAppData`, then the debug
-   build dir, and validates the required runtime files. Hub ＋ opens a catalog
+   build dir, and validates the required runtime files. Home ＋ opens a catalog
    card with Browser engine status/install/uninstall and controller focus
    (D-pad primary/Back, Cross select); Browser on a missing engine opens the
    catalog instead of a dead page. Dev install uses a DLC manifest
@@ -160,12 +160,12 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    `SDSC_CEF_DLC_URL`/`SDSC_CEF_DLC_SHA256`), SHA-256 verification, and
    extraction to `LocalAppData`. Installs are versioned
    (`cef-engine-<stamp>` + `cef-engine.current`) and carry `engine.json`
-   (version/changelog/size). The hub checks the manifest on open, shows
+   (version/changelog/size). Home checks the manifest on open, shows
    **Update ready** when the feed is newer, and Info shows the engine version,
    size on disk, pending cleanup, and changelog. Install/update is cancellable
    (cooperative token; staging removed; previous state restored), and a running
    CEF keeps the old runtime until restart (`Restart to finish`). Uninstall
-   drops the pointer and defers directory cleanup to the next boot. Hub
+   drops the pointer and defers directory cleanup to the next boot. Home
    Settings owns UI sound/haptic prefs and the standalone-only app-install
    download cap (`Unlimited / 2 / 5 / 10 MB/s`, live during a download and
    shared by every future managed-app installer); the tile shows the live
@@ -203,7 +203,7 @@ cargo check --no-default-features # UI-only; Browser tile shows install state
 - Optional-package install: pack both MSIXs and confirm the engine resolver
   finds `<package>/cef`; Store API install still needs assigned Store IDs.
 - Manual matrix: taskbar/Alt-Tab, toast-over-app, auto-open borderless vs
-  exclusive-fullscreen, hub→app focus transfer, game-over-hub input
+  exclusive-fullscreen, Home→app focus transfer, game-over-Home input
   coexistence.
 
 ## Viability (DLC route)

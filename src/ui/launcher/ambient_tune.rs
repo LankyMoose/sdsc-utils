@@ -21,7 +21,7 @@ pub const TUNE_PANEL_W: f32 = 560.0;
 pub const TUNE_PANEL_MAX_H: f32 = 560.0;
 /// Scrollable widget id for the tuning list.
 pub fn tune_scroll_id() -> iced::widget::Id {
-    iced::widget::Id::new("start-ambient-tune-scroll")
+    iced::widget::Id::new("launcher-ambient-tune-scroll")
 }
 
 /// One tunable ambient slider. Ranges/steps mirror the Diagnostics sliders

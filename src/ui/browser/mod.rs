@@ -1,8 +1,8 @@
 //! Browser app UI state and (later) its standalone window view.
 //!
-//! Phase 0 of the hub pivot keeps rendering inside Launcher; only the state moved
+//! Phase 0 of Home pivot keeps rendering inside Launcher; only the state moved
 //! here so it no longer belongs to `LauncherState`. See
-//! `notes/browser-hub-pivot.md`.
+//! `notes/browser-Home-pivot.md`.
 
 pub mod state;
 pub mod view;

@@ -1,4 +1,4 @@
-//! Pure start-screen timing (enter ceremony) and controllers-surface focus.
+//! Pure launcher timing (enter ceremony) and controllers-surface focus.
 //!
 //! The launcher is always the fullscreen console stage; there is no
 //! windowed presentation and no promote/demote morph.

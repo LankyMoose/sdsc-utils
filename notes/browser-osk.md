@@ -1,8 +1,8 @@
 # On-screen keyboard (plan, not built)
 
 **Status:** design only. **When to read:** adding controller text entry to
-the browser (or anywhere else). After the hub pivot
-([browser-hub-pivot.md](browser-hub-pivot.md)) the OSK belongs to the Browser
+the browser (or anywhere else). After Home pivot
+([browser-home-pivot.md](browser-home-pivot.md)) the OSK belongs to the Browser
 app's own window, not Launcher.
 
 ## Goal

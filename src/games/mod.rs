@@ -1,4 +1,4 @@
-//! Persisted start-screen game catalog (`games.json`).
+//! Persisted launcher game catalog (`games.json`).
 
 pub mod launch;
 pub mod process_match;

@@ -17,7 +17,7 @@ One loopback process serves:
 
 The point of the console is to run a standalone install that has **no CEF
 engine yet**. `Build & launch` builds the app, copies only the exe into the
-QA install, points `APPDATA` at a private directory, and starts it. The hub
+QA install, points `APPDATA` at a private directory, and starts it. The Home
 then shows Browser as not installed; its Install action downloads the engine
 zip from this server and attaches CEF without restarting the app.
 
@@ -552,7 +552,7 @@ class Console:
                 raise RuntimeError(f"unknown flavor {flavor!r}")
             bundle = bool(payload.get("engine_bundled", self.engine_bundled))
             msix_mock = bool(payload.get("msix_mock", self.msix_mock))
-            open_hub = bool(payload.get("open_hub", True))
+            open_home = bool(payload.get("open_home", True))
             restage = bool(payload.get("restage", False))
             controller_input = bool(payload.get("controller_input", True))
             automated = bool(payload.get("automated", not controller_input))
@@ -599,7 +599,7 @@ class Console:
             self._set_prepare_step("launching")
             self.launch(
                 f"installed:{tag}",
-                "hub" if open_hub and flavor == "debug" else "",
+                "home" if open_home and flavor == "debug" else "",
                 controller_input,
                 automated,
             )
@@ -935,7 +935,7 @@ PAGE = """<!doctype html>
     </div>
     <div class="row"><textarea id="engine-changelog" placeholder="What's new in this engine build…"></textarea></div>
     <div class="row"><label><input id="msix-mock" type="checkbox"> Mock MSIX engine package</label></div>
-    <div class="row hint">The app checks <b>/engine-manifest</b> when the hub opens. <b>Publish update</b> bumps the patch version so the next hub open shows <b>Update ready</b>. The MSIX mock puts the staged <b>cef\\</b> folder in the optional-package resolver slot and marks it store-managed (Uninstall hidden).</div>
+    <div class="row hint">The app checks <b>/engine-manifest</b> when Home opens. <b>Publish update</b> bumps the patch version so the next Home open shows <b>Update ready</b>. The MSIX mock puts the staged <b>cef\\</b> folder in the optional-package resolver slot and marks it store-managed (Uninstall hidden).</div>
   </section>
 
   <section class="card">
@@ -946,7 +946,7 @@ PAGE = """<!doctype html>
         <option value="release">Release (qa-feed)</option>
       </select></label>
       <label><input id="engine" type="checkbox"> Bundle browser engine</label>
-      <label><input id="open-hub" type="checkbox" checked> Open hub (debug)</label>
+      <label><input id="open-home" type="checkbox" checked> Open Home (debug)</label>
       <label><input id="controller-input" type="checkbox" checked> Allow controller input</label>
       <label><input id="automated" type="checkbox"> Automated (secondary monitor)</label>
       <label><input id="restage" type="checkbox"> Rebuild install</label>
@@ -958,7 +958,7 @@ PAGE = """<!doctype html>
     </div>
     <div class="row error" id="error" style="display:none"></div>
     <div class="row muted" id="run">—</div>
-    <div class="row hint">Leave <b>Bundle browser engine</b> unchecked to start with no CEF at all: only the exe is staged, and the hub's Apps → Browser → Install walks the DLC flow. Check it to test an already-installed engine. <b>Rebuild install</b> resets the private appdata, including a previously downloaded engine. Manual runs open on the primary monitor with focus. Check <b>Automated (secondary monitor)</b> for quiet placement on the secondary display with no focus steal; uncheck <b>Allow controller input</b> too so the physical controller cannot navigate or close it.</div>
+    <div class="row hint">Leave <b>Bundle browser engine</b> unchecked to start with no CEF at all: only the exe is staged, and Home's apps → Browser → Install walks the DLC flow. Check it to test an already-installed engine. <b>Rebuild install</b> resets the private appdata, including a previously downloaded engine. Manual runs open on the primary monitor with focus. Check <b>Automated (secondary monitor)</b> for quiet placement on the secondary display with no focus steal; uncheck <b>Allow controller input</b> too so the physical controller cannot navigate or close it.</div>
   </section>
 
   <section class="card">
@@ -1068,7 +1068,7 @@ async function prepare(){
       engine_version: $('engine-version').value,
       engine_changelog: $('engine-changelog').value,
       msix_mock: $('msix-mock').checked,
-      open_hub: $('open-hub').checked,
+      open_home: $('open-home').checked,
       controller_input: $('controller-input').checked,
       automated: $('automated').checked,
       restage: $('restage').checked

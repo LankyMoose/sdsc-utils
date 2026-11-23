@@ -7,7 +7,7 @@
 //! above the iced/wgpu canvas, breaking toasts, idle/sleep veils, and overlay
 //! surfaces). Chromium's real TLS/JS is why CEF replaced Servo.
 //!
-//! App lifecycle (which app is foreground) lives in [`crate::app::hub`], not
+//! App lifecycle (which app is foreground) lives in [`crate::app::Home`], not
 //! here. This module is engine/runtime plumbing plus pure protocol types.
 
 pub mod bookmarks;

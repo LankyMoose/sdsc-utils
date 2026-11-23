@@ -20,9 +20,8 @@ use crate::games::process_match::RunningSession;
 use crate::games::steam::SteamGame;
 use crate::games::{self, GamesCatalog, launch, process_match, steam};
 use crate::persist::prefs::{
-    LauncherSelectionMode, NavbarVisibility, ReducedMotion, StartAutoOpen,
-    clamp_start_screen_idle_timeouts, clamp_start_screen_inactive_dim_percent,
-    renderer_restart_needed,
+    HomeAutoOpen, LauncherSelectionMode, NavbarVisibility, ReducedMotion,
+    clamp_launcher_idle_timeouts, clamp_launcher_inactive_dim_percent, renderer_restart_needed,
 };
 use crate::platform::app_log;
 use crate::platform::ui_sound::UiSoundKind;
@@ -47,8 +46,8 @@ impl App {
     }
 
     pub(crate) fn on_launcher_message_inner(&mut self, message: LauncherMessage) -> Task<Message> {
-        // Hub is modal: the app underneath takes no input while it is open.
-        if self.hub_visible {
+        // Home is modal: the app underneath takes no input while it is open.
+        if self.home_visible {
             return Task::none();
         }
         // Cold ambient: only Close is live (escape hatch); ignore nav/launch/edit.
@@ -167,7 +166,7 @@ impl App {
                 }
                 Task::none()
             }
-            LauncherMessage::SetAutoOpen(mode) => self.apply_start_screen_auto_open(mode),
+            LauncherMessage::SetAutoOpen(mode) => self.apply_home_auto_open(mode),
             LauncherMessage::SetSelectionPersist(enabled) => {
                 self.apply_launcher_selection_persist(enabled)
             }
@@ -266,7 +265,7 @@ impl App {
             // close preserves it now, so this guard only skips the close
             // while the modal owns the screen — the game already launched.
             if self.launcher_state.replace_confirm.is_none() {
-                self.close_start_screen()
+                self.close_launcher()
             } else {
                 Task::none()
             }
@@ -342,7 +341,7 @@ impl App {
             }
         } else if self.launcher_visible {
             self.play_ui_cue(UiSoundKind::Action);
-            self.close_start_screen()
+            self.close_launcher()
         } else {
             Task::none()
         }
@@ -376,7 +375,7 @@ impl App {
     pub(crate) fn open_browser_session(&mut self) -> Task<Message> {
         self.note_launcher_activity();
         self.play_ui_cue(UiSoundKind::Action);
-        let _ = self.hub.open(crate::app::hub::AppId::Browser);
+        let _ = self.home_apps.open(crate::app::home::AppId::Browser);
         self.browser.panel.session.open_surface();
         // The card's 16:9 page area drives the engine viewport; sync before
         // the first frame so the cursor space and image are the same size.
@@ -459,7 +458,7 @@ impl App {
     }
 
     pub(crate) fn close_browser_surface(&mut self) -> Task<Message> {
-        let _ = self.hub.close(crate::app::hub::AppId::Browser);
+        let _ = self.home_apps.close(crate::app::home::AppId::Browser);
         self.browser.panel.close_surface();
         // A held D-pad must not jump the cursor of the next opened page.
         self.browser.dpad_stepper.reset();
@@ -512,7 +511,7 @@ impl App {
         self.play_ui_cue(UiSoundKind::Nav);
         crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
         let Some(engine) = &self.browser.engine else {
-            // The engine is mandatory in phase 4; the hub tile handles the
+            // The engine is mandatory in phase 4; Home tile handles the
             // missing-engine install flow before a window ever opens.
             self.browser
                 .panel
@@ -536,8 +535,8 @@ impl App {
     /// (arrows navigate, Enter confirms, Esc cancels).
     pub(crate) fn on_browser_raw_key(&mut self, id: window::Id, raw: RawKey) -> Task<Message> {
         self.haptic_pad_serial = None;
-        if Some(id) == self.hub_window && self.hub_visible {
-            return self.on_hub_key(raw);
+        if Some(id) == self.home_window && self.home_visible {
+            return self.on_home_key(raw);
         }
         if Some(id) == self.browser_window && self.browser_visible {
             return self.on_browser_key(raw);
@@ -2279,7 +2278,7 @@ impl App {
             if self.launcher_state.replace_confirm.is_some() {
                 return Task::none();
             }
-            return self.close_start_screen();
+            return self.close_launcher();
         }
         Task::none()
     }
@@ -2730,22 +2729,22 @@ impl App {
         let meta = Some(edge.meta());
         let readings = edge.readings;
 
-        // Hub is modal: while open it owns the pad; the app underneath keeps
+        // Home is modal: while open it owns the pad; the app underneath keeps
         // its last frame but gets no nav.
-        if self.hub_visible {
-            return self.on_hub_pad(&readings);
+        if self.home_visible {
+            return self.on_home_pad(&readings);
         }
-        // The hub may have just closed on a face press. Swallow pad input
+        // Home may have just closed on a face press. Swallow pad input
         // until that press is fully released so it cannot also dismiss the
         // Launcher/Browser popup underneath.
-        if let Some(until) = self.hub_face_latch_until {
+        if let Some(until) = self.home_face_latch_until {
             let face_held = readings
                 .iter()
                 .any(|r| r.sample.cross || r.sample.circle || r.sample.square || r.sample.triangle);
             if face_held && Instant::now() < until {
                 return Task::none();
             }
-            self.hub_face_latch_until = None;
+            self.home_face_latch_until = None;
         }
         if self.browser_visible {
             return self.on_browser_pad(&readings);
@@ -2912,7 +2911,7 @@ impl App {
 
         // PS while open toggles Launcher closed (PS opens when closed); a close
         // task preempts pad nav for this tick.
-        if let Some(task) = self.toggle_hub_on_reopen_chord(readings) {
+        if let Some(task) = self.toggle_home_on_reopen_chord(readings) {
             return task;
         }
 
@@ -2964,7 +2963,7 @@ impl App {
                         .get(self.launcher_state.game_selected)
                         .is_some_and(|row| &row.target == t)
                 });
-        // Triangle hold power-off lives in the PS hub controllers row.
+        // Triangle hold power-off lives in the PS Home controllers row.
         let hold_triangle_power = false;
         // Left/right move. Settings ignores Left/Right (form controls are
         // mouse-driven); Up/Down moves focus.
@@ -3189,7 +3188,7 @@ impl App {
             );
             return Task::none();
         }
-        if !self.session.prefs.start_screen_enabled {
+        if !self.session.prefs.home_enabled {
             return Task::none();
         }
         let required = gesture::default_gesture();
@@ -3222,23 +3221,23 @@ impl App {
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: reopen gesture fire held={held}"
             ));
-            self.open_hub()
+            self.open_home()
         } else {
             Task::none()
         }
     }
 
-    /// Rising-edge PS chord while Launcher is open opens the hub. The hub is
+    /// Rising-edge PS chord while Launcher is open opens Home. Home is
     /// the only PS target now: PS never closes Launcher directly. True modals
     /// (replace/edit/manual dialogs, open or animating settings, ambient
     /// tuning) swallow the chord so PS cannot strand them mid-dialog. The
     /// release gate consumes the sticky hold so the opening press cannot
     /// immediately re-fire.
-    pub(crate) fn toggle_hub_on_reopen_chord(
+    pub(crate) fn toggle_home_on_reopen_chord(
         &mut self,
         readings: &[launcher_input::NavReading],
     ) -> Option<Task<Message>> {
-        if !self.launcher_visible || self.hub_visible || readings.is_empty() {
+        if !self.launcher_visible || self.home_visible || readings.is_empty() {
             return None;
         }
         let modal_blocking = self.launcher_state.replace_confirm.is_some()
@@ -3272,10 +3271,10 @@ impl App {
             ChordReleaseTick::Open => {
                 // Rising-edge guard: the gate reports Open on every tick once
                 // unlatched, even with the chord absent. Only a genuine new
-                // press (detector rising edge) opens the hub.
+                // press (detector rising edge) opens Home.
                 if self.gesture_detectors.update(&required, readings) {
-                    crate::controller::hid::diag::diag_info("ui-diag: PS opens hub");
-                    Some(self.toggle_hub())
+                    crate::controller::hid::diag::diag_info("ui-diag: PS opens home");
+                    Some(self.toggle_home())
                 } else {
                     None
                 }
@@ -3306,7 +3305,7 @@ impl App {
         &self,
     ) -> crate::ui::launcher::settings::LauncherSettingsSnapshot {
         crate::ui::launcher::settings::LauncherSettingsSnapshot {
-            auto_open: self.session.prefs.start_screen_auto_open,
+            auto_open: self.session.prefs.home_auto_open,
             selection_persist: self.session.prefs.launcher_selection_persist,
             selection_mode: self.session.prefs.launcher_selection_mode,
             clock_enabled: self.session.prefs.launcher_clock_enabled,
@@ -3316,10 +3315,10 @@ impl App {
             inactive_secs: self.session.prefs.launcher_inactive_secs,
             sleep_secs: self.session.prefs.launcher_sleep_secs,
             inactive_dim_percent: self.session.prefs.launcher_inactive_dim_percent,
-            sounds_enabled: self.session.prefs.start_screen_sounds_enabled,
-            sound_volume: self.session.prefs.start_screen_sound_volume,
-            haptics_enabled: self.session.prefs.start_screen_haptics_enabled,
-            haptics_strength: self.session.prefs.start_screen_haptics_strength,
+            sounds_enabled: self.session.prefs.ui_sounds_enabled,
+            sound_volume: self.session.prefs.ui_sound_volume,
+            haptics_enabled: self.session.prefs.ui_haptics_enabled,
+            haptics_strength: self.session.prefs.ui_haptics_strength,
             perf_throttle_immersive: self.session.prefs.perf_throttle_immersive,
             perf_antialiasing: self.session.prefs.perf_antialiasing,
             perf_vsync: self.session.prefs.perf_vsync,
@@ -3412,7 +3411,7 @@ impl App {
 
     pub(crate) fn apply_launcher_inactive_secs(&mut self, secs: u32) -> Task<Message> {
         let (inactive, sleep) =
-            clamp_start_screen_idle_timeouts(secs, self.session.prefs.launcher_sleep_secs);
+            clamp_launcher_idle_timeouts(secs, self.session.prefs.launcher_sleep_secs);
         if self.session.prefs.launcher_inactive_secs != inactive
             || self.session.prefs.launcher_sleep_secs != sleep
         {
@@ -3425,7 +3424,7 @@ impl App {
 
     pub(crate) fn apply_launcher_sleep_secs(&mut self, secs: u32) -> Task<Message> {
         let (inactive, sleep) =
-            clamp_start_screen_idle_timeouts(self.session.prefs.launcher_inactive_secs, secs);
+            clamp_launcher_idle_timeouts(self.session.prefs.launcher_inactive_secs, secs);
         if self.session.prefs.launcher_inactive_secs != inactive
             || self.session.prefs.launcher_sleep_secs != sleep
         {
@@ -3437,7 +3436,7 @@ impl App {
     }
 
     pub(crate) fn apply_launcher_inactive_dim_percent(&mut self, percent: u8) -> Task<Message> {
-        let percent = clamp_start_screen_inactive_dim_percent(percent);
+        let percent = clamp_launcher_inactive_dim_percent(percent);
         if self.session.prefs.launcher_inactive_dim_percent != percent {
             self.session.prefs.launcher_inactive_dim_percent = percent;
             self.save_prefs();
@@ -3445,15 +3444,15 @@ impl App {
         Task::none()
     }
 
-    pub(crate) fn apply_start_screen_auto_open(&mut self, mode: StartAutoOpen) -> Task<Message> {
+    pub(crate) fn apply_home_auto_open(&mut self, mode: HomeAutoOpen) -> Task<Message> {
         // Picking from the menu collapses it, even when re-picking the
         // current value.
         self.launcher_state.settings.close_menus();
-        let old = self.session.prefs.start_screen_auto_open;
+        let old = self.session.prefs.home_auto_open;
         if old == mode {
             return Task::none();
         }
-        self.session.prefs.start_screen_auto_open = mode;
+        self.session.prefs.home_auto_open = mode;
         self.save_prefs();
         if !mode.auto_opens() {
             // Disabling auto-open clears any latched auto-open; never opens
@@ -3466,7 +3465,7 @@ impl App {
         }
         // Scope flip may CloseStart when USB pads no longer qualify; never opens.
         let ctx = crate::session::ApplyContext {
-            hub_visible: self.hub_visible,
+            home_visible: self.home_visible,
             fullscreen: launcher_input::foreground_is_exclusive_fullscreen(),
             now: Instant::now(),
             lightbar_enabled: self.claims.is_enabled(),
@@ -4269,7 +4268,7 @@ impl App {
             self.configure_state.content_scroll_y = rs.configure_scroll_y;
             self.pending_configure_scroll = Some(rs.configure_scroll_y);
         }
-        if rs.launcher_visible && self.session.prefs.start_screen_enabled {
+        if rs.launcher_visible && self.session.prefs.home_enabled {
             if rs.game_key.is_some() {
                 // Fresh boot: seed the shadow from the restore record so row
                 // rebuilds re-pin the pre-restart selection by key.
@@ -4282,7 +4281,7 @@ impl App {
             // Bypass the open-time nav reset below; everything it would
             // clear is restored here instead.
             self.restore_preserve_nav = true;
-            // Controllers live in the PS hub now; legacy Launcher surface state
+            // Controllers live in the PS Home now; legacy Launcher surface state
             // in the record is ignored.
             let _ = rs.launcher_on_controllers;
             if rs.settings_open {
@@ -4303,7 +4302,7 @@ impl App {
         if rs.configure_open {
             task = task.chain(self.open_configure());
         }
-        if rs.launcher_visible && self.session.prefs.start_screen_enabled {
+        if rs.launcher_visible && self.session.prefs.home_enabled {
             task = task.chain(self.open_launcher());
         }
         if rs.popup_open {
@@ -4329,7 +4328,7 @@ impl App {
 
 impl App {
     pub(crate) fn open_launcher(&mut self) -> Task<Message> {
-        if !self.session.prefs.start_screen_enabled {
+        if !self.session.prefs.home_enabled {
             return Task::none();
         }
         // An explicit open wins over a pending deferred destroy.
@@ -4446,7 +4445,7 @@ impl App {
             transparent: crate::ui::chrome::transparent_windows(),
             resizable: false,
             decorations: false,
-            // Launcher is a normal-level window now: the PS hub is the only
+            // Launcher is a normal-level window now: the PS Home is the only
             // always-on-top shell surface. Bring-to-front happens on open.
             level: window::Level::Normal,
             exit_on_close_request: true,
@@ -4666,7 +4665,7 @@ impl App {
         clear_gate
     }
 
-    pub(crate) fn close_start_screen(&mut self) -> Task<Message> {
+    pub(crate) fn close_launcher(&mut self) -> Task<Message> {
         // A close arriving while a deferred destroy is armed is already
         // handled: the armed phase owns the teardown.
         if self.launcher_close_armed {
@@ -4887,7 +4886,7 @@ impl App {
         let close_task = self.close_running_game();
         self.launcher_state.game_selected = confirm.next_index;
         if self.launch_selected() {
-            return close_task.chain(self.close_start_screen());
+            return close_task.chain(self.close_launcher());
         }
         close_task
     }

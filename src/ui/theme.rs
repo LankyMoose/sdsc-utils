@@ -441,7 +441,7 @@ pub fn immersive_island_radius(radius: f32) -> impl Fn(&Theme) -> container::Sty
     glass(radius)
 }
 
-/// Alpha of the full-screen dim behind the hub and Browser popup shells.
+/// Alpha of the full-screen dim behind Home and Browser popup shells.
 pub const BACKDROP_ALPHA: f32 = 0.55;
 
 /// Full-bleed dimming scrim behind a modal/popup shell surface.

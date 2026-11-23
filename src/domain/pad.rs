@@ -1,4 +1,4 @@
-//! Pad samples, input snapshot, and start-screen nav banks.
+//! Pad samples, input snapshot, and launcher nav banks.
 //!
 //! PadPoll never opens HID on the UI thread — it clones the latest samples published
 //! by [`crate::controller::hid::worker`]. The worker interleaves Identify lightbar writes with
@@ -139,7 +139,7 @@ impl Default for InputHub {
 impl std::hash::Hash for InputHub {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         // Subscription identity: `Arc` clones share the heap allocation, so
-        // hash the allocation address (stable across clones, distinct per hub).
+        // hash the allocation address (stable across clones, distinct per Home).
         (self as *const Self as usize).hash(state);
     }
 }
@@ -260,7 +260,7 @@ pub enum NavAction {
     Triangle,
     /// Options — open/close Launcher settings.
     ToggleSettings,
-    /// Create (Select) — legacy controllers-surface toggle (inert: the PS hub
+    /// Create (Select) — legacy controllers-surface toggle (inert: the PS Home
     /// owns the controllers strip now).
     ToggleControllers,
 }
@@ -307,7 +307,7 @@ pub struct PadSample {
     pub l3: bool,
 }
 
-/// Which backend produced a start-screen nav sample.
+/// Which backend produced a launcher nav sample.
 ///
 /// Single-backend stub: HID is the only producer. A `&'static str` const (not an
 /// enum) so `NavReading.source`, `format_line`, `log_source_once`, and the one-shot
@@ -1080,7 +1080,7 @@ fn log_source_once(source: &str, pads: usize) {
     }
 }
 
-/// Result of a multi-pad start-screen nav poll.
+/// Result of a multi-pad launcher nav poll.
 #[derive(Debug)]
 pub enum NavReadingsOutcome {
     Readings {
@@ -1220,7 +1220,7 @@ pub fn soft_stick(x: f32, y: f32) -> (f32, f32) {
     (x, y)
 }
 
-/// Per-pad edge / hold / arming state for start-screen navigation.
+/// Per-pad edge / hold / arming state for launcher navigation.
 #[derive(Debug, Clone, Default)]
 struct PadSlot {
     nav_stepper: NavStepper,

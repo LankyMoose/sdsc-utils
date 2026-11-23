@@ -1,10 +1,10 @@
 //! Top-level Browser app state.
 //!
-//! Phase 0 of the hub pivot lifts the browser out of `LauncherState`: the panel,
+//! Phase 0 of Home pivot lifts the browser out of `LauncherState`: the panel,
 //! engine handle, capability flag, and browser-only D-pad stepper live here so
 //! the browser no longer disappears when the Launcher is not the owner.
 //! Behavior is unchanged — Launcher still renders the panel until the standalone
-//! Browser window lands. See `notes/browser-hub-pivot.md`.
+//! Browser window lands. See `notes/browser-Home-pivot.md`.
 
 use crate::browser::engine::{EngineCommand, EngineHandle};
 use crate::domain::pad::NavStepper;
@@ -28,7 +28,7 @@ pub enum EngineInstallOutcome {
 // with `cef-engine` enabled.
 #[allow(dead_code)]
 pub enum EngineStatus {
-    /// No valid runtime found. The hub Browser tile offers install.
+    /// No valid runtime found. Home Browser tile offers install.
     #[default]
     Missing,
     /// Runtime directory verified and the worker is live.
@@ -63,7 +63,7 @@ pub struct BrowserAppState {
     /// CEF OSR worker. `None` in UI-only builds or when CEF is missing.
     pub engine: Option<EngineHandle>,
     /// Process-static capability: true when an engine worker is live. Drives
-    /// the page placeholder copy and the hub tile install state.
+    /// the page placeholder copy and Home tile install state.
     pub engine_available: bool,
     /// Runtime/install status for the optional engine package.
     pub engine_status: EngineStatus,
@@ -187,7 +187,7 @@ impl super::App {
         // Launcher and Browser are mutually exclusive: opening one dismisses
         // the other rather than stacking two fullscreen apps.
         let close_start = if self.launcher_visible {
-            self.close_start_screen()
+            self.close_launcher()
         } else {
             Task::none()
         };
@@ -384,8 +384,8 @@ impl super::App {
 }
 
 impl super::App {
-    /// Pad tick while the standalone Browser window is the owner. The hub is
-    /// routed before this, so the browser never sees hub presses.
+    /// Pad tick while the standalone Browser window is the owner. Home is
+    /// routed before this, so the browser never sees Home presses.
     pub(crate) fn on_browser_pad(
         &mut self,
         readings: &[crate::ui::launcher::input::NavReading],
@@ -395,11 +395,11 @@ impl super::App {
         if readings.is_empty() {
             return Task::none();
         }
-        // PS is global: while Browser owns the pad it must still open the hub
-        // (the hub-open path routes PS to close once visible).
-        if self.hub_chord_fires(readings) {
-            crate::controller::hid::diag::diag_info("ui-diag: PS opens hub over Browser");
-            return self.toggle_hub();
+        // PS is global: while Browser owns the pad it must still open Home
+        // (Home-open path routes PS to close once visible).
+        if self.home_chord_fires(readings) {
+            crate::controller::hid::diag::diag_info("ui-diag: PS opens home over Browser");
+            return self.toggle_home();
         }
         let now = std::time::Instant::now();
         let history_open = self.browser.panel.history_selector.is_some();
@@ -692,16 +692,16 @@ impl super::App {
                     "engine install: could not open Store page: {err}"
                 ));
             }
-            let msg = "Finish installing Browser Engine in the Store, then reopen the hub";
+            let msg = "Finish installing Browser Engine in the Store, then reopen Home";
             self.browser.engine_status = EngineStatus::Missing;
-            self.hub_state.install_done(false, Some(msg.to_string()));
+            self.home_state.install_done(false, Some(msg.to_string()));
             return Task::none();
         }
 
         self.browser.engine_install_previous = Some(self.browser.engine_status.clone());
         self.browser.engine_status = EngineStatus::Installing;
         self.browser.engine_rate = None;
-        self.hub_state.set_installing(true);
+        self.home_state.set_installing(true);
         self.browser.engine_install_generation =
             self.browser.engine_install_generation.wrapping_add(1);
         let generation = self.browser.engine_install_generation;
@@ -753,7 +753,7 @@ impl super::App {
 
     #[cfg(not(feature = "cef-engine"))]
     pub(crate) fn start_engine_install(&mut self) -> Task<Message> {
-        self.hub_state.install_done(
+        self.home_state.install_done(
             false,
             Some("This build has no browser engine support".to_string()),
         );
@@ -768,9 +768,9 @@ impl super::App {
         let path = path.clone();
         if crate::platform::packaged::is_packaged() {
             let _ = crate::games::launch::launch_target("ms-settings:appsfeatures", "");
-            self.hub_state.install_done(
+            self.home_state.install_done(
                 false,
-                Some("Remove Browser Engine in Windows Settings, then reopen the hub".to_string()),
+                Some("Remove Browser Engine in Windows Settings, then reopen Home".to_string()),
             );
             return Task::none();
         }
@@ -780,7 +780,7 @@ impl super::App {
             Task::none()
         };
         self.browser.engine_status = EngineStatus::Uninstalling;
-        self.hub_state.set_uninstalling();
+        self.home_state.set_uninstalling();
         self.browser.engine_install_generation =
             self.browser.engine_install_generation.wrapping_add(1);
         let generation = self.browser.engine_install_generation;
@@ -817,7 +817,7 @@ impl super::App {
 
     #[cfg(not(feature = "cef-engine"))]
     pub(crate) fn start_engine_uninstall(&mut self) -> Task<Message> {
-        self.hub_state.install_done(
+        self.home_state.install_done(
             false,
             Some("This build has no browser engine support".to_string()),
         );
@@ -830,14 +830,14 @@ impl super::App {
     #[cfg(feature = "cef-engine")]
     pub(crate) fn cancel_engine_install(&mut self) -> Task<Message> {
         if !matches!(self.browser.engine_status, EngineStatus::Installing)
-            || self.hub_state.cancelling
+            || self.home_state.cancelling
         {
             return Task::none();
         }
         self.browser
             .engine_install_cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.hub_state.set_cancelling();
+        self.home_state.set_cancelling();
         crate::platform::app_log::info("cef: BrowserEngine install cancel requested");
         Task::none()
     }
@@ -848,7 +848,7 @@ impl super::App {
     }
 
     /// Fetch the DLC manifest in the background when the feed is configured.
-    /// Called on hub open; no polling, no telemetry.
+    /// Called on Home open; no polling, no telemetry.
     #[cfg(feature = "cef-engine")]
     pub(crate) fn check_engine_manifest(&mut self) -> Task<Message> {
         if std::env::var_os("SDSC_CEF_DLC_MANIFEST_URL").is_none() {
@@ -886,7 +886,7 @@ impl super::App {
         match result {
             Ok(Some(manifest)) => {
                 self.browser.engine_manifest = Some(manifest);
-                self.sync_hub_engine_info();
+                self.sync_home_engine_info();
             }
             Ok(None) => {}
             Err(err) => {
@@ -900,7 +900,7 @@ impl super::App {
     /// thread for the Info panel.
     #[cfg(feature = "cef-engine")]
     pub(crate) fn load_engine_info_sizes(&mut self) -> Task<Message> {
-        self.sync_hub_engine_info();
+        self.sync_home_engine_info();
         self.browser.engine_info_generation = self.browser.engine_info_generation.wrapping_add(1);
         let generation = self.browser.engine_info_generation;
         Task::perform(
@@ -927,10 +927,10 @@ impl super::App {
         )
     }
 
-    /// Refresh the hub's engine version/update/changelog view from the local
+    /// Refresh Home's engine version/update/changelog view from the local
     /// install metadata and the last fetched manifest.
     #[cfg(feature = "cef-engine")]
-    pub(crate) fn sync_hub_engine_info(&mut self) {
+    pub(crate) fn sync_home_engine_info(&mut self) {
         let installed = crate::browser::engine_install::active_meta();
         let remote = self.browser.engine_manifest.clone();
         let installed_version = installed.as_ref().map(|(_, meta)| meta.version.clone());
@@ -954,7 +954,7 @@ impl super::App {
                 .filter(|text| !text.trim().is_empty())
                 .or_else(|| remote.as_ref().map(|remote| remote.changelog.clone()))
         };
-        self.hub_state.engine_version = if managed {
+        self.home_state.engine_version = if managed {
             remote
                 .as_ref()
                 .map(|remote| remote.version.clone())
@@ -962,19 +962,20 @@ impl super::App {
         } else {
             installed_version
         };
-        self.hub_state.engine_latest_version = remote.as_ref().map(|remote| remote.version.clone());
-        self.hub_state.engine_changelog = changelog.filter(|text| !text.trim().is_empty());
-        self.hub_state.engine_size = installed
+        self.home_state.engine_latest_version =
+            remote.as_ref().map(|remote| remote.version.clone());
+        self.home_state.engine_changelog = changelog.filter(|text| !text.trim().is_empty());
+        self.home_state.engine_size = installed
             .as_ref()
             .map(|(_, meta)| meta.size)
             .filter(|size| *size > 0);
-        self.hub_state.engine_update_ready = update_ready;
-        self.hub_state.engine_managed = managed;
-        self.hub_state.engine_restart_required = self.browser.engine_restart_required;
+        self.home_state.engine_update_ready = update_ready;
+        self.home_state.engine_managed = managed;
+        self.home_state.engine_restart_required = self.browser.engine_restart_required;
     }
 
     #[cfg(not(feature = "cef-engine"))]
-    pub(crate) fn sync_hub_engine_info(&mut self) {}
+    pub(crate) fn sync_home_engine_info(&mut self) {}
 
     #[cfg(feature = "cef-engine")]
     pub(crate) fn on_engine_install_progress(
@@ -984,14 +985,14 @@ impl super::App {
     ) -> Task<Message> {
         if generation != self.browser.engine_install_generation
             || !matches!(self.browser.engine_status, EngineStatus::Installing)
-            || self.hub_state.cancelling
+            || self.home_state.cancelling
         {
             return Task::none();
         }
         let rate = self.note_engine_rate(&progress);
-        let mut mapped = hub_install_progress(progress);
+        let mut mapped = home_install_progress(progress);
         mapped.rate_bps = rate;
-        self.hub_state.set_install_progress(mapped);
+        self.home_state.set_install_progress(mapped);
         Task::none()
     }
 
@@ -1066,7 +1067,7 @@ impl super::App {
                     self.refresh_engine_status();
                 }
                 if self.browser.engine.is_some() {
-                    self.hub_state.install_done(true, None);
+                    self.home_state.install_done(true, None);
                     crate::platform::app_log::info(format!(
                         "cef: BrowserEngine install complete{}",
                         if self.browser.engine_restart_required {
@@ -1078,7 +1079,7 @@ impl super::App {
                 } else {
                     let msg = "Browser engine installed but failed to start".to_string();
                     self.browser.engine_status = EngineStatus::Failed(msg.clone());
-                    self.hub_state.install_done(false, Some(msg));
+                    self.home_state.install_done(false, Some(msg));
                 }
             }
             EngineInstallOutcome::Cancelled => {
@@ -1086,7 +1087,7 @@ impl super::App {
                 let ready = previous.as_ref().is_some_and(EngineStatus::is_ready);
                 self.browser.engine_status = previous.unwrap_or(EngineStatus::Missing);
                 self.browser.engine_available = self.browser.engine.is_some();
-                self.hub_state.install_cancelled(ready);
+                self.home_state.install_cancelled(ready);
                 crate::platform::app_log::info("cef: BrowserEngine install cancelled");
             }
             EngineInstallOutcome::Failed(err) => {
@@ -1098,10 +1099,10 @@ impl super::App {
                 self.browser.engine_status = previous
                     .filter(|status| status.is_ready())
                     .unwrap_or_else(|| EngineStatus::Failed(err.clone()));
-                self.hub_state.install_done(ready, Some(err));
+                self.home_state.install_done(ready, Some(err));
             }
         }
-        self.sync_hub_engine_info();
+        self.sync_home_engine_info();
         Task::none()
     }
 
@@ -1124,16 +1125,16 @@ impl super::App {
                 self.browser.engine_available = false;
                 self.browser.engine_managed = false;
                 self.browser.engine_restart_required = false;
-                self.hub_state.uninstall_done(None);
+                self.home_state.uninstall_done(None);
                 crate::platform::app_log::info("cef: BrowserEngine uninstalled");
             }
             Err(err) => {
                 crate::platform::app_log::warn(format!("cef: uninstall failed: {err}"));
                 self.browser.engine_status = EngineStatus::Failed(err.clone());
-                self.hub_state.uninstall_done(Some(err));
+                self.home_state.uninstall_done(Some(err));
             }
         }
-        self.sync_hub_engine_info();
+        self.sync_home_engine_info();
         Task::none()
     }
 
@@ -1148,11 +1149,11 @@ impl super::App {
 }
 
 #[cfg(feature = "cef-engine")]
-fn hub_install_progress(
+fn home_install_progress(
     progress: crate::browser::engine_install::InstallProgress,
-) -> crate::ui::hub::EngineProgress {
+) -> crate::ui::home::EngineProgress {
     use crate::browser::engine_install::InstallProgress as Engine;
-    use crate::ui::hub::{EnginePhase, EngineProgress};
+    use crate::ui::home::{EnginePhase, EngineProgress};
     match progress {
         Engine::Starting => EngineProgress {
             phase: EnginePhase::Preparing,

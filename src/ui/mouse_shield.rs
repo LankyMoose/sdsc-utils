@@ -1,6 +1,6 @@
-//! Mouse/touch shield for controller-first hub surfaces.
+//! Mouse/touch shield for controller-first Home surfaces.
 //!
-//! The hub is pad/keyboard owned. Cards and the controllers dock are wrapped
+//! Home is pad/keyboard owned. Cards and the controllers dock are wrapped
 //! in this widget so native button/toggler/slider/scrollable hover and drag
 //! behaviour can never fire under the visual surface. The shield:
 //!

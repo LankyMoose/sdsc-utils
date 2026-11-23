@@ -1027,7 +1027,7 @@ impl HidWorkerHandle {
         let launch_serials = Arc::new(Mutex::new(Vec::new()));
         let launch_serials_worker = Arc::clone(&launch_serials);
         let spectrum_worker = spectrum.clone();
-        // Fresh worker start owns a new input hub (seq restarts at 0).
+        // Fresh worker start owns a new input Home (seq restarts at 0).
         let input_hub = Arc::new(InputHub::new());
         let input_hub_worker = Arc::clone(&input_hub);
         // Fresh worker start owns the lightbar-claim unit.
@@ -1088,7 +1088,7 @@ impl HidWorkerHandle {
         self.spectrum.clone()
     }
 
-    /// Owned pad-input hub shared with the worker thread and the iced subscription.
+    /// Owned pad-input Home shared with the worker thread and the iced subscription.
     pub fn input_hub(&self) -> Arc<InputHub> {
         Arc::clone(&self.input_hub)
     }
@@ -1399,7 +1399,7 @@ fn publish_snapshot(
     let now_empty = readings.is_empty();
     let pad_count = readings.len();
 
-    // Store through the owned hub (single snapshot lock for write + meta, as before).
+    // Store through the owned Home (single snapshot lock for write + meta, as before).
     let meta = hub.publish(readings.clone(), reason);
 
     if emit_edge {

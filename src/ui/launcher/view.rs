@@ -4,8 +4,8 @@ use crate::controller::model::Serial;
 use crate::games::GameEntry;
 use crate::games::steam::SteamGame;
 use crate::persist::prefs::{
-    GamesSortMode, ImmersiveLayout, LauncherSelectionMode, NavbarVisibility, ReducedMotion,
-    StartAutoOpen,
+    GamesSortMode, HomeAutoOpen, ImmersiveLayout, LauncherSelectionMode, NavbarVisibility,
+    ReducedMotion,
 };
 use crate::ui::face::FacePressAnim;
 use crate::ui::launcher::icon_cache;
@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// Logical width of the start-screen window.
+/// Logical width of the launcher window.
 pub const WIDTH: f32 = 768.0;
 
 /// Layout-transition duration when swapping immersive strip orientation
@@ -69,7 +69,7 @@ pub enum LauncherMessage {
     ManualClearIcon,
     /// Options — open/close in-window Launcher settings.
     ToggleSettings,
-    SetAutoOpen(StartAutoOpen),
+    SetAutoOpen(HomeAutoOpen),
     ToggleAutoOpenMenu,
     ToggleLayoutMenu,
     ToggleNavbarMenu,
@@ -128,7 +128,7 @@ pub enum LauncherMessage {
 #[derive(Debug, Clone)]
 pub struct LauncherIcon(pub iced::widget::image::Handle);
 
-/// Where to load list / hero art for a start-screen game row.
+/// Where to load list / hero art for a launcher game row.
 #[derive(Debug, Clone)]
 pub enum IconSource {
     File(PathBuf),
@@ -3330,11 +3330,11 @@ impl State {
     }
 
     /// Defer every wall-clock animation stamp that was already running when
-    /// the PS hub opened. Launcher keeps painting its last frame underneath the
-    /// hub, so without this shift the first frame after close sees the whole
-    /// hub session as elapsed time: the ken-burns splash snaps ahead, enter
+    /// the PS Home opened. Launcher keeps painting its last frame underneath the
+    /// Home, so without this shift the first frame after close sees the whole
+    /// Home session as elapsed time: the ken-burns splash snaps ahead, enter
     /// veils jump, and chrome races to settle. Stamps created *during* the
-    /// pause (e.g. art decoding while the hub is open) are left alone.
+    /// pause (e.g. art decoding while Home is open) are left alone.
     pub fn shift_animation_clock(&mut self, paused_at: Instant, pause: Duration) {
         if pause.is_zero() {
             return;
@@ -4096,7 +4096,7 @@ mod tests {
         // Unknown / future list ids must never disturb tracked lists.
         let mut state = State::default();
         state.record_list_scroll(LauncherListId::Settings, 42.0, 480.0);
-        let unknown = iced::widget::Id::new("start-future-list-xyz");
+        let unknown = iced::widget::Id::new("future-list-xyz");
         assert!(LauncherListId::from_scroll_id(&unknown).is_none());
         assert!(!state.note_scroll_y(&unknown, 999.0));
         assert!((state.list_offset(LauncherListId::Settings) - 42.0).abs() < f32::EPSILON);
@@ -6339,7 +6339,7 @@ mod tests {
     }
 
     #[test]
-    fn hub_pause_defers_running_start_animations() {
+    fn home_pause_defers_running_launcher_animations() {
         let t0 = Instant::now();
         let paused_at = t0 + Duration::from_secs(1);
         let pause = Duration::from_secs(10);
@@ -6359,7 +6359,7 @@ mod tests {
     }
 
     #[test]
-    fn hub_pause_leaves_art_started_during_the_pause_alone() {
+    fn home_pause_leaves_art_started_during_the_pause_alone() {
         let paused_at = Instant::now();
         let started_during = paused_at + Duration::from_secs(2);
         let mut state = State {

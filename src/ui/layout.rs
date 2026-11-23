@@ -65,9 +65,9 @@ pub struct ToastPlacement {
 /// foreground. On Windows we apply `WS_EX_NOACTIVATE`, pin `HWND_TOPMOST`, and
 /// show with `SW_SHOWNOACTIVATE` instead.
 ///
-/// Callers that have the hub / Settings / popup open should raise those
+/// Callers that have Home / Settings / popup open should raise those
 /// windows (focus/refresh), then re-raise the toast with
-/// [`raise_toast_topmost`] so it stays visible above the hub's full-screen
+/// [`raise_toast_topmost`] so it stays visible above Home's full-screen
 /// scrim without stealing focus.
 /// normal-level window and stays behind the toast by design.
 pub fn show_toast_without_activate<Message: Send + 'static>(id: window::Id) -> Task<Message> {
@@ -154,7 +154,7 @@ pub fn open_visible() -> bool {
     !crate::platform::debug_quiet::enabled()
 }
 
-/// Re-assert toast topmost (e.g. after Settings / hub / popup open or close).
+/// Re-assert toast topmost (e.g. after Settings / Home / popup open or close).
 pub fn set_toast_topmost<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     #[cfg(windows)]
     {
@@ -204,7 +204,7 @@ pub fn disable_window_transitions<Message: Send + 'static>(id: window::Id) -> Ta
 }
 
 /// Raise the non-activating toast to the top of the z-order without stealing
-/// focus from the hub or Settings underneath it.
+/// focus from Home or Settings underneath it.
 pub fn raise_toast_topmost<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     #[cfg(windows)]
     {

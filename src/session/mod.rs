@@ -6,9 +6,9 @@ mod gate;
 pub mod notify;
 
 pub use gate::{
-    ConnectCooldownDecision, POLL_MISS_HOLD, connect_cooldown_on_empty, has_hub_presence,
-    reconcile_poll_with_hold, should_auto_close_hub, should_auto_open_hub,
-    should_defer_auto_open_hub, should_flush_latched_hub,
+    ConnectCooldownDecision, POLL_MISS_HOLD, connect_cooldown_on_empty, has_home_presence,
+    reconcile_poll_with_hold, should_auto_close_home, should_auto_open_home,
+    should_defer_auto_open_home, should_flush_latched_home,
     should_skip_connect_cooldown_on_power_off, take_skip_connect_cooldown,
 };
 
@@ -53,14 +53,14 @@ pub enum SessionEffect {
     QueueNotifications {
         events: Vec<NotifyEvent>,
         /// Latch Launcher open onto the connect toast presentation machine.
-        open_start_after_toast: bool,
+        open_home_after_toast: bool,
     },
-    /// Open the hub now (no connect toast to wait on).
-    OpenHub,
+    /// Open Home now (no connect toast to wait on).
+    OpenHome,
     /// Close Home, or the Launcher when Home is not visible (all pads gone).
-    CloseHub,
-    /// Clear latched auto-open and toast AfterToast::OpenHub.
-    ClearStartLatch,
+    CloseHome,
+    /// Clear latched auto-open and toast AfterToast::OpenHome.
+    ClearHomeLatch,
     /// Persist remembered controllers / nicknames.
     SaveKnown,
     /// Persist analytics store and rebuild Settings → Analytics panel.
@@ -76,7 +76,7 @@ pub enum SessionEffect {
 /// Inputs the app provides when applying a poll snapshot (UI facts only).
 #[derive(Debug, Clone, Copy)]
 pub struct ApplyContext {
-    pub hub_visible: bool,
+    pub home_visible: bool,
     pub fullscreen: bool,
     pub now: Instant,
     pub lightbar_enabled: bool,
@@ -186,13 +186,13 @@ impl DeviceSession {
             return effects;
         }
 
-        let include_usb = self.prefs.start_screen_auto_open.includes_usb();
+        let include_usb = self.prefs.home_auto_open.includes_usb();
         let mut events = Vec::new();
         let mut presence_edge: Option<(bool, bool)> = None;
         if controllers_changed {
             let previous = std::mem::replace(&mut self.controllers, controllers);
-            let prev_present = has_hub_presence(&previous, include_usb);
-            let next_present = has_hub_presence(&self.controllers, include_usb);
+            let prev_present = has_home_presence(&previous, include_usb);
+            let next_present = has_home_presence(&self.controllers, include_usb);
             presence_edge = Some((prev_present, next_present));
             if prev_present != next_present {
                 crate::controller::hid::diag::diag_info(format!(
@@ -250,11 +250,11 @@ impl DeviceSession {
 
         effects.push(SessionEffect::SaveKnown);
         let want_auto_open = presence_edge.is_some_and(|(prev_present, next_present)| {
-            should_auto_open_hub(
-                self.prefs.start_screen_enabled && self.prefs.start_screen_auto_open.auto_opens(),
+            should_auto_open_home(
+                self.prefs.home_enabled && self.prefs.home_auto_open.auto_opens(),
                 !prev_present,
                 next_present,
-                ctx.hub_visible,
+                ctx.home_visible,
                 self.cooldown_active(ctx.now),
                 ctx.fullscreen,
             )
@@ -275,8 +275,8 @@ impl DeviceSession {
         if want_auto_open {
             self.auto_open_pending = true;
         }
-        let open_start_after_toast =
-            want_auto_open && should_defer_auto_open_hub(true, connect_toast_queued);
+        let open_home_after_toast =
+            want_auto_open && should_defer_auto_open_home(true, connect_toast_queued);
 
         effects.push(SessionEffect::SetTray {
             connected: self.controllers.len(),
@@ -284,22 +284,22 @@ impl DeviceSession {
         // Live membership or the remembered set changed, so the popup's row
         // list may have grown or shrunk — rebuild it and resize while open.
         effects.push(SessionEffect::SyncPopup);
-        if !events.is_empty() || open_start_after_toast {
+        if !events.is_empty() || open_home_after_toast {
             effects.push(SessionEffect::QueueNotifications {
                 events,
-                open_start_after_toast,
+                open_home_after_toast,
             });
         }
 
         if let Some((prev_present, next_present)) = presence_edge {
             if !next_present {
                 self.auto_open_pending = false;
-                effects.push(SessionEffect::ClearStartLatch);
-                if should_auto_close_hub(prev_present, next_present, ctx.hub_visible) {
-                    effects.push(SessionEffect::CloseHub);
+                effects.push(SessionEffect::ClearHomeLatch);
+                if should_auto_close_home(prev_present, next_present, ctx.home_visible) {
+                    effects.push(SessionEffect::CloseHome);
                 }
             } else if want_auto_open && !connect_toast_queued {
-                effects.push(SessionEffect::OpenHub);
+                effects.push(SessionEffect::OpenHome);
             }
         }
 
@@ -311,8 +311,8 @@ impl DeviceSession {
     /// A settings flip is not a connect edge — never auto-open Launcher here.
     /// Does not arm the ghost-flap cooldown (settings flip is not a pad leave).
     pub fn reevaluate_start_presence(&mut self, ctx: ApplyContext) -> Vec<SessionEffect> {
-        let include_usb = self.prefs.start_screen_auto_open.includes_usb();
-        let present = has_hub_presence(&self.controllers, include_usb);
+        let include_usb = self.prefs.home_auto_open.includes_usb();
+        let present = has_home_presence(&self.controllers, include_usb);
         crate::controller::hid::diag::diag_info(format!(
             "ui-diag: launcher presence include_usb={} present={} (prefs)",
             u8::from(include_usb),
@@ -327,9 +327,9 @@ impl DeviceSession {
         } else {
             self.auto_open_pending = false;
             self.controllers_nonempty_since = None;
-            effects.push(SessionEffect::ClearStartLatch);
-            if ctx.hub_visible {
-                effects.push(SessionEffect::CloseHub);
+            effects.push(SessionEffect::ClearHomeLatch);
+            if ctx.home_visible {
+                effects.push(SessionEffect::CloseHome);
             }
         }
         effects
@@ -391,7 +391,7 @@ mod tests {
     use super::*;
     use crate::controller::dualsense::battery::dualsense_status;
     use crate::controller::model::{Connection, PowerState};
-    use crate::persist::prefs::StartAutoOpen;
+    use crate::persist::prefs::HomeAutoOpen;
 
     fn bt_pad(serial: &str) -> ControllerStatus {
         dualsense_status(
@@ -426,19 +426,19 @@ mod tests {
         )
     }
 
-    fn ctx(hub_visible: bool) -> ApplyContext {
+    fn ctx(home_visible: bool) -> ApplyContext {
         ApplyContext {
-            hub_visible,
+            home_visible,
             fullscreen: false,
             now: Instant::now(),
             lightbar_enabled: false,
         }
     }
 
-    fn session_with(mode: StartAutoOpen) -> DeviceSession {
+    fn session_with(mode: HomeAutoOpen) -> DeviceSession {
         let prefs = Prefs {
-            start_screen_enabled: true,
-            start_screen_auto_open: mode,
+            home_enabled: true,
+            home_auto_open: mode,
             notify_connect: true,
             analytics_enabled: false,
             ..Prefs::default()
@@ -450,8 +450,8 @@ mod tests {
         )
     }
 
-    fn has_open_hub(effects: &[SessionEffect]) -> bool {
-        effects.iter().any(|e| matches!(e, SessionEffect::OpenHub))
+    fn has_open_home(effects: &[SessionEffect]) -> bool {
+        effects.iter().any(|e| matches!(e, SessionEffect::OpenHome))
     }
 
     fn queued_bodies(effects: &[SessionEffect]) -> Vec<String> {
@@ -468,9 +468,9 @@ mod tests {
 
     #[test]
     fn auto_open_suppresses_connected_toast() {
-        let mut session = session_with(StartAutoOpen::Any);
+        let mut session = session_with(HomeAutoOpen::Any);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
-        assert!(has_open_hub(&effects));
+        assert!(has_open_home(&effects));
         assert!(
             !queued_bodies(&effects).contains(&"Connected".to_string()),
             "auto-open must not queue Connected, got {:?}",
@@ -479,18 +479,18 @@ mod tests {
     }
 
     #[test]
-    fn no_auto_open_when_hub_already_open() {
-        let mut session = session_with(StartAutoOpen::Any);
+    fn no_auto_open_when_home_already_open() {
+        let mut session = session_with(HomeAutoOpen::Any);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(true));
-        assert!(!has_open_hub(&effects));
+        assert!(!has_open_home(&effects));
         assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
     }
 
     #[test]
     fn auto_open_never_never_opens_but_still_toasts() {
-        let mut session = session_with(StartAutoOpen::Never);
+        let mut session = session_with(HomeAutoOpen::Never);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
-        assert!(!has_open_hub(&effects));
+        assert!(!has_open_home(&effects));
         assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
     }
 
@@ -498,12 +498,12 @@ mod tests {
     fn hot_path_stall_within_hold_keeps_pad_quiet() {
         use std::time::Duration;
 
-        let mut session = session_with(StartAutoOpen::Any);
+        let mut session = session_with(HomeAutoOpen::Any);
         let pad_a = bt_pad("aa");
         let pad_b = bt_pad("bb");
         let t0 = Instant::now();
         let ctx_at = |now: Instant| ApplyContext {
-            hub_visible: false,
+            home_visible: false,
             fullscreen: false,
             now,
             lightbar_enabled: false,
@@ -536,11 +536,11 @@ mod tests {
     fn poll_miss_flag_tracks_hold_lifecycle() {
         use std::time::Duration;
 
-        let mut session = session_with(StartAutoOpen::Any);
+        let mut session = session_with(HomeAutoOpen::Any);
         let pad_a = bt_pad("aa");
         let t0 = Instant::now();
         let ctx_at = |now: Instant| ApplyContext {
-            hub_visible: false,
+            home_visible: false,
             fullscreen: false,
             now,
             lightbar_enabled: false,
@@ -566,15 +566,15 @@ mod tests {
     fn bluetooth_mode_ignores_usb_only_presence() {
         // USB-only arrival is not qualifying presence in Bluetooth mode:
         // no open, and the toast stays a plain notification.
-        let mut session = session_with(StartAutoOpen::Bluetooth);
+        let mut session = session_with(HomeAutoOpen::Bluetooth);
         let effects = session.apply_controllers(vec![usb_pad("usb:1")], ctx(false));
-        assert!(!has_open_hub(&effects));
+        assert!(!has_open_home(&effects));
         assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
         assert!(
             !effects.iter().any(|e| matches!(
                 e,
                 SessionEffect::QueueNotifications {
-                    open_start_after_toast: true,
+                    open_home_after_toast: true,
                     ..
                 }
             )),
@@ -584,9 +584,9 @@ mod tests {
 
     #[test]
     fn bluetooth_mode_opens_on_bluetooth_arrival() {
-        let mut session = session_with(StartAutoOpen::Bluetooth);
+        let mut session = session_with(HomeAutoOpen::Bluetooth);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
-        assert!(has_open_hub(&effects));
+        assert!(has_open_home(&effects));
         assert!(
             !queued_bodies(&effects).contains(&"Connected".to_string()),
             "auto-open suppresses Connected, got {:?}",
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn membership_gain_emits_popup_sync() {
         // 0→1 grows the popup by a row: the shell must resize while open.
-        let mut session = session_with(StartAutoOpen::Any);
+        let mut session = session_with(HomeAutoOpen::Any);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
         assert!(
             has_popup_sync(&effects),
@@ -614,7 +614,7 @@ mod tests {
     #[test]
     fn membership_loss_emits_popup_sync() {
         // 1→0 shrinks the popup by a row: the shell must resize while open.
-        let mut session = session_with(StartAutoOpen::Any);
+        let mut session = session_with(HomeAutoOpen::Any);
         let _ = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
         let effects = session.apply_controllers(Vec::new(), ctx(false));
         assert!(
@@ -627,7 +627,7 @@ mod tests {
     fn reconnecting_a_forgotten_pad_emits_popup_sync() {
         // Forgetting drops the remembered row; reconnecting re-adds the live
         // row. Both change the row count, so both must resize the popup.
-        let mut session = session_with(StartAutoOpen::Any);
+        let mut session = session_with(HomeAutoOpen::Any);
         session.known.remember(&bt_pad("aa"));
         assert!(session.known.forget("aa"));
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
@@ -640,7 +640,7 @@ mod tests {
     #[test]
     fn unchanged_snapshot_emits_no_popup_sync() {
         // Same pad, same readings: no row change, so no pointless resize.
-        let mut session = session_with(StartAutoOpen::Any);
+        let mut session = session_with(HomeAutoOpen::Any);
         let _ = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
         assert!(
@@ -656,7 +656,7 @@ mod tests {
     /// remembered record at 100%, not the boot-time 95%.
     #[test]
     fn full_charge_then_unplug_remembered_carries_100() {
-        let mut session = session_with(StartAutoOpen::Any);
+        let mut session = session_with(HomeAutoOpen::Any);
         // Boot-time state: pad remembered at 95%.
         session
             .known

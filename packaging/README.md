@@ -51,7 +51,7 @@ uses the same publisher identity.
 - **Sideload:** an AppInstaller file must list both packages
   (`<MainPackage>` + `<OptionalPackages><Package .../></OptionalPackages>`);
   `Add-AppxPackage` cannot install an optional package as an unrelated app.
-- **Dev/unpackaged:** set `SDSC_CEF_DLC_URL` + `SDSC_CEF_DLC_SHA256`; the hub
+- **Dev/unpackaged:** set `SDSC_CEF_DLC_URL` + `SDSC_CEF_DLC_SHA256`; Home
   catalog Install button downloads the zip, verifies SHA-256, extracts to
   `%LOCALAPPDATA%\sdsc-utils\cef-engine`, and starts CEF without a restart.
 

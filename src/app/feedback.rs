@@ -1,22 +1,21 @@
 //! Shared UI feedback: sounds, haptics, and the settings that control them.
 //!
-//! Launcher, Browser, Configure, and the PS hub all route cues through these
-//! methods so the hub-shell preferences apply globally. On-disk keys keep
-//! their historical `start_screen_*` names for compatibility.
+//! Launcher, Browser, Configure, and Home all route cues through these
+//! methods so the shared `ui_*` preferences apply globally.
 
 use super::{App, Message};
 use crate::controller::dualsense::rumble::MotorPulse;
 use crate::domain::pad::PadId;
-use crate::persist::prefs::{clamp_start_screen_haptics_strength, clamp_start_screen_sound_volume};
+use crate::persist::prefs::{clamp_ui_haptics_strength, clamp_ui_sound_volume};
 use crate::platform::ui_sound::UiSoundKind;
 use iced::Task;
 
 impl App {
     pub(crate) fn play_ui_sound(&self, kind: UiSoundKind) {
-        if !self.session.prefs.start_screen_sounds_enabled {
+        if !self.session.prefs.ui_sounds_enabled {
             return;
         }
-        let volume = f32::from(self.session.prefs.start_screen_sound_volume) / 100.0;
+        let volume = f32::from(self.session.prefs.ui_sound_volume) / 100.0;
         self.sound.play(kind, volume);
     }
 
@@ -27,9 +26,7 @@ impl App {
     }
 
     pub(crate) fn play_ui_haptic(&self, kind: UiSoundKind) {
-        if !self.session.prefs.start_screen_haptics_enabled
-            || crate::platform::debug_quiet::enabled()
-        {
+        if !self.session.prefs.ui_haptics_enabled || crate::platform::debug_quiet::enabled() {
             return;
         }
         let Some(serial) = self.haptic_pad_serial.as_ref() else {
@@ -41,8 +38,7 @@ impl App {
             UiSoundKind::Hold => MotorPulse::HOLD,
             UiSoundKind::Slide => MotorPulse::SLIDE,
         };
-        let (right, left, duration) =
-            pulse.scaled(self.session.prefs.start_screen_haptics_strength);
+        let (right, left, duration) = pulse.scaled(self.session.prefs.ui_haptics_strength);
         if right == 0 && left == 0 {
             return;
         }
@@ -52,13 +48,10 @@ impl App {
 
     /// Preview haptic on every connected DualSense (settings toggle / strength slider).
     pub(crate) fn preview_haptic_all(&self, pulse: MotorPulse) {
-        if !self.session.prefs.start_screen_haptics_enabled
-            || crate::platform::debug_quiet::enabled()
-        {
+        if !self.session.prefs.ui_haptics_enabled || crate::platform::debug_quiet::enabled() {
             return;
         }
-        let (right, left, duration) =
-            pulse.scaled(self.session.prefs.start_screen_haptics_strength);
+        let (right, left, duration) = pulse.scaled(self.session.prefs.ui_haptics_strength);
         if right == 0 && left == 0 {
             return;
         }
@@ -78,7 +71,7 @@ impl App {
     }
 
     pub(crate) fn apply_ui_sounds(&mut self, enabled: bool) -> Task<Message> {
-        self.session.prefs.start_screen_sounds_enabled = enabled;
+        self.session.prefs.ui_sounds_enabled = enabled;
         self.save_prefs();
         if enabled {
             self.play_ui_sound(UiSoundKind::Nav);
@@ -87,11 +80,11 @@ impl App {
     }
 
     pub(crate) fn apply_ui_sound_volume(&mut self, volume: u8) -> Task<Message> {
-        let volume = clamp_start_screen_sound_volume(volume);
-        if self.session.prefs.start_screen_sound_volume != volume {
-            self.session.prefs.start_screen_sound_volume = volume;
+        let volume = clamp_ui_sound_volume(volume);
+        if self.session.prefs.ui_sound_volume != volume {
+            self.session.prefs.ui_sound_volume = volume;
             self.save_prefs();
-            if self.session.prefs.start_screen_sounds_enabled {
+            if self.session.prefs.ui_sounds_enabled {
                 self.play_ui_sound(UiSoundKind::Nav);
             }
         }
@@ -99,7 +92,7 @@ impl App {
     }
 
     pub(crate) fn apply_ui_haptics(&mut self, enabled: bool) -> Task<Message> {
-        self.session.prefs.start_screen_haptics_enabled = enabled;
+        self.session.prefs.ui_haptics_enabled = enabled;
         self.save_prefs();
         if enabled {
             self.preview_haptic_all(MotorPulse::NAV);
@@ -110,11 +103,11 @@ impl App {
     }
 
     pub(crate) fn apply_ui_haptics_strength(&mut self, strength: u8) -> Task<Message> {
-        let strength = clamp_start_screen_haptics_strength(strength);
-        if self.session.prefs.start_screen_haptics_strength != strength {
-            self.session.prefs.start_screen_haptics_strength = strength;
+        let strength = clamp_ui_haptics_strength(strength);
+        if self.session.prefs.ui_haptics_strength != strength {
+            self.session.prefs.ui_haptics_strength = strength;
             self.save_prefs();
-            if self.session.prefs.start_screen_haptics_enabled {
+            if self.session.prefs.ui_haptics_enabled {
                 self.preview_haptic_all(MotorPulse::NAV);
             }
         }

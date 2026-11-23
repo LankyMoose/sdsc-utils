@@ -33,7 +33,7 @@ pub const BASE_MS: u64 = 280;
 /// Large surface transition: art crossfades, veil-style fades.
 pub const SLOW_MS: u64 = 450;
 
-/// Hub/Browser entrance: let the card appear first; the full-screen backdrop
+/// Home/Browser entrance: let the card appear first; the full-screen backdrop
 /// stays clear briefly, then fades in behind it.
 pub const SHELL_BACKDROP_DELAY: Duration = Duration::from_millis(140);
 pub const SHELL_BACKDROP_FADE: Duration = Duration::from_millis(220);

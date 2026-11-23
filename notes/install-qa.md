@@ -26,7 +26,7 @@ zips, the CEF DLC zip, installed copies, and private `APPDATA` dirs.
 - **No CEF by default.** With **Bundle browser engine** unchecked, the staged
   install contains only `sdsc-utils.exe` (plus the exe's non-CEF runtime) and
   the private appdata has no `cef-engine`. The app binary delay-loads
-  `libcef.dll`, so it starts cleanly and the hub shows Browser as not
+  `libcef.dll`, so it starts cleanly and Home shows Browser as not
   installed. **Apps → Browser → Install** downloads the engine zip from this
   server, verifies the SHA-256, extracts it under the private appdata, and
   attaches CEF in the same process — no relaunch required.
@@ -56,7 +56,7 @@ zips, the CEF DLC zip, installed copies, and private `APPDATA` dirs.
 CEF entry point is first called. Every entry point resolves the runtime
 directory and calls `SetDllDirectoryW` first (`browser::cef_backend`), so:
 
-- no runtime → `execute_subprocess()` returns `None`, the app starts, the hub
+- no runtime → `execute_subprocess()` returns `None`, the app starts, Home
   offers Install;
 - runtime installed later → the next `spawn_engine` loads `libcef.dll` from
   the resolved directory and initializes CEF in-process.
@@ -75,7 +75,7 @@ runtime is left intact until exit. The next boot deletes the pending old
 copies and loads the pointer target.
 
 Each install writes `engine.json` (version, CEF/Chromium source versions,
-changelog, measured size). The app checks `/engine-manifest` on hub open and
+changelog, measured size). The app checks `/engine-manifest` on Home open and
 compares that version with the installed copy; a newer feed shows an Update
 badge and the Update action. Updates use the same versioned store, so the
 running CEF stays loaded until restart (`Restart to finish` in Info).
@@ -83,13 +83,13 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
 ## Update, cancel, and settings
 
 - **Publish update** in the DLC card bumps the engine version and saves the
-  changelog. The app sees it on the next hub open (relaunch, or close/reopen
-  the hub) and offers **Update**.
+  changelog. The app sees it on the next Home open (relaunch, or close/reopen
+  Home) and offers **Update**.
 - **Cancel** during Downloading/Verifying/Installing: Circle/Esc or the Cancel
   action row. The worker deletes staging, restores the previous install, and
   leaves the pointer untouched.
-- **Download speed** lives in PS hub → Settings → App installs
-  (`Unlimited / 2 / 5 / 10 MB/s`). It is hub-owned policy, shared live with
+- **Download speed** lives in Home → Settings → App installs
+  (`Unlimited / 2 / 5 / 10 MB/s`). It is Home-owned policy, shared live with
   every standalone managed-app install (Browser engine today, future catalog
   apps later), and hidden in packaged builds because the Store owns downloads.
   The tile shows the live `current / target` size and MB/s; there is no
@@ -99,30 +99,30 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
   Browser reports **Managed by Store**, Uninstall is hidden, and Info shows the
   version/size without a local uninstall path.
 
-## Hub layout and pad input
+## Home layout and pad input
 
-- The hub card keeps three rows and no outer padding: branding header
+- The Home card keeps three rows and no outer padding: branding header
   (DualSense mark + `SDSC Utils`), apps (Launcher / Browser), then action hints
   left-to-right: **SELECT Controllers** and **START Settings**. Hints are
   display-only; the pad owns every action.
 - The controllers list is the restored Launcher-style dock in the monitor's
   top-right corner: collapsed battery-ring column by default; Select/Share
   (Create) expands it in place and moves focus to controllers. It has no
-  section title or count. The dock stays visible while hub Settings is open
+  section title or count. The dock stays visible while Home Settings is open
   (display-only there) and hides only for Info/action modals.
 - While the dock is expanded, Up/Down or Left/Right move the controller
   selection, Cross identifies, Triangle hold powers off a live Bluetooth pad,
   Square toggles Connected/All in the dock footer, and Circle collapses the
-  dock (a second Circle closes the hub). Up/Down have no row-focus role on the
-  main hub outside the dock.
-- **Options** (or the START Settings hint) opens hub Settings. The screen uses
+  dock (a second Circle closes Home). Up/Down have no row-focus role on the
+  main Home outside the dock.
+- **Options** (or the START Settings hint) opens Home Settings. The screen uses
   Launcher-settings sections and controls: **Feedback** (UI sounds, volume,
   controller haptics, strength) and **App installs** (Download speed, hidden
-  in packaged builds). The cap is hub-owned and applies to every standalone
+  in packaged builds). The cap is Home-owned and applies to every standalone
   managed-app install/update. The disconnected-controller filter is no longer
   a settings row; Square in the dock owns it. Feedback prefs are global
-  (Launcher, Browser, and hub).
-- Hub Settings and the dock are controller/keyboard only. The sole mouse
+  (Launcher, Browser, and Home).
+- Home Settings and the dock are controller/keyboard only. The sole mouse
   binding is clicking the backdrop of the active panel, which acts like
   Circle. Cross launches the focused app; Triangle on the Browser tile opens
   its install/update/Info actions popup (the old catalog screen is gone).
@@ -137,7 +137,7 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
 | `SDSC_MSIX_ENGINE_DIR` | resolver mock for the optional BrowserEngine package |
 | `SDSC_CEF_NO_BUILD_FALLBACK` | engine resolver in debug/qa-feed builds |
 | `APPDATA` | app data dir (`%APPDATA%\sdsc-utils`) |
-| `SDSC_DEBUG_OPEN` | debug builds: open `hub`/`browser`/etc. after boot |
+| `SDSC_DEBUG_OPEN` | debug builds: open `home`/`launcher`/`browser`/etc. after boot |
 | `SDSC_DEBUG_QUIET` | `1` forces quiet secondary placement; `0` opts out of debug-open quiet |
 | `SDSC_DEBUG_INPUT` | `1` keeps pad edges live; `0` drops them (even outside quiet mode) |
 
@@ -173,13 +173,13 @@ reuse it.
 
 1. Set the version/manifest (default `v1.7.4`); the binary is 1.7.3.
 2. Leave **Bundle browser engine** unchecked; choose **Debug**; press
-   **Build & launch**. The hub opens with no CEF sidecar and clean appdata.
+   **Build & launch**. Home opens with no CEF sidecar and clean appdata.
 3. **Apps → Browser → Install** (X/Cross). The catalog downloads the local CEF
    zip, verifies the SHA-256, installs under the private `APPDATA`, and starts
    the engine. The Browser tile becomes usable.
 4. **Apps → Browser → Info** shows the engine version, `Size on disk`, pending
    cleanup, and the changelog (no app version line).
-5. Set a new engine version, press **Publish update**, and reopen the hub to
+5. Set a new engine version, press **Publish update**, and reopen Home to
    test Update; cancel mid-download with Circle/Esc.
 6. **Relaunch** to exercise a process that finds the downloaded engine at boot.
 7. To test the already-installed layout, check **Bundle browser engine** and

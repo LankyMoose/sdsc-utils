@@ -72,7 +72,7 @@ pub fn focus(hwnd: isize) {
 }
 
 /// Raise a window to the top of the z-order without activating it. Used for
-/// the non-activating toast so it can sit above the hub's full-screen scrim.
+/// the non-activating toast so it can sit above Home's full-screen scrim.
 pub fn raise_no_activate(hwnd: isize) {
     #[cfg(windows)]
     {

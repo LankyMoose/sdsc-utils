@@ -12,7 +12,7 @@
 //! same process even while the old runtime is still loaded.
 //!
 //! Installs carry an `engine.json` manifest copy (version, changelog, source
-//! versions, size). The hub compares that against the latest feed manifest to
+//! versions, size). Home compares that against the latest feed manifest to
 //! offer updates and renders the changelog in Info.
 //!
 //! No URL/hash is compiled in: the DLC feed is deployment configuration, not
@@ -41,7 +41,7 @@ const LOCAL_STAGING_DIR: &str = "cef-engine.staging";
 const LOCAL_PENDING_FILE: &str = "cef-engine.uninstall";
 const LOCAL_META_FILE: &str = "engine.json";
 
-/// Download caps offered in hub Settings. `0` means unlimited.
+/// Download caps offered in Home Settings. `0` means unlimited.
 pub const DOWNLOAD_LIMIT_OPTIONS_KBPS: [u32; 4] = crate::app::installs::DOWNLOAD_LIMIT_OPTIONS_KBPS;
 
 /// Latest DLC feed metadata. Served by the QA console in development and by
@@ -83,7 +83,7 @@ pub struct EngineMeta {
     pub changelog: String,
 }
 
-/// Install phases reported to the hub while the engine DLC is prepared.
+/// Install phases reported to Home while the engine DLC is prepared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallProgress {
     Starting,
@@ -113,7 +113,7 @@ impl std::fmt::Display for InstallError {
 #[derive(Clone)]
 pub struct InstallOptions {
     /// `0` = unlimited; otherwise cap the download at this many KB/s. The
-    /// atomic is shared with hub Settings, so a change applies at the next
+    /// atomic is shared with Home Settings, so a change applies at the next
     /// chunk boundary of a live download.
     pub download_limit_kbps: Arc<AtomicU32>,
     pub cancel: Arc<AtomicBool>,
@@ -487,7 +487,7 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), InstallError> {
 }
 
 /// Token-bucket limiter over the download. The cap is read from a shared
-/// atomic on every chunk, so hub Settings changes apply to a live download.
+/// atomic on every chunk, so Home Settings changes apply to a live download.
 /// Sleeping stays in short slices so Cancel is immediate even at a low cap.
 struct RateLimiter {
     limit_kbps: Arc<AtomicU32>,
@@ -764,7 +764,7 @@ pub fn pending_cleanup_size() -> u64 {
 }
 
 /// Remove a locally installed engine. The active pointer is dropped
-/// immediately (the hub reports Missing); the directory itself is deferred
+/// immediately (Home reports Missing); the directory itself is deferred
 /// until the next boot because the running process has `libcef.dll` mapped.
 /// Reinstall works now because a new versioned directory is used.
 pub fn uninstall_local(path: &Path) -> Result<(), String> {

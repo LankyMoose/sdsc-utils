@@ -8,7 +8,7 @@ pub mod configure;
 #[cfg(debug_assertions)]
 pub mod debug_bounds;
 pub mod face;
-pub mod hub;
+pub mod home;
 pub mod icon;
 pub mod launcher;
 pub mod layout;
