@@ -30,11 +30,8 @@
   hub, standalone Browser window, CEF OSR engine. Absorbed the pivot at
   `d245777` (also contains the former `browser/multi-app-suspend-spike` /
   `browser/tabs` work). Plan/handoff: `notes/browser-hub-pivot.md`.
-- `browser/hub-pivot` — the hub-pivot work line; fully merged into
-  `browser/main` at `d245777`, so it is safe to delete or reuse for follow-up
-  hub work. Land changes on `browser/main` unless a separate line is wanted.
-- `backup/pre-split-full` — pre-split snapshot. Its keep-until-the-pivot-merges
-  condition is met, so it can be dropped once nothing needs the history.
+- Land changes on `browser/main`; the pivot line and the pre-split snapshot
+  branch were removed once the pivot merged.
 
 
 ## Build / test / lint ordering
