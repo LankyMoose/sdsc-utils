@@ -2365,9 +2365,17 @@ fn poll_incremental(
         }
         // Full probe: new serial, unknown hint, or re-probe after a drop.
         // Re-resolve the device by path (list may have shifted since enumerate).
-        if skip_probe.contains(&path) || actively_used {
+        // While input is hot the sample loop owns every input report; opening
+        // or probing here could consume a press/release before the interpreter.
+        if skip_probe.contains(&path) || actively_used || input_hot {
             if log_probe_skip {
-                let reason = if actively_used { "active" } else { "backoff" };
+                let reason = if actively_used {
+                    "active"
+                } else if input_hot {
+                    "input-hot"
+                } else {
+                    "backoff"
+                };
                 crate::controller::hid::diag::diag_info(format!(
                     "hid-diag: probe skip path={path} reason={reason} fails={} input_hot={}",
                     cache.probe_fails(&path),
