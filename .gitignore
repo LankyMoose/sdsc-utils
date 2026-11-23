@@ -1,3 +1,6 @@
 /target
 /packaging/Assets/*.png
 *.key
+# Python bytecode from scripts/ (QA console)
+__pycache__/
+*.pyc
