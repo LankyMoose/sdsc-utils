@@ -350,12 +350,14 @@ pub enum PadButton {
     Triangle,
     Options,
     Create,
+    L1,
+    R1,
     L3,
     R3,
 }
 
 impl PadButton {
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 10;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Cross,
         Self::Circle,
@@ -363,9 +365,13 @@ impl PadButton {
         Self::Triangle,
         Self::Options,
         Self::Create,
+        Self::L1,
+        Self::R1,
         Self::L3,
         Self::R3,
     ];
+    const L1_INDEX: usize = 6;
+    const R1_INDEX: usize = 7;
 
     fn raw(self, sample: &PadSample) -> bool {
         match self {
@@ -375,6 +381,8 @@ impl PadButton {
             Self::Triangle => sample.triangle,
             Self::Options => sample.options,
             Self::Create => sample.create,
+            Self::L1 => sample.l1,
+            Self::R1 => sample.r1,
             Self::L3 => sample.l3,
             Self::R3 => sample.held.contains(&GestureControl::R3),
         }
@@ -386,10 +394,16 @@ impl PadButton {
         matches!(self, Self::R3)
     }
 
+    /// Bumpers use the shared tap/hold state machine rather than the generic
+    /// tap path (both-held and side-switch semantics live there).
+    fn is_bumper(self) -> bool {
+        matches!(self, Self::L1 | Self::R1)
+    }
+
     /// Face/Options/Create presses cancel each other's pending tap, matching
-    /// the old release-cancellation discipline. L3/R3 are independent.
+    /// the old release-cancellation discipline. Bumpers/L3/R3 are independent.
     fn cancels_others(self) -> bool {
-        !matches!(self, Self::L3 | Self::R3)
+        !matches!(self, Self::L1 | Self::R1 | Self::L3 | Self::R3)
     }
 }
 
@@ -397,6 +411,8 @@ impl PadButton {
 #[serde(rename_all = "snake_case")]
 pub enum PadButtonAction {
     Tap,
+    /// Bumper held past [`BUMPER_HOLD`]; the matching release emits nothing.
+    Hold,
 }
 
 /// One semantic button action from the source interpreter. Ordered and
@@ -440,10 +456,21 @@ impl ButtonDebounce {
 pub struct PadInterpreter {
     buttons: [ButtonDebounce; PadButton::COUNT],
     cancelled: [bool; PadButton::COUNT],
+    bumpers: BumperHold,
 }
 
 impl PadInterpreter {
+    /// Test/legacy convenience: process reports with a fresh clock.
     pub fn ingest(&mut self, pad: &PadId, reports: &[PadSample]) -> Vec<PadAction> {
+        self.ingest_at(pad, reports, Instant::now())
+    }
+
+    pub fn ingest_at(
+        &mut self,
+        pad: &PadId,
+        reports: &[PadSample],
+        now: Instant,
+    ) -> Vec<PadAction> {
         let mut actions = Vec::new();
         for sample in reports {
             let was_stable: [bool; PadButton::COUNT] =
@@ -467,6 +494,9 @@ impl PadInterpreter {
             }
             for (index, pressed) in transitions {
                 let button = PadButton::ALL[index];
+                if button.is_bumper() {
+                    continue;
+                }
                 let tap = if pressed {
                     button.tap_on_press()
                 } else {
@@ -483,6 +513,24 @@ impl PadInterpreter {
                 }
             }
         }
+        // Bumpers keep their original at-most-one-side tap/hold semantics.
+        if let Some(event) = self.bumpers.update(
+            self.buttons[PadButton::L1_INDEX].stable,
+            self.buttons[PadButton::R1_INDEX].stable,
+            now,
+        ) {
+            let (button, action) = match event {
+                BumperHoldEvent::Tap(BumperSide::Left) => (PadButton::L1, PadButtonAction::Tap),
+                BumperHoldEvent::Tap(BumperSide::Right) => (PadButton::R1, PadButtonAction::Tap),
+                BumperHoldEvent::Open(BumperSide::Left) => (PadButton::L1, PadButtonAction::Hold),
+                BumperHoldEvent::Open(BumperSide::Right) => (PadButton::R1, PadButtonAction::Hold),
+            };
+            actions.push(PadAction {
+                pad: pad.clone(),
+                button,
+                action,
+            });
+        }
         actions
     }
 }
@@ -495,10 +543,19 @@ pub struct PadInterpreterBank {
 
 impl PadInterpreterBank {
     pub fn ingest(&mut self, pad: &PadId, reports: &[PadSample]) -> Vec<PadAction> {
+        self.ingest_at(pad, reports, Instant::now())
+    }
+
+    pub fn ingest_at(
+        &mut self,
+        pad: &PadId,
+        reports: &[PadSample],
+        now: Instant,
+    ) -> Vec<PadAction> {
         self.pads
             .entry(pad.clone())
             .or_default()
-            .ingest(pad, reports)
+            .ingest_at(pad, reports, now)
     }
 
     pub fn retain_live(&mut self, live: &HashSet<PadId>) {
@@ -824,199 +881,47 @@ impl NavStepper {
     }
 }
 
+/// Which hold owns the press for foreign-press cancellation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EdgeButton {
+pub enum HoldOwner {
     Cross,
-    Circle,
-    Square,
     Triangle,
-    Options,
-    Create,
 }
 
-impl EdgeButton {
-    const ALL: [Self; 6] = [
-        Self::Cross,
-        Self::Circle,
-        Self::Square,
-        Self::Triangle,
-        Self::Options,
-        Self::Create,
-    ];
-
-    /// Face + Options + Create: activate on release.
-    const RELEASE_FIRE: [Self; 6] = [
-        Self::Cross,
-        Self::Circle,
-        Self::Square,
-        Self::Triangle,
-        Self::Options,
-        Self::Create,
-    ];
-
-    fn action(self) -> Option<NavAction> {
-        match self {
-            Self::Cross => Some(NavAction::Confirm),
-            Self::Circle => Some(NavAction::Cancel),
-            // Sort stays on Square in browse and edit; manual Edit is mouse-only.
-            Self::Square => Some(NavAction::CycleSort),
-            // Browse: enter edit. Edit: save (ToggleEdit commits).
-            Self::Triangle => Some(NavAction::ToggleEdit),
-            Self::Options => Some(NavAction::ToggleSettings),
-            // Create (Select): legacy controllers-surface toggle (inert).
-            Self::Create => Some(NavAction::ToggleControllers),
-        }
-    }
-
-    fn held(self, sample: &PadSample) -> bool {
-        match self {
-            Self::Cross => sample.cross,
-            Self::Circle => sample.circle,
-            Self::Square => sample.square,
-            Self::Triangle => sample.triangle,
-            Self::Options => sample.options,
-            Self::Create => sample.create,
-        }
-    }
-}
-
-/// Face/Options/Create fire on release; bumper taps fire on release via
-/// [`BumperHold`] (hold-vs-tap disambiguation for the history selector).
-/// `hold_owned` never fires here.
+/// Previous face/Options/Create held state. Taps are source-side actions now;
+/// this only exists so a Triangle/Cross hold can tell whether another button
+/// just went down.
 #[derive(Debug, Clone, Default)]
-pub struct ButtonEdges {
+struct HeldButtons {
     cross: bool,
     circle: bool,
     square: bool,
     triangle: bool,
     options: bool,
     create: bool,
-    l1: bool,
-    r1: bool,
-    /// Face/Options/Create that went down but were cancelled by a foreign face press.
-    cancel_cross: bool,
-    cancel_circle: bool,
-    cancel_square: bool,
-    cancel_triangle: bool,
-    cancel_options: bool,
-    cancel_create: bool,
 }
 
-impl ButtonEdges {
-    fn prev_held(&self, button: EdgeButton) -> bool {
-        match button {
-            EdgeButton::Cross => self.cross,
-            EdgeButton::Circle => self.circle,
-            EdgeButton::Square => self.square,
-            EdgeButton::Triangle => self.triangle,
-            EdgeButton::Options => self.options,
-            EdgeButton::Create => self.create,
-        }
+impl HeldButtons {
+    fn foreign_press(&self, sample: &PadSample, except: Option<HoldOwner>) -> bool {
+        (sample.cross && except != Some(HoldOwner::Cross) && !self.cross)
+            || (sample.triangle && except != Some(HoldOwner::Triangle) && !self.triangle)
+            || (sample.circle && !self.circle)
+            || (sample.square && !self.square)
+            || (sample.options && !self.options)
+            || (sample.create && !self.create)
     }
 
-    fn cancelled(&self, button: EdgeButton) -> bool {
-        match button {
-            EdgeButton::Cross => self.cancel_cross,
-            EdgeButton::Circle => self.cancel_circle,
-            EdgeButton::Square => self.cancel_square,
-            EdgeButton::Triangle => self.cancel_triangle,
-            EdgeButton::Options => self.cancel_options,
-            EdgeButton::Create => self.cancel_create,
-        }
-    }
-
-    fn set_cancelled(&mut self, button: EdgeButton, value: bool) {
-        match button {
-            EdgeButton::Cross => self.cancel_cross = value,
-            EdgeButton::Circle => self.cancel_circle = value,
-            EdgeButton::Square => self.cancel_square = value,
-            EdgeButton::Triangle => self.cancel_triangle = value,
-            EdgeButton::Options => self.cancel_options = value,
-            EdgeButton::Create => self.cancel_create = value,
-        }
-    }
-
-    /// True when any control other than `except` just went down.
-    pub fn foreign_press(&self, sample: &PadSample, except: Option<EdgeButton>) -> bool {
-        EdgeButton::ALL
-            .iter()
-            .any(|&b| Some(b) != except && b.held(sample) && !self.prev_held(b))
-    }
-
-    /// Release edges for face/Options/Create unless cancelled or `hold_owned`.
-    pub fn update(
-        &mut self,
-        sample: &PadSample,
-        hold_owned: Option<EdgeButton>,
-    ) -> Option<NavAction> {
-        // Foreign face/Options/Create press cancels other held pending releases.
-        for &b in &EdgeButton::RELEASE_FIRE {
-            let now = b.held(sample);
-            let was = self.prev_held(b);
-            if now && !was {
-                for &other in &EdgeButton::RELEASE_FIRE {
-                    if other != b && self.prev_held(other) {
-                        self.set_cancelled(other, true);
-                    }
-                }
-            }
-        }
-
-        let mut action = None;
-        for &b in &EdgeButton::RELEASE_FIRE {
-            let now = b.held(sample);
-            let was = self.prev_held(b);
-            if was && !now {
-                let cancelled = self.cancelled(b);
-                self.set_cancelled(b, false);
-                if !cancelled && Some(b) != hold_owned && action.is_none() {
-                    action = b.action();
-                }
-            }
-        }
-
-        self.sync(sample);
-        action
-    }
-
-    /// Track held buttons without firing (used while nav is disarmed / animating).
-    pub fn sync(&mut self, sample: &PadSample) {
+    fn sync(&mut self, sample: &PadSample) {
         self.cross = sample.cross;
         self.circle = sample.circle;
         self.square = sample.square;
         self.triangle = sample.triangle;
         self.options = sample.options;
         self.create = sample.create;
-        self.l1 = sample.l1;
-        self.r1 = sample.r1;
     }
 
-    /// Rising edge on L1/R1 (browser history). Checked before `update` syncs,
-    /// like the release path below. LEGACY press-edge path: `PadNavBank::tick`
-    /// no longer calls this — bumper taps now flow through [`BumperHold`]
-    /// (release-timed) so a hold can claim the press first. Kept for
-    /// unit tests of the old discipline.
-    pub fn bumper_press(&self, sample: &PadSample) -> Option<NavAction> {
-        if sample.l1 && !self.l1 {
-            Some(NavAction::BumperLeft)
-        } else if sample.r1 && !self.r1 {
-            Some(NavAction::BumperRight)
-        } else {
-            None
-        }
-    }
-
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
         *self = Self::default();
-    }
-
-    /// Mark every currently held face/Options/Create so its pending release will not fire.
-    pub fn cancel_held_releases(&mut self) {
-        for &b in &EdgeButton::RELEASE_FIRE {
-            if self.prev_held(b) {
-                self.set_cancelled(b, true);
-            }
-        }
     }
 }
 
@@ -1443,10 +1348,9 @@ pub fn soft_stick(x: f32, y: f32) -> (f32, f32) {
 #[derive(Debug, Clone, Default)]
 struct PadSlot {
     nav_stepper: NavStepper,
-    button_edges: ButtonEdges,
+    held: HeldButtons,
     triangle_hold: TriangleHold,
     cross_hold: CrossHold,
-    bumper_hold: BumperHold,
     armed: bool,
 }
 
@@ -1529,21 +1433,11 @@ impl PadNavBank {
         self.arm_new_pads = arm_immediately;
     }
 
-    /// Abort Triangle / Cross charge and decay immediately, and drop any
-    /// in-progress bumper hold (so a hold started before a modal cannot
-    /// pop the history selector over it).
+    /// Abort Triangle / Cross charge and decay immediately.
     pub fn cancel_holds(&mut self) {
         for slot in self.slots.values_mut() {
             slot.triangle_hold.cancel();
             slot.cross_hold.cancel();
-            slot.bumper_hold.reset();
-        }
-    }
-
-    /// Cancel pending face/Options releases on every pad (e.g. after a slide change).
-    pub fn cancel_held_face_releases(&mut self) {
-        for slot in self.slots.values_mut() {
-            slot.button_edges.cancel_held_releases();
         }
     }
 
@@ -1579,7 +1473,6 @@ impl PadNavBank {
             ..Default::default()
         };
 
-        let mut button_action: Option<(PadId, NavAction)> = None;
         let mut nav_action: Option<(PadId, NavAction)> = None;
         let mut newly_armed: Vec<PadId> = Vec::new();
 
@@ -1589,12 +1482,11 @@ impl PadNavBank {
             };
 
             if !slot.armed {
-                slot.button_edges.clear();
-                slot.button_edges.sync(&reading.sample);
+                slot.held.clear();
+                slot.held.sync(&reading.sample);
                 slot.nav_stepper.reset();
                 slot.triangle_hold.reset();
                 slot.cross_hold.reset();
-                slot.bumper_hold.reset();
                 if sample_nav_resting(&reading.sample) {
                     slot.armed = true;
                     newly_armed.push(reading.id.clone());
@@ -1625,24 +1517,15 @@ impl PadNavBank {
                     || reading.sample.stick_x != 0.0
                     || reading.sample.stick_y != 0.0;
                 let foreign = slot
-                    .button_edges
-                    .foreign_press(&reading.sample, Some(EdgeButton::Cross));
+                    .held
+                    .foreign_press(&reading.sample, Some(HoldOwner::Cross));
                 if slot.cross_hold.is_active() && (stick_interrupt || foreign) {
                     slot.cross_hold.cancel();
                     result.cross_progress = 0.0;
                     result.cross_completed = false;
                     result.cross_completed_pad = None;
                 }
-
-                let edge = slot
-                    .button_edges
-                    .update(&reading.sample, Some(EdgeButton::Cross));
-                if let Some(action) = edge
-                    && action == NavAction::Cancel
-                    && button_action.is_none()
-                {
-                    button_action = Some((reading.id.clone(), action));
-                }
+                slot.held.sync(&reading.sample);
                 continue;
             }
 
@@ -1664,8 +1547,8 @@ impl PadNavBank {
                     || reading.sample.stick_x != 0.0
                     || reading.sample.stick_y != 0.0;
                 let foreign = slot
-                    .button_edges
-                    .foreign_press(&reading.sample, Some(EdgeButton::Cross));
+                    .held
+                    .foreign_press(&reading.sample, Some(HoldOwner::Cross));
                 if slot.cross_hold.is_active() && (stick_interrupt || foreign) {
                     slot.cross_hold.cancel();
                     result.cross_progress = 0.0;
@@ -1678,7 +1561,7 @@ impl PadNavBank {
 
             let hold_owned = if hold_cross_close {
                 slot.triangle_hold.reset();
-                Some(EdgeButton::Cross)
+                Some(HoldOwner::Cross)
             } else if hold_triangle_power {
                 let (t_progress, t_completed) =
                     slot.triangle_hold.update(reading.sample.triangle, now);
@@ -1689,7 +1572,7 @@ impl PadNavBank {
                     result.triangle_completed = true;
                     result.triangle_completed_pad = Some(reading.id.clone());
                 }
-                Some(EdgeButton::Triangle)
+                Some(HoldOwner::Triangle)
             } else {
                 slot.triangle_hold.reset();
                 None
@@ -1717,7 +1600,7 @@ impl PadNavBank {
                 other => Some(other),
             });
 
-            let foreign = slot.button_edges.foreign_press(&reading.sample, hold_owned);
+            let foreign = slot.held.foreign_press(&reading.sample, hold_owned);
             if hold_triangle_power && slot.triangle_hold.is_active() && (nav.is_some() || foreign) {
                 slot.triangle_hold.cancel();
                 result.triangle_progress = 0.0;
@@ -1725,36 +1608,15 @@ impl PadNavBank {
                 result.triangle_completed_pad = None;
             }
 
-            // Bumper taps still use the hold tracker for tap-vs-hold. Face,
-            // Options/Create and L3 taps are source-side PadActions now; this
-            // update only maintains the cancellation/held state used by
-            // holds, so its edge result is deliberately ignored.
-            let bumper = slot
-                .bumper_hold
-                .update(reading.sample.l1, reading.sample.r1, now);
-            let bumper = bumper.map(|event| match event {
-                BumperHoldEvent::Tap(BumperSide::Left) => NavAction::BumperLeft,
-                BumperHoldEvent::Tap(BumperSide::Right) => NavAction::BumperRight,
-                BumperHoldEvent::Open(BumperSide::Left) => NavAction::BumperHoldLeft,
-                BumperHoldEvent::Open(BumperSide::Right) => NavAction::BumperHoldRight,
-            });
-            let _ = slot.button_edges.update(&reading.sample, hold_owned);
-
             if let Some(action) = nav
                 && nav_action.is_none()
             {
                 nav_action = Some((reading.id.clone(), action));
             }
-            if let Some(action) = bumper
-                && button_action.is_none()
-            {
-                button_action = Some((reading.id.clone(), action));
-            }
+            slot.held.sync(&reading.sample);
         }
 
-        // Prefer button over stick/D-pad when both fire this tick.
-        let chosen = button_action.or(nav_action);
-        if let Some((id, action)) = chosen {
+        if let Some((id, action)) = nav_action {
             result.diag = readings.iter().find(|r| r.id == id).cloned();
             result.action_pad = Some(id);
             result.action = Some(action);
@@ -1780,8 +1642,8 @@ impl PadNavBank {
                 continue;
             }
             let mut slot = PadSlot::default();
-            // First sight: sync edges without firing so held Cross is not a Confirm.
-            slot.button_edges.sync(&reading.sample);
+            // First sight: sync hold-cancellation state without firing.
+            slot.held.sync(&reading.sample);
             if self.arm_new_pads {
                 slot.armed = true;
             } else {
@@ -2202,152 +2064,6 @@ mod tests {
     }
 
     #[test]
-    fn button_edges_fires_square_cycle_sort_on_release() {
-        let mut edges = ButtonEdges::default();
-        let held = PadSample {
-            square: true,
-            ..Default::default()
-        };
-        assert!(edges.update(&held, None).is_none());
-        assert_eq!(
-            edges.update(&PadSample::default(), None),
-            Some(NavAction::CycleSort)
-        );
-    }
-
-    #[test]
-    fn button_edges_fires_triangle_toggle_edit_on_release() {
-        let mut edges = ButtonEdges::default();
-        let held = PadSample {
-            triangle: true,
-            ..Default::default()
-        };
-        assert!(edges.update(&held, None).is_none());
-        assert_eq!(
-            edges.update(&PadSample::default(), None),
-            Some(NavAction::ToggleEdit)
-        );
-    }
-
-    #[test]
-    fn button_edges_options_fires_toggle_settings_on_release() {
-        let mut edges = ButtonEdges::default();
-        let held = PadSample {
-            options: true,
-            ..Default::default()
-        };
-        assert!(edges.update(&held, None).is_none());
-        assert_eq!(
-            edges.update(&PadSample::default(), None),
-            Some(NavAction::ToggleSettings)
-        );
-    }
-
-    #[test]
-    fn button_edges_fires_cross_on_release() {
-        let mut edges = ButtonEdges::default();
-        let held = PadSample {
-            cross: true,
-            ..Default::default()
-        };
-        assert!(edges.update(&held, None).is_none());
-        assert_eq!(
-            edges.update(&PadSample::default(), None),
-            Some(NavAction::Confirm)
-        );
-    }
-
-    #[test]
-    fn button_edges_cancel_held_releases_blocks_square_toggle() {
-        let mut edges = ButtonEdges::default();
-        let square = PadSample {
-            square: true,
-            ..Default::default()
-        };
-        assert!(edges.update(&square, None).is_none());
-        edges.cancel_held_releases();
-        assert!(
-            edges.update(&PadSample::default(), None).is_none(),
-            "cancelled held Square must not CycleSort on release"
-        );
-    }
-
-    #[test]
-    fn button_edges_foreign_face_cancels_pending_release() {
-        let mut edges = ButtonEdges::default();
-        let square = PadSample {
-            square: true,
-            ..Default::default()
-        };
-        assert!(edges.update(&square, None).is_none());
-        let both = PadSample {
-            square: true,
-            circle: true,
-            ..Default::default()
-        };
-        assert!(edges.update(&both, None).is_none());
-        let circle_only = PadSample {
-            circle: true,
-            ..Default::default()
-        };
-        // Square released while cancelled — no CycleSort.
-        assert!(edges.update(&circle_only, None).is_none());
-        assert_eq!(
-            edges.update(&PadSample::default(), None),
-            Some(NavAction::Cancel)
-        );
-    }
-
-    #[test]
-    fn button_edges_create_fires_toggle_controllers_on_release() {
-        let mut edges = ButtonEdges::default();
-        let held = PadSample {
-            create: true,
-            ..Default::default()
-        };
-        assert!(edges.update(&held, None).is_none());
-        assert_eq!(
-            edges.update(&PadSample::default(), None),
-            Some(NavAction::ToggleControllers)
-        );
-    }
-
-    #[test]
-    fn button_edges_l2_r2_are_inert() {
-        let mut edges = ButtonEdges::default();
-        let r2 = PadSample {
-            r2: true,
-            ..Default::default()
-        };
-        assert!(edges.update(&r2, None).is_none());
-        assert!(edges.update(&r2, None).is_none());
-        assert!(edges.update(&PadSample::default(), None).is_none());
-
-        let l2 = PadSample {
-            l2: true,
-            ..Default::default()
-        };
-        assert!(edges.update(&l2, None).is_none());
-        assert!(edges.update(&PadSample::default(), None).is_none());
-    }
-
-    #[test]
-    fn button_edges_sync_then_held_create_fires_on_release() {
-        let mut edges = ButtonEdges::default();
-        let held = PadSample {
-            create: true,
-            ..Default::default()
-        };
-        edges.sync(&held);
-        assert!(edges.update(&held, None).is_none());
-        let released = PadSample::default();
-        assert_eq!(
-            edges.update(&released, None),
-            Some(NavAction::ToggleControllers)
-        );
-    }
-
-    #[test]
     fn nav_stepper_horizontal_disabled_ignores_left_right() {
         let mut stepper = NavStepper::default();
         let now = Instant::now();
@@ -2361,21 +2077,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(stepper.update(&up, now, false, true), Some(NavAction::Up));
-    }
-
-    #[test]
-    fn button_edges_hold_owned_triangle_never_arms() {
-        let mut edges = ButtonEdges::default();
-        let held = PadSample {
-            triangle: true,
-            ..Default::default()
-        };
-        assert!(edges.update(&held, Some(EdgeButton::Triangle)).is_none());
-        assert!(
-            edges
-                .update(&PadSample::default(), Some(EdgeButton::Triangle))
-                .is_none()
-        );
     }
 
     #[test]
@@ -2621,6 +2322,80 @@ mod tests {
                 .expect("post-rest edge")
                 .len(),
             1
+        );
+    }
+
+    fn l1_sample(pressed: bool) -> PadSample {
+        PadSample {
+            l1: pressed,
+            held: if pressed {
+                [GestureControl::L1].into_iter().collect()
+            } else {
+                Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn interpreter_emits_bumper_tap_on_short_release() {
+        let mut interpreter = PadInterpreter::default();
+        let pad = PadId("hid:a".into());
+        let now = Instant::now();
+        let n = usize::from(BUTTON_STABLE_REPORTS);
+        assert!(
+            interpreter
+                .ingest_at(&pad, &vec![l1_sample(true); n], now)
+                .is_empty()
+        );
+        assert_eq!(
+            interpreter.ingest_at(
+                &pad,
+                &vec![l1_sample(false); n],
+                now + Duration::from_millis(20)
+            ),
+            vec![PadAction {
+                pad,
+                button: PadButton::L1,
+                action: PadButtonAction::Tap,
+            }]
+        );
+    }
+
+    #[test]
+    fn interpreter_emits_bumper_hold_once_and_no_release_tap() {
+        let mut interpreter = PadInterpreter::default();
+        let pad = PadId("hid:a".into());
+        let now = Instant::now();
+        let n = usize::from(BUTTON_STABLE_REPORTS);
+        assert!(
+            interpreter
+                .ingest_at(&pad, &vec![l1_sample(true); n], now)
+                .is_empty()
+        );
+        assert_eq!(
+            interpreter.ingest_at(&pad, &[], now + BUMPER_HOLD),
+            vec![PadAction {
+                pad: pad.clone(),
+                button: PadButton::L1,
+                action: PadButtonAction::Hold,
+            }]
+        );
+        assert!(
+            interpreter
+                .ingest_at(&pad, &[], now + BUMPER_HOLD + Duration::from_millis(10))
+                .is_empty(),
+            "hold opens once"
+        );
+        assert!(
+            interpreter
+                .ingest_at(
+                    &pad,
+                    &vec![l1_sample(false); n],
+                    now + BUMPER_HOLD + Duration::from_millis(20)
+                )
+                .is_empty(),
+            "release after a hold is not also a tap"
         );
     }
 
@@ -3643,105 +3418,6 @@ mod tests {
     /// L1/R1 taps fire on release (hold-vs-tap disambiguation for the
     /// history selector), never repeat while held, and fire again after a
     /// release — without disturbing the face-button path.
-    #[test]
-    fn bumper_edges_fire_once_per_press() {
-        let mut bank = PadNavBank::default();
-        bank.prepare_on_open(true);
-        let now = Instant::now();
-        // First sight only syncs (never fires, even armed) — rest, then press.
-        let rest_tick = bank.tick(
-            &[reading("a", PadSample::default())],
-            now,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        );
-        assert!(rest_tick.action.is_none());
-        let l1 = PadSample {
-            l1: true,
-            held: [GestureControl::L1].into_iter().collect(),
-            ..Default::default()
-        };
-        // Press: silent (the hold may still claim it).
-        let press = bank.tick(
-            &[reading("a", l1)],
-            now,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        );
-        assert!(press.action.is_none());
-        // Held: silent.
-        let hold = bank.tick(
-            &[reading(
-                "a",
-                PadSample {
-                    l1: true,
-                    held: [GestureControl::L1].into_iter().collect(),
-                    ..Default::default()
-                },
-            )],
-            now,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        );
-        assert!(hold.action.is_none());
-        // Release before the threshold: tap fires. R1 maps right.
-        let release = bank.tick(
-            &[reading("a", PadSample::default())],
-            now,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        );
-        assert_eq!(release.action, Some(NavAction::BumperLeft));
-        let r1 = PadSample {
-            r1: true,
-            held: [GestureControl::R1].into_iter().collect(),
-            ..Default::default()
-        };
-        let _ = bank.tick(
-            &[reading("a", r1)],
-            now,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        );
-        let release2 = bank.tick(
-            &[reading("a", PadSample::default())],
-            now,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        );
-        assert_eq!(release2.action, Some(NavAction::BumperRight));
-    }
-
     #[test]
     fn bumper_hold_opens_selector_instead_of_tapping() {
         let mut hold = BumperHold::default();

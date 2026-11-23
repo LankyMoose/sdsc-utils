@@ -16,7 +16,7 @@ use crate::AppResult;
 use crate::browser::cursor::{JumpDir, VIEWPORT_H, VIEWPORT_W};
 use crate::browser::engine::{EngineCommand, EngineEvent};
 use crate::browser::keys::RawKey;
-use crate::domain::pad::{PadAction, PadButton, PadId};
+use crate::domain::pad::{PadAction, PadButton, PadButtonAction, PadId};
 use crate::games::process_match::RunningSession;
 use crate::games::steam::SteamGame;
 use crate::games::{self, GamesCatalog, launch, process_match, steam};
@@ -43,6 +43,9 @@ use std::time::{Duration, Instant};
 /// Map source-side tap actions to the Launcher's semantic nav actions.
 fn launcher_tap_action(actions: &[PadAction]) -> Option<(PadId, NavAction)> {
     actions.iter().find_map(|action| {
+        if action.action != PadButtonAction::Tap {
+            return None;
+        }
         let nav = match action.button {
             PadButton::Cross => NavAction::Confirm,
             PadButton::Circle => NavAction::Cancel,
@@ -50,7 +53,7 @@ fn launcher_tap_action(actions: &[PadAction]) -> Option<(PadId, NavAction)> {
             PadButton::Triangle => NavAction::ToggleEdit,
             PadButton::Options => NavAction::ToggleSettings,
             PadButton::Create => NavAction::ToggleControllers,
-            PadButton::L3 | PadButton::R3 => return None,
+            PadButton::L1 | PadButton::R1 | PadButton::L3 | PadButton::R3 => return None,
         };
         Some((action.pad.clone(), nav))
     })
@@ -707,7 +710,6 @@ impl App {
             None => return Task::none(),
         };
         self.browser.panel.history_selector = None;
-        self.browser.nav.cancel_held_face_releases();
         self.browser.panel.draft = url;
         if index == current {
             return Task::none();
@@ -739,7 +741,6 @@ impl App {
             return Task::none();
         }
         self.browser.panel.history_selector = None;
-        self.browser.nav.cancel_held_face_releases();
         self.note_launcher_activity();
         self.play_ui_cue(UiSoundKind::Action);
         crate::controller::hid::diag::diag_info("ui-diag: browser history selector cancel");
@@ -2697,7 +2698,6 @@ impl App {
 
     pub(crate) fn cancel_launcher_holds(&mut self) {
         self.pad_nav.cancel_holds();
-        self.pad_nav.cancel_held_face_releases();
         self.keyboard_cross_hold.cancel();
         self.launcher_state.triangle_progress = 0.0;
         self.launcher_state.cross_progress = 0.0;

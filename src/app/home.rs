@@ -202,6 +202,8 @@ fn home_tap_message(
         PadButton::Create
         | PadButton::Square
         | PadButton::Triangle
+        | PadButton::L1
+        | PadButton::R1
         | PadButton::L3
         | PadButton::R3 => None,
     }

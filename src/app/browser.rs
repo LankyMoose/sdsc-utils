@@ -7,7 +7,7 @@
 //! Browser window lands. See `notes/browser-Home-pivot.md`.
 
 use crate::browser::engine::{EngineCommand, EngineHandle};
-use crate::domain::pad::{NavAction, NavStepper, PadAction, PadButton, PadId};
+use crate::domain::pad::{NavAction, NavStepper, PadAction, PadButton, PadButtonAction, PadId};
 use crate::platform::ui_sound::UiSoundKind;
 use crate::ui::browser::BrowserPanel;
 use std::path::PathBuf;
@@ -117,15 +117,19 @@ use super::Message;
 /// Map source-side tap actions to the Browser's semantic nav actions.
 fn browser_tap_action(actions: &[PadAction]) -> Option<(PadId, NavAction)> {
     actions.iter().find_map(|action| {
-        let nav = match action.button {
-            PadButton::Cross => NavAction::Confirm,
-            PadButton::Circle => NavAction::Cancel,
-            PadButton::Square => NavAction::CycleSort,
-            PadButton::Triangle => NavAction::Triangle,
-            PadButton::Options => NavAction::ToggleSettings,
-            PadButton::Create => NavAction::ToggleControllers,
-            PadButton::L3 => NavAction::ToggleMagnetism,
-            PadButton::R3 => return None,
+        let nav = match (action.button, action.action) {
+            (PadButton::Cross, PadButtonAction::Tap) => NavAction::Confirm,
+            (PadButton::Circle, PadButtonAction::Tap) => NavAction::Cancel,
+            (PadButton::Square, PadButtonAction::Tap) => NavAction::CycleSort,
+            (PadButton::Triangle, PadButtonAction::Tap) => NavAction::Triangle,
+            (PadButton::Options, PadButtonAction::Tap) => NavAction::ToggleSettings,
+            (PadButton::Create, PadButtonAction::Tap) => NavAction::ToggleControllers,
+            (PadButton::L1, PadButtonAction::Tap) => NavAction::BumperLeft,
+            (PadButton::R1, PadButtonAction::Tap) => NavAction::BumperRight,
+            (PadButton::L1, PadButtonAction::Hold) => NavAction::BumperHoldLeft,
+            (PadButton::R1, PadButtonAction::Hold) => NavAction::BumperHoldRight,
+            (PadButton::L3, PadButtonAction::Tap) => NavAction::ToggleMagnetism,
+            _ => return None,
         };
         Some((action.pad.clone(), nav))
     })
@@ -429,8 +433,17 @@ impl super::App {
         );
         // Source-side taps replace the old per-surface face-edge reconstruction.
         if let Some((pad, action)) = browser_tap_action(tap_actions) {
-            tick.action = Some(action);
-            tick.action_pad = Some(pad);
+            // A hold that started before a URL/bookmark surface opened must
+            // not pop the history selector over it.
+            let hold_blocked = matches!(
+                action,
+                NavAction::BumperHoldLeft | NavAction::BumperHoldRight
+            ) && (self.browser.panel.url_editing
+                || self.browser.panel.bookmark_bubble);
+            if !hold_blocked {
+                tick.action = Some(action);
+                tick.action_pad = Some(pad);
+            }
         }
         self.set_haptic_pad_from_id(
             tick.action_pad
@@ -1230,6 +1243,14 @@ mod tests {
         }
     }
 
+    fn hold(button: PadButton) -> PadAction {
+        PadAction {
+            pad: PadId("hid:a".into()),
+            button,
+            action: PadButtonAction::Hold,
+        }
+    }
+
     #[test]
     fn browser_taps_map_to_semantic_actions() {
         for (button, expected) in [
@@ -1237,12 +1258,23 @@ mod tests {
             (PadButton::Circle, NavAction::Cancel),
             (PadButton::Triangle, NavAction::Triangle),
             (PadButton::L3, NavAction::ToggleMagnetism),
+            (PadButton::L1, NavAction::BumperLeft),
+            (PadButton::R1, NavAction::BumperRight),
         ] {
             assert_eq!(
                 browser_tap_action(&[tap(button)]).map(|(_, action)| action),
                 Some(expected)
             );
         }
+        assert_eq!(
+            browser_tap_action(&[hold(PadButton::L1)]).map(|(_, action)| action),
+            Some(NavAction::BumperHoldLeft)
+        );
+        assert_eq!(
+            browser_tap_action(&[hold(PadButton::R1)]).map(|(_, action)| action),
+            Some(NavAction::BumperHoldRight)
+        );
         assert!(browser_tap_action(&[tap(PadButton::R3)]).is_none());
+        assert!(browser_tap_action(&[hold(PadButton::Cross)]).is_none());
     }
 }

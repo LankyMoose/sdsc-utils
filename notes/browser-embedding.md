@@ -102,8 +102,9 @@ Face/Options/Create/L3/R3 taps are normalized at the HID source by
 `PadAction::Tap` events travel with the input edge. `PadActionGate` dedupes the
 UI sequence and keeps actions suppressed until a pad reaches rest after an owner
 change (Home/Browser/Launcher). L3 is a release tap; Browser maps its single
-action to the cursor-magnet toggle. Bumper tap/hold and analog/nav repeat still
-use the legacy per-surface bank.
+action to the cursor-magnet toggle. Bumper tap/hold is also a source action
+(L1/R1 `Tap`/`Hold`); analog/D-pad repeat and the Cross/Triangle hold progress
+meters still use the legacy per-surface bank.
 
 - Left stick moves the cursor with velocity + friction; magnet docks on
   arrival, centre-snaps on fresh acquisition, holds in place while scrolling.

@@ -1484,7 +1484,7 @@ fn sample_all_inputs(
     for serial in serials {
         match sample_one(cache, live_pads, serial.as_ref(), input_hot) {
             SampleOneResult::Ok { reading, reports } => {
-                actions.extend(interpreters.ingest(&reading.id, &reports));
+                actions.extend(interpreters.ingest_at(&reading.id, &reports, Instant::now()));
                 out.push(reading);
             }
             SampleOneResult::Timeout => {
@@ -1548,7 +1548,7 @@ fn sample_serial_into_snapshot(
 ) {
     match sample_one(cache, live_pads, serial, input_hot) {
         SampleOneResult::Ok { reading, reports } => {
-            let actions = interpreters.ingest(&reading.id, &reports);
+            let actions = interpreters.ingest_at(&reading.id, &reports, Instant::now());
             let edge = if let Ok(mut guard) = hub.snapshot_mutex().lock() {
                 guard.seq = guard.seq.saturating_add(1);
                 guard.published_at = Instant::now();
