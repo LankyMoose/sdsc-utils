@@ -120,49 +120,50 @@ meters still use the legacy per-surface bank.
 
 - Left stick moves the cursor with velocity + friction; magnet docks on
   arrival, centre-snaps on fresh acquisition, holds in place while scrolling.
-- D-pad: vertical is one row per press with column preserved; horizontal is
-  row-locked and stops at row ends. D-pad Up/Down is the explicit
-  header/page crossing; the analog stick may cross freely.
+- D-pad jumps spatially between page focusables (vertical cone, horizontal
+  row-locked); there is no browser header to cross in v0.
 - R2 turbo doubles cursor acceleration/cap and scroll speed while held and
   disables docking; release re-snaps in place.
 - Right stick scrolls only while the cursor is over the page. Scroll
   commands go straight to the engine as instant JS deltas (no wheel
   animation).
-- Cross clicks the docked target (chrome target first, then exact-element
-  click, else point click); Circle closes/backs out; Triangle edits the URL;
-  L1/R1 travel history (tap) or open the history selector (hold); L3 toggles
-  magnet; R3 dumps an issue bundle.
+- Cross clicks the docked page target (exact-element click, else point click).
+  Cross on a page text field also requests the system OSK. L1/R1/Options are
+  semantic back/forward/reload actions from the OS binding table (tap only);
+  L3 toggles magnet; R3 dumps an issue bundle. Circle/Esc do not close the
+  Browser — Home/PS is the only close path.
 - Real keyboard input goes to the page as `RAWKEYDOWN` + `CHAR` + `KEYUP`
-  (text needs the separate `CHAR` leg). `Ctrl+L`/`Ctrl+R` and
-  `Alt+Left`/`Alt+Right` stay app shortcuts; the URL field owns printable
-  keys while editing.
+  (text needs the separate `CHAR` leg). `Ctrl+R` and `Alt+Left`/`Alt+Right`
+  stay app shortcuts; there is no address field or Ctrl+L entry in v0.
 - Real page mouse supports left click, double/triple-click word/paragraph
   selection, drag selection, and native CEF wheel (lines × 120); CEF cursor
   shapes drive the OS cursor over the page. Right/middle click and a custom
   context menu are still unwired.
-- Page `window.open` / `target=_blank` is canceled as a native popup and
-  opened as a normal foreground tab instead. The source tab is preserved.
-- The on-screen keyboard (Square, or F6 on a hardware keyboard) types into
-  the focused page field or the URL draft. It also opens automatically when a
-  pointer click lands on an editable field and closes on blur; page-load
-  autofocus is ignored until the user points at the field. Page IME flows
-  through `ime_bridge` and CEF composition calls. See
-  [browser-osk.md](browser-osk.md).
+- Page `window.open` / `target=_blank` is denied entirely: no native popup,
+  no new tab, no navigation. `PopupRequested` is traced as
+  `browser.popup_denied`.
+- The system controller keyboard (Quadrant default, Grid fallback) is a
+  topmost no-activate overlay owned by the main app. Cross on a page text
+  field is the only opener; focus/autofocus never opens it. Real
+  mouse/keyboard/IME/touch closes it, and keyboard keys hand off to the page
+  (Escape consumed). Page IME still flows through `ime_bridge` and CEF
+  composition calls. See [controller-os-handoff.md](controller-os-handoff.md).
 - Automated sessions set `SDSC_DEBUG_INPUT=0`, which locks real pad,
   keyboard, mouse, and touch input (`ui::input_lock`). Quiet sessions also
   suppress the startup toast and controller auto-open Home. Replay drives the
   same handlers through synthetic `text`, `key`, `mouse.click`, `mouse.drag`,
-  `mouse.wheel`, `ime.*`, and `osk.*` steps and closes the Browser window at
-  `replay.done`; never use OS input injection for QA and do not leave test
-  windows on screen.
-- Tabs: favicon (CEF icon URLs, 64px cache keyed by origin) + minimum-width
-  title + close, active highlighted; crowded strips switch to an overflow
-  chip instead of collapsing titles. Background tabs suspend, strip
-  persists/restores lazily.
-- The saved strip is not written until the first Browser open has restored
+  `mouse.wheel`, `ime.*`, `cursor.dock`, `pad.tap`, `pad.dir`, and `osk.stick`
+  steps and closes the Browser window at `replay.done`; never use OS input
+  injection for QA and do not leave test windows on screen.
+- v0 is single-tab and chrome-less. Tab/session/bookmark backends and the
+  exact DevTools history-jump path stay dormant for the redesign; no tab
+  strip, address, bookmark/history UI, or status chrome is rendered. The
+  last page persists to `tabs.json` and is restored on open (crash-restart
+  boots use the default page).
+- The saved page is not written until the first Browser open has restored
   it. The engine preloads the saved active URL at boot and its early
-  `TitleChanged`/`UrlChanged` events used to persist a one-tab strip before
-  the restore read the file; `BrowserAppState::tabs_restored` gates that.
+  `TitleChanged`/`UrlChanged` events used to persist a one-tab file before
+  the restore read it; `BrowserAppState::tabs_restored` gates that.
 - On alpha-capable backends the Browser root dims the whole screen with a
   55% black scrim behind the 16:9 card (`theme::BACKDROP_ALPHA`); opaque
   backends keep the flat backdrop. The cursor is recentered in the live page

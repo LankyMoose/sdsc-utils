@@ -73,6 +73,9 @@ pub struct BrowserTabPage {
     pub last_engine_history: Option<EngineHistorySnapshot>,
     /// Last CEF back/forward capability flag pair.
     pub last_engine_can: Option<(bool, bool)>,
+    /// Page text session state published to the hosted-app contract. Set by
+    /// the engine's editable-focus signal; never opens the OSK by itself.
+    pub text_session_active: bool,
 }
 
 /// One background tab: stable id, page state, and whether a backend view

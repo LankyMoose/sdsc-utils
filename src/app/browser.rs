@@ -155,12 +155,9 @@ fn browser_tap_action(actions: &[PadAction]) -> Option<(PadId, NavAction)> {
             (PadButton::Circle, PadButtonAction::Tap) => NavAction::Cancel,
             (PadButton::Square, PadButtonAction::Tap) => NavAction::CycleSort,
             (PadButton::Triangle, PadButtonAction::Tap) => NavAction::Triangle,
-            // Semantic action: Options reloads.
-            (PadButton::Options, PadButtonAction::Tap) => NavAction::ToggleSettings,
             (PadButton::Create, PadButtonAction::Tap) => NavAction::ToggleControllers,
-            // Semantic actions: L1 back, R1 forward.
-            (PadButton::L1, PadButtonAction::Tap) => NavAction::BumperLeft,
-            (PadButton::R1, PadButtonAction::Tap) => NavAction::BumperRight,
+            // L1/R1/Options semantic actions are resolved by the OS binding
+            // table, not this generic nav map.
             (PadButton::L3, PadButtonAction::Tap) => NavAction::ToggleMagnetism,
             _ => return None,
         };
@@ -207,7 +204,8 @@ impl super::App {
             return Task::none();
         };
         let flow = plan.flow();
-        if !self.browser_visible {
+        let wants_browser = plan.peek_app() == Some("browser");
+        if wants_browser && !self.browser_visible {
             let open = self.open_browser_window();
             return Task::batch([
                 open,
@@ -258,6 +256,10 @@ impl super::App {
         &mut self,
         step: &crate::platform::trace::replay::ReplayStep,
     ) -> Task<Message> {
+        #[cfg(debug_assertions)]
+        if step.app == "launcher" {
+            return self.replay_launcher_action(step);
+        }
         if step.app != "browser" {
             crate::platform::trace::event(
                 crate::platform::trace::Lane::Platform,
@@ -336,10 +338,21 @@ impl super::App {
                     Some("triangle") => PadButton::Triangle,
                     Some("l3") => PadButton::L3,
                     Some("r3") => PadButton::R3,
+                    Some("l1") => PadButton::L1,
+                    Some("r1") => PadButton::R1,
                     Some("options") => PadButton::Options,
                     _ => return Task::none(),
                 };
                 self.replay_pad_tap(button)
+            }
+            #[cfg(debug_assertions)]
+            "pad.dir" => {
+                let action = match step.params.get("dir").and_then(serde_json::Value::as_str) {
+                    Some("up") => NavAction::Up,
+                    Some("down") => NavAction::Down,
+                    _ => return Task::none(),
+                };
+                self.replay_pad_dir(action)
             }
             #[cfg(debug_assertions)]
             "osk.stick" => {
@@ -400,6 +413,14 @@ impl super::App {
                 let close = self.close_osk("keyboard");
                 if matches!(key.to_ascii_lowercase().as_str(), "escape" | "esc") {
                     return close;
+                }
+                if self.launcher_state.manual_add.is_some() && !self.browser_visible {
+                    if key.eq_ignore_ascii_case("enter") {
+                        return close.chain(self.on_launcher_confirm());
+                    }
+                    if key.eq_ignore_ascii_case("escape") {
+                        return close.chain(self.cancel_manual_add());
+                    }
                 }
                 if !self.replay_press_key(key, modifiers) {
                     if key.chars().count() == 1 {
@@ -1568,6 +1589,7 @@ impl super::App {
             tick.action = Some(action);
             tick.action_pad = Some(pad);
         }
+        let semantic = self.hosted_action_for_tap(tap_actions);
         self.set_haptic_pad_from_id(
             tick.action_pad
                 .as_ref()
@@ -1592,61 +1614,58 @@ impl super::App {
             } else {
                 Task::none()
             };
-            let action = match tick.action {
-                Some(NavAction::Up) => {
-                    self.play_ui_cue(UiSoundKind::Nav);
-                    self.browser.panel.jump_cursor(JumpDir::Up);
-                    Task::none()
-                }
-                Some(NavAction::Down) => {
-                    self.play_ui_cue(UiSoundKind::Nav);
-                    self.browser.panel.jump_cursor(JumpDir::Down);
-                    Task::none()
-                }
-                Some(NavAction::Left) => {
-                    self.play_ui_cue(UiSoundKind::Nav);
-                    self.browser.panel.jump_cursor(JumpDir::Left);
-                    Task::none()
-                }
-                Some(NavAction::Right) => {
-                    self.play_ui_cue(UiSoundKind::Nav);
-                    self.browser.panel.jump_cursor(JumpDir::Right);
-                    Task::none()
-                }
-                Some(NavAction::Confirm) => self.click_browser_cursor(),
-                // Escape does not close the Browser; Home/PS is the only
-                // close path.
-                Some(NavAction::Cancel) => self.browser_cancel(),
-                // Semantic actions: L1 back, R1 forward, Options reload.
-                Some(NavAction::BumperLeft) => {
-                    self.on_browser_message(crate::ui::browser::BrowserMessage::Back)
-                }
-                Some(NavAction::BumperRight) => {
-                    self.on_browser_message(crate::ui::browser::BrowserMessage::Forward)
-                }
-                Some(NavAction::ToggleSettings) => {
-                    self.on_browser_message(crate::ui::browser::BrowserMessage::Reload)
-                }
-                Some(NavAction::ToggleMagnetism) => {
-                    self.play_ui_cue(UiSoundKind::Action);
-                    let cursor = &mut self.browser.panel.cursor;
-                    cursor.magnet = !cursor.magnet;
-                    if !cursor.magnet {
-                        cursor.attached = None;
-                        cursor.no_dock = None;
+            let action = if let Some(invoked) = semantic {
+                self.invoke_hosted_action(invoked)
+            } else {
+                match tick.action {
+                    Some(NavAction::Up) => {
+                        self.play_ui_cue(UiSoundKind::Nav);
+                        self.browser.panel.jump_cursor(JumpDir::Up);
+                        Task::none()
                     }
-                    crate::platform::app_log::info(format!(
-                        "ui-diag: browser magnet {}",
-                        if cursor.magnet { "on" } else { "off" }
-                    ));
-                    Task::none()
+                    Some(NavAction::Down) => {
+                        self.play_ui_cue(UiSoundKind::Nav);
+                        self.browser.panel.jump_cursor(JumpDir::Down);
+                        Task::none()
+                    }
+                    Some(NavAction::Left) => {
+                        self.play_ui_cue(UiSoundKind::Nav);
+                        self.browser.panel.jump_cursor(JumpDir::Left);
+                        Task::none()
+                    }
+                    Some(NavAction::Right) => {
+                        self.play_ui_cue(UiSoundKind::Nav);
+                        self.browser.panel.jump_cursor(JumpDir::Right);
+                        Task::none()
+                    }
+                    Some(NavAction::Confirm) => self.click_browser_cursor(),
+                    // Escape does not close the Browser; Home/PS is the only
+                    // close path.
+                    Some(NavAction::Cancel) => self.browser_cancel(),
+                    Some(NavAction::ToggleMagnetism) => {
+                        self.play_ui_cue(UiSoundKind::Action);
+                        let cursor = &mut self.browser.panel.cursor;
+                        cursor.magnet = !cursor.magnet;
+                        if !cursor.magnet {
+                            cursor.attached = None;
+                            cursor.no_dock = None;
+                        }
+                        crate::platform::app_log::info(format!(
+                            "ui-diag: browser magnet {}",
+                            if cursor.magnet { "on" } else { "off" }
+                        ));
+                        Task::none()
+                    }
+                    _ => Task::none(),
                 }
-                _ => Task::none(),
             };
             let sync = self.sync_browser_mouse();
             Task::batch(vec![flag, action, sync])
         } else {
             // Reader fallback: D-pad scrolls text, Cross restores the page.
+            if let Some(invoked) = semantic {
+                return self.invoke_hosted_action(invoked);
+            }
             match tick.action {
                 Some(NavAction::Up) | Some(NavAction::Left) => {
                     self.play_ui_cue(UiSoundKind::Nav);
@@ -1658,15 +1677,6 @@ impl super::App {
                 }
                 Some(NavAction::Confirm) => self.on_browser_go_default(),
                 Some(NavAction::Cancel) => self.browser_cancel(),
-                Some(NavAction::BumperLeft) => {
-                    self.on_browser_message(crate::ui::browser::BrowserMessage::Back)
-                }
-                Some(NavAction::BumperRight) => {
-                    self.on_browser_message(crate::ui::browser::BrowserMessage::Forward)
-                }
-                Some(NavAction::ToggleSettings) => {
-                    self.on_browser_message(crate::ui::browser::BrowserMessage::Reload)
-                }
                 _ => Task::none(),
             }
         }
@@ -2524,20 +2534,23 @@ mod tests {
     }
 
     #[test]
-    fn browser_taps_map_to_semantic_actions() {
+    fn browser_taps_map_to_generic_nav_actions() {
         for (button, expected) in [
             (PadButton::Cross, NavAction::Confirm),
             (PadButton::Circle, NavAction::Cancel),
             (PadButton::Triangle, NavAction::Triangle),
             (PadButton::L3, NavAction::ToggleMagnetism),
-            (PadButton::L1, NavAction::BumperLeft),
-            (PadButton::R1, NavAction::BumperRight),
-            (PadButton::Options, NavAction::ToggleSettings),
+            (PadButton::Create, NavAction::ToggleControllers),
         ] {
             assert_eq!(
                 browser_tap_action(&[tap(button)]).map(|(_, action)| action),
                 Some(expected)
             );
+        }
+        // Semantic bindings (L1/R1/Options) are resolved by the OS action
+        // table, not this generic map.
+        for button in [PadButton::L1, PadButton::R1, PadButton::Options] {
+            assert!(browser_tap_action(&[tap(button)]).is_none());
         }
         // Tap only: holds never invoke actions.
         assert!(browser_tap_action(&[hold(PadButton::L1)]).is_none());

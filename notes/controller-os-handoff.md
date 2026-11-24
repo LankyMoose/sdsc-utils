@@ -1,7 +1,8 @@
 # Controller OS handoff: Browser app, hosted UI contract, system OSK
 
-**Status:** Browser v0 + system OSK design locked; implementation not started.
-Browser app split/packaging design is open (Phase D).
+**Status:** Phases A–C implemented on `browser/main` (Browser v0, system OSK,
+hosted contract v0 + Launcher Settings proof). Phase D (Browser app split/
+packaging) and Phase E (chrome redesign) remain open.
 **Scope:** controller-OS architecture, Browser v0 chrome removal, system OSK,
 hosted app/action contract, Browser app split/packaging.
 **Supersedes:** the browser-coupled OSK plan in

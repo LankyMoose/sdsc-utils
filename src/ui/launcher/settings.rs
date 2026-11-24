@@ -8,8 +8,8 @@ use crate::persist::prefs::{
 use crate::ui::face::{FaceButton, action_cluster, face_hint, face_hold_hint};
 use crate::ui::launcher::icon_cache;
 use crate::ui::launcher::view::{
-    HintPress, HintPressOwner, ICON_H, ICON_W, LauncherIcon, LauncherMessage, ScrollReveal, State,
-    scroll_y_to_reveal_bounds,
+    HintPress, HintPressOwner, ICON_H, ICON_W, LauncherIcon, LauncherMessage, ManualField,
+    ScrollReveal, State, scroll_y_to_reveal_bounds,
 };
 use crate::ui::layout as window_layout;
 use crate::ui::theme;
@@ -1902,6 +1902,8 @@ pub(crate) fn manual_add_view(state: &State) -> Element<'_, LauncherMessage> {
         );
     }
 
+    let title_focused = draft.focus == ManualField::Title;
+    let args_focused = draft.focus == ManualField::Args;
     // Plain content column: the overlay card centers it and hugs its width
     // (the column fixes content at 420px); no Fill wrapper — inside a
     // shrink-sized card Fill would have nothing to anchor to.
@@ -1918,13 +1920,21 @@ pub(crate) fn manual_add_view(state: &State) -> Element<'_, LauncherMessage> {
             .size(14.0)
             .padding(8)
             .on_input(LauncherMessage::ManualAddTitle)
-            .style(theme::input),
+            .style(if title_focused {
+                theme::input_docked
+            } else {
+                theme::input
+            }),
         text(&draft.target).size(12.0).color(theme::MUTED),
         text_input("Arguments (optional)", &draft.args)
             .size(14.0)
             .padding(8)
             .on_input(LauncherMessage::ManualAddArgs)
-            .style(theme::input),
+            .style(if args_focused {
+                theme::input_docked
+            } else {
+                theme::input
+            }),
         row![icon_el, column![icon_actions, icon_hint].spacing(6)]
             .spacing(14)
             .align_y(Alignment::Center),
@@ -1942,18 +1952,18 @@ pub(crate) fn manual_add_view(state: &State) -> Element<'_, LauncherMessage> {
         .spacing(10),
         {
             let press = HintPress::for_owner(state, HintPressOwner::ManualAdd);
-            action_cluster(
-                &[
-                    face_hint(
-                        FaceButton::Cross,
-                        if draft.is_edit() { "Save" } else { "Add" },
-                        press.held,
-                        press.press_anim,
-                    ),
-                    face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
-                ],
-                false,
-            )
+            row![
+                action_cluster(
+                    &[
+                        face_hint(FaceButton::Cross, "Keyboard", press.held, press.press_anim,),
+                        face_hint(FaceButton::Circle, "Cancel", press.held, press.press_anim),
+                    ],
+                    false,
+                ),
+                text("R2 / Enter saves").size(12.0).color(theme::MUTED),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center)
         },
     ]
     .spacing(10)

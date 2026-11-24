@@ -18,8 +18,10 @@
 | Replay a browser flow in a sandbox | `sdsc-utils --trace-replay <session> --flow <flow-id>` |
 | Install/update QA console | `python scripts/install_qa_web.py --open` (see `notes/install-qa.md`) |
 | Browser input QA (synthetic, no OS input) | `python scripts/qa_browser_input.py` |
-| Browser popup QA (synthetic, no OS input) | `python scripts/qa_browser_popup.py` |
-| Browser auto-OSK QA (synthetic, no OS input) | `python scripts/qa_browser_osk.py` |
+| Browser action QA (Back/Forward/Reload) | `python scripts/qa_browser_actions.py` |
+| Browser popup-denial QA (synthetic, no OS input) | `python scripts/qa_browser_popup.py` |
+| System OSK QA (Quadrant + Grid) | `python scripts/qa_browser_osk.py` |
+| Launcher Settings OSK proof QA | `python scripts/qa_launcher_osk.py` |
 | Browser pixel QA (render smoke test) | `python scripts/qa_browser_visual.py` |
 
 ## Project structure
@@ -95,8 +97,11 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 
 | Directory | Typical changes |
 |---|---|
-| `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Launcher / toast, message routing; `browser.rs` (top-level `BrowserAppState`, standalone Browser window, pad/key/`BrowserMessage` routing), `home.rs` (`HomeApps` installed/active apps + Home window lifecycle/input) |
-| `src/browser/` | Browser internals: engine seam + CEF OSR worker, DOM target query, controller cursor, tabs/bookmarks, stable frame texture; no reader fallback |
+| `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Launcher / toast / system OSK, message routing; `browser.rs` (top-level `BrowserAppState`, standalone Browser window, pad/key/`BrowserMessage` routing), `osk.rs` (system OSK session/overlay/input/text routing), `actions.rs` (semantic action bindings), `home.rs` (`HomeApps` installed/active apps + Home window lifecycle/input) |
+| `src/browser/` | Browser internals: engine seam + CEF OSR worker, DOM target query, controller cursor, dormant tabs/bookmarks/history backends, stable frame texture; no reader fallback |
+| `src/hosted/` | Hosted app contract v0: manifest, native surface, semantic actions, text session, OS-owned lifecycle (no widget toolkit) |
+| `src/ui/osk/` | System controller keyboard: Quadrant core/layouts + Grid fallback; no Browser imports |
+| `src/app/actions.rs` | OS-owned semantic action bindings (Browser L1/R1/Options) + `ActionInvoked` path |
 | `src/session/` | Pure device session (no windows/HWND): presence, notify, analytics, Launcher-open policy; emits `SessionEffect`s the UI applies |
 | `src/controller/` | HID polling + worker (`hid/`), DualSense protocol (`dualsense/`: battery, lightbar, rumble, input, identity), known controllers, debug-only `emulate` emulation |
 | `src/domain/` | Pure logic: battery colors/spectrum math, pad gestures/chords, protocol helpers |
@@ -120,6 +125,8 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Hot enumeration freeze**: while input is hot (`input_hot=1`, e.g. Launcher open with a stable pad), `refresh_devices()` is deferred up to `HOT_ENUM_MAX_DEFER` (20s heartbeat cap) and cold polls are gated off — plus the OS arrival watcher (Windows `CM_Register_Notification`, Linux `/dev` snapshot; see `notes/device-arrival-watch.md`) fires list-only refresh hints so newly-connected pads surface in ~1s. Pre-existing freeze documented in `notes/hot-enumeration-freeze.md`; any poll/sampling change must still be validated with a Launcher-open + second-connect test, not just tray-idle.
 - **Button taps are source-side events, not reconstructed state**. `PadInterpreter` consumes ordered raw HID reports (not the merged snapshot), debounces press/release, and emits `PadAction::Tap`; `PadActionGate` dedupes UI sequence and arms pads only after rest following an owner change. Home/Browser/Launcher route these actions centrally. Do not add per-surface edge detection for face/Options/Create/L1/R1/L3/R3 taps. Analog/D-pad repeat and the Cross/Triangle hold progress meters still use the legacy per-surface bank.
 - **Battery step mapping is Linux-midpoint**. Windows may report different percentages; the app maps firmware steps → percentages via the fixed mid-point formula.
+- **Browser v0 is chrome-less and single-tab**: no address/tabs/bookmarks/history/status UI, popups denied, Home/PS is the only close path. L1/R1/Options are semantic back/forward/reload via `src/app/actions.rs`; tap only. Keep page cursor/D-pad/docking/IME intact.
+- **The OSK is a system service**: `src/ui/osk/` + `src/app/osk.rs`, topmost no-activate overlay; the Browser ships no OSK UI/layout/gesture/mode code. Cross is the only opener (first Cross on a page field); real mouse/keyboard/IME/touch closes it, keyboard keys hand off (Escape consumed). Quadrant is default; Grid fallback; `OskMode` is a system pref (`SDSC_OSK_MODE=quadrant|grid` debug override).
 
 ## Where to find things
 
@@ -132,7 +139,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Shared face-button hints / rings** → `src/ui/face/` (`mod.rs` widgets, `ring.rs` SVG rings); used by Launcher, Launcher Settings, and Home controller dock rows
 - **Shared UI sounds / haptics** → `src/app/feedback.rs` (global cue + pref application), `src/platform/ui_sound.rs` (audio worker); Home Settings owns the controls
 - **Launcher / fullscreen game console** → `src/ui/launcher/` (UI), `src/games/` (Steam scan, launch); behavior → `notes/launcher-immersive.md`
-- **Browser (CEF)** → `src/browser/` (engine seam, `cef_backend.rs`, DOM/cursor, nav helpers) + `src/ui/browser/state.rs` (panel/tabs/chrome) + `src/ui/launcher/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state); Home → `src/ui/home/` + `src/app/home.rs`; contracts → `notes/browser-embedding.md`; CEF API map → `notes/cef-api.md`; Home/CEF pivot plan → `notes/browser-home-pivot.md`
+- **Browser (CEF)** → `src/browser/` (engine seam, `cef_backend.rs`, DOM/cursor, nav helpers) + `src/ui/browser/state.rs` (page surface state; dormant tab data) + `src/ui/launcher/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state/text session); system OSK → `src/ui/osk/` + `src/app/osk.rs`; semantic actions → `src/app/actions.rs`; hosted contract → `src/hosted/`; Home → `src/ui/home/` + `src/app/home.rs`; contracts → `notes/browser-embedding.md`; CEF API map → `notes/cef-api.md`; Home/CEF pivot plan → `notes/browser-home-pivot.md`
 - **Toasts** → `src/ui/toast/` (state machine in `machine.rs`); z-order / remount → `notes/windows-toast.md`
 - **Persisted state (prefs/controllers/analytics)** → `src/persist/`
 - **Single instance, tray lifecycle, crash-restart** → `src/bin/sdsc-utils.rs`, `src/platform/crash_restart.rs`

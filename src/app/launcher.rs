@@ -519,6 +519,7 @@ impl App {
             None
         };
         self.browser.panel.scroll_y = 0.0;
+        self.browser.panel.page.text_session_active = false;
         // Fresh page: cursor back to center; focusables arrive with the
         // accessibility tree. Recenter the existing cursor so the live
         // viewport bounds (not the 800x600 defaults) survive navigation.
@@ -1398,6 +1399,7 @@ impl App {
                 }
             }
             EngineEvent::EditableFocusChanged { tab: _, editable } => {
+                self.browser.panel.page.text_session_active = editable;
                 // The page text session ended: close the system keyboard. A
                 // focus/autofocus event never opens it (Cross is the only
                 // opener).
@@ -1658,7 +1660,161 @@ impl App {
         // Cancel drains through the exit tween (form clears when it
         // settles); reduced motion clears instantly.
         self.launcher_state.dismiss_manual(Instant::now());
-        Task::none()
+        self.close_osk("manual_cancel")
+    }
+
+    /// Debug replay: open the Launcher and arm the manual-shortcut form so QA
+    /// can exercise the non-browser system-OSK proof host.
+    #[cfg(debug_assertions)]
+    pub(crate) fn replay_launcher_action(
+        &mut self,
+        step: &crate::platform::trace::replay::ReplayStep,
+    ) -> Task<Message> {
+        match step.action.as_str() {
+            "manual_add" => {
+                let open = if self.launcher_visible {
+                    Task::none()
+                } else {
+                    self.open_launcher()
+                };
+                if !self.launcher_state.editing {
+                    let _ = self.enter_launcher_edit();
+                }
+                let target = step
+                    .params
+                    .get("target")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("C:\\Windows\\notepad.exe")
+                    .to_string();
+                let title = step
+                    .params
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let args = step
+                    .params
+                    .get("args")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                self.launcher_state.arm_manual(
+                    launcher_view::ManualAddDraft {
+                        edit_id: None,
+                        target,
+                        title,
+                        args,
+                        icon_path: None,
+                        shell_icon: None,
+                        focus: launcher_view::ManualField::Title,
+                    },
+                    Instant::now(),
+                );
+                open
+            }
+            "commit" => self.commit_launcher_edit(),
+            "close" => self.close_launcher(),
+            "pad.tap" => {
+                let button = match step
+                    .params
+                    .get("button")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("cross") => PadButton::Cross,
+                    Some("circle") => PadButton::Circle,
+                    Some("square") => PadButton::Square,
+                    Some("triangle") => PadButton::Triangle,
+                    _ => return Task::none(),
+                };
+                self.replay_pad_tap(button)
+            }
+            "pad.dir" => {
+                let action = match step.params.get("dir").and_then(serde_json::Value::as_str) {
+                    Some("up") => NavAction::Up,
+                    Some("down") => NavAction::Down,
+                    _ => return Task::none(),
+                };
+                self.replay_pad_dir(action)
+            }
+            "osk.stick" => {
+                let x = step
+                    .params
+                    .get("x")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0) as f32;
+                let y = step
+                    .params
+                    .get("y")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0) as f32;
+                let pair = (x, y);
+                match step.params.get("side").and_then(serde_json::Value::as_str) {
+                    Some("right") => self.replay_osk_stick((0.0, 0.0), pair),
+                    _ => self.replay_osk_stick(pair, (0.0, 0.0)),
+                }
+            }
+            "key" => {
+                let key = step
+                    .params
+                    .get("key")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if key.eq_ignore_ascii_case("enter") {
+                    self.on_launcher_confirm()
+                } else if key.eq_ignore_ascii_case("escape") {
+                    self.cancel_manual_add()
+                } else {
+                    Task::none()
+                }
+            }
+            _ => {
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Platform,
+                    "replay.unsupported",
+                )
+                .field("app", &step.app)
+                .field("action", &step.action)
+                .emit();
+                Task::none()
+            }
+        }
+    }
+
+    /// Manual-shortcut form pad actions: Up/Down move Title/Arguments focus,
+    /// Cross opens the system OSK for that field, Circle cancels. Saving is
+    /// R2/Enter (or the Save button), never Cross.
+    pub(crate) fn on_manual_add_pad_action(&mut self, action: NavAction) -> Task<Message> {
+        match action {
+            NavAction::Up | NavAction::Down => {
+                if let Some(draft) = self.launcher_state.manual_add.as_mut() {
+                    draft.focus = draft.focus.next();
+                }
+                self.play_ui_cue(UiSoundKind::Nav);
+                Task::none()
+            }
+            NavAction::Confirm => {
+                let target =
+                    self.launcher_state
+                        .manual_add
+                        .as_ref()
+                        .map(|draft| match draft.focus {
+                            launcher_view::ManualField::Title => {
+                                crate::ui::osk::OskTarget::LauncherManualTitle
+                            }
+                            launcher_view::ManualField::Args => {
+                                crate::ui::osk::OskTarget::LauncherManualArgs
+                            }
+                        });
+                if let Some(target) = target {
+                    self.play_ui_cue(UiSoundKind::Action);
+                    self.request_osk_open(target)
+                } else {
+                    Task::none()
+                }
+            }
+            NavAction::Cancel => self.on_launcher_message(LauncherMessage::Close),
+            _ => Task::none(),
+        }
     }
 
     pub(crate) fn toggle_launcher_edit(&mut self) -> Option<Task<Message>> {
@@ -1720,6 +1876,7 @@ impl App {
                 args: row.args,
                 icon_path,
                 shell_icon,
+                focus: launcher_view::ManualField::Title,
             },
             Instant::now(),
         );
@@ -2103,6 +2260,7 @@ impl App {
                 args: String::new(),
                 icon_path: None,
                 shell_icon,
+                focus: launcher_view::ManualField::Title,
             },
             Instant::now(),
         );
@@ -2506,6 +2664,9 @@ impl App {
 
         let replace_confirm = self.launcher_state.replace_confirm.is_some();
         let manual_add = self.launcher_state.manual_add.is_some();
+        if !manual_add {
+            self.manual_add_r2_latched = false;
+        }
         let save_modal = self.launcher_state.edit_confirm.is_some();
         let settings_open = self.launcher_state.settings.open;
         let allow_nav_move = launcher_nav_move_allowed(&self.launcher_state);
@@ -2668,19 +2829,21 @@ impl App {
             self.launcher_state.triangle_progress = 0.0;
             self.keyboard_cross_hold.reset();
             self.launcher_state.tick_hint_anims(now);
-            if let Some(action) = tick.action {
-                match action {
-                    NavAction::Confirm | NavAction::Cancel => {
-                        self.on_launcher_message(match action {
-                            NavAction::Confirm => LauncherMessage::Confirm,
-                            _ => LauncherMessage::Close,
-                        })
-                    }
-                    _ => Task::none(),
-                }
-            } else {
-                Task::none()
+            // Save/add is R2 (edge) or Enter/Save button; Cross opens the
+            // system keyboard for the focused Title/Arguments field instead
+            // of saving. The old Cross=Save conflict is resolved explicitly.
+            let r2 = launcher_input::preferred_reading(readings)
+                .is_some_and(|reading| reading.sample.r2);
+            let r2_pressed = r2 && !self.manual_add_r2_latched;
+            self.manual_add_r2_latched = r2;
+            if r2_pressed {
+                self.play_ui_cue(UiSoundKind::Action);
+                return self.on_launcher_message(LauncherMessage::Confirm);
             }
+            if let Some(action) = tick.action {
+                return self.on_manual_add_pad_action(action);
+            }
+            Task::none()
         } else {
             self.keyboard_cross_hold.reset();
 
@@ -3697,7 +3860,7 @@ impl App {
         // Data is committed; the form stays mounted as display-only through
         // the exit tween and clears when it settles.
         self.launcher_state.dismiss_manual(Instant::now());
-        Task::none()
+        self.close_osk("manual_confirm")
     }
 
     pub(crate) fn apply_perf_throttle_immersive(&mut self, enabled: bool) -> Task<Message> {
@@ -4534,10 +4697,8 @@ pub(crate) fn launcher_cold_allows(message: &LauncherMessage) -> bool {
 /// directionals must NOT flow here (or every pad move would double-fire).
 pub(crate) fn launcher_nav_move_allowed(state: &launcher_view::State) -> bool {
     state.settings.open
-        || (!state.animating()
-            && state.replace_confirm.is_none()
-            && state.manual_add.is_none()
-            && state.edit_confirm.is_none())
+        || state.manual_add.is_some()
+        || (!state.animating() && state.replace_confirm.is_none() && state.edit_confirm.is_none())
 }
 
 /// Layout-transition gate: focus moves freeze mid-transition; Confirm /
@@ -4595,7 +4756,9 @@ mod tests {
     #[test]
     fn launcher_nav_movement_follows_settings_and_modals() {
         use super::launcher_nav_move_allowed;
-        use crate::ui::launcher::view::{EditConfirm, ManualAddDraft, ReplaceConfirm, State};
+        use crate::ui::launcher::view::{
+            EditConfirm, ManualAddDraft, ManualField, ReplaceConfirm, State,
+        };
         let mut state = State::default();
         assert!(launcher_nav_move_allowed(&state));
         state.settings.open = true;
@@ -4608,8 +4771,10 @@ mod tests {
             args: String::new(),
             icon_path: None,
             shell_icon: None,
+            focus: ManualField::Title,
         });
-        assert!(!launcher_nav_move_allowed(&state));
+        // The manual form owns Up/Down for Title/Arguments focus.
+        assert!(launcher_nav_move_allowed(&state));
         state.manual_add = None;
         state.replace_confirm = Some(ReplaceConfirm {
             running_title: String::new(),

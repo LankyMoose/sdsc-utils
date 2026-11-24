@@ -739,6 +739,26 @@ pub struct ReplaceConfirm {
 #[derive(Debug, Clone)]
 pub struct EditConfirm;
 
+/// Pad-focusable text field in the manual shortcut form.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ManualField {
+    #[default]
+    Title,
+    Args,
+}
+
+impl ManualField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Title => Self::Args,
+            Self::Args => Self::Title,
+        }
+    }
+    pub fn prev(self) -> Self {
+        self.next()
+    }
+}
+
 /// Draft for the edit-mode add/edit-manual modal.
 #[derive(Debug, Clone)]
 pub struct ManualAddDraft {
@@ -749,6 +769,8 @@ pub struct ManualAddDraft {
     pub args: String,
     pub icon_path: Option<PathBuf>,
     pub shell_icon: Option<LauncherIcon>,
+    /// Pad focus in the form (Title / Arguments).
+    pub focus: ManualField,
 }
 
 impl ManualAddDraft {
@@ -4843,6 +4865,13 @@ mod tests {
     }
 
     #[test]
+    fn manual_field_focus_toggles_title_and_arguments() {
+        assert_eq!(ManualField::Title.next(), ManualField::Args);
+        assert_eq!(ManualField::Args.next(), ManualField::Title);
+        assert_eq!(ManualField::Title.prev(), ManualField::Args);
+    }
+
+    #[test]
     fn save_guard_owns_hints_over_browse() {
         let mut state = State {
             edit_confirm: Some(EditConfirm),
@@ -4860,6 +4889,7 @@ mod tests {
             args: String::new(),
             icon_path: None,
             shell_icon: None,
+            focus: ManualField::Title,
         });
         assert_eq!(HintPressOwner::current(&state), HintPressOwner::ManualAdd);
     }

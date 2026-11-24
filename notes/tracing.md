@@ -123,8 +123,14 @@ synthetic input steps for automation:
 - `mouse.wheel` — `{"x": 300, "y": 400, "dy": -240}` wheels at page-local
   coordinates.
 - `ime.preedit` / `ime.commit` — `{"text": "é"}` drive the page IME path.
-- `osk.toggle` / `osk.key` — `{"char": "!"}` open/close and commit through
-  the on-screen keyboard.
+- `cursor.dock` — `{"x": 100, "y": 70}` attaches the virtual cursor to the
+  page focusable under a point (QA setup for the Cross-opens-OSK path).
+- `pad.tap` — `{"button": "cross"}` injects one source-side pad tap through
+  the live owner (OSK first, then Browser/Launcher manual form).
+- `pad.dir` — `{"dir": "down"}` moves pad focus in a form/OSK (no tap).
+- `osk.stick` — `{"side": "left", "x": 0.65, "y": 0}` feeds the real Quadrant
+  state machine; a following neutral sample releases/commits.
+- `osk.open` / `osk.close` — debug-only direct system-OSK open/close for QA.
 - `screenshot` — debug-only: capture the Browser window to `<data>/shots`;
   `scripts/qa_browser_visual.py` uses it as a pixel smoke test.
 
@@ -143,12 +149,16 @@ Home.
 `python scripts/qa_browser_input.py` is the checked-in smoke test: it builds a
 local page, runs these synthetic steps, asserts typed text / wheel scroll /
 drag selection / cursor-shape trace, and kills the process immediately.
-`python scripts/qa_browser_popup.py` does the same for target=_blank popups
-becoming a second Browser tab. `python scripts/qa_browser_visual.py` captures
-a debug screenshot and verifies the actual page pixels, catching widget-tree
-render regressions that traces cannot see. `python scripts/qa_browser_osk.py`
-clicks/blurs/refocuses a field and checks the `browser.osk_focus` auto-open /
-auto-close sequence.
+`python scripts/qa_browser_popup.py` asserts target=_blank popups are denied
+(no second tab, source page intact, `browser.popup_denied` traced).
+`python scripts/qa_browser_visual.py` captures a debug screenshot and verifies
+the actual page pixels, catching widget-tree render regressions that traces
+cannot see. `python scripts/qa_browser_actions.py` fires L1/R1/Options and
+checks `app.action` enabled-state/back/forward/reload. `python
+scripts/qa_browser_osk.py` exercises the system OSK in Quadrant and Grid modes
+(first Cross open, split-stick typing, keyboard/mouse close). `python
+scripts/qa_launcher_osk.py` is the non-browser proof: Add shortcut Title/
+Arguments editing and the Enter save path.
 
 ## Adding instrumentation
 

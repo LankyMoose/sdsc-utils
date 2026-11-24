@@ -23,6 +23,7 @@ pub mod browser;
 pub mod controller;
 pub mod domain;
 pub mod games;
+pub mod hosted;
 pub mod persist;
 pub mod platform;
 pub mod session;

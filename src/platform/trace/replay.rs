@@ -48,6 +48,12 @@ impl ReplayPlan {
         self.steps.len().saturating_sub(self.index)
     }
 
+    /// App targeted by the next step, if any (used to avoid opening the
+    /// Browser when a replay flow belongs to another app).
+    pub fn peek_app(&self) -> Option<&str> {
+        self.steps.get(self.index).map(|step| step.app.as_str())
+    }
+
     pub fn next_step(&mut self) -> Option<ReplayStep> {
         let step = self.steps.get(self.index).cloned();
         if step.is_some() {

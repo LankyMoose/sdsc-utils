@@ -6,6 +6,7 @@
 //! compositor; popup, Settings, and Launcher stay ephemeral (create/destroy on each
 //! open — Launcher uses a normal OS window open).
 
+mod actions;
 mod browser;
 mod configure;
 mod feedback;
@@ -803,6 +804,8 @@ pub struct App {
     replay: Option<crate::platform::trace::replay::ReplayPlan>,
     /// Surface receiving source-side tap actions.
     pad_input_owner: PadInputOwner,
+    /// R2 rising-edge latch while the manual-shortcut form is open (R2 saves).
+    manual_add_r2_latched: bool,
     /// When set, the next start cue may rumble this DualSense serial (pad-originated).
     haptic_pad_serial: Option<Serial>,
     /// Keyboard Enter hold for replace-confirm (not folded into pad slots).
@@ -1204,6 +1207,7 @@ impl App {
             pending_history_travel: None,
             replay,
             pad_input_owner: PadInputOwner::None,
+            manual_add_r2_latched: false,
             haptic_pad_serial: None,
             keyboard_cross_hold: CrossHold::default(),
             confirm_key_held: false,

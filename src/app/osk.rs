@@ -305,8 +305,15 @@ impl App {
             .emit();
         match target {
             Some(OskTarget::BrowserPage) => self.browser_text_insert(text),
-            Some(OskTarget::LauncherManualTitle) | Some(OskTarget::LauncherManualArgs) => {
-                // Phase C wires the Launcher Settings proof host.
+            Some(OskTarget::LauncherManualTitle) => {
+                if let Some(draft) = self.launcher_state.manual_add.as_mut() {
+                    draft.title.push_str(text);
+                }
+            }
+            Some(OskTarget::LauncherManualArgs) => {
+                if let Some(draft) = self.launcher_state.manual_add.as_mut() {
+                    draft.args.push_str(text);
+                }
             }
             None => {}
         }
@@ -320,7 +327,16 @@ impl App {
             .emit();
         match target {
             Some(OskTarget::BrowserPage) => self.browser_text_backspace(),
-            Some(OskTarget::LauncherManualTitle) | Some(OskTarget::LauncherManualArgs) => {}
+            Some(OskTarget::LauncherManualTitle) => {
+                if let Some(draft) = self.launcher_state.manual_add.as_mut() {
+                    draft.title.pop();
+                }
+            }
+            Some(OskTarget::LauncherManualArgs) => {
+                if let Some(draft) = self.launcher_state.manual_add.as_mut() {
+                    draft.args.pop();
+                }
+            }
             None => {}
         }
         Task::none()
@@ -332,9 +348,22 @@ impl App {
             .field("target", target.map(OskTarget::label))
             .emit();
         match target {
-            Some(OskTarget::BrowserPage) => self.browser_text_enter(),
-            Some(OskTarget::LauncherManualTitle) | Some(OskTarget::LauncherManualArgs) => {}
-            None => {}
+            Some(OskTarget::BrowserPage) => {
+                self.browser_text_enter();
+                Task::none()
+            }
+            Some(OskTarget::LauncherManualTitle) | Some(OskTarget::LauncherManualArgs) => {
+                self.confirm_manual_add()
+            }
+            None => Task::none(),
+        }
+    }
+
+    /// Debug replay: directional pad press for the manual-shortcut form.
+    #[cfg(debug_assertions)]
+    pub(crate) fn replay_pad_dir(&mut self, action: NavAction) -> Task<Message> {
+        if self.launcher_state.manual_add.is_some() {
+            return self.on_manual_add_pad_action(action);
         }
         Task::none()
     }
@@ -368,6 +397,30 @@ impl App {
         crate::platform::trace::event(crate::platform::trace::Lane::Platform, "replay.pad_tap")
             .field("button", format!("{button:?}"))
             .emit();
+        if self.osk.state.open {
+            let pad = crate::domain::pad::PadId("replay".into());
+            let reading = crate::ui::launcher::input::NavReading {
+                id: pad.clone(),
+                sample: crate::domain::pad::PadSample::default(),
+                source: "replay",
+            };
+            let action = PadAction {
+                pad,
+                button,
+                action: PadButtonAction::Tap,
+            };
+            return self.on_osk_pad(&[reading], &[action]);
+        }
+        if self.launcher_state.manual_add.is_some() {
+            let action = match button {
+                PadButton::Cross => Some(NavAction::Confirm),
+                PadButton::Circle => Some(NavAction::Cancel),
+                _ => None,
+            };
+            if let Some(action) = action {
+                return self.on_manual_add_pad_action(action);
+            }
+        }
         let pad = crate::domain::pad::PadId("replay".into());
         let reading = crate::ui::launcher::input::NavReading {
             id: pad.clone(),
@@ -379,9 +432,6 @@ impl App {
             button,
             action: PadButtonAction::Tap,
         };
-        if self.osk.state.open {
-            return self.on_osk_pad(&[reading], &[action]);
-        }
         if self.browser_visible {
             return self.on_browser_pad(&[reading], &[action]);
         }

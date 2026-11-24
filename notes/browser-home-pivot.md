@@ -13,6 +13,11 @@ overlay, app selection, the engine backend, or MSIX packaging.
 > separate optional app** (UI + engine), not only the CEF engine DLC. The
 > CEF/Home/DLC history here remains useful, but the packaging/ownership plan
 > is revised by [controller-os-handoff.md](controller-os-handoff.md).
+>
+> **v0 update (Phases A–C landed):** the in-process Browser is chrome-less
+> and single-tab (page surface + cursor + page text only); the OSK is system
+> owned; L1/R1/Options map to semantic back/forward/reload; popups are denied.
+> The app split/packaging below (Phase D) remains future work.
 
 Current browser internals: [browser-embedding.md](browser-embedding.md).
 
