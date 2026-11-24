@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 const DOM_QUERY_MSG: &str = "sdsc.dom.query";
 const DOM_RESULT_MSG: &str = "sdsc.dom.result";
 const DOM_POLL: Duration = Duration::from_millis(350);
+/// Trusted link click -> navigation-start budget before the JS fallback.
+const CLICK_FALLBACK: Duration = Duration::from_millis(700);
 const BROWSER_BG: u32 = 0xFFFF_FFFF;
 
 /// CEF is process-global; subprocess bootstrap and host init both need it.
@@ -314,6 +316,14 @@ pub fn spawn_engine(boot_url: &str, initial_size: (u32, u32)) -> Option<EngineHa
     Some(handle)
 }
 
+/// Trusted link click awaiting a navigation-start callback. If CEF reports
+/// no load/address change before the deadline, the worker falls back to the
+/// old JS element click.
+struct PendingClick {
+    target: u64,
+    at: Instant,
+}
+
 /// Shared by every CEF callback for one tab.
 #[derive(Clone)]
 struct TabContext {
@@ -336,6 +346,8 @@ struct TabContext {
     favicon_key: Arc<Mutex<String>>,
     /// Invalidates in-flight favicon callbacks after navigation/closure.
     favicon_request: Arc<AtomicU64>,
+    /// Trusted link click awaiting navigation; fallback JS click on timeout.
+    pending_click: Arc<Mutex<Option<PendingClick>>>,
     /// Last canonical history snapshot hash, so address/title/load callbacks
     /// do not emit duplicate HistoryChanged events.
     last_history_hash: Arc<Mutex<u64>>,
@@ -743,6 +755,11 @@ cef::wrap_life_span_handler! {
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
             self.ctx.browser.clear();
             self.ctx.favicon_request.fetch_add(1, Ordering::AcqRel);
+            *self
+                .ctx
+                .pending_click
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             self.ctx.handle.emit(EngineEvent::TabClosed { tab: self.ctx.tab });
         }
     }
@@ -774,6 +791,13 @@ cef::wrap_load_handler! {
                 can_back: can_go_back != 0,
                 can_forward: can_go_forward != 0,
             });
+            if is_loading != 0 {
+                *self
+                    .ctx
+                    .pending_click
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            }
             trace_engine(&self.ctx, "loading")
                 .field("loading", is_loading != 0)
                 .field("can_back", can_go_back != 0)
@@ -850,6 +874,11 @@ cef::wrap_display_handler! {
                 return;
             }
             let url = url.map(|u| u.to_string()).unwrap_or_default();
+            *self
+                .ctx
+                .pending_click
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             trace_engine(&self.ctx, "address")
                 .field("url", &url)
                 .emit();
@@ -1405,6 +1434,7 @@ fn run(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
         worker.tick_dom();
+        worker.tick_pending_click();
     }
     // CEF shutdown is process-global and must run on the initializing thread
     // in the strictest reading of the API. The caller exits immediately after
@@ -1431,6 +1461,7 @@ impl Worker {
             extent: Arc::new(Mutex::new((0.0, 0.0))),
             favicon_key: Arc::new(Mutex::new(String::new())),
             favicon_request: Arc::new(AtomicU64::new(0)),
+            pending_click: Arc::new(Mutex::new(None)),
             last_history_hash: Arc::new(Mutex::new(0)),
             trace_flow: Arc::new(Mutex::new(None)),
         };
@@ -1625,7 +1656,13 @@ impl Worker {
                     entry.last_dom = Instant::now() - DOM_POLL;
                 }
             }
-            EngineCommand::ClickAt { tab, x, y, target } => {
+            EngineCommand::ClickAt {
+                tab,
+                x,
+                y,
+                target,
+                trusted,
+            } => {
                 let Some(entry) = self.tab(tab) else {
                     return false;
                 };
@@ -1635,19 +1672,36 @@ impl Worker {
                 let Some(frame) = browser.main_frame() else {
                     return false;
                 };
-                if let Some(id) = target {
+                if let Some(id) = target
+                    && !trusted
+                {
                     let code = format!("window.__sdsc_click && window.__sdsc_click({id})");
                     let code: CefString = code.as_str().into();
                     let url: CefString = "sdsc://click".into();
                     frame.execute_java_script(Some(&code), Some(&url), 0);
-                } else if let Some(host) = browser.host() {
+                    return false;
+                }
+                if let Some(host) = browser.host() {
+                    host.set_focus(1);
                     let ev = MouseEvent {
                         x: x as i32,
                         y: y as i32,
                         modifiers: 0,
                     };
+                    host.send_mouse_move_event(Some(&ev), 0);
                     host.send_mouse_click_event(Some(&ev), MouseButtonType::LEFT, 0, 1);
                     host.send_mouse_click_event(Some(&ev), MouseButtonType::LEFT, 1, 1);
+                    if let Some(id) = target {
+                        *entry
+                            .ctx
+                            .pending_click
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(PendingClick {
+                                target: id,
+                                at: Instant::now(),
+                            });
+                    }
                 }
             }
             EngineCommand::ProbeEventLoop { tab } => {
@@ -1830,6 +1884,49 @@ impl Worker {
                 slot: entry.ctx.frame.clone(),
             });
         }
+    }
+
+    /// A trusted link click that produced no loading/address callback by the
+    /// deadline gets the old JS click. This keeps links usable if CEF's
+    /// synthetic mouse path misses, while successful trusted clicks keep the
+    /// navigation's user-activation bit.
+    fn tick_pending_click(&self) {
+        let Some(entry) = self.tab(self.active) else {
+            return;
+        };
+        let pending = {
+            let mut guard = entry
+                .ctx
+                .pending_click
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(pending) = guard.as_ref() else {
+                return;
+            };
+            if pending.at.elapsed() < CLICK_FALLBACK {
+                return;
+            }
+            guard.take()
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+        let Some(browser) = entry.ctx.browser.get() else {
+            return;
+        };
+        let Some(frame) = browser.main_frame() else {
+            return;
+        };
+        trace_engine(&entry.ctx, "click.fallback")
+            .field("target", pending.target)
+            .emit();
+        let code = format!(
+            "window.__sdsc_click && window.__sdsc_click({})",
+            pending.target
+        );
+        let code: CefString = code.as_str().into();
+        let url: CefString = "sdsc://click".into();
+        frame.execute_java_script(Some(&code), Some(&url), 0);
     }
 
     fn tick_dom(&mut self) {

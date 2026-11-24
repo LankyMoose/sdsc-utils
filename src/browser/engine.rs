@@ -113,6 +113,10 @@ pub enum EngineCommand {
         x: f32,
         y: f32,
         target: Option<u64>,
+        /// `true` = try trusted CEF mouse input first (links). A missing
+        /// navigation falls back to the JS element click so a broken trust
+        /// path never makes a link unclickable.
+        trusted: bool,
     },
     /// R3 diagnostic: arm a one-shot event-loop probe (timers, rAF,
     /// IntersectionObserver) and read it back ~700ms later. Tells whether

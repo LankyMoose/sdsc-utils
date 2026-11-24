@@ -158,6 +158,10 @@ trace_event!(Lane::Input, "pad.gate", owner = owner, edge_seq = edge.seq);
 
 Rules:
 
+- `browser.click` records the target id, point, and `method`
+  (`trusted`/`mouse`/`js`) so page-click provenance is visible.
+- `history.fallback` records a selector pick that CEF skipped over and the
+  requested URL loaded as the fallback.
 - `actions.jsonl` is only for user-visible intents and their outcomes.
 - Lane detail goes in the owning lane; never dump whole app state.
 - Snapshots are bounded and semantic (no DOM, frames, or raw HID reports).

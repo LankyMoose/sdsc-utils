@@ -673,51 +673,37 @@ impl App {
         Task::none()
     }
 
-    /// Resolve the adjacent history target without mutating state.
-    fn browser_adjacent_target(&self, back: bool) -> Result<(usize, Option<String>), &'static str> {
-        if self.browser.engine.is_none() {
-            return Err("engine_unavailable");
-        }
-        let session = &self.browser.panel.session;
-        let Some(current) = session.nav_current() else {
-            return Err("no_stack");
-        };
-        if back {
-            if !self.browser.panel.can_go_back() {
-                return Err("no_back_entry");
-            }
-            let target = current.saturating_sub(1);
-            Ok((target, session.nav_entry(target).map(|e| e.url.clone())))
-        } else {
-            if !self.browser.panel.can_go_forward() {
-                return Err("no_forward_entry");
-            }
-            let target = current + 1;
-            Ok((target, session.nav_entry(target).map(|e| e.url.clone())))
-        }
-    }
-
     pub(crate) fn on_browser_go_back(&mut self) -> Task<Message> {
-        let (target, target_url) = match self.browser_adjacent_target(true) {
-            Ok(target) => target,
-            Err(reason) => {
-                self.trace_browser_noop("browser.history.back", "pad", reason);
-                return Task::none();
-            }
-        };
-        self.start_history_travel("browser.history.back", "pad", target, target_url);
+        if self.browser.engine.is_none() {
+            self.trace_browser_noop("browser.history.back", "pad", "engine_unavailable");
+            return Task::none();
+        }
+        if self.browser.panel.session.nav_current().is_none() {
+            self.trace_browser_noop("browser.history.back", "pad", "no_stack");
+            return Task::none();
+        }
+        if !self.browser.panel.can_go_back() {
+            self.trace_browser_noop("browser.history.back", "pad", "no_back_entry");
+            return Task::none();
+        }
+        self.start_history_step("browser.history.back", "pad", true);
         Task::none()
     }
 
     pub(crate) fn on_browser_go_forward(&mut self) -> Task<Message> {
-        let (target, target_url) = match self.browser_adjacent_target(false) {
-            Ok(target) => target,
-            Err(reason) => {
-                self.trace_browser_noop("browser.history.forward", "pad", reason);
-                return Task::none();
-            }
-        };
-        self.start_history_travel("browser.history.forward", "pad", target, target_url);
+        if self.browser.engine.is_none() {
+            self.trace_browser_noop("browser.history.forward", "pad", "engine_unavailable");
+            return Task::none();
+        }
+        if self.browser.panel.session.nav_current().is_none() {
+            self.trace_browser_noop("browser.history.forward", "pad", "no_stack");
+            return Task::none();
+        }
+        if !self.browser.panel.can_go_forward() {
+            self.trace_browser_noop("browser.history.forward", "pad", "no_forward_entry");
+            return Task::none();
+        }
+        self.start_history_step("browser.history.forward", "pad", false);
         Task::none()
     }
 
@@ -1222,10 +1208,11 @@ impl App {
     }
 
     /// Click at the cursor: attached element center, else the free point.
-    /// Passes the docked target id so Button-kind targets can activate on
-    /// the exact element (`__sdsc_click`); everything else (and free
-    /// points) go through the trusted synthetic pair. A chrome dock isn't
-    /// a page click at all — it runs the header action instead.
+    /// Links use trusted CEF mouse input (with a delayed JS fallback), so
+    /// Chromium keeps user activation and does not mark the navigation as
+    /// skippable. Buttons use trusted input unless the Diagnostics JS-click
+    /// toggle is on. A chrome dock isn't a page click at all — it runs the
+    /// header action instead.
     pub(crate) fn click_browser_cursor(&mut self) -> Task<Message> {
         // Chrome dock first: pad action, never an engine click.
         if let Some(target) = self.browser.panel.chrome_attached() {
@@ -1258,29 +1245,32 @@ impl App {
             }
             return Task::none();
         }
-        let (x, y, target) = {
+        let (x, y, target, trusted) = {
             let panel = &self.browser.panel;
             let targets = crate::ui::browser::cursor_targets(&panel.focusables, &panel.chrome);
             let (x, y) = panel.cursor.click_point(&targets);
-            // Exact-element targets: docked buttons honor the Diagnostics
-            // JS-click toggle (untrusted-activation A/B); docked links
-            // always go exact — synthetic Down/Up pairs demonstrably never
-            // navigated, so there is nothing to A/B there. The backend
-            // falls back to synthetic at the point when the element is gone.
-            let target = match panel.cursor.attached {
-                Some(id)
-                    if panel.focusables.iter().any(|o| {
-                        o.id == id
-                            && (o.kind == crate::browser::cursor::FocusKind::Link
-                                || (o.kind == crate::browser::cursor::FocusKind::Button
-                                    && panel.js_click))
-                    }) =>
-                {
-                    Some(id)
+            // Links use trusted CEF mouse input so Chromium keeps user
+            // activation and does not mark the resulting history entry
+            // skippable. The backend falls back to the JS element click if
+            // no navigation starts in time. Buttons keep the existing
+            // Diagnostics JS-click A/B toggle.
+            let mut target = None;
+            let mut trusted = false;
+            if let Some(id) = panel.cursor.attached
+                && let Some(item) = panel.focusables.iter().find(|o| o.id == id)
+            {
+                match item.kind {
+                    crate::browser::cursor::FocusKind::Link => {
+                        target = Some(id);
+                        trusted = true;
+                    }
+                    crate::browser::cursor::FocusKind::Button if panel.js_click => {
+                        target = Some(id);
+                    }
+                    _ => {}
                 }
-                _ => None,
-            };
-            (x, y, target)
+            }
+            (x, y, target, trusted)
         };
         // Instant header feedback ("Opening link…"): the click is
         // acknowledged now; the page changing (or not) tells the rest.
@@ -1295,14 +1285,43 @@ impl App {
             };
         self.browser.panel.last_click = Some(((x, y), Instant::now()));
         self.browser.panel.action_hint = Some((label.to_string(), Instant::now()));
+        let trace =
+            crate::platform::trace::action(crate::platform::trace::Lane::Browser, "browser.click")
+                .app("browser")
+                .source("pad")
+                .field("x", x)
+                .field("y", y)
+                .field("target", target)
+                .field(
+                    "method",
+                    if trusted {
+                        "trusted"
+                    } else if target.is_some() {
+                        "js"
+                    } else {
+                        "mouse"
+                    },
+                )
+                .field("trusted", trusted)
+                .pre(crate::app::browser::trace_browser_state(
+                    &self.browser.panel,
+                ))
+                .begin();
         if let Some(engine) = &self.browser.engine {
             engine.send(EngineCommand::ClickAt {
                 tab: self.browser_tab(),
                 x,
                 y,
                 target,
+                trusted,
             });
         }
+        trace
+            .finish("sent")
+            .post(crate::app::browser::trace_browser_state(
+                &self.browser.panel,
+            ))
+            .emit();
         Task::none()
     }
 

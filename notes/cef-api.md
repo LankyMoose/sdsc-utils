@@ -91,7 +91,7 @@ Status legend:
 | Print / PDF | `BrowserHost::Print`, `PrintToPDF`; `PrintHandler` | print | **wrapper only** | — |
 | DevTools | `BrowserHost::ShowDevTools`, `ExecuteDevToolsMethod`, `DevToolsMessageObserver` | none | **wrapper only** | — |
 | Accessibility | `AccessibilityHandler::OnAccessibilityTreeChange`; `BrowserHost::SetAccessibilityState` | accessibility | **custom** (DOM query) | `src/browser/dom.rs` |
-| Keyboard / mouse / wheel | `BrowserHost::SendKeyEvent`, `SendMouseClickEvent`, `SendMouseMoveEvent`, `SendMouseWheelEvent` | none | **wired** (clicks/scroll use JS in places) | `src/browser/cef_backend.rs` |
+| Keyboard / mouse / wheel | `BrowserHost::SendKeyEvent`, `SendMouseClickEvent`, `SendMouseMoveEvent`, `SendMouseWheelEvent` | none | **wired** (trusted link/button clicks; JS fallback; scroll uses JS) | `src/browser/cef_backend.rs` |
 | IME | `BrowserHost::ImeSetComposition`, `ImeCommitText`, `ImeFinishComposingText`, `ImeCancelComposition` | none | **unhandled** | `notes/browser-osk.md` |
 | OSR paint | `RenderHandler::OnPaint`; `OnAcceleratedPaint` | render | **wired** (CPU L1; accelerated not wired) | `src/browser/cef_backend.rs` |
 | Cookies / cache / profile | `CookieManager`, `RequestContext`, `Settings.root_cache_path` | settings | **wired** (CEF defaults) | `src/browser/cef_backend.rs:initialize_cef` |
@@ -105,9 +105,11 @@ history from address-change events.
 
 Current wiring: `src/browser/cef_backend.rs` polls `GetNavigationEntries` and
 emits `EngineEvent::HistoryChanged`; `BrowserSession::apply_engine_history`
-projects it for the selector; `App::start_history_travel` /
-`advance_history_travel` move one CEF step per canonical snapshot. Address
-changes only update the live URL and autocomplete MRU.
+projects it for the selector. `App::start_history_step` treats L1/R1 as one
+CEF step and accepts the landing; `start_history_travel` /
+`advance_history_travel` sequence selector jumps one snapshot at a time and
+detect a skipped target. Address changes only update the live URL and
+autocomplete MRU.
 
 ### Read
 
@@ -156,9 +158,18 @@ a burst of identical events.
 
 - History is **per browser**, in-memory, and not persisted across restarts.
 - CEF does not expose a global browsing-history database or omnibox.
-- There is no `GoToIndex`. `GoBack`/`GoForward` move one entry and are
-  asynchronous. Sequence one step per canonical snapshot; do not loop N calls
-  in one batch.
+- There is no `GoToIndex`. `GoBack`/`GoForward` move one *non-skippable* entry
+  and are asynchronous. Sequence one step per canonical snapshot; do not loop
+  N calls in one batch.
+- **Index is not a traversal offset.** Chromium's history-manipulation
+  intervention marks some entries `should_skip_on_back_forward_ui`;
+  `GetNavigationEntries` lists them, but `GoBack`/`GoForward` skip them. CEF
+  does not expose that flag publicly.
+- The app treats L1/R1 (`browser.history.back/forward`) as one CEF step and
+  accepts the reported landing. Selector picks target an index; if CEF skips
+  past it, the action records `target_skipped` and falls back to loading the
+  requested URL (a new history entry, forward tail lost) rather than
+  oscillating.
 - Redirects remain one navigation entry; use `GetOriginalURL` for replay
   matching.
 - `HasPostData` means a URL-only replay is not equivalent.

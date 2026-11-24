@@ -73,9 +73,12 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
   the stick centers. `--disable-smooth-scrolling` still covers real wheel
   input. The custom iced scrollbar was removed — Chromium owns the page
   scrollbar.
-- Docked clicks use `window.__sdsc_click`, defined by the DOM query itself
-  (the observer install script is gone). Precise/free clicks use trusted
-  synthetic events at the point.
+- Docked links use trusted CEF mouse input at the element center. If no
+  navigation starts within 700ms, the backend falls back to
+  `window.__sdsc_click` so a miss never leaves the link unclickable. Docked
+  buttons use trusted mouse input by default; the Diagnostics JS-click toggle
+  keeps the old untrusted A/B path. Precise/free clicks use trusted input at
+  the point.
 - `--force-color-profile=srgb` and a white `BrowserSettings.background_color`
   keep the OSR buffer aligned with the browser canvas.
 - The OSR frame texture is **`Rgba8Unorm`, not `Rgba8UnormSrgb`**. iced renders
