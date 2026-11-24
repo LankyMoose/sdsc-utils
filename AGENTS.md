@@ -128,7 +128,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Shared face-button hints / rings** → `src/ui/face/` (`mod.rs` widgets, `ring.rs` SVG rings); used by Launcher, Launcher Settings, and Home controller dock rows
 - **Shared UI sounds / haptics** → `src/app/feedback.rs` (global cue + pref application), `src/platform/ui_sound.rs` (audio worker); Home Settings owns the controls
 - **Launcher / fullscreen game console** → `src/ui/launcher/` (UI), `src/games/` (Steam scan, launch); behavior → `notes/launcher-immersive.md`
-- **Browser (CEF)** → `src/browser/` (engine seam, `cef_backend.rs`, DOM/cursor, nav helpers) + `src/ui/browser/state.rs` (panel/tabs/chrome) + `src/ui/launcher/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state); Home → `src/ui/home/` + `src/app/home.rs`; contracts → `notes/browser-embedding.md`; Home/CEF pivot plan → `notes/browser-home-pivot.md`
+- **Browser (CEF)** → `src/browser/` (engine seam, `cef_backend.rs`, DOM/cursor, nav helpers) + `src/ui/browser/state.rs` (panel/tabs/chrome) + `src/ui/launcher/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state); Home → `src/ui/home/` + `src/app/home.rs`; contracts → `notes/browser-embedding.md`; CEF API map → `notes/cef-api.md`; Home/CEF pivot plan → `notes/browser-home-pivot.md`
 - **Toasts** → `src/ui/toast/` (state machine in `machine.rs`); z-order / remount → `notes/windows-toast.md`
 - **Persisted state (prefs/controllers/analytics)** → `src/persist/`
 - **Single instance, tray lifecycle, crash-restart** → `src/bin/sdsc-utils.rs`, `src/platform/crash_restart.rs`
