@@ -35,6 +35,10 @@ struct ImeBridge<'a, Message, Theme, Renderer> {
     cursor: Rectangle,
 }
 
+// This is a transparent wrapper: `tag`/`state`/`children`/`diff` all delegate
+// to the content, so `draw`, `mouse_interaction`, and `overlay` must receive
+// that same content `tree` — never `tree.children[0]`.
+
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
     for ImeBridge<'_, Message, Theme, Renderer>
 where
@@ -118,13 +122,9 @@ where
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        self.content.as_widget().mouse_interaction(
-            &tree.children[0],
-            layout,
-            cursor,
-            viewport,
-            renderer,
-        )
+        self.content
+            .as_widget()
+            .mouse_interaction(tree, layout, cursor, viewport, renderer)
     }
 
     fn draw(
@@ -137,15 +137,9 @@ where
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        self.content.as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            style,
-            layout,
-            cursor,
-            viewport,
-        );
+        self.content
+            .as_widget()
+            .draw(tree, renderer, theme, style, layout, cursor, viewport);
     }
 
     fn overlay<'b>(
@@ -156,13 +150,9 @@ where
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        self.content.as_widget_mut().overlay(
-            &mut tree.children[0],
-            layout,
-            renderer,
-            viewport,
-            translation,
-        )
+        self.content
+            .as_widget_mut()
+            .overlay(tree, layout, renderer, viewport, translation)
     }
 }
 

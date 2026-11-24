@@ -377,6 +377,12 @@ impl super::App {
                 Task::none()
             }
             #[cfg(debug_assertions)]
+            "screenshot" => {
+                self.debug_browser = true;
+                self.browser.panel.debug_overlay = false;
+                self.shoot_browser_window(true)
+            }
+            #[cfg(debug_assertions)]
             "osk.toggle" => {
                 self.toggle_browser_osk();
                 Task::none()

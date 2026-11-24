@@ -125,6 +125,8 @@ synthetic input steps for automation:
 - `ime.preedit` / `ime.commit` — `{"text": "é"}` drive the page IME path.
 - `osk.toggle` / `osk.key` — `{"char": "!"}` open/close and commit through
   the on-screen keyboard.
+- `screenshot` — debug-only: capture the Browser window to `<data>/shots`;
+  `scripts/qa_browser_visual.py` uses it as a pixel smoke test.
 
 Input steps call the real browser handlers with explicit page coordinates;
 they never use the OS keyboard, mouse, cursor position, or window focus. The
@@ -142,7 +144,9 @@ Home.
 local page, runs these synthetic steps, asserts typed text / wheel scroll /
 drag selection / cursor-shape trace, and kills the process immediately.
 `python scripts/qa_browser_popup.py` does the same for target=_blank popups
-becoming a second Browser tab.
+becoming a second Browser tab. `python scripts/qa_browser_visual.py` captures
+a debug screenshot and verifies the actual page pixels, catching widget-tree
+render regressions that traces cannot see.
 
 ## Adding instrumentation
 
