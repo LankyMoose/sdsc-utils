@@ -195,7 +195,9 @@ impl super::App {
         let Some(step) = self.replay.as_mut().and_then(|plan| plan.next_step()) else {
             self.replay = None;
             crate::platform::trace::manifest("replay.done", serde_json::json!({ "flow": flow }));
-            return Task::none();
+            // Automated sessions must not leave the browser on screen after
+            // the plan finishes. The trace is fully written before close.
+            return self.close_browser_window();
         };
         if step.app == "browser" {
             let state = trace_browser_state(&self.browser.panel);
@@ -325,6 +327,55 @@ impl super::App {
                 }
             }
             "history.cancel" => self.on_browser_history_cancel(),
+            #[cfg(debug_assertions)]
+            "text" => {
+                if let Some(text) = step.params.get("text").and_then(serde_json::Value::as_str) {
+                    self.replay_type_text(text);
+                }
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            "key" => {
+                let Some(key) = step.params.get("key").and_then(serde_json::Value::as_str) else {
+                    return Task::none();
+                };
+                let modifiers = replay_modifiers(step.params.get("modifiers"));
+                if !self.replay_press_key(key, modifiers) {
+                    crate::platform::trace::event(
+                        crate::platform::trace::Lane::Platform,
+                        "replay.unsupported",
+                    )
+                    .field("app", &step.app)
+                    .field("action", &step.action)
+                    .field("key", key)
+                    .emit();
+                }
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            "mouse.click" => {
+                if let Some((x, y)) = replay_point(&step.params) {
+                    self.inject_browser_click(x, y, "replay");
+                }
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            "mouse.wheel" => {
+                if let Some((x, y)) = replay_point(&step.params) {
+                    let dx = step
+                        .params
+                        .get("dx")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    let dy = step
+                        .params
+                        .get("dy")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    self.inject_browser_wheel(x, y, dx as i32, dy as i32, "replay");
+                }
+                Task::none()
+            }
             _ => {
                 crate::platform::trace::event(
                     crate::platform::trace::Lane::Platform,
@@ -885,6 +936,14 @@ impl super::App {
             }
             BrowserMessage::BookmarkSave => self.on_browser_bookmark_save(),
             BrowserMessage::BookmarkRemove => self.on_browser_bookmark_remove(),
+            BrowserMessage::PagePointerMoved { x, y } => {
+                if !crate::platform::debug_quiet::input_dropped() {
+                    self.browser.panel.page_mouse = (x, y);
+                }
+                Task::none()
+            }
+            BrowserMessage::PageClick => self.on_browser_page_click(),
+            BrowserMessage::PageWheel { dx, dy } => self.on_browser_page_wheel(dx, dy),
             BrowserMessage::Scrolled(y) => {
                 self.browser.panel.note_scrolled(y);
                 Task::none()
@@ -892,6 +951,133 @@ impl super::App {
             #[cfg(debug_assertions)]
             BrowserMessage::Shot(shot) => self.save_browser_shot(shot),
         }
+    }
+
+    fn on_browser_page_click(&mut self) -> Task<Message> {
+        if crate::platform::debug_quiet::input_dropped() {
+            return Task::none();
+        }
+        let (x, y) = self.browser.panel.page_mouse;
+        self.inject_browser_click(x, y, "mouse");
+        Task::none()
+    }
+
+    fn on_browser_page_wheel(&mut self, dx: i32, dy: i32) -> Task<Message> {
+        if crate::platform::debug_quiet::input_dropped() {
+            return Task::none();
+        }
+        let (x, y) = self.browser.panel.page_mouse;
+        self.inject_browser_wheel(x, y, dx, dy, "mouse");
+        Task::none()
+    }
+
+    /// Shared page-click path for hardware and replay injection. Replay
+    /// supplies explicit page-local coordinates, so tests never move or read
+    /// the OS cursor.
+    pub(crate) fn inject_browser_click(&mut self, x: f32, y: f32, source: &'static str) {
+        let (x, y) = self.clamp_page_mouse(x, y);
+        if self.browser.panel.url_editing {
+            // A page click leaves the omnibox; the field disappears and the
+            // page receives keyboard focus on the next CEF click.
+            self.browser.panel.url_editing = false;
+        }
+        let Some(engine) = &self.browser.engine else {
+            return;
+        };
+        let tab = self.browser_tab();
+        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.page_click")
+            .field("x", x)
+            .field("y", y)
+            .field("source", source)
+            .emit();
+        engine.send(EngineCommand::ClickAt {
+            tab,
+            x,
+            y,
+            target: None,
+            trusted: true,
+        });
+    }
+
+    /// Shared page-wheel path for hardware and replay injection.
+    pub(crate) fn inject_browser_wheel(
+        &mut self,
+        x: f32,
+        y: f32,
+        dx: i32,
+        dy: i32,
+        source: &'static str,
+    ) {
+        let (x, y) = self.clamp_page_mouse(x, y);
+        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.page_wheel")
+            .field("x", x)
+            .field("y", y)
+            .field("dx", dx)
+            .field("dy", dy)
+            .field("source", source)
+            .emit();
+        let Some(engine) = &self.browser.engine else {
+            // Reader fallback has no CEF wheel path; invert to iced's
+            // scroll-down-positive convention.
+            let _ = self.scroll_browser(-(dy as f32));
+            return;
+        };
+        engine.send(EngineCommand::MouseWheel {
+            tab: self.browser_tab(),
+            x,
+            y,
+            dx,
+            dy,
+        });
+    }
+
+    fn clamp_page_mouse(&mut self, x: f32, y: f32) -> (f32, f32) {
+        let (w, h) = self.browser.panel.viewport;
+        let x = x.clamp(0.0, (w - 1.0).max(0.0));
+        let y = y.clamp(0.0, (h - 1.0).max(0.0));
+        self.browser.panel.page_mouse = (x, y);
+        (x, y)
+    }
+
+    /// Replay text injection: press+release each character through the real
+    /// browser key handler. Never touches the OS keyboard.
+    #[cfg(debug_assertions)]
+    pub(crate) fn replay_type_text(&mut self, text: &str) {
+        let events = crate::browser::keys::synthetic_text(text, iced::keyboard::Modifiers::empty());
+        self.replay_raw_keys(events, "text");
+        crate::platform::trace::event(
+            crate::platform::trace::Lane::Browser,
+            "browser.synthetic_text",
+        )
+        .field("len", text.chars().count())
+        .emit();
+    }
+
+    /// Replay named-key tap through the real browser key handler.
+    #[cfg(debug_assertions)]
+    pub(crate) fn replay_press_key(
+        &mut self,
+        name: &str,
+        modifiers: iced::keyboard::Modifiers,
+    ) -> bool {
+        let Some(events) = crate::browser::keys::synthetic_named(name, modifiers) else {
+            return false;
+        };
+        self.replay_raw_keys(events.to_vec(), name);
+        true
+    }
+
+    #[cfg(debug_assertions)]
+    fn replay_raw_keys(&mut self, events: Vec<crate::browser::keys::RawKey>, label: &str) {
+        for raw in events {
+            let _ = self.on_browser_key(raw);
+        }
+        crate::platform::trace::event(
+            crate::platform::trace::Lane::Browser,
+            "browser.synthetic_key",
+        )
+        .field("key", label)
+        .emit();
     }
 }
 
@@ -1942,6 +2128,35 @@ fn home_install_progress(
     }
 }
 
+/// Replay key modifiers from a JSON array (`["ctrl","shift"]`). The keys are
+/// only constructible by the debug replay driver.
+#[cfg(debug_assertions)]
+fn replay_modifiers(value: Option<&serde_json::Value>) -> iced::keyboard::Modifiers {
+    use iced::keyboard::Modifiers;
+    let mut modifiers = Modifiers::empty();
+    let Some(items) = value.and_then(serde_json::Value::as_array) else {
+        return modifiers;
+    };
+    for item in items {
+        match item.as_str() {
+            Some("ctrl" | "control") => modifiers |= Modifiers::CTRL,
+            Some("shift") => modifiers |= Modifiers::SHIFT,
+            Some("alt") => modifiers |= Modifiers::ALT,
+            Some("meta" | "logo" | "super") => modifiers |= Modifiers::LOGO,
+            _ => {}
+        }
+    }
+    modifiers
+}
+
+/// Replay page-local point (`{"x":..,"y":..}`).
+#[cfg(debug_assertions)]
+fn replay_point(params: &serde_json::Value) -> Option<(f32, f32)> {
+    let x = params.get("x")?.as_f64()? as f32;
+    let y = params.get("y")?.as_f64()? as f32;
+    Some((x, y))
+}
+
 /// Bounded browser state for action traces. Includes the UI stack, the last
 /// raw engine history, CEF's back/forward flags, and the selector list so a
 /// picked index can always be resolved back to an actual URL/title.
@@ -2134,5 +2349,19 @@ mod tests {
         );
         assert!(browser_tap_action(&[tap(PadButton::R3)]).is_none());
         assert!(browser_tap_action(&[hold(PadButton::Cross)]).is_none());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn replay_input_helpers_parse_points_and_modifiers() {
+        assert_eq!(
+            replay_point(&serde_json::json!({"x": 12.5, "y": 40})),
+            Some((12.5, 40.0))
+        );
+        assert_eq!(replay_point(&serde_json::json!({"x": 1})), None);
+        let modifiers = replay_modifiers(Some(&serde_json::json!(["ctrl", "shift", "bogus"])));
+        assert!(modifiers.control());
+        assert!(modifiers.shift());
+        assert!(!modifiers.alt());
     }
 }

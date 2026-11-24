@@ -58,6 +58,65 @@ pub fn pad_key(key: keyboard_types::NamedKey) -> [keyboard_types::KeyboardEvent;
     [base, released]
 }
 
+/// Synthetic key events for replay/QA. They enter the same shell handler as
+/// hardware keys but never touch the OS keyboard, cursor, or focus.
+#[cfg(debug_assertions)]
+fn synthetic_raw(key: keyboard::Key, modifiers: keyboard::Modifiers, pressed: bool) -> RawKey {
+    RawKey {
+        key,
+        physical: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+        location: keyboard::Location::Standard,
+        modifiers,
+        pressed,
+        repeat: false,
+    }
+}
+
+/// Text plus newline/tab controls as press+release pairs. No OS input.
+#[cfg(debug_assertions)]
+pub fn synthetic_text(text: &str, modifiers: keyboard::Modifiers) -> Vec<RawKey> {
+    let mut events = Vec::new();
+    for ch in text.chars() {
+        let key = match ch {
+            '\n' => keyboard::Key::Named(keyboard::key::Named::Enter),
+            '\t' => keyboard::Key::Named(keyboard::key::Named::Tab),
+            ch if ch.is_control() => continue,
+            ch => keyboard::Key::Character(ch.to_string().into()),
+        };
+        events.push(synthetic_raw(key.clone(), modifiers, true));
+        events.push(synthetic_raw(key, modifiers, false));
+    }
+    events
+}
+
+/// One named key tap (press+release) for replay/QA.
+#[cfg(debug_assertions)]
+pub fn synthetic_named(name: &str, modifiers: keyboard::Modifiers) -> Option<[RawKey; 2]> {
+    use keyboard::key::Named;
+    let named = match name {
+        "Enter" | "Return" => Named::Enter,
+        "Tab" => Named::Tab,
+        "Escape" => Named::Escape,
+        "Backspace" => Named::Backspace,
+        "Delete" => Named::Delete,
+        "Space" => Named::Space,
+        "ArrowUp" => Named::ArrowUp,
+        "ArrowDown" => Named::ArrowDown,
+        "ArrowLeft" => Named::ArrowLeft,
+        "ArrowRight" => Named::ArrowRight,
+        "Home" => Named::Home,
+        "End" => Named::End,
+        "PageUp" => Named::PageUp,
+        "PageDown" => Named::PageDown,
+        _ => return None,
+    };
+    let key = keyboard::Key::Named(named);
+    Some([
+        synthetic_raw(key.clone(), modifiers, true),
+        synthetic_raw(key, modifiers, false),
+    ])
+}
+
 fn map_key(key: &keyboard::Key) -> keyboard_types::Key {
     use iced::keyboard::key::Named as In;
     use keyboard_types::{Key as Out, NamedKey};
@@ -182,5 +241,34 @@ mod tests {
         assert!(matches!(down.state, keyboard_types::KeyState::Down));
         assert!(matches!(up.state, keyboard_types::KeyState::Up));
         assert_eq!(down.key.to_string(), up.key.to_string());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn synthetic_text_emits_press_release_pairs_without_os_input() {
+        let events = synthetic_text("a\n", keyboard::Modifiers::empty());
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            events[0].key,
+            keyboard::Key::Character(ref text) if text == "a"
+        ));
+        assert!(events[0].pressed);
+        assert!(!events[1].pressed);
+        assert!(matches!(
+            events[2].key,
+            keyboard::Key::Named(keyboard::key::Named::Enter)
+        ));
+        assert!(events[2].pressed);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn synthetic_named_maps_common_keys_and_rejects_unknown() {
+        let [down, up] = synthetic_named("Tab", keyboard::Modifiers::SHIFT).unwrap();
+        assert!(down.pressed);
+        assert!(!up.pressed);
+        assert!(down.modifiers.shift());
+        assert_eq!(down.location, keyboard::Location::Standard);
+        assert!(synthetic_named("NotAKey", keyboard::Modifiers::empty()).is_none());
     }
 }

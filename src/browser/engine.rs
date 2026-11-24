@@ -138,6 +138,16 @@ pub enum EngineCommand {
         tab: TabId,
         index: usize,
     },
+    /// Physical mouse wheel at a page-local point. The UI translates line
+    /// deltas to CEF's 120-unit wheel scale; native wheel events keep
+    /// Chromium's nested-scroller handling instead of the pad's JS scroll.
+    MouseWheel {
+        tab: TabId,
+        x: f32,
+        y: f32,
+        dx: i32,
+        dy: i32,
+    },
     /// Ask the engine for a fresh canonical history snapshot.
     QueryHistory {
         tab: TabId,
@@ -211,6 +221,7 @@ impl EngineCommand {
             | Self::GoBack { tab }
             | Self::GoForward { tab }
             | Self::GoToHistoryIndex { tab, .. }
+            | Self::MouseWheel { tab, .. }
             | Self::QueryHistory { tab }
             | Self::Reload { tab, .. }
             | Self::OpenTab { tab, .. }

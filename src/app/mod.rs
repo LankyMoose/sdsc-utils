@@ -1457,61 +1457,75 @@ impl App {
     fn subscription(&self) -> Subscription<Message> {
         let mut subscriptions = vec![
             window::close_events().map(Message::WindowClosed),
-            iced::event::listen_with(|event, _status, id| match event {
-                iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
-                iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocused(id)),
-                iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                    key,
-                    physical_key,
-                    location,
-                    modifiers,
-                    repeat,
-                    ..
-                }) => {
-                    #[cfg(debug_assertions)]
-                    if key == keyboard::Key::Named(keyboard::key::Named::F9) {
-                        return Some(Message::ToggleDebugLayoutBounds);
+            iced::event::listen_with(|event, _status, id| {
+                // Real input is off for automated/quiet sessions. Replay
+                // injects synthetic keys/mouse directly into app handlers.
+                if crate::platform::debug_quiet::input_dropped()
+                    && matches!(
+                        event,
+                        iced::Event::Keyboard(_) | iced::Event::Mouse(_) | iced::Event::Touch(_)
+                    )
+                {
+                    return None;
+                }
+                match event {
+                    iced::Event::Window(window::Event::Unfocused) => {
+                        Some(Message::WindowUnfocused(id))
                     }
-                    #[cfg(debug_assertions)]
-                    if key == keyboard::Key::Named(keyboard::key::Named::F10) {
-                        return Some(Message::ToggleDebugBrowser);
+                    iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocused(id)),
+                    iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                        key,
+                        physical_key,
+                        location,
+                        modifiers,
+                        repeat,
+                        ..
+                    }) => {
+                        #[cfg(debug_assertions)]
+                        if key == keyboard::Key::Named(keyboard::key::Named::F9) {
+                            return Some(Message::ToggleDebugLayoutBounds);
+                        }
+                        #[cfg(debug_assertions)]
+                        if key == keyboard::Key::Named(keyboard::key::Named::F10) {
+                            return Some(Message::ToggleDebugBrowser);
+                        }
+                        Some(Message::BrowserRawKey {
+                            id,
+                            key: RawKey {
+                                key,
+                                physical: physical_key,
+                                location,
+                                modifiers,
+                                pressed: true,
+                                repeat,
+                            },
+                        })
                     }
-                    Some(Message::BrowserRawKey {
+                    iced::Event::Keyboard(keyboard::Event::KeyReleased {
+                        key,
+                        physical_key,
+                        location,
+                        modifiers,
+                        ..
+                    }) => Some(Message::BrowserRawKey {
                         id,
                         key: RawKey {
                             key,
                             physical: physical_key,
                             location,
                             modifiers,
-                            pressed: true,
-                            repeat,
+                            pressed: false,
+                            repeat: false,
                         },
-                    })
+                    }),
+                    iced::Event::Mouse(
+                        mouse::Event::CursorMoved { .. }
+                        | mouse::Event::ButtonPressed(_)
+                        | mouse::Event::ButtonReleased(_)
+                        | mouse::Event::WheelScrolled { .. },
+                    ) => Some(Message::LauncherCursorActivity(id)),
+                    _ => None,
                 }
-                iced::Event::Keyboard(keyboard::Event::KeyReleased {
-                    key,
-                    physical_key,
-                    location,
-                    modifiers,
-                    ..
-                }) => Some(Message::BrowserRawKey {
-                    id,
-                    key: RawKey {
-                        key,
-                        physical: physical_key,
-                        location,
-                        modifiers,
-                        pressed: false,
-                        repeat: false,
-                    },
-                }),
-                iced::Event::Mouse(
-                    mouse::Event::CursorMoved { .. }
-                    | mouse::Event::ButtonPressed(_)
-                    | mouse::Event::ButtonReleased(_)
-                    | mouse::Event::WheelScrolled { .. },
-                ) => Some(Message::LauncherCursorActivity(id)),
-                _ => None,
             }),
         ];
 
@@ -1533,7 +1547,7 @@ impl App {
         // owns its watcher registration for the process lifetime.
         subscriptions.push(Subscription::run(presence_hint_stream));
 
-        if self.toast_message.is_some() {
+        if self.toast_message.is_some() && !crate::platform::debug_quiet::input_dropped() {
             subscriptions.push(Subscription::run_with(
                 self.toast_generation,
                 |generation| escape_hotkey(*generation),
@@ -1669,6 +1683,16 @@ impl App {
     }
 
     fn view(&self, window: window::Id) -> Element<'_, Message> {
+        let content = self.view_inner(window);
+        // Automated/quiet sessions never accept real keyboard or mouse input;
+        // replay injects synthetic events into the same handlers instead.
+        if crate::platform::debug_quiet::input_dropped() {
+            return crate::ui::input_lock::input_lock(content);
+        }
+        content
+    }
+
+    fn view_inner(&self, window: window::Id) -> Element<'_, Message> {
         if Some(window) == self.popup_window {
             return popup_view::view(
                 &self.popup_state,
@@ -2093,7 +2117,10 @@ impl App {
                 }
             }
             Message::LauncherCursorActivity(id) => {
-                if Some(id) == self.launcher_window && self.launcher_visible {
+                if !crate::platform::debug_quiet::input_dropped()
+                    && Some(id) == self.launcher_window
+                    && self.launcher_visible
+                {
                     self.note_start_cursor_activity();
                 }
                 Task::none()
@@ -2109,8 +2136,20 @@ impl App {
                 id,
                 action,
                 pressed,
-            } => self.on_start_key(id, action, pressed),
-            Message::BrowserRawKey { id, key } => self.on_browser_raw_key(id, key),
+            } => {
+                if crate::platform::debug_quiet::input_dropped() {
+                    Task::none()
+                } else {
+                    self.on_start_key(id, action, pressed)
+                }
+            }
+            Message::BrowserRawKey { id, key } => {
+                if crate::platform::debug_quiet::input_dropped() {
+                    Task::none()
+                } else {
+                    self.on_browser_raw_key(id, key)
+                }
+            }
             Message::PadInput(edge) => {
                 if crate::platform::debug_quiet::input_dropped() {
                     Task::none()
@@ -2938,10 +2977,16 @@ impl App {
                     tasks.push(self.queue_notifications(events, open_home_after_toast));
                 }
                 SessionEffect::OpenHome => {
-                    // The reopen chord may fire during the connect-toast
-                    // latch; the toast's own AfterToast::OpenHome still opens
-                    // Home.
-                    if self.toast_machine.suppresses_reopen_gesture() {
+                    if crate::platform::debug_quiet::input_dropped() {
+                        // Automated/quiet sessions must not pop Home over the
+                        // surface under test; replay drives its own window.
+                        crate::controller::hid::diag::diag_info(
+                            "ui-diag: OpenHome ignored (automated input lock)",
+                        );
+                    } else if self.toast_machine.suppresses_reopen_gesture() {
+                        // The reopen chord may fire during the connect-toast
+                        // latch; the toast's own AfterToast::OpenHome still opens
+                        // Home.
                         crate::controller::hid::diag::diag_info(
                             "ui-diag: OpenHome ignored (toast OpenHome pending)",
                         );
@@ -3389,6 +3434,10 @@ fn stamp_hitch_report(hub: &InputHub, kind: &str, source: &str, extra: Option<St
 /// Debug builds only (`cfg(debug_assertions)`).
 #[cfg(all(windows, debug_assertions))]
 fn start_hitch_hotkey_worker(hub: Arc<InputHub>) {
+    // Automated sessions must not reserve F7/F8 globally.
+    if crate::platform::debug_quiet::input_dropped() {
+        return;
+    }
     use std::sync::OnceLock;
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {

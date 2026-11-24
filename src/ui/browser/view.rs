@@ -12,7 +12,7 @@ use crate::ui::text_fit;
 use crate::ui::theme;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, column, container, image, row, scrollable, space, stack, text, text_input,
+    button, column, container, image, mouse_area, row, scrollable, space, stack, text, text_input,
 };
 use iced::{Alignment, Element, Fill, Length};
 
@@ -43,6 +43,18 @@ pub enum BrowserMessage {
     BookmarkNameChanged(String),
     BookmarkSave,
     BookmarkRemove,
+    /// Hardware pointer moved over the live page (page-local coordinates).
+    PagePointerMoved {
+        x: f32,
+        y: f32,
+    },
+    /// Hardware left click on the live page; uses `BrowserPanel::page_mouse`.
+    PageClick,
+    /// Hardware wheel over the live page; uses `BrowserPanel::page_mouse`.
+    PageWheel {
+        dx: i32,
+        dy: i32,
+    },
     Scrolled(f32),
     #[cfg(debug_assertions)]
     Shot(iced::window::Screenshot),
@@ -73,6 +85,7 @@ impl BrowserMessage {
             Self::BookmarkStar => Some("browser.bookmark.star"),
             Self::BookmarkSave => Some("browser.bookmark.save"),
             Self::BookmarkRemove => Some("browser.bookmark.remove"),
+            Self::PagePointerMoved { .. } | Self::PageClick | Self::PageWheel { .. } => None,
             Self::Scrolled(_) => None,
             #[cfg(debug_assertions)]
             Self::Shot(_) => None,
@@ -132,6 +145,18 @@ fn cursor_draws(panel: &BrowserPanel) -> bool {
 /// The surface is 1:1: the engine viewport is resized to the page area.
 fn cursor_card_point(x: f32, y: f32) -> (f32, f32) {
     (x, CHROME_HEADER_H + y)
+}
+
+/// CEF wheel deltas use the Windows 120-units-per-line convention. iced
+/// reports line deltas for wheel notches and pixel deltas for precision
+/// touchpads; both preserve the sign, which CEF expects positive = up/left.
+pub(crate) fn scroll_delta_units(delta: iced::mouse::ScrollDelta) -> (i32, i32) {
+    match delta {
+        iced::mouse::ScrollDelta::Lines { x, y } => {
+            ((x * 120.0).round() as i32, (y * 120.0).round() as i32)
+        }
+        iced::mouse::ScrollDelta::Pixels { x, y } => (x.round() as i32, y.round() as i32),
+    }
 }
 
 /// Virtual cursor overlay across the whole browser surface (header plus
@@ -229,15 +254,28 @@ pub fn browser_page_view(
         // One stable GPU texture per tab, uploaded on unseen generations
         // only. Never mint a per-frame image handle: the atlas cache misses
         // by construction and the page blinks at large viewports.
-        return iced::widget::shader(
+        let page = iced::widget::shader(
             crate::ui::launcher::browser_frame::BrowserFrameProgram::new(
                 std::sync::Arc::clone(session.frame_slot()),
                 panel.active_tab.0,
             ),
         )
         .width(Length::Fixed(page_w))
-        .height(Length::Fixed(page_h))
-        .into();
+        .height(Length::Fixed(page_h));
+        // Hardware pointer path: page-local coordinates go straight to the
+        // engine. Replay injects the same handlers with explicit points, so
+        // automation never needs the OS cursor.
+        return mouse_area(page)
+            .on_move(|point| BrowserMessage::PagePointerMoved {
+                x: point.x,
+                y: point.y,
+            })
+            .on_press(BrowserMessage::PageClick)
+            .on_scroll(|delta| {
+                let (dx, dy) = scroll_delta_units(delta);
+                BrowserMessage::PageWheel { dx, dy }
+            })
+            .into();
     }
     let body_text = match session.error() {
         Some(err) => format!("Page couldn't load: {err}"),
@@ -1476,5 +1514,21 @@ mod tests {
         assert_eq!(panel.tab_title(TabId::BOOT), "A page");
         // Unknown id: empty (no strip slot renders it).
         assert!(panel.tab_title(TabId(999)).is_empty());
+    }
+
+    #[test]
+    fn wheel_lines_use_the_cef_120_unit_scale() {
+        assert_eq!(
+            scroll_delta_units(iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+            (0, -120)
+        );
+        assert_eq!(
+            scroll_delta_units(iced::mouse::ScrollDelta::Lines { x: 1.0, y: 0.0 }),
+            (120, 0)
+        );
+        assert_eq!(
+            scroll_delta_units(iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -12.4 }),
+            (0, -12)
+        );
     }
 }

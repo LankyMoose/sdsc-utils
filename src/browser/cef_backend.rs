@@ -1860,6 +1860,22 @@ impl Worker {
                     }
                 }
             }
+            EngineCommand::MouseWheel { tab, x, y, dx, dy } => {
+                if let Some(entry) = self.tab(tab)
+                    && let Some(browser) = entry.ctx.browser.get()
+                    && let Some(host) = browser.host()
+                {
+                    host.send_mouse_wheel_event(
+                        Some(&MouseEvent {
+                            x: x as i32,
+                            y: y as i32,
+                            modifiers: 0,
+                        }),
+                        dx,
+                        dy,
+                    );
+                }
+            }
             EngineCommand::ReseedDom { tab } => {
                 if let Some(entry) = self.tab_mut(tab) {
                     entry.last_dom = Instant::now() - DOM_POLL;
@@ -2215,27 +2231,67 @@ fn modifiers(m: keyboard_types::Modifiers) -> u32 {
 }
 
 fn send_key(host: &BrowserHost, key: &TabKey) {
-    let (vk, ch) = key_code(&key.event.key);
-    let down = key.event.state == keyboard_types::KeyState::Down;
-    let type_ = if down {
-        if ch != 0 {
-            KeyEventType::KEYDOWN
-        } else {
-            KeyEventType::RAWKEYDOWN
-        }
-    } else {
-        KeyEventType::KEYUP
-    };
-    let event = KeyEvent {
-        type_,
-        modifiers: modifiers(key.event.modifiers),
+    for event in key_events(&key.event) {
+        host.send_key_event(Some(&event));
+    }
+}
+
+/// Translate one logical key transition into the CEF sequence Chromium
+/// expects: `RAWKEYDOWN`, zero or more `CHAR` events for text input, then
+/// `KEYUP` on release. Sending a character on `KEYDOWN` is not equivalent and
+/// leaves text inputs empty.
+fn key_events(event: &keyboard_types::KeyboardEvent) -> Vec<KeyEvent> {
+    let (vk, _) = key_code(&event.key);
+    let is_system_key = i32::from(event.modifiers.alt() && !event.modifiers.ctrl());
+    let base = KeyEvent {
+        modifiers: modifiers(event.modifiers),
         windows_key_code: vk,
         native_key_code: vk,
-        character: ch,
-        unmodified_character: ch,
+        is_system_key,
         ..KeyEvent::default()
     };
-    host.send_key_event(Some(&event));
+    if event.state == keyboard_types::KeyState::Up {
+        return vec![KeyEvent {
+            type_: KeyEventType::KEYUP,
+            ..base
+        }];
+    }
+    let mut events = vec![KeyEvent {
+        type_: KeyEventType::RAWKEYDOWN,
+        ..base.clone()
+    }];
+    for unit in text_units(event) {
+        events.push(KeyEvent {
+            type_: KeyEventType::CHAR,
+            // WM_CHAR carries the character code in wParam; CEF derives the
+            // inserted text from this field, not the virtual key. Leaving the
+            // VK here makes lowercase input insert its uppercase twin.
+            windows_key_code: i32::from(unit),
+            native_key_code: i32::from(unit),
+            character: unit,
+            unmodified_character: unit,
+            ..base.clone()
+        });
+    }
+    events
+}
+
+/// Text inserted by this key press. Ctrl/Alt/Meta combinations are shortcuts,
+/// not text; plain Shift is normal character input. AltGr currently reports
+/// Ctrl+Alt here and is suppressed.
+fn text_units(event: &keyboard_types::KeyboardEvent) -> Vec<u16> {
+    if event.modifiers.ctrl() || event.modifiers.alt() || event.modifiers.meta() {
+        return Vec::new();
+    }
+    match &event.key {
+        keyboard_types::Key::Character(text) if !text.is_empty() => text
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .collect::<String>()
+            .encode_utf16()
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn key_code(key: &keyboard_types::Key) -> (i32, u16) {
@@ -2330,7 +2386,6 @@ mod favicon_tests {
 #[cfg(test)]
 mod devtools_tests {
     use super::*;
-
     const HISTORY: &[u8] = br#"{
         "currentIndex": 1,
         "entries": [
@@ -2364,5 +2419,87 @@ mod devtools_tests {
         let state = DevToolsState::default();
         assert_eq!(next_devtools_id(&state), 1);
         assert_eq!(next_devtools_id(&state), 2);
+    }
+}
+
+#[cfg(test)]
+mod key_event_tests {
+    use super::*;
+    use keyboard_types::{Code, Key, KeyState, Location, Modifiers, NamedKey};
+
+    fn event(key: Key, state: KeyState, modifiers: Modifiers) -> keyboard_types::KeyboardEvent {
+        keyboard_types::KeyboardEvent {
+            state,
+            key,
+            code: Code::Unidentified,
+            location: Location::Standard,
+            modifiers,
+            repeat: false,
+            is_composing: false,
+        }
+    }
+
+    #[test]
+    fn printable_press_emits_rawkeydown_then_char() {
+        let events = key_events(&event(
+            Key::Character("a".into()),
+            KeyState::Down,
+            Modifiers::empty(),
+        ));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].type_, KeyEventType::RAWKEYDOWN);
+        assert_eq!(events[0].windows_key_code, i32::from(b'A'));
+        assert_eq!(events[1].type_, KeyEventType::CHAR);
+        assert_eq!(events[1].character, u16::from(b'a'));
+        assert_eq!(events[1].windows_key_code, i32::from(b'a'));
+    }
+
+    #[test]
+    fn ctrl_shortcut_suppresses_character_input() {
+        let events = key_events(&event(
+            Key::Character("c".into()),
+            KeyState::Down,
+            Modifiers::CONTROL,
+        ));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].type_, KeyEventType::RAWKEYDOWN);
+        assert_eq!(events[0].modifiers & (1 << 2), 1 << 2);
+    }
+
+    #[test]
+    fn release_emits_only_keyup() {
+        let events = key_events(&event(
+            Key::Character("a".into()),
+            KeyState::Up,
+            Modifiers::empty(),
+        ));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].type_, KeyEventType::KEYUP);
+    }
+
+    #[test]
+    fn emoji_uses_utf16_surrogate_char_events() {
+        let events = key_events(&event(
+            Key::Character("😀".into()),
+            KeyState::Down,
+            Modifiers::empty(),
+        ));
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1].type_, KeyEventType::CHAR);
+        assert_eq!(events[2].type_, KeyEventType::CHAR);
+        assert_eq!(events[1].character, 0xD83D);
+        assert_eq!(events[2].character, 0xDE00);
+    }
+
+    #[test]
+    fn named_enter_is_not_character_input() {
+        let events = key_events(&event(
+            Key::Named(NamedKey::Enter),
+            KeyState::Down,
+            Modifiers::empty(),
+        ));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].type_, KeyEventType::RAWKEYDOWN);
+        assert_eq!(events[0].windows_key_code, 0x0D);
     }
 }

@@ -5,12 +5,11 @@
 //! quiet mode on its own, so an automated launch that auto-opens a window
 //! without `SDSC_DEBUG_OPEN` still goes to the secondary monitor. While quiet:
 //! windows never take focus and are relocated from the primary monitor to a
-//! secondary one (`ui::layout::{focus_window, show_window, move_window}`), pad
-//! edges are dropped, and UI sounds / Launcher haptics are muted — so a debug
-//! session cannot interrupt a game running on the primary monitor. Set
-//! `SDSC_DEBUG_INPUT=1` to keep pad edges live in quiet mode (the install QA
-//! console uses this to drive Home on the secondary monitor while a game
-//! keeps focus on the primary). Release builds always return `false`.
+//! secondary one (`ui::layout::{focus_window, show_window, move_window}`), real
+//! keyboard/mouse/touch input is locked out, pad edges are dropped, and UI
+//! sounds / Launcher haptics are muted — so a debug session cannot interrupt a
+//! game running on the primary monitor. Set `SDSC_DEBUG_INPUT=1` to keep real
+//! input live in quiet mode (manual QA). Release builds always return `false`.
 
 /// Env var that opens windows at boot; turns quiet mode on by default.
 pub const DEBUG_OPEN_ENV: &str = "SDSC_DEBUG_OPEN";
@@ -19,8 +18,8 @@ pub const DEBUG_OPEN_ENV: &str = "SDSC_DEBUG_OPEN";
 /// Set to `0`, `false`, or `off`.
 pub const DEBUG_QUIET_ENV: &str = "SDSC_DEBUG_QUIET";
 
-/// Keep pad edges live while quiet mode still owns window placement/focus.
-/// Set to `1`, `true`, or `on`.
+/// Keep real keyboard/mouse/touch/pad input live while quiet mode still owns
+/// window placement/focus. Set to `1`, `true`, or `on`.
 pub const DEBUG_INPUT_ENV: &str = "SDSC_DEBUG_INPUT";
 
 /// True while debug quiet mode is active (never in release builds).
@@ -41,7 +40,7 @@ pub fn enabled() -> bool {
     }
 }
 
-/// True when quiet mode should swallow controller edges.
+/// True when quiet mode should swallow real keyboard/mouse/touch/pad input.
 pub fn input_dropped() -> bool {
     #[cfg(debug_assertions)]
     {

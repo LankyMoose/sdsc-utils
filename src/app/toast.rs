@@ -86,6 +86,11 @@ impl App {
     /// on their StartupTask, so an enabled startup task implies a possible
     /// login launch and stays quiet too.
     pub(crate) fn maybe_show_startup_notice(&mut self) -> Task<Message> {
+        // Quiet/automated sessions are for screenshots and replay; the
+        // tray-start notice is noise on the secondary display.
+        if crate::platform::debug_quiet::enabled() {
+            return Task::none();
+        }
         if !self.session.prefs.notify_startup {
             return Task::none();
         }
@@ -290,6 +295,12 @@ impl App {
     }
 
     pub(crate) fn effect_open_home(&mut self) -> Task<Message> {
+        if crate::platform::debug_quiet::input_dropped() {
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: home open after toast skipped (automated input lock)",
+            );
+            return Task::none();
+        }
         if crate::session::should_flush_latched_home(
             true,
             self.session.prefs.home_enabled && self.session.prefs.home_auto_open.auto_opens(),

@@ -556,10 +556,12 @@ class Console:
             restage = bool(payload.get("restage", False))
             controller_input = bool(payload.get("controller_input", True))
             automated = bool(payload.get("automated", not controller_input))
+            if automated:
+                controller_input = False
             self.log(
                 f"prepare: {flavor}, engine={'bundled' if bundle else ('msix-mock' if msix_mock else 'missing')}"
                 + (", reset" if restage else "")
-                + (", controller on" if controller_input else ", controller off")
+                + (", real input on" if controller_input else ", real input off")
             )
             self.stop()
 
@@ -704,6 +706,10 @@ class Console:
         controller_input: bool = True,
         automated: bool = False,
     ):
+        # Automated sessions never accept real input. Synthetic replay steps
+        # drive the app instead.
+        if automated:
+            controller_input = False
         self.stop()
         if flavor.startswith("installed:"):
             tag = normalize_tag(flavor.split(":", 1)[1]) or flavor.split(":", 1)[1]
@@ -725,8 +731,9 @@ class Console:
         env["SDSC_UPDATE_API_URL"] = self.feed_url()
         env["SDSC_CEF_NO_BUILD_FALLBACK"] = "1"
         # Manual launches open on the primary monitor with focus; automated
-        # launches use the secondary monitor and never steal focus. Pad edges
-        # stay live for manual testing and are dropped for automation.
+        # launches use the secondary monitor and never steal focus. Real pad,
+        # keyboard, and mouse input stays live for manual testing and is
+        # locked out for automation (synthetic replay drives tests instead).
         env["SDSC_DEBUG_QUIET"] = "1" if automated else "0"
         env["SDSC_DEBUG_INPUT"] = "1" if controller_input else "0"
         if self.engine:
@@ -755,7 +762,7 @@ class Console:
             self.last_automated = automated
         self.log(
             f"launch: {flavor} pid={self.proc.pid} "
-            f"controller={'on' if controller_input else 'off'} "
+            f"input={'on' if controller_input else 'off'} "
             f"display={'secondary' if automated else 'primary'} data={appdata}"
         )
         return self.api_state()
@@ -947,7 +954,7 @@ PAGE = """<!doctype html>
       </select></label>
       <label><input id="engine" type="checkbox"> Bundle browser engine</label>
       <label><input id="open-home" type="checkbox" checked> Open Home (debug)</label>
-      <label><input id="controller-input" type="checkbox" checked> Allow controller input</label>
+      <label><input id="controller-input" type="checkbox" checked> Allow real input (pad/keyboard/mouse)</label>
       <label><input id="automated" type="checkbox"> Automated (secondary monitor)</label>
       <label><input id="restage" type="checkbox"> Rebuild install</label>
     </div>
@@ -958,7 +965,7 @@ PAGE = """<!doctype html>
     </div>
     <div class="row error" id="error" style="display:none"></div>
     <div class="row muted" id="run">—</div>
-    <div class="row hint">Leave <b>Bundle browser engine</b> unchecked to start with no CEF at all: only the exe is staged, and Home's apps → Browser → Install walks the DLC flow. Check it to test an already-installed engine. <b>Rebuild install</b> resets the private appdata, including a previously downloaded engine. Manual runs open on the primary monitor with focus. Check <b>Automated (secondary monitor)</b> for quiet placement on the secondary display with no focus steal; uncheck <b>Allow controller input</b> too so the physical controller cannot navigate or close it.</div>
+    <div class="row hint">Leave <b>Bundle browser engine</b> unchecked to start with no CEF at all: only the exe is staged, and Home's apps → Browser → Install walks the DLC flow. Check it to test an already-installed engine. <b>Rebuild install</b> resets the private appdata, including a previously downloaded engine. Manual runs open on the primary monitor with focus. Check <b>Automated (secondary monitor)</b> for quiet placement on the secondary display with no focus steal; uncheck <b>Allow real input</b> too so the physical controller, keyboard, and mouse cannot navigate or close it. Browser input tests use synthetic replay steps, never OS input injection.</div>
   </section>
 
   <section class="card">

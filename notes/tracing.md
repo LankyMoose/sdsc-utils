@@ -110,11 +110,27 @@ Replay a flow in an isolated sandbox:
 sdsc-utils --trace-replay <session-id-or-dir> --flow 42
 ```
 
-The replay driver currently supports browser `navigate`, `history.back`,
-`history.forward`, `history.open`, `history.pick`, and `history.cancel`.
-Targets resolve by URL first, then index (`pass_resolved` semantics). State
-mismatches are logged as `replay.mismatch` and replay continues best-effort;
-the trace records both the mismatch and the final landing.
+The replay driver supports browser `navigate`, `history.back`,
+`history.forward`, `history.open`, `history.pick`, and `history.cancel`, plus
+synthetic input steps for automation:
+
+- `text` — `{"text": "hello"}` presses/releases each character.
+- `key` — `{"key": "Enter", "modifiers": ["ctrl"]}` taps one named key.
+- `mouse.click` — `{"x": 120, "y": 70}` left-clicks page-local coordinates.
+- `mouse.wheel` — `{"x": 300, "y": 400, "dy": -240}` wheels at page-local
+  coordinates.
+
+Input steps call the real browser handlers with explicit page coordinates;
+they never use the OS keyboard, mouse, cursor position, or window focus. The
+driver runs with `SDSC_DEBUG_INPUT=0`, which locks out all real input for the
+session. Targets resolve by URL first, then index (`pass_resolved` semantics).
+State mismatches are logged as `replay.mismatch` and replay continues
+best-effort; the trace records both the mismatch and the final landing.
+
+When the plan ends (`replay.done`), the driver closes the Browser window
+immediately so automated runs do not leave UI on the secondary display.
+Quiet sessions also suppress the tray-startup toast and controller auto-open
+Home.
 
 ## Adding instrumentation
 
@@ -165,6 +181,10 @@ Rules:
 - `history.devtools` records each exact-jump protocol leg
   (`getNavigationHistory` / `navigateToHistoryEntry`, index, entry id,
   message id), and `history.jump_failed` records why it stopped.
+- `browser.page_click` / `browser.page_wheel` record the page-local point and
+  whether the event came from hardware (`mouse`) or replay. Synthetic replay
+  also emits `browser.synthetic_text` (length only) and
+  `browser.synthetic_key` (named key only); typed characters are never logged.
 - `actions.jsonl` is only for user-visible intents and their outcomes.
 - Lane detail goes in the owning lane; never dump whole app state.
 - Snapshots are bounded and semantic (no DOM, frames, or raw HID reports).

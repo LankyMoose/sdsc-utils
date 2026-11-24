@@ -91,7 +91,7 @@ Status legend:
 | Print / PDF | `BrowserHost::Print`, `PrintToPDF`; `PrintHandler` | print | **wrapper only** | — |
 | DevTools | `BrowserHost::ShowDevTools`, `ExecuteDevToolsMethod`, `DevToolsMessageObserver` | none | **wrapper only** | — |
 | Accessibility | `AccessibilityHandler::OnAccessibilityTreeChange`; `BrowserHost::SetAccessibilityState` | accessibility | **custom** (DOM query) | `src/browser/dom.rs` |
-| Keyboard / mouse / wheel | `BrowserHost::SendKeyEvent`, `SendMouseClickEvent`, `SendMouseMoveEvent`, `SendMouseWheelEvent` | none | **wired** (trusted link/button clicks; JS fallback; scroll uses JS) | `src/browser/cef_backend.rs` |
+| Keyboard / mouse / wheel | `BrowserHost::SendKeyEvent`, `SendMouseClickEvent`, `SendMouseMoveEvent`, `SendMouseWheelEvent` | none | **partial**: keyboard text (`RAWKEYDOWN`+`CHAR`+`KEYUP`), pad trusted clicks, hardware left click and wheel; no drag/right/middle | `src/browser/cef_backend.rs` |
 | IME | `BrowserHost::ImeSetComposition`, `ImeCommitText`, `ImeFinishComposingText`, `ImeCancelComposition` | none | **unhandled** | `notes/browser-osk.md` |
 | OSR paint | `RenderHandler::OnPaint`; `OnAcceleratedPaint` | render | **wired** (CPU L1; accelerated not wired) | `src/browser/cef_backend.rs` |
 | Cookies / cache / profile | `CookieManager`, `RequestContext`, `Settings.root_cache_path` | settings | **wired** (CEF defaults) | `src/browser/cef_backend.rs:initialize_cef` |
@@ -204,6 +204,25 @@ Implementation notes (`src/browser/cef_backend.rs`):
   `navigateToHistoryEntry` emits `HistoryJumpFailed`; the UI settles the
   action and falls back to a URL load.
 - No `Page.enable` is required for these methods.
+
+## Keyboard and mouse input
+
+- CEF's `CefKeyEvent` follows the Windows message model: `RAWKEYDOWN` for the
+  key transition, `CHAR` for inserted text, and `KEYUP` on release. For
+  `CHAR`, `windows_key_code` carries the character code (what `WM_CHAR`
+  passes in `wParam`), not the virtual key; using the VK here changes
+  lowercase input to uppercase.
+- `CHAR` takes UTF-16 code units, so supplementary characters need two
+  events. Modifier flags ride every event; Ctrl/Alt/Meta combinations are
+  shortcuts, not text. AltGr currently arrives as Ctrl+Alt and is therefore
+  not inserted yet.
+- Page mouse input is page-local: `SendMouseClickEvent` for left clicks and
+  `SendMouseWheelEvent` with CEF's 120-units-per-line wheel scale. Native
+  wheel events keep Chromium's nested-scroller handling.
+- Automated sessions never receive real iced key/mouse events. Replay calls
+  the same app handlers with explicit coordinates (`text`, `key`,
+  `mouse.click`, `mouse.wheel`) and `SDSC_DEBUG_INPUT=0` locks the widget
+  tree.
 
 ## Threading and ownership rules
 

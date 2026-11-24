@@ -10,6 +10,7 @@ pub mod debug_bounds;
 pub mod face;
 pub mod home;
 pub mod icon;
+pub mod input_lock;
 pub mod launcher;
 pub mod layout;
 pub mod motion;

@@ -155,6 +155,10 @@ pub struct BrowserPanel {
     /// Ctrl+L enters, Enter commits, Esc/Circle backs out). Cleared on
     /// navigate and close.
     pub url_editing: bool,
+    /// Last page-local hardware/replay pointer position. Clicks and wheel
+    /// events use this point; replay sets it explicitly so automation never
+    /// depends on the OS cursor position.
+    pub page_mouse: (f32, f32),
     /// Last debug frame-shot time (5s cadence while the overlay is on).
     pub last_shot: Option<Instant>,
     /// Last dock transition (None→Some) wall-clock, for settled dock shots.
@@ -228,6 +232,10 @@ impl Default for BrowserPanel {
             next_tab_id: 2,
             draft: String::new(),
             url_editing: false,
+            page_mouse: (
+                crate::browser::cursor::VIEWPORT_W * 0.5,
+                crate::browser::cursor::VIEWPORT_H * 0.5,
+            ),
             last_shot: None,
             last_dock_change: None,
             js_click: false,
