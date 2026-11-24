@@ -777,8 +777,9 @@ impl App {
     }
 
     /// Browser: selector pick — traverse to the absolute session index.
-    /// History travel moves within the existing stack (go_back/go_forward),
-    /// so the forward tail survives; only a normal navigation truncates it.
+    /// History travel jumps directly through CEF's DevTools protocol
+    /// (`Page.navigateToHistoryEntry`), so skippable entries cannot be skipped
+    /// and the forward tail survives; only a normal navigation truncates it.
     /// Closes the selector first so the loadbehind never renders under it,
     /// and swallows an in-flight Cross press so the confirming release
     /// cannot also click the fresh page.
@@ -2150,6 +2151,9 @@ impl App {
                     }
                 }
             }
+            EngineEvent::HistoryJumpFailed { tab, index, reason } => {
+                self.on_history_jump_failed(tab, index, reason);
+            }
             EngineEvent::FocusChanged { tab: _, id } => {
                 // Magnet off means never dock — drop any parked target too.
                 if !self.browser.panel.cursor.magnet {
@@ -2283,7 +2287,8 @@ impl App {
                 EngineEvent::Frame(_)
                 | EngineEvent::FrameSlot { .. }
                 | EngineEvent::TabOpened { .. }
-                | EngineEvent::TabClosed { .. } => {}
+                | EngineEvent::TabClosed { .. }
+                | EngineEvent::HistoryJumpFailed { .. } => {}
             }
         }
         if strip_changed && self.browser.tabs_restored {

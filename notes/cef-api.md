@@ -158,21 +158,52 @@ a burst of identical events.
 
 - History is **per browser**, in-memory, and not persisted across restarts.
 - CEF does not expose a global browsing-history database or omnibox.
-- There is no `GoToIndex`. `GoBack`/`GoForward` move one *non-skippable* entry
-  and are asynchronous. Sequence one step per canonical snapshot; do not loop
-  N calls in one batch.
-- **Index is not a traversal offset.** Chromium's history-manipulation
-  intervention marks some entries `should_skip_on_back_forward_ui`;
-  `GetNavigationEntries` lists them, but `GoBack`/`GoForward` skip them. CEF
-  does not expose that flag publicly.
-- The app treats L1/R1 (`browser.history.back/forward`) as one CEF step and
-  accepts the reported landing. Selector picks target an index; if CEF skips
-  past it, the action records `target_skipped` and falls back to loading the
-  requested URL (a new history entry, forward tail lost) rather than
+- CEF's public API has no `GoToIndex`. `GoBack`/`GoForward` move one
+  *non-skippable* entry and are asynchronous. L1/R1 sends one step per press
+  and accepts the reported landing.
+- **Back/Forward skip history-manipulation entries.** Chromium marks some
+  entries `should_skip_on_back_forward_ui`; `GetNavigationEntries` lists
+  them, but `GoBack`/`GoForward` skip them.
+- **Exact jumps use the DevTools protocol.** `Page.getNavigationHistory`
+  returns controller entries with stable `id`s, and
+  `Page.navigateToHistoryEntry` calls `NavigationController::GoToIndex`
+  directly, bypassing the skip filter and preserving the forward tail. CEF's
+  `SendDevToolsMessage` / `ExecuteDevToolsMethod` /
+  `AddDevToolsMessageObserver` do not require a DevTools window or
+  remote-debugging session.
+- Selector picks (`browser.history.pick`) use this exact path. If the CDP
+  round trip fails or times out, the action records `history.fallback` and
+  loads the requested URL (a new history entry; forward tail lost) instead of
   oscillating.
 - Redirects remain one navigation entry; use `GetOriginalURL` for replay
   matching.
 - `HasPostData` means a URL-only replay is not equivalent.
+
+## DevTools protocol for exact history
+
+CEF exposes no index-based traversal, so the engine uses raw CDP messages on
+the browser host:
+
+1. `Page.getNavigationHistory` (no params) → `{currentIndex, entries[]}`.
+   Match the session index from the canonical CEF snapshot to
+   `entries[index].id`. CDP ids are `NavigationEntry::GetUniqueID()`, not the
+   array index.
+2. `Page.navigateToHistoryEntry` with `{entryId: <id>}` → `GoToIndex`.
+
+Implementation notes (`src/browser/cef_backend.rs`):
+
+- Register one observer per tab with `AddDevToolsMessageObserver`; the
+  `Registration` is stored on the worker-owned tab entry.
+- Message ids are assigned by the engine, not passed as `0`. With
+  `multi_threaded_message_loop` (Windows) `ExecuteDevToolsMethod` posts the
+  call to CEF's UI thread and returns `0`, so the id must be known before the
+  call to match the asynchronous result.
+- `OnDevToolsMethodResult` receives the UTF-8 JSON *result dictionary*
+  directly; no envelope parsing.
+- A failed `getNavigationHistory`, missing entry id, or rejected
+  `navigateToHistoryEntry` emits `HistoryJumpFailed`; the UI settles the
+  action and falls back to a URL load.
+- No `Page.enable` is required for these methods.
 
 ## Threading and ownership rules
 

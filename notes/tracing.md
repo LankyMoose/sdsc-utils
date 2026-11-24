@@ -160,8 +160,11 @@ Rules:
 
 - `browser.click` records the target id, point, and `method`
   (`trusted`/`mouse`/`js`) so page-click provenance is visible.
-- `history.fallback` records a selector pick that CEF skipped over and the
-  requested URL loaded as the fallback.
+- `history.fallback` records a selector pick whose exact DevTools jump failed
+  or timed out and the requested URL loaded as the fallback.
+- `history.devtools` records each exact-jump protocol leg
+  (`getNavigationHistory` / `navigateToHistoryEntry`, index, entry id,
+  message id), and `history.jump_failed` records why it stopped.
 - `actions.jsonl` is only for user-visible intents and their outcomes.
 - Lane detail goes in the owning lane; never dump whole app state.
 - Snapshots are bounded and semantic (no DOM, frames, or raw HID reports).

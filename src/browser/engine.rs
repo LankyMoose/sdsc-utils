@@ -130,6 +130,14 @@ pub enum EngineCommand {
     GoForward {
         tab: TabId,
     },
+    /// Jump to an absolute session-history index through the DevTools
+    /// protocol (`Page.navigateToHistoryEntry`). Unlike Back/Forward, this
+    /// addresses Chromium's history-manipulation entries and preserves the
+    /// forward tail.
+    GoToHistoryIndex {
+        tab: TabId,
+        index: usize,
+    },
     /// Ask the engine for a fresh canonical history snapshot.
     QueryHistory {
         tab: TabId,
@@ -202,6 +210,7 @@ impl EngineCommand {
             | Self::ProbeEventLoop { tab, .. }
             | Self::GoBack { tab }
             | Self::GoForward { tab }
+            | Self::GoToHistoryIndex { tab, .. }
             | Self::QueryHistory { tab }
             | Self::Reload { tab, .. }
             | Self::OpenTab { tab, .. }
@@ -302,6 +311,13 @@ pub enum EngineEvent {
         can_back: bool,
         can_forward: bool,
     },
+    /// An exact history jump could not be resolved or executed through the
+    /// DevTools protocol. The UI falls back to loading the requested URL.
+    HistoryJumpFailed {
+        tab: TabId,
+        index: usize,
+        reason: String,
+    },
     LoadFinished {
         tab: TabId,
         generation: u64,
@@ -345,6 +361,7 @@ impl EngineEvent {
             | Self::FocusChanged { tab, .. }
             | Self::HistoryChanged { tab, .. }
             | Self::HistoryCapability { tab, .. }
+            | Self::HistoryJumpFailed { tab, .. }
             | Self::LoadFinished { tab, .. } => Some(*tab),
             Self::A11yTree { tab, .. } => Some(*tab),
             Self::TabOpened { .. } | Self::TabClosed { .. } => None,

@@ -180,11 +180,13 @@ CEF toolchain needs the pinned compiler.
 - **Popups denied**: `window.open`/`target=_blank` are canceled until the UI
   adopts engine-created tabs.
 - **History is canonical**: `GetNavigationEntries` snapshots replace the
-  URL-change inference; the UI stack is a projection. Multi-step selector
-  jumps advance one CEF step per canonical snapshot. Favicons use CEF
-  `DownloadImage` for HTTP(S) (Chromium cache/network stack; `is_favicon`
-  disables cookies), with the local `favicon.rs` decoder as the
-  `data:`/failure fallback and `/favicon.ico` fallback.
+  URL-change inference; the UI stack is a projection. Selector jumps resolve
+  the CDP entry id and call `Page.navigateToHistoryEntry` (exact index,
+  skippable entries addressable, forward tail preserved); L1/R1 remains one
+  `GoBack`/`GoForward` step. Favicons use CEF `DownloadImage` for HTTP(S)
+  (Chromium cache/network stack; `is_favicon` disables cookies), with the
+  local `favicon.rs` decoder as the `data:`/failure fallback and
+  `/favicon.ico` fallback.
 - **Accelerated OSR not wired**: L1 CPU `OnPaint` only; `OnAcceleratedPaint`
   shared-texture import is the L2 performance step.
 - **macOS/Linux untested** for the CEF backend.

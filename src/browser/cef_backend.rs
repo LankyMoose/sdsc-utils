@@ -23,7 +23,7 @@ use crate::browser::engine::{
 use crate::browser::frame_slot::FrameSlot;
 use cef::*;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -324,6 +324,32 @@ struct PendingClick {
     at: Instant,
 }
 
+/// One in-flight DevTools method call. Exact history traversal is two
+/// round trips: resolve the CDP entry id for a session index, then jump.
+#[derive(Clone, Copy)]
+enum DevToolsRequest {
+    GetHistory { index: usize },
+    Navigate { index: usize },
+}
+
+/// DevTools message ids are assigned here instead of by CEF: with the
+/// multi-threaded message loop `ExecuteDevToolsMethod` posts the call to the
+/// browser UI thread and returns 0, so the caller must know the id up front
+/// to match the asynchronous result.
+struct DevToolsState {
+    next_id: AtomicI32,
+    pending: Mutex<HashMap<i32, DevToolsRequest>>,
+}
+
+impl Default for DevToolsState {
+    fn default() -> Self {
+        Self {
+            next_id: AtomicI32::new(1),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
 /// Shared by every CEF callback for one tab.
 #[derive(Clone)]
 struct TabContext {
@@ -351,6 +377,8 @@ struct TabContext {
     /// Last canonical history snapshot hash, so address/title/load callbacks
     /// do not emit duplicate HistoryChanged events.
     last_history_hash: Arc<Mutex<u64>>,
+    /// Exact history traversal through the DevTools protocol.
+    devtools: Arc<DevToolsState>,
     /// Causal flow of the last traced navigation/history command. CEF
     /// callbacks join engine log lines to the UI action that caused them.
     trace_flow: Arc<Mutex<Option<crate::platform::trace::FlowId>>>,
@@ -482,6 +510,181 @@ fn emit_history(ctx: &TabContext) {
         entries,
         current,
     });
+}
+
+/// Record an exact history jump that could not be resolved or executed.
+/// The UI settles the pending selector pick and falls back to a URL load.
+fn history_jump_failed(ctx: &TabContext, index: usize, reason: &'static str) {
+    trace_engine(ctx, "history.jump_failed")
+        .field("index", index)
+        .field("reason", reason)
+        .emit();
+    ctx.handle.emit(EngineEvent::HistoryJumpFailed {
+        tab: ctx.tab,
+        index,
+        reason: reason.to_string(),
+    });
+}
+
+/// Extract the DevTools entry id at a session-history index from a
+/// `Page.getNavigationHistory` result payload.
+fn devtools_entry_id(result: Option<&[u8]>, index: usize) -> Option<i32> {
+    let value: serde_json::Value = serde_json::from_slice(result?).ok()?;
+    let id = value
+        .get("entries")?
+        .as_array()?
+        .get(index)?
+        .get("id")?
+        .as_i64()?;
+    i32::try_from(id).ok()
+}
+
+fn next_devtools_id(state: &DevToolsState) -> std::os::raw::c_int {
+    let id = state.next_id.fetch_add(1, Ordering::Relaxed);
+    if id <= 0 { 1 } else { id }
+}
+
+/// Second leg of an exact history jump: send `Page.navigateToHistoryEntry`
+/// with the id resolved by `Page.getNavigationHistory`.
+fn send_navigate_to_entry(ctx: &TabContext, host: &BrowserHost, index: usize, entry_id: i32) {
+    let Some(mut params) = cef::dictionary_value_create() else {
+        history_jump_failed(ctx, index, "params_failed");
+        return;
+    };
+    let key: CefString = "entryId".into();
+    params.set_int(Some(&key), entry_id);
+    let method: CefString = "Page.navigateToHistoryEntry".into();
+    // Assign the id here: with the multi-threaded message loop CEF posts the
+    // call to the UI thread and returns 0, so the return value cannot supply
+    // the id used to match the asynchronous result.
+    let id = next_devtools_id(&ctx.devtools);
+    ctx.devtools
+        .pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(id, DevToolsRequest::Navigate { index });
+    let returned = host.execute_dev_tools_method(id, Some(&method), Some(&mut params));
+    if !cfg!(windows) && returned == 0 {
+        ctx.devtools
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&id);
+        history_jump_failed(ctx, index, "devtools_send_failed");
+        return;
+    }
+    trace_engine(ctx, "history.devtools")
+        .field("method", "navigateToHistoryEntry")
+        .field("index", index)
+        .field("entry_id", entry_id)
+        .field("message_id", id)
+        .field("returned_id", returned)
+        .emit();
+}
+
+/// Sends `Page.getNavigationHistory`, then jumps to the entry at `index`.
+/// `NavigateToHistoryEntry` calls `NavigationController::GoToIndex`, which
+/// addresses entries that Back/Forward intentionally skip.
+fn go_to_history_index(ctx: &TabContext, index: usize) {
+    let Some(host) = ctx.browser.get().and_then(|browser| browser.host()) else {
+        history_jump_failed(ctx, index, "browser_missing");
+        return;
+    };
+    let method: CefString = "Page.getNavigationHistory".into();
+    let id = next_devtools_id(&ctx.devtools);
+    ctx.devtools
+        .pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(id, DevToolsRequest::GetHistory { index });
+    let returned = host.execute_dev_tools_method(id, Some(&method), None);
+    if !cfg!(windows) && returned == 0 {
+        ctx.devtools
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&id);
+        history_jump_failed(ctx, index, "devtools_send_failed");
+        return;
+    }
+    trace_engine(ctx, "history.devtools")
+        .field("method", "getNavigationHistory")
+        .field("index", index)
+        .field("message_id", id)
+        .field("returned_id", returned)
+        .emit();
+}
+
+cef::wrap_dev_tools_message_observer! {
+    struct SdscDevToolsObserver {
+        ctx: TabContext,
+    }
+    impl DevToolsMessageObserver {
+        fn on_dev_tools_method_result(
+            &self,
+            browser: Option<&mut Browser>,
+            message_id: std::os::raw::c_int,
+            success: std::os::raw::c_int,
+            result: Option<&[u8]>,
+        ) {
+            let request = self
+                .ctx
+                .devtools
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&message_id);
+            let Some(request) = request else {
+                return;
+            };
+            match request {
+                DevToolsRequest::GetHistory { index } => {
+                    if success == 0 {
+                        let error = result.map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+                        trace_engine(&self.ctx, "history.devtools")
+                            .field("method", "getNavigationHistory")
+                            .field("index", index)
+                            .field("ok", false)
+                            .field("error", error.as_deref())
+                            .emit();
+                        history_jump_failed(&self.ctx, index, "devtools_error");
+                        return;
+                    }
+                    let Some(entry_id) = devtools_entry_id(result, index) else {
+                        history_jump_failed(&self.ctx, index, "entry_missing");
+                        return;
+                    };
+                    let Some(host) = browser.and_then(|browser| browser.host()) else {
+                        history_jump_failed(&self.ctx, index, "browser_missing");
+                        return;
+                    };
+                    send_navigate_to_entry(&self.ctx, &host, index, entry_id);
+                }
+                DevToolsRequest::Navigate { index } => {
+                    if success == 0 {
+                        history_jump_failed(&self.ctx, index, "devtools_error");
+                    } else {
+                        trace_engine(&self.ctx, "history.devtools")
+                            .field("method", "navigateToHistoryEntry")
+                            .field("index", index)
+                            .field("ok", true)
+                            .emit();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Register the DevTools observer once per browser. The registration handle
+/// is stored on the worker-owned `TabEntry` because it is not `Send`.
+fn ensure_devtools_observer(entry: &mut TabEntry, host: &BrowserHost) -> bool {
+    if entry.devtools_registration.is_some() {
+        return true;
+    }
+    let mut observer = SdscDevToolsObserver::new(entry.ctx.clone());
+    entry.devtools_registration = host.add_dev_tools_message_observer(Some(&mut observer));
+    entry.devtools_registration.is_some()
 }
 
 /// `cef::Browser` is a ref-counted raw pointer without Rust `Send`; CEF's
@@ -1380,6 +1583,10 @@ struct TabEntry {
     url: String,
     last_dom: Instant,
     dom_epoch: u64,
+    /// Keeps the DevTools message observer registered for this browser.
+    /// Lives outside `TabContext` because the registration handle is not
+    /// `Send`; `TabContext` crosses into the favicon worker.
+    devtools_registration: Option<Registration>,
 }
 
 struct Worker {
@@ -1463,6 +1670,7 @@ impl Worker {
             favicon_request: Arc::new(AtomicU64::new(0)),
             pending_click: Arc::new(Mutex::new(None)),
             last_history_hash: Arc::new(Mutex::new(0)),
+            devtools: Arc::new(DevToolsState::default()),
             trace_flow: Arc::new(Mutex::new(None)),
         };
         let mut client = SdscClient::new(
@@ -1498,6 +1706,7 @@ impl Worker {
                 url: url.to_string(),
                 last_dom: Instant::now(),
                 dom_epoch: 0,
+                devtools_registration: None,
             },
         );
         if started == 0 {
@@ -1726,6 +1935,20 @@ impl Worker {
                     && let Some(browser) = entry.ctx.browser.get()
                 {
                     browser.go_forward();
+                }
+            }
+            EngineCommand::GoToHistoryIndex { tab, index } => {
+                if let Some(entry) = self.tab_mut(tab) {
+                    let host = entry.ctx.browser.get().and_then(|browser| browser.host());
+                    let Some(host) = host else {
+                        history_jump_failed(&entry.ctx, index, "browser_missing");
+                        return false;
+                    };
+                    if !ensure_devtools_observer(entry, &host) {
+                        history_jump_failed(&entry.ctx, index, "observer_failed");
+                        return false;
+                    }
+                    go_to_history_index(&entry.ctx, index);
                 }
             }
             EngineCommand::QueryHistory { tab } => {
@@ -2101,5 +2324,45 @@ mod favicon_tests {
         assert!(favicon_is_http("http://a.test/icon.png"));
         assert!(!favicon_is_http("data:image/png;base64,AAAA"));
         assert!(!favicon_is_http(""));
+    }
+}
+
+#[cfg(test)]
+mod devtools_tests {
+    use super::*;
+
+    const HISTORY: &[u8] = br#"{
+        "currentIndex": 1,
+        "entries": [
+            {"id": 12, "url": "https://a.test/"},
+            {"id": 34, "url": "https://b.test/"},
+            {"id": 56, "url": "https://c.test/"}
+        ]
+    }"#;
+
+    #[test]
+    fn resolves_entry_id_by_session_index() {
+        assert_eq!(devtools_entry_id(Some(HISTORY), 0), Some(12));
+        assert_eq!(devtools_entry_id(Some(HISTORY), 1), Some(34));
+        assert_eq!(devtools_entry_id(Some(HISTORY), 2), Some(56));
+    }
+
+    #[test]
+    fn rejects_missing_index_and_malformed_payloads() {
+        assert_eq!(devtools_entry_id(Some(HISTORY), 3), None);
+        assert_eq!(devtools_entry_id(None, 0), None);
+        assert_eq!(devtools_entry_id(Some(b"not json"), 0), None);
+        assert_eq!(devtools_entry_id(Some(br#"{"entries":[]}"#), 0), None);
+        assert_eq!(
+            devtools_entry_id(Some(br#"{"entries":[{"id":4294967296}]}"#), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn devtools_ids_start_positive_and_increment() {
+        let state = DevToolsState::default();
+        assert_eq!(next_devtools_id(&state), 1);
+        assert_eq!(next_devtools_id(&state), 2);
     }
 }
